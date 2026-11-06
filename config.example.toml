@@ -13,7 +13,7 @@ listen = "127.0.0.1:9090"
 # "json" (one object per line) or "text". The PUBKY_SWITCH_LOG environment variable
 # overrides the filter.
 format = "json"
-filter = "info"
+filter = "info,sqlx::postgres::notice=warn"
 
 # Limits, quotas and rates, by their Switch wire 9.2 names. The defaults are the wire
 # format's, for one identity on a shared service; an operator may raise them.
@@ -70,3 +70,19 @@ max_uncertainty_ms = 300000            # 5 minutes
 max_disagreement_ms = 300000           # 5 minutes
 sample_interval_ms = 900000            # 15 minutes; at most one hour
 retry_interval_ms = 60000
+
+# The database: PostgreSQL. Commits must be durable: the service refuses a database with
+# fsync off or synchronous_commit off.
+[database]
+# Prefer the PUBKY_SWITCH_DATABASE_URL environment variable, which overrides this, so the
+# password stays out of the file. Required to run the service.
+# url = "postgres://switch@localhost/switch"
+max_connections = 16
+acquire_timeout_ms = 5000
+lock_timeout_ms = 10000                # a request waits this long for its account's lock
+migrate_on_start = true
+
+# The key store: service keys, their marks and the erasure ledger. Put it on a disk that
+# database backups don't cover, and back it up on its own. Required to run the service.
+[keys]
+# path = "/var/lib/pubky-switch/keys"

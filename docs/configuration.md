@@ -7,7 +7,7 @@ pubky-switch --config /etc/pubky-switch/config.toml
 pubky-switch check-config --config /etc/pubky-switch/config.toml
 ```
 
-- `run`, the default command, starts the service. It stops on `SIGTERM` or Ctrl-C.
+- `run`, the default command, starts the service. It needs a database (`database.url` or `PUBKY_SWITCH_DATABASE_URL`) and a key store (`keys.path`), applies pending schema migrations, and stops on `SIGTERM` or Ctrl-C.
 - `check-config` checks a file and prints it with every default written out.
 - `--config` may also be given as `PUBKY_SWITCH_CONFIG`. Without a file, every setting takes its default.
 
@@ -15,10 +15,13 @@ pubky-switch check-config --config /etc/pubky-switch/config.toml
 
 ```sh
 docker build -t pubky-switch .
-docker run -p 127.0.0.1:9090:9090 -v ./config.toml:/etc/pubky-switch/config.toml pubky-switch
+docker run -p 127.0.0.1:9090:9090 \
+  -e PUBKY_SWITCH_DATABASE_URL=postgres://switch:...@db/switch \
+  -v switch-keys:/var/lib/pubky-switch/keys \
+  pubky-switch
 ```
 
-The image runs as a non-root user. Its default configuration, [`docker/config.toml`](../docker/config.toml), listens on every interface inside the container; mount your own file over it.
+The image runs as a non-root user. Its default configuration, [`docker/config.toml`](../docker/config.toml), listens on every interface inside the container and keeps the key store in the `/var/lib/pubky-switch/keys` volume; mount your own file at `/etc/pubky-switch/config.toml` to change it.
 
 ## The configuration file
 
@@ -45,7 +48,7 @@ The listener isn't authenticated. Keep it on a private network.
 | Setting | Default | Meaning |
 |---|---|---|
 | `format` | `json` | `json`, one object per line, or `text` |
-| `filter` | `info` | a `tracing` filter, such as `info,pubky_switch=debug`; `PUBKY_SWITCH_LOG` overrides it |
+| `filter` | `info,sqlx::postgres::notice=warn` | a `tracing` filter, such as `info,pubky_switch=debug`; `PUBKY_SWITCH_LOG` overrides it |
 
 Logs never hold message content: no envelopes, sealed values, record bodies, signatures or keys.
 
@@ -75,6 +78,42 @@ Trusted time (Switch spec 10.1, Switch wire 7.3).
 | `retry_interval_ms` | `60000` | how long it waits after a failed sample |
 
 The service doesn't have a time source yet. Until one is configured it has no trusted time: it serves reads and everything else that doesn't depend on time, and refuses the rest. The `pubky_switch_trusted_time_available` metric shows whether it has trusted time, and `pubky_switch_time_disagreement_alerts_total` counts the times its wall clock disagreed with trusted time.
+
+### `[database]`
+
+PostgreSQL.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `url` | none | the connection URL; `PUBKY_SWITCH_DATABASE_URL` overrides it, and keeps the password out of the file |
+| `max_connections` | `16` | most connections in the pool |
+| `acquire_timeout_ms` | `5000` | how long a request waits for a free connection |
+| `lock_timeout_ms` | `10000` | how long a request waits for its account's lock before it gives up with `503 unavailable` |
+| `migrate_on_start` | `true` | apply pending schema migrations at start; safe with several instances |
+
+### `[keys]`
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `path` | none | the directory of the key store |
+
+## Storage and durability
+
+The service keeps its state in two places, and they are backed up differently.
+
+- **The database** holds every account's state. Every request to an account runs in one transaction that locks the account, so one account's operations are serialized, and a request either commits whole or leaves no trace. An answer carrying a `seq`, a transition proof or a signed head goes out only once its commit is durable (Switch spec 6.5). The service refuses a database with `fsync` off or `synchronous_commit` off. With synchronous replicas, use `synchronous_commit = on` or `remote_apply`, so a commit is durable on every replica that could be promoted; never promote an asynchronous replica to serve writes.
+- **The key store** holds each account's service key, its **mark** (the newest head the key signed) and the erasure ledger. Keep it on a disk that database backups don't cover, and back it up on its own, often: losing it loses every account's service key. The key signs nothing behind its mark, so after a database restore the accounts whose state went back stop with `503 unavailable` instead of serving a history that lost acknowledged writes.
+
+### No restore and continue
+
+Restoring a database backup, failing over to a replica that may lag, or replaying an incomplete log is a loss of committed state (Switch spec 6.5). The service never continues from it under the same generation:
+
+1. The key's mark stops the affected accounts on their own, and the readiness answer stays up for the others.
+2. Find the accounts whose state is behind their mark; their requests answer `503 unavailable`.
+3. Tell their users, through the signer's operator channel, that a provider loss must be declared. The signer declares it, here or at another service, and the account starts a new generation with a new service key.
+4. Never serve the lost generation again, and never reuse its service key.
+
+Database backups are for disaster recovery only: after a restore, every account whose state went back takes the steps above.
 
 ## Metrics
 
