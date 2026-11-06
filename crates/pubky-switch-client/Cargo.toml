@@ -1,6 +1,6 @@
 [package]
-name = "pubky-switch-paykit"
-description = "The Paykit v0.2 profile of the Pubky Switch"
+name = "pubky-switch-client"
+description = "Client for apps that use a Pubky Switch"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

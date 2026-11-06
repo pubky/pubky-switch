@@ -7,5 +7,13 @@ name = "pubky-switch"
 version = "0.1.0"
 
 [[package]]
-name = "pubky-switch-paykit"
+name = "pubky-switch-client"
+version = "0.1.0"
+
+[[package]]
+name = "pubky-switch-core"
+version = "0.1.0"
+
+[[package]]
+name = "pubky-switch-signer"
 version = "0.1.0"

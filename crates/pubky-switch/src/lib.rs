@@ -1,4 +1,4 @@
-//! The Pubky Switch: an inbox and coordination service for Pubky identities.
+//! The Pubky Switch service: an inbox and coordination service for Pubky identities.
 //!
 //! One Switch hosts many identities, each with its own account. For each identity it keeps:
 //!
@@ -9,10 +9,9 @@
 //! - the directory: the identity's newest `identity.json`, its apps' records, receive keys
 //!   and key bundles.
 //!
-//! This crate holds the protocol-neutral service: storage, the HTTP API and operations. The
-//! rules of a particular protocol, such as its scopes, the record policies of its collections
-//! and its message kinds, come from a protocol profile the service is configured with; the
-//! Paykit v0.2 profile is the `pubky-switch-paykit` crate.
+//! The service reads no message and no shared data, and knows no protocol: scopes, message
+//! kinds and collections are opaque to it. It holds storage, the HTTP API and operations; the
+//! formats come from `pubky-switch-core`.
 //!
-//! The behaviour is specified by the Paykit v0.2 specification (spec 6) and its wire format
-//! (wire 6 to 11), in `specs/v0.2/` of `pubky/paykit-rs`.
+//! The behaviour is specified by the Pubky Switch spec and wire format, in this repository's
+//! `spec/`.
