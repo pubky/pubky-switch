@@ -91,6 +91,7 @@ pub struct AccountTxn {
     tx: Transaction<'static, Postgres>,
     head: AccountHead,
     loaded: AccountHead,
+    changed: bool,
 }
 
 impl std::fmt::Debug for AccountTxn {
@@ -164,6 +165,7 @@ impl AccountTxn {
             tx,
             loaded: head.clone(),
             head,
+            changed: false,
         }))
     }
 
@@ -218,6 +220,13 @@ impl AccountTxn {
         })
     }
 
+    /// Note that this request changes the account, so its commit wakes the requests
+    /// waiting on it ([`crate::changes`]). A request that gives out a `seq` or moves the
+    /// chain head counts as a change without this; one that only stamps the time doesn't.
+    pub fn note_change(&mut self) {
+        self.changed = true;
+    }
+
     /// The transaction's connection, for the queries of the account's other state. Every
     /// query on it is part of this request, and commits or rolls back with it.
     pub fn conn(&mut self) -> &mut PgConnection {
@@ -251,6 +260,20 @@ impl AccountTxn {
             if updated != 1 {
                 return Err(StoreError::Corrupt("account row vanished under its lock"));
             }
+            // A new seq or chain head is a change waiting readers care about; a stamped
+            // time alone, which every request may move, isn't.
+            if self.head.last_seq != self.loaded.last_seq || self.head.chain != self.loaded.chain {
+                self.changed = true;
+            }
+        }
+        if self.changed {
+            // Sent with the commit, and only if it commits.
+            sqlx::query("SELECT pg_notify($1, $2)")
+                .bind(crate::changes::CHANNEL)
+                .bind(&self.head.id)
+                .execute(&mut *self.tx)
+                .await
+                .map_err(StoreError::from_db)?;
         }
         self.tx.commit().await.map_err(StoreError::from_db)?;
         Ok(Committed { head: self.head })
