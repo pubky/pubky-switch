@@ -12,6 +12,7 @@
 mod common;
 
 mod encoding;
+mod http;
 mod identifiers;
 mod keys;
 mod signatures;

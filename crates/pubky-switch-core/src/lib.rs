@@ -14,11 +14,14 @@
 
 pub mod enc;
 pub mod error;
+pub mod http;
 pub mod ident;
 pub mod json;
 pub mod keys;
 pub mod labels;
+pub mod net;
 pub mod sig;
+pub mod signing;
 pub mod time;
 
 pub use error::{Error, Result};
