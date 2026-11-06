@@ -1,0 +1,3065 @@
+{
+  "apps": {
+    "A": {
+      "app_id": "rbedjtmm6qhfpx3ejngdkjeprr",
+      "cert": {
+        "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFwcF9jZXJ0IiwiaWRlbnRpdHkiOiI5aDVhODF6czR3Zndpb2JhYTU2OGM4cG54cjk4cWY0ZWR0N3VtZ2tqdzZocmtpaGI4dW95IiwiYXBwX2lkIjoicmJlZGp0bW02cWhmcHgzZWpuZ2RramVwcnIiLCJzaWduaW5nX2tleSI6IkUwRTdKWWdRTVgwWDFlR2Q3dVJMRGYxR1RnZUV2ZVpQZ3hSTEFUNF8tdzQiLCJidW5kbGVfa2V5IjoiWEpGcmtYcVpnUlhlQ3pONUhNbnFObXhlRmUwdWlGbWVwR20tMzZxblNGdyIsInNjb3BlcyI6WyJwYXkiXSwicGVybWlzc2lvbnMiOlsiY2xhaW1zLnJlYWQiLCJjbGFpbXMud3JpdGUiLCJjb252ZXJzYXRpb24uYWRkIl0sImlzc3VlZF9hdCI6IjIwMjYtMDEtMDFUMDA6MDA6MDAuMDAwWiIsImV4cGlyZXNfYXQiOiIyMDI3LTAxLTAxVDAwOjAwOjAwLjAwMFoifQ",
+        "sig": "v3823o-qZD1771ZFXEA2eH2TEl926LAAhq60T0go0UiUB66LDnjZu4EPQn8FfgyzQ_wxVK2H5ZFw4L9am095AQ"
+      },
+      "inbox_permissions": [
+        "claims.read",
+        "claims.write",
+        "conversation.add"
+      ],
+      "registered_receive_key": {
+        "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLnJlY2VpdmVfa2V5IiwiaWRlbnRpdHkiOiI5aDVhODF6czR3Zndpb2JhYTU2OGM4cG54cjk4cWY0ZWR0N3VtZ2tqdzZocmtpaGI4dW95IiwiYXBwX2lkIjoicmJlZGp0bW02cWhmcHgzZWpuZ2RramVwcnIiLCJuIjowLCJraWQiOiJHa0dNX25CZmpVZyIsIngyNTUxOSI6IlBtblNRY0JXanUzY1AtLXZ2aHpNNU9peXl6ZEJFSi1tNDJRNVJHRE5sVjQifQ",
+        "sig": "m71YIopeqduY4GsXBxgc6ChSrQG5rCjCuJFyIy85Ld3MC2-fbetXoI7dhEvlZQZ23QOA4XmePi_Iv9pSmdYpBQ"
+      },
+      "registered_record": {
+        "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFwcCIsImlkZW50aXR5IjoiOWg1YTgxenM0d2Z3aW9iYWE1NjhjOHBueHI5OHFmNGVkdDd1bWdranc2aHJraWhiOHVveSIsImFwcF9pZCI6InJiZWRqdG1tNnFoZnB4M2Vqbmdka2plcHJyIiwic2lnbmluZ19rZXkiOiJFMEU3SllnUU1YMFgxZUdkN3VSTERmMUdUZ2VFdmVaUGd4UkxBVDRfLXc0IiwiY2VydCI6eyJib2R5IjoiZXlKMklqb3hMQ0pyYVc1a0lqb2ljSFZpYTNrdGMzZHBkR05vTG1Gd2NGOWpaWEowSWl3aWFXUmxiblJwZEhraU9pSTVhRFZoT0RGNmN6UjNabmRwYjJKaFlUVTJPR000Y0c1NGNqazRjV1kwWldSME4zVnRaMnRxZHpab2NtdHBhR0k0ZFc5NUlpd2lZWEJ3WDJsa0lqb2ljbUpsWkdwMGJXMDJjV2htY0hnelpXcHVaMlJyYW1Wd2NuSWlMQ0p6YVdkdWFXNW5YMnRsZVNJNklrVXdSVGRLV1dkUlRWZ3dXREZsUjJRM2RWSk1SR1l4UjFSblpVVjJaVnBRWjNoU1RFRlVORjh0ZHpRaUxDSmlkVzVrYkdWZmEyVjVJam9pV0VwR2NtdFljVnBuVWxobFEzcE9OVWhOYm5GT2JYaGxSbVV3ZFdsR2JXVndSMjB0TXpaeGJsTkdkeUlzSW5OamIzQmxjeUk2V3lKd1lYa2lYU3dpY0dWeWJXbHpjMmx2Ym5NaU9sc2lZMnhoYVcxekxuSmxZV1FpTENKamJHRnBiWE11ZDNKcGRHVWlMQ0pqYjI1MlpYSnpZWFJwYjI0dVlXUmtJbDBzSW1semMzVmxaRjloZENJNklqSXdNall0TURFdE1ERlVNREE2TURBNk1EQXVNREF3V2lJc0ltVjRjR2x5WlhOZllYUWlPaUl5TURJM0xUQXhMVEF4VkRBd09qQXdPakF3TGpBd01Gb2lmUSIsInNpZyI6InYzODIzby1xWkQxNzcxWkZYRUEyZUgyVEVsOTI2TEFBaHE2MFQwZ28wVWlVQjY2TERualp1NEVQUW44RmZneXpRX3d4VksySDVaRnc0TDlhbTA5NUFRIn0sImFjY2VwdHMiOltdLCJjYXBhYmlsaXRpZXMiOnsiZW5kcG9pbnRfaWRlbnRpZmllcnMiOltdfSwicHVibGljX2VuZHBvaW50cyI6e30sImxhYmVsIjpudWxsLCJ1cGRhdGVkX2F0IjoiMjAyNi0wMS0wMVQwMDowMDowMC4wMDBaIiwiZXhwaXJlc19hdCI6bnVsbH0",
+        "sig": "TNoSyNjXhIz-4W6ogxClqKVew71GWhac88VU3hpOD648Cz617B2bC3d8G7U1d50aAfdcIzqlpihUKzcOxICSDQ"
+      },
+      "scopes": [
+        "pay"
+      ],
+      "signing_seed_label": "claims/A/signing"
+    },
+    "B": {
+      "app_id": "as16gnyxnnhet86cip8ftw4odw",
+      "cert": {
+        "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFwcF9jZXJ0IiwiaWRlbnRpdHkiOiI5aDVhODF6czR3Zndpb2JhYTU2OGM4cG54cjk4cWY0ZWR0N3VtZ2tqdzZocmtpaGI4dW95IiwiYXBwX2lkIjoiYXMxNmdueXhubmhldDg2Y2lwOGZ0dzRvZHciLCJzaWduaW5nX2tleSI6IkowQktpeFVRcmE3MlA5dmtIWUlMUlFPVkd3Nlp1dGVwYVREMDh6RjMzN1EiLCJidW5kbGVfa2V5Ijoic2FOSHRtaEZhSFpxSWZfWW5uLTBtZHRiY2RqYnJwMlZValNHTXlyUjMxSSIsInNjb3BlcyI6WyJwYXkiXSwicGVybWlzc2lvbnMiOlsiY2xhaW1zLnJlYWQiLCJjbGFpbXMud3JpdGUiLCJjb252ZXJzYXRpb24uYWRkIl0sImlzc3VlZF9hdCI6IjIwMjYtMDEtMDFUMDA6MDA6MDAuMDAwWiIsImV4cGlyZXNfYXQiOiIyMDI3LTAxLTAxVDAwOjAwOjAwLjAwMFoifQ",
+        "sig": "BJIlMfw6G2B6RtsnsZhrM3-NqqBJWVC_DhqENUGpDdrkzkib_5nPElXw1WaK0g7EFOTPSDj35-JveNtUz2Z4Dg"
+      },
+      "inbox_permissions": [
+        "claims.read",
+        "claims.write",
+        "conversation.add"
+      ],
+      "registered_receive_key": {
+        "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLnJlY2VpdmVfa2V5IiwiaWRlbnRpdHkiOiI5aDVhODF6czR3Zndpb2JhYTU2OGM4cG54cjk4cWY0ZWR0N3VtZ2tqdzZocmtpaGI4dW95IiwiYXBwX2lkIjoiYXMxNmdueXhubmhldDg2Y2lwOGZ0dzRvZHciLCJuIjowLCJraWQiOiIxSDVveTV6MXpiMCIsIngyNTUxOSI6Im5kMHV3eVhRX3pqWWdueUdWVXN0TUpFYm1TcXc0bjlxeVB0SWl5cEFJblUifQ",
+        "sig": "O-bpyA-ZiiSkYMtbpRKAxkvjC1hO42QSl1_Ie4glEkBklgr2XM6IF0D9Q478FAi0JDJXCjoz_3zLJ-mHpjWgAg"
+      },
+      "registered_record": {
+        "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFwcCIsImlkZW50aXR5IjoiOWg1YTgxenM0d2Z3aW9iYWE1NjhjOHBueHI5OHFmNGVkdDd1bWdranc2aHJraWhiOHVveSIsImFwcF9pZCI6ImFzMTZnbnl4bm5oZXQ4NmNpcDhmdHc0b2R3Iiwic2lnbmluZ19rZXkiOiJKMEJLaXhVUXJhNzJQOXZrSFlJTFJRT1ZHdzZadXRlcGFURDA4ekYzMzdRIiwiY2VydCI6eyJib2R5IjoiZXlKMklqb3hMQ0pyYVc1a0lqb2ljSFZpYTNrdGMzZHBkR05vTG1Gd2NGOWpaWEowSWl3aWFXUmxiblJwZEhraU9pSTVhRFZoT0RGNmN6UjNabmRwYjJKaFlUVTJPR000Y0c1NGNqazRjV1kwWldSME4zVnRaMnRxZHpab2NtdHBhR0k0ZFc5NUlpd2lZWEJ3WDJsa0lqb2lZWE14Tm1kdWVYaHVibWhsZERnMlkybHdPR1owZHpSdlpIY2lMQ0p6YVdkdWFXNW5YMnRsZVNJNklrb3dRa3RwZUZWUmNtRTNNbEE1ZG10SVdVbE1VbEZQVmtkM05scDFkR1Z3WVZSRU1EaDZSak16TjFFaUxDSmlkVzVrYkdWZmEyVjVJam9pYzJGT1NIUnRhRVpoU0ZweFNXWmZXVzV1TFRCdFpIUmlZMlJxWW5Kd01sWlZhbE5IVFhseVVqTXhTU0lzSW5OamIzQmxjeUk2V3lKd1lYa2lYU3dpY0dWeWJXbHpjMmx2Ym5NaU9sc2lZMnhoYVcxekxuSmxZV1FpTENKamJHRnBiWE11ZDNKcGRHVWlMQ0pqYjI1MlpYSnpZWFJwYjI0dVlXUmtJbDBzSW1semMzVmxaRjloZENJNklqSXdNall0TURFdE1ERlVNREE2TURBNk1EQXVNREF3V2lJc0ltVjRjR2x5WlhOZllYUWlPaUl5TURJM0xUQXhMVEF4VkRBd09qQXdPakF3TGpBd01Gb2lmUSIsInNpZyI6IkJKSWxNZnc2RzJCNlJ0c25zWmhyTTMtTnFxQkpXVkNfRGhxRU5VR3BEZHJremtpYl81blBFbFh3MVdhSzBnN0VGT1RQU0RqMzUtSnZlTnRVejJaNERnIn0sImFjY2VwdHMiOltdLCJjYXBhYmlsaXRpZXMiOnsiZW5kcG9pbnRfaWRlbnRpZmllcnMiOltdfSwicHVibGljX2VuZHBvaW50cyI6e30sImxhYmVsIjpudWxsLCJ1cGRhdGVkX2F0IjoiMjAyNi0wMS0wMVQwMDowMDowMC4wMDBaIiwiZXhwaXJlc19hdCI6bnVsbH0",
+        "sig": "akTdneCOfJItd6Vny_Zh5_Aqty1AKzlwsRpmlmlUBc3xB3S4os6mXSZyw1JI-TPTAIXNvwCTo0-bKgZPsGkGDA"
+      },
+      "scopes": [
+        "pay"
+      ],
+      "signing_seed_label": "claims/B/signing"
+    },
+    "C": {
+      "app_id": "ffam9rpra19mg8xt3fnohugbeo",
+      "cert": {
+        "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFwcF9jZXJ0IiwiaWRlbnRpdHkiOiI5aDVhODF6czR3Zndpb2JhYTU2OGM4cG54cjk4cWY0ZWR0N3VtZ2tqdzZocmtpaGI4dW95IiwiYXBwX2lkIjoiZmZhbTlycHJhMTltZzh4dDNmbm9odWdiZW8iLCJzaWduaW5nX2tleSI6Ik1uamVJRUpUN0E0cEsybE1kSklIVXJUNGVfZVpXaHpwNkRuSUFzNjI2Z3MiLCJidW5kbGVfa2V5IjoiWFB3VGItUC1uTTR1bDZzcFVLR01LWXE4UmFjRzc3WUt4SGEybFBLMGlFZyIsInNjb3BlcyI6WyJwYXkiXSwicGVybWlzc2lvbnMiOlsiY2xhaW1zLnJlYWQiLCJjbGFpbXMud3JpdGUiLCJjb252ZXJzYXRpb24uYWRkIl0sImlzc3VlZF9hdCI6IjIwMjYtMDEtMDFUMDA6MDA6MDAuMDAwWiIsImV4cGlyZXNfYXQiOiIyMDI3LTAxLTAxVDAwOjAwOjAwLjAwMFoifQ",
+        "sig": "5Mtwmom65paiZLvuqGYy9izEXEFEyrOELkFCOYd_Zds7k-VTiLf5AYF4NKKAgaf6Ujpjm0quxmrRSFuDd7F8Cw"
+      },
+      "inbox_permissions": [
+        "claims.read",
+        "claims.write",
+        "conversation.add"
+      ],
+      "registered_receive_key": {
+        "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLnJlY2VpdmVfa2V5IiwiaWRlbnRpdHkiOiI5aDVhODF6czR3Zndpb2JhYTU2OGM4cG54cjk4cWY0ZWR0N3VtZ2tqdzZocmtpaGI4dW95IiwiYXBwX2lkIjoiZmZhbTlycHJhMTltZzh4dDNmbm9odWdiZW8iLCJuIjowLCJraWQiOiJuT05mMWtLeDV2MCIsIngyNTUxOSI6IjZWbXN5UXQxeEV1STRHNHU3bV9aeUV5U05jMV92NGlrLTZCSXZwbEEtUWMifQ",
+        "sig": "BQJ6Mu2vMukEAcWfjrx0cPIXRWOvIo3OlCAuFCh2tn8Cer6fbA5PS5ZBVQQrEEuclnZf8jDx9X6Vg0PGnH5aDQ"
+      },
+      "registered_record": {
+        "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFwcCIsImlkZW50aXR5IjoiOWg1YTgxenM0d2Z3aW9iYWE1NjhjOHBueHI5OHFmNGVkdDd1bWdranc2aHJraWhiOHVveSIsImFwcF9pZCI6ImZmYW05cnByYTE5bWc4eHQzZm5vaHVnYmVvIiwic2lnbmluZ19rZXkiOiJNbmplSUVKVDdBNHBLMmxNZEpJSFVyVDRlX2VaV2h6cDZEbklBczYyNmdzIiwiY2VydCI6eyJib2R5IjoiZXlKMklqb3hMQ0pyYVc1a0lqb2ljSFZpYTNrdGMzZHBkR05vTG1Gd2NGOWpaWEowSWl3aWFXUmxiblJwZEhraU9pSTVhRFZoT0RGNmN6UjNabmRwYjJKaFlUVTJPR000Y0c1NGNqazRjV1kwWldSME4zVnRaMnRxZHpab2NtdHBhR0k0ZFc5NUlpd2lZWEJ3WDJsa0lqb2labVpoYlRseWNISmhNVGx0WnpoNGRETm1ibTlvZFdkaVpXOGlMQ0p6YVdkdWFXNW5YMnRsZVNJNklrMXVhbVZKUlVwVU4wRTBjRXN5YkUxa1NrbElWWEpVTkdWZlpWcFhhSHB3TmtSdVNVRnpOakkyWjNNaUxDSmlkVzVrYkdWZmEyVjVJam9pV0ZCM1ZHSXRVQzF1VFRSMWJEWnpjRlZMUjAxTFdYRTRVbUZqUnpjM1dVdDRTR0V5YkZCTE1HbEZaeUlzSW5OamIzQmxjeUk2V3lKd1lYa2lYU3dpY0dWeWJXbHpjMmx2Ym5NaU9sc2lZMnhoYVcxekxuSmxZV1FpTENKamJHRnBiWE11ZDNKcGRHVWlMQ0pqYjI1MlpYSnpZWFJwYjI0dVlXUmtJbDBzSW1semMzVmxaRjloZENJNklqSXdNall0TURFdE1ERlVNREE2TURBNk1EQXVNREF3V2lJc0ltVjRjR2x5WlhOZllYUWlPaUl5TURJM0xUQXhMVEF4VkRBd09qQXdPakF3TGpBd01Gb2lmUSIsInNpZyI6IjVNdHdtb202NXBhaVpMdnVxR1l5OWl6RVhFRkV5ck9FTGtGQ09ZZF9aZHM3ay1WVGlMZjVBWUY0TktLQWdhZjZVanBqbTBxdXhtclJTRnVEZDdGOEN3In0sImFjY2VwdHMiOltdLCJjYXBhYmlsaXRpZXMiOnsiZW5kcG9pbnRfaWRlbnRpZmllcnMiOltdfSwicHVibGljX2VuZHBvaW50cyI6e30sImxhYmVsIjpudWxsLCJ1cGRhdGVkX2F0IjoiMjAyNi0wMS0wMVQwMDowMDowMC4wMDBaIiwiZXhwaXJlc19hdCI6bnVsbH0",
+        "sig": "tJWHz2bOeHkcq82Ocpls5_fA59d6mEB4IgGfrU1CVb8nimzJMLVkeVcNm8TF8skqLHg1FVSCHhIN0IRBo7U0Bw"
+      },
+      "scopes": [
+        "pay"
+      ],
+      "signing_seed_label": "claims/C/signing"
+    },
+    "D": {
+      "app_id": "ycrn5updcpf7kzuf5exay8kw9r",
+      "cert": {
+        "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFwcF9jZXJ0IiwiaWRlbnRpdHkiOiI5aDVhODF6czR3Zndpb2JhYTU2OGM4cG54cjk4cWY0ZWR0N3VtZ2tqdzZocmtpaGI4dW95IiwiYXBwX2lkIjoieWNybjV1cGRjcGY3a3p1ZjVleGF5OGt3OXIiLCJzaWduaW5nX2tleSI6ImE2UVBhUXBwby04UkRjWlFDbHhTOFJhbE9IaHJXeXVVOXdrMFRWX0dhMkEiLCJidW5kbGVfa2V5IjoibV90TVIyUzl1MzRlY2NqTy1STGVCUGdVV0N1RVN3N3BpVlNRNFZIRlBFMCIsInNjb3BlcyI6WyJwYXkiXSwicGVybWlzc2lvbnMiOlsiY2xhaW1zLnJlYWQiLCJjbGFpbXMud3JpdGUiLCJjb252ZXJzYXRpb24uYWRkIl0sImlzc3VlZF9hdCI6IjIwMjYtMDEtMDFUMDA6MDA6MDAuMDAwWiIsImV4cGlyZXNfYXQiOiIyMDI3LTAxLTAxVDAwOjAwOjAwLjAwMFoifQ",
+        "sig": "74tF66LYzX8T_766Gc60RKWp2g-vNOU_8_WRFbf_0R6jro97zcg8GLeH2M9zTAXCSnXQtoKxu8OCR6N9asL8AA"
+      },
+      "inbox_permissions": [
+        "claims.read",
+        "claims.write",
+        "conversation.add"
+      ],
+      "registered_receive_key": {
+        "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLnJlY2VpdmVfa2V5IiwiaWRlbnRpdHkiOiI5aDVhODF6czR3Zndpb2JhYTU2OGM4cG54cjk4cWY0ZWR0N3VtZ2tqdzZocmtpaGI4dW95IiwiYXBwX2lkIjoieWNybjV1cGRjcGY3a3p1ZjVleGF5OGt3OXIiLCJuIjowLCJraWQiOiJkVUhrYmgzN2d5MCIsIngyNTUxOSI6IkRJdUNRbkR4RTFPZzNGUHdQQnBwX2lyV2o1dzdWMkxlRUw0VGtJWGx4V00ifQ",
+        "sig": "11MSJyKQ1JpgLZF-cU2_1jcYZua6jjywQmlFwdcrXxBDK-IwChTSpWnvlXbYAWrh1TffoQ--FkCsawGrIR68CQ"
+      },
+      "registered_record": {
+        "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFwcCIsImlkZW50aXR5IjoiOWg1YTgxenM0d2Z3aW9iYWE1NjhjOHBueHI5OHFmNGVkdDd1bWdranc2aHJraWhiOHVveSIsImFwcF9pZCI6Inljcm41dXBkY3BmN2t6dWY1ZXhheThrdzlyIiwic2lnbmluZ19rZXkiOiJhNlFQYVFwcG8tOFJEY1pRQ2x4UzhSYWxPSGhyV3l1VTl3azBUVl9HYTJBIiwiY2VydCI6eyJib2R5IjoiZXlKMklqb3hMQ0pyYVc1a0lqb2ljSFZpYTNrdGMzZHBkR05vTG1Gd2NGOWpaWEowSWl3aWFXUmxiblJwZEhraU9pSTVhRFZoT0RGNmN6UjNabmRwYjJKaFlUVTJPR000Y0c1NGNqazRjV1kwWldSME4zVnRaMnRxZHpab2NtdHBhR0k0ZFc5NUlpd2lZWEJ3WDJsa0lqb2llV055YmpWMWNHUmpjR1kzYTNwMVpqVmxlR0Y1T0d0M09YSWlMQ0p6YVdkdWFXNW5YMnRsZVNJNkltRTJVVkJoVVhCd2J5MDRVa1JqV2xGRGJIaFRPRkpoYkU5SWFISlhlWFZWT1hkck1GUldYMGRoTWtFaUxDSmlkVzVrYkdWZmEyVjVJam9pYlY5MFRWSXlVemwxTXpSbFkyTnFUeTFTVEdWQ1VHZFZWME4xUlZOM04zQnBWbE5STkZaSVJsQkZNQ0lzSW5OamIzQmxjeUk2V3lKd1lYa2lYU3dpY0dWeWJXbHpjMmx2Ym5NaU9sc2lZMnhoYVcxekxuSmxZV1FpTENKamJHRnBiWE11ZDNKcGRHVWlMQ0pqYjI1MlpYSnpZWFJwYjI0dVlXUmtJbDBzSW1semMzVmxaRjloZENJNklqSXdNall0TURFdE1ERlVNREE2TURBNk1EQXVNREF3V2lJc0ltVjRjR2x5WlhOZllYUWlPaUl5TURJM0xUQXhMVEF4VkRBd09qQXdPakF3TGpBd01Gb2lmUSIsInNpZyI6Ijc0dEY2NkxZelg4VF83NjZHYzYwUktXcDJnLXZOT1VfOF9XUkZiZl8wUjZqcm85N3pjZzhHTGVIMk05elRBWENTblhRdG9LeHU4T0NSNk45YXNMOEFBIn0sImFjY2VwdHMiOltdLCJjYXBhYmlsaXRpZXMiOnsiZW5kcG9pbnRfaWRlbnRpZmllcnMiOltdfSwicHVibGljX2VuZHBvaW50cyI6e30sImxhYmVsIjpudWxsLCJ1cGRhdGVkX2F0IjoiMjAyNi0wMS0wMVQwMDowMDowMC4wMDBaIiwiZXhwaXJlc19hdCI6bnVsbH0",
+        "sig": "7zYSO_5dX2ts22D-WZz9eHkUKNTriiUR7Qi8rMoVWsHK0AWRl3_uiU-55bzvHjzVqmyMIxDkTe5h40WsVStlBg"
+      },
+      "scopes": [
+        "pay"
+      ],
+      "signing_seed_label": "claims/D/signing"
+    },
+    "E": {
+      "app_id": "w7a95z6u16sqzyatm58hkng95r",
+      "cert": {
+        "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFwcF9jZXJ0IiwiaWRlbnRpdHkiOiI5aDVhODF6czR3Zndpb2JhYTU2OGM4cG54cjk4cWY0ZWR0N3VtZ2tqdzZocmtpaGI4dW95IiwiYXBwX2lkIjoidzdhOTV6NnUxNnNxenlhdG01OGhrbmc5NXIiLCJzaWduaW5nX2tleSI6Ikt6SXI0X05vVTRZZ29PbnNYVG9ubEp2XzZFeXRZME16dUpVbUVyTEhJMUkiLCJidW5kbGVfa2V5IjoiNjZtc21BQ3hsTS0yc2puWllaaGZqRDlRZGhVdVR3TEJ5Z0NhTklFQVNEbyIsInNjb3BlcyI6WyJyZXF1ZXN0Il0sInBlcm1pc3Npb25zIjpbImNvbnZlcnNhdGlvbi5hZGQiXSwiaXNzdWVkX2F0IjoiMjAyNi0wMS0wMVQwMDowMDowMC4wMDBaIiwiZXhwaXJlc19hdCI6IjIwMjctMDEtMDFUMDA6MDA6MDAuMDAwWiJ9",
+        "sig": "ONymHuSHgg69W7IKmZi4_Pze5aKdLtf9GavAbjM1ZPFJSPX6qF-TNxxGdUvu-NZZxIv1gfJaK64LysBCqtzfCg"
+      },
+      "inbox_permissions": [
+        "conversation.add"
+      ],
+      "registered_receive_key": {
+        "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLnJlY2VpdmVfa2V5IiwiaWRlbnRpdHkiOiI5aDVhODF6czR3Zndpb2JhYTU2OGM4cG54cjk4cWY0ZWR0N3VtZ2tqdzZocmtpaGI4dW95IiwiYXBwX2lkIjoidzdhOTV6NnUxNnNxenlhdG01OGhrbmc5NXIiLCJuIjowLCJraWQiOiItTDl3SjBUV0l0ZyIsIngyNTUxOSI6IlNwWUJGWmpVUXl3dm40Smc3QU1RVjRLZ1lvQkNaNTQ5OUFOTWZWR1oxeXMifQ",
+        "sig": "wr9MkGUsbNChDLLt2gMGGQic1pnOY9fjUh_CS2XVKswhsuEKbof0OoHiDCvxxJXL13bo7mii2zy6MQ_8Mt3qCA"
+      },
+      "registered_record": {
+        "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFwcCIsImlkZW50aXR5IjoiOWg1YTgxenM0d2Z3aW9iYWE1NjhjOHBueHI5OHFmNGVkdDd1bWdranc2aHJraWhiOHVveSIsImFwcF9pZCI6Inc3YTk1ejZ1MTZzcXp5YXRtNThoa25nOTVyIiwic2lnbmluZ19rZXkiOiJLeklyNF9Ob1U0WWdvT25zWFRvbmxKdl82RXl0WTBNenVKVW1FckxISTFJIiwiY2VydCI6eyJib2R5IjoiZXlKMklqb3hMQ0pyYVc1a0lqb2ljSFZpYTNrdGMzZHBkR05vTG1Gd2NGOWpaWEowSWl3aWFXUmxiblJwZEhraU9pSTVhRFZoT0RGNmN6UjNabmRwYjJKaFlUVTJPR000Y0c1NGNqazRjV1kwWldSME4zVnRaMnRxZHpab2NtdHBhR0k0ZFc5NUlpd2lZWEJ3WDJsa0lqb2lkemRoT1RWNk5uVXhObk54ZW5saGRHMDFPR2hyYm1jNU5YSWlMQ0p6YVdkdWFXNW5YMnRsZVNJNklrdDZTWEkwWDA1dlZUUlpaMjlQYm5OWVZHOXViRXAyWHpaRmVYUlpNRTE2ZFVwVmJVVnlURWhKTVVraUxDSmlkVzVrYkdWZmEyVjVJam9pTmpadGMyMUJRM2hzVFMweWMycHVXbGxhYUdacVJEbFJaR2hWZFZSM1RFSjVaME5oVGtsRlFWTkVieUlzSW5OamIzQmxjeUk2V3lKeVpYRjFaWE4wSWwwc0luQmxjbTFwYzNOcGIyNXpJanBiSW1OdmJuWmxjbk5oZEdsdmJpNWhaR1FpWFN3aWFYTnpkV1ZrWDJGMElqb2lNakF5Tmkwd01TMHdNVlF3TURvd01Eb3dNQzR3TURCYUlpd2laWGh3YVhKbGMxOWhkQ0k2SWpJd01qY3RNREV0TURGVU1EQTZNREE2TURBdU1EQXdXaUo5Iiwic2lnIjoiT055bUh1U0hnZzY5VzdJS21aaTRfUHplNWFLZEx0ZjlHYXZBYmpNMVpQRkpTUFg2cUYtVE54eEdkVXZ1LU5aWnhJdjFnZkphSzY0THlzQkNxdHpmQ2cifSwiYWNjZXB0cyI6W10sImNhcGFiaWxpdGllcyI6eyJlbmRwb2ludF9pZGVudGlmaWVycyI6W119LCJwdWJsaWNfZW5kcG9pbnRzIjp7fSwibGFiZWwiOm51bGwsInVwZGF0ZWRfYXQiOiIyMDI2LTAxLTAxVDAwOjAwOjAwLjAwMFoiLCJleHBpcmVzX2F0IjpudWxsfQ",
+        "sig": "qeYwwhnc3EEcAZyYmh9WYNKDqsSQmyIki7fffjGADX6ZTgRoHkwzwfTLyg21ztjvLzxni-uCMsBZEGB1D0HTDg"
+      },
+      "scopes": [
+        "request"
+      ],
+      "signing_seed_label": "claims/E/signing"
+    }
+  },
+  "attempts": {
+    "a1": "P5BA8Wc-dkw7tsS44NbRCA",
+    "b1": "tbIpIEtI-lIxthEYBE5C4w",
+    "b2": "Lb4D0pt6L5EuFkL6svC2RQ",
+    "c1": "cZpoHjmYg6xH4OO9BazdUA",
+    "c2": "DJm7yWaTOr8QwPWyrsdlZA",
+    "c3": "DwipFawQ_JDPIGKSt9AHdQ",
+    "d1": "leqhzC91t3BEHkxcl8jbKQ",
+    "e1": "O11V8xENELT2pykACwQt6Q"
+  },
+  "claim_keys": {
+    "O1": "r3hVWvQ_jCA4JnmUImMGWYC-S5g-Hzsp3rPsDieDAfI",
+    "O10": "3Qe0BfHFOMaYpLs8RVpLsL0QsaiI9YC-wmP-NTfMXiM",
+    "O11": "u_d7bG8QmnOE8_DaPdD0LpR1l4_aplJc8ATNxXJ8oqU",
+    "O2": "Cnd1HVB5NaYdaoUiK-scFcYDNxL0R8Zvu7DkB4sNR9o",
+    "O3": "0OYq1Jcg0P-aHeRYyxTclw4f8CBr5BUGehmLaAUh8po",
+    "O4": "aTZUuqUArskwSrePp2Uchq5OJUFPgO9N0DtSCGy7lDY",
+    "O5": "2La00j1kA7Bk5qgYMOnNjoTa5c-ruA8mXgRmgAaJxpE",
+    "O6": "jbHkEZTguTFL6RVJ9kiUTr5SsdXiS5v1qizrnr9LkWI",
+    "O7": "YpZzhtmFGmMcRJzmSThS_qXecYqdz5cX_-cPpRpZOJg",
+    "O8": "gVttCo7ryXGoiZrLipQDDS7hq8AkcVpMW-vcNPa0rb4",
+    "O9": "G9HlYIf20i1bYvfzMJfGuR64Tmet5JSHtp110S8QWF4"
+  },
+  "description": "A scripted sequence of claim entries through every row of the claim rules (wire 6.8, spec 10.2), run on the prototype Pubky Switch. Every write is one batch with one claim operation; after a successful write the expected state is GET /claims/{claim_key} as app A sees it (404 once a tombstone or a failed claim is deleted, when the service clock reaches its pinned deadline plus the 30-day reconciliation window). Failed writes show the error status, code and current. The account is identity (its key from the seed label identity_seed_label), enrolled at start_time and given its identity.json (version 1, generation 1, data epoch 1, listing apps A to E with the hashes of their certs, and naming the service key the switch drew at random, so it isn't given here); each app then registered, in one batch with batch ID seed claims/register/<name>, its registered_record and registered_receive_key, under its cert. A noop_batch step (wire 6.4) sends request_body, a batch of one unchanged app.put of the record the app registered, conditioned on claim O11's step when condition_step is set, with cursor.set to cursor_position when cursor is true; its expect is the status and the number of proofs, or the error. An app_put step (wire 6.2) sends request_body, a batch of one app.put of record: with variant held the record the app registered, with variant equal_time that record with its updated_at and another label, signed by the app; its expect is the status and the number of proofs, or the error. The service clock starts at start_time and moves only with advance steps.",
+  "evidence_refs": {
+    "r1": "PeT3xazOYpSE37brqq0GYq1tr4iIHchktQQV05Zjml0",
+    "r2": "-cRkK6sYuInRpI4TxR_ZCQeFnwXNfFurO0BCLNftS8M"
+  },
+  "identity": "9h5a81zs4wfwiobaa568c8pnxr98qf4edt7umgkjw6hrkihb8uoy",
+  "identity_seed_label": "claims/identity",
+  "quota": {
+    "attempts": {
+      "b4": "_qr5Azl-ynijWfOQ6U8ipA",
+      "q1": "C9_mcjKm7OPy_LixOH4Mdw",
+      "q2": "aDcr2a6c0bRJLw78MpUXjA",
+      "q3": "aBW3g6ej8DUynm21UVfnzQ",
+      "q4": "3qxNoVQLvF1jh0EZo7yWzw"
+    },
+    "claim_keys": {
+      "Q1": "WIaBzsoTjF0Q2ihezOq8ZDofPrzBlIUoXLVdfl4An3U",
+      "Q2": "Zd-DNFvT2JDx2gbxN-qV6Y0dSIU0BZy-VE8ot5514Dw",
+      "Q3": "calYETedWEZMaDJSVFzrqCzZilcapLekCKCEd7mcH7I",
+      "Q4": "0Z1SBbLXUsG-pqwDl1gqFMPgWyTcYpUdfkGxHO-K-B0"
+    },
+    "description": "Wire 9.3: the per-app claim limits, on a switch of its own set up as the main sequence's (the same identity, apps and registrations) but with max_claims 12 and open_attempts_per_app 2, so one app's claims, live and tombstones, hold at most 3 (claim_share_percent 25). Each write is one batch with one claim entry; after a successful write the expected state is GET /claims/{claim_key} as the writer sees it, and a refused one shows the error. Batch ID seeds are claims/quota/batch/<n - 1>.",
+    "limits": {
+      "claim_share_percent": 25,
+      "max_claims": 12,
+      "open_attempts_per_app": 2
+    },
+    "steps": [
+      {
+        "action": "write",
+        "app": "A",
+        "claim_key": "Q1",
+        "entry": {
+          "attempt": "q1",
+          "expected_step": 0,
+          "orphan_after": 3600,
+          "type": "attempt"
+        },
+        "expect": {
+          "claim": {
+            "attempt_id": "C9_mcjKm7OPy_LixOH4Mdw",
+            "attempts": [
+              {
+                "attempt_id": "C9_mcjKm7OPy_LixOH4Mdw",
+                "duplicate": false,
+                "opened_at": "2026-01-01T00:00:00.000Z",
+                "orphan_after": 3600,
+                "orphaned": false,
+                "outcome": "open",
+                "owner": "rbedjtmm6qhfpx3ejngdkjeprr",
+                "possibly_duplicate": false
+              }
+            ],
+            "claim_key": "WIaBzsoTjF0Q2ihezOq8ZDofPrzBlIUoXLVdfl4An3U",
+            "divergent": false,
+            "next_possibly_duplicate": false,
+            "owner": "rbedjtmm6qhfpx3ejngdkjeprr",
+            "state": "ATTEMPTING",
+            "step": 1,
+            "tombstone": false
+          },
+          "status": 200
+        },
+        "n": 1,
+        "note": "A's first claim: ATTEMPTING(A, q1)",
+        "op": {
+          "attempt_id": "C9_mcjKm7OPy_LixOH4Mdw",
+          "claim_key": "WIaBzsoTjF0Q2ihezOq8ZDofPrzBlIUoXLVdfl4An3U",
+          "expected_step": 0,
+          "orphan_after": 3600,
+          "type": "attempt"
+        },
+        "row": "1"
+      },
+      {
+        "action": "write",
+        "app": "A",
+        "claim_key": "Q2",
+        "entry": {
+          "attempt": "q2",
+          "expected_step": 0,
+          "orphan_after": 3600,
+          "type": "attempt"
+        },
+        "expect": {
+          "claim": {
+            "attempt_id": "aDcr2a6c0bRJLw78MpUXjA",
+            "attempts": [
+              {
+                "attempt_id": "aDcr2a6c0bRJLw78MpUXjA",
+                "duplicate": false,
+                "opened_at": "2026-01-01T00:00:00.000Z",
+                "orphan_after": 3600,
+                "orphaned": false,
+                "outcome": "open",
+                "owner": "rbedjtmm6qhfpx3ejngdkjeprr",
+                "possibly_duplicate": false
+              }
+            ],
+            "claim_key": "Zd-DNFvT2JDx2gbxN-qV6Y0dSIU0BZy-VE8ot5514Dw",
+            "divergent": false,
+            "next_possibly_duplicate": false,
+            "owner": "rbedjtmm6qhfpx3ejngdkjeprr",
+            "state": "ATTEMPTING",
+            "step": 1,
+            "tombstone": false
+          },
+          "status": 200
+        },
+        "n": 2,
+        "note": "A's second claim: A holds 2 attempts open",
+        "op": {
+          "attempt_id": "aDcr2a6c0bRJLw78MpUXjA",
+          "claim_key": "Zd-DNFvT2JDx2gbxN-qV6Y0dSIU0BZy-VE8ot5514Dw",
+          "expected_step": 0,
+          "orphan_after": 3600,
+          "type": "attempt"
+        },
+        "row": "1"
+      },
+      {
+        "action": "write",
+        "app": "A",
+        "claim_key": "Q3",
+        "entry": {
+          "attempt": "q3",
+          "expected_step": 0,
+          "orphan_after": 3600,
+          "type": "attempt"
+        },
+        "expect": {
+          "code": "quota_exceeded",
+          "current": {
+            "limit": "open_attempts"
+          },
+          "status": 429
+        },
+        "n": 3,
+        "note": "a third open attempt of A: 429 quota_exceeded, open_attempts",
+        "op": {
+          "attempt_id": "aBW3g6ej8DUynm21UVfnzQ",
+          "claim_key": "calYETedWEZMaDJSVFzrqCzZilcapLekCKCEd7mcH7I",
+          "expected_step": 0,
+          "orphan_after": 3600,
+          "type": "attempt"
+        },
+        "row": "-"
+      },
+      {
+        "action": "write",
+        "app": "A",
+        "claim_key": "Q1",
+        "entry": {
+          "attempt": "q1",
+          "basis": "owner",
+          "expected_step": 1,
+          "type": "done"
+        },
+        "expect": {
+          "claim": {
+            "attempts": [
+              {
+                "attempt_id": "C9_mcjKm7OPy_LixOH4Mdw",
+                "duplicate": false,
+                "opened_at": "2026-01-01T00:00:00.000Z",
+                "orphan_after": 3600,
+                "orphaned": false,
+                "outcome": "done",
+                "owner": "rbedjtmm6qhfpx3ejngdkjeprr",
+                "possibly_duplicate": false,
+                "resolved_by": "rbedjtmm6qhfpx3ejngdkjeprr"
+              }
+            ],
+            "claim_key": "WIaBzsoTjF0Q2ihezOq8ZDofPrzBlIUoXLVdfl4An3U",
+            "divergent": false,
+            "next_possibly_duplicate": false,
+            "state": "SETTLED",
+            "step": 2,
+            "tombstone": true
+          },
+          "status": 200
+        },
+        "n": 4,
+        "note": "A finishes q1: a tombstone, 1 attempt open",
+        "op": {
+          "attempt_id": "C9_mcjKm7OPy_LixOH4Mdw",
+          "basis": "owner",
+          "claim_key": "WIaBzsoTjF0Q2ihezOq8ZDofPrzBlIUoXLVdfl4An3U",
+          "expected_step": 1,
+          "type": "done"
+        },
+        "row": "2"
+      },
+      {
+        "action": "write",
+        "app": "A",
+        "claim_key": "Q3",
+        "entry": {
+          "attempt": "q3",
+          "expected_step": 0,
+          "orphan_after": 3600,
+          "type": "attempt"
+        },
+        "expect": {
+          "claim": {
+            "attempt_id": "aBW3g6ej8DUynm21UVfnzQ",
+            "attempts": [
+              {
+                "attempt_id": "aBW3g6ej8DUynm21UVfnzQ",
+                "duplicate": false,
+                "opened_at": "2026-01-01T00:00:00.000Z",
+                "orphan_after": 3600,
+                "orphaned": false,
+                "outcome": "open",
+                "owner": "rbedjtmm6qhfpx3ejngdkjeprr",
+                "possibly_duplicate": false
+              }
+            ],
+            "claim_key": "calYETedWEZMaDJSVFzrqCzZilcapLekCKCEd7mcH7I",
+            "divergent": false,
+            "next_possibly_duplicate": false,
+            "owner": "rbedjtmm6qhfpx3ejngdkjeprr",
+            "state": "ATTEMPTING",
+            "step": 1,
+            "tombstone": false
+          },
+          "status": 200
+        },
+        "n": 5,
+        "note": "A's third claim, its share of 12 * 25 / 100",
+        "op": {
+          "attempt_id": "aBW3g6ej8DUynm21UVfnzQ",
+          "claim_key": "calYETedWEZMaDJSVFzrqCzZilcapLekCKCEd7mcH7I",
+          "expected_step": 0,
+          "orphan_after": 3600,
+          "type": "attempt"
+        },
+        "row": "1"
+      },
+      {
+        "action": "write",
+        "app": "A",
+        "claim_key": "Q2",
+        "entry": {
+          "attempt": "q2",
+          "basis": "owner",
+          "expected_step": 1,
+          "type": "done"
+        },
+        "expect": {
+          "claim": {
+            "attempts": [
+              {
+                "attempt_id": "aDcr2a6c0bRJLw78MpUXjA",
+                "duplicate": false,
+                "opened_at": "2026-01-01T00:00:00.000Z",
+                "orphan_after": 3600,
+                "orphaned": false,
+                "outcome": "done",
+                "owner": "rbedjtmm6qhfpx3ejngdkjeprr",
+                "possibly_duplicate": false,
+                "resolved_by": "rbedjtmm6qhfpx3ejngdkjeprr"
+              }
+            ],
+            "claim_key": "Zd-DNFvT2JDx2gbxN-qV6Y0dSIU0BZy-VE8ot5514Dw",
+            "divergent": false,
+            "next_possibly_duplicate": false,
+            "state": "SETTLED",
+            "step": 2,
+            "tombstone": true
+          },
+          "status": 200
+        },
+        "n": 6,
+        "note": "A finishes q2: 1 attempt open",
+        "op": {
+          "attempt_id": "aDcr2a6c0bRJLw78MpUXjA",
+          "basis": "owner",
+          "claim_key": "Zd-DNFvT2JDx2gbxN-qV6Y0dSIU0BZy-VE8ot5514Dw",
+          "expected_step": 1,
+          "type": "done"
+        },
+        "row": "2"
+      },
+      {
+        "action": "write",
+        "app": "A",
+        "claim_key": "Q4",
+        "entry": {
+          "attempt": "q4",
+          "expected_step": 0,
+          "orphan_after": 3600,
+          "type": "attempt"
+        },
+        "expect": {
+          "code": "quota_exceeded",
+          "current": {
+            "limit": "claim_share"
+          },
+          "status": 429
+        },
+        "n": 7,
+        "note": "a fourth claim created by A: 429 quota_exceeded, claim_share",
+        "op": {
+          "attempt_id": "3qxNoVQLvF1jh0EZo7yWzw",
+          "claim_key": "0Z1SBbLXUsG-pqwDl1gqFMPgWyTcYpUdfkGxHO-K-B0",
+          "expected_step": 0,
+          "orphan_after": 3600,
+          "type": "attempt"
+        },
+        "row": "-"
+      },
+      {
+        "action": "write",
+        "app": "B",
+        "claim_key": "Q4",
+        "entry": {
+          "attempt": "b4",
+          "expected_step": 0,
+          "orphan_after": 3600,
+          "type": "attempt"
+        },
+        "expect": {
+          "claim": {
+            "attempt_id": "_qr5Azl-ynijWfOQ6U8ipA",
+            "attempts": [
+              {
+                "attempt_id": "_qr5Azl-ynijWfOQ6U8ipA",
+                "duplicate": false,
+                "opened_at": "2026-01-01T00:00:00.000Z",
+                "orphan_after": 3600,
+                "orphaned": false,
+                "outcome": "open",
+                "owner": "as16gnyxnnhet86cip8ftw4odw",
+                "possibly_duplicate": false
+              }
+            ],
+            "claim_key": "0Z1SBbLXUsG-pqwDl1gqFMPgWyTcYpUdfkGxHO-K-B0",
+            "divergent": false,
+            "next_possibly_duplicate": false,
+            "owner": "as16gnyxnnhet86cip8ftw4odw",
+            "state": "ATTEMPTING",
+            "step": 1,
+            "tombstone": false
+          },
+          "status": 200
+        },
+        "n": 8,
+        "note": "the same claim created by B, whose share has room",
+        "op": {
+          "attempt_id": "_qr5Azl-ynijWfOQ6U8ipA",
+          "claim_key": "0Z1SBbLXUsG-pqwDl1gqFMPgWyTcYpUdfkGxHO-K-B0",
+          "expected_step": 0,
+          "orphan_after": 3600,
+          "type": "attempt"
+        },
+        "row": "1"
+      }
+    ]
+  },
+  "start_time": "2026-01-01T00:00:00.000Z",
+  "steps": [
+    {
+      "action": "write",
+      "app": "A",
+      "claim_key": "O1",
+      "entry": {
+        "attempt": "a1",
+        "expected_step": 0,
+        "orphan_after": 3600,
+        "type": "attempt"
+      },
+      "expect": {
+        "claim": {
+          "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+          "attempts": [
+            {
+              "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+              "duplicate": false,
+              "opened_at": "2026-01-01T00:00:00.000Z",
+              "orphan_after": 3600,
+              "orphaned": false,
+              "outcome": "open",
+              "owner": "rbedjtmm6qhfpx3ejngdkjeprr",
+              "possibly_duplicate": false
+            }
+          ],
+          "claim_key": "r3hVWvQ_jCA4JnmUImMGWYC-S5g-Hzsp3rPsDieDAfI",
+          "divergent": false,
+          "next_possibly_duplicate": false,
+          "owner": "rbedjtmm6qhfpx3ejngdkjeprr",
+          "state": "ATTEMPTING",
+          "step": 1,
+          "tombstone": false
+        },
+        "status": 200
+      },
+      "n": 1,
+      "note": "FREE + attempt: ATTEMPTING(A, a1)",
+      "op": {
+        "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+        "claim_key": "r3hVWvQ_jCA4JnmUImMGWYC-S5g-Hzsp3rPsDieDAfI",
+        "expected_step": 0,
+        "orphan_after": 3600,
+        "type": "attempt"
+      },
+      "row": "1"
+    },
+    {
+      "action": "write",
+      "app": "B",
+      "claim_key": "O1",
+      "entry": {
+        "attempt": "b1",
+        "expected_step": 1,
+        "orphan_after": 3600,
+        "type": "attempt"
+      },
+      "expect": {
+        "code": "conflict",
+        "current": {
+          "claim": {
+            "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+            "attempts": [
+              {
+                "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+                "duplicate": false,
+                "opened_at": "2026-01-01T00:00:00.000Z",
+                "orphan_after": 3600,
+                "orphaned": false,
+                "outcome": "open",
+                "owner": "rbedjtmm6qhfpx3ejngdkjeprr",
+                "possibly_duplicate": false
+              }
+            ],
+            "claim_key": "r3hVWvQ_jCA4JnmUImMGWYC-S5g-Hzsp3rPsDieDAfI",
+            "divergent": false,
+            "next_possibly_duplicate": false,
+            "owner": "rbedjtmm6qhfpx3ejngdkjeprr",
+            "state": "ATTEMPTING",
+            "step": 1,
+            "tombstone": false
+          }
+        },
+        "status": 409
+      },
+      "n": 2,
+      "note": "a second wallet while a1 is open: conflict",
+      "op": {
+        "attempt_id": "tbIpIEtI-lIxthEYBE5C4w",
+        "claim_key": "r3hVWvQ_jCA4JnmUImMGWYC-S5g-Hzsp3rPsDieDAfI",
+        "expected_step": 1,
+        "orphan_after": 3600,
+        "type": "attempt"
+      },
+      "row": "1"
+    },
+    {
+      "action": "write",
+      "app": "B",
+      "claim_key": "O1",
+      "entry": {
+        "attempt": "a1",
+        "basis": "owner",
+        "expected_step": 1,
+        "type": "done"
+      },
+      "expect": {
+        "code": "conflict",
+        "current": {
+          "claim": {
+            "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+            "attempts": [
+              {
+                "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+                "duplicate": false,
+                "opened_at": "2026-01-01T00:00:00.000Z",
+                "orphan_after": 3600,
+                "orphaned": false,
+                "outcome": "open",
+                "owner": "rbedjtmm6qhfpx3ejngdkjeprr",
+                "possibly_duplicate": false
+              }
+            ],
+            "claim_key": "r3hVWvQ_jCA4JnmUImMGWYC-S5g-Hzsp3rPsDieDAfI",
+            "divergent": false,
+            "next_possibly_duplicate": false,
+            "owner": "rbedjtmm6qhfpx3ejngdkjeprr",
+            "state": "ATTEMPTING",
+            "step": 1,
+            "tombstone": false
+          }
+        },
+        "status": 409
+      },
+      "n": 3,
+      "note": "basis owner from another app: conflict",
+      "op": {
+        "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+        "basis": "owner",
+        "claim_key": "r3hVWvQ_jCA4JnmUImMGWYC-S5g-Hzsp3rPsDieDAfI",
+        "expected_step": 1,
+        "type": "done"
+      },
+      "row": "2"
+    },
+    {
+      "action": "write",
+      "app": "A",
+      "claim_key": "O1",
+      "entry": {
+        "attempt": "a1",
+        "basis": "owner",
+        "expected_step": 0,
+        "type": "done"
+      },
+      "expect": {
+        "code": "conflict",
+        "current": {
+          "claim": {
+            "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+            "attempts": [
+              {
+                "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+                "duplicate": false,
+                "opened_at": "2026-01-01T00:00:00.000Z",
+                "orphan_after": 3600,
+                "orphaned": false,
+                "outcome": "open",
+                "owner": "rbedjtmm6qhfpx3ejngdkjeprr",
+                "possibly_duplicate": false
+              }
+            ],
+            "claim_key": "r3hVWvQ_jCA4JnmUImMGWYC-S5g-Hzsp3rPsDieDAfI",
+            "divergent": false,
+            "next_possibly_duplicate": false,
+            "owner": "rbedjtmm6qhfpx3ejngdkjeprr",
+            "state": "ATTEMPTING",
+            "step": 1,
+            "tombstone": false
+          }
+        },
+        "status": 409
+      },
+      "n": 4,
+      "note": "stale expected_step: conflict",
+      "op": {
+        "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+        "basis": "owner",
+        "claim_key": "r3hVWvQ_jCA4JnmUImMGWYC-S5g-Hzsp3rPsDieDAfI",
+        "expected_step": 0,
+        "type": "done"
+      },
+      "row": "-"
+    },
+    {
+      "action": "write",
+      "app": "A",
+      "claim_key": "O1",
+      "entry": {
+        "attempt": "a1",
+        "basis": "owner",
+        "expected_step": 1,
+        "type": "done"
+      },
+      "expect": {
+        "claim": {
+          "attempts": [
+            {
+              "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+              "duplicate": false,
+              "opened_at": "2026-01-01T00:00:00.000Z",
+              "orphan_after": 3600,
+              "orphaned": false,
+              "outcome": "done",
+              "owner": "rbedjtmm6qhfpx3ejngdkjeprr",
+              "possibly_duplicate": false,
+              "resolved_by": "rbedjtmm6qhfpx3ejngdkjeprr"
+            }
+          ],
+          "claim_key": "r3hVWvQ_jCA4JnmUImMGWYC-S5g-Hzsp3rPsDieDAfI",
+          "divergent": false,
+          "next_possibly_duplicate": false,
+          "state": "SETTLED",
+          "step": 2,
+          "tombstone": true
+        },
+        "status": 200
+      },
+      "n": 5,
+      "note": "owner reports done: SETTLED, compacted to a tombstone",
+      "op": {
+        "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+        "basis": "owner",
+        "claim_key": "r3hVWvQ_jCA4JnmUImMGWYC-S5g-Hzsp3rPsDieDAfI",
+        "expected_step": 1,
+        "type": "done"
+      },
+      "row": "2"
+    },
+    {
+      "action": "write",
+      "app": "B",
+      "claim_key": "O1",
+      "entry": {
+        "attempt": "b2",
+        "expected_step": 2,
+        "orphan_after": 3600,
+        "type": "attempt"
+      },
+      "expect": {
+        "code": "conflict",
+        "current": {
+          "claim": {
+            "attempts": [
+              {
+                "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+                "duplicate": false,
+                "opened_at": "2026-01-01T00:00:00.000Z",
+                "orphan_after": 3600,
+                "orphaned": false,
+                "outcome": "done",
+                "owner": "rbedjtmm6qhfpx3ejngdkjeprr",
+                "possibly_duplicate": false,
+                "resolved_by": "rbedjtmm6qhfpx3ejngdkjeprr"
+              }
+            ],
+            "claim_key": "r3hVWvQ_jCA4JnmUImMGWYC-S5g-Hzsp3rPsDieDAfI",
+            "divergent": false,
+            "next_possibly_duplicate": false,
+            "state": "SETTLED",
+            "step": 2,
+            "tombstone": true
+          }
+        },
+        "status": 409
+      },
+      "n": 6,
+      "note": "SETTLED rejects attempt",
+      "op": {
+        "attempt_id": "Lb4D0pt6L5EuFkL6svC2RQ",
+        "claim_key": "r3hVWvQ_jCA4JnmUImMGWYC-S5g-Hzsp3rPsDieDAfI",
+        "expected_step": 2,
+        "orphan_after": 3600,
+        "type": "attempt"
+      },
+      "row": "7"
+    },
+    {
+      "action": "write",
+      "app": "B",
+      "claim_key": "O1",
+      "entry": {
+        "attempt": "a1",
+        "expected_step": 2,
+        "type": "unknown"
+      },
+      "expect": {
+        "code": "conflict",
+        "current": {
+          "claim": {
+            "attempts": [
+              {
+                "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+                "duplicate": false,
+                "opened_at": "2026-01-01T00:00:00.000Z",
+                "orphan_after": 3600,
+                "orphaned": false,
+                "outcome": "done",
+                "owner": "rbedjtmm6qhfpx3ejngdkjeprr",
+                "possibly_duplicate": false,
+                "resolved_by": "rbedjtmm6qhfpx3ejngdkjeprr"
+              }
+            ],
+            "claim_key": "r3hVWvQ_jCA4JnmUImMGWYC-S5g-Hzsp3rPsDieDAfI",
+            "divergent": false,
+            "next_possibly_duplicate": false,
+            "state": "SETTLED",
+            "step": 2,
+            "tombstone": true
+          }
+        },
+        "status": 409
+      },
+      "n": 7,
+      "note": "SETTLED rejects unknown",
+      "op": {
+        "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+        "claim_key": "r3hVWvQ_jCA4JnmUImMGWYC-S5g-Hzsp3rPsDieDAfI",
+        "expected_step": 2,
+        "type": "unknown"
+      },
+      "row": "7"
+    },
+    {
+      "action": "write",
+      "app": "A",
+      "claim_key": "O1",
+      "entry": {
+        "attempt": "a1",
+        "basis": "owner",
+        "expected_step": 2,
+        "type": "done"
+      },
+      "expect": {
+        "code": "conflict",
+        "current": {
+          "claim": {
+            "attempts": [
+              {
+                "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+                "duplicate": false,
+                "opened_at": "2026-01-01T00:00:00.000Z",
+                "orphan_after": 3600,
+                "orphaned": false,
+                "outcome": "done",
+                "owner": "rbedjtmm6qhfpx3ejngdkjeprr",
+                "possibly_duplicate": false,
+                "resolved_by": "rbedjtmm6qhfpx3ejngdkjeprr"
+              }
+            ],
+            "claim_key": "r3hVWvQ_jCA4JnmUImMGWYC-S5g-Hzsp3rPsDieDAfI",
+            "divergent": false,
+            "next_possibly_duplicate": false,
+            "state": "SETTLED",
+            "step": 2,
+            "tombstone": true
+          }
+        },
+        "status": 409
+      },
+      "n": 8,
+      "note": "a repeated done changes nothing: conflict",
+      "op": {
+        "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+        "basis": "owner",
+        "claim_key": "r3hVWvQ_jCA4JnmUImMGWYC-S5g-Hzsp3rPsDieDAfI",
+        "expected_step": 2,
+        "type": "done"
+      },
+      "row": "2"
+    },
+    {
+      "action": "write",
+      "app": "A",
+      "claim_key": "O2",
+      "entry": {
+        "attempt": "a1",
+        "expected_step": 0,
+        "orphan_after": 3600,
+        "type": "attempt"
+      },
+      "expect": {
+        "claim": {
+          "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+          "attempts": [
+            {
+              "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+              "duplicate": false,
+              "opened_at": "2026-01-01T00:00:00.000Z",
+              "orphan_after": 3600,
+              "orphaned": false,
+              "outcome": "open",
+              "owner": "rbedjtmm6qhfpx3ejngdkjeprr",
+              "possibly_duplicate": false
+            }
+          ],
+          "claim_key": "Cnd1HVB5NaYdaoUiK-scFcYDNxL0R8Zvu7DkB4sNR9o",
+          "divergent": false,
+          "next_possibly_duplicate": false,
+          "owner": "rbedjtmm6qhfpx3ejngdkjeprr",
+          "state": "ATTEMPTING",
+          "step": 1,
+          "tombstone": false
+        },
+        "status": 200
+      },
+      "n": 9,
+      "note": "attempt a1",
+      "op": {
+        "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+        "claim_key": "Cnd1HVB5NaYdaoUiK-scFcYDNxL0R8Zvu7DkB4sNR9o",
+        "expected_step": 0,
+        "orphan_after": 3600,
+        "type": "attempt"
+      },
+      "row": "1"
+    },
+    {
+      "action": "write",
+      "app": "A",
+      "claim_key": "O2",
+      "entry": {
+        "attempt": "a1",
+        "expected_step": 1,
+        "type": "failed"
+      },
+      "expect": {
+        "claim": {
+          "attempts": [
+            {
+              "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+              "duplicate": false,
+              "opened_at": "2026-01-01T00:00:00.000Z",
+              "orphan_after": 3600,
+              "orphaned": false,
+              "outcome": "failed",
+              "owner": "rbedjtmm6qhfpx3ejngdkjeprr",
+              "possibly_duplicate": false,
+              "resolved_by": "rbedjtmm6qhfpx3ejngdkjeprr"
+            }
+          ],
+          "claim_key": "Cnd1HVB5NaYdaoUiK-scFcYDNxL0R8Zvu7DkB4sNR9o",
+          "divergent": false,
+          "next_possibly_duplicate": false,
+          "state": "FREE",
+          "step": 2,
+          "tombstone": false
+        },
+        "status": 200
+      },
+      "n": 10,
+      "note": "owner reports failed: FREE",
+      "op": {
+        "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+        "claim_key": "Cnd1HVB5NaYdaoUiK-scFcYDNxL0R8Zvu7DkB4sNR9o",
+        "expected_step": 1,
+        "type": "failed"
+      },
+      "row": "5"
+    },
+    {
+      "action": "write",
+      "app": "B",
+      "claim_key": "O2",
+      "entry": {
+        "attempt": "b1",
+        "expected_step": 2,
+        "orphan_after": 3600,
+        "type": "attempt"
+      },
+      "expect": {
+        "claim": {
+          "attempt_id": "tbIpIEtI-lIxthEYBE5C4w",
+          "attempts": [
+            {
+              "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+              "duplicate": false,
+              "opened_at": "2026-01-01T00:00:00.000Z",
+              "orphan_after": 3600,
+              "orphaned": false,
+              "outcome": "failed",
+              "owner": "rbedjtmm6qhfpx3ejngdkjeprr",
+              "possibly_duplicate": false,
+              "resolved_by": "rbedjtmm6qhfpx3ejngdkjeprr"
+            },
+            {
+              "attempt_id": "tbIpIEtI-lIxthEYBE5C4w",
+              "duplicate": false,
+              "opened_at": "2026-01-01T00:00:00.000Z",
+              "orphan_after": 3600,
+              "orphaned": false,
+              "outcome": "open",
+              "owner": "as16gnyxnnhet86cip8ftw4odw",
+              "possibly_duplicate": false
+            }
+          ],
+          "claim_key": "Cnd1HVB5NaYdaoUiK-scFcYDNxL0R8Zvu7DkB4sNR9o",
+          "divergent": false,
+          "next_possibly_duplicate": false,
+          "owner": "as16gnyxnnhet86cip8ftw4odw",
+          "state": "ATTEMPTING",
+          "step": 3,
+          "tombstone": false
+        },
+        "status": 200
+      },
+      "n": 11,
+      "note": "attempt b1",
+      "op": {
+        "attempt_id": "tbIpIEtI-lIxthEYBE5C4w",
+        "claim_key": "Cnd1HVB5NaYdaoUiK-scFcYDNxL0R8Zvu7DkB4sNR9o",
+        "expected_step": 2,
+        "orphan_after": 3600,
+        "type": "attempt"
+      },
+      "row": "1"
+    },
+    {
+      "action": "write",
+      "app": "B",
+      "claim_key": "O2",
+      "entry": {
+        "attempt": "b1",
+        "basis": "owner",
+        "expected_step": 3,
+        "type": "done"
+      },
+      "expect": {
+        "claim": {
+          "attempts": [
+            {
+              "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+              "duplicate": false,
+              "opened_at": "2026-01-01T00:00:00.000Z",
+              "orphan_after": 3600,
+              "orphaned": false,
+              "outcome": "failed",
+              "owner": "rbedjtmm6qhfpx3ejngdkjeprr",
+              "possibly_duplicate": false,
+              "resolved_by": "rbedjtmm6qhfpx3ejngdkjeprr"
+            },
+            {
+              "attempt_id": "tbIpIEtI-lIxthEYBE5C4w",
+              "duplicate": false,
+              "opened_at": "2026-01-01T00:00:00.000Z",
+              "orphan_after": 3600,
+              "orphaned": false,
+              "outcome": "done",
+              "owner": "as16gnyxnnhet86cip8ftw4odw",
+              "possibly_duplicate": false,
+              "resolved_by": "as16gnyxnnhet86cip8ftw4odw"
+            }
+          ],
+          "claim_key": "Cnd1HVB5NaYdaoUiK-scFcYDNxL0R8Zvu7DkB4sNR9o",
+          "divergent": false,
+          "next_possibly_duplicate": false,
+          "state": "SETTLED",
+          "step": 4,
+          "tombstone": true
+        },
+        "status": 200
+      },
+      "n": 12,
+      "note": "b1 done: tombstone",
+      "op": {
+        "attempt_id": "tbIpIEtI-lIxthEYBE5C4w",
+        "basis": "owner",
+        "claim_key": "Cnd1HVB5NaYdaoUiK-scFcYDNxL0R8Zvu7DkB4sNR9o",
+        "expected_step": 3,
+        "type": "done"
+      },
+      "row": "2"
+    },
+    {
+      "action": "write",
+      "app": "A",
+      "claim_key": "O2",
+      "entry": {
+        "attempt": "a1",
+        "basis": "evidence",
+        "evidence": "r1",
+        "expected_step": 4,
+        "type": "done"
+      },
+      "expect": {
+        "claim": {
+          "attempts": [
+            {
+              "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+              "duplicate": true,
+              "opened_at": "2026-01-01T00:00:00.000Z",
+              "orphan_after": 3600,
+              "orphaned": false,
+              "outcome": "done",
+              "owner": "rbedjtmm6qhfpx3ejngdkjeprr",
+              "possibly_duplicate": false,
+              "resolved_by": "rbedjtmm6qhfpx3ejngdkjeprr"
+            },
+            {
+              "attempt_id": "tbIpIEtI-lIxthEYBE5C4w",
+              "duplicate": false,
+              "opened_at": "2026-01-01T00:00:00.000Z",
+              "orphan_after": 3600,
+              "orphaned": false,
+              "outcome": "done",
+              "owner": "as16gnyxnnhet86cip8ftw4odw",
+              "possibly_duplicate": false,
+              "resolved_by": "as16gnyxnnhet86cip8ftw4odw"
+            }
+          ],
+          "claim_key": "Cnd1HVB5NaYdaoUiK-scFcYDNxL0R8Zvu7DkB4sNR9o",
+          "divergent": false,
+          "next_possibly_duplicate": false,
+          "state": "SETTLED",
+          "step": 5,
+          "tombstone": true
+        },
+        "status": 200
+      },
+      "n": 13,
+      "note": "evidence for the failed a1, on the tombstone: duplicate",
+      "op": {
+        "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+        "basis": "evidence",
+        "claim_key": "Cnd1HVB5NaYdaoUiK-scFcYDNxL0R8Zvu7DkB4sNR9o",
+        "evidence_ref": "PeT3xazOYpSE37brqq0GYq1tr4iIHchktQQV05Zjml0",
+        "expected_step": 4,
+        "type": "done"
+      },
+      "row": "3"
+    },
+    {
+      "action": "write",
+      "app": "A",
+      "claim_key": "O3",
+      "entry": {
+        "attempt": "a1",
+        "expected_step": 0,
+        "orphan_after": 60,
+        "type": "attempt"
+      },
+      "expect": {
+        "claim": {
+          "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+          "attempts": [
+            {
+              "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+              "duplicate": false,
+              "opened_at": "2026-01-01T00:00:00.000Z",
+              "orphan_after": 60,
+              "orphaned": false,
+              "outcome": "open",
+              "owner": "rbedjtmm6qhfpx3ejngdkjeprr",
+              "possibly_duplicate": false
+            }
+          ],
+          "claim_key": "0OYq1Jcg0P-aHeRYyxTclw4f8CBr5BUGehmLaAUh8po",
+          "divergent": false,
+          "next_possibly_duplicate": false,
+          "owner": "rbedjtmm6qhfpx3ejngdkjeprr",
+          "state": "ATTEMPTING",
+          "step": 1,
+          "tombstone": false
+        },
+        "status": 200
+      },
+      "n": 14,
+      "note": "attempt a1 with orphan_after 60 s",
+      "op": {
+        "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+        "claim_key": "0OYq1Jcg0P-aHeRYyxTclw4f8CBr5BUGehmLaAUh8po",
+        "expected_step": 0,
+        "orphan_after": 60,
+        "type": "attempt"
+      },
+      "row": "1"
+    },
+    {
+      "action": "write",
+      "app": "B",
+      "claim_key": "O3",
+      "entry": {
+        "attempt": "a1",
+        "expected_step": 1,
+        "type": "unknown"
+      },
+      "expect": {
+        "code": "conflict",
+        "current": {
+          "claim": {
+            "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+            "attempts": [
+              {
+                "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+                "duplicate": false,
+                "opened_at": "2026-01-01T00:00:00.000Z",
+                "orphan_after": 60,
+                "orphaned": false,
+                "outcome": "open",
+                "owner": "rbedjtmm6qhfpx3ejngdkjeprr",
+                "possibly_duplicate": false
+              }
+            ],
+            "claim_key": "0OYq1Jcg0P-aHeRYyxTclw4f8CBr5BUGehmLaAUh8po",
+            "divergent": false,
+            "next_possibly_duplicate": false,
+            "owner": "rbedjtmm6qhfpx3ejngdkjeprr",
+            "state": "ATTEMPTING",
+            "step": 1,
+            "tombstone": false
+          }
+        },
+        "status": 409
+      },
+      "n": 15,
+      "note": "unknown before a1 is orphaned: conflict",
+      "op": {
+        "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+        "claim_key": "0OYq1Jcg0P-aHeRYyxTclw4f8CBr5BUGehmLaAUh8po",
+        "expected_step": 1,
+        "type": "unknown"
+      },
+      "row": "6"
+    },
+    {
+      "action": "advance",
+      "n": 16,
+      "seconds": 61
+    },
+    {
+      "action": "read",
+      "app": "B",
+      "claim_key": "O3",
+      "expect": {
+        "claim": {
+          "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+          "attempts": [
+            {
+              "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+              "duplicate": false,
+              "opened_at": "2026-01-01T00:00:00.000Z",
+              "orphan_after": 60,
+              "orphaned": true,
+              "outcome": "open",
+              "owner": "rbedjtmm6qhfpx3ejngdkjeprr",
+              "possibly_duplicate": false
+            }
+          ],
+          "claim_key": "0OYq1Jcg0P-aHeRYyxTclw4f8CBr5BUGehmLaAUh8po",
+          "divergent": false,
+          "next_possibly_duplicate": false,
+          "owner": "rbedjtmm6qhfpx3ejngdkjeprr",
+          "state": "ATTEMPTING",
+          "step": 1,
+          "tombstone": false
+        },
+        "status": 200
+      },
+      "n": 17,
+      "note": "a1 is orphaned: orphan_after has passed"
+    },
+    {
+      "action": "write",
+      "app": "B",
+      "claim_key": "O3",
+      "entry": {
+        "attempt": "a1",
+        "expected_step": 1,
+        "type": "unknown"
+      },
+      "expect": {
+        "claim": {
+          "attempts": [
+            {
+              "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+              "duplicate": false,
+              "opened_at": "2026-01-01T00:00:00.000Z",
+              "orphan_after": 60,
+              "orphaned": false,
+              "outcome": "unknown",
+              "owner": "rbedjtmm6qhfpx3ejngdkjeprr",
+              "possibly_duplicate": false,
+              "resolved_by": "as16gnyxnnhet86cip8ftw4odw"
+            }
+          ],
+          "claim_key": "0OYq1Jcg0P-aHeRYyxTclw4f8CBr5BUGehmLaAUh8po",
+          "divergent": false,
+          "next_possibly_duplicate": true,
+          "state": "FREE",
+          "step": 2,
+          "tombstone": false
+        },
+        "status": 200
+      },
+      "n": 18,
+      "note": "user-confirmed unknown: FREE",
+      "op": {
+        "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+        "claim_key": "0OYq1Jcg0P-aHeRYyxTclw4f8CBr5BUGehmLaAUh8po",
+        "expected_step": 1,
+        "type": "unknown"
+      },
+      "row": "6"
+    },
+    {
+      "action": "write",
+      "app": "B",
+      "claim_key": "O3",
+      "entry": {
+        "attempt": "b1",
+        "expected_step": 2,
+        "orphan_after": 3600,
+        "type": "attempt"
+      },
+      "expect": {
+        "claim": {
+          "attempt_id": "tbIpIEtI-lIxthEYBE5C4w",
+          "attempts": [
+            {
+              "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+              "duplicate": false,
+              "opened_at": "2026-01-01T00:00:00.000Z",
+              "orphan_after": 60,
+              "orphaned": false,
+              "outcome": "unknown",
+              "owner": "rbedjtmm6qhfpx3ejngdkjeprr",
+              "possibly_duplicate": false,
+              "resolved_by": "as16gnyxnnhet86cip8ftw4odw"
+            },
+            {
+              "attempt_id": "tbIpIEtI-lIxthEYBE5C4w",
+              "duplicate": false,
+              "opened_at": "2026-01-01T00:01:01.000Z",
+              "orphan_after": 3600,
+              "orphaned": false,
+              "outcome": "open",
+              "owner": "as16gnyxnnhet86cip8ftw4odw",
+              "possibly_duplicate": true
+            }
+          ],
+          "claim_key": "0OYq1Jcg0P-aHeRYyxTclw4f8CBr5BUGehmLaAUh8po",
+          "divergent": false,
+          "next_possibly_duplicate": true,
+          "owner": "as16gnyxnnhet86cip8ftw4odw",
+          "state": "ATTEMPTING",
+          "step": 3,
+          "tombstone": false
+        },
+        "status": 200
+      },
+      "n": 19,
+      "note": "attempt after an unknown one: possibly_duplicate",
+      "op": {
+        "attempt_id": "tbIpIEtI-lIxthEYBE5C4w",
+        "claim_key": "0OYq1Jcg0P-aHeRYyxTclw4f8CBr5BUGehmLaAUh8po",
+        "expected_step": 2,
+        "orphan_after": 3600,
+        "type": "attempt"
+      },
+      "row": "1"
+    },
+    {
+      "action": "write",
+      "app": "B",
+      "claim_key": "O3",
+      "entry": {
+        "attempt": "b1",
+        "expected_step": 3,
+        "type": "failed"
+      },
+      "expect": {
+        "claim": {
+          "attempts": [
+            {
+              "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+              "duplicate": false,
+              "opened_at": "2026-01-01T00:00:00.000Z",
+              "orphan_after": 60,
+              "orphaned": false,
+              "outcome": "unknown",
+              "owner": "rbedjtmm6qhfpx3ejngdkjeprr",
+              "possibly_duplicate": false,
+              "resolved_by": "as16gnyxnnhet86cip8ftw4odw"
+            },
+            {
+              "attempt_id": "tbIpIEtI-lIxthEYBE5C4w",
+              "duplicate": false,
+              "opened_at": "2026-01-01T00:01:01.000Z",
+              "orphan_after": 3600,
+              "orphaned": false,
+              "outcome": "failed",
+              "owner": "as16gnyxnnhet86cip8ftw4odw",
+              "possibly_duplicate": true,
+              "resolved_by": "as16gnyxnnhet86cip8ftw4odw"
+            }
+          ],
+          "claim_key": "0OYq1Jcg0P-aHeRYyxTclw4f8CBr5BUGehmLaAUh8po",
+          "divergent": false,
+          "next_possibly_duplicate": true,
+          "state": "FREE",
+          "step": 4,
+          "tombstone": false
+        },
+        "status": 200
+      },
+      "n": 20,
+      "note": "owner reports b1 failed: FREE",
+      "op": {
+        "attempt_id": "tbIpIEtI-lIxthEYBE5C4w",
+        "claim_key": "0OYq1Jcg0P-aHeRYyxTclw4f8CBr5BUGehmLaAUh8po",
+        "expected_step": 3,
+        "type": "failed"
+      },
+      "row": "5"
+    },
+    {
+      "action": "write",
+      "app": "B",
+      "claim_key": "O3",
+      "entry": {
+        "attempt": "a1",
+        "expected_step": 4,
+        "type": "failed"
+      },
+      "expect": {
+        "code": "conflict",
+        "current": {
+          "claim": {
+            "attempts": [
+              {
+                "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+                "duplicate": false,
+                "opened_at": "2026-01-01T00:00:00.000Z",
+                "orphan_after": 60,
+                "orphaned": false,
+                "outcome": "unknown",
+                "owner": "rbedjtmm6qhfpx3ejngdkjeprr",
+                "possibly_duplicate": false,
+                "resolved_by": "as16gnyxnnhet86cip8ftw4odw"
+              },
+              {
+                "attempt_id": "tbIpIEtI-lIxthEYBE5C4w",
+                "duplicate": false,
+                "opened_at": "2026-01-01T00:01:01.000Z",
+                "orphan_after": 3600,
+                "orphaned": false,
+                "outcome": "failed",
+                "owner": "as16gnyxnnhet86cip8ftw4odw",
+                "possibly_duplicate": true,
+                "resolved_by": "as16gnyxnnhet86cip8ftw4odw"
+              }
+            ],
+            "claim_key": "0OYq1Jcg0P-aHeRYyxTclw4f8CBr5BUGehmLaAUh8po",
+            "divergent": false,
+            "next_possibly_duplicate": true,
+            "state": "FREE",
+            "step": 4,
+            "tombstone": false
+          }
+        },
+        "status": 409
+      },
+      "n": 21,
+      "note": "failed on a1 from another app while its owner is current: conflict",
+      "op": {
+        "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+        "claim_key": "0OYq1Jcg0P-aHeRYyxTclw4f8CBr5BUGehmLaAUh8po",
+        "expected_step": 4,
+        "type": "failed"
+      },
+      "row": "5"
+    },
+    {
+      "action": "write",
+      "app": "B",
+      "claim_key": "O3",
+      "entry": {
+        "attempt": "a1",
+        "basis": "reconcile",
+        "expected_step": 4,
+        "type": "done"
+      },
+      "expect": {
+        "code": "conflict",
+        "current": {
+          "claim": {
+            "attempts": [
+              {
+                "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+                "duplicate": false,
+                "opened_at": "2026-01-01T00:00:00.000Z",
+                "orphan_after": 60,
+                "orphaned": false,
+                "outcome": "unknown",
+                "owner": "rbedjtmm6qhfpx3ejngdkjeprr",
+                "possibly_duplicate": false,
+                "resolved_by": "as16gnyxnnhet86cip8ftw4odw"
+              },
+              {
+                "attempt_id": "tbIpIEtI-lIxthEYBE5C4w",
+                "duplicate": false,
+                "opened_at": "2026-01-01T00:01:01.000Z",
+                "orphan_after": 3600,
+                "orphaned": false,
+                "outcome": "failed",
+                "owner": "as16gnyxnnhet86cip8ftw4odw",
+                "possibly_duplicate": true,
+                "resolved_by": "as16gnyxnnhet86cip8ftw4odw"
+              }
+            ],
+            "claim_key": "0OYq1Jcg0P-aHeRYyxTclw4f8CBr5BUGehmLaAUh8po",
+            "divergent": false,
+            "next_possibly_duplicate": true,
+            "state": "FREE",
+            "step": 4,
+            "tombstone": false
+          }
+        },
+        "status": 409
+      },
+      "n": 22,
+      "note": "reconcile needs an open attempt: conflict",
+      "op": {
+        "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+        "basis": "reconcile",
+        "claim_key": "0OYq1Jcg0P-aHeRYyxTclw4f8CBr5BUGehmLaAUh8po",
+        "expected_step": 4,
+        "type": "done"
+      },
+      "row": "4"
+    },
+    {
+      "action": "write",
+      "app": "B",
+      "claim_key": "O3",
+      "entry": {
+        "attempt": "a1",
+        "basis": "evidence",
+        "evidence": "r2",
+        "expected_step": 4,
+        "type": "done"
+      },
+      "expect": {
+        "claim": {
+          "attempts": [
+            {
+              "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+              "duplicate": false,
+              "opened_at": "2026-01-01T00:00:00.000Z",
+              "orphan_after": 60,
+              "orphaned": false,
+              "outcome": "done",
+              "owner": "rbedjtmm6qhfpx3ejngdkjeprr",
+              "possibly_duplicate": false,
+              "resolved_by": "as16gnyxnnhet86cip8ftw4odw"
+            },
+            {
+              "attempt_id": "tbIpIEtI-lIxthEYBE5C4w",
+              "duplicate": false,
+              "opened_at": "2026-01-01T00:01:01.000Z",
+              "orphan_after": 3600,
+              "orphaned": false,
+              "outcome": "failed",
+              "owner": "as16gnyxnnhet86cip8ftw4odw",
+              "possibly_duplicate": true,
+              "resolved_by": "as16gnyxnnhet86cip8ftw4odw"
+            }
+          ],
+          "claim_key": "0OYq1Jcg0P-aHeRYyxTclw4f8CBr5BUGehmLaAUh8po",
+          "divergent": false,
+          "next_possibly_duplicate": false,
+          "state": "SETTLED",
+          "step": 5,
+          "tombstone": true
+        },
+        "status": 200
+      },
+      "n": 23,
+      "note": "evidence settles the unknown a1: tombstone",
+      "op": {
+        "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+        "basis": "evidence",
+        "claim_key": "0OYq1Jcg0P-aHeRYyxTclw4f8CBr5BUGehmLaAUh8po",
+        "evidence_ref": "-cRkK6sYuInRpI4TxR_ZCQeFnwXNfFurO0BCLNftS8M",
+        "expected_step": 4,
+        "type": "done"
+      },
+      "row": "3"
+    },
+    {
+      "action": "write",
+      "app": "C",
+      "claim_key": "O4",
+      "entry": {
+        "attempt": "c1",
+        "expected_step": 0,
+        "orphan_after": 86400,
+        "type": "attempt"
+      },
+      "expect": {
+        "claim": {
+          "attempt_id": "cZpoHjmYg6xH4OO9BazdUA",
+          "attempts": [
+            {
+              "attempt_id": "cZpoHjmYg6xH4OO9BazdUA",
+              "duplicate": false,
+              "opened_at": "2026-01-01T00:01:01.000Z",
+              "orphan_after": 86400,
+              "orphaned": false,
+              "outcome": "open",
+              "owner": "ffam9rpra19mg8xt3fnohugbeo",
+              "possibly_duplicate": false
+            }
+          ],
+          "claim_key": "aTZUuqUArskwSrePp2Uchq5OJUFPgO9N0DtSCGy7lDY",
+          "divergent": false,
+          "next_possibly_duplicate": false,
+          "owner": "ffam9rpra19mg8xt3fnohugbeo",
+          "state": "ATTEMPTING",
+          "step": 1,
+          "tombstone": false
+        },
+        "status": 200
+      },
+      "n": 24,
+      "note": "attempt c1",
+      "op": {
+        "attempt_id": "cZpoHjmYg6xH4OO9BazdUA",
+        "claim_key": "aTZUuqUArskwSrePp2Uchq5OJUFPgO9N0DtSCGy7lDY",
+        "expected_step": 0,
+        "orphan_after": 86400,
+        "type": "attempt"
+      },
+      "row": "1"
+    },
+    {
+      "action": "write",
+      "app": "D",
+      "claim_key": "O5",
+      "entry": {
+        "attempt": "d1",
+        "expected_step": 0,
+        "orphan_after": 86400,
+        "type": "attempt"
+      },
+      "expect": {
+        "claim": {
+          "attempt_id": "leqhzC91t3BEHkxcl8jbKQ",
+          "attempts": [
+            {
+              "attempt_id": "leqhzC91t3BEHkxcl8jbKQ",
+              "duplicate": false,
+              "opened_at": "2026-01-01T00:01:01.000Z",
+              "orphan_after": 86400,
+              "orphaned": false,
+              "outcome": "open",
+              "owner": "ycrn5updcpf7kzuf5exay8kw9r",
+              "possibly_duplicate": false
+            }
+          ],
+          "claim_key": "2La00j1kA7Bk5qgYMOnNjoTa5c-ruA8mXgRmgAaJxpE",
+          "divergent": false,
+          "next_possibly_duplicate": false,
+          "owner": "ycrn5updcpf7kzuf5exay8kw9r",
+          "state": "ATTEMPTING",
+          "step": 1,
+          "tombstone": false
+        },
+        "status": 200
+      },
+      "n": 25,
+      "note": "attempt d1",
+      "op": {
+        "attempt_id": "leqhzC91t3BEHkxcl8jbKQ",
+        "claim_key": "2La00j1kA7Bk5qgYMOnNjoTa5c-ruA8mXgRmgAaJxpE",
+        "expected_step": 0,
+        "orphan_after": 86400,
+        "type": "attempt"
+      },
+      "row": "1"
+    },
+    {
+      "action": "write",
+      "app": "C",
+      "claim_key": "O6",
+      "entry": {
+        "attempt": "c2",
+        "expected_step": 0,
+        "orphan_after": 86400,
+        "type": "attempt"
+      },
+      "expect": {
+        "claim": {
+          "attempt_id": "DJm7yWaTOr8QwPWyrsdlZA",
+          "attempts": [
+            {
+              "attempt_id": "DJm7yWaTOr8QwPWyrsdlZA",
+              "duplicate": false,
+              "opened_at": "2026-01-01T00:01:01.000Z",
+              "orphan_after": 86400,
+              "orphaned": false,
+              "outcome": "open",
+              "owner": "ffam9rpra19mg8xt3fnohugbeo",
+              "possibly_duplicate": false
+            }
+          ],
+          "claim_key": "jbHkEZTguTFL6RVJ9kiUTr5SsdXiS5v1qizrnr9LkWI",
+          "divergent": false,
+          "next_possibly_duplicate": false,
+          "owner": "ffam9rpra19mg8xt3fnohugbeo",
+          "state": "ATTEMPTING",
+          "step": 1,
+          "tombstone": false
+        },
+        "status": 200
+      },
+      "n": 26,
+      "note": "attempt c2",
+      "op": {
+        "attempt_id": "DJm7yWaTOr8QwPWyrsdlZA",
+        "claim_key": "jbHkEZTguTFL6RVJ9kiUTr5SsdXiS5v1qizrnr9LkWI",
+        "expected_step": 0,
+        "orphan_after": 86400,
+        "type": "attempt"
+      },
+      "row": "1"
+    },
+    {
+      "action": "write",
+      "app": "B",
+      "claim_key": "O4",
+      "entry": {
+        "attempt": "c1",
+        "basis": "reconcile",
+        "expected_step": 1,
+        "type": "done"
+      },
+      "expect": {
+        "code": "conflict",
+        "current": {
+          "claim": {
+            "attempt_id": "cZpoHjmYg6xH4OO9BazdUA",
+            "attempts": [
+              {
+                "attempt_id": "cZpoHjmYg6xH4OO9BazdUA",
+                "duplicate": false,
+                "opened_at": "2026-01-01T00:01:01.000Z",
+                "orphan_after": 86400,
+                "orphaned": false,
+                "outcome": "open",
+                "owner": "ffam9rpra19mg8xt3fnohugbeo",
+                "possibly_duplicate": false
+              }
+            ],
+            "claim_key": "aTZUuqUArskwSrePp2Uchq5OJUFPgO9N0DtSCGy7lDY",
+            "divergent": false,
+            "next_possibly_duplicate": false,
+            "owner": "ffam9rpra19mg8xt3fnohugbeo",
+            "state": "ATTEMPTING",
+            "step": 1,
+            "tombstone": false
+          }
+        },
+        "status": 409
+      },
+      "n": 27,
+      "note": "reconcile before c1 is orphaned: conflict",
+      "op": {
+        "attempt_id": "cZpoHjmYg6xH4OO9BazdUA",
+        "basis": "reconcile",
+        "claim_key": "aTZUuqUArskwSrePp2Uchq5OJUFPgO9N0DtSCGy7lDY",
+        "expected_step": 1,
+        "type": "done"
+      },
+      "row": "4"
+    },
+    {
+      "action": "write",
+      "app": "B",
+      "claim_key": "O6",
+      "entry": {
+        "attempt": "c2",
+        "expected_step": 1,
+        "type": "failed"
+      },
+      "expect": {
+        "code": "conflict",
+        "current": {
+          "claim": {
+            "attempt_id": "DJm7yWaTOr8QwPWyrsdlZA",
+            "attempts": [
+              {
+                "attempt_id": "DJm7yWaTOr8QwPWyrsdlZA",
+                "duplicate": false,
+                "opened_at": "2026-01-01T00:01:01.000Z",
+                "orphan_after": 86400,
+                "orphaned": false,
+                "outcome": "open",
+                "owner": "ffam9rpra19mg8xt3fnohugbeo",
+                "possibly_duplicate": false
+              }
+            ],
+            "claim_key": "jbHkEZTguTFL6RVJ9kiUTr5SsdXiS5v1qizrnr9LkWI",
+            "divergent": false,
+            "next_possibly_duplicate": false,
+            "owner": "ffam9rpra19mg8xt3fnohugbeo",
+            "state": "ATTEMPTING",
+            "step": 1,
+            "tombstone": false
+          }
+        },
+        "status": 409
+      },
+      "n": 28,
+      "note": "failed from another app while the owner is current: conflict",
+      "op": {
+        "attempt_id": "DJm7yWaTOr8QwPWyrsdlZA",
+        "claim_key": "jbHkEZTguTFL6RVJ9kiUTr5SsdXiS5v1qizrnr9LkWI",
+        "expected_step": 1,
+        "type": "failed"
+      },
+      "row": "5"
+    },
+    {
+      "action": "revoke",
+      "app": "C",
+      "expect": {
+        "status": 200
+      },
+      "n": 29
+    },
+    {
+      "action": "revoke",
+      "app": "D",
+      "expect": {
+        "status": 200
+      },
+      "n": 30
+    },
+    {
+      "action": "read",
+      "app": "B",
+      "claim_key": "O4",
+      "expect": {
+        "claim": {
+          "attempt_id": "cZpoHjmYg6xH4OO9BazdUA",
+          "attempts": [
+            {
+              "attempt_id": "cZpoHjmYg6xH4OO9BazdUA",
+              "duplicate": false,
+              "opened_at": "2026-01-01T00:01:01.000Z",
+              "orphan_after": 86400,
+              "orphaned": true,
+              "outcome": "open",
+              "owner": "ffam9rpra19mg8xt3fnohugbeo",
+              "possibly_duplicate": false
+            }
+          ],
+          "claim_key": "aTZUuqUArskwSrePp2Uchq5OJUFPgO9N0DtSCGy7lDY",
+          "divergent": false,
+          "next_possibly_duplicate": false,
+          "owner": "ffam9rpra19mg8xt3fnohugbeo",
+          "state": "ATTEMPTING",
+          "step": 1,
+          "tombstone": false
+        },
+        "status": 200
+      },
+      "n": 31,
+      "note": "c1 is orphaned: its owner isn't current"
+    },
+    {
+      "action": "write",
+      "app": "B",
+      "claim_key": "O4",
+      "entry": {
+        "attempt": "c1",
+        "basis": "reconcile",
+        "expected_step": 1,
+        "type": "done"
+      },
+      "expect": {
+        "claim": {
+          "attempts": [
+            {
+              "attempt_id": "cZpoHjmYg6xH4OO9BazdUA",
+              "duplicate": false,
+              "opened_at": "2026-01-01T00:01:01.000Z",
+              "orphan_after": 86400,
+              "orphaned": false,
+              "outcome": "done",
+              "owner": "ffam9rpra19mg8xt3fnohugbeo",
+              "possibly_duplicate": false,
+              "resolved_by": "as16gnyxnnhet86cip8ftw4odw"
+            }
+          ],
+          "claim_key": "aTZUuqUArskwSrePp2Uchq5OJUFPgO9N0DtSCGy7lDY",
+          "divergent": false,
+          "next_possibly_duplicate": false,
+          "state": "SETTLED",
+          "step": 2,
+          "tombstone": true
+        },
+        "status": 200
+      },
+      "n": 32,
+      "note": "user-confirmed reconcile: SETTLED, tombstone",
+      "op": {
+        "attempt_id": "cZpoHjmYg6xH4OO9BazdUA",
+        "basis": "reconcile",
+        "claim_key": "aTZUuqUArskwSrePp2Uchq5OJUFPgO9N0DtSCGy7lDY",
+        "expected_step": 1,
+        "type": "done"
+      },
+      "row": "4"
+    },
+    {
+      "action": "write",
+      "app": "B",
+      "claim_key": "O5",
+      "entry": {
+        "attempt": "d1",
+        "expected_step": 1,
+        "type": "unknown"
+      },
+      "expect": {
+        "claim": {
+          "attempts": [
+            {
+              "attempt_id": "leqhzC91t3BEHkxcl8jbKQ",
+              "duplicate": false,
+              "opened_at": "2026-01-01T00:01:01.000Z",
+              "orphan_after": 86400,
+              "orphaned": false,
+              "outcome": "unknown",
+              "owner": "ycrn5updcpf7kzuf5exay8kw9r",
+              "possibly_duplicate": false,
+              "resolved_by": "as16gnyxnnhet86cip8ftw4odw"
+            }
+          ],
+          "claim_key": "2La00j1kA7Bk5qgYMOnNjoTa5c-ruA8mXgRmgAaJxpE",
+          "divergent": false,
+          "next_possibly_duplicate": true,
+          "state": "FREE",
+          "step": 2,
+          "tombstone": false
+        },
+        "status": 200
+      },
+      "n": 33,
+      "note": "user-confirmed unknown: FREE",
+      "op": {
+        "attempt_id": "leqhzC91t3BEHkxcl8jbKQ",
+        "claim_key": "2La00j1kA7Bk5qgYMOnNjoTa5c-ruA8mXgRmgAaJxpE",
+        "expected_step": 1,
+        "type": "unknown"
+      },
+      "row": "6"
+    },
+    {
+      "action": "write",
+      "app": "B",
+      "claim_key": "O5",
+      "entry": {
+        "attempt": "d1",
+        "expected_step": 2,
+        "type": "failed"
+      },
+      "expect": {
+        "claim": {
+          "attempts": [
+            {
+              "attempt_id": "leqhzC91t3BEHkxcl8jbKQ",
+              "duplicate": false,
+              "opened_at": "2026-01-01T00:01:01.000Z",
+              "orphan_after": 86400,
+              "orphaned": false,
+              "outcome": "failed",
+              "owner": "ycrn5updcpf7kzuf5exay8kw9r",
+              "possibly_duplicate": false,
+              "resolved_by": "as16gnyxnnhet86cip8ftw4odw"
+            }
+          ],
+          "claim_key": "2La00j1kA7Bk5qgYMOnNjoTa5c-ruA8mXgRmgAaJxpE",
+          "divergent": false,
+          "next_possibly_duplicate": true,
+          "state": "FREE",
+          "step": 3,
+          "tombstone": false
+        },
+        "status": 200
+      },
+      "n": 34,
+      "note": "failed on an unknown attempt whose owner isn't current",
+      "op": {
+        "attempt_id": "leqhzC91t3BEHkxcl8jbKQ",
+        "claim_key": "2La00j1kA7Bk5qgYMOnNjoTa5c-ruA8mXgRmgAaJxpE",
+        "expected_step": 2,
+        "type": "failed"
+      },
+      "row": "5"
+    },
+    {
+      "action": "write",
+      "app": "B",
+      "claim_key": "O5",
+      "entry": {
+        "attempt": "b1",
+        "expected_step": 3,
+        "orphan_after": 3600,
+        "type": "attempt"
+      },
+      "expect": {
+        "claim": {
+          "attempt_id": "tbIpIEtI-lIxthEYBE5C4w",
+          "attempts": [
+            {
+              "attempt_id": "leqhzC91t3BEHkxcl8jbKQ",
+              "duplicate": false,
+              "opened_at": "2026-01-01T00:01:01.000Z",
+              "orphan_after": 86400,
+              "orphaned": false,
+              "outcome": "failed",
+              "owner": "ycrn5updcpf7kzuf5exay8kw9r",
+              "possibly_duplicate": false,
+              "resolved_by": "as16gnyxnnhet86cip8ftw4odw"
+            },
+            {
+              "attempt_id": "tbIpIEtI-lIxthEYBE5C4w",
+              "duplicate": false,
+              "opened_at": "2026-01-01T00:01:01.000Z",
+              "orphan_after": 3600,
+              "orphaned": false,
+              "outcome": "open",
+              "owner": "as16gnyxnnhet86cip8ftw4odw",
+              "possibly_duplicate": true
+            }
+          ],
+          "claim_key": "2La00j1kA7Bk5qgYMOnNjoTa5c-ruA8mXgRmgAaJxpE",
+          "divergent": false,
+          "next_possibly_duplicate": true,
+          "owner": "as16gnyxnnhet86cip8ftw4odw",
+          "state": "ATTEMPTING",
+          "step": 4,
+          "tombstone": false
+        },
+        "status": 200
+      },
+      "n": 35,
+      "note": "attempt after a failure B wrote for another app's attempt: possibly_duplicate",
+      "op": {
+        "attempt_id": "tbIpIEtI-lIxthEYBE5C4w",
+        "claim_key": "2La00j1kA7Bk5qgYMOnNjoTa5c-ruA8mXgRmgAaJxpE",
+        "expected_step": 3,
+        "orphan_after": 3600,
+        "type": "attempt"
+      },
+      "row": "1"
+    },
+    {
+      "action": "write",
+      "app": "B",
+      "claim_key": "O6",
+      "entry": {
+        "attempt": "c2",
+        "expected_step": 1,
+        "type": "failed"
+      },
+      "expect": {
+        "claim": {
+          "attempts": [
+            {
+              "attempt_id": "DJm7yWaTOr8QwPWyrsdlZA",
+              "duplicate": false,
+              "opened_at": "2026-01-01T00:01:01.000Z",
+              "orphan_after": 86400,
+              "orphaned": false,
+              "outcome": "failed",
+              "owner": "ffam9rpra19mg8xt3fnohugbeo",
+              "possibly_duplicate": false,
+              "resolved_by": "as16gnyxnnhet86cip8ftw4odw"
+            }
+          ],
+          "claim_key": "jbHkEZTguTFL6RVJ9kiUTr5SsdXiS5v1qizrnr9LkWI",
+          "divergent": false,
+          "next_possibly_duplicate": true,
+          "state": "FREE",
+          "step": 2,
+          "tombstone": false
+        },
+        "status": 200
+      },
+      "n": 36,
+      "note": "failed on an open, orphaned attempt whose owner isn't current: FREE",
+      "op": {
+        "attempt_id": "DJm7yWaTOr8QwPWyrsdlZA",
+        "claim_key": "jbHkEZTguTFL6RVJ9kiUTr5SsdXiS5v1qizrnr9LkWI",
+        "expected_step": 1,
+        "type": "failed"
+      },
+      "row": "5"
+    },
+    {
+      "action": "write",
+      "app": "C",
+      "claim_key": "O6",
+      "entry": {
+        "attempt": "c3",
+        "expected_step": 2,
+        "orphan_after": 3600,
+        "type": "attempt"
+      },
+      "expect": {
+        "code": "not_current",
+        "current": null,
+        "status": 403
+      },
+      "n": 37,
+      "note": "a revoked app writes nothing",
+      "op": {
+        "attempt_id": "DwipFawQ_JDPIGKSt9AHdQ",
+        "claim_key": "jbHkEZTguTFL6RVJ9kiUTr5SsdXiS5v1qizrnr9LkWI",
+        "expected_step": 2,
+        "orphan_after": 3600,
+        "type": "attempt"
+      },
+      "row": "-"
+    },
+    {
+      "action": "write",
+      "app": "A",
+      "claim_key": "O7",
+      "entry": {
+        "attempt": "a1",
+        "deadline_after_s": 600,
+        "expected_step": 0,
+        "orphan_after": 3600,
+        "type": "attempt"
+      },
+      "expect": {
+        "claim": {
+          "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+          "attempts": [
+            {
+              "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+              "duplicate": false,
+              "opened_at": "2026-01-01T00:01:01.000Z",
+              "orphan_after": 3600,
+              "orphaned": false,
+              "outcome": "open",
+              "owner": "rbedjtmm6qhfpx3ejngdkjeprr",
+              "possibly_duplicate": false
+            }
+          ],
+          "claim_key": "YpZzhtmFGmMcRJzmSThS_qXecYqdz5cX_-cPpRpZOJg",
+          "deadline": "2026-01-01T00:10:00.000Z",
+          "divergent": false,
+          "next_possibly_duplicate": false,
+          "owner": "rbedjtmm6qhfpx3ejngdkjeprr",
+          "state": "ATTEMPTING",
+          "step": 1,
+          "tombstone": false
+        },
+        "status": 200
+      },
+      "n": 38,
+      "note": "attempt with a deadline 600 s after the start",
+      "op": {
+        "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+        "claim_key": "YpZzhtmFGmMcRJzmSThS_qXecYqdz5cX_-cPpRpZOJg",
+        "deadline": "2026-01-01T00:10:00.000Z",
+        "expected_step": 0,
+        "orphan_after": 3600,
+        "type": "attempt"
+      },
+      "row": "1"
+    },
+    {
+      "action": "write",
+      "app": "A",
+      "claim_key": "O7",
+      "entry": {
+        "attempt": "a1",
+        "basis": "owner",
+        "expected_step": 1,
+        "type": "done"
+      },
+      "expect": {
+        "claim": {
+          "attempts": [
+            {
+              "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+              "duplicate": false,
+              "opened_at": "2026-01-01T00:01:01.000Z",
+              "orphan_after": 3600,
+              "orphaned": false,
+              "outcome": "done",
+              "owner": "rbedjtmm6qhfpx3ejngdkjeprr",
+              "possibly_duplicate": false,
+              "resolved_by": "rbedjtmm6qhfpx3ejngdkjeprr"
+            }
+          ],
+          "claim_key": "YpZzhtmFGmMcRJzmSThS_qXecYqdz5cX_-cPpRpZOJg",
+          "deadline": "2026-01-01T00:10:00.000Z",
+          "divergent": false,
+          "next_possibly_duplicate": false,
+          "state": "SETTLED",
+          "step": 2,
+          "tombstone": true
+        },
+        "status": 200
+      },
+      "n": 39,
+      "note": "done: tombstone keeping the deadline",
+      "op": {
+        "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+        "basis": "owner",
+        "claim_key": "YpZzhtmFGmMcRJzmSThS_qXecYqdz5cX_-cPpRpZOJg",
+        "expected_step": 1,
+        "type": "done"
+      },
+      "row": "2"
+    },
+    {
+      "action": "advance",
+      "n": 40,
+      "seconds": 539
+    },
+    {
+      "action": "read",
+      "app": "A",
+      "claim_key": "O7",
+      "expect": {
+        "claim": {
+          "attempts": [
+            {
+              "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+              "duplicate": false,
+              "opened_at": "2026-01-01T00:01:01.000Z",
+              "orphan_after": 3600,
+              "orphaned": false,
+              "outcome": "done",
+              "owner": "rbedjtmm6qhfpx3ejngdkjeprr",
+              "possibly_duplicate": false,
+              "resolved_by": "rbedjtmm6qhfpx3ejngdkjeprr"
+            }
+          ],
+          "claim_key": "YpZzhtmFGmMcRJzmSThS_qXecYqdz5cX_-cPpRpZOJg",
+          "deadline": "2026-01-01T00:10:00.000Z",
+          "divergent": false,
+          "next_possibly_duplicate": false,
+          "state": "SETTLED",
+          "step": 2,
+          "tombstone": true
+        },
+        "status": 200
+      },
+      "n": 41,
+      "note": "the service clock reached the deadline: the tombstone stays for the 30-day reconciliation window"
+    },
+    {
+      "action": "write",
+      "app": "B",
+      "claim_key": "O7",
+      "entry": {
+        "attempt": "b1",
+        "deadline_after_s": 600,
+        "expected_step": 0,
+        "orphan_after": 3600,
+        "type": "attempt"
+      },
+      "expect": {
+        "code": "conflict",
+        "current": {
+          "claim": {
+            "attempts": [
+              {
+                "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+                "duplicate": false,
+                "opened_at": "2026-01-01T00:01:01.000Z",
+                "orphan_after": 3600,
+                "orphaned": false,
+                "outcome": "done",
+                "owner": "rbedjtmm6qhfpx3ejngdkjeprr",
+                "possibly_duplicate": false,
+                "resolved_by": "rbedjtmm6qhfpx3ejngdkjeprr"
+              }
+            ],
+            "claim_key": "YpZzhtmFGmMcRJzmSThS_qXecYqdz5cX_-cPpRpZOJg",
+            "deadline": "2026-01-01T00:10:00.000Z",
+            "divergent": false,
+            "next_possibly_duplicate": false,
+            "state": "SETTLED",
+            "step": 2,
+            "tombstone": true
+          },
+          "server_time": "2026-01-01T00:10:00.000Z"
+        },
+        "status": 409
+      },
+      "n": 42,
+      "note": "a re-sent copy is refused by its deadline",
+      "op": {
+        "attempt_id": "tbIpIEtI-lIxthEYBE5C4w",
+        "claim_key": "YpZzhtmFGmMcRJzmSThS_qXecYqdz5cX_-cPpRpZOJg",
+        "deadline": "2026-01-01T00:10:00.000Z",
+        "expected_step": 0,
+        "orphan_after": 3600,
+        "type": "attempt"
+      },
+      "row": "1"
+    },
+    {
+      "action": "write",
+      "app": "A",
+      "claim_key": "O9",
+      "entry": {
+        "attempt": "a1",
+        "deadline_after_s": 7200,
+        "expected_step": 0,
+        "orphan_after": 3600,
+        "type": "attempt"
+      },
+      "expect": {
+        "claim": {
+          "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+          "attempts": [
+            {
+              "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+              "duplicate": false,
+              "opened_at": "2026-01-01T00:10:00.000Z",
+              "orphan_after": 3600,
+              "orphaned": false,
+              "outcome": "open",
+              "owner": "rbedjtmm6qhfpx3ejngdkjeprr",
+              "possibly_duplicate": false
+            }
+          ],
+          "claim_key": "G9HlYIf20i1bYvfzMJfGuR64Tmet5JSHtp110S8QWF4",
+          "deadline": "2026-01-01T02:00:00.000Z",
+          "divergent": false,
+          "next_possibly_duplicate": false,
+          "owner": "rbedjtmm6qhfpx3ejngdkjeprr",
+          "state": "ATTEMPTING",
+          "step": 1,
+          "tombstone": false
+        },
+        "status": 200
+      },
+      "n": 43,
+      "note": "attempt with a deadline: it pins the claim's deadline",
+      "op": {
+        "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+        "claim_key": "G9HlYIf20i1bYvfzMJfGuR64Tmet5JSHtp110S8QWF4",
+        "deadline": "2026-01-01T02:00:00.000Z",
+        "expected_step": 0,
+        "orphan_after": 3600,
+        "type": "attempt"
+      },
+      "row": "1"
+    },
+    {
+      "action": "write",
+      "app": "A",
+      "claim_key": "O9",
+      "entry": {
+        "attempt": "a1",
+        "expected_step": 1,
+        "type": "failed"
+      },
+      "expect": {
+        "claim": {
+          "attempts": [
+            {
+              "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+              "duplicate": false,
+              "opened_at": "2026-01-01T00:10:00.000Z",
+              "orphan_after": 3600,
+              "orphaned": false,
+              "outcome": "failed",
+              "owner": "rbedjtmm6qhfpx3ejngdkjeprr",
+              "possibly_duplicate": false,
+              "resolved_by": "rbedjtmm6qhfpx3ejngdkjeprr"
+            }
+          ],
+          "claim_key": "G9HlYIf20i1bYvfzMJfGuR64Tmet5JSHtp110S8QWF4",
+          "deadline": "2026-01-01T02:00:00.000Z",
+          "divergent": false,
+          "next_possibly_duplicate": false,
+          "state": "FREE",
+          "step": 2,
+          "tombstone": false
+        },
+        "status": 200
+      },
+      "n": 44,
+      "note": "the owner fails it: FREE",
+      "op": {
+        "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+        "claim_key": "G9HlYIf20i1bYvfzMJfGuR64Tmet5JSHtp110S8QWF4",
+        "expected_step": 1,
+        "type": "failed"
+      },
+      "row": "5"
+    },
+    {
+      "action": "write",
+      "app": "B",
+      "claim_key": "O9",
+      "entry": {
+        "attempt": "b1",
+        "deadline_after_s": 9000,
+        "expected_step": 2,
+        "orphan_after": 3600,
+        "type": "attempt"
+      },
+      "expect": {
+        "code": "conflict",
+        "current": {
+          "claim": {
+            "attempts": [
+              {
+                "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+                "duplicate": false,
+                "opened_at": "2026-01-01T00:10:00.000Z",
+                "orphan_after": 3600,
+                "orphaned": false,
+                "outcome": "failed",
+                "owner": "rbedjtmm6qhfpx3ejngdkjeprr",
+                "possibly_duplicate": false,
+                "resolved_by": "rbedjtmm6qhfpx3ejngdkjeprr"
+              }
+            ],
+            "claim_key": "G9HlYIf20i1bYvfzMJfGuR64Tmet5JSHtp110S8QWF4",
+            "deadline": "2026-01-01T02:00:00.000Z",
+            "divergent": false,
+            "next_possibly_duplicate": false,
+            "state": "FREE",
+            "step": 2,
+            "tombstone": false
+          }
+        },
+        "status": 409
+      },
+      "n": 45,
+      "note": "an attempt naming another deadline: conflict",
+      "op": {
+        "attempt_id": "tbIpIEtI-lIxthEYBE5C4w",
+        "claim_key": "G9HlYIf20i1bYvfzMJfGuR64Tmet5JSHtp110S8QWF4",
+        "deadline": "2026-01-01T02:30:00.000Z",
+        "expected_step": 2,
+        "orphan_after": 3600,
+        "type": "attempt"
+      },
+      "row": "1"
+    },
+    {
+      "action": "write",
+      "app": "B",
+      "claim_key": "O9",
+      "entry": {
+        "attempt": "b1",
+        "expected_step": 2,
+        "orphan_after": 3600,
+        "type": "attempt"
+      },
+      "expect": {
+        "code": "conflict",
+        "current": {
+          "claim": {
+            "attempts": [
+              {
+                "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+                "duplicate": false,
+                "opened_at": "2026-01-01T00:10:00.000Z",
+                "orphan_after": 3600,
+                "orphaned": false,
+                "outcome": "failed",
+                "owner": "rbedjtmm6qhfpx3ejngdkjeprr",
+                "possibly_duplicate": false,
+                "resolved_by": "rbedjtmm6qhfpx3ejngdkjeprr"
+              }
+            ],
+            "claim_key": "G9HlYIf20i1bYvfzMJfGuR64Tmet5JSHtp110S8QWF4",
+            "deadline": "2026-01-01T02:00:00.000Z",
+            "divergent": false,
+            "next_possibly_duplicate": false,
+            "state": "FREE",
+            "step": 2,
+            "tombstone": false
+          }
+        },
+        "status": 409
+      },
+      "n": 46,
+      "note": "an attempt without a deadline: conflict, the pin stands",
+      "op": {
+        "attempt_id": "tbIpIEtI-lIxthEYBE5C4w",
+        "claim_key": "G9HlYIf20i1bYvfzMJfGuR64Tmet5JSHtp110S8QWF4",
+        "expected_step": 2,
+        "orphan_after": 3600,
+        "type": "attempt"
+      },
+      "row": "1"
+    },
+    {
+      "action": "write",
+      "app": "B",
+      "claim_key": "O9",
+      "entry": {
+        "attempt": "b1",
+        "deadline_after_s": 7200,
+        "expected_step": 2,
+        "orphan_after": 3600,
+        "type": "attempt"
+      },
+      "expect": {
+        "claim": {
+          "attempt_id": "tbIpIEtI-lIxthEYBE5C4w",
+          "attempts": [
+            {
+              "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+              "duplicate": false,
+              "opened_at": "2026-01-01T00:10:00.000Z",
+              "orphan_after": 3600,
+              "orphaned": false,
+              "outcome": "failed",
+              "owner": "rbedjtmm6qhfpx3ejngdkjeprr",
+              "possibly_duplicate": false,
+              "resolved_by": "rbedjtmm6qhfpx3ejngdkjeprr"
+            },
+            {
+              "attempt_id": "tbIpIEtI-lIxthEYBE5C4w",
+              "duplicate": false,
+              "opened_at": "2026-01-01T00:10:00.000Z",
+              "orphan_after": 3600,
+              "orphaned": false,
+              "outcome": "open",
+              "owner": "as16gnyxnnhet86cip8ftw4odw",
+              "possibly_duplicate": false
+            }
+          ],
+          "claim_key": "G9HlYIf20i1bYvfzMJfGuR64Tmet5JSHtp110S8QWF4",
+          "deadline": "2026-01-01T02:00:00.000Z",
+          "divergent": false,
+          "next_possibly_duplicate": false,
+          "owner": "as16gnyxnnhet86cip8ftw4odw",
+          "state": "ATTEMPTING",
+          "step": 3,
+          "tombstone": false
+        },
+        "status": 200
+      },
+      "n": 47,
+      "note": "an attempt naming the pinned deadline: ATTEMPTING(B, b1)",
+      "op": {
+        "attempt_id": "tbIpIEtI-lIxthEYBE5C4w",
+        "claim_key": "G9HlYIf20i1bYvfzMJfGuR64Tmet5JSHtp110S8QWF4",
+        "deadline": "2026-01-01T02:00:00.000Z",
+        "expected_step": 2,
+        "orphan_after": 3600,
+        "type": "attempt"
+      },
+      "row": "1"
+    },
+    {
+      "action": "write",
+      "app": "A",
+      "claim_key": "O8",
+      "entry": {
+        "attempt": "a1",
+        "expected_step": 0,
+        "type": "attempt"
+      },
+      "expect": {
+        "code": "bad_request",
+        "current": null,
+        "status": 400
+      },
+      "n": 48,
+      "note": "attempt without orphan_after",
+      "op": {
+        "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+        "claim_key": "gVttCo7ryXGoiZrLipQDDS7hq8AkcVpMW-vcNPa0rb4",
+        "expected_step": 0,
+        "type": "attempt"
+      },
+      "row": "-"
+    },
+    {
+      "action": "write",
+      "app": "A",
+      "claim_key": "O8",
+      "entry": {
+        "attempt": "a1",
+        "expected_step": 0,
+        "type": "done"
+      },
+      "expect": {
+        "code": "bad_request",
+        "current": null,
+        "status": 400
+      },
+      "n": 49,
+      "note": "done without a basis",
+      "op": {
+        "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+        "claim_key": "gVttCo7ryXGoiZrLipQDDS7hq8AkcVpMW-vcNPa0rb4",
+        "expected_step": 0,
+        "type": "done"
+      },
+      "row": "-"
+    },
+    {
+      "action": "write",
+      "app": "A",
+      "claim_key": "O8",
+      "entry": {
+        "attempt": "a1",
+        "basis": "evidence",
+        "expected_step": 0,
+        "type": "done"
+      },
+      "expect": {
+        "code": "bad_request",
+        "current": null,
+        "status": 400
+      },
+      "n": 50,
+      "note": "basis evidence without evidence_ref",
+      "op": {
+        "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+        "basis": "evidence",
+        "claim_key": "gVttCo7ryXGoiZrLipQDDS7hq8AkcVpMW-vcNPa0rb4",
+        "expected_step": 0,
+        "type": "done"
+      },
+      "row": "-"
+    },
+    {
+      "action": "write",
+      "app": "A",
+      "claim_key": "O8",
+      "entry": {
+        "attempt": "a1",
+        "deadline_after_s": 600,
+        "expected_step": 0,
+        "type": "failed"
+      },
+      "expect": {
+        "code": "bad_request",
+        "current": null,
+        "status": 400
+      },
+      "n": 51,
+      "note": "only an attempt carries a deadline",
+      "op": {
+        "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+        "claim_key": "gVttCo7ryXGoiZrLipQDDS7hq8AkcVpMW-vcNPa0rb4",
+        "deadline": "2026-01-01T00:10:00.000Z",
+        "expected_step": 0,
+        "type": "failed"
+      },
+      "row": "-"
+    },
+    {
+      "action": "write",
+      "app": "E",
+      "claim_key": "O8",
+      "entry": {
+        "attempt": "e1",
+        "expected_step": 0,
+        "orphan_after": 3600,
+        "type": "attempt"
+      },
+      "expect": {
+        "code": "permission_missing",
+        "current": null,
+        "status": 403
+      },
+      "n": 52,
+      "note": "an app without claims.write",
+      "op": {
+        "attempt_id": "O11V8xENELT2pykACwQt6Q",
+        "claim_key": "gVttCo7ryXGoiZrLipQDDS7hq8AkcVpMW-vcNPa0rb4",
+        "expected_step": 0,
+        "orphan_after": 3600,
+        "type": "attempt"
+      },
+      "row": "-"
+    },
+    {
+      "action": "read",
+      "app": "A",
+      "claim_key": "O8",
+      "expect": {
+        "code": "not_found",
+        "current": null,
+        "status": 404
+      },
+      "n": 53,
+      "note": "nothing was stored"
+    },
+    {
+      "action": "write",
+      "app": "A",
+      "claim_key": "O10",
+      "entry": {
+        "attempt": "a1",
+        "deadline_after_s": 1200,
+        "expected_step": 0,
+        "orphan_after": 3600,
+        "type": "attempt"
+      },
+      "expect": {
+        "claim": {
+          "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+          "attempts": [
+            {
+              "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+              "duplicate": false,
+              "opened_at": "2026-01-01T00:10:00.000Z",
+              "orphan_after": 3600,
+              "orphaned": false,
+              "outcome": "open",
+              "owner": "rbedjtmm6qhfpx3ejngdkjeprr",
+              "possibly_duplicate": false
+            }
+          ],
+          "claim_key": "3Qe0BfHFOMaYpLs8RVpLsL0QsaiI9YC-wmP-NTfMXiM",
+          "deadline": "2026-01-01T00:20:00.000Z",
+          "divergent": false,
+          "next_possibly_duplicate": false,
+          "owner": "rbedjtmm6qhfpx3ejngdkjeprr",
+          "state": "ATTEMPTING",
+          "step": 1,
+          "tombstone": false
+        },
+        "status": 200
+      },
+      "n": 54,
+      "note": "attempt with a deadline 1200 s after the start",
+      "op": {
+        "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+        "claim_key": "3Qe0BfHFOMaYpLs8RVpLsL0QsaiI9YC-wmP-NTfMXiM",
+        "deadline": "2026-01-01T00:20:00.000Z",
+        "expected_step": 0,
+        "orphan_after": 3600,
+        "type": "attempt"
+      },
+      "row": "1"
+    },
+    {
+      "action": "write",
+      "app": "A",
+      "claim_key": "O10",
+      "entry": {
+        "attempt": "a1",
+        "expected_step": 1,
+        "type": "failed"
+      },
+      "expect": {
+        "claim": {
+          "attempts": [
+            {
+              "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+              "duplicate": false,
+              "opened_at": "2026-01-01T00:10:00.000Z",
+              "orphan_after": 3600,
+              "orphaned": false,
+              "outcome": "failed",
+              "owner": "rbedjtmm6qhfpx3ejngdkjeprr",
+              "possibly_duplicate": false,
+              "resolved_by": "rbedjtmm6qhfpx3ejngdkjeprr"
+            }
+          ],
+          "claim_key": "3Qe0BfHFOMaYpLs8RVpLsL0QsaiI9YC-wmP-NTfMXiM",
+          "deadline": "2026-01-01T00:20:00.000Z",
+          "divergent": false,
+          "next_possibly_duplicate": false,
+          "state": "FREE",
+          "step": 2,
+          "tombstone": false
+        },
+        "status": 200
+      },
+      "n": 55,
+      "note": "the owner fails it: FREE, its only attempt failed",
+      "op": {
+        "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+        "claim_key": "3Qe0BfHFOMaYpLs8RVpLsL0QsaiI9YC-wmP-NTfMXiM",
+        "expected_step": 1,
+        "type": "failed"
+      },
+      "row": "5"
+    },
+    {
+      "action": "advance",
+      "n": 56,
+      "seconds": 600
+    },
+    {
+      "action": "read",
+      "app": "A",
+      "claim_key": "O10",
+      "expect": {
+        "claim": {
+          "attempts": [
+            {
+              "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+              "duplicate": false,
+              "opened_at": "2026-01-01T00:10:00.000Z",
+              "orphan_after": 3600,
+              "orphaned": false,
+              "outcome": "failed",
+              "owner": "rbedjtmm6qhfpx3ejngdkjeprr",
+              "possibly_duplicate": false,
+              "resolved_by": "rbedjtmm6qhfpx3ejngdkjeprr"
+            }
+          ],
+          "claim_key": "3Qe0BfHFOMaYpLs8RVpLsL0QsaiI9YC-wmP-NTfMXiM",
+          "deadline": "2026-01-01T00:20:00.000Z",
+          "divergent": false,
+          "next_possibly_duplicate": false,
+          "state": "FREE",
+          "step": 2,
+          "tombstone": false
+        },
+        "status": 200
+      },
+      "n": 57,
+      "note": "the service clock reached the deadline: the failed claim stays for the 30-day reconciliation window"
+    },
+    {
+      "action": "write",
+      "app": "B",
+      "claim_key": "O10",
+      "entry": {
+        "attempt": "a1",
+        "basis": "evidence",
+        "evidence": "r2",
+        "expected_step": 2,
+        "type": "done"
+      },
+      "expect": {
+        "claim": {
+          "attempts": [
+            {
+              "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+              "duplicate": false,
+              "opened_at": "2026-01-01T00:10:00.000Z",
+              "orphan_after": 3600,
+              "orphaned": false,
+              "outcome": "done",
+              "owner": "rbedjtmm6qhfpx3ejngdkjeprr",
+              "possibly_duplicate": false,
+              "resolved_by": "as16gnyxnnhet86cip8ftw4odw"
+            }
+          ],
+          "claim_key": "3Qe0BfHFOMaYpLs8RVpLsL0QsaiI9YC-wmP-NTfMXiM",
+          "deadline": "2026-01-01T00:20:00.000Z",
+          "divergent": false,
+          "next_possibly_duplicate": false,
+          "state": "SETTLED",
+          "step": 3,
+          "tombstone": true
+        },
+        "status": 200
+      },
+      "n": 58,
+      "note": "a late receipt within the window: done on the failed attempt, SETTLED, a tombstone",
+      "op": {
+        "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+        "basis": "evidence",
+        "claim_key": "3Qe0BfHFOMaYpLs8RVpLsL0QsaiI9YC-wmP-NTfMXiM",
+        "evidence_ref": "-cRkK6sYuInRpI4TxR_ZCQeFnwXNfFurO0BCLNftS8M",
+        "expected_step": 2,
+        "type": "done"
+      },
+      "row": "3"
+    },
+    {
+      "action": "noop_batch",
+      "app": "A",
+      "condition_step": 1,
+      "cursor": false,
+      "expect": {
+        "proofs": 0,
+        "status": 200
+      },
+      "n": 59,
+      "note": "a failing condition without cursor.set: a no-op, answered before the conditions",
+      "request_body": "{\"ops\":[{\"body\":\"eyJpZGVudGl0eSI6IjloNWE4MXpzNHdmd2lvYmFhNTY4YzhwbnhyOThxZjRlZHQ3dW1na2p3Nmhya2loYjh1b3kiLCJhcHBfaWQiOiJyYmVkanRtbTZxaGZweDNlam5nZGtqZXByciIsImdlbmVyYXRpb24iOjEsImJhdGNoIjp7ImlkIjoiUVBPbHVzX1dvUERHR05rdW1TWGdrZyIsImNvdW50IjoxfSwiY29uZGl0aW9ucyI6W3siY2xhaW1fc3RlcCI6eyJjbGFpbV9rZXkiOiJ1X2Q3Ykc4UW1uT0U4X0RhUGREMExwUjFsNF9hcGxKYzhBVE54WEo4b3FVIiwic3RlcCI6MX19XSwib3AiOiJhcHAucHV0IiwicmVjb3JkIjp7ImJvZHkiOiJleUoySWpveExDSnJhVzVrSWpvaWNIVmlhM2t0YzNkcGRHTm9MbUZ3Y0NJc0ltbGtaVzUwYVhSNUlqb2lPV2cxWVRneGVuTTBkMlozYVc5aVlXRTFOamhqT0hCdWVISTVPSEZtTkdWa2REZDFiV2RyYW5jMmFISnJhV2hpT0hWdmVTSXNJbUZ3Y0Y5cFpDSTZJbkppWldScWRHMXRObkZvWm5CNE0yVnFibWRrYTJwbGNISnlJaXdpYzJsbmJtbHVaMTlyWlhraU9pSkZNRVUzU2xsblVVMVlNRmd4WlVka04zVlNURVJtTVVkVVoyVkZkbVZhVUdkNFVreEJWRFJmTFhjMElpd2lZMlZ5ZENJNmV5SmliMlI1SWpvaVpYbEtNa2xxYjNoTVEwcHlZVmMxYTBscWIybGpTRlpwWVROcmRHTXpaSEJrUjA1dlRHMUdkMk5HT1dwYVdFb3dTV2wzYVdGWFVteGlibEp3WkVocmFVOXBTVFZoUkZab1QwUkdObU42VWpOYWJtUndZakpLYUZsVVZUSlBSMDAwWTBjMU5HTnFhelJqVjFrd1dsZFNNRTR6Vm5SYU1uUnhaSHBhYjJOdGRIQmhSMGswWkZjNU5VbHBkMmxaV0VKM1dESnNhMGxxYjJsamJVcHNXa2R3TUdKWE1ESmpWMmh0WTBobmVscFhjSFZhTWxKeVlXMVdkMk51U1dsTVEwcDZZVmRrZFdGWE5XNVlNblJzWlZOSk5rbHJWWGRTVkdSTFYxZGtVbFJXWjNkWFJFWnNVakpSTTJSV1NrMVNSMWw0VWpGU2JscFZWakphVm5CUldqTm9VMVJGUmxWT1JqaDBaSHBSYVV4RFNtbGtWelZyWWtkV1ptRXlWalZKYW05cFYwVndSMk50ZEZsalZuQnVWV3hvYkZFemNFOU9WV2hPWW01R1QySllhR3hTYlZWM1pGZHNSMkpYVm5kU01qQjBUWHBhZUdKc1RrZGtlVWx6U1c1T2FtSXpRbXhqZVVrMlYzbEtkMWxZYTJsWVUzZHBZMGRXZVdKWGJIcGpNbXgyWW01TmFVOXNjMmxaTW5ob1lWY3hla3h1U214WlYxRnBURU5LYW1KSFJuQmlXRTExWkROS2NHUkhWV2xNUTBwcVlqSTFNbHBZU25wWldGSndZakkwZFZsWFVtdEpiREJ6U1cxc2VtTXpWbXhhUmpsb1pFTkpOa2xxU1hkTmFsbDBUVVJGZEUxRVJsVk5SRUUyVFVSQk5rMUVRWFZOUkVGM1YybEpjMGx0VmpSalIyeDVXbGhPWmxsWVVXbFBhVWw1VFVSSk0weFVRWGhNVkVGNFZrUkJkMDlxUVhkUGFrRjNUR3BCZDAxR2IybG1VU0lzSW5OcFp5STZJbll6T0RJemJ5MXhXa1F4TnpjeFdrWllSVUV5WlVneVZFVnNPVEkyVEVGQmFIRTJNRlF3WjI4d1ZXbFZRalkyVEVSdWFscDFORVZRVVc0NFJtWm5lWHBSWDNkNFZrc3lTRFZhUm5jMFREbGhiVEE1TlVGUkluMHNJbUZqWTJWd2RITWlPbHRkTENKallYQmhZbWxzYVhScFpYTWlPbnNpWlc1a2NHOXBiblJmYVdSbGJuUnBabWxsY25NaU9sdGRmU3dpY0hWaWJHbGpYMlZ1WkhCdmFXNTBjeUk2ZTMwc0lteGhZbVZzSWpwdWRXeHNMQ0oxY0dSaGRHVmtYMkYwSWpvaU1qQXlOaTB3TVMwd01WUXdNRG93TURvd01DNHdNREJhSWl3aVpYaHdhWEpsYzE5aGRDSTZiblZzYkgwIiwic2lnIjoiVE5vU3lOalhoSXotNFc2b2d4Q2xxS1ZldzcxR1doYWM4OFZVM2hwT0Q2NDhDejYxN0IyYkMzZDhHN1UxZDUwYUFmZGNJenFscGloVUt6Y094SUNTRFEifX0\",\"sig\":\"o8CmeChDgNe-cPax8IXiCAkL1VB4jIoglgm8iU0u6OzDOWk--38yZO65kkRigFX32NLV5SOJmz0uq05_A5uuCA\"}]}"
+    },
+    {
+      "action": "noop_batch",
+      "app": "A",
+      "condition_step": 1,
+      "cursor": true,
+      "cursor_position": "1:41",
+      "expect": {
+        "code": "conflict",
+        "current": {
+          "claim": null,
+          "claim_step": {
+            "claim_key": "u_d7bG8QmnOE8_DaPdD0LpR1l4_aplJc8ATNxXJ8oqU",
+            "step": 0
+          }
+        },
+        "status": 409
+      },
+      "n": 60,
+      "note": "the same with cursor.set: checked in full, 409 conflict, the cursor stays",
+      "request_body": "{\"ops\":[{\"body\":\"eyJpZGVudGl0eSI6IjloNWE4MXpzNHdmd2lvYmFhNTY4YzhwbnhyOThxZjRlZHQ3dW1na2p3Nmhya2loYjh1b3kiLCJhcHBfaWQiOiJyYmVkanRtbTZxaGZweDNlam5nZGtqZXByciIsImdlbmVyYXRpb24iOjEsImJhdGNoIjp7ImlkIjoiMFhOSnhBQ2pibEJZY0x1NjgxTUZuZyIsImNvdW50IjoxfSwiY29uZGl0aW9ucyI6W3siY2xhaW1fc3RlcCI6eyJjbGFpbV9rZXkiOiJ1X2Q3Ykc4UW1uT0U4X0RhUGREMExwUjFsNF9hcGxKYzhBVE54WEo4b3FVIiwic3RlcCI6MX19XSwib3AiOiJhcHAucHV0IiwicmVjb3JkIjp7ImJvZHkiOiJleUoySWpveExDSnJhVzVrSWpvaWNIVmlhM2t0YzNkcGRHTm9MbUZ3Y0NJc0ltbGtaVzUwYVhSNUlqb2lPV2cxWVRneGVuTTBkMlozYVc5aVlXRTFOamhqT0hCdWVISTVPSEZtTkdWa2REZDFiV2RyYW5jMmFISnJhV2hpT0hWdmVTSXNJbUZ3Y0Y5cFpDSTZJbkppWldScWRHMXRObkZvWm5CNE0yVnFibWRrYTJwbGNISnlJaXdpYzJsbmJtbHVaMTlyWlhraU9pSkZNRVUzU2xsblVVMVlNRmd4WlVka04zVlNURVJtTVVkVVoyVkZkbVZhVUdkNFVreEJWRFJmTFhjMElpd2lZMlZ5ZENJNmV5SmliMlI1SWpvaVpYbEtNa2xxYjNoTVEwcHlZVmMxYTBscWIybGpTRlpwWVROcmRHTXpaSEJrUjA1dlRHMUdkMk5HT1dwYVdFb3dTV2wzYVdGWFVteGlibEp3WkVocmFVOXBTVFZoUkZab1QwUkdObU42VWpOYWJtUndZakpLYUZsVVZUSlBSMDAwWTBjMU5HTnFhelJqVjFrd1dsZFNNRTR6Vm5SYU1uUnhaSHBhYjJOdGRIQmhSMGswWkZjNU5VbHBkMmxaV0VKM1dESnNhMGxxYjJsamJVcHNXa2R3TUdKWE1ESmpWMmh0WTBobmVscFhjSFZhTWxKeVlXMVdkMk51U1dsTVEwcDZZVmRrZFdGWE5XNVlNblJzWlZOSk5rbHJWWGRTVkdSTFYxZGtVbFJXWjNkWFJFWnNVakpSTTJSV1NrMVNSMWw0VWpGU2JscFZWakphVm5CUldqTm9VMVJGUmxWT1JqaDBaSHBSYVV4RFNtbGtWelZyWWtkV1ptRXlWalZKYW05cFYwVndSMk50ZEZsalZuQnVWV3hvYkZFemNFOU9WV2hPWW01R1QySllhR3hTYlZWM1pGZHNSMkpYVm5kU01qQjBUWHBhZUdKc1RrZGtlVWx6U1c1T2FtSXpRbXhqZVVrMlYzbEtkMWxZYTJsWVUzZHBZMGRXZVdKWGJIcGpNbXgyWW01TmFVOXNjMmxaTW5ob1lWY3hla3h1U214WlYxRnBURU5LYW1KSFJuQmlXRTExWkROS2NHUkhWV2xNUTBwcVlqSTFNbHBZU25wWldGSndZakkwZFZsWFVtdEpiREJ6U1cxc2VtTXpWbXhhUmpsb1pFTkpOa2xxU1hkTmFsbDBUVVJGZEUxRVJsVk5SRUUyVFVSQk5rMUVRWFZOUkVGM1YybEpjMGx0VmpSalIyeDVXbGhPWmxsWVVXbFBhVWw1VFVSSk0weFVRWGhNVkVGNFZrUkJkMDlxUVhkUGFrRjNUR3BCZDAxR2IybG1VU0lzSW5OcFp5STZJbll6T0RJemJ5MXhXa1F4TnpjeFdrWllSVUV5WlVneVZFVnNPVEkyVEVGQmFIRTJNRlF3WjI4d1ZXbFZRalkyVEVSdWFscDFORVZRVVc0NFJtWm5lWHBSWDNkNFZrc3lTRFZhUm5jMFREbGhiVEE1TlVGUkluMHNJbUZqWTJWd2RITWlPbHRkTENKallYQmhZbWxzYVhScFpYTWlPbnNpWlc1a2NHOXBiblJmYVdSbGJuUnBabWxsY25NaU9sdGRmU3dpY0hWaWJHbGpYMlZ1WkhCdmFXNTBjeUk2ZTMwc0lteGhZbVZzSWpwdWRXeHNMQ0oxY0dSaGRHVmtYMkYwSWpvaU1qQXlOaTB3TVMwd01WUXdNRG93TURvd01DNHdNREJhSWl3aVpYaHdhWEpsYzE5aGRDSTZiblZzYkgwIiwic2lnIjoiVE5vU3lOalhoSXotNFc2b2d4Q2xxS1ZldzcxR1doYWM4OFZVM2hwT0Q2NDhDejYxN0IyYkMzZDhHN1UxZDUwYUFmZGNJenFscGloVUt6Y094SUNTRFEifX0\",\"sig\":\"absFs_vb0V3Ki4e5gJClvmQ3_DjJsYoyNSGO3PqpwvsqWPDTyscO0rLlDZhhlOXYSRwu1mtIQD8TFIcotID0Cw\"},{\"op\":\"cursor.set\",\"position\":\"1:41\"}]}"
+    },
+    {
+      "action": "noop_batch",
+      "app": "A",
+      "condition_step": 0,
+      "cursor": true,
+      "cursor_position": "1:41",
+      "expect": {
+        "proofs": 0,
+        "status": 200
+      },
+      "n": 61,
+      "note": "a condition that holds, with cursor.set: the cursor moves, no proof, no chain item",
+      "request_body": "{\"ops\":[{\"body\":\"eyJpZGVudGl0eSI6IjloNWE4MXpzNHdmd2lvYmFhNTY4YzhwbnhyOThxZjRlZHQ3dW1na2p3Nmhya2loYjh1b3kiLCJhcHBfaWQiOiJyYmVkanRtbTZxaGZweDNlam5nZGtqZXByciIsImdlbmVyYXRpb24iOjEsImJhdGNoIjp7ImlkIjoicFZzSXJjZG05RVFWVFEtLXduYjFvUSIsImNvdW50IjoxfSwiY29uZGl0aW9ucyI6W3siY2xhaW1fc3RlcCI6eyJjbGFpbV9rZXkiOiJ1X2Q3Ykc4UW1uT0U4X0RhUGREMExwUjFsNF9hcGxKYzhBVE54WEo4b3FVIiwic3RlcCI6MH19XSwib3AiOiJhcHAucHV0IiwicmVjb3JkIjp7ImJvZHkiOiJleUoySWpveExDSnJhVzVrSWpvaWNIVmlhM2t0YzNkcGRHTm9MbUZ3Y0NJc0ltbGtaVzUwYVhSNUlqb2lPV2cxWVRneGVuTTBkMlozYVc5aVlXRTFOamhqT0hCdWVISTVPSEZtTkdWa2REZDFiV2RyYW5jMmFISnJhV2hpT0hWdmVTSXNJbUZ3Y0Y5cFpDSTZJbkppWldScWRHMXRObkZvWm5CNE0yVnFibWRrYTJwbGNISnlJaXdpYzJsbmJtbHVaMTlyWlhraU9pSkZNRVUzU2xsblVVMVlNRmd4WlVka04zVlNURVJtTVVkVVoyVkZkbVZhVUdkNFVreEJWRFJmTFhjMElpd2lZMlZ5ZENJNmV5SmliMlI1SWpvaVpYbEtNa2xxYjNoTVEwcHlZVmMxYTBscWIybGpTRlpwWVROcmRHTXpaSEJrUjA1dlRHMUdkMk5HT1dwYVdFb3dTV2wzYVdGWFVteGlibEp3WkVocmFVOXBTVFZoUkZab1QwUkdObU42VWpOYWJtUndZakpLYUZsVVZUSlBSMDAwWTBjMU5HTnFhelJqVjFrd1dsZFNNRTR6Vm5SYU1uUnhaSHBhYjJOdGRIQmhSMGswWkZjNU5VbHBkMmxaV0VKM1dESnNhMGxxYjJsamJVcHNXa2R3TUdKWE1ESmpWMmh0WTBobmVscFhjSFZhTWxKeVlXMVdkMk51U1dsTVEwcDZZVmRrZFdGWE5XNVlNblJzWlZOSk5rbHJWWGRTVkdSTFYxZGtVbFJXWjNkWFJFWnNVakpSTTJSV1NrMVNSMWw0VWpGU2JscFZWakphVm5CUldqTm9VMVJGUmxWT1JqaDBaSHBSYVV4RFNtbGtWelZyWWtkV1ptRXlWalZKYW05cFYwVndSMk50ZEZsalZuQnVWV3hvYkZFemNFOU9WV2hPWW01R1QySllhR3hTYlZWM1pGZHNSMkpYVm5kU01qQjBUWHBhZUdKc1RrZGtlVWx6U1c1T2FtSXpRbXhqZVVrMlYzbEtkMWxZYTJsWVUzZHBZMGRXZVdKWGJIcGpNbXgyWW01TmFVOXNjMmxaTW5ob1lWY3hla3h1U214WlYxRnBURU5LYW1KSFJuQmlXRTExWkROS2NHUkhWV2xNUTBwcVlqSTFNbHBZU25wWldGSndZakkwZFZsWFVtdEpiREJ6U1cxc2VtTXpWbXhhUmpsb1pFTkpOa2xxU1hkTmFsbDBUVVJGZEUxRVJsVk5SRUUyVFVSQk5rMUVRWFZOUkVGM1YybEpjMGx0VmpSalIyeDVXbGhPWmxsWVVXbFBhVWw1VFVSSk0weFVRWGhNVkVGNFZrUkJkMDlxUVhkUGFrRjNUR3BCZDAxR2IybG1VU0lzSW5OcFp5STZJbll6T0RJemJ5MXhXa1F4TnpjeFdrWllSVUV5WlVneVZFVnNPVEkyVEVGQmFIRTJNRlF3WjI4d1ZXbFZRalkyVEVSdWFscDFORVZRVVc0NFJtWm5lWHBSWDNkNFZrc3lTRFZhUm5jMFREbGhiVEE1TlVGUkluMHNJbUZqWTJWd2RITWlPbHRkTENKallYQmhZbWxzYVhScFpYTWlPbnNpWlc1a2NHOXBiblJmYVdSbGJuUnBabWxsY25NaU9sdGRmU3dpY0hWaWJHbGpYMlZ1WkhCdmFXNTBjeUk2ZTMwc0lteGhZbVZzSWpwdWRXeHNMQ0oxY0dSaGRHVmtYMkYwSWpvaU1qQXlOaTB3TVMwd01WUXdNRG93TURvd01DNHdNREJhSWl3aVpYaHdhWEpsYzE5aGRDSTZiblZzYkgwIiwic2lnIjoiVE5vU3lOalhoSXotNFc2b2d4Q2xxS1ZldzcxR1doYWM4OFZVM2hwT0Q2NDhDejYxN0IyYkMzZDhHN1UxZDUwYUFmZGNJenFscGloVUt6Y094SUNTRFEifX0\",\"sig\":\"oFkIn_gA00hkqT1V8Jd0P86UJ7H3g-hj9GPflD8lGujfdNh29SNLyrmY1FuuwPLFev8hsImLev6Jk0boFjrUCg\"},{\"op\":\"cursor.set\",\"position\":\"1:41\"}]}"
+    },
+    {
+      "action": "noop_batch",
+      "app": "C",
+      "condition_step": null,
+      "cursor": true,
+      "cursor_position": "1:41",
+      "expect": {
+        "code": "not_current",
+        "current": null,
+        "status": 403
+      },
+      "n": 62,
+      "note": "the revoked app's app.put of its held record with cursor.set: 403 not_current",
+      "request_body": "{\"ops\":[{\"body\":\"eyJpZGVudGl0eSI6IjloNWE4MXpzNHdmd2lvYmFhNTY4YzhwbnhyOThxZjRlZHQ3dW1na2p3Nmhya2loYjh1b3kiLCJhcHBfaWQiOiJmZmFtOXJwcmExOW1nOHh0M2Zub2h1Z2JlbyIsImdlbmVyYXRpb24iOjEsImJhdGNoIjp7ImlkIjoiYWRXY2NZMk5qeG5ZNU5qY2JKelNXQSIsImNvdW50IjoxfSwib3AiOiJhcHAucHV0IiwicmVjb3JkIjp7ImJvZHkiOiJleUoySWpveExDSnJhVzVrSWpvaWNIVmlhM2t0YzNkcGRHTm9MbUZ3Y0NJc0ltbGtaVzUwYVhSNUlqb2lPV2cxWVRneGVuTTBkMlozYVc5aVlXRTFOamhqT0hCdWVISTVPSEZtTkdWa2REZDFiV2RyYW5jMmFISnJhV2hpT0hWdmVTSXNJbUZ3Y0Y5cFpDSTZJbVptWVcwNWNuQnlZVEU1YldjNGVIUXpabTV2YUhWblltVnZJaXdpYzJsbmJtbHVaMTlyWlhraU9pSk5ibXBsU1VWS1ZEZEJOSEJMTW14TlpFcEpTRlZ5VkRSbFgyVmFWMmg2Y0RaRWJrbEJjell5Tm1keklpd2lZMlZ5ZENJNmV5SmliMlI1SWpvaVpYbEtNa2xxYjNoTVEwcHlZVmMxYTBscWIybGpTRlpwWVROcmRHTXpaSEJrUjA1dlRHMUdkMk5HT1dwYVdFb3dTV2wzYVdGWFVteGlibEp3WkVocmFVOXBTVFZoUkZab1QwUkdObU42VWpOYWJtUndZakpLYUZsVVZUSlBSMDAwWTBjMU5HTnFhelJqVjFrd1dsZFNNRTR6Vm5SYU1uUnhaSHBhYjJOdGRIQmhSMGswWkZjNU5VbHBkMmxaV0VKM1dESnNhMGxxYjJsYWJWcG9ZbFJzZVdOSVNtaE5WR3gwV25wb05HUkVUbTFpYlRsdlpGZGthVnBYT0dsTVEwcDZZVmRrZFdGWE5XNVlNblJzWlZOSk5rbHJNWFZoYlZaS1VsVndWVTR3UlRCalJYTjVZa1V4YTFOcmJFbFdXRXBWVGtkV1pscFdjRmhoU0hCM1RtdFNkVk5WUm5wT2Fra3lXak5OYVV4RFNtbGtWelZyWWtkV1ptRXlWalZKYW05cFYwWkNNMVpIU1hSVlF6RjFWRlJTTVdKRVducGpSbFpNVWpBeFRGZFlSVFJWYlVacVVucGpNMWRWZERSVFIwVjVZa1pDVEUxSGJFWmFlVWx6U1c1T2FtSXpRbXhqZVVrMlYzbEtkMWxZYTJsWVUzZHBZMGRXZVdKWGJIcGpNbXgyWW01TmFVOXNjMmxaTW5ob1lWY3hla3h1U214WlYxRnBURU5LYW1KSFJuQmlXRTExWkROS2NHUkhWV2xNUTBwcVlqSTFNbHBZU25wWldGSndZakkwZFZsWFVtdEpiREJ6U1cxc2VtTXpWbXhhUmpsb1pFTkpOa2xxU1hkTmFsbDBUVVJGZEUxRVJsVk5SRUUyVFVSQk5rMUVRWFZOUkVGM1YybEpjMGx0VmpSalIyeDVXbGhPWmxsWVVXbFBhVWw1VFVSSk0weFVRWGhNVkVGNFZrUkJkMDlxUVhkUGFrRjNUR3BCZDAxR2IybG1VU0lzSW5OcFp5STZJalZOZEhkdGIyMDJOWEJoYVZwTWRuVnhSMWw1T1dsNlJWaEZSa1Y1Y2s5RlRHdEdRMDlaWkY5YVpITTNheTFXVkdsTVpqVkJXVVkwVGt0TFFXZGhaalpWYW5CcWJUQnhkWGh0Y2xKVFJuVkVaRGRHT0VOM0luMHNJbUZqWTJWd2RITWlPbHRkTENKallYQmhZbWxzYVhScFpYTWlPbnNpWlc1a2NHOXBiblJmYVdSbGJuUnBabWxsY25NaU9sdGRmU3dpY0hWaWJHbGpYMlZ1WkhCdmFXNTBjeUk2ZTMwc0lteGhZbVZzSWpwdWRXeHNMQ0oxY0dSaGRHVmtYMkYwSWpvaU1qQXlOaTB3TVMwd01WUXdNRG93TURvd01DNHdNREJhSWl3aVpYaHdhWEpsYzE5aGRDSTZiblZzYkgwIiwic2lnIjoidEpXSHoyYk9lSGtjcTgyT2NwbHM1X2ZBNTlkNm1FQjRJZ0dmclUxQ1ZiOG5pbXpKTUxWa2VWY05tOFRGOHNrcUxIZzFGVlNDSGhJTjBJUkJvN1UwQncifX0\",\"sig\":\"psq40pnfecXqpKP5ah26bV-fSeIMh_xobbJotA6CwCNPKwaBzGR8REhJVddnzr3mCTeyPvtTEoN79pmcUxVSDw\"},{\"op\":\"cursor.set\",\"position\":\"1:41\"}]}"
+    },
+    {
+      "action": "advance",
+      "n": 63,
+      "seconds": 2591999
+    },
+    {
+      "action": "read",
+      "app": "A",
+      "claim_key": "O10",
+      "expect": {
+        "claim": {
+          "attempts": [
+            {
+              "attempt_id": "P5BA8Wc-dkw7tsS44NbRCA",
+              "duplicate": false,
+              "opened_at": "2026-01-01T00:10:00.000Z",
+              "orphan_after": 3600,
+              "orphaned": false,
+              "outcome": "done",
+              "owner": "rbedjtmm6qhfpx3ejngdkjeprr",
+              "possibly_duplicate": false,
+              "resolved_by": "as16gnyxnnhet86cip8ftw4odw"
+            }
+          ],
+          "claim_key": "3Qe0BfHFOMaYpLs8RVpLsL0QsaiI9YC-wmP-NTfMXiM",
+          "deadline": "2026-01-01T00:20:00.000Z",
+          "divergent": false,
+          "next_possibly_duplicate": false,
+          "state": "SETTLED",
+          "step": 3,
+          "tombstone": true
+        },
+        "status": 200
+      },
+      "n": 64,
+      "note": "1 s before O10's deadline plus 30 days: the tombstone is kept"
+    },
+    {
+      "action": "read",
+      "app": "A",
+      "claim_key": "O7",
+      "expect": {
+        "code": "not_found",
+        "current": null,
+        "status": 404
+      },
+      "n": 65,
+      "note": "O7's deadline plus 30 days has passed: the tombstone is deleted"
+    },
+    {
+      "action": "advance",
+      "n": 66,
+      "seconds": 1
+    },
+    {
+      "action": "read",
+      "app": "A",
+      "claim_key": "O10",
+      "expect": {
+        "code": "not_found",
+        "current": null,
+        "status": 404
+      },
+      "n": 67,
+      "note": "the service clock reached O10's deadline plus 30 days: deleted"
+    },
+    {
+      "action": "app_put",
+      "app": "A",
+      "expect": {
+        "proofs": 0,
+        "status": 200
+      },
+      "n": 68,
+      "note": "the record the switch holds, byte for byte: a no-op, no proof",
+      "record": {
+        "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFwcCIsImlkZW50aXR5IjoiOWg1YTgxenM0d2Z3aW9iYWE1NjhjOHBueHI5OHFmNGVkdDd1bWdranc2aHJraWhiOHVveSIsImFwcF9pZCI6InJiZWRqdG1tNnFoZnB4M2Vqbmdka2plcHJyIiwic2lnbmluZ19rZXkiOiJFMEU3SllnUU1YMFgxZUdkN3VSTERmMUdUZ2VFdmVaUGd4UkxBVDRfLXc0IiwiY2VydCI6eyJib2R5IjoiZXlKMklqb3hMQ0pyYVc1a0lqb2ljSFZpYTNrdGMzZHBkR05vTG1Gd2NGOWpaWEowSWl3aWFXUmxiblJwZEhraU9pSTVhRFZoT0RGNmN6UjNabmRwYjJKaFlUVTJPR000Y0c1NGNqazRjV1kwWldSME4zVnRaMnRxZHpab2NtdHBhR0k0ZFc5NUlpd2lZWEJ3WDJsa0lqb2ljbUpsWkdwMGJXMDJjV2htY0hnelpXcHVaMlJyYW1Wd2NuSWlMQ0p6YVdkdWFXNW5YMnRsZVNJNklrVXdSVGRLV1dkUlRWZ3dXREZsUjJRM2RWSk1SR1l4UjFSblpVVjJaVnBRWjNoU1RFRlVORjh0ZHpRaUxDSmlkVzVrYkdWZmEyVjVJam9pV0VwR2NtdFljVnBuVWxobFEzcE9OVWhOYm5GT2JYaGxSbVV3ZFdsR2JXVndSMjB0TXpaeGJsTkdkeUlzSW5OamIzQmxjeUk2V3lKd1lYa2lYU3dpY0dWeWJXbHpjMmx2Ym5NaU9sc2lZMnhoYVcxekxuSmxZV1FpTENKamJHRnBiWE11ZDNKcGRHVWlMQ0pqYjI1MlpYSnpZWFJwYjI0dVlXUmtJbDBzSW1semMzVmxaRjloZENJNklqSXdNall0TURFdE1ERlVNREE2TURBNk1EQXVNREF3V2lJc0ltVjRjR2x5WlhOZllYUWlPaUl5TURJM0xUQXhMVEF4VkRBd09qQXdPakF3TGpBd01Gb2lmUSIsInNpZyI6InYzODIzby1xWkQxNzcxWkZYRUEyZUgyVEVsOTI2TEFBaHE2MFQwZ28wVWlVQjY2TERualp1NEVQUW44RmZneXpRX3d4VksySDVaRnc0TDlhbTA5NUFRIn0sImFjY2VwdHMiOltdLCJjYXBhYmlsaXRpZXMiOnsiZW5kcG9pbnRfaWRlbnRpZmllcnMiOltdfSwicHVibGljX2VuZHBvaW50cyI6e30sImxhYmVsIjpudWxsLCJ1cGRhdGVkX2F0IjoiMjAyNi0wMS0wMVQwMDowMDowMC4wMDBaIiwiZXhwaXJlc19hdCI6bnVsbH0",
+        "sig": "TNoSyNjXhIz-4W6ogxClqKVew71GWhac88VU3hpOD648Cz617B2bC3d8G7U1d50aAfdcIzqlpihUKzcOxICSDQ"
+      },
+      "request_body": "{\"ops\":[{\"body\":\"eyJpZGVudGl0eSI6IjloNWE4MXpzNHdmd2lvYmFhNTY4YzhwbnhyOThxZjRlZHQ3dW1na2p3Nmhya2loYjh1b3kiLCJhcHBfaWQiOiJyYmVkanRtbTZxaGZweDNlam5nZGtqZXByciIsImdlbmVyYXRpb24iOjEsImJhdGNoIjp7ImlkIjoiMmhkd1cwaFVIRTl6X1JreFFpU1hEZyIsImNvdW50IjoxfSwib3AiOiJhcHAucHV0IiwicmVjb3JkIjp7ImJvZHkiOiJleUoySWpveExDSnJhVzVrSWpvaWNIVmlhM2t0YzNkcGRHTm9MbUZ3Y0NJc0ltbGtaVzUwYVhSNUlqb2lPV2cxWVRneGVuTTBkMlozYVc5aVlXRTFOamhqT0hCdWVISTVPSEZtTkdWa2REZDFiV2RyYW5jMmFISnJhV2hpT0hWdmVTSXNJbUZ3Y0Y5cFpDSTZJbkppWldScWRHMXRObkZvWm5CNE0yVnFibWRrYTJwbGNISnlJaXdpYzJsbmJtbHVaMTlyWlhraU9pSkZNRVUzU2xsblVVMVlNRmd4WlVka04zVlNURVJtTVVkVVoyVkZkbVZhVUdkNFVreEJWRFJmTFhjMElpd2lZMlZ5ZENJNmV5SmliMlI1SWpvaVpYbEtNa2xxYjNoTVEwcHlZVmMxYTBscWIybGpTRlpwWVROcmRHTXpaSEJrUjA1dlRHMUdkMk5HT1dwYVdFb3dTV2wzYVdGWFVteGlibEp3WkVocmFVOXBTVFZoUkZab1QwUkdObU42VWpOYWJtUndZakpLYUZsVVZUSlBSMDAwWTBjMU5HTnFhelJqVjFrd1dsZFNNRTR6Vm5SYU1uUnhaSHBhYjJOdGRIQmhSMGswWkZjNU5VbHBkMmxaV0VKM1dESnNhMGxxYjJsamJVcHNXa2R3TUdKWE1ESmpWMmh0WTBobmVscFhjSFZhTWxKeVlXMVdkMk51U1dsTVEwcDZZVmRrZFdGWE5XNVlNblJzWlZOSk5rbHJWWGRTVkdSTFYxZGtVbFJXWjNkWFJFWnNVakpSTTJSV1NrMVNSMWw0VWpGU2JscFZWakphVm5CUldqTm9VMVJGUmxWT1JqaDBaSHBSYVV4RFNtbGtWelZyWWtkV1ptRXlWalZKYW05cFYwVndSMk50ZEZsalZuQnVWV3hvYkZFemNFOU9WV2hPWW01R1QySllhR3hTYlZWM1pGZHNSMkpYVm5kU01qQjBUWHBhZUdKc1RrZGtlVWx6U1c1T2FtSXpRbXhqZVVrMlYzbEtkMWxZYTJsWVUzZHBZMGRXZVdKWGJIcGpNbXgyWW01TmFVOXNjMmxaTW5ob1lWY3hla3h1U214WlYxRnBURU5LYW1KSFJuQmlXRTExWkROS2NHUkhWV2xNUTBwcVlqSTFNbHBZU25wWldGSndZakkwZFZsWFVtdEpiREJ6U1cxc2VtTXpWbXhhUmpsb1pFTkpOa2xxU1hkTmFsbDBUVVJGZEUxRVJsVk5SRUUyVFVSQk5rMUVRWFZOUkVGM1YybEpjMGx0VmpSalIyeDVXbGhPWmxsWVVXbFBhVWw1VFVSSk0weFVRWGhNVkVGNFZrUkJkMDlxUVhkUGFrRjNUR3BCZDAxR2IybG1VU0lzSW5OcFp5STZJbll6T0RJemJ5MXhXa1F4TnpjeFdrWllSVUV5WlVneVZFVnNPVEkyVEVGQmFIRTJNRlF3WjI4d1ZXbFZRalkyVEVSdWFscDFORVZRVVc0NFJtWm5lWHBSWDNkNFZrc3lTRFZhUm5jMFREbGhiVEE1TlVGUkluMHNJbUZqWTJWd2RITWlPbHRkTENKallYQmhZbWxzYVhScFpYTWlPbnNpWlc1a2NHOXBiblJmYVdSbGJuUnBabWxsY25NaU9sdGRmU3dpY0hWaWJHbGpYMlZ1WkhCdmFXNTBjeUk2ZTMwc0lteGhZbVZzSWpwdWRXeHNMQ0oxY0dSaGRHVmtYMkYwSWpvaU1qQXlOaTB3TVMwd01WUXdNRG93TURvd01DNHdNREJhSWl3aVpYaHdhWEpsYzE5aGRDSTZiblZzYkgwIiwic2lnIjoiVE5vU3lOalhoSXotNFc2b2d4Q2xxS1ZldzcxR1doYWM4OFZVM2hwT0Q2NDhDejYxN0IyYkMzZDhHN1UxZDUwYUFmZGNJenFscGloVUt6Y094SUNTRFEifX0\",\"sig\":\"STTDKqZLzcHFUuOLE9PxsQ0J8s-xRtq9CU02SW6gK47_Sanoi3CLORNa5xNyUenONS_9Hw_2udA7oG2IWFx-Cg\"}]}",
+      "variant": "held"
+    },
+    {
+      "action": "app_put",
+      "app": "A",
+      "expect": {
+        "code": "conflict",
+        "current": {
+          "record": {
+            "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFwcCIsImlkZW50aXR5IjoiOWg1YTgxenM0d2Z3aW9iYWE1NjhjOHBueHI5OHFmNGVkdDd1bWdranc2aHJraWhiOHVveSIsImFwcF9pZCI6InJiZWRqdG1tNnFoZnB4M2Vqbmdka2plcHJyIiwic2lnbmluZ19rZXkiOiJFMEU3SllnUU1YMFgxZUdkN3VSTERmMUdUZ2VFdmVaUGd4UkxBVDRfLXc0IiwiY2VydCI6eyJib2R5IjoiZXlKMklqb3hMQ0pyYVc1a0lqb2ljSFZpYTNrdGMzZHBkR05vTG1Gd2NGOWpaWEowSWl3aWFXUmxiblJwZEhraU9pSTVhRFZoT0RGNmN6UjNabmRwYjJKaFlUVTJPR000Y0c1NGNqazRjV1kwWldSME4zVnRaMnRxZHpab2NtdHBhR0k0ZFc5NUlpd2lZWEJ3WDJsa0lqb2ljbUpsWkdwMGJXMDJjV2htY0hnelpXcHVaMlJyYW1Wd2NuSWlMQ0p6YVdkdWFXNW5YMnRsZVNJNklrVXdSVGRLV1dkUlRWZ3dXREZsUjJRM2RWSk1SR1l4UjFSblpVVjJaVnBRWjNoU1RFRlVORjh0ZHpRaUxDSmlkVzVrYkdWZmEyVjVJam9pV0VwR2NtdFljVnBuVWxobFEzcE9OVWhOYm5GT2JYaGxSbVV3ZFdsR2JXVndSMjB0TXpaeGJsTkdkeUlzSW5OamIzQmxjeUk2V3lKd1lYa2lYU3dpY0dWeWJXbHpjMmx2Ym5NaU9sc2lZMnhoYVcxekxuSmxZV1FpTENKamJHRnBiWE11ZDNKcGRHVWlMQ0pqYjI1MlpYSnpZWFJwYjI0dVlXUmtJbDBzSW1semMzVmxaRjloZENJNklqSXdNall0TURFdE1ERlVNREE2TURBNk1EQXVNREF3V2lJc0ltVjRjR2x5WlhOZllYUWlPaUl5TURJM0xUQXhMVEF4VkRBd09qQXdPakF3TGpBd01Gb2lmUSIsInNpZyI6InYzODIzby1xWkQxNzcxWkZYRUEyZUgyVEVsOTI2TEFBaHE2MFQwZ28wVWlVQjY2TERualp1NEVQUW44RmZneXpRX3d4VksySDVaRnc0TDlhbTA5NUFRIn0sImFjY2VwdHMiOltdLCJjYXBhYmlsaXRpZXMiOnsiZW5kcG9pbnRfaWRlbnRpZmllcnMiOltdfSwicHVibGljX2VuZHBvaW50cyI6e30sImxhYmVsIjpudWxsLCJ1cGRhdGVkX2F0IjoiMjAyNi0wMS0wMVQwMDowMDowMC4wMDBaIiwiZXhwaXJlc19hdCI6bnVsbH0",
+            "sig": "TNoSyNjXhIz-4W6ogxClqKVew71GWhac88VU3hpOD648Cz617B2bC3d8G7U1d50aAfdcIzqlpihUKzcOxICSDQ"
+          }
+        },
+        "status": 409
+      },
+      "n": 69,
+      "note": "a record with the held record's updated_at and another label: 409 conflict, the held record in current",
+      "record": {
+        "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFwcCIsImlkZW50aXR5IjoiOWg1YTgxenM0d2Z3aW9iYWE1NjhjOHBueHI5OHFmNGVkdDd1bWdranc2aHJraWhiOHVveSIsImFwcF9pZCI6InJiZWRqdG1tNnFoZnB4M2Vqbmdka2plcHJyIiwic2lnbmluZ19rZXkiOiJFMEU3SllnUU1YMFgxZUdkN3VSTERmMUdUZ2VFdmVaUGd4UkxBVDRfLXc0IiwiY2VydCI6eyJib2R5IjoiZXlKMklqb3hMQ0pyYVc1a0lqb2ljSFZpYTNrdGMzZHBkR05vTG1Gd2NGOWpaWEowSWl3aWFXUmxiblJwZEhraU9pSTVhRFZoT0RGNmN6UjNabmRwYjJKaFlUVTJPR000Y0c1NGNqazRjV1kwWldSME4zVnRaMnRxZHpab2NtdHBhR0k0ZFc5NUlpd2lZWEJ3WDJsa0lqb2ljbUpsWkdwMGJXMDJjV2htY0hnelpXcHVaMlJyYW1Wd2NuSWlMQ0p6YVdkdWFXNW5YMnRsZVNJNklrVXdSVGRLV1dkUlRWZ3dXREZsUjJRM2RWSk1SR1l4UjFSblpVVjJaVnBRWjNoU1RFRlVORjh0ZHpRaUxDSmlkVzVrYkdWZmEyVjVJam9pV0VwR2NtdFljVnBuVWxobFEzcE9OVWhOYm5GT2JYaGxSbVV3ZFdsR2JXVndSMjB0TXpaeGJsTkdkeUlzSW5OamIzQmxjeUk2V3lKd1lYa2lYU3dpY0dWeWJXbHpjMmx2Ym5NaU9sc2lZMnhoYVcxekxuSmxZV1FpTENKamJHRnBiWE11ZDNKcGRHVWlMQ0pqYjI1MlpYSnpZWFJwYjI0dVlXUmtJbDBzSW1semMzVmxaRjloZENJNklqSXdNall0TURFdE1ERlVNREE2TURBNk1EQXVNREF3V2lJc0ltVjRjR2x5WlhOZllYUWlPaUl5TURJM0xUQXhMVEF4VkRBd09qQXdPakF3TGpBd01Gb2lmUSIsInNpZyI6InYzODIzby1xWkQxNzcxWkZYRUEyZUgyVEVsOTI2TEFBaHE2MFQwZ28wVWlVQjY2TERualp1NEVQUW44RmZneXpRX3d4VksySDVaRnc0TDlhbTA5NUFRIn0sImFjY2VwdHMiOltdLCJjYXBhYmlsaXRpZXMiOnsiZW5kcG9pbnRfaWRlbnRpZmllcnMiOltdfSwicHVibGljX2VuZHBvaW50cyI6e30sImxhYmVsIjoiQSBvbiBhbm90aGVyIGRldmljZSIsInVwZGF0ZWRfYXQiOiIyMDI2LTAxLTAxVDAwOjAwOjAwLjAwMFoiLCJleHBpcmVzX2F0IjpudWxsfQ",
+        "sig": "UsfT3Hm4MekrkjAP8ZD5K4rwJTDryviW1p67JMh3hk1PK4gEVG0AZtbZt9ibhOOk1i7Kxd_fQ24RFOybP945BA"
+      },
+      "request_body": "{\"ops\":[{\"body\":\"eyJpZGVudGl0eSI6IjloNWE4MXpzNHdmd2lvYmFhNTY4YzhwbnhyOThxZjRlZHQ3dW1na2p3Nmhya2loYjh1b3kiLCJhcHBfaWQiOiJyYmVkanRtbTZxaGZweDNlam5nZGtqZXByciIsImdlbmVyYXRpb24iOjEsImJhdGNoIjp7ImlkIjoibHUtd0VvRkJfTlQ3TTh4YnBtXzVmUSIsImNvdW50IjoxfSwib3AiOiJhcHAucHV0IiwicmVjb3JkIjp7ImJvZHkiOiJleUoySWpveExDSnJhVzVrSWpvaWNIVmlhM2t0YzNkcGRHTm9MbUZ3Y0NJc0ltbGtaVzUwYVhSNUlqb2lPV2cxWVRneGVuTTBkMlozYVc5aVlXRTFOamhqT0hCdWVISTVPSEZtTkdWa2REZDFiV2RyYW5jMmFISnJhV2hpT0hWdmVTSXNJbUZ3Y0Y5cFpDSTZJbkppWldScWRHMXRObkZvWm5CNE0yVnFibWRrYTJwbGNISnlJaXdpYzJsbmJtbHVaMTlyWlhraU9pSkZNRVUzU2xsblVVMVlNRmd4WlVka04zVlNURVJtTVVkVVoyVkZkbVZhVUdkNFVreEJWRFJmTFhjMElpd2lZMlZ5ZENJNmV5SmliMlI1SWpvaVpYbEtNa2xxYjNoTVEwcHlZVmMxYTBscWIybGpTRlpwWVROcmRHTXpaSEJrUjA1dlRHMUdkMk5HT1dwYVdFb3dTV2wzYVdGWFVteGlibEp3WkVocmFVOXBTVFZoUkZab1QwUkdObU42VWpOYWJtUndZakpLYUZsVVZUSlBSMDAwWTBjMU5HTnFhelJqVjFrd1dsZFNNRTR6Vm5SYU1uUnhaSHBhYjJOdGRIQmhSMGswWkZjNU5VbHBkMmxaV0VKM1dESnNhMGxxYjJsamJVcHNXa2R3TUdKWE1ESmpWMmh0WTBobmVscFhjSFZhTWxKeVlXMVdkMk51U1dsTVEwcDZZVmRrZFdGWE5XNVlNblJzWlZOSk5rbHJWWGRTVkdSTFYxZGtVbFJXWjNkWFJFWnNVakpSTTJSV1NrMVNSMWw0VWpGU2JscFZWakphVm5CUldqTm9VMVJGUmxWT1JqaDBaSHBSYVV4RFNtbGtWelZyWWtkV1ptRXlWalZKYW05cFYwVndSMk50ZEZsalZuQnVWV3hvYkZFemNFOU9WV2hPWW01R1QySllhR3hTYlZWM1pGZHNSMkpYVm5kU01qQjBUWHBhZUdKc1RrZGtlVWx6U1c1T2FtSXpRbXhqZVVrMlYzbEtkMWxZYTJsWVUzZHBZMGRXZVdKWGJIcGpNbXgyWW01TmFVOXNjMmxaTW5ob1lWY3hla3h1U214WlYxRnBURU5LYW1KSFJuQmlXRTExWkROS2NHUkhWV2xNUTBwcVlqSTFNbHBZU25wWldGSndZakkwZFZsWFVtdEpiREJ6U1cxc2VtTXpWbXhhUmpsb1pFTkpOa2xxU1hkTmFsbDBUVVJGZEUxRVJsVk5SRUUyVFVSQk5rMUVRWFZOUkVGM1YybEpjMGx0VmpSalIyeDVXbGhPWmxsWVVXbFBhVWw1VFVSSk0weFVRWGhNVkVGNFZrUkJkMDlxUVhkUGFrRjNUR3BCZDAxR2IybG1VU0lzSW5OcFp5STZJbll6T0RJemJ5MXhXa1F4TnpjeFdrWllSVUV5WlVneVZFVnNPVEkyVEVGQmFIRTJNRlF3WjI4d1ZXbFZRalkyVEVSdWFscDFORVZRVVc0NFJtWm5lWHBSWDNkNFZrc3lTRFZhUm5jMFREbGhiVEE1TlVGUkluMHNJbUZqWTJWd2RITWlPbHRkTENKallYQmhZbWxzYVhScFpYTWlPbnNpWlc1a2NHOXBiblJmYVdSbGJuUnBabWxsY25NaU9sdGRmU3dpY0hWaWJHbGpYMlZ1WkhCdmFXNTBjeUk2ZTMwc0lteGhZbVZzSWpvaVFTQnZiaUJoYm05MGFHVnlJR1JsZG1salpTSXNJblZ3WkdGMFpXUmZZWFFpT2lJeU1ESTJMVEF4TFRBeFZEQXdPakF3T2pBd0xqQXdNRm9pTENKbGVIQnBjbVZ6WDJGMElqcHVkV3hzZlEiLCJzaWciOiJVc2ZUM0htNE1la3JrakFQOFpENUs0cndKVERyeXZpVzFwNjdKTWgzaGsxUEs0Z0VWRzBBWnRiWnQ5aWJoT09rMWk3S3hkX2ZRMjRSRk95YlA5NDVCQSJ9fQ\",\"sig\":\"ESOUTWfwuN5zfZuFOZYnNlN3F-XqdRujzmbiceowEH8hBEdC2NDhBCs7ma34VondTabR0uL4s11fL_S7hxuECA\"}]}",
+      "variant": "equal_time"
+    }
+  ]
+}
