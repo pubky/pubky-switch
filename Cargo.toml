@@ -21,6 +21,20 @@ pubky-switch-client = { path = "crates/pubky-switch-client" }
 pubky-switch-signer = { path = "crates/pubky-switch-signer" }
 pubky-switch = { path = "crates/pubky-switch" }
 
+axum = "0.8"
+clap = { version = "4", features = ["derive", "env"] }
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
+parking_lot = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+toml = "1"
+tower = { version = "0.5", features = ["util"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
 [workspace.lints.rust]
 missing_docs = "deny"
 unsafe_code = "forbid"

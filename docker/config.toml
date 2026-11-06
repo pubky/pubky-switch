@@ -1,0 +1,7 @@
+# The container's default configuration. Mount your own at /etc/pubky-switch/config.toml,
+# or point PUBKY_SWITCH_CONFIG at it. See docs/configuration.md.
+
+[admin]
+# Inside the container, listen on every interface; publish the port on a private network
+# only.
+listen = "0.0.0.0:9090"

@@ -15,3 +15,9 @@
 //!
 //! The behaviour is specified by the Pubky Switch spec and wire format, in this repository's
 //! `spec/`.
+
+pub mod admin;
+pub mod config;
+pub mod limits;
+pub mod telemetry;
+pub mod time;
