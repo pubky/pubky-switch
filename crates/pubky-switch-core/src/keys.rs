@@ -48,11 +48,13 @@ pub fn x25519_public_key(public: &[u8; 32]) -> Result<<X25519HkdfSha256 as hpke:
 }
 
 /// The bytes of an HPKE X25519 public key.
+// For the envelopes' sealing (Switch wire 4.3); outside this crate's tests nothing calls it yet.
 pub(crate) fn x25519_public_bytes(key: &<X25519HkdfSha256 as hpke::Kem>::PublicKey) -> [u8; 32] {
     key.to_bytes().into()
 }
 
 /// The X25519 public key of an HPKE private key.
+// For the envelopes' sealing (Switch wire 4.3); outside this crate's tests nothing calls it yet.
 pub(crate) fn hpke_public_of(private: &<X25519HkdfSha256 as hpke::Kem>::PrivateKey) -> [u8; 32] {
     x25519_public_bytes(&X25519HkdfSha256::sk_to_pk(private))
 }
