@@ -1,0 +1,32 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/pubky-switch-core",
+    "crates/pubky-switch-client",
+    "crates/pubky-switch-signer",
+    "crates/pubky-switch",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91.1"
+license = "MIT"
+repository = "https://github.com/pubky/pubky-switch"
+publish = false
+
+[workspace.dependencies]
+pubky-switch-core = { path = "crates/pubky-switch-core" }
+pubky-switch-client = { path = "crates/pubky-switch-client" }
+pubky-switch-signer = { path = "crates/pubky-switch-signer" }
+pubky-switch = { path = "crates/pubky-switch" }
+
+[workspace.lints.rust]
+missing_docs = "deny"
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+# No panics on network input: fallible paths return errors. `clippy.toml` allows these in tests.
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
