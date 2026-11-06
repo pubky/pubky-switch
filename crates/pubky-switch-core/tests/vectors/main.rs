@@ -12,6 +12,8 @@
 mod common;
 
 mod encoding;
+mod envelopes;
 mod identifiers;
 mod keys;
+mod sealed;
 mod signatures;

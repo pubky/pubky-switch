@@ -13,12 +13,15 @@
 //! are a protocol's, and the crate reads them only as opaque strings (Switch spec 1).
 
 pub mod enc;
+pub mod envelope;
 pub mod error;
 pub mod ident;
 pub mod json;
 pub mod keys;
 pub mod labels;
+pub mod message;
+pub mod sealed;
 pub mod sig;
 pub mod time;
 
-pub use error::{Error, Result};
+pub use error::{Error, Result, SizeRefusal};
