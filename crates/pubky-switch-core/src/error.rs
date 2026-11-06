@@ -58,6 +58,46 @@ pub fn json_reason(error: &serde_json::Error) -> String {
 /// The core's result type.
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// A size or shape rule whose refusal the wire format answers with a fixed status: an
+/// envelope at the inbox (Switch wire 4.4) or a sealed value's ciphertext (Switch wire 6.2).
+///
+/// Like [`Error`], the text names the rule and never the refused bytes.
+#[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
+pub enum SizeRefusal {
+    /// Over the size limit: answered `413 too_large`.
+    #[error("too large: {0}")]
+    TooLarge(String),
+    /// Malformed, or a length the rule doesn't allow: answered `400 bad_request`.
+    #[error("bad request: {0}")]
+    BadRequest(String),
+}
+
+impl SizeRefusal {
+    /// The HTTP status of the answer: 413 or 400 (Switch wire 7.6).
+    pub fn status(&self) -> u16 {
+        match self {
+            Self::TooLarge(_) => 413,
+            Self::BadRequest(_) => 400,
+        }
+    }
+
+    /// The error `code` of the answer: `too_large` or `bad_request` (Switch wire 7.6).
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::TooLarge(_) => "too_large",
+            Self::BadRequest(_) => "bad_request",
+        }
+    }
+}
+
+impl From<SizeRefusal> for Error {
+    fn from(refusal: SizeRefusal) -> Self {
+        match refusal {
+            SizeRefusal::TooLarge(why) | SizeRefusal::BadRequest(why) => Self::Invalid(why),
+        }
+    }
+}
+
 /// Shorthand for an [`Error::Invalid`].
 pub(crate) fn invalid<T>(why: impl Into<String>) -> Result<T> {
     Err(Error::Invalid(why.into()))
@@ -78,6 +118,15 @@ mod tests {
         let reason = json_reason(&error);
         assert!(!reason.contains("secret-text"), "{reason}");
         assert!(reason.contains("wrong type or value"), "{reason}");
+    }
+
+    #[test]
+    fn test_size_refusal_maps_to_its_answer() {
+        let too_large = SizeRefusal::TooLarge("rule".into());
+        assert_eq!((too_large.status(), too_large.code()), (413, "too_large"));
+        let bad = SizeRefusal::BadRequest("rule".into());
+        assert_eq!((bad.status(), bad.code()), (400, "bad_request"));
+        assert_eq!(Error::from(bad), Error::Invalid("rule".into()));
     }
 
     #[test]
