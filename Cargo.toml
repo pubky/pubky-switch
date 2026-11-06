@@ -21,6 +21,19 @@ pubky-switch-client = { path = "crates/pubky-switch-client" }
 pubky-switch-signer = { path = "crates/pubky-switch-signer" }
 pubky-switch = { path = "crates/pubky-switch" }
 
+base64 = "0.22"
+blake3 = "1"
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc", "getrandom"] }
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+curve25519-dalek = "5"
+ed25519-dalek = "3"
+hex = "0.4"
+hpke = { version = "0.14.1", default-features = false, features = ["alloc", "chacha", "x25519"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+zeroize = { version = "1", features = ["derive"] }
+
 [workspace.lints.rust]
 missing_docs = "deny"
 unsafe_code = "forbid"

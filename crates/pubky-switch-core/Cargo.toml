@@ -8,7 +8,28 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[features]
+# Test-only: fixed sealing randomness, so that the test vectors can be rebuilt byte for byte.
+# No production build enables it; this crate's own tests turn it on through the
+# dev-dependency below.
+test-vectors = []
+
 [dependencies]
+base64.workspace = true
+blake3.workspace = true
+chacha20poly1305.workspace = true
+chrono.workspace = true
+curve25519-dalek.workspace = true
+ed25519-dalek.workspace = true
+hpke.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+hex.workspace = true
+pubky-switch-core = { workspace = true, features = ["test-vectors"] }
 
 [lints]
 workspace = true
