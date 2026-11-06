@@ -162,10 +162,9 @@ pub fn reject_unknown_members(
     let Some(object) = value.as_object() else {
         return invalid(format!("Switch wire 1.1: {what} isn't a JSON object"));
     };
-    if let Some(unknown) = object.keys().find(|k| !allowed.contains(&k.as_str())) {
-        return invalid(format!(
-            "Switch wire 1.1: unknown member {unknown:?} in {what}"
-        ));
+    // The member's name is the refused document's text, so the reason doesn't repeat it.
+    if object.keys().any(|k| !allowed.contains(&k.as_str())) {
+        return invalid(format!("Switch wire 1.1: an unknown member in {what}"));
     }
     Ok(())
 }

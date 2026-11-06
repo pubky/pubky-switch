@@ -11,6 +11,7 @@
 
 mod common;
 
+mod documents;
 mod encoding;
 mod identifiers;
 mod keys;

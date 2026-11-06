@@ -18,6 +18,8 @@ pub mod ident;
 pub mod json;
 pub mod keys;
 pub mod labels;
+pub mod records;
+pub mod scopes;
 pub mod sig;
 pub mod time;
 
