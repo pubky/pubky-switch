@@ -348,6 +348,73 @@ pub fn verify_webhook(
     )
 }
 
+/// The body of `PUT /v1/{id}/identity`: `{ "identity": signed<IdentityDoc>, "prev": b64(32)
+/// | null }` (Switch wire 7.4.2).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IdentityDelivery {
+    /// The delivered `identity.json`, as signed.
+    pub identity: sig::SignedDoc,
+    /// The document hash of the version this one builds on; `None` for the first delivery
+    /// to an account that holds none.
+    pub prev: Option<[u8; 32]>,
+}
+
+impl IdentityDelivery {
+    /// Read a delivery body. `prev` is always written, `null` for none; other members are
+    /// ignored (Switch wire 1.1).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] if the body isn't strict JSON of that shape.
+    pub fn parse(body: &[u8]) -> Result<Self> {
+        let value: serde_json::Value = crate::json::parse_json(body)?;
+        let Some(identity) = value.get("identity") else {
+            return invalid("Switch wire 7.4.2: a delivery carries `identity`");
+        };
+        let identity: sig::SignedDoc = serde_json::from_value(identity.clone())?;
+        let prev = match value.get("prev") {
+            Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(text)) => Some(unb64_array::<32>(text)?),
+            _ => return invalid("Switch wire 7.4.2: `prev` is a hash or null"),
+        };
+        Ok(Self { identity, prev })
+    }
+
+    /// Write a delivery body.
+    pub fn to_json(&self) -> Vec<u8> {
+        serde_json::json!({
+            "identity": self.identity,
+            "prev": self.prev.map(|hash| crate::enc::b64(&hash)),
+        })
+        .to_string()
+        .into_bytes()
+    }
+}
+
+/// The answer body of a committed erasure, `{"erased":true}` (Switch wire 7.4.16).
+pub const ERASED_BODY: &[u8] = br#"{"erased":true}"#;
+
+/// Read the body of `POST /v1/{id}/erase`: `{ "service_key": b64(32) }`, the account's
+/// service key the signer pinned (Switch wire 7.4.16).
+///
+/// # Errors
+///
+/// [`Error::Invalid`] (`400 bad_request`) for any other member or a key that isn't
+/// `b64(32)`.
+pub fn parse_erase_body(body: &[u8]) -> Result<[u8; 32]> {
+    let value: serde_json::Value = crate::json::parse_json(body)?;
+    crate::json::reject_unknown_members(&value, &["service_key"], "the erasure body")?;
+    match value.get("service_key") {
+        Some(serde_json::Value::String(text)) => unb64_array::<32>(text),
+        _ => invalid("Switch wire 7.4.16: the erasure body names `service_key`"),
+    }
+}
+
+/// Write the body of `POST /v1/{id}/erase` (Switch wire 7.4.16).
+pub fn erase_body(service_key: &[u8; 32]) -> Vec<u8> {
+    format!("{{\"service_key\":\"{}\"}}", crate::enc::b64(service_key)).into_bytes()
+}
+
 /// The calls after `/v1/{id}/` of a path, without its query.
 fn call_of(path: &str) -> Option<Vec<&str>> {
     let path = path.split('?').next().unwrap_or_default();
@@ -701,6 +768,34 @@ mod tests {
         assert!(frozen_refuses("POST", "/v1/id/ops"));
         assert!(!frozen_refuses("POST", "/v1/id/unfreeze"));
         assert!(!frozen_refuses("GET", "/v1/id/feed"));
+    }
+
+    #[test]
+    fn test_identity_delivery_requires_prev() {
+        let doc = sig::SignedDoc::from_parts(b"{}", &[1; 64]);
+        let delivery = IdentityDelivery {
+            identity: doc.clone(),
+            prev: Some([2; 32]),
+        };
+        assert_eq!(
+            IdentityDelivery::parse(&delivery.to_json()).unwrap(),
+            delivery
+        );
+        let first = IdentityDelivery {
+            identity: doc,
+            prev: None,
+        };
+        assert_eq!(IdentityDelivery::parse(&first.to_json()).unwrap(), first);
+        assert!(IdentityDelivery::parse(br#"{"identity":{"body":"","sig":""}}"#).is_err());
+        assert!(IdentityDelivery::parse(br#"{"prev":null}"#).is_err());
+    }
+
+    #[test]
+    fn test_erase_body_refuses_other_members() {
+        let key = [3; 32];
+        assert_eq!(parse_erase_body(&erase_body(&key)).unwrap(), key);
+        assert!(parse_erase_body(br#"{"service_key":"AA","x":1}"#).is_err());
+        assert!(parse_erase_body(b"{}").is_err());
     }
 
     #[test]

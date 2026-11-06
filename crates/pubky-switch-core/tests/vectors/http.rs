@@ -2,6 +2,8 @@
 //! (Switch wire 7.1, 7.2, 8.2).
 
 use pubky_switch_core::http::{self, RequestHeaders, RequestTarget, TransferHeaders};
+use pubky_switch_core::records::{Enrollment, EnrollmentAnswer, IdentityDoc};
+use pubky_switch_core::sig::SignedDoc;
 use pubky_switch_core::{labels, sig};
 use serde_json::Value;
 
@@ -115,6 +117,45 @@ fn test_vectors_http() {
     }
     assert_eq!(transfer_requests, 1);
 
+    // What the bodies carry, read through the records' API.
+    let alice = keys.identity("alice");
+    let alice_id = pubky_switch_core::enc::pubky_id(&alice);
+    let mut enrollment = None;
+    for r in arr(&v, "requests") {
+        let name = st(r, "name");
+        let body = b64(st(r, "body_b64"));
+        let path = st(r, "path");
+        let call = path.split('?').next().unwrap();
+        if call == "/v1/enroll" {
+            let value: Value = serde_json::from_slice(&body).unwrap();
+            let signed: SignedDoc = serde_json::from_value(value["enrollment"].clone()).unwrap();
+            enrollment = Some(
+                Enrollment::verify(&signed, &alice, st(r, "origin"))
+                    .unwrap_or_else(|e| panic!("{name}: {e}")),
+            );
+        } else if call.ends_with("/identity") && st(r, "method") == "PUT" {
+            let delivery = http::IdentityDelivery::parse(&body).unwrap();
+            assert_eq!(delivery.to_json(), body, "{name}: the body as written");
+            let doc = IdentityDoc::verify(&delivery.identity, &alice)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            // The account's first delivery builds on nothing.
+            assert_eq!(delivery.prev.is_none(), doc.version() == 1, "{name}: prev");
+        } else if call.ends_with("/peers") {
+            // A peer copy is the signed document itself.
+            let signed: SignedDoc = serde_json::from_slice(&body).unwrap();
+            let doc =
+                IdentityDoc::verify(&signed, &alice).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(doc.version(), 3, "{name}");
+        } else if call.ends_with("/erase") {
+            assert_eq!(
+                http::parse_erase_body(&body).unwrap(),
+                keys.service_key(&alice_id)
+            );
+            assert_eq!(http::erase_body(&keys.service_key(&alice_id)), body);
+        }
+    }
+    let enrollment = enrollment.expect("an enrollment request");
+
     for r in arr(&v, "responses") {
         let name = st(r, "name");
         let status = u16::try_from(int(r, "status")).unwrap();
@@ -195,6 +236,26 @@ fn test_vectors_http() {
                 ),
                 "{name}: no fixed key for the service"
             );
+        }
+        if name.starts_with("signer: enrollment answer") {
+            let answer = EnrollmentAnswer::from_json(body).unwrap();
+            answer
+                .check(&enrollment)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(
+                answer.to_json().unwrap(),
+                body,
+                "{name}: the answer as written"
+            );
+        }
+        if name.starts_with("signer: account erasure answer") {
+            assert_eq!(body, http::ERASED_BODY);
+        }
+        // No answer to an enrollment or an erasure carries a head (Switch wire 7.1).
+        if name.starts_with("signer: enrollment answer")
+            || name.starts_with("signer: account erasure")
+        {
+            assert!(header(r, http::header::HEAD).is_none(), "{name}: no head");
         }
         // Errors name a code of the table with its status.
         if status >= 400 {
