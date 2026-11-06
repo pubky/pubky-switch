@@ -10,9 +10,6 @@ const KIB: u64 = 1024;
 /// One MiB.
 const MIB: u64 = 1024 * KIB;
 
-/// The cap of `PUT /handover`: 64 envelopes in base64url, with their JSON (Switch wire 7.1).
-pub const HANDOVER_BODY_CAP: u64 = 6 * MIB;
-
 /// The cap for a request the service has no route for: it answers `404`, and reads little.
 pub const UNKNOWN_ROUTE_BODY_CAP: u64 = 64 * KIB;
 
@@ -97,7 +94,7 @@ impl Call {
             Self::Enroll | Self::PutIdentity | Self::PutPeers => 256 * KIB,
             Self::ImportChunk(_) => fixed::MAX_CHUNK_BYTES,
             Self::RecoveryUpload => 16 * MIB,
-            Self::PutHandover => HANDOVER_BODY_CAP,
+            Self::PutHandover => fixed::HANDOVER_BODY_CAP,
             Self::Freeze
             | Self::Unfreeze
             | Self::ImportActivate
