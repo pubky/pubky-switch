@@ -9,7 +9,7 @@ use pubky_switch::{
     keys::{FileKeyStore, KeyStoreReadiness},
     store::{Store, StoreReadiness},
     telemetry,
-    time::{SystemClock, TrustedTime},
+    time::{SystemClock, TrustedTime, roughtime::RoughtimeSource},
 };
 
 /// Inbox and coordination service for Pubky identities.
@@ -90,13 +90,25 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         config.trusted_time.clone(),
         Arc::new(SystemClock),
     ));
-    if config.trusted_time.required {
+    let (stop, stopped) = tokio::sync::watch::channel(false);
+    let source = RoughtimeSource::new(&config.trusted_time.roughtime)
+        .map_err(|(name, reason)| format!("trusted_time.{name}: {reason}"))?;
+    if !config.trusted_time.required {
+        tracing::warn!("trusted time is not required: the wall clock is taken as trusted");
+    } else if let Some(source) = source {
+        let mut stopped = stopped.clone();
+        tokio::spawn(time.clone().run_sampler(Arc::new(source), async move {
+            let _ = stopped.wait_for(|stop| *stop).await;
+        }));
+        tracing::info!(
+            servers = config.trusted_time.roughtime.servers.len(),
+            "sampling trusted time from roughtime"
+        );
+    } else {
         tracing::warn!(
             "no time source is configured: the service has no trusted time, and refuses what \
              depends on its time"
         );
-    } else {
-        tracing::warn!("trusted time is not required: the wall clock is taken as trusted");
     }
     time.record_gauges();
 
@@ -125,6 +137,8 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     axum::serve(listener, admin)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
+    let _ = stop.send(true);
+    drop(stopped);
     store.close().await;
     tracing::info!("pubky-switch stopped");
     Ok(())

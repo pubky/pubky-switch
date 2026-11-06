@@ -13,6 +13,8 @@
 //! above `max_uncertainty_ms`) the service refuses what depends on its time with
 //! `503 unavailable`.
 
+pub mod roughtime;
+
 use std::{
     future::Future,
     pin::Pin,
@@ -122,6 +124,8 @@ pub struct TrustedTimeConfig {
     pub sample_interval_ms: u64,
     /// How long the service waits before asking again after a failed sample.
     pub retry_interval_ms: u64,
+    /// The Roughtime servers trusted time is sampled from.
+    pub roughtime: roughtime::RoughtimeConfig,
 }
 
 /// One hour in milliseconds: the longest interval between samples (Switch spec 10.1).
@@ -137,6 +141,7 @@ impl Default for TrustedTimeConfig {
             max_disagreement_ms: 5 * 60 * 1000,
             sample_interval_ms: 15 * 60 * 1000,
             retry_interval_ms: 60 * 1000,
+            roughtime: roughtime::RoughtimeConfig::default(),
         }
     }
 }
@@ -176,7 +181,9 @@ impl TrustedTimeConfig {
         if self.max_disagreement_ms == 0 {
             return fail("max_disagreement_ms", "must be at least 1 ms");
         }
-        Ok(())
+        self.roughtime
+            .validate()
+            .map_err(|(name, reason)| TrustedTimeConfigError { name, reason })
     }
 }
 

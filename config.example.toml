@@ -71,6 +71,29 @@ max_disagreement_ms = 300000           # 5 minutes
 sample_interval_ms = 900000            # 15 minutes; at most one hour
 retry_interval_ms = 60000
 
+# Roughtime (RFC 10049): the servers trusted time is sampled from. Each answer's
+# signatures are checked against the server's public key; a sample needs `min_agreeing`
+# checked answers whose time intervals overlap. Review the list before production.
+[trusted_time.roughtime]
+min_agreeing = 2
+timeout_ms = 2000
+attempts = 2                           # per server per sample, at most 5
+
+[[trusted_time.roughtime.servers]]
+name = "int08h"
+address = "roughtime.int08h.com:2002"
+public_key = "AW5uAoTSTDfG5NfY1bTh08GUnOqlRb+HVhbJ3ODJvsE="
+
+[[trusted_time.roughtime.servers]]
+name = "roughtime.se"
+address = "roughtime.se:2002"
+public_key = "S3AzfZJ5CjSdkJ21ZJGbxqdYP/SoE8fXKY0+aicsehI="
+
+[[trusted_time.roughtime.servers]]
+name = "txryan"
+address = "time.txryan.com:2002"
+public_key = "iBVjxg/1j7y1+kQUTBYdTabxCppesU/07D4PMDJk2WA="
+
 # The database: PostgreSQL. Commits must be durable: the service refuses a database with
 # fsync off or synchronous_commit off.
 [database]

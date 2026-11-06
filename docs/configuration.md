@@ -77,7 +77,30 @@ Trusted time (Switch spec 10.1, Switch wire 7.3).
 | `sample_interval_ms` | `900000` (15 minutes) | how often the service samples its time source; at most an hour |
 | `retry_interval_ms` | `60000` | how long it waits after a failed sample |
 
-The service doesn't have a time source yet. Until one is configured it has no trusted time: it serves reads and everything else that doesn't depend on time, and refuses the rest. The `pubky_switch_trusted_time_available` metric shows whether it has trusted time, and `pubky_switch_time_disagreement_alerts_total` counts the times its wall clock disagreed with trusted time.
+Without trusted time the service serves reads and everything else that doesn't depend on time, and refuses the rest. The `pubky_switch_trusted_time_available` metric shows whether it has trusted time, and `pubky_switch_time_disagreement_alerts_total` counts the times its wall clock disagreed with trusted time.
+
+#### `[trusted_time.roughtime]`
+
+The service samples trusted time from Roughtime servers (RFC 10049), asking all of them at once over UDP.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `servers` | three public servers, listed in [`config.example.toml`](../config.example.toml) | each `{ name, address = "host:port", public_key = base64 Ed25519 key }`; an empty list means no time source |
+| `min_agreeing` | `2` | how many checked answers must agree for a sample; at most the number of servers |
+| `timeout_ms` | `2000` | how long to wait for one server's answer |
+| `attempts` | `2` | how many times to ask one server per sample, each with a fresh nonce; at most 5 |
+
+Every answer is checked before it counts:
+
+- its version is one the request offered, RFC 10049 version 1 or the earlier draft `0x8000000c`;
+- its nonce is the request's;
+- the server's long-term key signed the delegation, and the delegated key signed the answer;
+- the Merkle path leads from the request to the signed root;
+- the midpoint lies within the delegation's validity.
+
+Each checked answer vouches that true time lies within its midpoint plus or minus its radius. The sample is the window where at least `min_agreeing` of those intervals overlap. So a minority of wrong or hostile servers can't move it, and a server that disagrees with the others is logged. The sample's uncertainty is half that window plus the time the queries took.
+
+Choose servers run by independent operators, and review the list before production: the public keys are pinned here, and a server that rotates its long-term key stops counting until the key is updated.
 
 ### `[database]`
 
@@ -124,3 +147,4 @@ Database backups are for disaster recovery only: after a restore, every account 
 | `pubky_switch_trusted_time_uncertainty_ms` | gauge | the uncertainty of trusted time |
 | `pubky_switch_time_samples_total{result}` | counter | time samples, `ok` or `error` |
 | `pubky_switch_time_disagreement_alerts_total` | counter | readings where the wall clock disagreed with trusted time beyond `max_disagreement_ms` |
+| `pubky_switch_roughtime_answers_total{server,result}` | counter | Roughtime answers, `ok` when checked, `error` otherwise |

@@ -22,6 +22,7 @@ pubky-switch-signer = { path = "crates/pubky-switch-signer" }
 pubky-switch = { path = "crates/pubky-switch" }
 
 axum = "0.8"
+base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
 ed25519-dalek = "3"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
@@ -31,8 +32,10 @@ ipnet = { version = "2", features = ["serde"] }
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
 parking_lot = "0.12"
+roughenough-protocol = "2.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.11"
 sqlx = { version = "0.8", default-features = false, features = ["macros", "migrate", "postgres", "runtime-tokio", "tls-rustls-ring-webpki"] }
 tempfile = "3"
 thiserror = "2"
