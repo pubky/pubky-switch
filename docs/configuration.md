@@ -89,6 +89,7 @@ The service samples trusted time from Roughtime servers (RFC 10049), asking all 
 | `min_agreeing` | `2` | how many checked answers must agree for a sample; at most the number of servers |
 | `timeout_ms` | `2000` | how long to wait for one server's answer |
 | `attempts` | `2` | how many times to ask one server per sample, each with a fresh nonce; at most 5 |
+| `alert_after_ms` | `3600000` (1 hour) | how long a server may keep failing before the service alerts |
 
 Every answer is checked before it counts:
 
@@ -101,6 +102,31 @@ Every answer is checked before it counts:
 Each checked answer vouches that true time lies within its midpoint plus or minus its radius. The sample is the window where at least `min_agreeing` of those intervals overlap. So a minority of wrong or hostile servers can't move it, and a server that disagrees with the others is logged. The sample's uncertainty is half that window plus the time the queries took.
 
 Choose servers run by independent operators, and review the list before production: the public keys are pinned here, and a server that rotates its long-term key stops counting until the key is updated.
+
+**Server health.** Every answer is counted by outcome in `pubky_switch_roughtime_answers_total{server,result}`:
+
+- `verified`;
+- `refused`, an answer that arrived and failed a check;
+- `timeout`;
+- `unreachable`.
+
+When a server's samples keep failing for `alert_after_ms`, the service raises one alert:
+
+- an `error` log line with `alert = "roughtime_server_failing"`, the server and the outcome;
+- the gauge `pubky_switch_roughtime_server_alert{server}` set to 1;
+- `pubky_switch_roughtime_alerts_total{server}` counted.
+
+The alert clears when the server is verified again. A refused server most often rotated its long-term key: check its published key and update the pinned one. Act on the alert while the other servers still agree, before agreement is lost. A Prometheus rule:
+
+```yaml
+- alert: PubkySwitchRoughtimeServerFailing
+  expr: pubky_switch_roughtime_server_alert == 1
+  annotations:
+    summary: "Roughtime server {{ $labels.server }} has failed for over an hour"
+- alert: PubkySwitchNoTrustedTime
+  expr: pubky_switch_trusted_time_available == 0
+  for: 5m
+```
 
 ### `[database]`
 
@@ -147,4 +173,7 @@ Database backups are for disaster recovery only: after a restore, every account 
 | `pubky_switch_trusted_time_uncertainty_ms` | gauge | the uncertainty of trusted time |
 | `pubky_switch_time_samples_total{result}` | counter | time samples, `ok` or `error` |
 | `pubky_switch_time_disagreement_alerts_total` | counter | readings where the wall clock disagreed with trusted time beyond `max_disagreement_ms` |
-| `pubky_switch_roughtime_answers_total{server,result}` | counter | Roughtime answers, `ok` when checked, `error` otherwise |
+| `pubky_switch_roughtime_answers_total{server,result}` | counter | Roughtime answers by outcome: `verified`, `refused`, `timeout`, `unreachable` |
+| `pubky_switch_roughtime_server_failing_ms{server}` | gauge | how long the server's samples have been failing; 0 when healthy |
+| `pubky_switch_roughtime_server_alert{server}` | gauge | 1 while the server has failed for `alert_after_ms`, 0 otherwise |
+| `pubky_switch_roughtime_alerts_total{server}` | counter | alerts raised for the server |

@@ -78,6 +78,7 @@ retry_interval_ms = 60000
 min_agreeing = 2
 timeout_ms = 2000
 attempts = 2                           # per server per sample, at most 5
+alert_after_ms = 3600000               # alert when a server fails this long (1 hour)
 
 [[trusted_time.roughtime.servers]]
 name = "int08h"

@@ -30,7 +30,9 @@ use roughenough_protocol::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
 
-use super::{SampleFuture, TimeSample, TimeSource, TimeSourceError};
+use parking_lot::Mutex;
+
+use super::{Clock, SampleFuture, SystemClock, TimeSample, TimeSource, TimeSourceError};
 
 /// The versions every request offers, in ascending wire order (RFC 10049 5.1.1).
 const OFFERED: [ProtocolVersion; 2] = [ProtocolVersion::RFC, ProtocolVersion::DRAFT];
@@ -59,6 +61,10 @@ pub struct RoughtimeConfig {
     pub timeout_ms: u64,
     /// How many times to ask one server within one sample.
     pub attempts: u32,
+    /// How long a server may keep failing, its answers refused or missing, before the
+    /// service alerts its operator. A refused answer often means the server rotated its
+    /// long-term key, and its pinned key needs updating before agreement is lost.
+    pub alert_after_ms: u64,
 }
 
 /// One Roughtime server.
@@ -101,6 +107,7 @@ impl Default for RoughtimeConfig {
             min_agreeing: 2,
             timeout_ms: 2_000,
             attempts: 2,
+            alert_after_ms: 3_600_000,
         }
     }
 }
@@ -125,6 +132,9 @@ impl RoughtimeConfig {
         }
         if self.attempts == 0 || self.attempts > MAX_ATTEMPTS {
             return Err(("roughtime.attempts", "must be between 1 and 5"));
+        }
+        if self.alert_after_ms == 0 {
+            return Err(("roughtime.alert_after_ms", "must be at least 1"));
         }
         let mut names = std::collections::BTreeSet::new();
         for server in &self.servers {
@@ -192,6 +202,54 @@ pub enum RoughtimeError {
     /// No randomness for a nonce.
     #[error("no randomness for a nonce")]
     Random,
+}
+
+/// How one attempt to ask a server ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    /// An answer that passed every check.
+    Verified,
+    /// An answer that arrived and failed a check: a signature, the nonce, the Merkle path,
+    /// the delegation's validity, or the format.
+    Refused,
+    /// No answer in time.
+    Timeout,
+    /// The server couldn't be reached.
+    Unreachable,
+    /// The service couldn't make a request.
+    Internal,
+}
+
+impl Outcome {
+    /// The outcome's name in metrics and logs.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Verified => "verified",
+            Self::Refused => "refused",
+            Self::Timeout => "timeout",
+            Self::Unreachable => "unreachable",
+            Self::Internal => "internal",
+        }
+    }
+}
+
+impl RoughtimeError {
+    /// The outcome this error ends an attempt with.
+    pub fn outcome(&self) -> Outcome {
+        match self {
+            Self::Timeout => Outcome::Timeout,
+            Self::Network(_) => Outcome::Unreachable,
+            Self::Random => Outcome::Internal,
+            Self::Malformed(_)
+            | Self::UnofferedVersion(_)
+            | Self::NonceMismatch
+            | Self::BadDelegationSignature
+            | Self::BadResponseSignature
+            | Self::BadDelegatedKey
+            | Self::OutsideDelegation
+            | Self::NotInTree => Outcome::Refused,
+        }
+    }
 }
 
 /// The interval a checked answer vouches for, in Unix milliseconds.
@@ -462,8 +520,36 @@ pub struct RoughtimeSource {
     min_agreeing: usize,
     timeout: Duration,
     attempts: u32,
+    alert_after_ms: u64,
     exchange: Arc<dyn Exchange>,
     nonces: NonceSource,
+    clock: Arc<dyn Clock>,
+    health: Mutex<Vec<Health>>,
+}
+
+/// A server's run of failed samples.
+#[derive(Clone, Debug, Default)]
+struct Health {
+    /// The monotonic reading of the first failed sample of the current run.
+    failing_since_ms: Option<u64>,
+    /// How the last failed sample ended, and why.
+    last_failure: Option<(Outcome, String)>,
+    /// Whether the run has raised its alert.
+    alerted: bool,
+}
+
+/// A server's health, for the operator.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServerStatus {
+    /// The server's name.
+    pub name: String,
+    /// How long its samples have been failing; `None` when its last one was verified, or
+    /// it hasn't been asked yet.
+    pub failing_for_ms: Option<u64>,
+    /// How its last failed sample ended, and why.
+    pub last_failure: Option<(Outcome, String)>,
+    /// Whether the failures have lasted `alert_after_ms`, and raised an alert.
+    pub alerted: bool,
 }
 
 impl std::fmt::Debug for RoughtimeSource {
@@ -510,14 +596,98 @@ impl RoughtimeSource {
                     ))
             })
             .collect::<Result<_, _>>()?;
+        let health = Mutex::new(vec![Health::default(); config.servers.len()]);
         Ok(Some(Self {
             servers,
             min_agreeing: config.min_agreeing,
             timeout: Duration::from_millis(config.timeout_ms),
             attempts: config.attempts,
+            alert_after_ms: config.alert_after_ms,
             exchange,
             nonces,
+            clock: Arc::new(SystemClock),
+            health,
         }))
+    }
+
+    /// Measure how long servers fail on `clock`'s monotonic reading instead of the
+    /// system's.
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// Each server's health.
+    pub fn health(&self) -> Vec<ServerStatus> {
+        let now = self.clock.monotonic_ms();
+        self.servers
+            .iter()
+            .zip(self.health.lock().iter())
+            .map(|(server, health)| ServerStatus {
+                name: server.name.clone(),
+                failing_for_ms: health
+                    .failing_since_ms
+                    .map(|since| now.saturating_sub(since)),
+                last_failure: health.last_failure.clone(),
+                alerted: health.alerted,
+            })
+            .collect()
+    }
+
+    /// Record how a server's sample ended. A run of failures lasting `alert_after_ms`
+    /// raises one alert, until the server is verified again.
+    fn note(&self, index: usize, result: &Result<Interval, RoughtimeError>) {
+        let Some(server) = self.servers.get(index) else {
+            return;
+        };
+        let now = self.clock.monotonic_ms();
+        let mut all = self.health.lock();
+        let Some(health) = all.get_mut(index) else {
+            return;
+        };
+        let name = server.name.clone();
+        match result {
+            Ok(_) => {
+                if health.alerted {
+                    tracing::warn!(server = %name, "roughtime server verified again");
+                }
+                *health = Health::default();
+                metrics::gauge!("pubky_switch_roughtime_server_failing_ms", "server" => name.clone())
+                    .set(0.0);
+                metrics::gauge!("pubky_switch_roughtime_server_alert", "server" => name).set(0.0);
+            }
+            Err(error) => {
+                let since = *health.failing_since_ms.get_or_insert(now);
+                let failing_for = now.saturating_sub(since);
+                let outcome = error.outcome();
+                health.last_failure = Some((outcome, error.to_string()));
+                // Milliseconds are far below the 2^53 a gauge holds exactly.
+                #[allow(clippy::cast_precision_loss)]
+                metrics::gauge!("pubky_switch_roughtime_server_failing_ms", "server" => name.clone())
+                    .set(failing_for as f64);
+                if failing_for >= self.alert_after_ms && !health.alerted {
+                    health.alerted = true;
+                    metrics::counter!("pubky_switch_roughtime_alerts_total", "server" => name.clone())
+                        .increment(1);
+                    metrics::gauge!("pubky_switch_roughtime_server_alert", "server" => name.clone())
+                        .set(1.0);
+                    let hint = if outcome == Outcome::Refused {
+                        "its answers fail verification: check whether it rotated its long-term \
+                         key, and update its pinned public key"
+                    } else {
+                        "it doesn't answer: check that it is still running and reachable"
+                    };
+                    tracing::error!(
+                        alert = "roughtime_server_failing",
+                        server = %name,
+                        outcome = outcome.as_str(),
+                        %error,
+                        failing_for_s = failing_for / 1_000,
+                        "roughtime server failing: {hint}"
+                    );
+                }
+            }
+        }
     }
 
     /// Ask one server, up to `attempts` times, each with a fresh nonce.
@@ -531,6 +701,15 @@ impl RoughtimeSource {
                 .exchange(&server.address, &request, self.timeout)
                 .await
                 .and_then(|response| verify_response(&server.key, &nonce, &request, &response));
+            let outcome = answer
+                .as_ref()
+                .map_or_else(RoughtimeError::outcome, |_| Outcome::Verified);
+            metrics::counter!(
+                "pubky_switch_roughtime_answers_total",
+                "server" => server.name.clone(),
+                "result" => outcome.as_str()
+            )
+            .increment(1);
             match answer {
                 Ok(interval) => return Ok(interval),
                 Err(error) => last = error,
@@ -548,26 +727,20 @@ impl RoughtimeSource {
         .await;
         let mut intervals = Vec::new();
         let mut checked = Vec::new();
-        for (server, answer) in answers {
+        for (index, (server, answer)) in answers.into_iter().enumerate() {
+            self.note(index, &answer);
             match answer {
                 Ok(interval) => {
-                    metrics::counter!(
-                        "pubky_switch_roughtime_answers_total",
-                        "server" => server.name.clone(),
-                        "result" => "ok"
-                    )
-                    .increment(1);
                     intervals.push(interval);
                     checked.push((server, interval));
                 }
                 Err(error) => {
-                    metrics::counter!(
-                        "pubky_switch_roughtime_answers_total",
-                        "server" => server.name.clone(),
-                        "result" => "error"
-                    )
-                    .increment(1);
-                    tracing::warn!(server = %server.name, %error, "roughtime server");
+                    tracing::warn!(
+                        server = %server.name,
+                        outcome = error.outcome().as_str(),
+                        %error,
+                        "roughtime server"
+                    );
                 }
             }
         }
@@ -1034,9 +1207,12 @@ mod tests {
     }
 
     /// Answers recorded exchanges, and times out for anything else.
+    /// A recorded request and the answer to it.
+    type Recorded = (Vec<u8>, Vec<u8>);
+
     #[derive(Default)]
     struct Replay {
-        answers: HashMap<String, (Vec<u8>, Vec<u8>)>,
+        answers: Mutex<HashMap<String, Recorded>>,
         /// Calls to time out first, per address.
         drop_first: Mutex<HashMap<String, u32>>,
         calls: Mutex<u32>,
@@ -1055,9 +1231,10 @@ mod tests {
                 *left = left.saturating_sub(1);
                 drop
             });
-            let answer = match self.answers.get(address) {
+            let recorded = self.answers.lock().get(address).cloned();
+            let answer = match recorded {
                 _ if dropped => Err(RoughtimeError::Timeout),
-                Some((recorded, response)) if recorded == request => Ok(response.clone()),
+                Some((recorded, response)) if recorded == request => Ok(response),
                 Some(_) => Err(RoughtimeError::Network("unexpected request".into())),
                 None => Err(RoughtimeError::Timeout),
             };
@@ -1077,6 +1254,7 @@ mod tests {
             if replayed.contains(&f.name.as_str()) {
                 replay
                     .answers
+                    .get_mut()
                     .insert(f.address.clone(), (f.request.clone(), f.response.clone()));
             }
         }
@@ -1164,6 +1342,7 @@ mod tests {
             }
             replay
                 .answers
+                .get_mut()
                 .insert(f.address.clone(), (f.request.clone(), response));
         }
         let config = RoughtimeConfig {
@@ -1179,6 +1358,181 @@ mod tests {
         .expect("config")
         .expect("servers");
         assert!(source.sample().await.is_err(), "only two checked answers");
+    }
+
+    fn forged(f: &Fixture) -> Vec<u8> {
+        let mut response = f.response.clone();
+        let sig = value_range(&response, &[Tag::SIG]);
+        response[sig.start] ^= 1;
+        response
+    }
+
+    const HOUR_MS: u64 = 3_600_000;
+
+    #[tokio::test]
+    async fn test_roughtime_silent_server_alerts_after_a_while() {
+        let all = fixtures();
+        let names: Vec<&str> = all.iter().map(|f| f.name.as_str()).collect();
+        let (source, replay) = replay_source(&all, &names[1..], 2);
+        let clock = Arc::new(crate::time::ManualClock::new(0));
+        let source = source.with_clock(clock.clone());
+        let silent = all[0].name.clone();
+        let status = |source: &RoughtimeSource| {
+            source
+                .health()
+                .into_iter()
+                .find(|s| s.name == silent)
+                .expect("status")
+        };
+
+        source.sample().await.expect("two still agree");
+        let first = status(&source);
+        assert_eq!(first.failing_for_ms, Some(0));
+        assert_eq!(
+            first.last_failure.as_ref().map(|(outcome, _)| *outcome),
+            Some(Outcome::Timeout)
+        );
+        assert!(!first.alerted);
+
+        // Still failing just short of the bound: no alert yet.
+        clock.advance_ms(HOUR_MS - 1);
+        source.sample().await.expect("sample");
+        assert!(!status(&source).alerted);
+
+        // Failing for the whole bound: the alert, once.
+        clock.advance_ms(1);
+        source.sample().await.expect("sample");
+        let alerted = status(&source);
+        assert!(alerted.alerted);
+        assert_eq!(alerted.failing_for_ms, Some(HOUR_MS));
+
+        // The others are healthy throughout.
+        for other in source.health().into_iter().filter(|s| s.name != silent) {
+            assert_eq!(other.failing_for_ms, None, "{}", other.name);
+            assert!(!other.alerted);
+        }
+
+        // It answers again: the run ends, and a later failure starts a new one.
+        replay.answers.lock().insert(
+            all[0].address.clone(),
+            (all[0].request.clone(), all[0].response.clone()),
+        );
+        clock.advance_ms(1_000);
+        source.sample().await.expect("sample");
+        let recovered = status(&source);
+        assert_eq!(recovered.failing_for_ms, None);
+        assert_eq!(recovered.last_failure, None);
+        assert!(!recovered.alerted);
+    }
+
+    #[tokio::test]
+    async fn test_roughtime_refused_answers_alert_as_refused() {
+        let all = fixtures();
+        let names: Vec<&str> = all.iter().map(|f| f.name.as_str()).collect();
+        let (source, replay) = replay_source(&all, &names, 2);
+        // The server now signs with a key that isn't the pinned one, as after a rotation.
+        replay.answers.lock().insert(
+            all[2].address.clone(),
+            (all[2].request.clone(), forged(&all[2])),
+        );
+        let clock = Arc::new(crate::time::ManualClock::new(0));
+        let source = source.with_clock(clock.clone());
+        source.sample().await.expect("two still agree");
+        clock.advance_ms(HOUR_MS);
+        source.sample().await.expect("two still agree");
+        let status = source
+            .health()
+            .into_iter()
+            .find(|s| s.name == all[2].name)
+            .expect("status");
+        assert!(status.alerted);
+        let (outcome, reason) = status.last_failure.expect("failure");
+        assert_eq!(outcome, Outcome::Refused);
+        assert!(reason.contains("signature"), "{reason}");
+    }
+
+    #[test]
+    fn test_roughtime_metrics_count_answers_and_alerts() {
+        let all = fixtures();
+        let names: Vec<&str> = all.iter().map(|f| f.name.as_str()).collect();
+        let (source, replay) = replay_source(&all, &names[..2], 2);
+        replay.answers.lock().insert(
+            all[1].address.clone(),
+            (all[1].request.clone(), forged(&all[1])),
+        );
+        let config = RoughtimeConfig {
+            servers: all.iter().map(Fixture::config).collect(),
+            ..RoughtimeConfig::default()
+        };
+        assert_eq!(config.alert_after_ms, HOUR_MS);
+        let clock = Arc::new(crate::time::ManualClock::new(0));
+        let source = source.with_clock(clock.clone());
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                // Only one server verifies: no sample, but every answer is counted.
+                assert!(source.sample().await.is_err());
+                clock.advance_ms(HOUR_MS);
+                assert!(source.sample().await.is_err());
+            });
+        });
+        let text = handle.render();
+        let line = |needle: &str| {
+            text.lines()
+                .find(|line| line.starts_with(needle))
+                .unwrap_or_else(|| panic!("no {needle} in\n{text}"))
+                .to_string()
+        };
+        let verified = format!(
+            "pubky_switch_roughtime_answers_total{{server=\"{}\",result=\"verified\"}}",
+            all[0].name
+        );
+        assert!(line(&verified).ends_with(" 2"));
+        let refused = format!(
+            "pubky_switch_roughtime_answers_total{{server=\"{}\",result=\"refused\"}}",
+            all[1].name
+        );
+        // Two attempts in each of two samples.
+        assert!(line(&refused).ends_with(" 4"));
+        let timeout = format!(
+            "pubky_switch_roughtime_answers_total{{server=\"{}\",result=\"timeout\"}}",
+            all[2].name
+        );
+        assert!(line(&timeout).ends_with(" 4"));
+        for (index, alert) in [(0, " 0"), (1, " 1"), (2, " 1")] {
+            let gauge = format!(
+                "pubky_switch_roughtime_server_alert{{server=\"{}\"}}",
+                all[index].name
+            );
+            assert!(line(&gauge).ends_with(alert), "{gauge}");
+        }
+    }
+
+    #[test]
+    fn test_roughtime_outcomes() {
+        assert_eq!(RoughtimeError::Timeout.outcome(), Outcome::Timeout);
+        assert_eq!(
+            RoughtimeError::Network("refused".into()).outcome(),
+            Outcome::Unreachable
+        );
+        for refused in [
+            RoughtimeError::Malformed("x".into()),
+            RoughtimeError::UnofferedVersion(2),
+            RoughtimeError::NonceMismatch,
+            RoughtimeError::BadDelegationSignature,
+            RoughtimeError::BadResponseSignature,
+            RoughtimeError::BadDelegatedKey,
+            RoughtimeError::OutsideDelegation,
+            RoughtimeError::NotInTree,
+        ] {
+            assert_eq!(refused.outcome(), Outcome::Refused, "{refused}");
+        }
+        assert_eq!(RoughtimeError::Random.outcome(), Outcome::Internal);
     }
 
     #[test]
@@ -1203,6 +1557,7 @@ mod tests {
         assert_eq!(with(&|c| c.min_agreeing = 4), "roughtime.min_agreeing");
         assert_eq!(with(&|c| c.timeout_ms = 0), "roughtime.timeout_ms");
         assert_eq!(with(&|c| c.attempts = 6), "roughtime.attempts");
+        assert_eq!(with(&|c| c.alert_after_ms = 0), "roughtime.alert_after_ms");
         assert_eq!(
             with(&|c| c.servers[1].name = c.servers[0].name.clone()),
             "roughtime.servers.name"
