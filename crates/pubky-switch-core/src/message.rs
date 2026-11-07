@@ -279,6 +279,7 @@ impl Message {
 ///
 /// Building one is the caller's part: the certificate must verify as a certificate of the
 /// inbox entry's `sender` identity and must not have expired at the entry's `accepted_at`.
+/// [`crate::receive::receive`] does both, and runs the whole check order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VerifiedSender {
     /// The identity the certificate was verified for.
@@ -287,6 +288,19 @@ pub struct VerifiedSender {
     pub app_id: [u8; 16],
     /// The certificate's signing key.
     pub signing_key: [u8; 32],
+}
+
+impl VerifiedSender {
+    /// What `cert` says about the sender. The caller verified it for the entry's `sender`
+    /// identity and checked that it hadn't expired at the entry's `accepted_at` (Switch wire
+    /// 5.1 checks 2 and 3), as [`crate::receive::receive`] does.
+    pub fn from_cert(cert: &crate::records::AppCert) -> Self {
+        Self {
+            identity: cert.identity(),
+            app_id: cert.app_id(),
+            signing_key: cert.signing_key(),
+        }
+    }
 }
 
 /// The signed plaintext of a message (Switch wire 4.5, Switch spec 5.2): the sender's App ID,

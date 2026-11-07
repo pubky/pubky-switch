@@ -121,6 +121,15 @@ impl IdentityKey {
         SignedDoc::sign_bytes(&self.signing_key(), label, prefix, body)
     }
 
+    /// Sign message bytes that aren't an `lp()` input. Only the approval's companion claim
+    /// does, and its input starts with a fixed claim prefix no other format the identity
+    /// key signs starts with (Switch wire 2.1, 3.10); signers expose no signing of
+    /// caller-supplied bytes.
+    pub(crate) fn sign_message(&self, message: &[u8]) -> [u8; 64] {
+        use ed25519_dalek::Signer as _;
+        self.signing_key().sign(message).to_bytes()
+    }
+
     /// The Switch root (Switch wire 1.5). Sensitive: it yields every scope key and the
     /// naming key.
     pub fn switch_root(&self) -> [u8; 32] {

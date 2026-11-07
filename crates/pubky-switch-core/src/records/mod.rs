@@ -1,6 +1,7 @@
 //! The Switch's signed documents (Switch wire 3): app certificates and records,
-//! `identity.json`, receive key records, freezes and unfreezes, enrollments, app requests and
-//! export transfers, with the pure rules the service, apps and the signer apply to them.
+//! `identity.json`, receive key records, key bundles, freezes and unfreezes, enrollments,
+//! app requests, approvals, export transfers, and the signer's hand-over and backup, with the
+//! pure rules the service, apps and the signer apply to them.
 //!
 //! Each document comes in two types:
 //!
@@ -16,6 +17,7 @@
 
 mod app_record;
 mod app_request;
+mod approval;
 mod cert;
 mod delivery;
 mod enroll;
@@ -23,7 +25,9 @@ mod export_transfer;
 #[cfg(test)]
 mod fixtures;
 mod freeze;
+mod handover;
 mod identity;
+mod key_bundle;
 mod receive_key;
 mod renewal;
 
@@ -32,6 +36,10 @@ pub use app_request::{
     APP_REQUEST_KIND, AppRequest, AppRequestBody, Approve, AuthRequest, IDENTITY_PATH,
     SIGNER_BACKUP_PATH, SignerView, app_backup_path, app_record_path, check_app_request,
     check_caps,
+};
+pub use approval::{
+    APPROVAL_CLAIM_TYPE, APPROVAL_KIND, Approval, ApprovalClaim, ApprovedApp, CLAIM_PARAMETER,
+    claim_signed_bytes,
 };
 pub use cert::{AppCert, AppCertBody, CERT_KIND, DEFAULT_CERT_LIFETIME_MS, MAX_CERT_LIFETIME_MS};
 pub use delivery::{
@@ -43,10 +51,21 @@ pub use enroll::{
 };
 pub use export_transfer::{EXPORT_TRANSFER_KIND, ExportTransfer, ExportTransferBody};
 pub use freeze::{DiscardAnswer, FREEZE_KIND, Freeze, FreezeBody, Unfreeze, UnfreezeAt};
+pub use handover::{
+    DeliveryKind, HANDOVER_KIND, MAX_BUNDLE_PARTS, MAX_HANDOVER_ENVELOPES, RestoreStart,
+    SignerBackup, SignerHandover, SignerRecords, TakeOver, abort_body, check_handover_copies,
+    check_restore_copies, revoked_after, succeeded, take_over_body, taken_over,
+};
 pub use identity::{
     Admission, ConnectRequests, DEFAULT_RECORD_MAX_AGE_S, IDENTITY_KIND, IdentityBody, IdentityDoc,
     IdentityPolicy, ListedApp, MAX_SERVICE_KEYS, RemovedApp, RenewedCert, SeenBodies,
     ServiceKeyEntry, Standing, VersionOrder,
+};
+pub use key_bundle::{
+    BundlePart, BundleReading, KEY_BUNDLE_KIND, KeyBundle, KeyBundleContents, MissingKeys,
+    PartReader, SkipReason, SkippedPart, StoredPart, check_bundle_keys, check_part_order,
+    covers_from_one, full_bundle_ranges, incremental_first_epoch, keyed_scopes, missing_keys,
+    missing_ranges, needs_cert_put, note_stored, ranges_for_cert, reader_certs, seal_bundle_parts,
 };
 pub use receive_key::{RECEIVE_KEY_KIND, ReceiveKeyBody, ReceiveKeyRecord};
 pub use renewal::{

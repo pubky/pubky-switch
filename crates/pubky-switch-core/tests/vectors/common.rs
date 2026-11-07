@@ -225,3 +225,60 @@ pub fn reproduce(
         None => false,
     }
 }
+
+/// The scopes the vectors give keys, which is a protocol's choice (Switch spec 3.5), read
+/// from the vector files: the scopes of `keys.json`'s scope keys and sub-scope keys, of the
+/// honest key bundles of `envelopes.json`, and the scope its reduction removes as one with
+/// keys.
+pub fn keyed_scopes() -> std::collections::BTreeSet<String> {
+    let k = load("keys.json");
+    let e = load("envelopes.json");
+    let mut keyed = std::collections::BTreeSet::new();
+    for entry in arr(&k, "scope_keys")
+        .iter()
+        .chain(arr(&k["sub_scope_keys"], "keys"))
+    {
+        keyed.insert(st(entry, "scope").to_owned());
+    }
+    for member in ["key_bundle", "reduction_key_bundle"] {
+        let plaintext: Value = serde_json::from_str(st(&e[member], "plaintext_json")).unwrap();
+        for key in arr(&plaintext, "keys") {
+            keyed.insert(st(key, "scope").to_owned());
+        }
+    }
+    keyed.insert(st(&e["reduction_key_bundle"], "removed_scope").to_owned());
+    keyed
+}
+
+/// A document of `documents.json` by name, in its carrying form.
+pub fn document(name: &str) -> sig::SignedDoc {
+    let v = load("documents.json");
+    let entry = arr(&v, "documents")
+        .iter()
+        .find(|d| st(d, "name") == name)
+        .unwrap_or_else(|| panic!("no document {name}"));
+    serde_json::from_value(entry["signed"].clone()).unwrap()
+}
+
+/// Fixed sealing randomness from its three values.
+pub fn fixed(
+    cek_hex: &str,
+    nonce_hex: &str,
+    ikm_e_hex: &str,
+) -> pubky_switch_core::envelope::FixedRandomness {
+    pubky_switch_core::envelope::FixedRandomness {
+        content_key: hx32(cek_hex),
+        nonce: hx(nonce_hex).try_into().expect("24 bytes"),
+        ikm_e: hx32(ikm_e_hex),
+    }
+}
+
+/// Fixed sealing randomness from the seeds `<label>/cek`, `<label>/nonce` (its first 24
+/// bytes) and `<label>/ikm-e` (README "Seeds").
+pub fn fixed_from_seeds(label: &str) -> pubky_switch_core::envelope::FixedRandomness {
+    pubky_switch_core::envelope::FixedRandomness {
+        content_key: seed(&format!("{label}/cek")),
+        nonce: seed(&format!("{label}/nonce"))[..24].try_into().unwrap(),
+        ikm_e: seed(&format!("{label}/ikm-e")),
+    }
+}
