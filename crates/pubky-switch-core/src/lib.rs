@@ -2,8 +2,8 @@
 //!
 //! The service, the client and the signer all build on this crate, so that each of them
 //! encodes, signs and checks every Switch document the same way: app certificates and records,
-//! `identity.json`, receive key records, key bundles, envelopes, signed operations, transition
-//! proofs and signed heads.
+//! `identity.json`, receive key records, key bundles, envelopes, signed operations and
+//! batches, claims, shared records, transition proofs, the chain and signed heads.
 //!
 //! The formats are specified by the Pubky Switch wire format, in this repository's `spec/`,
 //! and checked against its test vectors.
@@ -12,6 +12,8 @@
 //! takes it as an argument, in Unix milliseconds. Scope names, message kinds and collections
 //! are a protocol's, and the crate reads them only as opaque strings (Switch spec 1).
 
+pub mod chain;
+pub mod claims;
 pub mod enc;
 pub mod envelope;
 pub mod error;
@@ -22,9 +24,11 @@ pub mod keys;
 pub mod labels;
 pub mod message;
 pub mod net;
+pub mod ops;
 pub mod records;
 pub mod scopes;
 pub mod sealed;
+pub mod shared;
 pub mod sig;
 pub mod signing;
 pub mod time;
