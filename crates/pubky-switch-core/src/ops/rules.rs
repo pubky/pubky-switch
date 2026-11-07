@@ -448,7 +448,8 @@ mod tests {
     use crate::claims::{ClaimFields, ClaimType};
     use crate::ident::{NamingKey, Policy};
     use crate::keys::{AppKeys, ReceiveKey};
-    use crate::ops::body::{BatchRef, IdInputs, KeyBundleForm, RecordPut, RecordVersion};
+    use crate::ops::body::{BatchRef, IdInputs, RecordPut, RecordVersion};
+    use crate::records::KeyBundle;
     use crate::records::{AppCertBody, AppRecordBody, DEFAULT_CERT_LIFETIME_MS};
     use crate::sealed::SealedValue;
 
@@ -632,7 +633,7 @@ mod tests {
         );
         let mut put = KeyBundlePut {
             target_app_id: target,
-            bundle: KeyBundleForm { envelope, sig },
+            bundle: KeyBundle::from_parts(envelope, sig),
             first_epoch: 1,
             last_epoch: 2,
         };
@@ -822,10 +823,7 @@ mod tests {
     fn test_key_bundle_put_rules() {
         let part = |first: u64, last: u64, byte: u8| KeyBundlePut {
             target_app_id: [5; 16],
-            bundle: KeyBundleForm {
-                envelope: vec![byte],
-                sig: [byte; 64],
-            },
+            bundle: KeyBundle::from_parts(vec![byte], [byte; 64]),
             first_epoch: first,
             last_epoch: last,
         };

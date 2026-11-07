@@ -16,6 +16,7 @@ mod claims;
 mod documents;
 mod encoding;
 mod envelopes;
+mod export;
 mod http;
 mod identifiers;
 mod keys;

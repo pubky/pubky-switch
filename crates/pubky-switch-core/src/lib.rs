@@ -17,6 +17,7 @@ pub mod claims;
 pub mod enc;
 pub mod envelope;
 pub mod error;
+pub mod export;
 pub mod http;
 pub mod ident;
 pub mod json;

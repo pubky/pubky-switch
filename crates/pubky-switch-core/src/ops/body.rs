@@ -14,8 +14,9 @@ use crate::error::{Error, Result, invalid};
 use crate::ident::Policy;
 use crate::json::{Doc, parse_json_as};
 use crate::labels;
+use crate::records::KeyBundle;
 use crate::sealed::SealedValue;
-use crate::sig::{self, SignedDoc};
+use crate::sig::SignedDoc;
 use crate::signing::Signs;
 use crate::time::rfc3339;
 
@@ -366,48 +367,25 @@ pub struct InviteCodePut {
     pub context: Value,
 }
 
-/// A key bundle as `key_bundle.put` carries it (Switch wire 3.5): its envelope and the
-/// identity key's signature over `lp("pubky-switch/v1/key-bundle", identity, target App ID,
-/// envelope)`. Only the signature and the form are the switch's to check: the envelope is
-/// sealed to the target app.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct KeyBundleForm {
-    /// The envelope's bytes (Switch wire 4).
-    pub envelope: Vec<u8>,
-    /// The identity key's signature.
-    pub sig: [u8; 64],
+/// The carrying form of a key bundle inside an operation body (Switch wire 3.5, 6.2):
+/// `{ "envelope", "sig" }`, written in that order.
+fn key_bundle_json(bundle: &KeyBundle) -> Vec<u8> {
+    let mut o = Obj::new();
+    o.str("envelope", &b64(bundle.envelope()))
+        .str("sig", &b64(&bundle.sig()));
+    o.finish()
 }
 
-impl KeyBundleForm {
-    /// Verify the signature with the identity key, for the target app (Switch wire 3.5).
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Signature`] if it doesn't verify.
-    pub fn verify(&self, identity: &[u8; 32], target_app_id: &[u8; 16]) -> Result<()> {
-        sig::verify(
-            identity,
-            labels::sig::KEY_BUNDLE,
-            &[identity, target_app_id, &self.envelope],
-            &self.sig,
-        )
-    }
-
-    fn to_json(&self) -> Vec<u8> {
-        let mut o = Obj::new();
-        o.str("envelope", &b64(&self.envelope))
-            .str("sig", &b64(&self.sig));
-        o.finish()
-    }
-
-    fn read(value: &Value) -> Result<Self> {
-        let what = "bundle";
-        only(value, &["envelope", "sig"], what)?;
-        Ok(Self {
-            envelope: req_b64(value, "envelope", what)?,
-            sig: req_b64n::<64>(value, "sig", what)?,
-        })
-    }
+/// Read a key bundle's carrying form inside an operation body, refusing unknown members
+/// (Switch wire 1.1, 6.1): unlike a key bundle read elsewhere, the form in a signed operation
+/// is strict.
+fn read_key_bundle(value: &Value) -> Result<KeyBundle> {
+    let what = "bundle";
+    only(value, &["envelope", "sig"], what)?;
+    Ok(KeyBundle::from_parts(
+        req_b64(value, "envelope", what)?,
+        req_b64n::<64>(value, "sig", what)?,
+    ))
 }
 
 /// The members of a `key_bundle.put` (Switch wire 6.2).
@@ -415,8 +393,8 @@ impl KeyBundleForm {
 pub struct KeyBundlePut {
     /// The app the bundle is for.
     pub target_app_id: [u8; 16],
-    /// The bundle, or one part of it.
-    pub bundle: KeyBundleForm,
+    /// The bundle, or one part of it, as it travels (Switch wire 3.5).
+    pub bundle: KeyBundle,
     /// The first data epoch the sealed bundle holds, repeated in the clear.
     pub first_epoch: u64,
     /// The last data epoch the sealed bundle holds, repeated in the clear.
@@ -625,7 +603,7 @@ impl OpKind {
             }
             OpKind::KeyBundlePut(put) => {
                 o.str("target_app_id", &zbase32_encode(&put.target_app_id))
-                    .raw("bundle", &put.bundle.to_json())
+                    .raw("bundle", &key_bundle_json(&put.bundle))
                     .int("first_epoch", put.first_epoch)
                     .int("last_epoch", put.last_epoch);
             }
@@ -682,7 +660,7 @@ impl OpKind {
             },
             "key_bundle.put" => OpKind::KeyBundlePut(KeyBundlePut {
                 target_app_id: req_app_id(v, "target_app_id", what)?,
-                bundle: KeyBundleForm::read(req(v, "bundle", what)?)?,
+                bundle: read_key_bundle(req(v, "bundle", what)?)?,
                 first_epoch: req_int(v, "first_epoch", what)?,
                 last_epoch: req_int(v, "last_epoch", what)?,
             }),
@@ -1089,10 +1067,7 @@ mod tests {
             OpKind::InviteCodeDelete { code_hash: [4; 32] },
             OpKind::KeyBundlePut(KeyBundlePut {
                 target_app_id: [5; 16],
-                bundle: KeyBundleForm {
-                    envelope: vec![1, 2, 3],
-                    sig: [6; 64],
-                },
+                bundle: KeyBundle::from_parts(vec![1, 2, 3], [6; 64]),
                 first_epoch: 1,
                 last_epoch: 2,
             }),
@@ -1136,6 +1111,31 @@ mod tests {
         v["conditions"] =
             serde_json::json!([{"claim_step": {"claim_key": b64(&[1; 32]), "step": 0}}]);
         assert!(OpBody::parse(&serde_json::to_vec(&v).unwrap()).is_ok());
+    }
+
+    #[test]
+    fn test_op_body_key_bundle_form_is_strict() {
+        let b = body(OpKind::KeyBundlePut(KeyBundlePut {
+            target_app_id: [5; 16],
+            bundle: KeyBundle::from_parts(vec![1, 2, 3], [6; 64]),
+            first_epoch: 1,
+            last_epoch: 1,
+        }));
+        let v: Value = serde_json::from_slice(&b.to_json().unwrap()).unwrap();
+        assert_eq!(
+            v["bundle"],
+            serde_json::json!({"envelope": "AQID", "sig": b64(&[6; 64])})
+        );
+        assert_eq!(OpBody::parse(&b.to_json().unwrap()).unwrap(), b);
+        // Read elsewhere a key bundle ignores unknown members; inside an operation it doesn't.
+        let mut extra = v.clone();
+        extra["bundle"]["future"] = 1.into();
+        assert!(serde_json::from_value::<KeyBundle>(extra["bundle"].clone()).is_ok());
+        let refused = OpBody::parse(&serde_json::to_vec(&extra).unwrap()).unwrap_err();
+        assert_eq!(refused.status(), 400);
+        let mut short = v;
+        short["bundle"]["sig"] = b64(&[6; 63]).into();
+        assert!(OpBody::parse(&serde_json::to_vec(&short).unwrap()).is_err());
     }
 
     #[test]

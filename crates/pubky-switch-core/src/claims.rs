@@ -68,7 +68,7 @@ impl ClaimType {
         }
     }
 
-    fn parse(text: &str) -> Result<Self> {
+    pub(crate) fn parse(text: &str) -> Result<Self> {
         Ok(match text {
             "attempt" => ClaimType::Attempt,
             "done" => ClaimType::Done,
@@ -104,7 +104,7 @@ impl Basis {
         }
     }
 
-    fn parse(text: &str) -> Result<Self> {
+    pub(crate) fn parse(text: &str) -> Result<Self> {
         Ok(match text {
             "owner" => Basis::Owner,
             "evidence" => Basis::Evidence,
@@ -355,7 +355,7 @@ impl Outcome {
         }
     }
 
-    fn parse(text: &str) -> Result<Self> {
+    pub(crate) fn parse(text: &str) -> Result<Self> {
         Ok(match text {
             "open" => Outcome::Open,
             "done" => Outcome::Done,

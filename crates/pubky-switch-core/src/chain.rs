@@ -57,7 +57,7 @@ impl ItemType {
         }
     }
 
-    fn parse(text: &str) -> Result<Self> {
+    pub(crate) fn parse(text: &str) -> Result<Self> {
         Ok(match text {
             "op" => ItemType::Op,
             "identity" => ItemType::Identity,

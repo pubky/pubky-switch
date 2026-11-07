@@ -36,8 +36,8 @@ pub use batch::{
     ops_hash, random_batch_id, retry_check, sign_batch, unchanged,
 };
 pub use body::{
-    AllowKind, BatchRef, Condition, IdInputs, InviteCodePut, KeyBundleForm, KeyBundlePut,
-    MAX_OP_BYTES, OpBody, OpKind, RecordPut, RecordVersion, SignedOp, carrying_len,
+    AllowKind, BatchRef, Condition, IdInputs, InviteCodePut, KeyBundlePut, MAX_OP_BYTES, OpBody,
+    OpKind, RecordPut, RecordVersion, SignedOp, carrying_len,
 };
 pub use rules::{
     AppPutEffect, CertPutEffect, KeyBundleEffect, MAX_INVITE_CONTEXT_BYTES, MAX_INVITE_USES, Need,
