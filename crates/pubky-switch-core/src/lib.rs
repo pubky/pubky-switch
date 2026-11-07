@@ -22,6 +22,7 @@ pub mod keys;
 pub mod labels;
 pub mod message;
 pub mod net;
+pub mod receive;
 pub mod records;
 pub mod scopes;
 pub mod sealed;

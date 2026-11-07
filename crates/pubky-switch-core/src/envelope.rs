@@ -739,6 +739,51 @@ pub fn seal_framed_with(
     )
 }
 
+/// The random inputs of one sealing to one key, fixed to rebuild the shared vectors: the
+/// content key, the nonce and the recipient's HPKE ephemeral keying material `ikmE`. Test
+/// builds only: production sealing takes no randomness from its caller (Switch wire 4.2).
+#[cfg(any(test, feature = "test-vectors"))]
+#[derive(Clone, Copy)]
+pub struct FixedRandomness {
+    /// The content key.
+    pub content_key: [u8; 32],
+    /// The body's nonce.
+    pub nonce: [u8; 24],
+    /// The recipient's `ikmE`.
+    pub ikm_e: [u8; 32],
+}
+
+#[cfg(any(test, feature = "test-vectors"))]
+impl std::fmt::Debug for FixedRandomness {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FixedRandomness(..)")
+    }
+}
+
+#[cfg(any(test, feature = "test-vectors"))]
+impl FixedRandomness {
+    /// [`seal_framed_with`] with these inputs. Test builds only.
+    ///
+    /// # Errors
+    ///
+    /// As [`seal_framed`].
+    pub fn seal_framed(
+        &self,
+        identity: &[u8; 32],
+        recipient: &Recipient,
+        json: &[u8],
+    ) -> Result<Vec<u8>> {
+        seal_framed_with(
+            identity,
+            recipient,
+            json,
+            &self.content_key,
+            &self.nonce,
+            &self.ikm_e,
+        )
+    }
+}
+
 /// Open an envelope holding a framed JSON document (Switch wire 4.3, 4.5), as a key bundle,
 /// a hand-over part or a backup part: the JSON bytes. They may hold keys, so they are
 /// zeroized when dropped.

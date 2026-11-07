@@ -49,6 +49,20 @@ pub fn verify(
     fields: &[&[u8]],
     signature: &[u8; 64],
 ) -> Result<()> {
+    verify_message(public, &signed_bytes(label, fields), signature, label)
+}
+
+/// Verify an Ed25519 signature over exact message bytes, by the steps of [`verify`].
+///
+/// Only the approval's companion claim signs bytes that aren't an `lp()` input (Switch wire
+/// 2.1, 3.10); every other signature goes through [`verify`]. `what` names the signature in
+/// the error.
+pub(crate) fn verify_message(
+    public: &[u8; 32],
+    message: &[u8],
+    signature: &[u8; 64],
+    what: &str,
+) -> Result<()> {
     use curve25519_dalek::{Scalar, edwards::CompressedEdwardsY};
     let fail = |why: &str| Err(Error::Signature(format!("Switch wire 2.1: {why}")));
     let (r, s) = signature.split_at(32);
@@ -80,15 +94,12 @@ pub fn verify(
         .map_err(|_| Error::Signature("Switch wire 2.1: the public key is invalid".into()))?;
     // Step 4: `verify_strict` computes the cofactorless equation and compares R byte for
     // byte; it repeats checks 1 and 3.
-    key.verify_strict(
-        &signed_bytes(label, fields),
-        &Signature::from_bytes(signature),
-    )
-    .map_err(|_| {
-        Error::Signature(format!(
-            "Switch wire 2.1: the equation doesn't hold ({label})"
-        ))
-    })
+    key.verify_strict(message, &Signature::from_bytes(signature))
+        .map_err(|_| {
+            Error::Signature(format!(
+                "Switch wire 2.1: the equation doesn't hold ({what})"
+            ))
+        })
 }
 
 /// A signed document in its carrying form: `{ "body": "<base64url of the exact JSON

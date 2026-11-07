@@ -1,7 +1,7 @@
-//! `documents.json`: every signed document of Switch wire 3 but the key bundle, the approval,
-//! the signer hand-over and the signer backup, with the permission and scope rules, the
-//! conflict of two app records, the unfreeze and the discard answer, and the auth request an
-//! app request binds (Switch wire 2.2, 3).
+//! `documents.json`: every signed document of Switch wire 3 but the key bundle, the signer
+//! hand-over and the signer backup, with the permission and scope rules, the conflict of two
+//! app records, the unfreeze and the discard answer, the auth request an app request binds,
+//! and the approval with its companion claim (Switch wire 2.2, 3).
 //!
 //! Every document is checked in its carrying and compact forms, its document bytes and hash,
 //! verified, signed again from the fixed keys, read through the records API, and written
@@ -159,6 +159,7 @@ fn test_vectors_documents() {
     check_permission_rejections(&keys, &v, doc("wallet certificate"));
     check_scope_rule(&keys, &v, doc("wallet certificate"));
     check_app_record_conflict(&keys, &v, &docs);
+    check_approval(&keys, &v, &docs, &certs);
     // Bob's documents verify for bob only.
     assert!(AppCert::verify(doc("shop certificate"), &alice).is_err());
     IdentityDoc::verify(doc("bob identity.json"), &bob).unwrap();
@@ -953,4 +954,195 @@ fn check_app_record_conflict(keys: &Keys, v: &Value, docs: &HashMap<String, Doc>
     fresh.see(a, now);
     assert!(fresh.see(b, now));
     assert_eq!(fresh.used(), None, "no earlier record to use");
+}
+
+/// `approval` (Switch wire 3.10): the wallet's approval, read by the app's checks, rebuilt
+/// byte for byte where it is deterministic, refused at each step, and carried in its
+/// companion claim, whose signed bytes come from `auth_request`.
+fn check_approval(
+    keys: &Keys,
+    v: &Value,
+    docs: &HashMap<String, Doc>,
+    certs: &HashMap<String, AppCert>,
+) {
+    use pubky_switch_core::records::{
+        Approval, ApprovalClaim, BundlePart, KeyBundle, KeyBundleContents,
+    };
+    use sha2::{Digest as _, Sha256};
+
+    let keyed = keyed_scopes();
+    let has_keys = |scope: &str| keyed.contains(scope);
+    let alice = keys.identity("alice");
+    let wallet = keys.app("wallet");
+    let wallet_id = app_id_decode(&wallet.app_id).unwrap();
+    let request = AppRequest::verify(&docs["wallet app request"].signed).unwrap();
+    let a = &v["auth_request"];
+    let auth = AuthRequest {
+        client_id: st(a, "client_id").to_owned(),
+        client_key: b64n(st(a, "client_key")),
+        caps: st(a, "caps").to_owned(),
+        secret: b64n(st(a, "secret")),
+    };
+    let ap = &v["approval"]["approval"];
+    let json = serde_json::to_vec(ap).unwrap();
+    let read =
+        |json: &[u8], secret: &[u8; 32]| Approval::read(json, &request, &alice, secret, &has_keys);
+
+    // The app's checks pass, and it keeps every key of the wallet's keyed scopes.
+    let got = read(&json, &wallet.bundle_secret).unwrap();
+    let cert = &certs["wallet certificate"];
+    assert_eq!(got.cert, *cert);
+    assert_eq!(
+        st(ap, "request"),
+        b64e(&request.hash()),
+        "the request's hash"
+    );
+    assert_eq!(got.identity.signed(), &docs["alice identity.json"].signed);
+    assert_eq!(got.naming_key, keys.naming(&alice));
+    let keyed_scopes: Vec<&String> = cert.scopes().iter().filter(|s| has_keys(s)).collect();
+    assert_eq!(
+        got.keys.keys.len(),
+        keyed_scopes.len() * got.identity.data_epoch() as usize,
+        "every keyed scope, every epoch from 1"
+    );
+    let root = keys.root(&alice);
+    for k in &got.keys.keys {
+        assert_eq!(
+            k.key,
+            pubky_switch_core::ident::key_of_scope(&root, k.data_epoch, &k.scope)
+        );
+    }
+    let text = serde_json::to_string(ap).unwrap();
+    for k in &got.keys.keys {
+        assert!(!text.contains(&b64e(&k.key)), "no key in the clear");
+    }
+    assert!(!text.contains(&b64e(&got.naming_key.to_bytes())));
+
+    // Its one part, rebuilt from the identity key and the fixed randomness.
+    let parts: Vec<BundlePart> = serde_json::from_value(ap["bundles"].clone()).unwrap();
+    assert_eq!(parts.len(), 1);
+    let part = &parts[0];
+    assert_eq!(part.range(), (1, got.identity.data_epoch()));
+    let key = identity_key(keys, &alice);
+    let contents =
+        KeyBundleContents::derive(&key, cert, 1, got.identity.data_epoch(), &has_keys).unwrap();
+    let plaintext = contents.to_json().unwrap();
+    let opened = pubky_switch_core::envelope::open_framed(
+        part.bundle.envelope(),
+        &alice,
+        &wallet.bundle_secret,
+    )
+    .unwrap();
+    assert!(*opened == *plaintext, "the part's plaintext derived again");
+    let again = KeyBundle::seal_json_with(
+        &key,
+        &wallet_id,
+        &wallet.bundle_public,
+        &plaintext,
+        &fixed_from_seeds("approval"),
+    )
+    .unwrap();
+    assert!(again == part.bundle, "the part rebuilt");
+    assert!(reproduce(
+        keys,
+        &alice,
+        labels::sig::KEY_BUNDLE,
+        &[&alice, &wallet_id, part.bundle.envelope()],
+        &part.bundle.sig()
+    ));
+    // The approval rebuilt from its parts: the same JSON value.
+    let v3 = IdentityDoc::verify(&docs["alice identity.json"].signed, &alice).unwrap();
+    let approval = Approval::new(&request, cert.clone(), v3.clone(), parts.clone()).unwrap();
+    let written: Value = serde_json::from_slice(&approval.to_json().unwrap()).unwrap();
+    assert_eq!(&written, ap, "the approval rebuilt");
+
+    // The companion claim: the identity key signs the claim prefix, the SHA-256 of the auth
+    // request's secret, and the approval's JSON bytes.
+    let claim = ApprovalClaim::sign(&key, &auth, &approval).unwrap();
+    let signed = records::claim_signed_bytes(&auth.secret, claim.json());
+    let prefix = format!(
+        "{}|{}|",
+        records::CLAIM_PARAMETER,
+        records::APPROVAL_CLAIM_TYPE
+    );
+    assert_eq!(prefix, "x-pubky-switch-claim|pubky-switch.v1.approval|");
+    let digest: [u8; 32] = Sha256::digest(auth.secret).into();
+    let mut expected = prefix.into_bytes();
+    expected.extend_from_slice(&digest);
+    expected.extend_from_slice(&approval.to_json().unwrap());
+    assert_eq!(signed, expected);
+    // The auth secret's hash in the request is BLAKE3; the claim's is SHA-256.
+    assert_ne!(digest, request.body().secret_hash);
+    let plaintext = claim.plaintext();
+    let received = ApprovalClaim::from_plaintext(&plaintext).unwrap();
+    let approval_json = received.verify(&alice, &auth).unwrap();
+    assert_eq!(read(approval_json, &wallet.bundle_secret).unwrap(), got);
+    let signer = SigningKey::from_bytes(&keys.identity_secrets[&alice]);
+    assert_eq!(
+        ed25519_dalek::Signer::sign(&signer, &expected).to_bytes(),
+        received.sig(),
+        "deterministic, over exactly those bytes"
+    );
+    let mut other = auth.clone();
+    other.secret[0] ^= 1;
+    assert!(
+        received.verify(&alice, &other).is_err(),
+        "another auth secret"
+    );
+    assert!(received.verify(&keys.identity("bob"), &auth).is_err());
+
+    // One refusal per step.
+    let step = |value: &Value, secret: &[u8; 32]| {
+        let error = read(&serde_json::to_vec(value).unwrap(), secret).unwrap_err();
+        let text = error.to_string();
+        (1..=4)
+            .find(|n| text.contains(&format!("Switch wire 3.10 step {n}")))
+            .unwrap_or_else(|| panic!("no step in {text}"))
+    };
+    let changed = |change: &dyn Fn(&mut Value)| {
+        let mut value = ap.clone();
+        change(&mut value);
+        step(&value, &wallet.bundle_secret)
+    };
+    assert_eq!(changed(&|a| a["request"] = json!(b64e(&[1; 32]))), 1);
+    assert_eq!(changed(&|a| a["kind"] = json!("pubky-switch.other")), 1);
+    assert_eq!(changed(&|a| a["v"] = json!(2)), 1);
+    let phone_cert = serde_json::to_value(&docs["phone certificate"].signed).unwrap();
+    assert_eq!(changed(&|a| a["cert"] = phone_cert.clone()), 2);
+    let bob_cert = serde_json::to_value(&docs["shop certificate"].signed).unwrap();
+    assert_eq!(changed(&|a| a["cert"] = bob_cert.clone()), 2);
+    let renewing =
+        serde_json::to_value(&docs["alice identity.json, wallet renewal in progress"].signed)
+            .unwrap();
+    assert_eq!(changed(&|a| a["identity"] = renewing.clone()), 3);
+    assert_eq!(changed(&|a| a["bundles"] = json!([])), 4);
+    assert_eq!(changed(&|a| a["bundles"][0]["first_epoch"] = json!(2)), 4);
+    let mut extra = ap["bundles"][0].clone();
+    extra["first_epoch"] = json!(3);
+    extra["last_epoch"] = json!(3);
+    extra["bundle"]["sig"] = json!(b64e(&[0; 64]));
+    assert_eq!(
+        changed(&|a| a["bundles"].as_array_mut().unwrap().push(extra.clone())),
+        4,
+        "every part must be taken"
+    );
+    assert_eq!(
+        step(ap, &keys.app("phone").bundle_secret),
+        4,
+        "another bundle key"
+    );
+    // A part made for another certificate, the renewed one, isn't the approval's.
+    let renewed = &certs["wallet certificate, renewed"];
+    let for_renewed = KeyBundleContents::derive(&key, renewed, 1, 2, &has_keys).unwrap();
+    let stale = BundlePart {
+        bundle: KeyBundle::seal(&key, renewed, &for_renewed).unwrap(),
+        first_epoch: 1,
+        last_epoch: 2,
+    };
+    let stale = serde_json::to_value(vec![stale]).unwrap();
+    assert_eq!(changed(&|a| a["bundles"] = stale.clone()), 4);
+    // Unknown members are ignored.
+    let mut future = ap.clone();
+    future["future"] = json!({"x": 1});
+    read(&serde_json::to_vec(&future).unwrap(), &wallet.bundle_secret).unwrap();
 }
