@@ -2,7 +2,7 @@
 //! (Switch wire 7.1, 7.2, 8.2).
 
 use pubky_switch_core::http::{self, RequestHeaders, RequestTarget, TransferHeaders};
-use pubky_switch_core::records::{Enrollment, EnrollmentAnswer, IdentityDoc};
+use pubky_switch_core::records::{Enrollment, EnrollmentAnswer, IdentityDoc, SignerHandover};
 use pubky_switch_core::sig::SignedDoc;
 use pubky_switch_core::{labels, sig};
 use serde_json::Value;
@@ -11,6 +11,14 @@ use crate::common::*;
 
 fn header<'a>(v: &'a Value, name: &str) -> Option<&'a str> {
     v["headers"].get(name).and_then(Value::as_str)
+}
+
+fn handover_of(v: &Value) -> SignerHandover {
+    let envelopes = arr(v, "envelopes")
+        .iter()
+        .map(|e| b64(e.as_str().unwrap()))
+        .collect();
+    SignerHandover::from_parts(envelopes, b64n::<64>(st(v, "sig")))
 }
 
 fn fields_of(v: &Value) -> Vec<Vec<u8>> {
@@ -146,6 +154,23 @@ fn test_vectors_http() {
             let doc =
                 IdentityDoc::verify(&signed, &alice).unwrap_or_else(|e| panic!("{name}: {e}"));
             assert_eq!(doc.version(), 3, "{name}");
+        } else if call.ends_with("/handover") && st(r, "method") == "PUT" {
+            // The hand-over the signer stores for its target app (Switch wire 7.4.17).
+            let value: Value = serde_json::from_slice(&body).unwrap();
+            let target = keys.app_by_id(st(&value, "app_id"));
+            let handover = handover_of(&value["handover"]);
+            let target_id = pubky_switch_core::enc::app_id_decode(&target.app_id).unwrap();
+            handover
+                .check_stored(&alice, &target_id, &target.bundle_public)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            // Stored for another app, it fails.
+            let other = keys.app("wallet");
+            let other_id = pubky_switch_core::enc::app_id_decode(&other.app_id).unwrap();
+            assert!(
+                handover
+                    .check_stored(&alice, &other_id, &other.bundle_public)
+                    .is_err()
+            );
         } else if call.ends_with("/erase") {
             assert_eq!(
                 http::parse_erase_body(&body).unwrap(),
@@ -247,6 +272,15 @@ fn test_vectors_http() {
                 body,
                 "{name}: the answer as written"
             );
+        }
+        if name.starts_with("own app: the hand-over the switch stores") {
+            // The fetch answers the stored body as it was put.
+            let value: Value = serde_json::from_slice(body).unwrap();
+            let target = keys.app_by_id(st(&value, "app_id"));
+            let target_id = pubky_switch_core::enc::app_id_decode(&target.app_id).unwrap();
+            handover_of(&value["handover"])
+                .verify(&alice, &target_id)
+                .unwrap();
         }
         if name.starts_with("signer: account erasure answer") {
             assert_eq!(body, http::ERASED_BODY);
