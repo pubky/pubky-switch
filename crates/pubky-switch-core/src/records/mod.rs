@@ -134,14 +134,22 @@ pub fn is_origin(url: &str) -> bool {
         Some((host, port)) => (host, Some(port)),
         None => (rest, None),
     };
+    // Every label of the host is non-empty and neither starts nor ends with `-`.
     let host_ok = !host.is_empty()
-        && host
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-');
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        });
+    // A port of 1 to 65535 written without leading zeros, as the connecting side reads it
+    // (Switch wire 7.1).
     let port_ok = port.is_none_or(|p| {
-        (1..=5).contains(&p.len())
-            && p.bytes().all(|b| b.is_ascii_digit())
-            && p.parse::<u16>().is_ok()
+        p.bytes().all(|b| b.is_ascii_digit())
+            && !p.starts_with('0')
+            && p.parse::<u16>().is_ok_and(|n| n != 0)
     });
     host_ok && port_ok
 }
@@ -392,6 +400,12 @@ mod tests {
             "https://user@inbox.example",
             "https://inbox.example:",
             "https://inbox.example:99999",
+            "https://inbox.example:0",
+            "https://inbox.example:00443",
+            "https://-",
+            "https://.",
+            "https://inbox..example",
+            "https://-inbox.example",
             "https://",
         ] {
             assert!(!is_origin(bad), "{bad}");

@@ -27,7 +27,7 @@ use crate::claims::{
     Attempt, Claim, ClaimLimits, ClaimStatus, ClaimTally, ClaimView, EntryContext,
     MAX_CLAIM_AGE_MS, Pin, RECONCILIATION_MS, apply_entry,
 };
-use crate::enc::{b64, zbase32_encode};
+use crate::enc::{b64, unb64_array, zbase32_encode};
 use crate::http::ErrorCode;
 use crate::ops::{OpKind, RecordVersion, Refusal, SignedOp};
 use crate::records::{
@@ -623,7 +623,9 @@ fn check_apps(
             zbase32_encode(app)
         ))
     };
-    let has_part = |app: &[u8; 16]| g.apps.iter().any(|(p, _)| &p.app_id == app);
+    // Indexed once: the parts come from the old service, so lookups stay linear in them.
+    let app_parts: HashSet<[u8; 16]> = g.apps.iter().map(|(p, _)| p.app_id).collect();
+    let has_part = |app: &[u8; 16]| app_parts.contains(app);
     for listed in &doc.body().apps {
         if !has_part(&listed.app_id) {
             return Err(missing(&listed.app_id));
@@ -882,8 +884,9 @@ fn check_records(
         });
     }
     // Every `record.put` the chain parts hold with its document is its key's current write.
+    let current_writes: HashMap<[u8; 32], u64> = g.records.iter().map(|r| (r.key, r.seq)).collect();
     for (key, seqs) in &puts {
-        let current = g.records.iter().find(|r| &r.key == key).map(|r| r.seq);
+        let current = current_writes.get(key).copied();
         if seqs.iter().any(|s| Some(*s) != current) {
             return Err(conflict(
                 "Switch wire 10.5: a record.put the chain parts hold isn't its key's current write",
@@ -1196,6 +1199,13 @@ fn check_evidence(
     records: &[ImportedRecord],
 ) -> std::result::Result<(), Refusal> {
     let last_time = cx.manifest.body().last_time;
+    // Indexed once, so the work stays linear in the uploads and the import.
+    let live_claims: HashMap<[u8; 32], &ImportedClaim> =
+        claims.iter().map(|c| (c.claim_key, c)).collect();
+    let tombstone_claims: HashMap<[u8; 32], &ImportedClaim> =
+        tombstones.iter().map(|c| (c.claim_key, c)).collect();
+    let held_records: HashMap<[u8; 32], &ImportedRecord> =
+        records.iter().map(|r| (r.part.key, r)).collect();
     for uploaded in &cx.uploads.proofs {
         let fail = |what: &str| {
             Err(conflict(format!(
@@ -1206,8 +1216,8 @@ fn check_evidence(
         let body = uploaded.proof.body();
         let state = &body.state;
         if let Ok(view) = ClaimView::from_value(state) {
-            let live = claims.iter().find(|c| c.claim_key == view.claim_key);
-            let tomb = tombstones.iter().find(|c| c.claim_key == view.claim_key);
+            let live = live_claims.get(&view.claim_key).copied();
+            let tomb = tombstone_claims.get(&view.claim_key).copied();
             match (view.status, view.attempt_id) {
                 (ClaimStatus::Settled, _) => {
                     let gone = match view.deadline {
@@ -1242,7 +1252,9 @@ fn check_evidence(
             state.get("version").and_then(Value::as_u64),
         ) {
             let shown = RecordVersion::new(generation, version);
-            let held = records.iter().find(|r| b64(&r.part.key) == body.object);
+            let held = unb64_array::<32>(&body.object)
+                .ok()
+                .and_then(|key| held_records.get(&key).copied());
             let holds = match held {
                 None => deleted,
                 Some(r) => {

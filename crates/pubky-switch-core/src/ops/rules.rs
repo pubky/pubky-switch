@@ -125,7 +125,7 @@ pub fn check_shape(body: &OpBody) -> std::result::Result<(), Refusal> {
             let policy_hash = put.policy.hash()?;
             put.value_sealed.check_shape(&put.policy.read_scope)?;
             match (put.expected_version.is_none(), &put.id_inputs) {
-                (true, None) => bad("a create carries id_inputs"),
+                (true, None) => bad("a create lacks id_inputs"),
                 (false, Some(_)) => bad("id_inputs on a write that isn't a create"),
                 (false, None) => Ok(()),
                 (true, Some(inputs)) => {

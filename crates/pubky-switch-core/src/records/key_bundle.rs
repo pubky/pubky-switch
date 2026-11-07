@@ -572,13 +572,27 @@ impl PartReader<'_> {
         &self,
         part: &BundlePart,
     ) -> std::result::Result<KeyBundleContents, SkipReason> {
+        let contents = self.open_signed(part)?;
+        self.check_contents(part, contents)
+    }
+
+    /// Verify a part's signature and open it.
+    fn open_signed(&self, part: &BundlePart) -> std::result::Result<KeyBundleContents, SkipReason> {
         part.bundle
             .verify(&self.identity, &self.app_id)
             .map_err(|_| SkipReason::Unverified)?;
         let json = envelope::open_framed(&part.bundle.envelope, &self.identity, self.bundle_secret)
             .map_err(|error| SkipReason::Unopened(error.to_string()))?;
-        let contents = KeyBundleContents::parse(&json)
-            .map_err(|error| SkipReason::Unopened(error.to_string()))?;
+        KeyBundleContents::parse(&json).map_err(|error| SkipReason::Unopened(error.to_string()))
+    }
+
+    /// The skip rules after opening, but the naming key's: the clear range, the next
+    /// epoch, the certificate the part names and its keys.
+    fn check_contents(
+        &self,
+        part: &BundlePart,
+        contents: KeyBundleContents,
+    ) -> std::result::Result<KeyBundleContents, SkipReason> {
         if (contents.first_epoch, contents.last_epoch) != part.range() {
             return Err(SkipReason::Relabelled);
         }
@@ -616,13 +630,15 @@ impl PartReader<'_> {
                 range: part.range(),
                 reason,
             };
-            let contents = match self.open_part(part) {
+            let contents = match self.open_signed(part) {
                 Ok(contents) => contents,
                 Err(reason) => {
                     reading.skipped.push(skip(reason));
                     continue;
                 }
             };
+            // Another naming key in a part the identity key signed is an alert, whatever
+            // else is wrong with the part, so it is judged first (Switch spec 3.5).
             if reading
                 .naming_key
                 .as_ref()
@@ -631,6 +647,13 @@ impl PartReader<'_> {
                 reading.skipped.push(skip(SkipReason::OtherNamingKey));
                 continue;
             }
+            let contents = match self.check_contents(part, contents) {
+                Ok(contents) => contents,
+                Err(reason) => {
+                    reading.skipped.push(skip(reason));
+                    continue;
+                }
+            };
             reading.naming_key = Some(contents.naming_key.clone());
             reading.keys.merge(&contents.keys);
             reading.taken.push(part.range());
@@ -1146,6 +1169,20 @@ mod tests {
         let held = NamingKey::from_bytes([4; 32]);
         let reading = r.read(std::slice::from_ref(&first), Some(&held)).unwrap();
         assert!(reading.taken.is_empty() && reading.alerts());
+        // Another naming key alerts even in a part that breaks a later rule as well, here
+        // one that names a certificate the app doesn't hold.
+        let stale = cert_for(&["scope-a"]);
+        let mut stale_contents =
+            KeyBundleContents::derive(&identity(), &stale, 2, 2, &has_keys).unwrap();
+        stale_contents.naming_key = NamingKey::from_bytes([5; 32]);
+        let both = BundlePart {
+            bundle: KeyBundle::seal(&identity(), &stale, &stale_contents).unwrap(),
+            first_epoch: 2,
+            last_epoch: 2,
+        };
+        let reading = r.read(&[first.clone(), both], None).unwrap();
+        assert_eq!(reading.skipped[0].reason, SkipReason::OtherNamingKey);
+        assert!(reading.alerts());
 
         // Overlapping or out-of-order parts refuse the whole list.
         assert!(r.read(&[second.clone(), first.clone()], None).is_err());
