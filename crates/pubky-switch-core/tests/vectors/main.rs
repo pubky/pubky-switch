@@ -11,11 +11,14 @@
 
 mod common;
 
+mod chain;
+mod claims;
 mod documents;
 mod encoding;
 mod envelopes;
 mod http;
 mod identifiers;
 mod keys;
+mod operations;
 mod sealed;
 mod signatures;
