@@ -1282,7 +1282,7 @@ mod tests {
     const A: [u8; 16] = [0xA; 16];
     const B: [u8; 16] = [0xB; 16];
     const KEY: [u8; 32] = [1; 32];
-    const T0: u64 = 1_767_225_600_000;
+    const START: u64 = 1_767_225_600_000;
 
     fn all_current(_: &[u8; 16]) -> bool {
         true
@@ -1340,9 +1340,9 @@ mod tests {
 
     #[test]
     fn test_attempt_deadline_is_one_millisecond_after_the_last_instant() {
-        assert_eq!(attempt_deadline(T0), T0 + 1);
+        assert_eq!(attempt_deadline(START), START + 1);
         assert_eq!(
-            rfc3339(attempt_deadline(T0 + 999)),
+            rfc3339(attempt_deadline(START + 999)),
             "2026-01-01T00:00:01.000Z"
         );
         assert_eq!(attempt_deadline(u64::MAX), crate::time::MAX_TIME_MS);
@@ -1350,11 +1350,11 @@ mod tests {
 
     #[test]
     fn test_claim_row1_attempt_opens_and_a_second_conflicts() {
-        let c = apply(None, &attempt(0, 1), &cx(A, T0));
+        let c = apply(None, &attempt(0, 1), &cx(A, START));
         assert_eq!(c.status(), ClaimStatus::Attempting);
         assert_eq!((c.step, c.creator), (1, Some(A)));
         assert_eq!(c.attempts[0].attempt_id, [1; 16]);
-        let refused = apply_entry(Some(&c), &attempt(1, 2), &cx(B, T0)).unwrap_err();
+        let refused = apply_entry(Some(&c), &attempt(1, 2), &cx(B, START)).unwrap_err();
         assert_eq!(refused.status(), 409);
         let current = refused.current.unwrap();
         assert_eq!(current["claim"]["state"], "ATTEMPTING");
@@ -1362,100 +1362,107 @@ mod tests {
 
     #[test]
     fn test_claim_stale_expected_step_conflicts() {
-        let c = apply(None, &attempt(0, 1), &cx(A, T0));
-        let refused = apply_entry(Some(&c), &done(0, 1, Basis::Owner), &cx(A, T0)).unwrap_err();
+        let c = apply(None, &attempt(0, 1), &cx(A, START));
+        let refused = apply_entry(Some(&c), &done(0, 1, Basis::Owner), &cx(A, START)).unwrap_err();
         assert_eq!(refused.code, ErrorCode::Conflict);
-        let refused = apply_entry(None, &attempt(3, 1), &cx(A, T0)).unwrap_err();
+        let refused = apply_entry(None, &attempt(3, 1), &cx(A, START)).unwrap_err();
         assert_eq!(refused.current.unwrap()["claim"], Value::Null);
     }
 
     #[test]
     fn test_claim_row2_owner_done_settles_and_compacts() {
-        let c = apply(None, &attempt(0, 1), &cx(A, T0));
-        assert!(apply_entry(Some(&c), &done(1, 1, Basis::Owner), &cx(B, T0)).is_err());
-        let settled = apply(Some(&c), &done(1, 1, Basis::Owner), &cx(A, T0));
+        let c = apply(None, &attempt(0, 1), &cx(A, START));
+        assert!(apply_entry(Some(&c), &done(1, 1, Basis::Owner), &cx(B, START)).is_err());
+        let settled = apply(Some(&c), &done(1, 1, Basis::Owner), &cx(A, START));
         assert!(settled.tombstone && settled.settled);
         assert_eq!(settled.attempts[0].resolved_by, Some(A));
         // A repeated done conflicts; so do attempt and unknown (row 7).
-        assert!(apply_entry(Some(&settled), &done(2, 1, Basis::Owner), &cx(A, T0)).is_err());
-        assert!(apply_entry(Some(&settled), &attempt(2, 2), &cx(B, T0)).is_err());
+        assert!(apply_entry(Some(&settled), &done(2, 1, Basis::Owner), &cx(A, START)).is_err());
+        assert!(apply_entry(Some(&settled), &attempt(2, 2), &cx(B, START)).is_err());
         let unknown = entry(2, 1, EntryKind::Unknown);
-        assert!(apply_entry(Some(&settled), &unknown, &cx(B, T0)).is_err());
+        assert!(apply_entry(Some(&settled), &unknown, &cx(B, START)).is_err());
     }
 
     #[test]
     fn test_claim_row2_owner_done_on_failed_only_when_rebuilt() {
-        let c = apply(None, &attempt(0, 1), &cx(A, T0));
-        let failed = apply(Some(&c), &entry(1, 1, EntryKind::Failed), &cx(A, T0));
-        assert!(apply_entry(Some(&failed), &done(2, 1, Basis::Owner), &cx(A, T0)).is_err());
+        let c = apply(None, &attempt(0, 1), &cx(A, START));
+        let failed = apply(Some(&c), &entry(1, 1, EntryKind::Failed), &cx(A, START));
+        assert!(apply_entry(Some(&failed), &done(2, 1, Basis::Owner), &cx(A, START)).is_err());
         let mut rebuilt = failed.clone();
         rebuilt.rebuilt = true;
-        let settled = apply(Some(&rebuilt), &done(2, 1, Basis::Owner), &cx(A, T0));
+        let settled = apply(Some(&rebuilt), &done(2, 1, Basis::Owner), &cx(A, START));
         assert!(settled.settled);
     }
 
     #[test]
     fn test_claim_row3_evidence_on_failed_and_tombstone_flags_duplicate() {
-        let c = apply(None, &attempt(0, 1), &cx(A, T0));
-        let failed = apply(Some(&c), &entry(1, 1, EntryKind::Failed), &cx(A, T0));
+        let c = apply(None, &attempt(0, 1), &cx(A, START));
+        let failed = apply(Some(&c), &entry(1, 1, EntryKind::Failed), &cx(A, START));
         assert_eq!(failed.status(), ClaimStatus::Free);
         assert!(failed.is_failed());
-        let second = apply(Some(&failed), &attempt(2, 2), &cx(B, T0));
-        let tomb = apply(Some(&second), &done(3, 2, Basis::Owner), &cx(B, T0));
+        let second = apply(Some(&failed), &attempt(2, 2), &cx(B, START));
+        let tomb = apply(Some(&second), &done(3, 2, Basis::Owner), &cx(B, START));
         assert!(tomb.tombstone);
-        let late = apply(Some(&tomb), &done(4, 1, Basis::Evidence), &cx(A, T0));
+        let late = apply(Some(&tomb), &done(4, 1, Basis::Evidence), &cx(A, START));
         assert!(late.attempts[0].duplicate && late.tombstone);
         assert_eq!(late.step, 5);
         // Any other entry on a tombstone conflicts.
-        assert!(apply_entry(Some(&late), &entry(5, 2, EntryKind::Failed), &cx(B, T0)).is_err());
+        assert!(apply_entry(Some(&late), &entry(5, 2, EntryKind::Failed), &cx(B, START)).is_err());
     }
 
     #[test]
     fn test_claim_row4_reconcile_needs_an_orphaned_attempt() {
-        let c = apply(None, &attempt(0, 1), &cx(A, T0));
-        assert!(apply_entry(Some(&c), &done(1, 1, Basis::Reconcile), &cx(B, T0)).is_err());
-        let late = T0 + 60_000;
+        let c = apply(None, &attempt(0, 1), &cx(A, START));
+        assert!(apply_entry(Some(&c), &done(1, 1, Basis::Reconcile), &cx(B, START)).is_err());
+        let late = START + 60_000;
         let settled = apply(Some(&c), &done(1, 1, Basis::Reconcile), &cx(B, late));
         assert_eq!(settled.attempts[0].resolved_by, Some(B));
         // An owner that isn't current orphans its attempt at once.
-        let mut other = cx(B, T0);
+        let mut other = cx(B, START);
         other.is_current = &only_b_current;
         assert!(apply_entry(Some(&c), &done(1, 1, Basis::Reconcile), &other).is_ok());
     }
 
     #[test]
     fn test_claim_row5_failed_by_owner_or_once_owner_isnt_current() {
-        let c = apply(None, &attempt(0, 1), &cx(A, T0));
-        assert!(apply_entry(Some(&c), &entry(1, 1, EntryKind::Failed), &cx(B, T0)).is_err());
-        let mut other = cx(B, T0);
+        let c = apply(None, &attempt(0, 1), &cx(A, START));
+        assert!(apply_entry(Some(&c), &entry(1, 1, EntryKind::Failed), &cx(B, START)).is_err());
+        let mut other = cx(B, START);
         other.is_current = &only_b_current;
         let failed = apply(Some(&c), &entry(1, 1, EntryKind::Failed), &other);
         assert_eq!(failed.attempts[0].outcome, Outcome::Failed);
         // The next attempt is possibly a duplicate: another app wrote the failure.
         assert!(failed.next_possibly_duplicate());
-        let next = apply(Some(&failed), &attempt(2, 2), &cx(B, T0));
+        let next = apply(Some(&failed), &attempt(2, 2), &cx(B, START));
         assert!(next.attempts[1].possibly_duplicate);
         // failed again on a failed attempt conflicts.
-        assert!(apply_entry(Some(&failed), &entry(2, 1, EntryKind::Failed), &cx(A, T0)).is_err());
+        assert!(
+            apply_entry(
+                Some(&failed),
+                &entry(2, 1, EntryKind::Failed),
+                &cx(A, START)
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn test_claim_row6_unknown_needs_orphaned_and_frees() {
-        let c = apply(None, &attempt(0, 1), &cx(A, T0));
+        let c = apply(None, &attempt(0, 1), &cx(A, START));
         let unknown = entry(1, 1, EntryKind::Unknown);
-        assert!(apply_entry(Some(&c), &unknown, &cx(B, T0 + 59_999)).is_err());
-        let free = apply(Some(&c), &unknown, &cx(B, T0 + 60_000));
+        assert!(apply_entry(Some(&c), &unknown, &cx(B, START + 59_999)).is_err());
+        let free = apply(Some(&c), &unknown, &cx(B, START + 60_000));
         assert_eq!(free.status(), ClaimStatus::Free);
         assert!(free.next_possibly_duplicate());
-        let view = free.view(&KEY, T0, &all_current);
+        let view = free.view(&KEY, START, &all_current);
         assert!(view.doubtful());
     }
 
     #[test]
     fn test_claim_unknown_attempt_id_conflicts() {
-        let c = apply(None, &attempt(0, 1), &cx(A, T0));
-        assert!(apply_entry(Some(&c), &entry(1, 9, EntryKind::Failed), &cx(A, T0)).is_err());
-        assert!(apply_entry(Some(&c), &done(1, 9, Basis::Evidence), &cx(A, T0)).is_err());
+        let c = apply(None, &attempt(0, 1), &cx(A, START));
+        assert!(apply_entry(Some(&c), &entry(1, 9, EntryKind::Failed), &cx(A, START)).is_err());
+        assert!(apply_entry(Some(&c), &done(1, 9, Basis::Evidence), &cx(A, START)).is_err());
     }
 
     #[test]
@@ -1465,12 +1472,12 @@ mod tests {
             1,
             EntryKind::Attempt {
                 orphan_after: 60,
-                deadline: Some(T0 + 1_000),
+                deadline: Some(START + 1_000),
             },
         );
-        let c = apply(None, &pinned, &cx(A, T0));
-        assert_eq!(c.pin, Pin::At(T0 + 1_000));
-        let failed = apply(Some(&c), &entry(1, 1, EntryKind::Failed), &cx(A, T0));
+        let c = apply(None, &pinned, &cx(A, START));
+        assert_eq!(c.pin, Pin::At(START + 1_000));
+        let failed = apply(Some(&c), &entry(1, 1, EntryKind::Failed), &cx(A, START));
         // Another deadline, or none, conflicts; the pinned one opens.
         let mut other = pinned;
         other.attempt_id = [2; 16];
@@ -1479,25 +1486,25 @@ mod tests {
             orphan_after: 60,
             deadline: None,
         };
-        assert!(apply_entry(Some(&failed), &other, &cx(B, T0)).is_err());
+        assert!(apply_entry(Some(&failed), &other, &cx(B, START)).is_err());
         other.kind = EntryKind::Attempt {
             orphan_after: 60,
-            deadline: Some(T0 + 1_000),
+            deadline: Some(START + 1_000),
         };
-        assert!(apply_entry(Some(&failed), &other, &cx(B, T0)).is_ok());
+        assert!(apply_entry(Some(&failed), &other, &cx(B, START)).is_ok());
         // At the deadline itself: refused with the service time, before expected_step.
         other.expected_step = 7;
-        let refused = apply_entry(Some(&failed), &other, &cx(B, T0 + 1_000)).unwrap_err();
+        let refused = apply_entry(Some(&failed), &other, &cx(B, START + 1_000)).unwrap_err();
         let current = refused.current.unwrap();
-        assert_eq!(current["server_time"], rfc3339(T0 + 1_000));
+        assert_eq!(current["server_time"], rfc3339(START + 1_000));
         assert_eq!(current["claim"]["step"], 2);
     }
 
     #[test]
     fn test_claim_settled_with_open_attempt_keeps_it() {
         // Evidence settling the only open attempt finishes the claim at once.
-        let c = apply(None, &attempt(0, 1), &cx(A, T0));
-        let settled = apply(Some(&c), &done(1, 1, Basis::Evidence), &cx(B, T0));
+        let c = apply(None, &attempt(0, 1), &cx(A, START));
+        let settled = apply(Some(&c), &done(1, 1, Basis::Evidence), &cx(B, START));
         assert!(settled.tombstone, "every attempt is done");
         // A SETTLED claim with another attempt open stays live until that one is resolved.
         let mut two = Claim {
@@ -1509,24 +1516,24 @@ mod tests {
         let mut open = c.attempts[0].clone();
         open.attempt_id = [2; 16];
         two.attempts.push(open);
-        let duplicate = apply(Some(&two), &done(2, 2, Basis::Owner), &cx(A, T0));
+        let duplicate = apply(Some(&two), &done(2, 2, Basis::Owner), &cx(A, START));
         assert!(duplicate.attempts[1].duplicate && duplicate.tombstone);
-        let failed = apply(Some(&two), &entry(2, 2, EntryKind::Failed), &cx(A, T0));
+        let failed = apply(Some(&two), &entry(2, 2, EntryKind::Failed), &cx(A, START));
         assert!(failed.tombstone);
         assert!(!failed.next_possibly_duplicate());
     }
 
     #[test]
     fn test_claim_view_shows_owner_only_while_attempting() {
-        let c = apply(None, &attempt(0, 1), &cx(A, T0));
-        let view = c.view(&KEY, T0, &all_current).to_value();
+        let c = apply(None, &attempt(0, 1), &cx(A, START));
+        let view = c.view(&KEY, START, &all_current).to_value();
         assert_eq!(view["owner"], zbase32_encode(&A));
         assert_eq!(view["attempts"][0]["orphaned"], false);
         assert!(view.get("deadline").is_none());
         let read = ClaimView::from_value(&view).unwrap();
-        assert_eq!(read, c.view(&KEY, T0, &all_current));
-        let tomb = apply(Some(&c), &done(1, 1, Basis::Owner), &cx(A, T0));
-        let view = tomb.view(&KEY, T0, &all_current).to_value();
+        assert_eq!(read, c.view(&KEY, START, &all_current));
+        let tomb = apply(Some(&c), &done(1, 1, Basis::Owner), &cx(A, START));
+        let view = tomb.view(&KEY, START, &all_current).to_value();
         assert!(view.get("owner").is_none() && view.get("attempt_id").is_none());
         assert_eq!(view["attempts"][0]["resolved_by"], zbase32_encode(&A));
         // Its members are sorted, as a proof's state is written.
@@ -1536,8 +1543,8 @@ mod tests {
 
     #[test]
     fn test_claim_conflict_hides_the_claim_without_claims_read() {
-        let c = apply(None, &attempt(0, 1), &cx(A, T0));
-        let mut blind = cx(B, T0);
+        let c = apply(None, &attempt(0, 1), &cx(A, START));
+        let mut blind = cx(B, START);
         blind.can_read = false;
         let refused = apply_entry(Some(&c), &attempt(1, 2), &blind).unwrap_err();
         assert_eq!(refused.current, Some(json!({})));
@@ -1573,7 +1580,7 @@ mod tests {
         };
         assert_eq!(limit(None, open), Some(json!("open_attempts")));
         let busy = Claim {
-            attempts: vec![apply(None, &attempt(0, 1), &cx(A, T0)).attempts[0].clone(); 2],
+            attempts: vec![apply(None, &attempt(0, 1), &cx(A, START)).attempts[0].clone(); 2],
             ..Claim::default()
         };
         assert_eq!(limit(Some(&busy), open), Some(json!("attempts")));
@@ -1592,9 +1599,9 @@ mod tests {
 
     #[test]
     fn test_claim_tally_counts_live_and_tombstones() {
-        let open = apply(None, &attempt(0, 1), &cx(A, T0));
-        let tomb = apply(Some(&open), &done(1, 1, Basis::Owner), &cx(A, T0));
-        let other = apply(None, &attempt(0, 2), &cx(B, T0));
+        let open = apply(None, &attempt(0, 1), &cx(A, START));
+        let tomb = apply(Some(&open), &done(1, 1, Basis::Owner), &cx(A, START));
+        let other = apply(None, &attempt(0, 2), &cx(B, START));
         let tally = ClaimTally::count([&open, &tomb, &other], &A);
         assert_eq!(
             tally,
@@ -1613,12 +1620,12 @@ mod tests {
             1,
             EntryKind::Attempt {
                 orphan_after: 60,
-                deadline: Some(T0 + 1_000),
+                deadline: Some(START + 1_000),
             },
         );
-        let c = apply(None, &pinned, &cx(A, T0));
-        let tomb = apply(Some(&c), &done(1, 1, Basis::Owner), &cx(A, T0));
-        let from = T0 + 1_000 + RECONCILIATION_MS;
+        let c = apply(None, &pinned, &cx(A, START));
+        let tomb = apply(Some(&c), &done(1, 1, Basis::Owner), &cx(A, START));
+        let from = START + 1_000 + RECONCILIATION_MS;
         assert_eq!(tomb.deletable_from(MAX_CLAIM_AGE_MS), Some(from));
         assert!(!tomb.deletable(Some(from - 1), MAX_CLAIM_AGE_MS));
         assert!(tomb.deletable(Some(from), MAX_CLAIM_AGE_MS));
@@ -1629,11 +1636,15 @@ mod tests {
         // A live claim with an open attempt is never deleted by age.
         assert_eq!(c.deletable_from(MAX_CLAIM_AGE_MS), None);
         // A failed claim pinned to "none" goes 400 days after its last entry.
-        let none = apply(None, &attempt(0, 1), &cx(A, T0));
-        let failed = apply(Some(&none), &entry(1, 1, EntryKind::Failed), &cx(A, T0 + 5));
+        let none = apply(None, &attempt(0, 1), &cx(A, START));
+        let failed = apply(
+            Some(&none),
+            &entry(1, 1, EntryKind::Failed),
+            &cx(A, START + 5),
+        );
         assert_eq!(
             failed.deletable_from(MAX_CLAIM_AGE_MS),
-            Some(T0 + 5 + MAX_CLAIM_AGE_MS)
+            Some(START + 5 + MAX_CLAIM_AGE_MS)
         );
     }
 
@@ -1681,7 +1692,7 @@ mod tests {
         );
         assert_eq!(
             bad(ClaimFields {
-                deadline: Some(T0),
+                deadline: Some(START),
                 ..done_fields.clone()
             }),
             400
@@ -1701,7 +1712,7 @@ mod tests {
 
     #[test]
     fn test_entry_depends_on_time() {
-        let c = apply(None, &attempt(0, 1), &cx(A, T0));
+        let c = apply(None, &attempt(0, 1), &cx(A, START));
         assert!(entry_depends_on_time(
             None,
             &attempt(0, 1),
@@ -1729,27 +1740,33 @@ mod tests {
     #[test]
     fn test_evidence_kept_to_the_later_bound() {
         let day = 86_400_000;
-        let d = T0 + 10 * day;
+        let d = START + 10 * day;
         // Pinned and own deadline: the later plus 30 days, kept at the boundary itself.
         let edge = d + RECONCILIATION_MS;
-        assert!(evidence_kept(Some(d), Some(d - day), T0, edge, edge));
+        assert!(evidence_kept(Some(d), Some(d - day), START, edge, edge));
         assert!(!evidence_kept(
             Some(d),
             Some(d - day),
-            T0,
+            START,
             edge + 1,
             edge + 1
         ));
         // An early pin is kept for good.
-        assert!(evidence_kept(Some(d), None, T0, u64::MAX, u64::MAX - day));
+        assert!(evidence_kept(
+            Some(d),
+            None,
+            START,
+            u64::MAX,
+            u64::MAX - day
+        ));
         // A pin to "none": 400 days after the proof's time.
-        let aged = T0 + MAX_CLAIM_AGE_MS;
-        assert!(evidence_kept(None, None, T0, aged, aged));
-        assert!(!evidence_kept(None, None, T0, aged + 1, aged + 1));
+        let aged = START + MAX_CLAIM_AGE_MS;
+        assert!(evidence_kept(None, None, START, aged, aged));
+        assert!(!evidence_kept(None, None, START, aged + 1, aged + 1));
         // A far-future verified time is bounded by the device clock plus 24 hours.
-        assert!(evidence_kept(None, None, T0, u64::MAX, aged - day));
-        assert!(service_may_delete(Some(d), T0, edge));
-        assert!(!service_may_delete(Some(d), T0, edge - 1));
-        assert!(service_may_delete(None, T0, aged));
+        assert!(evidence_kept(None, None, START, u64::MAX, aged - day));
+        assert!(service_may_delete(Some(d), START, edge));
+        assert!(!service_may_delete(Some(d), START, edge - 1));
+        assert!(service_may_delete(None, START, aged));
     }
 }

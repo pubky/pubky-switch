@@ -1416,7 +1416,7 @@ mod tests {
     use crate::keys::IdentityKey;
     use ed25519_dalek::SigningKey;
 
-    const T0: u64 = 1_767_225_600_000;
+    const START: u64 = 1_767_225_600_000;
 
     fn service() -> SigningKey {
         SigningKey::from_bytes(&[5; 32])
@@ -1475,7 +1475,7 @@ mod tests {
             generation: 1,
             seq: 7,
             prev_chain_hash: [1; 32],
-            server_time: T0,
+            server_time: START,
             item_type: ItemType::Op,
             item_hash: [2; 32],
             batch: Some(BatchRef {
@@ -1503,15 +1503,15 @@ mod tests {
 
     #[test]
     fn test_chain_tip_links_and_refuses_a_seq_not_above() {
-        let (stubs, tip) = chain(&[(None, T0), (Some(([1; 16], 2)), T0)]);
+        let (stubs, tip) = chain(&[(None, START), (Some(([1; 16], 2)), START)]);
         assert_eq!(tip.seq, 3);
         let second = stubs[1].open().unwrap();
         assert_eq!(second.prev_chain_hash, stubs[0].chain_hash);
         assert!(
-            tip.append(3, T0, ItemType::Identity, [0; 32], None)
+            tip.append(3, START, ItemType::Identity, [0; 32], None)
                 .is_err()
         );
-        assert!(tip.append(4, T0, ItemType::Op, [0; 32], None).is_err());
+        assert!(tip.append(4, START, ItemType::Op, [0; 32], None).is_err());
         let mut forged = stubs[0].clone();
         forged.chain_hash[0] ^= 1;
         assert_eq!(forged.open().unwrap_err(), ChainError::ChainHash { seq: 1 });
@@ -1519,7 +1519,7 @@ mod tests {
 
     #[test]
     fn test_signed_head_signs_verifies_and_travels_as_a_header() {
-        let (_, tip) = chain(&[(None, T0)]);
+        let (_, tip) = chain(&[(None, START)]);
         let head = SignedHead::sign(&service(), &identity(), &tip);
         let key = service().verifying_key().to_bytes();
         head.verify(&key, &identity()).unwrap();
@@ -1533,7 +1533,7 @@ mod tests {
 
     #[test]
     fn test_verifier_takes_an_honest_chain_with_a_gap_in_seqs() {
-        let (mut stubs, _) = chain(&[(None, T0), (Some(([1; 16], 2)), T0 + 1)]);
+        let (mut stubs, _) = chain(&[(None, START), (Some(([1; 16], 2)), START + 1)]);
         // A gap in seqs (an inbox entry) is fine when the link holds.
         let env = stubs[2].open().unwrap();
         let mut tip = ChainTip {
@@ -1542,7 +1542,7 @@ mod tests {
             chain_hash: stubs[2].chain_hash,
         };
         let (late, next) = tip
-            .append(5, T0 + 2, ItemType::Identity, [9; 32], None)
+            .append(5, START + 2, ItemType::Identity, [9; 32], None)
             .unwrap();
         tip = next;
         stubs.push(late);
@@ -1552,12 +1552,12 @@ mod tests {
         }
         v.end_of_feed().unwrap();
         assert_eq!(v.last(), (5, tip.chain_hash));
-        assert_eq!(v.highest_time(), Some(T0 + 2));
+        assert_eq!(v.highest_time(), Some(START + 2));
     }
 
     #[test]
     fn test_verifier_refuses_a_broken_link() {
-        let (stubs, _) = chain(&[(None, T0), (None, T0), (None, T0)]);
+        let (stubs, _) = chain(&[(None, START), (None, START), (None, START)]);
         let mut v = Verifier::new(1);
         v.push(&stubs[0]).unwrap();
         assert_eq!(v.push(&stubs[2]).unwrap_err(), ChainError::Link { seq: 3 });
@@ -1571,7 +1571,7 @@ mod tests {
 
     #[test]
     fn test_verifier_refuses_a_stub_stamped_earlier() {
-        let (stubs, _) = chain(&[(None, T0 + 5), (None, T0)]);
+        let (stubs, _) = chain(&[(None, START + 5), (None, START)]);
         let mut v = Verifier::new(1);
         v.push(&stubs[0]).unwrap();
         assert_eq!(v.push(&stubs[1]).unwrap_err(), ChainError::Stamp { seq: 2 });
@@ -1589,10 +1589,10 @@ mod tests {
             id: [1; 16],
             count: 3,
         });
-        let (a, tip) = tip.append(1, T0, ItemType::Op, [1; 32], batch).unwrap();
-        let (b, tip) = tip.append(2, T0, ItemType::Op, [2; 32], batch).unwrap();
+        let (a, tip) = tip.append(1, START, ItemType::Op, [1; 32], batch).unwrap();
+        let (b, tip) = tip.append(2, START, ItemType::Op, [2; 32], batch).unwrap();
         let (c, _) = tip
-            .append(3, T0, ItemType::Identity, [3; 32], None)
+            .append(3, START, ItemType::Identity, [3; 32], None)
             .unwrap();
         let mut v = Verifier::new(1);
         v.push(&a).unwrap();
@@ -1611,7 +1611,7 @@ mod tests {
     fn test_verifier_batch_id_window_is_thirty_days_by_server_time() {
         let id = [4u8; 16];
         let at = |gap: u64| {
-            let (stubs, _) = chain(&[(Some((id, 1)), T0), (Some((id, 1)), T0 + gap)]);
+            let (stubs, _) = chain(&[(Some((id, 1)), START), (Some((id, 1)), START + gap)]);
             let mut v = Verifier::new(1);
             v.push(&stubs[0]).unwrap();
             v.push(&stubs[1])
@@ -1626,7 +1626,7 @@ mod tests {
 
     #[test]
     fn test_verifier_heads_must_match_or_wait() {
-        let (stubs, tip) = chain(&[(None, T0), (None, T0)]);
+        let (stubs, tip) = chain(&[(None, START), (None, START)]);
         let key = service();
         let mut v = Verifier::new(1);
         v.push(&stubs[0]).unwrap();
@@ -1679,7 +1679,7 @@ mod tests {
 
     #[test]
     fn test_verifier_checkpoints() {
-        let (stubs, _) = chain(&[(None, T0), (None, T0), (None, T0), (None, T0)]);
+        let (stubs, _) = chain(&[(None, START), (None, START), (None, START), (None, START)]);
         let key = service();
         let at = |seq: u64, hash: [u8; 32]| {
             SignedHead::sign(
@@ -1721,7 +1721,7 @@ mod tests {
             generation: 1,
             seq: 1,
             prev_chain_hash: ZERO_HASH,
-            server_time: T0,
+            server_time: START,
             item_type: ItemType::Identity,
             item_hash: item_hash(ItemType::Identity, b"doc"),
             batch: None,
@@ -1735,7 +1735,7 @@ mod tests {
     fn test_service_transition_round_trips_sorted() {
         let t = ServiceTransition::Revoke {
             app_id: [1; 16],
-            at: T0,
+            at: START,
         };
         let json = String::from_utf8(t.to_json().unwrap()).unwrap();
         assert!(json.starts_with("{\"app_id\":"), "{json}");
@@ -1751,7 +1751,7 @@ mod tests {
             pubky: identity(),
             code_hash: [2; 32],
             context: json!({"rate": 1.5}),
-            at: T0,
+            at: START,
         };
         let signed = add.sign(&service(), &identity()).unwrap();
         assert_eq!(
@@ -1759,7 +1759,7 @@ mod tests {
             add
         );
         assert_eq!(add.proof_object(), None);
-        let admission = ServiceTransition::Admission { at: T0 };
+        let admission = ServiceTransition::Admission { at: START };
         assert_eq!(admission.proof_object().as_deref(), Some("admission"));
         let mut odd = admission.to_value();
         odd["by"] = "app".into();
@@ -1841,7 +1841,7 @@ mod tests {
     #[test]
     fn test_bind_answer_needs_one_bound_proof_per_operation() {
         let key = service().verifying_key().to_bytes();
-        let (op, proof, _) = attempt_and_proof(None, T0);
+        let (op, proof, _) = attempt_and_proof(None, START);
         let ops = vec![op.clone()];
         assert_eq!(
             bind_answer(&ops, &[proof.signed().clone()], &key, &identity())
@@ -1859,7 +1859,7 @@ mod tests {
             Err(ChainError::Signature(_))
         ));
         // A proof of another operation doesn't bind.
-        let (later, later_proof, _) = attempt_and_proof(Some(T0 + 5), T0);
+        let (later, later_proof, _) = attempt_and_proof(Some(START + 5), START);
         assert!(later_proof.check_binds(&later).is_ok());
         assert!(matches!(
             proof.check_binds(&later),
@@ -1870,7 +1870,7 @@ mod tests {
     #[test]
     fn test_check_attempt_proof_before_acting() {
         let app = crate::keys::AppKeys::from_secrets([2; 32], [3; 32]).app_id_bytes();
-        let (_, proof, entry) = attempt_and_proof(Some(T0 + 10), T0);
+        let (_, proof, entry) = attempt_and_proof(Some(START + 10), START);
         let view = check_attempt_proof(&proof, &entry, &app, 1).unwrap();
         assert_eq!(view.owner, Some(app));
         // Another generation, another app, a stale step or a stamp at the deadline.
@@ -1879,13 +1879,13 @@ mod tests {
         let mut stale = entry;
         stale.expected_step = 1;
         assert!(check_attempt_proof(&proof, &stale, &app, 1).is_err());
-        let (_, late, entry) = attempt_and_proof(Some(T0), T0);
+        let (_, late, entry) = attempt_and_proof(Some(START), START);
         assert!(check_attempt_proof(&late, &entry, &app, 1).is_err());
     }
 
     #[test]
     fn test_transition_proof_signs_verifies_and_writes_its_order() {
-        let (stubs, _) = chain(&[(None, T0)]);
+        let (stubs, _) = chain(&[(None, START)]);
         let state = ProofState::Identity {
             version: 1,
             generation: 1,
