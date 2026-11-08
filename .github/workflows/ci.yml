@@ -45,6 +45,22 @@ jobs:
     name: Tests
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: switch
+          POSTGRES_PASSWORD: switch
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U switch"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      PUBKY_SWITCH_TEST_DATABASE_URL: postgres://switch:switch@localhost:5432/postgres
+      PUBKY_SWITCH_REQUIRE_DB: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
@@ -89,7 +105,14 @@ jobs:
       - name: Smoke test
         run: |
           docker run --rm pubky-switch:ci check-config
-          docker run -d --name switch -p 127.0.0.1:9090:9090 pubky-switch:ci
-          for i in $(seq 1 30); do curl -sf localhost:9090/health/live && break; sleep 1; done
+          docker network create switch
+          docker run -d --name db --network switch \
+            -e POSTGRES_USER=switch -e POSTGRES_PASSWORD=switch postgres:17
+          for i in $(seq 1 30); do docker exec db pg_isready -U switch && break; sleep 1; done
+          docker run -d --name switch --network switch -p 127.0.0.1:9090:9090 \
+            -e PUBKY_SWITCH_DATABASE_URL=postgres://switch:switch@db:5432/switch \
+            pubky-switch:ci
+          for i in $(seq 1 30); do curl -sf localhost:9090/health/ready && break; sleep 1; done
           curl -sf localhost:9090/health/ready
+          docker logs switch
           docker stop switch

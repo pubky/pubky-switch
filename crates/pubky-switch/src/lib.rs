@@ -18,6 +18,8 @@
 
 pub mod admin;
 pub mod config;
+pub mod keys;
 pub mod limits;
+pub mod store;
 pub mod telemetry;
 pub mod time;

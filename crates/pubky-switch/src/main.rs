@@ -6,6 +6,8 @@ use clap::{Parser, Subcommand};
 use pubky_switch::{
     admin::{self, AdminState},
     config::Config,
+    keys::{FileKeyStore, KeyStoreReadiness},
+    store::{Store, StoreReadiness},
     telemetry,
     time::{SystemClock, TrustedTime},
 };
@@ -98,7 +100,22 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     }
     time.record_gauges();
 
-    let admin = admin::router(AdminState::new(time, Some(metrics)));
+    let key_dir = config
+        .keys
+        .path
+        .clone()
+        .ok_or("no key store: set keys.path")?;
+    let keys = FileKeyStore::open(&key_dir)?;
+    let store = Store::connect(&config.database).await?;
+    if config.database.migrate_on_start {
+        store.migrate().await?;
+        tracing::info!("database schema up to date");
+    }
+
+    let admin_state = AdminState::new(time, Some(metrics))
+        .with_check(Arc::new(StoreReadiness(store.clone())))
+        .with_check(Arc::new(KeyStoreReadiness(keys.clone())));
+    let admin = admin::router(admin_state);
     let listener = tokio::net::TcpListener::bind(config.admin.listen).await?;
     tracing::info!(
         admin = %listener.local_addr()?,
@@ -108,6 +125,7 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     axum::serve(listener, admin)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
+    store.close().await;
     tracing::info!("pubky-switch stopped");
     Ok(())
 }

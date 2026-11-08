@@ -8,7 +8,7 @@ use std::{net::SocketAddr, path::Path};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{limits::Limits, time::TrustedTimeConfig};
+use crate::{keys::KeysConfig, limits::Limits, store::DatabaseConfig, time::TrustedTimeConfig};
 
 /// The whole configuration.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -22,6 +22,10 @@ pub struct Config {
     pub limits: Limits,
     /// Trusted time (Switch wire 7.3).
     pub trusted_time: TrustedTimeConfig,
+    /// The database.
+    pub database: DatabaseConfig,
+    /// The key store.
+    pub keys: KeysConfig,
 }
 
 /// The operator listener, which serves health checks and metrics. Keep it off the public
@@ -55,7 +59,7 @@ impl Default for LogConfig {
     fn default() -> Self {
         Self {
             format: LogFormat::Json,
-            filter: "info".into(),
+            filter: "info,sqlx::postgres::notice=warn".into(),
         }
     }
 }
@@ -90,6 +94,9 @@ pub enum ConfigError {
     /// A trusted time setting is invalid.
     #[error(transparent)]
     TrustedTime(#[from] crate::time::TrustedTimeConfigError),
+    /// A database setting is invalid.
+    #[error(transparent)]
+    Database(#[from] crate::store::DatabaseConfigError),
     /// The log filter doesn't parse.
     #[error("log.filter: {0}")]
     LogFilter(String),
@@ -116,6 +123,7 @@ impl Config {
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.limits.validate()?;
         self.trusted_time.validate()?;
+        self.database.validate()?;
         tracing_subscriber::EnvFilter::try_new(&self.log.filter)
             .map_err(|error| ConfigError::LogFilter(error.to_string()))?;
         Ok(())
@@ -150,6 +158,8 @@ mod tests {
         config.limits.quota_bytes *= 2;
         config.limits.checkpoint_behind = Some(10_000);
         config.log.format = LogFormat::Text;
+        config.database.url = Some("postgres://switch@db/switch".into());
+        config.keys.path = Some("/var/lib/pubky-switch/keys".into());
         let text = config.to_toml().expect("serialize");
         assert_eq!(Config::from_toml(&text).expect("parse"), config);
     }
@@ -186,6 +196,10 @@ mod tests {
         assert!(matches!(
             Config::from_toml("[log]\nfilter = \"info,[\"\n"),
             Err(ConfigError::LogFilter(_))
+        ));
+        assert!(matches!(
+            Config::from_toml("[database]\nurl = \"mysql://db\"\n"),
+            Err(ConfigError::Database(_))
         ));
         assert!(matches!(
             Config::from_toml("[admin]\nlisten = \"nowhere\"\n"),
