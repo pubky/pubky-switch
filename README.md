@@ -39,6 +39,15 @@ The Switch is specified in [`spec/`](spec/):
 | `crates/pubky-switch-signer` | Identity management, for the signer that holds the identity key. |
 | `crates/pubky-switch` | The service: storage, the HTTP API, and operations. |
 
+## Running
+
+```sh
+cargo run -p pubky-switch -- --config config.example.toml
+docker build -t pubky-switch .
+```
+
+[`docs/configuration.md`](docs/configuration.md) describes the configuration file, the container image, the health endpoints and the metrics.
+
 ## Building
 
 You need Rust 1.91.1 or later.

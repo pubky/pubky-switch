@@ -78,3 +78,18 @@ jobs:
           toolchain: "1.91.1"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo check --workspace --all-targets --all-features --locked
+
+  container:
+    name: Container image
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: docker build -t pubky-switch:ci .
+      - name: Smoke test
+        run: |
+          docker run --rm pubky-switch:ci check-config
+          docker run -d --name switch -p 127.0.0.1:9090:9090 pubky-switch:ci
+          for i in $(seq 1 30); do curl -sf localhost:9090/health/live && break; sleep 1; done
+          curl -sf localhost:9090/health/ready
+          docker stop switch
