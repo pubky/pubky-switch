@@ -15,12 +15,15 @@ http = ["dep:reqwest", "dep:tokio", "tokio?/net"]
 # Runs each `StateStore` call through `tokio::task::spawn_blocking`, so a slow host store never
 # blocks the async executor.
 tokio = ["dep:tokio", "tokio?/rt"]
-# Test-only: the fault-injecting store, the scripted transport and the test clock. No
-# production build enables it; this crate's own tests turn it on through the dev-dependency
-# below.
-test-support = []
+# Test-only: the fault-injecting store, the scripted transport, the test clock, and the
+# `testing` module with the scripted switch and its fixtures. No production build enables it;
+# this crate's own tests turn it on through the dev-dependency below, and the tests of other
+# crates through their dev-dependencies.
+test-support = ["dep:blake3", "dep:ed25519-dalek"]
 
 [dependencies]
+blake3 = { workspace = true, optional = true }
+ed25519-dalek = { workspace = true, optional = true }
 pubky-switch-core.workspace = true
 reqwest = { workspace = true, optional = true }
 serde.workspace = true

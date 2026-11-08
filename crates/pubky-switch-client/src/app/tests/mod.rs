@@ -1,64 +1,56 @@
-//! The app layer's flow tests, against a scripted switch ([`fake::FakeSwitch`]) answering
-//! through the `MockTransport`, a fake Homeserver, and a neutral sample protocol. Keys come
-//! from the vectors' fixed seeds, whose prefix is read from `spec/vectors/README.md`.
+//! The app layer's flow tests, against the scripted switch of [`crate::testing`], its
+//! Homeserver, and a neutral sample protocol. Keys come from the test seeds.
 
-mod fake;
 mod flows;
 mod moves;
-mod peer;
 mod push;
 mod shared_flows;
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use ed25519_dalek::SigningKey;
 use pubky_switch_core::keys::{AppKeys, IdentityKey};
 use pubky_switch_core::message::Message;
 use pubky_switch_core::ops::{AllowKind, OpKind};
 use pubky_switch_core::records::{
-    AppCert, AppCertBody, AppRequest, AppRequestBody, Approval, AuthRequest,
-    DEFAULT_CERT_LIFETIME_MS, IDENTITY_PATH, IdentityBody, IdentityDoc, IdentityPolicy, Inbox,
-    ListedApp, app_record_path,
+    AppCert, IdentityBody, IdentityDoc, IdentityPolicy, Inbox, ListedApp,
 };
 use serde_json::{Value, json};
 
-use self::fake::{FakeSwitch, ORIGIN};
 use super::{
-    App, AppConfig, AppEnv, Effect, HomeserverReader, JoinRequest, LocalWrite, MissedEntries,
-    Outcome, Protocol, ReceivedMessage, ResendNeeded,
+    App, AppConfig, AppEnv, Effect, JoinRequest, LocalWrite, MissedEntries, Outcome, Protocol,
+    ReceivedMessage, ResendNeeded,
 };
 use crate::clock::{Clock, TestClock};
-use crate::error::TransportError;
-use crate::store::{MemoryStore, StateStore, StoreHandle};
-use crate::transport::BoxFuture;
+use crate::store::{MemoryStore, StateStore};
+use crate::testing::{
+    AppSpec, PEER_ORIGIN, ProtocolSpec, ScriptedSwitch, Seeds, TestHomeserver, TestIdentity,
+    TestSigner, issue_cert,
+};
 
 /// 2026-01-01T00:00:00Z.
-pub(crate) const START: u64 = 1_767_225_600_000;
+pub(crate) const START: u64 = crate::testing::START_MS;
 
-/// The seed prefix of the vectors' README ("Seeds"), read from the README, the
-/// convention's one source.
-fn seed_prefix() -> String {
-    let path = format!(
-        "{}/../../spec/vectors/README.md",
-        env!("CARGO_MANIFEST_DIR")
-    );
-    let readme = std::fs::read_to_string(&path).unwrap();
-    let start = readme.find("BLAKE3(\"").unwrap() + 8;
-    let len = readme[start..].find('"').unwrap();
-    readme[start..start + len].to_owned()
-}
-
-/// A fixed secret of the vectors: `BLAKE3(prefix + label)`.
+/// A fixed secret of the test seeds.
 pub(crate) fn seed(label: &str) -> [u8; 32] {
-    *blake3::hash(format!("{}{label}", seed_prefix()).as_bytes()).as_bytes()
+    Seeds::default().seed(label)
 }
 
+/// A test identity of the default seeds.
+pub(crate) fn identity(name: &str) -> TestIdentity {
+    TestIdentity::new(&Seeds::default(), name)
+}
+
+/// The keys of alice's app `name`.
 pub(crate) fn app_keys(name: &str) -> AppKeys {
-    AppKeys::from_secrets(
-        seed(&format!("alice/{name}/signing")),
-        seed(&format!("alice/{name}/bundle")),
-    )
+    identity("alice").app_keys(name)
+}
+
+/// What the signer needs of the sample protocol: `scope-a` has keys.
+pub(crate) fn sample_spec() -> ProtocolSpec {
+    ProtocolSpec {
+        keyed_scopes: vec!["scope-a".into()],
+        ..ProtocolSpec::default()
+    }
 }
 
 /// A neutral protocol: scope `scope-a` has keys and sends and receives `sample.note`;
@@ -147,40 +139,6 @@ impl Protocol for SampleProtocol {
     }
 }
 
-/// Public files by identity and path.
-type Files = HashMap<([u8; 32], String), Vec<u8>>;
-
-/// A Homeserver of public files, failing on demand.
-#[derive(Default)]
-pub(crate) struct FakeHomeserver {
-    pub(crate) files: Mutex<Files>,
-    pub(crate) down: Mutex<bool>,
-}
-
-impl FakeHomeserver {
-    pub(crate) fn publish(&self, doc: &IdentityDoc) {
-        self.files.lock().unwrap().insert(
-            (doc.identity(), IDENTITY_PATH.to_owned()),
-            serde_json::to_vec(doc.signed()).unwrap(),
-        );
-    }
-}
-
-impl HomeserverReader for FakeHomeserver {
-    fn get(
-        &self,
-        identity: [u8; 32],
-        path: String,
-    ) -> BoxFuture<'_, Result<Option<Vec<u8>>, TransportError>> {
-        let answer = if *self.down.lock().unwrap() {
-            Err(TransportError::Connect("down".into()))
-        } else {
-            Ok(self.files.lock().unwrap().get(&(identity, path)).cloned())
-        };
-        Box::pin(async move { answer })
-    }
-}
-
 /// Alice's account, bob as her counterparty, and the signer's documents.
 pub(crate) struct World {
     pub(crate) clock: Arc<TestClock>,
@@ -188,12 +146,12 @@ pub(crate) struct World {
     pub(crate) bob: IdentityKey,
     pub(crate) bob_keys: AppKeys,
     pub(crate) bob_cert: AppCert,
-    pub(crate) switch: Arc<FakeSwitch>,
-    pub(crate) homeserver: Arc<FakeHomeserver>,
+    /// Alice's signer, with her account's switch.
+    pub(crate) signer: TestSigner,
+    pub(crate) switch: Arc<ScriptedSwitch>,
+    pub(crate) homeserver: Arc<TestHomeserver>,
     pub(crate) store: Arc<MemoryStore>,
     pub(crate) protocol: Arc<SampleProtocol>,
-    /// Alice's newest document body.
-    pub(crate) body: Mutex<IdentityBody>,
 }
 
 pub(crate) fn cert_for(
@@ -202,73 +160,52 @@ pub(crate) fn cert_for(
     issued: u64,
     scopes: &[&str],
 ) -> AppCert {
-    AppCert::issue(
-        identity,
-        AppCertBody::new(
-            identity.public(),
-            keys.signing_public(),
-            keys.bundle_public(),
-            scopes.iter().map(|s| (*s).to_owned()).collect(),
-            &[],
-            issued,
-            issued + DEFAULT_CERT_LIFETIME_MS,
-        ),
-    )
-    .unwrap()
+    issue_cert(identity, keys, &AppSpec::new(scopes), issued).unwrap()
 }
 
 impl World {
     pub(crate) fn new() -> Self {
         let clock = Arc::new(TestClock::new(START));
-        let alice = IdentityKey::from_secret(seed("alice/identity"));
-        let bob = IdentityKey::from_secret(seed("bob/identity"));
-        let bob_keys = AppKeys::from_secrets(seed("bob/shop/signing"), seed("bob/shop/bundle"));
-        let bob_cert = cert_for(&bob, &bob_keys, START - 1000, &["scope-a"]);
-        let service = SigningKey::from_bytes(&seed("service/alice"));
-        let switch = FakeSwitch::new(
-            IdentityKey::from_secret(seed("alice/identity")),
-            service.clone(),
-            Arc::clone(&clock),
-        );
-        let homeserver = Arc::new(FakeHomeserver::default());
+        let alice = identity("alice");
+        let bob = identity("bob");
+        let bob_keys = bob.app_keys("shop");
+        let bob_cert = cert_for(bob.key(), &bob_keys, START - 1000, &["scope-a"]);
+        let homeserver = Arc::new(TestHomeserver::new());
         let mut bob_body = IdentityBody::first(
             bob.public(),
-            [2; 16],
-            Inbox::new("https://other.example", [3; 32]),
+            bob.signer_id(),
+            Inbox::new(PEER_ORIGIN, [3; 32]),
             IdentityPolicy::default(),
         );
         bob_body.apps.push(ListedApp {
             app_id: bob_cert.app_id(),
             cert: bob_cert.hash(),
         });
-        homeserver.publish(&IdentityDoc::sign(&bob, bob_body).unwrap());
-        let body = IdentityBody::first(
-            alice.public(),
-            [1; 16],
-            Inbox::new(ORIGIN, service.verifying_key().to_bytes()),
-            IdentityPolicy::default(),
+        homeserver
+            .publish(&IdentityDoc::sign(bob.key(), bob_body).unwrap())
+            .unwrap();
+        let signer = TestSigner::new(
+            alice.clone(),
+            Arc::clone(&clock),
+            Arc::clone(&homeserver),
+            sample_spec(),
         );
         Self {
             clock,
-            alice,
-            bob,
+            alice: IdentityKey::from_secret(alice.key().secret_bytes()),
+            bob: IdentityKey::from_secret(bob.key().secret_bytes()),
             bob_keys,
             bob_cert,
-            switch,
+            switch: Arc::clone(signer.switch()),
+            signer,
             homeserver,
             store: Arc::new(MemoryStore::new()),
             protocol: Arc::new(SampleProtocol::default()),
-            body: Mutex::new(body),
         }
     }
 
     pub(crate) fn env_on(&self, store: Arc<dyn StateStore>) -> AppEnv {
-        AppEnv {
-            store: StoreHandle::inline(store),
-            transport: self.switch.transport(),
-            clock: Arc::clone(&self.clock) as Arc<dyn Clock>,
-            homeserver: Arc::clone(&self.homeserver) as Arc<dyn HomeserverReader>,
-        }
+        self.signer.env(store)
     }
 
     pub(crate) fn env(&self) -> AppEnv {
@@ -282,51 +219,13 @@ impl World {
     /// The next version of alice's document, changed by `change`, delivered to the switch
     /// and published.
     pub(crate) fn next_doc(&self, change: impl FnOnce(&mut IdentityBody)) -> IdentityDoc {
-        let mut body = self.body.lock().unwrap();
-        if self.switch.lock().doc.is_some() {
-            body.version += 1;
-        }
-        change(&mut body);
-        let doc = IdentityDoc::sign(&self.alice, body.clone()).unwrap();
-        self.switch.deliver_identity(&doc);
-        self.homeserver.publish(&doc);
-        doc
+        self.signer.next_doc(change).unwrap()
     }
 
     /// The signer approves `keys` for `scopes`: a certificate, the document that lists it,
     /// and the approval.
     pub(crate) fn approve(&self, keys: &AppKeys, scopes: &[&str]) -> JoinRequest {
-        let cert = cert_for(&self.alice, keys, self.clock.now_ms(), scopes);
-        let auth = AuthRequest {
-            client_id: "sample.example".into(),
-            client_key: [7; 32],
-            caps: format!("{}:rw", app_record_path(&keys.app_id_bytes())),
-            secret: [8; 32],
-        };
-        let request = AppRequest::sign(
-            keys,
-            AppRequestBody::new(
-                keys,
-                scopes.iter().map(|s| (*s).to_owned()).collect(),
-                &auth,
-            ),
-        )
-        .unwrap();
-        let doc = self.next_doc(|body| {
-            body.apps.push(ListedApp {
-                app_id: cert.app_id(),
-                cert: cert.hash(),
-            })
-        });
-        let protocol = SampleProtocol::default();
-        let approval =
-            Approval::issue(&self.alice, &request, cert, doc, &|s| protocol.has_keys(s)).unwrap();
-        JoinRequest {
-            identity: self.alice.public(),
-            keys: keys.clone(),
-            request,
-            approval: approval.to_json().unwrap(),
-        }
+        self.signer.approve(keys, &AppSpec::new(scopes)).unwrap()
     }
 
     pub(crate) async fn join(&self, name: &str) -> App {
@@ -344,14 +243,16 @@ impl World {
 
     /// A note from bob's app to `to`.
     pub(crate) fn note(&self, to: [u8; 16], text: &str) -> (u64, Message) {
-        self.switch.send(
-            &self.bob,
-            &self.bob_keys,
-            &self.bob_cert,
-            "sample.note",
-            json!({ "text": text }),
-            &[to],
-        )
+        self.switch
+            .send(
+                &self.bob,
+                &self.bob_keys,
+                &self.bob_cert,
+                "sample.note",
+                json!({ "text": text }),
+                &[to],
+            )
+            .unwrap()
     }
 
     /// How many conversation entries the switch applied: effects done.

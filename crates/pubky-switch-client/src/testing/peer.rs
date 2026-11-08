@@ -1,5 +1,5 @@
-//! A counterparty's switch for the sending flows: bob's account at another origin, with his
-//! apps' records and receive keys, his inbox and the peer copies of other identities'
+//! Another identity's switch, as a sender sees it: the account at another origin, with its
+//! apps' records and receive keys, its inbox and the peer copies of other identities'
 //! `identity.json` (Switch wire 7.4.3, 7.4.5, 7.4.7, 7.4.10). It checks what a sender relies
 //! on: admission, the sender's listing in the copy it holds, the targets' current keys and
 //! the `apps_version`, and retries by content.
@@ -11,7 +11,7 @@ use ed25519_dalek::SigningKey;
 use pubky_switch_core::enc::{app_id_decode, b64, pubky_key, zbase32_encode};
 use pubky_switch_core::envelope::parse_header;
 use pubky_switch_core::http::{ErrorCode, header, request_signature_of, sign_response};
-use pubky_switch_core::keys::{AppKeys, IdentityKey, ReceiveKey};
+use pubky_switch_core::keys::{AppKeys, ReceiveKey};
 use pubky_switch_core::message::{Message, MessagePlaintext};
 use pubky_switch_core::records::{
     AppCert, AppRecord, AppRecordBody, IdentityBody, IdentityDoc, IdentityPolicy, Inbox, ListedApp,
@@ -21,22 +21,27 @@ use pubky_switch_core::sig::SignedDoc;
 use pubky_switch_core::time::rfc3339;
 use serde_json::{Value, json};
 
-use super::{FakeHomeserver, cert_for, seed};
+use super::{AppSpec, ScriptError, ScriptedSwitch, TestHomeserver, TestIdentity, issue_cert};
 use crate::clock::{Clock, TestClock};
 use crate::error::TransportError;
 use crate::transport::{BoxFuture, Header, Request, Response, Transport};
 
-pub(crate) const PEER_ORIGIN: &str = "https://other.example";
+/// The origin a [`PeerSwitch`] is reached at, unless a test routes another one to it.
+pub const PEER_ORIGIN: &str = "https://other.example";
 
-/// One of bob's apps.
-pub(crate) struct PeerApp {
-    pub(crate) keys: AppKeys,
-    pub(crate) cert: AppCert,
-    pub(crate) record: SignedDoc,
-    /// Every receive key, the current one last.
-    pub(crate) receive_keys: Vec<(ReceiveKey, SignedDoc)>,
+/// One app of the peer identity.
+#[derive(Clone, Debug)]
+pub struct PeerApp {
+    /// Its static keys.
+    pub keys: AppKeys,
+    /// Its certificate.
+    pub cert: AppCert,
+    /// Its app record (signed).
+    pub record: SignedDoc,
+    /// Every receive key with its signed record, the current one last.
+    pub receive_keys: Vec<(ReceiveKey, SignedDoc)>,
     /// The `apps_version` at which it became reachable.
-    pub(crate) since: u64,
+    pub since: u64,
 }
 
 /// One accepted entry.
@@ -46,10 +51,10 @@ pub(crate) struct Appended {
 }
 
 pub(crate) struct PeerInner {
-    pub(crate) identity: IdentityKey,
+    pub(crate) identity: TestIdentity,
     pub(crate) service: SigningKey,
     pub(crate) clock: Arc<TestClock>,
-    pub(crate) homeserver: Arc<FakeHomeserver>,
+    pub(crate) homeserver: Arc<TestHomeserver>,
     pub(crate) body: IdentityBody,
     pub(crate) apps: Vec<PeerApp>,
     pub(crate) apps_version: u64,
@@ -69,9 +74,24 @@ pub(crate) struct PeerInner {
     pub(crate) down: bool,
 }
 
-/// Bob's switch.
-pub(crate) struct PeerSwitch {
+/// The switch of another identity, the counterparty a sending app writes to.
+///
+/// It publishes the identity's `identity.json` on the [`TestHomeserver`] each time an app
+/// is added, and opens what its inbox accepts with the apps' receive keys.
+pub struct PeerSwitch {
     inner: Mutex<PeerInner>,
+}
+
+impl std::fmt::Debug for PeerSwitch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let inner = self.lock();
+        write!(
+            f,
+            "PeerSwitch({:?}, {} apps)",
+            inner.identity,
+            inner.apps.len()
+        )
+    }
 }
 
 fn bad(code: ErrorCode, current: Value) -> (u16, Value) {
@@ -82,26 +102,27 @@ fn bad(code: ErrorCode, current: Value) -> (u16, Value) {
 }
 
 impl PeerSwitch {
-    /// Bob's switch with one app, `shop`, which accepts `kinds`; bob's `identity.json`
-    /// naming it is published.
-    pub(crate) fn new(
-        bob: &IdentityKey,
+    /// The switch of `identity` at `origin`, with no apps yet; its service key is the
+    /// identity's. Its `identity.json` goes on after any version the Homeserver holds.
+    pub fn new(
+        identity: TestIdentity,
+        origin: &str,
         clock: Arc<TestClock>,
-        homeserver: Arc<FakeHomeserver>,
-        kinds: &[&str],
+        homeserver: Arc<TestHomeserver>,
     ) -> Arc<Self> {
-        let service = SigningKey::from_bytes(&seed("service/bob"));
+        let service = SigningKey::from_bytes(&identity.service_secret());
         let mut body = IdentityBody::first(
-            bob.public(),
-            [2; 16],
-            Inbox::new(PEER_ORIGIN, service.verifying_key().to_bytes()),
+            identity.public(),
+            identity.signer_id(),
+            Inbox::new(origin, service.verifying_key().to_bytes()),
             IdentityPolicy::default(),
         );
-        // The world published version 1 already.
-        body.version = 2;
-        let switch = Arc::new(Self {
+        if let Some(held) = homeserver.identity_doc(&identity.public()) {
+            body.version = held.version().saturating_add(1);
+        }
+        Arc::new(Self {
             inner: Mutex::new(PeerInner {
-                identity: IdentityKey::from_secret(bob.secret_bytes()),
+                identity,
                 service,
                 clock,
                 homeserver,
@@ -119,9 +140,7 @@ impl PeerSwitch {
                 requests: Vec::new(),
                 down: false,
             }),
-        });
-        switch.add_app("shop", kinds, false);
-        switch
+        })
     }
 
     pub(crate) fn lock(&self) -> MutexGuard<'_, PeerInner> {
@@ -130,24 +149,40 @@ impl PeerSwitch {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Add one of bob's apps, listed in a new `identity.json`; `bump` raises the
-    /// `apps_version`.
-    pub(crate) fn add_app(&self, name: &str, kinds: &[&str], bump: bool) -> [u8; 16] {
+    /// The identity's public key.
+    pub fn identity(&self) -> [u8; 32] {
+        self.lock().identity.public()
+    }
+
+    /// Add the identity's app `name`, its keys from the identity's seeds, certified for
+    /// what `app` names and accepting `accepts`, with receive key 0; the next
+    /// `identity.json` lists it and is published. `bump` raises the `apps_version`. Returns
+    /// its App ID.
+    ///
+    /// # Errors
+    ///
+    /// When a record or the document doesn't sign.
+    pub fn add_app(
+        &self,
+        name: &str,
+        app: &AppSpec,
+        accepts: &[&str],
+        bump: bool,
+    ) -> Result<[u8; 16], ScriptError> {
         let mut inner = self.lock();
-        let keys = AppKeys::from_secrets(
-            seed(&format!("bob/{name}/signing")),
-            seed(&format!("bob/{name}/bundle")),
-        );
+        let keys = inner.identity.app_keys(name);
         let now = inner.clock.now_ms();
-        let cert = cert_for(&inner.identity, &keys, now - 1000, &["scope-a"]);
+        let cert = issue_cert(inner.identity.key(), &keys, app, now.saturating_sub(1000))?;
         let record = AppRecord::sign(
             &keys,
-            AppRecordBody::new(&cert, kinds.iter().map(|k| (*k).to_owned()).collect(), now),
-        )
-        .unwrap();
-        let key = ReceiveKey::from_secret(0, seed(&format!("bob/{name}/receive/0")));
-        let key_record =
-            ReceiveKeyRecord::sign(&keys, &cert, ReceiveKeyBody::new(&cert, &key)).unwrap();
+            AppRecordBody::new(
+                &cert,
+                accepts.iter().map(|k| (*k).to_owned()).collect(),
+                now,
+            ),
+        )?;
+        let key = inner.identity.receive_key(name, 0);
+        let key_record = ReceiveKeyRecord::sign(&keys, &cert, ReceiveKeyBody::new(&cert, &key))?;
         if bump {
             inner.apps_version += 1;
         }
@@ -166,33 +201,74 @@ impl PeerSwitch {
             receive_keys: vec![(key, key_record.signed().clone())],
             since,
         });
-        inner.publish();
-        app_id
+        inner.publish()?;
+        Ok(app_id)
     }
 
-    /// Rotate the receive key of bob's app `index`.
-    pub(crate) fn rotate(&self, index: usize) {
+    /// Rotate the receive key of the app at `index`, in the order added: a new current key,
+    /// from the seed `<name>/<index>/receive/<n>`.
+    ///
+    /// # Errors
+    ///
+    /// When there is no such app, or the record doesn't sign.
+    pub fn rotate(&self, index: usize) -> Result<(), ScriptError> {
         let mut inner = self.lock();
-        let app = &mut inner.apps[index];
+        let identity = inner.identity.clone();
+        let app = inner
+            .apps
+            .get_mut(index)
+            .ok_or_else(|| ScriptError::Missing(format!("no peer app at {index}")))?;
         let n = app.receive_keys.len() as u64;
-        let key = ReceiveKey::from_secret(n, seed(&format!("bob/{index}/receive/{n}")));
+        let key = ReceiveKey::from_secret(n, identity.seed(&format!("{index}/receive/{n}")));
         let record =
-            ReceiveKeyRecord::sign(&app.keys, &app.cert, ReceiveKeyBody::new(&app.cert, &key))
-                .unwrap();
+            ReceiveKeyRecord::sign(&app.keys, &app.cert, ReceiveKeyBody::new(&app.cert, &key))?;
         app.receive_keys.push((key, record.signed().clone()));
         inner.directory_version += 1;
+        Ok(())
     }
 
-    pub(crate) fn fail_next(&self, route: &str, code: ErrorCode, current: Value) {
+    /// The identity's apps, in the order added.
+    pub fn apps(&self) -> Vec<PeerApp> {
+        self.lock().apps.clone()
+    }
+
+    /// Answer the next request to `route` (such as `inbox` or `directory`) with the error
+    /// `code` and `current`, applying nothing.
+    pub fn fail_next(&self, route: &str, code: ErrorCode, current: Value) {
         self.lock()
             .faults
             .push_back((route.to_owned(), code, current));
     }
 
-    /// The `msg_id` of every accepted entry, opened with bob's keys.
-    pub(crate) fn received(&self) -> Vec<String> {
+    /// Admit only `senders`, and senders with an invite code; `None` admits every sender.
+    pub fn admit_only(&self, senders: Option<&[[u8; 32]]>) {
+        self.lock().admitted = senders.map(|s| s.iter().copied().collect());
+    }
+
+    /// An invite code that admits a sender `uses` times.
+    pub fn add_invite_code(&self, code: &str, uses: u64) {
+        self.lock().codes.insert(code.to_owned(), uses);
+    }
+
+    /// The senders with a connect request.
+    pub fn connects(&self) -> Vec<[u8; 32]> {
+        self.lock().connects.clone()
+    }
+
+    /// The peer copy of `identity`'s `identity.json` the switch holds.
+    pub fn peer_copy(&self, identity: &[u8; 32]) -> Option<IdentityDoc> {
+        self.lock().peers.get(identity).cloned()
+    }
+
+    /// Make the switch unreachable, or reachable again.
+    pub fn set_down(&self, down: bool) {
+        self.lock().down = down;
+    }
+
+    /// The `msg_id` of every accepted entry, opened with the apps' receive keys.
+    pub fn received(&self) -> Vec<String> {
         let inner = self.lock();
-        let bob = inner.identity.public();
+        let identity = inner.identity.public();
         inner
             .inbox
             .iter()
@@ -200,7 +276,8 @@ impl PeerSwitch {
                 inner.apps.iter().find_map(|app| {
                     app.receive_keys.iter().find_map(|(key, _)| {
                         let plaintext =
-                            MessagePlaintext::open(&entry.envelope, &bob, &key.secret()).ok()?;
+                            MessagePlaintext::open(&entry.envelope, &identity, &key.secret())
+                                .ok()?;
                         Some(Message::parse(plaintext.json(), &[]).ok()?.msg_id)
                     })
                 })
@@ -208,8 +285,17 @@ impl PeerSwitch {
             .collect()
     }
 
-    /// The routes asked, in order.
-    pub(crate) fn routes(&self) -> Vec<String> {
+    /// The envelopes the inbox accepted, in order.
+    pub fn envelopes(&self) -> Vec<Vec<u8>> {
+        self.lock()
+            .inbox
+            .iter()
+            .map(|entry| entry.envelope.clone())
+            .collect()
+    }
+
+    /// The routes asked, in order, as `"METHOD route"`.
+    pub fn routes(&self) -> Vec<String> {
         self.lock()
             .requests
             .iter()
@@ -217,7 +303,36 @@ impl PeerSwitch {
             .collect()
     }
 
-    pub(crate) fn transport(self: &Arc<Self>) -> Arc<dyn Transport> {
+    /// A message of `kind` with `body` from the app `from` of this identity, entered at
+    /// `switch` for its apps `to`, as if its inbox had accepted it. Returns the entry's
+    /// `seq` and the message.
+    ///
+    /// # Errors
+    ///
+    /// When this identity has no app `from`, or as [`ScriptedSwitch::send`].
+    pub fn send_to(
+        &self,
+        switch: &ScriptedSwitch,
+        from: [u8; 16],
+        kind: &str,
+        body: Value,
+        to: &[[u8; 16]],
+    ) -> Result<(u64, Message), ScriptError> {
+        let (identity, app) = {
+            let inner = self.lock();
+            let app = inner
+                .apps
+                .iter()
+                .find(|app| app.cert.app_id() == from)
+                .cloned()
+                .ok_or_else(|| ScriptError::Missing("no such peer app".into()))?;
+            (inner.identity.clone(), app)
+        };
+        switch.send(identity.key(), &app.keys, &app.cert, kind, body, to)
+    }
+
+    /// A transport to this switch.
+    pub fn transport(self: &Arc<Self>) -> Arc<dyn Transport> {
         Arc::clone(self) as Arc<dyn Transport>
     }
 
@@ -234,8 +349,9 @@ impl PeerSwitch {
             .to_owned();
         let route = rest.split('?').next().unwrap_or_default().to_owned();
         inner.requests.push((request.method.clone(), route.clone()));
-        if let Some(index) = inner.faults.iter().position(|(r, _, _)| *r == route) {
-            let (_, code, current) = inner.faults.remove(index).unwrap();
+        if let Some(index) = inner.faults.iter().position(|(r, _, _)| *r == route)
+            && let Some((_, code, current)) = inner.faults.remove(index)
+        {
             let (status, body) = bad(code, current);
             return Ok(inner.respond(request, status, &body));
         }
@@ -248,13 +364,15 @@ impl PeerSwitch {
             .and_then(|text| app_id_decode(text).ok())
             .unwrap_or_default();
         let code = request.header(header::INVITE_CODE).map(str::to_owned);
-        let (status, body) = match (request.method.as_str(), route.as_str()) {
+        let answer = match (request.method.as_str(), route.as_str()) {
             ("GET", "directory") => inner.directory(sender, code.as_deref()),
-            ("POST", "inbox") => inner.append(request, sender, app, code.as_deref()),
-            ("PUT", "peers") => inner.peers(sender, &request.body),
-            ("POST", "connect") => inner.connect(sender, app),
-            _ => bad(ErrorCode::NotFound, json!(null)),
+            ("POST", "inbox") => Ok(inner.append(request, sender, app, code.as_deref())),
+            ("PUT", "peers") => Ok(inner.peers(sender, &request.body)),
+            ("POST", "connect") => Ok(inner.connect(sender, app)),
+            _ => Ok(bad(ErrorCode::NotFound, json!(null))),
         };
+        let (status, body) =
+            answer.map_err(|error| TransportError::Other(format!("peer switch: {error}")))?;
         Ok(inner.respond(request, status, &body))
     }
 }
@@ -267,13 +385,13 @@ impl Transport for PeerSwitch {
 }
 
 impl PeerInner {
-    fn publish(&mut self) {
-        let doc = IdentityDoc::sign(&self.identity, self.body.clone()).unwrap();
-        self.homeserver.publish(&doc);
+    fn doc(&self) -> Result<IdentityDoc, ScriptError> {
+        Ok(IdentityDoc::sign(self.identity.key(), self.body.clone())?)
     }
 
-    fn doc(&self) -> IdentityDoc {
-        IdentityDoc::sign(&self.identity, self.body.clone()).unwrap()
+    fn publish(&mut self) -> Result<(), ScriptError> {
+        let doc = self.doc()?;
+        self.homeserver.publish(&doc)
     }
 
     fn respond(&self, request: &Request, status: u16, body: &Value) -> Response {
@@ -330,9 +448,13 @@ impl PeerInner {
             .is_some_and(|doc| doc.listed_cert(app).is_some())
     }
 
-    fn directory(&mut self, sender: [u8; 32], code: Option<&str>) -> (u16, Value) {
+    fn directory(
+        &mut self,
+        sender: [u8; 32],
+        code: Option<&str>,
+    ) -> Result<(u16, Value), ScriptError> {
         if !self.admits(&sender, code, false) {
-            return bad(ErrorCode::NotAdmitted, json!({}));
+            return Ok(bad(ErrorCode::NotAdmitted, json!({})));
         }
         let apps: Vec<Value> = self
             .apps
@@ -342,12 +464,12 @@ impl PeerInner {
                         "receive_key": app.receive_keys.last().map(|(_, r)| r.clone()) })
             })
             .collect();
-        (
+        Ok((
             200,
-            json!({ "identity": self.doc().signed(), "apps": apps,
+            json!({ "identity": self.doc()?.signed(), "apps": apps,
                     "directory_version": self.directory_version,
                     "apps_version": self.apps_version, "known_version": self.known(&sender) }),
-        )
+        ))
     }
 
     fn append(
@@ -380,14 +502,14 @@ impl PeerInner {
         let mut stale = Vec::new();
         let mut unknown = Vec::new();
         for kid in &kids {
-            match self
+            let holder = self
                 .apps
                 .iter()
-                .find(|a| a.receive_keys.iter().any(|(k, _)| k.kid == *kid))
-            {
-                Some(app) if app.receive_keys.last().unwrap().0.kid != *kid => {
+                .find(|a| a.receive_keys.iter().any(|(k, _)| k.kid == *kid));
+            match holder.and_then(|app| Some((app, app.receive_keys.last()?))) {
+                Some((app, (current, record))) if current.kid != *kid => {
                     stale.push(json!({ "app_id": zbase32_encode(&app.cert.app_id()),
-                                       "record": app.receive_keys.last().unwrap().1 }));
+                                       "record": record }));
                 }
                 Some(_) => {}
                 None => unknown.push(b64(kid)),
@@ -400,9 +522,10 @@ impl PeerInner {
                 app.since > sealed_for
                     && !app.receive_keys.iter().any(|(k, _)| kids.contains(&k.kid))
             })
-            .map(|app| {
-                json!({ "app_id": zbase32_encode(&app.cert.app_id()), "app_record": app.record,
-                        "record": app.receive_keys.last().unwrap().1 })
+            .filter_map(|app| {
+                let (_, record) = app.receive_keys.last()?;
+                Some(json!({ "app_id": zbase32_encode(&app.cert.app_id()),
+                             "app_record": app.record, "record": record }))
             })
             .collect();
         if !stale.is_empty() || !unknown.is_empty() || !added.is_empty() {
@@ -417,7 +540,8 @@ impl PeerInner {
         self.inbox.push(Appended {
             envelope: request.body.clone(),
         });
-        let answer = json!({ "entry_id": b64(&[self.inbox.len() as u8; 16]),
+        let entry_id = [self.inbox.len().to_le_bytes()[0]; 16];
+        let answer = json!({ "entry_id": b64(&entry_id),
                              "accepted_at": rfc3339(accepted_at),
                              "directory_version": self.directory_version,
                              "known_version": self.known(&sender) });
@@ -462,32 +586,5 @@ impl PeerInner {
             200,
             json!({ "pending": true, "known_version": self.known(&sender) }),
         )
-    }
-}
-
-/// A transport that sends each request to the switch of its origin.
-pub(crate) struct Router {
-    pub(crate) routes: Vec<(String, Arc<dyn Transport>)>,
-    /// Every request, as "METHOD origin path", in order.
-    pub(crate) log: Mutex<Vec<String>>,
-}
-
-impl Transport for Router {
-    fn send(&self, request: Request) -> BoxFuture<'_, Result<Response, TransportError>> {
-        self.log
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(format!(
-                "{} {} {}",
-                request.method, request.origin, request.path_and_query
-            ));
-        match self
-            .routes
-            .iter()
-            .find(|(origin, _)| *origin == request.origin)
-        {
-            Some((_, transport)) => transport.send(request),
-            None => Box::pin(async { Err(TransportError::Refused("no such origin".into())) }),
-        }
     }
 }

@@ -18,18 +18,24 @@ use pubky_switch_core::sig::SignedDoc;
 use pubky_switch_core::time::rfc3339;
 use serde_json::{Value, json};
 
-use super::{FakeSwitch, Inner, bad};
+use super::{Answer, Inner, ScriptedSwitch, bad};
 use crate::clock::Clock;
+use crate::testing::ScriptError;
 use crate::transport::Request;
 
-/// A record as the switch holds it, with what its reads return.
+/// A shared record as the switch holds it, with what its reads return (Switch wire 7.4.6).
 #[derive(Clone, Debug)]
-pub(crate) struct HeldWrite {
-    pub(crate) state: RecordState,
-    pub(crate) op: SignedDoc,
-    pub(crate) proof: SignedDoc,
-    pub(crate) writer: [u8; 16],
-    pub(crate) seq: u64,
+pub struct HeldRecord {
+    /// The record's state after its newest write.
+    pub state: RecordState,
+    /// The newest write's signed `record.put`.
+    pub op: SignedDoc,
+    /// The write's transition proof.
+    pub proof: SignedDoc,
+    /// The App ID that wrote it.
+    pub writer: [u8; 16],
+    /// The write's `seq`.
+    pub seq: u64,
 }
 
 /// One claim entry as `GET /claims` returns it.
@@ -43,7 +49,7 @@ pub(crate) struct HeldEntry {
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Shared {
-    pub(crate) records: BTreeMap<[u8; 32], HeldWrite>,
+    pub(crate) records: BTreeMap<[u8; 32], HeldRecord>,
     pub(crate) claims: BTreeMap<[u8; 32], Claim>,
     entries: BTreeMap<[u8; 32], Vec<HeldEntry>>,
     pub(crate) connect: Vec<([u8; 32], u64)>,
@@ -57,6 +63,7 @@ pub(crate) struct Shared {
     pub(crate) listings: u64,
 }
 
+#[cfg(test)]
 impl Shared {
     /// Hold an invite code as if `writer` had registered it, for a faulty service's export.
     pub(crate) fn plant_invite(&mut self, code_hash: [u8; 32], max_uses: u64, writer: [u8; 16]) {
@@ -119,26 +126,26 @@ fn shared_batch(ops: &[SignedOp]) -> bool {
     })
 }
 
-impl FakeSwitch {
-    /// A pending connect request from `pubky`.
-    pub(crate) fn push_connect(&self, pubky: [u8; 32]) {
+impl ScriptedSwitch {
+    /// A pending connect request from `pubky` (Switch wire 7.4.10).
+    pub fn push_connect(&self, pubky: [u8; 32]) {
         let mut inner = self.lock();
         let now = inner.clock.now_ms();
         inner.shared.connect.push((pubky, now));
     }
 
-    /// The pending connect requests.
-    pub(crate) fn connects(&self) -> Vec<[u8; 32]> {
+    /// The identities with a pending connect request.
+    pub fn connects(&self) -> Vec<[u8; 32]> {
         self.lock().shared.connect.iter().map(|(p, _)| *p).collect()
     }
 
-    /// A record write another own app makes, applied as the switch would.
-    pub(crate) fn record_view(&self, key: &[u8; 32]) -> Option<HeldWrite> {
+    /// The shared record the switch holds at `key`, deleted or not.
+    pub fn record(&self, key: &[u8; 32]) -> Option<HeldRecord> {
         self.lock().shared.records.get(key).cloned()
     }
 
     /// The claim the switch holds for `claim_key`.
-    pub(crate) fn claim(&self, claim_key: &[u8; 32]) -> Option<Claim> {
+    pub fn claim(&self, claim_key: &[u8; 32]) -> Option<Claim> {
         self.lock().shared.claims.get(claim_key).cloned()
     }
 }
@@ -150,19 +157,21 @@ impl Inner {
         request: &Request,
         caller: Option<[u8; 16]>,
         rest: &str,
-    ) -> Option<(u16, Value)> {
+    ) -> Result<Option<Answer>, ScriptError> {
         let (route, query) = rest.split_once('?').unwrap_or((rest, ""));
-        match (request.method.as_str(), route) {
+        Ok(match (request.method.as_str(), route) {
             ("POST", "ops") => {
-                let parsed = OpsRequest::parse(&request.body).ok()?;
+                let Ok(parsed) = OpsRequest::parse(&request.body) else {
+                    return Ok(None);
+                };
                 let ops: Vec<SignedOp> = parsed
                     .signed()
                     .filter_map(|signed| SignedOp::peek(signed).ok())
                     .collect();
                 if !shared_batch(&ops) {
-                    return None;
+                    return Ok(None);
                 }
-                Some(self.shared_ops(caller, &parsed, &ops))
+                Some(self.shared_ops(caller, &parsed, &ops)?)
             }
             // A scripted answer, for a faulty service, takes precedence.
             ("GET", "allow") if self.allow.is_none() => Some(self.allow_list()),
@@ -180,11 +189,13 @@ impl Inner {
             }
             ("DELETE", r) if r.starts_with("connect/") => {
                 let id = r.trim_start_matches("connect/");
-                let pubky = pubky_switch_core::enc::pubky_key(id).ok()?;
+                let Ok(pubky) = pubky_switch_core::enc::pubky_key(id) else {
+                    return Ok(None);
+                };
                 let before = self.shared.connect.len();
                 self.shared.connect.retain(|(p, _)| *p != pubky);
                 if self.shared.connect.len() == before {
-                    return Some(bad(ErrorCode::NotFound, "no request", json!(null)));
+                    return Ok(Some(bad(ErrorCode::NotFound, "no request", json!(null))));
                 }
                 Some((200, json!({ "declined": id })))
             }
@@ -195,7 +206,9 @@ impl Inner {
                         collection = unb64_array::<32>(value).ok();
                     }
                 }
-                let collection = collection?;
+                let Some(collection) = collection else {
+                    return Ok(None);
+                };
                 let views: Vec<Value> = self
                     .shared
                     .records
@@ -220,21 +233,25 @@ impl Inner {
                 ))
             }
             ("GET", r) if r.starts_with("records/") => {
-                let key = unb64_array::<32>(r.trim_start_matches("records/")).ok()?;
+                let Ok(key) = unb64_array::<32>(r.trim_start_matches("records/")) else {
+                    return Ok(None);
+                };
                 Some(match self.shared.records.get(&key) {
                     Some(held) => (200, self.view(held)),
                     None => bad(ErrorCode::NotFound, "no record", json!(null)),
                 })
             }
             ("GET", r) if r.starts_with("claims/") => {
-                let claim_key = unb64_array::<32>(r.trim_start_matches("claims/")).ok()?;
+                let Ok(claim_key) = unb64_array::<32>(r.trim_start_matches("claims/")) else {
+                    return Ok(None);
+                };
                 Some(self.claim_answer(&claim_key))
             }
             _ => None,
-        }
+        })
     }
 
-    fn view(&self, held: &HeldWrite) -> Value {
+    fn view(&self, held: &HeldRecord) -> Value {
         let cert = self
             .apps
             .get(&held.writer)
@@ -260,7 +277,7 @@ impl Inner {
         view
     }
 
-    fn claim_answer(&mut self, claim_key: &[u8; 32]) -> (u16, Value) {
+    fn claim_answer(&mut self, claim_key: &[u8; 32]) -> Answer {
         let now = self.now();
         if self
             .shared
@@ -291,7 +308,7 @@ impl Inner {
         (200, json!({ "claim": view, "entries": entries }))
     }
 
-    fn allow_list(&self) -> (u16, Value) {
+    fn allow_list(&self) -> Answer {
         let mut contacts: BTreeMap<[u8; 32], ()> = BTreeMap::new();
         let mut conversations: BTreeMap<[u8; 32], [u8; 16]> = BTreeMap::new();
         let mut deny: BTreeMap<[u8; 32], ()> = BTreeMap::new();
@@ -353,28 +370,28 @@ impl Inner {
         caller: Option<[u8; 16]>,
         request: &OpsRequest,
         ops: &[SignedOp],
-    ) -> (u16, Value) {
+    ) -> Result<Answer, ScriptError> {
         if let Some(id) = ops.first().map(|op| op.body().batch.id)
             && let Some(answer) = self.answered.get(&id)
         {
             let mut answer = answer.clone();
             answer["head"] = self.head().to_value();
-            return (200, answer);
+            return Ok((200, answer));
         }
         // Switch wire 6.4 step 6: an operation naming another generation.
         let generation = self.tip.generation;
         if ops.iter().any(|op| op.body().generation != generation) {
-            return bad(
+            return Ok(bad(
                 ErrorCode::StaleGeneration,
                 "generation",
                 json!({ "generation": generation }),
-            );
+            ));
         }
         let Some(writer) = caller else {
-            return bad(ErrorCode::PermissionMissing, "apps only", json!({}));
+            return Ok(bad(ErrorCode::PermissionMissing, "apps only", json!({})));
         };
         if self.apps.get(&writer).is_some_and(|a| a.departed) {
-            return bad(ErrorCode::NotCurrent, "departed", json!({}));
+            return Ok(bad(ErrorCode::NotCurrent, "departed", json!({})));
         }
         let epoch = self.doc.as_ref().map_or(1, |d| d.data_epoch());
         let now = self.now();
@@ -384,15 +401,15 @@ impl Inner {
         };
         for op in ops {
             if let Err(refusal) = check_conditions(&op.body().conditions, &before) {
-                return bad(
+                return Ok(bad(
                     refusal.code,
                     "condition",
                     refusal.current.unwrap_or(json!({})),
-                );
+                ));
             }
         }
         let mut claims = self.shared.claims.clone();
-        let mut after: Vec<Option<Claim>> = Vec::new();
+        let mut after: Vec<Option<([u8; 32], Claim)>> = Vec::new();
         for op in ops {
             match &op.body().kind {
                 OpKind::RecordPut(put) => {
@@ -401,13 +418,17 @@ impl Inner {
                     if let Err(refusal) =
                         check_record_put(put, held.map(|h| &h.state), epoch, true, view.as_ref())
                     {
-                        return bad(refusal.code, "record", refusal.current.unwrap_or(json!({})));
+                        return Ok(bad(
+                            refusal.code,
+                            "record",
+                            refusal.current.unwrap_or(json!({})),
+                        ));
                     }
                     after.push(None);
                 }
                 OpKind::Claim(fields) => {
                     let Ok(entry) = fields.check() else {
-                        return bad(ErrorCode::BadRequest, "claim", json!(null));
+                        return Ok(bad(ErrorCode::BadRequest, "claim", json!(null)));
                     };
                     let apps = self.apps.clone();
                     let current = |app: &[u8; 16]| apps.get(app).is_some_and(|a| !a.departed);
@@ -422,24 +443,24 @@ impl Inner {
                     match apply_entry(claims.get(&entry.claim_key), &entry, &cx) {
                         Ok(claim) => {
                             claims.insert(entry.claim_key, claim.clone());
-                            after.push(Some(claim));
+                            after.push(Some((entry.claim_key, claim)));
                         }
                         Err(refusal) => {
-                            return bad(
+                            return Ok(bad(
                                 refusal.code,
                                 "claim",
                                 refusal.current.unwrap_or(json!({})),
-                            );
+                            ));
                         }
                     }
                 }
                 OpKind::InviteCodePut(put) if self.shared.invites.contains_key(&put.code_hash) => {
-                    return bad(ErrorCode::Conflict, "registered", json!({}));
+                    return Ok(bad(ErrorCode::Conflict, "registered", json!({})));
                 }
                 OpKind::InviteCodeDelete { code_hash }
                     if !self.shared.invites.contains_key(code_hash) =>
                 {
-                    return bad(ErrorCode::NotFound, "no code", json!(null));
+                    return Ok(bad(ErrorCode::NotFound, "no code", json!(null)));
                 }
                 _ => after.push(None),
             }
@@ -448,8 +469,13 @@ impl Inner {
         let generation = self.tip.generation;
         for (op, claim) in ops.iter().zip(after) {
             let body = op.body();
-            let hash = op.item_hash().unwrap();
-            let object = body.kind.proof_object(body.app_id.as_ref()).unwrap();
+            let hash = op.item_hash()?;
+            let object = body
+                .kind
+                .proof_object(body.app_id.as_ref())
+                .ok_or_else(|| {
+                    ScriptError::Missing("an operation without a proof object".into())
+                })?;
             let seq = self.seq + 1;
             let state = match (&body.kind, &claim) {
                 (OpKind::RecordPut(put), _) => {
@@ -459,11 +485,10 @@ impl Inner {
                         deleted: state.deleted,
                     }
                 }
-                (OpKind::Claim(fields), Some(claim)) => {
-                    let key = <[u8; 32]>::try_from(fields.claim_key.as_slice()).unwrap();
+                (OpKind::Claim(_), Some((key, claim))) => {
                     let apps = self.apps.clone();
                     let current = |app: &[u8; 16]| apps.get(app).is_some_and(|a| !a.departed);
-                    ProofState::Claim(claim.view(&key, now, &current).to_value())
+                    ProofState::Claim(claim.view(key, now, &current).to_value())
                 }
                 (OpKind::InviteCodePut(put), _) => ProofState::InviteCodePut {
                     max_uses: put.max_uses,
@@ -488,12 +513,12 @@ impl Inner {
                 &object,
                 &state,
                 None,
-            );
+            )?;
             match (&body.kind, claim) {
                 (OpKind::RecordPut(put), _) => {
                     self.shared.records.insert(
                         put.key,
-                        HeldWrite {
+                        HeldRecord {
                             state: RecordState::after(put, generation, seq),
                             op: op.signed().clone(),
                             proof: proof.clone(),
@@ -502,8 +527,7 @@ impl Inner {
                         },
                     );
                 }
-                (OpKind::Claim(fields), Some(claim)) => {
-                    let key = <[u8; 32]>::try_from(fields.claim_key.as_slice()).unwrap();
+                (OpKind::Claim(fields), Some((key, claim))) => {
                     self.shared.entries.entry(key).or_default().push(HeldEntry {
                         step: fields.expected_step,
                         seq,
@@ -549,6 +573,6 @@ impl Inner {
         if let Some(op) = ops.first() {
             self.answered.insert(op.body().batch.id, answer.clone());
         }
-        (200, answer)
+        Ok((200, answer))
     }
 }

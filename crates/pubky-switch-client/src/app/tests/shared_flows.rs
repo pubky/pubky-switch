@@ -1,7 +1,7 @@
 //! Sending, admission, shared records and claims against the scripted switch, with bob's
 //! switch as the counterparty's, and a neutral protocol with one collection.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use pubky_switch_core::claims::{Basis, ClaimStatus, RECONCILIATION_MS};
 use pubky_switch_core::envelope::parse_header;
@@ -13,14 +13,15 @@ use pubky_switch_core::records::{DAY_MS, RemovedApp, seal_bundle_parts};
 use pubky_switch_core::scopes::Permission;
 use serde_json::{Map, json};
 
-use super::fake::ORIGIN;
-use super::peer::{PEER_ORIGIN, PeerSwitch, Router};
 use super::*;
 use crate::app::{
     Alarm, AppError, AppEvent, ClaimOp, Collection, Delivery, ObligationDeadline, OpBatch,
     OutgoingMessage, RecordContent, RecordJob, RecordTarget, Refusal, SentMessage, claim_conflict,
 };
+use crate::store::StoreHandle;
 use crate::store::{Fault as StoreFault, FaultStore};
+use crate::testing::SWITCH_ORIGIN as ORIGIN;
+use crate::testing::{Fault, PeerSwitch, Router};
 use crate::transport::Transport;
 
 const HOUR: u64 = 3_600_000;
@@ -147,21 +148,21 @@ impl Setup {
     fn new() -> Self {
         let w = World::new();
         let peer = PeerSwitch::new(
-            &w.bob,
+            identity("bob"),
+            PEER_ORIGIN,
             Arc::clone(&w.clock),
             Arc::clone(&w.homeserver),
-            &["sample.note", "sample.resend"],
         );
-        let router = Arc::new(Router {
-            routes: vec![
-                (
-                    ORIGIN.to_owned(),
-                    w.switch.transport() as Arc<dyn Transport>,
-                ),
-                (PEER_ORIGIN.to_owned(), peer.transport()),
-            ],
-            log: Mutex::new(Vec::new()),
-        });
+        peer.add_app(
+            "shop",
+            &AppSpec::new(&["scope-a"]),
+            &["sample.note", "sample.resend"],
+            false,
+        )
+        .unwrap();
+        let router = Arc::new(Router::new());
+        router.add_switch(ORIGIN, &w.switch);
+        router.add(PEER_ORIGIN, peer.transport());
         Self {
             w,
             peer,
@@ -171,12 +172,9 @@ impl Setup {
     }
 
     fn env_on(&self, store: Arc<dyn StateStore>) -> AppEnv {
-        AppEnv {
-            store: StoreHandle::inline(store),
-            transport: Arc::clone(&self.router) as Arc<dyn Transport>,
-            clock: Arc::clone(&self.w.clock) as Arc<dyn Clock>,
-            homeserver: Arc::clone(&self.w.homeserver) as Arc<dyn HomeserverReader>,
-        }
+        self.w
+            .signer
+            .env_with(store, Arc::clone(&self.router) as Arc<dyn Transport>)
     }
 
     fn env(&self) -> AppEnv {
@@ -185,46 +183,8 @@ impl Setup {
 
     /// The signer approves `keys` with `permissions`.
     fn approve(&self, keys: &AppKeys, permissions: &[Permission]) -> JoinRequest {
-        let now = self.w.clock.now_ms();
-        let cert = AppCert::issue(
-            &self.w.alice,
-            AppCertBody::new(
-                self.w.alice.public(),
-                keys.signing_public(),
-                keys.bundle_public(),
-                vec!["scope-a".to_owned()],
-                permissions,
-                now,
-                now + DEFAULT_CERT_LIFETIME_MS,
-            ),
-        )
-        .unwrap();
-        let auth = AuthRequest {
-            client_id: "sample.example".into(),
-            client_key: [7; 32],
-            caps: format!("{}:rw", app_record_path(&keys.app_id_bytes())),
-            secret: [8; 32],
-        };
-        let request = AppRequest::sign(
-            keys,
-            AppRequestBody::new(keys, vec!["scope-a".to_owned()], &auth),
-        )
-        .unwrap();
-        let doc = self.w.next_doc(|body| {
-            body.apps.push(ListedApp {
-                app_id: cert.app_id(),
-                cert: cert.hash(),
-            })
-        });
-        let has = SampleProtocol::default();
-        let approval =
-            Approval::issue(&self.w.alice, &request, cert, doc, &|s| has.has_keys(s)).unwrap();
-        JoinRequest {
-            identity: self.w.alice.public(),
-            keys: keys.clone(),
-            request,
-            approval: approval.to_json().unwrap(),
-        }
+        let app = AppSpec::new(&["scope-a"]).with_permissions(permissions);
+        self.w.signer.approve(keys, &app).unwrap()
     }
 
     async fn join_with(&self, name: &str, permissions: &[Permission]) -> App {
@@ -257,7 +217,7 @@ impl Setup {
     }
 
     fn log(&self) -> Vec<String> {
-        self.router.log.lock().unwrap().clone()
+        self.router.log()
     }
 
     fn target(&self, natural: &str) -> RecordTarget {
@@ -326,7 +286,7 @@ async fn test_send_stale_key_checks_the_record_and_seals_again() {
     let mut app = s.join("wallet").await;
     let (first, _) = app.send(s.note("one")).await.unwrap();
     // Bob rotates; the cached directory still names the old key.
-    s.peer.rotate(0);
+    s.peer.rotate(0).unwrap();
     let (second, delivery) = app.send(s.note("two")).await.unwrap();
     assert!(accepted(&delivery), "{delivery:?}");
     assert_eq!(s.peer.received(), vec![first, second]);
@@ -350,7 +310,7 @@ async fn test_send_stale_key_checks_the_record_and_seals_again() {
 async fn test_send_stale_key_with_an_older_record_is_not_sealed_to() {
     let s = Setup::new();
     let mut app = s.join("wallet").await;
-    s.peer.rotate(0);
+    s.peer.rotate(0).unwrap();
     app.send(s.note("one")).await.unwrap();
     // A stale_key answer offering the key of n 0, after n 1 was seen: ignored.
     let (old, app_id) = {
@@ -383,7 +343,10 @@ async fn test_send_added_app_joins_the_recipients_after_stale_key() {
     let s = Setup::new();
     let mut app = s.join("wallet").await;
     app.send(s.note("one")).await.unwrap();
-    let till = s.peer.add_app("till", &["sample.note"], true);
+    let till = s
+        .peer
+        .add_app("till", &AppSpec::new(&["scope-a"]), &["sample.note"], true)
+        .unwrap();
     let (_, delivery) = app.send(s.note("two")).await.unwrap();
     assert!(accepted(&delivery), "{delivery:?}");
     let inner = s.peer.lock();
@@ -493,7 +456,7 @@ async fn test_send_resend_seals_the_same_plaintext_again() {
     let s = Setup::new();
     let mut app = s.join("wallet").await;
     let (msg_id, _) = app.send(s.note("hello")).await.unwrap();
-    s.peer.rotate(0);
+    s.peer.rotate(0).unwrap();
     let delivery = app.resend(&msg_id).await.unwrap();
     assert!(accepted(&delivery), "{delivery:?}");
     assert_eq!(s.peer.received(), vec![msg_id.clone(), msg_id.clone()]);
@@ -924,12 +887,14 @@ async fn test_records_stale_epoch_takes_the_new_keys_and_writes_again() {
     let has_keys = |scope: &str| SampleProtocol::default().has_keys(scope);
     s.w.next_doc(|body| body.data_epoch = 2);
     for part in seal_bundle_parts(&s.w.alice, &cert, 1, 2, &has_keys).unwrap() {
-        s.w.switch.signer_op(OpKind::KeyBundlePut(KeyBundlePut {
-            target_app_id: app.app_id(),
-            bundle: part.bundle,
-            first_epoch: part.first_epoch,
-            last_epoch: part.last_epoch,
-        }));
+        s.w.switch
+            .signer_op(OpKind::KeyBundlePut(KeyBundlePut {
+                target_app_id: app.app_id(),
+                bundle: part.bundle,
+                first_epoch: part.first_epoch,
+                last_epoch: part.last_epoch,
+            }))
+            .unwrap();
     }
     let target = s.target("n1");
     let written = app
@@ -938,7 +903,7 @@ async fn test_records_stale_epoch_takes_the_new_keys_and_writes_again() {
         .unwrap();
     assert_eq!(app.data_epoch(), 2);
     let key = app.record_key(&target).unwrap();
-    let held = s.w.switch.record_view(&key).unwrap();
+    let held = s.w.switch.record(&key).unwrap();
     let OpKind::RecordPut(put) = SignedOp::peek(&held.op).unwrap().body().kind.clone() else {
         panic!("a record.put")
     };
@@ -962,7 +927,7 @@ async fn test_records_without_the_current_key_writes_nothing() {
     );
     assert!(
         s.w.switch
-            .record_view(&app.record_key(&target).unwrap())
+            .record(&app.record_key(&target).unwrap())
             .is_none()
     );
 }
@@ -1118,7 +1083,7 @@ async fn test_records_older_write_shown_as_newer_without_a_proof_is_not_taken() 
         .await
         .unwrap();
     let key = wallet.record_key(&target).unwrap();
-    let older = s.w.switch.record_view(&key).unwrap();
+    let older = s.w.switch.record(&key).unwrap();
     wallet
         .put_record(&target, &value(&["a", "b"]), vec![])
         .await
@@ -1400,14 +1365,17 @@ async fn test_batch_carries_the_deferred_cursor_move() {
     let mut app = s.join("wallet").await;
     let me = app.app_id();
     // A note whose body fails check 10: dropped, the cursor move deferred.
-    let (seq, _) = s.w.switch.send(
-        &s.w.bob,
-        &s.w.bob_keys,
-        &s.w.bob_cert,
-        "sample.note",
-        json!({ "nothing": 1 }),
-        &[me],
-    );
+    let (seq, _) =
+        s.w.switch
+            .send(
+                &s.w.bob,
+                &s.w.bob_keys,
+                &s.w.bob_cert,
+                "sample.note",
+                json!({ "nothing": 1 }),
+                &[me],
+            )
+            .unwrap();
     app.receive(None).await.unwrap();
     assert!(app.cursor().seq >= seq);
     assert!(s.w.switch.app(&me).cursor < seq);
@@ -1423,20 +1391,22 @@ async fn test_batch_sent_again_never_takes_the_service_cursor_back() {
     let mut app = s.join("wallet").await;
     let me = app.app_id();
     let dropped = |s: &Setup| {
-        s.w.switch.send(
-            &s.w.bob,
-            &s.w.bob_keys,
-            &s.w.bob_cert,
-            "sample.note",
-            json!({ "nothing": 1 }),
-            &[me],
-        )
+        s.w.switch
+            .send(
+                &s.w.bob,
+                &s.w.bob_keys,
+                &s.w.bob_cert,
+                "sample.note",
+                json!({ "nothing": 1 }),
+                &[me],
+            )
+            .unwrap()
     };
     // A dropped note defers the cursor move; the next batch carries it, but the service
     // is unavailable, so the batch is kept with that cursor move.
     let (first, _) = dropped(&s);
     app.receive(None).await.unwrap();
-    s.w.switch.fail_next(super::fake::Fault::Error {
+    s.w.switch.fail_next(Fault::Error {
         path: "ops".into(),
         code: ErrorCode::Unavailable,
         current: json!(null),
@@ -1463,14 +1433,17 @@ async fn test_batch_of_eight_has_no_room_for_the_cursor_and_nine_is_refused() {
     let s = Setup::new();
     let mut app = s.join("wallet").await;
     let me = app.app_id();
-    let (seq, _) = s.w.switch.send(
-        &s.w.bob,
-        &s.w.bob_keys,
-        &s.w.bob_cert,
-        "sample.note",
-        json!({ "nothing": 1 }),
-        &[me],
-    );
+    let (seq, _) =
+        s.w.switch
+            .send(
+                &s.w.bob,
+                &s.w.bob_keys,
+                &s.w.bob_cert,
+                "sample.note",
+                json!({ "nothing": 1 }),
+                &[me],
+            )
+            .unwrap();
     app.receive(None).await.unwrap();
     let mut eight = OpBatch::new();
     for n in 0..8u8 {
@@ -1608,7 +1581,7 @@ async fn test_batch_kept_on_a_retryable_refusal_and_sent_again() {
     ] {
         let s = Setup::new();
         let mut app = s.join("wallet").await;
-        s.w.switch.fail_next(super::fake::Fault::Error {
+        s.w.switch.fail_next(Fault::Error {
             path: "ops".into(),
             code,
             current: json!(null),
@@ -1639,7 +1612,7 @@ async fn test_batch_kept_on_a_retryable_refusal_and_sent_again() {
 async fn test_batch_kept_and_refused_for_good_later_is_reported() {
     let s = Setup::new();
     let mut app = s.join("wallet").await;
-    s.w.switch.fail_next(super::fake::Fault::Error {
+    s.w.switch.fail_next(Fault::Error {
         path: "ops".into(),
         code: ErrorCode::Unavailable,
         current: json!(null),
@@ -1649,7 +1622,7 @@ async fn test_batch_kept_and_refused_for_good_later_is_reported() {
             .await
             .is_err()
     );
-    s.w.switch.fail_next(super::fake::Fault::Error {
+    s.w.switch.fail_next(Fault::Error {
         path: "ops".into(),
         code: ErrorCode::PermissionMissing,
         current: json!(null),
@@ -1675,7 +1648,7 @@ async fn test_batch_kept_and_refused_for_good_later_is_reported() {
 async fn test_batch_refused_for_good_is_the_callers_error_and_not_kept() {
     let s = Setup::new();
     let mut app = s.join("wallet").await;
-    s.w.switch.fail_next(super::fake::Fault::Error {
+    s.w.switch.fail_next(Fault::Error {
         path: "ops".into(),
         code: ErrorCode::PermissionMissing,
         current: json!(null),
@@ -1694,7 +1667,7 @@ async fn test_claims_attempt_answer_lost_is_checked_when_sent_again() {
     let s = Setup::new();
     let mut app = s.join("wallet").await;
     s.w.switch
-        .fail_next(super::fake::Fault::LoseAnswer { path: "ops".into() });
+        .fail_next(Fault::LoseAnswer { path: "ops".into() });
     assert!(
         app.write_claim(
             ClaimOp::attempt(CLAIM, 0, ATTEMPT, 3600, None),
@@ -1790,7 +1763,7 @@ async fn test_send_record_job_owed_still_finds_the_sent_message() {
         tag: b"sent".to_vec(),
     });
     // The record write can't be made now: the record job stays owed.
-    s.w.switch.fail_next(super::fake::Fault::Error {
+    s.w.switch.fail_next(Fault::Error {
         path: "ops".into(),
         code: ErrorCode::Unavailable,
         current: json!(null),
@@ -1801,7 +1774,7 @@ async fn test_send_record_job_owed_still_finds_the_sent_message() {
     let sent = app.sent_to(&s.w.bob.public(), 0, u64::MAX).await.unwrap();
     let ids: Vec<&str> = sent.iter().map(|m| m.msg_id.as_str()).collect();
     assert!(ids.contains(&msg_id.as_str()), "{ids:?}");
-    s.peer.rotate(0);
+    s.peer.rotate(0).unwrap();
     let delivery = app.resend(&msg_id).await.unwrap();
     assert!(accepted(&delivery), "{delivery:?}");
     assert_eq!(s.peer.received(), vec![first, msg_id.clone(), msg_id]);
@@ -1864,7 +1837,7 @@ async fn test_directory_floor_only_rises_within_one_answer() {
     let s = Setup::new();
     let mut app = s.join("wallet").await;
     app.send(s.note("one")).await.unwrap();
-    s.peer.rotate(0);
+    s.peer.rotate(0).unwrap();
     let (app_id, older, newer) = {
         let inner = s.peer.lock();
         (
@@ -1904,14 +1877,20 @@ async fn test_directory_floor_only_rises_within_one_answer() {
 async fn test_directory_bad_or_repeated_app_is_skipped_and_the_others_used() {
     let s = Setup::new();
     let mut app = s.join("wallet").await;
-    let till = s.peer.add_app("till", &["sample.note"], true);
-    let kiosk = s.peer.add_app("kiosk", &["sample.note"], true);
+    let till = s
+        .peer
+        .add_app("till", &AppSpec::new(&["scope-a"]), &["sample.note"], true)
+        .unwrap();
+    let kiosk = s
+        .peer
+        .add_app("kiosk", &AppSpec::new(&["scope-a"]), &["sample.note"], true)
+        .unwrap();
     {
         let mut inner = s.peer.lock();
         // Till's entry carries the shop's record: it doesn't verify for its App ID.
         inner.apps[1].record = inner.apps[0].record.clone();
         // Kiosk is listed twice.
-        let copy = super::peer::PeerApp {
+        let copy = crate::testing::PeerApp {
             keys: inner.apps[2].keys.clone(),
             cert: inner.apps[2].cert.clone(),
             record: inner.apps[2].record.clone(),

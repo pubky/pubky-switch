@@ -17,6 +17,8 @@
 //!   answer against the pinned service key before using it, and offers a typed call for
 //!   every endpoint, with batches that are signed once and resent byte for byte.
 //! - [`error`]: one error type per layer.
+//! - `testing` (`test-support` feature, tests only): a scripted switch and the fixtures to
+//!   drive the app layer against it, for the tests of this crate and of crates built on it.
 //! - [`app`]: the app layer, which runs one app of an identity on top of the Switch: its
 //!   keys, its own `identity.json`, its receive keys, its key bundles and its feed, with all
 //!   durable state in the [`store::StateStore`] (Switch spec 3, 8, 11, 12).
@@ -28,6 +30,8 @@ pub mod client;
 pub mod clock;
 pub mod error;
 pub mod store;
+#[cfg(feature = "test-support")]
+pub mod testing;
 pub mod transport;
 
 pub use client::{Credentials, SwitchClient};

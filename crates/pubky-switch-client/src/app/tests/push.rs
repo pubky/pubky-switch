@@ -4,12 +4,12 @@ use std::sync::{Arc, Mutex};
 
 use pubky_switch_core::http::{sign_webhook, verify_webhook, webhook_body};
 
-use super::fake::Fault;
 use super::moves::{NEXT, Router, freeze_for, has, join, join_on, next_key, publish_at};
 use super::*;
 use crate::app::{AppError, AppEvent, Peeked, PushRelay, Refusal};
 use crate::error::TransportError;
 use crate::store::StateStore;
+use crate::testing::Fault;
 use crate::transport::BoxFuture;
 
 const RELAY: &str = "https://push.example/v1/hook";
@@ -73,7 +73,7 @@ fn relay_accepts(relay: &FakeRelay, handle: &str, signed_by: &ed25519_dalek::Sig
     verify_webhook(&bound, &url, &body, &signature).is_ok()
 }
 
-fn push_key_at(switch: &FakeSwitch, app: &[u8; 16]) -> ed25519_dalek::SigningKey {
+fn push_key_at(switch: &ScriptedSwitch, app: &[u8; 16]) -> ed25519_dalek::SigningKey {
     switch.lock().push.get(app).unwrap().key.clone()
 }
 
@@ -182,7 +182,7 @@ async fn test_push_start_for_another_relays_registration_names_it() {
     let held = ed25519_dalek::SigningKey::from_bytes(&[3; 32]);
     w.switch.lock().push.insert(
         me,
-        super::fake::PushReg {
+        crate::testing::PushReg {
             relay_url: OTHER_RELAY.into(),
             key: held.clone(),
             handles: vec!["other-device".into()],
@@ -251,8 +251,8 @@ async fn test_push_registers_again_after_a_move() {
     let relay = FakeRelay::default();
     let before = app.register_push(&relay, RELAY, "device-1").await.unwrap();
     let n_key = next_key();
-    w.switch.freeze(&freeze_for(&w, &n_key, 2));
-    let next = w.switch.import_into(n_key.clone());
+    w.switch.freeze(&freeze_for(&w, &n_key, 2)).unwrap();
+    let next = w.switch.import_into(n_key.to_bytes());
     router.add(NEXT, &next);
     app.receive(None).await.unwrap();
     publish_at(
@@ -430,7 +430,8 @@ async fn test_peek_of_a_processed_message_shows_nothing() {
     // Bob re-sends the same signed message.
     let plaintext = message.sign(&w.bob_keys).unwrap();
     w.switch
-        .send_plaintext(w.bob.public(), &w.bob_cert, &plaintext, &[me]);
+        .send_plaintext(w.bob.public(), &w.bob_cert, &plaintext, &[me])
+        .unwrap();
     let report = app.peek().await.unwrap();
     assert!(report.items.is_empty(), "{:?}", report.items);
 }
@@ -447,7 +448,8 @@ async fn test_peek_on_a_chain_that_doesnt_verify_is_generic_and_raises_nothing()
     // The service rolls back its chain and forks it.
     w.switch.roll_back_to(verified - 1);
     w.switch
-        .signer_op(pubky_switch_core::ops::OpKind::DenyPut { pubky: [5; 32] });
+        .signer_op(pubky_switch_core::ops::OpKind::DenyPut { pubky: [5; 32] })
+        .unwrap();
     let seq = w.note(me, "second").0;
     let before = snapshot(&w.store, &me);
     let report = app.peek().await.unwrap();
