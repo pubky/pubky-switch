@@ -85,52 +85,55 @@ impl App {
     /// [`Refusal::Left`] for an app that left; [`Refusal::Gone`] for one that isn't current
     /// any more, or whose account is gone; a failed feed read.
     pub async fn peek(&self) -> Result<PeekReport, AppError> {
-        if self.state.leave.is_some() {
-            return Err(Refusal::Left.into());
-        }
-        if self.state.gone.is_some() {
-            return Err(Refusal::Gone.into());
-        }
-        let Some(mut chain) = self.state.chain.clone() else {
-            return Err(Refusal::NotNow("the app isn't registered".into()).into());
-        };
-        let compromised = self.state.alarm.is_some();
-        let cursor = self.state.cursor;
-        let now = self.now();
-        let multi = self.state.device.multi_device;
-        let mut report = PeekReport {
-            items: Vec::new(),
-            chain_verified: true,
-        };
-        let mut after = cursor.seq;
-        for _ in 0..PEEK_PAGES {
-            let query = FeedQuery {
-                after: Some(Position {
-                    generation: cursor.generation,
-                    seq: after,
-                }),
-                limit: Some(self.config.page()),
-                wait: None,
+        Box::pin(async move {
+            if self.state.leave.is_some() {
+                return Err(Refusal::Left.into());
+            }
+            if self.state.gone.is_some() {
+                return Err(Refusal::Gone.into());
+            }
+            let Some(mut chain) = self.state.chain.clone() else {
+                return Err(Refusal::NotNow("the app isn't registered".into()).into());
             };
-            let page = self.client.feed(query).await?;
-            if report.chain_verified && chain.feed_page(&page, now, multi).is_err() {
-                report.chain_verified = false;
-            }
-            let trusted = report.chain_verified && !compromised && page.freeze.is_none();
-            for item in &page.items {
-                if let FeedItem::Entry(entry) = item
-                    && entry.seq > cursor.seq
-                    && let Some(peeked) = self.peek_entry(entry, trusted).await?
-                {
-                    report.items.push(peeked);
+            let compromised = self.state.alarm.is_some();
+            let cursor = self.state.cursor;
+            let now = self.now();
+            let multi = self.state.device.multi_device;
+            let mut report = PeekReport {
+                items: Vec::new(),
+                chain_verified: true,
+            };
+            let mut after = cursor.seq;
+            for _ in 0..PEEK_PAGES {
+                let query = FeedQuery {
+                    after: Some(Position {
+                        generation: cursor.generation,
+                        seq: after,
+                    }),
+                    limit: Some(self.config.page()),
+                    wait: None,
+                };
+                let page = self.client.feed(query).await?;
+                if report.chain_verified && chain.feed_page(&page, now, multi).is_err() {
+                    report.chain_verified = false;
                 }
+                let trusted = report.chain_verified && !compromised && page.freeze.is_none();
+                for item in &page.items {
+                    if let FeedItem::Entry(entry) = item
+                        && entry.seq > cursor.seq
+                        && let Some(peeked) = self.peek_entry(entry, trusted).await?
+                    {
+                        report.items.push(peeked);
+                    }
+                }
+                if !page.more || page.scanned_through <= after {
+                    break;
+                }
+                after = page.scanned_through;
             }
-            if !page.more || page.scanned_through <= after {
-                break;
-            }
-            after = page.scanned_through;
-        }
-        Ok(report)
+            Ok(report)
+        })
+        .await
     }
 
     /// The checks on one entry; `None` for a message already processed.

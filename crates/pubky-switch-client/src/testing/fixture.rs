@@ -110,10 +110,16 @@ pub fn issue_cert(
 /// publishes it on the [`TestHomeserver`], and approves apps to join.
 ///
 /// The account's switch is created with it, under the identity's service key, and its
-/// first `identity.json` names it at [`SWITCH_ORIGIN`]. The first document is delivered with
-/// the first approval or [`TestSigner::next_doc`].
+/// first `identity.json` names it at [`SWITCH_ORIGIN`], or at the origin
+/// [`TestSigner::at`] gives. The first document is delivered with the first approval or
+/// [`TestSigner::next_doc`].
+///
+/// Two signers at two origins, their switches routed by a [`super::Router`], let their
+/// apps message each other: each switch answers the other identity's apps as a sender sees
+/// it, with admission, peer copies, `stale_key` and invite codes.
 pub struct TestSigner {
     identity: TestIdentity,
+    origin: String,
     clock: Arc<TestClock>,
     homeserver: Arc<TestHomeserver>,
     switch: Arc<ScriptedSwitch>,
@@ -141,6 +147,18 @@ impl TestSigner {
         homeserver: Arc<TestHomeserver>,
         spec: ProtocolSpec,
     ) -> Self {
+        Self::at(identity, SWITCH_ORIGIN, clock, homeserver, spec)
+    }
+
+    /// The signer of `identity`, its account's switch named at `origin`, where a
+    /// [`super::Router`] routes it.
+    pub fn at(
+        identity: TestIdentity,
+        origin: &str,
+        clock: Arc<TestClock>,
+        homeserver: Arc<TestHomeserver>,
+        spec: ProtocolSpec,
+    ) -> Self {
         let switch = ScriptedSwitch::new(
             identity.key(),
             identity.service_secret(),
@@ -149,11 +167,12 @@ impl TestSigner {
         let body = IdentityBody::first(
             identity.public(),
             identity.signer_id(),
-            Inbox::new(SWITCH_ORIGIN, switch.service_key()),
+            Inbox::new(origin, switch.service_key()),
             IdentityPolicy::default(),
         );
         Self {
             identity,
+            origin: origin.to_owned(),
             clock,
             homeserver,
             switch,
@@ -165,6 +184,11 @@ impl TestSigner {
     /// The identity.
     pub fn identity(&self) -> &TestIdentity {
         &self.identity
+    }
+
+    /// The origin its `identity.json` names for the account's switch.
+    pub fn origin(&self) -> &str {
+        &self.origin
     }
 
     /// The account's switch.

@@ -28,75 +28,78 @@ impl App {
     ///
     /// A failed call or commit. A `404` (no part stored) isn't one.
     pub async fn fetch_key_bundle(&mut self) -> Result<(), AppError> {
-        self.ready_local().await?;
-        let result = self.client.keys().await;
-        let answer = match self.take(result).await {
-            Ok(answer) => Some(answer),
-            Err(error) if error.code() == Some(ErrorCode::NotFound) => None,
-            Err(error) => return Err(error),
-        };
-        let mut tx = self.tx()?;
-        if let Some(answer) = answer {
-            let parts: Vec<BundlePart> = answer
-                .bundles
-                .iter()
-                .map(|stored| BundlePart {
-                    bundle: stored.bundle.clone(),
-                    first_epoch: stored.first_epoch,
-                    last_epoch: stored.last_epoch,
-                })
-                .collect();
-            let renewals: Vec<AppCert> = self.state.renewal.iter().cloned().collect();
-            let certs = reader_certs(&self.state.cert, &renewals, &self.state.own_doc);
-            let secret = self.state.keys.bundle_secret();
-            let protocol = std::sync::Arc::clone(&self.protocol);
-            let has_keys = |scope: &str| protocol.has_keys(scope);
-            let reader = PartReader {
-                identity: self.state.meta.identity,
-                app_id: self.state.meta.app_id,
-                bundle_secret: &secret,
-                newest_epoch: self.state.own_doc.data_epoch(),
-                certs: &certs,
-                has_keys: &has_keys,
+        Box::pin(async move {
+            self.ready_local().await?;
+            let result = self.client.keys().await;
+            let answer = match self.take(result).await {
+                Ok(answer) => Some(answer),
+                Err(error) if error.code() == Some(ErrorCode::NotFound) => None,
+                Err(error) => return Err(error),
             };
-            match reader.read(&parts, Some(&self.state.naming)) {
-                Err(error) => self.events.push(AppEvent::BundlePartSkipped {
-                    range: (0, 0),
-                    reason: error.to_string(),
-                    alert: false,
-                }),
-                Ok(reading) => {
-                    for skipped in &reading.skipped {
-                        self.events.push(AppEvent::BundlePartSkipped {
-                            range: skipped.range,
-                            reason: skip_text(&skipped.reason),
-                            alert: skipped.reason.alerts(),
-                        });
-                    }
-                    for scope_key in reading.keys.keys {
-                        if self
-                            .state
-                            .scope_keys
-                            .get(scope_key.data_epoch, &scope_key.scope)
-                            .is_none()
-                        {
-                            tx.put(
-                                &key::scope(scope_key.data_epoch, &scope_key.scope),
-                                &scope_key,
-                            )?;
-                            self.state.scope_keys.keys.push(scope_key);
+            let mut tx = self.tx()?;
+            if let Some(answer) = answer {
+                let parts: Vec<BundlePart> = answer
+                    .bundles
+                    .iter()
+                    .map(|stored| BundlePart {
+                        bundle: stored.bundle.clone(),
+                        first_epoch: stored.first_epoch,
+                        last_epoch: stored.last_epoch,
+                    })
+                    .collect();
+                let renewals: Vec<AppCert> = self.state.renewal.iter().cloned().collect();
+                let certs = reader_certs(&self.state.cert, &renewals, &self.state.own_doc);
+                let secret = self.state.keys.bundle_secret();
+                let protocol = std::sync::Arc::clone(&self.protocol);
+                let has_keys = |scope: &str| protocol.has_keys(scope);
+                let reader = PartReader {
+                    identity: self.state.meta.identity,
+                    app_id: self.state.meta.app_id,
+                    bundle_secret: &secret,
+                    newest_epoch: self.state.own_doc.data_epoch(),
+                    certs: &certs,
+                    has_keys: &has_keys,
+                };
+                match reader.read(&parts, Some(&self.state.naming)) {
+                    Err(error) => self.events.push(AppEvent::BundlePartSkipped {
+                        range: (0, 0),
+                        reason: error.to_string(),
+                        alert: false,
+                    }),
+                    Ok(reading) => {
+                        for skipped in &reading.skipped {
+                            self.events.push(AppEvent::BundlePartSkipped {
+                                range: skipped.range,
+                                reason: skip_text(&skipped.reason),
+                                alert: skipped.reason.alerts(),
+                            });
+                        }
+                        for scope_key in reading.keys.keys {
+                            if self
+                                .state
+                                .scope_keys
+                                .get(scope_key.data_epoch, &scope_key.scope)
+                                .is_none()
+                            {
+                                tx.put(
+                                    &key::scope(scope_key.data_epoch, &scope_key.scope),
+                                    &scope_key,
+                                )?;
+                                self.state.scope_keys.keys.push(scope_key);
+                            }
                         }
                     }
                 }
             }
-        }
-        let missing = self.update_keys_through();
-        tx.put(key::BUNDLE, &self.state.bundle)?;
-        self.commit(tx).await?;
-        if missing && self.state.bundle.full_requested_ms.is_none() {
-            self.request_full_bundle().await?;
-        }
-        Ok(())
+            let missing = self.update_keys_through();
+            tx.put(key::BUNDLE, &self.state.bundle)?;
+            self.commit(tx).await?;
+            if missing && self.state.bundle.full_requested_ms.is_none() {
+                self.request_full_bundle().await?;
+            }
+            Ok(())
+        })
+        .await
     }
 
     /// Work out `keys_through` from the keys held, clear a full-bundle request that nothing

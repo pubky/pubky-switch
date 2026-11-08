@@ -47,13 +47,26 @@ pub(crate) struct HeldEntry {
     proof: SignedDoc,
 }
 
+/// An invite code the switch holds (Switch spec 7).
+#[derive(Clone, Debug)]
+pub(crate) struct Invite {
+    pub(crate) max_uses: u64,
+    pub(crate) uses: u64,
+    pub(crate) writer: [u8; 16],
+    pub(crate) expires_at: u64,
+    pub(crate) context: Value,
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Shared {
     pub(crate) records: BTreeMap<[u8; 32], HeldRecord>,
     pub(crate) claims: BTreeMap<[u8; 32], Claim>,
     entries: BTreeMap<[u8; 32], Vec<HeldEntry>>,
     pub(crate) connect: Vec<([u8; 32], u64)>,
-    invites: BTreeMap<[u8; 32], (u64, u64, [u8; 16])>,
+    pub(crate) invites: BTreeMap<[u8; 32], Invite>,
+    /// Conversation entries the service wrote for senders an invite code admitted, with the
+    /// code's hash (Switch spec 7).
+    pub(crate) service_conversations: BTreeMap<[u8; 32], [u8; 32]>,
     /// Answer the next record read without its proof, as after a recovery upload.
     pub(crate) hide_proofs: bool,
     /// A faulty listing: every page names these two keys as `next` in turn, for the first
@@ -67,7 +80,16 @@ pub(crate) struct Shared {
 impl Shared {
     /// Hold an invite code as if `writer` had registered it, for a faulty service's export.
     pub(crate) fn plant_invite(&mut self, code_hash: [u8; 32], max_uses: u64, writer: [u8; 16]) {
-        self.invites.insert(code_hash, (max_uses, 0, writer));
+        self.invites.insert(
+            code_hash,
+            Invite {
+                max_uses,
+                uses: 0,
+                writer,
+                expires_at: u64::MAX,
+                context: Value::Null,
+            },
+        );
     }
 }
 
@@ -209,11 +231,20 @@ impl Inner {
                 let Some(collection) = collection else {
                     return Ok(None);
                 };
+                // The records the caller may read: its certificate holds the read scope, a
+                // name covering its sub-scopes (Switch wire 7.4.9).
+                let cert = caller
+                    .and_then(|app| self.apps.get(&app))
+                    .and_then(|app| app.cert.clone());
                 let views: Vec<Value> = self
                     .shared
                     .records
                     .values()
                     .filter(|held| held.state.collection == collection && !held.state.deleted)
+                    .filter(|held| {
+                        cert.as_ref()
+                            .is_none_or(|cert| cert.holds_scope(&held.state.policy.read_scope))
+                    })
                     .map(|held| self.view(held))
                     .collect();
                 self.shared.listings += 1;
@@ -345,9 +376,9 @@ impl Inner {
             .shared
             .invites
             .iter()
-            .map(|(hash, (max, uses, by))| {
-                json!({ "code_hash": b64(hash), "expires_at": now, "max_uses": max,
-                        "uses": uses, "written_by": zbase32_encode(by) })
+            .map(|(hash, invite)| {
+                json!({ "code_hash": b64(hash), "expires_at": now, "max_uses": invite.max_uses,
+                        "uses": invite.uses, "written_by": zbase32_encode(&invite.writer) })
             })
             .collect();
         (
@@ -355,7 +386,13 @@ impl Inner {
             json!({
                 "contacts": contacts.keys().map(pubky_id).collect::<Vec<_>>(),
                 "conversations": conversations.iter().map(|(p, by)| json!({
-                    "pubky": pubky_id(p), "written_by": zbase32_encode(by), "at": now })).collect::<Vec<_>>(),
+                    "pubky": pubky_id(p), "written_by": zbase32_encode(by), "at": now }))
+                    .chain(self.shared.service_conversations.iter()
+                        .filter(|(p, _)| !conversations.contains_key(*p))
+                        .map(|(p, code)| json!({
+                        "pubky": pubky_id(p), "written_by": "service", "code_hash": b64(code),
+                        "at": now })))
+                    .collect::<Vec<_>>(),
                 "deny": deny.keys().map(pubky_id).collect::<Vec<_>>(),
                 "flagged": [],
                 "invite_codes": codes,
@@ -537,9 +574,16 @@ impl Inner {
                     self.shared.claims.insert(key, claim);
                 }
                 (OpKind::InviteCodePut(put), _) => {
-                    self.shared
-                        .invites
-                        .insert(put.code_hash, (put.max_uses, 0, writer));
+                    self.shared.invites.insert(
+                        put.code_hash,
+                        Invite {
+                            max_uses: put.max_uses,
+                            uses: 0,
+                            writer,
+                            expires_at: put.expires_at,
+                            context: put.context.clone(),
+                        },
+                    );
                 }
                 (OpKind::InviteCodeDelete { code_hash }, _) => {
                     self.shared.invites.remove(code_hash);

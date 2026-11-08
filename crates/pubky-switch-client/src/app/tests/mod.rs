@@ -3,6 +3,7 @@
 
 mod flows;
 mod moves;
+mod protocol_api;
 mod push;
 mod shared_flows;
 

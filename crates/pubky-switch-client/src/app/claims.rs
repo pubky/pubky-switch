@@ -43,7 +43,7 @@ use crate::error::ClientError;
 const CLAIM_PREFIX: &str = "claim/";
 const ENTRY_PREFIX: &str = "clent/";
 
-fn claim_key_of(claim_key: &[u8; 32]) -> String {
+pub(crate) fn claim_key_of(claim_key: &[u8; 32]) -> String {
     format!("{CLAIM_PREFIX}{}", b64(claim_key))
 }
 
@@ -350,14 +350,17 @@ impl App {
         claim_key: &[u8; 32],
         deadline: ObligationDeadline,
     ) -> Result<(), AppError> {
-        self.ready_local().await?;
-        let Some(mut kept) = self.kept_claim(claim_key).await? else {
-            return Ok(());
-        };
-        kept.own_deadline = deadline;
-        let mut tx = self.tx()?;
-        tx.put(&claim_key_of(claim_key), &kept)?;
-        self.commit(tx).await
+        Box::pin(async move {
+            self.ready_local().await?;
+            let Some(mut kept) = self.kept_claim(claim_key).await? else {
+                return Ok(());
+            };
+            kept.own_deadline = deadline;
+            let mut tx = self.tx()?;
+            tx.put(&claim_key_of(claim_key), &kept)?;
+            self.commit(tx).await
+        })
+        .await
     }
 
     /// Write one claim entry, with `conditions`, in a batch of its own (Switch wire 6.2), and
@@ -378,25 +381,24 @@ impl App {
         conditions: Vec<Condition>,
         deadline: ObligationDeadline,
     ) -> Result<ClaimWritten, AppError> {
-        let batch = OpBatch::new()
-            .op_if(op.kind(), conditions)
-            .obligation_deadline(op.entry.claim_key, deadline);
-        let submitted = self.submit_batch(batch).await?;
-        let proof = submitted.proofs.first().cloned().ok_or_else(|| {
-            AppError::InvalidData(
-                "Switch wire 6.5: a claim entry answered without its proof".into(),
-            )
-        })?;
-        if let EntryKind::Attempt { .. } = op.entry.kind {
-            return match self.check_own_attempt(&op.entry, &proof).await? {
-                Ok(view) => Ok(ClaimWritten { view, proof }),
-                Err(reason) => Err(AppError::InvalidData(format!(
-                    "the attempt's proof shows another state; written failed: {reason}"
-                ))),
+        Box::pin(async move {
+            let batch = OpBatch::new()
+                .op_if(op.kind(), conditions)
+                .obligation_deadline(op.entry.claim_key, deadline);
+            let (submitted, views) = self.submit_checked(batch).await?;
+            let proof = submitted.proofs.first().cloned().ok_or_else(|| {
+                AppError::InvalidData(
+                    "Switch wire 6.5: a claim entry answered without its proof".into(),
+                )
+            })?;
+            // An attempt's view is the one its checked proof shows.
+            let view = match views.into_iter().next() {
+                Some(view) => view,
+                None => ClaimView::from_value(&proof.body().state)?,
             };
-        }
-        let view = ClaimView::from_value(&proof.body().state)?;
-        Ok(ClaimWritten { view, proof })
+            Ok(ClaimWritten { view, proof })
+        })
+        .await
     }
 
     /// The checks of the proof of an own attempt the switch applied (Switch wire 6.5
@@ -444,6 +446,13 @@ impl App {
     /// evidence of that the switch shows nothing for before it may delete it (Switch spec
     /// 6.3); a failed call or commit.
     pub async fn read_claim(
+        &mut self,
+        claim_key: &[u8; 32],
+    ) -> Result<Option<ClaimRead>, AppError> {
+        Box::pin(self.read_claim_inner(claim_key)).await
+    }
+
+    pub(crate) async fn read_claim_inner(
         &mut self,
         claim_key: &[u8; 32],
     ) -> Result<Option<ClaimRead>, AppError> {
@@ -665,36 +674,39 @@ impl App {
     ///
     /// A store failure.
     pub async fn prune_claim_evidence(&mut self) -> Result<u64, AppError> {
-        self.ready_local().await?;
-        let Some(service) = self.state.service_time.map(|t| t.highest_ms) else {
-            return Ok(0);
-        };
-        let horizon = service.min(self.now().saturating_add(SERVICE_AHEAD_BOUND_MS));
-        let mut tx = self.tx()?;
-        let mut dropped = 0u64;
-        for (rest, kept) in self.reader().scan::<KeptClaim>(CLAIM_PREFIX).await? {
-            let Ok(view) = kept.view() else {
-                continue;
+        Box::pin(async move {
+            self.ready_local().await?;
+            let Some(service) = self.state.service_time.map(|t| t.highest_ms) else {
+                return Ok(0);
             };
-            if !finished_or_failed(&view) {
-                continue;
+            let horizon = service.min(self.now().saturating_add(SERVICE_AHEAD_BOUND_MS));
+            let mut tx = self.tx()?;
+            let mut dropped = 0u64;
+            for (rest, kept) in self.reader().scan::<KeptClaim>(CLAIM_PREFIX).await? {
+                let Ok(view) = kept.view() else {
+                    continue;
+                };
+                if !finished_or_failed(&view) {
+                    continue;
+                }
+                let Some(until) = kept
+                    .last_entry_ms
+                    .and_then(|time| keep_until(&view, kept.own_deadline, time))
+                else {
+                    continue;
+                };
+                if until < horizon {
+                    let claim_key = unb64_array::<32>(&rest)
+                        .map_err(|_| AppError::Store(crate::error::StoreError::Corrupt))?;
+                    tx.delete(&claim_key_of(&claim_key))?;
+                    tx.delete_prefix(&format!("{ENTRY_PREFIX}{}/", b64(&claim_key)))?;
+                    dropped = dropped.saturating_add(1);
+                }
             }
-            let Some(until) = kept
-                .last_entry_ms
-                .and_then(|time| keep_until(&view, kept.own_deadline, time))
-            else {
-                continue;
-            };
-            if until < horizon {
-                let claim_key = unb64_array::<32>(&rest)
-                    .map_err(|_| AppError::Store(crate::error::StoreError::Corrupt))?;
-                tx.delete(&claim_key_of(&claim_key))?;
-                tx.delete_prefix(&format!("{ENTRY_PREFIX}{}/", b64(&claim_key)))?;
-                dropped = dropped.saturating_add(1);
-            }
-        }
-        self.commit(tx).await?;
-        Ok(dropped)
+            self.commit(tx).await?;
+            Ok(dropped)
+        })
+        .await
     }
 
     /// The doubtful and orphaned rules for `claim_key`, from the view and entries the app

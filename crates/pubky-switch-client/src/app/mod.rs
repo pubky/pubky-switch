@@ -14,7 +14,11 @@
 //!   registration (Switch spec 3.6).
 //!
 //! The protocol the app is built with ([`Protocol`]) gives the kind rules and the effects of
-//! received messages; the Switch gives them no meaning (Switch spec 1).
+//! received messages; the Switch gives them no meaning (Switch spec 1). Its receive step
+//! builds a message's record writes and claim entries through a [`ReceiveContext`], into the
+//! batch that moves the cursor (Switch spec 8.2); its other writes go in batches of its own
+//! ([`OpBatch`]), with its local writes and the messages it signed before queueing them
+//! ([`App::sign_message`]), or alone ([`App::protocol_commit`]).
 //!
 //! Async is used only at the network edge: the switch, through the base client, the store,
 //! through [`StoreHandle`], and the Homeserver, through [`HomeserverReader`].
@@ -22,9 +26,13 @@
 //! Moves, provider loss and recovery, revocation and erasure as an app sees them, and push
 //! with its peek, are in `provider.rs`, `recovery.rs`, `push.rs` and `peek.rs`.
 //!
-//! Sending with the outbox and directories, admission, shared records and claims, and
-//! batches with conditions are in `send.rs`, `directory.rs`, `admission.rs`, `records.rs`,
-//! `claims.rs` and `batch.rs`. `STATE.md` lists the store keys each part keeps.
+//! Sending with the outbox and directories, admission, shared records and claims, batches
+//! with conditions, and the receive context are in `send.rs`, `directory.rs`,
+//! `admission.rs`, `records.rs`, `claims.rs`, `batch.rs` and `context.rs`. `STATE.md` lists
+//! the store keys each part keeps.
+//!
+//! Every call that reaches the network returns a boxed future at its boundary, so a caller's
+//! stack holds only a pointer to the call's state, debug builds included.
 
 mod chain;
 mod error;
@@ -44,6 +52,7 @@ mod state;
 mod admission;
 mod batch;
 mod claims;
+mod context;
 mod directory;
 mod records;
 mod send;
@@ -72,12 +81,15 @@ pub use claims::{
     ClaimDoubt, ClaimEntryRead, ClaimEvidence, ClaimOp, ClaimRead, ClaimWritten,
     ObligationDeadline, claim_conflict,
 };
-pub use directory::PEER_DELIVERY_MS;
+pub use context::ReceiveContext;
+pub use directory::{PEER_DELIVERY_MS, PeerIdentity, SwitchCopy};
 pub use records::{
-    Collection, FlaggedWrite, KeptOp, RecordContent, RecordTarget, SharedEvidence, SharedRecord,
+    Collection, FlaggedWrite, KeptOp, PolicyFamily, RecordContent, RecordTarget, SharedEvidence,
+    SharedRecord,
 };
 pub use send::{
     Delivery, OutboxReport, OutgoingMessage, RecordJob, SENT_RETENTION_MS, SentMessage,
+    SignedMessage,
 };
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -106,6 +118,9 @@ use crate::clock::Clock;
 use crate::error::{ClientError, StoreError};
 use crate::store::{StoreHandle, client_namespace};
 use crate::transport::Transport;
+
+/// How many entries of the protocol's local state one store scan reads.
+const PROTOCOL_SCAN_PAGE: u32 = 256;
 
 /// The default receive key rotation interval: a day (Switch spec 3.6).
 pub const DEFAULT_ROTATION_MS: u64 = DAY_MS;
@@ -432,145 +447,149 @@ impl App {
         config: AppConfig,
         request: JoinRequest,
     ) -> Result<App, AppError> {
-        let approved = Approval::read(
-            &request.approval,
-            &request.request,
-            &request.identity,
-            &request.keys.bundle_secret(),
-            &|scope| protocol.has_keys(scope),
-        )
-        .map_err(|error| Refusal::Approval(error.to_string()))?;
-        let keys = request.keys;
-        let cert = approved.cert;
-        let doc = approved.identity;
-        let now = env.clock.now_ms();
-        let inbox = doc.inbox().clone();
-        let meta = Meta {
-            identity: request.identity,
-            app_id: cert.app_id(),
-            origin: inbox.url.clone(),
-            service_key: inbox.service_key,
-            generation: doc.generation(),
-        };
-        let ns = client_namespace(&meta.app_id);
-        let reader = Reader {
-            ns: ns.clone(),
-            store: env.store.clone(),
-        };
-        if reader.exists(key::META).await? {
-            return Err(Refusal::Usage("the app joined already; load it".into()).into());
-        }
-        let first = ReceiveKey::generate(0)?;
-        let key_record = ReceiveKeyRecord::sign(&keys, &cert, ReceiveKeyBody::new(&cert, &first))?;
-        let mut body = AppRecordBody::new(&cert, protocol.accepts(&cert), now);
-        body.label = config.label.clone();
-        let record = AppRecord::sign(&keys, body)?;
-        let client = Self::client_for(&env, &meta, &keys, &cert)?;
-        let batch = client.sign_batch(
-            meta.generation,
-            vec![
-                (
-                    Vec::<Condition>::new(),
-                    OpKind::AppPut {
-                        record: record.signed().clone(),
-                    },
-                ),
-                (
-                    Vec::new(),
-                    OpKind::ReceiveKeyPut {
-                        record: key_record.signed().clone(),
-                    },
-                ),
-            ],
-            None,
-        )?;
-        let held = HeldKey {
-            key: first.clone(),
-            record: key_record.signed().clone(),
-            reg_seq: None,
-            pending: Vec::new(),
-        };
-        let state = AppState {
-            meta: meta.clone(),
-            keys: keys.clone(),
-            cert: cert.clone(),
-            renewal: None,
-            record: record.signed().clone(),
-            naming: approved.naming_key.clone(),
-            scope_keys: approved.keys.clone(),
-            bundle: BundleState::default(),
-            own_doc: doc.clone(),
-            receive_keys: BTreeMap::from([(0, held.clone())]),
-            known_kids: BTreeMap::from([(first.kid, 0)]),
-            registrations: BTreeMap::new(),
-            rotation: Rotation {
-                last_ms: now,
-                opened_since: false,
-            },
-            device: Device::default(),
-            cursor: Cursor {
-                generation: meta.generation,
-                ..Cursor::default()
-            },
-            chain: None,
-            held: BTreeMap::new(),
-            seen: BTreeSet::new(),
-            asked: BTreeSet::new(),
-            parked: BTreeMap::new(),
-            departed: BTreeMap::new(),
-            join: JoinStep::Registering {
-                body: batch.body().to_vec(),
-            },
-            pending_effect: None,
-            pending_record: None,
-            alarm: None,
-            restore: None,
-            leave: None,
-            service_time: None,
-            gone: None,
-        };
-        let mut app = App {
-            env,
-            protocol,
-            config,
-            ns,
-            state,
-            client,
-            reload: false,
-            service_time_dirty: false,
-            events: Vec::new(),
-        };
-        app.update_keys_through();
-        app.events.clear();
-        let mut tx = Tx::new(&app.ns);
-        tx.put(key::META, &meta)?;
-        tx.put(key::KEYS, &keys)?;
-        tx.put(key::CERT, cert.signed())?;
-        tx.put(key::RECORD, record.signed())?;
-        tx.put(key::NAMING, &approved.naming_key)?;
-        for scope_key in &approved.keys.keys {
-            tx.put(
-                &key::scope(scope_key.data_epoch, &scope_key.scope),
-                scope_key,
+        Box::pin(async move {
+            let approved = Approval::read(
+                &request.approval,
+                &request.request,
+                &request.identity,
+                &request.keys.bundle_secret(),
+                &|scope| protocol.has_keys(scope),
+            )
+            .map_err(|error| Refusal::Approval(error.to_string()))?;
+            let keys = request.keys;
+            let cert = approved.cert;
+            let doc = approved.identity;
+            let now = env.clock.now_ms();
+            let inbox = doc.inbox().clone();
+            let meta = Meta {
+                identity: request.identity,
+                app_id: cert.app_id(),
+                origin: inbox.url.clone(),
+                service_key: inbox.service_key,
+                generation: doc.generation(),
+            };
+            let ns = client_namespace(&meta.app_id);
+            let reader = Reader {
+                ns: ns.clone(),
+                store: env.store.clone(),
+            };
+            if reader.exists(key::META).await? {
+                return Err(Refusal::Usage("the app joined already; load it".into()).into());
+            }
+            let first = ReceiveKey::generate(0)?;
+            let key_record =
+                ReceiveKeyRecord::sign(&keys, &cert, ReceiveKeyBody::new(&cert, &first))?;
+            let mut body = AppRecordBody::new(&cert, protocol.accepts(&cert), now);
+            body.label = config.label.clone();
+            let record = AppRecord::sign(&keys, body)?;
+            let client = Self::client_for(&env, &meta, &keys, &cert)?;
+            let batch = client.sign_batch(
+                meta.generation,
+                vec![
+                    (
+                        Vec::<Condition>::new(),
+                        OpKind::AppPut {
+                            record: record.signed().clone(),
+                        },
+                    ),
+                    (
+                        Vec::new(),
+                        OpKind::ReceiveKeyPut {
+                            record: key_record.signed().clone(),
+                        },
+                    ),
+                ],
+                None,
             )?;
-        }
-        tx.put(key::BUNDLE, &app.state.bundle)?;
-        let taken = identity::take_copy(&app.reader(), &mut tx, &doc, None, now).await?;
-        if taken.is_err() {
-            return Err(AppError::InvalidData(
-                "Switch spec 4.3: the approval's identity.json equivocates".into(),
-            ));
-        }
-        tx.put(&key::receive_key(0), &held)?;
-        tx.put(&key::kid(&first.kid), &KnownKid { n: 0 })?;
-        tx.put(key::ROTATION, &app.state.rotation)?;
-        tx.put(key::DEVICE, &app.state.device)?;
-        tx.put(key::CURSOR, &app.state.cursor)?;
-        tx.put(key::JOIN, &app.state.join)?;
-        tx.put(records::LIST_DUE, &true)?;
-        tx.commit(&app.env.store).await?;
-        app.finish_join().await?;
-        Ok(app)
+            let held = HeldKey {
+                key: first.clone(),
+                record: key_record.signed().clone(),
+                reg_seq: None,
+                pending: Vec::new(),
+            };
+            let state = AppState {
+                meta: meta.clone(),
+                keys: keys.clone(),
+                cert: cert.clone(),
+                renewal: None,
+                record: record.signed().clone(),
+                naming: approved.naming_key.clone(),
+                scope_keys: approved.keys.clone(),
+                bundle: BundleState::default(),
+                own_doc: doc.clone(),
+                receive_keys: BTreeMap::from([(0, held.clone())]),
+                known_kids: BTreeMap::from([(first.kid, 0)]),
+                registrations: BTreeMap::new(),
+                rotation: Rotation {
+                    last_ms: now,
+                    opened_since: false,
+                },
+                device: Device::default(),
+                cursor: Cursor {
+                    generation: meta.generation,
+                    ..Cursor::default()
+                },
+                chain: None,
+                held: BTreeMap::new(),
+                seen: BTreeSet::new(),
+                asked: BTreeSet::new(),
+                parked: BTreeMap::new(),
+                departed: BTreeMap::new(),
+                join: JoinStep::Registering {
+                    body: batch.body().to_vec(),
+                },
+                pending_effect: None,
+                pending_record: None,
+                alarm: None,
+                restore: None,
+                leave: None,
+                service_time: None,
+                gone: None,
+            };
+            let mut app = App {
+                env,
+                protocol,
+                config,
+                ns,
+                state,
+                client,
+                reload: false,
+                service_time_dirty: false,
+                events: Vec::new(),
+            };
+            app.update_keys_through();
+            app.events.clear();
+            let mut tx = Tx::new(&app.ns);
+            tx.put(key::META, &meta)?;
+            tx.put(key::KEYS, &keys)?;
+            tx.put(key::CERT, cert.signed())?;
+            tx.put(key::RECORD, record.signed())?;
+            tx.put(key::NAMING, &approved.naming_key)?;
+            for scope_key in &approved.keys.keys {
+                tx.put(
+                    &key::scope(scope_key.data_epoch, &scope_key.scope),
+                    scope_key,
+                )?;
+            }
+            tx.put(key::BUNDLE, &app.state.bundle)?;
+            let taken = identity::take_copy(&app.reader(), &mut tx, &doc, None, now).await?;
+            if taken.is_err() {
+                return Err(AppError::InvalidData(
+                    "Switch spec 4.3: the approval's identity.json equivocates".into(),
+                ));
+            }
+            tx.put(&key::receive_key(0), &held)?;
+            tx.put(&key::kid(&first.kid), &KnownKid { n: 0 })?;
+            tx.put(key::ROTATION, &app.state.rotation)?;
+            tx.put(key::DEVICE, &app.state.device)?;
+            tx.put(key::CURSOR, &app.state.cursor)?;
+            tx.put(key::JOIN, &app.state.join)?;
+            tx.put(records::LIST_DUE, &true)?;
+            tx.commit(&app.env.store).await?;
+            app.finish_join().await?;
+            Ok(app)
+        })
+        .await
     }
 
     /// Send the registration batch kept at join until it is answered, then follow the feed
@@ -633,24 +652,27 @@ impl App {
         config: AppConfig,
         app_id: [u8; 16],
     ) -> Result<App, AppError> {
-        let ns = client_namespace(&app_id);
-        let reader = Reader {
-            ns: ns.clone(),
-            store: env.store.clone(),
-        };
-        let state = Self::read_state(&reader).await?;
-        let client = Self::client_for(&env, &state.meta, &state.keys, &state.cert)?;
-        Ok(App {
-            env,
-            protocol,
-            config,
-            ns,
-            state,
-            client,
-            reload: false,
-            service_time_dirty: false,
-            events: Vec::new(),
+        Box::pin(async move {
+            let ns = client_namespace(&app_id);
+            let reader = Reader {
+                ns: ns.clone(),
+                store: env.store.clone(),
+            };
+            let state = Self::read_state(&reader).await?;
+            let client = Self::client_for(&env, &state.meta, &state.keys, &state.cert)?;
+            Ok(App {
+                env,
+                protocol,
+                config,
+                ns,
+                state,
+                client,
+                reload: false,
+                service_time_dirty: false,
+                events: Vec::new(),
+            })
         })
+        .await
     }
 
     async fn read_state(reader: &Reader) -> Result<AppState, AppError> {
@@ -793,114 +815,119 @@ impl App {
         config: AppConfig,
         backup: &AppBackup,
     ) -> Result<App, AppError> {
-        let meta = backup.meta.clone();
-        let invalid = |why: &str| AppError::InvalidData(format!("the backup: {why}"));
-        let cert = AppCert::verify(&backup.cert, &meta.identity)
-            .map_err(|_| invalid("its certificate doesn't verify"))?;
-        if cert.app_id() != meta.app_id || cert.signing_key() != backup.keys.signing_public() {
-            return Err(invalid("its certificate isn't its keys'"));
-        }
-        let own_doc = IdentityDoc::verify(&backup.own_doc, &meta.identity)
-            .map_err(|_| invalid("its identity.json doesn't verify"))?;
-        let mut at = BTreeMap::new();
-        for (seq, hash) in &backup.chain_at {
-            at.insert(
-                *seq,
-                pubky_switch_core::enc::unb64_array::<32>(hash).map_err(|_| invalid("chain"))?,
-            );
-        }
-        let mut batches = BTreeMap::new();
-        for (id, time) in &backup.chain_batches {
-            batches.insert(
-                pubky_switch_core::enc::unb64_array::<16>(id).map_err(|_| invalid("chain"))?,
-                *time,
-            );
-        }
-        let mut chain = ChainView::import(backup.chain.clone(), at, batches)?;
-        // The cursor moves made after the backup are lost with it: missing stubs aren't a
-        // rollback until the service holds a cursor this app moved and it read after that.
-        chain.restore = Some(RestorePending::Cursor);
-        let mut known_kids = BTreeMap::new();
-        for (kid, n) in &backup.known {
-            known_kids.insert(
-                pubky_switch_core::enc::unb64_array::<8>(kid).map_err(|_| invalid("kids"))?,
-                *n,
-            );
-        }
-        let mut departed = BTreeMap::new();
-        for (app, time) in &backup.departed {
-            departed.insert(
-                pubky_switch_core::enc::app_id_decode(app).map_err(|_| invalid("departures"))?,
-                *time,
-            );
-        }
-        let receive_keys: BTreeMap<u64, HeldKey> = backup
-            .receive_keys
-            .iter()
-            .map(|held| (held.key.n, held.clone()))
-            .collect();
-        let n_floor = receive_keys.keys().next_back().copied().unwrap_or(0);
-        let mut cursor = backup.cursor;
-        // The service may hold a later cursor: the first move after the restore is sent.
-        cursor.at_service = 0;
-        cursor.deferred_since_ms = Some(env.clock.now_ms());
-        let state = AppState {
-            meta: meta.clone(),
-            keys: backup.keys.clone(),
-            cert: cert.clone(),
-            renewal: None,
-            record: backup.record.clone(),
-            naming: backup.naming.clone(),
-            scope_keys: ScopeKeys {
-                keys: backup.scope_keys.clone(),
-            },
-            bundle: backup.bundle.clone(),
-            own_doc: own_doc.clone(),
-            receive_keys,
-            known_kids,
-            registrations: BTreeMap::new(),
-            rotation: backup.rotation,
-            device: backup.device,
-            cursor,
-            chain: Some(chain),
-            held: BTreeMap::new(),
-            seen: BTreeSet::new(),
-            asked: BTreeSet::new(),
-            parked: BTreeMap::new(),
-            departed,
-            join: JoinStep::Done,
-            pending_effect: None,
-            pending_record: None,
-            alarm: None,
-            restore: Some(RestoreState {
-                n_floor,
-                key_checked: false,
-                own_key_n: None,
-                reconcile: true,
-            }),
-            leave: None,
-            service_time: None,
-            gone: None,
-        };
-        let ns = client_namespace(&meta.app_id);
-        let client = Self::client_for(&env, &meta, &backup.keys, &cert)?;
-        let mut app = App {
-            env,
-            protocol,
-            config,
-            ns,
-            state,
-            client,
-            reload: false,
-            service_time_dirty: false,
-            events: Vec::new(),
-        };
-        let mut tx = Tx::new(&app.ns);
-        tx.delete_prefix("")?;
-        app.write_all(&mut tx).await?;
-        tx.put(records::LIST_DUE, &true)?;
-        tx.commit(&app.env.store).await?;
-        Ok(app)
+        Box::pin(async move {
+            let meta = backup.meta.clone();
+            let invalid = |why: &str| AppError::InvalidData(format!("the backup: {why}"));
+            let cert = AppCert::verify(&backup.cert, &meta.identity)
+                .map_err(|_| invalid("its certificate doesn't verify"))?;
+            if cert.app_id() != meta.app_id || cert.signing_key() != backup.keys.signing_public() {
+                return Err(invalid("its certificate isn't its keys'"));
+            }
+            let own_doc = IdentityDoc::verify(&backup.own_doc, &meta.identity)
+                .map_err(|_| invalid("its identity.json doesn't verify"))?;
+            let mut at = BTreeMap::new();
+            for (seq, hash) in &backup.chain_at {
+                at.insert(
+                    *seq,
+                    pubky_switch_core::enc::unb64_array::<32>(hash)
+                        .map_err(|_| invalid("chain"))?,
+                );
+            }
+            let mut batches = BTreeMap::new();
+            for (id, time) in &backup.chain_batches {
+                batches.insert(
+                    pubky_switch_core::enc::unb64_array::<16>(id).map_err(|_| invalid("chain"))?,
+                    *time,
+                );
+            }
+            let mut chain = ChainView::import(backup.chain.clone(), at, batches)?;
+            // The cursor moves made after the backup are lost with it: missing stubs aren't a
+            // rollback until the service holds a cursor this app moved and it read after that.
+            chain.restore = Some(RestorePending::Cursor);
+            let mut known_kids = BTreeMap::new();
+            for (kid, n) in &backup.known {
+                known_kids.insert(
+                    pubky_switch_core::enc::unb64_array::<8>(kid).map_err(|_| invalid("kids"))?,
+                    *n,
+                );
+            }
+            let mut departed = BTreeMap::new();
+            for (app, time) in &backup.departed {
+                departed.insert(
+                    pubky_switch_core::enc::app_id_decode(app)
+                        .map_err(|_| invalid("departures"))?,
+                    *time,
+                );
+            }
+            let receive_keys: BTreeMap<u64, HeldKey> = backup
+                .receive_keys
+                .iter()
+                .map(|held| (held.key.n, held.clone()))
+                .collect();
+            let n_floor = receive_keys.keys().next_back().copied().unwrap_or(0);
+            let mut cursor = backup.cursor;
+            // The service may hold a later cursor: the first move after the restore is sent.
+            cursor.at_service = 0;
+            cursor.deferred_since_ms = Some(env.clock.now_ms());
+            let state = AppState {
+                meta: meta.clone(),
+                keys: backup.keys.clone(),
+                cert: cert.clone(),
+                renewal: None,
+                record: backup.record.clone(),
+                naming: backup.naming.clone(),
+                scope_keys: ScopeKeys {
+                    keys: backup.scope_keys.clone(),
+                },
+                bundle: backup.bundle.clone(),
+                own_doc: own_doc.clone(),
+                receive_keys,
+                known_kids,
+                registrations: BTreeMap::new(),
+                rotation: backup.rotation,
+                device: backup.device,
+                cursor,
+                chain: Some(chain),
+                held: BTreeMap::new(),
+                seen: BTreeSet::new(),
+                asked: BTreeSet::new(),
+                parked: BTreeMap::new(),
+                departed,
+                join: JoinStep::Done,
+                pending_effect: None,
+                pending_record: None,
+                alarm: None,
+                restore: Some(RestoreState {
+                    n_floor,
+                    key_checked: false,
+                    own_key_n: None,
+                    reconcile: true,
+                }),
+                leave: None,
+                service_time: None,
+                gone: None,
+            };
+            let ns = client_namespace(&meta.app_id);
+            let client = Self::client_for(&env, &meta, &backup.keys, &cert)?;
+            let mut app = App {
+                env,
+                protocol,
+                config,
+                ns,
+                state,
+                client,
+                reload: false,
+                service_time_dirty: false,
+                events: Vec::new(),
+            };
+            let mut tx = Tx::new(&app.ns);
+            tx.delete_prefix("")?;
+            app.write_all(&mut tx).await?;
+            tx.put(records::LIST_DUE, &true)?;
+            tx.commit(&app.env.store).await?;
+            Ok(app)
+        })
+        .await
     }
 
     /// Every record of the state, after a full delete of the namespace in the same commit.
@@ -1101,26 +1128,36 @@ impl App {
     /// [`Refusal::NotNow`] while a provider loss is followed and the app's evidence isn't
     /// uploaded yet (Switch spec 12.6 step 3); a store failure.
     pub async fn end_reconcile(&mut self, _confirmed: UserConfirmed) -> Result<(), AppError> {
-        self.ready_local().await?;
-        if !self.restore_question().is_empty() {
-            return Err(Refusal::RestoreQuestionOpen.into());
-        }
-        self.refuse_before_upload().await?;
-        let mut tx = self.tx()?;
-        if let Some(restore) = self.state.restore.as_mut() {
-            restore.reconcile = false;
-            tx.put(key::RESTORE, restore)?;
-        }
-        if let Some(chain) = self.state.chain.as_mut() {
-            chain.gap = None;
-            chain.write(&mut tx)?;
-        }
-        self.commit(tx).await
+        Box::pin(async move {
+            self.ready_local().await?;
+            if !self.restore_question().is_empty() {
+                return Err(Refusal::RestoreQuestionOpen.into());
+            }
+            self.refuse_before_upload().await?;
+            let mut tx = self.tx()?;
+            if let Some(restore) = self.state.restore.as_mut() {
+                restore.reconcile = false;
+                tx.put(key::RESTORE, restore)?;
+            }
+            if let Some(chain) = self.state.chain.as_mut() {
+                chain.gap = None;
+                chain.write(&mut tx)?;
+            }
+            self.commit(tx).await
+        })
+        .await
     }
 
     /// Take the events collected since the last call.
     pub fn take_events(&mut self) -> Vec<AppEvent> {
         std::mem::take(&mut self.events)
+    }
+
+    /// The highest service time the app verified, Unix milliseconds (Switch spec 10.1): a
+    /// protocol checks its deadlines against it rather than the device clock. `None` before
+    /// any verified answer.
+    pub fn highest_service_time(&self) -> Option<u64> {
+        self.state.service_time.map(|time| time.highest_ms)
     }
 
     /// A value of the protocol's own local state, under its key space.
@@ -1132,6 +1169,64 @@ impl App {
         self.reader()
             .get_raw(&[PROTOCOL_PREFIX, key].concat())
             .await
+    }
+
+    /// Every value of the protocol's own local state whose key starts with `prefix`, with
+    /// its key in the protocol's key space, in key order.
+    ///
+    /// # Errors
+    ///
+    /// A store failure.
+    pub async fn protocol_scan(
+        &self,
+        prefix: &[u8],
+    ) -> Result<Vec<crate::store::KeyValue>, AppError> {
+        let full = [PROTOCOL_PREFIX, prefix].concat();
+        let mut out = Vec::new();
+        let mut after: Option<Vec<u8>> = None;
+        loop {
+            let page = self
+                .env
+                .store
+                .scan(&self.ns, &full, after.as_deref(), PROTOCOL_SCAN_PAGE)
+                .await?;
+            let more = page.len() >= usize::try_from(PROTOCOL_SCAN_PAGE).unwrap_or(usize::MAX);
+            for (key, value) in page {
+                if let Some(rest) = key.get(PROTOCOL_PREFIX.len()..) {
+                    out.push((rest.to_vec(), value.clone()));
+                }
+                after = Some(key);
+            }
+            if !more {
+                return Ok(out);
+            }
+        }
+    }
+
+    /// Commit writes of the protocol's own local state on their own, in one store commit.
+    /// Writes that go with a batch's outcome go in the batch instead
+    /// ([`OpBatch::local`]), and those of a received message's effect with it
+    /// ([`Effect::local`], [`ReceiveContext::local`]).
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::Left`] once the app deleted its keys; a store failure, after which nothing
+    /// was written.
+    pub async fn protocol_commit(&mut self, writes: &[LocalWrite]) -> Result<(), AppError> {
+        Box::pin(async move {
+            self.ready_local().await?;
+            if self
+                .state
+                .leave
+                .is_some_and(|l| l.keys_deleted_ms.is_some())
+            {
+                return Err(Refusal::Left.into());
+            }
+            let mut tx = self.tx()?;
+            tx.local(writes)?;
+            self.commit(tx).await
+        })
+        .await
     }
 
     // ---------------------------------------------------------------------------------
@@ -1147,16 +1242,19 @@ impl App {
     ///
     /// A failed call; the leave is tried again by the next call to `leave`.
     pub async fn leave(&mut self, mode: LeaveMode) -> Result<LeaveReport, AppError> {
-        self.ready_local().await?;
-        let two_step = matches!(mode, LeaveMode::TwoStep);
-        self.leave_at_service(two_step, false).await?;
-        match mode {
-            LeaveMode::Immediate(_) => {
-                self.destroy_keys().await?;
-                Ok(LeaveReport::Done)
+        Box::pin(async move {
+            self.ready_local().await?;
+            let two_step = matches!(mode, LeaveMode::TwoStep);
+            self.leave_at_service(two_step, false).await?;
+            match mode {
+                LeaveMode::Immediate(_) => {
+                    self.destroy_keys().await?;
+                    Ok(LeaveReport::Done)
+                }
+                LeaveMode::TwoStep => self.finish_leave().await,
             }
-            LeaveMode::TwoStep => self.finish_leave().await,
-        }
+        })
+        .await
     }
 
     /// The second step of a two-step leave: once the own `identity.json` on the Homeserver
@@ -1167,45 +1265,48 @@ impl App {
     ///
     /// [`Refusal::NotNow`] if the app hasn't left; a failed read.
     pub async fn finish_leave(&mut self) -> Result<LeaveReport, AppError> {
-        self.ready_local().await?;
-        let Some(leave) = self.state.leave else {
-            return Err(Refusal::NotNow("the app hasn't left".into()).into());
-        };
-        if leave.left_at_ms.is_none() {
-            return Err(Refusal::NotNow("the leave hasn't reached the service".into()).into());
-        }
-        if leave.keys_deleted_ms.is_some() {
-            return Ok(LeaveReport::Done);
-        }
-        let now = self.now();
-        let seen = match leave.removed_seen_ms {
-            Some(seen) => seen,
-            None => {
-                let identity = self.state.meta.identity;
-                let doc =
-                    identity::read_homeserver(self.env.homeserver.as_ref(), &identity).await?;
-                let removed = doc
-                    .as_ref()
-                    .is_some_and(|d| d.lists_removed(&self.state.meta.app_id));
-                if !removed {
-                    return Ok(LeaveReport::AwaitingRemoval);
-                }
-                let mut tx = self.tx()?;
-                let leave = self.state.leave.get_or_insert_with(LeaveState::default);
-                leave.removed_seen_ms = Some(now);
-                tx.put(key::LEAVE, leave)?;
-                self.commit(tx).await?;
-                now
+        Box::pin(async move {
+            self.ready_local().await?;
+            let Some(leave) = self.state.leave else {
+                return Err(Refusal::NotNow("the app hasn't left".into()).into());
+            };
+            if leave.left_at_ms.is_none() {
+                return Err(Refusal::NotNow("the leave hasn't reached the service".into()).into());
             }
-        };
-        let at = seen.saturating_add(LEAVE_CACHE_MS);
-        if now < at {
-            return Ok(LeaveReport::Removed {
-                delete_keys_at_ms: at,
-            });
-        }
-        self.destroy_keys().await?;
-        Ok(LeaveReport::Done)
+            if leave.keys_deleted_ms.is_some() {
+                return Ok(LeaveReport::Done);
+            }
+            let now = self.now();
+            let seen = match leave.removed_seen_ms {
+                Some(seen) => seen,
+                None => {
+                    let identity = self.state.meta.identity;
+                    let doc =
+                        identity::read_homeserver(self.env.homeserver.as_ref(), &identity).await?;
+                    let removed = doc
+                        .as_ref()
+                        .is_some_and(|d| d.lists_removed(&self.state.meta.app_id));
+                    if !removed {
+                        return Ok(LeaveReport::AwaitingRemoval);
+                    }
+                    let mut tx = self.tx()?;
+                    let leave = self.state.leave.get_or_insert_with(LeaveState::default);
+                    leave.removed_seen_ms = Some(now);
+                    tx.put(key::LEAVE, leave)?;
+                    self.commit(tx).await?;
+                    now
+                }
+            };
+            let at = seen.saturating_add(LEAVE_CACHE_MS);
+            if now < at {
+                return Ok(LeaveReport::Removed {
+                    delete_keys_at_ms: at,
+                });
+            }
+            self.destroy_keys().await?;
+            Ok(LeaveReport::Done)
+        })
+        .await
     }
 
     /// `leave` at the service, once: the intent is committed first, so a crash calls it

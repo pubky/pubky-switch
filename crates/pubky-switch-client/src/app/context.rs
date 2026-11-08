@@ -1,0 +1,405 @@
+//! What a protocol's receive step can do: [`ReceiveContext`] (Switch spec 8.2, 10.2, 10.3).
+//!
+//! An app that processes a message with a lasting effect writes the effect to its shared
+//! record and advances its cursor in one batch (Switch spec 8.2). The context gives the
+//! protocol, while it handles one message, what it needs to build that batch: the record
+//! keys from the naming key, the writes the app holds and their versions, the claim views it
+//! keeps, and the protocol's own local state. The writes the protocol adds go into the
+//! effect's batch with the cursor move:
+//!
+//! - a `record.put` is sealed by the app under the policy's read scope at the current data
+//!   epoch, with `expected_version` the version the app holds (Switch spec 10.3, 13.4);
+//! - a claim entry goes as the protocol built it, with the deadline the app keeps for it
+//!   (Switch wire 6.8);
+//! - local writes commit with the outcome, as [`super::Effect::local`] does.
+//!
+//! The batch is signed and kept before it is sent, and its outcome committed with the
+//! processed pair and the cursor, as every effect is (`STATE.md`). On `409 conflict` the
+//! app reads the records and claims the context wrote again before it hands the message
+//! over once more, so the next effect builds on what the switch holds.
+//!
+//! The protocol's callbacks are synchronous, so the context reads the host's store
+//! synchronously, on the calling thread.
+
+use pubky_switch_core::claims::{ClaimView, EntryKind};
+use pubky_switch_core::ops::{Condition, MAX_BATCH_ENTRIES, OpKind, RecordVersion};
+use pubky_switch_core::records::AppCert;
+
+use super::claims::{ClaimOp, KeptClaim, ObligationDeadline, claim_key_of};
+use super::error::Refusal;
+use super::protocol::LocalWrite;
+use super::records::{
+    Collection, HeldRecord, RecordTarget, SeenMark, SharedRecord, record_key_of, record_put,
+    seen_key,
+};
+use super::state::{PROTOCOL_PREFIX, decode};
+use super::{AppError, AppState};
+use crate::store::{KeyValue, StateStore};
+
+/// The most entries one store scan returns; scans page through larger sets.
+const SCAN_PAGE: u32 = 256;
+
+/// The writes a receive step adds, taken by the app once the protocol returns.
+#[derive(Debug, Default)]
+pub(crate) struct ContextWrites {
+    /// The operations, in the order added.
+    pub(crate) ops: Vec<(Vec<Condition>, OpKind)>,
+    /// The protocol's local writes.
+    pub(crate) local: Vec<LocalWrite>,
+    /// The records written, with their collections, to read again after a conflict.
+    pub(crate) records: Vec<([u8; 32], Collection)>,
+    /// The claims written, to read again after a conflict.
+    pub(crate) claims: Vec<[u8; 32]>,
+    /// The deadlines the app computes itself for the claims written (Switch wire 6.8).
+    pub(crate) deadlines: Vec<([u8; 32], ObligationDeadline)>,
+    /// A write couldn't be built now, such as for want of a scope key: the entry waits.
+    pub(crate) not_now: Option<String>,
+}
+
+/// What a protocol's receive step can read and add to the effect's batch
+/// ([`super::Protocol::receive_with`]). Reads come from the app's store; writes go into the
+/// batch that carries the cursor move, at most 7 operations beside it (Switch wire 6.4).
+pub struct ReceiveContext<'a> {
+    state: &'a AppState,
+    store: &'a dyn StateStore,
+    ns: &'a str,
+    may_attempt: bool,
+    writes: ContextWrites,
+}
+
+impl std::fmt::Debug for ReceiveContext<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ReceiveContext({} operations)", self.writes.ops.len())
+    }
+}
+
+fn store_error(error: crate::error::StoreError) -> AppError {
+    AppError::Store(error)
+}
+
+impl<'a> ReceiveContext<'a> {
+    pub(crate) fn new(
+        state: &'a AppState,
+        store: &'a dyn StateStore,
+        ns: &'a str,
+        may_attempt: bool,
+    ) -> Self {
+        Self {
+            state,
+            store,
+            ns,
+            may_attempt,
+            writes: ContextWrites::default(),
+        }
+    }
+
+    pub(crate) fn into_writes(self) -> ContextWrites {
+        self.writes
+    }
+
+    // ---------------------------------------------------------------------------------
+    // The app
+
+    /// The identity.
+    pub fn identity(&self) -> [u8; 32] {
+        self.state.meta.identity
+    }
+
+    /// The App ID.
+    pub fn app_id(&self) -> [u8; 16] {
+        self.state.meta.app_id
+    }
+
+    /// The certificate the app presents.
+    pub fn cert(&self) -> &AppCert {
+        &self.state.cert
+    }
+
+    /// The data epoch of the newest own `identity.json`, the one writes are sealed at.
+    pub fn data_epoch(&self) -> u64 {
+        self.state.own_doc.data_epoch()
+    }
+
+    /// The highest service time the app verified, Unix milliseconds (Switch spec 10.1);
+    /// `None` before any verified answer.
+    pub fn highest_service_time(&self) -> Option<u64> {
+        self.state.service_time.map(|time| time.highest_ms)
+    }
+
+    // ---------------------------------------------------------------------------------
+    // Reads
+
+    fn get<T: serde::de::DeserializeOwned>(&self, key: &str) -> Result<Option<T>, AppError> {
+        match self
+            .store
+            .get(self.ns, key.as_bytes())
+            .map_err(store_error)?
+        {
+            None => Ok(None),
+            Some(bytes) => decode(&bytes).map(Some),
+        }
+    }
+
+    /// The record key of `target`, from the naming key and the collection's policy (Switch
+    /// spec 13.3).
+    ///
+    /// # Errors
+    ///
+    /// [`AppError::InvalidData`] for a policy whose write scopes aren't sorted and unique.
+    pub fn record_key(&self, target: &RecordTarget) -> Result<[u8; 32], AppError> {
+        Ok(self.state.naming.record_key(
+            &target.collection.name,
+            &target.natural_key,
+            &target.collection.policy.hash()?,
+        ))
+    }
+
+    fn held(&self, key: &[u8; 32]) -> Result<Option<HeldRecord>, AppError> {
+        self.get(&record_key_of(key))
+    }
+
+    /// The record the app holds at `target`: the newest write it accepted, its version and
+    /// content.
+    ///
+    /// # Errors
+    ///
+    /// A store failure, or a policy that doesn't hash.
+    pub fn record(&self, target: &RecordTarget) -> Result<Option<SharedRecord>, AppError> {
+        let key = self.record_key(target)?;
+        self.record_at(&key)
+    }
+
+    /// The record the app holds at `key`.
+    ///
+    /// # Errors
+    ///
+    /// A store failure.
+    pub fn record_at(&self, key: &[u8; 32]) -> Result<Option<SharedRecord>, AppError> {
+        Ok(self.held(key)?.map(|held| held.shared(key)))
+    }
+
+    /// The protocol's mark of what the app has seen in record `key`, its high water.
+    ///
+    /// # Errors
+    ///
+    /// A store failure.
+    pub fn record_seen(&self, key: &[u8; 32]) -> Result<Option<Vec<u8>>, AppError> {
+        Ok(self.get::<SeenMark>(&seen_key(key))?.map(|mark| mark.mark))
+    }
+
+    /// A `record_version` condition on the version of record `key` the app holds, or the
+    /// version the switch showed for a write the app refused (Switch wire 6.3); `{0, 0}` for
+    /// a record it holds nothing of.
+    ///
+    /// # Errors
+    ///
+    /// A store failure.
+    pub fn record_condition(&self, key: &[u8; 32]) -> Result<Condition, AppError> {
+        let version = self
+            .held(key)?
+            .map_or(RecordVersion::NONE, |held| held.base_version());
+        Ok(Condition::RecordVersion { key: *key, version })
+    }
+
+    /// The newest view the app keeps of the claim `claim_key` (Switch wire 6.8).
+    ///
+    /// # Errors
+    ///
+    /// A store failure, or a kept view that doesn't read.
+    pub fn claim_view(&self, claim_key: &[u8; 32]) -> Result<Option<ClaimView>, AppError> {
+        self.get::<KeptClaim>(&claim_key_of(claim_key))?
+            .map(|kept| kept.view())
+            .transpose()
+    }
+
+    /// A `claim_step` condition on the step of the claim view the app keeps, 0 when it keeps
+    /// none (Switch wire 6.3).
+    ///
+    /// # Errors
+    ///
+    /// As [`ReceiveContext::claim_view`].
+    pub fn claim_condition(&self, claim_key: &[u8; 32]) -> Result<Condition, AppError> {
+        let step = self.claim_view(claim_key)?.map_or(0, |view| view.step);
+        Ok(Condition::ClaimStep {
+            claim_key: *claim_key,
+            step,
+        })
+    }
+
+    /// A value of the protocol's own local state, as committed before this message.
+    ///
+    /// # Errors
+    ///
+    /// A store failure.
+    pub fn local_get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, AppError> {
+        self.store
+            .get(self.ns, &[PROTOCOL_PREFIX, key].concat())
+            .map_err(store_error)
+    }
+
+    /// Every value of the protocol's local state whose key starts with `prefix`, with its
+    /// key in the protocol's key space, in key order, as committed before this message.
+    ///
+    /// # Errors
+    ///
+    /// A store failure.
+    pub fn local_scan(&self, prefix: &[u8]) -> Result<Vec<KeyValue>, AppError> {
+        let full = [PROTOCOL_PREFIX, prefix].concat();
+        let mut out = Vec::new();
+        let mut after: Option<Vec<u8>> = None;
+        loop {
+            let page = self
+                .store
+                .scan(self.ns, &full, after.as_deref(), SCAN_PAGE)
+                .map_err(store_error)?;
+            let more = page.len() >= usize::try_from(SCAN_PAGE).unwrap_or(usize::MAX);
+            for (key, value) in page {
+                if let Some(rest) = key.get(PROTOCOL_PREFIX.len()..) {
+                    out.push((rest.to_vec(), value.clone()));
+                }
+                after = Some(key);
+            }
+            if !more {
+                return Ok(out);
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------------------
+    // Writes
+
+    /// How many operations the effect's batch holds so far.
+    pub fn len(&self) -> usize {
+        self.writes.ops.len()
+    }
+
+    /// Whether the effect's batch holds no operation yet.
+    pub fn is_empty(&self) -> bool {
+        self.writes.ops.is_empty()
+    }
+
+    fn room(&self) -> Result<(), AppError> {
+        if self.writes.ops.len() >= MAX_BATCH_ENTRIES.saturating_sub(1) {
+            return Err(Refusal::Usage(
+                "Switch wire 6.4: an effect holds at most 7 operations beside the cursor".into(),
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    /// Write `value` at `target` in the effect's batch, with `conditions`: compare-and-swap
+    /// on the version the app holds, or a create, sealed under the read scope's key at the
+    /// current data epoch (Switch spec 10.3). Returns the record key.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::Usage`] when the certificate holds none of the write scopes, the record is
+    /// written already in this batch (Switch wire 6.2), or the batch is full;
+    /// [`Refusal::NotNow`] while the app lacks the read scope's key at the current data
+    /// epoch: the message then waits, whatever the protocol returns, and is handed over
+    /// again at a later read; a store failure.
+    pub fn put_record(
+        &mut self,
+        target: &RecordTarget,
+        value: &[u8],
+        conditions: Vec<Condition>,
+    ) -> Result<[u8; 32], AppError> {
+        self.write_record(target, Some(value), conditions)
+    }
+
+    /// Delete the record at `target` in the effect's batch: a write whose sealed value is
+    /// empty (Switch spec 10.3). Returns the record key.
+    ///
+    /// # Errors
+    ///
+    /// As [`ReceiveContext::put_record`].
+    pub fn delete_record(
+        &mut self,
+        target: &RecordTarget,
+        conditions: Vec<Condition>,
+    ) -> Result<[u8; 32], AppError> {
+        self.write_record(target, None, conditions)
+    }
+
+    fn write_record(
+        &mut self,
+        target: &RecordTarget,
+        value: Option<&[u8]>,
+        conditions: Vec<Condition>,
+    ) -> Result<[u8; 32], AppError> {
+        self.room()?;
+        let key = self.record_key(target)?;
+        if self.writes.records.iter().any(|(k, _)| *k == key) {
+            return Err(
+                Refusal::Usage("Switch wire 6.2: one write per record per batch".into()).into(),
+            );
+        }
+        let held = self.held(&key)?;
+        let put = match record_put(self.state, target, value, held.as_ref()) {
+            Ok(put) => put,
+            Err(AppError::Refused(Refusal::NotNow(why))) => {
+                self.writes.not_now = Some(why.clone());
+                return Err(Refusal::NotNow(why).into());
+            }
+            Err(error) => return Err(error),
+        };
+        self.writes.ops.push((conditions, OpKind::RecordPut(put)));
+        self.writes.records.push((key, target.collection.clone()));
+        Ok(key)
+    }
+
+    /// Add a claim entry to the effect's batch, with `conditions`, and the deadline the app
+    /// computes itself for the obligation (Switch wire 6.8). An `attempt` passes the checks
+    /// of [`super::App::may_attempt`] first, and its proof is checked once the batch is
+    /// applied (Switch wire 6.5 "Binding").
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::Usage`] when the batch is full; [`Refusal::NotNow`] for an `attempt`
+    /// while the app may not attempt.
+    pub fn claim(
+        &mut self,
+        op: ClaimOp,
+        conditions: Vec<Condition>,
+        deadline: ObligationDeadline,
+    ) -> Result<(), AppError> {
+        self.room()?;
+        if matches!(op.entry().kind, EntryKind::Attempt { .. }) && !self.may_attempt {
+            return Err(
+                Refusal::NotNow("Switch spec 12.4: the app makes no attempt now".into()).into(),
+            );
+        }
+        let claim_key = op.entry().claim_key;
+        self.writes.ops.push((conditions, op.kind()));
+        if !self.writes.claims.contains(&claim_key) {
+            self.writes.claims.push(claim_key);
+        }
+        self.writes.deadlines.retain(|(k, _)| *k != claim_key);
+        self.writes.deadlines.push((claim_key, deadline));
+        Ok(())
+    }
+
+    /// Add another operation to the effect's batch, as the protocol built it.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::Usage`] when the batch is full, or for a `record.put` or a claim entry,
+    /// which go through [`ReceiveContext::put_record`] and [`ReceiveContext::claim`].
+    pub fn op(&mut self, conditions: Vec<Condition>, kind: OpKind) -> Result<(), AppError> {
+        self.room()?;
+        if matches!(kind, OpKind::RecordPut(_) | OpKind::Claim(_)) {
+            return Err(Refusal::Usage(
+                "a record write or claim entry goes through put_record or claim".into(),
+            )
+            .into());
+        }
+        self.writes.ops.push((conditions, kind));
+        Ok(())
+    }
+
+    /// A write of the protocol's own local state, committed with the outcome.
+    pub fn local(&mut self, write: LocalWrite) {
+        self.writes.local.push(write);
+    }
+}

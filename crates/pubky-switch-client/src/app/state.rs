@@ -382,6 +382,10 @@ pub(crate) struct PendingEffect {
     /// The entry was stored locally before: removing it from `parked` is part of the
     /// outcome.
     pub(crate) parked: bool,
+    /// The deadlines the app computes itself for the claims the batch writes, kept with
+    /// their evidence once it is applied (Switch wire 6.8), by claim key (base64url).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) deadlines: Vec<(String, super::claims::ObligationDeadline)>,
 }
 
 impl std::fmt::Debug for ParkedEntry {

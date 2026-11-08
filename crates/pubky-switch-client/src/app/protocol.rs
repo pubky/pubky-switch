@@ -8,11 +8,13 @@
 //! The trait is object-safe and takes and returns plain owned types, so a binding can
 //! implement it across a language boundary.
 //!
-//! - **Receiving** ([`Protocol::receive`]): the app hands over each message that passed
-//!   checks 1 to 9; the protocol parses the body (check 10) and returns the shared record
-//!   writes and other operations to commit in the same batch as the cursor move, and the
-//!   writes of its own local state to commit with the outcome (Switch spec 8.2: "writes the
-//!   effect to its shared record and advances its cursor in one batch").
+//! - **Receiving** ([`Protocol::receive_with`], or [`Protocol::receive`] for a protocol that
+//!   needs nothing of the app's state): the app hands over each message that passed checks 1
+//!   to 9; the protocol parses the body (check 10) and adds, through the
+//!   [`ReceiveContext`], the shared record writes and claim entries the app builds and signs
+//!   for it, all committed in the same batch as the cursor move, and the writes of its own
+//!   local state to commit with the outcome (Switch spec 8.2: "writes the effect to its
+//!   shared record and advances its cursor in one batch").
 //! - **Re-sends** ([`Protocol::resend_needed`], [`Protocol::missed`]): the kind that asks a
 //!   counterparty to send again is a protocol's (Switch spec 11), so the app hands over
 //!   what it needs and the protocol queues its request with the local writes it returns.
@@ -27,6 +29,7 @@ use pubky_switch_core::receive::KindRules;
 use pubky_switch_core::records::{AppCert, AppRecord, Standing};
 use serde_json::Value;
 
+use super::context::ReceiveContext;
 use super::records::Collection;
 use super::recovery::{LossActions, ProviderLoss};
 use super::send::{RecordJob, SentMessage};
@@ -112,12 +115,14 @@ impl std::fmt::Debug for LocalWrite {
 }
 
 /// What a received message does: the operations committed in one batch with the cursor
-/// move, and the protocol's local writes committed with the outcome.
+/// move, and the protocol's local writes committed with the outcome. The writes added
+/// through the [`ReceiveContext`] come first, then these.
 #[derive(Clone, Debug, Default)]
 pub struct Effect {
-    /// Signed by the app and sent in one batch with the cursor move: at most 7, the cursor
-    /// taking the eighth entry (Switch wire 6.4). Empty when the message has no lasting
-    /// effect, or another own app applied it already: only the cursor moves.
+    /// Signed by the app and sent in one batch with the cursor move, after the context's:
+    /// at most 7 in all, the cursor taking the eighth entry (Switch wire 6.4). Empty, with
+    /// nothing added through the context, when the message has no lasting effect, or another
+    /// own app applied it already: only the cursor moves.
     pub ops: Vec<(Vec<Condition>, OpKind)>,
     /// The protocol's local writes, committed once the batch is answered, with the
     /// processed pair and the cursor.
@@ -213,8 +218,28 @@ pub trait Protocol: Send + Sync {
     /// what its scopes receive (Switch spec 3.4).
     fn accepts(&self, cert: &AppCert) -> Vec<String>;
 
-    /// Check 10 and the effect of a message that passed checks 1 to 9.
-    fn receive(&self, message: &ReceivedMessage) -> Outcome;
+    /// Check 10 and the effect of a message that passed checks 1 to 9, for a protocol that
+    /// needs nothing of the app's state: [`Protocol::receive_with`] calls it by default. A
+    /// protocol that implements [`Protocol::receive_with`] need not implement this one; by
+    /// default it drops every message.
+    fn receive(&self, message: &ReceivedMessage) -> Outcome {
+        let _ = message;
+        Outcome::Drop {
+            reason: "the protocol takes no messages".into(),
+        }
+    }
+
+    /// Check 10 and the effect of a message that passed checks 1 to 9, with the app's
+    /// state at hand (Switch spec 8.2): `cx` derives record keys, reads the writes the app
+    /// holds and the claims it keeps, and adds record writes and claim entries to the
+    /// effect's batch, which carries the cursor move. What `cx` added goes only with
+    /// [`Outcome::Apply`]; a [`Outcome::Drop`] discards it. After `409 conflict` on the
+    /// batch the app reads the records and claims `cx` wrote again and calls this once
+    /// more, with [`ReceivedMessage::conflict`] set. [`Protocol::receive`] by default.
+    fn receive_with(&self, message: &ReceivedMessage, cx: &mut ReceiveContext<'_>) -> Outcome {
+        let _ = cx;
+        self.receive(message)
+    }
 
     /// Entries the app can't read: the protocol queues its re-send request and returns the
     /// local writes that queue it, committed with the cursor passing the entries.

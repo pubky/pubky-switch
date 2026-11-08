@@ -20,16 +20,18 @@
 //! as a retry (Switch spec 6.4; Switch wire 2.1, 6.4 step 5).
 
 use pubky_switch_core::chain::TransitionProof;
-use pubky_switch_core::claims::{ClaimType, ClaimView, EntryKind};
+use pubky_switch_core::claims::{ClaimEntry, ClaimType, ClaimView, EntryKind};
 use pubky_switch_core::enc::{b64, serde_b64_vec};
 use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::ops::{Condition, MAX_BATCH_ENTRIES, OpKind, RecordVersion, SignedOp};
 use serde::{Deserialize, Serialize};
 
-use super::claims::ObligationDeadline;
+use super::claims::{ClaimOp, ObligationDeadline};
 use super::error::{Refusal, refused_for_good};
 use super::events::AppEvent;
+use super::protocol::LocalWrite;
 use super::recovery::LossStep;
+use super::send::{OutboxItem, SignedMessage};
 use super::state::{Tx, key};
 use super::{App, AppError};
 use crate::client::{Batch, Submitted};
@@ -49,6 +51,8 @@ pub struct OpBatch {
     ops: Vec<(Vec<Condition>, OpKind)>,
     invites: Vec<InviteNote>,
     deadlines: Vec<([u8; 32], ObligationDeadline)>,
+    local: Vec<LocalWrite>,
+    queued: Vec<SignedMessage>,
 }
 
 /// An invite code registered in a batch, kept by the app once the switch takes it.
@@ -108,6 +112,30 @@ impl OpBatch {
         self
     }
 
+    /// A write of the protocol's own local state, committed once the switch applies the
+    /// batch, with what its answer settles; never if the batch is refused (`STATE.md`).
+    pub fn local(mut self, write: LocalWrite) -> Self {
+        self.local.push(write);
+        self
+    }
+
+    /// Writes of the protocol's own local state, as [`OpBatch::local`].
+    pub fn locals(mut self, writes: impl IntoIterator<Item = LocalWrite>) -> Self {
+        self.local.extend(writes);
+        self
+    }
+
+    /// A message signed by [`App::sign_message`], put in the outbox once the switch applies
+    /// the batch, with what its answer settles (Switch spec 8.2, 11). The batch is kept with
+    /// it before it is first sent, so a crash never loses the message once the batch may
+    /// have been applied; a batch refused for good queues nothing, and the caller may put
+    /// the same signed message in the batch it builds again. The outbox then delivers it
+    /// ([`App::flush_outbox`], [`App::flush_message`]).
+    pub fn queue(mut self, message: SignedMessage) -> Self {
+        self.queued.push(message);
+        self
+    }
+
     pub(crate) fn invite(mut self, code_hash: &[u8; 32], code: &str) -> Self {
         self.invites.push(InviteNote {
             code_hash: b64(code_hash),
@@ -139,12 +167,18 @@ impl OpBatch {
 
 /// A batch signed and kept before it is first sent: its exact body and what its answer
 /// settles. Its `Debug` shows no content.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub(crate) struct PendingBatch {
     #[serde(with = "serde_b64_vec")]
     pub(crate) body: Vec<u8>,
     pub(crate) invites: Vec<InviteNote>,
     pub(crate) deadlines: Vec<(String, ObligationDeadline)>,
+    /// The protocol's local writes, committed with the answer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) local: Vec<LocalWrite>,
+    /// The messages put in the outbox with the answer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) queued: Vec<OutboxItem>,
 }
 
 impl std::fmt::Debug for PendingBatch {
@@ -156,7 +190,10 @@ impl std::fmt::Debug for PendingBatch {
 impl App {
     /// Sign `batch` once, keep it, send it, and commit what its answer settles (module
     /// docs). The app's deferred cursor move rides along when there is room for it (Switch
-    /// spec 8.2). The batches kept from earlier calls are sent first.
+    /// spec 8.2). The batches kept from earlier calls are sent first. Each own `attempt` in
+    /// the batch gets the checks of its proof once the switch applied it (Switch wire 6.5
+    /// "Binding", 6.8 "Deadline"), as [`App::check_attempt`] gives them: only an attempt
+    /// that passes them may be carried out.
     ///
     /// # Errors
     ///
@@ -168,8 +205,19 @@ impl App {
     /// (the network, `429`, `503`, an answer that doesn't verify), after which the batch is
     /// kept and sent again, the same bytes, by the next call that writes. A batch kept from
     /// an earlier call that still can't be sent fails the call the same way, before the new
-    /// batch is signed.
+    /// batch is signed. [`AppError::InvalidData`] when an attempt's proof shows another
+    /// state: the batch was applied and its outcome committed, and the attempt is written
+    /// `failed`; a rollback for an attempt stamped at or after its deadline.
     pub async fn submit_batch(&mut self, batch: OpBatch) -> Result<Submitted, AppError> {
+        Box::pin(async move { Ok(self.submit_checked(batch).await?.0) }).await
+    }
+
+    /// [`App::submit_batch`], with the claim view each own `attempt`'s proof shows, in the
+    /// batch's order.
+    pub(crate) async fn submit_checked(
+        &mut self,
+        batch: OpBatch,
+    ) -> Result<(Submitted, Vec<ClaimView>), AppError> {
         self.ready_local().await?;
         self.refuse_when_stopped()?;
         self.refuse_before_upload().await?;
@@ -184,14 +232,72 @@ impl App {
             })) => {}
             Err(error) => return Err(error),
         }
-        let attempts = batch
+        let attempts: Vec<(usize, ClaimEntry)> = batch
             .ops
             .iter()
-            .any(|(_, kind)| matches!(kind, OpKind::Claim(c) if c.kind == ClaimType::Attempt));
-        if attempts {
+            .enumerate()
+            .filter_map(|(index, (_, kind))| match kind {
+                OpKind::Claim(c) if c.kind == ClaimType::Attempt => {
+                    c.check().ok().map(|entry| (index, entry))
+                }
+                _ => None,
+            })
+            .collect();
+        if !attempts.is_empty() {
             self.may_attempt(false)?;
         }
-        self.submit_new(batch).await
+        let submitted = self.submit_new(batch).await?;
+        let mut views = Vec::new();
+        let mut refused = Vec::new();
+        for (index, entry) in &attempts {
+            let proof = submitted.proofs.get(*index).ok_or_else(|| {
+                AppError::InvalidData(
+                    "Switch wire 6.5: an attempt answered without its proof".into(),
+                )
+            })?;
+            match self.check_own_attempt(entry, proof).await? {
+                Ok(view) => views.push(view),
+                Err(reason) => refused.push(reason),
+            }
+        }
+        if let Some(reason) = refused.first() {
+            return Err(AppError::InvalidData(format!(
+                "the attempt's proof shows another state; written failed: {reason}"
+            )));
+        }
+        Ok((submitted, views))
+    }
+
+    /// The checks of an own `attempt`'s proof (Switch wire 6.5 "Binding", 6.8 "Deadline"),
+    /// for a batch the protocol sent another way: the proof binds the operation, is of the
+    /// generation the own `identity.json` names, before the attempt's deadline, and shows the
+    /// app's own open attempt. Only then may the protocol carry the attempt out.
+    /// [`App::submit_batch`] and [`App::write_claim`] give these checks to their own
+    /// attempts.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::Usage`] for an entry other than an `attempt`; a rollback for a proof
+    /// stamped at or after the deadline; [`AppError::InvalidData`] for a proof that shows
+    /// another state, after which the attempt is written `failed`.
+    pub async fn check_attempt(
+        &mut self,
+        op: &ClaimOp,
+        proof: &TransitionProof,
+    ) -> Result<ClaimView, AppError> {
+        Box::pin(async move {
+            self.ready_local().await?;
+            if !matches!(op.entry().kind, EntryKind::Attempt { .. }) {
+                return Err(Refusal::Usage("only an attempt's proof is checked so".into()).into());
+            }
+            match self.check_own_attempt(op.entry(), proof).await? {
+                Ok(view) => Ok(view),
+                Err(reason) => Err(AppError::InvalidData(format!(
+                    "the attempt's proof shows another state; written failed: {reason}"
+                ))),
+            }
+        })
+        .await
     }
 
     /// Sign `batch` once, keep it, send it and commit its outcome, without sending the
@@ -205,6 +311,11 @@ impl App {
         let carry = (batch.ops.len() < MAX_BATCH_ENTRIES)
             .then_some(self.state.cursor.seq)
             .filter(|_| self.state.cursor.deferred_since_ms.is_some());
+        let queued = batch
+            .queued
+            .iter()
+            .map(|message| self.outbox_item(message))
+            .collect::<Result<Vec<_>, _>>()?;
         let signed = self.sign_ops(batch.ops, carry)?;
         let id = signed
             .id()
@@ -217,6 +328,8 @@ impl App {
                 .iter()
                 .map(|(claim_key, deadline)| (b64(claim_key), *deadline))
                 .collect(),
+            local: batch.local,
+            queued,
         };
         let mut tx = self.tx()?;
         tx.put(&pending_key(&id), &pending)?;
@@ -256,7 +369,7 @@ impl App {
                 .map_err(|_| AppError::Store(crate::error::StoreError::Corrupt))?;
             let batch = self.without_stale_cursor(Batch::from_body(pending.body.clone())?)?;
             match self.run_pending(&id, &pending, &batch).await {
-                Ok(submitted) => self.check_resumed_attempts(&batch, &submitted).await?,
+                Ok(submitted) => self.check_attempts_of(&batch, &submitted).await?,
                 Err(error) => match refused_for_good(&error) {
                     Some(code) => self.events.push(AppEvent::BatchRefused {
                         batch_id: id,
@@ -269,9 +382,10 @@ impl App {
         Ok(())
     }
 
-    /// The attempts of a batch sent again: their proofs get the checks
-    /// [`App::write_claim`] gives its own (Switch wire 6.5 "Binding", 6.8 "Deadline").
-    async fn check_resumed_attempts(
+    /// The own attempts of a batch sent again, or of a received message's effect: their
+    /// proofs get the checks [`App::submit_batch`] gives its own (Switch wire 6.5
+    /// "Binding", 6.8 "Deadline"); one that fails them is written `failed` and reported.
+    pub(crate) async fn check_attempts_of(
         &mut self,
         batch: &Batch,
         submitted: &Submitted,
@@ -338,6 +452,7 @@ impl App {
             let proof = submitted.proofs.get(index);
             self.settle_op(op, proof, pending, &mut tx).await?;
         }
+        self.settle_kept_writes(pending, &mut tx).await?;
         tx.delete(&pending_key(id))?;
         tx.put(key::CURSOR, &self.state.cursor)?;
         if let Some(chain) = self.state.chain.as_mut() {
@@ -347,8 +462,25 @@ impl App {
         Ok(submitted)
     }
 
+    /// The writes a kept batch carries for its outcome: the protocol's local writes, and
+    /// the messages it puts in the outbox, each once: one the outbox holds already, or that
+    /// was sent, is left as it is (`STATE.md`).
+    async fn settle_kept_writes(
+        &self,
+        pending: &PendingBatch,
+        tx: &mut Tx,
+    ) -> Result<(), AppError> {
+        tx.local(&pending.local)?;
+        for item in &pending.queued {
+            if !self.knows_message(item.msg_id()).await? {
+                super::send::put_outbox_item(tx, item)?;
+            }
+        }
+        Ok(())
+    }
+
     /// What one answered operation settles, written to `tx`.
-    async fn settle_op(
+    pub(crate) async fn settle_op(
         &mut self,
         op: &SignedOp,
         proof: Option<&TransitionProof>,
@@ -465,6 +597,7 @@ impl App {
         for op in batch.ops() {
             self.settle_op(op, None, pending, tx).await?;
         }
+        self.settle_kept_writes(pending, tx).await?;
         tx.delete(&pending_key(id))
     }
 
@@ -525,6 +658,7 @@ mod tests {
                 code: "secret-code".into(),
             }],
             deadlines: Vec::new(),
+            ..PendingBatch::default()
         };
         let text = format!("{pending:?} {:?}", pending.invites);
         assert!(!text.contains("secret"), "{text}");

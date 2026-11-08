@@ -29,6 +29,7 @@ use crate::clock::{Clock, TestClock};
 use crate::error::TransportError;
 use crate::transport::{Header, MockTransport, Request, Response};
 
+mod inbox;
 mod shared;
 
 pub use shared::HeldRecord;
@@ -50,6 +51,8 @@ pub(crate) enum Item {
         accepted_at: u64,
         envelope: Vec<u8>,
         targets: Vec<[u8; 16]>,
+        /// The context of the invite code that admitted it.
+        context: Option<Value>,
     },
     Chain {
         seq: u64,
@@ -192,6 +195,20 @@ pub(crate) struct Inner {
     pub(crate) feed_limit: Option<u64>,
     /// The bodies of the requests an `Unreachable` fault failed.
     pub(crate) unreached: Vec<Vec<u8>>,
+    /// The peer copies of other identities' `identity.json` (Switch wire 7.4.5).
+    pub(crate) peers: HashMap<[u8; 32], IdentityDoc>,
+    /// The answers to appends, by sender and envelope, for retries by content.
+    pub(crate) appended: HashMap<([u8; 32], Vec<u8>), Value>,
+    /// The `apps_version`: it moves when an app becomes reachable or stops being so.
+    pub(crate) apps_version: u64,
+    /// The `apps_version` at which each reachable app became reachable.
+    pub(crate) reachable_since: BTreeMap<[u8; 16], u64>,
+    /// The app each kid registered belongs to.
+    pub(crate) kids: HashMap<[u8; 8], [u8; 16]>,
+    /// Every sender is admitted, whatever the lists say.
+    pub(crate) open_admission: bool,
+    /// The `directory_version`: it moves whenever the directory changes.
+    pub(crate) directory_version: u64,
 }
 
 impl Inner {
@@ -231,6 +248,13 @@ impl Inner {
             feed_reads: 0,
             feed_limit: None,
             unreached: Vec::new(),
+            peers: HashMap::new(),
+            appended: HashMap::new(),
+            apps_version: 1,
+            reachable_since: BTreeMap::new(),
+            kids: HashMap::new(),
+            open_admission: false,
+            directory_version: 1,
         }
     }
 }
@@ -349,6 +373,12 @@ impl ScriptedSwitch {
         next.staged = true;
         // The import carries the shared state with the rest of the account.
         next.shared = inner.shared.clone();
+        next.peers = inner.peers.clone();
+        next.apps_version = inner.apps_version;
+        next.reachable_since = inner.reachable_since.clone();
+        next.kids = inner.kids.clone();
+        next.open_admission = inner.open_admission;
+        next.directory_version = inner.directory_version;
         Arc::new(Self {
             inner: Mutex::new(next),
         })
@@ -397,6 +427,7 @@ impl ScriptedSwitch {
     pub fn revoke(&self, app: [u8; 16]) -> Result<(), ScriptError> {
         let mut inner = self.lock();
         inner.apps.entry(app).or_default().departed = true;
+        inner.unreachable(&app);
         inner.push.remove(&app);
         let at = inner.now();
         inner.service_transition(ServiceTransition::Revoke { app_id: app, at })?;
@@ -517,6 +548,17 @@ impl ScriptedSwitch {
             .header(header::APP)
             .and_then(|text| app_id_decode(text).ok());
         let rest = path.splitn(4, '/').nth(3).unwrap_or_default().to_owned();
+        let account = inner.identity.public();
+        if let Some(sender) = inbox::Sender::foreign(request, &account) {
+            // An app of another identity: the routes a sender calls (Switch wire 7.2).
+            let (status, body) = inner
+                .route_foreign(request, &sender, &rest)
+                .map_err(|error| TransportError::Other(format!("scripted switch: {error}")))?;
+            if lose {
+                return Err(TransportError::Timeout);
+            }
+            return Ok(inner.respond(request, status, &body));
+        }
         let answer = match inner.route_shared(request, caller, &rest) {
             Ok(Some(answer)) => Ok(answer),
             Ok(None) => inner.route(request, caller, &rest),
@@ -563,6 +605,7 @@ impl ScriptedSwitch {
             None,
         )?;
         inner.doc = Some(doc.clone());
+        inner.directory_version += 1;
         Ok(())
     }
 
@@ -653,6 +696,7 @@ impl ScriptedSwitch {
             accepted_at,
             envelope,
             targets: to.to_vec(),
+            context: None,
         });
         seq
     }
@@ -771,6 +815,14 @@ impl ScriptedSwitch {
 impl Inner {
     fn now(&self) -> u64 {
         self.clock.now_ms()
+    }
+
+    /// `app` departed: it stops being reachable (Switch wire 7.4.10).
+    fn unreachable(&mut self, app: &[u8; 16]) {
+        self.directory_version += 1;
+        if self.reachable_since.remove(app).is_some() {
+            self.apps_version += 1;
+        }
     }
 
     fn next_seq(&mut self) -> u64 {
@@ -932,6 +984,7 @@ impl Inner {
                     let entry = self.apps.entry(app).or_default();
                     entry.record = Some(record.clone());
                     entry.cert = cert;
+                    self.directory_version += 1;
                     ProofState::App { app_id: app }
                 }
                 OpKind::ReceiveKeyPut { record } => {
@@ -946,8 +999,16 @@ impl Inner {
                             .ok_or_else(|| missing("a receive key record without kid"))?,
                     )?;
                     let entry = self.apps.entry(app).or_default();
+                    let first = entry.receive_key.is_none() && !entry.departed;
                     entry.receive_key = Some(record.clone());
                     entry.receive_n = Some(n);
+                    self.kids.insert(kid, app);
+                    self.directory_version += 1;
+                    if first {
+                        // The app becomes reachable (Switch wire 7.4.10).
+                        self.apps_version += 1;
+                        self.reachable_since.insert(app, self.apps_version);
+                    }
                     ProofState::ReceiveKey { n, kid }
                 }
                 OpKind::KeyBundlePut(put) => {
@@ -1017,6 +1078,7 @@ impl Inner {
         let own_leave = format!("apps/{me}/leave");
         Ok(match (request.method.as_str(), route) {
             ("POST", "ops") => self.ops(caller, &request.body)?,
+            ("POST", "inbox") => self.append(request, None, query)?,
             ("GET", "feed") => self.feed(caller, query),
             ("GET", "directory") => self.directory(),
             ("GET", "identity") => self.identity_answer(),
@@ -1048,6 +1110,7 @@ impl Inner {
                     return Ok(bad(ErrorCode::NotCurrent, "departed", json!({})));
                 }
                 self.apps.entry(app).or_default().departed = true;
+                self.unreachable(&app);
                 let at = self.now();
                 let proof =
                     self.service_transition(ServiceTransition::Leave { app_id: app, at })?;
@@ -1210,13 +1273,19 @@ impl Inner {
                 accepted_at,
                 envelope,
                 targets,
+                context,
             } => {
                 if !targets.contains(&app) {
                     return None;
                 }
-                json!({ "type": "entry", "seq": seq, "entry_id": Self::entry_id(*seq),
-                        "sender": pubky_id(sender), "cert": cert,
-                        "accepted_at": rfc3339(*accepted_at), "envelope": b64(envelope) })
+                let mut value = json!({ "type": "entry", "seq": seq,
+                        "entry_id": Self::entry_id(*seq), "sender": pubky_id(sender),
+                        "cert": cert, "accepted_at": rfc3339(*accepted_at),
+                        "envelope": b64(envelope) });
+                if let Some(context) = context {
+                    value["context"] = context.clone();
+                }
+                value
             }
             Item::Chain {
                 seq,
@@ -1398,7 +1467,8 @@ impl Inner {
         (
             200,
             json!({ "identity": self.doc.as_ref().map(|d| d.signed().clone()),
-                    "apps": apps, "directory_version": self.seq, "apps_version": 1 }),
+                    "apps": apps, "directory_version": self.directory_version,
+                    "apps_version": self.apps_version }),
         )
     }
 }

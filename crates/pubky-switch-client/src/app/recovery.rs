@@ -223,44 +223,49 @@ impl App {
     ///
     /// [`Refusal::Usage`] for an item that doesn't read as such; a store failure.
     pub async fn keep_evidence(&mut self, items: Vec<Evidence>) -> Result<(), AppError> {
-        self.ready_local().await?;
-        let identity = self.state.meta.identity;
-        let mut tx = self.tx()?;
-        for item in items {
-            match item {
-                Evidence::Op { op, cert, proof } => {
-                    let usage = |why: &str| AppError::Refused(Refusal::Usage(why.into()));
-                    let signed = SignedOp::peek(&op)
-                        .map_err(|_| usage("evidence: the operation doesn't read"))?;
-                    let body = signed.body();
-                    if !matches!(body.kind, OpKind::RecordPut(_) | OpKind::Claim(_))
-                        || body.identity != identity
-                    {
-                        return Err(usage(
-                            "evidence: only this identity's record.put and claim entries",
-                        ));
+        Box::pin(async move {
+            self.ready_local().await?;
+            let identity = self.state.meta.identity;
+            let mut tx = self.tx()?;
+            for item in items {
+                match item {
+                    Evidence::Op { op, cert, proof } => {
+                        let usage = |why: &str| AppError::Refused(Refusal::Usage(why.into()));
+                        let signed = SignedOp::peek(&op)
+                            .map_err(|_| usage("evidence: the operation doesn't read"))?;
+                        let body = signed.body();
+                        if !matches!(body.kind, OpKind::RecordPut(_) | OpKind::Claim(_))
+                            || body.identity != identity
+                        {
+                            return Err(usage(
+                                "evidence: only this identity's record.put and claim entries",
+                            ));
+                        }
+                        let writer = AppCert::verify(&cert, &identity)
+                            .map_err(|_| usage("evidence: the certificate doesn't verify"))?;
+                        if body.app_id != Some(writer.app_id()) {
+                            return Err(usage("evidence: the certificate isn't the writer's"));
+                        }
+                        if let Some(proof) = &proof {
+                            TransitionProof::peek(proof)
+                                .map_err(|_| usage("evidence: the proof doesn't read"))?;
+                        }
+                        let hash = op.doc_hash()?;
+                        tx.put(&keys::op(&hash), &KeptOp { op, cert, proof })?;
                     }
-                    let writer = AppCert::verify(&cert, &identity)
-                        .map_err(|_| usage("evidence: the certificate doesn't verify"))?;
-                    if body.app_id != Some(writer.app_id()) {
-                        return Err(usage("evidence: the certificate isn't the writer's"));
+                    Evidence::Proof(proof) => {
+                        TransitionProof::peek(&proof).map_err(|_| {
+                            AppError::Refused(Refusal::Usage(
+                                "evidence: the proof doesn't read".into(),
+                            ))
+                        })?;
+                        tx.put(&keys::proof(&proof.doc_hash()?), &proof)?;
                     }
-                    if let Some(proof) = &proof {
-                        TransitionProof::peek(proof)
-                            .map_err(|_| usage("evidence: the proof doesn't read"))?;
-                    }
-                    let hash = op.doc_hash()?;
-                    tx.put(&keys::op(&hash), &KeptOp { op, cert, proof })?;
-                }
-                Evidence::Proof(proof) => {
-                    TransitionProof::peek(&proof).map_err(|_| {
-                        AppError::Refused(Refusal::Usage("evidence: the proof doesn't read".into()))
-                    })?;
-                    tx.put(&keys::proof(&proof.doc_hash()?), &proof)?;
                 }
             }
-        }
-        self.commit(tx).await
+            self.commit(tx).await
+        })
+        .await
     }
 
     /// Forget evidence the app no longer keeps, such as proofs past their window.
@@ -269,15 +274,18 @@ impl App {
     ///
     /// A store failure.
     pub async fn forget_evidence(&mut self, items: &[Evidence]) -> Result<(), AppError> {
-        self.ready_local().await?;
-        let mut tx = self.tx()?;
-        for item in items {
-            match item {
-                Evidence::Op { op, .. } => tx.delete(&keys::op(&op.doc_hash()?))?,
-                Evidence::Proof(proof) => tx.delete(&keys::proof(&proof.doc_hash()?))?,
+        Box::pin(async move {
+            self.ready_local().await?;
+            let mut tx = self.tx()?;
+            for item in items {
+                match item {
+                    Evidence::Op { op, .. } => tx.delete(&keys::op(&op.doc_hash()?))?,
+                    Evidence::Proof(proof) => tx.delete(&keys::proof(&proof.doc_hash()?))?,
+                }
             }
-        }
-        self.commit(tx).await
+            self.commit(tx).await
+        })
+        .await
     }
 
     /// The kept operations, as uploads: the `record.put`s and the claim entries, those kept
