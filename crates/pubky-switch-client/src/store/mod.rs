@@ -179,12 +179,26 @@ impl std::fmt::Debug for Write {
 ///
 /// Build one with [`WriteBatch::new`] and its methods, which count the batch's size and
 /// refuse a write that would take it over the working sizes, so the host never sees an
-/// oversized batch.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// oversized batch. They keep a running total, so building a batch costs time linear in its
+/// writes.
+#[derive(Clone, Debug, Default)]
 pub struct WriteBatch {
     /// The writes, in order.
     pub writes: Vec<Write>,
+    /// The number of writes the methods counted and their size: the running total. When
+    /// `writes` has another length, it was changed by hand and the size is counted again;
+    /// [`WriteBatch::check_size`], which the store handle runs before every commit, always
+    /// counts it again.
+    counted: (usize, u64),
 }
+
+impl PartialEq for WriteBatch {
+    fn eq(&self, other: &Self) -> bool {
+        self.writes == other.writes
+    }
+}
+
+impl Eq for WriteBatch {}
 
 impl WriteBatch {
     /// An empty batch.
@@ -242,7 +256,12 @@ impl WriteBatch {
                 });
             }
         }
-        let size = self.size().saturating_add(write.size());
+        let held = if self.counted.0 == self.writes.len() {
+            self.counted.1
+        } else {
+            self.size()
+        };
+        let size = held.saturating_add(write.size());
         if size > MAX_BATCH_BYTES {
             return Err(BatchError::BatchTooLarge {
                 size,
@@ -250,6 +269,7 @@ impl WriteBatch {
             });
         }
         self.writes.push(write);
+        self.counted = (self.writes.len(), size);
         Ok(self)
     }
 
@@ -363,6 +383,28 @@ mod tests {
             by_hand.check_size(),
             Err(BatchError::BatchTooLarge { .. })
         ));
+    }
+
+    #[test]
+    fn test_write_batch_running_total_follows_hand_changes() {
+        let mut batch = WriteBatch::new();
+        for n in 0..2_000u32 {
+            batch.delete("ns", n.to_be_bytes().to_vec()).unwrap();
+        }
+        assert_eq!(batch.size(), 2_000 * (2 + 4));
+        // A write added by hand is counted before the next one the methods add.
+        let size = usize::try_from(MAX_VALUE_BYTES).unwrap();
+        batch.writes.push(Write::Put {
+            ns: "ns".into(),
+            key: b"k".to_vec(),
+            value: vec![0; size],
+        });
+        let error = batch.put("ns", b"k".to_vec(), vec![0; size]).unwrap_err();
+        assert!(matches!(error, BatchError::BatchTooLarge { .. }));
+        // Equality looks at the writes only.
+        let mut other = WriteBatch::new();
+        other.writes = batch.writes.clone();
+        assert_eq!(other, batch);
     }
 
     #[test]

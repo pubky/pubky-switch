@@ -202,7 +202,8 @@ pub struct CheckedResponse {
     pub body: Vec<u8>,
     /// `Switch-Server-Time`, the identity's service time, in Unix milliseconds.
     pub server_time_ms: u64,
-    /// `Switch-Head`, verified with the service key, where present.
+    /// `Switch-Head`, where present and verified with the service key; `None` for one that
+    /// doesn't read or verify, which the response signature doesn't cover (Switch wire 7.1).
     pub head: Option<SignedHead>,
 }
 
@@ -212,15 +213,19 @@ pub struct CheckedResponse {
 /// key signed for `account` (Switch wire 6.7). An error status is read into
 /// [`ClientError::Switch`].
 ///
+/// The response signature doesn't cover `Switch-Head` (Switch wire 7.1), so anything on the
+/// way may change or add one: a header head that doesn't read or doesn't verify is ignored,
+/// never evidence against the service. The heads the chain view checks come from the
+/// signed bodies.
+///
 /// `request_signature` is the 64 bytes of the request's `Switch-Signature`, `None` for a
 /// request without one.
 ///
 /// # Errors
 ///
 /// [`ClientError::BadServiceSignature`] for a signature that is missing or doesn't verify,
-/// [`ClientError::InvalidResponse`] for a server time or head that doesn't read,
-/// [`ClientError::Chain`] for a head the key didn't sign, and [`ClientError::Switch`] for an
-/// error answer.
+/// [`ClientError::InvalidResponse`] for a server time that doesn't read, and
+/// [`ClientError::Switch`] for an error answer.
 pub fn check_response(
     service_key: &[u8; 32],
     account: &[u8; 32],
@@ -249,16 +254,10 @@ pub fn check_response(
     let server_time_ms = parse_rfc3339(server_time).map_err(|_| {
         ClientError::InvalidResponse("Switch wire 7.1: Switch-Server-Time doesn't parse".into())
     })?;
-    let head = match response.header(header::HEAD) {
-        None => None,
-        Some(text) => {
-            let head = SignedHead::from_header(text).map_err(|_| {
-                ClientError::InvalidResponse("Switch wire 6.7: Switch-Head doesn't read".into())
-            })?;
-            verify_head(&head, service_key, account)?;
-            Some(head)
-        }
-    };
+    let head = response
+        .header(header::HEAD)
+        .and_then(|text| SignedHead::from_header(text).ok())
+        .filter(|head| verify_head(head, service_key, account).is_ok());
     if !(200..300).contains(&status) {
         return Err(parse_error(status, &response.body));
     }

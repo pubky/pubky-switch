@@ -358,22 +358,79 @@ async fn test_head_header_is_verified() {
         chain_hash: [2; 32],
     };
     let good = SignedHead::sign(&service_key(), &account, &tip);
+    let key = service_key();
+    let transport = Arc::new(MockTransport::with_handler(move |request| {
+        let mut response = respond(&key, request, 200, br#"{"pending":true}"#);
+        response
+            .headers
+            .push(Header::new(header::HEAD, &good.to_header()));
+        Ok(response)
+    }));
+    let client = client_with(app(), Some(service_public()), transport);
+    client.connect().await.unwrap();
+    // The head is kept only when it verifies with the service key.
+    let response = |head: &str| {
+        let bytes = br#"{"pending":true}"#;
+        let server_time = rfc3339(NOW);
+        let signature = sign_response(&service_key(), 200, None, &server_time, bytes);
+        Response {
+            status: 200,
+            headers: vec![
+                Header::new(header::SERVICE_SIGNATURE, &b64(&signature)),
+                Header::new(header::SERVER_TIME, &server_time),
+                Header::new(header::HEAD, head),
+            ],
+            body: bytes.to_vec(),
+        }
+    };
+    let checked = check_response(
+        &service_public(),
+        &account,
+        None,
+        &response(&good.to_header()),
+    );
+    assert_eq!(checked.unwrap().head, Some(good));
+}
+
+#[tokio::test]
+async fn test_head_header_that_fails_is_ignored() {
+    // The response signature doesn't cover `Switch-Head` (Switch wire 7.1): a proxy may add
+    // or change one, so a head that doesn't verify or doesn't read is ignored, never an
+    // error the app could take as evidence against the service.
+    let account = identity().public();
+    let tip = ChainTip {
+        generation: 1,
+        seq: 3,
+        chain_hash: [2; 32],
+    };
     let forged = SignedHead::sign(&SigningKey::from_bytes(&[6; 32]), &account, &tip);
-    for (head, ok) in [(good, true), (forged, false)] {
+    for head in [forged.to_header(), "not a head".to_owned()] {
         let key = service_key();
+        let header_value = head.clone();
         let transport = Arc::new(MockTransport::with_handler(move |request| {
             let mut response = respond(&key, request, 200, br#"{"pending":true}"#);
             response
                 .headers
-                .push(Header::new(header::HEAD, &head.to_header()));
+                .push(Header::new(header::HEAD, &header_value));
             Ok(response)
         }));
         let client = client_with(app(), Some(service_public()), transport);
         let result = client.connect().await;
-        assert_eq!(result.is_ok(), ok, "{result:?}");
-        if !ok {
-            assert!(matches!(result, Err(ClientError::Chain(_))));
-        }
+        assert!(result.is_ok(), "{head}: {result:?}");
+        let bytes = br#"{"pending":true}"#;
+        let server_time = rfc3339(NOW);
+        let signature = sign_response(&service_key(), 200, None, &server_time, bytes);
+        let response = Response {
+            status: 200,
+            headers: vec![
+                Header::new(header::SERVICE_SIGNATURE, &b64(&signature)),
+                Header::new(header::SERVER_TIME, &server_time),
+                Header::new(header::HEAD, &head),
+            ],
+            body: bytes.to_vec(),
+        };
+        let checked = check_response(&service_public(), &account, None, &response).unwrap();
+        assert_eq!(checked.head, None);
     }
 }
 

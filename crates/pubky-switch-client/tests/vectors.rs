@@ -490,7 +490,8 @@ fn test_vectors_http_responses_checked_with_the_pinned_key() {
             check_response(&public, &account, Some(&[0; 64]), &response),
             Err(ClientError::BadServiceSignature { .. })
         ));
-        // A head is checked for the account it names.
+        // A head is checked for the account it names; one that doesn't verify is ignored,
+        // as the response signature doesn't cover it (wire 7.1).
         if header_of(r, header::HEAD).is_some() {
             let other = keys.identity("bob").public();
             let account = if other == account {
@@ -498,10 +499,12 @@ fn test_vectors_http_responses_checked_with_the_pinned_key() {
             } else {
                 other
             };
-            assert!(matches!(
-                check_response(&public, &account, request_signature.as_ref(), &response),
-                Err(ClientError::Chain(_))
-            ));
+            let checked = check_response(&public, &account, request_signature.as_ref(), &response);
+            assert!(
+                matches!(&checked, Ok(c) if c.head.is_none())
+                    || matches!(&checked, Err(ClientError::Switch { .. })),
+                "{name}: {checked:?}"
+            );
         }
     }
 }

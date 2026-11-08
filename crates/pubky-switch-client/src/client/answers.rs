@@ -624,40 +624,72 @@ pub struct Directory {
     /// For an app of another identity, the version of its identity's `identity.json` the
     /// service holds.
     pub known_version: Option<u64>,
+    /// The App IDs of the entries left out of `apps`: a record or receive key record that
+    /// doesn't verify, or an App ID listed more than once. A sender skips those apps and
+    /// uses the others (Switch spec 8.1).
+    pub skipped: Vec<[u8; 16]>,
 }
 
 impl Directory {
     pub(crate) fn read(o: Obj<'_>, account: &[u8; 32]) -> Result<Self, ClientError> {
         let identity = IdentityDoc::verify(&o.doc("identity")?, account)?;
-        let apps = o
-            .objects("apps")?
-            .into_iter()
-            .map(|a| {
-                let app_id = a.app_id("app_id")?;
-                let record = AppRecord::verify(&a.doc("record")?, account)?;
-                if record.cert().app_id() != app_id {
-                    return Err(bad(
-                        "Switch wire 7.4.10: an app record of another App ID than it is listed \
-                         under",
-                    ));
+        let mut apps: Vec<DirectoryApp> = Vec::new();
+        let mut skipped: Vec<[u8; 16]> = Vec::new();
+        for a in o.objects("apps")? {
+            // An entry without an App ID that reads can't be named; it is left out.
+            let Ok(app_id) = a.app_id("app_id") else {
+                continue;
+            };
+            match Self::read_app(&a, app_id, account) {
+                Ok(app) if !skipped.contains(&app_id) => {
+                    if apps.iter().any(|held| held.app_id == app_id) {
+                        // Listed twice: neither copy is used.
+                        apps.retain(|held| held.app_id != app_id);
+                        skipped.push(app_id);
+                    } else {
+                        apps.push(app);
+                    }
                 }
-                let receive_key = match a.opt_doc("receive_key")? {
-                    None => None,
-                    Some(signed) => Some(ReceiveKeyRecord::verify(&signed, record.cert())?),
-                };
-                Ok(DirectoryApp {
-                    app_id,
-                    record,
-                    receive_key,
-                })
-            })
-            .collect::<Result<_, ClientError>>()?;
+                Ok(_) => {}
+                Err(_) => {
+                    apps.retain(|held| held.app_id != app_id);
+                    if !skipped.contains(&app_id) {
+                        skipped.push(app_id);
+                    }
+                }
+            }
+        }
         Ok(Self {
             identity,
             apps,
+            skipped,
             directory_version: o.u64("directory_version")?,
             apps_version: o.u64("apps_version")?,
             known_version: o.opt_u64("known_version")?,
+        })
+    }
+
+    /// One app of the directory, its record verified for `account` and its receive key
+    /// record with the record's certificate (Switch spec 8.1).
+    fn read_app(
+        a: &Obj<'_>,
+        app_id: [u8; 16],
+        account: &[u8; 32],
+    ) -> Result<DirectoryApp, ClientError> {
+        let record = AppRecord::verify(&a.doc("record")?, account)?;
+        if record.cert().app_id() != app_id {
+            return Err(bad(
+                "Switch wire 7.4.10: an app record of another App ID than it is listed under",
+            ));
+        }
+        let receive_key = match a.opt_doc("receive_key")? {
+            None => None,
+            Some(signed) => Some(ReceiveKeyRecord::verify(&signed, record.cert())?),
+        };
+        Ok(DirectoryApp {
+            app_id,
+            record,
+            receive_key,
         })
     }
 }
@@ -705,8 +737,9 @@ impl KeysAnswer {
     }
 }
 
-/// The body of `PUT /v1/{id}/push` (Switch wire 8.1).
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// The body of `PUT /v1/{id}/push` (Switch wire 8.1). Its `Debug` shows the relay and how
+/// many handles, never the handles.
+#[derive(Clone, PartialEq, Eq)]
 pub struct PushSetting {
     /// The relay URL: `https://` on port 443, with no user info.
     pub relay_url: String,
@@ -716,6 +749,18 @@ pub struct PushSetting {
     pub push_key: Option<[u8; 32]>,
     /// On a start only: the push key of the registration it replaces.
     pub replaces: Option<[u8; 32]>,
+}
+
+impl std::fmt::Debug for PushSetting {
+    // The handles reach the device through the relay: they stay out of logs.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PushSetting")
+            .field("relay_url", &self.relay_url)
+            .field("handles", &self.handles.len())
+            .field("push_key", &self.push_key.is_some())
+            .field("replaces", &self.replaces.is_some())
+            .finish()
+    }
 }
 
 impl PushSetting {
