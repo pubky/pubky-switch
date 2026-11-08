@@ -8,7 +8,31 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[features]
+default = ["http"]
+# The HTTPS transport on reqwest and rustls, with the public-address resolver.
+http = ["dep:reqwest", "dep:tokio", "tokio?/net"]
+# Runs each `StateStore` call through `tokio::task::spawn_blocking`, so a slow host store never
+# blocks the async executor.
+tokio = ["dep:tokio", "tokio?/rt"]
+# Test-only: the fault-injecting store, the scripted transport and the test clock. No
+# production build enables it; this crate's own tests turn it on through the dev-dependency
+# below.
+test-support = []
+
 [dependencies]
+pubky-switch-core.workspace = true
+reqwest = { workspace = true, optional = true }
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, optional = true }
+
+[dev-dependencies]
+blake3.workspace = true
+ed25519-dalek.workspace = true
+hex.workspace = true
+pubky-switch-client = { path = ".", features = ["test-support"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
 
 [lints]
 workspace = true
