@@ -15,8 +15,8 @@ use pubky_switch_core::keys::{AppKeys as SwitchAppKeys, IdentityKey};
 use pubky_switch_core::records::{
     self, AccountView, AppCert, AppRecord, AppRequest, AuthRequest, CLOCK_TOLERANCE_MS, DAY_MS,
     Delivery, DiscardAnswer, Enrollment, ExportTransfer, Freeze, IdentityBody, IdentityDoc,
-    ListedApp, ReceiveKeyRecord, RecordOrder, RecordView, RenewedCert, ServiceKeyEntry, SignerView,
-    Standing, Unfreeze, UnfreezeAt, VersionOrder,
+    KeptProofs, ListedApp, ReceiveKeyRecord, RecordOrder, RecordView, RenewedCert, ServiceKeyEntry,
+    SignerView, Standing, Unfreeze, UnfreezeAt, VersionOrder,
 };
 use pubky_switch_core::sig::SignedDoc;
 use pubky_switch_core::time::parse_rfc3339;
@@ -517,11 +517,16 @@ fn check_identity_docs(keys: &Keys, docs: &HashMap<String, Doc>, certs: &HashMap
         "another body at the version held"
     );
     // The move keeps generation 1's service key, which the switch checks.
-    records::check_kept_service_keys(&moved, &[(1, v3.inbox().service_key)]).unwrap();
+    let kept = [(1, v3.inbox().service_key)];
+    let kept = KeptProofs {
+        records: &kept,
+        claim_entries: &[],
+    };
+    records::check_kept_service_keys(&moved, &kept).unwrap();
     let mut without = b7.clone();
     without.service_keys.clear();
     assert_eq!(
-        records::check_kept_service_keys(&sign(without), &[(1, v3.inbox().service_key)]),
+        records::check_kept_service_keys(&sign(without), &kept),
         Err(vec![1])
     );
     assert_eq!(
@@ -579,7 +584,7 @@ fn account_view<'a>(held: Option<&'a IdentityDoc>, origin: &'a str) -> AccountVi
         origin,
         pending_key: None,
         kept_app_ids: &[],
-        proof_keys: &[],
+        kept_proofs: KeptProofs::default(),
     }
 }
 

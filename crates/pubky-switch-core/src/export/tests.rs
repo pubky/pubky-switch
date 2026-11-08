@@ -21,7 +21,7 @@ use crate::ops::{BatchRef, OpBody, OpKind, RecordPut, RecordVersion, Refusal, Si
 use crate::records::{
     AppCert, AppCertBody, AppRecord, AppRecordBody, ExportTransfer, ExportTransferBody, Freeze,
     FreezeBody, IdentityBody, IdentityDoc, IdentityPolicy, Inbox, KeyBundle, ListedApp,
-    ReceiveKeyBody, ReceiveKeyRecord, Unfreeze,
+    ReceiveKeyBody, ReceiveKeyRecord, ServiceKeyEntry, Unfreeze,
 };
 use crate::scopes::Permission;
 use crate::sealed::SealedValue;
@@ -340,6 +340,7 @@ fn fixture() -> Fixture {
         seq: 6,
         op: attempt.signed().clone(),
         proof: claim_proof.signed().clone(),
+        cert: None,
     }));
     all.push(Part::Record(RecordEntry {
         key: put.key,
@@ -932,6 +933,23 @@ fn test_part_reading_rules() {
     ] {
         assert_eq!(Part::read(&v).unwrap_err().status(), 400, "{what}");
     }
+    // A claim entry's cert is always written: null, or the certificate, which round-trips.
+    let entry = &f.parts[f.index("claim_entry")];
+    let mut e: Value = serde_json::from_slice(&entry.to_json().unwrap()).unwrap();
+    assert!(e["cert"].is_null());
+    e.as_object_mut().unwrap().remove("cert");
+    assert_eq!(Part::read(&e).unwrap_err().status(), 400, "no cert");
+    e["cert"] = serde_json::to_value(f.cert.signed()).unwrap();
+    let with_cert = Part::read(&e).unwrap();
+    assert!(matches!(&with_cert, Part::ClaimEntry(c) if c.cert.as_ref() == Some(f.cert.signed())));
+    let again: Value = serde_json::from_slice(&with_cert.to_json().unwrap()).unwrap();
+    assert_eq!(again, e);
+    e["cert"] = json!("x");
+    assert_eq!(
+        Part::read(&e).unwrap_err().status(),
+        400,
+        "a cert that isn't a document"
+    );
     // The pin: absent before any attempt, null for "none".
     let mut c: Value =
         serde_json::from_slice(&f.parts[f.index("claim")].to_json().unwrap()).unwrap();
@@ -1939,7 +1957,7 @@ fn test_activation_claims() {
     refused(
         f.run_with(&parts),
         ErrorCode::Conflict,
-        "doesn't verify with the old service's key",
+        "doesn't verify with generation 1's service key",
     );
     let parts = f.with(|p| {
         if let Part::ClaimEntry(e) = &mut p[ci + 1] {
@@ -1959,9 +1977,314 @@ fn test_activation_claims() {
     refused(
         f.run_with(&parts),
         ErrorCode::Conflict,
-        "isn't that entry's",
+        "isn't a claim of this claim at the entry's step",
     );
     let _ = app_id;
+}
+
+/// The claim entry part.
+fn entry_mut(parts: &mut [Part]) -> &mut ClaimEntryPart {
+    parts
+        .iter_mut()
+        .find_map(|p| match p {
+            Part::ClaimEntry(e) => Some(e),
+            _ => None,
+        })
+        .unwrap()
+}
+
+/// The fixture's certificate for `keys`, with `permissions` in place of `claims.write`.
+fn cert_with(keys: &AppKeys, permissions: &[Permission]) -> AppCert {
+    let body = AppCertBody::new(
+        identity().public(),
+        keys.signing_public(),
+        keys.bundle_public(),
+        vec![SCOPE.to_owned()],
+        permissions,
+        START - DAY,
+        START + 365 * DAY,
+    );
+    AppCert::issue(&identity(), body).unwrap()
+}
+
+#[test]
+fn test_activation_claim_entry_certificate() {
+    let f = fixture();
+    // The writer's certificate carried in the part imports, as the app part's does.
+    let parts = f.with(|p| entry_mut(p).cert = Some(f.cert.signed().clone()));
+    let import = f.run_with(&parts).unwrap();
+    assert_eq!(
+        import.claims[0].entries[0].cert,
+        Some(f.cert.signed().clone())
+    );
+    // A certificate without claims.write: the entry is refused.
+    let reader = cert_with(&app(), &[Permission::ClaimsRead]);
+    let parts = f.with(|p| entry_mut(p).cert = Some(reader.signed().clone()));
+    refused(
+        f.run_with(&parts),
+        ErrorCode::Conflict,
+        "doesn't hold claims.write",
+    );
+    // Another app's certificate doesn't verify the writer's signature (401).
+    let parts = f.with(|p| entry_mut(p).cert = Some(cert_of(&other_app()).signed().clone()));
+    refused(
+        f.run_with(&parts),
+        ErrorCode::BadSignature,
+        "an entry's operation isn't its writer's",
+    );
+    // An entry written by an app without an app part: no certificate in either place.
+    let foreign = SignedOp::sign(
+        &other_app(),
+        OpBody {
+            identity: identity().public(),
+            app_id: Some(other_app().app_id_bytes()),
+            generation: 1,
+            batch: batch(12, 1),
+            conditions: Vec::new(),
+            kind: OpKind::Claim(attempt_fields()),
+        },
+    )
+    .unwrap();
+    let parts = f.with(|p| entry_mut(p).op = foreign.signed().clone());
+    refused(
+        f.run_with(&parts),
+        ErrorCode::Conflict,
+        "no certificate for an entry's writer",
+    );
+    // With its certificate in the part, it passes that check and fails at its proof, which
+    // names the wallet's entry.
+    let parts = f.with(|p| {
+        let e = entry_mut(p);
+        e.op = foreign.signed().clone();
+        e.cert = Some(cert_of(&other_app()).signed().clone());
+    });
+    refused(
+        f.run_with(&parts),
+        ErrorCode::Conflict,
+        "an entry's proof isn't that entry's",
+    );
+    // An entry of another claim, or at another step than its part's.
+    let mut fields = attempt_fields();
+    fields.claim_key = vec![7; 32];
+    let other_claim = op(OpKind::Claim(fields), batch(12, 1));
+    let parts = f.with(|p| entry_mut(p).op = other_claim.signed().clone());
+    refused(
+        f.run_with(&parts),
+        ErrorCode::Conflict,
+        "isn't a claim of this claim at the entry's step",
+    );
+}
+
+#[test]
+fn test_activation_claim_entry_proof_state() {
+    let f = fixture();
+    // The proof shows the state the replay of its entry gives.
+    f.run().unwrap();
+    // A proof signed again by the old service to show the attempt failed is refused at the
+    // entry, before the claim's own members are compared.
+    let mut state = f.claim_proof.body().state.clone();
+    state["attempts"][0]["outcome"] = json!("failed");
+    state["state"] = json!("FREE");
+    let resigned = TransitionProof::sign(
+        &old_key(),
+        &f.id,
+        ProofBody::new(
+            f.stubs[4].clone(),
+            b64(&CLAIM_KEY),
+            &ProofState::Claim(state),
+        ),
+    )
+    .unwrap();
+    let parts = f.with(|p| {
+        entry_mut(p).proof = resigned.signed().clone();
+        let c = claim_mut(p);
+        c.attempts[0].outcome = Outcome::Failed;
+        c.current = None;
+    });
+    refused(
+        f.run_with(&parts),
+        ErrorCode::Conflict,
+        "an entry's proof doesn't show the state its entry leads to",
+    );
+    // What depends on when the view is read isn't compared.
+    let mut state = f.claim_proof.body().state.clone();
+    state["attempts"][0]["orphaned"] = json!(true);
+    state["next_possibly_duplicate"] = json!(true);
+    let timed = TransitionProof::sign(
+        &old_key(),
+        &f.id,
+        ProofBody::new(
+            f.stubs[4].clone(),
+            b64(&CLAIM_KEY),
+            &ProofState::Claim(state),
+        ),
+    )
+    .unwrap();
+    let parts = f.with(|p| entry_mut(p).proof = timed.signed().clone());
+    f.run_with(&parts).unwrap();
+}
+
+/// The fixture's account one generation on, its export at generation 2: the old service
+/// changed its key in place after seq 6, so the record's and the claim entry's proofs are
+/// generation 1's, behind a checkpoint at seq 6. `service_keys` is what the generation 2
+/// `identity.json` lists. Returns the fixture with its manifest, freeze and document.
+fn second_generation(service_keys: Vec<ServiceKeyEntry>) -> Fixture {
+    let f = fixture();
+    let ik = identity();
+    let key2 = SigningKey::from_bytes(&[15; 32]);
+    let mut body = f.doc.body().clone();
+    body.version = 2;
+    body.generation = 2;
+    body.inbox = Inbox::new(OLD, key2.verifying_key().to_bytes());
+    body.service_keys = service_keys;
+    let doc = IdentityDoc::sign(&ik, body).unwrap();
+    let freeze = Freeze::sign(
+        &ik,
+        FreezeBody {
+            identity: f.id,
+            inbox: Inbox::new(NEXT, next_key().verifying_key().to_bytes()),
+            next_generation: 3,
+            issued_at: START + 3_500,
+            nonce: [4; 16],
+        },
+    )
+    .unwrap();
+    let freeze_at = START + 4_000;
+    let transition = ServiceTransition::Freeze {
+        freeze_hash: freeze.hash(),
+        next_generation: 3,
+        inbox: freeze.next().clone(),
+        at: freeze_at,
+    }
+    .sign(&key2, &f.id)
+    .unwrap();
+    let at6 = f.stubs[4].chain_hash;
+    let checkpoint = SignedHead::sign(
+        &key2,
+        &f.id,
+        &ChainTip {
+            generation: 1,
+            seq: 6,
+            chain_hash: at6,
+        },
+    );
+    let mut tip = ChainTip {
+        generation: 2,
+        seq: 6,
+        chain_hash: at6,
+    };
+    let mut chain = Vec::new();
+    for (seq, item_type, signed, time) in [
+        (7, ItemType::Identity, doc.signed().clone(), START + 3_200),
+        (8, ItemType::Service, transition, freeze_at),
+    ] {
+        let hash = item_hash(item_type, &signed.doc_bytes().unwrap());
+        let (stub, next) = tip.append(seq, time, item_type, hash, None).unwrap();
+        tip = next;
+        chain.push(Part::Chain(ChainPart {
+            seq,
+            stub,
+            item_type,
+            doc: Some(signed),
+            context: Value::Null,
+        }));
+    }
+    let head = SignedHead::sign(&key2, &f.id, &tip);
+    let mut parts = vec![Part::Meta(MetaPart {
+        identity: doc.signed().clone(),
+        generation: 2,
+        seq: 8,
+        directory_version: 3,
+        apps_version: 1,
+        app_added_at: vec![(app().app_id_bytes(), 1)],
+    })];
+    parts.extend(chain);
+    parts.extend(
+        f.parts
+            .iter()
+            .filter(|p| matches!(p.kind(), "app" | "claim" | "claim_entry" | "record"))
+            .cloned(),
+    );
+    // Behind the checkpoint, no chain part carries the record's write: its part does.
+    let write = match &f.parts[4] {
+        Part::Chain(c) => c.doc.clone(),
+        _ => unreachable!(),
+    };
+    record_mut(&mut parts).op = write;
+    let chunks = pack(&parts, DEFAULT_CHUNK_TARGET).unwrap();
+    let manifest = Manifest::sign(
+        &key2,
+        ManifestBody::new(
+            f.id,
+            freeze.hash(),
+            2,
+            freeze_at,
+            head,
+            Some(checkpoint),
+            chunks.iter().map(|(r, _)| r.clone()).collect(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    Fixture {
+        doc,
+        freeze,
+        parts,
+        manifest,
+        chunks,
+        now: freeze_at,
+        ..f
+    }
+}
+
+impl Fixture {
+    /// Activate `parts` under the manifest signed again with their count by `key`.
+    fn run_signed(&self, key: &SigningKey, parts: &[Part]) -> Result<Import, Refusal> {
+        let mut body = self.manifest.body().clone();
+        body.parts = parts.len() as u64;
+        let manifest = Manifest::sign(key, body).unwrap();
+        self.run_manifest(&manifest, parts)
+    }
+}
+
+#[test]
+fn test_activation_claim_entry_of_an_earlier_generation() {
+    let key2 = SigningKey::from_bytes(&[15; 32]);
+    let generation1 = ServiceKeyEntry {
+        generation: 1,
+        key: old_key().verifying_key().to_bytes(),
+    };
+    let f = second_generation(vec![generation1]);
+    // Generation 1's proofs, the record's and the claim entry's, verify with the key
+    // service_keys lists for it, behind the checkpoint.
+    let import = f.run().unwrap();
+    assert_eq!(import.generation, 2);
+    assert_eq!(import.claims.len(), 1);
+    assert_eq!(import.proof_generations, [1]);
+    // Without the record, the live claim's entry alone keeps generation 1 reported.
+    let no_record = f.with(|p| p.retain(|x| x.kind() != "record"));
+    let import = f.run_signed(&key2, &no_record).unwrap();
+    assert!(import.records.is_empty());
+    assert_eq!(import.proof_generations, [1]);
+    // A service_keys that doesn't name generation 1 refuses the entry's proof.
+    let f = second_generation(Vec::new());
+    let no_record = f.with(|p| p.retain(|x| x.kind() != "record"));
+    refused(
+        f.run_signed(&key2, &no_record),
+        ErrorCode::Conflict,
+        "an entry's proof names generation 1, which the identity.json doesn't list",
+    );
+    // One that names it with another key: the proof doesn't verify.
+    let f = second_generation(vec![ServiceKeyEntry {
+        generation: 1,
+        key: next_key().verifying_key().to_bytes(),
+    }]);
+    let no_record = f.with(|p| p.retain(|x| x.kind() != "record"));
+    refused(
+        f.run_signed(&key2, &no_record),
+        ErrorCode::Conflict,
+        "an entry's proof doesn't verify with generation 1's service key",
+    );
 }
 
 #[test]
