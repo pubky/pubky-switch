@@ -1,17 +1,11 @@
-//! The routes of the HTTP API (Switch wire 7.4), their body caps (Switch wire 7.1) and the
-//! account states they pass (Switch wire 7.3 steps 7 and 8).
+//! The routes of the HTTP API (Switch wire 7.4), and the account states they pass (Switch wire
+//! 7.3 steps 7 and 8). The body caps and the writes a frozen account refuses are the core's
+//! tables (`pubky_switch_core::http`); this module routes to the service's endpoints.
 
 use std::collections::BTreeMap;
 
-use crate::limits::fixed;
-
-/// One KiB.
-const KIB: u64 = 1024;
-/// One MiB.
-const MIB: u64 = 1024 * KIB;
-
 /// The cap for a request the service has no route for: it answers `404`, and reads little.
-pub const UNKNOWN_ROUTE_BODY_CAP: u64 = 64 * KIB;
+pub const UNKNOWN_ROUTE_BODY_CAP: u64 = 64 * 1024;
 
 /// An endpoint of the API.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -85,60 +79,6 @@ pub enum Call {
 }
 
 impl Call {
-    /// The largest body the call takes; a larger one is `413 too_large` before it is read
-    /// (Switch wire 7.1).
-    pub fn body_cap(&self) -> u64 {
-        match self {
-            Self::Append => fixed::MAX_ENVELOPE,
-            Self::Ops | Self::Import => 4 * MIB,
-            Self::Enroll | Self::PutIdentity | Self::PutPeers => 256 * KIB,
-            Self::ImportChunk(_) => fixed::MAX_CHUNK_BYTES,
-            Self::RecoveryUpload => 16 * MIB,
-            Self::PutHandover => fixed::HANDOVER_BODY_CAP,
-            Self::Freeze
-            | Self::Unfreeze
-            | Self::ImportActivate
-            | Self::RecoveryAdmission
-            | Self::Revoke(_)
-            | Self::Leave(_)
-            | Self::RequestKeys(_)
-            | Self::PutPush
-            | Self::Erase => 16 * KIB,
-            Self::GetIdentity
-            | Self::Feed
-            | Self::GetAllow
-            | Self::PostConnect
-            | Self::GetConnect
-            | Self::DeleteConnect(_)
-            | Self::GetClaim(_)
-            | Self::GetRecord(_)
-            | Self::ListRecords
-            | Self::Directory
-            | Self::GetKeys(_)
-            | Self::GetApps
-            | Self::Export
-            | Self::ExportChunk(_)
-            | Self::GetHandover => 0,
-        }
-    }
-
-    /// A write, which a frozen account answers with `410 moved` (Switch wire 7.3 step 8).
-    pub fn is_write(&self) -> bool {
-        matches!(
-            self,
-            Self::Append
-                | Self::PutPeers
-                | Self::PostConnect
-                | Self::DeleteConnect(_)
-                | Self::Ops
-                | Self::Leave(_)
-                | Self::Revoke(_)
-                | Self::RecoveryUpload
-                | Self::PutPush
-                | Self::PutHandover
-        )
-    }
-
     /// A call a staged account answers; it answers every other with `503 staged`
     /// (Switch wire 7.3 step 7).
     pub fn passes_staged(&self) -> bool {
@@ -284,9 +224,23 @@ pub fn route(method: &str, path_and_query: &str) -> Option<Route> {
     })
 }
 
-/// The body cap of a request, by its route; [`UNKNOWN_ROUTE_BODY_CAP`] without one.
-pub fn body_cap(route: Option<&Route>) -> u64 {
-    route.map_or(UNKNOWN_ROUTE_BODY_CAP, |route| route.call.body_cap())
+/// The body cap of a request, from the core's table (Switch wire 7.1);
+/// [`UNKNOWN_ROUTE_BODY_CAP`] for a request without a route.
+pub fn body_cap(method: &str, path_and_query: &str, route: Option<&Route>) -> u64 {
+    match route {
+        Some(_) => pubky_switch_core::http::body_cap(method, path_and_query)
+            .and_then(|cap| u64::try_from(cap).ok())
+            // Every routed call is in the core's table (a test checks); a call that weren't
+            // would take no body.
+            .unwrap_or(0),
+        None => UNKNOWN_ROUTE_BODY_CAP,
+    }
+}
+
+/// Whether a frozen account answers the request with `410 moved`, from the core's table
+/// (Switch wire 7.3 step 8).
+pub fn refused_when_frozen(method: &str, path_and_query: &str) -> bool {
+    pubky_switch_core::http::frozen_refuses(method, path_and_query)
 }
 
 /// Parse `name=value` pairs joined by `&`, percent-decoding names and values (Switch wire
@@ -475,7 +429,7 @@ mod tests {
 
     #[test]
     fn test_route_body_caps_match_wire_table() {
-        let cap = |method: &str, path: &str| body_cap(route(method, path).as_ref());
+        let cap = |method: &str, path: &str| body_cap(method, path, route(method, path).as_ref());
         assert_eq!(cap("POST", "/v1/x/inbox"), 65_536);
         assert_eq!(cap("POST", "/v1/x/ops"), 4 * 1024 * 1024);
         assert_eq!(cap("POST", "/v1/x/import"), 4 * 1024 * 1024);
@@ -523,29 +477,74 @@ mod tests {
         assert!(!Call::Feed.passes_staged());
         assert!(!Call::Ops.passes_staged());
 
-        for write in [
-            Call::Append,
-            Call::PutPeers,
-            Call::PostConnect,
-            Call::DeleteConnect("p".into()),
-            Call::Ops,
-            Call::Leave("a".into()),
-            Call::Revoke("a".into()),
-            Call::RecoveryUpload,
-            Call::PutPush,
-            Call::PutHandover,
+        for (method, path) in [
+            ("POST", "/v1/x/inbox"),
+            ("PUT", "/v1/x/peers"),
+            ("POST", "/v1/x/connect"),
+            ("DELETE", "/v1/x/connect/p"),
+            ("POST", "/v1/x/ops"),
+            ("POST", "/v1/x/apps/a/leave"),
+            ("POST", "/v1/x/apps/a/revoke"),
+            ("POST", "/v1/x/recovery/upload"),
+            ("PUT", "/v1/x/push"),
+            ("PUT", "/v1/x/handover"),
         ] {
-            assert!(write.is_write(), "{write:?}");
+            assert!(refused_when_frozen(method, path), "{method} {path}");
         }
-        for read in [
-            Call::Feed,
-            Call::Export,
-            Call::ExportChunk("c".into()),
-            Call::Unfreeze,
-            Call::Erase,
-            Call::GetIdentity,
+        for (method, path) in [
+            ("GET", "/v1/x/feed"),
+            ("GET", "/v1/x/export"),
+            ("GET", "/v1/x/export/chunks/c"),
+            ("POST", "/v1/x/unfreeze"),
+            ("POST", "/v1/x/erase"),
+            ("GET", "/v1/x/identity"),
         ] {
-            assert!(!read.is_write(), "{read:?}");
+            assert!(!refused_when_frozen(method, path), "{method} {path}");
+        }
+    }
+
+    #[test]
+    fn test_route_every_routed_call_is_in_the_cap_table() {
+        for (method, path) in [
+            ("POST", "/v1/enroll"),
+            ("PUT", "/v1/x/identity"),
+            ("GET", "/v1/x/identity"),
+            ("POST", "/v1/x/inbox"),
+            ("GET", "/v1/x/feed"),
+            ("PUT", "/v1/x/peers"),
+            ("GET", "/v1/x/allow"),
+            ("POST", "/v1/x/connect"),
+            ("GET", "/v1/x/connect"),
+            ("DELETE", "/v1/x/connect/p"),
+            ("POST", "/v1/x/ops"),
+            ("GET", "/v1/x/claims/k"),
+            ("GET", "/v1/x/records/r"),
+            ("GET", "/v1/x/records"),
+            ("GET", "/v1/x/directory"),
+            ("GET", "/v1/x/apps/a/keys"),
+            ("POST", "/v1/x/apps/a/keys"),
+            ("PUT", "/v1/x/push"),
+            ("POST", "/v1/x/apps/a/leave"),
+            ("GET", "/v1/x/apps"),
+            ("POST", "/v1/x/apps/a/revoke"),
+            ("POST", "/v1/x/freeze"),
+            ("POST", "/v1/x/unfreeze"),
+            ("GET", "/v1/x/export"),
+            ("GET", "/v1/x/export/chunks/c"),
+            ("POST", "/v1/x/import"),
+            ("PUT", "/v1/x/import/chunks/c"),
+            ("POST", "/v1/x/import/activate"),
+            ("POST", "/v1/x/recovery/admission"),
+            ("POST", "/v1/x/recovery/upload"),
+            ("POST", "/v1/x/erase"),
+            ("PUT", "/v1/x/handover"),
+            ("GET", "/v1/x/handover"),
+        ] {
+            assert!(route(method, path).is_some(), "{method} {path}");
+            assert!(
+                pubky_switch_core::http::body_cap(method, path).is_some(),
+                "{method} {path}"
+            );
         }
     }
 

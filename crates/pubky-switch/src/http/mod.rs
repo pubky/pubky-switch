@@ -215,7 +215,7 @@ async fn dispatch(
     );
     let routed = route::route(&method, &path_and_query);
     let call = routed.as_ref().map_or("unknown", |route| route.call.name());
-    let cap = route::body_cap(routed.as_ref());
+    let cap = route::body_cap(&method, &path_and_query, routed.as_ref());
 
     let declared = parts
         .headers
