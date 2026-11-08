@@ -36,3 +36,13 @@ pub mod signing;
 pub mod time;
 
 pub use error::{Error, Result, SizeRefusal};
+
+/// The folder of the spec's test vectors (`spec/vectors/`) at this crate's revision, for the
+/// tests of a protocol built on the Switch, whose own vectors build on these.
+///
+/// Test-only: it exists only with the `test-vectors` feature, and names a path in the source
+/// tree this crate was built from.
+#[cfg(feature = "test-vectors")]
+pub fn spec_vectors_dir() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../spec/vectors")
+}
