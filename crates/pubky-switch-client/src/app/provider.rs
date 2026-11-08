@@ -24,6 +24,7 @@
 //!   didn't sign, while the identity publishes no `identity.json`, means its account is
 //!   gone. The app keeps that, stops, reports it and drops its push setting.
 
+use pubky_switch_core::claims::ClaimType;
 use pubky_switch_core::enc::{b64, pubky_id, pubky_key, serde_b64, serde_b64_vec};
 use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::ops::{AllowKind, Condition, MAX_BATCH_ENTRIES, OpBody, OpKind, Position};
@@ -34,10 +35,10 @@ use serde::{Deserialize, Serialize};
 
 use super::error::{Alarm, AppError};
 use super::events::AppEvent;
-use super::feed::ReceiveReport;
+use super::feed::{ReceiveReport, processed_writes};
 use super::identity;
 use super::state::{Tx, key};
-use super::{App, push};
+use super::{App, OpBatch, push};
 use crate::client::answers::{FeedQuery, RecoveryUpload};
 use crate::client::{Batch, Credentials, SwitchClient};
 use crate::error::{ClientError, StoreError};
@@ -169,8 +170,21 @@ enum Unknown {
     Unexplained,
 }
 
+/// How many provider changes one follow takes in a row, each given up for a newer own
+/// `identity.json` met on the way; the next call goes on from there.
+const FOLLOW_PASSES: usize = 4;
+
 fn corrupt() -> AppError {
     AppError::Store(StoreError::Corrupt)
+}
+
+/// A kept batch's operations, with their conditions, to sign again.
+fn ops_of(batch: &Batch) -> Vec<(Vec<Condition>, OpKind)> {
+    batch
+        .ops()
+        .iter()
+        .map(|op| (op.body().conditions.clone(), op.body().kind.clone()))
+        .collect()
 }
 
 impl App {
@@ -188,7 +202,7 @@ impl App {
     /// failed call or commit, after which the next call resumes at the step it stopped in.
     pub async fn follow_provider(&mut self) -> Result<ProviderStatus, AppError> {
         self.ready_local().await?;
-        self.refuse_when_stopped()?;
+        self.refuse_when_halted()?;
         let result = self.provider_step().await;
         if result.is_err() {
             self.reload = true;
@@ -206,7 +220,11 @@ impl App {
     /// follow the generation the app follows.
     pub async fn check_for_move(&mut self) -> Result<ProviderStatus, AppError> {
         self.ready_local().await?;
-        self.refuse_when_stopped()?;
+        self.refuse_when_halted()?;
+        if self.state.gone.is_some() {
+            // `gone` stops every read: nothing is asked.
+            return self.follow_provider().await;
+        }
         let result = self.client.public_identity().await;
         let public = self.take(result).await?;
         if let Some(freeze) = &public.freeze {
@@ -274,8 +292,11 @@ impl App {
                     return Ok(TakeOver::Done(Err(error)));
                 }
                 // Switch wire 7.2 check 5: a revoked or departed app, or one the newest
-                // identity.json doesn't list. One listed with another certificate than it
-                // presents is a renewal it hasn't taken yet, not a removal.
+                // identity.json doesn't list. The app is gone for good only once the newest
+                // verified identity.json removes it or doesn't list it (Switch spec 12.2).
+                // One listed, with its own certificate or with a renewal it hasn't taken yet,
+                // reports the answer and asks again later: a revocation the signer hasn't
+                // published yet shows as removed once it is.
                 let identity = self.state.meta.identity;
                 if let Ok(Some(doc)) =
                     identity::read_homeserver(self.env.homeserver.as_ref(), &identity).await
@@ -283,13 +304,8 @@ impl App {
                     self.take_own_copy(doc).await?;
                 }
                 let me = self.state.meta.app_id;
-                let presented = self.state.cert.hash();
-                if self
-                    .state
-                    .own_doc
-                    .listed_cert(&me)
-                    .is_some_and(|listed| listed != presented)
-                {
+                let doc = &self.state.own_doc;
+                if !doc.lists_removed(&me) && doc.listed_cert(&me).is_some() {
                     return Ok(TakeOver::Done(Err(error)));
                 }
                 self.mark_gone(GoneReason::NotCurrent).await?;
@@ -345,7 +361,9 @@ impl App {
     // ---------------------------------------------------------------------------------
     // The steps
 
-    /// One pass of following the own identity's service.
+    /// One pass of following the own identity's service. A move or a loss that a newer own
+    /// `identity.json` supersedes is given up, and the newer document followed instead
+    /// (Switch spec 12.5 "Abort", 12.6), at most [`FOLLOW_PASSES`] times in a row.
     async fn provider_step(&mut self) -> Result<ProviderStatus, AppError> {
         let reader = self.reader();
         if let Some(gone) = reader.get::<GoneRecord>(keys::GONE).await? {
@@ -358,24 +376,53 @@ impl App {
             return Ok(ProviderStatus::Gone);
         }
         let mut followed = None;
-        if let Some(loss) = self.loss_record().await?
-            && !loss.done()
-        {
-            self.run_loss(loss).await?;
+        for _ in 0..FOLLOW_PASSES {
+            if let Some(loss) = self.loss_record().await?
+                && !loss.done()
+                && self.run_loss(loss).await?
+            {
+                followed = Some(self.state.meta.generation);
+            }
+            if let Some(mv) = reader.get::<MoveRecord>(keys::MOVE).await?
+                && let Some(status) = self.run_move(mv).await?
+            {
+                return Ok(status);
+            }
+            if !self.provider_superseded() {
+                break;
+            }
+            let status = self.follow_generation().await?;
+            if !self.provider_superseded() {
+                return Ok(status);
+            }
             followed = Some(self.state.meta.generation);
-        }
-        if let Some(mv) = reader.get::<MoveRecord>(keys::MOVE).await?
-            && let Some(status) = self.run_move(mv).await?
-        {
-            return Ok(status);
-        }
-        if self.state.own_doc.generation() > self.state.meta.generation {
-            return self.follow_generation().await;
         }
         Ok(match followed {
             Some(generation) => ProviderStatus::Followed { generation },
             None => ProviderStatus::Current,
         })
+    }
+
+    /// Whether the newest own `identity.json` names a later generation than the app follows.
+    pub(crate) fn provider_superseded(&self) -> bool {
+        self.state.own_doc.generation() > self.state.meta.generation
+    }
+
+    /// After a step of a move or a loss failed at a service: read the own `identity.json`
+    /// from the Homeserver, since the identity may have gone elsewhere meanwhile, for example
+    /// to a provider loss declared because that service is gone (Switch spec 12.5 "Abort").
+    /// Only a failed call is looked into; a failed read changes nothing.
+    pub(crate) async fn look_for_newer_doc(&mut self, error: &AppError) {
+        if !matches!(error, AppError::Switch(_) | AppError::Transport(_)) || self.reload {
+            return;
+        }
+        let identity = self.state.meta.identity;
+        if let Ok(Some(doc)) =
+            identity::read_homeserver(self.env.homeserver.as_ref(), &identity).await
+        {
+            // An alarm the copy raises is kept; the step's own error is the one returned.
+            let _ = self.take_own_copy(doc).await;
+        }
     }
 
     /// The newest own `identity.json` names a later generation and no move is in progress:
@@ -463,7 +510,9 @@ impl App {
     }
 
     /// Run a move's steps from where they stand. `None` when the identity went to another
-    /// service than the freeze names, or declared a loss: that change is followed instead.
+    /// service than the freeze names, declared a loss, or moved on to a later generation:
+    /// the move is given up at whichever step it stands, a stuck one included, and that
+    /// change is followed instead (Switch spec 12.5 "Abort").
     async fn run_move(&mut self, mut mv: MoveRecord) -> Result<Option<ProviderStatus>, AppError> {
         let freeze = match &mv.freeze {
             None => None,
@@ -472,66 +521,127 @@ impl App {
             }
         };
         loop {
-            match mv.step {
-                MoveStep::Seen => {
-                    self.read_old_feed_to_end().await?;
-                    mv.step = MoveStep::Read;
-                    self.save_move(&mv).await?;
-                }
-                MoveStep::Read => {
-                    if let Some(freeze) = &freeze {
-                        self.upload_to_next(freeze).await?;
+            if self.move_superseded(&mv, freeze.as_ref()) {
+                self.give_up_move(&mv, freeze.as_ref()).await?;
+                return Ok(None);
+            }
+            match self.move_step(&mut mv, freeze.as_ref()).await {
+                Ok(None) => {}
+                Ok(Some(status)) => return Ok(Some(status)),
+                Err(error) => {
+                    self.look_for_newer_doc(&error).await;
+                    if !self.move_superseded(&mv, freeze.as_ref()) {
+                        return Err(error);
                     }
-                    mv.step = MoveStep::Uploaded;
-                    self.save_move(&mv).await?;
-                }
-                MoveStep::Uploaded => {
-                    let next_generation = freeze.as_ref().map_or_else(
-                        || self.state.meta.generation.saturating_add(1),
-                        |f| f.body().next_generation,
-                    );
-                    if !self
-                        .move_published(freeze.as_ref(), next_generation)
-                        .await?
-                    {
-                        if let Some(freeze) = &freeze
-                            && self.move_cancelled(freeze).await?
-                        {
-                            return Ok(Some(ProviderStatus::MoveCancelled));
-                        }
-                        return Ok(Some(ProviderStatus::AwaitingMove { next_generation }));
-                    }
-                    let doc = self.state.own_doc.clone();
-                    let elsewhere = freeze.as_ref().is_some_and(|f| doc.inbox() != f.next());
-                    let lost = doc
-                        .body()
-                        .recovery_from
-                        .is_some_and(|lost| lost >= mv.from_generation);
-                    if elsewhere || lost {
-                        let mut tx = self.tx()?;
-                        tx.delete(keys::MOVE)?;
-                        self.commit(tx).await?;
-                        return Ok(None);
-                    }
-                    self.switch_over(&doc, &mut mv).await?;
-                }
-                MoveStep::Switched => {
-                    self.reregister(&mv).await?;
-                    mv.step = MoveStep::Registered;
-                    mv.batch.clear();
-                    self.save_move(&mv).await?;
-                }
-                MoveStep::Registered => {
-                    self.after_switch(mv.from_generation).await?;
-                    let mut tx = self.tx()?;
-                    tx.delete(keys::MOVE)?;
-                    self.commit(tx).await?;
-                    let generation = self.state.meta.generation;
-                    self.events.push(AppEvent::ProviderFollowed { generation });
-                    return Ok(Some(ProviderStatus::Followed { generation }));
                 }
             }
         }
+    }
+
+    /// The generation a move goes to: the freeze's next one, or the one after the
+    /// generation followed for a move the app never saw frozen.
+    fn move_target(&self, mv: &MoveRecord, freeze: Option<&Freeze>) -> u64 {
+        if mv.step >= MoveStep::Switched {
+            return self.state.meta.generation;
+        }
+        freeze.map_or_else(
+            || self.state.meta.generation.saturating_add(1),
+            |f| f.body().next_generation,
+        )
+    }
+
+    /// Whether the newest own `identity.json` supersedes the move: it records a loss of
+    /// the generation moved from, names another service than the freeze at the next
+    /// generation, or names a later generation than the move goes to. A move the app never
+    /// saw frozen follows whatever generation the newest document names.
+    fn move_superseded(&self, mv: &MoveRecord, freeze: Option<&Freeze>) -> bool {
+        let doc = &self.state.own_doc;
+        if mv.step >= MoveStep::Switched {
+            return self.provider_superseded();
+        }
+        let lost = doc
+            .body()
+            .recovery_from
+            .is_some_and(|lost| lost >= mv.from_generation);
+        let Some(freeze) = freeze else {
+            return lost;
+        };
+        let next = freeze.body().next_generation;
+        let generation = doc.generation();
+        generation > next || (generation == next && (lost || doc.inbox() != freeze.next()))
+    }
+
+    /// Give the move up for the newer document: the record goes, and the host is told.
+    async fn give_up_move(
+        &mut self,
+        mv: &MoveRecord,
+        freeze: Option<&Freeze>,
+    ) -> Result<(), AppError> {
+        let generation = self.move_target(mv, freeze);
+        let mut tx = self.tx()?;
+        tx.delete(keys::MOVE)?;
+        self.commit(tx).await?;
+        let newer = self.state.own_doc.generation();
+        if newer > generation {
+            self.events
+                .push(AppEvent::ProviderChangeSuperseded { generation, newer });
+        }
+        Ok(())
+    }
+
+    /// One step of a move: `Some` ends the pass with that status.
+    async fn move_step(
+        &mut self,
+        mv: &mut MoveRecord,
+        freeze: Option<&Freeze>,
+    ) -> Result<Option<ProviderStatus>, AppError> {
+        match mv.step {
+            MoveStep::Seen => {
+                self.read_old_feed_to_end().await?;
+                mv.step = MoveStep::Read;
+                self.save_move(mv).await?;
+            }
+            MoveStep::Read => {
+                if let Some(freeze) = freeze {
+                    self.upload_to_next(freeze).await?;
+                }
+                mv.step = MoveStep::Uploaded;
+                self.save_move(mv).await?;
+            }
+            MoveStep::Uploaded => {
+                let next_generation = self.move_target(mv, freeze);
+                if !self.move_published(freeze, next_generation).await? {
+                    if let Some(freeze) = freeze
+                        && self.move_cancelled(freeze).await?
+                    {
+                        return Ok(Some(ProviderStatus::MoveCancelled));
+                    }
+                    return Ok(Some(ProviderStatus::AwaitingMove { next_generation }));
+                }
+                // A document that names another service, a loss or a later generation is
+                // followed instead: the next pass gives the move up.
+                if !self.move_superseded(mv, freeze) {
+                    let doc = self.state.own_doc.clone();
+                    self.switch_over(&doc, mv).await?;
+                }
+            }
+            MoveStep::Switched => {
+                self.reregister(mv).await?;
+                mv.step = MoveStep::Registered;
+                mv.batch.clear();
+                self.save_move(mv).await?;
+            }
+            MoveStep::Registered => {
+                self.after_switch(mv.from_generation).await?;
+                let mut tx = self.tx()?;
+                tx.delete(keys::MOVE)?;
+                self.commit(tx).await?;
+                let generation = self.state.meta.generation;
+                self.events.push(AppEvent::ProviderFollowed { generation });
+                return Ok(Some(ProviderStatus::Followed { generation }));
+            }
+        }
+        Ok(None)
     }
 
     async fn save_move(&mut self, mv: &MoveRecord) -> Result<(), AppError> {
@@ -546,23 +656,28 @@ impl App {
     /// Read the frozen service's feed to its end, checking each page against the chain
     /// view only (Switch spec 12.5 step 3): its writes are refused, and the next service
     /// shows the same items again from the cursor. The newest head is then verified.
+    ///
+    /// The read starts at the verified chain position and pages by each page's `next`,
+    /// kept apart from that position (Switch wire 7.4.4): inbox entries aren't chain items
+    /// (Switch spec 8.3), so a page of entries alone moves the read but not the chain.
     async fn read_old_feed_to_end(&mut self) -> Result<(), AppError> {
         let multi = self.state.device.multi_device;
+        let Some(start) = self.state.chain.as_ref().map(|c| c.verified_seq()) else {
+            return Ok(());
+        };
+        let mut after = Position {
+            generation: self.state.cursor.generation,
+            seq: start,
+        };
         loop {
-            let Some(after) = self.state.chain.as_ref().map(|c| c.verified_seq()) else {
-                return Ok(());
-            };
             let query = FeedQuery {
-                after: Some(Position {
-                    generation: self.state.cursor.generation,
-                    seq: after,
-                }),
+                after: Some(after),
                 limit: Some(self.config.page()),
                 wait: None,
             };
             let result = self.client.feed(query).await;
             let page = self.take(result).await?;
-            if page.more && page.scanned_through <= after {
+            if page.more && (page.scanned_through <= after.seq || page.next.seq <= after.seq) {
                 return Err(AppError::InvalidData(
                     "Switch wire 7.4.4: a page that doesn't move past the position asked".into(),
                 ));
@@ -590,6 +705,7 @@ impl App {
             if !page.more {
                 return Ok(());
             }
+            after = page.next;
         }
     }
 
@@ -718,9 +834,9 @@ impl App {
 
     /// Follow the service `doc` names (Switch spec 12.5 step 4): the meta, the client, the
     /// cursor's generation and the chain view go across in one commit, with the
-    /// re-registration batch signed for the new generation. Batches signed for the old
-    /// generation are dropped: their entries are read again, and the record and the newest
-    /// receive key go in the re-registration.
+    /// re-registration batch signed for the new generation. Of the batches signed for the
+    /// old generation, the record and the newest receive key go in the re-registration, and
+    /// the kept ones are carried across ([`App::carry_kept_writes`]).
     async fn switch_over(
         &mut self,
         doc: &IdentityDoc,
@@ -754,11 +870,18 @@ impl App {
                 tx.put(&key::receive_key(*n), held)?;
             }
         }
-        if self.state.pending_effect.take().is_some() {
-            tx.delete(key::PENDING_EFFECT)?;
-        }
+        let events = self.carry_kept_writes(&mut tx, false).await?;
         if self.state.pending_record.take().is_some() {
             tx.delete(key::PENDING_RECORD)?;
+        }
+        // A loss followed before, its kept batch unanswered, goes on at this generation.
+        if let Some(mut loss) = self.loss_record().await?
+            && !loss.done()
+            && !loss.batch.is_empty()
+        {
+            let kept = Batch::from_body(loss.batch.clone())?;
+            loss.batch = self.sign_ops(ops_of(&kept), None)?.body().to_vec();
+            tx.put(super::recovery::keys::LOSS, &loss)?;
         }
         let batch = self.reregistration_batch()?;
         mv.step = MoveStep::Switched;
@@ -766,7 +889,101 @@ impl App {
         tx.put(key::META, &self.state.meta)?;
         tx.put(key::CURSOR, &self.state.cursor)?;
         tx.put(keys::MOVE, &*mv)?;
-        self.commit(tx).await
+        self.commit(tx).await?;
+        self.events.extend(events);
+        Ok(())
+    }
+
+    /// At a provider change, what the app signed for the generation it leaves and kept
+    /// unanswered (Switch spec 12.5 step 2, 12.6, 13.5), into `tx`. Called once the app
+    /// signs for the new generation, while the chain view is still the old service's: a
+    /// batch whose ID that chain holds was applied there, though its answer was lost.
+    ///
+    /// - **`pending/effect`:** applied, its outcome commits now, so its entry isn't
+    ///   processed again and an effect without conditions is never applied twice; otherwise
+    ///   it goes, and its entry is read again and its effect signed anew.
+    /// - **`opq/<batch_id>`:** applied, what it settles commits and it goes; otherwise its
+    ///   operations are signed again for the new generation and kept under a new batch ID,
+    ///   sent with the next write. After a loss, one holding an `attempt` goes instead: no
+    ///   automatic attempt is made on an obligation from before the loss (Switch spec 12.6
+    ///   step 5).
+    ///
+    /// Returns the events to report once `tx` commits.
+    pub(crate) async fn carry_kept_writes(
+        &mut self,
+        tx: &mut Tx,
+        after_loss: bool,
+    ) -> Result<Vec<AppEvent>, AppError> {
+        let mut events = Vec::new();
+        if let Some(pending) = self.state.pending_effect.take() {
+            tx.delete(key::PENDING_EFFECT)?;
+            let applied = Batch::from_body(pending.body.clone())?
+                .id()
+                .is_some_and(|id| self.applied_by_old_service(&id));
+            if applied {
+                let now = self.now();
+                processed_writes(tx, &pending.sender, &pending.msg_id, pending.hash, now)?;
+                tx.local(&pending.local)?;
+                if pending.parked {
+                    tx.delete(&key::parked(pending.seq))?;
+                    self.state.parked.remove(&pending.seq);
+                } else if pending.past_held {
+                    tx.put(&key::seen(pending.seq), &())?;
+                    self.state.seen.insert(pending.seq);
+                } else {
+                    let cursor = &mut self.state.cursor;
+                    cursor.seq = cursor.seq.max(pending.seq);
+                    cursor.time_ms = cursor.time_ms.max(pending.accepted_at_ms);
+                }
+                if let Some(to) = pending.cursor_to {
+                    let cursor = &mut self.state.cursor;
+                    cursor.at_service = cursor.at_service.max(to);
+                }
+                events.push(AppEvent::MessageReceived {
+                    seq: pending.seq,
+                    kind: pending.kind,
+                    msg_id: pending.msg_id,
+                    sender: pending.sender,
+                });
+            }
+        }
+        for (id, pending) in self.kept_batches().await? {
+            if self.applied_by_old_service(&id) {
+                self.settle_kept_batch(&id, &pending, tx).await?;
+                events.push(AppEvent::KeptBatchApplied { batch_id: id });
+                continue;
+            }
+            let kept = Batch::from_body(pending.body.clone())?;
+            let ops = ops_of(&kept);
+            let attempts = ops.iter().any(|(_, kind)| {
+                matches!(kind, OpKind::Claim(claim) if claim.kind == ClaimType::Attempt)
+            });
+            if after_loss && attempts {
+                Self::replace_kept_batch(&id, None, tx)?;
+                events.push(AppEvent::KeptBatchDropped { batch_id: id });
+                continue;
+            }
+            let signed = self.sign_ops(ops, None)?;
+            let new_id = signed
+                .id()
+                .ok_or_else(|| AppError::InvalidData("a batch of operations has an ID".into()))?;
+            let mut renewed = pending.clone();
+            renewed.body = signed.body().to_vec();
+            Self::replace_kept_batch(&id, Some((&new_id, &renewed)), tx)?;
+            events.push(AppEvent::KeptBatchSignedAgain {
+                batch_id: id,
+                new_batch_id: new_id,
+            });
+        }
+        Ok(events)
+    }
+
+    /// Whether the old service's chain, as the app verified it, holds batch `id`.
+    fn applied_by_old_service(&self, id: &[u8; 16]) -> bool {
+        self.state
+            .chain
+            .as_ref()
+            .is_some_and(|chain| chain.holds_batch(id))
     }
 
     /// The app record and the newest receive key record, signed for the generation followed.
@@ -898,6 +1115,8 @@ impl App {
         if !read {
             return Ok(());
         }
+        // Batches kept from an earlier pass go first, so the lists are compared after them.
+        self.resume_batches().await?;
         let result = self.client.allow().await;
         let held = match self.take(result).await {
             Ok(held) => held,
@@ -953,17 +1172,15 @@ impl App {
         self.submit_ops(ops).await
     }
 
-    /// Send `ops` in batches of at most eight, each signed once and sent until answered.
+    /// Send `ops` in batches of at most eight, each signed once and kept before it is
+    /// first sent (Switch wire 2.1): one whose answer is lost goes again, the same bytes,
+    /// before any later write ([`App::submit_batch`]).
     pub(crate) async fn submit_ops(&mut self, ops: Vec<OpKind>) -> Result<(), AppError> {
         for chunk in ops.chunks(MAX_BATCH_ENTRIES) {
-            let batch = self.sign_ops(
-                chunk
-                    .iter()
-                    .map(|op| (Vec::<Condition>::new(), op.clone()))
-                    .collect(),
-                None,
-            )?;
-            self.submit(&batch).await?;
+            let batch = chunk
+                .iter()
+                .fold(OpBatch::new(), |batch, op| batch.op(op.clone()));
+            self.submit_batch(batch).await?;
         }
         Ok(())
     }
@@ -1077,6 +1294,7 @@ impl App {
             tx.delete(push::KEY)?;
         }
         self.commit(tx).await?;
+        self.state.gone = Some(gone);
         if had_push {
             self.events.push(AppEvent::PushRemoved);
         }
@@ -1087,10 +1305,13 @@ impl App {
     /// An answer the account's key didn't sign. A newer own `identity.json` is followed: a
     /// key change or a move the app hadn't seen yet. For a `404`, the account may be erased
     /// (Switch spec 12.7): it is gone when the identity publishes no `identity.json` any
-    /// more. Anything else the app can't tell.
+    /// more, unless the verified own copy the app holds names a later generation than it
+    /// follows, a live account elsewhere, which is followed instead. Anything else the app
+    /// can't tell.
     async fn unknown_account(&mut self, status: u16) -> Result<Unknown, AppError> {
         let identity = self.state.meta.identity;
         match identity::read_homeserver(self.env.homeserver.as_ref(), &identity).await {
+            Ok(None) if status == 404 && self.provider_superseded() => Ok(Unknown::Moved),
             Ok(None) if status == 404 => {
                 self.mark_gone(GoneReason::Erased).await?;
                 Ok(Unknown::Gone)

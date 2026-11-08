@@ -22,6 +22,7 @@
 use pubky_switch_core::chain::TransitionProof;
 use pubky_switch_core::claims::{ClaimType, ClaimView, EntryKind};
 use pubky_switch_core::enc::{b64, serde_b64_vec};
+use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::ops::{Condition, MAX_BATCH_ENTRIES, OpKind, RecordVersion, SignedOp};
 use serde::{Deserialize, Serialize};
 
@@ -32,6 +33,7 @@ use super::recovery::LossStep;
 use super::state::{Tx, key};
 use super::{App, AppError};
 use crate::client::{Batch, Submitted};
+use crate::error::ClientError;
 
 /// The prefix of the kept batches.
 const PENDING_PREFIX: &str = "opq/";
@@ -171,7 +173,17 @@ impl App {
         self.ready_local().await?;
         self.refuse_when_stopped()?;
         self.refuse_before_upload().await?;
-        self.resume_batches().await?;
+        match self.resume_batches().await {
+            Ok(()) => {}
+            // A frozen account takes no write, but the app queues its writes for the next
+            // service (Switch spec 12.5 step 2): the new batch is kept too, and the call
+            // reports the `410 moved` its own send gets.
+            Err(AppError::Switch(ClientError::Switch {
+                code: ErrorCode::Moved,
+                ..
+            })) => {}
+            Err(error) => return Err(error),
+        }
         let attempts = batch
             .ops
             .iter()
@@ -242,7 +254,7 @@ impl App {
         for (id, pending) in kept {
             let id = pubky_switch_core::enc::unb64_array::<16>(&id)
                 .map_err(|_| AppError::Store(crate::error::StoreError::Corrupt))?;
-            let batch = Batch::from_body(pending.body.clone())?;
+            let batch = self.without_stale_cursor(Batch::from_body(pending.body.clone())?)?;
             match self.run_pending(&id, &pending, &batch).await {
                 Ok(submitted) => self.check_resumed_attempts(&batch, &submitted).await?,
                 Err(error) => match refused_for_good(&error) {
@@ -284,6 +296,22 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    /// A kept batch to send again: its signed operations are its exact bytes (Switch wire
+    /// 2.1), but its unsigned `cursor.set` may name a position the service's cursor has
+    /// passed since, which would take that cursor back. Such a cursor move is left out; the
+    /// batch ID and the signed operations don't change.
+    fn without_stale_cursor(&self, batch: Batch) -> Result<Batch, AppError> {
+        match batch.cursor() {
+            Some(position)
+                if position.generation != self.state.meta.generation
+                    || position.seq < self.state.cursor.at_service =>
+            {
+                Ok(Batch::new(batch.ops().to_vec(), None)?)
+            }
+            _ => Ok(batch),
+        }
     }
 
     /// Send a kept batch and commit its outcome. A refusal for good drops it; any other
@@ -404,6 +432,54 @@ impl App {
             claim_key: *claim_key,
             step,
         })
+    }
+}
+
+// -------------------------------------------------------------------------------------
+// Kept batches at a provider change (`provider.rs`, `recovery.rs`)
+
+impl App {
+    /// The batches kept under `opq/`, by ID.
+    pub(crate) async fn kept_batches(&self) -> Result<Vec<([u8; 16], PendingBatch)>, AppError> {
+        self.reader()
+            .scan::<PendingBatch>(PENDING_PREFIX)
+            .await?
+            .into_iter()
+            .map(|(id, pending)| {
+                pubky_switch_core::enc::unb64_array::<16>(&id)
+                    .map(|id| (id, pending))
+                    .map_err(|_| AppError::Store(crate::error::StoreError::Corrupt))
+            })
+            .collect()
+    }
+
+    /// A kept batch the old service applied, though its answer was lost: what it settles
+    /// without its proofs goes into `tx`, and it is no longer kept.
+    pub(crate) async fn settle_kept_batch(
+        &mut self,
+        id: &[u8; 16],
+        pending: &PendingBatch,
+        tx: &mut Tx,
+    ) -> Result<(), AppError> {
+        let batch = Batch::from_body(pending.body.clone())?;
+        for op in batch.ops() {
+            self.settle_op(op, None, pending, tx).await?;
+        }
+        tx.delete(&pending_key(id))
+    }
+
+    /// Keep `pending` under `new_id` in place of the batch kept under `id`; `None` only
+    /// drops it.
+    pub(crate) fn replace_kept_batch(
+        id: &[u8; 16],
+        replacement: Option<(&[u8; 16], &PendingBatch)>,
+        tx: &mut Tx,
+    ) -> Result<(), AppError> {
+        tx.delete(&pending_key(id))?;
+        match replacement {
+            Some((new_id, pending)) => tx.put(&pending_key(new_id), pending),
+            None => Ok(()),
+        }
     }
 }
 

@@ -375,6 +375,8 @@ pub(crate) struct AppState {
     pub(crate) restore: Option<RestoreState>,
     pub(crate) leave: Option<LeaveState>,
     pub(crate) service_time: Option<ServiceTime>,
+    /// The app isn't current any more, or its account is gone: every read stops.
+    pub(crate) gone: Option<provider::GoneRecord>,
 }
 
 /// One app of an identity, on top of the Switch.
@@ -525,6 +527,7 @@ impl App {
             restore: None,
             leave: None,
             service_time: None,
+            gone: None,
         };
         let mut app = App {
             env,
@@ -711,6 +714,7 @@ impl App {
             restore: reader.get(key::RESTORE).await?,
             leave,
             service_time: reader.get(key::SERVICE_TIME).await?,
+            gone: reader.get(provider::keys::GONE).await?,
             meta,
         })
     }
@@ -876,6 +880,7 @@ impl App {
             }),
             leave: None,
             service_time: None,
+            gone: None,
         };
         let ns = client_namespace(&meta.app_id);
         let client = Self::client_for(&env, &meta, &backup.keys, &cert)?;

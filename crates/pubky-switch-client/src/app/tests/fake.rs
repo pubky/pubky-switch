@@ -111,6 +111,9 @@ pub(crate) enum Fault {
     },
     /// Apply the request, then lose the answer.
     LoseAnswer { path: String },
+    /// Fail to connect, applying nothing, once `after` matching requests went through; the
+    /// request's body is kept.
+    Unreachable { path: String, after: usize },
 }
 
 pub(crate) struct Inner {
@@ -158,6 +161,8 @@ pub(crate) struct Inner {
     /// Feed reads answered before every later one is `503 unavailable`: a bound for tests
     /// of reads that must end.
     pub(crate) feed_limit: Option<u64>,
+    /// The bodies of the requests an `Unreachable` fault failed.
+    pub(crate) unreached: Vec<Vec<u8>>,
 }
 
 /// The scripted switch.
@@ -225,6 +230,7 @@ impl FakeSwitch {
                 shared: shared::Shared::default(),
                 feed_reads: 0,
                 feed_limit: None,
+                unreached: Vec::new(),
             }),
         })
     }
@@ -284,6 +290,7 @@ impl FakeSwitch {
                 shared: inner.shared.clone(),
                 feed_reads: 0,
                 feed_limit: None,
+                unreached: Vec::new(),
             }),
         })
     }
@@ -370,17 +377,29 @@ impl FakeSwitch {
         let mut inner = self.lock();
         let path = request.path_and_query.clone();
         let mut lose = false;
-        if let Some(index) = inner.faults.iter().position(|fault| match fault {
-            Fault::Error { path: p, .. } | Fault::LoseAnswer { path: p } => {
-                path.contains(p.as_str())
+        let matching = inner.faults.iter().position(|fault| match fault {
+            Fault::Error { path: p, .. }
+            | Fault::LoseAnswer { path: p }
+            | Fault::Unreachable { path: p, .. } => path.contains(p.as_str()),
+        });
+        let passes = matching.is_some_and(|index| match inner.faults.get_mut(index) {
+            Some(Fault::Unreachable { after, .. }) if *after > 0 => {
+                *after -= 1;
+                true
             }
-        }) {
+            _ => false,
+        });
+        if let Some(index) = matching.filter(|_| !passes) {
             match inner.faults.remove(index) {
                 Some(Fault::Error { code, current, .. }) => {
                     let (status, body) = bad(code, "scripted", current);
                     return Ok(inner.respond(request, status, &body));
                 }
                 Some(Fault::LoseAnswer { .. }) => lose = true,
+                Some(Fault::Unreachable { .. }) => {
+                    inner.unreached.push(request.body.clone());
+                    return Err(TransportError::Connect("scripted".into()));
+                }
                 None => {}
             }
         }
@@ -921,6 +940,16 @@ impl Inner {
             let mut answer = answer.clone();
             answer["head"] = self.head().to_value();
             return (200, answer);
+        }
+        // Switch wire 6.4 step 6: an operation naming another generation, after the retry
+        // check.
+        let generation = self.tip.generation;
+        if ops.iter().any(|op| op.body().generation != generation) {
+            return bad(
+                ErrorCode::StaleGeneration,
+                "generation",
+                json!({ "generation": generation }),
+            );
         }
         if let Some(refusal) = self.check_ops(caller, &ops) {
             return refusal;

@@ -169,7 +169,7 @@ impl App {
         if matches!(self.state.alarm, Some(Alarm::Compromise { .. })) {
             self.leave_on_compromise().await;
         }
-        self.refuse_when_stopped()?;
+        self.refuse_when_halted()?;
         self.finish_join().await?;
         if let Some(report) = self.follow_provider_change().await? {
             return Ok(report);
@@ -232,6 +232,7 @@ impl App {
         }
         if self.state.alarm.is_none() {
             self.delete_retired_keys().await?;
+            self.forget_chain_behind_cursor().await?;
             self.maybe_rotate().await?;
             self.flush_cursor_if_due().await?;
         }
@@ -1328,7 +1329,7 @@ impl App {
 }
 
 /// The processed pair and its time index.
-fn processed_writes(
+pub(crate) fn processed_writes(
     tx: &mut Tx,
     sender: &[u8; 32],
     msg_id: &str,

@@ -45,6 +45,8 @@ type Routes = Vec<(String, Arc<FakeSwitch>)>;
 #[derive(Clone, Default)]
 pub(crate) struct Router {
     switches: Arc<Mutex<Routes>>,
+    /// Feed reads left before every further one fails to connect, when set.
+    feeds_left: Arc<Mutex<Option<u64>>>,
 }
 
 impl Router {
@@ -61,7 +63,25 @@ impl Router {
         switches.push((origin.to_owned(), Arc::clone(switch)));
     }
 
+    /// Route nothing to `origin` any more: its service is unreachable.
+    pub(crate) fn remove(&self, origin: &str) {
+        self.switches.lock().unwrap().retain(|(o, _)| o != origin);
+    }
+
+    /// Fail every feed read after the next `reads`, so a read that never ends fails.
+    pub(crate) fn limit_feeds(&self, reads: u64) {
+        *self.feeds_left.lock().unwrap() = Some(reads);
+    }
+
     fn handle(&self, request: &Request) -> Result<Response, TransportError> {
+        if request.path_and_query.contains("/feed")
+            && let Some(left) = self.feeds_left.lock().unwrap().as_mut()
+        {
+            if *left == 0 {
+                return Err(TransportError::Connect("too many feed reads".into()));
+            }
+            *left -= 1;
+        }
         let switch = self
             .switches
             .lock()
@@ -1134,8 +1154,24 @@ async fn test_revoked_app_stops_and_drops_its_push_setting() {
     app.register_push(&NoRelay, "https://push.example/v1/hook", "token")
         .await
         .unwrap();
-    // The signer revokes the app at the service: every call is `403 not_current`.
+    // The signer revokes the app at the service: every call is `403 not_current`. Until it
+    // publishes the revocation, the newest identity.json still lists the app, which reports
+    // the answer and isn't gone (Switch spec 12.2).
     w.switch.revoke(me);
+    let error = app.receive(None).await.unwrap_err();
+    assert_eq!(error.code(), Some(ErrorCode::NotCurrent));
+    assert_eq!(
+        app.follow_provider().await.unwrap(),
+        ProviderStatus::Current
+    );
+    // The signer publishes the app as removed (Switch spec 12.2 step 3).
+    w.next_doc(|body| {
+        body.apps.retain(|a| a.app_id != me);
+        body.removed.push(RemovedApp {
+            app_id: me,
+            distrust_from: START,
+        });
+    });
     let report = app.receive(None).await.unwrap();
     assert!(report.stopped);
     assert!(has(&report.events, |e| matches!(e, AppEvent::Removed)));
@@ -1412,4 +1448,617 @@ async fn test_loss_writes_wait_for_the_upload() {
     app.submit_batch(crate::app::OpBatch::new().op(OpKind::DenyPut { pubky: [9; 32] }))
         .await
         .unwrap();
+}
+
+// -------------------------------------------------------------------------------------
+// Provider changes that go wrong on the way (Switch spec 12.5 "Abort", 12.6, 13.5)
+
+/// A third service's origin.
+pub(crate) const THIRD: &str = "https://third.example";
+
+/// A service recovering alice's account at `generation` after the loss of `from`, at
+/// `THIRD`, with the signer's document naming it delivered and published.
+fn third_recovering(w: &World, router: &Router, generation: u64, from: u64) -> Arc<FakeSwitch> {
+    let key = SigningKey::from_bytes(&seed("service/alice/third"));
+    let third = FakeSwitch::recovering(
+        IdentityKey::from_secret(seed("alice/identity")),
+        key.clone(),
+        Arc::clone(&w.clock),
+        generation,
+        from,
+    );
+    router.add(THIRD, &third);
+    publish_at(
+        w,
+        &third,
+        Inbox::new(THIRD, key.verifying_key().to_bytes()),
+        generation,
+        Some(from),
+    );
+    third
+}
+
+fn transport(error: &AppError) -> bool {
+    matches!(error, AppError::Transport(_))
+}
+
+fn allow_ops_for(ops: &[pubky_switch_core::ops::SignedOp], who: [u8; 32]) -> usize {
+    ops.iter()
+        .filter(|op| matches!(op.body().kind, OpKind::AllowPut { pubky, .. } if pubky == who))
+        .count()
+}
+
+#[tokio::test]
+async fn test_move_reads_the_old_feed_past_pages_of_entries_alone() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let config = AppConfig {
+        page_size: 2,
+        ..World::config()
+    };
+    let mut app = App::join(
+        router.env(&w, Arc::clone(&w.store) as Arc<dyn StateStore>),
+        w.protocol.clone(),
+        config,
+        approve_with(&w, &[]),
+    )
+    .await
+    .unwrap();
+    let me = app.app_id();
+    // More than a page of inbox entries after the last chain item, then the freeze.
+    for i in 0..5 {
+        w.note(me, &format!("note {i}"));
+    }
+    let n_key = next_key();
+    w.switch.freeze(&freeze_for(&w, &n_key, 2));
+    let next = w.switch.import_into(n_key.clone());
+    router.add(NEXT, &next);
+    // A read of the old feed that never ends fails here instead of running on.
+    router.limit_feeds(50);
+    let report = app.receive(None).await.unwrap();
+    assert!(report.stopped);
+    assert_eq!(next.uploads().len(), 1, "{:?}", report.events);
+    publish_at(
+        &w,
+        &next,
+        Inbox::new(NEXT, n_key.verifying_key().to_bytes()),
+        2,
+        None,
+    );
+    let report = app.receive(None).await.unwrap();
+    assert!(has(&report.events, |e| matches!(
+        e,
+        AppEvent::ProviderFollowed { generation: 2 }
+    )));
+    // Every entry is processed once, at the next service.
+    assert_eq!(conversations_at(&next), 5);
+    assert_eq!(w.effects(), 0);
+}
+
+#[tokio::test]
+async fn test_move_stuck_at_a_gone_next_service_follows_a_newer_loss() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join(&w, &router).await;
+    let me = app.app_id();
+    let n_key = next_key();
+    w.switch.freeze(&freeze_for(&w, &n_key, 2));
+    let next = w.switch.import_into(n_key.clone());
+    router.add(NEXT, &next);
+    assert!(app.receive(None).await.unwrap().stopped);
+    publish_at(
+        &w,
+        &next,
+        Inbox::new(NEXT, n_key.verifying_key().to_bytes()),
+        2,
+        None,
+    );
+    // The next service is gone before the app re-registers there: the move is stuck.
+    router.remove(NEXT);
+    let error = app.receive(None).await.unwrap_err();
+    assert!(transport(&error), "{error:?}");
+    assert!(transport(&app.receive(None).await.unwrap_err()));
+    // The signer declares generation 2 lost, at a third service.
+    let third = third_recovering(&w, &router, 3, 2);
+    let report = app.receive(None).await.unwrap();
+    assert!(
+        has(&report.events, |e| matches!(
+            e,
+            AppEvent::ProviderChangeSuperseded {
+                generation: 2,
+                newer: 3
+            }
+        )),
+        "{:?}",
+        report.events
+    );
+    assert!(has(&report.events, |e| matches!(
+        e,
+        AppEvent::ProviderLost {
+            lost_generation: 2,
+            generation: 3
+        }
+    )));
+    assert!(has(&report.events, |e| matches!(
+        e,
+        AppEvent::ProviderRecovered { generation: 3 }
+    )));
+    assert_eq!(app.cursor().generation, 3);
+    assert!(third.app(&me).receive_n.is_some());
+    assert!(app.alarm().is_none());
+}
+
+#[tokio::test]
+async fn test_loss_stuck_at_a_gone_service_follows_a_newer_loss() {
+    let store = Arc::new(MemoryStore::new());
+    let lost = lost_world(Arc::clone(&store) as Arc<dyn StateStore>).await;
+    // The new service is gone too before the app registers there.
+    lost.router.remove(NEXT);
+    let error = follow_loss(&lost, Arc::clone(&store) as Arc<dyn StateStore>)
+        .await
+        .unwrap_err();
+    assert!(transport(&error), "{error:?}");
+    // The signer declares generation 2 lost, at a third service.
+    let third = third_recovering(&lost.w, &lost.router, 3, 2);
+    let (app, events) = follow_loss(&lost, store as Arc<dyn StateStore>)
+        .await
+        .unwrap();
+    assert!(
+        has(&events, |e| matches!(
+            e,
+            AppEvent::ProviderChangeSuperseded {
+                generation: 2,
+                newer: 3
+            }
+        )),
+        "{events:?}"
+    );
+    let info = app.recovery_info().await.unwrap().unwrap();
+    assert!(info.steps_done);
+    assert_eq!(info.loss.lost_generation, 2);
+    assert_eq!(info.loss.generation, 3);
+    assert!(third.app(&app.app_id()).receive_n.is_some());
+    // The re-sends are asked once, from the cursor's time at the first service.
+    let losses = lost.protocol.losses.lock().unwrap().clone();
+    assert_eq!(losses.len(), 1);
+    assert_eq!(losses[0].accepted_from_ms, lost.note_at_ms);
+}
+
+#[tokio::test]
+async fn test_move_carries_kept_batches_to_the_next_service() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join(&w, &router).await;
+    let carol = IdentityKey::from_secret(seed("carol/identity")).public();
+    let erin = IdentityKey::from_secret(seed("erin/identity")).public();
+    let dave = IdentityKey::from_secret(seed("dave/identity")).public();
+    let contact = |pubky| {
+        crate::app::OpBatch::new().op(OpKind::AllowPut {
+            pubky,
+            kind: AllowKind::Contact,
+        })
+    };
+    // A batch the old service applied, its answer lost.
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.submit_batch(contact(carol)).await.is_err());
+    // A batch queued while the account is frozen (Switch spec 12.5 step 2).
+    let n_key = next_key();
+    w.switch.freeze(&freeze_for(&w, &n_key, 2));
+    let error = app.submit_batch(contact(erin)).await.unwrap_err();
+    assert_eq!(error.code(), Some(ErrorCode::Moved));
+    let next = w.switch.import_into(n_key.clone());
+    router.add(NEXT, &next);
+    assert!(app.receive(None).await.unwrap().stopped);
+    publish_at(
+        &w,
+        &next,
+        Inbox::new(NEXT, n_key.verifying_key().to_bytes()),
+        2,
+        None,
+    );
+    let report = app.receive(None).await.unwrap();
+    assert!(
+        has(&report.events, |e| matches!(
+            e,
+            AppEvent::KeptBatchApplied { .. }
+        )),
+        "{:?}",
+        report.events
+    );
+    assert!(has(&report.events, |e| matches!(
+        e,
+        AppEvent::KeptBatchSignedAgain { .. }
+    )));
+    assert!(app.admits(&carol).await.unwrap());
+    // The batch the old service never applied goes to the next one at generation 2, with
+    // the next write.
+    app.submit_batch(contact(dave)).await.unwrap();
+    let applied = next.applied();
+    assert!(applied.iter().any(|op| op.body().generation == 2
+        && matches!(op.body().kind, OpKind::AllowPut { pubky, .. } if pubky == erin)));
+    // The one it applied isn't applied again.
+    assert_eq!(allow_ops_for(&applied, carol), 0);
+    assert_eq!(allow_ops_for(&w.switch.applied(), carol), 1);
+    assert_eq!(allow_ops_for(&applied, erin), 1);
+}
+
+#[tokio::test]
+async fn test_move_settles_an_effect_the_old_service_applied() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join(&w, &router).await;
+    let me = app.app_id();
+    let (seq, message) = w.note(me, "before");
+    // The effect is applied at the old service, and its answer lost.
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.receive(None).await.is_err());
+    assert_eq!(w.effects(), 1);
+    let n_key = next_key();
+    w.switch.freeze(&freeze_for(&w, &n_key, 2));
+    let next = w.switch.import_into(n_key.clone());
+    router.add(NEXT, &next);
+    publish_at(
+        &w,
+        &next,
+        Inbox::new(NEXT, n_key.verifying_key().to_bytes()),
+        2,
+        None,
+    );
+    let report = app.receive(None).await.unwrap();
+    assert!(
+        has(&report.events, |e| matches!(
+            e,
+            AppEvent::ProviderFollowed { generation: 2 }
+        )),
+        "{:?}",
+        report.events
+    );
+    assert!(received(&report.events, seq));
+    // Applied once, at the old service: the entry isn't processed again at the next one.
+    assert_eq!(conversations_at(&next), 0);
+    assert_eq!(w.effects(), 1);
+    assert!(app.cursor().seq >= seq);
+    assert_eq!(
+        app.protocol_get(format!("notes/{}", message.msg_id).as_bytes())
+            .await
+            .unwrap(),
+        Some(b"before".to_vec())
+    );
+}
+
+/// The app at `store`, loaded through the loss's router.
+async fn load_lost(lost: &Lost, store: Arc<dyn StateStore>) -> App {
+    App::load(
+        lost.router.env(&lost.w, store),
+        Arc::clone(&lost.protocol) as Arc<dyn Protocol>,
+        World::config(),
+        app_keys("wallet").app_id_bytes(),
+    )
+    .await
+    .unwrap()
+}
+
+/// A receive key record of the wallet's signing key for `key`.
+fn wallet_key_record(
+    app: &App,
+    key: &pubky_switch_core::keys::ReceiveKey,
+) -> pubky_switch_core::records::ReceiveKeyRecord {
+    pubky_switch_core::records::ReceiveKeyRecord::sign(
+        &app_keys("wallet"),
+        app.cert(),
+        pubky_switch_core::records::ReceiveKeyBody::new(app.cert(), key),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn test_loss_registration_taken_by_another_device_is_adopted() {
+    let store = Arc::new(MemoryStore::new());
+    let lost = lost_world(Arc::clone(&store) as Arc<dyn StateStore>).await;
+    // The first follow can't reach the new service: the loss starts, its batch kept.
+    lost.router.remove(NEXT);
+    assert!(
+        follow_loss(&lost, Arc::clone(&store) as Arc<dyn StateStore>)
+            .await
+            .is_err()
+    );
+    // Another device of the app registers its key first, and shares its kid.
+    let mut app = load_lost(&lost, Arc::clone(&store) as Arc<dyn StateStore>).await;
+    let other = pubky_switch_core::keys::ReceiveKey::generate(1).unwrap();
+    let record = wallet_key_record(&app, &other);
+    lost.next
+        .app_op(
+            &app_keys("wallet"),
+            OpKind::ReceiveKeyPut {
+                record: record.signed().clone(),
+            },
+        )
+        .unwrap();
+    app.take_device_keys(crate::app::DeviceKeys {
+        receive_keys: Vec::new(),
+        known: vec![(pubky_switch_core::enc::b64(&other.kid), 1)],
+        rotation_ms: 0,
+    })
+    .await
+    .unwrap();
+    drop(app);
+    lost.router.add(NEXT, &lost.next);
+    let (app, events) = follow_loss(&lost, store as Arc<dyn StateStore>)
+        .await
+        .unwrap();
+    assert!(
+        has(&events, |e| matches!(e, AppEvent::RotationLost { n: 1 })),
+        "{events:?}"
+    );
+    // This device's own key went; its record went alone.
+    assert_eq!(app.receive_key_numbers(), vec![0]);
+    assert!(lost.next.app(&app.app_id()).record.is_some());
+    assert!(app.recovery_info().await.unwrap().unwrap().steps_done);
+    assert!(app.alarm().is_none());
+}
+
+#[tokio::test]
+async fn test_loss_registration_taken_by_a_foreign_key_is_a_compromise() {
+    let store = Arc::new(MemoryStore::new());
+    let lost = lost_world(Arc::clone(&store) as Arc<dyn StateStore>).await;
+    // A copy of the signing key registers a key of its own first at the new service.
+    let app = load_lost(&lost, Arc::clone(&store) as Arc<dyn StateStore>).await;
+    let me = app.app_id();
+    let thief = pubky_switch_core::keys::ReceiveKey::generate(1).unwrap();
+    let record = wallet_key_record(&app, &thief);
+    drop(app);
+    lost.next
+        .app_op(
+            &app_keys("wallet"),
+            OpKind::ReceiveKeyPut {
+                record: record.signed().clone(),
+            },
+        )
+        .unwrap();
+    let error = follow_loss(&lost, store as Arc<dyn StateStore>)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            AppError::Alarm(crate::app::Alarm::Compromise { n: 1, .. })
+        ),
+        "{error:?}"
+    );
+    // It left at once, at the new service.
+    assert!(lost.next.app(&me).departed);
+}
+
+#[tokio::test]
+async fn test_not_current_while_listed_with_its_own_certificate_isnt_gone() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join(&w, &router).await;
+    let me = app.app_id();
+    // The newest identity.json lists the app with the certificate it presents.
+    w.switch.fail_next(Fault::Error {
+        path: "feed".into(),
+        code: ErrorCode::NotCurrent,
+        current: json!({}),
+    });
+    let error = app.receive(None).await.unwrap_err();
+    assert_eq!(error.code(), Some(ErrorCode::NotCurrent));
+    assert_eq!(
+        app.follow_provider().await.unwrap(),
+        ProviderStatus::Current
+    );
+    // The next read goes on.
+    let seq = w.note(me, "after").0;
+    let report = app.receive(None).await.unwrap();
+    assert!(received(&report.events, seq), "{:?}", report.events);
+}
+
+#[tokio::test]
+async fn test_gone_app_refuses_every_read() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join(&w, &router).await;
+    let me = app.app_id();
+    w.next_doc(|body| {
+        body.apps.retain(|a| a.app_id != me);
+        body.removed.push(RemovedApp {
+            app_id: me,
+            distrust_from: START,
+        });
+    });
+    assert!(app.receive(None).await.unwrap().stopped);
+    let gone = |error: AppError| matches!(error, AppError::Refused(crate::app::Refusal::Gone));
+    let target = crate::app::RecordTarget::new(super::shared_flows::items(), b"key");
+    for _ in 0..2 {
+        assert!(gone(
+            app.register_push(&NoRelay, "https://push.example/v1/hook", "token")
+                .await
+                .unwrap_err()
+        ));
+        assert!(gone(app.read_claim(&[1; 32]).await.unwrap_err()));
+        assert!(gone(app.read_record(&target).await.unwrap_err()));
+        assert!(gone(app.peek().await.unwrap_err()));
+        // The read itself reports the app stopped, asking the service nothing.
+        assert!(app.receive(None).await.unwrap().stopped);
+        app = w_load(&w, &router).await;
+    }
+}
+
+#[tokio::test]
+async fn test_registration_sent_again_never_takes_the_service_cursor_back() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join(&w, &router).await;
+    let me = app.app_id();
+    w.note(me, "one");
+    app.receive(None).await.unwrap();
+    // A chain item the cursor passes with its move deferred, then the rotation, whose
+    // registration doesn't reach the service.
+    w.switch.signer_op(OpKind::DenyPut { pubky: [9; 32] });
+    w.clock.advance_ms(25 * 3_600_000);
+    w.switch.fail_next(Fault::Unreachable {
+        path: "ops".into(),
+        after: 0,
+    });
+    assert!(app.receive(None).await.is_err());
+    // A later effect moves the service's cursor further, then the registration goes again.
+    let seq = w.note(me, "two").0;
+    app.receive(None).await.unwrap();
+    assert_eq!(w.switch.app(&me).receive_n, Some(1));
+    assert!(
+        w.switch.app(&me).cursor >= seq,
+        "{}",
+        w.switch.app(&me).cursor
+    );
+}
+
+#[tokio::test]
+async fn test_device_sync_doesnt_bring_back_a_deleted_key() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join(&w, &router).await;
+    let me = app.app_id();
+    let shared = app.device_keys();
+    w.note(me, "one");
+    app.receive(None).await.unwrap();
+    w.clock.advance_ms(25 * 3_600_000);
+    app.receive(None).await.unwrap();
+    app.receive(None).await.unwrap();
+    // Key 0 went once the cursor passed key 1's registration.
+    assert_eq!(app.receive_key_numbers(), vec![1]);
+    // Another device still shares key 0: it doesn't come back.
+    app.take_device_keys(shared).await.unwrap();
+    assert_eq!(app.receive_key_numbers(), vec![1]);
+}
+
+#[tokio::test]
+async fn test_move_lists_batch_is_kept_and_sent_again_unchanged() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join_on(
+        &w,
+        &router,
+        Arc::clone(&w.store) as Arc<dyn StateStore>,
+        w.protocol.clone(),
+        &[Permission::ListsRead, Permission::ListsManage],
+    )
+    .await;
+    let carol = IdentityKey::from_secret(seed("carol/identity")).public();
+    w.switch.signer_op(OpKind::AllowPut {
+        pubky: carol,
+        kind: AllowKind::Contact,
+    });
+    app.receive(None).await.unwrap();
+    let n_key = next_key();
+    w.switch.freeze(&freeze_for(&w, &n_key, 2));
+    let next = w.switch.import_into(n_key.clone());
+    router.add(NEXT, &next);
+    // The export lacks carol.
+    next.lock().allow = Some(json!({
+        "contacts": [], "conversations": [], "deny": [], "flagged": [], "invite_codes": [],
+    }));
+    app.receive(None).await.unwrap();
+    publish_at(
+        &w,
+        &next,
+        Inbox::new(NEXT, n_key.verifying_key().to_bytes()),
+        2,
+        None,
+    );
+    // The re-registration goes through; the batch adding carol back doesn't.
+    next.fail_next(Fault::Unreachable {
+        path: "ops".into(),
+        after: 1,
+    });
+    assert!(app.receive(None).await.is_err());
+    let report = app.receive(None).await.unwrap();
+    assert!(has(&report.events, |e| matches!(
+        e,
+        AppEvent::ProviderFollowed { generation: 2 }
+    )));
+    // The batch went again, the bytes signed before it was first sent, and once.
+    let unreached = next.lock().unreached.clone();
+    let request = pubky_switch_core::ops::OpsRequest::parse(&unreached[0]).unwrap();
+    let sent_id = request
+        .signed()
+        .map(|signed| pubky_switch_core::ops::SignedOp::peek(signed).unwrap())
+        .next()
+        .unwrap()
+        .body()
+        .batch
+        .id;
+    let applied = next.applied();
+    assert_eq!(allow_ops_for(&applied, carol), 1);
+    assert!(applied.iter().any(|op| op.body().batch.id == sent_id
+        && matches!(op.body().kind, OpKind::AllowPut { pubky, .. } if pubky == carol)));
+}
+
+#[tokio::test]
+async fn test_unsigned_404_with_a_newer_own_document_is_followed_not_erased() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join(&w, &router).await;
+    let n_key = next_key();
+    w.switch.freeze(&freeze_for(&w, &n_key, 2));
+    let next = w.switch.import_into(n_key.clone());
+    router.add(NEXT, &next);
+    publish_at(
+        &w,
+        &next,
+        Inbox::new(NEXT, n_key.verifying_key().to_bytes()),
+        2,
+        None,
+    );
+    // The app holds the verified document naming the next service; then the old service
+    // drops the account and the Homeserver serves no identity.json.
+    assert!(app.refresh_identity().await.unwrap());
+    w.switch.lock().erased = true;
+    w.homeserver
+        .files
+        .lock()
+        .unwrap()
+        .remove(&(w.alice.public(), IDENTITY_PATH.to_owned()));
+    let over = app
+        .take_over(Err(AppError::Switch(ClientError::BadServiceSignature {
+            status: 404,
+        })))
+        .await;
+    assert!(matches!(over, crate::app::provider::TakeOver::ReadAgain));
+    assert_eq!(
+        app.follow_provider().await.unwrap(),
+        ProviderStatus::Followed { generation: 2 }
+    );
+}
+
+#[tokio::test]
+async fn test_chain_hashes_behind_the_cursor_stay_bounded() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join(&w, &router).await;
+    let me = app.app_id();
+    let ns = crate::store::client_namespace(&me);
+    let rows = |w: &World| {
+        w.store
+            .scan(&ns, b"chain/at/", None, u32::MAX)
+            .unwrap()
+            .len()
+    };
+    for round in 0..3u8 {
+        for i in 0..100u8 {
+            w.switch.signer_op(OpKind::DenyPut {
+                pubky: [round.wrapping_mul(100).wrapping_add(i); 32],
+            });
+        }
+        app.receive(None).await.unwrap();
+        assert!(
+            rows(&w) <= crate::app::chain::HASHES_BEHIND + 2,
+            "{} rows",
+            rows(&w)
+        );
+    }
+    // The view still checks what it reads, and reloads.
+    let seq = w.note(me, "after").0;
+    let mut app = w_load(&w, &router).await;
+    assert!(received(&app.receive(None).await.unwrap().events, seq));
+    assert!(app.alarm().is_none());
 }

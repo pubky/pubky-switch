@@ -432,6 +432,9 @@ impl App {
         self.state.meta.service_key = doc.inbox().service_key;
         self.state.meta.generation = generation;
         self.rebuild_client()?;
+        // The kept writes, judged against the old chain view before it goes (Switch spec
+        // 12.6 step 1, 13.5).
+        let events = self.carry_kept_writes(&mut tx, true).await?;
         let batch = self.sign_ops(
             vec![
                 (
@@ -493,9 +496,6 @@ impl App {
             tx.put(&key::parked(renumbered), &entry)?;
             self.state.parked.insert(renumbered, entry);
         }
-        if self.state.pending_effect.take().is_some() {
-            tx.delete(key::PENDING_EFFECT)?;
-        }
         if self.state.pending_record.take().is_some() {
             tx.delete(key::PENDING_RECORD)?;
         }
@@ -525,6 +525,7 @@ impl App {
         tx.put(key::META, &self.state.meta)?;
         tx.put(key::CURSOR, &self.state.cursor)?;
         self.commit(tx).await?;
+        self.events.extend(events);
         self.events.push(AppEvent::ProviderLost {
             lost_generation: lost,
             generation,
@@ -532,87 +533,133 @@ impl App {
         Ok(())
     }
 
-    /// Run the steps of a loss from where they stand, each committed as done.
-    pub(crate) async fn run_loss(&mut self, mut loss: LossRecord) -> Result<(), AppError> {
+    /// Run the steps of a loss from where they stand, each committed as done. Returns
+    /// `false` when a newer own `identity.json` names a later generation than the app
+    /// follows: the loss is left where it stands, a stuck step included, and the newer
+    /// document is followed instead (Switch spec 12.5 "Abort", 12.6). A loss superseded by
+    /// another loss is replaced by it; one superseded by a move or a key change goes on at
+    /// the generation followed once the app switched there.
+    pub(crate) async fn run_loss(&mut self, mut loss: LossRecord) -> Result<bool, AppError> {
         while !loss.done() {
-            match loss.step {
-                LossStep::Register => {
-                    self.loss_register(&mut loss).await?;
-                    loss.step = LossStep::Upload;
-                }
-                LossStep::Upload => {
-                    self.loss_upload(&loss).await?;
-                    loss.step = LossStep::Lists;
-                }
-                LossStep::Lists => {
-                    self.loss_lists().await?;
-                    loss.step = LossStep::Resend;
-                }
-                LossStep::Resend => {
-                    // The protocol's local writes commit with the step: asked once.
-                    let actions = self.protocol.provider_lost(&loss.view());
-                    let copy = self.lists_copy().await?;
-                    let me = self.state.meta.identity;
-                    let may_add = self.state.cert.has_permission(Permission::ConversationAdd);
-                    loss.conversations = actions
-                        .conversations
-                        .iter()
-                        .filter(|who| may_add && **who != me && !copy.deny.contains(who))
-                        .map(pubky_id)
-                        .collect();
-                    loss.conversations.sort();
-                    loss.conversations.dedup();
-                    loss.step = LossStep::Conversations;
-                    let mut tx = self.tx()?;
-                    tx.local(&actions.local)?;
-                    tx.put(keys::LOSS, &loss)?;
-                    self.commit(tx).await?;
-                    continue;
-                }
-                LossStep::Conversations => {
-                    self.loss_conversations(&mut loss).await?;
-                    loss.step = LossStep::Done;
-                    self.events.push(AppEvent::ProviderRecovered {
-                        generation: loss.generation,
-                    });
-                }
-                LossStep::Done => {}
+            if self.provider_superseded() {
+                self.events.push(AppEvent::ProviderChangeSuperseded {
+                    generation: self.state.meta.generation,
+                    newer: self.state.own_doc.generation(),
+                });
+                return Ok(false);
             }
-            let mut tx = self.tx()?;
-            tx.put(keys::LOSS, &loss)?;
-            if let Some(chain) = self.state.chain.as_mut() {
-                chain.write(&mut tx)?;
+            if let Err(error) = self.loss_step(&mut loss).await {
+                self.look_for_newer_doc(&error).await;
+                if !self.provider_superseded() {
+                    return Err(error);
+                }
             }
-            self.commit(tx).await?;
         }
-        self.push_after_provider_change().await
+        self.push_after_provider_change().await?;
+        Ok(true)
+    }
+
+    /// One step of a loss, committed as done.
+    async fn loss_step(&mut self, loss: &mut LossRecord) -> Result<(), AppError> {
+        match loss.step {
+            LossStep::Register => {
+                self.loss_register(loss).await?;
+                loss.step = LossStep::Upload;
+            }
+            LossStep::Upload => {
+                self.loss_upload(loss).await?;
+                loss.step = LossStep::Lists;
+            }
+            LossStep::Lists => {
+                self.loss_lists().await?;
+                loss.step = LossStep::Resend;
+            }
+            LossStep::Resend => {
+                // The protocol's local writes commit with the step: asked once.
+                let actions = self.protocol.provider_lost(&loss.view());
+                let copy = self.lists_copy().await?;
+                let me = self.state.meta.identity;
+                let may_add = self.state.cert.has_permission(Permission::ConversationAdd);
+                loss.conversations = actions
+                    .conversations
+                    .iter()
+                    .filter(|who| may_add && **who != me && !copy.deny.contains(who))
+                    .map(pubky_id)
+                    .collect();
+                loss.conversations.sort();
+                loss.conversations.dedup();
+                loss.step = LossStep::Conversations;
+                let mut tx = self.tx()?;
+                tx.local(&actions.local)?;
+                tx.put(keys::LOSS, &*loss)?;
+                return self.commit(tx).await;
+            }
+            LossStep::Conversations => {
+                self.loss_conversations(loss).await?;
+                loss.step = LossStep::Done;
+                self.events.push(AppEvent::ProviderRecovered {
+                    generation: loss.generation,
+                });
+            }
+            LossStep::Done => {}
+        }
+        let mut tx = self.tx()?;
+        tx.put(keys::LOSS, &*loss)?;
+        if let Some(chain) = self.state.chain.as_mut() {
+            chain.write(&mut tx)?;
+        }
+        self.commit(tx).await
     }
 
     /// Step 1: the kept batch delivers the record and registers the new key; then the
     /// recovery record, the new sequence's first item, gives the declaration's time.
+    ///
+    /// A `409 conflict` names the key registered there (Switch spec 3.6): this very key is
+    /// a registration answered before. Another device's key is adopted: this device drops
+    /// its own, and its record goes alone, signed once and kept, since the conflict applied
+    /// nothing. A key no device of the app made is a compromise: the app stops and leaves.
     async fn loss_register(&mut self, loss: &mut LossRecord) -> Result<(), AppError> {
-        let batch = Batch::from_body(loss.batch.clone())?;
-        let proofs = match self.submit(&batch).await {
-            Ok(submitted) => submitted.proofs,
-            Err(AppError::Switch(ClientError::Switch {
-                code: ErrorCode::Conflict,
-                current,
-                ..
-            })) => {
-                // A registration answered before: the conflict names this very key.
-                let named = current
-                    .get("receive_key")
-                    .and_then(|value| SignedDoc::from_strict_value(value).ok())
-                    .and_then(|doc| ReceiveKeyRecord::verify(&doc, &self.state.cert).ok());
-                let ours = self.state.receive_keys.get(&loss.key_n).map(|h| h.key.kid);
-                if named.is_none_or(|record| Some(record.kid()) != ours) {
-                    return Err(AppError::InvalidData(
-                        "Switch spec 12.6 step 1: the new service refused the registration".into(),
-                    ));
-                }
-                Vec::new()
+        let proofs = loop {
+            let batch = Batch::from_body(loss.batch.clone())?;
+            let registers = batch
+                .ops()
+                .iter()
+                .any(|op| matches!(op.body().kind, OpKind::ReceiveKeyPut { .. }));
+            let current = match self.submit(&batch).await {
+                Ok(submitted) => break submitted.proofs,
+                // The record alone: the service holds it, or a later one of the app's
+                // (Switch spec 4.2).
+                Err(AppError::Switch(ClientError::Switch {
+                    code: ErrorCode::Conflict,
+                    ..
+                })) if !registers => break Vec::new(),
+                Err(AppError::Switch(ClientError::Switch {
+                    code: ErrorCode::Conflict,
+                    current,
+                    ..
+                })) => current,
+                Err(error) => return Err(error),
+            };
+            let named = self.conflict_receive_key(&current).await?;
+            let ours = self.state.receive_keys.get(&loss.key_n).map(|h| h.key.kid);
+            if Some(named.kid()) == ours {
+                break Vec::new();
             }
-            Err(error) => return Err(error),
+            self.registered_elsewhere(loss.key_n, &named).await?;
+            loss.key_n = named.n();
+            let record = self.sign_ops(
+                vec![(
+                    Vec::<Condition>::new(),
+                    OpKind::AppPut {
+                        record: self.state.record.clone(),
+                    },
+                )],
+                None,
+            )?;
+            loss.batch = record.body().to_vec();
+            let mut tx = self.tx()?;
+            tx.put(keys::LOSS, &*loss)?;
+            self.commit(tx).await?;
         };
         let mut tx = self.tx()?;
         if let Some(proof) = proofs.get(1)

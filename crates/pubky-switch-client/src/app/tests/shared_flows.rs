@@ -1418,6 +1418,47 @@ async fn test_batch_carries_the_deferred_cursor_move() {
 }
 
 #[tokio::test]
+async fn test_batch_sent_again_never_takes_the_service_cursor_back() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    let me = app.app_id();
+    let dropped = |s: &Setup| {
+        s.w.switch.send(
+            &s.w.bob,
+            &s.w.bob_keys,
+            &s.w.bob_cert,
+            "sample.note",
+            json!({ "nothing": 1 }),
+            &[me],
+        )
+    };
+    // A dropped note defers the cursor move; the next batch carries it, but the service
+    // is unavailable, so the batch is kept with that cursor move.
+    let (first, _) = dropped(&s);
+    app.receive(None).await.unwrap();
+    s.w.switch.fail_next(super::fake::Fault::Error {
+        path: "ops".into(),
+        code: ErrorCode::Unavailable,
+        current: json!(null),
+    });
+    assert!(
+        app.submit_batch(OpBatch::new().op(OpKind::DenyPut { pubky: [9; 32] }))
+            .await
+            .is_err()
+    );
+    // The cursor moves on past a later note, on its own.
+    let (second, _) = dropped(&s);
+    app.receive(None).await.unwrap();
+    app.flush_cursor().await.unwrap();
+    assert!(s.w.switch.app(&me).cursor >= second && second > first);
+    // The kept batch goes again with its signed operations, but not its stale cursor move.
+    app.submit_batch(OpBatch::new().op(OpKind::DenyPut { pubky: [8; 32] }))
+        .await
+        .unwrap();
+    assert!(s.w.switch.app(&me).cursor >= second);
+}
+
+#[tokio::test]
 async fn test_batch_of_eight_has_no_room_for_the_cursor_and_nine_is_refused() {
     let s = Setup::new();
     let mut app = s.join("wallet").await;

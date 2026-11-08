@@ -41,6 +41,10 @@ pub const STUBS_KEPT_FOR_MS: u64 = 30 * DAY_MS - CLOCK_TOLERANCE_MS;
 /// The most held heads and own-write stubs the view keeps beyond its verified position.
 pub const HELD_MARKS: usize = 256;
 
+/// How many chain hashes behind the cursor the view keeps before it forgets them: they are
+/// forgotten in one step, so the store isn't rewritten on every read.
+pub(crate) const HASHES_BEHIND: usize = 64;
+
 /// A chain view as plain data: its record, chain hashes and batch IDs.
 pub(crate) type ChainExport = (ChainRecord, Vec<(u64, [u8; 32])>, Vec<([u8; 16], u64)>);
 
@@ -113,6 +117,29 @@ impl ChainView {
     /// The verified chain hash at `seq`, while the view keeps it.
     pub(crate) fn hash_at(&self, seq: u64) -> Option<[u8; 32]> {
         self.verifier.chain_hash_at(seq)
+    }
+
+    /// Whether the verified chain holds a batch with this ID within its 30-day window
+    /// (Switch spec 13.5): the service applied it.
+    pub(crate) fn holds_batch(&self, id: &[u8; 16]) -> bool {
+        self.verifier.holds_batch(id)
+    }
+
+    /// Forget the chain hashes behind `seq`, once more than [`HASHES_BEHIND`] of them are
+    /// kept. The app never reads behind its cursor again, so nothing compares a stub there;
+    /// heads and checkpoints at or behind the new floor are no longer compared, as behind
+    /// a checkpoint (Switch wire 7.4.4). The tip's hash is always kept. Returns whether
+    /// anything was forgotten.
+    pub(crate) fn forget_behind(&mut self, seq: u64) -> bool {
+        let mut state = self.verifier.state();
+        let floor = seq.min(state.last_seq);
+        if floor <= state.pruned_seq || state.at.range(..floor).count() <= HASHES_BEHIND {
+            return false;
+        }
+        state.at = state.at.split_off(&floor);
+        state.pruned_seq = floor;
+        self.verifier = Verifier::from_state(state);
+        true
     }
 
     /// The app follows a cooperative move or a key change in place (Switch spec 12.5, Switch
@@ -410,6 +437,27 @@ fn push_onto(verifier: &mut Verifier, stub: &Stub) -> Result<ChainEnvelope, Chai
     verifier.push(stub)
 }
 
+impl super::App {
+    /// After the cursor's commit: forget the chain hashes behind the cursor, which no read
+    /// meets again, so the view's records stay bounded however long the app runs without
+    /// checkpoints (Switch wire 7.4.4).
+    pub(crate) async fn forget_chain_behind_cursor(&mut self) -> Result<(), AppError> {
+        let cursor = self.state.cursor;
+        let Some(chain) = self.state.chain.as_mut() else {
+            return Ok(());
+        };
+        // A cooperative move continues the sequence, so the cursor's `seq` stays comparable.
+        if !chain.forget_behind(cursor.seq) {
+            return Ok(());
+        }
+        let mut tx = self.tx()?;
+        if let Some(chain) = self.state.chain.as_mut() {
+            chain.write(&mut tx)?;
+        }
+        self.commit(tx).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -581,6 +629,39 @@ mod tests {
         view.feed_page(&p2, START, false).unwrap();
         assert_eq!(view.verified_seq(), 6);
         assert_eq!(view.gap, None);
+    }
+
+    #[test]
+    fn test_chain_view_forgets_hashes_behind_a_floor() {
+        let (stubs, tips) = chain(100);
+        let mut view = ChainView::from_start(1);
+        view.feed_page(&page(&stubs, 0, head(&tips[100]), false), START, false)
+            .unwrap();
+        // Too few hashes behind the floor: nothing goes.
+        assert!(!view.forget_behind(10));
+        assert_eq!(view.hash_at(5), Some(tips[5].chain_hash));
+        assert!(view.forget_behind(90));
+        assert_eq!(view.hash_at(89), None);
+        assert_eq!(view.hash_at(90), Some(tips[90].chain_hash));
+        assert!(!view.forget_behind(90));
+        // A head behind the floor can't be compared; one at a kept `seq` still is.
+        let mut stale = head(&tips[5]);
+        stale.chain_hash = [1; 32];
+        view.observe_head(stale).unwrap();
+        let mut forged = head(&tips[95]);
+        forged.chain_hash = [1; 32];
+        assert!(view.observe_head(forged).is_err());
+        // A re-read from the floor on is still matched.
+        let (forked, _) = tips[94]
+            .append(95, START, ItemType::Identity, [99; 32], None)
+            .unwrap();
+        let error = view
+            .feed_page(&page(&[forked], 94, head(&tips[100]), false), START, false)
+            .unwrap_err();
+        assert!(matches!(error, AppError::Alarm(_)));
+        // The tip's hash is always kept.
+        assert!(!view.forget_behind(500));
+        assert_eq!(view.hash_at(100), Some(tips[100].chain_hash));
     }
 
     #[tokio::test]

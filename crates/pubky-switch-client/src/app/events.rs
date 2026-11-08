@@ -233,6 +233,38 @@ pub enum AppEvent {
         /// The generation recovered at.
         generation: u64,
     },
+    /// A move or a provider loss the app was following toward `generation` was given up:
+    /// the newest own `identity.json` names the later generation `newer`, which the app
+    /// follows instead (Switch spec 12.5 "Abort", 12.6).
+    ProviderChangeSuperseded {
+        /// The generation the change being followed went to.
+        generation: u64,
+        /// The generation the newest own `identity.json` names.
+        newer: u64,
+    },
+    /// A batch of operations kept before a provider change, its answer lost, is in the
+    /// old service's chain: it was applied, and what it settles is committed (Switch spec
+    /// 13.5).
+    KeptBatchApplied {
+        /// The batch ID.
+        batch_id: [u8; 16],
+    },
+    /// A kept batch the old service didn't apply was signed again for the generation the
+    /// app follows now, under a new batch ID, and is sent there with the next write
+    /// (Switch spec 12.5 step 2, 13.5).
+    KeptBatchSignedAgain {
+        /// The batch ID it had.
+        batch_id: [u8; 16],
+        /// The batch ID it has now.
+        new_batch_id: [u8; 16],
+    },
+    /// A kept batch holding an `attempt` wasn't carried to the new service after a provider
+    /// loss: no automatic attempt is made on an obligation from before the loss (Switch spec
+    /// 12.6 step 5). The protocol decides what to write instead.
+    KeptBatchDropped {
+        /// The batch ID.
+        batch_id: [u8; 16],
+    },
     /// The account the app used is gone: the service answers as for an identity it doesn't
     /// host and the identity publishes no `identity.json` (Switch spec 12.7).
     AccountGone,
