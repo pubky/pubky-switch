@@ -26,8 +26,12 @@ use std::{
     sync::Arc,
 };
 
-use ed25519_dalek::{Signer, SigningKey};
+use ed25519_dalek::SigningKey;
 use parking_lot::Mutex;
+use pubky_switch_core::{
+    chain::{ChainTip, SignedHead},
+    signing::Signs,
+};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
@@ -204,19 +208,9 @@ pub trait KeyStore: Send + Sync {
     /// The public key of `id`.
     fn public_key<'a>(&'a self, id: &'a KeyId) -> KeyFuture<'a, [u8; 32]>;
 
-    /// Sign `message` with `id`. For anything that isn't a head, such as a response or a
-    /// transition proof.
-    fn sign<'a>(&'a self, id: &'a KeyId, message: &'a [u8]) -> KeyFuture<'a, [u8; 64]>;
-
-    /// Sign `message`, the signing input of `head`, with `id`, unless `head` is behind the
-    /// key's mark or beside it (`KeyStoreError::Refused`). Signing doesn't move the mark:
-    /// [`KeyStore::advance_mark`] does, once the head's state is durable.
-    fn sign_head<'a>(
-        &'a self,
-        id: &'a KeyId,
-        head: Mark,
-        message: &'a [u8],
-    ) -> KeyFuture<'a, [u8; 64]>;
+    /// A signer for `id`, for the core's signing functions: responses, transition proofs,
+    /// manifests and, through [`sign_head`] only, heads.
+    fn signer<'a>(&'a self, id: &'a KeyId) -> KeyFuture<'a, ServiceSigner>;
 
     /// The newest head `id` signed, if any.
     fn mark<'a>(&'a self, id: &'a KeyId) -> KeyFuture<'a, Option<Mark>>;
@@ -234,6 +228,66 @@ pub trait KeyStore: Send + Sync {
 
     /// When `identity`'s account was last erased, if ever.
     fn erasure<'a>(&'a self, identity: &'a str) -> KeyFuture<'a, Option<u64>>;
+}
+
+/// A service key's signer: it signs `lp(label, fields...)` under a Switch label, for the
+/// core's signing functions (Switch wire 2.1). The secret key stays inside it.
+///
+/// A head is signed only through [`sign_head`], which checks the key's mark first.
+#[derive(Clone)]
+pub struct ServiceSigner(Arc<dyn Signs + Send + Sync>);
+
+impl ServiceSigner {
+    /// A signer over `key`, for a key store that holds keys in memory or behind its own
+    /// signing interface, such as an HSM's.
+    pub fn new(key: Arc<dyn Signs + Send + Sync>) -> Self {
+        Self(key)
+    }
+}
+
+impl std::fmt::Debug for ServiceSigner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServiceSigner")
+            .field("public", &hex::encode(self.0.public_key()))
+            .finish_non_exhaustive()
+    }
+}
+
+impl Signs for ServiceSigner {
+    fn public_key(&self) -> [u8; 32] {
+        self.0.public_key()
+    }
+
+    fn sign_fields(&self, label: &str, fields: &[&[u8]]) -> [u8; 64] {
+        self.0.sign_fields(label, fields)
+    }
+}
+
+impl From<ChainTip> for Mark {
+    fn from(tip: ChainTip) -> Self {
+        Self {
+            generation: tip.generation,
+            seq: tip.seq,
+            chain_hash: tip.chain_hash,
+        }
+    }
+}
+
+/// Sign the head at `tip` for `identity`, unless it is behind `mark`, the key's newest
+/// signed head, or beside it (Switch spec 6.5): the only way the service signs a head.
+/// Signing doesn't move the mark: [`KeyStore::advance_mark`] does, once the head's state is
+/// durable.
+pub fn sign_head(
+    signer: &ServiceSigner,
+    mark: Option<&Mark>,
+    identity: &[u8; 32],
+    tip: &ChainTip,
+) -> Result<SignedHead, KeyStoreError> {
+    let check = check_mark(mark, &Mark::from(*tip));
+    if !check.allows_signing() {
+        return Err(KeyStoreError::Refused(check));
+    }
+    Ok(SignedHead::sign(signer, identity, tip))
 }
 
 /// A key store in files under one directory:
@@ -407,28 +461,12 @@ impl KeyStore for FileKeyStore {
         }))
     }
 
-    fn sign<'a>(&'a self, id: &'a KeyId, message: &'a [u8]) -> KeyFuture<'a, [u8; 64]> {
+    fn signer<'a>(&'a self, id: &'a KeyId) -> KeyFuture<'a, ServiceSigner> {
         let store = self.inner.clone();
         let id = id.clone();
         Box::pin(async move {
             let key = blocking(move || store.load_key(&id)).await?;
-            Ok(key.sign(message).to_bytes())
-        })
-    }
-
-    fn sign_head<'a>(
-        &'a self,
-        id: &'a KeyId,
-        head: Mark,
-        message: &'a [u8],
-    ) -> KeyFuture<'a, [u8; 64]> {
-        Box::pin(async move {
-            let mark = self.mark(id).await?;
-            let check = check_mark(mark.as_ref(), &head);
-            if !check.allows_signing() {
-                return Err(KeyStoreError::Refused(check));
-            }
-            self.sign(id, message).await
+            Ok(ServiceSigner(key as Arc<dyn Signs + Send + Sync>))
         })
     }
 
@@ -577,7 +615,7 @@ mod hex_bytes {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    use pubky_switch_core::{chain::ZERO_HASH, labels, sig};
 
     fn mark(seq: u64, hash: u8) -> Mark {
         Mark {
@@ -616,11 +654,13 @@ mod tests {
         let (_dir, store) = open();
         let key = store.generate().await.expect("generate");
         assert_eq!(store.public_key(&key.id).await.expect("public"), key.public);
-        let signature = store.sign(&key.id, b"message").await.expect("sign");
-        let verifying = VerifyingKey::from_bytes(&key.public).expect("public key");
-        verifying
-            .verify(b"message", &Signature::from_bytes(&signature))
-            .expect("verifies");
+        let signer = store.signer(&key.id).await.expect("signer");
+        assert_eq!(signer.public_key(), key.public);
+        let fields: [&[u8]; 2] = [b"status", b"body"];
+        let signature = signer.sign_fields(labels::sig::HTTP_RESPONSE, &fields);
+        sig::verify(&key.public, labels::sig::HTTP_RESPONSE, &fields, &signature)
+            .expect("verifies under its label");
+        assert!(sig::verify(&key.public, labels::sig::HEAD, &fields, &signature).is_err());
     }
 
     #[tokio::test]
@@ -685,26 +725,37 @@ mod tests {
     async fn test_key_store_sign_head_refuses_behind_and_fork() {
         let (_dir, store) = open();
         let key = store.generate().await.expect("generate");
-        store
-            .sign_head(&key.id, mark(1, 1), b"first")
-            .await
-            .expect("unmarked");
-        store.advance_mark(&key.id, mark(5, 1)).await.expect("mark");
-        store
-            .sign_head(&key.id, mark(5, 1), b"same head")
-            .await
-            .expect("the mark itself");
-        store
-            .sign_head(&key.id, mark(6, 9), b"ahead")
-            .await
-            .expect("ahead");
+        let signer = store.signer(&key.id).await.expect("signer");
+        let identity = [3u8; 32];
+        let tip = |seq: u64, hash: u8| ChainTip {
+            generation: 1,
+            seq,
+            chain_hash: if seq == 0 { ZERO_HASH } else { [hash; 32] },
+        };
+        // Unmarked: any head, the empty chain's included.
+        sign_head(&signer, None, &identity, &tip(0, 0)).expect("empty chain");
+        let marked = mark(5, 1);
+        let head = sign_head(&signer, Some(&marked), &identity, &tip(5, 1)).expect("the mark");
+        assert_eq!(
+            (head.generation, head.seq, head.chain_hash),
+            (1, 5, [1; 32])
+        );
+        sign_head(&signer, Some(&marked), &identity, &tip(6, 9)).expect("ahead");
         assert!(matches!(
-            store.sign_head(&key.id, mark(4, 1), b"behind").await,
+            sign_head(&signer, Some(&marked), &identity, &tip(4, 1)),
             Err(KeyStoreError::Refused(MarkCheck::Behind))
         ));
         assert!(matches!(
-            store.sign_head(&key.id, mark(5, 2), b"fork").await,
+            sign_head(&signer, Some(&marked), &identity, &tip(5, 2)),
             Err(KeyStoreError::Refused(MarkCheck::Fork))
+        ));
+        let other = ChainTip {
+            generation: 2,
+            ..tip(9, 9)
+        };
+        assert!(matches!(
+            sign_head(&signer, Some(&marked), &identity, &other),
+            Err(KeyStoreError::Refused(MarkCheck::OtherGeneration))
         ));
     }
 
@@ -715,7 +766,7 @@ mod tests {
         store.advance_mark(&key.id, mark(5, 1)).await.expect("mark");
         store.delete(&key.id).await.expect("delete");
         assert!(matches!(
-            store.sign(&key.id, b"x").await,
+            store.signer(&key.id).await,
             Err(KeyStoreError::NotFound)
         ));
         let store = FileKeyStore::open(dir.path()).expect("reopen");

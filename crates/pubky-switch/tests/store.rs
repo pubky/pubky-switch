@@ -580,3 +580,45 @@ async fn test_store_refuses_a_database_without_durable_commits() {
     );
     fx.finish().await;
 }
+
+#[tokio::test]
+async fn test_store_connect_waits_for_a_late_database() {
+    let Some(fx) = fixture().await else { return };
+    // A forwarder to the test database that opens its port only after a while, as a
+    // database container does while it initializes.
+    let free = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = free.local_addr().expect("addr").port();
+    drop(free);
+    let target = format!(
+        "{}:{}",
+        fx.db.options().get_host(),
+        fx.db.options().get_port()
+    );
+    let forwarder = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+            .await
+            .expect("rebind");
+        loop {
+            let Ok((mut client, _)) = listener.accept().await else {
+                return;
+            };
+            let target = target.clone();
+            tokio::spawn(async move {
+                if let Ok(mut server) = tokio::net::TcpStream::connect(target).await {
+                    let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
+                }
+            });
+        }
+    });
+    let options = fx.db.options().clone().host("127.0.0.1").port(port);
+    let started = std::time::Instant::now();
+    let store = Store::connect_with(options, &DatabaseConfig::default())
+        .await
+        .expect("connects once the database listens");
+    assert!(started.elapsed() >= Duration::from_millis(300));
+    assert!(store.begin(ID_A).await.expect("begin").is_none());
+    store.close().await;
+    forwarder.abort();
+    fx.finish().await;
+}

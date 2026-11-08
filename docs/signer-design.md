@@ -22,68 +22,50 @@ So the direction is `pubky-switch-signer -> pubky-switch-client -> pubky-switch-
 
 ## 2. The identity key interface
 
-From the moment an install becomes the signer, keeping the key safe and backed up is its job (spec 12.8). The interface has two layers.
+From the moment an install becomes the signer, keeping the key safe and backed up is its job (spec 12.8). The core's document builders all take its `IdentityKey`, a secret held in memory, and neither the Secure Enclave nor the Android Keystore supports Ed25519, so the key has to be in software while it signs. The interface has two layers.
 
-### 2.1 `IdentityKey` (Rust trait)
-
-```rust
-pub trait IdentityKey: Send + Sync {
-    /// The identity's Ed25519 public key.
-    fn public_key(&self) -> PublicKey;
-
-    /// Sign one input this crate built. `SigningInput` has no public constructor.
-    /// This crate makes one only for an identity-key row of wire 2.3:
-    /// certificate, identity.json, enrollment, key bundle, hand-over, backup,
-    /// freeze, unfreeze, export transfer, signer request or signer operation.
-    /// It also makes one for the companion claim of an approval (wire 3.10),
-    /// whose input starts with `x-pubky-switch-claim|pubky-switch.v1.approval|`.
-    fn sign(&self, input: &SigningInput) -> Result<Signature, KeyError>;
-
-    /// `switch_root` (spec 13.3), for scope keys, sub-scope keys and the naming
-    /// key. Zeroized on drop, and held only for one bundle operation.
-    fn switch_root(&self) -> Result<Secret32, KeyError>;
-
-    /// The backup key's X25519 secret, `derive("pubky-switch/v1/backup-key",
-    /// identity secret)`, clamped (spec 13.3). Used only to open the signer's own
-    /// backup.
-    fn backup_secret(&self) -> Result<Secret32, KeyError>;
-
-    /// Pubky's own formats for the same key: the auth token of a grant approval,
-    /// and the root session sign-in. Built by this crate from typed inputs, never
-    /// from raw bytes.
-    fn sign_pubky(&self, input: &PubkyInput) -> Result<PubkySigned, KeyError>;
-
-    /// The 32-byte secret, for these reasons only. Both seal it at once: in the
-    /// hand-over to `to_app` (wire 3.12), or in the signer's backup (wire 3.13).
-    fn export_secret(&self, reason: ExportReason) -> Result<Secret32, KeyError>;
-
-    /// Delete the key from every copy the host keeps (spec 3.1 "Deleting a key").
-    /// Called after a hand-over took effect, or after a received hand-over was
-    /// refused.
-    fn destroy(&self) -> Result<(), KeyError>;
-}
-
-pub enum ExportReason { HandOver { to_app: AppId }, Backup }
-```
-
-`SigningInput` carries the label and the `lp()` fields, or the claim input. A host can sign only what this crate hands it, and the signer's public API offers no signing at all.
-
-### 2.2 `SecretVault` (host callback, what Bitkit implements)
-
-Neither the Secure Enclave nor the Android Keystore supports Ed25519, so the key has to be in software when it signs. The crate provides `VaultIdentityKey: IdentityKey`, which does all the crypto in Rust and keeps the secret in a vault the host provides:
+### 2.1 `SecretVault` (host callback, what Bitkit implements)
 
 ```rust
 pub trait SecretVault: Send + Sync {
-    fn load(&self) -> Result<Secret32, VaultError>;              // per operation, zeroized after
-    fn store(&self, secret: Secret32) -> Result<(), VaultError>; // first setup, take-over, restore
+    fn load(&self) -> Result<Option<IdentitySecret>, VaultError>; // per operation, zeroized after
+    fn store(&self, secret: &IdentitySecret) -> Result<(), VaultError>; // first setup, take-over, restore
     fn delete(&self) -> Result<(), VaultError>;
 }
 ```
 
+- **`IdentitySecret`** is the 32-byte Ed25519 secret (seed). It zeroizes on drop and `Debug` never shows it; the host builds one from the bytes it keeps and reads them back with `as_bytes` to store them.
+- **Synchronous:** Swift and Kotlin implement the three calls without async callbacks. Each is atomic: after `store` returns `Ok`, `load` returns that secret, also after a crash.
 - **Where it lives:** on iOS, one keychain item of a `...ThisDeviceOnly` class. On Android, a Keystore-wrapped file excluded from backups (spec 3.1).
-- **What the host code does:** Swift and Kotlin never sign, derive or parse anything. They move 32 opaque bytes, so the binding surface is these three calls.
+- **What the host code does:** Swift and Kotlin never sign, derive or parse anything. They move 32 opaque bytes.
 - **Hosts that derive the key:** a host that already controls the key, for example one that derives it from a wallet seed, implements `load` as that derivation. It implements `store` and `delete` by its own policy. For a derived key, `delete` can't make the key unrecoverable, and the host tells the user so at a hand-over (spec 12.8, "The limit").
-- **Backups:** the identity key itself is the host's to back up, as before. The signer's records are backed up by the crate (section 4.4).
+- **Backups:** the identity key itself is the host's to back up. The signer's records are backed up by the crate (section 4.4).
+
+### 2.2 `IdentityKeyring` (the crate's side)
+
+```rust
+impl IdentityKeyring {
+    pub fn open(vault: Arc<dyn SecretVault>) -> Result<Self, KeyError>;    // an existing identity
+    pub fn create(vault: Arc<dyn SecretVault>) -> Result<Self, KeyError>;  // a new one, the vault empty
+    pub fn public_key(&self) -> [u8; 32];
+    pub fn pubky_id(&self) -> String;
+    pub fn backup_public(&self) -> Result<([u8; 32], [u8; 8]), KeyError>;  // backup key and kid
+
+    pub(crate) fn install(vault, identity, secret) -> Result<Self, KeyError>; // a received key
+    pub(crate) fn with_key<T>(&self, use_key: impl FnOnce(&IdentityKey) -> T) -> Result<T, KeyError>;
+    pub(crate) fn for_export<T>(&self, reason: ExportReason,
+                                seal: impl FnOnce(ExportReason, &IdentityKey) -> T) -> Result<T, KeyError>;
+    pub(crate) fn destroy(&self) -> Result<(), KeyError>;
+}
+
+pub enum ExportReason { HandOver { to_app: [u8; 16] }, Backup }
+```
+
+- **It holds no secret.** It holds the vault and the identity's public key. Each use loads the secret, checks that its public key is still this identity's, makes the core's `IdentityKey` for one operation and drops it, zeroized.
+- **No signing in the public API.** `with_key` is the crate's alone. The crate calls it only to sign inputs it builds, through the core's builders, for the identity-key rows of wire 2.3 and the approval's companion claim (wire 3.10), and for the derivations of spec 13.3: the Switch root and the keys it yields, and the backup key. The core's builders sign Pubky's own formats from typed inputs too.
+- **The secret leaves for two reasons only.** `for_export` is the one place the secret bytes may be read, and only to seal them at once, in a hand-over to `to_app` (wire 3.12) or in the signer's backup (wire 3.13).
+- **Received keys:** `install` takes the secret of a hand-over or a backup into the vault only when it is the identity's key, and only into a vault that holds none or that same secret, as after a retry.
+- **`KeyError`** says which of these went wrong: the vault failed, it holds no secret, it already holds one, the secret isn't this identity's, the bytes aren't 32 long, or the random generator failed.
 
 ## 3. Protocols
 
@@ -98,30 +80,29 @@ Approval takes the protocol's scopes and permission table from the caller, as a 
 pub trait Protocol: Send + Sync {
     /// For messages and errors only.
     fn name(&self) -> &str;
-    /// The scope names it owns (spec 3.3). Every name belongs to one protocol.
-    fn owns(&self, name: &str) -> bool;
-    /// Its own rules on a requested scope set, beyond the Switch's scope rule
-    /// (wire 3.9 check 1), such as two scopes that never go together.
-    fn check_scopes(&self, scopes: &[Scope]) -> Result<(), ScopeRefusal>;
+    /// The scope names it owns, each with whether it has Shared Data Keys
+    /// (spec 3.3, 3.5). Read once, when the set is built. A sub-scope has keys
+    /// exactly when its name does.
+    fn scopes(&self) -> Vec<ScopeDef>;
+    /// Its own rule on a requested set of its scopes, beyond the Switch's scope
+    /// rule (wire 3.9 step 1), such as two scopes that never go together.
+    fn check_scopes(&self, scopes: &[&str]) -> Result<(), String>;
     /// Its permission table (spec 3.2): the switch permissions these scopes need.
-    fn permissions(&self, scopes: &[Scope]) -> Permissions;
-    /// Whether a scope name has Shared Data Keys (spec 3.5). A sub-scope has keys
-    /// when its name does.
-    fn has_keys(&self, name: &str) -> bool;
-    /// Paths it adds to an app's grant, each needing the user's consent
-    /// (wire 3.9 check 3).
-    fn extra_paths(&self, app_id: &AppId) -> Vec<GrantPath>;
+    fn permissions(&self, scopes: &[&str]) -> Vec<Permission>;
+    /// Paths it adds to the grant of an app holding these scopes, each shown to
+    /// the user for consent (wire 3.9 step 3). None by default.
+    fn grant_paths(&self, app_id: &[u8; 16], scopes: &[&str]) -> Vec<GrantPath>;
 }
 ```
 
-- **Several protocols:** the signer holds a `Protocols` set. Opening it refuses two protocols that own one name. An app may hold scopes of several protocols: its permissions are the union, written in the Switch's fixed order (wire 3.1), and its keyed scopes are those any owner marks.
-- **The Switch's own rules stay in the signer:**
-  - the scope rule and the 32-scope bound;
-  - no name beside its own sub-scope;
-  - grants exactly the app's own paths;
+- **Several protocols:** the signer holds a `Protocols` set. Building it refuses an empty set, a malformed or repeated protocol name, a protocol that owns no scope, a scope name that breaks the scope rule or has a sub-scope, and one name declared twice. An app may hold scopes of several protocols: each protocol sees only its own, the permissions are the union, written in the Switch's fixed order (wire 3.1), and the keyed scopes are those whose owner marks them.
+- **What the set gives:** `terms(scopes)` checks a request and returns its permissions and keyed scopes; `knows_scope` and `has_keys` are the predicates the core's app request check and key bundle functions take; `grant_paths` gives the paths for the core's caps check; `unowned` lists the scopes no registered protocol owns.
+- **The Switch's own rules stay in the signer and the core:**
+  - the scope rule and the 32-scope bound, and no name beside its own sub-scope;
+  - grants exactly the app's own paths, and a protocol's grant paths lie outside the Switch's own folders;
   - no grant covering `identity.json` or the signer's backup;
   - the app limit.
-- **Unknown scopes:** a scope no registered protocol owns is refused in a request (wire 3.9 check 1). A received hand-over or a restored backup whose certificates hold one is refused, naming the missing protocol. A certificate already in the records that holds one blocks every step that needs that app's keys and raises an alert, instead of guessing (decision 2).
+- **Unknown scopes:** a scope no registered protocol owns is refused in a request (wire 3.9 step 1). A received hand-over or a restored backup whose certificates hold one is refused, naming those scopes so the host can tell the user which protocol support is missing. A certificate already in the records that holds one blocks every step that needs that app's keys and raises an alert, instead of guessing (decision 2).
 
 ## 4. State
 
@@ -249,7 +230,7 @@ pub enum Write {
 4. **One writer per namespace:** only one process at a time writes a namespace, for example the main app and not a push extension. The crates serialize their own commits.
 5. **Device-bound:** the store is excluded from device and cloud backups and is encrypted at rest under a key kept like the app's keys, as spec 3.1 asks of local state. The signer stores no secret key in it (the identity key stays in the `SecretVault`), but its records hold the signed hand-over and backup.
 6. **Real deletion:** `Delete` and `DeletePrefix` remove the data from the store's files, not only from its index (for SQLite, `secure_delete`). A signer that hands over deletes its records "in every copy it keeps" (spec 12.8, 3.1).
-7. **Sizes:** a value up to 8 MiB, which fits a 64-part hand-over or backup kept as signed bytes, and a batch up to 16 MiB.
+7. **Sizes:** a value up to 16 MiB and a batch up to 32 MiB. The largest value is a hand-over or a backup kept as signed bytes: at most 128 envelopes, 11,185,390 bytes of JSON at the limits (wire 3.12, 3.13). A commit holds at most one such value with the flow step it belongs to, so a 32 MiB batch leaves room for two.
 
 **What the crates add:** an in-memory store for tests, and a fault-injecting store behind a test-only feature, which fails or stops before and after any commit, for the crash tests.
 
@@ -260,9 +241,9 @@ Async at the edges, plain types, and no lifetimes in public structs, so it binds
 ```rust
 impl Signer {
     // Setup
-    async fn create(env: SignerEnv, key: Arc<dyn IdentityKey>, switch: Origin) -> Result<Self>;    // wire 3.7, 7.4.1-2
-    async fn open(env: SignerEnv, key: Arc<dyn IdentityKey>) -> Result<Self>;                     // load records, no network
-    async fn restore(env: SignerEnv, key: Arc<dyn IdentityKey>, ok: UserConfirmed) -> Result<Self>; // from the backup, wire 3.13
+    async fn create(env: SignerEnv, keyring: IdentityKeyring, switch: Origin) -> Result<Self>;    // wire 3.7, 7.4.1-2
+    async fn open(env: SignerEnv, keyring: IdentityKeyring) -> Result<Self>;                     // load records, no network
+    async fn restore(env: SignerEnv, keyring: IdentityKeyring, ok: UserConfirmed) -> Result<Self>; // from the backup, wire 3.13
     async fn take_over(&mut self, ok: UserConfirmed) -> Result<()>;                                // this install isn't named: restore in place
 
     async fn run_due(&mut self) -> Result<RunReport>;
@@ -352,7 +333,7 @@ There are no panics on network input, and all arithmetic is checked.
 | 6 Provider moves | `move_to`, `abort_move` | rotations owed done first; import limit check; the freeze kept before it is sent; direct transfer under the export transfer, with a relay fallback; the abort sends the unfreeze to N, then to O with N's discard answer |
 | 7 Provider loss | `declare_provider_loss`, `end_staged_admission` | a new generation with `recovery_from`; no service key added |
 | 8 Erasure | `erase_previous`, `close_account` | refused during a move; a lost `200` followed by a `404` counts as done |
-| 9 Hand-over | `hand_over_to`, `abort_hand_over`, `receive_hand_over` | up to 64 envelopes through `PUT`/`GET /handover`; the abort at version + 2; checks 1 to 3 on the receiving side, then the version + 1 delivery; a refusal destroys the received secret |
+| 9 Hand-over | `hand_over_to`, `abort_hand_over`, `receive_hand_over` | up to 128 envelopes through `PUT`/`GET /handover`; the abort at version + 2; checks 1 to 3 on the receiving side, then the version + 1 delivery; a refusal destroys the received secret |
 | 10 Backup and the one-signer rule | section 4.4, `restore`, `take_over`, `status` | written before each delivery and after bundle parts; another install's backup or document stops signing |
 | 11 Key interface | section 2 | |
 | 12 Telling the user | `alerts`, `status` | section 5.1 |

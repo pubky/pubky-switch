@@ -59,9 +59,9 @@ Limits, quotas and rates, under their Switch wire 9.2 names, with the wire forma
 - `app_limit` is between 1 and 255;
 - `max_claim_age_ms` (400 days) and `batch_proofs_ms` (30 days) may be raised but not lowered, since apps rely on them;
 - `claim_share_percent` and `sender_share_percent` are between 1 and 100;
-- the other limits are at least 1; `checkpoint_behind` is absent (no checkpoints) or at least 1.
+- the other limits are at least 1.
 
-Values the wire format fixes aren't configurable: the envelope cap (64 KiB), the sealed value cap (256 KiB), 8 entries per batch, 64 hand-over parts, 1 MiB export chunks, feed pages of at most 500 items and 1000 positions, the 25-second long-poll and the 5-minute timestamp window.
+Values the wire format fixes aren't configurable: the envelope cap (64 KiB), the sealed value cap (256 KiB), 8 entries per batch, 128 hand-over parts (a 12 MiB `PUT /handover` body), 1 MiB export chunks, feed pages of at most 500 items and 1000 positions, the 25-second long-poll and the 5-minute timestamp window.
 
 ### `[trusted_time]`
 
@@ -139,6 +139,7 @@ PostgreSQL.
 | `acquire_timeout_ms` | `5000` | how long a request waits for a free connection |
 | `lock_timeout_ms` | `10000` | how long a request waits for its account's lock before it gives up with `503 unavailable` |
 | `migrate_on_start` | `true` | apply pending schema migrations at start; safe with several instances |
+| `connect_retry_ms` | `30000` | how long the service keeps trying to reach the database at start, while it refuses connections or is still starting up, before it exits |
 
 ### `[keys]`
 

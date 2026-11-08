@@ -8,23 +8,23 @@
 use serde::{Deserialize, Serialize};
 
 /// Values the wire format fixes. They bound encodings and body caps that every client
-/// relies on, so they aren't configurable.
+/// relies on, so they aren't configurable. Where the core defines one, it is the core's
+/// value, so each number is set in one place.
 pub mod fixed {
+    use pubky_switch_core::{claims, envelope, export, http, ops, records};
+
     /// Envelope cap in bytes (Switch wire 4.4, 9.2 `max_envelope`).
-    pub const MAX_ENVELOPE: u64 = 65_536;
+    pub const MAX_ENVELOPE: u64 = envelope::MAX_ENVELOPE_LEN as u64;
     /// Sealed value plaintext cap in bytes (Switch wire 9.2 `max_sealed_value`).
     pub const MAX_SEALED_VALUE: u64 = 262_144;
     /// Entries per batch (Switch wire 6.4, 9.2 `max_batch`).
-    pub const MAX_BATCH: u64 = 8;
-    /// Envelopes of the one hand-over an account holds (Switch wire 7.4.17, 9.2
-    /// `max_handover_parts`). The only place this number is set; keep it beside
-    /// [`HANDOVER_BODY_CAP`], which must hold this many envelopes.
-    pub const MAX_HANDOVER_PARTS: u64 = 64;
-    /// The body cap of `PUT /handover`: [`MAX_HANDOVER_PARTS`] envelopes in base64url, with
-    /// their JSON (Switch wire 7.1). The only place this number is set.
-    pub const HANDOVER_BODY_CAP: u64 = 6 * 1024 * 1024;
+    pub const MAX_BATCH: u64 = ops::MAX_BATCH_ENTRIES as u64;
+    /// Envelopes of the one hand-over an account holds, and of the signer's backup
+    /// (Switch wire 3.13, 7.4.17, 9.2 `max_handover_parts`). The body cap of
+    /// `PUT /handover` that holds them is the core's body cap table (Switch wire 7.1).
+    pub const MAX_HANDOVER_PARTS: u64 = records::MAX_HANDOVER_ENVELOPES as u64;
     /// Bytes of one export chunk (Switch wire 10.3, 9.2 `max_chunk_bytes`).
-    pub const MAX_CHUNK_BYTES: u64 = 1_048_576;
+    pub const MAX_CHUNK_BYTES: u64 = export::MAX_CHUNK_BYTES as u64;
     /// Default items per feed page (Switch wire 7.4.4).
     pub const FEED_LIMIT_DEFAULT: u64 = 100;
     /// Most items per feed page (Switch wire 7.4.4).
@@ -34,18 +34,17 @@ pub mod fixed {
     /// Longest long-poll wait, in seconds (Switch wire 7.4.4).
     pub const FEED_MAX_WAIT_S: u64 = 25;
     /// How far a request's `Switch-Timestamp` may be from the time base (Switch wire 7.1).
-    pub const TIMESTAMP_WINDOW_MS: u64 = 5 * 60 * 1000;
+    pub const TIMESTAMP_WINDOW_MS: u64 = http::TIMESTAMP_TOLERANCE_MS;
     /// The reconciliation window after a claim's deadline (Switch wire 9.1).
-    pub const RECONCILIATION_WINDOW_MS: u64 = 30 * 24 * 3600 * 1000;
+    pub const RECONCILIATION_WINDOW_MS: u64 = claims::RECONCILIATION_MS;
     /// The highest app limit `identity.json` may carry (Switch wire 9.2 `app_limit`).
-    pub const APP_LIMIT_MAX: u32 = 255;
+    pub const APP_LIMIT_MAX: u32 = records::MAX_APP_LIMIT as u32;
+    /// The shortest `max_claim_age_ms`: 400 days (Switch wire 9.2).
+    pub const MIN_CLAIM_AGE_MS: u64 = claims::MAX_CLAIM_AGE_MS;
+    /// The shortest `batch_proofs_ms`: 30 days, over which apps compare batch IDs (Switch
+    /// wire 6.6, 9.2).
+    pub const MIN_BATCH_PROOFS_MS: u64 = ops::BATCH_PROOFS_MS;
 }
-
-// The hand-over body cap holds its largest hand-over: every part a full envelope in
-// base64url without padding.
-const _: () = assert!(
-    fixed::HANDOVER_BODY_CAP >= fixed::MAX_HANDOVER_PARTS * (fixed::MAX_ENVELOPE * 4).div_ceil(3)
-);
 
 /// Every configurable limit, by its Switch wire 9.2 name.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -127,8 +126,9 @@ pub struct Limits {
     pub identity_reads_per_source_per_min: u32,
     /// Most records per `GET /records` page.
     pub list_page: u64,
-    /// Chain items that may go before the service signs a checkpoint; `None` signs none.
-    pub checkpoint_behind: Option<u64>,
+    /// Chain items that may go before the service signs a checkpoint, or, with
+    /// `checkpoint_at_head`, chain items added since the last one.
+    pub checkpoint_behind: u64,
     /// Sign each checkpoint at the newest chain item.
     pub checkpoint_at_head: bool,
     /// Mark lagging apps.
@@ -143,8 +143,6 @@ pub struct Limits {
 
 /// 30 days in milliseconds.
 const DAYS_30_MS: u64 = 30 * 24 * 3600 * 1000;
-/// 400 days in milliseconds.
-const DAYS_400_MS: u64 = 400 * 24 * 3600 * 1000;
 
 impl Default for Limits {
     fn default() -> Self {
@@ -158,7 +156,7 @@ impl Default for Limits {
             max_attempts_per_claim: 64,
             open_attempts_per_app: 1_000,
             claim_share_percent: 25,
-            max_claim_age_ms: DAYS_400_MS,
+            max_claim_age_ms: fixed::MIN_CLAIM_AGE_MS,
             max_contacts: 100_000,
             max_conversations: 100_000,
             max_deny: 100_000,
@@ -168,7 +166,7 @@ impl Default for Limits {
             max_peers: 10_000,
             max_enrollments: 16,
             max_flags: 1_000,
-            batch_proofs_ms: DAYS_30_MS,
+            batch_proofs_ms: fixed::MIN_BATCH_PROOFS_MS,
             ops_per_min: 3_000,
             control_per_min: 60,
             cursor_hold_ms: DAYS_30_MS,
@@ -184,7 +182,7 @@ impl Default for Limits {
             identity_reads_per_min: 6_000,
             identity_reads_per_source_per_min: 60,
             list_page: 1_000,
-            checkpoint_behind: None,
+            checkpoint_behind: 1_000,
             checkpoint_at_head: false,
             mark_lagging: true,
             notify_per_min: 20,
@@ -234,10 +232,7 @@ impl Limits {
                 return fail(name, "must be between 1 and 100");
             }
         }
-        if self.checkpoint_behind == Some(0) {
-            return fail("checkpoint_behind", "must be at least 1, or absent");
-        }
-        let nonzero: [(&'static str, u64); 33] = [
+        let nonzero: [(&'static str, u64); 34] = [
             ("quota_bytes", self.quota_bytes),
             ("record_quota_bytes", self.record_quota_bytes),
             ("max_record_keys", self.max_record_keys),
@@ -276,6 +271,7 @@ impl Limits {
                 u64::from(self.identity_reads_per_source_per_min),
             ),
             ("list_page", self.list_page),
+            ("checkpoint_behind", self.checkpoint_behind),
             ("notify_per_min", u64::from(self.notify_per_min)),
             ("connect_per_min", u64::from(self.connect_per_min)),
             ("flag_after", u64::from(self.flag_after)),
@@ -348,13 +344,37 @@ mod tests {
         assert_eq!(limits.identity_reads_per_min, 6_000);
         assert_eq!(limits.identity_reads_per_source_per_min, 60);
         assert_eq!(limits.list_page, 1_000);
-        assert_eq!(limits.checkpoint_behind, None);
+        assert_eq!(limits.checkpoint_behind, 1_000);
         assert!(!limits.checkpoint_at_head);
         assert!(limits.mark_lagging);
         assert_eq!(limits.notify_per_min, 20);
         assert_eq!(limits.connect_per_min, 5);
         assert_eq!(limits.flag_after, 3);
         assert_eq!(limits.validate(), Ok(()));
+    }
+
+    #[test]
+    fn test_limits_fixed_values_match_the_wire_format() {
+        assert_eq!(fixed::MAX_ENVELOPE, 65_536);
+        assert_eq!(fixed::MAX_BATCH, 8);
+        assert_eq!(fixed::MAX_HANDOVER_PARTS, 128);
+        assert_eq!(fixed::MAX_CHUNK_BYTES, 1_048_576);
+        assert_eq!(fixed::TIMESTAMP_WINDOW_MS, 300_000);
+        assert_eq!(fixed::RECONCILIATION_WINDOW_MS, 2_592_000_000);
+        assert_eq!(fixed::APP_LIMIT_MAX, 255);
+        assert_eq!(fixed::MIN_CLAIM_AGE_MS, 34_560_000_000);
+        assert_eq!(fixed::MIN_BATCH_PROOFS_MS, 2_592_000_000);
+    }
+
+    #[test]
+    fn test_limits_handover_cap_holds_its_largest_handover() {
+        // Every part a full envelope in base64url without padding.
+        let largest = fixed::MAX_HANDOVER_PARTS * (fixed::MAX_ENVELOPE * 4).div_ceil(3);
+        let cap = pubky_switch_core::http::body_cap("PUT", "/v1/x/handover").expect("cap");
+        assert!(
+            u64::try_from(cap).expect("cap") >= largest,
+            "{cap} < {largest}"
+        );
     }
 
     #[test]
@@ -373,7 +393,7 @@ mod tests {
     fn test_limits_raised_values_pass() {
         let limits = Limits {
             app_limit: 255,
-            max_claim_age_ms: DAYS_400_MS * 2,
+            max_claim_age_ms: fixed::MIN_CLAIM_AGE_MS * 2,
             batch_proofs_ms: DAYS_30_MS * 2,
             claim_share_percent: 100,
             quota_bytes: u64::MAX,
@@ -402,7 +422,7 @@ mod tests {
             ),
             (
                 Limits {
-                    max_claim_age_ms: DAYS_400_MS - 1,
+                    max_claim_age_ms: fixed::MIN_CLAIM_AGE_MS - 1,
                     ..Limits::default()
                 },
                 "max_claim_age_ms",
@@ -430,7 +450,7 @@ mod tests {
             ),
             (
                 Limits {
-                    checkpoint_behind: Some(0),
+                    checkpoint_behind: 0,
                     ..Limits::default()
                 },
                 "checkpoint_behind",

@@ -1595,6 +1595,7 @@ dependencies = [
  "metrics-exporter-prometheus",
  "parking_lot",
  "pubky-switch",
+ "pubky-switch-core",
  "roughenough-protocol",
  "serde",
  "serde_json",
@@ -1637,6 +1638,13 @@ dependencies = [
 [[package]]
 name = "pubky-switch-signer"
 version = "0.1.0"
+dependencies = [
+ "hex",
+ "pubky-switch-core",
+ "serde_json",
+ "thiserror",
+ "zeroize",
+]
 
 [[package]]
 name = "quanta"
