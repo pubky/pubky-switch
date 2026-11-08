@@ -23,11 +23,16 @@ pubky-switch = { path = "crates/pubky-switch" }
 
 axum = "0.8"
 base64 = "0.22"
+blake3 = "1"
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc", "getrandom"] }
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 clap = { version = "4", features = ["derive", "env"] }
+curve25519-dalek = "5"
 ed25519-dalek = "3"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 getrandom = "0.3"
 hex = "0.4"
+hpke = { version = "0.14.1", default-features = false, features = ["alloc", "chacha", "x25519"] }
 ipnet = { version = "2", features = ["serde"] }
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
@@ -44,7 +49,7 @@ toml = "1"
 tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-zeroize = "1"
+zeroize = { version = "1", features = ["derive"] }
 
 [workspace.lints.rust]
 missing_docs = "deny"
