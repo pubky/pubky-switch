@@ -171,6 +171,7 @@ impl App {
         self.ensure_scope_keys().await?;
         self.prune_processed().await?;
         self.retry_parked().await?;
+        self.list_collections_if_due().await?;
         let mut report = ReceiveReport::default();
         let mut wait = wait.map(|w| w.min(25));
         loop {
@@ -934,6 +935,7 @@ impl App {
             let writes = self.protocol.missed(&missed);
             read.tx.local(&writes)?;
             read.tx.put(&key::asked(seq), &())?;
+            read.tx.put(super::records::LIST_DUE, &true)?;
             self.events.push(AppEvent::Missed { seq, entries });
         }
         Ok(Step::Pass)
@@ -999,6 +1001,16 @@ impl App {
                         cert,
                     } if *target_app_id == me && body.app_id.is_none() => {
                         self.note_renewal(cert, &mut read.tx)?;
+                        Ok(Step::Pass)
+                    }
+                    OpKind::RecordPut(_)
+                    | OpKind::Claim(_)
+                    | OpKind::AppPut { .. }
+                    | OpKind::AllowPut { .. }
+                    | OpKind::AllowDelete { .. }
+                    | OpKind::DenyPut { .. }
+                    | OpKind::DenyDelete { .. } => {
+                        self.feed_shared_item(item, envelope, &mut read.tx).await?;
                         Ok(Step::Pass)
                     }
                     _ => Ok(Step::Pass),

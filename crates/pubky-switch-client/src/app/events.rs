@@ -178,6 +178,61 @@ pub enum AppEvent {
     Left,
     /// The app deleted its keys after leaving.
     KeysDestroyed,
+    /// The recipient's inbox accepted a message: its delivery is complete (Switch spec 11).
+    MessageAccepted {
+        /// The message ID.
+        msg_id: String,
+        /// The acceptance time, the recipient's service time.
+        accepted_at_ms: u64,
+    },
+    /// An app of a counterparty has no receive key record that passes the checks, so a
+    /// message went to its other apps (Switch spec 8.1).
+    UnreachableApp {
+        /// The counterparty.
+        identity: [u8; 32],
+        /// The app.
+        app_id: [u8; 16],
+    },
+    /// After a provider loss of a counterparty, the messages its old switch accepted since
+    /// the previous check were queued again for its new one (Switch spec 8.1).
+    ResendAfterLoss {
+        /// The counterparty.
+        identity: [u8; 32],
+        /// How many messages.
+        messages: u64,
+    },
+    /// The app took a newer write of a shared record (Switch spec 10.3).
+    RecordChanged {
+        /// The record key.
+        key: [u8; 32],
+    },
+    /// A shared record write failed a check, or went back on what the app had seen: it is
+    /// ignored and shown with the app that signed it (Switch spec 8.2, 10.3).
+    WriteFlagged {
+        /// The record key.
+        key: [u8; 32],
+        /// The app the write names.
+        writer: [u8; 16],
+        /// The rule, without content.
+        reason: String,
+    },
+    /// Uploads after a provider loss conflict with a record's current write (Switch spec
+    /// 12.6).
+    RecordDivergent {
+        /// The record key.
+        key: [u8; 32],
+    },
+    /// The app kept a newer view or proof of a claim (Switch spec 10.2).
+    ClaimChanged {
+        /// The claim key.
+        claim_key: [u8; 32],
+    },
+    /// The deadline a claim pinned differs from the one the app computes for its
+    /// obligation: an early pin, or "none" beside a deadline (Switch wire 6.8).
+    ClaimPinDiffers {
+        /// The claim key.
+        claim_key: [u8; 32],
+    },
 }
 
 /// Why an entry was stored locally (Switch spec 8.2).

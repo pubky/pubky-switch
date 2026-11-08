@@ -26,6 +26,8 @@ use crate::clock::{Clock, TestClock};
 use crate::error::TransportError;
 use crate::transport::{Header, MockTransport, Request, Response};
 
+mod shared;
+
 /// One item of the account's sequence.
 #[derive(Clone, Debug)]
 pub(crate) enum Item {
@@ -119,6 +121,8 @@ pub(crate) struct Inner {
     pub(crate) faults: VecDeque<Fault>,
     /// Every operation applied, in order, for counting effects.
     pub(crate) applied: Vec<SignedOp>,
+    /// Shared records, claims, invite codes and connect requests.
+    pub(crate) shared: shared::Shared,
 }
 
 /// The scripted switch.
@@ -163,6 +167,7 @@ impl FakeSwitch {
                 dropped_through: 0,
                 faults: VecDeque::new(),
                 applied: Vec::new(),
+                shared: shared::Shared::default(),
             }),
         })
     }
@@ -207,7 +212,10 @@ impl FakeSwitch {
             .header(header::APP)
             .and_then(|text| app_id_decode(text).ok());
         let rest = path.splitn(4, '/').nth(3).unwrap_or_default().to_owned();
-        let (status, body) = inner.route(request, caller, &rest);
+        let (status, body) = match inner.route_shared(request, caller, &rest) {
+            Some(answer) => answer,
+            None => inner.route(request, caller, &rest),
+        };
         if lose {
             return Err(TransportError::Timeout);
         }
