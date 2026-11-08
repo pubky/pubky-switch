@@ -1595,6 +1595,7 @@ dependencies = [
  "metrics-exporter-prometheus",
  "parking_lot",
  "pubky-switch",
+ "pubky-switch-core",
  "roughenough-protocol",
  "serde",
  "serde_json",
