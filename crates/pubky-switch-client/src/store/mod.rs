@@ -25,12 +25,14 @@ use pubky_switch_core::enc::zbase32_encode;
 
 pub use crate::error::{BatchError, StoreError};
 
-/// The working size of one value: 16 MiB. Provisional until the signer confirms what it
-/// stores (its hand-over and backup kept as signed bytes are the largest values).
+/// The largest value a host stores: 16 MiB.
+///
+/// The largest values are the signer's hand-over and backup kept as signed bytes: at most
+/// 128 envelopes holding at most 11,185,390 bytes of JSON (Switch wire 3.12, 3.13).
 pub const MAX_VALUE_BYTES: u64 = 16 << 20;
 
-/// The working size of one batch: 32 MiB, counting every write's namespace, key and value.
-/// Provisional, as [`MAX_VALUE_BYTES`].
+/// The largest batch a host commits: 32 MiB, counting every write's namespace, key and
+/// value, so one batch holds such a value with the rest of its writes.
 pub const MAX_BATCH_BYTES: u64 = 32 << 20;
 
 /// One entry a [`StateStore::scan`] returns: a key and its value.
@@ -72,8 +74,9 @@ pub fn client_namespace(app_id: &[u8; 16]) -> String {
 /// 6. **Real deletion:** [`Write::Delete`] and [`Write::DeletePrefix`] remove the data from
 ///    the store's files, not only from its index (for SQLite, `secure_delete`).
 /// 7. **Sizes:** a value of up to [`MAX_VALUE_BYTES`] (16 MiB) and a batch of up to
-///    [`MAX_BATCH_BYTES`] (32 MiB). These working sizes are provisional until the signer
-///    confirms them; [`WriteBatch`] refuses a larger batch before the host sees it.
+///    [`MAX_BATCH_BYTES`] (32 MiB). A hand-over or backup, the largest value, is at most
+///    11,185,390 bytes of JSON (Switch wire 3.12, 3.13). [`WriteBatch`] refuses a larger
+///    value or batch before the host sees it.
 pub trait StateStore: Send + Sync {
     /// The value at `key` in `ns`, or `None`.
     ///
