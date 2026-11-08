@@ -59,9 +59,9 @@ Limits, quotas and rates, under their Switch wire 9.2 names, with the wire forma
 - `app_limit` is between 1 and 255;
 - `max_claim_age_ms` (400 days) and `batch_proofs_ms` (30 days) may be raised but not lowered, since apps rely on them;
 - `claim_share_percent` and `sender_share_percent` are between 1 and 100;
-- the other limits are at least 1; `checkpoint_behind` is absent (no checkpoints) or at least 1.
+- the other limits are at least 1.
 
-Values the wire format fixes aren't configurable: the envelope cap (64 KiB), the sealed value cap (256 KiB), 8 entries per batch, 64 hand-over parts, 1 MiB export chunks, feed pages of at most 500 items and 1000 positions, the 25-second long-poll and the 5-minute timestamp window.
+Values the wire format fixes aren't configurable: the envelope cap (64 KiB), the sealed value cap (256 KiB), 8 entries per batch, 128 hand-over parts (a 12 MiB `PUT /handover` body), 1 MiB export chunks, feed pages of at most 500 items and 1000 positions, the 25-second long-poll and the 5-minute timestamp window.
 
 ### `[trusted_time]`
 

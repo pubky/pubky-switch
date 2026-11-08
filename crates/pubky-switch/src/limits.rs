@@ -16,13 +16,13 @@ pub mod fixed {
     pub const MAX_SEALED_VALUE: u64 = 262_144;
     /// Entries per batch (Switch wire 6.4, 9.2 `max_batch`).
     pub const MAX_BATCH: u64 = 8;
-    /// Envelopes of the one hand-over an account holds (Switch wire 7.4.17, 9.2
-    /// `max_handover_parts`). The only place this number is set; keep it beside
-    /// [`HANDOVER_BODY_CAP`], which must hold this many envelopes.
-    pub const MAX_HANDOVER_PARTS: u64 = 64;
+    /// Envelopes of the one hand-over an account holds, and of the signer's backup
+    /// (Switch wire 3.13, 7.4.17, 9.2 `max_handover_parts`). The only place this number is
+    /// set; keep it beside [`HANDOVER_BODY_CAP`], which must hold this many envelopes.
+    pub const MAX_HANDOVER_PARTS: u64 = 128;
     /// The body cap of `PUT /handover`: [`MAX_HANDOVER_PARTS`] envelopes in base64url, with
     /// their JSON (Switch wire 7.1). The only place this number is set.
-    pub const HANDOVER_BODY_CAP: u64 = 6 * 1024 * 1024;
+    pub const HANDOVER_BODY_CAP: u64 = 12 * 1024 * 1024;
     /// Bytes of one export chunk (Switch wire 10.3, 9.2 `max_chunk_bytes`).
     pub const MAX_CHUNK_BYTES: u64 = 1_048_576;
     /// Default items per feed page (Switch wire 7.4.4).
@@ -127,8 +127,9 @@ pub struct Limits {
     pub identity_reads_per_source_per_min: u32,
     /// Most records per `GET /records` page.
     pub list_page: u64,
-    /// Chain items that may go before the service signs a checkpoint; `None` signs none.
-    pub checkpoint_behind: Option<u64>,
+    /// Chain items that may go before the service signs a checkpoint, or, with
+    /// `checkpoint_at_head`, chain items added since the last one.
+    pub checkpoint_behind: u64,
     /// Sign each checkpoint at the newest chain item.
     pub checkpoint_at_head: bool,
     /// Mark lagging apps.
@@ -184,7 +185,7 @@ impl Default for Limits {
             identity_reads_per_min: 6_000,
             identity_reads_per_source_per_min: 60,
             list_page: 1_000,
-            checkpoint_behind: None,
+            checkpoint_behind: 1_000,
             checkpoint_at_head: false,
             mark_lagging: true,
             notify_per_min: 20,
@@ -234,10 +235,7 @@ impl Limits {
                 return fail(name, "must be between 1 and 100");
             }
         }
-        if self.checkpoint_behind == Some(0) {
-            return fail("checkpoint_behind", "must be at least 1, or absent");
-        }
-        let nonzero: [(&'static str, u64); 33] = [
+        let nonzero: [(&'static str, u64); 34] = [
             ("quota_bytes", self.quota_bytes),
             ("record_quota_bytes", self.record_quota_bytes),
             ("max_record_keys", self.max_record_keys),
@@ -276,6 +274,7 @@ impl Limits {
                 u64::from(self.identity_reads_per_source_per_min),
             ),
             ("list_page", self.list_page),
+            ("checkpoint_behind", self.checkpoint_behind),
             ("notify_per_min", u64::from(self.notify_per_min)),
             ("connect_per_min", u64::from(self.connect_per_min)),
             ("flag_after", u64::from(self.flag_after)),
@@ -348,7 +347,7 @@ mod tests {
         assert_eq!(limits.identity_reads_per_min, 6_000);
         assert_eq!(limits.identity_reads_per_source_per_min, 60);
         assert_eq!(limits.list_page, 1_000);
-        assert_eq!(limits.checkpoint_behind, None);
+        assert_eq!(limits.checkpoint_behind, 1_000);
         assert!(!limits.checkpoint_at_head);
         assert!(limits.mark_lagging);
         assert_eq!(limits.notify_per_min, 20);
@@ -430,7 +429,7 @@ mod tests {
             ),
             (
                 Limits {
-                    checkpoint_behind: Some(0),
+                    checkpoint_behind: 0,
                     ..Limits::default()
                 },
                 "checkpoint_behind",

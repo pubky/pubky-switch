@@ -484,7 +484,7 @@ mod tests {
         assert_eq!(cap("PUT", "/v1/x/peers"), 256 * 1024);
         assert_eq!(cap("PUT", "/v1/x/import/chunks/c"), 1024 * 1024);
         assert_eq!(cap("POST", "/v1/x/recovery/upload"), 16 * 1024 * 1024);
-        assert_eq!(cap("PUT", "/v1/x/handover"), 6 * 1024 * 1024);
+        assert_eq!(cap("PUT", "/v1/x/handover"), 12 * 1024 * 1024);
         for path in [
             "/v1/x/freeze",
             "/v1/x/unfreeze",
