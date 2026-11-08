@@ -2,7 +2,7 @@
 
 **Status.** Complete; a review candidate, with the Pubky Switch spec. The wire format of `spec/spec.md` ("the spec"). The spec decides behaviour; this document decides bytes. It settles every wire detail the spec leaves open, taking the reference prototype as the source of truth, so that a second team can build an interoperable switch, signer or app without reading the prototype. Where this document had to choose something the prototype doesn't fix, Appendix A says so. Paykit's own formats, those of the first protocol on the Switch, are in [Paykit's wire format](https://github.com/pubky/paykit-rs/blob/master/specs/v0.2/wire-format.md).
 
-**Test vectors.** `spec/vectors/` holds the Switch's test vectors for every encoding, signature, derivation, envelope and state transition below; its `README.md` lists the files. Every example in this document comes from those files and uses the fixed keys of `keys.json` (identities alice and bob, alice's apps `wallet`, `phone` and `executor`, bob's apps `shop` and `cap`), except the `429 quota_exceeded` body of 9.3, which is the prototype's answer and says so. The examples' scopes, message kinds and collections are Paykit's values, used as sample data, which the switch treats as opaque. The reference prototype, shared separately, recomputes every vector from its code.
+**Test vectors.** `spec/vectors/` holds the Switch's test vectors for every encoding, signature, derivation, envelope and state transition below; its `README.md` lists the files. Every example in this document comes from those files and uses the fixed keys of `keys.json` (identities alice and bob, alice's apps `wallet`, `phone` and `executor`, bob's apps `shop` and `cap`), except the `429 quota_exceeded` body of 9.3, which is the prototype's answer and says so. The examples' scopes, message kinds, collections and app record member are Paykit's values, used as sample data, which the switch treats as opaque. The reference prototype, shared separately, recomputes every vector from its code.
 
 **Conventions.**
 
@@ -230,7 +230,7 @@ Signed by the identity key (label `pubky-switch/v1/app-cert`). The signer delive
 | `expires_at` | time | yes | after `issued_at`, at most 730 days (2 years) after it | the signer sets it 365 days after `issued_at` by default (spec 3.2). Expired when the checker's clock is at or past it |
 | `suite_keys` | `array<suite key>` | no | 1 to 4 entries, suites strictly ascending | bundle keys of later suites (spec 3.2); writers of this version omit it. A suite key is `{ "suite": int, "key": b64 }`, `suite` from 2 to 255 (the envelope suite byte, 4.1), `key` 1 to 4096 bytes; unknown members in an entry are refused (1.1). Readers ignore the keys of suites they don't support, which in this version is every suite; its kid is derived over suite and key (1.5) |
 
-A verifier checks: the signature with the key of the identity it expects; `v` and `kind`; that the body has no unknown members (1.1); that `identity` is that identity; that `app_id` is derived from `signing_key`; that both keys are 32 bytes, that `bundle_key` isn't an X25519 key of low order (4.2), and both times parse; that `suite_keys`, if present, has the form above; that `scopes` follows the scope rule (Scope names, below); that `permissions` holds only switch permissions (below), each once and in their order; and that `expires_at` is present, not `null`, later than `issued_at` and at most 730 days after it. A certificate that fails any of these is invalid at every reader: the switch, apps and payers. The switch then enforces exactly `permissions`. A protocol's verifiers also check its own scope rules and that `permissions` is the list its scopes need; a certificate that fails these is invalid at those verifiers, though the switch takes it. Paykit's checks are in Paykit wire 3.1. Expiry is checked against the verifier's clock (the service uses its own time, 7.2). For the claim rules an app whose certificate has expired isn't current, so its open attempts are orphaned (6.8).
+A verifier checks: the signature with the key of the identity it expects; `v` and `kind`; that the body has no unknown members (1.1); that `identity` is that identity; that `app_id` is derived from `signing_key`; that both keys are 32 bytes, that `bundle_key` isn't an X25519 key of low order (4.2), and both times parse; that `suite_keys`, if present, has the form above; that `scopes` follows the scope rule (Scope names, below); that `permissions` holds only switch permissions (below), each once and in their order; and that `expires_at` is present, not `null`, later than `issued_at` and at most 730 days after it. A certificate that fails any of these is invalid at every reader: the switch and every app. The switch then enforces exactly `permissions`. A protocol's verifiers also check its own scope rules and that `permissions` is the list its scopes need; a certificate that fails these is invalid at those verifiers, though the switch takes it. Paykit's checks are in Paykit wire 3.1. Expiry is checked against the verifier's clock (the service uses its own time, 7.2). For the claim rules an app whose certificate has expired isn't current, so its open attempts are orphaned (6.8).
 
 **Scope names** (spec 3.3). The switch knows no scope names, only this rule. A scope is `name` or `name:<sub>`: `name` is 1 to 32 characters of `a-z`, `0-9`, `_` and `-`, starting with a letter or digit, and `<sub>` is 1 to 32 characters of `a-z`, `0-9` and `-`, starting with a letter or digit. Wherever a scope is compared, for a record's `read_scope` and `write_scopes` (6.2, 7.4.9, 7.5) and for the keys an app holds (3.5), holding `name` covers every `name:<sub>`: a certificate holding `name` holds every one of its sub-scopes, and one holding `name:<sub>` holds only that one. That is the one rule of hierarchy among scopes, and the switch applies it. So a certificate never holds both `name` and a `name:<sub>`: holding both would say nothing more, and every verifier refuses such a certificate. A certificate holds at most 32 scopes in all; a protocol may keep lower bounds of its own, as Paykit does (Paykit wire 3.1). A sub-scope's key derives from its parent's (1.5). Vectors: `documents.json` `scope_rule`.
 
@@ -278,15 +278,15 @@ Signed by the app's signing key (label `pubky-switch/v1/app-record`). Delivered 
 | `signing_key` | `b64(32)` | yes | equals the certificate's | the key that verifies this record |
 | `cert` | `signed<AppCert>` | yes | carrying form, signed by `identity` | |
 | `accepts` | `array<string>` | yes | full kind strings of the app's protocol, such as `paykit.payment_request` or a Paykit extension kind (Paykit wire 3.2) | may narrow the certificate's scopes, never widen them (spec 3.4). The app signs its record, so it adds a kind under a scope it holds, such as a Paykit extension kind, without a new certificate |
-| `capabilities` | object | no | `{ "endpoint_identifiers": array<string> }` | default empty; Paykit's: identifiers the app can pay to (Paykit wire 3.2) |
-| `public_endpoints` | object | no | Payment Endpoint Identifier to payload | default empty; Paykit's (Paykit wire 3.2) |
+| `protocols` | object | no | each member named by a protocol, with the syntax of a scope `name` (3.1); each value an object | default empty, and written as `{}` when the app's protocols add nothing. The members the app's protocols add to its record, each defined by its protocol, such as Paykit's `paykit` (Paykit wire 3.2). The switch checks only their form (Protocols' members, below) |
 | `label` | `string \| null` | no | | display only |
 | `updated_at` | time | yes | | the later `updated_at` wins between two copies; two different bodies with one `updated_at` are a conflict (Equal times, below; spec 4.2) |
-| `expires_at` | `time \| null` | yes, always written | required, not `null`, when `public_endpoints` is non-empty | chosen by the app, at most 30 days after `updated_at` recommended (the prototype: exactly 30 days); `null` for a record without public endpoints |
+| `expires_at` | `time \| null` | yes, always written | | chosen by the app; `null` means the record doesn't expire. A protocol may require one, as Paykit does for a record with public endpoints (Paykit wire 3.2) |
 
-A verifier reads `signing_key` from the body, verifies the signature with it, then checks `v`, `kind` and `identity`, verifies `cert` for that identity, and checks that the certificate names the same `app_id` and `signing_key`. A record with public endpoints and no `expires_at` is invalid.
+A verifier reads `signing_key` from the body, verifies the signature with it, then checks `v`, `kind` and `identity`, verifies `cert` for that identity, checks that the certificate names the same `app_id` and `signing_key`, and checks the form of `protocols` (below). A record that fails any of these is invalid at every reader, the switch included.
 
-- **Equal times** (spec 4.2): each new record of an app has an `updated_at` later than every record of it the app delivered or published, on any of its devices. Two records of one app with the same `updated_at` and different body bytes are a conflict for every reader, wherever it read them. A reader uses neither record and tells the user; it goes on using an earlier record of that app it holds, if any, and can still use the identity's other apps, as a Paykit payer does (Paykit wire 3.2). A record with a strictly later `updated_at` ends the conflict. The same body twice is one record. The switch refuses the second record of such a pair (6.2 `app.put`). A record whose `updated_at` is more than 5 minutes ahead of the reader's clock isn't used at all (Record age limit, above), so it takes part in no comparison. Vectors: `documents.json` `app_record_conflict`.
+- **Protocols' members** (spec 4.2). `protocols` holds what the app's protocols add to its record: one member per protocol, under the protocol's name, such as Paykit's `paykit` (Paykit wire 3.2). A protocol's name has the syntax of a scope `name` (3.1): 1 to 32 characters of `a-z`, `0-9`, `_` and `-`, starting with a letter or digit. The switch checks only the form: `protocols` is an object, each name has that syntax, and each value is an object, or `null`, which is no member (Absent and null). Every reader refuses a record that breaks this, the switch included. Inside a member the rules of 1.1 hold as in the rest of the record: duplicate names, the integer rule, and unknown members, which readers ignore. The operation cap bounds the record with its members (6.1). The switch never reads inside a member, and a reader ignores the member of a protocol it doesn't know. A protocol's rules on its member, and on `expires_at`, are its own: a record that breaks them is invalid at that protocol's readers, though the switch takes it. Vectors: the app records of `documents.json` carry Paykit's member; the apps of `claims.json` belong to no protocol, and their records carry an empty `protocols`; `documents.json` `app_record_protocols` holds records that only the form check refuses, and two that every reader takes.
+- **Equal times** (spec 4.2): each new record of an app has an `updated_at` later than every record of it the app delivered or published, on any of its devices. Two records of one app with the same `updated_at` and different body bytes are a conflict for every reader, wherever it read them. A reader uses neither record and tells the user; it goes on using an earlier record of that app it holds, if any, and can still use the identity's other apps, as a Paykit payer does (Paykit wire 3.2). A record with a strictly later `updated_at` ends the conflict. The same body twice is one record. The switch refuses the second record of such a pair (6.2 `app.put`). A record whose `updated_at` is more than the clock tolerance, 5 minutes (spec 11), ahead of the reader's clock isn't used at all, so it takes part in no comparison. Vectors: `documents.json` `app_record_conflict`.
 
 Example (`shop`, with a public endpoint and its 30-day `expires_at`):
 
@@ -313,14 +313,18 @@ Example (`shop`, with a public endpoint and its 30-day `expires_at`):
     "paykit.allowance_rejection",
     "paykit.allowance_end"
   ],
-  "capabilities": {
-    "endpoint_identifiers": [
-      "btc-lightning-bolt11",
-      "btc-bitcoin-p2wpkh"
-    ]
-  },
-  "public_endpoints": {
-    "btc-lightning-bolt12": "lno1qgsqvgnwgcg35z6ee2h3yczraddm72xrfua9uve2rlrm9deu7xyfzr"
+  "protocols": {
+    "paykit": {
+      "capabilities": {
+        "endpoint_identifiers": [
+          "btc-lightning-bolt11",
+          "btc-bitcoin-p2wpkh"
+        ]
+      },
+      "public_endpoints": {
+        "btc-lightning-bolt12": "lno1qgsqvgnwgcg35z6ee2h3yczraddm72xrfua9uve2rlrm9deu7xyfzr"
+      }
+    }
   },
   "label": "bob shop",
   "updated_at": "2025-12-31T00:00:00.000Z",
@@ -346,7 +350,7 @@ Signed by the identity key (label `pubky-switch/v1/identity`). Published at `/pu
 | `removed` | `array<object>` | yes | `{ "app_id": app-id, "distrust_from": time }` | |
 | `data_epoch` | int | yes | at least 1, only increases | |
 | `recovery_from` | `int \| null` | yes, always written | the generation lost in the most recent provider loss | |
-| `record_max_age` | int | no | at least 1; absent when the identity sets none | the longest time, in seconds, payers trust one of the identity's app records after its `updated_at` (3.2, spec 4.2); absent means 90 days (7776000) |
+| `record_max_age` | int | no | at least 1; absent when the identity sets none | the longest time, in seconds, that a reader relying on the identity's app records trusts one after its `updated_at` (spec 4.3), as Paykit's payers do (Paykit wire 3.2); absent means 90 days (7776000) |
 | `service_keys` | `array<object>` | no | `{ "generation": int, "key": b64(32) }` each, ascending by `generation`, each generation once, every one before this document's `generation`, at most 256; writers leave it out when empty, and readers treat a present `[]` as none | the service keys of earlier generations that current records' proofs need; the current one is `inbox.service_key` (below) |
 | `renewed` | `array<object>` | no | below; absent when empty | earlier certificates of listed apps (3.8) |
 
@@ -377,10 +381,10 @@ Rules the service enforces at `PUT /identity` (7.4.2):
 - **Deliver, then publish.** The signer delivers each new version to the service first and publishes it on the Homeserver only after the service accepts. If the Homeserver copy differs from the service's, the signer republishes the service's copy (the one `409 stale_identity` carries).
 - **Never back** (spec 4.3). The signer keeps the generation, version and document hash of the newest version a service accepted from it, or that it adopted. It never adopts or republishes a copy with a lower version or generation, or another body at that version, whichever service or answer shows it: that is a rollback or an equivocation, which it shows the user as an alarm instead of building on it. A copy with a higher version, another signer's, it may adopt.
 - **Equivocation.** Two documents with the same `version` and different body bytes are equivocation: an app that sees both, from any source, stops paying and alerts the user. Apps keep `hash(body bytes)` of each `(identity, version)` they have seen. The same body under another signature isn't equivocation: it shows a signer that signed one version twice, against 2.1, and the service still treats it as another document (7.4.2). A switch that holds one body refuses a peer delivery of another at that version and answers with its copy (7.4.5), so the sender holds both.
-- **Two copies.** A payer that holds both the Homeserver copy and the copy in the payee's directory (7.4.10) uses the one with the higher `version`.
-- **The switch's copy** (spec 4.3). A payer about to pay a public endpoint that holds no copy of the payee's document fresher than 10 minutes reads the Homeserver copy, then, in parallel with the app record reads that need only that document, the copy the payee's switch holds (7.4.15, at the `inbox.url` the Homeserver copy names). It waits for that answer at most until its record reads finish plus a short grace (500 ms in the prototype), and uses the higher `version`: the same body at an equal version, and another body there is equivocation (above). A lower copy changes nothing, and still counts as an answer. The switch's copy is fetched now, so it counts as a fresh copy (spec 4.3), for 10 minutes like any other, whether it came from the service or from a cache (7.4.15). An app that only the newer copy lists has its record read then, one more read in that case only.
-  - **A freeze in the answer** (7.4.15): the payer checks it as a freeze (3.6) with the payee's identity key, then reads the public read once more, at the freeze's `inbox.url`, and uses the higher of all the copies it holds. That answer without a freeze completes the lookup; `503 staged` there means the move isn't published, and the first answer's copy stands; a second freeze isn't followed, and the lookup has failed. A freeze that doesn't verify fails the lookup.
-  - **No answer:** a lookup that hasn't answered after the grace keeps running. If, when money is about to move, it has failed (no answer after the client's retries, an error status, a copy that doesn't verify) or still hasn't answered, a manual payment goes ahead only with the user's explicit confirmation that the payee's switch couldn't confirm the payee's apps, given before the attempt is written, and the app records an event for it; an answer that arrives first is used, before the destination check. An automatic payment waits for the lookup, with the client's usual request timeout (5 s in the prototype) and one retry, and isn't made if it fails; it never pays on the Homeserver copy alone. A failed lookup counts until the payer looks up again, once its copy is more than 10 minutes old.
+- **Two copies.** A reader that holds both the Homeserver copy and the copy in the identity's directory (7.4.10) uses the one with the higher `version`.
+- **The switch's copy** (spec 4.3). A reader about to act on an identity's public app records, for Paykit a payer about to pay a public endpoint, that holds no copy of the identity's document fresher than 10 minutes reads the Homeserver copy, then, in parallel with the app record reads that need only that document, the copy the identity's switch holds (7.4.15, at the `inbox.url` the Homeserver copy names). It waits for that answer at most until its record reads finish plus a short grace (500 ms in the prototype), and uses the higher `version`: the same body at an equal version, and another body there is equivocation (above). A lower copy changes nothing, and still counts as an answer. The switch's copy is fetched now, so it counts as a fresh copy (spec 4.3), for 10 minutes like any other, whether it came from the service or from a cache (7.4.15). An app that only the newer copy lists has its record read then, one more read in that case only.
+  - **A freeze in the answer** (7.4.15): the reader checks it as a freeze (3.6) with the identity's key, then reads the public read once more, at the freeze's `inbox.url`, and uses the higher of all the copies it holds. That answer without a freeze completes the lookup; `503 staged` there means the move isn't published, and the first answer's copy stands; a second freeze isn't followed, and the lookup has failed. A freeze that doesn't verify fails the lookup.
+  - **No answer:** a lookup that hasn't answered after the grace keeps running. If, when the app is about to act (for Paykit, when money is about to move), it has failed (no answer after the client's retries, an error status, a copy that doesn't verify) or still hasn't answered, an action the user starts goes ahead only with the user's explicit confirmation that the identity's switch couldn't confirm the identity's apps, given before the app writes anything for the action, and the app records an event for it; an answer that arrives first is used, before the app checks the records it acts on. An action without the user waits for the lookup, with the client's usual request timeout (5 s in the prototype) and one retry, and isn't taken if it fails; it never acts on the Homeserver copy alone. For Paykit these are a manual payment, confirmed before its attempt is written, and an automatic one (Paykit spec 7.2). A failed lookup counts until the reader looks up again, once its copy is more than 10 minutes old.
 - **Revocations reach counterparties** (spec 12.2 step 5): when an own app sees, in its feed, a delivery whose `removed` adds an app, or whose `renewed` sets an `until` (a closed renewal, 3.8), it delivers that document with `PUT /peers` (7.4.5) to the switches it sent messages to that were accepted in the last 30 days, skipping a switch whose `known_version` (7.1) is already that version or newer.
 
 **`renewed`** lists the earlier certificates of apps in `apps`, during and after a renewal (3.8). An entry:
@@ -521,7 +525,7 @@ A key bundle is a JSON object, not a signed document:
 - **At approval** (spec 3.2, 3.5) the app gets its scope keys for every data epoch so far and the naming key as a full bundle of this format, sealed to its certified bundle key, inside the approval (3.10). No Pubky grant carries them, and the companion claim's plaintext holds none either. The prototype hands the approval over in process.
 - **Incremental bundles** (spec 3.5). A bundle holds only the epochs the app lacks: those after the newest epoch through which the app holds every key (`keys_through` in `GET /apps`, 7.4.12), up to the current one. The signer reads `keys_through`; when the service shows none (a new app before any bundle, or after a provider loss), it stores a full bundle. A bundle that replaces one the app never fetched starts where the app's holdings end, so nothing is skipped.
 - **Full bundles on request.** An app that, after fetching its bundle, still lacks a scope key for some data epoch up to the current one (after a restore from an old backup) asks once with `POST /v1/{id}/apps/{app_id}/keys` (7.4.11); the signer, when next online, stores a full bundle for each app with a pending request, made for the app's current certificate, in parts when it is large: the ranges from epoch 1 to the current one that the parts it stored for that certificate don't cover yet. The service shows only the ranges of the stored parts (`bundle_ranges`, 7.4.12), so the signer keeps which certificate each part it stored names, and passes that on in a hand-over or a backup (`bundle_parts`, 3.12); a range whose part names another certificate, or one it can't tell, counts as missing. The new parts replace every part made for another certificate, which the app skipped. When the app's record at the service carries a certificate other than the current one (`record_cert`, 7.4.12), the signer also stores the current certificate with `cert.put`, in the batch of the first part, as at a renewal (3.8 step 1): an app restored from a backup older than its renewal, or one at a new service after a provider loss, may never have seen that `cert.put`, and takes the parts once it holds the certificate. The request stays pending until the stored parts together cover every epoch from 1 to the current one.
-- **Size:** each scope key takes about 90 bytes of compact JSON, so one 64 KiB envelope holds about 700 of them (714 with three scopes); incremental bundles stay small while the app keeps up.
+- **Size:** each scope key takes 81 to 160 bytes of compact JSON, by the length of its `scope` and its `data_epoch`, so one 64 KiB envelope holds about 400 to 800 of them. A Paykit app's keys take about 90 bytes each, about 700 to an envelope (714 with three scopes). Incremental bundles stay small while the app keeps up.
 - **Parts** (spec 3.5). A bundle whose envelope would exceed 64 KiB, such as a full bundle of three scopes over 300 data epochs, or the delta of an app offline through many rotations, is stored as several bundles, each a `key_bundle.put` (6.2) covering a contiguous range `[first_epoch, last_epoch]` and each within 64 KiB. Each part is signed and sealed on its own, with the naming key and the scope keys of its range only, so an app opens it without the others. The prototype seals the whole range, and halves a range whose envelope doesn't fit until each half does. The parts stored for an app never overlap; the app fetches them all (7.4.11) and merges their keys. A delivery cut short leaves whole parts stored, and the signer resumes it with what `GET /apps` shows is still missing (`bundle_ranges`, 7.4.12). Every renewal stores, with its `cert.put`, a full bundle made for the new certificate (spec 3.2 step 1): its range, from epoch 1 to the current one, or to the next one for a renewal that rotates the data epoch (3.8 Reductions), covers every part stored for the app, so its parts replace them all, and every part stored for an app names its newest certificate. A renewal cut short between two parts leaves parts made for the earlier certificate; the app skips them and asks for a full bundle. No part holds `switch_root` or a key for an epoch after the one it was made for: the current one, or during a rotation the next one, whose parts the signer stores before it publishes the document that raises the epoch (spec 3.2 and 12.2 step 2).
 - **Reading** (7.4.11): for each part the app verifies `sig` with the identity key, opens the envelope with its bundle secret, checks `v`, `kind` and the epoch range and that the naming key is the one it holds, and merges the keys into its state. The naming key never changes (spec 3.5): the app keeps the one it was approved with. `key_bundle.put` names `first_epoch` and `last_epoch` in the clear (6.2), since data epochs are public in `identity.json`. For the parts of a `GET /keys` answer:
   - The app refuses the whole answer when its parts, by the ranges they name in the clear, are out of `first_epoch` order or overlap, since merging them would pick between two keys. It takes no part from it. An empty `bundles` is none.
@@ -585,7 +589,7 @@ Its **freeze hash** is the document hash (2.2).
 
 - **Kept before it is sent:** the signer keeps the signed freeze before it sends it and sends those same bytes again until it has an answer, so a lost answer never leaves it without the freeze the service may have applied. The service answers the same freeze again with its original proof (7.4.13).
 - **Used once:** a freeze an unfreeze cancelled is never applied again (`409 conflict`), so a replay can't freeze the account after an abort. A new move signs a new freeze, with a new `nonce`.
-- **Shown to payers:** while the account is frozen, its public read of `identity.json` carries the freeze beside the document (7.4.15), so a payer holding an old document that names this service finds the next one.
+- **Shown to readers:** while the account is frozen, its public read of `identity.json` carries the freeze beside the document (7.4.15), so a reader holding an old document that names this service, such as a Paykit payer, finds the next one.
 
 The unfreeze, the body of `POST /v1/{id}/unfreeze`, is a JSON object:
 
@@ -662,7 +666,7 @@ Example unfreeze (as sent to N; `documents.json` `discarded` has N's answer, sig
 
 `limits`:
 
-| Field | Type | Prototype default | Meaning |
+| Field | Type | Default (9.2) | Meaning |
 |---|---|---|---|
 | `app_limit` | int | 32 | most apps in `identity.json`, never above 255 |
 | `max_envelope` | int | 65536 | envelope cap in bytes |
@@ -723,13 +727,13 @@ Example answer:
 
 ### 3.8 Certificate check order and renewal
 
-**Check order** (spec 3.4). The service, recipients, senders and payers check an app in this order and stop at the first check that fails:
+**Check order** (spec 3.4). The service, recipients, senders and other readers of app records, such as Paykit payers, check an app in this order and stop at the first check that fails:
 
-| # | Check | At the service | A recipient, sender or payer |
+| # | Check | At the service | A recipient, sender or other reader |
 |---|---|---|---|
 | 1 | The certificate verifies with the identity key (3.1) | `401 bad_signature` | drops the message, or skips the app |
 | 2 | Its `identity` and `app_id` are the expected identity and app, `app_id` derives from `signing_key`, and that key is the one the request, message or record is checked with | `401 bad_signature` | as 1 |
-| 3 | It hasn't expired: `expires_at` is later than the service's time for a request, the entry's `accepted_at` for a message, the reader's clock for sending or paying | `403 cert_expired` | as 1 |
+| 3 | It hasn't expired: `expires_at` is later than the service's time for a request, the entry's `accepted_at` for a message, the reader's clock for sending or for acting on a record | `403 cert_expired` | as 1 |
 | 4 | The request (7.1), message (4.5) or app record (3.2) signature verifies with `signing_key` | `401 bad_signature` | as 1 |
 | 5 | The certificate's standing (below) in the newest `identity.json` held counts | own app: `403 not_current`; another identity's app: `409 identity_needed`, or `403 not_current` when the certificate's renewal has closed; an app that copy lists in `removed` is answered exactly like a stranger (7.2) | as 1 |
 | 6 | The app record is signed with `signing_key` and carries this certificate, or an earlier one of the same app with the same `signing_key` and `bundle_key` | `403 not_current` | skips the app |
@@ -738,7 +742,7 @@ Then come scopes and switch permissions (`403 permission_missing`; recipients dr
 
 - **The timestamp** (7.1) is checked right after check 4, so a stale request is refused only once it is authenticated.
 - **Why 4 before 5.** Checks 1 to 3 need only what the caller presents and a clock; check 4 authenticates the caller before the service consults anything it holds for the account. If check 5 came first, anyone holding an app's public certificate could learn, without that app's key, whether this switch holds its identity's `identity.json`, which shows that the two identities correspond.
-- **Which certificate.** The service checks an own app against the renewed certificate it stored with `cert.put` once the newest `identity.json` lists that certificate's hash, and otherwise against the one in the app's record (from `app.put`, or from the `app.put` in the body of the app's first call, 7.2). For an app of another identity it checks the one in `Switch-Cert`. A recipient checks the one the inbox entry carries (the feed's `cert`), a sender the one in the app record it read in a directory (7.4.10), a payer the one in the destination app's record.
+- **Which certificate.** The service checks an own app against the renewed certificate it stored with `cert.put` once the newest `identity.json` lists that certificate's hash, and otherwise against the one in the app's record (from `app.put`, or from the `app.put` in the body of the app's first call, 7.2). For an app of another identity it checks the one in `Switch-Cert`. A recipient checks the one the inbox entry carries (the feed's `cert`), a sender the one in the app record it read in a directory (7.4.10), another reader, such as a Paykit payer, the one in the record it acts on.
 - **Standing** of a certificate with hash h for app a in an `identity.json` D (check 5):
 
   | Standing | When | Counts for a message accepted at t | Makes the app current now |
@@ -749,21 +753,21 @@ Then come scopes and switch permissions (`403 permission_missing`; recipients dr
   | removed | D's `removed` lists a | if t is at least 5 minutes before `distrust_from` (5.1 check 7) | no |
   | none | otherwise | no | no |
 
-  "Current now" decides wherever the app acts at present: the service serving its requests and accepting its appends, a sender wrapping to it, a payer paying its destinations. "Counts at t" decides for a message, with t its `accepted_at` (spec 11).
-- **Check 6** applies where a record is involved: the record the service holds for each own app, the records a sender reads in a directory, and the public record a payer reads (spec 4.2).
-- **Payers** refuse a destination whose app's listed certificate has expired (check 3 at the payer's clock).
+  "Current now" decides wherever the app acts at present: the service serving its requests and accepting its appends, a sender wrapping to it, a reader acting on its record (for Paykit, a payer paying its destinations). "Counts at t" decides for a message, with t its `accepted_at` (spec 11).
+- **Check 6** applies where a record is involved: the record the service holds for each own app, the records a sender reads in a directory, and the public record another reader acts on (spec 4.2).
+- **Readers acting on a record** refuse it once its app's listed certificate has expired (check 3 at the reader's clock), as Paykit payers refuse that app's destinations (Paykit spec 4).
 
 **Renewal** (spec 3.2). A renewed certificate is a new certificate for the same app: the same `app_id`, `signing_key` and `bundle_key`, and a later `issued_at`; `scopes`, `permissions` and `expires_at` may change. Other keys make a new app (spec 12.1).
 
 1. The signer stores the new certificate with `cert.put` (6.2), in the same batch as the first `key_bundle.put` of a full bundle made for it (3.5). The bundle's parts replace every part stored for the app, whether the renewal adds scopes, removes them or keeps them, so every stored part names the newest certificate.
 2. It delivers and then publishes `identity.json` with a higher `version` (3.3), listing the new certificate's hash for the app and adding the earlier hash to `renewed` with `until: null` (3.3). From this delivery the service checks the app against the stored renewed certificate: its expiry, switch permissions and scopes apply at once, also to requests the app signed earlier.
-3. The app reads `cert.put` in its feed (7.5) and takes the certificate once its own `identity.json` lists its hash. An app that holds an earlier certificate and no `cert.put` for the listed one, such as one restored from a backup older than a renewal it took (the `cert.put` keeps only its stub once the record carries the new certificate, 7.5), reads its own entry in `GET /directory` (7.4.10). It takes the record's certificate only if the record verifies with its own signing key (3.2) and the certificate verifies for the identity (3.1), names its own `app_id`, `signing_key` and `bundle_key`, has a later `issued_at` than the one it holds, and has the hash `identity.json` lists for the app; it takes that record as its own too, since the service already holds it. It does this before it reads its key bundle parts. From then on it presents it (`Switch-Cert`, the `cert` its inbox entries carry, executor grants), follows its scopes, and delivers its record carrying it with `app.put`. An app with public endpoints republishes that record on the Homeserver.
+3. The app reads `cert.put` in its feed (7.5) and takes the certificate once its own `identity.json` lists its hash. An app that holds an earlier certificate and no `cert.put` for the listed one, such as one restored from a backup older than a renewal it took (the `cert.put` keeps only its stub once the record carries the new certificate, 7.5), reads its own entry in `GET /directory` (7.4.10). It takes the record's certificate only if the record verifies with its own signing key (3.2) and the certificate verifies for the identity (3.1), names its own `app_id`, `signing_key` and `bundle_key`, has a later `issued_at` than the one it holds, and has the hash `identity.json` lists for the app; it takes that record as its own too, since the service already holds it. It does this before it reads its key bundle parts. From then on it presents it (`Switch-Cert`, the `cert` its inbox entries carry, executor grants), follows its scopes, and delivers its record carrying it with `app.put`. An app that publishes its record, such as a Paykit app with public endpoints, republishes it on the Homeserver.
 4. `GET /apps` (7.4.12) shows, for each app, `record_cert`, the certificate hash of the record the service holds, and `record_at`, when the service took it. Once `record_cert` is the new hash, the signer sets the entry's `until` to `record_at` plus the clock tolerance, 5 minutes (spec 3.2 step 4), in its next `identity.json` and delivers it. A renewal isn't a distrust event, so the tolerance goes on the side that keeps the app's last messages: recipients count the earlier certificate for a message accepted more than 5 minutes before `until` (5.1 check 7), that is, before `record_at`, when the app stopped presenting it.
 
 - **Reductions** (spec 3.2). A renewal is a reduction when the new certificate lacks a scope or a switch permission of the earlier one, or expires earlier. Its cutoff doesn't wait for the app: right after the delivery of step 2, the signer delivers a further `identity.json` that sets `until` of every renewed entry of the app still `null` to the service time at which the service took that delivery, plus the 5-minute tolerance, and then publishes it. The time is the `server_time` of the chain envelope in the delivery's transition proof (6.5). A retry of a delivery whose answer was lost gets that proof again (7.4.2), so the time is always the service's, never the signer's clock. Step 4 doesn't apply. Recipients count the earlier certificate for a message accepted more than the tolerance before `until`, so before that delivery (5.1 check 7). Renewals that only add scopes or extend the expiry follow steps 3 and 4.
 - **A removed scope's keys rotate** (spec 3.2, 12.2). A reduction whose new certificate lacks a scope with keys of the earlier one rotates the data epoch from e to e+1: a keyed scope (3.5), such as a sub-scope with keys of its own, or a name replaced by some of its sub-scopes, whose key derives every sub-scope's (for Paykit: a Paykit scope, a labelled selling scope with its label keys, or `request` replaced by labels). One that removes only scopes without keys, such as Paykit's extension scopes, a switch permission or expiry doesn't, and neither does dropping a sub-scope that its name in the new certificate covers (for Paykit, a label that `request` covers). The full bundle of step 1 runs from epoch 1 to e+1 and is made for the new certificate, so it holds no key of the removed scope; then the signer stores each other current app's bundle for e+1, with its own scopes' keys, as at a revocation (spec 12.2 step 2); then step 2's delivery lists the new certificate and raises `data_epoch` to e+1, in one `identity.json`, as a revocation's delivery moves the app and raises it. The closing delivery follows as above. From that delivery the service takes sealed fields only at e+1 (`409 stale_epoch`), so the reduced app holds no key for anything written under the removed scope after it, whoever hands it the ciphertext. Vectors: the wallet renewal of `documents.json`, which removes `manage_contacts`, raises `data_epoch` from 2 to 3 in version 4, and `envelopes.json` `reduction_key_bundle` is the wallet's full bundle for it.
 - **A closing delivery owed.** A signer stopped between the renewing delivery and the closing one leaves the earlier certificate open until it returns. At its next run, before any other delivery and before a provider change, it finds the closing delivery it owes from the newest `identity.json` the service holds (`GET /apps`, 7.4.12): every `renewed` entry still `null` whose renewal was a reduction, which it judges from the certificates it issued. It delivers that version again, a retry: it is still the renewing delivery, so the answer carries that delivery's proof, and the signer closes from its time as above.
-- **In between.** While `until` is `null` the earlier certificate counts wherever the app presents it: other inboxes accept appends carrying it, recipients accept its messages, and senders and payers use the record that carries it. Once `until` is set, a switch refuses a request presenting it (`403 not_current`), and recipients accept a message carrying it only if its inbox accepted it more than the 5-minute tolerance before `until` (5.1 check 7), so before `record_at`, or for a reduction before the renewing delivery. A sender skips an app whose record carries a certificate whose renewal has closed (check 5, "current now"), until the app delivers its record with the new certificate.
+- **In between.** While `until` is `null` the earlier certificate counts wherever the app presents it: other inboxes accept appends carrying it, recipients accept its messages, and senders and other readers use the record that carries it. Once `until` is set, a switch refuses a request presenting it (`403 not_current`), and recipients accept a message carrying it only if its inbox accepted it more than the 5-minute tolerance before `until` (5.1 check 7), so before `record_at`, or for a reduction before the renewing delivery. A sender skips an app whose record carries a certificate whose renewal has closed (check 5, "current now"), until the app delivers its record with the new certificate.
 - **Directory caches** (spec 8.1): a sender's cached directory belongs to the `identity.json` version it was read under; once the sender holds a newer version, it reads the directory again before its next send, so an app given a scope receives its kinds as soon as its new record is delivered. An app that lost a receiving scope receives its kinds no longer from each sender's next send after that sender sees the closing version: through the Homeserver event stream, an append answer whose `directory_version` is newer (7.4.3), or its re-fetch of a copy more than 10 minutes old (spec 8.1). Until then the sender's appends may still wrap those kinds to the app, and the inbox can't refuse them, since kinds are sealed and `apps_version` doesn't change on a renewal. So a removed receiving scope stops at most the sender's directory cache lifetime after the cutoff. A removed sending scope has no such delay: recipients reject a message carrying the earlier certificate that their inbox accepted after the cutoff (5.1 check 7).
 - **Earlier messages** keep the authority they were sent with: a request stored in a record still verifies and can be paid (spec 11).
 - **Removing a scope** applies at once at the service and, since the reduction closes the earlier certificate in the same signer step, at recipients: a switch holding the closing `identity.json` refuses the earlier certificate (`403 not_current`), recipient apps checking against it reject messages accepted after the cutoff (5.1 check 7), and senders stop wrapping to the app from their next send after they see the closing document (Directory caches, above). Own apps deliver the closing document to the switches they wrote to in the last 30 days, as after a revocation (3.3). The app keeps that scope's keys for every data epoch so far, so the removal of a scope with keys also rotates the data epoch (A removed scope's keys rotate, above).
@@ -894,11 +898,11 @@ How a signer hands the identity to a new signer (spec 12.8). The new signer is a
 
 | Field | Type | Req | Notes |
 |---|---|---|---|
-| `envelopes` | `array<b64>` | yes | 1 to 64 envelopes (Section 4), in order, each with one recipient: the new signer's certified bundle key. The recipient identity is the identity itself, so the HPKE `info` is `lp("pubky-switch/v1/hpke", identity, kid of the bundle key)`; `notify` is 0 |
+| `envelopes` | `array<b64>` | yes | 1 to 128 envelopes (Section 4, `max_handover_parts` of 9.2), in order, each with one recipient: the new signer's certified bundle key. The recipient identity is the identity itself, so the HPKE `info` is `lp("pubky-switch/v1/hpke", identity, kid of the bundle key)`; `notify` is 0 |
 | `sig` | `b64(64)` | yes | identity key signature, label `pubky-switch/v1/signer-handover`, over `lp(label, identity, the new signer's App ID (16 bytes), u32_be(n), envelope_1 bytes, ..., envelope_n bytes)`, n the number of envelopes, so it binds the count and the order |
 
-- **Parts:** the JSON below is split into n parts, in order, and part i is the plaintext of envelope i: `u32_be(len(part)) || part || zero padding` (4.5). The sender splits where it likes, each part fitting one envelope: at most 65,364 bytes, the 65,368 bytes of plaintext a one-recipient envelope holds less the length. With at most 64 parts the JSON is at most 64 x 65,364 = 4,183,296 bytes.
-- **The bound holds every state the other limits allow.** `identity_doc` fits `PUT /identity`'s 256 KiB body cap (7.1), so it is at most 262,119 bytes here as the `identity_doc` member. That document references at most 1,884 certificates: 255 apps, the most `app_limit` allows, and as many `renewed` entries as the rest of it holds. A certificate a signer of this version issues is at most 1,662 bytes here, with every scope but `request`, 8 extension scopes and 8 labels of 32 characters, and no `suite_keys`, which writers of this version omit: 3,131,208 bytes for all of them. `revoked_apps` fits an enrollment within the same body cap, since the signer names it in every enrollment (3.7): at most 6,766 App IDs, 196,214 bytes. `bundle_parts` holds at most 2,048 entries of at most 153 bytes, 315,409 bytes with its member name. With the other members the JSON is at most 3,905,486 bytes, 60 parts; a backup's `prev` (3.13) adds 53 bytes.
+- **Parts:** the JSON below is split into n parts, in order, and part i is the plaintext of envelope i: `u32_be(len(part)) || part || zero padding` (4.5). The sender splits where it likes, each part fitting one envelope: at most 65,364 bytes, the 65,368 bytes of plaintext a one-recipient envelope holds less the length. With at most 128 parts the JSON is at most 128 x 65,364 = 8,366,592 bytes.
+- **The bound holds every state the other limits allow.** `identity_doc` fits `PUT /identity`'s 256 KiB body cap (7.1), so it is at most 262,119 bytes here as the `identity_doc` member. That document references at most 1,884 certificates: 255 apps, the most `app_limit` allows, and as many `renewed` entries as the rest of it holds. A certificate is at most 3,599 bytes here, the largest the Switch allows in compact JSON: 32 scopes of the longest form, `name:<sub>` with 32 characters on each side (3.1), all five switch permissions, times with three fraction digits (1.6), and no `suite_keys`, which writers of this version omit: 6,780,516 bytes for all of them. The number of certificates doesn't depend on their size, since `identity_doc` names each by its hash. `revoked_apps` fits an enrollment within the same body cap, since the signer names it in every enrollment (3.7): at most 6,766 App IDs, 196,214 bytes. `bundle_parts` holds at most 2,048 entries of at most 153 bytes, 315,409 bytes with its member name. With the other members the JSON is at most 7,554,688 bytes, 116 parts; a backup's `prev` (3.13) adds 53 bytes. So `max_handover_parts` is 128 (9.2): 8,366,592 bytes, with 811,851 to spare.
 - **Plaintext:** the parts, concatenated in order, are this JSON:
 
   | Field | Type | Req | Notes |
@@ -918,7 +922,7 @@ How a signer hands the identity to a new signer (spec 12.8). The new signer is a
 - **Only referenced certificates:** the new signer acts on certificates only through `identity.json`. It renews a listed app, closes a listed renewal and judges a reduction against the listed certificate (3.8). A certificate that `identity.json` no longer references plays no part in its decisions: a removed or revoked app is handled by App ID (`removed`, `revoked_apps`), and readers judge old writes and messages from the certificates the records and messages carry, never from the signer. So `certs` stays within the bound however long the identity lives.
 - **The old signer** seals it only to an app its newest `identity.json` lists as current, with that app's certificate, once that version is delivered and no closing delivery is owed (3.8), and not during a move (Section 10). It stores the hand-over at the switch for the new signer (7.4.17), which keeps it until the next `identity.json` version. From then on it is handing over: it signs nothing for the identity but an abort (below), and keeps the key and these records. A signer that can't tell whether the switch stored the hand-over, after a lost answer, is handing over all the same, and aborts as for a lost target. The hand-over takes effect when the new signer's delivery wins the compare-and-swap (below). The old signer deletes the key and these records once the switch holds a version newer than `identity_doc` that it didn't deliver (spec 12.8).
 - **The new signer checks**, and refuses the hand-over at the first failure:
-  1. `envelopes` holds 1 to 64 envelopes; `sig` verifies with the identity key over its own App ID, their number and their bytes, in order; every envelope opens with its bundle secret, and their parts, concatenated in order, parse as the JSON; `v`, `kind` and `identity` are right; and `identity_secret` is the secret of the identity's key. So parts swapped, a part missing or added, or a count that isn't the parts', refuse it.
+  1. `envelopes` holds 1 to 128 envelopes; `sig` verifies with the identity key over its own App ID, their number and their bytes, in order; every envelope opens with its bundle secret, and their parts, concatenated in order, parse as the JSON; `v`, `kind` and `identity` are right; and `identity_secret` is the secret of the identity's key. So parts swapped, a part missing or added, or a count that isn't the parts', refuse it.
   2. `identity_doc` verifies for the identity (3.3) and lists the new signer's app; every certificate it lists, in `apps` and `renewed`, is among `certs`, and each of `certs` verifies for the identity (3.1). A certificate of `certs` that `identity_doc` doesn't reference, which a sender of this version doesn't include, is ignored: it plays no part in the new signer's decisions.
   3. Neither the switch's copy of `identity.json` (`GET /apps` `identity`, 7.4.12) nor the Homeserver's is newer than `identity_doc`, by version or generation, or another document at its version.
 
@@ -932,11 +936,12 @@ The signer's records, backed up as a hand-over addressed to the identity itself 
 
 | Field | Type | Req | Notes |
 |---|---|---|---|
-| `envelopes` | `array<b64>` | yes | 1 to 64 envelopes (Section 4), in order, each with one recipient: the identity's backup key (1.5). The recipient identity is the identity itself, so the HPKE `info` is `lp("pubky-switch/v1/hpke", identity, kid of the backup key)`; `notify` is 0 |
+| `envelopes` | `array<b64>` | yes | 1 to 128 envelopes (Section 4), in order, each with one recipient: the identity's backup key (1.5). The recipient identity is the identity itself, so the HPKE `info` is `lp("pubky-switch/v1/hpke", identity, kid of the backup key)`; `notify` is 0 |
 | `sig` | `b64(64)` | yes | identity key signature, label `pubky-switch/v1/signer-backup`, over `lp(label, identity, u32_be(n), envelope_1 bytes, ..., envelope_n bytes)` |
 
 - **Parts and plaintext:** as in 3.12: the parts, concatenated in order, are a hand-over's plaintext, with `identity_doc` the newest version the signer signed, and with `prev`, the document hash of the version `identity_doc` builds on, absent for a first version. The bound of 3.12 holds.
 - **When it is written:** before each delivery of a new version of `identity.json`, holding that version, so it is never behind the switch's copy; and after the signer stores key bundle parts, holding the same version, so `bundle_parts` lists them. A write that fails stops the delivery. The deliveries that race another signer, a new signer's first one after a hand-over (3.12) or a restore (below) and an abort, write it once they have won instead, so a delivery that loses never overwrites the winner's backup; a write that fails then leaves an alarm, and the next write repairs it.
+- **Size:** at the limits a backup is 128 envelopes of 64 KiB, 11,185,390 bytes of JSON (the largest state of 3.12 fills 116 of them), so the signer's Homeserver must accept a file that large. A Homeserver that refuses the write stops the delivery, as any failed write does: the backup is written first, so the signer changes nothing, and it tells the user.
 - **Another install's backup:** before it writes, the signer opens the backup it finds. One that names another install (3.3) at or past the newest version a service accepted from this signer shows that install has taken over: the signer writes nothing and refuses this and every later signing call, as an install that isn't named (3.3).
 - **Restoring** (spec 12.8), with the identity key and on the user's confirmation: the install reads the backup, derives the backup key, and checks it as a new signer checks a hand-over (3.12), with these changes. Check 1 uses the backup's label and fields and its own backup key. Check 2 doesn't ask that `identity_doc` list an app of its own. Check 3 asks that the switch's copy (`GET /apps` `identity`, 7.4.12) be `identity_doc` itself, or the version whose document hash is `prev`, and that the Homeserver's copy be neither newer than `identity_doc` nor another one at its version. A switch at `prev` means the signer stopped between writing the backup and delivering: the restore delivers `identity_doc` first, on that copy. A switch that holds no copy counts as being at `prev` only when the backup has none (`identity_doc` is the account's first document, which the restore then delivers first); a switch with no copy under a backup that names a `prev` has lost the state the backup builds on, and the restore is refused. Any other copy makes the backup stale, and the restore is refused. The install then takes as revoked the App IDs of `revoked_apps`, of `identity_doc`'s `removed` and those `GET /apps` shows revoked or departed, delivers the next version with `prev` the hash of `identity_doc` and `signer` its own install's ID, publishes it, and writes its backup once that delivery has won. A delivery that gets `409 stale_identity` cancels the restore.
 - Vectors: `envelopes.json` `signer_backup` (alice's backup in one part, with fixed randomness), `keys.json` (each identity's backup key) and `signatures.json` (its label).
@@ -1308,19 +1313,19 @@ A failed condition is `409 conflict`, with the current value the caller may read
   "proofs": [
     {
       "body": "eyJjaGFpbiI6eyJlbnZlbG9wZSI6ImV5SmphR0Zw...",
-      "sig": "Q5nynJBSPdnMOUh1OKNwrFMzaxISqng6ApkHyxK_10aueQmbLxAWnttLiugebDxHoV4PTuNPlUwOd-IR5siPCQ"
+      "sig": "CEsyOBevIdX7OGtYEHr_nITIARcwoKIl_SOyRVskyzNJaYIVV29L7Pkl0d-PGwa3zZTj75wCHQ-DB9YwKlmLCw"
     },
     {
       "body": "eyJjaGFpbiI6eyJlbnZlbG9wZSI6ImV5SmphR0Zw...",
-      "sig": "ALNsPgGJOahsPkudNm3_sVWlEFdHbZNvp0ExgHD87l7wjsSsOIEBw223T71tpN7vcS72vxk73nVuliZEz6cJDA"
+      "sig": "EKxwnREEqEIFUTxlrhjF7Qnsn-ub22nFWseqqqityQgInMnmqwIIsYby7X76XFhQKQIsD2UclxgXsG44Bq99DA"
     }
   ],
   "head": {
     "chain_version": 1,
     "generation": 1,
     "seq": 9,
-    "chain_hash": "fekukVdB-7UTMDrAXB88ds1n2_zavT7vZYz15ndSGpU",
-    "sig": "yBS_MQ7YakC2NRjJ9xFZajCq99UEMX5aTax8dMVPaF5Z9-MfsT6pJGxa75c_ByTzFC8mxU1ICq2euJHQohm3Bw"
+    "chain_hash": "7cnQjhJhU6AcoBWbYkGqHkYpCA-dn_qkjLalmGaky9g",
+    "sig": "yZx9ezPGRFJ4xaokjpOrhPntr7_82PJpHurtW2cBi6ttl8EMu6Lcqi3emnON4A53tySDxjp6JUBdZAnXRC1wAA"
   }
 }
 ```
@@ -1337,7 +1342,7 @@ Example (the registration batch of spec 12.1 step 2: `app.put`, the first `recei
   "ops": [
     {
       "body": "eyJpZGVudGl0eSI6IjZmcmFvOHc5c3M1Y241NDRx...",
-      "sig": "IVcLjnKhvqOF5Y6i3rU0jsoitMZ1dedIfkucWSmWclEoRg116HR_ItXXFgWKD4vx8QiK2-NuZeqpRSP7AP75BA"
+      "sig": "fX8mPu_Gx7BeDzLiOmQ59dPCu2Ry1tDQTATqEnRyJSv9PAMoh6kKnXOSZ4lLhSL3Rh0kRA7wQSthcLMuM3bmDA"
     },
     {
       "body": "eyJpZGVudGl0eSI6IjZmcmFvOHc5c3M1Y241NDRx...",
@@ -1401,7 +1406,7 @@ Example proof (`chain.json` "claim attempt (seq 7)", the `attempt` of 6.1; the c
 {
   "chain": {
     "envelope": "eyJjaGFpbl92ZXJzaW9uIjoxLCJnZW5lcmF0aW9u...",
-    "chain_hash": "eTzwZI4bae4QJnWXw6Zr_GNcKaPcAndnwI6Vdib-1jE"
+    "chain_hash": "5pd27ePol1fBJcRvuJhfSLI0kXfMiYT4EiXf8htSkOY"
   },
   "object": "sTqkmOg6G5PIHULuqwOHIuIiZBdkPJL2uxE_kuo8K5Y",
   "step": 1,
@@ -1461,7 +1466,7 @@ Example envelope (the `attempt` of 6.1, at `seq` 7: an inbox entry at `seq` 5, t
   "chain_version": 1,
   "generation": 1,
   "seq": 7,
-  "prev_chain_hash": "laV7-bIhFxhF8S4MLwrtCq2DILEaL56KFgTKpq8Zxtw",
+  "prev_chain_hash": "PEG3PKwsceFwKTZKjaBRzGEYRurhBQ7cn8jNiBRNtgs",
   "server_time": "2026-01-01T00:00:03.000Z",
   "item_type": "op",
   "item_hash": "nLYzEGm46RkXyS60TK0uwblTbRrIgJEtMk0m-2a9KUU",
@@ -1487,11 +1492,11 @@ A signed head is a JSON object (not a signed document):
 
 ```json
 {
-  "chain_hash": "fekukVdB-7UTMDrAXB88ds1n2_zavT7vZYz15ndSGpU",
+  "chain_hash": "7cnQjhJhU6AcoBWbYkGqHkYpCA-dn_qkjLalmGaky9g",
   "chain_version": 1,
   "generation": 1,
   "seq": 9,
-  "sig": "yBS_MQ7YakC2NRjJ9xFZajCq99UEMX5aTax8dMVPaF5Z9-MfsT6pJGxa75c_ByTzFC8mxU1ICq2euJHQohm3Bw"
+  "sig": "yZx9ezPGRFJ4xaokjpOrhPntr7_82PJpHurtW2cBi6ttl8EMu6Lcqi3emnON4A53tySDxjp6JUBdZAnXRC1wAA"
 }
 ```
 
@@ -1610,7 +1615,7 @@ Vectors: `claims.json` runs 69 steps through every row above, the deadline pin a
 | `POST /enroll`, `PUT /identity`, `PUT /peers` | 256 KiB |
 | `PUT /import/chunks/{chunk_id}` | 1 MiB (the chunk size) |
 | `POST /recovery/upload` | 16 MiB |
-| `PUT /handover` | 6 MiB (64 envelopes in base64url, 3.12) |
+| `PUT /handover` | 12 MiB (128 envelopes in base64url, 3.12) |
 | `POST /freeze`, `POST /unfreeze`, `POST /import/activate`, `POST /recovery/admission`, `POST /apps/{app_id}/revoke`, `POST /apps/{app_id}/leave`, `POST /apps/{app_id}/keys`, `PUT /push`, `POST /erase` | 16 KiB |
 | every `GET`, `POST /connect`, `DELETE /connect/{pubky}` | none (0 bytes) |
 
@@ -1692,7 +1697,7 @@ For every request the service:
   - an append, directory read or `PUT /peers` admitted only by an invite code, whose expiry is a time.
 
   Deletions at a deadline (9.1 sweeps) wait. Everything else is served as usual: reads, cursor moves, appends and `PUT /peers` admitted otherwise, record writes without a time condition, list and invite code changes, the owner's outcomes and `done` by evidence, outcomes for an attempt whose owner isn't current in the sense above or that came from uploads, deletes and removals, and revocation. Request timestamps, certificate expiry and rate windows are then checked against the time base, which is the wall clock, corrected by the last sample where they disagree by more than 5 minutes.
-- The prototype implements this as an opt-in (`trusted_time.required`), since it has no time source of its own; tests give it samples.
+- `trusted_time.required` is on by default (9.2), as a production service has trusted time (spec 10.1). The prototype runs with it off, since it has no time source of its own; its tests turn it on where they need it and give it samples.
 
 ### 7.4 Endpoints
 
@@ -1797,7 +1802,7 @@ For every request the service:
   - beyond it, the app accepts it only once the page's stubs extend its verified chain through the checkpoint's `seq` and the checkpoint matches the chain hash there (a mismatch is a rollback); while they extend it and `more` is set before the checkpoint, the checkpoint waits for the next page;
   - beyond it without those stubs (the first stub after its position doesn't link to its chain, or the page reaches the checkpoint's position with none), it depends on the app. For an app whose verified chain item is less than 30 days old, by the `server_time` of its envelope on the app's clock less the 5-minute clock tolerance (the prototype's `STUBS_KEPT_FOR_MS`), and that wasn't restored since, the service rule above keeps the stubs from its position, so their absence is evidence of a rollback. How often the app reads doesn't matter. After a restore the service may hold the app's cursor past the backup's position, so the rule holds again only once the service holds a cursor the restored app moved and the app has read a page after that. The same holds for an app more than 30 days behind that holds a signed head or a transition proof of its own write at a `seq` in (its verified position, the checkpoint], from an answer whose `Switch-Server-Time` is less than 30 days old by the same measure: the service keeps that item's stub behind the app's cursor, so its absence is a rollback, not a gap to continue over. Not for an app whose devices share its cursor (another device may have moved it past that item; such apps sync their chain views) or that was restored since. The prototype keeps up to 256 such marks (`ChainView::note_held`). For an app more than 30 days behind, or restored, the stubs may otherwise be gone honestly, and the app has no evidence of continuity, since the checkpoint's signer is the service being checked. It enters "continuity unverified", which is reconcile mode (spec 12.4): no automatic payments, every obligation checked against the SETTLED proofs and claims it keeps before attempting, shown to the user. Only as that recovery decision does it continue from the checkpoint's chain hash, with no time for its verified item until the next stub; reconciliation ends the state, but doesn't prove the missing chain's continuity. A new app before its first read takes this path too.
 
-  Behind the checkpoint an app keeps no chain hashes, and heads at or before it are no longer compared; it drops claim evidence behind it as spec 12.6 allows (10.6). Batch IDs don't follow checkpoints: the app compares each for 30 days of the chain, by its stubs' `server_time`, and then forgets it, whatever checkpoints it sees (6.6). How often the service signs a checkpoint, and at which item, is the operator's choice (spec 8.3), since apps verify from their cursor whatever the checkpoint: whenever the stubs it could drop would free a useful amount. So a checkpoint may lie ahead of stubs the service still keeps, and an export carries those too (10.2). The prototype signs one once `checkpoint_behind` chain items may go, at the newest of them, and drops every stub behind it (opt-in, off by default). With `checkpoint_at_head` it signs one at the newest chain item once `checkpoint_behind` items were added since the last, and drops behind it only what the rule above lets go. After a cooperative move N signs the export's checkpoint again with its own key (10.5).
+  Behind the checkpoint an app keeps no chain hashes, and heads at or before it are no longer compared; it drops claim evidence behind it as spec 12.6 allows (10.6). Batch IDs don't follow checkpoints: the app compares each for 30 days of the chain, by its stubs' `server_time`, and then forgets it, whatever checkpoints it sees (6.6). How often the service signs a checkpoint, and at which item, is the operator's choice (spec 8.3), since apps verify from their cursor whatever the checkpoint: whenever the stubs it could drop would free a useful amount. So a checkpoint may lie ahead of stubs the service still keeps, and an export carries those too (10.2). By default the service signs one once `checkpoint_behind` chain items, 1,000 (9.2), may go, at the newest of them, and drops every stub behind it. With `checkpoint_at_head`, off by default, it signs one at the newest chain item once `checkpoint_behind` items were added since the last, and drops behind it only what the rule above lets go. The prototype's own default is off, so it signs no checkpoint unless its configuration sets one, as its tests do. After a cooperative move N signs the export's checkpoint again with its own key (10.5).
 - **Lagging apps** (spec 6.3): an app whose unread entries exceed its share of the inbox quota (the quota divided among current apps) is marked lagging (7.4.12), and entries no longer wait for it, but only while another current app is reading: when every current app would be lagging, none is marked and entries wait as before, so the quota refuses senders. The mark ends when the app reads its feed.
 - **`missed` items:** when the service deletes an entry a lagging target hasn't read, it records the miss in a `missed` item for that app, which takes a new `seq` like an unreadable entry, so the app's cursor reaches it whatever its position. A later miss replaces an item the app hasn't passed with one covering both. On a `missed` item the app asks the counterparties of its unfinished records to re-send what their inboxes accepted from the later of the item's `accepted_from` and its cursor's time, less the clock tolerance, by its protocol's re-send (for Paykit, Paykit wire 4.12), and lists its collections again (7.4.9), since deleted keys may have been forgotten meanwhile. An item whose times don't parse is ignored.
 - **Errors:** `403 permission_missing` for callers that aren't own apps; `400` for a malformed `after`.
@@ -1824,7 +1829,7 @@ Example page (alice's `wallet` after `1:4`: bob's entry at `seq` 5, then four ch
       "seq": 6,
       "stub": {
         "envelope": "eyJjaGFpbl92ZXJzaW9uIjoxLCJnZW5lcmF0aW9u...",
-        "chain_hash": "laV7-bIhFxhF8S4MLwrtCq2DILEaL56KFgTKpq8Zxtw"
+        "chain_hash": "PEG3PKwsceFwKTZKjaBRzGEYRurhBQ7cn8jNiBRNtgs"
       },
       "item_type": "op",
       "item": {
@@ -1833,7 +1838,7 @@ Example page (alice's `wallet` after `1:4`: bob's entry at `seq` 5, then four ch
       },
       "proof": {
         "body": "eyJjaGFpbiI6eyJlbnZlbG9wZSI6ImV5SmphR0Zw...",
-        "sig": "vgnHs8g12bhoEl3Ync6BXxKA-1R3crhHIsDOgvUONEsRTzZ5qY8CPq_lImatS52nTE1IPXjYI6GCVVA9duRVCA"
+        "sig": "aHA6fvZEMbToN3t16uPsDAHQBm81_4pnvimBkgNJfA_POUxKH9S8kNgL8zKGgWYz-deUa91AdL6KaCcxs001DQ"
       }
     },
     {
@@ -1841,7 +1846,7 @@ Example page (alice's `wallet` after `1:4`: bob's entry at `seq` 5, then four ch
       "seq": 7,
       "stub": {
         "envelope": "eyJjaGFpbl92ZXJzaW9uIjoxLCJnZW5lcmF0aW9u...",
-        "chain_hash": "eTzwZI4bae4QJnWXw6Zr_GNcKaPcAndnwI6Vdib-1jE"
+        "chain_hash": "5pd27ePol1fBJcRvuJhfSLI0kXfMiYT4EiXf8htSkOY"
       },
       "item_type": "op",
       "item": {
@@ -1850,7 +1855,7 @@ Example page (alice's `wallet` after `1:4`: bob's entry at `seq` 5, then four ch
       },
       "proof": {
         "body": "eyJjaGFpbiI6eyJlbnZlbG9wZSI6ImV5SmphR0Zw...",
-        "sig": "Q5nynJBSPdnMOUh1OKNwrFMzaxISqng6ApkHyxK_10aueQmbLxAWnttLiugebDxHoV4PTuNPlUwOd-IR5siPCQ"
+        "sig": "CEsyOBevIdX7OGtYEHr_nITIARcwoKIl_SOyRVskyzNJaYIVV29L7Pkl0d-PGwa3zZTj75wCHQ-DB9YwKlmLCw"
       }
     },
     {
@@ -1858,7 +1863,7 @@ Example page (alice's `wallet` after `1:4`: bob's entry at `seq` 5, then four ch
       "seq": 8,
       "stub": {
         "envelope": "eyJjaGFpbl92ZXJzaW9uIjoxLCJnZW5lcmF0aW9u...",
-        "chain_hash": "GNOCzbTTgTqIeUGtsMufzt0h2rmSmQvGODylUB_wqp0"
+        "chain_hash": "yTESsVT4FMSMWpLke97CDhoQg1OVGe3_ZigpgZZhwWc"
       },
       "item_type": "op",
       "item": {
@@ -1867,7 +1872,7 @@ Example page (alice's `wallet` after `1:4`: bob's entry at `seq` 5, then four ch
       },
       "proof": {
         "body": "eyJjaGFpbiI6eyJlbnZlbG9wZSI6ImV5SmphR0Zw...",
-        "sig": "ALNsPgGJOahsPkudNm3_sVWlEFdHbZNvp0ExgHD87l7wjsSsOIEBw223T71tpN7vcS72vxk73nVuliZEz6cJDA"
+        "sig": "EKxwnREEqEIFUTxlrhjF7Qnsn-ub22nFWseqqqityQgInMnmqwIIsYby7X76XFhQKQIsD2UclxgXsG44Bq99DA"
       }
     },
     {
@@ -1875,7 +1880,7 @@ Example page (alice's `wallet` after `1:4`: bob's entry at `seq` 5, then four ch
       "seq": 9,
       "stub": {
         "envelope": "eyJjaGFpbl92ZXJzaW9uIjoxLCJnZW5lcmF0aW9u...",
-        "chain_hash": "fekukVdB-7UTMDrAXB88ds1n2_zavT7vZYz15ndSGpU"
+        "chain_hash": "7cnQjhJhU6AcoBWbYkGqHkYpCA-dn_qkjLalmGaky9g"
       },
       "item_type": "service",
       "item": {
@@ -1891,8 +1896,8 @@ Example page (alice's `wallet` after `1:4`: bob's entry at `seq` 5, then four ch
     "chain_version": 1,
     "generation": 1,
     "seq": 9,
-    "chain_hash": "fekukVdB-7UTMDrAXB88ds1n2_zavT7vZYz15ndSGpU",
-    "sig": "yBS_MQ7YakC2NRjJ9xFZajCq99UEMX5aTax8dMVPaF5Z9-MfsT6pJGxa75c_ByTzFC8mxU1ICq2euJHQohm3Bw"
+    "chain_hash": "7cnQjhJhU6AcoBWbYkGqHkYpCA-dn_qkjLalmGaky9g",
+    "sig": "yZx9ezPGRFJ4xaokjpOrhPntr7_82PJpHurtW2cBi6ttl8EMu6Lcqi3emnON4A53tySDxjp6JUBdZAnXRC1wAA"
   }
 }
 ```
@@ -1969,8 +1974,8 @@ Example page (alice's `wallet` after `1:4`: bob's entry at `seq` 5, then four ch
   | `apps_version` | int | changes only when an app becomes reachable (current, with a receive key) or stops being reachable |
 
   Apps of other identities also get `known_version`. `404` before the account holds an `identity.json`.
-- **Two copies of `identity.json`:** a payer holding both this copy and the Homeserver's uses the one with the higher `version`; two copies with one `version` and different body bytes are equivocation (3.3).
-- **Records expire:** a sender or payer ignores the public endpoints of a record whose `expires_at` has passed (3.2).
+- **Two copies of `identity.json`:** a reader holding both this copy and the Homeserver's uses the one with the higher `version`; two copies with one `version` and different body bytes are equivocation (3.3).
+- **Records expire** as their protocols say (3.2): for Paykit, payers ignore the public endpoints of a record whose `expires_at` has passed (Paykit wire 3.2).
 
 Example (bob's `shop` reading alice's directory; signed documents cut short):
 
@@ -1985,7 +1990,7 @@ Example (bob's `shop` reading alice's directory; signed documents cut short):
       },
       "record": {
         "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFw...",
-        "sig": "nWdxbVmxiQPioR2UVPQlon0CA80U5aE76FYEN4boIGIzSV1SCVbIj3oV7SVJEfgeUbHeEyYcqE4wpwTPtvaDCg"
+        "sig": "0KQI1CIMiMApXmQkYbSgsd9xttJaW-iGFfasDbQlmCwDXzfM1qj1hydqFFRL8NJVrMH_LWxuE0Q2A1E_k1yFCQ"
       }
     },
     {
@@ -1996,7 +2001,7 @@ Example (bob's `shop` reading alice's directory; signed documents cut short):
       },
       "record": {
         "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFw...",
-        "sig": "oEO7WiknYh4nOWiX3ZO8VNcbeQUWktK0UMN_vaeaYcLNkUrrf3E62vsF71br3nqJFBVxcK2Z8v90v4TfJQuBAA"
+        "sig": "I1VnSi0CjO7W45Z9gpn90mxAxq4DV5m9IwX72O07hHHfI2xpevmxW8x8OP2rfAJiQXnfK67MATaTYgcUTZEvCg"
       }
     },
     {
@@ -2007,7 +2012,7 @@ Example (bob's `shop` reading alice's directory; signed documents cut short):
       },
       "record": {
         "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFw...",
-        "sig": "V84n7JKO0Cfj9wtLYaP54ESDOZeK2wuvKS-PD1mVV6bB2IPT5S8r-TpkIao_0SEB9YO8lZWVVMH-hEXISqv2BQ"
+        "sig": "Gf11MF1EMN3ipYAsh7_vv6JFL2J0MdOzjcNMHXpkqdZDRAALwMB18BmrBW_X7ZRsj8WmE3Q-Rr7ihaxRkLxBDA"
       }
     }
   ],
@@ -2085,14 +2090,14 @@ Example (bob's `shop` reading alice's directory; signed documents cut short):
 
 #### 7.4.15 `GET /v1/{id}/identity`
 
-The newest `identity.json` the service holds for the account's own identity, as the signer delivered it (7.4.2, spec 4.3), so a payer can compare it with the Homeserver copy (3.3, "The switch's copy").
+The newest `identity.json` the service holds for the account's own identity, as the signer delivered it (7.4.2, spec 4.3), so a reader can compare it with the Homeserver copy (3.3, "The switch's copy").
 
-- **Request:** unauthenticated: no `Switch-Identity`, `Switch-App` or `Switch-Signature`, so it names no payer; a client sends none. No body.
-- **Answer:** `{ "identity": signed<IdentityDoc>, "freeze": signed<Freeze> }`, with `freeze` only while the account is frozen (3.6, 7.4.13), signed with the account's service key like every answer (the request signature field is `hash` of the empty string, 7.1), with no `Switch-Head`, `seq` or `known_version`. The document and the freeze are signed by the identity key, so a reader verifies them as any `identity.json` (3.3) and any freeze (3.6) and needs nothing else from the answer. How a payer uses it: 3.3, "The switch's copy".
+- **Request:** unauthenticated: no `Switch-Identity`, `Switch-App` or `Switch-Signature`, so it names no reader; a client sends none. No body.
+- **Answer:** `{ "identity": signed<IdentityDoc>, "freeze": signed<Freeze> }`, with `freeze` only while the account is frozen (3.6, 7.4.13), signed with the account's service key like every answer (the request signature field is `hash` of the empty string, 7.1), with no `Switch-Head`, `seq` or `known_version`. The document and the freeze are signed by the identity key, so a reader verifies them as any `identity.json` (3.3) and any freeze (3.6) and needs nothing else from the answer. How a reader uses it: 3.3, "The switch's copy".
 - **Caching:** a `200` carries `Cache-Control: public, max-age=60`. The answer is the same for every reader, since its signature covers the hash of the empty string as the request signature, so a cache may serve it for up to 60 seconds. Error answers carry none.
 - **Limits** (9.4): per network source, an IPv4 address or an IPv6 /64, `identity_reads_per_source_per_min` reads a minute per account; and per account, from all sources together, `identity_reads_per_min`, a higher backstop. Reads that a source's limit refuses don't count against the account's. A service that can't tell the source, such as the prototype's in-process transport, applies only the account's limit; behind a reverse proxy the source is the address the proxy reports.
 - **Errors:** `404` for an unknown account (operator key) or one holding no document; `503 staged` for an account the newest document doesn't name yet (7.3 step 7); `429 rate_limited` past either limit (9.4).
-- **A frozen account** answers with its last document and the freeze. After a move the old service keeps both, and answers so, for at least the identity's record age limit (`record_max_age`, 90 days when absent) after the move, after which no app record from before the move is payable (3.2). It doesn't see the move published, so it counts from the last export call it answered, plus a day. The prototype deletes a frozen account only when the signer erases it (7.4.16). After an unfreeze (10.6) the answer carries no freeze.
+- **A frozen account** answers with its last document and the freeze. After a move the old service keeps both, and answers so, for at least the identity's record age limit (`record_max_age`, 90 days when absent) after the move, after which no reader that applies it, such as a Paykit payer, uses an app record from before the move (Paykit wire 3.2). It doesn't see the move published, so it counts from the last export call it answered, plus a day. The prototype deletes a frozen account only when the signer erases it (7.4.16). After an unfreeze (10.6) the answer carries no freeze.
 - It reveals nothing the Homeserver doesn't publish. The service sees the reader's network address and when it looked the identity up, so it learns that someone is about to pay it (spec 15).
 - Vectors: `http.json` "anyone: the public identity.json read" and "anyone: a frozen service's public identity.json read, with the freeze".
 
@@ -2104,7 +2109,7 @@ The signer erases the identity's account at this service (spec 12.7).
 - **Refused during a move** (`409 conflict`): at a frozen account whose export isn't finished, that is, with no manifest built yet (10.2) or a chunk of it never fetched, by the next service or the signer (10.3); and at a staged account holding an import, partial or activated, until the signer aborts it (10.6), since the old service resumes only with this service's discard answer (3.6). The service doesn't wait for the pointer window of 7.4.15: once the export is finished it takes the erasure, and it is the signer that waits for the window (spec 12.7). After a move given up for a provider loss (spec 12.6), the signer finishes the old service's export by fetching its manifest and every chunk itself, then erases there.
 - **Answer:** `{ "erased": true }`, signed with the account's service key. It is the last answer that key signs. No answer to an erasure, an error included, carries `Switch-Head`. The service then deletes everything it holds for the identity: every kind of 9.1, "for good" ones included, the chain with its stubs, checkpoints and batch records, the freeze, the export or the staged import, a stored hand-over (7.4.17), the enrollment answers, the pending key of the next generation (3.7), the rate-limit and failed-authentication counts (9.4), and the account's service key with its mark (7.3 step 10). An account whose state is behind its key's mark still takes the erasure, since the answer carries no head.
 - **Order:** the service signs the answer first, while it still holds the key; then it commits the deletion of all of it, the state, the service key and the mark, durably (7.3 step 10); only then does it release the answer. So a crash after the answer can't leave the erased account recoverable. If the deletion can't be committed, the service answers `503 unavailable`, signed with the account's service key, without a head, having deleted nothing, and the signer retries. A retry after a committed erasure finds no account: it gets the `404` of the next bullet, signed with the operator key. A signer whose `200` was lost takes that `404`, for the account it asked to erase, as the erasure done. It can't authenticate it, but a signed `200` proves no more: a service that keeps the data could sign one anyway (spec 12.7).
-- **Afterwards** every request for the account is answered as for an account the service doesn't host: `404`, signed with the operator key (7.3 step 2), the public read and the erasure itself included. `POST /v1/enroll` creates a new, staged account with a new key. The signer names in it the App IDs it revoked or saw depart, as in every enrollment (3.7), and starts the account as after a provider loss: an `identity.json` at the next generation with `recovery_from` (7.4.2), so its version and generation stay above any a payer has seen.
+- **Afterwards** every request for the account is answered as for an account the service doesn't host: `404`, signed with the operator key (7.3 step 2), the public read and the erasure itself included. `POST /v1/enroll` creates a new, staged account with a new key. The signer names in it the App IDs it revoked or saw depart, as in every enrollment (3.7), and starts the account as after a provider loss: an `identity.json` at the next generation with `recovery_from` (7.4.2), so its version and generation stay above any a reader has seen.
 - **Not erased:** other accounts' state that names the identity, such as their contacts, conversation entries, deny lists and peer copies of its `identity.json`, belongs to them.
 - **Backups** (spec 6.5): the operator lets the account's data age out of its backups and erases it again after any restore from a backup taken before the erasure.
 - Vectors: `http.json` "signer: account erasure, naming the account's service key" and its answer. Its `service_key` is `keys.json`'s fixed key for alice; the generator replays it on the prototype service, where the account's key is drawn at random, so there it names that key.
@@ -2113,9 +2118,9 @@ The signer erases the identity's account at this service (spec 12.7).
 
 The signer hand-over travels through the switch (3.12, spec 12.8), as key bundle parts do.
 
-- **`PUT`, by the signer:** body `{ "app_id": app-id, "handover": { "envelopes": [...], "sig": b64(64) } }`, the target app and the hand-over of 3.12; unknown members are `400` (1.1). The switch checks, without opening anything: the target is a current app (`409 conflict` otherwise); `envelopes` holds 1 to 64 envelopes, each within the envelope cap (4.4) with exactly one recipient, whose kid is that of the bundle key of the certificate the switch checks the target against (`400`); and `sig` verifies with the identity key over the target's App ID, the number of envelopes and their bytes, under `pubky-switch/v1/signer-handover` (`400`). It keeps it, replacing any hand-over it holds: one per account, of at most 64 parts. Answer: `{ "app_id": app-id, "parts": int }`, with `Switch-Head` as every answer to the signer.
+- **`PUT`, by the signer:** body `{ "app_id": app-id, "handover": { "envelopes": [...], "sig": b64(64) } }`, the target app and the hand-over of 3.12; unknown members are `400` (1.1). The switch checks, without opening anything: the target is a current app (`409 conflict` otherwise); `envelopes` holds 1 to 128 envelopes, each within the envelope cap (4.4) with exactly one recipient, whose kid is that of the bundle key of the certificate the switch checks the target against (`400`); and `sig` verifies with the identity key over the target's App ID, the number of envelopes and their bytes, under `pubky-switch/v1/signer-handover` (`400`). It keeps it, replacing any hand-over it holds: one per account, of at most 128 parts. Answer: `{ "app_id": app-id, "parts": int }`, with `Switch-Head` as every answer to the signer.
 - **`GET`, by the target app or the signer:** the body of the `PUT` the switch holds. Any other own app, or a call when none is held, gets `404 not_found`, so an app learns nothing of a hand-over to another. The target checks it as 3.12 says.
-- **Deletion:** the switch deletes the stored hand-over when it takes the next `identity.json` version (7.4.2), whichever signer delivered it: the new signer's, so the hand-over took effect, or the old signer's abort. It deletes it on erasure (7.4.16) too. It isn't exported: there is no hand-over during a move (3.12). It counts against no quota; the body cap is 6 MiB (7.1).
+- **Deletion:** the switch deletes the stored hand-over when it takes the next `identity.json` version (7.4.2), whichever signer delivered it: the new signer's, so the hand-over took effect, or the old signer's abort. It deletes it on erasure (7.4.16) too. It isn't exported: there is no hand-over during a move (3.12). It counts against no quota; the body cap is 12 MiB (7.1).
 - Vectors: `http.json` "signer: store the hand-over to the phone at the switch" and "own app: the phone fetches the hand-over stored for it", with their answers.
 
 ### 7.5 Feed items and visibility
@@ -2199,7 +2204,7 @@ Example (`409 stale_key`, records cut short):
         "app_id": "g7teif9k1ur75jrmidqk7z7u6w",
         "app_record": {
           "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFw...",
-          "sig": "oEO7WiknYh4nOWiX3ZO8VNcbeQUWktK0UMN_vaeaYcLNkUrrf3E62vsF71br3nqJFBVxcK2Z8v90v4TfJQuBAA"
+          "sig": "I1VnSi0CjO7W45Z9gpn90mxAxq4DV5m9IwX72O07hHHfI2xpevmxW8x8OP2rfAJiQXnfK67MATaTYgcUTZEvCg"
         },
         "record": {
           "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLnJl...",
@@ -2309,7 +2314,7 @@ Spec 6.3. For every kind of state the service keeps, how long it keeps it, which
 | Inbox entry | until every current target's cursor has passed it, not waiting for targets marked lagging (7.4.4); no expiry | inbox quota: its envelope bytes plus `entry_overhead_bytes` (256) | `quota_bytes` 64 MiB; 64 KiB per envelope (4.4) | the append is `429 quota_exceeded` (`inbox`) |
 | `missed` item (7.5) | until its app's cursor has passed it | nothing; never refused | one per lagging app; a later miss replaces it | - |
 | Unreadable entry (7.5) | until every current app's cursor has passed it | inbox quota: `entry_overhead_bytes` only | - | never refused: the service creates it |
-| Shared record value | while current, with the operation, certificate and transition proof of its current write (7.4.9); a superseded value is deleted at once | storage quota: its sealed `ct` bytes, ciphertext and tag as decoded from base64url (not the text), 0 for a delete; the certificate and proof, about 1.6 KB, are bounded by `max_record_keys`, not counted | `record_quota_bytes` 64 MiB; 256 KiB per value (6.2) | a `record.put` that grows the stored bytes is `429` (`storage`) |
+| Shared record value | while current, with the operation, certificate and transition proof of its current write (7.4.9); a superseded value is deleted at once | storage quota: its sealed `ct` bytes, ciphertext and tag as decoded from base64url (not the text), 0 for a delete; the certificate and proof are bounded by `max_record_keys`, not counted: at most 33,950 bytes, the largest certificate of 10.3 and a proof of 1,078, and about 1.6 KB for a Paykit app's | `record_quota_bytes` 64 MiB; 256 KiB per value (6.2) | a `record.put` that grows the stored bytes is `429` (`storage`) |
 | Shared record key | while live; once deleted, until the service forgets it (below) | record key limit: live keys only | `max_record_keys` 100,000 live keys | a `record.put` creating a key, or writing a deleted one again, is `429` (`record_keys`) |
 | Live claim | until finished, then compacted to a tombstone at once (6.8) | claim limit, with tombstones; its creator's share of it (6.8) | `max_claims` 1,000,000; `max_attempts_per_claim` 64; `claim_share_percent` 25; `open_attempts_per_app` 1,000 | only `attempt` is refused: on a new claim key (`claims`, or `claim_share` beyond its app's share), beyond 64 on one (`attempts`), or beyond its app's open attempts (`open_attempts`) |
 | Tombstone | until the time base, with trusted time, reaches its pinned deadline plus the 30-day reconciliation window (6.8), then deleted at a request to the account (7.3 step 4); when pinned to "none", until it reaches its last entry plus `max_claim_age_ms` (400 days), then deleted the same way | claim limit, its creator's share | as above | - |
@@ -2326,7 +2331,7 @@ Spec 6.3. For every kind of state the service keeps, how long it keeps it, which
 | A frozen account's last `identity.json` and freeze | while frozen, and after a move at least `record_max_age` (7.4.15) | - | one of each | - |
 | Sender flag | while among the most frequent | - | `max_flags` 1,000 | the least frequent drop |
 | App record, current receive key record, key bundle parts | while the app is listed in `apps` or `removed`, or awaits its rotation | app limit (3.7) | one record and one current receive key record per app; key bundle parts that never overlap (6.2), so at most one key per scope and data epoch | - |
-| Signer hand-over (7.4.17) | until the next `identity.json` version the service takes, whichever signer delivered it, or the erasure | nothing | `max_handover_parts` 64 envelopes; one per account, a new one replacing it | - |
+| Signer hand-over (7.4.17) | until the next `identity.json` version the service takes, whichever signer delivered it, or the erasure | nothing | `max_handover_parts` 128 envelopes; one per account, a new one replacing it | - |
 | Retired receive key record | until `max_retired_keys` newer ones exist | control reserve | 8 per app | the oldest drops; an envelope wrapped to it gets `409 stale_key` with its kid in `unknown_kids` |
 | Renewed certificate (3.8) | until the app's record carries it, or a newer `cert.put` | control reserve | one per app | replaced |
 | Departure, revoked app | its record, receive key records, key bundles, cursor and last-seen time until the signer purges it from `removed` (it is in neither list), after its rotation, and it owns no open or `unknown` attempt; its App ID with its revocation or departure time for good, exported as its `app` part (10.3); likewise each App ID an enrollment names in `revoked_apps` (3.7), dated by the enrollment | app limit, until purged; then nothing | - | - |
@@ -2376,7 +2381,7 @@ Spec 6.3. For every kind of state the service keeps, how long it keeps it, which
 | `control_per_min` | 60 | batches with a repeatable control mutation, per app per minute (6.4) | not yet |
 | `cursor_hold_ms` | 2592000000 | how long an app's cursor holds a chain stub back: a stub this old (30 days) may be dropped behind a checkpoint even if a cursor hasn't passed it (7.4.4) | not yet |
 | `max_divergent_uploads` | 8 | divergent uploads per record | not yet |
-| `max_handover_parts` | 64 | envelopes of the one hand-over an account holds (7.4.17); fixed | not yet |
+| `max_handover_parts` | 128 | envelopes of the one hand-over an account holds (7.4.17), and of the signer's backup (3.13): the bound of 3.12 with room; fixed | not yet |
 | `max_import_bytes` | 4294967296 | bytes of one staged import; it covers the export of an account at every default limit, with room for the stubs and batch IDs it keeps (Appendix A34) | yes |
 | `max_chunk_bytes` | 1048576 | bytes of one export chunk; fixed | not yet |
 | `sender_per_min` | 120 | appends per sender identity per minute | not yet |
@@ -2389,10 +2394,10 @@ Spec 6.3. For every kind of state the service keeps, how long it keeps it, which
 | `identity_reads_per_min` | 6000 | public reads of `identity.json` (7.4.15) per account per minute, from all sources together: the backstop above the per-source limit | not yet |
 | `identity_reads_per_source_per_min` | 60 | public reads of `identity.json` per network source (an IPv4 address or an IPv6 /64) per account per minute | not yet |
 | `list_page` | 1000 | most records per `GET /records` page (7.4.9) | not yet |
-| `checkpoint_behind` | off | chain items that may go before the service signs a checkpoint, or with `checkpoint_at_head` chain items added since the last one (7.4.4); the prototype's opt-in | not yet |
-| `checkpoint_at_head` | off | sign each checkpoint at the newest chain item, and drop behind it only the stubs the chain stub row lets go (7.4.4); the prototype's opt-in | not yet |
+| `checkpoint_behind` | 1000 | chain items that may go before the service signs a checkpoint, or with `checkpoint_at_head` chain items added since the last one (7.4.4). The prototype's own default is off, and its tests set it | not yet |
+| `checkpoint_at_head` | off | sign each checkpoint at the newest chain item, and drop behind it only the stubs the chain stub row lets go (7.4.4); off in the prototype too | not yet |
 | `mark_lagging` | on | mark lagging apps (7.4.4) | not yet |
-| `trusted_time.required` | off | require trusted time: without it, refuse what depends on time with `503 unavailable` (7.3); the prototype's opt-in, since it has no time source of its own | not yet |
+| `trusted_time.required` | on | require trusted time: without it, refuse what depends on time with `503 unavailable` (7.3). A production service has trusted time (spec 10.1); the prototype runs with it off, since it has no time source of its own, and its tests give it samples | not yet |
 | `trusted_time.drift_ppm` | 100 | drift bound of the monotonic clock, parts per million (7.3) | not yet |
 | `trusted_time.max_sample_age_ms` | 86400000 | the oldest time sample that still gives trusted time (24 hours) | not yet |
 | `trusted_time.max_uncertainty_ms` | 300000 | the largest uncertainty trusted time may have (5 minutes) | not yet |
@@ -2564,24 +2569,24 @@ An **attempt**, in claims and tombstones: `attempt_id`, `owner` (App ID), `outco
 
 Deleted record keys are exported while the account is frozen (9.1), so N holds every delete an app may still need to see.
 
-**Part sizes.** Every part fits one chunk of 1 MiB (1,048,576 bytes) with the chunk's own members, which take at most 103 bytes. The largest JSON of each kind, at the default caps (9.2), with every integer at 2^53 - 1 but a `divergent` part's `index`, which is at most 7 since a record holds at most 8 divergent uploads, and every certificate and receive key record carrying 4 suite keys of 4,096 bytes (30,934 and 29,701 bytes signed):
+**Part sizes.** Every part fits one chunk of 1 MiB (1,048,576 bytes) with the chunk's own members, which take at most 103 bytes. The largest JSON of each kind, at the default caps (9.2), with every integer at 2^53 - 1 but a `divergent` part's `index`, which is at most 7 since a record holds at most 8 divergent uploads, and every certificate and receive key record carrying 4 suite keys of 4,096 bytes, each certificate otherwise the largest of 3.12 (32,872 and 29,701 bytes signed):
 
 | Part | At most (bytes) | What bounds it |
 |---|---|---|
 | `meta` | 274,016 | its `identity.json` within `PUT /identity`'s 256 KiB body (262,119 bytes), and `app_added_at` for at most 255 reachable apps |
 | `chain` | 906,360 | the stub (554), a context (1,024) and the document: an operation (512 KiB, 6.1), an `identity.json` (262,119), or a service transition, of which an `upload` is the largest: each item of the 16 MiB upload takes at least 1,138 bytes, so it names at most 14,742 keys (904,694) |
-| `entry` | 127,154 | the envelope (64 KiB, 87,382 in base64url), the sender's certificate, 255 targets and a context |
-| `app` | 691,791 | the app record, which its `app.put` bounds (392,924), the current and 8 retired receive key records and a renewed certificate |
+| `entry` | 129,092 | the envelope (64 KiB, 87,382 in base64url), the sender's certificate, 255 targets and a context |
+| `app` | 693,729 | the app record, which its `app.put` bounds (392,924), the current and 8 retired receive key records and a renewed certificate |
 | `key_bundle` | 87,645 | one key bundle part, an envelope of at most 64 KiB |
 | `claim` | 19,558 | 64 attempts, each `unknown` with `resolved_by`, so none is current, and each after the first `possibly_duplicate` (6.8 row 1) |
 | `tombstone` | 19,494 | 64 attempts, each `done` or `failed` with `resolved_by`, one at least `done` |
 | `claim_entry` | 548,952 | the entry (512 KiB) and its proof, whose claim view holds at most 64 attempts (24,522, ATTEMPTING with 63 of them `unknown`) |
-| `record` | 949,277 | its operation when carried (512 KiB; a 256 KiB value takes 466,897), its `read_scope` and `write_scopes` again (at most what the operation leaves, 392,563), the certificate and the proof (1,078) |
+| `record` | 951,215 | its operation when carried (512 KiB; a 256 KiB value takes 466,897), its `read_scope` and `write_scopes` again (at most what the operation leaves, 392,563), the certificate and the proof (1,078) |
 | `divergent` | 524,380 | one uploaded operation |
 | `peer` | 262,153 | a peer's `identity.json` within `PUT /peers`' 256 KiB body |
 | `batch`, `contact`, `conversation`, `deny`, `invite_code`, `connect`, `flag`, `peer_floor` | 1,292 | identifiers, times, counts and a context of at most 1,024 bytes |
 
-The largest, a `record` part, takes 949,380 bytes of a chunk. Three kinds that could outgrow a chunk are split into parts of their own: an app's stored key bundle parts, which grow with the data epochs an offline app missed (`key_bundle`); a live claim's entries, up to four for each of 64 attempts, each proof carrying the claim view (`claim_entry`); and a record's divergent uploads, eight values of up to 256 KiB (`divergent`, one each).
+The largest, a `record` part, takes 951,318 bytes of a chunk. Three kinds that could outgrow a chunk are split into parts of their own: an app's stored key bundle parts, which grow with the data epochs an offline app missed (`key_bundle`); a live claim's entries, up to four for each of 64 attempts, each proof carrying the claim view (`claim_entry`); and a record's divergent uploads, eight values of up to 256 KiB (`divergent`, one each).
 
 **`GET /v1/{id}/export`** (signer). Answer `{ "manifest": signed<Manifest> }`. Errors: `403 permission_missing` for another caller; `409 conflict` when the account isn't frozen; `404` without an `identity.json`.
 
@@ -2680,17 +2685,17 @@ The manifest body:
     "chain_version": 1,
     "generation": 1,
     "seq": 10,
-    "chain_hash": "2V5xVjpUpfX3On8bSVHGqHSBSKPavdtt_m3g3jeRqVQ",
-    "sig": "ku9mNYmFLtxioehaYQKNtZXn9n5BQ06KeLA-VuNp..."
+    "chain_hash": "jsOhKDUaJnG60SNNklE2uLefYLF58_yV9LWArp-9nPQ",
+    "sig": "5ZDjNf53Pt7aR-UvC3QsihF3JPmFyMfdBYIYAEQs..."
   },
   "checkpoint": null,
   "parts": 19,
-  "bytes": 29177,
+  "bytes": 29254,
   "chunks": [
     {
       "id": "00000",
-      "len": 29177,
-      "hash": "ZRDyvvHlXf-UWh2WjCQqpFFQ1FF2Fh7HLt5eQYrlnII",
+      "len": 29254,
+      "hash": "xXphE4hh1tvQvv-GrtdfJCACTfLXAN5A_mWD0V6Q74o",
       "first": 0,
       "last": 18
     }
@@ -2783,7 +2788,7 @@ The `claim` part, the live claim of `seq` 7, and its one `claim_entry` part, the
   },
   "proof": {
     "body": "eyJjaGFpbiI6eyJlbnZlbG9wZSI6ImV5SmphR0Zw...",
-    "sig": "Q5nynJBSPdnMOUh1OKNwrFMzaxISqng6ApkHyxK_..."
+    "sig": "CEsyOBevIdX7OGtYEHr_nITIARcwoKIl_SOyRVsk..."
   }
 }
 ```
@@ -2803,7 +2808,7 @@ The `record` part, with the proof of its current write (`chain.json` `seq` 8); `
     "op": null,
     "proof": {
       "body": "eyJjaGFpbiI6eyJlbnZlbG9wZSI6ImV5SmphR0Zw...",
-      "sig": "ALNsPgGJOahsPkudNm3_sVWlEFdHbZNvp0ExgHD8..."
+      "sig": "EKxwnREEqEIFUTxlrhjF7Qnsn-ub22nFWseqqqit..."
     },
     "read_scope": "pay",
     "seq": 8,
@@ -2826,7 +2831,7 @@ The wallet's `app` part:
   "app_id": "wejf37ngr7qizej3eoijn3hq4c",
   "record": {
     "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFw...",
-    "sig": "nWdxbVmxiQPioR2UVPQlon0CA80U5aE76FYEN4bo..."
+    "sig": "0KQI1CIMiMApXmQkYbSgsd9xttJaW-iGFfasDbQl..."
   },
   "record_seq": 3,
   "record_at_ms": 1767225601000,
@@ -2886,7 +2891,7 @@ The prototype fixes every other detail above. These it leaves open, so this docu
 | A12 | Push registration | two `PUT /push` calls: without `push_key` to start one, with it to set handles; `409 conflict` for another key or relay (8.1) | the same |
 | A13 | `missed` feed item | `{ entries, accepted_from, accepted_until }`, one per lagging app, replaced while unread; it waits for its target even while lagging (7.4.4, 7.5) | the same |
 | A14 | Lagging when every app is idle | no app is marked; entries wait and the quota refuses senders (7.4.4) | the same |
-| A15 | Checkpoint | the latest one in each feed page; N signs the export's checkpoint again with its own key after an import (7.4.4, 10.5); signed once `checkpoint_behind` items may go, behind every cursor or 30 days old | opt-in, off by default; with `checkpoint_at_head`, signed at the newest item, keeping behind it the stubs a cursor holds |
+| A15 | Checkpoint | the latest one in each feed page; N signs the export's checkpoint again with its own key after an import (7.4.4, 10.5); signed once `checkpoint_behind` items, 1,000 by default (9.2), may go, behind every cursor or 30 days old | off by default (`checkpoint_behind` unset), set by its tests; with `checkpoint_at_head`, signed at the newest item, keeping behind it the stubs a cursor holds |
 | A16 | Feed of a frozen account | carries the signed `freeze` (7.4.4) | the same |
 | A17 | Unverifiable sender | store locally and move on after 24 hours (5.1) | `DEFAULT_PARK_UNVERIFIABLE_MS` |
 | A18 | "Counterparties recently written to" | switches whose inbox accepted a message from the app in the last 30 days, skipped when their `known_version` is already current (3.3) | the same |
@@ -2895,7 +2900,7 @@ The prototype fixes every other detail above. These it leaves open, so this docu
 | A21 | `evidence_ref` | one field for either piece of evidence: required with basis `evidence`, optional with `owner` or `reconcile`, refused on other types (6.2) | the same, `400` otherwise |
 | A22 | Cursor deferral bound | at most 2 s while running, sent before the app stops reading (7.4.4) | `cursor_defer_ms`, `suspend()` |
 | A23 | Order of per-operation checks | permission, shape, per-kind limit, then the type's rules; for a claim the deadline before `expected_step` (6.4, 6.8) | the same |
-| A24 | Trusted time | an authenticated sample anchored to the monotonic clock, with a drift bound and a maximum sample age; the wall clock while it agrees within 5 minutes; `503 unavailable` for what depends on time without it (spec 10.1, Paykit spec 6) | opt-in (`trusted_time.required`), as the prototype has no time source; tests give samples (`note_time_sample`), and the test clock's wall reading can jump without moving its monotonic one |
+| A24 | Trusted time | required by default (`trusted_time.required` on, 9.2): an authenticated sample anchored to the monotonic clock, with a drift bound and a maximum sample age; the wall clock while it agrees within 5 minutes; `503 unavailable` for what depends on time without it (spec 10.1, Paykit spec 6) | opt-in (`trusted_time.required`), as the prototype has no time source; tests give samples (`note_time_sample`), and the test clock's wall reading can jump without moving its monotonic one |
 | A25 | How a record view gives readers the writer's certificate | one optional `cert` member, the certificate of the record the service holds for the writer, also after a revocation; the reader checks the write's standing with it at the write's time, and a renewal's earlier certificate is replaced by the record's new one (7.4.9, 6.2). A per-write certificate or a cert hash in the chain envelope was not chosen: one more member in the view is the smallest change, and feed readers already hold the records of the identity's apps | the same |
 | A26 | The O/N clock offset in the residual window | the difference between (last service time verified from O minus the device clock then) and (the first from N minus the device clock then); twice the clock tolerance without one from O (spec 12.6) | the same (`RecoveryState.clock_offset_ms`) |
 | A27 | App request and approval | the fields of 3.9 and 3.10; the request is a signed document under its own label; the approval names the request by document hash and carries the bundle as `GET /keys` parts without `seq` | the same; the Pubky auth request is modelled (`records::AuthRequest`) and the approval is handed over in process |
@@ -2905,12 +2910,12 @@ The prototype fixes every other detail above. These it leaves open, so this docu
 | A31 | The reserved `suite_keys` member | 1 to 4 entries `{ suite, key }`, suites 2 to 255 strictly ascending, keys 1 to 4096 bytes; in a receive key record no entry's kid equals the record's; readers ignore unsupported suites (3.1, 3.4) | `records::SuiteKey`, `check_suite_keys` |
 | A32 | The kid of a later suite's key | first 8 bytes of `derive("pubky-switch/v1/kid", u64(suite), key)`; suite 1 keeps `derive("pubky-switch/v1/kid", key)`, so no existing kid changes (1.5) | `wire::suite_kid` |
 | A33 | Ed25519 verification and low-order X25519 keys | the four steps of 2.1; a key is of low order when X25519 with a clamped secret gives all zeros (4.2) | `wire::verify`, `wire::x25519_low_order` |
-| A34 | The import limit | 4 GiB. Measured part sizes, each operation once and no batch proofs: a shared record about 1.2 KB with the transition proof of its current write (0.9 KB), plus its chain item with its operation about 2.5 KB (at the smallest sealed value), a tombstone with one attempt 0.4 KB, a live claim 2.5 KB, a chain stub alone about 0.5 KB, a batch part 0.15 KB. An account at every default limit (100,000 records within the 64 MiB record quota, 1,000,000 claims and tombstones, a full 64 MiB inbox, 100,000 entries in each list, 10,000 peer copies) exports under 1 GiB; the other 3 GiB hold about 5 million kept chain stubs with their batch parts. A service whose rates and stub retention keep more raises it, and a signer moves an identity only to a service whose limit is at least its current one's (7.4.13) | `retention::KindLimits::max_import_bytes`, `lifecycle::Limits` |
-| A35 | The clock bound for automatic payments (spec 10.1) | 5 minutes, the clock tolerance, either way: the offset between the service's signed time and the device clock at the latest verified answer, or the highest verified service time ahead of the device clock now | `App::clock_skew_ms`, `check_clock`: an automatic payment is refused, a manual one goes on with the event `clock_skew_warning` |
+| A34 | The import limit | 4 GiB. Part sizes measured on the vectors' Paykit apps, each operation once and no batch proofs (10.3 gives the largest): a shared record about 1.2 KB with the transition proof of its current write (0.9 KB), plus its chain item with its operation about 2.5 KB (at the smallest sealed value), a tombstone with one attempt 0.4 KB, a live claim 2.5 KB, a chain stub alone about 0.5 KB, a batch part 0.15 KB. An account at every default limit (100,000 records within the 64 MiB record quota, 1,000,000 claims and tombstones, a full 64 MiB inbox, 100,000 entries in each list, 10,000 peer copies) exports under 1 GiB; the other 3 GiB hold about 5 million kept chain stubs with their batch parts. A service whose rates and stub retention keep more raises it, and a signer moves an identity only to a service whose limit is at least its current one's (7.4.13) | `retention::KindLimits::max_import_bytes`, `lifecycle::Limits` |
+| A35 | The clock bound for automatic attempts (spec 10.1) | 5 minutes, the clock tolerance, either way: the offset between the service's signed time and the device clock at the latest verified answer, or the highest verified service time ahead of the device clock now | `App::clock_skew_ms`, `check_clock`: an automatic payment is refused, a manual one goes on with the event `clock_skew_warning` |
 | A36 | How the next service fetches the export | during `POST /import`, before it answers, one chunk at a time, stopping at the first failure; the status counts `pulled` and names `pull_error`; the signer moves what is missing | `InboxService::serve`, `set_peer_transport`; `Signer::transfer` (direct, with the fallback) and `transfer_relayed` |
 | A37 | The sender's share of the inbox quota | `sender_share_percent` 25 | the same |
-| A38 | The switch's copy of `identity.json` | the grace after the Homeserver reads: 500 ms, after which the lookup keeps running and a manual payment it hasn't answered for needs the user's confirmation before the attempt; an automatic payment's lookup: 5 s per try and one retry; `identity_reads_per_source_per_min` 60 per IPv4 address or IPv6 /64, `identity_reads_per_min` 6,000 per account; `Cache-Control: public, max-age=60`; a failed lookup counts until the payer's copy is 10 minutes old | `pay::INBOX_IDENTITY_GRACE_MS`, `INBOX_LOOKUP_TIMEOUT_MS`, `with_grace`, `lookup_with_retry`, `App::settle_lookup`; `execute::check_unconfirmed` (event `identity_unconfirmed`); `directory::source_key`, `IDENTITY_CACHE_CONTROL` |
-| A39 | How long a frozen service answers the public read with its freeze | while frozen, and after a move at least `record_max_age` counted from the last export call it answered, plus a day; the payer follows a freeze once | the prototype deletes a frozen account only when the signer erases it (7.4.16, `directory::public_identity`); `pay::inbox_identity` |
+| A38 | The switch's copy of `identity.json` | the grace after the Homeserver reads: 500 ms, after which the lookup keeps running and a manual payment it hasn't answered for needs the user's confirmation before the attempt; an automatic payment's lookup: 5 s per try and one retry; `identity_reads_per_source_per_min` 60 per IPv4 address or IPv6 /64, `identity_reads_per_min` 6,000 per account; `Cache-Control: public, max-age=60`; a failed lookup counts until the reader's copy is 10 minutes old | `pay::INBOX_IDENTITY_GRACE_MS`, `INBOX_LOOKUP_TIMEOUT_MS`, `with_grace`, `lookup_with_retry`, `App::settle_lookup`; `execute::check_unconfirmed` (event `identity_unconfirmed`); `directory::source_key`, `IDENTITY_CACHE_CONTROL` |
+| A39 | How long a frozen service answers the public read with its freeze | while frozen, and after a move at least `record_max_age` counted from the last export call it answered, plus a day; the reader follows a freeze once | the prototype deletes a frozen account only when the signer erases it (7.4.16, `directory::public_identity`); `pay::inbox_identity` |
 | A40 | A full connect request list | refused with `429 quota_exceeded` `connect_requests`, checked before the deny list; `GET /connect` reports `max_pending` and `full` | `admission::post_connect`, `get_connect`, `ConnectList` |
 | A41 | The cap on an invite code's uses | `max_invite_uses` 100 | the same |
 
