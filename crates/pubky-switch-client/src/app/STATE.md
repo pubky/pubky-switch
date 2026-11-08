@@ -16,7 +16,12 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
   effect's batch carries the cursor move, with the record writes and claim entries the
   protocol added through its receive context. The processed pair, what the batch's
   operations settle (record writes cached at their proofs' versions, claim proofs kept), the
-  protocol's local writes and the cursor are committed together with the answer.
+  protocol's local writes and the cursor are committed together with the answer. A claim
+  the receive step asks for (`Outcome::Need`) is read and kept (`claim/`, `clent/`) in a
+  commit of its own, which moves no cursor; the step then runs again.
+- **A batch refused with `409 stale_epoch`** is gone from `opq/` with the refusal; the app
+  takes the newer `identity.json` and key bundle, each in its own commit, and the batch
+  sealed again is signed and kept under a new batch ID before it is first sent.
 - **A retired receive key goes only after the cursor's commit** that passes the next key's
   registration (Switch spec 3.6).
 - **Any commit carries everything read before it.** A page's writes go in the next commit
@@ -39,7 +44,8 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
 | `ident/<pubky>/floor` | the highest version and generation seen | |
 | `ident/<pubky>/body/<version>` | the body hash seen at a version, for equivocation | |
 | `ident/<pubky>/equivocated` | the version at which another body was seen | |
-| `ident/<pubky>/sw` | when a counterparty's switch copy was last read, and whether the read succeeded | |
+| `ident/<pubky>/sw` | when a counterparty's switch copy was last looked up, and whether the read succeeded | |
+| `ident/<pubky>/reads` | when a counterparty's `identity.json` was last read from its Homeserver, and from its switch | |
 | `rk/<n>` | a held receive key: secret, signed record, registration `seq`, pending batch | yes |
 | `kid/<kid>` | a kid this app or one of its devices made, kept after the key is deleted | |
 | `reg/<n>` | a registration of the own app whose key this device doesn't hold: own, awaiting device sync, or unaccounted after a restore | |

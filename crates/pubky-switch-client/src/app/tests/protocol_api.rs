@@ -26,7 +26,7 @@ use crate::testing::{Router, SWITCH_ORIGIN};
 use crate::transport::Transport;
 
 const MINUTE: u64 = 60_000;
-const BOB_ORIGIN: &str = "https://bob-switch.example";
+pub(super) const BOB_ORIGIN: &str = "https://bob-switch.example";
 const CAROL_ORIGIN: &str = "https://carol-switch.example";
 const CLAIM: [u8; 32] = [5; 32];
 const ATTEMPT: [u8; 16] = [6; 16];
@@ -217,7 +217,7 @@ impl Protocol for ApiProtocol {
 
 /// A cursor move that waits for the next batch as long as it may: one the switch holds came
 /// with an effect.
-fn config() -> AppConfig {
+pub(super) fn config() -> AppConfig {
     AppConfig {
         cursor_defer_ms: MAX_CURSOR_DEFER_MS,
         ..AppConfig::default()
@@ -875,16 +875,16 @@ fn test_policy_family_readable_by_a_sub_scope_holder() {
 
 /// Alice, bob and carol, each with a signer and a scripted switch at an origin of its own,
 /// a router between them, and one Homeserver.
-struct Pair {
-    clock: Arc<crate::clock::TestClock>,
-    alice: TestSigner,
-    bob: TestSigner,
-    carol: TestSigner,
-    router: Arc<Router>,
+pub(super) struct Pair {
+    pub(super) clock: Arc<crate::clock::TestClock>,
+    pub(super) alice: TestSigner,
+    pub(super) bob: TestSigner,
+    pub(super) carol: TestSigner,
+    pub(super) router: Arc<Router>,
 }
 
 impl Pair {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let clock = Arc::new(crate::clock::TestClock::new(START));
         let homeserver = Arc::new(TestHomeserver::new());
         let signer = |name: &str, origin: &str| {
@@ -912,28 +912,26 @@ impl Pair {
         }
     }
 
-    async fn join_on(
+    pub(super) async fn join_on(
         &self,
         signer: &TestSigner,
         name: &str,
-        protocol: &Arc<ApiProtocol>,
+        protocol: Arc<dyn Protocol>,
         store: Arc<dyn StateStore>,
     ) -> App {
         let keys = signer.identity().app_keys(name);
         let app = AppSpec::new(&["scope-a"]).with_permissions(&Permission::ALL);
         let request = signer.approve(&keys, &app).unwrap();
         let env = signer.env_with(store, Arc::clone(&self.router) as Arc<dyn Transport>);
-        App::join(env, protocol.clone(), config(), request)
-            .await
-            .unwrap()
+        App::join(env, protocol, config(), request).await.unwrap()
     }
 
     async fn join(&self, signer: &TestSigner, name: &str, protocol: &Arc<ApiProtocol>) -> App {
-        self.join_on(signer, name, protocol, Arc::new(MemoryStore::new()))
+        self.join_on(signer, name, protocol.clone(), Arc::new(MemoryStore::new()))
             .await
     }
 
-    fn note(to: &TestSigner, text: &str) -> OutgoingMessage {
+    pub(super) fn note(to: &TestSigner, text: &str) -> OutgoingMessage {
         let mut body = Map::new();
         body.insert("text".into(), json!(text));
         OutgoingMessage::new(to.identity().public(), "sample.note", body)

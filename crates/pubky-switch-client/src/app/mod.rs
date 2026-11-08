@@ -67,8 +67,8 @@ pub use feed::ReceiveReport;
 pub use identity::{DOC_CACHE_MS, HomeserverReader};
 pub use peek::{PeekReport, Peeked};
 pub use protocol::{
-    Effect, LocalWrite, MissedEntries, OpaqueRule, Outcome, Protocol, ReceivedMessage,
-    ResendNeeded, ResendReason,
+    Effect, LocalWrite, MAX_CLAIM_READS, MissedEntries, Need, OpaqueRule, Outcome, Protocol,
+    ReceivedMessage, ResendNeeded, ResendReason,
 };
 pub use provider::ProviderStatus;
 pub use push::{MAX_HANDLE_BYTES, PushRegistration, PushRelay};
@@ -81,8 +81,11 @@ pub use claims::{
     ClaimDoubt, ClaimEntryRead, ClaimEvidence, ClaimOp, ClaimRead, ClaimWritten,
     ObligationDeadline, claim_conflict,
 };
-pub use context::ReceiveContext;
-pub use directory::{PEER_DELIVERY_MS, PeerIdentity, SwitchCopy};
+pub use context::{ClaimFetch, LocalView, ReceiveContext};
+pub use directory::{
+    HomeserverCopy, IdentityLookup, Initiator, MayAct, PEER_DELIVERY_MS, PeerIdentity,
+    SwitchAnswer, SwitchCopy, SwitchLookup,
+};
 pub use records::{
     Collection, FlaggedWrite, KeptOp, PolicyFamily, RecordContent, RecordTarget, SharedEvidence,
     SharedRecord,
@@ -1028,6 +1031,14 @@ impl App {
     /// The naming key (Switch spec 3.5). Sensitive.
     pub fn naming_key(&self) -> &NamingKey {
         &self.state.naming
+    }
+
+    /// `blind(input)` under the identity's naming key: `derive("pubky-switch/v1/name",
+    /// naming_key, input)` (Switch wire 1.5). Every app of the identity gets the same output
+    /// for the same input, so a protocol derives from it the keys its apps share, such as
+    /// its claim keys (Switch spec 10.2, 13.3), without holding the naming key itself.
+    pub fn blind(&self, input: &[u8]) -> [u8; 32] {
+        self.state.naming.blind(input)
     }
 
     /// The newest data epoch through which the app holds every scope key.

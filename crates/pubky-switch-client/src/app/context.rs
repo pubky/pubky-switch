@@ -1,4 +1,5 @@
-//! What a protocol's receive step can do: [`ReceiveContext`] (Switch spec 8.2, 10.2, 10.3).
+//! What a protocol's receive step can do: [`ReceiveContext`] (Switch spec 8.2, 10.2, 10.3);
+//! and what its other callbacks can read: [`LocalView`].
 //!
 //! An app that processes a message with a lasting effect writes the effect to its shared
 //! record and advances its cursor in one batch (Switch spec 8.2). The context gives the
@@ -19,13 +20,19 @@
 //! over once more, so the next effect builds on what the switch holds.
 //!
 //! The protocol's callbacks are synchronous, so the context reads the host's store
-//! synchronously, on the calling thread.
+//! synchronously, on the calling thread. What only the switch holds, such as a claim the app
+//! keeps no view of, the step asks for with [`super::Outcome::Need`]: the app reads it,
+//! keeps what it checked, and calls the step again with the answer in the context
+//! ([`ReceiveContext::switch_claim`]), at most [`super::MAX_CLAIM_READS`] claims per entry.
+//!
+//! The protocol's other callbacks get a [`LocalView`]: the identity, the App ID and the
+//! protocol's local state, read-only.
 
 use pubky_switch_core::claims::{ClaimView, EntryKind};
 use pubky_switch_core::ops::{Condition, MAX_BATCH_ENTRIES, OpKind, RecordVersion};
 use pubky_switch_core::records::AppCert;
 
-use super::claims::{ClaimOp, KeptClaim, ObligationDeadline, claim_key_of};
+use super::claims::{ClaimOp, ClaimRead, KeptClaim, ObligationDeadline, claim_key_of};
 use super::error::Refusal;
 use super::protocol::LocalWrite;
 use super::records::{
@@ -56,14 +63,30 @@ pub(crate) struct ContextWrites {
     pub(crate) not_now: Option<String>,
 }
 
+/// A claim the app read from the switch for a receive step ([`super::Need::Claim`]).
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub enum ClaimFetch {
+    /// The switch's answer, checked as [`super::App::read_claim`] checks it (Switch wire
+    /// 7.4.8); the app keeps its view.
+    Read(ClaimRead),
+    /// The switch holds nothing for the key (`404`).
+    Absent,
+    /// The switch refused the read for good, such as `403 permission_missing` for an app
+    /// without `claims.read` (Switch spec 10.2): the error code.
+    Refused(String),
+}
+
 /// What a protocol's receive step can read and add to the effect's batch
-/// ([`super::Protocol::receive_with`]). Reads come from the app's store; writes go into the
-/// batch that carries the cursor move, at most 7 operations beside it (Switch wire 6.4).
+/// ([`super::Protocol::receive_with`]). Reads come from the app's store, and from the
+/// switch through [`super::Outcome::Need`]; writes go into the batch that carries the cursor
+/// move, at most 7 operations beside it (Switch wire 6.4).
 pub struct ReceiveContext<'a> {
     state: &'a AppState,
     store: &'a dyn StateStore,
     ns: &'a str,
     may_attempt: bool,
+    fetched: &'a [([u8; 32], ClaimFetch)],
     writes: ContextWrites,
 }
 
@@ -77,18 +100,109 @@ fn store_error(error: crate::error::StoreError) -> AppError {
     AppError::Store(error)
 }
 
+fn local_get(store: &dyn StateStore, ns: &str, key: &[u8]) -> Result<Option<Vec<u8>>, AppError> {
+    store
+        .get(ns, &[PROTOCOL_PREFIX, key].concat())
+        .map_err(store_error)
+}
+
+fn local_scan(store: &dyn StateStore, ns: &str, prefix: &[u8]) -> Result<Vec<KeyValue>, AppError> {
+    let full = [PROTOCOL_PREFIX, prefix].concat();
+    let mut out = Vec::new();
+    let mut after: Option<Vec<u8>> = None;
+    loop {
+        let page = store
+            .scan(ns, &full, after.as_deref(), SCAN_PAGE)
+            .map_err(store_error)?;
+        let more = page.len() >= usize::try_from(SCAN_PAGE).unwrap_or(usize::MAX);
+        for (key, value) in page {
+            if let Some(rest) = key.get(PROTOCOL_PREFIX.len()..) {
+                out.push((rest.to_vec(), value.clone()));
+            }
+            after = Some(key);
+        }
+        if !more {
+            return Ok(out);
+        }
+    }
+}
+
+/// What the protocol's callbacks other than the receive step can read: the app's identity
+/// and App ID, and the protocol's own local state as committed ([`super::Protocol`],
+/// "Callbacks and the store"). It reads the host's store synchronously, on the calling
+/// thread, and writes nothing.
+pub struct LocalView<'a> {
+    identity: [u8; 32],
+    app_id: [u8; 16],
+    store: &'a dyn StateStore,
+    ns: &'a str,
+}
+
+impl std::fmt::Debug for LocalView<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LocalView")
+    }
+}
+
+impl<'a> LocalView<'a> {
+    pub(crate) fn new(
+        identity: [u8; 32],
+        app_id: [u8; 16],
+        store: &'a dyn StateStore,
+        ns: &'a str,
+    ) -> Self {
+        Self {
+            identity,
+            app_id,
+            store,
+            ns,
+        }
+    }
+
+    /// The identity.
+    pub fn identity(&self) -> [u8; 32] {
+        self.identity
+    }
+
+    /// The App ID.
+    pub fn app_id(&self) -> [u8; 16] {
+        self.app_id
+    }
+
+    /// A value of the protocol's own local state, as committed.
+    ///
+    /// # Errors
+    ///
+    /// A store failure.
+    pub fn local_get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, AppError> {
+        local_get(self.store, self.ns, key)
+    }
+
+    /// Every value of the protocol's local state whose key starts with `prefix`, with its
+    /// key in the protocol's key space, in key order, as committed.
+    ///
+    /// # Errors
+    ///
+    /// A store failure.
+    pub fn local_scan(&self, prefix: &[u8]) -> Result<Vec<KeyValue>, AppError> {
+        local_scan(self.store, self.ns, prefix)
+    }
+}
+
 impl<'a> ReceiveContext<'a> {
     pub(crate) fn new(
         state: &'a AppState,
         store: &'a dyn StateStore,
         ns: &'a str,
         may_attempt: bool,
+        fetched: &'a [([u8; 32], ClaimFetch)],
     ) -> Self {
         Self {
             state,
             store,
             ns,
             may_attempt,
+            fetched,
             writes: ContextWrites::default(),
         }
     }
@@ -124,6 +238,14 @@ impl<'a> ReceiveContext<'a> {
     /// `None` before any verified answer.
     pub fn highest_service_time(&self) -> Option<u64> {
         self.state.service_time.map(|time| time.highest_ms)
+    }
+
+    /// `blind(input)` under the identity's naming key (Switch wire 1.5), as
+    /// [`super::App::blind`]: what a protocol derives its shared keys from, such as the claim
+    /// key of an obligation a message names (Switch spec 10.2, 13.3). The naming key itself
+    /// stays with the app.
+    pub fn blind(&self, input: &[u8]) -> [u8; 32] {
+        self.state.naming.blind(input)
     }
 
     // ---------------------------------------------------------------------------------
@@ -226,15 +348,23 @@ impl<'a> ReceiveContext<'a> {
         })
     }
 
+    /// What the app read from the switch for this step at its request
+    /// ([`super::Need::Claim`]): `None` for a claim the step hasn't asked for (Switch wire
+    /// 7.4.8).
+    pub fn switch_claim(&self, claim_key: &[u8; 32]) -> Option<&ClaimFetch> {
+        self.fetched
+            .iter()
+            .find(|(key, _)| key == claim_key)
+            .map(|(_, fetch)| fetch)
+    }
+
     /// A value of the protocol's own local state, as committed before this message.
     ///
     /// # Errors
     ///
     /// A store failure.
     pub fn local_get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, AppError> {
-        self.store
-            .get(self.ns, &[PROTOCOL_PREFIX, key].concat())
-            .map_err(store_error)
+        local_get(self.store, self.ns, key)
     }
 
     /// Every value of the protocol's local state whose key starts with `prefix`, with its
@@ -244,25 +374,7 @@ impl<'a> ReceiveContext<'a> {
     ///
     /// A store failure.
     pub fn local_scan(&self, prefix: &[u8]) -> Result<Vec<KeyValue>, AppError> {
-        let full = [PROTOCOL_PREFIX, prefix].concat();
-        let mut out = Vec::new();
-        let mut after: Option<Vec<u8>> = None;
-        loop {
-            let page = self
-                .store
-                .scan(self.ns, &full, after.as_deref(), SCAN_PAGE)
-                .map_err(store_error)?;
-            let more = page.len() >= usize::try_from(SCAN_PAGE).unwrap_or(usize::MAX);
-            for (key, value) in page {
-                if let Some(rest) = key.get(PROTOCOL_PREFIX.len()..) {
-                    out.push((rest.to_vec(), value.clone()));
-                }
-                after = Some(key);
-            }
-            if !more {
-                return Ok(out);
-            }
-        }
+        local_scan(self.store, self.ns, prefix)
     }
 
     // ---------------------------------------------------------------------------------

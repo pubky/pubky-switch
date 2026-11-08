@@ -44,6 +44,7 @@ use serde_json::Value;
 
 use super::App;
 use super::chain::ChainView;
+use super::context::LocalView;
 use super::error::{AppError, Refusal};
 use super::events::AppEvent;
 use super::protocol::LocalWrite;
@@ -584,7 +585,16 @@ impl App {
             }
             LossStep::Resend => {
                 // The protocol's local writes commit with the step: asked once.
-                let actions = self.protocol.provider_lost(&loss.view());
+                let actions = {
+                    let store = std::sync::Arc::clone(self.env.store.store());
+                    let view = LocalView::new(
+                        self.state.meta.identity,
+                        self.state.meta.app_id,
+                        store.as_ref(),
+                        &self.ns,
+                    );
+                    self.protocol.provider_lost_with(&loss.view(), &view)
+                };
                 let copy = self.lists_copy().await?;
                 let me = self.state.meta.identity;
                 let may_add = self.state.cert.has_permission(Permission::ConversationAdd);

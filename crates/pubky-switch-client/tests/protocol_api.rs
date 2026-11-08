@@ -11,9 +11,9 @@
 use std::sync::{Arc, Mutex};
 
 use pubky_switch_client::app::{
-    App, AppConfig, AppError, Collection, Delivery, Effect, LocalWrite, MAX_CURSOR_DEFER_MS,
-    MissedEntries, OpBatch, Outcome, OutgoingMessage, Protocol, ReceiveContext, ReceivedMessage,
-    RecordTarget, ResendNeeded, SwitchCopy,
+    App, AppConfig, AppError, Collection, Delivery, Effect, Initiator, LocalWrite,
+    MAX_CURSOR_DEFER_MS, MayAct, MissedEntries, OpBatch, Outcome, OutgoingMessage, Protocol,
+    ReceiveContext, ReceivedMessage, RecordTarget, ResendNeeded, SwitchCopy,
 };
 use pubky_switch_client::clock::TestClock;
 use pubky_switch_client::store::{MemoryStore, StateStore};
@@ -353,4 +353,30 @@ async fn test_protocol_api_unknown_identity_is_not_found_at_any_switch() {
     let mut wallet = w.join(&w.alice, "wallet", &["notes"], &protocol).await;
     let stranger = TestIdentity::new(&Seeds::default(), "stranger").public();
     assert!(wallet.identity_of(&stranger, false).await.is_err());
+}
+
+#[tokio::test]
+async fn test_protocol_api_identity_lookup_in_two_halves() {
+    let w = World::new();
+    let protocol = Arc::new(NotesProtocol::default());
+    let mut wallet = w.join(&w.alice, "wallet", &["notes"], &protocol).await;
+    let _desk = w.join(&w.bob, "desk", &["notes"], &protocol).await;
+    let bob = w.bob.identity().public();
+    let grace_ms = 500;
+    // The Homeserver's half is read now; the switch's half runs apart from the app, so a
+    // caller waits for it at most the grace and lets it run on (Switch spec 4.3).
+    let lookup = wallet.begin_identity_lookup(&bob, true).await.unwrap();
+    assert_eq!(lookup.identity.switch_copy, SwitchCopy::Pending);
+    assert_eq!(
+        lookup
+            .identity
+            .may_act(START_MS + grace_ms, Initiator::User, grace_ms),
+        MayAct::IfUserConfirms
+    );
+    let answer = lookup.switch.unwrap().await;
+    let found = wallet.finish_identity_lookup(answer).await.unwrap();
+    assert_eq!(
+        found.may_act(START_MS + grace_ms, Initiator::Automatic, grace_ms),
+        MayAct::Now
+    );
 }

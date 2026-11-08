@@ -13,7 +13,9 @@
 //! - allowlist, deny list and invite code changes update what the app keeps of them.
 //!
 //! A batch the switch refuses for good is dropped: it was not applied, and the caller decides
-//! what to write instead; one sent again from an earlier call is reported as
+//! what to write instead, except after `409 stale_epoch`, when the app seals its record
+//! writes again at the new data epoch and sends it once more ([`App::submit_batch`]); one
+//! sent again from an earlier call is reported as
 //! [`AppEvent::BatchRefused`]. A batch whose answer didn't come back, or may pass unchanged
 //! later (`429`, `503`, `401 stale_timestamp`, an answer that doesn't verify), stays kept,
 //! and the next call that writes sends it again, the same bytes, so the service answers it
@@ -24,6 +26,7 @@ use pubky_switch_core::claims::{ClaimEntry, ClaimType, ClaimView, EntryKind};
 use pubky_switch_core::enc::{b64, serde_b64_vec};
 use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::ops::{Condition, MAX_BATCH_ENTRIES, OpKind, RecordVersion, SignedOp};
+use pubky_switch_core::sealed::{RecordValue, SealedValue};
 use serde::{Deserialize, Serialize};
 
 use super::claims::{ClaimOp, ObligationDeadline};
@@ -195,13 +198,24 @@ impl App {
     /// "Binding", 6.8 "Deadline"), as [`App::check_attempt`] gives them: only an attempt
     /// that passes them may be carried out.
     ///
+    /// On `409 stale_epoch` for a batch with record writes, the app takes the newer own
+    /// `identity.json` and its key bundle, seals the record writes again at the new data
+    /// epoch, and signs and sends the batch once more, under a new batch ID: the batch
+    /// refused was refused for good, so nothing of it was applied or kept. Sealing again
+    /// keeps every value, condition and expected version the caller built. When it can't be
+    /// done (the newer document isn't on the Homeserver yet, or a write was sealed under a
+    /// key the app doesn't hold), the call returns the `409 stale_epoch`, and the caller
+    /// builds the batch again ([`App::record_op`] seals at the epoch the app holds then).
+    ///
     /// # Errors
     ///
     /// [`Refusal::Usage`] for an empty batch or one over 8 entries; [`Refusal::Stopped`] or
     /// [`Refusal::Left`]; [`Refusal::NotNow`] while a provider loss is followed and the
-    /// app's evidence isn't uploaded yet (Switch spec 12.6 step 3); an `attempt` while the
-    /// app may not attempt ([`App::may_attempt`]); the switch's refusal for good, such as
-    /// `409 conflict` with its `current`, after which nothing is kept; any other failure
+    /// app's evidence isn't uploaded yet (Switch spec 12.6 step 3), or after `409
+    /// stale_epoch` while the app lacks a read scope's key at the new data epoch; an
+    /// `attempt` while the app may not attempt ([`App::may_attempt`]); the switch's refusal
+    /// for good, such as `409 conflict` with its `current`, after which nothing is kept; any
+    /// other failure
     /// (the network, `429`, `503`, an answer that doesn't verify), after which the batch is
     /// kept and sent again, the same bytes, by the next call that writes. A batch kept from
     /// an earlier call that still can't be sent fails the call the same way, before the new
@@ -246,7 +260,20 @@ impl App {
         if !attempts.is_empty() {
             self.may_attempt(false)?;
         }
-        let submitted = self.submit_new(batch).await?;
+        // A batch with sealed record writes is kept unsigned too, to be sealed again after
+        // `409 stale_epoch` (below).
+        let unsigned = batch
+            .ops
+            .iter()
+            .any(|(_, kind)| matches!(kind, OpKind::RecordPut(_)))
+            .then(|| batch.clone());
+        let submitted = match (self.submit_new(batch).await, unsigned) {
+            (Ok(submitted), _) => submitted,
+            (Err(stale), Some(unsigned)) if stale.code() == Some(ErrorCode::StaleEpoch) => {
+                self.submit_resealed(unsigned, stale).await?
+            }
+            (Err(error), _) => return Err(error),
+        };
         let mut views = Vec::new();
         let mut refused = Vec::new();
         for (index, entry) in &attempts {
@@ -335,6 +362,85 @@ impl App {
         tx.put(&pending_key(&id), &pending)?;
         self.commit(tx).await?;
         self.run_pending(&id, &pending, &signed).await
+    }
+
+    /// After `409 stale_epoch` on `batch` (Switch spec 3.5, 6.4): the switch refused it for
+    /// good, and nothing of it is kept. The app takes the newer own `identity.json` and its
+    /// key bundle, seals each record write again at the new data epoch, and signs and sends
+    /// the batch once more, under a new batch ID. Sealing again changes only the ciphertext:
+    /// each value is the one the caller built, opened with the app's key of the epoch it was
+    /// sealed at, and the record key, policy, expected version and conditions stay as they
+    /// were, so the switch still applies the batch only on the state it was built on.
+    ///
+    /// Returns `stale`, the switch's refusal, when nothing can be sealed again: the newer
+    /// document isn't on the Homeserver yet (the data epoch didn't change), a record write
+    /// was sealed under a key the app doesn't hold, or reading the newer document or key
+    /// bundle failed. The caller then builds the batch again, as for any refusal for good.
+    async fn submit_resealed(
+        &mut self,
+        batch: OpBatch,
+        stale: AppError,
+    ) -> Result<Submitted, AppError> {
+        let refreshed = match self.refresh_identity().await {
+            Ok(_) => self.fetch_key_bundle().await,
+            Err(error) => Err(error),
+        };
+        match refreshed {
+            Ok(()) => {}
+            Err(error @ AppError::Alarm(_)) => return Err(error),
+            Err(_) => return Err(stale),
+        }
+        match self.reseal(batch)? {
+            Some(resealed) => self.submit_new(resealed).await,
+            None => Err(stale),
+        }
+    }
+
+    /// `batch` with every record write sealed at the current data epoch (Switch spec 13.4),
+    /// or `None` when no write changes, or one can't be opened with the app's keys.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::NotNow`] while the app lacks the read scope's key at the current data
+    /// epoch, as [`App::record_op`]; a value that doesn't seal.
+    fn reseal(&self, mut batch: OpBatch) -> Result<Option<OpBatch>, AppError> {
+        let epoch = self.state.own_doc.data_epoch();
+        let identity = self.state.meta.identity;
+        let mut changed = false;
+        for (_, kind) in &mut batch.ops {
+            let OpKind::RecordPut(put) = kind else {
+                continue;
+            };
+            let sealed = &put.value_sealed;
+            if sealed.data_epoch == epoch {
+                continue;
+            }
+            let Some(old_key) = self.state.scope_keys.get(sealed.data_epoch, &sealed.scope) else {
+                return Ok(None);
+            };
+            let Ok(value) = sealed.open(&old_key, &identity, &put.key) else {
+                return Ok(None);
+            };
+            let read_scope = &put.policy.read_scope;
+            let new_key = self
+                .state
+                .scope_keys
+                .get(epoch, read_scope)
+                .ok_or_else(|| {
+                    AppError::Refused(Refusal::NotNow(
+                        "Switch spec 3.5: no key of the read scope at the current data epoch yet"
+                            .into(),
+                    ))
+                })?;
+            let json: &[u8] = match &value {
+                RecordValue::Delete => b"",
+                RecordValue::Json(json) => json,
+            };
+            put.value_sealed =
+                SealedValue::seal(&new_key, &identity, epoch, read_scope, &put.key, json)?;
+            changed = true;
+        }
+        Ok(changed.then_some(batch))
     }
 
     /// While a provider loss is followed and the app's evidence isn't uploaded yet, it

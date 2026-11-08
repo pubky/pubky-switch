@@ -29,7 +29,7 @@ use pubky_switch_core::receive::KindRules;
 use pubky_switch_core::records::{AppCert, AppRecord, Standing};
 use serde_json::Value;
 
-use super::context::ReceiveContext;
+use super::context::{LocalView, ReceiveContext};
 use super::records::Collection;
 use super::recovery::{LossActions, ProviderLoss};
 use super::send::{RecordJob, SentMessage};
@@ -129,6 +129,23 @@ pub struct Effect {
     pub local: Vec<LocalWrite>,
 }
 
+/// The most claims the app reads from the switch for one entry's receive step
+/// ([`Outcome::Need`]), over all its calls: a step that asks for more is stored locally and
+/// passed ([`super::ParkReason::TooManyReads`]).
+pub const MAX_CLAIM_READS: usize = 4;
+
+/// What a receive step needs read from the switch before it can build its effect
+/// ([`Outcome::Need`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Need {
+    /// The claim of this key, as `GET /claims/{claim_key}` gives it (Switch wire 7.4.8),
+    /// checked as [`super::App::read_claim`] checks it. Its view is kept, so the context's
+    /// [`ReceiveContext::claim_view`] and [`ReceiveContext::claim_condition`] show it, and
+    /// the answer itself is in [`ReceiveContext::switch_claim`].
+    Claim([u8; 32]),
+}
+
 /// The protocol's answer for a received message.
 #[derive(Clone, Debug)]
 pub enum Outcome {
@@ -141,6 +158,15 @@ pub enum Outcome {
         /// The rule, without content.
         reason: String,
     },
+    /// The step needs these read from the switch first, such as the claim a message gives
+    /// evidence for when the app keeps no view of it (Switch spec 10.2). What the context
+    /// added is discarded; the app reads them, then calls [`Protocol::receive_with`] again
+    /// with them in the context. Reads are bounded: every call for one entry together reads
+    /// at most [`MAX_CLAIM_READS`] claims, and a `Need` that names nothing new or goes past
+    /// the bound stores the entry locally and passes it
+    /// ([`super::ParkReason::TooManyReads`]). A read that fails for now (the network, `429`,
+    /// `503`) leaves the entry waiting for the next read of the feed.
+    Need(Vec<Need>),
 }
 
 /// Entries the app can't read and whose senders it asks to send again (Switch spec 8.2):
@@ -185,6 +211,18 @@ pub struct MissedEntries {
 
 /// A protocol on the Switch, as the app layer uses it. Object-safe; the app holds an
 /// `Arc<dyn Protocol>`.
+///
+/// # Callbacks and the store
+///
+/// Every callback is synchronous and runs on the app's task, in the middle of one of its
+/// calls. A callback may read the host's store synchronously: the receive step through its
+/// [`ReceiveContext`], [`Protocol::sends_to_with`] and [`Protocol::provider_lost_with`]
+/// through a [`LocalView`], any callback through a handle of its own on the host's store.
+/// No callback writes the store: the app commits the protocol's local state only as the
+/// [`LocalWrite`]s a callback returns, or a batch or [`super::App::protocol_commit`]
+/// carries, each at the commit point its crash rules give it (`STATE.md`). A write made
+/// beside them could land without the outcome it belongs to, or after a crash that
+/// discards it.
 pub trait Protocol: Send + Sync {
     /// The opaque members of the protocol's message bodies (Switch wire 1.1). None by
     /// default.
@@ -230,12 +268,14 @@ pub trait Protocol: Send + Sync {
     }
 
     /// Check 10 and the effect of a message that passed checks 1 to 9, with the app's
-    /// state at hand (Switch spec 8.2): `cx` derives record keys, reads the writes the app
-    /// holds and the claims it keeps, and adds record writes and claim entries to the
-    /// effect's batch, which carries the cursor move. What `cx` added goes only with
-    /// [`Outcome::Apply`]; a [`Outcome::Drop`] discards it. After `409 conflict` on the
-    /// batch the app reads the records and claims `cx` wrote again and calls this once
-    /// more, with [`ReceivedMessage::conflict`] set. [`Protocol::receive`] by default.
+    /// state at hand (Switch spec 8.2): `cx` derives record keys and blinded inputs, reads
+    /// the writes the app holds and the claims it keeps, and adds record writes and claim
+    /// entries to the effect's batch, which carries the cursor move. What `cx` added goes
+    /// only with [`Outcome::Apply`]; a [`Outcome::Drop`] or an [`Outcome::Need`] discards
+    /// it. After an [`Outcome::Need`] the app reads what it names and calls this again, the
+    /// answers in [`ReceiveContext::switch_claim`]. After `409 conflict` on the batch the
+    /// app reads the records and claims `cx` wrote again and calls this once more, with
+    /// [`ReceivedMessage::conflict`] set. [`Protocol::receive`] by default.
     fn receive_with(&self, message: &ReceivedMessage, cx: &mut ReceiveContext<'_>) -> Outcome {
         let _ = cx;
         self.receive(message)
@@ -259,6 +299,14 @@ pub trait Protocol: Send + Sync {
         LossActions::default()
     }
 
+    /// [`Protocol::provider_lost`], with the protocol's local state at hand, read-only
+    /// (`view`), such as to find the counterparties of its unfinished activity. The app
+    /// calls this one; by default it calls [`Protocol::provider_lost`].
+    fn provider_lost_with(&self, loss: &ProviderLoss, view: &LocalView<'_>) -> LossActions {
+        let _ = view;
+        self.provider_lost(loss)
+    }
+
     /// Whether a certificate's scopes allow its app to receive `kind`, which a sender checks
     /// before wrapping a message to the app (Switch spec 3.4). By default, whether the kinds
     /// [`Protocol::accepts`] gives for the certificate list it, which are never wider than
@@ -273,6 +321,18 @@ pub trait Protocol: Send + Sync {
     fn sends_to(&self, message: &Message, recipient: &AppRecord) -> bool {
         let _ = (message, recipient);
         true
+    }
+
+    /// [`Protocol::sends_to`], with the protocol's local state at hand, read-only (`view`).
+    /// The app calls this one; by default it calls [`Protocol::sends_to`].
+    fn sends_to_with(
+        &self,
+        message: &Message,
+        recipient: &AppRecord,
+        view: &LocalView<'_>,
+    ) -> bool {
+        let _ = view;
+        self.sends_to(message, recipient)
     }
 
     /// Whether a first message of `kind` to a counterparty that isn't a contact adds a

@@ -1334,27 +1334,20 @@ impl App {
     ) -> Result<SharedRecord, AppError> {
         self.ready_local().await?;
         let key = self.record_key(target)?;
-        let mut epoch_retried = false;
-        loop {
-            let entry = self.record_op(target, value, conditions.clone()).await?;
-            self.note_pending_name(&key, &target.collection).await?;
-            match self.submit_batch(OpBatch::new().entry(entry)).await {
-                Ok(_) => {
-                    return self.shared_record(&key).await?.ok_or_else(|| {
-                        AppError::InvalidData("the record written isn't held".into())
-                    });
-                }
-                Err(error) if error.code() == Some(ErrorCode::StaleEpoch) && !epoch_retried => {
-                    epoch_retried = true;
-                    self.refresh_identity().await?;
-                    self.fetch_key_bundle().await?;
-                }
-                Err(error) if error.code() == Some(ErrorCode::Conflict) => {
-                    self.fetch_record(&key, &target.collection).await?;
-                    return Err(error);
-                }
-                Err(error) => return Err(error),
+        let entry = self.record_op(target, value, conditions).await?;
+        self.note_pending_name(&key, &target.collection).await?;
+        // `409 stale_epoch` is followed inside `submit_batch`: the write is sealed again at
+        // the new data epoch and sent once more.
+        match self.submit_batch(OpBatch::new().entry(entry)).await {
+            Ok(_) => self
+                .shared_record(&key)
+                .await?
+                .ok_or_else(|| AppError::InvalidData("the record written isn't held".into())),
+            Err(error) if error.code() == Some(ErrorCode::Conflict) => {
+                self.fetch_record(&key, &target.collection).await?;
+                Err(error)
             }
+            Err(error) => Err(error),
         }
     }
 

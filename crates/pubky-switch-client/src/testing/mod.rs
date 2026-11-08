@@ -15,7 +15,10 @@
 //! - [`ScriptedSwitch`]: one account's switch, its chain, feed, directory and shared state,
 //!   with [`Fault`]s to inject. Apps of other identities reach its inbox as senders do:
 //!   admission by the lists and invite codes, the directory with `known_version`, peer copies
-//!   of their `identity.json`, connect requests, `identity_needed` and `stale_key`.
+//!   of their `identity.json`, connect requests, `identity_needed` and `stale_key`. A claim
+//!   read (`GET /claims/{claim_key}`) answers with the claim view and its entries, each with
+//!   its step, `seq`, signed operation and transition proof, none for a tombstone (Switch
+//!   wire 7.4.8).
 //! - [`PeerSwitch`]: another identity's switch, as a sender sees it: its directory, inbox
 //!   and peer copies of `identity.json`.
 //! - [`Router`]: a [`crate::transport::Transport`] that sends each request to the switch of
