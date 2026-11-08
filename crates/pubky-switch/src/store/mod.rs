@@ -56,6 +56,9 @@ pub struct DatabaseConfig {
     pub lock_timeout_ms: u64,
     /// Apply pending schema migrations at start.
     pub migrate_on_start: bool,
+    /// How long the service keeps trying to reach the database at start, while it refuses
+    /// connections or is still starting up, before it gives up and exits.
+    pub connect_retry_ms: u64,
 }
 
 impl Default for DatabaseConfig {
@@ -66,6 +69,7 @@ impl Default for DatabaseConfig {
             acquire_timeout_ms: 5_000,
             lock_timeout_ms: 10_000,
             migrate_on_start: true,
+            connect_retry_ms: 30_000,
         }
     }
 }
@@ -78,6 +82,7 @@ impl std::fmt::Debug for DatabaseConfig {
             .field("acquire_timeout_ms", &self.acquire_timeout_ms)
             .field("lock_timeout_ms", &self.lock_timeout_ms)
             .field("migrate_on_start", &self.migrate_on_start)
+            .field("connect_retry_ms", &self.connect_retry_ms)
             .finish()
     }
 }
@@ -239,7 +244,7 @@ impl Store {
         // Check once on a connection of its own, so a database that would acknowledge
         // commits before they are durable is refused at start with the reason. The pool
         // checks every later connection too, in case the settings change.
-        let mut first = PgConnection::connect_with(&options).await?;
+        let mut first = connect_first(&options, config.connect_retry_ms).await?;
         let settings = DurabilitySettings::read(&mut first).await?;
         settings.check().map_err(StoreError::NotDurable)?;
         if let Some(warning) = settings.replica_warning() {
@@ -297,6 +302,42 @@ impl Store {
     /// Close every connection.
     pub async fn close(&self) {
         self.pool.close().await;
+    }
+}
+
+/// PostgreSQL's code for a server that is starting up or shutting down.
+const CANNOT_CONNECT_NOW: &str = "57P03";
+
+/// Whether a failed connection may succeed if tried again: a server not listening yet, or
+/// one still starting up. Refused credentials and other errors aren't retried.
+fn retryable(error: &sqlx::Error) -> bool {
+    match error {
+        sqlx::Error::Io(_) | sqlx::Error::PoolTimedOut => true,
+        sqlx::Error::Database(db) => db.code().as_deref() == Some(CANNOT_CONNECT_NOW),
+        _ => false,
+    }
+}
+
+/// Open the first connection, trying again while the database isn't up yet, for at most
+/// `retry_ms`. A database started at the same time as the service, by an orchestrator or a
+/// container runtime, is often not listening for its first second or two.
+async fn connect_first(
+    options: &PgConnectOptions,
+    retry_ms: u64,
+) -> Result<PgConnection, StoreError> {
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(retry_ms);
+    let mut backoff = Duration::from_millis(100);
+    loop {
+        match PgConnection::connect_with(options).await {
+            Ok(conn) => return Ok(conn),
+            Err(error) if retryable(&error) && tokio::time::Instant::now() < deadline => {
+                tracing::warn!(%error, "the database isn't reachable yet; trying again");
+                let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+                tokio::time::sleep(backoff.min(left)).await;
+                backoff = (backoff * 2).min(Duration::from_secs(2));
+            }
+            Err(error) => return Err(error.into()),
+        }
     }
 }
 
@@ -387,6 +428,37 @@ mod tests {
             no_pool.validate().expect_err("pool").name,
             "max_connections"
         );
+    }
+
+    #[tokio::test]
+    async fn test_store_connect_retries_then_gives_up() {
+        // A port nothing listens on: refused at once, so every attempt is retried until the
+        // bound, and then the error is returned.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        drop(listener);
+        let options = PgConnectOptions::new().host("127.0.0.1").port(port);
+        let started = std::time::Instant::now();
+        let error = connect_first(&options, 400)
+            .await
+            .expect_err("nothing listens");
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(error, StoreError::Database(sqlx::Error::Io(_))),
+            "{error:?}"
+        );
+        assert!(elapsed >= Duration::from_millis(400), "{elapsed:?}");
+        assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+    }
+
+    #[test]
+    fn test_store_retryable_errors() {
+        assert!(retryable(&sqlx::Error::Io(std::io::Error::from(
+            std::io::ErrorKind::ConnectionRefused
+        ))));
+        assert!(retryable(&sqlx::Error::PoolTimedOut));
+        assert!(!retryable(&sqlx::Error::Configuration("bad".into())));
+        assert!(!retryable(&sqlx::Error::RowNotFound));
     }
 
     #[test]

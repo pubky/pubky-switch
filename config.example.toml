@@ -105,6 +105,7 @@ max_connections = 16
 acquire_timeout_ms = 5000
 lock_timeout_ms = 10000                # a request waits this long for its account's lock
 migrate_on_start = true
+connect_retry_ms = 30000               # keep trying to reach the database at start
 
 # The key store: service keys, their marks and the erasure ledger. Put it on a disk that
 # database backups don't cover, and back it up on its own. Required to run the service.

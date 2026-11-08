@@ -139,6 +139,7 @@ PostgreSQL.
 | `acquire_timeout_ms` | `5000` | how long a request waits for a free connection |
 | `lock_timeout_ms` | `10000` | how long a request waits for its account's lock before it gives up with `503 unavailable` |
 | `migrate_on_start` | `true` | apply pending schema migrations at start; safe with several instances |
+| `connect_retry_ms` | `30000` | how long the service keeps trying to reach the database at start, while it refuses connections or is still starting up, before it exits |
 
 ### `[keys]`
 
