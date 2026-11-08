@@ -729,3 +729,22 @@ async fn test_write_answer_proof_must_be_the_transition_written() {
         ClientError::Chain(_)
     ));
 }
+
+#[tokio::test]
+async fn test_last_server_time_follows_checked_answers_only() {
+    let transport = fixed(
+        service_key(),
+        200,
+        json!({ "contacts": [], "conversations": [], "deny": [] }),
+    );
+    let client = client_with(app(), Some(service_public()), Arc::clone(&transport));
+    assert_eq!(client.last_server_time(), None);
+    client.allow().await.unwrap();
+    assert_eq!(client.last_server_time(), Some(NOW));
+    // An answer the pinned key didn't sign leaves the time as it was.
+    let other = SigningKey::from_bytes(&[6; 32]);
+    let forged = fixed(other, 200, json!({}));
+    let client = client_with(app(), Some(service_public()), forged);
+    assert!(client.allow().await.is_err());
+    assert_eq!(client.last_server_time(), None);
+}

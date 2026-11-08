@@ -1681,6 +1681,7 @@ dependencies = [
  "pubky-switch-client",
  "pubky-switch-core",
  "reqwest",
+ "serde",
  "serde_json",
  "thiserror",
  "tokio",

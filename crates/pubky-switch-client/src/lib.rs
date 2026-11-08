@@ -17,9 +17,13 @@
 //!   answer against the pinned service key before using it, and offers a typed call for
 //!   every endpoint, with batches that are signed once and resent byte for byte.
 //! - [`error`]: one error type per layer.
+//! - [`app`]: the app layer, which runs one app of an identity on top of the Switch: its
+//!   keys, its own `identity.json`, its receive keys, its key bundles and its feed, with all
+//!   durable state in the [`store::StateStore`] (Switch spec 3, 8, 11, 12).
 //!
 //! Async is used only at the network edge; every public type is plain owned data.
 
+pub mod app;
 pub mod client;
 pub mod clock;
 pub mod error;

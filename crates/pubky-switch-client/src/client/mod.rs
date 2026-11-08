@@ -326,6 +326,7 @@ pub struct SwitchClient {
     account: [u8; 32],
     credentials: Credentials,
     pinned: Mutex<Option<[u8; 32]>>,
+    last_server_time: Mutex<Option<u64>>,
     transport: Arc<dyn Transport>,
     clock: Arc<dyn Clock>,
 }
@@ -377,6 +378,7 @@ impl SwitchClient {
             account,
             credentials,
             pinned: Mutex::new(pinned_key),
+            last_server_time: Mutex::new(None),
             transport,
             clock,
         })
@@ -406,6 +408,38 @@ impl SwitchClient {
     /// signer pins the key the delivered `identity.json` names (Switch wire 3.3, 3.7).
     pub fn pin(&self, service_key: [u8; 32]) {
         *self.pinned.lock().unwrap_or_else(PoisonError::into_inner) = Some(service_key);
+    }
+
+    /// The `Switch-Server-Time` of the latest answer this client checked with the pinned key,
+    /// a success or an error answer, in Unix milliseconds; `None` before any. An app keeps
+    /// the highest service time it verified and measures it against its own clock (Switch
+    /// spec 10.1).
+    pub fn last_server_time(&self) -> Option<u64> {
+        *self
+            .last_server_time
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn note_server_time(
+        &self,
+        checked: &Result<CheckedResponse, ClientError>,
+        response: &Response,
+    ) {
+        let time = match checked {
+            Ok(answer) => Some(answer.server_time_ms),
+            // An error answer verified with the pinned key: its time is the service's too.
+            Err(ClientError::Switch { .. }) => response
+                .header(header::SERVER_TIME)
+                .and_then(|text| parse_rfc3339(text).ok()),
+            Err(_) => None,
+        };
+        if let Some(time) = time {
+            *self
+                .last_server_time
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(time);
+        }
     }
 
     /// Whether the account is another identity's than the caller's, so an app sends
@@ -580,7 +614,9 @@ impl SwitchClient {
         let key = self.pinned_key().ok_or(ClientError::Unpinned)?;
         let signed = self.build(method, path_and_query, body, content, auth)?;
         let response = self.transport.send(signed.request).await?;
-        check_response(&key, &self.account, signed.signature.as_ref(), &response)
+        let checked = check_response(&key, &self.account, signed.signature.as_ref(), &response);
+        self.note_server_time(&checked, &response);
+        checked
     }
 
     /// Send a request this client signed, as built by [`SwitchClient::sign_request`], and
@@ -593,7 +629,9 @@ impl SwitchClient {
     pub async fn send(&self, signed: SignedRequest) -> Result<CheckedResponse, ClientError> {
         let key = self.pinned_key().ok_or(ClientError::Unpinned)?;
         let response = self.transport.send(signed.request).await?;
-        check_response(&key, &self.account, signed.signature.as_ref(), &response)
+        let checked = check_response(&key, &self.account, signed.signature.as_ref(), &response);
+        self.note_server_time(&checked, &response);
+        checked
     }
 
     pub(crate) fn transport(&self) -> &dyn Transport {
