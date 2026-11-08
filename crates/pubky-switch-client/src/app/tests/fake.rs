@@ -13,11 +13,13 @@ use pubky_switch_core::chain::{
 };
 use pubky_switch_core::enc::{app_id_decode, b64, pubky_id, zbase32_encode};
 use pubky_switch_core::envelope::Recipient;
-use pubky_switch_core::http::{ErrorCode, header, request_signature_of, sign_response};
+use pubky_switch_core::http::{
+    ErrorCode, frozen_refuses, header, request_signature_of, sign_response,
+};
 use pubky_switch_core::keys::{AppKeys, IdentityKey};
 use pubky_switch_core::message::{Message, Sender};
 use pubky_switch_core::ops::{OpKind, OpsRequest, Position, SignedOp, sign_batch};
-use pubky_switch_core::records::{AppCert, BundlePart, IdentityDoc};
+use pubky_switch_core::records::{AppCert, BundlePart, Freeze, IdentityDoc};
 use pubky_switch_core::sig::SignedDoc;
 use pubky_switch_core::time::rfc3339;
 use serde_json::{Map, Value, json};
@@ -77,6 +79,14 @@ impl Item {
     }
 }
 
+/// A push registration the switch holds for an app (Switch wire 8.1).
+#[derive(Clone, Debug)]
+pub(crate) struct PushReg {
+    pub(crate) relay_url: String,
+    pub(crate) key: SigningKey,
+    pub(crate) handles: Vec<String>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct AppAtSwitch {
     pub(crate) record: Option<SignedDoc>,
@@ -119,6 +129,26 @@ pub(crate) struct Inner {
     pub(crate) faults: VecDeque<Fault>,
     /// Every operation applied, in order, for counting effects.
     pub(crate) applied: Vec<SignedOp>,
+    /// The signed freeze while the account is frozen (Switch spec 12.5).
+    pub(crate) frozen: Option<SignedDoc>,
+    /// Whether a frozen account's feed pages carry the freeze.
+    pub(crate) freeze_in_feed: bool,
+    /// A staged account: everything but uploads answers `503 staged`.
+    pub(crate) staged: bool,
+    /// An erased account: every answer is the operator's `404`.
+    pub(crate) erased: bool,
+    /// The generation a recovery started from, at a recovering account.
+    pub(crate) recovery_from: Option<u64>,
+    /// An app's first receive key record may carry any `n` (after a provider loss).
+    pub(crate) any_first_n: bool,
+    /// The recovery uploads taken: the body, and whether it came with `Switch-Cert`.
+    pub(crate) uploads: Vec<(Value, bool)>,
+    /// The push registrations by app.
+    pub(crate) push: BTreeMap<[u8; 16], PushReg>,
+    /// Push keys minted, for fresh seeds.
+    pub(crate) minted: u64,
+    /// The answer to `GET /allow`, when scripted.
+    pub(crate) allow: Option<Value>,
 }
 
 /// The scripted switch.
@@ -141,8 +171,18 @@ impl FakeSwitch {
         service: SigningKey,
         clock: Arc<TestClock>,
     ) -> Arc<Self> {
+        Self::with_generation(identity, service, clock, 1)
+    }
+
+    /// A switch whose sequence and chain start at `generation`.
+    pub(crate) fn with_generation(
+        identity: IdentityKey,
+        service: SigningKey,
+        clock: Arc<TestClock>,
+        generation: u64,
+    ) -> Arc<Self> {
         let tip = ChainTip {
-            generation: 1,
+            generation,
             seq: 0,
             chain_hash: ZERO_HASH,
         };
@@ -163,8 +203,133 @@ impl FakeSwitch {
                 dropped_through: 0,
                 faults: VecDeque::new(),
                 applied: Vec::new(),
+                frozen: None,
+                freeze_in_feed: true,
+                staged: false,
+                erased: false,
+                recovery_from: None,
+                any_first_n: false,
+                uploads: Vec::new(),
+                push: BTreeMap::new(),
+                minted: 0,
+                allow: None,
             }),
         })
+    }
+
+    /// A service recovering the account after the loss of `recovery_from`: a new sequence and
+    /// chain at `generation`, starting with the recovery record (Switch spec 12.6 step 1).
+    pub(crate) fn recovering(
+        identity: IdentityKey,
+        service: SigningKey,
+        clock: Arc<TestClock>,
+        generation: u64,
+        recovery_from: u64,
+    ) -> Arc<Self> {
+        let switch = Self::with_generation(identity, service, clock, generation);
+        {
+            let mut inner = switch.lock();
+            inner.recovery_from = Some(recovery_from);
+            inner.any_first_n = true;
+            let at = inner.now();
+            inner.service_transition(ServiceTransition::Recovery { recovery_from, at });
+        }
+        switch
+    }
+
+    /// The next service of a cooperative move, staged, with this account imported: the same
+    /// sequence, chain, apps and cursors, under its own key (Switch spec 12.5 step 3).
+    pub(crate) fn import_into(&self, service: SigningKey) -> Arc<Self> {
+        let inner = self.lock();
+        Arc::new(Self {
+            inner: Mutex::new(Inner {
+                identity: inner.identity.clone_key(),
+                service,
+                clock: Arc::clone(&inner.clock),
+                tip: inner.tip,
+                seq: inner.seq,
+                items: inner.items.clone(),
+                tips: inner.tips.clone(),
+                doc: inner.doc.clone(),
+                apps: inner.apps.clone(),
+                bundles: inner.bundles.clone(),
+                answered: HashMap::new(),
+                checkpoint: None,
+                dropped_through: inner.dropped_through,
+                faults: VecDeque::new(),
+                applied: Vec::new(),
+                frozen: None,
+                freeze_in_feed: true,
+                staged: true,
+                erased: false,
+                recovery_from: None,
+                any_first_n: false,
+                uploads: Vec::new(),
+                push: BTreeMap::new(),
+                minted: 0,
+                allow: None,
+            }),
+        })
+    }
+
+    /// The signer's freeze (Switch wire 7.4.13): the `freeze` transition, then every write
+    /// is `410 moved`.
+    pub(crate) fn freeze(&self, freeze: &Freeze) {
+        let mut inner = self.lock();
+        let at = inner.now();
+        inner.service_transition(ServiceTransition::Freeze {
+            freeze_hash: freeze.hash(),
+            next_generation: freeze.body().next_generation,
+            inbox: freeze.next().clone(),
+            at,
+        });
+        inner.frozen = Some(freeze.signed().clone());
+    }
+
+    /// The signer's unfreeze at the old service (Switch wire 7.4.13).
+    pub(crate) fn unfreeze(&self, freeze: &Freeze) {
+        let mut inner = self.lock();
+        let at = inner.now();
+        inner.service_transition(ServiceTransition::Unfreeze {
+            freeze_hash: freeze.hash(),
+            at,
+        });
+        inner.frozen = None;
+    }
+
+    /// The signer revokes `app` (Switch spec 12.2 step 1).
+    pub(crate) fn revoke(&self, app: [u8; 16]) {
+        let mut inner = self.lock();
+        inner.apps.entry(app).or_default().departed = true;
+        inner.push.remove(&app);
+        let at = inner.now();
+        inner.service_transition(ServiceTransition::Revoke { app_id: app, at });
+    }
+
+    /// The recovery uploads taken.
+    pub(crate) fn uploads(&self) -> Vec<(Value, bool)> {
+        self.lock().uploads.clone()
+    }
+
+    /// The push registration of `app`: its relay, push key and handles.
+    pub(crate) fn push_of(&self, app: &[u8; 16]) -> Option<(String, [u8; 32], Vec<String>)> {
+        self.lock().push.get(app).map(|reg| {
+            (
+                reg.relay_url.clone(),
+                reg.key.verifying_key().to_bytes(),
+                reg.handles.clone(),
+            )
+        })
+    }
+
+    /// Another device of `app` rotates its push key: a new key for the same relay.
+    pub(crate) fn rotate_push_behind(&self, app: &[u8; 16]) {
+        let mut inner = self.lock();
+        let key = inner.mint();
+        if let Some(reg) = inner.push.get_mut(app) {
+            reg.key = key;
+            reg.handles.clear();
+        }
     }
 
     pub(crate) fn lock(&self) -> MutexGuard<'_, Inner> {
@@ -185,7 +350,7 @@ impl FakeSwitch {
         self.lock().faults.push_back(fault);
     }
 
-    fn handle(&self, request: &Request) -> Result<Response, TransportError> {
+    pub(crate) fn handle(&self, request: &Request) -> Result<Response, TransportError> {
         let mut inner = self.lock();
         let path = request.path_and_query.clone();
         let mut lose = false;
@@ -203,6 +368,24 @@ impl FakeSwitch {
                 None => {}
             }
         }
+        if inner.erased {
+            // Switch wire 7.4.16: an account the service doesn't host, signed with the
+            // operator key.
+            let operator = SigningKey::from_bytes(&[42; 32]);
+            let (status, body) = bad(ErrorCode::NotFound, "no such account", json!(null));
+            return Ok(inner.respond_with(&operator, request, status, &body));
+        }
+        let upload = request.method == "POST" && path.contains("recovery/upload");
+        if inner.staged && !upload {
+            let (status, body) = bad(ErrorCode::Staged, "staged", json!(null));
+            return Ok(inner.respond(request, status, &body));
+        }
+        if let Some(freeze) = inner.frozen.clone()
+            && frozen_refuses(&request.method, &path)
+        {
+            let (status, body) = bad(ErrorCode::Moved, "moved", json!({ "freeze": freeze }));
+            return Ok(inner.respond(request, status, &body));
+        }
         let caller = request
             .header(header::APP)
             .and_then(|text| app_id_decode(text).ok());
@@ -217,6 +400,14 @@ impl FakeSwitch {
     /// Deliver an own `identity.json` (the signer's `PUT /identity`).
     pub(crate) fn deliver_identity(&self, doc: &IdentityDoc) {
         let mut inner = self.lock();
+        // A document naming this service at the next generation makes it serve, and its
+        // chain go on under that generation (Switch wire 6.5 "Import").
+        if doc.generation() > inner.tip.generation {
+            inner.tip.generation = doc.generation();
+        }
+        if doc.inbox().service_key == inner.service.verifying_key().to_bytes() {
+            inner.staged = false;
+        }
         let bytes = doc.signed().doc_bytes().unwrap();
         let hash = item_hash(ItemType::Identity, &bytes);
         let state = ProofState::Identity {
@@ -432,11 +623,21 @@ impl Inner {
     }
 
     fn respond(&self, request: &Request, status: u16, body: &Value) -> Response {
+        self.respond_with(&self.service, request, status, body)
+    }
+
+    fn respond_with(
+        &self,
+        key: &SigningKey,
+        request: &Request,
+        status: u16,
+        body: &Value,
+    ) -> Response {
         let bytes = body.to_string().into_bytes();
         let server_time = rfc3339(self.now());
         let request_signature = request_signature_of(request.header(header::SIGNATURE));
         let signature = sign_response(
-            &self.service,
+            key,
             status,
             request_signature.as_ref(),
             &server_time,
@@ -514,7 +715,8 @@ impl Inner {
                         continue;
                     }
                     let expected = held.receive_n.map_or(0, |c| c + 1);
-                    if n != expected {
+                    let first = held.receive_n.is_none() && self.any_first_n;
+                    if n != expected && !first {
                         return Some(bad(
                             ErrorCode::Conflict,
                             "receive key number",
@@ -628,6 +830,23 @@ impl Inner {
             ("POST", "ops") => self.ops(caller, &request.body),
             ("GET", "feed") => self.feed(caller, query),
             ("GET", "directory") => self.directory(),
+            ("GET", "identity") => {
+                let mut answer =
+                    json!({ "identity": self.doc.as_ref().map(|d| d.signed().clone()) });
+                if let Some(freeze) = &self.frozen {
+                    answer["freeze"] = json!(freeze);
+                }
+                (200, answer)
+            }
+            ("POST", "recovery/upload") => self.upload(request, caller),
+            ("GET", "allow") => (
+                200,
+                self.allow.clone().unwrap_or_else(|| {
+                    json!({ "contacts": [], "conversations": [], "deny": [], "flagged": [],
+                            "invite_codes": [] })
+                }),
+            ),
+            ("PUT", "push") => self.put_push(caller, &request.body),
             ("GET", r) if r == format!("apps/{me}/keys") => {
                 let parts = self
                     .bundles
@@ -753,6 +972,11 @@ impl Inner {
         if let Some(checkpoint) = &self.checkpoint {
             page["checkpoint"] = checkpoint.to_value();
         }
+        if let Some(freeze) = &self.frozen
+            && self.freeze_in_feed
+        {
+            page["freeze"] = json!(freeze);
+        }
         (200, page)
     }
 
@@ -810,6 +1034,127 @@ impl Inner {
             } => json!({ "type": "missed", "seq": seq, "entries": entries,
                          "accepted_from": rfc3339(*from), "accepted_until": rfc3339(*until) }),
         })
+    }
+
+    fn mint(&mut self) -> SigningKey {
+        self.minted += 1;
+        let seed = format!("push/{}/{}", self.minted, b64(&self.service.to_bytes()));
+        SigningKey::from_bytes(blake3::hash(seed.as_bytes()).as_bytes())
+    }
+
+    /// `POST /recovery/upload` (Switch wire 7.4.14): kept, and answered as the account
+    /// stands: staged, recovering, or serving after a move.
+    fn upload(&mut self, request: &Request, caller: Option<[u8; 16]>) -> (u16, Value) {
+        let Ok(body) = serde_json::from_slice::<Value>(&request.body) else {
+            return bad(ErrorCode::BadRequest, "upload", json!(null));
+        };
+        let count = |name: &str| body[name].as_array().map_or(0, Vec::len) as u64;
+        let (heads, proofs) = (count("heads"), count("proofs"));
+        self.uploads
+            .push((body.clone(), request.header(header::CERT).is_some()));
+        if self.staged {
+            return (200, json!({ "heads": heads, "proofs": proofs }));
+        }
+        let changes = json!({ "records": [], "divergent": [], "claims": [],
+                              "divergent_claims": [], "unverified": 0, "distrusted": 0,
+                              "refused": 0, "heads": heads,
+                              "lists": body.get("lists").is_some() });
+        if self.recovery_from.is_some() {
+            let at = self.now();
+            let proof = self.service_transition(ServiceTransition::Upload {
+                by: caller.unwrap_or_default(),
+                changes: changes.clone(),
+                proofs,
+                at,
+            });
+            return (
+                200,
+                json!({ "result": changes, "proof": proof, "head": self.head().to_value() }),
+            );
+        }
+        (
+            200,
+            json!({ "heads": heads, "proofs": proofs, "merged": changes,
+                    "head": self.head().to_value() }),
+        )
+    }
+
+    /// `PUT /push` (Switch wire 8.1).
+    fn put_push(&mut self, caller: Option<[u8; 16]>, body: &[u8]) -> (u16, Value) {
+        let (Some(app), Ok(body)) = (caller, serde_json::from_slice::<Value>(body)) else {
+            return bad(ErrorCode::BadRequest, "push", json!(null));
+        };
+        let key = |name: &str| {
+            body.get(name)
+                .and_then(Value::as_str)
+                .map(|text| pubky_switch_core::enc::unb64_array::<32>(text).unwrap())
+        };
+        let relay_url = body["relay_url"].as_str().unwrap_or_default().to_owned();
+        let handles: Vec<String> = body["handles"]
+            .as_array()
+            .map(|h| {
+                h.iter()
+                    .filter_map(|v| v.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let (push_key, replaces) = (key("push_key"), key("replaces"));
+        let current = self
+            .push
+            .get(&app)
+            .map(|reg| reg.key.verifying_key().to_bytes());
+        let conflict = |current: Option<[u8; 32]>| {
+            bad(
+                ErrorCode::Conflict,
+                "push",
+                json!({ "push_key": current.map(|k| b64(&k)) }),
+            )
+        };
+        let answer = |reg: &PushReg| {
+            (
+                200,
+                json!({ "relay_url": reg.relay_url, "handles": reg.handles.len(),
+                        "push_key": b64(&reg.key.verifying_key().to_bytes()) }),
+            )
+        };
+        match push_key {
+            None => {
+                if !handles.is_empty() {
+                    return bad(ErrorCode::BadRequest, "handles on a start", json!(null));
+                }
+                let held = self.push.get(&app).cloned();
+                match held {
+                    None if replaces.is_some() => conflict(None),
+                    Some(reg) if replaces.is_none() && reg.relay_url == relay_url => answer(&reg),
+                    Some(_) if replaces.is_some() && replaces != current => conflict(current),
+                    Some(_) if replaces.is_none() => conflict(current),
+                    _ => {
+                        let key = self.mint();
+                        let reg = PushReg {
+                            relay_url,
+                            key,
+                            handles: Vec::new(),
+                        };
+                        let out = answer(&reg);
+                        self.push.insert(app, reg);
+                        out
+                    }
+                }
+            }
+            Some(named) => {
+                if replaces.is_some() || handles.len() > 8 {
+                    return bad(ErrorCode::BadRequest, "push", json!(null));
+                }
+                match self.push.get_mut(&app) {
+                    Some(reg) if Some(named) == current && reg.relay_url == relay_url => {
+                        reg.handles = handles;
+                        let reg = reg.clone();
+                        answer(&reg)
+                    }
+                    _ => conflict(current),
+                }
+            }
+        }
     }
 
     fn directory(&self) -> (u16, Value) {

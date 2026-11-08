@@ -19,11 +19,12 @@
 //! Async is used only at the network edge: the switch, through the base client, the store,
 //! through [`StoreHandle`], and the Homeserver, through [`HomeserverReader`].
 //!
+//! Moves, provider loss and recovery, revocation and erasure as an app sees them, and push
+//! with its peek, are in `provider.rs`, `recovery.rs`, `push.rs` and `peek.rs`.
+//!
 //! What this layer leaves to later parts, and where they plug in, is in `STATE.md`:
-//! sending and admission (the outbox and its jobs), shared records and claims (the
-//! protocol's effects already carry their operations; listing collections at the start),
-//! moves, provider loss and recovery uploads ([`AppEvent::ProviderChanged`],
-//! [`AppEvent::Moved`]), and push.
+//! sending and admission (the outbox and its jobs), and shared records and claims (the
+//! protocol's effects already carry their operations; listing collections at the start).
 
 mod chain;
 mod error;
@@ -31,7 +32,11 @@ mod events;
 mod feed;
 mod identity;
 mod keys;
+mod peek;
 mod protocol;
+mod provider;
+mod push;
+mod recovery;
 mod renewal;
 mod rotation;
 mod state;
@@ -44,10 +49,14 @@ pub use error::{Alarm, AppError, Refusal};
 pub use events::{AppEvent, ParkReason};
 pub use feed::ReceiveReport;
 pub use identity::{DOC_CACHE_MS, HomeserverReader};
+pub use peek::{PeekReport, Peeked};
 pub use protocol::{
     Effect, LocalWrite, MissedEntries, OpaqueRule, Outcome, Protocol, ReceivedMessage,
     ResendNeeded, ResendReason,
 };
+pub use provider::ProviderStatus;
+pub use push::{MAX_HANDLE_BYTES, PushRegistration, PushRelay};
+pub use recovery::{Evidence, LossActions, ProviderLoss, RESIDUAL_WINDOW_MS, RecoveryInfo};
 pub use state::{PROTOCOL_PREFIX, SCHEMA_VERSION};
 
 use std::collections::{BTreeMap, BTreeSet};

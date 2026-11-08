@@ -47,6 +47,7 @@ use super::protocol::{
     Effect, LocalWrite, MissedEntries, OpaqueRule, Outcome, ReceivedMessage, ResendNeeded,
     ResendReason, Rules,
 };
+use super::provider::TakeOver;
 use super::rotation::RegistrationStep;
 use super::state::{CachedDoc, HeldEntry, ParkedEntry, PendingEffect, Processed, Tx, key};
 use super::{App, AppError, PROCESSED_RETENTION_MS};
@@ -134,6 +135,12 @@ impl App {
     pub async fn receive(&mut self, wait: Option<u32>) -> Result<ReceiveReport, AppError> {
         self.ready_local().await?;
         let result = self.receive_inner(wait).await;
+        // A move, a provider change, a revocation or an erasure met during the read is
+        // followed (`provider.rs`), and the read goes on once at the service followed.
+        let result = match self.take_over(result).await {
+            TakeOver::Done(result) => result,
+            TakeOver::ReadAgain => self.receive_inner(None).await,
+        };
         if result.is_err() {
             self.reload = true;
         }
@@ -148,6 +155,9 @@ impl App {
         }
         self.refuse_when_stopped()?;
         self.finish_join().await?;
+        if let Some(report) = self.follow_provider_change().await? {
+            return Ok(report);
+        }
         if let Some(stop) = self.not_current_here() {
             self.events.push(stop);
             return Ok(ReceiveReport {
@@ -246,9 +256,11 @@ impl App {
         if let Some(chain) = self.state.chain.as_mut() {
             chain.write(&mut read.tx)?;
         }
-        if page.freeze.is_some() {
-            self.events.push(AppEvent::Moved);
+        if let Some(freeze) = &page.freeze {
+            // Nothing on a frozen service's page is processed: its items come again from
+            // the next service (`provider.rs`).
             self.end_page(read).await?;
+            self.note_freeze(freeze).await?;
             return Ok(None);
         }
         let mut stopped = None;
@@ -970,6 +982,7 @@ impl App {
                     return Ok(Step::Pass);
                 };
                 let body = op.body();
+                self.note_list_op(body, &mut read.tx)?;
                 match &body.kind {
                     OpKind::ReceiveKeyPut { record } if body.app_id == Some(me) => {
                         match self.own_registration(
@@ -1005,8 +1018,12 @@ impl App {
                 }
             }
             ItemType::Service => {
-                let Ok(transition) =
-                    ServiceTransition::verify(&item.item, &self.state.meta.service_key, &identity)
+                // Transitions of an earlier generation came with a move, signed by the
+                // service of their generation.
+                let Some(service_key) = self.service_key_of(envelope.generation).await? else {
+                    return Ok(Step::Pass);
+                };
+                let Ok(transition) = ServiceTransition::verify(&item.item, &service_key, &identity)
                 else {
                     return Ok(Step::Pass);
                 };
@@ -1021,10 +1038,9 @@ impl App {
                         self.state.departed.insert(app_id, at);
                         Ok(Step::Pass)
                     }
-                    ServiceTransition::Freeze { .. } => {
-                        self.events.push(AppEvent::Moved);
-                        Ok(Step::Stop)
-                    }
+                    // A frozen account's pages carry the freeze, which `process_page` takes
+                    // before any item; a freeze transition on another page is history: a
+                    // move followed, read again at the next service, or a cancelled one.
                     _ => Ok(Step::Pass),
                 }
             }
@@ -1062,6 +1078,11 @@ impl App {
         let me = self.state.meta.app_id;
         if doc.data_epoch() > held.data_epoch() {
             read.epoch_rose = true;
+        }
+        if doc.generation() != held.generation() {
+            // The last copy of the generation left, for its service key and the uploads of
+            // a recovery (`provider.rs`).
+            self.keep_generation(&held, &mut read.tx)?;
         }
         self.state.own_doc = doc.clone();
         self.events.push(AppEvent::IdentityUpdated {

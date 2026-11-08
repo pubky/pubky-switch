@@ -27,6 +27,8 @@ use pubky_switch_core::receive::KindRules;
 use pubky_switch_core::records::{AppCert, Standing};
 use serde_json::Value;
 
+use super::recovery::{LossActions, ProviderLoss};
+
 /// An opaque member of a protocol's message bodies (Switch wire 1.1): its numbers aren't
 /// checked against the integer range.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -218,6 +220,17 @@ pub trait Protocol: Send + Sync {
 
     /// Entries missed while lagging: as [`Protocol::resend_needed`].
     fn missed(&self, missed: &MissedEntries) -> Vec<LocalWrite>;
+
+    /// A provider loss the app follows (Switch spec 12.6 steps 2 and 4): the protocol queues
+    /// its re-send requests to the counterparties of its unfinished activity, for what their
+    /// inboxes accepted from [`ProviderLoss::accepted_from_ms`] on, and names the
+    /// counterparties whose conversation entries the app adds back. The app commits the
+    /// local writes once, with that step; a crash before that commit calls it again.
+    /// Nothing by default.
+    fn provider_lost(&self, loss: &ProviderLoss) -> LossActions {
+        let _ = loss;
+        LossActions::default()
+    }
 }
 
 /// The protocol's kind rules as the core's recipient checks take them, with the own

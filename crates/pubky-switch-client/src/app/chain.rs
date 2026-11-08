@@ -116,6 +116,13 @@ impl ChainView {
         self.verifier.chain_hash_at(seq)
     }
 
+    /// The app follows a cooperative move or a key change in place (Switch spec 12.5, Switch
+    /// wire 7.4.4): the chain, its hashes and batch IDs go on under the next generation, and
+    /// checkpoints are compared only with those accepted from the next service.
+    pub(crate) fn switch_service(&mut self) {
+        self.verifier.switch_service();
+    }
+
     /// A head from any answer of the own switch: it must agree with the verified chain;
     /// one beyond it waits for the stubs (Switch spec 10.1).
     pub(crate) fn observe_head(&mut self, head: SignedHead) -> Result<(), AppError> {

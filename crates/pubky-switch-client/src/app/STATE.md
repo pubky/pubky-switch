@@ -83,9 +83,35 @@ Deleting the keys on a leave removes `keys`, `naming`, `rk/`, `scope/`, `parked/
   `record.put` and `claim` items from the feed (today passed by `feed.rs` as chain items with
   no app-layer effect), lists collections at join and after a `missed` item, and keeps proofs
   and evidence for uploads. Effects already carry their operations with the cursor move.
-- **Moves, provider loss and recovery:** `AppEvent::Moved` and `AppEvent::ProviderChanged`
-  stop the read today; the provider-change flow follows the newest `identity.json`, updates
-  `meta`, starts a new chain view and cursor, re-registers, and uploads evidence. Reconcile
-  mode (`restore.reconcile`, the chain gap) is where its reconciliation plugs in.
-- **Push:** the push registration under `push`, and a peek that runs the receive checks
-  read-only on a copy of the chain view.
+- **Moves, provider loss and recovery, and push:** in place; their records are below.
+
+## Moves, recovery and push
+
+`provider.rs` follows a cooperative move or a key change in place, and keeps that the app
+isn't current any more; `recovery.rs` follows a provider loss and keeps the evidence for
+uploads; `push.rs` holds the push registration. The peek (`peek.rs`) writes nothing.
+
+| Key | Holds | Sensitive |
+|---|---|---|
+| `mv` | a move in progress: the signed freeze (none for a key change), the generation left, the step, the re-registration batch signed once | |
+| `gens/<generation>` | a generation the app left: its origin and service key, and the last own `identity.json` taken there | |
+| `loss` | a provider loss followed: the step, the old newest head, the cursor's time there, the declaration time, the clocks' offset, the new key's `n`, the batch of the current step, the conversation entries still to add back | |
+| `ev/op/<hash>` | a kept `record.put` or claim entry, with its writer's certificate and its proof when held | |
+| `ev/proof/<hash>` | a kept transition proof | |
+| `lc/contact/<pubky>`, `lc/deny/<pubky>` | the app's copy of the contacts and deny list, from the feed | |
+| `lc/code/<hash>` | an invite code this app registered, from the feed | |
+| `push` | the push setting: relay, device token, the service it is at, the push key, the handle, whether set, a rotation in flight | the device token |
+| `gone` | the app isn't current any more, or its account is gone, and since when | |
+
+- **A move** commits each step: `Seen` (the freeze verified and kept), `Read` (the old feed
+  read to its end, its chain view saved), `Uploaded` (the evidence sent to the next
+  service), `Switched` (`meta`, the cursor's generation, the chain view and the
+  re-registration batch, in one commit), `Registered`; then `mv` goes. Batches signed for the
+  old generation (`pending/effect`, `pending/record`, a pending receive key registration)
+  are dropped at the switch: their entries are read again, and the record and the newest
+  key go in the re-registration.
+- **A loss** starts in one commit, before any call: `meta`, a cursor and chain view from the
+  start of the new sequence, a fresh receive key with its registration batch, the
+  registrations of the old service cleared, `restore.reconcile` on, and `loss`. Each step
+  then commits as done; the protocol's re-send writes commit with their step, once.
+- **`gone`** stops every read; `push` goes with it.

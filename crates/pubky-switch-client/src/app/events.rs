@@ -178,6 +178,72 @@ pub enum AppEvent {
     Left,
     /// The app deleted its keys after leaving.
     KeysDestroyed,
+    /// The app uploaded its newest head and evidence to the next service of a move, or to
+    /// the service of a recovery (Switch spec 12.5 step 3, 12.6 step 3).
+    EvidenceUploaded {
+        /// The heads the service counted.
+        heads: u64,
+        /// The proofs the service kept or checked.
+        proofs: u64,
+    },
+    /// The service refused the app's evidence: an import conflict the signer resolves, or
+    /// another refusal (Switch wire 7.4.14). The app goes on without it.
+    EvidenceRefused {
+        /// The error code of the refusal.
+        code: String,
+    },
+    /// The account's freeze was cancelled: the app stays at its service (Switch spec 12.5
+    /// "Abort").
+    MoveCancelled,
+    /// The app follows the service of this generation now, after a cooperative move or a
+    /// key change in place (Switch spec 12.5).
+    ProviderFollowed {
+        /// The generation followed.
+        generation: u64,
+    },
+    /// The next service shows an older receive key of the app as current: a rollback of its
+    /// registrations, which the app registers again (Switch spec 12.5 step 4).
+    ReceiveKeyRolledBack {
+        /// The `n` the service shows.
+        shown: u64,
+        /// The `n` of the app's current key.
+        current: u64,
+    },
+    /// The next service's admission lists differ from the app's copy (Switch spec 12.5 step
+    /// 4): entries added back, contacts the app never saw added, invite codes withdrawn.
+    ListsDiffer {
+        /// Contacts and deny list entries added back.
+        added: u64,
+        /// Contacts the service holds that the app never saw added; shown, not removed.
+        unverified_contacts: u64,
+        /// Invite codes withdrawn.
+        withdrawn_codes: u64,
+    },
+    /// The identity declared the loss of a generation: the app recovers at the new service
+    /// and stays in reconcile mode until its reconciliation ends it (Switch spec 12.6).
+    ProviderLost {
+        /// The generation lost.
+        lost_generation: u64,
+        /// The generation recovered at.
+        generation: u64,
+    },
+    /// The app finished its steps of a recovery: registered, uploaded, restored admission
+    /// and asked for re-sends (Switch spec 12.6 steps 1 to 4).
+    ProviderRecovered {
+        /// The generation recovered at.
+        generation: u64,
+    },
+    /// The account the app used is gone: the service answers as for an identity it doesn't
+    /// host and the identity publishes no `identity.json` (Switch spec 12.7).
+    AccountGone,
+    /// The app's push registration is set (Switch spec 9 steps 1 to 3).
+    PushRegistered {
+        /// The handles the service keeps.
+        handles: u64,
+    },
+    /// The app's push registration went with the service it was made at, or because the
+    /// app stopped being current; the app registers again at its current service.
+    PushRemoved,
 }
 
 /// Why an entry was stored locally (Switch spec 8.2).
