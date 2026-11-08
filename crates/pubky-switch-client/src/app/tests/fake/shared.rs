@@ -345,6 +345,15 @@ impl Inner {
             answer["head"] = self.head().to_value();
             return (200, answer);
         }
+        // Switch wire 6.4 step 6: an operation naming another generation.
+        let generation = self.tip.generation;
+        if ops.iter().any(|op| op.body().generation != generation) {
+            return bad(
+                ErrorCode::StaleGeneration,
+                "generation",
+                json!({ "generation": generation }),
+            );
+        }
         let Some(writer) = caller else {
             return bad(ErrorCode::PermissionMissing, "apps only", json!({}));
         };
@@ -495,7 +504,21 @@ impl Inner {
                 (OpKind::InviteCodeDelete { code_hash }, _) => {
                     self.shared.invites.remove(code_hash);
                 }
-                (OpKind::AllowPut { pubky, .. }, _) | (OpKind::DenyPut { pubky }, _) => {
+                (OpKind::AllowPut { pubky, kind }, _) => {
+                    self.shared.connect.retain(|(p, _)| p != pubky);
+                    // A scripted `GET /allow` shows the contacts added since.
+                    let id = json!(pubky_id(pubky));
+                    if *kind == AllowKind::Contact
+                        && let Some(contacts) = self
+                            .allow
+                            .as_mut()
+                            .and_then(|allow| allow["contacts"].as_array_mut())
+                        && !contacts.contains(&id)
+                    {
+                        contacts.push(id);
+                    }
+                }
+                (OpKind::DenyPut { pubky }, _) => {
                     self.shared.connect.retain(|(p, _)| p != pubky);
                 }
                 _ => {}

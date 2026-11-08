@@ -90,6 +90,9 @@ impl App {
         Ok(())
     }
 
+    /// The `app.put` batch. It is kept and may be sent again after the cursor moved on: a
+    /// cursor move in it could take the service's cursor back, so it carries none (Switch
+    /// spec 8.2).
     fn record_batch(&self, record: &SignedDoc) -> Result<Batch, AppError> {
         self.sign_ops(
             vec![(
@@ -98,7 +101,7 @@ impl App {
                     record: record.clone(),
                 },
             )],
-            Some(self.state.cursor.seq),
+            None,
         )
     }
 

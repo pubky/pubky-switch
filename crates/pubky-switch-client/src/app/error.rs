@@ -85,6 +85,9 @@ pub enum Refusal {
     Stopped,
     /// The app left its identity (Switch spec 12.3) or was removed from it.
     Left,
+    /// The app isn't current any more, or its account is gone (Switch spec 12.2, 12.7): it
+    /// reads and writes nothing more.
+    Gone,
     /// The approval doesn't pass the app's checks (Switch wire 3.10); the text names the
     /// step.
     Approval(String),
@@ -104,6 +107,7 @@ impl std::fmt::Display for Refusal {
         match self {
             Refusal::Stopped => f.write_str("the app stopped on an alarm"),
             Refusal::Left => f.write_str("the app left its identity or was removed"),
+            Refusal::Gone => f.write_str("the app isn't current any more, or its account is gone"),
             Refusal::Approval(why) => write!(f, "approval refused: {why}"),
             Refusal::NotJoined => f.write_str("no app with this App ID in the store"),
             Refusal::RestoreQuestionOpen => {

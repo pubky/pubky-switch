@@ -224,9 +224,20 @@ impl App {
         let submitted = match result {
             Ok(submitted) => submitted,
             Err(AppError::Switch(error)) => {
-                let mut tx = self.tx()?;
-                tx.delete(&pending_key(id))?;
-                self.commit(tx).await?;
+                // A frozen service's `410 moved` refuses nothing for good: the batch stays
+                // kept, and is carried to the next service at the switch (Switch spec 12.5
+                // step 2).
+                if !matches!(
+                    error,
+                    crate::error::ClientError::Switch {
+                        code: pubky_switch_core::http::ErrorCode::Moved,
+                        ..
+                    }
+                ) {
+                    let mut tx = self.tx()?;
+                    tx.delete(&pending_key(id))?;
+                    self.commit(tx).await?;
+                }
                 return Err(AppError::Switch(error));
             }
             Err(error) => return Err(error),
@@ -330,6 +341,54 @@ impl App {
             claim_key: *claim_key,
             step,
         })
+    }
+}
+
+// -------------------------------------------------------------------------------------
+// Kept batches at a provider change (`provider.rs`, `recovery.rs`)
+
+impl App {
+    /// The batches kept under `opq/`, by ID.
+    pub(crate) async fn kept_batches(&self) -> Result<Vec<([u8; 16], PendingBatch)>, AppError> {
+        self.reader()
+            .scan::<PendingBatch>(PENDING_PREFIX)
+            .await?
+            .into_iter()
+            .map(|(id, pending)| {
+                pubky_switch_core::enc::unb64_array::<16>(&id)
+                    .map(|id| (id, pending))
+                    .map_err(|_| AppError::Store(crate::error::StoreError::Corrupt))
+            })
+            .collect()
+    }
+
+    /// A kept batch the old service applied, though its answer was lost: what it settles
+    /// without its proofs goes into `tx`, and it is no longer kept.
+    pub(crate) async fn settle_kept_batch(
+        &mut self,
+        id: &[u8; 16],
+        pending: &PendingBatch,
+        tx: &mut Tx,
+    ) -> Result<(), AppError> {
+        let batch = Batch::from_body(pending.body.clone())?;
+        for op in batch.ops() {
+            self.settle_op(op, None, pending, tx).await?;
+        }
+        tx.delete(&pending_key(id))
+    }
+
+    /// Keep `pending` under `new_id` in place of the batch kept under `id`; `None` only
+    /// drops it.
+    pub(crate) fn replace_kept_batch(
+        id: &[u8; 16],
+        replacement: Option<(&[u8; 16], &PendingBatch)>,
+        tx: &mut Tx,
+    ) -> Result<(), AppError> {
+        tx.delete(&pending_key(id))?;
+        match replacement {
+            Some((new_id, pending)) => tx.put(&pending_key(new_id), pending),
+            None => Ok(()),
+        }
     }
 }
 

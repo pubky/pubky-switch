@@ -82,10 +82,14 @@ impl App {
     ///
     /// # Errors
     ///
-    /// [`Refusal::Left`] for an app that left; a failed feed read.
+    /// [`Refusal::Left`] for an app that left; [`Refusal::Gone`] for one that isn't current
+    /// any more, or whose account is gone; a failed feed read.
     pub async fn peek(&self) -> Result<PeekReport, AppError> {
         if self.state.leave.is_some() {
             return Err(Refusal::Left.into());
+        }
+        if self.state.gone.is_some() {
+            return Err(Refusal::Gone.into());
         }
         let Some(mut chain) = self.state.chain.clone() else {
             return Err(Refusal::NotNow("the app isn't registered".into()).into());

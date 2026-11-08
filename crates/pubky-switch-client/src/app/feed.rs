@@ -153,7 +153,7 @@ impl App {
         if matches!(self.state.alarm, Some(Alarm::Compromise { .. })) {
             self.leave_on_compromise().await;
         }
-        self.refuse_when_stopped()?;
+        self.refuse_when_halted()?;
         self.finish_join().await?;
         if let Some(report) = self.follow_provider_change().await? {
             return Ok(report);
@@ -211,6 +211,7 @@ impl App {
         }
         if self.state.alarm.is_none() {
             self.delete_retired_keys().await?;
+            self.forget_chain_behind_cursor().await?;
             self.maybe_rotate().await?;
             self.flush_cursor_if_due().await?;
         }
@@ -631,6 +632,16 @@ impl App {
         let result = self.submit(batch).await;
         let sent = match result {
             Ok(_) => Sent::Applied,
+            // A frozen service applies nothing more: the kept effect waits for the switch,
+            // which settles it against the old chain (Switch spec 12.5 step 2).
+            Err(
+                error @ AppError::Switch(ClientError::Switch {
+                    code: ErrorCode::Moved,
+                    ..
+                }),
+            ) => {
+                return Err(error);
+            }
             Err(AppError::Switch(ClientError::Switch { code, current, .. })) => match code {
                 ErrorCode::Conflict => Sent::Conflict(current),
                 ErrorCode::StaleEpoch => Sent::StaleEpoch,
@@ -1260,7 +1271,7 @@ impl App {
 }
 
 /// The processed pair and its time index.
-fn processed_writes(
+pub(crate) fn processed_writes(
     tx: &mut Tx,
     sender: &[u8; 32],
     msg_id: &str,

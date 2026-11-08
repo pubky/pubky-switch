@@ -44,7 +44,7 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
 | `device` | whether the app shares its keys across devices | |
 | `cursor` | the processed position, the cursor the service holds, the deferral, the cursor's time | |
 | `chain` | the chain view's small fields: tip, open batch, pending heads and checkpoint, newest head, the continuity gap, held marks, restore state | |
-| `chain/at/<seq>` | the verified chain hash at a `seq` | |
+| `chain/at/<seq>` | the verified chain hash at a `seq`, from a little behind the cursor on: the hashes behind it are forgotten in steps | |
 | `chain/batch/<id>` | a batch ID in the 30-day window, with its first stub's time | |
 | `proc/<sender>/<msg_id>` | a processed message's hash and time | |
 | `proct/<time>/<sender>/<msg_id>` | the time index for pruning processed pairs | |
@@ -92,15 +92,27 @@ uploads; `push.rs` holds the push registration. The peek (`peek.rs`) writes noth
 - **A move** commits each step: `Seen` (the freeze verified and kept), `Read` (the old feed
   read to its end, its chain view saved), `Uploaded` (the evidence sent to the next
   service), `Switched` (`meta`, the cursor's generation, the chain view and the
-  re-registration batch, in one commit), `Registered`; then `mv` goes. Batches signed for the
-  old generation (`pending/effect`, `pending/record`, a pending receive key registration)
-  are dropped at the switch: their entries are read again, and the record and the newest
-  key go in the re-registration.
+  re-registration batch, in one commit), `Registered`; then `mv` goes. The old feed is read
+  by its pages' `next`, apart from the verified chain position. Of the batches signed for
+  the old generation, `pending/record` and a pending receive key registration go at the
+  switch, since the record and the newest key go in the re-registration. A kept
+  `pending/effect` or `opq/<batch_id>` whose batch ID the old chain holds was applied: its
+  outcome commits at the switch. Otherwise the effect goes, and its entry is read again;
+  a kept `opq/` batch is signed again for the new generation under a new batch ID. A
+  frozen service's `410 moved` keeps them for the switch.
+- **A newer own `identity.json`** that names a later generation, a loss of the generation
+  moved from, or another service than the freeze, supersedes a move or a loss at any step,
+  a stuck one included: after a step fails at a service the app reads its `identity.json`
+  from the Homeserver, gives the change up and follows the newer document.
 - **A loss** starts in one commit, before any call: `meta`, a cursor and chain view from the
   start of the new sequence, a fresh receive key with its registration batch, the
-  registrations of the old service cleared, `restore.reconcile` on, and `loss`. Each step
-  then commits as done; the protocol's re-send writes commit with their step, once.
-- **`gone`** stops every read; `push` goes with it.
+  registrations of the old service cleared, the kept writes judged against the old chain
+  view as at a move (a kept batch holding an `attempt` goes instead of being signed
+  again), `restore.reconcile` on, and `loss`. Each step then commits as done; the
+  protocol's re-send writes commit with their step, once. A registration another device
+  of the app made first is adopted, and the record then goes alone.
+- **`gone`** stops every read; `push` goes with it. It is kept only once the newest verified
+  own `identity.json` removes the app or doesn't list it, or the account is erased.
 
 ## Sending, admission, records and claims
 

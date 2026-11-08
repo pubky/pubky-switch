@@ -96,7 +96,8 @@ impl App {
             &self.state.cert,
             ReceiveKeyBody::new(&self.state.cert, &key),
         )?;
-        let cursor_to = Some(self.state.cursor.seq);
+        // The batch is kept and may be sent again after the cursor moved on: a cursor move
+        // in it could take the service's cursor back, so it carries none (Switch spec 8.2).
         let batch = self.sign_ops(
             vec![(
                 Vec::<Condition>::new(),
@@ -104,7 +105,7 @@ impl App {
                     record: record.signed().clone(),
                 },
             )],
-            cursor_to,
+            None,
         )?;
         let held = HeldKey {
             key: key.clone(),
@@ -171,54 +172,71 @@ impl App {
         held: &HeldKey,
         current: &serde_json::Value,
     ) -> Result<bool, AppError> {
-        let named = current
-            .get("receive_key")
-            .and_then(|value| SignedDoc::from_strict_value(value).ok());
-        let record = match named {
-            Some(doc) => ReceiveKeyRecord::verify(&doc, &self.state.cert).ok(),
-            None => self.own_directory_key().await?,
-        };
-        let Some(record) = record else {
-            return Err(AppError::InvalidData(
-                "Switch wire 6.2: a registration conflict that names no receive key".into(),
-            ));
-        };
+        let record = self.conflict_receive_key(current).await?;
         if record.kid() == held.key.kid {
             self.key_registered(n, None).await?;
             return Ok(true);
         }
-        // Another key holds the place: this one is discarded, never registered.
+        self.registered_elsewhere(n, &record).await?;
+        Ok(false)
+    }
+
+    /// The key a registration's `409 conflict` names in `current.receive_key`, verified
+    /// with the app's certificate; without one, the own entry in the directory (Switch wire
+    /// 6.2).
+    pub(crate) async fn conflict_receive_key(
+        &mut self,
+        current: &serde_json::Value,
+    ) -> Result<ReceiveKeyRecord, AppError> {
+        let named = current
+            .get("receive_key")
+            .and_then(|value| SignedDoc::from_strict_value(value).ok())
+            .and_then(|doc| ReceiveKeyRecord::verify(&doc, &self.state.cert).ok());
+        let record = match named {
+            Some(record) => Some(record),
+            None => self.own_directory_key().await?,
+        };
+        record.ok_or_else(|| {
+            AppError::InvalidData(
+                "Switch wire 6.2: a registration conflict that names no receive key".into(),
+            )
+        })
+    }
+
+    /// Another key holds the place this device's key `n` was registered for (Switch spec
+    /// 3.6): this device discards its own, never registered. A key one of the app's devices
+    /// made is adopted; with keys shared across devices, an unknown one waits for the
+    /// device sync; any other is a compromise: the app stops, leaves at once and returns
+    /// the alarm.
+    pub(crate) async fn registered_elsewhere(
+        &mut self,
+        n: u64,
+        record: &ReceiveKeyRecord,
+    ) -> Result<(), AppError> {
         let mut tx = self.tx()?;
         tx.delete(&key::receive_key(n))?;
         self.state.receive_keys.remove(&n);
         let known = self.state.known_kids.contains_key(&record.kid());
-        if known {
-            self.events.push(AppEvent::RotationLost { n: record.n() });
-            tx.put(
-                &key::registration(record.n()),
-                &Registration {
-                    kid: record.kid(),
-                    seq: None,
-                    at_ms: None,
-                    status: RegStatus::Own,
-                },
-            )?;
-            self.commit(tx).await?;
-            return Ok(false);
-        }
-        if self.state.device.multi_device {
+        if known || self.state.device.multi_device {
             let registration = Registration {
                 kid: record.kid(),
                 seq: None,
                 at_ms: None,
-                status: RegStatus::AwaitingSync,
+                status: if known {
+                    RegStatus::Own
+                } else {
+                    RegStatus::AwaitingSync
+                },
             };
             tx.put(&key::registration(record.n()), &registration)?;
             self.state.registrations.insert(record.n(), registration);
             self.commit(tx).await?;
-            self.events
-                .push(AppEvent::AwaitingDeviceSync { n: record.n() });
-            return Ok(false);
+            self.events.push(if known {
+                AppEvent::RotationLost { n: record.n() }
+            } else {
+                AppEvent::AwaitingDeviceSync { n: record.n() }
+            });
+            return Ok(());
         }
         self.commit(tx).await?;
         let alarm = Alarm::Compromise {
@@ -328,33 +346,12 @@ impl App {
         let Some(current) = self.current_n() else {
             return Ok(());
         };
-        let cursor = self.state.cursor.seq;
-        let mut registered: Vec<(u64, u64)> = self
-            .state
-            .receive_keys
-            .iter()
-            .filter_map(|(n, held)| held.reg_seq.map(|seq| (*n, seq)))
-            .collect();
-        registered.extend(
-            self.state
-                .registrations
-                .iter()
-                .filter_map(|(n, r)| r.seq.map(|seq| (*n, seq))),
-        );
         let due: Vec<u64> = self
             .state
             .receive_keys
             .keys()
             .copied()
-            .filter(|n| *n != current)
-            .filter(|n| {
-                registered
-                    .iter()
-                    .filter(|(later, _)| later > n)
-                    .map(|(_, seq)| *seq)
-                    .min()
-                    .is_some_and(|next| cursor >= next)
-            })
+            .filter(|n| *n != current && self.successor_passed(*n))
             .collect();
         if due.is_empty() {
             return Ok(());
@@ -371,6 +368,27 @@ impl App {
             count: u64::try_from(due.len()).unwrap_or(u64::MAX),
         });
         Ok(())
+    }
+
+    /// Whether the cursor has passed the `seq` of the registration of a key after `n`: key
+    /// `n` is retired and goes, for good (Switch spec 3.6).
+    fn successor_passed(&self, n: u64) -> bool {
+        let cursor = self.state.cursor.seq;
+        let held = self
+            .state
+            .receive_keys
+            .iter()
+            .filter_map(|(k, held)| held.reg_seq.map(|seq| (*k, seq)));
+        let seen = self
+            .state
+            .registrations
+            .iter()
+            .filter_map(|(k, r)| r.seq.map(|seq| (*k, seq)));
+        held.chain(seen)
+            .filter(|(later, _)| *later > n)
+            .map(|(_, seq)| seq)
+            .min()
+            .is_some_and(|next| cursor >= next)
     }
 
     /// After a restore, before reading (Switch spec 12.4 step 1): read the own current
@@ -553,7 +571,9 @@ impl App {
         }
         for shared in keys.receive_keys {
             let n = shared.key.n;
-            if self.state.receive_keys.contains_key(&n) {
+            // A retired key this device deleted once the cursor passed its successor's
+            // registration doesn't come back from another device (Switch spec 3.6).
+            if self.state.receive_keys.contains_key(&n) || self.successor_passed(n) {
                 continue;
             }
             if ReceiveKeyRecord::verify(&shared.record, &self.state.cert).is_err() {
@@ -607,8 +627,19 @@ impl App {
         Ok(())
     }
 
-    /// Refuse a call that would read or write while the app is stopped or gone.
+    /// Refuse a call that would read or write while the app is stopped or gone: `gone`
+    /// stops every read (`STATE.md`).
     pub(crate) fn refuse_when_stopped(&self) -> Result<(), AppError> {
+        self.refuse_when_halted()?;
+        if self.state.gone.is_some() {
+            return Err(Refusal::Gone.into());
+        }
+        Ok(())
+    }
+
+    /// Refuse a call while the app is stopped on an alarm or left. A gone app passes: the
+    /// read and the provider follow report it as stopped, without asking the service.
+    pub(crate) fn refuse_when_halted(&self) -> Result<(), AppError> {
         if self.state.alarm.is_some() {
             return Err(Refusal::Stopped.into());
         }
