@@ -24,8 +24,10 @@ pubky-switch = { path = "crates/pubky-switch" }
 axum = "0.8"
 clap = { version = "4", features = ["derive", "env"] }
 ed25519-dalek = "3"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 getrandom = "0.3"
 hex = "0.4"
+ipnet = { version = "2", features = ["serde"] }
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
 parking_lot = "0.12"

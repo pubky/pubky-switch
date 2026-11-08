@@ -23,6 +23,7 @@ clap.workspace = true
 ed25519-dalek.workspace = true
 getrandom.workspace = true
 hex.workspace = true
+ipnet.workspace = true
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
 parking_lot.workspace = true
@@ -37,6 +38,7 @@ tracing-subscriber.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+futures-util.workspace = true
 pubky-switch = { path = ".", features = ["test-util"] }
 tempfile.workspace = true
 tower.workspace = true

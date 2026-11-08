@@ -17,8 +17,12 @@ pub mod fixed {
     /// Entries per batch (Switch wire 6.4, 9.2 `max_batch`).
     pub const MAX_BATCH: u64 = 8;
     /// Envelopes of the one hand-over an account holds (Switch wire 7.4.17, 9.2
-    /// `max_handover_parts`).
+    /// `max_handover_parts`). The only place this number is set; keep it beside
+    /// [`HANDOVER_BODY_CAP`], which must hold this many envelopes.
     pub const MAX_HANDOVER_PARTS: u64 = 64;
+    /// The body cap of `PUT /handover`: [`MAX_HANDOVER_PARTS`] envelopes in base64url, with
+    /// their JSON (Switch wire 7.1). The only place this number is set.
+    pub const HANDOVER_BODY_CAP: u64 = 6 * 1024 * 1024;
     /// Bytes of one export chunk (Switch wire 10.3, 9.2 `max_chunk_bytes`).
     pub const MAX_CHUNK_BYTES: u64 = 1_048_576;
     /// Default items per feed page (Switch wire 7.4.4).
@@ -36,6 +40,12 @@ pub mod fixed {
     /// The highest app limit `identity.json` may carry (Switch wire 9.2 `app_limit`).
     pub const APP_LIMIT_MAX: u32 = 255;
 }
+
+// The hand-over body cap holds its largest hand-over: every part a full envelope in
+// base64url without padding.
+const _: () = assert!(
+    fixed::HANDOVER_BODY_CAP >= fixed::MAX_HANDOVER_PARTS * (fixed::MAX_ENVELOPE * 4).div_ceil(3)
+);
 
 /// Every configurable limit, by its Switch wire 9.2 name.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
