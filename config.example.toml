@@ -1,0 +1,112 @@
+# Pubky Switch configuration.
+#
+# Every setting below is its default: leave out whatever you don't change. Unknown
+# settings are refused. `pubky-switch check-config --config <file>` checks a file and
+# prints it with every default written out. See docs/configuration.md.
+
+[admin]
+# The operator listener: GET /health/live, GET /health/ready and GET /metrics. It isn't
+# authenticated, so keep it on a private network.
+listen = "127.0.0.1:9090"
+
+[log]
+# "json" (one object per line) or "text". The PUBKY_SWITCH_LOG environment variable
+# overrides the filter.
+format = "json"
+filter = "info,sqlx::postgres::notice=warn"
+
+# Limits, quotas and rates, by their Switch wire 9.2 names. The defaults are the wire
+# format's, for one identity on a shared service; an operator may raise them.
+[limits]
+app_limit = 32                         # at most 255
+quota_bytes = 67108864                 # inbox quota
+record_quota_bytes = 67108864          # storage quota for shared record values
+entry_overhead_bytes = 256
+max_record_keys = 100000
+max_claims = 1000000
+max_attempts_per_claim = 64
+open_attempts_per_app = 1000
+claim_share_percent = 25
+max_claim_age_ms = 34560000000         # 400 days; may be raised, never lowered
+max_contacts = 100000
+max_conversations = 100000
+max_deny = 100000
+max_invite_codes = 1000
+max_connect_pending = 1000
+max_retired_keys = 8
+max_peers = 10000
+max_enrollments = 16
+max_flags = 1000
+batch_proofs_ms = 2592000000           # 30 days; may be raised, never lowered
+ops_per_min = 3000
+control_per_min = 60
+cursor_hold_ms = 2592000000            # 30 days
+max_divergent_uploads = 8
+max_import_bytes = 4294967296
+sender_per_min = 120
+sender_app_per_min = 120
+invite_reads_per_min = 30
+auth_failures_per_source_per_min = 60
+stranger_per_min = 60
+sender_share_percent = 25
+max_invite_uses = 100
+identity_reads_per_min = 6000
+identity_reads_per_source_per_min = 60
+list_page = 1000
+# checkpoint_behind = 10000            # off unless set
+checkpoint_at_head = false
+mark_lagging = true
+notify_per_min = 20
+connect_per_min = 5
+flag_after = 3
+
+# Trusted time (Switch wire 7.3).
+[trusted_time]
+# Without trusted time, refuse what depends on time. Turn off only for development.
+required = true
+drift_ppm = 100
+max_sample_age_ms = 86400000           # 24 hours
+max_uncertainty_ms = 300000            # 5 minutes
+max_disagreement_ms = 300000           # 5 minutes
+sample_interval_ms = 900000            # 15 minutes; at most one hour
+retry_interval_ms = 60000
+
+# Roughtime (RFC 10049): the servers trusted time is sampled from. Each answer's
+# signatures are checked against the server's public key; a sample needs `min_agreeing`
+# checked answers whose time intervals overlap. Review the list before production.
+[trusted_time.roughtime]
+min_agreeing = 2
+timeout_ms = 2000
+attempts = 2                           # per server per sample, at most 5
+alert_after_ms = 3600000               # alert when a server fails this long (1 hour)
+
+[[trusted_time.roughtime.servers]]
+name = "int08h"
+address = "roughtime.int08h.com:2002"
+public_key = "AW5uAoTSTDfG5NfY1bTh08GUnOqlRb+HVhbJ3ODJvsE="
+
+[[trusted_time.roughtime.servers]]
+name = "roughtime.se"
+address = "roughtime.se:2002"
+public_key = "S3AzfZJ5CjSdkJ21ZJGbxqdYP/SoE8fXKY0+aicsehI="
+
+[[trusted_time.roughtime.servers]]
+name = "txryan"
+address = "time.txryan.com:2002"
+public_key = "iBVjxg/1j7y1+kQUTBYdTabxCppesU/07D4PMDJk2WA="
+
+# The database: PostgreSQL. Commits must be durable: the service refuses a database with
+# fsync off or synchronous_commit off.
+[database]
+# Prefer the PUBKY_SWITCH_DATABASE_URL environment variable, which overrides this, so the
+# password stays out of the file. Required to run the service.
+# url = "postgres://switch@localhost/switch"
+max_connections = 16
+acquire_timeout_ms = 5000
+lock_timeout_ms = 10000                # a request waits this long for its account's lock
+migrate_on_start = true
+
+# The key store: service keys, their marks and the erasure ledger. Put it on a disk that
+# database backups don't cover, and back it up on its own. Required to run the service.
+[keys]
+# path = "/var/lib/pubky-switch/keys"

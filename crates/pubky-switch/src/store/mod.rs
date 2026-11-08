@@ -1,0 +1,402 @@
+//! Durable storage in PostgreSQL.
+//!
+//! **One account at a time.** Every request to an account runs in one database transaction
+//! that first locks the account's row ([`Store::begin`]), so one account's operations are
+//! serialized while other accounts proceed in parallel (Switch spec 6.5). What a request
+//! changes commits all at once or not at all: a batch that fails, or a process that dies
+//! before the commit, leaves no trace.
+//!
+//! **Durable, then answered** (Switch wire 7.3 step 10). A request's answer carries a `seq`,
+//! a transition proof or a signed head only once [`AccountTxn::commit`] has returned, which
+//! it does once PostgreSQL has made the commit durable. The service refuses to use a
+//! database where commits may not be durable: `fsync` must be on and `synchronous_commit`
+//! must not be `off`. With synchronous replicas, `synchronous_commit` should be `on` or
+//! `remote_apply`, so a commit is durable on every replica that could be promoted; an
+//! asynchronous replica must never be promoted to serve writes (Switch spec 6.5).
+//!
+//! **The key's mark** (Switch spec 6.5) lives in the key store, apart from the database and
+//! its backups. [`AccountTxn::commit_marked`] moves it once the state is durable, and
+//! [`AccountTxn::mark_check`] finds a state behind it, as a restored backup would leave.
+
+mod account;
+#[cfg(any(test, feature = "test-util"))]
+pub mod testing;
+
+use std::{str::FromStr, time::Duration};
+
+use serde::{Deserialize, Serialize};
+use sqlx::{
+    Connection, Executor, PgConnection, PgPool, Row,
+    postgres::{PgConnectOptions, PgPoolOptions},
+};
+
+pub use account::{AccountHead, AccountTxn, CommitError, Committed, NewAccount};
+
+use crate::admin::{CheckFuture, ReadinessCheck};
+
+/// The environment variable that overrides `database.url`.
+pub const DATABASE_URL_ENV: &str = "PUBKY_SWITCH_DATABASE_URL";
+
+/// The schema migrations, applied in order.
+pub static MIGRATIONS: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+
+/// The database settings.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DatabaseConfig {
+    /// The PostgreSQL connection URL. `PUBKY_SWITCH_DATABASE_URL` overrides it; prefer the
+    /// variable, so the password stays out of the file.
+    pub url: Option<String>,
+    /// Most connections in the pool.
+    pub max_connections: u32,
+    /// How long a request waits for a free connection.
+    pub acquire_timeout_ms: u64,
+    /// How long a request waits for its account's lock before it gives up with
+    /// `503 unavailable`.
+    pub lock_timeout_ms: u64,
+    /// Apply pending schema migrations at start.
+    pub migrate_on_start: bool,
+}
+
+impl Default for DatabaseConfig {
+    fn default() -> Self {
+        Self {
+            url: None,
+            max_connections: 16,
+            acquire_timeout_ms: 5_000,
+            lock_timeout_ms: 10_000,
+            migrate_on_start: true,
+        }
+    }
+}
+
+impl std::fmt::Debug for DatabaseConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DatabaseConfig")
+            .field("url", &self.url.as_ref().map(|_| "[redacted]"))
+            .field("max_connections", &self.max_connections)
+            .field("acquire_timeout_ms", &self.acquire_timeout_ms)
+            .field("lock_timeout_ms", &self.lock_timeout_ms)
+            .field("migrate_on_start", &self.migrate_on_start)
+            .finish()
+    }
+}
+
+/// A database setting that breaks a rule.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("database.{name}: {reason}")]
+pub struct DatabaseConfigError {
+    /// The setting's name.
+    pub name: &'static str,
+    /// What is wrong with it.
+    pub reason: &'static str,
+}
+
+impl DatabaseConfig {
+    /// Check the settings.
+    pub fn validate(&self) -> Result<(), DatabaseConfigError> {
+        let fail = |name, reason| Err(DatabaseConfigError { name, reason });
+        if self.max_connections == 0 {
+            return fail("max_connections", "must be at least 1");
+        }
+        if self.acquire_timeout_ms == 0 {
+            return fail("acquire_timeout_ms", "must be at least 1");
+        }
+        if self.lock_timeout_ms == 0 {
+            return fail("lock_timeout_ms", "must be at least 1");
+        }
+        if let Some(url) = &self.url
+            && (!(url.starts_with("postgres://") || url.starts_with("postgresql://"))
+                || PgConnectOptions::from_str(url).is_err())
+        {
+            return fail("url", "not a PostgreSQL connection URL");
+        }
+        Ok(())
+    }
+
+    /// The URL to connect to: `PUBKY_SWITCH_DATABASE_URL`, or `url`.
+    pub fn effective_url(&self) -> Option<String> {
+        std::env::var(DATABASE_URL_ENV)
+            .ok()
+            .filter(|url| !url.is_empty())
+            .or_else(|| self.url.clone())
+    }
+}
+
+/// What the store can fail at.
+#[derive(Debug, thiserror::Error)]
+pub enum StoreError {
+    /// The database failed, or a statement was refused.
+    #[error("database: {0}")]
+    Database(#[from] sqlx::Error),
+    /// A schema migration failed.
+    #[error("migration: {0}")]
+    Migrate(#[from] sqlx::migrate::MigrateError),
+    /// The database may acknowledge a commit before it is durable.
+    #[error("the database doesn't make commits durable: {0}")]
+    NotDurable(String),
+    /// The account's lock wasn't free within `lock_timeout_ms`.
+    #[error("the account is busy")]
+    LockTimeout,
+    /// A value doesn't fit what the database stores, or the reverse.
+    #[error("value out of range: {0}")]
+    OutOfRange(&'static str),
+    /// A stored value breaks an invariant.
+    #[error("corrupt account state: {0}")]
+    Corrupt(&'static str),
+    /// No database URL is configured.
+    #[error("no database URL: set database.url or {DATABASE_URL_ENV}")]
+    NoUrl,
+}
+
+/// PostgreSQL's code for a lock that wasn't free within `lock_timeout`.
+const LOCK_NOT_AVAILABLE: &str = "55P03";
+
+impl StoreError {
+    /// Map a database error, telling a lock timeout apart.
+    pub(crate) fn from_db(error: sqlx::Error) -> Self {
+        match &error {
+            sqlx::Error::Database(db) if db.code().as_deref() == Some(LOCK_NOT_AVAILABLE) => {
+                Self::LockTimeout
+            }
+            _ => Self::Database(error),
+        }
+    }
+}
+
+/// The durability settings of a database connection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DurabilitySettings {
+    /// `fsync`.
+    pub fsync: String,
+    /// `synchronous_commit`.
+    pub synchronous_commit: String,
+    /// `synchronous_standby_names`.
+    pub synchronous_standby_names: String,
+}
+
+impl DurabilitySettings {
+    /// Read the settings in force on `conn`.
+    pub async fn read(conn: &mut PgConnection) -> Result<Self, sqlx::Error> {
+        let row = sqlx::query(
+            "SELECT current_setting('fsync'), current_setting('synchronous_commit'), \
+             current_setting('synchronous_standby_names')",
+        )
+        .fetch_one(conn)
+        .await?;
+        Ok(Self {
+            fsync: row.try_get(0)?,
+            synchronous_commit: row.try_get(1)?,
+            synchronous_standby_names: row.try_get(2)?,
+        })
+    }
+
+    /// Refuse settings under which a commit can return before it is durable.
+    pub fn check(&self) -> Result<(), String> {
+        if self.fsync != "on" {
+            return Err(format!("fsync is {}", self.fsync));
+        }
+        if self.synchronous_commit == "off" {
+            return Err("synchronous_commit is off".into());
+        }
+        Ok(())
+    }
+
+    /// Settings that are durable on this server but may not be on a synchronous replica:
+    /// `local` or `remote_write` with synchronous standbys configured.
+    pub fn replica_warning(&self) -> Option<String> {
+        let weak = matches!(self.synchronous_commit.as_str(), "local" | "remote_write");
+        (weak && !self.synchronous_standby_names.is_empty()).then(|| {
+            format!(
+                "synchronous_commit is {} with synchronous standbys: a commit may not be \
+                 durable on a replica that could be promoted",
+                self.synchronous_commit
+            )
+        })
+    }
+}
+
+/// The service's database.
+#[derive(Clone, Debug)]
+pub struct Store {
+    pool: PgPool,
+    lock_timeout_ms: u64,
+}
+
+impl Store {
+    /// Connect with `config`. Every connection is checked for durable commits before use.
+    pub async fn connect(config: &DatabaseConfig) -> Result<Self, StoreError> {
+        let url = config.effective_url().ok_or(StoreError::NoUrl)?;
+        let options = PgConnectOptions::from_str(&url)?;
+        Self::connect_with(options, config).await
+    }
+
+    /// Connect to `options` with the pool settings of `config`.
+    pub async fn connect_with(
+        options: PgConnectOptions,
+        config: &DatabaseConfig,
+    ) -> Result<Self, StoreError> {
+        // Check once on a connection of its own, so a database that would acknowledge
+        // commits before they are durable is refused at start with the reason. The pool
+        // checks every later connection too, in case the settings change.
+        let mut first = PgConnection::connect_with(&options).await?;
+        let settings = DurabilitySettings::read(&mut first).await?;
+        settings.check().map_err(StoreError::NotDurable)?;
+        if let Some(warning) = settings.replica_warning() {
+            tracing::warn!(%warning, "database durability");
+        }
+        first.close().await?;
+        let pool = PgPoolOptions::new()
+            .max_connections(config.max_connections)
+            .acquire_timeout(Duration::from_millis(config.acquire_timeout_ms))
+            .after_connect(|conn, _meta| {
+                Box::pin(async move {
+                    let settings = DurabilitySettings::read(conn).await?;
+                    settings.check().map_err(|reason| {
+                        sqlx::Error::Configuration(StoreError::NotDurable(reason).into())
+                    })
+                })
+            })
+            .connect_with(options)
+            .await?;
+        Ok(Self {
+            pool,
+            lock_timeout_ms: config.lock_timeout_ms,
+        })
+    }
+
+    /// Apply pending schema migrations. Safe to run from several processes at once.
+    pub async fn migrate(&self) -> Result<(), StoreError> {
+        MIGRATIONS.run(&self.pool).await?;
+        Ok(())
+    }
+
+    /// Create an account. Returns `false`, changing nothing, when one exists for the
+    /// identity already.
+    pub async fn create_account(&self, account: &NewAccount) -> Result<bool, StoreError> {
+        account::create(&self.pool, account).await
+    }
+
+    /// Start a request to account `id`: a transaction holding the account's lock until it
+    /// commits or is dropped. `None` when there is no such account. Waits at most
+    /// `lock_timeout_ms` for the lock ([`StoreError::LockTimeout`]).
+    pub async fn begin(&self, id: &str) -> Result<Option<AccountTxn>, StoreError> {
+        let mut tx = self.pool.begin().await.map_err(StoreError::from_db)?;
+        // `SET LOCAL` takes no bind parameters; the value is a number we format.
+        tx.execute(format!("SET LOCAL lock_timeout = {}", self.lock_timeout_ms).as_str())
+            .await
+            .map_err(StoreError::from_db)?;
+        AccountTxn::lock(tx, id).await
+    }
+
+    /// The connection pool, for the store's own modules.
+    pub(crate) fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
+    /// Close every connection.
+    pub async fn close(&self) {
+        self.pool.close().await;
+    }
+}
+
+/// The readiness check of the database: a round trip on a pooled connection.
+#[derive(Clone, Debug)]
+pub struct StoreReadiness(pub Store);
+
+impl ReadinessCheck for StoreReadiness {
+    fn name(&self) -> &str {
+        "database"
+    }
+
+    fn check(&self) -> CheckFuture<'_> {
+        Box::pin(async move {
+            let mut conn = self
+                .0
+                .pool()
+                .acquire()
+                .await
+                .map_err(|_| "no database connection".to_string())?;
+            conn.ping()
+                .await
+                .map_err(|_| "the database doesn't answer".to_string())
+        })
+    }
+}
+
+/// Convert a `u64` to the `BIGINT` the database stores.
+pub(crate) fn to_db(value: u64, what: &'static str) -> Result<i64, StoreError> {
+    i64::try_from(value).map_err(|_| StoreError::OutOfRange(what))
+}
+
+/// Convert a stored `BIGINT` back to a `u64`.
+pub(crate) fn from_db(value: i64, what: &'static str) -> Result<u64, StoreError> {
+    u64::try_from(value).map_err(|_| StoreError::Corrupt(what))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn settings(fsync: &str, commit: &str, standbys: &str) -> DurabilitySettings {
+        DurabilitySettings {
+            fsync: fsync.into(),
+            synchronous_commit: commit.into(),
+            synchronous_standby_names: standbys.into(),
+        }
+    }
+
+    #[test]
+    fn test_durability_settings_check() {
+        assert_eq!(settings("on", "on", "").check(), Ok(()));
+        assert_eq!(settings("on", "remote_apply", "s1").check(), Ok(()));
+        assert_eq!(settings("on", "local", "").check(), Ok(()));
+        assert!(settings("off", "on", "").check().is_err());
+        assert!(settings("on", "off", "").check().is_err());
+    }
+
+    #[test]
+    fn test_durability_settings_replica_warning() {
+        assert_eq!(settings("on", "on", "s1").replica_warning(), None);
+        assert_eq!(settings("on", "remote_write", "").replica_warning(), None);
+        assert!(
+            settings("on", "remote_write", "s1")
+                .replica_warning()
+                .is_some()
+        );
+        assert!(
+            settings("on", "local", "ANY 1 (s1)")
+                .replica_warning()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn test_database_config_validation() {
+        assert_eq!(DatabaseConfig::default().validate(), Ok(()));
+        let bad_url = DatabaseConfig {
+            url: Some("mysql://x".into()),
+            ..DatabaseConfig::default()
+        };
+        assert_eq!(bad_url.validate().expect_err("url").name, "url");
+        let no_pool = DatabaseConfig {
+            max_connections: 0,
+            ..DatabaseConfig::default()
+        };
+        assert_eq!(
+            no_pool.validate().expect_err("pool").name,
+            "max_connections"
+        );
+    }
+
+    #[test]
+    fn test_database_config_debug_redacts_url() {
+        let config = DatabaseConfig {
+            url: Some("postgres://switch:secret@db/switch".into()),
+            ..DatabaseConfig::default()
+        };
+        let text = format!("{config:?}");
+        assert!(!text.contains("secret"), "{text}");
+        assert!(text.contains("[redacted]"));
+    }
+}
