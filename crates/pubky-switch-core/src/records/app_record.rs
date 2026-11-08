@@ -11,15 +11,19 @@ use crate::error::{Result, invalid};
 use crate::json::parse_json;
 use crate::keys::AppKeys;
 use crate::labels;
+use crate::scopes::is_name;
 use crate::sig::SignedDoc;
 
 /// The app record's `kind`.
 pub const RECORD_KIND: &str = "pubky-switch.app";
 
-/// The members of an app record (Switch wire 3.2), as its app writes them.
+/// The members a protocol adds to an app record, by protocol name (Switch wire 3.2).
 ///
-/// `capabilities` and `public_endpoints` are a protocol's members; the switch reads them only
-/// to know whether the record has public endpoints, which then need an `expires_at`.
+/// The switch checks only their form: each name has the syntax of a scope name and each
+/// value is an object. It never reads inside a member.
+pub type ProtocolMembers = BTreeMap<String, serde_json::Map<String, Value>>;
+
+/// The members of an app record (Switch wire 3.2), as its app writes them.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppRecordBody {
     /// The app's identity.
@@ -36,27 +40,25 @@ pub struct AppRecordBody {
     /// The message kinds the app takes, in its protocol's names. It may narrow the
     /// certificate's scopes, never widen them (Switch spec 3.4).
     pub accepts: Vec<String>,
-    /// The protocol's capabilities object, opaque to the switch.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub capabilities: Option<serde_json::Map<String, Value>>,
-    /// The public endpoints: an identifier to an opaque payload.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub public_endpoints: Option<BTreeMap<String, String>>,
+    /// What the app's protocols add to its record, one member per protocol, each defined by
+    /// its protocol. Written as `{}` when they add nothing; a missing or `null` member reads
+    /// as empty, and a protocol's `null` value as no member.
+    #[serde(default, deserialize_with = "protocols::deserialize")]
+    pub protocols: ProtocolMembers,
     /// A display label.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
     /// When the record was made; the later `updated_at` wins between two records.
     #[serde(with = "fmt::time_ms")]
     pub updated_at: u64,
-    /// When the record expires: required with public endpoints, `null` otherwise. Always
-    /// written.
+    /// When the record expires, chosen by the app; `None` means it doesn't. Always written.
+    /// A protocol may require one, which its own readers check.
     #[serde(with = "fmt::opt_time_ms")]
     pub expires_at: Option<u64>,
 }
 
 impl AppRecordBody {
-    /// A record for the app `cert` certifies, with no capabilities, no public endpoints and
-    /// no label.
+    /// A record for the app `cert` certifies, with no protocol members and no label.
     pub fn new(cert: &AppCert, accepts: Vec<String>, updated_at: u64) -> Self {
         Self {
             identity: cert.identity(),
@@ -64,24 +66,21 @@ impl AppRecordBody {
             signing_key: cert.signing_key(),
             cert: cert.signed().clone(),
             accepts,
-            capabilities: None,
-            public_endpoints: None,
+            protocols: ProtocolMembers::new(),
             label: None,
             updated_at,
             expires_at: None,
         }
     }
 
-    /// Whether the record has public endpoints.
-    pub fn has_public_endpoints(&self) -> bool {
-        self.public_endpoints
-            .as_ref()
-            .is_some_and(|e| !e.is_empty())
+    /// The member a protocol added to the record, if any. The switch never reads inside it.
+    pub fn protocol(&self, name: &str) -> Option<&serde_json::Map<String, Value>> {
+        self.protocols.get(name)
     }
 
     /// Check the record for the identity the reader expects (Switch wire 3.2): `identity`,
     /// the certificate for that identity, the same `app_id` and `signing_key` as the
-    /// certificate, and an `expires_at` when it has public endpoints. Returns the certificate.
+    /// certificate, and the form of `protocols`. Returns the certificate.
     ///
     /// # Errors
     ///
@@ -98,8 +97,8 @@ impl AppRecordBody {
         if cert.signing_key() != self.signing_key {
             return invalid("Switch wire 3.2: signing_key isn't the certificate's");
         }
-        if self.has_public_endpoints() && self.expires_at.is_none() {
-            return invalid("Switch wire 3.2: a record with public endpoints needs expires_at");
+        if self.protocols.keys().any(|name| !is_name(name)) {
+            return invalid("Switch wire 3.2: a protocol member's name isn't a scope name");
         }
         Ok(cert)
     }
@@ -111,6 +110,41 @@ impl AppRecordBody {
     /// [`crate::Error::Invalid`] if it can't be written.
     pub fn to_json(&self) -> Result<Vec<u8>> {
         encode(RECORD_KIND, self)
+    }
+}
+
+/// The form check of `protocols` as it is read (Switch wire 3.2 "Protocols' members").
+mod protocols {
+    use serde::de::Error as _;
+    use serde::{Deserialize, Deserializer};
+    use serde_json::Value;
+
+    use super::ProtocolMembers;
+
+    /// Read `protocols`: an object, or `null` for none, whose values are objects, or `null`
+    /// for no member. Names are checked with the rest of the record.
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<ProtocolMembers, D::Error> {
+        let Some(members) = Option::<serde_json::Map<String, Value>>::deserialize(deserializer)?
+        else {
+            return Ok(ProtocolMembers::new());
+        };
+        let mut out = ProtocolMembers::new();
+        for (name, value) in members {
+            match value {
+                Value::Null => {}
+                Value::Object(member) => {
+                    out.insert(name, member);
+                }
+                _ => {
+                    return Err(D::Error::custom(
+                        "Switch wire 3.2: a protocol member isn't an object",
+                    ));
+                }
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -373,17 +407,56 @@ mod tests {
     }
 
     #[test]
-    fn test_app_record_with_public_endpoints_needs_expires_at() {
+    fn test_app_record_protocols_are_checked_for_form_only() {
+        // Written as `{}` when the protocols add nothing.
+        let text = String::from_utf8(record(10, "a").signed().body_bytes().unwrap()).unwrap();
+        assert!(text.contains(r#""protocols":{}"#), "{text}");
+        // A protocol's member is any object, read back as it was written.
         let mut v = value();
-        v["public_endpoints"] = serde_json::json!({"id-1": "payload"});
-        let error = AppRecord::verify(&resign(&v), &identity().public()).unwrap_err();
-        assert!(error.to_string().contains("expires_at"), "{error}");
-        v["expires_at"] = serde_json::json!("1970-01-31T00:00:00.000Z");
-        AppRecord::verify(&resign(&v), &identity().public()).unwrap();
-        // `expires_at` is always written: a record without it is refused.
+        v["protocols"] = serde_json::json!({"sample": {"any": [1, {"deep": "x"}]}, "other-1": {}});
+        let read = AppRecord::verify(&resign(&v), &identity().public()).unwrap();
+        assert_eq!(read.body().protocol("sample").unwrap()["any"][0], 1);
+        assert!(read.body().protocol("other-1").is_some());
+        // A missing or null `protocols`, and a null member, read as no member.
         let mut missing = value();
-        missing.as_object_mut().unwrap().remove("expires_at");
-        assert!(AppRecord::verify(&resign(&missing), &identity().public()).is_err());
+        missing.as_object_mut().unwrap().remove("protocols");
+        assert!(
+            AppRecord::verify(&resign(&missing), &identity().public())
+                .unwrap()
+                .body()
+                .protocols
+                .is_empty()
+        );
+        let mut nulls = value();
+        nulls["protocols"] = serde_json::json!({"sample": null});
+        assert!(
+            AppRecord::verify(&resign(&nulls), &identity().public())
+                .unwrap()
+                .body()
+                .protocol("sample")
+                .is_none()
+        );
+        // The form check: an object of objects under scope-name syntax.
+        for bad in [
+            serde_json::json!([]),
+            serde_json::json!("x"),
+            serde_json::json!({"sample": []}),
+            serde_json::json!({"sample": "x"}),
+            serde_json::json!({"Sample": {}}),
+            serde_json::json!({"": {}}),
+            serde_json::json!({"a.b": {}}),
+        ] {
+            let mut v = value();
+            v["protocols"] = bad.clone();
+            assert!(
+                AppRecord::verify(&resign(&v), &identity().public()).is_err(),
+                "{bad}"
+            );
+        }
+        // The switch requires no `expires_at`, but it is always written.
+        let mut no_expiry = value();
+        no_expiry.as_object_mut().unwrap().remove("expires_at");
+        assert!(AppRecord::verify(&resign(&no_expiry), &identity().public()).is_err());
     }
 
     #[test]

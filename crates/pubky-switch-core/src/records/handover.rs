@@ -3,7 +3,7 @@
 //! Both carry the signer's records, [`SignerRecords`]: the identity key, the newest
 //! `identity.json` a service accepted, the App IDs revoked for good, the certificates that
 //! document references, the switch's limits and the key bundle parts stored for its apps.
-//! Their JSON is split into 1 to 64 parts, each sealed in its own envelope:
+//! Their JSON is split into 1 to 128 parts, each sealed in its own envelope:
 //!
 //! - a hand-over to the new signer's certified bundle key, signed over `lp(label, identity,
 //!   the new signer's App ID, u32_be(n), envelope_1, ..., envelope_n)`;
@@ -34,7 +34,7 @@ use crate::sig::{self, SignedDoc};
 pub const HANDOVER_KIND: &str = "pubky-switch.signer_handover";
 
 /// The most envelopes a hand-over or a backup holds (Switch wire 3.12).
-pub const MAX_HANDOVER_ENVELOPES: usize = 64;
+pub const MAX_HANDOVER_ENVELOPES: usize = 128;
 
 /// The most `bundle_parts` entries (Switch wire 3.12).
 pub const MAX_BUNDLE_PARTS: usize = 2048;
@@ -463,15 +463,15 @@ impl std::fmt::Debug for SealedParts {
     }
 }
 
-/// 1 to 64 envelopes (Switch wire 3.12 check 1).
+/// 1 to 128 envelopes (Switch wire 3.12 check 1).
 fn check_count(count: usize) -> Result<()> {
     if !(1..=MAX_HANDOVER_ENVELOPES).contains(&count) {
-        return invalid("Switch wire 3.12 check 1: 1 to 64 envelopes");
+        return invalid("Switch wire 3.12 check 1: 1 to 128 envelopes");
     }
     Ok(())
 }
 
-/// `u32_be(n)`; at most 64 after [`check_count`].
+/// `u32_be(n)`; at most 128 after [`check_count`].
 fn count_bytes(count: usize) -> [u8; 4] {
     u32::try_from(count).unwrap_or(u32::MAX).to_be_bytes()
 }
@@ -574,19 +574,19 @@ impl SignerHandover {
         self.0.sig
     }
 
-    /// Check 1's count and signature: 1 to 64 envelopes, and `sig` verifies with the
+    /// Check 1's count and signature: 1 to 128 envelopes, and `sig` verifies with the
     /// identity key over `target`, their number and their bytes, in order.
     ///
     /// # Errors
     ///
-    /// [`Error::Invalid`] for a count outside 1 to 64, [`Error::Signature`] for a signature
+    /// [`Error::Invalid`] for a count outside 1 to 128, [`Error::Signature`] for a signature
     /// that doesn't verify.
     pub fn verify(&self, identity: &[u8; 32], target: &[u8; 16]) -> Result<()> {
         self.0.verify(identity, Some(target))
     }
 
     /// The switch's checks when the signer stores the hand-over for `target`, a current app,
-    /// without opening anything (Switch wire 7.4.17): 1 to 64 envelopes, each passing the
+    /// without opening anything (Switch wire 7.4.17): 1 to 128 envelopes, each passing the
     /// inbox's checks (Switch wire 4.4) with one recipient, the kid of `target`'s certified
     /// bundle key, and the signature over `target`, the count and the bytes.
     ///
@@ -824,12 +824,12 @@ impl SignerBackup {
         self.0.sig
     }
 
-    /// The count and the signature: 1 to 64 envelopes, and `sig` verifies with the identity
+    /// The count and the signature: 1 to 128 envelopes, and `sig` verifies with the identity
     /// key over their number and their bytes, in order.
     ///
     /// # Errors
     ///
-    /// [`Error::Invalid`] for a count outside 1 to 64, [`Error::Signature`] for a signature
+    /// [`Error::Invalid`] for a count outside 1 to 128, [`Error::Signature`] for a signature
     /// that doesn't verify.
     pub fn verify(&self, identity: &[u8; 32]) -> Result<()> {
         self.0.verify(identity, None)
@@ -933,6 +933,15 @@ impl DeliveryKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_handover_count_takes_one_to_128_envelopes() {
+        assert!(check_count(1).is_ok());
+        assert!(check_count(MAX_HANDOVER_ENVELOPES).is_ok());
+        assert_eq!(MAX_HANDOVER_ENVELOPES, 128);
+        assert!(check_count(0).is_err());
+        assert!(check_count(MAX_HANDOVER_ENVELOPES + 1).is_err());
+    }
     use crate::records::fixtures::{app, cert, cert_body_for, identity, other_app};
     use crate::records::{IdentityPolicy, Inbox, ListedApp, RemovedApp, RenewedCert};
 

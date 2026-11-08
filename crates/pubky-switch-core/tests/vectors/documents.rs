@@ -159,6 +159,7 @@ fn test_vectors_documents() {
     check_permission_rejections(&keys, &v, doc("wallet certificate"));
     check_scope_rule(&keys, &v, doc("wallet certificate"));
     check_app_record_conflict(&keys, &v, &docs);
+    check_app_record_protocols(&keys, &v);
     check_approval(&keys, &v, &docs, &certs);
     // Bob's documents verify for bob only.
     assert!(AppCert::verify(doc("shop certificate"), &alice).is_err());
@@ -235,7 +236,7 @@ fn check_certificates(
 }
 
 /// The app records (Switch wire 3.2): read, signed again byte for byte, carrying their app's
-/// certificate, with `expires_at` exactly when there are public endpoints.
+/// certificate, with their protocols' members read as written.
 fn check_app_records(keys: &Keys, docs: &HashMap<String, Doc>, certs: &HashMap<String, AppCert>) {
     for (name, d) in docs {
         if st(&d.entry, "label") != labels::sig::APP_RECORD {
@@ -261,21 +262,29 @@ fn check_app_records(keys: &Keys, docs: &HashMap<String, Doc>, certs: &HashMap<S
         for kind in &record.body().accepts {
             assert!(record.accepts(kind));
         }
-        if record.body().has_public_endpoints() {
+        // The protocols' members are read as written, opaque to the switch; `protocols` is
+        // always written, `{}` when they add nothing.
+        let written = body_value(&d.signed);
+        assert!(
+            written["protocols"].is_object(),
+            "{name}: protocols written"
+        );
+        for (protocol, member) in written["protocols"].as_object().unwrap() {
             assert_eq!(
-                record.expires_at(),
-                Some(record.updated_at() + 30 * DAY_MS),
-                "{name}"
+                record
+                    .body()
+                    .protocol(protocol)
+                    .map(|m| Value::Object(m.clone()))
+                    .as_ref(),
+                Some(member),
+                "{name}: {protocol}"
             );
-            // Without `expires_at`, a record with public endpoints is invalid.
-            let mut without = body_value(&d.signed);
-            without["expires_at"] = Value::Null;
-            let forged = resign(&app.signing_secret, labels::sig::APP_RECORD, &without);
-            let error = AppRecord::verify(&forged, &app.identity).unwrap_err();
-            assert!(error.to_string().contains("expires_at"), "{name}: {error}");
-        } else {
-            assert_eq!(record.expires_at(), None, "{name}");
         }
+        // The switch requires no `expires_at`, but it is always written.
+        assert!(
+            written.get("expires_at").is_some(),
+            "{name}: expires_at written"
+        );
         // A record verifies only for its own identity.
         let other = keys
             .identities
@@ -1145,4 +1154,59 @@ fn check_approval(
     let mut future = ap.clone();
     future["future"] = json!({"x": 1});
     read(&serde_json::to_vec(&future).unwrap(), &wallet.bundle_secret).unwrap();
+}
+
+/// `app_record_protocols` (Switch wire 3.2, "Protocols' members"): the wallet's record with a
+/// member added, signed again. Every reader refuses the `refused` ones by the form check
+/// alone, and takes the `accepted` ones, ignoring a protocol it doesn't know.
+fn check_app_record_protocols(keys: &Keys, v: &Value) {
+    let cases = &v["app_record_protocols"];
+    let wallet = keys.app("wallet");
+    let mut accepted = 0;
+    for c in arr(cases, "accepted") {
+        let signed: SignedDoc = serde_json::from_value(c["signed"].clone()).unwrap();
+        assert_eq!(
+            signed.body_bytes().unwrap(),
+            st(c, "body").as_bytes(),
+            "{}",
+            st(c, "name")
+        );
+        let record = AppRecord::verify(&signed, &wallet.identity)
+            .unwrap_or_else(|e| panic!("{}: {e}", st(c, "name")));
+        let written = body_value(&signed);
+        assert_eq!(written["protocols"], c["protocols"]);
+        for (protocol, member) in c["protocols"].as_object().unwrap() {
+            // A null member is no member; any other is read as written.
+            let read = record
+                .body()
+                .protocol(protocol)
+                .map(|m| Value::Object(m.clone()));
+            if member.is_null() {
+                assert!(read.is_none(), "{}: a null member", st(c, "name"));
+            } else {
+                assert_eq!(read.as_ref(), Some(member), "{}", st(c, "name"));
+            }
+        }
+        accepted += 1;
+    }
+    assert_eq!(accepted, 2);
+    let refused = arr(cases, "refused");
+    assert!(!refused.is_empty());
+    for c in refused {
+        let signed: SignedDoc = serde_json::from_value(c["signed"].clone()).unwrap();
+        assert_eq!(body_value(&signed)["protocols"], c["protocols"]);
+        // The signature holds; only the form check refuses it.
+        assert!(
+            signed
+                .verify(&wallet.signing_public, labels::sig::APP_RECORD, &[])
+                .is_ok()
+        );
+        let error = AppRecord::verify(&signed, &wallet.identity)
+            .expect_err(&format!("{}: accepted", st(c, "name")));
+        assert!(
+            matches!(error, pubky_switch_core::Error::Invalid(_)),
+            "{}: {error}",
+            st(c, "name")
+        );
+    }
 }

@@ -438,7 +438,7 @@ pub fn body_cap(method: &str, path: &str) -> Option<usize> {
         ("PUT", ["identity"] | ["peers"]) => 256 << 10,
         ("PUT", ["import", "chunks", _]) => 1 << 20,
         ("POST", ["recovery", "upload"]) => 16 << 20,
-        ("PUT", ["handover"]) => 6 << 20,
+        ("PUT", ["handover"]) => 12 << 20,
         ("POST", ["freeze"])
         | ("POST", ["unfreeze"])
         | ("POST", ["import", "activate"])
@@ -763,6 +763,8 @@ mod tests {
             Some(65_536)
         );
         assert_eq!(body_cap("GET", "/v1/id/feed"), Some(0));
+        // 128 envelopes in base64url (Switch wire 3.12).
+        assert_eq!(body_cap("PUT", "/v1/id/handover"), Some(12 << 20));
         assert_eq!(body_cap("POST", "/v1/id/apps/a/keys"), Some(16 << 10));
         assert_eq!(body_cap("PATCH", "/v1/id/ops"), None);
         assert!(frozen_refuses("POST", "/v1/id/ops"));
