@@ -20,6 +20,8 @@
 //!   (`peer/<pubky>`, from `known_version`), and, after an own delivery that removes an app
 //!   or closes a renewal, to the switches the app wrote to in the last 30 days.
 
+use std::collections::HashMap;
+
 use pubky_switch_core::enc::{b64, pubky_id, serde_b64, zbase32_encode};
 use pubky_switch_core::envelope::Recipient;
 use pubky_switch_core::http::ErrorCode;
@@ -52,6 +54,15 @@ fn dir_key(pubky: &[u8; 32]) -> String {
 
 fn peer_key(pubky: &[u8; 32]) -> String {
     format!("{PEER_PREFIX}{}", pubky_id(pubky))
+}
+
+/// Write what the app keeps of `pubky`'s switch into `tx`.
+pub(crate) fn put_peer(
+    tx: &mut super::state::Tx,
+    pubky: &[u8; 32],
+    peer: &PeerSwitch,
+) -> Result<(), AppError> {
+    tx.put(&peer_key(pubky), peer)
 }
 
 fn highest_n_key(pubky: &[u8; 32], app_id: &[u8; 16]) -> String {
@@ -96,12 +107,17 @@ pub(crate) struct PeerSwitch {
 }
 
 /// `peers_doc`: the own `identity.json` the deliveries of Switch spec 12.2 step 5 were last
-/// judged against: its version, removed apps and closed renewals.
+/// judged against: its version, removed apps and closed renewals, and the counterparties
+/// whose switches are still owed the delivery.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct PeersDoc {
     version: u64,
     removed: Vec<String>,
     closed: Vec<String>,
+    /// The Pubky IDs of the counterparties still owed the delivery, tried again at each
+    /// call until it goes or they stop being recent.
+    #[serde(default)]
+    owed: Vec<String>,
 }
 
 /// One recipient app of a message.
@@ -280,6 +296,11 @@ impl App {
             let client = self.peer_client(pubky, doc)?;
             client.directory(invite_code).await?
         };
+        // Apps whose entry didn't verify are left out of the directory, and the others used
+        // (Switch spec 8.1).
+        for app_id in &directory.skipped {
+            self.unreachable(pubky, *app_id);
+        }
         let mut newest = doc.clone();
         if own {
             if directory.identity.compare(doc) == VersionOrder::Newer {
@@ -411,9 +432,28 @@ impl App {
         let own = *pubky == self.state.meta.identity;
         let mut routes = Vec::new();
         let mut tx = self.tx()?;
+        let mut floors = HashMap::new();
+        // Each app is listed once (Switch wire 7.4.10): one listed twice can't be judged,
+        // and goes unreachable.
+        let mut listed: HashMap<[u8; 16], usize> = HashMap::new();
+        for app in &directory.apps {
+            let count = listed.entry(app.app_id).or_insert(0);
+            *count = count.saturating_add(1);
+        }
         for app in &directory.apps {
             if own && app.app_id == self.state.meta.app_id {
                 continue;
+            }
+            match listed.get_mut(&app.app_id) {
+                Some(count) if *count > 1 => {
+                    // Reported once, every copy skipped.
+                    if *count != usize::MAX {
+                        *count = usize::MAX;
+                        self.unreachable(pubky, app.app_id);
+                    }
+                    continue;
+                }
+                _ => {}
             }
             let Ok(record) = AppRecord::verify(&app.record, pubky) else {
                 self.unreachable(pubky, app.app_id);
@@ -439,7 +479,7 @@ impl App {
             }
             let checked = match &app.receive_key {
                 Some(signed) => {
-                    self.check_receive_key(pubky, &record, signed, &mut tx)
+                    self.check_receive_key(pubky, &record, signed, &mut floors, &mut tx)
                         .await?
                 }
                 None => None,
@@ -467,11 +507,16 @@ impl App {
     /// record's key, its identity and App ID, its kid derived from a key not of low order
     /// (the core's [`ReceiveKeyRecord::verify`]), and an `n` not below the highest seen for
     /// the app, which then moves up.
+    ///
+    /// `floors` holds the highest `n` taken so far in this answer, ahead of `tx`'s commit,
+    /// so a second record of the same app in one answer is checked against the first: the
+    /// floor only goes up (Switch spec 4.4).
     async fn check_receive_key(
         &mut self,
         pubky: &[u8; 32],
         record: &AppRecord,
         signed: &SignedDoc,
+        floors: &mut HashMap<String, u64>,
         tx: &mut super::state::Tx,
     ) -> Result<Option<ReceiveKeyRecord>, AppError> {
         let Ok(key) = ReceiveKeyRecord::verify(signed, record.cert()) else {
@@ -481,13 +526,18 @@ impl App {
             return Ok(None);
         }
         let slot = highest_n_key(pubky, &record.cert().app_id());
-        let highest: u64 = self.reader().get(&slot).await?.unwrap_or(0);
+        let highest: u64 = match floors.get(&slot) {
+            Some(highest) => *highest,
+            None => self.reader().get(&slot).await?.unwrap_or(0),
+        };
         if key.n() < highest {
+            floors.insert(slot, highest);
             return Ok(None);
         }
         if key.n() > highest {
             tx.put(&slot, &key.n())?;
         }
+        floors.insert(slot, key.n());
         Ok(Some(key))
     }
 
@@ -504,6 +554,7 @@ impl App {
             return Ok(());
         };
         let mut tx = self.tx()?;
+        let mut floors = HashMap::new();
         for entry in array(current, "receive_keys") {
             let (Some(app_id), Some(signed)) =
                 (app_id_of(entry, "app_id"), doc_of(entry, "record"))
@@ -520,7 +571,7 @@ impl App {
                 continue;
             };
             if self
-                .check_receive_key(pubky, &record, &signed, &mut tx)
+                .check_receive_key(pubky, &record, &signed, &mut floors, &mut tx)
                 .await?
                 .is_some()
                 && let Some(app) = cached.apps.get_mut(index)
@@ -565,7 +616,7 @@ impl App {
                     continue;
                 }
                 if self
-                    .check_receive_key(pubky, &record, &receive_key, &mut tx)
+                    .check_receive_key(pubky, &record, &receive_key, &mut floors, &mut tx)
                     .await?
                     .is_some()
                 {
@@ -612,14 +663,6 @@ impl App {
             return Ok(());
         }
         peer.known_version = known;
-        let mut tx = self.tx()?;
-        tx.put(&peer_key(pubky), &peer)?;
-        self.commit(tx).await
-    }
-
-    pub(crate) async fn note_sent(&mut self, pubky: &[u8; 32]) -> Result<(), AppError> {
-        let mut peer = self.peer_switch(pubky).await?;
-        peer.last_sent_ms = Some(self.now());
         let mut tx = self.tx()?;
         tx.put(&peer_key(pubky), &peer)?;
         self.commit(tx).await
@@ -689,63 +732,77 @@ impl App {
 
     /// After an own `identity.json` that removes an app or closes a renewal, deliver it to
     /// the switches the app wrote to in the last 30 days whose copy is older, by the
-    /// `known_version` they last answered (Switch spec 12.2 step 5, 3.2). Each failure is
-    /// tried again at the next call.
+    /// `known_version` they last answered (Switch spec 12.2 step 5, 3.2). Every switch owed
+    /// is tried; the ones that fail stay owed, each on its own, and are tried again at the
+    /// next call, so one unreachable switch holds up no other.
+    ///
+    /// # Errors
+    ///
+    /// An alarm or a store failure; a switch's failure only keeps it owed.
     pub(crate) async fn deliver_to_recent_peers(&mut self) -> Result<(), AppError> {
         let own = self.state.own_doc.clone();
-        let judged: PeersDoc = self.reader().get(PEERS_DOC).await?.unwrap_or_default();
-        if own.version() <= judged.version {
-            return Ok(());
-        }
-        let removed: Vec<String> = own
-            .body()
-            .removed
-            .iter()
-            .map(|r| zbase32_encode(&r.app_id))
-            .collect();
-        let closed: Vec<String> = own
-            .body()
-            .renewed
-            .iter()
-            .filter(|r| r.until.is_some())
-            .map(|r| b64(&r.cert))
-            .collect();
-        // Without an earlier judgement, any removal or closed renewal counts as new.
-        let owed = removed.iter().any(|r| !judged.removed.contains(r))
-            || closed.iter().any(|c| !judged.closed.contains(c));
-        if owed {
-            let now = self.now();
-            let peers = self.reader().scan::<PeerSwitch>(PEER_PREFIX).await?;
-            for (rest, peer) in peers {
-                let recent = peer
-                    .last_sent_ms
-                    .is_some_and(|at| now.saturating_sub(at) < PEER_DELIVERY_MS);
-                if !recent || peer.known_version.is_some_and(|v| v >= own.version()) {
-                    continue;
-                }
-                let Ok(pubky) = pubky_switch_core::enc::pubky_key(&rest) else {
-                    continue;
-                };
-                // A switch that can't be reached now gets it at a later call: the judged
-                // version stays behind until every delivery went.
-                if self
-                    .deliver_own_identity(&pubky, None, false)
-                    .await
-                    .is_err()
-                {
-                    return Ok(());
+        let mut judged: PeersDoc = self.reader().get(PEERS_DOC).await?.unwrap_or_default();
+        let now = self.now();
+        let recent = |peer: &PeerSwitch| {
+            peer.last_sent_ms
+                .is_some_and(|at| now.saturating_sub(at) < PEER_DELIVERY_MS)
+        };
+        if own.version() > judged.version {
+            let removed: Vec<String> = own
+                .body()
+                .removed
+                .iter()
+                .map(|r| zbase32_encode(&r.app_id))
+                .collect();
+            let closed: Vec<String> = own
+                .body()
+                .renewed
+                .iter()
+                .filter(|r| r.until.is_some())
+                .map(|r| b64(&r.cert))
+                .collect();
+            // Without an earlier judgement, any removal or closed renewal counts as new.
+            let owed_now = removed.iter().any(|r| !judged.removed.contains(r))
+                || closed.iter().any(|c| !judged.closed.contains(c));
+            let mut owed = std::mem::take(&mut judged.owed);
+            if owed_now {
+                for (rest, peer) in self.reader().scan::<PeerSwitch>(PEER_PREFIX).await? {
+                    if recent(&peer)
+                        && peer.known_version.is_none_or(|v| v < own.version())
+                        && !owed.contains(&rest)
+                    {
+                        owed.push(rest);
+                    }
                 }
             }
-        }
-        let mut tx = self.tx()?;
-        tx.put(
-            PEERS_DOC,
-            &PeersDoc {
+            judged = PeersDoc {
                 version: own.version(),
                 removed,
                 closed,
-            },
-        )?;
+                owed,
+            };
+        } else if judged.owed.is_empty() {
+            return Ok(());
+        }
+        let mut still = Vec::new();
+        for rest in std::mem::take(&mut judged.owed) {
+            let Ok(pubky) = pubky_switch_core::enc::pubky_key(&rest) else {
+                continue;
+            };
+            let peer = self.peer_switch(&pubky).await?;
+            if !recent(&peer) {
+                continue;
+            }
+            match self.deliver_own_identity(&pubky, None, false).await {
+                Ok(()) => {}
+                Err(error @ (AppError::Alarm(_) | AppError::Store(_))) => return Err(error),
+                // A switch that can't be reached now gets it at a later call.
+                Err(_) => still.push(rest),
+            }
+        }
+        judged.owed = still;
+        let mut tx = self.tx()?;
+        tx.put(PEERS_DOC, &judged)?;
         self.commit(tx).await
     }
 }

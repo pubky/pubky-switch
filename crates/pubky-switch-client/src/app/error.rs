@@ -4,7 +4,7 @@
 //! No text quotes a body, a message, a key or a document: each names the rule or the
 //! member that failed.
 
-use pubky_switch_core::http::ErrorCode;
+use pubky_switch_core::http::{ErrorCode, Retry};
 
 use crate::error::{BatchError, ClientError, StoreError, TransportError};
 
@@ -153,6 +153,32 @@ impl AppError {
     }
 }
 
+/// Whether the switch refused these exact bytes for good, so that sending them again can't
+/// pass (Switch spec 6.4): the Retry column says "No", or allows the call only once it is
+/// built again (after re-reading, with the key bundle, signed again or sealed again). Every
+/// other failure may pass with the same bytes later: `429`, `503`, `401 stale_timestamp`
+/// (the request is signed again, the body isn't), `409 identity_needed`, `410 moved`, a
+/// transport failure, or an answer whose signature didn't verify or that didn't read, which
+/// may not be the service's (Switch wire 2.1, 7.1).
+pub(crate) fn refused_for_good(error: &AppError) -> Option<ErrorCode> {
+    let AppError::Switch(ClientError::Switch { code, .. }) = error else {
+        return None;
+    };
+    match code.retry() {
+        Retry::No
+        | Retry::AfterReread
+        | Retry::AfterKeyBundle
+        | Retry::AfterResigning
+        | Retry::AfterResealing => Some(*code),
+        Retry::WithNewTimestamp
+        | Retry::AfterDeliveringIdentity
+        | Retry::AtNextService
+        | Retry::AfterRetryAfter
+        | Retry::WhenLimitFrees
+        | Retry::Yes => None,
+    }
+}
+
 impl From<ClientError> for AppError {
     fn from(error: ClientError) -> Self {
         match error {
@@ -212,6 +238,50 @@ mod tests {
         assert_eq!(unpinned.code(), None);
         let chain: AppError = ClientError::Chain(ChainError::Proof("x".into())).into();
         assert!(matches!(chain, AppError::Switch(ClientError::Chain(_))));
+    }
+
+    fn answer(code: ErrorCode) -> AppError {
+        AppError::Switch(ClientError::Switch {
+            status: code.status(),
+            code,
+            message: String::new(),
+            current: serde_json::Value::Null,
+            known_version: None,
+            retry_after: None,
+        })
+    }
+
+    #[test]
+    fn test_refused_for_good_keeps_what_may_pass_unchanged() {
+        for code in [
+            ErrorCode::RateLimited,
+            ErrorCode::QuotaExceeded,
+            ErrorCode::Unavailable,
+            ErrorCode::Staged,
+            ErrorCode::StaleTimestamp,
+            ErrorCode::IdentityNeeded,
+            ErrorCode::Moved,
+        ] {
+            assert_eq!(refused_for_good(&answer(code)), None, "{code}");
+        }
+        for code in [
+            ErrorCode::BadRequest,
+            ErrorCode::PermissionMissing,
+            ErrorCode::NotCurrent,
+            ErrorCode::Conflict,
+            ErrorCode::StaleEpoch,
+            ErrorCode::StaleGeneration,
+            ErrorCode::TooLarge,
+        ] {
+            assert_eq!(refused_for_good(&answer(code)), Some(code), "{code}");
+        }
+        for error in [
+            AppError::Switch(ClientError::BadServiceSignature { status: 502 }),
+            AppError::Switch(ClientError::InvalidResponse("x".into())),
+            AppError::Transport(TransportError::Timeout),
+        ] {
+            assert_eq!(refused_for_good(&error), None, "{error:?}");
+        }
     }
 
     #[test]

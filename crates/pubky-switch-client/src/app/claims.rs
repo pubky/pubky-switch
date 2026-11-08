@@ -387,34 +387,49 @@ impl App {
                 "Switch wire 6.5: a claim entry answered without its proof".into(),
             )
         })?;
-        if let EntryKind::Attempt { deadline, .. } = op.entry.kind {
-            // A proof stamping the attempt at or after its deadline is misbehaviour (Switch
-            // wire 6.8 "Deadline").
-            if deadline.is_some_and(|d| proof.envelope().server_time >= d) {
-                return Err(self
-                    .raise(Alarm::Rollback {
-                        reason: "Switch wire 6.8: an attempt stamped at or after its deadline"
-                            .into(),
-                    })
-                    .await);
-            }
-            let me = self.state.meta.app_id;
-            let generation = self.state.own_doc.generation();
-            match check_attempt_proof(&proof, &op.entry, &me, generation) {
-                Ok(view) => return Ok(ClaimWritten { view, proof }),
-                Err(error) => {
-                    let reason = error.to_string();
-                    let step = proof.body().step.unwrap_or_default();
-                    let failed = ClaimOp::failed(op.entry.claim_key, step, op.entry.attempt_id);
-                    let _ = self.submit_batch(OpBatch::new().op(failed.kind())).await;
-                    return Err(AppError::InvalidData(format!(
-                        "the attempt's proof shows another state; written failed: {reason}"
-                    )));
-                }
-            }
+        if let EntryKind::Attempt { .. } = op.entry.kind {
+            return match self.check_own_attempt(&op.entry, &proof).await? {
+                Ok(view) => Ok(ClaimWritten { view, proof }),
+                Err(reason) => Err(AppError::InvalidData(format!(
+                    "the attempt's proof shows another state; written failed: {reason}"
+                ))),
+            };
         }
         let view = ClaimView::from_value(&proof.body().state)?;
         Ok(ClaimWritten { view, proof })
+    }
+
+    /// The checks of the proof of an own attempt the switch applied (Switch wire 6.5
+    /// "Binding", 6.8 "Deadline"): a proof stamping it at or after its deadline is a
+    /// rollback; one that doesn't show the app's own open attempt, of the generation its
+    /// `identity.json` names, has the attempt written `failed`, and `Err` names why.
+    pub(crate) async fn check_own_attempt(
+        &mut self,
+        entry: &ClaimEntry,
+        proof: &TransitionProof,
+    ) -> Result<Result<ClaimView, String>, AppError> {
+        if let EntryKind::Attempt { deadline, .. } = entry.kind
+            && deadline.is_some_and(|d| proof.envelope().server_time >= d)
+        {
+            return Err(self
+                .raise(Alarm::Rollback {
+                    reason: "Switch wire 6.8: an attempt stamped at or after its deadline".into(),
+                })
+                .await);
+        }
+        let me = self.state.meta.app_id;
+        let generation = self.state.own_doc.generation();
+        match check_attempt_proof(proof, entry, &me, generation) {
+            Ok(view) => Ok(Ok(view)),
+            Err(error) => {
+                let step = proof.body().step.unwrap_or_default();
+                let failed = ClaimOp::failed(entry.claim_key, step, entry.attempt_id);
+                // Best effort: the attempt is refused to the protocol either way, and an
+                // open attempt nobody carries out ends orphaned (Switch spec 10.2).
+                let _ = self.submit_new(OpBatch::new().op(failed.kind())).await;
+                Ok(Err(error.to_string()))
+            }
+        }
     }
 
     /// Read a claim (`GET /claims/{claim_key}`, Switch wire 7.4.8) and check it: each entry
@@ -483,14 +498,21 @@ impl App {
         Ok(Some(read))
     }
 
-    /// The checks of a claim answer; `Err` names the contradiction.
+    /// The checks of a claim answer; `Err` names the contradiction (Switch wire 7.4.8).
+    ///
+    /// Each proof is checked with the service key of its own generation, from the own
+    /// `identity.json` and the generations the app followed: after a move or a key change
+    /// the entries carry earlier services' proofs. A proof of the current generation that
+    /// doesn't verify contradicts the signed answer. One of an earlier generation whose key
+    /// the app doesn't know, or that doesn't verify with it, can't be checked: it is skipped,
+    /// never an alarm on its own.
     async fn check_claim_answer(
         &mut self,
         claim_key: &[u8; 32],
         answer: &ClaimAnswer,
     ) -> Result<Result<ClaimRead, String>, AppError> {
         let identity = self.state.meta.identity;
-        let service_key = self.state.meta.service_key;
+        let generation = self.state.meta.generation;
         if answer.claim.claim_key != *claim_key {
             return Ok(Err("Switch wire 7.4.8: a claim of another key".into()));
         }
@@ -511,16 +533,28 @@ impl App {
                     "Switch wire 7.4.8: an entry of another claim or step".into()
                 ));
             }
-            let Ok(proof) = TransitionProof::verify(&item.proof, &service_key, &identity) else {
-                return Ok(Err("Switch wire 7.4.8: a proof that doesn't verify".into()));
+            let Ok(peeked) = TransitionProof::peek(&item.proof) else {
+                return Ok(Err("Switch wire 7.4.8: a proof that doesn't read".into()));
             };
-            if proof.check_binds(&op).is_err()
-                || proof.body().step != item.step.checked_add(1)
-                || proof.envelope().seq != item.seq
-            {
-                return Ok(Err(
-                    "Switch wire 7.4.8: a proof that doesn't name its entry".into(),
-                ));
+            let of = peeked.envelope().generation;
+            let key = self.service_key_of(of).await?;
+            let verified =
+                key.and_then(|key| TransitionProof::verify(&item.proof, &key, &identity).ok());
+            match &verified {
+                Some(proof) => {
+                    if proof.check_binds(&op).is_err()
+                        || proof.body().step != item.step.checked_add(1)
+                        || (of == generation && proof.envelope().seq != item.seq)
+                    {
+                        return Ok(Err(
+                            "Switch wire 7.4.8: a proof that doesn't name its entry".into(),
+                        ));
+                    }
+                }
+                None if of == generation => {
+                    return Ok(Err("Switch wire 7.4.8: a proof that doesn't verify".into()));
+                }
+                None => {}
             }
             if let Some(writer) = op.body().app_id
                 && let Some(cert) = self.cert_of(&writer).await?
@@ -537,7 +571,7 @@ impl App {
                 seq: item.seq,
                 writer: op.body().app_id,
                 entry,
-                at_ms: proof.envelope().server_time,
+                at_ms: verified.as_ref().unwrap_or(&peeked).envelope().server_time,
             });
         }
         if let Some(next) = next
@@ -813,9 +847,13 @@ impl App {
         let Some(signed) = &item.proof else {
             return Ok(());
         };
+        // Checked with the service key of the item's own generation: after a move or a key
+        // change the feed carries earlier services' items (Switch wire 7.4.8).
         let identity = self.state.meta.identity;
-        let Ok(proof) = TransitionProof::verify(signed, &self.state.meta.service_key, &identity)
-        else {
+        let Some(service_key) = self.service_key_of(envelope.generation).await? else {
+            return Ok(());
+        };
+        let Ok(proof) = TransitionProof::verify(signed, &service_key, &identity) else {
             return Ok(());
         };
         if proof.check_binds(&op).is_err()

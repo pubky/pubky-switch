@@ -12,19 +12,23 @@
 //! - a claim entry's proof and view are kept as evidence (Switch spec 6.3, 10.2);
 //! - allowlist, deny list and invite code changes update what the app keeps of them.
 //!
-//! A batch the switch refuses is dropped: it was not applied, and the caller decides what to
-//! write instead. A batch whose answer didn't come back stays kept, and the next call that
-//! writes sends it again, the same bytes, so the service answers it as a retry (Switch wire
-//! 6.4 step 5).
+//! A batch the switch refuses for good is dropped: it was not applied, and the caller decides
+//! what to write instead; one sent again from an earlier call is reported as
+//! [`AppEvent::BatchRefused`]. A batch whose answer didn't come back, or may pass unchanged
+//! later (`429`, `503`, `401 stale_timestamp`, an answer that doesn't verify), stays kept,
+//! and the next call that writes sends it again, the same bytes, so the service answers it
+//! as a retry (Switch spec 6.4; Switch wire 2.1, 6.4 step 5).
 
 use pubky_switch_core::chain::TransitionProof;
-use pubky_switch_core::claims::{ClaimType, ClaimView};
+use pubky_switch_core::claims::{ClaimType, ClaimView, EntryKind};
 use pubky_switch_core::enc::{b64, serde_b64_vec};
 use pubky_switch_core::ops::{Condition, MAX_BATCH_ENTRIES, OpKind, RecordVersion, SignedOp};
 use serde::{Deserialize, Serialize};
 
 use super::claims::ObligationDeadline;
-use super::error::Refusal;
+use super::error::{Refusal, refused_for_good};
+use super::events::AppEvent;
+use super::recovery::LossStep;
 use super::state::{Tx, key};
 use super::{App, AppError};
 use crate::client::{Batch, Submitted};
@@ -150,30 +154,41 @@ impl std::fmt::Debug for PendingBatch {
 impl App {
     /// Sign `batch` once, keep it, send it, and commit what its answer settles (module
     /// docs). The app's deferred cursor move rides along when there is room for it (Switch
-    /// spec 8.2). A batch kept from an earlier call is sent first.
+    /// spec 8.2). The batches kept from earlier calls are sent first.
     ///
     /// # Errors
     ///
     /// [`Refusal::Usage`] for an empty batch or one over 8 entries; [`Refusal::Stopped`] or
-    /// [`Refusal::Left`]; an `attempt` while the app may not attempt ([`App::may_attempt`]);
-    /// the switch's refusal, such as `409 conflict` with its `current`, after which nothing
-    /// is kept; a transport failure, after which the batch is kept and sent again by the next
-    /// call that writes.
+    /// [`Refusal::Left`]; [`Refusal::NotNow`] while a provider loss is followed and the
+    /// app's evidence isn't uploaded yet (Switch spec 12.6 step 3); an `attempt` while the
+    /// app may not attempt ([`App::may_attempt`]); the switch's refusal for good, such as
+    /// `409 conflict` with its `current`, after which nothing is kept; any other failure
+    /// (the network, `429`, `503`, an answer that doesn't verify), after which the batch is
+    /// kept and sent again, the same bytes, by the next call that writes. A batch kept from
+    /// an earlier call that still can't be sent fails the call the same way, before the new
+    /// batch is signed.
     pub async fn submit_batch(&mut self, batch: OpBatch) -> Result<Submitted, AppError> {
         self.ready_local().await?;
         self.refuse_when_stopped()?;
+        self.refuse_before_upload().await?;
         self.resume_batches().await?;
-        if batch.ops.is_empty() || batch.ops.len() > MAX_BATCH_ENTRIES {
-            return Err(
-                Refusal::Usage("Switch wire 6.4: a batch has 1 to 8 entries".into()).into(),
-            );
-        }
         let attempts = batch
             .ops
             .iter()
             .any(|(_, kind)| matches!(kind, OpKind::Claim(c) if c.kind == ClaimType::Attempt));
         if attempts {
             self.may_attempt(false)?;
+        }
+        self.submit_new(batch).await
+    }
+
+    /// Sign `batch` once, keep it, send it and commit its outcome, without sending the
+    /// batches kept from earlier calls first.
+    pub(crate) async fn submit_new(&mut self, batch: OpBatch) -> Result<Submitted, AppError> {
+        if batch.ops.is_empty() || batch.ops.len() > MAX_BATCH_ENTRIES {
+            return Err(
+                Refusal::Usage("Switch wire 6.4: a batch has 1 to 8 entries".into()).into(),
+            );
         }
         let carry = (batch.ops.len() < MAX_BATCH_ENTRIES)
             .then_some(self.state.cursor.seq)
@@ -197,39 +212,98 @@ impl App {
         self.run_pending(&id, &pending, &signed).await
     }
 
+    /// While a provider loss is followed and the app's evidence isn't uploaded yet, it
+    /// writes nothing at the new service: it uploads before its first write there (Switch
+    /// spec 12.6 step 3, Switch wire 7.4.14).
+    pub(crate) async fn refuse_before_upload(&self) -> Result<(), AppError> {
+        if let Some(loss) = self.loss_record().await?
+            && loss.step <= LossStep::Upload
+        {
+            return Err(Refusal::NotNow(
+                "Switch spec 12.6 step 3: the app uploads its evidence before it writes at the \
+                 new service"
+                    .into(),
+            )
+            .into());
+        }
+        Ok(())
+    }
+
     /// Send the batches kept from earlier calls, oldest first by ID order, and commit their
-    /// answers. A refused one is dropped.
+    /// answers. One refused for good is dropped and reported ([`AppEvent::BatchRefused`]);
+    /// any other failure stops here, the batch still kept, and is the caller's error, so
+    /// later writes don't overtake it. Nothing is sent while the evidence of a provider loss
+    /// isn't uploaded yet.
     pub(crate) async fn resume_batches(&mut self) -> Result<(), AppError> {
+        if self.refuse_before_upload().await.is_err() {
+            return Ok(());
+        }
         let kept = self.reader().scan::<PendingBatch>(PENDING_PREFIX).await?;
         for (id, pending) in kept {
             let id = pubky_switch_core::enc::unb64_array::<16>(&id)
                 .map_err(|_| AppError::Store(crate::error::StoreError::Corrupt))?;
             let batch = Batch::from_body(pending.body.clone())?;
             match self.run_pending(&id, &pending, &batch).await {
-                Ok(_) | Err(AppError::Switch(_)) => {}
-                Err(error) => return Err(error),
+                Ok(submitted) => self.check_resumed_attempts(&batch, &submitted).await?,
+                Err(error) => match refused_for_good(&error) {
+                    Some(code) => self.events.push(AppEvent::BatchRefused {
+                        batch_id: id,
+                        code: code.as_str().to_owned(),
+                    }),
+                    None => return Err(error),
+                },
             }
         }
         Ok(())
     }
 
-    /// Send a kept batch and commit its outcome.
+    /// The attempts of a batch sent again: their proofs get the checks
+    /// [`App::write_claim`] gives its own (Switch wire 6.5 "Binding", 6.8 "Deadline").
+    async fn check_resumed_attempts(
+        &mut self,
+        batch: &Batch,
+        submitted: &Submitted,
+    ) -> Result<(), AppError> {
+        for (index, op) in batch.ops().iter().enumerate() {
+            let OpKind::Claim(fields) = &op.body().kind else {
+                continue;
+            };
+            let Ok(entry) = fields.check() else {
+                continue;
+            };
+            let (EntryKind::Attempt { .. }, Some(proof)) =
+                (&entry.kind, submitted.proofs.get(index))
+            else {
+                continue;
+            };
+            if self.check_own_attempt(&entry, proof).await?.is_err() {
+                self.events.push(AppEvent::AttemptNotHeld {
+                    claim_key: entry.claim_key,
+                    attempt_id: entry.attempt_id,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Send a kept batch and commit its outcome. A refusal for good drops it; any other
+    /// failure keeps it, to be sent again with the same bytes (Switch wire 2.1, 6.4).
     async fn run_pending(
         &mut self,
         id: &[u8; 16],
         pending: &PendingBatch,
         batch: &Batch,
     ) -> Result<Submitted, AppError> {
-        let result = self.submit(batch).await;
-        let submitted = match result {
+        let submitted = match self.submit(batch).await {
             Ok(submitted) => submitted,
-            Err(AppError::Switch(error)) => {
-                let mut tx = self.tx()?;
-                tx.delete(&pending_key(id))?;
-                self.commit(tx).await?;
-                return Err(AppError::Switch(error));
+            Err(error) => {
+                if refused_for_good(&error).is_some() {
+                    let mut tx = self.tx()?;
+                    tx.delete(&pending_key(id))?;
+                    self.commit(tx).await?;
+                }
+                return Err(error);
             }
-            Err(error) => return Err(error),
         };
         let mut tx = self.tx()?;
         for (index, op) in batch.ops().iter().enumerate() {

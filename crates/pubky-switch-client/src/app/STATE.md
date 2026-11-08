@@ -50,7 +50,7 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
 | `proct/<time>/<sender>/<msg_id>` | the time index for pruning processed pairs | |
 | `seen/<seq>` | an entry processed past a held one | |
 | `held/<seq>` | an entry held because its sender can't be checked, since when | |
-| `parked/<seq>` | an entry stored locally and passed: the opened plaintext, sender, certificate, time, reason | yes |
+| `parked/<seq>` | an entry stored locally and passed: the opened plaintext, sender, certificate, time, reason (an unverifiable sender or a quota, tried again; an effect refused for good or over one batch, not tried again) | yes |
 | `asked/<seq>` | a re-send was handed to the protocol for this item | |
 | `departed/<app_id>` | another own app's departure verified in the chain, and its time | |
 | `join` | the join step: the registration batch while it is owed | |
@@ -106,16 +106,16 @@ uploads; `push.rs` holds the push registration. The peek (`peek.rs`) writes noth
 
 | Key | Holds | Sensitive |
 |---|---|---|
-| `out/<msg_id>` | a queued message: its signed plaintext, signed once, the envelope sealed for one try with its `apps_version`, its jobs (conversation entry, delivery, record) and where each stands | yes |
-| `sent/<msg_id>` | a message the recipient's inbox accepted, kept 30 days from its first acceptance for re-sends | yes |
+| `out/<msg_id>` | a queued message: its signed plaintext, signed once, the envelope sealed for one try with its `apps_version`, its jobs (conversation entry, delivery, record) and where each stands, a re-send owed, and when it was refused for good; a failed one goes after the sent-message retention | yes |
+| `sent/<msg_id>` | a message the recipient's inbox accepted, written in the commit that records the acceptance, kept 30 days from its first acceptance for re-sends | yes |
 | `sentt/<time>/<msg_id>` | the time index for pruning sent messages | |
 | `dir/<pubky>` | a counterparty's directory as signed, the switch, generation and `identity.json` version it was read under, its versions, and whether it is read again before the next send | |
 | `rkn/<pubky>/<app_id>` | the highest receive key `n` seen for a counterparty's app | |
 | `peer/<pubky>` | the version of the own `identity.json` a counterparty's switch last named, and when the app last wrote there | |
-| `peers_doc` | the own `identity.json` the deliveries to recent peers were last judged against | |
+| `peers_doc` | the own `identity.json` the deliveries to recent peers were last judged against, and the counterparties still owed it | |
 | `lc/conv/<pubky>` | a conversation entry in the app's copy of the lists, from its writes, the feed and `GET /allow`; its writes and `GET /allow` also keep `lc/contact/`, `lc/deny/` and `lc/code/` | |
 | `invite/<code_hash>` | the code of an invite code the app registered, to show it again | yes |
-| `opq/<batch_id>` | a batch of operations, signed and kept before it is sent, with what its answer settles | |
+| `opq/<batch_id>` | a batch of operations, signed and kept before it is sent, with what its answer settles; it goes with its answer or a refusal for good, and stays through anything else | |
 | `list_due` | a listing of the collections is owed: after joining, a restore or a `missed` item | |
 | `rec/<key>` | the shared record write the app took: the signed operation, certificate and proof, its version and whether a proof gave it, the opened value, and the refused write it follows | yes |
 | `recname/<key>` | the collection name of a record the app creates, until its write is answered | |

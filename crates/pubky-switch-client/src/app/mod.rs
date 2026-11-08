@@ -1092,12 +1092,15 @@ impl App {
     ///
     /// # Errors
     ///
-    /// [`Refusal::RestoreQuestionOpen`] while the restore question is open; a store failure.
+    /// [`Refusal::RestoreQuestionOpen`] while the restore question is open;
+    /// [`Refusal::NotNow`] while a provider loss is followed and the app's evidence isn't
+    /// uploaded yet (Switch spec 12.6 step 3); a store failure.
     pub async fn end_reconcile(&mut self, _confirmed: UserConfirmed) -> Result<(), AppError> {
         self.ready_local().await?;
         if !self.restore_question().is_empty() {
             return Err(Refusal::RestoreQuestionOpen.into());
         }
+        self.refuse_before_upload().await?;
         let mut tx = self.tx()?;
         if let Some(restore) = self.state.restore.as_mut() {
             restore.reconcile = false;

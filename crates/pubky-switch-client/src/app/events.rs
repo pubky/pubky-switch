@@ -299,6 +299,23 @@ pub enum AppEvent {
         /// The claim key.
         claim_key: [u8; 32],
     },
+    /// A batch kept from an earlier call was sent again and refused for good: it was not
+    /// applied, and the app no longer keeps it (Switch spec 6.4, Switch wire 6.4).
+    BatchRefused {
+        /// The batch ID.
+        batch_id: [u8; 16],
+        /// The error code of the refusal.
+        code: String,
+    },
+    /// An attempt sent again from a kept batch was applied, but its proof doesn't show the
+    /// app's own open attempt: the app wrote it `failed`, and the protocol doesn't carry it
+    /// out (Switch wire 6.5 "Binding").
+    AttemptNotHeld {
+        /// The claim key.
+        claim_key: [u8; 32],
+        /// The attempt.
+        attempt_id: [u8; 16],
+    },
 }
 
 /// Why an entry was stored locally (Switch spec 8.2).
@@ -309,4 +326,10 @@ pub enum ParkReason {
     Unverifiable,
     /// Its shared record write hit a per-kind limit, the storage quota or the value size.
     Quota,
+    /// Its effect's batch was refused for good (Switch spec 6.4): it is kept, not applied,
+    /// and not tried again.
+    Refused,
+    /// Its effect has more operations than one batch takes with the cursor move (Switch
+    /// wire 6.4): it is kept, not applied, and not tried again.
+    TooManyOperations,
 }

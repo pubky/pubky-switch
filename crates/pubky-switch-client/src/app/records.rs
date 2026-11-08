@@ -556,8 +556,14 @@ impl App {
                 listed = listed.saturating_add(1);
             }
             self.commit(tx).await?;
+            // Records are listed by the base64url text of their keys, compared as ASCII
+            // (Switch wire 7.4.9): a `next` that doesn't move past the key asked after ends
+            // the listing, so a service that names keys back and forth can't keep the app
+            // reading.
             match page.next {
-                Some(next) if after != Some(next) => after = Some(next),
+                Some(next) if after.is_none_or(|after| b64(&next) > b64(&after)) => {
+                    after = Some(next);
+                }
                 _ => return Ok(listed),
             }
         }

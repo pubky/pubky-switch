@@ -50,6 +50,11 @@ pub(crate) struct Shared {
     invites: BTreeMap<[u8; 32], (u64, u64, [u8; 16])>,
     /// Answer the next record read without its proof, as after a recovery upload.
     pub(crate) hide_proofs: bool,
+    /// A faulty listing: every page names these two keys as `next` in turn, for the first
+    /// 50 pages.
+    pub(crate) alternate_next: Option<([u8; 32], [u8; 32])>,
+    /// Listing pages answered.
+    pub(crate) listings: u64,
 }
 
 impl Shared {
@@ -198,9 +203,20 @@ impl Inner {
                     .filter(|held| held.state.collection == collection && !held.state.deleted)
                     .map(|held| self.view(held))
                     .collect();
+                self.shared.listings += 1;
+                let next = match self.shared.alternate_next {
+                    Some((a, b)) if self.shared.listings <= 50 => {
+                        json!(b64(if self.shared.listings % 2 == 1 {
+                            &a
+                        } else {
+                            &b
+                        }))
+                    }
+                    _ => json!(null),
+                };
                 Some((
                     200,
-                    json!({ "records": views, "seq": self.seq, "next": null }),
+                    json!({ "records": views, "seq": self.seq, "next": next }),
                 ))
             }
             ("GET", r) if r.starts_with("records/") => {

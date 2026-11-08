@@ -1218,3 +1218,226 @@ async fn test_app_backup_refuses_another_schema_or_bytes() {
     let text = format!("{:?}", app.backup().unwrap());
     assert!(text.starts_with("AppBackup("));
 }
+
+// -------------------------------------------------------------------------------------
+// Reading past held entries, duplicates on one page, effects refused for good
+
+/// A notice from alice's phone to `to`.
+fn notice(
+    w: &World,
+    phone: &App,
+    to: [u8; 16],
+    text: &str,
+) -> (u64, pubky_switch_core::message::Message) {
+    w.switch.send(
+        &w.alice,
+        &app_keys("phone"),
+        phone.cert(),
+        "sample.notice",
+        json!({ "text": text }),
+        &[to],
+    )
+}
+
+#[tokio::test]
+async fn test_app_held_entry_doesnt_hold_up_later_pages() {
+    let w = World::new();
+    let request = w.approve(&app_keys("wallet"), &["scope-a"]);
+    let config = AppConfig {
+        page_size: 2,
+        ..World::config()
+    };
+    let mut wallet = App::join(w.env(), w.protocol.clone(), config, request)
+        .await
+        .unwrap();
+    let phone = w.join("phone").await;
+    let me = wallet.app_id();
+    wallet.receive(None).await.unwrap();
+    *w.homeserver.down.lock().unwrap() = true;
+    let (held, _) = w.note(me, "held");
+    let later: Vec<u64> = (0..5)
+        .map(|n| notice(&w, &phone, me, &format!("later {n}")).0)
+        .collect();
+    // A read that went back to the cursor for every page would never end: the switch
+    // answers `503` after a bound.
+    {
+        let mut inner = w.switch.lock();
+        inner.feed_limit = Some(inner.feed_reads + 20);
+    }
+    let report = wallet.receive(None).await.unwrap();
+    assert!(has(
+        &report.events,
+        |e| matches!(e, AppEvent::Held { seq } if *seq == held)
+    ));
+    for seq in &later {
+        assert!(received(&report.events, *seq), "{seq}: {:?}", report.events);
+    }
+    // The cursor stays before the held entry, here and at the switch.
+    assert!(wallet.cursor().seq < held);
+    assert!(w.switch.app(&me).cursor < held);
+    // The next read meets the held entry again and processes nothing twice.
+    let report = wallet.receive(None).await.unwrap();
+    for seq in &later {
+        assert!(!received(&report.events, *seq), "{seq}");
+    }
+    assert_eq!(w.protocol.received.lock().unwrap().len(), 5);
+}
+
+#[tokio::test]
+async fn test_app_same_pair_twice_on_one_page_is_applied_once() {
+    let w = World::new();
+    let mut wallet = w.join("wallet").await;
+    let phone = w.join("phone").await;
+    let me = wallet.app_id();
+    wallet.receive(None).await.unwrap();
+    // A notice has no operations: its processed pair is only in the read's writes when the
+    // second copy comes.
+    let (first, message) = notice(&w, &phone, me, "once");
+    let plaintext = message.sign(&app_keys("phone")).unwrap();
+    let again = w
+        .switch
+        .send_plaintext(w.alice.public(), phone.cert(), &plaintext, &[me]);
+    let mut other = message.clone();
+    other.body.insert("text".into(), json!("changed"));
+    let plaintext = other.sign(&app_keys("phone")).unwrap();
+    let third = w
+        .switch
+        .send_plaintext(w.alice.public(), phone.cert(), &plaintext, &[me]);
+    let report = wallet.receive(None).await.unwrap();
+    assert!(received(&report.events, first));
+    assert!(has(&report.events, |e| matches!(
+        e,
+        AppEvent::Duplicate { seq, conflicting: false } if *seq == again
+    )));
+    assert!(has(&report.events, |e| matches!(
+        e,
+        AppEvent::Duplicate { seq, conflicting: true } if *seq == third
+    )));
+    assert_eq!(w.protocol.received.lock().unwrap().len(), 1);
+    assert!(wallet.cursor().seq >= third);
+}
+
+#[tokio::test]
+async fn test_app_effect_refused_for_good_is_parked_and_the_feed_goes_on() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let me = app.app_id();
+    let (refused, _) = w.note(me, "refused");
+    let (after, _) = w.note(me, "after");
+    w.switch.fail_next(Fault::Error {
+        path: "ops".into(),
+        code: ErrorCode::PermissionMissing,
+        current: json!(null),
+    });
+    let report = app.receive(None).await.unwrap();
+    assert!(has(&report.events, |e| matches!(
+        e,
+        AppEvent::Parked { seq, reason: ParkReason::Refused } if *seq == refused
+    )));
+    assert!(received(&report.events, after), "{:?}", report.events);
+    assert!(app.cursor().seq >= after);
+    assert_eq!(w.effects(), 1);
+    // It isn't tried again.
+    let report = app.receive(None).await.unwrap();
+    assert!(!has(&report.events, |e| matches!(
+        e,
+        AppEvent::Unparked { .. }
+    )));
+    assert_eq!(w.effects(), 1);
+}
+
+#[tokio::test]
+async fn test_app_effect_kept_on_a_retryable_refusal_and_sent_again() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let (seq, _) = w.note(app.app_id(), "busy");
+    w.switch.fail_next(Fault::Error {
+        path: "ops".into(),
+        code: ErrorCode::Unavailable,
+        current: json!(null),
+    });
+    assert!(app.receive(None).await.is_err());
+    let report = app.receive(None).await.unwrap();
+    assert!(received(&report.events, seq), "{:?}", report.events);
+    assert_eq!(w.effects(), 1);
+    // The protocol built the effect once: the kept batch went again, the same bytes.
+    assert_eq!(w.protocol.received.lock().unwrap().len(), 1);
+}
+
+/// The sample protocol, whose note writes eight operations: more than one batch takes with
+/// the cursor move.
+struct WideProtocol(SampleProtocol);
+
+impl Protocol for WideProtocol {
+    fn has_keys(&self, scope: &str) -> bool {
+        self.0.has_keys(scope)
+    }
+
+    fn sent_between_own_apps(&self, kind: &str) -> bool {
+        self.0.sent_between_own_apps(kind)
+    }
+
+    fn check_scopes(
+        &self,
+        message: &pubky_switch_core::message::Message,
+        sender: &AppCert,
+        own: &AppCert,
+    ) -> Result<(), String> {
+        self.0.check_scopes(message, sender, own)
+    }
+
+    fn accepts(&self, cert: &AppCert) -> Vec<String> {
+        self.0.accepts(cert)
+    }
+
+    fn receive(&self, message: &ReceivedMessage) -> Outcome {
+        let ops = (0..8u8)
+            .map(|n| (Vec::new(), OpKind::DenyPut { pubky: [n; 32] }))
+            .collect();
+        self.0
+            .received
+            .lock()
+            .unwrap()
+            .push((message.seq, message.message.msg_id.clone(), false));
+        Outcome::Apply(Effect {
+            ops,
+            local: Vec::new(),
+        })
+    }
+
+    fn resend_needed(&self, needed: &ResendNeeded) -> Vec<LocalWrite> {
+        self.0.resend_needed(needed)
+    }
+
+    fn missed(&self, missed: &MissedEntries) -> Vec<LocalWrite> {
+        self.0.missed(missed)
+    }
+}
+
+#[tokio::test]
+async fn test_app_effect_over_one_batch_is_parked_and_the_feed_goes_on() {
+    let w = World::new();
+    let request = w.approve(&app_keys("wallet"), &["scope-a"]);
+    let protocol = Arc::new(WideProtocol(SampleProtocol::default()));
+    let mut app = App::join(w.env(), protocol.clone(), World::config(), request)
+        .await
+        .unwrap();
+    let (first, _) = w.note(app.app_id(), "wide");
+    let (second, _) = w.note(app.app_id(), "wide again");
+    let report = app.receive(None).await.unwrap();
+    for seq in [first, second] {
+        assert!(has(&report.events, |e| matches!(
+            e,
+            AppEvent::Parked { seq: s, reason: ParkReason::TooManyOperations } if *s == seq
+        )));
+    }
+    assert!(app.cursor().seq >= second);
+    assert!(
+        w.switch
+            .applied()
+            .iter()
+            .all(|op| !matches!(op.body().kind, OpKind::DenyPut { .. }))
+    );
+    app.receive(None).await.unwrap();
+    assert_eq!(protocol.0.received.lock().unwrap().len(), 2);
+}

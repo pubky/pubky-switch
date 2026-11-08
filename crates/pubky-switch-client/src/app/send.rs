@@ -22,12 +22,20 @@
 //! 5. **The record job** builds the record's next value through the protocol
 //!    ([`super::Protocol::sent_record`]), compare-and-swap.
 //!
-//! A message the counterparty's inbox accepted moves to `sent/<msg_id>`, kept 30 days from
-//! its first acceptance for re-sends (Switch spec 11), which seal the same signed plaintext
-//! to the current keys ([`App::resend`]).
+//! The acceptance is committed as soon as the append is answered, before anything else is
+//! done with the answer, so a crash never sends the same bytes again: with it the message
+//! goes to `sent/<msg_id>`, kept 30 days from its first acceptance for re-sends (Switch spec
+//! 11), which seal the same signed plaintext to the current keys ([`App::resend`]), also
+//! while its record job is still owed. The message leaves the outbox once every job is done.
+//!
+//! Only a refusal for good marks a message failed: the Retry column of Switch spec 6.4 says
+//! "No". `403 not_admitted` and `403 not_current` stay queued, as admission changes when the
+//! counterparty adds a contact or an invite, and a certificate renewal makes the app current
+//! again (Switch spec 7, Switch wire 3.8). A failed message is forgotten, plaintext and all,
+//! after the retention of sent messages.
 
 use pubky_switch_core::enc::{serde_b64, serde_b64_vec};
-use pubky_switch_core::http::ErrorCode;
+use pubky_switch_core::http::{ErrorCode, Retry};
 use pubky_switch_core::message::{Message, MessagePlaintext, Sender};
 use pubky_switch_core::ops::{AllowKind, OpKind};
 use pubky_switch_core::records::DAY_MS;
@@ -245,6 +253,13 @@ struct OutboxItem {
     last_error: Option<String>,
     tries: u64,
     queued_ms: u64,
+    /// When it was refused for good, app clock: it is forgotten after the retention of sent
+    /// messages.
+    #[serde(default)]
+    failed_ms: Option<u64>,
+    /// An accepted message is to be sent again, sealed to the current keys (Switch spec 11).
+    #[serde(default)]
+    resend: bool,
 }
 
 impl std::fmt::Debug for OutboxItem {
@@ -255,7 +270,12 @@ impl std::fmt::Debug for OutboxItem {
 
 impl OutboxItem {
     fn complete(&self) -> bool {
-        self.accepted_at_ms.is_some() && (self.record.is_none() || self.record_done)
+        self.accepted_at_ms.is_some() && !self.resend && (self.record.is_none() || self.record_done)
+    }
+
+    /// Whether a delivery is owed: never accepted, or a re-send asked since.
+    fn delivery_owed(&self) -> bool {
+        self.accepted_at_ms.is_none() || self.resend
     }
 
     fn plaintext(&self) -> Result<MessagePlaintext, AppError> {
@@ -286,7 +306,7 @@ impl std::fmt::Debug for SentStored {
 
 /// What one delivery try came to.
 enum Tried {
-    Accepted(u64),
+    Accepted(AppendAnswer),
     Queued(String),
     Failed(String),
 }
@@ -358,6 +378,8 @@ impl App {
             last_error: None,
             tries: 0,
             queued_ms: self.now(),
+            failed_ms: None,
+            resend: false,
         };
         let mut tx = self.tx()?;
         tx.put(&out_key(&item.msg_id), &item)?;
@@ -375,7 +397,7 @@ impl App {
     pub async fn resend(&mut self, msg_id: &str) -> Result<Delivery, AppError> {
         self.ready_local().await?;
         self.refuse_when_stopped()?;
-        if !self.reader().exists(&out_key(msg_id)).await? {
+        if !self.ask_resend_of_queued(msg_id).await? {
             let sent: SentStored =
                 self.reader().get(&sent_key(msg_id)).await?.ok_or_else(|| {
                     AppError::Refused(Refusal::Usage("no sent message with this msg_id".into()))
@@ -386,6 +408,20 @@ impl App {
         self.delivery(msg_id)
             .await?
             .ok_or_else(|| AppError::InvalidData("the message left the outbox".into()))
+    }
+
+    /// A message still in the outbox: one already accepted, whose other jobs are owed, is
+    /// marked to be sealed and sent again. Returns whether it is in the outbox.
+    async fn ask_resend_of_queued(&mut self, msg_id: &str) -> Result<bool, AppError> {
+        let Some(mut item) = self.reader().get::<OutboxItem>(&out_key(msg_id)).await? else {
+            return Ok(false);
+        };
+        if item.accepted_at_ms.is_some() && !item.resend {
+            item.resend = true;
+            item.sealed = None;
+            self.save_item(&item).await?;
+        }
+        Ok(true)
     }
 
     async fn queue_resend(&mut self, sent: &SentStored) -> Result<(), AppError> {
@@ -405,6 +441,8 @@ impl App {
             last_error: None,
             tries: 0,
             queued_ms: self.now(),
+            failed_ms: None,
+            resend: false,
         };
         let mut tx = self.tx()?;
         tx.put(&out_key(&item.msg_id), &item)?;
@@ -427,13 +465,14 @@ impl App {
                 .max()
                 .unwrap_or(sent.first_ms)
                 .max(sent.first_ms);
-            if sent.to == *pubky
-                && last >= since_ms
-                && !self.reader().exists(&out_key(&sent.msg_id)).await?
-            {
-                self.queue_resend(&sent).await?;
-                queued = queued.saturating_add(1);
+            if sent.to != *pubky || last < since_ms {
+                continue;
             }
+            // One whose record job is still owed is in the outbox: marked to go again.
+            if !self.ask_resend_of_queued(&sent.msg_id).await? {
+                self.queue_resend(&sent).await?;
+            }
+            queued = queued.saturating_add(1);
         }
         if queued > 0 {
             self.events.push(AppEvent::ResendAfterLoss {
@@ -458,8 +497,10 @@ impl App {
                 (Some(reason), _) => Delivery::Failed {
                     reason: reason.clone(),
                 },
-                (None, Some(accepted_at_ms)) => Delivery::Accepted { accepted_at_ms },
-                (None, None) => Delivery::Queued {
+                (None, Some(accepted_at_ms)) if !item.resend => {
+                    Delivery::Accepted { accepted_at_ms }
+                }
+                (None, _) => Delivery::Queued {
                     tries: item.tries,
                     last_error: item.last_error.clone(),
                 },
@@ -519,14 +560,27 @@ impl App {
     pub async fn flush_outbox(&mut self) -> Result<OutboxReport, AppError> {
         self.ready_local().await?;
         self.refuse_when_stopped()?;
-        self.resume_batches().await?;
+        // A kept batch that can't be sent now holds up no delivery: it is sent again by the
+        // next call that writes.
+        match self.resume_batches().await {
+            Err(error) if is_local(&error) => return Err(error),
+            _ => {}
+        }
         self.deliver_to_recent_peers().await?;
         let mut items = self.reader().scan::<OutboxItem>(OUT_PREFIX).await?;
         items.sort_by_key(|(_, item)| item.queued_ms);
         let mut report = OutboxReport::default();
+        let cutoff = self.now().saturating_sub(SENT_RETENTION_MS);
         for (msg_id, item) in items {
             if item.failed.is_some() {
-                report.failed.push(msg_id);
+                // Forgotten, plaintext and all, after the retention of sent messages.
+                if item.failed_ms.unwrap_or(item.queued_ms) <= cutoff {
+                    let mut tx = self.tx()?;
+                    tx.delete(&out_key(&msg_id))?;
+                    self.commit(tx).await?;
+                } else {
+                    report.failed.push(msg_id);
+                }
                 continue;
             }
             self.flush_item(&msg_id).await?;
@@ -563,21 +617,18 @@ impl App {
             }
             self.save_item(&item).await?;
         }
-        if item.accepted_at_ms.is_none() {
+        if item.delivery_owed() {
             match self.deliver(&mut item).await? {
-                Tried::Accepted(at) => {
-                    item.accepted_at_ms = Some(at);
-                    item.last_error = None;
+                Tried::Accepted(answer) => self.accept(&mut item, &answer).await?,
+                Tried::Queued(why) => {
+                    item.last_error = Some(why);
+                    self.save_item(&item).await?;
                 }
-                Tried::Queued(why) => item.last_error = Some(why),
-                Tried::Failed(why) => item.failed = Some(why),
-            }
-            self.save_item(&item).await?;
-            if let Some(at) = item.accepted_at_ms {
-                self.events.push(AppEvent::MessageAccepted {
-                    msg_id: item.msg_id.clone(),
-                    accepted_at_ms: at,
-                });
+                Tried::Failed(why) => {
+                    item.failed = Some(why);
+                    item.failed_ms = Some(self.now());
+                    self.save_item(&item).await?;
+                }
             }
         }
         if item.accepted_at_ms.is_some()
@@ -603,13 +654,22 @@ impl App {
         self.commit(tx).await
     }
 
-    /// A complete item leaves the outbox for the sent messages, with its acceptance time.
-    async fn finish_item(&mut self, item: &OutboxItem) -> Result<(), AppError> {
-        let Some(at) = item.accepted_at_ms else {
-            return Ok(());
-        };
+    /// The counterparty's inbox accepted the message: its acceptance is committed at once,
+    /// with the sent message kept for re-sends and what the answer shows of the counterparty's
+    /// switch, before anything else is done (Switch spec 11). Then what the answer asks for:
+    /// the directory read again, the own `identity.json` delivered.
+    async fn accept(
+        &mut self,
+        item: &mut OutboxItem,
+        answer: &AppendAnswer,
+    ) -> Result<(), AppError> {
+        let at = answer.accepted_at;
+        let first = *item.accepted_at_ms.get_or_insert(at);
+        item.resend = false;
+        item.last_error = None;
         let mut tx = self.tx()?;
-        match self
+        tx.put(&out_key(&item.msg_id), &*item)?;
+        let sent = match self
             .reader()
             .get::<SentStored>(&sent_key(&item.msg_id))
             .await?
@@ -618,23 +678,42 @@ impl App {
                 if at != sent.first_ms && !sent.resent.contains(&at) {
                     sent.resent.push(at);
                 }
-                tx.put(&sent_key(&item.msg_id), &sent)?;
+                sent
             }
             None => {
-                tx.put(
-                    &sent_key(&item.msg_id),
-                    &SentStored {
-                        to: item.to,
-                        kind: item.kind.clone(),
-                        msg_id: item.msg_id.clone(),
-                        plaintext: item.plaintext.clone(),
-                        first_ms: at,
-                        resent: Vec::new(),
-                    },
-                )?;
-                tx.put(&sent_time_key(at, &item.msg_id), &())?;
+                tx.put(&sent_time_key(first, &item.msg_id), &())?;
+                SentStored {
+                    to: item.to,
+                    kind: item.kind.clone(),
+                    msg_id: item.msg_id.clone(),
+                    plaintext: item.plaintext.clone(),
+                    first_ms: first,
+                    resent: if at == first { Vec::new() } else { vec![at] },
+                }
             }
+        };
+        tx.put(&sent_key(&item.msg_id), &sent)?;
+        let own = item.to == self.state.meta.identity;
+        if !own {
+            let mut peer = self.peer_switch(&item.to).await?;
+            peer.last_sent_ms = Some(self.now());
+            peer.known_version = answer.known_version;
+            super::directory::put_peer(&mut tx, &item.to, &peer)?;
         }
+        self.commit(tx).await?;
+        self.events.push(AppEvent::MessageAccepted {
+            msg_id: item.msg_id.clone(),
+            accepted_at_ms: at,
+        });
+        if !own {
+            self.after_accepted(&item.to, answer).await?;
+        }
+        Ok(())
+    }
+
+    /// A complete item leaves the outbox; its sent message is kept from its acceptance.
+    async fn finish_item(&mut self, item: &OutboxItem) -> Result<(), AppError> {
+        let mut tx = self.tx()?;
         tx.delete(&out_key(&item.msg_id))?;
         self.commit(tx).await
     }
@@ -735,10 +814,7 @@ impl App {
                     .map_err(AppError::from)
             };
             match result {
-                Ok(answer) => {
-                    self.accepted(&to, own, &answer).await?;
-                    return Ok(Tried::Accepted(answer.accepted_at));
-                }
+                Ok(answer) => return Ok(Tried::Accepted(answer)),
                 Err(AppError::Switch(ClientError::Switch {
                     code: ErrorCode::StaleKey,
                     current,
@@ -803,19 +879,13 @@ impl App {
         self.save_item(item).await
     }
 
-    /// An append the counterparty's inbox accepted: what its answer shows about the
-    /// directory and the own `identity.json` there.
-    async fn accepted(
+    /// An append the counterparty's inbox accepted, its acceptance committed: what its
+    /// answer shows about the directory and the own `identity.json` there.
+    async fn after_accepted(
         &mut self,
         to: &[u8; 32],
-        own: bool,
         answer: &AppendAnswer,
     ) -> Result<(), AppError> {
-        if own {
-            return Ok(());
-        }
-        self.note_sent(to).await?;
-        self.note_known_version(to, answer.known_version).await?;
         if let Some(cached) = self.cached_directory(to).await?
             && answer.directory_version > cached.directory_version
         {
@@ -853,24 +923,18 @@ fn is_local(error: &AppError) -> bool {
     matches!(error, AppError::Alarm(_) | AppError::Store(_))
 }
 
-/// A failed try: queued again for what may pass later (the network, `429`, `503`, a
-/// refusal of the app's rules that may lift), failed for good for the switch's other
-/// refusals.
+/// A failed try: failed for good only when the switch refused it for good, the Retry column
+/// of Switch spec 6.4 saying "No"; queued again for everything else (the network, `429`,
+/// `503`, a refusal of the app's rules that may lift). `403 not_admitted` and `403
+/// not_current` stay queued: admission changes when the counterparty adds a contact or an
+/// invite (Switch spec 7), and a renewal makes a certificate current again (Switch wire
+/// 3.8).
 fn queued_or(error: AppError) -> Result<Tried, AppError> {
     match &error {
         AppError::Alarm(_) | AppError::Store(_) => Err(error),
         AppError::Switch(ClientError::Switch { code, .. })
-            if !matches!(
-                code,
-                ErrorCode::RateLimited
-                    | ErrorCode::QuotaExceeded
-                    | ErrorCode::Staged
-                    | ErrorCode::Unavailable
-                    | ErrorCode::StaleTimestamp
-                    | ErrorCode::StaleKey
-                    | ErrorCode::IdentityNeeded
-                    | ErrorCode::Moved
-            ) =>
+            if code.retry() == Retry::No
+                && !matches!(code, ErrorCode::NotAdmitted | ErrorCode::NotCurrent) =>
         {
             Ok(Tried::Failed(error.to_string()))
         }
@@ -904,6 +968,22 @@ mod tests {
         ));
         assert!(matches!(
             queued_or(switch(ErrorCode::NotAdmitted)),
+            Ok(Tried::Queued(_))
+        ));
+        assert!(matches!(
+            queued_or(switch(ErrorCode::NotCurrent)),
+            Ok(Tried::Queued(_))
+        ));
+        assert!(matches!(
+            queued_or(switch(ErrorCode::Conflict)),
+            Ok(Tried::Queued(_))
+        ));
+        assert!(matches!(
+            queued_or(switch(ErrorCode::TooLarge)),
+            Ok(Tried::Failed(_))
+        ));
+        assert!(matches!(
+            queued_or(switch(ErrorCode::PermissionMissing)),
             Ok(Tried::Failed(_))
         ));
         assert!(matches!(

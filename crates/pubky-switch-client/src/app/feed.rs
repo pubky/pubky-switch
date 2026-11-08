@@ -11,11 +11,16 @@
 //!   are committed with the answer. A message without operations, a dropped one and a
 //!   duplicate only move the cursor, deferred.
 //! - **Dedupe** is by (sender identity, `msg_id`) with the message hash, kept for 30 days
-//!   plus the clock tolerance; the same pair with other bytes is shown as a conflict.
+//!   plus the clock tolerance; the same pair with other bytes is shown as a conflict. The
+//!   pairs processed in the current read count before they are committed, so the same pair
+//!   twice on one page is applied once.
 //! - **An entry whose sender can't be checked** is held: later items go on, the cursor stays
 //!   before it, and the entries processed past it are remembered. After the bounded wait it
 //!   is stored locally and passed. An entry whose write hits a quota is stored and passed
-//!   too, and applied once there is room.
+//!   too, and applied once there is room. So is an entry whose effect the switch refuses for
+//!   good, or that has more operations than one batch takes, which isn't tried again: a
+//!   permanent refusal never stalls the feed. Pages are read from a position that moves on
+//!   to each page's `scanned_through`, while the cursor stays before the held entry.
 //! - **An entry no held key opens** is passed; the protocol is asked to request a re-send,
 //!   never for a time before the cursor's less the clock tolerance. So is an entry a departed
 //!   own app left unread, accepted at or before a departure the app verified in its chain;
@@ -27,6 +32,7 @@
 //! Cursor moves that apply nothing are deferred, for at most a few seconds while the app
 //! runs, and go with the next batch or alone ([`App::flush_cursor`]).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use pubky_switch_core::chain::{ChainEnvelope, ItemType, ServiceTransition, Verifier};
@@ -40,7 +46,7 @@ use pubky_switch_core::receive::{
 use pubky_switch_core::records::{CLOCK_TOLERANCE_MS, IdentityDoc};
 use pubky_switch_core::sig::SignedDoc;
 
-use super::error::{Alarm, Refusal};
+use super::error::{Alarm, Refusal, refused_for_good};
 use super::events::{AppEvent, ParkReason};
 use super::identity::{self, DOC_CACHE_MS, Taken};
 use super::protocol::{
@@ -84,6 +90,8 @@ enum Sent {
     Conflict(serde_json::Value),
     StaleEpoch,
     Quota,
+    /// Refused for good: the entry is stored and passed.
+    Refused,
 }
 
 /// An entry as the feed carries it, or as the app stored it.
@@ -104,17 +112,25 @@ struct Read {
     opaque: Vec<OpaqueRule>,
     /// The own data epoch rose: fetch the key bundle after the page.
     epoch_rose: bool,
+    /// The (sender, `msg_id`) pairs processed in this read and not yet committed, with
+    /// their message hashes (Switch spec 11).
+    pairs: HashMap<([u8; 32], String), [u8; 32]>,
 }
 
 impl Read {
-    /// A read outside the feed, for a copy taken from the directory or the Homeserver.
-    fn outside(tx: Tx) -> Self {
+    fn new(tx: Tx, blocked: Option<u64>, opaque: Vec<OpaqueRule>) -> Self {
         Self {
             tx,
-            blocked: None,
-            opaque: Vec::new(),
+            blocked,
+            opaque,
             epoch_rose: false,
+            pairs: HashMap::new(),
         }
+    }
+
+    /// A read outside the feed, for a copy taken from the directory or the Homeserver.
+    fn outside(tx: Tx) -> Self {
+        Self::new(tx, None, Vec::new())
     }
 
     fn block(&mut self, seq: u64) {
@@ -184,6 +200,10 @@ impl App {
         self.list_collections_if_due().await?;
         let mut report = ReceiveReport::default();
         let mut wait = wait.map(|w| w.min(25));
+        // The read position moves on page by page, past a held entry, while the cursor
+        // stays before it (Switch spec 8.2); the held `seq` carries over to later pages.
+        let mut after = self.state.cursor.seq;
+        let mut blocked = None;
         loop {
             if let (Some(seconds), Some(since)) = (wait, self.state.cursor.deferred_since_ms) {
                 let due = since.saturating_add(self.config.defer_ms());
@@ -193,15 +213,16 @@ impl App {
             let query = FeedQuery {
                 after: Some(Position {
                     generation: self.state.cursor.generation,
-                    seq: self.state.cursor.seq,
+                    seq: after,
                 }),
                 limit: Some(self.config.page()),
                 wait: wait.take(),
             };
             let result = self.client.feed(query).await;
             let page = self.take(result).await?;
-            match self.process_page(page).await? {
-                Some(true) => continue,
+            let scanned = page.scanned_through;
+            match self.process_page(page, after, &mut blocked).await? {
+                Some(true) => after = after.max(scanned).max(self.state.cursor.seq),
                 Some(false) => break,
                 None => {
                     report.stopped = true;
@@ -218,8 +239,14 @@ impl App {
         Ok(report)
     }
 
-    /// One page: `Some(more)`, or `None` when the read stops on it.
-    async fn process_page(&mut self, page: FeedPage) -> Result<Option<bool>, AppError> {
+    /// One page, read after `after`, with the lowest `seq` held so far in this read:
+    /// `Some(more)`, or `None` when the read stops on it.
+    async fn process_page(
+        &mut self,
+        page: FeedPage,
+        after: u64,
+        blocked: &mut Option<u64>,
+    ) -> Result<Option<bool>, AppError> {
         let now = self.now();
         let multi = self.state.device.multi_device;
         let Some(chain) = self.state.chain.as_mut() else {
@@ -240,20 +267,16 @@ impl App {
                 checkpoint_seq,
             });
         }
-        let start = self.state.cursor.seq;
+        let start = after;
         if page.scanned_through < start || (page.more && page.scanned_through == start) {
             return Err(AppError::InvalidData(
                 "Switch wire 7.4.4: a page that doesn't move past the position asked".into(),
             ));
         }
-        // Held entries lie after the cursor, so this read meets each again before any later
-        // item, and blocks the cursor there if it is still held.
-        let mut read = Read {
-            tx: self.tx()?,
-            blocked: None,
-            opaque: self.protocol.opaque_members(),
-            epoch_rose: false,
-        };
+        // Held entries lie after the cursor, so each read meets each again before any later
+        // item, and blocks the cursor there if it is still held; later pages of the read
+        // carry the block on.
+        let mut read = Read::new(self.tx()?, *blocked, self.protocol.opaque_members());
         if let Some(chain) = self.state.chain.as_mut() {
             chain.write(&mut read.tx)?;
         }
@@ -326,6 +349,7 @@ impl App {
             self.state.cursor.seq = end;
         }
         let epoch_rose = read.epoch_rose;
+        *blocked = read.blocked;
         self.end_page(read).await?;
         if epoch_rose {
             self.fetch_key_bundle().await?;
@@ -466,7 +490,20 @@ impl App {
                 return self.hold_or_park(entry, &plaintext, read);
             }
         };
-        // Check 9, with the app's own record of processed messages.
+        // Check 9, with the pairs processed in this read and not committed yet, then the
+        // app's own record of processed messages.
+        let pair = (entry.sender, received.message.msg_id.clone());
+        if let Some(hash) = read.pairs.get(&pair).copied() {
+            if parked {
+                read.tx.delete(&key::parked(entry.seq))?;
+                self.state.parked.remove(&entry.seq);
+            }
+            self.events.push(AppEvent::Duplicate {
+                seq: entry.seq,
+                conflicting: hash != received.hash(),
+            });
+            return Ok(Step::Pass);
+        }
         let processed: Option<Processed> = self
             .reader()
             .get(&key::processed(&entry.sender, &received.message.msg_id))
@@ -515,10 +552,15 @@ impl App {
                 Outcome::Apply(effect) => effect,
             };
             if effect.ops.len() >= MAX_BATCH_ENTRIES {
-                return Err(Refusal::Usage(
-                    "Switch wire 6.4: an effect of more than 7 operations".into(),
-                )
-                .into());
+                // Switch wire 6.4: at most 7 operations beside the cursor move. Stored and
+                // passed, so the feed goes on (Switch spec 8.2).
+                self.park(
+                    entry,
+                    &received.plaintext,
+                    ParkReason::TooManyOperations,
+                    read,
+                )?;
+                return Ok(Step::Pass);
             }
             if effect.ops.is_empty() {
                 self.note_processed(entry, &received, &effect.local, parked, read)?;
@@ -530,6 +572,10 @@ impl App {
                 .await?
             {
                 Sent::Applied => {
+                    read.pairs.insert(
+                        (entry.sender, received.message.msg_id.clone()),
+                        received.hash(),
+                    );
                     self.received_event(entry, &received);
                     return Ok(Step::Pass);
                 }
@@ -540,6 +586,10 @@ impl App {
                 }
                 Sent::Quota => {
                     self.park(entry, &received.plaintext, ParkReason::Quota, read)?;
+                    return Ok(Step::Pass);
+                }
+                Sent::Refused => {
+                    self.park(entry, &received.plaintext, ParkReason::Refused, read)?;
                     return Ok(Step::Pass);
                 }
             }
@@ -573,6 +623,10 @@ impl App {
             received.hash(),
             now,
         )?;
+        read.pairs.insert(
+            (entry.sender, received.message.msg_id.clone()),
+            received.hash(),
+        );
         read.tx.local(local)?;
         if parked {
             read.tx.delete(&key::parked(entry.seq))?;
@@ -631,24 +685,36 @@ impl App {
         let result = self.submit(batch).await;
         let sent = match result {
             Ok(_) => Sent::Applied,
-            Err(AppError::Switch(ClientError::Switch { code, current, .. })) => match code {
-                ErrorCode::Conflict => Sent::Conflict(current),
-                ErrorCode::StaleEpoch => Sent::StaleEpoch,
-                ErrorCode::QuotaExceeded | ErrorCode::TooLarge => Sent::Quota,
-                other => {
-                    // Refused for good: the kept batch goes, and the entry is read again.
-                    self.drop_pending_effect().await?;
-                    return Err(AppError::Switch(ClientError::Switch {
-                        status: other.status(),
-                        code: other,
-                        message: "the effect's batch was refused".into(),
-                        current,
-                        known_version: None,
-                        retry_after: None,
-                    }));
+            // A quota is stored and passed, and applied once there is room (Switch spec 8.2).
+            Err(error) if error.code() == Some(ErrorCode::QuotaExceeded) => Sent::Quota,
+            Err(error) => {
+                let Some(code) = refused_for_good(&error) else {
+                    // It may pass unchanged later (`429`, `503`, the network, an answer that
+                    // doesn't verify): kept, and sent again, the same bytes, by the next
+                    // read (Switch wire 2.1).
+                    return Err(error);
+                };
+                match (code, error) {
+                    (
+                        ErrorCode::Conflict,
+                        AppError::Switch(ClientError::Switch { current, .. }),
+                    ) => Sent::Conflict(current),
+                    (ErrorCode::StaleEpoch, _) => Sent::StaleEpoch,
+                    (ErrorCode::TooLarge, _) => Sent::Quota,
+                    // The app isn't current, its certificate expired, or the batch names
+                    // another generation: nothing it writes passes until that changes. The
+                    // kept batch goes, and the entry is read again then.
+                    (
+                        ErrorCode::NotCurrent | ErrorCode::CertExpired | ErrorCode::StaleGeneration,
+                        error,
+                    ) => {
+                        self.drop_pending_effect().await?;
+                        return Err(error);
+                    }
+                    // This effect is refused for good, the app's other writes aren't.
+                    _ => Sent::Refused,
                 }
-            },
-            Err(error) => return Err(error),
+            }
         };
         if !matches!(sent, Sent::Applied) {
             self.drop_pending_effect().await?;
@@ -700,7 +766,7 @@ impl App {
             }),
             // The entry is read again from the cursor, which didn't pass it, or from the
             // local store, and its effect built again.
-            Sent::Conflict(_) | Sent::StaleEpoch | Sent::Quota => {}
+            Sent::Conflict(_) | Sent::StaleEpoch | Sent::Quota | Sent::Refused => {}
         }
         Ok(())
     }
@@ -771,6 +837,13 @@ impl App {
             let Some(stored) = self.state.parked.get(&seq).cloned() else {
                 continue;
             };
+            // A refusal for good, or an effect over one batch, isn't tried again.
+            if matches!(
+                stored.reason,
+                ParkReason::Refused | ParkReason::TooManyOperations
+            ) {
+                continue;
+            }
             let plaintext = MessagePlaintext::decode(&stored.plaintext)
                 .map_err(|_| AppError::Store(crate::error::StoreError::Corrupt))?;
             let entry = Entry {
@@ -780,12 +853,7 @@ impl App {
                 accepted_at_ms: stored.accepted_at_ms,
                 context: stored.context,
             };
-            let mut read = Read {
-                tx: self.tx()?,
-                blocked: None,
-                opaque: self.protocol.opaque_members(),
-                epoch_rose: false,
-            };
+            let mut read = Read::new(self.tx()?, None, self.protocol.opaque_members());
             let step = self
                 .check_and_apply(&entry, plaintext, true, &mut read)
                 .await?;

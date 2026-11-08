@@ -16,8 +16,8 @@ use pubky_switch_core::sig::SignedDoc;
 use super::fake::{Fault, Item};
 use super::*;
 use crate::app::{
-    AppError, AppEvent, Evidence, LossActions, ProviderLoss, ProviderStatus, PushRelay,
-    UserConfirmed,
+    AppError, AppEvent, ClaimOp, Evidence, LossActions, ObligationDeadline, ProviderLoss,
+    ProviderStatus, PushRelay, UserConfirmed,
 };
 use crate::error::ClientError;
 use crate::error::TransportError;
@@ -1279,4 +1279,137 @@ async fn test_not_current_while_listed_with_another_certificate_is_no_removal() 
         app.follow_provider().await.unwrap(),
         ProviderStatus::Current
     );
+}
+
+// -------------------------------------------------------------------------------------
+// Earlier generations' evidence, and writes before the upload
+
+const CLAIM: [u8; 32] = [5; 32];
+const ATTEMPT: [u8; 16] = [6; 16];
+
+/// The same origin under a new key at generation 2, published (a key change in place).
+fn change_key(w: &World, router: &Router) -> Arc<FakeSwitch> {
+    let pending = SigningKey::from_bytes(&seed("service/alice/pending"));
+    let changed = w.switch.import_into(pending.clone());
+    router.add(ORIGIN, &changed);
+    publish_at(
+        w,
+        &changed,
+        Inbox::new(ORIGIN, pending.verifying_key().to_bytes()),
+        2,
+        None,
+    );
+    changed
+}
+
+#[tokio::test]
+async fn test_claim_read_after_a_key_change_checks_earlier_proofs_with_their_key() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join_on(
+        &w,
+        &router,
+        Arc::clone(&w.store) as Arc<dyn StateStore>,
+        w.protocol.clone(),
+        &Permission::ALL,
+    )
+    .await;
+    app.write_claim(
+        ClaimOp::attempt(CLAIM, 0, ATTEMPT, 3600, None),
+        vec![],
+        ObligationDeadline::NoDeadline,
+    )
+    .await
+    .unwrap();
+    change_key(&w, &router);
+    app.receive(None).await.unwrap();
+    assert_eq!(app.cursor().generation, 2);
+    // The entry carries generation 1's proof: checked with that generation's key, no alarm.
+    let read = app.read_claim(&CLAIM).await.unwrap().unwrap();
+    assert_eq!(read.entries.len(), 1);
+    assert!(app.alarm().is_none(), "{:?}", app.alarm());
+}
+
+#[tokio::test]
+async fn test_claim_entry_of_an_earlier_generation_in_the_feed_is_kept() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let phone_store = Arc::new(MemoryStore::new());
+    let mut phone = App::join(
+        router.env(&w, Arc::clone(&phone_store) as Arc<dyn StateStore>),
+        w.protocol.clone(),
+        World::config(),
+        w.approve(&app_keys("phone"), &["scope-a"]),
+    )
+    .await
+    .unwrap();
+    phone.receive(None).await.unwrap();
+    let mut wallet = join_on(
+        &w,
+        &router,
+        Arc::clone(&w.store) as Arc<dyn StateStore>,
+        w.protocol.clone(),
+        &Permission::ALL,
+    )
+    .await;
+    wallet
+        .write_claim(
+            ClaimOp::attempt(CLAIM, 0, ATTEMPT, 3600, None),
+            vec![],
+            ObligationDeadline::NoDeadline,
+        )
+        .await
+        .unwrap();
+    change_key(&w, &router);
+    // The phone learns of the change first, then reads generation 1's items at the new key.
+    phone.refresh_identity().await.unwrap();
+    phone.receive(None).await.unwrap();
+    assert_eq!(phone.cursor().generation, 2);
+    assert!(phone.alarm().is_none(), "{:?}", phone.alarm());
+    let evidence = phone.claim_evidence(&CLAIM).await.unwrap();
+    assert!(evidence.is_some(), "the entry's evidence is kept");
+}
+
+#[tokio::test]
+async fn test_loss_writes_wait_for_the_upload() {
+    let store = Arc::new(MemoryStore::new());
+    let lost = lost_world(Arc::clone(&store) as Arc<dyn StateStore>).await;
+    lost.next.fail_next(Fault::LoseAnswer {
+        path: "recovery/upload".into(),
+    });
+    assert!(
+        follow_loss(&lost, Arc::clone(&store) as Arc<dyn StateStore>)
+            .await
+            .is_err()
+    );
+    let mut app = App::load(
+        lost.router
+            .env(&lost.w, Arc::clone(&store) as Arc<dyn StateStore>),
+        Arc::clone(&lost.protocol) as Arc<dyn Protocol>,
+        World::config(),
+        app_keys("wallet").app_id_bytes(),
+    )
+    .await
+    .unwrap();
+    let applied = lost.next.applied().len();
+    let error = app
+        .submit_batch(crate::app::OpBatch::new().op(OpKind::DenyPut { pubky: [9; 32] }))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, AppError::Refused(crate::app::Refusal::NotNow(_))),
+        "{error:?}"
+    );
+    let error = app.end_reconcile(UserConfirmed::new()).await.unwrap_err();
+    assert!(
+        matches!(error, AppError::Refused(crate::app::Refusal::NotNow(_))),
+        "{error:?}"
+    );
+    assert_eq!(lost.next.applied().len(), applied);
+    // Once the upload went, the app writes.
+    app.receive(None).await.unwrap();
+    assert!(app.recovery_info().await.unwrap().unwrap().steps_done);
+    app.submit_batch(crate::app::OpBatch::new().op(OpKind::DenyPut { pubky: [9; 32] }))
+        .await
+        .unwrap();
 }

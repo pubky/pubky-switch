@@ -153,6 +153,11 @@ pub(crate) struct Inner {
     pub(crate) allow: Option<Value>,
     /// Shared records, claims, invite codes and connect requests.
     pub(crate) shared: shared::Shared,
+    /// Feed reads answered so far.
+    pub(crate) feed_reads: u64,
+    /// Feed reads answered before every later one is `503 unavailable`: a bound for tests
+    /// of reads that must end.
+    pub(crate) feed_limit: Option<u64>,
 }
 
 /// The scripted switch.
@@ -218,6 +223,8 @@ impl FakeSwitch {
                 minted: 0,
                 allow: None,
                 shared: shared::Shared::default(),
+                feed_reads: 0,
+                feed_limit: None,
             }),
         })
     }
@@ -275,6 +282,8 @@ impl FakeSwitch {
                 allow: None,
                 // The import carries the shared state with the rest of the account.
                 shared: inner.shared.clone(),
+                feed_reads: 0,
+                feed_limit: None,
             }),
         })
     }
@@ -939,6 +948,13 @@ impl Inner {
         if self.apps.get(&app).is_some_and(|a| a.departed) {
             return bad(ErrorCode::NotCurrent, "departed", json!({}));
         }
+        if self
+            .feed_limit
+            .is_some_and(|limit| self.feed_reads >= limit)
+        {
+            return bad(ErrorCode::Unavailable, "feed read limit", json!(null));
+        }
+        self.feed_reads += 1;
         let mut after = 0;
         let mut limit = 100usize;
         for pair in query.split('&') {
