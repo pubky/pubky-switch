@@ -1637,6 +1637,13 @@ dependencies = [
 [[package]]
 name = "pubky-switch-signer"
 version = "0.1.0"
+dependencies = [
+ "hex",
+ "pubky-switch-core",
+ "serde_json",
+ "thiserror",
+ "zeroize",
+]
 
 [[package]]
 name = "quanta"
