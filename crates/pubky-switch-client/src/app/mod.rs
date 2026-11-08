@@ -41,6 +41,13 @@ mod renewal;
 mod rotation;
 mod state;
 
+mod admission;
+mod batch;
+mod claims;
+mod directory;
+mod records;
+mod send;
+
 #[cfg(test)]
 mod tests;
 
@@ -58,6 +65,20 @@ pub use provider::ProviderStatus;
 pub use push::{MAX_HANDLE_BYTES, PushRegistration, PushRelay};
 pub use recovery::{Evidence, LossActions, ProviderLoss, RESIDUAL_WINDOW_MS, RecoveryInfo};
 pub use state::{PROTOCOL_PREFIX, SCHEMA_VERSION};
+
+pub use admission::{INVITE_CODE_BYTES, InviteCode};
+pub use batch::{OpBatch, server_time_in};
+pub use claims::{
+    ClaimDoubt, ClaimEntryRead, ClaimEvidence, ClaimOp, ClaimRead, ClaimWritten,
+    ObligationDeadline, claim_conflict,
+};
+pub use directory::PEER_DELIVERY_MS;
+pub use records::{
+    Collection, FlaggedWrite, KeptOp, RecordContent, RecordTarget, SharedEvidence, SharedRecord,
+};
+pub use send::{
+    Delivery, OutboxReport, OutgoingMessage, RecordJob, SENT_RETENTION_MS, SentMessage,
+};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -543,6 +564,7 @@ impl App {
         tx.put(key::DEVICE, &app.state.device)?;
         tx.put(key::CURSOR, &app.state.cursor)?;
         tx.put(key::JOIN, &app.state.join)?;
+        tx.put(records::LIST_DUE, &true)?;
         tx.commit(&app.env.store).await?;
         app.finish_join().await?;
         Ok(app)
@@ -871,6 +893,7 @@ impl App {
         let mut tx = Tx::new(&app.ns);
         tx.delete_prefix("")?;
         app.write_all(&mut tx).await?;
+        tx.put(records::LIST_DUE, &true)?;
         tx.commit(&app.env.store).await?;
         Ok(app)
     }
@@ -1228,6 +1251,7 @@ impl App {
         for prefix in ["rk/", "scope/", "parked/", "pending/", "p/"] {
             tx.delete_prefix(prefix)?;
         }
+        records::destroy_shared(&mut tx)?;
         tx.delete(key::KEYS)?;
         tx.delete(key::NAMING)?;
         let leave = self.state.leave.get_or_insert_with(LeaveState::default);

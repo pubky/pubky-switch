@@ -111,7 +111,6 @@ impl ChainView {
     }
 
     /// The verified chain hash at `seq`, while the view keeps it.
-    #[cfg(test)]
     pub(crate) fn hash_at(&self, seq: u64) -> Option<[u8; 32]> {
         self.verifier.chain_hash_at(seq)
     }

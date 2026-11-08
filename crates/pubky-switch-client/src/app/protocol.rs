@@ -24,10 +24,12 @@ use pubky_switch_core::json::OpaqueMember;
 use pubky_switch_core::message::{Message, MessagePlaintext};
 use pubky_switch_core::ops::{Condition, OpKind};
 use pubky_switch_core::receive::KindRules;
-use pubky_switch_core::records::{AppCert, Standing};
+use pubky_switch_core::records::{AppCert, AppRecord, Standing};
 use serde_json::Value;
 
+use super::records::Collection;
 use super::recovery::{LossActions, ProviderLoss};
+use super::send::{RecordJob, SentMessage};
 
 /// An opaque member of a protocol's message bodies (Switch wire 1.1): its numbers aren't
 /// checked against the integer range.
@@ -230,6 +232,77 @@ pub trait Protocol: Send + Sync {
     fn provider_lost(&self, loss: &ProviderLoss) -> LossActions {
         let _ = loss;
         LossActions::default()
+    }
+
+    /// Whether a certificate's scopes allow its app to receive `kind`, which a sender checks
+    /// before wrapping a message to the app (Switch spec 3.4). By default, whether the kinds
+    /// [`Protocol::accepts`] gives for the certificate list it, which are never wider than
+    /// what its scopes receive.
+    fn receives(&self, kind: &str, cert: &AppCert) -> bool {
+        self.accepts(cert).iter().any(|k| k == kind)
+    }
+
+    /// The protocol's narrower rule for senders (Switch spec 3.4): whether `message` goes to
+    /// the app whose record is `recipient`, beyond its certificate and `accepts`. Every app
+    /// by default.
+    fn sends_to(&self, message: &Message, recipient: &AppRecord) -> bool {
+        let _ = (message, recipient);
+        true
+    }
+
+    /// Whether a first message of `kind` to a counterparty that isn't a contact adds a
+    /// conversation entry before it is sent (Switch spec 7): every kind but the protocol's
+    /// re-send request, which answers entries the app can't check. Every kind by default.
+    fn adds_conversation(&self, kind: &str) -> bool {
+        let _ = kind;
+        true
+    }
+
+    /// The protocol's collections, each with its fixed policy (Switch spec 10.3). The app
+    /// lists those it may read at join and after a `missed` item, and takes writes to them
+    /// from the feed; writes to any other collection are left alone. None by default.
+    fn collections(&self) -> Vec<Collection> {
+        Vec::new()
+    }
+
+    /// What the app has seen of a record, its high water (Switch spec 8.2): the protocol's
+    /// mark after `value`, from the mark held (`None` for a write of the app's own, built on
+    /// what it trusts), or `None` to keep no mark. None by default.
+    fn record_seen(
+        &self,
+        collection: &str,
+        seen: Option<&[u8]>,
+        value: Option<&[u8]>,
+    ) -> Option<Vec<u8>> {
+        let _ = (collection, seen, value);
+        None
+    }
+
+    /// Whether a newer write of a record goes back on what the app has seen there (Switch
+    /// spec 8.2), such as dropping or replacing a message of a role it saw: the rule it
+    /// breaks, without content, and the write is flagged and not acted on. `value` is
+    /// `None` for a delete or an unreadable value. Never by default.
+    fn record_regression(
+        &self,
+        collection: &str,
+        seen: &[u8],
+        value: Option<&[u8]>,
+    ) -> Option<String> {
+        let _ = (collection, seen, value);
+        None
+    }
+
+    /// The shared record write of a sent message (Switch spec 8.2): the record's next value
+    /// from its current one (`None` for none, deleted or unreadable), or `None` when the
+    /// record already reflects the message. Nothing by default.
+    fn sent_record(
+        &self,
+        job: &RecordJob,
+        sent: &SentMessage,
+        current: Option<&[u8]>,
+    ) -> Option<Vec<u8>> {
+        let _ = (job, sent, current);
+        None
     }
 }
 

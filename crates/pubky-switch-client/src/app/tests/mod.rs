@@ -5,7 +5,9 @@
 mod fake;
 mod flows;
 mod moves;
+mod peer;
 mod push;
+mod shared_flows;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

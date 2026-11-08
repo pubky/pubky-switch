@@ -582,6 +582,7 @@ async fn test_move_compares_the_admission_lists() {
     // A faulty export: carol is gone, erin was never added, and an invite code in this
     // app's name that it never registered.
     let planted = [1u8; 32];
+    next.lock().shared.plant_invite(planted, 1, me);
     next.lock().allow = Some(json!({
         "contacts": [pubky_switch_core::enc::pubky_id(&erin)],
         "conversations": [], "deny": [], "flagged": [],

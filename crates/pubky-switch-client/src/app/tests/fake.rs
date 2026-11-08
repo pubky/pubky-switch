@@ -28,6 +28,8 @@ use crate::clock::{Clock, TestClock};
 use crate::error::TransportError;
 use crate::transport::{Header, MockTransport, Request, Response};
 
+mod shared;
+
 /// One item of the account's sequence.
 #[derive(Clone, Debug)]
 pub(crate) enum Item {
@@ -149,6 +151,8 @@ pub(crate) struct Inner {
     pub(crate) minted: u64,
     /// The answer to `GET /allow`, when scripted.
     pub(crate) allow: Option<Value>,
+    /// Shared records, claims, invite codes and connect requests.
+    pub(crate) shared: shared::Shared,
 }
 
 /// The scripted switch.
@@ -213,6 +217,7 @@ impl FakeSwitch {
                 push: BTreeMap::new(),
                 minted: 0,
                 allow: None,
+                shared: shared::Shared::default(),
             }),
         })
     }
@@ -268,6 +273,8 @@ impl FakeSwitch {
                 push: BTreeMap::new(),
                 minted: 0,
                 allow: None,
+                // The import carries the shared state with the rest of the account.
+                shared: inner.shared.clone(),
             }),
         })
     }
@@ -390,7 +397,10 @@ impl FakeSwitch {
             .header(header::APP)
             .and_then(|text| app_id_decode(text).ok());
         let rest = path.splitn(4, '/').nth(3).unwrap_or_default().to_owned();
-        let (status, body) = inner.route(request, caller, &rest);
+        let (status, body) = match inner.route_shared(request, caller, &rest) {
+            Some(answer) => answer,
+            None => inner.route(request, caller, &rest),
+        };
         if lose {
             return Err(TransportError::Timeout);
         }
