@@ -156,7 +156,7 @@ mod tests {
     fn test_config_round_trips_through_toml() {
         let mut config = Config::default();
         config.limits.quota_bytes *= 2;
-        config.limits.checkpoint_behind = Some(10_000);
+        config.limits.checkpoint_behind = 10_000;
         config.log.format = LogFormat::Text;
         config.database.url = Some("postgres://switch@db/switch".into());
         config.keys.path = Some("/var/lib/pubky-switch/keys".into());
