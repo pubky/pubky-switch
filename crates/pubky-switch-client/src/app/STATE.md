@@ -71,20 +71,6 @@ Deleting the keys on a leave removes `keys`, `naming`, `rk/`, `scope/`, `parked/
 - A changed record type bumps `SCHEMA_VERSION` with a migration that runs on load.
 - Protocol state stays under `p/`, written only through `LocalWrite`.
 
-## What the next parts add, and where
-
-- **Sending and admission:** an outbox under `out/<msg_id>` (the envelope, signed once, and
-  its delivery and record jobs), sent messages kept 30 days under `sent/`, counterparties'
-  directories under `dir/<pubky>`, and the deliveries of the own `identity.json` to the
-  switches the app wrote to (Switch spec 12.2 step 5). The protocol's re-send requests,
-  queued today by `Protocol::resend_needed` and `Protocol::missed` in `p/`, go out through
-  it. A deferred cursor move already rides on the next batch (`App::sign_ops`).
-- **Shared records and claims:** the records layer reads and caches collections, takes
-  `record.put` and `claim` items from the feed (today passed by `feed.rs` as chain items with
-  no app-layer effect), lists collections at join and after a `missed` item, and keeps proofs
-  and evidence for uploads. Effects already carry their operations with the cursor move.
-- **Moves, provider loss and recovery, and push:** in place; their records are below.
-
 ## Moves, recovery and push
 
 `provider.rs` follows a cooperative move or a key change in place, and keeps that the app

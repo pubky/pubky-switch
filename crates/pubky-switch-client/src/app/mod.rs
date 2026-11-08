@@ -22,9 +22,9 @@
 //! Moves, provider loss and recovery, revocation and erasure as an app sees them, and push
 //! with its peek, are in `provider.rs`, `recovery.rs`, `push.rs` and `peek.rs`.
 //!
-//! What this layer leaves to later parts, and where they plug in, is in `STATE.md`:
-//! sending and admission (the outbox and its jobs), and shared records and claims (the
-//! protocol's effects already carry their operations; listing collections at the start).
+//! Sending with the outbox and directories, admission, shared records and claims, and
+//! batches with conditions are in `send.rs`, `directory.rs`, `admission.rs`, `records.rs`,
+//! `claims.rs` and `batch.rs`. `STATE.md` lists the store keys each part keeps.
 
 mod chain;
 mod error;

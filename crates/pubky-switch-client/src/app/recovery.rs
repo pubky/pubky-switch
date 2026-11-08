@@ -280,11 +280,29 @@ impl App {
         self.commit(tx).await
     }
 
-    /// The kept operations, as uploads: the `record.put`s and the claim entries.
+    /// The kept operations, as uploads: the `record.put`s and the claim entries, those kept
+    /// here and those the shared state holds (Switch spec 12.5 step 3, 12.6 step 3), each
+    /// once.
     async fn kept_ops(&self) -> Result<(Vec<UploadedOp>, Vec<UploadedOp>), AppError> {
         let mut records = Vec::new();
         let mut claims = Vec::new();
-        for (_, kept) in self.reader().scan::<KeptOp>("ev/op/").await? {
+        let mut kept: Vec<KeptOp> = self
+            .reader()
+            .scan::<KeptOp>("ev/op/")
+            .await?
+            .into_iter()
+            .map(|(_, kept)| kept)
+            .collect();
+        for shared in self.shared_evidence().await?.ops {
+            if !kept.iter().any(|k| k.op == shared.op) {
+                kept.push(KeptOp {
+                    op: shared.op,
+                    cert: shared.cert,
+                    proof: shared.proof,
+                });
+            }
+        }
+        for kept in kept {
             let claim = SignedOp::peek(&kept.op)
                 .map(|op| matches!(op.body().kind, OpKind::Claim(_)))
                 .map_err(|_| corrupt())?;
@@ -319,6 +337,18 @@ impl App {
             if let Some(proof) = kept.proof
                 && !proofs.contains(&proof)
             {
+                proofs.push(proof);
+            }
+        }
+        // The shared state's evidence: its SETTLED and tombstone proofs, and the proofs of
+        // the record writes and claim entries it holds.
+        let shared = self.shared_evidence().await?;
+        let shared_proofs = shared
+            .proofs
+            .into_iter()
+            .chain(shared.ops.into_iter().filter_map(|kept| kept.proof));
+        for proof in shared_proofs {
+            if !proofs.contains(&proof) {
                 proofs.push(proof);
             }
         }

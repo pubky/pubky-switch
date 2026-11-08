@@ -1242,6 +1242,31 @@ async fn test_claims_and_records_hand_over_their_evidence() {
 }
 
 #[tokio::test]
+async fn test_shared_evidence_goes_into_the_uploads() {
+    let s = Setup::new();
+    let (mut app, _) = settled(&s).await;
+    app.put_record(&s.target("n1"), &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    // A move's or a loss's uploads carry the shared state's proofs with the evidence kept
+    // on its own (Switch spec 12.5 step 3, 12.6 step 3).
+    let shared = app.shared_evidence().await.unwrap();
+    let proofs = app.kept_proofs(None).await.unwrap();
+    for proof in shared
+        .proofs
+        .iter()
+        .chain(shared.ops.iter().filter_map(|op| op.proof.as_ref()))
+    {
+        assert!(proofs.contains(proof));
+    }
+    // Each proof once: the SETTLED proof is the `done` entry's own.
+    for (i, proof) in proofs.iter().enumerate() {
+        assert!(!proofs[i + 1..].contains(proof), "a proof twice");
+    }
+    assert_eq!(proofs.len(), 3);
+}
+
+#[tokio::test]
 async fn test_claims_tombstone_kept_until_its_window_ends() {
     let s = Setup::new();
     let (mut app, deadline) = settled(&s).await;
