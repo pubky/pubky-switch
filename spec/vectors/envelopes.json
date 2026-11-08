@@ -377,7 +377,7 @@
         "last_epoch": 2,
         "name": "extra scope",
         "plaintext_json": "{\"v\":1,\"kind\":\"pubky-switch.key_bundle\",\"naming_key\":\"5AO6w5gGCLH-8mq7M11VAHUtatZT5a708KzmlEUdApY\",\"cert\":\"mHF_23P3wo5d0XIIu4uUfd28tdePYkzFgnokrJ2mr4U\",\"first_epoch\":2,\"last_epoch\":2,\"keys\":[{\"data_epoch\":2,\"scope\":\"pay\",\"key\":\"yG_XliYxOR8tWgKowDdeqZ9oQpuA7QESajDOHRPe3lE\"},{\"data_epoch\":2,\"scope\":\"allowance\",\"key\":\"GEIyEAug6I4vVoFU05tve2rYsTGKSXra4buQRLpprgQ\"},{\"data_epoch\":2,\"scope\":\"allowance_execute\",\"key\":\"XUEBd9f8DaREq-cxRpzdPawZHFklFBoOg9afhkpMIPU\"},{\"data_epoch\":2,\"scope\":\"request\",\"key\":\"-9c985haRd6JxJ02XqnPnpTlWza1JypjE3kc3NzMQOY\"}]}",
-        "reason": "a key for request, which the certificate doesn't hold as a Paykit scope"
+        "reason": "a key for request, a scope the certificate doesn't hold"
       },
       {
         "bundle": {
@@ -416,7 +416,7 @@
         "reason": "the part names a certificate the app doesn't hold"
       }
     ],
-    "description": "Wire 3.5 Reading: key bundle parts the executor skips although each verifies and opens with its bundle secret (key_bundle.bundle_secret_hex): each is key_bundle's part at data epoch 2 changed once, sealed with fixed randomness (seeds key-bundle/reject/<n>/cek, /nonce, /ikm-e, <n> the case's index in cases, from 0) and signed by alice's identity key. A part's keys are exactly one for each Paykit scope of the certificate its cert names and each data epoch of its range, and cert names a certificate the reader takes parts for. The executor holds documents.json's executor certificate. reason is the prototype's wording."
+    "description": "Wire 3.5 Reading: key bundle parts the executor skips although each verifies and opens with its bundle secret (key_bundle.bundle_secret_hex): each is key_bundle's part at data epoch 2 changed once, sealed with fixed randomness (seeds key-bundle/reject/<n>/cek, /nonce, /ikm-e, <n> the case's index in cases, from 0) and signed by alice's identity key. A part's keys are exactly one for each keyed scope of the certificate its cert names and each data epoch of its range, and cert names a certificate the reader takes parts for. The executor holds documents.json's executor certificate. reason is the prototype's wording."
   },
   "reduction_key_bundle": {
     "app": "wallet",
