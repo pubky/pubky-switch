@@ -26,6 +26,7 @@ mod enrollments;
 mod feed;
 mod identity;
 mod ops;
+mod peers;
 #[cfg(any(test, feature = "test-util"))]
 pub mod testing;
 
@@ -46,6 +47,7 @@ pub use ops::{
     ListName, StoredApp, StoredBundlePart, StoredClaimEntry, StoredInvite, StoredListEntry,
     StoredRecord,
 };
+pub use peers::{HeldPeer, PeerFloor};
 
 use crate::admin::{CheckFuture, ReadinessCheck};
 
