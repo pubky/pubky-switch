@@ -1296,6 +1296,63 @@ async fn test_erasure_wait_isnt_concluded_by_a_clock_jump() {
     assert_eq!(app.state.erasing.map(|e| e.tries), Some(1));
 }
 
+/// An app whose account was taken as erased, holding alice's version 2; the Homeserver
+/// serves nothing. Returns the bytes of her version 1.
+async fn erased_holding_v2(w: &World, router: &Router) -> (App, Vec<u8>) {
+    let mut app = join(w, router).await;
+    let first = w.homeserver.file(w.alice.public(), IDENTITY_PATH).unwrap();
+    w.next_doc(|_| {});
+    app.refresh_identity().await.unwrap();
+    assert_eq!(app.state.own_doc.version(), 2);
+    w.switch.lock().erased = true;
+    w.homeserver.remove(w.alice.public(), IDENTITY_PATH);
+    erasure_tries_but_the_last(w, &mut app).await;
+    w.clock
+        .advance_ms(crate::app::provider::ERASURE_TRY_SPACING_MS);
+    assert!(app.receive(None).await.unwrap().stopped);
+    assert_eq!(app.follow_provider().await.unwrap(), ProviderStatus::Gone);
+    (app, first)
+}
+
+#[tokio::test]
+async fn test_erased_account_isnt_revived_by_an_older_document() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let (mut app, first) = erased_holding_v2(&w, &router).await;
+    // A stale version 1 shows again: nothing newer than what the app holds.
+    w.homeserver.put(w.alice.public(), IDENTITY_PATH, first);
+    let report = app.receive(None).await.unwrap();
+    assert!(report.stopped);
+    assert!(
+        !has(&report.events, |e| matches!(e, AppEvent::AccountBack)),
+        "{:?}",
+        report.events
+    );
+    assert_eq!(app.follow_provider().await.unwrap(), ProviderStatus::Gone);
+}
+
+#[tokio::test]
+async fn test_erased_account_stays_gone_when_the_copy_fails() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let (mut app, _) = erased_holding_v2(&w, &router).await;
+    // Another body at the version held: equivocation, so the copy fails.
+    let mut body = w.signer.body();
+    body.record_max_age = Some(3600);
+    let other = IdentityDoc::sign(&w.alice, body).unwrap();
+    assert_eq!(other.version(), 2);
+    w.homeserver.publish(&other).unwrap();
+    assert!(app.receive(None).await.is_err());
+    // `gone` stays, in the store too.
+    assert!(app.state.gone.is_some());
+    assert!(
+        app.reader()
+            .exists(crate::app::provider::keys::GONE)
+            .await
+            .unwrap()
+    );
+}
+
 #[tokio::test]
 async fn test_erased_account_seen_alive_again_comes_back() {
     let w = World::new();
