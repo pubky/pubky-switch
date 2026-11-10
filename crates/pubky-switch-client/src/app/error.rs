@@ -182,7 +182,11 @@ pub(crate) enum RefusalPlace {
     /// Authentication's `401 bad_signature`, `401 stale_timestamp`, `403 not_current`, `403
     /// cert_expired`, `410 moved` and `503 staged` (Switch wire 7.2, 7.3), and `403
     /// not_admitted` (step 1, a caller of another identity, decided from the request's
-    /// identity and the account, not from the batch).
+    /// identity and the account, not from the batch). `410 moved` is the one of these that
+    /// lets feed reads go on (Switch wire 7.3 step 8); that is fine: during a freeze every
+    /// write is refused, the cursor move included, so the feed can't advance at that
+    /// service with or without a kept effect in front of it, and stopping the read at the
+    /// `410` and having the move carry the effect across loses nothing.
     Caller,
     /// Before the lookup, about these bytes: the same bytes get the same answer, so the
     /// batch is never answered and is handled at once as one kept past the window: an
