@@ -26,10 +26,16 @@ impl App {
     ///
     /// # Errors
     ///
-    /// A failed call or commit. A `404` (no part stored) isn't one.
+    /// [`Refusal::Stopped`] or [`Refusal::Left`] for a stopped or departed app; a failed
+    /// call or commit. A `404` (no part stored) isn't one.
+    ///
+    /// [`Refusal::Stopped`]: super::Refusal::Stopped
+    /// [`Refusal::Left`]: super::Refusal::Left
     pub async fn fetch_key_bundle(&mut self) -> Result<(), AppError> {
         Box::pin(async move {
             self.ready_local().await?;
+            // A full-bundle request is a write through the service (Switch spec 3.5).
+            self.refuse_when_halted()?;
             let result = self.client.keys().await;
             let answer = match self.take(result).await {
                 Ok(answer) => Some(answer),

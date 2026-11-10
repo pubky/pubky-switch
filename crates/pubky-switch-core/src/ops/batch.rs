@@ -243,6 +243,32 @@ pub fn check_batch(ops: &[SignedOp]) -> std::result::Result<(), Refusal> {
     Ok(())
 }
 
+/// The bounds of a `cursor.set` position (Switch wire 6.2): its generation is `current`, or
+/// `continued_from`, the generation a cooperative move's sequence continues from, and its
+/// `seq` is at most `newest`, the newest `seq` of the account's sequence.
+///
+/// # Errors
+///
+/// `400 bad_request`.
+pub fn check_cursor(
+    position: Position,
+    current: u64,
+    continued_from: Option<u64>,
+    newest: u64,
+) -> std::result::Result<(), Refusal> {
+    if position.generation != current && Some(position.generation) != continued_from {
+        return Err(Refusal::bad_request(
+            "Switch wire 6.2: a cursor.set of another generation",
+        ));
+    }
+    if position.seq > newest {
+        return Err(Refusal::bad_request(
+            "Switch wire 6.2: a cursor.set past the newest seq",
+        ));
+    }
+    Ok(())
+}
+
 /// A batch ID: 16 bytes from the secure random generator (Switch wire 1.7).
 ///
 /// # Errors
@@ -1007,5 +1033,20 @@ mod tests {
         )
         .unwrap();
         assert!(depends_on_time(&windowed, &never));
+    }
+
+    #[test]
+    fn test_check_cursor_keeps_the_generation_and_head_bounds() {
+        let at = |generation, seq| Position { generation, seq };
+        assert!(check_cursor(at(1, 0), 1, None, 0).is_ok());
+        assert!(check_cursor(at(1, 9), 1, None, 9).is_ok());
+        // After a cooperative move, the generation the sequence continues from.
+        assert!(check_cursor(at(1, 9), 2, Some(1), 12).is_ok());
+        assert!(check_cursor(at(2, 12), 2, Some(1), 12).is_ok());
+        let refused = |position| check_cursor(position, 1, None, 9).err().map(|r| r.code);
+        assert_eq!(refused(at(1, 10)), Some(ErrorCode::BadRequest));
+        assert_eq!(refused(at(77, 9)), Some(ErrorCode::BadRequest));
+        assert_eq!(refused(at(0, 0)), Some(ErrorCode::BadRequest));
+        assert!(check_cursor(at(3, 0), 2, Some(1), 12).is_err());
     }
 }

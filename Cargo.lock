@@ -1714,9 +1714,12 @@ name = "pubky-switch-signer"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "pubky-switch-client",
  "pubky-switch-core",
+ "serde",
  "serde_json",
  "thiserror",
+ "tokio",
  "zeroize",
 ]
 

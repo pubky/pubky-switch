@@ -380,7 +380,7 @@ impl App {
         let epoch_rose = read.epoch_rose;
         *blocked = read.blocked;
         self.end_page(read).await?;
-        if epoch_rose {
+        if epoch_rose && self.state.alarm.is_none() {
             self.fetch_key_bundle().await?;
         }
         if stopped.is_some() {

@@ -308,8 +308,9 @@ impl App {
     ///
     /// # Errors
     ///
-    /// [`Refusal::Usage`] for an operation that isn't an own `attempt` signed by the app's
-    /// key; [`AppError::InvalidData`] for a proof that doesn't verify with the service key or
+    /// [`Refusal::Stopped`] or [`Refusal::Left`] for a stopped or departed app, with nothing
+    /// checked or written; [`Refusal::Usage`] for an operation that isn't an own `attempt`
+    /// signed by the app's key; [`AppError::InvalidData`] for a proof that doesn't verify with the service key or
     /// doesn't bind the operation, with nothing changed; once it binds, a rollback for a
     /// proof stamped at or after the deadline, and [`AppError::InvalidData`] for one that
     /// shows another state, after which the attempt is written `failed`.
@@ -320,6 +321,7 @@ impl App {
     ) -> Result<ClaimView, AppError> {
         Box::pin(async move {
             self.ready_local().await?;
+            self.refuse_when_stopped()?;
             let identity = self.state.meta.identity;
             let app_id = self.state.meta.app_id;
             let op = SignedOp::verify(
