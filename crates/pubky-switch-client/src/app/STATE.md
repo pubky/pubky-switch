@@ -88,7 +88,7 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
 | `leave` | a leave in progress or done | |
 | `service_time` | the highest service time verified, its key, the offset from the device clock | |
 | `p/...` | the protocol's own local state (`LocalWrite`) | the protocol's |
-| `duty/<id>` | a duty event (`AppEvent::is_duty`), written in the commit of the change it reports, until the host acknowledges it (`App::ack_events`); one per entry stored for good, kept batch or `attempt` dropped, or outbox message given up. Only acknowledgements remove them: nothing bounds them for a host that never acknowledges | |
+| `duty/<id>` | a duty event (`AppEvent::is_duty`), written in the commit of the change it reports, until the host acknowledges it (`App::ack_events`); one per entry stored for good, kept batch or `attempt` dropped, kept batch refused for good, or outbox message given up. Only acknowledgements remove them: nothing bounds them for a host that never acknowledges | |
 | `dutyn` | the counter the next duty event takes; it only goes up in one store, and a restore in place keeps it | |
 | `dutye` | the store's event epoch, random, chosen once when the store starts empty (the first join, or a restore onto a store without one); every duty event ID carries it with its counter | |
 

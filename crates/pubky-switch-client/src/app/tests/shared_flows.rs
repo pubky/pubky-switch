@@ -1894,6 +1894,16 @@ async fn test_batch_kept_and_refused_for_good_later_is_reported() {
     // Dropped: not sent again.
     app.flush_outbox().await.unwrap();
     assert_eq!(denied(&s, [9; 32]), 0);
+    // A duty event: a load delivers it again until it is acknowledged.
+    let mut loaded = App::load(s.env(), s.protocol.clone(), World::config(), app.app_id())
+        .await
+        .unwrap();
+    let again = loaded.take_events();
+    assert!(
+        again.iter().any(|e| e.is_duty()
+            && matches!(e, AppEvent::BatchRefused { code, .. } if code == "permission_missing")),
+        "{again:?}"
+    );
 }
 
 #[tokio::test]

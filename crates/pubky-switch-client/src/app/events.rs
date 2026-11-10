@@ -9,7 +9,8 @@
 //! ([`AppEvent::is_duty`]): a received message's effect refused for good, too large for one
 //! batch, or of unknown fate, and its entry stored locally for good (Switch spec 8.2, 12.5
 //! "Kept batches"); a kept batch dropped at a provider change and each `attempt` in it
-//! (Switch spec 12.5 "Kept batches", 12.6 step 5); a message deleted from the outbox
+//! (Switch spec 12.5 "Kept batches", 12.6 step 5); a kept batch refused for good, with its
+//! local writes and outbox messages (Switch spec 6.4); a message deleted from the outbox
 //! undelivered (Switch spec 11). Each carries a stable [`EventId`] and is kept in the
 //! store (`duty/<id>`) in the same commit as the change it reports, so no crash separates
 //! the two. It is reported once that commit is done, or, for a commit whose answer can't
@@ -551,8 +552,11 @@ pub enum AppEvent {
         claim_key: [u8; 32],
     },
     /// A batch kept from an earlier call was sent again and refused for good: it was not
-    /// applied, and the app no longer keeps it (Switch spec 6.4, Switch wire 6.4).
+    /// applied, and the app no longer keeps it, nor the local writes and outbox messages it
+    /// carried (Switch spec 6.4, Switch wire 6.4). A duty event.
     BatchRefused {
+        /// The duty event's ID.
+        id: EventId,
         /// The batch ID.
         batch_id: [u8; 16],
         /// The error code of the refusal.
@@ -578,6 +582,7 @@ impl AppEvent {
             Self::EffectRefused { id, .. }
             | Self::EffectUncertain { id, .. }
             | Self::KeptBatchDropped { id, .. }
+            | Self::BatchRefused { id, .. }
             | Self::AttemptDropped { id, .. }
             | Self::MessageUndelivered { id, .. } => Some(*id),
             _ => None,
@@ -630,6 +635,11 @@ pub(crate) enum Duty {
         #[serde(with = "serde_b64")]
         batch_id: [u8; 16],
     },
+    BatchRefused {
+        #[serde(with = "serde_b64")]
+        batch_id: [u8; 16],
+        code: String,
+    },
     AttemptDropped {
         #[serde(with = "serde_b64")]
         claim_key: [u8; 32],
@@ -680,6 +690,7 @@ impl Duty {
                 attempts,
             },
             Self::KeptBatchDropped { batch_id } => AppEvent::KeptBatchDropped { id, batch_id },
+            Self::BatchRefused { batch_id, code } => AppEvent::BatchRefused { id, batch_id, code },
             Self::AttemptDropped {
                 claim_key,
                 attempt_id,

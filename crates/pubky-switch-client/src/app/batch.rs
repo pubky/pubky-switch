@@ -540,10 +540,7 @@ impl App {
                         .await?;
                 }
                 Err(error) => match refused_for_good(&error) {
-                    Some(code) => self.events.push(AppEvent::BatchRefused {
-                        batch_id: id,
-                        code: code.as_str().to_owned(),
-                    }),
+                    Some(code) => self.kept_batch_refused(&id, code).await?,
                     None => return Err(error),
                 },
             }
@@ -579,6 +576,22 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    /// A kept batch sent again and refused for good at or after its batch ID lookup: it was
+    /// never applied, and goes with the local writes and outbox messages it carried; the
+    /// protocol is told in that commit ([`AppEvent::BatchRefused`]).
+    async fn kept_batch_refused(&mut self, id: &[u8; 16], code: ErrorCode) -> Result<(), AppError> {
+        let mut tx = self.tx()?;
+        tx.delete(&pending_key(id))?;
+        self.keep_duty(
+            &mut tx,
+            super::events::Duty::BatchRefused {
+                batch_id: *id,
+                code: code.as_str().to_owned(),
+            },
+        )?;
+        self.commit(tx).await
     }
 
     /// A kept batch sent again and refused before the service looked at its batch ID, which
@@ -632,8 +645,9 @@ impl App {
         let submitted = match self.submit(batch).await {
             Ok(submitted) => submitted,
             Err(error) => {
-                if refused_for_good(&error).is_some() && !(resent && refused_before_lookup(&error))
-                {
+                // A first send's refusal is its caller's; one sent again is dropped and
+                // reported by its caller, in one commit.
+                if refused_for_good(&error).is_some() && !resent {
                     let mut tx = self.tx()?;
                     tx.delete(&pending_key(id))?;
                     self.commit(tx).await?;
@@ -847,14 +861,7 @@ impl App {
             }
             Err(error) => {
                 if let Some(code) = refused_for_good(&error) {
-                    let mut tx = self.tx()?;
-                    tx.delete(&pending_key(id))?;
-                    self.commit(tx).await?;
-                    self.events.push(AppEvent::BatchRefused {
-                        batch_id: *id,
-                        code: code.as_str().to_owned(),
-                    });
-                    return Ok(());
+                    return self.kept_batch_refused(id, code).await;
                 }
                 return Err(error);
             }
