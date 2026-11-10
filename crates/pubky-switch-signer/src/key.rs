@@ -408,11 +408,25 @@ impl BackupView {
         }
     }
 
-    /// Whether another install wrote it at or past `own_newest`, the high-water version of
-    /// the install `own_signer`: it took over, and this one stops (Switch wire 3.13
-    /// "Another install's backup"; the core's `taken_over`).
-    pub(crate) fn taken_over(&self, own_signer: &[u8; 16], own_newest: u64) -> bool {
-        &self.identity_doc.body().signer != own_signer && self.identity_doc.version() >= own_newest
+    /// Whether another install than `own_signer` wrote it past `own_newest`, the high-water
+    /// mark's document, or at its version holding that same document: it took over, and this
+    /// one stops (Switch wire 3.13 "Another install's backup"; the core's `taken_over`). One
+    /// at the mark's version holding another document is a losing delivery's, and this
+    /// install, still the signer, writes over it.
+    pub(crate) fn taken_over(
+        &self,
+        own_signer: &[u8; 16],
+        own_newest: Option<&IdentityDoc>,
+    ) -> bool {
+        let doc = &self.identity_doc;
+        if &doc.body().signer == own_signer {
+            return false;
+        }
+        let Some(mark) = own_newest else {
+            return true;
+        };
+        doc.version() > mark.version()
+            || (doc.version() == mark.version() && doc.signed() == mark.signed())
     }
 }
 
@@ -784,6 +798,43 @@ pub(crate) mod tests {
         assert_eq!(view.revoked_apps, [[2; 16]]);
         let other = IdentityKeyring::open(MemoryVault::holding([7; 32])).unwrap();
         assert!(other.open_backup(&backup).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_key_backup_at_the_mark_is_a_take_over_only_with_its_document() {
+        use pubky_switch_core::records::{IdentityBody, IdentityPolicy, Inbox};
+        let key = IdentityKey::from_secret([6; 32]);
+        let doc = |version: u64, signer: [u8; 16], record_max_age: Option<u64>| {
+            let mut body = IdentityBody::first(
+                key.public(),
+                signer,
+                Inbox::new("https://switch.example", [4; 32]),
+                IdentityPolicy::default(),
+            );
+            body.version = version;
+            body.record_max_age = record_max_age;
+            IdentityDoc::sign(&key, body).unwrap()
+        };
+        let view = |identity_doc: IdentityDoc| BackupView {
+            identity_doc,
+            revoked_apps: Vec::new(),
+            certs: Vec::new(),
+            limits: Limits::default(),
+            bundle_parts: Vec::new(),
+            prev: None,
+        };
+        let (me, other) = ([1; 16], [2; 16]);
+        let theirs = doc(2, other, None);
+        // At the mark's version holding the mark's own document, another install's: taken.
+        assert!(view(theirs.clone()).taken_over(&me, Some(&theirs)));
+        // At it with another document: a losing delivery's.
+        let mine = doc(2, me, Some(60));
+        assert!(!view(theirs.clone()).taken_over(&me, Some(&mine)));
+        // Past it: taken; behind it, or this install's own: not.
+        assert!(view(theirs.clone()).taken_over(&me, Some(&doc(1, me, None))));
+        assert!(!view(theirs.clone()).taken_over(&me, Some(&doc(3, me, None))));
+        assert!(!view(doc(5, me, None)).taken_over(&me, Some(&mine)));
+        assert!(view(theirs).taken_over(&me, None));
     }
 
     #[test]

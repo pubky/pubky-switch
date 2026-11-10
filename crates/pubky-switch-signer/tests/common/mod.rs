@@ -62,6 +62,8 @@ pub struct TestHomeserver {
     pub failing_path: Mutex<Option<String>>,
     /// Writes to this path apply, and their answer is lost: the writer sees a failure.
     pub losing_path: Mutex<Option<String>>,
+    /// Reads of this path fail while other reads and every write go through.
+    pub failing_read_path: Mutex<Option<String>>,
 }
 
 impl TestHomeserver {
@@ -87,7 +89,8 @@ impl TestHomeserver {
 
 impl Homeserver for TestHomeserver {
     fn get(&self, path: &str) -> BoxFuture<'_, Result<Option<Vec<u8>>, TransportError>> {
-        let answer = if *self.down.lock().unwrap() {
+        let failing = self.failing_read_path.lock().unwrap().as_deref() == Some(path);
+        let answer = if *self.down.lock().unwrap() || failing {
             Err(TransportError::Connect("down".into()))
         } else {
             Ok(self.file(path))

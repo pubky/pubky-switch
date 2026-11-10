@@ -322,6 +322,9 @@ impl Signer {
         let Some(newest) = self.state.newest.clone() else {
             return Ok(());
         };
+        // Sealed before the check, so only the check's read comes before the write.
+        let backup = self.seal_backup(&newest.doc, newest.prev)?;
+        let bytes = serde_json::to_vec(&backup).map_err(|e| SignerError::Records(e.to_string()))?;
         let raised = match self.check_backup_write().await {
             Ok(raised) => raised,
             Err(SignerError::Homeserver(_) | SignerError::Switch(_)) => {
@@ -334,8 +337,6 @@ impl Signer {
             }
             Err(error) => return Err(error),
         };
-        let backup = self.seal_backup(&newest.doc, newest.prev)?;
-        let bytes = serde_json::to_vec(&backup).map_err(|e| SignerError::Records(e.to_string()))?;
         let written = self
             .env
             .homeserver
