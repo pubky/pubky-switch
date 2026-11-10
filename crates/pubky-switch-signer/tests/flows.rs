@@ -692,6 +692,20 @@ async fn test_signer_another_body_on_the_homeserver_is_an_alarm_then_republished
     assert_eq!(signer.status(), SignerStatus::Signing);
     let three = signer.set_record_max_age(Some(3_600)).await.unwrap();
     assert_eq!(world.published().unwrap().signed(), three.signed());
+    // A third body planted after the clear is another equivocation: the alarm again, and
+    // it is kept.
+    let third = other_body(&world, &three);
+    plant(&world, &third);
+    let alert = Alert::Equivocation {
+        source: Source::Homeserver,
+        version: 3,
+    };
+    assert_eq!(
+        signer.set_record_max_age(Some(60)).await.unwrap_err(),
+        SignerError::Alarm(alert.clone())
+    );
+    assert!(signer.alerts().contains(&alert));
+    assert_eq!(world.published().unwrap().signed(), third.signed());
 }
 
 #[tokio::test]

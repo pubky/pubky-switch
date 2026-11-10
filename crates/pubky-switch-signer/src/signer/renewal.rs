@@ -442,7 +442,7 @@ impl Signer {
 
     /// Whether a closing delivery is owed and can be made now.
     pub(super) fn owes_closing(&self) -> Result<bool> {
-        Ok(self.state.managed_by.is_none() && !self.closing_stalled() && !self.owed()?.is_empty())
+        Ok(self.check_named().is_ok() && !self.closing_stalled() && !self.owed()?.is_empty())
     }
 
     /// When a closing delivery is owed and no flow is in progress, commit it as the next
@@ -454,7 +454,8 @@ impl Signer {
     /// a retry, whose answer carries its delivery's proof. [`Alert::ReductionNotClosed`]
     /// is shown while a retry gave no time, and goes once the renewals are closed.
     pub(super) async fn queue_owed_closing(&mut self) -> Result<bool> {
-        if self.flow.is_some() || self.state.managed_by.is_some() {
+        // Nothing is signed while another install signs or the records are behind.
+        if self.flow.is_some() || self.check_named().is_err() {
             return Ok(false);
         }
         let owed = self.owed()?;
