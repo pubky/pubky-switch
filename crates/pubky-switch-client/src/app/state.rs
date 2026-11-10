@@ -134,6 +134,10 @@ pub(crate) mod key {
         format!("held/{}", num(seq))
     }
 
+    pub(crate) fn retry(seq: u64) -> String {
+        format!("retry/{}", num(seq))
+    }
+
     pub(crate) fn parked(seq: u64) -> String {
         format!("parked/{}", num(seq))
     }
@@ -324,6 +328,15 @@ pub(crate) struct HeldEntry {
     pub(crate) since_ms: u64,
 }
 
+/// `retry/<seq>`: an entry whose receive step couldn't finish because the protocol's store
+/// or the host failed (`Outcome::Retry`): the reads in a row that ended so, and when the
+/// first was. Kept until the entry is processed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RetryEntry {
+    pub(crate) reads: u32,
+    pub(crate) since_ms: u64,
+}
+
 /// `parked/<seq>`: an entry stored locally and passed with the cursor (Switch spec 8.2).
 /// Sensitive: it holds the opened message, so its `Debug` shows only its size.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -472,6 +485,9 @@ pub(crate) struct ServiceTime {
 pub(crate) struct Tx {
     ns: String,
     batch: WriteBatch,
+    /// The protocol's local writes in the batch, in order, which a receive step later in
+    /// the same read sees before they are committed.
+    local: Vec<LocalWrite>,
 }
 
 impl Tx {
@@ -479,6 +495,7 @@ impl Tx {
         Self {
             ns: ns.to_owned(),
             batch: WriteBatch::new(),
+            local: Vec::new(),
         }
     }
 
@@ -514,8 +531,14 @@ impl Tx {
                     self.batch.delete_prefix(&self.ns, prefixed(prefix))?;
                 }
             }
+            self.local.push(write.clone());
         }
         Ok(())
+    }
+
+    /// The protocol's local writes in the batch, not yet committed, in order.
+    pub(crate) fn pending_local(&self) -> &[LocalWrite] {
+        &self.local
     }
 
     pub(crate) fn is_empty(&self) -> bool {

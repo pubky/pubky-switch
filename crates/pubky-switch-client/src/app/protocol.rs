@@ -32,9 +32,12 @@ use pubky_switch_core::records::{AppCert, AppRecord, Standing};
 use serde_json::Value;
 
 use super::context::{LocalView, ReceiveContext};
+use super::error::AppError;
 use super::records::Collection;
 use super::recovery::{LossActions, ProviderLoss};
 use super::send::{RecordJob, SentMessage};
+use crate::error::StoreError;
+use crate::store::KeyValue;
 
 /// An opaque member of a protocol's message bodies (Switch wire 1.1): its numbers aren't
 /// checked against the integer range.
@@ -116,6 +119,56 @@ impl std::fmt::Debug for LocalWrite {
     }
 }
 
+/// The protocol's layer of an app backup (Switch spec 12.4): its own local state, such as
+/// its journal, in a form it chooses ([`Protocol::backup_layer`]), carried in the
+/// [`super::AppBackup`] ([`super::App::backup_layered`]) and installed by
+/// [`super::App::restore`] in
+/// the same commit as the app's own state ([`Protocol::restore_layer`]). Opaque to the app.
+/// Sensitive: its `Debug` shows only the protocol's name and the data's size.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ProtocolLayer {
+    /// The protocol that made it, as its [`Protocol::backup_name`] gives it: a restore takes
+    /// the layer only with a protocol of that name.
+    pub protocol: String,
+    /// The protocol's data.
+    pub data: Vec<u8>,
+}
+
+impl std::fmt::Debug for ProtocolLayer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ProtocolLayer({}, {} bytes)",
+            self.protocol,
+            self.data.len()
+        )
+    }
+}
+
+/// A protocol's local state as the default [`Protocol::backup_layer`] writes it: each key
+/// and value length-prefixed, in order.
+pub fn encode_local_state(state: &[KeyValue]) -> Vec<u8> {
+    let parts: Vec<&[u8]> = state
+        .iter()
+        .flat_map(|(key, value)| [key.as_slice(), value.as_slice()])
+        .collect();
+    pubky_switch_core::enc::lp(&parts)
+}
+
+/// The local state [`encode_local_state`] wrote, or `None` for bytes it didn't write.
+pub fn decode_local_state(bytes: &[u8]) -> Option<Vec<KeyValue>> {
+    let parts = pubky_switch_core::enc::split_lp(bytes)?;
+    if parts.len() % 2 != 0 {
+        return None;
+    }
+    let mut parts = parts.into_iter();
+    let mut state = Vec::new();
+    while let (Some(key), Some(value)) = (parts.next(), parts.next()) {
+        state.push((key, value));
+    }
+    Some(state)
+}
+
 /// What a received message does: the operations committed in one batch with the cursor
 /// move, and the protocol's local writes committed with the outcome. The writes added
 /// through the [`ReceiveContext`] come first, then these.
@@ -148,6 +201,100 @@ pub enum Need {
     Claim([u8; 32]),
 }
 
+/// The reads of the feed in a row, each ending in [`Outcome::Retry`] at one held entry,
+/// after which the app raises [`super::AppEvent::StoreFailing`] for it, on that read and
+/// every later one until the entry is processed or stored locally.
+pub const RETRY_EVENT_READS: u32 = 3;
+
+/// A failure of the store or the host that kept a receive step from finishing
+/// ([`Outcome::Retry`]). It is built only from a [`StoreError`]: what the host's
+/// [`crate::store::StateStore`] answers, through the [`ReceiveContext`]'s or a
+/// [`LocalView`]'s reads or a store handle of the protocol's own, or what a binding maps
+/// its own host's storage failure to. A protocol never builds one for a message it can't
+/// handle: that is an [`Outcome::Drop`].
+///
+/// It is of one of two kinds, which decide how long the entry waits:
+///
+/// - **The store is unavailable for now** ([`StoreFailure::unavailable`]): the entry is
+///   held, up to the bounded wait an entry whose sender can't be checked gets
+///   ([`super::AppConfig::park_after_ms`]), then stored locally and passed
+///   ([`super::ParkReason::StoreUnavailable`]).
+/// - **The store fails for this entry** ([`StoreFailure::of_entry`]), whatever the time,
+///   such as a corrupt value it holds or a write it refuses: retrying on the feed can't
+///   help, so the entry is stored locally and passed at once
+///   ([`super::ParkReason::StoreRejected`]).
+///
+/// Either way the entry is never dropped: an entry stored locally is tried again at every
+/// read, and processed once the store works.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoreFailure {
+    error: StoreError,
+    of_entry: bool,
+}
+
+impl StoreFailure {
+    /// The store, or the host, is unavailable for now, and may work at a later read.
+    pub fn unavailable(error: StoreError) -> Self {
+        Self {
+            error,
+            of_entry: false,
+        }
+    }
+
+    /// The store fails for this entry every time, such as a corrupt value it holds or a
+    /// write of the entry's state it refuses.
+    pub fn of_entry(error: StoreError) -> Self {
+        Self {
+            error,
+            of_entry: true,
+        }
+    }
+
+    /// The store's error.
+    pub fn error(&self) -> &StoreError {
+        &self.error
+    }
+
+    /// Whether the store fails for this entry every time ([`StoreFailure::of_entry`]),
+    /// rather than for now.
+    pub fn is_of_entry(&self) -> bool {
+        self.of_entry
+    }
+}
+
+impl From<StoreError> for StoreFailure {
+    /// [`StoreError::Corrupt`] fails for the entry ([`StoreFailure::of_entry`]); every other
+    /// error is the store unavailable for now ([`StoreFailure::unavailable`]), bounded by
+    /// the wait.
+    fn from(error: StoreError) -> Self {
+        match error {
+            StoreError::Corrupt => Self::of_entry(error),
+            error => Self::unavailable(error),
+        }
+    }
+}
+
+impl TryFrom<AppError> for StoreFailure {
+    /// Any other error, given back: it isn't a failure of the store.
+    type Error = AppError;
+
+    /// The failure of an [`AppError::Store`], such as a [`ReceiveContext::local_get`] whose
+    /// store failed, of the kind [`StoreFailure::from`] gives it; any other error is given
+    /// back.
+    fn try_from(error: AppError) -> Result<Self, AppError> {
+        match error {
+            AppError::Store(error) => Ok(error.into()),
+            other => Err(other),
+        }
+    }
+}
+
+impl std::fmt::Display for StoreFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
 /// The protocol's answer for a received message.
 #[derive(Clone, Debug)]
 pub enum Outcome {
@@ -169,6 +316,34 @@ pub enum Outcome {
     /// ([`super::ParkReason::TooManyReads`]). A read that fails for now (the network, `429`,
     /// `503`) leaves the entry waiting for the next read of the feed.
     Need(Vec<Need>),
+    /// The step couldn't finish because the protocol's store or the host failed, such as a
+    /// read of its own state: never for a message the protocol can't handle, which is an
+    /// [`Outcome::Drop`]. A valid message is never consumed by a store failure (Switch spec
+    /// 8.2): the app keeps no processed pair for the entry and commits nothing the step
+    /// built (what the context added is discarded). What happens to the entry depends on
+    /// the [`StoreFailure`]'s kind:
+    ///
+    /// - **Unavailable for now:** the entry is held, as an entry whose sender can't be
+    ///   checked yet is. The cursor stays before it; the read goes on with later items, which
+    ///   are processed past it and remembered; the entry comes again at the next read of the
+    ///   feed, never twice in one read, and the step runs again from the start. The app
+    ///   counts the reads in a row that end so, in its own store; from the
+    ///   [`RETRY_EVENT_READS`]th on it raises [`super::AppEvent::StoreFailing`] on each, so
+    ///   the host learns its store is failing. Once the entry has waited the bounded wait
+    ///   ([`super::AppConfig::park_after_ms`]) since its first retry, it is stored locally
+    ///   and the cursor passes it ([`super::ParkReason::StoreUnavailable`]), so a store
+    ///   that stays down never pins the cursor.
+    /// - **Of the entry:** retrying on the feed can't help, so the entry is stored locally
+    ///   and the cursor passes it at once ([`super::ParkReason::StoreRejected`]).
+    ///
+    /// An entry stored locally is tried again at every read, and processed once its step
+    /// finishes. A retry of an entry stored locally before ([`ReceivedMessage::parked`])
+    /// leaves it stored, for the next read, and counts on: the count of reads in a row is
+    /// kept from the feed into local storage until the entry is processed, so a store that
+    /// stays down raises [`super::AppEvent::StoreFailing`] whichever way the entry waits. Claims read for the step ([`Outcome::Need`])
+    /// stay kept, in their own commits. A push extension's peek runs no receive step, so a
+    /// retry doesn't change what it shows.
+    Retry(StoreFailure),
 }
 
 /// Entries the app can't read and whose senders it asks to send again (Switch spec 8.2):
@@ -273,7 +448,8 @@ pub trait Protocol: Send + Sync {
     /// The effect of a message whose body passed [`Protocol::check_body`], for a protocol
     /// that needs nothing of the app's state: [`Protocol::receive_with`] calls it by default.
     /// A protocol that implements [`Protocol::receive_with`] need not implement this one; by
-    /// default it drops every message.
+    /// default it drops every message. A step that can't finish because the protocol's
+    /// store or the host failed returns [`Outcome::Retry`], never [`Outcome::Drop`].
     fn receive(&self, message: &ReceivedMessage) -> Outcome {
         let _ = message;
         Outcome::Drop {
@@ -285,9 +461,12 @@ pub trait Protocol: Send + Sync {
     /// state at hand (Switch spec 8.2): `cx` derives record keys and blinded inputs, reads
     /// the writes the app holds and the claims it keeps, and adds record writes and claim
     /// entries to the effect's batch, which carries the cursor move. What `cx` added goes
-    /// only with [`Outcome::Apply`]; a [`Outcome::Drop`] or an [`Outcome::Need`] discards
-    /// it. After an [`Outcome::Need`] the app reads what it names and calls this again, the
-    /// answers in [`ReceiveContext::switch_claim`]. After `409 conflict` on the batch the
+    /// only with [`Outcome::Apply`]; a [`Outcome::Drop`], an [`Outcome::Need`] or an
+    /// [`Outcome::Retry`] discards it. After an [`Outcome::Need`] the app reads what it
+    /// names and calls this again, the answers in [`ReceiveContext::switch_claim`]. A read
+    /// of the context, or of the protocol's own store, that fails with a store error is an
+    /// [`Outcome::Retry`] ([`StoreFailure::try_from`]): the entry is held for a later read,
+    /// or stored locally and tried again at a later read. After `409 conflict` on the batch the
     /// app reads the records and claims `cx` wrote again and calls this once more, with
     /// [`ReceivedMessage::conflict`] set. [`Protocol::receive`] by default.
     fn receive_with(&self, message: &ReceivedMessage, cx: &mut ReceiveContext<'_>) -> Outcome {
@@ -389,6 +568,55 @@ pub trait Protocol: Send + Sync {
     ) -> Option<String> {
         let _ = (collection, seen, value);
         None
+    }
+
+    /// The name of the layers the protocol adds to app backups ([`ProtocolLayer`]):
+    /// [`super::App::restore`] takes a backup's layer only with a protocol that gives the
+    /// same name, and refuses a backup whose layer another protocol, or a protocol without a
+    /// name, made, rather than drop that data. `None` by default: the protocol takes no
+    /// layer, and [`super::App::backup_layered`] refuses.
+    fn backup_name(&self) -> Option<String> {
+        None
+    }
+
+    /// The bytes of the protocol's backup layer from its local state as committed: every
+    /// key and value it holds, in key order, read by [`super::App::backup_layered`] in the
+    /// same call as the app's own state. [`Protocol::restore_layer`] reads them back. By
+    /// default the whole state, as [`encode_local_state`] gives it.
+    ///
+    /// # Errors
+    ///
+    /// Why the state can't be backed up, without content: the backup is refused.
+    fn backup_layer(&self, state: Vec<KeyValue>) -> Result<Vec<u8>, String> {
+        Ok(encode_local_state(&state))
+    }
+
+    /// The writes that install a backup's protocol layer at a restore (Switch spec 12.4),
+    /// or that a backup without one, `None`, needs. [`super::App::restore`] calls it once,
+    /// after it checked the backup's own state and the layer's name and before it writes
+    /// anything, and commits the writes in the one commit that installs its own restored
+    /// state, after it cleared the app's namespace: so the protocol starts from an empty
+    /// local state and its writes stay under its prefix. It checks the layer in full here;
+    /// nothing is written until it returns. [`super::App::backup_layered`] calls it too,
+    /// writing nothing, to check that the backup can be restored, so it has no effect of
+    /// its own. By default it reads the layer as the default [`Protocol::backup_layer`]
+    /// writes it ([`decode_local_state`]) and puts every key back, and needs no writes for a
+    /// backup without a layer.
+    ///
+    /// # Errors
+    ///
+    /// Why the layer, or a backup without one, can't be installed, without content: the
+    /// restore is refused and nothing is written.
+    fn restore_layer(&self, layer: Option<&ProtocolLayer>) -> Result<Vec<LocalWrite>, String> {
+        let Some(layer) = layer else {
+            return Ok(Vec::new());
+        };
+        let state = decode_local_state(&layer.data)
+            .ok_or_else(|| String::from("the layer doesn't read as local state"))?;
+        Ok(state
+            .into_iter()
+            .map(|(key, value)| LocalWrite::Put { key, value })
+            .collect())
     }
 
     /// The shared record write of a sent message (Switch spec 8.2): the record's next value

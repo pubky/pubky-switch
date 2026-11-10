@@ -18,7 +18,9 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
   operations settle (record writes cached at their proofs' versions, claim proofs kept), the
   protocol's local writes and the cursor are committed together with the answer. A claim
   the receive step asks for (`Outcome::Need`) is read and kept (`claim/`, `clent/`) in a
-  commit of its own, which moves no cursor; the step then runs again.
+  commit of its own, which moves no cursor; the step then runs again. A step that ends in
+  `Outcome::Retry` commits nothing of its own: only, with the page, its count under
+  `retry/`, and the entry under `parked/` once the cursor passes it.
 - **A batch refused with `409 stale_epoch`** is gone from `opq/` with the refusal; the app
   takes the newer `identity.json` and key bundle, each in its own commit, and the batch
   sealed again is signed and kept under a new batch ID before it is first sent.
@@ -27,6 +29,10 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
 - **Any commit carries everything read before it.** A page's writes go in the next commit
   point, so no commit records a cursor past items whose writes it lacks.
 - **After a failed commit the app reloads** from the store before its next call.
+- **A restore is one commit:** the namespace cleared, the app's restored state and the
+  protocol's backup layer under `p/`, both checked before it, so a failure leaves neither.
+  A backup with a layer also carries `seen/`, `parked/` and `proc/` of the same moment,
+  which the layer may reflect, so no entry is handed to the protocol twice.
 
 ## Keys
 
@@ -60,7 +66,8 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
 | `proct/<time>/<sender>/<msg_id>` | the time index for pruning processed pairs | |
 | `seen/<seq>` | an entry processed past a held one | |
 | `held/<seq>` | an entry held because its sender can't be checked, since when | |
-| `parked/<seq>` | an entry stored locally and passed: the opened plaintext, sender, certificate, time, reason (an unverifiable sender or a quota, tried again; an effect refused for good, over one batch, or kept past the window in which its resend tells whether it was applied, not tried again) | yes |
+| `retry/<seq>` | an entry whose receive step the protocol's store or the host kept from finishing (`Outcome::Retry`): the reads in a row that ended so, and when the first was; kept while the entry is stored locally too, and it goes once the entry is processed | |
+| `parked/<seq>` | an entry stored locally and passed: the opened plaintext, sender, certificate, time, reason (an unverifiable sender, a quota or a store failure of the receive step, tried again; an effect refused for good, over one batch, or kept past the window in which its resend tells whether it was applied, not tried again) | yes |
 | `uncert/<sender>/<msg_id>` | a message whose kept effect may have been applied: its entry is parked when the feed shows it again | |
 | `asked/<seq>` | a re-send was handed to the protocol for this item | |
 | `departed/<app_id>` | another own app's departure verified in the chain, and its time | |
