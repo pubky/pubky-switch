@@ -30,7 +30,7 @@ use pubky_switch_core::sig::SignedDoc;
 use super::chain::ChainView;
 use super::error::{Alarm, Refusal};
 use super::events::AppEvent;
-use super::state::{HeldKey, KnownKid, RegStatus, Registration, Tx, key};
+use super::state::{Device, HeldKey, KnownKid, RegStatus, Registration, Rotation, Tx, key};
 use super::{App, AppError, DeviceKeys, HeldKeyOut, UserConfirmed};
 use crate::client::Batch;
 use crate::error::ClientError;
@@ -600,21 +600,26 @@ impl App {
     pub async fn take_device_keys(&mut self, keys: DeviceKeys) -> Result<(), AppError> {
         Box::pin(async move {
             self.ready_local().await?;
-            let mut tx = self.tx()?;
-            self.state.device.multi_device = true;
-            tx.put(key::DEVICE, &self.state.device)?;
+            // Everything is read and checked into locals first, and memory takes it only
+            // once the commit is done: a set that fails a check changes nothing.
+            let mut kids = Vec::new();
             for (kid, n) in &keys.known {
                 let kid = pubky_switch_core::enc::unb64_array::<8>(kid)
                     .map_err(|_| AppError::InvalidData("device sync: a kid doesn't read".into()))?;
-                if self.state.known_kids.insert(kid, *n).is_none() {
-                    tx.put(&key::kid(&kid), &KnownKid { n: *n })?;
+                if !self.state.known_kids.contains_key(&kid) && !kids.iter().any(|(k, _)| *k == kid)
+                {
+                    kids.push((kid, *n));
                 }
             }
+            let mut held_keys = Vec::new();
             for shared in keys.receive_keys {
                 let n = shared.key.n;
                 // A retired key this device deleted once the cursor passed its successor's
                 // registration doesn't come back from another device (Switch spec 3.6).
-                if self.state.receive_keys.contains_key(&n) || self.successor_passed(n) {
+                if self.state.receive_keys.contains_key(&n)
+                    || held_keys.iter().any(|(m, _)| *m == n)
+                    || self.successor_passed(n)
+                {
                     continue;
                 }
                 if ReceiveKeyRecord::verify(&shared.record, &self.state.cert).is_err() {
@@ -630,34 +635,67 @@ impl App {
                     reg_time_ms: registration.and_then(|r| r.at_ms),
                     pending: Vec::new(),
                 };
-                tx.put(&key::receive_key(n), &held)?;
-                self.state.receive_keys.insert(n, held);
-                if self.state.registrations.remove(&n).is_some() {
-                    tx.delete(&key::registration(n))?;
-                }
+                held_keys.push((n, held));
             }
-            if keys.rotation_ms > self.state.rotation.last_ms {
-                self.state.rotation.last_ms = keys.rotation_ms;
-                tx.put(key::ROTATION, &self.state.rotation)?;
-            }
+            let known = |kid: &[u8; 8]| {
+                self.state.known_kids.contains_key(kid) || kids.iter().any(|(k, _)| k == kid)
+            };
+            let taken = |n: &u64| held_keys.iter().any(|(m, _)| m == n);
             let unknown = self
                 .state
                 .registrations
                 .iter()
-                .find(|(_, r)| {
-                    r.status == RegStatus::AwaitingSync
-                        && !self.state.known_kids.contains_key(&r.kid)
-                })
+                .find(|(n, r)| r.status == RegStatus::AwaitingSync && !taken(n) && !known(&r.kid))
                 .map(|(n, r)| (*n, r.at_ms));
-            for (n, registration) in self.state.registrations.iter_mut() {
-                if registration.status == RegStatus::AwaitingSync
-                    && self.state.known_kids.contains_key(&registration.kid)
-                {
-                    registration.status = RegStatus::Own;
-                    tx.put(&key::registration(*n), registration)?;
+            let synced: Vec<u64> = self
+                .state
+                .registrations
+                .iter()
+                .filter(|(n, r)| r.status == RegStatus::AwaitingSync && !taken(n) && known(&r.kid))
+                .map(|(n, _)| *n)
+                .collect();
+            let device = Device { multi_device: true };
+            let rotation_ms = keys.rotation_ms.max(self.state.rotation.last_ms);
+            let mut tx = self.tx()?;
+            tx.put(key::DEVICE, &device)?;
+            for (kid, n) in &kids {
+                tx.put(&key::kid(kid), &KnownKid { n: *n })?;
+            }
+            for (n, held) in &held_keys {
+                tx.put(&key::receive_key(*n), held)?;
+                if self.state.registrations.contains_key(n) {
+                    tx.delete(&key::registration(*n))?;
+                }
+            }
+            if rotation_ms > self.state.rotation.last_ms {
+                let rotation = Rotation {
+                    last_ms: rotation_ms,
+                    ..self.state.rotation
+                };
+                tx.put(key::ROTATION, &rotation)?;
+            }
+            for n in &synced {
+                if let Some(registration) = self.state.registrations.get(n) {
+                    let own = Registration {
+                        status: RegStatus::Own,
+                        ..registration.clone()
+                    };
+                    tx.put(&key::registration(*n), &own)?;
                 }
             }
             self.commit(tx).await?;
+            self.state.device = device;
+            self.state.known_kids.extend(kids);
+            for (n, held) in held_keys {
+                self.state.registrations.remove(&n);
+                self.state.receive_keys.insert(n, held);
+            }
+            self.state.rotation.last_ms = rotation_ms;
+            for n in synced {
+                if let Some(registration) = self.state.registrations.get_mut(&n) {
+                    registration.status = RegStatus::Own;
+                }
+            }
             if let Some((n, at_ms)) = unknown {
                 let alarm = Alarm::Compromise {
                     n,

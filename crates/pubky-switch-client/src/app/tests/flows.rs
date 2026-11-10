@@ -368,6 +368,44 @@ async fn test_app_two_devices_rotating_at_once_one_discards_its_key() {
 }
 
 #[tokio::test]
+async fn test_app_device_sync_with_a_bad_key_changes_nothing() {
+    let w = World::new();
+    let mut a = w.join("wallet").await;
+    let backup = a.backup().unwrap();
+    a.set_multi_device(true).await.unwrap();
+    assert!(a.rotate().await.unwrap());
+    w.clock.advance_ms(1000);
+    assert!(a.rotate().await.unwrap());
+    // A second device of the app, from before the rotations.
+    let store_b = Arc::new(MemoryStore::new());
+    let mut b = App::restore(
+        w.env_on(Arc::clone(&store_b) as Arc<dyn StateStore>),
+        w.protocol.clone(),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    let before = b.backup().unwrap().to_bytes().unwrap();
+    let shared_before = b.device_keys();
+    // The set's last key carries a record another app signed.
+    let mut keys = a.device_keys();
+    assert_eq!(keys.receive_keys.len(), 3);
+    let lone = w.join("phone").await;
+    let foreign = lone.device_keys();
+    if let (Some(last), Some(bad)) = (keys.receive_keys.last_mut(), foreign.receive_keys.first()) {
+        last.record = bad.record.clone();
+    }
+    let error = b.take_device_keys(keys).await.unwrap_err();
+    assert!(matches!(error, AppError::InvalidData(_)), "{error:?}");
+    // Nothing of the set was taken, in memory or in a backup.
+    assert_eq!(b.receive_key_numbers(), vec![0]);
+    assert_eq!(b.device_keys(), shared_before);
+    assert_eq!(b.backup().unwrap().to_bytes().unwrap(), before);
+    assert!(!b.state.device.multi_device);
+}
+
+#[tokio::test]
 async fn test_app_device_sync_without_the_key_is_a_compromise() {
     let w = World::new();
     let mut app = w.join("wallet").await;
