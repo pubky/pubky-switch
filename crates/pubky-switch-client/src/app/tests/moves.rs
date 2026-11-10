@@ -645,6 +645,11 @@ async fn test_move_next_service_showing_a_foreign_key_is_a_compromise() {
     let router = Router::of(&w);
     let mut app = join(&w, &router).await;
     let me = app.app_id();
+    let registered_at = w.clock.now_ms();
+    // The freeze, an hour later, is the newest chain item the app verifies at the old
+    // service.
+    w.clock.advance_ms(3_600_000);
+    let frozen_at = w.clock.now_ms();
     let n_key = next_key();
     w.switch.freeze(&freeze_for(&w, &n_key, 2)).unwrap();
     let next = w.switch.import_into(n_key.to_bytes());
@@ -664,6 +669,7 @@ async fn test_move_next_service_showing_a_foreign_key_is_a_compromise() {
         held.receive_n = Some(1);
     }
     app.receive(None).await.unwrap();
+    w.clock.advance_ms(3_600_000);
     publish_at(
         &w,
         &next,
@@ -679,10 +685,10 @@ async fn test_move_next_service_showing_a_foreign_key_is_a_compromise() {
         ),
         "{error:?}"
     );
-    // Without the registration's chain item, it distrusts from the latest service time it
-    // holds (Switch spec 3.6).
-    let distrust_from = app.compromise_distrust_from().unwrap();
-    assert!(distrust_from <= w.clock.now_ms(), "{distrust_from}");
+    // Without the registration's chain item, it distrusts from the later of the newest
+    // chain item it verified, the freeze, and its own last registration (Switch spec 3.6).
+    assert!(registered_at < frozen_at);
+    assert_eq!(app.compromise_distrust_from(), Some(frozen_at));
     // It left at once, at the service it follows.
     assert!(next.app(&me).departed);
 }
@@ -1399,7 +1405,7 @@ const ATTEMPT: [u8; 16] = [6; 16];
 /// The same origin under a new key at generation 2, published (a key change in place).
 fn change_key(w: &World, router: &Router) -> Arc<ScriptedSwitch> {
     let pending = SigningKey::from_bytes(&seed("service/alice/pending"));
-    let changed = w.switch.import_into(pending.to_bytes());
+    let changed = w.switch.change_key_into(pending.to_bytes());
     router.add(ORIGIN, &changed);
     publish_at(
         w,
@@ -1789,7 +1795,7 @@ fn contact_batch(pubky: [u8; 32]) -> crate::app::OpBatch {
 }
 
 #[tokio::test]
-async fn test_key_change_sends_a_kept_batch_again_and_its_answer_shows_it_applied() {
+async fn test_key_change_sends_a_kept_batch_again_and_its_original_proofs_show_it_applied() {
     let w = World::new();
     let router = Router::of(&w);
     let mut app = lists_app(&w, &router).await;
@@ -1798,9 +1804,21 @@ async fn test_key_change_sends_a_kept_batch_again_and_its_answer_shows_it_applie
     w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
     assert!(app.submit_batch(contact_batch(carol)).await.is_err());
     let changed = change_key(&w, &router);
-    // Sent again unchanged, it is answered `409 conflict`: applied, and never signed again
-    // (Switch spec 12.5 "Kept batches").
+    // Sent again unchanged, it gets its original proofs, which a key change in place keeps,
+    // checked with generation 1's key: applied, and never signed again (Switch spec 12.5
+    // "Kept batches", Switch wire 6.4 step 6).
     let report = app.receive(None).await.unwrap();
+    assert!(app.alarm().is_none(), "{:?}", app.alarm());
+    assert_eq!(
+        changed
+            .lock()
+            .batches
+            .values()
+            .filter(|record| record.proofs.is_some())
+            .count(),
+        w.switch.lock().batches.len(),
+        "the original proofs are kept"
+    );
     assert!(
         has(&report.events, |e| matches!(
             e,
@@ -1820,6 +1838,42 @@ async fn test_key_change_sends_a_kept_batch_again_and_its_answer_shows_it_applie
     assert!(app.kept_batches().await.unwrap().is_empty());
     assert_eq!(allow_ops_for(&changed.applied(), carol), 0);
     assert_eq!(allow_ops_for(&w.switch.applied(), carol), 1);
+    assert!(app.admits(&carol).await.unwrap());
+}
+
+#[tokio::test]
+async fn test_unseen_move_sends_a_kept_batch_again_and_its_conflict_shows_it_applied() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = lists_app(&w, &router).await;
+    let carol = IdentityKey::from_secret(seed("carol/identity")).public();
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.submit_batch(contact_batch(carol)).await.is_err());
+    // A move the app never saw frozen: the import carries the batch's ID without its
+    // proofs, so the resend is answered `409 conflict`, which shows it applied.
+    let n_key = next_key();
+    let next = w.switch.import_into(n_key.to_bytes());
+    router.add(NEXT, &next);
+    publish_at(
+        &w,
+        &next,
+        Inbox::new(NEXT, n_key.verifying_key().to_bytes()),
+        2,
+        None,
+    );
+    // The app learns of the move from its identity.json, before reading the old feed.
+    app.refresh_identity().await.unwrap();
+    let report = app.receive(None).await.unwrap();
+    assert!(
+        has(&report.events, |e| matches!(
+            e,
+            AppEvent::KeptBatchApplied { .. }
+        )),
+        "{:?}",
+        report.events
+    );
+    assert!(app.kept_batches().await.unwrap().is_empty());
+    assert_eq!(allow_ops_for(&next.applied(), carol), 0);
     assert!(app.admits(&carol).await.unwrap());
 }
 
