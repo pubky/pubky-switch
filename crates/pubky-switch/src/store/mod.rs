@@ -19,9 +19,11 @@
 //! [`AccountTxn::mark_check`] finds a state behind it, as a restored backup would leave.
 
 mod account;
+mod apps;
 mod chain;
 mod claim_codec;
 mod enrollments;
+mod feed;
 mod identity;
 mod ops;
 #[cfg(any(test, feature = "test-util"))]
@@ -36,7 +38,9 @@ use sqlx::{
 };
 
 pub use account::{AccountHead, AccountTxn, CommitError, Committed, NewAccount, Savepoint};
+pub use apps::{AppsView, KeptAppId, KeptReason, OpenAttempt, PartSpan, newly_listed};
 pub use chain::NewChainItem;
+pub use feed::{AppDocs, CurrentDocs, FeedRow, FeedSnapshot, PageReader};
 pub use identity::HeldIdentity;
 pub use ops::{
     ListName, StoredApp, StoredBundlePart, StoredClaimEntry, StoredInvite, StoredListEntry,
@@ -374,6 +378,24 @@ impl Store {
         steps: u64,
     ) -> Result<Vec<StoredClaimEntry>, StoreError> {
         ops::claim_entries_before(&self.pool, id, claim_key, steps).await
+    }
+
+    /// Read a feed page of account `id` from one snapshot, without the account's lock
+    /// (Switch wire 7.4.4): the sequence, then the chain items after `after`, up to
+    /// `positions` positions on and `batch_tail` more to finish a batch, each given to
+    /// `take`, which answers whether the page wants the next. `None` for an account that
+    /// isn't there.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn read_feed(
+        &self,
+        id: &str,
+        reader: &[u8; 16],
+        after: Option<pubky_switch_core::ops::Position>,
+        positions: u64,
+        batch_tail: u64,
+        page: &mut impl PageReader,
+    ) -> Result<Option<FeedSnapshot>, StoreError> {
+        feed::read_feed(&self.pool, id, reader, after, positions, batch_tail, page).await
     }
 
     /// Start a request to account `id`: a transaction holding the account's lock until it

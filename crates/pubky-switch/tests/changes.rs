@@ -115,3 +115,36 @@ async fn test_changes_committed_change_wakes_its_account_only() {
     task.await.expect("listener stops");
     db.drop_database().await.expect("drop");
 }
+
+/// The listener holds a connection of its own, outside the request pool: with a pool of one
+/// connection, requests still get it.
+#[tokio::test]
+#[allow(clippy::panic)]
+async fn test_changes_listener_leaves_a_one_connection_pool_to_requests() {
+    use pubky_switch::store::{DatabaseConfig, testing::TestDatabase};
+    let config = DatabaseConfig {
+        max_connections: 1,
+        acquire_timeout_ms: 2_000,
+        ..DatabaseConfig::default()
+    };
+    let db = match TestDatabase::create(&config).await {
+        Ok(db) => db,
+        Err(pubky_switch::store::testing::TestDatabaseError::Skipped) => return,
+        Err(error) => panic!("test database: {error}"),
+    };
+    let hub = ChangeHub::new();
+    let listener = ChangeListener::connect(db.store()).await.expect("listen");
+    let (stop, stopped) = oneshot::channel::<()>();
+    let task = tokio::spawn(listener.run(hub.clone(), async {
+        let _ = stopped.await;
+    }));
+    // A request's query, on the pool's one connection, answers.
+    let found = tokio::time::timeout(Duration::from_secs(5), db.store().lookup(ID_A))
+        .await
+        .expect("not starved")
+        .expect("lookup");
+    assert!(found.is_none());
+    let _ = stop.send(());
+    task.await.expect("listener");
+    db.drop_database().await.expect("drop");
+}

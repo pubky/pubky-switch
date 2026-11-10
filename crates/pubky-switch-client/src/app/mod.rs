@@ -62,14 +62,16 @@ mod tests;
 
 pub use chain::{HELD_MARKS, STUBS_KEPT_FOR_MS};
 pub use error::{Alarm, AppError, Refusal};
-pub use events::{AppEvent, BackupRefusal, ParkReason};
+pub use events::{
+    AppEvent, BackupRefusal, ClaimAttempt, EVENT_ID_LEN, EventId, EventIdError, ParkReason,
+};
 pub use feed::ReceiveReport;
 pub use identity::{DOC_CACHE_MS, HomeserverReader, IdentityRefresh, REVALIDATION_MS};
 pub use peek::{PeekReport, Peeked};
 pub use protocol::{
-    Effect, LocalWrite, MAX_CLAIM_READS, MissedEntries, Need, OpaqueRule, Outcome, Protocol,
-    ProtocolLayer, RETRY_EVENT_READS, ReceivedMessage, ResendNeeded, ResendReason, StoreFailure,
-    decode_local_state, encode_local_state,
+    Effect, LocalWrite, MAX_CLAIM_READS, MissedEntries, Need, OpaqueRule, Outcome,
+    PARKED_RETRIES_PER_READ, Protocol, ProtocolLayer, RETRY_EVENT_READS, ReceivedMessage,
+    ResendNeeded, ResendReason, StoreFailure, decode_local_state, encode_local_state,
 };
 pub use provider::ProviderStatus;
 pub use push::{MAX_HANDLE_BYTES, MAX_HANDLES, PushHandles, PushRegistration, PushRelay};
@@ -337,7 +339,7 @@ pub struct AppBackup {
 /// reader that knows no layers, which takes only that version, refuses such a backup
 /// rather than restore it without the layer. A schema change gives both kinds of backup
 /// new versions.
-const LAYERED_BACKUP_VERSION: u32 = 2;
+const LAYERED_BACKUP_VERSION: u32 = 3;
 const _: () = assert!(LAYERED_BACKUP_VERSION != SCHEMA_VERSION);
 
 /// A [`ProtocolLayer`] as a backup's bytes carry it, with what the app's feed holds beyond
@@ -380,16 +382,28 @@ impl AppBackup {
     ///
     /// # Errors
     ///
-    /// [`AppError::InvalidData`] if they don't read as a backup of this schema, or their
-    /// version isn't the one of a backup with, or without, a layer.
+    /// [`StoreError::OldSchema`] for a backup an earlier schema wrote, as for a store of
+    /// one; [`AppError::InvalidData`] if they don't read as a backup, or their version isn't
+    /// the one of a backup with, or without, a layer.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, AppError> {
-        let backup: Self = serde_json::from_slice(bytes)
+        #[derive(Deserialize)]
+        struct Version {
+            v: u32,
+            #[serde(default)]
+            protocol: Option<serde_json::Value>,
+        }
+        let version: Version = serde_json::from_slice(bytes)
             .map_err(|_| AppError::InvalidData("the backup doesn't read".into()))?;
-        let expected = if backup.protocol.is_some() {
+        let expected = if version.protocol.is_some() {
             LAYERED_BACKUP_VERSION
         } else {
             SCHEMA_VERSION
         };
+        if version.v < expected {
+            return Err(AppError::Store(StoreError::OldSchema { found: version.v }));
+        }
+        let backup: Self = serde_json::from_slice(bytes)
+            .map_err(|_| AppError::InvalidData("the backup doesn't read".into()))?;
         if backup.v != expected {
             return Err(AppError::InvalidData(
                 "the backup is of another schema version".into(),
@@ -446,6 +460,9 @@ pub(crate) struct AppState {
     pub(crate) chain: Option<ChainView>,
     pub(crate) held: BTreeMap<u64, HeldEntry>,
     pub(crate) retries: BTreeMap<u64, RetryEntry>,
+    /// Where the retries of stored entries stand in their round (`parkn`), so a bounded
+    /// number each read reaches every one in turn.
+    pub(crate) parked_round: state::ParkedRound,
     pub(crate) seen: BTreeSet<u64>,
     pub(crate) asked: BTreeSet<u64>,
     pub(crate) parked: BTreeMap<u64, ParkedEntry>,
@@ -459,6 +476,10 @@ pub(crate) struct AppState {
     pub(crate) service_time: Option<ServiceTime>,
     /// The app isn't current any more, or its account is gone: every read stops.
     pub(crate) gone: Option<provider::GoneRecord>,
+    /// The ID the next duty event takes (`dutyn`).
+    pub(crate) next_duty: u64,
+    /// The store's event epoch (`dutye`).
+    pub(crate) duty_epoch: state::DutyEpoch,
     /// The wait before the account counts as erased, while it runs.
     pub(crate) erasing: Option<provider::ErasingRecord>,
 }
@@ -478,6 +499,15 @@ pub struct App {
     /// The last Homeserver read that confirmed the own `identity.json`; kept in memory only.
     identity_confirmed: Option<identity::Confirmed>,
     events: Vec<AppEvent>,
+    /// The highest duty event counter queued in `events` since the app was made: a kept one
+    /// above it is queued after a reload (`events` module, "Duty events").
+    duty_queued: u64,
+    /// The highest duty event counter handed to the host since the app was made: no
+    /// acknowledgement removes one above it.
+    duty_handed: u64,
+    /// When, by the device clock, an answer in this call last brought a verified service
+    /// time ([`App::fresh_service_time`]).
+    time_fresh_at: Option<u64>,
 }
 
 impl std::fmt::Debug for App {
@@ -488,6 +518,25 @@ impl std::fmt::Debug for App {
 
 fn corrupt() -> AppError {
     AppError::Store(StoreError::Corrupt)
+}
+
+/// The ID of a store's first duty event.
+const FIRST_DUTY: u64 = 1;
+
+/// What a restore in place carries of what the app owes its protocol
+/// ([`App::kept_for_protocol`]).
+#[derive(Default)]
+struct Carried {
+    /// The store's epoch; `None` for one that didn't read, which a new epoch replaces.
+    epoch: Option<state::DutyEpoch>,
+    /// The counter the next duty event takes.
+    next_duty: u64,
+    /// The kept duty events and owed calls that read, by key, as stored.
+    values: Vec<(String, serde_json::Value)>,
+    /// The kept duty events left behind, their values unreadable.
+    lost_duties: u64,
+    /// The owed calls left behind, their values unreadable.
+    lost_owed: u64,
 }
 
 fn missing() -> AppError {
@@ -604,6 +653,7 @@ impl App {
                 chain: None,
                 held: BTreeMap::new(),
                 retries: BTreeMap::new(),
+                parked_round: state::ParkedRound::default(),
                 seen: BTreeSet::new(),
                 asked: BTreeSet::new(),
                 parked: BTreeMap::new(),
@@ -618,6 +668,8 @@ impl App {
                 leave: None,
                 service_time: None,
                 gone: None,
+                next_duty: FIRST_DUTY,
+                duty_epoch: state::DutyEpoch::random()?,
                 erasing: None,
             };
             let mut app = App {
@@ -631,6 +683,9 @@ impl App {
                 service_time_dirty: false,
                 identity_confirmed: None,
                 events: Vec::new(),
+                duty_queued: 0,
+                duty_handed: 0,
+                time_fresh_at: None,
             };
             app.update_keys_through();
             app.events.clear();
@@ -660,6 +715,7 @@ impl App {
             tx.put(key::CURSOR, &app.state.cursor)?;
             tx.put(key::JOIN, &app.state.join)?;
             tx.put(records::LIST_DUE, &true)?;
+            tx.put(key::DUTY_EPOCH, &app.state.duty_epoch)?;
             tx.commit(&app.env.store).await?;
             app.finish_join().await?;
             Ok(app)
@@ -736,7 +792,7 @@ impl App {
             };
             let state = Self::read_state(&reader).await?;
             let client = Self::client_for(&env, &state.meta, &state.keys, &state.cert)?;
-            Ok(App {
+            let mut app = App {
                 env,
                 protocol,
                 config,
@@ -747,7 +803,20 @@ impl App {
                 service_time_dirty: false,
                 identity_confirmed: None,
                 events: Vec::new(),
-            })
+                duty_queued: 0,
+                duty_handed: 0,
+                time_fresh_at: None,
+            };
+            // A store an earlier build wrote keeps the epoch read now.
+            if !app.reader().exists(key::DUTY_EPOCH).await? {
+                let mut tx = Tx::new(&app.ns);
+                tx.put(key::DUTY_EPOCH, &app.state.duty_epoch)?;
+                tx.commit(&app.env.store).await?;
+            }
+            // Duty events not acknowledged before are delivered again (`events` module).
+            let kept = app.kept_duties().await?;
+            app.queue_duties(kept);
+            Ok(app)
         })
         .await
     }
@@ -803,6 +872,7 @@ impl App {
             chain: ChainView::load(reader).await?,
             held: reader.scan_numbered("held/").await?,
             retries: reader.scan_numbered("retry/").await?,
+            parked_round: reader.get(key::PARKED_NEXT).await?.unwrap_or_default(),
             seen: reader.scan_numbers("seen/").await?,
             asked: reader.scan_numbers("asked/").await?,
             parked: reader.scan_numbered("parked/").await?,
@@ -815,6 +885,12 @@ impl App {
             leave,
             service_time: reader.get(key::SERVICE_TIME).await?,
             gone: reader.get(provider::keys::GONE).await?,
+            next_duty: Self::next_duty(reader).await?,
+            duty_epoch: match reader.get(key::DUTY_EPOCH).await? {
+                Some(epoch) => epoch,
+                // A store an earlier build wrote: `App::load` keeps this one.
+                None => state::DutyEpoch::random()?,
+            },
             erasing: reader.get(provider::keys::ERASING).await?,
             meta,
         })
@@ -991,6 +1067,13 @@ impl App {
     /// ([`StoreError::Unknown`]): it landed whole or not at all, and the host loads the app
     /// ([`App::load`]) to learn which.
     ///
+    /// What the store holds that the app still owes its protocol stays, a layered restore's
+    /// included: the duty events
+    /// not acknowledged, with their IDs, delivered again as after [`App::load`], and the
+    /// protocol calls it couldn't answer, made again by the next read. A backup carries
+    /// neither, so a restore on another device starts without them, under a new event epoch
+    /// ([`EventId`]).
+    ///
     /// # Errors
     ///
     /// [`AppError::InvalidData`] for a backup that doesn't verify, for a protocol layer that
@@ -1006,7 +1089,10 @@ impl App {
             match Self::restore_commit(env, protocol, config, backup).await? {
                 Restorable::Ready(app, tx) => {
                     tx.commit(&app.env.store).await?;
-                    Ok(*app)
+                    let mut app = *app;
+                    let kept = app.kept_duties().await?;
+                    app.queue_duties(kept);
+                    Ok(app)
                 }
                 Restorable::TooLarge(error) => Err(error),
             }
@@ -1133,6 +1219,7 @@ impl App {
                 chain: Some(chain),
                 held: BTreeMap::new(),
                 retries: BTreeMap::new(),
+                parked_round: state::ParkedRound::default(),
                 seen,
                 asked: BTreeSet::new(),
                 parked,
@@ -1150,9 +1237,27 @@ impl App {
                 leave: None,
                 service_time: None,
                 gone: None,
+                next_duty: FIRST_DUTY,
+                duty_epoch: state::DutyEpoch::random()?,
                 erasing: None,
             };
             let ns = client_namespace(&meta.app_id);
+            // A restore in place keeps the store's event epoch and counter, and what the store
+            // holds of what the app still owes its protocol: the duty events not
+            // acknowledged and the calls the protocol couldn't answer. A store with no epoch,
+            // on another device or wiped, starts a new epoch at the first counter. A store
+            // that can't be read fails the restore (`STATE.md`, "What the app owes its
+            // protocol").
+            let old = Reader {
+                ns: ns.clone(),
+                store: env.store.clone(),
+            };
+            let carried = Self::kept_for_protocol(&old).await?.unwrap_or_default();
+            let state = AppState {
+                duty_epoch: carried.epoch.unwrap_or(state.duty_epoch),
+                next_duty: carried.next_duty.max(FIRST_DUTY),
+                ..state
+            };
             let client = Self::client_for(&env, &meta, &backup.keys, &cert)?;
             let mut app = App {
                 env,
@@ -1165,6 +1270,9 @@ impl App {
                 service_time_dirty: false,
                 identity_confirmed: None,
                 events: Vec::new(),
+                duty_queued: 0,
+                duty_handed: 0,
+                time_fresh_at: None,
             };
             // Every write of the one commit; what fails here is a write the store can't
             // take in one batch, over its sizes.
@@ -1176,7 +1284,23 @@ impl App {
                     feed::processed_writes(&mut tx, sender, msg_id, record.hash, record.at_ms)?;
                 }
                 tx.put(records::LIST_DUE, &true)?;
-                tx.local(&layer_writes)
+                tx.local(&layer_writes)?;
+                tx.put(key::DUTY_NEXT, &app.state.next_duty)?;
+                tx.put(key::DUTY_EPOCH, &app.state.duty_epoch)?;
+                for (stored, value) in &carried.values {
+                    tx.put(stored, value)?;
+                }
+                // What didn't read is left behind, and the protocol told how much.
+                if carried.lost_duties > 0 || carried.lost_owed > 0 {
+                    app.keep_duty(
+                        &mut tx,
+                        events::Duty::RestoreLeftBehind {
+                            duty_events: carried.lost_duties,
+                            owed_calls: carried.lost_owed,
+                        },
+                    )?;
+                }
+                Ok(())
             }
             .await;
             Ok(match built {
@@ -1419,9 +1543,195 @@ impl App {
         .await
     }
 
-    /// Take the events collected since the last call.
+    /// Take the events collected since the last call. Duty events among them stay kept
+    /// until [`App::ack_events`] acknowledges them (`events` module, "Duty events").
     pub fn take_events(&mut self) -> Vec<AppEvent> {
-        std::mem::take(&mut self.events)
+        let events = std::mem::take(&mut self.events);
+        for id in events.iter().filter_map(AppEvent::id) {
+            self.duty_handed = self.duty_handed.max(id.counter());
+        }
+        events
+    }
+
+    /// Queue duty events for the host, in order, and keep how far they go.
+    fn queue_duties(&mut self, duties: Vec<AppEvent>) {
+        for id in duties.iter().filter_map(AppEvent::id) {
+            self.duty_queued = self.duty_queued.max(id.counter());
+        }
+        self.events.extend(duties);
+    }
+
+    /// After a reload: the kept duty events no call queued, such as those of a commit that
+    /// answered [`StoreError::Unknown`] and was applied, queued now.
+    async fn queue_unreported_duties(&mut self) -> Result<(), AppError> {
+        let queued = self.duty_queued;
+        let kept: Vec<AppEvent> = self
+            .kept_duties()
+            .await?
+            .into_iter()
+            .filter(|event| event.id().is_some_and(|id| id.counter() > queued))
+            .collect();
+        self.queue_duties(kept);
+        Ok(())
+    }
+
+    /// How many protocol calls the protocol answered with an error and the app still owes
+    /// it ([`Protocol::resend_needed`], [`Protocol::missed`]): each read makes them again,
+    /// so a count that stays up shows a protocol that keeps failing.
+    ///
+    /// # Errors
+    ///
+    /// A failed store read.
+    pub async fn owed_protocol_calls(&self) -> Result<u64, AppError> {
+        let owed = self.reader().scan_raw(key::OWED_PREFIX).await?;
+        Ok(u64::try_from(owed.len()).unwrap_or(u64::MAX))
+    }
+
+    /// The duty events kept and not acknowledged yet, by ascending ID: what a host that
+    /// lost its copy of the reports still has to act on. Nothing but [`App::ack_events`]
+    /// shortens this list (`events` module, "Duty events"). Listing them hands them to the
+    /// host, as [`App::take_events`] does, so an acknowledgement up to the last of them
+    /// removes them all.
+    ///
+    /// # Errors
+    ///
+    /// A failed store read.
+    pub async fn unacknowledged_events(&mut self) -> Result<Vec<AppEvent>, AppError> {
+        // A reload owed first, so what it queues is listed here, once.
+        self.ready_local().await?;
+        let kept = self.kept_duties().await?;
+        for id in kept.iter().filter_map(AppEvent::id) {
+            self.duty_handed = self.duty_handed.max(id.counter());
+        }
+        // Handed over here, so not again by the next report.
+        let handed = self.duty_handed;
+        self.events
+            .retain(|event| event.id().is_none_or(|id| id.counter() > handed));
+        Ok(kept)
+    }
+
+    /// The duty events kept, by ascending ID, without handing them to the host.
+    pub(crate) async fn kept_duties(&self) -> Result<Vec<AppEvent>, AppError> {
+        Ok(self
+            .reader()
+            .scan_numbered::<events::Duty>(key::DUTY_PREFIX)
+            .await?
+            .into_iter()
+            .map(|(n, duty)| duty.event(EventId::new(self.state.duty_epoch.epoch, n)))
+            .collect())
+    }
+
+    /// Acknowledge every duty event up to and including `up_to`: the host and its protocol
+    /// kept what they say, and the store no longer keeps them, so no later
+    /// [`App::load`] delivers them again. IDs rise in the order the events are reported,
+    /// so a host acknowledges after acting on every duty event it took up to that ID. An
+    /// ID no event has yet acknowledges only those before it. IDs compare only within one
+    /// store ([`EventId::cmp_same_store`]). Only events this app value handed to the host,
+    /// by [`App::take_events`] or a call's report, are removed: one kept but not yet taken,
+    /// such as one queued after a reload, stays until it is taken and acknowledged.
+    ///
+    /// The host must call this once it has handed the events to its protocol and the
+    /// protocol has kept what they say: nothing else removes a kept duty event, so a host
+    /// that never acknowledges keeps them all, without limit (`events` module, "Duty
+    /// events").
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::Usage`] for an ID of another store, such as one from before a restore on
+    /// another device: nothing is acknowledged. A failed store read or commit; nothing is
+    /// acknowledged then either.
+    pub async fn ack_events(&mut self, up_to: EventId) -> Result<(), AppError> {
+        Box::pin(async move {
+            self.ready_local().await?;
+            if up_to.epoch() != self.state.duty_epoch.epoch {
+                return Err(Refusal::Usage(
+                    "an event ID of another store: nothing acknowledged".into(),
+                )
+                .into());
+            }
+            // Only what the host was handed: a kept event it never took stays.
+            let through = up_to.counter().min(self.duty_handed);
+            let kept = self.reader().scan_numbers(key::DUTY_PREFIX).await?;
+            let mut tx = self.tx()?;
+            for n in kept.range(..=through) {
+                tx.delete(&key::duty(*n))?;
+            }
+            self.commit(tx).await
+        })
+        .await
+    }
+
+    /// Keep a duty event in `tx`, under the next ID: written in the commit of the change it
+    /// reports, and reported once that commit is done (`events` module, "Duty events").
+    pub(crate) fn keep_duty(&mut self, tx: &mut Tx, duty: events::Duty) -> Result<(), AppError> {
+        let n = self.state.next_duty;
+        let next = n.checked_add(1).ok_or_else(corrupt)?;
+        tx.put(&key::duty(n), &duty)?;
+        tx.put(key::DUTY_NEXT, &next)?;
+        self.state.next_duty = next;
+        tx.report(duty.event(EventId::new(self.state.duty_epoch.epoch, n)));
+        Ok(())
+    }
+
+    /// What a restore in place carries across. `None` for a store that holds no epoch. A
+    /// failed store read is the error: the restore can be tried again. A value that reads
+    /// but doesn't decode is left behind and counted; a damaged epoch or counter starts a
+    /// new epoch, since the kept counters may then be below IDs the host acknowledged.
+    async fn kept_for_protocol(reader: &Reader) -> Result<Option<Carried>, AppError> {
+        let Some(epoch) = reader.get_raw(key::DUTY_EPOCH.as_bytes()).await? else {
+            return Ok(None);
+        };
+        let epoch = state::decode::<state::DutyEpoch>(&epoch).ok();
+        let counter = match reader.get_raw(key::DUTY_NEXT.as_bytes()).await? {
+            None => Some(FIRST_DUTY),
+            Some(bytes) => state::decode::<u64>(&bytes).ok(),
+        };
+        let mut carried = Carried::default();
+        let mut past_kept = FIRST_DUTY;
+        for (rest, bytes) in reader.scan_raw(key::DUTY_PREFIX).await? {
+            let read = state::parse_num(&rest).and_then(|n| {
+                state::decode::<events::Duty>(&bytes)?;
+                Ok((n, state::decode::<serde_json::Value>(&bytes)?))
+            });
+            match read {
+                Ok((n, value)) => {
+                    past_kept = past_kept.max(n.checked_add(1).ok_or_else(corrupt)?);
+                    carried
+                        .values
+                        .push((format!("{}{rest}", key::DUTY_PREFIX), value));
+                }
+                Err(_) => carried.lost_duties = carried.lost_duties.saturating_add(1),
+            }
+        }
+        for (rest, bytes) in reader.scan_raw(key::OWED_PREFIX).await? {
+            let read = state::decode::<feed::OwedCall>(&bytes)
+                .and_then(|_| state::decode::<serde_json::Value>(&bytes));
+            match read {
+                Ok(value) => carried
+                    .values
+                    .push((format!("{}{rest}", key::OWED_PREFIX), value)),
+                Err(_) => carried.lost_owed = carried.lost_owed.saturating_add(1),
+            }
+        }
+        match (epoch, counter) {
+            (Some(epoch), Some(counter)) => {
+                carried.epoch = Some(epoch);
+                carried.next_duty = counter.max(past_kept);
+            }
+            _ => carried.next_duty = past_kept,
+        }
+        Ok(Some(carried))
+    }
+
+    /// The ID the next duty event takes: past the counter and every kept event.
+    async fn next_duty(reader: &Reader) -> Result<u64, AppError> {
+        let counter: u64 = reader.get(key::DUTY_NEXT).await?.unwrap_or(FIRST_DUTY);
+        let kept = reader.scan_numbers(key::DUTY_PREFIX).await?;
+        let past_kept = match kept.last() {
+            Some(last) => last.checked_add(1).ok_or_else(corrupt)?,
+            None => FIRST_DUTY,
+        };
+        Ok(counter.max(past_kept))
     }
 
     /// The highest service time the app verified, Unix milliseconds (Switch spec 10.1): a
@@ -1628,7 +1938,15 @@ impl App {
     async fn destroy_keys(&mut self) -> Result<(), AppError> {
         let now = self.now();
         let mut tx = Tx::new(&self.ns);
-        for prefix in ["rk/", "scope/", "parked/", "pending/", "p/"] {
+        for prefix in [
+            "rk/",
+            "scope/",
+            "parked/",
+            "pending/",
+            "p/",
+            key::DUTY_PREFIX,
+            key::OWED_PREFIX,
+        ] {
             tx.delete_prefix(prefix)?;
         }
         records::destroy_shared(&mut tx)?;
@@ -1705,10 +2023,12 @@ impl App {
     }
 
     /// Commit; after a failure the app reads its state again before going on.
-    pub(crate) async fn commit(&mut self, tx: Tx) -> Result<(), AppError> {
+    pub(crate) async fn commit(&mut self, mut tx: Tx) -> Result<(), AppError> {
+        let duties = tx.take_reports();
         match tx.commit(&self.env.store).await {
             Ok(()) => {
                 self.service_time_dirty = false;
+                self.queue_duties(duties);
                 Ok(())
             }
             Err(error) => {
@@ -1720,6 +2040,8 @@ impl App {
 
     /// Reload after a failed commit, and refuse calls the app's state forbids.
     async fn ready_local(&mut self) -> Result<(), AppError> {
+        // Each call takes a service time of its own before it judges a kept batch's age.
+        self.time_fresh_at = None;
         if self.reload {
             self.state = Self::read_state(&self.reader()).await?;
             self.client = Self::client_for(
@@ -1728,8 +2050,11 @@ impl App {
                 &self.state.keys,
                 &self.state.cert,
             )?;
-            self.reload = false;
             self.service_time_dirty = false;
+            // The reload is done only once the kept duty events it may owe the host are
+            // queued: a replay that fails is made again by the next call.
+            self.queue_unreported_duties().await?;
+            self.reload = false;
         }
         Ok(())
     }
@@ -1783,6 +2108,7 @@ impl App {
         // verified carries the last committed time, and measures nothing (Switch wire 7.1).
         let time = self.client.latest_server_time()?;
         let now = self.now();
+        self.time_fresh_at = Some(now);
         let key = self.state.meta.service_key;
         let offset = i64::try_from(time)
             .unwrap_or(i64::MAX)

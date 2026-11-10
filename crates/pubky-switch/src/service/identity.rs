@@ -86,6 +86,28 @@ impl Service {
             .await
             .map_err(|e| store_error(&e))?
             .app_limit;
+        // The kept proofs all name the generation the account serves, whose key is this
+        // one; an earlier generation's come with generation changes, which carry its key.
+        let (record_generations, entry_generations) = txn
+            .kept_proof_generations()
+            .await
+            .map_err(|e| store_error(&e))?;
+        let generation = txn.head().generation;
+        let keyed = |generations: Vec<u64>| -> Result<Vec<(u64, [u8; 32])>, ApiError> {
+            generations
+                .into_iter()
+                .map(|g| {
+                    if g == generation {
+                        Ok((g, service_key))
+                    } else {
+                        tracing::error!(generation = g, "a kept proof of an earlier generation");
+                        Err(ApiError::unavailable("7.6: a temporary failure"))
+                    }
+                })
+                .collect()
+        };
+        let records = keyed(record_generations)?;
+        let claim_entries = keyed(entry_generations)?;
         let view = AccountView {
             held,
             app_limit,
@@ -93,8 +115,10 @@ impl Service {
             origin: &self.origin,
             pending_key,
             kept_app_ids: &kept_app_ids,
-            // No record or claim proofs are kept before operations are served.
-            kept_proofs: KeptProofs::default(),
+            kept_proofs: KeptProofs {
+                records: &records,
+                claim_entries: &claim_entries,
+            },
         };
         match check_delivery(&view, &doc, delivery.prev.as_ref()) {
             Err(DeliveryRefusal::BadRequest(why)) => Err(ApiError::bad_request(why)),
@@ -137,7 +161,7 @@ impl Service {
                     "7.4.2: a generation change isn't served yet",
                 ))
             }
-            Ok(Delivery::New(None)) => self.chain_delivery(txn, signer, &doc, time_ms).await,
+            Ok(Delivery::New(None)) => self.chain_delivery(txn, signer, held, &doc, time_ms).await,
         }
     }
 
@@ -146,6 +170,7 @@ impl Service {
         &self,
         txn: &mut AccountTxn,
         signer: &ServiceSigner,
+        previous: Option<&IdentityDoc>,
         doc: &IdentityDoc,
         time_ms: u64,
     ) -> Result<(Answer, bool), ApiError> {
@@ -166,6 +191,7 @@ impl Service {
             stub: &stub,
             server_time_ms: time_ms,
             only_for: None,
+            proof: None,
         })
         .await
         .map_err(|e| store_error(&e))?;
@@ -186,6 +212,17 @@ impl Service {
         })
         .await
         .map_err(|e| store_error(&e))?;
+        // Where the keys_through of each app it lists for the first time starts (Switch
+        // wire 7.4.12).
+        let listed = crate::store::newly_listed(previous, doc);
+        txn.note_listings(&listed, doc.data_epoch())
+            .await
+            .map_err(|e| store_error(&e))?;
+        // The departures whose rotation this version makes.
+        let removed: Vec<[u8; 16]> = doc.body().removed.iter().map(|app| app.app_id).collect();
+        txn.note_rotations(&removed, doc.data_epoch())
+            .await
+            .map_err(|e| store_error(&e))?;
         let head = self
             .head(txn, signer)
             .await

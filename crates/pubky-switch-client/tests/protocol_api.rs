@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use pubky_switch_client::app::{
     App, AppConfig, AppError, Collection, Delivery, Effect, Initiator, LocalWrite,
     MAX_CURSOR_DEFER_MS, MayAct, MissedEntries, OpBatch, Outcome, OutgoingMessage, Protocol,
-    ReceiveContext, ReceivedMessage, RecordTarget, ResendNeeded, SwitchCopy,
+    ReceiveContext, ReceivedMessage, RecordTarget, ResendNeeded, StoreFailure, SwitchCopy,
 };
 use pubky_switch_client::clock::TestClock;
 use pubky_switch_client::store::{MemoryStore, StateStore};
@@ -134,12 +134,12 @@ impl Protocol for NotesProtocol {
         Outcome::Apply(Effect::default())
     }
 
-    fn resend_needed(&self, _needed: &ResendNeeded) -> Vec<LocalWrite> {
-        Vec::new()
+    fn resend_needed(&self, _needed: &ResendNeeded) -> Result<Vec<LocalWrite>, StoreFailure> {
+        Ok(Vec::new())
     }
 
-    fn missed(&self, _missed: &MissedEntries) -> Vec<LocalWrite> {
-        Vec::new()
+    fn missed(&self, _missed: &MissedEntries) -> Result<Vec<LocalWrite>, StoreFailure> {
+        Ok(Vec::new())
     }
 
     fn collections(&self) -> Vec<Collection> {
