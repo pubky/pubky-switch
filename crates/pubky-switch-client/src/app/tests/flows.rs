@@ -1403,6 +1403,68 @@ async fn test_kept_batch_window_holds_with_the_device_clock_ahead_after_a_restor
     );
 }
 
+/// How many conversation entries for `pubky` the switch applied.
+fn conversations_for(w: &World, pubky: [u8; 32]) -> usize {
+    w.switch
+        .applied()
+        .iter()
+        .filter(|op| matches!(op.body().kind, OpKind::AllowPut { pubky: p, .. } if p == pubky))
+        .count()
+}
+
+/// A write while the service can't be reached: kept, never sent.
+async fn write_offline(w: &World, app: &mut App) {
+    w.switch.fail_next(Fault::Unreachable {
+        path: "feed".into(),
+        after: 0,
+    });
+    w.switch.fail_next(Fault::Unreachable {
+        path: "ops".into(),
+        after: 0,
+    });
+    let result = app.submit_batch(conversation(w.bob.public())).await;
+    assert!(matches!(result, Err(AppError::Transport(_))), "{result:?}");
+    w.switch.lock().faults.clear();
+    let kept = app.kept_batches().await.unwrap();
+    assert_eq!(kept.len(), 1, "a network failure keeps the batch");
+    assert_eq!(kept[0].1.kept_ms, None, "never sent, so not stamped");
+    assert_eq!(conversations_for(w, w.bob.public()), 0);
+}
+
+#[tokio::test]
+async fn test_kept_batch_written_offline_goes_once_the_service_is_back() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    w.clock.advance_ms(20 * 60 * 1000);
+    write_offline(&w, &mut app).await;
+    // The next write sends it first, as its first send: applied once.
+    app.submit_batch(conversation([7; 32])).await.unwrap();
+    assert!(app.kept_batches().await.unwrap().is_empty());
+    assert_eq!(conversations_for(&w, w.bob.public()), 1);
+    assert_eq!(conversations_for(&w, [7; 32]), 1);
+}
+
+#[tokio::test]
+async fn test_kept_batch_written_offline_survives_a_restart_unsent() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let me = app.app_id();
+    w.clock.advance_ms(20 * 60 * 1000);
+    write_offline(&w, &mut app).await;
+    drop(app);
+    // Loaded again a month on: still unsent, with no window, so not judged for age.
+    w.clock.advance_ms(31 * 24 * HOUR);
+    let mut app = w.load(me).await;
+    assert_eq!(app.kept_batches().await.unwrap()[0].1.kept_ms, None);
+    app.submit_batch(conversation([7; 32])).await.unwrap();
+    assert!(app.kept_batches().await.unwrap().is_empty());
+    assert_eq!(conversations_for(&w, w.bob.public()), 1);
+    assert!(!has(
+        &app.unacknowledged_events().await.unwrap(),
+        |e| matches!(e, AppEvent::KeptBatchDropped { .. })
+    ));
+}
+
 #[tokio::test]
 async fn test_kept_batch_window_holds_with_the_device_clock_behind_at_the_resend() {
     let w = World::new();

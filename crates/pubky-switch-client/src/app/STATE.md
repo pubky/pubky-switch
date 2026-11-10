@@ -30,18 +30,21 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
 - **Any commit carries everything read before it.** A page's writes go in the next commit
   point, so no commit records a cursor past items whose writes it lacks.
 - **After a failed commit the app reloads** from the store before its next call.
-- **A kept batch or effect is never sent again past its window**, whatever the
-  generation: 30 days from when it was kept, less an hour, both ends in verified service
-  time, erring older. It is kept at the earlier of the device clock and the service time
-  verified in the call that keeps it, which a one-item feed read fetches first when
-  no answer of the call brought one; its age is judged at the later of the device clock
-  and a service time verified in the call that sends it again, fetched the same way; a
-  time verified more than 10 minutes before by the device clock, or with the device clock
-  gone back since, is read again. One past the window by the clocks at hand already, the
-  device clock or the service time held, needs no reading. Past
-  it a retry would get `409 conflict` once the service dropped its proofs, or be taken as
-  new once it forgot the ID (Switch wire 6.4 step 5): the effect's entry is parked as
-  uncertain, the batch dropped with its attempts, unsent.
+- **A kept batch or effect is never sent again past its window**, whatever the generation:
+  30 days from its first send, less an hour, both ends in verified service time, erring
+  older. Its first send is stamped (`kept_ms`) at the earlier of the device clock and a
+  service time verified in that call, which a one-item feed read fetches first when no
+  answer of the call brought one, and the stamp is committed before the request leaves; a
+  batch never sent has no stamp and no window, can't be ambiguous, and is never judged for
+  age, and a call that can't verify a time leaves it kept and unsent. An effect is stamped
+  the same way when it is kept, right before its first send. Its age is judged at the later
+  of the device clock and a service time verified in the call that sends it again, fetched
+  the same way; a time verified more than 10 minutes before by the device clock, or with the
+  device clock gone back since, is read again. One past the window by the clocks at hand
+  already, the device clock or the service time held, needs no reading. Past it a retry
+  would get `409 conflict` once the service dropped its proofs, or be taken as new once it
+  forgot the ID (Switch wire 6.4 step 5): the effect's entry is parked as uncertain, the
+  batch dropped with its attempts, unsent.
 - **A refusal of a batch sent again tells only from the batch ID lookup on** (Switch wire
   6.4 step 5). One made before it is about the caller, such as `403 cert_expired`, or about
   these bytes, such as `400`. About the caller, it tells nothing of the batch: a kept effect
@@ -207,7 +210,7 @@ uploads; `push.rs` holds the push registration. The peek (`peek.rs`) writes noth
 | `peers_doc` | the own `identity.json` the deliveries to recent peers were last judged against, and the counterparties still owed it | |
 | `lc/conv/<pubky>` | a conversation entry in the app's copy of the lists, from its writes, the feed and `GET /allow`; its writes and `GET /allow` also keep `lc/contact/`, `lc/deny/` and `lc/code/` | |
 | `invite/<code_hash>` | the code of an invite code the app registered, to show it again | yes |
-| `opq/<batch_id>` | a batch of operations, signed and kept before it is sent, with what its answer settles: the protocol's local writes and the signed messages it puts in the outbox; it goes with its answer or a refusal for good, and stays through anything else | the messages' |
+| `opq/<batch_id>` | a batch of operations, signed and kept before it is sent, with what its answer settles and, from its first send on, when that left (`kept_ms`, absent while never sent): the protocol's local writes and the signed messages it puts in the outbox; it goes with its answer or a refusal for good, and stays through anything else | the messages' |
 | `list_due` | a listing of the collections is owed: after joining, a restore or a `missed` item | |
 | `rec/<key>` | the shared record write the app took: the signed operation, certificate and proof, its version and whether a proof gave it, the opened value, and the refused write it follows | yes |
 | `recname/<key>` | the collection name of a record the app creates outside the protocol's collections, from a write or an effect, until its write is answered | |
