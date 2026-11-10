@@ -30,10 +30,13 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
   point, so no commit records a cursor past items whose writes it lacks.
 - **After a failed commit the app reloads** from the store before its next call.
 - **A refusal of a batch sent again tells only from the batch ID lookup on** (Switch wire
-  6.4 step 5): one refused before it, such as `403 cert_expired` or `401 bad_signature`,
-  may have been applied, so a kept effect or batch stays as it is, to go again unchanged,
-  until a resend answers, or it outlives the window and is parked or dropped as uncertain.
-  The codes are classified in one place (`refused_after_lookup`).
+  6.4 step 5). One made before it is about the caller, such as `403 cert_expired`, or about
+  these bytes, such as `400`. About the caller, it tells nothing of the batch: a kept effect
+  or batch stays as it is, to go again unchanged once the service accepts the app's
+  requests, and a renewed certificate is taken before a kept effect goes again; past the
+  window it is parked or dropped as uncertain. About these bytes, it will come again: the
+  effect's entry is parked as uncertain, or the batch dropped with its attempts, at once.
+  The codes are classified in one place (`refusal_place`).
 - **A duty event goes in the commit of what it reports** (`duty/<id>`), and is reported
   only once that commit is done: a failed commit reports nothing, and a crash after it
   loses nothing, since every load reports the kept duty events again. A commit that

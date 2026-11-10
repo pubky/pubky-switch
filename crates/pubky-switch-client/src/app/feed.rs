@@ -56,7 +56,7 @@ use pubky_switch_core::sig::SignedDoc;
 use super::batch::PendingBatch;
 use super::claims::{ClaimRead, ObligationDeadline};
 use super::context::{ClaimFetch, ContextWrites, ReceiveContext};
-use super::error::{Alarm, Refusal, refused_after_lookup, refused_for_good};
+use super::error::{Alarm, Refusal, RefusalPlace, refused_at, refused_for_good};
 use super::events::{AppEvent, Duty, ParkReason};
 use super::identity::{self, DOC_CACHE_MS, Taken};
 use super::protocol::{
@@ -945,9 +945,11 @@ impl App {
     ///
     /// `resent` for an effect that may have been sent before, its answer lost: a refusal
     /// the service made before its batch ID lookup tells nothing of whether it was applied
-    /// ([`refused_after_lookup`]), so the effect stays kept, to go again unchanged once the
-    /// cause is gone, such as after a renewed certificate. Past the window in which a resend
-    /// tells, its entry is stored and passed as uncertain instead ([`App::effect_uncertain`]).
+    /// ([`RefusalPlace`]). One about the caller keeps the effect, to go again unchanged once
+    /// the cause is gone, such as after a renewed certificate, and is the read's error, as
+    /// the same answer to any request; past the window in which a resend tells, its entry is
+    /// stored as uncertain instead. One about these bytes will come again: the entry is
+    /// stored as uncertain at once ([`App::effect_uncertain`]), and the read goes on.
     async fn run_effect(
         &mut self,
         pending: PendingEffect,
@@ -959,9 +961,14 @@ impl App {
             Ok(submitted) => submitted,
             Err(error)
                 if resent
-                    && refused_for_good(&error).is_some_and(|code| !refused_after_lookup(code)) =>
+                    && matches!(
+                        refused_at(&error),
+                        Some(RefusalPlace::Caller | RefusalPlace::Bytes)
+                    ) =>
             {
-                if super::provider::answer_decides(self.now(), pending.kept_ms) {
+                if refused_at(&error) == Some(RefusalPlace::Caller)
+                    && super::provider::answer_decides(self.now(), pending.kept_ms)
+                {
                     return Err(error);
                 }
                 self.effect_uncertain(&pending).await?;
@@ -1060,7 +1067,8 @@ impl App {
     /// stale_generation` among them, means it wasn't: it goes, and its entry is read again
     /// and its effect signed anew. `409 stale_generation` tells that only while the service
     /// still holds the batch's ID: past the window, the effect's entry is stored and
-    /// passed instead ([`App::effect_uncertain`]). Any other failure keeps it.
+    /// passed instead ([`App::effect_uncertain`]); so is it at once on a refusal about these
+    /// bytes ([`RefusalPlace::Bytes`]). Any other failure keeps it.
     async fn resend_earlier_effect(
         &mut self,
         pending: PendingEffect,
@@ -1078,12 +1086,18 @@ impl App {
             })) if !super::provider::answer_decides(self.now(), pending.kept_ms) => {
                 return self.effect_uncertain(&pending).await;
             }
-            // Refused before the batch ID lookup: nothing told, so kept, to go again
-            // unchanged, or past the window stored as uncertain.
+            // Refused before the batch ID lookup, which tells nothing: about the caller, kept,
+            // to go again unchanged, or past the window stored as uncertain; about these
+            // bytes, stored as uncertain at once.
             Err(error)
-                if refused_for_good(&error).is_some_and(|code| !refused_after_lookup(code)) =>
+                if matches!(
+                    refused_at(&error),
+                    Some(RefusalPlace::Caller | RefusalPlace::Bytes)
+                ) =>
             {
-                if super::provider::answer_decides(self.now(), pending.kept_ms) {
+                if refused_at(&error) == Some(RefusalPlace::Caller)
+                    && super::provider::answer_decides(self.now(), pending.kept_ms)
+                {
                     return Err(error);
                 }
                 return self.effect_uncertain(&pending).await;

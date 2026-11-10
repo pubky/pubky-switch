@@ -31,7 +31,7 @@ use pubky_switch_core::sig::SignedDoc;
 use serde::{Deserialize, Serialize};
 
 use super::claims::ObligationDeadline;
-use super::error::{Refusal, refused_after_lookup, refused_for_good};
+use super::error::{Refusal, RefusalPlace, refused_at, refused_for_good};
 use super::events::AppEvent;
 use super::protocol::LocalWrite;
 use super::recovery::LossStep;
@@ -44,9 +44,13 @@ use crate::error::ClientError;
 /// The prefix of the kept batches.
 const PENDING_PREFIX: &str = "opq/";
 
-/// Whether `error` refuses a batch for good before the service's batch ID lookup.
+/// Whether `error` refuses a batch for good before the service's batch ID lookup, about the
+/// caller or about these bytes ([`RefusalPlace`]).
 fn refused_before_lookup(error: &AppError) -> bool {
-    refused_for_good(error).is_some_and(|code| !refused_after_lookup(code))
+    matches!(
+        refused_at(error),
+        Some(RefusalPlace::Caller | RefusalPlace::Bytes)
+    )
 }
 
 fn pending_key(batch_id: &[u8; 16]) -> String {
@@ -595,10 +599,12 @@ impl App {
     }
 
     /// A kept batch sent again and refused before the service looked at its batch ID, which
-    /// tells nothing of whether it was applied ([`refused_after_lookup`]): it stays kept, to
-    /// go again unchanged once the cause is gone, and the error is the caller's. Past the
-    /// window in which a resend tells, it is dropped and reported with its attempts instead
-    /// (Switch spec 12.5 "Kept batches").
+    /// tells nothing of whether it was applied ([`RefusalPlace`]). Refused about the caller,
+    /// it stays kept, to go again unchanged once the cause is gone, and the error is the
+    /// caller's; past the window in which a resend tells, it is dropped and reported with
+    /// its attempts instead (Switch spec 12.5 "Kept batches"). Refused about these bytes,
+    /// which will be refused again, it is dropped and reported so at once, and the next
+    /// kept batch goes on.
     async fn kept_refused_before_lookup(
         &mut self,
         id: &[u8; 16],
@@ -606,7 +612,9 @@ impl App {
         batch: &Batch,
         error: AppError,
     ) -> Result<(), AppError> {
-        if super::provider::answer_decides(self.now(), pending.kept_ms) {
+        if refused_at(&error) == Some(RefusalPlace::Caller)
+            && super::provider::answer_decides(self.now(), pending.kept_ms)
+        {
             return Err(error);
         }
         let mut tx = self.tx()?;
@@ -634,7 +642,7 @@ impl App {
     /// Send a kept batch and commit its outcome. A refusal for good drops it; any other
     /// failure keeps it, to be sent again with the same bytes (Switch wire 2.1, 6.4).
     /// `resent` for a batch that may have been sent before: one refused before the batch ID
-    /// lookup stays kept ([`refused_after_lookup`]).
+    /// lookup stays kept ([`RefusalPlace`]).
     async fn run_pending(
         &mut self,
         id: &[u8; 16],

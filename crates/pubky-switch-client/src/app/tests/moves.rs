@@ -3048,6 +3048,80 @@ async fn test_uncertain_park_of_an_entry_past_a_held_one_keeps_the_cursor() {
     assert!(app.cursor().seq < seq);
 }
 
+#[tokio::test]
+async fn test_kept_effect_refused_for_its_bytes_is_parked_at_once() {
+    for code in [ErrorCode::BadRequest, ErrorCode::TooLarge] {
+        let w = World::new();
+        let router = Router::of(&w);
+        let mut app = join(&w, &router).await;
+        let me = app.app_id();
+        let (seq, message) = w.note(me, "before");
+        w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+        assert!(app.receive(None).await.is_err());
+        let (later, _) = w.note(me, "later");
+        // Sent again, refused for its own shape: the same bytes would be again, so the
+        // entry is stored as uncertain at once, and the read goes on to the feed.
+        w.switch.fail_next(Fault::Error {
+            path: "ops".into(),
+            code,
+            current: json!(null),
+        });
+        let report = app.receive(None).await.unwrap();
+        assert!(
+            has(&report.events, |e| matches!(
+                e,
+                AppEvent::EffectUncertain { seq: s, .. } if *s == seq
+            )),
+            "{code:?}: {:?}",
+            report.events
+        );
+        assert!(
+            received(&report.events, later),
+            "{code:?}: {:?}",
+            report.events
+        );
+        assert_eq!(
+            app.state.parked.get(&seq).map(|p| p.reason),
+            Some(ParkReason::Uncertain)
+        );
+        assert!(app.state.pending_effect.is_none());
+        // Never applied twice, and a re-send is a duplicate: one effect for each note.
+        assert_eq!(w.effects(), 2, "{code:?}");
+        resend_is_a_duplicate(&w, &mut app, &w.switch.clone(), &message).await;
+    }
+}
+
+#[tokio::test]
+async fn test_kept_batch_refused_for_its_bytes_is_dropped_at_once() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = lists_app(&w, &router).await;
+    let carol = IdentityKey::from_secret(seed("carol/identity")).public();
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.submit_batch(contact_batch(carol)).await.is_err());
+    // The next write sends it again first; refused for its shape, it is dropped and
+    // reported at once, and the write goes on.
+    let dave = IdentityKey::from_secret(seed("dave/identity")).public();
+    w.switch.fail_next(Fault::Error {
+        path: "ops".into(),
+        code: ErrorCode::BadRequest,
+        current: json!(null),
+    });
+    app.submit_batch(contact_batch(dave)).await.unwrap();
+    assert!(app.kept_batches().await.unwrap().is_empty());
+    let events = app.take_events();
+    assert!(
+        has(&events, |e| matches!(e, AppEvent::KeptBatchDropped { .. })),
+        "{events:?}"
+    );
+    assert!(has(
+        &app.unacknowledged_events().await.unwrap(),
+        |e| matches!(e, AppEvent::KeptBatchDropped { .. })
+    ));
+    assert_eq!(allow_ops_for(&w.switch.applied(), dave), 1);
+    assert_eq!(allow_ops_for(&w.switch.applied(), carol), 1);
+}
+
 /// The app at `store`, loaded through the loss's router.
 async fn load_lost(lost: &Lost, store: Arc<dyn StateStore>) -> App {
     App::load(

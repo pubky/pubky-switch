@@ -164,6 +164,60 @@ impl AppError {
     }
 }
 
+/// Where the service made a refusal for good of a batch sent again (Switch wire 6.4), which
+/// decides what the refusal tells of the batch. A batch whose ID the service holds is
+/// answered at the batch ID lookup (step 5), by its original proofs or `409 conflict`,
+/// before any later check; what comes before that lookup tells nothing of whether it was
+/// applied.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RefusalPlace {
+    /// At or after the batch ID lookup: the batch was never applied. `409 conflict` (step
+    /// 5, or a condition or rule at steps 8 and 9), `409 stale_generation` (step 6), `403
+    /// permission_missing` (step 9), `409 stale_epoch` (a sealed field's rule, step 9),
+    /// `429 quota_exceeded` (step 9).
+    AfterLookup,
+    /// Before the lookup, about the caller: every request the app sends gets it until
+    /// something outside the batch changes, so it tells nothing of the batch, which stays
+    /// kept, the same bytes, and is handled as the same answer to any request.
+    /// Authentication's `401 bad_signature`, `401 stale_timestamp`, `403 not_current`, `403
+    /// cert_expired`, `410 moved` and `503 staged` (Switch wire 7.2, 7.3), and `403
+    /// not_admitted` (step 1, a caller of another identity, decided from the request's
+    /// identity and the account, not from the batch).
+    Caller,
+    /// Before the lookup, about these bytes: the same bytes get the same answer, so the
+    /// batch is never answered and is handled at once as one kept past the window: an
+    /// effect's entry stored as uncertain, a batch dropped with its attempts. It is
+    /// uncertain, not refused: a batch applied under an earlier service can be refused for
+    /// its shape by a later one. `400` (steps 2 to 4), `413 too_large` (step 2), and every
+    /// code not classified above. `400` and `413` can also come from step 9 (a field's
+    /// shape, a record value's size), which this takes as before the lookup.
+    Bytes,
+}
+
+/// The place of a refusal for good of a batch sent again ([`RefusalPlace`]).
+pub(crate) fn refusal_place(code: ErrorCode) -> RefusalPlace {
+    match code {
+        ErrorCode::Conflict
+        | ErrorCode::StaleGeneration
+        | ErrorCode::PermissionMissing
+        | ErrorCode::StaleEpoch
+        | ErrorCode::QuotaExceeded => RefusalPlace::AfterLookup,
+        ErrorCode::BadSignature
+        | ErrorCode::StaleTimestamp
+        | ErrorCode::NotCurrent
+        | ErrorCode::CertExpired
+        | ErrorCode::Moved
+        | ErrorCode::Staged
+        | ErrorCode::NotAdmitted => RefusalPlace::Caller,
+        _ => RefusalPlace::Bytes,
+    }
+}
+
+/// The place of an error that refuses a batch for good; `None` for any other error.
+pub(crate) fn refused_at(error: &AppError) -> Option<RefusalPlace> {
+    refused_for_good(error).map(refusal_place)
+}
+
 /// Whether the switch refused these exact bytes for good, so that sending them again can't
 /// pass (Switch spec 6.4): the Retry column says "No", or allows the call only once it is
 /// built again (after re-reading, with the key bundle, signed again or sealed again). Every
@@ -171,33 +225,6 @@ impl AppError {
 /// (the request is signed again, the body isn't), `409 identity_needed`, `410 moved`, a
 /// transport failure, or an answer whose signature didn't verify or that didn't read, which
 /// may not be the service's (Switch wire 2.1, 7.1).
-/// Whether a refusal for good of a batch sent again shows that the batch was never applied:
-/// only an answer the service makes at or after its batch ID lookup (Switch wire 6.4 step
-/// 5) does, since a batch whose ID it holds is answered there, by its original proofs or
-/// `409 conflict`, before any later check. By the step order of Switch wire 6.4:
-///
-/// - **At or after the lookup:** `409 conflict` (step 5, or a condition or rule at steps 8
-///   and 9), `409 stale_generation` (step 6), `403 permission_missing` (step 9), `409
-///   stale_epoch` (a sealed field's rule, step 9), `429 quota_exceeded` (step 9).
-/// - **Before it, so they tell nothing:** what authentication answers (Switch wire 7.1, 7.2:
-///   `401 bad_signature`, `401 stale_timestamp`, `403 not_current`, `403 cert_expired`,
-///   `410 moved`, `503 staged`), `403 not_admitted` (step 1), `400` (steps 2 to 4),
-///   `413 too_large` (step 2), `401 bad_signature` (step 3).
-///
-/// `400` and `413 too_large` can also come from step 9 (a field's shape, a record value's
-/// size); they are taken as before the lookup, which keeps the batch rather than risk
-/// building it twice. Every other code is taken so too.
-pub(crate) fn refused_after_lookup(code: ErrorCode) -> bool {
-    matches!(
-        code,
-        ErrorCode::Conflict
-            | ErrorCode::StaleGeneration
-            | ErrorCode::PermissionMissing
-            | ErrorCode::StaleEpoch
-            | ErrorCode::QuotaExceeded
-    )
-}
-
 pub(crate) fn refused_for_good(error: &AppError) -> Option<ErrorCode> {
     let AppError::Switch(ClientError::Switch { code, .. }) = error else {
         return None;
