@@ -44,15 +44,17 @@ use serde_json::Value;
 use crate::alert::{Alert, Source};
 use crate::error::{Refusal, Result, SignerError};
 use crate::homeserver::Homeserver;
-use crate::key::{ExportReason, IdentityKeyring, SigningKey};
+use crate::key::{IdentityKeyring, SigningKey};
 use crate::protocol::Protocols;
 use crate::state::{self, DeliverStep, Flow, Newest, Service, SignerState};
 
 mod approval;
+mod clients;
 pub(crate) mod gate;
 mod renewal;
 
 pub use approval::{AppReview, ApprovedRequest};
+use clients::{RequestClient, SigningClient};
 pub use renewal::CertChange;
 
 /// What the signer works with, from the host.
@@ -344,7 +346,10 @@ impl Signer {
     ///
     /// Nothing is delivered again when the alarm saw no copy at all, since that switch lost
     /// the account's state and must not serve it again under this generation (Switch spec
-    /// 6.5): the user declares a provider loss. Nor once another install is the signer.
+    /// 6.5). Then the switch's copy is read instead: one at the mark, as after a single bad
+    /// answer, confirms the switch, and signing goes on; none raises the alarm again, and the
+    /// user declares a provider loss. Nothing is delivered or read once another install is
+    /// the signer.
     ///
     /// # Errors
     ///
@@ -408,6 +413,11 @@ impl Signer {
         self.commit(state, flow).await?;
         if deliver_again || republish {
             self.resume().await?;
+        } else if named && self.state.switch_unconfirmed && gate::held_alarm(&self.state).is_none()
+        {
+            // Nothing to deliver again: the switch's copy confirms it, if it holds the mark.
+            // One that holds nothing raises the alarm again; the way out is a provider loss.
+            self.switch_at_mark().await?;
         }
         Ok(())
     }
@@ -656,17 +666,25 @@ impl Signer {
 
     /// A client of the switch the identity is enrolled at, for requests: it signs no
     /// operation ([`crate::key::IdentityKeyring::request_signer`]).
-    fn service_client(&self) -> Result<SwitchClient> {
+    fn service_client(&self) -> Result<RequestClient> {
         let service = self.service()?;
         let key = self.keyring.request_signer()?;
-        self.client(&service.origin, Some(service.service_key), key)
+        Ok(RequestClient(self.client(
+            &service.origin,
+            Some(service.service_key),
+            key,
+        )?))
     }
 
     /// A client of the switch the identity is enrolled at that signs operations with `key`,
     /// which the signing gate handed out.
-    fn signing_client(&self, key: &SigningKey) -> Result<SwitchClient> {
+    fn signing_client(&self, key: &SigningKey) -> Result<SigningClient> {
         let service = self.service()?;
-        self.client(&service.origin, Some(service.service_key), key.shared())
+        Ok(SigningClient(self.client(
+            &service.origin,
+            Some(service.service_key),
+            key.signer(),
+        )?))
     }
 
     /// The identity key for this call's signing steps, through the signing gate
@@ -685,8 +703,7 @@ impl Signer {
     ) -> Result<()> {
         let identity = self.state.identity;
         let enrollment = Enrollment::verify(signed, &identity, origin)?;
-        let answer = self
-            .client(origin, None, self.keyring.request_signer()?)?
+        let answer = RequestClient(self.client(origin, None, self.keyring.request_signer()?)?)
             .enroll(&enrollment)
             .await?;
         let key = self.signing_key()?;
@@ -814,7 +831,20 @@ impl Signer {
             None => None,
         };
         match self.judge_copy(copy.as_ref()) {
-            Ok(Verdict::AtMark) => Ok(()),
+            Ok(Verdict::AtMark) => {
+                // The switch's own copy, authenticated with its pinned key and verified for
+                // the identity, is the mark's document: it confirms the switch as a delivery
+                // does, once no alarm's alert is held (Switch spec 4.3).
+                let mark = self.state.newest_doc()?.map(|doc| doc.hash());
+                let same = copy.as_ref().is_some_and(|c| Some(c.hash()) == mark);
+                if same && self.state.switch_unconfirmed && gate::held_alarm(&self.state).is_none()
+                {
+                    let mut state = self.state.clone();
+                    state.switch_unconfirmed = false;
+                    self.commit(state, self.flow.clone()).await?;
+                }
+                Ok(())
+            }
             Ok(Verdict::Newer) => match copy {
                 Some(copy) => self.adopt(copy, Source::Switch).await,
                 None => Ok(()),
@@ -849,7 +879,7 @@ impl Signer {
         let Ok(backup) = serde_json::from_slice::<SignerBackup>(bytes) else {
             return Ok(None);
         };
-        Ok(self.keyring.with_key(|key| backup.open(key).ok())?)
+        Ok(self.keyring.open_backup(&backup)?)
     }
 
     /// Seal the signer's records, holding `doc`, to the backup key (Switch wire 3.13). The
@@ -864,19 +894,16 @@ impl Signer {
             .map(|cert| AppCert::verify(cert, &identity))
             .collect::<std::result::Result<Vec<_>, _>>()?;
         let limits = self.service()?.limits;
-        let sealed = self.keyring.for_export(ExportReason::Backup, |_, key| {
-            let records = SignerRecords::new(
-                key.clone(),
-                doc,
-                &self.state.tombstones,
-                &issued,
-                limits,
-                &self.state.bundle_parts,
-                prev,
-            )?;
-            SignerBackup::seal(key, &records)
-        })??;
-        Ok(sealed)
+        // Sealing signs the backup, so it takes the gated key.
+        let key = self.signing_key()?;
+        Ok(key.seal_backup(
+            doc,
+            &self.state.tombstones,
+            &issued,
+            limits,
+            &self.state.bundle_parts,
+            prev,
+        )?)
     }
 
     /// Deliver the new version (Switch wire 7.4.2) and take the answer.

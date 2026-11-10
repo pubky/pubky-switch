@@ -39,6 +39,9 @@ use std::sync::Arc;
 use pubky_switch_core::enc::{kid, pubky_id};
 use pubky_switch_core::keys::IdentityKey;
 use pubky_switch_core::labels;
+use pubky_switch_core::records::{
+    AppCert, IdentityDoc, Limits, SignerBackup, SignerRecords, StoredPart,
+};
 use pubky_switch_core::signing::Signs;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -323,38 +326,34 @@ impl IdentityKeyring {
         Ok(Arc::new(RequestSigner(secret.key())))
     }
 
-    /// Run `use_key` with the identity key, for one signature or derivation over an input this
-    /// crate built (see the module docs). The key is dropped, and zeroized, when `use_key`
-    /// returns. `use_key` never reads the secret bytes: that is
-    /// [`IdentityKeyring::for_export`]'s alone.
+    /// Run `use_key` with the identity key, for one derivation or one opening, never a
+    /// signature: signing takes the gated [`SigningKey`]. Private to this module, so every
+    /// use is one of its narrow calls ([`IdentityKeyring::backup_public`],
+    /// [`IdentityKeyring::open_backup`]). The key is dropped, and zeroized, when `use_key`
+    /// returns.
     ///
     /// # Errors
     ///
     /// [`KeyError::Missing`] or [`KeyError::Mismatch`] when the vault no longer holds this
     /// identity's secret, or the vault's error.
-    pub(crate) fn with_key<T>(
-        &self,
-        use_key: impl FnOnce(&IdentityKey) -> T,
-    ) -> Result<T, KeyError> {
+    fn with_key<T>(&self, use_key: impl FnOnce(&IdentityKey) -> T) -> Result<T, KeyError> {
         let secret = self.load()?;
         let key = secret.key();
         Ok(use_key(&key))
     }
 
-    /// Run `seal` with the identity key, to seal its secret for `reason` (Switch spec 12.8):
-    /// into a hand-over to the new signer (Switch wire 3.12) or into the signer's backup
-    /// (Switch wire 3.13). This is the one place the secret bytes may be read, and only to
-    /// seal them at once.
+    /// Open the signer's backup `backup` with the identity key (Switch wire 3.13): its
+    /// records, or `None` for one that doesn't open or verify. The key opens it and does
+    /// nothing else.
     ///
     /// # Errors
     ///
     /// The errors of [`IdentityKeyring::with_key`].
-    pub(crate) fn for_export<T>(
+    pub(crate) fn open_backup(
         &self,
-        reason: ExportReason,
-        seal: impl FnOnce(ExportReason, &IdentityKey) -> T,
-    ) -> Result<T, KeyError> {
-        self.with_key(|key| seal(reason, key))
+        backup: &SignerBackup,
+    ) -> Result<Option<SignerRecords>, KeyError> {
+        self.with_key(|key| backup.open(key).ok())
     }
 
     /// Delete the identity secret from the vault (Switch spec 3.1, 12.8): once a hand-over
@@ -381,9 +380,51 @@ pub(crate) struct SigningKey {
 }
 
 impl SigningKey {
-    /// The key, shared, for a client that signs operations with it.
-    pub(crate) fn shared(&self) -> Arc<IdentityKey> {
-        Arc::clone(&self.key)
+    /// The key as a client's credentials, for one call's operations and requests: it hands
+    /// out signatures, never the key.
+    pub(crate) fn signer(&self) -> Arc<dyn Signs + Send + Sync> {
+        Arc::new(GatedSigner(Arc::clone(&self.key)))
+    }
+
+    /// Seal the signer's backup holding `doc` and these records to the backup key, with the
+    /// identity secret in it ([`ExportReason::Backup`], Switch spec 12.8, Switch wire 3.13).
+    /// This is the one place the secret leaves the vault, and only sealed.
+    ///
+    /// # Errors
+    ///
+    /// The core's error for records that don't build or seal.
+    pub(crate) fn seal_backup(
+        &self,
+        doc: IdentityDoc,
+        revoked: &[[u8; 16]],
+        issued: &[AppCert],
+        limits: Limits,
+        parts: &[StoredPart],
+        prev: Option<[u8; 32]>,
+    ) -> Result<SignerBackup, pubky_switch_core::Error> {
+        let records = SignerRecords::new(
+            IdentityKey::clone(&self.key),
+            doc,
+            revoked,
+            issued,
+            limits,
+            parts,
+            prev,
+        )?;
+        SignerBackup::seal(&self.key, &records)
+    }
+}
+
+/// The gated key behind a signing client's credentials.
+struct GatedSigner(Arc<IdentityKey>);
+
+impl Signs for GatedSigner {
+    fn public_key(&self) -> [u8; 32] {
+        self.0.public()
+    }
+
+    fn sign_fields(&self, label: &str, fields: &[&[u8]]) -> [u8; 64] {
+        self.0.sign(label, fields)
     }
 }
 
@@ -397,7 +438,8 @@ impl std::ops::Deref for SigningKey {
 
 /// The identity key behind a request-only credential: it signs `Switch-Signature` (Switch
 /// wire 7.1) and nothing else. Any other label gets an all-zero signature, which no reader
-/// takes.
+/// takes (Switch wire 2.1), and fails a debug assertion, so a bug that asks for one shows in
+/// tests.
 struct RequestSigner(IdentityKey);
 
 impl Signs for RequestSigner {
@@ -409,6 +451,7 @@ impl Signs for RequestSigner {
         if label == labels::sig::HTTP {
             self.0.sign(label, fields)
         } else {
+            debug_assert!(false, "a request-only key was asked to sign {label}");
             [0; 64]
         }
     }
@@ -678,18 +721,25 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_key_export_names_its_reason() {
+    fn test_key_backup_seals_the_secret_and_opens_with_the_key() {
+        use pubky_switch_core::records::{IdentityBody, IdentityPolicy, Inbox};
         let keyring = IdentityKeyring::open(MemoryVault::holding([6; 32])).unwrap();
-        for reason in [
-            ExportReason::Backup,
-            ExportReason::HandOver { to_app: [8; 16] },
-        ] {
-            let (seen, secret) = keyring
-                .for_export(reason, |why, key| (why, key.secret_bytes()))
-                .unwrap();
-            assert_eq!(seen, reason);
-            assert_eq!(secret, [6; 32]);
-        }
+        let state = crate::state::SignerState::new(keyring.public_key(), [1; 16]);
+        let key = crate::signer::gate::signing_key(&keyring, &state).unwrap();
+        let body = IdentityBody::first(
+            keyring.public_key(),
+            [1; 16],
+            Inbox::new("https://switch.example", [4; 32]),
+            IdentityPolicy::default(),
+        );
+        let doc = IdentityDoc::sign(&key, body).unwrap();
+        let backup = key
+            .seal_backup(doc, &[[2; 16]], &[], Limits::default(), &[], None)
+            .unwrap();
+        let records = keyring.open_backup(&backup).unwrap().unwrap();
+        assert_eq!(records.revoked_apps(), [[2; 16]]);
+        let other = IdentityKeyring::open(MemoryVault::holding([7; 32])).unwrap();
+        assert!(other.open_backup(&backup).unwrap().is_none());
     }
 
     #[test]
@@ -718,7 +768,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_request_signer_signs_requests_and_nothing_else() {
+    fn test_request_signer_signs_requests() {
         let keyring = IdentityKeyring::open(MemoryVault::holding([7; 32])).unwrap();
         let key = IdentityKey::from_secret([7; 32]);
         let request = keyring.request_signer().unwrap();
@@ -727,8 +777,14 @@ pub(crate) mod tests {
             request.sign_fields(labels::sig::HTTP, fields),
             key.sign(labels::sig::HTTP, fields)
         );
-        for label in [labels::sig::OP, labels::sig::HTTP_RESPONSE] {
-            assert_eq!(request.sign_fields(label, fields), [0; 64]);
-        }
+    }
+
+    #[test]
+    #[cfg_attr(debug_assertions, should_panic(expected = "request-only key"))]
+    fn test_request_signer_signs_nothing_else() {
+        let keyring = IdentityKeyring::open(MemoryVault::holding([7; 32])).unwrap();
+        let request = keyring.request_signer().unwrap();
+        // In a release build, an all-zero signature, which no reader takes.
+        assert_eq!(request.sign_fields(labels::sig::OP, &[b"op"]), [0; 64]);
     }
 }
