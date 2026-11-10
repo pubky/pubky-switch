@@ -94,8 +94,8 @@ pub(super) struct VerifiedApp {
     app: [u8; 16],
     /// The signing key its request verified with.
     key: [u8; 32],
-    /// The body, parsed.
-    parsed: OpsRequest,
+    /// A `POST /ops` body, parsed.
+    parsed: Option<OpsRequest>,
 }
 
 /// The app record of an own app's first call (Switch wire 7.2): the batch's first `app.put`
@@ -212,6 +212,24 @@ async fn load_state(
     Ok(state)
 }
 
+/// The account's apps and the App IDs it keeps, for judging which apps are current (Switch
+/// spec 3.4) outside a batch.
+pub(super) async fn load_apps(
+    txn: &mut AccountTxn,
+    held: Option<&IdentityDoc>,
+    now: u64,
+) -> Result<OpsState, StoreError> {
+    let head = txn.head().clone();
+    let identity = head.identity_key;
+    let mut state = OpsState::new(identity, head.generation, head.last_seq, now);
+    state.doc = held.cloned();
+    for app in txn.apps().await? {
+        state.apps.insert(app.app_id, held_app(&app, &identity)?);
+    }
+    state.kept = txn.kept_app_ids().await?.into_iter().collect();
+    Ok(state)
+}
+
 fn held_app(app: &StoredApp, identity: &[u8; 32]) -> Result<HeldApp, StoreError> {
     let corrupt = |_| StoreError::Corrupt("a stored app document doesn't verify");
     let record = app
@@ -266,8 +284,9 @@ fn held_part(part: &StoredBundlePart) -> Result<HeldPart, StoreError> {
 }
 
 impl Service {
-    /// An own app's `POST /ops` before the account's lock (Switch wire 7.2 Order): the body
-    /// parsed, the key the request is checked with found, and the request verified with it.
+    /// An own app's request before the account's lock (Switch wire 7.2 Order): for a `POST
+    /// /ops` (`batch`), the body parsed; the key the request is checked with found, and the
+    /// request verified with it.
     /// The key is the record's in the batch's first `app.put` naming the caller, for a
     /// first call, else the one of the record the account holds, read without the lock; an
     /// App ID derives from its signing key, so every record of the app has that key.
@@ -282,12 +301,18 @@ impl Service {
         request: &SwitchRequest,
         claimed: &Claimed,
         app: &str,
+        batch: bool,
     ) -> Result<VerifiedApp, ApiError> {
         let app = zbase32_decode::<16>(app)
             .map_err(|_| ApiError::bad_request("7.1: Switch-App isn't an App ID"))?;
-        // Step 2 of Switch wire 6.4: parse, before any signature is checked.
-        let parsed = OpsRequest::parse(&request.body).map_err(refused)?;
-        let first_call = first_app_put(&parsed, &app);
+        // Step 2 of Switch wire 6.4: a batch is parsed before any signature is checked. Only
+        // a batch can be an app's first call.
+        let parsed = batch
+            .then(|| OpsRequest::parse(&request.body).map_err(refused))
+            .transpose()?;
+        let first_call = parsed
+            .as_ref()
+            .and_then(|parsed| first_app_put(parsed, &app));
         let key = match &first_call {
             Some(record) => record_signing_key(record)
                 .filter(|key| app_id_bytes(key) == app)
@@ -326,10 +351,10 @@ impl Service {
         Ok(VerifiedApp { app, key, parsed })
     }
 
-    /// The writer of a `POST /ops` under the lock (Switch wire 7.2, 7.3 step 5), before the
-    /// staged gate: `None` for the signer, verified before the lock, or the certificate an
-    /// own app is checked against.
-    pub(super) async fn ops_writer(
+    /// The caller under the lock (Switch wire 7.2, 7.3 step 5), before the staged gate:
+    /// `None` for the signer, verified before the lock, or the certificate an own app is
+    /// checked against.
+    pub(super) async fn own_app_writer(
         &self,
         txn: &mut AccountTxn,
         held: Option<&IdentityDoc>,
@@ -362,8 +387,8 @@ impl Service {
         let identity = txn.head().identity_key;
         // The signer's body is parsed here, so its refusals carry the head like its others.
         let parsed_here;
-        let parsed = match verified {
-            Some(verified) => &verified.parsed,
+        let parsed = match verified.and_then(|verified| verified.parsed.as_ref()) {
+            Some(parsed) => parsed,
             None => {
                 parsed_here = OpsRequest::parse(&request.body)?;
                 &parsed_here
@@ -390,7 +415,11 @@ impl Service {
                 "7.2: the key the request verified with isn't the app's",
             ))
         };
-        let (cert, record) = match first_app_put(&verified.parsed, app) {
+        let first_call = verified
+            .parsed
+            .as_ref()
+            .and_then(|parsed| first_app_put(parsed, app));
+        let (cert, record) = match first_call {
             // The first call: the record and its certificate verify.
             Some(record) => {
                 let record = AppRecord::verify(&record, &identity).map_err(|_| {
@@ -576,9 +605,16 @@ impl Service {
         // Step 11: the chain items and their proofs, then the state, all at once.
         let first_seq = txn.head().last_seq.saturating_add(1);
         let proofs = self.chain_ops(txn, signer, &ops, &applied, time_ms).await?;
-        save(txn, &before, &mut after, &ops, &proofs)
-            .await
-            .map_err(|e| storage(&e))?;
+        save(
+            txn,
+            &before,
+            &mut after,
+            &ops,
+            &proofs,
+            self.limits.max_claim_age_ms,
+        )
+        .await
+        .map_err(|e| storage(&e))?;
         if let (Some(first), Some(ops_hash)) = (ops.first(), hash) {
             txn.put_batch(
                 &first.body().batch.id,
@@ -730,6 +766,7 @@ async fn save(
     after: &mut OpsState,
     ops: &[SignedOp],
     proofs: &[SignedDoc],
+    max_claim_age_ms: u64,
 ) -> Result<(), StoreError> {
     // The records and claim entries this batch wrote keep their operation's proof.
     let proof_at = |seq: u64| -> Option<SignedDoc> {
@@ -778,7 +815,7 @@ async fn save(
     }
     for (key, claim) in &after.claims {
         if before.claims.get(key) != Some(claim) {
-            txn.put_claim(key, claim).await?;
+            txn.put_claim(key, claim, max_claim_age_ms).await?;
         }
     }
     for entry in &after.new_entries {

@@ -478,17 +478,20 @@ impl AccountTxn {
         })
     }
 
-    /// Store a claim's state.
+    /// Store a claim's state, with when it may be deleted: `max_claim_age_ms` after its last
+    /// entry for a claim pinned to no deadline (Switch wire 6.8).
     pub async fn put_claim(
         &mut self,
         claim_key: &[u8; 32],
         claim: &Claim,
+        max_claim_age_ms: u64,
     ) -> Result<(), StoreError> {
         let id = self.head().id.clone();
         sqlx::query(
-            "INSERT INTO claims (account_id, claim_key, state, creator, tombstone, open_owners) \
-             VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (account_id, claim_key) DO UPDATE \
-             SET state = $3, creator = $4, tombstone = $5, open_owners = $6",
+            "INSERT INTO claims (account_id, claim_key, state, creator, tombstone, open_owners, \
+             deletable_at_ms) VALUES ($1, $2, $3, $4, $5, $6, $7) \
+             ON CONFLICT (account_id, claim_key) DO UPDATE SET state = $3, creator = $4, \
+             tombstone = $5, open_owners = $6, deletable_at_ms = $7",
         )
         .bind(id)
         .bind(claim_key.as_slice())
@@ -496,9 +499,86 @@ impl AccountTxn {
         .bind(claim.creator.map(|c| c.to_vec()))
         .bind(claim.tombstone)
         .bind(claim_codec::open_owners(claim))
+        .bind(opt_to_db(
+            claim.deletable_from(max_claim_age_ms),
+            "deletable_at_ms",
+        )?)
         .execute(self.conn())
         .await
         .map_err(db)?;
+        Ok(())
+    }
+
+    /// Delete the claims that may be deleted at `base_ms`, the time base, with their entries
+    /// (Switch wire 7.3 step 4). Returns how many went.
+    pub async fn delete_due_claims(&mut self, base_ms: u64) -> Result<u64, StoreError> {
+        let id = self.head().id.clone();
+        let deleted = sqlx::query(
+            "DELETE FROM claims WHERE account_id = $1 AND deletable_at_ms IS NOT NULL \
+             AND deletable_at_ms <= $2",
+        )
+        .bind(id)
+        .bind(to_db(base_ms, "time")?)
+        .execute(self.conn())
+        .await
+        .map_err(db)?
+        .rows_affected();
+        if deleted > 0 {
+            self.note_change();
+        }
+        Ok(deleted)
+    }
+
+    /// A claim's entries with their proofs, by step (Switch wire 7.4.8).
+    pub async fn claim_entries(
+        &mut self,
+        claim_key: &[u8; 32],
+    ) -> Result<Vec<StoredClaimEntry>, StoreError> {
+        let id = self.head().id.clone();
+        let rows = sqlx::query(
+            "SELECT step, seq, op, proof FROM claim_entries \
+             WHERE account_id = $1 AND claim_key = $2 ORDER BY step",
+        )
+        .bind(id)
+        .bind(claim_key.as_slice())
+        .fetch_all(self.conn())
+        .await
+        .map_err(db)?;
+        rows.iter()
+            .map(|row| {
+                let op: Vec<u8> = row.try_get("op")?;
+                let proof: Vec<u8> = row.try_get("proof")?;
+                Ok(StoredClaimEntry {
+                    step: from_db(row.try_get("step")?, "step")?,
+                    seq: from_db(row.try_get("seq")?, "seq")?,
+                    op: decode_doc(&op, "claim entry")?,
+                    proof: decode_doc(&proof, "claim entry proof")?,
+                })
+            })
+            .collect()
+    }
+
+    /// Keep `app_id` as revoked at `at_ms`, for good, and withdraw the invite codes it
+    /// registered (Switch spec 7, 12.2, Switch wire 9.1).
+    pub async fn revoke_app(&mut self, app_id: &[u8; 16], at_ms: u64) -> Result<(), StoreError> {
+        let id = self.head().id.clone();
+        sqlx::query(
+            "INSERT INTO kept_app_ids (account_id, app_id, reason, at_ms) \
+             VALUES ($1, $2, 'revoked', $3)",
+        )
+        .bind(&id)
+        .bind(app_id.as_slice())
+        .bind(to_db(at_ms, "time")?)
+        .execute(self.conn())
+        .await
+        .map_err(db)?;
+        sqlx::query("DELETE FROM invite_codes WHERE account_id = $1 AND writer = $2")
+            .bind(&id)
+            .bind(app_id.as_slice())
+            .execute(self.conn())
+            .await
+            .map_err(db)?;
+        self.note_change();
         Ok(())
     }
 

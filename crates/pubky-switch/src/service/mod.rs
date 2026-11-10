@@ -9,10 +9,11 @@
 //! (Switch wire 7.3 step 10).
 //!
 //! Served so far: `POST /v1/enroll`, `PUT /v1/{id}/identity`, the public
-//! `GET /v1/{id}/identity` and `POST /v1/{id}/ops`. Every other call is answered
-//! `503 unavailable`.
+//! `GET /v1/{id}/identity`, `POST /v1/{id}/ops`, `GET /v1/{id}/claims/{claim_key}` and
+//! `POST /v1/{id}/apps/{app_id}/revoke`. Every other call is answered `503 unavailable`.
 
 pub mod batch;
+mod claims;
 mod enroll;
 mod identity;
 pub mod rules;
@@ -278,31 +279,43 @@ impl Service {
                 }
                 None
             }
-            Call::PutIdentity => match self.authenticate_signer(&account, &request, base_ms) {
+            Call::PutIdentity => {
+                match self.authenticate_signer(&account, &request, base_ms).await {
+                    Ok(claimed) => Some(claimed),
+                    Err(error) => return refused_early(error).await,
+                }
+            }
+            // The signer is verified here; an own app under the lock, with the key the
+            // account holds for it (Switch wire 7.2).
+            Call::Revoke(_) => match self.authenticate_signer(&account, &request, base_ms).await {
                 Ok(claimed) => Some(claimed),
                 Err(error) => return refused_early(error).await,
             },
-            // The signer is verified here; an own app under the lock, with the key the
-            // account holds for it (Switch wire 7.2).
-            Call::Ops => match self.authenticate_caller(&account, &request, base_ms) {
-                Ok(claimed) => {
-                    // An own app's request is verified here too, so nothing unverified
-                    // takes the lock (Switch wire 7.2 Order).
-                    if let Caller::OwnApp(app) = &claimed.caller {
-                        match self.verify_own_app(&account, &request, &claimed, app).await {
-                            Ok(app) => verified = Some(app),
-                            Err(error) => {
-                                if is_failed_authentication(error.code) {
-                                    self.record_failure(&request, account.clone());
+            Call::Ops | Call::GetClaim(_) => {
+                match self.authenticate_caller(&account, &request, base_ms) {
+                    Ok(claimed) => {
+                        // An own app's request is verified here too, so nothing unverified
+                        // takes the lock (Switch wire 7.2 Order).
+                        if let Caller::OwnApp(app) = &claimed.caller {
+                            let batch = *call == Call::Ops;
+                            match self
+                                .verify_own_app(&account, &request, &claimed, app, batch)
+                                .await
+                            {
+                                Ok(app) => verified = Some(app),
+                                Err(error) => {
+                                    if is_failed_authentication(error.code) {
+                                        self.record_failure(&request, account.clone());
+                                    }
+                                    return refused_early(error).await;
                                 }
-                                return refused_early(error).await;
                             }
                         }
+                        Some(claimed)
                     }
-                    Some(claimed)
+                    Err(error) => return refused_early(error).await,
                 }
-                Err(error) => return refused_early(error).await,
-            },
+            }
             _ => {
                 return refused_early(ApiError::unavailable("7.4: this call isn't served yet"))
                     .await;
@@ -361,10 +374,12 @@ impl Service {
         }
     }
 
-    /// The signer's authentication, before any account state (Switch wire 7.2 Order): the
+    /// The signer's authentication, before the account's lock (Switch wire 7.2 Order): the
     /// network source's failed-authentication limit, then the headers, the timestamp and
-    /// the request signature, verified with the identity key `{id}` names.
-    fn authenticate_signer(
+    /// the request signature, verified with the identity key `{id}` names. An own app's
+    /// request is verified as at its own calls, then refused: `403 permission_missing`
+    /// for a call only the signer makes (7.6).
+    async fn authenticate_signer(
         &self,
         account: &str,
         request: &SwitchRequest,
@@ -385,6 +400,15 @@ impl Service {
                     self.record_failure(request, account.to_string());
                 }
             })?;
+        if let Caller::OwnApp(app) = &claimed.caller {
+            self.verify_own_app(account, request, &claimed, app, false)
+                .await
+                .inspect_err(|error| {
+                    if is_failed_authentication(error.code) {
+                        self.record_failure(request, account.to_string());
+                    }
+                })?;
+        }
         rules::require_signer(&claimed.caller)?;
         Ok(claimed)
     }
@@ -459,7 +483,7 @@ impl Service {
             }
         };
         let (answer, marked) = match self
-            .run_at_account(&mut txn, &signer, request, verified, time_ms)
+            .run_at_account(&mut txn, &signer, request, verified, base_ms, time_ms)
             .await
         {
             Ok(done) => done,
@@ -524,6 +548,7 @@ impl Service {
         signer: &ServiceSigner,
         request: &SwitchRequest,
         verified: Option<&batch::VerifiedApp>,
+        base_ms: u64,
         time_ms: u64,
     ) -> Result<(Answer, bool), Refused> {
         let call = &request.route.call;
@@ -569,6 +594,11 @@ impl Service {
             }
         }
 
+        // Step 4: claims whose time has passed go, with trusted time only.
+        self.delete_due_claims(txn, base_ms, self.time.peek().trusted)
+            .await
+            .map_err(|error| Refused::with_head(error, serving))?;
+
         if *call == Call::GetIdentity {
             return self
                 .public_identity(held.as_ref(), serving)
@@ -586,13 +616,12 @@ impl Service {
                 head: false,
             },
         };
-        let writer = if *call == Call::Ops {
-            match self.ops_writer(txn, held.as_ref(), verified, time_ms).await {
-                Ok(writer) => writer,
-                Err(error) => return Err(stop(error)),
-            }
-        } else {
-            None
+        let writer = match self
+            .own_app_writer(txn, held.as_ref(), verified, time_ms)
+            .await
+        {
+            Ok(writer) => writer,
+            Err(error) => return Err(stop(error)),
         };
         // Step 7: the staged gate. Step 9: the endpoint.
         staged_gate(call, !serving).map_err(|error| Refused::with_head(error, serving))?;
@@ -612,6 +641,30 @@ impl Service {
                 Ok(answer) => Ok((answer, serving)),
                 Err(error) => Err(stop(error)),
             };
+        }
+        match call {
+            Call::GetClaim(claim_key) => {
+                return self
+                    .get_claim(
+                        txn,
+                        signer,
+                        held.as_ref(),
+                        writer.as_ref(),
+                        claim_key,
+                        time_ms,
+                    )
+                    .await
+                    .map(|answer| (answer, serving))
+                    .map_err(|error| Refused::with_head(error, serving));
+            }
+            Call::Revoke(app_id) => {
+                return self
+                    .revoke(txn, signer, held.as_ref(), app_id, &request.body, time_ms)
+                    .await
+                    .map(|answer| (answer, serving))
+                    .map_err(|error| Refused::with_head(error, serving));
+            }
+            _ => {}
         }
         let (answer, serves_after) = self
             .put_identity(txn, signer, request, held.as_ref(), time_ms)

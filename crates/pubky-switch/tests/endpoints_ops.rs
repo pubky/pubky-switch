@@ -937,3 +937,170 @@ async fn test_ops_self_made_key_takes_no_lock() {
     assert_eq!(stamped_time(&replay).await, before, "nothing was stamped");
     replay.db.drop_database().await.expect("drop");
 }
+
+fn claim(kind: ClaimType, expected_step: u64, deadline: Option<u64>) -> (Vec<Condition>, OpKind) {
+    (
+        Vec::new(),
+        OpKind::Claim(ClaimFields {
+            claim_key: vec![7; 32],
+            kind,
+            expected_step,
+            attempt_id: vec![8; 16],
+            orphan_after: (kind == ClaimType::Attempt).then_some(60),
+            deadline,
+            basis: (kind == ClaimType::Done).then_some(pubky_switch_core::claims::Basis::Owner),
+            evidence_ref: None,
+        }),
+    )
+}
+
+/// `GET /claims` of the tests' claim key, as the wallet at `at`.
+async fn read_claim(replay: &Replay, at: &str) -> (u16, Value) {
+    let keys = vectors("keys.json");
+    let path = format!(
+        "/v1/{}/claims/{}",
+        alice_id(),
+        pubky_switch_core::enc::b64(&[7; 32])
+    );
+    let request = app_request(app(&keys, "wallet"), "GET", &path, Vec::new(), ms(at));
+    let (status, body, _) = answer_of(replay.service.handle(request).await);
+    (status, body)
+}
+
+#[tokio::test]
+async fn test_claims_deletion_waits_for_trusted_time() {
+    let Some(replay) = registered(Limits::default(), true).await else {
+        return;
+    };
+    let sample = |replay: &Replay| {
+        use pubky_switch::time::Clock;
+        replay.time.note(
+            pubky_switch::time::TimeSample {
+                utc_ms: replay.clock.now_ms(),
+                uncertainty_ms: 0,
+            },
+            replay.clock.monotonic_ms(),
+        );
+    };
+    sample(&replay);
+    // An attempt pinned to a deadline a minute away, then done: a tombstone, deletable 30
+    // days after the deadline.
+    let deadline = ms(AT) + 60_000;
+    let ops = wallet_batch(30, 1, vec![claim(ClaimType::Attempt, 0, Some(deadline))]);
+    let (status, body) = post_app(&replay, "wallet", &ops, None, AT).await;
+    assert_eq!(status, 200, "{body}");
+    let ops = wallet_batch(31, 1, vec![claim(ClaimType::Done, 1, None)]);
+    let (status, body) = post_app(&replay, "wallet", &ops, None, AT).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(read_claim(&replay, AT).await.1["claim"]["tombstone"], true);
+    // 31 days on, the sample is too old: no trusted time, so nothing is deleted.
+    replay.clock.advance_ms(31 * 86_400_000);
+    let later = pubky_switch_core::time::rfc3339(ms(AT) + 31 * 86_400_000);
+    let (status, body) = read_claim(&replay, &later).await;
+    assert_eq!(status, 200, "kept without trusted time: {body}");
+    // With a fresh sample, it goes.
+    sample(&replay);
+    let (status, body) = read_claim(&replay, &later).await;
+    assert_eq!((status, body["code"].as_str()), (404, Some("not_found")));
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_claims_read_refusals() {
+    let Some(replay) = registered(Limits::default(), false).await else {
+        return;
+    };
+    // The signer holds no claims.read.
+    let path = format!(
+        "/v1/{}/claims/{}",
+        alice_id(),
+        pubky_switch_core::enc::b64(&[7; 32])
+    );
+    let answer = replay
+        .service
+        .handle(signer_request("GET", &path, Vec::new(), ms(AT)))
+        .await;
+    let (status, body, _) = answer_of(answer);
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (403, Some("permission_missing"))
+    );
+    // A claim key that isn't 32 bytes, and an unknown one.
+    let keys = vectors("keys.json");
+    let bad = format!("/v1/{}/claims/AAAA", alice_id());
+    let request = app_request(app(&keys, "wallet"), "GET", &bad, Vec::new(), ms(AT));
+    assert_eq!(answer_of(replay.service.handle(request).await).0, 400);
+    let (status, body) = read_claim(&replay, AT).await;
+    assert_eq!((status, body["code"].as_str()), (404, Some("not_found")));
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_revoke_rules() {
+    let Some(replay) = registered(Limits::default(), false).await else {
+        return;
+    };
+    let keys = vectors("keys.json");
+    let wallet = app(&keys, "wallet")["app_id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    let revoke = |app: &str, body: Vec<u8>| {
+        signer_request(
+            "POST",
+            &format!("/v1/{}/apps/{app}/revoke", alice_id()),
+            body,
+            ms(AT),
+        )
+    };
+    // The wallet registers an invite code, which its revocation withdraws.
+    let invite = OpKind::InviteCodePut(pubky_switch_core::ops::InviteCodePut {
+        code_hash: [5; 32],
+        expires_at: ms(AT) + 86_400_000,
+        max_uses: 1,
+        context: pubky_switch_core::ops::InviteContext::new(Value::Null),
+    });
+    let ops = wallet_batch(32, 1, vec![(Vec::new(), invite)]);
+    let (status, body) = post_app(&replay, "wallet", &ops, None, AT).await;
+    assert_eq!(status, 200, "{body}");
+    // An unknown app is 404; a body is 400; an app may not revoke.
+    let unknown = pubky_switch_core::enc::zbase32_encode(&[3; 16]);
+    assert_eq!(
+        answer_of(replay.service.handle(revoke(&unknown, Vec::new())).await).0,
+        404
+    );
+    assert_eq!(
+        answer_of(replay.service.handle(revoke(&wallet, b"{}".to_vec())).await).0,
+        400
+    );
+    let by_app = app_request(
+        app(&keys, "wallet"),
+        "POST",
+        &format!("/v1/{}/apps/{wallet}/revoke", alice_id()),
+        Vec::new(),
+        ms(AT),
+    );
+    let (status, body, _) = answer_of(replay.service.handle(by_app).await);
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (403, Some("permission_missing"))
+    );
+    // The revocation: one proof, the code withdrawn, the app no longer current.
+    let (status, body, head) = answer_of(replay.service.handle(revoke(&wallet, Vec::new())).await);
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["proofs"].as_array().map(Vec::len), Some(1));
+    assert!(head.is_some());
+    let mut txn = replay
+        .db
+        .store()
+        .begin(&alice_id())
+        .await
+        .expect("begin")
+        .expect("account");
+    assert!(txn.invites(&[[5; 32]]).await.expect("invites").is_empty());
+    drop(txn);
+    let ops = wallet_batch(33, 1, vec![contact(bob())]);
+    let (status, body) = post_app(&replay, "wallet", &ops, None, AT).await;
+    assert_eq!((status, body["code"].as_str()), (403, Some("not_current")));
+    replay.db.drop_database().await.expect("drop");
+}
