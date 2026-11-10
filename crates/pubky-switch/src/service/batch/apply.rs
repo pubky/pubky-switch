@@ -93,6 +93,8 @@ fn set_cursor(
     writer: Option<&AppCert>,
     position: Position,
 ) -> Result<(), Refusal> {
+    // `OpsRequest::check_caller` refuses a signer's cursor at step 4; a batch built
+    // otherwise has no app whose cursor would move.
     let Some(cert) = writer else {
         return Err(Refusal::bad_request(
             "Switch wire 6.2: the signer's batch carries no cursor.set",
@@ -268,7 +270,7 @@ fn apply_op(
                     uses: 0,
                     writer: cert.app_id(),
                     expires_at: put.expires_at,
-                    context: put.context.clone(),
+                    context: put.context.value().clone(),
                 },
             );
             StateAfter::Op

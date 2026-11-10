@@ -434,13 +434,17 @@ impl Service {
     ) -> Result<Answer, Stop> {
         let cert = writer;
         let caller_app = cert.map(AppCert::app_id);
-        // Step 3: each operation's signature with the caller's key.
-        let key = cert.map_or(identity, AppCert::signing_key);
+        // Step 3: each operation's signature with the caller's key: an app's with the
+        // certificate it is checked against, which binds the operation's `app_id` to it.
         let ops = parsed
             .signed()
-            .map(|doc| SignedOp::verify(doc, &key, &identity, caller_app.as_ref()))
+            .map(|doc| match cert {
+                Some(cert) => SignedOp::verify_with_cert(doc, cert, &identity),
+                None => SignedOp::verify(doc, &identity, &identity, None),
+            })
             .collect::<Result<Vec<_>, _>>()?;
-        // Step 4.
+        // Step 4: the batch rules, the signer's batch carrying no cursor among them.
+        parsed.check_caller(cert.is_none())?;
         check_batch(&ops)?;
         // Step 5: a retry gets the original proofs while they are kept.
         let hash = match ops.first() {
