@@ -1404,6 +1404,48 @@ async fn test_kept_batch_window_holds_with_the_device_clock_ahead_after_a_restor
 }
 
 #[tokio::test]
+async fn test_kept_batch_window_holds_with_the_device_clock_behind_at_the_resend() {
+    let w = World::new();
+    let (mut app, clock) = app_with_its_own_clock(&w, 0).await;
+    let me = app.app_id();
+    // Applied, its answer lost: kept.
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(
+        app.submit_batch(conversation(w.bob.public()))
+            .await
+            .is_err()
+    );
+    assert_eq!(app.kept_batches().await.unwrap().len(), 1);
+    // A fresh load, the service time it holds from before; 30 days and half an hour on,
+    // the device clock reads two hours behind.
+    let mut env = w.env();
+    env.clock = Arc::clone(&clock) as Arc<dyn Clock>;
+    drop(app);
+    let mut app = App::load(env, w.protocol.clone(), World::config(), me)
+        .await
+        .unwrap();
+    w.clock.advance_ms(30 * 24 * HOUR + HOUR / 2);
+    clock.set_ms(w.clock.now_ms() - 2 * HOUR);
+    w.switch.fail_next(Fault::Error {
+        path: "ops".into(),
+        code: ErrorCode::Conflict,
+        current: json!(null),
+    });
+    // The next write sends the kept batch again first: a service time read before it shows
+    // it past the window, so it is dropped unsent, never read as refused.
+    let _ = app.submit_batch(conversation([7; 32])).await;
+    let events = app.unacknowledged_events().await.unwrap();
+    assert!(
+        has(&events, |e| matches!(e, AppEvent::KeptBatchDropped { .. })),
+        "{events:?}"
+    );
+    assert!(
+        !has(&events, |e| matches!(e, AppEvent::BatchRefused { .. })),
+        "{events:?}"
+    );
+}
+
+#[tokio::test]
 async fn test_kept_batch_kept_after_an_idle_month_is_resent_after_a_lost_answer() {
     let w = World::new();
     let mut app = w.join("wallet").await;
