@@ -12,7 +12,7 @@ use crate::app::{
     ReceiveContext, StoreFailure,
 };
 use crate::error::StoreError;
-use crate::store::{Fault as StoreFault, FaultStore};
+use crate::store::{Fault as StoreFault, FaultStore, MAX_VALUE_BYTES};
 use crate::testing::Fault;
 use pubky_switch_core::http::ErrorCode;
 
@@ -144,18 +144,9 @@ impl Protocol for FlakyProtocol {
         self.sample.receive(message)
     }
 
+    /// Backs up its whole local state, as the default hooks write and read it.
     fn backup_name(&self) -> Option<String> {
         Some(JOURNAL.into())
-    }
-
-    fn restore_layer(&self, layer: Option<&ProtocolLayer>) -> Result<Vec<LocalWrite>, String> {
-        Ok(layer
-            .map(|layer| LocalWrite::Put {
-                key: JOURNAL_KEY.to_vec(),
-                value: layer.data.clone(),
-            })
-            .into_iter()
-            .collect())
     }
 
     fn resend_needed(&self, needed: &ResendNeeded) -> Vec<LocalWrite> {
@@ -547,6 +538,9 @@ const JOURNAL: &str = "journal-protocol";
 /// The local key the protocol keeps its journal under.
 const JOURNAL_KEY: &[u8] = b"journal";
 
+/// A journal [`JournalProtocol`] backs up as a layer over the store's value size.
+const HUGE: &[u8] = b"huge";
+
 /// [`SampleProtocol`], with a journal it backs up as a layer: the journal's bytes, under the
 /// name `name`, refused when empty.
 struct JournalProtocol {
@@ -612,6 +606,20 @@ impl Protocol for JournalProtocol {
         self.name.clone()
     }
 
+    /// The journal's value, empty without one; a journal of [`HUGE`] stands for one over
+    /// the store's value size.
+    fn backup_layer(&self, state: Vec<crate::store::KeyValue>) -> Result<Vec<u8>, String> {
+        let journal = state
+            .into_iter()
+            .find(|(key, _)| key.as_slice() == JOURNAL_KEY)
+            .map(|(_, value)| value)
+            .unwrap_or_default();
+        if journal == HUGE {
+            return Ok(vec![7u8; usize::try_from(MAX_VALUE_BYTES).unwrap() + 1]);
+        }
+        Ok(journal)
+    }
+
     fn restore_layer(&self, layer: Option<&ProtocolLayer>) -> Result<Vec<LocalWrite>, String> {
         let Some(layer) = layer else {
             return Err("journal: the backup has no journal".into());
@@ -637,14 +645,13 @@ fn journal_layer(name: &str, data: &[u8]) -> ProtocolLayer {
     }
 }
 
-/// An app with the journal protocol on `store`, its journal at `journal`, and its backup
-/// with the journal layer `layer`, read back from its bytes.
+/// An app with the journal protocol on `store`, its journal at `journal`, and its layered
+/// backup, read back from its bytes.
 async fn journaled(
     w: &World,
     protocol: &Arc<JournalProtocol>,
     store: &Arc<MemoryStore>,
     journal: &[u8],
-    layer: ProtocolLayer,
 ) -> (App, AppBackup) {
     let request = w.approve(&app_keys("wallet"), &["scope-a"]);
     let mut app = App::join(
@@ -661,7 +668,7 @@ async fn journaled(
     }])
     .await
     .unwrap();
-    let backup = app.backup_with_protocol_layer(layer).await.unwrap();
+    let backup = app.backup_layered().await.unwrap();
     let backup = AppBackup::from_bytes(&backup.to_bytes().unwrap()).unwrap();
     (app, backup)
 }
@@ -692,11 +699,9 @@ fn handed(protocol: &FlakyProtocol) -> Vec<String> {
         .collect()
 }
 
-/// `app`'s backup with a layer of its notes, read back from its bytes.
-async fn layered(app: &App) -> AppBackup {
-    let notes = app.protocol_scan(b"notes/").await.unwrap();
-    let layer = journal_layer(JOURNAL, &serde_json::to_vec(&notes).unwrap());
-    let backup = app.backup_with_protocol_layer(layer).await.unwrap();
+/// `app`'s layered backup, read back from its bytes.
+async fn layered(app: &mut App) -> AppBackup {
+    let backup = app.backup_layered().await.unwrap();
     AppBackup::from_bytes(&backup.to_bytes().unwrap()).unwrap()
 }
 
@@ -712,7 +717,7 @@ async fn test_restore_of_a_backup_taken_during_a_hold_hands_no_entry_over_twice(
     assert_eq!(handed(&protocol), vec![past_message.msg_id.clone()]);
     assert_eq!(w.effects(), 1);
     // The layer reflects the note applied past the held one.
-    let backup = layered(&app).await;
+    let backup = layered(&mut app).await;
     let again = FlakyProtocol::new(0);
     let store = Arc::new(MemoryStore::new());
     let mut restored = App::restore(
@@ -751,7 +756,7 @@ async fn test_restore_of_a_layered_backup_keeps_the_entries_stored_locally() {
     app.receive(None).await.unwrap();
     assert!(app.state.parked.contains_key(&seq));
     assert!(app.cursor().seq >= seq, "passed");
-    let backup = layered(&app).await;
+    let backup = layered(&mut app).await;
     // Restored with a store that works: the entry the cursor passed is still processed.
     let again = FlakyProtocol::new(0);
     let mut restored = App::restore(
@@ -782,7 +787,6 @@ async fn test_restore_installs_the_protocol_layer_with_the_app_state() {
         &protocol,
         &Arc::new(MemoryStore::new()),
         b"at the backup",
-        journal_layer(JOURNAL, b"at the backup"),
     )
     .await;
     assert_eq!(
@@ -824,14 +828,13 @@ async fn test_restore_failed_commit_writes_neither_layer() {
     let w = World::new();
     let protocol = JournalProtocol::new(Some(JOURNAL));
     let store = Arc::new(MemoryStore::new());
-    let (app, backup) = journaled(
-        &w,
-        &protocol,
-        &store,
-        b"before the restore",
-        journal_layer(JOURNAL, b"from the backup"),
-    )
-    .await;
+    let (mut app, backup) = journaled(&w, &protocol, &store, b"from the backup").await;
+    app.protocol_commit(&[LocalWrite::Put {
+        key: JOURNAL_KEY.to_vec(),
+        value: b"before the restore".to_vec(),
+    }])
+    .await
+    .unwrap();
     let before = snapshot(&store, &app.app_id());
     let fault = Arc::new(FaultStore::new(
         Arc::clone(&store) as Arc<dyn StateStore>,
@@ -873,7 +876,6 @@ async fn test_restore_commit_of_unknown_outcome_holds_both_layers_or_neither() {
         &protocol,
         &Arc::new(MemoryStore::new()),
         b"at the backup",
-        journal_layer(JOURNAL, b"at the backup"),
     )
     .await;
     let store = Arc::new(MemoryStore::new());
@@ -908,14 +910,7 @@ async fn test_restore_refused_protocol_layer_writes_nothing() {
     // The app's own store, holding its state and journal: a refused restore leaves it as
     // it was.
     let store = Arc::new(MemoryStore::new());
-    let (app, backup) = journaled(
-        &w,
-        &protocol,
-        &store,
-        b"at the backup",
-        journal_layer(JOURNAL, b"at the backup"),
-    )
-    .await;
+    let (app, backup) = journaled(&w, &protocol, &store, b"at the backup").await;
     let before = snapshot(&store, &app.app_id());
     assert!(!before.is_empty());
     let fault = Arc::new(FaultStore::new(
@@ -952,44 +947,42 @@ async fn test_backup_with_a_layer_that_could_never_be_restored_is_refused() {
     let w = World::new();
     let protocol = JournalProtocol::new(Some(JOURNAL));
     let request = w.approve(&app_keys("wallet"), &["scope-a"]);
-    let app = App::join(w.env(), protocol.clone(), World::config(), request)
+    let mut app = App::join(w.env(), protocol.clone(), World::config(), request)
         .await
         .unwrap();
-    // A layer the protocol refuses.
-    let error = app
-        .backup_with_protocol_layer(journal_layer(JOURNAL, b""))
-        .await
-        .unwrap_err();
+    let journal = |value: &[u8]| {
+        vec![LocalWrite::Put {
+            key: JOURNAL_KEY.to_vec(),
+            value: value.to_vec(),
+        }]
+    };
+    // A layer the protocol refuses: no journal.
+    let error = app.backup_layered().await.unwrap_err();
     assert!(
         matches!(&error, AppError::InvalidData(why) if why.contains("the journal is empty")),
         "{error:?}"
     );
     // A layer whose value is over the store's value size.
-    let too_large = vec![7u8; usize::try_from(crate::store::MAX_VALUE_BYTES).unwrap() + 1];
-    let error = app
-        .backup_with_protocol_layer(journal_layer(JOURNAL, &too_large))
-        .await
-        .unwrap_err();
+    app.protocol_commit(&journal(HUGE)).await.unwrap();
+    let error = app.backup_layered().await.unwrap_err();
     assert!(
         matches!(&error, AppError::Store(StoreError::Other(why)) if why.contains("value size")),
         "{error:?}"
     );
     // Within the sizes, it backs up.
-    app.backup_with_protocol_layer(journal_layer(JOURNAL, b"fits"))
-        .await
-        .unwrap();
+    app.protocol_commit(&journal(b"fits")).await.unwrap();
+    app.backup_layered().await.unwrap();
 }
 
 #[tokio::test]
 async fn test_backup_with_a_layer_carries_a_version_a_reader_without_layers_refuses() {
     let w = World::new();
     let protocol = JournalProtocol::new(Some(JOURNAL));
-    let (app, _) = journaled(
+    let (mut app, _) = journaled(
         &w,
         &protocol,
         &Arc::new(MemoryStore::new()),
         b"at the backup",
-        journal_layer(JOURNAL, b"at the backup"),
     )
     .await;
     let version = |bytes: &[u8]| serde_json::from_slice::<Value>(bytes).unwrap()["v"].clone();
@@ -999,12 +992,7 @@ async fn test_backup_with_a_layer_carries_a_version_a_reader_without_layers_refu
         serde_json::to_vec(&value).unwrap()
     };
     let bare = app.backup().unwrap().to_bytes().unwrap();
-    let layered = app
-        .backup_with_protocol_layer(journal_layer(JOURNAL, b"at the backup"))
-        .await
-        .unwrap()
-        .to_bytes()
-        .unwrap();
+    let layered = app.backup_layered().await.unwrap().to_bytes().unwrap();
     // Without a layer, the schema's version, as before; with one, another, which a reader
     // that takes only the schema's version refuses.
     assert_eq!(version(&bare), json!(crate::app::SCHEMA_VERSION));
@@ -1032,14 +1020,7 @@ async fn test_restore_layer_of_a_protocol_not_registered_is_refused() {
     // The app's own store, holding its state and journal: a refused restore leaves it as
     // it was.
     let store = Arc::new(MemoryStore::new());
-    let (app, backup) = journaled(
-        &w,
-        &protocol,
-        &store,
-        b"at the backup",
-        journal_layer(JOURNAL, b"at the backup"),
-    )
-    .await;
+    let (app, backup) = journaled(&w, &protocol, &store, b"at the backup").await;
     let before = snapshot(&store, &app.app_id());
     assert!(!before.is_empty());
     let fault = Arc::new(FaultStore::new(
@@ -1189,6 +1170,11 @@ impl Protocol for CounterProtocol {
     fn missed(&self, missed: &MissedEntries) -> Vec<LocalWrite> {
         self.sample.missed(missed)
     }
+
+    /// Backs up its count, as the default hooks write and read it.
+    fn backup_name(&self) -> Option<String> {
+        Some("counter".into())
+    }
 }
 
 #[tokio::test]
@@ -1275,4 +1261,101 @@ async fn test_backup_after_a_failed_commit_is_refused_until_the_store_is_read_ag
     .await
     .unwrap();
     assert!(restored.cursor().seq >= seq);
+}
+
+#[tokio::test]
+async fn test_backup_layered_after_a_failed_commit_is_of_the_store_not_memory() {
+    let w = World::new();
+    let protocol = Arc::new(CounterProtocol {
+        sample: SampleProtocol::default(),
+        fails: Mutex::new(0),
+    });
+    let request = w.approve(&app_keys("wallet"), &["scope-a"]);
+    let mut app = App::join(w.env(), protocol.clone(), World::config(), request)
+        .await
+        .unwrap();
+    app.receive(None).await.unwrap();
+    let me = app.app_id();
+    drop(app);
+    let fault = Arc::new(FaultStore::new(
+        Arc::clone(&w.store) as Arc<dyn StateStore>,
+        StoreFault::FailBefore(FAILING_COMMIT),
+    ));
+    let mut app = App::load(
+        w.env_on(fault as Arc<dyn StateStore>),
+        protocol.clone(),
+        World::config(),
+        me,
+    )
+    .await
+    .unwrap();
+    let (seq, _) = w.note(me, "one");
+    app.receive(None).await.unwrap_err();
+    assert!(app.cursor().seq >= seq, "memory is ahead");
+    // The layered backup reads the store: its cursor is before the note, its layer
+    // without it.
+    let backup = app.backup_layered().await.unwrap();
+    let backup = AppBackup::from_bytes(&backup.to_bytes().unwrap()).unwrap();
+    let store = Arc::new(MemoryStore::new());
+    let mut restored = App::restore(
+        w.env_on(Arc::clone(&store) as Arc<dyn StateStore>),
+        protocol,
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    assert!(restored.cursor().seq < seq);
+    assert_eq!(restored.protocol_get(COUNT).await.unwrap(), None);
+    // So the restored app applies the note.
+    restored.receive(None).await.unwrap();
+    assert_eq!(count_of(restored.protocol_get(COUNT).await.unwrap()), 1);
+}
+
+/// What a restore must bring back of an app: its protocol's local state, its cursor, the
+/// entries processed past a held one and stored locally, and the processed pairs.
+type Restorable = (
+    Vec<crate::store::KeyValue>,
+    pubky_switch_core::ops::Position,
+    std::collections::BTreeSet<u64>,
+    Vec<u64>,
+    Vec<(String, crate::app::state::Processed)>,
+);
+
+async fn restorable(app: &App) -> Restorable {
+    let processed: Vec<(String, crate::app::state::Processed)> =
+        app.reader().scan("proc/").await.unwrap();
+    (
+        app.protocol_scan(b"").await.unwrap(),
+        app.cursor(),
+        app.state.seen.clone(),
+        app.state.parked.keys().copied().collect::<Vec<_>>(),
+        processed,
+    )
+}
+
+#[tokio::test]
+async fn test_backup_layered_right_after_a_read_restores_exactly_that_state() {
+    let w = World::new();
+    let protocol = FlakyProtocol::new(1);
+    let mut app = join_flaky(&w, &protocol, "wallet").await;
+    w.note(app.app_id(), "first");
+    w.note(app.app_id(), FLAKY);
+    w.note(app.app_id(), "past the held one");
+    app.receive(None).await.unwrap();
+    assert!(
+        !app.state.seen.is_empty(),
+        "a note processed past the held one"
+    );
+    let before = restorable(&app).await;
+    let backup = layered(&mut app).await;
+    let restored = App::restore(
+        w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
+        FlakyProtocol::new(0),
+        flaky_config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    assert_eq!(restorable(&restored).await, before);
 }

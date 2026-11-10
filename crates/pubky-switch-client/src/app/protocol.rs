@@ -37,6 +37,7 @@ use super::records::Collection;
 use super::recovery::{LossActions, ProviderLoss};
 use super::send::{RecordJob, SentMessage};
 use crate::error::StoreError;
+use crate::store::KeyValue;
 
 /// An opaque member of a protocol's message bodies (Switch wire 1.1): its numbers aren't
 /// checked against the integer range.
@@ -119,8 +120,9 @@ impl std::fmt::Debug for LocalWrite {
 }
 
 /// The protocol's layer of an app backup (Switch spec 12.4): its own local state, such as
-/// its journal, in a form it chooses, carried in the [`super::AppBackup`]
-/// ([`super::App::backup_with_protocol_layer`]) and installed by [`super::App::restore`] in
+/// its journal, in a form it chooses ([`Protocol::backup_layer`]), carried in the
+/// [`super::AppBackup`] ([`super::App::backup_layered`]) and installed by
+/// [`super::App::restore`] in
 /// the same commit as the app's own state ([`Protocol::restore_layer`]). Opaque to the app.
 /// Sensitive: its `Debug` shows only the protocol's name and the data's size.
 #[derive(Clone, PartialEq, Eq)]
@@ -141,6 +143,30 @@ impl std::fmt::Debug for ProtocolLayer {
             self.data.len()
         )
     }
+}
+
+/// A protocol's local state as the default [`Protocol::backup_layer`] writes it: each key
+/// and value length-prefixed, in order.
+pub fn encode_local_state(state: &[KeyValue]) -> Vec<u8> {
+    let parts: Vec<&[u8]> = state
+        .iter()
+        .flat_map(|(key, value)| [key.as_slice(), value.as_slice()])
+        .collect();
+    pubky_switch_core::enc::lp(&parts)
+}
+
+/// The local state [`encode_local_state`] wrote, or `None` for bytes it didn't write.
+pub fn decode_local_state(bytes: &[u8]) -> Option<Vec<KeyValue>> {
+    let parts = pubky_switch_core::enc::split_lp(bytes)?;
+    if parts.len() % 2 != 0 {
+        return None;
+    }
+    let mut parts = parts.into_iter();
+    let mut state = Vec::new();
+    while let (Some(key), Some(value)) = (parts.next(), parts.next()) {
+        state.push((key, value));
+    }
+    Some(state)
 }
 
 /// What a received message does: the operations committed in one batch with the cursor
@@ -548,9 +574,21 @@ pub trait Protocol: Send + Sync {
     /// [`super::App::restore`] takes a backup's layer only with a protocol that gives the
     /// same name, and refuses a backup whose layer another protocol, or a protocol without a
     /// name, made, rather than drop that data. `None` by default: the protocol takes no
-    /// layer.
+    /// layer, and [`super::App::backup_layered`] refuses.
     fn backup_name(&self) -> Option<String> {
         None
+    }
+
+    /// The bytes of the protocol's backup layer from its local state as committed: every
+    /// key and value it holds, in key order, read by [`super::App::backup_layered`] in the
+    /// same call as the app's own state. [`Protocol::restore_layer`] reads them back. By
+    /// default the whole state, as [`encode_local_state`] gives it.
+    ///
+    /// # Errors
+    ///
+    /// Why the state can't be backed up, without content: the backup is refused.
+    fn backup_layer(&self, state: Vec<KeyValue>) -> Result<Vec<u8>, String> {
+        Ok(encode_local_state(&state))
     }
 
     /// The writes that install a backup's protocol layer at a restore (Switch spec 12.4),
@@ -559,19 +597,26 @@ pub trait Protocol: Send + Sync {
     /// anything, and commits the writes in the one commit that installs its own restored
     /// state, after it cleared the app's namespace: so the protocol starts from an empty
     /// local state and its writes stay under its prefix. It checks the layer in full here;
-    /// nothing is written until it returns. [`super::App::backup_with_protocol_layer`]
-    /// calls it too, writing nothing, to check that the backup can be restored, so it has
-    /// no effect of its own. By default it takes no layer, and needs no writes for none.
+    /// nothing is written until it returns. [`super::App::backup_layered`] calls it too,
+    /// writing nothing, to check that the backup can be restored, so it has no effect of
+    /// its own. By default it reads the layer as the default [`Protocol::backup_layer`]
+    /// writes it ([`decode_local_state`]) and puts every key back, and needs no writes for a
+    /// backup without a layer.
     ///
     /// # Errors
     ///
     /// Why the layer, or a backup without one, can't be installed, without content: the
     /// restore is refused and nothing is written.
     fn restore_layer(&self, layer: Option<&ProtocolLayer>) -> Result<Vec<LocalWrite>, String> {
-        match layer {
-            None => Ok(Vec::new()),
-            Some(_) => Err("the protocol takes no backup layer".into()),
-        }
+        let Some(layer) = layer else {
+            return Ok(Vec::new());
+        };
+        let state = decode_local_state(&layer.data)
+            .ok_or_else(|| String::from("the layer doesn't read as local state"))?;
+        Ok(state
+            .into_iter()
+            .map(|(key, value)| LocalWrite::Put { key, value })
+            .collect())
     }
 
     /// The shared record write of a sent message (Switch spec 8.2): the record's next value

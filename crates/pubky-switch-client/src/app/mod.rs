@@ -69,6 +69,7 @@ pub use peek::{PeekReport, Peeked};
 pub use protocol::{
     Effect, LocalWrite, MAX_CLAIM_READS, MissedEntries, Need, OpaqueRule, Outcome, Protocol,
     ProtocolLayer, RETRY_EVENT_READS, ReceivedMessage, ResendNeeded, ResendReason, StoreFailure,
+    decode_local_state, encode_local_state,
 };
 pub use provider::ProviderStatus;
 pub use push::{MAX_HANDLE_BYTES, PushRegistration, PushRelay};
@@ -830,30 +831,37 @@ impl App {
             )
             .into());
         }
-        let chain =
-            self.state.chain.as_ref().ok_or_else(|| {
-                AppError::Refused(Refusal::NotNow("the app isn't registered".into()))
-            })?;
+        Self::backup_of(&self.state)
+    }
+
+    /// The backup of `state`.
+    fn backup_of(state: &AppState) -> Result<AppBackup, AppError> {
+        if state.leave.is_some() {
+            return Err(Refusal::Left.into());
+        }
+        let chain = state
+            .chain
+            .as_ref()
+            .ok_or_else(|| AppError::Refused(Refusal::NotNow("the app isn't registered".into())))?;
         let (record, at, batches) = chain.export();
         Ok(AppBackup {
             v: SCHEMA_VERSION,
-            meta: self.state.meta.clone(),
-            keys: self.state.keys.clone(),
-            cert: self.state.cert.signed().clone(),
-            record: self.state.record.clone(),
-            naming: self.state.naming.clone(),
-            scope_keys: self.state.scope_keys.keys.clone(),
-            own_doc: self.state.own_doc.signed().clone(),
-            receive_keys: self.state.receive_keys.values().cloned().collect(),
-            known: self
-                .state
+            meta: state.meta.clone(),
+            keys: state.keys.clone(),
+            cert: state.cert.signed().clone(),
+            record: state.record.clone(),
+            naming: state.naming.clone(),
+            scope_keys: state.scope_keys.keys.clone(),
+            own_doc: state.own_doc.signed().clone(),
+            receive_keys: state.receive_keys.values().cloned().collect(),
+            known: state
                 .known_kids
                 .iter()
                 .map(|(kid, n)| (pubky_switch_core::enc::b64(kid), *n))
                 .collect(),
-            rotation: self.state.rotation,
-            device: self.state.device,
-            cursor: self.state.cursor,
+            rotation: state.rotation,
+            device: state.device,
+            cursor: state.cursor,
             chain: record,
             chain_at: at
                 .into_iter()
@@ -863,49 +871,57 @@ impl App {
                 .into_iter()
                 .map(|(id, t)| (pubky_switch_core::enc::b64(&id), t))
                 .collect(),
-            departed: self
-                .state
+            departed: state
                 .departed
                 .iter()
                 .map(|(app, at)| (zbase32_encode(app), *at))
                 .collect(),
-            bundle: self.state.bundle.clone(),
+            bundle: state.bundle.clone(),
             protocol: None,
         })
     }
 
-    /// The app's backup with the protocol's layer (Switch spec 12.4): its own local state,
-    /// such as its journal, which the host reads ([`App::protocol_scan`]) with no commit
-    /// between that read and this call, so the two layers are of one moment. Beside what
-    /// [`App::backup`] holds, the backup then carries what the feed holds beyond the cursor
-    /// that the layer may reflect: the entries processed past a held one, the entries
-    /// stored locally, and the processed pairs, so a restore hands none of those messages
-    /// to the protocol again. [`App::restore`] installs it all in one commit.
+    /// The app's backup with the protocol's layer (Switch spec 12.4), the layer taken by
+    /// the app itself, so it is always of the same moment as the rest. In this one call,
+    /// which holds the app exclusively so no other call writes its store meanwhile, the app
+    /// reads from its store: its committed state (never memory that a failed commit left
+    /// ahead of the store), the protocol's whole local state, which
+    /// [`Protocol::backup_layer`] turns into the layer's bytes under
+    /// [`Protocol::backup_name`], and what the feed holds beyond the cursor that the layer
+    /// may reflect: the entries processed past a held one, the entries stored locally, and
+    /// the processed pairs, so a restore hands none of those messages to the protocol
+    /// again. [`App::restore`] installs it all in one commit.
     ///
     /// The restore of the backup is built, without writing anything, before it is
-    /// returned: the protocol's [`Protocol::restore_layer`] checks the layer, and the one
-    /// commit that would install it must fit the store's sizes
-    /// ([`crate::store::MAX_VALUE_BYTES`], [`crate::store::MAX_BATCH_BYTES`]).
+    /// returned: [`Protocol::restore_layer`] checks the layer, and the one commit that would
+    /// install it must fit the store's sizes ([`crate::store::MAX_VALUE_BYTES`] for each
+    /// value, [`crate::store::MAX_BATCH_BYTES`] for the whole).
     ///
     /// # Errors
     ///
-    /// As [`App::backup`]; a store failure reading the processed pairs; as
-    /// [`App::restore`] for a layer it would refuse, such as one the protocol refuses
+    /// [`Refusal::NotNow`] for a protocol with no backup name; [`Refusal::Left`] or
+    /// [`Refusal::NotNow`] when there is nothing to back up; a store failure; as
+    /// [`App::restore`] for a backup it would refuse, such as a layer the protocol refuses
     /// ([`AppError::InvalidData`]) or one over the store's sizes ([`AppError::Store`]).
-    pub async fn backup_with_protocol_layer(
-        &self,
-        layer: ProtocolLayer,
-    ) -> Result<AppBackup, AppError> {
+    pub async fn backup_layered(&mut self) -> Result<AppBackup, AppError> {
         Box::pin(async move {
-            let mut backup = self.backup()?;
+            let Some(name) = self.protocol.backup_name() else {
+                return Err(Refusal::NotNow("the protocol names no backup layer".into()).into());
+            };
+            let reader = self.reader();
+            let state = Self::read_state(&reader).await?;
+            let mut backup = Self::backup_of(&state)?;
+            let local = self.protocol_scan(b"").await?;
+            let processed = reader.scan::<Processed>("proc/").await?;
+            let data = self.protocol.backup_layer(local).map_err(|why| {
+                AppError::InvalidData(format!("the protocol's backup layer: {why}"))
+            })?;
             backup.v = LAYERED_BACKUP_VERSION;
-            let processed = self.reader().scan::<Processed>("proc/").await?;
             backup.protocol = Some(LayerOut {
-                name: layer.protocol,
-                data: pubky_switch_core::enc::b64(&layer.data),
-                seen: self.state.seen.iter().copied().collect(),
-                parked: self
-                    .state
+                name,
+                data: pubky_switch_core::enc::b64(&data),
+                seen: state.seen.iter().copied().collect(),
+                parked: state
                     .parked
                     .iter()
                     .map(|(seq, entry)| (*seq, entry.clone()))
@@ -937,7 +953,7 @@ impl App {
     /// record, registers a fresh key if it rotated after the backup, and asks the user
     /// about registrations it can't account for ([`App::restore_question`]).
     ///
-    /// The protocol's layer ([`App::backup_with_protocol_layer`]) is installed with the
+    /// The protocol's layer ([`App::backup_layered`]) is installed with the
     /// app's own state, and with the entries and processed pairs of the same moment that
     /// the backup carries beside it, in one commit: the app checks its own state, then the
     /// layer's name
