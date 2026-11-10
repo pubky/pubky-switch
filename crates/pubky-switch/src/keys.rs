@@ -213,6 +213,10 @@ pub trait KeyStore: Send + Sync {
     /// manifests and, through [`sign_head`] only, heads.
     fn signer<'a>(&'a self, id: &'a KeyId) -> KeyFuture<'a, ServiceSigner>;
 
+    /// The operator key's signer: it signs answers the service can't tie to an account,
+    /// such as one to an unknown account (Switch wire 7.1). No client knows it.
+    fn operator(&self) -> KeyFuture<'_, ServiceSigner>;
+
     /// The newest head `id` signed, if any.
     fn mark<'a>(&'a self, id: &'a KeyId) -> KeyFuture<'a, Option<Mark>>;
 
@@ -435,6 +439,35 @@ impl Inner {
         Ok(ServiceKey { id, public })
     }
 
+    /// The operator key, made on first use: `operator` holds its ID.
+    fn operator_sync(&self) -> Result<Arc<SigningKey>, KeyStoreError> {
+        let path = self.root.join("operator");
+        let _writes = self.writes.lock();
+        let id = match fs::read_to_string(&path) {
+            Ok(text) => KeyId::parse(text.trim())?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let key = self.generate_sync()?;
+                write_atomic(&path, key.id.as_str().as_bytes(), true)?;
+                key.id
+            }
+            Err(error) => return Err(error.into()),
+        };
+        self.load_key(&id)
+    }
+
+    /// Keep `seed` as a new key, for tests that need the vectors' fixed keys.
+    #[cfg(any(test, feature = "test-util"))]
+    fn import_sync(&self, seed: &[u8; 32]) -> Result<ServiceKey, KeyStoreError> {
+        let mut raw = [0u8; 16];
+        getrandom::fill(&mut raw).map_err(|_| KeyStoreError::Random)?;
+        let id = KeyId(hex::encode(raw));
+        write_atomic(&self.key_path(&id), seed, true)?;
+        let key = SigningKey::from_bytes(seed);
+        let public = key.verifying_key().to_bytes();
+        self.keys.lock().insert(id.clone(), Arc::new(key));
+        Ok(ServiceKey { id, public })
+    }
+
     fn advance_mark_sync(&self, id: &KeyId, head: Mark) -> Result<MarkCheck, KeyStoreError> {
         let _writes = self.writes.lock();
         // A mark is only meaningful with its key.
@@ -548,6 +581,14 @@ impl KeyStore for FileKeyStore {
         })
     }
 
+    fn operator(&self) -> KeyFuture<'_, ServiceSigner> {
+        let store = self.inner.clone();
+        Box::pin(async move {
+            let key = blocking(move || store.operator_sync()).await?;
+            Ok(ServiceSigner(key as Arc<dyn Signs + Send + Sync>))
+        })
+    }
+
     fn mark<'a>(&'a self, id: &'a KeyId) -> KeyFuture<'a, Option<Mark>> {
         let store = self.inner.clone();
         let id = id.clone();
@@ -657,6 +698,84 @@ mod hex_bytes {
         let mut bytes = [0u8; 32];
         hex::decode_to_slice(text, &mut bytes).map_err(D::Error::custom)?;
         Ok(bytes)
+    }
+}
+
+/// A key store whose new keys are given seeds, in order, for tests that replay the
+/// vectors' fixed service keys; everything else is the file store's.
+#[cfg(any(test, feature = "test-util"))]
+pub struct FixedKeys {
+    store: FileKeyStore,
+    seeds: Mutex<std::collections::VecDeque<[u8; 32]>>,
+    operator: Option<[u8; 32]>,
+    operator_key: Mutex<Option<Arc<SigningKey>>>,
+}
+
+#[cfg(any(test, feature = "test-util"))]
+impl FixedKeys {
+    /// Hand out `seeds` as new keys, in order, then random ones; sign operator answers with
+    /// `operator` when given.
+    pub fn new(store: FileKeyStore, seeds: Vec<[u8; 32]>, operator: Option<[u8; 32]>) -> Self {
+        Self {
+            store,
+            seeds: Mutex::new(seeds.into()),
+            operator,
+            operator_key: Mutex::new(None),
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-util"))]
+impl KeyStore for FixedKeys {
+    fn generate(&self) -> KeyFuture<'_, ServiceKey> {
+        let next = self.seeds.lock().pop_front();
+        match next {
+            Some(seed) => {
+                let store = self.store.inner.clone();
+                Box::pin(blocking(move || store.import_sync(&seed)))
+            }
+            None => self.store.generate(),
+        }
+    }
+
+    fn public_key<'a>(&'a self, id: &'a KeyId) -> KeyFuture<'a, [u8; 32]> {
+        self.store.public_key(id)
+    }
+
+    fn signer<'a>(&'a self, id: &'a KeyId) -> KeyFuture<'a, ServiceSigner> {
+        self.store.signer(id)
+    }
+
+    fn operator(&self) -> KeyFuture<'_, ServiceSigner> {
+        let Some(seed) = self.operator else {
+            return self.store.operator();
+        };
+        let key = self
+            .operator_key
+            .lock()
+            .get_or_insert_with(|| Arc::new(SigningKey::from_bytes(&seed)))
+            .clone();
+        Box::pin(async move { Ok(ServiceSigner(key as Arc<dyn Signs + Send + Sync>)) })
+    }
+
+    fn mark<'a>(&'a self, id: &'a KeyId) -> KeyFuture<'a, Option<Mark>> {
+        self.store.mark(id)
+    }
+
+    fn advance_mark<'a>(&'a self, id: &'a KeyId, head: Mark) -> KeyFuture<'a, MarkCheck> {
+        self.store.advance_mark(id, head)
+    }
+
+    fn delete<'a>(&'a self, id: &'a KeyId) -> KeyFuture<'a, ()> {
+        self.store.delete(id)
+    }
+
+    fn record_erasure<'a>(&'a self, identity: &'a str, erased_at_ms: u64) -> KeyFuture<'a, ()> {
+        self.store.record_erasure(identity, erased_at_ms)
+    }
+
+    fn erasure<'a>(&'a self, identity: &'a str) -> KeyFuture<'a, Option<u64>> {
+        self.store.erasure(identity)
     }
 }
 
@@ -791,6 +910,17 @@ mod tests {
         assert_eq!(
             store.mark(&key.id).await.expect("mark"),
             Some(mark(1002, 2))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_key_store_operator_key_is_kept() {
+        let (dir, store) = open();
+        let first = store.operator().await.expect("operator").public_key();
+        let store = FileKeyStore::open(dir.path()).expect("reopen");
+        assert_eq!(
+            store.operator().await.expect("operator").public_key(),
+            first
         );
     }
 

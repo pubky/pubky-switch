@@ -40,6 +40,9 @@ async fn test_changes_committed_change_wakes_its_account_only() {
                 generation: 1,
                 service_key: key.id,
                 created_at_ms: 0,
+                limits: pubky_switch_core::records::Limits::default(),
+                identity_doc: None,
+                revoked_apps: Vec::new(),
             })
             .await
             .expect("create");
