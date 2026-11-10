@@ -222,7 +222,9 @@ pub enum AppEvent {
     /// than a resend's answer can tell whether it was applied (Switch spec 12.5 "Kept
     /// batches"): its entry was stored locally and passed ([`AppEvent::Parked`]), and the
     /// effect isn't sent or built again. It may have been applied: the protocol decides
-    /// from the current state of what the effect writes. A duty event.
+    /// from the current state of what the effect writes, and treats each `attempt` the
+    /// effect carried as of unknown fate (Switch spec 12.5 "Kept batches", 12.6 step 5). A
+    /// duty event.
     EffectUncertain {
         /// The duty event's ID.
         id: EventId,
@@ -234,6 +236,8 @@ pub enum AppEvent {
         msg_id: String,
         /// The message kind.
         kind: String,
+        /// The effect's own `attempt`s: whether each was applied can't be known.
+        attempts: Vec<ClaimAttempt>,
     },
     /// An entry stored locally was processed.
     Unparked {
@@ -587,6 +591,17 @@ impl AppEvent {
     }
 }
 
+/// An `attempt` on a claim (Switch wire 6.8), named by its claim key and attempt ID.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ClaimAttempt {
+    /// The claim key.
+    #[serde(with = "serde_b64")]
+    pub claim_key: [u8; 32],
+    /// The attempt.
+    #[serde(with = "serde_b64")]
+    pub attempt_id: [u8; 16],
+}
+
 /// `duty/<id>`: a duty event as the store keeps it, its ID in its key.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum Duty {
@@ -608,6 +623,8 @@ pub(crate) enum Duty {
         sender: [u8; 32],
         msg_id: String,
         kind: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attempts: Vec<ClaimAttempt>,
     },
     KeptBatchDropped {
         #[serde(with = "serde_b64")]
@@ -653,12 +670,14 @@ impl Duty {
                 sender,
                 msg_id,
                 kind,
+                attempts,
             } => AppEvent::EffectUncertain {
                 id,
                 seq,
                 sender,
                 msg_id,
                 kind,
+                attempts,
             },
             Self::KeptBatchDropped { batch_id } => AppEvent::KeptBatchDropped { id, batch_id },
             Self::AttemptDropped {

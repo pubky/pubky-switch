@@ -2725,6 +2725,154 @@ async fn test_kept_batch_resend_refused_before_the_lookup_stays_kept() {
     assert_eq!(allow_ops_for(&w.switch.applied(), carol), 1);
 }
 
+/// The sample protocol, whose effect for a note also writes an own `attempt`.
+struct AttemptingProtocol(SampleProtocol);
+
+impl Protocol for AttemptingProtocol {
+    fn has_keys(&self, scope: &str) -> bool {
+        self.0.has_keys(scope)
+    }
+
+    fn sent_between_own_apps(&self, kind: &str) -> bool {
+        self.0.sent_between_own_apps(kind)
+    }
+
+    fn check_scopes(
+        &self,
+        message: &Message,
+        sender: &AppCert,
+        own: &AppCert,
+    ) -> Result<(), String> {
+        self.0.check_scopes(message, sender, own)
+    }
+
+    fn accepts(&self, cert: &AppCert) -> Vec<String> {
+        self.0.accepts(cert)
+    }
+
+    fn check_body(&self, message: &ReceivedMessage) -> Result<(), String> {
+        self.0.check_body(message)
+    }
+
+    fn receive(&self, message: &ReceivedMessage) -> Outcome {
+        match self.0.receive(message) {
+            Outcome::Apply(mut effect) => {
+                effect.ops.push((
+                    Vec::new(),
+                    ClaimOp::attempt(CLAIM, 0, ATTEMPT, 3600, None).kind(),
+                ));
+                Outcome::Apply(effect)
+            }
+            other => other,
+        }
+    }
+
+    fn resend_needed(
+        &self,
+        needed: &ResendNeeded,
+    ) -> Result<Vec<LocalWrite>, crate::error::StoreError> {
+        self.0.resend_needed(needed)
+    }
+
+    fn missed(&self, missed: &MissedEntries) -> Result<Vec<LocalWrite>, crate::error::StoreError> {
+        self.0.missed(missed)
+    }
+}
+
+#[tokio::test]
+async fn test_kept_effect_parked_uncertain_reports_its_attempts() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join_on(
+        &w,
+        &router,
+        Arc::clone(&w.store) as Arc<dyn StateStore>,
+        Arc::new(AttemptingProtocol(SampleProtocol::default())),
+        &Permission::ALL,
+    )
+    .await;
+    let me = app.app_id();
+    let (seq, _) = w.note(me, "before");
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.receive(None).await.is_err());
+    w.clock
+        .advance_ms(crate::app::provider::KEPT_BATCH_ANSWER_MS);
+    let changed = change_key(&w, &router);
+    changed.lock().batches.clear();
+    let report = app.receive(None).await.unwrap();
+    let attempt = crate::app::ClaimAttempt {
+        claim_key: CLAIM,
+        attempt_id: ATTEMPT,
+    };
+    assert!(
+        has(&report.events, |e| matches!(
+            e,
+            AppEvent::EffectUncertain { seq: s, attempts, .. }
+                if *s == seq && *attempts == vec![attempt]
+        )),
+        "{:?}",
+        report.events
+    );
+    // Kept with them.
+    assert!(has(
+        &app.unacknowledged_events().await.unwrap(),
+        |e| matches!(
+            e,
+            AppEvent::EffectUncertain { attempts, .. } if *attempts == vec![attempt]
+        )
+    ));
+}
+
+#[tokio::test]
+async fn test_loss_reports_the_attempts_of_a_kept_effect_it_drops() {
+    let store = Arc::new(MemoryStore::new());
+    let lost = lost_world(Arc::clone(&store) as Arc<dyn StateStore>).await;
+    // A kept effect from before the loss, carrying an `attempt`.
+    let mut app = load_lost(&lost, Arc::clone(&store) as Arc<dyn StateStore>).await;
+    let attempt = ClaimOp::attempt(CLAIM, 0, ATTEMPT, 3600, None);
+    let batch = app
+        .sign_ops(vec![(Vec::new(), attempt.kind())], None)
+        .unwrap();
+    let pending = crate::app::state::PendingEffect {
+        body: batch.body().to_vec(),
+        seq: 99,
+        sender: lost.w.bob.public(),
+        msg_id: "kept".into(),
+        hash: [1; 32],
+        accepted_at_ms: lost.note_at_ms,
+        kind: "sample.note".into(),
+        local: Vec::new(),
+        cursor_to: None,
+        past_held: false,
+        parked: false,
+        deadlines: Vec::new(),
+        kept_ms: Some(lost.note_at_ms),
+        entry: crate::app::state::KeptEntry {
+            cert: app.cert().signed().clone(),
+            plaintext: Vec::new(),
+            context: None,
+        },
+    };
+    let mut tx = app.tx().unwrap();
+    tx.put(crate::app::state::key::PENDING_EFFECT, &pending)
+        .unwrap();
+    app.commit(tx).await.unwrap();
+    drop(app);
+    let (app, events) = follow_loss(&lost, Arc::clone(&store) as Arc<dyn StateStore>)
+        .await
+        .unwrap();
+    let dropped = |e: &AppEvent| {
+        matches!(
+            e,
+            AppEvent::AttemptDropped { claim_key, attempt_id, .. }
+                if *claim_key == CLAIM && *attempt_id == ATTEMPT
+        )
+    };
+    assert!(has(&events, dropped), "{events:?}");
+    assert!(app.state.pending_effect.is_none());
+    assert!(has(&app.unacknowledged_events().await.unwrap(), dropped));
+}
+
 /// The app at `store`, loaded through the loss's router.
 async fn load_lost(lost: &Lost, store: Arc<dyn StateStore>) -> App {
     App::load(

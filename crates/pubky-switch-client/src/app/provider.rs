@@ -237,6 +237,22 @@ fn corrupt() -> AppError {
     AppError::Store(StoreError::Corrupt)
 }
 
+/// The own `attempt`s a batch carries.
+pub(crate) fn attempts_in(batch: &Batch) -> Vec<super::events::ClaimAttempt> {
+    batch
+        .ops()
+        .iter()
+        .filter_map(|op| match &op.body().kind {
+            OpKind::Claim(fields) if fields.kind == ClaimType::Attempt => fields.check().ok(),
+            _ => None,
+        })
+        .map(|entry| super::events::ClaimAttempt {
+            claim_key: entry.claim_key,
+            attempt_id: entry.attempt_id,
+        })
+        .collect()
+}
+
 /// A kept batch's operations, with their conditions, to sign again.
 fn ops_of(batch: &Batch) -> Vec<(Vec<Condition>, OpKind)> {
     batch
@@ -1025,6 +1041,12 @@ impl App {
                 tx.delete(key::PENDING_EFFECT)?;
                 self.state.pending_effect = None;
             }
+            // After a loss, an effect the old chain doesn't show applied goes, and its entry
+            // is read again; an `attempt` in it is never signed again, so it is reported as
+            // a kept batch's is (Switch spec 12.6 step 5).
+            if !applied && carry == Carry::AfterLoss {
+                self.attempts_dropped(&Batch::from_body(pending.body.clone())?, tx)?;
+            }
             if applied {
                 let now = self.now();
                 // What its operations settle without their proofs, such as a list change.
@@ -1108,19 +1130,20 @@ impl App {
         tx: &mut Tx,
     ) -> Result<(), AppError> {
         self.keep_duty(tx, Duty::KeptBatchDropped { batch_id: *id })?;
-        for op in batch.ops() {
-            if let OpKind::Claim(fields) = &op.body().kind
-                && fields.kind == ClaimType::Attempt
-                && let Ok(entry) = fields.check()
-            {
-                self.keep_duty(
-                    tx,
-                    Duty::AttemptDropped {
-                        claim_key: entry.claim_key,
-                        attempt_id: entry.attempt_id,
-                    },
-                )?;
-            }
+        self.attempts_dropped(batch, tx)
+    }
+
+    /// Each `attempt` of a batch the app drops unsent, reported in `tx` so the protocol
+    /// treats its obligation as uncertain (Switch spec 12.5 "Kept batches", 12.6 step 5).
+    fn attempts_dropped(&mut self, batch: &Batch, tx: &mut Tx) -> Result<(), AppError> {
+        for attempt in attempts_in(batch) {
+            self.keep_duty(
+                tx,
+                Duty::AttemptDropped {
+                    claim_key: attempt.claim_key,
+                    attempt_id: attempt.attempt_id,
+                },
+            )?;
         }
         Ok(())
     }

@@ -1153,6 +1153,7 @@ impl App {
                 sender: pending.sender,
                 msg_id: pending.msg_id.clone(),
                 kind: pending.kind.clone(),
+                attempts: super::provider::attempts_in(&Batch::from_body(pending.body.clone())?),
             },
         )
     }

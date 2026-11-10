@@ -62,7 +62,7 @@ mod tests;
 
 pub use chain::{HELD_MARKS, STUBS_KEPT_FOR_MS};
 pub use error::{Alarm, AppError, Refusal};
-pub use events::{AppEvent, EVENT_ID_LEN, EventId, EventIdError, ParkReason};
+pub use events::{AppEvent, ClaimAttempt, EVENT_ID_LEN, EventId, EventIdError, ParkReason};
 pub use feed::ReceiveReport;
 pub use identity::{DOC_CACHE_MS, HomeserverReader, IdentityRefresh, REVALIDATION_MS};
 pub use peek::{PeekReport, Peeked};
