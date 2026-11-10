@@ -49,6 +49,12 @@ pub enum Alert {
     /// version this signer delivered, so no other install had taken over, and the signer
     /// wrote its own backup over it (Switch wire 3.13).
     BackupUnreadable,
+    /// Before this install's first version was delivered, the Homeserver held a signer backup
+    /// it can't open: another install may sign for the identity, or the file is damaged. The
+    /// signer writes nothing and delivers nothing until the user deals with it (Switch wire
+    /// 3.13): by restoring from it on the install that wrote it, or, sure that no other
+    /// install signs, by removing it from the Homeserver, after which `resume` goes on.
+    UnreadableBackupBeforeEnrollment,
     /// The Homeserver held no signer backup, though this signer had written one. The switch
     /// still held the newest version this signer delivered, so the signer wrote its backup
     /// again (Switch wire 3.13).

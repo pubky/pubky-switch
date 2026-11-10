@@ -820,3 +820,39 @@ async fn test_signer_a_new_version_survives_a_crash_at_every_commit() {
         }
     }
 }
+
+#[tokio::test]
+async fn test_signer_an_unreadable_backup_before_the_first_version_is_refused_with_an_alert() {
+    let world = World::new();
+    let garbage = b"not a backup".to_vec();
+    world.homeserver.set(SIGNER_BACKUP_PATH, garbage.clone());
+    let store = Arc::new(MemoryStore::new());
+    let mut signer = Signer::create(world.env(store), world.keyring(), SWITCH_ORIGIN)
+        .await
+        .unwrap();
+    // Every attempt is the same typed refusal, never the staged switch's `503`.
+    for _ in 0..2 {
+        let error = signer.resume().await.unwrap_err();
+        assert_eq!(error, SignerError::Refused(Refusal::UnreadableBackup));
+    }
+    assert!(
+        signer
+            .alerts()
+            .contains(&Alert::UnreadableBackupBeforeEnrollment)
+    );
+    assert_eq!(signer.status(), SignerStatus::Enrolling);
+    // Nothing written over the backup, nothing delivered.
+    assert_eq!(world.homeserver.file(SIGNER_BACKUP_PATH), Some(garbage));
+    assert!(world.sent_docs().is_empty());
+    // Once the user removes it, the enrollment goes on from where it stopped.
+    world
+        .homeserver
+        .files
+        .lock()
+        .unwrap()
+        .remove(SIGNER_BACKUP_PATH);
+    signer.resume().await.unwrap();
+    assert_eq!(signer.status(), SignerStatus::Signing);
+    assert_eq!(world.backup().identity_doc().version(), 1);
+    assert_eq!(world.distinct_requests("POST", "/v1/enroll"), 1);
+}

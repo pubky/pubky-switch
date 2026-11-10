@@ -396,3 +396,8 @@ The Switch spec answers four questions a signer has to settle:
 3. **Finding a waiting hand-over.** No feed item announces one (wire 7.4.17), so the user drives it. The old signer tells the user to open the new app, and the new app calls `GET /handover` at start and when the user asks; a `404` costs little.
 4. **Revoking Pubky grants.** Revocations and leaves revoke the app's grant (spec 3.4, 12.2 step 1). Until the Pubky SDK offers a revocation call, the signer records each revocation as owed and raises `GrantRevocationOwed`. The rest of the flow doesn't wait for it.
 5. **The `StateStore`:** proposed in section 4.6, to be agreed together with `pubky-switch-client`.
+
+## 11. Known limits
+
+- **A lagging switch with an unreadable or missing backup.** When the backup on the Homeserver doesn't open, or is missing where this signer wrote one, the signer writes its own only if the switch's copy (`GET /apps` `identity`) is still its high-water version (wire 3.13). A switch whose `GET /apps` lags its own writes can show that version after another install's delivery has won. The signer then writes its backup over the winner's. Its own delivery still fails at the switch's compare-and-swap, so the identity stays with the winner; the winner's next backup write repairs the file.
+- **An unreadable backup before the first version.** A new install that finds a backup it can't open, before any switch accepted a version from it, has no copy to judge the switch by. It writes and delivers nothing, raises `UnreadableBackupBeforeEnrollment` and refuses with `UnreadableBackup`. The user restores from that backup on the install that wrote it, or, sure that no other install signs for the identity, removes the file from the Homeserver; `resume` then goes on.

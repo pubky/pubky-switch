@@ -485,6 +485,11 @@ impl Signer {
                         return self.managed_by(install).await;
                     }
                 }
+                None if self.state.newest.is_none() => {
+                    // No mark yet, so no copy of the switch to judge: a staged account shows
+                    // none. The backup may be another install's, so nothing is written.
+                    return self.unreadable_before_mark().await;
+                }
                 None => {
                     self.switch_at_mark().await?;
                     state.alert(Alert::BackupUnreadable);
@@ -524,6 +529,16 @@ impl Signer {
             step: DeliverStep::BackupWritten,
         };
         self.commit(state, Some(flow)).await
+    }
+
+    /// A backup this install can't open, found before its first version was delivered: keep
+    /// the flow, so [`Signer::resume`] goes on once the backup is dealt with, and tell the
+    /// user (Switch wire 3.13).
+    async fn unreadable_before_mark(&mut self) -> Result<()> {
+        let mut state = self.state.clone();
+        state.alert(Alert::UnreadableBackupBeforeEnrollment);
+        self.commit(state, self.flow.clone()).await?;
+        Err(Refusal::UnreadableBackup.into())
     }
 
     /// Check that the switch still holds the newest version this signer delivered (`GET

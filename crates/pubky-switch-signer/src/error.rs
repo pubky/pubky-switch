@@ -88,6 +88,11 @@ pub enum Refusal {
     /// The store holds no signer records for this identity.
     #[error("refused: the signer isn't set up for this identity")]
     NotSetUp,
+    /// The Homeserver holds a signer backup this install can't open, found before its first
+    /// version was delivered; nothing is written or delivered until the user deals with it
+    /// ([`crate::Alert::UnreadableBackupBeforeEnrollment`]).
+    #[error("refused: the Homeserver holds a signer backup this install can't open")]
+    UnreadableBackup,
     /// A flow is in progress: [`crate::Signer::resume`] finishes it first.
     #[error("refused: a flow is in progress")]
     FlowInProgress,
