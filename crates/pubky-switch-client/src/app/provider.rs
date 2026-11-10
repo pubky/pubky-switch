@@ -304,7 +304,9 @@ impl App {
 /// it came counts as not fresh. The window ends an hour before the service's 30 days, and
 /// the worst case of the clocks and a request's accepted time takes some 20 minutes of it
 /// ([`KEPT_BATCH_MARGIN_MS`]): 10 minutes between the reading and the send leaves half an
-/// hour.
+/// hour. A known limit: a device clock stepped back by about the length of a suspend
+/// between the reading and the send, and left more than about 45 minutes behind true time,
+/// still passes this test, since the device clock is all it measures the gap by.
 pub(crate) const FRESH_SERVICE_TIME_MS: u64 = 10 * 60 * 1000;
 
 /// How many provider changes one follow takes in a row, each given up for a newer own
