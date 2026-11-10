@@ -905,6 +905,41 @@ async fn test_inbox_entry_waits_for_a_target_whose_certificate_lapsed() {
         String::from_utf8_lossy(&answer.body)
     );
     assert_eq!(entries(&replay).await, 1);
+    // Not served, the wallet is no target: the phone's append wrapped to it is stale, naming
+    // it not current, and one sealed before the wallet was reachable needn't wrap to it.
+    let from_phone = |envelope: Vec<u8>, apps_version: i64| {
+        app_request(
+            app(&keys, "phone"),
+            "POST",
+            &format!("/v1/{}/inbox?apps_version={apps_version}", alice_id()),
+            envelope,
+            ms(later),
+        )
+    };
+    let answer = replay
+        .service
+        .handle(from_phone(
+            sealed_to(&[receive_public("wallet"), receive_public("phone")], 13),
+            version,
+        ))
+        .await;
+    assert_eq!(code_of(&answer), (409, json!("stale_key")));
+    assert_eq!(
+        body(&answer)["current"]["not_current"],
+        json!([app(&keys, "wallet")["app_id"]])
+    );
+    let answer = replay
+        .service
+        .handle(from_phone(sealed_to(&[receive_public("phone")], 14), 0))
+        .await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    let own = entry_seq(&replay).await;
+    move_cursor_at(&replay, "phone", own, later).await;
     // Renewed, the wallet reads it in its feed, then moves past it, and it goes.
     renew_wallet(&replay, later).await;
     let feed = body(
