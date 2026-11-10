@@ -73,6 +73,21 @@ impl Replay {
             limits,
         )
     }
+
+    /// Another service on the same database, keys and clock, that needs trusted time and
+    /// has no sample.
+    pub fn without_trusted_time(&self) -> Service {
+        Service::new(
+            ORIGIN.into(),
+            self.db.store().clone(),
+            self.keys.clone(),
+            Arc::new(TrustedTime::new(
+                TrustedTimeConfig::default(),
+                self.clock.clone(),
+            )),
+            Limits::default(),
+        )
+    }
 }
 
 pub async fn replay() -> Option<Replay> {

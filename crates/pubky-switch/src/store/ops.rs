@@ -112,8 +112,9 @@ impl ListName {
 pub struct StoredListEntry {
     /// The Pubky ID.
     pub pubky: [u8; 32],
-    /// The writing app.
-    pub written_by: [u8; 16],
+    /// The writing app; `None` for a conversation entry the service wrote for a sender an
+    /// invite code admitted.
+    pub written_by: Option<[u8; 16]>,
     /// The service time of the write.
     pub at_ms: u64,
 }
@@ -133,6 +134,9 @@ pub struct StoredInvite {
     pub expires_at_ms: u64,
     /// Its context.
     pub context: Value,
+    /// The context's bytes as its writer wrote them, which a reader repeats (Switch wire
+    /// 1.1). A code stored before the service kept them holds a re-serialization.
+    pub context_written: Vec<u8>,
 }
 
 fn array<const N: usize>(bytes: &[u8], what: &'static str) -> Result<[u8; N], StoreError> {
@@ -659,10 +663,10 @@ impl AccountTxn {
         rows.iter()
             .map(|row| {
                 let pubky: Vec<u8> = row.try_get("pubky")?;
-                let by: Vec<u8> = row.try_get("written_by")?;
+                let by: Option<Vec<u8>> = row.try_get("written_by")?;
                 Ok(StoredListEntry {
                     pubky: array(&pubky, "pubky")?,
-                    written_by: array(&by, "written_by")?,
+                    written_by: by.map(|by| array(&by, "written_by")).transpose()?,
                     at_ms: from_db(row.try_get("at_ms")?, "at_ms")?,
                 })
             })
@@ -704,7 +708,7 @@ impl AccountTxn {
         .bind(id)
         .bind(list.as_str())
         .bind(entry.pubky.as_slice())
-        .bind(entry.written_by.as_slice())
+        .bind(entry.written_by.map(|app| app.to_vec()))
         .bind(to_db(entry.at_ms, "at_ms")?)
         .execute(self.conn())
         .await
@@ -757,6 +761,7 @@ impl AccountTxn {
                     expires_at_ms: from_db(row.try_get("expires_at_ms")?, "expires_at_ms")?,
                     context: serde_json::from_slice(&context)
                         .map_err(|_| StoreError::Corrupt("an invite code's context"))?,
+                    context_written: context,
                 })
             })
             .collect()
@@ -785,8 +790,8 @@ impl AccountTxn {
     /// Store an invite code, replacing one at its hash.
     pub async fn put_invite(&mut self, invite: &StoredInvite) -> Result<(), StoreError> {
         let id = self.head().id.clone();
-        let context = serde_json::to_vec(&invite.context)
-            .map_err(|_| StoreError::Corrupt("an invite code's context doesn't encode"))?;
+        // The bytes as written, never a re-serialization (Switch wire 1.1).
+        let context = invite.context_written.clone();
         sqlx::query(
             "INSERT INTO invite_codes (account_id, code_hash, max_uses, uses, writer, \
              expires_at_ms, context) VALUES ($1, $2, $3, $4, $5, $6, $7) \

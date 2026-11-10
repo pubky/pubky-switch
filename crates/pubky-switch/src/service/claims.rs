@@ -78,7 +78,7 @@ impl Service {
         let apps = batch::load_apps(txn, held, time_ms)
             .await
             .map_err(|e| store_error(&e))?;
-        let current = |app: &[u8; 16]| apps.is_current(app);
+        let current = |app: &[u8; 16]| apps.is_served(app);
         let view = claim.view(&claim_key, time_ms, &current).to_value();
         let steps = if claim.tombstone { 0 } else { claim.step };
         let last_seq = match steps.checked_sub(1) {
@@ -168,6 +168,10 @@ impl Service {
         // The data epoch its rotation goes above (Switch wire 7.4.12 awaiting_rotation).
         let data_epoch = held.map_or(1, IdentityDoc::data_epoch);
         txn.revoke_app(&app, time_ms, data_epoch)
+            .await
+            .map_err(|e| store_error(&e))?;
+        // Entries no longer wait for it (Switch wire 9.1).
+        batch::release_entries(txn, held, time_ms)
             .await
             .map_err(|e| store_error(&e))?;
         // It leaves the directory: its record and receive key no longer show, and a

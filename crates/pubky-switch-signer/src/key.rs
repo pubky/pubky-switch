@@ -408,11 +408,26 @@ impl BackupView {
         }
     }
 
-    /// Whether another install wrote it at or past `own_newest`, the high-water version of
-    /// the install `own_signer`: it took over, and this one stops (Switch wire 3.13
-    /// "Another install's backup"; the core's `taken_over`).
-    pub(crate) fn taken_over(&self, own_signer: &[u8; 16], own_newest: u64) -> bool {
-        &self.identity_doc.body().signer != own_signer && self.identity_doc.version() >= own_newest
+    /// Whether another install than `own_signer` wrote it at or past `own_newest`, the
+    /// high-water mark's document, which built on `own_prev`: it took over, and this one
+    /// stops (Switch wire 3.13 "Another install's backup"; the core's `taken_over`). One that
+    /// builds on `own_prev` too and isn't the mark itself is a losing delivery's, whatever its
+    /// version, and this install, still the signer, writes over it.
+    pub(crate) fn taken_over(
+        &self,
+        own_signer: &[u8; 16],
+        own_newest: Option<&IdentityDoc>,
+        own_prev: Option<[u8; 32]>,
+    ) -> bool {
+        let doc = &self.identity_doc;
+        if &doc.body().signer == own_signer {
+            return false;
+        }
+        let Some(mark) = own_newest else {
+            return true;
+        };
+        let losing = self.prev.is_some() && self.prev == own_prev && doc.signed() != mark.signed();
+        !losing && doc.version() >= mark.version()
     }
 }
 
@@ -784,6 +799,49 @@ pub(crate) mod tests {
         assert_eq!(view.revoked_apps, [[2; 16]]);
         let other = IdentityKeyring::open(MemoryVault::holding([7; 32])).unwrap();
         assert!(other.open_backup(&backup).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_key_backup_built_on_the_marks_prev_is_a_losing_deliverys() {
+        use pubky_switch_core::records::{IdentityBody, IdentityPolicy, Inbox};
+        let key = IdentityKey::from_secret([6; 32]);
+        let doc = |version: u64, signer: [u8; 16], record_max_age: Option<u64>| {
+            let mut body = IdentityBody::first(
+                key.public(),
+                signer,
+                Inbox::new("https://switch.example", [4; 32]),
+                IdentityPolicy::default(),
+            );
+            body.version = version;
+            body.record_max_age = record_max_age;
+            IdentityDoc::sign(&key, body).unwrap()
+        };
+        let view = |identity_doc: IdentityDoc, prev: Option<[u8; 32]>| BackupView {
+            identity_doc,
+            revoked_apps: Vec::new(),
+            certs: Vec::new(),
+            limits: Limits::default(),
+            bundle_parts: Vec::new(),
+            prev,
+        };
+        let (me, other) = ([1; 16], [2; 16]);
+        let (built_on, elsewhere) = (Some([5; 32]), Some([9; 32]));
+        let mine = doc(3, me, Some(60));
+        // Another install's, built on what the mark built on: a losing delivery's, at the
+        // mark's version or past it, as after a spent version.
+        assert!(!view(doc(3, other, None), built_on).taken_over(&me, Some(&mine), built_on));
+        assert!(!view(doc(4, other, None), built_on).taken_over(&me, Some(&mine), built_on));
+        // Built on something else, at or past the mark: taken over.
+        assert!(view(doc(3, other, None), elsewhere).taken_over(&me, Some(&mine), built_on));
+        assert!(view(doc(4, other, None), elsewhere).taken_over(&me, Some(&mine), built_on));
+        // The mark itself, another install's: taken over.
+        let theirs = doc(3, other, None);
+        assert!(view(theirs.clone(), built_on).taken_over(&me, Some(&theirs), built_on));
+        // Behind the mark, this install's own, or a first version's: as before.
+        assert!(!view(doc(2, other, None), elsewhere).taken_over(&me, Some(&mine), built_on));
+        assert!(!view(doc(5, me, None), elsewhere).taken_over(&me, Some(&mine), built_on));
+        assert!(view(doc(3, other, None), None).taken_over(&me, Some(&mine), None));
+        assert!(view(doc(1, other, None), None).taken_over(&me, None, None));
     }
 
     #[test]
