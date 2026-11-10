@@ -102,6 +102,10 @@ impl Protocol for LossProtocol {
         self.sample.accepts(cert)
     }
 
+    fn check_body(&self, message: &ReceivedMessage) -> Result<(), String> {
+        self.sample.check_body(message)
+    }
+
     fn receive(&self, message: &ReceivedMessage) -> Outcome {
         self.sample.receive(message)
     }
@@ -1983,7 +1987,10 @@ async fn test_unsigned_404_with_a_newer_own_document_is_followed_not_erased() {
     );
     // The app holds the verified document naming the next service; then the old service
     // drops the account and the Homeserver serves no identity.json.
-    assert!(app.refresh_identity().await.unwrap());
+    assert!(matches!(
+        app.refresh_identity().await.unwrap(),
+        crate::app::IdentityRefresh::Newer { .. }
+    ));
     w.switch.lock().erased = true;
     w.homeserver.remove(w.alice.public(), IDENTITY_PATH);
     let over = app

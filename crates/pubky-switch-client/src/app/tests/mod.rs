@@ -94,6 +94,13 @@ impl Protocol for SampleProtocol {
         }
     }
 
+    fn check_body(&self, message: &ReceivedMessage) -> Result<(), String> {
+        match message.message.body.get("text") {
+            Some(Value::String(_)) => Ok(()),
+            _ => Err("sample: body.text isn't text".into()),
+        }
+    }
+
     fn receive(&self, message: &ReceivedMessage) -> Outcome {
         let Some(text) = message.message.body.get("text").and_then(Value::as_str) else {
             return Outcome::Drop {

@@ -377,6 +377,10 @@ impl Protocol for TestProtocol {
         self.spec.accepts.clone()
     }
 
+    fn check_body(&self, _message: &ReceivedMessage) -> Result<(), String> {
+        Ok(())
+    }
+
     fn receive(&self, message: &ReceivedMessage) -> Outcome {
         lock(&self.received).push(message.clone());
         Outcome::Apply(Effect::default())
