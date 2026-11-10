@@ -313,9 +313,9 @@ impl OpsState {
     }
 
     /// Whether `app` is served now: current ([`Self::is_current`]) and its certificate
-    /// unexpired (Switch wire 3.8 check 3). What acting now needs: an inbox wrapping to it
-    /// (7.4.3 check 5), and the claim rules, for which an expired app counts as not current
-    /// (spec 3.2, 10.2).
+    /// unexpired (Switch wire 3.8 check 3). Only the claim rules take it, for which an
+    /// expired app counts as not current (spec 3.2, 10.2); a caller's own expiry is check 3
+    /// on its request.
     pub fn is_served(&self, app: &[u8; 16]) -> bool {
         self.current_by(app, true)
     }
@@ -324,7 +324,8 @@ impl OpsState {
     /// record's certificate, or a renewed one, listed or in an open renewal in the newest
     /// `identity.json` (wire 3.8's standing, check 5). Expiry isn't part of it: a lapsed
     /// certificate stops the app being served (check 3), not current, and a renewal brings
-    /// it back with nothing lost. So entries wait for it (wire 9.1).
+    /// it back with nothing lost. So entries wait for it (wire 9.1), and an append's targets
+    /// (7.4.3 check 5), `stale_key`'s members (7.6) and the directory (7.4.10) take it.
     pub fn is_current(&self, app: &[u8; 16]) -> bool {
         self.current_by(app, false)
     }
