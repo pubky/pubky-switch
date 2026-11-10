@@ -319,6 +319,16 @@ impl OpsState {
         self.current_by(app, true)
     }
 
+    /// The App IDs current now ([`Self::is_current`]): the targets an inbox entry waits for
+    /// and counts as unread for (Switch wire 9.1, 7.4.12).
+    pub fn current_app_ids(&self) -> Vec<[u8; 16]> {
+        self.apps
+            .keys()
+            .filter(|app| self.is_current(app))
+            .copied()
+            .collect()
+    }
+
     /// Whether `app` is current without its certificate's expiry, which only trusted time
     /// can judge (Switch wire 7.3 "Without trusted time").
     pub fn current_without_expiry(&self, app: &[u8; 16]) -> bool {

@@ -212,6 +212,11 @@ impl Service {
         })
         .await
         .map_err(|e| store_error(&e))?;
+        // An app it no longer makes current stops holding entries at once (Switch wire
+        // 7.4.2, 9.1).
+        super::batch::release_entries(txn, Some(doc), time_ms)
+            .await
+            .map_err(|e| store_error(&e))?;
         // Where the keys_through of each app it lists for the first time starts (Switch
         // wire 7.4.12).
         let listed = crate::store::newly_listed(previous, doc);
