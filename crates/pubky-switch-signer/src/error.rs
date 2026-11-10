@@ -90,6 +90,14 @@ pub enum Refusal {
     /// here.
     #[error("refused: the app is listed already")]
     AlreadyListed,
+    /// The approval's version is delivered, but its claim is held: the switch isn't confirmed
+    /// to hold the signer's newest version since a rollback or an equivocation, named here
+    /// when its alert is still held ([`crate::Signer::clear_alert`]).
+    #[error("refused: the claim is held until the switch is confirmed")]
+    ClaimHeld {
+        /// The rollback or equivocation alert behind it, if still held.
+        alert: Option<crate::alert::Alert>,
+    },
     /// The store already holds this identity's signer records, so it isn't set up again.
     #[error("refused: the signer is already set up for this identity")]
     AlreadySetUp,

@@ -244,8 +244,19 @@ impl Signer {
         state.claims.push(pending);
         self.commit(state, Some(flow)).await?;
         self.resume().await?;
-        self.approved(&review.request.hash())?
-            .ok_or_else(|| SignerError::Records("the approved version isn't the newest".into()))
+        match self.approved(&review.request.hash())? {
+            Some(approved) => Ok(approved),
+            None => Err(Refusal::ClaimHeld {
+                alert: self
+                    .state
+                    .alerts
+                    .iter()
+                    .rev()
+                    .find(|a| matches!(a, Alert::Rollback { .. } | Alert::Equivocation { .. }))
+                    .cloned(),
+            }
+            .into()),
+        }
     }
 
     /// The claim of an approval whose version the switch has taken and the Homeserver
@@ -254,8 +265,8 @@ impl Signer {
     ///
     /// `None` for a request this signer holds no claim for, or whose version isn't the newest
     /// published one listing its certificate; also while another install is the signer, and
-    /// while a rollback or equivocation alert is uncleared, since the switch may no longer
-    /// hold that version ([`Signer::clear_alert`]).
+    /// after a rollback or an equivocation until a delivery to the switch has succeeded again,
+    /// since the switch may not hold that version ([`Signer::clear_alert`]).
     ///
     /// # Errors
     ///
@@ -264,12 +275,7 @@ impl Signer {
         let Some(held) = self.state.claims.iter().find(|c| &c.request == request) else {
             return Ok(None);
         };
-        let alarmed = self
-            .state
-            .alerts
-            .iter()
-            .any(|alert| matches!(alert, Alert::Rollback { .. } | Alert::Equivocation { .. }));
-        if alarmed || self.state.managed_by.is_some() {
+        if self.state.switch_unconfirmed || self.state.managed_by.is_some() {
             return Ok(None);
         }
         let published = self.state.newest.as_ref().is_some_and(|n| n.published);
