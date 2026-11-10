@@ -143,7 +143,9 @@ pub struct ProviderLoss {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LossActions {
     /// The counterparties in its records, whose conversation entries the app adds back,
-    /// except identities on its copy of the deny list.
+    /// except identities on its copy of the deny list. At most
+    /// [`super::MAX_LOSS_CONVERSATIONS`] are added back, the first in key order; how many
+    /// more there were is kept with the loss ([`RecoveryInfo::conversations_left_out`]).
     pub conversations: Vec<[u8; 32]>,
     /// The protocol's local writes that queue its re-send requests, committed once.
     pub local: Vec<LocalWrite>,
@@ -156,6 +158,10 @@ pub struct RecoveryInfo {
     pub loss: ProviderLoss,
     /// Whether the app's steps of the recovery have all run.
     pub steps_done: bool,
+    /// How many counterparties of [`LossActions::conversations`] past
+    /// [`super::MAX_LOSS_CONVERSATIONS`] the app didn't add back: their writes are refused
+    /// `403 not_admitted` until a write of the app's admits them again (Switch spec 7).
+    pub conversations_left_out: u64,
 }
 
 /// The steps of following a loss, in order.
@@ -190,11 +196,27 @@ pub(crate) struct LossRecord {
     pub(crate) batch: Vec<u8>,
     /// The counterparties whose conversation entries are still to be added back.
     pub(crate) conversations: Vec<String>,
+    /// How many counterparties the protocol named past [`MAX_LOSS_CONVERSATIONS`], not
+    /// added back.
+    #[serde(default)]
+    pub(crate) conversations_left_out: u64,
 }
 
 impl LossRecord {
     pub(crate) fn done(&self) -> bool {
         self.step == LossStep::Done
+    }
+
+    /// Keep the counterparties the loss adds back, sorted and once each, at most
+    /// [`MAX_LOSS_CONVERSATIONS`] of them, so the record and its batches stay within the
+    /// store's sizes; and how many it leaves out, with them, in the same commit.
+    fn keep_conversations(&mut self, mut conversations: Vec<String>) {
+        conversations.sort();
+        conversations.dedup();
+        let left_out = conversations.len().saturating_sub(MAX_LOSS_CONVERSATIONS);
+        conversations.truncate(MAX_LOSS_CONVERSATIONS);
+        self.conversations = conversations;
+        self.conversations_left_out = u64::try_from(left_out).unwrap_or(u64::MAX);
     }
 
     fn view(&self) -> ProviderLoss {
@@ -387,6 +409,7 @@ impl App {
         Ok(self.loss_record().await?.map(|loss| RecoveryInfo {
             loss: loss.view(),
             steps_done: loss.done(),
+            conversations_left_out: loss.conversations_left_out,
         }))
     }
 
@@ -547,6 +570,7 @@ impl App {
             key_n: n,
             batch: batch.body().to_vec(),
             conversations: Vec::new(),
+            conversations_left_out: 0,
         };
         tx.put(keys::LOSS, &loss)?;
         tx.put(key::META, &self.state.meta)?;
@@ -618,16 +642,14 @@ impl App {
                 let copy = self.lists_copy().await?;
                 let me = self.state.meta.identity;
                 let may_add = self.state.cert.has_permission(Permission::ConversationAdd);
-                loss.conversations = actions
-                    .conversations
-                    .iter()
-                    .filter(|who| may_add && **who != me && !copy.deny.contains(who))
-                    .map(pubky_id)
-                    .collect();
-                loss.conversations.sort();
-                loss.conversations.dedup();
-                // Bounded, so the loss record and its batches stay within the store's sizes.
-                loss.conversations.truncate(MAX_LOSS_CONVERSATIONS);
+                loss.keep_conversations(
+                    actions
+                        .conversations
+                        .iter()
+                        .filter(|who| may_add && **who != me && !copy.deny.contains(who))
+                        .map(pubky_id)
+                        .collect(),
+                );
                 loss.step = LossStep::Conversations;
                 let mut tx = self.tx()?;
                 if local_writes_bytes(&actions.local) > MAX_STEP_LOCAL_BYTES {
@@ -898,5 +920,60 @@ impl App {
             tx.put(keys::LOSS, &*loss)?;
             self.commit(tx).await?;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn loss() -> LossRecord {
+        LossRecord {
+            lost_generation: 1,
+            generation: 2,
+            step: LossStep::Resend,
+            newest_head: None,
+            cursor_time_ms: 5,
+            declared_at_ms: Some(6),
+            old_offset_ms: None,
+            clock_offset_ms: 0,
+            key_n: 1,
+            batch: Vec::new(),
+            conversations: Vec::new(),
+            conversations_left_out: 0,
+        }
+    }
+
+    #[test]
+    fn test_loss_conversations_past_the_cap_are_counted_left_out() {
+        let named: Vec<String> = (0..MAX_LOSS_CONVERSATIONS + 3)
+            .rev()
+            .map(|n| format!("{n:08}"))
+            .chain(std::iter::once(format!("{:08}", 0)))
+            .collect();
+        let mut record = loss();
+        record.keep_conversations(named);
+        assert_eq!(record.conversations.len(), MAX_LOSS_CONVERSATIONS);
+        assert_eq!(record.conversations_left_out, 3);
+        // The first in key order, once each.
+        assert_eq!(
+            record.conversations.first().map(String::as_str),
+            Some("00000000")
+        );
+        assert!(record.conversations.windows(2).all(|w| w[0] < w[1]));
+        // Kept with the loss: the count reads back, and a record without it reads as none.
+        let bytes = serde_json::to_vec(&record).unwrap();
+        let read: LossRecord = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(read.conversations_left_out, 3);
+        let mut old: Value = serde_json::from_slice(&bytes).unwrap();
+        old.as_object_mut()
+            .unwrap()
+            .remove("conversations_left_out");
+        let old: LossRecord = serde_json::from_value(old).unwrap();
+        assert_eq!(old.conversations_left_out, 0);
+        // Within the cap, none is left out.
+        record.keep_conversations(vec!["b".into(), "a".into(), "a".into()]);
+        assert_eq!(record.conversations, ["a", "b"]);
+        assert_eq!(record.conversations_left_out, 0);
     }
 }
