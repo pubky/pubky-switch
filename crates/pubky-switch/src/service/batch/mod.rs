@@ -371,8 +371,8 @@ pub(super) async fn load_apps_and_rows(
     Ok((state, apps))
 }
 
-/// Delete the inbox entries every current target has passed (Switch wire 9.1), judged by
-/// the one rule for current apps ([`OpsState::is_current`]): after anything that changes
+/// Delete the inbox entries every current target has passed (Switch wire 9.1), current by
+/// [`OpsState::is_current`], expired certificates included: after anything that changes
 /// which apps are current outside a batch, such as a revocation or an `identity.json`
 /// delivery.
 pub(super) async fn release_entries(
@@ -685,7 +685,7 @@ impl Service {
                 before.claims.get(&entry.claim_key),
                 &entry,
                 writer,
-                &|app| before.current_without_expiry(app),
+                &|app| before.is_current(app),
             )
         };
         if !self.time.read().trusted && depends_on_time(&ops, &outcome_depends) {

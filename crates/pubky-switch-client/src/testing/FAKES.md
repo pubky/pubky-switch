@@ -94,13 +94,27 @@ service.
   at another generation than the switch's, is chained where the service answers `503`. The test call `deliver_identity` takes any document, without those
   checks, for scripting what another signer or a faulty service did. `forget_delivery_proof`
   makes a retry answer with no proof.
-- **`GET /apps`** (Switch wire 7.4.12): the apps the switch holds or the newest document
-  lists, with `current`, `record_cert`, `record_at`, `revoked_at`, `departed_at`,
-  `awaiting_rotation`, `full_bundle_requested`, `bundle_ranges`, `keys_through` and
-  `cert_expires_at`, and the
-  account's `identity`, `recovery` (`declared_at` its recovery record's time) and
-  `proof_generations`, from the same kept proofs as the delivery; no last-seen times,
-  attempts, unread counts or departures.
+- **`GET /apps`** (Switch wire 7.4.12), in `switch/signer.rs`: by the service's rules, member
+  by member:
+  - every app the switch holds, every App ID it keeps for good, and every app the newest
+    document lists. An App ID an enrollment named shows `revoked_at` at the enrollment's time;
+  - `current` by the full rule once the app has a record: listed, or renewed and open, with a
+    certificate that hasn't expired, and never once revoked, departed or kept. An app with no
+    record is current while it is listed and not kept;
+  - `last_seen`: the time of the app's latest request to the switch;
+  - `revoked_at`, `departed_at`, and `awaiting_rotation` for a departure until a delivered
+    version removes it at a higher data epoch. That stays done after a purge;
+  - `open_attempts`: the attempts the app owns that are open or `unknown`;
+  - `record_cert`, `record_at`, `full_bundle_requested`, `bundle_ranges` and
+    `cert_expires_at`;
+  - `keys_through` by the core's rule, counting only the stored parts the app's cursor has
+    passed;
+  - the account's `identity`, `recovery` (`declared_at` its recovery record's time), and
+    `proof_generations` from the same kept proofs as the delivery, the member left out when
+    there are none.
+
+  `unread_entries` and `sole_target_unread` are 0 and `lagging` is false, as on the service
+  until it serves `POST /inbox`.
 - **Moves and recovery** (Switch spec 12.5, 12.6, Switch wire 10): `import_into` copies the
   account in memory, with no manifest, chunks or export transfer; a recovery upload is kept
   and answered with fixed changes, merging nothing.
@@ -118,10 +132,11 @@ service.
 
 ## Signer flows tested only here
 
-The service in this workspace doesn't serve `GET /apps`, `POST /apps/{app_id}/leave` or
-`POST /apps/{app_id}/keys` yet, and the signer reads `GET /apps` before every signing step.
-So these signer flows run only against the scripted switch; re-run them against the service
-once it serves those calls:
+These signer flows run only against the scripted switch, whose `GET /apps` follows the
+service's rules (above). The service in this workspace serves `GET /apps`, but not yet
+`POST /apps/{app_id}/leave`, `POST /apps/{app_id}/keys` or `GET /apps/{app_id}/keys`, which
+departures, full-bundle requests and reading the stored parts need. Re-run them against the
+service once it serves those calls:
 
 - approval, renewals and reductions, their closings, and epoch completion
   (`crates/pubky-switch-signer/tests/approval.rs`, `renewal.rs`);

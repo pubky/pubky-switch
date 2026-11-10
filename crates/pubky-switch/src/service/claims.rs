@@ -78,7 +78,7 @@ impl Service {
         let apps = batch::load_apps(txn, held, time_ms)
             .await
             .map_err(|e| store_error(&e))?;
-        let current = |app: &[u8; 16]| apps.is_current(app);
+        let current = |app: &[u8; 16]| apps.is_served(app);
         let view = claim.view(&claim_key, time_ms, &current).to_value();
         let steps = if claim.tombstone { 0 } else { claim.step };
         let last_seq = match steps.checked_sub(1) {

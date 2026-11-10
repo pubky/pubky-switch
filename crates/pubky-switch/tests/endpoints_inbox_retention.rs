@@ -386,10 +386,12 @@ async fn test_inbox_entries_released_when_a_target_is_dropped_by_delivery() {
     let status = apps_status(&replay).await;
     assert_eq!(status_of(&status, "executor")["current"], json!(false));
     assert_eq!(entries(&replay).await, 1);
-    // B counts for the wallet alone, its only current target, and not for the executor.
+    // B is the wallet's alone among current targets. It still targets the executor, which
+    // hasn't read it: unread for both (Switch wire 7.4.12), and sole for the wallet only.
     assert_eq!(status_of(&status, "wallet")["unread_entries"], 1);
     assert_eq!(status_of(&status, "wallet")["sole_target_unread"], 1);
-    assert_eq!(status_of(&status, "executor")["unread_entries"], 0);
+    assert_eq!(status_of(&status, "executor")["unread_entries"], 1);
+    assert_eq!(status_of(&status, "executor")["sole_target_unread"], 0);
     // The wallet reads past B: it goes.
     move_cursor(&replay, "wallet", b).await;
     assert_eq!(entries(&replay).await, 0);
@@ -663,4 +665,320 @@ async fn test_inbox_flags_keep_the_most_frequent() {
         2
     );
     replay.db.drop_database().await.expect("drop");
+}
+
+/// The phone registers its app record and receive key, so it can be a target.
+async fn register_phone(replay: &Replay, at_ms: u64) {
+    let keys = vectors("keys.json");
+    let phone = app(&keys, "phone");
+    let ops = sign_batch(
+        &ed25519_dalek::SigningKey::from_bytes(&hex32(&phone["signing_secret_hex"])),
+        &hex32(&alice(&keys)["public_hex"]),
+        Some(app_id_of("phone")),
+        1,
+        [93; 16],
+        vec![
+            (
+                Vec::new(),
+                OpKind::AppPut {
+                    record: doc("phone app record"),
+                },
+            ),
+            (
+                Vec::new(),
+                OpKind::ReceiveKeyPut {
+                    record: doc("phone receive key record"),
+                },
+            ),
+        ],
+    )
+    .expect("batch");
+    let path = format!("/v1/{}/ops", alice_id());
+    let answer = replay
+        .service
+        .handle(app_request(
+            phone,
+            "POST",
+            &path,
+            OpsRequest::new(&ops, None).to_json(),
+            at_ms,
+        ))
+        .await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+}
+
+/// The signer renews the wallet's certificate, as a lapsed one is renewed (Switch spec 3.2):
+/// `cert.put` with a key bundle part made for it, then version 4 of alice's `identity.json`
+/// listing the new certificate, the earlier one renewed and open.
+async fn renew_wallet(replay: &Replay, at: &str) {
+    use pubky_switch_core::keys::IdentityKey;
+    use pubky_switch_core::records::{AppCert, AppCertBody};
+    let keys = vectors("keys.json");
+    let wallet = app(&keys, "wallet");
+    let app_keys = AppKeys::from_secrets(
+        hex32(&wallet["signing_secret_hex"]),
+        hex32(&wallet["bundle_secret_hex"]),
+    );
+    let alice_key: [u8; 32] = hex32(&alice(&keys)["public_hex"]);
+    let old = AppCert::verify(&doc("wallet certificate"), &alice_key).expect("old");
+    let identity = IdentityKey::from_secret(hex32(&alice(&keys)["secret_hex"]));
+    let issued = ms(at) - 1_000;
+    let renewed = AppCert::issue(
+        &identity,
+        AppCertBody::new(
+            alice_key,
+            app_keys.signing_public(),
+            app_keys.bundle_public(),
+            old.scopes().to_vec(),
+            old.permissions(),
+            issued,
+            issued + 180 * 86_400_000,
+        ),
+    )
+    .expect("cert");
+    let part = pubky_switch_core::records::seal_bundle_parts(&identity, &renewed, 1, 1, &|_| true)
+        .expect("bundle")
+        .remove(0);
+    let renewal = sign_batch(
+        &identity,
+        &alice_key,
+        None,
+        1,
+        [94; 16],
+        vec![
+            (
+                Vec::new(),
+                OpKind::CertPut {
+                    target_app_id: renewed.app_id(),
+                    cert: renewed.signed().clone(),
+                },
+            ),
+            (
+                Vec::new(),
+                OpKind::KeyBundlePut(pubky_switch_core::ops::KeyBundlePut {
+                    target_app_id: renewed.app_id(),
+                    bundle: part.bundle,
+                    first_epoch: part.first_epoch,
+                    last_epoch: part.last_epoch,
+                }),
+            ),
+        ],
+    )
+    .expect("batch");
+    let path = format!("/v1/{}/ops", alice_id());
+    let answer = replay
+        .service
+        .handle(signer_request(
+            "POST",
+            &path,
+            OpsRequest::new(&renewal, None).to_json(),
+            ms(at),
+        ))
+        .await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    let wallet_id = app_id_of("wallet");
+    let new_hash = renewed.hash();
+    let old_hash = old.hash();
+    let v3 = doc("alice identity.json");
+    let mut body: pubky_switch_core::records::IdentityBody =
+        serde_json::from_slice(&v3.body_bytes().expect("body")).expect("body");
+    body.version = 4;
+    if let Some(listed) = body
+        .apps
+        .iter_mut()
+        .find(|listed| listed.app_id == wallet_id)
+    {
+        listed.cert = new_hash;
+    }
+    body.renewed.push(pubky_switch_core::records::RenewedCert {
+        app_id: wallet_id,
+        cert: old_hash,
+        until: None,
+    });
+    let v4 = pubky_switch_core::records::IdentityDoc::sign(&identity, body)
+        .expect("sign")
+        .signed()
+        .clone();
+    let delivery = pubky_switch_core::http::IdentityDelivery {
+        identity: v4,
+        prev: Some(v3.doc_hash().expect("hash")),
+    }
+    .to_json();
+    let answer = replay
+        .service
+        .handle(signer_request(
+            "PUT",
+            &format!("/v1/{}/identity", alice_id()),
+            delivery,
+            ms(at),
+        ))
+        .await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+}
+
+#[tokio::test]
+async fn test_inbox_entry_waits_for_a_target_whose_certificate_lapsed() {
+    let Some(replay) = replay().await else { return };
+    let chain = vectors("chain.json");
+    serve_alice(&replay).await;
+    replay_batch(&replay, &chain, &[3, 4]).await;
+    assert_eq!(replay.db.give_out_seq(&alice_id()).await.expect("seq"), 5);
+    replay_batch(&replay, &chain, &[6]).await;
+    replay_batch(&replay, &chain, &[7, 8]).await;
+    set_time(&replay.clock, &at());
+    register_phone(&replay, ms(&at())).await;
+    wallet_op(
+        &replay,
+        OpKind::AllowPut {
+            pubky: hex32(&bob()["public_hex"]),
+            kind: AllowKind::Contact,
+        },
+        61,
+    )
+    .await;
+    deliver_bob(&replay).await;
+    let version = apps_version(&replay).await;
+    let answer = from_shop(
+        &replay,
+        sealed_to(&[receive_public("wallet"), receive_public("phone")], 12),
+        Some(version),
+        None,
+    )
+    .await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    let seq = entry_seq(&replay).await;
+    // The wallet's certificate lapses (2026-12-01); the phone's runs to 2027-01-01.
+    let later = "2026-12-01T00:00:10.000Z";
+    set_time(&replay.clock, later);
+    let status = body(
+        &replay
+            .service
+            .handle(signer_request(
+                "GET",
+                &format!("/v1/{}/apps", alice_id()),
+                Vec::new(),
+                ms(later),
+            ))
+            .await,
+    );
+    // Not served, but still current: the entry it hasn't read counts for it.
+    assert_eq!(status_of(&status, "wallet")["current"], json!(false));
+    assert_eq!(status_of(&status, "wallet")["unread_entries"], 1);
+    // The phone reads past the entry: it stays, waiting for the wallet.
+    let keys = vectors("keys.json");
+    let path = format!("/v1/{}/ops", alice_id());
+    let cursor = OpsRequest::new(&[], Some(Position { generation: 1, seq })).to_json();
+    let answer = replay
+        .service
+        .handle(app_request(
+            app(&keys, "phone"),
+            "POST",
+            &path,
+            cursor,
+            ms(later),
+        ))
+        .await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    assert_eq!(entries(&replay).await, 1);
+    // Not served, the wallet is no target: the phone's append wrapped to it is stale, naming
+    // it not current, and one sealed before the wallet was reachable needn't wrap to it.
+    let from_phone = |envelope: Vec<u8>, apps_version: i64| {
+        app_request(
+            app(&keys, "phone"),
+            "POST",
+            &format!("/v1/{}/inbox?apps_version={apps_version}", alice_id()),
+            envelope,
+            ms(later),
+        )
+    };
+    let answer = replay
+        .service
+        .handle(from_phone(
+            sealed_to(&[receive_public("wallet"), receive_public("phone")], 13),
+            version,
+        ))
+        .await;
+    assert_eq!(code_of(&answer), (409, json!("stale_key")));
+    assert_eq!(
+        body(&answer)["current"]["not_current"],
+        json!([app(&keys, "wallet")["app_id"]])
+    );
+    let answer = replay
+        .service
+        .handle(from_phone(sealed_to(&[receive_public("phone")], 14), 0))
+        .await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    let own = entry_seq(&replay).await;
+    move_cursor_at(&replay, "phone", own, later).await;
+    // Renewed, the wallet reads it in its feed, then moves past it, and it goes.
+    renew_wallet(&replay, later).await;
+    let feed = body(
+        &replay
+            .service
+            .handle(app_request(
+                app(&keys, "wallet"),
+                "GET",
+                &format!("/v1/{}/feed?after=1:{}", alice_id(), seq - 1),
+                Vec::new(),
+                ms(later),
+            ))
+            .await,
+    );
+    assert!(
+        feed["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .any(|item| item["type"] == "entry" && item["seq"] == seq),
+        "{feed}"
+    );
+    move_cursor_at(&replay, "wallet", seq, later).await;
+    assert_eq!(entries(&replay).await, 0);
+    replay.db.drop_database().await.expect("drop");
+}
+
+async fn move_cursor_at(replay: &Replay, name: &str, seq: u64, at: &str) {
+    let keys = vectors("keys.json");
+    let path = format!("/v1/{}/ops", alice_id());
+    let cursor = OpsRequest::new(&[], Some(Position { generation: 1, seq })).to_json();
+    let answer = replay
+        .service
+        .handle(app_request(app(&keys, name), "POST", &path, cursor, ms(at)))
+        .await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
 }

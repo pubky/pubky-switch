@@ -6,6 +6,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use pubky_switch_core::chain::{ItemType, ProofState, item_hash};
+use pubky_switch_core::claims::Outcome;
 use pubky_switch_core::enc::{b64, zbase32_encode};
 use pubky_switch_core::http::{ErrorCode, IdentityDelivery};
 use pubky_switch_core::json::parse_json;
@@ -139,6 +140,7 @@ impl Inner {
         if creating {
             let kept: BTreeSet<[u8; 16]> = enrollment.revoked_apps().iter().copied().collect();
             self.kept_app_ids = kept.into_iter().collect();
+            self.kept_at = self.now();
         }
         Ok((200, value))
     }
@@ -173,6 +175,16 @@ impl Inner {
             self.listed_at_epoch
                 .entry(app.app_id)
                 .or_insert(doc.data_epoch());
+        }
+        // A departure's rotation is done once a version removes the app at a higher data
+        // epoch than at its departure, and stays done, also after a purge (Switch wire 7.4.12).
+        for (id, app) in &mut self.apps {
+            if let Some((_, epoch)) = app.departed_at
+                && doc.data_epoch() > epoch
+                && doc.body().removed.iter().any(|r| &r.app_id == id)
+            {
+                app.rotated = true;
+            }
         }
         self.doc = Some(doc.clone());
         self.delivery_proof = Some(proof.clone());
@@ -251,28 +263,27 @@ impl Inner {
         }
     }
 
-    /// The newest data epoch through which `app` holds every key (Switch wire 7.4.12): the
-    /// epoch of the first version that listed it, raised by each stored part that continues
-    /// it, as if the app had fetched every part; `None` for an app never listed.
+    /// The newest data epoch through which `app` holds every key (Switch wire 7.4.12), by
+    /// the core's rule: the epoch of the first version that listed it, raised by each stored
+    /// part its cursor has passed that continues it; `None` for an app never listed.
     fn keys_through(&self, app: &[u8; 16]) -> Option<u64> {
-        let mut held = *self.listed_at_epoch.get(app)?;
-        let mut ranges: Vec<(u64, u64)> = self
+        let start = *self.listed_at_epoch.get(app)?;
+        let spans: Vec<pubky_switch_core::ops::StoredPart> = self
             .bundles
             .get(app)
             .map(|parts| {
                 parts
                     .iter()
-                    .map(|(p, _)| (p.first_epoch, p.last_epoch))
+                    .map(|(p, seq)| pubky_switch_core::ops::StoredPart {
+                        first_epoch: p.first_epoch,
+                        last_epoch: p.last_epoch,
+                        seq: *seq,
+                    })
                     .collect()
             })
             .unwrap_or_default();
-        ranges.sort_unstable();
-        for (first, last) in ranges {
-            if first <= held.saturating_add(1) {
-                held = held.max(last);
-            }
-        }
-        Some(held)
+        let cursor = self.apps.get(app).map_or(0, |a| a.cursor);
+        pubky_switch_core::ops::keys_through(Some(start), &spans, cursor)
     }
 
     /// The kept proofs' generations, each with the key that verifies its proofs: an earlier
@@ -317,10 +328,12 @@ impl Inner {
 
     /// `GET /v1/{id}/apps` (Switch wire 7.4.12): every app the switch holds or the newest
     /// `identity.json` lists, the recovery in progress, the newest document, and the
-    /// generations the kept proofs name but those the newest document declares lost. The
-    /// scripted switch reports no last-seen times.
+    /// generations the kept proofs name but those the newest document declares lost, the
+    /// member left out when there are none. It lists the App IDs an enrollment named too,
+    /// revoked from the enrollment's time.
     pub(super) fn apps_answer(&self) -> Answer {
         let mut ids: BTreeSet<[u8; 16]> = self.apps.keys().copied().collect();
+        ids.extend(self.kept_app_ids.iter().copied());
         if let Some(doc) = &self.doc {
             ids.extend(doc.body().apps.iter().map(|a| a.app_id));
         }
@@ -328,7 +341,8 @@ impl Inner {
             .iter()
             .map(|id| {
                 let held = self.apps.get(id);
-                let departed = held.is_some_and(|a| a.departed);
+                let enrolled_kept = self.kept_app_ids.contains(id);
+                let kept = enrolled_kept || held.is_some_and(|a| a.departed);
                 let listed = self
                     .doc
                     .as_ref()
@@ -345,19 +359,23 @@ impl Inner {
                     .unwrap_or_default();
                 json!({
                     "app_id": zbase32_encode(id),
-                    "current": listed && !departed,
-                    "last_seen": null,
-                    "revoked_at": held.and_then(|a| a.revoked_at).map(pubky_switch_core::time::rfc3339),
+                    // By the full rule once the app has a record: listed, or renewed and open,
+                    // with a certificate that hasn't expired (Switch spec 3.4).
+                    "current": if held.is_some_and(|a| a.cert.is_some()) {
+                        !enrolled_kept && self.app_current(&self.apps, id)
+                    } else {
+                        listed && !kept
+                    },
+                    "last_seen": held.and_then(|a| a.last_seen).map(pubky_switch_core::time::rfc3339),
+                    "revoked_at": held
+                        .and_then(|a| a.revoked_at)
+                        .or(enrolled_kept.then_some(self.kept_at))
+                        .map(pubky_switch_core::time::rfc3339),
                     "departed_at": held
                         .and_then(|a| a.departed_at)
                         .map(|(at, _)| pubky_switch_core::time::rfc3339(at)),
-                    "awaiting_rotation": held.and_then(|a| a.departed_at).is_some_and(|(_, epoch)| {
-                        !self.doc.as_ref().is_some_and(|doc| {
-                            doc.body().removed.iter().any(|r| &r.app_id == id)
-                                && doc.data_epoch() > epoch
-                        })
-                    }),
-                    "open_attempts": [],
+                    "awaiting_rotation": held.is_some_and(|a| a.departed_at.is_some() && !a.rotated),
+                    "open_attempts": self.open_attempts(id),
                     "unread_entries": 0,
                     "sole_target_unread": 0,
                     "record_cert": held.and_then(|a| a.cert.as_ref()).map(|c| b64(&c.hash())),
@@ -388,10 +406,32 @@ impl Inner {
             .as_ref()
             .and_then(|doc| serde_json::to_value(doc.signed()).ok())
             .unwrap_or(Value::Null);
-        (
-            200,
-            json!({ "apps": apps, "identity": identity, "recovery": recovery,
-                    "proof_generations": proof_generations }),
-        )
+        let mut answer = json!({ "apps": apps, "identity": identity, "recovery": recovery });
+        // Left out when no kept proof names a generation (Switch wire 7.4.12).
+        if !proof_generations.is_empty() {
+            answer["proof_generations"] = json!(proof_generations);
+        }
+        (200, answer)
+    }
+
+    /// The attempts `app` owns that are open or `unknown`, as `GET /apps` lists them (Switch
+    /// wire 7.4.12).
+    fn open_attempts(&self, app: &[u8; 16]) -> Vec<Value> {
+        self.shared
+            .claims
+            .iter()
+            .flat_map(|(claim_key, claim)| {
+                claim
+                    .attempts
+                    .iter()
+                    .filter(|attempt| &attempt.owner == app)
+                    .filter(|attempt| matches!(attempt.outcome, Outcome::Open | Outcome::Unknown))
+                    .map(move |attempt| {
+                        json!({ "claim_key": b64(claim_key),
+                                "attempt_id": b64(&attempt.attempt_id),
+                                "outcome": attempt.outcome.as_str() })
+                    })
+            })
+            .collect()
     }
 }

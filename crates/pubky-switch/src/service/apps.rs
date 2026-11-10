@@ -122,10 +122,11 @@ pub(crate) fn statuses(
         let row = rows.get(&id).copied();
         let kept_id = kept.get(&id).copied();
         let held = state.apps.get(&id);
-        // An app with a record is current by the full rule (Switch spec 3.4); one the
-        // document lists that hasn't registered yet, while it isn't kept.
+        // An app with a record: `current` is served, its certificate unexpired too, as
+        // `GET /apps` has reported it since it was first served; one the document lists that
+        // hasn't registered yet, while it isn't kept.
         let current = if held.is_some_and(|app| app.record.is_some()) {
-            state.is_current(&id)
+            state.is_served(&id)
         } else {
             kept_id.is_none() && doc.is_some_and(|doc| doc.listed_cert(&id).is_some())
         };
@@ -231,8 +232,8 @@ impl Service {
     ) -> Result<Answer, ApiError> {
         let head = txn.head().clone();
         let mut view = txn.apps_view().await.map_err(|e| store_error(&e))?;
-        // Unread entries count for the apps current now, by the one rule (Switch wire
-        // 7.4.12, 9.1).
+        // `sole_target_unread` counts current targets (Switch wire 7.4.12), expired ones
+        // included, as retention does (9.1).
         let current = view_state(head.identity_key, head.generation, &view, held, time_ms)
             .map_err(|e| store_error(&e))?
             .current_app_ids();
