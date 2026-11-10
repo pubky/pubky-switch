@@ -14,13 +14,14 @@ use std::sync::Arc;
 use common::*;
 use pubky_switch_client::store::{Fault, FaultStore, MemoryStore, StateStore};
 use pubky_switch_client::testing::{Fault as SwitchFault, SWITCH_ORIGIN};
-use pubky_switch_core::keys::AppKeys;
+use pubky_switch_core::keys::{AppKeys, IdentityKey};
 use pubky_switch_core::ops::OpKind;
 use pubky_switch_core::records::{
-    IDENTITY_PATH, IdentityDoc, KeyBundleContents, RemovedApp, app_record_path,
+    IDENTITY_PATH, IdentityDoc, KeyBundleContents, Limits, RemovedApp, SIGNER_BACKUP_PATH,
+    SignerBackup, SignerRecords, app_record_path,
 };
 use pubky_switch_signer::Alert;
-use pubky_switch_signer::{CertChange, Refusal, Signer, SignerError, UserConfirmed};
+use pubky_switch_signer::{CertChange, Refusal, Signer, SignerError, SignerStatus, UserConfirmed};
 
 const DAY_MS: u64 = 86_400_000;
 
@@ -236,17 +237,20 @@ async fn test_revocation_without_a_time_is_an_error_with_an_alert() {
 }
 
 #[tokio::test]
-async fn test_revocation_is_kept_when_the_backup_cant_be_checked() {
-    // The Homeserver is down, so the backup can't show whether another install took over:
-    // nothing is sent yet, the revocation is kept, and the next run carries it out.
+async fn test_revocation_goes_out_when_the_backup_cant_be_read() {
+    // The Homeserver is down, and the switch's copy is this install's mark: no other install
+    // took over there, so the revocation goes out. The removal waits for the Homeserver.
     let world = World::new();
     let (mut signer, _) = world.enrolled().await;
     let (a, _) = two_joined(&world, &mut signer).await;
     let id = a.keys.app_id_bytes();
     *world.homeserver.down.lock().unwrap() = true;
     signer.revoke(id, None, confirmed()).await.unwrap_err();
-    assert!(refused_for_good(&signer, &a));
-    assert!(!world.switch.app(&id).departed);
+    assert!(world.switch.app(&id).departed);
+    assert!(signer.alerts().contains(&Alert::RevocationPending {
+        app_id: id,
+        at_switch: true,
+    }));
     *world.homeserver.down.lock().unwrap() = false;
     signer.run_due().await.unwrap();
     assert!(
@@ -257,6 +261,204 @@ async fn test_revocation_is_kept_when_the_backup_cant_be_checked() {
             .listed_cert(&id)
             .is_none()
     );
+}
+
+#[tokio::test]
+async fn test_revocation_isnt_sent_with_an_unreadable_backup_and_a_rollback() {
+    // The switch shows an older version, so it doesn't confirm this install, and the backup
+    // can't be read: nothing shows that no other install took over, so nothing is sent.
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let (a, _) = two_joined(&world, &mut signer).await;
+    let id = a.keys.app_id_bytes();
+    let before = signer.identity_doc().unwrap().unwrap();
+    signer.set_record_max_age(Some(86_400)).await.unwrap();
+    world.switch.deliver_identity(&before).unwrap();
+    *world.homeserver.down.lock().unwrap() = true;
+    let error = signer.revoke(id, None, confirmed()).await.unwrap_err();
+    assert!(matches!(error, SignerError::Homeserver(_)), "{error:?}");
+    assert!(!world.switch.app(&id).departed);
+    assert!(signer.alerts().contains(&Alert::RevocationPending {
+        app_id: id,
+        at_switch: false,
+    }));
+}
+
+#[tokio::test]
+async fn test_revocation_isnt_sent_when_the_backup_shows_a_take_over() {
+    // The switch's copy is this install's mark, but the backup holds another install's newer
+    // version: it took over, so no revocation goes out.
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let (a, b) = two_joined(&world, &mut signer).await;
+    let id = a.keys.app_id_bytes();
+    let newest = signer.identity_doc().unwrap().unwrap();
+    let certs = [
+        world.switch.app(&id).cert.unwrap(),
+        world.switch.app(&b.keys.app_id_bytes()).cert.unwrap(),
+    ];
+    let records = SignerRecords::new(
+        IdentityKey::from_secret(SECRET),
+        world.other_install_version(&newest, [7; 16]),
+        &[],
+        &certs,
+        Limits::default(),
+        &[],
+        Some(newest.hash()),
+    )
+    .unwrap();
+    let backup = SignerBackup::seal(&world.key, &records).unwrap();
+    world
+        .homeserver
+        .set(SIGNER_BACKUP_PATH, serde_json::to_vec(&backup).unwrap());
+    assert_eq!(
+        signer.revoke(id, None, confirmed()).await.unwrap_err(),
+        SignerError::NotNamed { install: [7; 16] }
+    );
+    assert!(!world.switch.app(&id).departed);
+}
+
+#[tokio::test]
+async fn test_revocation_while_a_delivery_answer_is_lost_goes_out_and_the_flow_recovers() {
+    // A version reached the switch and its answer was lost. The switch's copy is that
+    // version, this install's own in its flow: the revocation goes out, the records aren't
+    // taken as behind, and the next run finishes the flow and removes the app.
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let (a, _) = two_joined(&world, &mut signer).await;
+    let id = a.keys.app_id_bytes();
+    world.switch.fail_next(SwitchFault::LoseAnswer {
+        path: "/identity".into(),
+    });
+    signer.set_record_max_age(Some(86_400)).await.unwrap_err();
+    signer.revoke(id, None, confirmed()).await.unwrap_err();
+    assert!(world.switch.app(&id).departed);
+    assert!(!matches!(
+        signer.status(),
+        SignerStatus::RecordsBehind { .. }
+    ));
+    signer.run_due().await.unwrap();
+    let doc = signer.identity_doc().unwrap().unwrap();
+    assert!(doc.listed_cert(&id).is_none());
+    assert_eq!(doc.body().record_max_age, Some(86_400));
+    assert_eq!(signer.status(), SignerStatus::Signing);
+}
+
+#[tokio::test]
+async fn test_pending_revocation_on_the_error_path_with_a_lost_answer_goes_out() {
+    // A revocation's first send failed, then a version's answer was lost, and the run's
+    // re-delivery can't connect: the run's error path still revokes at the switch, the
+    // records aren't taken as behind, and the next run recovers.
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let (a, _) = two_joined(&world, &mut signer).await;
+    let id = a.keys.app_id_bytes();
+    world.switch.fail_next(SwitchFault::Unreachable {
+        path: "/revoke".into(),
+        after: 0,
+    });
+    signer.revoke(id, None, confirmed()).await.unwrap_err();
+    world.switch.fail_next(SwitchFault::LoseAnswer {
+        path: "/identity".into(),
+    });
+    signer.set_record_max_age(Some(86_400)).await.unwrap_err();
+    world.switch.fail_next(SwitchFault::Unreachable {
+        path: "/identity".into(),
+        after: 0,
+    });
+    signer.run_due().await.unwrap_err();
+    assert!(world.switch.app(&id).departed);
+    assert!(!matches!(
+        signer.status(),
+        SignerStatus::RecordsBehind { .. }
+    ));
+    signer.run_due().await.unwrap();
+    let doc = signer.identity_doc().unwrap().unwrap();
+    assert!(doc.listed_cert(&id).is_none());
+    assert_eq!(doc.body().record_max_age, Some(86_400));
+}
+
+#[tokio::test]
+async fn test_revocation_pending_isnt_at_the_switch_when_nothing_was_sent() {
+    // The switch can't be reached for the ownership check, so no revocation is sent: the
+    // alert says the switch still serves the app.
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let (a, _) = two_joined(&world, &mut signer).await;
+    let id = a.keys.app_id_bytes();
+    world.switch.fail_next(SwitchFault::Unreachable {
+        path: "/apps".into(),
+        after: 0,
+    });
+    signer.revoke(id, None, confirmed()).await.unwrap_err();
+    assert!(!world.switch.app(&id).departed);
+    assert!(signer.alerts().contains(&Alert::RevocationPending {
+        app_id: id,
+        at_switch: false,
+    }));
+}
+
+#[tokio::test]
+async fn test_cooperative_closing_skips_a_cut_off_app() {
+    // `a` was renewed and took its new certificate, so its renewal is closable; then its
+    // revocation is kept but not yet at the switch. Its renewal isn't closed: it goes with
+    // the app when the app is removed.
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let (a, _) = two_joined(&world, &mut signer).await;
+    let id = a.keys.app_id_bytes();
+    let change = CertChange {
+        scopes: None,
+        expires_at: Some(START_MS + 400 * DAY_MS),
+    };
+    signer.renew(id, change).await.unwrap();
+    let new = world.switch.app(&id).renewed.unwrap();
+    world.clock.advance_ms(3_600_000);
+    let record = pubky_switch_core::records::AppRecord::sign(
+        &a.keys,
+        pubky_switch_core::records::AppRecordBody::new(&new, Vec::new(), START_MS + 3_600_000),
+    )
+    .unwrap();
+    world
+        .switch
+        .app_op(
+            &a.keys,
+            OpKind::AppPut {
+                record: record.signed().clone(),
+            },
+        )
+        .unwrap();
+    world.switch.fail_next(SwitchFault::Unreachable {
+        path: "/revoke".into(),
+        after: 0,
+    });
+    signer.revoke(id, None, confirmed()).await.unwrap_err();
+    assert!(signer.complete_renewals().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_failing_record_delete_still_raises_the_grant_reminder() {
+    // The record's deletion keeps failing: the grant reminder is raised all the same, the
+    // run goes on, and the deletion stays owed until it succeeds.
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let (a, _) = two_joined(&world, &mut signer).await;
+    let id = a.keys.app_id_bytes();
+    world
+        .homeserver
+        .set(&app_record_path(&id), b"a's record".to_vec());
+    *world.homeserver.failing_path.lock().unwrap() = Some(app_record_path(&id));
+    signer.revoke(id, None, confirmed()).await.unwrap();
+    assert!(
+        signer
+            .alerts()
+            .contains(&Alert::GrantRevocationOwed { app_id: id })
+    );
+    signer.run_due().await.unwrap();
+    assert!(world.homeserver.file(&app_record_path(&id)).is_some());
+    *world.homeserver.failing_path.lock().unwrap() = None;
+    signer.run_due().await.unwrap();
+    assert!(world.homeserver.file(&app_record_path(&id)).is_none());
 }
 
 #[tokio::test]

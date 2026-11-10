@@ -84,16 +84,17 @@ impl Signer {
         if !state.tombstones.contains(&app_id) {
             state.tombstones.push(app_id);
         }
-        let revoked_at = state
-            .revoking
-            .iter()
-            .find(|r| r.app_id == app_id)
-            .and_then(|r| r.revoked_at);
+        let held = state.revoking.iter().find(|r| r.app_id == app_id);
+        let (revoked_at, taken) = (
+            held.and_then(|r| r.revoked_at),
+            held.is_some_and(|r| r.taken),
+        );
         state.revoking.retain(|r| r.app_id != app_id);
         state.revoking.push(Revoking {
             app_id,
             distrust_from,
             revoked_at,
+            taken,
         });
         self.commit(state, self.flow.clone()).await?;
         let completed = self.remove_now().await;
@@ -108,11 +109,14 @@ impl Signer {
             Err(error) => (Vec::new(), Some(error)),
         };
         let own = failures.into_iter().find(|(app, _)| *app == app_id);
+        // At the switch only once its answer said so.
+        let at_switch = self
+            .state
+            .revoking
+            .iter()
+            .any(|r| r.app_id == app_id && r.taken);
         let mut state = self.state.clone();
-        state.alert(Alert::RevocationPending {
-            app_id,
-            at_switch: own.is_none(),
-        });
+        state.alert(Alert::RevocationPending { app_id, at_switch });
         self.commit(state, self.flow.clone()).await?;
         Err(match (own, error) {
             (Some((_, failed)), _) => failed,
@@ -231,21 +235,38 @@ impl Signer {
     /// install that took over or a newer version of this install's own (Switch spec 4.3,
     /// 12.8; Switch wire 3.13). A rollback or an equivocation the copy shows doesn't stop
     /// it: a revocation signs nothing new, and goes out while an alarm holds signing back.
+    ///
+    /// The copy of the version a flow in progress delivers, as after a lost answer, is this
+    /// install's own: it is left for [`Signer::resume`], never taken as records behind. When
+    /// the copy confirms this install, its mark or that version, a backup that can't be read
+    /// adds nothing, since a take-over shows at the switch first (Switch wire 3.13), and the
+    /// revocation, the user's safety step, goes out. A backup that is read and shows a
+    /// take-over or records behind still stops it, and so does an unreadable one when the
+    /// copy shows an alarm.
     async fn named_for_revoking(&mut self) -> Result<Named> {
         self.check_named()?;
         let held = self.service_client()?.apps().await?.identity;
-        match self.confirm_copy(held.as_ref()).await {
-            Ok(()) | Err(SignerError::Alarm(_)) => {}
-            Err(error) => return Err(error),
-        }
-        let found = self
-            .env
-            .homeserver
-            .get(SIGNER_BACKUP_PATH)
-            .await
-            .map_err(SignerError::Homeserver)?;
-        if let Some(found) = found.and_then(|bytes| self.open_backup(&bytes).transpose()) {
-            self.judge_backup(&found?).await?;
+        let in_flow = match &self.flow {
+            Some(Flow::Deliver { doc, .. } | Flow::Renew { doc, .. }) => Some(doc.clone()),
+            _ => None,
+        };
+        let confirmed = if held.is_some() && held == in_flow {
+            true
+        } else {
+            match self.confirm_copy(held.as_ref()).await {
+                Ok(()) => true,
+                Err(SignerError::Alarm(_)) => false,
+                Err(error) => return Err(error),
+            }
+        };
+        match self.env.homeserver.get(SIGNER_BACKUP_PATH).await {
+            Ok(found) => {
+                if let Some(found) = found.and_then(|bytes| self.open_backup(&bytes).transpose()) {
+                    self.judge_backup(&found?).await?;
+                }
+            }
+            Err(_) if confirmed => {}
+            Err(error) => return Err(SignerError::Homeserver(error)),
         }
         Named::check(&self.state)
     }
@@ -278,6 +299,18 @@ impl Signer {
                     continue;
                 }
             };
+            if !self
+                .state
+                .revoking
+                .iter()
+                .any(|r| &r.app_id == app_id && r.taken)
+            {
+                let mut state = self.state.clone();
+                for revoking in state.revoking.iter_mut().filter(|r| &r.app_id == app_id) {
+                    revoking.taken = true;
+                }
+                self.commit(state, self.flow.clone()).await?;
+            }
             // The proof the client verified dates the revocation; one sent again gets none.
             let at = answer
                 .proofs
@@ -385,17 +418,24 @@ impl Signer {
             // Once no version lists the app: removed, or purged from `removed` since.
             .filter(|app| newest.listed_cert(app).is_none())
             .collect();
+        // The grant reminder is raised whether or not the record goes now; a deletion that
+        // fails stays owed, and doesn't hold back the next app's.
         for app_id in done {
-            self.env
+            let deleted = self
+                .env
                 .homeserver
                 .delete(&app_record_path(&app_id))
                 .await
-                .map_err(SignerError::Homeserver)?;
+                .is_ok();
             let mut state = self.state.clone();
-            state.cleanup.retain(|a| *a != app_id);
-            state.revoking.retain(|r| r.app_id != app_id);
+            if deleted {
+                state.cleanup.retain(|a| *a != app_id);
+                state.revoking.retain(|r| r.app_id != app_id);
+            }
             state.alert(Alert::GrantRevocationOwed { app_id });
-            self.commit(state, self.flow.clone()).await?;
+            if state != self.state {
+                self.commit(state, self.flow.clone()).await?;
+            }
         }
         Ok(())
     }

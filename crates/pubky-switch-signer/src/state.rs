@@ -163,6 +163,9 @@ pub(crate) struct Revoking {
     /// The revocation's time, from the proof of the switch's answer (Switch wire 7.4.12).
     #[serde(default)]
     pub(crate) revoked_at: Option<u64>,
+    /// Whether the switch answered the revocation, so it serves the app no more.
+    #[serde(default)]
+    pub(crate) taken: bool,
 }
 
 /// A full-bundle request the switch refused an answer to, by the time the app asked.
