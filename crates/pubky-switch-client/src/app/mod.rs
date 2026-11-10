@@ -1568,8 +1568,11 @@ impl App {
     }
 
     /// `POST /ops` with a batch whose body the caller committed: the answer's head goes to
-    /// the chain view, and a signed answer that contradicts itself is a rollback.
+    /// the chain view, and a signed answer that contradicts itself is a rollback. Nothing
+    /// but a provider loss's registration goes before the loss's upload (Switch spec 12.6
+    /// step 3).
     pub(crate) async fn submit(&mut self, batch: &Batch) -> Result<Submitted, AppError> {
+        self.refuse_before_upload_of(Some(batch)).await?;
         let result = self.client.submit(batch).await;
         let submitted = self.take(result).await?;
         if let Err(alarm) = self.note_answer_head(submitted.head, &submitted.proofs) {

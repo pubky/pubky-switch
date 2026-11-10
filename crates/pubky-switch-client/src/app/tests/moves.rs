@@ -1428,6 +1428,12 @@ async fn test_loss_writes_wait_for_the_upload() {
         matches!(error, AppError::Refused(crate::app::Refusal::NotNow(_))),
         "{error:?}"
     );
+    // Nor does a rotation go, whose key is kept for later (Switch spec 12.6 step 3).
+    let error = app.rotate().await.unwrap_err();
+    assert!(
+        matches!(error, AppError::Refused(crate::app::Refusal::NotNow(_))),
+        "{error:?}"
+    );
     assert_eq!(lost.next.applied().len(), applied);
     // Once the upload went, the app writes.
     app.receive(None).await.unwrap();

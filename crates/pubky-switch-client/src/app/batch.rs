@@ -481,8 +481,20 @@ impl App {
     /// writes nothing at the new service: it uploads before its first write there (Switch
     /// spec 12.6 step 3, Switch wire 7.4.14).
     pub(crate) async fn refuse_before_upload(&self) -> Result<(), AppError> {
+        self.refuse_before_upload_of(None).await
+    }
+
+    /// [`App::refuse_before_upload`] for one batch: only the loss's own registration batch
+    /// (Switch spec 12.6 step 1) goes before the upload. Every other write waits, a received
+    /// message's effect, a cursor move, a receive key rotation and the record of a renewal
+    /// included.
+    pub(crate) async fn refuse_before_upload_of(
+        &self,
+        batch: Option<&Batch>,
+    ) -> Result<(), AppError> {
         if let Some(loss) = self.loss_record().await?
             && loss.step <= LossStep::Upload
+            && batch.is_none_or(|batch| batch.body() != loss.batch.as_slice())
         {
             return Err(Refusal::NotNow(
                 "Switch spec 12.6 step 3: the app uploads its evidence before it writes at the \
