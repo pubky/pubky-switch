@@ -77,6 +77,18 @@ pub struct ReceivedMessage {
     pub context: Option<Value>,
     /// Whether the entry was stored locally before and the cursor is past it already.
     pub parked: bool,
+    /// Whether the host released the entry ([`super::App::release_parked`]) after its
+    /// effect was uncertain ([`super::AppEvent::EffectUncertain`]): the app no longer counts
+    /// it processed, and builds its effect again. The host releases it only once it knows
+    /// the effect wasn't applied; a protocol that may have compensated from its own state
+    /// since, or can't tell, declines with [`Outcome::Drop`], which keeps the message
+    /// processed.
+    ///
+    /// An effect run again this way can apply twice only through what carries no
+    /// condition: local writes, and operations without conditions, such as a list change.
+    /// A claim's step and a record write's expected version are checked by the service,
+    /// which refuses a second application.
+    pub released: bool,
     /// After a `409 conflict` on the effect's batch: the answer's `current`, so the
     /// protocol builds its effect again on what the service holds now.
     pub conflict: Option<Value>,

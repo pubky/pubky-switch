@@ -281,6 +281,24 @@ pub enum AppEvent {
         /// The effect's own `attempt`s: whether each was applied can't be known.
         attempts: Vec<ClaimAttempt>,
     },
+    /// An entry the host released ([`super::App::release_parked`]) was a duplicate when it
+    /// ran: the message was processed in the meantime, such as from a re-send that arrived
+    /// first, so the released entry went without its effect. A duty event, so the host
+    /// that released it learns how it ended.
+    ReleasedDuplicate {
+        /// The duty event's ID.
+        id: EventId,
+        /// The `seq` the entry was read at.
+        seq: u64,
+        /// The entry's local ID while it was stored.
+        stored_id: u64,
+        /// The sender identity.
+        sender: [u8; 32],
+        /// The message ID.
+        msg_id: String,
+        /// Whether the bytes differ from the message processed before.
+        conflicting: bool,
+    },
     /// An entry stored locally was processed.
     Unparked {
         /// The `seq` the entry was read at.
@@ -669,6 +687,7 @@ impl AppEvent {
             Self::Parked { id, .. } => *id,
             Self::EffectRefused { id, .. }
             | Self::EffectUncertain { id, .. }
+            | Self::ReleasedDuplicate { id, .. }
             | Self::KeptBatchDropped { id, .. }
             | Self::BatchRefused { id, .. }
             | Self::RestoreLeftBehind { id, .. }
@@ -781,6 +800,14 @@ pub(crate) enum Duty {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         attempts: Vec<ClaimAttempt>,
     },
+    ReleasedDuplicate {
+        seq: u64,
+        stored_id: u64,
+        #[serde(with = "serde_b64")]
+        sender: [u8; 32],
+        msg_id: String,
+        conflicting: bool,
+    },
     KeptBatchDropped {
         #[serde(with = "serde_b64")]
         batch_id: [u8; 16],
@@ -863,6 +890,20 @@ impl Duty {
                 msg_id,
                 kind,
                 attempts,
+            },
+            Self::ReleasedDuplicate {
+                seq,
+                stored_id,
+                sender,
+                msg_id,
+                conflicting,
+            } => AppEvent::ReleasedDuplicate {
+                id,
+                seq,
+                stored_id,
+                sender,
+                msg_id,
+                conflicting,
             },
             Self::KeptBatchDropped { batch_id } => AppEvent::KeptBatchDropped { id, batch_id },
             Self::BatchRefused { batch_id, code } => AppEvent::BatchRefused { id, batch_id, code },
@@ -958,7 +999,11 @@ pub enum ParkReason {
     Uncertain,
     /// It was stored as [`ParkReason::Uncertain`], and the host released it
     /// ([`super::App::release_parked`]): its processed pair is gone, and a later read tries
-    /// it again as a fresh receive.
+    /// it again as a fresh receive, with [`super::ReceivedMessage::released`] set. A run
+    /// whose effect is uncertain again is stored as [`ParkReason::Uncertain`] again.
+    ///
+    /// A build earlier than schema 3 (`STATE.md`) refuses a store that holds this reason, or
+    /// [`ParkReason::EffectTooLarge`], from the schema version alone, so neither is misread.
     Released,
 }
 

@@ -631,11 +631,8 @@ impl App {
         // app's own record of processed messages.
         let pair = (entry.sender, received.message.msg_id.clone());
         if let Some(hash) = read.pairs.get(&pair).copied() {
-            self.unpark(entry.stored, &mut read.tx)?;
-            self.events.push(AppEvent::Duplicate {
-                seq: entry.seq,
-                conflicting: hash != received.hash(),
-            });
+            let conflicting = hash != received.hash();
+            self.duplicate(entry, &received.message.msg_id, conflicting, read)?;
             return Ok(Step::Pass);
         }
         let processed: Option<Processed> = self
@@ -643,14 +640,51 @@ impl App {
             .get(&key::processed(&entry.sender, &received.message.msg_id))
             .await?;
         if let Some(seen) = processed {
-            self.unpark(entry.stored, &mut read.tx)?;
-            self.events.push(AppEvent::Duplicate {
-                seq: entry.seq,
-                conflicting: seen.hash != received.hash(),
-            });
+            let conflicting = seen.hash != received.hash();
+            self.duplicate(entry, &received.message.msg_id, conflicting, read)?;
             return Ok(Step::Pass);
         }
         self.apply(entry, received, parked, read).await
+    }
+
+    /// An entry whose message was processed before (check 9): passed, and gone if it was
+    /// stored locally. One the host released is reported with a duty event in the same
+    /// commit, so the host learns that its release ended without the effect.
+    fn duplicate(
+        &mut self,
+        entry: &Entry,
+        msg_id: &str,
+        conflicting: bool,
+        read: &mut Read,
+    ) -> Result<(), AppError> {
+        if let Some(id) = entry.stored
+            && self.released(id)
+        {
+            self.keep_duty(
+                &mut read.tx,
+                Duty::ReleasedDuplicate {
+                    seq: entry.seq,
+                    stored_id: id,
+                    sender: entry.sender,
+                    msg_id: msg_id.to_owned(),
+                    conflicting,
+                },
+            )?;
+        }
+        self.unpark(entry.stored, &mut read.tx)?;
+        self.events.push(AppEvent::Duplicate {
+            seq: entry.seq,
+            conflicting,
+        });
+        Ok(())
+    }
+
+    /// Whether the entry stored locally at `id` is one the host released.
+    fn released(&self, id: u64) -> bool {
+        self.state
+            .parked
+            .get(&id)
+            .is_some_and(|stored| stored.reason == ParkReason::Released)
     }
 
     /// The protocol's check 10, then its effect, at most twice after a conflict: the records
@@ -673,6 +707,7 @@ impl App {
             standing: received.standing,
             context: entry.context.clone(),
             parked,
+            released: entry.stored.is_some_and(|id| self.released(id)),
             conflict: None,
         };
         if let Err(reason) = self.protocol.check_body(&message) {
