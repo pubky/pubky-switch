@@ -439,6 +439,16 @@ enum Restorable {
     TooLarge(AppError),
 }
 
+/// The error of building a restore's commit: [`Restorable::TooLarge`] for writes over the
+/// store's sizes ([`StoreError::TooLarge`]), which [`App::backup_layered`] reports as
+/// [`BackupRefusal::TooLarge`]; any other error is returned as it is, unlabelled.
+fn restore_build_error(error: AppError) -> Result<Restorable, AppError> {
+    match error {
+        AppError::Store(StoreError::TooLarge { .. }) => Ok(Restorable::TooLarge(error)),
+        error => Err(error),
+    }
+}
+
 /// The app's state in memory, as the store holds it.
 #[derive(Clone, Debug)]
 pub(crate) struct AppState {
@@ -1281,8 +1291,8 @@ impl App {
                 duty_handed: 0,
                 time_fresh_at: None,
             };
-            // Every write of the one commit; what fails here is a write the store can't
-            // take in one batch, over its sizes.
+            // Every write of the one commit; what fails here is mostly a write the store
+            // can't take in one batch, over its sizes.
             let mut tx = Tx::new(&app.ns);
             let built: Result<(), AppError> = async {
                 tx.delete_prefix("")?;
@@ -1310,10 +1320,10 @@ impl App {
                 Ok(())
             }
             .await;
-            Ok(match built {
-                Ok(()) => Restorable::Ready(Box::new(app), tx),
-                Err(error) => Restorable::TooLarge(error),
-            })
+            match built {
+                Ok(()) => Ok(Restorable::Ready(Box::new(app), tx)),
+                Err(error) => restore_build_error(error),
+            }
         })
         .await
     }

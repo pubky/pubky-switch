@@ -1222,6 +1222,21 @@ async fn test_restore_layer_refused_by_the_naming_key_writes_neither_layer() {
     assert!(snapshot(&empty, &app.app_id()).is_empty());
 }
 
+#[test]
+fn test_restore_build_error_is_labelled_too_large_only_for_its_size() {
+    let too_large = AppError::Store(StoreError::TooLarge { size: 2, cap: 1 });
+    assert!(matches!(
+        crate::app::restore_build_error(too_large),
+        Ok(crate::app::Restorable::TooLarge(_))
+    ));
+    // A write that can't be encoded is no matter of size: returned as it is.
+    let other = AppError::Store(StoreError::Other("a record can't be written".into()));
+    assert!(matches!(
+        crate::app::restore_build_error(other.clone()),
+        Err(error) if error == other
+    ));
+}
+
 #[tokio::test]
 async fn test_backup_with_a_layer_that_could_never_be_restored_is_refused() {
     let w = World::new();
