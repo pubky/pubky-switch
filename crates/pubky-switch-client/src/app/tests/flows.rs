@@ -1952,6 +1952,39 @@ async fn test_app_lifecycle_operation_in_a_stored_entrys_effect_stores_it_for_go
 }
 
 #[tokio::test]
+async fn test_app_entry_stored_for_good_drops_its_retry_count() {
+    let w = World::new();
+    let base = w.join("phone").await;
+    let protocol = Arc::new(LifecycleProtocol {
+        sample: SampleProtocol::default(),
+        extra: lifecycle_ops(&w, &base)[0].clone(),
+        in_context: false,
+        answers: std::sync::Mutex::new(Vec::new()),
+        active: std::sync::atomic::AtomicBool::new(true),
+    });
+    let request = w.approve(&app_keys("wallet"), &["scope-a"]);
+    let mut app = App::join(w.env(), protocol.clone(), World::config(), request)
+        .await
+        .unwrap();
+    let (seq, _) = w.note(app.app_id(), "note");
+    // Its receive step had been retried for the store before.
+    let retry = crate::app::state::RetryEntry {
+        reads: 1,
+        since_ms: w.clock.now_ms(),
+    };
+    let mut tx = app.tx().unwrap();
+    tx.put(&crate::app::state::key::retry(seq), &retry).unwrap();
+    app.commit(tx).await.unwrap();
+    app.state.retries.insert(seq, retry);
+    // Stored for good, its effect carrying a lifecycle operation: the count goes with it.
+    let report = app.receive(None).await.unwrap();
+    lifecycle_effect_refused(&mut app, &report, seq).await;
+    assert!(app.state.retries.is_empty(), "{:?}", app.state.retries);
+    let loaded = w.load(app.app_id()).await;
+    assert!(loaded.state.retries.is_empty(), "and in the store");
+}
+
+#[tokio::test]
 async fn test_app_refuses_lifecycle_operations_in_a_protocol_effect() {
     let probe = World::new();
     let probe_app = probe.join("wallet").await;
