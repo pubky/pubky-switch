@@ -362,3 +362,55 @@ pub async fn serve_alice(replay: &Replay) {
         "version 3"
     );
 }
+
+/// A request signed at `at_ms` by `key`, for the identity `identity` (a Pubky ID) and, with
+/// `app`, one of its apps (an App ID).
+pub fn signed_request(
+    key: &ed25519_dalek::SigningKey,
+    identity: &str,
+    app: Option<&str>,
+    method: &str,
+    path: &str,
+    body: Vec<u8>,
+    at_ms: u64,
+) -> SwitchRequest {
+    let timestamp = rfc3339_seconds(at_ms);
+    let signed_headers = RequestHeaders {
+        timestamp: timestamp.clone(),
+        identity: identity.to_string(),
+        app: app.map(str::to_string),
+        ..RequestHeaders::default()
+    };
+    let signature = b64(&wire_http::sign_request(
+        key,
+        &RequestTarget {
+            method,
+            path_and_query: path,
+            body: &body,
+            origin: ORIGIN,
+        },
+        &signed_headers,
+    ));
+    let mut headers = vec![
+        (header::IDENTITY, identity),
+        (header::TIMESTAMP, timestamp.as_str()),
+        (header::SIGNATURE, signature.as_str()),
+    ];
+    if let Some(app) = app {
+        headers.push((header::APP, app));
+    }
+    request(method, path, &headers, body)
+}
+
+/// The fixed secret of a vectors' seed label, by the seed rule `spec/vectors/README.md`
+/// states, read from there.
+pub fn seed(label: &str) -> [u8; 32] {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../spec/vectors/README.md");
+    let readme = std::fs::read_to_string(&path).expect("README");
+    let start = readme
+        .find("BLAKE3(\"")
+        .expect("the README states the seed rule")
+        + 8;
+    let end = start + readme[start..].find('"').expect("the rule's prefix");
+    *blake3::hash(format!("{}{label}", &readme[start..end]).as_bytes()).as_bytes()
+}

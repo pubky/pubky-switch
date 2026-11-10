@@ -191,9 +191,12 @@ impl Service {
         let time_ms = txn.stamp(base_ms);
         let limits = txn.announced_limits().await.map_err(|e| store_error(&e))?;
         // The same enrollment again gets the same answer, whatever the account did since
-        // (Switch wire 3.7): the key it named, recognized by the enrollment's hash. The rows
-        // name keys of this generation: a key rotation or a recovery in place, once served,
-        // must clear them, so a retry never names a retired or deleted key.
+        // (Switch wire 3.7): the key it named, recognized by the enrollment's hash. An answer
+        // drops only while a rebuild would give it byte for byte: one naming the pending key,
+        // as long as that key is pending. Once served, a key rotation or a recovery in place
+        // makes every answer naming a key that is neither the account's nor its pending key a
+        // `409 conflict` on retry, so the signer enrolls anew; a retry never gets another key
+        // under the old enrollment.
         if let Some(key_id) = txn
             .enrollment_answer(&enrollment_hash)
             .await
@@ -225,7 +228,25 @@ impl Service {
             serving: names_this_service(held.as_ref(), &self.origin, &account_public),
             pending_key: pending.is_some(),
         };
-        let key_id: KeyId = match enrollment_key(Some(state)) {
+        let choice = enrollment_key(Some(state));
+        // A staged account's answers name its own key, which a rebuild at the serving
+        // account wouldn't: each is kept as long as the account, so a staged account takes
+        // at most max_enrollments distinct enrollments, its creating one included.
+        let rebuildable = matches!(choice, EnrollmentKey::PendingKey { .. });
+        if !rebuildable
+            && txn
+                .kept_enrollment_answers()
+                .await
+                .map_err(|e| store_error(&e))?
+                >= self.limits.max_enrollments
+        {
+            return Err(ApiError::new(
+                ErrorCode::QuotaExceeded,
+                "3.7: a staged account takes at most max_enrollments enrollments",
+            )
+            .with_current(serde_json::json!({ "limit": "enrollments" })));
+        }
+        let key_id: KeyId = match choice {
             EnrollmentKey::NewAccount | EnrollmentKey::AccountKey => account_key,
             EnrollmentKey::PendingKey { exists: true } => pending.ok_or_else(unavailable)?,
             EnrollmentKey::PendingKey { exists: false } => {
@@ -241,6 +262,7 @@ impl Service {
             &key_id,
             time_ms,
             self.limits.max_enrollments,
+            rebuildable,
         )
         .await
         .map_err(|e| store_error(&e))?;

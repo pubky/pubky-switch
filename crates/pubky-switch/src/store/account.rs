@@ -187,6 +187,7 @@ pub(super) async fn create(pool: &PgPool, account: &NewAccount) -> Result<bool, 
         account.created_at_ms,
         u64::MAX >> 1,
         true,
+        false,
     )
     .await?;
     tx.commit().await.map_err(StoreError::from_db)?;
