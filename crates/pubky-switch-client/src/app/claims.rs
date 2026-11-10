@@ -410,6 +410,9 @@ impl App {
         entry: &ClaimEntry,
         proof: &TransitionProof,
     ) -> Result<Result<ClaimView, String>, AppError> {
+        // A stopped app takes no proof and writes nothing (Switch spec 3.6, 4.3, 10.1), even
+        // when an alarm stopped it during the call that sent the attempt.
+        self.refuse_when_stopped()?;
         if let EntryKind::Attempt { deadline, .. } = entry.kind
             && deadline.is_some_and(|d| proof.envelope().server_time >= d)
         {
