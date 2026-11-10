@@ -533,7 +533,9 @@ pub enum AppEvent {
     /// A message answered `403 not_admitted` or `403 not_current` for
     /// [`super::UNDELIVERABLE_MS`] wasn't delivered (Switch spec 11). A message its
     /// recipient never accepted was deleted from the outbox with its plaintext; for a
-    /// re-send, only the re-send was given up. A duty event.
+    /// re-send, only the re-send was given up. Also a message whose try needed writes over
+    /// the store's sizes ([`crate::error::StoreError::TooLarge`]), which no later try can
+    /// make: it was deleted from the outbox at once. A duty event.
     MessageUndelivered {
         /// The duty event's ID.
         id: EventId,

@@ -1155,6 +1155,51 @@ async fn test_scripted_inbox_refuses_a_sender_not_admitted() {
 }
 
 #[tokio::test]
+async fn test_outbox_try_too_large_for_the_store_gives_the_message_up() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let store = Arc::new(FaultStore::new(
+        Arc::new(MemoryStore::new()),
+        StoreFault::None,
+    ));
+    let mut wallet = p
+        .join_on(
+            &p.alice,
+            "wallet",
+            protocol.clone(),
+            Arc::clone(&store) as Arc<dyn StateStore>,
+        )
+        .await;
+    let _shop = p.join(&p.bob, "shop", &protocol).await;
+    let (msg_id, delivery) = wallet.send(Pair::note(&p.bob, "hello")).await.unwrap();
+    assert!(queued_with(&delivery, "not_admitted"), "{delivery:?}");
+    wallet.take_events();
+    // Every write of the message is now over the store's sizes: no try can be kept.
+    store.refuse_puts_as_too_large(Some(b"out/"));
+    let report = wallet.flush_outbox().await.unwrap();
+    assert_eq!(report.undelivered, vec![msg_id.clone()]);
+    assert!(
+        wallet.take_events().iter().any(|e| matches!(
+            e,
+            AppEvent::MessageUndelivered { msg_id: m, resend: false, .. } if *m == msg_id
+        )),
+        "the protocol is told"
+    );
+    // Given up for good: later flushes go on, and don't try it again.
+    let appends = p.bob.switch().entries_from(&p.alice.identity().public());
+    let report = wallet.flush_outbox().await.unwrap();
+    assert!(
+        report.queued.is_empty() && report.undelivered.is_empty(),
+        "{report:?}"
+    );
+    assert_eq!(wallet.delivery(&msg_id).await.unwrap(), None);
+    assert_eq!(
+        p.bob.switch().entries_from(&p.alice.identity().public()),
+        appends
+    );
+}
+
+#[tokio::test]
 async fn test_scripted_inbox_admits_after_an_invite_and_delivers() {
     let p = Pair::new();
     let protocol = ApiProtocol::new(Mode::Plain);

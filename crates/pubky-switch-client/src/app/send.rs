@@ -58,7 +58,7 @@ use super::records::{Collection, RecordTarget};
 use super::state::key;
 use super::{App, AppError};
 use crate::client::answers::AppendAnswer;
-use crate::error::ClientError;
+use crate::error::{ClientError, StoreError};
 
 /// How long a sent message is kept for re-sends: 30 days from its first acceptance (Switch
 /// spec 11).
@@ -295,7 +295,8 @@ pub struct OutboxReport {
     /// The messages refused for good.
     pub failed: Vec<String>,
     /// The messages given up after [`UNDELIVERABLE_MS`] of `403 not_admitted` or `403
-    /// not_current` (Switch spec 11).
+    /// not_current` (Switch spec 11), or because a try's writes were too large for the
+    /// store ([`StoreError::TooLarge`]).
     pub undelivered: Vec<String>,
 }
 
@@ -866,7 +867,43 @@ impl App {
 
     /// One try of each job of one message. Returns whether a delivery was given up as
     /// undeliverable.
+    ///
+    /// A try whose writes are over the store's sizes ([`StoreError::TooLarge`]) would be
+    /// refused the same way at every flush, and hold up none of the others: the message is
+    /// given up for good, deleted from the outbox with its plaintext in one commit with
+    /// [`AppEvent::MessageUndelivered`](super::AppEvent::MessageUndelivered) for the
+    /// protocol, and the flush goes on.
     async fn flush_item(&mut self, msg_id: &str) -> Result<bool, AppError> {
+        match self.try_item(msg_id).await {
+            Err(AppError::Store(StoreError::TooLarge { .. })) => {
+                self.give_up_too_large(msg_id).await?;
+                Ok(true)
+            }
+            tried => tried,
+        }
+    }
+
+    /// Give up a message whose try is too large for the store: see [`App::flush_item`].
+    async fn give_up_too_large(&mut self, msg_id: &str) -> Result<(), AppError> {
+        let accepted = self
+            .reader()
+            .get::<OutboxItem>(&out_key(msg_id))
+            .await?
+            .is_some_and(|item| item.accepted_at_ms.is_some());
+        let resend = accepted || self.reader().exists(&sent_key(msg_id)).await?;
+        let mut tx = self.tx()?;
+        tx.delete(&out_key(msg_id))?;
+        self.keep_duty(
+            &mut tx,
+            Duty::MessageUndelivered {
+                msg_id: msg_id.to_owned(),
+                resend,
+            },
+        )?;
+        self.commit(tx).await
+    }
+
+    async fn try_item(&mut self, msg_id: &str) -> Result<bool, AppError> {
         let Some(mut item) = self.reader().get::<OutboxItem>(&out_key(msg_id)).await? else {
             return Ok(false);
         };

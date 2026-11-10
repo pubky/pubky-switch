@@ -36,6 +36,9 @@ pub struct FaultStore {
     /// Key prefixes whose scan fails with [`StoreError::Unavailable`], once each, after
     /// as many scans of it as given pass.
     failing_scans: Mutex<Vec<(Vec<u8>, usize)>>,
+    /// A key prefix whose puts make a commit fail with [`StoreError::TooLarge`], as a write
+    /// over the working sizes would.
+    too_large: Mutex<Option<Vec<u8>>>,
 }
 
 impl std::fmt::Debug for FaultStore {
@@ -57,6 +60,16 @@ impl FaultStore {
             commits: AtomicU64::new(0),
             stopped: AtomicBool::new(false),
             failing_scans: Mutex::new(Vec::new()),
+            too_large: Mutex::new(None),
+        }
+    }
+
+    /// Refuse every commit that puts a key starting with `prefix` with
+    /// [`StoreError::TooLarge`], applying nothing, as for writes over the working sizes;
+    /// `None` stops refusing.
+    pub fn refuse_puts_as_too_large(&self, prefix: Option<&[u8]>) {
+        if let Ok(mut too_large) = self.too_large.lock() {
+            *too_large = prefix.map(<[u8]>::to_vec);
         }
     }
 
@@ -122,6 +135,14 @@ impl StateStore for FaultStore {
 
     fn commit(&self, batch: WriteBatch) -> Result<(), StoreError> {
         self.check_running()?;
+        if let Ok(too_large) = self.too_large.lock()
+            && let Some(prefix) = too_large.as_deref()
+            && batch.writes.iter().any(
+                |write| matches!(write, super::Write::Put { key, .. } if key.starts_with(prefix)),
+            )
+        {
+            return Err(StoreError::TooLarge { size: 0, cap: 0 });
+        }
         let n = self
             .commits
             .fetch_add(1, Ordering::SeqCst)
