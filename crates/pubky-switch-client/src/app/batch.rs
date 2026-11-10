@@ -27,9 +27,10 @@ use pubky_switch_core::enc::{b64, serde_b64_vec};
 use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::ops::{Condition, MAX_BATCH_ENTRIES, OpKind, RecordVersion, SignedOp};
 use pubky_switch_core::sealed::{RecordValue, SealedValue};
+use pubky_switch_core::sig::SignedDoc;
 use serde::{Deserialize, Serialize};
 
-use super::claims::{ClaimOp, ObligationDeadline};
+use super::claims::ObligationDeadline;
 use super::error::{Refusal, refused_for_good};
 use super::events::AppEvent;
 use super::protocol::LocalWrite;
@@ -295,29 +296,60 @@ impl App {
         Ok((submitted, views))
     }
 
-    /// The checks of an own `attempt`'s proof (Switch wire 6.5 "Binding", 6.8 "Deadline"),
-    /// for a batch the protocol sent another way: the proof binds the operation, is of the
-    /// generation the own `identity.json` names, before the attempt's deadline, and shows the
-    /// app's own open attempt. Only then may the protocol carry the attempt out.
+    /// The checks of an own `attempt` the protocol sent another way (Switch wire 6.5
+    /// "Binding", 6.8 "Deadline"), from the exact bytes of the signed operation and of its
+    /// transition proof ([`SignedOp::signed`], [`TransitionProof::signed`]). The operation
+    /// verifies with the app's own key; the proof verifies with the service key of the
+    /// operation's generation and binds the operation; and it is of the generation the own
+    /// `identity.json` names, stamped before the attempt's deadline, showing the app's own
+    /// open attempt. Only then may the protocol carry the attempt out.
     /// [`App::submit_batch`] and [`App::write_claim`] give these checks to their own
     /// attempts.
     ///
     /// # Errors
     ///
-    /// [`Refusal::Usage`] for an entry other than an `attempt`; a rollback for a proof
-    /// stamped at or after the deadline; [`AppError::InvalidData`] for a proof that shows
-    /// another state, after which the attempt is written `failed`.
+    /// [`Refusal::Usage`] for an operation that isn't an own `attempt` signed by the app's
+    /// key; [`AppError::InvalidData`] for a proof that doesn't verify with the service key or
+    /// doesn't bind the operation, with nothing changed; once it binds, a rollback for a
+    /// proof stamped at or after the deadline, and [`AppError::InvalidData`] for one that
+    /// shows another state, after which the attempt is written `failed`.
     pub async fn check_attempt(
         &mut self,
-        op: &ClaimOp,
-        proof: &TransitionProof,
+        op: &SignedDoc,
+        proof: &SignedDoc,
     ) -> Result<ClaimView, AppError> {
         Box::pin(async move {
             self.ready_local().await?;
-            if !matches!(op.entry().kind, EntryKind::Attempt { .. }) {
-                return Err(Refusal::Usage("only an attempt's proof is checked so".into()).into());
+            let identity = self.state.meta.identity;
+            let app_id = self.state.meta.app_id;
+            let op = SignedOp::verify(
+                op,
+                &self.state.keys.signing_public(),
+                &identity,
+                Some(&app_id),
+            )
+            .map_err(|_| {
+                Refusal::Usage("Switch wire 6.1: the operation isn't the app's own".into())
+            })?;
+            let entry = match &op.body().kind {
+                OpKind::Claim(fields) => fields.check().ok(),
+                _ => None,
             }
-            match self.check_own_attempt(op.entry(), proof).await? {
+            .filter(|entry| matches!(entry.kind, EntryKind::Attempt { .. }))
+            .ok_or_else(|| Refusal::Usage("only an attempt's proof is checked so".into()))?;
+            let unbound = || {
+                AppError::InvalidData(
+                    "Switch wire 6.5: the proof isn't the service's proof of the operation".into(),
+                )
+            };
+            let service_key = self
+                .service_key_of(op.body().generation)
+                .await?
+                .ok_or_else(unbound)?;
+            let proof =
+                TransitionProof::verify(proof, &service_key, &identity).map_err(|_| unbound())?;
+            proof.check_binds(&op).map_err(|_| unbound())?;
+            match self.check_own_attempt(&entry, &proof).await? {
                 Ok(view) => Ok(view),
                 Err(reason) => Err(AppError::InvalidData(format!(
                     "the attempt's proof shows another state; written failed: {reason}"

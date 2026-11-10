@@ -6,12 +6,14 @@
 
 use std::sync::{Arc, Mutex};
 
+use pubky_switch_core::chain::TransitionProof;
 use pubky_switch_core::claims::ClaimStatus;
 use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::ident::Policy;
 use pubky_switch_core::ops::{Condition, KeyBundlePut, OpKind, RecordVersion};
 use pubky_switch_core::records::{DAY_MS, IdentityDoc, seal_bundle_parts};
 use pubky_switch_core::scopes::Permission;
+use pubky_switch_core::sig::SignedDoc;
 use serde_json::{Map, Value, json};
 
 use super::shared_flows::{ItemsProtocol, ids, items, value};
@@ -677,40 +679,126 @@ async fn test_submit_batch_checks_its_attempt_with_another_write() {
         .await
         .unwrap();
     assert_eq!(submitted.proofs.len(), 2);
-    let view = app
-        .check_attempt(&attempt, &submitted.proofs[0])
+    let claim = w.switch.claim(&CLAIM).unwrap();
+    assert_eq!(claim.step, 1);
+}
+
+/// An own attempt and a record write, signed by the app and sent apart from
+/// [`App::submit_batch`]: the batch and its verified answer.
+async fn send_apart(
+    app: &mut App,
+    orphan_after_s: u64,
+) -> (crate::client::Batch, crate::client::Submitted) {
+    let entry = app
+        .record_op(&inbox(), Some(&value(&["paying"])), vec![])
         .await
         .unwrap();
-    assert_eq!(view.owner, Some(app.app_id()));
-    assert_eq!(view.status, ClaimStatus::Attempting);
+    let attempt = ClaimOp::attempt(CLAIM, 0, ATTEMPT, orphan_after_s, None);
+    let batch = app
+        .sign_ops(vec![(Vec::new(), attempt.kind()), entry], None)
+        .unwrap();
+    let submitted = app.submit(&batch).await.unwrap();
+    (batch, submitted)
 }
 
 #[tokio::test]
-async fn test_check_attempt_refuses_a_proof_of_another_attempt() {
+async fn test_check_attempt_takes_the_proof_bound_to_its_operation() {
     let w = World::new();
     let mut app = join(&w, &ApiProtocol::new(Mode::Plain), "wallet").await;
-    let attempt = ClaimOp::attempt(CLAIM, 0, ATTEMPT, 3600, None);
-    let submitted = app
-        .submit_batch(OpBatch::new().op(attempt.kind()))
-        .await
-        .unwrap();
-    // A proof that shows another attempt than the one named: refused, written failed.
-    let other = ClaimOp::attempt(CLAIM, 0, [7; 16], 3600, None);
+    let (batch, submitted) = send_apart(&mut app, 3600).await;
+    let (op, proof) = (batch.ops()[0].signed(), submitted.proofs[0].signed());
+    let view = app.check_attempt(op, proof).await.unwrap();
+    assert_eq!(view.owner, Some(app.app_id()));
+    assert_eq!(view.status, ClaimStatus::Attempting);
+    // The record write's own proof, with the record write: not an attempt.
     let error = app
-        .check_attempt(&other, &submitted.proofs[0])
-        .await
-        .unwrap_err();
-    assert!(matches!(error, AppError::InvalidData(_)), "{error:?}");
-    // Not an attempt at all: a usage error.
-    let done = ClaimOp::failed(CLAIM, 1, ATTEMPT);
-    let error = app
-        .check_attempt(&done, &submitted.proofs[0])
+        .check_attempt(batch.ops()[1].signed(), submitted.proofs[1].signed())
         .await
         .unwrap_err();
     assert!(matches!(error, AppError::Refused(Refusal::Usage(_))));
-    // The genuine attempt is still the claim's.
+}
+
+#[tokio::test]
+async fn test_check_attempt_refuses_a_proof_of_another_operation() {
+    let w = World::new();
+    let mut app = join(&w, &ApiProtocol::new(Mode::Plain), "wallet").await;
+    let (batch, submitted) = send_apart(&mut app, 3600).await;
+    let proof = submitted.proofs[0].signed();
+    // The same attempt, orphaned after another time: another operation the switch never took.
+    let other = ClaimOp::attempt(CLAIM, 0, ATTEMPT, 1200, None);
+    let unsent = app
+        .sign_ops(vec![(Vec::new(), other.kind())], None)
+        .unwrap();
+    let error = app
+        .check_attempt(unsent.ops()[0].signed(), proof)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, AppError::InvalidData(_)), "{error:?}");
+    // The proof of the other operation in the same batch.
+    let error = app
+        .check_attempt(batch.ops()[0].signed(), submitted.proofs[1].signed())
+        .await
+        .unwrap_err();
+    assert!(matches!(error, AppError::InvalidData(_)), "{error:?}");
+    // Nothing was written: the attempt is still open, and its own proof still passes.
+    assert_eq!(w.switch.claim(&CLAIM).unwrap().step, 1);
+    app.check_attempt(batch.ops()[0].signed(), proof)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn test_check_attempt_refuses_a_proof_that_doesnt_verify() {
+    let w = World::new();
+    let mut app = join(&w, &ApiProtocol::new(Mode::Plain), "wallet").await;
+    let (batch, submitted) = send_apart(&mut app, 3600).await;
+    let op = batch.ops()[0].signed();
+    let genuine = &submitted.proofs[0];
+    // A signature that doesn't verify.
+    let mut sig = genuine.signed().sig_bytes().unwrap();
+    sig[0] ^= 1;
+    let tampered = SignedDoc::from_parts(&genuine.signed().body_bytes().unwrap(), &sig);
+    let error = app.check_attempt(op, &tampered).await.unwrap_err();
+    assert!(matches!(error, AppError::InvalidData(_)), "{error:?}");
+    // The same body, signed by another key.
+    let other_key = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
+    let forged =
+        TransitionProof::sign(&other_key, &w.alice.public(), genuine.body().clone()).unwrap();
+    let error = app.check_attempt(op, forged.signed()).await.unwrap_err();
+    assert!(matches!(error, AppError::InvalidData(_)), "{error:?}");
+    // An operation that isn't signed by the app's key.
+    let mut op_sig = op.sig_bytes().unwrap();
+    op_sig[0] ^= 1;
+    let unsigned = SignedDoc::from_parts(&op.body_bytes().unwrap(), &op_sig);
+    let error = app
+        .check_attempt(&unsigned, genuine.signed())
+        .await
+        .unwrap_err();
+    assert!(matches!(error, AppError::Refused(Refusal::Usage(_))));
+    // Nothing was written.
+    assert_eq!(w.switch.claim(&CLAIM).unwrap().step, 1);
+    app.check_attempt(op, genuine.signed()).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_check_attempt_writes_failed_for_a_bound_proof_of_another_state() {
+    let w = World::new();
+    let mut app = join(&w, &ApiProtocol::new(Mode::Plain), "wallet").await;
+    let (batch, submitted) = send_apart(&mut app, 3600).await;
+    // A proof the service key signed that binds the attempt but shows the claim settled.
+    let service = ed25519_dalek::SigningKey::from_bytes(&identity("alice").service_secret());
+    assert_eq!(service.verifying_key().to_bytes(), w.switch.service_key());
+    let mut body = submitted.proofs[0].body().clone();
+    body.state["state"] = "SETTLED".into();
+    let shown = TransitionProof::sign(&service, &w.alice.public(), body).unwrap();
+    let error = app
+        .check_attempt(batch.ops()[0].signed(), shown.signed())
+        .await
+        .unwrap_err();
+    assert!(matches!(error, AppError::InvalidData(_)), "{error:?}");
+    // Written failed after the attempt.
     let claim = w.switch.claim(&CLAIM).unwrap();
-    assert_eq!(claim.step, 1);
+    assert_eq!(claim.step, 2);
 }
 
 #[tokio::test]

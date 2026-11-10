@@ -951,6 +951,49 @@ async fn test_identity_lookup_split_waits_a_grace_then_takes_the_answer() {
 }
 
 #[tokio::test]
+async fn test_identity_lookup_split_answer_held_past_ten_minutes_is_stale() {
+    let p = Pair::new();
+    let protocol = ReadsProtocol::new(Mode::Settle);
+    let mut wallet = p
+        .join_on(
+            &p.alice,
+            "wallet",
+            protocol.clone(),
+            Arc::new(MemoryStore::new()),
+        )
+        .await;
+    let _shop = p
+        .join_on(&p.bob, "shop", protocol, Arc::new(MemoryStore::new()))
+        .await;
+    let bob = p.bob.identity().public();
+    let lookup = wallet.begin_identity_lookup(&bob, true).await.unwrap();
+    let answer = lookup.switch.unwrap().await;
+    let read_ms = p.clock.now_ms();
+    assert!(answer.read());
+    assert_eq!(answer.read_ms(), read_ms);
+    // The answer is held past the 10 minutes before it is finished.
+    p.clock.advance_ms(11 * MINUTE);
+    let found = wallet.finish_identity_lookup(answer).await.unwrap();
+    let now = p.clock.now_ms();
+    assert_eq!(found.switch_copy, SwitchCopy::Read);
+    assert_eq!(found.switch_lookup_ms, read_ms);
+    assert_eq!(found.switch_read_ms, Some(read_ms));
+    assert_eq!(found.read_at_ms, read_ms);
+    assert_eq!(
+        found.may_act(now, Initiator::Automatic, GRACE),
+        MayAct::LookUpAgain
+    );
+    assert_eq!(
+        found.may_act(now, Initiator::User, GRACE),
+        MayAct::LookUpAgain
+    );
+    // The next lookup reads the switch again.
+    let again = wallet.begin_identity_lookup(&bob, false).await.unwrap();
+    assert!(again.switch.is_some());
+    assert_eq!(again.identity.homeserver, HomeserverCopy::Read);
+}
+
+#[tokio::test]
 async fn test_identity_lookup_split_failed_switch_needs_the_user() {
     let p = Pair::new();
     let protocol = ReadsProtocol::new(Mode::Settle);

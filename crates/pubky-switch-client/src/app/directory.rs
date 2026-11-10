@@ -148,10 +148,10 @@ fn source_reads_key(pubky: &[u8; 32]) -> String {
 /// Where a counterparty's copy came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CopySource {
-    /// Its Homeserver.
+    /// Its Homeserver, read now.
     Homeserver,
-    /// Its switch's public read (Switch wire 7.4.15).
-    Switch,
+    /// Its switch's public read (Switch wire 7.4.15), completed at `read_ms`, app clock.
+    Switch { read_ms: u64 },
     /// A directory answer of its switch: no fresh read of the document.
     Directory,
 }
@@ -301,10 +301,11 @@ pub struct IdentityLookup {
 /// The switch's half of a lookup (Switch wire 7.4.15): the public read of the switch the
 /// newest copy names, following a freeze once to the next service. It runs apart from the
 /// app, on the caller's executor; dropping it abandons the lookup, which then counts as not
-/// made.
+/// made. Its answer carries the app-clock time the read completed.
 pub struct SwitchLookup {
     pubky: [u8; 32],
     homeserver: HomeserverCopy,
+    clock: std::sync::Arc<dyn crate::clock::Clock>,
     future: crate::transport::BoxFuture<'static, Option<Vec<IdentityDoc>>>,
 }
 
@@ -326,6 +327,7 @@ impl std::future::Future for SwitchLookup {
         std::task::Poll::Ready(SwitchAnswer {
             pubky: this.pubky,
             homeserver: this.homeserver,
+            read_ms: this.clock.now_ms(),
             copies,
         })
     }
@@ -333,11 +335,14 @@ impl std::future::Future for SwitchLookup {
 
 /// What the switch's half of a lookup found ([`SwitchLookup`]), for
 /// [`App::finish_identity_lookup`]. Its copies are verified with the identity's key, and
-/// still go through the version floor and the equivocation check there.
+/// still go through the version floor and the equivocation check there. Its freshness
+/// counts from when the read completed, however long the answer is held before it is
+/// finished (Switch spec 4.3).
 #[derive(Clone, Debug)]
 pub struct SwitchAnswer {
     pubky: [u8; 32],
     homeserver: HomeserverCopy,
+    read_ms: u64,
     copies: Option<Vec<IdentityDoc>>,
 }
 
@@ -350,6 +355,11 @@ impl SwitchAnswer {
     /// Whether the switch gave its copy.
     pub fn read(&self) -> bool {
         self.copies.is_some()
+    }
+
+    /// When the read completed, or failed, app clock.
+    pub fn read_ms(&self) -> u64 {
+        self.read_ms
     }
 }
 
@@ -466,7 +476,9 @@ impl App {
 
     /// The second half of [`App::identity_of`]: take the copies the switch's half read,
     /// under the version floor and the equivocation check, and keep when the switch was
-    /// looked up and whether it answered, which counts until the next lookup.
+    /// looked up and whether it answered, which counts until the next lookup. The answer
+    /// counts from when its read completed ([`SwitchAnswer::read_ms`]), not from this call:
+    /// one held more than 10 minutes gives a copy to look up again.
     ///
     /// # Errors
     ///
@@ -591,20 +603,26 @@ impl App {
         let pubky = answer.pubky;
         self.refuse_equivocated(&pubky).await?;
         let read = answer.copies.is_some();
+        let read_ms = answer.read_ms;
         for copy in answer.copies.unwrap_or_default() {
-            self.take_peer_copy(&pubky, copy, CopySource::Switch)
+            self.take_peer_copy(&pubky, copy, CopySource::Switch { read_ms })
                 .await?;
         }
-        let now = self.now();
         let mut tx = self.tx()?;
-        tx.put(&switch_read_key(&pubky), &SwitchRead { at_ms: now, read })?;
+        tx.put(
+            &switch_read_key(&pubky),
+            &SwitchRead {
+                at_ms: read_ms,
+                read,
+            },
+        )?;
         self.commit(tx).await?;
         let switch_copy = if read {
             SwitchCopy::Read
         } else {
             SwitchCopy::Unavailable
         };
-        self.peer_identity_held(&pubky, answer.homeserver, switch_copy, now)
+        self.peer_identity_held(&pubky, answer.homeserver, switch_copy, read_ms)
             .await
     }
 
@@ -659,13 +677,14 @@ impl App {
         SwitchLookup {
             pubky: *pubky,
             homeserver,
+            clock: std::sync::Arc::clone(&self.env.clock),
             future: Box::pin(future),
         }
     }
 
     /// Take a counterparty's copy, from its Homeserver, its switch's public read or a
     /// directory answer, and return the newest held. A Homeserver or public read is a fresh
-    /// read of the document, kept as its source's last read.
+    /// read of the document, kept as its source's last read, at the time it completed.
     async fn take_peer_copy(
         &mut self,
         pubky: &[u8; 32],
@@ -674,7 +693,10 @@ impl App {
     ) -> Result<IdentityDoc, AppError> {
         let reader = self.reader();
         let held = identity::held_copy(&reader, pubky).await?;
-        let now = self.now();
+        let read_ms = match source {
+            CopySource::Switch { read_ms } => read_ms,
+            CopySource::Homeserver | CopySource::Directory => self.now(),
+        };
         let fresh = source != CopySource::Directory;
         let mut tx = self.tx()?;
         if fresh {
@@ -683,15 +705,15 @@ impl App {
                 .await?
                 .unwrap_or_default();
             match source {
-                CopySource::Homeserver => reads.homeserver_ms = Some(now),
-                CopySource::Switch => reads.switch_ms = Some(now),
+                CopySource::Homeserver => reads.homeserver_ms = Some(read_ms),
+                CopySource::Switch { .. } => reads.switch_ms = Some(read_ms),
                 CopySource::Directory => {}
             }
             tx.put(&source_reads_key(pubky), &reads)?;
         }
         let held_doc = held.as_ref().map(|(doc, _)| doc);
         let fetched_ms = if fresh {
-            now
+            read_ms
         } else {
             held.as_ref().map_or(0, |(_, at)| *at)
         };
@@ -716,7 +738,7 @@ impl App {
                         &super::state::key::ident_doc(pubky),
                         &CachedDoc {
                             doc: kept.signed().clone(),
-                            fetched_ms: now,
+                            fetched_ms: read_ms,
                         },
                     )?;
                 }
