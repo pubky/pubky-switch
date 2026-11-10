@@ -36,6 +36,7 @@ use serde::{Deserialize, Serialize};
 use pubky_switch_core::enc::serde_b64;
 
 use super::error::Alarm;
+use super::protocol::StoreFailure;
 
 /// The stable ID of a duty event ([`AppEvent::is_duty`]): the store's epoch, and a counter.
 ///
@@ -189,6 +190,28 @@ pub enum AppEvent {
     Held {
         /// The entry's `seq`.
         seq: u64,
+    },
+    /// The protocol's receive step at an entry couldn't finish, because its store or the
+    /// host failed ([`super::Outcome::Retry`]), on `reads` reads in a row: raised from the
+    /// [`super::RETRY_EVENT_READS`]th on, on each such read, whether the entry is held on
+    /// the feed or, after the bounded wait, stored locally ([`ParkReason::StoreUnavailable`]).
+    /// The entry stays unprocessed until a read processes it; the host repairs or frees its
+    /// store.
+    StoreFailing {
+        /// The entry's `seq`.
+        seq: u64,
+        /// The reads in a row that ended in a retry at the entry, this one included.
+        reads: u32,
+        /// When the first of them was, device time in Unix milliseconds.
+        since_ms: u64,
+        /// The store's failure on this read.
+        failure: StoreFailure,
+    },
+    /// A layered backup was refused ([`super::App::backup_layered`]), so the host knows it
+    /// has no current backup.
+    BackupRefused {
+        /// Why.
+        reason: BackupRefusal,
     },
     /// An entry was stored locally and the cursor moved past it (Switch spec 8.2), for
     /// `reason`. A duty event when the entry isn't tried again
@@ -708,6 +731,15 @@ impl Duty {
     }
 }
 
+/// Why a backup was refused ([`AppEvent::BackupRefused`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum BackupRefusal {
+    /// The restore's one commit wouldn't fit the store's value or batch size: the layer, or
+    /// the entries stored locally and the processed pairs it carries, are too large for now.
+    TooLarge,
+}
+
 /// Why an entry was stored locally (Switch spec 8.2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
@@ -726,6 +758,14 @@ pub enum ParkReason {
     /// ([`super::MAX_CLAIM_READS`]), or again for what it was given: it is kept, not
     /// applied, and not tried again.
     TooManyReads,
+    /// Its receive step was retried for want of the store ([`super::Outcome::Retry`],
+    /// [`super::StoreFailure::unavailable`]) for longer than the bounded wait: it is tried
+    /// again at every read.
+    StoreUnavailable,
+    /// The store failed for its receive step in a way that retrying can't mend
+    /// ([`super::StoreFailure::of_entry`]), such as a corrupt value: it is tried again at
+    /// every read, in case the host repaired it.
+    StoreRejected,
     /// Its effect was kept unanswered longer than a resend's answer can tell whether it was
     /// applied (Switch spec 12.5 "Kept batches"): it is kept, and not tried again
     /// ([`AppEvent::EffectUncertain`]).
@@ -734,9 +774,13 @@ pub enum ParkReason {
 
 impl ParkReason {
     /// Whether an entry stored for this reason is processed again by a later read: one
-    /// whose sender couldn't be checked, or whose write hit a quota. The others stay
-    /// stored until the protocol acts on them.
+    /// whose sender couldn't be checked, whose write hit a quota, or whose receive step
+    /// the store kept from finishing. The others stay stored until the protocol acts on
+    /// them.
     pub fn tried_again(self) -> bool {
-        matches!(self, Self::Unverifiable | Self::Quota)
+        matches!(
+            self,
+            Self::Unverifiable | Self::Quota | Self::StoreUnavailable | Self::StoreRejected
+        )
     }
 }

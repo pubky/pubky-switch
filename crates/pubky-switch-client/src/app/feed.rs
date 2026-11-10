@@ -21,6 +21,12 @@
 //!   good, or that has more operations than one batch takes, which isn't tried again: a
 //!   permanent refusal never stalls the feed. Pages are read from a position that moves on
 //!   to each page's `scanned_through`, while the cursor stays before the held entry.
+//! - **An entry whose receive step the protocol's store or the host kept from finishing**
+//!   ([`Outcome::Retry`]) commits nothing of the step. While the store is unavailable it is
+//!   held the same way, for the same bounded wait, and comes again at each read; from the
+//!   [`RETRY_EVENT_READS`]th read in a row the app raises [`AppEvent::StoreFailing`]. After
+//!   the wait, or at once when the store fails for that entry, it is stored and passed, and
+//!   tried again at every read: never dropped.
 //! - **An entry no held key opens** is passed; the protocol is asked to request a re-send,
 //!   never for a time before the cursor's less the clock tolerance. So is an entry a departed
 //!   own app left unread, accepted at or before a departure the app verified in its chain;
@@ -55,13 +61,13 @@ use super::events::{AppEvent, Duty, ParkReason};
 use super::identity::{self, DOC_CACHE_MS, Taken};
 use super::protocol::{
     Effect, LocalWrite, MAX_CLAIM_READS, MissedEntries, Need, OpaqueRule, Outcome, Protocol,
-    ReceivedMessage, ResendNeeded, ResendReason, Rules,
+    RETRY_EVENT_READS, ReceivedMessage, ResendNeeded, ResendReason, Rules, StoreFailure,
 };
 use super::provider::TakeOver;
 use super::records::{Collection, pending_name_key};
 use super::rotation::RegistrationStep;
 use super::state::{
-    CachedDoc, HeldEntry, KeptEntry, ParkedEntry, PendingEffect, Processed, Tx, key,
+    CachedDoc, HeldEntry, KeptEntry, ParkedEntry, PendingEffect, Processed, RetryEntry, Tx, key,
 };
 use super::{App, AppError, PROCESSED_RETENTION_MS};
 use crate::client::Batch;
@@ -418,6 +424,10 @@ impl App {
             };
             match step {
                 Step::Pass => {
+                    // An entry stored locally isn't processed yet: its count stays.
+                    if !self.state.parked.contains_key(&seq) {
+                        self.clear_retry(seq, &mut read)?;
+                    }
                     if read.blocked.is_none_or(|b| seq < b) {
                         self.pass(seq, item, &mut read)?;
                     } else if matches!(item, FeedItem::Entry(_)) && !self.state.seen.contains(&seq)
@@ -662,6 +672,7 @@ impl App {
                     &self.ns,
                     may_attempt,
                     &fetched,
+                    read.tx.pending_local(),
                 );
                 let outcome = protocol.receive_with(&message, &mut cx);
                 (outcome, cx.into_writes())
@@ -679,6 +690,9 @@ impl App {
                         return Ok(Step::Pass);
                     }
                 },
+                Outcome::Retry(failure) => {
+                    return self.retry_later(entry, &received.plaintext, parked, failure, read);
+                }
                 Outcome::Apply(effect) => effect,
             };
             if writes.not_now.is_some() {
@@ -1192,6 +1206,61 @@ impl App {
         Ok(())
     }
 
+    /// A receive step the protocol's store or the host kept from finishing
+    /// ([`Outcome::Retry`]), with nothing of the step committed. A failure of the entry
+    /// stores it and passes it at once. Otherwise the reads in a row that end so are
+    /// counted, to raise [`AppEvent::StoreFailing`] from [`RETRY_EVENT_READS`] on, and the
+    /// count is kept until the entry is processed, while it is stored locally too. An
+    /// entry stored locally stays so; one on the feed is held until the bounded wait since
+    /// the first retry, which an entry whose sender can't be checked gets too, then stored
+    /// and passed (Switch spec 8.2). Never dropped.
+    fn retry_later(
+        &mut self,
+        entry: &Entry,
+        plaintext: &MessagePlaintext,
+        parked: bool,
+        failure: StoreFailure,
+        read: &mut Read,
+    ) -> Result<Step, AppError> {
+        if failure.is_of_entry() && !parked {
+            self.park(entry, plaintext, ParkReason::StoreRejected, read)?;
+            return Ok(Step::Pass);
+        }
+        let now = self.now();
+        let retry = self.state.retries.entry(entry.seq).or_insert(RetryEntry {
+            reads: 0,
+            since_ms: now,
+        });
+        retry.reads = retry.reads.saturating_add(1);
+        let retry = *retry;
+        read.tx.put(&key::retry(entry.seq), &retry)?;
+        if retry.reads >= RETRY_EVENT_READS {
+            self.events.push(AppEvent::StoreFailing {
+                seq: entry.seq,
+                reads: retry.reads,
+                since_ms: retry.since_ms,
+                failure,
+            });
+        }
+        if parked {
+            // Stored already: it stays so, and is tried again at the next read.
+            return Ok(Step::Hold);
+        }
+        if now.saturating_sub(retry.since_ms) >= self.config.park_after_ms {
+            self.park(entry, plaintext, ParkReason::StoreUnavailable, read)?;
+            return Ok(Step::Pass);
+        }
+        Ok(Step::Hold)
+    }
+
+    /// An entry processed at last, and not stored locally: its count of retries goes.
+    fn clear_retry(&mut self, seq: u64, read: &mut Read) -> Result<(), AppError> {
+        if self.state.retries.remove(&seq).is_some() {
+            read.tx.delete(&key::retry(seq))?;
+        }
+        Ok(())
+    }
+
     fn dropped(&mut self, seq: u64, check: u8, reason: String) -> Step {
         self.events
             .push(AppEvent::MessageDropped { seq, check, reason });
@@ -1309,6 +1378,9 @@ impl App {
             let step = self
                 .check_and_apply(&entry, plaintext, true, &mut read)
                 .await?;
+            if step == Step::Pass && !self.state.parked.contains_key(&seq) {
+                self.clear_retry(seq, &mut read)?;
+            }
             self.commit(read.tx).await?;
             if step == Step::Pass && !self.state.parked.contains_key(&seq) {
                 self.events.push(AppEvent::Unparked { seq });

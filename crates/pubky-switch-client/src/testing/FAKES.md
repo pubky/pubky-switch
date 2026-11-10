@@ -95,7 +95,8 @@ service.
   checks, for scripting what another signer or a faulty service did. `forget_delivery_proof`
   makes a retry answer with no proof.
 - **`GET /apps`** (Switch wire 7.4.12): the apps the switch holds or the newest document
-  lists, with `current`, `record_cert`, `record_at`, `bundle_ranges`, `keys_through` and
+  lists, with `current`, `record_cert`, `record_at`, `revoked_at`, `departed_at`,
+  `awaiting_rotation`, `full_bundle_requested`, `bundle_ranges`, `keys_through` and
   `cert_expires_at`, and the
   account's `identity`, `recovery` (`declared_at` its recovery record's time) and
   `proof_generations`, from the same kept proofs as the delivery; no last-seen times,
@@ -103,8 +104,26 @@ service.
 - **Moves and recovery** (Switch spec 12.5, 12.6, Switch wire 10): `import_into` copies the
   account in memory, with no manifest, chunks or export transfer; a recovery upload is kept
   and answered with fixed changes, merging nothing.
-- **Revocation, freeze and unfreeze** are test calls, not routes.
+- **Revocation** is `POST /apps/{app_id}/revoke` from the signer, and the test call
+  `revoke`; an app that left is answered as one revoked already, with no proof. `leave` and
+  `request_full_bundle` are test calls for the app's own routes, and `forget_removal_time`
+  scripts a faulty service that shows no time for a removal. Freeze and
+  unfreeze are test calls, not routes.
 - **`lose_identity`** scripts a faulty service that lost the account's `identity.json`.
 - **Erasure** (Switch wire 7.4.16) is a flag; its answers are signed with a fixed operator
   key.
 - **Push** (Switch wire 8.1): registrations only; nothing is sent to a relay.
+
+## Signer flows tested only here
+
+The service in this workspace doesn't serve `GET /apps`, `POST /apps/{app_id}/leave` or
+`POST /apps/{app_id}/keys` yet, and the signer reads `GET /apps` before every signing step.
+So these signer flows run only against the scripted switch; re-run them against the service
+once it serves those calls:
+
+- approval, renewals and reductions, their closings, and epoch completion
+  (`crates/pubky-switch-signer/tests/approval.rs`, `renewal.rs`);
+- revocations, departures, removal times and their bounds, full-bundle requests, purge and
+  record cleanup (`revocation.rs`);
+- the one-signer checks, alarms and their clearing, records behind, and publication
+  (`flows.rs`).

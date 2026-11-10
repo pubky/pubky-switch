@@ -83,6 +83,10 @@ impl Signer {
     /// for an expiry the certificate rules refuse; otherwise as [`Signer::resume`].
     pub async fn renew(&mut self, app_id: [u8; 16], change: CertChange) -> Result<IdentityDoc> {
         self.ready().await?;
+        // A revoked or departing app gets no new certificate, expiry or key (Switch spec 12.2).
+        if self.cut_off(&app_id) {
+            return Err(Refusal::CutOff.into());
+        }
         let identity = self.state.identity;
         let newest = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
         let listed = newest.listed_cert(&app_id).ok_or(Refusal::NotListed)?;
@@ -165,7 +169,7 @@ impl Signer {
         // A rotation: every other current app's bundle through the new epoch.
         let mut alerts = Vec::new();
         if rotates {
-            let (more, skipped) = self.catch_up(&key, &newest, &statuses, Some(app_id), last)?;
+            let (more, skipped) = self.catch_up(&key, &newest, &statuses, &[app_id], last)?;
             ops.extend(more);
             alerts = skipped;
         }
@@ -196,11 +200,11 @@ impl Signer {
     /// reduction included, as it still holds its scopes, then deliver a version raising
     /// `data_epoch` to it (Switch spec 3.2, 3.5; Switch wire 3.8). `statuses` is the switch's
     /// view, read once its copy was confirmed.
-    async fn complete_epoch(&mut self, statuses: &[AppStatus]) -> Result<()> {
+    pub(super) async fn complete_epoch(&mut self, statuses: &[AppStatus]) -> Result<()> {
         let newest = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
         let through = self.state.epoch_through;
         let key = self.signing_key()?;
-        let (ops, alerts) = self.catch_up(&key, &newest, statuses, None, through)?;
+        let (ops, alerts) = self.catch_up(&key, &newest, statuses, &[], through)?;
         let batches = self.sign_batches(&key, newest.generation(), ops)?;
         let (doc, flow) = self.next_version(&key, |body| body.data_epoch = through)?;
         drop(key);
@@ -214,16 +218,20 @@ impl Signer {
     /// through epoch `last`, each with its own scopes' keys for the epochs it lacks, and the
     /// alerts for the apps left out (Switch wire 3.5, 3.8).
     ///
+    /// The signer's own records decide who is cut off, never the switch's status alone: an
+    /// App ID that is a tombstone or has a revocation asked for gets no part, whatever the
+    /// switch shows (Switch spec 12.2: a removed app reads nothing written later).
+    ///
     /// An app the switch doesn't serve now, one not current, not joined or expired, gets no
     /// part, nor does one whose certificate holds a scope no registered protocol owns, with
     /// [`Alert::RotationSkipped`]. Either gets the epochs it lacks from its next bundle, which
     /// starts after `keys_through`.
-    fn catch_up(
+    pub(super) fn catch_up(
         &self,
         key: &SigningKey,
         newest: &IdentityDoc,
         statuses: &[AppStatus],
-        except: Option<[u8; 16]>,
+        except: &[[u8; 16]],
         last: u64,
     ) -> Result<(Vec<Op>, Vec<Alert>)> {
         let certs = self.held_certs()?;
@@ -232,7 +240,7 @@ impl Signer {
         let mut ops = Vec::new();
         let mut alerts = Vec::new();
         for listed in &newest.body().apps {
-            if Some(listed.app_id) == except {
+            if except.contains(&listed.app_id) || self.cut_off(&listed.app_id) {
                 continue;
             }
             let Some(status) = statuses.iter().find(|s| s.app_id == listed.app_id) else {
@@ -280,7 +288,7 @@ impl Signer {
     }
 
     /// Sign `ops` in batches at `generation`, each with the parts it stores.
-    fn sign_batches(
+    pub(super) fn sign_batches(
         &self,
         key: &SigningKey,
         generation: u64,
@@ -308,7 +316,7 @@ impl Signer {
     /// certificate that an app has passed, which the switch may drop (Switch wire 3.5,
     /// 7.4.12).
     #[allow(clippy::too_many_arguments)]
-    async fn commit_batches(
+    pub(super) async fn commit_batches(
         &mut self,
         mut state: SignerState,
         newest: &IdentityDoc,
@@ -323,7 +331,7 @@ impl Signer {
                 "a version without its delivery".into(),
             ));
         };
-        state.signed_through = doc.version();
+        state.signed_through = state.signed_through.max(doc.version());
         for alert in alerts {
             state.alert(alert);
         }
@@ -351,10 +359,16 @@ impl Signer {
     }
 
     /// The switch's apps, once its copy is confirmed as this install's mark.
-    async fn switch_apps(&mut self) -> Result<Vec<AppStatus>> {
+    pub(super) async fn switch_apps(&mut self) -> Result<Vec<AppStatus>> {
+        Ok(self.switch_apps_at().await?.0)
+    }
+
+    /// The switch's apps, once its copy is confirmed as this install's mark, and the service
+    /// time the answer is signed at.
+    pub(super) async fn switch_apps_at(&mut self) -> Result<(Vec<AppStatus>, u64)> {
         let answer = self.service_client()?.apps().await?;
         self.confirm_copy(answer.identity.as_ref()).await?;
-        Ok(answer.apps)
+        Ok((answer.apps, answer.server_time))
     }
 
     /// Send a renewal's or an epoch completion's batches from `sent` on, each with its signed
@@ -416,8 +430,15 @@ impl Signer {
         self.commit(self.state.clone(), Some(deliver)).await
     }
 
+    /// Whether the records cut `app_id` off: a tombstone, or a revocation asked for. Such an
+    /// app gets no key bundle part (Switch spec 12.2).
+    pub(super) fn cut_off(&self, app_id: &[u8; 16]) -> bool {
+        self.state.tombstones.contains(app_id)
+            || self.state.revoking.iter().any(|r| &r.app_id == app_id)
+    }
+
     /// Every certificate the signer holds, verified.
-    fn held_certs(&self) -> Result<Vec<AppCert>> {
+    pub(super) fn held_certs(&self) -> Result<Vec<AppCert>> {
         let identity = self.state.identity;
         Ok(self
             .state
@@ -469,7 +490,8 @@ impl Signer {
     /// alarm or for a retry that gave no time, and goes once the renewals are closed; another
     /// install that signs closes them itself.
     pub(super) async fn queue_owed_closing(&mut self) -> Result<bool> {
-        if self.flow.is_some() || self.state.managed_by.is_some() {
+        // Nothing is signed while another install signs or the records are behind.
+        if self.flow.is_some() || self.check_named().is_err() {
             return Ok(false);
         }
         let owed = self.owed()?;
@@ -552,6 +574,8 @@ impl Signer {
             .renewed
             .iter()
             .filter(|entry| entry.until.is_none())
+            // A cut-off app's renewals go with it when it is removed.
+            .filter(|entry| !self.cut_off(&entry.app_id))
             .filter(|entry| {
                 // Reductions close on their own.
                 let old = certs.iter().find(|c| c.hash() == entry.cert);
@@ -593,9 +617,10 @@ impl Signer {
         Ok(closing.into_iter().map(|(app, _)| app).collect())
     }
 
-    /// What is due at each start, in order (Switch wire 3.8): finish the flow in progress and
-    /// any closing delivery owed, then close the cooperative renewals whose apps took their new
-    /// certificate.
+    /// What is due at each start, in order (design note, section 4.5): finish the flow in
+    /// progress and any closing delivery owed (Switch wire 3.8), remove the apps revoked or
+    /// departed (Switch spec 12.2, 12.3), close the cooperative renewals whose apps took their
+    /// new certificate, and answer the full-bundle requests (Switch wire 3.5).
     ///
     /// # Errors
     ///
@@ -606,24 +631,34 @@ impl Signer {
         if let Err(error) = &resumed
             && (self.flow.is_some() || !matches!(error, SignerError::Homeserver(_)))
         {
+            // A pending revocation still goes to the switch: it signs nothing new, and
+            // cutting the app off is the safe step. What it can't send stays pending.
+            let _ = self.revoke_at_switch().await;
             return resumed;
         }
+        self.complete_removals().await?;
         self.complete_renewals().await?;
+        self.serve_full_bundles().await?;
         resumed
     }
 }
 
 /// A batch operation, with the key bundle part it stores, if any.
-type Op = (OpKind, Option<StoredPart>);
+pub(super) type Op = (OpKind, Option<StoredPart>);
 
 /// Whether a scope has keys, for a rotation: one no registered protocol owns counts as keyed,
 /// so removing it rotates, as its keys can't be judged (design note, decision 2).
-fn keyed(protocols: &Protocols) -> impl Fn(&str) -> bool + '_ {
+pub(super) fn keyed(protocols: &Protocols) -> impl Fn(&str) -> bool + '_ {
     |scope| protocols.has_keys(scope) || !protocols.knows_scope(scope)
 }
 
 /// Add `sealed`'s parts for `app_id`, made for the certificate `cert`, to the operations.
-fn push_parts(ops: &mut Vec<Op>, app_id: [u8; 16], cert: [u8; 32], sealed: Vec<BundlePart>) {
+pub(super) fn push_parts(
+    ops: &mut Vec<Op>,
+    app_id: [u8; 16],
+    cert: [u8; 32],
+    sealed: Vec<BundlePart>,
+) {
     for part in sealed {
         let stored = StoredPart {
             app_id,

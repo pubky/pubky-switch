@@ -52,10 +52,12 @@ mod approval;
 mod clients;
 pub(crate) mod gate;
 mod renewal;
+mod revocation;
 
 pub use approval::{AppReview, ApprovedRequest};
 use clients::{RequestClient, SigningClient};
 pub use renewal::CertChange;
+pub use revocation::UserConfirmed;
 
 /// What the signer works with, from the host.
 #[derive(Clone)]
@@ -257,7 +259,10 @@ impl Signer {
             // owed"). Only the backup write comes before it, as before every delivery
             // (Switch wire 3.13).
             if !self.queue_owed_closing().await? {
-                return self.publish().await;
+                self.publish().await?;
+                // A removed app's record goes once its removal is published (Switch spec
+                // 12.2 step 4).
+                return self.clean_up_removed().await;
             }
         }
     }
@@ -586,13 +591,7 @@ impl Signer {
     /// Refuse every signing call while another install is the signer (Switch spec 4.3).
     /// Nor while its records are behind its own newer version.
     fn check_named(&self) -> Result<()> {
-        if let Some(install) = self.state.managed_by {
-            return Err(SignerError::NotNamed { install });
-        }
-        if let Some(version) = self.state.records_behind {
-            return Err(Refusal::RecordsBehind { version }.into());
-        }
-        Ok(())
+        clients::Named::check(&self.state).map(drop)
     }
 
     /// Commit `state` and `flow`, and only then take them as the signer's own, so the signer
@@ -921,6 +920,15 @@ impl Signer {
                     .and_then(|proof| proof.body().chain.open().ok())
                     .map(|envelope| envelope.server_time);
                 let mut state = self.state.clone();
+                if let (Some(at), Ok(delivered)) =
+                    (delivered_at, IdentityDoc::verify(&doc, &state.identity))
+                {
+                    for app in &delivered.body().apps {
+                        if !state.listed_at.iter().any(|(id, _)| *id == app.app_id) {
+                            state.listed_at.push((app.app_id, at));
+                        }
+                    }
+                }
                 let published = state
                     .newest
                     .as_ref()

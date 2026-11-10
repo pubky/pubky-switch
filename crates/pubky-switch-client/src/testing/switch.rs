@@ -126,6 +126,11 @@ pub struct SwitchApp {
     pub cursor: u64,
     /// Whether the app left or was revoked.
     pub departed: bool,
+    /// When the signer revoked it (`revoked_at`, Switch wire 7.4.12).
+    pub revoked_at: Option<u64>,
+    /// When it left (`departed_at`), and the newest document's data epoch then, which its
+    /// rotation goes above (`awaiting_rotation`, Switch wire 7.4.12).
+    pub departed_at: Option<(u64, u64)>,
     /// When the app asked for its full key bundle, until a bundle part answers it.
     pub full_requested: Option<u64>,
 }
@@ -517,13 +522,39 @@ impl ScriptedSwitch {
     ///
     /// When the transition doesn't sign.
     pub fn revoke(&self, app: [u8; 16]) -> Result<(), ScriptError> {
-        let mut inner = self.lock();
-        inner.apps.entry(app).or_default().departed = true;
-        inner.unreachable(&app);
-        inner.push.remove(&app);
-        let at = inner.now();
-        inner.service_transition(ServiceTransition::Revoke { app_id: app, at })?;
+        self.lock().revoke(app)?;
         Ok(())
+    }
+
+    /// `app` leaves, as its `POST /apps/{app_id}/leave` does (Switch wire 7.4.12).
+    ///
+    /// # Errors
+    ///
+    /// When the transition doesn't sign.
+    pub fn leave(&self, app: [u8; 16]) -> Result<(), ScriptError> {
+        self.lock().leave(app)?;
+        Ok(())
+    }
+
+    /// A faulty service: `app` stays revoked or departed, but `GET /apps` shows no time for it.
+    pub fn forget_removal_time(&self, app: [u8; 16]) {
+        let mut inner = self.lock();
+        let held = inner.apps.entry(app).or_default();
+        held.revoked_at = None;
+        held.departed_at = None;
+    }
+
+    /// `app` asks for its full key bundle, as its `POST /apps/{app_id}/keys` does (Switch
+    /// wire 7.4.11).
+    pub fn request_full_bundle(&self, app: [u8; 16]) {
+        let mut inner = self.lock();
+        let now = inner.now();
+        inner
+            .apps
+            .entry(app)
+            .or_default()
+            .full_requested
+            .get_or_insert(now);
     }
 
     /// The account's identity.
@@ -1086,6 +1117,41 @@ impl Inner {
         Ok(proof.signed().clone())
     }
 
+    /// Revoke `app` (Switch spec 12.2 step 1): its proof, or `None` for an app revoked or
+    /// departed already.
+    pub(crate) fn revoke(&mut self, app: [u8; 16]) -> Result<Option<SignedDoc>, ScriptError> {
+        if self.apps.get(&app).is_some_and(|a| a.departed) {
+            return Ok(None);
+        }
+        let at = self.now();
+        let held = self.apps.entry(app).or_default();
+        held.departed = true;
+        held.revoked_at = Some(at);
+        self.unreachable(&app);
+        self.push.remove(&app);
+        Ok(Some(self.service_transition(
+            ServiceTransition::Revoke { app_id: app, at },
+        )?))
+    }
+
+    /// `app` leaves (Switch spec 12.3): the `leave` transition's proof, or `None` for an app
+    /// revoked or departed already.
+    pub(crate) fn leave(&mut self, app: [u8; 16]) -> Result<Option<SignedDoc>, ScriptError> {
+        if self.apps.get(&app).is_some_and(|a| a.departed) {
+            return Ok(None);
+        }
+        let at = self.now();
+        let epoch = self.doc.as_ref().map_or(0, IdentityDoc::data_epoch);
+        let held = self.apps.entry(app).or_default();
+        held.departed = true;
+        held.departed_at = Some((at, epoch));
+        self.unreachable(&app);
+        Ok(Some(self.service_transition(ServiceTransition::Leave {
+            app_id: app,
+            at,
+        })?))
+    }
+
     fn service_transition(
         &mut self,
         transition: ServiceTransition,
@@ -1129,6 +1195,9 @@ impl Inner {
             return Ok(match (request.method.as_str(), route) {
                 ("PUT", "identity") => self.put_identity(&request.body)?,
                 ("GET", "apps") => self.apps_answer(),
+                ("POST", r) if r.starts_with("apps/") && r.ends_with("/revoke") => {
+                    self.revoke_answer(r)?
+                }
                 ("GET", "directory") => self.directory(),
                 ("GET", "identity") => self.identity_answer(),
                 ("POST", "recovery/upload") => self.upload(request, None)?,
@@ -1171,20 +1240,13 @@ impl Inner {
                 let at = *held.full_requested.get_or_insert(now);
                 (200, json!({ "requested": rfc3339(at) }))
             }
-            ("POST", r) if r == own_leave => {
-                if self.apps.get(&app).is_some_and(|a| a.departed) {
-                    return Ok(bad(ErrorCode::NotCurrent, "departed", json!({})));
-                }
-                self.apps.entry(app).or_default().departed = true;
-                self.unreachable(&app);
-                let at = self.now();
-                let proof =
-                    self.service_transition(ServiceTransition::Leave { app_id: app, at })?;
-                (
+            ("POST", r) if r == own_leave => match self.leave(app)? {
+                Some(proof) => (
                     200,
                     json!({ "proofs": [proof], "head": self.head().to_value() }),
-                )
-            }
+                ),
+                None => bad(ErrorCode::NotCurrent, "departed", json!({})),
+            },
             _ => bad(ErrorCode::NotFound, "no route", json!(null)),
         })
     }
