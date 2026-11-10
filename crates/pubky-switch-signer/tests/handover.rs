@@ -1271,3 +1271,109 @@ async fn test_hand_over_refuses_a_target_whose_certificate_lapsed() {
         SignerError::Refused(Refusal::TargetNotCurrent)
     );
 }
+
+#[tokio::test]
+async fn test_hand_over_writes_nothing_to_the_homeserver_meanwhile() {
+    // While handing over, the old install never publishes, nor republishes the switch's copy
+    // over another one, nor writes its backup: until its abort or take-back has won.
+    let world = World::new();
+    let mut s = setup(&world).await;
+    s.old.hand_over_to(s.app_id(), confirmed()).await.unwrap();
+    let next = world.other_install_version(&s.handed, [7; 16]);
+    world.switch.deliver_identity(&next).unwrap();
+    world
+        .homeserver
+        .set(IDENTITY_PATH, b"another copy".to_vec());
+    let writes = world.homeserver.writes.lock().unwrap().len();
+    let _ = s.old.resume().await;
+    let _ = s.old.run_due().await;
+    assert_eq!(world.homeserver.writes.lock().unwrap().len(), writes);
+    assert_eq!(
+        world.homeserver.file(IDENTITY_PATH).unwrap(),
+        b"another copy"
+    );
+}
+
+#[tokio::test]
+async fn test_take_back_sent_again_and_read_back_has_won() {
+    // The take-back's answer is lost: it is sent again, the same bytes. And when its flow
+    // ended on a refusal though the switch took it, the switch's copy of its own take-back
+    // means it won.
+    for read_back in [false, true] {
+        let world = World::new();
+        let mut s = setup(&world).await;
+        s.old.hand_over_to(s.app_id(), confirmed()).await.unwrap();
+        *world.homeserver.failing_path.lock().unwrap() = Some(SIGNER_BACKUP_PATH.to_owned());
+        drop(
+            Signer::receive_hand_over(
+                world.env(Arc::new(MemoryStore::new())),
+                &s.target,
+                empty_vault(),
+            )
+            .await
+            .unwrap(),
+        );
+        *world.homeserver.failing_path.lock().unwrap() = None;
+        let distinct = world.distinct_requests("PUT", "/identity");
+        world.switch.fail_next(if read_back {
+            SwitchFault::Error {
+                path: "/identity".into(),
+                code: ErrorCode::BadRequest,
+                current: json!(null),
+            }
+        } else {
+            SwitchFault::LoseAnswer {
+                path: "/identity".into(),
+            }
+        });
+        s.old.take_back(confirmed()).await.unwrap_err();
+        let back = world.sent_docs().into_iter().last().unwrap();
+        if read_back {
+            world.switch.deliver_identity(&back).unwrap();
+        }
+        s.old.resume().await.unwrap();
+        assert_eq!(
+            s.old.status(),
+            SignerStatus::Signing,
+            "read back: {read_back}"
+        );
+        assert_eq!(
+            s.old.identity_doc().unwrap().unwrap().signed(),
+            back.signed()
+        );
+        assert_eq!(world.backup().identity_doc().signed(), back.signed());
+        assert_eq!(world.distinct_requests("PUT", "/identity"), distinct + 1);
+        world.assert_no_version_sent_twice();
+    }
+}
+
+#[tokio::test]
+async fn test_take_back_asked_again_after_a_refusal_is_the_same_bytes() {
+    // The take-back's delivery was refused for good, so its flow ended. Asked again, it
+    // sends the take-back it signed, not a new one at another version.
+    let world = World::new();
+    let mut s = setup(&world).await;
+    s.old.hand_over_to(s.app_id(), confirmed()).await.unwrap();
+    *world.homeserver.failing_path.lock().unwrap() = Some(SIGNER_BACKUP_PATH.to_owned());
+    drop(
+        Signer::receive_hand_over(
+            world.env(Arc::new(MemoryStore::new())),
+            &s.target,
+            empty_vault(),
+        )
+        .await
+        .unwrap(),
+    );
+    *world.homeserver.failing_path.lock().unwrap() = None;
+    let distinct = world.distinct_requests("PUT", "/identity");
+    world.switch.fail_next(SwitchFault::Error {
+        path: "/identity".into(),
+        code: ErrorCode::BadRequest,
+        current: json!(null),
+    });
+    s.old.take_back(confirmed()).await.unwrap_err();
+    let first = world.sent_docs().into_iter().last().unwrap();
+    let back = s.old.take_back(confirmed()).await.unwrap();
+    assert_eq!(back.signed(), first.signed());
+    assert_eq!(world.distinct_requests("PUT", "/identity"), distinct + 1);
+}
