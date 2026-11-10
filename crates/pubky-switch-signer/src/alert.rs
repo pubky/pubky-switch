@@ -154,4 +154,8 @@ pub enum Alert {
         /// later send succeeds.
         at_switch: bool,
     },
+    /// After a restore, the signer backup couldn't be written once its delivery won (Switch
+    /// wire 3.13). The backup on the Homeserver is the one restored from; the next version's
+    /// backup write replaces it.
+    BackupNotWritten,
 }

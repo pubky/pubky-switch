@@ -29,7 +29,7 @@ use std::sync::Arc;
 use pubky_switch_client::clock::Clock;
 use pubky_switch_client::store::StoreHandle;
 use pubky_switch_client::transport::Transport;
-use pubky_switch_client::{ClientError, Credentials, StoreError, SwitchClient};
+use pubky_switch_client::{ClientError, StoreError};
 use pubky_switch_core::enc::{pubky_id, random_bytes};
 use pubky_switch_core::http::{ErrorCode, IdentityDelivery};
 
@@ -38,7 +38,7 @@ use pubky_switch_core::records::{
     IdentityPolicy, Inbox, SIGNER_BACKUP_PATH, SignerBackup,
 };
 use pubky_switch_core::sig::SignedDoc;
-use pubky_switch_core::signing::Signs;
+
 use serde_json::Value;
 
 use crate::alert::{Alert, Source};
@@ -52,10 +52,11 @@ mod approval;
 mod clients;
 pub(crate) mod gate;
 mod renewal;
+mod restore;
 mod revocation;
 
 pub use approval::{AppReview, ApprovedRequest};
-use clients::{RequestClient, SigningClient};
+use clients::{RequestClient, SigningClient, Target};
 pub use renewal::CertChange;
 pub use revocation::UserConfirmed;
 
@@ -643,47 +644,27 @@ impl Signer {
             .ok_or_else(|| SignerError::Records("no switch before the enrollment".into()))
     }
 
-    /// A client for this step, signing with the identity key (Switch wire 7.2).
-    fn client(
-        &self,
-        origin: &str,
-        pinned: Option<[u8; 32]>,
-        key: Arc<dyn Signs + Send + Sync>,
-    ) -> Result<SwitchClient> {
-        Ok(SwitchClient::new(
-            origin,
-            self.state.identity,
-            Credentials::Signer {
-                identity: self.state.identity,
-                key,
-            },
-            pinned,
-            Arc::clone(&self.env.transport),
-            Arc::clone(&self.env.clock),
-        )?)
-    }
-
     /// A client of the switch the identity is enrolled at, for requests: it signs no
     /// operation ([`crate::key::IdentityKeyring::request_signer`]).
     fn service_client(&self) -> Result<RequestClient> {
         let service = self.service()?;
-        let key = self.keyring.request_signer()?;
-        Ok(RequestClient(self.client(
-            &service.origin,
-            Some(service.service_key),
-            key,
-        )?))
+        RequestClient::new(&self.env, &self.service_target(&service), &self.keyring)
+    }
+
+    /// Where the clients of the enrolled switch go.
+    fn service_target<'a>(&self, service: &'a Service) -> Target<'a> {
+        Target {
+            origin: &service.origin,
+            pinned: Some(service.service_key),
+            identity: self.state.identity,
+        }
     }
 
     /// A client of the switch the identity is enrolled at that signs operations with `key`,
     /// which the signing gate handed out.
     fn signing_client(&self, key: &SigningKey) -> Result<SigningClient> {
         let service = self.service()?;
-        Ok(SigningClient(self.client(
-            &service.origin,
-            Some(service.service_key),
-            key.signer(),
-        )?))
+        SigningClient::new(&self.env, &self.service_target(&service), key)
     }
 
     /// The identity key for this call's signing steps, through the signing gate
@@ -702,7 +683,12 @@ impl Signer {
     ) -> Result<()> {
         let identity = self.state.identity;
         let enrollment = Enrollment::verify(signed, &identity, origin)?;
-        let answer = RequestClient(self.client(origin, None, self.keyring.request_signer()?)?)
+        let target = Target {
+            origin,
+            pinned: None,
+            identity,
+        };
+        let answer = RequestClient::new(&self.env, &target, &self.keyring)?
             .enroll(&enrollment)
             .await?;
         let key = self.signing_key()?;

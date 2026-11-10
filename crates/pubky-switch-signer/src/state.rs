@@ -89,7 +89,7 @@ pub(crate) struct SignerState {
     pub(crate) managed_by: Option<[u8; 16]>,
     /// The version of a newer `identity.json` this install signed itself that the switch or
     /// the Homeserver holds: the records are behind, and nothing is signed until a restore
-    /// from the signer backup replaces them (a later flow).
+    /// from the signer backup replaces them ([`crate::Signer::restore`]).
     #[serde(default)]
     pub(crate) records_behind: Option<u64>,
     /// The document hash of another body at the mark's version that the Homeserver
