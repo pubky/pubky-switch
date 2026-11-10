@@ -17,6 +17,8 @@ mod enroll;
 mod identity;
 pub mod rules;
 
+pub use enroll::announced_limits;
+
 use std::sync::Arc;
 
 use axum::http::{HeaderName, HeaderValue};
@@ -445,6 +447,17 @@ impl Service {
                 return self.operator_answer(signature, base_ms, &error).await;
             }
         };
+        // What the endpoint writes is undone if it is refused, whatever step refuses it: a
+        // refusal commits the stamped time and nothing else, so no later request can build
+        // on a write it was never answered for (step 10).
+        let savepoint = match txn.savepoint().await {
+            Ok(savepoint) => savepoint,
+            Err(error) => {
+                let _ = store_error(&error);
+                let error = ApiError::unavailable("7.6: a temporary failure");
+                return sign_answer(&signer, signature, committed_ms, Answer::error(&error));
+            }
+        };
         let (answer, marked) = match self
             .run_at_account(&mut txn, &signer, request, verified, time_ms)
             .await
@@ -455,6 +468,17 @@ impl Service {
                 serving,
                 head,
             }) => {
+                if let Err(failure) = txn.rollback_to(savepoint).await {
+                    // Dropped uncommitted: nothing of the request stays, the stamp included.
+                    tracing::error!(%failure, "rolling back a refused request");
+                    let error = ApiError::unavailable("7.6: a temporary failure");
+                    return sign_answer(&signer, signature, committed_ms, Answer::error(&error));
+                }
+                // Every 401 counts against the network source, whatever the step: a request
+                // signature, an operation's, a first call's record (Switch wire 7.2, 9.4).
+                if is_failed_authentication(error.code) {
+                    self.record_failure(request, txn.head().id.clone());
+                }
                 // An error to the authenticated signer or own app carries the current head
                 // (Switch wire 7.1), except where the key's mark refuses one.
                 let head = if caller.is_some() && head {
@@ -553,24 +577,19 @@ impl Service {
         }
 
         // Step 5 comes before the staged gate: an own app is authenticated in full first.
-        let stop = |stop: batch::Stop, txn: &AccountTxn| match stop {
+        let stop = |stop: batch::Stop| match stop {
             batch::Stop::Refused(error) => Refused::with_head(error, serving),
-            // Not authenticated: no head, and a 401 counts against the source.
-            batch::Stop::Unauthenticated(error) => {
-                if is_failed_authentication(error.code) {
-                    self.record_failure(request, txn.head().id.clone());
-                }
-                Refused {
-                    error,
-                    serving,
-                    head: false,
-                }
-            }
+            // Not authenticated: no head.
+            batch::Stop::Unauthenticated(error) => Refused {
+                error,
+                serving,
+                head: false,
+            },
         };
         let writer = if *call == Call::Ops {
             match self.ops_writer(txn, held.as_ref(), verified, time_ms).await {
                 Ok(writer) => writer,
-                Err(error) => return Err(stop(error, txn)),
+                Err(error) => return Err(stop(error)),
             }
         } else {
             None
@@ -591,7 +610,7 @@ impl Service {
                 .await
             {
                 Ok(answer) => Ok((answer, serving)),
-                Err(error) => Err(stop(error, txn)),
+                Err(error) => Err(stop(error)),
             };
         }
         let (answer, serves_after) = self

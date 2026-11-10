@@ -148,6 +148,7 @@ impl Service {
         base_ms: u64,
     ) -> Result<(ServiceKey, u64, AnnouncedLimits), ApiError> {
         let unavailable = || ApiError::unavailable("7.6: a temporary failure");
+        let enrollment_hash = enrollment.signed().doc_hash().map_err(|_| unavailable())?;
         // An account that doesn't exist yet is made, then answered like any other.
         if self
             .store
@@ -166,6 +167,7 @@ impl Service {
                 limits: announced_limits(&self.limits),
                 identity_doc: enrollment.identity_doc().map(|doc| doc.signed().clone()),
                 revoked_apps: enrollment.revoked_apps().to_vec(),
+                enrollment_hash,
             };
             let created = self
                 .store
@@ -187,6 +189,22 @@ impl Service {
             .map_err(|e| store_error(&e))?
             .ok_or_else(unavailable)?;
         let time_ms = txn.stamp(base_ms);
+        let limits = txn.announced_limits().await.map_err(|e| store_error(&e))?;
+        // The same enrollment again gets the same answer, whatever the account did since
+        // (Switch wire 3.7): the key it named, recognized by the enrollment's hash.
+        if let Some(key_id) = txn
+            .enrollment_answer(&enrollment_hash)
+            .await
+            .map_err(|e| store_error(&e))?
+        {
+            txn.commit().await.map_err(|e| store_error(&e))?;
+            let public = self
+                .keys
+                .public_key(&key_id)
+                .await
+                .map_err(|_| unavailable())?;
+            return Ok((ServiceKey { id: key_id, public }, time_ms, limits));
+        }
         let account_key = txn.head().service_key.clone();
         let account_public = self
             .keys
@@ -201,7 +219,6 @@ impl Service {
             .transpose()
             .map_err(|_| unavailable())?;
         let pending = txn.pending_key().await.map_err(|e| store_error(&e))?;
-        let limits = txn.announced_limits().await.map_err(|e| store_error(&e))?;
         let state = AccountState {
             serving: names_this_service(held.as_ref(), &self.origin, &account_public),
             pending_key: pending.is_some(),
@@ -217,6 +234,14 @@ impl Service {
                 key.id
             }
         };
+        txn.keep_enrollment_answer(
+            &enrollment_hash,
+            &key_id,
+            time_ms,
+            self.limits.max_enrollments,
+        )
+        .await
+        .map_err(|e| store_error(&e))?;
         txn.commit().await.map_err(|e| store_error(&e))?;
         let public = self
             .keys

@@ -2,8 +2,8 @@
 
 ALTER TABLE accounts
     -- The limits announced at the first enrollment, as the answer writes them; every later
-    -- enrollment announces the same (Switch wire 3.7).
-    ADD COLUMN announced_limits BYTEA  NOT NULL,
+    -- enrollment announces the same (Switch wire 3.7). Not null, from the update below.
+    ADD COLUMN announced_limits BYTEA,
     -- The key store ID of the next generation's pending key, once an enrollment at the
     -- serving account asked for one (Switch wire 3.7).
     ADD COLUMN pending_key     TEXT,
@@ -13,6 +13,16 @@ ALTER TABLE accounts
     -- version the account was enrolled with (Switch wire 7.4.2).
     ADD COLUMN identity_proof  BYTEA,
     ADD CHECK (identity_proof IS NULL OR identity_doc IS NOT NULL);
+
+-- An account enrolled before this column existed was announced the limits the service ran
+-- with, which this migration can't see: the service passes the limits in force when it
+-- migrates, in the setting pubky_switch.announced_limits, and every such account inherits
+-- them. A database holding accounts can only be migrated that way; without the setting the
+-- update fails and nothing is applied.
+UPDATE accounts
+    SET announced_limits = convert_to(current_setting('pubky_switch.announced_limits'), 'UTF8')
+    WHERE announced_limits IS NULL;
+ALTER TABLE accounts ALTER COLUMN announced_limits SET NOT NULL;
 
 -- App IDs the account keeps for good: revoked, departed, or named by an enrollment's
 -- revoked_apps, so they are never current again (Switch wire 3.3, 3.7, 9.1).
