@@ -649,7 +649,7 @@ async fn test_apps_departure_rotation_is_done_for_good() {
         awaiting(&body(&get_apps(&replay, "signer", &at).await)),
         json!(true)
     );
-    // Dropped from apps, in neither list: not a rotation.
+    // Dropped from apps at a higher data epoch, in neither list: not a rotation.
     let v3 = held_doc("alice identity.json");
     let v4 = next_version(&replay, &v3, &at, |body| {
         body.apps.retain(|listed| listed.app_id != executor);
@@ -660,20 +660,28 @@ async fn test_apps_departure_rotation_is_done_for_good() {
         awaiting(&body(&get_apps(&replay, "signer", &at).await)),
         json!(true)
     );
-    // In removed at a higher data epoch: done, and it stays done though a later version
-    // lowers data_epoch, which the service doesn't refuse (Switch wire 3.3).
+    // In removed, but at the departure's own data epoch, 2, which the service accepts
+    // though it lowers data_epoch (Switch wire 3.3): not a rotation either.
     let v5 = next_version(&replay, &v4, &at, |body| {
         body.removed.push(RemovedApp {
             app_id: executor,
             distrust_from: ms(&at),
         });
+        body.data_epoch = 2;
     })
     .await;
     assert_eq!(
         awaiting(&body(&get_apps(&replay, "signer", &at).await)),
+        json!(true)
+    );
+    // In removed above it: done, and it stays done though a later version lowers
+    // data_epoch again.
+    let v6 = next_version(&replay, &v5, &at, |body| body.data_epoch = 3).await;
+    assert_eq!(
+        awaiting(&body(&get_apps(&replay, "signer", &at).await)),
         json!(false)
     );
-    next_version(&replay, &v5, &at, |body| body.data_epoch = 1).await;
+    next_version(&replay, &v6, &at, |body| body.data_epoch = 1).await;
     assert_eq!(
         awaiting(&body(&get_apps(&replay, "signer", &at).await)),
         json!(false)
