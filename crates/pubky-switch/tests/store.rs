@@ -43,6 +43,7 @@ impl Fixture {
             limits: pubky_switch_core::records::Limits::default(),
             identity_doc: None,
             revoked_apps: Vec::new(),
+            enrollment_hash: [0; 32],
         };
         assert!(self.store().create_account(&account).await.expect("create"));
         account
@@ -624,4 +625,61 @@ async fn test_store_connect_waits_for_a_late_database() {
     store.close().await;
     forwarder.abort();
     fx.finish().await;
+}
+
+/// A database holding an account from before migration 0002, migrated now.
+#[tokio::test]
+#[allow(clippy::panic)]
+async fn test_store_upgrade_gives_existing_accounts_the_limits_in_force() {
+    use pubky_switch::store::{DatabaseConfig, MIGRATIONS, testing::TestDatabase};
+    let db = match TestDatabase::create_with(&DatabaseConfig::default(), false).await {
+        Ok(db) => db,
+        Err(pubky_switch::store::testing::TestDatabaseError::Skipped) => return,
+        Err(error) => panic!("test database: {error}"),
+    };
+    let mut conn = PgConnection::connect_with(db.options())
+        .await
+        .expect("conn");
+    let first = sqlx::migrate::Migrator {
+        migrations: std::borrow::Cow::Owned(MIGRATIONS.iter().take(1).cloned().collect()),
+        ignore_missing: false,
+        locking: true,
+        no_tx: false,
+    };
+    first.run(&mut conn).await.expect("migration 0001");
+    sqlx::query(
+        "INSERT INTO accounts (id, identity_key, generation, service_key, created_at_ms) \
+         VALUES ('old', $1, 1, 'key', 1)",
+    )
+    .bind([7u8; 32].as_slice())
+    .execute(&mut conn)
+    .await
+    .expect("an account under 0001");
+    // Without the limits in force, the upgrade fails and applies nothing.
+    assert!(MIGRATIONS.run(&mut conn).await.is_err());
+    // A failed run keeps the migrator's lock on its connection.
+    conn.close().await.expect("close");
+    let mut conn = PgConnection::connect_with(db.options())
+        .await
+        .expect("conn");
+    let applied: i64 = sqlx::query_scalar("SELECT max(version) FROM _sqlx_migrations")
+        .fetch_one(&mut conn)
+        .await
+        .expect("versions");
+    assert_eq!(applied, 1);
+    // With them, the account inherits them.
+    let limits = pubky_switch::limits::Limits {
+        app_limit: 7,
+        ..pubky_switch::limits::Limits::default()
+    };
+    let announced = pubky_switch::service::announced_limits(&limits);
+    db.store().migrate(&announced).await.expect("upgrade");
+    let stored: Vec<u8> =
+        sqlx::query_scalar("SELECT announced_limits FROM accounts WHERE id = 'old'")
+            .fetch_one(&mut conn)
+            .await
+            .expect("limits");
+    assert_eq!(stored, serde_json::to_vec(&announced).expect("json"));
+    conn.close().await.expect("close");
+    db.drop_database().await.expect("drop");
 }
