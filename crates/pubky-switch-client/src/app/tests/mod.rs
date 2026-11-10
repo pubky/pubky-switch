@@ -7,6 +7,7 @@ mod protocol_api;
 mod protocol_reads;
 mod push;
 mod shared_flows;
+mod store_failures;
 
 use std::sync::{Arc, Mutex};
 

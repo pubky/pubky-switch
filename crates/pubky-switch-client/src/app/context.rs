@@ -87,6 +87,9 @@ pub struct ReceiveContext<'a> {
     ns: &'a str,
     may_attempt: bool,
     fetched: &'a [([u8; 32], ClaimFetch)],
+    /// The local writes of the entries processed before this one in the same read, not yet
+    /// committed.
+    pending: &'a [LocalWrite],
     writes: ContextWrites,
 }
 
@@ -104,6 +107,38 @@ fn local_get(store: &dyn StateStore, ns: &str, key: &[u8]) -> Result<Option<Vec<
     store
         .get(ns, &[PROTOCOL_PREFIX, key].concat())
         .map_err(store_error)
+}
+
+/// A key's value after `pending`, local writes not yet committed: `Some(value)` when one of
+/// them sets or removes it, `None` when none touches it.
+fn pending_get(pending: &[LocalWrite], key: &[u8]) -> Option<Option<Vec<u8>>> {
+    pending.iter().rev().find_map(|write| match write {
+        LocalWrite::Put { key: k, value } if k.as_slice() == key => Some(Some(value.clone())),
+        LocalWrite::Delete { key: k } if k.as_slice() == key => Some(None),
+        LocalWrite::DeletePrefix { prefix } if key.starts_with(prefix) => Some(None),
+        _ => None,
+    })
+}
+
+/// The values under `prefix` that `committed` holds, with `pending` applied in order.
+fn pending_scan(committed: Vec<KeyValue>, pending: &[LocalWrite], prefix: &[u8]) -> Vec<KeyValue> {
+    if pending.is_empty() {
+        return committed;
+    }
+    let mut values: std::collections::BTreeMap<Vec<u8>, Vec<u8>> = committed.into_iter().collect();
+    for write in pending {
+        match write {
+            LocalWrite::Put { key, value } if key.starts_with(prefix) => {
+                values.insert(key.clone(), value.clone());
+            }
+            LocalWrite::Put { .. } => {}
+            LocalWrite::Delete { key } => {
+                values.remove(key);
+            }
+            LocalWrite::DeletePrefix { prefix } => values.retain(|k, _| !k.starts_with(prefix)),
+        }
+    }
+    values.into_iter().collect()
 }
 
 fn local_scan(store: &dyn StateStore, ns: &str, prefix: &[u8]) -> Result<Vec<KeyValue>, AppError> {
@@ -196,6 +231,7 @@ impl<'a> ReceiveContext<'a> {
         ns: &'a str,
         may_attempt: bool,
         fetched: &'a [([u8; 32], ClaimFetch)],
+        pending: &'a [LocalWrite],
     ) -> Self {
         Self {
             state,
@@ -203,6 +239,7 @@ impl<'a> ReceiveContext<'a> {
             ns,
             may_attempt,
             fetched,
+            pending,
             writes: ContextWrites::default(),
         }
     }
@@ -358,23 +395,32 @@ impl<'a> ReceiveContext<'a> {
             .map(|(_, fetch)| fetch)
     }
 
-    /// A value of the protocol's own local state, as committed before this message.
+    /// A value of the protocol's own local state before this message: as committed, with
+    /// the local writes of the messages processed before it in the same read of the feed,
+    /// which aren't committed yet. A step that ended in [`super::Outcome::Drop`],
+    /// [`super::Outcome::Need`] or [`super::Outcome::Retry`] wrote nothing, so this shows
+    /// none of its writes, nor of this step's own [`ReceiveContext::local`].
     ///
     /// # Errors
     ///
     /// A store failure.
     pub fn local_get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, AppError> {
-        local_get(self.store, self.ns, key)
+        match pending_get(self.pending, key) {
+            Some(value) => Ok(value),
+            None => local_get(self.store, self.ns, key),
+        }
     }
 
     /// Every value of the protocol's local state whose key starts with `prefix`, with its
-    /// key in the protocol's key space, in key order, as committed before this message.
+    /// key in the protocol's key space, in key order, before this message, as
+    /// [`ReceiveContext::local_get`] reads it.
     ///
     /// # Errors
     ///
     /// A store failure.
     pub fn local_scan(&self, prefix: &[u8]) -> Result<Vec<KeyValue>, AppError> {
-        local_scan(self.store, self.ns, prefix)
+        let committed = local_scan(self.store, self.ns, prefix)?;
+        Ok(pending_scan(committed, self.pending, prefix))
     }
 
     // ---------------------------------------------------------------------------------
