@@ -7,9 +7,15 @@ service.
 
 ## Batches
 
-- **Request authentication** (Switch wire 7.1, 7.2): no request signature, timestamp or
+- **Request authentication** (Switch wire 7.1, 7.2): no request signature or
   `Switch-Identity` check; the caller is the `Switch-App` header as sent, and an app of
-  another identity is the `Switch-Identity` header as sent. Each operation's signature is
+  another identity is the `Switch-Identity` header as sent. A `Switch-Timestamp` more than 5
+  minutes from the switch's clock is `401 stale_timestamp`, with `current.server_time` and
+  the last stamped time in `Switch-Server-Time`, as at the service; a missing or unparsable
+  one isn't refused. Every other request stamps the clock's time. Answers to own apps and
+  the signer carry `Switch-Head`, refusals included, but a `401`, the enrollment and the
+  erasure. An injected `401` fault is answered as before the lock, with the last stamped
+  time and no head; other injected faults with the clock's time and the head. Each operation's signature is
   verified, and an own app must be current with an unexpired certificate.
 - **Rates** (Switch wire 6.4 step 7, 9.4): no operation, control, per-caller or
   failed-authentication limits; never `429 rate_limited`.
@@ -62,7 +68,10 @@ service.
   `forget_peer_copy`.
 - **`open_admission`** (`admit_everyone`) admits every sender the deny list doesn't hold, a
   test switch only.
-- **App currency outside batches**: other routes check only that the app hasn't departed.
+- **App currency outside batches**: a feed read is checked as a batch is, for an app that
+  delivered its record: current, with an unexpired certificate, the stored renewed one once
+  the newest `identity.json` lists it (Switch wire 7.2, 3.8). Other routes check only that
+  the app hasn't departed.
 - **`POST /v1/enroll`** (Switch wire 3.7, 7.4.1), in `switch/signer.rs`: only at
   [`SWITCH_ORIGIN`], with the default limits unless a test sets others
   (`set_enroll_limits`), and without checking the request signature. A
@@ -74,15 +83,18 @@ service.
   - a serving account is answered `400`, never a pending key for the next generation, so
     there is no key change in place and no provider loss at the same service.
 - **`PUT /identity`** (Switch wire 3.3, 7.4.2), in `switch/signer.rs`: judged by the core's
-  `check_delivery`, like the service, with no kept proofs (`kept_proofs` empty, as at the
-  service until it serves operations). Unlike the service: there is no pending key, so no
-  generation change at a serving account; a first document carrying `recovery_from`, or at
-  another generation than the switch's, is chained where the service answers `503`; and the
-  answer carries the head in its body only, not in `Switch-Head`. The test call `deliver_identity` takes any document, without those
+  `check_delivery`, like the service, with the kept proofs taken from what it holds: each held
+  record's current write proof and each live claim's entry proofs, by the generation each
+  names, with the key of that generation (its own, or the earlier service's that
+  `import_into` carried). Unlike the service: there is no pending key, so no
+  generation change at a serving account; and a first document carrying `recovery_from`, or
+  at another generation than the switch's, is chained where the service answers `503`. The test call `deliver_identity` takes any document, without those
   checks, for scripting what another signer or a faulty service did.
 - **`GET /apps`** (Switch wire 7.4.12): the apps the switch holds or the newest document
-  lists, with `current`, `record_cert` and `bundle_ranges`; no last-seen times, attempts,
-  unread counts, `keys_through`, departures or `proof_generations`.
+  lists, with `current`, `record_cert`, `bundle_ranges` and `cert_expires_at`, and the
+  account's `identity`, `recovery` (`declared_at` its recovery record's time) and
+  `proof_generations`, from the same kept proofs as the delivery; no last-seen times,
+  attempts, unread counts, `keys_through` or departures.
 - **Moves and recovery** (Switch spec 12.5, 12.6, Switch wire 10): `import_into` copies the
   account in memory, with no manifest, chunks or export transfer; a recovery upload is kept
   and answered with fixed changes, merging nothing.

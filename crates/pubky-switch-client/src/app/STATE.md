@@ -44,7 +44,8 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
 | `ident/<pubky>/floor` | the highest version and generation seen | |
 | `ident/<pubky>/body/<version>` | the body hash seen at a version, for equivocation | |
 | `ident/<pubky>/equivocated` | the version at which another body was seen | |
-| `ident/<pubky>/sw` | when a counterparty's switch copy was last looked up, and whether the read succeeded | |
+| `ident/<pubky>/sw` | when a counterparty's switch copy was last looked up, whether the read succeeded, and the lookup's number | |
+| `ident/<pubky>/swn` | the number of the last switch lookup begun for a counterparty, which orders the lookups whatever the clock reads | |
 | `ident/<pubky>/reads` | when a counterparty's `identity.json` was last read from its Homeserver, and from its switch | |
 | `rk/<n>` | a held receive key: secret, signed record, registration `seq`, pending batch | yes |
 | `kid/<kid>` | a kid this app or one of its devices made, kept after the key is deleted | |

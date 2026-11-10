@@ -243,9 +243,22 @@ pub fn check_batch(ops: &[SignedOp]) -> std::result::Result<(), Refusal> {
     Ok(())
 }
 
-/// The bounds of a `cursor.set` position (Switch wire 6.2): its generation is `current`, or
+/// What a `cursor.set` does (Switch wire 6.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CursorMove {
+    /// The position is ahead of the app's cursor: the cursor moves to it.
+    Moves,
+    /// The position is at the app's cursor or behind it: nothing changes, and it isn't an
+    /// error, so a batch sent again or replayed can't move the cursor back.
+    Stays,
+}
+
+/// The rules of a `cursor.set` position (Switch wire 6.2): its generation is `current`, or
 /// `continued_from`, the generation a cooperative move's sequence continues from, and its
-/// `seq` is at most `newest`, the newest `seq` of the account's sequence.
+/// `seq` is at most `newest`, the newest `seq` given out before the batch. It moves the
+/// cursor only past `held`, the `seq` of the app's cursor (`None` before its first), since
+/// positions are compared by `seq`, which a cooperative move and a key change in place
+/// continue.
 ///
 /// # Errors
 ///
@@ -255,7 +268,8 @@ pub fn check_cursor(
     current: u64,
     continued_from: Option<u64>,
     newest: u64,
-) -> std::result::Result<(), Refusal> {
+    held: Option<u64>,
+) -> std::result::Result<CursorMove, Refusal> {
     if position.generation != current && Some(position.generation) != continued_from {
         return Err(Refusal::bad_request(
             "Switch wire 6.2: a cursor.set of another generation",
@@ -266,7 +280,11 @@ pub fn check_cursor(
             "Switch wire 6.2: a cursor.set past the newest seq",
         ));
     }
-    Ok(())
+    if held.is_none_or(|held| position.seq > held) {
+        Ok(CursorMove::Moves)
+    } else {
+        Ok(CursorMove::Stays)
+    }
 }
 
 /// A batch ID: 16 bytes from the secure random generator (Switch wire 1.7).
@@ -1038,15 +1056,45 @@ mod tests {
     #[test]
     fn test_check_cursor_keeps_the_generation_and_head_bounds() {
         let at = |generation, seq| Position { generation, seq };
-        assert!(check_cursor(at(1, 0), 1, None, 0).is_ok());
-        assert!(check_cursor(at(1, 9), 1, None, 9).is_ok());
+        assert!(check_cursor(at(1, 0), 1, None, 0, None).is_ok());
+        assert!(check_cursor(at(1, 9), 1, None, 9, None).is_ok());
         // After a cooperative move, the generation the sequence continues from.
-        assert!(check_cursor(at(1, 9), 2, Some(1), 12).is_ok());
-        assert!(check_cursor(at(2, 12), 2, Some(1), 12).is_ok());
-        let refused = |position| check_cursor(position, 1, None, 9).err().map(|r| r.code);
+        assert!(check_cursor(at(1, 9), 2, Some(1), 12, None).is_ok());
+        assert!(check_cursor(at(2, 12), 2, Some(1), 12, None).is_ok());
+        let refused = |position| {
+            check_cursor(position, 1, None, 9, None)
+                .err()
+                .map(|r| r.code)
+        };
         assert_eq!(refused(at(1, 10)), Some(ErrorCode::BadRequest));
         assert_eq!(refused(at(77, 9)), Some(ErrorCode::BadRequest));
         assert_eq!(refused(at(0, 0)), Some(ErrorCode::BadRequest));
-        assert!(check_cursor(at(3, 0), 2, Some(1), 12).is_err());
+        assert!(check_cursor(at(3, 0), 2, Some(1), 12, None).is_err());
+    }
+
+    #[test]
+    fn test_check_cursor_moves_only_forward() {
+        let at = |seq| Position { generation: 1, seq };
+        let moves = |seq, held| check_cursor(at(seq), 1, None, 9, held).unwrap();
+        // Forward, or a first position: the cursor moves.
+        assert_eq!(moves(5, Some(4)), CursorMove::Moves);
+        assert_eq!(moves(0, None), CursorMove::Moves);
+        // At it or behind it: nothing changes, and it isn't an error.
+        assert_eq!(moves(4, Some(4)), CursorMove::Stays);
+        assert_eq!(moves(3, Some(4)), CursorMove::Stays);
+        // Compared by seq, across the generation a move continues from.
+        let continued = check_cursor(
+            Position {
+                generation: 1,
+                seq: 9,
+            },
+            2,
+            Some(1),
+            12,
+            Some(10),
+        );
+        assert_eq!(continued.unwrap(), CursorMove::Stays);
+        // The bounds still come first.
+        assert!(check_cursor(at(10), 1, None, 9, Some(4)).is_err());
     }
 }
