@@ -46,9 +46,9 @@ use super::App;
 use super::chain::ChainView;
 use super::context::LocalView;
 use super::error::{AppError, Refusal};
-use super::events::AppEvent;
+use super::events::{AppEvent, Duty, KeptRefusal};
 use super::identity::REVALIDATION_MS;
-use super::protocol::LocalWrite;
+use super::protocol::{LocalWrite, MAX_STEP_LOCAL_BYTES, local_writes_bytes};
 use super::state::{Cursor, HeldKey, KnownKid, RestoreState, key};
 use crate::client::Batch;
 use crate::client::answers::{FeedItem, FeedQuery, RecoveryUpload, UploadLists, UploadedOp};
@@ -626,7 +626,21 @@ impl App {
                 loss.conversations.dedup();
                 loss.step = LossStep::Conversations;
                 let mut tx = self.tx()?;
-                tx.local(&actions.local)?;
+                if local_writes_bytes(&actions.local) > MAX_STEP_LOCAL_BYTES {
+                    // Over the bound: not committed, and not asked again, since the same
+                    // answer would come and the recovery would never go on; the protocol is
+                    // told, and the loss goes on.
+                    self.keep_duty(
+                        &mut tx,
+                        Duty::LocalWritesRefused {
+                            call: KeptRefusal::Loss {
+                                lost_generation: loss.lost_generation,
+                            },
+                        },
+                    )?;
+                } else {
+                    tx.local(&actions.local)?;
+                }
                 tx.put(keys::LOSS, &*loss)?;
                 return self.commit(tx).await;
             }

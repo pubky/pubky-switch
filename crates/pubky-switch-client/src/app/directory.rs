@@ -35,12 +35,12 @@ use super::context::LocalView;
 use super::error::{Alarm, Refusal};
 use super::events::AppEvent;
 use super::identity::{self, DOC_CACHE_MS, Taken};
-use super::state::CachedDoc;
+use super::state::{CachedDoc, Tx};
 use super::{App, AppError};
 use crate::client::answers::Directory;
 use crate::client::read::Obj;
 use crate::client::{Credentials, SwitchClient};
-use crate::error::ClientError;
+use crate::error::{ClientError, StoreError};
 
 /// How long the app keeps delivering its own `identity.json` to the switches it wrote to:
 /// the 30 days senders keep sent messages (Switch spec 12.2 step 5).
@@ -904,8 +904,17 @@ impl App {
             read_ms: self.now(),
         };
         let mut tx = self.tx()?;
-        tx.put(&dir_key(pubky), &cached)?;
-        self.commit(tx).await?;
+        keep_directory(&mut tx, pubky, &cached)?;
+        match self.commit(tx).await {
+            // A store that refuses it as too large keeps none either: this send uses it.
+            Err(AppError::Store(StoreError::TooLarge { .. })) => {
+                self.reload_now().await?;
+                let mut tx = self.tx()?;
+                tx.delete(&dir_key(pubky))?;
+                self.commit(tx).await?;
+            }
+            committed => committed?,
+        }
         // A provider loss since the copy held: the old switch's accepted messages since the
         // previous check are sent again to the new one (Switch spec 8.1).
         if let Some(previous) = previous
@@ -940,7 +949,7 @@ impl App {
         if let Some(mut cached) = self.cached_directory(pubky).await? {
             cached.stale = true;
             let mut tx = self.tx()?;
-            tx.put(&dir_key(pubky), &cached)?;
+            keep_directory(&mut tx, pubky, &cached)?;
             self.commit(tx).await?;
         }
         Ok(())
@@ -1223,7 +1232,7 @@ impl App {
         if !gone.is_empty() {
             cached.stale = true;
         }
-        tx.put(&dir_key(pubky), &cached)?;
+        keep_directory(&mut tx, pubky, &cached)?;
         self.commit(tx).await
     }
 
@@ -1392,6 +1401,21 @@ impl App {
         let mut tx = self.tx()?;
         tx.put(PEERS_DOC, &judged)?;
         self.commit(tx).await
+    }
+}
+
+/// Cache `cached` as `pubky`'s directory, or, when it is over the store's value size, cache
+/// none: a directory may take up to 104 MiB at an app limit of 255 (Switch wire 9), and one
+/// too large to keep is read again at each send instead, which then still goes.
+fn keep_directory(tx: &mut Tx, pubky: &[u8; 32], cached: &CachedDirectory) -> Result<(), AppError> {
+    let key = dir_key(pubky);
+    let size = super::state::encode(cached)?
+        .len()
+        .saturating_add(key.len());
+    if u64::try_from(size).unwrap_or(u64::MAX) <= crate::store::MAX_VALUE_BYTES {
+        tx.put(&key, cached)
+    } else {
+        tx.delete(&key)
     }
 }
 

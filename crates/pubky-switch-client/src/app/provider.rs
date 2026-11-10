@@ -508,7 +508,7 @@ impl App {
         }
     }
 
-    async fn reload_now(&mut self) -> Result<(), AppError> {
+    pub(crate) async fn reload_now(&mut self) -> Result<(), AppError> {
         self.reload = true;
         self.ready_local().await
     }

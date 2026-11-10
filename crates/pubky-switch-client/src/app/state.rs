@@ -505,7 +505,9 @@ pub(crate) struct PendingEffect {
     pub(crate) hash: [u8; 32],
     pub(crate) accepted_at_ms: u64,
     pub(crate) kind: String,
-    /// The protocol's local writes, committed with the outcome.
+    /// The protocol's local writes, committed with the outcome, kept in base64
+    /// ([`kept_local`]).
+    #[serde(with = "kept_local")]
     pub(crate) local: Vec<LocalWrite>,
     /// The cursor the batch moves to, if it moves it.
     pub(crate) cursor_to: Option<u64>,
@@ -799,11 +801,202 @@ pub(crate) fn parse_num(text: &str) -> Result<u64, AppError> {
         .map_err(|_| AppError::Store(StoreError::Corrupt))
 }
 
+/// The kept form of local writes in a kept effect or batch: each key and value in
+/// base64url (`{"Put":{"key":"…","value":"…"}}`), so a write keeps in at most 4/3 of its
+/// bytes whatever they are (`MAX_STEP_LOCAL_BYTES`). It reads the form written before,
+/// `LocalWrite`'s own, with its bytes as arrays of numbers, too, so no stored value needs a
+/// migration.
+pub(crate) mod kept_local {
+    use pubky_switch_core::enc::{b64, serde_b64_vec};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use super::LocalWrite;
+
+    fn bytes<S: Serializer>(bytes: &&[u8], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&b64(bytes))
+    }
+
+    #[derive(Serialize)]
+    enum Out<'a> {
+        Put {
+            #[serde(serialize_with = "bytes")]
+            key: &'a [u8],
+            #[serde(serialize_with = "bytes")]
+            value: &'a [u8],
+        },
+        Delete {
+            #[serde(serialize_with = "bytes")]
+            key: &'a [u8],
+        },
+        DeletePrefix {
+            #[serde(serialize_with = "bytes")]
+            prefix: &'a [u8],
+        },
+    }
+
+    #[derive(Deserialize)]
+    enum Kept {
+        Put {
+            #[serde(with = "serde_b64_vec")]
+            key: Vec<u8>,
+            #[serde(with = "serde_b64_vec")]
+            value: Vec<u8>,
+        },
+        Delete {
+            #[serde(with = "serde_b64_vec")]
+            key: Vec<u8>,
+        },
+        DeletePrefix {
+            #[serde(with = "serde_b64_vec")]
+            prefix: Vec<u8>,
+        },
+    }
+
+    /// The base64 form, or the earlier one with arrays of numbers.
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Either {
+        Kept(Kept),
+        Earlier(LocalWrite),
+    }
+
+    pub(crate) fn serialize<S: Serializer>(writes: &[LocalWrite], s: S) -> Result<S::Ok, S::Error> {
+        s.collect_seq(writes.iter().map(|write| match write {
+            LocalWrite::Put { key, value } => Out::Put { key, value },
+            LocalWrite::Delete { key } => Out::Delete { key },
+            LocalWrite::DeletePrefix { prefix } => Out::DeletePrefix { prefix },
+        }))
+    }
+
+    pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<Vec<LocalWrite>, D::Error> {
+        Ok(Vec::<Either>::deserialize(d)?
+            .into_iter()
+            .map(|write| match write {
+                Either::Kept(Kept::Put { key, value }) => LocalWrite::Put { key, value },
+                Either::Kept(Kept::Delete { key }) => LocalWrite::Delete { key },
+                Either::Kept(Kept::DeletePrefix { prefix }) => LocalWrite::DeletePrefix { prefix },
+                Either::Earlier(write) => write,
+            })
+            .collect())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::store::{MemoryStore, StateStore};
     use std::sync::Arc;
+
+    use crate::app::{LOCAL_WRITE_OVERHEAD_BYTES, MAX_STEP_LOCAL_BYTES};
+    use crate::store::MAX_VALUE_BYTES;
+
+    #[derive(Serialize, Deserialize, PartialEq, Debug)]
+    struct Kept {
+        #[serde(with = "kept_local")]
+        local: Vec<LocalWrite>,
+    }
+
+    fn writes() -> Vec<LocalWrite> {
+        vec![
+            LocalWrite::Put {
+                key: b"k".to_vec(),
+                value: vec![0, 255, 7],
+            },
+            LocalWrite::Delete { key: b"d".to_vec() },
+            LocalWrite::DeletePrefix {
+                prefix: b"p/".to_vec(),
+            },
+        ]
+    }
+
+    #[test]
+    fn test_kept_local_writes_are_base64_and_read_back() {
+        let kept = Kept { local: writes() };
+        let json = serde_json::to_value(&kept).unwrap();
+        assert_eq!(json["local"][0]["Put"]["value"], b64(&[0, 255, 7]));
+        assert_eq!(serde_json::from_value::<Kept>(json).unwrap(), kept);
+    }
+
+    #[test]
+    fn test_kept_local_writes_of_the_earlier_form_still_read() {
+        // As `LocalWrite`'s own derive wrote them: bytes as arrays of numbers.
+        let earlier = serde_json::json!({
+            "local": writes()
+                .iter()
+                .map(|write| serde_json::to_value(write).unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            earlier["local"][0]["Put"]["value"],
+            serde_json::json!([0, 255, 7])
+        );
+        assert_eq!(
+            serde_json::from_value::<Kept>(earlier).unwrap(),
+            Kept { local: writes() }
+        );
+    }
+
+    /// A kept effect at the largest it can be: a `POST /ops` body at its 4 MiB cap, the
+    /// largest plaintext and certificate, and `local` writes at the bound.
+    fn largest_effect(local: Vec<LocalWrite>) -> PendingEffect {
+        PendingEffect {
+            body: vec![0xff; 4 << 20],
+            seq: u64::MAX,
+            sender: [0xff; 32],
+            msg_id: "f".repeat(36),
+            hash: [0xff; 32],
+            accepted_at_ms: u64::MAX,
+            kind: "k".repeat(65),
+            local,
+            cursor_to: Some(u64::MAX),
+            past_held: true,
+            parked: true,
+            deadlines: (0..7)
+                .map(|n| {
+                    (
+                        b64(&[n; 32]),
+                        super::super::claims::ObligationDeadline::At(u64::MAX),
+                    )
+                })
+                .collect(),
+            kept_ms: Some(u64::MAX),
+            entry: KeptEntry {
+                cert: SignedDoc {
+                    body: "A".repeat(33 * 1024),
+                    sig: "A".repeat(86),
+                },
+                plaintext: vec![0xff; 64 * 1024],
+                context: Some(Value::String("c".repeat(1024))),
+            },
+        }
+    }
+
+    #[test]
+    fn test_kept_effect_at_the_bound_fits_one_value() {
+        // One write at the bound, and the most writes the bound lets through.
+        let one = vec![LocalWrite::Put {
+            key: vec![0xff],
+            value: vec![0xff; MAX_STEP_LOCAL_BYTES - 1 - LOCAL_WRITE_OVERHEAD_BYTES],
+        }];
+        let many: Vec<LocalWrite> = (0..MAX_STEP_LOCAL_BYTES / (1 + LOCAL_WRITE_OVERHEAD_BYTES))
+            .map(|n| LocalWrite::Put {
+                key: vec![u8::try_from(n % 256).unwrap()],
+                value: Vec::new(),
+            })
+            .collect();
+        for local in [one, many] {
+            assert!(crate::app::local_writes_bytes(&local) <= MAX_STEP_LOCAL_BYTES);
+            let size = encode(&largest_effect(local)).unwrap().len();
+            assert!(
+                u64::try_from(size).unwrap() < MAX_VALUE_BYTES,
+                "{size} bytes kept"
+            );
+            // The arithmetic of `MAX_STEP_LOCAL_BYTES`: under 10.9 MiB.
+            assert!(size < 109 * 1024 * 1024 / 10, "{size}");
+        }
+    }
 
     /// Reads of retries over `due` while each read stores more entries than the bound,
     /// at `seq`s `stored_at` gives; returns how many times each of the first was tried.

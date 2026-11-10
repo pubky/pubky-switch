@@ -65,16 +65,17 @@ pub use chain::{HELD_MARKS, STUBS_KEPT_FOR_MS};
 pub use error::{Alarm, AppError, Refusal};
 pub use events::{
     AppEvent, BackupRefusal, ClaimAttempt, EVENT_ID_LEN, EventId, EventIdError, ParkReason,
+    RefusedCall,
 };
 pub use feed::ReceiveReport;
 pub use identity::{DOC_CACHE_MS, HomeserverReader, IdentityRefresh, REVALIDATION_MS};
 pub use parked::ParkedMessage;
 pub use peek::{PeekReport, Peeked};
 pub use protocol::{
-    Effect, LocalWrite, MAX_CLAIM_READS, MAX_STEP_LOCAL_BYTES, MissedEntries, Need, OpaqueRule,
-    Outcome, PARKED_RETRIES_PER_READ, Protocol, ProtocolLayer, RETRY_EVENT_READS, ReceivedMessage,
-    ResendNeeded, ResendReason, StoreFailure, decode_local_state, encode_local_state,
-    local_writes_bytes,
+    Effect, LOCAL_WRITE_OVERHEAD_BYTES, LocalWrite, MAX_CLAIM_READS, MAX_STEP_LOCAL_BYTES,
+    MissedEntries, Need, OpaqueRule, Outcome, PARKED_RETRIES_PER_READ, Protocol, ProtocolLayer,
+    RETRY_EVENT_READS, ReceivedMessage, ResendNeeded, ResendReason, StoreFailure,
+    decode_local_state, encode_local_state, local_writes_bytes,
 };
 pub use provider::ProviderStatus;
 pub use push::{MAX_HANDLE_BYTES, MAX_HANDLES, PushHandles, PushRegistration, PushRelay};
@@ -82,7 +83,7 @@ pub use recovery::{Evidence, LossActions, ProviderLoss, RESIDUAL_WINDOW_MS, Reco
 pub use state::{PROTOCOL_PREFIX, SCHEMA_VERSION};
 
 pub use admission::{INVITE_CODE_BYTES, InviteCode, LISTS_TOO_LARGE_RETRY_MS, SenderDisposition};
-pub use batch::{OpBatch, server_time_in};
+pub use batch::{MAX_KEPT_BATCHES_BYTES, OpBatch, server_time_in};
 pub use claims::{
     ClaimDoubt, ClaimEntryRead, ClaimEvidence, ClaimOp, ClaimRead, ClaimWritten,
     ObligationDeadline, claim_conflict,

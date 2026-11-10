@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 use super::claims::ObligationDeadline;
 use super::error::{Refusal, RefusalPlace, refused_at, refused_for_good};
 use super::events::AppEvent;
-use super::protocol::LocalWrite;
+use super::protocol::{LocalWrite, MAX_STEP_LOCAL_BYTES, local_writes_bytes};
 use super::recovery::LossStep;
 use super::send::{OutboxItem, SignedMessage};
 use super::state::{Tx, key};
@@ -43,6 +43,19 @@ use crate::error::ClientError;
 
 /// The prefix of the kept batches.
 const PENDING_PREFIX: &str = "opq/";
+
+/// The most bytes the batches kept unanswered (`opq/`) take together, as stored:
+/// [`App::submit_batch`] keeps no batch past it. A provider change carries every kept batch
+/// in its one commit, signed again or settled (Switch spec 12.5 "Kept batches"), so this
+/// bounds that commit: the change's own records (under 2 MiB: `meta`, the cursor and chain
+/// view, the move or loss record with its re-registration batch, the receive keys), the
+/// kept effect's outcome (its local writes, at most 4 MiB, `MAX_STEP_LOCAL_BYTES`; a
+/// settle without proofs caches no record), and the kept batches, each either signed again
+/// at about its own size or settled into its local writes and queued messages, both under
+/// its stored size plus 80 bytes, a fifth of the smallest batch: at most 1.2 x 12 MiB =
+/// 14.4 MiB. Under 21 MiB in all, below the 32 MiB batch size. One batch at the largest it
+/// can be, under 10.9 MiB kept (`MAX_STEP_LOCAL_BYTES`), always fits on its own.
+pub const MAX_KEPT_BATCHES_BYTES: usize = 12 * 1024 * 1024;
 
 /// Refuse the app's own lifecycle operations, and the signer's, in a batch a host or a
 /// protocol builds: `app.put`, `receive_key.put`, `key_bundle.put` and `cert.put`. The app
@@ -216,8 +229,13 @@ pub(crate) struct PendingBatch {
     pub(crate) body: Vec<u8>,
     pub(crate) invites: Vec<InviteNote>,
     pub(crate) deadlines: Vec<(String, ObligationDeadline)>,
-    /// The protocol's local writes, committed with the answer.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// The protocol's local writes, committed with the answer, kept in base64
+    /// ([`super::state::kept_local`]).
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        with = "super::state::kept_local"
+    )]
     pub(crate) local: Vec<LocalWrite>,
     /// The messages put in the outbox with the answer.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -414,6 +432,14 @@ impl App {
                 Refusal::Usage("Switch wire 6.4: a batch has 1 to 8 entries".into()).into(),
             );
         }
+        // Local writes over the bound are refused at hand-over, before anything is signed
+        // or kept (`Protocol`, "Limits a receive step plans for").
+        if local_writes_bytes(&batch.local) > MAX_STEP_LOCAL_BYTES {
+            return Err(Refusal::Usage(format!(
+                "a batch's local writes are at most {MAX_STEP_LOCAL_BYTES} bytes"
+            ))
+            .into());
+        }
         let carry = (batch.ops.len() < MAX_BATCH_ENTRIES)
             .then_some(self.state.cursor.seq)
             .filter(|_| self.state.cursor.deferred_since_ms.is_some());
@@ -440,6 +466,23 @@ impl App {
             // the next call that writes when this one can't reach the service.
             kept_ms: None,
         };
+        // The kept batches together stay within what a provider change carries in its one
+        // commit ([`MAX_KEPT_BATCHES_BYTES`]).
+        let kept: usize = self
+            .reader()
+            .scan_raw(PENDING_PREFIX)
+            .await?
+            .iter()
+            .map(|(_, value)| value.len())
+            .sum();
+        let this = super::state::encode(&pending)?.len();
+        if kept.saturating_add(this) > MAX_KEPT_BATCHES_BYTES {
+            return Err(Refusal::NotNow(format!(
+                "the batches kept unanswered take {kept} bytes, and this one {this} more, over \
+                 {MAX_KEPT_BATCHES_BYTES}: it is not kept, nor sent, until they are answered"
+            ))
+            .into());
+        }
         let mut tx = self.tx()?;
         tx.put(&pending_key(&id), &pending)?;
         self.commit(tx).await?;

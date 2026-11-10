@@ -111,7 +111,8 @@ pub struct SenderDisposition {
     /// (as an app without `lists.read`), was restored from a backup, which carries no copy,
     /// or followed a provider loss since. `blocked` and `flagged` then say nothing of the
     /// sender: a `false` may be a deny or a flag the app never saw, such as its own deny made
-    /// before the backup. A protocol must not read `None` as neither blocked nor flagged. An
+    /// before the backup. A protocol must not read `None` as neither blocked nor flagged,
+    /// unless the protocol states its own rule for an unknown sender. An
     /// app with `lists.read` refreshes a copy in that state at its next
     /// [`App::receive`](super::App::receive), before it hands any entry over, when it can.
     pub lists_as_of_ms: Option<u64>,
@@ -361,23 +362,15 @@ impl App {
             return Ok(());
         }
         // Lists too large for one commit are tried again a day later, not at every read.
-        if let Some(at) = reader.get::<u64>(LISTS_TOO_LARGE).await? {
-            let due = |app: &Self| {
-                app.highest_service_time()
-                    .is_some_and(|now| now >= at.saturating_add(LISTS_TOO_LARGE_RETRY_MS))
-            };
-            if !due(self) {
-                // The highest time held may be a day old: a service time this call verified
-                // decides, which the cheapest authenticated read brings when none did.
-                match self.fresh_service_time().await {
-                    Ok(()) => {}
-                    Err(error @ (AppError::Alarm(_) | AppError::Store(_))) => return Err(error),
-                    Err(_) => return Ok(()),
-                }
-                if !due(self) {
-                    return Ok(());
-                }
-            }
+        // The day is judged on the highest service time verified, which every read's page
+        // moves on: at most one read later than a fresh time would, and no request of its
+        // own.
+        if let Some(at) = reader.get::<u64>(LISTS_TOO_LARGE).await?
+            && self
+                .highest_service_time()
+                .is_none_or(|now| now < at.saturating_add(LISTS_TOO_LARGE_RETRY_MS))
+        {
+            return Ok(());
         }
         match self.refresh_lists().await {
             Ok(_) => Ok(()),

@@ -157,14 +157,28 @@ fn proofs_for(key: &SigningKey, body: &[u8]) -> (Vec<SignedDoc>, SignedHead) {
 
 /// A switch that answers `POST /ops` with the batch's proofs, passed through `edit`.
 fn ops_switch(edit: fn(&mut Vec<SignedDoc>)) -> Arc<MockTransport> {
+    ops_switch_with(edit, |_| {})
+}
+
+/// [`ops_switch`], with the answer's body then passed through `edit_body`.
+fn ops_switch_with(edit: fn(&mut Vec<SignedDoc>), edit_body: fn(&mut Value)) -> Arc<MockTransport> {
     let key = service_key();
     Arc::new(MockTransport::with_handler(move |request| {
         let (mut proofs, head) = proofs_for(&key, &request.body);
         edit(&mut proofs);
-        let body = json!({ "proofs": proofs, "head": head.to_value() });
+        let mut body = json!({ "proofs": proofs, "head": head.to_value() });
+        edit_body(&mut body);
         Ok(respond(&key, request, 200, body.to_string().as_bytes()))
     }))
 }
+
+/// The two edits that leave out an answer's `proofs`: missing, and `null`.
+const WITHOUT_PROOFS: [fn(&mut Value); 2] = [
+    |body| {
+        body.as_object_mut().unwrap().remove("proofs");
+    },
+    |body| body["proofs"] = Value::Null,
+];
 
 fn two_lists() -> Vec<(Vec<Condition>, OpKind)> {
     vec![
@@ -596,6 +610,25 @@ async fn test_cursor_only_batch_takes_no_proofs() {
     assert!(answer.proofs.is_empty());
 }
 
+#[tokio::test]
+async fn test_batch_answer_requires_proofs() {
+    // A cursor-only batch is answered `{ "proofs": [], "head" }`, so a missing list would
+    // read as that answer.
+    let batch = Batch::cursor_only(Position {
+        generation: 1,
+        seq: 9,
+    });
+    for edit in WITHOUT_PROOFS {
+        let switch = ops_switch_with(|_| {}, edit);
+        let client = client_with(app(), Some(service_public()), switch);
+        let error = client.submit(&batch).await.unwrap_err();
+        assert!(
+            matches!(error, ClientError::InvalidResponse(_)),
+            "{error:?}"
+        );
+    }
+}
+
 #[test]
 fn test_batch_refuses_too_many_entries() {
     let client = client_with(
@@ -970,6 +1003,14 @@ async fn test_signer_and_app_calls_refuse_the_other_caller() {
 
 /// A switch that answers a leave with a proof naming `object`, or the caller's App ID.
 fn leave_switch(object: Option<&'static str>) -> Arc<MockTransport> {
+    leave_switch_with(object, |_| {})
+}
+
+/// [`leave_switch`], with the answer's body passed through `edit_body`.
+fn leave_switch_with(
+    object: Option<&'static str>,
+    edit_body: fn(&mut Value),
+) -> Arc<MockTransport> {
     let key = service_key();
     let account = identity().public();
     Arc::new(MockTransport::with_handler(move |request| {
@@ -987,12 +1028,27 @@ fn leave_switch(object: Option<&'static str>) -> Arc<MockTransport> {
         let state = ProofState::Service(json!({ "type": "leave" }));
         let proof =
             TransitionProof::sign(&key, &account, ProofBody::new(stub, object, &state)).unwrap();
-        let body = json!({
+        let mut body = json!({
             "proofs": [proof.signed()],
             "head": SignedHead::sign(&key, &account, &tip).to_value(),
         });
+        edit_body(&mut body);
         Ok(respond(&key, request, 200, body.to_string().as_bytes()))
     }))
+}
+
+#[tokio::test]
+async fn test_write_answer_requires_proofs() {
+    // A revoke of a revoked app is answered `{ "proofs": [], "head" }`, so a missing list
+    // would read as a write that wrote nothing.
+    for edit in WITHOUT_PROOFS {
+        let client = client_with(app(), Some(service_public()), leave_switch_with(None, edit));
+        let error = client.leave().await.unwrap_err();
+        assert!(
+            matches!(error, ClientError::InvalidResponse(_)),
+            "{error:?}"
+        );
+    }
 }
 
 #[tokio::test]

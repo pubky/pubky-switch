@@ -57,7 +57,7 @@ use super::batch::PendingBatch;
 use super::claims::{ClaimRead, ObligationDeadline};
 use super::context::{ClaimFetch, ContextWrites, ReceiveContext};
 use super::error::{Alarm, Refusal, RefusalPlace, refused_at, refused_for_good};
-use super::events::{AppEvent, Duty, ParkReason};
+use super::events::{AppEvent, Duty, KeptRefusal, ParkReason, RefusedCall};
 use super::identity::{self, DOC_CACHE_MS, Taken};
 use super::protocol::{
     Effect, LocalWrite, MAX_CLAIM_READS, MAX_STEP_LOCAL_BYTES, MissedEntries, Need, OpaqueRule,
@@ -171,27 +171,39 @@ impl From<&ResendNeeded> for OwedCall {
 impl OwedCall {
     /// The call, made again.
     fn make(&self, protocol: &dyn Protocol) -> Result<Vec<LocalWrite>, StoreFailure> {
+        match self.refused(0) {
+            RefusedCall::ResendNeeded { needed, .. } => protocol.resend_needed(&needed),
+            RefusedCall::Missed(missed) => protocol.missed(&missed),
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    /// The call as the protocol is handed it, about the feed item at `seq`.
+    pub(crate) fn refused(&self, seq: u64) -> RefusedCall {
         match *self {
             Self::Resend {
                 sender,
                 accepted_from_ms,
                 accepted_until_ms,
                 unreadable,
-            } => protocol.resend_needed(&ResendNeeded {
-                sender,
-                accepted_from_ms,
-                accepted_until_ms,
-                reason: if unreadable {
-                    ResendReason::Unreadable
-                } else {
-                    ResendReason::Unopenable
+            } => RefusedCall::ResendNeeded {
+                seq,
+                needed: ResendNeeded {
+                    sender,
+                    accepted_from_ms,
+                    accepted_until_ms,
+                    reason: if unreadable {
+                        ResendReason::Unreadable
+                    } else {
+                        ResendReason::Unopenable
+                    },
                 },
-            }),
+            },
             Self::Missed {
                 seq,
                 entries,
                 accepted_from_ms,
-            } => protocol.missed(&MissedEntries {
+            } => RefusedCall::Missed(MissedEntries {
                 seq,
                 entries,
                 accepted_from_ms,
@@ -409,6 +421,9 @@ impl App {
             if seq <= start {
                 continue;
             }
+            // Room for one more item, whatever it writes: the read's writes so far are
+            // committed first once they pass the high-water mark (`ITEM_ROOM_BYTES`).
+            self.make_room(&mut read, ITEM_ROOM_BYTES).await?;
             let step = match item {
                 // Processed past a held entry in an earlier read.
                 FeedItem::Entry(_) if self.state.seen.contains(&seq) => Step::Pass,
@@ -732,7 +747,7 @@ impl App {
             // A step's local writes are bounded (`Protocol`, "Limits a receive step plans
             // for"): an effect over the bound is too large, stored and passed.
             if over_local_bound || local_writes_bytes(&effect.local) > MAX_STEP_LOCAL_BYTES {
-                self.too_large(entry, &received, read)?;
+                self.too_large(entry, &received, read).await?;
                 return Ok(Step::Pass);
             }
             // The app layer's own lifecycle operations aren't a protocol's to write: an effect
@@ -771,7 +786,7 @@ impl App {
             {
                 // Switch spec 8.2: an effect too large for the store is stored and passed,
                 // so the feed goes on.
-                self.too_large(entry, &received, read)?;
+                self.too_large(entry, &received, read).await?;
                 return Ok(Step::Pass);
             }
             if effect.ops.is_empty() {
@@ -816,7 +831,7 @@ impl App {
                     return Ok(Step::Pass);
                 }
                 Sent::TooLarge => {
-                    self.too_large(entry, &received, read)?;
+                    self.too_large(entry, &received, read).await?;
                     return Ok(Step::Pass);
                 }
                 Sent::Refused(code) => {
@@ -1446,12 +1461,13 @@ impl App {
     /// 8.2): a duty event, kept in the commit that stores the entry.
     /// An effect too large for the store ([`ParkReason::EffectTooLarge`]): its entry stored
     /// and passed, and the protocol told.
-    fn too_large(
+    async fn too_large(
         &mut self,
         entry: &Entry,
         received: &Received,
         read: &mut Read,
     ) -> Result<(), AppError> {
+        self.make_room(read, PARK_ROOM_BYTES).await?;
         self.park(entry, &received.plaintext, ParkReason::EffectTooLarge, read)?;
         self.effect_refused(entry, received, None, read)
     }
@@ -1640,6 +1656,10 @@ impl App {
             return Ok(false);
         }
         let asked = match self.protocol.resend_needed(&needed) {
+            Ok(writes) if local_writes_bytes(&writes) > MAX_STEP_LOCAL_BYTES => {
+                self.local_writes_refused(seq, OwedCall::from(&needed), read)?;
+                false
+            }
             Ok(writes) => {
                 read.tx.local(&writes)?;
                 true
@@ -1652,6 +1672,23 @@ impl App {
         };
         read.tx.put(&key::asked(seq), &())?;
         Ok(asked)
+    }
+
+    /// A call whose answer's local writes are over [`MAX_STEP_LOCAL_BYTES`]: not committed,
+    /// and not owed, since making it again would bring the same answer; the protocol is
+    /// told in the commit that passes its item.
+    fn local_writes_refused(
+        &mut self,
+        seq: u64,
+        call: OwedCall,
+        read: &mut Read,
+    ) -> Result<(), AppError> {
+        self.keep_duty(
+            &mut read.tx,
+            Duty::LocalWritesRefused {
+                call: KeptRefusal::Owed { seq, call },
+            },
+        )
     }
 
     /// A call the protocol couldn't answer: kept in the commit that passes its item, and
@@ -1673,7 +1710,23 @@ impl App {
                 continue;
             };
             let mut tx = self.tx()?;
-            tx.local(&writes)?;
+            if local_writes_bytes(&writes) > MAX_STEP_LOCAL_BYTES {
+                // Over the bound: not committed, and the call made no more, since the same
+                // answer would come at every read; the protocol is told.
+                let seq = rest
+                    .rsplit('/')
+                    .next()
+                    .and_then(|seq| super::state::parse_num(seq).ok())
+                    .unwrap_or(0);
+                self.keep_duty(
+                    &mut tx,
+                    Duty::LocalWritesRefused {
+                        call: KeptRefusal::Owed { seq, call },
+                    },
+                )?;
+            } else {
+                tx.local(&writes)?;
+            }
             tx.delete(&format!("{}{rest}", key::OWED_PREFIX))?;
             self.commit(tx).await?;
         }
@@ -1731,6 +1784,16 @@ impl App {
                 accepted_from_ms: from.max(self.resend_floor()),
             };
             match self.protocol.missed(&missed) {
+                Ok(writes) if local_writes_bytes(&writes) > MAX_STEP_LOCAL_BYTES => self
+                    .local_writes_refused(
+                        seq,
+                        OwedCall::Missed {
+                            seq,
+                            entries,
+                            accepted_from_ms: missed.accepted_from_ms,
+                        },
+                        read,
+                    )?,
                 Ok(writes) => read.tx.local(&writes)?,
                 Err(_) => self.owe(
                     seq,
@@ -2086,6 +2149,41 @@ pub(crate) fn processed_writes(
 /// What processing one entry writes beside its effect's own writes, at most: its processed
 /// pair, the cursor, a parked or retry record removed, and the chain view's small fields.
 const ENTRY_RESERVE_BYTES: u64 = 256 * 1024;
+
+/// What storing an entry locally writes, at most: its plaintext (the 64 KiB envelope, 87
+/// KiB in base64), the sender's certificate (under 33 KiB) and its duty events.
+const PARK_ROOM_BYTES: u64 = 256 * 1024;
+
+/// The room a read keeps for its next feed item: the read's writes are committed early
+/// before an item once more would leave less, so the page's commit always fits the 32 MiB
+/// batch size (high-water mark: 32 - 12 = 20 MiB). One item writes at most:
+/// - a kept effect, under 10.9 MiB (`MAX_STEP_LOCAL_BYTES`), which goes in a commit of its
+///   own at once (`send_effect`);
+/// - an effect without operations, its local writes at most 4 MiB as stored
+///   (`MAX_STEP_LOCAL_BYTES`), with its processed pair;
+/// - a call's local writes ([`Protocol::resend_needed`], [`Protocol::missed`]), at most 4
+///   MiB, or a duty event refusing them;
+/// - an entry stored locally ([`PARK_ROOM_BYTES`]) and its duty events;
+/// - a chain item's cached record write, its operation and proof and opened value, under
+///   1.2 MiB.
+///
+/// The largest is under 11 MiB; [`ENTRY_RESERVE_BYTES`] and a margin make 12 MiB.
+const ITEM_ROOM_BYTES: u64 = 12 * 1024 * 1024;
+
+/// What an applied effect's outcome caches of one record write, at most: its operation
+/// (`MAX_OP_BYTES`, 512 KiB) and opened value (256 KiB), both in base64, and its proof.
+const CACHED_RECORD_BYTES: u64 = 1_258_291; // 1.2 MiB
+
+// An applied effect's outcome is committed on its own: its local writes, at most
+// `MAX_STEP_LOCAL_BYTES` as stored, at most 7 cached record writes, and what processing
+// its entry writes always fit one commit, so an applied effect can't fail to commit its
+// outcome for its size.
+const _: () = assert!(
+    (MAX_STEP_LOCAL_BYTES as u64) + 7 * CACHED_RECORD_BYTES + ENTRY_RESERVE_BYTES
+        <= MAX_BATCH_BYTES
+);
+// One more item always fits beside the read's writes kept to the high-water mark.
+const _: () = assert!(ITEM_ROOM_BYTES + ENTRY_RESERVE_BYTES < MAX_BATCH_BYTES);
 
 /// The bytes a write of `value_len` value bytes at `key` counts against a batch in `ns`.
 fn write_size(ns: &str, key: &str, value_len: u64) -> u64 {

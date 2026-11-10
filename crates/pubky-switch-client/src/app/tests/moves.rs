@@ -15,8 +15,8 @@ use pubky_switch_core::sig::SignedDoc;
 
 use super::*;
 use crate::app::{
-    AppError, AppEvent, ClaimOp, Evidence, LossActions, ObligationDeadline, ParkReason,
-    ProviderLoss, ProviderStatus, PushRelay, UserConfirmed,
+    AppError, AppEvent, ClaimOp, Evidence, LocalWrite, LossActions, ObligationDeadline, ParkReason,
+    ProviderLoss, ProviderStatus, PushRelay, Refusal, UserConfirmed,
 };
 use crate::error::TransportError;
 use crate::error::{ClientError, StoreError};
@@ -765,6 +765,93 @@ async fn test_key_change_in_place_is_followed_without_a_freeze() {
     )));
     assert!(received(&report.events, seq), "{:?}", report.events);
     assert_eq!(app.cursor().generation, 2);
+}
+
+#[tokio::test]
+async fn test_move_with_kept_batches_at_the_cap_completes() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join_on(
+        &w,
+        &router,
+        Arc::clone(&w.store) as Arc<dyn StateStore>,
+        w.protocol.clone(),
+        &[Permission::ListsManage, Permission::ConversationAdd],
+    )
+    .await;
+    let n_key = next_key();
+    w.switch.freeze(&freeze_for(&w, &n_key, 2)).unwrap();
+    // While frozen every batch is kept: each with 3.5 MiB of local writes, 4.7 MiB kept,
+    // 33 MiB for seven, more than the switch's one commit takes. Two fit the cap; the
+    // others are refused, not kept.
+    let mut results = Vec::new();
+    for n in 0..7u8 {
+        let batch = crate::app::OpBatch::new()
+            .op(OpKind::AllowPut {
+                pubky: [n + 40; 32],
+                kind: AllowKind::Contact,
+            })
+            .local(LocalWrite::Put {
+                key: format!("big/{n}").into_bytes(),
+                value: vec![123u8; (7 << 20) / 2],
+            });
+        results.push(app.submit_batch(batch).await.unwrap_err());
+    }
+    assert_eq!(results[0].code(), Some(ErrorCode::Moved));
+    assert_eq!(results[1].code(), Some(ErrorCode::Moved));
+    for refused in &results[2..] {
+        assert!(
+            matches!(refused, AppError::Refused(Refusal::NotNow(why)) if why.contains("not kept")),
+            "{refused:?}"
+        );
+    }
+    assert_eq!(app.kept_batches().await.unwrap().len(), 2);
+    let next = w.switch.import_into(n_key.to_bytes());
+    router.add(NEXT, &next);
+    app.receive(None).await.unwrap();
+    publish_at(
+        &w,
+        &next,
+        Inbox::new(NEXT, n_key.verifying_key().to_bytes()),
+        2,
+        None,
+    );
+    // The switch's one commit carries both kept batches; the move completes.
+    app.receive(None).await.unwrap();
+    assert_eq!(app.cursor().generation, 2);
+    app.receive(None).await.unwrap();
+    assert!(app.kept_batches().await.unwrap().is_empty());
+    for n in 0..2u8 {
+        assert!(next.applied().iter().any(|op| matches!(
+            op.body().kind,
+            OpKind::AllowPut { pubky, .. } if pubky == [n + 40; 32]
+        )));
+    }
+}
+
+#[tokio::test]
+async fn test_lists_too_large_refresh_is_tried_again_after_a_provider_loss() {
+    let store = Arc::new(MemoryStore::new());
+    let lost = lost_world(Arc::clone(&store) as Arc<dyn StateStore>).await;
+    // The copy was refused as too large just before the loss.
+    let ns = crate::store::client_namespace(&app_keys("wallet").app_id_bytes());
+    let mut batch = crate::store::WriteBatch::new();
+    batch
+        .put(
+            &ns,
+            b"lc/too_large".to_vec(),
+            crate::app::state::encode(&lost.w.clock.now_ms()).unwrap(),
+        )
+        .unwrap();
+    store.commit(batch).unwrap();
+    let (mut app, _) = follow_loss(&lost, Arc::clone(&store) as Arc<dyn StateStore>)
+        .await
+        .unwrap();
+    assert_eq!(app.cursor().generation, 2);
+    app.receive(None).await.unwrap();
+    // The loss let the refresh go: the copy is read from the new service.
+    assert!(store.get(&ns, b"lc/too_large").unwrap().is_none());
+    assert!(store.get(&ns, b"lc/lists_at").unwrap().is_some());
 }
 
 #[tokio::test]

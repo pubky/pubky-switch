@@ -79,13 +79,37 @@ pub struct ReceivedMessage {
     pub conflict: Option<Value>,
 }
 
-/// The most bytes of local writes one receive step makes ([`Protocol`], "Limits a receive
-/// step plans for"): 4 MiB, counted by [`local_writes_bytes`].
+/// The most bytes of local writes a protocol or host hands over at once: one receive step,
+/// one [`Protocol::resend_needed`] or [`Protocol::missed`] answer, or one
+/// [`super::OpBatch`]'s local writes ([`Protocol`], "Limits a receive step plans for").
+/// 4 MiB, counted by [`local_writes_bytes`].
+///
+/// It is chosen so that whatever the app keeps or commits with such writes fits the store
+/// ([`crate::store::MAX_VALUE_BYTES`] 16 MiB per value, [`crate::store::MAX_BATCH_BYTES`]
+/// 32 MiB per commit):
+///
+/// - **Kept, in base64:** each write is kept as `{"Put":{"key":"…","value":"…"}},`, its
+///   key and value in base64url, at most `4/3 (k + v) + 40` bytes, which is under
+///   `4/3 (k + v + 64)` since 4/3 x 64 > 40. So writes at the bound keep in at most
+///   4/3 x 4 MiB = 5.34 MiB.
+/// - **A kept effect** (`pending/effect`) adds its batch, at most the 4 MiB `POST /ops`
+///   body (Switch wire 7.1), 5.34 MiB in base64, and its entry: the plaintext (at most the
+///   64 KiB envelope, 87 KiB in base64), the certificate (under 33 KiB) and a context (1
+///   KiB), with under 8 KiB of other fields: under 10.9 MiB, below the 16 MiB value size.
+///   A kept batch (`opq/`) carries the same body and writes, and the messages it queues.
+/// - **Committed:** each write takes its key and value, the namespace (at most 33 bytes)
+///   and the `p/` prefix, under `k + v + 64`: at most 4 MiB. An applied effect's outcome
+///   adds at most 7 cached record writes (each under 1.2 MiB with its proof and opened
+///   value), under 13 MiB in all, below the 32 MiB batch size.
 pub const MAX_STEP_LOCAL_BYTES: usize = 4 * 1024 * 1024;
 
-/// The bytes `writes` count against [`MAX_STEP_LOCAL_BYTES`]: the raw length of each key
-/// (a prefix for [`LocalWrite::DeletePrefix`]) and of each value, without the app's own
-/// prefix or the form the app stores them in.
+/// What each write counts against [`MAX_STEP_LOCAL_BYTES`] beside its key and value: the
+/// room its stored and kept forms take around them.
+pub const LOCAL_WRITE_OVERHEAD_BYTES: usize = 64;
+
+/// The bytes `writes` count against [`MAX_STEP_LOCAL_BYTES`]: for each write, the raw
+/// length of its key (a prefix for [`LocalWrite::DeletePrefix`]) and of its value, plus
+/// [`LOCAL_WRITE_OVERHEAD_BYTES`].
 pub fn local_writes_bytes(writes: &[LocalWrite]) -> usize {
     writes.iter().fold(0usize, |total, write| {
         let bytes = match write {
@@ -93,7 +117,7 @@ pub fn local_writes_bytes(writes: &[LocalWrite]) -> usize {
             LocalWrite::Delete { key } => key.len(),
             LocalWrite::DeletePrefix { prefix } => prefix.len(),
         };
-        total.saturating_add(bytes)
+        total.saturating_add(bytes.saturating_add(LOCAL_WRITE_OVERHEAD_BYTES))
     })
 }
 
@@ -430,14 +454,21 @@ pub struct MissedEntries {
 /// # Limits a receive step plans for
 ///
 /// - **Operations:** at most 7 beside the cursor move (Switch wire 6.4).
-/// - **Local writes:** at most [`MAX_STEP_LOCAL_BYTES`], 4 MiB, of keys and values for one
-///   receive step, those added through [`ReceiveContext::local`] and those of the returned
-///   [`Effect`] together, counted as [`local_writes_bytes`] counts them. A write that would
-///   take [`ReceiveContext::local`] past it is refused there, and an effect over it is
-///   stored and passed as [`super::ParkReason::EffectTooLarge`], with
-///   [`super::AppEvent::EffectRefused`], never applied (Switch spec 8.2). The bound keeps
-///   every effect within what the app's store keeps and commits, whatever else the read
-///   holds; a protocol keeps larger state in its own store.
+/// - **Local writes:** at most [`MAX_STEP_LOCAL_BYTES`], 4 MiB, counted as
+///   [`local_writes_bytes`] counts them, for each set of local writes handed over at once.
+///   The bound keeps every set within what the app's store keeps and commits, whatever
+///   else the read holds; a protocol keeps larger state in its own store. Over it:
+///   - **a receive step**, its [`ReceiveContext::local`] writes and its [`Effect`]'s
+///     together: a write that would take [`ReceiveContext::local`] past it is refused
+///     there, and an effect over it is stored and passed as
+///     [`super::ParkReason::EffectTooLarge`], with [`super::AppEvent::EffectRefused`],
+///     never applied (Switch spec 8.2);
+///   - **[`Protocol::resend_needed`] and [`Protocol::missed`]**, made at once or again
+///     later: the writes aren't committed and the call isn't made again, since the same
+///     answer would come; the item is passed, and the protocol told with
+///     [`super::AppEvent::LocalWritesRefused`], a duty event;
+///   - **an [`super::OpBatch`]'s local writes**: [`super::App::submit_batch`] refuses the
+///     batch before it signs or keeps it ([`super::Refusal::Usage`]).
 ///
 /// # Duty events
 ///
