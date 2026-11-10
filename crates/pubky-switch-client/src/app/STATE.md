@@ -49,6 +49,10 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
   protocol's backup layer under `p/`, both checked before it, so a failure leaves neither.
   A backup with a layer also carries `seen/`, `parked/` and `proc/` of the same moment,
   which the layer may reflect, so no entry is handed to the protocol twice.
+- **A layered backup reads one moment:** `App::backup_layered` is several store reads in
+  sequence, and they agree because the call takes `&mut self`, so no call of the app commits
+  between them, and the store allows one writer per namespace (`StateStore`, rule 4), so no
+  other process does.
 
 ## Keys
 
