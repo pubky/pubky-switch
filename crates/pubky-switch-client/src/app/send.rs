@@ -31,8 +31,10 @@
 //! Only a refusal for good marks a message failed: the Retry column of Switch spec 6.4 says
 //! "No". `403 not_admitted` and `403 not_current` stay queued, as admission changes when the
 //! counterparty adds a contact or an invite, and a certificate renewal makes the app current
-//! again (Switch spec 7, Switch wire 3.8). A failed message is forgotten, plaintext and all,
-//! after the retention of sent messages.
+//! again (Switch spec 7, Switch wire 3.8), but for at most [`UNDELIVERABLE_MS`] from the
+//! first such answer: then the message is deleted, plaintext and all, and
+//! [`AppEvent::MessageUndelivered`] tells the protocol (Switch spec 11). A failed message
+//! is forgotten, plaintext and all, after the retention of sent messages.
 
 use pubky_switch_core::enc::{serde_b64, serde_b64_vec};
 use pubky_switch_core::http::{ErrorCode, Retry};
@@ -57,6 +59,10 @@ use crate::error::ClientError;
 /// How long a sent message is kept for re-sends: 30 days from its first acceptance (Switch
 /// spec 11).
 pub const SENT_RETENTION_MS: u64 = 30 * DAY_MS;
+
+/// How long a message answered `403 not_admitted` or `403 not_current` stays queued, from
+/// the first such answer: 30 days (Switch spec 11).
+pub const UNDELIVERABLE_MS: u64 = 30 * DAY_MS;
 
 /// How many times one delivery seals again after `409 stale_key` before it waits for the
 /// next flush.
@@ -251,6 +257,9 @@ pub struct OutboxReport {
     pub queued: Vec<String>,
     /// The messages refused for good.
     pub failed: Vec<String>,
+    /// The messages given up after [`UNDELIVERABLE_MS`] of `403 not_admitted` or `403
+    /// not_current` (Switch spec 11).
+    pub undelivered: Vec<String>,
 }
 
 /// The envelope sealed for one try, and where.
@@ -324,6 +333,9 @@ pub(crate) struct OutboxItem {
     /// An accepted message is to be sent again, sealed to the current keys (Switch spec 11).
     #[serde(default)]
     resend: bool,
+    /// The first `403 not_admitted` or `403 not_current` answer to a delivery, app clock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    undeliverable_ms: Option<u64>,
 }
 
 impl std::fmt::Debug for OutboxItem {
@@ -384,6 +396,8 @@ pub(crate) fn put_outbox_item(
 enum Tried {
     Accepted(AppendAnswer),
     Queued(String),
+    /// Queued after `403 not_admitted` or `403 not_current`, for a bounded time.
+    Undeliverable(String),
     Failed(String),
 }
 
@@ -522,6 +536,7 @@ impl App {
             queued_ms: self.now(),
             failed_ms: None,
             resend: false,
+            undeliverable_ms: None,
         })
     }
 
@@ -604,6 +619,7 @@ impl App {
             queued_ms: self.now(),
             failed_ms: None,
             resend: false,
+            undeliverable_ms: None,
         };
         let mut tx = self.tx()?;
         tx.put(&out_key(&item.msg_id), &item)?;
@@ -745,7 +761,10 @@ impl App {
                     }
                     continue;
                 }
-                self.flush_item(&msg_id).await?;
+                if self.flush_item(&msg_id).await? {
+                    report.undelivered.push(msg_id);
+                    continue;
+                }
                 match self.delivery(&msg_id).await? {
                     Some(Delivery::Failed { .. }) => report.failed.push(msg_id),
                     Some(Delivery::Queued { .. }) => report.queued.push(msg_id),
@@ -761,13 +780,17 @@ impl App {
         .await
     }
 
-    /// One try of each job of one message.
-    async fn flush_item(&mut self, msg_id: &str) -> Result<(), AppError> {
+    /// One try of each job of one message. Returns whether a delivery was given up as
+    /// undeliverable.
+    async fn flush_item(&mut self, msg_id: &str) -> Result<bool, AppError> {
         let Some(mut item) = self.reader().get::<OutboxItem>(&out_key(msg_id)).await? else {
-            return Ok(());
+            return Ok(false);
         };
         if item.failed.is_some() {
-            return Ok(());
+            return Ok(false);
+        }
+        if self.drop_undeliverable(&mut item).await? {
+            return Ok(true);
         }
         item.tries = item.tries.saturating_add(1);
         if item.conversation {
@@ -776,7 +799,8 @@ impl App {
                 Err(error) if is_local(&error) => return Err(error),
                 Err(error) => {
                     item.last_error = Some(error.to_string());
-                    return self.save_item(&item).await;
+                    self.save_item(&item).await?;
+                    return Ok(false);
                 }
             }
             self.save_item(&item).await?;
@@ -787,6 +811,14 @@ impl App {
                 Tried::Queued(why) => {
                     item.last_error = Some(why);
                     self.save_item(&item).await?;
+                }
+                Tried::Undeliverable(why) => {
+                    item.last_error = Some(why);
+                    item.undeliverable_ms.get_or_insert(self.now());
+                    self.save_item(&item).await?;
+                    if self.drop_undeliverable(&mut item).await? {
+                        return Ok(true);
+                    }
                 }
                 Tried::Failed(why) => {
                     item.failed = Some(why);
@@ -809,7 +841,38 @@ impl App {
         if item.complete() {
             self.finish_item(&item).await?;
         }
-        Ok(())
+        Ok(false)
+    }
+
+    /// End a delivery answered `403 not_admitted` or `403 not_current` for
+    /// [`UNDELIVERABLE_MS`] (Switch spec 11): a message never accepted is deleted, plaintext
+    /// and all; a re-send is no longer owed. The protocol is told. Returns whether the
+    /// delivery was given up.
+    async fn drop_undeliverable(&mut self, item: &mut OutboxItem) -> Result<bool, AppError> {
+        let Some(since) = item.undeliverable_ms else {
+            return Ok(false);
+        };
+        if self.now().saturating_sub(since) < UNDELIVERABLE_MS {
+            return Ok(false);
+        }
+        // A re-send: of an item accepted before, or queued again from `sent/`.
+        let resend =
+            item.accepted_at_ms.is_some() || self.reader().exists(&sent_key(&item.msg_id)).await?;
+        item.resend = false;
+        item.undeliverable_ms = None;
+        let gone = item.accepted_at_ms.is_none() || item.complete();
+        let mut tx = self.tx()?;
+        if gone {
+            tx.delete(&out_key(&item.msg_id))?;
+        } else {
+            tx.put(&out_key(&item.msg_id), &*item)?;
+        }
+        self.commit(tx).await?;
+        self.events.push(AppEvent::MessageUndelivered {
+            msg_id: item.msg_id.clone(),
+            resend,
+        });
+        Ok(true)
     }
 
     async fn save_item(&mut self, item: &OutboxItem) -> Result<(), AppError> {
@@ -831,6 +894,7 @@ impl App {
         let first = *item.accepted_at_ms.get_or_insert(at);
         item.resend = false;
         item.last_error = None;
+        item.undeliverable_ms = None;
         let mut tx = self.tx()?;
         tx.put(&out_key(&item.msg_id), &*item)?;
         let sent = match self
@@ -1090,16 +1154,17 @@ fn is_local(error: &AppError) -> bool {
 /// A failed try: failed for good only when the switch refused it for good, the Retry column
 /// of Switch spec 6.4 saying "No"; queued again for everything else (the network, `429`,
 /// `503`, a refusal of the app's rules that may lift). `403 not_admitted` and `403
-/// not_current` stay queued: admission changes when the counterparty adds a contact or an
-/// invite (Switch spec 7), and a renewal makes a certificate current again (Switch wire
-/// 3.8).
+/// not_current` stay queued for a bounded time: admission changes when the counterparty adds
+/// a contact or an invite (Switch spec 7), and a renewal makes a certificate current again
+/// (Switch wire 3.8).
 fn queued_or(error: AppError) -> Result<Tried, AppError> {
     match &error {
         AppError::Alarm(_) | AppError::Store(_) => Err(error),
-        AppError::Switch(ClientError::Switch { code, .. })
-            if code.retry() == Retry::No
-                && !matches!(code, ErrorCode::NotAdmitted | ErrorCode::NotCurrent) =>
-        {
+        AppError::Switch(ClientError::Switch {
+            code: ErrorCode::NotAdmitted | ErrorCode::NotCurrent,
+            ..
+        }) => Ok(Tried::Undeliverable(error.to_string())),
+        AppError::Switch(ClientError::Switch { code, .. }) if code.retry() == Retry::No => {
             Ok(Tried::Failed(error.to_string()))
         }
         _ => Ok(Tried::Queued(error.to_string())),
@@ -1132,11 +1197,11 @@ mod tests {
         ));
         assert!(matches!(
             queued_or(switch(ErrorCode::NotAdmitted)),
-            Ok(Tried::Queued(_))
+            Ok(Tried::Undeliverable(_))
         ));
         assert!(matches!(
             queued_or(switch(ErrorCode::NotCurrent)),
-            Ok(Tried::Queued(_))
+            Ok(Tried::Undeliverable(_))
         ));
         assert!(matches!(
             queued_or(switch(ErrorCode::Conflict)),

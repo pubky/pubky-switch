@@ -439,6 +439,39 @@ async fn test_send_not_admitted_stays_queued_and_goes_once_admitted() {
 }
 
 #[tokio::test]
+async fn test_send_not_admitted_is_deleted_after_30_days() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    s.peer.lock().admitted = Some(Default::default());
+    let (msg_id, _) = app.send(s.note("one")).await.unwrap();
+    app.take_events();
+    // Queued for 30 days from the first such answer (Switch spec 11).
+    s.w.clock.advance_ms(crate::app::UNDELIVERABLE_MS - 1);
+    assert_eq!(
+        app.flush_outbox().await.unwrap().queued,
+        vec![msg_id.clone()]
+    );
+    s.w.clock.advance_ms(1);
+    let report = app.flush_outbox().await.unwrap();
+    assert_eq!(report.undelivered, vec![msg_id.clone()]);
+    assert!(report.queued.is_empty(), "{report:?}");
+    // Deleted, plaintext and all, and the protocol told.
+    assert_eq!(app.delivery(&msg_id).await.unwrap(), None);
+    assert!(
+        app.take_events().contains(&AppEvent::MessageUndelivered {
+            msg_id: msg_id.clone(),
+            resend: false
+        }),
+        "the protocol is told"
+    );
+    // Admitted later, it isn't sent.
+    s.peer.lock().admitted = None;
+    let report = app.flush_outbox().await.unwrap();
+    assert!(report.done.is_empty(), "{report:?}");
+    assert!(s.peer.received().is_empty());
+}
+
+#[tokio::test]
 async fn test_send_with_an_invite_code_is_admitted() {
     let s = Setup::new();
     let mut app = s.join("wallet").await;

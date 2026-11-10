@@ -283,6 +283,16 @@ pub enum AppEvent {
         /// The acceptance time, the recipient's service time.
         accepted_at_ms: u64,
     },
+    /// A message answered `403 not_admitted` or `403 not_current` for
+    /// [`super::UNDELIVERABLE_MS`] wasn't delivered (Switch spec 11). A message its
+    /// recipient never accepted was deleted from the outbox with its plaintext; for a
+    /// re-send, only the re-send was given up.
+    MessageUndelivered {
+        /// The message ID.
+        msg_id: String,
+        /// Whether it was a re-send of a message accepted before.
+        resend: bool,
+    },
     /// An app of a counterparty has no receive key record that passes the checks, so a
     /// message went to its other apps (Switch spec 8.1).
     UnreachableApp {
