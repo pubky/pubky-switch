@@ -214,7 +214,7 @@ impl Service {
         .map_err(|e| store_error(&e))?;
         // An app it no longer makes current stops holding entries at once (Switch wire
         // 7.4.2, 9.1).
-        super::batch::release_entries(txn, Some(doc), time_ms)
+        super::batch::settle_change(txn, previous, Some(doc), None, time_ms)
             .await
             .map_err(|e| store_error(&e))?;
         // Where the keys_through of each app it lists for the first time starts (Switch
