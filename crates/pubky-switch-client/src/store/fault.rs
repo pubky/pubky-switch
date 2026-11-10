@@ -1,7 +1,7 @@
 //! A fault-injecting [`StateStore`] for crash tests. Test builds only (`test-support`).
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use super::{StateStore, StoreError, WriteBatch};
 
@@ -33,6 +33,9 @@ pub struct FaultStore {
     fault: Fault,
     commits: AtomicU64,
     stopped: AtomicBool,
+    /// Key prefixes whose scan fails with [`StoreError::Unavailable`], once each, after
+    /// as many scans of it as given pass.
+    failing_scans: Mutex<Vec<(Vec<u8>, usize)>>,
 }
 
 impl std::fmt::Debug for FaultStore {
@@ -53,6 +56,15 @@ impl FaultStore {
             fault,
             commits: AtomicU64::new(0),
             stopped: AtomicBool::new(false),
+            failing_scans: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Fail a scan of exactly `prefix` with [`StoreError::Unavailable`], once, after `after`
+    /// scans of it pass; other calls pass through.
+    pub fn fail_scan(&self, prefix: &[u8], after: usize) {
+        if let Ok(mut failing) = self.failing_scans.lock() {
+            failing.push((prefix.to_vec(), after));
         }
     }
 
@@ -94,6 +106,17 @@ impl StateStore for FaultStore {
         limit: u32,
     ) -> Result<Vec<super::KeyValue>, StoreError> {
         self.check_running()?;
+        if let Ok(mut failing) = self.failing_scans.lock()
+            && let Some(at) = failing.iter().position(|(p, _)| p.as_slice() == prefix)
+        {
+            match failing.get_mut(at) {
+                Some((_, after)) if *after > 0 => *after -= 1,
+                _ => {
+                    failing.remove(at);
+                    return Err(StoreError::Unavailable);
+                }
+            }
+        }
         self.inner.scan(ns, prefix, after, limit)
     }
 

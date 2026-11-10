@@ -1,9 +1,16 @@
 //! The account's chain items (Switch wire 6.6). The chain head lives in the account row
 //! ([`super::AccountHead::chain`]); this module keeps the items themselves.
 
-use pubky_switch_core::chain::{ItemType, Stub};
+use pubky_switch_core::{
+    chain::{ItemType, Stub},
+    sig::SignedDoc,
+};
 
-use super::{AccountTxn, StoreError, identity::time_to_db, to_db};
+use super::{
+    AccountTxn, StoreError,
+    identity::{encode_doc, time_to_db},
+    to_db,
+};
 
 /// A chain item to keep.
 #[derive(Clone, Debug)]
@@ -20,6 +27,9 @@ pub struct NewChainItem<'a> {
     pub server_time_ms: u64,
     /// The app it is shown in full to, for a key bundle part (Switch wire 7.5).
     pub only_for: Option<[u8; 16]>,
+    /// A signed operation's transition proof, which the feed shows with it (Switch wire
+    /// 7.5); `None` for the other types.
+    pub proof: Option<&'a SignedDoc>,
 }
 
 impl AccountTxn {
@@ -30,8 +40,8 @@ impl AccountTxn {
         let head = self.head().clone();
         sqlx::query(
             "INSERT INTO chain_items (account_id, generation, seq, item_type, item_bytes, \
-             envelope, chain_hash, server_time_ms, only_for) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+             envelope, chain_hash, server_time_ms, only_for, proof) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
         )
         .bind(&head.id)
         .bind(to_db(head.generation, "generation")?)
@@ -42,6 +52,7 @@ impl AccountTxn {
         .bind(item.stub.chain_hash.as_slice())
         .bind(time_to_db(item.server_time_ms)?)
         .bind(item.only_for.map(|app| app.to_vec()))
+        .bind(item.proof.map(encode_doc).transpose()?)
         .execute(self.conn())
         .await
         .map_err(StoreError::from_db)?;

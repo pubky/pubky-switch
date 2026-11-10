@@ -149,11 +149,14 @@ impl Protocol for FlakyProtocol {
         Some(JOURNAL.into())
     }
 
-    fn resend_needed(&self, needed: &ResendNeeded) -> Vec<LocalWrite> {
+    fn resend_needed(
+        &self,
+        needed: &ResendNeeded,
+    ) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
         self.sample.resend_needed(needed)
     }
 
-    fn missed(&self, missed: &MissedEntries) -> Vec<LocalWrite> {
+    fn missed(&self, missed: &MissedEntries) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
         self.sample.missed(missed)
     }
 }
@@ -402,7 +405,7 @@ async fn test_receive_retry_after_a_conflict_commits_nothing_and_applies_later()
 
 fn parked_for(events: &[AppEvent], seq: u64) -> Option<ParkReason> {
     events.iter().find_map(|e| match e {
-        AppEvent::Parked { seq: s, reason } if *s == seq => Some(*reason),
+        AppEvent::Parked { seq: s, reason, .. } if *s == seq => Some(*reason),
         _ => None,
     })
 }
@@ -502,6 +505,124 @@ async fn test_receive_retry_count_goes_on_while_the_entry_is_stored_locally() {
 }
 
 #[tokio::test]
+async fn test_receive_retries_a_bounded_number_of_stored_entries_each_read_in_turn() {
+    let w = World::new();
+    let protocol = FlakyProtocol::new(u32::MAX);
+    let mut app = join_flaky(&w, &protocol, "wallet").await;
+    let cap = crate::app::PARKED_RETRIES_PER_READ;
+    let count = cap + cap / 2;
+    let seqs: Vec<u64> = (0..count).map(|_| w.note(app.app_id(), FLAKY).0).collect();
+    // Held, then past the wait stored locally for the store.
+    app.receive(None).await.unwrap();
+    w.clock.advance_ms(PARK_AFTER_MS);
+    app.receive(None).await.unwrap();
+    for seq in &seqs {
+        assert_eq!(
+            app.state.parked.get(seq).map(|p| p.reason),
+            Some(ParkReason::StoreUnavailable)
+        );
+    }
+    // Each read tries at most the cap, from where the last stopped, and the host hears of
+    // the failing store at each.
+    let mut tried = std::collections::BTreeSet::new();
+    for _ in 0..2 {
+        let calls = protocol.calls();
+        let report = app.receive(None).await.unwrap();
+        let tries = u32::try_from(cap).unwrap();
+        assert_eq!(protocol.calls(), calls + tries);
+        let failing = store_failing(&report.events);
+        assert_eq!(failing.len(), cap, "{failing:?}");
+        tried.extend(failing.iter().map(|(seq, _)| *seq));
+    }
+    // Two reads reached every entry.
+    assert_eq!(tried, seqs.iter().copied().collect());
+    // Healed, every one is processed, once.
+    protocol.heal();
+    for _ in 0..2 {
+        app.receive(None).await.unwrap();
+    }
+    assert!(app.state.parked.is_empty());
+    assert_eq!(protocol.applied(), count);
+}
+
+#[tokio::test]
+async fn test_receive_retry_rotation_goes_on_after_a_load() {
+    let w = World::new();
+    let protocol = FlakyProtocol::new(u32::MAX);
+    let mut app = join_flaky(&w, &protocol, "wallet").await;
+    let cap = crate::app::PARKED_RETRIES_PER_READ;
+    let seqs: Vec<u64> = (0..cap + 1)
+        .map(|_| w.note(app.app_id(), FLAKY).0)
+        .collect();
+    app.receive(None).await.unwrap();
+    w.clock.advance_ms(PARK_AFTER_MS);
+    app.receive(None).await.unwrap();
+    let report = app.receive(None).await.unwrap();
+    assert!(
+        !store_failing(&report.events)
+            .iter()
+            .any(|(seq, _)| seq == seqs.last().unwrap())
+    );
+    // Loaded again, the next read starts at the one the last read didn't reach.
+    let mut app = load_flaky(&w, &protocol, app.app_id()).await;
+    let report = app.receive(None).await.unwrap();
+    let failing = store_failing(&report.events);
+    assert_eq!(failing.first().map(|(seq, _)| *seq), seqs.last().copied());
+}
+
+#[tokio::test]
+async fn test_receive_retry_count_goes_when_a_resumed_effect_applies_a_stored_entry() {
+    let w = World::new();
+    let protocol = FlakyProtocol::new(u32::MAX);
+    let mut app = join_flaky(&w, &protocol, "wallet").await;
+    let (seq, _) = w.note(app.app_id(), FLAKY);
+    app.receive(None).await.unwrap();
+    w.clock.advance_ms(PARK_AFTER_MS);
+    app.receive(None).await.unwrap();
+    assert_eq!(app.state.retries.get(&seq).map(|r| r.reads), Some(2));
+    // The store heals; the stored entry's effect is applied, but its answer is lost.
+    protocol.heal();
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.receive(None).await.is_err());
+    assert!(app.state.pending_effect.is_some());
+    // The next read sends it again: applied once, the entry processed, its count gone.
+    app.receive(None).await.unwrap();
+    assert!(app.state.parked.is_empty());
+    assert!(app.state.retries.is_empty(), "{:?}", app.state.retries);
+    assert_eq!(w.effects(), 1);
+    let app = load_flaky(&w, &protocol, app.app_id()).await;
+    assert!(app.state.retries.is_empty(), "and in the store");
+}
+
+#[tokio::test]
+async fn test_receive_retry_count_goes_when_a_stored_entry_is_parked_as_uncertain() {
+    let w = World::new();
+    let protocol = FlakyProtocol::new(u32::MAX);
+    let mut app = join_flaky(&w, &protocol, "wallet").await;
+    let (seq, _) = w.note(app.app_id(), FLAKY);
+    app.receive(None).await.unwrap();
+    w.clock.advance_ms(PARK_AFTER_MS);
+    app.receive(None).await.unwrap();
+    assert_eq!(app.state.retries.get(&seq).map(|r| r.reads), Some(2));
+    // The store heals; the stored entry's effect is sent, its answer lost.
+    protocol.heal();
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.receive(None).await.is_err());
+    assert!(app.state.pending_effect.is_some());
+    // Past the window it isn't sent again: stored as uncertain, its count gone.
+    w.clock
+        .advance_ms(crate::app::provider::KEPT_BATCH_ANSWER_MS);
+    app.receive(None).await.unwrap();
+    assert_eq!(
+        app.state.parked.get(&seq).map(|p| p.reason),
+        Some(ParkReason::Uncertain)
+    );
+    assert!(app.state.retries.is_empty(), "{:?}", app.state.retries);
+    let app = load_flaky(&w, &protocol, app.app_id()).await;
+    assert!(app.state.retries.is_empty(), "and in the store");
+}
+
+#[tokio::test]
 async fn test_receive_retry_of_the_entry_is_parked_at_once() {
     let w = World::new();
     let protocol = FlakyProtocol::failing(1, StoreError::Corrupt, Mode::Plain);
@@ -594,11 +715,14 @@ impl Protocol for JournalProtocol {
         self.sample.check_body(message)
     }
 
-    fn resend_needed(&self, needed: &ResendNeeded) -> Vec<LocalWrite> {
+    fn resend_needed(
+        &self,
+        needed: &ResendNeeded,
+    ) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
         self.sample.resend_needed(needed)
     }
 
-    fn missed(&self, missed: &MissedEntries) -> Vec<LocalWrite> {
+    fn missed(&self, missed: &MissedEntries) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
         self.sample.missed(missed)
     }
 
@@ -776,6 +900,59 @@ async fn test_restore_of_a_layered_backup_keeps_the_entries_stored_locally() {
     );
     assert_eq!(handed(&again), vec![message.msg_id.clone()]);
     assert_eq!(w.effects(), 1);
+}
+
+#[tokio::test]
+async fn test_restore_of_a_layered_backup_in_place_keeps_what_the_app_owes_its_protocol() {
+    let w = World::new();
+    let protocol = FlakyProtocol::new(0);
+    let mut app = join_flaky(&w, &protocol, "wallet").await;
+    let me = app.app_id();
+    let backup = app.backup_layered().await.unwrap();
+    // After the backup: a duty event, and a call the protocol couldn't answer.
+    w.note(me, "refused");
+    w.switch.fail_next(Fault::Error {
+        path: "ops".into(),
+        code: ErrorCode::PermissionMissing,
+        current: serde_json::json!(null),
+    });
+    let report = app.receive(None).await.unwrap();
+    let duties: Vec<AppEvent> = report
+        .events
+        .into_iter()
+        .filter(AppEvent::is_duty)
+        .collect();
+    assert!(!duties.is_empty());
+    let now = w.clock.now_ms();
+    w.switch.push_missed(1, now.saturating_sub(1000), now);
+    *protocol.sample.failing.lock().unwrap() = 1;
+    app.receive(None).await.unwrap();
+    assert_eq!(app.owed_protocol_calls().await.unwrap(), 1);
+    drop(app);
+    // Restored in place from the layered backup: both stay, the duty events with their
+    // IDs, and the store's epoch and counter go on.
+    let mut restored = App::restore(w.env(), protocol.clone(), flaky_config(), &backup)
+        .await
+        .unwrap();
+    assert_eq!(restored.take_events(), duties);
+    assert_eq!(restored.owed_protocol_calls().await.unwrap(), 1);
+    let last = duties
+        .iter()
+        .filter_map(AppEvent::id)
+        .max_by_key(crate::app::EventId::counter)
+        .unwrap();
+    w.note(me, "refused again");
+    w.switch.fail_next(Fault::Error {
+        path: "ops".into(),
+        code: ErrorCode::PermissionMissing,
+        current: serde_json::json!(null),
+    });
+    let report = restored.receive(None).await.unwrap();
+    let next: Vec<_> = report.events.iter().filter_map(AppEvent::id).collect();
+    assert!(!next.is_empty(), "{:?}", report.events);
+    for id in next {
+        assert_eq!(id.cmp_same_store(&last), Some(std::cmp::Ordering::Greater));
+    }
 }
 
 #[tokio::test]
@@ -1041,12 +1218,12 @@ async fn test_backup_with_a_layer_carries_a_version_a_reader_without_layers_refu
     assert_ne!(version(&layered), json!(crate::app::SCHEMA_VERSION));
     assert!(AppBackup::from_bytes(&bare).is_ok());
     assert!(AppBackup::from_bytes(&layered).is_ok());
-    // A layer under the schema's version, or the layered version without a layer, doesn't
-    // read.
+    // A layer under the schema's version, as an earlier schema wrote layered backups, is
+    // an old schema; the layered version without a layer doesn't read.
     let layer_as_bare = with(&layered, crate::app::SCHEMA_VERSION);
     assert!(matches!(
         AppBackup::from_bytes(&layer_as_bare),
-        Err(AppError::InvalidData(_))
+        Err(AppError::Store(StoreError::OldSchema { .. }))
     ));
     let bare_as_layered = with(&bare, version(&layered).as_u64().unwrap() as u32);
     assert!(matches!(
@@ -1205,11 +1382,14 @@ impl Protocol for CounterProtocol {
         })
     }
 
-    fn resend_needed(&self, needed: &ResendNeeded) -> Vec<LocalWrite> {
+    fn resend_needed(
+        &self,
+        needed: &ResendNeeded,
+    ) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
         self.sample.resend_needed(needed)
     }
 
-    fn missed(&self, missed: &MissedEntries) -> Vec<LocalWrite> {
+    fn missed(&self, missed: &MissedEntries) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
         self.sample.missed(missed)
     }
 

@@ -178,6 +178,14 @@ pub(super) async fn create(pool: &PgPool, account: &NewAccount) -> Result<bool, 
         .await
         .map_err(StoreError::from_db)?;
     }
+    // The apps the enrollment's identity.json lists are listed for the first time here
+    // (Switch wire 7.4.12 keys_through).
+    if let Some(doc) = &account.identity_doc {
+        let doc = pubky_switch_core::records::IdentityDoc::verify(doc, &account.identity_key)
+            .map_err(|_| StoreError::Corrupt("the enrollment's identity.json"))?;
+        let listed = super::apps::newly_listed(None, &doc);
+        super::apps::note_listings(&mut tx, &account.id, &listed, doc.data_epoch()).await?;
+    }
     // The first enrollment's answer: an account keeps far fewer than any limit allows.
     super::enrollments::keep(
         &mut tx,

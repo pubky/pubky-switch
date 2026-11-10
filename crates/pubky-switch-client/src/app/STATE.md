@@ -2,7 +2,8 @@
 
 The app layer keeps all of one app's durable state in the host's `StateStore`, namespace
 `client/<app_id>` (the App ID in z-base-32). One record per key; no blob is rewritten whole.
-Every value is `{"v":1,"d":<record>}`: a reader refuses another `v` as corrupt, so a later
+Every value is `{"v":2,"d":<record>}` (`SCHEMA_VERSION`): a reader refuses an earlier `v`
+as an old schema (`StoreError::OldSchema`) and any other as corrupt, so a later
 schema adds a migration instead of reading old bytes wrongly. Keys are ASCII. Numbers in keys
 are zero-padded to 20 digits so keys sort numerically. The record types are in `state.rs`.
 
@@ -29,10 +30,49 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
 - **Any commit carries everything read before it.** A page's writes go in the next commit
   point, so no commit records a cursor past items whose writes it lacks.
 - **After a failed commit the app reloads** from the store before its next call.
+- **A kept batch or effect is never sent again past its window**, whatever the generation:
+  30 days from its first send, less an hour, both ends in verified service time, erring
+  older. Its first send is stamped (`kept_ms`) at the earlier of the device clock and a
+  service time verified in that call, which a one-item feed read fetches first when no
+  answer of the call brought one, and the stamp is committed before the request leaves; a
+  batch never sent has no stamp and no window, can't be ambiguous, and is never judged for
+  age, and a call that can't verify a time leaves it kept and unsent. An effect is stamped
+  the same way when it is kept, right before its first send. Its age is judged at the later
+  of the device clock and a service time verified in the call that sends it again, fetched
+  the same way; a time verified more than 10 minutes before by the device clock, or with the
+  device clock gone back since, is read again. One past the window by the clocks at hand
+  already, the device clock or the service time held, needs no reading. Past it a retry
+  would get `409 conflict` once the service dropped its proofs, or be taken as new once it
+  forgot the ID (Switch wire 6.4 step 5): the effect's entry is parked as uncertain, the
+  batch dropped with its attempts, unsent.
+- **A refusal of a batch sent again tells only from the batch ID lookup on** (Switch wire
+  6.4 step 5). One made before it is about the caller, such as `403 cert_expired`, or about
+  these bytes, such as `400`. About the caller, it tells nothing of the batch: a kept effect
+  or batch stays as it is, to go again unchanged once the service accepts the app's
+  requests, and a renewed certificate is taken before a kept effect goes again; past the
+  window it is parked or dropped as uncertain. About these bytes, it will come again: the
+  effect's entry is parked as uncertain, or the batch dropped with its attempts, at once.
+  The codes are classified in one place (`refusal_place`).
+- **A duty event goes in the commit of what it reports** (`duty/<id>`), and is reported
+  only once that commit is done: a failed commit reports nothing, and a crash after it
+  loses nothing, since every load reports the kept duty events again. A commit that
+  answers `StoreError::Unknown` may have been applied: the reload after it reports every
+  kept duty event no call reported yet. An acknowledgement removes only events handed to
+  the host since the app was loaded, by `take_events`, a call's report or
+  `unacknowledged_events`.
+- **Only the host's acknowledgement removes a duty event.** The app sets no cap on
+  `duty/`: a cap would have to lose a duty event, or stop reading the feed (which never
+  stalls, Switch spec 8.2), giving up undeliverable messages (Switch spec 11) or following
+  a provider change (Switch spec 12.5, 12.6). A host acknowledges each one once its
+  protocol has kept what it says.
 - **A restore is one commit:** the namespace cleared, the app's restored state and the
   protocol's backup layer under `p/`, both checked before it, so a failure leaves neither.
   A backup with a layer also carries `seen/`, `parked/` and `proc/` of the same moment,
   which the layer may reflect, so no entry is handed to the protocol twice.
+- **A layered backup reads one moment:** `App::backup_layered` is several store reads in
+  sequence, and they agree because the call takes `&mut self`, so no call of the app commits
+  between them, and the store allows one writer per namespace (`StateStore`, rule 4), so no
+  other process does.
 
 ## Keys
 
@@ -67,26 +107,35 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
 | `seen/<seq>` | an entry processed past a held one | |
 | `held/<seq>` | an entry held because its sender can't be checked, since when | |
 | `retry/<seq>` | an entry whose receive step the protocol's store or the host kept from finishing (`Outcome::Retry`): the reads in a row that ended so, and when the first was; kept while the entry is stored locally too, and it goes once the entry is processed | |
-| `parked/<seq>` | an entry stored locally and passed: the opened plaintext, sender, certificate, time, reason (an unverifiable sender, a quota or a store failure of the receive step, tried again; an effect refused for good, over one batch, or kept past the window in which its resend tells whether it was applied, not tried again) | yes |
-| `uncert/<sender>/<msg_id>` | a message whose kept effect may have been applied: its entry is parked when the feed shows it again | |
+| `parked/<seq>` | an entry stored locally and passed: the opened plaintext, sender, certificate, time, reason (an unverifiable sender, a quota or a store failure of the receive step, tried again; an effect refused for good, over one batch, carrying an operation the app layer builds itself, or kept past the window in which its resend tells whether it was applied, not tried again) | yes |
 | `asked/<seq>` | a re-send was handed to the protocol for this item | |
+| `parkn` | where the retries of entries stored locally stand in their round: its number and the next `seq`. The round covers the entries stored in an earlier round, each `parked/` record naming the round it was stored in, not by `seq`, which a provider loss renumbers; each read tries at most `PARKED_RETRIES_PER_READ`, in `seq` order, and an entry stored later waits for the next round, so every entry is tried within two rounds | |
+| `owed/<generation>/<seq>` | a re-send or missed-entries call about this item that the protocol answered with an error: written in the commit that passes the item, made again at the start of each read, each call on its own, and gone in the commit of its answer's writes; `App::owed_protocol_calls` counts them. The key names the generation the item was read at | |
 | `departed/<app_id>` | another own app's departure verified in the chain, and its time | |
 | `join` | the join step: the registration batch while it is owed | |
-| `pending/effect` | a received message's effect batch and its outcome writes, with the deadlines of the claims it writes | |
+| `pending/effect` | a received message's effect batch and its outcome writes, with the deadlines of the claims it writes, and the opened entry, to store it locally if the batch outlives the batch ID window | yes |
 | `pending/record` | an `app.put` batch | |
 | `alarm` | the alarm that stopped the app | |
 | `restore` | after a restore: the backup's highest `n`, the key check, the app's own new key, reconcile mode | |
 | `leave` | a leave in progress or done | |
 | `service_time` | the highest service time verified, its key, the offset from the device clock | |
 | `p/...` | the protocol's own local state (`LocalWrite`) | the protocol's |
+| `duty/<id>` | a duty event (`AppEvent::is_duty`), written in the commit of the change it reports, until the host acknowledges it (`App::ack_events`); one per entry stored for good, kept batch or `attempt` dropped, kept batch refused for good, or outbox message given up. Only acknowledgements remove them: nothing bounds them for a host that never acknowledges | |
+| `dutyn` | the counter the next duty event takes; it only goes up in one store, and a restore in place keeps it | |
+| `dutye` | the store's event epoch, random, chosen once when the store starts empty (the first join, or a restore onto a store without one); every duty event ID carries it with its counter | |
 
 Deleting the keys on a leave removes `keys`, `naming`, `rk/`, `scope/`, `parked/`,
-`pending/` and `p/`, and marks `leave`.
+`pending/`, `p/`, `duty/` and `owed/`, and marks `leave`.
 
 ## Extending the schema
 
 - New records take new keys under a prefix of their own; existing keys keep their meaning.
 - A changed record type bumps `SCHEMA_VERSION` with a migration that runs on load.
+- `SCHEMA_VERSION` 2: `pending/effect` keeps the opened entry it is for, a required field.
+  No migration reads a store of schema 1; such a store fails to load as an old schema, and
+  a backup an earlier schema wrote (schema 1, or a layered backup of version 2) is refused
+  the same way (`StoreError::OldSchema`). A store or backup of an earlier schema has no way
+  forward but a new join; no tagged or pinned build wrote schema 1.
 - Protocol state stays under `p/`, written only through `LocalWrite`.
 
 ## Moves, recovery and push
@@ -125,7 +174,8 @@ uploads; `push.rs` holds the push registration. The peek (`peek.rs`) writes noth
   `409 conflict`: applied; `409 stale_generation`: signed again). Past 30 days less the
   clock tolerance from when it was kept, at the switch or at any later resend, or with no
   time kept, `409 stale_generation` decides nothing: a batch goes, reported as dropped,
-  and an effect's entry is parked, never applied again.
+  and an effect's entry is parked in the commit that drops the effect, never applied
+  again, and the protocol is told (`EffectUncertain`).
 - **A newer own `identity.json`** that names a later generation, a loss of the generation
   moved from, or another service than the freeze, supersedes a move or a loss at any step,
   a stuck one included: after a step fails at a service the app reads its `identity.json`
@@ -136,7 +186,8 @@ uploads; `push.rs` holds the push registration. The peek (`peek.rs`) writes noth
   view as at a move (a kept batch holding an `attempt` goes instead of being signed
   again), `restore.reconcile` on, and `loss`. Each step then commits as done; the
   protocol's re-send writes commit with their step, once. A registration another device
-  of the app made first is adopted, and the record then goes alone.
+  of the app made first is adopted, and the record then goes alone. A protocol that answers
+  the re-send step with an error leaves the loss at that step, to be asked again.
 - **`gone`** stops every read; `push` goes with it. It is kept only once the newest verified
   own `identity.json` removes the app or doesn't list it, a `403 not_current` came while it
   lists the app with the certificate the app holds, or the account is erased: an unsigned
@@ -159,7 +210,7 @@ uploads; `push.rs` holds the push registration. The peek (`peek.rs`) writes noth
 | `peers_doc` | the own `identity.json` the deliveries to recent peers were last judged against, and the counterparties still owed it | |
 | `lc/conv/<pubky>` | a conversation entry in the app's copy of the lists, from its writes, the feed and `GET /allow`; its writes and `GET /allow` also keep `lc/contact/`, `lc/deny/` and `lc/code/` | |
 | `invite/<code_hash>` | the code of an invite code the app registered, to show it again | yes |
-| `opq/<batch_id>` | a batch of operations, signed and kept before it is sent, with what its answer settles: the protocol's local writes and the signed messages it puts in the outbox; it goes with its answer or a refusal for good, and stays through anything else | the messages' |
+| `opq/<batch_id>` | a batch of operations, signed and kept before it is sent, with what its answer settles and, from its first send on, when that left (`kept_ms`, absent while never sent): the protocol's local writes and the signed messages it puts in the outbox; it goes with its answer or a refusal for good, and stays through anything else | the messages' |
 | `list_due` | a listing of the collections is owed: after joining, a restore or a `missed` item | |
 | `rec/<key>` | the shared record write the app took: the signed operation, certificate and proof, its version and whether a proof gave it, the opened value, and the refused write it follows | yes |
 | `recname/<key>` | the collection name of a record the app creates outside the protocol's collections, from a write or an effect, until its write is answered | |
@@ -173,3 +224,33 @@ Deleting the keys on a leave also removes `rec/`, `hw/`, `recname/`, `out/`, `se
 `sentt/`, `invite/` and `opq/`. A restore replaces the namespace, these keys included, and
 sets `list_due`. `rec/`, `clent/` and `claim/` hold the evidence of the shared state that
 uploads carry (`App::shared_evidence`).
+
+## What the app owes its protocol: restores and provider changes
+
+`duty/<id>`, `dutyn`, `dutye` and `owed/<generation>/<seq>` hold what the app still has to
+tell its protocol, so neither a restore nor a provider change drops them.
+
+- **A backup carries none of them.** They are the store's, not the app's keys or position.
+- **A restore in place** (into a store that holds an epoch) keeps `dutye`, sets `dutyn` to
+  the higher of the store's counter and the highest kept counter plus one, and carries
+  `duty/` and `owed/` across the namespace's replacement, all in its one commit: the duty
+  events keep their IDs and are delivered again, and the owed calls are made by the next
+  read. The restored cursor may meet the same items again; the protocol then hears of them
+  twice, which it tolerates.
+- **A restore in place is the way out of a damaged store.** A store that can't be read
+  now fails it, to be tried again. A duty event or owed call whose value reads but
+  doesn't decode is left behind, and the protocol told how many with `RestoreLeftBehind`,
+  a duty event in the restore's commit. A damaged `dutye` or `dutyn` starts a new epoch,
+  the readable duty events kept under it.
+- **A restore on another device, or onto a wiped store** (one without an epoch), starts a new random epoch at the first counter, with none of them:
+  their facts stayed with the lost store. Its IDs can't equal any the host acknowledged
+  before, whatever the counters or the clock, since an ID is its epoch and its counter.
+- **IDs compare only within one store.** `App::ack_events` refuses an ID of another epoch
+  and acknowledges nothing.
+- **A provider change keeps them** (a move, a key change in place, a provider loss). The
+  duty events report facts that stay true. An owed call is still made at the generation
+  followed: a re-send call names a sender and acceptance times, which the counterparty
+  answers wherever the app reads now, and a missed-entries call names the item's `seq` at
+  the generation in its key, which the protocol takes as information only. After a loss
+  the protocol is also asked for the loss's re-sends; a request twice is answered once,
+  since re-sends are deduplicated by `msg_id` (Switch spec 11).

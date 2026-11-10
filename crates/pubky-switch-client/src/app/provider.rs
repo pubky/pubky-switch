@@ -31,13 +31,13 @@ use pubky_switch_core::claims::ClaimType;
 use pubky_switch_core::enc::{b64, pubky_id, pubky_key, serde_b64, serde_b64_vec};
 use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::ops::{AllowKind, Condition, MAX_BATCH_ENTRIES, OpBody, OpKind, Position};
-use pubky_switch_core::records::{CLOCK_TOLERANCE_MS, DAY_MS, Freeze, IdentityDoc, Inbox};
+use pubky_switch_core::records::{DAY_MS, Freeze, IdentityDoc, Inbox};
 use pubky_switch_core::scopes::Permission;
 use pubky_switch_core::sig::SignedDoc;
 use serde::{Deserialize, Serialize};
 
 use super::error::{Alarm, AppError};
-use super::events::AppEvent;
+use super::events::{AppEvent, Duty};
 use super::feed::{ReceiveReport, processed_writes};
 use super::identity;
 use super::state::{Tx, key};
@@ -217,10 +217,22 @@ pub(crate) enum Carry {
     AfterLoss,
 }
 
-/// How long after it was kept a batch's resend still tells whether it was applied: the
-/// service holds a batch's ID at least 30 days, less the clock tolerance (Switch spec
-/// 12.5 "Kept batches", 6.3).
-pub(crate) const KEPT_BATCH_ANSWER_MS: u64 = 30 * DAY_MS - CLOCK_TOLERANCE_MS;
+/// How long after it was kept a batch's resend still tells whether it was applied. The
+/// service keeps a batch's proofs `batch_proofs_ms`, 30 days from when it applied the batch
+/// (Switch wire 6.4 step 5, 9): a retry within that time gets them back, and after it a
+/// retry gets `409 conflict`, which then can't be told from a condition that failed, and an
+/// ID forgotten takes the same bytes as new. The window ends [`KEPT_BATCH_MARGIN_MS`]
+/// before those 30 days from when the app kept the batch, before its first send.
+pub(crate) const KEPT_BATCH_ANSWER_MS: u64 =
+    pubky_switch_core::ops::BATCH_PROOFS_MS - KEPT_BATCH_MARGIN_MS;
+
+/// How much sooner than the service's 30 days a kept batch's window ends. A resend sent just
+/// inside the window, measured at [`App::kept_window_now`], reaches the service within the
+/// device clock's tolerance of the service's (5 minutes, the clock tolerance), plus the
+/// 5 minutes a request's signed time is accepted for (Switch wire 7.1), after the app kept
+/// it, and the service applied it no sooner than the app kept it: some 20 minutes in the
+/// worst case. An hour leaves room past that.
+pub(crate) const KEPT_BATCH_MARGIN_MS: u64 = 60 * 60 * 1000;
 
 /// Whether a resend of a batch kept at `kept_ms` still tells whether it was applied, at
 /// `now`: kept less than [`KEPT_BATCH_ANSWER_MS`] ago. A batch without a time, kept by an
@@ -228,6 +240,74 @@ pub(crate) const KEPT_BATCH_ANSWER_MS: u64 = 30 * DAY_MS - CLOCK_TOLERANCE_MS;
 pub(crate) fn answer_decides(now: u64, kept_ms: Option<u64>) -> bool {
     kept_ms.is_some_and(|at| now.saturating_sub(at) < KEPT_BATCH_ANSWER_MS)
 }
+
+impl App {
+    /// The time a batch's first send is stamped at: the earlier of the device clock and the
+    /// service time verified in this call, which every path fetches first, before a kept
+    /// batch's first send and before an effect is kept ([`App::fresh_service_time`]), so a
+    /// device clock ahead doesn't make it look younger, and a time from long before doesn't
+    /// make it look older.
+    pub(crate) fn kept_stamp(&self) -> u64 {
+        let now = self.now();
+        self.state
+            .service_time
+            .map_or(now, |time| now.min(time.highest_ms))
+    }
+
+    /// A service time verified in this call, before a kept batch's age is judged: a read of
+    /// one feed item, the cheapest authenticated request, when no answer of this call
+    /// brought one within [`FRESH_SERVICE_TIME_MS`] on the device clock
+    /// ([`App::kept_window_now`]).
+    ///
+    /// # Errors
+    ///
+    /// The read's: the age isn't judged, and the kept batch stays as it is.
+    pub(crate) async fn fresh_service_time(&mut self) -> Result<(), AppError> {
+        let now = self.now();
+        let fresh = self
+            .time_fresh_at
+            .is_some_and(|at| now >= at && now - at <= FRESH_SERVICE_TIME_MS);
+        if fresh {
+            return Ok(());
+        }
+        let query = crate::client::answers::FeedQuery {
+            after: Some(Position {
+                generation: self.state.cursor.generation,
+                seq: self.state.cursor.seq,
+            }),
+            limit: Some(1),
+            wait: None,
+        };
+        let result = self.client.feed(query).await;
+        self.take(result).await?;
+        Ok(())
+    }
+
+    /// The time a kept batch's age is measured at: the later of the device clock and the
+    /// highest service time the app verified, in this call before any resend
+    /// ([`App::fresh_service_time`]), so a device clock set back doesn't hold the window
+    /// open (Switch spec 12.5 "Kept batches").
+    pub(crate) fn kept_window_now(&self) -> u64 {
+        let verified = self.state.service_time.map_or(0, |time| time.highest_ms);
+        self.now().max(verified)
+    }
+
+    /// Whether a resend of a batch kept at `kept_ms` still tells whether it was applied,
+    /// now ([`answer_decides`], at [`App::kept_window_now`]).
+    pub(crate) fn answer_decides(&self, kept_ms: Option<u64>) -> bool {
+        answer_decides(self.kept_window_now(), kept_ms)
+    }
+}
+
+/// How long, by the device clock, a service time verified in a call counts as fresh for
+/// judging a kept batch's age ([`App::fresh_service_time`]); a device clock gone back since
+/// it came counts as not fresh. The window ends an hour before the service's 30 days, and
+/// the worst case of the clocks and a request's accepted time takes some 20 minutes of it
+/// ([`KEPT_BATCH_MARGIN_MS`]): 10 minutes between the reading and the send leaves half an
+/// hour. A known limit: a device clock stepped back by about the length of a suspend
+/// between the reading and the send, and left more than about 45 minutes behind true time,
+/// still passes this test, since the device clock is all it measures the gap by.
+pub(crate) const FRESH_SERVICE_TIME_MS: u64 = 10 * 60 * 1000;
 
 /// How many provider changes one follow takes in a row, each given up for a newer own
 /// `identity.json` met on the way; the next call goes on from there.
@@ -237,26 +317,24 @@ fn corrupt() -> AppError {
     AppError::Store(StoreError::Corrupt)
 }
 
-/// A kept batch dropped at a provider change: reported, with each `attempt` in it, so the
-/// protocol treats those obligations as uncertain (Switch spec 12.5 "Kept batches", 12.6
-/// step 5).
-pub(crate) fn dropped(id: &[u8; 16], batch: &Batch, events: &mut Vec<AppEvent>) {
-    events.push(AppEvent::KeptBatchDropped { batch_id: *id });
-    for op in batch.ops() {
-        if let OpKind::Claim(fields) = &op.body().kind
-            && fields.kind == ClaimType::Attempt
-            && let Ok(entry) = fields.check()
-        {
-            events.push(AppEvent::AttemptDropped {
-                claim_key: entry.claim_key,
-                attempt_id: entry.attempt_id,
-            });
-        }
-    }
+/// The own `attempt`s a batch carries.
+pub(crate) fn attempts_in(batch: &Batch) -> Vec<super::events::ClaimAttempt> {
+    batch
+        .ops()
+        .iter()
+        .filter_map(|op| match &op.body().kind {
+            OpKind::Claim(fields) if fields.kind == ClaimType::Attempt => fields.check().ok(),
+            _ => None,
+        })
+        .map(|entry| super::events::ClaimAttempt {
+            claim_key: entry.claim_key,
+            attempt_id: entry.attempt_id,
+        })
+        .collect()
 }
 
 /// A kept batch's operations, with their conditions, to sign again.
-fn ops_of(batch: &Batch) -> Vec<(Vec<Condition>, OpKind)> {
+pub(crate) fn ops_of(batch: &Batch) -> Vec<(Vec<Condition>, OpKind)> {
     batch
         .ops()
         .iter()
@@ -1020,16 +1098,17 @@ impl App {
     ///   stays whatever its age: when the answer can't decide, its entry is stored and
     ///   passed, never applied again.
     ///
-    /// Returns the events to report once `tx` commits.
+    /// Returns the informational events to report once `tx` commits; the duty events are
+    /// kept in `tx`, and reported by its commit.
     pub(crate) async fn carry_kept_writes(
         &mut self,
         tx: &mut Tx,
         carry: Carry,
     ) -> Result<Vec<AppEvent>, AppError> {
         let mut events = Vec::new();
-        let now = self.now();
         let resend_first = carry == Carry::ResendFirst;
-        let answer_decides = |kept_ms: Option<u64>| answer_decides(now, kept_ms);
+        let window_now = self.kept_window_now();
+        let answer_decides = |kept_ms: Option<u64>| answer_decides(window_now, kept_ms);
         if let Some(pending) = self.state.pending_effect.clone() {
             let applied = Batch::from_body(pending.body.clone())?
                 .id()
@@ -1041,6 +1120,12 @@ impl App {
             if !stays {
                 tx.delete(key::PENDING_EFFECT)?;
                 self.state.pending_effect = None;
+            }
+            // After a loss, an effect the old chain doesn't show applied goes, and its entry
+            // is read again; an `attempt` in it is never signed again, so it is reported as
+            // a kept batch's is (Switch spec 12.6 step 5).
+            if !applied && carry == Carry::AfterLoss {
+                self.attempts_dropped(&Batch::from_body(pending.body.clone())?, tx)?;
             }
             if applied {
                 let now = self.now();
@@ -1054,6 +1139,10 @@ impl App {
                 }
                 processed_writes(tx, &pending.sender, &pending.msg_id, pending.hash, now)?;
                 tx.local(&pending.local)?;
+                // Processed: a count of the store's retries at it goes with it.
+                if self.state.retries.remove(&pending.seq).is_some() {
+                    tx.delete(&key::retry(pending.seq))?;
+                }
                 if pending.parked {
                     tx.delete(&key::parked(pending.seq))?;
                     self.state.parked.remove(&pending.seq);
@@ -1084,10 +1173,13 @@ impl App {
                 continue;
             }
             let kept = Batch::from_body(pending.body.clone())?;
-            if resend_first {
+            // A batch never sent has no answer to wait for: it is signed again for the new
+            // generation, and sent as a first send, its old bytes never resent.
+            let never_sent = pending.kept_ms.is_none();
+            if resend_first && !never_sent {
                 if !answer_decides(pending.kept_ms) {
                     Self::replace_kept_batch(&id, None, tx)?;
-                    dropped(&id, &kept, &mut events);
+                    self.kept_batch_dropped(&id, &kept, tx)?;
                 }
                 continue;
             }
@@ -1097,15 +1189,17 @@ impl App {
             });
             if carry == Carry::AfterLoss && attempts {
                 Self::replace_kept_batch(&id, None, tx)?;
-                dropped(&id, &kept, &mut events);
+                self.kept_batch_dropped(&id, &kept, tx)?;
                 continue;
             }
             let signed = self.sign_ops(ops, None)?;
             let new_id = signed
                 .id()
                 .ok_or_else(|| AppError::InvalidData("a batch of operations has an ID".into()))?;
+            // New bytes, never sent: stamped at their first send.
             let mut renewed = pending.clone();
             renewed.body = signed.body().to_vec();
+            renewed.kept_ms = None;
             Self::replace_kept_batch(&id, Some((&new_id, &renewed)), tx)?;
             events.push(AppEvent::KeptBatchSignedAgain {
                 batch_id: id,
@@ -1113,6 +1207,34 @@ impl App {
             });
         }
         Ok(events)
+    }
+
+    /// A kept batch dropped at a provider change: reported, with each `attempt` in it, so
+    /// the protocol treats those obligations as uncertain (Switch spec 12.5 "Kept batches",
+    /// 12.6 step 5). Duty events, kept in `tx`, the commit that drops the batch.
+    pub(crate) fn kept_batch_dropped(
+        &mut self,
+        id: &[u8; 16],
+        batch: &Batch,
+        tx: &mut Tx,
+    ) -> Result<(), AppError> {
+        self.keep_duty(tx, Duty::KeptBatchDropped { batch_id: *id })?;
+        self.attempts_dropped(batch, tx)
+    }
+
+    /// Each `attempt` of a batch the app drops unsent, reported in `tx` so the protocol
+    /// treats its obligation as uncertain (Switch spec 12.5 "Kept batches", 12.6 step 5).
+    fn attempts_dropped(&mut self, batch: &Batch, tx: &mut Tx) -> Result<(), AppError> {
+        for attempt in attempts_in(batch) {
+            self.keep_duty(
+                tx,
+                Duty::AttemptDropped {
+                    claim_key: attempt.claim_key,
+                    attempt_id: attempt.attempt_id,
+                },
+            )?;
+        }
+        Ok(())
     }
 
     /// Whether the old service's chain, as the app verified it, holds batch `id`.

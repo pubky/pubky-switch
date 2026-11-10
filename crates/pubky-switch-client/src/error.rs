@@ -26,6 +26,13 @@ pub enum StoreError {
     /// A stored value failed its own checks.
     #[error("a stored value is corrupt")]
     Corrupt,
+    /// A stored value of an earlier schema, which this build doesn't read: the store was
+    /// written by an earlier build, and holds no migration to this one.
+    #[error("a stored value is of schema {found}, earlier than this build's")]
+    OldSchema {
+        /// The schema version the value carries.
+        found: u32,
+    },
     /// Any other failure, described by the host. Nothing was applied.
     #[error("store: {0}")]
     Other(String),

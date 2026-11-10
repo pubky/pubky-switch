@@ -1,11 +1,155 @@
 //! What the app tells its host: [`AppEvent`]s, collected in each call's report. Alarms
-//! (Switch spec 3.6, 4.3, 10.1) are also kept in the store until the user resolves them;
-//! every other event is shown once.
+//! (Switch spec 3.6, 4.3, 10.1) are also kept in the store until the user resolves them.
 //!
 //! Events carry facts, never wording, and never message content: a host words them.
+//!
+//! # Duty events
+//!
+//! Where the spec has the app tell its protocol something, the event is a duty event
+//! ([`AppEvent::is_duty`]): a received message's effect refused for good, too large for one
+//! batch, or of unknown fate, and its entry stored locally for good (Switch spec 8.2, 12.5
+//! "Kept batches"); a kept batch dropped at a provider change and each `attempt` in it
+//! (Switch spec 12.5 "Kept batches", 12.6 step 5); a kept batch refused for good, with its
+//! local writes and outbox messages (Switch spec 6.4); a message deleted from the outbox
+//! undelivered (Switch spec 11). Each carries a stable [`EventId`] and is kept in the
+//! store (`duty/<id>`) in the same commit as the change it reports, so no crash separates
+//! the two. It is reported once that commit is done, or, for a commit whose answer can't
+//! tell whether it was applied, by the reload after it; again by every [`super::App::load`],
+//! and listed by [`super::App::unacknowledged_events`], until the host acknowledges it with
+//! [`super::App::ack_events`]: delivery is at least once. A host and its protocol must
+//! therefore tolerate a duty event seen twice, and act on it only once they have kept what
+//! it says, then acknowledge it.
+//!
+//! Every other event is informational: kept in memory only, and shown once.
+//!
+//! Nothing in the app bounds the stored duty events: only the host's acknowledgements
+//! remove them. Each is written once, for one entry stored for good, one kept batch or
+//! `attempt` dropped, or one outbox message given up, so they grow with those facts, and
+//! without limit for a host that never acknowledges. The app sets no cap, since a cap would
+//! have to lose a duty event or stop the work that makes them: reading the feed, which never
+//! stalls (Switch spec 8.2), giving up an undeliverable message (Switch spec 11), or
+//! following a provider change (Switch spec 12.5, 12.6). A host acknowledges each duty
+//! event once it has handed it to its protocol and the protocol has kept what it says.
+
+use serde::{Deserialize, Serialize};
+
+use pubky_switch_core::enc::serde_b64;
 
 use super::error::Alarm;
 use super::protocol::StoreFailure;
+
+/// The stable ID of a duty event ([`AppEvent::is_duty`]): the store's epoch, and a counter.
+///
+/// The epoch is random, chosen once when the app's store starts empty: at the first
+/// [`super::App::join`], and at a [`super::App::restore`] onto a store that holds none. A
+/// restore in place keeps it. Within one store every kept event has the same epoch and the
+/// counter only goes up, in the order the events were kept; a store started on another
+/// device, or after a wipe, has another epoch, so its IDs never equal one from before.
+///
+/// IDs compare only within one store: [`EventId::cmp_same_store`] orders two of the same
+/// epoch and gives `None` otherwise. There is no total order across stores. A host keeps an
+/// ID as [`EventId::to_bytes`] or its string form ([`std::fmt::Display`], parsed with
+/// [`std::str::FromStr`]), both stable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct EventId {
+    epoch: [u8; EPOCH_LEN],
+    counter: u64,
+}
+
+/// The length of a store's event epoch, in bytes.
+pub(crate) const EPOCH_LEN: usize = 16;
+
+/// The length of [`EventId::to_bytes`].
+pub const EVENT_ID_LEN: usize = EPOCH_LEN + 8;
+
+impl EventId {
+    pub(crate) fn new(epoch: [u8; EPOCH_LEN], counter: u64) -> Self {
+        Self { epoch, counter }
+    }
+
+    pub(crate) fn epoch(&self) -> [u8; EPOCH_LEN] {
+        self.epoch
+    }
+
+    /// The counter: the event's place among its store's duty events.
+    pub fn counter(&self) -> u64 {
+        self.counter
+    }
+
+    /// Whether `other` comes from the same store.
+    pub fn same_store(&self, other: &Self) -> bool {
+        self.epoch == other.epoch
+    }
+
+    /// The order of two IDs of the same store, by counter; `None` for IDs of different
+    /// stores, which have no order.
+    pub fn cmp_same_store(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        self.same_store(other)
+            .then(|| self.counter.cmp(&other.counter))
+    }
+
+    /// The ID's stable bytes: the epoch, then the counter, big-endian.
+    pub fn to_bytes(&self) -> [u8; EVENT_ID_LEN] {
+        let mut bytes = [0u8; EVENT_ID_LEN];
+        let (epoch, counter) = bytes.split_at_mut(EPOCH_LEN);
+        epoch.copy_from_slice(&self.epoch);
+        counter.copy_from_slice(&self.counter.to_be_bytes());
+        bytes
+    }
+
+    /// An ID from [`EventId::to_bytes`].
+    ///
+    /// # Errors
+    ///
+    /// [`EventIdError`] for bytes of another length.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, EventIdError> {
+        if bytes.len() != EVENT_ID_LEN {
+            return Err(EventIdError);
+        }
+        let (epoch, counter) = bytes.split_at(EPOCH_LEN);
+        Ok(Self {
+            epoch: epoch.try_into().map_err(|_| EventIdError)?,
+            counter: u64::from_be_bytes(counter.try_into().map_err(|_| EventIdError)?),
+        })
+    }
+}
+
+/// The string form: the epoch in lowercase hex, a `-`, then the counter in decimal.
+impl std::fmt::Display for EventId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for byte in self.epoch {
+            write!(f, "{byte:02x}")?;
+        }
+        write!(f, "-{}", self.counter)
+    }
+}
+
+impl std::str::FromStr for EventId {
+    type Err = EventIdError;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let (hex, counter) = text.split_once('-').ok_or(EventIdError)?;
+        if hex.len() != EPOCH_LEN * 2 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(EventIdError);
+        }
+        let mut epoch = [0u8; EPOCH_LEN];
+        for (index, byte) in epoch.iter_mut().enumerate() {
+            let at = index.saturating_mul(2);
+            let pair = hex.get(at..at.saturating_add(2)).ok_or(EventIdError)?;
+            *byte = u8::from_str_radix(pair, 16).map_err(|_| EventIdError)?;
+        }
+        if counter.is_empty() || !counter.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(EventIdError);
+        }
+        let counter = counter.parse().map_err(|_| EventIdError)?;
+        Ok(Self { epoch, counter })
+    }
+}
+
+/// Bytes or a string that aren't an [`EventId`]'s stable form.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("not an event ID")]
+pub struct EventIdError;
 
 /// One thing that happened, for the host to show or act on.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -69,21 +213,24 @@ pub enum AppEvent {
         /// Why.
         reason: BackupRefusal,
     },
-    /// An entry was stored locally and the cursor moved past it (Switch spec 8.2): its
-    /// sender stayed unverifiable too long, its write hit a quota, or the store failed for
-    /// its receive step ([`ParkReason`]).
+    /// An entry was stored locally and the cursor moved past it (Switch spec 8.2), for
+    /// `reason`. A duty event when the entry isn't tried again
+    /// ([`ParkReason::tried_again`]): then nothing but the protocol brings it back.
     Parked {
+        /// The duty event's ID; `None` for an entry that later reads try again.
+        id: Option<EventId>,
         /// The entry's `seq`.
         seq: u64,
         /// Why.
         reason: ParkReason,
     },
-    /// A received message's effect was refused for good, has more operations than one batch
-    /// takes with the cursor move, or was kept from before a provider change past the
-    /// window in which its resend tells whether it was applied: its entry was stored
-    /// locally and passed ([`AppEvent::Parked`]), and the effect isn't sent again (Switch
-    /// spec 8.2, 12.5 "Kept batches"). The protocol may build it again in another form.
+    /// A received message's effect was refused for good, or has more operations than one
+    /// batch takes with the cursor move: its entry was stored locally and passed
+    /// ([`AppEvent::Parked`]), and the effect isn't sent again (Switch spec 8.2). The
+    /// protocol may build it again in another form. A duty event.
     EffectRefused {
+        /// The duty event's ID.
+        id: EventId,
         /// The entry's `seq`.
         seq: u64,
         /// The sender identity.
@@ -92,8 +239,31 @@ pub enum AppEvent {
         msg_id: String,
         /// The message kind.
         kind: String,
-        /// The error code of the refusal; `None` for an effect over one batch.
+        /// The error code of the refusal; `None` for an effect the app refused itself, over
+        /// one batch or carrying an operation the app layer builds ([`ParkReason`] says
+        /// which).
         code: Option<String>,
+    },
+    /// A received message's effect was kept unanswered across a provider change for longer
+    /// than a resend's answer can tell whether it was applied (Switch spec 12.5 "Kept
+    /// batches"): its entry was stored locally and passed ([`AppEvent::Parked`]), and the
+    /// effect isn't sent or built again. It may have been applied: the protocol decides
+    /// from the current state of what the effect writes, and treats each `attempt` the
+    /// effect carried as of unknown fate (Switch spec 12.5 "Kept batches", 12.6 step 5). A
+    /// duty event.
+    EffectUncertain {
+        /// The duty event's ID.
+        id: EventId,
+        /// The entry's `seq`.
+        seq: u64,
+        /// The sender identity.
+        sender: [u8; 32],
+        /// The message ID.
+        msg_id: String,
+        /// The message kind.
+        kind: String,
+        /// The effect's own `attempt`s: whether each was applied can't be known.
+        attempts: Vec<ClaimAttempt>,
     },
     /// An entry stored locally was processed.
     Unparked {
@@ -106,7 +276,8 @@ pub enum AppEvent {
         /// The entry's `seq`.
         seq: u64,
         /// Whether a re-send was asked; never for a time before the cursor's, less the
-        /// clock tolerance.
+        /// clock tolerance, and not when the protocol's call failed: it is owed then, and
+        /// asked by a later read ([`super::App::owed_protocol_calls`]).
         resend_asked: bool,
     },
     /// An entry left unread by a departed own app (Switch spec 8.2).
@@ -114,7 +285,8 @@ pub enum AppEvent {
         /// The item's `seq`.
         seq: u64,
         /// Whether a re-send was asked: only for an entry accepted at or before a departure
-        /// the app verified in its chain.
+        /// the app verified in its chain, and not when the protocol's call failed: it is
+        /// owed then, and asked by a later read.
         resend_asked: bool,
     },
     /// Entries the service deleted while the app was lagging (Switch spec 8.2).
@@ -303,20 +475,36 @@ pub enum AppEvent {
     /// provider loss, since no automatic attempt is made on an obligation from before the
     /// loss (Switch spec 12.6 step 5), or one kept longer than a resend's answer can tell
     /// whether it was applied (Switch spec 12.5 "Kept batches"). Each attempt in it follows
-    /// as [`AppEvent::AttemptDropped`]. The protocol decides what to write instead.
+    /// as [`AppEvent::AttemptDropped`]. The protocol decides what to write instead. A duty
+    /// event.
     KeptBatchDropped {
+        /// The duty event's ID.
+        id: EventId,
         /// The batch ID.
         batch_id: [u8; 16],
     },
     /// An `attempt` in a kept batch that was dropped ([`AppEvent::KeptBatchDropped`]): it
     /// is never signed again, and whether it was applied can't be known, so its obligation
     /// is uncertain (Switch spec 12.5 "Kept batches", 12.6 step 5). The protocol treats it
-    /// so.
+    /// so. A duty event.
     AttemptDropped {
+        /// The duty event's ID.
+        id: EventId,
         /// The claim key.
         claim_key: [u8; 32],
         /// The attempt.
         attempt_id: [u8; 16],
+    },
+    /// A restore in place left behind kept duty events and owed protocol calls whose stored
+    /// values didn't read: what they said is lost, and the protocol learns only how many
+    /// (`STATE.md`, "What the app owes its protocol"). A duty event.
+    RestoreLeftBehind {
+        /// The duty event's ID.
+        id: EventId,
+        /// The duty events left behind.
+        duty_events: u64,
+        /// The owed protocol calls left behind.
+        owed_calls: u64,
     },
     /// The account the app used is gone: the service answers as for an identity it doesn't
     /// host and the identity publishes no `identity.json` (Switch spec 12.7).
@@ -344,8 +532,10 @@ pub enum AppEvent {
     /// A message answered `403 not_admitted` or `403 not_current` for
     /// [`super::UNDELIVERABLE_MS`] wasn't delivered (Switch spec 11). A message its
     /// recipient never accepted was deleted from the outbox with its plaintext; for a
-    /// re-send, only the re-send was given up.
+    /// re-send, only the re-send was given up. A duty event.
     MessageUndelivered {
+        /// The duty event's ID.
+        id: EventId,
         /// The message ID.
         msg_id: String,
         /// Whether it was a re-send of a message accepted before.
@@ -400,8 +590,11 @@ pub enum AppEvent {
         claim_key: [u8; 32],
     },
     /// A batch kept from an earlier call was sent again and refused for good: it was not
-    /// applied, and the app no longer keeps it (Switch spec 6.4, Switch wire 6.4).
+    /// applied, and the app no longer keeps it, nor the local writes and outbox messages it
+    /// carried (Switch spec 6.4, Switch wire 6.4). A duty event.
     BatchRefused {
+        /// The duty event's ID.
+        id: EventId,
         /// The batch ID.
         batch_id: [u8; 16],
         /// The error code of the refusal.
@@ -416,6 +609,152 @@ pub enum AppEvent {
         /// The attempt.
         attempt_id: [u8; 16],
     },
+}
+
+impl AppEvent {
+    /// The ID of a duty event, which the store keeps until acknowledged; `None` for an
+    /// informational event (module docs, "Duty events").
+    pub fn id(&self) -> Option<EventId> {
+        match self {
+            Self::Parked { id, .. } => *id,
+            Self::EffectRefused { id, .. }
+            | Self::EffectUncertain { id, .. }
+            | Self::KeptBatchDropped { id, .. }
+            | Self::BatchRefused { id, .. }
+            | Self::RestoreLeftBehind { id, .. }
+            | Self::AttemptDropped { id, .. }
+            | Self::MessageUndelivered { id, .. } => Some(*id),
+            _ => None,
+        }
+    }
+
+    /// Whether this is a duty event: one the spec has the app tell its protocol, kept in
+    /// the store and delivered until acknowledged (module docs, "Duty events").
+    pub fn is_duty(&self) -> bool {
+        self.id().is_some()
+    }
+}
+
+/// An `attempt` on a claim (Switch wire 6.8), named by its claim key and attempt ID.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ClaimAttempt {
+    /// The claim key.
+    #[serde(with = "serde_b64")]
+    pub claim_key: [u8; 32],
+    /// The attempt.
+    #[serde(with = "serde_b64")]
+    pub attempt_id: [u8; 16],
+}
+
+/// `duty/<id>`: a duty event as the store keeps it, its ID in its key.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum Duty {
+    Parked {
+        seq: u64,
+        reason: ParkReason,
+    },
+    EffectRefused {
+        seq: u64,
+        #[serde(with = "serde_b64")]
+        sender: [u8; 32],
+        msg_id: String,
+        kind: String,
+        code: Option<String>,
+    },
+    EffectUncertain {
+        seq: u64,
+        #[serde(with = "serde_b64")]
+        sender: [u8; 32],
+        msg_id: String,
+        kind: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attempts: Vec<ClaimAttempt>,
+    },
+    KeptBatchDropped {
+        #[serde(with = "serde_b64")]
+        batch_id: [u8; 16],
+    },
+    BatchRefused {
+        #[serde(with = "serde_b64")]
+        batch_id: [u8; 16],
+        code: String,
+    },
+    AttemptDropped {
+        #[serde(with = "serde_b64")]
+        claim_key: [u8; 32],
+        #[serde(with = "serde_b64")]
+        attempt_id: [u8; 16],
+    },
+    MessageUndelivered {
+        msg_id: String,
+        resend: bool,
+    },
+    RestoreLeftBehind {
+        duty_events: u64,
+        owed_calls: u64,
+    },
+}
+
+impl Duty {
+    /// The event reported for it, with its ID.
+    pub(crate) fn event(self, id: EventId) -> AppEvent {
+        match self {
+            Self::Parked { seq, reason } => AppEvent::Parked {
+                id: Some(id),
+                seq,
+                reason,
+            },
+            Self::EffectRefused {
+                seq,
+                sender,
+                msg_id,
+                kind,
+                code,
+            } => AppEvent::EffectRefused {
+                id,
+                seq,
+                sender,
+                msg_id,
+                kind,
+                code,
+            },
+            Self::EffectUncertain {
+                seq,
+                sender,
+                msg_id,
+                kind,
+                attempts,
+            } => AppEvent::EffectUncertain {
+                id,
+                seq,
+                sender,
+                msg_id,
+                kind,
+                attempts,
+            },
+            Self::KeptBatchDropped { batch_id } => AppEvent::KeptBatchDropped { id, batch_id },
+            Self::BatchRefused { batch_id, code } => AppEvent::BatchRefused { id, batch_id, code },
+            Self::AttemptDropped {
+                claim_key,
+                attempt_id,
+            } => AppEvent::AttemptDropped {
+                id,
+                claim_key,
+                attempt_id,
+            },
+            Self::MessageUndelivered { msg_id, resend } => {
+                AppEvent::MessageUndelivered { id, msg_id, resend }
+            }
+            Self::RestoreLeftBehind {
+                duty_events,
+                owed_calls,
+            } => AppEvent::RestoreLeftBehind {
+                id,
+                duty_events,
+                owed_calls,
+            },
+        }
+    }
 }
 
 /// Why a backup was refused ([`AppEvent::BackupRefused`]).
@@ -445,6 +784,10 @@ pub enum ParkReason {
     /// ([`super::MAX_CLAIM_READS`]), or again for what it was given: it is kept, not
     /// applied, and not tried again.
     TooManyReads,
+    /// Its effect carries an operation the app layer builds itself (`app.put`,
+    /// `receive_key.put`, `key_bundle.put`, `cert.put`), which a protocol may not write: it
+    /// is kept, not applied, and not tried again ([`AppEvent::EffectRefused`]).
+    LifecycleOperation,
     /// Its receive step was retried for want of the store ([`super::Outcome::Retry`],
     /// [`super::StoreFailure::unavailable`]) for longer than the bounded wait: it is tried
     /// again at every read.
@@ -453,8 +796,21 @@ pub enum ParkReason {
     /// ([`super::StoreFailure::of_entry`]), such as a corrupt value: it is tried again at
     /// every read, in case the host repaired it.
     StoreRejected,
-    /// Its effect was kept from before a provider change longer than a resend's answer
-    /// tells whether it was applied (Switch spec 12.5 "Kept batches"): it may have been, so
-    /// it is kept, not applied again, and not tried again.
+    /// Its effect was kept unanswered longer than a resend's answer can tell whether it was
+    /// applied (Switch spec 12.5 "Kept batches"): it is kept, and not tried again
+    /// ([`AppEvent::EffectUncertain`]).
     Uncertain,
+}
+
+impl ParkReason {
+    /// Whether an entry stored for this reason is processed again by a later read: one
+    /// whose sender couldn't be checked, whose write hit a quota, or whose receive step
+    /// the store kept from finishing. The others stay stored until the protocol acts on
+    /// them.
+    pub fn tried_again(self) -> bool {
+        matches!(
+            self,
+            Self::Unverifiable | Self::Quota | Self::StoreUnavailable | Self::StoreRejected
+        )
+    }
 }

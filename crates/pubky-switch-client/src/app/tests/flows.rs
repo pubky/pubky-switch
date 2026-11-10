@@ -15,8 +15,8 @@ use serde_json::{Map, json};
 
 use super::*;
 use crate::app::{
-    Alarm, AppBackup, AppError, AppEvent, IdentityRefresh, LeaveMode, LeaveReport, ParkReason,
-    REVALIDATION_MS, Refusal, UserConfirmed,
+    Alarm, AppBackup, AppError, AppEvent, EventId, IdentityRefresh, LeaveMode, LeaveReport,
+    ParkReason, REVALIDATION_MS, Refusal, UserConfirmed,
 };
 use crate::store::{Fault as StoreFault, FaultStore};
 use crate::testing::Fault;
@@ -368,6 +368,44 @@ async fn test_app_two_devices_rotating_at_once_one_discards_its_key() {
 }
 
 #[tokio::test]
+async fn test_app_device_sync_with_a_bad_key_changes_nothing() {
+    let w = World::new();
+    let mut a = w.join("wallet").await;
+    let backup = a.backup().unwrap();
+    a.set_multi_device(true).await.unwrap();
+    assert!(a.rotate().await.unwrap());
+    w.clock.advance_ms(1000);
+    assert!(a.rotate().await.unwrap());
+    // A second device of the app, from before the rotations.
+    let store_b = Arc::new(MemoryStore::new());
+    let mut b = App::restore(
+        w.env_on(Arc::clone(&store_b) as Arc<dyn StateStore>),
+        w.protocol.clone(),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    let before = b.backup().unwrap().to_bytes().unwrap();
+    let shared_before = b.device_keys();
+    // The set's last key carries a record another app signed.
+    let mut keys = a.device_keys();
+    assert_eq!(keys.receive_keys.len(), 3);
+    let lone = w.join("phone").await;
+    let foreign = lone.device_keys();
+    if let (Some(last), Some(bad)) = (keys.receive_keys.last_mut(), foreign.receive_keys.first()) {
+        last.record = bad.record.clone();
+    }
+    let error = b.take_device_keys(keys).await.unwrap_err();
+    assert!(matches!(error, AppError::InvalidData(_)), "{error:?}");
+    // Nothing of the set was taken, in memory or in a backup.
+    assert_eq!(b.receive_key_numbers(), vec![0]);
+    assert_eq!(b.device_keys(), shared_before);
+    assert_eq!(b.backup().unwrap().to_bytes().unwrap(), before);
+    assert!(!b.state.device.multi_device);
+}
+
+#[tokio::test]
 async fn test_app_device_sync_without_the_key_is_a_compromise() {
     let w = World::new();
     let mut app = w.join("wallet").await;
@@ -669,6 +707,243 @@ async fn test_app_missed_entries_go_to_the_protocol_from_the_cursor_time() {
 }
 
 #[tokio::test]
+async fn test_app_missed_call_the_protocol_fails_is_made_again() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let me = app.app_id();
+    w.note(me, "first");
+    app.receive(None).await.unwrap();
+    let now = w.clock.now_ms();
+    let seq = w.switch.push_missed(3, now - 10 * HOUR, now);
+    // The protocol can't read its state: the item is passed, its call kept.
+    *w.protocol.failing.lock().unwrap() = 1;
+    app.receive(None).await.unwrap();
+    assert!(app.cursor().seq >= seq);
+    assert!(w.protocol.missed.lock().unwrap().is_empty());
+    let mark = format!("missed/{seq}");
+    assert_eq!(app.protocol_get(mark.as_bytes()).await.unwrap(), None);
+    // Made again by the next read, after a load too, with what the item gave.
+    let mut app = w.load(me).await;
+    app.receive(None).await.unwrap();
+    let missed = w.protocol.missed.lock().unwrap().clone();
+    assert_eq!(missed.len(), 1);
+    assert_eq!(missed[0].seq, seq);
+    assert_eq!(missed[0].entries, 3);
+    assert_eq!(missed[0].accepted_from_ms, now - CLOCK_TOLERANCE_MS);
+    assert_eq!(
+        app.protocol_get(mark.as_bytes()).await.unwrap(),
+        Some(b"1".to_vec())
+    );
+    // Once.
+    app.receive(None).await.unwrap();
+    assert_eq!(w.protocol.missed.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn test_app_owed_call_failing_for_good_starves_no_other() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    w.note(app.app_id(), "first");
+    app.receive(None).await.unwrap();
+    let now = w.clock.now_ms();
+    let stuck = w.switch.push_missed(1, now - HOUR, now);
+    w.protocol.failing_missed.lock().unwrap().push(stuck);
+    let later = w.switch.push_missed(2, now - HOUR, now);
+    // Both calls fail at first: both owed, and counted.
+    *w.protocol.failing.lock().unwrap() = 1;
+    app.receive(None).await.unwrap();
+    assert_eq!(app.owed_protocol_calls().await.unwrap(), 2);
+    // The next read makes each on its own: the later one is answered though the first
+    // keeps failing.
+    app.receive(None).await.unwrap();
+    let missed = w.protocol.missed.lock().unwrap().clone();
+    assert_eq!(missed.len(), 1, "{missed:?}");
+    assert_eq!(missed[0].seq, later);
+    assert_eq!(app.owed_protocol_calls().await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn test_app_unreadable_entry_whose_call_fails_isnt_reported_asked() {
+    let w = World::new();
+    let mut wallet = w.join("wallet").await;
+    let mut phone = w.join("phone").await;
+    wallet.receive(None).await.unwrap();
+    let accepted = w.clock.now_ms();
+    w.clock.advance_ms(1000);
+    phone
+        .leave(LeaveMode::Immediate(UserConfirmed::new()))
+        .await
+        .unwrap();
+    let seq = w.switch.push_unreadable(w.bob.public(), accepted);
+    *w.protocol.failing.lock().unwrap() = 1;
+    let report = wallet.receive(None).await.unwrap();
+    assert!(
+        has(&report.events, |e| matches!(
+            e,
+            AppEvent::Unreadable { seq: s, resend_asked: false } if *s == seq
+        )),
+        "{:?}",
+        report.events
+    );
+    assert_eq!(wallet.owed_protocol_calls().await.unwrap(), 1);
+    wallet.receive(None).await.unwrap();
+    assert_eq!(w.protocol.resends.lock().unwrap().len(), 1);
+    assert_eq!(wallet.owed_protocol_calls().await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn test_app_restore_in_place_over_a_store_that_cant_be_read_fails() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let me = app.app_id();
+    let backup = app.backup().unwrap();
+    assert!(!refuse_next(&w, &mut app).await.is_empty());
+    drop(app);
+    // The store can't be read right now: the restore fails, to be tried again.
+    let store = Arc::new(FaultStore::new(
+        Arc::clone(&w.store) as Arc<dyn StateStore>,
+        StoreFault::None,
+    ));
+    store.fail_scan(b"duty/", 0);
+    let failed = App::restore(
+        w.env_on(Arc::clone(&store) as Arc<dyn StateStore>),
+        w.protocol.clone(),
+        World::config(),
+        &backup,
+    )
+    .await;
+    assert!(
+        matches!(failed, Err(AppError::Store(crate::StoreError::Unavailable))),
+        "{:?}",
+        failed.map(|_| ())
+    );
+    // Tried again, it restores, the duty events kept.
+    let mut restored = App::restore(
+        w.env_on(Arc::clone(&store) as Arc<dyn StateStore>),
+        w.protocol.clone(),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    assert_eq!(restored.app_id(), me);
+    assert_eq!(restored.unacknowledged_events().await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn test_app_restore_in_place_leaves_behind_what_doesnt_read_and_says_so() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let backup = app.backup().unwrap();
+    let duties = refuse_next(&w, &mut app).await;
+    assert_eq!(duties.len(), 2);
+    let now = w.clock.now_ms();
+    w.switch.push_missed(1, now - HOUR, now);
+    *w.protocol.failing.lock().unwrap() = 1;
+    app.receive(None).await.unwrap();
+    // One duty event's value and the owed call's don't read.
+    let first = duties[0].id().unwrap().counter();
+    let owed = app.reader().scan_raw("owed/").await.unwrap();
+    assert_eq!(owed.len(), 1);
+    let mut batch = crate::store::WriteBatch::new();
+    batch
+        .put(
+            &app.ns,
+            crate::app::state::key::duty(first).into_bytes(),
+            b"not a value".to_vec(),
+        )
+        .unwrap();
+    batch
+        .put(
+            &app.ns,
+            format!("owed/{}", owed[0].0).into_bytes(),
+            b"not a value".to_vec(),
+        )
+        .unwrap();
+    app.env.store.commit(batch).await.unwrap();
+    drop(app);
+    let mut restored = App::restore(w.env(), w.protocol.clone(), World::config(), &backup)
+        .await
+        .unwrap();
+    let events = restored.take_events();
+    // The one that reads is carried with its ID; the protocol is told what was left.
+    assert!(events.contains(&duties[1]), "{events:?}");
+    assert!(!events.contains(&duties[0]), "{events:?}");
+    assert!(
+        has(&events, |e| e.is_duty()
+            && matches!(
+                e,
+                AppEvent::RestoreLeftBehind {
+                    duty_events: 1,
+                    owed_calls: 1,
+                    ..
+                }
+            )),
+        "{events:?}"
+    );
+    assert_eq!(restored.owed_protocol_calls().await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn test_app_restore_in_place_over_a_damaged_epoch_starts_a_new_one() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let backup = app.backup().unwrap();
+    let duties = refuse_next(&w, &mut app).await;
+    let old = last_id(&duties);
+    // The store's event epoch doesn't read.
+    let mut tx = app.tx().unwrap();
+    tx.put(crate::app::state::key::DUTY_EPOCH, &"not an epoch")
+        .unwrap();
+    app.commit(tx).await.unwrap();
+    drop(app);
+    let mut restored = App::restore(w.env(), w.protocol.clone(), World::config(), &backup)
+        .await
+        .unwrap();
+    // A new epoch: the kept duty events come again, under IDs of the new store.
+    let events = restored.take_events();
+    let ids: Vec<EventId> = events.iter().filter_map(AppEvent::id).collect();
+    assert_eq!(ids.len(), duties.len(), "{events:?}");
+    assert!(ids.iter().all(|id| !id.same_store(&old)), "{ids:?}");
+}
+
+#[tokio::test]
+async fn test_app_resend_call_the_protocol_fails_is_made_again() {
+    let w = World::new();
+    let mut wallet = w.join("wallet").await;
+    let mut phone = w.join("phone").await;
+    wallet.receive(None).await.unwrap();
+    let accepted = w.clock.now_ms();
+    w.clock.advance_ms(1000);
+    phone
+        .leave(LeaveMode::Immediate(UserConfirmed::new()))
+        .await
+        .unwrap();
+    let seq = w.switch.push_unreadable(w.bob.public(), accepted);
+    // Twice in a row the protocol can't answer: the item is passed, its call kept.
+    *w.protocol.failing.lock().unwrap() = 2;
+    wallet.receive(None).await.unwrap();
+    assert!(wallet.cursor().seq >= seq);
+    wallet.receive(None).await.unwrap();
+    assert!(w.protocol.resends.lock().unwrap().is_empty());
+    let mark = format!("resend/{accepted}");
+    assert_eq!(wallet.protocol_get(mark.as_bytes()).await.unwrap(), None);
+    // Then it answers: the same request, once.
+    wallet.receive(None).await.unwrap();
+    wallet.receive(None).await.unwrap();
+    let resends = w.protocol.resends.lock().unwrap().clone();
+    assert_eq!(resends.len(), 1);
+    assert_eq!(resends[0].sender, w.bob.public());
+    assert_eq!(resends[0].accepted_from_ms, accepted);
+    assert_eq!(resends[0].accepted_until_ms, accepted);
+    assert_eq!(resends[0].reason, crate::app::ResendReason::Unreadable);
+    assert_eq!(
+        wallet.protocol_get(mark.as_bytes()).await.unwrap(),
+        Some(b"1".to_vec())
+    );
+}
+
+#[tokio::test]
 async fn test_app_holds_then_parks_an_unverifiable_sender() {
     let w = World::new();
     let mut wallet = w.join("wallet").await;
@@ -704,7 +979,7 @@ async fn test_app_holds_then_parks_an_unverifiable_sender() {
     let report = wallet.receive(None).await.unwrap();
     assert!(has(&report.events, |e| matches!(
         e,
-        AppEvent::Parked { seq, reason: ParkReason::Unverifiable } if *seq == held
+        AppEvent::Parked { id: None, seq, reason: ParkReason::Unverifiable } if *seq == held
     )));
     assert!(wallet.cursor().seq >= later);
     assert_eq!(w.effects(), 0, "{:?}", report.events);
@@ -731,7 +1006,7 @@ async fn test_app_quota_parks_the_entry_and_writes_later() {
     let report = app.receive(None).await.unwrap();
     assert!(has(&report.events, |e| matches!(
         e,
-        AppEvent::Parked { seq: s, reason: ParkReason::Quota } if *s == seq
+        AppEvent::Parked { id: None, seq: s, reason: ParkReason::Quota } if *s == seq
     )));
     assert!(app.cursor().seq >= seq, "the feed never stalls");
     assert_eq!(w.effects(), 0);
@@ -1012,6 +1287,742 @@ async fn test_app_expired_certificate_is_renewed_by_the_signer_alone() {
     );
 }
 
+/// An app of `w` whose device clock is its own, starting `offset_ms` from the service's.
+async fn app_with_its_own_clock(w: &World, offset_ms: i64) -> (App, Arc<TestClock>) {
+    let start = w.clock.now_ms().saturating_add_signed(offset_ms);
+    let clock = Arc::new(TestClock::new(start));
+    let mut env = w.env();
+    env.clock = Arc::clone(&clock) as Arc<dyn Clock>;
+    let request = w.approve(&app_keys("wallet"), &["scope-a"]);
+    let app = App::join(env, w.protocol.clone(), World::config(), request)
+        .await
+        .unwrap();
+    (app, clock)
+}
+
+#[tokio::test]
+async fn test_kept_effect_window_holds_with_the_device_clock_ahead_at_the_keep() {
+    let w = World::new();
+    // The device clock reads two hours ahead; its requests still pass, a `401
+    // stale_timestamp` being retried at the service's time.
+    let (mut app, clock) = app_with_its_own_clock(&w, 2 * HOUR as i64).await;
+    let me = app.app_id();
+    let (seq, _) = w.note(me, "before");
+    // Its effect is kept, the send not reaching the service, whichever of the read's
+    // requests that send is.
+    for after in 0..4 {
+        w.switch.fail_next(Fault::Unreachable {
+            path: "ops".into(),
+            after,
+        });
+        let _ = app.receive(None).await;
+        w.switch.lock().faults.clear();
+        if app.state.pending_effect.is_some() {
+            break;
+        }
+    }
+    assert!(app.state.pending_effect.is_some());
+    // Kept in service time, whatever the device read.
+    let kept = app.state.pending_effect.as_ref().unwrap().kept_ms.unwrap();
+    assert!(kept <= w.clock.now_ms(), "{kept}");
+    // The clock is set right. 30 days and half an hour after the service applied it, its
+    // proofs are gone and a retry would be answered `409 conflict`.
+    w.clock.advance_ms(30 * 24 * HOUR + HOUR / 2);
+    clock.set_ms(w.clock.now_ms());
+    w.switch.fail_next(Fault::Error {
+        path: "ops".into(),
+        code: ErrorCode::Conflict,
+        current: json!(null),
+    });
+    let built = w.protocol.received.lock().unwrap().len();
+    let report = app.receive(None).await.unwrap();
+    // Past the window: not sent again, stored as uncertain, never built again.
+    assert!(
+        has(&report.events, |e| matches!(
+            e,
+            AppEvent::EffectUncertain { seq: s, .. } if *s == seq
+        )),
+        "{:?}",
+        report.events
+    );
+    assert_eq!(w.protocol.received.lock().unwrap().len(), built);
+    assert_eq!(w.effects(), 0, "not sent");
+}
+
+/// A batch writing a conversation entry for `pubky`.
+fn conversation(pubky: [u8; 32]) -> crate::app::OpBatch {
+    crate::app::OpBatch::new().op(OpKind::AllowPut {
+        pubky,
+        kind: pubky_switch_core::ops::AllowKind::Conversation,
+    })
+}
+
+#[tokio::test]
+async fn test_kept_batch_window_holds_with_the_device_clock_ahead_after_a_restore() {
+    let w = World::new();
+    let a = w.join("wallet").await;
+    let backup = a.backup().unwrap();
+    drop(a);
+    // Restored on a device whose clock reads two hours ahead: it holds no service time.
+    let clock = Arc::new(TestClock::new(w.clock.now_ms() + 2 * HOUR));
+    let store_b = Arc::new(MemoryStore::new());
+    let mut env = w.env_on(Arc::clone(&store_b) as Arc<dyn StateStore>);
+    env.clock = Arc::clone(&clock) as Arc<dyn Clock>;
+    let mut b = App::restore(env, w.protocol.clone(), World::config(), &backup)
+        .await
+        .unwrap();
+    // Its first call keeps a batch, which is applied and its answer lost. (A first try
+    // may be answered `401 stale_timestamp`, the device clock ahead, before the lost one.)
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(b.submit_batch(conversation(w.bob.public())).await.is_err());
+    w.switch.lock().faults.clear();
+    let kept = b.kept_batches().await.unwrap();
+    assert_eq!(kept.len(), 1);
+    // Kept in service time, not at the device's.
+    assert!(kept[0].1.kept_ms.unwrap() <= w.clock.now_ms());
+    // 30 days and half an hour on, the clock set right: the proofs are gone, and a resend
+    // would be answered `409 conflict`.
+    w.clock.advance_ms(30 * 24 * HOUR + HOUR / 2);
+    clock.set_ms(w.clock.now_ms());
+    w.switch.fail_next(Fault::Error {
+        path: "ops".into(),
+        code: ErrorCode::Conflict,
+        current: json!(null),
+    });
+    let _ = b.submit_batch(conversation([7; 32])).await;
+    let events = b.unacknowledged_events().await.unwrap();
+    // Past the window: dropped unsent, never read as refused.
+    assert!(
+        has(&events, |e| matches!(e, AppEvent::KeptBatchDropped { .. })),
+        "{events:?}"
+    );
+    assert!(
+        !has(&events, |e| matches!(e, AppEvent::BatchRefused { .. })),
+        "{events:?}"
+    );
+}
+
+/// How many conversation entries for `pubky` the switch applied.
+fn conversations_for(w: &World, pubky: [u8; 32]) -> usize {
+    w.switch
+        .applied()
+        .iter()
+        .filter(|op| matches!(op.body().kind, OpKind::AllowPut { pubky: p, .. } if p == pubky))
+        .count()
+}
+
+/// A write while the service can't be reached: kept, never sent.
+async fn write_offline(w: &World, app: &mut App) {
+    w.switch.fail_next(Fault::Unreachable {
+        path: "feed".into(),
+        after: 0,
+    });
+    w.switch.fail_next(Fault::Unreachable {
+        path: "ops".into(),
+        after: 0,
+    });
+    let result = app.submit_batch(conversation(w.bob.public())).await;
+    assert!(matches!(result, Err(AppError::Transport(_))), "{result:?}");
+    w.switch.lock().faults.clear();
+    let kept = app.kept_batches().await.unwrap();
+    assert_eq!(kept.len(), 1, "a network failure keeps the batch");
+    assert_eq!(kept[0].1.kept_ms, None, "never sent, so not stamped");
+    assert_eq!(conversations_for(w, w.bob.public()), 0);
+}
+
+#[tokio::test]
+async fn test_kept_batch_written_offline_goes_once_the_service_is_back() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    w.clock.advance_ms(20 * 60 * 1000);
+    write_offline(&w, &mut app).await;
+    // The next write sends it first, as its first send: applied once.
+    app.submit_batch(conversation([7; 32])).await.unwrap();
+    assert!(app.kept_batches().await.unwrap().is_empty());
+    assert_eq!(conversations_for(&w, w.bob.public()), 1);
+    assert_eq!(conversations_for(&w, [7; 32]), 1);
+}
+
+#[tokio::test]
+async fn test_kept_batch_written_offline_survives_a_restart_unsent() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let me = app.app_id();
+    w.clock.advance_ms(20 * 60 * 1000);
+    write_offline(&w, &mut app).await;
+    drop(app);
+    // Loaded again a month on: still unsent, with no window, so not judged for age.
+    w.clock.advance_ms(31 * 24 * HOUR);
+    let mut app = w.load(me).await;
+    assert_eq!(app.kept_batches().await.unwrap()[0].1.kept_ms, None);
+    app.submit_batch(conversation([7; 32])).await.unwrap();
+    assert!(app.kept_batches().await.unwrap().is_empty());
+    assert_eq!(conversations_for(&w, w.bob.public()), 1);
+    assert!(!has(
+        &app.unacknowledged_events().await.unwrap(),
+        |e| matches!(e, AppEvent::KeptBatchDropped { .. })
+    ));
+}
+
+#[tokio::test]
+async fn test_parked_retry_effect_is_kept_at_a_fresh_service_time() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let (seq, _) = w.note(app.app_id(), "note");
+    w.switch.fail_next(Fault::Error {
+        path: "ops".into(),
+        code: ErrorCode::QuotaExceeded,
+        current: json!(null),
+    });
+    app.receive(None).await.unwrap();
+    assert_eq!(
+        app.state.parked.get(&seq).map(|p| p.reason),
+        Some(ParkReason::Quota)
+    );
+    // A month on, the stored entry is tried again before any feed read, and its effect
+    // kept: at a service time read in this call, not the month-old one.
+    w.clock.advance_ms(30 * 24 * HOUR);
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    let _ = app.receive(None).await;
+    let pending = app.state.pending_effect.as_ref().unwrap();
+    assert_eq!(pending.seq, seq);
+    let age = w.clock.now_ms() - pending.kept_ms.unwrap();
+    assert!(age < HOUR, "kept {age} ms before now");
+}
+
+#[tokio::test]
+async fn test_kept_batch_window_holds_with_the_device_clock_behind_at_the_resend() {
+    let w = World::new();
+    let (mut app, clock) = app_with_its_own_clock(&w, 0).await;
+    let me = app.app_id();
+    // Applied, its answer lost: kept.
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(
+        app.submit_batch(conversation(w.bob.public()))
+            .await
+            .is_err()
+    );
+    assert_eq!(app.kept_batches().await.unwrap().len(), 1);
+    // A fresh load, the service time it holds from before; 30 days and half an hour on,
+    // the device clock reads two hours behind.
+    let mut env = w.env();
+    env.clock = Arc::clone(&clock) as Arc<dyn Clock>;
+    drop(app);
+    let mut app = App::load(env, w.protocol.clone(), World::config(), me)
+        .await
+        .unwrap();
+    w.clock.advance_ms(30 * 24 * HOUR + HOUR / 2);
+    clock.set_ms(w.clock.now_ms() - 2 * HOUR);
+    w.switch.fail_next(Fault::Error {
+        path: "ops".into(),
+        code: ErrorCode::Conflict,
+        current: json!(null),
+    });
+    // The next write sends the kept batch again first: a service time read before it shows
+    // it past the window, so it is dropped unsent, never read as refused.
+    let _ = app.submit_batch(conversation([7; 32])).await;
+    let events = app.unacknowledged_events().await.unwrap();
+    assert!(
+        has(&events, |e| matches!(e, AppEvent::KeptBatchDropped { .. })),
+        "{events:?}"
+    );
+    assert!(
+        !has(&events, |e| matches!(e, AppEvent::BatchRefused { .. })),
+        "{events:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_kept_batch_kept_after_an_idle_month_is_resent_after_a_lost_answer() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    // Idle for 30 days, the device clock and the service's agreeing: the service time the
+    // app holds is a month old.
+    w.clock.advance_ms(30 * 24 * HOUR);
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(
+        app.submit_batch(conversation(w.bob.public()))
+            .await
+            .is_err()
+    );
+    let kept = app.kept_batches().await.unwrap();
+    assert_eq!(kept.len(), 1);
+    // Kept at the service time of this call, not the month-old one.
+    assert!(w.clock.now_ms() - kept[0].1.kept_ms.unwrap() < HOUR);
+    // A minute later the app writes again: the kept batch goes again, and its proofs show
+    // it applied; it isn't dropped.
+    w.clock.advance_ms(60_000);
+    app.submit_batch(conversation([7; 32])).await.unwrap();
+    assert!(app.kept_batches().await.unwrap().is_empty());
+    let events = app.unacknowledged_events().await.unwrap();
+    assert!(
+        !has(&events, |e| matches!(e, AppEvent::KeptBatchDropped { .. })),
+        "{events:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_kept_batch_past_the_window_by_the_device_clock_goes_without_a_read() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let (seq, _) = w.note(app.app_id(), "before");
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.receive(None).await.is_err());
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(
+        app.submit_batch(conversation(w.bob.public()))
+            .await
+            .is_err()
+    );
+    assert_eq!(app.kept_batches().await.unwrap().len(), 1);
+    // Past the window by the device clock alone, with no feed read to be had: the kept
+    // effect and batch are judged without one.
+    w.clock.advance_ms(31 * 24 * HOUR);
+    for _ in 0..4 {
+        w.switch.fail_next(Fault::Unreachable {
+            path: "feed".into(),
+            after: 0,
+        });
+    }
+    let _ = app.receive(None).await;
+    assert_eq!(
+        app.state.parked.get(&seq).map(|p| p.reason),
+        Some(ParkReason::Uncertain)
+    );
+    let _ = app.submit_batch(conversation([7; 32])).await;
+    w.switch.lock().faults.clear();
+    assert!(has(&app.kept_duties().await.unwrap(), |e| matches!(
+        e,
+        AppEvent::KeptBatchDropped { .. }
+    )));
+}
+
+#[tokio::test]
+async fn test_fresh_service_time_is_read_again_once_it_has_aged() {
+    let w = World::new();
+    let (mut app, clock) = app_with_its_own_clock(&w, 0).await;
+    app.receive(None).await.unwrap();
+    let read_at = app.time_fresh_at.unwrap();
+    // Within the bound, the time read in the call counts.
+    clock.advance_ms(crate::app::provider::FRESH_SERVICE_TIME_MS);
+    app.fresh_service_time().await.unwrap();
+    assert_eq!(app.time_fresh_at, Some(read_at));
+    // Past it, by the device clock, it is read again.
+    clock.advance_ms(1);
+    app.fresh_service_time().await.unwrap();
+    assert_eq!(app.time_fresh_at, Some(clock.now_ms()));
+    // A device clock gone back since counts as not fresh either.
+    let again = clock.now_ms();
+    clock.set_ms(again - 60_000);
+    app.fresh_service_time().await.unwrap();
+    assert_eq!(app.time_fresh_at, Some(again - 60_000));
+}
+
+#[tokio::test]
+async fn test_kept_effect_window_holds_with_the_device_clock_behind_at_the_resend() {
+    let w = World::new();
+    let (mut app, clock) = app_with_its_own_clock(&w, 0).await;
+    let me = app.app_id();
+    let (seq, _) = w.note(me, "before");
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.receive(None).await.is_err());
+    // A fresh load, the service time it holds from before; 30 days and half an hour on,
+    // the device clock reads two hours behind.
+    let mut env = w.env();
+    env.clock = Arc::clone(&clock) as Arc<dyn Clock>;
+    drop(app);
+    let mut app = App::load(env, w.protocol.clone(), World::config(), me)
+        .await
+        .unwrap();
+    w.clock.advance_ms(30 * 24 * HOUR + HOUR / 2);
+    clock.set_ms(w.clock.now_ms() - 2 * HOUR);
+    w.switch.fail_next(Fault::Error {
+        path: "ops".into(),
+        code: ErrorCode::Conflict,
+        current: json!(null),
+    });
+    let built = w.protocol.received.lock().unwrap().len();
+    let report = app.receive(None).await.unwrap();
+    // A service time read first shows it past the window: not sent again.
+    assert!(
+        has(&report.events, |e| matches!(
+            e,
+            AppEvent::EffectUncertain { seq: s, .. } if *s == seq
+        )),
+        "{:?}",
+        report.events
+    );
+    assert_eq!(w.protocol.received.lock().unwrap().len(), built);
+    assert_eq!(w.effects(), 1);
+}
+
+/// A kept effect refused with `403 cert_expired` stays kept, and goes again once the renewal
+/// is listed. A service following Switch wire 7.2 checks an own app against the stored
+/// renewed certificate as soon as the newest `identity.json` lists it, so the resend can
+/// pass before the app adopts the certificate: this test passes whether or not the app
+/// takes the renewal before it sends the kept effect again.
+#[tokio::test]
+async fn test_app_kept_effect_refused_for_an_expired_certificate_waits_for_the_renewal() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let me = app.app_id();
+    let old = app.cert().clone();
+    // A day before the certificate expires, a note's effect is applied, its answer lost:
+    // the effect is kept.
+    w.clock.set_ms(old.expires_at() - 24 * HOUR);
+    let (seq, _) = w.note(me, "before");
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.receive(None).await.is_err());
+    assert_eq!(w.effects(), 1);
+    // The certificate expires: the resend is refused about the caller, so the effect stays.
+    w.clock.set_ms(old.expires_at() + 1);
+    let Err(AppError::Switch(crate::ClientError::Switch { code, .. })) = app.receive(None).await
+    else {
+        panic!("an expired app is refused");
+    };
+    assert_eq!(code, ErrorCode::CertExpired);
+    assert!(app.state.pending_effect.is_some());
+    // The signer renews it and lists the renewal.
+    let renewed = cert_for(
+        &w.alice,
+        &app_keys("wallet"),
+        w.clock.now_ms(),
+        &["scope-a"],
+    );
+    let has_keys = |s: &str| SampleProtocol::default().has_keys(s);
+    let epoch = w.switch.identity_doc().unwrap().data_epoch();
+    let mut batch = vec![OpKind::CertPut {
+        target_app_id: me,
+        cert: renewed.signed().clone(),
+    }];
+    for part in seal_bundle_parts(&w.alice, &renewed, 1, epoch, &has_keys).unwrap() {
+        batch.push(OpKind::KeyBundlePut(KeyBundlePut {
+            target_app_id: me,
+            bundle: part.bundle,
+            first_epoch: part.first_epoch,
+            last_epoch: part.last_epoch,
+        }));
+    }
+    w.switch.signer_batch(batch).unwrap();
+    w.next_doc(|body| {
+        body.apps.retain(|a| a.app_id != me);
+        body.apps.push(ListedApp {
+            app_id: me,
+            cert: renewed.hash(),
+        });
+        body.renewed.push(RenewedCert {
+            app_id: me,
+            cert: old.hash(),
+            until: None,
+        });
+    });
+    // The renewal is taken, the same bytes go again and show the effect applied: once.
+    let mut events = Vec::new();
+    for _ in 0..2 {
+        if let Ok(report) = app.receive(None).await {
+            events.extend(report.events);
+        }
+    }
+    assert!(
+        has(&events, |e| matches!(e, AppEvent::CertificateTaken { .. })),
+        "{events:?}"
+    );
+    assert!(received(&events, seq), "{events:?}");
+    assert_eq!(w.effects(), 1);
+    assert!(app.state.pending_effect.is_none());
+    assert_eq!(app.cert().hash(), renewed.hash());
+}
+
+/// The app layer's own lifecycle operations, and the signer's, for `app`.
+fn lifecycle_ops(w: &World, app: &App) -> Vec<OpKind> {
+    let has_keys = |s: &str| SampleProtocol::default().has_keys(s);
+    let epoch = w.switch.identity_doc().unwrap().data_epoch();
+    let part = seal_bundle_parts(&w.alice, app.cert(), 1, epoch, &has_keys)
+        .unwrap()
+        .remove(0);
+    vec![
+        OpKind::AppPut {
+            record: app.record().clone(),
+        },
+        OpKind::ReceiveKeyPut {
+            record: app
+                .state
+                .receive_keys
+                .values()
+                .next()
+                .unwrap()
+                .record
+                .clone(),
+        },
+        OpKind::KeyBundlePut(KeyBundlePut {
+            target_app_id: app.app_id(),
+            bundle: part.bundle,
+            first_epoch: part.first_epoch,
+            last_epoch: part.last_epoch,
+        }),
+        OpKind::CertPut {
+            target_app_id: app.app_id(),
+            cert: app.cert().signed().clone(),
+        },
+    ]
+}
+
+#[tokio::test]
+async fn test_app_refuses_lifecycle_operations_in_a_host_batch() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let applied = w.switch.applied().len();
+    for kind in lifecycle_ops(&w, &app) {
+        let error = app
+            .submit_batch(crate::app::OpBatch::new().op(kind.clone()))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, AppError::Refused(Refusal::Usage(_))),
+            "{kind:?}: {error:?}"
+        );
+        // Refused before anything is kept or sent.
+        assert!(app.kept_batches().await.unwrap().is_empty());
+        assert_eq!(w.switch.applied().len(), applied);
+    }
+    // A batch of the host's own writes still goes.
+    app.submit_batch(crate::app::OpBatch::new().op(OpKind::AllowPut {
+        pubky: w.bob.public(),
+        kind: pubky_switch_core::ops::AllowKind::Conversation,
+    }))
+    .await
+    .unwrap();
+    assert_eq!(w.switch.applied().len(), applied + 1);
+}
+
+/// The sample protocol, whose effect for a note also carries `extra`, through the context
+/// or in the effect itself, recording what the context answered.
+struct LifecycleProtocol {
+    sample: SampleProtocol,
+    extra: OpKind,
+    in_context: bool,
+    answers: std::sync::Mutex<Vec<bool>>,
+    /// Whether the effects carry `extra` yet.
+    active: std::sync::atomic::AtomicBool,
+}
+
+impl Protocol for LifecycleProtocol {
+    fn has_keys(&self, scope: &str) -> bool {
+        self.sample.has_keys(scope)
+    }
+
+    fn sent_between_own_apps(&self, kind: &str) -> bool {
+        self.sample.sent_between_own_apps(kind)
+    }
+
+    fn check_scopes(
+        &self,
+        message: &pubky_switch_core::message::Message,
+        sender: &pubky_switch_core::records::AppCert,
+        own: &pubky_switch_core::records::AppCert,
+    ) -> Result<(), String> {
+        self.sample.check_scopes(message, sender, own)
+    }
+
+    fn accepts(&self, cert: &pubky_switch_core::records::AppCert) -> Vec<String> {
+        self.sample.accepts(cert)
+    }
+
+    fn check_body(&self, message: &crate::app::ReceivedMessage) -> Result<(), String> {
+        self.sample.check_body(message)
+    }
+
+    fn receive_with(
+        &self,
+        message: &crate::app::ReceivedMessage,
+        cx: &mut crate::app::ReceiveContext<'_>,
+    ) -> crate::app::Outcome {
+        if !self.active.load(std::sync::atomic::Ordering::SeqCst) {
+            return self.sample.receive(message);
+        }
+        if self.in_context {
+            let answer = cx.op(Vec::new(), self.extra.clone());
+            self.answers.lock().unwrap().push(answer.is_ok());
+            return self.sample.receive(message);
+        }
+        match self.sample.receive(message) {
+            crate::app::Outcome::Apply(mut effect) => {
+                effect.ops.push((Vec::new(), self.extra.clone()));
+                crate::app::Outcome::Apply(effect)
+            }
+            other => other,
+        }
+    }
+
+    fn resend_needed(
+        &self,
+        needed: &crate::app::ResendNeeded,
+    ) -> Result<Vec<crate::app::LocalWrite>, crate::app::StoreFailure> {
+        self.sample.resend_needed(needed)
+    }
+
+    fn missed(
+        &self,
+        missed: &crate::app::MissedEntries,
+    ) -> Result<Vec<crate::app::LocalWrite>, crate::app::StoreFailure> {
+        self.sample.missed(missed)
+    }
+}
+
+/// The entry at `seq` stored for good for a lifecycle operation in its effect, and the
+/// protocol told in `report`, durably.
+async fn lifecycle_effect_refused(app: &mut App, report: &crate::app::ReceiveReport, seq: u64) {
+    assert_eq!(
+        app.state.parked.get(&seq).map(|p| p.reason),
+        Some(ParkReason::LifecycleOperation)
+    );
+    assert!(app.state.pending_effect.is_none());
+    let refused =
+        |e: &AppEvent| matches!(e, AppEvent::EffectRefused { seq: s, code: None, .. } if *s == seq);
+    assert!(has(&report.events, refused), "{:?}", report.events);
+    assert!(has(&app.unacknowledged_events().await.unwrap(), refused));
+}
+
+#[tokio::test]
+async fn test_app_lifecycle_operation_in_an_effect_doesnt_stall_the_feed() {
+    let w = World::new();
+    let base = w.join("phone").await;
+    let protocol = Arc::new(LifecycleProtocol {
+        sample: SampleProtocol::default(),
+        extra: lifecycle_ops(&w, &base)[0].clone(),
+        in_context: false,
+        answers: std::sync::Mutex::new(Vec::new()),
+        active: std::sync::atomic::AtomicBool::new(true),
+    });
+    let request = w.approve(&app_keys("wallet"), &["scope-a"]);
+    let mut app = App::join(w.env(), protocol.clone(), World::config(), request)
+        .await
+        .unwrap();
+    let (first, _) = w.note(app.app_id(), "note");
+    let report = app.receive(None).await.unwrap();
+    lifecycle_effect_refused(&mut app, &report, first).await;
+    // Later entries go on, and the stored one isn't tried again.
+    let (second, _) = w.note(app.app_id(), "later note");
+    let report = app.receive(None).await.unwrap();
+    assert!(app.cursor().seq >= second);
+    assert!(
+        !has(&report.events, |e| matches!(e, AppEvent::Unparked { .. })),
+        "{:?}",
+        report.events
+    );
+}
+
+#[tokio::test]
+async fn test_app_lifecycle_operation_in_a_stored_entrys_effect_stores_it_for_good() {
+    let w = World::new();
+    let base = w.join("phone").await;
+    let protocol = Arc::new(LifecycleProtocol {
+        sample: SampleProtocol::default(),
+        extra: lifecycle_ops(&w, &base)[1].clone(),
+        in_context: false,
+        answers: std::sync::Mutex::new(Vec::new()),
+        active: std::sync::atomic::AtomicBool::new(false),
+    });
+    let request = w.approve(&app_keys("wallet"), &["scope-a"]);
+    let mut app = App::join(w.env(), protocol.clone(), World::config(), request)
+        .await
+        .unwrap();
+    // Stored for a quota, to be tried again.
+    let (seq, _) = w.note(app.app_id(), "note");
+    w.switch.fail_next(Fault::Error {
+        path: "ops".into(),
+        code: ErrorCode::QuotaExceeded,
+        current: json!(null),
+    });
+    app.receive(None).await.unwrap();
+    assert_eq!(
+        app.state.parked.get(&seq).map(|p| p.reason),
+        Some(ParkReason::Quota)
+    );
+    // Tried again, its effect now carries a lifecycle operation: stored for good, and the
+    // protocol told; the read goes on.
+    protocol
+        .active
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let applied = w.switch.applied().len();
+    let report = app.receive(None).await.unwrap();
+    lifecycle_effect_refused(&mut app, &report, seq).await;
+    assert_eq!(w.switch.applied().len(), applied);
+}
+
+#[tokio::test]
+async fn test_app_entry_stored_for_good_drops_its_retry_count() {
+    let w = World::new();
+    let base = w.join("phone").await;
+    let protocol = Arc::new(LifecycleProtocol {
+        sample: SampleProtocol::default(),
+        extra: lifecycle_ops(&w, &base)[0].clone(),
+        in_context: false,
+        answers: std::sync::Mutex::new(Vec::new()),
+        active: std::sync::atomic::AtomicBool::new(true),
+    });
+    let request = w.approve(&app_keys("wallet"), &["scope-a"]);
+    let mut app = App::join(w.env(), protocol.clone(), World::config(), request)
+        .await
+        .unwrap();
+    let (seq, _) = w.note(app.app_id(), "note");
+    // Its receive step had been retried for the store before.
+    let retry = crate::app::state::RetryEntry {
+        reads: 1,
+        since_ms: w.clock.now_ms(),
+    };
+    let mut tx = app.tx().unwrap();
+    tx.put(&crate::app::state::key::retry(seq), &retry).unwrap();
+    app.commit(tx).await.unwrap();
+    app.state.retries.insert(seq, retry);
+    // Stored for good, its effect carrying a lifecycle operation: the count goes with it.
+    let report = app.receive(None).await.unwrap();
+    lifecycle_effect_refused(&mut app, &report, seq).await;
+    assert!(app.state.retries.is_empty(), "{:?}", app.state.retries);
+    let loaded = w.load(app.app_id()).await;
+    assert!(loaded.state.retries.is_empty(), "and in the store");
+}
+
+#[tokio::test]
+async fn test_app_refuses_lifecycle_operations_in_a_protocol_effect() {
+    let probe = World::new();
+    let probe_app = probe.join("wallet").await;
+    let kinds = lifecycle_ops(&probe, &probe_app);
+    for (index, _) in kinds.iter().enumerate() {
+        for in_context in [true, false] {
+            let w = World::new();
+            let base = w.join("phone").await;
+            let extra = lifecycle_ops(&w, &base)[index].clone();
+            let protocol = Arc::new(LifecycleProtocol {
+                sample: SampleProtocol::default(),
+                extra,
+                in_context,
+                answers: std::sync::Mutex::new(Vec::new()),
+                active: std::sync::atomic::AtomicBool::new(true),
+            });
+            let request = w.approve(&app_keys("wallet"), &["scope-a"]);
+            let mut app = App::join(w.env(), protocol.clone(), World::config(), request)
+                .await
+                .unwrap();
+            let (seq, _) = w.note(app.app_id(), "note");
+            let applied = w.switch.applied().len();
+            let report = app.receive(None).await.unwrap();
+            if in_context {
+                // The context refuses it; the effect goes without it.
+                assert_eq!(*protocol.answers.lock().unwrap(), vec![false]);
+                assert!(received(&report.events, seq), "{:?}", report.events);
+            } else {
+                // In the effect itself: never sent, the entry stored and passed, and the
+                // protocol told, so the feed goes on (Switch spec 8.2).
+                lifecycle_effect_refused(&mut app, &report, seq).await;
+                assert_eq!(w.switch.applied().len(), applied, "{index}");
+                assert!(app.cursor().seq >= seq);
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn test_app_ignores_a_cert_put_of_other_keys() {
     let w = World::new();
@@ -1281,6 +2292,34 @@ async fn test_app_leaves_in_two_steps() {
 }
 
 #[tokio::test]
+async fn test_app_leaving_deletes_the_duty_events_and_owed_calls() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let me = app.app_id();
+    assert!(!refuse_next(&w, &mut app).await.is_empty());
+    let now = w.clock.now_ms();
+    w.switch.push_missed(1, now - HOUR, now);
+    *w.protocol.failing.lock().unwrap() = 1;
+    app.receive(None).await.unwrap();
+    assert_eq!(app.owed_protocol_calls().await.unwrap(), 1);
+    assert!(!app.reader().scan_raw("duty/").await.unwrap().is_empty());
+    app.leave(LeaveMode::TwoStep).await.unwrap();
+    w.next_doc(|body| {
+        body.apps.retain(|a| a.app_id != me);
+        body.removed.push(RemovedApp {
+            app_id: me,
+            distrust_from: START,
+        });
+    });
+    app.finish_leave().await.unwrap();
+    w.clock.advance_ms(11 * 60_000);
+    assert_eq!(app.finish_leave().await.unwrap(), LeaveReport::Done);
+    // With the keys, what the app owed its protocol is gone from the store.
+    assert!(app.reader().scan_raw("duty/").await.unwrap().is_empty());
+    assert!(app.reader().scan_raw("owed/").await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn test_app_leave_retried_after_a_lost_answer() {
     let w = World::new();
     let mut app = w.join("wallet").await;
@@ -1523,13 +2562,76 @@ fn test_app_config_keeps_the_spec_bounds() {
 }
 
 #[tokio::test]
+async fn test_app_store_of_schema_1_fails_to_load_as_an_old_schema_and_stays() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let me = app.app_id();
+    w.note(me, "one");
+    app.receive(None).await.unwrap();
+    let ns = app.ns.clone();
+    // Every value of the app's own, as schema 1 wrote it.
+    let mut batch = crate::store::WriteBatch::new();
+    for (key, bytes) in app.reader().scan_raw("").await.unwrap() {
+        if key.starts_with("p/") {
+            continue;
+        }
+        let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            continue;
+        };
+        if value.get("v") == Some(&json!(crate::app::SCHEMA_VERSION)) {
+            value["v"] = json!(1);
+            batch
+                .put(
+                    &ns,
+                    key.as_bytes().to_vec(),
+                    serde_json::to_vec(&value).unwrap(),
+                )
+                .unwrap();
+        }
+    }
+    app.env.store.commit(batch).await.unwrap();
+    let before = app.reader().scan_raw("").await.unwrap();
+    let reader = app.reader();
+    drop(app);
+    let loaded = App::load(w.env(), w.protocol.clone(), World::config(), me).await;
+    assert!(
+        matches!(
+            loaded,
+            Err(AppError::Store(crate::StoreError::OldSchema { found: 1 }))
+        ),
+        "{:?}",
+        loaded.map(|_| ())
+    );
+    // Refused, it writes nothing.
+    assert_eq!(reader.scan_raw("").await.unwrap(), before);
+}
+
+#[tokio::test]
 async fn test_app_backup_refuses_another_schema_or_bytes() {
     let w = World::new();
     let app = w.join("wallet").await;
     let bytes = app.backup().unwrap().to_bytes().unwrap();
     assert!(AppBackup::from_bytes(&bytes).is_ok());
     let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    // An earlier schema's backup is an old schema, as its store is; a later one doesn't
+    // read.
+    value["v"] = json!(1);
+    let old = serde_json::to_vec(&value).unwrap();
+    assert!(matches!(
+        AppBackup::from_bytes(&old),
+        Err(AppError::Store(crate::StoreError::OldSchema { found: 1 }))
+    ));
+    // A layered backup as schema 1 wrote it, at version 2.
     value["v"] = json!(2);
+    value["protocol"] =
+        json!({ "name": "x", "data": "", "seen": [], "parked": [], "processed": [] });
+    let old_layered = serde_json::to_vec(&value).unwrap();
+    assert!(matches!(
+        AppBackup::from_bytes(&old_layered),
+        Err(AppError::Store(crate::StoreError::OldSchema { found: 2 }))
+    ));
+    value["v"] = json!(9);
+    value.as_object_mut().unwrap().remove("protocol");
     let other = serde_json::to_vec(&value).unwrap();
     assert!(matches!(
         AppBackup::from_bytes(&other),
@@ -1658,7 +2760,7 @@ async fn test_app_effect_refused_for_good_is_parked_and_the_feed_goes_on() {
     let report = app.receive(None).await.unwrap();
     assert!(has(&report.events, |e| matches!(
         e,
-        AppEvent::Parked { seq, reason: ParkReason::Refused } if *seq == refused
+        AppEvent::Parked { id: Some(_), seq, reason: ParkReason::Refused } if *seq == refused
     )));
     // The protocol is told, with the code, so it may build the effect another way (Switch
     // spec 8.2).
@@ -1681,6 +2783,490 @@ async fn test_app_effect_refused_for_good_is_parked_and_the_feed_goes_on() {
         AppEvent::Unparked { .. }
     )));
     assert_eq!(w.effects(), 1);
+}
+
+// -------------------------------------------------------------------------------------
+// Duty events (`events` module, "Duty events")
+
+fn refused_events(events: &[AppEvent], seq: u64) -> Vec<AppEvent> {
+    events
+        .iter()
+        .filter(|e| matches!(e, AppEvent::EffectRefused { seq: s, .. } if *s == seq))
+        .cloned()
+        .collect()
+}
+
+/// A joined app with a note at the first `seq` whose effect the switch refuses for good,
+/// and a note after it.
+async fn refusing(w: &World) -> (App, u64, u64) {
+    let app = w.join("wallet").await;
+    let me = app.app_id();
+    let (refused, _) = w.note(me, "refused");
+    let (after, _) = w.note(me, "after");
+    w.switch.fail_next(Fault::Error {
+        path: "ops".into(),
+        code: ErrorCode::PermissionMissing,
+        current: json!(null),
+    });
+    (app, refused, after)
+}
+
+/// `app`, loaded again on `w`'s store behind `fault`.
+async fn load_behind(w: &World, app: App, fault: StoreFault) -> (App, Arc<FaultStore>) {
+    let me = app.app_id();
+    drop(app);
+    let store = Arc::new(FaultStore::new(
+        Arc::clone(&w.store) as Arc<dyn StateStore>,
+        fault,
+    ));
+    let app = App::load(
+        w.env_on(Arc::clone(&store) as Arc<dyn StateStore>),
+        w.protocol.clone(),
+        World::config(),
+        me,
+    )
+    .await
+    .unwrap();
+    (app, store)
+}
+
+#[tokio::test]
+async fn test_duty_event_kept_through_a_crash_before_it_is_taken() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let me = app.app_id();
+    let (refused, _) = w.note(me, "refused");
+    w.switch.fail_next(Fault::Error {
+        path: "ops".into(),
+        code: ErrorCode::PermissionMissing,
+        current: json!(null),
+    });
+    let report = app.receive(None).await.unwrap();
+    let first = refused_events(&report.events, refused);
+    assert_eq!(first.len(), 1, "{:?}", report.events);
+    assert!(first.iter().all(AppEvent::is_duty));
+    // The host stops before it acts on the report: the next load delivers it again, with
+    // the same ID.
+    drop(app);
+    let mut app = w.load(me).await;
+    let events = app.take_events();
+    assert_eq!(refused_events(&events, refused), first, "{events:?}");
+    assert!(has(&events, |e| matches!(
+        e,
+        AppEvent::Parked { id: Some(_), seq, reason: ParkReason::Refused } if *seq == refused
+    )));
+    assert_eq!(app.unacknowledged_events().await.unwrap(), events);
+}
+
+#[tokio::test]
+async fn test_duty_event_delivered_again_until_acknowledged() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let me = app.app_id();
+    w.note(me, "refused");
+    let (after, _) = w.note(me, "after");
+    w.switch.fail_next(Fault::Error {
+        path: "ops".into(),
+        code: ErrorCode::PermissionMissing,
+        current: json!(null),
+    });
+    let report = app.receive(None).await.unwrap();
+    assert!(received(&report.events, after));
+    let duties: Vec<AppEvent> = report
+        .events
+        .iter()
+        .filter(|e| e.is_duty())
+        .cloned()
+        .collect();
+    assert_eq!(duties.len(), 2, "{:?}", report.events);
+    // Not acknowledged: every load delivers them again; informational events aren't kept.
+    for _ in 0..2 {
+        let mut app = w.load(me).await;
+        let events = app.take_events();
+        assert_eq!(events, duties);
+        assert!(!received(&events, after), "{events:?}");
+    }
+    // Acknowledged up to the last: gone, across a reload too.
+    let last = last_id(&duties);
+    app.ack_events(last).await.unwrap();
+    assert!(app.unacknowledged_events().await.unwrap().is_empty());
+    let mut app = w.load(me).await;
+    assert!(app.take_events().is_empty());
+    // The next duty event takes a new ID.
+    let (again, _) = w.note(me, "again");
+    w.switch.fail_next(Fault::Error {
+        path: "ops".into(),
+        code: ErrorCode::PermissionMissing,
+        current: json!(null),
+    });
+    let report = app.receive(None).await.unwrap();
+    let next = refused_events(&report.events, again);
+    assert!(
+        next.iter()
+            .filter_map(AppEvent::id)
+            .all(|id| id.cmp_same_store(&last) == Some(std::cmp::Ordering::Greater)),
+        "{next:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_duty_event_acknowledged_in_part_keeps_the_later_ones() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let me = app.app_id();
+    let (refused, _) = w.note(me, "refused");
+    w.switch.fail_next(Fault::Error {
+        path: "ops".into(),
+        code: ErrorCode::PermissionMissing,
+        current: json!(null),
+    });
+    let report = app.receive(None).await.unwrap();
+    let ids: Vec<EventId> = report.events.iter().filter_map(AppEvent::id).collect();
+    assert_eq!(ids.len(), 2, "{:?}", report.events);
+    assert_eq!(
+        ids[0].cmp_same_store(&ids[1]),
+        Some(std::cmp::Ordering::Less)
+    );
+    app.ack_events(ids[0]).await.unwrap();
+    let mut app = w.load(me).await;
+    let events = app.take_events();
+    assert_eq!(
+        events.iter().filter_map(AppEvent::id).collect::<Vec<_>>(),
+        vec![ids[1]]
+    );
+    assert_eq!(refused_events(&events, refused).len(), 1, "{events:?}");
+}
+
+/// Refuse the effect of the next note to `app` for good, and read it: the duty events.
+async fn refuse_next(w: &World, app: &mut App) -> Vec<AppEvent> {
+    w.note(app.app_id(), "refused");
+    w.switch.fail_next(Fault::Error {
+        path: "ops".into(),
+        code: ErrorCode::PermissionMissing,
+        current: json!(null),
+    });
+    let report = app.receive(None).await.unwrap();
+    report
+        .events
+        .into_iter()
+        .filter(AppEvent::is_duty)
+        .collect()
+}
+
+/// The duty event of the highest counter among `events`, all of one store.
+fn last_id(events: &[AppEvent]) -> EventId {
+    let ids: Vec<EventId> = events.iter().filter_map(AppEvent::id).collect();
+    assert!(ids.iter().all(|id| ids[0].same_store(id)), "{ids:?}");
+    ids.into_iter().max_by_key(EventId::counter).unwrap()
+}
+
+#[test]
+fn test_duty_event_id_round_trips_its_stable_forms() {
+    let id = EventId::new([7; 16], 42);
+    assert_eq!(EventId::from_bytes(&id.to_bytes()), Ok(id));
+    assert_eq!(id.to_string().parse::<EventId>(), Ok(id));
+    assert_eq!(id.to_string(), format!("{}-42", "07".repeat(16)));
+    for bad in [
+        "",
+        "07-1",
+        &format!("{}-", "07".repeat(16)),
+        &format!("{}-x", "07".repeat(16)),
+    ] {
+        assert!(bad.parse::<EventId>().is_err(), "{bad}");
+    }
+    assert!(EventId::from_bytes(&[0; 23]).is_err());
+    // Ordered within one store only.
+    let other = EventId::new([8; 16], 1);
+    assert_eq!(id.cmp_same_store(&other), None);
+    assert_eq!(
+        id.cmp_same_store(&EventId::new([7; 16], 1)),
+        Some(std::cmp::Ordering::Greater)
+    );
+}
+
+#[tokio::test]
+async fn test_duty_event_ids_after_a_restore_on_a_fresh_store_are_new() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let backup = app.backup().unwrap();
+    let start = w.clock.now_ms();
+    let before = refuse_next(&w, &mut app).await;
+    let acked = last_id(&before);
+    app.ack_events(acked).await.unwrap();
+    // The device is lost; the backup, older than the IDs the host acknowledged, is
+    // restored on a new one whose clock reads earlier.
+    w.clock.set_ms(start);
+    let store = Arc::new(MemoryStore::new());
+    let mut restored = App::restore(
+        w.env_on(Arc::clone(&store) as Arc<dyn StateStore>),
+        w.protocol.clone(),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    assert!(restored.take_events().is_empty());
+    let after = refuse_next(&w, &mut restored).await;
+    assert_eq!(after.len(), before.len(), "{after:?}");
+    // The same counters, under a new epoch: no ID equals one from before.
+    let counters = |events: &[AppEvent]| {
+        events
+            .iter()
+            .filter_map(AppEvent::id)
+            .map(|id| id.counter())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(counters(&after), counters(&before));
+    for id in after.iter().filter_map(AppEvent::id) {
+        assert!(!id.same_store(&acked), "{id}");
+        assert!(before.iter().filter_map(AppEvent::id).all(|old| old != id));
+    }
+    // An acknowledgement of the old store's ID removes nothing here, and says so.
+    let error = restored.ack_events(acked).await.unwrap_err();
+    assert!(
+        matches!(error, AppError::Refused(Refusal::Usage(_))),
+        "{error:?}"
+    );
+    assert_eq!(restored.unacknowledged_events().await.unwrap(), after);
+}
+
+#[tokio::test]
+async fn test_duty_events_and_owed_calls_carried_across_a_restore_in_place() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let backup = app.backup().unwrap();
+    let duties = refuse_next(&w, &mut app).await;
+    assert_eq!(duties.len(), 2, "{duties:?}");
+    let now = w.clock.now_ms();
+    let seq = w.switch.push_missed(3, now - HOUR, now);
+    *w.protocol.failing.lock().unwrap() = 1;
+    app.receive(None).await.unwrap();
+    assert!(w.protocol.missed.lock().unwrap().is_empty());
+    // Restored in place from the older backup: what the app still owes its protocol stays,
+    // with its IDs, and is delivered again.
+    drop(app);
+    let mut restored = App::restore(w.env(), w.protocol.clone(), World::config(), &backup)
+        .await
+        .unwrap();
+    assert_eq!(restored.take_events(), duties);
+    assert_eq!(restored.unacknowledged_events().await.unwrap(), duties);
+    // Its next duty events continue the store's epoch and counter.
+    let last = last_id(&duties);
+    let next = refuse_next(&w, &mut restored).await;
+    assert!(!next.is_empty());
+    for id in next.iter().filter_map(AppEvent::id) {
+        assert_eq!(
+            id.cmp_same_store(&last),
+            Some(std::cmp::Ordering::Greater),
+            "{id} after {last}"
+        );
+    }
+    restored.receive(None).await.unwrap();
+    assert!(
+        w.protocol
+            .missed
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|missed| missed.seq == seq && missed.entries == 3),
+        "the owed call is made"
+    );
+    // Restored on another device, nothing of this store is carried.
+    let store = Arc::new(MemoryStore::new());
+    let mut other = App::restore(
+        w.env_on(Arc::clone(&store) as Arc<dyn StateStore>),
+        w.protocol.clone(),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    assert!(other.unacknowledged_events().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_duty_event_reported_only_with_its_commit() {
+    let w = World::new();
+    let (app, _, _) = refusing(&w).await;
+    let (mut app, counting) = load_behind(&w, app, StoreFault::None).await;
+    app.receive(None).await.unwrap();
+    let commits = counting.commits();
+    assert!(commits > 1, "the read commits {commits} times");
+    // Each commit of the read fails once in turn, applying nothing or applied with an
+    // answer that can't tell: a refusal is reported at most once in all, only as kept, and
+    // every kept duty event is reported.
+    for n in 1..=commits {
+        for fault in [StoreFault::FailBefore(n), StoreFault::FailAfter(n)] {
+            let w = World::new();
+            let (app, refused, after) = refusing(&w).await;
+            let me = app.app_id();
+            let (mut app, _) = load_behind(&w, app, fault).await;
+            let mut events = match app.receive(None).await {
+                Ok(report) => report.events,
+                Err(_) => app.take_events(),
+            };
+            events.extend(app.receive(None).await.unwrap().events);
+            let reported = refused_events(&events, refused);
+            assert!(reported.len() <= 1, "{fault:?}: {events:?}");
+            let kept = app.unacknowledged_events().await.unwrap();
+            for event in &reported {
+                assert!(kept.contains(event), "{fault:?}: {event:?} isn't kept");
+            }
+            for event in &kept {
+                assert!(
+                    events.contains(event),
+                    "{fault:?}: {event:?} kept, never reported"
+                );
+            }
+            assert!(app.cursor().seq >= after, "{fault:?}");
+            // A later duty event, acknowledged: nothing kept is removed unreported.
+            let later = refuse_next(&w, &mut app).await;
+            events.extend(later.iter().cloned());
+            app.ack_events(last_id(&later)).await.unwrap();
+            for event in app.unacknowledged_events().await.unwrap() {
+                assert!(
+                    !events.contains(&event),
+                    "{fault:?}: {event:?} acknowledged, kept"
+                );
+            }
+            assert_eq!(w.load(me).await.take_events(), Vec::new(), "{fault:?}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_duty_event_replay_whose_read_fails_is_made_again() {
+    let mut found = false;
+    for n in 1..=8 {
+        let w = World::new();
+        let (app, seq, _) = refusing(&w).await;
+        let (mut app, store) = load_behind(&w, app, StoreFault::FailAfter(n)).await;
+        if app.receive(None).await.is_ok() {
+            continue;
+        }
+        if !refused_events(&app.take_events(), seq).is_empty()
+            || refused_events(&app.kept_duties().await.unwrap(), seq).is_empty()
+        {
+            continue;
+        }
+        found = true;
+        // The refusal's commit was applied unreported. The reload's replay of the kept duty
+        // events fails once: the next call makes it again.
+        store.fail_scan(b"duty/", 1);
+        assert!(app.receive(None).await.is_err(), "commit {n}");
+        let mut events = app.take_events();
+        let later = refuse_next(&w, &mut app).await;
+        events.extend(later.iter().cloned());
+        assert_eq!(
+            refused_events(&events, seq).len(),
+            1,
+            "commit {n}: {events:?}"
+        );
+        // Acknowledged: nothing kept was removed unseen.
+        app.ack_events(last_id(&later)).await.unwrap();
+        for event in app.unacknowledged_events().await.unwrap() {
+            assert!(!events.contains(&event), "commit {n}: {event:?}");
+        }
+        break;
+    }
+    assert!(
+        found,
+        "a commit keeping the refusal answers that it can't tell"
+    );
+}
+
+#[tokio::test]
+async fn test_duty_event_listed_after_a_failed_commit_comes_once() {
+    let mut found = false;
+    for n in 1..=8 {
+        let w = World::new();
+        let (app, seq, _) = refusing(&w).await;
+        let (mut app, _) = load_behind(&w, app, StoreFault::FailAfter(n)).await;
+        if app.receive(None).await.is_ok() {
+            continue;
+        }
+        if !refused_events(&app.take_events(), seq).is_empty()
+            || refused_events(&app.kept_duties().await.unwrap(), seq).is_empty()
+        {
+            continue;
+        }
+        found = true;
+        // The refusal's commit was applied unreported. Listing it reloads first and hands
+        // it over; the next report doesn't hand it over again.
+        let listed = app.unacknowledged_events().await.unwrap();
+        assert_eq!(refused_events(&listed, seq).len(), 1, "commit {n}");
+        let report = app.receive(None).await.unwrap();
+        let mut again = report.events;
+        again.extend(app.take_events());
+        assert!(
+            refused_events(&again, seq).is_empty(),
+            "commit {n}: {again:?}"
+        );
+        break;
+    }
+    assert!(
+        found,
+        "a commit keeping the refusal answers that it can't tell"
+    );
+}
+
+#[tokio::test]
+async fn test_duty_event_kept_but_not_taken_survives_an_acknowledgement() {
+    // The commit that keeps the refusal is applied, but answers that it can't tell: the
+    // read fails, and nothing reports the refusal yet.
+    let mut found = false;
+    for n in 1..=8 {
+        let w = World::new();
+        let (app, seq, _) = refusing(&w).await;
+        let (mut app, _) = load_behind(&w, app, StoreFault::FailAfter(n)).await;
+        if app.receive(None).await.is_ok() {
+            continue;
+        }
+        if !refused_events(&app.take_events(), seq).is_empty()
+            || refused_events(&app.kept_duties().await.unwrap(), seq).is_empty()
+        {
+            continue;
+        }
+        found = true;
+        // An acknowledgement of its ID before the host was handed it leaves it kept.
+        let kept = app.kept_duties().await.unwrap();
+        app.ack_events(last_id(&kept)).await.unwrap();
+        assert_eq!(
+            refused_events(&app.kept_duties().await.unwrap(), seq).len(),
+            1,
+            "commit {n}"
+        );
+        // The reload queued it: taken, then acknowledged, it goes.
+        let taken = app.take_events();
+        assert_eq!(
+            refused_events(&taken, seq).len(),
+            1,
+            "commit {n}: {taken:?}"
+        );
+        app.ack_events(last_id(&taken)).await.unwrap();
+        assert!(app.kept_duties().await.unwrap().is_empty());
+        break;
+    }
+    assert!(
+        found,
+        "a commit keeping the refusal answers that it can't tell"
+    );
+}
+
+#[tokio::test]
+async fn test_duty_event_listed_after_a_load_can_be_acknowledged() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let me = app.app_id();
+    assert_eq!(refuse_next(&w, &mut app).await.len(), 2);
+    drop(app);
+    // A new session: the host reads what it still has to act on, acts, and acknowledges,
+    // without taking the call's events.
+    let mut app = w.load(me).await;
+    let listed = app.unacknowledged_events().await.unwrap();
+    assert_eq!(listed.len(), 2);
+    app.ack_events(last_id(&listed)).await.unwrap();
+    assert!(app.unacknowledged_events().await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -1746,11 +3332,14 @@ impl Protocol for WideProtocol {
         })
     }
 
-    fn resend_needed(&self, needed: &ResendNeeded) -> Vec<LocalWrite> {
+    fn resend_needed(
+        &self,
+        needed: &ResendNeeded,
+    ) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
         self.0.resend_needed(needed)
     }
 
-    fn missed(&self, missed: &MissedEntries) -> Vec<LocalWrite> {
+    fn missed(&self, missed: &MissedEntries) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
         self.0.missed(missed)
     }
 }
@@ -1769,7 +3358,7 @@ async fn test_app_effect_over_one_batch_is_parked_and_the_feed_goes_on() {
     for seq in [first, second] {
         assert!(has(&report.events, |e| matches!(
             e,
-            AppEvent::Parked { seq: s, reason: ParkReason::TooManyOperations } if *s == seq
+            AppEvent::Parked { id: Some(_), seq: s, reason: ParkReason::TooManyOperations } if *s == seq
         )));
         assert!(has(&report.events, |e| matches!(
             e,

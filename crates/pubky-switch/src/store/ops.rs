@@ -588,15 +588,21 @@ impl AccountTxn {
 
     /// Keep `app_id` as revoked at `at_ms`, for good, and withdraw the invite codes it
     /// registered (Switch spec 7, 12.2, Switch wire 9.1).
-    pub async fn revoke_app(&mut self, app_id: &[u8; 16], at_ms: u64) -> Result<(), StoreError> {
+    pub async fn revoke_app(
+        &mut self,
+        app_id: &[u8; 16],
+        at_ms: u64,
+        data_epoch: u64,
+    ) -> Result<(), StoreError> {
         let id = self.head().id.clone();
         sqlx::query(
-            "INSERT INTO kept_app_ids (account_id, app_id, reason, at_ms) \
-             VALUES ($1, $2, 'revoked', $3)",
+            "INSERT INTO kept_app_ids (account_id, app_id, reason, at_ms, data_epoch) \
+             VALUES ($1, $2, 'revoked', $3, $4)",
         )
         .bind(&id)
         .bind(app_id.as_slice())
         .bind(to_db(at_ms, "time")?)
+        .bind(to_db(data_epoch, "data_epoch")?)
         .execute(self.conn())
         .await
         .map_err(db)?;
@@ -993,8 +999,8 @@ pub(super) async fn own_app_view(
 }
 
 /// The `apps` row of `app_id` at account `id`, read without the account's lock.
-pub(super) async fn app_row(
-    pool: &sqlx::PgPool,
+pub(super) async fn app_row<'c>(
+    conn: impl sqlx::PgExecutor<'c>,
     id: &str,
     app_id: &[u8; 16],
 ) -> Result<Option<StoredApp>, StoreError> {
@@ -1005,7 +1011,7 @@ pub(super) async fn app_row(
     )
     .bind(id)
     .bind(app_id.as_slice())
-    .fetch_optional(pool)
+    .fetch_optional(conn)
     .await
     .map_err(db)?;
     row.as_ref().map(app_of).transpose()
