@@ -134,6 +134,9 @@ pub struct StoredInvite {
     pub expires_at_ms: u64,
     /// Its context.
     pub context: Value,
+    /// The context's bytes as its writer wrote them, which a reader repeats (Switch wire
+    /// 1.1). A code stored before the service kept them holds a re-serialization.
+    pub context_written: Vec<u8>,
 }
 
 fn array<const N: usize>(bytes: &[u8], what: &'static str) -> Result<[u8; N], StoreError> {
@@ -758,6 +761,7 @@ impl AccountTxn {
                     expires_at_ms: from_db(row.try_get("expires_at_ms")?, "expires_at_ms")?,
                     context: serde_json::from_slice(&context)
                         .map_err(|_| StoreError::Corrupt("an invite code's context"))?,
+                    context_written: context,
                 })
             })
             .collect()
@@ -786,8 +790,8 @@ impl AccountTxn {
     /// Store an invite code, replacing one at its hash.
     pub async fn put_invite(&mut self, invite: &StoredInvite) -> Result<(), StoreError> {
         let id = self.head().id.clone();
-        let context = serde_json::to_vec(&invite.context)
-            .map_err(|_| StoreError::Corrupt("an invite code's context doesn't encode"))?;
+        // The bytes as written, never a re-serialization (Switch wire 1.1).
+        let context = invite.context_written.clone();
         sqlx::query(
             "INSERT INTO invite_codes (account_id, code_hash, max_uses, uses, writer, \
              expires_at_ms, context) VALUES ($1, $2, $3, $4, $5, $6, $7) \

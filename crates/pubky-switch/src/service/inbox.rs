@@ -460,8 +460,8 @@ impl Service {
                 ));
             }
         }
-        // The context as stored, which the feed shows with the entry.
-        let context = serde_json::to_vec(&invite.context).map_err(|_| temporary())?;
+        // The context as its writer wrote it, which the feed shows with the entry.
+        let context = invite.context_written.clone();
         txn.use_invite(code, sender, &context, time_ms)
             .await
             .map_err(|e| store_error(&e))?;

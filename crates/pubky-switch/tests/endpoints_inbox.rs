@@ -608,3 +608,107 @@ async fn test_inbox_own_app_appends_without_admission() {
     assert!(body(&answer).get("known_version").is_none());
     replay.db.drop_database().await.expect("drop");
 }
+
+#[tokio::test]
+async fn test_inbox_invite_context_reaches_the_feed_as_written() {
+    use pubky_switch_core::{labels::sig::OP, ops::SignedOp};
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    // An invite_code.put whose context holds numbers a re-serialization would change.
+    let code = "IRrC78oNIjZ4hcet2fYnJQ";
+    let keys = vectors("keys.json");
+    let wallet = app(&keys, "wallet");
+    let app_keys = AppKeys::from_secrets(
+        hex32(&wallet["signing_secret_hex"]),
+        hex32(&wallet["bundle_secret_hex"]),
+    );
+    let alice_key = hex32(&alice(&keys)["public_hex"]);
+    let app_id = pubky_switch_core::enc::app_id_decode(wallet["app_id"].as_str().expect("id"))
+        .expect("app id");
+    let ops = sign_batch(
+        &app_keys,
+        &alice_key,
+        Some(app_id),
+        1,
+        [91; 16],
+        vec![(
+            Vec::new(),
+            OpKind::InviteCodePut(InviteCodePut {
+                code_hash: pubky_switch_core::ident::invite_code_hash(code).expect("hash"),
+                expires_at: ms(&at()) + 3_600_000,
+                max_uses: 1,
+                context: InviteContext::new(json!({ "order": 7 })),
+            }),
+        )],
+    )
+    .expect("batch");
+    let written = r#"{"n":12345678901234567890123,"r":1.50}"#;
+    let body_text = String::from_utf8(ops[0].signed().body_bytes().expect("body"))
+        .expect("utf-8")
+        .replace(
+            r#""context":{"order":7}"#,
+            &format!(r#""context":{written}"#),
+        );
+    assert!(body_text.contains(written));
+    let signing = ed25519_dalek::SigningKey::from_bytes(&hex32(&wallet["signing_secret_hex"]));
+    let signed = SignedDoc::sign_bytes(&signing, OP, &[&alice_key], body_text.into_bytes());
+    let op = SignedOp::peek(&signed).expect("op");
+    let path = format!("/v1/{}/ops", alice_id());
+    let answer = replay
+        .service
+        .handle(app_request(
+            wallet,
+            "POST",
+            &path,
+            OpsRequest::new(&[op], None).to_json(),
+            ms(&at()),
+        ))
+        .await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    // Stored as written.
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    let stored: Vec<u8> =
+        sqlx::query_scalar("SELECT context FROM invite_codes WHERE account_id = $1")
+            .bind(alice_id())
+            .fetch_one(&mut conn)
+            .await
+            .expect("context");
+    assert_eq!(stored, written.as_bytes());
+    // The shop, admitted by the code, appends: its entry shows the context as written.
+    let path = format!("/v1/{}/peers", alice_id());
+    let peer = serde_json::to_vec(&doc("bob identity.json")).expect("body");
+    let request = other_request("shop", ORIGIN, "PUT", &path, peer, Some(code), ms(&at()));
+    assert_eq!(replay.service.handle(request).await.status, 200);
+    let version = apps_version(&replay).await;
+    let answer = from_shop(&replay, to_wallet(21, false), Some(version), Some(code)).await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    let path = format!("/v1/{}/feed?after=1:9", alice_id());
+    let page = replay
+        .service
+        .handle(app_request(
+            app(&keys, "wallet"),
+            "GET",
+            &path,
+            Vec::new(),
+            ms(&at()),
+        ))
+        .await;
+    let text = String::from_utf8(page.body).expect("utf-8");
+    assert!(
+        text.contains(&format!(r#""context":{written},"envelope""#)),
+        "{text}"
+    );
+    replay.db.drop_database().await.expect("drop");
+}
