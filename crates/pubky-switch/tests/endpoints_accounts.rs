@@ -914,3 +914,76 @@ async fn test_refused_delivery_leaves_nothing_to_build_on() {
     conn.close().await.expect("close");
     replay.db.drop_database().await.expect("drop");
 }
+
+#[tokio::test]
+#[ignore = "the first-document path of check_delivery doesn't check the kept App IDs yet \
+            (Switch wire 3.3); run it once the core checks them"]
+async fn test_identity_first_delivery_refuses_an_enrolled_revoked_app() {
+    let Some(replay) = replay().await else { return };
+    let alice = alice_keys();
+    set_time(&replay.clock, T);
+    // An enrollment without identity_doc whose revoked_apps names the wallet, which version 1
+    // lists as current.
+    let keys = vectors("keys.json");
+    let wallet: [u8; 16] = hex::decode(
+        keys["apps"]
+            .as_array()
+            .expect("apps")
+            .iter()
+            .find(|app| app["name"] == "wallet")
+            .expect("the wallet")["app_id_bytes_hex"]
+            .as_str()
+            .expect("hex"),
+    )
+    .expect("hex")
+    .try_into()
+    .expect("16 bytes");
+    let http = vectors("http.json");
+    let vector = named(&http["requests"], "signer: enrollment");
+    let body: Value = serde_json::from_slice(
+        &pubky_switch_core::enc::unb64(vector["body_b64"].as_str().expect("body")).expect("b64"),
+    )
+    .expect("json");
+    let signed: SignedDoc = serde_json::from_value(body["enrollment"].clone()).expect("signed");
+    let mut fields: EnrollmentBody =
+        serde_json::from_slice(&signed.body_bytes().expect("body")).expect("enrollment body");
+    fields.identity_doc = None;
+    fields.revoked_apps = Some(vec![wallet]);
+    let enrollment = Enrollment::sign(&alice.key, fields).expect("sign");
+    let body = serde_json::to_vec(&json!({ "enrollment": enrollment.signed() })).expect("json");
+    let enrolled = replay
+        .service
+        .handle(signer_request("POST", "/v1/enroll", body, ms(T)))
+        .await;
+    assert_eq!(
+        enrolled.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&enrolled.body)
+    );
+    let path = format!("/v1/{}/identity", alice.id);
+    let delivered = replay
+        .service
+        .handle(signer_request(
+            "PUT",
+            &path,
+            delivery(
+                version("alice identity.json, first delivery (version 1)"),
+                None,
+            ),
+            ms(T),
+        ))
+        .await;
+    assert_eq!(
+        (delivered.status, code(&delivered).as_str()),
+        (400, "bad_request"),
+        "{}",
+        String::from_utf8_lossy(&delivered.body)
+    );
+    let read = replay
+        .service
+        .handle(request("GET", &path, &[], Vec::new()))
+        .await;
+    assert_eq!(read.status, 404, "nothing is served");
+    replay.db.drop_database().await.expect("drop");
+}
