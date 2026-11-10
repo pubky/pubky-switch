@@ -336,7 +336,7 @@ fn app_put(state: &mut OpsState, app: [u8; 16], record: &SignedDoc) -> Result<St
 /// `receive_key.put`, by [`check_receive_key_put`]. An unchanged one's proof shows the
 /// current `n` and kid (Switch wire 6.4 "No-ops"). A stored key moves the directory; an
 /// app it makes reachable moves `apps_version` once the batch settles reachability
-/// ([`OpsState::settle_reachability`], Switch wire 7.4.10).
+/// ([`OpsState::settle_directory`], Switch wire 7.4.10).
 fn receive_key_put(
     state: &mut OpsState,
     cert: &AppCert,

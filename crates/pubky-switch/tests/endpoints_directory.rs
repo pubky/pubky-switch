@@ -445,6 +445,18 @@ async fn test_directory_keeps_an_app_whose_certificate_lapsed() {
     let after = body(&answer);
     assert_eq!(after["directory_version"], before["directory_version"]);
     assert_eq!(after["apps_version"], before["apps_version"]);
+    // A delivery after the lapse moves the directory's version, and not apps_version: the
+    // lapsed apps are still reachable.
+    deliver_after(&replay, between, &alice_v3(), |body| {
+        body.policy.connect_requests.enabled = true;
+    })
+    .await;
+    let delivered = read_as(&replay, "phone", between).await;
+    assert_eq!(
+        moved(&after, &delivered),
+        (true, false),
+        "a delivery after a lapse"
+    );
     replay.db.drop_database().await.expect("drop");
 }
 
@@ -884,5 +896,135 @@ async fn test_directory_versions_at_a_removal_and_a_revocation() {
     let revoked = read_as(&replay, "wallet", &at).await;
     assert_eq!(moved(&removed, &revoked), (true, true), "revocation");
     assert_eq!(ids_of(&revoked).len(), 1);
+    replay.db.drop_database().await.expect("drop");
+}
+
+/// The signer stores `cert` as the phone's renewed certificate, with a key bundle for it.
+async fn cert_put(
+    replay: &Replay,
+    cert: &pubky_switch_core::records::AppCert,
+    batch: u8,
+    at: &str,
+) {
+    let identity = pubky_switch_core::keys::IdentityKey::from_secret(hex32(
+        &alice(&vectors("keys.json"))["secret_hex"],
+    ));
+    let part = pubky_switch_core::records::seal_bundle_parts(&identity, cert, 1, 1, &|_| true)
+        .expect("bundle")
+        .remove(0);
+    let ops = sign_batch(
+        &identity,
+        &identity.public(),
+        None,
+        1,
+        [batch; 16],
+        vec![
+            (
+                Vec::new(),
+                OpKind::CertPut {
+                    target_app_id: cert.app_id(),
+                    cert: cert.signed().clone(),
+                },
+            ),
+            (
+                Vec::new(),
+                OpKind::KeyBundlePut(pubky_switch_core::ops::KeyBundlePut {
+                    target_app_id: cert.app_id(),
+                    bundle: part.bundle,
+                    first_epoch: part.first_epoch,
+                    last_epoch: part.last_epoch,
+                }),
+            ),
+        ],
+    )
+    .expect("batch");
+    let answer = replay
+        .service
+        .handle(signer_request(
+            "POST",
+            &format!("/v1/{}/ops", alice_id()),
+            OpsRequest::new(&ops, None).to_json(),
+            ms(at),
+        ))
+        .await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+}
+
+#[tokio::test]
+async fn test_directory_versions_at_a_cert_put() {
+    let Some(replay) = replay().await else { return };
+    alice_with_three_apps(&replay).await;
+    let at = setup_time();
+    let keys = vectors("keys.json");
+    let phone_keys = AppKeys::from_secrets(
+        hex32(&app(&keys, "phone")["signing_secret_hex"]),
+        hex32(&app(&keys, "phone")["bundle_secret_hex"]),
+    );
+    let identity =
+        pubky_switch_core::keys::IdentityKey::from_secret(hex32(&alice(&keys)["secret_hex"]));
+    let old = pubky_switch_core::records::AppCert::verify(
+        &signed(&named(&vectors("documents.json")["documents"], "phone certificate")["signed"]),
+        &identity.public(),
+    )
+    .expect("cert");
+    let issue = |issued: u64| {
+        pubky_switch_core::records::AppCert::issue(
+            &identity,
+            pubky_switch_core::records::AppCertBody::new(
+                identity.public(),
+                phone_keys.signing_public(),
+                phone_keys.bundle_public(),
+                old.scopes().to_vec(),
+                old.permissions(),
+                issued,
+                issued + 180 * 86_400_000,
+            ),
+        )
+        .expect("cert")
+    };
+    let b = issue(old.issued_at() + 60_000);
+    let c = issue(old.issued_at() + 120_000);
+    // A version listing renewal B for the phone and closing the earlier certificate its
+    // record carries, before B is stored: the phone isn't current, and leaves.
+    let phone = app_id_of("phone");
+    let (old_hash, b_hash) = (old.hash(), b.hash());
+    deliver_after(&replay, &at, &alice_v3(), |body| {
+        if let Some(entry) = body.apps.iter_mut().find(|entry| entry.app_id == phone) {
+            entry.cert = b_hash;
+        }
+        body.renewed.push(pubky_switch_core::records::RenewedCert {
+            app_id: phone,
+            cert: old_hash,
+            until: Some(ms(&at)),
+        });
+    })
+    .await;
+    let listed_b = read_as(&replay, "wallet", &at).await;
+    assert_eq!(ids_of(&listed_b).len(), 2);
+    // The signer stores B, the listed one: the phone is current again through it, back in
+    // the directory, and both versions move.
+    cert_put(&replay, &b, 150, &at).await;
+    let with_b = read_as(&replay, "wallet", &at).await;
+    assert_eq!(ids_of(&with_b).len(), 3);
+    assert_eq!(
+        moved(&listed_b, &with_b),
+        (true, true),
+        "a cert.put that brings an app back"
+    );
+    // A newer renewal C, not yet listed, replaces B: neither of the phone's certificates
+    // counts, and it leaves again. Both versions move.
+    cert_put(&replay, &c, 151, &at).await;
+    let with_c = read_as(&replay, "wallet", &at).await;
+    assert_eq!(ids_of(&with_c).len(), 2);
+    assert_eq!(
+        moved(&with_b, &with_c),
+        (true, true),
+        "a cert.put that drops an app"
+    );
     replay.db.drop_database().await.expect("drop");
 }

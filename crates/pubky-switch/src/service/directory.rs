@@ -124,9 +124,10 @@ impl Service {
             };
             // Current, not served (Switch wire 7.4.10 "the current apps", spec 3.4): an app
             // whose certificate has lapsed stays listed. A sender checks the certificate's
-            // expiry itself and skips it (wire 3.8 check 3 at its clock), and the inbox
-            // refuses an envelope wrapped to it (7.4.3 check 5). So the directory changes only
-            // with its versions, never as a clock passes an expiry.
+            // expiry itself (wire 3.8 check 3 at its clock), and the inbox takes an envelope
+            // wrapped to it and holds the entry for it (7.4.3 check 5 takes current apps
+            // too). So the directory changes only with its versions, never as a clock passes
+            // an expiry.
             if !state.is_current(&app.app_id) {
                 continue;
             }

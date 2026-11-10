@@ -352,8 +352,8 @@ pub(super) async fn load_apps(
 
 /// As [`load_apps`], with the app rows it read. The one loader behind every judgment of
 /// which apps are current ([`OpsState::is_current`]) or served ([`OpsState::is_served`])
-/// outside a batch: the inbox's targets (served), the entries' release (current), the
-/// directory (current) and the claims' views (served); `GET /apps` builds the same state
+/// outside a batch: the inbox's targets, the entries' release and the directory take
+/// current, and the claims' views served; `GET /apps` builds the same state
 /// from its own read ([`super::apps`]).
 pub(super) async fn load_apps_and_rows(
     txn: &mut AccountTxn,
@@ -376,7 +376,7 @@ pub(super) async fn load_apps_and_rows(
 /// `identity.json` delivery (`delivered` replacing `held`) or a revocation (`revoked`).
 /// `directory_version` moves, since the directory's `identity` or apps change with it;
 /// `apps_version` moves if the set of reachable apps changed, and an app that became
-/// reachable takes the new version (Switch wire 7.4.10, [`OpsState::settle_reachability`]);
+/// reachable takes the new version (Switch wire 7.4.10, [`OpsState::settle_directory`]);
 /// and the inbox entries every current target has passed go (9.1). Called before the
 /// revocation is written, so the state before it is read from the store.
 pub(super) async fn settle_change(
@@ -396,7 +396,7 @@ pub(super) async fn settle_change(
         after.kept.insert(app);
     }
     after.directory_version = after.directory_version.saturating_add(1);
-    after.settle_reachability(&before.reachable_app_ids());
+    after.settle_directory(&before);
     save_apps(txn, &before, &after).await?;
     txn.delete_passed_entries(&after.current_app_ids()).await?;
     Ok(())
@@ -736,7 +736,7 @@ impl Service {
         )?;
         // An app record, a receive key or a renewed certificate can make an app reachable
         // or stop it being so (Switch wire 7.4.10).
-        after.settle_reachability(&before.reachable_app_ids());
+        after.settle_directory(&before);
         if effect == BatchEffect::Unchanged {
             save_apps(txn, &before, &after)
                 .await
