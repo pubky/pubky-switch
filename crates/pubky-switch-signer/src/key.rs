@@ -4,7 +4,7 @@
 //! hands it to this crate through a [`SecretVault`]: three calls that move opaque bytes, so
 //! that host code never signs, derives or parses anything. Neither the iOS Secure Enclave nor
 //! the Android Keystore supports Ed25519, so the key must be in software while it signs; it is
-//! loaded for one operation at a time and zeroized after.
+//! loaded for one operation, or one step of a flow, at a time and zeroized after.
 //!
 //! Every use of the key goes through an [`IdentityKeyring`], whose signing and derivation
 //! entry points belong to this crate alone. The crate signs only inputs it builds itself, for
@@ -290,6 +290,19 @@ impl IdentityKeyring {
         Ok(secret)
     }
 
+    /// The identity key, loaded and checked, for one step of a flow: the requests and the
+    /// documents one call to the switch or the Homeserver signs. The client signs requests
+    /// through it, so it is shared; it is zeroized when the last holder drops it, at the end
+    /// of the step. Never kept in the signer's state.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`IdentityKeyring::with_key`].
+    pub(crate) fn unlock(&self) -> Result<Arc<IdentityKey>, KeyError> {
+        let secret = self.load()?;
+        Ok(Arc::new(secret.key()))
+    }
+
     /// Run `use_key` with the identity key, for one signature or derivation over an input this
     /// crate built (see the module docs). The key is dropped, and zeroized, when `use_key`
     /// returns. `use_key` never reads the secret bytes: that is
@@ -316,10 +329,6 @@ impl IdentityKeyring {
     /// # Errors
     ///
     /// The errors of [`IdentityKeyring::with_key`].
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the hand-over and backup flows seal the key")
-    )]
     pub(crate) fn for_export<T>(
         &self,
         reason: ExportReason,

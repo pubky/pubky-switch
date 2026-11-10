@@ -11,7 +11,7 @@ Status: for review, before any code. Scope: identity management on the Pubky Swi
 **Dependencies:**
 - `pubky-switch-core`: documents, signatures, derivations, envelopes, the scope rule and chain verification. It is pure, and time is passed in.
 - `pubky-switch-client`: the Switch client (request signing, response and proof verification, batches), the `StateStore` trait and the clock.
-- `pubky`: a concrete `PubkySession` for publishing `identity.json` and the backup and for deleting app records, and `PublicStorage` for reading the published copies. These are concrete handles, with no generic backend seam.
+- **The identity's Homeserver,** through a `Homeserver` trait (`get` and `put` of the identity's own public files) that the host implements on its Pubky session for the identity, as the client reads Homeserver files through `HomeserverReader`. The signer writes `identity.json` and the backup there, which no app's grant covers (spec 3.4).
 
 So the direction is `pubky-switch-signer -> pubky-switch-client -> pubky-switch-core`. The bindings expose it alongside a protocol's SDK, which is how "the signer core ships in the SDK" holds.
 
@@ -135,7 +135,7 @@ The list of apps isn't stored separately: it comes from the newest document and 
 
 ### 4.2 Persistence
 
-The signer uses the client's `StateStore` (atomic batches, durable writes) under its own namespace, so a host that is both an app and the signer has one store. Every network effect follows one rule:
+The signer uses the client's `StateStore` (atomic batches, durable writes) under its own namespace, `signer/<identity>`, so a host that is both an app and the signer has one store. The records and the flow in progress are two values there, always committed together; the identity key is never among them. Every network effect follows one rule:
 
 1. Build and sign the artifact, and commit it together with the flow's next step in one atomic write.
 2. Send those bytes, again and again until there is an answer. The Switch treats them as a retry.

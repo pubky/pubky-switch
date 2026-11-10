@@ -4,11 +4,14 @@
 //! key or storage failure it reports. Messages name the rule that failed and never carry a
 //! secret, and they don't repeat the text of a document or request that failed a check.
 
+use pubky_switch_client::{ClientError, StoreError, TransportError};
+
+use crate::alert::Alert;
 use crate::key::KeyError;
 use crate::protocol::ProtocolError;
 
 /// A failure of the signer.
-#[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
+#[derive(Debug, thiserror::Error, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum SignerError {
     /// The identity key couldn't be loaded, stored or used.
@@ -24,6 +27,32 @@ pub enum SignerError {
     /// Data that didn't verify or parse, such as a document from the network.
     #[error("invalid data: {0}")]
     InvalidData(#[from] pubky_switch_core::Error),
+    /// A call to the switch failed. A call that may not have arrived is resent with the same
+    /// bytes by [`crate::Signer::resume`].
+    #[error(transparent)]
+    Switch(#[from] ClientError),
+    /// The identity's Homeserver couldn't be read or written.
+    #[error("homeserver: {0}")]
+    Homeserver(TransportError),
+    /// The host's store failed.
+    #[error(transparent)]
+    Store(#[from] StoreError),
+    /// The signer's own records in the store don't read: they are corrupt or of another
+    /// version.
+    #[error("the signer's records don't read: {0}")]
+    Records(String),
+    /// Another install is the identity's signer, as the newest `identity.json` or the backup
+    /// names it, so this one signs nothing until the user has it take over (Switch spec 4.3,
+    /// 12.8).
+    #[error("another install is the identity's signer")]
+    NotNamed {
+        /// That install's signer ID.
+        install: [u8; 16],
+    },
+    /// A rollback or an equivocation: the signer shows it to the user instead of building on
+    /// it (Switch spec 4.3, Switch wire 3.3 "Never back").
+    #[error("alarm: {0:?}")]
+    Alarm(Alert),
 }
 
 /// A rule of the Switch or of a protocol said no.
@@ -52,6 +81,23 @@ pub enum Refusal {
         protocol: String,
         /// The protocol's reason.
         reason: String,
+    },
+    /// The store already holds this identity's signer records, so it isn't set up again.
+    #[error("refused: the signer is already set up for this identity")]
+    AlreadySetUp,
+    /// The store holds no signer records for this identity.
+    #[error("refused: the signer isn't set up for this identity")]
+    NotSetUp,
+    /// A flow is in progress: [`crate::Signer::resume`] finishes it first.
+    #[error("refused: a flow is in progress")]
+    FlowInProgress,
+    /// The switch holds a newer `identity.json` that this install didn't sign, which it
+    /// adopted; the change asked for wasn't made, and may be asked for again on top of it
+    /// (Switch spec 4.3).
+    #[error("refused: the switch holds a newer version, {version}, which the signer adopted")]
+    Superseded {
+        /// The adopted version.
+        version: u64,
     },
 }
 
