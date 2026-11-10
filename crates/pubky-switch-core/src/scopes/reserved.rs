@@ -4,6 +4,10 @@
 //! machine-readable copy of the wire format's list, and a test checks that the two agree. The
 //! core gives these names no meaning beyond the Switch's rule: each root belongs to the
 //! protocol it is listed under.
+//!
+//! The file is embedded from the repository's `spec/`, outside the crate's own folder. That
+//! works wherever the crate is built from the repository, as a git dependency is; a crate
+//! published on its own would have to copy the file into the crate at build time.
 
 use std::sync::OnceLock;
 

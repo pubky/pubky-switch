@@ -9,57 +9,9 @@ mod common;
 
 use common::*;
 use pubky_switch_core::keys::AppKeys;
-use pubky_switch_core::records::{
-    AppRequest, AppRequestBody, Approval, ApprovalClaim, AuthRequest, app_record_path,
-};
+use pubky_switch_core::records::{AppRequest, Approval, ApprovalClaim, app_record_path};
 use pubky_switch_core::scopes::Permission;
-use pubky_switch_core::sig::SignedDoc;
 use pubky_switch_signer::{Refusal, SignerError};
-
-/// An app asking for `scopes`, with the auth request its request binds.
-struct App {
-    keys: AppKeys,
-    auth: AuthRequest,
-    request: SignedDoc,
-}
-
-impl App {
-    fn new(scopes: &[&str], caps: Option<String>, secret: [u8; 32]) -> Self {
-        Self::with_keys(
-            AppKeys::from_secrets([3; 32], [4; 32]),
-            scopes,
-            caps,
-            secret,
-        )
-    }
-
-    fn with_keys(keys: AppKeys, scopes: &[&str], caps: Option<String>, secret: [u8; 32]) -> Self {
-        let record = format!("{}:rw", app_record_path(&keys.app_id_bytes()));
-        let caps = caps.unwrap_or_else(|| {
-            if scopes.contains(&"notes_tags") {
-                format!("{record},{TAGS_PATH}:rw")
-            } else {
-                record
-            }
-        });
-        let auth = AuthRequest {
-            client_id: "app.example".into(),
-            client_key: [8; 32],
-            caps,
-            secret,
-        };
-        let scopes = scopes.iter().map(|s| (*s).to_owned()).collect();
-        let request = AppRequest::sign(&keys, AppRequestBody::new(&keys, scopes, &auth))
-            .unwrap()
-            .signed()
-            .clone();
-        Self {
-            keys,
-            auth,
-            request,
-        }
-    }
-}
 
 fn refusal(error: SignerError) -> Refusal {
     match error {

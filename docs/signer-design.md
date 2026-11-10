@@ -109,7 +109,7 @@ pub trait Protocol: Send + Sync {
   - grants exactly the app's own paths, and a protocol's grant paths lie outside the Switch's own folders;
   - no grant covering `identity.json` or the signer's backup;
   - the app limit.
-- **Unknown scopes:** a scope no registered protocol owns is refused in a request (wire 3.9 step 1). A received hand-over or a restored backup whose certificates hold one is refused, naming those scopes so the host can tell the user which protocol support is missing. A certificate already in the records that holds one blocks every step that needs that app's keys and raises an alert, instead of guessing (decision 2).
+- **Unknown scopes:** a scope no registered protocol owns is refused in a request (wire 3.9 step 1). A received hand-over or a restored backup whose certificates hold one is refused, naming those scopes so the host can tell the user which protocol support is missing. A certificate already in the records that holds one blocks only the steps that need that app's keys, instead of guessing (decision 2): a rotation gives that app no part and raises `RotationSkipped`, naming the app and the scopes, and its next bundle catches it up; a renewal may remove such a scope, which counts as keyed and so rotates, but may not keep it.
 
 ## 4. State
 
@@ -263,7 +263,8 @@ impl Signer {
     async fn approve(&mut self, review: AppReview) -> Result<ApprovedRequest>;      // cert, version, approval and claim
     fn approved(&self, request: &[u8; 32]) -> Result<Option<ApprovedRequest>>;     // the claim, once its version is delivered
     async fn claim_delivered(&mut self, request: &[u8; 32]) -> Result<()>;          // the host sent the claim and the grant
-    async fn renew(&mut self, app: AppId, change: CertChange) -> Result<RenewalOutcome>;     // reductions included
+    async fn renew(&mut self, app: [u8; 16], change: CertChange) -> Result<IdentityDoc>;   // a reduction's closing follows at once
+    async fn complete_renewals(&mut self) -> Result<Vec<[u8; 16]>>;                         // cooperative: until = record_at + 5 min
     async fn revoke(&mut self, app: AppId, distrust_from: Option<Time>, ok: UserConfirmed) -> Result<Rotation>;
     async fn purge_removed(&mut self, app: AppId) -> Result<()>;
 
@@ -308,7 +309,7 @@ Alert = Equivocation { version, ours, theirs }      // stop, show
       | ManagedByOtherInstall { install }           // offer take-over
       | HandOverPending { to_app, since } | HandOverTookEffect { by_app } | HandOverRefused { reason }
       | BackupWriteFailed                           // after a racing delivery won
-      | UnknownScope { app, scope }                 // no registered protocol owns it
+      | RotationSkipped { app, scopes }             // no registered protocol owns them
       | AppIdle { app, last_seen }                  // suggest removal after 90 days
       | CertLapsingWithOpenAttempts { app, expires_at }
       | GrantRevocationOwed { app }
@@ -336,14 +337,14 @@ There are no panics on network input, and all arithmetic is checked.
 |---|---|---|
 | 1 Enrollment | `create`, `move_to`, `declare_provider_loss` | the enrollment is kept signed and resent unchanged; `revoked_apps` comes from the tombstones; the high-water mark after every accepted delivery; `signer` set to this install |
 | 2 App approval | `review`, `approve` | permissions from the `Protocols`; the approval is built from the delivered document; the full bundle in parts; the companion claim delivered before the grant; the approval kept by request hash until the claim is delivered, so a crash resends it |
-| 3 Renewals and reductions | `renew`, `run_due` | `cert.put` with the first bundle part; a reduction closes from the delivery proof's `server_time`; a removed keyed scope rotates the epoch, with the other apps' e+1 bundles stored before the delivery |
+| 3 Renewals and reductions | `renew`, `run_due` | `cert.put` with the first bundle part; a reduction closes from the delivery proof's `server_time`, or, when the switch never gave one, from the next delivery's, never the signer's clock; a removed keyed scope rotates the epoch, with the other apps' e+1 bundles stored before the delivery; an epoch a given-up rotation sent keys for is completed, in a version of its own, before the next rotation |
 | 4 Revocations and departures | `revoke`, `run_due` | the switch first, then bundles, delivery, publish, and the record and grant cleanup; departures completed from `GET /apps`; tombstones kept for good |
 | 5 Service keys | `rotate_service_key`, `move_to` | `service_keys` from `proof_generations`; refused past 256, or for a reported generation whose key it lacks |
 | 6 Provider moves | `move_to`, `abort_move` | rotations owed done first; import limit check; the freeze kept before it is sent; direct transfer under the export transfer, with a relay fallback; the abort sends the unfreeze to N, then to O with N's discard answer |
 | 7 Provider loss | `declare_provider_loss`, `end_staged_admission` | a new generation with `recovery_from`; no service key added |
 | 8 Erasure | `erase_previous`, `close_account` | refused during a move; a lost `200` followed by a `404` counts as done |
 | 9 Hand-over | `hand_over_to`, `abort_hand_over`, `receive_hand_over` | up to 128 envelopes through `PUT`/`GET /handover`; the abort at version + 2; checks 1 to 3 on the receiving side, then the version + 1 delivery; a refusal destroys the received secret |
-| 10 Backup and the one-signer rule | section 4.4, `restore`, `take_over`, `status` | written before each delivery and after bundle parts; another install's backup or document stops signing |
+| 10 Backup and the one-signer rule | section 4.4, `restore`, `take_over`, `status` | written before each delivery and after bundle parts; another install's backup or document stops signing; a restore or a received hand-over takes the highest epoch whose keys were sent from the `bundle_parts` it carries and from `keys_through` and `bundle_ranges` in `GET /apps` |
 | 11 Key interface | section 2 | |
 | 12 Telling the user | `alerts`, `status` | section 5.1 |
 
@@ -394,7 +395,7 @@ The Switch spec answers four questions a signer has to settle:
 ## 10. Decisions
 
 1. **Key bundles follow the neutral rule.** Wire 3.5, 3.8, 3.10 and 7.4.11 word a bundle part's keys in one protocol's terms, where spec 3.5 leaves the choice of keyed scopes to each protocol, and spec 12.7 step 5 names one protocol too. The signer implements the neutral rule through `Protocol::has_keys`, which gives the same bytes for the vectors. A follow-up spec PR fixes the wording.
-2. **A scope no registered protocol owns.** `receive_hand_over` and `restore` refuse unless a registered protocol owns every scope of every listed certificate, and tell the user which protocol is missing. Elsewhere, for example after a protocol is unregistered, the signer raises `UnknownScope` and blocks only the steps that need that app's keys.
+2. **A scope no registered protocol owns.** `receive_hand_over` and `restore` refuse unless a registered protocol owns every scope of every listed certificate, and tell the user which protocol is missing. Elsewhere, for example after a protocol is unregistered, the signer blocks only the steps that need that app's keys: a rotation skips the app with `RotationSkipped`, and a renewal may remove the scope, which rotates.
 3. **Finding a waiting hand-over.** No feed item announces one (wire 7.4.17), so the user drives it. The old signer tells the user to open the new app, and the new app calls `GET /handover` at start and when the user asks; a `404` costs little.
 4. **Revoking Pubky grants.** Revocations and leaves revoke the app's grant (spec 3.4, 12.2 step 1). Until the Pubky SDK offers a revocation call, the signer records each revocation as owed and raises `GrantRevocationOwed`. The rest of the flow doesn't wait for it.
 5. **The `StateStore`:** proposed in section 4.6, to be agreed together with `pubky-switch-client`.
@@ -403,3 +404,4 @@ The Switch spec answers four questions a signer has to settle:
 
 - **A lagging switch with an unreadable or missing backup.** When the backup on the Homeserver doesn't open, or is missing where this signer wrote one, the signer writes its own only if the switch's copy (`GET /apps` `identity`) is still its high-water version (wire 3.13). A switch whose `GET /apps` lags its own writes can show that version after another install's delivery has won. The signer then writes its backup over the winner's. Its own delivery still fails at the switch's compare-and-swap, so the identity stays with the winner; the winner's next backup write repairs the file.
 - **An unreadable backup before the first version.** A new install that finds a backup it can't open, before any switch accepted a version from it, has no copy to judge the switch by. It writes and delivers nothing, raises `UnreadableBackupBeforeEnrollment` and refuses with `UnreadableBackup`. The user restores from that backup on the install that wrote it, or, sure that no other install signs for the identity, removes the file from the Homeserver; `resume` then goes on.
+- **A switch that never gives a reduction's service time.** A reduction closes at the service time at which the switch took its renewing version. If neither the delivery nor its retry carries a proof, the reduction stays open with `ReductionNotClosed`, and the closing uses the service time of the next version the user signs. Nothing is delivered on its own to get a time, since the signer never uses its own clock for a cutoff. So until then, the earlier certificate isn't cut off. The alert tells the user to make a change, or to revoke the app, which cuts it off at once.

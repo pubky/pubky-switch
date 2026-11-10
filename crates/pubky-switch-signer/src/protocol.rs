@@ -326,8 +326,8 @@ impl Protocols {
     /// bundle functions take.
     ///
     /// A scope no registered protocol owns has no answer, and reads as `false` here. So before
-    /// making any bundle, callers check [`Protocols::unowned`] and refuse rather than leave a
-    /// key out.
+    /// making any bundle, callers check [`Protocols::unowned`] and make none for that app
+    /// rather than leave a key out.
     pub fn has_keys(&self, scope: &str) -> bool {
         self.owner(scope).is_some_and(|o| o.has_keys)
     }
