@@ -1427,3 +1427,130 @@ async fn test_app_at_a_signer_call_keeps_the_check_order() {
     assert_eq!((status, body["code"].as_str()), (403, Some("not_current")));
     replay.db.drop_database().await.expect("drop");
 }
+
+/// A batch of the phone's, with batch ID `[id; 16]`.
+fn phone_batch(id: u8, kinds: Vec<(Vec<Condition>, OpKind)>) -> Vec<SignedOp> {
+    let keys = vectors("keys.json");
+    let phone = app(&keys, "phone");
+    let key = ed25519_dalek::SigningKey::from_bytes(&hex32(&phone["signing_secret_hex"]));
+    let app_id = pubky_switch_core::enc::app_id_decode(phone["app_id"].as_str().expect("id"))
+        .expect("app id");
+    sign_batch(&key, &alice_key(), Some(app_id), 1, [id; 16], kinds).expect("batch")
+}
+
+fn document(name: &str) -> SignedDoc {
+    serde_json::from_value(named(&vectors("documents.json")["documents"], name)["signed"].clone())
+        .expect("document")
+}
+
+#[tokio::test]
+async fn test_claims_expired_owner_is_not_current_for_the_claim_rules() {
+    let Some(replay) = registered(Limits::default(), false).await else {
+        return;
+    };
+    // The phone registers; its certificate runs to 2027-01-01, the wallet's to 2026-12-01.
+    let register = phone_batch(
+        40,
+        vec![
+            (
+                Vec::new(),
+                OpKind::AppPut {
+                    record: document("phone app record"),
+                },
+            ),
+            (
+                Vec::new(),
+                OpKind::ReceiveKeyPut {
+                    record: document("phone receive key record"),
+                },
+            ),
+        ],
+    );
+    let (status, body) = post_app(&replay, "phone", &register, None, AT).await;
+    assert_eq!(status, 200, "{body}");
+    // The wallet opens an attempt that its age won't orphan.
+    let attempt = (
+        Vec::new(),
+        OpKind::Claim(ClaimFields {
+            claim_key: vec![9; 32],
+            kind: ClaimType::Attempt,
+            expected_step: 0,
+            attempt_id: vec![8; 16],
+            orphan_after: Some(1_000_000_000),
+            deadline: None,
+            basis: None,
+            evidence_ref: None,
+        }),
+    );
+    let (status, body) = post_app(
+        &replay,
+        "wallet",
+        &wallet_batch(41, 1, vec![attempt]),
+        None,
+        AT,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let failed = |id: u8| {
+        phone_batch(
+            id,
+            vec![(
+                Vec::new(),
+                OpKind::Claim(ClaimFields {
+                    claim_key: vec![9; 32],
+                    kind: ClaimType::Failed,
+                    expected_step: 1,
+                    attempt_id: vec![8; 16],
+                    orphan_after: None,
+                    deadline: None,
+                    basis: None,
+                    evidence_ref: None,
+                }),
+            )],
+        )
+    };
+    let view = |at: &'static str| {
+        let keys = vectors("keys.json");
+        let path = format!(
+            "/v1/{}/claims/{}",
+            alice_id(),
+            pubky_switch_core::enc::b64(&[9; 32])
+        );
+        app_request(app(&keys, "phone"), "GET", &path, Vec::new(), ms(at))
+    };
+    // While the owner is served, the attempt isn't orphaned, and another app can't fail it.
+    let (_, read, _) = answer_of(replay.service.handle(view(AT)).await);
+    assert_eq!(read["claim"]["attempts"][0]["orphaned"], false, "{read}");
+    let (status, body) = post_app(&replay, "phone", &failed(42), None, AT).await;
+    assert_eq!(status, 409, "{body}");
+    // Once the owner's certificate has expired it counts as not current for the claim rules
+    // (Switch spec 3.2, 10.2), though it is still current for retention: orphaned, and
+    // another app may fail it.
+    let later = "2026-12-01T00:00:10.000Z";
+    set_time(&replay.clock, later);
+    let (_, read, _) = answer_of(replay.service.handle(view(later)).await);
+    assert_eq!(read["claim"]["attempts"][0]["orphaned"], true, "{read}");
+    // So does the claim view a batch's unmet step condition answers with.
+    let unmet = phone_batch(
+        44,
+        vec![(
+            vec![Condition::ClaimStep {
+                claim_key: [9; 32],
+                step: 7,
+            }],
+            OpKind::AllowPut {
+                pubky: bob(),
+                kind: AllowKind::Contact,
+            },
+        )],
+    );
+    let (status, body) = post_app(&replay, "phone", &unmet, None, later).await;
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(
+        body["current"]["claim"]["attempts"][0]["orphaned"], true,
+        "{body}"
+    );
+    let (status, body) = post_app(&replay, "phone", &failed(43), None, later).await;
+    assert_eq!(status, 200, "{body}");
+    replay.db.drop_database().await.expect("drop");
+}

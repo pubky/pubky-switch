@@ -530,7 +530,7 @@ async fn test_apps_signature_covers_the_body_and_time() {
 }
 
 #[tokio::test]
-async fn test_apps_current_ends_with_the_certificate() {
+async fn test_apps_current_outlives_the_certificate() {
     let Some(replay) = replay().await else { return };
     replay_chain_through_revoke(&replay).await;
     let apps = body(&get_apps(&replay, "signer", &revoke_time()).await);
@@ -538,13 +538,15 @@ async fn test_apps_current_ends_with_the_certificate() {
         .as_str()
         .expect("expiry")
         .to_string();
-    // At its certificate's expiry the wallet is no longer current.
+    // At its certificate's expiry the wallet is still current (spec 3.4): listed and
+    // neither revoked nor departed, so a renewal brings it back. `cert_expires_at` shows
+    // the lapse.
     set_time(&replay.clock, &expires);
     let apps = body(&get_apps(&replay, "signer", &expires).await);
     let wallet = status(&apps, "wallet");
     assert_eq!(
         (wallet["current"].clone(), wallet["cert_expires_at"].clone()),
-        (json!(false), json!(expires))
+        (json!(true), json!(expires))
     );
     replay.db.drop_database().await.expect("drop");
 }
