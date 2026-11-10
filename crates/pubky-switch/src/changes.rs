@@ -75,6 +75,9 @@ impl ChangeHub {
 /// The database's change notifications, forwarded to a [`ChangeHub`].
 pub struct ChangeListener {
     listener: sqlx::postgres::PgListener,
+    /// The listener's own one-connection pool, apart from the request pool, so it holds
+    /// none of the requests' connections at any pool size.
+    _pool: sqlx::PgPool,
 }
 
 impl std::fmt::Debug for ChangeListener {
@@ -86,9 +89,16 @@ impl std::fmt::Debug for ChangeListener {
 impl ChangeListener {
     /// Connect and listen. Once this returns, every later change is seen.
     pub async fn connect(store: &Store) -> Result<Self, StoreError> {
-        let mut listener = sqlx::postgres::PgListener::connect_with(store.pool()).await?;
+        let options = (*store.pool().connect_options()).clone();
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect_lazy_with(options);
+        let mut listener = sqlx::postgres::PgListener::connect_with(&pool).await?;
         listener.listen(CHANNEL).await?;
-        Ok(Self { listener })
+        Ok(Self {
+            listener,
+            _pool: pool,
+        })
     }
 
     /// Forward notifications to `hub` until `shutdown` resolves. A lost connection is

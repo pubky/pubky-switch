@@ -9,12 +9,15 @@
 //! (Switch wire 7.3 step 10).
 //!
 //! Served so far: `POST /v1/enroll`, `PUT /v1/{id}/identity`, the public
-//! `GET /v1/{id}/identity`, `POST /v1/{id}/ops`, `GET /v1/{id}/claims/{claim_key}` and
+//! `GET /v1/{id}/identity`, `POST /v1/{id}/ops`, `GET /v1/{id}/feed`,
+//! `GET /v1/{id}/claims/{claim_key}`, `GET /v1/{id}/apps` and
 //! `POST /v1/{id}/apps/{app_id}/revoke`. Every other call is answered `503 unavailable`.
 
+mod apps;
 pub mod batch;
 mod claims;
 mod enroll;
+mod feed;
 mod identity;
 pub mod rules;
 
@@ -27,11 +30,12 @@ use pubky_switch_core::{
     chain::SignedHead,
     enc::b64,
     http::{self as wire_http, RequestTarget, header},
-    records::IdentityDoc,
+    records::{AppCert, IdentityDoc},
     time::rfc3339,
 };
 
 use crate::{
+    changes::ChangeHub,
     http::{
         Handler, HandlerFuture, Refusal, SwitchRequest, SwitchResponse,
         error::{ApiError, ErrorCode, is_failed_authentication},
@@ -63,6 +67,7 @@ pub struct Service {
     reads_per_account: MinuteWindows<String>,
     operation_rate: KeyedMinutes<(String, [u8; 16])>,
     control_rate: KeyedMinutes<(String, [u8; 16])>,
+    changes: Arc<ChangeHub>,
 }
 
 impl std::fmt::Debug for Service {
@@ -81,8 +86,19 @@ struct Answer {
     head: Option<SignedHead>,
     retry_after: Option<u64>,
     cacheable: bool,
-    /// A `GET /claims` answer, whose body is built once the lock is gone.
-    claim_read: Option<claims::ClaimRead>,
+    /// Never cached: `Cache-Control: no-store`.
+    no_store: bool,
+    /// An answer whose body is read once the lock is gone.
+    deferred: Option<Deferred>,
+}
+
+/// A read whose answer is built once the request's lock is gone.
+#[derive(Debug)]
+enum Deferred {
+    /// A `GET /claims` answer's entries.
+    Claim(claims::ClaimRead),
+    /// A feed page, after its long-poll.
+    Feed(Box<feed::FeedRead>),
 }
 
 impl Answer {
@@ -93,7 +109,8 @@ impl Answer {
             head: None,
             retry_after: None,
             cacheable: false,
-            claim_read: None,
+            no_store: false,
+            deferred: None,
         }
     }
 
@@ -104,7 +121,8 @@ impl Answer {
             head: None,
             retry_after: error.retry_after,
             cacheable: false,
-            claim_read: None,
+            no_store: false,
+            deferred: None,
         }
     }
 
@@ -166,6 +184,9 @@ fn sign_answer(
     if answer.cacheable {
         put("cache-control", "public, max-age=60".into());
     }
+    if answer.no_store {
+        put("cache-control", "no-store".into());
+    }
     SwitchResponse {
         status: answer.status,
         headers,
@@ -209,7 +230,14 @@ impl Service {
             reads_per_account: MinuteWindows::default(),
             operation_rate: KeyedMinutes::default(),
             control_rate: KeyedMinutes::default(),
+            changes: ChangeHub::new(),
         }
+    }
+
+    /// The hub that wakes waiting feed reads. Run a [`crate::changes::ChangeListener`]
+    /// into it, so changes made by any instance wake them.
+    pub fn changes(&self) -> Arc<ChangeHub> {
+        self.changes.clone()
     }
 
     /// The failed-authentication counts, for monitoring.
@@ -293,17 +321,25 @@ impl Service {
             }
             Call::PutIdentity => {
                 match self.authenticate_signer(&account, &request, base_ms).await {
-                    Ok(claimed) => Some(claimed),
+                    Ok((claimed, app)) => {
+                        verified = app;
+                        Some(claimed)
+                    }
                     Err(error) => return refused_early(error).await,
                 }
             }
             // The signer is verified here; an own app under the lock, with the key the
             // account holds for it (Switch wire 7.2).
-            Call::Revoke(_) => match self.authenticate_signer(&account, &request, base_ms).await {
-                Ok(claimed) => Some(claimed),
-                Err(error) => return refused_early(error).await,
-            },
-            Call::Ops | Call::GetClaim(_) => {
+            Call::Revoke(_) | Call::GetApps => {
+                match self.authenticate_signer(&account, &request, base_ms).await {
+                    Ok((claimed, app)) => {
+                        verified = app;
+                        Some(claimed)
+                    }
+                    Err(error) => return refused_early(error).await,
+                }
+            }
+            Call::Ops | Call::GetClaim(_) | Call::Feed => {
                 match self.authenticate_caller(&account, &request, base_ms) {
                     Ok(claimed) => {
                         // An own app's request is verified here too, so nothing unverified
@@ -397,7 +433,7 @@ impl Service {
         account: &str,
         request: &SwitchRequest,
         base_ms: u64,
-    ) -> Result<Claimed, ApiError> {
+    ) -> Result<(Claimed, Option<batch::VerifiedApp>), ApiError> {
         if let Err(retry_after) = self.failed_auth.check(request.source, base_ms) {
             return Err(ApiError::rate_limited(
                 "9.4: too many failed authentications from this network source",
@@ -413,17 +449,71 @@ impl Service {
                     self.record_failure(request, account.to_string());
                 }
             })?;
-        if let Caller::OwnApp(app) = &claimed.caller {
-            let error = self
-                .refuse_app_at_signer_call(account, request, &claimed, app, base_ms)
-                .await;
-            if is_failed_authentication(error.code) {
-                self.record_failure(request, account.to_string());
+        match &claimed.caller {
+            // Verified as at its own calls, then refused under the lock, where the refusal
+            // carries the head like every refusal to a verified own app (Switch wire 7.1).
+            Caller::OwnApp(app) => {
+                let verified = self
+                    .verify_own_app(account, request, &claimed, app, false, base_ms)
+                    .await
+                    .inspect_err(|error| {
+                        if is_failed_authentication(error.code) {
+                            self.record_failure(request, account.to_string());
+                        }
+                    })?;
+                Ok((claimed, Some(verified)))
             }
-            return Err(error);
+            // Its certificate first, in 7.2's order (`400`, `401`), then the refusal.
+            Caller::OtherApp { app, .. } => {
+                self.verify_other_app(request, &claimed, app)
+                    .inspect_err(|error| {
+                        if is_failed_authentication(error.code) {
+                            self.record_failure(request, account.to_string());
+                        }
+                    })?;
+                rules::require_signer(&claimed.caller)?;
+                Ok((claimed, None))
+            }
+            Caller::Signer => Ok((claimed, None)),
         }
-        rules::require_signer(&claimed.caller)?;
-        Ok(claimed)
+    }
+
+    /// Verify an app of another identity by the certificate it sends (Switch wire 7.2):
+    /// `Switch-Cert` present (`400`), verifying for `Switch-Identity` and naming
+    /// `Switch-App` (`401 bad_signature`), and the request signed with its key (`401`).
+    fn verify_other_app(
+        &self,
+        request: &SwitchRequest,
+        claimed: &Claimed,
+        app: &str,
+    ) -> Result<AppCert, ApiError> {
+        let bad = |why: &'static str| ApiError::new(ErrorCode::BadSignature, why);
+        let text = claimed.headers.cert.as_deref().ok_or_else(|| {
+            ApiError::bad_request("7.2: an app of another identity sends Switch-Cert")
+        })?;
+        let signed = pubky_switch_core::sig::SignedDoc::from_compact(text)
+            .map_err(|_| bad("7.2: Switch-Cert isn't a signed certificate"))?;
+        let cert = AppCert::verify(&signed, &claimed.identity_key)
+            .map_err(|_| bad("7.2: Switch-Cert doesn't verify for Switch-Identity"))?;
+        let named = pubky_switch_core::enc::app_id_decode(app)
+            .map_err(|_| bad("7.2: Switch-Cert doesn't name Switch-App"))?;
+        if cert.app_id() != named {
+            return Err(bad("7.2: Switch-Cert doesn't name Switch-App"));
+        }
+        let target = RequestTarget {
+            method: &request.method,
+            path_and_query: &request.path_and_query,
+            body: &request.body,
+            origin: &self.origin,
+        };
+        wire_http::verify_request(
+            &cert.signing_key(),
+            &target,
+            &claimed.headers,
+            &claimed.signature,
+        )
+        .map_err(|_| bad("7.1: the request signature doesn't verify"))?;
+        Ok(cert)
     }
 
     /// The public read's limits (Switch wire 9.4), before the account's lock: per network
@@ -542,6 +632,14 @@ impl Service {
                 (Answer::error(&error).with_head(head), serving)
             }
         };
+        // A read answered once the lock is gone answers a refusal with the head this request
+        // commits, as every refusal to a verified caller carries one (Switch wire 7.1).
+        let txn_account = txn.head().id.clone();
+        let fallback_head = if answer.deferred.is_some() {
+            self.head(&txn, &signer).await
+        } else {
+            None
+        };
         // Durable, then answered (step 10). An answer is sent even when the request only
         // stamped the time, which must be durable before it is shown. A serving account's
         // commit moves the key's mark to the head the answer carries.
@@ -560,11 +658,40 @@ impl Service {
         match committed {
             Ok(()) => {
                 let mut answer = answer;
-                if let Some(read) = answer.claim_read.take() {
-                    match self.claim_body(&read).await {
+                match answer.deferred.take() {
+                    Some(Deferred::Claim(read)) => match self.claim_body(&read).await {
                         Ok(body) => answer.body = body,
-                        Err(error) => answer = Answer::error(&error),
+                        Err(error) => answer = Answer::error(&error).with_head(fallback_head),
+                    },
+                    Some(Deferred::Feed(read)) => {
+                        return match self.feed_page(&read, &signer).await {
+                            Ok((page, at)) => sign_answer(&signer, signature, at, page),
+                            // Erased while the read waited: as an unknown account (step 2).
+                            Err(feed::FeedStop::Gone) => {
+                                let error = ApiError::not_found("no such account");
+                                self.operator_answer(signature, base_ms, &error).await
+                            }
+                            // Its key retired while the read waited: never signed with it.
+                            Err(feed::FeedStop::Retired) => {
+                                let error = ApiError::unavailable("7.6: a temporary failure");
+                                self.operator_answer(signature, base_ms, &error).await
+                            }
+                            Err(feed::FeedStop::Refused(refusal)) => {
+                                // Every 401 counts against the network source (9.4).
+                                if is_failed_authentication(refusal.error.code) {
+                                    self.record_failure(request, txn_account.clone());
+                                }
+                                let head = if refusal.head { fallback_head } else { None };
+                                sign_answer(
+                                    &signer,
+                                    signature,
+                                    refusal.time_ms,
+                                    Answer::error(&refusal.error).with_head(head),
+                                )
+                            }
+                        };
                     }
+                    None => {}
                 }
                 sign_answer(&signer, signature, time_ms, answer)
             }
@@ -656,6 +783,17 @@ impl Service {
             Ok(writer) => writer,
             Err(error) => return Err(stop(error)),
         };
+        // A call only the signer makes, from an own app that verified: refused with the head
+        // (Switch wire 7.4, 7.1).
+        if writer.is_some() && matches!(call, Call::PutIdentity | Call::Revoke(_) | Call::GetApps) {
+            return Err(Refused::with_head(
+                ApiError::new(
+                    ErrorCode::PermissionMissing,
+                    "7.4: a call only the signer may make",
+                ),
+                serving,
+            ));
+        }
         // Step 7: the staged gate. Step 9: the endpoint.
         staged_gate(call, !serving).map_err(|error| Refused::with_head(error, serving))?;
         if *call == Call::Ops {
@@ -689,6 +827,27 @@ impl Service {
                         time_ms,
                     )
                     .await
+                    .map(|answer| (answer, serving))
+                    .map_err(|error| Refused::with_head(error, serving));
+            }
+            Call::GetApps => {
+                return self
+                    .get_apps(txn, signer, held.as_ref(), time_ms)
+                    .await
+                    .map(|answer| (answer, serving))
+                    .map_err(|error| Refused::with_head(error, serving));
+            }
+            Call::Feed => {
+                let head = txn.head();
+                return self
+                    .feed(
+                        &head.id,
+                        head.identity_key,
+                        &head.service_key,
+                        writer.as_ref(),
+                        &request.route.query,
+                        time_ms,
+                    )
                     .map(|answer| (answer, serving))
                     .map_err(|error| Refused::with_head(error, serving));
             }
@@ -735,6 +894,13 @@ impl Service {
                 }
             })?;
         if let Caller::OtherApp { .. } = claimed.caller {
+            // The feed is for own apps only (Switch wire 7.4.4).
+            if request.route.call == Call::Feed {
+                return Err(ApiError::new(
+                    ErrorCode::PermissionMissing,
+                    "7.4.4: only own apps read the feed",
+                ));
+            }
             return Err(ApiError::new(
                 ErrorCode::NotAdmitted,
                 "6.4: an app of another identity doesn't write here",
