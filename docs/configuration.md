@@ -151,11 +151,11 @@ PostgreSQL.
 | Setting | Default | Meaning |
 |---|---|---|
 | `url` | none | the connection URL; `PUBKY_SWITCH_DATABASE_URL` overrides it, and keeps the password out of the file |
-| `max_connections` | `16` | most connections in the pool |
+| `max_connections` | `16` | most connections in the request pool. Each instance also opens one more, outside the pool, for the change listener that wakes feed long-polls: size PostgreSQL's `max_connections` for `instances × (max_connections + 1)` |
 | `acquire_timeout_ms` | `5000` | how long a request waits for a free connection |
 | `lock_timeout_ms` | `10000` | how long a request waits for its account's lock before it gives up with `503 unavailable` |
 | `migrate_on_start` | `true` | apply pending schema migrations at start; safe with several instances |
-| `connect_retry_ms` | `30000` | how long the service keeps trying to reach the database at start, while it refuses connections or is still starting up, before it exits |
+| `connect_retry_ms` | `30000` | how long the service keeps trying to reach the database at start, while it refuses connections or is still starting up, before it exits. It covers the request pool only: the change listener connects once the pool is up, without this retry, and a failure there stops the service |
 
 **Migrations on a large database.** Each migration runs in one transaction, and some take exclusive locks for their duration. `0008_feed` backfills every operation's proof into `chain_items` and builds two indexes without `CONCURRENTLY`, so `chain_items`, `shared_records` and `claim_entries` take no writes until it finishes, and since its `ALTER TABLE` holds an exclusive lock on `chain_items` until it commits, feed reads wait for it too. It is sized for a small database. On a large one, run it in a maintenance window, with `migrate_on_start` off on every instance but one.
 

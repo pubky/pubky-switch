@@ -495,22 +495,26 @@ fn rfc3339_of(text: &str) -> String {
 async fn test_feed_refuses_an_app_of_another_identity() {
     let Some(replay) = replay().await else { return };
     replay_chain_through_revoke(&replay).await;
-    let keys = vectors("keys.json");
-    let shop = app(&keys, "shop");
-    let key = ed25519_dalek::SigningKey::from_bytes(&hex32(&shop["signing_secret_hex"]));
-    let request = signed_request(
-        &key,
-        shop["identity"].as_str().expect("identity"),
-        Some(shop["app_id"].as_str().expect("app")),
-        "GET",
-        &format!("/v1/{}/feed", alice_id()),
-        Vec::new(),
-        ms(&revoke_time()),
-    );
+    let path = format!("/v1/{}/feed", alice_id());
+    let at = ms(&revoke_time());
+    // Authenticated first, by its certificate (Switch wire 7.2), then refused: the feed is
+    // for own apps (7.4.4).
+    let request = other_request("shop", ORIGIN, "GET", &path, Vec::new(), None, at);
     let answer = replay.service.handle(request).await;
     assert_eq!(
         (answer.status, body(&answer)["code"].clone()),
         (403, json!("permission_missing"))
+    );
+    assert!(header_text(&answer, header::HEAD).is_none());
+    let mut request = other_request("shop", ORIGIN, "GET", &path, Vec::new(), None, at);
+    request.headers.remove("switch-cert");
+    assert_eq!(replay.service.handle(request).await.status, 400);
+    // At POST /ops, likewise: its certificate, then 403 not_admitted.
+    let ops = format!("/v1/{}/ops", alice_id());
+    let request = other_request("shop", ORIGIN, "POST", &ops, b"{}".to_vec(), None, at);
+    assert_eq!(
+        body(&replay.service.handle(request).await)["code"],
+        json!("not_admitted")
     );
     replay.db.drop_database().await.expect("drop");
 }
@@ -810,6 +814,117 @@ async fn test_feed_401_from_the_page_check_counts_as_a_failed_authentication() {
             .failed_authentications()
             .claimed(&claimed, ms(&at)),
         1
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_feed_refusal_after_a_wait_is_never_signed_earlier_than_a_read() {
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let (stop, task) = listen(&replay).await;
+    let at = revoke_time();
+    let later = ms(&at) + 30_000;
+    // The wait reads once at its own time, again after a commit stamped 30 s later, then
+    // its last read fails: the refusal is signed at the later time, not the request's.
+    let (answer, ()) = tokio::join!(read(&replay, "wallet", "?after=1:9&wait=1", &at), async {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        sql(
+            &replay,
+            &format!("UPDATE accounts SET stamped_time_ms = {later} WHERE id = $1"),
+        )
+        .await;
+        sql(&replay, "SELECT pg_notify('pubky_switch_changes', $1)").await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        sql(&replay, "UPDATE accounts SET last_seq = 10 WHERE id = $1").await;
+        sql(
+            &replay,
+            "ALTER TABLE chain_items RENAME TO chain_items_gone",
+        )
+        .await;
+    });
+    assert_eq!(
+        answer.status,
+        503,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    assert_eq!(
+        header_text(&answer, header::SERVER_TIME),
+        Some(pubky_switch_core::time::rfc3339(later).as_str())
+    );
+    let _ = stop.send(());
+    task.await.expect("listener");
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_feed_page_check_runs_the_apps_checks_before_the_staged_gate() {
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let at = revoke_time();
+    let keys = vectors("keys.json");
+    let wallet = hex::decode(
+        app(&keys, "wallet")["app_id_bytes_hex"]
+            .as_str()
+            .expect("hex"),
+    )
+    .expect("hex");
+    // During the wait the wallet is revoked and the account moves away: a new request would
+    // get 403 not_current (7.3 step 5) before 503 staged (step 7), and so does the page.
+    let v3: SignedDoc = serde_json::from_value(
+        named(
+            &vectors("documents.json")["documents"],
+            "alice identity.json",
+        )["signed"]
+            .clone(),
+    )
+    .expect("v3");
+    let mut moved: pubky_switch_core::records::IdentityBody =
+        serde_json::from_slice(&v3.body_bytes().expect("body")).expect("body");
+    moved.version = 4;
+    moved.inbox.url = "https://other.example".into();
+    let key = pubky_switch_core::keys::IdentityKey::from_secret(hex32(
+        &alice(&vectors("keys.json"))["secret_hex"],
+    ));
+    let moved = pubky_switch_core::records::IdentityDoc::sign(&key, moved)
+        .expect("sign")
+        .signed()
+        .clone();
+    let delivery = pubky_switch_core::http::IdentityDelivery {
+        identity: moved,
+        prev: Some(v3.doc_hash().expect("hash")),
+    }
+    .to_json();
+    let path = format!("/v1/{}/identity", alice_id());
+    let (answer, ()) = tokio::join!(read(&replay, "wallet", "?after=1:9&wait=1", &at), async {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+            .await
+            .expect("conn");
+        sqlx::query(
+            "INSERT INTO kept_app_ids (account_id, app_id, reason, at_ms) \
+             VALUES ($1, $2, 'revoked', 0)",
+        )
+        .bind(alice_id())
+        .bind(wallet.as_slice())
+        .execute(&mut conn)
+        .await
+        .expect("revoked");
+        let delivered = replay
+            .service
+            .handle(signer_request("PUT", &path, delivery, ms(&at)))
+            .await;
+        assert_eq!(
+            delivered.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&delivered.body)
+        );
+    });
+    assert_eq!(
+        (answer.status, body(&answer)["code"].clone()),
+        (403, json!("not_current"))
     );
     replay.db.drop_database().await.expect("drop");
 }
