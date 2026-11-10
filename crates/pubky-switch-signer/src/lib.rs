@@ -23,5 +23,7 @@ pub mod key;
 pub mod protocol;
 
 pub use error::{Refusal, Result, SignerError};
-pub use key::{ExportReason, IdentityKeyring, IdentitySecret, KeyError, SecretVault, VaultError};
+pub use key::{
+    AddOutcome, ExportReason, IdentityKeyring, IdentitySecret, KeyError, SecretVault, VaultError,
+};
 pub use protocol::{GrantPath, Protocol, ProtocolError, Protocols, ScopeDef, ScopeTerms};
