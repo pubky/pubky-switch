@@ -1009,3 +1009,49 @@ async fn test_take_over_refuses_a_vault_holding_another_secret() {
     assert!(!holds_records(&store).await);
     assert_eq!(puts(&world, "/identity"), sends);
 }
+
+#[tokio::test]
+async fn test_hand_over_successor_lost_before_publishing_restores_from_its_backup() {
+    // The new signer won, wrote its backup, and was lost before publishing. The old install
+    // keeps the key and signs nothing; an install with the key restores from the new
+    // signer's backup on a fresh store and signs from then on.
+    let world = World::new();
+    let mut s = setup(&world).await;
+    s.old.hand_over_to(s.app_id(), confirmed()).await.unwrap();
+    *world.homeserver.failing_path.lock().unwrap() = Some(IDENTITY_PATH.to_owned());
+    let new = Signer::receive_hand_over(
+        world.env(Arc::new(MemoryStore::new())),
+        &s.target,
+        empty_vault(),
+    )
+    .await;
+    assert!(new.is_err(), "the publication failed");
+    drop(new);
+    *world.homeserver.failing_path.lock().unwrap() = None;
+    let won = world.switch.identity_doc().unwrap();
+    assert_eq!(world.backup().identity_doc().signed(), won.signed());
+    assert_eq!(
+        s.old.resume().await.unwrap_err(),
+        SignerError::Refused(Refusal::SuccessorUnpublished {
+            install: won.body().signer
+        })
+    );
+    assert_eq!(
+        s.old.restore(confirmed()).await.unwrap_err(),
+        SignerError::Refused(Refusal::HandingOver { to_app: s.app_id() })
+    );
+    assert!(vault_holds(&world.vault));
+    let restored = Signer::restore_new(
+        world.env(Arc::new(MemoryStore::new())),
+        world.keyring(),
+        confirmed(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(restored.status(), SignerStatus::Signing);
+    assert_eq!(
+        restored.identity_doc().unwrap().unwrap().version(),
+        won.version() + 1
+    );
+    world.assert_no_version_sent_twice();
+}
