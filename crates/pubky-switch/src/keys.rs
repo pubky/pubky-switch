@@ -200,7 +200,8 @@ pub type KeyFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, KeyStoreError>
 
 /// Holds the service keys, their marks and the erasure ledger.
 ///
-/// Every write is durable when its future resolves.
+/// Every write is durable when its future resolves. A write runs to its end, in order with
+/// the store's other writes, even if its caller stops waiting.
 pub trait KeyStore: Send + Sync {
     /// Generate a new service key.
     fn generate(&self) -> KeyFuture<'_, ServiceKey>;
@@ -311,8 +312,21 @@ struct Inner {
     root: PathBuf,
     keys: Mutex<HashMap<KeyId, Arc<SigningKey>>>,
     marks: Mutex<HashMap<KeyId, Option<Mark>>>,
-    /// Serializes mark updates, so that two advances can't both read the old mark.
-    mark_writes: tokio::sync::Mutex<()>,
+    /// Held around every read-check-write of a mark, a deletion and an erasure record,
+    /// inside the blocking task that does it. A caller that stops waiting can't release it
+    /// early: the task runs to its end, so writes land in the order they were checked.
+    writes: Mutex<()>,
+    /// Pauses a mark write before it lands, for tests.
+    #[cfg(test)]
+    pause: Mutex<Option<PauseGate>>,
+}
+
+/// Pauses the mark write for `seq` once: it says so on `paused`, then waits on `release`.
+#[cfg(test)]
+struct PauseGate {
+    seq: u64,
+    paused: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
 }
 
 impl std::fmt::Debug for FileKeyStore {
@@ -335,7 +349,9 @@ impl FileKeyStore {
                 root,
                 keys: Mutex::new(HashMap::new()),
                 marks: Mutex::new(HashMap::new()),
-                mark_writes: tokio::sync::Mutex::new(()),
+                writes: Mutex::new(()),
+                #[cfg(test)]
+                pause: Mutex::new(None),
             }),
         })
     }
@@ -419,7 +435,69 @@ impl Inner {
         Ok(ServiceKey { id, public })
     }
 
+    fn advance_mark_sync(&self, id: &KeyId, head: Mark) -> Result<MarkCheck, KeyStoreError> {
+        let _writes = self.writes.lock();
+        // A mark is only meaningful with its key.
+        self.load_key(id)?;
+        let current = self.load_mark(id)?;
+        let check = check_mark(current.as_ref(), &head);
+        match check {
+            MarkCheck::Behind => Ok(check),
+            MarkCheck::Current if current == Some(head) => Ok(check),
+            MarkCheck::Unmarked | MarkCheck::Current => {
+                #[cfg(test)]
+                self.pause_before_write(head.seq);
+                let bytes = serde_json::to_vec(&head)
+                    .map_err(|error| KeyStoreError::Corrupt(error.to_string()))?;
+                write_atomic(&self.mark_path(id), &bytes, false)?;
+                self.marks.lock().insert(id.clone(), Some(head));
+                Ok(check)
+            }
+            MarkCheck::Fork | MarkCheck::OtherGeneration => Err(KeyStoreError::Refused(check)),
+        }
+    }
+
+    #[cfg(test)]
+    fn pause_before_write(&self, seq: u64) {
+        let gate = {
+            let mut pause = self.pause.lock();
+            if pause.as_ref().is_some_and(|gate| gate.seq == seq) {
+                pause.take()
+            } else {
+                None
+            }
+        };
+        if let Some(gate) = gate {
+            let _ = gate.paused.send(());
+            let _ = gate.release.recv();
+        }
+    }
+
+    fn read_erasure(path: &Path) -> Result<Option<u64>, KeyStoreError> {
+        match fs::read_to_string(path) {
+            Ok(text) => text
+                .trim()
+                .parse::<u64>()
+                .map(Some)
+                .map_err(|error| KeyStoreError::Corrupt(format!("erasure: {error}"))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Keep the latest erasure time: an account created before it is erased again after a
+    /// restore (Switch spec 6.5), so an older time must never replace a newer one.
+    fn record_erasure_sync(&self, identity: &str, erased_at_ms: u64) -> Result<(), KeyStoreError> {
+        let path = self.erasure_path(identity)?;
+        let _writes = self.writes.lock();
+        if Self::read_erasure(&path)?.is_some_and(|recorded| recorded >= erased_at_ms) {
+            return Ok(());
+        }
+        write_atomic(&path, erased_at_ms.to_string().as_bytes(), false)
+    }
+
     fn delete_sync(&self, id: &KeyId) -> Result<(), KeyStoreError> {
+        let _writes = self.writes.lock();
         // The key goes first: a key whose mark is gone could sign behind it, while a mark
         // without its key signs nothing.
         for path in [self.key_path(id), self.mark_path(id)] {
@@ -481,58 +559,28 @@ impl KeyStore for FileKeyStore {
     }
 
     fn advance_mark<'a>(&'a self, id: &'a KeyId, head: Mark) -> KeyFuture<'a, MarkCheck> {
-        Box::pin(async move {
-            let _write = self.inner.mark_writes.lock().await;
-            let current = self.mark(id).await?;
-            let check = check_mark(current.as_ref(), &head);
-            match check {
-                MarkCheck::Behind => Ok(check),
-                MarkCheck::Current if current == Some(head) => Ok(check),
-                MarkCheck::Unmarked | MarkCheck::Current => {
-                    let store = self.inner.clone();
-                    let id = id.clone();
-                    blocking(move || {
-                        let bytes = serde_json::to_vec(&head)
-                            .map_err(|error| KeyStoreError::Corrupt(error.to_string()))?;
-                        write_atomic(&store.mark_path(&id), &bytes, false)?;
-                        store.marks.lock().insert(id, Some(head));
-                        Ok(())
-                    })
-                    .await?;
-                    Ok(check)
-                }
-                MarkCheck::Fork | MarkCheck::OtherGeneration => Err(KeyStoreError::Refused(check)),
-            }
-        })
+        let store = self.inner.clone();
+        let id = id.clone();
+        Box::pin(blocking(move || store.advance_mark_sync(&id, head)))
     }
 
     fn delete<'a>(&'a self, id: &'a KeyId) -> KeyFuture<'a, ()> {
-        Box::pin(async move {
-            let _write = self.inner.mark_writes.lock().await;
-            let store = self.inner.clone();
-            let id = id.clone();
-            blocking(move || store.delete_sync(&id)).await
-        })
+        let store = self.inner.clone();
+        let id = id.clone();
+        Box::pin(blocking(move || store.delete_sync(&id)))
     }
 
     fn record_erasure<'a>(&'a self, identity: &'a str, erased_at_ms: u64) -> KeyFuture<'a, ()> {
-        let path = self.inner.erasure_path(identity);
+        let store = self.inner.clone();
+        let identity = identity.to_string();
         Box::pin(blocking(move || {
-            write_atomic(&path?, erased_at_ms.to_string().as_bytes(), false)
+            store.record_erasure_sync(&identity, erased_at_ms)
         }))
     }
 
     fn erasure<'a>(&'a self, identity: &'a str) -> KeyFuture<'a, Option<u64>> {
         let path = self.inner.erasure_path(identity);
-        Box::pin(blocking(move || match fs::read_to_string(path?) {
-            Ok(text) => text
-                .trim()
-                .parse::<u64>()
-                .map(Some)
-                .map_err(|error| KeyStoreError::Corrupt(format!("erasure: {error}"))),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error.into()),
-        }))
+        Box::pin(blocking(move || Inner::read_erasure(&path?)))
     }
 }
 
@@ -699,6 +747,64 @@ mod tests {
             .expect("older");
         assert_eq!(check, MarkCheck::Behind);
         assert_eq!(store.mark(&key.id).await.expect("mark"), Some(mark(7, 2)));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_key_store_cancelled_advance_keeps_marks_in_order() {
+        let (dir, store) = open();
+        let key = store.generate().await.expect("generate");
+        let (paused_tx, paused) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        *store.inner.pause.lock() = Some(PauseGate {
+            seq: 1001,
+            paused: paused_tx,
+            release: release_rx,
+        });
+
+        // The write for 1001 pauses before it lands, and its caller is cancelled.
+        let first = tokio::spawn({
+            let (store, id) = (store.clone(), key.id.clone());
+            async move { store.advance_mark(&id, mark(1001, 1)).await }
+        });
+        tokio::task::spawn_blocking(move || paused.recv())
+            .await
+            .expect("join")
+            .expect("the write paused");
+        first.abort();
+        assert!(first.await.expect_err("cancelled").is_cancelled());
+
+        // 1002 waits behind the write still running for 1001.
+        let second = tokio::spawn({
+            let (store, id) = (store.clone(), key.id.clone());
+            async move { store.advance_mark(&id, mark(1002, 2)).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!second.is_finished(), "serialized behind the paused write");
+        release.send(()).expect("release");
+        assert_eq!(
+            second.await.expect("join").expect("advance"),
+            MarkCheck::Current
+        );
+
+        drop(store);
+        let store = FileKeyStore::open(dir.path()).expect("reopen");
+        assert_eq!(
+            store.mark(&key.id).await.expect("mark"),
+            Some(mark(1002, 2))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_key_store_erasure_ledger_keeps_the_latest_time() {
+        let (dir, store) = open();
+        let identity = "6frao8w9ss5cn544qd64hynikrbr97ae1s5941c7ma5e1epifhgy";
+        store.record_erasure(identity, 2_000).await.expect("record");
+        // An older erasure landing after a newer one doesn't take the ledger back.
+        store.record_erasure(identity, 1_000).await.expect("record");
+        let store = FileKeyStore::open(dir.path()).expect("reopen");
+        assert_eq!(store.erasure(identity).await.expect("read"), Some(2_000));
+        store.record_erasure(identity, 3_000).await.expect("record");
+        assert_eq!(store.erasure(identity).await.expect("read"), Some(3_000));
     }
 
     #[tokio::test]
