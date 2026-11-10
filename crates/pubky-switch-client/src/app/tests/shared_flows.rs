@@ -15,8 +15,9 @@ use serde_json::{Map, json};
 
 use super::*;
 use crate::app::{
-    Alarm, AppError, AppEvent, ClaimOp, Collection, Delivery, ObligationDeadline, OpBatch,
-    OutgoingMessage, RecordContent, RecordJob, RecordTarget, Refusal, SentMessage, claim_conflict,
+    Alarm, AppError, AppEvent, ClaimOp, Collection, Delivery, IdentityRefresh, ObligationDeadline,
+    OpBatch, OutgoingMessage, RecordContent, RecordJob, RecordTarget, Refusal, SentMessage,
+    claim_conflict,
 };
 use crate::store::StoreHandle;
 use crate::store::{Fault as StoreFault, FaultStore};
@@ -76,6 +77,10 @@ impl Protocol for ItemsProtocol {
             kinds.push("sample.resend".into());
         }
         kinds
+    }
+
+    fn check_body(&self, message: &ReceivedMessage) -> Result<(), String> {
+        self.sample.check_body(message)
     }
 
     fn receive(&self, message: &ReceivedMessage) -> Outcome {
@@ -649,7 +654,10 @@ async fn test_send_own_identity_goes_to_recent_peers_after_a_removal() {
             distrust_from: START,
         })
     });
-    assert!(app.refresh_identity().await.unwrap());
+    assert!(matches!(
+        app.refresh_identity().await.unwrap(),
+        crate::app::IdentityRefresh::Newer { .. }
+    ));
     app.flush_outbox().await.unwrap();
     assert_eq!(
         s.peer.lock().peers[&s.w.alice.public()].version(),
@@ -1113,20 +1121,29 @@ async fn test_records_write_by_a_removed_app_after_distrust_is_flagged() {
         .await
         .unwrap();
     phone.receive(None).await.unwrap();
-    // The signer removes the wallet, distrusted from an hour ago; its later write has no
-    // standing.
+    // The signer removes the wallet, distrusted from an hour ago, and publishes the document
+    // before the switch takes it: the wallet's write the switch still accepts has no
+    // standing for the phone, which read the document first.
     let me = wallet.app_id();
-    s.w.next_doc(|body| {
-        body.apps.retain(|app| app.app_id != me);
-        body.removed.push(RemovedApp {
-            app_id: me,
-            distrust_from: START - HOUR,
-        })
-    });
+    let doc =
+        s.w.signer
+            .sign_next(|body| {
+                body.apps.retain(|app| app.app_id != me);
+                body.removed.push(RemovedApp {
+                    app_id: me,
+                    distrust_from: START - HOUR,
+                })
+            })
+            .unwrap();
     wallet
         .put_record(&target, &value(&["a", "z"]), vec![])
         .await
         .unwrap();
+    assert!(matches!(
+        phone.refresh_identity().await.unwrap(),
+        IdentityRefresh::Newer { .. }
+    ));
+    s.w.switch.deliver_identity(&doc).unwrap();
     phone.receive(None).await.unwrap();
     let key = phone.record_key(&target).unwrap();
     let held = phone.shared_record(&key).await.unwrap().unwrap();
@@ -1820,7 +1837,10 @@ async fn test_send_unreachable_peer_doesnt_hold_up_the_others() {
             distrust_from: START,
         })
     });
-    assert!(app.refresh_identity().await.unwrap());
+    assert!(matches!(
+        app.refresh_identity().await.unwrap(),
+        crate::app::IdentityRefresh::Newer { .. }
+    ));
     app.flush_outbox().await.unwrap();
     assert_eq!(
         s.peer.lock().peers[&s.w.alice.public()].version(),

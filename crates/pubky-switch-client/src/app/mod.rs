@@ -64,7 +64,7 @@ pub use chain::{HELD_MARKS, STUBS_KEPT_FOR_MS};
 pub use error::{Alarm, AppError, Refusal};
 pub use events::{AppEvent, ParkReason};
 pub use feed::ReceiveReport;
-pub use identity::{DOC_CACHE_MS, HomeserverReader};
+pub use identity::{DOC_CACHE_MS, HomeserverReader, IdentityRefresh, REVALIDATION_MS};
 pub use peek::{PeekReport, Peeked};
 pub use protocol::{
     Effect, LocalWrite, MAX_CLAIM_READS, MissedEntries, Need, OpaqueRule, Outcome, Protocol,
@@ -409,6 +409,8 @@ pub struct App {
     reload: bool,
     /// The service time record changed and goes with the next commit.
     service_time_dirty: bool,
+    /// The last Homeserver read that confirmed the own `identity.json`; kept in memory only.
+    identity_confirmed: Option<identity::Confirmed>,
     events: Vec<AppEvent>,
 }
 
@@ -558,6 +560,7 @@ impl App {
                 client,
                 reload: false,
                 service_time_dirty: false,
+                identity_confirmed: None,
                 events: Vec::new(),
             };
             app.update_keys_through();
@@ -672,6 +675,7 @@ impl App {
                 client,
                 reload: false,
                 service_time_dirty: false,
+                identity_confirmed: None,
                 events: Vec::new(),
             })
         })
@@ -921,6 +925,7 @@ impl App {
                 client,
                 reload: false,
                 service_time_dirty: false,
+                identity_confirmed: None,
                 events: Vec::new(),
             };
             let mut tx = Tx::new(&app.ns);

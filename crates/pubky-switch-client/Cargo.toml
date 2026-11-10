@@ -11,7 +11,7 @@ publish.workspace = true
 [features]
 default = ["http"]
 # The HTTPS transport on reqwest and rustls, with the public-address resolver.
-http = ["dep:reqwest", "dep:tokio", "tokio?/net"]
+http = ["dep:reqwest", "dep:tokio", "dep:url", "tokio?/net"]
 # Runs each `StateStore` call through `tokio::task::spawn_blocking`, so a slow host store never
 # blocks the async executor.
 tokio = ["dep:tokio", "tokio?/rt"]
@@ -30,6 +30,7 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, optional = true }
+url = { workspace = true, optional = true }
 
 [dev-dependencies]
 blake3.workspace = true

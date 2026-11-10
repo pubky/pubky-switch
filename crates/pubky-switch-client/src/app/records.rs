@@ -40,7 +40,7 @@ use super::batch::OpBatch;
 use super::error::{Alarm, Refusal};
 use super::events::AppEvent;
 use super::state::{Tx, key};
-use super::{App, AppError};
+use super::{App, AppError, IdentityRefresh};
 use crate::client::answers::{ChainItem, SharedRecordView};
 use crate::error::ClientError;
 
@@ -881,7 +881,12 @@ impl App {
         // Step 4: standing at the write's time.
         let mut doubtful = false;
         let mut standing = self.state.own_doc.standing(&writer, &cert.hash());
-        if standing == Standing::None && self.refresh_identity().await.unwrap_or(false) {
+        if standing == Standing::None
+            && matches!(
+                self.refresh_identity().await,
+                Ok(IdentityRefresh::Newer { .. })
+            )
+        {
             standing = self.state.own_doc.standing(&writer, &cert.hash());
         }
         match standing {

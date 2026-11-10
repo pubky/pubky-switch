@@ -115,6 +115,15 @@ impl Protocol for ApiProtocol {
         self.items.accepts(cert)
     }
 
+    /// The plain mode receives as [`ItemsProtocol`] does; the others take any body.
+    fn check_body(&self, message: &ReceivedMessage) -> Result<(), String> {
+        if *self.mode.lock().unwrap() == Mode::Plain {
+            self.items.check_body(message)
+        } else {
+            Ok(())
+        }
+    }
+
     fn receive(&self, message: &ReceivedMessage) -> Outcome {
         self.items.receive(message)
     }

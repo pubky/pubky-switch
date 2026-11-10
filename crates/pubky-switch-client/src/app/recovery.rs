@@ -47,6 +47,7 @@ use super::chain::ChainView;
 use super::context::LocalView;
 use super::error::{AppError, Refusal};
 use super::events::AppEvent;
+use super::identity::REVALIDATION_MS;
 use super::protocol::LocalWrite;
 use super::state::{Cursor, HeldKey, KnownKid, RestoreState, key};
 use crate::client::Batch;
@@ -57,7 +58,7 @@ use crate::error::{ClientError, StoreError};
 /// service, before the offset between the two services' clocks: the 60 seconds an app trusts
 /// its own `identity.json` before an attempt, plus the clock tolerance (Switch spec 12.6,
 /// "Residual risk").
-pub const RESIDUAL_WINDOW_MS: u64 = 60_000 + CLOCK_TOLERANCE_MS;
+pub const RESIDUAL_WINDOW_MS: u64 = REVALIDATION_MS + CLOCK_TOLERANCE_MS;
 
 /// The keys of this file's records (`STATE.md`, "Moves, recovery and push").
 pub(crate) mod keys {

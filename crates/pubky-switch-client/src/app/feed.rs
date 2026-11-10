@@ -551,8 +551,9 @@ impl App {
         self.apply(entry, received, parked, read).await
     }
 
-    /// The protocol's check 10 and effect, at most twice after a conflict: the records and
-    /// claims the effect wrote are read again before the second try (Switch spec 8.2, 10.3).
+    /// The protocol's check 10, then its effect, at most twice after a conflict: the records
+    /// and claims the effect wrote are read again before the second try (Switch spec 8.2,
+    /// 10.3).
     async fn apply(
         &mut self,
         entry: &Entry,
@@ -572,6 +573,10 @@ impl App {
             parked,
             conflict: None,
         };
+        if let Err(reason) = self.protocol.check_body(&message) {
+            self.note_processed(entry, &received, &[], parked, read)?;
+            return Ok(self.dropped(entry.seq, 10, reason));
+        }
         let mut tries = 0usize;
         let mut keys_fetched = false;
         // The claims read from the switch at the step's request, for this entry.
@@ -1380,28 +1385,6 @@ impl App {
         (doc.generation() != self.state.meta.generation).then(|| AppEvent::ProviderChanged {
             generation: doc.generation(),
         })
-    }
-
-    /// Read the own `identity.json` from the Homeserver and take it if newer (Switch spec
-    /// 4.3): the app calls this when the Homeserver's event stream names the document, and
-    /// after waking. Returns whether a newer copy was taken.
-    ///
-    /// # Errors
-    ///
-    /// The alarm a copy raises (equivocation, a removed app listed again); a failed read.
-    pub async fn refresh_identity(&mut self) -> Result<bool, AppError> {
-        Box::pin(async move {
-            self.ready_local().await?;
-            self.refuse_when_stopped()?;
-            let identity = self.state.meta.identity;
-            let Some(doc) =
-                identity::read_homeserver(self.env.homeserver.as_ref(), &identity).await?
-            else {
-                return Ok(false);
-            };
-            self.take_own_copy(doc).await
-        })
-        .await
     }
 
     /// Take an own copy outside the feed and commit what it changed.

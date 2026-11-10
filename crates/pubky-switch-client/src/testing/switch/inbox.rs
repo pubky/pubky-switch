@@ -3,7 +3,8 @@
 //! the inbox, with its retry by content, `identity_needed`, `stale_key` and invite codes
 //! (Switch spec 7; Switch wire 7.4.3, 7.4.5, 7.4.7, 7.4.10). Own apps append to it too, for
 //! the kinds their protocol sends between own apps. It checks what a sender relies on, and
-//! nothing the service alone answers for, such as rate limits and quotas.
+//! nothing the service alone answers for, such as rate limits and quotas; `FAKES.md` lists
+//! what it leaves out.
 
 use std::collections::BTreeSet;
 
@@ -12,7 +13,7 @@ use pubky_switch_core::enc::{app_id_decode, b64, pubky_key, unb64_array, zbase32
 use pubky_switch_core::envelope::parse_header;
 use pubky_switch_core::http::{ErrorCode, header};
 use pubky_switch_core::ident::invite_code_hash;
-use pubky_switch_core::ops::{AllowKind, OpKind};
+use pubky_switch_core::ops::AllowKind;
 use pubky_switch_core::records::{AppCert, IdentityDoc};
 use pubky_switch_core::sig::SignedDoc;
 use pubky_switch_core::time::rfc3339;
@@ -135,29 +136,12 @@ impl Inner {
             .map_or(Value::Null, |doc| json!(doc.version()))
     }
 
-    /// The allowlist and deny list, from the operations applied (Switch spec 7):
-    /// whether `pubky` is a contact or has a conversation entry, and whether it is denied.
+    /// The allowlist and deny list (Switch spec 7): whether `pubky` is a contact or has a
+    /// conversation entry, an app's or the service's, and whether it is denied.
     fn listed(&self, pubky: &[u8; 32]) -> (bool, bool) {
-        let mut contact = false;
-        let mut conversation = false;
-        let mut denied = false;
-        for op in &self.applied {
-            match &op.body().kind {
-                OpKind::AllowPut { pubky: p, kind } if p == pubky => match kind {
-                    AllowKind::Contact => contact = true,
-                    AllowKind::Conversation => conversation = true,
-                },
-                OpKind::AllowDelete { pubky: p, kind } if p == pubky => match kind {
-                    AllowKind::Contact => contact = false,
-                    AllowKind::Conversation => conversation = false,
-                },
-                OpKind::DenyPut { pubky: p } if p == pubky => denied = true,
-                OpKind::DenyDelete { pubky: p } if p == pubky => denied = false,
-                _ => {}
-            }
-        }
-        let service = self.shared.service_conversations.contains_key(pubky);
-        (contact || conversation || service, denied)
+        let listed = self.shared.allowed(pubky, AllowKind::Contact)
+            || self.shared.allowed(pubky, AllowKind::Conversation);
+        (listed, self.shared.denied(pubky))
     }
 
     /// The invite code `sender` presents, when it is live: its hash.
@@ -416,8 +400,10 @@ impl Inner {
             invite.uses = invite.uses.saturating_add(1);
             context = Some(invite.context.clone());
             let invite_context = invite.context.clone();
-            self.shared.service_conversations.insert(identity, hash);
             let at = self.now();
+            self.shared
+                .service_conversations
+                .insert(identity, (hash, at));
             self.service_transition(ServiceTransition::ConversationAdd {
                 pubky: identity,
                 code_hash: hash,

@@ -4,8 +4,9 @@
 //! without their side effects: the envelope opens with a held receive key; the signature
 //! and certificate; the sender app current in a copy of the sender identity's
 //! `identity.json` at most 10 minutes old and not marked as equivocating; the kind's
-//! scopes; the message not processed already, which it only looks up; and the page's chain,
-//! checked on a copy of the app's chain view. A message that passes is shown; one already
+//! scopes; the message not processed already, which it only looks up; the protocol's body
+//! check, without the effect (Switch wire 5.1 check 10); and the page's chain, checked on a
+//! copy of the app's chain view. A message that passes is shown; one already
 //! processed shows nothing; anything else, or every message after the app found itself
 //! compromised, shows a generic notification.
 //!
@@ -26,7 +27,7 @@ use pubky_switch_core::records::IdentityDoc;
 use super::App;
 use super::error::{AppError, Refusal};
 use super::identity::{self, DOC_CACHE_MS};
-use super::protocol::Rules;
+use super::protocol::{ReceivedMessage, Rules};
 use super::state::{Processed, key};
 use crate::client::answers::{EntryItem, FeedItem, FeedQuery};
 
@@ -193,10 +194,25 @@ impl App {
         if processed.is_some() {
             return Ok(None);
         }
+        let message = ReceivedMessage {
+            seq: entry.seq,
+            sender: entry.sender,
+            accepted_at_ms: entry.accepted_at,
+            message: received.message,
+            plaintext: received.plaintext,
+            cert: received.cert,
+            standing: received.standing,
+            context: entry.context.clone(),
+            parked: false,
+            conflict: None,
+        };
+        if protocol.check_body(&message).is_err() {
+            return generic;
+        }
         Ok(Some(Peeked::Show {
             seq: entry.seq,
             sender: entry.sender,
-            message: Box::new(received.message),
+            message: Box::new(message.message),
         }))
     }
 

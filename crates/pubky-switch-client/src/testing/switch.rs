@@ -1,7 +1,6 @@
 //! The scripted switch: one account, its chain, feed and directory, answering with answers
-//! signed by the account's service key, built from the core's types. It checks what the app
-//! layer relies on (receive key numbers, record times, batch retries by ID) and nothing
-//! else.
+//! signed by the account's service key, built from the core's types. Batches go through the
+//! core's rules (`batch`); `FAKES.md` lists what it leaves out.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -18,10 +17,14 @@ use pubky_switch_core::http::{
 };
 use pubky_switch_core::keys::{AppKeys, IdentityKey};
 use pubky_switch_core::message::{Message, MessagePlaintext, Sender};
-use pubky_switch_core::ops::{BatchRef, OpKind, OpsRequest, Position, SignedOp, sign_batch};
-use pubky_switch_core::records::{AppCert, BundlePart, Freeze, IdentityDoc};
+use pubky_switch_core::ops::{
+    BatchRecord, BatchRef, KeyBundlePut, OpKind, OpsRequest, Position, SignedOp, random_batch_id,
+    sign_batch,
+};
+use pubky_switch_core::records::{AppCert, Freeze, IdentityDoc};
 use pubky_switch_core::sig::SignedDoc;
-use pubky_switch_core::time::{parse_rfc3339, rfc3339};
+use pubky_switch_core::signing::Signs;
+use pubky_switch_core::time::rfc3339;
 use serde_json::{Map, Value, json};
 
 use super::ScriptError;
@@ -29,6 +32,7 @@ use crate::clock::{Clock, TestClock};
 use crate::error::TransportError;
 use crate::transport::{Header, MockTransport, Request, Response};
 
+mod batch;
 mod inbox;
 mod shared;
 
@@ -109,6 +113,8 @@ pub struct SwitchApp {
     pub record: Option<SignedDoc>,
     /// The certificate of that record, verified.
     pub cert: Option<AppCert>,
+    /// The renewed certificate a `cert.put` stored, verified.
+    pub renewed: Option<AppCert>,
     /// The current receive key record (signed).
     pub receive_key: Option<SignedDoc>,
     /// The current receive key's number `n`.
@@ -158,8 +164,13 @@ pub(crate) struct Inner {
     pub(crate) tips: Vec<ChainTip>,
     pub(crate) doc: Option<IdentityDoc>,
     pub(crate) apps: BTreeMap<[u8; 16], SwitchApp>,
-    pub(crate) bundles: BTreeMap<[u8; 16], Vec<(BundlePart, u64)>>,
-    pub(crate) answered: HashMap<[u8; 16], Value>,
+    /// The key bundle parts stored for each app, with the `seq` of each.
+    pub(crate) bundles: BTreeMap<[u8; 16], Vec<(KeyBundlePut, u64)>>,
+    /// Every kid an app of the account registered (Switch spec 3.6), with the app it
+    /// belongs to.
+    pub(crate) kids: BTreeMap<[u8; 8], [u8; 16]>,
+    /// The batch records by batch ID (Switch wire 6.4 step 5).
+    pub(crate) batches: HashMap<[u8; 16], BatchRecord>,
     pub(crate) checkpoint: Option<SignedHead>,
     /// Stubs at or below this `seq` are gone (dropped behind a checkpoint).
     pub(crate) dropped_through: u64,
@@ -203,8 +214,6 @@ pub(crate) struct Inner {
     pub(crate) apps_version: u64,
     /// The `apps_version` at which each reachable app became reachable.
     pub(crate) reachable_since: BTreeMap<[u8; 16], u64>,
-    /// The app each kid registered belongs to.
-    pub(crate) kids: HashMap<[u8; 8], [u8; 16]>,
     /// Every sender is admitted, whatever the lists say.
     pub(crate) open_admission: bool,
     /// The `directory_version`: it moves whenever the directory changes.
@@ -229,7 +238,8 @@ impl Inner {
             doc: None,
             apps: BTreeMap::new(),
             bundles: BTreeMap::new(),
-            answered: HashMap::new(),
+            kids: BTreeMap::new(),
+            batches: HashMap::new(),
             checkpoint: None,
             dropped_through: 0,
             faults: VecDeque::new(),
@@ -252,7 +262,6 @@ impl Inner {
             appended: HashMap::new(),
             apps_version: 1,
             reachable_since: BTreeMap::new(),
-            kids: HashMap::new(),
             open_admission: false,
             directory_version: 1,
         }
@@ -369,14 +378,23 @@ impl ScriptedSwitch {
         next.doc = inner.doc.clone();
         next.apps = inner.apps.clone();
         next.bundles = inner.bundles.clone();
+        next.kids = inner.kids.clone();
+        // Batch records travel without their proofs (Switch wire 10.1).
+        next.batches = inner
+            .batches
+            .iter()
+            .map(|(id, record)| {
+                let mut record = record.clone();
+                record.proofs = None;
+                (*id, record)
+            })
+            .collect();
         next.dropped_through = inner.dropped_through;
         next.staged = true;
-        // The import carries the shared state with the rest of the account.
         next.shared = inner.shared.clone();
         next.peers = inner.peers.clone();
         next.apps_version = inner.apps_version;
         next.reachable_since = inner.reachable_since.clone();
-        next.kids = inner.kids.clone();
         next.open_admission = inner.open_admission;
         next.directory_version = inner.directory_version;
         Arc::new(Self {
@@ -526,22 +544,12 @@ impl ScriptedSwitch {
                 None => {}
             }
         }
-        if inner.erased {
-            // Switch wire 7.4.16: an account the service doesn't host, signed with the
-            // operator key.
-            let operator = SigningKey::from_bytes(&[42; 32]);
-            let (status, body) = bad(ErrorCode::NotFound, "no such account", json!(null));
-            return Ok(inner.respond_with(&operator, request, status, &body));
-        }
-        let upload = request.method == "POST" && path.contains("recovery/upload");
-        if inner.staged && !upload {
-            let (status, body) = bad(ErrorCode::Staged, "staged", json!(null));
-            return Ok(inner.respond(request, status, &body));
-        }
-        if let Some(freeze) = inner.frozen.clone()
-            && frozen_refuses(&request.method, &path)
-        {
-            let (status, body) = bad(ErrorCode::Moved, "moved", json!({ "freeze": freeze }));
+        if let Some((status, body)) = inner.gate(&request.method, &path) {
+            if inner.erased {
+                // Switch wire 7.4.16: signed with the operator key.
+                let operator = SigningKey::from_bytes(&[42; 32]);
+                return Ok(inner.respond_with(&operator, request, status, &body));
+            }
             return Ok(inner.respond(request, status, &body));
         }
         let caller = request
@@ -560,9 +568,8 @@ impl ScriptedSwitch {
             return Ok(inner.respond(request, status, &body));
         }
         let answer = match inner.route_shared(request, caller, &rest) {
-            Ok(Some(answer)) => Ok(answer),
-            Ok(None) => inner.route(request, caller, &rest),
-            Err(error) => Err(error),
+            Some(answer) => Ok(answer),
+            None => inner.route(request, caller, &rest),
         };
         let (status, body) =
             answer.map_err(|error| TransportError::Other(format!("scripted switch: {error}")))?;
@@ -728,50 +735,105 @@ impl ScriptedSwitch {
         seq
     }
 
-    /// An operation of the signer (identity key, `app_id` null), in a batch of its own.
-    /// Returns the `seq` after it.
+    /// An operation of the signer (identity key, `app_id` null), in a batch of its own,
+    /// applied as a submitted batch is. Returns the `seq` after it.
     ///
     /// # Errors
     ///
-    /// When the batch doesn't sign or its proof doesn't build.
+    /// [`ScriptError::Refused`] with the switch's error answer, or a batch or proof that
+    /// doesn't sign.
     pub fn signer_op(&self, kind: OpKind) -> Result<u64, ScriptError> {
+        let key = clone_key(&self.lock().identity);
+        self.inject(&key, None, kind)
+    }
+
+    /// An operation an app with `keys` signs, in a batch of its own, applied as a submitted
+    /// batch is: for another device of an own app, or a copy of its key. The app must be
+    /// current at the switch, as [`super::TestSigner::register_app`] makes one. Returns the
+    /// `seq` after it.
+    ///
+    /// # Errors
+    ///
+    /// As [`ScriptedSwitch::signer_op`].
+    pub fn app_op(&self, keys: &AppKeys, kind: OpKind) -> Result<u64, ScriptError> {
+        self.inject(keys, Some(keys.app_id_bytes()), kind)
+    }
+
+    fn inject(
+        &self,
+        writer: &impl Signs,
+        app_id: Option<[u8; 16]>,
+        kind: OpKind,
+    ) -> Result<u64, ScriptError> {
         let mut inner = self.lock();
-        let key = clone_key(&inner.identity);
-        let account = key.public();
+        let account = inner.identity.public();
+        let path = format!("/v1/{}/ops", pubky_id(&account));
         let ops = sign_batch(
-            &key,
+            writer,
             &account,
-            None,
+            app_id,
             inner.tip.generation,
-            pubky_switch_core::ops::random_batch_id()?,
+            random_batch_id()?,
             vec![(vec![], kind)],
         )?;
-        inner.apply_ops(None, &ops)?;
+        let signed: Vec<SignedDoc> = ops.iter().map(|op| op.signed().clone()).collect();
+        let (status, body) = match inner.gate("POST", &path) {
+            Some(answer) => answer,
+            None => inner.submit(app_id, &signed, None)?,
+        };
+        if status != 200 {
+            return Err(ScriptError::Refused { status, body });
+        }
         Ok(inner.seq)
     }
 
-    /// An operation an app with `keys` signs, applied as the switch would. Returns the
-    /// `seq` after it, or `Ok(Err(body))` with the error body the switch refuses it with.
-    ///
-    /// # Errors
-    ///
-    /// When the batch doesn't sign or its proof doesn't build.
-    pub fn app_op(&self, keys: &AppKeys, kind: OpKind) -> Result<Result<u64, Value>, ScriptError> {
+    /// Chain an operation without checking it, as a faulty service does, and store a key
+    /// bundle part it carries; nothing else is applied. For tests of what an app does with
+    /// an item a compliant switch refuses.
+    #[cfg(test)]
+    pub(crate) fn chain_unchecked(
+        &self,
+        writer: &impl Signs,
+        app_id: Option<[u8; 16]>,
+        kind: OpKind,
+    ) -> Result<u64, ScriptError> {
         let mut inner = self.lock();
         let account = inner.identity.public();
+        let generation = inner.tip.generation;
+        let only_for = match &kind {
+            OpKind::KeyBundlePut(put) => Some(put.target_app_id),
+            _ => None,
+        };
         let ops = sign_batch(
-            keys,
+            writer,
             &account,
-            Some(keys.app_id_bytes()),
-            inner.tip.generation,
-            pubky_switch_core::ops::random_batch_id()?,
+            app_id,
+            generation,
+            random_batch_id()?,
             vec![(vec![], kind)],
         )?;
-        if let Some((_, body)) = inner.check_ops(Some(keys.app_id_bytes()), &ops) {
-            return Ok(Err(body));
+        for op in &ops {
+            let body = op.body();
+            if let OpKind::KeyBundlePut(put) = &body.kind {
+                let seq = inner.seq + 1;
+                let parts = inner.bundles.entry(put.target_app_id).or_default();
+                parts.push((put.clone(), seq));
+            }
+            let object = body
+                .kind
+                .proof_object(body.app_id.as_ref())
+                .ok_or_else(|| missing("an operation without a proof object"))?;
+            inner.chain_item(
+                ItemType::Op,
+                op.signed().clone(),
+                op.item_hash()?,
+                Some(body.batch),
+                &object,
+                &ProofState::Deny { denied: false },
+                only_for,
+            )?;
         }
-        inner.apply_ops(Some(keys.app_id_bytes()), &ops)?;
-        Ok(Ok(inner.seq))
+        Ok(inner.seq)
     }
 
     /// Roll the chain back to `seq`: everything after it is gone, and the tip is as it was.
@@ -909,149 +971,23 @@ impl Inner {
         self.chain_item(ItemType::Service, signed, hash, None, &object, &state, None)
     }
 
-    /// The refusal the switch gives a batch, if any.
-    fn check_ops(&self, caller: Option<[u8; 16]>, ops: &[SignedOp]) -> Option<Answer> {
-        if let Some(app) = caller
-            && self.apps.get(&app).is_some_and(|a| a.departed)
-        {
-            return Some(bad(ErrorCode::NotCurrent, "departed", json!({})));
+    /// The answer an account gives every call `method` `path` makes, before routing: an
+    /// erased account's `404`, a staged account's `503 staged` (but for uploads), and a
+    /// frozen account's `410 moved` for writes.
+    fn gate(&self, method: &str, path: &str) -> Option<Answer> {
+        if self.erased {
+            return Some(bad(ErrorCode::NotFound, "no such account", json!(null)));
         }
-        for op in ops {
-            match &op.body().kind {
-                OpKind::ReceiveKeyPut { record } => {
-                    let app = caller?;
-                    let value: Value = record.peek().ok()?;
-                    let n = value["n"].as_u64()?;
-                    let held = self.apps.get(&app).cloned().unwrap_or_default();
-                    if held.receive_key.as_ref() == Some(record) {
-                        continue;
-                    }
-                    let expected = held.receive_n.map_or(0, |c| c + 1);
-                    let first = held.receive_n.is_none() && self.any_first_n;
-                    if n != expected && !first {
-                        return Some(bad(
-                            ErrorCode::Conflict,
-                            "receive key number",
-                            json!({ "receive_key": held.receive_key }),
-                        ));
-                    }
-                }
-                OpKind::AppPut { record } => {
-                    let app = caller?;
-                    let held = self.apps.get(&app).cloned().unwrap_or_default();
-                    if let Some(old) = &held.record
-                        && old != record
-                    {
-                        let time = |doc: &SignedDoc| {
-                            let v: Value = doc.peek().ok()?;
-                            parse_rfc3339(v["updated_at"].as_str()?).ok()
-                        };
-                        if time(record) <= time(old) {
-                            return Some(bad(
-                                ErrorCode::Conflict,
-                                "updated_at",
-                                json!({ "record": old }),
-                            ));
-                        }
-                    }
-                }
-                _ => {}
-            }
+        let upload = method == "POST" && path.contains("recovery/upload");
+        if self.staged && !upload {
+            return Some(bad(ErrorCode::Staged, "staged", json!(null)));
+        }
+        if let Some(freeze) = &self.frozen
+            && frozen_refuses(method, path)
+        {
+            return Some(bad(ErrorCode::Moved, "moved", json!({ "freeze": freeze })));
         }
         None
-    }
-
-    fn apply_ops(
-        &mut self,
-        caller: Option<[u8; 16]>,
-        ops: &[SignedOp],
-    ) -> Result<Vec<SignedDoc>, ScriptError> {
-        let mut proofs = Vec::new();
-        for op in ops {
-            let body = op.body();
-            let hash = op.item_hash()?;
-            let object = body
-                .kind
-                .proof_object(body.app_id.as_ref())
-                .ok_or_else(|| missing("an operation without a proof object"))?;
-            let mut only_for = None;
-            let state = match &body.kind {
-                OpKind::AppPut { record } => {
-                    let app = caller.ok_or_else(|| missing("app.put without an app"))?;
-                    let v: Value = record.peek()?;
-                    let cert = SignedDoc::from_strict_value(&v["cert"])?;
-                    let cert = AppCert::verify(&cert, &self.identity.public()).ok();
-                    let entry = self.apps.entry(app).or_default();
-                    entry.record = Some(record.clone());
-                    entry.cert = cert;
-                    self.directory_version += 1;
-                    ProofState::App { app_id: app }
-                }
-                OpKind::ReceiveKeyPut { record } => {
-                    let app = caller.ok_or_else(|| missing("receive_key.put without an app"))?;
-                    let v: Value = record.peek()?;
-                    let n = v["n"]
-                        .as_u64()
-                        .ok_or_else(|| missing("a receive key record without n"))?;
-                    let kid = unb64_array::<8>(
-                        v["kid"]
-                            .as_str()
-                            .ok_or_else(|| missing("a receive key record without kid"))?,
-                    )?;
-                    let entry = self.apps.entry(app).or_default();
-                    let first = entry.receive_key.is_none() && !entry.departed;
-                    entry.receive_key = Some(record.clone());
-                    entry.receive_n = Some(n);
-                    self.kids.insert(kid, app);
-                    self.directory_version += 1;
-                    if first {
-                        // The app becomes reachable (Switch wire 7.4.10).
-                        self.apps_version += 1;
-                        self.reachable_since.insert(app, self.apps_version);
-                    }
-                    ProofState::ReceiveKey { n, kid }
-                }
-                OpKind::KeyBundlePut(put) => {
-                    only_for = Some(put.target_app_id);
-                    let seq = self.seq + 1;
-                    let part = BundlePart {
-                        bundle: put.bundle.clone(),
-                        first_epoch: put.first_epoch,
-                        last_epoch: put.last_epoch,
-                    };
-                    let parts = self.bundles.entry(put.target_app_id).or_default();
-                    parts.retain(|(p, _)| {
-                        p.last_epoch < put.first_epoch || p.first_epoch > put.last_epoch
-                    });
-                    parts.push((part, seq));
-                    parts.sort_by_key(|(p, _)| p.first_epoch);
-                    if let Some(app) = self.apps.get_mut(&put.target_app_id) {
-                        app.full_requested = None;
-                    }
-                    ProofState::KeyBundle { bundle_seq: seq }
-                }
-                OpKind::CertPut { cert, .. } => ProofState::Cert {
-                    cert: cert.doc_hash()?,
-                },
-                OpKind::AllowPut { kind, .. } => ProofState::Allow {
-                    kind: *kind,
-                    present: true,
-                },
-                OpKind::DenyPut { .. } => ProofState::Deny { denied: true },
-                _ => ProofState::Deny { denied: false },
-            };
-            proofs.push(self.chain_item(
-                ItemType::Op,
-                op.signed().clone(),
-                hash,
-                Some(body.batch),
-                &object,
-                &state,
-                only_for,
-            )?);
-            self.applied.push(op.clone());
-        }
-        Ok(proofs)
     }
 
     fn route(
@@ -1141,51 +1077,14 @@ impl Inner {
         )
     }
 
+    /// `POST /ops` (Switch wire 6.4): the body read, then the batch handler.
     fn ops(&mut self, caller: Option<[u8; 16]>, body: &[u8]) -> Result<Answer, ScriptError> {
-        let Ok(request) = OpsRequest::parse(body) else {
-            return Ok(bad(ErrorCode::BadRequest, "ops", json!(null)));
+        let request = match OpsRequest::parse(body) {
+            Ok(request) => request,
+            Err(refusal) => return Ok(batch::refused(&refusal)),
         };
-        let Ok(ops) = request
-            .signed()
-            .map(SignedOp::peek)
-            .collect::<Result<Vec<SignedOp>, _>>()
-        else {
-            return Ok(bad(ErrorCode::BadRequest, "ops", json!(null)));
-        };
-        if let Some(id) = ops.first().map(|op| op.body().batch.id)
-            && let Some(answer) = self.answered.get(&id)
-        {
-            let mut answer = answer.clone();
-            answer["head"] = self.head().to_value();
-            return Ok((200, answer));
-        }
-        // Switch wire 6.4 step 6: an operation naming another generation, after the retry
-        // check.
-        let generation = self.tip.generation;
-        if ops.iter().any(|op| op.body().generation != generation) {
-            return Ok(bad(
-                ErrorCode::StaleGeneration,
-                "generation",
-                json!({ "generation": generation }),
-            ));
-        }
-        if let Some(refusal) = self.check_ops(caller, &ops) {
-            return Ok(refusal);
-        }
-        if let Some(app) = caller
-            && self.apps.get(&app).is_some_and(|a| a.departed)
-        {
-            return Ok(bad(ErrorCode::NotCurrent, "departed", json!({})));
-        }
-        let proofs = self.apply_ops(caller, &ops)?;
-        if let (Some(app), Some(position)) = (caller, request.cursor()) {
-            self.apps.entry(app).or_default().cursor = position.seq;
-        }
-        let answer = json!({ "proofs": proofs, "head": self.head().to_value() });
-        if let Some(op) = ops.first() {
-            self.answered.insert(op.body().batch.id, answer.clone());
-        }
-        Ok((200, answer))
+        let signed: Vec<SignedDoc> = request.signed().cloned().collect();
+        self.submit(caller, &signed, request.cursor())
     }
 
     fn feed(&mut self, caller: Option<[u8; 16]>, query: &str) -> Answer {

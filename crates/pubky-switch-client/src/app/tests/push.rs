@@ -420,6 +420,38 @@ async fn test_peek_without_a_fresh_sender_copy_is_generic() {
 }
 
 #[tokio::test]
+async fn test_peek_of_a_body_the_protocol_refuses_is_generic() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join(&w, &router).await;
+    let me = app.app_id();
+    w.note(me, "first");
+    app.receive(None).await.unwrap();
+    // Signed by bob's current app, with a number where the kind needs text.
+    let (seq, _) = w
+        .switch
+        .send(
+            &w.bob,
+            &w.bob_keys,
+            &w.bob_cert,
+            "sample.note",
+            json!({ "text": 42 }),
+            &[me],
+        )
+        .unwrap();
+    let before = snapshot(&w.store, &me);
+    let report = app.peek().await.unwrap();
+    assert_eq!(report.items, vec![Peeked::Generic { seq }]);
+    assert_eq!(snapshot(&w.store, &me), before);
+    // The read drops it at check 10, as the peek judged it.
+    let report = app.receive(None).await.unwrap();
+    assert!(has(&report.events, |e| matches!(
+        e,
+        AppEvent::MessageDropped { seq: s, check: 10, .. } if *s == seq
+    )));
+}
+
+#[tokio::test]
 async fn test_peek_of_a_processed_message_shows_nothing() {
     let w = World::new();
     let router = Router::of(&w);
@@ -442,13 +474,17 @@ async fn test_peek_on_a_chain_that_doesnt_verify_is_generic_and_raises_nothing()
     let router = Router::of(&w);
     let mut app = join(&w, &router).await;
     let me = app.app_id();
+    let phone = w.other_app("phone", &[Permission::ListsManage]);
     w.note(me, "first");
     app.receive(None).await.unwrap();
     let verified = w.switch.tip_seq();
     // The service rolls back its chain and forks it.
     w.switch.roll_back_to(verified - 1);
     w.switch
-        .signer_op(pubky_switch_core::ops::OpKind::DenyPut { pubky: [5; 32] })
+        .app_op(
+            &phone,
+            pubky_switch_core::ops::OpKind::DenyPut { pubky: [5; 32] },
+        )
         .unwrap();
     let seq = w.note(me, "second").0;
     let before = snapshot(&w.store, &me);

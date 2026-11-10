@@ -89,6 +89,13 @@ impl Protocol for NotesProtocol {
         }
     }
 
+    fn check_body(&self, message: &ReceivedMessage) -> Result<(), String> {
+        match message.message.body.get("text") {
+            Some(Value::String(_)) => Ok(()),
+            _ => Err("example: body.text isn't text".into()),
+        }
+    }
+
     fn receive_with(&self, message: &ReceivedMessage, cx: &mut ReceiveContext<'_>) -> Outcome {
         let Some(text) = message.message.body.get("text").and_then(Value::as_str) else {
             return Outcome::Drop {

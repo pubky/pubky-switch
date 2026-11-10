@@ -124,6 +124,11 @@ impl Protocol for ReadsProtocol {
         self.items.accepts(cert)
     }
 
+    /// The receive step reads no body member: every body passes.
+    fn check_body(&self, _message: &ReceivedMessage) -> Result<(), String> {
+        Ok(())
+    }
+
     fn receive_with(&self, message: &ReceivedMessage, cx: &mut ReceiveContext<'_>) -> Outcome {
         let mode = *self.mode.lock().unwrap();
         let claim_key = cx.blind(OBLIGATION);

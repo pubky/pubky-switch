@@ -1,29 +1,31 @@
 //! The scripted switch's shared state: shared records, claims, the lists, invite codes and
-//! connect requests, with their reads (Switch wire 6.2, 6.8, 7.4.6 to 7.4.9). The record and
-//! claim rules are the core's.
+//! connect requests, their reads (Switch wire 7.4.6 to 7.4.9), and the rules of their
+//! operations (Switch wire 6.2, 6.8), which are the core's.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-use pubky_switch_core::chain::{ItemType, ProofState};
+use pubky_switch_core::chain::ProofState;
 use pubky_switch_core::claims::{
-    Claim, ClaimLimits, ClaimTally, EntryContext, MAX_CLAIM_AGE_MS, apply_entry,
+    Claim, ClaimFields, ClaimLimits, ClaimTally, EntryContext, MAX_CLAIM_AGE_MS, apply_entry,
 };
 use pubky_switch_core::enc::{b64, pubky_id, unb64_array, zbase32_encode};
 use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::ops::{
-    AllowKind, ConditionState, OpKind, OpsRequest, RecordVersion, SignedOp, check_conditions,
+    AllowKind, ConditionState, InviteCodePut, MAX_INVITE_USES, RecordPut, RecordVersion, Refusal,
+    SignedOp, check_invite_code_put,
 };
+use pubky_switch_core::records::AppCert;
+use pubky_switch_core::scopes::Permission;
 use pubky_switch_core::shared::{RecordState, check_record_put};
 use pubky_switch_core::sig::SignedDoc;
 use pubky_switch_core::time::rfc3339;
 use serde_json::{Value, json};
 
-use super::{Answer, Inner, ScriptedSwitch, bad};
+use super::{Answer, Inner, ScriptedSwitch, SwitchApp, bad};
 use crate::clock::Clock;
-use crate::testing::ScriptError;
 use crate::transport::Request;
 
-/// A shared record as the switch holds it, with what its reads return (Switch wire 7.4.6).
+/// A shared record as the switch holds it, with what its reads return (Switch wire 7.4.9).
 #[derive(Clone, Debug)]
 pub struct HeldRecord {
     /// The record's state after its newest write.
@@ -38,15 +40,6 @@ pub struct HeldRecord {
     pub seq: u64,
 }
 
-/// One claim entry as `GET /claims` returns it.
-#[derive(Clone, Debug)]
-pub(crate) struct HeldEntry {
-    step: u64,
-    seq: u64,
-    op: SignedDoc,
-    proof: SignedDoc,
-}
-
 /// An invite code the switch holds (Switch spec 7).
 #[derive(Clone, Debug)]
 pub(crate) struct Invite {
@@ -57,16 +50,31 @@ pub(crate) struct Invite {
     pub(crate) context: Value,
 }
 
+/// One claim entry as `GET /claims` returns it.
+#[derive(Clone, Debug)]
+pub(crate) struct HeldEntry {
+    step: u64,
+    seq: u64,
+    op: SignedDoc,
+    proof: SignedDoc,
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Shared {
     pub(crate) records: BTreeMap<[u8; 32], HeldRecord>,
     pub(crate) claims: BTreeMap<[u8; 32], Claim>,
     entries: BTreeMap<[u8; 32], Vec<HeldEntry>>,
     pub(crate) connect: Vec<([u8; 32], u64)>,
+    /// By code hash.
     pub(crate) invites: BTreeMap<[u8; 32], Invite>,
-    /// Conversation entries the service wrote for senders an invite code admitted, with the
-    /// code's hash (Switch spec 7).
-    pub(crate) service_conversations: BTreeMap<[u8; 32], [u8; 32]>,
+    contacts: BTreeSet<[u8; 32]>,
+    /// By Pubky ID: the writer and the time of the entry.
+    conversations: BTreeMap<[u8; 32], ([u8; 16], u64)>,
+    /// Conversation entries the service wrote for senders an invite code admitted, by Pubky
+    /// ID: the code's hash and the time of the entry (Switch spec 7, Switch wire 6.5
+    /// `conversation.add`).
+    pub(crate) service_conversations: BTreeMap<[u8; 32], ([u8; 32], u64)>,
+    deny: BTreeSet<[u8; 32]>,
     /// Answer the next record read without its proof, as after a recovery upload.
     pub(crate) hide_proofs: bool,
     /// A faulty listing: every page names these two keys as `next` in turn, for the first
@@ -93,10 +101,39 @@ impl Shared {
     }
 }
 
-/// The state before a batch, for its conditions.
-struct Before<'a> {
-    shared: &'a Shared,
-    now: u64,
+/// What a shared operation is checked and applied with.
+pub(super) struct OpContext<'a> {
+    /// The writing app; `None` for the signer.
+    pub(super) writer: Option<[u8; 16]>,
+    /// The certificate the writer is checked against; `None` for the signer.
+    pub(super) cert: Option<&'a AppCert>,
+    /// The account's apps, for record views and claim views.
+    pub(super) apps: &'a BTreeMap<[u8; 16], SwitchApp>,
+    /// Whether an app is current (Switch spec 3.4).
+    pub(super) is_current: &'a dyn Fn(&[u8; 16]) -> bool,
+    /// The service time of the batch.
+    pub(super) now: u64,
+    /// The account's current data epoch.
+    pub(super) data_epoch: u64,
+}
+
+impl OpContext<'_> {
+    /// Whether the writer may read a record of `read_scope` (the signer reads everything).
+    fn may_read(&self, read_scope: &str) -> bool {
+        self.cert.is_none_or(|cert| cert.holds_scope(read_scope))
+    }
+
+    /// Whether the writer holds `claims.read`.
+    fn may_read_claims(&self) -> bool {
+        self.cert
+            .is_none_or(|cert| cert.has_permission(Permission::ClaimsRead))
+    }
+}
+
+/// The state before a batch, for its conditions (Switch wire 6.3).
+pub(super) struct Before<'a> {
+    pub(super) shared: &'a Shared,
+    pub(super) cx: &'a OpContext<'a>,
 }
 
 impl ConditionState for Before<'_> {
@@ -107,8 +144,11 @@ impl ConditionState for Before<'_> {
             .map_or(RecordVersion::NONE, |held| held.state.version)
     }
 
-    fn may_read_record(&self, _: &[u8; 32]) -> bool {
-        true
+    fn may_read_record(&self, key: &[u8; 32]) -> bool {
+        self.shared
+            .records
+            .get(key)
+            .is_none_or(|held| self.cx.may_read(&held.state.policy.read_scope))
     }
 
     fn claim_step(&self, claim_key: &[u8; 32]) -> u64 {
@@ -118,38 +158,257 @@ impl ConditionState for Before<'_> {
             .map_or(0, |claim| claim.step)
     }
 
-    fn claim_view(&self, _: &[u8; 32]) -> Option<Value> {
-        None
+    fn claim_view(&self, claim_key: &[u8; 32]) -> Option<Value> {
+        self.shared.claims.get(claim_key).map(|claim| {
+            claim
+                .view(claim_key, self.cx.now, self.cx.is_current)
+                .to_value()
+        })
     }
 
     fn may_read_claims(&self) -> bool {
-        true
+        self.cx.may_read_claims()
     }
 
     fn server_time(&self) -> u64 {
-        self.now
+        self.cx.now
     }
 }
 
-/// Whether a batch carries an operation of the shared state.
-fn shared_batch(ops: &[SignedOp]) -> bool {
-    ops.iter().any(|op| {
-        matches!(
-            op.body().kind,
-            OpKind::RecordPut(_)
-                | OpKind::Claim(_)
-                | OpKind::InviteCodePut(_)
-                | OpKind::InviteCodeDelete { .. }
-                | OpKind::DenyPut { .. }
-                | OpKind::DenyDelete { .. }
-                | OpKind::AllowPut { .. }
-                | OpKind::AllowDelete { .. }
-        )
-    })
+/// A record's view, as `GET /records` returns it (Switch wire 7.4.9).
+fn record_view(held: &HeldRecord, apps: &BTreeMap<[u8; 16], SwitchApp>, proof: bool) -> Value {
+    let cert = apps
+        .get(&held.writer)
+        .and_then(|app| app.cert.clone())
+        .map(|cert| cert.signed().clone());
+    let mut view = json!({
+        "key": b64(&held.state.key),
+        "collection": b64(&held.state.collection),
+        "read_scope": held.state.policy.read_scope,
+        "write_scopes": held.state.policy.write_scopes,
+        "generation": held.state.version.generation,
+        "version": held.state.version.version,
+        "seq": held.seq,
+        "deleted": held.state.deleted,
+        "writer": zbase32_encode(&held.writer),
+        "op": held.op,
+        "divergent": false,
+        "cert": cert,
+    });
+    if proof {
+        view["proof"] = json!(held.proof);
+    }
+    view
+}
+
+/// The rules of the shared operations, each against the state the earlier operations of its
+/// batch left. Records and claim entries are kept once their proof is signed, by
+/// [`Shared::record_written`] and [`Shared::claim_written`].
+impl Shared {
+    /// `record.put` (Switch wire 6.2, Switch spec 10.3), by [`check_record_put`].
+    pub(super) fn record_put(
+        &self,
+        put: &RecordPut,
+        cx: &OpContext<'_>,
+        generation: u64,
+        seq: u64,
+    ) -> Result<ProofState, Refusal> {
+        let held = self.records.get(&put.key);
+        let view = held.map(|h| record_view(h, cx.apps, true));
+        check_record_put(
+            put,
+            held.map(|h| &h.state),
+            cx.data_epoch,
+            cx.may_read(&put.policy.read_scope),
+            view.as_ref(),
+        )?;
+        Ok(ProofState::Record {
+            version: RecordVersion::new(generation, seq),
+            deleted: put.value_sealed.looks_like_delete(),
+        })
+    }
+
+    /// Keep a written record with its proof.
+    pub(super) fn record_written(&mut self, put: &RecordPut, written: Written<'_>) {
+        self.records.insert(
+            put.key,
+            HeldRecord {
+                state: RecordState::after(put, written.generation, written.seq),
+                op: written.op.signed().clone(),
+                proof: written.proof.clone(),
+                writer: written.writer,
+                seq: written.seq,
+            },
+        );
+    }
+
+    /// A claim entry (Switch wire 6.8), by [`apply_entry`] with the default limits.
+    pub(super) fn claim(
+        &mut self,
+        fields: &ClaimFields,
+        cx: &OpContext<'_>,
+    ) -> Result<ProofState, Refusal> {
+        let entry = fields.check()?;
+        let writer = cx.writer.unwrap_or_default();
+        let entry_cx = EntryContext {
+            writer,
+            now: cx.now,
+            can_read: cx.may_read_claims(),
+            is_current: cx.is_current,
+            limits: ClaimLimits::default(),
+            tally: ClaimTally::count(self.claims.values(), &writer),
+        };
+        let claim = apply_entry(self.claims.get(&entry.claim_key), &entry, &entry_cx)?;
+        let view = claim
+            .view(&entry.claim_key, cx.now, cx.is_current)
+            .to_value();
+        self.claims.insert(entry.claim_key, claim);
+        Ok(ProofState::Claim(view))
+    }
+
+    /// Keep a claim entry with its proof, for `GET /claims`.
+    pub(super) fn claim_written(&mut self, fields: &ClaimFields, written: Written<'_>) {
+        let Ok(entry) = fields.check() else {
+            return;
+        };
+        self.entries
+            .entry(entry.claim_key)
+            .or_default()
+            .push(HeldEntry {
+                step: fields.expected_step,
+                seq: written.seq,
+                op: written.op.signed().clone(),
+                proof: written.proof.clone(),
+            });
+    }
+
+    /// `invite_code.put` (Switch wire 6.2), by [`check_invite_code_put`].
+    pub(super) fn invite_code_put(
+        &mut self,
+        put: &InviteCodePut,
+        cx: &OpContext<'_>,
+    ) -> Result<ProofState, Refusal> {
+        check_invite_code_put(
+            put,
+            MAX_INVITE_USES,
+            self.invites.contains_key(&put.code_hash),
+        )?;
+        self.invites.insert(
+            put.code_hash,
+            Invite {
+                max_uses: put.max_uses,
+                uses: 0,
+                writer: cx.writer.unwrap_or_default(),
+                expires_at: put.expires_at,
+                context: put.context.clone(),
+            },
+        );
+        Ok(ProofState::InviteCodePut {
+            max_uses: put.max_uses,
+        })
+    }
+
+    /// `invite_code.delete` (Switch wire 6.2): the core has no rule for it that needs state;
+    /// a code that isn't registered is `404`.
+    pub(super) fn invite_code_delete(
+        &mut self,
+        code_hash: &[u8; 32],
+    ) -> Result<ProofState, Refusal> {
+        if self.invites.remove(code_hash).is_none() {
+            return Err(Refusal::new(
+                ErrorCode::NotFound,
+                "Switch wire 6.2: no such invite code",
+            ));
+        }
+        Ok(ProofState::InviteCodeDelete)
+    }
+
+    /// `allow.put` (Switch wire 6.2): the entry, and the sender's connect request goes
+    /// (Switch wire 7.4.7).
+    pub(super) fn allow_put(
+        &mut self,
+        pubky: &[u8; 32],
+        kind: AllowKind,
+        cx: &OpContext<'_>,
+    ) -> ProofState {
+        match kind {
+            AllowKind::Contact => {
+                self.contacts.insert(*pubky);
+            }
+            AllowKind::Conversation => {
+                self.conversations
+                    .entry(*pubky)
+                    .or_insert((cx.writer.unwrap_or_default(), cx.now));
+            }
+        }
+        self.connect.retain(|(p, _)| p != pubky);
+        ProofState::Allow {
+            kind,
+            present: true,
+        }
+    }
+
+    /// `allow.delete` (Switch wire 6.2); a conversation entry goes whoever wrote it.
+    pub(super) fn allow_delete(&mut self, pubky: &[u8; 32], kind: AllowKind) -> ProofState {
+        match kind {
+            AllowKind::Contact => self.contacts.remove(pubky),
+            AllowKind::Conversation => {
+                let service = self.service_conversations.remove(pubky).is_some();
+                self.conversations.remove(pubky).is_some() || service
+            }
+        };
+        ProofState::Allow {
+            kind,
+            present: false,
+        }
+    }
+
+    /// `deny.put` and `deny.delete` (Switch wire 6.2); a denial ends the connect request.
+    pub(super) fn deny(&mut self, pubky: &[u8; 32], denied: bool) -> ProofState {
+        if denied {
+            self.deny.insert(*pubky);
+            self.connect.retain(|(p, _)| p != pubky);
+        } else {
+            self.deny.remove(pubky);
+        }
+        ProofState::Deny { denied }
+    }
+
+    /// Whether a record's current write isn't a delete.
+    pub(super) fn record_live(&self, key: &[u8; 32]) -> bool {
+        self.records
+            .get(key)
+            .is_some_and(|held| !held.state.deleted)
+    }
+
+    /// Whether the allowlist holds the entry.
+    pub(super) fn allowed(&self, pubky: &[u8; 32], kind: AllowKind) -> bool {
+        match kind {
+            AllowKind::Contact => self.contacts.contains(pubky),
+            AllowKind::Conversation => {
+                self.conversations.contains_key(pubky)
+                    || self.service_conversations.contains_key(pubky)
+            }
+        }
+    }
+
+    /// Whether the deny list holds the Pubky ID.
+    pub(super) fn denied(&self, pubky: &[u8; 32]) -> bool {
+        self.deny.contains(pubky)
+    }
+}
+
+/// A written operation, once its proof is signed.
+pub(super) struct Written<'a> {
+    pub(super) op: &'a SignedOp,
+    pub(super) proof: &'a SignedDoc,
+    pub(super) writer: [u8; 16],
+    pub(super) generation: u64,
+    pub(super) seq: u64,
 }
 
 impl ScriptedSwitch {
-    /// A pending connect request from `pubky` (Switch wire 7.4.10).
+    /// A pending connect request from `pubky` (Switch wire 7.4.7).
     pub fn push_connect(&self, pubky: [u8; 32]) {
         let mut inner = self.lock();
         let now = inner.clock.now_ms();
@@ -173,30 +432,18 @@ impl ScriptedSwitch {
 }
 
 impl Inner {
-    /// The routes of the shared state; `None` for any other.
+    /// The reads of the shared state, for `caller` (`None` for the signer); `None` for any
+    /// other route.
     pub(super) fn route_shared(
         &mut self,
         request: &Request,
         caller: Option<[u8; 16]>,
         rest: &str,
-    ) -> Result<Option<Answer>, ScriptError> {
+    ) -> Option<Answer> {
         let (route, query) = rest.split_once('?').unwrap_or((rest, ""));
-        Ok(match (request.method.as_str(), route) {
-            ("POST", "ops") => {
-                let Ok(parsed) = OpsRequest::parse(&request.body) else {
-                    return Ok(None);
-                };
-                let ops: Vec<SignedOp> = parsed
-                    .signed()
-                    .filter_map(|signed| SignedOp::peek(signed).ok())
-                    .collect();
-                if !shared_batch(&ops) {
-                    return Ok(None);
-                }
-                Some(self.shared_ops(caller, &parsed, &ops)?)
-            }
+        Some(match (request.method.as_str(), route) {
             // A scripted answer, for a faulty service, takes precedence.
-            ("GET", "allow") if self.allow.is_none() => Some(self.allow_list()),
+            ("GET", "allow") if self.allow.is_none() => self.allow_list(),
             ("GET", "connect") => {
                 let requests: Vec<Value> = self
                     .shared
@@ -204,33 +451,28 @@ impl Inner {
                     .iter()
                     .map(|(pubky, at)| json!({ "pubky": pubky_id(pubky), "at": rfc3339(*at) }))
                     .collect();
-                Some((
+                (
                     200,
                     json!({ "requests": requests, "max_pending": 50, "full": false }),
-                ))
+                )
             }
             ("DELETE", r) if r.starts_with("connect/") => {
                 let id = r.trim_start_matches("connect/");
-                let Ok(pubky) = pubky_switch_core::enc::pubky_key(id) else {
-                    return Ok(None);
-                };
+                let pubky = pubky_switch_core::enc::pubky_key(id).ok()?;
                 let before = self.shared.connect.len();
                 self.shared.connect.retain(|(p, _)| *p != pubky);
                 if self.shared.connect.len() == before {
-                    return Ok(Some(bad(ErrorCode::NotFound, "no request", json!(null))));
+                    return Some(bad(ErrorCode::NotFound, "no request", json!(null)));
                 }
-                Some((200, json!({ "declined": id })))
+                (200, json!({ "declined": id }))
             }
             ("GET", "records") => {
-                let mut collection = None;
-                for pair in query.split('&') {
-                    if let Some(("collection", value)) = pair.split_once('=') {
-                        collection = unb64_array::<32>(value).ok();
-                    }
-                }
-                let Some(collection) = collection else {
-                    return Ok(None);
-                };
+                let collection = query
+                    .split('&')
+                    .find_map(|pair| match pair.split_once('=') {
+                        Some(("collection", value)) => unb64_array::<32>(value).ok(),
+                        _ => None,
+                    })?;
                 // The records the caller may read: its certificate holds the read scope, a
                 // name covering its sub-scopes (Switch wire 7.4.9).
                 let cert = caller
@@ -245,7 +487,7 @@ impl Inner {
                         cert.as_ref()
                             .is_none_or(|cert| cert.holds_scope(&held.state.policy.read_scope))
                     })
-                    .map(|held| self.view(held))
+                    .map(|held| record_view(held, &self.apps, !self.shared.hide_proofs))
                     .collect();
                 self.shared.listings += 1;
                 let next = match self.shared.alternate_next {
@@ -258,54 +500,24 @@ impl Inner {
                     }
                     _ => json!(null),
                 };
-                Some((
+                (
                     200,
                     json!({ "records": views, "seq": self.seq, "next": next }),
-                ))
+                )
             }
             ("GET", r) if r.starts_with("records/") => {
-                let Ok(key) = unb64_array::<32>(r.trim_start_matches("records/")) else {
-                    return Ok(None);
-                };
-                Some(match self.shared.records.get(&key) {
-                    Some(held) => (200, self.view(held)),
+                let key = unb64_array::<32>(r.trim_start_matches("records/")).ok()?;
+                match self.shared.records.get(&key) {
+                    Some(held) => (200, record_view(held, &self.apps, !self.shared.hide_proofs)),
                     None => bad(ErrorCode::NotFound, "no record", json!(null)),
-                })
+                }
             }
             ("GET", r) if r.starts_with("claims/") => {
-                let Ok(claim_key) = unb64_array::<32>(r.trim_start_matches("claims/")) else {
-                    return Ok(None);
-                };
-                Some(self.claim_answer(&claim_key))
+                let claim_key = unb64_array::<32>(r.trim_start_matches("claims/")).ok()?;
+                self.claim_answer(&claim_key)
             }
-            _ => None,
+            _ => return None,
         })
-    }
-
-    fn view(&self, held: &HeldRecord) -> Value {
-        let cert = self
-            .apps
-            .get(&held.writer)
-            .and_then(|app| app.cert.clone())
-            .map(|cert| cert.signed().clone());
-        let mut view = json!({
-            "key": b64(&held.state.key),
-            "collection": b64(&held.state.collection),
-            "read_scope": held.state.policy.read_scope,
-            "write_scopes": held.state.policy.write_scopes,
-            "generation": held.state.version.generation,
-            "version": held.state.version.version,
-            "seq": held.seq,
-            "deleted": held.state.deleted,
-            "writer": zbase32_encode(&held.writer),
-            "op": held.op,
-            "divergent": false,
-            "cert": cert,
-        });
-        if !self.shared.hide_proofs {
-            view["proof"] = json!(held.proof);
-        }
-        view
     }
 
     fn claim_answer(&mut self, claim_key: &[u8; 32]) -> Answer {
@@ -322,8 +534,7 @@ impl Inner {
         let Some(claim) = self.shared.claims.get(claim_key) else {
             return bad(ErrorCode::NotFound, "no claim", json!(null));
         };
-        let apps = self.apps.clone();
-        let current = |app: &[u8; 16]| apps.get(app).is_some_and(|a| !a.departed);
+        let current = |app: &[u8; 16]| self.app_current(&self.apps, app);
         let view = claim.view(claim_key, now, &current).to_value();
         let entries: Vec<Value> = if claim.tombstone {
             Vec::new()
@@ -340,283 +551,47 @@ impl Inner {
     }
 
     fn allow_list(&self) -> Answer {
-        let mut contacts: BTreeMap<[u8; 32], ()> = BTreeMap::new();
-        let mut conversations: BTreeMap<[u8; 32], [u8; 16]> = BTreeMap::new();
-        let mut deny: BTreeMap<[u8; 32], ()> = BTreeMap::new();
-        for op in &self.applied {
-            let writer = op.body().app_id.unwrap_or_default();
-            match &op.body().kind {
-                OpKind::AllowPut { pubky, kind } => match kind {
-                    AllowKind::Contact => {
-                        contacts.insert(*pubky, ());
-                    }
-                    AllowKind::Conversation => {
-                        conversations.entry(*pubky).or_insert(writer);
-                    }
-                },
-                OpKind::AllowDelete { pubky, kind } => match kind {
-                    AllowKind::Contact => {
-                        contacts.remove(pubky);
-                    }
-                    AllowKind::Conversation => {
-                        conversations.remove(pubky);
-                    }
-                },
-                OpKind::DenyPut { pubky } => {
-                    deny.insert(*pubky, ());
-                }
-                OpKind::DenyDelete { pubky } => {
-                    deny.remove(pubky);
-                }
-                _ => {}
-            }
-        }
-        let now = rfc3339(self.now());
+        let now = self.now();
         let codes: Vec<Value> = self
             .shared
             .invites
             .iter()
+            .filter(|(_, invite)| invite.uses < invite.max_uses && now < invite.expires_at)
             .map(|(hash, invite)| {
-                json!({ "code_hash": b64(hash), "expires_at": now, "max_uses": invite.max_uses,
-                        "uses": invite.uses, "written_by": zbase32_encode(&invite.writer) })
+                json!({ "code_hash": b64(hash), "expires_at": rfc3339(invite.expires_at),
+                        "max_uses": invite.max_uses, "uses": invite.uses,
+                        "written_by": zbase32_encode(&invite.writer) })
             })
+            .collect();
+        let conversations: Vec<Value> = self
+            .shared
+            .conversations
+            .iter()
+            .map(|(pubky, (by, at))| {
+                json!({ "pubky": pubky_id(pubky), "written_by": zbase32_encode(by),
+                        "at": rfc3339(*at) })
+            })
+            // The entries the service wrote (Switch wire 7.4.8).
+            .chain(
+                self.shared
+                    .service_conversations
+                    .iter()
+                    .filter(|(pubky, _)| !self.shared.conversations.contains_key(*pubky))
+                    .map(|(pubky, (code, at))| {
+                        json!({ "pubky": pubky_id(pubky), "written_by": "service",
+                                "code_hash": b64(code), "at": rfc3339(*at) })
+                    }),
+            )
             .collect();
         (
             200,
             json!({
-                "contacts": contacts.keys().map(pubky_id).collect::<Vec<_>>(),
-                "conversations": conversations.iter().map(|(p, by)| json!({
-                    "pubky": pubky_id(p), "written_by": zbase32_encode(by), "at": now }))
-                    .chain(self.shared.service_conversations.iter()
-                        .filter(|(p, _)| !conversations.contains_key(*p))
-                        .map(|(p, code)| json!({
-                        "pubky": pubky_id(p), "written_by": "service", "code_hash": b64(code),
-                        "at": now })))
-                    .collect::<Vec<_>>(),
-                "deny": deny.keys().map(pubky_id).collect::<Vec<_>>(),
+                "contacts": self.shared.contacts.iter().map(pubky_id).collect::<Vec<_>>(),
+                "conversations": conversations,
+                "deny": self.shared.deny.iter().map(pubky_id).collect::<Vec<_>>(),
                 "flagged": [],
                 "invite_codes": codes,
             }),
         )
-    }
-
-    /// A batch of the shared state: every rule checked on the state before the batch, the
-    /// operations in order, then applied all or nothing.
-    fn shared_ops(
-        &mut self,
-        caller: Option<[u8; 16]>,
-        request: &OpsRequest,
-        ops: &[SignedOp],
-    ) -> Result<Answer, ScriptError> {
-        if let Some(id) = ops.first().map(|op| op.body().batch.id)
-            && let Some(answer) = self.answered.get(&id)
-        {
-            let mut answer = answer.clone();
-            answer["head"] = self.head().to_value();
-            return Ok((200, answer));
-        }
-        // Switch wire 6.4 step 6: an operation naming another generation.
-        let generation = self.tip.generation;
-        if ops.iter().any(|op| op.body().generation != generation) {
-            return Ok(bad(
-                ErrorCode::StaleGeneration,
-                "generation",
-                json!({ "generation": generation }),
-            ));
-        }
-        let Some(writer) = caller else {
-            return Ok(bad(ErrorCode::PermissionMissing, "apps only", json!({})));
-        };
-        if self.apps.get(&writer).is_some_and(|a| a.departed) {
-            return Ok(bad(ErrorCode::NotCurrent, "departed", json!({})));
-        }
-        let epoch = self.doc.as_ref().map_or(1, |d| d.data_epoch());
-        let now = self.now();
-        let before = Before {
-            shared: &self.shared,
-            now,
-        };
-        for op in ops {
-            if let Err(refusal) = check_conditions(&op.body().conditions, &before) {
-                return Ok(bad(
-                    refusal.code,
-                    "condition",
-                    refusal.current.unwrap_or(json!({})),
-                ));
-            }
-        }
-        let mut claims = self.shared.claims.clone();
-        let mut after: Vec<Option<([u8; 32], Claim)>> = Vec::new();
-        for op in ops {
-            match &op.body().kind {
-                OpKind::RecordPut(put) => {
-                    let held = self.shared.records.get(&put.key);
-                    let view = held.map(|h| self.view(h));
-                    if let Err(refusal) =
-                        check_record_put(put, held.map(|h| &h.state), epoch, true, view.as_ref())
-                    {
-                        return Ok(bad(
-                            refusal.code,
-                            "record",
-                            refusal.current.unwrap_or(json!({})),
-                        ));
-                    }
-                    after.push(None);
-                }
-                OpKind::Claim(fields) => {
-                    let Ok(entry) = fields.check() else {
-                        return Ok(bad(ErrorCode::BadRequest, "claim", json!(null)));
-                    };
-                    let apps = self.apps.clone();
-                    let current = |app: &[u8; 16]| apps.get(app).is_some_and(|a| !a.departed);
-                    let cx = EntryContext {
-                        writer,
-                        now,
-                        can_read: true,
-                        is_current: &current,
-                        limits: ClaimLimits::default(),
-                        tally: ClaimTally::count(claims.values(), &writer),
-                    };
-                    match apply_entry(claims.get(&entry.claim_key), &entry, &cx) {
-                        Ok(claim) => {
-                            claims.insert(entry.claim_key, claim.clone());
-                            after.push(Some((entry.claim_key, claim)));
-                        }
-                        Err(refusal) => {
-                            return Ok(bad(
-                                refusal.code,
-                                "claim",
-                                refusal.current.unwrap_or(json!({})),
-                            ));
-                        }
-                    }
-                }
-                OpKind::InviteCodePut(put) if self.shared.invites.contains_key(&put.code_hash) => {
-                    return Ok(bad(ErrorCode::Conflict, "registered", json!({})));
-                }
-                OpKind::InviteCodeDelete { code_hash }
-                    if !self.shared.invites.contains_key(code_hash) =>
-                {
-                    return Ok(bad(ErrorCode::NotFound, "no code", json!(null)));
-                }
-                _ => after.push(None),
-            }
-        }
-        let mut proofs = Vec::new();
-        let generation = self.tip.generation;
-        for (op, claim) in ops.iter().zip(after) {
-            let body = op.body();
-            let hash = op.item_hash()?;
-            let object = body
-                .kind
-                .proof_object(body.app_id.as_ref())
-                .ok_or_else(|| {
-                    ScriptError::Missing("an operation without a proof object".into())
-                })?;
-            let seq = self.seq + 1;
-            let state = match (&body.kind, &claim) {
-                (OpKind::RecordPut(put), _) => {
-                    let state = RecordState::after(put, generation, seq);
-                    ProofState::Record {
-                        version: RecordVersion::new(generation, seq),
-                        deleted: state.deleted,
-                    }
-                }
-                (OpKind::Claim(_), Some((key, claim))) => {
-                    let apps = self.apps.clone();
-                    let current = |app: &[u8; 16]| apps.get(app).is_some_and(|a| !a.departed);
-                    ProofState::Claim(claim.view(key, now, &current).to_value())
-                }
-                (OpKind::InviteCodePut(put), _) => ProofState::InviteCodePut {
-                    max_uses: put.max_uses,
-                },
-                (OpKind::InviteCodeDelete { .. }, _) => ProofState::InviteCodeDelete,
-                (OpKind::AllowPut { kind, .. }, _) => ProofState::Allow {
-                    kind: *kind,
-                    present: true,
-                },
-                (OpKind::AllowDelete { kind, .. }, _) => ProofState::Allow {
-                    kind: *kind,
-                    present: false,
-                },
-                (OpKind::DenyPut { .. }, _) => ProofState::Deny { denied: true },
-                _ => ProofState::Deny { denied: false },
-            };
-            let proof = self.chain_item(
-                ItemType::Op,
-                op.signed().clone(),
-                hash,
-                Some(body.batch),
-                &object,
-                &state,
-                None,
-            )?;
-            match (&body.kind, claim) {
-                (OpKind::RecordPut(put), _) => {
-                    self.shared.records.insert(
-                        put.key,
-                        HeldRecord {
-                            state: RecordState::after(put, generation, seq),
-                            op: op.signed().clone(),
-                            proof: proof.clone(),
-                            writer,
-                            seq,
-                        },
-                    );
-                }
-                (OpKind::Claim(fields), Some((key, claim))) => {
-                    self.shared.entries.entry(key).or_default().push(HeldEntry {
-                        step: fields.expected_step,
-                        seq,
-                        op: op.signed().clone(),
-                        proof: proof.clone(),
-                    });
-                    self.shared.claims.insert(key, claim);
-                }
-                (OpKind::InviteCodePut(put), _) => {
-                    self.shared.invites.insert(
-                        put.code_hash,
-                        Invite {
-                            max_uses: put.max_uses,
-                            uses: 0,
-                            writer,
-                            expires_at: put.expires_at,
-                            context: put.context.clone(),
-                        },
-                    );
-                }
-                (OpKind::InviteCodeDelete { code_hash }, _) => {
-                    self.shared.invites.remove(code_hash);
-                }
-                (OpKind::AllowPut { pubky, kind }, _) => {
-                    self.shared.connect.retain(|(p, _)| p != pubky);
-                    // A scripted `GET /allow` shows the contacts added since.
-                    let id = json!(pubky_id(pubky));
-                    if *kind == AllowKind::Contact
-                        && let Some(contacts) = self
-                            .allow
-                            .as_mut()
-                            .and_then(|allow| allow["contacts"].as_array_mut())
-                        && !contacts.contains(&id)
-                    {
-                        contacts.push(id);
-                    }
-                }
-                (OpKind::DenyPut { pubky }, _) => {
-                    self.shared.connect.retain(|(p, _)| p != pubky);
-                }
-                _ => {}
-            }
-            self.applied.push(op.clone());
-            proofs.push(proof);
-        }
-        if let Some(position) = request.cursor() {
-            self.apps.entry(writer).or_default().cursor = position.seq;
-        }
-        let answer = json!({ "proofs": proofs, "head": self.head().to_value() });
-        if let Some(op) = ops.first() {
-            self.answered.insert(op.body().batch.id, answer.clone());
-        }
-        Ok((200, answer))
     }
 }

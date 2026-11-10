@@ -8,13 +8,15 @@
 //! The trait is object-safe and takes and returns plain owned types, so a binding can
 //! implement it across a language boundary.
 //!
-//! - **Receiving** ([`Protocol::receive_with`], or [`Protocol::receive`] for a protocol that
-//!   needs nothing of the app's state): the app hands over each message that passed checks 1
-//!   to 9; the protocol parses the body (check 10) and adds, through the
-//!   [`ReceiveContext`], the shared record writes and claim entries the app builds and signs
-//!   for it, all committed in the same batch as the cursor move, and the writes of its own
-//!   local state to commit with the outcome (Switch spec 8.2: "writes the effect to its
-//!   shared record and advances its cursor in one batch").
+//! - **Receiving** ([`Protocol::check_body`], then [`Protocol::receive_with`], or
+//!   [`Protocol::receive`] for a protocol that needs nothing of the app's state): the app
+//!   hands over each message that passed checks 1 to 9. The protocol checks the body (check
+//!   10) on its own, without effects, which is also what a push extension's peek runs; for a
+//!   body that passes, it adds, through the [`ReceiveContext`], the shared record writes and
+//!   claim entries the app builds and signs for it, all committed in the same batch as the
+//!   cursor move, and the writes of its own local state to commit with the outcome (Switch
+//!   spec 8.2: "writes the effect to its shared record and advances its cursor in one
+//!   batch").
 //! - **Re-sends** ([`Protocol::resend_needed`], [`Protocol::missed`]): the kind that asks a
 //!   counterparty to send again is a protocol's (Switch spec 11), so the app hands over
 //!   what it needs and the protocol queues its request with the local writes it returns.
@@ -45,7 +47,7 @@ pub struct OpaqueRule {
 }
 
 /// A message that passed the recipient checks 1 to 9 (Switch wire 5.1), handed to the
-/// protocol for check 10 and its effect.
+/// protocol for check 10 ([`Protocol::check_body`]) and its effect ([`Protocol::receive`]).
 #[derive(Clone, Debug)]
 pub struct ReceivedMessage {
     /// The entry's `seq` in the current generation.
@@ -149,11 +151,11 @@ pub enum Need {
 /// The protocol's answer for a received message.
 #[derive(Clone, Debug)]
 pub enum Outcome {
-    /// Check 10 passed: apply the effect.
+    /// Apply the effect.
     Apply(Effect),
-    /// The body doesn't parse for its kind, or a rule the protocol states for the kind
-    /// fails (Switch wire 5.1 check 10): the entry is dropped, kept as processed, and the
-    /// cursor moves past it.
+    /// A rule the protocol states for the kind fails (Switch wire 5.1 check 10), one that
+    /// [`Protocol::check_body`] couldn't judge: the entry is dropped, kept as processed, and
+    /// the cursor moves past it.
     Drop {
         /// The rule, without content.
         reason: String,
@@ -256,9 +258,21 @@ pub trait Protocol: Send + Sync {
     /// what its scopes receive (Switch spec 3.4).
     fn accepts(&self, cert: &AppCert) -> Vec<String>;
 
-    /// Check 10 and the effect of a message that passed checks 1 to 9, for a protocol that
-    /// needs nothing of the app's state: [`Protocol::receive_with`] calls it by default. A
-    /// protocol that implements [`Protocol::receive_with`] need not implement this one; by
+    /// Check 10 (Switch wire 5.1) of a message that passed checks 1 to 9, with no effect:
+    /// the body parses as its kind's body, the members read have their types, and the
+    /// protocol's rules for the kind hold. The app runs it before [`Protocol::receive_with`],
+    /// and a push extension's peek runs it alone (Switch spec 9 step 5), so it must refuse
+    /// every body that the receive step would drop for its shape, and change nothing.
+    ///
+    /// # Errors
+    ///
+    /// The rule the body breaks, without content: the entry is dropped, and a peek shows a
+    /// generic notification for it.
+    fn check_body(&self, message: &ReceivedMessage) -> Result<(), String>;
+
+    /// The effect of a message whose body passed [`Protocol::check_body`], for a protocol
+    /// that needs nothing of the app's state: [`Protocol::receive_with`] calls it by default.
+    /// A protocol that implements [`Protocol::receive_with`] need not implement this one; by
     /// default it drops every message.
     fn receive(&self, message: &ReceivedMessage) -> Outcome {
         let _ = message;
@@ -267,7 +281,7 @@ pub trait Protocol: Send + Sync {
         }
     }
 
-    /// Check 10 and the effect of a message that passed checks 1 to 9, with the app's
+    /// The effect of a message whose body passed [`Protocol::check_body`], with the app's
     /// state at hand (Switch spec 8.2): `cx` derives record keys and blinded inputs, reads
     /// the writes the app holds and the claims it keeps, and adds record writes and claim
     /// entries to the effect's batch, which carries the cursor move. What `cx` added goes

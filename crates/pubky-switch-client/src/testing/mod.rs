@@ -8,9 +8,9 @@
 //! The scripted switch models the switch's answers as the spec gives them (Switch wire 7.4):
 //! every answer, head, transition proof and service transition is built from the core's
 //! types and signed with a real service key, so the client checks them as it checks a
-//! service's. It checks only what the app layer relies on, and is no substitute for the
-//! service: storage, durability, limits, admission policy and most refusals are the
-//! service's, and are tested there.
+//! service's. Every batch, submitted or injected, goes through the core's rules (Switch wire
+//! 6.4). It is no substitute for the service: `FAKES.md`, next to this module, lists what it
+//! fakes or leaves out, such as quotas, rates, trusted time, retention and durability.
 //!
 //! - [`ScriptedSwitch`]: one account's switch, its chain, feed, directory and shared state,
 //!   with [`Fault`]s to inject. Apps of other identities reach its inbox as senders do:
@@ -107,6 +107,15 @@ pub enum ScriptError {
     /// The scripted state lacks what the call needs, such as an app without a receive key.
     #[error("missing: {0}")]
     Missing(String),
+    /// The scripted switch refused an injected batch, as it would the same batch submitted:
+    /// the answer's status and error body (Switch wire 7.6).
+    #[error("refused with {status}")]
+    Refused {
+        /// The HTTP status.
+        status: u16,
+        /// The error body.
+        body: serde_json::Value,
+    },
 }
 
 /// Deterministic secrets: `BLAKE3(prefix + label)`, so a test's keys are the same on every
@@ -324,6 +333,78 @@ mod tests {
         let answered = switch.handle(&request(SWITCH_ORIGIN, &path)).unwrap();
         assert_eq!(answered.status, 200);
         assert!(answered.header(header::SERVICE_SIGNATURE).is_some());
+    }
+
+    #[test]
+    fn test_scripted_switch_batch_retry_and_no_op_follow_the_core() {
+        use pubky_switch_core::ops::{OpKind, OpsRequest, sign_batch};
+        use pubky_switch_core::records::{AppRecord, AppRecordBody};
+        use pubky_switch_core::scopes::Permission;
+
+        use crate::clock::Clock;
+        use crate::transport::Header;
+
+        let seeds = Seeds::default();
+        let clock = Arc::new(TestClock::new(START_MS));
+        let signer = TestSigner::new(
+            TestIdentity::new(&seeds, "alice"),
+            Arc::clone(&clock),
+            Arc::new(TestHomeserver::new()),
+            ProtocolSpec::default(),
+        );
+        let switch = signer.switch();
+        let alice = signer.identity().public();
+        let keys = signer.identity().app_keys("phone");
+        let spec = AppSpec::new(&["notes"]).with_permissions(&Permission::ALL);
+        let cert = signer.register_app(&keys, &spec).unwrap();
+        let post = |kinds: Vec<OpKind>, id: [u8; 16]| {
+            let ops = sign_batch(&keys, &alice, Some(keys.app_id_bytes()), 1, id, {
+                kinds.into_iter().map(|kind| (vec![], kind)).collect()
+            })
+            .unwrap();
+            let mut request = request(
+                SWITCH_ORIGIN,
+                &format!("/v1/{}/ops", signer.identity().key().id()),
+            );
+            request.method = "POST".into();
+            request.headers.push(Header::new(
+                header::APP,
+                &pubky_switch_core::enc::zbase32_encode(&keys.app_id_bytes()),
+            ));
+            request.body = OpsRequest::new(&ops, None).to_json();
+            let answer = switch.handle(&request).unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&answer.body).unwrap();
+            (answer.status, body)
+        };
+        let deny = |pubky| OpKind::DenyPut { pubky };
+        let (status, first) = post(vec![deny([1; 32])], [1; 16]);
+        assert_eq!(
+            (status, first["proofs"].as_array().map(Vec::len)),
+            (200, Some(1))
+        );
+        let seq = switch.seq();
+        // A retry gets the original proofs; other operations under the same ID are refused.
+        let (status, again) = post(vec![deny([1; 32])], [1; 16]);
+        assert_eq!((status, &again["proofs"]), (200, &first["proofs"]));
+        let (status, other) = post(vec![deny([2; 32])], [1; 16]);
+        assert_eq!((status, other["code"].as_str()), (409, Some("conflict")));
+        // The record the switch holds, again: a no-op, which chains nothing.
+        let record = switch.app(&keys.app_id_bytes()).record.unwrap();
+        let (status, noop) = post(vec![OpKind::AppPut { record }], [2; 16]);
+        assert_eq!(
+            (status, noop["proofs"].as_array().map(Vec::len)),
+            (200, Some(0))
+        );
+        assert_eq!(switch.seq(), seq);
+        // A later record is applied.
+        clock.advance_ms(1000);
+        let later =
+            AppRecord::sign(&keys, AppRecordBody::new(&cert, vec![], clock.now_ms())).unwrap();
+        let later = OpKind::AppPut {
+            record: later.signed().clone(),
+        };
+        assert_eq!(post(vec![later], [3; 16]).0, 200);
+        assert_eq!(switch.seq(), seq + 1);
     }
 
     #[tokio::test]
