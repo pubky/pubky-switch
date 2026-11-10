@@ -905,8 +905,9 @@ async fn test_inbox_entry_waits_for_a_target_whose_certificate_lapsed() {
         String::from_utf8_lossy(&answer.body)
     );
     assert_eq!(entries(&replay).await, 1);
-    // Not served, the wallet is no target: the phone's append wrapped to it is stale, naming
-    // it not current, and one sealed before the wallet was reachable needn't wrap to it.
+    // Still current, the wallet is a target: the phone's append wrapped to it is taken and
+    // held for it too, and one that leaves it out, sealed before it was reachable, is stale
+    // with the wallet among added_apps. Its expiry is the sender's own check.
     let from_phone = |envelope: Vec<u8>, apps_version: i64| {
         app_request(
             app(&keys, "phone"),
@@ -918,19 +919,19 @@ async fn test_inbox_entry_waits_for_a_target_whose_certificate_lapsed() {
     };
     let answer = replay
         .service
+        .handle(from_phone(sealed_to(&[receive_public("phone")], 14), 0))
+        .await;
+    assert_eq!(code_of(&answer), (409, json!("stale_key")));
+    assert_eq!(
+        body(&answer)["current"]["added_apps"][0]["app_id"],
+        app(&keys, "wallet")["app_id"]
+    );
+    let answer = replay
+        .service
         .handle(from_phone(
             sealed_to(&[receive_public("wallet"), receive_public("phone")], 13),
             version,
         ))
-        .await;
-    assert_eq!(code_of(&answer), (409, json!("stale_key")));
-    assert_eq!(
-        body(&answer)["current"]["not_current"],
-        json!([app(&keys, "wallet")["app_id"]])
-    );
-    let answer = replay
-        .service
-        .handle(from_phone(sealed_to(&[receive_public("phone")], 14), 0))
         .await;
     assert_eq!(
         answer.status,
@@ -938,8 +939,9 @@ async fn test_inbox_entry_waits_for_a_target_whose_certificate_lapsed() {
         "{}",
         String::from_utf8_lossy(&answer.body)
     );
-    let own = entry_seq(&replay).await;
-    move_cursor_at(&replay, "phone", own, later).await;
+    let second = entry_seq(&replay).await;
+    move_cursor_at(&replay, "phone", second, later).await;
+    assert_eq!(entries(&replay).await, 2);
     // Renewed, the wallet reads it in its feed, then moves past it, and it goes.
     renew_wallet(&replay, later).await;
     let feed = body(
@@ -962,7 +964,7 @@ async fn test_inbox_entry_waits_for_a_target_whose_certificate_lapsed() {
             .any(|item| item["type"] == "entry" && item["seq"] == seq),
         "{feed}"
     );
-    move_cursor_at(&replay, "wallet", seq, later).await;
+    move_cursor_at(&replay, "wallet", second, later).await;
     assert_eq!(entries(&replay).await, 0);
     replay.db.drop_database().await.expect("drop");
 }

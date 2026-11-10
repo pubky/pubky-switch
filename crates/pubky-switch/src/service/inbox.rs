@@ -372,9 +372,11 @@ impl Service {
                 unknown.push(json!(b64(kid)));
                 continue;
             };
-            // Served, not only current: an envelope wraps to an app the service serves now,
-            // its certificate unexpired (Switch wire 7.4.3 check 5, 3.8 check 3).
-            if !state.is_served(holder) {
+            // Current (Switch wire 7.4.3 check 5 "the current receive key of a current app",
+            // 7.6 `not_current`, spec 3.4), its certificate's expiry apart: that is the
+            // sender's own check on the record the directory gave it (wire 3.8 check 3, spec
+            // 8.1), and an entry wrapped to a lapsed app is held for it as its others are.
+            if !state.is_current(holder) {
                 named.insert(*holder);
                 not_current.push(json!(zbase32_encode(holder)));
                 continue;
@@ -405,7 +407,7 @@ impl Service {
                 || targets.contains(&app.app_id)
                 || named.contains(&app.app_id)
                 || own == Some(app.app_id)
-                || !state.is_served(&app.app_id)
+                || !state.is_current(&app.app_id)
             {
                 continue;
             }
