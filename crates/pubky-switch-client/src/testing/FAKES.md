@@ -85,9 +85,9 @@ service.
   checks, for scripting what another signer or a faulty service did. `forget_delivery_proof`
   makes a retry answer with no proof.
 - **`GET /apps`** (Switch wire 7.4.12): the apps the switch holds or the newest document
-  lists, with `current`, `record_cert`, `record_at`, `bundle_ranges` and `keys_through`; no
-  last-seen times, attempts,
-  unread counts, `keys_through`, departures or `proof_generations`.
+  lists, with `current`, `record_cert`, `record_at`, `bundle_ranges`, `keys_through` and
+  `cert_expires_at`; no last-seen times, attempts, unread counts, departures or
+  `proof_generations`.
 - **Moves and recovery** (Switch spec 12.5, 12.6, Switch wire 10): `import_into` copies the
   account in memory, with no manifest, chunks or export transfer; a recovery upload is kept
   and answered with fixed changes, merging nothing.

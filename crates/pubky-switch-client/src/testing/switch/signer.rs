@@ -10,8 +10,8 @@ use pubky_switch_core::enc::{b64, zbase32_encode};
 use pubky_switch_core::http::{ErrorCode, IdentityDelivery};
 use pubky_switch_core::json::parse_json;
 use pubky_switch_core::records::{
-    AccountView, Delivery, DeliveryRefusal, Enrollment, EnrollmentAnswer, IdentityDoc, KeptProofs,
-    Limits, check_delivery,
+    AccountView, AppCert, Delivery, DeliveryRefusal, Enrollment, EnrollmentAnswer, IdentityDoc,
+    KeptProofs, Limits, Standing, check_delivery,
 };
 use pubky_switch_core::sig::SignedDoc;
 use serde_json::{Value, json};
@@ -262,6 +262,21 @@ impl Inner {
         Some(held)
     }
 
+    /// The certificate the switch checks `app` against (Switch wire 7.2): a stored renewed
+    /// certificate once the newest `identity.json` lists it, else its record's.
+    fn checked_cert(&self, app: &[u8; 16]) -> Option<&AppCert> {
+        let held = self.apps.get(app)?;
+        let listed = |cert: &AppCert| {
+            self.doc
+                .as_ref()
+                .is_some_and(|doc| doc.standing(app, &cert.hash()) == Standing::Listed)
+        };
+        held.renewed
+            .as_ref()
+            .filter(|renewed| listed(renewed))
+            .or(held.cert.as_ref())
+    }
+
     /// `GET /v1/{id}/apps` (Switch wire 7.4.12): every app the switch holds or the newest
     /// `identity.json` lists, the recovery in progress and the newest document. The scripted
     /// switch reports no proof generations and no last-seen times.
@@ -305,7 +320,8 @@ impl Inner {
                     "keys_through": self.keys_through(id),
                     "full_bundle_requested": null,
                     "bundle_ranges": ranges,
-                    "cert_expires_at": null,
+                    "cert_expires_at": self.checked_cert(id)
+                        .map(|c| pubky_switch_core::time::rfc3339(c.expires_at())),
                 })
             })
             .collect();

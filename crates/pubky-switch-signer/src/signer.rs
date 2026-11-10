@@ -236,16 +236,11 @@ impl Signer {
         while let Some(flow) = self.flow.clone() {
             match flow {
                 Flow::Renew {
-                    app_id,
                     batches,
                     sent,
-                    parts,
                     doc,
                     prev,
-                } => {
-                    self.send_renewal(app_id, &batches, sent, &parts, doc, prev)
-                        .await?
-                }
+                } => self.send_renewal(&batches, sent, doc, prev).await?,
                 Flow::Enroll {
                     origin,
                     enrollment,
@@ -310,7 +305,8 @@ impl Signer {
         &self.state.alerts
     }
 
-    /// Clear `alert`, once the user has seen it.
+    /// Clear `alert`, once the user has seen it. [`Alert::ReductionNotClosed`] stays until its
+    /// renewals are closed.
     ///
     /// A rollback or an equivocation leaves the switch unconfirmed: the signer doesn't know that
     /// it holds the high-water version, so it releases no claim (Switch spec 4.3). Clearing such
@@ -332,6 +328,10 @@ impl Signer {
     pub async fn clear_alert(&mut self, alert: &Alert) -> Result<()> {
         self.refresh().await?;
         if !self.state.alerts.contains(alert) {
+            return Ok(());
+        }
+        // A reduction's alert stays until its renewals are closed (Switch wire 3.8).
+        if matches!(alert, Alert::ReductionNotClosed { .. }) && !self.owed()?.is_empty() {
             return Ok(());
         }
         let mut state = self.state.clone();
@@ -772,9 +772,6 @@ impl Signer {
                 });
                 // The switch took this version, built on the one before: it holds the mark.
                 state.switch_unconfirmed = false;
-                if delivered_at.is_some() {
-                    state.time_asked = false;
-                }
                 self.commit(state, None).await
             }
             Err(ClientError::Switch {

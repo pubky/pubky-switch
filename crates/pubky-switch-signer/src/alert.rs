@@ -60,11 +60,23 @@ pub enum Alert {
     /// again (Switch wire 3.13).
     BackupMissing,
     /// The switch gave no service time for a reduction's renewing delivery, even on a retry,
-    /// so the earlier certificates of these apps aren't cut off: a reduction's cutoff is the
-    /// service's time, never the signer's own (Switch wire 3.8). Revoking an app cuts it off;
-    /// a switch that keeps doing this is faulty, and the user moves to another provider.
+    /// so the earlier certificates of these apps aren't cut off yet: a reduction's cutoff is
+    /// the service's time, never the signer's own (Switch wire 3.8). The signer closes them at
+    /// the service time of its next delivery, and the alert stays until then. Revoking an app
+    /// cuts it off at once; a switch that keeps doing this is faulty, and the user moves to
+    /// another provider.
     ReductionNotClosed {
         /// The apps whose reduction stays open.
         apps: Vec<[u8; 16]>,
+    },
+    /// A rotation gave this app no keys for its new data epoch: its certificate holds scopes
+    /// no registered protocol owns, so the signer can't tell which keys it holds (design note,
+    /// decision 2). Its next bundle, once a protocol owns them, starts after the epochs it
+    /// holds, so it catches up (Switch wire 3.5).
+    RotationSkipped {
+        /// The app left without the new epoch's keys.
+        app_id: [u8; 16],
+        /// Its scopes that no registered protocol owns.
+        scopes: Vec<String>,
     },
 }

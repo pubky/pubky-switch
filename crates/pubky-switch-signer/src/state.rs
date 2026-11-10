@@ -102,17 +102,25 @@ pub(crate) struct SignerState {
     #[serde(default)]
     pub(crate) switch_unconfirmed: bool,
     /// The highest data epoch whose keys this signer ever sent in a bundle, by a rotation it
-    /// gave up too: the next rotation goes above it (Switch spec 3.2, 3.5).
+    /// gave up too. While it is above the newest version's `data_epoch`, some apps may hold
+    /// keys of an epoch no version raised: before its next rotation the signer completes that
+    /// epoch, giving every current app holding each keyed scope its keys through it and
+    /// delivering a version that raises `data_epoch` to it, then rotates by one (Switch spec
+    /// 3.2, 3.5). A restore or a hand-over takes it as the highest `last_epoch` of the parts
+    /// it receives and of `keys_through` and `bundle_ranges` in `GET /apps` (Switch wire 3.5,
+    /// 3.12, 7.4.12), never below the newest `data_epoch`.
     #[serde(default)]
     pub(crate) epoch_through: u64,
-    /// A closing delivery is owed and the renewing version was delivered again for its
-    /// service time, whose answer must carry it.
+    /// The version that was delivered again for its service time, because a closing delivery
+    /// is owed and the delivery's answer was lost: its retry's answer must carry that time
+    /// (Switch wire 7.4.2). It concerns only that version.
     #[serde(default)]
-    pub(crate) time_asked: bool,
-    /// The switch gave no service time for a reduction's renewing delivery: the closing stays
-    /// owed, with [`Alert::ReductionNotClosed`] shown, and isn't tried again.
+    pub(crate) time_asked: Option<u64>,
+    /// The version whose retry gave no service time either: the closing stays owed, with
+    /// [`Alert::ReductionNotClosed`] shown, until a later version's delivery carries a service
+    /// time to close at.
     #[serde(default)]
-    pub(crate) closing_unavailable: bool,
+    pub(crate) closing_unavailable: Option<u64>,
 }
 
 /// An approval's companion claim, signed with the version that lists its certificate and
@@ -175,8 +183,8 @@ impl SignerState {
             claims: Vec::new(),
             switch_unconfirmed: false,
             epoch_through: 0,
-            time_asked: false,
-            closing_unavailable: false,
+            time_asked: None,
+            closing_unavailable: None,
         }
     }
 
@@ -218,18 +226,14 @@ pub(crate) enum Flow {
         /// The policy the first `identity.json` carries.
         policy: IdentityPolicy,
     },
-    /// Renewing an app's certificate (Switch spec 3.2, Switch wire 3.8): storing the new
-    /// certificate and the key bundles at the switch, batch by batch, then delivering the
-    /// renewing version.
+    /// Renewing an app's certificate (Switch spec 3.2, Switch wire 3.8), or completing a data
+    /// epoch before a rotation: storing the new certificate and the key bundles at the switch,
+    /// batch by batch, then delivering the version.
     Renew {
-        /// The renewed app.
-        app_id: [u8; 16],
         /// The signed batches, each sent again with the same bytes until it is answered.
-        batches: Vec<Bytes>,
+        batches: Vec<RenewBatch>,
         /// How many batches the switch took.
         sent: usize,
-        /// The key bundle parts the batches store.
-        parts: Vec<StoredPart>,
         /// The renewing version, as signed.
         doc: SignedDoc,
         /// The document hash of the version it builds on.
@@ -246,6 +250,15 @@ pub(crate) enum Flow {
         /// Where it is.
         step: DeliverStep,
     },
+}
+
+/// One signed batch of a renewal or an epoch's completion, and the key bundle parts it stores.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RenewBatch {
+    /// The batch, as signed.
+    pub(crate) bytes: Bytes,
+    /// The key bundle parts it stores (Switch wire 3.5).
+    pub(crate) parts: Vec<StoredPart>,
 }
 
 /// Bytes kept as they were signed, stored in base64url.
