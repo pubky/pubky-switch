@@ -70,6 +70,21 @@ pub enum AppEvent {
         /// The error code of the refusal; `None` for an effect over one batch.
         code: Option<String>,
     },
+    /// A received message's effect was kept unanswered across a provider change for longer
+    /// than a resend's answer can tell whether it was applied (Switch spec 12.5 "Kept
+    /// batches"): its entry was stored locally and passed ([`AppEvent::Parked`]), and the
+    /// effect isn't sent or built again. It may have been applied: the protocol decides
+    /// from the current state of what the effect writes.
+    EffectUncertain {
+        /// The entry's `seq`.
+        seq: u64,
+        /// The sender identity.
+        sender: [u8; 32],
+        /// The message ID.
+        msg_id: String,
+        /// The message kind.
+        kind: String,
+    },
     /// An entry stored locally was processed.
     Unparked {
         /// The entry's `seq`.
@@ -406,4 +421,17 @@ pub enum ParkReason {
     /// ([`super::MAX_CLAIM_READS`]), or again for what it was given: it is kept, not
     /// applied, and not tried again.
     TooManyReads,
+    /// Its effect was kept unanswered longer than a resend's answer can tell whether it was
+    /// applied (Switch spec 12.5 "Kept batches"): it is kept, and not tried again
+    /// ([`AppEvent::EffectUncertain`]).
+    Uncertain,
+}
+
+impl ParkReason {
+    /// Whether an entry stored for this reason is processed again by a later read: one
+    /// whose sender couldn't be checked, or whose write hit a quota. The others stay
+    /// stored until the protocol acts on them.
+    pub fn tried_again(self) -> bool {
+        matches!(self, Self::Unverifiable | Self::Quota)
+    }
 }

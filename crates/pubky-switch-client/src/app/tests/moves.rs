@@ -15,8 +15,8 @@ use pubky_switch_core::sig::SignedDoc;
 
 use super::*;
 use crate::app::{
-    AppError, AppEvent, ClaimOp, Evidence, LossActions, ObligationDeadline, ProviderLoss,
-    ProviderStatus, PushRelay, UserConfirmed,
+    AppError, AppEvent, ClaimOp, Evidence, LossActions, ObligationDeadline, ParkReason,
+    ProviderLoss, ProviderStatus, PushRelay, UserConfirmed,
 };
 use crate::error::ClientError;
 use crate::error::TransportError;
@@ -1884,6 +1884,60 @@ async fn test_key_change_sends_a_kept_effect_again_and_settles_it_once() {
             .unwrap(),
         Some(b"before".to_vec())
     );
+}
+
+#[tokio::test]
+async fn test_key_change_parks_a_kept_effect_older_than_the_batch_window() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join(&w, &router).await;
+    let me = app.app_id();
+    let (seq, message) = w.note(me, "before");
+    // The effect is applied at generation 1, and its answer lost.
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.receive(None).await.is_err());
+    assert_eq!(w.effects(), 1);
+    w.clock
+        .advance_ms(crate::app::provider::KEPT_BATCH_ANSWER_MS);
+    let changed = change_key(&w, &router);
+    // The answer can't tell any more whether it was applied: the entry is stored and
+    // passed, its effect not built again, and the protocol told (Switch spec 12.5 "Kept
+    // batches").
+    let report = app.receive(None).await.unwrap();
+    assert!(
+        has(&report.events, |e| matches!(
+            e,
+            AppEvent::Parked { seq: s, reason: ParkReason::Uncertain, .. } if *s == seq
+        )),
+        "{:?}",
+        report.events
+    );
+    assert!(
+        has(&report.events, |e| matches!(
+            e,
+            AppEvent::EffectUncertain { seq: s, msg_id, .. }
+                if *s == seq && *msg_id == message.msg_id
+        )),
+        "{:?}",
+        report.events
+    );
+    assert!(!received(&report.events, seq), "{:?}", report.events);
+    assert_eq!(conversations_at(&changed), 0);
+    assert!(app.cursor().seq >= seq);
+    assert_eq!(
+        app.state.parked.get(&seq).map(|p| p.reason),
+        Some(ParkReason::Uncertain)
+    );
+    assert_eq!(
+        app.protocol_get(format!("notes/{}", message.msg_id).as_bytes())
+            .await
+            .unwrap(),
+        None
+    );
+    // Later reads don't try it again.
+    let report = app.receive(None).await.unwrap();
+    assert!(!received(&report.events, seq), "{:?}", report.events);
+    assert_eq!(conversations_at(&changed), 0);
 }
 
 /// The app at `store`, loaded through the loss's router.

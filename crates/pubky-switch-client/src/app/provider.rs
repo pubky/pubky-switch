@@ -36,10 +36,10 @@ use pubky_switch_core::sig::SignedDoc;
 use serde::{Deserialize, Serialize};
 
 use super::error::{Alarm, AppError};
-use super::events::AppEvent;
+use super::events::{AppEvent, ParkReason};
 use super::feed::{ReceiveReport, processed_writes};
 use super::identity;
-use super::state::{Tx, key};
+use super::state::{ParkedEntry, PendingEffect, Tx, key};
 use super::{App, OpBatch, push};
 use crate::client::answers::{FeedQuery, RecoveryUpload};
 use crate::client::{Batch, Credentials, SwitchClient};
@@ -983,7 +983,7 @@ impl App {
     ///   applied stays as it is, to be sent again unchanged, and its answer decides (Switch
     ///   spec 12.5 "Kept batches"). One kept longer than the service holds batch IDs, 30
     ///   days less the clock tolerance, goes instead: a batch reported as dropped, an
-    ///   effect with its entry read again.
+    ///   effect with its entry stored locally and passed ([`App::park_uncertain`]).
     ///
     /// Returns the events to report once `tx` commits.
     pub(crate) async fn carry_kept_writes(
@@ -1001,10 +1001,14 @@ impl App {
             let applied = Batch::from_body(pending.body.clone())?
                 .id()
                 .is_some_and(|id| self.applied_by_old_service(&id));
-            let stays = !applied && resend_first && answer_decides(pending.kept_ms);
+            let answerable = answer_decides(pending.kept_ms);
+            let stays = !applied && resend_first && answerable;
             if !stays {
                 tx.delete(key::PENDING_EFFECT)?;
                 self.state.pending_effect = None;
+            }
+            if !applied && resend_first && !answerable {
+                self.park_uncertain(&pending, tx, &mut events)?;
             }
             if applied {
                 let now = self.now();
@@ -1077,6 +1081,62 @@ impl App {
             });
         }
         Ok(events)
+    }
+
+    /// A kept effect the chain doesn't show applied, kept longer than a resend's answer can
+    /// tell whether it was (Switch spec 12.5 "Kept batches"): building it again could apply
+    /// it twice, so its entry is stored locally and passed, like an effect refused for good
+    /// (Switch spec 8.2), and the protocol is told; it decides from the current state. A
+    /// kept effect written without its entry can't be stored: its entry is read again.
+    fn park_uncertain(
+        &mut self,
+        pending: &PendingEffect,
+        tx: &mut Tx,
+        events: &mut Vec<AppEvent>,
+    ) -> Result<(), AppError> {
+        let reason = ParkReason::Uncertain;
+        let parked = match (self.state.parked.get(&pending.seq), &pending.entry) {
+            (Some(stored), _) if pending.parked => ParkedEntry {
+                reason,
+                ..stored.clone()
+            },
+            (_, Some(entry)) => ParkedEntry {
+                sender: pending.sender,
+                cert: entry.cert.clone(),
+                accepted_at_ms: pending.accepted_at_ms,
+                plaintext: entry.plaintext.clone(),
+                context: entry.context.clone(),
+                reason,
+            },
+            _ => return Ok(()),
+        };
+        tx.put(&key::parked(pending.seq), &parked)?;
+        self.state.parked.insert(pending.seq, parked);
+        if pending.parked {
+            // Stored before, and passed then.
+        } else if pending.past_held {
+            tx.put(&key::seen(pending.seq), &())?;
+            self.state.seen.insert(pending.seq);
+        } else {
+            let now = self.now();
+            let cursor = &mut self.state.cursor;
+            cursor.seq = cursor.seq.max(pending.seq);
+            cursor.time_ms = cursor.time_ms.max(pending.accepted_at_ms);
+            if cursor.seq > cursor.at_service && cursor.deferred_since_ms.is_none() {
+                cursor.deferred_since_ms = Some(now);
+            }
+        }
+        events.push(AppEvent::Parked {
+            seq: pending.seq,
+            reason,
+        });
+        events.push(AppEvent::EffectUncertain {
+            seq: pending.seq,
+            sender: pending.sender,
+            msg_id: pending.msg_id.clone(),
+            kind: pending.kind.clone(),
+        });
+        Ok(())
     }
 
     /// Whether the old service's chain, as the app verified it, holds batch `id`.

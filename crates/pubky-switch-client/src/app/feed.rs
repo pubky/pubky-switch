@@ -59,7 +59,9 @@ use super::protocol::{
 use super::provider::TakeOver;
 use super::records::{Collection, pending_name_key};
 use super::rotation::RegistrationStep;
-use super::state::{CachedDoc, HeldEntry, ParkedEntry, PendingEffect, Processed, Tx, key};
+use super::state::{
+    CachedDoc, HeldEntry, KeptEntry, ParkedEntry, PendingEffect, Processed, Tx, key,
+};
 use super::{App, AppError, PROCESSED_RETENTION_MS};
 use crate::client::Batch;
 use crate::client::answers::{ChainItem, EntryItem, FeedItem, FeedPage, FeedQuery};
@@ -829,6 +831,11 @@ impl App {
                 .map(|(claim_key, deadline)| (pubky_switch_core::enc::b64(claim_key), *deadline))
                 .collect(),
             kept_ms: Some(self.now()),
+            entry: Some(KeptEntry {
+                cert: entry.cert.clone(),
+                plaintext: received.plaintext.encode(),
+                context: entry.context.clone(),
+            }),
         };
         // The collection name of a record the effect creates outside the protocol's
         // collections, until its write is answered: the switch knows only its ID.
@@ -1079,12 +1086,9 @@ impl App {
             let Some(stored) = self.state.parked.get(&seq).cloned() else {
                 continue;
             };
-            // A refusal for good, an effect over one batch, or a step that asked for more
-            // reads than an entry gets, isn't tried again.
-            if matches!(
-                stored.reason,
-                ParkReason::Refused | ParkReason::TooManyOperations | ParkReason::TooManyReads
-            ) {
+            // A refusal for good, an effect over one batch, a step that asked for more reads
+            // than an entry gets, or an effect whose fate can't be known, isn't tried again.
+            if !stored.reason.tried_again() {
                 continue;
             }
             let plaintext = MessagePlaintext::decode(&stored.plaintext)

@@ -392,6 +392,22 @@ pub(crate) struct PendingEffect {
     /// When it was kept, before its first send, app clock.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) kept_ms: Option<u64>,
+    /// What storing the entry locally takes, beside the fields above: the entry is stored
+    /// when the effect is kept so long that its fate can't be known (Switch spec 12.5
+    /// "Kept batches").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) entry: Option<KeptEntry>,
+}
+
+/// The part of an entry a kept effect keeps so the entry can be stored locally
+/// ([`PendingEffect::entry`]). Sensitive: it holds the opened message.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct KeptEntry {
+    pub(crate) cert: SignedDoc,
+    /// The signed plaintext's bytes (Switch wire 4.5).
+    #[serde(with = "serde_b64_vec")]
+    pub(crate) plaintext: Vec<u8>,
+    pub(crate) context: Option<Value>,
 }
 
 impl std::fmt::Debug for ParkedEntry {

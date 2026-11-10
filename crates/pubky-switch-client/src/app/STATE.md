@@ -60,11 +60,11 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
 | `proct/<time>/<sender>/<msg_id>` | the time index for pruning processed pairs | |
 | `seen/<seq>` | an entry processed past a held one | |
 | `held/<seq>` | an entry held because its sender can't be checked, since when | |
-| `parked/<seq>` | an entry stored locally and passed: the opened plaintext, sender, certificate, time, reason (an unverifiable sender or a quota, tried again; an effect refused for good or over one batch, not tried again) | yes |
+| `parked/<seq>` | an entry stored locally and passed: the opened plaintext, sender, certificate, time, reason (an unverifiable sender or a quota, tried again; an effect refused for good, over one batch, or kept past the batch ID window, not tried again) | yes |
 | `asked/<seq>` | a re-send was handed to the protocol for this item | |
 | `departed/<app_id>` | another own app's departure verified in the chain, and its time | |
 | `join` | the join step: the registration batch while it is owed | |
-| `pending/effect` | a received message's effect batch and its outcome writes, with the deadlines of the claims it writes | |
+| `pending/effect` | a received message's effect batch and its outcome writes, with the deadlines of the claims it writes, and the opened entry, to store it locally if the batch outlives the batch ID window | yes |
 | `pending/record` | an `app.put` batch | |
 | `alarm` | the alarm that stopped the app | |
 | `restore` | after a restore: the backup's highest `n`, the key check, the app's own new key, reconcile mode | |
@@ -115,7 +115,9 @@ uploads; `push.rs` holds the push registration. The peek (`peek.rs`) writes noth
   or a key change in place, didn't read the old feed to its end: its kept batches and
   effect stay unchanged and go again first, and the answer decides (original proofs or
   `409 conflict`: applied; `409 stale_generation`: signed again); one kept 30 days less
-  the clock tolerance or more goes instead.
+  the clock tolerance or more goes instead. Such an effect may have been applied, so its
+  entry isn't read again: it is stored in `parked/` and passed in the switch's commit, and
+  the protocol is told (`EffectUncertain`).
 - **A newer own `identity.json`** that names a later generation, a loss of the generation
   moved from, or another service than the freeze, supersedes a move or a loss at any step,
   a stuck one included: after a step fails at a service the app reads its `identity.json`
