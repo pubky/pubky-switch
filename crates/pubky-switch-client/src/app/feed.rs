@@ -1211,24 +1211,6 @@ impl App {
         })
     }
 
-    /// Read the own `identity.json` from the Homeserver and take it if newer (Switch spec
-    /// 4.3): the app calls this when the Homeserver's event stream names the document, and
-    /// after waking. Returns whether a newer copy was taken.
-    ///
-    /// # Errors
-    ///
-    /// The alarm a copy raises (equivocation, a removed app listed again); a failed read.
-    pub async fn refresh_identity(&mut self) -> Result<bool, AppError> {
-        self.ready_local().await?;
-        self.refuse_when_stopped()?;
-        let identity = self.state.meta.identity;
-        let Some(doc) = identity::read_homeserver(self.env.homeserver.as_ref(), &identity).await?
-        else {
-            return Ok(false);
-        };
-        self.take_own_copy(doc).await
-    }
-
     /// Take an own copy outside the feed and commit what it changed.
     pub(crate) async fn take_own_copy(&mut self, doc: IdentityDoc) -> Result<bool, AppError> {
         let version = self.state.own_doc.version();

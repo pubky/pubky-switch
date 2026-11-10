@@ -11,6 +11,10 @@
 //!   that identity;
 //! - an own copy that lists again an App ID an earlier version removed is an alarm too.
 //!
+//! [`App::refresh_identity`] reads the own copy from the Homeserver and says whether the read
+//! confirmed the copy held, which an attempt needs within the last 60 seconds (Switch spec
+//! 12.6).
+//!
 //! The Homeserver is read through [`HomeserverReader`], one method, so tests can fake it.
 //! The Pubky implementation (a `PublicStorage` read of
 //! `/pub/pubky-switch/v1/identity.json`) belongs to the host's Pubky integration and isn't
@@ -19,6 +23,7 @@
 use pubky_switch_core::records::{IDENTITY_PATH, IdentityDoc, VersionOrder};
 use pubky_switch_core::sig::SignedDoc;
 
+use super::App;
 use super::error::{Alarm, AppError};
 use super::state::{CachedDoc, Floor, Reader, Tx, key};
 use crate::error::TransportError;
@@ -27,6 +32,117 @@ use crate::transport::BoxFuture;
 /// How long a sender's `identity.json` copy is used without reading it again: 10 minutes
 /// (Switch spec 4.3, "Caching for verification and use").
 pub const DOC_CACHE_MS: u64 = 10 * 60_000;
+
+/// How recent the last confirmed read of the own `identity.json` must be for an app to make
+/// an attempt: 60 seconds (Switch spec 12.6 "Residual risk", 4.3).
+pub const REVALIDATION_MS: u64 = 60_000;
+
+/// What reading the own `identity.json` from the Homeserver found ([`App::refresh_identity`]).
+///
+/// Only [`IdentityRefresh::Newer`] and [`IdentityRefresh::Current`] confirm the copy the app
+/// holds. Times are the app's clock, in Unix milliseconds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum IdentityRefresh {
+    /// The Homeserver serves a newer version, which the app took: it is confirmed.
+    Newer {
+        /// The version taken.
+        version: u64,
+        /// When the read was answered.
+        confirmed_at: u64,
+    },
+    /// The Homeserver serves the version the app holds: it is confirmed.
+    Current {
+        /// When the read was answered.
+        confirmed_at: u64,
+    },
+    /// The Homeserver serves a version the app doesn't take, older than the one it took from
+    /// its switch: the Homeserver lags, and confirms nothing.
+    Older {
+        /// The version it serves.
+        served: u64,
+    },
+    /// The Homeserver serves no `identity.json`: nothing is confirmed.
+    Missing,
+    /// The Homeserver couldn't be read: nothing is confirmed.
+    Unavailable,
+}
+
+impl IdentityRefresh {
+    /// When the read confirmed the copy held, for the outcomes that confirm it.
+    pub fn confirmed_at(&self) -> Option<u64> {
+        match self {
+            IdentityRefresh::Newer { confirmed_at, .. }
+            | IdentityRefresh::Current { confirmed_at } => Some(*confirmed_at),
+            _ => None,
+        }
+    }
+}
+
+/// The last read that confirmed the own copy: the version confirmed, and when.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Confirmed {
+    pub(crate) version: u64,
+    pub(crate) at_ms: u64,
+}
+
+impl App {
+    /// Read the own `identity.json` from the Homeserver and take it if newer (Switch spec
+    /// 4.3): the app calls this when the Homeserver's event stream names the document, after
+    /// waking, and before an attempt that needs a fresh copy.
+    ///
+    /// An app makes no attempt without an `identity.json` revalidated in the last
+    /// [`REVALIDATION_MS`] (Switch spec 12.6 "Residual risk"). Before one, a wallet calls
+    /// this and goes ahead only when [`IdentityRefresh::confirmed_at`] is `Some`, or when
+    /// [`App::identity_confirmed_at`] is less than [`REVALIDATION_MS`] before the app's clock:
+    /// `Missing`, `Older`, `Unavailable` and an error confirm nothing, so a document missing
+    /// from the Homeserver stops attempts once the last confirmation is 60 seconds old.
+    ///
+    /// # Errors
+    ///
+    /// The alarm a copy raises (equivocation, a removed app listed again); a copy that
+    /// doesn't verify; a failed commit.
+    pub async fn refresh_identity(&mut self) -> Result<IdentityRefresh, AppError> {
+        self.ready_local().await?;
+        self.refuse_when_stopped()?;
+        let identity = self.state.meta.identity;
+        let doc = match read_homeserver(self.env.homeserver.as_ref(), &identity).await {
+            Ok(Some(doc)) => doc,
+            Ok(None) => return Ok(IdentityRefresh::Missing),
+            Err(AppError::Transport(_)) => return Ok(IdentityRefresh::Unavailable),
+            Err(error) => return Err(error),
+        };
+        let served = doc.version();
+        let newer = self.take_own_copy(doc).await?;
+        let held = self.state.own_doc.version();
+        if !newer && served != held {
+            return Ok(IdentityRefresh::Older { served });
+        }
+        let confirmed_at = self.now();
+        self.identity_confirmed = Some(Confirmed {
+            version: held,
+            at_ms: confirmed_at,
+        });
+        Ok(if newer {
+            IdentityRefresh::Newer {
+                version: held,
+                confirmed_at,
+            }
+        } else {
+            IdentityRefresh::Current { confirmed_at }
+        })
+    }
+
+    /// When a Homeserver read last confirmed the own `identity.json` the app holds now, on
+    /// the app's clock, in Unix milliseconds ([`App::refresh_identity`]). `None` when none
+    /// has since the app was loaded, or the app took a newer copy from another source since,
+    /// which needs its own confirmation.
+    pub fn identity_confirmed_at(&self) -> Option<u64> {
+        self.identity_confirmed
+            .filter(|confirmed| confirmed.version == self.state.own_doc.version())
+            .map(|confirmed| confirmed.at_ms)
+    }
+}
 
 /// Reads a public file of an identity's Homeserver.
 ///

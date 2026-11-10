@@ -16,8 +16,8 @@ use serde_json::{Map, json};
 use super::fake::Fault;
 use super::*;
 use crate::app::{
-    Alarm, AppBackup, AppError, AppEvent, LeaveMode, LeaveReport, ParkReason, Refusal,
-    UserConfirmed,
+    Alarm, AppBackup, AppError, AppEvent, IdentityRefresh, LeaveMode, LeaveReport, ParkReason,
+    REVALIDATION_MS, Refusal, UserConfirmed,
 };
 use crate::store::{Fault as StoreFault, FaultStore};
 
@@ -1156,10 +1156,24 @@ async fn test_app_refresh_identity_takes_a_newer_homeserver_copy() {
     body.version += 1;
     let newer = IdentityDoc::sign(&w.alice, body.clone()).unwrap();
     w.homeserver.publish(&newer);
-    assert!(app.refresh_identity().await.unwrap());
+    assert_eq!(
+        app.refresh_identity().await.unwrap(),
+        IdentityRefresh::Newer {
+            version: before + 1,
+            confirmed_at: START,
+        }
+    );
     assert_eq!(app.own_identity().version(), before + 1);
-    // The same copy again changes nothing.
-    assert!(!app.refresh_identity().await.unwrap());
+    assert_eq!(app.identity_confirmed_at(), Some(START));
+    // The same copy again confirms it.
+    w.clock.set_ms(START + 5_000);
+    assert_eq!(
+        app.refresh_identity().await.unwrap(),
+        IdentityRefresh::Current {
+            confirmed_at: START + 5_000
+        }
+    );
+    assert_eq!(app.identity_confirmed_at(), Some(START + 5_000));
     // Another body at that version, from the switch: equivocation across sources.
     body.data_epoch += 1;
     let other = IdentityDoc::sign(&w.alice, body).unwrap();
@@ -1172,16 +1186,70 @@ async fn test_app_refresh_identity_takes_a_newer_homeserver_copy() {
 }
 
 #[tokio::test]
-async fn test_app_refresh_identity_ignores_an_older_copy() {
+async fn test_app_refresh_identity_of_an_older_copy_confirms_nothing() {
     let w = World::new();
     let mut app = w.join("wallet").await;
     let first = app.own_identity().clone();
+    assert!(
+        app.refresh_identity()
+            .await
+            .unwrap()
+            .confirmed_at()
+            .is_some()
+    );
     w.next_doc(|_| {});
     app.receive(None).await.unwrap();
+    // The copy taken from the feed isn't the one the Homeserver confirmed.
+    assert_eq!(app.identity_confirmed_at(), None);
     // A stale Homeserver serves the earlier version.
     w.homeserver.publish(&first);
-    assert!(!app.refresh_identity().await.unwrap());
+    assert_eq!(
+        app.refresh_identity().await.unwrap(),
+        IdentityRefresh::Older {
+            served: first.version()
+        }
+    );
     assert_eq!(app.own_identity().version(), first.version() + 1);
+    assert_eq!(app.identity_confirmed_at(), None);
+}
+
+#[tokio::test]
+async fn test_app_refresh_identity_missing_or_unavailable_confirms_nothing() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    assert_eq!(app.identity_confirmed_at(), None);
+    let confirmed = app.refresh_identity().await.unwrap();
+    assert_eq!(
+        confirmed,
+        IdentityRefresh::Current {
+            confirmed_at: START
+        }
+    );
+    // The Homeserver stops serving the document: the last confirmation stays where it was,
+    // so it ages past the window.
+    w.homeserver.files.lock().unwrap().clear();
+    w.clock.set_ms(START + REVALIDATION_MS);
+    let missing = app.refresh_identity().await.unwrap();
+    assert_eq!(missing, IdentityRefresh::Missing);
+    assert_eq!(missing.confirmed_at(), None);
+    assert_eq!(app.identity_confirmed_at(), Some(START));
+    let fresh = |app: &App, now: u64| {
+        app.identity_confirmed_at()
+            .is_some_and(|at| now.saturating_sub(at) < REVALIDATION_MS)
+    };
+    assert!(!fresh(&app, START + REVALIDATION_MS));
+    // A Homeserver that can't be read confirms nothing either.
+    *w.homeserver.down.lock().unwrap() = true;
+    let unavailable = app.refresh_identity().await.unwrap();
+    assert_eq!(unavailable, IdentityRefresh::Unavailable);
+    assert_eq!(unavailable.confirmed_at(), None);
+    assert_eq!(app.identity_confirmed_at(), Some(START));
+    // Served again, it confirms the copy held anew.
+    *w.homeserver.down.lock().unwrap() = false;
+    w.homeserver.publish(app.own_identity());
+    let again = app.refresh_identity().await.unwrap();
+    assert_eq!(again.confirmed_at(), Some(START + REVALIDATION_MS));
+    assert!(fresh(&app, START + REVALIDATION_MS));
 }
 
 #[test]

@@ -690,7 +690,10 @@ async fn test_send_own_identity_goes_to_recent_peers_after_a_removal() {
             distrust_from: START,
         })
     });
-    assert!(app.refresh_identity().await.unwrap());
+    assert!(matches!(
+        app.refresh_identity().await.unwrap(),
+        crate::app::IdentityRefresh::Newer { .. }
+    ));
     app.flush_outbox().await.unwrap();
     assert_eq!(
         s.peer.lock().peers[&s.w.alice.public()].version(),
@@ -1851,7 +1854,10 @@ async fn test_send_unreachable_peer_doesnt_hold_up_the_others() {
             distrust_from: START,
         })
     });
-    assert!(app.refresh_identity().await.unwrap());
+    assert!(matches!(
+        app.refresh_identity().await.unwrap(),
+        crate::app::IdentityRefresh::Newer { .. }
+    ));
     app.flush_outbox().await.unwrap();
     assert_eq!(
         s.peer.lock().peers[&s.w.alice.public()].version(),
