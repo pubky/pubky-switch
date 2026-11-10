@@ -2095,6 +2095,43 @@ async fn test_not_current_while_listed_with_its_own_certificate_is_final() {
 }
 
 #[tokio::test]
+async fn test_not_current_from_a_service_the_identity_left_follows_the_move() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join(&w, &router).await;
+    let me = app.app_id();
+    // The identity publishes generation 2 at another service, still listing the app with
+    // the certificate it holds.
+    let n_key = next_key();
+    let next = w.switch.import_into(n_key.to_bytes());
+    router.add(NEXT, &next);
+    publish_at(
+        &w,
+        &next,
+        Inbox::new(NEXT, n_key.verifying_key().to_bytes()),
+        2,
+        None,
+    );
+    // The old service answers `403 not_current`, which says nothing once the identity left
+    // it (Switch wire 7.2).
+    w.switch.fail_next(Fault::Error {
+        path: "feed".into(),
+        code: ErrorCode::NotCurrent,
+        current: json!({}),
+    });
+    let seq = note_at(&w, &next, me, "at the next service");
+    let report = app.receive(None).await.unwrap();
+    assert!(
+        !has(&report.events, |e| matches!(e, AppEvent::Removed)),
+        "{:?}",
+        report.events
+    );
+    assert!(received(&report.events, seq), "{:?}", report.events);
+    assert_eq!(app.cursor().generation, 2);
+    assert_ne!(app.follow_provider().await.unwrap(), ProviderStatus::Gone);
+}
+
+#[tokio::test]
 async fn test_not_current_without_the_homeserver_isnt_final() {
     let w = World::new();
     let router = Router::of(&w);

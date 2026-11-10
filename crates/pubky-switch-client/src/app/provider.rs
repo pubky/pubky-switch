@@ -20,8 +20,8 @@
 //! - **A key change in place**, or a move the app never saw frozen, is followed the same way
 //!   from the switch on.
 //! - **Revocation and erasure.** An own `identity.json` that lists the app in `removed`, or a
-//!   `403 not_current` answer while the newest one doesn't list the app with another
-//!   certificate, means the app isn't current; a `404` that the account's key didn't sign,
+//!   `403 not_current` answer from the service and generation the newest one names, while
+//!   it doesn't list the app with another certificate, means the app isn't current; a `404` that the account's key didn't sign,
 //!   while the identity publishes no `identity.json`, held at every try for
 //!   [`ERASURE_WAIT_MS`], means its account is gone. The app keeps that, stops, reports it
 //!   and drops its push setting.
@@ -357,10 +357,12 @@ impl App {
                 if self.state.leave.is_some() {
                     return Ok(TakeOver::Done(Err(error)));
                 }
-                // Switch wire 7.2: final unless the newest identity.json lists the app with
-                // another certificate than the one it holds, a renewal it takes before it
-                // asks again. Listed with its own, listed in `removed` or not listed, it is
-                // revoked, departed or dropped (Switch spec 12.2, 12.3). Without a read of
+                // Switch wire 7.2: final only from the service and generation the newest
+                // identity.json names, and unless it lists the app with another certificate
+                // than the one it holds, a renewal it takes before it asks again. Listed with
+                // its own, listed in `removed` or not listed, it is revoked, departed or
+                // dropped (Switch spec 12.2, 12.3). A service the identity has left may say
+                // anything: the app follows the newer document instead. Without a read of
                 // the Homeserver, the newest isn't known: the answer stands for now.
                 let identity = self.state.meta.identity;
                 match identity::read_homeserver(self.env.homeserver.as_ref(), &identity).await {
@@ -370,8 +372,14 @@ impl App {
                     Ok(None) => {}
                     Err(_) => return Ok(TakeOver::Done(Err(error))),
                 }
-                let me = self.state.meta.app_id;
+                let meta = &self.state.meta;
                 let doc = &self.state.own_doc;
+                if doc.generation() > meta.generation
+                    || doc.inbox() != &Inbox::new(&meta.origin, meta.service_key)
+                {
+                    return Ok(TakeOver::ReadAgain);
+                }
+                let me = self.state.meta.app_id;
                 if !doc.lists_removed(&me)
                     && doc
                         .listed_cert(&me)
