@@ -271,7 +271,7 @@ impl FeedPage {
         };
         Ok(Self {
             items: o
-                .objects("items")?
+                .required_objects("items")?
                 .into_iter()
                 .filter_map(|item| FeedItem::read(item).transpose())
                 .collect::<Result<_, _>>()?,
@@ -469,7 +469,7 @@ impl ConnectList {
     pub(crate) fn read(o: Obj<'_>) -> Result<Self, ClientError> {
         Ok(Self {
             requests: o
-                .objects("requests")?
+                .required_objects("requests")?
                 .into_iter()
                 .map(|r| {
                     Ok(ConnectRequest {
@@ -514,7 +514,7 @@ impl ClaimAnswer {
         Ok(Self {
             claim: ClaimView::from_value(claim)?,
             entries: o
-                .objects("entries")?
+                .required_objects("entries")?
                 .into_iter()
                 .map(|e| {
                     Ok(ClaimEntryItem {
@@ -569,7 +569,7 @@ impl SharedRecordView {
             key: o.b64n("key")?,
             collection: o.b64n("collection")?,
             read_scope: o.string("read_scope")?,
-            write_scopes: o.each("write_scopes", read::string)?,
+            write_scopes: o.required_each("write_scopes", read::string)?,
             generation: o.u64("generation")?,
             version: o.u64("version")?,
             seq: o.u64("seq")?,
@@ -598,7 +598,7 @@ impl RecordPage {
     pub(crate) fn read(o: Obj<'_>) -> Result<Self, ClientError> {
         Ok(Self {
             records: o
-                .objects("records")?
+                .required_objects("records")?
                 .into_iter()
                 .map(SharedRecordView::read)
                 .collect::<Result<_, _>>()?,
@@ -646,7 +646,7 @@ impl Directory {
         let mut apps: Vec<DirectoryApp> = Vec::new();
         let mut skipped: Vec<[u8; 16]> = Vec::new();
         let mut seen = std::collections::HashSet::new();
-        for a in o.objects("apps")? {
+        for a in o.required_objects("apps")? {
             // An entry without an App ID that reads can't be named; it is left out.
             let Ok(app_id) = a.app_id("app_id") else {
                 continue;
@@ -718,7 +718,7 @@ impl KeysAnswer {
     pub(crate) fn read(o: Obj<'_>) -> Result<Self, ClientError> {
         Ok(Self {
             bundles: o
-                .objects("bundles")?
+                .required_objects("bundles")?
                 .into_iter()
                 .map(|b| {
                     let bundle = b
@@ -859,7 +859,7 @@ pub struct AppStatus {
 impl AppStatus {
     fn read(o: Obj<'_>) -> Result<Self, ClientError> {
         let bundle_ranges = o
-            .list("bundle_ranges")?
+            .required_list("bundle_ranges")?
             .iter()
             .map(|range| match range.as_array().map(Vec::as_slice) {
                 Some([first, last]) => Some(EpochRange {
@@ -877,8 +877,10 @@ impl AppStatus {
             revoked_at: o.opt_time("revoked_at")?,
             departed_at: o.opt_time("departed_at")?,
             awaiting_rotation: o.opt_bool("awaiting_rotation")?.unwrap_or(false),
+            // Required: a missing list never reads as no open or `unknown` attempt, the
+            // condition for purging a revoked app (Switch wire 9.1).
             open_attempts: o
-                .objects("open_attempts")?
+                .required_objects("open_attempts")?
                 .into_iter()
                 .map(|a| {
                     Ok(OpenAttempt {
@@ -919,7 +921,8 @@ pub struct AppsAnswer {
     pub apps: Vec<AppStatus>,
     /// The recovery in progress, if any.
     pub recovery: Option<RecoveryState>,
-    /// The generations whose service keys `identity.json` keeps, ascending.
+    /// The generations whose service keys `identity.json` keeps, ascending; the answer
+    /// leaves the member out when there are none.
     pub proof_generations: Vec<u64>,
     /// The newest `identity.json` the service holds, as signed.
     pub identity: Option<SignedDoc>,
@@ -942,12 +945,12 @@ impl AppsAnswer {
         };
         Ok(Self {
             apps: o
-                .objects("apps")?
+                .required_objects("apps")?
                 .into_iter()
                 .map(AppStatus::read)
                 .collect::<Result<_, _>>()?,
             recovery,
-            proof_generations: o.each("proof_generations", read::int)?,
+            proof_generations: o.opt_each("proof_generations", read::int)?,
             identity: o.opt_doc("identity")?,
             server_time,
         })
@@ -1131,10 +1134,10 @@ pub struct UploadChanges {
 impl UploadChanges {
     fn read(o: Obj<'_>) -> Result<Self, ClientError> {
         Ok(Self {
-            records: o.each("records", read::b64_32)?,
-            divergent: o.each("divergent", read::b64_32)?,
-            claims: o.each("claims", read::b64_32)?,
-            divergent_claims: o.each("divergent_claims", read::b64_32)?,
+            records: o.required_each("records", read::b64_32)?,
+            divergent: o.required_each("divergent", read::b64_32)?,
+            claims: o.required_each("claims", read::b64_32)?,
+            divergent_claims: o.required_each("divergent_claims", read::b64_32)?,
             unverified: o.opt_u64("unverified")?.unwrap_or(0),
             distrusted: o.opt_u64("distrusted")?.unwrap_or(0),
             refused: o.opt_u64("refused")?.unwrap_or(0),
@@ -1184,6 +1187,80 @@ impl UploadAnswer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::SigningKey;
+    use pubky_switch_core::chain::{ChainTip, ZERO_HASH};
+    use pubky_switch_core::enc::zbase32_encode;
+    use pubky_switch_core::keys::IdentityKey;
+    use pubky_switch_core::records::{IdentityBody, IdentityPolicy, Inbox};
+    use pubky_switch_core::time::rfc3339;
+
+    const ACCOUNT_SECRET: [u8; 32] = [1; 32];
+    const AT: u64 = 1_767_225_600_000;
+
+    fn account() -> [u8; 32] {
+        IdentityKey::from_secret(ACCOUNT_SECRET).public()
+    }
+
+    /// `read` takes `valid`, and refuses it as malformed with the member at `pointer`
+    /// missing and with it `null`.
+    fn requires(valid: &Value, pointer: &str, read: impl Fn(&Value) -> Result<(), ClientError>) {
+        read(valid).unwrap_or_else(|error| panic!("{pointer}: the valid form: {error:?}"));
+        let (parent, member) = pointer.rsplit_once('/').unwrap();
+        for null in [false, true] {
+            let mut value = valid.clone();
+            let object = value.pointer_mut(parent).unwrap().as_object_mut().unwrap();
+            if null {
+                object.insert(member.into(), Value::Null);
+            } else {
+                object.remove(member);
+            }
+            let read = read(&value);
+            assert!(
+                matches!(read, Err(ClientError::InvalidResponse(_))),
+                "{pointer} (null: {null}): {read:?}"
+            );
+        }
+    }
+
+    fn head_value() -> Value {
+        let tip = ChainTip {
+            generation: 1,
+            seq: 9,
+            chain_hash: ZERO_HASH,
+        };
+        SignedHead::sign(&SigningKey::from_bytes(&[5; 32]), &account(), &tip).to_value()
+    }
+
+    fn doc_value() -> Value {
+        json!({ "body": "e30", "sig": "AA" })
+    }
+
+    fn record_view() -> Value {
+        json!({
+            "key": b64(&[1; 32]), "collection": b64(&[2; 32]), "read_scope": "scope-a",
+            "write_scopes": ["scope-a"], "generation": 1, "version": 1, "seq": 3,
+            "deleted": false, "writer": zbase32_encode(&[3; 16]), "op": doc_value(),
+            "cert": doc_value()
+        })
+    }
+
+    fn app_status() -> Value {
+        json!({
+            "app_id": zbase32_encode(&[3; 16]), "current": false,
+            "open_attempts": [
+                { "claim_key": b64(&[4; 32]), "attempt_id": b64(&[5; 16]), "outcome": "unknown" }
+            ],
+            "bundle_ranges": [[1, 2]]
+        })
+    }
+
+    fn apps_answer() -> Value {
+        json!({ "apps": [app_status()], "identity": null, "recovery": null })
+    }
+
+    fn read_apps(value: &Value) -> Result<AppsAnswer, ClientError> {
+        AppsAnswer::read(Obj::of(value, "apps")?, AT)
+    }
 
     fn allow_answer() -> Value {
         serde_json::json!({
@@ -1219,6 +1296,169 @@ mod tests {
                 AllowList::read(Obj::of(&value, "allow").unwrap()).is_err(),
                 "{member}"
             );
+        }
+    }
+
+    #[test]
+    fn test_app_status_requires_open_attempts() {
+        // A missing list never reads as "owns no open or unknown attempt", which would let a
+        // signer purge a revoked app (Switch wire 9.1).
+        requires(&apps_answer(), "/apps/0/open_attempts", |value| {
+            let answer = read_apps(value)?;
+            assert_eq!(answer.apps[0].open_attempts[0].outcome, "unknown");
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_app_status_requires_bundle_ranges() {
+        requires(&apps_answer(), "/apps/0/bundle_ranges", |value| {
+            let answer = read_apps(value)?;
+            assert_eq!(
+                answer.apps[0].bundle_ranges,
+                [EpochRange { first: 1, last: 2 }]
+            );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_apps_answer_requires_apps() {
+        requires(&apps_answer(), "/apps", |value| {
+            assert_eq!(read_apps(value)?.apps.len(), 1);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_apps_answer_reads_absent_proof_generations_as_none() {
+        // Absent when none (Switch wire 7.4.12).
+        let mut value = apps_answer();
+        assert!(read_apps(&value).unwrap().proof_generations.is_empty());
+        value["proof_generations"] = Value::Null;
+        assert!(read_apps(&value).unwrap().proof_generations.is_empty());
+        value["proof_generations"] = json!([1, 2]);
+        assert_eq!(read_apps(&value).unwrap().proof_generations, [1, 2]);
+    }
+
+    #[test]
+    fn test_feed_page_requires_items() {
+        let page = json!({
+            "items": [{ "type": "missed", "seq": 4, "entries": 2 }], "next": "1:9",
+            "scanned_through": 9, "more": false, "head": head_value()
+        });
+        requires(&page, "/items", |value| {
+            let page = FeedPage::read(Obj::of(value, "feed")?, &account())?;
+            assert_eq!(page.items.len(), 1);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_connect_list_requires_requests() {
+        let list = json!({
+            "requests": [{ "pubky": pubky_id(&[6; 32]), "at": rfc3339(AT) }],
+            "max_pending": 50, "full": false
+        });
+        requires(&list, "/requests", |value| {
+            assert_eq!(
+                ConnectList::read(Obj::of(value, "connect")?)?
+                    .requests
+                    .len(),
+                1
+            );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_claim_answer_requires_entries() {
+        let claim = json!({ "claim_key": b64(&[4; 32]), "state": "FREE", "step": 1,
+                            "attempts": [] });
+        let answer = json!({
+            "claim": claim,
+            "entries": [{ "step": 0, "seq": 3, "op": doc_value(), "proof": doc_value() }]
+        });
+        requires(&answer, "/entries", |value| {
+            assert_eq!(
+                ClaimAnswer::read(Obj::of(value, "claim")?)?.entries.len(),
+                1
+            );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_record_view_requires_write_scopes() {
+        requires(&record_view(), "/write_scopes", |value| {
+            let view = SharedRecordView::read(Obj::of(value, "record")?)?;
+            assert_eq!(view.write_scopes, ["scope-a"]);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_record_page_requires_records() {
+        let page = json!({ "records": [record_view()], "seq": 3, "next": null });
+        requires(&page, "/records", |value| {
+            assert_eq!(
+                RecordPage::read(Obj::of(value, "records")?)?.records.len(),
+                1
+            );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_directory_requires_apps() {
+        let identity = IdentityKey::from_secret(ACCOUNT_SECRET);
+        let body = IdentityBody::first(
+            account(),
+            [7; 16],
+            Inbox::new("https://switch.example", [5; 32]),
+            IdentityPolicy::default(),
+        );
+        let doc = IdentityDoc::sign(&identity, body).unwrap();
+        // An entry whose record doesn't verify is skipped, not refused (Switch spec 8.1).
+        let directory = json!({
+            "identity": doc.signed(),
+            "apps": [{ "app_id": zbase32_encode(&[3; 16]), "record": doc_value() }],
+            "directory_version": 1, "apps_version": 1
+        });
+        requires(&directory, "/apps", |value| {
+            let directory = Directory::read(Obj::of(value, "directory")?, &account())?;
+            assert_eq!(directory.skipped, [[3; 16]]);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_keys_answer_requires_bundles() {
+        requires(&json!({ "bundles": [] }), "/bundles", |value| {
+            assert!(
+                KeysAnswer::read(Obj::of(value, "keys")?)?
+                    .bundles
+                    .is_empty()
+            );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_upload_changes_require_every_list() {
+        let changes = json!({
+            "records": [b64(&[1; 32])], "divergent": [], "claims": [], "divergent_claims": [],
+            "unverified": 0, "distrusted": 0, "refused": 0, "heads": 0, "lists": false
+        });
+        let answer = json!({ "result": changes, "merged": changes });
+        for changes in ["result", "merged"] {
+            for list in ["records", "divergent", "claims", "divergent_claims"] {
+                requires(&answer, &format!("/{changes}/{list}"), |value| {
+                    let answer = UploadAnswer::read_counts(Obj::of(value, "upload")?)?;
+                    assert_eq!(answer.result.unwrap().records, [[1; 32]]);
+                    Ok(())
+                });
+            }
         }
     }
 }
