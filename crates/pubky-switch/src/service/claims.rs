@@ -171,7 +171,7 @@ impl Service {
             .await
             .map_err(|e| store_error(&e))?;
         // Entries no longer wait for it (Switch wire 9.1).
-        txn.delete_passed_entries()
+        batch::release_entries(txn, held, time_ms)
             .await
             .map_err(|e| store_error(&e))?;
         // It leaves the directory: its record and receive key no longer show, and a

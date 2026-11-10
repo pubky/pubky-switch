@@ -73,6 +73,26 @@ pub(crate) fn awaiting_rotation(kept: &KeptAppId) -> bool {
     kept.reason == KeptReason::Departed && !kept.rotated
 }
 
+/// The account's apps as `view` holds them, at service time `now`, for judging which are
+/// current (Switch spec 3.4).
+fn view_state(
+    identity: [u8; 32],
+    generation: u64,
+    view: &AppsView,
+    doc: Option<&IdentityDoc>,
+    now: u64,
+) -> Result<OpsState, StoreError> {
+    let mut state = OpsState::new(identity, generation, 0, now);
+    state.doc = doc.cloned();
+    for app in &view.apps {
+        state
+            .apps
+            .insert(app.app_id, super::batch::held_app(app, &identity)?);
+    }
+    state.kept = view.kept.iter().map(|kept| kept.app_id).collect();
+    Ok(state)
+}
+
 /// The statuses of `GET /apps`, at service time `now`, by App ID, each as JSON in the order
 /// of the wire's table (Switch wire 7.4.12): every app with a row, every App ID kept for
 /// good, and every app `doc` lists.
@@ -87,16 +107,9 @@ pub(crate) fn statuses(
     doc: Option<&IdentityDoc>,
     now: u64,
 ) -> Result<Vec<Vec<u8>>, StoreError> {
-    let mut state = OpsState::new(identity, generation, 0, now);
-    state.doc = doc.cloned();
-    for app in &view.apps {
-        state
-            .apps
-            .insert(app.app_id, super::batch::held_app(app, &identity)?);
-    }
+    let state = view_state(identity, generation, view, doc, now)?;
     let kept: BTreeMap<[u8; 16], &KeptAppId> =
         view.kept.iter().map(|kept| (kept.app_id, kept)).collect();
-    state.kept = kept.keys().copied().collect();
     let rows: BTreeMap<[u8; 16], &crate::store::StoredApp> =
         view.apps.iter().map(|app| (app.app_id, app)).collect();
     let mut ids: BTreeSet<[u8; 16]> = rows.keys().copied().collect();
@@ -217,7 +230,19 @@ impl Service {
         time_ms: u64,
     ) -> Result<Answer, ApiError> {
         let head = txn.head().clone();
-        let view = txn.apps_view().await.map_err(|e| store_error(&e))?;
+        let mut view = txn.apps_view().await.map_err(|e| store_error(&e))?;
+        // Unread entries count for the apps current now, by the one rule (Switch wire
+        // 7.4.12, 9.1).
+        let current = view_state(head.identity_key, head.generation, &view, held, time_ms)
+            .map_err(|e| store_error(&e))?
+            .current_app_ids();
+        view.unread = txn
+            .unread_counts(&current)
+            .await
+            .map_err(|e| store_error(&e))?
+            .into_iter()
+            .map(|(app, unread, sole)| (app, (unread, sole)))
+            .collect();
         let apps = statuses(head.identity_key, head.generation, &view, held, time_ms)
             .map_err(|e| store_error(&e))?;
         let recovery_from = held.and_then(|doc| doc.body().recovery_from);

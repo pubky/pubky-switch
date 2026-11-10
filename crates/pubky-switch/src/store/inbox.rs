@@ -166,29 +166,27 @@ impl AccountTxn {
         Ok(())
     }
 
-    /// Delete the entries every target has passed (Switch wire 9.1): each target's cursor,
-    /// in the generation the account serves, is at or past the entry, or its App ID is kept
-    /// for good (revoked or departed). An entry whose every target is kept stays, for the
+    /// Delete the entries every current target has passed (Switch wire 9.1): each target
+    /// in `current`, the App IDs current now, has its cursor, in the generation the account
+    /// serves, at or past the entry. An entry with no current target stays, for the
     /// unreadable item that replaces it.
-    pub async fn delete_passed_entries(&mut self) -> Result<u64, StoreError> {
+    pub async fn delete_passed_entries(&mut self, current: &[[u8; 16]]) -> Result<u64, StoreError> {
         let head = self.head().clone();
+        let current: Vec<Vec<u8>> = current.iter().map(|app| app.to_vec()).collect();
         let deleted = sqlx::query(
             "DELETE FROM inbox_entries e WHERE e.account_id = $1 AND e.generation = $2 \
+             AND EXISTS (SELECT 1 FROM unnest(e.targets) AS t(app_id) WHERE t.app_id = ANY($3)) \
              AND NOT EXISTS ( \
                  SELECT 1 FROM unnest(e.targets) AS t(app_id) \
-                 WHERE NOT EXISTS (SELECT 1 FROM kept_app_ids k \
-                                   WHERE k.account_id = e.account_id AND k.app_id = t.app_id) \
+                 WHERE t.app_id = ANY($3) \
                  AND NOT EXISTS (SELECT 1 FROM apps a \
                                  WHERE a.account_id = e.account_id AND a.app_id = t.app_id \
                                  AND a.cursor_generation = e.generation \
-                                 AND a.cursor_seq >= e.seq)) \
-             AND EXISTS ( \
-                 SELECT 1 FROM unnest(e.targets) AS t(app_id) \
-                 WHERE NOT EXISTS (SELECT 1 FROM kept_app_ids k \
-                                   WHERE k.account_id = e.account_id AND k.app_id = t.app_id))",
+                                 AND a.cursor_seq >= e.seq))",
         )
         .bind(&head.id)
         .bind(to_db(head.generation, "generation")?)
+        .bind(current)
         .execute(self.conn())
         .await
         .map_err(StoreError::from_db)?
@@ -196,25 +194,26 @@ impl AccountTxn {
         Ok(deleted)
     }
 
-    /// Each app's unread entries, and of those, the ones it is the only current target of
-    /// (Switch wire 7.4.12 `unread_entries`, `sole_target_unread`), for the apps with any.
-    pub async fn unread_counts(&mut self) -> Result<Vec<([u8; 16], u64, u64)>, StoreError> {
+    /// Each current app's unread entries, and of those, the ones it is the only current
+    /// target of (Switch wire 7.4.12 `unread_entries`, `sole_target_unread`), for the apps
+    /// with any; `current` holds the App IDs current now.
+    pub async fn unread_counts(
+        &mut self,
+        current: &[[u8; 16]],
+    ) -> Result<Vec<([u8; 16], u64, u64)>, StoreError> {
         let head = self.head().clone();
+        let current: Vec<Vec<u8>> = current.iter().map(|app| app.to_vec()).collect();
         let rows = sqlx::query(
             "WITH unread AS ( \
                  SELECT e.seq, t.app_id FROM inbox_entries e, unnest(e.targets) AS t(app_id) \
-                 WHERE e.account_id = $1 AND e.generation = $2 \
-                 AND NOT EXISTS (SELECT 1 FROM kept_app_ids k \
-                                 WHERE k.account_id = e.account_id AND k.app_id = t.app_id) \
+                 WHERE e.account_id = $1 AND e.generation = $2 AND t.app_id = ANY($3) \
                  AND NOT EXISTS (SELECT 1 FROM apps a \
                                  WHERE a.account_id = e.account_id AND a.app_id = t.app_id \
                                  AND a.cursor_generation = e.generation \
                                  AND a.cursor_seq >= e.seq)), \
              current_targets AS ( \
                  SELECT e.seq, count(*) AS n FROM inbox_entries e, unnest(e.targets) AS t(app_id) \
-                 WHERE e.account_id = $1 AND e.generation = $2 \
-                 AND NOT EXISTS (SELECT 1 FROM kept_app_ids k \
-                                 WHERE k.account_id = e.account_id AND k.app_id = t.app_id) \
+                 WHERE e.account_id = $1 AND e.generation = $2 AND t.app_id = ANY($3) \
                  GROUP BY e.seq) \
              SELECT u.app_id, count(*)::BIGINT AS unread, \
                     (count(*) FILTER (WHERE c.n = 1))::BIGINT AS sole \
@@ -222,6 +221,7 @@ impl AccountTxn {
         )
         .bind(&head.id)
         .bind(to_db(head.generation, "generation")?)
+        .bind(current)
         .fetch_all(self.conn())
         .await
         .map_err(StoreError::from_db)?;

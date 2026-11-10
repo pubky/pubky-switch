@@ -76,7 +76,9 @@ pub struct AppsView {
     pub parts: BTreeMap<[u8; 16], Vec<PartSpan>>,
     /// Every attempt open or unknown.
     pub open_attempts: Vec<OpenAttempt>,
-    /// Each app's unread entries, and of those the ones it is the only current target of.
+    /// Each current app's unread entries, and of those the ones it is the only current
+    /// target of: filled by the service, which judges which apps are current
+    /// ([`AccountTxn::unread_counts`]).
     pub unread: BTreeMap<[u8; 16], (u64, u64)>,
     /// The generations that some current record's kept proof names (Switch wire 7.4.9).
     pub record_generations: Vec<u64>,
@@ -266,12 +268,6 @@ impl AccountTxn {
                 }
             }
         }
-        view.unread = self
-            .unread_counts()
-            .await?
-            .into_iter()
-            .map(|(app, unread, sole)| (app, (unread, sole)))
-            .collect();
         let (records, entries) = self.kept_proof_generations().await?;
         view.record_generations = records;
         view.claim_entry_generations = entries;

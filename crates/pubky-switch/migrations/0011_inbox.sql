@@ -27,8 +27,8 @@ CREATE TABLE inbox_entries (
     quota_bytes     BIGINT   NOT NULL CHECK (quota_bytes > 0),
     PRIMARY KEY (account_id, generation, seq)
 );
+-- Also serves each sender's usage of the inbox quota, by its prefix.
 CREATE UNIQUE INDEX inbox_entries_by_content ON inbox_entries (account_id, sender, envelope_hash);
-CREATE INDEX inbox_entries_by_sender ON inbox_entries (account_id, sender);
 
 -- A conversation entry the service writes for a sender an invite code admitted names the
 -- code and its context, and no app (Switch wire 7.4.6). An entry's last admitted append is
@@ -40,10 +40,12 @@ ALTER TABLE list_entries
     ADD COLUMN last_used_ms BIGINT CHECK (last_used_ms >= 0),
     ADD CHECK (written_by IS NOT NULL OR (list = 'conversation' AND code_hash IS NOT NULL));
 
--- Each sender identity's hits against the append limits (Switch wire 9.4 Flags).
+-- Each sender identity's hits against the append limits (Switch wire 9.4 Flags), at most
+-- `max_flags` per account: the least frequent drop, of those the one hit longest ago.
 CREATE TABLE sender_flags (
-    account_id  TEXT    NOT NULL REFERENCES accounts (id) ON DELETE CASCADE,
-    pubky       BYTEA   NOT NULL CHECK (octet_length(pubky) = 32),
-    hits        BIGINT  NOT NULL CHECK (hits > 0),
+    account_id   TEXT    NOT NULL REFERENCES accounts (id) ON DELETE CASCADE,
+    pubky        BYTEA   NOT NULL CHECK (octet_length(pubky) = 32),
+    hits         BIGINT  NOT NULL CHECK (hits > 0),
+    last_hit_ms  BIGINT  NOT NULL CHECK (last_hit_ms >= 0),
     PRIMARY KEY (account_id, pubky)
 );

@@ -358,6 +358,19 @@ pub(super) async fn load_apps(
     Ok(state)
 }
 
+/// Delete the inbox entries every current target has passed (Switch wire 9.1), judged by
+/// the one rule for current apps ([`OpsState::is_current`]): after anything that changes
+/// which apps are current outside a batch, such as a revocation or an `identity.json`
+/// delivery.
+pub(super) async fn release_entries(
+    txn: &mut AccountTxn,
+    held: Option<&IdentityDoc>,
+    now: u64,
+) -> Result<u64, StoreError> {
+    let state = load_apps(txn, held, now).await?;
+    txn.delete_passed_entries(&state.current_app_ids()).await
+}
+
 pub(crate) fn held_app(app: &StoredApp, identity: &[u8; 32]) -> Result<HeldApp, StoreError> {
     let corrupt = |_| StoreError::Corrupt("a stored app document doesn't verify");
     let record = app
@@ -836,9 +849,9 @@ async fn save_apps(
             cursor_moved |= before.apps.get(app_id).map(|held| held.cursor) != Some(app.cursor);
         }
     }
-    // An entry every target has passed goes (Switch wire 9.1).
+    // An entry every current target has passed goes (Switch wire 9.1).
     if cursor_moved {
-        txn.delete_passed_entries().await?;
+        txn.delete_passed_entries(&after.current_app_ids()).await?;
     }
     for (app_id, key) in &after.new_receive_keys {
         txn.add_receive_key(app_id, key.n(), &key.kid(), key.signed())
