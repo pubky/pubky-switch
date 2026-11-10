@@ -563,15 +563,20 @@ impl App {
         }
         let kept = self.reader().scan::<PendingBatch>(PENDING_PREFIX).await?;
         for (id, pending) in kept {
-            // Fresh again before each, should the sends before it have taken long.
-            self.fresh_service_time().await?;
             let id = pubky_switch_core::enc::unb64_array::<16>(&id)
                 .map_err(|_| AppError::Store(crate::error::StoreError::Corrupt))?;
             let batch = self.without_stale_cursor(Batch::from_body(pending.body.clone())?)?;
             // Past the window no answer tells whether it was applied, at any generation: it
             // isn't sent again, and goes, reported with its attempts (Switch wire 6.4 step
-            // 5, Switch spec 12.5 "Kept batches").
-            if !self.answer_decides(pending.kept_ms) {
+            // 5, Switch spec 12.5 "Kept batches"). Past it by the clocks at hand is past it;
+            // only a "still inside" needs a fresh service time, taken again before each
+            // batch, should the sends before it have taken long.
+            let mut past = !self.answer_decides(pending.kept_ms);
+            if !past {
+                self.fresh_service_time().await?;
+                past = !self.answer_decides(pending.kept_ms);
+            }
+            if past {
                 let mut tx = self.tx()?;
                 Self::replace_kept_batch(&id, None, &mut tx)?;
                 self.kept_batch_dropped(&id, &batch, &mut tx)?;

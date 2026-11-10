@@ -37,7 +37,8 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
   no answer of the call brought one; its age is judged at the later of the device clock
   and a service time verified in the call that sends it again, fetched the same way; a
   time verified more than 10 minutes before by the device clock, or with the device clock
-  gone back since, is read again. Past
+  gone back since, is read again. One past the window by the clocks at hand already, the
+  device clock or the service time held, needs no reading. Past
   it a retry would get `409 conflict` once the service dropped its proofs, or be taken as
   new once it forgot the ID (Switch wire 6.4 step 5): the effect's entry is parked as
   uncertain, the batch dropped with its attempts, unsent.

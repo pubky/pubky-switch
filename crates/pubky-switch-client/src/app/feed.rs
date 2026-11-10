@@ -1228,11 +1228,15 @@ impl App {
             return Ok(());
         };
         let batch = Batch::from_body(pending.body.clone())?;
-        self.fresh_service_time().await?;
         // Past the window no answer tells whether it was applied, at any generation: a
         // retry after the service dropped its proofs gets `409 conflict`, and a forgotten
         // ID takes the same bytes as new. It isn't sent again; its entry is stored as
-        // uncertain (Switch wire 6.4 step 5, Switch spec 12.5 "Kept batches").
+        // uncertain (Switch wire 6.4 step 5, Switch spec 12.5 "Kept batches"). Past it by
+        // the clocks at hand is past it; only a "still inside" needs a fresh service time.
+        if !self.answer_decides(pending.kept_ms) {
+            return self.effect_uncertain(&pending).await;
+        }
+        self.fresh_service_time().await?;
         if !self.answer_decides(pending.kept_ms) {
             return self.effect_uncertain(&pending).await;
         }

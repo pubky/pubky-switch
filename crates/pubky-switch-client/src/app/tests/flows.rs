@@ -1433,6 +1433,42 @@ async fn test_kept_batch_kept_after_an_idle_month_is_resent_after_a_lost_answer(
 }
 
 #[tokio::test]
+async fn test_kept_batch_past_the_window_by_the_device_clock_goes_without_a_read() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let (seq, _) = w.note(app.app_id(), "before");
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.receive(None).await.is_err());
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(
+        app.submit_batch(conversation(w.bob.public()))
+            .await
+            .is_err()
+    );
+    assert_eq!(app.kept_batches().await.unwrap().len(), 1);
+    // Past the window by the device clock alone, with no feed read to be had: the kept
+    // effect and batch are judged without one.
+    w.clock.advance_ms(31 * 24 * HOUR);
+    for _ in 0..4 {
+        w.switch.fail_next(Fault::Unreachable {
+            path: "feed".into(),
+            after: 0,
+        });
+    }
+    let _ = app.receive(None).await;
+    assert_eq!(
+        app.state.parked.get(&seq).map(|p| p.reason),
+        Some(ParkReason::Uncertain)
+    );
+    let _ = app.submit_batch(conversation([7; 32])).await;
+    w.switch.lock().faults.clear();
+    assert!(has(&app.kept_duties().await.unwrap(), |e| matches!(
+        e,
+        AppEvent::KeptBatchDropped { .. }
+    )));
+}
+
+#[tokio::test]
 async fn test_fresh_service_time_is_read_again_once_it_has_aged() {
     let w = World::new();
     let (mut app, clock) = app_with_its_own_clock(&w, 0).await;
