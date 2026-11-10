@@ -224,8 +224,9 @@ pub enum AppEvent {
         /// Why.
         reason: ParkReason,
     },
-    /// A received message's effect was refused for good, or has more operations than one
-    /// batch takes with the cursor move: its entry was stored locally and passed
+    /// A received message's effect was refused for good, has more operations than one
+    /// batch takes with the cursor move, or is too large for the app's store to keep or
+    /// commit ([`ParkReason::EffectTooLarge`]): its entry was stored locally and passed
     /// ([`AppEvent::Parked`]), and the effect isn't sent again (Switch spec 8.2). The
     /// protocol may build it again in another form. A duty event.
     EffectRefused {
@@ -780,6 +781,13 @@ pub enum ParkReason {
     /// Its effect has more operations than one batch takes with the cursor move (Switch
     /// wire 6.4): it is kept, not applied, and not tried again.
     TooManyOperations,
+    /// Its effect is too large for the app to keep before it sends it, or to commit with
+    /// its outcome: the kept effect over the store's value size
+    /// ([`crate::store::MAX_VALUE_BYTES`]), or its local writes over what one commit takes
+    /// ([`crate::store::MAX_BATCH_BYTES`]) (Switch spec 8.2). The same effect is refused
+    /// again however often it is built: it is kept, not applied, and not tried again
+    /// ([`AppEvent::EffectRefused`]).
+    EffectTooLarge,
     /// Its receive step asked for more reads from the switch than one entry gets
     /// ([`super::MAX_CLAIM_READS`]), or again for what it was given: it is kept, not
     /// applied, and not tried again.

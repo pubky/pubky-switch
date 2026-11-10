@@ -686,6 +686,11 @@ impl Tx {
         &self.batch.writes
     }
 
+    /// The bytes the batch counts against the store's batch size so far.
+    pub(crate) fn size(&self) -> u64 {
+        self.batch.size()
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.batch.is_empty()
     }

@@ -3376,6 +3376,127 @@ async fn test_app_effect_over_one_batch_is_parked_and_the_feed_goes_on() {
     assert_eq!(protocol.0.received.lock().unwrap().len(), 2);
 }
 
+/// The sample protocol, whose note `big` writes local values of `sizes` bytes, with a
+/// conversation entry when `ops`; other notes as the sample protocol.
+struct BigProtocol {
+    sample: SampleProtocol,
+    ops: bool,
+    sizes: Vec<usize>,
+}
+
+impl Protocol for BigProtocol {
+    fn has_keys(&self, scope: &str) -> bool {
+        self.sample.has_keys(scope)
+    }
+
+    fn sent_between_own_apps(&self, kind: &str) -> bool {
+        self.sample.sent_between_own_apps(kind)
+    }
+
+    fn check_scopes(
+        &self,
+        message: &pubky_switch_core::message::Message,
+        sender: &AppCert,
+        own: &AppCert,
+    ) -> Result<(), String> {
+        self.sample.check_scopes(message, sender, own)
+    }
+
+    fn accepts(&self, cert: &AppCert) -> Vec<String> {
+        self.sample.accepts(cert)
+    }
+
+    fn check_body(&self, message: &ReceivedMessage) -> Result<(), String> {
+        self.sample.check_body(message)
+    }
+
+    fn receive(&self, message: &ReceivedMessage) -> Outcome {
+        if message.message.body.get("text").and_then(Value::as_str) != Some("big") {
+            return self.sample.receive(message);
+        }
+        let ops = if self.ops {
+            vec![(
+                Vec::new(),
+                OpKind::AllowPut {
+                    pubky: message.sender,
+                    kind: AllowKind::Conversation,
+                },
+            )]
+        } else {
+            Vec::new()
+        };
+        let local = self
+            .sizes
+            .iter()
+            .enumerate()
+            .map(|(n, size)| LocalWrite::Put {
+                key: format!("big/{n}").into_bytes(),
+                value: vec![0; *size],
+            })
+            .collect();
+        Outcome::Apply(Effect { ops, local })
+    }
+
+    fn resend_needed(
+        &self,
+        needed: &ResendNeeded,
+    ) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
+        self.sample.resend_needed(needed)
+    }
+
+    fn missed(&self, missed: &MissedEntries) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
+        self.sample.missed(missed)
+    }
+}
+
+/// A note `big` to an app with [`BigProtocol`], then a plain one: the big one is stored
+/// and passed as too large, the protocol told, and the plain one applied.
+async fn big_effect_is_parked(ops: bool, sizes: Vec<usize>) {
+    let w = World::new();
+    let request = w.approve(&app_keys("wallet"), &["scope-a"]);
+    let protocol = Arc::new(BigProtocol {
+        sample: SampleProtocol::default(),
+        ops,
+        sizes,
+    });
+    let mut app = App::join(w.env(), protocol.clone(), World::config(), request)
+        .await
+        .unwrap();
+    let (big, _) = w.note(app.app_id(), "big");
+    let (plain, _) = w.note(app.app_id(), "plain");
+    let report = app.receive(None).await.unwrap();
+    assert!(has(&report.events, |e| matches!(
+        e,
+        AppEvent::Parked { id: Some(_), seq: s, reason: ParkReason::EffectTooLarge } if *s == big
+    )));
+    assert!(has(&report.events, |e| matches!(
+        e,
+        AppEvent::EffectRefused { seq: s, code: None, .. } if *s == big
+    )));
+    assert!(received(&report.events, plain), "{:?}", report.events);
+    assert!(app.cursor().seq >= plain);
+    // Only the plain note's conversation entry went.
+    assert_eq!(w.effects(), 1);
+    assert!(app.protocol_get(b"big/0").await.unwrap().is_none());
+    app.receive(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_effect_too_large_to_keep_is_stored_and_passed() {
+    // One 9 MiB local write, which the kept effect carries as a JSON array, over 16 MiB.
+    big_effect_is_parked(true, vec![9 << 20]).await;
+}
+
+#[tokio::test]
+async fn test_effect_local_writes_over_one_commit_are_stored_and_passed() {
+    big_effect_is_parked(false, vec![12 << 20, 12 << 20, 12 << 20]).await;
+}
+
+#[tokio::test]
+async fn test_effect_local_write_over_the_value_size_is_stored_and_passed() {
+    big_effect_is_parked(false, vec![(16 << 20) + 1]).await;
+}
+
 /// The wallet joined, then loaded again on a device clock `offset_ms` ahead of the switch's.
 async fn wallet_on_a_clock_ahead(w: &World, offset_ms: u64) -> App {
     let me = w.join("wallet").await.app_id();

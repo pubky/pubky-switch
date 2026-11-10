@@ -68,12 +68,14 @@ use super::provider::TakeOver;
 use super::records::{Collection, pending_name_key};
 use super::rotation::RegistrationStep;
 use super::state::{
-    CachedDoc, HeldEntry, KeptEntry, ParkedEntry, PendingEffect, Processed, RetryEntry, Tx, key,
+    CachedDoc, HeldEntry, KeptEntry, PROTOCOL_PREFIX, ParkedEntry, PendingEffect, Processed,
+    RetryEntry, Tx, encode, key,
 };
 use super::{App, AppError, PROCESSED_RETENTION_MS};
 use crate::client::Batch;
 use crate::client::answers::{ChainItem, EntryItem, FeedItem, FeedPage, FeedQuery};
 use crate::error::ClientError;
+use crate::store::{MAX_BATCH_BYTES, MAX_VALUE_BYTES};
 
 /// What one read did.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -127,6 +129,9 @@ enum Sent {
     Quota,
     /// Refused for good, with the error code: the entry is stored and passed.
     Refused(String),
+    /// Too large for the app to keep before it sends it: nothing was kept or sent, and the
+    /// entry is stored and passed.
+    TooLarge,
     /// Sent again and refused before the service looked at its batch ID, past the window in
     /// which a resend tells: its entry is stored and passed as uncertain.
     Uncertain,
@@ -749,6 +754,19 @@ impl App {
                 self.effect_refused(entry, &received, None, read)?;
                 return Ok(Step::Pass);
             }
+            if !self
+                .make_room(read, local_size(&self.ns, &effect.local))
+                .await?
+                || effect.local.iter().any(|write| {
+                    matches!(write, LocalWrite::Put { value, .. }
+                        if u64::try_from(value.len()).unwrap_or(u64::MAX) > MAX_VALUE_BYTES)
+                })
+            {
+                // Switch spec 8.2: an effect too large for the store is stored and passed,
+                // so the feed goes on.
+                self.too_large(entry, &received, read)?;
+                return Ok(Step::Pass);
+            }
             if effect.ops.is_empty() {
                 self.note_processed(entry, &received, &effect.local, parked, read)?;
                 self.received_event(entry, &received);
@@ -788,6 +806,10 @@ impl App {
                 }
                 Sent::Quota => {
                     self.park(entry, &received.plaintext, ParkReason::Quota, read)?;
+                    return Ok(Step::Pass);
+                }
+                Sent::TooLarge => {
+                    self.too_large(entry, &received, read)?;
                     return Ok(Step::Pass);
                 }
                 Sent::Refused(code) => {
@@ -951,6 +973,19 @@ impl App {
             if !self.collection_of_name(collection) && self.held_record(key).await?.is_none() {
                 read.tx.put(&pending_name_key(key), &collection.name)?;
             }
+        }
+        // A kept effect over the store's value size can't be kept, so it isn't sent: the
+        // same effect is refused again however often it is built (Switch spec 8.2).
+        let kept = u64::try_from(encode(&pending)?.len()).unwrap_or(u64::MAX);
+        if kept > MAX_VALUE_BYTES
+            || !self
+                .make_room(
+                    read,
+                    kept.saturating_add(write_size(&self.ns, key::PENDING_EFFECT, 0)),
+                )
+                .await?
+        {
+            return Ok(Sent::TooLarge);
         }
         // Everything read so far, with the kept batch, before it is sent.
         read.tx.put(key::PENDING_EFFECT, &pending)?;
@@ -1260,7 +1295,9 @@ impl App {
             | Sent::StaleEpoch
             | Sent::Quota
             | Sent::Refused(_)
-            | Sent::Uncertain => {}
+            | Sent::Uncertain
+            // Only a first send that can't be kept is too large; a kept effect was kept.
+            | Sent::TooLarge => {}
         }
         Ok(())
     }
@@ -1400,6 +1437,35 @@ impl App {
 
     /// Tell the protocol that the effect of `received` won't be sent again (Switch spec
     /// 8.2): a duty event, kept in the commit that stores the entry.
+    /// An effect too large for the store ([`ParkReason::EffectTooLarge`]): its entry stored
+    /// and passed, and the protocol told.
+    fn too_large(
+        &mut self,
+        entry: &Entry,
+        received: &Received,
+        read: &mut Read,
+    ) -> Result<(), AppError> {
+        self.park(entry, &received.plaintext, ParkReason::EffectTooLarge, read)?;
+        self.effect_refused(entry, received, None, read)
+    }
+
+    /// Room in the read's commit for `bytes` more, with what processing an entry adds: when
+    /// the read's writes so far and `bytes` would be over the store's batch size, the read's
+    /// writes are committed first, with the cursor, as before a kept effect. `false` when
+    /// `bytes` alone wouldn't fit one commit.
+    async fn make_room(&mut self, read: &mut Read, bytes: u64) -> Result<bool, AppError> {
+        let needed = bytes.saturating_add(ENTRY_RESERVE_BYTES);
+        if needed > MAX_BATCH_BYTES {
+            return Ok(false);
+        }
+        if read.tx.size().saturating_add(needed) > MAX_BATCH_BYTES && !read.tx.is_empty() {
+            read.tx.put(key::CURSOR, &self.state.cursor)?;
+            let tx = std::mem::replace(&mut read.tx, self.tx()?);
+            self.commit(tx).await?;
+        }
+        Ok(true)
+    }
+
     fn effect_refused(
         &mut self,
         entry: &Entry,
@@ -2008,4 +2074,34 @@ pub(crate) fn processed_writes(
     )?;
     tx.put(&key::processed_at(now, sender, msg_id), &())?;
     Ok(())
+}
+
+/// What processing one entry writes beside its effect's own writes, at most: its processed
+/// pair, the cursor, a parked or retry record removed, and the chain view's small fields.
+const ENTRY_RESERVE_BYTES: u64 = 256 * 1024;
+
+/// The bytes a write of `value_len` value bytes at `key` counts against a batch in `ns`.
+fn write_size(ns: &str, key: &str, value_len: u64) -> u64 {
+    let len = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
+    len(ns.len())
+        .saturating_add(len(key.len()))
+        .saturating_add(value_len)
+}
+
+/// The bytes the protocol's local writes count against a batch in `ns`, under its prefix.
+fn local_size(ns: &str, local: &[LocalWrite]) -> u64 {
+    let prefix = u64::try_from(PROTOCOL_PREFIX.len()).unwrap_or(u64::MAX);
+    let len = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
+    local.iter().fold(0u64, |total, write| {
+        let (key, value) = match write {
+            LocalWrite::Put { key, value } => (key.len(), value.len()),
+            LocalWrite::Delete { key } => (key.len(), 0),
+            LocalWrite::DeletePrefix { prefix } => (prefix.len(), 0),
+        };
+        total
+            .saturating_add(len(ns.len()))
+            .saturating_add(prefix)
+            .saturating_add(len(key))
+            .saturating_add(len(value))
+    })
 }
