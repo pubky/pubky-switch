@@ -351,9 +351,10 @@ pub(super) async fn load_apps(
 }
 
 /// As [`load_apps`], with the app rows it read. The one loader behind every judgment of
-/// which apps are current outside a batch ([`OpsState::is_current`]): the inbox's targets,
-/// the entries' release, the directory and the claims' views; `GET /apps` builds the same
-/// state from its own read ([`super::apps`]).
+/// which apps are current ([`OpsState::is_current`]) or served ([`OpsState::is_served`])
+/// outside a batch: the inbox's targets (served), the entries' release (current), the
+/// directory (current) and the claims' views (served); `GET /apps` builds the same state
+/// from its own read ([`super::apps`]).
 pub(super) async fn load_apps_and_rows(
     txn: &mut AccountTxn,
     held: Option<&IdentityDoc>,

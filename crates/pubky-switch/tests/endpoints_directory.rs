@@ -409,24 +409,27 @@ async fn test_directory_lists_current_apps_only() {
 }
 
 #[tokio::test]
-async fn test_directory_leaves_out_expired_certificates() {
+async fn test_directory_keeps_an_app_whose_certificate_lapsed() {
     let Some(replay) = replay().await else { return };
     alice_with_three_apps(&replay).await;
-    // The wallet's and the executor's certificates expire on 2026-12-01, the phone's a
-    // month later: in between, only the phone is current.
-    let between = "2026-12-15T00:00:00.000Z";
-    set_time(&replay.clock, between);
     let keys = vectors("keys.json");
-    let answer = replay
-        .service
-        .handle(app_request(
+    let read = |at: &str| {
+        app_request(
             app(&keys, "phone"),
             "GET",
             &directory_path(),
             Vec::new(),
-            ms(between),
-        ))
-        .await;
+            ms(at),
+        )
+    };
+    let before = body(&replay.service.handle(read(&setup_time())).await);
+    // The wallet's and the executor's certificates expire on 2026-12-01, the phone's a
+    // month later. In between, all three are still current: the directory lists them, each
+    // with its record, whose certificate shows the expiry a sender checks, and its
+    // versions don't move.
+    let between = "2026-12-15T00:00:00.000Z";
+    set_time(&replay.clock, between);
+    let answer = replay.service.handle(read(between)).await;
     assert_eq!(
         answer.status,
         200,
@@ -435,8 +438,13 @@ async fn test_directory_leaves_out_expired_certificates() {
     );
     assert_eq!(
         app_ids(&answer),
-        vec![app(&keys, "phone")["app_id"].clone()]
+        ["wallet", "phone", "executor"]
+            .map(|name| app(&keys, name)["app_id"].clone())
+            .to_vec()
     );
+    let after = body(&answer);
+    assert_eq!(after["directory_version"], before["directory_version"]);
+    assert_eq!(after["apps_version"], before["apps_version"]);
     replay.db.drop_database().await.expect("drop");
 }
 
