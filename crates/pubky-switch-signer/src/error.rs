@@ -108,6 +108,13 @@ pub enum Refusal {
     /// The store already holds this identity's signer records, so it isn't set up again.
     #[error("refused: the signer is already set up for this identity")]
     AlreadySetUp,
+    /// This install's records are behind a newer `identity.json` it signed itself, so it
+    /// signs nothing until they are restored from the signer backup (Switch wire 3.13).
+    #[error("refused: this install's records are behind its own version {version}")]
+    RecordsBehind {
+        /// The newer version.
+        version: u64,
+    },
     /// The store holds no signer records for this identity.
     #[error("refused: the signer isn't set up for this identity")]
     NotSetUp,
