@@ -57,6 +57,18 @@ const PENDING_PREFIX: &str = "opq/";
 /// can be, under 10.9 MiB kept (`MAX_STEP_LOCAL_BYTES`), always fits on its own.
 pub const MAX_KEPT_BATCHES_BYTES: usize = 12 * 1024 * 1024;
 
+// A batch's answer is settled in one commit: its local writes and queued messages (under
+// its stored size, itself under `MAX_KEPT_BATCHES_BYTES`), a cached record write with its
+// mark for each of its 8 operations at most, and the cursor, the chain view and the kept
+// batch removed (under 1 MiB).
+const _: () = assert!(
+    MAX_KEPT_BATCHES_BYTES as u64
+        + MAX_BATCH_ENTRIES as u64
+            * (super::feed::CACHED_RECORD_BYTES + super::feed::KEPT_MARK_BYTES)
+        + (1 << 20)
+        <= crate::store::MAX_BATCH_BYTES
+);
+
 /// Refuse the app's own lifecycle operations, and the signer's, in a batch a host or a
 /// protocol builds: `app.put`, `receive_key.put`, `key_bundle.put` and `cert.put`. The app
 /// layer builds and sends these itself, in batches of their own (joining, the record's

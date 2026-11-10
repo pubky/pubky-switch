@@ -690,6 +690,7 @@ impl App {
             let (outcome, writes) = {
                 let mut cx = ReceiveContext::new(
                     &self.state,
+                    protocol.as_ref(),
                     store.as_ref(),
                     &self.ns,
                     may_attempt,
@@ -2246,7 +2247,11 @@ const ITEM_ROOM_BYTES: u64 = 12 * 1024 * 1024;
 
 /// What an applied effect's outcome caches of one record write, at most: its operation
 /// (`MAX_OP_BYTES`, 512 KiB) and opened value (256 KiB), both in base64, and its proof.
-const CACHED_RECORD_BYTES: u64 = 1_258_291; // 1.2 MiB
+pub(crate) const CACHED_RECORD_BYTES: u64 = 1_258_291; // 1.2 MiB
+
+/// What a record's mark takes as stored, at most: [`MAX_SEEN_MARK_BYTES`] in base64
+/// (87,382 bytes), its key, namespace and encoding (256 bytes).
+pub(crate) const KEPT_MARK_BYTES: u64 = (MAX_SEEN_MARK_BYTES as u64).div_ceil(3) * 4 + 256;
 
 // An applied effect's outcome is committed on its own: its local writes, at most
 // `MAX_STEP_LOCAL_BYTES` as stored, at most 7 cached record writes with their marks, and
@@ -2254,7 +2259,7 @@ const CACHED_RECORD_BYTES: u64 = 1_258_291; // 1.2 MiB
 // to commit its outcome for its size.
 const _: () = assert!(
     (MAX_STEP_LOCAL_BYTES as u64)
-        + 7 * (CACHED_RECORD_BYTES + MAX_SEEN_MARK_BYTES as u64)
+        + 7 * (CACHED_RECORD_BYTES + KEPT_MARK_BYTES)
         + ENTRY_RESERVE_BYTES
         <= MAX_BATCH_BYTES
 );
@@ -2279,7 +2284,7 @@ const _: () = assert!(
 // - a chain item's cached record write, its mark and a flagged write's rule.
 const _: () = assert!(
     CACHED_RECORD_BYTES
-        + (MAX_SEEN_MARK_BYTES as u64)
+        + KEPT_MARK_BYTES
         + (MAX_REGRESSION_REASON_BYTES as u64)
         + ENTRY_RESERVE_BYTES
         <= ITEM_ROOM_BYTES

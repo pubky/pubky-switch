@@ -20,9 +20,9 @@ use super::shared_flows::{ItemsProtocol, ids, items, value};
 use super::*;
 use crate::app::{
     AppBackup, AppError, AppEvent, ClaimOp, Collection, DOC_CACHE_MS, Delivery,
-    LISTS_TOO_LARGE_RETRY_MS, MAX_CURSOR_DEFER_MS, ObligationDeadline, OpBatch, OutgoingMessage,
-    PolicyFamily, ReceiveContext, RecordJob, RecordTarget, Refusal, SenderDisposition, SentMessage,
-    SwitchCopy,
+    LISTS_TOO_LARGE_RETRY_MS, MAX_CURSOR_DEFER_MS, MAX_SEEN_MARK_BYTES, ObligationDeadline,
+    OpBatch, OutgoingMessage, PolicyFamily, ReceiveContext, RecordJob, RecordTarget, Refusal,
+    SenderDisposition, SentMessage, SwitchCopy,
 };
 use crate::store::{Fault as StoreFault, FaultStore};
 use crate::testing::{Fault, Router, SWITCH_ORIGIN, ScriptedSwitch};
@@ -437,6 +437,20 @@ async fn test_receive_context_without_a_write_scope_is_refused() {
     assert!(refused.contains("write scopes"), "{refused}");
     assert_eq!(record_puts(&w), 0);
     // The effect without the write still applies: the cursor passes the entry.
+    assert_eq!(app.cursor().seq, seq);
+}
+
+#[tokio::test]
+async fn test_receive_context_write_whose_mark_wont_fit_is_refused() {
+    let w = World::new();
+    let protocol = ApiProtocol::new(Mode::Record);
+    let mut app = join(&w, &protocol, "wallet").await;
+    *protocol.items.pad.lock().unwrap() = MAX_SEEN_MARK_BYTES;
+    let (seq, _) = w.note(app.app_id(), "hello");
+    app.receive(None).await.unwrap();
+    let refused = protocol.seen()[0].writes[0].clone().unwrap_err();
+    assert!(refused.contains("mark"), "{refused}");
+    assert_eq!(record_puts(&w), 0);
     assert_eq!(app.cursor().seq, seq);
 }
 

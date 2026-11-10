@@ -106,8 +106,15 @@ pub struct ReceivedMessage {
 ///   value), under 13 MiB in all, below the 32 MiB batch size.
 pub const MAX_STEP_LOCAL_BYTES: usize = 4 * 1024 * 1024;
 
-/// The most bytes a [`Protocol::record_seen`] mark takes: 1 KiB. A longer one isn't kept.
-pub const MAX_SEEN_MARK_BYTES: usize = 1024;
+/// The most bytes a [`Protocol::record_seen`] mark takes: 64 KiB, 85.6 KiB as stored in
+/// base64 with its key. The commits that keep marks stay within the 32 MiB batch size: a
+/// feed item or a listed record caches at most one record write with its mark (1.2 MiB
+/// and 85.6 KiB, within a read's 12 MiB room for one item); an applied effect's outcome at
+/// most 7, with its 4 MiB of local writes and what its entry writes (256 KiB): 4 MiB + 7 x
+/// (1.2 MiB + 85.6 KiB) + 256 KiB = 13.2 MiB; and a batch's answer at most 8, with what the
+/// batch kept (under 12 MiB) and 1 MiB more: 12 MiB + 8 x (1.2 MiB + 85.6 KiB) + 1 MiB =
+/// 23.3 MiB. The `const` assertions of `feed.rs`, `records.rs` and `batch.rs` check each.
+pub const MAX_SEEN_MARK_BYTES: usize = 64 * 1024;
 
 /// The most bytes a [`Protocol::record_regression`] rule takes: 256. A longer one is cut
 /// there.
@@ -588,9 +595,12 @@ pub trait Protocol: Send + Sync {
     /// A provider loss the app follows (Switch spec 12.6 steps 2 and 4): the protocol queues
     /// its re-send requests to the counterparties of its unfinished activity, for what their
     /// inboxes accepted from [`ProviderLoss::accepted_from_ms`] on, and names the
-    /// counterparties whose conversation entries the app adds back. The app commits the
-    /// local writes once, with that step; a crash before that commit calls it again.
-    /// Nothing by default.
+    /// counterparties whose conversation entries the app adds back, at most
+    /// [`MAX_LOSS_CONVERSATIONS`]: how many past it were left out is kept with the loss
+    /// ([`super::RecoveryInfo::conversations_left_out`]). The app commits the local writes
+    /// once, with that step; a crash before that commit calls it again. Writes over
+    /// [`MAX_STEP_LOCAL_BYTES`] aren't committed and the loss goes on, with
+    /// [`super::AppEvent::LocalWritesRefused`]. Nothing by default.
     ///
     /// # Errors
     ///
@@ -666,9 +676,18 @@ pub trait Protocol: Send + Sync {
     /// mark after `value`, from the mark held (`None` for a write of the app's own, built on
     /// what it trusts), or `None` to keep no mark. None by default.
     ///
-    /// A mark is at most [`MAX_SEEN_MARK_BYTES`], 1 KiB. A longer one isn't kept: the
-    /// record keeps the mark it held, and the host is told with
-    /// [`super::AppEvent::SeenMarkDropped`].
+    /// A mark is at most [`MAX_SEEN_MARK_BYTES`], 64 KiB. Past it, nothing is silent:
+    ///
+    /// - **The app's own write**, built through [`super::App::put_record`],
+    ///   [`super::App::record_op`] or [`super::ReceiveContext::put_record`]: the write is
+    ///   refused there, before anything is signed ([`super::Refusal::Usage`]), since the
+    ///   protocol's own value gives a mark it can't keep.
+    /// - **An own write whose mark is over it only once taken**, such as a kept batch
+    ///   answered after the protocol's marks grew: the mark held goes, as for `None`, so it
+    ///   never stands for the own write, and the protocol is told the record can't be
+    ///   checked from that write on ([`super::AppEvent::RecordUncheckable`], a duty event).
+    /// - **Another app's write:** the record keeps the mark it held, so what was seen before
+    ///   is still checked against later writes, and the protocol is told the same way.
     fn record_seen(
         &self,
         collection: &str,

@@ -1164,6 +1164,11 @@ impl App {
         let Some(mut cached) = self.cached_directory(pubky).await? else {
             return Ok(());
         };
+        if cached.stale && cached.apps.is_empty() {
+            // A stub, or a copy without apps read again before the next seal anyway: the
+            // answer has nothing to update.
+            return Ok(());
+        }
         let mut tx = self.tx()?;
         let mut floors = HashMap::new();
         for entry in array(current, "receive_keys") {

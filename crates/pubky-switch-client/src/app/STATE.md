@@ -151,7 +151,7 @@ uploads; `push.rs` holds the push registration. The peek (`peek.rs`) writes noth
 |---|---|---|
 | `mv` | a move in progress: the signed freeze (none for a key change), the generation left, the step, the re-registration batch signed once | |
 | `gens/<generation>` | a generation the app left: its origin and service key, and the last own `identity.json` taken there | |
-| `loss` | a provider loss followed: the step, the old newest head, the cursor's time there, the declaration time, the clocks' offset, the new key's `n`, the batch of the current step, the conversation entries still to add back | |
+| `loss` | a provider loss followed: the step, the old newest head, the cursor's time there, the declaration time, the clocks' offset, the new key's `n`, the batch of the current step, the conversation entries still to add back (at most `MAX_LOSS_CONVERSATIONS`, the first in key order) and how many past it were left out, shown in `RecoveryInfo::conversations_left_out` | |
 | `ev/op/<hash>` | a kept `record.put` or claim entry, with its writer's certificate and its proof when held | |
 | `ev/proof/<hash>` | a kept transition proof | |
 | `lc/contact/<pubky>`, `lc/deny/<pubky>` | the app's copy of the contacts and deny list, from the feed | |

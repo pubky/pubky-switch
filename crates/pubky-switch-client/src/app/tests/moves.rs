@@ -15,8 +15,9 @@ use pubky_switch_core::sig::SignedDoc;
 
 use super::*;
 use crate::app::{
-    AppError, AppEvent, ClaimOp, Evidence, LocalWrite, LossActions, ObligationDeadline, ParkReason,
-    ProviderLoss, ProviderStatus, PushRelay, Refusal, UserConfirmed,
+    AppError, AppEvent, ClaimOp, Evidence, LocalWrite, LossActions, MAX_STEP_LOCAL_BYTES,
+    ObligationDeadline, ParkReason, ProviderLoss, ProviderStatus, PushRelay, Refusal, RefusedCall,
+    UserConfirmed,
 };
 use crate::error::TransportError;
 use crate::error::{ClientError, StoreError};
@@ -80,6 +81,8 @@ pub(crate) struct LossProtocol {
     pub(crate) counterparties: Vec<[u8; 32]>,
     /// How many of the next loss calls fail, as when the protocol can't read its state.
     pub(crate) failing: Mutex<u32>,
+    /// The size of the value the loss call writes; one byte when zero.
+    pub(crate) local_bytes: Mutex<usize>,
 }
 
 impl Protocol for LossProtocol {
@@ -132,11 +135,12 @@ impl Protocol for LossProtocol {
             }
         }
         self.losses.lock().unwrap().push(*loss);
+        let bytes = (*self.local_bytes.lock().unwrap()).max(1);
         Ok(LossActions {
             conversations: self.counterparties.clone(),
             local: vec![LocalWrite::Put {
                 key: format!("lost/{}", loss.lost_generation).into_bytes(),
-                value: b"1".to_vec(),
+                value: vec![b'1'; bytes],
             }],
         })
     }
@@ -1164,6 +1168,42 @@ async fn follow_loss(
 }
 
 #[tokio::test]
+async fn test_loss_local_writes_over_the_bound_are_refused_with_the_loss_as_called() {
+    let store = Arc::new(MemoryStore::new());
+    let lost = lost_world(Arc::clone(&store) as Arc<dyn StateStore>).await;
+    *lost.protocol.local_bytes.lock().unwrap() = MAX_STEP_LOCAL_BYTES;
+    let (app, events) = follow_loss(&lost, store as Arc<dyn StateStore>)
+        .await
+        .unwrap();
+    // Asked once, with a view of nothing zero.
+    let losses = lost.protocol.losses.lock().unwrap().clone();
+    assert_eq!(losses.len(), 1);
+    let loss = losses[0];
+    assert_eq!(loss.accepted_from_ms, lost.note_at_ms);
+    assert!(loss.lost_generation > 0 && loss.generation > loss.lost_generation);
+    assert!(loss.declared_at_ms > 0 && loss.uncertain_until_ms > loss.declared_at_ms);
+    // Its writes, over the bound with their overhead, weren't committed; the protocol is
+    // told, durably, of the very loss it was called with; and the recovery went on.
+    assert_eq!(app.protocol_get(b"lost/1").await.unwrap(), None);
+    let refused = |events: &[AppEvent]| {
+        has(events, |e| {
+            matches!(
+                e,
+                AppEvent::LocalWritesRefused { call: RefusedCall::ProviderLost(called), .. }
+                    if *called == loss
+            )
+        })
+    };
+    assert!(refused(&events), "{events:?}");
+    assert!(refused(&app.kept_duties().await.unwrap()));
+    assert!(has(&events, |e| matches!(
+        e,
+        AppEvent::ProviderRecovered { generation: 2 }
+    )));
+    assert_eq!(lost.protocol.losses.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn test_loss_recovers_at_the_new_generation() {
     let store = Arc::new(MemoryStore::new());
     let lost = lost_world(Arc::clone(&store) as Arc<dyn StateStore>).await;
@@ -1226,6 +1266,7 @@ async fn test_loss_recovers_at_the_new_generation() {
     let info = app.recovery_info().await.unwrap().unwrap();
     assert!(info.steps_done);
     assert_eq!(info.loss.generation, 2);
+    assert_eq!(info.conversations_left_out, 0);
     assert_eq!(app.cursor().generation, 2);
     // The new service's feed is followed from its start; a note there is received.
     let seq = note_at(&lost.w, &lost.next, me, "after the loss");
