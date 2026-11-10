@@ -122,7 +122,9 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let keys = FileKeyStore::open(&key_dir)?;
     let store = Store::connect(&config.database).await?;
     if config.database.migrate_on_start {
-        store.migrate().await?;
+        store
+            .migrate(&pubky_switch::service::announced_limits(&config.limits))
+            .await?;
         tracing::info!("database schema up to date");
     }
 

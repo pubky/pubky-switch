@@ -43,6 +43,7 @@ async fn test_changes_committed_change_wakes_its_account_only() {
                 limits: pubky_switch_core::records::Limits::default(),
                 identity_doc: None,
                 revoked_apps: Vec::new(),
+                enrollment_hash: [0; 32],
             })
             .await
             .expect("create");
