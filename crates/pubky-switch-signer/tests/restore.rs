@@ -1163,7 +1163,44 @@ async fn test_restore_winner_writes_over_a_losing_backup_past_its_mark() {
     assert_eq!(winner.status(), SignerStatus::Signing);
     assert_eq!(world.backup().identity_doc().signed(), won.signed());
     // The winner signs on. Its next version reuses the number the loser spent, which the
-    // switch never took: each install signs every version once, and the switch takes one.
+    // switch never took, and the switch takes the winner's.
     let next = winner.set_record_max_age(Some(120)).await.unwrap();
     assert_eq!(world.switch.identity_doc().unwrap().signed(), next.signed());
+}
+
+#[tokio::test]
+async fn test_restore_refused_next_version_leaves_the_source_signing() {
+    // A new install restores, and the switch refuses its next version for good: its mark is
+    // still the source install's document, which the source's backup holds. That backup is
+    // the mark itself, not a losing delivery's, so the restoring install stops as an install
+    // that isn't named, and never writes over the source's backup.
+    let world = World::new();
+    let (mut old, _) = world.enrolled().await;
+    // Past the first version, so the source's backup builds on one.
+    old.set_record_max_age(Some(30)).await.unwrap();
+    assert!(world.backup().prev().is_some());
+    let source = old.install_id();
+    drop(old);
+    let held = world.homeserver.file(SIGNER_BACKUP_PATH).unwrap();
+    let store = Arc::new(MemoryStore::new());
+    world.switch.fail_next(SwitchFault::Error {
+        path: "/identity".into(),
+        code: ErrorCode::BadRequest,
+        current: serde_json::Value::Null,
+    });
+    Signer::restore_new(world.env(store.clone()), world.keyring(), confirmed())
+        .await
+        .unwrap_err();
+    let mut restoring = Signer::open(world.env(store), world.keyring())
+        .await
+        .unwrap();
+    assert_eq!(
+        restoring.identity_doc().unwrap().unwrap().body().signer,
+        source
+    );
+    assert_eq!(
+        restoring.set_record_max_age(Some(60)).await.unwrap_err(),
+        SignerError::NotNamed { install: source }
+    );
+    assert_eq!(world.homeserver.file(SIGNER_BACKUP_PATH).unwrap(), held);
 }
