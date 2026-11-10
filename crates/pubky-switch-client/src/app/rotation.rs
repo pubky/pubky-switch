@@ -436,11 +436,11 @@ impl App {
         let mut tx = self.tx()?;
         let mut register = None;
         if let Some(record) = current
-            && !self
+            && self
                 .state
                 .receive_keys
                 .get(&record.n())
-                .is_some_and(|held| held.key.kid == record.kid())
+                .is_none_or(|held| held.key.kid != record.kid())
         {
             let n = record.n();
             if n > restore.n_floor
