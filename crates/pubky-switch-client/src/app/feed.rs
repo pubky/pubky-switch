@@ -553,6 +553,13 @@ impl App {
         let uncertain = key::uncertain(&entry.sender, &received.message.msg_id);
         if self.reader().exists(&uncertain).await? {
             read.tx.delete(&uncertain)?;
+            uncertain_processed(
+                &mut read.tx,
+                &entry.sender,
+                &received.message.msg_id,
+                received.hash(),
+                self.now(),
+            )?;
             self.park(entry, &received.plaintext, ParkReason::Uncertain, read)?;
             self.effect_refused(entry, &received, Some("stale_generation".into()));
             return Ok(Step::Pass);
@@ -999,6 +1006,13 @@ impl App {
         match stored {
             Some(mut entry) if pending.parked => {
                 entry.reason = ParkReason::Uncertain;
+                uncertain_processed(
+                    &mut tx,
+                    &pending.sender,
+                    &pending.msg_id,
+                    pending.hash,
+                    self.now(),
+                )?;
                 tx.put(&key::parked(pending.seq), &entry)?;
                 self.state.parked.insert(pending.seq, entry);
                 self.events.push(AppEvent::Parked {
@@ -1608,6 +1622,20 @@ impl App {
 }
 
 /// The processed pair and its time index.
+/// The processed pair of a message whose entry is parked as [`ParkReason::Uncertain`]: its
+/// effect may have been applied, so a re-send of it is a duplicate and never applies it
+/// again (Switch spec 11, 12.5 "Kept batches"). Every park as `Uncertain` writes it, in the
+/// same commit.
+pub(crate) fn uncertain_processed(
+    tx: &mut Tx,
+    sender: &[u8; 32],
+    msg_id: &str,
+    hash: [u8; 32],
+    now: u64,
+) -> Result<(), AppError> {
+    processed_writes(tx, sender, msg_id, hash, now)
+}
+
 pub(crate) fn processed_writes(
     tx: &mut Tx,
     sender: &[u8; 32],

@@ -1954,7 +1954,7 @@ async fn test_key_change_effect_resend_past_the_window_parks_its_entry() {
     let router = Router::of(&w);
     let mut app = join(&w, &router).await;
     let me = app.app_id();
-    let (seq, _) = w.note(me, "before");
+    let (seq, message) = w.note(me, "before");
     // The effect is applied at generation 1, and its answer lost.
     w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
     assert!(app.receive(None).await.is_err());
@@ -1989,6 +1989,23 @@ async fn test_key_change_effect_resend_past_the_window_parks_its_entry() {
     // Not tried again.
     let report = app.receive(None).await.unwrap();
     assert!(!received(&report.events, seq));
+    assert_eq!(conversations_at(&changed), 0);
+    // The sender re-sends the same signed message: a duplicate, never applied again (Switch
+    // spec 11).
+    let plaintext = message.sign(&w.bob_keys).unwrap();
+    let again = changed
+        .send_plaintext(w.bob.public(), &w.bob_cert, &plaintext, &[me])
+        .unwrap();
+    let report = app.receive(None).await.unwrap();
+    assert!(
+        has(&report.events, |e| matches!(
+            e,
+            AppEvent::Duplicate { seq, conflicting: false } if *seq == again
+        )),
+        "{:?}",
+        report.events
+    );
+    assert!(!received(&report.events, again), "{:?}", report.events);
     assert_eq!(conversations_at(&changed), 0);
 }
 
