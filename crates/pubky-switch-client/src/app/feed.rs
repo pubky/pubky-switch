@@ -125,7 +125,7 @@ enum Sent {
 /// `owed/<generation>/<seq>`: a protocol call about a feed item that the protocol couldn't
 /// answer (`Protocol::resend_needed`, `Protocol::missed`), kept until it does.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-enum OwedCall {
+pub(crate) enum OwedCall {
     Resend {
         #[serde(with = "pubky_switch_core::enc::serde_b64")]
         sender: [u8; 32],

@@ -785,6 +785,51 @@ async fn follow_move(
 }
 
 #[tokio::test]
+async fn test_move_keeps_an_owed_call_and_makes_it_at_the_next_service() {
+    let store = Arc::new(MemoryStore::new());
+    let (w, router, _next, _) = moved_world(Arc::clone(&store) as Arc<dyn StateStore>).await;
+    // A re-send call the protocol couldn't answer at generation 1.
+    let mut app = App::load(
+        router.env(&w, Arc::clone(&store) as Arc<dyn StateStore>),
+        w.protocol.clone(),
+        World::config(),
+        app_keys("wallet").app_id_bytes(),
+    )
+    .await
+    .unwrap();
+    let call = crate::app::feed::OwedCall::Resend {
+        sender: w.bob.public(),
+        accepted_from_ms: 5,
+        accepted_until_ms: 6,
+        unreadable: false,
+    };
+    let mut tx = app.tx().unwrap();
+    tx.put(&crate::app::state::key::owed(1, 7), &call).unwrap();
+    app.commit(tx).await.unwrap();
+    drop(app);
+    follow_move(&w, &router, Arc::clone(&store) as Arc<dyn StateStore>)
+        .await
+        .unwrap();
+    let resends = w.protocol.resends.lock().unwrap().clone();
+    assert!(
+        resends.iter().any(|r| r.sender == w.bob.public()
+            && r.accepted_from_ms == 5
+            && r.accepted_until_ms == 6),
+        "{resends:?}"
+    );
+    let app = App::load(
+        router.env(&w, Arc::clone(&store) as Arc<dyn StateStore>),
+        w.protocol.clone(),
+        World::config(),
+        app_keys("wallet").app_id_bytes(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(app.cursor().generation, 2);
+    assert!(app.reader().scan_raw("owed/").await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn test_move_crash_at_each_commit_point_resumes() {
     let counting_inner = Arc::new(MemoryStore::new());
     let (w, router, _, _) = moved_world(Arc::clone(&counting_inner) as Arc<dyn StateStore>).await;
@@ -1044,6 +1089,37 @@ async fn test_loss_call_the_protocol_fails_is_made_again() {
         Some(b"1".to_vec())
     );
     assert_eq!(conversations_at(&lost.next), 1);
+}
+
+#[tokio::test]
+async fn test_loss_keeps_an_owed_call_from_the_lost_generation_and_makes_it() {
+    let store = Arc::new(MemoryStore::new());
+    let lost = lost_world(Arc::clone(&store) as Arc<dyn StateStore>).await;
+    // A missed-entries call the protocol couldn't answer at generation 1.
+    let mut app = load_lost(&lost, Arc::clone(&store) as Arc<dyn StateStore>).await;
+    let call = crate::app::feed::OwedCall::Missed {
+        seq: 9,
+        entries: 2,
+        accepted_from_ms: lost.note_at_ms,
+    };
+    let mut tx = app.tx().unwrap();
+    tx.put(&crate::app::state::key::owed(1, 9), &call).unwrap();
+    app.commit(tx).await.unwrap();
+    drop(app);
+    // Recovered at generation 2, the call is still made, with what it named then: the
+    // re-sends it asks for are the counterparties' to answer, wherever the app reads.
+    let (app, _) = follow_loss(&lost, Arc::clone(&store) as Arc<dyn StateStore>)
+        .await
+        .unwrap();
+    assert_eq!(app.cursor().generation, 2);
+    let missed = lost.protocol.sample.missed.lock().unwrap().clone();
+    assert!(
+        missed
+            .iter()
+            .any(|m| m.seq == 9 && m.entries == 2 && m.accepted_from_ms == lost.note_at_ms),
+        "{missed:?}"
+    );
+    assert!(app.reader().scan_raw("owed/").await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -2377,6 +2453,30 @@ async fn test_key_change_sends_a_kept_effect_again_and_settles_it_once() {
             .unwrap(),
         Some(b"before".to_vec())
     );
+}
+
+#[tokio::test]
+async fn test_key_change_keeps_an_owed_call_and_makes_it_at_the_new_generation() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join(&w, &router).await;
+    w.note(app.app_id(), "first");
+    app.receive(None).await.unwrap();
+    let now = w.clock.now_ms();
+    let seq = w.switch.push_missed(3, now - 3_600_000, now);
+    // The protocol can't answer at generation 1: the call is kept.
+    *w.protocol.failing.lock().unwrap() = 1;
+    app.receive(None).await.unwrap();
+    assert!(w.protocol.missed.lock().unwrap().is_empty());
+    // After the key change the next read makes it, with the item's `seq` at generation 1.
+    let _changed = change_key(&w, &router);
+    app.receive(None).await.unwrap();
+    assert_eq!(app.cursor().generation, 2);
+    let missed = w.protocol.missed.lock().unwrap().clone();
+    assert_eq!(missed.len(), 1, "{missed:?}");
+    assert_eq!(missed[0].seq, seq);
+    assert_eq!(missed[0].entries, 3);
+    assert!(app.reader().scan_raw("owed/").await.unwrap().is_empty());
 }
 
 /// After an uncertain park of `message`'s entry: the same signed message again, as a

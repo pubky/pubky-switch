@@ -432,6 +432,11 @@ fn corrupt() -> AppError {
 /// The ID of a store's first duty event.
 const FIRST_DUTY: u64 = 1;
 
+/// After a restore, duty event IDs start at the restore time in milliseconds times this:
+/// above any ID an app restored before then gave, unless it gave this many in one
+/// millisecond since its own restore.
+const DUTY_IDS_PER_MS: u64 = 1024;
+
 fn missing() -> AppError {
     AppError::Store(StoreError::Corrupt)
 }
@@ -830,6 +835,12 @@ impl App {
     /// record, registers a fresh key if it rotated after the backup, and asks the user
     /// about registrations it can't account for ([`App::restore_question`]).
     ///
+    /// What the store holds that the app still owes its protocol stays: the duty events
+    /// not acknowledged, with their IDs, delivered again as after [`App::load`], and the
+    /// protocol calls it couldn't answer, made again by the next read. A backup carries
+    /// neither, so a restore on another device starts without them. Duty event IDs never
+    /// go back ([`EventId`]).
+    ///
     /// # Errors
     ///
     /// [`AppError::InvalidData`] for a backup that doesn't verify; a store failure.
@@ -934,13 +945,19 @@ impl App {
                 erasing: None,
             };
             let ns = client_namespace(&meta.app_id);
-            // The store's duty event IDs go on rising, so an ID the host acknowledged before
-            // is never given to another event; a counter that can't be read starts over.
+            // What the store holds of what the app still owes its protocol, the duty events
+            // not acknowledged and the calls the protocol couldn't answer, is carried across
+            // (`STATE.md`, "Restore"). A store that can't be read carries nothing.
             let old = Reader {
                 ns: ns.clone(),
                 store: env.store.clone(),
             };
-            let next_duty = Self::next_duty(&old).await.unwrap_or(FIRST_DUTY);
+            let carried = Self::owed_to_protocol(&old).await.unwrap_or_default();
+            // Duty event IDs never go back: past the store's counter, and past the restore
+            // time's floor, above any ID an app restored earlier could have given, so a
+            // backup older than IDs the host acknowledged gives none of them again.
+            let floor = env.clock.now_ms().saturating_mul(DUTY_IDS_PER_MS);
+            let next_duty = Self::next_duty(&old).await.unwrap_or(FIRST_DUTY).max(floor);
             let state = AppState { next_duty, ..state };
             let client = Self::client_for(&env, &meta, &backup.keys, &cert)?;
             let mut app = App {
@@ -960,7 +977,11 @@ impl App {
             app.write_all(&mut tx).await?;
             tx.put(records::LIST_DUE, &true)?;
             tx.put(key::DUTY_NEXT, &app.state.next_duty)?;
+            for (stored, value) in &carried {
+                tx.put(stored, value)?;
+            }
             tx.commit(&app.env.store).await?;
+            app.events = app.unacknowledged_events().await?;
             Ok(app)
         })
         .await
@@ -1252,6 +1273,20 @@ impl App {
         self.state.next_duty = next;
         tx.report(duty.event(EventId::new(n)));
         Ok(())
+    }
+
+    /// The kept duty events and owed protocol calls, by key, as stored: what a restore
+    /// carries across.
+    async fn owed_to_protocol(
+        reader: &Reader,
+    ) -> Result<Vec<(String, serde_json::Value)>, AppError> {
+        let mut owed = Vec::new();
+        for prefix in [key::DUTY_PREFIX, key::OWED_PREFIX] {
+            for (rest, value) in reader.scan::<serde_json::Value>(prefix).await? {
+                owed.push((format!("{prefix}{rest}"), value));
+            }
+        }
+        Ok(owed)
     }
 
     /// The ID the next duty event takes: past the counter and every kept event.

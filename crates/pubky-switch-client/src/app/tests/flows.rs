@@ -1899,6 +1899,94 @@ async fn test_duty_event_acknowledged_in_part_keeps_the_later_ones() {
     assert_eq!(refused_events(&events, refused).len(), 1, "{events:?}");
 }
 
+/// Refuse the effect of the next note to `app` for good, and read it: the duty events.
+async fn refuse_next(w: &World, app: &mut App) -> Vec<AppEvent> {
+    w.note(app.app_id(), "refused");
+    w.switch.fail_next(Fault::Error {
+        path: "ops".into(),
+        code: ErrorCode::PermissionMissing,
+        current: json!(null),
+    });
+    let report = app.receive(None).await.unwrap();
+    report
+        .events
+        .into_iter()
+        .filter(AppEvent::is_duty)
+        .collect()
+}
+
+#[tokio::test]
+async fn test_duty_event_ids_never_repeat_after_a_restore_from_an_older_backup() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let backup = app.backup().unwrap();
+    let before = refuse_next(&w, &mut app).await;
+    let acked = before.iter().filter_map(AppEvent::id).max().unwrap();
+    app.ack_events(acked).await.unwrap();
+    // The device is lost; the backup, older than the IDs the host acknowledged, is
+    // restored on a new one.
+    w.clock.advance_ms(1000);
+    let store = Arc::new(MemoryStore::new());
+    let mut restored = App::restore(
+        w.env_on(Arc::clone(&store) as Arc<dyn StateStore>),
+        w.protocol.clone(),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    assert!(restored.take_events().is_empty());
+    let after = refuse_next(&w, &mut restored).await;
+    assert!(!after.is_empty());
+    assert!(
+        after.iter().filter_map(AppEvent::id).all(|id| id > acked),
+        "{after:?} after {acked:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_duty_events_and_owed_calls_carried_across_a_restore_in_place() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let backup = app.backup().unwrap();
+    let duties = refuse_next(&w, &mut app).await;
+    assert_eq!(duties.len(), 2, "{duties:?}");
+    let now = w.clock.now_ms();
+    let seq = w.switch.push_missed(3, now - HOUR, now);
+    *w.protocol.failing.lock().unwrap() = 1;
+    app.receive(None).await.unwrap();
+    assert!(w.protocol.missed.lock().unwrap().is_empty());
+    // Restored in place from the older backup: what the app still owes its protocol stays,
+    // with its IDs, and is delivered again.
+    drop(app);
+    let mut restored = App::restore(w.env(), w.protocol.clone(), World::config(), &backup)
+        .await
+        .unwrap();
+    assert_eq!(restored.take_events(), duties);
+    assert_eq!(restored.unacknowledged_events().await.unwrap(), duties);
+    restored.receive(None).await.unwrap();
+    assert!(
+        w.protocol
+            .missed
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|missed| missed.seq == seq && missed.entries == 3),
+        "the owed call is made"
+    );
+    // Restored on another device, nothing of this store is carried.
+    let store = Arc::new(MemoryStore::new());
+    let other = App::restore(
+        w.env_on(Arc::clone(&store) as Arc<dyn StateStore>),
+        w.protocol.clone(),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    assert!(other.unacknowledged_events().await.unwrap().is_empty());
+}
+
 #[tokio::test]
 async fn test_duty_event_reported_only_with_its_commit() {
     let w = World::new();

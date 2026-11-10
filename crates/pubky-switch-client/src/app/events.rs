@@ -36,7 +36,10 @@ use pubky_switch_core::enc::serde_b64;
 use super::error::Alarm;
 
 /// The stable ID of a duty event ([`AppEvent::is_duty`]). IDs rise in the order the events
-/// were kept and are never reused in one store, a restore included.
+/// were kept and are never given twice: a restore ([`super::App::restore`]) starts them
+/// past the store's counter and past a floor from the restore time, so even a backup older
+/// than IDs the host acknowledged gives none of them again. The floor holds while the
+/// device clock at a restore is later than at any earlier restore of the app.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct EventId(u64);
 

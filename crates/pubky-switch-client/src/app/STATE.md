@@ -71,7 +71,7 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
 | `parked/<seq>` | an entry stored locally and passed: the opened plaintext, sender, certificate, time, reason (an unverifiable sender or a quota, tried again; an effect refused for good, over one batch, or kept past the window in which its resend tells whether it was applied, not tried again) | yes |
 | `uncert/<sender>/<msg_id>` | a message whose kept effect may have been applied, kept without its entry by an earlier build: its entry is parked when the feed shows it again, and the protocol told in that commit | |
 | `asked/<seq>` | a re-send was handed to the protocol for this item | |
-| `owed/<generation>/<seq>` | a re-send or missed-entries call about this item that the protocol answered with an error: written in the commit that passes the item, made again at the start of each read, and gone in the commit of its answer's writes | |
+| `owed/<generation>/<seq>` | a re-send or missed-entries call about this item that the protocol answered with an error: written in the commit that passes the item, made again at the start of each read, and gone in the commit of its answer's writes. The key names the generation the item was read at | |
 | `departed/<app_id>` | another own app's departure verified in the chain, and its time | |
 | `join` | the join step: the registration batch while it is owed | |
 | `pending/effect` | a received message's effect batch and its outcome writes, with the deadlines of the claims it writes, and the opened entry, to store it locally if the batch outlives the batch ID window | yes |
@@ -82,7 +82,7 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
 | `service_time` | the highest service time verified, its key, the offset from the device clock | |
 | `p/...` | the protocol's own local state (`LocalWrite`) | the protocol's |
 | `duty/<id>` | a duty event (`AppEvent::is_duty`), written in the commit of the change it reports, until the host acknowledges it (`App::ack_events`); one per entry stored for good, kept batch or `attempt` dropped, or outbox message given up. Only acknowledgements remove them: nothing bounds them for a host that never acknowledges | |
-| `dutyn` | the ID the next duty event takes; a restore keeps it, so an ID is never given twice | |
+| `dutyn` | the ID the next duty event takes; a restore sets it past the store's counter and past the restore time in milliseconds times 1024, so an ID is never given twice, even after a backup older than IDs the host acknowledged | |
 
 Deleting the keys on a leave removes `keys`, `naming`, `rk/`, `scope/`, `parked/`,
 `pending/`, `p/`, `duty/` and `owed/`, and marks `leave`.
@@ -179,3 +179,28 @@ Deleting the keys on a leave also removes `rec/`, `hw/`, `recname/`, `out/`, `se
 `sentt/`, `invite/` and `opq/`. A restore replaces the namespace, these keys included, and
 sets `list_due`. `rec/`, `clent/` and `claim/` hold the evidence of the shared state that
 uploads carry (`App::shared_evidence`).
+
+## What the app owes its protocol: restores and provider changes
+
+`duty/<id>`, `dutyn` and `owed/<generation>/<seq>` hold what the app still has to tell its
+protocol, so neither a restore nor a provider change drops them.
+
+- **A backup carries none of them.** They are the store's, not the app's keys or position.
+- **A restore in place** (into the store that holds them) carries `duty/` and `owed/`
+  across the namespace's replacement, in its one commit: the duty events keep their IDs
+  and are delivered again, and the owed calls are made by the next read. What the store
+  can't read is not carried. The restored cursor may meet the same items again; the
+  protocol then hears of them twice, which it tolerates.
+- **A restore on another device** starts with none: their facts stayed with the lost store.
+- **`dutyn` never goes back.** A restore sets it to the highest of the store's counter, the
+  kept IDs plus one, and the restore time (app clock, milliseconds) times 1024. A backup
+  older than IDs the host acknowledged then gives none of them again, as long as the
+  device clock at a restore is later than at any earlier restore of the app and the app
+  gave fewer than 1024 duty events per millisecond since.
+- **A provider change keeps them** (a move, a key change in place, a provider loss). The
+  duty events report facts that stay true. An owed call is still made at the generation
+  followed: a re-send call names a sender and acceptance times, which the counterparty
+  answers wherever the app reads now, and a missed-entries call names the item's `seq` at
+  the generation in its key, which the protocol takes as information only. After a loss
+  the protocol is also asked for the loss's re-sends; a request twice is answered once,
+  since re-sends are deduplicated by `msg_id` (Switch spec 11).

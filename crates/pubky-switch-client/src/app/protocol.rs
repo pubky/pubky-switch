@@ -206,7 +206,8 @@ pub enum ResendReason {
 /// accepted from `accepted_from_ms`, and lists its collections again.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MissedEntries {
-    /// The item's `seq`.
+    /// The item's `seq`, in the sequence of the generation the app read it at: a call made
+    /// again after a provider change keeps it, as information only.
     pub seq: u64,
     /// How many entries were missed.
     pub entries: u64,
