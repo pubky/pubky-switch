@@ -987,3 +987,44 @@ async fn test_identity_first_delivery_refuses_an_enrolled_revoked_app() {
     assert_eq!(read.status, 404, "nothing is served");
     replay.db.drop_database().await.expect("drop");
 }
+
+#[tokio::test]
+async fn test_enroll_retry_after_serving_gets_the_first_answer() {
+    let Some(replay) = replay().await else { return };
+    serving(&replay).await;
+    // The vectors' enrollment again, under a fresh request signature, once the account
+    // serves: the answer it got first, not the next generation's pending key.
+    let http = vectors("http.json");
+    let vector = named(&http["requests"], "signer: enrollment");
+    let body =
+        pubky_switch_core::enc::unb64(vector["body_b64"].as_str().expect("body")).expect("b64");
+    let again = replay
+        .service
+        .handle(signer_request("POST", "/v1/enroll", body, ms(T)))
+        .await;
+    let first = named(
+        &http["responses"],
+        "signer: enrollment answer, signed with the new account's key",
+    );
+    assert_eq!(again.status, 200);
+    assert_eq!(
+        String::from_utf8_lossy(&again.body),
+        first["body"].as_str().expect("body"),
+        "the same enrollment, the same answer"
+    );
+    // A new enrollment still gets the pending key.
+    let other = replay
+        .service
+        .handle(signer_request(
+            "POST",
+            "/v1/enroll",
+            enrollment_body(5, ORIGIN),
+            ms(T),
+        ))
+        .await;
+    assert_ne!(
+        json(&other)["service_key"],
+        vectors("keys.json")["service_keys"][0]["public"]
+    );
+    replay.db.drop_database().await.expect("drop");
+}

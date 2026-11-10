@@ -20,6 +20,7 @@
 
 mod account;
 mod chain;
+mod enrollments;
 mod identity;
 #[cfg(any(test, feature = "test-util"))]
 pub mod testing;

@@ -43,6 +43,7 @@ impl Fixture {
             limits: pubky_switch_core::records::Limits::default(),
             identity_doc: None,
             revoked_apps: Vec::new(),
+            enrollment_hash: [0; 32],
         };
         assert!(self.store().create_account(&account).await.expect("create"));
         account

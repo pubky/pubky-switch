@@ -33,6 +33,9 @@ pub struct NewAccount {
     /// The App IDs the enrollment's `revoked_apps` names, kept for good from the start
     /// (Switch wire 3.7).
     pub revoked_apps: Vec<[u8; 16]>,
+    /// The document hash of the enrollment that creates the account, whose answer the
+    /// account keeps (Switch wire 3.7).
+    pub enrollment_hash: [u8; 32],
 }
 
 /// An account's position: its generation and key, the last `seq` given out, the chain head
@@ -174,6 +177,16 @@ pub(super) async fn create(pool: &PgPool, account: &NewAccount) -> Result<bool, 
         .await
         .map_err(StoreError::from_db)?;
     }
+    // The first enrollment's answer: an account keeps far fewer than any limit allows.
+    super::enrollments::keep(
+        &mut tx,
+        &account.id,
+        &account.enrollment_hash,
+        &account.service_key,
+        account.created_at_ms,
+        u64::MAX >> 1,
+    )
+    .await?;
     tx.commit().await.map_err(StoreError::from_db)?;
     Ok(true)
 }
