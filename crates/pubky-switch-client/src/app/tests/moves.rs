@@ -767,6 +767,48 @@ async fn test_key_change_in_place_is_followed_without_a_freeze() {
     assert_eq!(app.cursor().generation, 2);
 }
 
+#[tokio::test]
+async fn test_lists_too_large_refresh_is_tried_again_after_a_provider_change() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join_on(
+        &w,
+        &router,
+        Arc::clone(&w.store) as Arc<dyn StateStore>,
+        w.protocol.clone(),
+        &[Permission::ListsRead, Permission::ConversationAdd],
+    )
+    .await;
+    let ns = crate::store::client_namespace(&app.app_id());
+    let held = |key: &[u8]| w.store.get(&ns, key).unwrap().is_some();
+    {
+        let mut switch = w.switch.lock();
+        for n in 0..310_000u32 {
+            let mut pubky = [9u8; 32];
+            pubky[..4].copy_from_slice(&n.to_be_bytes());
+            switch.shared.flagged.insert(pubky, 3);
+        }
+    }
+    app.receive(None).await.unwrap();
+    assert!(held(b"lc/too_large") && !held(b"lc/lists_at"));
+    // A key change in place; the lists fit at the new service.
+    let pending = SigningKey::from_bytes(&seed("service/alice/pending"));
+    let changed = w.switch.import_into(pending.to_bytes());
+    changed.lock().shared.flagged.clear();
+    router.add(ORIGIN, &changed);
+    publish_at(
+        &w,
+        &changed,
+        Inbox::new(ORIGIN, pending.verifying_key().to_bytes()),
+        2,
+        None,
+    );
+    app.receive(None).await.unwrap();
+    assert_eq!(app.cursor().generation, 2);
+    assert!(!held(b"lc/too_large"));
+    assert!(held(b"lc/lists_at"));
+}
+
 /// Join and read at the old service, freeze it and import the account at the next one,
 /// publish the move, and queue a note there: everything the follow then reads.
 async fn moved_world(store: Arc<dyn StateStore>) -> (World, Router, Arc<ScriptedSwitch>, u64) {

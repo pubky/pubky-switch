@@ -181,7 +181,7 @@ uploads; `push.rs` holds the push registration. The peek (`peek.rs`) writes noth
   a stuck one included: after a step fails at a service the app reads its `identity.json`
   from the Homeserver, gives the change up and follows the newer document.
 - **A loss** starts in one commit, before any call: `meta`, a cursor and chain view from the
-  start of the new sequence, `lc/lists_at` removed, a fresh receive key with its registration batch, the
+  start of the new sequence, `lc/lists_at` and `lc/too_large` removed, a fresh receive key with its registration batch, the
   registrations of the old service cleared, the kept writes judged against the old chain
   view as at a move (a kept batch holding an `attempt` goes instead of being signed
   again), `restore.reconcile` on, and `loss`. Each step then commits as done; the
@@ -211,6 +211,7 @@ uploads; `push.rs` holds the push registration. The peek (`peek.rs`) writes noth
 | `lc/conv/<pubky>` | a conversation entry in the app's copy of the lists, from its writes, the feed and `GET /allow`; its writes and `GET /allow` also keep `lc/contact/`, `lc/deny/` and `lc/code/` | |
 | `lc/flag/<pubky>` | a flagged sender in the app's copy of the lists, from `GET /allow` only, which replaces it with `lc/contact/`, `lc/conv/`, `lc/deny/` and `lc/code/` in one commit; kept whole, as the answer holds it, bounded by the transport's answer cap and the store's batch size as the other lists are (at most `max_flags`, 1,000, at the default limits), and never cut, since a cut list would read a flagged sender as not flagged | |
 | `lc/lists_at` | the service time of the `GET /allow` answer the copy of the lists was last replaced from, written in that commit; absent until the first, after a restore, and from the commit that starts a provider loss, which keeps `lc/flag/`; while it is absent the copy isn't known to be complete, and a read by an app with `lists.read` refreshes it first, best effort, outside a move or a loss in progress | |
+| `lc/too_large` | the service time of the last `GET /allow` answer whose lists didn't fit one commit, in a commit of its own; while it is less than `LISTS_TOO_LARGE_RETRY_MS` (a day) old by a service time verified in the read, a read doesn't refresh the copy it owes; `allow_list()` always does; a refresh that fits, a provider change (the commit that switches the service, or that starts a loss) and a restore remove it | |
 | `invite/<code_hash>` | the code of an invite code the app registered, to show it again | yes |
 | `opq/<batch_id>` | a batch of operations, signed and kept before it is sent, with what its answer settles and, from its first send on, when that left (`kept_ms`, absent while never sent): the protocol's local writes and the signed messages it puts in the outbox; it goes with its answer or a refusal for good, and stays through anything else | the messages' |
 | `list_due` | a listing of the collections is owed: after joining, a restore or a `missed` item | |

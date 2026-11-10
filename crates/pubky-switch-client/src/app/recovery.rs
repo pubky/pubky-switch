@@ -506,6 +506,7 @@ impl App {
         // and the first read after the loss refreshes it. The flagged senders stay until
         // then, the old service's being all the app knows.
         tx.delete(super::admission::LISTS_AT)?;
+        tx.delete(super::admission::LISTS_TOO_LARGE)?;
         // Entries stored locally keep their plaintext; their old `seq`s are renumbered past
         // any `seq` of the new sequence.
         // Every old key is deleted before any new one is written: after an earlier loss the

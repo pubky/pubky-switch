@@ -19,9 +19,9 @@ use serde_json::{Map, Value, json};
 use super::shared_flows::{ItemsProtocol, ids, items, value};
 use super::*;
 use crate::app::{
-    AppBackup, AppError, AppEvent, ClaimOp, Collection, Delivery, MAX_CURSOR_DEFER_MS,
-    ObligationDeadline, OpBatch, OutgoingMessage, PolicyFamily, ReceiveContext, RecordJob,
-    RecordTarget, Refusal, SenderDisposition, SentMessage, SwitchCopy,
+    AppBackup, AppError, AppEvent, ClaimOp, Collection, Delivery, LISTS_TOO_LARGE_RETRY_MS,
+    MAX_CURSOR_DEFER_MS, ObligationDeadline, OpBatch, OutgoingMessage, PolicyFamily,
+    ReceiveContext, RecordJob, RecordTarget, Refusal, SenderDisposition, SentMessage, SwitchCopy,
 };
 use crate::store::{Fault as StoreFault, FaultStore};
 use crate::testing::{Fault, Router, SWITCH_ORIGIN};
@@ -2009,6 +2009,142 @@ async fn test_sender_disposition_lists_too_large_for_one_commit_let_the_read_go_
         ),
         "{error:?}"
     );
+}
+
+/// How many `GET /allow` calls the router carried.
+fn allow_reads(p: &Pair) -> usize {
+    p.router
+        .log()
+        .iter()
+        .filter(|line| line.starts_with("GET ") && line.ends_with("/allow"))
+        .count()
+}
+
+/// Whether the copy of the lists in `store` holds `key`.
+fn lists_key(store: &MemoryStore, shop: &App, key: &[u8]) -> bool {
+    let ns = crate::store::client_namespace(&shop.app_id());
+    store.get(&ns, key).unwrap().is_some()
+}
+
+/// Bob's shop on `store`, with a note from alice waiting, whose first read found its lists
+/// too large for one commit: the refusal is kept.
+async fn shop_with_lists_too_large(
+    p: &Pair,
+    protocol: &Arc<ApiProtocol>,
+    store: &Arc<MemoryStore>,
+) -> App {
+    let mut wallet = p.join(&p.alice, "wallet", protocol).await;
+    let mut shop = p
+        .join_on(
+            &p.bob,
+            "shop",
+            protocol.clone(),
+            Arc::clone(store) as Arc<dyn StateStore>,
+        )
+        .await;
+    shop.invite(&p.alice.identity().public()).await.unwrap();
+    wallet.send(Pair::note(&p.bob, "hello")).await.unwrap();
+    {
+        let mut switch = p.bob.switch().lock();
+        for n in 0..310_000u32 {
+            let mut pubky = [9u8; 32];
+            pubky[..4].copy_from_slice(&n.to_be_bytes());
+            switch.shared.flagged.insert(pubky, 3);
+        }
+    }
+    let before = allow_reads(p);
+    shop.receive(None).await.unwrap();
+    assert_eq!(allow_reads(p), before + 1);
+    assert!(lists_key(store, &shop, b"lc/too_large"));
+    assert!(!lists_key(store, &shop, b"lc/lists_at"));
+    shop
+}
+
+/// The service's flagged senders shrink to fit one commit.
+fn lists_fit_again(p: &Pair) {
+    p.bob.switch().lock().shared.flagged.clear();
+}
+
+#[tokio::test]
+async fn test_lists_too_large_refresh_isnt_tried_again_by_the_next_read() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let store = Arc::new(MemoryStore::new());
+    let mut shop = shop_with_lists_too_large(&p, &protocol, &store).await;
+    let reads = allow_reads(&p);
+    shop.receive(None).await.unwrap();
+    assert_eq!(allow_reads(&p), reads);
+    // Still nothing known, so still `None`.
+    assert_eq!(last_disposition(&protocol).lists_as_of_ms, None);
+}
+
+#[tokio::test]
+async fn test_lists_too_large_refresh_is_tried_again_after_a_day() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let store = Arc::new(MemoryStore::new());
+    let mut shop = shop_with_lists_too_large(&p, &protocol, &store).await;
+    lists_fit_again(&p);
+    let reads = allow_reads(&p);
+    p.clock.advance_ms(LISTS_TOO_LARGE_RETRY_MS - MINUTE);
+    shop.receive(None).await.unwrap();
+    assert_eq!(allow_reads(&p), reads, "not before a day");
+    p.clock.advance_ms(2 * MINUTE);
+    shop.receive(None).await.unwrap();
+    assert_eq!(allow_reads(&p), reads + 1);
+    assert!(lists_key(&store, &shop, b"lc/lists_at"));
+    assert!(!lists_key(&store, &shop, b"lc/too_large"));
+}
+
+#[tokio::test]
+async fn test_lists_too_large_explicit_refresh_is_always_tried() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let store = Arc::new(MemoryStore::new());
+    let mut shop = shop_with_lists_too_large(&p, &protocol, &store).await;
+    let reads = allow_reads(&p);
+    let error = shop.allow_list().await.unwrap_err();
+    assert!(
+        matches!(
+            error,
+            AppError::Store(crate::error::StoreError::TooLarge { .. })
+        ),
+        "{error:?}"
+    );
+    assert_eq!(allow_reads(&p), reads + 1);
+    assert!(lists_key(&store, &shop, b"lc/too_large"));
+    lists_fit_again(&p);
+    shop.allow_list().await.unwrap();
+    assert!(lists_key(&store, &shop, b"lc/lists_at"));
+    assert!(!lists_key(&store, &shop, b"lc/too_large"));
+}
+
+#[tokio::test]
+async fn test_lists_too_large_refresh_is_tried_again_after_a_restore() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let store = Arc::new(MemoryStore::new());
+    let mut shop = shop_with_lists_too_large(&p, &protocol, &store).await;
+    lists_fit_again(&p);
+    // Held back at the app's own store.
+    let reads = allow_reads(&p);
+    shop.receive(None).await.unwrap();
+    assert_eq!(allow_reads(&p), reads);
+    let backup = shop.backup_layered().await.unwrap();
+    let backup = AppBackup::from_bytes(&backup.to_bytes().unwrap()).unwrap();
+    let restored_store = Arc::new(MemoryStore::new());
+    let mut restored = App::restore(
+        p.env(&p.bob, Arc::clone(&restored_store) as Arc<dyn StateStore>),
+        protocol.clone(),
+        config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    let reads = allow_reads(&p);
+    restored.receive(None).await.unwrap();
+    assert_eq!(allow_reads(&p), reads + 1);
+    assert!(lists_key(&restored_store, &restored, b"lc/lists_at"));
 }
 
 #[tokio::test]
