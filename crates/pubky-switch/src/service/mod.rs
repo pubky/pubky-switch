@@ -15,6 +15,8 @@ mod enroll;
 mod identity;
 pub mod rules;
 
+pub use enroll::announced_limits;
+
 use std::sync::Arc;
 
 use axum::http::{HeaderName, HeaderValue};
