@@ -104,6 +104,10 @@ pub struct Limits {
     pub max_divergent_uploads: u64,
     /// Bytes of one staged import. Announced at enrollment.
     pub max_import_bytes: u64,
+    /// Most bytes of the items of one feed page and of the record views of one
+    /// `GET /records` page; a page still holds its first item, or its first batch, whatever
+    /// its size (Switch wire 7.4.4, 7.4.9).
+    pub max_page_bytes: u64,
     /// Appends per sender identity per minute.
     pub sender_per_min: u32,
     /// Appends per sender app per minute.
@@ -172,6 +176,7 @@ impl Default for Limits {
             cursor_hold_ms: DAYS_30_MS,
             max_divergent_uploads: 8,
             max_import_bytes: 4 * 1024 * 1024 * 1024,
+            max_page_bytes: 8 * 1024 * 1024,
             sender_per_min: 120,
             sender_app_per_min: 120,
             invite_reads_per_min: 30,
@@ -252,7 +257,7 @@ impl Limits {
                 return fail(name, "must be between 1 and 100");
             }
         }
-        let nonzero: [(&'static str, u64); 34] = [
+        let nonzero: [(&'static str, u64); 35] = [
             ("quota_bytes", self.quota_bytes),
             ("record_quota_bytes", self.record_quota_bytes),
             ("max_record_keys", self.max_record_keys),
@@ -273,6 +278,7 @@ impl Limits {
             ("cursor_hold_ms", self.cursor_hold_ms),
             ("max_divergent_uploads", self.max_divergent_uploads),
             ("max_import_bytes", self.max_import_bytes),
+            ("max_page_bytes", self.max_page_bytes),
             ("sender_per_min", u64::from(self.sender_per_min)),
             ("sender_app_per_min", u64::from(self.sender_app_per_min)),
             ("invite_reads_per_min", u64::from(self.invite_reads_per_min)),
@@ -354,6 +360,7 @@ mod tests {
         assert_eq!(limits.cursor_hold_ms, 2_592_000_000);
         assert_eq!(limits.max_divergent_uploads, 8);
         assert_eq!(limits.max_import_bytes, 4_294_967_296);
+        assert_eq!(limits.max_page_bytes, 8_388_608);
         assert_eq!(limits.sender_per_min, 120);
         assert_eq!(limits.sender_app_per_min, 120);
         assert_eq!(limits.invite_reads_per_min, 30);
