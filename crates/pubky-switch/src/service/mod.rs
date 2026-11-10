@@ -9,12 +9,13 @@
 //! (Switch wire 7.3 step 10).
 //!
 //! Served so far: `POST /v1/enroll`, `PUT /v1/{id}/identity`, the public
-//! `GET /v1/{id}/identity`, `POST /v1/{id}/ops`, `GET /v1/{id}/claims/{claim_key}` and
-//! `POST /v1/{id}/apps/{app_id}/revoke`. Every other call is answered `503 unavailable`.
+//! `GET /v1/{id}/identity`, `POST /v1/{id}/ops`, `GET /v1/{id}/feed`,
+//! `GET /v1/{id}/claims/{claim_key}` and `POST /v1/{id}/apps/{app_id}/revoke`. Every other call is answered `503 unavailable`.
 
 pub mod batch;
 mod claims;
 mod enroll;
+mod feed;
 mod identity;
 pub mod rules;
 
@@ -32,6 +33,7 @@ use pubky_switch_core::{
 };
 
 use crate::{
+    changes::ChangeHub,
     http::{
         Handler, HandlerFuture, Refusal, SwitchRequest, SwitchResponse,
         error::{ApiError, ErrorCode, is_failed_authentication},
@@ -63,6 +65,7 @@ pub struct Service {
     reads_per_account: MinuteWindows<String>,
     operation_rate: KeyedMinutes<(String, [u8; 16])>,
     control_rate: KeyedMinutes<(String, [u8; 16])>,
+    changes: Arc<ChangeHub>,
 }
 
 impl std::fmt::Debug for Service {
@@ -81,8 +84,17 @@ struct Answer {
     head: Option<SignedHead>,
     retry_after: Option<u64>,
     cacheable: bool,
-    /// A `GET /claims` answer, whose body is built once the lock is gone.
-    claim_read: Option<claims::ClaimRead>,
+    /// An answer whose body is read once the lock is gone.
+    deferred: Option<Deferred>,
+}
+
+/// A read whose answer is built once the request's lock is gone.
+#[derive(Debug)]
+enum Deferred {
+    /// A `GET /claims` answer's entries.
+    Claim(claims::ClaimRead),
+    /// A feed page, after its long-poll.
+    Feed(Box<feed::FeedRead>),
 }
 
 impl Answer {
@@ -93,7 +105,7 @@ impl Answer {
             head: None,
             retry_after: None,
             cacheable: false,
-            claim_read: None,
+            deferred: None,
         }
     }
 
@@ -104,7 +116,7 @@ impl Answer {
             head: None,
             retry_after: error.retry_after,
             cacheable: false,
-            claim_read: None,
+            deferred: None,
         }
     }
 
@@ -209,7 +221,14 @@ impl Service {
             reads_per_account: MinuteWindows::default(),
             operation_rate: KeyedMinutes::default(),
             control_rate: KeyedMinutes::default(),
+            changes: ChangeHub::new(),
         }
+    }
+
+    /// The hub that wakes waiting feed reads. Run a [`crate::changes::ChangeListener`]
+    /// into it, so changes made by any instance wake them.
+    pub fn changes(&self) -> Arc<ChangeHub> {
+        self.changes.clone()
     }
 
     /// The failed-authentication counts, for monitoring.
@@ -303,7 +322,7 @@ impl Service {
                 Ok(claimed) => Some(claimed),
                 Err(error) => return refused_early(error).await,
             },
-            Call::Ops | Call::GetClaim(_) => {
+            Call::Ops | Call::GetClaim(_) | Call::Feed => {
                 match self.authenticate_caller(&account, &request, base_ms) {
                     Ok(claimed) => {
                         // An own app's request is verified here too, so nothing unverified
@@ -560,11 +579,16 @@ impl Service {
         match committed {
             Ok(()) => {
                 let mut answer = answer;
-                if let Some(read) = answer.claim_read.take() {
-                    match self.claim_body(&read).await {
+                match answer.deferred.take() {
+                    Some(Deferred::Claim(read)) => match self.claim_body(&read).await {
                         Ok(body) => answer.body = body,
                         Err(error) => answer = Answer::error(&error),
-                    }
+                    },
+                    Some(Deferred::Feed(read)) => match self.feed_page(&read, &signer).await {
+                        Ok(page) => answer = page,
+                        Err(error) => answer = Answer::error(&error),
+                    },
+                    None => {}
                 }
                 sign_answer(&signer, signature, time_ms, answer)
             }
@@ -689,6 +713,19 @@ impl Service {
                         time_ms,
                     )
                     .await
+                    .map(|answer| (answer, serving))
+                    .map_err(|error| Refused::with_head(error, serving));
+            }
+            Call::Feed => {
+                let head = txn.head();
+                return self
+                    .feed(
+                        &head.id,
+                        head.identity_key,
+                        &head.service_key,
+                        writer.as_ref(),
+                        &request.route.query,
+                    )
                     .map(|answer| (answer, serving))
                     .map_err(|error| Refused::with_head(error, serving));
             }

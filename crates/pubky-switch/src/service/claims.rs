@@ -92,13 +92,13 @@ impl Service {
         };
         let head = self.head(txn, signer).await.ok_or_else(temporary)?;
         let mut answer = Answer::ok(Vec::new()).with_head(Some(head));
-        answer.claim_read = Some(ClaimRead {
+        answer.deferred = Some(super::Deferred::Claim(ClaimRead {
             account: txn.head().id.clone(),
             claim_key,
             view,
             steps,
             last_seq,
-        });
+        }));
         Ok(answer)
     }
 
@@ -204,6 +204,7 @@ impl Service {
             stub: &stub,
             server_time_ms: time_ms,
             only_for: None,
+            proof: None,
         })
         .await
         .map_err(|e| store_error(&e))?;

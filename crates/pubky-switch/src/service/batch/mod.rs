@@ -774,16 +774,6 @@ impl Service {
                 .chain_tip()
                 .append(seq, time_ms, ItemType::Op, hash, Some(body.batch))
                 .map_err(|_| temporary())?;
-            txn.append_chain_item(&NewChainItem {
-                seq,
-                item_type: ItemType::Op,
-                item_bytes: &item_bytes,
-                stub: &stub,
-                server_time_ms: time_ms,
-                only_for: applied.only_for,
-            })
-            .await
-            .map_err(|e| storage(&e))?;
             let object = body
                 .kind
                 .proof_object(body.app_id.as_ref())
@@ -791,9 +781,21 @@ impl Service {
             let proof = TransitionProof::sign(
                 signer,
                 &identity,
-                ProofBody::new(stub, object, &applied.state),
+                ProofBody::new(stub.clone(), object, &applied.state),
             )
             .map_err(|_| temporary())?;
+            // The item keeps its proof, which the feed shows with it (Switch wire 7.5).
+            txn.append_chain_item(&NewChainItem {
+                seq,
+                item_type: ItemType::Op,
+                item_bytes: &item_bytes,
+                stub: &stub,
+                server_time_ms: time_ms,
+                only_for: applied.only_for,
+                proof: Some(proof.signed()),
+            })
+            .await
+            .map_err(|e| storage(&e))?;
             proofs.push(proof.signed().clone());
         }
         Ok(proofs)
