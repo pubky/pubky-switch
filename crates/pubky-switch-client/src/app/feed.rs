@@ -620,9 +620,14 @@ impl App {
         let uncertain = key::uncertain(&entry.sender, &received.message.msg_id);
         if self.reader().exists(&uncertain).await? {
             read.tx.delete(&uncertain)?;
-            // The park and its duty events go in this read's commit, with the marker's
-            // deletion.
+            // The park, the processed pair and the duty events go in this read's commit,
+            // with the marker's deletion, so a re-send of the message is a duplicate.
             self.park(entry, &received.plaintext, ParkReason::Uncertain, read)?;
+            let now = self.now();
+            let msg_id = &received.message.msg_id;
+            processed_writes(&mut read.tx, &entry.sender, msg_id, received.hash(), now)?;
+            read.pairs
+                .insert((entry.sender, msg_id.clone()), received.hash());
             self.keep_duty(
                 &mut read.tx,
                 Duty::EffectUncertain {
@@ -1092,8 +1097,8 @@ impl App {
     /// The entry of a kept effect whose fate can't be known: building the effect again
     /// could apply it twice, so the entry is stored locally and passed, like an effect
     /// refused for good (Switch spec 8.2), and the protocol is told ([`Duty::Parked`],
-    /// [`Duty::EffectUncertain`]), all in `tx`; it decides from the current state. One
-    /// stored before only changes its reason. Returns `false`, writing nothing, for an
+    /// [`Duty::EffectUncertain`]), with its processed pair, all in `tx`; it decides from the
+    /// current state. One stored before only changes its reason. Returns `false`, writing nothing, for an
     /// effect kept without its entry.
     fn park_uncertain(&mut self, pending: &PendingEffect, tx: &mut Tx) -> Result<bool, AppError> {
         let reason = ParkReason::Uncertain;
@@ -1114,13 +1119,16 @@ impl App {
         };
         tx.put(&key::parked(pending.seq), &parked)?;
         self.state.parked.insert(pending.seq, parked);
+        // Processed, so a re-send of the message is a duplicate, not applied (Switch spec
+        // 11).
+        let now = self.now();
+        processed_writes(tx, &pending.sender, &pending.msg_id, pending.hash, now)?;
         if pending.parked {
             // Stored before, and passed then.
         } else if pending.past_held {
             tx.put(&key::seen(pending.seq), &())?;
             self.state.seen.insert(pending.seq);
         } else {
-            let now = self.now();
             let cursor = &mut self.state.cursor;
             cursor.seq = cursor.seq.max(pending.seq);
             cursor.time_ms = cursor.time_ms.max(pending.accepted_at_ms);

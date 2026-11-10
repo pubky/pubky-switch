@@ -2001,7 +2001,7 @@ async fn test_key_change_effect_resend_past_the_window_parks_its_entry() {
     let router = Router::of(&w);
     let mut app = join(&w, &router).await;
     let me = app.app_id();
-    let (seq, _) = w.note(me, "before");
+    let (seq, message) = w.note(me, "before");
     // The effect is applied at generation 1, and its answer lost.
     w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
     assert!(app.receive(None).await.is_err());
@@ -2040,6 +2040,7 @@ async fn test_key_change_effect_resend_past_the_window_parks_its_entry() {
     let report = app.receive(None).await.unwrap();
     assert!(!received(&report.events, seq));
     assert_eq!(conversations_at(&changed), 0);
+    resend_is_a_duplicate(&w, &mut app, &changed, &message).await;
 }
 
 #[tokio::test]
@@ -2048,7 +2049,7 @@ async fn test_key_change_effect_kept_without_its_entry_parks_it_when_read_again(
     let router = Router::of(&w);
     let mut app = join(&w, &router).await;
     let me = app.app_id();
-    let (seq, _) = w.note(me, "before");
+    let (seq, message) = w.note(me, "before");
     w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
     assert!(app.receive(None).await.is_err());
     // A kept effect written without its entry, as an earlier build kept it.
@@ -2083,6 +2084,7 @@ async fn test_key_change_effect_kept_without_its_entry_parks_it_when_read_again(
     );
     // The marker went with the park.
     assert!(app.reader().scan_raw("uncert/").await.unwrap().is_empty());
+    resend_is_a_duplicate(&w, &mut app, &changed, &message).await;
     let loaded = App::load(
         router.env(&w, Arc::clone(&w.store) as Arc<dyn StateStore>),
         w.protocol.clone(),
@@ -2238,6 +2240,40 @@ async fn test_key_change_sends_a_kept_effect_again_and_settles_it_once() {
     );
 }
 
+/// After an uncertain park of `message`'s entry: the same signed message again, as a
+/// re-send at `switch`, is a duplicate, not applied (Switch spec 11).
+async fn resend_is_a_duplicate(
+    w: &World,
+    app: &mut App,
+    switch: &Arc<ScriptedSwitch>,
+    message: &pubky_switch_core::message::Message,
+) {
+    let plaintext = message.sign(&w.bob_keys).unwrap();
+    let again = switch
+        .send_plaintext(w.bob.public(), &w.bob_cert, &plaintext, &[app.app_id()])
+        .unwrap();
+    let before = conversations_at(switch);
+    let report = app.receive(None).await.unwrap();
+    assert!(
+        has(&report.events, |e| matches!(
+            e,
+            AppEvent::Duplicate { seq, conflicting: false } if *seq == again
+        )),
+        "{:?}",
+        report.events
+    );
+    assert!(
+        !has(&report.events, |e| matches!(
+            e,
+            AppEvent::MessageReceived { .. }
+        )),
+        "{:?}",
+        report.events
+    );
+    assert_eq!(conversations_at(switch), before);
+    assert!(app.cursor().seq >= again);
+}
+
 #[tokio::test]
 async fn test_key_change_parks_a_kept_effect_older_than_the_batch_window() {
     let w = World::new();
@@ -2289,10 +2325,11 @@ async fn test_key_change_parks_a_kept_effect_older_than_the_batch_window() {
             .unwrap(),
         None
     );
-    // Later reads don't try it again.
+    // Later reads don't try it again, nor apply a re-send.
     let report = app.receive(None).await.unwrap();
     assert!(!received(&report.events, seq), "{:?}", report.events);
     assert_eq!(conversations_at(&changed), 0);
+    resend_is_a_duplicate(&w, &mut app, &changed, &message).await;
     // The protocol is told durably: a load delivers it again until it is acknowledged.
     let loaded = App::load(
         router.env(&w, Arc::clone(&w.store) as Arc<dyn StateStore>),
