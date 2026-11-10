@@ -8,7 +8,7 @@ use pubky_switch_core::chain::ItemType;
 use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::ops::{AllowKind, OpKind};
 use pubky_switch_core::records::{
-    CLOCK_TOLERANCE_MS, Freeze, FreezeBody, IDENTITY_PATH, RemovedApp,
+    CLOCK_TOLERANCE_MS, DAY_MS, Freeze, FreezeBody, IDENTITY_PATH, RemovedApp,
 };
 use pubky_switch_core::scopes::Permission;
 use pubky_switch_core::sig::SignedDoc;
@@ -1765,6 +1765,91 @@ async fn test_key_change_signs_a_kept_batch_again_only_on_stale_generation() {
         && matches!(op.body().kind, OpKind::AllowPut { pubky, .. } if pubky == carol)));
     assert_eq!(allow_ops_for(&applied, carol), 1);
     assert!(app.kept_batches().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_key_change_resend_past_the_window_drops_instead_of_signing_again() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = lists_app(&w, &router).await;
+    let carol = IdentityKey::from_secret(seed("carol/identity")).public();
+    // Applied at generation 1, its answer lost.
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.submit_batch(contact_batch(carol)).await.is_err());
+    // On day 29 the key changes: the batch is kept to be sent again, but the first resend
+    // can't connect.
+    w.clock.advance_ms(29 * DAY_MS);
+    let changed = change_key(&w, &router);
+    changed.fail_next(Fault::Unreachable {
+        path: "ops".into(),
+        after: 0,
+    });
+    assert!(app.receive(None).await.is_err());
+    assert_eq!(app.kept_batches().await.unwrap().len(), 1);
+    // On day 31 the service has forgotten the batch ID: `409 stale_generation` no longer
+    // shows the batch was never applied (Switch spec 12.5 "Kept batches").
+    w.clock.advance_ms(2 * DAY_MS);
+    changed.lock().batches.clear();
+    let report = app.receive(None).await.unwrap();
+    assert!(
+        has(&report.events, |e| matches!(
+            e,
+            AppEvent::KeptBatchDropped { .. }
+        )),
+        "{:?}",
+        report.events
+    );
+    assert!(!has(&report.events, |e| matches!(
+        e,
+        AppEvent::KeptBatchSignedAgain { .. }
+    )));
+    assert!(app.kept_batches().await.unwrap().is_empty());
+    assert_eq!(allow_ops_for(&changed.applied(), carol), 0);
+    assert_eq!(allow_ops_for(&w.switch.applied(), carol), 1);
+}
+
+#[tokio::test]
+async fn test_key_change_effect_resend_past_the_window_parks_its_entry() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join(&w, &router).await;
+    let me = app.app_id();
+    let (seq, _) = w.note(me, "before");
+    // The effect is applied at generation 1, and its answer lost.
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.receive(None).await.is_err());
+    assert_eq!(w.effects(), 1);
+    w.clock.advance_ms(29 * DAY_MS);
+    let changed = change_key(&w, &router);
+    changed.fail_next(Fault::Unreachable {
+        path: "ops".into(),
+        after: 0,
+    });
+    assert!(app.receive(None).await.is_err());
+    w.clock.advance_ms(2 * DAY_MS);
+    changed.lock().batches.clear();
+    // The entry is stored and passed, never applied again, and the protocol told.
+    let report = app.receive(None).await.unwrap();
+    assert!(
+        has(&report.events, |e| matches!(
+            e,
+            AppEvent::Parked { seq: s, reason: crate::app::ParkReason::Uncertain } if *s == seq
+        )),
+        "{:?}",
+        report.events
+    );
+    assert!(has(&report.events, |e| matches!(
+        e,
+        AppEvent::EffectRefused { seq: s, code: Some(code), .. }
+            if *s == seq && code == "stale_generation"
+    )));
+    assert!(!received(&report.events, seq), "{:?}", report.events);
+    assert_eq!(conversations_at(&changed), 0);
+    assert!(app.cursor().seq >= seq);
+    // Not tried again.
+    let report = app.receive(None).await.unwrap();
+    assert!(!received(&report.events, seq));
+    assert_eq!(conversations_at(&changed), 0);
 }
 
 #[tokio::test]

@@ -60,7 +60,8 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
 | `proct/<time>/<sender>/<msg_id>` | the time index for pruning processed pairs | |
 | `seen/<seq>` | an entry processed past a held one | |
 | `held/<seq>` | an entry held because its sender can't be checked, since when | |
-| `parked/<seq>` | an entry stored locally and passed: the opened plaintext, sender, certificate, time, reason (an unverifiable sender or a quota, tried again; an effect refused for good or over one batch, not tried again) | yes |
+| `parked/<seq>` | an entry stored locally and passed: the opened plaintext, sender, certificate, time, reason (an unverifiable sender or a quota, tried again; an effect refused for good, over one batch, or kept past the window in which its resend tells whether it was applied, not tried again) | yes |
+| `uncert/<sender>/<msg_id>` | a message whose kept effect may have been applied: its entry is parked when the feed shows it again | |
 | `asked/<seq>` | a re-send was handed to the protocol for this item | |
 | `departed/<app_id>` | another own app's departure verified in the chain, and its time | |
 | `join` | the join step: the registration batch while it is owed | |
@@ -114,8 +115,10 @@ uploads; `push.rs` holds the push registration. The peek (`peek.rs`) writes noth
   frozen service's `410 moved` keeps them for the switch. A move the app never saw frozen,
   or a key change in place, didn't read the old feed to its end: its kept batches and
   effect stay unchanged and go again first, and the answer decides (original proofs or
-  `409 conflict`: applied; `409 stale_generation`: signed again); one kept 30 days less
-  the clock tolerance or more goes instead.
+  `409 conflict`: applied; `409 stale_generation`: signed again). Past 30 days less the
+  clock tolerance from when it was kept, at the switch or at any later resend, or with no
+  time kept, `409 stale_generation` decides nothing: a batch goes, reported as dropped,
+  and an effect's entry is parked, never applied again.
 - **A newer own `identity.json`** that names a later generation, a loss of the generation
   moved from, or another service than the freeze, supersedes a move or a loss at any step,
   a stuck one included: after a step fails at a service the app reads its `identity.json`

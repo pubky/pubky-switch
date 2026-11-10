@@ -54,10 +54,11 @@ pub enum AppEvent {
         /// Why.
         reason: ParkReason,
     },
-    /// A received message's effect was refused for good, or has more operations than one
-    /// batch takes with the cursor move: its entry was stored locally and passed
-    /// ([`AppEvent::Parked`]), and the effect isn't sent again (Switch spec 8.2). The
-    /// protocol may build it again in another form.
+    /// A received message's effect was refused for good, has more operations than one batch
+    /// takes with the cursor move, or was kept from before a provider change past the
+    /// window in which its resend tells whether it was applied: its entry was stored
+    /// locally and passed ([`AppEvent::Parked`]), and the effect isn't sent again (Switch
+    /// spec 8.2, 12.5 "Kept batches"). The protocol may build it again in another form.
     EffectRefused {
         /// The entry's `seq`.
         seq: u64,
@@ -406,4 +407,8 @@ pub enum ParkReason {
     /// ([`super::MAX_CLAIM_READS`]), or again for what it was given: it is kept, not
     /// applied, and not tried again.
     TooManyReads,
+    /// Its effect was kept from before a provider change longer than a resend's answer
+    /// tells whether it was applied (Switch spec 12.5 "Kept batches"): it may have been, so
+    /// it is kept, not applied again, and not tried again.
+    Uncertain,
 }

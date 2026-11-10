@@ -548,6 +548,15 @@ impl App {
             });
             return Ok(Step::Pass);
         }
+        // A kept effect that may have been applied: never built again (Switch spec 12.5
+        // "Kept batches").
+        let uncertain = key::uncertain(&entry.sender, &received.message.msg_id);
+        if self.reader().exists(&uncertain).await? {
+            read.tx.delete(&uncertain)?;
+            self.park(entry, &received.plaintext, ParkReason::Uncertain, read)?;
+            self.effect_refused(entry, &received, Some("stale_generation".into()));
+            return Ok(Step::Pass);
+        }
         self.apply(entry, received, parked, read).await
     }
 
@@ -957,6 +966,12 @@ impl App {
                 code: ErrorCode::Conflict,
                 ..
             })) => Vec::new(),
+            Err(AppError::Switch(ClientError::Switch {
+                code: ErrorCode::StaleGeneration,
+                ..
+            })) if !super::provider::answer_decides(self.now(), pending.kept_ms) => {
+                return self.effect_uncertain(&pending).await;
+            }
             Err(error) if refused_for_good(&error).is_some() => {
                 return self.drop_pending_effect().await;
             }
@@ -970,6 +985,38 @@ impl App {
             sender: pending.sender,
         });
         Ok(())
+    }
+
+    /// A kept effect answered `409 stale_generation` past the window in which that answer
+    /// means it was never applied: the service may have forgotten a batch it applied, so
+    /// the effect goes and its entry is stored and passed, never applied again. An entry
+    /// stored before keeps its plaintext and changes reason; another is stored when the
+    /// feed shows it again, since the cursor didn't pass it.
+    async fn effect_uncertain(&mut self, pending: &PendingEffect) -> Result<(), AppError> {
+        let mut tx = self.tx()?;
+        tx.delete(key::PENDING_EFFECT)?;
+        let stored = self.state.parked.get(&pending.seq).cloned();
+        match stored {
+            Some(mut entry) if pending.parked => {
+                entry.reason = ParkReason::Uncertain;
+                tx.put(&key::parked(pending.seq), &entry)?;
+                self.state.parked.insert(pending.seq, entry);
+                self.events.push(AppEvent::Parked {
+                    seq: pending.seq,
+                    reason: ParkReason::Uncertain,
+                });
+                self.events.push(AppEvent::EffectRefused {
+                    seq: pending.seq,
+                    sender: pending.sender,
+                    msg_id: pending.msg_id.clone(),
+                    kind: pending.kind.clone(),
+                    code: Some("stale_generation".into()),
+                });
+            }
+            _ => tx.put(&key::uncertain(&pending.sender, &pending.msg_id), &())?,
+        }
+        self.state.pending_effect = None;
+        self.commit(tx).await
     }
 
     async fn drop_pending_effect(&mut self) -> Result<(), AppError> {
@@ -1083,7 +1130,10 @@ impl App {
             // reads than an entry gets, isn't tried again.
             if matches!(
                 stored.reason,
-                ParkReason::Refused | ParkReason::TooManyOperations | ParkReason::TooManyReads
+                ParkReason::Refused
+                    | ParkReason::TooManyOperations
+                    | ParkReason::TooManyReads
+                    | ParkReason::Uncertain
             ) {
                 continue;
             }

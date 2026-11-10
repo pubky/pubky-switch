@@ -204,6 +204,13 @@ pub(crate) enum Carry {
 /// 12.5 "Kept batches", 6.3).
 pub(crate) const KEPT_BATCH_ANSWER_MS: u64 = 30 * DAY_MS - CLOCK_TOLERANCE_MS;
 
+/// Whether a resend of a batch kept at `kept_ms` still tells whether it was applied, at
+/// `now`: kept less than [`KEPT_BATCH_ANSWER_MS`] ago. A batch without a time, kept by an
+/// earlier build, counts as too old.
+pub(crate) fn answer_decides(now: u64, kept_ms: Option<u64>) -> bool {
+    kept_ms.is_some_and(|at| now.saturating_sub(at) < KEPT_BATCH_ANSWER_MS)
+}
+
 /// How many provider changes one follow takes in a row, each given up for a newer own
 /// `identity.json` met on the way; the next call goes on from there.
 const FOLLOW_PASSES: usize = 4;
@@ -215,7 +222,7 @@ fn corrupt() -> AppError {
 /// A kept batch dropped at a provider change: reported, with each `attempt` in it, so the
 /// protocol treats those obligations as uncertain (Switch spec 12.5 "Kept batches", 12.6
 /// step 5).
-fn dropped(id: &[u8; 16], batch: &Batch, events: &mut Vec<AppEvent>) {
+pub(crate) fn dropped(id: &[u8; 16], batch: &Batch, events: &mut Vec<AppEvent>) {
     events.push(AppEvent::KeptBatchDropped { batch_id: *id });
     for op in batch.ops() {
         if let OpKind::Claim(fields) = &op.body().kind
@@ -982,8 +989,9 @@ impl App {
     /// - **With [`Carry::ResendFirst`],** a kept batch or effect the chain doesn't show
     ///   applied stays as it is, to be sent again unchanged, and its answer decides (Switch
     ///   spec 12.5 "Kept batches"). One kept longer than the service holds batch IDs, 30
-    ///   days less the clock tolerance, goes instead: a batch reported as dropped, an
-    ///   effect with its entry read again.
+    ///   days less the clock tolerance, goes instead, reported as dropped. A kept effect
+    ///   stays whatever its age: when the answer can't decide, its entry is stored and
+    ///   passed, never applied again.
     ///
     /// Returns the events to report once `tx` commits.
     pub(crate) async fn carry_kept_writes(
@@ -994,14 +1002,15 @@ impl App {
         let mut events = Vec::new();
         let now = self.now();
         let resend_first = carry == Carry::ResendFirst;
-        let answer_decides = |kept_ms: Option<u64>| {
-            kept_ms.is_none_or(|at| now.saturating_sub(at) < KEPT_BATCH_ANSWER_MS)
-        };
+        let answer_decides = |kept_ms: Option<u64>| answer_decides(now, kept_ms);
         if let Some(pending) = self.state.pending_effect.clone() {
             let applied = Batch::from_body(pending.body.clone())?
                 .id()
                 .is_some_and(|id| self.applied_by_old_service(&id));
-            let stays = !applied && resend_first && answer_decides(pending.kept_ms);
+            // A kept effect stays to be sent again whatever its age: an answer that can't
+            // decide parks its entry instead of building the effect again
+            // (`feed.rs`).
+            let stays = !applied && resend_first;
             if !stays {
                 tx.delete(key::PENDING_EFFECT)?;
                 self.state.pending_effect = None;
