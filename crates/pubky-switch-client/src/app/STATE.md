@@ -2,7 +2,7 @@
 
 The app layer keeps all of one app's durable state in the host's `StateStore`, namespace
 `client/<app_id>` (the App ID in z-base-32). One record per key; no blob is rewritten whole.
-Every value is `{"v":2,"d":<record>}` (`SCHEMA_VERSION`): a reader refuses an earlier `v`
+Every value is `{"v":3,"d":<record>}` (`SCHEMA_VERSION`): a reader refuses an earlier `v`
 as an old schema (`StoreError::OldSchema`) and any other as corrupt, so a later
 schema adds a migration instead of reading old bytes wrongly. Keys are ASCII. Numbers in keys
 are zero-padded to 20 digits so keys sort numerically. The record types are in `state.rs`.
@@ -106,10 +106,12 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
 | `proct/<time>/<sender>/<msg_id>` | the time index for pruning processed pairs | |
 | `seen/<seq>` | an entry processed past a held one | |
 | `held/<seq>` | an entry held because its sender can't be checked, since when | |
-| `retry/<seq>` | an entry whose receive step the protocol's store or the host kept from finishing (`Outcome::Retry`): the reads in a row that ended so, and when the first was; kept while the entry is stored locally too, and it goes once the entry is processed | |
-| `parked/<seq>` | an entry stored locally and passed: the opened plaintext, sender, certificate, time, reason (an unverifiable sender, a quota or a store failure of the receive step, tried again; an effect refused for good, over one batch, too large for the store to keep or commit, carrying an operation the app layer builds itself, or kept past the window in which its resend tells whether it was applied, not tried again) | yes |
+| `retry/<seq>` | an entry on the feed whose receive step the protocol's store or the host kept from finishing (`Outcome::Retry`): the reads in a row that ended so, and when the first was; it goes once the entry is processed, or moves to `sretry/<id>` when the entry is stored locally | |
+| `sretry/<id>` | the same count for the entry stored locally at local ID `id`, until it is processed or stored for good | |
+| `parked/<id>` | an entry stored locally and passed, keyed by its local ID, which never changes: the `seq` and generation it was read at, the opened plaintext, sender, certificate, time, reason (an unverifiable sender, a quota or a store failure of the receive step, tried again; an effect refused for good, over one batch, too large for the store to keep or commit, carrying an operation the app layer builds itself, or kept past the window in which its resend tells whether it was applied, not tried again) | yes |
 | `asked/<seq>` | a re-send was handed to the protocol for this item | |
-| `parkn` | where the retries of entries stored locally stand in their round: its number and the next `seq`. The round covers the entries stored in an earlier round, each `parked/` record naming the round it was stored in, not by `seq`, which a provider loss renumbers; each read tries at most `PARKED_RETRIES_PER_READ`, in `seq` order, and an entry stored later waits for the next round, so every entry is tried within two rounds | |
+| `parkn` | where the retries of entries stored locally stand in their round: its number and the next local ID. The round covers the entries stored in an earlier round, each `parked/` record naming the round it was stored in; each read tries at most `PARKED_RETRIES_PER_READ`, in local ID order, and an entry stored later waits for the next round, so every entry is tried within two rounds | |
+| `parkid` | the local ID the next entry stored locally takes: it only goes up, and is never below one past the highest `parked/` key, so no ID is used twice in one store | |
 | `owed/<generation>/<seq>` | a re-send or missed-entries call about this item that the protocol answered with an error: written in the commit that passes the item, made again at the start of each read, each call on its own, and gone in the commit of its answer's writes, or, for an answer whose writes are over `MAX_STEP_LOCAL_BYTES`, in the commit of the duty event that refuses them; `App::owed_protocol_calls` counts them. The key names the generation the item was read at | |
 | `departed/<app_id>` | another own app's departure verified in the chain, and its time | |
 | `join` | the join step: the registration batch while it is owed | |
@@ -131,6 +133,7 @@ Deleting the keys on a leave removes `keys`, `naming`, `rk/`, `scope/`, `parked/
 
 - New records take new keys under a prefix of their own; existing keys keep their meaning.
 - A changed record type bumps `SCHEMA_VERSION` with a migration that runs on load.
+- `SCHEMA_VERSION` 3: entries stored locally are keyed by a local ID (`parked/<id>`, `parkid`) instead of the `seq` they were read at, which they keep as fields with its generation; a provider loss no longer writes them again. `pending/effect` names its entry's local ID (`stored`) and generation, and retries of stored entries count under `sretry/<id>`. A layered backup carries version 4. No migration reads a store of schema 2: it fails to load as an old schema, and so does a backup of schema 2 or a layered backup of version 3. No released build wrote schema 2.
 - `SCHEMA_VERSION` 2: `pending/effect` keeps the opened entry it is for, a required field.
   No migration reads a store of schema 1; such a store fails to load as an old schema, and
   a backup an earlier schema wrote (schema 1, or a layered backup of version 2) is refused

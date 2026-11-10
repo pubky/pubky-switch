@@ -223,7 +223,7 @@ async fn test_receive_retry_keeps_the_entry_and_applies_it_at_the_next_read() {
     assert_eq!(w.effects(), 0);
     assert_eq!(app.protocol_get(FAILED_STEP).await.unwrap(), None);
     assert_eq!(note_kept(&app, &message).await, None);
-    assert_eq!(app.state.retries.get(&seq).map(|r| r.reads), Some(1));
+    assert_eq!(app.retry_reads_at(seq), Some(1));
     // A peek still shows it: it runs no receive step.
     let peeked = app.peek().await.unwrap();
     assert!(
@@ -251,13 +251,10 @@ async fn test_receive_retry_keeps_the_entry_and_applies_it_at_the_next_read() {
         Some(FLAKY.as_bytes().to_vec())
     );
     assert_eq!(app.protocol_get(FAILED_STEP).await.unwrap(), None);
-    assert!(
-        app.state.retries.is_empty(),
-        "the count goes with the entry"
-    );
+    assert!(app.no_retries(), "the count goes with the entry");
     // Reloaded from the store: nothing of the retry is left.
     let app = load_flaky(&w, &protocol, app.app_id()).await;
-    assert!(app.state.retries.is_empty());
+    assert!(app.no_retries());
 }
 
 #[tokio::test]
@@ -335,7 +332,7 @@ async fn test_receive_retry_repeated_raises_store_failing_and_keeps_the_entry() 
     assert!(store_failing(&report.events).is_empty());
     assert_eq!(report.cursor.seq, seq);
     assert_eq!(w.effects(), 1);
-    assert!(app.state.retries.is_empty());
+    assert!(app.no_retries());
 }
 
 #[test]
@@ -367,7 +364,7 @@ async fn test_receive_retry_after_a_need_commits_nothing_and_applies_later() {
     assert!(report.cursor.seq < seq);
     assert_eq!(w.effects(), 0);
     assert_eq!(app.protocol_get(FAILED_STEP).await.unwrap(), None);
-    assert_eq!(app.state.retries.get(&seq).map(|r| r.reads), Some(1));
+    assert_eq!(app.retry_reads_at(seq), Some(1));
     // The next read asks again, and applies.
     let report = app.receive(None).await.unwrap();
     assert_eq!(protocol.calls(), 4);
@@ -442,7 +439,7 @@ async fn test_receive_retry_unavailable_is_held_for_the_wait_then_parked_and_pro
     let calls = protocol.calls();
     let report = app.receive(None).await.unwrap();
     assert_eq!(protocol.calls(), calls + 1);
-    assert!(app.state.parked.contains_key(&seq));
+    assert!(app.stored_at(seq).is_some());
     assert!(
         !report
             .events
@@ -457,13 +454,10 @@ async fn test_receive_retry_unavailable_is_held_for_the_wait_then_parked_and_pro
         report
             .events
             .iter()
-            .any(|e| matches!(e, AppEvent::Unparked { seq: s } if *s == seq))
+            .any(|e| matches!(e, AppEvent::Unparked { seq: s, .. } if *s == seq))
     );
     assert!(app.state.parked.is_empty());
-    assert!(
-        app.state.retries.is_empty(),
-        "the count goes once it is processed"
-    );
+    assert!(app.no_retries(), "the count goes once it is processed");
     assert_eq!(w.effects(), 1);
     assert_eq!(protocol.applied(), 1);
     assert_eq!(
@@ -490,13 +484,13 @@ async fn test_receive_retry_count_goes_on_while_the_entry_is_stored_locally() {
         Some(ParkReason::StoreUnavailable)
     );
     assert!(store_failing(&report.events).is_empty());
-    assert_eq!(app.state.retries.get(&seq).map(|r| r.reads), Some(2));
+    assert_eq!(app.retry_reads_at(seq), Some(2));
     // Stored, it is tried at each read with the store still failing: the count goes on,
     // and the host learns of it from the third read in a row.
     for reads in RETRY_EVENT_READS..RETRY_EVENT_READS + 3 {
         let report = app.receive(None).await.unwrap();
         assert_eq!(store_failing(&report.events), vec![(seq, reads)]);
-        assert!(app.state.parked.contains_key(&seq));
+        assert!(app.stored_at(seq).is_some());
     }
     // Kept in the store with the entry: loaded again, the app counts on.
     let mut app = load_flaky(&w, &protocol, app.app_id()).await;
@@ -522,7 +516,7 @@ async fn test_receive_retries_a_bounded_number_of_stored_entries_each_read_in_tu
     app.receive(None).await.unwrap();
     for seq in &seqs {
         assert_eq!(
-            app.state.parked.get(seq).map(|p| p.reason),
+            app.stored_at(*seq).map(|p| p.reason),
             Some(ParkReason::StoreUnavailable)
         );
     }
@@ -583,7 +577,7 @@ async fn test_receive_retry_count_goes_when_a_resumed_effect_applies_a_stored_en
     app.receive(None).await.unwrap();
     w.clock.advance_ms(PARK_AFTER_MS);
     app.receive(None).await.unwrap();
-    assert_eq!(app.state.retries.get(&seq).map(|r| r.reads), Some(2));
+    assert_eq!(app.retry_reads_at(seq), Some(2));
     // The store heals; the stored entry's effect is applied, but its answer is lost.
     protocol.heal();
     w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
@@ -592,10 +586,10 @@ async fn test_receive_retry_count_goes_when_a_resumed_effect_applies_a_stored_en
     // The next read sends it again: applied once, the entry processed, its count gone.
     app.receive(None).await.unwrap();
     assert!(app.state.parked.is_empty());
-    assert!(app.state.retries.is_empty(), "{:?}", app.state.retries);
+    assert!(app.no_retries(), "{:?}", app.state.retries);
     assert_eq!(w.effects(), 1);
     let app = load_flaky(&w, &protocol, app.app_id()).await;
-    assert!(app.state.retries.is_empty(), "and in the store");
+    assert!(app.no_retries(), "and in the store");
 }
 
 #[tokio::test]
@@ -607,7 +601,7 @@ async fn test_receive_retry_count_goes_when_a_stored_entry_is_parked_as_uncertai
     app.receive(None).await.unwrap();
     w.clock.advance_ms(PARK_AFTER_MS);
     app.receive(None).await.unwrap();
-    assert_eq!(app.state.retries.get(&seq).map(|r| r.reads), Some(2));
+    assert_eq!(app.retry_reads_at(seq), Some(2));
     // The store heals; the stored entry's effect is sent, its answer lost.
     protocol.heal();
     w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
@@ -618,12 +612,12 @@ async fn test_receive_retry_count_goes_when_a_stored_entry_is_parked_as_uncertai
         .advance_ms(crate::app::provider::KEPT_BATCH_ANSWER_MS);
     app.receive(None).await.unwrap();
     assert_eq!(
-        app.state.parked.get(&seq).map(|p| p.reason),
+        app.stored_at(seq).map(|p| p.reason),
         Some(ParkReason::Uncertain)
     );
-    assert!(app.state.retries.is_empty(), "{:?}", app.state.retries);
+    assert!(app.no_retries(), "{:?}", app.state.retries);
     let app = load_flaky(&w, &protocol, app.app_id()).await;
-    assert!(app.state.retries.is_empty(), "and in the store");
+    assert!(app.no_retries(), "and in the store");
 }
 
 #[tokio::test]
@@ -640,7 +634,7 @@ async fn test_receive_retry_of_the_entry_is_parked_at_once() {
     );
     // Not held: the cursor passes it and the later note in the same read.
     assert!(report.cursor.seq >= later);
-    assert!(app.state.retries.is_empty());
+    assert!(app.no_retries());
     assert_eq!(w.effects(), 1, "the later note only");
     assert_eq!(app.protocol_get(FAILED_STEP).await.unwrap(), None);
     // Tried again at the next read, in case the host repaired the store.
@@ -649,7 +643,7 @@ async fn test_receive_retry_of_the_entry_is_parked_at_once() {
         report
             .events
             .iter()
-            .any(|e| matches!(e, AppEvent::Unparked { seq: s } if *s == seq))
+            .any(|e| matches!(e, AppEvent::Unparked { seq: s, .. } if *s == seq))
     );
     assert_eq!(w.effects(), 2);
 }
@@ -907,7 +901,7 @@ async fn test_restore_of_a_layered_backup_keeps_the_entries_stored_locally() {
     let mut app = join_flaky(&w, &protocol, "wallet").await;
     let (seq, message) = w.note(app.app_id(), FLAKY);
     app.receive(None).await.unwrap();
-    assert!(app.state.parked.contains_key(&seq));
+    assert!(app.stored_at(seq).is_some());
     assert!(app.cursor().seq >= seq, "passed");
     let backup = layered(&mut app).await;
     // Restored with a store that works: the entry the cursor passed is still processed.
@@ -925,7 +919,7 @@ async fn test_restore_of_a_layered_backup_keeps_the_entries_stored_locally() {
         report
             .events
             .iter()
-            .any(|e| matches!(e, AppEvent::Unparked { seq: s } if *s == seq))
+            .any(|e| matches!(e, AppEvent::Unparked { seq: s, .. } if *s == seq))
     );
     assert_eq!(handed(&again), vec![message.msg_id.clone()]);
     assert_eq!(w.effects(), 1);
@@ -1671,7 +1665,7 @@ async fn restorable(app: &App) -> Restorable {
         app.protocol_scan(b"").await.unwrap(),
         app.cursor(),
         app.state.seen.clone(),
-        app.state.parked.keys().copied().collect::<Vec<_>>(),
+        app.stored_seqs(),
         processed,
     )
 }

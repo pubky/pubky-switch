@@ -509,20 +509,8 @@ impl App {
         // then, the old service's being all the app knows.
         tx.delete(super::admission::LISTS_AT)?;
         tx.delete(super::admission::LISTS_TOO_LARGE)?;
-        // Entries stored locally keep their plaintext; their old `seq`s are renumbered past
-        // any `seq` of the new sequence.
-        // Every old key is deleted before any new one is written: after an earlier loss the
-        // old `seq`s are already at the top, where the new ones go, and a delete after a put
-        // of the same key in this one ordered commit would remove the entry just written.
-        let parked = std::mem::take(&mut self.state.parked);
-        for old_seq in parked.keys() {
-            tx.delete(&key::parked(*old_seq))?;
-        }
-        for (index, (_, entry)) in parked.into_iter().enumerate() {
-            let renumbered = u64::MAX.saturating_sub(u64::try_from(index).unwrap_or(u64::MAX));
-            tx.put(&key::parked(renumbered), &entry)?;
-            self.state.parked.insert(renumbered, entry);
-        }
+        // Entries stored locally stay as they are: their local IDs, not the `seq`s they
+        // were read at, key them, so nothing of them is written again here.
         if self.state.pending_record.take().is_some() {
             tx.delete(key::PENDING_RECORD)?;
         }

@@ -200,8 +200,10 @@ pub enum AppEvent {
     /// The entry stays unprocessed until a read processes it; the host repairs or frees its
     /// store.
     StoreFailing {
-        /// The entry's `seq`.
+        /// The entry's `seq`, the one it was read at for an entry stored locally.
         seq: u64,
+        /// The entry's local ID when it is stored locally.
+        stored_id: Option<u64>,
         /// The reads in a row that ended in a retry at the entry, this one included.
         reads: u32,
         /// When the first of them was, device time in Unix milliseconds.
@@ -221,8 +223,11 @@ pub enum AppEvent {
     Parked {
         /// The duty event's ID; `None` for an entry that later reads try again.
         id: Option<EventId>,
-        /// The entry's `seq`.
+        /// The `seq` the entry was read at.
         seq: u64,
+        /// The entry's local ID while it is stored ([`super::App`] keys stored entries by
+        /// it): it never changes, across provider changes too.
+        stored_id: u64,
         /// Why.
         reason: ParkReason,
     },
@@ -234,8 +239,12 @@ pub enum AppEvent {
     EffectRefused {
         /// The duty event's ID.
         id: EventId,
-        /// The entry's `seq`.
+        /// The `seq` the entry was read at.
         seq: u64,
+        /// The entry's local ID while it is stored ([`super::App`] keys stored entries by
+        /// it): it never changes, across provider changes too.
+        stored_id: u64,
+
         /// The sender identity.
         sender: [u8; 32],
         /// The message ID.
@@ -257,8 +266,12 @@ pub enum AppEvent {
     EffectUncertain {
         /// The duty event's ID.
         id: EventId,
-        /// The entry's `seq`.
+        /// The `seq` the entry was read at.
         seq: u64,
+        /// The entry's local ID while it is stored ([`super::App`] keys stored entries by
+        /// it): it never changes, across provider changes too.
+        stored_id: u64,
+
         /// The sender identity.
         sender: [u8; 32],
         /// The message ID.
@@ -270,8 +283,11 @@ pub enum AppEvent {
     },
     /// An entry stored locally was processed.
     Unparked {
-        /// The entry's `seq`.
+        /// The `seq` the entry was read at.
         seq: u64,
+        /// The entry's local ID while it is stored ([`super::App`] keys stored entries by
+        /// it): it never changes, across provider changes too.
+        stored_id: u64,
     },
     /// An entry wrapped to a key the app doesn't hold was passed with the cursor (Switch
     /// spec 8.2, 12.4); the protocol was asked to request a re-send when allowed.
@@ -733,10 +749,12 @@ pub struct ClaimAttempt {
 pub(crate) enum Duty {
     Parked {
         seq: u64,
+        stored_id: u64,
         reason: ParkReason,
     },
     EffectRefused {
         seq: u64,
+        stored_id: u64,
         #[serde(with = "serde_b64")]
         sender: [u8; 32],
         msg_id: String,
@@ -745,6 +763,7 @@ pub(crate) enum Duty {
     },
     EffectUncertain {
         seq: u64,
+        stored_id: u64,
         #[serde(with = "serde_b64")]
         sender: [u8; 32],
         msg_id: String,
@@ -784,13 +803,19 @@ impl Duty {
     /// The event reported for it, with its ID.
     pub(crate) fn event(self, id: EventId) -> AppEvent {
         match self {
-            Self::Parked { seq, reason } => AppEvent::Parked {
+            Self::Parked {
+                seq,
+                stored_id,
+                reason,
+            } => AppEvent::Parked {
                 id: Some(id),
                 seq,
+                stored_id,
                 reason,
             },
             Self::EffectRefused {
                 seq,
+                stored_id,
                 sender,
                 msg_id,
                 kind,
@@ -798,6 +823,7 @@ impl Duty {
             } => AppEvent::EffectRefused {
                 id,
                 seq,
+                stored_id,
                 sender,
                 msg_id,
                 kind,
@@ -805,6 +831,7 @@ impl Duty {
             },
             Self::EffectUncertain {
                 seq,
+                stored_id,
                 sender,
                 msg_id,
                 kind,
@@ -812,6 +839,7 @@ impl Duty {
             } => AppEvent::EffectUncertain {
                 id,
                 seq,
+                stored_id,
                 sender,
                 msg_id,
                 kind,
