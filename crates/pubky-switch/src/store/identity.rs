@@ -13,7 +13,7 @@ pub(super) fn encode_doc(doc: &SignedDoc) -> Result<Vec<u8>, StoreError> {
     serde_json::to_vec(doc).map_err(|_| StoreError::Corrupt("a signed document doesn't encode"))
 }
 
-fn decode_doc(bytes: &[u8], what: &'static str) -> Result<SignedDoc, StoreError> {
+pub(super) fn decode_doc(bytes: &[u8], what: &'static str) -> Result<SignedDoc, StoreError> {
     serde_json::from_slice(bytes).map_err(|_| StoreError::Corrupt(what))
 }
 

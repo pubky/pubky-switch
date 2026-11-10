@@ -1419,16 +1419,17 @@ fn replay_live(
 /// A claim rebuilt from uploads after a provider loss (Switch wire 10.5, Switch spec 12.6),
 /// checked attempt by attempt, so that where uploads fell between its entries doesn't
 /// matter. The export carries no uploads, which merge per attempt and only add attempts or
-/// settle; so every attempt the part holds is either marked `from_upload`, or the one an
-/// `attempt` entry of the claim wrote, with the members that entry gives, never both; and
-/// each attempt's outcome is the one the latest entry naming it gives (`open` for its
-/// `attempt` entry), or, for an attempt marked `from_upload`, `done`, since an uploaded
-/// `done` settles an attempt whatever its outcome. An uploaded attempt no entry names keeps
-/// its outcome as written, which the uploaded evidence checks. What only uploads change is
-/// taken as written (`divergent`, `last_entry_ms`, the pin, `possibly_duplicate`,
-/// `duplicate`, and the entries' proof states), within the bounds that hold whatever the
-/// order of the uploads: SETTLED exactly when an attempt is `done`, `current` an open attempt
-/// the claim holds, and two open attempts divergent.
+/// settle; so every attempt the part holds is exactly one of: marked `from_upload`; the one
+/// an `attempt` entry of the claim wrote, with the members that entry gives; or kept from a
+/// tombstone an upload reopened ([`kept_from_tombstone`]). Each attempt's outcome is the one
+/// the latest entry naming it gives (`open` for its `attempt` entry), or, for an attempt
+/// marked `from_upload`, `done`, since an uploaded `done` settles an attempt whatever its
+/// outcome. An uploaded attempt no entry names keeps its outcome as written, which the
+/// uploaded evidence checks. What only uploads change is taken as written (`divergent`,
+/// `last_entry_ms`, the pin, `possibly_duplicate`, `duplicate`, and the entries' proof
+/// states), within the bounds that hold whatever the order of the uploads: SETTLED exactly
+/// when an attempt is `done`, `current` an open attempt the claim holds, and two open
+/// attempts divergent.
 fn check_rebuilt(
     state: &ClaimState,
     checked: &CheckedEntries,
@@ -1489,9 +1490,22 @@ fn check_rebuilt(
                 }
             }
             None if !a.from_upload => {
-                return Err(fail(
-                    "an attempt neither marked from_upload nor written by an attempt entry",
-                ));
+                // Kept from a tombstone an upload reopened: compaction removed its entries,
+                // so the tombstone's members are taken as written, as a tombstone's are.
+                // A tombstone holds only `done` and `failed` attempts and is SETTLED, and the
+                // reopened claim stays SETTLED, so what such an attempt holds frees nothing.
+                if !kept_from_tombstone(state, a) {
+                    return Err(fail(
+                        "an attempt neither marked from_upload nor written by an attempt entry, nor kept from a reopened tombstone: not done or failed, or on a claim not SETTLED",
+                    ));
+                }
+                // Compaction removed every entry before the reopening, and the reopened claim,
+                // SETTLED, refuses every `attempt` (Switch wire 6.8 row 7).
+                if !opened.is_empty() {
+                    return Err(fail(
+                        "an attempt kept from a reopened tombstone beside an attempt entry",
+                    ));
+                }
             }
             None => {}
         }
@@ -1528,6 +1542,18 @@ fn check_rebuilt(
     claim_of(state)
 }
 
+/// Whether an attempt of a rebuilt claim, neither marked `from_upload` nor written by an
+/// `attempt` entry, may be one kept from a tombstone an upload reopened (Switch wire 10.5,
+/// Switch spec 12.6 step 3): a tombstone holds only `done` and `failed` attempts and is
+/// SETTLED, and nothing makes a SETTLED claim unsettled or a final outcome open again. Such
+/// a claim holds no `attempt` entry: compaction removed the entries before the reopening,
+/// and a SETTLED claim refuses every `attempt` after it (Switch wire 6.8 row 7).
+fn kept_from_tombstone(state: &ClaimState, attempt: &AttemptState) -> bool {
+    state.settled
+        && !attempt.from_upload
+        && matches!(attempt.outcome, Outcome::Done | Outcome::Failed)
+}
+
 /// The part's claim is the replayed one, member for member, those no claim view shows
 /// included, such as each attempt's `deadline_ms`, the pinned deadline, and `from_upload`.
 fn same_state(state: &ClaimState, claim: &Claim) -> std::result::Result<(), Refusal> {
@@ -1547,7 +1573,8 @@ fn same_state(state: &ClaimState, claim: &Claim) -> std::result::Result<(), Refu
 /// attempt is held with that attempt, at that step or later; a live claim holds each attempt
 /// a proof shows of the app that uploaded it with the outcome it shows, unless one of the
 /// claim's verified entries after that proof wrote another ([`resolved_after`]), or, for an
-/// uploaded attempt of a rebuilt claim, an upload settled it `done`; a record a proof shows at a version is that
+/// uploaded attempt of a rebuilt claim, an upload settled it `done`, or the attempt is one a
+/// reopened tombstone kept ([`kept_attempt`]), on a claim that stays SETTLED; a record a proof shows at a version is that
 /// very write, or one whose signed `expected_version` is that version or later, or absent
 /// when that version deletes.
 fn check_evidence(
@@ -1608,13 +1635,15 @@ fn check_evidence(
             // attempts as written, so an outcome the evidence of the attempt's own owner
             // contradicts must come from an entry, or be an upload's `done`, which settles an
             // uploaded attempt whatever its outcome. A tombstone keeps no entries; it is
-            // SETTLED, so it frees nothing.
+            // SETTLED, so it frees nothing; and so does an attempt a reopened tombstone kept,
+            // whose entries compaction removed, on a claim that stays SETTLED.
             if let Some(c) = live.filter(|c| c.claim.step >= view.step) {
                 for shown in view.attempts.iter().filter(|a| a.owner == uploaded.app_id) {
                     let changed = c.claim.attempts.iter().any(|a| {
                         a.attempt_id == shown.attempt_id
                             && a.outcome != shown.outcome
                             && !(c.claim.rebuilt && a.from_upload && a.outcome == Outcome::Done)
+                            && !kept_attempt(c, a)
                     });
                     if changed && !resolved_after(c, &shown.attempt_id, view.step) {
                         return fail(
@@ -1651,6 +1680,26 @@ fn check_evidence(
         }
     }
     Ok(())
+}
+
+/// Whether an imported claim's attempt is one kept from a tombstone an upload reopened: on a
+/// rebuilt claim that is SETTLED, `done` or `failed`, not marked `from_upload`, and written
+/// by none of the claim's `attempt` entries ([`check_rebuilt`] accepted it as such, and such
+/// a claim holds none).
+fn kept_attempt(claim: &ImportedClaim, attempt: &Attempt) -> bool {
+    claim.claim.rebuilt
+        && claim.claim.settled
+        && !attempt.from_upload
+        && matches!(attempt.outcome, Outcome::Done | Outcome::Failed)
+        && !claim.entries.iter().any(|e| {
+            SignedOp::peek(&e.op).is_ok_and(|op| match &op.body().kind {
+                OpKind::Claim(fields) => {
+                    fields.kind == ClaimType::Attempt
+                        && fields.attempt_id.as_slice() == attempt.attempt_id
+                }
+                _ => false,
+            })
+        })
 }
 
 /// Whether one of a live claim's entries at `step` or later, all verified, writes an outcome

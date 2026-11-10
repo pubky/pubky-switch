@@ -34,7 +34,7 @@ pub fn stale_identity_current(held: Option<&IdentityDoc>) -> Value {
 }
 
 /// A write answer's body: `{ "proofs": [...], "head": signed head }` (Switch wire 7.1).
-fn write_answer(
+pub(super) fn write_answer(
     proofs: &[&pubky_switch_core::sig::SignedDoc],
     head: &[u8],
 ) -> Result<Vec<u8>, ApiError> {
@@ -165,6 +165,7 @@ impl Service {
             item_bytes: &item_bytes,
             stub: &stub,
             server_time_ms: time_ms,
+            only_for: None,
         })
         .await
         .map_err(|e| store_error(&e))?;

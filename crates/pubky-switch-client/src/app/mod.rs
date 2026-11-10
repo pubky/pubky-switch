@@ -1519,7 +1519,9 @@ impl App {
     /// kept with its key, and its offset from the device clock; an earlier one from the
     /// same key is misbehaviour, returned as the alarm.
     fn note_service_time(&mut self) -> Option<Alarm> {
-        let time = self.client.last_server_time()?;
+        // Only the latest call's own stamped time: a refusal answered before the request
+        // verified carries the last committed time, and measures nothing (Switch wire 7.1).
+        let time = self.client.latest_server_time()?;
         let now = self.now();
         let key = self.state.meta.service_key;
         let offset = i64::try_from(time)

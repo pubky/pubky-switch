@@ -26,7 +26,8 @@ impl AccountTxn {
     }
 
     /// Keep that the enrollment with document hash `hash` was answered with `key` at
-    /// `at_ms`, dropping the oldest answers beyond `max` (Switch wire 9.1).
+    /// `at_ms`, dropping the oldest answers beyond `max`, but never the creating
+    /// enrollment's (Switch wire 9.1).
     pub async fn keep_enrollment_answer(
         &mut self,
         hash: &[u8; 32],
@@ -35,11 +36,12 @@ impl AccountTxn {
         max: u64,
     ) -> Result<(), StoreError> {
         let id = self.head().id.clone();
-        keep(self.conn(), &id, hash, key, at_ms, max).await
+        keep(self.conn(), &id, hash, key, at_ms, max, false).await
     }
 }
 
-/// Keep an enrollment answer on `conn`, for account `id`.
+/// Keep an enrollment answer on `conn`, for account `id`; `creating` for the enrollment
+/// that creates the account, whose answer is never dropped.
 pub(super) async fn keep(
     conn: &mut sqlx::PgConnection,
     id: &str,
@@ -47,22 +49,25 @@ pub(super) async fn keep(
     key: &KeyId,
     at_ms: u64,
     max: u64,
+    creating: bool,
 ) -> Result<(), StoreError> {
     sqlx::query(
         "INSERT INTO enrollment_answers (account_id, enrollment_hash, service_key, \
-         answered_at_ms) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
+         answered_at_ms, creating) VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING",
     )
     .bind(id)
     .bind(hash.as_slice())
     .bind(key.as_str())
     .bind(time_to_db(at_ms)?)
+    .bind(creating)
     .execute(&mut *conn)
     .await
     .map_err(StoreError::from_db)?;
+    // The creating answer counts toward the limit; the others drop, oldest first.
     sqlx::query(
         "DELETE FROM enrollment_answers WHERE account_id = $1 AND enrollment_hash IN ( \
          SELECT enrollment_hash FROM enrollment_answers WHERE account_id = $1 \
-         ORDER BY answered_at_ms DESC, enrollment_hash OFFSET $2)",
+         AND NOT creating ORDER BY kept_order DESC OFFSET greatest($2 - 1, 0))",
     )
     .bind(id)
     .bind(to_db(max, "max_enrollments")?)

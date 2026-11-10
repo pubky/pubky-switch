@@ -10,7 +10,9 @@ use crate::error::{Error, Result};
 use crate::http::ErrorCode;
 use crate::ident::{collection_id, record_key_from_blinded};
 use crate::json::parse_json;
-use crate::records::{AppCert, AppRecord, ReceiveKeyBody, ReceiveKeyRecord, check_suite_keys};
+use crate::records::{
+    AppCert, AppRecord, IdentityDoc, ReceiveKeyBody, ReceiveKeyRecord, check_suite_keys,
+};
 use crate::scopes::Permission;
 use crate::sig::SignedDoc;
 
@@ -122,6 +124,20 @@ pub fn check_shape(body: &OpBody) -> std::result::Result<(), Refusal> {
     match &body.kind {
         OpKind::Claim(fields) => fields.check().map(drop),
         OpKind::RecordPut(put) => {
+            // A record's scopes follow the scope rule, as every scope the switch compares
+            // (Switch wire 3.1 "Scope names"): another string names no scope, and would
+            // reach the service's storage unchecked.
+            let policy = &put.policy;
+            if !crate::scopes::is_scope(&policy.read_scope) {
+                return bad("record.put: read_scope isn't a scope (wire 3.1)");
+            }
+            if !policy
+                .write_scopes
+                .iter()
+                .all(|s| crate::scopes::is_scope(s))
+            {
+                return bad("record.put: a write_scopes entry isn't a scope (wire 3.1)");
+            }
             let policy_hash = put.policy.hash()?;
             put.value_sealed.check_shape(&put.policy.read_scope)?;
             match (put.expected_version.is_none(), &put.id_inputs) {
@@ -173,8 +189,21 @@ pub fn check_shape(body: &OpBody) -> std::result::Result<(), Refusal> {
             shape().map_err(|e| Refusal::bad_request(reason(e)))
         }
         OpKind::KeyBundlePut(put) => {
+            // Data epochs start at 1 (Switch spec 4.3), and a part's range runs from its
+            // first epoch to its last (Switch wire 3.5).
+            if put.first_epoch == 0 {
+                return bad("key_bundle.put: first_epoch is at least 1 (wire 3.5)");
+            }
             if put.first_epoch > put.last_epoch {
                 return bad("key_bundle.put: first_epoch above last_epoch");
+            }
+            // Each part's envelope is within the envelope cap, which bounds the epochs one
+            // part holds (Switch wire 3.5 "Parts", 4.4, 7.6).
+            if put.bundle.envelope().len() > crate::envelope::MAX_ENVELOPE_LEN {
+                return Err(Refusal::new(
+                    ErrorCode::TooLarge,
+                    "Switch wire 3.5: a key bundle part's envelope over 64 KiB",
+                ));
             }
             put.bundle
                 .verify(identity, &put.target_app_id)
@@ -328,10 +357,23 @@ pub enum CertPutEffect {
     Unchanged,
 }
 
+/// Whether `app_id` is a target of the signer's `cert.put` and `key_bundle.put` (Switch wire
+/// 6.2, 3.8; Switch spec 3.2): an app the newest `identity.json` the service holds
+/// (`newest`) lists in `apps`, and that the service holds neither revoked nor departed
+/// (`withdrawn`). Its certificate's expiry doesn't count, nor does the standing of the
+/// certificate its record carries: the signer's renewal brings an app whose certificate has
+/// expired back without anything from the app, and its first step stores the new
+/// certificate and key bundle before the delivery that lists the new certificate. An app the
+/// document lists in `removed`, or in neither list, isn't one.
+pub fn is_signer_target(newest: Option<&IdentityDoc>, app_id: &[u8; 16], withdrawn: bool) -> bool {
+    !withdrawn && newest.is_some_and(|doc| doc.listed_cert(app_id).is_some())
+}
+
 /// The rules of `cert.put` (Switch wire 6.2, 3.8) for a certificate [`check_shape`] verified:
 ///
-/// - the target is known, not revoked or departed, and delivered its record
-///   (`record_cert`, the certificate its record carries; `target_active`), else `404`;
+/// - the target is the signer's ([`is_signer_target`], whatever its certificate's expiry)
+///   and delivered its record (`record_cert`, the certificate its record carries), else
+///   `404`;
 /// - the stored renewed certificate, or without one the record's, again is unchanged;
 /// - it keeps the record's certificate's signing and bundle keys, else `400`;
 /// - its `issued_at` is later than the record's certificate's and any stored renewed one's,
@@ -343,10 +385,12 @@ pub enum CertPutEffect {
 pub fn check_cert_put(
     cert: &AppCert,
     record_cert: Option<&AppCert>,
-    target_active: bool,
+    newest: Option<&IdentityDoc>,
+    withdrawn: bool,
     stored_renewed: Option<&AppCert>,
 ) -> std::result::Result<CertPutEffect, Refusal> {
-    let Some(record_cert) = record_cert.filter(|_| target_active) else {
+    let target = is_signer_target(newest, &cert.app_id(), withdrawn);
+    let Some(record_cert) = record_cert.filter(|_| target) else {
         return Err(Refusal::new(
             ErrorCode::NotFound,
             "Switch wire 6.2: cert.put for an app the service doesn't serve",
@@ -385,8 +429,9 @@ pub enum KeyBundleEffect {
     Unchanged,
 }
 
-/// The rules of `key_bundle.put` (Switch wire 6.2): the target is current, else `403
-/// not_current`; a part identical to one stored, with the same epochs, changes nothing; a new
+/// The rules of `key_bundle.put` (Switch wire 6.2): the target is the signer's
+/// ([`is_signer_target`], whatever its certificate's expiry), else `403 not_current`; a part
+/// identical to one stored, with the same epochs, changes nothing; a new
 /// part replaces every stored part whose range it overlaps. Which parts the target's cursor
 /// lets go is the service's to decide.
 ///
@@ -395,13 +440,14 @@ pub enum KeyBundleEffect {
 /// `403 not_current`.
 pub fn check_key_bundle_put(
     put: &KeyBundlePut,
-    target_current: bool,
+    newest: Option<&IdentityDoc>,
+    withdrawn: bool,
     stored: &[KeyBundlePut],
 ) -> std::result::Result<KeyBundleEffect, Refusal> {
-    if !target_current {
+    if !is_signer_target(newest, &put.target_app_id, withdrawn) {
         return Err(Refusal::new(
             ErrorCode::NotCurrent,
-            "Switch wire 6.2: key_bundle.put for a target that isn't current",
+            "Switch wire 6.2: key_bundle.put for an app identity.json doesn't list, or one revoked or departed",
         ));
     }
     if stored.iter().any(|part| part == put) {
@@ -476,6 +522,24 @@ mod tests {
             issued + DEFAULT_CERT_LIFETIME_MS,
         );
         AppCert::issue(&identity(), body).unwrap()
+    }
+
+    /// An `identity.json` of the identity listing `app_id` with the certificate `cert`.
+    fn listing_app(app_id: [u8; 16], cert: [u8; 32]) -> IdentityDoc {
+        use crate::records::{IdentityBody, IdentityPolicy, Inbox, ListedApp};
+        let mut body = IdentityBody::first(
+            identity().public(),
+            [9; 16],
+            Inbox::new("https://switch.example", [4; 32]),
+            IdentityPolicy::default(),
+        );
+        body.apps.push(ListedApp { app_id, cert });
+        IdentityDoc::sign(&identity(), body).unwrap()
+    }
+
+    /// An `identity.json` listing `cert`'s app with it.
+    fn listing(cert: &AppCert) -> IdentityDoc {
+        listing_app(cert.app_id(), cert.hash())
     }
 
     fn cert() -> AppCert {
@@ -593,6 +657,38 @@ mod tests {
     }
 
     #[test]
+    fn test_shape_of_a_record_put_scopes() {
+        let with = |read: &str, writes: &[&str]| {
+            let mut put = record_put(RecordVersion::new(1, 6), false);
+            put.policy = Policy::new(read, writes);
+            let id = identity();
+            put.value_sealed = SealedValue::seal(
+                &id.scope_key(1, read),
+                &id.public(),
+                1,
+                read,
+                &put.key,
+                b"{}",
+            )
+            .unwrap();
+            check_shape(&body(OpKind::RecordPut(put)))
+        };
+        assert!(with("notes", &["notes", "notes:a"]).is_ok());
+        for (read, writes) in [
+            ("no\u{0}tes", &["notes"][..]),
+            ("", &["notes"]),
+            ("Notes", &["notes"]),
+            ("notes:", &["notes"]),
+            ("notes", &["notes", "bad scope"]),
+            ("notes", &["no\u{0}tes"]),
+            ("notes", &["notes:A"]),
+        ] {
+            let refused = with(read, writes).unwrap_err();
+            assert_eq!(refused.code, ErrorCode::BadRequest, "{read:?} {writes:?}");
+        }
+    }
+
+    #[test]
     fn test_shape_of_a_record_put() {
         assert!(
             check_shape(&body(OpKind::RecordPut(record_put(
@@ -696,7 +792,38 @@ mod tests {
         put.first_epoch = 3;
         signer.kind = OpKind::KeyBundlePut(put.clone());
         assert_eq!(check_shape(&signer).unwrap_err().status(), 400);
+        // Data epochs start at 1: a range from 0 is refused, whatever its last epoch.
+        for last in [0, 2] {
+            put.first_epoch = 0;
+            put.last_epoch = last;
+            signer.kind = OpKind::KeyBundlePut(put.clone());
+            assert_eq!(
+                check_shape(&signer).unwrap_err().status(),
+                400,
+                "0 to {last}"
+            );
+        }
+        put.last_epoch = 2;
         put.first_epoch = 1;
+        // A part's envelope is within the envelope cap: at it, taken; one byte over, 413.
+        for (len, status) in [
+            (crate::envelope::MAX_ENVELOPE_LEN, None),
+            (crate::envelope::MAX_ENVELOPE_LEN + 1, Some(413)),
+        ] {
+            let envelope = vec![1u8; len];
+            let sig = id.sign(
+                crate::labels::sig::KEY_BUNDLE,
+                &[&id.public(), &target, &envelope],
+            );
+            let mut large = put.clone();
+            large.bundle = KeyBundle::from_parts(envelope, sig);
+            signer.kind = OpKind::KeyBundlePut(large);
+            assert_eq!(
+                check_shape(&signer).err().map(|r| r.status()),
+                status,
+                "{len}"
+            );
+        }
         put.target_app_id = [6; 16];
         signer.kind = OpKind::KeyBundlePut(put);
         assert_eq!(check_shape(&signer).unwrap_err().status(), 401);
@@ -813,41 +940,43 @@ mod tests {
     #[test]
     fn test_cert_put_rules() {
         let old = cert();
+        let doc = listing(&old);
+        let doc = Some(&doc);
         let renewed = cert_at(ISSUED + 1, &[Permission::ClaimsWrite]);
         assert_eq!(
-            check_cert_put(&renewed, Some(&old), true, None).unwrap(),
+            check_cert_put(&renewed, Some(&old), doc, false, None).unwrap(),
             CertPutEffect::Stores
         );
         assert_eq!(
-            check_cert_put(&old, Some(&old), true, None).unwrap(),
+            check_cert_put(&old, Some(&old), doc, false, None).unwrap(),
             CertPutEffect::Unchanged
         );
         assert_eq!(
-            check_cert_put(&renewed, Some(&old), true, Some(&renewed)).unwrap(),
+            check_cert_put(&renewed, Some(&old), doc, false, Some(&renewed)).unwrap(),
             CertPutEffect::Unchanged
         );
         assert_eq!(
-            check_cert_put(&renewed, None, true, None)
+            check_cert_put(&renewed, None, doc, false, None)
                 .unwrap_err()
                 .status(),
             404
         );
         assert_eq!(
-            check_cert_put(&renewed, Some(&old), false, None)
+            check_cert_put(&renewed, Some(&old), doc, true, None)
                 .unwrap_err()
                 .status(),
             404
         );
         let earlier = cert_at(ISSUED - 1, &[Permission::ClaimsWrite]);
         assert_eq!(
-            check_cert_put(&earlier, Some(&old), true, None)
+            check_cert_put(&earlier, Some(&old), doc, false, None)
                 .unwrap_err()
                 .status(),
             409
         );
         let newer = cert_at(ISSUED + 2, &[Permission::ClaimsRead]);
         assert_eq!(
-            check_cert_put(&old, Some(&old), true, Some(&newer))
+            check_cert_put(&old, Some(&old), doc, false, Some(&newer))
                 .unwrap_err()
                 .status(),
             409
@@ -865,10 +994,60 @@ mod tests {
         );
         let moved = AppCert::issue(&identity(), moved).unwrap();
         assert_eq!(
-            check_cert_put(&moved, Some(&old), true, None)
+            check_cert_put(&moved, Some(&old), doc, false, None)
                 .unwrap_err()
                 .status(),
             400
+        );
+    }
+
+    #[test]
+    fn test_signer_target_whatever_the_certificate_expiry() {
+        use crate::records::{IdentityBody, RemovedApp};
+        let old = cert();
+        let app_id = old.app_id();
+        let listed = listing(&old);
+        // Listed, with the certificate the record carries, expired or not: the expiry isn't
+        // judged here, nor which certificate the document lists.
+        assert!(is_signer_target(Some(&listed), &app_id, false));
+        let renewed = cert_at(ISSUED + 1, &[Permission::ClaimsWrite]);
+        let relisted = listing(&renewed);
+        assert!(is_signer_target(Some(&relisted), &app_id, false));
+        // Revoked or departed at the service, in `removed`, in neither list, or no document.
+        assert!(!is_signer_target(Some(&listed), &app_id, true));
+        let mut body: IdentityBody = listed.body().clone();
+        body.version += 1;
+        body.apps.clear();
+        let neither = IdentityDoc::sign(&identity(), body.clone()).unwrap();
+        assert!(!is_signer_target(Some(&neither), &app_id, false));
+        body.removed.push(RemovedApp {
+            app_id,
+            distrust_from: ISSUED,
+        });
+        let removed = IdentityDoc::sign(&identity(), body).unwrap();
+        assert!(!is_signer_target(Some(&removed), &app_id, false));
+        assert!(!is_signer_target(None, &app_id, false));
+        // Both signer operations follow it: a renewal's batch is taken for an expired app,
+        // and refused for a removed one.
+        let put = KeyBundlePut {
+            target_app_id: app_id,
+            bundle: KeyBundle::from_parts(vec![1], [1; 64]),
+            first_epoch: 1,
+            last_epoch: 1,
+        };
+        assert!(check_cert_put(&renewed, Some(&old), Some(&listed), false, None).is_ok());
+        assert!(check_key_bundle_put(&put, Some(&listed), false, &[]).is_ok());
+        assert_eq!(
+            check_cert_put(&renewed, Some(&old), Some(&removed), false, None)
+                .unwrap_err()
+                .status(),
+            404
+        );
+        assert_eq!(
+            check_key_bundle_put(&put, Some(&removed), false, &[])
+                .unwrap_err()
+                .code,
+            ErrorCode::NotCurrent
         );
     }
 
@@ -881,22 +1060,24 @@ mod tests {
             last_epoch: last,
         };
         let stored = vec![part(1, 2, 1), part(3, 4, 2), part(5, 6, 3)];
+        let doc = listing_app([5; 16], [6; 32]);
+        let doc = Some(&doc);
         assert_eq!(
-            check_key_bundle_put(&part(3, 4, 2), true, &stored).unwrap(),
+            check_key_bundle_put(&part(3, 4, 2), doc, false, &stored).unwrap(),
             KeyBundleEffect::Unchanged
         );
         assert_eq!(
-            check_key_bundle_put(&part(2, 3, 9), true, &stored).unwrap(),
+            check_key_bundle_put(&part(2, 3, 9), doc, false, &stored).unwrap(),
             KeyBundleEffect::Stores {
                 replaces: vec![0, 1]
             }
         );
         assert_eq!(
-            check_key_bundle_put(&part(7, 7, 9), true, &stored).unwrap(),
+            check_key_bundle_put(&part(7, 7, 9), doc, false, &stored).unwrap(),
             KeyBundleEffect::Stores { replaces: vec![] }
         );
         assert_eq!(
-            check_key_bundle_put(&part(1, 1, 9), false, &stored)
+            check_key_bundle_put(&part(1, 1, 9), doc, true, &stored)
                 .unwrap_err()
                 .code,
             ErrorCode::NotCurrent

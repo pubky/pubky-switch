@@ -35,9 +35,10 @@ pub(crate) mod read;
 mod rules;
 
 pub use batch::{
-    BATCH_PROOFS_MS, BatchEffect, BatchRecord, ConditionState, Entry, Held, MAX_BATCH_ENTRIES,
-    OpsRequest, Position, RetryCheck, batch_effect, check_batch, check_conditions, check_cursor,
-    depends_on_time, ops_hash, random_batch_id, retry_check, sign_batch, unchanged,
+    BATCH_PROOFS_MS, BatchEffect, BatchRecord, ConditionState, CursorMove, Entry, Held,
+    MAX_BATCH_ENTRIES, OpsRequest, Position, RetryCheck, batch_effect, check_batch,
+    check_conditions, check_cursor, depends_on_time, ops_hash, random_batch_id, retry_check,
+    sign_batch, unchanged,
 };
 pub use body::{
     AllowKind, BatchRef, Condition, IdInputs, InviteCodePut, InviteContext, KeyBundlePut,
@@ -50,7 +51,7 @@ pub use proof_state::{StateAfter, proof_state};
 pub use rules::{
     AppPutEffect, CertPutEffect, KeyBundleEffect, MAX_INVITE_CONTEXT_BYTES, MAX_INVITE_USES, Need,
     ReceiveKeyEffect, Writer, check_app_put, check_cert_put, check_invite_code_put,
-    check_key_bundle_put, check_permission, check_receive_key_put, check_shape,
+    check_key_bundle_put, check_permission, check_receive_key_put, check_shape, is_signer_target,
 };
 
 use crate::error::{Error, SizeRefusal};
