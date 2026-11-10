@@ -1,7 +1,8 @@
 //! A protocol whose store or host fails: a receive step that can't finish for now
 //! ([`Outcome::Retry`]) leaves its entry unprocessed until a later read (Switch spec 8.2),
 //! and a restore installs the protocol's backup layer with the app's state, in one commit,
-//! or neither (Switch spec 12.4).
+//! or neither (Switch spec 12.4). A receive step reads its own local state as the earlier
+//! entries of the same read left it, before they are committed.
 
 use std::sync::Mutex;
 
@@ -654,4 +655,122 @@ async fn test_restore_without_a_layer_by_a_protocol_that_takes_none() {
     .await
     .unwrap();
     assert_eq!(restored.protocol_get(JOURNAL_KEY).await.unwrap(), None);
+}
+
+// -------------------------------------------------------------------------------------
+// A receive step reads the local writes of the read's earlier entries
+
+/// The local key of [`CounterProtocol`]'s count.
+const COUNT: &[u8] = b"count";
+
+/// [`SampleProtocol`], whose receive step counts the notes in its local state, reading the
+/// count and writing it plus one, with no operation, so only the cursor moves. A note whose
+/// text is [`FLAKY`] fails while `fails` is above zero, after writing a count of 99 through
+/// the context, which must never be seen.
+struct CounterProtocol {
+    sample: SampleProtocol,
+    fails: Mutex<u32>,
+}
+
+fn count_of(value: Option<Vec<u8>>) -> u64 {
+    value
+        .and_then(|v| String::from_utf8(v).ok())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
+
+impl Protocol for CounterProtocol {
+    fn has_keys(&self, scope: &str) -> bool {
+        self.sample.has_keys(scope)
+    }
+
+    fn sent_between_own_apps(&self, kind: &str) -> bool {
+        self.sample.sent_between_own_apps(kind)
+    }
+
+    fn check_scopes(
+        &self,
+        message: &Message,
+        sender: &AppCert,
+        own: &AppCert,
+    ) -> Result<(), String> {
+        self.sample.check_scopes(message, sender, own)
+    }
+
+    fn accepts(&self, cert: &AppCert) -> Vec<String> {
+        self.sample.accepts(cert)
+    }
+
+    fn check_body(&self, message: &ReceivedMessage) -> Result<(), String> {
+        self.sample.check_body(message)
+    }
+
+    fn receive_with(&self, message: &ReceivedMessage, cx: &mut ReceiveContext<'_>) -> Outcome {
+        let count = match cx.local_get(COUNT) {
+            Ok(value) => count_of(value),
+            Err(error) => {
+                return match StoreFailure::try_from(error) {
+                    Ok(failure) => Outcome::Retry(failure),
+                    Err(error) => Outcome::Drop {
+                        reason: error.to_string(),
+                    },
+                };
+            }
+        };
+        let flaky = message.message.body.get("text").and_then(Value::as_str) == Some(FLAKY);
+        let mut fails = self.fails.lock().unwrap();
+        if flaky && *fails > 0 {
+            *fails -= 1;
+            cx.local(LocalWrite::Put {
+                key: COUNT.to_vec(),
+                value: b"99".to_vec(),
+            });
+            return Outcome::Retry(StoreError::Unavailable.into());
+        }
+        let scanned = cx.local_scan(COUNT).unwrap();
+        assert_eq!(
+            scanned
+                .first()
+                .map(|(_, v)| count_of(Some(v.clone())))
+                .unwrap_or(0),
+            count,
+            "a scan reads what a get reads"
+        );
+        Outcome::Apply(Effect {
+            ops: Vec::new(),
+            local: vec![LocalWrite::Put {
+                key: COUNT.to_vec(),
+                value: (count + 1).to_string().into_bytes(),
+            }],
+        })
+    }
+
+    fn resend_needed(&self, needed: &ResendNeeded) -> Vec<LocalWrite> {
+        self.sample.resend_needed(needed)
+    }
+
+    fn missed(&self, missed: &MissedEntries) -> Vec<LocalWrite> {
+        self.sample.missed(missed)
+    }
+}
+
+#[tokio::test]
+async fn test_receive_context_reads_the_local_writes_of_earlier_entries_in_the_read() {
+    let w = World::new();
+    let protocol = Arc::new(CounterProtocol {
+        sample: SampleProtocol::default(),
+        fails: Mutex::new(1),
+    });
+    let request = w.approve(&app_keys("wallet"), &["scope-a"]);
+    let mut app = App::join(w.env(), protocol.clone(), World::config(), request)
+        .await
+        .unwrap();
+    w.note(app.app_id(), "one");
+    w.note(app.app_id(), FLAKY);
+    w.note(app.app_id(), "two");
+    app.receive(None).await.unwrap();
+    // Both notes counted in one read; the retried step's write stays unseen.
+    assert_eq!(count_of(app.protocol_get(COUNT).await.unwrap()), 2);
+    app.receive(None).await.unwrap();
+    assert_eq!(count_of(app.protocol_get(COUNT).await.unwrap()), 3);
 }

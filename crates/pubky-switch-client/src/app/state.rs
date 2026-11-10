@@ -474,6 +474,9 @@ pub(crate) struct ServiceTime {
 pub(crate) struct Tx {
     ns: String,
     batch: WriteBatch,
+    /// The protocol's local writes in the batch, in order, which a receive step later in
+    /// the same read sees before they are committed.
+    local: Vec<LocalWrite>,
 }
 
 impl Tx {
@@ -481,6 +484,7 @@ impl Tx {
         Self {
             ns: ns.to_owned(),
             batch: WriteBatch::new(),
+            local: Vec::new(),
         }
     }
 
@@ -516,8 +520,14 @@ impl Tx {
                     self.batch.delete_prefix(&self.ns, prefixed(prefix))?;
                 }
             }
+            self.local.push(write.clone());
         }
         Ok(())
+    }
+
+    /// The protocol's local writes in the batch, not yet committed, in order.
+    pub(crate) fn pending_local(&self) -> &[LocalWrite] {
+        &self.local
     }
 
     pub(crate) fn is_empty(&self) -> bool {
