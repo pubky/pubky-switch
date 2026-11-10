@@ -234,6 +234,8 @@ pub(crate) struct Inner {
     pub(crate) delivery_proof: Option<SignedDoc>,
     /// The limits an enrollment announces.
     pub(crate) enroll_limits: pubky_switch_core::records::Limits,
+    /// The data epoch of the first delivered `identity.json` that listed each app.
+    pub(crate) listed_at_epoch: BTreeMap<[u8; 16], u64>,
 }
 
 impl Inner {
@@ -285,6 +287,7 @@ impl Inner {
             kept_app_ids: Vec::new(),
             delivery_proof: None,
             enroll_limits: pubky_switch_core::records::Limits::default(),
+            listed_at_epoch: BTreeMap::new(),
         }
     }
 }

@@ -645,8 +645,18 @@ impl Signer {
     /// [`Signer::judge_copy`] says.
     async fn switch_at_mark(&mut self) -> Result<()> {
         let held = self.service_client()?.apps().await?.identity;
+        self.confirm_copy(held.as_ref()).await
+    }
+
+    /// Judge the switch's copy of `identity.json`, `held` as `GET /apps` gave it, against the
+    /// mark: its own version goes on; a newer one is adopted and an older one, none or another
+    /// body at the mark raises the alarm, and either stops the flow (Switch spec 4.3).
+    pub(crate) async fn confirm_copy(
+        &mut self,
+        held: Option<&pubky_switch_core::sig::SignedDoc>,
+    ) -> Result<()> {
         let copy = match held {
-            Some(signed) => Some(IdentityDoc::verify(&signed, &self.state.identity)?),
+            Some(signed) => Some(IdentityDoc::verify(signed, &self.state.identity)?),
             None => None,
         };
         match self.judge_copy(copy.as_ref()) {
@@ -657,6 +667,29 @@ impl Signer {
             },
             Err(alert) => self.alarm(alert).await,
         }
+    }
+
+    /// Check that this install still signs before a write at the switch: it is named, the
+    /// switch's copy is its mark, and the backup on the Homeserver names no other install
+    /// that took over (Switch spec 4.3, 12.8; Switch wire 3.13).
+    pub(crate) async fn ensure_signer(&mut self) -> Result<()> {
+        self.check_named()?;
+        self.switch_at_mark().await?;
+        let found = self
+            .env
+            .homeserver
+            .get(SIGNER_BACKUP_PATH)
+            .await
+            .map_err(SignerError::Homeserver)?;
+        if let Some(found) = found.and_then(|bytes| self.open_backup(&bytes).transpose()) {
+            let found = found?;
+            let newest = self.high_water().map_or(0, |h| h.version);
+            if taken_over(&found, &self.state.install, newest) {
+                let install = found.identity_doc().body().signer;
+                return self.managed_by(install).await;
+            }
+        }
+        Ok(())
     }
 
     /// The records a backup holds, opened with the identity key; `None` for one that doesn't
@@ -722,6 +755,9 @@ impl Signer {
                 });
                 // The switch took this version, built on the one before: it holds the mark.
                 state.switch_unconfirmed = false;
+                if delivered_at.is_some() {
+                    state.time_asked = false;
+                }
                 self.commit(state, None).await
             }
             Err(ClientError::Switch {

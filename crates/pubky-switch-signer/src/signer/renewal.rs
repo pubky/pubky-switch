@@ -29,10 +29,11 @@ use pubky_switch_core::ops::{KeyBundlePut, OpKind};
 use pubky_switch_core::records::{
     AppCert, AppCertBody, BundlePart, CLOCK_TOLERANCE_MS, IdentityDoc, MAX_CERT_LIFETIME_MS,
     RenewedCert, StoredPart, incremental_first_epoch, is_reduction, owed_closings,
-    reduction_rotates, renewal_epochs, seal_bundle_parts,
+    reduction_rotates, seal_bundle_parts,
 };
 
 use super::Signer;
+use crate::alert::Alert;
 use crate::error::{Refusal, Result, SignerError};
 use crate::state::{Bytes, DeliverStep, Flow};
 
@@ -70,6 +71,9 @@ impl Signer {
             .find(|cert| cert.hash() == listed)
             .ok_or_else(|| SignerError::Records("the listed certificate isn't held".into()))?
             .clone();
+        // A scope no registered protocol owns can't be judged for keys (design note,
+        // decision 2): the renewal stops rather than guess.
+        self.require_owned(old.scopes())?;
         let scopes = change.scopes.unwrap_or_else(|| old.scopes().to_vec());
         let terms = self.env.protocols.terms(&scopes)?;
         let now = self.env.clock.now_ms();
@@ -80,9 +84,17 @@ impl Signer {
             .min(issued.saturating_add(MAX_CERT_LIFETIME_MS));
         let protocols = self.env.protocols.clone();
         let has_keys = |scope: &str| protocols.has_keys(scope);
-        // Another switch read before anything is signed: the other apps' holdings, for a
-        // rotation's bundles.
-        let statuses = self.service_client()?.apps().await?.apps;
+        // The switch's view, read before anything is signed: this install still signs, the app
+        // has joined, and the other apps' holdings, for a rotation's bundles.
+        let answer = self.service_client()?.apps().await?;
+        self.confirm_copy(answer.identity.as_ref()).await?;
+        let statuses = answer.apps;
+        let joined = statuses
+            .iter()
+            .any(|s| s.app_id == app_id && s.record_cert.is_some());
+        if !joined {
+            return Err(Refusal::NotJoined.into());
+        }
 
         let key = self.keyring.unlock()?;
         let new = AppCert::issue(
@@ -98,8 +110,18 @@ impl Signer {
             ),
         )?;
         let rotates = reduction_rotates(&old, &new, has_keys);
-        let (last, epoch) = renewal_epochs(rotates, newest.data_epoch())
-            .ok_or_else(|| SignerError::Records("the data epoch can't go higher".into()))?;
+        // A rotation goes above every epoch whose keys were ever sent, also by a rotation that
+        // was given up, so no app holds the new epoch's keys early (Switch spec 3.2, 3.5).
+        // `data_epoch` only increases, so it may skip (Switch wire 3.3).
+        let current = newest.data_epoch();
+        let last = if rotates {
+            current
+                .max(self.state.epoch_through)
+                .checked_add(1)
+                .ok_or_else(|| SignerError::Records("the data epoch can't go higher".into()))?
+        } else {
+            current
+        };
 
         // The full bundle for the new certificate, the cert.put in its first batch.
         let mut ops = vec![OpKind::CertPut {
@@ -109,10 +131,22 @@ impl Signer {
         let mut parts: Vec<StoredPart> = Vec::new();
         let full = seal_bundle_parts(&key, &new, 1, last, &has_keys)?;
         push_parts(&mut ops, &mut parts, app_id, new.hash(), full);
-        // A rotation: every other current app's bundle for the next epoch.
+        // A rotation: every other current app's bundle through the new epoch. An app the
+        // switch doesn't serve now, one not current, not joined or expired, gets no part: it
+        // gets the epochs it lacks from its next bundle, which starts after `keys_through`
+        // (Switch wire 3.5).
         if rotates {
             for other in &newest.body().apps {
                 if other.app_id == app_id {
+                    continue;
+                }
+                let Some(status) = statuses.iter().find(|s| s.app_id == other.app_id) else {
+                    continue;
+                };
+                let served = status.current
+                    && status.record_cert.is_some()
+                    && status.cert_expires_at.is_none_or(|at| at > now);
+                if !served {
                     continue;
                 }
                 let Some(cert) = certs.iter().find(|c| c.hash() == other.cert) else {
@@ -120,10 +154,10 @@ impl Signer {
                         "a listed certificate isn't held".into(),
                     ));
                 };
-                let status = statuses.iter().find(|s| s.app_id == other.app_id);
+                self.require_owned(cert.scopes())?;
                 let first = incremental_first_epoch(
-                    status.and_then(|s| s.keys_through),
-                    status.is_some_and(|s| s.full_bundle_requested.is_some()),
+                    status.keys_through,
+                    status.full_bundle_requested.is_some(),
                 );
                 let sealed = seal_bundle_parts(&key, cert, first.min(last), last, &has_keys)?;
                 push_parts(&mut ops, &mut parts, other.app_id, other.cert, sealed);
@@ -146,7 +180,7 @@ impl Signer {
                 cert: old.hash(),
                 until: None,
             });
-            body.data_epoch = epoch;
+            body.data_epoch = last;
         })?;
         drop(key);
         let Flow::Deliver { prev, .. } = flow else {
@@ -156,7 +190,18 @@ impl Signer {
         };
         let mut state = self.state.clone();
         state.signed_through = doc.version();
+        state.epoch_through = state.epoch_through.max(last);
         state.certs.push(new.signed().clone());
+        // Parts the switch no longer keeps go: those of apps the newest version doesn't list,
+        // and those an app has passed, which the switch may drop (Switch wire 3.5, 7.4.12).
+        state.bundle_parts.retain(|held| {
+            newest.listed_cert(&held.app_id).is_some()
+                && statuses
+                    .iter()
+                    .find(|s| s.app_id == held.app_id)
+                    .and_then(|s| s.keys_through)
+                    .is_none_or(|through| held.last_epoch > through)
+        });
         let renew = Flow::Renew {
             app_id,
             batches,
@@ -170,8 +215,20 @@ impl Signer {
         Ok(doc)
     }
 
+    /// Refuse scopes no registered protocol owns (design note, decision 2).
+    fn require_owned(&self, scopes: &[String]) -> Result<()> {
+        let unknown = self.env.protocols.unowned(scopes);
+        if unknown.is_empty() {
+            Ok(())
+        } else {
+            Err(Refusal::UnknownScopes { scopes: unknown }.into())
+        }
+    }
+
     /// Send a renewal's batches from `sent` on, each with its signed bytes, then go on to
-    /// the renewing version's delivery.
+    /// the renewing version's delivery. Before the first batch it sends, a resumed one
+    /// included, it checks that this install still signs: the switch's copy is its mark, and
+    /// no other install's backup took over (Switch spec 4.3, 12.8).
     pub(super) async fn send_renewal(
         &mut self,
         app_id: [u8; 16],
@@ -181,7 +238,9 @@ impl Signer {
         doc: pubky_switch_core::sig::SignedDoc,
         prev: Option<[u8; 32]>,
     ) -> Result<()> {
-        self.check_named()?;
+        if sent < batches.len() {
+            self.ensure_signer().await?;
+        }
         let client = self.service_client()?;
         for (index, bytes) in batches.iter().enumerate().skip(sent) {
             let batch = Batch::from_body(bytes.0.clone())?;
@@ -197,12 +256,11 @@ impl Signer {
                     };
                     self.commit(self.state.clone(), Some(flow)).await?;
                 }
-                Err(
-                    error @ ClientError::Switch {
-                        status: 400..=403, ..
-                    },
-                ) => {
-                    // A definite refusal: the renewal ends, its version stays spent.
+                Err(error @ ClientError::Switch { status, .. })
+                    if (400..500).contains(&status) && status != 408 && status != 429 =>
+                {
+                    // A definite refusal: the renewal ends, its version and its epochs stay
+                    // spent.
                     self.commit(self.state.clone(), None).await?;
                     return Err(error.into());
                 }
@@ -254,7 +312,9 @@ impl Signer {
 
     /// Whether a closing delivery is owed.
     pub(super) fn owes_closing(&self) -> Result<bool> {
-        Ok(self.state.managed_by.is_none() && !self.owed()?.is_empty())
+        Ok(self.state.managed_by.is_none()
+            && !self.state.closing_unavailable
+            && !self.owed()?.is_empty())
     }
 
     /// When a closing delivery is owed and no flow is in progress, commit it as the next
@@ -270,13 +330,30 @@ impl Signer {
             return Ok(false);
         };
         let Some(delivered_at) = newest.delivered_at else {
+            if self.state.time_asked {
+                // The retry's answer carried no proof either (Switch wire 7.4.2): there is no
+                // service time to cut off at, and the signer never uses its own clock. The
+                // closing stays owed and the user is told.
+                let apps = self.owed()?;
+                let mut state = self.state.clone();
+                state.alert(Alert::ReductionNotClosed { apps });
+                state.closing_unavailable = true;
+                self.commit(state, None).await?;
+                return Err(SignerError::InvalidData(pubky_switch_core::Error::Invalid(
+                    "Switch wire 7.4.2: the delivery's retry carried no proof, so the \
+                     reduction has no cutoff time"
+                        .into(),
+                )));
+            }
+            let mut state = self.state.clone();
+            state.time_asked = true;
             let again = Flow::Deliver {
                 doc: newest.doc,
                 prev: newest.prev,
                 backup: None,
                 step: DeliverStep::BackupWritten,
             };
-            self.commit(self.state.clone(), Some(again)).await?;
+            self.commit(state, Some(again)).await?;
             return Ok(true);
         };
         let owed = self.owed()?;

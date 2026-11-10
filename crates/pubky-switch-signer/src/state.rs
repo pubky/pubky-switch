@@ -101,6 +101,18 @@ pub(crate) struct SignerState {
     /// no claim.
     #[serde(default)]
     pub(crate) switch_unconfirmed: bool,
+    /// The highest data epoch whose keys this signer ever sent in a bundle, by a rotation it
+    /// gave up too: the next rotation goes above it (Switch spec 3.2, 3.5).
+    #[serde(default)]
+    pub(crate) epoch_through: u64,
+    /// A closing delivery is owed and the renewing version was delivered again for its
+    /// service time, whose answer must carry it.
+    #[serde(default)]
+    pub(crate) time_asked: bool,
+    /// The switch gave no service time for a reduction's renewing delivery: the closing stays
+    /// owed, with [`Alert::ReductionNotClosed`] shown, and isn't tried again.
+    #[serde(default)]
+    pub(crate) closing_unavailable: bool,
 }
 
 /// An approval's companion claim, signed with the version that lists its certificate and
@@ -162,6 +174,9 @@ impl SignerState {
             cert_lifetime_ms: DEFAULT_CERT_LIFETIME_MS,
             claims: Vec::new(),
             switch_unconfirmed: false,
+            epoch_through: 0,
+            time_asked: false,
+            closing_unavailable: false,
         }
     }
 

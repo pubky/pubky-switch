@@ -101,6 +101,10 @@ pub enum Refusal {
         /// The rollback or equivocation alert behind it, if still held.
         alert: Option<crate::alert::Alert>,
     },
+    /// The app hasn't joined: the switch holds no record of it, so it takes no certificate or
+    /// bundle for it yet (Switch wire 6.2, spec 12.1 step 2).
+    #[error("refused: the app hasn't joined the switch")]
+    NotJoined,
     /// The store already holds this identity's signer records, so it isn't set up again.
     #[error("refused: the signer is already set up for this identity")]
     AlreadySetUp,

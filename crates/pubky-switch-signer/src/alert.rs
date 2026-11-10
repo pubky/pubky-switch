@@ -59,4 +59,12 @@ pub enum Alert {
     /// still held the newest version this signer delivered, so the signer wrote its backup
     /// again (Switch wire 3.13).
     BackupMissing,
+    /// The switch gave no service time for a reduction's renewing delivery, even on a retry,
+    /// so the earlier certificates of these apps aren't cut off: a reduction's cutoff is the
+    /// service's time, never the signer's own (Switch wire 3.8). Revoking an app cuts it off;
+    /// a switch that keeps doing this is faulty, and the user moves to another provider.
+    ReductionNotClosed {
+        /// The apps whose reduction stays open.
+        apps: Vec<[u8; 16]>,
+    },
 }
