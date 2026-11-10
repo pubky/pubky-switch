@@ -660,8 +660,8 @@ async fn test_signer_publishes_nothing_over_a_newer_homeserver_copy() {
         world.switch.identity_doc().unwrap().signed()
     );
     // A version 9 of its own there, as after its records went back, is newer than anything
-    // the switch took: nothing is published over it, and the next version is signed above it
-    // and published over it.
+    // the switch took, so readers keep it: the change is signed again above it, as version
+    // 10, delivered and published in the same call.
     let mut body = first.body().clone();
     body.version = 9;
     let nine = IdentityDoc::sign(&world.key, body).unwrap();
@@ -669,8 +669,14 @@ async fn test_signer_publishes_nothing_over_a_newer_homeserver_copy() {
         pubky_switch_core::records::IDENTITY_PATH,
         serde_json::to_vec(nine.signed()).unwrap(),
     );
-    signer.set_record_max_age(Some(3_600)).await.unwrap();
-    assert_eq!(world.published().unwrap().version(), 9);
+    let changed = signer.set_record_max_age(Some(3_600)).await.unwrap();
+    assert_eq!(changed.version(), 10);
+    assert_eq!(changed.body().record_max_age, Some(3_600));
+    assert_eq!(world.published().unwrap().signed(), changed.signed());
+    assert_eq!(
+        world.switch.identity_doc().unwrap().signed(),
+        changed.signed()
+    );
     assert!(
         signer
             .alerts()
@@ -678,9 +684,33 @@ async fn test_signer_publishes_nothing_over_a_newer_homeserver_copy() {
             .any(|a| matches!(a, Alert::HomeserverAhead { version: 9, .. }))
     );
     let next = signer.set_record_max_age(Some(60)).await.unwrap();
-    assert_eq!(next.version(), 10);
+    assert_eq!(next.version(), 11);
     assert_eq!(world.published().unwrap().signed(), next.signed());
     world.assert_no_version_sent_twice();
+}
+
+#[tokio::test]
+async fn test_signer_a_homeserver_copy_at_a_higher_generation_but_lower_version_isnt_adopted() {
+    // Only a higher version at no lower generation is newer (Switch spec 4.3): a copy that
+    // raises the generation but lowers the version, which an honest key never signs, doesn't
+    // move the mark back. The newest version is published over it.
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let first = signer.identity_doc().unwrap().unwrap();
+    let mut body = first.body().clone();
+    body.generation += 1;
+    body.signer = [7; 16];
+    let odd = IdentityDoc::sign(&world.key, body).unwrap();
+    signer.set_record_max_age(Some(86_400)).await.unwrap();
+    world.homeserver.set(
+        pubky_switch_core::records::IDENTITY_PATH,
+        serde_json::to_vec(odd.signed()).unwrap(),
+    );
+    let changed = signer.set_record_max_age(Some(3_600)).await.unwrap();
+    assert_eq!(changed.version(), 3);
+    assert_eq!(signer.high_water().unwrap().version, 3);
+    assert_eq!(signer.status(), pubky_switch_signer::SignerStatus::Signing);
+    assert_eq!(world.published().unwrap().signed(), changed.signed());
 }
 
 #[tokio::test]

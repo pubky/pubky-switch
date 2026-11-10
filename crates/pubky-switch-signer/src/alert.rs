@@ -59,10 +59,10 @@ pub enum Alert {
     /// still held the newest version this signer delivered, so the signer wrote its backup
     /// again (Switch wire 3.13).
     BackupMissing,
-    /// The Homeserver publishes a newer `identity.json` of this install's own than the one the
-    /// switch holds as its mark, as after its records went back. The signer publishes nothing
-    /// over it, and signs its next version above it, which the switch takes and which is then
-    /// published over it; nothing else is needed. (A newer one by another install isn't this
+    /// The Homeserver published a newer `identity.json` of this install's own than the one the
+    /// switch holds as its mark, as after its records went back. The signer signed its newest
+    /// version again above it, which the switch took and which was then published over it;
+    /// nothing else is needed. (A newer one by another install isn't this
     /// alert: this install adopts it and stops, as for a newer copy from the switch.)
     HomeserverAhead {
         /// The Homeserver's version.

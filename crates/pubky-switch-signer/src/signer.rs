@@ -218,6 +218,19 @@ impl Signer {
     /// version that this install adopted instead of its own.
     pub async fn resume(&mut self) -> Result<()> {
         self.refresh().await?;
+        loop {
+            self.finish_flow().await?;
+            self.publish().await?;
+            // A publication that found this install's own newer copy signed the newest change
+            // again above it: that version goes out too.
+            if self.flow.is_none() {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Run the flow in progress to its end.
+    async fn finish_flow(&mut self) -> Result<()> {
         while let Some(flow) = self.flow.clone() {
             match flow {
                 Flow::Enroll {
@@ -239,7 +252,7 @@ impl Signer {
                 } => self.deliver(doc, prev).await?,
             }
         }
-        self.publish().await
+        Ok(())
     }
 
     /// The identity.
@@ -347,10 +360,12 @@ impl Signer {
             .await
     }
 
-    /// Sign the next version, built from the newest with `change`, and deliver it. Its
-    /// version is above every version this install committed a signed document at, so a
+    /// Sign the next version, built from the newest with `change`, and deliver and publish it.
+    /// Its version is above every version this install committed a signed document at, so a
     /// version whose document went out in a flow that was dropped is never signed again
-    /// (Switch spec 4.3, 13.2).
+    /// (Switch spec 4.3, 13.2). Returns the version readers see carrying the change: when the
+    /// Homeserver held a newer version of this install's own, the change signed again above
+    /// it.
     async fn new_version(&mut self, change: impl FnOnce(&mut IdentityBody)) -> Result<IdentityDoc> {
         self.ready().await?;
         let key = self.keyring.unlock()?;
@@ -360,7 +375,7 @@ impl Signer {
         state.signed_through = doc.version();
         self.commit(state, Some(flow)).await?;
         self.resume().await?;
-        Ok(doc)
+        Ok(self.state.newest_doc()?.unwrap_or(doc))
     }
 
     /// Ready for a new signing call: the store read again if a commit left it unsure, this
@@ -837,30 +852,32 @@ impl Signer {
         let already = held
             .as_ref()
             .is_some_and(|copy| copy.signed() == mine.signed());
-        if let Some(copy) = held
-            .clone()
-            .filter(|copy| copy.version() > mine.version() || copy.generation() > mine.generation())
-        {
+        if let Some(copy) = held.clone().filter(|copy| {
+            copy.version() > mine.version() && copy.generation() >= mine.generation()
+        }) {
             // A newer version, verified for the identity, is handled as a newer copy from the
-            // switch is (Switch spec 4.3). Another install's is adopted, and this install
-            // stops. This install's own, which the switch doesn't hold, as after its records
-            // went back, is left in place: nothing is published over it, and the next version
-            // is signed above it and published over it.
+            // switch is (Switch spec 4.3): a higher version at no lower generation. Another
+            // install's is adopted, and this install stops. This install's own, which the
+            // switch doesn't hold, as after its records went back, isn't published over:
+            // readers would keep the higher version. The newest version is signed again above
+            // it, the same body, and that one is delivered and published, so the change it
+            // carries is seen.
             if copy.body().signer != self.state.install {
                 return self.adopt(copy).await;
             }
-            let alert = Alert::HomeserverAhead {
+            let mut state = self.state.clone();
+            state.alert(Alert::HomeserverAhead {
                 version: copy.version(),
                 high_water_version: mine.version(),
-            };
-            let mut state = self.state.clone();
-            state.alert(alert);
-            state.signed_through = state.signed_through.max(copy.version());
-            state.newest = Some(Newest {
-                published: true,
-                ..newest
             });
-            return self.commit(state, self.flow.clone()).await;
+            state.signed_through = state.signed_through.max(copy.version());
+            self.commit(state, None).await?;
+            let key = self.keyring.unlock()?;
+            let (again, flow) = self.next_version(&key, |_| {})?;
+            drop(key);
+            let mut state = self.state.clone();
+            state.signed_through = again.version();
+            return self.commit(state, Some(flow)).await;
         }
         if !already {
             let bytes =
