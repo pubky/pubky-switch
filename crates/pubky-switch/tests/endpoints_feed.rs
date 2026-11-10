@@ -86,9 +86,11 @@ async fn test_feed_vectors_page_after_the_registration() {
             .cloned()
             .unwrap_or_else(|| panic!("no item {seq}"))
     };
-    // The entry at seq 5 comes with the inbox. The record's create at seq 6, superseded by
-    // the update at seq 8, shows as its stub (Switch wire 7.5); the rest as http.json has it.
+    // The entry at seq 5 comes with the inbox; the rest as http.json has it, but for seq 6.
     assert_eq!(seqs(&page), vec![6, 7, 8, 9]);
+    // The record's create at seq 6, superseded by the update at seq 8, shows as its stub
+    // (Switch wire 7.5, 9.1). http.json's page shows it in full, against that text, and is
+    // to be corrected; then this page is compared whole.
     assert_eq!(
         item_at(&page, 6),
         json!({ "type": "stub", "seq": 6, "stub": item_at(&expected_page, 6)["stub"] })
