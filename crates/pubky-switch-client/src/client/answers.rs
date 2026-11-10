@@ -371,9 +371,11 @@ pub struct AllowList {
 }
 
 impl AllowList {
+    /// Every list is required (Switch wire 7.4.6): an answer missing one is malformed, so
+    /// a missing `flagged` never reads as no flagged sender.
     pub(crate) fn read(o: Obj<'_>) -> Result<Self, ClientError> {
         let conversations = o
-            .objects("conversations")?
+            .required_objects("conversations")?
             .into_iter()
             .map(|c| {
                 let written_by = match c.str("written_by")? {
@@ -393,7 +395,7 @@ impl AllowList {
             })
             .collect::<Result<_, ClientError>>()?;
         let flagged = o
-            .objects("flagged")?
+            .required_objects("flagged")?
             .into_iter()
             .map(|f| {
                 Ok(Flagged {
@@ -403,7 +405,7 @@ impl AllowList {
             })
             .collect::<Result<_, ClientError>>()?;
         let invite_codes = o
-            .objects("invite_codes")?
+            .required_objects("invite_codes")?
             .into_iter()
             .map(|i| {
                 Ok(InviteCodeStatus {
@@ -416,9 +418,9 @@ impl AllowList {
             })
             .collect::<Result<_, ClientError>>()?;
         Ok(Self {
-            contacts: o.each("contacts", read::pubky)?,
+            contacts: o.required_each("contacts", read::pubky)?,
             conversations,
-            deny: o.each("deny", read::pubky)?,
+            deny: o.required_each("deny", read::pubky)?,
             flagged,
             invite_codes,
         })
@@ -1176,5 +1178,47 @@ impl UploadAnswer {
             proofs: o.opt_u64("proofs")?,
             merged: changes("merged")?,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn allow_answer() -> Value {
+        serde_json::json!({
+            "contacts": [], "conversations": [], "deny": [], "flagged": [], "invite_codes": []
+        })
+    }
+
+    #[test]
+    fn test_allow_list_reads_every_list() {
+        let value = allow_answer();
+        let list = AllowList::read(Obj::of(&value, "allow").unwrap()).unwrap();
+        assert!(list.flagged.is_empty() && list.deny.is_empty());
+    }
+
+    #[test]
+    fn test_allow_list_missing_a_list_is_malformed() {
+        for member in [
+            "contacts",
+            "conversations",
+            "deny",
+            "flagged",
+            "invite_codes",
+        ] {
+            let mut value = allow_answer();
+            value.as_object_mut().unwrap().remove(member);
+            let read = AllowList::read(Obj::of(&value, "allow").unwrap());
+            assert!(
+                matches!(read, Err(ClientError::InvalidResponse(_))),
+                "{member}: {read:?}"
+            );
+            value[member] = Value::Null;
+            assert!(
+                AllowList::read(Obj::of(&value, "allow").unwrap()).is_err(),
+                "{member}"
+            );
+        }
     }
 }

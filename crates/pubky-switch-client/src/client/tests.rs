@@ -1014,7 +1014,8 @@ async fn test_last_server_time_follows_checked_answers_only() {
     let transport = fixed(
         service_key(),
         200,
-        json!({ "contacts": [], "conversations": [], "deny": [] }),
+        json!({ "contacts": [], "conversations": [], "deny": [], "flagged": [],
+                "invite_codes": [] }),
     );
     let client = client_with(app(), Some(service_public()), Arc::clone(&transport));
     assert_eq!(client.last_server_time(), None);
