@@ -2986,6 +2986,33 @@ fn test_activation_rebuilt_claim_evidence_compares_attempt_state() {
 }
 
 #[test]
+fn test_activation_checkpoint_never_inside_a_batch() {
+    let f = fixture();
+    // The chain parts from a checkpoint at `seq`, dropping the stubs at and before it.
+    let from = |seq: u64| {
+        let checkpoint = SignedHead::sign(
+            &old_key(),
+            &f.id,
+            &ChainTip {
+                generation: 1,
+                seq,
+                chain_hash: f.stubs[seq as usize - 1].chain_hash,
+            },
+        );
+        let parts = f.with(|p| p.retain(|x| !matches!(x, Part::Chain(c) if c.seq <= seq)));
+        let manifest = f.resign(|b| {
+            b.checkpoint = Some(checkpoint);
+            b.parts = parts.len() as u64;
+        });
+        f.run_manifest(&manifest, &parts)
+    };
+    // Seq 2 is the first of the app's batch of two: the stubs kept would begin inside it.
+    refused(from(2), ErrorCode::Conflict, "the chain part at seq 4");
+    // At the batch's last item, the export activates.
+    from(3).unwrap();
+}
+
+#[test]
 fn test_activation_tombstones_entries_and_batches() {
     let f = fixture();
     let app_id = app().app_id_bytes();

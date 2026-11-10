@@ -557,6 +557,39 @@ mod tests {
             kind: crate::ops::AllowKind::Conversation,
         };
         assert!(check_permission(&removal, Writer::App(&writes)).is_err());
+        // The signer writes key_bundle.put and cert.put only: every other type it signs is
+        // 403 permission_missing.
+        let record =
+            AppRecord::sign(&app(), AppRecordBody::new(&writes, Vec::new(), ISSUED)).unwrap();
+        for kind in [
+            claim.clone(),
+            put.clone(),
+            conversation.clone(),
+            removal.clone(),
+            OpKind::DenyPut { pubky: [1; 32] },
+            OpKind::DenyDelete { pubky: [1; 32] },
+            OpKind::InviteCodePut(InviteCodePut {
+                code_hash: [1; 32],
+                expires_at: ISSUED,
+                max_uses: 1,
+                context: InviteContext::new(json!(null)),
+            }),
+            OpKind::InviteCodeDelete { code_hash: [1; 32] },
+            OpKind::AppPut {
+                record: record.signed().clone(),
+            },
+            OpKind::ReceiveKeyPut {
+                record: record.signed().clone(),
+            },
+        ] {
+            let refused = check_permission(&kind, Writer::Signer).unwrap_err();
+            assert_eq!(
+                refused.code,
+                ErrorCode::PermissionMissing,
+                "{}",
+                kind.name()
+            );
+        }
     }
 
     #[test]

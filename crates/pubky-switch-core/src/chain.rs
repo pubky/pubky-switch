@@ -1410,6 +1410,40 @@ impl Verifier {
     }
 }
 
+/// The newest chain item a checkpoint may lie at, and stubs be dropped up to, at or before
+/// `limit` (Switch wire 7.4.4, Switch spec 8.3): never inside a batch, only at a batch's last
+/// chain item or at an item of no batch, so the stubs a service keeps, and an export's
+/// `chain` parts, never begin with part of a batch, which apps and the activation refuse as
+/// a partial batch. `kept` are the envelopes of the stubs the service keeps, oldest first,
+/// starting at a batch's first item or an item of no batch, as such a service's always do;
+/// `limit` is the newest `seq` the other rules let go, which may lie inside a batch (a cursor
+/// may). `None` when no such item is at or before `limit`.
+pub fn checkpoint_at(kept: &[ChainEnvelope], limit: u64) -> Option<u64> {
+    let mut at = None;
+    let mut open: Option<(BatchRef, u64)> = None;
+    for envelope in kept.iter().take_while(|e| e.seq <= limit) {
+        match envelope.batch {
+            None => {
+                open = None;
+                at = Some(envelope.seq);
+            }
+            Some(batch) => {
+                let seen = match open {
+                    Some((current, seen)) if current == batch => seen.saturating_add(1),
+                    _ => 1,
+                };
+                if seen >= batch.count {
+                    open = None;
+                    at = Some(envelope.seq);
+                } else {
+                    open = Some((batch, seen));
+                }
+            }
+        }
+    }
+    at
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1466,6 +1500,61 @@ mod tests {
             }
         }
         (stubs, tip)
+    }
+
+    #[test]
+    fn test_checkpoint_at_never_inside_a_batch() {
+        // Seq 1 no batch, seqs 2 to 4 one batch, seq 5 no batch, seqs 6 and 7 a batch.
+        let (stubs, _) = chain(&[
+            (None, START),
+            (Some(([1; 16], 3)), START),
+            (None, START),
+            (Some(([2; 16], 2)), START),
+        ]);
+        let kept: Vec<ChainEnvelope> = stubs.iter().map(|s| s.open().unwrap()).collect();
+        let at = |limit| checkpoint_at(&kept, limit);
+        assert_eq!(at(0), None);
+        assert_eq!(at(1), Some(1));
+        assert_eq!(at(2), Some(1), "inside the batch: the item before it");
+        assert_eq!(at(3), Some(1));
+        assert_eq!(at(4), Some(4), "the batch's last item");
+        assert_eq!(at(5), Some(5));
+        assert_eq!(at(6), Some(5));
+        assert_eq!(at(7), Some(7));
+        assert_eq!(at(100), Some(7));
+        // The stubs kept from a checkpoint inside a batch begin with part of it, which the
+        // verifier refuses as a partial batch.
+        let checkpoint = SignedHead::sign(
+            &service(),
+            &identity(),
+            &ChainTip {
+                generation: 1,
+                seq: 2,
+                chain_hash: stubs[1].chain_hash,
+            },
+        );
+        let mut v = Verifier::from_checkpoint(&checkpoint);
+        v.push(&stubs[2]).unwrap();
+        v.push(&stubs[3]).unwrap();
+        assert!(matches!(
+            v.push(&stubs[4]),
+            Err(ChainError::PartialBatch { .. })
+        ));
+        // From the batch's last item, they verify.
+        let checkpoint = SignedHead::sign(
+            &service(),
+            &identity(),
+            &ChainTip {
+                generation: 1,
+                seq: 4,
+                chain_hash: stubs[3].chain_hash,
+            },
+        );
+        let mut v = Verifier::from_checkpoint(&checkpoint);
+        for stub in &stubs[4..] {
+            v.push(stub).unwrap();
+        }
+        v.end_of_feed().unwrap();
     }
 
     #[test]

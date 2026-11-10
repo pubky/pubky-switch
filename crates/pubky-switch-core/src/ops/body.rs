@@ -1210,6 +1210,22 @@ mod tests {
     }
 
     #[test]
+    fn test_op_body_app_id_is_always_written() {
+        let mut v: Value = serde_json::from_slice(&body(attempt()).to_json().unwrap()).unwrap();
+        v["app_id"] = Value::Null;
+        assert_eq!(
+            OpBody::parse(&serde_json::to_vec(&v).unwrap())
+                .unwrap()
+                .app_id,
+            None,
+            "null: the signer"
+        );
+        v.as_object_mut().unwrap().remove("app_id");
+        let refused = OpBody::parse(&serde_json::to_vec(&v).unwrap()).unwrap_err();
+        assert_eq!(refused.status(), 400);
+    }
+
+    #[test]
     fn test_signed_op_verifies_with_a_certificate_of_its_writer() {
         use crate::records::{AppCert, AppCertBody};
         let id = identity();

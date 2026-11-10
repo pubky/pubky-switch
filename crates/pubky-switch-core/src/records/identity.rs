@@ -691,6 +691,19 @@ mod tests {
         IdentityDoc::verify(&resign(&v), &identity().public()).unwrap();
         v.as_object_mut().unwrap().remove("recovery_from");
         assert!(IdentityDoc::verify(&resign(&v), &identity().public()).is_err());
+        // A renewed entry's `until` is always written, `null` while the renewal is open.
+        let mut renewing = body();
+        renewing.renewed.push(RenewedCert {
+            app_id: app().app_id_bytes(),
+            cert: [6; 32],
+            until: None,
+        });
+        let mut v: serde_json::Value =
+            serde_json::from_slice(&renewing.to_json().unwrap()).unwrap();
+        assert!(v["renewed"][0]["until"].is_null());
+        IdentityDoc::verify(&resign(&v), &identity().public()).unwrap();
+        v["renewed"][0].as_object_mut().unwrap().remove("until");
+        assert!(IdentityDoc::verify(&resign(&v), &identity().public()).is_err());
         let mut no_signer: serde_json::Value =
             serde_json::from_slice(&body().to_json().unwrap()).unwrap();
         no_signer["signer"] = serde_json::json!(crate::enc::b64(&[1; 15]));
@@ -875,6 +888,19 @@ mod tests {
         v1.check_successor(&v2).unwrap();
         assert!(v2.check_successor(&v1).is_err());
         assert!(v1.check_successor(&v1).is_err());
+        // data_epoch only increases: a later version that lowers it is refused (Switch wire
+        // 3.3 "Lists"); one that keeps or raises it isn't.
+        let mut raised = b2.clone();
+        raised.data_epoch = 2;
+        let raised = sign(raised);
+        v1.check_successor(&raised).unwrap();
+        let mut lowered = body();
+        lowered.version = 3;
+        let error = raised.check_successor(&sign(lowered)).unwrap_err();
+        assert!(
+            error.to_string().contains("data_epoch only increases"),
+            "{error}"
+        );
         // An App ID once removed is never listed again.
         let mut removed = body();
         removed.version = 4;
