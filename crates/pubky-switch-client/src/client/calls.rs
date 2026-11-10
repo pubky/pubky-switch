@@ -474,7 +474,7 @@ impl SwitchClient {
         let checked = self.get("apps").await?;
         let (value, what) =
             Self::json_answer(&checked, Doc::Plain, "Switch wire 7.4.12: an apps answer")?;
-        AppsAnswer::read(Obj::of(&value, what)?)
+        AppsAnswer::read(Obj::of(&value, what)?, checked.server_time_ms)
     }
 
     /// `POST /v1/{id}/apps/{app_id}/revoke` (signer, Switch wire 7.4.12), answered with the

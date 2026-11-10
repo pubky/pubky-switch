@@ -142,4 +142,14 @@ pub enum Alert {
         /// The app.
         app_id: [u8; 16],
     },
+    /// A revocation is asked for and no version removes the app yet: the switch couldn't be
+    /// reached or refused it, or the version waits for an alarm to be cleared. The App ID is
+    /// refused for good already, and gets no key; each run tries again (Switch spec 12.2).
+    RevocationPending {
+        /// The app.
+        app_id: [u8; 16],
+        /// Whether the switch took the revocation, so it serves the app no more, while
+        /// `identity.json` still lists it.
+        at_switch: bool,
+    },
 }

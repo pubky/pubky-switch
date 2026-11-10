@@ -93,15 +93,31 @@ impl Signer {
             revoked_at,
         });
         self.commit(state, self.flow.clone()).await?;
-        self.complete_removals().await?;
+        let completed = self.remove_now().await;
         let newest = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
-        // Never reported done while a version still lists the app.
-        if newest.listed_cert(&app_id).is_some() {
-            return Err(SignerError::InvalidData(pubky_switch_core::Error::Invalid(
-                "Switch wire 7.4.12: the switch took the revocation but gave no time for it".into(),
-            )));
+        if newest.listed_cert(&app_id).is_none() {
+            return Ok(newest);
         }
-        Ok(newest)
+        // Never reported done while a version still lists the app: the user is told it is
+        // pending, and whether the switch serves it no more.
+        let (failures, error) = match completed {
+            Ok((_, failures)) => (failures, None),
+            Err(error) => (Vec::new(), Some(error)),
+        };
+        let own = failures.into_iter().find(|(app, _)| *app == app_id);
+        let mut state = self.state.clone();
+        state.alert(Alert::RevocationPending {
+            app_id,
+            at_switch: own.is_none(),
+        });
+        self.commit(state, self.flow.clone()).await?;
+        Err(match (own, error) {
+            (Some((_, failed)), _) => failed,
+            (None, Some(error)) => error,
+            (None, None) => SignerError::InvalidData(pubky_switch_core::Error::Invalid(
+                "Switch wire 7.4.12: the switch took the revocation but gave no time for it".into(),
+            )),
+        })
     }
 
     /// Remove every app that is revoked or departed and still listed, in one version with a
@@ -112,14 +128,33 @@ impl Signer {
     /// # Errors
     ///
     /// As [`Signer::resume`].
+    ///
+    /// A revocation the switch can't be reached for, or refuses, stays pending with
+    /// [`Alert::RevocationPending`]; it doesn't hold back the other removals, nor the rest of
+    /// [`Signer::run_due`].
     pub async fn complete_removals(&mut self) -> Result<bool> {
+        Ok(self.remove_now().await?.0)
+    }
+
+    /// [`Signer::complete_removals`], with the revocations the switch didn't take and why.
+    async fn remove_now(&mut self) -> Result<(bool, Vec<([u8; 16], SignerError)>)> {
         self.refresh().await?;
         self.check_named()?;
-        self.send_revocations().await?;
+        let failures = self.send_revocations().await?;
+        if !failures.is_empty() {
+            let mut state = self.state.clone();
+            for (app_id, _) in &failures {
+                state.alert(Alert::RevocationPending {
+                    app_id: *app_id,
+                    at_switch: false,
+                });
+            }
+            self.commit(state, self.flow.clone()).await?;
+        }
         self.ready().await?;
         let mut newest = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
-        let mut statuses = self.switch_apps().await?;
-        let found = self.removals(&newest, &statuses);
+        let (mut statuses, mut answered_at) = self.switch_apps_at().await?;
+        let found = self.removals(&newest, &statuses, answered_at);
         if !found.unconfirmed.is_empty() {
             let mut state = self.state.clone();
             for app_id in &found.unconfirmed {
@@ -129,16 +164,16 @@ impl Signer {
         }
         if found.apps.is_empty() {
             self.drop_revoked_requests().await?;
-            return Ok(false);
+            return Ok((false, failures));
         }
         // A rotation goes to the epoch after the newest version's, completing first an
         // epoch a given-up rotation sent keys for (Switch spec 3.2, 3.5).
         if self.state.epoch_through > newest.data_epoch() {
             self.complete_epoch(&statuses).await?;
             newest = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
-            statuses = self.switch_apps().await?;
+            (statuses, answered_at) = self.switch_apps_at().await?;
         }
-        let found = self.removals(&newest, &statuses);
+        let found = self.removals(&newest, &statuses, answered_at);
         let removing = found.apps;
         let last = newest
             .data_epoch()
@@ -161,9 +196,10 @@ impl Signer {
         drop(key);
         let mut state = self.state.clone();
         state.epoch_through = state.epoch_through.max(last);
-        state.alerts.retain(
-            |a| !matches!(a, Alert::RevocationUnconfirmed { app_id } if cut.contains(app_id)),
-        );
+        state.alerts.retain(|a| {
+            !matches!(a, Alert::RevocationUnconfirmed { app_id }
+                | Alert::RevocationPending { app_id, .. } if cut.contains(app_id))
+        });
         for removed in &removing {
             if !state.tombstones.contains(&removed.app_id) {
                 state.tombstones.push(removed.app_id);
@@ -175,15 +211,15 @@ impl Signer {
         self.commit_batches(state, &newest, &statuses, alerts, batches, &doc, flow)
             .await?;
         self.resume().await?;
-        Ok(true)
+        Ok((true, failures))
     }
 
     /// Revoke at the switch every app a revocation was asked for that the newest version
     /// still lists (Switch spec 12.2 step 1). It is a request and signs nothing new; the
     /// switch answers a revocation sent again with no proof (Switch wire 7.4.12).
-    async fn send_revocations(&mut self) -> Result<()> {
+    async fn send_revocations(&mut self) -> Result<Vec<([u8; 16], SignerError)>> {
         let Some(newest) = self.state.newest_doc()? else {
-            return Ok(());
+            return Ok(Vec::new());
         };
         let pending: Vec<[u8; 16]> = self
             .state
@@ -193,12 +229,19 @@ impl Signer {
             .filter(|app| newest.listed_cert(app).is_some())
             .collect();
         if pending.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let named = super::clients::Named::check(&self.state)?;
         let client = self.service_client()?;
+        let mut failures = Vec::new();
         for app_id in &pending {
-            let answer = client.revoke(&named, app_id).await?;
+            let answer = match client.revoke(&named, app_id).await {
+                Ok(answer) => answer,
+                Err(error) => {
+                    failures.push((*app_id, error.into()));
+                    continue;
+                }
+            };
             // The proof the client verified dates the revocation; one sent again gets none.
             let at = answer
                 .proofs
@@ -215,7 +258,7 @@ impl Signer {
                 }
             }
         }
-        Ok(())
+        Ok(failures)
     }
 
     /// The listed apps to remove, each with its `distrust_from`, the alerts that go with
@@ -223,12 +266,13 @@ impl Signer {
     ///
     /// A revocation this signer asked for is dated by its proof, else by the switch's
     /// `revoked_at`. One the switch reports, or a departure, is dated by the earlier of
-    /// `revoked_at` and `departed_at`, with [`Alert::RemovedAtSwitch`]; never before the time
-    /// the switch took the newest version, which lists the app, since the switch refuses a
-    /// version listing a revoked or departed App ID ([`Alert::RemovalTimeBounded`]). The
-    /// user's earlier pick, after a compromise, reaches back as far as they chose.
-    fn removals(&self, newest: &IdentityDoc, statuses: &[AppStatus]) -> Removals {
-        let listed_at = self.state.newest.as_ref().and_then(|n| n.delivered_at);
+    /// `revoked_at` and `departed_at`, with [`Alert::RemovedAtSwitch`], bounded on both sides,
+    /// with [`Alert::RemovalTimeBounded`]: never before the service time at which the switch
+    /// took the first version listing the app, which it can't have left before, and never
+    /// after `answered_at`, the service time of the verified answer reporting it, so a faulty
+    /// switch can't keep the removed app's later messages counting. The user's earlier
+    /// pick, after a compromise, reaches back as far as they chose.
+    fn removals(&self, newest: &IdentityDoc, statuses: &[AppStatus], answered_at: u64) -> Removals {
         let mut found = Removals::default();
         for listed in &newest.body().apps {
             let app_id = listed.app_id;
@@ -237,17 +281,23 @@ impl Signer {
             let reported = status.and_then(|s| reported_time(s.revoked_at, s.departed_at));
             let at = match (asked.and_then(|r| r.revoked_at), reported) {
                 (Some(own), _) => own,
-                (None, Some(reported)) => match listed_at {
-                    Some(floor) if reported < floor => {
+                (None, Some(reported)) => {
+                    let first_listed = self
+                        .state
+                        .listed_at
+                        .iter()
+                        .find(|(id, _)| *id == app_id)
+                        .map(|(_, at)| *at);
+                    let bounded = bounded_time(reported, first_listed, answered_at);
+                    if bounded != reported {
                         found.alerts.push(Alert::RemovalTimeBounded {
                             app_id,
                             reported,
-                            distrust_from: floor,
+                            distrust_from: bounded,
                         });
-                        floor
                     }
-                    _ => reported,
-                },
+                    bounded
+                }
                 (None, None) => {
                     if asked.is_some() && status.is_some_and(|s| !s.current) {
                         found.unconfirmed.push(app_id);
@@ -494,6 +544,13 @@ fn reported_time(revoked_at: Option<u64>, departed_at: Option<u64>) -> Option<u6
     }
 }
 
+/// A removal time the switch reported, kept between `first_listed`, when it took the first
+/// version listing the app, and `answered_at`, when it signed the answer reporting it.
+fn bounded_time(reported: u64, first_listed: Option<u64>, answered_at: u64) -> u64 {
+    let floor = first_listed.unwrap_or(0);
+    reported.max(floor).min(answered_at.max(floor))
+}
+
 /// The ranges of epochs from 1 to `current` that `covered` leaves out, in order.
 fn missing_ranges(covered: &[(u64, u64)], current: u64) -> Vec<(u64, u64)> {
     let mut covered = covered.to_vec();
@@ -518,7 +575,15 @@ fn missing_ranges(covered: &[(u64, u64)], current: u64) -> Vec<(u64, u64)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{missing_ranges, reported_time};
+    use super::{bounded_time, missing_ranges, reported_time};
+
+    #[test]
+    fn test_bounded_time_stays_between_the_listing_and_the_answer() {
+        assert_eq!(bounded_time(5, Some(3), 9), 5);
+        assert_eq!(bounded_time(1, Some(3), 9), 3);
+        assert_eq!(bounded_time(12, Some(3), 9), 9);
+        assert_eq!(bounded_time(1, None, 9), 1);
+    }
 
     #[test]
     fn test_reported_time_is_the_earlier_of_a_revocation_and_a_departure() {

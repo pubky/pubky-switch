@@ -923,10 +923,12 @@ pub struct AppsAnswer {
     pub proof_generations: Vec<u64>,
     /// The newest `identity.json` the service holds, as signed.
     pub identity: Option<SignedDoc>,
+    /// The service time the answer is signed at (`Switch-Server-Time`, Switch wire 7.1).
+    pub server_time: u64,
 }
 
 impl AppsAnswer {
-    pub(crate) fn read(o: Obj<'_>) -> Result<Self, ClientError> {
+    pub(crate) fn read(o: Obj<'_>, server_time: u64) -> Result<Self, ClientError> {
         let recovery = match o.get("recovery") {
             None => None,
             Some(value) => {
@@ -947,6 +949,7 @@ impl AppsAnswer {
             recovery,
             proof_generations: o.each("proof_generations", read::int)?,
             identity: o.opt_doc("identity")?,
+            server_time,
         })
     }
 }

@@ -83,6 +83,10 @@ impl Signer {
     /// for an expiry the certificate rules refuse; otherwise as [`Signer::resume`].
     pub async fn renew(&mut self, app_id: [u8; 16], change: CertChange) -> Result<IdentityDoc> {
         self.ready().await?;
+        // A revoked or departing app gets no new certificate, expiry or key (Switch spec 12.2).
+        if self.cut_off(&app_id) {
+            return Err(Refusal::CutOff.into());
+        }
         let identity = self.state.identity;
         let newest = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
         let listed = newest.listed_cert(&app_id).ok_or(Refusal::NotListed)?;
@@ -356,9 +360,15 @@ impl Signer {
 
     /// The switch's apps, once its copy is confirmed as this install's mark.
     pub(super) async fn switch_apps(&mut self) -> Result<Vec<AppStatus>> {
+        Ok(self.switch_apps_at().await?.0)
+    }
+
+    /// The switch's apps, once its copy is confirmed as this install's mark, and the service
+    /// time the answer is signed at.
+    pub(super) async fn switch_apps_at(&mut self) -> Result<(Vec<AppStatus>, u64)> {
         let answer = self.service_client()?.apps().await?;
         self.confirm_copy(answer.identity.as_ref()).await?;
-        Ok(answer.apps)
+        Ok((answer.apps, answer.server_time))
     }
 
     /// Send a renewal's or an epoch completion's batches from `sent` on, each with its signed
@@ -564,6 +574,8 @@ impl Signer {
             .renewed
             .iter()
             .filter(|entry| entry.until.is_none())
+            // A cut-off app's renewals go with it when it is removed.
+            .filter(|entry| !self.cut_off(&entry.app_id))
             .filter(|entry| {
                 // Reductions close on their own.
                 let old = certs.iter().find(|c| c.hash() == entry.cert);

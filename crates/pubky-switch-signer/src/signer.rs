@@ -920,6 +920,15 @@ impl Signer {
                     .and_then(|proof| proof.body().chain.open().ok())
                     .map(|envelope| envelope.server_time);
                 let mut state = self.state.clone();
+                if let (Some(at), Ok(delivered)) =
+                    (delivered_at, IdentityDoc::verify(&doc, &state.identity))
+                {
+                    for app in &delivered.body().apps {
+                        if !state.listed_at.iter().any(|(id, _)| *id == app.app_id) {
+                            state.listed_at.push((app.app_id, at));
+                        }
+                    }
+                }
                 let published = state
                     .newest
                     .as_ref()

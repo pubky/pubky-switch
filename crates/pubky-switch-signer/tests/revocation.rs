@@ -177,17 +177,18 @@ async fn test_revocation_reaches_the_switch_while_an_alarm_holds_signing_back() 
     assert!(world.switch.app(&id).departed);
     assert!(refused_for_good(&signer, &a));
     assert_eq!(world.sent_docs().len(), sent);
-    // Cleared, the next run removes it.
+    // The user is told the app is cut off at the switch and still listed.
+    let pending = Alert::RevocationPending {
+        app_id: id,
+        at_switch: true,
+    };
+    assert!(signer.alerts().contains(&pending));
+    // Cleared, the next run removes it, and the alert goes.
     signer.clear_alert(&alarm).await.unwrap();
     signer.run_due().await.unwrap();
-    assert!(
-        signer
-            .identity_doc()
-            .unwrap()
-            .unwrap()
-            .listed_cert(&id)
-            .is_none()
-    );
+    let doc = signer.identity_doc().unwrap().unwrap();
+    assert!(doc.listed_cert(&id).is_none());
+    assert!(!signer.alerts().contains(&pending));
 }
 
 #[tokio::test]
@@ -329,17 +330,41 @@ async fn test_removal_the_switch_reports_raises_an_alert_for_a_departure() {
 }
 
 #[tokio::test]
-async fn test_removal_time_never_reaches_back_past_a_version_the_switch_took_listing_it() {
-    // The switch reports a departure, then takes a version that still lists the app, later.
-    // The removal is distrusted only from that version's time, with an alert, so a reported
-    // time can't invalidate the app's messages before it.
+async fn test_departure_keeps_its_time_after_a_later_delivery() {
+    // The app leaves on day 1, and a version that still lists it is delivered on day 2, as the
+    // switch allows while the departure awaits its rotation (Switch wire 3.3). The removal is
+    // distrusted from day 1, with no alert.
     let world = World::new();
     let (mut signer, _) = world.enrolled().await;
     let (a, _) = two_joined(&world, &mut signer).await;
     let id = a.keys.app_id_bytes();
+    world.clock.advance_ms(DAY_MS);
     world.switch.leave(id).unwrap();
     world.clock.advance_ms(DAY_MS);
     signer.set_record_max_age(Some(86_400)).await.unwrap();
+    signer.run_due().await.unwrap();
+    let doc = signer.identity_doc().unwrap().unwrap();
+    assert_eq!(doc.body().removed[0].distrust_from, START_MS + DAY_MS);
+    assert!(
+        !signer
+            .alerts()
+            .iter()
+            .any(|a| matches!(a, Alert::RemovalTimeBounded { .. }))
+    );
+}
+
+#[tokio::test]
+async fn test_removal_time_before_the_app_was_listed_is_raised_to_its_listing() {
+    // A faulty switch reports a departure before the version that first listed the app: it
+    // can't have left before it was listed, so the removal counts from the listing.
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    world.clock.advance_ms(DAY_MS);
+    let (a, _) = two_joined(&world, &mut signer).await;
+    let id = a.keys.app_id_bytes();
+    world.clock.set_ms(START_MS);
+    world.switch.leave(id).unwrap();
+    world.clock.set_ms(START_MS + 2 * DAY_MS);
     signer.run_due().await.unwrap();
     let doc = signer.identity_doc().unwrap().unwrap();
     assert_eq!(doc.body().removed[0].distrust_from, START_MS + DAY_MS);
@@ -348,6 +373,89 @@ async fn test_removal_time_never_reaches_back_past_a_version_the_switch_took_lis
         reported: START_MS,
         distrust_from: START_MS + DAY_MS,
     }));
+}
+
+#[tokio::test]
+async fn test_removal_time_in_the_future_is_lowered_to_the_answers_time() {
+    // A faulty switch reports a departure later than the answer that reports it: the removal
+    // counts from the answer's time, so the app's later messages don't keep counting.
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let (a, _) = two_joined(&world, &mut signer).await;
+    let id = a.keys.app_id_bytes();
+    world.clock.set_ms(START_MS + 5 * DAY_MS);
+    world.switch.leave(id).unwrap();
+    world.clock.set_ms(START_MS + DAY_MS);
+    signer.run_due().await.unwrap();
+    let doc = signer.identity_doc().unwrap().unwrap();
+    assert_eq!(doc.body().removed[0].distrust_from, START_MS + DAY_MS);
+    assert!(signer.alerts().contains(&Alert::RemovalTimeBounded {
+        app_id: id,
+        reported: START_MS + 5 * DAY_MS,
+        distrust_from: START_MS + DAY_MS,
+    }));
+}
+
+#[tokio::test]
+async fn test_renewal_of_a_cut_off_app_is_refused() {
+    // The revocation is kept but hasn't reached the switch: the app gets no new certificate
+    // or key from a renewal either.
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let (a, _) = two_joined(&world, &mut signer).await;
+    let id = a.keys.app_id_bytes();
+    world.switch.fail_next(SwitchFault::Unreachable {
+        path: "/revoke".into(),
+        after: 0,
+    });
+    signer.revoke(id, None, confirmed()).await.unwrap_err();
+    let sent = world.sent_docs().len();
+    let change = CertChange {
+        scopes: None,
+        expires_at: Some(START_MS + 400 * DAY_MS),
+    };
+    assert_eq!(
+        signer.renew(id, change).await.unwrap_err(),
+        SignerError::Refused(Refusal::CutOff)
+    );
+    assert_eq!(world.sent_docs().len(), sent);
+    assert!(world.switch.app(&id).renewed.is_none());
+}
+
+#[tokio::test]
+async fn test_revocation_the_switch_refuses_doesnt_hold_back_the_run() {
+    // `/revoke` keeps failing for `b`: it stays pending with its alert, while `a`'s departure
+    // is still completed and the run goes on.
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let (a, b) = two_joined(&world, &mut signer).await;
+    let (a_id, b_id) = (a.keys.app_id_bytes(), b.keys.app_id_bytes());
+    world.switch.fail_next(SwitchFault::Unreachable {
+        path: "/revoke".into(),
+        after: 0,
+    });
+    signer.revoke(b_id, None, confirmed()).await.unwrap_err();
+    let pending = Alert::RevocationPending {
+        app_id: b_id,
+        at_switch: false,
+    };
+    assert!(signer.alerts().contains(&pending));
+    world.switch.leave(a_id).unwrap();
+    world.switch.fail_next(SwitchFault::Error {
+        path: "/revoke".into(),
+        code: pubky_switch_core::http::ErrorCode::Conflict,
+        current: serde_json::Value::Null,
+    });
+    signer.run_due().await.unwrap();
+    let doc = signer.identity_doc().unwrap().unwrap();
+    assert!(doc.listed_cert(&a_id).is_none());
+    assert!(doc.listed_cert(&b_id).is_some());
+    assert!(signer.alerts().contains(&pending));
+    // Once the switch takes it, the next run removes `b` and the alert goes.
+    signer.run_due().await.unwrap();
+    let doc = signer.identity_doc().unwrap().unwrap();
+    assert!(doc.listed_cert(&b_id).is_none());
+    assert!(!signer.alerts().contains(&pending));
 }
 
 #[tokio::test]
@@ -584,7 +692,8 @@ async fn test_revocation_record_cleanup_waits_for_the_homeserver() {
         .homeserver
         .set(&app_record_path(&id), b"a's record".to_vec());
     *world.homeserver.failing_path.lock().unwrap() = Some(app_record_path(&id));
-    signer.revoke(id, None, confirmed()).await.unwrap_err();
+    // The removal is done; only the record's deletion waits.
+    signer.revoke(id, None, confirmed()).await.unwrap();
     assert!(
         world
             .switch

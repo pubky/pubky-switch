@@ -115,6 +115,10 @@ pub enum Refusal {
         /// The newer version.
         version: u64,
     },
+    /// That App ID is revoked, being revoked, or seen departing: it gets no new certificate
+    /// or key (Switch spec 12.2).
+    #[error("refused: the App ID is revoked or being revoked")]
+    CutOff,
     /// The newest `identity.json` doesn't list that App ID in `removed`.
     #[error("refused: the App ID isn't in removed")]
     NotRemoved,

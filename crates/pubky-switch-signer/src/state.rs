@@ -112,6 +112,10 @@ pub(crate) struct SignerState {
     /// app asks anew.
     #[serde(default)]
     pub(crate) refused_requests: Vec<RefusedRequest>,
+    /// The service time at which the switch took the first version this signer delivered
+    /// that lists each app: no app left or was revoked before it (Switch spec 12.3).
+    #[serde(default)]
+    pub(crate) listed_at: Vec<([u8; 16], u64)>,
     /// The alerts the user hasn't cleared.
     pub(crate) alerts: Vec<Alert>,
     /// The certificate lifetime new certificates get, in milliseconds (Switch spec 3.2).
@@ -231,6 +235,7 @@ impl SignerState {
             revoking: Vec::new(),
             cleanup: Vec::new(),
             refused_requests: Vec::new(),
+            listed_at: Vec::new(),
             alerts: Vec::new(),
             cert_lifetime_ms: DEFAULT_CERT_LIFETIME_MS,
             claims: Vec::new(),
