@@ -42,7 +42,7 @@ use pubky_switch_core::records::AppCert;
 use super::admission::{LISTS_AT, SenderDisposition, deny_key, flag_key};
 use super::claims::{ClaimOp, ClaimRead, KeptClaim, ObligationDeadline, claim_key_of};
 use super::error::Refusal;
-use super::protocol::LocalWrite;
+use super::protocol::{LocalWrite, MAX_STEP_LOCAL_BYTES, local_writes_bytes};
 use super::records::{
     Collection, HeldRecord, RecordTarget, SeenMark, SharedRecord, record_key_of, record_put,
     seen_key,
@@ -69,6 +69,9 @@ pub(crate) struct ContextWrites {
     pub(crate) deadlines: Vec<([u8; 32], ObligationDeadline)>,
     /// A write couldn't be built now, such as for want of a scope key: the entry waits.
     pub(crate) not_now: Option<String>,
+    /// A local write was refused for taking the step past [`MAX_STEP_LOCAL_BYTES`]: the
+    /// effect is too large, whatever the step returns with it.
+    pub(crate) over_local_bound: bool,
 }
 
 /// A claim the app read from the switch for a receive step ([`super::Need::Claim`]).
@@ -674,7 +677,24 @@ impl<'a> ReceiveContext<'a> {
     }
 
     /// A write of the protocol's own local state, committed with the outcome.
-    pub fn local(&mut self, write: LocalWrite) {
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::Usage`] when the write would take this step's local writes past
+    /// [`MAX_STEP_LOCAL_BYTES`] ([`local_writes_bytes`]): the write isn't added, and an
+    /// effect the step then applies is stored and passed as too large
+    /// ([`super::ParkReason::EffectTooLarge`]), never applied without it.
+    pub fn local(&mut self, write: LocalWrite) -> Result<(), AppError> {
+        let after = local_writes_bytes(&self.writes.local)
+            .saturating_add(local_writes_bytes(std::slice::from_ref(&write)));
+        if after > MAX_STEP_LOCAL_BYTES {
+            self.writes.over_local_bound = true;
+            return Err(Refusal::Usage(format!(
+                "a receive step writes at most {MAX_STEP_LOCAL_BYTES} bytes of local state"
+            ))
+            .into());
+        }
         self.writes.local.push(write);
+        Ok(())
     }
 }

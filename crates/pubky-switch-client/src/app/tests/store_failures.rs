@@ -129,7 +129,8 @@ impl Protocol for FlakyProtocol {
             cx.local(LocalWrite::Put {
                 key: FAILED_STEP.to_vec(),
                 value: b"1".to_vec(),
-            });
+            })
+            .unwrap();
             // A read of the protocol's own state whose store failed: the error that read
             // gives is a store failure, so the step is retried.
             let read = AppError::Store(self.error.clone());
@@ -1479,7 +1480,8 @@ impl Protocol for CounterProtocol {
             cx.local(LocalWrite::Put {
                 key: COUNT.to_vec(),
                 value: b"99".to_vec(),
-            });
+            })
+            .unwrap();
             return Outcome::Retry(StoreError::Unavailable.into());
         }
         let scanned = cx.local_scan(COUNT).unwrap();
