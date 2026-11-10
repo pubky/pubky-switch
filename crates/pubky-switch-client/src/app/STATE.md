@@ -77,7 +77,6 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
 | `seen/<seq>` | an entry processed past a held one | |
 | `held/<seq>` | an entry held because its sender can't be checked, since when | |
 | `parked/<seq>` | an entry stored locally and passed: the opened plaintext, sender, certificate, time, reason (an unverifiable sender or a quota, tried again; an effect refused for good, over one batch, or kept past the window in which its resend tells whether it was applied, not tried again) | yes |
-| `uncert/<sender>/<msg_id>` | a message whose kept effect may have been applied, kept without its entry by an earlier build: its entry is parked when the feed shows it again, and the protocol told in that commit | |
 | `asked/<seq>` | a re-send was handed to the protocol for this item | |
 | `owed/<generation>/<seq>` | a re-send or missed-entries call about this item that the protocol answered with an error: written in the commit that passes the item, made again at the start of each read, and gone in the commit of its answer's writes. The key names the generation the item was read at | |
 | `departed/<app_id>` | another own app's departure verified in the chain, and its time | |

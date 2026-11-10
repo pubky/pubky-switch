@@ -158,11 +158,6 @@ pub(crate) mod key {
         format!("parked/{}", num(seq))
     }
 
-    /// A message whose kept effect may have been applied: its entry is parked when read.
-    pub(crate) fn uncertain(sender: &[u8; 32], msg_id: &str) -> String {
-        format!("uncert/{}/{msg_id}", pubky_id(sender))
-    }
-
     pub(crate) fn asked(seq: u64) -> String {
         format!("asked/{}", num(seq))
     }
@@ -440,9 +435,8 @@ pub(crate) struct PendingEffect {
     pub(crate) kept_ms: Option<u64>,
     /// What storing the entry locally takes, beside the fields above: the entry is stored
     /// when the effect is kept so long that its fate can't be known (Switch spec 12.5
-    /// "Kept batches").
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) entry: Option<KeptEntry>,
+    /// "Kept batches"). Required: a kept effect without it doesn't read.
+    pub(crate) entry: KeptEntry,
 }
 
 /// The part of an entry a kept effect keeps so the entry can be stored locally

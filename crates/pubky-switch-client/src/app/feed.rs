@@ -618,30 +618,6 @@ impl App {
             });
             return Ok(Step::Pass);
         }
-        // A kept effect that may have been applied: never built again (Switch spec 12.5
-        // "Kept batches").
-        let uncertain = key::uncertain(&entry.sender, &received.message.msg_id);
-        if self.reader().exists(&uncertain).await? {
-            read.tx.delete(&uncertain)?;
-            // The park, the processed pair and the duty events go in this read's commit,
-            // with the marker's deletion, so a re-send of the message is a duplicate.
-            self.park(entry, &received.plaintext, ParkReason::Uncertain, read)?;
-            let now = self.now();
-            let msg_id = &received.message.msg_id;
-            uncertain_processed(&mut read.tx, &entry.sender, msg_id, received.hash(), now)?;
-            read.pairs
-                .insert((entry.sender, msg_id.clone()), received.hash());
-            self.keep_duty(
-                &mut read.tx,
-                Duty::EffectUncertain {
-                    seq: entry.seq,
-                    sender: entry.sender,
-                    msg_id: received.message.msg_id.clone(),
-                    kind: received.message.kind.clone(),
-                },
-            )?;
-            return Ok(Step::Pass);
-        }
         self.apply(entry, received, parked, read).await
     }
 
@@ -925,11 +901,11 @@ impl App {
                 .map(|(claim_key, deadline)| (pubky_switch_core::enc::b64(claim_key), *deadline))
                 .collect(),
             kept_ms: Some(self.now()),
-            entry: Some(KeptEntry {
+            entry: KeptEntry {
                 cert: entry.cert.clone(),
                 plaintext: received.plaintext.encode(),
                 context: entry.context.clone(),
-            }),
+            },
         };
         // The collection name of a record the effect creates outside the protocol's
         // collections, until its write is answered: the switch knows only its ID.
@@ -1112,15 +1088,11 @@ impl App {
     /// means it was never applied (Switch spec 12.5 "Kept batches"): the service may have
     /// forgotten a batch it applied, so the effect goes and is never built again. Its entry
     /// is stored and passed, and the protocol told, in the commit that drops it
-    /// ([`App::park_uncertain`]); an effect kept without its entry, by an earlier build,
-    /// leaves a marker in that commit instead, and its entry is stored when the feed shows
-    /// it again.
+    /// ([`App::park_uncertain`]).
     async fn effect_uncertain(&mut self, pending: &PendingEffect) -> Result<(), AppError> {
         let mut tx = self.tx()?;
         tx.delete(key::PENDING_EFFECT)?;
-        if !self.park_uncertain(pending, &mut tx)? {
-            tx.put(&key::uncertain(&pending.sender, &pending.msg_id), &())?;
-        }
+        self.park_uncertain(pending, &mut tx)?;
         tx.put(key::CURSOR, &self.state.cursor)?;
         self.state.pending_effect = None;
         self.commit(tx).await
@@ -1130,24 +1102,22 @@ impl App {
     /// could apply it twice, so the entry is stored locally and passed, like an effect
     /// refused for good (Switch spec 8.2), and the protocol is told ([`Duty::Parked`],
     /// [`Duty::EffectUncertain`]), with its processed pair, all in `tx`; it decides from the
-    /// current state. One stored before only changes its reason. Returns `false`, writing nothing, for an
-    /// effect kept without its entry.
-    fn park_uncertain(&mut self, pending: &PendingEffect, tx: &mut Tx) -> Result<bool, AppError> {
+    /// current state. One stored before only changes its reason.
+    fn park_uncertain(&mut self, pending: &PendingEffect, tx: &mut Tx) -> Result<(), AppError> {
         let reason = ParkReason::Uncertain;
-        let parked = match (self.state.parked.get(&pending.seq), &pending.entry) {
-            (Some(stored), _) if pending.parked => ParkedEntry {
+        let parked = match self.state.parked.get(&pending.seq) {
+            Some(stored) if pending.parked => ParkedEntry {
                 reason,
                 ..stored.clone()
             },
-            (_, Some(entry)) => ParkedEntry {
+            _ => ParkedEntry {
                 sender: pending.sender,
-                cert: entry.cert.clone(),
+                cert: pending.entry.cert.clone(),
                 accepted_at_ms: pending.accepted_at_ms,
-                plaintext: entry.plaintext.clone(),
-                context: entry.context.clone(),
+                plaintext: pending.entry.plaintext.clone(),
+                context: pending.entry.context.clone(),
                 reason,
             },
-            _ => return Ok(false),
         };
         tx.put(&key::parked(pending.seq), &parked)?;
         self.state.parked.insert(pending.seq, parked);
@@ -1184,8 +1154,7 @@ impl App {
                 msg_id: pending.msg_id.clone(),
                 kind: pending.kind.clone(),
             },
-        )?;
-        Ok(true)
+        )
     }
 
     async fn drop_pending_effect(&mut self) -> Result<(), AppError> {

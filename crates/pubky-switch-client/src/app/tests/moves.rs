@@ -2259,62 +2259,35 @@ async fn test_key_change_effect_resend_past_the_window_parks_its_entry() {
 }
 
 #[tokio::test]
-async fn test_key_change_effect_kept_without_its_entry_parks_it_when_read_again() {
+async fn test_kept_effect_without_its_entry_is_corrupt_state() {
     let w = World::new();
     let router = Router::of(&w);
     let mut app = join(&w, &router).await;
     let me = app.app_id();
-    let (seq, message) = w.note(me, "before");
+    w.note(me, "before");
     w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
     assert!(app.receive(None).await.is_err());
-    // A kept effect written without its entry, as an earlier build kept it.
+    // A kept effect without the entry it keeps: no build writes one.
     app.ready_local().await.unwrap();
-    let mut pending = app.state.pending_effect.clone().unwrap();
-    pending.entry = None;
+    let pending = app.state.pending_effect.clone().unwrap();
+    let mut value = serde_json::to_value(&pending).unwrap();
+    value.as_object_mut().unwrap().remove("entry");
     let mut tx = app.tx().unwrap();
-    tx.put(crate::app::state::key::PENDING_EFFECT, &pending)
+    tx.put(crate::app::state::key::PENDING_EFFECT, &value)
         .unwrap();
     app.commit(tx).await.unwrap();
-    app.state.pending_effect = Some(pending);
-    w.clock
-        .advance_ms(crate::app::provider::KEPT_BATCH_ANSWER_MS);
-    let changed = change_key(&w, &router);
-    changed.lock().batches.clear();
-    // Its resend leaves a marker, and the entry the feed shows again is stored and passed
-    // in that read's commit, with its duty events.
-    let report = app.receive(None).await.unwrap();
-    assert!(
-        has(&report.events, |e| matches!(
-            e,
-            AppEvent::EffectUncertain { id, seq: s, .. } if *s == seq && e.id() == Some(*id)
-        )),
-        "{:?}",
-        report.events
-    );
-    assert!(!received(&report.events, seq), "{:?}", report.events);
-    assert_eq!(conversations_at(&changed), 0);
-    assert_eq!(
-        app.state.parked.get(&seq).map(|p| p.reason),
-        Some(ParkReason::Uncertain)
-    );
-    // The marker went with the park.
-    assert!(app.reader().scan_raw("uncert/").await.unwrap().is_empty());
-    resend_is_a_duplicate(&w, &mut app, &changed, &message).await;
+    drop(app);
     let loaded = App::load(
         router.env(&w, Arc::clone(&w.store) as Arc<dyn StateStore>),
         w.protocol.clone(),
         World::config(),
         me,
     )
-    .await
-    .unwrap()
-    .take_events();
+    .await;
     assert!(
-        has(
-            &loaded,
-            |e| matches!(e, AppEvent::EffectUncertain { seq: s, .. } if *s == seq)
-        ),
-        "{loaded:?}"
+        matches!(loaded, Err(AppError::Store(StoreError::Corrupt))),
+        "{:?}",
+        loaded.map(|_| ())
     );
 }
 
