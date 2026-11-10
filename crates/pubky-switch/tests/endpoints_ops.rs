@@ -1550,6 +1550,24 @@ async fn test_claims_expired_owner_is_not_current_for_the_claim_rules() {
         body["current"]["claim"]["attempts"][0]["orphaned"], true,
         "{body}"
     );
+    // Without trusted time that outcome waits for it: only the owner's expiry allows it, and
+    // expiry can't be judged without trusted time (Switch wire 7.3). The owner is current
+    // for that test, its expiry apart.
+    let keys = vectors("keys.json");
+    let untrusted = replay.without_trusted_time();
+    let request = app_request(
+        app(&keys, "phone"),
+        "POST",
+        &ops_path(),
+        OpsRequest::new(&failed(45), None).to_json(),
+        ms(later),
+    );
+    let (status, body, _) = answer_of(untrusted.handle(request).await);
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (503, Some("unavailable")),
+        "{body}"
+    );
     let (status, body) = post_app(&replay, "phone", &failed(43), None, later).await;
     assert_eq!(status, 200, "{body}");
     replay.db.drop_database().await.expect("drop");
