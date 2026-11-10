@@ -193,8 +193,21 @@ pub(crate) enum RefusalPlace {
     /// effect's entry stored as uncertain, a batch dropped with its attempts. It is
     /// uncertain, not refused: a batch applied under an earlier service can be refused for
     /// its shape by a later one. `400` (steps 2 to 4), `413 too_large` (step 2), and every
-    /// code not classified above. `400` and `413` can also come from step 9 (a field's
-    /// shape, a record value's size), which this takes as before the lookup.
+    /// code not classified above.
+    ///
+    /// `400`, `413 too_large` and `404 not_found` also come from step 9, an operation's
+    /// shape or its rules (an invite code not held), after the lookup, which would prove the
+    /// batch never applied. The answer can't tell them apart from the request's: its body
+    /// is the code, a message that isn't normative, and `current`, which none of them
+    /// carries, with no operation named (Switch wire 7.6). So they are taken as before the
+    /// lookup, the weaker reading: the entry is stored as uncertain where it was in fact
+    /// refused.
+    ///
+    /// The one `401 bad_signature` of step 9 is a key bundle's signature (`key_bundle.put`),
+    /// about the bytes; it never reaches an app's own batch, since `key_bundle.put` is the
+    /// signer's, and step 9 checks an operation's permission (`403 permission_missing`)
+    /// before its shape. So every `401 bad_signature` an app's batch gets is authentication's
+    /// or step 3's, about the caller's key.
     Bytes,
 }
 
