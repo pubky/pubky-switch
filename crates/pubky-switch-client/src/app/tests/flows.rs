@@ -1466,6 +1466,32 @@ async fn test_kept_batch_written_offline_survives_a_restart_unsent() {
 }
 
 #[tokio::test]
+async fn test_parked_retry_effect_is_kept_at_a_fresh_service_time() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let (seq, _) = w.note(app.app_id(), "note");
+    w.switch.fail_next(Fault::Error {
+        path: "ops".into(),
+        code: ErrorCode::QuotaExceeded,
+        current: json!(null),
+    });
+    app.receive(None).await.unwrap();
+    assert_eq!(
+        app.state.parked.get(&seq).map(|p| p.reason),
+        Some(ParkReason::Quota)
+    );
+    // A month on, the stored entry is tried again before any feed read, and its effect
+    // kept: at a service time read in this call, not the month-old one.
+    w.clock.advance_ms(30 * 24 * HOUR);
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    let _ = app.receive(None).await;
+    let pending = app.state.pending_effect.as_ref().unwrap();
+    assert_eq!(pending.seq, seq);
+    let age = w.clock.now_ms() - pending.kept_ms.unwrap();
+    assert!(age < HOUR, "kept {age} ms before now");
+}
+
+#[tokio::test]
 async fn test_kept_batch_window_holds_with_the_device_clock_behind_at_the_resend() {
     let w = World::new();
     let (mut app, clock) = app_with_its_own_clock(&w, 0).await;
