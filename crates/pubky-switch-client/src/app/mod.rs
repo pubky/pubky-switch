@@ -970,15 +970,15 @@ impl App {
             // A restore in place keeps the store's event epoch and counter, and what the store
             // holds of what the app still owes its protocol: the duty events not
             // acknowledged and the calls the protocol couldn't answer. A store with no epoch,
-            // on another device or wiped, starts a new epoch at the first counter, and a
-            // store that can't be read is taken as one (`STATE.md`, "What the app owes its
+            // on another device or wiped, starts a new epoch at the first counter. A store
+            // that can't be read fails the restore (`STATE.md`, "What the app owes its
             // protocol").
             let old = Reader {
                 ns: ns.clone(),
                 store: env.store.clone(),
             };
-            let (state, carried) = match Self::kept_for_protocol(&old).await {
-                Ok(Some((duty_epoch, next_duty, carried))) => (
+            let (state, carried) = match Self::kept_for_protocol(&old).await? {
+                Some((duty_epoch, next_duty, carried)) => (
                     AppState {
                         duty_epoch,
                         next_duty,
@@ -986,7 +986,7 @@ impl App {
                     },
                     carried,
                 ),
-                Ok(None) | Err(_) => (state, Vec::new()),
+                None => (state, Vec::new()),
             };
             let client = Self::client_for(&env, &meta, &backup.keys, &cert)?;
             let mut app = App {
@@ -1276,6 +1276,18 @@ impl App {
             .collect();
         self.queue_duties(kept);
         Ok(())
+    }
+
+    /// How many protocol calls the protocol answered with an error and the app still owes
+    /// it ([`Protocol::resend_needed`], [`Protocol::missed`]): each read makes them again,
+    /// so a count that stays up shows a protocol that keeps failing.
+    ///
+    /// # Errors
+    ///
+    /// A failed store read.
+    pub async fn owed_protocol_calls(&self) -> Result<u64, AppError> {
+        let owed = self.reader().scan_raw(key::OWED_PREFIX).await?;
+        Ok(u64::try_from(owed.len()).unwrap_or(u64::MAX))
     }
 
     /// The duty events kept and not acknowledged yet, by ascending ID: what a host that

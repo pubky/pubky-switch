@@ -67,6 +67,8 @@ pub(crate) struct SampleProtocol {
     /// How many of the next re-send and missed calls fail, as when the protocol can't read
     /// its own state.
     pub(crate) failing: Mutex<u32>,
+    /// The `seq`s of missed items whose call always fails.
+    pub(crate) failing_missed: Mutex<Vec<u64>>,
 }
 
 impl SampleProtocol {
@@ -160,7 +162,7 @@ impl Protocol for SampleProtocol {
     }
 
     fn missed(&self, missed: &MissedEntries) -> Result<Vec<LocalWrite>, crate::error::StoreError> {
-        if self.fails() {
+        if self.failing_missed.lock().unwrap().contains(&missed.seq) || self.fails() {
             return Err(crate::error::StoreError::Unavailable);
         }
         self.missed.lock().unwrap().push(missed.clone());

@@ -1408,12 +1408,19 @@ impl App {
         if !self.state.asked.insert(seq) {
             return Ok(false);
         }
-        match self.protocol.resend_needed(&needed) {
-            Ok(writes) => read.tx.local(&writes)?,
-            Err(_) => self.owe(seq, OwedCall::from(&needed), read)?,
-        }
+        let asked = match self.protocol.resend_needed(&needed) {
+            Ok(writes) => {
+                read.tx.local(&writes)?;
+                true
+            }
+            // Not asked yet: owed, and asked by a later read.
+            Err(_) => {
+                self.owe(seq, OwedCall::from(&needed), read)?;
+                false
+            }
+        };
         read.tx.put(&key::asked(seq), &())?;
-        Ok(true)
+        Ok(asked)
     }
 
     /// A call the protocol couldn't answer: kept in the commit that passes its item, and
@@ -1424,15 +1431,15 @@ impl App {
             .put(&key::owed(self.state.cursor.generation, seq), &call)
     }
 
-    /// The calls the protocol couldn't answer before, made again, oldest first; each one
-    /// answered commits its writes and goes, in one commit. The first that fails again
-    /// stops this pass; the next read goes on from it.
+    /// The calls the protocol couldn't answer before, made again, oldest first, each on its
+    /// own: one answered commits its writes and goes, in one commit; one that fails again
+    /// stays for the next read, and the others are still made.
     async fn retry_owed(&mut self) -> Result<(), AppError> {
         let owed = self.reader().scan::<OwedCall>(key::OWED_PREFIX).await?;
         for (rest, call) in owed {
             let answer = call.make(self.protocol.as_ref());
             let Ok(writes) = answer else {
-                break;
+                continue;
             };
             let mut tx = self.tx()?;
             tx.local(&writes)?;

@@ -740,6 +740,77 @@ async fn test_app_missed_call_the_protocol_fails_is_made_again() {
 }
 
 #[tokio::test]
+async fn test_app_owed_call_failing_for_good_starves_no_other() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    w.note(app.app_id(), "first");
+    app.receive(None).await.unwrap();
+    let now = w.clock.now_ms();
+    let stuck = w.switch.push_missed(1, now - HOUR, now);
+    w.protocol.failing_missed.lock().unwrap().push(stuck);
+    let later = w.switch.push_missed(2, now - HOUR, now);
+    // Both calls fail at first: both owed, and counted.
+    *w.protocol.failing.lock().unwrap() = 1;
+    app.receive(None).await.unwrap();
+    assert_eq!(app.owed_protocol_calls().await.unwrap(), 2);
+    // The next read makes each on its own: the later one is answered though the first
+    // keeps failing.
+    app.receive(None).await.unwrap();
+    let missed = w.protocol.missed.lock().unwrap().clone();
+    assert_eq!(missed.len(), 1, "{missed:?}");
+    assert_eq!(missed[0].seq, later);
+    assert_eq!(app.owed_protocol_calls().await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn test_app_unreadable_entry_whose_call_fails_isnt_reported_asked() {
+    let w = World::new();
+    let mut wallet = w.join("wallet").await;
+    let mut phone = w.join("phone").await;
+    wallet.receive(None).await.unwrap();
+    let accepted = w.clock.now_ms();
+    w.clock.advance_ms(1000);
+    phone
+        .leave(LeaveMode::Immediate(UserConfirmed::new()))
+        .await
+        .unwrap();
+    let seq = w.switch.push_unreadable(w.bob.public(), accepted);
+    *w.protocol.failing.lock().unwrap() = 1;
+    let report = wallet.receive(None).await.unwrap();
+    assert!(
+        has(&report.events, |e| matches!(
+            e,
+            AppEvent::Unreadable { seq: s, resend_asked: false } if *s == seq
+        )),
+        "{:?}",
+        report.events
+    );
+    assert_eq!(wallet.owed_protocol_calls().await.unwrap(), 1);
+    wallet.receive(None).await.unwrap();
+    assert_eq!(w.protocol.resends.lock().unwrap().len(), 1);
+    assert_eq!(wallet.owed_protocol_calls().await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn test_app_restore_in_place_over_a_store_that_doesnt_read_fails() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let backup = app.backup().unwrap();
+    // The store's event epoch doesn't read.
+    let mut tx = app.tx().unwrap();
+    tx.put(crate::app::state::key::DUTY_EPOCH, &"not an epoch")
+        .unwrap();
+    app.commit(tx).await.unwrap();
+    drop(app);
+    let restored = App::restore(w.env(), w.protocol.clone(), World::config(), &backup).await;
+    assert!(
+        matches!(restored, Err(AppError::Store(_))),
+        "{:?}",
+        restored.map(|_| ())
+    );
+}
+
+#[tokio::test]
 async fn test_app_resend_call_the_protocol_fails_is_made_again() {
     let w = World::new();
     let mut wallet = w.join("wallet").await;

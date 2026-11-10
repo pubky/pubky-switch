@@ -251,7 +251,8 @@ pub enum AppEvent {
         /// The entry's `seq`.
         seq: u64,
         /// Whether a re-send was asked; never for a time before the cursor's, less the
-        /// clock tolerance.
+        /// clock tolerance, and not when the protocol's call failed: it is owed then, and
+        /// asked by a later read ([`super::App::owed_protocol_calls`]).
         resend_asked: bool,
     },
     /// An entry left unread by a departed own app (Switch spec 8.2).
@@ -259,7 +260,8 @@ pub enum AppEvent {
         /// The item's `seq`.
         seq: u64,
         /// Whether a re-send was asked: only for an entry accepted at or before a departure
-        /// the app verified in its chain.
+        /// the app verified in its chain, and not when the protocol's call failed: it is
+        /// owed then, and asked by a later read.
         resend_asked: bool,
     },
     /// Entries the service deleted while the app was lagging (Switch spec 8.2).
