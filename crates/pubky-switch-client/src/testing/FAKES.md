@@ -128,7 +128,8 @@ service.
   stored hand-over (`SignerHandover::check_stored`) for a current target with a checked
   certificate, and keeps one, replacing any it held; `GET /handover` serves it to the signer
   and to its target; the next `identity.json` version, whoever delivered it, drops it.
-  `stored_handover` names the target held.
+  `stored_handover` names the target held; `stored_handover_body` and
+  `store_handover_again` script a hand-over stored or served again after it was dropped.
 - **`Fault::LeaveOut`** scripts a faulty service whose answer to an own app or the signer
   leaves out a top-level member, such as a feed page's `items`.
 - **Erasure** (Switch wire 7.4.16) is a flag; its answers are signed with a fixed operator

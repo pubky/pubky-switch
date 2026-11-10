@@ -131,6 +131,10 @@ pub(crate) struct SignerState {
     /// has won and the received secret is in the vault (Switch wire 3.12).
     #[serde(default)]
     pub(crate) taking_over: bool,
+    /// A take-over's first version won, and its publication waits for its backup (Switch wire
+    /// 3.12): the old signer's deletion relies on that order.
+    #[serde(default)]
+    pub(crate) publish_after_backup: bool,
     /// The hand-over took effect, naming this install as the signer: committed before the key
     /// is deleted, so records a crash leaves behind are deleted on the next open and count as
     /// none for a new set-up (Switch spec 12.8).
@@ -195,6 +199,20 @@ pub(crate) struct HandingOver {
     /// The document hash of the abort, once it is signed: never taken for the new signer's
     /// version.
     pub(crate) abort: Option<[u8; 32]>,
+    /// The take-back, once it is signed: kept to be sent again, the same bytes.
+    #[serde(default)]
+    pub(crate) take_back: Option<TakeBack>,
+}
+
+/// A take-back of the identity from a new signer that is lost (Switch wire 3.12).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct TakeBack {
+    /// The version, as signed: the switch's copy's content, naming this install.
+    pub(crate) doc: SignedDoc,
+    /// The document hash of the switch's copy it builds on.
+    pub(crate) prev: [u8; 32],
+    /// The install the switch's copy named.
+    pub(crate) from: [u8; 16],
 }
 
 /// Where a hand-over's `PUT /handover` is (Switch wire 7.4.17).
@@ -311,6 +329,7 @@ impl SignerState {
             handing_over: None,
             taking_over: false,
             handed_over_to: None,
+            publish_after_backup: false,
             refused_requests: Vec::new(),
             listed_at: Vec::new(),
             alerts: Vec::new(),

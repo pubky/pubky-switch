@@ -161,15 +161,21 @@ pub enum Refusal {
     /// nothing received is kept.
     #[error("refused: the switch's or the Homeserver's copy isn't the version handed over")]
     StaleHandOver,
-    /// The switch shows the hand-over took effect, naming `install`, and the Homeserver
-    /// doesn't publish that version yet: this install keeps the key, and the hand-over, until
-    /// it does, then deletes them (Switch spec 12.8). The new signer publishes only once its
-    /// delivery has won.
-    #[error("refused: the new signer's version isn't published yet")]
-    SuccessorUnpublished {
+    /// The switch holds a newer version naming `install`, but the proof that it holds the
+    /// identity isn't there yet: its signer backup on the Homeserver, holding a newer version
+    /// naming it (Switch wire 3.12). This install signs nothing, as one that isn't named,
+    /// keeps the key and the hand-over, and looks for the proof again at each run; if that
+    /// install is lost, the user takes the identity back ([`crate::Signer::take_back`]).
+    #[error("refused: another install's version holds no proof yet")]
+    SuccessorUnproven {
         /// The signer ID the switch's copy names.
         install: [u8; 16],
     },
+    /// Nothing to take back: the switch doesn't show another install's version after the one
+    /// handed over, or that install's proof is there, or no hand-over is in progress (Switch
+    /// wire 3.12).
+    #[error("refused: nothing to take back")]
+    NothingToTakeBack,
     /// The store holds no take-over in progress for this identity.
     #[error("refused: no take-over is in progress")]
     NotTakingOver,

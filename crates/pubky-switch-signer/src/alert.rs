@@ -171,6 +171,17 @@ pub enum Alert {
     /// [`crate::Signer::resume`] puts the secret in the vault again; nothing is signed until
     /// then.
     KeyNotInstalled,
+    /// The switch refused the take-over's first delivery for good, as with a `400`, a `403`
+    /// or a `409 conflict` (Switch wire 3.12). The take-over stays undecided and is sent again;
+    /// the old signer's abort is the way out.
+    TakeOverRefused,
+    /// This install took the identity back from `from`, which the user confirmed lost (Switch
+    /// wire 3.12). If `from` is still around, it holds the key too, and stops as an install
+    /// that isn't named; nothing deletes it there.
+    TakenBack {
+        /// The signer ID the switch's copy named.
+        from: [u8; 16],
+    },
     /// A restore found the switch or the backup claiming keys sent past the next data
     /// epoch, which can't be: epochs never skip, and at most one is in progress beyond
     /// `data_epoch` (Switch spec 3.2, 3.5). The floor is kept at the next epoch.

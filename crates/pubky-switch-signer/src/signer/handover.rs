@@ -1,55 +1,62 @@
-//! Handing the identity over to another signer, and aborting it: the old signer's side
-//! (Switch spec 12.8; Switch wire 3.12, 7.4.17).
+//! Handing the identity over to another signer, aborting it, and taking it back: the old
+//! signer's side (Switch spec 12.8; Switch wire 3.12, 7.4.17).
 //!
 //! On the user's confirmation, the old signer seals its records, the identity secret in them,
 //! to the certified bundle key of an app its newest `identity.json` lists and the switch shows
-//! current, and stores the hand-over at the switch (`PUT /handover`). It hands over only the
-//! newest version the switch accepted from it, with no closing delivery owed. From then on it
-//! signs nothing for the identity but the abort: the signing gate refuses every routine step
-//! ([`crate::Refusal::HandingOver`]), and the routine run keeps the work it owes for later. No
-//! revocation is owed when it starts, nor asked for meanwhile: the hand-over carries the
-//! records as sealed, not a revocation in progress, so one the switch hadn't taken when it took
-//! effect would be lost with this install's records. The user aborts first, then revokes.
+//! current with a certificate that hasn't expired, and stores the hand-over at the switch
+//! (`PUT /handover`), again only while the switch still holds the version handed over. It
+//! hands over only the newest version the switch accepted from it, with no closing delivery
+//! owed. From then on it signs nothing for the identity but an abort or a take-back: the
+//! signing gate refuses every routine step ([`crate::Refusal::HandingOver`]), the routine run
+//! keeps the work it owes for later, and it writes nothing to the Homeserver until its abort
+//! or take-back has won, so it never republishes the switch's copy. No revocation is owed
+//! when it starts, nor asked for meanwhile: the hand-over carries the records as sealed, not
+//! a revocation in progress. The user aborts first, then revokes.
 //!
-//! The hand-over ends one of two ways, whichever wins the switch's compare-and-swap on the
-//! version handed over:
+//! How it ends:
 //!
-//! - **It takes effect.** The new signer delivers that version plus 1, naming its own install.
-//!   The old signer deletes the identity key, then its records, only on a copy of
-//!   `identity.json` that proves another install holds the identity: from the switch, in its
-//!   `GET /apps` answer or a `409 stale_identity` answering the abort, both authenticated with
-//!   its pinned key; verifying for the identity; at the version handed over plus 1 and the same
-//!   generation; naming another install; and not the abort. The switch's copy doesn't carry
-//!   the hash it builds on, but the switch took it with the compare-and-swap on the version it
-//!   held, which was the one handed over, so it builds on it. And the Homeserver must publish
-//!   that version, or a later one of that install: the new signer publishes only once its
-//!   delivery has won, so a switch that shows each side the other's version can't make both
-//!   delete the key. Until then the key and the hand-over stay. The deletion is committed
-//!   first, so a crash between the key and the records leaves marked records, which the next
-//!   open deletes and a new set-up replaces. Any other newer copy, such as one
-//!   further on, or one only the Homeserver shows, is adopted as any other signer's, and the
-//!   key stays. Answers that decide nothing, such as a refusal of the caller, a rate limit or
-//!   a copy that doesn't verify, delete nothing.
+//! - **It takes effect.** The new signer delivers the version handed over plus 1, naming its
+//!   own install, and once it has won stores the key, writes its backup, then publishes. The
+//!   old signer deletes the key, then its records, only on proof that another install holds
+//!   the identity:
+//!   - the switch's copy, from `GET /apps` or a `409 stale_identity` answering its abort or
+//!     take-back, is newer than the version handed over, verifies, names another install, and
+//!     is neither its abort nor its take-back;
+//!   - the signer backup on the Homeserver opens with the identity's backup key, verifies, and
+//!     holds a newer version naming that same install.
+//!
+//!   Only a holder of the key makes that backup, and the new signer writes it only once its
+//!   key is stored, so neither the switch nor the Homeserver, alone or together, can make
+//!   both installs delete the key. The deletion is committed first, so a crash between the
+//!   key and the records leaves marked records, which the next open deletes and a new set-up
+//!   replaces. A newer copy without the proof stops this install as one that isn't named
+//!   ([`crate::Refusal::SuccessorUnproven`]): it keeps the key and the hand-over, and looks
+//!   again at each run. Answers that decide nothing delete nothing.
 //! - **It is aborted.** Only while the switch still holds the version handed over, the old
 //!   signer signs it again, at its version plus 2 so it never shares a version with the new
-//!   signer's, built on the same hash, and delivers it. Once it has won, the hand-over is over and the backup is written, as after a
-//!   restore (Switch wire 3.13 "When it is written").
+//!   signer's first one, built on the same hash, and delivers it. Once it has won, it writes
+//!   its backup and publishes, as after a restore (Switch wire 3.13 "When it is written").
+//! - **It is taken back.** When the switch shows another install's version just after the
+//!   one handed over and no proof follows, the new signer lost before it stored the key or
+//!   wrote its backup, the user can have the old signer take the identity back
+//!   ([`Signer::take_back`]): that copy's content naming this install, built on it, above
+//!   every version it signed, its abort included. A new signer still alive that races it
+//!   finds itself not named and keeps its key.
 //!
-//! The version after the one handed over may come from a third install that restored the new
-//! signer's backup before the old signer looked: the switch's copy can't tell the two apart.
-//! The identity has another signer either way, so deleting is still right; the outcome names
-//! the install the copy names, not the target.
+//! The old signer's own abort or take-back at the switch means that delivery won, also when
+//! its answer was lost. The newer version may come from a third install that restored the new
+//! signer's backup: the copy can't tell them apart, so the outcome names the install the copy
+//! names.
 
 use pubky_switch_client::ClientError;
 use pubky_switch_client::client::answers::StoredHandover;
-use pubky_switch_core::records::{AppCert, IDENTITY_PATH, IdentityDoc, abort_body, succeeded};
-use pubky_switch_core::sig::SignedDoc;
+use pubky_switch_core::records::{AppCert, IdentityDoc, SIGNER_BACKUP_PATH, abort_body, succeeded};
 
 use super::revocation::UserConfirmed;
 use super::{Signer, gate};
 use crate::alert::Alert;
 use crate::error::{Refusal, Result, SignerError};
-use crate::state::{self, DeliverStep, Flow, HandOverSent, HandingOver};
+use crate::state::{self, DeliverStep, Flow, HandOverSent, HandingOver, TakeBack};
 
 /// What an abort of a hand-over came to (Switch wire 3.12).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -105,8 +112,14 @@ impl Signer {
             });
         }
         let cert_hash = doc.listed_cert(&to_app).ok_or(Refusal::NotListed)?;
+        let now = self.env.clock.now_ms();
+        // Current in spec 3.4's sense, and served: its certificate hasn't expired.
         let target_current = self.service_client()?.apps().await?.apps.iter().any(|s| {
-            s.app_id == to_app && s.current && s.revoked_at.is_none() && s.departed_at.is_none()
+            s.app_id == to_app
+                && s.current
+                && s.revoked_at.is_none()
+                && s.departed_at.is_none()
+                && s.cert_expires_at.is_none_or(|at| at > now)
         });
         let revoking = self.state.revoking.iter().any(|r| r.app_id == to_app);
         if !target_current || revoking || self.state.tombstones.contains(&to_app) {
@@ -142,6 +155,7 @@ impl Signer {
             handover,
             sent: HandOverSent::Pending,
             abort: None,
+            take_back: None,
         });
         self.commit(state, None).await?;
         self.send_hand_over().await
@@ -268,49 +282,190 @@ impl Signer {
         answer.map(drop).map_err(SignerError::from)
     }
 
-    /// Whether `copy`, from the switch, shows that the hand-over in progress took effect: it
-    /// is at the version handed over plus 1 and the same generation, names another install,
-    /// and isn't this install's abort (Switch wire 3.12; the core's `succeeded`). The switch
-    /// took it with its compare-and-swap on the version handed over, so it builds on it.
-    pub(super) fn hand_over_took_effect(&self, copy: &IdentityDoc) -> bool {
+    /// Whether `copy`, from the switch and verified, is another install's version past the
+    /// one handed over: newer than it, at no lower generation, naming another install, and
+    /// neither this install's abort nor its take-back, documents compared whole (Switch wire
+    /// 3.12). Alone it proves nothing; [`Signer::succeeded`] looks for the backup too.
+    pub(super) fn succeeded_by(&self, copy: &IdentityDoc) -> bool {
         let Some(handing) = &self.state.handing_over else {
             return false;
         };
         let Ok(handed) = IdentityDoc::verify(&handing.doc, &self.state.identity) else {
             return false;
         };
-        let delivered: Vec<[u8; 32]> = handing.abort.into_iter().collect();
-        copy.version() == handed.version().saturating_add(1)
-            && copy.generation() == handed.generation()
+        let own: Vec<[u8; 32]> = handing
+            .abort
+            .into_iter()
+            .chain(
+                handing
+                    .take_back
+                    .as_ref()
+                    .and_then(|t| t.doc.doc_hash().ok()),
+            )
+            .collect();
+        copy.generation() >= handed.generation()
             && copy.body().signer != self.state.install
-            && succeeded(&handed, &delivered, copy.version(), &copy.hash())
+            && succeeded(&handed, &own, copy.version(), &copy.hash())
     }
 
-    /// The switch's `copy` shows the hand-over took effect. The key goes only once the
-    /// Homeserver publishes that version, or a later one of the same install: the new signer
-    /// publishes only once its delivery has won, so a switch that shows each side the other's
-    /// version can't make both delete the key. Until then this install keeps the key and the
-    /// hand-over, and signs nothing ([`Refusal::SuccessorUnpublished`]).
+    /// Whether `copy`, from the switch, is this install's own abort or take-back: that
+    /// delivery won, its answer lost (Switch wire 3.12).
+    pub(super) fn own_hand_over_delivery(&self, copy: &IdentityDoc) -> Option<[u8; 32]> {
+        let handing = self.state.handing_over.as_ref()?;
+        if handing.abort == Some(copy.hash()) {
+            return IdentityDoc::verify(&handing.doc, &self.state.identity)
+                .ok()
+                .map(|handed| handed.hash());
+        }
+        handing
+            .take_back
+            .as_ref()
+            .filter(|t| &t.doc == copy.signed())
+            .map(|t| t.prev)
+    }
+
+    /// The switch's `copy` names another install past the version handed over. The key goes
+    /// only on proof that it holds the identity: the signer backup on the Homeserver opens
+    /// with the identity's backup key, verifies, and holds a newer version than the one handed
+    /// over naming that same install (Switch wire 3.12). Only a holder of the key makes that
+    /// backup, and the new signer writes it only once its key is stored, so neither the switch
+    /// nor the Homeserver can make both installs delete the key. Until then this install signs
+    /// nothing, as one that isn't named, keeps the key and the hand-over, and looks again at
+    /// each run ([`Refusal::SuccessorUnproven`]).
     pub(super) async fn succeeded(&mut self, copy: &IdentityDoc) -> Result<()> {
         let install = copy.body().signer;
-        let published = self
+        if self.successor_backed_up(install).await? {
+            return self.handed_over(install).await;
+        }
+        let alert = Alert::ManagedByOtherInstall { install };
+        if !self.state.alerts.contains(&alert) {
+            let mut state = self.state.clone();
+            state.alert(alert);
+            self.commit(state, self.flow.clone()).await?;
+        }
+        Err(Refusal::SuccessorUnproven { install }.into())
+    }
+
+    /// Whether the signer backup on the Homeserver proves `install` holds the identity: it
+    /// opens with the identity's backup key, verifies, and holds a newer version than the
+    /// one handed over naming `install`.
+    async fn successor_backed_up(&self, install: [u8; 16]) -> Result<bool> {
+        let Some(handing) = &self.state.handing_over else {
+            return Ok(false);
+        };
+        let handed = IdentityDoc::verify(&handing.doc, &self.state.identity)?;
+        let Some(bytes) = self
             .env
             .homeserver
-            .get(IDENTITY_PATH)
+            .get(SIGNER_BACKUP_PATH)
             .await
             .map_err(SignerError::Homeserver)?
-            .and_then(|bytes| serde_json::from_slice::<SignedDoc>(&bytes).ok())
-            .and_then(|signed| IdentityDoc::verify(&signed, &self.state.identity).ok())
-            .is_some_and(|held| {
-                held.signed() == copy.signed()
-                    || (held.body().signer == install
-                        && held.generation() == copy.generation()
-                        && held.version() > copy.version())
-            });
-        if !published {
-            return Err(Refusal::SuccessorUnpublished { install }.into());
+        else {
+            return Ok(false);
+        };
+        Ok(self.open_backup(&bytes)?.is_some_and(|found| {
+            found.identity_doc.version() > handed.version()
+                && found.identity_doc.body().signer == install
+        }))
+    }
+
+    /// Take the identity back from a new signer that is lost, on the user's confirmation
+    /// (Switch wire 3.12, spec 12.8): when the switch's copy, verified, is at the version
+    /// handed over plus 1 and names another install, and no proof follows. It delivers that
+    /// copy's content naming this install, built on it, at a version above that copy's and
+    /// above every version this install signed, its abort included; once it has won, it
+    /// writes its backup and publishes, and this install is the signer again. Sent again, the
+    /// same bytes, after a lost answer. Returns that version.
+    ///
+    /// A new signer still alive that races it finds itself not named and stops, keeping its
+    /// key; [`Alert::TakenBack`] tells the user both installs then hold it.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::NothingToTakeBack`] when there is nothing to take back;
+    /// [`SignerError::HandedOver`] when the proof is there after all, and the key is deleted;
+    /// otherwise as [`Signer::resume`], the take-back kept and sent again.
+    pub async fn take_back(&mut self, _confirmed: UserConfirmed) -> Result<IdentityDoc> {
+        self.refresh().await?;
+        self.check_named()?;
+        let Some(handing) = self.state.handing_over.clone() else {
+            return Err(Refusal::NothingToTakeBack.into());
+        };
+        if handing.take_back.is_none() || self.flow.is_none() {
+            let handed = IdentityDoc::verify(&handing.doc, &self.state.identity)?;
+            let held = self.service_client()?.apps().await?.identity;
+            let copy = held
+                .map(|signed| IdentityDoc::verify(&signed, &self.state.identity))
+                .transpose()?
+                .ok_or(Refusal::NothingToTakeBack)?;
+            let open = copy.version() == handed.version().saturating_add(1)
+                && copy.generation() == handed.generation()
+                && copy.body().signer != self.state.install
+                && handing.abort != Some(copy.hash());
+            if !open {
+                return Err(Refusal::NothingToTakeBack.into());
+            }
+            let from = copy.body().signer;
+            if self.successor_backed_up(from).await? {
+                self.handed_over(from).await?;
+            }
+            let take_back = match handing.take_back.clone().filter(|t| t.prev == copy.hash()) {
+                // Signed already: the same bytes again.
+                Some(take_back) => take_back,
+                None => {
+                    let mut body = copy.body().clone();
+                    body.version = copy
+                        .version()
+                        .max(self.state.signed_through)
+                        .checked_add(1)
+                        .ok_or_else(|| {
+                            SignerError::Records("the version can't go higher".into())
+                        })?;
+                    body.signer = self.state.install;
+                    let doc = {
+                        let key = gate::hand_over_key(&self.keyring, &self.state)?;
+                        IdentityDoc::sign(&key, body)?
+                    };
+                    TakeBack {
+                        doc: doc.signed().clone(),
+                        prev: copy.hash(),
+                        from,
+                    }
+                }
+            };
+            let version = IdentityDoc::verify(&take_back.doc, &self.state.identity)?.version();
+            let mut state = self.state.clone();
+            state.signed_through = state.signed_through.max(version);
+            // It races the new signer, so its backup is written once it has won (Switch wire
+            // 3.13 "When it is written").
+            state.backup_owed = true;
+            let flow = Flow::Deliver {
+                doc: take_back.doc.clone(),
+                prev: Some(take_back.prev),
+                backup: None,
+                step: DeliverStep::BackupWritten,
+            };
+            if let Some(held) = state.handing_over.as_mut() {
+                held.take_back = Some(take_back);
+            }
+            self.commit(state, Some(flow)).await?;
         }
-        self.handed_over(install).await
+        let signed = self
+            .state
+            .handing_over
+            .as_ref()
+            .and_then(|h| h.take_back.as_ref())
+            .map(|t| t.doc.clone());
+        let result = self.resume().await;
+        let won = signed
+            .as_ref()
+            .filter(|_| self.state.handing_over.is_none())
+            .filter(|doc| self.state.newest.as_ref().is_some_and(|n| &n.doc == *doc));
+        match (won, result) {
+            (Some(doc), _) => Ok(IdentityDoc::verify(doc, &self.state.identity)?),
+            (None, Err(error)) => Err(error),
+            (None, Ok(())) => Err(Refusal::NothingToTakeBack.into()),
+        }
     }
 
     /// The hand-over took effect, naming `install`: commit that, then delete the identity

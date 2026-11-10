@@ -18,18 +18,25 @@
 //! ([`Signer::resume_take_over`]). Its first delivery is the version handed over plus 1, naming
 //! this install, built on it, signed once and sent again with the same bytes:
 //!
-//! - **It won**, a `2xx`, or a `409 stale_identity` whose copy is that delivery itself, as
-//!   after a lost answer. The secret goes into the vault, is read back and checked, and only
-//!   then is the flow, with the hand-over, dropped. A vault that fails keeps the flow with
+//! - **It won**, a `2xx`, or a `409 stale_identity` whose copy is that delivery itself, or a
+//!   later version naming this install, as after a lost answer or a resend of stale bytes.
+//!   The secret goes into the vault, is read back and checked, and only then is the flow,
+//!   with the hand-over, dropped. A vault that fails keeps the flow with
 //!   [`crate::Alert::KeyNotInstalled`], and nothing is sent again. The backup is written next,
-//!   then the version published (Switch wire 3.13 "When it is written").
+//!   and the version is published only once it is: the old signer's deletion relies on that
+//!   order (Switch wire 3.12). Once it has won, nothing cancels the take-over.
 //! - **It lost**, a `409 stale_identity` whose copy verifies for the identity, is at or above
-//!   the delivery's version, and isn't the delivery: an abort, or another signer, got ahead.
-//!   The records and the flow are deleted, and the secret, never in the vault, goes with the
-//!   keyring.
+//!   the delivery's version, and names another install: an abort, or another signer, got
+//!   ahead. The records and the flow are deleted, and the secret, never in the vault, goes
+//!   with the keyring.
 //! - Anything else decides nothing and deletes nothing: a refusal of the caller, a rate limit,
 //!   a server error, or a `409` whose copy is missing, older or doesn't verify. The delivery
-//!   is sent again.
+//!   is sent again. A refusal for good, a `400`, a `403` or a `409 conflict`, also raises
+//!   [`crate::Alert::TakeOverRefused`]; the old signer's abort is the way out.
+//!
+//! A refusal or a cancellation deletes only what that hand-over brought, never a key the
+//! install held before: an install that signs for the identity refuses another take-over
+//! (`AlreadySetUp`), and a vault already holding the key keeps it.
 //!
 //! It takes the records as a restore does: the tombstones those of the hand-over, its
 //! `identity_doc`'s `removed` and the switch's revoked or departed apps; the epoch floor; and
@@ -81,7 +88,8 @@ impl std::fmt::Debug for ReceivingApp {
 enum Answer409 {
     /// The copy is the delivery itself: it won, and the answer was lost.
     Won,
-    /// A verified copy at or above the delivery's version that isn't it: the take-over lost.
+    /// A verified copy at or above the delivery's version naming another install: the
+    /// take-over lost.
     Lost {
         /// The signer ID the copy names.
         install: [u8; 16],
@@ -336,7 +344,20 @@ impl Signer {
                         ));
                     }
                 },
-                Err(error) => return Err(error.into()),
+                Err(error) => {
+                    // A refusal for good decides nothing either; the user is told.
+                    if let ClientError::Switch {
+                        status: 400 | 403 | 409,
+                        ..
+                    } = &error
+                        && !self.state.alerts.contains(&Alert::TakeOverRefused)
+                    {
+                        let mut state = self.state.clone();
+                        state.alert(Alert::TakeOverRefused);
+                        self.commit(state, self.flow.clone()).await?;
+                    }
+                    return Err(error.into());
+                }
             }
             let mut flow = self.flow.clone();
             if let Some(Flow::TakingOver {
@@ -365,8 +386,11 @@ impl Signer {
             delivered_at,
         });
         state.switch_unconfirmed = false;
-        // It raced the old signer, so its backup is written now it has won (Switch wire 3.13).
+        // It raced the old signer, so its backup is written now it has won (Switch wire 3.13),
+        // and the version is published only once it is (Switch wire 3.12).
         state.backup_owed = true;
+        state.publish_after_backup = true;
+        state.alerts.retain(|a| *a != Alert::TakeOverRefused);
         self.commit(state, None).await
     }
 
@@ -384,12 +408,17 @@ impl Signer {
         }
         let own_version =
             IdentityDoc::verify(own, &self.state.identity).map_or(u64::MAX, |doc| doc.version());
-        if copy.version() >= own_version {
-            return Answer409::Lost {
-                install: copy.body().signer,
-            };
+        if copy.version() < own_version {
+            return Answer409::Unsure;
         }
-        Answer409::Unsure
+        // At or above the delivery's version: another install's got ahead; this install's own
+        // means its delivery won earlier and it signed on, as after a resend of stale bytes.
+        if copy.body().signer == self.state.install {
+            return Answer409::Won;
+        }
+        Answer409::Lost {
+            install: copy.body().signer,
+        }
     }
 
     /// The take-over lost to `install`'s version: delete the records and the flow, with the

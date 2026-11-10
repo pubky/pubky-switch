@@ -66,6 +66,18 @@ impl ScriptedSwitch {
             .unwrap_or_default()
     }
 
+    /// The hand-over the switch holds, its target and its `PUT` body, as a test keeps it to
+    /// store again ([`ScriptedSwitch::store_handover_again`]).
+    pub fn stored_handover_body(&self) -> Option<([u8; 16], Value)> {
+        self.lock().handover.clone()
+    }
+
+    /// A switch that stores, or serves again, a hand-over it dropped: as a lost answer's
+    /// resend would, or a faulty switch (Switch wire 7.4.17).
+    pub fn store_handover_again(&self, held: ([u8; 16], Value)) {
+        self.lock().handover = Some(held);
+    }
+
     /// The target of the hand-over the switch holds, if any (Switch wire 7.4.17).
     pub fn stored_handover(&self) -> Option<[u8; 16]> {
         self.lock().stored_handover()

@@ -378,6 +378,7 @@ impl Signer {
         }
         if written {
             state.backup_owed = false;
+            state.publish_after_backup = false;
             state.alerts.retain(|a| *a != Alert::BackupNotWritten);
         } else {
             state.alert(Alert::BackupNotWritten);

@@ -280,7 +280,13 @@ impl Signer {
             // While a hand-over is in progress nothing routine is signed: its own step only,
             // and owed work stays owed (Switch wire 3.12).
             if self.state.handing_over.is_some() {
-                return self.continue_hand_over().await;
+                self.continue_hand_over().await?;
+                // Still handing over: nothing more this run. Over, as when its own abort or
+                // take-back is found to have won: the run goes on.
+                if self.state.handing_over.is_some() {
+                    return Ok(());
+                }
+                continue;
             }
             // A closing delivery a reduction owes comes before anything else, publication
             // included: it cuts the earlier certificate off at the switch, and a Homeserver
@@ -1008,12 +1014,17 @@ impl Signer {
             }
         }
         if let Ok(delivered) = &verified
-            && state
-                .handing_over
-                .as_ref()
-                .is_some_and(|h| h.abort == Some(delivered.hash()))
+            && let Some(handing) = state.handing_over.clone()
         {
-            state.handing_over = None;
+            // The abort or the take-back won: the hand-over is over (Switch wire 3.12).
+            if handing.abort == Some(delivered.hash()) {
+                state.handing_over = None;
+            } else if let Some(take_back) = handing.take_back.filter(|t| t.doc == doc) {
+                state.handing_over = None;
+                state.alert(Alert::TakenBack {
+                    from: take_back.from,
+                });
+            }
         }
         let published = state
             .newest
@@ -1116,15 +1127,29 @@ impl Signer {
     /// adopted nor signed over, and this install stops until a restore from the signer
     /// backup.
     ///
-    /// While a hand-over is in progress, the switch's copy of the version after the one
-    /// handed over, naming another install, means it took effect: the key and the records are
-    /// deleted ([`Signer::hand_over_took_effect`]). Any other newer copy is adopted, and the
-    /// key stays.
+    /// While a hand-over is in progress (Switch wire 3.12), the switch's copy of this
+    /// install's own abort or take-back means that delivery won. Another install's newer
+    /// version from the switch is the proof that it took the identity only with that install's
+    /// backup on the Homeserver ([`Signer::succeeded`]); then the key and the records are
+    /// deleted. Any other newer copy stops this install as one that isn't named, keeping the
+    /// key and the hand-over, which it looks at again at each run.
     async fn adopt(&mut self, copy: IdentityDoc, source: Source) -> Result<()> {
         let version = copy.version();
         let signer = copy.body().signer;
-        if source == Source::Switch && self.hand_over_took_effect(&copy) {
-            return self.succeeded(&copy).await;
+        if self.state.handing_over.is_some() {
+            if source == Source::Switch {
+                if let Some(prev) = self.own_hand_over_delivery(&copy) {
+                    return self
+                        .delivered(copy.signed().clone(), Some(prev), None)
+                        .await;
+                }
+                if self.succeeded_by(&copy) {
+                    return self.succeeded(&copy).await;
+                }
+            }
+            if signer != self.state.install {
+                return Err(Refusal::SuccessorUnproven { install: signer }.into());
+            }
         }
         if signer == self.state.install {
             return self.records_behind(source, version).await;
@@ -1189,6 +1214,10 @@ impl Signer {
             return Ok(());
         };
         if newest.published || self.state.managed_by.is_some() {
+            return Ok(());
+        }
+        // A take-over's first version waits for its backup (Switch wire 3.12).
+        if self.state.publish_after_backup && self.state.backup_owed {
             return Ok(());
         }
         // A publication may come after a crash, once another install has signed and published

@@ -176,6 +176,7 @@ mod tests {
             ),
             sent: crate::state::HandOverSent::Stored,
             abort: None,
+            take_back: None,
         }
     }
 
