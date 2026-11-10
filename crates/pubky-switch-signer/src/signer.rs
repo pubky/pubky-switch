@@ -310,6 +310,22 @@ impl Signer {
         &self.state.alerts
     }
 
+    /// Clear `alert`, once the user has seen it and dealt with it. A rollback or equivocation
+    /// alert holds back every approval's claim until it is cleared.
+    ///
+    /// # Errors
+    ///
+    /// The store's error.
+    pub async fn clear_alert(&mut self, alert: &Alert) -> Result<()> {
+        self.refresh().await?;
+        if !self.state.alerts.contains(alert) {
+            return Ok(());
+        }
+        let mut state = self.state.clone();
+        state.alerts.retain(|held| held != alert);
+        self.commit(state, self.flow.clone()).await
+    }
+
     /// Set the record age limit, in seconds, or clear it for the 90-day default (Switch spec
     /// 4.3), in a new version. Returns that version once it is delivered and published.
     ///
@@ -400,7 +416,15 @@ impl Signer {
     /// Commit `state` and `flow`, and only then take them as the signer's own, so the signer
     /// never acts on anything the store doesn't hold. A commit the store can't tell about
     /// makes the signer read the store again before its next step.
-    pub(crate) async fn commit(&mut self, state: SignerState, flow: Option<Flow>) -> Result<()> {
+    pub(crate) async fn commit(
+        &mut self,
+        mut state: SignerState,
+        flow: Option<Flow>,
+    ) -> Result<()> {
+        if flow.is_none() {
+            // A flow that ended without its version delivered leaves no certificate or claim.
+            state.prune_unreferenced();
+        }
         match state::save(&self.env.store, &state, flow.as_ref()).await {
             Ok(()) => {
                 self.state = state;

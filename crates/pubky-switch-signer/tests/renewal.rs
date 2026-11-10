@@ -115,10 +115,10 @@ async fn test_renewal_cooperative_closes_once_the_apps_record_carries_the_new_ce
 async fn test_renewal_a_reduction_closes_at_once() {
     let world = World::new();
     let (mut signer, _) = world.enrolled().await;
-    let app = App::new(&["notes", "tags"], None, [9; 32]);
+    let app = App::new(&["notes", "notes_tags"], None, [9; 32]);
     world.approve(&mut signer, &app).await;
     let id = app.keys.app_id_bytes();
-    // Removing `tags`, a scope without keys, is a reduction that rotates nothing.
+    // Removing `notes_tags`, a scope without keys, is a reduction that rotates nothing.
     let renewing = signer
         .renew(
             id,
@@ -151,7 +151,7 @@ async fn test_renewal_removing_a_keyed_scope_rotates_the_data_epoch() {
     let (mut signer, _) = world.enrolled().await;
     let reduced = App::with_keys(
         AppKeys::from_secrets([3; 32], [4; 32]),
-        &["notes", "tags"],
+        &["notes", "notes_tags"],
         None,
         [9; 32],
     );
@@ -168,7 +168,7 @@ async fn test_renewal_removing_a_keyed_scope_rotates_the_data_epoch() {
         .renew(
             id,
             CertChange {
-                scopes: scopes(&["tags"]),
+                scopes: scopes(&["notes_tags"]),
                 expires_at: None,
             },
         )
@@ -246,7 +246,7 @@ async fn test_renewal_a_reductions_closing_survives_a_crash_at_every_commit() {
             .await
             .unwrap();
             signer.resume().await.unwrap();
-            let app = App::new(&["notes", "tags"], None, [9; 32]);
+            let app = App::new(&["notes", "notes_tags"], None, [9; 32]);
             world.approve(&mut signer, &app).await;
             let id = app.keys.app_id_bytes();
             let faulty: Arc<dyn StateStore> = Arc::new(FaultStore::new(memory.clone(), fault));

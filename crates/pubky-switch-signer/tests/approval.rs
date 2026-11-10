@@ -24,7 +24,7 @@ fn refusal(error: SignerError) -> Refusal {
 async fn test_approval_lists_the_app_and_the_app_reads_its_claim() {
     let world = World::new();
     let (mut signer, _) = world.enrolled().await;
-    let app = App::new(&["notes", "tags"], None, [9; 32]);
+    let app = App::new(&["notes", "notes_tags"], None, [9; 32]);
     let review = signer.review(&app.request, &app.auth).unwrap();
     assert_eq!(review.app_id, app.keys.app_id_bytes());
     // The permissions are the protocol's table for the scopes, in the fixed order.
@@ -65,7 +65,7 @@ async fn test_approval_lists_the_app_and_the_app_reads_its_claim() {
     )
     .unwrap();
     assert_eq!(read.cert.hash(), cert_hash);
-    assert_eq!(read.cert.scopes(), ["notes", "tags"]);
+    assert_eq!(read.cert.scopes(), ["notes", "notes_tags"]);
     assert_eq!(
         read.cert.permissions(),
         [Permission::ClaimsRead, Permission::ListsRead]
@@ -76,7 +76,7 @@ async fn test_approval_lists_the_app_and_the_app_reads_its_claim() {
         read.keys.get(1, "notes"),
         Some(world.key.scope_key(1, "notes"))
     );
-    assert_eq!(read.keys.get(1, "tags"), None);
+    assert_eq!(read.keys.get(1, "notes_tags"), None);
 
     // The host reports it delivered: the claim is dropped.
     assert!(signer.approved(&approved.request).unwrap().is_some());
@@ -120,8 +120,6 @@ async fn test_review_refuses_capabilities_that_arent_the_apps_own() {
     for caps in [
         // A path the app's protocols don't add for its scopes.
         format!("{record},{TAGS_PATH}:rw"),
-        // A grant that covers identity.json.
-        format!("{record},/pub/pubky-switch/:rw"),
         // No record path.
         format!("{TAGS_PATH}:rw"),
     ] {
@@ -196,4 +194,172 @@ async fn test_approval_claim_of_a_refused_delivery_is_never_released() {
     let error = signer.approve(review).await.unwrap_err();
     assert!(matches!(error, SignerError::Alarm(_)), "{error:?}");
     assert!(signer.approved(&request).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn test_review_refuses_a_grant_that_covers_identity_json() {
+    // Only the covers check refuses this: the reason names it (Switch wire 3.9 step 3).
+    let world = World::new();
+    let (signer, _) = world.enrolled().await;
+    let record = format!(
+        "{}:rw",
+        app_record_path(&AppKeys::from_secrets([3; 32], [4; 32]).app_id_bytes())
+    );
+    for covering in [
+        "/pub/pubky-switch/",
+        "/pub/",
+        "/pub/pubky-switch/v1/signer-backup.json",
+    ] {
+        let app = App::new(&["notes"], Some(format!("{record},{covering}:rw")), [9; 32]);
+        let error = signer.review(&app.request, &app.auth).unwrap_err();
+        assert!(
+            matches!(refusal(error), Refusal::AppRequest(ref why) if why.contains("covers")),
+            "{covering}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_review_refuses_an_app_id_the_newest_version_lists_as_removed() {
+    // Wire 3.9 step 4. The revocations PR writes the signer's own tombstones; here the
+    // newest version, adopted from the switch, lists the app in `removed`.
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let app = App::new(&["notes"], None, [9; 32]);
+    let newest = signer.identity_doc().unwrap().unwrap();
+    let mut body = newest.body().clone();
+    body.version += 1;
+    body.removed.push(pubky_switch_core::records::RemovedApp {
+        app_id: app.keys.app_id_bytes(),
+        distrust_from: START_MS,
+    });
+    let removing = pubky_switch_core::records::IdentityDoc::sign(&world.key, body).unwrap();
+    world.switch.deliver_identity(&removing).unwrap();
+    let error = signer.set_record_max_age(Some(86_400)).await.unwrap_err();
+    assert!(
+        matches!(error, SignerError::Refused(Refusal::Superseded { .. })),
+        "{error:?}"
+    );
+    let error = signer.review(&app.request, &app.auth).unwrap_err();
+    assert!(matches!(refusal(error), Refusal::AppRequest(ref why) if why.contains("step 4")),);
+}
+
+#[tokio::test]
+async fn test_review_refuses_an_app_past_the_app_limit() {
+    // Wire 3.9 step 6, at the limit the switch announced at enrollment.
+    let world = World::new();
+    world
+        .switch
+        .set_enroll_limits(pubky_switch_core::records::Limits {
+            app_limit: 1,
+            ..Default::default()
+        });
+    let (mut signer, _) = world.enrolled().await;
+    let first = App::new(&["notes"], None, [9; 32]);
+    let review = signer.review(&first.request, &first.auth).unwrap();
+    signer.approve(review).await.unwrap();
+    let second = App::with_keys(
+        AppKeys::from_secrets([5; 32], [6; 32]),
+        &["notes"],
+        None,
+        [10; 32],
+    );
+    let error = signer.review(&second.request, &second.auth).unwrap_err();
+    assert!(matches!(refusal(error), Refusal::AppRequest(ref why) if why.contains("step 6")),);
+}
+
+#[tokio::test]
+async fn test_approval_claim_waits_for_the_publish_and_for_alarms() {
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let first = signer.identity_doc().unwrap().unwrap();
+    let app = App::new(&["notes"], None, [9; 32]);
+    let review = signer.review(&app.request, &app.auth).unwrap();
+    let request = review.request_hash();
+    // Delivered, but the publish fails: no claim yet (Switch wire 3.9).
+    *world.homeserver.failing_path.lock().unwrap() =
+        Some(pubky_switch_core::records::IDENTITY_PATH.into());
+    let error = signer.approve(review).await.unwrap_err();
+    assert!(matches!(error, SignerError::Homeserver(_)), "{error:?}");
+    assert_eq!(world.switch.identity_doc().unwrap().version(), 2);
+    assert!(signer.approved(&request).unwrap().is_none());
+    *world.homeserver.failing_path.lock().unwrap() = None;
+    signer.resume().await.unwrap();
+    assert!(signer.approved(&request).unwrap().is_some());
+    // The switch rolls back: the alarm holds the claim back until the user clears it.
+    world.switch.deliver_identity(&first).unwrap();
+    let error = signer.set_record_max_age(Some(86_400)).await.unwrap_err();
+    let SignerError::Alarm(alert) = error else {
+        panic!("{error:?}")
+    };
+    assert!(signer.approved(&request).unwrap().is_none());
+    signer.clear_alert(&alert).await.unwrap();
+    assert!(signer.approved(&request).unwrap().is_some());
+}
+
+#[tokio::test]
+async fn test_approval_claim_is_held_while_another_install_signs() {
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let app = App::new(&["notes"], None, [9; 32]);
+    let review = signer.review(&app.request, &app.auth).unwrap();
+    let approved = signer.approve(review).await.unwrap();
+    let newest = signer.identity_doc().unwrap().unwrap();
+    world
+        .switch
+        .deliver_identity(&world.other_install_version(&newest, [7; 16]))
+        .unwrap();
+    signer.set_record_max_age(Some(86_400)).await.unwrap_err();
+    assert!(signer.approved(&approved.request).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn test_approval_a_refused_delivery_leaves_no_certificate() {
+    use pubky_switch_client::testing::Fault as SwitchFault;
+    use pubky_switch_core::http::ErrorCode;
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let app = App::new(&["notes"], None, [9; 32]);
+    world.switch.fail_next(SwitchFault::Error {
+        path: "/identity".into(),
+        code: ErrorCode::BadRequest,
+        current: serde_json::Value::Null,
+    });
+    let review = signer.review(&app.request, &app.auth).unwrap();
+    signer.approve(review).await.unwrap_err();
+    assert!(signer.certificates().unwrap().is_empty());
+    // Approving the same request again holds one certificate for the App ID.
+    let review = signer.review(&app.request, &app.auth).unwrap();
+    signer.approve(review).await.unwrap();
+    let id = app.keys.app_id_bytes();
+    let held = signer.certificates().unwrap();
+    assert_eq!(held.iter().filter(|c| c.app_id() == id).count(), 1);
+}
+
+#[tokio::test]
+async fn test_approval_a_reopened_signer_releases_the_same_claim_bytes() {
+    let world = World::new();
+    let (mut signer, store) = world.enrolled().await;
+    let app = App::new(&["notes"], None, [9; 32]);
+    let review = signer.review(&app.request, &app.auth).unwrap();
+    let request = review.request_hash();
+    *world.homeserver.failing_path.lock().unwrap() =
+        Some(pubky_switch_core::records::IDENTITY_PATH.into());
+    signer.approve(review).await.unwrap_err();
+    drop(signer);
+    *world.homeserver.failing_path.lock().unwrap() = None;
+    let mut reopened = pubky_switch_signer::Signer::open(world.env(store.clone()), world.keyring())
+        .await
+        .unwrap();
+    reopened.resume().await.unwrap();
+    let first = reopened.approved(&request).unwrap().unwrap();
+    let again = pubky_switch_signer::Signer::open(world.env(store), world.keyring())
+        .await
+        .unwrap();
+    let second = again.approved(&request).unwrap().unwrap();
+    assert_eq!(first.claim, second.claim);
+    ApprovalClaim::from_plaintext(&first.claim)
+        .unwrap()
+        .verify(&world.key.public(), &app.auth)
+        .unwrap();
 }

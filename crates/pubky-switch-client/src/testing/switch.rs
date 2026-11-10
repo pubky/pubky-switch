@@ -230,6 +230,8 @@ pub(crate) struct Inner {
     /// The transition proof of the newest `identity.json` delivery, which a retry gets again
     /// (Switch wire 7.4.2).
     pub(crate) delivery_proof: Option<SignedDoc>,
+    /// The limits an enrollment announces.
+    pub(crate) enroll_limits: pubky_switch_core::records::Limits,
 }
 
 impl Inner {
@@ -279,6 +281,7 @@ impl Inner {
             enrolled: Some(signer::Enrolled::default()),
             kept_app_ids: Vec::new(),
             delivery_proof: None,
+            enroll_limits: pubky_switch_core::records::Limits::default(),
         }
     }
 }
