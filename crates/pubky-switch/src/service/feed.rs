@@ -280,6 +280,31 @@ fn item_json(row: &FeedRow, shown: Shown) -> Vec<u8> {
     out
 }
 
+/// An inbox entry's feed item (Switch wire 7.5), in the member order of the wire's example
+/// (7.4.4): `type, seq, entry_id, sender, cert, accepted_at`, the invite code's `context` as
+/// stored when one admitted the sender, then `envelope`.
+fn entry_json(entry: &crate::store::StoredEntry) -> Vec<u8> {
+    let mut out = b"{\"type\":\"entry\",\"seq\":".to_vec();
+    out.extend_from_slice(entry.seq.to_string().as_bytes());
+    out.extend_from_slice(b",\"entry_id\":\"");
+    out.extend_from_slice(pubky_switch_core::enc::b64(&entry.entry_id).as_bytes());
+    out.extend_from_slice(b"\",\"sender\":\"");
+    out.extend_from_slice(pubky_switch_core::enc::pubky_id(&entry.sender).as_bytes());
+    out.extend_from_slice(b"\",\"cert\":");
+    out.extend_from_slice(&doc_json(&entry.cert));
+    out.extend_from_slice(b",\"accepted_at\":\"");
+    out.extend_from_slice(pubky_switch_core::time::rfc3339(entry.accepted_at_ms).as_bytes());
+    out.push(b'"');
+    if let Some(context) = &entry.context {
+        out.extend_from_slice(b",\"context\":");
+        out.extend_from_slice(context);
+    }
+    out.extend_from_slice(b",\"envelope\":\"");
+    out.extend_from_slice(pubky_switch_core::enc::b64(&entry.envelope).as_bytes());
+    out.extend_from_slice(b"\"}");
+    out
+}
+
 /// A signed document's carrying form, `{"body","sig"}` (Switch wire 2.2).
 fn doc_json(doc: &pubky_switch_core::sig::SignedDoc) -> Vec<u8> {
     // Two strings: their serialization can't fail; the empty object stands in if it did.
@@ -424,6 +449,30 @@ impl PageBuilder {
 }
 
 impl PageReader for PageBuilder {
+    /// An entry shows to its target apps only, and to no other app at all: no stub, and
+    /// nothing counted against the page's limit or budget (Switch wire 7.5). It is never part
+    /// of a batch.
+    fn take_entry(&mut self, snapshot: &FeedSnapshot, entry: crate::store::StoredEntry) -> bool {
+        let Some(cert) = self.cert.as_ref() else {
+            return false;
+        };
+        if entry.seq > snapshot.window_end {
+            return false;
+        }
+        if !entry.targets.contains(&cert.app_id()) {
+            return true;
+        }
+        if !self.close_group() {
+            return false;
+        }
+        let item = entry_json(&entry);
+        self.group_bytes = self.group_bytes.saturating_add(item.len());
+        self.group.push(item);
+        self.group_batch = None;
+        self.group_last = entry.seq;
+        true
+    }
+
     /// Check the reader against the snapshot as a fresh request is checked (Switch wire 7.2):
     /// the account's key unchanged; the certificate it is checked against, with the key its
     /// request verified with; unexpired at the page's service time; not revoked or departed,

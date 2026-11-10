@@ -10,7 +10,8 @@
 //!
 //! Served so far: `POST /v1/enroll`, `PUT /v1/{id}/identity`, the public
 //! `GET /v1/{id}/identity`, `POST /v1/{id}/ops`, `GET /v1/{id}/feed`,
-//! `PUT /v1/{id}/peers`, `GET /v1/{id}/claims/{claim_key}`, `GET /v1/{id}/apps` and
+//! `POST /v1/{id}/inbox`, `PUT /v1/{id}/peers`, `GET /v1/{id}/claims/{claim_key}`,
+//! `GET /v1/{id}/apps` and
 //! `POST /v1/{id}/apps/{app_id}/revoke`. Every other call is answered `503 unavailable`.
 
 mod admission;
@@ -20,6 +21,7 @@ mod claims;
 mod enroll;
 mod feed;
 mod identity;
+mod inbox;
 mod peers;
 pub mod rules;
 
@@ -71,7 +73,23 @@ pub struct Service {
     control_rate: KeyedMinutes<(String, [u8; 16])>,
     invite_rate: KeyedMinutes<(String, [u8; 32])>,
     stranger_rate: KeyedMinutes<String>,
+    sender_rate: KeyedMinutes<(String, [u8; 32])>,
+    sender_app_rate: KeyedMinutes<(String, [u8; 16])>,
+    notify_rate: KeyedMinutes<(String, [u8; 32])>,
     changes: Arc<ChangeHub>,
+    /// Where entry IDs come from: random, opaque to senders (Switch wire 1.7).
+    entry_ids: EntryIds,
+}
+
+/// A source of entry IDs.
+type EntryIds = Arc<dyn Fn() -> [u8; 16] + Send + Sync>;
+
+/// A random entry ID; all zeros only if the system has no randomness, which the service's
+/// own keys would have failed on first.
+fn random_entry_id() -> [u8; 16] {
+    let mut id = [0u8; 16];
+    let _ = getrandom::fill(&mut id);
+    id
 }
 
 impl std::fmt::Debug for Service {
@@ -236,8 +254,20 @@ impl Service {
             control_rate: KeyedMinutes::default(),
             invite_rate: KeyedMinutes::default(),
             stranger_rate: KeyedMinutes::default(),
+            sender_rate: KeyedMinutes::default(),
+            sender_app_rate: KeyedMinutes::default(),
+            notify_rate: KeyedMinutes::default(),
             changes: ChangeHub::new(),
+            entry_ids: Arc::new(random_entry_id),
         }
+    }
+
+    /// The service with entry IDs from `ids`, for tests that replay the vectors' fixed ones.
+    #[cfg(any(test, feature = "test-util"))]
+    #[must_use]
+    pub fn with_entry_ids(mut self, ids: impl Fn() -> [u8; 16] + Send + Sync + 'static) -> Self {
+        self.entry_ids = Arc::new(ids);
+        self
     }
 
     /// The hub that wakes waiting feed reads. Run a [`crate::changes::ChangeListener`]
@@ -346,8 +376,8 @@ impl Service {
                     Err(error) => return refused_early(error).await,
                 }
             }
-            Call::Ops | Call::GetClaim(_) | Call::Feed | Call::PutPeers => {
-                let others = *call == Call::PutPeers;
+            Call::Ops | Call::GetClaim(_) | Call::Feed | Call::PutPeers | Call::Append => {
+                let others = matches!(call, Call::PutPeers | Call::Append);
                 match self.authenticate_caller(&account, &request, base_ms, others) {
                     Ok(claimed) => {
                         // An own app's request is verified here too, so nothing unverified
@@ -862,6 +892,46 @@ impl Service {
                         writer.as_ref(),
                         claim_key,
                         due,
+                        time_ms,
+                    )
+                    .await
+                    .map(|answer| (answer, serving))
+                    .map_err(|error| Refused::with_head(error, serving));
+            }
+            Call::Append => {
+                let appender = match (writer.as_ref(), other) {
+                    (Some(cert), _) => inbox::Appender::OwnApp(cert),
+                    (None, Some(cert)) => inbox::Appender::OtherApp(cert),
+                    (None, None) => {
+                        return Err(Refused::with_head(
+                            ApiError::new(
+                                ErrorCode::PermissionMissing,
+                                "7.4.3: apps append; the signer doesn't",
+                            ),
+                            serving,
+                        ));
+                    }
+                };
+                let query = request.route.query.as_ref().map_err(|_| {
+                    Refused::with_head(
+                        ApiError::bad_request("7.1: the query doesn't decode"),
+                        serving,
+                    )
+                })?;
+                let invite_code = request
+                    .headers
+                    .get(header::INVITE_CODE)
+                    .and_then(|value| value.to_str().ok());
+                return self
+                    .append(
+                        txn,
+                        signer,
+                        held.as_ref(),
+                        appender,
+                        &request.body,
+                        query,
+                        invite_code,
+                        due.is_some(),
                         time_ms,
                     )
                     .await

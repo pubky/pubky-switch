@@ -828,10 +828,16 @@ async fn save_apps(
     before: &OpsState,
     after: &OpsState,
 ) -> Result<(), StoreError> {
+    let mut cursor_moved = false;
     for (app_id, app) in &after.apps {
         if before.apps.get(app_id) != Some(app) {
             txn.put_app(&stored_app(*app_id, app)).await?;
+            cursor_moved |= before.apps.get(app_id).map(|held| held.cursor) != Some(app.cursor);
         }
+    }
+    // An entry every target has passed goes (Switch wire 9.1).
+    if cursor_moved {
+        txn.delete_passed_entries().await?;
     }
     for (app_id, key) in &after.new_receive_keys {
         txn.add_receive_key(app_id, key.n(), &key.kid(), key.signed())

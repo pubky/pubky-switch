@@ -170,9 +170,15 @@ pub(crate) fn statuses(
                 json_of(&kept_id.is_some_and(awaiting_rotation))?,
             ),
             ("open_attempts", array(&open_attempts)),
-            // The inbox comes with POST /inbox: nothing is unread, no app is lagging.
-            ("unread_entries", json_of(&0)?),
-            ("sole_target_unread", json_of(&0)?),
+            // Lagging comes with the next inbox PR.
+            (
+                "unread_entries",
+                json_of(&view.unread.get(&id).map_or(0, |(unread, _)| *unread))?,
+            ),
+            (
+                "sole_target_unread",
+                json_of(&view.unread.get(&id).map_or(0, |(_, sole)| *sole))?,
+            ),
             ("record_cert", json_of(&record_cert)?),
             (
                 "record_at",

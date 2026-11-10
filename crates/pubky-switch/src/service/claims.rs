@@ -170,6 +170,10 @@ impl Service {
         txn.revoke_app(&app, time_ms, data_epoch)
             .await
             .map_err(|e| store_error(&e))?;
+        // Entries no longer wait for it (Switch wire 9.1).
+        txn.delete_passed_entries()
+            .await
+            .map_err(|e| store_error(&e))?;
         // It leaves the directory: its record and receive key no longer show, and a
         // reachable app no longer counts among the reachable ones (Switch wire 7.4.10).
         let (directory_version, apps_version) = txn

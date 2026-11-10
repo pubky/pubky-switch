@@ -273,6 +273,35 @@ impl AccountTxn {
         Ok(())
     }
 
+    /// The app each of `kids` was registered by, for the kids the account ever registered
+    /// (Switch spec 3.6: a kid is never registered twice in an account).
+    pub async fn kid_holders(
+        &mut self,
+        kids: &[[u8; 8]],
+    ) -> Result<Vec<([u8; 8], [u8; 16])>, StoreError> {
+        let id = self.head().id.clone();
+        let kids: Vec<Vec<u8>> = kids.iter().map(|kid| kid.to_vec()).collect();
+        let rows = sqlx::query(
+            "SELECT kid, app_id FROM receive_keys WHERE account_id = $1 AND kid = ANY($2)",
+        )
+        .bind(id)
+        .bind(kids)
+        .fetch_all(self.conn())
+        .await
+        .map_err(StoreError::from_db)?;
+        rows.iter()
+            .map(|row| {
+                let kid: Vec<u8> = row.try_get("kid")?;
+                let app: Vec<u8> = row.try_get("app_id")?;
+                Ok((
+                    <[u8; 8]>::try_from(kid.as_slice()).map_err(|_| StoreError::Corrupt("kid"))?,
+                    <[u8; 16]>::try_from(app.as_slice())
+                        .map_err(|_| StoreError::Corrupt("app_id"))?,
+                ))
+            })
+            .collect()
+    }
+
     /// Note an admitted append's time on the sender's conversation entry (Switch spec 7
     /// "Pruning": `last_used`).
     pub async fn note_conversation_used(
