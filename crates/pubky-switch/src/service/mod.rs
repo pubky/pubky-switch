@@ -358,9 +358,13 @@ impl Service {
                 None
             }
             Call::PutIdentity => {
-                match self.authenticate_signer(&account, &request, base_ms).await {
-                    Ok((claimed, app)) => {
+                match self
+                    .authenticate_signer(&account, &request, base_ms, base_ms.max(stamped_ms))
+                    .await
+                {
+                    Ok((claimed, app, cert)) => {
                         verified = app;
+                        other = cert;
                         Some(claimed)
                     }
                     Err(error) => return refused_early(error).await,
@@ -369,24 +373,23 @@ impl Service {
             // The signer is verified here; an own app under the lock, with the key the
             // account holds for it (Switch wire 7.2).
             Call::Revoke(_) | Call::GetApps => {
-                match self.authenticate_signer(&account, &request, base_ms).await {
-                    Ok((claimed, app)) => {
+                match self
+                    .authenticate_signer(&account, &request, base_ms, base_ms.max(stamped_ms))
+                    .await
+                {
+                    Ok((claimed, app, cert)) => {
                         verified = app;
+                        other = cert;
                         Some(claimed)
                     }
                     Err(error) => return refused_early(error).await,
                 }
             }
             Call::Ops | Call::GetClaim(_) | Call::Feed | Call::PutPeers | Call::Append => {
-                let others = matches!(call, Call::PutPeers | Call::Append);
-                match self.authenticate_caller(
-                    &account,
-                    &request,
-                    base_ms,
-                    base_ms.max(stamped_ms),
-                    others,
-                ) {
-                    Ok(claimed) => {
+                match self.authenticate_caller(&account, &request, base_ms, base_ms.max(stamped_ms))
+                {
+                    Ok((claimed, cert)) => {
+                        other = cert;
                         // An own app's request is verified here too, so nothing unverified
                         // takes the lock (Switch wire 7.2 Order).
                         if let Caller::OwnApp(app) = &claimed.caller {
@@ -396,19 +399,6 @@ impl Service {
                                 .await
                             {
                                 Ok(app) => verified = Some(app),
-                                Err(error) => {
-                                    if is_failed_authentication(error.code) {
-                                        self.record_failure(&request, account.clone());
-                                    }
-                                    return refused_early(error).await;
-                                }
-                            }
-                        }
-                        // An app of another identity, by the certificate it sends (Switch
-                        // wire 7.2 checks 1, 2 and 4); check 3 comes under the lock.
-                        if let Caller::OtherApp { app, .. } = &claimed.caller {
-                            match self.verify_other_app(&request, &claimed, app) {
-                                Ok(cert) => other = Some(cert),
                                 Err(error) => {
                                     if is_failed_authentication(error.code) {
                                         self.record_failure(&request, account.clone());
@@ -504,7 +494,8 @@ impl Service {
         account: &str,
         request: &SwitchRequest,
         base_ms: u64,
-    ) -> Result<(Claimed, Option<batch::VerifiedApp>), ApiError> {
+        service_time_ms: u64,
+    ) -> Result<(Claimed, Option<batch::VerifiedApp>, Option<AppCert>), ApiError> {
         if let Err(retry_after) = self.failed_auth.check(request.source, base_ms) {
             return Err(ApiError::rate_limited(
                 "9.4: too many failed authentications from this network source",
@@ -532,20 +523,16 @@ impl Service {
                             self.record_failure(request, account.to_string());
                         }
                     })?;
-                Ok((claimed, Some(verified)))
+                Ok((claimed, Some(verified), None))
             }
-            // Its certificate first, in 7.2's order (`400`, `401`), then the refusal.
+            // Its certificate first, in 7.2's order (`400`, `401`), then its expiry, then
+            // the refusal (3.8).
             Caller::OtherApp { app, .. } => {
-                self.verify_other_app(request, &claimed, app)
-                    .inspect_err(|error| {
-                        if is_failed_authentication(error.code) {
-                            self.record_failure(request, account.to_string());
-                        }
-                    })?;
-                rules::require_signer(&claimed.caller)?;
-                Ok((claimed, None))
+                let cert =
+                    self.other_app_before_lock(account, request, &claimed, app, service_time_ms)?;
+                Ok((claimed, None, Some(cert)))
             }
-            Caller::Signer => Ok((claimed, None)),
+            Caller::Signer => Ok((claimed, None, None)),
         }
     }
 
@@ -1052,8 +1039,7 @@ impl Service {
         request: &SwitchRequest,
         base_ms: u64,
         service_time_ms: u64,
-        others: bool,
-    ) -> Result<Claimed, ApiError> {
+    ) -> Result<(Claimed, Option<AppCert>), ApiError> {
         if let Err(retry_after) = self.failed_auth.check(request.source, base_ms) {
             return Err(ApiError::rate_limited(
                 "9.4: too many failed authentications from this network source",
@@ -1069,39 +1055,51 @@ impl Service {
                     self.record_failure(request, account.to_string());
                 }
             })?;
-        if let Caller::OtherApp { app, .. } = &claimed.caller
-            && !others
-        {
-            // Authenticated first, by its certificate (`400`, `401`, Switch wire 7.2):
-            // permissions and the endpoint's refusal come after authentication.
-            let cert = self
-                .verify_other_app(request, &claimed, app)
-                .inspect_err(|error| {
-                    if is_failed_authentication(error.code) {
-                        self.record_failure(request, account.to_string());
-                    }
-                })?;
-            // Check 3, expiry, before any permission (Switch wire 3.8), at the identity's
-            // service time as far as it is known before the lock.
-            if cert.expired_at(service_time_ms) {
-                return Err(ApiError::new(
-                    ErrorCode::CertExpired,
-                    "3.8: the certificate has expired",
-                ));
-            }
-            // The feed is for own apps only (Switch wire 7.4.4).
-            if request.route.call == Call::Feed {
-                return Err(ApiError::new(
-                    ErrorCode::PermissionMissing,
-                    "7.4.4: only own apps read the feed",
-                ));
-            }
+        let cert = match &claimed.caller {
+            Caller::OtherApp { app, .. } => Some(self.other_app_before_lock(
+                account,
+                request,
+                &claimed,
+                app,
+                service_time_ms,
+            )?),
+            _ => None,
+        };
+        Ok((claimed, cert))
+    }
+
+    /// An app of another identity before the lock (Switch wire 7.2): its certificate
+    /// checked (`400`, `401`, counted against the network source), then the call. A call
+    /// it makes goes on, its expiry judged under the lock. At any other call it is refused
+    /// here: `403 cert_expired` when its certificate has expired by the identity's service
+    /// time as far as it is known before the lock, since expiry comes before permissions
+    /// (3.8), else `rules::other_app_refusal`.
+    fn other_app_before_lock(
+        &self,
+        account: &str,
+        request: &SwitchRequest,
+        claimed: &Claimed,
+        app: &str,
+        service_time_ms: u64,
+    ) -> Result<AppCert, ApiError> {
+        let cert = self
+            .verify_other_app(request, claimed, app)
+            .inspect_err(|error| {
+                if is_failed_authentication(error.code) {
+                    self.record_failure(request, account.to_string());
+                }
+            })?;
+        let call = &request.route.call;
+        if rules::takes_other_apps(call) {
+            return Ok(cert);
+        }
+        if cert.expired_at(service_time_ms) {
             return Err(ApiError::new(
-                ErrorCode::NotAdmitted,
-                "6.4: an app of another identity doesn't write here",
+                ErrorCode::CertExpired,
+                "3.8: the certificate has expired",
             ));
         }
-        Ok(claimed)
+        Err(rules::other_app_refusal(call))
     }
 
     /// Decode and verify a request's signature (Switch wire 7.2): the signer's with the

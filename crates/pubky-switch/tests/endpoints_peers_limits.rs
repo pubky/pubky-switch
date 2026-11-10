@@ -523,31 +523,53 @@ async fn test_peers_denied_contact_is_refused() {
 async fn test_peers_expired_certificate_comes_before_permissions_elsewhere() {
     let Some(replay) = replay().await else { return };
     replay_chain_through_revoke(&replay).await;
-    let expired = "2026-12-01T00:00:00.000Z";
-    set_time(&replay.clock, expired);
     let alice = identity("alice")["pubky_id"]
         .as_str()
         .expect("id")
         .to_string();
-    for (method, path) in [
-        ("GET", format!("/v1/{alice}/feed")),
-        ("POST", format!("/v1/{alice}/ops")),
-    ] {
-        let request = other_request(
-            "shop",
-            ORIGIN,
-            method,
-            &path,
-            b"{}".to_vec(),
-            None,
-            ms(expired),
+    let phone = vectors("keys.json")["apps"]
+        .as_array()
+        .expect("apps")
+        .iter()
+        .find(|app| app["name"] == "phone")
+        .and_then(|app| app["app_id"].as_str())
+        .expect("phone")
+        .to_string();
+    let calls = [
+        ("GET", format!("/v1/{alice}/feed"), "permission_missing"),
+        ("POST", format!("/v1/{alice}/ops"), "not_admitted"),
+        ("PUT", format!("/v1/{alice}/identity"), "permission_missing"),
+        (
+            "POST",
+            format!("/v1/{alice}/apps/{phone}/revoke"),
+            "permission_missing",
+        ),
+        ("GET", format!("/v1/{alice}/apps"), "permission_missing"),
+    ];
+    let call = |method: &str, path: &str, at: &str| {
+        other_request("shop", ORIGIN, method, path, b"{}".to_vec(), None, ms(at))
+    };
+    // Unexpired, the shop gets each call's own refusal.
+    let at = item_time(chain_item(&vectors("chain.json"), 9));
+    for (method, path, code) in &calls {
+        let answer = replay.service.handle(call(method, path, &at)).await;
+        assert_eq!(
+            (answer.status, body(&answer)["code"].clone()),
+            (403, json!(code)),
+            "{method} {path}"
         );
-        let answer = replay.service.handle(request).await;
+    }
+    // Expired, `cert_expired` comes first.
+    let expired = "2026-12-01T00:00:00.000Z";
+    set_time(&replay.clock, expired);
+    for (method, path, _) in &calls {
+        let answer = replay.service.handle(call(method, path, expired)).await;
         assert_eq!(
             (answer.status, body(&answer)["code"].clone()),
             (403, json!("cert_expired")),
             "{method} {path}"
         );
+        assert!(header_text(&answer, "switch-head").is_none());
     }
     replay.db.drop_database().await.expect("drop");
 }
