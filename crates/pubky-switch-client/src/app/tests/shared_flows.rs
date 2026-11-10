@@ -518,11 +518,23 @@ async fn test_send_not_admitted_is_deleted_after_30_days() {
     // Deleted, plaintext and all, and the protocol told.
     assert_eq!(app.delivery(&msg_id).await.unwrap(), None);
     assert!(
-        app.take_events().contains(&AppEvent::MessageUndelivered {
-            msg_id: msg_id.clone(),
-            resend: false
-        }),
+        app.take_events().iter().any(|e| matches!(
+            e,
+            AppEvent::MessageUndelivered { msg_id: m, resend: false, .. } if *m == msg_id
+        )),
         "the protocol is told"
+    );
+    // Durably: a load tells it again until it is acknowledged.
+    let mut loaded = App::load(s.env(), s.protocol.clone(), World::config(), app.app_id())
+        .await
+        .unwrap();
+    let told = loaded.take_events();
+    assert!(
+        told.iter().any(|e| matches!(
+            e,
+            AppEvent::MessageUndelivered { msg_id: m, .. } if *m == msg_id
+        )),
+        "{told:?}"
     );
     // Admitted later, it isn't sent.
     s.peer.lock().admitted = None;

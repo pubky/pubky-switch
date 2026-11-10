@@ -36,7 +36,7 @@ use pubky_switch_core::sig::SignedDoc;
 use serde::{Deserialize, Serialize};
 
 use super::error::{Alarm, AppError};
-use super::events::{AppEvent, ParkReason};
+use super::events::{AppEvent, Duty, ParkReason};
 use super::feed::{ReceiveReport, processed_writes};
 use super::identity;
 use super::state::{ParkedEntry, PendingEffect, Tx, key};
@@ -210,24 +210,6 @@ const FOLLOW_PASSES: usize = 4;
 
 fn corrupt() -> AppError {
     AppError::Store(StoreError::Corrupt)
-}
-
-/// A kept batch dropped at a provider change: reported, with each `attempt` in it, so the
-/// protocol treats those obligations as uncertain (Switch spec 12.5 "Kept batches", 12.6
-/// step 5).
-fn dropped(id: &[u8; 16], batch: &Batch, events: &mut Vec<AppEvent>) {
-    events.push(AppEvent::KeptBatchDropped { batch_id: *id });
-    for op in batch.ops() {
-        if let OpKind::Claim(fields) = &op.body().kind
-            && fields.kind == ClaimType::Attempt
-            && let Ok(entry) = fields.check()
-        {
-            events.push(AppEvent::AttemptDropped {
-                claim_key: entry.claim_key,
-                attempt_id: entry.attempt_id,
-            });
-        }
-    }
 }
 
 /// A kept batch's operations, with their conditions, to sign again.
@@ -985,7 +967,8 @@ impl App {
     ///   days less the clock tolerance, goes instead: a batch reported as dropped, an
     ///   effect with its entry stored locally and passed ([`App::park_uncertain`]).
     ///
-    /// Returns the events to report once `tx` commits.
+    /// Returns the informational events to report once `tx` commits; the duty events are
+    /// kept in `tx`, and reported by its commit.
     pub(crate) async fn carry_kept_writes(
         &mut self,
         tx: &mut Tx,
@@ -1008,7 +991,7 @@ impl App {
                 self.state.pending_effect = None;
             }
             if !applied && resend_first && !answerable {
-                self.park_uncertain(&pending, tx, &mut events)?;
+                self.park_uncertain(&pending, tx)?;
             }
             if applied {
                 let now = self.now();
@@ -1055,7 +1038,7 @@ impl App {
             if resend_first {
                 if !answer_decides(pending.kept_ms) {
                     Self::replace_kept_batch(&id, None, tx)?;
-                    dropped(&id, &kept, &mut events);
+                    self.kept_batch_dropped(&id, &kept, tx)?;
                 }
                 continue;
             }
@@ -1065,7 +1048,7 @@ impl App {
             });
             if carry == Carry::AfterLoss && attempts {
                 Self::replace_kept_batch(&id, None, tx)?;
-                dropped(&id, &kept, &mut events);
+                self.kept_batch_dropped(&id, &kept, tx)?;
                 continue;
             }
             let signed = self.sign_ops(ops, None)?;
@@ -1088,12 +1071,7 @@ impl App {
     /// it twice, so its entry is stored locally and passed, like an effect refused for good
     /// (Switch spec 8.2), and the protocol is told; it decides from the current state. A
     /// kept effect written without its entry can't be stored: its entry is read again.
-    fn park_uncertain(
-        &mut self,
-        pending: &PendingEffect,
-        tx: &mut Tx,
-        events: &mut Vec<AppEvent>,
-    ) -> Result<(), AppError> {
+    fn park_uncertain(&mut self, pending: &PendingEffect, tx: &mut Tx) -> Result<(), AppError> {
         let reason = ParkReason::Uncertain;
         let parked = match (self.state.parked.get(&pending.seq), &pending.entry) {
             (Some(stored), _) if pending.parked => ParkedEntry {
@@ -1126,16 +1104,49 @@ impl App {
                 cursor.deferred_since_ms = Some(now);
             }
         }
-        events.push(AppEvent::Parked {
-            seq: pending.seq,
-            reason,
-        });
-        events.push(AppEvent::EffectUncertain {
-            seq: pending.seq,
-            sender: pending.sender,
-            msg_id: pending.msg_id.clone(),
-            kind: pending.kind.clone(),
-        });
+        // Duty events, kept in `tx`, the commit that stores the entry.
+        self.keep_duty(
+            tx,
+            Duty::Parked {
+                seq: pending.seq,
+                reason,
+            },
+        )?;
+        self.keep_duty(
+            tx,
+            Duty::EffectUncertain {
+                seq: pending.seq,
+                sender: pending.sender,
+                msg_id: pending.msg_id.clone(),
+                kind: pending.kind.clone(),
+            },
+        )
+    }
+
+    /// A kept batch dropped at a provider change: reported, with each `attempt` in it, so
+    /// the protocol treats those obligations as uncertain (Switch spec 12.5 "Kept batches",
+    /// 12.6 step 5). Duty events, kept in `tx`, the commit that drops the batch.
+    fn kept_batch_dropped(
+        &mut self,
+        id: &[u8; 16],
+        batch: &Batch,
+        tx: &mut Tx,
+    ) -> Result<(), AppError> {
+        self.keep_duty(tx, Duty::KeptBatchDropped { batch_id: *id })?;
+        for op in batch.ops() {
+            if let OpKind::Claim(fields) = &op.body().kind
+                && fields.kind == ClaimType::Attempt
+                && let Ok(entry) = fields.check()
+            {
+                self.keep_duty(
+                    tx,
+                    Duty::AttemptDropped {
+                        claim_key: entry.claim_key,
+                        attempt_id: entry.attempt_id,
+                    },
+                )?;
+            }
+        }
         Ok(())
     }
 

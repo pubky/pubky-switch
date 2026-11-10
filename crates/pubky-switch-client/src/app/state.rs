@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::error::AppError;
-use super::events::ParkReason;
+use super::events::{AppEvent, ParkReason};
 use super::protocol::LocalWrite;
 use crate::error::StoreError;
 use crate::store::{StoreHandle, WriteBatch};
@@ -89,6 +89,15 @@ pub(crate) mod key {
     pub(crate) const SERVICE_TIME: &str = "service_time";
     pub(crate) const PENDING_EFFECT: &str = "pending/effect";
     pub(crate) const PENDING_RECORD: &str = "pending/record";
+    /// The ID the next duty event takes.
+    pub(crate) const DUTY_NEXT: &str = "dutyn";
+    /// The prefix of the kept duty events.
+    pub(crate) const DUTY_PREFIX: &str = "duty/";
+
+    /// A duty event kept until acknowledged.
+    pub(crate) fn duty(id: u64) -> String {
+        format!("duty/{}", num(id))
+    }
 
     pub(crate) fn num(n: u64) -> String {
         format!("{n:020}")
@@ -478,11 +487,13 @@ pub(crate) struct ServiceTime {
     pub(crate) offset_ms: i64,
 }
 
-/// A transaction: the writes of one commit, in the app's namespace.
+/// A transaction: the writes of one commit, in the app's namespace, and the duty events
+/// it keeps, reported once it commits.
 #[derive(Debug)]
 pub(crate) struct Tx {
     ns: String,
     batch: WriteBatch,
+    duties: Vec<AppEvent>,
 }
 
 impl Tx {
@@ -490,7 +501,19 @@ impl Tx {
         Self {
             ns: ns.to_owned(),
             batch: WriteBatch::new(),
+            duties: Vec::new(),
         }
+    }
+
+    /// A duty event whose record this transaction writes: reported once it commits, and
+    /// never if it doesn't.
+    pub(crate) fn report(&mut self, event: AppEvent) {
+        self.duties.push(event);
+    }
+
+    /// The duty events to report once this transaction commits.
+    pub(crate) fn take_reports(&mut self) -> Vec<AppEvent> {
+        std::mem::take(&mut self.duties)
     }
 
     pub(crate) fn put<T: Serialize>(&mut self, key: &str, value: &T) -> Result<(), AppError> {

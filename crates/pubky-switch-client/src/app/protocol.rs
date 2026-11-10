@@ -225,6 +225,14 @@ pub struct MissedEntries {
 /// carries, each at the commit point its crash rules give it (`STATE.md`). A write made
 /// beside them could land without the outcome it belongs to, or after a crash that
 /// discards it.
+///
+/// # Duty events
+///
+/// What the app must tell its protocol outside a callback comes as a duty event
+/// ([`super::AppEvent::is_duty`]), which the host relays. Delivery is at least once: a
+/// duty event comes again after any load until the host acknowledges it
+/// ([`super::App::ack_events`]), so a protocol tolerates seeing one twice, and acts on it
+/// by its [`super::EventId`] or by the state it names.
 pub trait Protocol: Send + Sync {
     /// The opaque members of the protocol's message bodies (Switch wire 1.1). None by
     /// default.

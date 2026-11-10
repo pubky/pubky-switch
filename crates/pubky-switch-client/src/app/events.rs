@@ -1,10 +1,52 @@
 //! What the app tells its host: [`AppEvent`]s, collected in each call's report. Alarms
-//! (Switch spec 3.6, 4.3, 10.1) are also kept in the store until the user resolves them;
-//! every other event is shown once.
+//! (Switch spec 3.6, 4.3, 10.1) are also kept in the store until the user resolves them.
 //!
 //! Events carry facts, never wording, and never message content: a host words them.
+//!
+//! # Duty events
+//!
+//! Where the spec has the app tell its protocol something, the event is a duty event
+//! ([`AppEvent::is_duty`]): a received message's effect refused for good, too large for one
+//! batch, or of unknown fate, and its entry stored locally for good (Switch spec 8.2, 12.5
+//! "Kept batches"); a kept batch dropped at a provider change and each `attempt` in it
+//! (Switch spec 12.5 "Kept batches", 12.6 step 5); a message deleted from the outbox
+//! undelivered (Switch spec 11). Each carries a stable [`EventId`] and is kept in the
+//! store (`duty/<id>`) in the same commit as the change it reports, so no crash separates
+//! the two. It is reported once that commit is done, again by every [`super::App::load`],
+//! and listed by [`super::App::unacknowledged_events`], until the host acknowledges it with
+//! [`super::App::ack_events`]: delivery is at least once. A host and its protocol must
+//! therefore tolerate a duty event seen twice, and act on it only once they have kept what
+//! it says, then acknowledge it.
+//!
+//! Every other event is informational: kept in memory only, and shown once.
+//!
+//! Stored duty events are bounded by what they report: each is written once, for one
+//! entry stored for good, one kept batch or `attempt` dropped, or one outbox message given
+//! up, and goes when acknowledged.
+
+use serde::{Deserialize, Serialize};
+
+use pubky_switch_core::enc::serde_b64;
 
 use super::error::Alarm;
+
+/// The stable ID of a duty event ([`AppEvent::is_duty`]). IDs rise in the order the events
+/// were kept and are never reused in one store, a restore included.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct EventId(u64);
+
+impl EventId {
+    /// The ID with this number, as [`EventId::get`] gave it: for a host that keeps how far
+    /// it acknowledged.
+    pub fn new(n: u64) -> Self {
+        Self(n)
+    }
+
+    /// The ID's number.
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
 
 /// One thing that happened, for the host to show or act on.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -46,9 +88,12 @@ pub enum AppEvent {
         /// The entry's `seq`.
         seq: u64,
     },
-    /// An entry was stored locally and the cursor moved past it (Switch spec 8.2): its
-    /// sender stayed unverifiable too long, or its write hit a quota.
+    /// An entry was stored locally and the cursor moved past it (Switch spec 8.2), for
+    /// `reason`. A duty event when the entry isn't tried again
+    /// ([`ParkReason::tried_again`]): then nothing but the protocol brings it back.
     Parked {
+        /// The duty event's ID; `None` for an entry that later reads try again.
+        id: Option<EventId>,
         /// The entry's `seq`.
         seq: u64,
         /// Why.
@@ -57,8 +102,10 @@ pub enum AppEvent {
     /// A received message's effect was refused for good, or has more operations than one
     /// batch takes with the cursor move: its entry was stored locally and passed
     /// ([`AppEvent::Parked`]), and the effect isn't sent again (Switch spec 8.2). The
-    /// protocol may build it again in another form.
+    /// protocol may build it again in another form. A duty event.
     EffectRefused {
+        /// The duty event's ID.
+        id: EventId,
         /// The entry's `seq`.
         seq: u64,
         /// The sender identity.
@@ -74,8 +121,10 @@ pub enum AppEvent {
     /// than a resend's answer can tell whether it was applied (Switch spec 12.5 "Kept
     /// batches"): its entry was stored locally and passed ([`AppEvent::Parked`]), and the
     /// effect isn't sent or built again. It may have been applied: the protocol decides
-    /// from the current state of what the effect writes.
+    /// from the current state of what the effect writes. A duty event.
     EffectUncertain {
+        /// The duty event's ID.
+        id: EventId,
         /// The entry's `seq`.
         seq: u64,
         /// The sender identity.
@@ -293,16 +342,21 @@ pub enum AppEvent {
     /// provider loss, since no automatic attempt is made on an obligation from before the
     /// loss (Switch spec 12.6 step 5), or one kept longer than a resend's answer can tell
     /// whether it was applied (Switch spec 12.5 "Kept batches"). Each attempt in it follows
-    /// as [`AppEvent::AttemptDropped`]. The protocol decides what to write instead.
+    /// as [`AppEvent::AttemptDropped`]. The protocol decides what to write instead. A duty
+    /// event.
     KeptBatchDropped {
+        /// The duty event's ID.
+        id: EventId,
         /// The batch ID.
         batch_id: [u8; 16],
     },
     /// An `attempt` in a kept batch that was dropped ([`AppEvent::KeptBatchDropped`]): it
     /// is never signed again, and whether it was applied can't be known, so its obligation
     /// is uncertain (Switch spec 12.5 "Kept batches", 12.6 step 5). The protocol treats it
-    /// so.
+    /// so. A duty event.
     AttemptDropped {
+        /// The duty event's ID.
+        id: EventId,
         /// The claim key.
         claim_key: [u8; 32],
         /// The attempt.
@@ -329,8 +383,10 @@ pub enum AppEvent {
     /// A message answered `403 not_admitted` or `403 not_current` for
     /// [`super::UNDELIVERABLE_MS`] wasn't delivered (Switch spec 11). A message its
     /// recipient never accepted was deleted from the outbox with its plaintext; for a
-    /// re-send, only the re-send was given up.
+    /// re-send, only the re-send was given up. A duty event.
     MessageUndelivered {
+        /// The duty event's ID.
+        id: EventId,
         /// The message ID.
         msg_id: String,
         /// Whether it was a re-send of a message accepted before.
@@ -401,6 +457,117 @@ pub enum AppEvent {
         /// The attempt.
         attempt_id: [u8; 16],
     },
+}
+
+impl AppEvent {
+    /// The ID of a duty event, which the store keeps until acknowledged; `None` for an
+    /// informational event (module docs, "Duty events").
+    pub fn id(&self) -> Option<EventId> {
+        match self {
+            Self::Parked { id, .. } => *id,
+            Self::EffectRefused { id, .. }
+            | Self::EffectUncertain { id, .. }
+            | Self::KeptBatchDropped { id, .. }
+            | Self::AttemptDropped { id, .. }
+            | Self::MessageUndelivered { id, .. } => Some(*id),
+            _ => None,
+        }
+    }
+
+    /// Whether this is a duty event: one the spec has the app tell its protocol, kept in
+    /// the store and delivered until acknowledged (module docs, "Duty events").
+    pub fn is_duty(&self) -> bool {
+        self.id().is_some()
+    }
+}
+
+/// `duty/<id>`: a duty event as the store keeps it, its ID in its key.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum Duty {
+    Parked {
+        seq: u64,
+        reason: ParkReason,
+    },
+    EffectRefused {
+        seq: u64,
+        #[serde(with = "serde_b64")]
+        sender: [u8; 32],
+        msg_id: String,
+        kind: String,
+        code: Option<String>,
+    },
+    EffectUncertain {
+        seq: u64,
+        #[serde(with = "serde_b64")]
+        sender: [u8; 32],
+        msg_id: String,
+        kind: String,
+    },
+    KeptBatchDropped {
+        #[serde(with = "serde_b64")]
+        batch_id: [u8; 16],
+    },
+    AttemptDropped {
+        #[serde(with = "serde_b64")]
+        claim_key: [u8; 32],
+        #[serde(with = "serde_b64")]
+        attempt_id: [u8; 16],
+    },
+    MessageUndelivered {
+        msg_id: String,
+        resend: bool,
+    },
+}
+
+impl Duty {
+    /// The event reported for it, with its ID.
+    pub(crate) fn event(self, id: EventId) -> AppEvent {
+        match self {
+            Self::Parked { seq, reason } => AppEvent::Parked {
+                id: Some(id),
+                seq,
+                reason,
+            },
+            Self::EffectRefused {
+                seq,
+                sender,
+                msg_id,
+                kind,
+                code,
+            } => AppEvent::EffectRefused {
+                id,
+                seq,
+                sender,
+                msg_id,
+                kind,
+                code,
+            },
+            Self::EffectUncertain {
+                seq,
+                sender,
+                msg_id,
+                kind,
+            } => AppEvent::EffectUncertain {
+                id,
+                seq,
+                sender,
+                msg_id,
+                kind,
+            },
+            Self::KeptBatchDropped { batch_id } => AppEvent::KeptBatchDropped { id, batch_id },
+            Self::AttemptDropped {
+                claim_key,
+                attempt_id,
+            } => AppEvent::AttemptDropped {
+                id,
+                claim_key,
+                attempt_id,
+            },
+            Self::MessageUndelivered { msg_id, resend } => {
+                AppEvent::MessageUndelivered { id, msg_id, resend }
+            }
+        }
+    }
 }
 
 /// Why an entry was stored locally (Switch spec 8.2).

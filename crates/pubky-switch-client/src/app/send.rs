@@ -49,7 +49,7 @@ use super::admission::allow_key;
 use super::batch::OpBatch;
 use super::directory::Route;
 use super::error::Refusal;
-use super::events::AppEvent;
+use super::events::{AppEvent, Duty};
 use super::records::{Collection, RecordTarget};
 use super::state::key;
 use super::{App, AppError};
@@ -897,11 +897,15 @@ impl App {
         } else {
             tx.put(&out_key(&item.msg_id), &*item)?;
         }
+        // A duty event, kept in the commit that gives the delivery up.
+        self.keep_duty(
+            &mut tx,
+            Duty::MessageUndelivered {
+                msg_id: item.msg_id.clone(),
+                resend,
+            },
+        )?;
         self.commit(tx).await?;
-        self.events.push(AppEvent::MessageUndelivered {
-            msg_id: item.msg_id.clone(),
-            resend,
-        });
         Ok(true)
     }
 

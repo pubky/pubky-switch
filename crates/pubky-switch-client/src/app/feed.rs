@@ -50,7 +50,7 @@ use super::batch::PendingBatch;
 use super::claims::{ClaimRead, ObligationDeadline};
 use super::context::{ClaimFetch, ContextWrites, ReceiveContext};
 use super::error::{Alarm, Refusal, refused_for_good};
-use super::events::{AppEvent, ParkReason};
+use super::events::{AppEvent, Duty, ParkReason};
 use super::identity::{self, DOC_CACHE_MS, Taken};
 use super::protocol::{
     Effect, LocalWrite, MAX_CLAIM_READS, MissedEntries, Need, OpaqueRule, Outcome, ReceivedMessage,
@@ -643,7 +643,7 @@ impl App {
                     ParkReason::TooManyOperations,
                     read,
                 )?;
-                self.effect_refused(entry, &received, None);
+                self.effect_refused(entry, &received, None, read)?;
                 return Ok(Step::Pass);
             }
             if effect.ops.is_empty() {
@@ -689,7 +689,7 @@ impl App {
                 }
                 Sent::Refused(code) => {
                     self.park(entry, &received.plaintext, ParkReason::Refused, read)?;
-                    self.effect_refused(entry, &received, Some(code));
+                    self.effect_refused(entry, &received, Some(code), read)?;
                     return Ok(Step::Pass);
                 }
             }
@@ -1060,22 +1060,44 @@ impl App {
         read.tx.delete(&key::held(entry.seq))?;
         self.state.held.remove(&entry.seq);
         self.state.parked.insert(entry.seq, parked);
-        self.events.push(AppEvent::Parked {
-            seq: entry.seq,
-            reason,
-        });
+        if reason.tried_again() {
+            self.events.push(AppEvent::Parked {
+                id: None,
+                seq: entry.seq,
+                reason,
+            });
+        } else {
+            // Stored for good: a duty event, kept in the commit that stores the entry.
+            self.keep_duty(
+                &mut read.tx,
+                Duty::Parked {
+                    seq: entry.seq,
+                    reason,
+                },
+            )?;
+        }
         Ok(())
     }
 
-    /// Tell the protocol that the effect of `received` won't be sent again (Switch spec 8.2).
-    fn effect_refused(&mut self, entry: &Entry, received: &Received, code: Option<String>) {
-        self.events.push(AppEvent::EffectRefused {
-            seq: entry.seq,
-            sender: entry.sender,
-            msg_id: received.message.msg_id.clone(),
-            kind: received.message.kind.clone(),
-            code,
-        });
+    /// Tell the protocol that the effect of `received` won't be sent again (Switch spec
+    /// 8.2): a duty event, kept in the commit that stores the entry.
+    fn effect_refused(
+        &mut self,
+        entry: &Entry,
+        received: &Received,
+        code: Option<String>,
+        read: &mut Read,
+    ) -> Result<(), AppError> {
+        self.keep_duty(
+            &mut read.tx,
+            Duty::EffectRefused {
+                seq: entry.seq,
+                sender: entry.sender,
+                msg_id: received.message.msg_id.clone(),
+                kind: received.message.kind.clone(),
+                code,
+            },
+        )
     }
 
     /// Entries stored locally, checked and applied again now (Switch spec 8.2); the cursor is

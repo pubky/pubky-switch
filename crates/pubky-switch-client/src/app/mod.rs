@@ -62,7 +62,7 @@ mod tests;
 
 pub use chain::{HELD_MARKS, STUBS_KEPT_FOR_MS};
 pub use error::{Alarm, AppError, Refusal};
-pub use events::{AppEvent, ParkReason};
+pub use events::{AppEvent, EventId, ParkReason};
 pub use feed::ReceiveReport;
 pub use identity::{DOC_CACHE_MS, HomeserverReader, IdentityRefresh, REVALIDATION_MS};
 pub use peek::{PeekReport, Peeked};
@@ -395,6 +395,8 @@ pub(crate) struct AppState {
     pub(crate) service_time: Option<ServiceTime>,
     /// The app isn't current any more, or its account is gone: every read stops.
     pub(crate) gone: Option<provider::GoneRecord>,
+    /// The ID the next duty event takes (`dutyn`).
+    pub(crate) next_duty: u64,
 }
 
 /// One app of an identity, on top of the Switch.
@@ -423,6 +425,9 @@ impl std::fmt::Debug for App {
 fn corrupt() -> AppError {
     AppError::Store(StoreError::Corrupt)
 }
+
+/// The ID of a store's first duty event.
+const FIRST_DUTY: u64 = 1;
 
 fn missing() -> AppError {
     AppError::Store(StoreError::Corrupt)
@@ -551,6 +556,7 @@ impl App {
                 leave: None,
                 service_time: None,
                 gone: None,
+                next_duty: FIRST_DUTY,
             };
             let mut app = App {
                 env,
@@ -668,7 +674,7 @@ impl App {
             };
             let state = Self::read_state(&reader).await?;
             let client = Self::client_for(&env, &state.meta, &state.keys, &state.cert)?;
-            Ok(App {
+            let mut app = App {
                 env,
                 protocol,
                 config,
@@ -679,7 +685,10 @@ impl App {
                 service_time_dirty: false,
                 identity_confirmed: None,
                 events: Vec::new(),
-            })
+            };
+            // Duty events not acknowledged before are delivered again (`events` module).
+            app.events = app.unacknowledged_events().await?;
+            Ok(app)
         })
         .await
     }
@@ -746,6 +755,7 @@ impl App {
             leave,
             service_time: reader.get(key::SERVICE_TIME).await?,
             gone: reader.get(provider::keys::GONE).await?,
+            next_duty: Self::next_duty(reader).await?,
             meta,
         })
     }
@@ -915,8 +925,17 @@ impl App {
                 leave: None,
                 service_time: None,
                 gone: None,
+                next_duty: FIRST_DUTY,
             };
             let ns = client_namespace(&meta.app_id);
+            // The store's duty event IDs go on rising, so an ID the host acknowledged before
+            // is never given to another event; a counter that can't be read starts over.
+            let old = Reader {
+                ns: ns.clone(),
+                store: env.store.clone(),
+            };
+            let next_duty = Self::next_duty(&old).await.unwrap_or(FIRST_DUTY);
+            let state = AppState { next_duty, ..state };
             let client = Self::client_for(&env, &meta, &backup.keys, &cert)?;
             let mut app = App {
                 env,
@@ -934,6 +953,7 @@ impl App {
             tx.delete_prefix("")?;
             app.write_all(&mut tx).await?;
             tx.put(records::LIST_DUE, &true)?;
+            tx.put(key::DUTY_NEXT, &app.state.next_duty)?;
             tx.commit(&app.env.store).await?;
             Ok(app)
         })
@@ -1166,9 +1186,71 @@ impl App {
         .await
     }
 
-    /// Take the events collected since the last call.
+    /// Take the events collected since the last call. Duty events among them stay kept
+    /// until [`App::ack_events`] acknowledges them (`events` module, "Duty events").
     pub fn take_events(&mut self) -> Vec<AppEvent> {
         std::mem::take(&mut self.events)
+    }
+
+    /// The duty events kept and not acknowledged yet, by ascending ID: what a host that
+    /// lost its copy of the reports still has to act on.
+    ///
+    /// # Errors
+    ///
+    /// A failed store read.
+    pub async fn unacknowledged_events(&self) -> Result<Vec<AppEvent>, AppError> {
+        Ok(self
+            .reader()
+            .scan_numbered::<events::Duty>(key::DUTY_PREFIX)
+            .await?
+            .into_iter()
+            .map(|(n, duty)| duty.event(EventId::new(n)))
+            .collect())
+    }
+
+    /// Acknowledge every duty event up to and including `up_to`: the host and its protocol
+    /// kept what they say, and the store no longer keeps them, so no later
+    /// [`App::load`] delivers them again. IDs rise in the order the events are reported,
+    /// so a host acknowledges after acting on every duty event it took up to that ID. An
+    /// ID no event has yet acknowledges only those before it.
+    ///
+    /// # Errors
+    ///
+    /// A failed store read or commit; nothing is acknowledged then.
+    pub async fn ack_events(&mut self, up_to: EventId) -> Result<(), AppError> {
+        Box::pin(async move {
+            self.ready_local().await?;
+            let kept = self.reader().scan_numbers(key::DUTY_PREFIX).await?;
+            let mut tx = self.tx()?;
+            for n in kept.range(..=up_to.get()) {
+                tx.delete(&key::duty(*n))?;
+            }
+            self.commit(tx).await
+        })
+        .await
+    }
+
+    /// Keep a duty event in `tx`, under the next ID: written in the commit of the change it
+    /// reports, and reported once that commit is done (`events` module, "Duty events").
+    pub(crate) fn keep_duty(&mut self, tx: &mut Tx, duty: events::Duty) -> Result<(), AppError> {
+        let n = self.state.next_duty;
+        let next = n.checked_add(1).ok_or_else(corrupt)?;
+        tx.put(&key::duty(n), &duty)?;
+        tx.put(key::DUTY_NEXT, &next)?;
+        self.state.next_duty = next;
+        tx.report(duty.event(EventId::new(n)));
+        Ok(())
+    }
+
+    /// The ID the next duty event takes: past the counter and every kept event.
+    async fn next_duty(reader: &Reader) -> Result<u64, AppError> {
+        let counter: u64 = reader.get(key::DUTY_NEXT).await?.unwrap_or(FIRST_DUTY);
+        let kept = reader.scan_numbers(key::DUTY_PREFIX).await?;
+        let past_kept = match kept.last() {
+            Some(last) => last.checked_add(1).ok_or_else(corrupt)?,
+            None => FIRST_DUTY,
+        };
+        Ok(counter.max(past_kept))
     }
 
     /// The highest service time the app verified, Unix milliseconds (Switch spec 10.1): a
@@ -1375,7 +1457,14 @@ impl App {
     async fn destroy_keys(&mut self) -> Result<(), AppError> {
         let now = self.now();
         let mut tx = Tx::new(&self.ns);
-        for prefix in ["rk/", "scope/", "parked/", "pending/", "p/"] {
+        for prefix in [
+            "rk/",
+            "scope/",
+            "parked/",
+            "pending/",
+            "p/",
+            key::DUTY_PREFIX,
+        ] {
             tx.delete_prefix(prefix)?;
         }
         records::destroy_shared(&mut tx)?;
@@ -1452,10 +1541,12 @@ impl App {
     }
 
     /// Commit; after a failure the app reads its state again before going on.
-    pub(crate) async fn commit(&mut self, tx: Tx) -> Result<(), AppError> {
+    pub(crate) async fn commit(&mut self, mut tx: Tx) -> Result<(), AppError> {
+        let duties = tx.take_reports();
         match tx.commit(&self.env.store).await {
             Ok(()) => {
                 self.service_time_dirty = false;
+                self.events.extend(duties);
                 Ok(())
             }
             Err(error) => {

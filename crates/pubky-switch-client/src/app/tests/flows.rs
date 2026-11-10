@@ -15,8 +15,8 @@ use serde_json::{Map, json};
 
 use super::*;
 use crate::app::{
-    Alarm, AppBackup, AppError, AppEvent, IdentityRefresh, LeaveMode, LeaveReport, ParkReason,
-    REVALIDATION_MS, Refusal, UserConfirmed,
+    Alarm, AppBackup, AppError, AppEvent, EventId, IdentityRefresh, LeaveMode, LeaveReport,
+    ParkReason, REVALIDATION_MS, Refusal, UserConfirmed,
 };
 use crate::store::{Fault as StoreFault, FaultStore};
 use crate::testing::Fault;
@@ -704,7 +704,7 @@ async fn test_app_holds_then_parks_an_unverifiable_sender() {
     let report = wallet.receive(None).await.unwrap();
     assert!(has(&report.events, |e| matches!(
         e,
-        AppEvent::Parked { seq, reason: ParkReason::Unverifiable } if *seq == held
+        AppEvent::Parked { id: None, seq, reason: ParkReason::Unverifiable } if *seq == held
     )));
     assert!(wallet.cursor().seq >= later);
     assert_eq!(w.effects(), 0, "{:?}", report.events);
@@ -731,7 +731,7 @@ async fn test_app_quota_parks_the_entry_and_writes_later() {
     let report = app.receive(None).await.unwrap();
     assert!(has(&report.events, |e| matches!(
         e,
-        AppEvent::Parked { seq: s, reason: ParkReason::Quota } if *s == seq
+        AppEvent::Parked { id: None, seq: s, reason: ParkReason::Quota } if *s == seq
     )));
     assert!(app.cursor().seq >= seq, "the feed never stalls");
     assert_eq!(w.effects(), 0);
@@ -1658,7 +1658,7 @@ async fn test_app_effect_refused_for_good_is_parked_and_the_feed_goes_on() {
     let report = app.receive(None).await.unwrap();
     assert!(has(&report.events, |e| matches!(
         e,
-        AppEvent::Parked { seq, reason: ParkReason::Refused } if *seq == refused
+        AppEvent::Parked { id: Some(_), seq, reason: ParkReason::Refused } if *seq == refused
     )));
     // The protocol is told, with the code, so it may build the effect another way (Switch
     // spec 8.2).
@@ -1681,6 +1681,182 @@ async fn test_app_effect_refused_for_good_is_parked_and_the_feed_goes_on() {
         AppEvent::Unparked { .. }
     )));
     assert_eq!(w.effects(), 1);
+}
+
+// -------------------------------------------------------------------------------------
+// Duty events (`events` module, "Duty events")
+
+fn refused_events(events: &[AppEvent], seq: u64) -> Vec<AppEvent> {
+    events
+        .iter()
+        .filter(|e| matches!(e, AppEvent::EffectRefused { seq: s, .. } if *s == seq))
+        .cloned()
+        .collect()
+}
+
+/// A joined app with a note at the first `seq` whose effect the switch refuses for good,
+/// and a note after it.
+async fn refusing(w: &World) -> (App, u64, u64) {
+    let app = w.join("wallet").await;
+    let me = app.app_id();
+    let (refused, _) = w.note(me, "refused");
+    let (after, _) = w.note(me, "after");
+    w.switch.fail_next(Fault::Error {
+        path: "ops".into(),
+        code: ErrorCode::PermissionMissing,
+        current: json!(null),
+    });
+    (app, refused, after)
+}
+
+/// `app`, loaded again on `w`'s store behind `fault`.
+async fn load_behind(w: &World, app: App, fault: StoreFault) -> (App, Arc<FaultStore>) {
+    let me = app.app_id();
+    drop(app);
+    let store = Arc::new(FaultStore::new(
+        Arc::clone(&w.store) as Arc<dyn StateStore>,
+        fault,
+    ));
+    let app = App::load(
+        w.env_on(Arc::clone(&store) as Arc<dyn StateStore>),
+        w.protocol.clone(),
+        World::config(),
+        me,
+    )
+    .await
+    .unwrap();
+    (app, store)
+}
+
+#[tokio::test]
+async fn test_duty_event_kept_through_a_crash_before_it_is_taken() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let me = app.app_id();
+    let (refused, _) = w.note(me, "refused");
+    w.switch.fail_next(Fault::Error {
+        path: "ops".into(),
+        code: ErrorCode::PermissionMissing,
+        current: json!(null),
+    });
+    let report = app.receive(None).await.unwrap();
+    let first = refused_events(&report.events, refused);
+    assert_eq!(first.len(), 1, "{:?}", report.events);
+    assert!(first.iter().all(AppEvent::is_duty));
+    // The host stops before it acts on the report: the next load delivers it again, with
+    // the same ID.
+    drop(app);
+    let mut app = w.load(me).await;
+    let events = app.take_events();
+    assert_eq!(refused_events(&events, refused), first, "{events:?}");
+    assert!(has(&events, |e| matches!(
+        e,
+        AppEvent::Parked { id: Some(_), seq, reason: ParkReason::Refused } if *seq == refused
+    )));
+    assert_eq!(app.unacknowledged_events().await.unwrap(), events);
+}
+
+#[tokio::test]
+async fn test_duty_event_delivered_again_until_acknowledged() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let me = app.app_id();
+    w.note(me, "refused");
+    let (after, _) = w.note(me, "after");
+    w.switch.fail_next(Fault::Error {
+        path: "ops".into(),
+        code: ErrorCode::PermissionMissing,
+        current: json!(null),
+    });
+    let report = app.receive(None).await.unwrap();
+    assert!(received(&report.events, after));
+    let duties: Vec<AppEvent> = report
+        .events
+        .iter()
+        .filter(|e| e.is_duty())
+        .cloned()
+        .collect();
+    assert_eq!(duties.len(), 2, "{:?}", report.events);
+    // Not acknowledged: every load delivers them again; informational events aren't kept.
+    for _ in 0..2 {
+        let mut app = w.load(me).await;
+        let events = app.take_events();
+        assert_eq!(events, duties);
+        assert!(!received(&events, after), "{events:?}");
+    }
+    // Acknowledged up to the last: gone, across a reload too.
+    let last = duties.iter().filter_map(AppEvent::id).max().unwrap();
+    app.ack_events(last).await.unwrap();
+    assert!(app.unacknowledged_events().await.unwrap().is_empty());
+    let mut app = w.load(me).await;
+    assert!(app.take_events().is_empty());
+    // The next duty event takes a new ID.
+    let (again, _) = w.note(me, "again");
+    w.switch.fail_next(Fault::Error {
+        path: "ops".into(),
+        code: ErrorCode::PermissionMissing,
+        current: json!(null),
+    });
+    let report = app.receive(None).await.unwrap();
+    let next = refused_events(&report.events, again);
+    assert!(
+        next.iter().filter_map(AppEvent::id).all(|id| id > last),
+        "{next:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_duty_event_acknowledged_in_part_keeps_the_later_ones() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let me = app.app_id();
+    let (refused, _) = w.note(me, "refused");
+    w.switch.fail_next(Fault::Error {
+        path: "ops".into(),
+        code: ErrorCode::PermissionMissing,
+        current: json!(null),
+    });
+    let report = app.receive(None).await.unwrap();
+    let ids: Vec<EventId> = report.events.iter().filter_map(AppEvent::id).collect();
+    assert_eq!(ids.len(), 2, "{:?}", report.events);
+    assert!(ids[0] < ids[1]);
+    app.ack_events(ids[0]).await.unwrap();
+    let mut app = w.load(me).await;
+    let events = app.take_events();
+    assert_eq!(
+        events.iter().filter_map(AppEvent::id).collect::<Vec<_>>(),
+        vec![ids[1]]
+    );
+    assert_eq!(refused_events(&events, refused).len(), 1, "{events:?}");
+}
+
+#[tokio::test]
+async fn test_duty_event_reported_only_with_its_commit() {
+    let w = World::new();
+    let (app, _, _) = refusing(&w).await;
+    let (mut app, counting) = load_behind(&w, app, StoreFault::None).await;
+    app.receive(None).await.unwrap();
+    let commits = counting.commits();
+    assert!(commits > 1, "the read commits {commits} times");
+    // Each commit of the read fails once in turn: a refusal whose commit failed isn't
+    // reported, so it is reported at most once in all, and only as kept.
+    for n in 1..=commits {
+        let w = World::new();
+        let (app, refused, after) = refusing(&w).await;
+        let (mut app, _) = load_behind(&w, app, StoreFault::FailBefore(n)).await;
+        let mut events = match app.receive(None).await {
+            Ok(report) => report.events,
+            Err(_) => app.take_events(),
+        };
+        events.extend(app.receive(None).await.unwrap().events);
+        let reported = refused_events(&events, refused);
+        assert!(reported.len() <= 1, "commit {n}: {events:?}");
+        let kept = app.unacknowledged_events().await.unwrap();
+        for event in &reported {
+            assert!(kept.contains(event), "commit {n}: {event:?} isn't kept");
+        }
+        assert!(app.cursor().seq >= after, "commit {n}");
+    }
 }
 
 #[tokio::test]
@@ -1769,7 +1945,7 @@ async fn test_app_effect_over_one_batch_is_parked_and_the_feed_goes_on() {
     for seq in [first, second] {
         assert!(has(&report.events, |e| matches!(
             e,
-            AppEvent::Parked { seq: s, reason: ParkReason::TooManyOperations } if *s == seq
+            AppEvent::Parked { id: Some(_), seq: s, reason: ParkReason::TooManyOperations } if *s == seq
         )));
         assert!(has(&report.events, |e| matches!(
             e,

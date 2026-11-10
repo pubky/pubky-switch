@@ -1806,13 +1806,31 @@ async fn test_key_change_drops_a_kept_batch_older_than_the_batch_window() {
     assert!(
         has(&report.events, |e| matches!(
             e,
-            AppEvent::AttemptDropped { claim_key, attempt_id }
+            AppEvent::AttemptDropped { claim_key, attempt_id, .. }
                 if *claim_key == CLAIM && *attempt_id == ATTEMPT
         )),
         "{:?}",
         report.events
     );
     assert_eq!(allow_ops_for(&changed.applied(), carol), 0);
+    // Both are duty events: a load delivers them again until acknowledged.
+    let mut loaded = App::load(
+        router.env(&w, Arc::clone(&w.store) as Arc<dyn StateStore>),
+        w.protocol.clone(),
+        World::config(),
+        app.app_id(),
+    )
+    .await
+    .unwrap();
+    let events = loaded.take_events();
+    let duties: Vec<AppEvent> = report
+        .events
+        .iter()
+        .filter(|e| e.is_duty())
+        .cloned()
+        .collect();
+    assert_eq!(duties.len(), 2, "{:?}", report.events);
+    assert_eq!(events, duties);
 }
 
 #[tokio::test]
@@ -1938,6 +1956,24 @@ async fn test_key_change_parks_a_kept_effect_older_than_the_batch_window() {
     let report = app.receive(None).await.unwrap();
     assert!(!received(&report.events, seq), "{:?}", report.events);
     assert_eq!(conversations_at(&changed), 0);
+    // The protocol is told durably: a load delivers it again until it is acknowledged.
+    let loaded = App::load(
+        router.env(&w, Arc::clone(&w.store) as Arc<dyn StateStore>),
+        w.protocol.clone(),
+        World::config(),
+        me,
+    )
+    .await
+    .unwrap()
+    .take_events();
+    assert!(
+        has(&loaded, |e| matches!(
+            e,
+            AppEvent::EffectUncertain { id, seq: s, .. } if *s == seq && e.id() == Some(*id)
+        )),
+        "{loaded:?}"
+    );
+    assert!(loaded.iter().all(AppEvent::is_duty), "{loaded:?}");
 }
 
 /// The app at `store`, loaded through the loss's router.
