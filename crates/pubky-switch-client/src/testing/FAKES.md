@@ -95,16 +95,20 @@ service.
   checks, for scripting what another signer or a faulty service did. `forget_delivery_proof`
   makes a retry answer with no proof.
 - **`GET /apps`** (Switch wire 7.4.12), in `switch/signer.rs`: by the service's rules, member
-  by member, but `recovery` (below):
+  by member, but `last_seen`, `unread_entries`, `sole_target_unread` and `recovery` (below):
   - every app the switch holds, every App ID it keeps for good, and every app the newest
     document lists. An App ID an enrollment named shows `revoked_at` at the enrollment's time;
-  - `current` in spec 3.4's sense once the app has a record: listed with its certificate, or
+  - `current` in spec 3.4's sense, as the service reports it, once the app has a record: listed with its certificate, or
     renewed and open, and never once revoked, departed or kept. Expiry isn't part of it:
     `cert_expires_at` carries that, and a signer that serves an app checks both. An app with
     no record is current while it is listed and not kept;
   - `last_seen`: the time of the app's latest request past authentication, a staged
-    account's refusal and a scripted error other than a `401` included. The scripted switch
-    takes an app with a record that isn't revoked, departed or kept as authenticated;
+    account's refusal included. The scripted switch doesn't authenticate an own app's
+    requests one by one: it takes any app with a record that isn't revoked, departed or kept
+    as authenticated. So, unlike the service, it counts an app whose certificate expired or
+    isn't listed, which the service refuses at authentication (`cert_expired`,
+    `not_current`) before recording anything, and it counts any scripted error other than a
+    `401`;
   - `revoked_at`, `departed_at`, and `awaiting_rotation` for a departure until a delivered
     version removes it at a higher data epoch. That stays done after a purge;
   - `open_attempts`: the attempts the app owns that are open or `unknown`;
@@ -113,14 +117,16 @@ service.
   - `keys_through` by the core's rule, counting only the stored parts the app's cursor has
     passed. It starts at the epoch of the first version that listed the app, kept only for an
     app with no row and no stored part then, as the service keeps it; otherwise the start is
-    unknown, and only parts from epoch 1 count;
+    unknown, and only parts from epoch 1 count. A row is an entry in the switch's apps, which
+    an `app.put`, a revocation, a departure, a `cert.put` and some test calls create;
   - the account's `identity`, `recovery` as the spec's object (`declared_at` its recovery
     record's time), where the service sends `null` until it serves recoveries, and
     `proof_generations` from the same kept proofs as the delivery, the member left out when
     there are none.
 
-  `unread_entries` and `sole_target_unread` are 0 and `lagging` is false, as on the service
-  until it serves `POST /inbox`. The test call `forget_bundle_parts` scripts a faulty service
+  `unread_entries` and `sole_target_unread` are always 0, where the service counts them over
+  the current targets, expired certificates included; no signer or app code reads them.
+  `lagging` is false, as on the service. The test call `forget_bundle_parts` scripts a faulty service
   that lost an app's stored parts.
 - **Moves and recovery** (Switch spec 12.5, 12.6, Switch wire 10): `import_into` copies the
   account in memory, with no manifest, chunks or export transfer; a recovery upload is kept
