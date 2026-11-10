@@ -95,26 +95,32 @@ service.
   checks, for scripting what another signer or a faulty service did. `forget_delivery_proof`
   makes a retry answer with no proof.
 - **`GET /apps`** (Switch wire 7.4.12), in `switch/signer.rs`: by the service's rules, member
-  by member:
+  by member, but `recovery` (below):
   - every app the switch holds, every App ID it keeps for good, and every app the newest
     document lists. An App ID an enrollment named shows `revoked_at` at the enrollment's time;
   - `current` by the full rule once the app has a record: listed, or renewed and open, with a
     certificate that hasn't expired, and never once revoked, departed or kept. An app with no
     record is current while it is listed and not kept;
-  - `last_seen`: the time of the app's latest request to the switch;
+  - `last_seen`: the time of the app's latest request past authentication, a staged
+    account's refusal and a scripted error other than a `401` included. The scripted switch
+    takes an app with a record that isn't revoked, departed or kept as authenticated;
   - `revoked_at`, `departed_at`, and `awaiting_rotation` for a departure until a delivered
     version removes it at a higher data epoch. That stays done after a purge;
   - `open_attempts`: the attempts the app owns that are open or `unknown`;
   - `record_cert`, `record_at`, `full_bundle_requested`, `bundle_ranges` and
     `cert_expires_at`;
   - `keys_through` by the core's rule, counting only the stored parts the app's cursor has
-    passed;
-  - the account's `identity`, `recovery` (`declared_at` its recovery record's time), and
+    passed. It starts at the epoch of the first version that listed the app, kept only for an
+    app with no row and no stored part then, as the service keeps it; otherwise the start is
+    unknown, and only parts from epoch 1 count;
+  - the account's `identity`, `recovery` as the spec's object (`declared_at` its recovery
+    record's time), where the service sends `null` until it serves recoveries, and
     `proof_generations` from the same kept proofs as the delivery, the member left out when
     there are none.
 
   `unread_entries` and `sole_target_unread` are 0 and `lagging` is false, as on the service
-  until it serves `POST /inbox`.
+  until it serves `POST /inbox`. The test call `forget_bundle_parts` scripts a faulty service
+  that lost an app's stored parts.
 - **Moves and recovery** (Switch spec 12.5, 12.6, Switch wire 10): `import_into` copies the
   account in memory, with no manifest, chunks or export transfer; a recovery upload is kept
   and answered with fixed changes, merging nothing.
