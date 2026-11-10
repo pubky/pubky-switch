@@ -2097,25 +2097,89 @@ async fn test_duty_event_reported_only_with_its_commit() {
     app.receive(None).await.unwrap();
     let commits = counting.commits();
     assert!(commits > 1, "the read commits {commits} times");
-    // Each commit of the read fails once in turn: a refusal whose commit failed isn't
-    // reported, so it is reported at most once in all, and only as kept.
+    // Each commit of the read fails once in turn, applying nothing or applied with an
+    // answer that can't tell: a refusal is reported at most once in all, only as kept, and
+    // every kept duty event is reported.
     for n in 1..=commits {
-        let w = World::new();
-        let (app, refused, after) = refusing(&w).await;
-        let (mut app, _) = load_behind(&w, app, StoreFault::FailBefore(n)).await;
-        let mut events = match app.receive(None).await {
-            Ok(report) => report.events,
-            Err(_) => app.take_events(),
-        };
-        events.extend(app.receive(None).await.unwrap().events);
-        let reported = refused_events(&events, refused);
-        assert!(reported.len() <= 1, "commit {n}: {events:?}");
-        let kept = app.unacknowledged_events().await.unwrap();
-        for event in &reported {
-            assert!(kept.contains(event), "commit {n}: {event:?} isn't kept");
+        for fault in [StoreFault::FailBefore(n), StoreFault::FailAfter(n)] {
+            let w = World::new();
+            let (app, refused, after) = refusing(&w).await;
+            let me = app.app_id();
+            let (mut app, _) = load_behind(&w, app, fault).await;
+            let mut events = match app.receive(None).await {
+                Ok(report) => report.events,
+                Err(_) => app.take_events(),
+            };
+            events.extend(app.receive(None).await.unwrap().events);
+            let reported = refused_events(&events, refused);
+            assert!(reported.len() <= 1, "{fault:?}: {events:?}");
+            let kept = app.unacknowledged_events().await.unwrap();
+            for event in &reported {
+                assert!(kept.contains(event), "{fault:?}: {event:?} isn't kept");
+            }
+            for event in &kept {
+                assert!(
+                    events.contains(event),
+                    "{fault:?}: {event:?} kept, never reported"
+                );
+            }
+            assert!(app.cursor().seq >= after, "{fault:?}");
+            // A later duty event, acknowledged: nothing kept is removed unreported.
+            let later = refuse_next(&w, &mut app).await;
+            events.extend(later.iter().cloned());
+            app.ack_events(last_id(&later)).await.unwrap();
+            for event in app.unacknowledged_events().await.unwrap() {
+                assert!(
+                    !events.contains(&event),
+                    "{fault:?}: {event:?} acknowledged, kept"
+                );
+            }
+            assert_eq!(w.load(me).await.take_events(), Vec::new(), "{fault:?}");
         }
-        assert!(app.cursor().seq >= after, "commit {n}");
     }
+}
+
+#[tokio::test]
+async fn test_duty_event_kept_but_not_taken_survives_an_acknowledgement() {
+    // The commit that keeps the refusal is applied, but answers that it can't tell: the
+    // read fails, and nothing reports the refusal yet.
+    let mut found = false;
+    for n in 1..=8 {
+        let w = World::new();
+        let (app, seq, _) = refusing(&w).await;
+        let (mut app, _) = load_behind(&w, app, StoreFault::FailAfter(n)).await;
+        if app.receive(None).await.is_ok() {
+            continue;
+        }
+        if !refused_events(&app.take_events(), seq).is_empty()
+            || refused_events(&app.unacknowledged_events().await.unwrap(), seq).is_empty()
+        {
+            continue;
+        }
+        found = true;
+        let kept = app.unacknowledged_events().await.unwrap();
+        // An acknowledgement before the host takes it leaves it kept.
+        app.ack_events(last_id(&kept)).await.unwrap();
+        assert_eq!(
+            refused_events(&app.unacknowledged_events().await.unwrap(), seq).len(),
+            1,
+            "commit {n}"
+        );
+        // The reload queued it: taken, then acknowledged, it goes.
+        let taken = app.take_events();
+        assert_eq!(
+            refused_events(&taken, seq).len(),
+            1,
+            "commit {n}: {taken:?}"
+        );
+        app.ack_events(last_id(&taken)).await.unwrap();
+        assert!(app.unacknowledged_events().await.unwrap().is_empty());
+        break;
+    }
+    assert!(
+        found,
+        "a commit keeping the refusal answers that it can't tell"
+    );
 }
 
 #[tokio::test]

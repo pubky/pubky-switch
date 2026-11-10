@@ -12,7 +12,8 @@
 //! (Switch spec 12.5 "Kept batches", 12.6 step 5); a message deleted from the outbox
 //! undelivered (Switch spec 11). Each carries a stable [`EventId`] and is kept in the
 //! store (`duty/<id>`) in the same commit as the change it reports, so no crash separates
-//! the two. It is reported once that commit is done, again by every [`super::App::load`],
+//! the two. It is reported once that commit is done, or, for a commit whose answer can't
+//! tell whether it was applied, by the reload after it; again by every [`super::App::load`],
 //! and listed by [`super::App::unacknowledged_events`], until the host acknowledges it with
 //! [`super::App::ack_events`]: delivery is at least once. A host and its protocol must
 //! therefore tolerate a duty event seen twice, and act on it only once they have kept what

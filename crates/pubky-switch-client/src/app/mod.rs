@@ -419,6 +419,12 @@ pub struct App {
     /// The last Homeserver read that confirmed the own `identity.json`; kept in memory only.
     identity_confirmed: Option<identity::Confirmed>,
     events: Vec<AppEvent>,
+    /// The highest duty event counter queued in `events` since the app was made: a kept one
+    /// above it is queued after a reload (`events` module, "Duty events").
+    duty_queued: u64,
+    /// The highest duty event counter handed to the host since the app was made: no
+    /// acknowledgement removes one above it.
+    duty_handed: u64,
 }
 
 impl std::fmt::Debug for App {
@@ -576,6 +582,8 @@ impl App {
                 service_time_dirty: false,
                 identity_confirmed: None,
                 events: Vec::new(),
+                duty_queued: 0,
+                duty_handed: 0,
             };
             app.update_keys_through();
             app.events.clear();
@@ -693,6 +701,8 @@ impl App {
                 service_time_dirty: false,
                 identity_confirmed: None,
                 events: Vec::new(),
+                duty_queued: 0,
+                duty_handed: 0,
             };
             // A store an earlier build wrote keeps the epoch read now.
             if !app.reader().exists(key::DUTY_EPOCH).await? {
@@ -701,7 +711,8 @@ impl App {
                 tx.commit(&app.env.store).await?;
             }
             // Duty events not acknowledged before are delivered again (`events` module).
-            app.events = app.unacknowledged_events().await?;
+            let kept = app.unacknowledged_events().await?;
+            app.queue_duties(kept);
             Ok(app)
         })
         .await
@@ -989,6 +1000,8 @@ impl App {
                 service_time_dirty: false,
                 identity_confirmed: None,
                 events: Vec::new(),
+                duty_queued: 0,
+                duty_handed: 0,
             };
             let mut tx = Tx::new(&app.ns);
             tx.delete_prefix("")?;
@@ -1000,7 +1013,8 @@ impl App {
                 tx.put(stored, value)?;
             }
             tx.commit(&app.env.store).await?;
-            app.events = app.unacknowledged_events().await?;
+            let kept = app.unacknowledged_events().await?;
+            app.queue_duties(kept);
             Ok(app)
         })
         .await
@@ -1235,7 +1249,33 @@ impl App {
     /// Take the events collected since the last call. Duty events among them stay kept
     /// until [`App::ack_events`] acknowledges them (`events` module, "Duty events").
     pub fn take_events(&mut self) -> Vec<AppEvent> {
-        std::mem::take(&mut self.events)
+        let events = std::mem::take(&mut self.events);
+        for id in events.iter().filter_map(AppEvent::id) {
+            self.duty_handed = self.duty_handed.max(id.counter());
+        }
+        events
+    }
+
+    /// Queue duty events for the host, in order, and keep how far they go.
+    fn queue_duties(&mut self, duties: Vec<AppEvent>) {
+        for id in duties.iter().filter_map(AppEvent::id) {
+            self.duty_queued = self.duty_queued.max(id.counter());
+        }
+        self.events.extend(duties);
+    }
+
+    /// After a reload: the kept duty events no call queued, such as those of a commit that
+    /// answered [`StoreError::Unknown`] and was applied, queued now.
+    async fn queue_unreported_duties(&mut self) -> Result<(), AppError> {
+        let queued = self.duty_queued;
+        let kept: Vec<AppEvent> = self
+            .unacknowledged_events()
+            .await?
+            .into_iter()
+            .filter(|event| event.id().is_some_and(|id| id.counter() > queued))
+            .collect();
+        self.queue_duties(kept);
+        Ok(())
     }
 
     /// The duty events kept and not acknowledged yet, by ascending ID: what a host that
@@ -1260,7 +1300,9 @@ impl App {
     /// [`App::load`] delivers them again. IDs rise in the order the events are reported,
     /// so a host acknowledges after acting on every duty event it took up to that ID. An
     /// ID no event has yet acknowledges only those before it. IDs compare only within one
-    /// store ([`EventId::cmp_same_store`]).
+    /// store ([`EventId::cmp_same_store`]). Only events this app value handed to the host,
+    /// by [`App::take_events`] or a call's report, are removed: one kept but not yet taken,
+    /// such as one queued after a reload, stays until it is taken and acknowledged.
     ///
     /// The host must call this once it has handed the events to its protocol and the
     /// protocol has kept what they say: nothing else removes a kept duty event, so a host
@@ -1281,9 +1323,11 @@ impl App {
                 )
                 .into());
             }
+            // Only what the host was handed: a kept event it never took stays.
+            let through = up_to.counter().min(self.duty_handed);
             let kept = self.reader().scan_numbers(key::DUTY_PREFIX).await?;
             let mut tx = self.tx()?;
-            for n in kept.range(..=up_to.counter()) {
+            for n in kept.range(..=through) {
                 tx.delete(&key::duty(*n))?;
             }
             self.commit(tx).await
@@ -1627,7 +1671,7 @@ impl App {
         match tx.commit(&self.env.store).await {
             Ok(()) => {
                 self.service_time_dirty = false;
-                self.events.extend(duties);
+                self.queue_duties(duties);
                 Ok(())
             }
             Err(error) => {
@@ -1649,6 +1693,7 @@ impl App {
             )?;
             self.reload = false;
             self.service_time_dirty = false;
+            self.queue_unreported_duties().await?;
         }
         Ok(())
     }
