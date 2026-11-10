@@ -158,4 +158,13 @@ pub enum Alert {
     /// wire 3.13). The backup on the Homeserver is the one restored from; the next version's
     /// backup write replaces it.
     BackupNotWritten,
+    /// A restore found the switch or the backup claiming keys sent past the next data
+    /// epoch, which can't be: epochs never skip, and at most one is in progress beyond
+    /// `data_epoch` (Switch spec 3.2, 3.5). The floor is kept at the next epoch.
+    EpochFloorBounded {
+        /// The highest epoch claimed.
+        claimed: u64,
+        /// The floor kept.
+        kept: u64,
+    },
 }

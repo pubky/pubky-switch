@@ -112,6 +112,14 @@ pub(crate) struct SignerState {
     /// owed deletion, so the user can clear it while a deletion keeps failing.
     #[serde(default)]
     pub(crate) grant_reminded: Vec<[u8; 16]>,
+    /// The removed apps a restore found whose record may still be on the Homeserver: the
+    /// routine run checks them, a few at a time, and owes the deletion of those it finds.
+    #[serde(default)]
+    pub(crate) deletion_checks: Vec<[u8; 16]>,
+    /// A restore's backup write is owed: it raced another signer, so it is written once its
+    /// delivery has won (Switch wire 3.13).
+    #[serde(default)]
+    pub(crate) backup_owed: bool,
     /// The full-bundle requests whose answer the switch refused, not tried again until the
     /// app asks anew.
     #[serde(default)]
@@ -242,6 +250,8 @@ impl SignerState {
             revoking: Vec::new(),
             cleanup: Vec::new(),
             grant_reminded: Vec::new(),
+            deletion_checks: Vec::new(),
+            backup_owed: false,
             refused_requests: Vec::new(),
             listed_at: Vec::new(),
             alerts: Vec::new(),

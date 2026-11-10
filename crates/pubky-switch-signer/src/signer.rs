@@ -260,7 +260,11 @@ impl Signer {
             // owed"). Only the backup write comes before it, as before every delivery
             // (Switch wire 3.13).
             if !self.queue_owed_closing().await? {
+                // A restore's backup is written once its delivery has won, before publication,
+                // so a failed publication doesn't hold it back (Switch wire 3.13).
+                self.write_owed_backup().await?;
                 self.publish().await?;
+                self.check_owed_deletions().await?;
                 // A removed app's record goes once its removal is published (Switch spec
                 // 12.2 step 4).
                 return self.clean_up_removed().await;
@@ -777,6 +781,9 @@ impl Signer {
             .put(SIGNER_BACKUP_PATH, bytes)
             .await
             .map_err(SignerError::Homeserver)?;
+        // A newer backup replaces one a restore owed.
+        state.backup_owed = false;
+        state.alerts.retain(|a| *a != Alert::BackupNotWritten);
         let flow = Flow::Deliver {
             doc: doc.clone(),
             prev,

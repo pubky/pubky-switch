@@ -11,25 +11,32 @@
 //! - the Homeserver's copy is neither newer than the backup's version nor another document at
 //!   it.
 //!
-//! The install then takes the backup's records as its own, with these additions: the App IDs
-//! `GET /apps` shows revoked or departed join the tombstones; the epoch floor is the highest
-//! epoch whose keys the records or the switch show were sent; and a removed app whose record
-//! is still on the Homeserver gets its deletion owed again, with its grant reminder raised once
-//! more. It delivers the next version naming this install as the signer, publishes it, and
-//! writes its own backup once that delivery has won (wire 3.13 "When it is written"). Records
-//! behind their own newer version, or an install another took over from, are restored in
-//! place this way.
+//! In place, the install's own records are checked too: no alarm stands, since a restore never
+//! clears one, and the backup isn't below the mark (wire 3.3 "Never back").
+//!
+//! The install then takes the backup's records as its own, with these additions:
+//! - the App IDs `GET /apps` shows revoked or departed join the tombstones, and, in place, so
+//!   do this install's own, with the revocations it asked for and the deletions it owes;
+//! - the epoch floor is the highest epoch whose keys the records or the switch show were
+//!   sent, at most one past `data_epoch`;
+//! - the removed apps are left for the routine run to check, whose record still on the
+//!   Homeserver owes its deletion again, with its grant reminder raised once more.
+//!
+//! It delivers the next version naming this install as the signer, publishes it, and owes its
+//! own backup, which `resume` writes once that delivery has won (wire 3.13 "When it is
+//! written"). Records behind their own newer version, or an install another took over from,
+//! are restored in place this way.
 
 use pubky_switch_core::records::{IDENTITY_PATH, IdentityDoc, SIGNER_BACKUP_PATH, app_record_path};
 use pubky_switch_core::sig::SignedDoc;
 
-use super::Signer;
 use super::SignerEnv;
 use super::clients::{RequestClient, Target};
 use super::revocation::UserConfirmed;
+use super::{Signer, gate};
 use crate::alert::Alert;
 use crate::error::{Refusal, Result, SignerError};
-use crate::key::IdentityKeyring;
+use crate::key::{BackupView, IdentityKeyring};
 use crate::state::{self, DeliverStep, Flow, Newest, Service, SignerState};
 
 impl Signer {
@@ -58,7 +65,7 @@ impl Signer {
             flow: None,
             unsure: false,
         };
-        signer.restore_records(confirmed).await?;
+        signer.restore_records(false, confirmed).await?;
         Ok(signer)
     }
 
@@ -78,10 +85,14 @@ impl Signer {
         if self.flow.is_some() {
             return Err(Refusal::FlowInProgress.into());
         }
-        self.restore_records(confirmed).await
+        self.restore_records(true, confirmed).await
     }
 
-    async fn restore_records(&mut self, _confirmed: UserConfirmed) -> Result<IdentityDoc> {
+    async fn restore_records(
+        &mut self,
+        in_place: bool,
+        _confirmed: UserConfirmed,
+    ) -> Result<IdentityDoc> {
         let identity = self.state.identity;
         let bytes = self
             .env
@@ -105,40 +116,13 @@ impl Signer {
         let answer = RequestClient::new(&self.env, &target, &self.keyring)?
             .apps()
             .await?;
-        // Check 3: the switch's copy is the backup's version, or the one it builds on.
-        let held = answer
-            .identity
-            .as_ref()
-            .map(|signed| IdentityDoc::verify(signed, &identity))
-            .transpose()?;
-        let first = match (&held, view.prev) {
-            (Some(copy), _) if copy.hash() == doc.hash() => None,
-            (Some(copy), Some(prev)) if copy.hash() == prev => Some(view.prev),
-            (None, None) => Some(None),
-            _ => return Err(Refusal::StaleBackup.into()),
-        };
-        // And the Homeserver's copy isn't past it.
-        if let Some(copy) = self
-            .env
-            .homeserver
-            .get(IDENTITY_PATH)
-            .await
-            .map_err(SignerError::Homeserver)?
-            .and_then(|bytes| serde_json::from_slice::<SignedDoc>(&bytes).ok())
-            .and_then(|signed| IdentityDoc::verify(&signed, &identity).ok())
-        {
-            let past = copy.version() > doc.version()
-                || copy.generation() > doc.generation()
-                || (copy.version() == doc.version() && copy.hash() != doc.hash());
-            if past {
-                return Err(Refusal::StaleBackup.into());
-            }
-        }
+        let first = self
+            .check_restore(&view, answer.identity.as_ref(), in_place)
+            .await?;
 
         let mut state = SignerState::new(identity, self.state.install);
-        // The versions this install spent stay spent, and the user's other alerts stay; those
-        // about the records restored over go, and so do alarms, which the checks above
-        // answer for the restored records.
+        // The versions this install spent stay spent. Of the user's alerts, those about the
+        // records restored over go; an alarm can't stand here (`check_restore`).
         state.signed_through = self.state.signed_through.max(doc.version());
         state.alerts = self
             .state
@@ -147,10 +131,7 @@ impl Signer {
             .filter(|a| {
                 !matches!(
                     a,
-                    Alert::RecordsBehind { .. }
-                        | Alert::ManagedByOtherInstall { .. }
-                        | Alert::Rollback { .. }
-                        | Alert::Equivocation { .. }
+                    Alert::RecordsBehind { .. } | Alert::ManagedByOtherInstall { .. }
                 )
             })
             .cloned()
@@ -158,7 +139,9 @@ impl Signer {
         state.service = Some(service);
         state.certs = view.certs.iter().map(|c| c.signed().clone()).collect();
         state.bundle_parts = view.bundle_parts.clone();
-        // Revoked for good: the backup's, `identity_doc`'s `removed`, and what the switch shows.
+        // Revoked for good: the backup's, `identity_doc`'s `removed`, what the switch shows,
+        // and, in place, this install's own, with the revocations it asked for and the
+        // deletions it owes.
         let mut tombstones = view.revoked_apps.clone();
         tombstones.extend(doc.body().removed.iter().map(|r| r.app_id));
         tombstones.extend(
@@ -168,11 +151,21 @@ impl Signer {
                 .filter(|s| s.revoked_at.is_some() || s.departed_at.is_some())
                 .map(|s| s.app_id),
         );
+        if in_place {
+            tombstones.extend(self.state.tombstones.iter().copied());
+            state.revoking.clone_from(&self.state.revoking);
+            state.cleanup.clone_from(&self.state.cleanup);
+        }
         tombstones.sort_unstable();
         tombstones.dedup();
+        // The apps the restored document lists get no listing floor for their removal time:
+        // the time they were first listed is unknown here, and a reported time before it
+        // changes nothing anyway (Switch spec 12.3).
+        state.listed_at = doc.body().apps.iter().map(|a| (a.app_id, 0)).collect();
         // The epoch floor: the highest epoch whose keys were sent, by the records or as the
-        // switch shows (Switch spec 3.2, 3.5).
-        state.epoch_through = view
+        // switch shows, and never more than one past `data_epoch`, since epochs never skip
+        // (Switch spec 3.2, 3.5).
+        let claimed = view
             .bundle_parts
             .iter()
             .map(|p| p.last_epoch)
@@ -184,21 +177,22 @@ impl Signer {
                     .flat_map(|s| s.bundle_ranges.iter().map(|r| r.last)),
             )
             .fold(doc.data_epoch(), u64::max);
-        // A removed app whose record is still on the Homeserver owes its deletion again; its
-        // grant reminder is raised once more, since this install can't tell it was seen.
-        for app_id in &tombstones {
-            if doc.listed_cert(app_id).is_none()
-                && self
-                    .env
-                    .homeserver
-                    .get(&app_record_path(app_id))
-                    .await
-                    .map_err(SignerError::Homeserver)?
-                    .is_some()
-            {
-                state.cleanup.push(*app_id);
-            }
+        let most = doc.data_epoch().saturating_add(1);
+        if claimed > most {
+            state.alert(Alert::EpochFloorBounded {
+                claimed,
+                kept: most,
+            });
         }
+        state.epoch_through = claimed.min(most);
+        // A removed app's record may still be on the Homeserver: the routine run checks, a
+        // few at a time, and owes its deletion with its grant reminder raised once more,
+        // since this install can't tell the user saw it. Taking over doesn't wait for that.
+        state.deletion_checks = tombstones
+            .iter()
+            .copied()
+            .filter(|app| doc.listed_cert(app).is_none() && !state.cleanup.contains(app))
+            .collect();
         state.tombstones = tombstones;
         state.newest = Some(Newest {
             doc: doc.signed().clone(),
@@ -217,7 +211,8 @@ impl Signer {
         self.finish_flow().await?;
 
         // The next version, naming this install as the signer. It races any other signer, so
-        // its backup is written once it has won (Switch wire 3.13).
+        // its backup is owed, and written by `resume` once the delivery has won (Switch wire
+        // 3.13).
         let key = self.signing_key()?;
         let (next, flow) = self.next_version(&key, |_| {})?;
         drop(key);
@@ -231,6 +226,7 @@ impl Signer {
         };
         let mut state = self.state.clone();
         state.signed_through = next.version();
+        state.backup_owed = true;
         let flow = Flow::Deliver {
             doc: signed,
             prev,
@@ -239,30 +235,135 @@ impl Signer {
         };
         self.commit(state, Some(flow)).await?;
         self.resume().await?;
-        self.write_backup_after_win().await?;
         Ok(next)
     }
 
-    /// Write the backup holding the newest version, after a delivery that raced another
-    /// signer has won (Switch wire 3.13). A write that fails leaves an alert, and the next
-    /// version's backup write repairs it.
-    async fn write_backup_after_win(&mut self) -> Result<()> {
+    /// The checks a restore passes before it takes the backup's records (Switch wire 3.13
+    /// "Restoring"). They are its only guard: once the records are replaced, the signing gate
+    /// passes by construction. Returns, when the backup's own version is to be delivered
+    /// first, the `prev` it builds on.
+    ///
+    /// - In place, the records' own state: no alarm stands, since a restore never clears
+    ///   one, and the backup isn't below the mark, by version or generation, nor another
+    ///   body at its version (Switch wire 3.3 "Never back").
+    /// - The switch's copy, `held`, is the backup's version, or the one it builds on, or
+    ///   none under a backup of the account's first version.
+    /// - The Homeserver's copy is neither newer than the backup's version nor another
+    ///   document at it.
+    async fn check_restore(
+        &self,
+        view: &BackupView,
+        held: Option<&SignedDoc>,
+        in_place: bool,
+    ) -> Result<Option<Option<[u8; 32]>>> {
+        let identity = self.state.identity;
+        let doc = &view.identity_doc;
+        if in_place {
+            if let Some(alarm) = gate::held_alarm(&self.state) {
+                return Err(SignerError::Alarm(alarm.clone()));
+            }
+            if self.state.switch_unconfirmed {
+                return Err(Refusal::SwitchUnconfirmed.into());
+            }
+            if let Some(mark) = self.high_water() {
+                let below = doc.version() < mark.version
+                    || doc.generation() < mark.generation
+                    || (doc.version() == mark.version && doc.body_hash() != mark.body_hash);
+                if below {
+                    return Err(Refusal::StaleBackup.into());
+                }
+            }
+        }
+        let held = held
+            .map(|signed| IdentityDoc::verify(signed, &identity))
+            .transpose()?;
+        let first = match (&held, view.prev) {
+            (Some(copy), _) if copy.hash() == doc.hash() => None,
+            (Some(copy), Some(prev)) if copy.hash() == prev => Some(view.prev),
+            (None, None) => Some(None),
+            _ => return Err(Refusal::StaleBackup.into()),
+        };
+        if let Some(copy) = self
+            .env
+            .homeserver
+            .get(IDENTITY_PATH)
+            .await
+            .map_err(SignerError::Homeserver)?
+            .and_then(|bytes| serde_json::from_slice::<SignedDoc>(&bytes).ok())
+            .and_then(|signed| IdentityDoc::verify(&signed, &identity).ok())
+        {
+            let past = copy.version() > doc.version()
+                || copy.generation() > doc.generation()
+                || (copy.version() == doc.version() && copy.hash() != doc.hash());
+            if past {
+                return Err(Refusal::StaleBackup.into());
+            }
+        }
+        Ok(first)
+    }
+
+    /// Write the backup a restore owes, holding the newest version, once its delivery has won
+    /// (Switch wire 3.13 "When it is written"). A write that fails raises
+    /// [`Alert::BackupNotWritten`] and stays owed; nothing is held back by it.
+    pub(super) async fn write_owed_backup(&mut self) -> Result<()> {
+        if !self.state.backup_owed || self.flow.is_some() || gate::refusal(&self.state).is_some() {
+            return Ok(());
+        }
         let Some(newest) = self.state.newest.clone() else {
             return Ok(());
         };
         let backup = self.seal_backup(&newest.doc, newest.prev)?;
         let bytes = serde_json::to_vec(&backup).map_err(|e| SignerError::Records(e.to_string()))?;
-        if self
+        let written = self
             .env
             .homeserver
             .put(SIGNER_BACKUP_PATH, bytes)
             .await
-            .is_err()
-        {
-            let mut state = self.state.clone();
+            .is_ok();
+        let mut state = self.state.clone();
+        if written {
+            state.backup_owed = false;
+            state.alerts.retain(|a| *a != Alert::BackupNotWritten);
+        } else {
             state.alert(Alert::BackupNotWritten);
+        }
+        if state != self.state {
+            self.commit(state, None).await?;
+        }
+        Ok(())
+    }
+
+    /// Check, a few at a time, whether the record of a removed app a restore found is still
+    /// on the Homeserver, and owe its deletion if it is (Switch spec 12.2 step 4). A read that
+    /// fails postpones the rest to the next run.
+    pub(super) async fn check_owed_deletions(&mut self) -> Result<()> {
+        if self.state.deletion_checks.is_empty() {
+            return Ok(());
+        }
+        let mut state = self.state.clone();
+        let batch: Vec<[u8; 16]> = state
+            .deletion_checks
+            .iter()
+            .take(DELETION_CHECKS_PER_RUN)
+            .copied()
+            .collect();
+        for app_id in batch {
+            match self.env.homeserver.get(&app_record_path(&app_id)).await {
+                Ok(found) => {
+                    state.deletion_checks.retain(|a| *a != app_id);
+                    if found.is_some() && !state.cleanup.contains(&app_id) {
+                        state.cleanup.push(app_id);
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        if state != self.state {
             self.commit(state, self.flow.clone()).await?;
         }
         Ok(())
     }
 }
+
+/// How many removed apps' records a run checks for.
+const DELETION_CHECKS_PER_RUN: usize = 32;

@@ -313,3 +313,293 @@ async fn test_restore_keeps_a_revocation_only_the_switch_shows() {
         Err(SignerError::Refused(Refusal::AppRequest(ref why))) if why.contains("step 4")
     ));
 }
+
+/// A backup of `doc`, the switch's copy, written as a signer would, with these records.
+fn backup_of(
+    world: &World,
+    doc: &IdentityDoc,
+    revoked: &[[u8; 16]],
+    apps: &[&App],
+    parts: &[pubky_switch_core::records::StoredPart],
+) -> Vec<u8> {
+    let certs: Vec<_> = apps
+        .iter()
+        .map(|app| world.switch.app(&app.keys.app_id_bytes()).cert.unwrap())
+        .collect();
+    let records = SignerRecords::new(
+        IdentityKey::from_secret(SECRET),
+        doc.clone(),
+        revoked,
+        &certs,
+        Limits::default(),
+        parts,
+        None,
+    )
+    .unwrap();
+    serde_json::to_vec(&SignerBackup::seal(&world.key, &records).unwrap()).unwrap()
+}
+
+/// The switch, its backup and the Homeserver's `identity.json` as they are now, to put back.
+fn snapshot(world: &World) -> (IdentityDoc, Vec<u8>, Vec<u8>) {
+    (
+        world.switch.identity_doc().unwrap(),
+        world.homeserver.file(SIGNER_BACKUP_PATH).unwrap(),
+        world.homeserver.file(IDENTITY_PATH).unwrap(),
+    )
+}
+
+fn put_back(world: &World, (doc, backup, published): &(IdentityDoc, Vec<u8>, Vec<u8>)) {
+    world.switch.deliver_identity(doc).unwrap();
+    world.homeserver.set(SIGNER_BACKUP_PATH, backup.clone());
+    world.homeserver.set(IDENTITY_PATH, published.clone());
+}
+
+#[tokio::test]
+async fn test_restore_in_place_refuses_a_backup_below_the_mark() {
+    // The install revoked `a` at version 4. The switch, the backup and the Homeserver all go
+    // back to version 3: restoring over that would list `a` again, so it is refused.
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let (a, _) = two_joined(&world, &mut signer).await;
+    let before = snapshot(&world);
+    signer
+        .revoke(a.keys.app_id_bytes(), None, confirmed())
+        .await
+        .unwrap();
+    put_back(&world, &before);
+    let sent = world.sent_docs().len();
+    assert_eq!(
+        signer.restore(confirmed()).await.unwrap_err(),
+        SignerError::Refused(Refusal::StaleBackup)
+    );
+    assert_eq!(world.sent_docs().len(), sent);
+}
+
+#[tokio::test]
+async fn test_restore_in_place_never_clears_an_alarm() {
+    // The same rollback, seen first by a signing call: the alarm stands, and the restore is
+    // refused while it does.
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let (a, _) = two_joined(&world, &mut signer).await;
+    let before = snapshot(&world);
+    signer
+        .revoke(a.keys.app_id_bytes(), None, confirmed())
+        .await
+        .unwrap();
+    put_back(&world, &before);
+    let SignerError::Alarm(alarm) = signer.set_record_max_age(Some(60)).await.unwrap_err() else {
+        panic!("no alarm")
+    };
+    assert_eq!(
+        signer.restore(confirmed()).await.unwrap_err(),
+        SignerError::Alarm(alarm.clone())
+    );
+    assert!(signer.alerts().contains(&alarm));
+    assert_eq!(signer.status(), SignerStatus::Alarm);
+}
+
+#[tokio::test]
+async fn test_restore_keeps_a_removal_time_from_before_it() {
+    // The switch revoked `a` on day 1, and a new install restores on day 5: the removal is
+    // distrusted from day 1, with no bound applied.
+    let world = World::new();
+    let (mut old, _) = world.enrolled().await;
+    let (a, _) = two_joined(&world, &mut old).await;
+    drop(old);
+    let id = a.keys.app_id_bytes();
+    world.clock.advance_ms(86_400_000);
+    world.switch.revoke(id).unwrap();
+    world.clock.advance_ms(4 * 86_400_000);
+    let mut signer = restored(&world).await.unwrap();
+    signer.run_due().await.unwrap();
+    let doc = signer.identity_doc().unwrap().unwrap();
+    assert_eq!(doc.body().removed[0].distrust_from, START_MS + 86_400_000);
+    assert!(
+        !signer
+            .alerts()
+            .iter()
+            .any(|a| matches!(a, Alert::RemovalTimeBounded { .. }))
+    );
+}
+
+#[tokio::test]
+async fn test_restore_in_place_keeps_a_revocation_asked_for() {
+    // `a`'s revocation is kept but hasn't reached the switch. Restored in place, the install
+    // still refuses `a`'s App ID, and the next run sends the revocation and removes it.
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let (a, _) = two_joined(&world, &mut signer).await;
+    let id = a.keys.app_id_bytes();
+    world.switch.fail_next(SwitchFault::Unreachable {
+        path: "/revoke".into(),
+        after: 0,
+    });
+    signer.revoke(id, None, confirmed()).await.unwrap_err();
+    signer.restore(confirmed()).await.unwrap();
+    assert!(matches!(
+        signer.review(&a.request, &a.auth),
+        Err(SignerError::Refused(Refusal::AppRequest(ref why))) if why.contains("step 4")
+    ));
+    signer.run_due().await.unwrap();
+    assert!(world.switch.app(&id).departed);
+    assert!(
+        signer
+            .identity_doc()
+            .unwrap()
+            .unwrap()
+            .listed_cert(&id)
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn test_restore_writes_its_backup_once_its_delivery_won() {
+    // The publication fails during the restore: the backup is written all the same, holding
+    // the version the switch took.
+    let world = World::new();
+    let (old, _) = world.enrolled().await;
+    drop(old);
+    *world.homeserver.failing_path.lock().unwrap() = Some(IDENTITY_PATH.into());
+    restored(&world).await.unwrap_err();
+    assert_eq!(
+        world.backup().identity_doc().signed(),
+        world.switch.identity_doc().unwrap().signed()
+    );
+}
+
+#[tokio::test]
+async fn test_restore_backup_that_cant_be_written_stays_owed() {
+    // The backup write fails after the restore's delivery: `BackupNotWritten` stays while it
+    // is owed, and the next run writes it.
+    let world = World::new();
+    let (old, _) = world.enrolled().await;
+    drop(old);
+    *world.homeserver.failing_path.lock().unwrap() = Some(SIGNER_BACKUP_PATH.into());
+    let mut signer = restored(&world).await.unwrap();
+    assert!(signer.alerts().contains(&Alert::BackupNotWritten));
+    assert_ne!(
+        world.backup().identity_doc().signed(),
+        world.switch.identity_doc().unwrap().signed()
+    );
+    *world.homeserver.failing_path.lock().unwrap() = None;
+    signer.run_due().await.unwrap();
+    assert!(!signer.alerts().contains(&Alert::BackupNotWritten));
+    assert_eq!(
+        world.backup().identity_doc().signed(),
+        world.switch.identity_doc().unwrap().signed()
+    );
+}
+
+#[tokio::test]
+async fn test_restore_keeps_the_epoch_floor_the_backup_shows() {
+    // The backup's parts show epoch 2's keys sent to `b`, which the switch doesn't show: the
+    // restored install's next rotation completes epoch 2 first, and goes to 3.
+    let world = World::new();
+    let (mut old, _) = world.enrolled().await;
+    let (a, b) = two_joined(&world, &mut old).await;
+    let doc = old.identity_doc().unwrap().unwrap();
+    drop(old);
+    let b_id = b.keys.app_id_bytes();
+    let part = pubky_switch_core::records::StoredPart {
+        app_id: b_id,
+        first_epoch: 2,
+        last_epoch: 2,
+        cert: doc.listed_cert(&b_id).unwrap(),
+    };
+    world.homeserver.set(
+        SIGNER_BACKUP_PATH,
+        backup_of(&world, &doc, &[], &[&a, &b], &[part]),
+    );
+    let mut signer = restored(&world).await.unwrap();
+    let reduce = CertChange {
+        scopes: Some(vec!["notes_sync".into()]),
+        expires_at: None,
+    };
+    let renewing = signer.renew(a.keys.app_id_bytes(), reduce).await.unwrap();
+    assert_eq!(renewing.data_epoch(), 3);
+}
+
+#[tokio::test]
+async fn test_restore_bounds_an_epoch_floor_past_the_next_epoch() {
+    // The backup claims epoch 41's keys sent at data epoch 1: epochs never skip, so the floor
+    // is kept at 2, with an alert, and the next rotation goes to 3, not 42.
+    let world = World::new();
+    let (mut old, _) = world.enrolled().await;
+    let (a, b) = two_joined(&world, &mut old).await;
+    let doc = old.identity_doc().unwrap().unwrap();
+    drop(old);
+    let b_id = b.keys.app_id_bytes();
+    let part = pubky_switch_core::records::StoredPart {
+        app_id: b_id,
+        first_epoch: 2,
+        last_epoch: 41,
+        cert: doc.listed_cert(&b_id).unwrap(),
+    };
+    world.homeserver.set(
+        SIGNER_BACKUP_PATH,
+        backup_of(&world, &doc, &[], &[&a, &b], &[part]),
+    );
+    let mut signer = restored(&world).await.unwrap();
+    assert!(signer.alerts().contains(&Alert::EpochFloorBounded {
+        claimed: 41,
+        kept: 2,
+    }));
+    let reduce = CertChange {
+        scopes: Some(vec!["notes_sync".into()]),
+        expires_at: None,
+    };
+    let renewing = signer.renew(a.keys.app_id_bytes(), reduce).await.unwrap();
+    assert_eq!(renewing.data_epoch(), 3);
+}
+
+#[tokio::test]
+async fn test_restore_keeps_the_versions_this_install_spent() {
+    // A renewal's version was signed and its batch refused, so that version is spent though
+    // nothing holds it. Restored in place, the next version goes above it.
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let (a, _) = two_joined(&world, &mut signer).await;
+    let newest = signer.identity_doc().unwrap().unwrap();
+    world.switch.fail_next(SwitchFault::Error {
+        path: "/ops".into(),
+        code: ErrorCode::Conflict,
+        current: serde_json::Value::Null,
+    });
+    let change = CertChange {
+        scopes: None,
+        expires_at: Some(START_MS + 400 * 86_400_000),
+    };
+    signer
+        .renew(a.keys.app_id_bytes(), change)
+        .await
+        .unwrap_err();
+    let restored = signer.restore(confirmed()).await.unwrap();
+    assert_eq!(restored.version(), newest.version() + 2);
+}
+
+#[tokio::test]
+async fn test_restore_keeps_the_backups_revoked_apps() {
+    // The backup names an App ID as revoked that nothing else shows: the restored install
+    // refuses it for good.
+    let world = World::new();
+    let (mut old, _) = world.enrolled().await;
+    let (a, b) = two_joined(&world, &mut old).await;
+    let doc = old.identity_doc().unwrap().unwrap();
+    drop(old);
+    let gone = App::with_keys(
+        AppKeys::from_secrets([30; 32], [31; 32]),
+        &["notes"],
+        None,
+        [32; 32],
+    );
+    world.homeserver.set(
+        SIGNER_BACKUP_PATH,
+        backup_of(&world, &doc, &[gone.keys.app_id_bytes()], &[&a, &b], &[]),
+    );
+    let signer = restored(&world).await.unwrap();
+    assert!(matches!(
+        signer.review(&gone.request, &gone.auth),
+        Err(SignerError::Refused(Refusal::AppRequest(ref why))) if why.contains("step 4")
+    ));
+}
