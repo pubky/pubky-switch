@@ -2360,6 +2360,51 @@ async fn test_key_change_drops_a_kept_batch_older_than_the_batch_window() {
 }
 
 #[tokio::test]
+async fn test_move_settling_an_applied_effect_clears_its_retry_count() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join(&w, &router).await;
+    let me = app.app_id();
+    let (seq, _) = w.note(me, "before");
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.receive(None).await.is_err());
+    // The entry's receive step had been retried for the store before.
+    app.ready_local().await.unwrap();
+    let retry = crate::app::state::RetryEntry {
+        reads: 1,
+        since_ms: w.clock.now_ms(),
+    };
+    let mut tx = app.tx().unwrap();
+    tx.put(&crate::app::state::key::retry(seq), &retry).unwrap();
+    app.commit(tx).await.unwrap();
+    app.state.retries.insert(seq, retry);
+    let n_key = next_key();
+    w.switch.freeze(&freeze_for(&w, &n_key, 2)).unwrap();
+    let next = w.switch.import_into(n_key.to_bytes());
+    router.add(NEXT, &next);
+    publish_at(
+        &w,
+        &next,
+        Inbox::new(NEXT, n_key.verifying_key().to_bytes()),
+        2,
+        None,
+    );
+    let report = app.receive(None).await.unwrap();
+    assert!(received(&report.events, seq), "{:?}", report.events);
+    // Settled at the switch: processed, its count gone, in memory and in the store.
+    assert!(app.state.retries.is_empty());
+    let loaded = App::load(
+        router.env(&w, Arc::clone(&w.store) as Arc<dyn StateStore>),
+        w.protocol.clone(),
+        World::config(),
+        me,
+    )
+    .await
+    .unwrap();
+    assert!(loaded.state.retries.is_empty());
+}
+
+#[tokio::test]
 async fn test_move_settles_an_effect_the_old_service_applied() {
     let w = World::new();
     let router = Router::of(&w);

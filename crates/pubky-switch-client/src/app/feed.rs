@@ -1030,6 +1030,10 @@ impl App {
         }
         processed_writes(&mut tx, &pending.sender, &pending.msg_id, pending.hash, now)?;
         tx.local(&pending.local)?;
+        // Processed: a count of the store's retries at it goes with it.
+        if self.state.retries.remove(&pending.seq).is_some() {
+            tx.delete(&key::retry(pending.seq))?;
+        }
         if pending.parked {
             tx.delete(&key::parked(pending.seq))?;
             self.state.parked.remove(&pending.seq);
