@@ -55,7 +55,7 @@ impl Signer {
         confirmed: UserConfirmed,
     ) -> Result<Self> {
         let identity = keyring.public_key();
-        if state::load(&env.store, &identity).await?.is_some() {
+        if state::set_up(&env.store, &identity).await? {
             return Err(Refusal::AlreadySetUp.into());
         }
         let install = pubky_switch_core::enc::random_bytes::<16>()?;
@@ -65,7 +65,6 @@ impl Signer {
             state: SignerState::new(identity, install),
             flow: None,
             unsure: false,
-            succeeded_by: None,
         };
         signer.restore_records(false, confirmed).await?;
         Ok(signer)
@@ -78,7 +77,9 @@ impl Signer {
     ///
     /// # Errors
     ///
-    /// [`Refusal::FlowInProgress`] while a flow is in progress; [`Refusal::NoBackup`] when the
+    /// [`Refusal::FlowInProgress`] while a flow is in progress; [`Refusal::HandingOver`] or
+    /// [`Refusal::TakingOver`] while a hand-over is in progress, which the abort or the
+    /// take-over ends; [`Refusal::NoBackup`] when the
     /// Homeserver holds none; [`Refusal::UnreadableBackup`] for one that doesn't open or
     /// verify; [`Refusal::StaleBackup`] when the switch's or the Homeserver's copy is past it;
     /// otherwise as [`Signer::resume`].
@@ -86,6 +87,17 @@ impl Signer {
         self.refresh().await?;
         if self.flow.is_some() {
             return Err(Refusal::FlowInProgress.into());
+        }
+        // A restore would sign the version after the one handed over, racing the new signer
+        // at its own version, and drop the hand-over from the records.
+        if let Some(handing) = &self.state.handing_over {
+            return Err(Refusal::HandingOver {
+                to_app: handing.to_app,
+            }
+            .into());
+        }
+        if self.state.taking_over {
+            return Err(Refusal::TakingOver.into());
         }
         self.restore_records(true, confirmed).await
     }

@@ -131,6 +131,11 @@ pub(crate) struct SignerState {
     /// has won and the received secret is in the vault (Switch wire 3.12).
     #[serde(default)]
     pub(crate) taking_over: bool,
+    /// The hand-over took effect, naming this install as the signer: committed before the key
+    /// is deleted, so records a crash leaves behind are deleted on the next open and count as
+    /// none for a new set-up (Switch spec 12.8).
+    #[serde(default)]
+    pub(crate) handed_over_to: Option<[u8; 16]>,
     /// The full-bundle requests whose answer the switch refused, not tried again until the
     /// app asks anew.
     #[serde(default)]
@@ -305,6 +310,7 @@ impl SignerState {
             backup_owed: false,
             handing_over: None,
             taking_over: false,
+            handed_over_to: None,
             refused_requests: Vec::new(),
             listed_at: Vec::new(),
             alerts: Vec::new(),
@@ -421,6 +427,14 @@ pub(crate) async fn delete(store: &StoreHandle, identity: &[u8; 32]) -> Result<(
     }
     store.commit(batch).await?;
     Ok(())
+}
+
+/// Whether the store holds records for `identity` that a new set-up would replace: any but
+/// those of a hand-over that took effect, which are only waiting to be deleted.
+pub(crate) async fn set_up(store: &StoreHandle, identity: &[u8; 32]) -> Result<bool> {
+    Ok(load(store, identity)
+        .await?
+        .is_some_and(|(state, _)| state.handed_over_to.is_none()))
 }
 
 /// Read the records and the flow of `identity`; `None` when the store holds none.

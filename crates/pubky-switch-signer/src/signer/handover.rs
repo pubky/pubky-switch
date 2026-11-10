@@ -21,13 +21,18 @@
 //!   its pinned key; verifying for the identity; at the version handed over plus 1 and the same
 //!   generation; naming another install; and not the abort. The switch's copy doesn't carry
 //!   the hash it builds on, but the switch took it with the compare-and-swap on the version it
-//!   held, which was the one handed over, so it builds on it. Any other newer copy, such as one
+//!   held, which was the one handed over, so it builds on it. And the Homeserver must publish
+//!   that version, or a later one of that install: the new signer publishes only once its
+//!   delivery has won, so a switch that shows each side the other's version can't make both
+//!   delete the key. Until then the key and the hand-over stay. The deletion is committed
+//!   first, so a crash between the key and the records leaves marked records, which the next
+//!   open deletes and a new set-up replaces. Any other newer copy, such as one
 //!   further on, or one only the Homeserver shows, is adopted as any other signer's, and the
 //!   key stays. Answers that decide nothing, such as a refusal of the caller, a rate limit or
 //!   a copy that doesn't verify, delete nothing.
-//! - **It is aborted.** The old signer signs the version handed over again, at its version
-//!   plus 2 so it never shares a version with the new signer's, built on the same hash, and
-//!   delivers it. Once it has won, the hand-over is over and the backup is written, as after a
+//! - **It is aborted.** Only while the switch still holds the version handed over, the old
+//!   signer signs it again, at its version plus 2 so it never shares a version with the new
+//!   signer's, built on the same hash, and delivers it. Once it has won, the hand-over is over and the backup is written, as after a
 //!   restore (Switch wire 3.13 "When it is written").
 //!
 //! The version after the one handed over may come from a third install that restored the new
@@ -37,7 +42,8 @@
 
 use pubky_switch_client::ClientError;
 use pubky_switch_client::client::answers::StoredHandover;
-use pubky_switch_core::records::{AppCert, IdentityDoc, abort_body, succeeded};
+use pubky_switch_core::records::{AppCert, IDENTITY_PATH, IdentityDoc, abort_body, succeeded};
+use pubky_switch_core::sig::SignedDoc;
 
 use super::revocation::UserConfirmed;
 use super::{Signer, gate};
@@ -81,7 +87,8 @@ impl Signer {
     /// and sent again by [`Signer::resume`].
     pub async fn hand_over_to(&mut self, to_app: [u8; 16], confirmed: UserConfirmed) -> Result<()> {
         self.ready().await?;
-        if self.owes_closing()? {
+        // Any closing owed, one waiting for a later version's service time included.
+        if !self.owed()?.is_empty() {
             return Err(Refusal::ClosingOwed.into());
         }
         if !self.state.revoking.is_empty() {
@@ -156,8 +163,16 @@ impl Signer {
         };
         // While a hand-over is in progress the only flow is its abort's delivery: one in
         // flight is sent again. Otherwise the abort is signed, and committed with its delivery;
-        // signed again, it is the same bytes.
+        // signed again, it is the same bytes. It is signed only while the switch still holds
+        // the version handed over: once the new signer has moved on, an abort at that version
+        // plus 2 would be another body at a version the new signer signed.
         if self.flow.is_none() {
+            match self.switch_at_mark().await {
+                Err(SignerError::HandedOver { install }) => {
+                    return Ok(AbortOutcome::SucceededBy { install });
+                }
+                other => other?,
+            }
             let handed = IdentityDoc::verify(&handing.doc, &self.state.identity)?;
             let (body, prev) = abort_body(&handed)?;
             let doc = {
@@ -180,8 +195,15 @@ impl Signer {
             };
             self.commit(state, Some(flow)).await?;
         }
-        match self.resume().await {
-            Ok(()) if self.state.handing_over.is_none() => Ok(AbortOutcome::Aborted {
+        let abort = self.state.handing_over.as_ref().and_then(|h| h.abort);
+        let result = self.resume().await;
+        // Once the abort has won, the hand-over is over, whatever came after it: a backup or a
+        // publication that failed is the next run's.
+        let won = self.state.handing_over.is_none()
+            && abort.is_some()
+            && self.high_water().map(|h| h.doc_hash) == abort;
+        match result {
+            _ if won => Ok(AbortOutcome::Aborted {
                 version: self.high_water().map_or(0, |h| h.version),
             }),
             Ok(()) => Err(Refusal::HandingOver {
@@ -198,8 +220,9 @@ impl Signer {
     /// the hand-over has taken effect ([`Signer::adopt`]). Nothing routine is signed, and owed
     /// work stays owed.
     pub(super) async fn continue_hand_over(&mut self) -> Result<()> {
-        self.send_hand_over().await?;
-        self.switch_at_mark().await
+        // The switch first: once the hand-over took effect, it isn't stored again.
+        self.switch_at_mark().await?;
+        self.send_hand_over().await
     }
 
     /// Send the hand-over's `PUT /handover` while it isn't answered and no abort is signed. A
@@ -263,16 +286,52 @@ impl Signer {
             && succeeded(&handed, &delivered, copy.version(), &copy.hash())
     }
 
-    /// The hand-over took effect, the switch's copy naming `install`: delete the identity
-    /// key, then the records and the flow (Switch spec 12.8). A deletion that fails is tried
-    /// again by the next call, which deletes what is left before anything else.
-    pub(super) async fn handed_over(&mut self, install: [u8; 16]) -> Result<()> {
+    /// The switch's `copy` shows the hand-over took effect. The key goes only once the
+    /// Homeserver publishes that version, or a later one of the same install: the new signer
+    /// publishes only once its delivery has won, so a switch that shows each side the other's
+    /// version can't make both delete the key. Until then this install keeps the key and the
+    /// hand-over, and signs nothing ([`Refusal::SuccessorUnpublished`]).
+    pub(super) async fn succeeded(&mut self, copy: &IdentityDoc) -> Result<()> {
+        let install = copy.body().signer;
+        let published = self
+            .env
+            .homeserver
+            .get(IDENTITY_PATH)
+            .await
+            .map_err(SignerError::Homeserver)?
+            .and_then(|bytes| serde_json::from_slice::<SignedDoc>(&bytes).ok())
+            .and_then(|signed| IdentityDoc::verify(&signed, &self.state.identity).ok())
+            .is_some_and(|held| {
+                held.signed() == copy.signed()
+                    || (held.body().signer == install
+                        && held.generation() == copy.generation()
+                        && held.version() > copy.version())
+            });
+        if !published {
+            return Err(Refusal::SuccessorUnpublished { install }.into());
+        }
+        self.handed_over(install).await
+    }
+
+    /// The hand-over took effect, naming `install`: commit that, then delete the identity
+    /// key, then the records and the flow (Switch spec 12.8). A deletion that fails, or a
+    /// crash, leaves the marked records, which the next call or open deletes before anything
+    /// else, and which count as none for a new set-up.
+    async fn handed_over(&mut self, install: [u8; 16]) -> Result<()> {
+        let mut state = self.state.clone();
+        state.handed_over_to = Some(install);
+        state.managed_by = Some(install);
+        state.handing_over = None;
+        self.commit(state, None).await?;
+        self.delete_handed_over(install).await
+    }
+
+    /// Delete what is left once the hand-over to `install` took effect: the key, then the
+    /// records. Both deletions are idempotent.
+    pub(super) async fn delete_handed_over(&mut self, install: [u8; 16]) -> Result<()> {
         self.keyring.destroy()?;
-        self.succeeded_by = Some(install);
-        self.state.managed_by = Some(install);
-        self.state.handing_over = None;
-        self.flow = None;
         state::delete(&self.env.store, &self.state.identity).await?;
+        self.flow = None;
         Err(SignerError::HandedOver { install })
     }
 }

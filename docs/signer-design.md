@@ -204,7 +204,7 @@ Two exceptions:
 5. Set `until` for cooperative renewals whose app record now carries the new certificate (`record_cert`, `record_at`).
 6. Serve full-bundle requests, resuming from `bundle_ranges`, with `cert.put` where `record_cert` lags.
 7. Renew certificates past half their lifetime.
-8. Check a pending hand-over. While one is in progress, nothing else here runs: its `PUT /handover` is sent again until answered, and the switch's copy is read. A copy at the version handed over plus 1, same generation, naming another install and not the abort, finishes it: destroy the key, then the records. Any other newer copy is adopted and the key stays.
+8. Check a pending hand-over. While one is in progress, nothing else here runs: its `PUT /handover` is sent again until answered, and the switch's copy is read. A copy at the version handed over plus 1, same generation, naming another install and not the abort, finishes it once the Homeserver publishes that version: commit the deletion, destroy the key, then the records. Any other newer copy is adopted and the key stays.
 9. Republish the switch's copy if the Homeserver copy differs.
 
 It returns a report and refreshes the alerts.

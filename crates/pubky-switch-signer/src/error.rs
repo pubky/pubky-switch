@@ -161,6 +161,15 @@ pub enum Refusal {
     /// nothing received is kept.
     #[error("refused: the switch's or the Homeserver's copy isn't the version handed over")]
     StaleHandOver,
+    /// The switch shows the hand-over took effect, naming `install`, and the Homeserver
+    /// doesn't publish that version yet: this install keeps the key, and the hand-over, until
+    /// it does, then deletes them (Switch spec 12.8). The new signer publishes only once its
+    /// delivery has won.
+    #[error("refused: the new signer's version isn't published yet")]
+    SuccessorUnpublished {
+        /// The signer ID the switch's copy names.
+        install: [u8; 16],
+    },
     /// The store holds no take-over in progress for this identity.
     #[error("refused: no take-over is in progress")]
     NotTakingOver,

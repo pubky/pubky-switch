@@ -176,9 +176,6 @@ pub struct Signer {
     /// A commit answered that the store can't tell whether it applied: the records and the
     /// flow are read again before the next step.
     unsure: bool,
-    /// The hand-over took effect, naming this install: the key is deleted, and the records
-    /// are, or are deleted again before anything else.
-    succeeded_by: Option<[u8; 16]>,
 }
 
 impl std::fmt::Debug for Signer {
@@ -204,7 +201,7 @@ impl Signer {
     /// or random generator failure.
     pub async fn create(env: SignerEnv, keyring: IdentityKeyring, origin: &str) -> Result<Self> {
         let identity = keyring.public_key();
-        if state::load(&env.store, &identity).await?.is_some() {
+        if state::set_up(&env.store, &identity).await? {
             return Err(Refusal::AlreadySetUp.into());
         }
         let install = random_bytes::<16>()?;
@@ -236,7 +233,6 @@ impl Signer {
             state,
             flow: Some(flow),
             unsure: false,
-            succeeded_by: None,
         })
     }
 
@@ -252,14 +248,19 @@ impl Signer {
         let (state, flow) = state::load(&env.store, &identity)
             .await?
             .ok_or(Refusal::NotSetUp)?;
-        Ok(Self {
+        let handed_over = state.handed_over_to;
+        let mut signer = Self {
             env,
             keyring,
             state,
             flow,
             unsure: false,
-            succeeded_by: None,
-        })
+        };
+        // Records of a hand-over that took effect: the deletion is finished now.
+        if let Some(install) = handed_over {
+            signer.delete_handed_over(install).await?;
+        }
+        Ok(signer)
     }
 
     /// Finish the flow in progress, resending what it signed, then publish the newest version
@@ -656,19 +657,18 @@ impl Signer {
 
     /// After a commit the store couldn't tell about, read the records and the flow again.
     async fn refresh(&mut self) -> Result<()> {
-        if let Some(install) = self.succeeded_by {
-            state::delete(&self.env.store, &self.state.identity).await?;
-            return Err(SignerError::HandedOver { install });
+        if self.unsure {
+            let (state, flow) = state::load(&self.env.store, &self.state.identity)
+                .await?
+                .ok_or(Refusal::NotSetUp)?;
+            self.state = state;
+            self.flow = flow;
+            self.unsure = false;
         }
-        if !self.unsure {
-            return Ok(());
+        // A hand-over that took effect: what is left of the key and the records goes first.
+        if let Some(install) = self.state.handed_over_to {
+            return self.delete_handed_over(install).await;
         }
-        let (state, flow) = state::load(&self.env.store, &self.state.identity)
-            .await?
-            .ok_or(Refusal::NotSetUp)?;
-        self.state = state;
-        self.flow = flow;
-        self.unsure = false;
         Ok(())
     }
 
@@ -1095,7 +1095,7 @@ impl Signer {
         let version = copy.version();
         let signer = copy.body().signer;
         if source == Source::Switch && self.hand_over_took_effect(&copy) {
-            return self.handed_over(signer).await;
+            return self.succeeded(&copy).await;
         }
         if signer == self.state.install {
             return self.records_behind(source, version).await;

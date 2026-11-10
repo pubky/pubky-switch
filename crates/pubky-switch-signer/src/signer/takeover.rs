@@ -101,10 +101,13 @@ impl Signer {
     /// # Errors
     ///
     /// [`Refusal::AlreadySetUp`] when the store holds records for the identity;
+    /// [`crate::KeyError::Occupied`] when `vault` holds another identity's secret;
     /// [`SignerError::InvalidData`] for a hand-over that fails check 1 or 2, or names another
     /// switch; [`Refusal::StaleHandOver`] when check 3 fails; [`Refusal::TakeOverCancelled`]
     /// when the delivery lost; otherwise the switch's, the store's or the vault's error, the
-    /// take-over kept for [`Signer::resume_take_over`].
+    /// take-over kept for [`Signer::resume_take_over`]. An error after the take-over has won,
+    /// from the backup or the publication, leaves it to [`Signer::resume_take_over`] too, or
+    /// to [`Signer::open`] with the vault's keyring.
     pub async fn receive_hand_over(
         env: SignerEnv,
         app: &ReceivingApp,
@@ -112,9 +115,12 @@ impl Signer {
     ) -> Result<Self> {
         let identity = app.cert.identity();
         let app_id = app.cert.app_id();
-        if state::load(&env.store, &identity).await?.is_some() {
+        if state::set_up(&env.store, &identity).await? {
             return Err(Refusal::AlreadySetUp.into());
         }
+        // A vault that holds another secret could never take this one: found before anything
+        // is sent, not once the delivery has won.
+        IdentityKeyring::vault_takes(vault.as_ref(), &identity)?;
         let target = Target {
             origin: &app.origin,
             pinned: Some(app.service_key),
@@ -160,7 +166,9 @@ impl Signer {
 
     /// The signer of a take-over the store holds in progress for `identity`, the identity
     /// secret opened again from the hand-over it holds with `keys`, the receiving app's,
-    /// and its next step taken (Switch wire 3.12). A store with no take-over gives none.
+    /// and its next step taken (Switch wire 3.12). A store with no take-over gives none. A
+    /// take-over that has won, whose secret is in `vault`, is opened with the vault's keyring
+    /// and resumed, as [`Signer::open`] would.
     ///
     /// # Errors
     ///
@@ -176,7 +184,16 @@ impl Signer {
         let (state, flow) = state::load(&env.store, &identity)
             .await?
             .ok_or(Refusal::NotSetUp)?;
-        let flow = flow.ok_or(Refusal::NotTakingOver)?;
+        let Some(flow @ Flow::TakingOver { .. }) = flow else {
+            // Won already: the secret is in the vault, and the routine steps go on.
+            if state.taking_over || state.handed_over_to.is_some() {
+                return Err(Refusal::NotTakingOver.into());
+            }
+            let keyring = IdentityKeyring::open(vault)?;
+            let mut signer = Self::open(env, keyring).await?;
+            signer.resume().await?;
+            return Ok(signer);
+        };
         let (mut signer, records) = Self::taking_over(env, state, flow, vault, keys)?;
         let unsigned = matches!(signer.flow, Some(Flow::TakingOver { delivery: None, .. }));
         if unsigned {
@@ -212,7 +229,6 @@ impl Signer {
             state,
             flow: Some(flow),
             unsure: false,
-            succeeded_by: None,
         };
         Ok((signer, records))
     }

@@ -240,6 +240,21 @@ impl IdentityKeyring {
         Ok((keyring, records))
     }
 
+    /// Check that `vault` could take the secret of `identity`: it holds none, or that one.
+    ///
+    /// # Errors
+    ///
+    /// [`KeyError::Occupied`] when it holds another secret, or the vault's error.
+    pub(crate) fn vault_takes(
+        vault: &dyn SecretVault,
+        identity: &[u8; 32],
+    ) -> Result<(), KeyError> {
+        match vault.load()? {
+            Some(held) if held.key().public() != *identity => Err(KeyError::Occupied),
+            _ => Ok(()),
+        }
+    }
+
     /// Whether this is the received form, its secret not yet in the vault.
     pub(crate) fn is_received(&self) -> bool {
         self.held.is_some()
