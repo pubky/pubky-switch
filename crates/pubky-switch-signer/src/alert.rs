@@ -106,4 +106,40 @@ pub enum Alert {
         /// The removed app.
         app_id: [u8; 16],
     },
+    /// The switch took the revocation of this app but gave no time for it, neither in its
+    /// answer's proof nor in `GET /apps` (Switch wire 7.4.12). The app is cut off at the switch,
+    /// but no version removes it yet; each run tries again. A switch that keeps doing this is
+    /// faulty, and the user moves to another provider.
+    RevocationUnconfirmed {
+        /// The app.
+        app_id: [u8; 16],
+    },
+    /// The switch shows this app revoked or departed, which this signer didn't ask for: it
+    /// was removed from that time, and its App ID is kept for good (Switch spec 12.2, 12.3).
+    /// The user checks that the app was meant to go.
+    RemovedAtSwitch {
+        /// The app.
+        app_id: [u8; 16],
+        /// Whether the app left on its own, rather than being revoked.
+        left: bool,
+    },
+    /// The switch reported a revocation or departure time for this app before it took this
+    /// signer's newest version, which lists the app: its own answer contradicts it, since it
+    /// refuses a version listing a revoked or departed App ID (Switch wire 3.3). The app is
+    /// distrusted only from that version's time, so its earlier messages stand; the switch
+    /// may be faulty.
+    RemovalTimeBounded {
+        /// The app.
+        app_id: [u8; 16],
+        /// The time the switch reported.
+        reported: u64,
+        /// The time it was removed from.
+        distrust_from: u64,
+    },
+    /// The switch refused the key bundle answering this app's full-bundle request. The
+    /// request isn't tried again until the app asks anew; the other apps' are answered.
+    FullBundleRefused {
+        /// The app.
+        app_id: [u8; 16],
+    },
 }

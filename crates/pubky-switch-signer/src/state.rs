@@ -108,6 +108,10 @@ pub(crate) struct SignerState {
     /// step 4).
     #[serde(default)]
     pub(crate) cleanup: Vec<[u8; 16]>,
+    /// The full-bundle requests whose answer the switch refused, not tried again until the
+    /// app asks anew.
+    #[serde(default)]
+    pub(crate) refused_requests: Vec<RefusedRequest>,
     /// The alerts the user hasn't cleared.
     pub(crate) alerts: Vec<Alert>,
     /// The certificate lifetime new certificates get, in milliseconds (Switch spec 3.2).
@@ -152,6 +156,18 @@ pub(crate) struct Revoking {
     /// An earlier `distrust_from` than the revocation time, which the user picked after a
     /// compromise.
     pub(crate) distrust_from: Option<u64>,
+    /// The revocation's time, from the proof of the switch's answer (Switch wire 7.4.12).
+    #[serde(default)]
+    pub(crate) revoked_at: Option<u64>,
+}
+
+/// A full-bundle request the switch refused an answer to, by the time the app asked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RefusedRequest {
+    /// The app.
+    pub(crate) app_id: [u8; 16],
+    /// When it asked (`full_bundle_requested`, Switch wire 7.4.12).
+    pub(crate) requested: u64,
 }
 
 /// An approval's companion claim, signed with the version that lists its certificate and
@@ -214,6 +230,7 @@ impl SignerState {
             republish_over: None,
             revoking: Vec::new(),
             cleanup: Vec::new(),
+            refused_requests: Vec::new(),
             alerts: Vec::new(),
             cert_lifetime_ms: DEFAULT_CERT_LIFETIME_MS,
             claims: Vec::new(),

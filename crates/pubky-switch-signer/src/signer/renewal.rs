@@ -165,7 +165,7 @@ impl Signer {
         // A rotation: every other current app's bundle through the new epoch.
         let mut alerts = Vec::new();
         if rotates {
-            let (more, skipped) = self.catch_up(&key, &newest, &statuses, Some(app_id), last)?;
+            let (more, skipped) = self.catch_up(&key, &newest, &statuses, &[app_id], last)?;
             ops.extend(more);
             alerts = skipped;
         }
@@ -200,7 +200,7 @@ impl Signer {
         let newest = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
         let through = self.state.epoch_through;
         let key = self.signing_key()?;
-        let (ops, alerts) = self.catch_up(&key, &newest, statuses, None, through)?;
+        let (ops, alerts) = self.catch_up(&key, &newest, statuses, &[], through)?;
         let batches = self.sign_batches(&key, newest.generation(), ops)?;
         let (doc, flow) = self.next_version(&key, |body| body.data_epoch = through)?;
         drop(key);
@@ -214,6 +214,10 @@ impl Signer {
     /// through epoch `last`, each with its own scopes' keys for the epochs it lacks, and the
     /// alerts for the apps left out (Switch wire 3.5, 3.8).
     ///
+    /// The signer's own records decide who is cut off, never the switch's status alone: an
+    /// App ID that is a tombstone or has a revocation asked for gets no part, whatever the
+    /// switch shows (Switch spec 12.2: a removed app reads nothing written later).
+    ///
     /// An app the switch doesn't serve now, one not current, not joined or expired, gets no
     /// part, nor does one whose certificate holds a scope no registered protocol owns, with
     /// [`Alert::RotationSkipped`]. Either gets the epochs it lacks from its next bundle, which
@@ -223,7 +227,7 @@ impl Signer {
         key: &SigningKey,
         newest: &IdentityDoc,
         statuses: &[AppStatus],
-        except: Option<[u8; 16]>,
+        except: &[[u8; 16]],
         last: u64,
     ) -> Result<(Vec<Op>, Vec<Alert>)> {
         let certs = self.held_certs()?;
@@ -232,7 +236,7 @@ impl Signer {
         let mut ops = Vec::new();
         let mut alerts = Vec::new();
         for listed in &newest.body().apps {
-            if Some(listed.app_id) == except {
+            if except.contains(&listed.app_id) || self.cut_off(&listed.app_id) {
                 continue;
             }
             let Some(status) = statuses.iter().find(|s| s.app_id == listed.app_id) else {
@@ -414,6 +418,13 @@ impl Signer {
             step: DeliverStep::Signed,
         };
         self.commit(self.state.clone(), Some(deliver)).await
+    }
+
+    /// Whether the records cut `app_id` off: a tombstone, or a revocation asked for. Such an
+    /// app gets no key bundle part (Switch spec 12.2).
+    pub(super) fn cut_off(&self, app_id: &[u8; 16]) -> bool {
+        self.state.tombstones.contains(app_id)
+            || self.state.revoking.iter().any(|r| &r.app_id == app_id)
     }
 
     /// Every certificate the signer holds, verified.

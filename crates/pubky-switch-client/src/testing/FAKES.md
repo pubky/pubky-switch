@@ -106,7 +106,8 @@ service.
   and answered with fixed changes, merging nothing.
 - **Revocation** is `POST /apps/{app_id}/revoke` from the signer, and the test call
   `revoke`; an app that left is answered as one revoked already, with no proof. `leave` and
-  `request_full_bundle` are test calls for the app's own routes. Freeze and
+  `request_full_bundle` are test calls for the app's own routes, and `forget_removal_time`
+  scripts a faulty service that shows no time for a removal. Freeze and
   unfreeze are test calls, not routes.
 - **Erasure** (Switch wire 7.4.16) is a flag; its answers are signed with a fixed operator
   key.

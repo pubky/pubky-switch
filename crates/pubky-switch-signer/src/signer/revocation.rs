@@ -26,6 +26,7 @@
 //! them, at the same version, so it lists the parts (Switch wire 3.5 "Full bundles on
 //! request").
 
+use pubky_switch_client::ClientError;
 use pubky_switch_client::client::answers::AppStatus;
 use pubky_switch_core::ops::OpKind;
 use pubky_switch_core::records::{IdentityDoc, RemovedApp, app_record_path, seal_bundle_parts};
@@ -34,7 +35,7 @@ use super::Signer;
 use super::renewal::{Op, keyed, push_parts};
 use crate::alert::Alert;
 use crate::error::{Refusal, Result, SignerError};
-use crate::state::{Flow, Revoking};
+use crate::state::{Flow, RefusedRequest, RenewBatch, Revoking};
 
 /// The host's word that it showed the user what a step does and the user confirmed it: a
 /// revocation cuts an app off for good (design note, section 5).
@@ -80,16 +81,27 @@ impl Signer {
         if !state.tombstones.contains(&app_id) {
             state.tombstones.push(app_id);
         }
+        let revoked_at = state
+            .revoking
+            .iter()
+            .find(|r| r.app_id == app_id)
+            .and_then(|r| r.revoked_at);
         state.revoking.retain(|r| r.app_id != app_id);
         state.revoking.push(Revoking {
             app_id,
             distrust_from,
+            revoked_at,
         });
         self.commit(state, self.flow.clone()).await?;
         self.complete_removals().await?;
-        self.state
-            .newest_doc()?
-            .ok_or_else(|| Refusal::NotSetUp.into())
+        let newest = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
+        // Never reported done while a version still lists the app.
+        if newest.listed_cert(&app_id).is_some() {
+            return Err(SignerError::InvalidData(pubky_switch_core::Error::Invalid(
+                "Switch wire 7.4.12: the switch took the revocation but gave no time for it".into(),
+            )));
+        }
+        Ok(newest)
     }
 
     /// Remove every app that is revoked or departed and still listed, in one version with a
@@ -107,7 +119,15 @@ impl Signer {
         self.ready().await?;
         let mut newest = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
         let mut statuses = self.switch_apps().await?;
-        if self.removals(&newest, &statuses).is_empty() {
+        let found = self.removals(&newest, &statuses);
+        if !found.unconfirmed.is_empty() {
+            let mut state = self.state.clone();
+            for app_id in &found.unconfirmed {
+                state.alert(Alert::RevocationUnconfirmed { app_id: *app_id });
+            }
+            self.commit(state, None).await?;
+        }
+        if found.apps.is_empty() {
             self.drop_revoked_requests().await?;
             return Ok(false);
         }
@@ -118,14 +138,17 @@ impl Signer {
             newest = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
             statuses = self.switch_apps().await?;
         }
-        let removing = self.removals(&newest, &statuses);
+        let found = self.removals(&newest, &statuses);
+        let removing = found.apps;
         let last = newest
             .data_epoch()
             .checked_add(1)
             .ok_or_else(|| SignerError::Records("the data epoch can't go higher".into()))?;
         let key = self.signing_key()?;
-        // The apps the switch no longer serves get no part, the removed ones among them.
-        let (ops, alerts) = self.catch_up(&key, &newest, &statuses, None, last)?;
+        // The apps removed get no part, whatever the switch shows of them.
+        let cut: Vec<[u8; 16]> = removing.iter().map(|r| r.app_id).collect();
+        let (ops, mut alerts) = self.catch_up(&key, &newest, &statuses, &cut, last)?;
+        alerts.extend(found.alerts);
         let batches = self.sign_batches(&key, newest.generation(), ops)?;
         let (doc, flow) = self.next_version(&key, |body| {
             for removed in &removing {
@@ -138,6 +161,9 @@ impl Signer {
         drop(key);
         let mut state = self.state.clone();
         state.epoch_through = state.epoch_through.max(last);
+        state.alerts.retain(
+            |a| !matches!(a, Alert::RevocationUnconfirmed { app_id } if cut.contains(app_id)),
+        );
         for removed in &removing {
             if !state.tombstones.contains(&removed.app_id) {
                 state.tombstones.push(removed.app_id);
@@ -171,33 +197,76 @@ impl Signer {
         }
         let client = self.service_client()?;
         for app_id in &pending {
-            client.revoke(app_id).await?;
+            let answer = client.revoke(app_id).await?;
+            // The proof the client verified dates the revocation; one sent again gets none.
+            let at = answer
+                .proofs
+                .first()
+                .and_then(|proof| proof.body().chain.open().ok())
+                .map(|envelope| envelope.server_time);
+            if let Some(at) = at {
+                let mut state = self.state.clone();
+                for revoking in state.revoking.iter_mut().filter(|r| &r.app_id == app_id) {
+                    revoking.revoked_at.get_or_insert(at);
+                }
+                if state.revoking != self.state.revoking {
+                    self.commit(state, self.flow.clone()).await?;
+                }
+            }
         }
         Ok(())
     }
 
-    /// The listed apps the switch shows revoked or departed, each with its `distrust_from`:
-    /// the revocation or departure time, or the earlier one the user picked.
-    fn removals(&self, newest: &IdentityDoc, statuses: &[AppStatus]) -> Vec<RemovedApp> {
-        newest
-            .body()
-            .apps
-            .iter()
-            .filter_map(|listed| {
-                let status = statuses.iter().find(|s| s.app_id == listed.app_id)?;
-                let at = status.revoked_at.or(status.departed_at)?;
-                let picked = self
-                    .state
-                    .revoking
-                    .iter()
-                    .find(|r| r.app_id == listed.app_id)
-                    .and_then(|r| r.distrust_from);
-                Some(RemovedApp {
-                    app_id: listed.app_id,
-                    distrust_from: picked.map_or(at, |picked| picked.min(at)),
-                })
-            })
-            .collect()
+    /// The listed apps to remove, each with its `distrust_from`, the alerts that go with
+    /// them, and the revocations asked for that have no time yet (Switch spec 12.2, 12.3).
+    ///
+    /// A revocation this signer asked for is dated by its proof, else by the switch's
+    /// `revoked_at`. One the switch reports, or a departure, is dated by the earlier of
+    /// `revoked_at` and `departed_at`, with [`Alert::RemovedAtSwitch`]; never before the time
+    /// the switch took the newest version, which lists the app, since the switch refuses a
+    /// version listing a revoked or departed App ID ([`Alert::RemovalTimeBounded`]). The
+    /// user's earlier pick, after a compromise, reaches back as far as they chose.
+    fn removals(&self, newest: &IdentityDoc, statuses: &[AppStatus]) -> Removals {
+        let listed_at = self.state.newest.as_ref().and_then(|n| n.delivered_at);
+        let mut found = Removals::default();
+        for listed in &newest.body().apps {
+            let app_id = listed.app_id;
+            let status = statuses.iter().find(|s| s.app_id == app_id);
+            let asked = self.state.revoking.iter().find(|r| r.app_id == app_id);
+            let reported = status.and_then(|s| reported_time(s.revoked_at, s.departed_at));
+            let at = match (asked.and_then(|r| r.revoked_at), reported) {
+                (Some(own), _) => own,
+                (None, Some(reported)) => match listed_at {
+                    Some(floor) if reported < floor => {
+                        found.alerts.push(Alert::RemovalTimeBounded {
+                            app_id,
+                            reported,
+                            distrust_from: floor,
+                        });
+                        floor
+                    }
+                    _ => reported,
+                },
+                (None, None) => {
+                    if asked.is_some() && status.is_some_and(|s| !s.current) {
+                        found.unconfirmed.push(app_id);
+                    }
+                    continue;
+                }
+            };
+            if asked.is_none() {
+                found.alerts.push(Alert::RemovedAtSwitch {
+                    app_id,
+                    left: status.is_some_and(|s| s.revoked_at.is_none()),
+                });
+            }
+            let picked = asked.and_then(|r| r.distrust_from);
+            found.apps.push(RemovedApp {
+                app_id,
+                distrust_from: picked.map_or(at, |picked| picked.min(at)),
+            });
+        }
+        found
     }
 
     /// Forget the revocations asked for whose app the newest version no longer lists.
@@ -282,17 +351,27 @@ impl Signer {
         let protocols = self.env.protocols.clone();
         let keyed = keyed(&protocols);
         let key = self.signing_key()?;
-        let mut ops: Vec<Op> = Vec::new();
+        // One flow for each app, so a refused one doesn't hold back the others.
+        let mut requests: Vec<(RefusedRequest, Vec<Op>)> = Vec::new();
         let mut alerts = Vec::new();
-        let mut answered = Vec::new();
         for listed in &newest.body().apps {
             let Some(status) = statuses.iter().find(|s| s.app_id == listed.app_id) else {
                 continue;
             };
+            let Some(requested) = status.full_bundle_requested else {
+                continue;
+            };
+            let request = RefusedRequest {
+                app_id: listed.app_id,
+                requested,
+            };
             let served = status.current
                 && status.record_cert.is_some()
                 && status.cert_expires_at.is_none_or(|at| at > now);
-            if status.full_bundle_requested.is_none() || !served {
+            if !served
+                || self.cut_off(&listed.app_id)
+                || self.state.refused_requests.contains(&request)
+            {
                 continue;
             }
             let Some(cert) = certs.iter().find(|c| c.hash() == listed.cert) else {
@@ -328,6 +407,7 @@ impl Signer {
             if missing.is_empty() {
                 continue;
             }
+            let mut ops: Vec<Op> = Vec::new();
             if status.record_cert != Some(listed.cert) {
                 ops.push((
                     OpKind::CertPut {
@@ -341,32 +421,75 @@ impl Signer {
                 let sealed = seal_bundle_parts(&key, cert, first, last, &keyed)?;
                 push_parts(&mut ops, listed.app_id, listed.cert, sealed);
             }
-            answered.push(listed.app_id);
+            requests.push((request, ops));
         }
+        let signed: Vec<(RefusedRequest, Vec<RenewBatch>)> = requests
+            .into_iter()
+            .map(|(request, ops)| Ok((request, self.sign_batches(&key, newest.generation(), ops)?)))
+            .collect::<Result<_>>()?;
+        drop(key);
         let mut state = self.state.clone();
         for alert in alerts {
             state.alert(alert);
         }
-        if ops.is_empty() {
-            if state.alerts != self.state.alerts {
-                self.commit(state, None).await?;
-            }
-            return Ok(answered);
+        // A refused request is tried again once the app asks anew.
+        state.refused_requests.retain(|refused| {
+            statuses.iter().any(|s| {
+                s.app_id == refused.app_id && s.full_bundle_requested == Some(refused.requested)
+            })
+        });
+        if state != self.state {
+            self.commit(state, None).await?;
         }
-        let batches = self.sign_batches(&key, newest.generation(), ops)?;
-        drop(key);
-        let held = self.state.newest.clone().ok_or(Refusal::NotSetUp)?;
-        // After the parts, the newest version again: its backup lists them, and its delivery
-        // is a retry the switch answers with its proof (Switch wire 3.13, 7.4.2).
-        let flow = Flow::Renew {
-            batches,
-            sent: 0,
-            doc: held.doc,
-            prev: held.prev,
-        };
-        self.commit(state, Some(flow)).await?;
-        self.resume().await?;
+        let mut answered = Vec::new();
+        for (request, batches) in signed {
+            let held = self.state.newest.clone().ok_or(Refusal::NotSetUp)?;
+            // After the parts, the newest version again: its backup lists them, and its
+            // delivery is a retry the switch answers with its proof (Switch wire 3.13, 7.4.2).
+            let flow = Flow::Renew {
+                batches,
+                sent: 0,
+                doc: held.doc,
+                prev: held.prev,
+            };
+            self.commit(self.state.clone(), Some(flow)).await?;
+            match self.resume().await {
+                Ok(()) => answered.push(request.app_id),
+                Err(SignerError::Switch(ClientError::Switch { status, .. }))
+                    if (400..500).contains(&status) && status != 408 && status != 429 =>
+                {
+                    let mut state = self.state.clone();
+                    state.refused_requests.push(request);
+                    state.alert(Alert::FullBundleRefused {
+                        app_id: request.app_id,
+                    });
+                    self.commit(state, self.flow.clone()).await?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
         Ok(answered)
+    }
+}
+
+/// What [`Signer::removals`] finds.
+#[derive(Default)]
+struct Removals {
+    /// The apps to remove.
+    apps: Vec<RemovedApp>,
+    /// The alerts that go with them.
+    alerts: Vec<Alert>,
+    /// The revocations asked for that the switch took without a time.
+    unconfirmed: Vec<[u8; 16]>,
+}
+
+/// The time a switch reports for a removal: the earlier of a revocation and a departure,
+/// should it show both, which an honest service never does, since an app that left can't be
+/// revoked again (Switch wire 7.4.12).
+fn reported_time(revoked_at: Option<u64>, departed_at: Option<u64>) -> Option<u64> {
+    match (revoked_at, departed_at) {
+        (Some(revoked), Some(left)) => Some(revoked.min(left)),
+        (revoked, left) => revoked.or(left),
     }
 }
 
@@ -394,7 +517,16 @@ fn missing_ranges(covered: &[(u64, u64)], current: u64) -> Vec<(u64, u64)> {
 
 #[cfg(test)]
 mod tests {
-    use super::missing_ranges;
+    use super::{missing_ranges, reported_time};
+
+    #[test]
+    fn test_reported_time_is_the_earlier_of_a_revocation_and_a_departure() {
+        assert_eq!(reported_time(None, None), None);
+        assert_eq!(reported_time(Some(5), None), Some(5));
+        assert_eq!(reported_time(None, Some(7)), Some(7));
+        assert_eq!(reported_time(Some(9), Some(7)), Some(7));
+        assert_eq!(reported_time(Some(3), Some(7)), Some(3));
+    }
 
     #[test]
     fn test_missing_ranges_fill_every_gap_up_to_the_current_epoch() {

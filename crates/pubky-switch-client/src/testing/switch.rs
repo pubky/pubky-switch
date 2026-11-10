@@ -508,6 +508,14 @@ impl ScriptedSwitch {
         Ok(())
     }
 
+    /// A faulty service: `app` stays revoked or departed, but `GET /apps` shows no time for it.
+    pub fn forget_removal_time(&self, app: [u8; 16]) {
+        let mut inner = self.lock();
+        let held = inner.apps.entry(app).or_default();
+        held.revoked_at = None;
+        held.departed_at = None;
+    }
+
     /// `app` asks for its full key bundle, as its `POST /apps/{app_id}/keys` does (Switch
     /// wire 7.4.11).
     pub fn request_full_bundle(&self, app: [u8; 16]) {

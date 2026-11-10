@@ -191,6 +191,215 @@ async fn test_revocation_reaches_the_switch_while_an_alarm_holds_signing_back() 
 }
 
 #[tokio::test]
+async fn test_revocation_takes_the_switchs_time_not_the_signers_clock() {
+    // The signer's clock runs ten hours ahead of the switch's: `distrust_from` is the time
+    // in the revocation's proof (Switch wire 7.4.12), and the backup keeps the App ID.
+    let world = World::new();
+    let (signer, memory) = world.enrolled().await;
+    drop(signer);
+    let mut env = world.env(memory);
+    env.clock = Arc::new(pubky_switch_client::clock::TestClock::new(
+        START_MS + 10 * 3_600_000,
+    ));
+    let mut signer = Signer::open(env, world.keyring()).await.unwrap();
+    let (a, _) = two_joined(&world, &mut signer).await;
+    let id = a.keys.app_id_bytes();
+    world.clock.advance_ms(DAY_MS);
+    let removing = signer.revoke(id, None, confirmed()).await.unwrap();
+    assert_eq!(removing.body().removed[0].distrust_from, START_MS + DAY_MS);
+    assert!(world.backup().revoked_apps().contains(&id));
+}
+
+#[tokio::test]
+async fn test_revocation_without_a_time_is_an_error_with_an_alert() {
+    // A faulty switch: the app is revoked already, so the answer carries no proof, and
+    // `GET /apps` shows no time. The revocation isn't reported done, and the user is told.
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let (a, _) = two_joined(&world, &mut signer).await;
+    let id = a.keys.app_id_bytes();
+    world.switch.revoke(id).unwrap();
+    world.switch.forget_removal_time(id);
+    let error = signer.revoke(id, None, confirmed()).await.unwrap_err();
+    assert!(matches!(error, SignerError::InvalidData(_)), "{error:?}");
+    assert!(
+        signer
+            .alerts()
+            .contains(&Alert::RevocationUnconfirmed { app_id: id })
+    );
+    let doc = signer.identity_doc().unwrap().unwrap();
+    assert!(doc.listed_cert(&id).is_some());
+    assert!(refused_for_good(&signer, &a));
+}
+
+#[tokio::test]
+async fn test_revocation_is_kept_when_the_checks_after_it_fail() {
+    // The Homeserver is down: the revocation reaches the switch and is kept, and the next
+    // run removes the app once the Homeserver answers again.
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let (a, _) = two_joined(&world, &mut signer).await;
+    let id = a.keys.app_id_bytes();
+    *world.homeserver.down.lock().unwrap() = true;
+    signer.revoke(id, None, confirmed()).await.unwrap_err();
+    assert!(refused_for_good(&signer, &a));
+    // The time was kept from the revocation's proof: it stands even if the switch's list
+    // later shows none.
+    world.clock.advance_ms(DAY_MS);
+    world.switch.forget_removal_time(id);
+    *world.homeserver.down.lock().unwrap() = false;
+    signer.run_due().await.unwrap();
+    let doc = signer.identity_doc().unwrap().unwrap();
+    assert!(doc.listed_cert(&id).is_none());
+    assert_eq!(doc.body().removed[0].distrust_from, START_MS);
+}
+
+#[tokio::test]
+async fn test_revocation_during_a_flow_is_kept_and_completed_after_it() {
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let (a, _) = two_joined(&world, &mut signer).await;
+    let id = a.keys.app_id_bytes();
+    world.switch.fail_next(SwitchFault::Unreachable {
+        path: "/identity".into(),
+        after: 0,
+    });
+    signer.set_record_max_age(Some(86_400)).await.unwrap_err();
+    assert_eq!(
+        signer.revoke(id, None, confirmed()).await.unwrap_err(),
+        SignerError::Refused(Refusal::FlowInProgress)
+    );
+    assert!(refused_for_good(&signer, &a));
+    signer.run_due().await.unwrap();
+    let doc = signer.identity_doc().unwrap().unwrap();
+    assert!(doc.listed_cert(&id).is_none());
+    assert_eq!(doc.body().record_max_age, Some(86_400));
+}
+
+#[tokio::test]
+async fn test_revoked_app_gets_no_keys_even_while_the_switch_still_serves_it() {
+    // The revocation hasn't reached the switch, which still serves the app and would take
+    // its part. A rotation and a full-bundle request give it nothing all the same: the
+    // signer's records decide who is cut off (Switch spec 12.2).
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let (a, b) = two_joined(&world, &mut signer).await;
+    let b_id = b.keys.app_id_bytes();
+    world.switch.fail_next(SwitchFault::Unreachable {
+        path: "/revoke".into(),
+        after: 0,
+    });
+    signer.revoke(b_id, None, confirmed()).await.unwrap_err();
+    assert!(!world.switch.app(&b_id).departed);
+    let renewing = signer
+        .renew(
+            a.keys.app_id_bytes(),
+            CertChange {
+                scopes: Some(vec!["notes_sync".into()]),
+                expires_at: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(renewing.data_epoch(), 2);
+    assert!(!holds(&world, &opened(&world, &b), 2, "notes"));
+    world.switch.request_full_bundle(b_id);
+    assert!(signer.serve_full_bundles().await.unwrap().is_empty());
+    assert!(world.switch.bundle_parts_of(&b_id).is_empty());
+}
+
+#[tokio::test]
+async fn test_removal_the_switch_reports_raises_an_alert_for_a_departure() {
+    // The app left: the removal takes its departure time, and the user is told an app went
+    // that this signer didn't revoke.
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let (a, _) = two_joined(&world, &mut signer).await;
+    let id = a.keys.app_id_bytes();
+    world.clock.advance_ms(DAY_MS);
+    world.switch.leave(id).unwrap();
+    world.clock.advance_ms(DAY_MS);
+    signer.run_due().await.unwrap();
+    let doc = signer.identity_doc().unwrap().unwrap();
+    assert_eq!(doc.body().removed[0].distrust_from, START_MS + DAY_MS);
+    assert!(signer.alerts().contains(&Alert::RemovedAtSwitch {
+        app_id: id,
+        left: true,
+    }));
+}
+
+#[tokio::test]
+async fn test_removal_time_never_reaches_back_past_a_version_the_switch_took_listing_it() {
+    // The switch reports a departure, then takes a version that still lists the app, later.
+    // The removal is distrusted only from that version's time, with an alert, so a reported
+    // time can't invalidate the app's messages before it.
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let (a, _) = two_joined(&world, &mut signer).await;
+    let id = a.keys.app_id_bytes();
+    world.switch.leave(id).unwrap();
+    world.clock.advance_ms(DAY_MS);
+    signer.set_record_max_age(Some(86_400)).await.unwrap();
+    signer.run_due().await.unwrap();
+    let doc = signer.identity_doc().unwrap().unwrap();
+    assert_eq!(doc.body().removed[0].distrust_from, START_MS + DAY_MS);
+    assert!(signer.alerts().contains(&Alert::RemovalTimeBounded {
+        app_id: id,
+        reported: START_MS,
+        distrust_from: START_MS + DAY_MS,
+    }));
+}
+
+#[tokio::test]
+async fn test_full_bundle_request_refused_for_one_app_doesnt_hold_back_the_others() {
+    // `a`'s renewal stored a newer certificate before it was given up, so the `cert.put` its
+    // full-bundle answer needs is refused (`409`, Switch wire 6.2). `b`'s request is answered
+    // all the same, and `a`'s isn't tried again until it asks anew.
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let (a, b) = two_joined(&world, &mut signer).await;
+    let (a_id, b_id) = (a.keys.app_id_bytes(), b.keys.app_id_bytes());
+    signer
+        .renew(
+            a_id,
+            CertChange {
+                scopes: None,
+                expires_at: Some(START_MS + 400 * DAY_MS),
+            },
+        )
+        .await
+        .unwrap();
+    world.switch.fail_next(SwitchFault::Error {
+        path: "/identity".into(),
+        code: pubky_switch_core::http::ErrorCode::BadRequest,
+        current: serde_json::Value::Null,
+    });
+    signer
+        .renew(
+            a_id,
+            CertChange {
+                scopes: Some(vec!["notes".into()]),
+                expires_at: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    world.switch.request_full_bundle(a_id);
+    world.switch.request_full_bundle(b_id);
+    signer.run_due().await.unwrap();
+    assert!(world.switch.app(&b_id).full_requested.is_none());
+    assert!(world.switch.app(&a_id).full_requested.is_some());
+    assert!(
+        signer
+            .alerts()
+            .contains(&Alert::FullBundleRefused { app_id: a_id })
+    );
+    let sent = world.switch.applied().len();
+    signer.run_due().await.unwrap();
+    assert_eq!(world.switch.applied().len(), sent);
+}
+
+#[tokio::test]
 async fn test_revocation_refuses_an_app_that_isnt_listed() {
     let world = World::new();
     let (mut signer, _) = world.enrolled().await;
@@ -290,6 +499,10 @@ async fn test_revocation_the_signer_didnt_ask_for_is_completed_at_the_next_run()
     let doc = signer.identity_doc().unwrap().unwrap();
     assert_eq!(doc.body().removed[0].distrust_from, START_MS + DAY_MS);
     assert!(refused_for_good(&signer, &a));
+    assert!(signer.alerts().contains(&Alert::RemovedAtSwitch {
+        app_id: id,
+        left: false,
+    }));
 }
 
 #[tokio::test]

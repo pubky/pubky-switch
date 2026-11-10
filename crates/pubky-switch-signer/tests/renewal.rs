@@ -936,6 +936,39 @@ async fn test_renewal_an_owed_closing_waits_for_a_held_alarm_to_be_cleared() {
 }
 
 #[tokio::test]
+async fn test_renewal_an_owed_closing_isnt_signed_through_a_rollback_alarm() {
+    // A closing is owed with no flow, and the switch then goes back a version: an alarm.
+    // However often it resumes, no closing is signed while the alarm is held.
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let app = App::new(&["notes", "notes_tags"], None, [9; 32]);
+    world.approve(&mut signer, &app).await;
+    let id = app.keys.app_id_bytes();
+    let before = signer.identity_doc().unwrap().unwrap();
+    world.switch.fail_next(SwitchFault::Unreachable {
+        path: "/identity".into(),
+        after: 1,
+    });
+    signer.renew(id, reduce(&["notes"])).await.unwrap_err();
+    world.switch.fail_next(SwitchFault::Error {
+        path: "/identity".into(),
+        code: ErrorCode::BadRequest,
+        current: serde_json::Value::Null,
+    });
+    signer.resume().await.unwrap_err();
+    world.switch.deliver_identity(&before).unwrap();
+    let SignerError::Alarm(_) = signer.set_record_max_age(Some(60)).await.unwrap_err() else {
+        panic!("no alarm")
+    };
+    let sent = world.sent_docs().len();
+    for _ in 0..3 {
+        signer.resume().await.unwrap_err();
+    }
+    assert_eq!(world.sent_docs().len(), sent);
+    assert_eq!(signer.status(), pubky_switch_signer::SignerStatus::Alarm);
+}
+
+#[tokio::test]
 async fn test_renewal_refuses_an_app_that_isnt_listed() {
     let world = World::new();
     let (mut signer, _) = world.enrolled().await;
