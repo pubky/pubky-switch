@@ -578,6 +578,51 @@ async fn test_send_resend_seals_the_same_plaintext_again() {
 }
 
 #[tokio::test]
+async fn test_send_sent_message_shows_every_acceptance_time() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    let (msg_id, delivery) = app.send(s.note("hello")).await.unwrap();
+    let Delivery::Accepted {
+        accepted_at_ms: first,
+    } = delivery
+    else {
+        panic!("{delivery:?}");
+    };
+    s.w.clock.advance_ms(1000);
+    s.peer.rotate(0).unwrap();
+    app.resend(&msg_id).await.unwrap();
+    s.w.clock.advance_ms(1000);
+    app.resend(&msg_id).await.unwrap();
+    let times = |sent: &[crate::app::SentMessage]| {
+        sent.iter()
+            .map(crate::app::SentMessage::accepted_times_ms)
+            .collect::<Vec<_>>()
+    };
+    let all = app.sent_to(&s.w.bob.public(), 0, u64::MAX).await.unwrap();
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].accepted_at_ms, Some(first));
+    assert_eq!(all[0].resent_at_ms.len(), 2);
+    let every = all[0].accepted_times_ms();
+    assert_eq!(every.len(), 3);
+    assert_eq!(every[0], first);
+    assert!(every.windows(2).all(|w| w[0] < w[1]), "{every:?}");
+    // A window around a re-send's acceptance alone selects it too, with all its times
+    // (Switch spec 11).
+    let resent = every[2];
+    let selected = app
+        .sent_to(&s.w.bob.public(), resent, resent)
+        .await
+        .unwrap();
+    assert_eq!(times(&selected), vec![every.clone()]);
+    // A time no acceptance has selects nothing.
+    let none = app
+        .sent_to(&s.w.bob.public(), first + 1, every[1] - 1)
+        .await
+        .unwrap();
+    assert!(none.is_empty());
+}
+
+#[tokio::test]
 async fn test_send_resend_of_an_unknown_message_is_refused() {
     let s = Setup::new();
     let mut app = s.join("wallet").await;

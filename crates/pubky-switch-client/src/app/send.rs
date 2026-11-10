@@ -218,6 +218,25 @@ pub struct SentMessage {
     /// When the recipient's inbox first accepted it, the recipient's service time; `None`
     /// while it is queued.
     pub accepted_at_ms: Option<u64>,
+    /// When the recipient's inbox accepted each re-send of it since, ascending, in the same
+    /// clock. A re-send request's times select by these as well as the first (Switch spec
+    /// 11).
+    pub resent_at_ms: Vec<u64>,
+}
+
+impl SentMessage {
+    /// Every acceptance time of the message, ascending: the first, then each accepted
+    /// re-send's.
+    pub fn accepted_times_ms(&self) -> Vec<u64> {
+        let mut times: Vec<u64> = self
+            .accepted_at_ms
+            .into_iter()
+            .chain(self.resent_at_ms.iter().copied())
+            .collect();
+        times.sort_unstable();
+        times.dedup();
+        times
+    }
 }
 
 impl std::fmt::Debug for SentMessage {
@@ -376,6 +395,15 @@ struct SentStored {
     first_ms: u64,
     /// The acceptances of re-sends.
     resent: Vec<u64>,
+}
+
+impl SentStored {
+    /// The re-sends' acceptance times, ascending.
+    fn resent_ascending(&self) -> Vec<u64> {
+        let mut times = self.resent.clone();
+        times.sort_unstable();
+        times
+    }
 }
 
 impl std::fmt::Debug for SentStored {
@@ -694,7 +722,8 @@ impl App {
 
     /// The messages sent to `pubky` that its inbox accepted within `[from_ms, until_ms]`,
     /// first acceptances and re-sends, for the protocol's answer to a re-send request
-    /// (Switch spec 11).
+    /// (Switch spec 11). Each carries every acceptance time the app kept
+    /// ([`SentMessage::accepted_times_ms`]).
     ///
     /// # Errors
     ///
@@ -718,6 +747,7 @@ impl App {
                     plaintext: MessagePlaintext::decode(&sent.plaintext)
                         .map_err(|_| store_corrupt())?,
                     accepted_at_ms: Some(sent.first_ms),
+                    resent_at_ms: sent.resent_ascending(),
                 });
             }
         }
@@ -1128,12 +1158,23 @@ impl App {
     /// The record job: the protocol builds the record's next value from what the app holds,
     /// written compare-and-swap.
     async fn record_job(&mut self, item: &OutboxItem, job: &KeptJob) -> Result<(), AppError> {
+        let kept = self
+            .reader()
+            .get::<SentStored>(&sent_key(&item.msg_id))
+            .await?;
         let sent = SentMessage {
             to: item.to,
             kind: item.kind.clone(),
             msg_id: item.msg_id.clone(),
             plaintext: item.plaintext()?,
-            accepted_at_ms: item.accepted_at_ms,
+            accepted_at_ms: kept
+                .as_ref()
+                .map(|sent| sent.first_ms)
+                .or(item.accepted_at_ms),
+            resent_at_ms: kept
+                .as_ref()
+                .map(SentStored::resent_ascending)
+                .unwrap_or_default(),
         };
         let job = job.job();
         let protocol = std::sync::Arc::clone(&self.protocol);
