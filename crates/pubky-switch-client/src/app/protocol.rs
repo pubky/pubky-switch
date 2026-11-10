@@ -79,6 +79,24 @@ pub struct ReceivedMessage {
     pub conflict: Option<Value>,
 }
 
+/// The most bytes of local writes one receive step makes ([`Protocol`], "Limits a receive
+/// step plans for"): 4 MiB, counted by [`local_writes_bytes`].
+pub const MAX_STEP_LOCAL_BYTES: usize = 4 * 1024 * 1024;
+
+/// The bytes `writes` count against [`MAX_STEP_LOCAL_BYTES`]: the raw length of each key
+/// (a prefix for [`LocalWrite::DeletePrefix`]) and of each value, without the app's own
+/// prefix or the form the app stores them in.
+pub fn local_writes_bytes(writes: &[LocalWrite]) -> usize {
+    writes.iter().fold(0usize, |total, write| {
+        let bytes = match write {
+            LocalWrite::Put { key, value } => key.len().saturating_add(value.len()),
+            LocalWrite::Delete { key } => key.len(),
+            LocalWrite::DeletePrefix { prefix } => prefix.len(),
+        };
+        total.saturating_add(bytes)
+    })
+}
+
 /// A write of the protocol's own local state, under keys the app prefixes so they never
 /// meet its own (`STATE.md`).
 #[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -408,6 +426,18 @@ pub struct MissedEntries {
 /// carries, each at the commit point its crash rules give it (`STATE.md`). A write made
 /// beside them could land without the outcome it belongs to, or after a crash that
 /// discards it.
+///
+/// # Limits a receive step plans for
+///
+/// - **Operations:** at most 7 beside the cursor move (Switch wire 6.4).
+/// - **Local writes:** at most [`MAX_STEP_LOCAL_BYTES`], 4 MiB, of keys and values for one
+///   receive step, those added through [`ReceiveContext::local`] and those of the returned
+///   [`Effect`] together, counted as [`local_writes_bytes`] counts them. A write that would
+///   take [`ReceiveContext::local`] past it is refused there, and an effect over it is
+///   stored and passed as [`super::ParkReason::EffectTooLarge`], with
+///   [`super::AppEvent::EffectRefused`], never applied (Switch spec 8.2). The bound keeps
+///   every effect within what the app's store keeps and commits, whatever else the read
+///   holds; a protocol keeps larger state in its own store.
 ///
 /// # Duty events
 ///

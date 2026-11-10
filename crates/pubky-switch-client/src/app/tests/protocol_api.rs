@@ -176,7 +176,8 @@ impl Protocol for ApiProtocol {
                 cx.local(LocalWrite::Put {
                     key: format!("notes/{msg_id}").into_bytes(),
                     value: b"1".to_vec(),
-                });
+                })
+                .unwrap();
                 if mode == Mode::DropAfterWrite {
                     Outcome::Drop {
                         reason: "sample: dropped after writing".into(),

@@ -1,6 +1,6 @@
 //! App flows against the scripted switch.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use pubky_switch_core::envelope::Recipient;
 use pubky_switch_core::http::ErrorCode;
@@ -16,7 +16,7 @@ use serde_json::{Map, json};
 use super::*;
 use crate::app::{
     Alarm, AppBackup, AppError, AppEvent, EventId, IdentityRefresh, LeaveMode, LeaveReport,
-    ParkReason, REVALIDATION_MS, Refusal, UserConfirmed,
+    MAX_STEP_LOCAL_BYTES, ParkReason, REVALIDATION_MS, Refusal, UserConfirmed,
 };
 use crate::store::{Fault as StoreFault, FaultStore};
 use crate::testing::Fault;
@@ -3376,12 +3376,30 @@ async fn test_app_effect_over_one_batch_is_parked_and_the_feed_goes_on() {
     assert_eq!(protocol.0.received.lock().unwrap().len(), 2);
 }
 
-/// The sample protocol, whose note `big` writes local values of `sizes` bytes, with a
-/// conversation entry when `ops`; other notes as the sample protocol.
+/// The sample protocol, whose note `big` writes local values of `sizes` bytes of `0xff`,
+/// with a conversation entry when `ops`; other notes as the sample protocol. With
+/// `via_context`, the step adds the writes through its context instead, and keeps what
+/// each add answered.
+#[derive(Default)]
 struct BigProtocol {
     sample: SampleProtocol,
     ops: bool,
     sizes: Vec<usize>,
+    via_context: bool,
+    added: Mutex<Vec<Result<(), String>>>,
+}
+
+impl BigProtocol {
+    fn writes(&self) -> Vec<LocalWrite> {
+        self.sizes
+            .iter()
+            .enumerate()
+            .map(|(n, size)| LocalWrite::Put {
+                key: format!("big/{n}").into_bytes(),
+                value: vec![0xff; *size],
+            })
+            .collect()
+    }
 }
 
 impl Protocol for BigProtocol {
@@ -3425,16 +3443,26 @@ impl Protocol for BigProtocol {
         } else {
             Vec::new()
         };
-        let local = self
-            .sizes
-            .iter()
-            .enumerate()
-            .map(|(n, size)| LocalWrite::Put {
-                key: format!("big/{n}").into_bytes(),
-                value: vec![0; *size],
-            })
-            .collect();
-        Outcome::Apply(Effect { ops, local })
+        Outcome::Apply(Effect {
+            ops,
+            local: self.writes(),
+        })
+    }
+
+    fn receive_with(
+        &self,
+        message: &ReceivedMessage,
+        cx: &mut crate::app::ReceiveContext<'_>,
+    ) -> Outcome {
+        let big = message.message.body.get("text").and_then(Value::as_str) == Some("big");
+        if !self.via_context || !big {
+            return self.receive(message);
+        }
+        for write in self.writes() {
+            let added = cx.local(write).map_err(|error| error.to_string());
+            self.added.lock().unwrap().push(added);
+        }
+        Outcome::Apply(Effect::default())
     }
 
     fn resend_needed(
@@ -3452,13 +3480,17 @@ impl Protocol for BigProtocol {
 /// A note `big` to an app with [`BigProtocol`], then a plain one: the big one is stored
 /// and passed as too large, the protocol told, and the plain one applied.
 async fn big_effect_is_parked(ops: bool, sizes: Vec<usize>) {
-    let w = World::new();
-    let request = w.approve(&app_keys("wallet"), &["scope-a"]);
     let protocol = Arc::new(BigProtocol {
-        sample: SampleProtocol::default(),
         ops,
         sizes,
+        ..BigProtocol::default()
     });
+    big_effect_is_parked_with(protocol).await;
+}
+
+async fn big_effect_is_parked_with(protocol: Arc<BigProtocol>) {
+    let w = World::new();
+    let request = w.approve(&app_keys("wallet"), &["scope-a"]);
     let mut app = App::join(w.env(), protocol.clone(), World::config(), request)
         .await
         .unwrap();
@@ -3481,10 +3513,58 @@ async fn big_effect_is_parked(ops: bool, sizes: Vec<usize>) {
     app.receive(None).await.unwrap();
 }
 
+/// The key `big/0` [`BigProtocol`] writes first.
+const BIG_KEY_BYTES: usize = 5;
+
 #[tokio::test]
 async fn test_effect_too_large_to_keep_is_stored_and_passed() {
-    // One 9 MiB local write, which the kept effect carries as a JSON array, over 16 MiB.
-    big_effect_is_parked(true, vec![9 << 20]).await;
+    // Local writes at the step's bound, of bytes the kept effect carries as `255,` each:
+    // over the 16 MiB value size once kept.
+    big_effect_is_parked(true, vec![MAX_STEP_LOCAL_BYTES - BIG_KEY_BYTES]).await;
+}
+
+#[tokio::test]
+async fn test_step_local_writes_at_the_bound_are_applied() {
+    let w = World::new();
+    let request = w.approve(&app_keys("wallet"), &["scope-a"]);
+    let protocol = Arc::new(BigProtocol {
+        sizes: vec![MAX_STEP_LOCAL_BYTES - BIG_KEY_BYTES],
+        ..BigProtocol::default()
+    });
+    let mut app = App::join(w.env(), protocol.clone(), World::config(), request)
+        .await
+        .unwrap();
+    let (seq, _) = w.note(app.app_id(), "big");
+    let report = app.receive(None).await.unwrap();
+    assert!(received(&report.events, seq), "{:?}", report.events);
+    assert_eq!(
+        app.protocol_get(b"big/0").await.unwrap().map(|v| v.len()),
+        Some(MAX_STEP_LOCAL_BYTES - BIG_KEY_BYTES)
+    );
+}
+
+#[tokio::test]
+async fn test_step_local_writes_one_byte_over_the_bound_are_parked() {
+    big_effect_is_parked(false, vec![MAX_STEP_LOCAL_BYTES - BIG_KEY_BYTES + 1]).await;
+}
+
+#[tokio::test]
+async fn test_step_local_through_the_context_past_the_bound_is_refused() {
+    let protocol = Arc::new(BigProtocol {
+        sizes: vec![MAX_STEP_LOCAL_BYTES - BIG_KEY_BYTES, 1],
+        via_context: true,
+        ..BigProtocol::default()
+    });
+    big_effect_is_parked_with(protocol.clone()).await;
+    let added = protocol.added.lock().unwrap().clone();
+    assert_eq!(added.len(), 2);
+    assert!(added[0].is_ok());
+    assert!(
+        added[1]
+            .as_ref()
+            .is_err_and(|why| why.contains(&MAX_STEP_LOCAL_BYTES.to_string())),
+        "{added:?}"
+    );
 }
 
 #[tokio::test]

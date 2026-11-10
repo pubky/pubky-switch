@@ -60,9 +60,9 @@ use super::error::{Alarm, Refusal, RefusalPlace, refused_at, refused_for_good};
 use super::events::{AppEvent, Duty, ParkReason};
 use super::identity::{self, DOC_CACHE_MS, Taken};
 use super::protocol::{
-    Effect, LocalWrite, MAX_CLAIM_READS, MissedEntries, Need, OpaqueRule, Outcome,
-    PARKED_RETRIES_PER_READ, Protocol, RETRY_EVENT_READS, ReceivedMessage, ResendNeeded,
-    ResendReason, Rules, StoreFailure,
+    Effect, LocalWrite, MAX_CLAIM_READS, MAX_STEP_LOCAL_BYTES, MissedEntries, Need, OpaqueRule,
+    Outcome, PARKED_RETRIES_PER_READ, Protocol, RETRY_EVENT_READS, ReceivedMessage, ResendNeeded,
+    ResendReason, Rules, StoreFailure, local_writes_bytes,
 };
 use super::provider::TakeOver;
 use super::records::{Collection, pending_name_key};
@@ -725,9 +725,16 @@ impl App {
                 claims,
                 deadlines,
                 not_now: _,
+                over_local_bound,
             } = writes;
             effect.ops = ops.into_iter().chain(effect.ops).collect();
             effect.local = local.into_iter().chain(effect.local).collect();
+            // A step's local writes are bounded (`Protocol`, "Limits a receive step plans
+            // for"): an effect over the bound is too large, stored and passed.
+            if over_local_bound || local_writes_bytes(&effect.local) > MAX_STEP_LOCAL_BYTES {
+                self.too_large(entry, &received, read)?;
+                return Ok(Step::Pass);
+            }
             // The app layer's own lifecycle operations aren't a protocol's to write: an effect
             // carrying one is never sent. Its entry is stored and passed, so the feed goes on,
             // and the protocol told, as for an effect refused for good (Switch spec 8.2).

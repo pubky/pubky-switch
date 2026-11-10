@@ -127,7 +127,8 @@ impl Protocol for NotesProtocol {
         cx.local(LocalWrite::Put {
             key: format!("seen/{}", message.message.msg_id).into_bytes(),
             value: b"1".to_vec(),
-        });
+        })
+        .unwrap();
         self.received
             .lock()
             .unwrap()
