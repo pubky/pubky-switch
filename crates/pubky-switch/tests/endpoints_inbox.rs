@@ -712,3 +712,356 @@ async fn test_inbox_invite_context_reaches_the_feed_as_written() {
     );
     replay.db.drop_database().await.expect("drop");
 }
+
+/// bob's version 2, by `change` over version 1, signed by his key, delivered by alice's
+/// wallet.
+async fn deliver_bob_version(
+    replay: &Replay,
+    change: impl FnOnce(&mut pubky_switch_core::records::IdentityBody),
+) {
+    let v1 = doc("bob identity.json");
+    let mut body: pubky_switch_core::records::IdentityBody =
+        serde_json::from_slice(&v1.body_bytes().expect("body")).expect("body");
+    body.version = 2;
+    change(&mut body);
+    let key = pubky_switch_core::keys::IdentityKey::from_secret(hex32(&bob()["secret_hex"]));
+    let v2 = pubky_switch_core::records::IdentityDoc::sign(&key, body)
+        .expect("sign")
+        .signed()
+        .clone();
+    // Delivered by alice's wallet: an own app delivers counterparties' documents without
+    // admission, and a version listing the shop as removed can't come from the shop.
+    let path = format!("/v1/{}/peers", alice_id());
+    let keys = vectors("keys.json");
+    let request = app_request(
+        app(&keys, "wallet"),
+        "PUT",
+        &path,
+        serde_json::to_vec(&v2).expect("body"),
+        ms(&at()),
+    );
+    let answer = replay.service.handle(request).await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+}
+
+fn shop_app_id() -> [u8; 16] {
+    pubky_switch_core::enc::app_id_decode(
+        app(&vectors("keys.json"), "shop")["app_id"]
+            .as_str()
+            .expect("id"),
+    )
+    .expect("app id")
+}
+
+#[tokio::test]
+async fn test_inbox_removed_app_and_closed_renewal() {
+    let Some(replay) = replay().await else { return };
+    with_bob(&replay).await;
+    let version = apps_version(&replay).await;
+    // bob renews the shop to another certificate and closes the old one's renewal: the
+    // shop, still on the old one, is no longer current.
+    let shop = shop_app_id();
+    let old = doc("shop certificate").doc_hash().expect("hash");
+    deliver_bob_version(&replay, |body| {
+        let listed = body
+            .apps
+            .iter_mut()
+            .find(|listed| listed.app_id == shop)
+            .expect("listed");
+        listed.cert = [7; 32];
+        body.renewed.push(pubky_switch_core::records::RenewedCert {
+            app_id: shop,
+            cert: old,
+            until: Some(0),
+        });
+    })
+    .await;
+    let answer = from_shop(&replay, to_wallet(30, false), Some(version), None).await;
+    assert_eq!(code_of(&answer), (403, json!("not_current")));
+    replay.db.drop_database().await.expect("drop");
+
+    // A copy listing the shop as removed: answered like a stranger with no copy, 409
+    // identity_needed with version null, though bob is a contact.
+    let Some(replay) = support::replay().await else {
+        return;
+    };
+    with_bob(&replay).await;
+    let version = apps_version(&replay).await;
+    deliver_bob_version(&replay, |body| {
+        body.apps.retain(|listed| listed.app_id != shop);
+        body.removed.push(pubky_switch_core::records::RemovedApp {
+            app_id: shop,
+            distrust_from: 0,
+        });
+    })
+    .await;
+    let answer = from_shop(&replay, to_wallet(31, false), Some(version), None).await;
+    assert_eq!(code_of(&answer), (403, json!("not_admitted")));
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_inbox_deny_list_and_connect_policy_admit_no_append() {
+    let Some(replay) = replay().await else { return };
+    with_bob(&replay).await;
+    let version = apps_version(&replay).await;
+    // Denied, though a contact.
+    wallet_op(
+        &replay,
+        OpKind::DenyPut {
+            pubky: hex32(&bob()["public_hex"]),
+        },
+        63,
+        None,
+    )
+    .await;
+    let answer = from_shop(&replay, to_wallet(32, false), Some(version), None).await;
+    assert_eq!(code_of(&answer), (403, json!("not_admitted")));
+    replay.db.drop_database().await.expect("drop");
+
+    // alice's policy takes connect requests: a stranger may deliver its document, but not
+    // append (Switch spec 7: a stranger can't write at all).
+    let Some(replay) = support::replay().await else {
+        return;
+    };
+    replay_chain_through_revoke(&replay).await;
+    let v3 = doc("alice identity.json");
+    let mut body: pubky_switch_core::records::IdentityBody =
+        serde_json::from_slice(&v3.body_bytes().expect("body")).expect("body");
+    body.version = 4;
+    body.policy.connect_requests.enabled = true;
+    let key = pubky_switch_core::keys::IdentityKey::from_secret(hex32(
+        &alice(&vectors("keys.json"))["secret_hex"],
+    ));
+    let v4 = pubky_switch_core::records::IdentityDoc::sign(&key, body)
+        .expect("sign")
+        .signed()
+        .clone();
+    let delivery = pubky_switch_core::http::IdentityDelivery {
+        identity: v4,
+        prev: Some(v3.doc_hash().expect("hash")),
+    }
+    .to_json();
+    let path = format!("/v1/{}/identity", alice_id());
+    let answer = replay
+        .service
+        .handle(signer_request("PUT", &path, delivery, ms(&at())))
+        .await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    deliver_bob(&replay).await;
+    let version = apps_version(&replay).await;
+    let answer = from_shop(&replay, to_wallet(33, false), Some(version), None).await;
+    assert_eq!(code_of(&answer), (403, json!("not_admitted")));
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_inbox_refused_append_uses_no_invite_code() {
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    deliver_bob_with_code(&replay).await;
+    let version = apps_version(&replay).await;
+    let code = "IRrC78oNIjZ4hcet2fYnJQ";
+    // Admitted by the code, then refused at its targets: the code stays unused and no
+    // conversation entry is written, all in the append's one transaction.
+    let stranger_key = seal(
+        &hex32(&alice(&vectors("keys.json"))["public_hex"]),
+        &[Recipient::new([9; 32])],
+        &[0; 10],
+        false,
+    )
+    .expect("seal");
+    let answer = from_shop(&replay, stranger_key, Some(version), Some(code)).await;
+    assert_eq!(code_of(&answer), (409, json!("stale_key")));
+    assert_eq!(
+        sql_value(
+            &replay,
+            "SELECT uses FROM invite_codes WHERE account_id = $1"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        sql_value(
+            &replay,
+            "SELECT count(*) FROM list_entries WHERE account_id = $1 AND list = 'conversation'"
+        )
+        .await,
+        0
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_inbox_conversations_limit_refuses_a_code_admitted_append() {
+    let limits = Limits {
+        max_conversations: 0,
+        ..Limits::default()
+    };
+    let Some(replay) = replay_with(limits).await else {
+        return;
+    };
+    replay_chain_through_revoke(&replay).await;
+    deliver_bob_with_code(&replay).await;
+    let version = apps_version(&replay).await;
+    let answer = from_shop(
+        &replay,
+        to_wallet(34, false),
+        Some(version),
+        Some("IRrC78oNIjZ4hcet2fYnJQ"),
+    )
+    .await;
+    assert_eq!(code_of(&answer), (429, json!("quota_exceeded")));
+    assert_eq!(body(&answer)["current"]["limit"], "conversations");
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_inbox_flags_only_rate_refusals_of_authenticated_senders() {
+    let limits = Limits {
+        sender_per_min: 0,
+        ..Limits::default()
+    };
+    let Some(replay) = replay_with(limits).await else {
+        return;
+    };
+    with_bob(&replay).await;
+    let version = apps_version(&replay).await;
+    let flags = || async {
+        sql_value(
+            &replay,
+            "SELECT coalesce(sum(hits), 0)::BIGINT FROM sender_flags WHERE account_id = $1",
+        )
+        .await
+    };
+    // A certificate that doesn't verify: 401, before any rate, and no hit.
+    let path = format!("/v1/{}/inbox?apps_version={version}", alice_id());
+    let request = other_request_as(
+        "shop",
+        "shop certificate",
+        "cap",
+        ORIGIN,
+        "POST",
+        &path,
+        to_wallet(35, false),
+        None,
+        ms(&at()),
+    );
+    assert_eq!(replay.service.handle(request).await.status, 401);
+    // A refusal other than a rate's: 400, and no hit.
+    assert_eq!(
+        from_shop(&replay, vec![0; 10], Some(version), None)
+            .await
+            .status,
+        400
+    );
+    assert_eq!(flags().await, 0);
+    // The rate: a hit.
+    let answer = from_shop(&replay, to_wallet(36, false), Some(version), None).await;
+    assert_eq!(code_of(&answer), (429, json!("rate_limited")));
+    assert_eq!(flags().await, 1);
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_inbox_entry_hidden_from_other_apps_and_counted_for_its_target() {
+    let Some(replay) = replay().await else { return };
+    with_bob(&replay).await;
+    let version = apps_version(&replay).await;
+    // The executor registers, so a second own app reads the feed.
+    let record: SignedDoc = serde_json::from_value(
+        named(
+            &vectors("documents.json")["documents"],
+            "executor app record",
+        )["signed"]
+            .clone(),
+    )
+    .expect("record");
+    let keys = vectors("keys.json");
+    let executor = app(&keys, "executor");
+    let ops = sign_batch(
+        &ed25519_dalek::SigningKey::from_bytes(&hex32(&executor["signing_secret_hex"])),
+        &hex32(&alice(&keys)["public_hex"]),
+        Some(
+            pubky_switch_core::enc::app_id_decode(executor["app_id"].as_str().expect("id"))
+                .expect("app id"),
+        ),
+        1,
+        [92; 16],
+        vec![(Vec::new(), OpKind::AppPut { record })],
+    )
+    .expect("batch");
+    let ops_path = format!("/v1/{}/ops", alice_id());
+    let answer = replay
+        .service
+        .handle(app_request(
+            executor,
+            "POST",
+            &ops_path,
+            OpsRequest::new(&ops, None).to_json(),
+            ms(&at()),
+        ))
+        .await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    let appended = from_shop(&replay, to_wallet(37, false), Some(version), None).await;
+    assert_eq!(appended.status, 200);
+    let head: u64 =
+        u64::try_from(sql_value(&replay, "SELECT last_seq FROM accounts WHERE id = $1").await)
+            .expect("seq");
+    // The executor isn't a target: no item for the entry, and its page passes the entry's
+    // position like any other, so the gap in seqs is all it shows.
+    let path = format!("/v1/{}/feed?after=1:9", alice_id());
+    let page = body(
+        &replay
+            .service
+            .handle(app_request(executor, "GET", &path, Vec::new(), ms(&at())))
+            .await,
+    );
+    assert!(
+        page["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .all(|item| item["type"] != "entry")
+    );
+    assert_eq!(page["scanned_through"], head);
+    assert_eq!(page["next"], format!("1:{head}"));
+    // GET /apps counts it for the wallet, its only current target.
+    let apps_path = format!("/v1/{}/apps", alice_id());
+    let apps = body(
+        &replay
+            .service
+            .handle(signer_request("GET", &apps_path, Vec::new(), ms(&at())))
+            .await,
+    );
+    let wallet = apps["apps"]
+        .as_array()
+        .expect("apps")
+        .iter()
+        .find(|status| status["app_id"] == app(&keys, "wallet")["app_id"])
+        .cloned()
+        .expect("wallet");
+    assert_eq!(
+        (
+            wallet["unread_entries"].clone(),
+            wallet["sole_target_unread"].clone()
+        ),
+        (json!(1), json!(1))
+    );
+    replay.db.drop_database().await.expect("drop");
+}
