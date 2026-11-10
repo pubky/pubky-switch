@@ -3282,6 +3282,139 @@ async fn test_kept_batch_signed_again_then_refused_for_good_is_reported() {
     assert_eq!(allow_ops_for(&changed.applied(), carol), 0);
 }
 
+/// The kept batch of `app`, with its attempt, never sent.
+async fn kept_attempt_batch(
+    w: &World,
+    app: &mut App,
+) -> (
+    [u8; 16],
+    crate::app::batch::PendingBatch,
+    crate::client::Batch,
+) {
+    let carol = IdentityKey::from_secret(seed("carol/identity")).public();
+    w.switch.fail_next(Fault::Unreachable {
+        path: "ops".into(),
+        after: 0,
+    });
+    let attempt = ClaimOp::attempt(CLAIM, 0, ATTEMPT, 3600, None);
+    assert!(
+        app.submit_batch(contact_batch(carol).op(attempt.kind()))
+            .await
+            .is_err()
+    );
+    let (id, pending) = app.kept_batches().await.unwrap().pop().unwrap();
+    let batch = crate::client::Batch::from_body(pending.body.clone()).unwrap();
+    (id, pending, batch)
+}
+
+fn refused(code: ErrorCode) -> AppError {
+    AppError::Switch(ClientError::Switch {
+        status: 403,
+        code,
+        message: "scripted".into(),
+        current: json!(null),
+        known_version: None,
+        retry_after: None,
+    })
+}
+
+/// Dropped and reported, with its attempt, in one commit.
+async fn dropped_with_its_attempt(app: &mut App) {
+    assert!(app.kept_batches().await.unwrap().is_empty());
+    let kept = app.unacknowledged_events().await.unwrap();
+    assert!(
+        has(&kept, |e| matches!(e, AppEvent::KeptBatchDropped { .. })),
+        "{kept:?}"
+    );
+    assert!(
+        has(&kept, |e| matches!(
+            e,
+            AppEvent::AttemptDropped { claim_key, attempt_id, .. }
+                if *claim_key == CLAIM && *attempt_id == ATTEMPT
+        )),
+        "{kept:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_kept_batch_refused_about_the_caller_past_the_window_is_dropped() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join_on(
+        &w,
+        &router,
+        Arc::clone(&w.store) as Arc<dyn StateStore>,
+        w.protocol.clone(),
+        &Permission::ALL,
+    )
+    .await;
+    let (id, pending, batch) = kept_attempt_batch(&w, &mut app).await;
+    // Within the window a refusal about the caller keeps it.
+    let kept = app
+        .kept_refused_before_lookup(&id, &pending, &batch, refused(ErrorCode::CertExpired))
+        .await;
+    assert!(kept.is_err());
+    assert_eq!(app.kept_batches().await.unwrap().len(), 1);
+    // Past it, the same refusal drops it.
+    w.clock
+        .advance_ms(crate::app::provider::KEPT_BATCH_ANSWER_MS);
+    app.kept_refused_before_lookup(&id, &pending, &batch, refused(ErrorCode::CertExpired))
+        .await
+        .unwrap();
+    dropped_with_its_attempt(&mut app).await;
+}
+
+#[tokio::test]
+async fn test_kept_batch_of_an_earlier_generation_past_the_window_is_dropped_at_its_resend() {
+    for code in [Some(ErrorCode::CertExpired), None] {
+        let w = World::new();
+        let router = Router::of(&w);
+        let mut app = join_on(
+            &w,
+            &router,
+            Arc::clone(&w.store) as Arc<dyn StateStore>,
+            w.protocol.clone(),
+            &Permission::ALL,
+        )
+        .await;
+        let (id, pending, batch) = kept_attempt_batch(&w, &mut app).await;
+        let changed = change_key(&w, &router);
+        // Followed to generation 2 with the batch still kept for generation 1.
+        let mut followed = false;
+        for after in 0..6 {
+            changed.fail_next(Fault::Unreachable {
+                path: "ops".into(),
+                after,
+            });
+            let _ = app.receive(None).await;
+            changed.lock().faults.clear();
+            if app.cursor().generation == 2 && app.kept_batches().await.unwrap().len() == 1 {
+                followed = true;
+                break;
+            }
+        }
+        assert!(followed);
+        // Past the window, its resend is refused about the caller, or answered `409
+        // stale_generation`: either way it is dropped, not kept or signed again.
+        w.clock
+            .advance_ms(crate::app::provider::KEPT_BATCH_ANSWER_MS);
+        if let Some(code) = code {
+            changed.fail_next(Fault::Error {
+                path: "ops".into(),
+                code,
+                current: json!(null),
+            });
+        }
+        app.ready_local().await.unwrap();
+        app.resend_earlier(&id, &pending, &batch).await.unwrap();
+        dropped_with_its_attempt(&mut app).await;
+        assert!(!has(&app.take_events(), |e| matches!(
+            e,
+            AppEvent::KeptBatchSignedAgain { .. }
+        )));
+    }
+}
+
 /// The app at `store`, loaded through the loss's router.
 async fn load_lost(lost: &Lost, store: Arc<dyn StateStore>) -> App {
     App::load(

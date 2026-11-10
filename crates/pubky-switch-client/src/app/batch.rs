@@ -615,7 +615,7 @@ impl App {
     /// its attempts instead (Switch spec 12.5 "Kept batches"). Refused about these bytes,
     /// which will be refused again, it is dropped and reported so at once, and the next
     /// kept batch goes on.
-    async fn kept_refused_before_lookup(
+    pub(crate) async fn kept_refused_before_lookup(
         &mut self,
         id: &[u8; 16],
         pending: &PendingBatch,
@@ -819,7 +819,7 @@ impl App {
     /// tell: one kept longer than the service holds batch IDs is dropped instead, and
     /// reported with each `attempt` in it. Another refusal for good drops it; any other
     /// failure keeps it, and is the caller's error.
-    async fn resend_earlier(
+    pub(crate) async fn resend_earlier(
         &mut self,
         id: &[u8; 16],
         pending: &PendingBatch,
