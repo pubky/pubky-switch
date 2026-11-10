@@ -195,7 +195,7 @@ impl Signer {
     /// reduction included, as it still holds its scopes, then deliver a version raising
     /// `data_epoch` to it (Switch spec 3.2, 3.5; Switch wire 3.8). `statuses` is the switch's
     /// view, read once its copy was confirmed.
-    async fn complete_epoch(&mut self, statuses: &[AppStatus]) -> Result<()> {
+    pub(super) async fn complete_epoch(&mut self, statuses: &[AppStatus]) -> Result<()> {
         let newest = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
         let through = self.state.epoch_through;
         let key = self.keyring.unlock()?;
@@ -217,7 +217,7 @@ impl Signer {
     /// part, nor does one whose certificate holds a scope no registered protocol owns, with
     /// [`Alert::RotationSkipped`]. Either gets the epochs it lacks from its next bundle, which
     /// starts after `keys_through`.
-    fn catch_up(
+    pub(super) fn catch_up(
         &self,
         key: &IdentityKey,
         newest: &IdentityDoc,
@@ -279,7 +279,7 @@ impl Signer {
     }
 
     /// Sign `ops` in batches at `generation`, each with the parts it stores.
-    fn sign_batches(&self, generation: u64, ops: Vec<Op>) -> Result<Vec<RenewBatch>> {
+    pub(super) fn sign_batches(&self, generation: u64, ops: Vec<Op>) -> Result<Vec<RenewBatch>> {
         let client = self.service_client()?;
         ops.chunks(MAX_OPS)
             .map(|chunk| {
@@ -302,7 +302,7 @@ impl Signer {
     /// certificate that an app has passed, which the switch may drop (Switch wire 3.5,
     /// 7.4.12).
     #[allow(clippy::too_many_arguments)]
-    async fn commit_batches(
+    pub(super) async fn commit_batches(
         &mut self,
         mut state: SignerState,
         newest: &IdentityDoc,
@@ -317,7 +317,7 @@ impl Signer {
                 "a version without its delivery".into(),
             ));
         };
-        state.signed_through = doc.version();
+        state.signed_through = state.signed_through.max(doc.version());
         for alert in alerts {
             state.alert(alert);
         }
@@ -345,7 +345,7 @@ impl Signer {
     }
 
     /// The switch's apps, once its copy is confirmed as this install's mark.
-    async fn switch_apps(&mut self) -> Result<Vec<AppStatus>> {
+    pub(super) async fn switch_apps(&mut self) -> Result<Vec<AppStatus>> {
         let answer = self.service_client()?.apps().await?;
         self.confirm_copy(answer.identity.as_ref()).await?;
         Ok(answer.apps)
@@ -411,7 +411,7 @@ impl Signer {
     }
 
     /// Every certificate the signer holds, verified.
-    fn held_certs(&self) -> Result<Vec<AppCert>> {
+    pub(super) fn held_certs(&self) -> Result<Vec<AppCert>> {
         let identity = self.state.identity;
         Ok(self
             .state
@@ -579,9 +579,10 @@ impl Signer {
         Ok(closing.into_iter().map(|(app, _)| app).collect())
     }
 
-    /// What is due at each start, in order (Switch wire 3.8): finish the flow in progress and
-    /// any closing delivery owed, then close the cooperative renewals whose apps took their new
-    /// certificate.
+    /// What is due at each start, in order (design note, section 4.5): finish the flow in
+    /// progress and any closing delivery owed (Switch wire 3.8), remove the apps revoked or
+    /// departed (Switch spec 12.2, 12.3), close the cooperative renewals whose apps took their
+    /// new certificate, and answer the full-bundle requests (Switch wire 3.5).
     ///
     /// # Errors
     ///
@@ -594,22 +595,29 @@ impl Signer {
         {
             return resumed;
         }
+        self.complete_removals().await?;
         self.complete_renewals().await?;
+        self.serve_full_bundles().await?;
         resumed
     }
 }
 
 /// A batch operation, with the key bundle part it stores, if any.
-type Op = (OpKind, Option<StoredPart>);
+pub(super) type Op = (OpKind, Option<StoredPart>);
 
 /// Whether a scope has keys, for a rotation: one no registered protocol owns counts as keyed,
 /// so removing it rotates, as its keys can't be judged (design note, decision 2).
-fn keyed(protocols: &Protocols) -> impl Fn(&str) -> bool + '_ {
+pub(super) fn keyed(protocols: &Protocols) -> impl Fn(&str) -> bool + '_ {
     |scope| protocols.has_keys(scope) || !protocols.knows_scope(scope)
 }
 
 /// Add `sealed`'s parts for `app_id`, made for the certificate `cert`, to the operations.
-fn push_parts(ops: &mut Vec<Op>, app_id: [u8; 16], cert: [u8; 32], sealed: Vec<BundlePart>) {
+pub(super) fn push_parts(
+    ops: &mut Vec<Op>,
+    app_id: [u8; 16],
+    cert: [u8; 32],
+    sealed: Vec<BundlePart>,
+) {
     for part in sealed {
         let stored = StoredPart {
             app_id,

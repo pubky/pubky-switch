@@ -2,7 +2,8 @@
 //!
 //! The signer writes two public files there, which only it writes and no app's grant covers
 //! (Switch spec 3.4): `identity.json` (Switch wire 3.3) and the signer's backup (Switch wire
-//! 3.13). The host implements [`Homeserver`] on its Pubky client, with the identity's own
+//! 3.13). It also deletes a removed app's record, which the app wrote under its own grant
+//! (Switch spec 12.2 step 4). The host implements [`Homeserver`] on its Pubky client, with the identity's own
 //! session; how it signs in, and the request deadlines, are the host's.
 
 use pubky_switch_client::TransportError;
@@ -28,4 +29,12 @@ pub trait Homeserver: Send + Sync {
     /// A [`TransportError`] when the write failed or may not have arrived; the signer writes
     /// the same bytes again.
     fn put(&self, path: &str, bytes: Vec<u8>) -> BoxFuture<'_, Result<(), TransportError>>;
+
+    /// Delete the identity's file at `path`. `Ok` also when there is no such file.
+    ///
+    /// # Errors
+    ///
+    /// A [`TransportError`] when the deletion failed or may not have arrived; the signer
+    /// deletes again.
+    fn delete(&self, path: &str) -> BoxFuture<'_, Result<(), TransportError>>;
 }

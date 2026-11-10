@@ -95,7 +95,8 @@ service.
   checks, for scripting what another signer or a faulty service did. `forget_delivery_proof`
   makes a retry answer with no proof.
 - **`GET /apps`** (Switch wire 7.4.12): the apps the switch holds or the newest document
-  lists, with `current`, `record_cert`, `record_at`, `bundle_ranges`, `keys_through` and
+  lists, with `current`, `record_cert`, `record_at`, `revoked_at`, `departed_at`,
+  `awaiting_rotation`, `full_bundle_requested`, `bundle_ranges`, `keys_through` and
   `cert_expires_at`, and the
   account's `identity`, `recovery` (`declared_at` its recovery record's time) and
   `proof_generations`, from the same kept proofs as the delivery; no last-seen times,
@@ -103,7 +104,10 @@ service.
 - **Moves and recovery** (Switch spec 12.5, 12.6, Switch wire 10): `import_into` copies the
   account in memory, with no manifest, chunks or export transfer; a recovery upload is kept
   and answered with fixed changes, merging nothing.
-- **Revocation, freeze and unfreeze** are test calls, not routes.
+- **Revocation** is `POST /apps/{app_id}/revoke` from the signer, and the test call
+  `revoke`; an app that left is answered as one revoked already, with no proof. `leave` and
+  `request_full_bundle` are test calls for the app's own routes. Freeze and
+  unfreeze are test calls, not routes.
 - **Erasure** (Switch wire 7.4.16) is a flag; its answers are signed with a fixed operator
   key.
 - **Push** (Switch wire 8.1): registrations only; nothing is sent to a relay.

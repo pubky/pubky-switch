@@ -50,9 +50,11 @@ use crate::state::{self, DeliverStep, Flow, Newest, Service, SignerState};
 
 mod approval;
 mod renewal;
+mod revocation;
 
 pub use approval::{AppReview, ApprovedRequest};
 pub use renewal::CertChange;
+pub use revocation::UserConfirmed;
 
 /// What the signer works with, from the host.
 #[derive(Clone)]
@@ -239,7 +241,10 @@ impl Signer {
             // owed"). Only the backup write comes before it, as before every delivery
             // (Switch wire 3.13).
             if !self.queue_owed_closing().await? {
-                return self.publish().await;
+                self.publish().await?;
+                // A removed app's record goes once its removal is published (Switch spec
+                // 12.2 step 4).
+                return self.clean_up_removed().await;
             }
         }
     }

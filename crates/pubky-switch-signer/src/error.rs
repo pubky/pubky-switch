@@ -115,6 +115,9 @@ pub enum Refusal {
         /// The newer version.
         version: u64,
     },
+    /// The newest `identity.json` doesn't list that App ID in `removed`.
+    #[error("refused: the App ID isn't in removed")]
+    NotRemoved,
     /// The store holds no signer records for this identity.
     #[error("refused: the signer isn't set up for this identity")]
     NotSetUp,

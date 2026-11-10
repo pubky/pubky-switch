@@ -100,6 +100,14 @@ pub(crate) struct SignerState {
     /// it (Switch wire 3.3 "Deliver, then publish").
     #[serde(default)]
     pub(crate) republish_over: Option<[u8; 32]>,
+    /// The revocations asked for whose removal isn't delivered yet, with the earlier
+    /// `distrust_from` the user picked, if any (Switch spec 12.2).
+    #[serde(default)]
+    pub(crate) revoking: Vec<Revoking>,
+    /// The removed apps whose Homeserver record is still to be deleted (Switch spec 12.2
+    /// step 4).
+    #[serde(default)]
+    pub(crate) cleanup: Vec<[u8; 16]>,
     /// The alerts the user hasn't cleared.
     pub(crate) alerts: Vec<Alert>,
     /// The certificate lifetime new certificates get, in milliseconds (Switch spec 3.2).
@@ -134,6 +142,16 @@ pub(crate) struct SignerState {
     /// time to close at.
     #[serde(default)]
     pub(crate) closing_unavailable: Option<u64>,
+}
+
+/// A revocation asked for, until the version that removes the app is delivered.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Revoking {
+    /// The App ID.
+    pub(crate) app_id: [u8; 16],
+    /// An earlier `distrust_from` than the revocation time, which the user picked after a
+    /// compromise.
+    pub(crate) distrust_from: Option<u64>,
 }
 
 /// An approval's companion claim, signed with the version that lists its certificate and
@@ -194,6 +212,8 @@ impl SignerState {
             records_behind: None,
             homeserver_other: None,
             republish_over: None,
+            revoking: Vec::new(),
+            cleanup: Vec::new(),
             alerts: Vec::new(),
             cert_lifetime_ms: DEFAULT_CERT_LIFETIME_MS,
             claims: Vec::new(),

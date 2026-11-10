@@ -160,13 +160,16 @@ Flow = Approve     { request_hash, cert, step }
      | TakingOver  { source: HandOver | Backup | NotNamed, version, step }
 ```
 
-Each step is one idempotent call. `Revoke`, for example, runs these steps:
-1. Revoke at the switch.
-2. Store each remaining app's bundle for e+1.
-3. Write the backup.
-4. Deliver `identity.json` with the app in `removed` and `data_epoch` e+1.
-5. Publish.
-6. Delete the app's Homeserver record and revoke its grant.
+Each step is one idempotent call. A revocation, for example, runs these steps:
+1. Keep the App ID as a tombstone and the revocation as asked for, in one commit.
+2. Revoke at the switch.
+3. Store each remaining app's bundle for e+1, completing first an epoch a given-up rotation sent keys for.
+4. Write the backup.
+5. Deliver `identity.json` with the app in `removed` and `data_epoch` e+1.
+6. Publish.
+7. Delete the app's Homeserver record, and ask the user to revoke its grant (decision 4).
+
+The rotation's batches and its delivery are one `Renew` flow; what is asked for and still owed (the revocation, the record deletion) is kept in the records, so `run_due` finishes it after a crash. A departure, or a revocation the switch shows that the records don't, is completed by steps 3 to 7 at the next run.
 
 ### 4.4 Delivering a version, with the backup
 
@@ -265,8 +268,10 @@ impl Signer {
     async fn claim_delivered(&mut self, request: &[u8; 32]) -> Result<()>;          // the host sent the claim and the grant
     async fn renew(&mut self, app: [u8; 16], change: CertChange) -> Result<IdentityDoc>;   // a reduction's closing follows at once
     async fn complete_renewals(&mut self) -> Result<Vec<[u8; 16]>>;                         // cooperative: until = record_at + 5 min
-    async fn revoke(&mut self, app: AppId, distrust_from: Option<Time>, ok: UserConfirmed) -> Result<Rotation>;
-    async fn purge_removed(&mut self, app: AppId) -> Result<()>;
+    async fn revoke(&mut self, app: [u8; 16], distrust_from: Option<u64>, ok: UserConfirmed) -> Result<IdentityDoc>;
+    async fn complete_removals(&mut self) -> Result<bool>;                                   // revocations and departures the switch shows
+    async fn purge_removed(&mut self, app: [u8; 16]) -> Result<IdentityDoc>;
+    async fn serve_full_bundles(&mut self) -> Result<Vec<[u8; 16]>>;                         // pending POST /keys
 
     // Settings
     async fn set_record_max_age(&mut self, seconds: Option<u64>) -> Result<()>;
@@ -407,3 +412,4 @@ The Switch spec answers four questions a signer has to settle:
 - **Records behind this install's own newer version.** Before it signs a new version, the signer compares every copy with its mark: the switch's (`GET /apps`), the signer backup, and the Homeserver's `identity.json`; publication and the backup write check again. A newer copy, a higher version at no lower generation, verified for the identity, is judged by its signer. Another install's is adopted, and this install stops as an install that isn't named, so the take-over flow is how it signs again. This install's own, or a backup of its own above every version its records signed, means its records are behind, as after a restore of an old device backup: signing on top of them would roll the identity's state back (its data epoch, apps and renewals). So it signs nothing more, refuses with `RecordsBehind`, raises `RecordsBehind`, and holds its claims, and the change asked for isn't applied. Above all, it never writes over that backup, since it is the one to restore from: it is written before every delivery and so holds the newer version. The restore flow (a later PR) clears the state. Another body at the mark's version on the Homeserver is equivocation, as from the switch: it needed the identity key, so the signer raises the alarm, holds claims, signs nothing on top and reports `Alarm`. The switch decides which body is the version, and the Homeserver file only publishes it (wire 3.3 "Deliver, then publish"), so once the user clears the alert, the signer delivers its newest version again and, when the switch holds it, publishes it over the other body. If the switch holds something else, the usual rules decide: another install's newer version stops this install, and a rollback or another body there is the alarm. A copy that doesn't verify, or is older, is written over.
 - **The window between the read and the write.** `Homeserver::put` is unconditional: another install can publish `identity.json`, or write the backup, between this signer's read and its write, and this signer then writes over it. The switch's compare-and-swap still decides who signs, and the winner's next write repairs the file. The Homeserver has no conditional write: it takes `If-None-Match` and `If-Modified-Since` on reads only, with no `If-Match` or other precondition on a write. So `Homeserver::put` stays unconditional, and this window stays.
 - **A switch that never gives a reduction's service time.** A reduction closes at the service time at which the switch took its renewing version. If neither the delivery nor its retry carries a proof, the reduction stays open with `ReductionNotClosed`, and the closing uses the service time of the next version the user signs. Nothing is delivered on its own to get a time, since the signer never uses its own clock for a cutoff. So until then, the earlier certificate isn't cut off. The alert tells the user to make a change, or to revoke the app, which cuts it off at once.
+- **A full-bundle request after a given-up renewal of the same app.** When the app's record carries an older certificate than the listed one, the signer sends `cert.put` with the listed certificate before the parts. If a renewal that was given up after its batches had stored a newer certificate with `cert.put`, the switch refuses the older one (`409 conflict`, wire 6.2), so the request stays pending and each run tries it again. A new renewal of the app, which stores a certificate newer than both, clears it.

@@ -97,4 +97,11 @@ pub enum Alert {
         /// Its scopes that no registered protocol owns.
         scopes: Vec<String>,
     },
+    /// A removed app's Pubky grant still lets it write its Homeserver paths: the Pubky SDK
+    /// offers no call to revoke a grant yet, so the user revokes it in the Homeserver's own
+    /// settings (Switch spec 3.4, 12.2 step 1; design note, decision 4).
+    GrantRevocationOwed {
+        /// The removed app.
+        app_id: [u8; 16],
+    },
 }
