@@ -881,8 +881,13 @@ async fn test_inbox_entry_waits_for_a_target_whose_certificate_lapsed() {
             ))
             .await,
     );
-    // Not served, but still current: the entry it hasn't read counts for it.
-    assert_eq!(status_of(&status, "wallet")["current"], json!(false));
+    // Lapsed, but still current: the entry it hasn't read counts for it, and
+    // `cert_expires_at` shows the lapse.
+    assert_eq!(status_of(&status, "wallet")["current"], json!(true));
+    assert_eq!(
+        status_of(&status, "wallet")["cert_expires_at"],
+        "2026-12-01T00:00:00.000Z"
+    );
     assert_eq!(status_of(&status, "wallet")["unread_entries"], 1);
     // The phone reads past the entry: it stays, waiting for the wallet.
     let keys = vectors("keys.json");
