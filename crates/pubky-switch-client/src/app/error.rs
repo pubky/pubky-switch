@@ -38,9 +38,11 @@ pub enum Alarm {
     Compromise {
         /// The registration's `n`.
         n: u64,
-        /// The service time at which the registration was accepted, from its chain item:
-        /// the `distrust_from` the app asks the signer for. `None` when the app saw the
-        /// registration only in a `409 conflict`, without its chain item.
+        /// The `distrust_from` the app asks the signer for: the service time at which the
+        /// registration was accepted, from its chain item. Learned of without that item, from
+        /// a `409 conflict` or a directory, the later of the service times of the newest
+        /// chain item the app verified and of its own last registration (Switch spec 3.6).
+        /// `None` only when the app holds neither.
         distrust_from: Option<u64>,
     },
     /// A time signed by the service key that is earlier than one the app verified before

@@ -180,14 +180,17 @@ impl FeedItem {
         }
     }
 
-    fn read(o: Obj<'_>) -> Result<Self, ClientError> {
+    /// Read an item; `None` for one whose `type` this version doesn't know and that carries
+    /// no stub. Such an item that carries a stub reads as [`FeedItem::Stub`], so its stub is
+    /// still checked in the chain and nothing else is taken from it (Switch wire 7.5).
+    fn read(o: Obj<'_>) -> Result<Option<Self>, ClientError> {
         let seq = o.u64("seq")?;
         let stub = |o: &Obj<'_>| {
             o.get("stub")
                 .and_then(|value| Stub::from_value(value).ok())
                 .ok_or_else(|| bad("Switch wire 7.5: a feed item's stub doesn't read"))
         };
-        Ok(match o.str("type")? {
+        Ok(Some(match o.str("type")? {
             "entry" => FeedItem::Entry(EntryItem {
                 seq,
                 entry_id: o.b64n("entry_id")?,
@@ -228,8 +231,12 @@ impl FeedItem {
                 seq,
                 stub: stub(&o)?,
             },
-            _ => return Err(bad("Switch wire 7.5: a feed item of an unknown type")),
-        })
+            _ if o.get("stub").is_some() => FeedItem::Stub {
+                seq,
+                stub: stub(&o)?,
+            },
+            _ => return Ok(None),
+        }))
     }
 }
 
@@ -266,7 +273,7 @@ impl FeedPage {
             items: o
                 .objects("items")?
                 .into_iter()
-                .map(FeedItem::read)
+                .filter_map(|item| FeedItem::read(item).transpose())
                 .collect::<Result<_, _>>()?,
             next,
             scanned_through: o.u64("scanned_through")?,
@@ -625,38 +632,29 @@ pub struct Directory {
     /// service holds.
     pub known_version: Option<u64>,
     /// The App IDs of the entries left out of `apps`: a record or receive key record that
-    /// doesn't verify, or an App ID listed more than once. A sender skips those apps and
-    /// uses the others (Switch spec 8.1).
+    /// doesn't verify. A sender skips those apps and uses the others (Switch spec 8.1).
     pub skipped: Vec<[u8; 16]>,
 }
 
 impl Directory {
+    /// Read a directory. One that names an App ID twice is refused whole (Switch wire
+    /// 7.4.10 "Each App ID once").
     pub(crate) fn read(o: Obj<'_>, account: &[u8; 32]) -> Result<Self, ClientError> {
         let identity = IdentityDoc::verify(&o.doc("identity")?, account)?;
         let mut apps: Vec<DirectoryApp> = Vec::new();
         let mut skipped: Vec<[u8; 16]> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
         for a in o.objects("apps")? {
             // An entry without an App ID that reads can't be named; it is left out.
             let Ok(app_id) = a.app_id("app_id") else {
                 continue;
             };
+            if !seen.insert(app_id) {
+                return Err(bad("Switch wire 7.4.10: a directory names an App ID twice"));
+            }
             match Self::read_app(&a, app_id, account) {
-                Ok(app) if !skipped.contains(&app_id) => {
-                    if apps.iter().any(|held| held.app_id == app_id) {
-                        // Listed twice: neither copy is used.
-                        apps.retain(|held| held.app_id != app_id);
-                        skipped.push(app_id);
-                    } else {
-                        apps.push(app);
-                    }
-                }
-                Ok(_) => {}
-                Err(_) => {
-                    apps.retain(|held| held.app_id != app_id);
-                    if !skipped.contains(&app_id) {
-                        skipped.push(app_id);
-                    }
-                }
+                Ok(app) => apps.push(app),
+                Err(_) => skipped.push(app_id),
             }
         }
         Ok(Self {

@@ -183,6 +183,9 @@ pub(crate) struct PendingBatch {
     /// The messages put in the outbox with the answer.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) queued: Vec<OutboxItem>,
+    /// When it was kept, before its first send, app clock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) kept_ms: Option<u64>,
 }
 
 impl std::fmt::Debug for PendingBatch {
@@ -391,6 +394,7 @@ impl App {
                 .collect(),
             local: batch.local,
             queued,
+            kept_ms: Some(self.now()),
         };
         let mut tx = self.tx()?;
         tx.put(&pending_key(&id), &pending)?;
@@ -481,8 +485,20 @@ impl App {
     /// writes nothing at the new service: it uploads before its first write there (Switch
     /// spec 12.6 step 3, Switch wire 7.4.14).
     pub(crate) async fn refuse_before_upload(&self) -> Result<(), AppError> {
+        self.refuse_before_upload_of(None).await
+    }
+
+    /// [`App::refuse_before_upload`] for one batch: only the loss's own registration batch
+    /// (Switch spec 12.6 step 1) goes before the upload. Every other write waits, a received
+    /// message's effect, a cursor move, a receive key rotation and the record of a renewal
+    /// included.
+    pub(crate) async fn refuse_before_upload_of(
+        &self,
+        batch: Option<&Batch>,
+    ) -> Result<(), AppError> {
         if let Some(loss) = self.loss_record().await?
             && loss.step <= LossStep::Upload
+            && batch.is_none_or(|batch| batch.body() != loss.batch.as_slice())
         {
             return Err(Refusal::NotNow(
                 "Switch spec 12.6 step 3: the app uploads its evidence before it writes at the \
@@ -508,6 +524,10 @@ impl App {
             let id = pubky_switch_core::enc::unb64_array::<16>(&id)
                 .map_err(|_| AppError::Store(crate::error::StoreError::Corrupt))?;
             let batch = self.without_stale_cursor(Batch::from_body(pending.body.clone())?)?;
+            if super::batch_generation(&batch).is_some_and(|g| g < self.state.meta.generation) {
+                self.resend_earlier(&id, &pending, &batch).await?;
+                continue;
+            }
             match self.run_pending(&id, &pending, &batch).await {
                 Ok(submitted) => self.check_attempts_of(&batch, &submitted).await?,
                 Err(error) => match refused_for_good(&error) {
@@ -723,6 +743,99 @@ impl App {
                     .map_err(|_| AppError::Store(crate::error::StoreError::Corrupt))
             })
             .collect()
+    }
+
+    /// A kept batch signed for a generation before a provider change that the app's chain
+    /// can't tell about, sent again unchanged: the answer decides (Switch spec 12.5 "Kept
+    /// batches", Switch wire 6.4 step 6). Its original proofs, or `409 conflict` after an
+    /// import, show it applied: what it settles commits and nothing is signed again. `409
+    /// stale_generation` shows it never applied, for a batch kept less than the window the
+    /// service holds batch IDs: its operations are signed again for the generation
+    /// followed, under a new batch ID, and sent. Kept longer, it is dropped and reported. Another refusal for good drops
+    /// it; any other failure keeps it, and is the caller's error.
+    async fn resend_earlier(
+        &mut self,
+        id: &[u8; 16],
+        pending: &PendingBatch,
+        batch: &Batch,
+    ) -> Result<(), AppError> {
+        let proofs = match self.submit(batch).await {
+            Ok(submitted) => submitted.proofs,
+            Err(AppError::Switch(ClientError::Switch {
+                code: ErrorCode::Conflict,
+                ..
+            })) => Vec::new(),
+            Err(AppError::Switch(ClientError::Switch {
+                code: ErrorCode::StaleGeneration,
+                ..
+            })) if !super::provider::answer_decides(self.now(), pending.kept_ms) => {
+                // The service may have forgotten a batch it applied: past the window the
+                // answer decides nothing, and the batch goes (Switch spec 12.5 "Kept
+                // batches").
+                let mut tx = self.tx()?;
+                tx.delete(&pending_key(id))?;
+                self.commit(tx).await?;
+                super::provider::dropped(id, batch, &mut self.events);
+                return Ok(());
+            }
+            Err(AppError::Switch(ClientError::Switch {
+                code: ErrorCode::StaleGeneration,
+                ..
+            })) => {
+                let ops = batch
+                    .ops()
+                    .iter()
+                    .map(|op| (op.body().conditions.clone(), op.body().kind.clone()))
+                    .collect();
+                let signed = self.sign_ops(ops, None)?;
+                let new_id = signed.id().ok_or_else(|| {
+                    AppError::InvalidData("a batch of operations has an ID".into())
+                })?;
+                let renewed = PendingBatch {
+                    body: signed.body().to_vec(),
+                    kept_ms: Some(self.now()),
+                    ..pending.clone()
+                };
+                let mut tx = self.tx()?;
+                Self::replace_kept_batch(id, Some((&new_id, &renewed)), &mut tx)?;
+                self.commit(tx).await?;
+                self.events.push(AppEvent::KeptBatchSignedAgain {
+                    batch_id: *id,
+                    new_batch_id: new_id,
+                });
+                let submitted = self.run_pending(&new_id, &renewed, &signed).await?;
+                return self.check_attempts_of(&signed, &submitted).await;
+            }
+            Err(error) => {
+                if let Some(code) = refused_for_good(&error) {
+                    let mut tx = self.tx()?;
+                    tx.delete(&pending_key(id))?;
+                    self.commit(tx).await?;
+                    self.events.push(AppEvent::BatchRefused {
+                        batch_id: *id,
+                        code: code.as_str().to_owned(),
+                    });
+                    return Ok(());
+                }
+                return Err(error);
+            }
+        };
+        // Applied: an attempt learned of this way isn't carried out on this answer; the
+        // protocol reads its claim (Switch spec 12.5 "Kept batches").
+        let mut tx = self.tx()?;
+        for (index, op) in batch.ops().iter().enumerate() {
+            self.settle_op(op, proofs.get(index), pending, &mut tx)
+                .await?;
+        }
+        self.settle_kept_writes(pending, &mut tx).await?;
+        tx.delete(&pending_key(id))?;
+        if let Some(chain) = self.state.chain.as_mut() {
+            chain.write(&mut tx)?;
+        }
+        self.commit(tx).await?;
+        self.events
+            .push(AppEvent::KeptBatchApplied { batch_id: *id });
+        Ok(())
     }
 
     /// A kept batch the old service applied, though its answer was lost: what it settles

@@ -444,7 +444,9 @@ impl App {
         self.rebuild_client()?;
         // The kept writes, judged against the old chain view before it goes (Switch spec
         // 12.6 step 1, 13.5).
-        let events = self.carry_kept_writes(&mut tx, true).await?;
+        let events = self
+            .carry_kept_writes(&mut tx, super::provider::Carry::AfterLoss)
+            .await?;
         let batch = self.sign_ops(
             vec![
                 (
@@ -477,6 +479,7 @@ impl App {
         // once the cursor passes the new key's registration there.
         for (old_n, held) in self.state.receive_keys.iter_mut() {
             held.reg_seq = None;
+            held.reg_time_ms = None;
             held.pending.clear();
             tx.put(&key::receive_key(*old_n), held)?;
         }
@@ -484,6 +487,7 @@ impl App {
             key: fresh.clone(),
             record: record.signed().clone(),
             reg_seq: None,
+            reg_time_ms: None,
             pending: Vec::new(),
         };
         tx.put(&key::receive_key(n), &held)?;
@@ -685,6 +689,7 @@ impl App {
             && let Some(held) = self.state.receive_keys.get_mut(&loss.key_n)
         {
             held.reg_seq = Some(proof.envelope().seq);
+            held.reg_time_ms = Some(proof.envelope().server_time);
             tx.put(&key::receive_key(loss.key_n), held)?;
         }
         // Switch spec 12.6 "Residual risk": the offset between the two services' clocks,

@@ -302,6 +302,8 @@ async fn test_app_unexpected_registration_stops_and_leaves() {
 async fn test_app_conflict_naming_a_foreign_key_is_a_compromise() {
     let w = World::new();
     let mut app = w.join("wallet").await;
+    let joined = w.clock.now_ms();
+    w.clock.advance_ms(HOUR);
     let thief = ReceiveKey::from_secret(1, [43; 32]);
     let record = ReceiveKeyRecord::sign(
         &app_keys("wallet"),
@@ -317,17 +319,19 @@ async fn test_app_conflict_naming_a_foreign_key_is_a_compromise() {
             },
         )
         .unwrap();
+    let registered = w.clock.now_ms();
     // The app rotates before reading the thief's registration: `409 conflict` names it.
+    // Without its chain item, the app distrusts from its own registration, the latest
+    // service time it holds, which lies before the thief's (Switch spec 3.6).
     let error = app.rotate().await.unwrap_err();
     assert!(
-        matches!(
-            error,
-            AppError::Alarm(Alarm::Compromise {
-                n: 1,
-                distrust_from: None
-            })
-        ),
+        matches!(error, AppError::Alarm(Alarm::Compromise { n: 1, .. })),
         "{error:?}"
+    );
+    let distrust_from = app.compromise_distrust_from().unwrap();
+    assert!(
+        (joined..=registered).contains(&distrust_from),
+        "{distrust_from}"
     );
     assert!(w.switch.app(&app.app_id()).departed);
 }
@@ -789,6 +793,54 @@ async fn test_scripted_switch_refuses_a_cursor_outside_the_sequence() {
     }
     app.submit(&cursor(1, newest)).await.unwrap();
     assert_eq!(w.switch.app(&me).cursor, newest);
+}
+
+#[tokio::test]
+async fn test_scripted_switch_pages_the_feed_by_bytes_never_inside_a_batch() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let me = app.app_id();
+    let notes: Vec<u64> = (0..3).map(|i| w.note(me, &format!("note {i}")).0).collect();
+    // A budget below one item: each page holds its first item or batch alone (Switch wire
+    // 7.4.4).
+    w.switch.lock().max_page_bytes = 1;
+    let query = |seq| crate::client::answers::FeedQuery {
+        after: Some(pubky_switch_core::ops::Position { generation: 1, seq }),
+        limit: Some(100),
+        wait: None,
+    };
+    // A batch comes whole, as the join's record and first receive key do.
+    let batch_of = |item: &crate::client::answers::FeedItem| match item {
+        crate::client::answers::FeedItem::Chain(chain) => chain
+            .stub
+            .open()
+            .ok()
+            .and_then(|env| env.batch)
+            .map(|b| b.id),
+        _ => None,
+    };
+    let mut after = 0;
+    let mut whole_batch = false;
+    loop {
+        let page = app.client.feed(query(after)).await.unwrap();
+        if page.items.len() > 1 {
+            let first = batch_of(&page.items[0]);
+            assert!(first.is_some(), "{:?}", page.items);
+            assert!(page.items.iter().all(|item| batch_of(item) == first));
+            whole_batch = true;
+        }
+        if !page.more {
+            break;
+        }
+        assert!(!page.items.is_empty(), "a page holds at least one item");
+        after = page.next.seq;
+    }
+    assert!(whole_batch);
+    // The app reads them all, a page at a time.
+    let report = app.receive(None).await.unwrap();
+    for seq in notes {
+        assert!(received(&report.events, seq), "{:?}", report.events);
+    }
 }
 
 #[tokio::test]
@@ -1608,6 +1660,17 @@ async fn test_app_effect_refused_for_good_is_parked_and_the_feed_goes_on() {
         e,
         AppEvent::Parked { seq, reason: ParkReason::Refused } if *seq == refused
     )));
+    // The protocol is told, with the code, so it may build the effect another way (Switch
+    // spec 8.2).
+    assert!(
+        has(&report.events, |e| matches!(
+            e,
+            AppEvent::EffectRefused { seq, code: Some(code), kind, .. }
+                if *seq == refused && code == "permission_missing" && kind == "sample.note"
+        )),
+        "{:?}",
+        report.events
+    );
     assert!(received(&report.events, after), "{:?}", report.events);
     assert!(app.cursor().seq >= after);
     assert_eq!(w.effects(), 1);
@@ -1707,6 +1770,10 @@ async fn test_app_effect_over_one_batch_is_parked_and_the_feed_goes_on() {
         assert!(has(&report.events, |e| matches!(
             e,
             AppEvent::Parked { seq: s, reason: ParkReason::TooManyOperations } if *s == seq
+        )));
+        assert!(has(&report.events, |e| matches!(
+            e,
+            AppEvent::EffectRefused { seq: s, code: None, .. } if *s == seq
         )));
     }
     assert!(app.cursor().seq >= second);
