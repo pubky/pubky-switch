@@ -228,7 +228,8 @@ pub(super) async fn read_feed(
     let db_generation = to_db(generation, "generation")?;
     snapshot.current = current_docs(&mut tx, id, db_generation, low, high).await?;
 
-    // Chain items and inbox entries, in one sequence by seq.
+    // Chain items and inbox entries, in one sequence by seq: only the entries wrapped to the
+    // reader, so another app's envelopes are never read (Switch wire 7.5).
     let mut rows = sqlx::query(
         "SELECT 'chain' AS kind, seq, item_type, item_bytes, envelope, chain_hash, proof, \
                 only_for, NULL::BYTEA AS entry_id, NULL::BYTEA AS sender, NULL::BYTEA AS cert, \
@@ -238,12 +239,14 @@ pub(super) async fn read_feed(
          SELECT 'entry', seq, NULL, NULL, envelope, NULL, NULL, NULL, entry_id, sender, cert, \
                 accepted_at_ms, targets, context \
          FROM inbox_entries WHERE account_id = $1 AND generation = $2 AND seq > $3 AND seq <= $4 \
+         AND $5 = ANY(targets) \
          ORDER BY seq",
     )
     .bind(id)
     .bind(db_generation)
     .bind(low)
     .bind(high)
+    .bind(reader.as_slice())
     .fetch(&mut *tx);
     while let Some(row) = rows.try_next().await.map_err(StoreError::from_db)? {
         let kind: String = row.try_get("kind")?;

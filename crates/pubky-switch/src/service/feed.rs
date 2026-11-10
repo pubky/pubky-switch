@@ -450,17 +450,15 @@ impl PageBuilder {
 
 impl PageReader for PageBuilder {
     /// An entry shows to its target apps only, and to no other app at all: no stub, and
-    /// nothing counted against the page's limit or budget (Switch wire 7.5). It is never part
-    /// of a batch.
+    /// nothing counted against the page's limit or budget (Switch wire 7.5). The page's
+    /// query reads only the entries wrapped to the reader (`store::feed::read_feed`), so
+    /// every entry seen here is one. It is never part of a batch.
     fn take_entry(&mut self, snapshot: &FeedSnapshot, entry: crate::store::StoredEntry) -> bool {
-        let Some(cert) = self.cert.as_ref() else {
-            return false;
-        };
-        if entry.seq > snapshot.window_end {
+        if self.cert.is_none() {
             return false;
         }
-        if !entry.targets.contains(&cert.app_id()) {
-            return true;
+        if entry.seq > snapshot.window_end {
+            return false;
         }
         if !self.close_group() {
             return false;
