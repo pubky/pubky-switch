@@ -16,14 +16,27 @@
 //! - [`protocol`]: the protocols on the Switch the host registers, which tell the signer
 //!   their scopes, the switch permissions those need and which have Shared Data Keys
 //!   (Switch spec 1). The signer knows no protocol of its own.
+//! - [`Signer`]: enrolling the identity at a switch, and signing, delivering and publishing
+//!   its `identity.json` versions with the high-water mark, the one-signer rule and the
+//!   backup, each step committed to the host's store before it is sent (Switch spec 4.3, 12.8).
+//! - [`homeserver`]: the identity's own Homeserver, which the host implements.
+//! - [`state`]: the signer's records in the host's store.
+//! - [`alert`]: what the signer tells the user.
 //! - [`error`]: the typed errors.
 
+pub mod alert;
 pub mod error;
+pub mod homeserver;
 pub mod key;
 pub mod protocol;
+mod signer;
+pub mod state;
 
+pub use alert::{Alert, Source};
 pub use error::{Refusal, Result, SignerError};
+pub use homeserver::Homeserver;
 pub use key::{
     AddOutcome, ExportReason, IdentityKeyring, IdentitySecret, KeyError, SecretVault, VaultError,
 };
 pub use protocol::{GrantPath, Protocol, ProtocolError, Protocols, ScopeDef, ScopeTerms};
+pub use signer::{HighWater, Signer, SignerEnv, SignerStatus};
