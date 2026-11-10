@@ -238,6 +238,10 @@ pub(crate) struct Inner {
     pub(crate) delivery_proof: Option<SignedDoc>,
     /// The limits an enrollment announces.
     pub(crate) enroll_limits: pubky_switch_core::records::Limits,
+    /// The identity's service time, the last the switch stamped: a request refused before
+    /// the account's lock, such as a `401 stale_timestamp`, answers with it and doesn't
+    /// move it (Switch wire 7.1).
+    pub(crate) stamped_ms: u64,
 }
 
 impl Inner {
@@ -247,7 +251,9 @@ impl Inner {
         clock: Arc<TestClock>,
         tip: ChainTip,
     ) -> Self {
+        let stamped_ms = clock.now_ms();
         Self {
+            stamped_ms,
             identity,
             service,
             clock,
@@ -587,6 +593,9 @@ impl ScriptedSwitch {
                 return Err(TransportError::Timeout);
             }
             return Ok(inner.respond(request, status, &body));
+        }
+        if let Some(answer) = inner.stale_timestamp(request) {
+            return Ok(answer);
         }
         if let Some((status, body)) = inner.gate(&request.method, &path) {
             if inner.erased || inner.enrolled.is_none() {
@@ -928,6 +937,32 @@ impl Inner {
         self.respond_with(&self.service, request, status, body)
     }
 
+    /// A `Switch-Timestamp` more than 5 minutes from the time base, at an account the switch
+    /// holds, is `401 stale_timestamp` (Switch wire 7.1, 7.6): `current.server_time` is the
+    /// time base, for the retry's timestamp, and `Switch-Server-Time` the last time stamped,
+    /// which the refusal, answered before the account's lock, doesn't move. A request that
+    /// passes stamps the time. A missing or unparsable timestamp isn't checked.
+    fn stale_timestamp(&mut self, request: &Request) -> Option<Response> {
+        if self.erased || self.enrolled.is_none() {
+            return None;
+        }
+        let now = self.now();
+        let stale = request
+            .header(header::TIMESTAMP)
+            .and_then(|text| pubky_switch_core::time::parse_rfc3339(text).ok())
+            .is_some_and(|at| at.abs_diff(now) > pubky_switch_core::records::CLOCK_TOLERANCE_MS);
+        if !stale {
+            self.stamped_ms = self.stamped_ms.max(now);
+            return None;
+        }
+        let (status, body) = bad(
+            ErrorCode::StaleTimestamp,
+            "Switch wire 7.1: the timestamp is more than 5 minutes from the service's time",
+            json!({ "server_time": rfc3339(now) }),
+        );
+        Some(self.respond_at(&self.service, request, status, &body, self.stamped_ms))
+    }
+
     fn respond_with(
         &self,
         key: &SigningKey,
@@ -935,8 +970,20 @@ impl Inner {
         status: u16,
         body: &Value,
     ) -> Response {
+        self.respond_at(key, request, status, body, self.now())
+    }
+
+    /// An answer whose `Switch-Server-Time` is `at`.
+    fn respond_at(
+        &self,
+        key: &SigningKey,
+        request: &Request,
+        status: u16,
+        body: &Value,
+        at: u64,
+    ) -> Response {
         let bytes = body.to_string().into_bytes();
-        let server_time = rfc3339(self.now());
+        let server_time = rfc3339(at);
         let request_signature = request_signature_of(request.header(header::SIGNATURE));
         let signature = sign_response(
             key,

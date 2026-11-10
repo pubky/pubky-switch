@@ -1719,3 +1719,38 @@ async fn test_app_effect_over_one_batch_is_parked_and_the_feed_goes_on() {
     app.receive(None).await.unwrap();
     assert_eq!(protocol.0.received.lock().unwrap().len(), 2);
 }
+
+/// The wallet joined, then loaded again on a device clock `offset_ms` ahead of the switch's.
+async fn wallet_on_a_clock_ahead(w: &World, offset_ms: u64) -> App {
+    let me = w.join("wallet").await.app_id();
+    let clock = Arc::new(crate::clock::TestClock::new(w.clock.now_ms() + offset_ms));
+    let env = AppEnv {
+        clock: clock as Arc<dyn crate::clock::Clock>,
+        ..w.env()
+    };
+    App::load(env, w.protocol.clone(), World::config(), me)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn test_app_stale_timestamp_is_retried_once_at_the_service_time() {
+    let w = World::new();
+    let mut app = wallet_on_a_clock_ahead(&w, 60 * 60_000).await;
+    // The switch refuses the timestamp, and the client signs the call again at the time
+    // the refusal names.
+    let (seq, _) = w.note(app.app_id(), "hello");
+    let report = app.receive(None).await.unwrap();
+    assert!(received(&report.events, seq), "{:?}", report.events);
+    // Only once: a retry whose timestamp the switch refuses again is the answer.
+    w.switch.fail_next(Fault::Error {
+        path: "feed".into(),
+        code: ErrorCode::StaleTimestamp,
+        current: json!({ "server_time": pubky_switch_core::time::rfc3339(w.clock.now_ms() + 3_600_000) }),
+    });
+    let Err(AppError::Switch(crate::ClientError::Switch { code, .. })) = app.receive(None).await
+    else {
+        panic!("a second stale timestamp is the answer");
+    };
+    assert_eq!(code, ErrorCode::StaleTimestamp);
+}

@@ -170,6 +170,9 @@ pub(crate) struct Auth<'a> {
     pub(crate) with_cert: bool,
     /// The unauthenticated public read: no `Switch-*` header at all (Switch wire 7.4.15).
     pub(crate) public: bool,
+    /// The signing time to send instead of the clock's: the `current.server_time` of a
+    /// `401 stale_timestamp`, for its one retry (Switch wire 7.1).
+    pub(crate) timestamp_ms: Option<u64>,
 }
 
 /// The `Content-Type` of a request body (Switch wire 7.1).
@@ -307,6 +310,23 @@ pub(crate) fn parse_error(status: u16, body: &[u8]) -> ClientError {
         current: value.get("current").cloned().unwrap_or(Value::Null),
         known_version: value.get("known_version").and_then(Value::as_u64),
         retry_after: value.get("retry_after").and_then(Value::as_u64),
+    }
+}
+
+/// The `current.server_time` of a verified `401 stale_timestamp`: the service's time base,
+/// for the one retry's timestamp (Switch wire 7.1, 7.6). It isn't the identity's service
+/// time, and counts as no verified service time (Switch spec 10.1).
+fn stale_timestamp_hint(checked: &Result<CheckedResponse, ClientError>) -> Option<u64> {
+    match checked {
+        Err(ClientError::Switch {
+            code: ErrorCode::StaleTimestamp,
+            current,
+            ..
+        }) => current
+            .get("server_time")
+            .and_then(Value::as_str)
+            .and_then(|text| parse_rfc3339(text).ok()),
+        _ => None,
     }
 }
 
@@ -533,7 +553,7 @@ impl SwitchClient {
                 "Switch wire 1.7: an invite code is a base64url token".into(),
             ));
         }
-        let timestamp = rfc3339_seconds(self.clock.now_ms());
+        let timestamp = rfc3339_seconds(auth.timestamp_ms.unwrap_or_else(|| self.clock.now_ms()));
         let identity = pubky_id(&self.credentials.identity());
         let target = RequestTarget {
             method: &method,
@@ -601,7 +621,9 @@ impl SwitchClient {
     }
 
     /// Sign, send and check a call with the pinned key. Without a pinned key nothing is
-    /// sent (Switch wire 7.1).
+    /// sent (Switch wire 7.1). A verified `401 stale_timestamp` that carries
+    /// `current.server_time` is retried once, the same call signed at that time; the time is
+    /// used for nothing else, and a second `stale_timestamp` is the answer.
     pub(crate) async fn call(
         &self,
         method: &str,
@@ -611,7 +633,19 @@ impl SwitchClient {
         auth: Auth<'_>,
     ) -> Result<CheckedResponse, ClientError> {
         let key = self.pinned_key().ok_or(ClientError::Unpinned)?;
+        let retry_body = body.clone();
         let signed = self.build(method, path_and_query, body, content, auth)?;
+        let response = self.transport.send(signed.request).await?;
+        let checked = check_response(&key, &self.account, signed.signature.as_ref(), &response);
+        self.note_server_time(&checked, &response);
+        let Some(at) = stale_timestamp_hint(&checked) else {
+            return checked;
+        };
+        let auth = Auth {
+            timestamp_ms: Some(at),
+            ..auth
+        };
+        let signed = self.build(method, path_and_query, retry_body, content, auth)?;
         let response = self.transport.send(signed.request).await?;
         let checked = check_response(&key, &self.account, signed.signature.as_ref(), &response);
         self.note_server_time(&checked, &response);

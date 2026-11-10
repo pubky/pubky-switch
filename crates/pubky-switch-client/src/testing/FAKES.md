@@ -7,9 +7,13 @@ service.
 
 ## Batches
 
-- **Request authentication** (Switch wire 7.1, 7.2): no request signature, timestamp or
+- **Request authentication** (Switch wire 7.1, 7.2): no request signature or
   `Switch-Identity` check; the caller is the `Switch-App` header as sent, and an app of
-  another identity is the `Switch-Identity` header as sent. Each operation's signature is
+  another identity is the `Switch-Identity` header as sent. A `Switch-Timestamp` more than 5
+  minutes from the switch's clock is `401 stale_timestamp`, with `current.server_time` and
+  the last stamped time in `Switch-Server-Time`, as at the service; a missing or unparsable
+  one isn't refused. Every other request stamps the clock's time, and injected faults
+  answer with the clock's time. Each operation's signature is
   verified, and an own app must be current with an unexpired certificate.
 - **Rates** (Switch wire 6.4 step 7, 9.4): no operation, control, per-caller or
   failed-authentication limits; never `429 rate_limited`.
