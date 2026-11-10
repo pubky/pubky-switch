@@ -1468,8 +1468,8 @@ impl App {
         Ok(())
     }
 
-    /// An erased account seen alive again: the identity publishes an `identity.json` that
-    /// lists the app (Switch spec 12.7). `gone` goes, the copy is taken, and the app reads
+    /// An erased account seen alive again: the identity publishes an `identity.json`, no
+    /// older than the one the app holds, that lists the app (Switch spec 12.7). `gone` goes, the copy is taken, and the app reads
     /// on; one that lists it no longer, or in `removed`, is followed as any copy is.
     /// Returns whether the app came back.
     async fn revive_erased(&mut self) -> Result<bool, AppError> {
@@ -1480,14 +1480,19 @@ impl App {
             return Ok(false);
         };
         let me = self.state.meta.app_id;
-        if doc.listed_cert(&me).is_none() || doc.lists_removed(&me) {
+        // A copy older than the one held shows nothing new: the account stays gone.
+        let held = &self.state.own_doc;
+        if doc.version() < held.version()
+            || doc.generation() < held.generation()
+            || doc.listed_cert(&me).is_none()
+            || doc.lists_removed(&me)
+        {
             return Ok(false);
         }
-        let mut tx = self.tx()?;
-        tx.delete(keys::GONE)?;
-        self.commit(tx).await?;
+        // `gone` goes with the copy, in its commit: a copy that fails leaves it.
+        self.take_own_copy_with(doc, |tx| tx.delete(keys::GONE))
+            .await?;
         self.state.gone = None;
-        self.take_own_copy(doc).await?;
         self.events.push(AppEvent::AccountBack);
         Ok(true)
     }

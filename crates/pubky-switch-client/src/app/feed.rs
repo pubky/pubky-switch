@@ -625,7 +625,7 @@ impl App {
             self.park(entry, &received.plaintext, ParkReason::Uncertain, read)?;
             let now = self.now();
             let msg_id = &received.message.msg_id;
-            processed_writes(&mut read.tx, &entry.sender, msg_id, received.hash(), now)?;
+            uncertain_processed(&mut read.tx, &entry.sender, msg_id, received.hash(), now)?;
             read.pairs
                 .insert((entry.sender, msg_id.clone()), received.hash());
             self.keep_duty(
@@ -1122,7 +1122,7 @@ impl App {
         // Processed, so a re-send of the message is a duplicate, not applied (Switch spec
         // 11).
         let now = self.now();
-        processed_writes(tx, &pending.sender, &pending.msg_id, pending.hash, now)?;
+        uncertain_processed(tx, &pending.sender, &pending.msg_id, pending.hash, now)?;
         if pending.parked {
             // Stored before, and passed then.
         } else if pending.past_held {
@@ -1692,6 +1692,16 @@ impl App {
 
     /// Take an own copy outside the feed and commit what it changed.
     pub(crate) async fn take_own_copy(&mut self, doc: IdentityDoc) -> Result<bool, AppError> {
+        self.take_own_copy_with(doc, |_| Ok(())).await
+    }
+
+    /// [`App::take_own_copy`], with `also` written in the same commit as the copy, and only
+    /// if the copy is taken.
+    pub(crate) async fn take_own_copy_with(
+        &mut self,
+        doc: IdentityDoc,
+        also: impl FnOnce(&mut Tx) -> Result<(), AppError>,
+    ) -> Result<bool, AppError> {
         // A published `identity.json`: the erasure wait starts over (Switch spec 12.7).
         self.clear_erasing().await?;
         let version = self.state.own_doc.version();
@@ -1701,6 +1711,7 @@ impl App {
             self.reload = true;
         }
         result?;
+        also(&mut read.tx)?;
         let epoch_rose = read.epoch_rose;
         self.commit(read.tx).await?;
         if epoch_rose {
@@ -1796,6 +1807,20 @@ impl App {
         }
         Ok(())
     }
+}
+
+/// The processed pair of a message whose entry is parked as [`ParkReason::Uncertain`]: its
+/// effect may have been applied, so a re-send of it is a duplicate and never applies it
+/// again (Switch spec 11, 12.5 "Kept batches"). Every park as `Uncertain` writes it, in the
+/// same commit.
+pub(crate) fn uncertain_processed(
+    tx: &mut Tx,
+    sender: &[u8; 32],
+    msg_id: &str,
+    hash: [u8; 32],
+    now: u64,
+) -> Result<(), AppError> {
+    processed_writes(tx, sender, msg_id, hash, now)
 }
 
 /// The processed pair and its time index.
