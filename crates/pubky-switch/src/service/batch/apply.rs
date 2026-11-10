@@ -334,8 +334,9 @@ fn app_put(state: &mut OpsState, app: [u8; 16], record: &SignedDoc) -> Result<St
 }
 
 /// `receive_key.put`, by [`check_receive_key_put`]. An unchanged one's proof shows the
-/// current `n` and kid (Switch wire 6.4 "No-ops"). A stored key moves the directory, and an
-/// app's first makes it reachable, which moves `apps_version` (Switch wire 7.4.10).
+/// current `n` and kid (Switch wire 6.4 "No-ops"). A stored key moves the directory; an
+/// app it makes reachable moves `apps_version` once the batch settles reachability
+/// ([`OpsState::settle_directory`], Switch wire 7.4.10).
 fn receive_key_put(
     state: &mut OpsState,
     cert: &AppCert,
@@ -355,17 +356,9 @@ fn receive_key_put(
     let shown = match (effect, current) {
         (ReceiveKeyEffect::Unchanged, Some(current)) => current.clone(),
         _ => {
-            let first = current.is_none();
             state.kids.insert(new.kid());
             state.directory_version = state.directory_version.saturating_add(1);
-            if first {
-                state.apps_version = state.apps_version.saturating_add(1);
-            }
-            let apps_version = state.apps_version;
             let entry = state.apps.entry(app).or_default();
-            if first {
-                entry.reachable_since = Some(apps_version);
-            }
             entry.receive_key = Some(new.clone());
             state.new_receive_keys.push((app, new.clone()));
             new
