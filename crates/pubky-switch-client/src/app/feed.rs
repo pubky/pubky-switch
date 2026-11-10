@@ -1017,7 +1017,10 @@ impl App {
     /// batches", Switch wire 6.4 step 6). Its original proofs, or `409 conflict` after an
     /// import, show it applied, and its outcome commits; any other refusal for good, `409
     /// stale_generation` among them, means it wasn't: it goes, and its entry is read again
-    /// and its effect signed anew. Any other failure keeps it.
+    /// and its effect signed anew. That holds only while the answer can tell: once the
+    /// effect has been kept longer than the service holds batch IDs, it may have been
+    /// applied, so its entry is stored and passed instead ([`App::park_uncertain`]). Any
+    /// other failure keeps it.
     async fn resend_earlier_effect(
         &mut self,
         pending: PendingEffect,
@@ -1030,7 +1033,15 @@ impl App {
                 ..
             })) => Vec::new(),
             Err(error) if refused_for_good(&error).is_some() => {
-                return self.drop_pending_effect().await;
+                if super::provider::answer_decides(pending.kept_ms, self.now()) {
+                    return self.drop_pending_effect().await;
+                }
+                let mut tx = self.tx()?;
+                tx.delete(key::PENDING_EFFECT)?;
+                self.state.pending_effect = None;
+                self.park_uncertain(&pending, &mut tx)?;
+                tx.put(key::CURSOR, &self.state.cursor)?;
+                return self.commit(tx).await;
             }
             Err(error) => return Err(error),
         };

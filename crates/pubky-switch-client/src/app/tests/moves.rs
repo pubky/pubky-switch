@@ -2023,6 +2023,96 @@ async fn test_key_change_parks_a_kept_effect_older_than_the_batch_window() {
     assert!(loaded.iter().all(AppEvent::is_duty), "{loaded:?}");
 }
 
+#[tokio::test]
+async fn test_key_change_parks_a_kept_effect_that_outlives_the_window_before_its_resend() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join(&w, &router).await;
+    let me = app.app_id();
+    let (seq, message) = w.note(me, "before");
+    // The effect's batch is lost on its way at generation 1.
+    w.switch.fail_next(Fault::Unreachable {
+        path: "ops".into(),
+        after: 0,
+    });
+    assert!(app.receive(None).await.is_err());
+    let changed = change_key(&w, &router);
+    // Within the window at the switch it stays, to go again unchanged, but the new
+    // service can't be reached for it once the re-registration went.
+    changed.fail_next(Fault::Unreachable {
+        path: "ops".into(),
+        after: 1,
+    });
+    assert!(app.receive(None).await.is_err());
+    assert_eq!(app.cursor().generation, 2);
+    assert!(app.state.pending_effect.is_some());
+    // By its resend the answer can't tell any more: `409 stale_generation` doesn't show
+    // it was never applied, so the entry is stored and passed, not built again.
+    w.clock
+        .advance_ms(crate::app::provider::KEPT_BATCH_ANSWER_MS);
+    let report = app.receive(None).await.unwrap();
+    assert!(
+        has(&report.events, |e| matches!(
+            e,
+            AppEvent::EffectUncertain { seq: s, msg_id, .. }
+                if *s == seq && *msg_id == message.msg_id
+        )),
+        "{:?}",
+        report.events
+    );
+    assert!(!received(&report.events, seq), "{:?}", report.events);
+    assert!(app.state.pending_effect.is_none());
+    assert_eq!(
+        app.state.parked.get(&seq).map(|p| p.reason),
+        Some(ParkReason::Uncertain)
+    );
+    assert_eq!(conversations_at(&changed), 0);
+    assert!(app.cursor().seq >= seq);
+}
+
+#[tokio::test]
+async fn test_key_change_drops_a_kept_batch_that_outlives_the_window_before_its_resend() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = lists_app(&w, &router).await;
+    let carol = IdentityKey::from_secret(seed("carol/identity")).public();
+    w.switch.fail_next(Fault::Unreachable {
+        path: "ops".into(),
+        after: 0,
+    });
+    assert!(app.submit_batch(contact_batch(carol)).await.is_err());
+    let changed = change_key(&w, &router);
+    changed.fail_next(Fault::Unreachable {
+        path: "ops".into(),
+        after: 0,
+    });
+    assert!(app.receive(None).await.is_err());
+    assert_eq!(app.cursor().generation, 2);
+    assert_eq!(app.kept_batches().await.unwrap().len(), 1);
+    w.clock
+        .advance_ms(crate::app::provider::KEPT_BATCH_ANSWER_MS);
+    // `409 stale_generation` past the window: dropped and reported, never signed again.
+    let report = app.receive(None).await.unwrap();
+    assert!(
+        has(&report.events, |e| matches!(
+            e,
+            AppEvent::KeptBatchDropped { .. }
+        )),
+        "{:?}",
+        report.events
+    );
+    assert!(
+        !has(&report.events, |e| matches!(
+            e,
+            AppEvent::KeptBatchSignedAgain { .. }
+        )),
+        "{:?}",
+        report.events
+    );
+    assert!(app.kept_batches().await.unwrap().is_empty());
+    assert_eq!(allow_ops_for(&changed.applied(), carol), 0);
+}
+
 /// The app at `store`, loaded through the loss's router.
 async fn load_lost(lost: &Lost, store: Arc<dyn StateStore>) -> App {
     App::load(

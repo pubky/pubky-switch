@@ -750,8 +750,10 @@ impl App {
     /// batches", Switch wire 6.4 step 6). Its original proofs, or `409 conflict` after an
     /// import, show it applied: what it settles commits and nothing is signed again. `409
     /// stale_generation` shows it never applied: its operations are signed again for the
-    /// generation followed, under a new batch ID, and sent. Another refusal for good drops
-    /// it; any other failure keeps it, and is the caller's error.
+    /// generation followed, under a new batch ID, and sent, but only while the answer can
+    /// tell: one kept longer than the service holds batch IDs is dropped instead, and
+    /// reported with each `attempt` in it. Another refusal for good drops it; any other
+    /// failure keeps it, and is the caller's error.
     async fn resend_earlier(
         &mut self,
         id: &[u8; 16],
@@ -764,6 +766,15 @@ impl App {
                 code: ErrorCode::Conflict,
                 ..
             })) => Vec::new(),
+            Err(AppError::Switch(ClientError::Switch {
+                code: ErrorCode::StaleGeneration,
+                ..
+            })) if !super::provider::answer_decides(pending.kept_ms, self.now()) => {
+                let mut tx = self.tx()?;
+                Self::replace_kept_batch(id, None, &mut tx)?;
+                self.kept_batch_dropped(id, batch, &mut tx)?;
+                return self.commit(tx).await;
+            }
             Err(AppError::Switch(ClientError::Switch {
                 code: ErrorCode::StaleGeneration,
                 ..

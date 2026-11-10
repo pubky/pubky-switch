@@ -204,6 +204,13 @@ pub(crate) enum Carry {
 /// 12.5 "Kept batches", 6.3).
 pub(crate) const KEPT_BATCH_ANSWER_MS: u64 = 30 * DAY_MS - CLOCK_TOLERANCE_MS;
 
+/// Whether a resend's answer still tells whether a batch kept at `kept_ms` was applied, at
+/// `now` (Switch spec 12.5 "Kept batches"). A batch kept without its time is from before
+/// the app kept it, and is let the answer decide.
+pub(crate) fn answer_decides(kept_ms: Option<u64>, now: u64) -> bool {
+    kept_ms.is_none_or(|at| now.saturating_sub(at) < KEPT_BATCH_ANSWER_MS)
+}
+
 /// How many provider changes one follow takes in a row, each given up for a newer own
 /// `identity.json` met on the way; the next call goes on from there.
 const FOLLOW_PASSES: usize = 4;
@@ -977,9 +984,7 @@ impl App {
         let mut events = Vec::new();
         let now = self.now();
         let resend_first = carry == Carry::ResendFirst;
-        let answer_decides = |kept_ms: Option<u64>| {
-            kept_ms.is_none_or(|at| now.saturating_sub(at) < KEPT_BATCH_ANSWER_MS)
-        };
+        let answer_decides = |kept_ms: Option<u64>| answer_decides(kept_ms, now);
         if let Some(pending) = self.state.pending_effect.clone() {
             let applied = Batch::from_body(pending.body.clone())?
                 .id()
@@ -1071,7 +1076,11 @@ impl App {
     /// it twice, so its entry is stored locally and passed, like an effect refused for good
     /// (Switch spec 8.2), and the protocol is told; it decides from the current state. A
     /// kept effect written without its entry can't be stored: its entry is read again.
-    fn park_uncertain(&mut self, pending: &PendingEffect, tx: &mut Tx) -> Result<(), AppError> {
+    pub(crate) fn park_uncertain(
+        &mut self,
+        pending: &PendingEffect,
+        tx: &mut Tx,
+    ) -> Result<(), AppError> {
         let reason = ParkReason::Uncertain;
         let parked = match (self.state.parked.get(&pending.seq), &pending.entry) {
             (Some(stored), _) if pending.parked => ParkedEntry {
@@ -1126,7 +1135,7 @@ impl App {
     /// A kept batch dropped at a provider change: reported, with each `attempt` in it, so
     /// the protocol treats those obligations as uncertain (Switch spec 12.5 "Kept batches",
     /// 12.6 step 5). Duty events, kept in `tx`, the commit that drops the batch.
-    fn kept_batch_dropped(
+    pub(crate) fn kept_batch_dropped(
         &mut self,
         id: &[u8; 16],
         batch: &Batch,
