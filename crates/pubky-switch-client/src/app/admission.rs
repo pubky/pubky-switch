@@ -75,12 +75,16 @@ pub(crate) const LISTS_AT: &str = "lc/lists_at";
 /// deny and undeny, the deny list changes the feed shows an app with `lists.read`, and the
 /// last [`App::allow_list`]. `flagged` follows only the last [`App::allow_list`]: no feed
 /// item carries the flags, so it is `false` for every sender until the app first refreshes
-/// its lists, which [`SenderDisposition::lists_as_of_ms`] tells apart.
+/// its lists. [`SenderDisposition::lists_as_of_ms`] is `None` while the copy isn't known to
+/// be complete, and both values then say nothing.
+///
+/// It has no `Default`: a disposition that defaulted to neither blocked nor flagged would
+/// be the unsafe answer to a failed read.
 ///
 /// The service refuses a denied sender at the inbox (Switch spec 7), so `blocked` reaches a
 /// protocol only for a message accepted before the block, or after a deny that another app
 /// made and this one hasn't seen yet.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct SenderDisposition {
     /// The sender is on the app's copy of the deny list.
@@ -90,10 +94,15 @@ pub struct SenderDisposition {
     pub flagged: bool,
     /// The service time, Unix milliseconds, of the `GET /allow` answer the copy of the
     /// lists was last replaced from, to compare with
-    /// [`super::ReceiveContext::highest_service_time`] when deciding to refresh; `None`
-    /// when the app never refreshed its lists, as an app without `lists.read`: `flagged`
-    /// is then `false`, and `blocked` reflects only the app's own deny changes and those
-    /// the feed showed it.
+    /// [`super::ReceiveContext::highest_service_time`] when deciding to refresh.
+    ///
+    /// `None` when the copy isn't known to be complete: the app never refreshed its lists
+    /// (as an app without `lists.read`), was restored from a backup, which carries no copy,
+    /// or followed a provider loss since. `blocked` and `flagged` then say nothing of the
+    /// sender: a `false` may be a deny or a flag the app never saw, such as its own deny made
+    /// before the backup. A protocol must not read `None` as neither blocked nor flagged. An
+    /// app with `lists.read` refreshes a copy in that state at its next
+    /// [`App::receive`](super::App::receive), before it hands any entry over, when it can.
     pub lists_as_of_ms: Option<u64>,
 }
 
@@ -307,6 +316,38 @@ impl App {
             self.ready_local().await?;
             self.refuse_when_stopped()?;
             self.need(Permission::ListsRead)?;
+            self.refresh_lists().await
+        })
+        .await
+    }
+
+    /// The refresh a read owes when the copy of the lists isn't known to be complete
+    /// (`lc/lists_at` absent: never refreshed, restored, or after a provider loss) and the
+    /// app holds `lists.read`: [`App::allow_list`], before the read hands any entry over.
+    /// Not while a move or a provider loss is in progress, whose steps read and upload the
+    /// copy as the app kept it. Best effort: a refused or failed call leaves the copy as it
+    /// was, still owed, and the read goes on; an alarm or a store failure stops it.
+    pub(crate) async fn refresh_lists_if_owed(&mut self) -> Result<(), AppError> {
+        if !self.state.cert.has_permission(Permission::ListsRead) {
+            return Ok(());
+        }
+        let reader = self.reader();
+        if reader.exists(LISTS_AT).await?
+            || reader.exists(super::provider::keys::MOVE).await?
+            || self.loss_record().await?.is_some_and(|loss| !loss.done())
+        {
+            return Ok(());
+        }
+        match self.refresh_lists().await {
+            Ok(_) => Ok(()),
+            Err(error @ (AppError::Alarm(_) | AppError::Store(_))) => Err(error),
+            Err(_) => Ok(()),
+        }
+    }
+
+    /// `GET /allow`, and the copy of the lists replaced from it in one commit.
+    async fn refresh_lists(&mut self) -> Result<AllowList, AppError> {
+        Box::pin(async move {
             let result = self.client.allow().await;
             let list = self.take(result).await?;
             // The answer's own stamped time (Switch spec 10.1). For an answer without one, the
