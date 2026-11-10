@@ -12,10 +12,42 @@
 //!
 //! It commits them together, then delivers and publishes the version as every version is
 //! delivered. The claim is released to the host only once the switch has taken that version,
-//! so a claim never names a document the switch refused. The host then delivers the claim to
-//! the auth request's relay, and only after that approves the Pubky grant for exactly the
-//! capabilities checked (`specs/pubky-auth-companion-claims.md`, Switch spec 3.4). The auth
-//! request's secret is used to sign the claim and isn't kept.
+//! so a claim never names a document the switch refused. The auth request's secret is used to
+//! sign the claim and isn't kept.
+//!
+//! # What the host does, in this order
+//!
+//! The relay and the Pubky grant are Pubky's transport, so they are the host's, through its
+//! Pubky client.
+//!
+//! 1. **Review.** Call [`Signer::review`] with the app request and the auth request parsed from
+//!    the app's `pubkyauth://` URL, and show the user the App ID, the scopes, the switch
+//!    permissions, the capabilities and each grant path with what it is for (Switch spec
+//!    12.1 step 1). A refusal ends the approval.
+//! 2. **Approve.** On the user's yes, call [`Signer::approve`]. When it fails, the approval may
+//!    still finish: call [`Signer::resume`] later, then [`Signer::approved`].
+//! 3. **Deliver the claim.** Once [`Signer::approve`] or [`Signer::approved`] returns an
+//!    [`ApprovedRequest`], deliver its `claim` bytes, exactly as given, to the auth request's
+//!    relay as the companion claim under `x-pubky-switch-claim=pubky-switch.v1.approval`:
+//!    encrypted with the auth secret to the claim's relay channel, as the companion claims
+//!    spec says. They are already signed by the identity key; don't sign them again. When the
+//!    delivery fails, deliver the same bytes again.
+//! 4. **Approve the grant.** Only after the relay accepted the claim, approve the Pubky grant
+//!    of the auth request, for exactly `caps`, which the review checked: the app's own paths
+//!    and the grant paths shown. When the grant fails, try the grant again; the claim on the
+//!    relay authorizes nothing by itself.
+//! 5. **Report.** Call [`Signer::claim_delivered`], and the signer drops the claim.
+//!
+//! The host never:
+//!
+//! - approves the grant, or delivers anything, before [`Signer::approved`] returns the claim:
+//!   until then the switch hasn't taken the version that lists the app;
+//! - approves the grant before the claim is on the relay (the companion claims spec's order);
+//! - grants capabilities other than `caps`, and above all one that covers `identity.json` or
+//!   the signer's backup (Switch spec 3.4);
+//! - delivers a claim [`Signer::approved`] doesn't return, such as the one of an approval whose
+//!   delivery the switch refused;
+//! - logs the claim, the auth URL or its secret.
 
 use pubky_switch_core::records::{
     AppCert, AppCertBody, AppRequest, Approval, ApprovalClaim, Approve, AuthRequest, ListedApp,
