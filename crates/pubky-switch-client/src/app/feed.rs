@@ -22,9 +22,11 @@
 //!   permanent refusal never stalls the feed. Pages are read from a position that moves on
 //!   to each page's `scanned_through`, while the cursor stays before the held entry.
 //! - **An entry whose receive step the protocol's store or the host kept from finishing**
-//!   ([`Outcome::Retry`]) is held the same way, with nothing of the step committed, and comes
-//!   again at the next read. It is never stored and passed: from the
-//!   [`RETRY_EVENT_READS`]th read in a row the app raises [`AppEvent::StoreFailing`] instead.
+//!   ([`Outcome::Retry`]) commits nothing of the step. While the store is unavailable it is
+//!   held the same way, for the same bounded wait, and comes again at each read; from the
+//!   [`RETRY_EVENT_READS`]th read in a row the app raises [`AppEvent::StoreFailing`]. After
+//!   the wait, or at once when the store fails for that entry, it is stored and passed, and
+//!   tried again at every read: never dropped.
 //! - **An entry no held key opens** is passed; the protocol is asked to request a re-send,
 //!   never for a time before the cursor's less the clock tolerance. So is an entry a departed
 //!   own app left unread, accepted at or before a departure the app verified in its chain;
@@ -617,7 +619,9 @@ impl App {
                         return Ok(Step::Pass);
                     }
                 },
-                Outcome::Retry(failure) => return self.retry_later(entry, failure, read),
+                Outcome::Retry(failure) => {
+                    return self.retry_later(entry, &received.plaintext, parked, failure, read);
+                }
                 Outcome::Apply(effect) => effect,
             };
             if writes.not_now.is_some() {
@@ -961,15 +965,27 @@ impl App {
     }
 
     /// A receive step the protocol's store or the host kept from finishing
-    /// ([`Outcome::Retry`]): held, with nothing of the step committed, and the reads in a
-    /// row counted, to raise [`AppEvent::StoreFailing`] once they reach
-    /// [`RETRY_EVENT_READS`]. Never stored locally or passed (Switch spec 8.2).
+    /// ([`Outcome::Retry`]), with nothing of the step committed. An entry stored locally
+    /// stays so. Otherwise a failure of the entry stores it and passes it at once; a store
+    /// unavailable for now holds it, the reads in a row counted to raise
+    /// [`AppEvent::StoreFailing`] from [`RETRY_EVENT_READS`] on, until the bounded wait since
+    /// the first retry, which an entry whose sender can't be checked gets too: then it is
+    /// stored and passed (Switch spec 8.2). Never dropped.
     fn retry_later(
         &mut self,
         entry: &Entry,
+        plaintext: &MessagePlaintext,
+        parked: bool,
         failure: StoreFailure,
         read: &mut Read,
     ) -> Result<Step, AppError> {
+        if parked {
+            return Ok(Step::Hold);
+        }
+        if failure.is_of_entry() {
+            self.park(entry, plaintext, ParkReason::StoreRejected, read)?;
+            return Ok(Step::Pass);
+        }
         let now = self.now();
         let retry = self.state.retries.entry(entry.seq).or_insert(RetryEntry {
             reads: 0,
@@ -985,6 +1001,10 @@ impl App {
                 since_ms: retry.since_ms,
                 failure,
             });
+        }
+        if now.saturating_sub(retry.since_ms) >= self.config.park_after_ms {
+            self.park(entry, plaintext, ParkReason::StoreUnavailable, read)?;
+            return Ok(Step::Pass);
         }
         Ok(Step::Hold)
     }

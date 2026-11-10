@@ -50,8 +50,9 @@ pub enum AppEvent {
     /// The protocol's receive step at an entry couldn't finish, because its store or the
     /// host failed ([`super::Outcome::Retry`]), on `reads` reads of the feed in a row: raised
     /// from the [`super::RETRY_EVENT_READS`]th on, on each such read. The entry stays
-    /// unprocessed and the cursor before it until a read processes it; the host repairs or
-    /// frees its store.
+    /// unprocessed and the cursor before it until a read processes it, or the bounded wait
+    /// passes and it is stored locally ([`ParkReason::StoreUnavailable`]); the host repairs
+    /// or frees its store.
     StoreFailing {
         /// The entry's `seq`.
         seq: u64,
@@ -63,7 +64,8 @@ pub enum AppEvent {
         failure: StoreFailure,
     },
     /// An entry was stored locally and the cursor moved past it (Switch spec 8.2): its
-    /// sender stayed unverifiable too long, or its write hit a quota.
+    /// sender stayed unverifiable too long, its write hit a quota, or the store failed for
+    /// its receive step ([`ParkReason`]).
     Parked {
         /// The entry's `seq`.
         seq: u64,
@@ -384,4 +386,12 @@ pub enum ParkReason {
     /// ([`super::MAX_CLAIM_READS`]), or again for what it was given: it is kept, not
     /// applied, and not tried again.
     TooManyReads,
+    /// Its receive step was retried for want of the store ([`super::Outcome::Retry`],
+    /// [`super::StoreFailure::unavailable`]) for longer than the bounded wait: it is tried
+    /// again at every read.
+    StoreUnavailable,
+    /// The store failed for its receive step in a way that retrying can't mend
+    /// ([`super::StoreFailure::of_entry`]), such as a corrupt value: it is tried again at
+    /// every read, in case the host repaired it.
+    StoreRejected,
 }

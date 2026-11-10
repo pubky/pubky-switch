@@ -175,9 +175,9 @@ pub enum Need {
     Claim([u8; 32]),
 }
 
-/// The reads of the feed in a row, each ending in [`Outcome::Retry`] at one entry, after
-/// which the app raises [`super::AppEvent::StoreFailing`] for it, on that read and every
-/// later one until the entry is processed.
+/// The reads of the feed in a row, each ending in [`Outcome::Retry`] at one held entry,
+/// after which the app raises [`super::AppEvent::StoreFailing`] for it, on that read and
+/// every later one until the entry is processed or stored locally.
 pub const RETRY_EVENT_READS: u32 = 3;
 
 /// A failure of the store or the host that kept a receive step from finishing
@@ -186,19 +186,65 @@ pub const RETRY_EVENT_READS: u32 = 3;
 /// [`LocalView`]'s reads or a store handle of the protocol's own, or what a binding maps
 /// its own host's storage failure to. A protocol never builds one for a message it can't
 /// handle: that is an [`Outcome::Drop`].
+///
+/// It is of one of two kinds, which decide how long the entry waits:
+///
+/// - **The store is unavailable for now** ([`StoreFailure::unavailable`]): the entry is
+///   held, up to the bounded wait an entry whose sender can't be checked gets
+///   ([`super::AppConfig::park_after_ms`]), then stored locally and passed
+///   ([`super::ParkReason::StoreUnavailable`]).
+/// - **The store fails for this entry** ([`StoreFailure::of_entry`]), whatever the time,
+///   such as a corrupt value it holds or a write it refuses: retrying on the feed can't
+///   help, so the entry is stored locally and passed at once
+///   ([`super::ParkReason::StoreRejected`]).
+///
+/// Either way the entry is never dropped: an entry stored locally is tried again at every
+/// read, and processed once the store works.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StoreFailure(StoreError);
+pub struct StoreFailure {
+    error: StoreError,
+    of_entry: bool,
+}
 
 impl StoreFailure {
+    /// The store, or the host, is unavailable for now, and may work at a later read.
+    pub fn unavailable(error: StoreError) -> Self {
+        Self {
+            error,
+            of_entry: false,
+        }
+    }
+
+    /// The store fails for this entry every time, such as a corrupt value it holds or a
+    /// write of the entry's state it refuses.
+    pub fn of_entry(error: StoreError) -> Self {
+        Self {
+            error,
+            of_entry: true,
+        }
+    }
+
     /// The store's error.
     pub fn error(&self) -> &StoreError {
-        &self.0
+        &self.error
+    }
+
+    /// Whether the store fails for this entry every time ([`StoreFailure::of_entry`]),
+    /// rather than for now.
+    pub fn is_of_entry(&self) -> bool {
+        self.of_entry
     }
 }
 
 impl From<StoreError> for StoreFailure {
+    /// [`StoreError::Corrupt`] fails for the entry ([`StoreFailure::of_entry`]); every other
+    /// error is the store unavailable for now ([`StoreFailure::unavailable`]), bounded by
+    /// the wait.
     fn from(error: StoreError) -> Self {
-        Self(error)
+        match error {
+            StoreError::Corrupt => Self::of_entry(error),
+            error => Self::unavailable(error),
+        }
     }
 }
 
@@ -207,10 +253,11 @@ impl TryFrom<AppError> for StoreFailure {
     type Error = AppError;
 
     /// The failure of an [`AppError::Store`], such as a [`ReceiveContext::local_get`] whose
-    /// store failed; any other error is given back.
+    /// store failed, of the kind [`StoreFailure::from`] gives it; any other error is given
+    /// back.
     fn try_from(error: AppError) -> Result<Self, AppError> {
         match error {
-            AppError::Store(error) => Ok(Self(error)),
+            AppError::Store(error) => Ok(error.into()),
             other => Err(other),
         }
     }
@@ -218,7 +265,7 @@ impl TryFrom<AppError> for StoreFailure {
 
 impl std::fmt::Display for StoreFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
+        self.error.fmt(f)
     }
 }
 
@@ -243,26 +290,31 @@ pub enum Outcome {
     /// ([`super::ParkReason::TooManyReads`]). A read that fails for now (the network, `429`,
     /// `503`) leaves the entry waiting for the next read of the feed.
     Need(Vec<Need>),
-    /// The step couldn't finish for now because the protocol's store or the host failed,
-    /// such as a read of its own state: never for a message the protocol can't handle,
-    /// which is an [`Outcome::Drop`]. A valid message is never consumed by a failure that
-    /// passes (Switch spec 8.2), so the entry stays unprocessed, as an entry whose sender
-    /// can't be checked yet: the app keeps no processed pair for it, commits nothing the
-    /// step built (what the context added and the step's local writes are discarded), and
-    /// keeps its cursor before it. The read goes on with later items, which are processed
-    /// past it and remembered, as past any held entry; the cursor stays before the oldest
-    /// one not processed, so the inbox keeps them all. The entry comes again at the next
-    /// read of the feed, never twice in one read, and the step runs again from the start.
+    /// The step couldn't finish because the protocol's store or the host failed, such as a
+    /// read of its own state: never for a message the protocol can't handle, which is an
+    /// [`Outcome::Drop`]. A valid message is never consumed by a store failure (Switch spec
+    /// 8.2): the app keeps no processed pair for the entry and commits nothing the step
+    /// built (what the context added is discarded). What happens to the entry depends on
+    /// the [`StoreFailure`]'s kind:
     ///
-    /// The entry isn't stored locally or passed after a wait, as an entry whose sender
-    /// stays unverifiable is: the store that failed is the one it would go to, and a
-    /// failing store is never a reason to skip a message. Instead the app counts the reads
-    /// in a row that end in a retry at the entry, in its own store, and from the
-    /// [`RETRY_EVENT_READS`]th on raises [`super::AppEvent::StoreFailing`] on each, so the
-    /// host learns its store is failing. Claims read for the step ([`Outcome::Need`]) stay
-    /// kept, in their own commits. An entry stored locally before
-    /// ([`ReceivedMessage::parked`]) stays stored and is tried again at the next read. A
-    /// push extension's peek runs no receive step, so a retry doesn't change what it shows.
+    /// - **Unavailable for now:** the entry is held, as an entry whose sender can't be
+    ///   checked yet is. The cursor stays before it; the read goes on with later items, which
+    ///   are processed past it and remembered; the entry comes again at the next read of the
+    ///   feed, never twice in one read, and the step runs again from the start. The app
+    ///   counts the reads in a row that end so, in its own store; from the
+    ///   [`RETRY_EVENT_READS`]th on it raises [`super::AppEvent::StoreFailing`] on each, so
+    ///   the host learns its store is failing. Once the entry has waited the bounded wait
+    ///   ([`super::AppConfig::park_after_ms`]) since its first retry, it is stored locally
+    ///   and the cursor passes it ([`super::ParkReason::StoreUnavailable`]), so a store
+    ///   that stays down never pins the cursor.
+    /// - **Of the entry:** retrying on the feed can't help, so the entry is stored locally
+    ///   and the cursor passes it at once ([`super::ParkReason::StoreRejected`]).
+    ///
+    /// An entry stored locally is tried again at every read, and processed once its step
+    /// finishes. A retry of an entry stored locally before ([`ReceivedMessage::parked`])
+    /// leaves it stored, for the next read. Claims read for the step ([`Outcome::Need`])
+    /// stay kept, in their own commits. A push extension's peek runs no receive step, so a
+    /// retry doesn't change what it shows.
     Retry(StoreFailure),
 }
 
@@ -385,8 +437,8 @@ pub trait Protocol: Send + Sync {
     /// [`Outcome::Retry`] discards it. After an [`Outcome::Need`] the app reads what it
     /// names and calls this again, the answers in [`ReceiveContext::switch_claim`]. A read
     /// of the context, or of the protocol's own store, that fails with a store error is an
-    /// [`Outcome::Retry`] ([`StoreFailure::try_from`]): the entry comes again at the next
-    /// read of the feed. After `409 conflict` on the batch the
+    /// [`Outcome::Retry`] ([`StoreFailure::try_from`]): the entry is held for a later read,
+    /// or stored locally and tried again at a later read. After `409 conflict` on the batch the
     /// app reads the records and claims `cx` wrote again and calls this once more, with
     /// [`ReceivedMessage::conflict`] set. [`Protocol::receive`] by default.
     fn receive_with(&self, message: &ReceivedMessage, cx: &mut ReceiveContext<'_>) -> Outcome {

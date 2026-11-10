@@ -8,19 +8,37 @@ use std::sync::Mutex;
 
 use super::*;
 use crate::app::{
-    AppBackup, AppError, AppEvent, Peeked, ProtocolLayer, RETRY_EVENT_READS, ReceiveContext,
-    StoreFailure,
+    AppBackup, AppError, AppEvent, Need, ParkReason, Peeked, ProtocolLayer, RETRY_EVENT_READS,
+    ReceiveContext, StoreFailure,
 };
 use crate::error::StoreError;
 use crate::store::{Fault as StoreFault, FaultStore};
+use crate::testing::Fault;
+use pubky_switch_core::http::ErrorCode;
 
-/// [`SampleProtocol`], whose receive step fails for want of its store while `fails` is
-/// above zero for a note whose text is [`FLAKY`]: it adds a record write and a local write
-/// through the context first, which must never be committed.
+/// When [`FlakyProtocol`]'s receive step fails.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mode {
+    /// At its first call for the entry.
+    Plain,
+    /// After it asked for a claim ([`Need::Claim`]) and was given it.
+    AfterNeed,
+    /// When it builds the effect again after a `409 conflict`.
+    AfterConflict,
+}
+
+/// The input of the claim [`Mode::AfterNeed`] asks for.
+const OBLIGATION: &[u8] = b"sample obligation";
+
+/// [`SampleProtocol`], whose receive step fails with `error` while `fails` is above zero, for
+/// a note whose text is [`FLAKY`], at the point `mode` names: it adds a record write and a
+/// local write through the context first, which must never be committed.
 struct FlakyProtocol {
     sample: SampleProtocol,
     fails: Mutex<u32>,
     calls: Mutex<u32>,
+    error: StoreError,
+    mode: Mode,
 }
 
 /// The text of a note whose receive step fails while the store does.
@@ -31,10 +49,16 @@ const FAILED_STEP: &[u8] = b"failed-step";
 
 impl FlakyProtocol {
     fn new(fails: u32) -> Arc<Self> {
+        Self::failing(fails, StoreError::Unavailable, Mode::Plain)
+    }
+
+    fn failing(fails: u32, error: StoreError, mode: Mode) -> Arc<Self> {
         Arc::new(Self {
             sample: SampleProtocol::default(),
             fails: Mutex::new(fails),
             calls: Mutex::new(0),
+            error,
+            mode,
         })
     }
 
@@ -81,8 +105,18 @@ impl Protocol for FlakyProtocol {
     fn receive_with(&self, message: &ReceivedMessage, cx: &mut ReceiveContext<'_>) -> Outcome {
         *self.calls.lock().unwrap() += 1;
         let flaky = message.message.body.get("text").and_then(Value::as_str) == Some(FLAKY);
+        if flaky && self.mode == Mode::AfterNeed {
+            let claim_key = cx.blind(OBLIGATION);
+            if cx.switch_claim(&claim_key).is_none() {
+                return Outcome::Need(vec![Need::Claim(claim_key)]);
+            }
+        }
+        let at_point = match self.mode {
+            Mode::Plain | Mode::AfterNeed => true,
+            Mode::AfterConflict => message.conflict.is_some(),
+        };
         let mut fails = self.fails.lock().unwrap();
-        if flaky && *fails > 0 {
+        if flaky && at_point && *fails > 0 {
             *fails -= 1;
             cx.op(
                 Vec::new(),
@@ -96,9 +130,9 @@ impl Protocol for FlakyProtocol {
                 key: FAILED_STEP.to_vec(),
                 value: b"1".to_vec(),
             });
-            // A read of the protocol's own state, its store unavailable: the error that
-            // read gives is a store failure, so the step is retried.
-            let read = AppError::Store(StoreError::Unavailable);
+            // A read of the protocol's own state whose store failed: the error that read
+            // gives is a store failure, so the step is retried.
+            let read = AppError::Store(self.error.clone());
             return match StoreFailure::try_from(read) {
                 Ok(failure) => Outcome::Retry(failure),
                 Err(error) => Outcome::Drop {
@@ -119,15 +153,25 @@ impl Protocol for FlakyProtocol {
     }
 }
 
+/// The bounded wait of the tests' apps.
+const PARK_AFTER_MS: u64 = 60_000;
+
+fn flaky_config() -> AppConfig {
+    AppConfig {
+        park_after_ms: PARK_AFTER_MS,
+        ..World::config()
+    }
+}
+
 async fn join_flaky(w: &World, protocol: &Arc<FlakyProtocol>, name: &str) -> App {
     let request = w.approve(&app_keys(name), &["scope-a"]);
-    App::join(w.env(), protocol.clone(), World::config(), request)
+    App::join(w.env(), protocol.clone(), flaky_config(), request)
         .await
         .unwrap()
 }
 
 async fn load_flaky(w: &World, protocol: &Arc<FlakyProtocol>, app: [u8; 16]) -> App {
-    App::load(w.env(), protocol.clone(), World::config(), app)
+    App::load(w.env(), protocol.clone(), flaky_config(), app)
         .await
         .unwrap()
 }
@@ -289,9 +333,158 @@ async fn test_receive_retry_repeated_raises_store_failing_and_keeps_the_entry() 
 fn test_store_failure_is_built_only_from_a_store_error() {
     let failure = StoreFailure::try_from(AppError::Store(StoreError::Full)).unwrap();
     assert_eq!(failure.error(), &StoreError::Full);
+    assert!(!failure.is_of_entry(), "a full store frees");
+    // A corrupt value fails for the entry every time.
+    let corrupt = StoreFailure::try_from(AppError::Store(StoreError::Corrupt)).unwrap();
+    assert!(corrupt.is_of_entry());
+    assert!(StoreFailure::of_entry(StoreError::Other("refused".into())).is_of_entry());
     // Any other error isn't a store failure, and is given back.
     let other = AppError::InvalidData("a body".into());
     assert_eq!(StoreFailure::try_from(other.clone()).unwrap_err(), other);
+}
+
+#[tokio::test]
+async fn test_receive_retry_after_a_need_commits_nothing_and_applies_later() {
+    let w = World::new();
+    let protocol = FlakyProtocol::failing(1, StoreError::Unavailable, Mode::AfterNeed);
+    let mut app = join_flaky(&w, &protocol, "wallet").await;
+    let (seq, message) = w.note(app.app_id(), FLAKY);
+    let report = app.receive(None).await.unwrap();
+    // Asked for the claim, given it, then retried.
+    assert_eq!(protocol.calls(), 2);
+    assert!(report.cursor.seq < seq);
+    assert_eq!(w.effects(), 0);
+    assert_eq!(app.protocol_get(FAILED_STEP).await.unwrap(), None);
+    assert_eq!(app.state.retries.get(&seq).map(|r| r.reads), Some(1));
+    // The next read asks again, and applies.
+    let report = app.receive(None).await.unwrap();
+    assert_eq!(protocol.calls(), 4);
+    assert!(report.cursor.seq >= seq);
+    assert_eq!(w.effects(), 1);
+    assert_eq!(
+        note_kept(&app, &message).await,
+        Some(FLAKY.as_bytes().to_vec())
+    );
+}
+
+#[tokio::test]
+async fn test_receive_retry_after_a_conflict_commits_nothing_and_applies_later() {
+    let w = World::new();
+    let protocol = FlakyProtocol::failing(1, StoreError::Unavailable, Mode::AfterConflict);
+    let mut app = join_flaky(&w, &protocol, "wallet").await;
+    let (seq, message) = w.note(app.app_id(), FLAKY);
+    w.switch.fail_next(Fault::Error {
+        path: "ops".into(),
+        code: ErrorCode::Conflict,
+        current: json!({ "record": null }),
+    });
+    let report = app.receive(None).await.unwrap();
+    // Built, refused with a conflict, built again and retried: no batch kept or applied.
+    assert_eq!(protocol.calls(), 2);
+    assert!(report.cursor.seq < seq);
+    assert!(app.state.pending_effect.is_none());
+    assert_eq!(w.effects(), 0);
+    assert_eq!(app.protocol_get(FAILED_STEP).await.unwrap(), None);
+    assert_eq!(note_kept(&app, &message).await, None);
+    let report = app.receive(None).await.unwrap();
+    assert!(report.cursor.seq >= seq);
+    assert_eq!(w.effects(), 1);
+    assert_eq!(
+        note_kept(&app, &message).await,
+        Some(FLAKY.as_bytes().to_vec())
+    );
+}
+
+fn parked_for(events: &[AppEvent], seq: u64) -> Option<ParkReason> {
+    events.iter().find_map(|e| match e {
+        AppEvent::Parked { seq: s, reason } if *s == seq => Some(*reason),
+        _ => None,
+    })
+}
+
+#[tokio::test]
+async fn test_receive_retry_unavailable_is_held_for_the_wait_then_parked_and_processed() {
+    let w = World::new();
+    let protocol = FlakyProtocol::new(u32::MAX);
+    let mut app = join_flaky(&w, &protocol, "wallet").await;
+    let (seq, message) = w.note(app.app_id(), FLAKY);
+    let report = app.receive(None).await.unwrap();
+    assert!(report.cursor.seq < seq, "held");
+    assert_eq!(parked_for(&report.events, seq), None);
+    // Just short of the wait: still held.
+    w.clock.advance_ms(PARK_AFTER_MS - 1);
+    let report = app.receive(None).await.unwrap();
+    assert!(report.cursor.seq < seq);
+    // Past it: stored locally, and the cursor passes it, here and at the service.
+    w.clock.advance_ms(1);
+    let report = app.receive(None).await.unwrap();
+    assert_eq!(
+        parked_for(&report.events, seq),
+        Some(ParkReason::StoreUnavailable)
+    );
+    assert!(report.cursor.seq >= seq, "the cursor isn't pinned");
+    app.flush_cursor().await.unwrap();
+    assert!(w.switch.app(&app.app_id()).cursor >= seq);
+    assert!(app.state.retries.is_empty());
+    assert_eq!(w.effects(), 0);
+    // Stored, it is tried at the next read and stays stored while the store fails.
+    let calls = protocol.calls();
+    let report = app.receive(None).await.unwrap();
+    assert_eq!(protocol.calls(), calls + 1);
+    assert!(app.state.parked.contains_key(&seq));
+    assert!(
+        !report
+            .events
+            .iter()
+            .any(|e| matches!(e, AppEvent::Unparked { .. }))
+    );
+    assert_eq!(app.protocol_get(FAILED_STEP).await.unwrap(), None);
+    // Once the store works it is processed, once.
+    protocol.heal();
+    let report = app.receive(None).await.unwrap();
+    assert!(
+        report
+            .events
+            .iter()
+            .any(|e| matches!(e, AppEvent::Unparked { seq: s } if *s == seq))
+    );
+    assert!(app.state.parked.is_empty());
+    assert_eq!(w.effects(), 1);
+    assert_eq!(protocol.applied(), 1);
+    assert_eq!(
+        note_kept(&app, &message).await,
+        Some(FLAKY.as_bytes().to_vec())
+    );
+    app.receive(None).await.unwrap();
+    assert_eq!(protocol.applied(), 1);
+}
+
+#[tokio::test]
+async fn test_receive_retry_of_the_entry_is_parked_at_once() {
+    let w = World::new();
+    let protocol = FlakyProtocol::failing(1, StoreError::Corrupt, Mode::Plain);
+    let mut app = join_flaky(&w, &protocol, "wallet").await;
+    let (seq, _) = w.note(app.app_id(), FLAKY);
+    let (later, _) = w.note(app.app_id(), "steady");
+    let report = app.receive(None).await.unwrap();
+    assert_eq!(
+        parked_for(&report.events, seq),
+        Some(ParkReason::StoreRejected)
+    );
+    // Not held: the cursor passes it and the later note in the same read.
+    assert!(report.cursor.seq >= later);
+    assert!(app.state.retries.is_empty());
+    assert_eq!(w.effects(), 1, "the later note only");
+    assert_eq!(app.protocol_get(FAILED_STEP).await.unwrap(), None);
+    // Tried again at the next read, in case the host repaired the store.
+    let report = app.receive(None).await.unwrap();
+    assert!(
+        report
+            .events
+            .iter()
+            .any(|e| matches!(e, AppEvent::Unparked { seq: s } if *s == seq))
+    );
+    assert_eq!(w.effects(), 2);
 }
 
 // -------------------------------------------------------------------------------------
