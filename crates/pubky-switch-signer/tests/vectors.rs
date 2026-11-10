@@ -7,7 +7,7 @@
 use std::sync::{Arc, Mutex};
 
 use pubky_switch_core::enc::b64;
-use pubky_switch_signer::{IdentityKeyring, IdentitySecret, SecretVault, VaultError};
+use pubky_switch_signer::{AddOutcome, IdentityKeyring, IdentitySecret, SecretVault, VaultError};
 use serde_json::Value;
 
 fn load(name: &str) -> Value {
@@ -29,9 +29,13 @@ impl SecretVault for Vault {
     fn load(&self) -> Result<Option<IdentitySecret>, VaultError> {
         Ok(self.0.lock().unwrap().map(IdentitySecret::from_bytes))
     }
-    fn store(&self, secret: &IdentitySecret) -> Result<(), VaultError> {
-        *self.0.lock().unwrap() = Some(*secret.as_bytes());
-        Ok(())
+    fn add(&self, secret: &IdentitySecret) -> Result<AddOutcome, VaultError> {
+        let mut held = self.0.lock().unwrap();
+        if held.is_some() {
+            return Ok(AddOutcome::Occupied);
+        }
+        *held = Some(*secret.as_bytes());
+        Ok(AddOutcome::Stored)
     }
     fn delete(&self) -> Result<(), VaultError> {
         *self.0.lock().unwrap() = None;
