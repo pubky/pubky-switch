@@ -637,3 +637,252 @@ async fn test_directory_expired_certificate_of_another_identity() {
     assert_eq!(header_text(&answer, "switch-server-time"), Some(expired));
     replay.db.drop_database().await.expect("drop");
 }
+
+fn ids_of(read: &Value) -> Vec<Value> {
+    read["apps"]
+        .as_array()
+        .expect("apps")
+        .iter()
+        .map(|listed| listed["app_id"].clone())
+        .collect()
+}
+
+/// The directory as alice's app `name` reads it at `at`.
+async fn read_as(replay: &Replay, name: &str, at: &str) -> Value {
+    let keys = vectors("keys.json");
+    let answer = replay
+        .service
+        .handle(app_request(
+            app(&keys, name),
+            "GET",
+            &directory_path(),
+            Vec::new(),
+            ms(at),
+        ))
+        .await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    body(&answer)
+}
+
+/// `prev` with `change` applied, at the next version, delivered by alice's signer; the
+/// delivered document.
+async fn deliver_after(
+    replay: &Replay,
+    at: &str,
+    prev: &SignedDoc,
+    change: impl FnOnce(&mut pubky_switch_core::records::IdentityBody),
+) -> SignedDoc {
+    let mut body: pubky_switch_core::records::IdentityBody =
+        serde_json::from_slice(&prev.body_bytes().expect("body")).expect("body");
+    body.version += 1;
+    change(&mut body);
+    let key = pubky_switch_core::keys::IdentityKey::from_secret(hex32(
+        &alice(&vectors("keys.json"))["secret_hex"],
+    ));
+    let next = pubky_switch_core::records::IdentityDoc::sign(&key, body)
+        .expect("sign")
+        .signed()
+        .clone();
+    let delivery = pubky_switch_core::http::IdentityDelivery {
+        identity: next.clone(),
+        prev: Some(prev.doc_hash().expect("hash")),
+    }
+    .to_json();
+    let answer = replay
+        .service
+        .handle(signer_request(
+            "PUT",
+            &format!("/v1/{}/identity", alice_id()),
+            delivery,
+            ms(at),
+        ))
+        .await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    next
+}
+
+fn versions(read: &Value) -> (Value, Value) {
+    (
+        read["directory_version"].clone(),
+        read["apps_version"].clone(),
+    )
+}
+
+fn moved(before: &Value, after: &Value) -> (bool, bool) {
+    let (d0, a0) = versions(before);
+    let (d1, a1) = versions(after);
+    (d0 != d1, a0 != a1)
+}
+
+fn alice_v3() -> SignedDoc {
+    signed(
+        &named(
+            &vectors("documents.json")["documents"],
+            "alice identity.json",
+        )["signed"],
+    )
+}
+
+fn app_id_of(name: &str) -> [u8; 16] {
+    pubky_switch_core::enc::app_id_decode(
+        app(&vectors("keys.json"), name)["app_id"]
+            .as_str()
+            .expect("id"),
+    )
+    .expect("id")
+}
+
+#[tokio::test]
+async fn test_directory_versions_at_each_event() {
+    let Some(replay) = replay().await else { return };
+    let chain = vectors("chain.json");
+    serve_alice(&replay).await;
+    replay_batch(&replay, &chain, &[3, 4]).await;
+    assert_eq!(replay.db.give_out_seq(&alice_id()).await.expect("seq"), 5);
+    replay_batch(&replay, &chain, &[6]).await;
+    replay_batch(&replay, &chain, &[7, 8]).await;
+    let at = setup_time();
+    set_time(&replay.clock, &at);
+    let expected: Value =
+        serde_json::from_str(vector_answer()["body"].as_str().expect("body")).expect("json");
+    let listed = |name: &str| {
+        expected["apps"]
+            .as_array()
+            .expect("apps")
+            .iter()
+            .find(|listed| listed["app_id"] == app(&vectors("keys.json"), name)["app_id"])
+            .cloned()
+            .expect("listed")
+    };
+    // An app record: the directory moves; nothing becomes reachable.
+    let before = read_as(&replay, "wallet", &at).await;
+    app_ops(
+        &replay,
+        "phone",
+        vec![OpKind::AppPut {
+            record: signed(&listed("phone")["record"]),
+        }],
+        130,
+    )
+    .await;
+    let after = read_as(&replay, "wallet", &at).await;
+    assert_eq!(moved(&before, &after), (true, false), "app record");
+    // Its receive key: the directory moves, and the phone becomes reachable.
+    app_ops(
+        &replay,
+        "phone",
+        vec![OpKind::ReceiveKeyPut {
+            record: signed(&listed("phone")["receive_key"]),
+        }],
+        131,
+    )
+    .await;
+    let again = read_as(&replay, "wallet", &at).await;
+    assert_eq!(moved(&after, &again), (true, true), "first receive key");
+    assert_eq!(ids_of(&again).len(), 2);
+    // A delivery that changes only the policy: the identity member changes, so the
+    // directory moves; the reachable apps don't.
+    let v4 = deliver_after(&replay, &at, &alice_v3(), |body| {
+        body.policy.connect_requests.enabled = true;
+    })
+    .await;
+    let policy = read_as(&replay, "wallet", &at).await;
+    assert_ne!(policy["identity"], again["identity"]);
+    assert_eq!(moved(&again, &policy), (true, false), "a policy delivery");
+    // A renewal open for the phone (its record still carries the earlier certificate): it
+    // stays current and listed.
+    let phone = app_id_of("phone");
+    let old =
+        signed(&named(&vectors("documents.json")["documents"], "phone certificate")["signed"])
+            .doc_hash()
+            .expect("hash");
+    let v5 = deliver_after(&replay, &at, &v4, |body| {
+        if let Some(entry) = body.apps.iter_mut().find(|entry| entry.app_id == phone) {
+            entry.cert = [7; 32];
+        }
+        body.renewed.push(pubky_switch_core::records::RenewedCert {
+            app_id: phone,
+            cert: old,
+            until: None,
+        });
+    })
+    .await;
+    let open = read_as(&replay, "wallet", &at).await;
+    assert_eq!(moved(&policy, &open), (true, false), "a renewal open");
+    assert_eq!(ids_of(&open).len(), 2);
+    // The renewal closed: the earlier certificate no longer counts, the phone isn't
+    // current, it leaves the directory and stops being reachable.
+    deliver_after(&replay, &at, &v5, |body| {
+        if let Some(renewed) = body.renewed.iter_mut().find(|r| r.app_id == phone) {
+            renewed.until = Some(ms(&at));
+        }
+    })
+    .await;
+    let closed = read_as(&replay, "wallet", &at).await;
+    assert_eq!(moved(&open, &closed), (true, true), "a renewal closed");
+    assert_eq!(
+        ids_of(&closed),
+        vec![app(&vectors("keys.json"), "wallet")["app_id"].clone()]
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_directory_versions_at_a_removal_and_a_revocation() {
+    let Some(replay) = replay().await else { return };
+    alice_with_three_apps(&replay).await;
+    let at = setup_time();
+    let before = read_as(&replay, "wallet", &at).await;
+    // A delivery that moves the executor to removed, with no revocation first.
+    let executor = app_id_of("executor");
+    deliver_after(&replay, &at, &alice_v3(), |body| {
+        body.apps.retain(|listed| listed.app_id != executor);
+        body.removed.push(pubky_switch_core::records::RemovedApp {
+            app_id: executor,
+            distrust_from: ms(&at),
+        });
+        body.data_epoch += 1;
+    })
+    .await;
+    let removed = read_as(&replay, "wallet", &at).await;
+    assert_eq!(
+        moved(&before, &removed),
+        (true, true),
+        "removal by delivery"
+    );
+    assert_eq!(ids_of(&removed).len(), 2);
+    // The signer revokes the phone: both move.
+    let phone = app(&vectors("keys.json"), "phone")["app_id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    let answer = replay
+        .service
+        .handle(signer_request(
+            "POST",
+            &format!("/v1/{}/apps/{phone}/revoke", alice_id()),
+            Vec::new(),
+            ms(&at),
+        ))
+        .await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    let revoked = read_as(&replay, "wallet", &at).await;
+    assert_eq!(moved(&removed, &revoked), (true, true), "revocation");
+    assert_eq!(ids_of(&revoked).len(), 1);
+    replay.db.drop_database().await.expect("drop");
+}

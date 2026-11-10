@@ -330,6 +330,34 @@ impl OpsState {
         self.current_by(app, false)
     }
 
+    /// The App IDs reachable (Switch wire 7.4.10): current ([`Self::is_current`]) and with
+    /// a receive key.
+    pub fn reachable_app_ids(&self) -> BTreeSet<[u8; 16]> {
+        self.apps
+            .iter()
+            .filter(|(app, held)| held.receive_key.is_some() && self.is_current(app))
+            .map(|(app, _)| *app)
+            .collect()
+    }
+
+    /// After a change from a state whose reachable apps were `before`: `apps_version` moves
+    /// once if the set of reachable apps changed, and only then (Switch wire 7.4.10), and
+    /// each app that became reachable takes the new version as its `reachable_since`, the
+    /// version from which a sender must wrap to it (7.4.3 check 5).
+    pub fn settle_reachability(&mut self, before: &BTreeSet<[u8; 16]>) {
+        let after = self.reachable_app_ids();
+        if after == *before {
+            return;
+        }
+        self.apps_version = self.apps_version.saturating_add(1);
+        let version = self.apps_version;
+        for app in after.difference(before) {
+            if let Some(held) = self.apps.get_mut(app) {
+                held.reachable_since = Some(version);
+            }
+        }
+    }
+
     /// The App IDs current ([`Self::is_current`]), expired ones included: the targets an
     /// inbox entry waits for (Switch wire 9.1) and the current targets of
     /// `sole_target_unread` (7.4.12).

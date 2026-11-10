@@ -372,17 +372,34 @@ pub(super) async fn load_apps_and_rows(
     Ok((state, apps))
 }
 
-/// Delete the inbox entries every current target has passed (Switch wire 9.1), current by
-/// [`OpsState::is_current`], expired certificates included: after anything that changes
-/// which apps are current outside a batch, such as a revocation or an `identity.json`
-/// delivery.
-pub(super) async fn release_entries(
+/// A change outside a batch to the directory and to which apps are current: an
+/// `identity.json` delivery (`delivered` replacing `held`) or a revocation (`revoked`).
+/// `directory_version` moves, since the directory's `identity` or apps change with it;
+/// `apps_version` moves if the set of reachable apps changed, and an app that became
+/// reachable takes the new version (Switch wire 7.4.10, [`OpsState::settle_reachability`]);
+/// and the inbox entries every current target has passed go (9.1). Called before the
+/// revocation is written, so the state before it is read from the store.
+pub(super) async fn settle_change(
     txn: &mut AccountTxn,
     held: Option<&IdentityDoc>,
+    delivered: Option<&IdentityDoc>,
+    revoked: Option<[u8; 16]>,
     now: u64,
-) -> Result<u64, StoreError> {
-    let state = load_apps(txn, held, now).await?;
-    txn.delete_passed_entries(&state.current_app_ids()).await
+) -> Result<(), StoreError> {
+    let mut before = load_apps(txn, held, now).await?;
+    (before.directory_version, before.apps_version) = txn.directory_versions().await?;
+    let mut after = before.clone();
+    if let Some(doc) = delivered {
+        after.doc = Some(doc.clone());
+    }
+    if let Some(app) = revoked {
+        after.kept.insert(app);
+    }
+    after.directory_version = after.directory_version.saturating_add(1);
+    after.settle_reachability(&before.reachable_app_ids());
+    save_apps(txn, &before, &after).await?;
+    txn.delete_passed_entries(&after.current_app_ids()).await?;
+    Ok(())
 }
 
 pub(crate) fn held_app(app: &StoredApp, identity: &[u8; 32]) -> Result<HeldApp, StoreError> {
@@ -717,6 +734,9 @@ impl Service {
                 limits: &self.limits.ops_limits(),
             },
         )?;
+        // An app record, a receive key or a renewed certificate can make an app reachable
+        // or stop it being so (Switch wire 7.4.10).
+        after.settle_reachability(&before.reachable_app_ids());
         if effect == BatchEffect::Unchanged {
             save_apps(txn, &before, &after)
                 .await
