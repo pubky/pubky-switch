@@ -344,6 +344,66 @@ async fn test_send_stale_key_with_an_older_record_is_not_sealed_to() {
 }
 
 #[tokio::test]
+async fn test_send_stale_key_naming_an_app_twice_reads_the_directory_again() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    app.send(s.note("one")).await.unwrap();
+    let (record, app_id) = {
+        let inner = s.peer.lock();
+        (
+            inner.apps[0].receive_keys[0].1.clone(),
+            pubky_switch_core::enc::zbase32_encode(&inner.apps[0].cert.app_id()),
+        )
+    };
+    s.peer.fail_next(
+        "inbox",
+        ErrorCode::StaleKey,
+        json!({ "receive_keys": [ { "app_id": app_id, "record": record },
+                                  { "app_id": app_id, "record": record } ],
+                "not_current": [], "unknown_kids": [], "added_apps": [], "apps_version": 1 }),
+    );
+    s.peer.lock().requests.clear();
+    let (_, delivery) = app.send(s.note("two")).await.unwrap();
+    assert!(accepted(&delivery), "{delivery:?}");
+    // Nothing is taken from it: the directory is read again (Switch wire 7.6).
+    let routes = s.peer.routes();
+    assert_eq!(
+        routes,
+        vec!["POST inbox", "GET directory", "POST inbox"],
+        "{routes:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_directory_naming_an_app_twice_is_refused() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    s.peer
+        .add_app("till", &AppSpec::new(&["scope-a"]), &["sample.note"], true)
+        .unwrap();
+    {
+        let mut inner = s.peer.lock();
+        let copy = crate::testing::PeerApp {
+            keys: inner.apps[1].keys.clone(),
+            cert: inner.apps[1].cert.clone(),
+            record: inner.apps[1].record.clone(),
+            receive_keys: inner.apps[1].receive_keys.clone(),
+            since: inner.apps[1].since,
+        };
+        inner.apps.push(copy);
+    }
+    // None of it is used, not even the app listed once: the message waits for a directory
+    // read again later (Switch wire 7.4.10).
+    let (msg_id, delivery) = app.send(s.note("hello")).await.unwrap();
+    assert!(matches!(delivery, Delivery::Queued { .. }), "{delivery:?}");
+    assert!(s.peer.received().is_empty());
+    s.peer.lock().apps.pop();
+    let report = app.flush_outbox().await.unwrap();
+    assert_eq!(report.done, vec![msg_id.clone()]);
+    assert_eq!(s.peer.received(), vec![msg_id]);
+}
+
+#[tokio::test]
 async fn test_send_added_app_joins_the_recipients_after_stale_key() {
     let s = Setup::new();
     let mut app = s.join("wallet").await;
@@ -1927,43 +1987,28 @@ async fn test_directory_floor_only_rises_within_one_answer() {
 }
 
 #[tokio::test]
-async fn test_directory_bad_or_repeated_app_is_skipped_and_the_others_used() {
+async fn test_directory_bad_app_is_skipped_and_the_others_used() {
     let s = Setup::new();
     let mut app = s.join("wallet").await;
     let till = s
         .peer
         .add_app("till", &AppSpec::new(&["scope-a"]), &["sample.note"], true)
         .unwrap();
-    let kiosk = s
-        .peer
-        .add_app("kiosk", &AppSpec::new(&["scope-a"]), &["sample.note"], true)
-        .unwrap();
     {
         let mut inner = s.peer.lock();
         // Till's entry carries the shop's record: it doesn't verify for its App ID.
         inner.apps[1].record = inner.apps[0].record.clone();
-        // Kiosk is listed twice.
-        let copy = crate::testing::PeerApp {
-            keys: inner.apps[2].keys.clone(),
-            cert: inner.apps[2].cert.clone(),
-            record: inner.apps[2].record.clone(),
-            receive_keys: inner.apps[2].receive_keys.clone(),
-            since: inner.apps[2].since,
-        };
-        inner.apps.push(copy);
     }
     let (msg_id, delivery) = app.send(s.note("hello")).await.unwrap();
     assert!(accepted(&delivery), "{delivery:?}");
     assert_eq!(s.peer.received(), vec![msg_id]);
     let events = app.take_events();
-    for skipped in [till, kiosk] {
-        assert!(
-            events.iter().any(
-                |e| matches!(e, AppEvent::UnreachableApp { app_id, .. } if *app_id == skipped)
-            ),
-            "{events:?}"
-        );
-    }
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AppEvent::UnreachableApp { app_id, .. } if *app_id == till)),
+        "{events:?}"
+    );
     let inner = s.peer.lock();
     let last = &inner.inbox.last().unwrap().envelope;
     assert_eq!(parse_header(last).unwrap().kids().count(), 1);
