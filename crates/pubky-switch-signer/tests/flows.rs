@@ -659,7 +659,9 @@ async fn test_signer_publishes_nothing_over_a_newer_homeserver_copy() {
         world.published().unwrap().signed(),
         world.switch.identity_doc().unwrap().signed()
     );
-    // A version 9 there, though, is newer than anything the switch took: nothing is written.
+    // A version 9 of its own there, as after its records went back, is newer than anything
+    // the switch took: nothing is published over it, and the next version is signed above it
+    // and published over it.
     let mut body = first.body().clone();
     body.version = 9;
     let nine = IdentityDoc::sign(&world.key, body).unwrap();
@@ -667,13 +669,47 @@ async fn test_signer_publishes_nothing_over_a_newer_homeserver_copy() {
         pubky_switch_core::records::IDENTITY_PATH,
         serde_json::to_vec(nine.signed()).unwrap(),
     );
-    let error = signer.set_record_max_age(Some(3_600)).await.unwrap_err();
-    assert!(
-        matches!(
-            error,
-            SignerError::Alarm(Alert::HomeserverAhead { version: 9, .. })
-        ),
-        "{error:?}"
-    );
+    signer.set_record_max_age(Some(3_600)).await.unwrap();
     assert_eq!(world.published().unwrap().version(), 9);
+    assert!(
+        signer
+            .alerts()
+            .iter()
+            .any(|a| matches!(a, Alert::HomeserverAhead { version: 9, .. }))
+    );
+    let next = signer.set_record_max_age(Some(60)).await.unwrap();
+    assert_eq!(next.version(), 10);
+    assert_eq!(world.published().unwrap().signed(), next.signed());
+    world.assert_no_version_sent_twice();
+}
+
+#[tokio::test]
+async fn test_signer_a_newer_homeserver_version_by_another_install_stops_signing() {
+    // The reviewer's sequence: the Homeserver holds a verified version 4 that another install
+    // signed, the switch is at this signer's version 1. The signer stops at the first
+    // publication, so it never signs a version 4 of its own (Switch spec 4.3).
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let first = signer.identity_doc().unwrap().unwrap();
+    let mut body = first.body().clone();
+    body.version = 4;
+    body.signer = [7; 16];
+    let theirs = IdentityDoc::sign(&world.key, body).unwrap();
+    world.homeserver.set(
+        pubky_switch_core::records::IDENTITY_PATH,
+        serde_json::to_vec(theirs.signed()).unwrap(),
+    );
+    let error = signer.set_record_max_age(Some(86_400)).await.unwrap_err();
+    assert_eq!(error, SignerError::NotNamed { install: [7; 16] });
+    assert_eq!(
+        signer.status(),
+        pubky_switch_signer::SignerStatus::ManagedBy { install: [7; 16] }
+    );
+    for seconds in [3_600, 60] {
+        let error = signer.set_record_max_age(Some(seconds)).await.unwrap_err();
+        assert_eq!(error, SignerError::NotNamed { install: [7; 16] });
+    }
+    // Nothing of this install's at version 4, and the other install's copy stays published.
+    assert!(world.sent_docs().iter().all(|d| d.version() < 4));
+    assert_eq!(world.published().unwrap().signed(), theirs.signed());
 }

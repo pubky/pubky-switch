@@ -838,17 +838,29 @@ impl Signer {
             .as_ref()
             .is_some_and(|copy| copy.signed() == mine.signed());
         if let Some(copy) = held
-            .as_ref()
+            .clone()
             .filter(|copy| copy.version() > mine.version() || copy.generation() > mine.generation())
         {
+            // A newer version, verified for the identity, is handled as a newer copy from the
+            // switch is (Switch spec 4.3). Another install's is adopted, and this install
+            // stops. This install's own, which the switch doesn't hold, as after its records
+            // went back, is left in place: nothing is published over it, and the next version
+            // is signed above it and published over it.
+            if copy.body().signer != self.state.install {
+                return self.adopt(copy).await;
+            }
             let alert = Alert::HomeserverAhead {
                 version: copy.version(),
                 high_water_version: mine.version(),
             };
             let mut state = self.state.clone();
-            state.alert(alert.clone());
-            self.commit(state, self.flow.clone()).await?;
-            return Err(SignerError::Alarm(alert));
+            state.alert(alert);
+            state.signed_through = state.signed_through.max(copy.version());
+            state.newest = Some(Newest {
+                published: true,
+                ..newest
+            });
+            return self.commit(state, self.flow.clone()).await;
         }
         if !already {
             let bytes =
