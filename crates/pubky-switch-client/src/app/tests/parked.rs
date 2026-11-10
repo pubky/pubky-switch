@@ -220,7 +220,7 @@ async fn resent_is_duplicate(w: &World, app: &mut App, message: &Message) -> boo
 /// The host acknowledges every duty event it was handed.
 async fn ack_all(app: &mut App) {
     let events = app.unacknowledged_events().await.unwrap();
-    if let Some(last) = events.iter().filter_map(AppEvent::id).last() {
+    if let Some(last) = events.iter().filter_map(AppEvent::id).next_back() {
         app.ack_events(last).await.unwrap();
     }
 }
