@@ -3882,9 +3882,16 @@ impl Protocol for FillProtocol {
         if self.missed == 0 {
             return self.sample.missed(missed);
         }
+        let key = format!("missed/{}", missed.seq).into_bytes();
+        // `usize::MAX` stands for exactly the bound.
+        let size = if self.missed == usize::MAX {
+            MAX_STEP_LOCAL_BYTES - LOCAL_WRITE_OVERHEAD_BYTES - key.len()
+        } else {
+            self.missed
+        };
         Ok(vec![LocalWrite::Put {
-            key: format!("missed/{}", missed.seq).into_bytes(),
-            value: vec![0xff; self.missed],
+            key,
+            value: vec![0xff; size],
         }])
     }
 }
@@ -3953,6 +3960,53 @@ async fn test_missed_local_writes_near_the_bound_on_one_page_go_on() {
         assert!(app.protocol_get(key.as_bytes()).await.unwrap().is_some());
     }
     assert!(received(&report.events, plain));
+}
+
+#[tokio::test]
+async fn test_page_of_effects_at_the_bound_between_entries_stored_goes_on() {
+    let w = World::new();
+    let protocol = Arc::new(FillProtocol::default());
+    let mut app = fill_app(&w, &protocol).await;
+    // Nine effects near the bound, each followed by three entries stored as too large.
+    let pad = "x".repeat(40_000);
+    for _ in 0..9 {
+        w.note(app.app_id(), "fill");
+        for _ in 0..3 {
+            w.note(app.app_id(), &format!("huge{pad}"));
+        }
+    }
+    let (plain, _) = w.note(app.app_id(), "plain");
+    for _ in 0..3 {
+        app.receive(None).await.unwrap();
+    }
+    assert!(app.cursor().seq >= plain, "the feed goes on");
+}
+
+#[tokio::test]
+async fn test_missed_local_writes_at_the_bound_on_one_page_go_on() {
+    let w = World::new();
+    let protocol = Arc::new(FillProtocol {
+        missed: usize::MAX,
+        ..FillProtocol::default()
+    });
+    let mut app = fill_app(&w, &protocol).await;
+    w.note(app.app_id(), "first");
+    app.receive(None).await.unwrap();
+    let now = w.clock.now_ms();
+    for _ in 0..9 {
+        w.switch.push_missed(1, now - HOUR, now);
+    }
+    let (plain, _) = w.note(app.app_id(), "plain");
+    app.receive(None).await.unwrap();
+    assert!(app.cursor().seq >= plain, "the feed goes on");
+    assert!(
+        !app.kept_duties()
+            .await
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, AppEvent::LocalWritesRefused { .. })),
+        "at the bound, the writes are taken"
+    );
 }
 
 #[tokio::test]
