@@ -868,15 +868,19 @@ async fn test_restore_commit_of_unknown_outcome_holds_both_layers_or_neither() {
 async fn test_restore_refused_protocol_layer_writes_nothing() {
     let w = World::new();
     let protocol = JournalProtocol::new(Some(JOURNAL));
+    // The app's own store, holding its state and journal: a refused restore leaves it as
+    // it was.
+    let store = Arc::new(MemoryStore::new());
     let (app, backup) = journaled(
         &w,
         &protocol,
-        &Arc::new(MemoryStore::new()),
+        &store,
         b"at the backup",
         journal_layer(JOURNAL, b"at the backup"),
     )
     .await;
-    let store = Arc::new(MemoryStore::new());
+    let before = snapshot(&store, &app.app_id());
+    assert!(!before.is_empty());
     let fault = Arc::new(FaultStore::new(
         Arc::clone(&store) as Arc<dyn StateStore>,
         StoreFault::None,
@@ -894,7 +898,7 @@ async fn test_restore_refused_protocol_layer_writes_nothing() {
         "{error:?}"
     );
     assert_eq!(fault.commits(), 0);
-    assert!(snapshot(&store, &app.app_id()).is_empty());
+    assert_eq!(snapshot(&store, &app.app_id()), before);
     // A backup without the layer the protocol needs is refused the same way.
     let bare = AppBackup::from_bytes(&app.backup().unwrap().to_bytes().unwrap()).unwrap();
     assert_eq!(bare.protocol_layer().unwrap(), None);
@@ -903,7 +907,7 @@ async fn test_restore_refused_protocol_layer_writes_nothing() {
         .unwrap_err();
     assert!(matches!(error, AppError::InvalidData(_)), "{error:?}");
     assert_eq!(fault.commits(), 0);
-    assert!(snapshot(&store, &app.app_id()).is_empty());
+    assert_eq!(snapshot(&store, &app.app_id()), before);
 }
 
 #[tokio::test]
@@ -988,15 +992,19 @@ async fn test_backup_with_a_layer_carries_a_version_a_reader_without_layers_refu
 async fn test_restore_layer_of_a_protocol_not_registered_is_refused() {
     let w = World::new();
     let protocol = JournalProtocol::new(Some(JOURNAL));
+    // The app's own store, holding its state and journal: a refused restore leaves it as
+    // it was.
+    let store = Arc::new(MemoryStore::new());
     let (app, backup) = journaled(
         &w,
         &protocol,
-        &Arc::new(MemoryStore::new()),
+        &store,
         b"at the backup",
         journal_layer(JOURNAL, b"at the backup"),
     )
     .await;
-    let store = Arc::new(MemoryStore::new());
+    let before = snapshot(&store, &app.app_id());
+    assert!(!before.is_empty());
     let fault = Arc::new(FaultStore::new(
         Arc::clone(&store) as Arc<dyn StateStore>,
         StoreFault::None,
@@ -1017,7 +1025,7 @@ async fn test_restore_layer_of_a_protocol_not_registered_is_refused() {
         );
     }
     assert_eq!(fault.commits(), 0);
-    assert!(snapshot(&store, &app.app_id()).is_empty());
+    assert_eq!(snapshot(&store, &app.app_id()), before);
 }
 
 #[tokio::test]
