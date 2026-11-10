@@ -841,3 +841,329 @@ async fn test_restore_in_place_keeps_an_owed_deletion_whose_record_is_gone() {
     signer.run_due().await.unwrap();
     assert!(signer.alerts().contains(&reminder));
 }
+
+#[tokio::test]
+async fn test_restore_owed_backup_never_overwrites_a_newer_signers() {
+    // A restore's backup write applies and its answer is lost, so it stays owed. Another
+    // install then restores from that backup, takes over and writes its own. The first
+    // install's retry finds it and writes nothing: it stops, another install signing.
+    let world = World::new();
+    let (mut old, _) = world.enrolled().await;
+    two_joined(&world, &mut old).await;
+    drop(old);
+    *world.homeserver.losing_path.lock().unwrap() = Some(SIGNER_BACKUP_PATH.to_owned());
+    let mut first = restored(&world).await.unwrap();
+    *world.homeserver.losing_path.lock().unwrap() = None;
+    assert!(first.alerts().contains(&Alert::BackupNotWritten));
+    let first_doc = first.identity_doc().unwrap().unwrap();
+    assert_eq!(world.backup().identity_doc().signed(), first_doc.signed());
+    let second = restored(&world).await.unwrap();
+    let second_doc = second.identity_doc().unwrap().unwrap();
+    assert_eq!(second_doc.version(), first_doc.version() + 1);
+    assert_eq!(world.backup().identity_doc().signed(), second_doc.signed());
+    let writes = world.homeserver.distinct_writes(SIGNER_BACKUP_PATH);
+    assert_eq!(
+        first.resume().await.unwrap_err(),
+        SignerError::NotNamed {
+            install: second.install_id()
+        }
+    );
+    assert_eq!(world.homeserver.distinct_writes(SIGNER_BACKUP_PATH), writes);
+    assert_eq!(world.backup().identity_doc().signed(), second_doc.signed());
+    assert_eq!(
+        first.status(),
+        SignerStatus::ManagedBy {
+            install: second.install_id()
+        }
+    );
+    // Nothing is owed any more: a later run writes nothing either.
+    let _ = first.resume().await;
+    assert_eq!(world.homeserver.distinct_writes(SIGNER_BACKUP_PATH), writes);
+}
+
+#[tokio::test]
+async fn test_restore_owed_backup_retry_writes_when_nothing_newer_is_there() {
+    // The answer of the restore's backup write is lost; the retry finds its own backup there,
+    // nothing newer, and writes it again.
+    let world = World::new();
+    let (mut old, _) = world.enrolled().await;
+    two_joined(&world, &mut old).await;
+    drop(old);
+    *world.homeserver.losing_path.lock().unwrap() = Some(SIGNER_BACKUP_PATH.to_owned());
+    let mut signer = restored(&world).await.unwrap();
+    *world.homeserver.losing_path.lock().unwrap() = None;
+    assert!(signer.alerts().contains(&Alert::BackupNotWritten));
+    let writes = world.homeserver.distinct_writes(SIGNER_BACKUP_PATH);
+    signer.resume().await.unwrap();
+    assert_eq!(
+        world.homeserver.distinct_writes(SIGNER_BACKUP_PATH),
+        writes + 1
+    );
+    assert!(!signer.alerts().contains(&Alert::BackupNotWritten));
+    let doc = signer.identity_doc().unwrap().unwrap();
+    assert_eq!(world.backup().identity_doc().signed(), doc.signed());
+    assert_eq!(signer.status(), SignerStatus::Signing);
+}
+
+#[tokio::test]
+async fn test_owed_closing_checks_the_copies_before_signing() {
+    // A reduction's renewing delivery lost its answer, so its closing is owed when the signer
+    // resumes. Meanwhile the Homeserver shows a newer version of this install's own: the
+    // records are behind, and no closing is signed or sent over them.
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let app = App::new(&["notes", "notes_tags"], None, [9; 32]);
+    world.approve(&mut signer, &app).await;
+    let id = app.keys.app_id_bytes();
+    world.switch.fail_next(SwitchFault::LoseAnswer {
+        path: "/identity".into(),
+    });
+    let reduce = CertChange {
+        scopes: Some(vec!["notes".to_owned()]),
+        expires_at: None,
+    };
+    signer.renew(id, reduce).await.unwrap_err();
+    let renewing = world.switch.identity_doc().unwrap();
+    let newer = {
+        let mut body = renewing.body().clone();
+        body.version += 5;
+        IdentityDoc::sign(&world.key, body).unwrap()
+    };
+    world
+        .homeserver
+        .set(IDENTITY_PATH, serde_json::to_vec(newer.signed()).unwrap());
+    assert_eq!(
+        signer.resume().await.unwrap_err(),
+        SignerError::Refused(Refusal::RecordsBehind {
+            version: newer.version()
+        })
+    );
+    assert_eq!(
+        world.switch.identity_doc().unwrap().signed(),
+        renewing.signed(),
+        "no closing delivered"
+    );
+    world.assert_no_version_sent_twice();
+}
+
+#[tokio::test]
+async fn test_owed_record_deletion_left_to_the_install_that_took_over() {
+    // `a`'s record deletion is owed when another install takes over: this install no longer
+    // writes the identity's Homeserver, and the one that took over owes it from its own
+    // records.
+    let world = World::new();
+    let (mut old, _) = world.enrolled().await;
+    let (a, _) = two_joined(&world, &mut old).await;
+    let id = a.keys.app_id_bytes();
+    world
+        .homeserver
+        .set(&app_record_path(&id), b"a's record".to_vec());
+    *world.homeserver.failing_path.lock().unwrap() = Some(app_record_path(&id));
+    old.revoke(id, None, confirmed()).await.unwrap();
+    *world.homeserver.failing_path.lock().unwrap() = None;
+    let newest = old.identity_doc().unwrap().unwrap();
+    let next = world.other_install_version(&newest, [7; 16]);
+    world.switch.deliver_identity(&next).unwrap();
+    assert_eq!(
+        old.set_record_max_age(Some(60)).await.unwrap_err(),
+        SignerError::NotNamed { install: [7; 16] }
+    );
+    let _ = old.resume().await;
+    assert!(world.homeserver.file(&app_record_path(&id)).is_some());
+}
+
+#[tokio::test]
+async fn test_restore_winner_writes_over_a_losing_deliverys_backup() {
+    // Two deliveries build on version 1, so both carry version 2. The old install's backup
+    // write fails, so its delivery waits; a new install restores, wins with its version 2,
+    // and its owed backup write fails too. The old install resumes: it writes its losing
+    // version 2's backup, delivers, and adopts the winner's copy from the switch. The
+    // winner's retry finds that backup at its own mark's version with another document: a
+    // losing delivery's, not a take-over. It writes over it and goes on signing.
+    let world = World::new();
+    let (mut old, _) = world.enrolled().await;
+    *world.homeserver.failing_path.lock().unwrap() = Some(SIGNER_BACKUP_PATH.to_owned());
+    old.set_record_max_age(Some(60)).await.unwrap_err();
+    let mut winner = restored(&world).await.unwrap();
+    let won = winner.identity_doc().unwrap().unwrap();
+    assert_eq!(won.version(), 2);
+    assert!(winner.alerts().contains(&Alert::BackupNotWritten));
+    *world.homeserver.failing_path.lock().unwrap() = None;
+    assert_eq!(
+        old.resume().await.unwrap_err(),
+        SignerError::NotNamed {
+            install: winner.install_id()
+        }
+    );
+    let losing = world.backup().identity_doc().clone();
+    assert_eq!(losing.version(), 2);
+    assert_eq!(losing.body().signer, old.install_id());
+    winner.resume().await.unwrap();
+    assert_eq!(winner.status(), SignerStatus::Signing);
+    assert_eq!(world.backup().identity_doc().signed(), won.signed());
+    assert!(!winner.alerts().contains(&Alert::BackupNotWritten));
+    winner.set_record_max_age(Some(120)).await.unwrap();
+    assert_eq!(
+        old.status(),
+        SignerStatus::ManagedBy {
+            install: winner.install_id()
+        }
+    );
+}
+
+/// A new install restored from the backup whose own backup write failed, so it is owed, and
+/// the version it delivered.
+async fn restored_owing_its_backup(world: &World) -> (Signer, IdentityDoc) {
+    let (old, _) = world.enrolled().await;
+    drop(old);
+    *world.homeserver.failing_path.lock().unwrap() = Some(SIGNER_BACKUP_PATH.to_owned());
+    let signer = restored(world).await.unwrap();
+    *world.homeserver.failing_path.lock().unwrap() = None;
+    assert!(signer.alerts().contains(&Alert::BackupNotWritten));
+    let doc = signer.identity_doc().unwrap().unwrap();
+    (signer, doc)
+}
+
+#[tokio::test]
+async fn test_restore_owed_backup_stays_owed_when_its_check_cant_read() {
+    // The user cleared `BackupNotWritten`; the retry's read of the backup fails, so it raises
+    // the alert again, keeps the backup owed, and the rest of the run goes on.
+    let world = World::new();
+    let (mut signer, doc) = restored_owing_its_backup(&world).await;
+    signer.clear_alert(&Alert::BackupNotWritten).await.unwrap();
+    assert!(!signer.alerts().contains(&Alert::BackupNotWritten));
+    *world.homeserver.failing_read_path.lock().unwrap() = Some(SIGNER_BACKUP_PATH.to_owned());
+    let writes = world.homeserver.distinct_writes(SIGNER_BACKUP_PATH);
+    signer.resume().await.unwrap();
+    assert!(signer.alerts().contains(&Alert::BackupNotWritten));
+    assert_eq!(world.homeserver.distinct_writes(SIGNER_BACKUP_PATH), writes);
+    assert_eq!(world.published().unwrap().signed(), doc.signed());
+    *world.homeserver.failing_read_path.lock().unwrap() = None;
+    signer.resume().await.unwrap();
+    assert_eq!(world.backup().identity_doc().signed(), doc.signed());
+    assert!(!signer.alerts().contains(&Alert::BackupNotWritten));
+}
+
+#[tokio::test]
+async fn test_restore_owed_backup_stays_owed_while_the_homeserver_is_down() {
+    let world = World::new();
+    let (mut signer, doc) = restored_owing_its_backup(&world).await;
+    *world.homeserver.down.lock().unwrap() = true;
+    // Published already, so nothing else in the run needs the Homeserver.
+    signer.resume().await.unwrap();
+    assert!(signer.alerts().contains(&Alert::BackupNotWritten));
+    *world.homeserver.down.lock().unwrap() = false;
+    signer.resume().await.unwrap();
+    assert_eq!(world.backup().identity_doc().signed(), doc.signed());
+}
+
+#[tokio::test]
+async fn test_restore_owed_backup_stops_at_a_newer_backup_of_its_own() {
+    // The backup there holds a newer version of this install's own: its records are behind,
+    // and that backup is never written over.
+    let world = World::new();
+    let (mut signer, doc) = restored_owing_its_backup(&world).await;
+    let mut body = doc.body().clone();
+    body.version += 3;
+    let newer = IdentityDoc::sign(&world.key, body).unwrap();
+    let records = SignerRecords::new(
+        IdentityKey::from_secret(SECRET),
+        newer.clone(),
+        &[],
+        &[],
+        Limits::default(),
+        &[],
+        None,
+    )
+    .unwrap();
+    let backup = serde_json::to_vec(&SignerBackup::seal(&world.key, &records).unwrap()).unwrap();
+    world.homeserver.set(SIGNER_BACKUP_PATH, backup.clone());
+    assert_eq!(
+        signer.resume().await.unwrap_err(),
+        SignerError::Refused(Refusal::RecordsBehind {
+            version: newer.version()
+        })
+    );
+    assert_eq!(world.homeserver.file(SIGNER_BACKUP_PATH).unwrap(), backup);
+}
+
+#[tokio::test]
+async fn test_restore_owed_backup_writes_over_an_unreadable_one_while_the_switch_is_at_its_mark() {
+    let world = World::new();
+    let (mut signer, doc) = restored_owing_its_backup(&world).await;
+    world
+        .homeserver
+        .set(SIGNER_BACKUP_PATH, b"not a backup".to_vec());
+    signer.resume().await.unwrap();
+    assert_eq!(world.backup().identity_doc().signed(), doc.signed());
+    assert!(signer.alerts().contains(&Alert::BackupUnreadable));
+    assert!(!signer.alerts().contains(&Alert::BackupNotWritten));
+}
+
+#[tokio::test]
+async fn test_restore_owed_backup_stops_at_an_unreadable_one_once_another_install_signs() {
+    let world = World::new();
+    let (mut signer, doc) = restored_owing_its_backup(&world).await;
+    world
+        .homeserver
+        .set(SIGNER_BACKUP_PATH, b"not a backup".to_vec());
+    let next = world.other_install_version(&doc, [7; 16]);
+    world.switch.deliver_identity(&next).unwrap();
+    assert_eq!(
+        signer.resume().await.unwrap_err(),
+        SignerError::NotNamed { install: [7; 16] }
+    );
+    assert_eq!(
+        world.homeserver.file(SIGNER_BACKUP_PATH).unwrap(),
+        b"not a backup".to_vec()
+    );
+    assert_eq!(
+        signer.status(),
+        SignerStatus::ManagedBy { install: [7; 16] }
+    );
+}
+
+#[tokio::test]
+async fn test_restore_winner_writes_over_a_losing_backup_past_its_mark() {
+    // The old install spent a version: its renewal was refused at the batch, so it signs its
+    // next one two versions past its mark, on that mark, and that version's backup write
+    // fails. A new install restores, wins at the version after the mark, and owes its backup.
+    // The old install's losing backup is past the winner's mark but built on what the
+    // winner's mark built on: a losing delivery's. The winner writes over it and signs on.
+    let world = World::new();
+    let (mut old, _) = world.enrolled().await;
+    let app = App::new(&["notes"], None, [9; 32]);
+    world.approve(&mut old, &app).await;
+    let mark = old.identity_doc().unwrap().unwrap();
+    world.switch.fail_next(SwitchFault::Error {
+        path: "/ops".into(),
+        code: ErrorCode::Conflict,
+        current: serde_json::Value::Null,
+    });
+    old.renew(app.keys.app_id_bytes(), CertChange::default())
+        .await
+        .unwrap_err();
+    assert_eq!(old.identity_doc().unwrap().unwrap().signed(), mark.signed());
+    *world.homeserver.failing_path.lock().unwrap() = Some(SIGNER_BACKUP_PATH.to_owned());
+    old.set_record_max_age(Some(60)).await.unwrap_err();
+    let mut winner = restored(&world).await.unwrap();
+    let won = winner.identity_doc().unwrap().unwrap();
+    assert_eq!(won.version(), mark.version() + 1);
+    *world.homeserver.failing_path.lock().unwrap() = None;
+    assert_eq!(
+        old.resume().await.unwrap_err(),
+        SignerError::NotNamed {
+            install: winner.install_id()
+        }
+    );
+    let losing = world.backup().identity_doc().clone();
+    assert_eq!(losing.body().signer, old.install_id());
+    assert!(losing.version() > won.version());
+    winner.resume().await.unwrap();
+    assert_eq!(winner.status(), SignerStatus::Signing);
+    assert_eq!(world.backup().identity_doc().signed(), won.signed());
+    // The winner signs on. Its next version reuses the number the loser spent, which the
+    // switch never took: each install signs every version once, and the switch takes one.
+    let next = winner.set_record_max_age(Some(120)).await.unwrap();
+    assert_eq!(world.switch.identity_doc().unwrap().signed(), next.signed());
+}

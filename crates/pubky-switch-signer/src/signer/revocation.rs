@@ -399,6 +399,11 @@ impl Signer {
     /// Delete the Homeserver record of each app the newest version removed, and ask the
     /// user to revoke its grant (Switch spec 12.2 step 4; design note, decision 4).
     pub(super) async fn clean_up_removed(&mut self) -> Result<()> {
+        // Only the signer writes the identity's Homeserver; an install that took over owes
+        // these deletions again from its own records.
+        if self.check_named().is_err() {
+            return Ok(());
+        }
         let Some(newest) = self.state.newest_doc()? else {
             return Ok(());
         };
