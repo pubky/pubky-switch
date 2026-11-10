@@ -769,6 +769,29 @@ async fn test_app_lost_answer_resends_the_same_batch() {
 }
 
 #[tokio::test]
+async fn test_scripted_switch_refuses_a_cursor_outside_the_sequence() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let me = app.app_id();
+    let newest = w.switch.seq();
+    let before = w.switch.app(&me).cursor;
+    let cursor = |generation, seq| {
+        crate::client::Batch::cursor_only(pubky_switch_core::ops::Position { generation, seq })
+    };
+    for (generation, seq) in [(77, 10_000), (1, newest + 1), (2, 0)] {
+        let error = app.submit(&cursor(generation, seq)).await.unwrap_err();
+        assert_eq!(
+            error.code(),
+            Some(ErrorCode::BadRequest),
+            "{generation}:{seq}"
+        );
+        assert_eq!(w.switch.app(&me).cursor, before);
+    }
+    app.submit(&cursor(1, newest)).await.unwrap();
+    assert_eq!(w.switch.app(&me).cursor, newest);
+}
+
+#[tokio::test]
 async fn test_app_defers_a_cursor_only_move() {
     let w = World::new();
     let mut wallet = w.join("wallet").await;
@@ -1220,6 +1243,72 @@ async fn test_app_refresh_identity_takes_a_newer_homeserver_copy() {
         matches!(error, AppError::Alarm(Alarm::Equivocation { .. })),
         "{error:?}"
     );
+}
+
+/// A store whose commits take `delay_ms` of the test clock.
+struct SlowStore {
+    inner: MemoryStore,
+    clock: Arc<crate::clock::TestClock>,
+    delay_ms: std::sync::atomic::AtomicU64,
+}
+
+impl StateStore for SlowStore {
+    fn get(&self, ns: &str, key: &[u8]) -> Result<Option<Vec<u8>>, crate::error::StoreError> {
+        self.inner.get(ns, key)
+    }
+
+    fn scan(
+        &self,
+        ns: &str,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: u32,
+    ) -> Result<Vec<crate::store::KeyValue>, crate::error::StoreError> {
+        self.inner.scan(ns, prefix, after, limit)
+    }
+
+    fn commit(&self, batch: crate::store::WriteBatch) -> Result<(), crate::error::StoreError> {
+        self.clock
+            .advance_ms(self.delay_ms.load(std::sync::atomic::Ordering::SeqCst));
+        self.inner.commit(batch)
+    }
+}
+
+#[tokio::test]
+async fn test_app_refresh_identity_confirms_at_the_time_of_the_read() {
+    let w = World::new();
+    let store = Arc::new(SlowStore {
+        inner: MemoryStore::new(),
+        clock: Arc::clone(&w.clock),
+        delay_ms: std::sync::atomic::AtomicU64::new(0),
+    });
+    let request = w.approve(&app_keys("wallet"), &["scope-a"]);
+    let mut app = App::join(
+        w.env_on(Arc::clone(&store) as Arc<dyn StateStore>),
+        w.protocol.clone(),
+        World::config(),
+        request,
+    )
+    .await
+    .unwrap();
+    let mut body = w.signer.body();
+    body.version += 1;
+    w.homeserver
+        .publish(&IdentityDoc::sign(&w.alice, body).unwrap())
+        .unwrap();
+    // Taking the newer copy is slow: the read it confirms is past the window by the end.
+    store
+        .delay_ms
+        .store(REVALIDATION_MS + 1, std::sync::atomic::Ordering::SeqCst);
+    let read_at = w.clock.now_ms();
+    let refreshed = app.refresh_identity().await.unwrap();
+    assert!(
+        matches!(refreshed, IdentityRefresh::Newer { .. }),
+        "{refreshed:?}"
+    );
+    assert_eq!(refreshed.confirmed_at(), Some(read_at));
+    assert_eq!(app.identity_confirmed_at(), Some(read_at));
+    assert!(w.clock.now_ms() - read_at > REVALIDATION_MS);
 }
 
 #[tokio::test]
