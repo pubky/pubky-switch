@@ -342,9 +342,10 @@ impl IdentityKeyring {
         Ok(use_key(&key))
     }
 
-    /// Open the signer's backup `backup` with the identity key (Switch wire 3.13): its
-    /// records, or `None` for one that doesn't open or verify. The key opens it and does
-    /// nothing else.
+    /// Open the signer's backup `backup` with the identity key (Switch wire 3.13): what it
+    /// holds, without the identity key it carries, or `None` for one that doesn't open or
+    /// verify. The key opens it and does nothing else; the key in the records goes with them
+    /// here, zeroized, so only a restore, through the signing gate, takes it (a later flow).
     ///
     /// # Errors
     ///
@@ -352,8 +353,13 @@ impl IdentityKeyring {
     pub(crate) fn open_backup(
         &self,
         backup: &SignerBackup,
-    ) -> Result<Option<SignerRecords>, KeyError> {
-        self.with_key(|key| backup.open(key).ok())
+    ) -> Result<Option<BackupView>, KeyError> {
+        self.with_key(|key| {
+            backup
+                .open(key)
+                .ok()
+                .map(|records| BackupView::of(&records))
+        })
     }
 
     /// Delete the identity secret from the vault (Switch spec 3.1, 12.8): once a hand-over
@@ -369,6 +375,47 @@ impl IdentityKeyring {
     pub(crate) fn destroy(&self) -> Result<(), KeyError> {
         self.vault.delete()?;
         Ok(())
+    }
+}
+
+/// What an opened signer backup holds, but its identity key (Switch wire 3.13).
+#[derive(Clone, Debug)]
+#[expect(
+    dead_code,
+    reason = "the records but the document are for the restore flow, a later PR"
+)]
+pub(crate) struct BackupView {
+    /// The newest `identity.json` the backup's signer signed.
+    pub(crate) identity_doc: IdentityDoc,
+    /// Every App ID it revoked or saw depart.
+    pub(crate) revoked_apps: Vec<[u8; 16]>,
+    /// The certificates `identity_doc` references.
+    pub(crate) certs: Vec<AppCert>,
+    /// The switch's announced limits.
+    pub(crate) limits: Limits,
+    /// The key bundle parts it stored.
+    pub(crate) bundle_parts: Vec<StoredPart>,
+    /// The document hash of the version `identity_doc` builds on.
+    pub(crate) prev: Option<[u8; 32]>,
+}
+
+impl BackupView {
+    fn of(records: &SignerRecords) -> Self {
+        Self {
+            identity_doc: records.identity_doc().clone(),
+            revoked_apps: records.revoked_apps().to_vec(),
+            certs: records.certs().to_vec(),
+            limits: *records.limits(),
+            bundle_parts: records.bundle_parts().to_vec(),
+            prev: records.prev(),
+        }
+    }
+
+    /// Whether another install wrote it at or past `own_newest`, the high-water version of
+    /// the install `own_signer`: it took over, and this one stops (Switch wire 3.13
+    /// "Another install's backup"; the core's `taken_over`).
+    pub(crate) fn taken_over(&self, own_signer: &[u8; 16], own_newest: u64) -> bool {
+        &self.identity_doc.body().signer != own_signer && self.identity_doc.version() >= own_newest
     }
 }
 
@@ -736,8 +783,8 @@ pub(crate) mod tests {
         let backup = key
             .seal_backup(doc, &[[2; 16]], &[], Limits::default(), &[], None)
             .unwrap();
-        let records = keyring.open_backup(&backup).unwrap().unwrap();
-        assert_eq!(records.revoked_apps(), [[2; 16]]);
+        let view = keyring.open_backup(&backup).unwrap().unwrap();
+        assert_eq!(view.revoked_apps, [[2; 16]]);
         let other = IdentityKeyring::open(MemoryVault::holding([7; 32])).unwrap();
         assert!(other.open_backup(&backup).unwrap().is_none());
     }

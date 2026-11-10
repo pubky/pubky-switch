@@ -35,7 +35,7 @@ use pubky_switch_core::http::{ErrorCode, IdentityDelivery};
 
 use pubky_switch_core::records::{
     AppCert, ConnectRequests, Enrollment, EnrollmentBody, IDENTITY_PATH, IdentityBody, IdentityDoc,
-    IdentityPolicy, Inbox, SIGNER_BACKUP_PATH, SignerBackup, SignerRecords, taken_over,
+    IdentityPolicy, Inbox, SIGNER_BACKUP_PATH, SignerBackup,
 };
 use pubky_switch_core::sig::SignedDoc;
 use pubky_switch_core::signing::Signs;
@@ -44,7 +44,7 @@ use serde_json::Value;
 use crate::alert::{Alert, Source};
 use crate::error::{Refusal, Result, SignerError};
 use crate::homeserver::Homeserver;
-use crate::key::{IdentityKeyring, SigningKey};
+use crate::key::{BackupView, IdentityKeyring, SigningKey};
 use crate::protocol::Protocols;
 use crate::state::{self, DeliverStep, Flow, Newest, Service, SignerState};
 
@@ -499,10 +499,10 @@ impl Signer {
     /// this install's own above every version its records signed: the records are behind,
     /// and that backup is the one to restore from, so it is never written over (Switch wire
     /// 3.13).
-    async fn judge_backup(&mut self, found: &SignerRecords) -> Result<()> {
-        let doc = found.identity_doc();
+    async fn judge_backup(&mut self, found: &BackupView) -> Result<()> {
+        let doc = &found.identity_doc;
         let newest = self.high_water().map_or(0, |h| h.version);
-        if taken_over(found, &self.state.install, newest) {
+        if found.taken_over(&self.state.install, newest) {
             return self.managed_by(doc.body().signer).await;
         }
         if doc.body().signer == self.state.install && doc.version() > self.state.signed_through {
@@ -875,7 +875,7 @@ impl Signer {
 
     /// The records a backup holds, opened with the identity key; `None` for one that doesn't
     /// read, open or verify.
-    fn open_backup(&self, bytes: &[u8]) -> Result<Option<SignerRecords>> {
+    fn open_backup(&self, bytes: &[u8]) -> Result<Option<BackupView>> {
         let Ok(backup) = serde_json::from_slice::<SignerBackup>(bytes) else {
             return Ok(None);
         };
