@@ -357,7 +357,7 @@ pub(super) async fn load_apps(
     Ok(state)
 }
 
-fn held_app(app: &StoredApp, identity: &[u8; 32]) -> Result<HeldApp, StoreError> {
+pub(crate) fn held_app(app: &StoredApp, identity: &[u8; 32]) -> Result<HeldApp, StoreError> {
     let corrupt = |_| StoreError::Corrupt("a stored app document doesn't verify");
     let record = app
         .record
@@ -502,29 +502,6 @@ impl Service {
             return Err(error);
         }
         Ok(verified)
-    }
-
-    /// An own app's request at a call only the signer makes, before the lock: verified, then
-    /// checked as at its own calls in the order of Switch wire 7.2, from what the account
-    /// holds read without the lock, and only then refused with `403 permission_missing`.
-    pub(super) async fn refuse_app_at_signer_call(
-        &self,
-        account: &str,
-        request: &SwitchRequest,
-        claimed: &Claimed,
-        app: &str,
-        base_ms: u64,
-    ) -> ApiError {
-        if let Err(error) = self
-            .verify_own_app(account, request, claimed, app, false, base_ms)
-            .await
-        {
-            return error;
-        }
-        ApiError::new(
-            ErrorCode::PermissionMissing,
-            "7.4: a call only the signer may make",
-        )
     }
 
     /// The caller under the lock (Switch wire 7.2, 7.3 step 5), before the staged gate:
