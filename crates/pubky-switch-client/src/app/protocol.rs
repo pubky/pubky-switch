@@ -20,6 +20,9 @@
 //! - **Re-sends** ([`Protocol::resend_needed`], [`Protocol::missed`]): the kind that asks a
 //!   counterparty to send again is a protocol's (Switch spec 11), so the app hands over
 //!   what it needs and the protocol queues its request with the local writes it returns.
+//!   A protocol that can't read its own state for it says so with a [`StoreFailure`]: the app
+//!   keeps what it handed over and hands it over again later, so nothing is lost to a
+//!   default.
 //!
 //! The protocol's local state lives in the app's namespace under [`LocalWrite`] keys, which
 //! the app keeps apart from its own (`STATE.md`).
@@ -31,7 +34,7 @@ use pubky_switch_core::receive::KindRules;
 use pubky_switch_core::records::{AppCert, AppRecord, Standing};
 use serde_json::Value;
 
-use super::context::{LocalView, ReceiveContext};
+use super::context::{LocalView, ReceiveContext, RestoreContext};
 use super::error::AppError;
 use super::records::Collection;
 use super::recovery::{LossActions, ProviderLoss};
@@ -206,6 +209,10 @@ pub enum Need {
 /// every later one until the entry is processed or stored locally.
 pub const RETRY_EVENT_READS: u32 = 3;
 
+/// The most entries stored locally that one read tries again: the next read goes on after
+/// the last one tried, in `seq` order and round again, so each is reached in turn.
+pub const PARKED_RETRIES_PER_READ: usize = 16;
+
 /// A failure of the store or the host that kept a receive step from finishing
 /// ([`Outcome::Retry`]). It is built only from a [`StoreError`]: what the host's
 /// [`crate::store::StateStore`] answers, through the [`ReceiveContext`]'s or a
@@ -263,12 +270,12 @@ impl StoreFailure {
 }
 
 impl From<StoreError> for StoreFailure {
-    /// [`StoreError::Corrupt`] fails for the entry ([`StoreFailure::of_entry`]); every other
-    /// error is the store unavailable for now ([`StoreFailure::unavailable`]), bounded by
-    /// the wait.
+    /// [`StoreError::Corrupt`] and [`StoreError::TooLarge`] fail for the entry
+    /// ([`StoreFailure::of_entry`]), the same every time; every other error is the store
+    /// unavailable for now ([`StoreFailure::unavailable`]), bounded by the wait.
     fn from(error: StoreError) -> Self {
         match error {
-            StoreError::Corrupt => Self::of_entry(error),
+            StoreError::Corrupt | StoreError::TooLarge { .. } => Self::of_entry(error),
             error => Self::unavailable(error),
         }
     }
@@ -377,7 +384,8 @@ pub enum ResendReason {
 /// accepted from `accepted_from_ms`, and lists its collections again.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MissedEntries {
-    /// The item's `seq`.
+    /// The item's `seq`, in the sequence of the generation the app read it at: a call made
+    /// again after a provider change keeps it, as information only.
     pub seq: u64,
     /// How many entries were missed.
     pub entries: u64,
@@ -400,6 +408,14 @@ pub struct MissedEntries {
 /// carries, each at the commit point its crash rules give it (`STATE.md`). A write made
 /// beside them could land without the outcome it belongs to, or after a crash that
 /// discards it.
+///
+/// # Duty events
+///
+/// What the app must tell its protocol outside a callback comes as a duty event
+/// ([`super::AppEvent::is_duty`]), which the host relays. Delivery is at least once: a
+/// duty event comes again after any load until the host acknowledges it
+/// ([`super::App::ack_events`]), so a protocol tolerates seeing one twice, and acts on it
+/// by its [`super::EventId`] or by the state it names.
 pub trait Protocol: Send + Sync {
     /// The opaque members of the protocol's message bodies (Switch wire 1.1). None by
     /// default.
@@ -476,10 +492,22 @@ pub trait Protocol: Send + Sync {
 
     /// Entries the app can't read: the protocol queues its re-send request and returns the
     /// local writes that queue it, committed with the cursor passing the entries.
-    fn resend_needed(&self, needed: &ResendNeeded) -> Vec<LocalWrite>;
+    ///
+    /// # Errors
+    ///
+    /// A [`StoreFailure`] when the protocol can't build its writes now, such as when its own
+    /// state can't be read, of either kind. The cursor still passes the entries, and the app
+    /// keeps `needed` in that same commit and calls this again with it at the start of each
+    /// later read, across loads, until it returns writes
+    /// ([`super::App::owed_protocol_calls`]).
+    fn resend_needed(&self, needed: &ResendNeeded) -> Result<Vec<LocalWrite>, StoreFailure>;
 
-    /// Entries missed while lagging: as [`Protocol::resend_needed`].
-    fn missed(&self, missed: &MissedEntries) -> Vec<LocalWrite>;
+    /// Entries missed while lagging: as [`Protocol::resend_needed`], failure included.
+    ///
+    /// # Errors
+    ///
+    /// As [`Protocol::resend_needed`].
+    fn missed(&self, missed: &MissedEntries) -> Result<Vec<LocalWrite>, StoreFailure>;
 
     /// A provider loss the app follows (Switch spec 12.6 steps 2 and 4): the protocol queues
     /// its re-send requests to the counterparties of its unfinished activity, for what their
@@ -487,15 +515,30 @@ pub trait Protocol: Send + Sync {
     /// counterparties whose conversation entries the app adds back. The app commits the
     /// local writes once, with that step; a crash before that commit calls it again.
     /// Nothing by default.
-    fn provider_lost(&self, loss: &ProviderLoss) -> LossActions {
+    ///
+    /// # Errors
+    ///
+    /// A [`StoreFailure`] when the protocol can't build its actions now, such as when its own
+    /// state can't be read. The recovery stays at this step, which its record keeps, and the
+    /// app's call fails with [`super::AppError::Protocol`], apart from the app's own store
+    /// failing; the next call asks again.
+    fn provider_lost(&self, loss: &ProviderLoss) -> Result<LossActions, StoreFailure> {
         let _ = loss;
-        LossActions::default()
+        Ok(LossActions::default())
     }
 
     /// [`Protocol::provider_lost`], with the protocol's local state at hand, read-only
     /// (`view`), such as to find the counterparties of its unfinished activity. The app
     /// calls this one; by default it calls [`Protocol::provider_lost`].
-    fn provider_lost_with(&self, loss: &ProviderLoss, view: &LocalView<'_>) -> LossActions {
+    ///
+    /// # Errors
+    ///
+    /// As [`Protocol::provider_lost`].
+    fn provider_lost_with(
+        &self,
+        loss: &ProviderLoss,
+        view: &LocalView<'_>,
+    ) -> Result<LossActions, StoreFailure> {
         let _ = view;
         self.provider_lost(loss)
     }
@@ -603,11 +646,22 @@ pub trait Protocol: Send + Sync {
     /// writes it ([`decode_local_state`]) and puts every key back, and needs no writes for a
     /// backup without a layer.
     ///
+    /// `restoring` gives the identity, the App ID and `blind` under the naming key of the
+    /// backup, the ones the restored app goes on with ([`RestoreContext`]), so the protocol
+    /// can check its layer against them here, such as that each claim key it keeps is the
+    /// one its inputs blind to, rather than after the restore commits. The default ignores
+    /// it.
+    ///
     /// # Errors
     ///
     /// Why the layer, or a backup without one, can't be installed, without content: the
     /// restore is refused and nothing is written.
-    fn restore_layer(&self, layer: Option<&ProtocolLayer>) -> Result<Vec<LocalWrite>, String> {
+    fn restore_layer(
+        &self,
+        layer: Option<&ProtocolLayer>,
+        restoring: &RestoreContext<'_>,
+    ) -> Result<Vec<LocalWrite>, String> {
+        let _ = restoring;
         let Some(layer) = layer else {
             return Ok(Vec::new());
         };
