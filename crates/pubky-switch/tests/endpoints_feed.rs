@@ -857,3 +857,74 @@ async fn test_feed_refusal_after_a_wait_is_never_signed_earlier_than_a_read() {
     task.await.expect("listener");
     replay.db.drop_database().await.expect("drop");
 }
+
+#[tokio::test]
+async fn test_feed_page_check_runs_the_apps_checks_before_the_staged_gate() {
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let at = revoke_time();
+    let keys = vectors("keys.json");
+    let wallet = hex::decode(
+        app(&keys, "wallet")["app_id_bytes_hex"]
+            .as_str()
+            .expect("hex"),
+    )
+    .expect("hex");
+    // During the wait the wallet is revoked and the account moves away: a new request would
+    // get 403 not_current (7.3 step 5) before 503 staged (step 7), and so does the page.
+    let v3: SignedDoc = serde_json::from_value(
+        named(
+            &vectors("documents.json")["documents"],
+            "alice identity.json",
+        )["signed"]
+            .clone(),
+    )
+    .expect("v3");
+    let mut moved: pubky_switch_core::records::IdentityBody =
+        serde_json::from_slice(&v3.body_bytes().expect("body")).expect("body");
+    moved.version = 4;
+    moved.inbox.url = "https://other.example".into();
+    let key = pubky_switch_core::keys::IdentityKey::from_secret(hex32(
+        &alice(&vectors("keys.json"))["secret_hex"],
+    ));
+    let moved = pubky_switch_core::records::IdentityDoc::sign(&key, moved)
+        .expect("sign")
+        .signed()
+        .clone();
+    let delivery = pubky_switch_core::http::IdentityDelivery {
+        identity: moved,
+        prev: Some(v3.doc_hash().expect("hash")),
+    }
+    .to_json();
+    let path = format!("/v1/{}/identity", alice_id());
+    let (answer, ()) = tokio::join!(read(&replay, "wallet", "?after=1:9&wait=1", &at), async {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+            .await
+            .expect("conn");
+        sqlx::query(
+            "INSERT INTO kept_app_ids (account_id, app_id, reason, at_ms) \
+             VALUES ($1, $2, 'revoked', 0)",
+        )
+        .bind(alice_id())
+        .bind(wallet.as_slice())
+        .execute(&mut conn)
+        .await
+        .expect("revoked");
+        let delivered = replay
+            .service
+            .handle(signer_request("PUT", &path, delivery, ms(&at)))
+            .await;
+        assert_eq!(
+            delivered.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&delivered.body)
+        );
+    });
+    assert_eq!(
+        (answer.status, body(&answer)["code"].clone()),
+        (403, json!("not_current"))
+    );
+    replay.db.drop_database().await.expect("drop");
+}

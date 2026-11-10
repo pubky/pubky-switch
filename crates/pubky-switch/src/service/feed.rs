@@ -464,15 +464,6 @@ impl PageReader for PageBuilder {
                         return false;
                     }
                 };
-                // The staged gate of Switch wire 7.3 step 7: a version delivered during the
-                // wait that no longer names this service ends the page.
-                if !super::rules::names_this_service(doc.as_ref(), origin, service_public) {
-                    self.refusal = Some(Stop::Refused(ApiError::new(
-                        ErrorCode::Staged,
-                        "7.3: the account isn't named by its identity.json",
-                    )));
-                    return false;
-                }
                 match check_own_app(
                     identity_key,
                     doc.as_ref(),
@@ -482,6 +473,16 @@ impl PageReader for PageBuilder {
                     self.time_ms,
                 ) {
                     Ok(cert) => {
+                        // Then the staged gate, step 7 after step 5, as for a new request
+                        // (Switch wire 7.3): a version delivered during the wait that no
+                        // longer names this service ends the page.
+                        if !super::rules::names_this_service(doc.as_ref(), origin, service_public) {
+                            self.refusal = Some(Stop::Refused(ApiError::new(
+                                ErrorCode::Staged,
+                                "7.3: the account isn't named by its identity.json",
+                            )));
+                            return false;
+                        }
                         self.cert = Some(cert);
                         true
                     }
