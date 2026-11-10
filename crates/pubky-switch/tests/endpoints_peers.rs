@@ -456,3 +456,248 @@ async fn test_peers_certificates_invite_codes_and_removed_apps() {
     );
     replay.db.drop_database().await.expect("drop");
 }
+
+async fn insert_invite(replay: &Replay, account: &str, code: &str, expires_at_ms: u64) {
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    sqlx::query(
+        "INSERT INTO invite_codes (account_id, code_hash, max_uses, uses, writer, \
+         expires_at_ms, context) VALUES ($1, $2, 1, 0, $3, $4, $5)",
+    )
+    .bind(account)
+    .bind(
+        pubky_switch_core::ident::invite_code_hash(code)
+            .expect("hash")
+            .as_slice(),
+    )
+    .bind([1u8; 16].as_slice())
+    .bind(i64::try_from(expires_at_ms).expect("time"))
+    .bind(b"null".as_slice())
+    .execute(&mut conn)
+    .await
+    .expect("invite");
+}
+
+const CODE: &str = "IRrC78oNIjZ4hcet2fYnJQ";
+
+#[tokio::test]
+async fn test_peers_invite_code_expiry_and_trusted_time() {
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let at = item_time(chain_item(&vectors("chain.json"), 9));
+    let alice = identity("alice")["pubky_id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    // An expired code admits nobody.
+    insert_invite(&replay, &alice, CODE, ms(&at)).await;
+    let request = other_request(
+        "shop",
+        ORIGIN,
+        "PUT",
+        &alice_path(),
+        delivery(&doc("bob identity.json")),
+        Some(CODE),
+        ms(&at),
+    );
+    let answer = replay.service.handle(request).await;
+    assert_eq!(status_and_code(&answer), (403, json!("not_admitted")));
+    assert!(header_text(&answer, "switch-head").is_none());
+    replay.db.drop_database().await.expect("drop");
+
+    // Without trusted time, a delivery that only a code admits waits for it (Switch wire
+    // 7.3): at bob's switch, which takes connect requests, the code comes first.
+    let Some(bob_switch) = replay_at(BOB_ORIGIN, "service/bob", Limits::default(), true).await
+    else {
+        return;
+    };
+    let bob = serve_bob(&bob_switch).await;
+    let at = "2026-01-01T00:09:00.000Z";
+    set_time(&bob_switch.clock, at);
+    insert_invite(&bob_switch, &bob, CODE, ms(at) + 3_600_000).await;
+    let request = other_request(
+        "wallet",
+        BOB_ORIGIN,
+        "PUT",
+        &format!("/v1/{bob}/peers"),
+        delivery(&doc("alice identity.json")),
+        Some(CODE),
+        ms(at),
+    );
+    assert_eq!(
+        status_and_code(&bob_switch.service.handle(request).await),
+        (503, json!("unavailable"))
+    );
+    bob_switch.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_peers_invite_and_stranger_rates() {
+    // The invite code's rate.
+    let limits = Limits {
+        invite_reads_per_min: 1,
+        ..Limits::default()
+    };
+    let Some(replay) = replay_with(limits).await else {
+        return;
+    };
+    replay_chain_through_revoke(&replay).await;
+    let at = item_time(chain_item(&vectors("chain.json"), 9));
+    let alice = identity("alice")["pubky_id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    insert_invite(&replay, &alice, CODE, ms(&at) + 3_600_000).await;
+    let deliver = || {
+        other_request(
+            "shop",
+            ORIGIN,
+            "PUT",
+            &alice_path(),
+            delivery(&doc("bob identity.json")),
+            Some(CODE),
+            ms(&at),
+        )
+    };
+    assert_eq!(replay.service.handle(deliver()).await.status, 200);
+    assert_eq!(
+        status_and_code(&replay.service.handle(deliver()).await),
+        (429, json!("rate_limited"))
+    );
+    replay.db.drop_database().await.expect("drop");
+
+    // The account's stranger rate, at bob's switch, which takes connect requests.
+    let limits = Limits {
+        stranger_per_min: 1,
+        ..Limits::default()
+    };
+    let Some(bob_switch) = replay_at(BOB_ORIGIN, "service/bob", limits, false).await else {
+        return;
+    };
+    let bob = serve_bob(&bob_switch).await;
+    let at = "2026-01-01T00:09:00.000Z";
+    set_time(&bob_switch.clock, at);
+    let deliver = || {
+        other_request(
+            "wallet",
+            BOB_ORIGIN,
+            "PUT",
+            &format!("/v1/{bob}/peers"),
+            delivery(&doc("alice identity.json")),
+            None,
+            ms(at),
+        )
+    };
+    assert_eq!(bob_switch.service.handle(deliver()).await.status, 200);
+    assert_eq!(
+        status_and_code(&bob_switch.service.handle(deliver()).await),
+        (429, json!("rate_limited"))
+    );
+    bob_switch.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_peers_limit_drops_a_strangers_copy_before_an_admitted_one() {
+    let limits = Limits {
+        max_peers: 2,
+        ..Limits::default()
+    };
+    let Some(replay) = replay_with(limits).await else {
+        return;
+    };
+    replay_chain_through_revoke(&replay).await;
+    let at = item_time(chain_item(&vectors("chain.json"), 9));
+    let bob = hex32(&identity("bob")["public_hex"]);
+    add_contact(&replay, bob, 81, &at).await;
+    // bob's copy (admitted) first, then carol's (a stranger): both held.
+    assert_eq!(
+        from_wallet(&replay, &doc("bob identity.json"), &at)
+            .await
+            .status,
+        200
+    );
+    let (carol, carol_v1) = stranger_doc(77);
+    assert_eq!(from_wallet(&replay, &carol_v1, &at).await.status, 200);
+    // dave, admitted, is one too many: carol's goes, the stranger's, though bob's is older.
+    let (dave, dave_v1) = stranger_doc(78);
+    add_contact(&replay, dave, 82, &at).await;
+    assert_eq!(from_wallet(&replay, &dave_v1, &at).await.status, 200);
+    let mut held = vec![bob.to_vec(), dave.to_vec()];
+    held.sort();
+    assert_eq!(held_copies(&replay).await, held);
+    let _ = carol;
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_peers_certificate_checks_in_order() {
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let at = item_time(chain_item(&vectors("chain.json"), 9));
+    let bob_v1 = delivery(&doc("bob identity.json"));
+    let send = |cert: &str, signer: &str, at_ms: u64| {
+        other_request_as(
+            "shop",
+            cert,
+            signer,
+            ORIGIN,
+            "PUT",
+            &alice_path(),
+            bob_v1.clone(),
+            None,
+            at_ms,
+        )
+    };
+    // A certificate of bob's for another of his apps: it doesn't name Switch-App.
+    assert_eq!(
+        status_and_code(
+            &replay
+                .service
+                .handle(send(
+                    "cap certificate, extension scope ext:paykit-cap",
+                    "shop",
+                    ms(&at)
+                ))
+                .await
+        ),
+        (401, json!("bad_signature"))
+    );
+    // The shop's certificate, but the request signed with another key.
+    assert_eq!(
+        status_and_code(
+            &replay
+                .service
+                .handle(send("shop certificate", "cap", ms(&at)))
+                .await
+        ),
+        (401, json!("bad_signature"))
+    );
+    // At the certificate's expiry, by the identity's service time: 403 cert_expired.
+    let expired = "2026-12-01T00:00:00.000Z";
+    set_time(&replay.clock, expired);
+    assert_eq!(
+        status_and_code(
+            &replay
+                .service
+                .handle(send("shop certificate", "shop", ms(expired)))
+                .await
+        ),
+        (403, json!("cert_expired"))
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_peers_document_that_doesnt_verify_is_400_for_every_caller() {
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let at = item_time(chain_item(&vectors("chain.json"), 9));
+    let mut tampered = doc("bob identity.json");
+    tampered.sig = doc("alice identity.json").sig;
+    // The shop isn't admitted, and still gets the same 400 an own app gets: the check comes
+    // before admission and reads nothing held.
+    assert_eq!(from_shop(&replay, &tampered, &at).await.status, 400);
+    assert_eq!(from_wallet(&replay, &tampered, &at).await.status, 400);
+    replay.db.drop_database().await.expect("drop");
+}

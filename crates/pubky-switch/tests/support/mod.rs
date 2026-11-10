@@ -194,14 +194,39 @@ pub fn other_request(
     invite_code: Option<&str>,
     at_ms: u64,
 ) -> SwitchRequest {
+    other_request_as(
+        app_name,
+        &format!("{app_name} certificate"),
+        app_name,
+        origin,
+        method,
+        path,
+        body,
+        invite_code,
+        at_ms,
+    )
+}
+
+/// As [`other_request`], claiming `app_name`'s identity and App ID, but carrying the
+/// certificate `cert_name` (a `documents.json` name) and signed with `signing_app`'s key:
+/// for the certificate checks of an app of another identity (Switch wire 7.2).
+#[allow(clippy::too_many_arguments)]
+pub fn other_request_as(
+    app_name: &str,
+    cert_name: &str,
+    signing_app: &str,
+    origin: &str,
+    method: &str,
+    path: &str,
+    body: Vec<u8>,
+    invite_code: Option<&str>,
+    at_ms: u64,
+) -> SwitchRequest {
     let keys = vectors("keys.json");
+    let signer = app(&keys, signing_app)["signing_secret_hex"].clone();
     let app = app(&keys, app_name);
     let cert: pubky_switch_core::sig::SignedDoc = serde_json::from_value(
-        named(
-            &vectors("documents.json")["documents"],
-            &format!("{app_name} certificate"),
-        )["signed"]
-            .clone(),
+        named(&vectors("documents.json")["documents"], cert_name)["signed"].clone(),
     )
     .expect("certificate");
     let identity = app["identity"].as_str().expect("identity").to_string();
@@ -214,7 +239,7 @@ pub fn other_request(
         cert: Some(cert.compact()),
         invite_code: invite_code.map(str::to_string),
     };
-    let secret = ed25519_dalek::SigningKey::from_bytes(&hex32(&app["signing_secret_hex"]));
+    let secret = ed25519_dalek::SigningKey::from_bytes(&hex32(&signer));
     let signature = b64(&wire_http::sign_request(
         &secret,
         &RequestTarget {

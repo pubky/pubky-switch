@@ -495,22 +495,26 @@ fn rfc3339_of(text: &str) -> String {
 async fn test_feed_refuses_an_app_of_another_identity() {
     let Some(replay) = replay().await else { return };
     replay_chain_through_revoke(&replay).await;
-    let keys = vectors("keys.json");
-    let shop = app(&keys, "shop");
-    let key = ed25519_dalek::SigningKey::from_bytes(&hex32(&shop["signing_secret_hex"]));
-    let request = signed_request(
-        &key,
-        shop["identity"].as_str().expect("identity"),
-        Some(shop["app_id"].as_str().expect("app")),
-        "GET",
-        &format!("/v1/{}/feed", alice_id()),
-        Vec::new(),
-        ms(&revoke_time()),
-    );
+    let path = format!("/v1/{}/feed", alice_id());
+    let at = ms(&revoke_time());
+    // Authenticated first, by its certificate (Switch wire 7.2), then refused: the feed is
+    // for own apps (7.4.4).
+    let request = other_request("shop", ORIGIN, "GET", &path, Vec::new(), None, at);
     let answer = replay.service.handle(request).await;
     assert_eq!(
         (answer.status, body(&answer)["code"].clone()),
         (403, json!("permission_missing"))
+    );
+    assert!(header_text(&answer, header::HEAD).is_none());
+    let mut request = other_request("shop", ORIGIN, "GET", &path, Vec::new(), None, at);
+    request.headers.remove("switch-cert");
+    assert_eq!(replay.service.handle(request).await.status, 400);
+    // At POST /ops, likewise: its certificate, then 403 not_admitted.
+    let ops = format!("/v1/{}/ops", alice_id());
+    let request = other_request("shop", ORIGIN, "POST", &ops, b"{}".to_vec(), None, at);
+    assert_eq!(
+        body(&replay.service.handle(request).await)["code"],
+        json!("not_admitted")
     );
     replay.db.drop_database().await.expect("drop");
 }

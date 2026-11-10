@@ -966,9 +966,17 @@ impl Service {
                     self.record_failure(request, account.to_string());
                 }
             })?;
-        if let Caller::OtherApp { .. } = claimed.caller
+        if let Caller::OtherApp { app, .. } = &claimed.caller
             && !others
         {
+            // Authenticated first, by its certificate (`400`, `401`, Switch wire 7.2):
+            // permissions and the endpoint's refusal come after authentication.
+            self.verify_other_app(request, &claimed, app)
+                .inspect_err(|error| {
+                    if is_failed_authentication(error.code) {
+                        self.record_failure(request, account.to_string());
+                    }
+                })?;
             // The feed is for own apps only (Switch wire 7.4.4).
             if request.route.call == Call::Feed {
                 return Err(ApiError::new(
