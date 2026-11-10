@@ -18,6 +18,7 @@
 ## The Switch knows no protocol
 - Protocols are built on top of the Switch and depend on it, never the reverse. Scopes, message kinds and collections are opaque strings to the Switch; it applies only the generic rules its spec gives (Switch spec 1, 3.3).
 - **No Paykit anywhere in this repo:** no Paykit names, types, scopes, kinds or collections in code, tests, configuration, logs or metrics, and no dependency on a Paykit crate. The spec's examples and vectors use Paykit's values as sample data; code treats them as opaque strings and never gives them meaning. Where a test needs a scope or a collection of its own, use a neutral name. Outside `spec/`, the only mention of Paykit is the README's note that it is a protocol built on the Switch.
+- **The one exception, reserved names:** code may read the reserved protocol names and scope roots that `spec/reserved-roots.json` lists (Switch wire 3.1 "Scope roots"), and enforce only the Switch's rule on them: they belong to the protocol named there. It gives them no other meaning, and tests use neutral names except to check that reservation.
 - **Labels stay as specified:** signature labels, header names and paths fixed by the wire format (`pubky-switch/v1/...`, the `Switch-*` headers, `/v1/...`) are kept exactly. Renaming one is a spec change.
 
 ## The core types

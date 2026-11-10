@@ -1610,7 +1610,7 @@ Vectors: `claims.json` runs 69 steps through every row above, the deadline pin a
 - The **switch origin** is the service's origin exactly as `identity.json` names it in `inbox.url` (for an enrollment, the origin the signer enrolls at), for example `https://inbox.example`. It isn't sent; both sides know it.
 - Header values are signed as their exact text, and an absent header as an empty field.
 
-**Timestamp:** an unparsable or missing `Switch-Timestamp` is `400 bad_request`; one more than 5 minutes from the service's time base (7.3) is `401 stale_timestamp`. The time base is trusted time, or the wall clock while it agrees with trusted time; not the identity's stamped time, which never goes back, so neither a jump of the service's wall clock nor a corrected one locks out apps with correct clocks (spec 10.1).
+**Timestamp:** an unparsable or missing `Switch-Timestamp` is `400 bad_request`; one more than 5 minutes from the service's time base (7.3) is `401 stale_timestamp`. The time base is trusted time, or the wall clock while it agrees with trusted time; not the identity's stamped time, which never goes back, so neither a jump of the service's wall clock nor a corrected one locks out apps with correct clocks (spec 10.1). The answer's `current.server_time` (7.6) is that time base, for the client to set its retry's timestamp from; `Switch-Server-Time` stays the identity's service time, the last it committed, which a request refused before the account's lock (7.2 Order) doesn't move.
 
 **Response headers:**
 
@@ -2202,7 +2202,7 @@ Superseded record writes and key bundles, superseded app records, renewed certif
 |---|---|---|---|
 | 400 | `bad_request` | malformed request, document or operation; unknown members where 1.1 rejects them; a missing or unparsable `Switch-Timestamp` or `Switch-Identity`; an append without `apps_version`; an envelope size that isn't a bucket; a policy or collection that differs from the record's; a batch writing one record twice; an `evidence_ref` on a claim entry other than `done` | |
 | 401 | `bad_signature` | a request, operation, certificate, freeze, unfreeze or key bundle signature that doesn't verify | |
-| 401 | `stale_timestamp` | `Switch-Timestamp` more than 5 minutes from the service's clock | |
+| 401 | `stale_timestamp` | `Switch-Timestamp` more than 5 minutes from the service's clock | `{ "server_time" }`: the service's time base when it checked the timestamp (7.1) |
 | 403 | `not_admitted` | a sender not admitted or denied; a connect request where they are off; a signer of another identity. An admission refusal has one message, `7: sender not admitted`, whatever the reason (denied, unknown, an unknown, expired or used-up code) | |
 | 403 | `permission_missing` | the caller's certificate lacks the switch permission or scope; a call only another caller may make | |
 | 403 | `not_current` | the calling app is revoked, departed or not listed with its certificate, also once it is purged (its App ID is kept for good, 9.1); an app of another identity whose certificate's renewal has closed (3.8). An app the sender's `identity.json` lists as removed gets a stranger's answer instead (7.2) | |

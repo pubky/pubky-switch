@@ -846,3 +846,216 @@ async fn test_concurrent_first_enrollments_share_one_account() {
     assert_eq!(json(&a)["service_key"], json(&b)["service_key"]);
     replay.db.drop_database().await.expect("drop");
 }
+
+#[tokio::test]
+async fn test_refused_delivery_leaves_nothing_to_build_on() {
+    let Some(replay) = replay().await else { return };
+    serving(&replay).await;
+    let alice = alice_keys();
+    // A backup from before the first delivery is restored: no document and no chain, while
+    // the key's mark is at the first delivery's seq 1.
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    for statement in [
+        "UPDATE accounts SET last_seq = 0, chain_seq = NULL, chain_hash = NULL, \
+         identity_doc = NULL, identity_proof = NULL WHERE id = $1",
+        "DELETE FROM chain_items WHERE account_id = $1",
+    ] {
+        sqlx::query(statement)
+            .bind(&alice.id)
+            .execute(&mut conn)
+            .await
+            .expect("restore");
+    }
+    // Version 1 again, at another time: a seq 1 beside the mark, which no head may show.
+    let path = format!("/v1/{}/identity", alice.id);
+    let version_1 = version("alice identity.json, first delivery (version 1)");
+    let refused = replay
+        .service
+        .handle(signer_request(
+            "PUT",
+            &path,
+            delivery(version_1.clone(), None),
+            ms(T),
+        ))
+        .await;
+    assert_eq!(
+        (refused.status, code(&refused).as_str()),
+        (503, "unavailable")
+    );
+    // Nothing of the refused delivery was kept, so a later one can't extend it.
+    let (last_seq, doc): (i64, Option<Vec<u8>>) =
+        sqlx::query_as("SELECT last_seq, identity_doc FROM accounts WHERE id = $1")
+            .bind(&alice.id)
+            .fetch_one(&mut conn)
+            .await
+            .expect("account");
+    assert_eq!((last_seq, doc), (0, None));
+    let extended = replay
+        .service
+        .handle(signer_request(
+            "PUT",
+            &path,
+            delivery(
+                version("alice identity.json"),
+                Some(version_1.doc_hash().expect("hash")),
+            ),
+            ms(T),
+        ))
+        .await;
+    assert_ne!(
+        extended.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&extended.body)
+    );
+    assert!(header_of(&extended, header::HEAD).is_none());
+    conn.close().await.expect("close");
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_identity_first_delivery_refuses_an_enrolled_revoked_app() {
+    let Some(replay) = replay().await else { return };
+    let alice = alice_keys();
+    set_time(&replay.clock, T);
+    // An enrollment without identity_doc whose revoked_apps names the wallet, which version 1
+    // lists as current.
+    let keys = vectors("keys.json");
+    let wallet: [u8; 16] = hex::decode(
+        keys["apps"]
+            .as_array()
+            .expect("apps")
+            .iter()
+            .find(|app| app["name"] == "wallet")
+            .expect("the wallet")["app_id_bytes_hex"]
+            .as_str()
+            .expect("hex"),
+    )
+    .expect("hex")
+    .try_into()
+    .expect("16 bytes");
+    let http = vectors("http.json");
+    let vector = named(&http["requests"], "signer: enrollment");
+    let body: Value = serde_json::from_slice(
+        &pubky_switch_core::enc::unb64(vector["body_b64"].as_str().expect("body")).expect("b64"),
+    )
+    .expect("json");
+    let signed: SignedDoc = serde_json::from_value(body["enrollment"].clone()).expect("signed");
+    let mut fields: EnrollmentBody =
+        serde_json::from_slice(&signed.body_bytes().expect("body")).expect("enrollment body");
+    fields.identity_doc = None;
+    fields.revoked_apps = Some(vec![wallet]);
+    let enrollment = Enrollment::sign(&alice.key, fields).expect("sign");
+    let body = serde_json::to_vec(&json!({ "enrollment": enrollment.signed() })).expect("json");
+    let enrolled = replay
+        .service
+        .handle(signer_request("POST", "/v1/enroll", body, ms(T)))
+        .await;
+    assert_eq!(
+        enrolled.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&enrolled.body)
+    );
+    let path = format!("/v1/{}/identity", alice.id);
+    let delivered = replay
+        .service
+        .handle(signer_request(
+            "PUT",
+            &path,
+            delivery(
+                version("alice identity.json, first delivery (version 1)"),
+                None,
+            ),
+            ms(T),
+        ))
+        .await;
+    assert_eq!(
+        (delivered.status, code(&delivered).as_str()),
+        (400, "bad_request"),
+        "{}",
+        String::from_utf8_lossy(&delivered.body)
+    );
+    let read = replay
+        .service
+        .handle(request("GET", &path, &[], Vec::new()))
+        .await;
+    assert_eq!(read.status, 404, "nothing is served");
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_enroll_retry_after_serving_gets_the_first_answer() {
+    let Some(replay) = replay().await else { return };
+    serving(&replay).await;
+    // The vectors' enrollment again, under a fresh request signature, once the account
+    // serves: the answer it got first, not the next generation's pending key.
+    let http = vectors("http.json");
+    let vector = named(&http["requests"], "signer: enrollment");
+    let body =
+        pubky_switch_core::enc::unb64(vector["body_b64"].as_str().expect("body")).expect("b64");
+    let again = replay
+        .service
+        .handle(signer_request("POST", "/v1/enroll", body, ms(T)))
+        .await;
+    let first = named(
+        &http["responses"],
+        "signer: enrollment answer, signed with the new account's key",
+    );
+    assert_eq!(again.status, 200);
+    assert_eq!(
+        String::from_utf8_lossy(&again.body),
+        first["body"].as_str().expect("body"),
+        "the same enrollment, the same answer"
+    );
+    // A new enrollment still gets the pending key.
+    let other = replay
+        .service
+        .handle(signer_request(
+            "POST",
+            "/v1/enroll",
+            enrollment_body(5, ORIGIN),
+            ms(T),
+        ))
+        .await;
+    assert_ne!(
+        json(&other)["service_key"],
+        vectors("keys.json")["service_keys"][0]["public"]
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_stale_timestamp_gives_a_time_to_retry_with() {
+    let Some(replay) = replay().await else { return };
+    // The account last committed on December 30, and is idle until January 1.
+    serving(&replay).await;
+    let alice = alice_keys();
+    let path = format!("/v1/{}/identity", alice.id);
+    let body = delivery(version("alice identity.json"), None);
+    let last_committed = "2025-12-30T00:00:02.000Z";
+    let stale = signer_request("PUT", &path, body.clone(), ms(last_committed));
+    let refused = replay.service.handle(stale).await;
+    assert_eq!(
+        (refused.status, code(&refused).as_str()),
+        (401, "stale_timestamp")
+    );
+    // The signed time stays the identity's service time; the body gives the time base.
+    assert_eq!(
+        header_of(&refused, header::SERVER_TIME),
+        Some(last_committed)
+    );
+    let retry_at = json(&refused)["current"]["server_time"]
+        .as_str()
+        .expect("current.server_time")
+        .to_string();
+    assert_eq!(retry_at, T);
+    let retried = replay
+        .service
+        .handle(signer_request("PUT", &path, body, ms(&retry_at)))
+        .await;
+    assert_ne!(code(&retried), "stale_timestamp");
+    replay.db.drop_database().await.expect("drop");
+}
