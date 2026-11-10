@@ -1596,10 +1596,16 @@ impl App {
     ///
     /// A failed store read.
     pub async fn unacknowledged_events(&mut self) -> Result<Vec<AppEvent>, AppError> {
+        // A reload owed first, so what it queues is listed here, once.
+        self.ready_local().await?;
         let kept = self.kept_duties().await?;
         for id in kept.iter().filter_map(AppEvent::id) {
             self.duty_handed = self.duty_handed.max(id.counter());
         }
+        // Handed over here, so not again by the next report.
+        let handed = self.duty_handed;
+        self.events
+            .retain(|event| event.id().is_none_or(|id| id.counter() > handed));
         Ok(kept)
     }
 

@@ -2586,7 +2586,7 @@ async fn test_duty_event_replay_whose_read_fails_is_made_again() {
             continue;
         }
         if !refused_events(&app.take_events(), seq).is_empty()
-            || refused_events(&app.unacknowledged_events().await.unwrap(), seq).is_empty()
+            || refused_events(&app.kept_duties().await.unwrap(), seq).is_empty()
         {
             continue;
         }
@@ -2608,6 +2608,41 @@ async fn test_duty_event_replay_whose_read_fails_is_made_again() {
         for event in app.unacknowledged_events().await.unwrap() {
             assert!(!events.contains(&event), "commit {n}: {event:?}");
         }
+        break;
+    }
+    assert!(
+        found,
+        "a commit keeping the refusal answers that it can't tell"
+    );
+}
+
+#[tokio::test]
+async fn test_duty_event_listed_after_a_failed_commit_comes_once() {
+    let mut found = false;
+    for n in 1..=8 {
+        let w = World::new();
+        let (app, seq, _) = refusing(&w).await;
+        let (mut app, _) = load_behind(&w, app, StoreFault::FailAfter(n)).await;
+        if app.receive(None).await.is_ok() {
+            continue;
+        }
+        if !refused_events(&app.take_events(), seq).is_empty()
+            || refused_events(&app.kept_duties().await.unwrap(), seq).is_empty()
+        {
+            continue;
+        }
+        found = true;
+        // The refusal's commit was applied unreported. Listing it reloads first and hands
+        // it over; the next report doesn't hand it over again.
+        let listed = app.unacknowledged_events().await.unwrap();
+        assert_eq!(refused_events(&listed, seq).len(), 1, "commit {n}");
+        let report = app.receive(None).await.unwrap();
+        let mut again = report.events;
+        again.extend(app.take_events());
+        assert!(
+            refused_events(&again, seq).is_empty(),
+            "commit {n}: {again:?}"
+        );
         break;
     }
     assert!(
