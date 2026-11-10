@@ -5,21 +5,25 @@
 //! page is read once the lock is gone, from one snapshot ([`crate::store::FeedSnapshot`]).
 //! A long-poll waits there for the account's next change, holding no lock.
 
-use std::{collections::BTreeMap, time::Duration};
+use std::{collections::BTreeMap, future::Future, time::Duration};
 
 use pubky_switch_core::{
-    chain::{ChainEnvelope, ChainTip, ItemType, ServiceTransition, ZERO_HASH},
+    chain::{ChainEnvelope, ChainTip, ItemType, ServiceTransition, SignedHead, ZERO_HASH},
     ops::{MAX_BATCH_ENTRIES, OpKind, Position, SignedOp},
-    records::AppCert,
+    records::{AppCert, IdentityDoc},
     scopes::Permission,
 };
-use serde_json::{Value, json};
+use serde_json::Value;
 
-use super::{Answer, Service};
+use super::{
+    Answer, Service,
+    batch::{Stop, VerifiedApp, check_own_app},
+};
 use crate::{
+    changes::ChangeHub,
     http::error::{ApiError, ErrorCode},
     keys::{KeyId, Mark, ServiceSigner, sign_head},
-    store::{CurrentDocs, FeedRow, FeedSnapshot, StoreError},
+    store::{CurrentDocs, FeedRow, FeedSnapshot, PageReader, StoreError},
 };
 
 /// Positions one page examines at most, before it runs on to the end of a batch (Switch
@@ -89,14 +93,41 @@ impl FeedQuery {
     }
 }
 
-/// A feed read taken under the lock, whose page is read after it.
+/// A feed read taken under the lock, whose page is read after it. The reader is checked
+/// again for every page, in the snapshot the page comes from: a long-poll that outlives the
+/// app's standing, its certificate or the account's key answers as a fresh request would.
 #[derive(Debug)]
 pub(super) struct FeedRead {
     account: String,
     identity_key: [u8; 32],
     service_key: KeyId,
-    reader: AppCert,
+    /// The reader, with the signing key its request verified with.
+    reader: VerifiedApp,
     query: FeedQuery,
+    /// The service time the request stamped.
+    time_ms: u64,
+}
+
+/// How a feed read that can't answer with a page is answered.
+#[derive(Debug)]
+pub(super) enum FeedStop {
+    /// The account is gone: `404`, signed with the operator key (Switch wire 7.3 step 2).
+    Gone,
+    /// The account's key changed since the request: a temporary failure, signed with the
+    /// operator key, since the request's key is retired.
+    Retired,
+    /// An error answer at `time_ms`: with `head`, or, for `fallback`, with the head the
+    /// request committed; neither for the mark's `503` or an unauthenticated reader.
+    Refused {
+        /// The error.
+        error: Box<ApiError>,
+        /// The page's signed head.
+        head: Option<SignedHead>,
+        /// Whether it carries the request's own head instead.
+        fallback: bool,
+        /// The service time to sign at.
+        time_ms: u64,
+    },
 }
 
 /// How an item shows to a reader (Switch wire 7.5).
@@ -199,28 +230,61 @@ pub(crate) fn shows(
     })
 }
 
-/// The feed item of chain item `row` as it shows (Switch wire 7.5).
-fn item_value(row: &FeedRow, shown: Shown) -> Value {
-    let stub = row.stub.to_value();
+/// The feed item of chain item `row` as it shows (Switch wire 7.5), as JSON in the member
+/// order of the wire's example (7.4.4).
+fn item_json(row: &FeedRow, shown: Shown) -> Vec<u8> {
+    let mut out = Vec::new();
+    let stub = row.stub.to_json();
     match (shown, &row.item) {
         (Shown::Full { context }, Some(item)) => {
-            let mut value = json!({
-                "type": "chain",
-                "seq": row.seq,
-                "stub": stub,
-                "item_type": row.item_type.as_str(),
-                "item": item,
-            });
+            out.extend_from_slice(b"{\"type\":\"chain\",\"seq\":");
+            out.extend_from_slice(row.seq.to_string().as_bytes());
+            out.extend_from_slice(b",\"stub\":");
+            out.extend_from_slice(&stub);
+            out.extend_from_slice(b",\"item_type\":\"");
+            out.extend_from_slice(row.item_type.as_str().as_bytes());
+            out.extend_from_slice(b"\",\"item\":");
+            out.extend_from_slice(&doc_json(item));
             if let Some(context) = context {
-                value["context"] = context;
+                out.extend_from_slice(b",\"context\":");
+                out.extend_from_slice(context.to_string().as_bytes());
             }
             if let (ItemType::Op, Some(proof)) = (row.item_type, &row.proof) {
-                value["proof"] = json!(proof);
+                out.extend_from_slice(b",\"proof\":");
+                out.extend_from_slice(&doc_json(proof));
             }
-            value
+            out.push(b'}');
         }
-        _ => json!({ "type": "stub", "seq": row.seq, "stub": stub }),
+        _ => {
+            out.extend_from_slice(b"{\"type\":\"stub\",\"seq\":");
+            out.extend_from_slice(row.seq.to_string().as_bytes());
+            out.extend_from_slice(b",\"stub\":");
+            out.extend_from_slice(&stub);
+            out.push(b'}');
+        }
     }
+    out
+}
+
+/// A signed document's carrying form, `{"body","sig"}` (Switch wire 2.2).
+fn doc_json(doc: &pubky_switch_core::sig::SignedDoc) -> Vec<u8> {
+    // Two strings: their serialization can't fail; the empty object stands in if it did.
+    serde_json::to_vec(doc).unwrap_or_else(|_| b"{}".to_vec())
+}
+
+/// Who reads a page.
+#[derive(Debug)]
+enum Reader {
+    /// Checked again from each snapshot, as a fresh request (Switch wire 7.2).
+    Checked {
+        identity_key: [u8; 32],
+        service_key: String,
+        verified: VerifiedApp,
+        time_ms: u64,
+    },
+    /// A certificate taken as it is, for tests of the visibility rules.
+    #[cfg(test)]
+    Fixed(AppCert),
 }
 
 /// A page as it is built from the items of a snapshot, in `seq` order (Switch wire 7.4.4):
@@ -228,14 +292,16 @@ fn item_value(row: &FeedRow, shown: Shown) -> Value {
 /// budget, but never inside a batch, whose items count together; its first item or batch
 /// is shown whatever its size.
 #[derive(Debug)]
-pub(crate) struct PageBuilder<'a> {
-    reader: &'a AppCert,
+pub(crate) struct PageBuilder {
+    reader: Reader,
+    /// The certificate the reader is checked against in this snapshot.
+    cert: Option<AppCert>,
     limit: usize,
     budget: usize,
-    items: Vec<Value>,
+    items: Vec<Vec<u8>>,
     bytes: usize,
     /// The items of the group being read: one batch's, or one item of no batch.
-    group: Vec<Value>,
+    group: Vec<Vec<u8>>,
     group_bytes: usize,
     group_batch: Option<[u8; 16]>,
     group_last: u64,
@@ -244,22 +310,31 @@ pub(crate) struct PageBuilder<'a> {
     /// Whether the limit or the budget ended the page.
     cut: bool,
     error: Option<StoreError>,
+    /// Why the reader may not read this snapshot, as a fresh request would be refused.
+    refusal: Option<Stop>,
+    /// The key changed since the request.
+    retired: bool,
+    /// The service time the page answers at: the later of the request's and the
+    /// snapshot's.
+    time_ms: u64,
 }
 
 /// A page, finished.
 #[derive(Debug, PartialEq)]
 pub(crate) struct Page {
-    pub(crate) items: Vec<Value>,
+    /// Each item's JSON.
+    pub(crate) items: Vec<Vec<u8>>,
     /// The last `seq` the page examined, shown or not.
     pub(crate) scanned_through: u64,
     /// Whether items follow it.
     pub(crate) more: bool,
 }
 
-impl<'a> PageBuilder<'a> {
-    pub(crate) fn new(reader: &'a AppCert, limit: usize, budget: usize) -> Self {
+impl PageBuilder {
+    fn with(reader: Reader, limit: usize, budget: usize) -> Self {
         Self {
             reader,
+            cert: None,
             limit,
             budget,
             items: Vec::new(),
@@ -271,7 +346,16 @@ impl<'a> PageBuilder<'a> {
             covered: None,
             cut: false,
             error: None,
+            refusal: None,
+            retired: false,
+            time_ms: 0,
         }
+    }
+
+    /// A page for `reader`, taken as it is.
+    #[cfg(test)]
+    pub(crate) fn new(reader: AppCert, limit: usize, budget: usize) -> Self {
+        Self::with(Reader::Fixed(reader), limit, budget)
     }
 
     /// Take the group read so far, unless the page ends before it; whether it did.
@@ -291,43 +375,6 @@ impl<'a> PageBuilder<'a> {
         self.bytes = self.bytes.saturating_add(self.group_bytes);
         self.group_bytes = 0;
         self.covered = Some(self.group_last);
-        true
-    }
-
-    /// See the next item of `snapshot`; whether the page wants the one after.
-    pub(crate) fn take(&mut self, snapshot: &FeedSnapshot, row: FeedRow) -> bool {
-        let batch = match ChainEnvelope::parse(&row.stub.envelope) {
-            Ok(envelope) => envelope.batch.map(|batch| batch.id),
-            Err(_) => {
-                self.error = Some(corrupt("a chain envelope"));
-                return false;
-            }
-        };
-        // A batch's items take consecutive seqs (Switch wire 6.4).
-        let continues = batch.is_some()
-            && batch == self.group_batch
-            && !self.group.is_empty()
-            && row.seq == self.group_last.saturating_add(1);
-        // Past the positions a page examines, only the rest of the batch it is in.
-        if row.seq > snapshot.window_end && !continues {
-            return false;
-        }
-        if !continues && !self.close_group() {
-            return false;
-        }
-        let shown = match shows(&row, self.reader, &snapshot.current) {
-            Ok(shown) => shown,
-            Err(error) => {
-                self.error = Some(error);
-                return false;
-            }
-        };
-        let value = item_value(&row, shown);
-        let size = serde_json::to_vec(&value).map_or(0, |bytes| bytes.len());
-        self.group.push(value);
-        self.group_bytes = self.group_bytes.saturating_add(size);
-        self.group_batch = batch;
-        self.group_last = row.seq;
         true
     }
 
@@ -359,6 +406,148 @@ impl<'a> PageBuilder<'a> {
     }
 }
 
+impl PageReader for PageBuilder {
+    /// Check the reader against the snapshot as a fresh request is checked (Switch wire 7.2):
+    /// the account's key unchanged; the certificate it is checked against, with the key its
+    /// request verified with; unexpired at the page's service time; not revoked or departed,
+    /// listed and carried by its record. Its scopes and permissions are that certificate's.
+    fn begin(&mut self, snapshot: &FeedSnapshot) -> bool {
+        match &self.reader {
+            #[cfg(test)]
+            Reader::Fixed(cert) => {
+                self.cert = Some(cert.clone());
+                true
+            }
+            Reader::Checked {
+                identity_key,
+                service_key,
+                verified,
+                time_ms,
+            } => {
+                self.time_ms = (*time_ms).max(snapshot.stamped_time_ms);
+                if snapshot.service_key != *service_key {
+                    self.retired = true;
+                    return false;
+                }
+                let doc = match snapshot
+                    .identity_doc
+                    .as_ref()
+                    .map(|doc| IdentityDoc::verify(doc, identity_key))
+                    .transpose()
+                {
+                    Ok(doc) => doc,
+                    Err(_) => {
+                        self.error = Some(corrupt("the account's identity.json"));
+                        return false;
+                    }
+                };
+                match check_own_app(
+                    identity_key,
+                    doc.as_ref(),
+                    snapshot.reader.as_ref(),
+                    snapshot.reader_kept,
+                    verified,
+                    self.time_ms,
+                ) {
+                    Ok(cert) => {
+                        self.cert = Some(cert);
+                        true
+                    }
+                    Err(stop) => {
+                        self.refusal = Some(stop);
+                        false
+                    }
+                }
+            }
+        }
+    }
+
+    fn take(&mut self, snapshot: &FeedSnapshot, row: FeedRow) -> bool {
+        let Some(cert) = self.cert.as_ref() else {
+            return false;
+        };
+        let batch = match ChainEnvelope::parse(&row.stub.envelope) {
+            Ok(envelope) => envelope.batch.map(|batch| batch.id),
+            Err(_) => {
+                self.error = Some(corrupt("a chain envelope"));
+                return false;
+            }
+        };
+        // A batch's items take consecutive seqs (Switch wire 6.4).
+        let continues = batch.is_some()
+            && batch == self.group_batch
+            && !self.group.is_empty()
+            && row.seq == self.group_last.saturating_add(1);
+        // Past the positions a page examines, only the rest of the batch it is in.
+        if row.seq > snapshot.window_end && !continues {
+            return false;
+        }
+        let shown = match shows(&row, cert, &snapshot.current) {
+            Ok(shown) => shown,
+            Err(error) => {
+                self.error = Some(error);
+                return false;
+            }
+        };
+        if !continues && !self.close_group() {
+            return false;
+        }
+        let item = item_json(&row, shown);
+        self.group_bytes = self.group_bytes.saturating_add(item.len());
+        self.group.push(item);
+        self.group_batch = batch;
+        self.group_last = row.seq;
+        true
+    }
+}
+
+/// What one read of a long-poll gives: a page to answer with, or an empty one to answer
+/// with only once the wait is over.
+#[derive(Debug)]
+pub(crate) enum Polled<T> {
+    /// Answer with it.
+    Ready(T),
+    /// Nothing to read yet.
+    Empty(T),
+}
+
+/// The long-poll (Switch wire 7.4.4): read, and answer at once with a page to show;
+/// otherwise wait until `account` changes or `wait` passes, read again, and answer with the
+/// page as it is then. The subscription comes before the first read, and each wake-up is
+/// marked seen before the read that follows it, so no change after a read goes unseen.
+pub(crate) async fn long_poll<T, E, F, Fut>(
+    hub: &ChangeHub,
+    account: &str,
+    wait: Duration,
+    mut read: F,
+) -> Result<T, E>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<Polled<T>, E>>,
+{
+    let deadline = tokio::time::Instant::now() + wait;
+    let mut changes = hub.subscribe(account);
+    loop {
+        changes.borrow_and_update();
+        let page = match read().await? {
+            Polled::Ready(page) => return Ok(page),
+            Polled::Empty(page) => page,
+        };
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(page);
+        }
+        tokio::select! {
+            changed = changes.changed() => {
+                // The hub went away: answer with the page as it is.
+                if changed.is_err() {
+                    return Ok(page);
+                }
+            }
+            () = tokio::time::sleep_until(deadline) => {}
+        }
+    }
+}
+
 fn temporary() -> ApiError {
     ApiError::unavailable("7.6: a temporary failure")
 }
@@ -373,6 +562,7 @@ impl Service {
         service_key: &KeyId,
         writer: Option<&AppCert>,
         query: &Result<BTreeMap<String, String>, crate::http::route::QueryError>,
+        time_ms: u64,
     ) -> Result<Answer, ApiError> {
         let Some(reader) = writer else {
             return Err(ApiError::new(
@@ -389,40 +579,51 @@ impl Service {
             account: account.to_string(),
             identity_key,
             service_key: service_key.clone(),
-            reader: reader.clone(),
+            reader: VerifiedApp::reading(reader.app_id(), reader.signing_key()),
             query,
+            time_ms,
         })));
         Ok(answer)
     }
 
-    /// The feed page of `read`, once the lock is gone: at once when it shows an item or
-    /// more follow, or without `wait`; otherwise when the account changes or `wait` seconds
-    /// pass, with the page as it is then (Switch wire 7.4.4).
+    /// The feed page of `read`, once the lock is gone, and the service time to sign it at:
+    /// at once when it shows an item or more follow, or without `wait`; otherwise when the
+    /// account changes or `wait` seconds pass, with the page as it is then (Switch wire
+    /// 7.4.4).
     pub(super) async fn feed_page(
         &self,
         read: &FeedRead,
         signer: &ServiceSigner,
-    ) -> Result<Answer, ApiError> {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(read.query.wait);
-        // Subscribed before the first read, so no change after it is missed.
-        let mut changes = self.changes.subscribe(&read.account);
-        loop {
-            changes.borrow_and_update();
-            let (snapshot, page, head) = self.read_page(read, signer).await?;
-            let waited_out = tokio::time::Instant::now() >= deadline;
-            if !page.items.is_empty() || page.more || waited_out {
-                return self.page_answer(read, &snapshot, page, head).await;
-            }
-            tokio::select! {
-                changed = changes.changed() => {
-                    // The hub went away: answer with the page as it is.
-                    if changed.is_err() {
-                        return self.page_answer(read, &snapshot, page, head).await;
-                    }
-                }
-                () = tokio::time::sleep_until(deadline) => {}
-            }
+    ) -> Result<(Answer, u64), FeedStop> {
+        let answered = long_poll(
+            &self.changes,
+            &read.account,
+            Duration::from_secs(read.query.wait),
+            || async {
+                let answered = self.read_page(read, signer).await?;
+                Ok(if answered.ready {
+                    Polled::Ready(answered)
+                } else {
+                    Polled::Empty(answered)
+                })
+            },
+        )
+        .await?;
+        // The key's mark moves to the page's head first, so no head goes out that the mark
+        // is behind, also when the page shows a commit whose own request hasn't moved it
+        // yet (Switch wire 7.3 step 10).
+        if let Some(mark) = answered.mark {
+            self.keys
+                .advance_mark(&read.service_key, mark)
+                .await
+                .map_err(|_| FeedStop::Refused {
+                    error: Box::new(temporary()),
+                    head: None,
+                    fallback: false,
+                    time_ms: answered.time_ms,
+                })?;
         }
+        Ok((answered.answer(), answered.time_ms))
     }
 
     /// One page from one snapshot, and its head, signed. The key's mark is read before the
@@ -431,29 +632,46 @@ impl Service {
         &self,
         read: &FeedRead,
         signer: &ServiceSigner,
-    ) -> Result<(FeedSnapshot, Page, pubky_switch_core::chain::SignedHead), ApiError> {
+    ) -> Result<Answered, FeedStop> {
+        let fallback = |error: ApiError, time_ms| FeedStop::Refused {
+            error: Box::new(error),
+            head: None,
+            fallback: true,
+            time_ms,
+        };
         let mark = self
             .keys
             .mark(&read.service_key)
             .await
-            .map_err(|_| temporary())?;
+            .map_err(|_| fallback(temporary(), read.time_ms))?;
         let budget = usize::try_from(self.limits.max_page_bytes).unwrap_or(usize::MAX);
-        let mut builder = PageBuilder::new(&read.reader, read.query.limit, budget);
+        let mut builder = PageBuilder::with(
+            Reader::Checked {
+                identity_key: read.identity_key,
+                service_key: read.service_key.as_str().to_string(),
+                verified: read.reader.clone(),
+                time_ms: read.time_ms,
+            },
+            read.query.limit,
+            budget,
+        );
         let snapshot = self
             .store
             .read_feed(
                 &read.account,
+                &read.reader.app_id(),
                 read.query.after,
                 POSITIONS_PER_PAGE,
                 (MAX_BATCH_ENTRIES as u64).saturating_sub(1),
-                |snapshot, row| builder.take(snapshot, row),
+                &mut builder,
             )
             .await
-            .map_err(|error| super::store_error(&error))?
-            .ok_or_else(|| ApiError::not_found("no such account"))?;
-        let page = builder
-            .finish(&snapshot)
-            .map_err(|error| super::store_error(&error))?;
+            .map_err(|error| fallback(super::store_error(&error), read.time_ms))?
+            .ok_or(FeedStop::Gone)?;
+        if builder.retired {
+            return Err(FeedStop::Retired);
+        }
+        let time_ms = builder.time_ms;
         let (seq, chain_hash) = snapshot.chain.unwrap_or((0, ZERO_HASH));
         let tip = ChainTip {
             generation: snapshot.generation,
@@ -461,44 +679,87 @@ impl Service {
             chain_hash,
         };
         let head = sign_head(signer, mark.as_ref(), &read.identity_key, &tip).map_err(|_| {
-            ApiError::unavailable(
-                "7.3: the state is behind its service key's mark; a new generation is needed",
-            )
+            FeedStop::Refused {
+                error: Box::new(ApiError::unavailable(
+                    "7.3: the state is behind its service key's mark; a new generation is needed",
+                )),
+                head: None,
+                fallback: false,
+                time_ms,
+            }
         })?;
-        Ok((snapshot, page, head))
-    }
-
-    /// The page's answer. The key's mark moves to its head first, so no head goes out that
-    /// the mark is behind (Switch wire 7.3 step 10).
-    async fn page_answer(
-        &self,
-        read: &FeedRead,
-        snapshot: &FeedSnapshot,
-        page: Page,
-        head: pubky_switch_core::chain::SignedHead,
-    ) -> Result<Answer, ApiError> {
-        if let Some((seq, chain_hash)) = snapshot.chain {
-            self.keys
-                .advance_mark(
-                    &read.service_key,
-                    Mark {
-                        generation: snapshot.generation,
-                        seq,
-                        chain_hash,
-                    },
-                )
-                .await
-                .map_err(|_| temporary())?;
+        match builder.refusal.take() {
+            Some(Stop::Refused(error)) => {
+                return Err(FeedStop::Refused {
+                    error: Box::new(error),
+                    head: Some(head),
+                    fallback: false,
+                    time_ms,
+                });
+            }
+            Some(Stop::Unauthenticated(error)) => {
+                return Err(FeedStop::Refused {
+                    error: Box::new(error),
+                    head: None,
+                    fallback: false,
+                    time_ms,
+                });
+            }
+            None => {}
         }
-        let body = json!({
-            "items": page.items,
-            "next": format!("{}:{}", snapshot.generation, page.scanned_through),
-            "scanned_through": page.scanned_through,
-            "more": page.more,
-            "head": head.to_value(),
-        });
-        let body = serde_json::to_vec(&body).map_err(|_| temporary())?;
-        Ok(Answer::ok(body).with_head(Some(head)))
+        let page = builder
+            .finish(&snapshot)
+            .map_err(|error| fallback(super::store_error(&error), time_ms))?;
+        Ok(Answered {
+            ready: !page.items.is_empty() || page.more,
+            page,
+            mark: snapshot.chain.map(|(seq, chain_hash)| Mark {
+                generation: snapshot.generation,
+                seq,
+                chain_hash,
+            }),
+            generation: snapshot.generation,
+            head,
+            time_ms,
+        })
+    }
+}
+
+/// A page read and its signed head, before it is answered.
+#[derive(Debug)]
+struct Answered {
+    page: Page,
+    ready: bool,
+    /// The head as a mark, `None` before the first chain item.
+    mark: Option<Mark>,
+    generation: u64,
+    head: SignedHead,
+    time_ms: u64,
+}
+
+impl Answered {
+    /// The page's answer, `{ items, next, scanned_through, more, head }` in the member order
+    /// of the wire's example (Switch wire 7.4.4), with the head also in `Switch-Head`.
+    fn answer(&self) -> Answer {
+        let mut body = b"{\"items\":[".to_vec();
+        for (index, item) in self.page.items.iter().enumerate() {
+            if index > 0 {
+                body.push(b',');
+            }
+            body.extend_from_slice(item);
+        }
+        body.extend_from_slice(b"],\"next\":\"");
+        body.extend_from_slice(
+            format!("{}:{}", self.generation, self.page.scanned_through).as_bytes(),
+        );
+        body.extend_from_slice(b"\",\"scanned_through\":");
+        body.extend_from_slice(self.page.scanned_through.to_string().as_bytes());
+        body.extend_from_slice(b",\"more\":");
+        body.extend_from_slice(if self.page.more { b"true" } else { b"false" });
+        body.extend_from_slice(b",\"head\":");
+        body.extend_from_slice(&self.head.to_json());
+        body.push(b'}');
+        Answer::ok(body).with_head(Some(self.head))
     }
 }
 
@@ -507,7 +768,7 @@ mod tests {
     use pubky_switch_core::{chain::Stub, keys::IdentityKey, records::AppCertBody, sig::SignedDoc};
 
     use super::*;
-    use crate::store::AppDocs;
+    use crate::store::{AppDocs, PageReader};
 
     fn vectors(name: &str) -> Value {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -549,6 +810,11 @@ mod tests {
 
     /// A certificate of alice's for an app with `scopes` and `permissions`.
     fn reader(scopes: &[&str], permissions: &[Permission]) -> AppCert {
+        reader_keyed([7; 32], scopes, permissions)
+    }
+
+    /// The same, for the app of signing key `signing`.
+    fn reader_keyed(signing: [u8; 32], scopes: &[&str], permissions: &[Permission]) -> AppCert {
         let keys = vectors("keys.json");
         let alice = keys["identities"]
             .as_array()
@@ -561,7 +827,7 @@ mod tests {
             &key,
             AppCertBody::new(
                 key.public(),
-                [7; 32],
+                signing,
                 [8; 32],
                 scopes.iter().map(|scope| (*scope).to_string()).collect(),
                 permissions,
@@ -670,6 +936,215 @@ mod tests {
         assert_eq!(shows(&gone, &all, &current).expect("shows"), Shown::Stub);
     }
 
+    fn alice_key() -> IdentityKey {
+        let keys = vectors("keys.json");
+        let alice = keys["identities"]
+            .as_array()
+            .expect("identities")
+            .iter()
+            .find(|identity| identity["name"] == "alice")
+            .expect("alice")
+            .clone();
+        IdentityKey::from_secret(hex32(&alice["secret_hex"]))
+    }
+
+    /// A chain item at `seq` of the signer's operation `kind`, shown in full only to
+    /// `only_for` when given.
+    fn op_row(seq: u64, kind: OpKind, only_for: Option<[u8; 16]>) -> FeedRow {
+        let key = alice_key();
+        let ops = pubky_switch_core::ops::sign_batch(
+            &key,
+            &key.public(),
+            None,
+            1,
+            [seq.to_le_bytes()[0]; 16],
+            vec![(Vec::new(), kind)],
+        )
+        .expect("batch");
+        FeedRow {
+            seq,
+            item_type: ItemType::Op,
+            item: Some(ops[0].signed().clone()),
+            stub: row(3).stub,
+            proof: None,
+            only_for,
+        }
+    }
+
+    fn full(row: &FeedRow, reader: &AppCert, current: &CurrentDocs) -> bool {
+        matches!(
+            shows(row, reader, current).expect("shows"),
+            Shown::Full { .. }
+        )
+    }
+
+    #[test]
+    fn test_feed_visibility_of_the_lists() {
+        use pubky_switch_core::ops::{AllowKind, InviteCodePut, InviteContext};
+        let current = CurrentDocs::default();
+        let none = reader(&["pay"], &[]);
+        let lists = reader(&["pay"], &[Permission::ListsRead]);
+        let adder = reader(&["pay"], &[Permission::ConversationAdd]);
+        for kind in [
+            OpKind::AllowPut {
+                pubky: [1; 32],
+                kind: AllowKind::Contact,
+            },
+            OpKind::AllowDelete {
+                pubky: [1; 32],
+                kind: AllowKind::Conversation,
+            },
+            OpKind::DenyPut { pubky: [1; 32] },
+            OpKind::DenyDelete { pubky: [1; 32] },
+        ] {
+            let row = op_row(20, kind, None);
+            // allow.* and deny.*: lists.read only, not conversation.add.
+            assert!(full(&row, &lists, &current));
+            assert!(!full(&row, &adder, &current));
+            assert!(!full(&row, &none, &current));
+        }
+        for kind in [
+            OpKind::InviteCodePut(InviteCodePut {
+                code_hash: [2; 32],
+                expires_at: 1,
+                max_uses: 1,
+                context: InviteContext::new(serde_json::json!({ "order": 7 })),
+            }),
+            OpKind::InviteCodeDelete { code_hash: [2; 32] },
+        ] {
+            // invite_code.*: lists.read or conversation.add.
+            let row = op_row(21, kind, None);
+            assert!(full(&row, &lists, &current));
+            assert!(full(&row, &adder, &current));
+            assert!(!full(&row, &none, &current));
+        }
+    }
+
+    #[test]
+    fn test_feed_visibility_of_conversation_add() {
+        let context = serde_json::json!({ "order": 7 });
+        let transition = ServiceTransition::ConversationAdd {
+            pubky: [1; 32],
+            code_hash: [2; 32],
+            context: context.clone(),
+            at: 0,
+        };
+        let signed = transition
+            .sign(
+                &ed25519_dalek::SigningKey::from_bytes(&[5; 32]),
+                &alice_key().public(),
+            )
+            .expect("sign");
+        let row = FeedRow {
+            seq: 22,
+            item_type: ItemType::Service,
+            item: Some(signed),
+            stub: row(3).stub,
+            proof: None,
+            only_for: None,
+        };
+        let current = CurrentDocs::default();
+        // lists.read sees it, with the invite code's context; conversation.add alone doesn't.
+        assert_eq!(
+            shows(&row, &reader(&[], &[Permission::ListsRead]), &current).expect("shows"),
+            Shown::Full {
+                context: Some(context)
+            }
+        );
+        assert_eq!(
+            shows(&row, &reader(&[], &[Permission::ConversationAdd]), &current).expect("shows"),
+            Shown::Stub
+        );
+        let item: Value = serde_json::from_slice(&item_json(
+            &row,
+            Shown::Full {
+                context: Some(serde_json::json!({ "order": 7 })),
+            },
+        ))
+        .expect("json");
+        assert_eq!(item["context"], serde_json::json!({ "order": 7 }));
+    }
+
+    #[test]
+    fn test_feed_visibility_of_key_bundles_and_renewed_certificates() {
+        use pubky_switch_core::ops::KeyBundlePut;
+        let target = reader(&["pay"], &[]);
+        let other = reader_keyed(
+            [9; 32],
+            &["pay"],
+            &[Permission::ClaimsRead, Permission::ListsRead],
+        );
+        let part =
+            pubky_switch_core::records::seal_bundle_parts(&alice_key(), &target, 1, 1, &|_| true)
+                .expect("bundle")
+                .remove(0);
+        let bundle = op_row(
+            23,
+            OpKind::KeyBundlePut(KeyBundlePut {
+                target_app_id: target.app_id(),
+                bundle: part.bundle,
+                first_epoch: 1,
+                last_epoch: 1,
+            }),
+            Some(target.app_id()),
+        );
+        let mut current = CurrentDocs::default();
+        current.bundles.insert(23);
+        // Only its target reads a stored part; a part replaced since is a stub to it too.
+        assert!(full(&bundle, &target, &current));
+        assert!(!full(&bundle, &other, &current));
+        current.bundles.clear();
+        assert!(!full(&bundle, &target, &current));
+        // A cert.put is shown while its certificate is the one stored, to every own app.
+        let cert = op_row(
+            24,
+            OpKind::CertPut {
+                target_app_id: target.app_id(),
+                cert: target.signed().clone(),
+            },
+            None,
+        );
+        current.apps.insert(
+            target.app_id(),
+            AppDocs {
+                record: None,
+                renewed_cert: Some(target.signed().clone()),
+            },
+        );
+        assert!(full(&cert, &other, &current));
+        // Replaced, or carried by the record since, which drops it: a stub.
+        current.apps.insert(target.app_id(), AppDocs::default());
+        assert!(!full(&cert, &other, &current));
+    }
+
+    #[tokio::test]
+    async fn test_feed_long_poll_sees_a_change_during_its_read() {
+        // A change committed while the first read runs wakes the wait: the subscription comes
+        // before the read, and each wake-up is marked seen before the read after it.
+        let hub = ChangeHub::new();
+        let reads = std::cell::Cell::new(0u32);
+        let started = std::time::Instant::now();
+        let answer: Result<u32, ()> = long_poll(&hub, "account", Duration::from_secs(10), || {
+            let call = reads.get() + 1;
+            reads.set(call);
+            let hub = hub.clone();
+            async move {
+                if call == 1 {
+                    hub.notify("account");
+                    Ok(Polled::Empty(call))
+                } else {
+                    Ok(Polled::Ready(call))
+                }
+            }
+        })
+        .await;
+        assert_eq!(answer, Ok(2));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "woken, not waited out"
+        );
+    }
+
     fn snapshot(start: u64, window_end: u64, last_seq: u64) -> FeedSnapshot {
         FeedSnapshot {
             generation: 1,
@@ -678,13 +1153,15 @@ mod tests {
             start,
             window_end,
             current: current_at_nine(),
+            ..FeedSnapshot::default()
         }
     }
 
     /// The seqs of the page `reader` reads of `chain.json` from `snapshot`.
     fn page(snapshot: &FeedSnapshot, limit: usize, budget: usize) -> (Vec<u64>, u64, bool) {
         let reader = reader(&["pay"], &[Permission::ClaimsRead]);
-        let mut builder = PageBuilder::new(&reader, limit, budget);
+        let mut builder = PageBuilder::new(reader, limit, budget);
+        assert!(builder.begin(snapshot));
         for row in rows()
             .into_iter()
             .filter(|row| row.seq > snapshot.start && row.seq <= 9)
@@ -697,7 +1174,10 @@ mod tests {
         let seqs = page
             .items
             .iter()
-            .map(|item| item["seq"].as_u64().expect("seq"))
+            .map(|item| {
+                let item: Value = serde_json::from_slice(item).expect("json");
+                item["seq"].as_u64().expect("seq")
+            })
             .collect();
         (seqs, page.scanned_through, page.more)
     }

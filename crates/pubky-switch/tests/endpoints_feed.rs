@@ -11,13 +11,22 @@ mod support;
 
 use std::time::Duration;
 
-use pubky_switch::{changes::ChangeListener, http::Handler, http::SwitchResponse, limits::Limits};
+use pubky_switch::{
+    changes::ChangeListener,
+    http::Handler,
+    http::SwitchResponse,
+    keys::{KeyId, KeyStore, Mark},
+    limits::Limits,
+};
 use pubky_switch_core::{
+    claims::{ClaimFields, ClaimType},
+    enc::pubky_key,
     http::header,
-    ops::{OpsRequest, SignedOp},
+    ops::{Condition, OpKind, OpsRequest, SignedOp, sign_batch},
     sig::SignedDoc,
 };
 use serde_json::{Value, json};
+use sqlx::Connection;
 use support::*;
 
 fn alice_id() -> String {
@@ -109,6 +118,26 @@ async fn test_feed_vectors_page_after_the_registration() {
         header_text(&answer, header::HEAD),
         expected["headers"]["switch-head"].as_str(),
         "Switch-Head"
+    );
+    // As bytes too, in the member order of the vector: each of seqs 7, 8 and 9, and the
+    // members after the items, appear in the vector's body exactly as this page writes
+    // them. The whole body differs only by the entry at seq 5 and the stub at seq 6.
+    let text = String::from_utf8(answer.body.clone()).expect("utf-8");
+    for seq in [7, 8, 9] {
+        let start = text
+            .find(&format!("{{\"type\":\"chain\",\"seq\":{seq},"))
+            .unwrap_or_else(|| panic!("seq {seq}"));
+        let end = text[start..]
+            .find(",{\"type\":")
+            .or_else(|| text[start..].find("],\"next\""))
+            .expect("end")
+            + start;
+        assert!(page_text.contains(&text[start..end]), "seq {seq} as bytes");
+    }
+    let tail = &text[text.find("],\"next\"").expect("tail")..];
+    assert!(
+        page_text.ends_with(tail),
+        "the members after the items as bytes"
     );
     replay.db.drop_database().await.expect("drop");
 }
@@ -282,5 +311,301 @@ async fn test_feed_long_poll_answers_when_the_wait_ends() {
     let page = body(&read(&replay, "wallet", "?after=1:8&wait=25", &revoke_time()).await);
     assert!(started.elapsed() < Duration::from_secs(5), "at once");
     assert_eq!(seqs(&page), vec![9]);
+    replay.db.drop_database().await.expect("drop");
+}
+
+fn app_batch(name: &str, id: u8, kinds: Vec<(Vec<Condition>, OpKind)>) -> Vec<SignedOp> {
+    let keys = vectors("keys.json");
+    let entry = app(&keys, name);
+    let key = ed25519_dalek::SigningKey::from_bytes(&hex32(&entry["signing_secret_hex"]));
+    let app_id: [u8; 16] = hex::decode(entry["app_id_bytes_hex"].as_str().expect("hex"))
+        .expect("hex")
+        .try_into()
+        .expect("16");
+    sign_batch(
+        &key,
+        &pubky_key(&alice_id()).expect("key"),
+        Some(app_id),
+        1,
+        [id; 16],
+        kinds,
+    )
+    .expect("batch")
+}
+
+async fn post(replay: &Replay, name: &str, ops: &[SignedOp], at_ms: u64) -> SwitchResponse {
+    let keys = vectors("keys.json");
+    let body = OpsRequest::new(ops, None).to_json();
+    let path = format!("/v1/{}/ops", alice_id());
+    replay
+        .service
+        .handle(app_request(app(&keys, name), "POST", &path, body, at_ms))
+        .await
+}
+
+fn attempt(key: u8) -> (Vec<Condition>, OpKind) {
+    (
+        Vec::new(),
+        OpKind::Claim(ClaimFields {
+            claim_key: vec![key; 32],
+            kind: ClaimType::Attempt,
+            expected_step: 0,
+            attempt_id: vec![8; 16],
+            orphan_after: Some(60),
+            deadline: None,
+            basis: None,
+            evidence_ref: None,
+        }),
+    )
+}
+
+async fn listen(
+    replay: &Replay,
+) -> (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<()>,
+) {
+    let listener = ChangeListener::connect(replay.db.store())
+        .await
+        .expect("listen");
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let task = tokio::spawn(listener.run(replay.service.changes(), async {
+        let _ = stopped.await;
+    }));
+    (stop, task)
+}
+
+#[tokio::test]
+async fn test_feed_long_poll_of_an_app_revoked_meanwhile_is_refused() {
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let record: SignedDoc = serde_json::from_value(
+        named(
+            &vectors("documents.json")["documents"],
+            "executor app record",
+        )["signed"]
+            .clone(),
+    )
+    .expect("record");
+    let at = "2026-01-01T00:00:10.000Z";
+    set_time(&replay.clock, at);
+    // The executor registers: seq 10.
+    let answer = post(
+        &replay,
+        "executor",
+        &app_batch(
+            "executor",
+            40,
+            vec![(Vec::new(), OpKind::AppPut { record })],
+        ),
+        ms(at),
+    )
+    .await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    let (stop, task) = listen(&replay).await;
+    let keys = vectors("keys.json");
+    let wallet = app(&keys, "wallet")["app_id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    // The wallet waits after seq 11, its revocation's; the executor's attempt after the
+    // revocation (seq 12) wakes the poll.
+    let (answer, ()) = tokio::join!(read(&replay, "wallet", "?after=1:11&wait=10", at), async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let path = format!("/v1/{}/apps/{wallet}/revoke", alice_id());
+        let revoked = replay
+            .service
+            .handle(signer_request("POST", &path, Vec::new(), ms(at)))
+            .await;
+        assert_eq!(revoked.status, 200, "revoked");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let written = post(
+            &replay,
+            "executor",
+            &app_batch("executor", 41, vec![attempt(9)]),
+            ms(at),
+        )
+        .await;
+        assert_eq!(
+            written.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&written.body)
+        );
+    });
+    // Refused as a fresh request is, with the head: nothing of seq 12 reaches it.
+    assert_eq!(
+        (answer.status, body(&answer)["code"].clone()),
+        (403, json!("not_current"))
+    );
+    assert!(header_text(&answer, header::HEAD).is_some(), "Switch-Head");
+    let fresh = read(&replay, "wallet", "?after=1:11", at).await;
+    assert_eq!(fresh.status, 403);
+    let _ = stop.send(());
+    task.await.expect("listener");
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_feed_long_poll_answers_at_the_time_it_reads() {
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let (stop, task) = listen(&replay).await;
+    let early = "2026-01-01T00:00:04.000Z";
+    set_time(&replay.clock, early);
+    let chain = vectors("chain.json");
+    let late = item_time(&chain["record_delete"]["item"]);
+    let mut write_time = None;
+    let (answer, ()) = tokio::join!(
+        read(&replay, "wallet", "?after=1:9&wait=10", early),
+        async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            set_time(&replay.clock, &late);
+            delete_record(&replay).await;
+            write_time = Some(rfc3339_of(&late));
+        }
+    );
+    assert_eq!(seqs(&body(&answer)), vec![10]);
+    // Signed at the time the page was read, never behind what it shows or an answer sent
+    // before it (Switch spec 10.1).
+    assert_eq!(
+        header_text(&answer, header::SERVER_TIME).map(str::to_string),
+        write_time
+    );
+    let _ = stop.send(());
+    task.await.expect("listener");
+    replay.db.drop_database().await.expect("drop");
+}
+
+fn rfc3339_of(text: &str) -> String {
+    pubky_switch_core::time::rfc3339(ms(text))
+}
+
+#[tokio::test]
+async fn test_feed_refuses_an_app_of_another_identity() {
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let keys = vectors("keys.json");
+    let shop = app(&keys, "shop");
+    let key = ed25519_dalek::SigningKey::from_bytes(&hex32(&shop["signing_secret_hex"]));
+    let request = signed_request(
+        &key,
+        shop["identity"].as_str().expect("identity"),
+        Some(shop["app_id"].as_str().expect("app")),
+        "GET",
+        &format!("/v1/{}/feed", alice_id()),
+        Vec::new(),
+        ms(&revoke_time()),
+    );
+    let answer = replay.service.handle(request).await;
+    assert_eq!(
+        (answer.status, body(&answer)["code"].clone()),
+        (403, json!("permission_missing"))
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+async fn service_key(replay: &Replay) -> KeyId {
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    let id: String = sqlx::query_scalar("SELECT service_key FROM accounts WHERE id = $1")
+        .bind(alice_id())
+        .fetch_one(&mut conn)
+        .await
+        .expect("key");
+    KeyId::parse(&id).expect("key id")
+}
+
+async fn sql(replay: &Replay, statement: &str) {
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    sqlx::query(statement)
+        .bind(alice_id())
+        .execute(&mut conn)
+        .await
+        .expect("statement");
+}
+
+#[tokio::test]
+async fn test_feed_moves_the_mark_to_the_head_it_shows() {
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let key = service_key(&replay).await;
+    // A head committed meanwhile by a request that hasn't moved the mark yet: the page
+    // shows it, so the mark moves to it before the answer goes out.
+    let at = revoke_time();
+    let (answer, ()) = tokio::join!(read(&replay, "wallet", "?after=1:9&wait=1", &at), async {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        sql(
+                &replay,
+                "UPDATE accounts SET last_seq = 10, chain_seq = 10, chain_hash = decode(repeat('ab', 32), 'hex') \
+                 WHERE id = $1",
+            )
+            .await;
+    });
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    assert_eq!(body(&answer)["head"]["seq"], 10);
+    assert_eq!(
+        replay.keys.mark(&key).await.expect("mark"),
+        Some(Mark {
+            generation: 1,
+            seq: 10,
+            chain_hash: [0xab; 32],
+        })
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_feed_refuses_a_head_behind_the_mark() {
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let key = service_key(&replay).await;
+    // The key signed a head beyond the state the page reads: the page is refused with the
+    // mark's 503, which carries no head.
+    let at = revoke_time();
+    let (answer, ()) = tokio::join!(read(&replay, "wallet", "?after=1:9&wait=1", &at), async {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let mark = Mark {
+            generation: 1,
+            seq: 50,
+            chain_hash: [0xcd; 32],
+        };
+        replay.keys.advance_mark(&key, mark).await.expect("mark");
+    });
+    assert_eq!(
+        (answer.status, body(&answer)["code"].clone()),
+        (503, json!("unavailable"))
+    );
+    assert!(header_text(&answer, header::HEAD).is_none());
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_feed_of_an_account_erased_meanwhile_is_unknown() {
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let at = revoke_time();
+    let (answer, ()) = tokio::join!(read(&replay, "wallet", "?after=1:9&wait=1", &at), async {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        sql(&replay, "DELETE FROM accounts WHERE id = $1").await;
+    });
+    assert_eq!(
+        (answer.status, body(&answer)["code"].clone()),
+        (404, json!("not_found"))
+    );
+    assert!(header_text(&answer, header::HEAD).is_none());
     replay.db.drop_database().await.expect("drop");
 }

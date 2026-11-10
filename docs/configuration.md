@@ -157,6 +157,8 @@ PostgreSQL.
 | `migrate_on_start` | `true` | apply pending schema migrations at start; safe with several instances |
 | `connect_retry_ms` | `30000` | how long the service keeps trying to reach the database at start, while it refuses connections or is still starting up, before it exits |
 
+**Migrations on a large database.** Each migration runs in one transaction, and some take exclusive locks for their duration. `0008_feed` backfills every operation's proof into `chain_items` and builds two indexes without `CONCURRENTLY`, so `chain_items`, `shared_records` and `claim_entries` take no writes until it finishes. It is sized for a small database. On a large one, run it in a maintenance window, with `migrate_on_start` off on every instance but one.
+
 ### `[keys]`
 
 | Setting | Default | Meaning |

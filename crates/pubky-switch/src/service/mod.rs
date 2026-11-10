@@ -561,6 +561,13 @@ impl Service {
                 (Answer::error(&error).with_head(head), serving)
             }
         };
+        // A read answered once the lock is gone answers a refusal with the head this request
+        // commits, as every refusal to a verified caller carries one (Switch wire 7.1).
+        let fallback_head = if answer.deferred.is_some() {
+            self.head(&txn, &signer).await
+        } else {
+            None
+        };
         // Durable, then answered (step 10). An answer is sent even when the request only
         // stamped the time, which must be durable before it is shown. A serving account's
         // commit moves the key's mark to the head the answer carries.
@@ -582,12 +589,37 @@ impl Service {
                 match answer.deferred.take() {
                     Some(Deferred::Claim(read)) => match self.claim_body(&read).await {
                         Ok(body) => answer.body = body,
-                        Err(error) => answer = Answer::error(&error),
+                        Err(error) => answer = Answer::error(&error).with_head(fallback_head),
                     },
-                    Some(Deferred::Feed(read)) => match self.feed_page(&read, &signer).await {
-                        Ok(page) => answer = page,
-                        Err(error) => answer = Answer::error(&error),
-                    },
+                    Some(Deferred::Feed(read)) => {
+                        return match self.feed_page(&read, &signer).await {
+                            Ok((page, at)) => sign_answer(&signer, signature, at, page),
+                            // Erased while the read waited: as an unknown account (step 2).
+                            Err(feed::FeedStop::Gone) => {
+                                let error = ApiError::not_found("no such account");
+                                self.operator_answer(signature, base_ms, &error).await
+                            }
+                            // Its key retired while the read waited: never signed with it.
+                            Err(feed::FeedStop::Retired) => {
+                                let error = ApiError::unavailable("7.6: a temporary failure");
+                                self.operator_answer(signature, base_ms, &error).await
+                            }
+                            Err(feed::FeedStop::Refused {
+                                error,
+                                head,
+                                fallback,
+                                time_ms: at,
+                            }) => {
+                                let head = if fallback { fallback_head } else { head };
+                                sign_answer(
+                                    &signer,
+                                    signature,
+                                    at,
+                                    Answer::error(&error).with_head(head),
+                                )
+                            }
+                        };
+                    }
                     None => {}
                 }
                 sign_answer(&signer, signature, time_ms, answer)
@@ -725,6 +757,7 @@ impl Service {
                         &head.service_key,
                         writer.as_ref(),
                         &request.route.query,
+                        time_ms,
                     )
                     .map(|answer| (answer, serving))
                     .map_err(|error| Refused::with_head(error, serving));
@@ -772,6 +805,13 @@ impl Service {
                 }
             })?;
         if let Caller::OtherApp { .. } = claimed.caller {
+            // The feed is for own apps only (Switch wire 7.4.4).
+            if request.route.call == Call::Feed {
+                return Err(ApiError::new(
+                    ErrorCode::PermissionMissing,
+                    "7.4.4: only own apps read the feed",
+                ));
+            }
             return Err(ApiError::new(
                 ErrorCode::NotAdmitted,
                 "6.4: an app of another identity doesn't write here",
