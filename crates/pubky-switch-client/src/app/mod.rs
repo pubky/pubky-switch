@@ -331,6 +331,13 @@ pub struct AppBackup {
     protocol: Option<LayerOut>,
 }
 
+/// The version a backup with a protocol layer carries, in place of [`SCHEMA_VERSION`]: a
+/// reader that knows no layers, which takes only that version, refuses such a backup
+/// rather than restore it without the layer. A schema change gives both kinds of backup
+/// new versions.
+const LAYERED_BACKUP_VERSION: u32 = 2;
+const _: () = assert!(LAYERED_BACKUP_VERSION != SCHEMA_VERSION);
+
 /// A [`ProtocolLayer`] as a backup's bytes carry it, with what the app's feed holds beyond
 /// its cursor at the same moment: the entries processed past a held one, the entries
 /// stored locally, and the processed pairs (Switch spec 11). The layer reflects those
@@ -366,15 +373,22 @@ impl AppBackup {
             .map_err(|_| AppError::Store(StoreError::Other("the backup can't be written".into())))
     }
 
-    /// Read a backup's bytes.
+    /// Read a backup's bytes. A backup with a protocol layer carries a version of its own,
+    /// which a reader from before layers refuses, so none restores it without the layer.
     ///
     /// # Errors
     ///
-    /// [`AppError::InvalidData`] if they don't read as a backup of this schema.
+    /// [`AppError::InvalidData`] if they don't read as a backup of this schema, or their
+    /// version isn't the one of a backup with, or without, a layer.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, AppError> {
         let backup: Self = serde_json::from_slice(bytes)
             .map_err(|_| AppError::InvalidData("the backup doesn't read".into()))?;
-        if backup.v != SCHEMA_VERSION {
+        let expected = if backup.protocol.is_some() {
+            LAYERED_BACKUP_VERSION
+        } else {
+            SCHEMA_VERSION
+        };
+        if backup.v != expected {
             return Err(AppError::InvalidData(
                 "the backup is of another schema version".into(),
             ));
@@ -871,6 +885,7 @@ impl App {
     ) -> Result<AppBackup, AppError> {
         Box::pin(async move {
             let mut backup = self.backup()?;
+            backup.v = LAYERED_BACKUP_VERSION;
             let processed = self.reader().scan::<Processed>("proc/").await?;
             backup.protocol = Some(LayerOut {
                 name: layer.protocol,

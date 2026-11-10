@@ -940,6 +940,51 @@ async fn test_backup_with_a_layer_that_could_never_be_restored_is_refused() {
 }
 
 #[tokio::test]
+async fn test_backup_with_a_layer_carries_a_version_a_reader_without_layers_refuses() {
+    let w = World::new();
+    let protocol = JournalProtocol::new(Some(JOURNAL));
+    let (app, _) = journaled(
+        &w,
+        &protocol,
+        &Arc::new(MemoryStore::new()),
+        b"at the backup",
+        journal_layer(JOURNAL, b"at the backup"),
+    )
+    .await;
+    let version = |bytes: &[u8]| serde_json::from_slice::<Value>(bytes).unwrap()["v"].clone();
+    let with = |bytes: &[u8], v: u32| {
+        let mut value: Value = serde_json::from_slice(bytes).unwrap();
+        value["v"] = json!(v);
+        serde_json::to_vec(&value).unwrap()
+    };
+    let bare = app.backup().unwrap().to_bytes().unwrap();
+    let layered = app
+        .backup_with_protocol_layer(journal_layer(JOURNAL, b"at the backup"))
+        .await
+        .unwrap()
+        .to_bytes()
+        .unwrap();
+    // Without a layer, the schema's version, as before; with one, another, which a reader
+    // that takes only the schema's version refuses.
+    assert_eq!(version(&bare), json!(crate::app::SCHEMA_VERSION));
+    assert_ne!(version(&layered), json!(crate::app::SCHEMA_VERSION));
+    assert!(AppBackup::from_bytes(&bare).is_ok());
+    assert!(AppBackup::from_bytes(&layered).is_ok());
+    // A layer under the schema's version, or the layered version without a layer, doesn't
+    // read.
+    let layer_as_bare = with(&layered, crate::app::SCHEMA_VERSION);
+    assert!(matches!(
+        AppBackup::from_bytes(&layer_as_bare),
+        Err(AppError::InvalidData(_))
+    ));
+    let bare_as_layered = with(&bare, version(&layered).as_u64().unwrap() as u32);
+    assert!(matches!(
+        AppBackup::from_bytes(&bare_as_layered),
+        Err(AppError::InvalidData(_))
+    ));
+}
+
+#[tokio::test]
 async fn test_restore_layer_of_a_protocol_not_registered_is_refused() {
     let w = World::new();
     let protocol = JournalProtocol::new(Some(JOURNAL));
