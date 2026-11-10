@@ -873,6 +873,37 @@ async fn test_inbox_removed_app_and_closed_renewal() {
 }
 
 #[tokio::test]
+async fn test_inbox_retry_gets_the_original_answer() {
+    let Some(replay) = replay().await else { return };
+    with_bob(&replay).await;
+    let version = apps_version(&replay).await;
+    let envelope = to_wallet(33, false);
+    let first = from_shop(&replay, envelope.clone(), Some(version), None).await;
+    assert_eq!(
+        first.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&first.body)
+    );
+    assert_eq!(body(&first)["known_version"], 1);
+    // bob's version 2 lists the shop as removed. The shop's retry still gets the original
+    // answer, byte for byte, and so learns nothing of the version held now.
+    let shop = shop_app_id();
+    deliver_bob_version(&replay, |body| {
+        body.apps.retain(|listed| listed.app_id != shop);
+        body.removed.push(pubky_switch_core::records::RemovedApp {
+            app_id: shop,
+            distrust_from: 0,
+        });
+    })
+    .await;
+    let retry = from_shop(&replay, envelope, Some(version), None).await;
+    assert_eq!(retry.status, 200);
+    assert_eq!(retry.body, first.body);
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
 async fn test_inbox_code_only_append_needs_trusted_time() {
     let Some(replay) = replay().await else { return };
     replay_chain_through_revoke(&replay).await;

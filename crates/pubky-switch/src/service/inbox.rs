@@ -59,7 +59,7 @@ fn identity_needed(version: Option<u64>) -> ApiError {
 }
 
 /// The append's answer, `{ entry_id, accepted_at, directory_version }`, in the order of
-/// 7.4.3's table; `known_version` is added for an app of another identity when it is sent.
+/// 7.4.3's table; `known_version` is added for an app of another identity.
 fn stored_answer(entry_id: &[u8; 16], accepted_at: u64, directory_version: u64) -> Vec<u8> {
     format!(
         "{{\"entry_id\":\"{}\",\"accepted_at\":\"{}\",\"directory_version\":{}}}",
@@ -70,7 +70,7 @@ fn stored_answer(entry_id: &[u8; 16], accepted_at: u64, directory_version: u64) 
     .into_bytes()
 }
 
-/// A stored answer with `known_version` added at its end, for an app of another identity.
+/// An answer with `known_version` added at its end, for an app of another identity.
 fn with_known_version(stored: &[u8], known: Option<u64>) -> Vec<u8> {
     let mut body = stored.to_vec();
     if body.last() == Some(&b'}') {
@@ -127,13 +127,12 @@ impl Service {
             .await
             .map_err(|e| store_error(&e))?
         {
-            return self
-                .answer(txn, signer, &stored, other.then_some(sender))
-                .await;
+            return self.answer(txn, signer, stored, other).await;
         }
 
         // Check 2: admission and the listing, for an app of another identity.
         let mut by_code = None;
+        let mut known = None;
         if other {
             // Read from its own column, not the document: a refusal costs the same whether
             // or not a copy is held.
@@ -186,6 +185,7 @@ impl Service {
                 }
                 _ => return Err(identity_needed(copy.as_ref().map(IdentityDoc::version))),
             }
+            known = copy.as_ref().map(IdentityDoc::version);
         }
 
         // Check 3: size and header (Switch wire 4.4).
@@ -284,7 +284,12 @@ impl Service {
             .directory_versions()
             .await
             .map_err(|e| store_error(&e))?;
-        let stored = stored_answer(&entry_id, time_ms, directory_version);
+        // The whole answer is stored, `known_version` as it is now: a retry gets this
+        // original answer (check 1), so an app that is removed later learns nothing new.
+        let mut stored = stored_answer(&entry_id, time_ms, directory_version);
+        if other {
+            stored = with_known_version(&stored, known);
+        }
         txn.add_entry(&NewEntry {
             seq,
             entry_id,
@@ -301,34 +306,23 @@ impl Service {
         })
         .await
         .map_err(|e| store_error(&e))?;
-        self.answer(txn, signer, &stored, other.then_some(sender))
-            .await
+        self.answer(txn, signer, stored, other).await
     }
 
-    /// An append's answer: for an own app with the head; for an app of another identity
-    /// with `known_version`, the version of its identity's `identity.json` the service holds,
-    /// and no head (Switch wire 7.1).
+    /// An append's stored answer: to an own app with the head; to an app of another
+    /// identity (`other`) as stored, with its `known_version` and no head (Switch wire 7.1).
     async fn answer(
         &self,
         txn: &mut AccountTxn,
         signer: &ServiceSigner,
-        stored: &[u8],
-        other: Option<[u8; 32]>,
+        stored: Vec<u8>,
+        other: bool,
     ) -> Result<Answer, ApiError> {
-        match other {
-            Some(sender) => {
-                let known = txn
-                    .peer_copy(&sender)
-                    .await
-                    .map_err(|e| store_error(&e))?
-                    .map(|copy| copy.version);
-                Ok(Answer::ok(with_known_version(stored, known)))
-            }
-            None => {
-                let head = self.head(txn, signer).await.ok_or_else(temporary)?;
-                Ok(Answer::ok(stored.to_vec()).with_head(Some(head)))
-            }
+        if other {
+            return Ok(Answer::ok(stored));
         }
+        let head = self.head(txn, signer).await.ok_or_else(temporary)?;
+        Ok(Answer::ok(stored).with_head(Some(head)))
     }
 
     /// The target apps of an envelope whose header wraps to `header`'s kids, or `409
