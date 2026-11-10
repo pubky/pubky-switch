@@ -675,18 +675,17 @@ impl Service {
                                 let error = ApiError::unavailable("7.6: a temporary failure");
                                 self.operator_answer(signature, base_ms, &error).await
                             }
-                            Err(feed::FeedStop::Refused {
-                                error,
-                                head,
-                                fallback,
-                                time_ms: at,
-                            }) => {
-                                let head = if fallback { fallback_head } else { head };
+                            Err(feed::FeedStop::Refused(refusal)) => {
+                                let head = if refusal.fallback {
+                                    fallback_head
+                                } else {
+                                    refusal.head
+                                };
                                 sign_answer(
                                     &signer,
                                     signature,
-                                    at,
-                                    Answer::error(&error).with_head(head),
+                                    refusal.time_ms,
+                                    Answer::error(&refusal.error).with_head(head),
                                 )
                             }
                         };

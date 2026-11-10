@@ -116,18 +116,33 @@ pub(super) enum FeedStop {
     /// The account's key changed since the request: a temporary failure, signed with the
     /// operator key, since the request's key is retired.
     Retired,
-    /// An error answer at `time_ms`: with `head`, or, for `fallback`, with the head the
-    /// request committed; neither for the mark's `503` or an unauthenticated reader.
-    Refused {
-        /// The error.
-        error: Box<ApiError>,
-        /// The page's signed head.
-        head: Option<SignedHead>,
-        /// Whether it carries the request's own head instead.
-        fallback: bool,
-        /// The service time to sign at.
-        time_ms: u64,
-    },
+    /// An error answer.
+    Refused(Box<PageRefusal>),
+}
+
+/// An error answer to a feed read, at `time_ms`: with `head`, or, for `fallback`, with the
+/// head the request committed; neither for the mark's `503` or an unauthenticated reader.
+#[derive(Debug)]
+pub(super) struct PageRefusal {
+    /// The error.
+    pub(super) error: ApiError,
+    /// The page's signed head.
+    pub(super) head: Option<SignedHead>,
+    /// Whether it carries the request's own head instead.
+    pub(super) fallback: bool,
+    /// The service time to sign at.
+    pub(super) time_ms: u64,
+}
+
+impl FeedStop {
+    fn refused(error: ApiError, head: Option<SignedHead>, fallback: bool, time_ms: u64) -> Self {
+        Self::Refused(Box::new(PageRefusal {
+            error,
+            head,
+            fallback,
+            time_ms,
+        }))
+    }
 }
 
 /// How an item shows to a reader (Switch wire 7.5).
@@ -616,12 +631,7 @@ impl Service {
             self.keys
                 .advance_mark(&read.service_key, mark)
                 .await
-                .map_err(|_| FeedStop::Refused {
-                    error: Box::new(temporary()),
-                    head: None,
-                    fallback: false,
-                    time_ms: answered.time_ms,
-                })?;
+                .map_err(|_| FeedStop::refused(temporary(), None, false, answered.time_ms))?;
         }
         Ok((answered.answer(), answered.time_ms))
     }
@@ -633,12 +643,7 @@ impl Service {
         read: &FeedRead,
         signer: &ServiceSigner,
     ) -> Result<Answered, FeedStop> {
-        let fallback = |error: ApiError, time_ms| FeedStop::Refused {
-            error: Box::new(error),
-            head: None,
-            fallback: true,
-            time_ms,
-        };
+        let fallback = |error: ApiError, time_ms| FeedStop::refused(error, None, true, time_ms);
         let mark = self
             .keys
             .mark(&read.service_key)
@@ -679,31 +684,21 @@ impl Service {
             chain_hash,
         };
         let head = sign_head(signer, mark.as_ref(), &read.identity_key, &tip).map_err(|_| {
-            FeedStop::Refused {
-                error: Box::new(ApiError::unavailable(
+            FeedStop::refused(
+                ApiError::unavailable(
                     "7.3: the state is behind its service key's mark; a new generation is needed",
-                )),
-                head: None,
-                fallback: false,
+                ),
+                None,
+                false,
                 time_ms,
-            }
+            )
         })?;
         match builder.refusal.take() {
             Some(Stop::Refused(error)) => {
-                return Err(FeedStop::Refused {
-                    error: Box::new(error),
-                    head: Some(head),
-                    fallback: false,
-                    time_ms,
-                });
+                return Err(FeedStop::refused(error, Some(head), false, time_ms));
             }
             Some(Stop::Unauthenticated(error)) => {
-                return Err(FeedStop::Refused {
-                    error: Box::new(error),
-                    head: None,
-                    fallback: false,
-                    time_ms,
-                });
+                return Err(FeedStop::refused(error, None, false, time_ms));
             }
             None => {}
         }
