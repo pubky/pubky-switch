@@ -23,6 +23,7 @@ pub mod http;
 pub mod keys;
 pub mod limits;
 pub mod ratelimit;
+pub mod service;
 pub mod store;
 pub mod telemetry;
 pub mod time;

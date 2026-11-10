@@ -6,7 +6,9 @@ use clap::{Parser, Subcommand};
 use pubky_switch::{
     admin::{self, AdminState},
     config::Config,
+    http,
     keys::{FileKeyStore, KeyStoreReadiness},
+    service::Service,
     store::{Store, StoreReadiness},
     telemetry,
     time::{SystemClock, TrustedTime, roughtime::RoughtimeSource},
@@ -124,6 +126,39 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("database schema up to date");
     }
 
+    // Ctrl-C or SIGTERM stops every listener and the time sampler.
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        let _ = stop.send(true);
+    });
+    let until_stopped = |mut stopped: tokio::sync::watch::Receiver<bool>| async move {
+        let _ = stopped.wait_for(|stop| *stop).await;
+    };
+
+    let api = match config.server.origin.clone() {
+        Some(origin) => {
+            let service = Arc::new(Service::new(
+                origin.clone(),
+                store.clone(),
+                Arc::new(keys.clone()),
+                time.clone(),
+                config.limits.clone(),
+            ));
+            let router = http::router(service, config.server.proxy.clone());
+            let listener = tokio::net::TcpListener::bind(config.server.listen).await?;
+            tracing::info!(api = %listener.local_addr()?, %origin, "serving the API");
+            Some(tokio::spawn(http::serve(
+                listener,
+                router,
+                until_stopped(stopped.clone()),
+            )))
+        }
+        None => {
+            tracing::warn!("no server.origin: the API listener is off");
+            None
+        }
+    };
+
     let admin_state = AdminState::new(time, Some(metrics))
         .with_check(Arc::new(StoreReadiness(store.clone())))
         .with_check(Arc::new(KeyStoreReadiness(keys.clone())));
@@ -135,9 +170,11 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         "pubky-switch started"
     );
     axum::serve(listener, admin)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(until_stopped(stopped.clone()))
         .await?;
-    let _ = stop.send(true);
+    if let Some(api) = api {
+        api.await??;
+    }
     drop(stopped);
     store.close().await;
     tracing::info!("pubky-switch stopped");
