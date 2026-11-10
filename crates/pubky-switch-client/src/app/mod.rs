@@ -855,9 +855,16 @@ impl App {
     /// stored locally, and the processed pairs, so a restore hands none of those messages
     /// to the protocol again. [`App::restore`] installs it all in one commit.
     ///
+    /// The restore of the backup is built, without writing anything, before it is
+    /// returned: the protocol's [`Protocol::restore_layer`] checks the layer, and the one
+    /// commit that would install it must fit the store's sizes
+    /// ([`crate::store::MAX_VALUE_BYTES`], [`crate::store::MAX_BATCH_BYTES`]).
+    ///
     /// # Errors
     ///
-    /// As [`App::backup`]; a store failure reading the processed pairs.
+    /// As [`App::backup`]; a store failure reading the processed pairs; as
+    /// [`App::restore`] for a layer it would refuse, such as one the protocol refuses
+    /// ([`AppError::InvalidData`]) or one over the store's sizes ([`AppError::Store`]).
     pub async fn backup_with_protocol_layer(
         &self,
         layer: ProtocolLayer,
@@ -877,6 +884,16 @@ impl App {
                     .collect(),
                 processed,
             });
+            // The restore is built, not committed, so a layer the protocol refuses, or one
+            // over the store's sizes, is refused now rather than at a restore that can
+            // never succeed.
+            Self::restore_commit(
+                self.env.clone(),
+                Arc::clone(&self.protocol),
+                self.config.clone(),
+                &backup,
+            )
+            .await?;
             Ok(backup)
         })
         .await
@@ -914,6 +931,22 @@ impl App {
         config: AppConfig,
         backup: &AppBackup,
     ) -> Result<App, AppError> {
+        Box::pin(async move {
+            let (app, tx) = Self::restore_commit(env, protocol, config, backup).await?;
+            tx.commit(&app.env.store).await?;
+            Ok(app)
+        })
+        .await
+    }
+
+    /// The app a backup restores and the one commit that installs it, checked and built
+    /// within the store's sizes; nothing is written.
+    async fn restore_commit(
+        env: AppEnv,
+        protocol: Arc<dyn Protocol>,
+        config: AppConfig,
+        backup: &AppBackup,
+    ) -> Result<(App, Tx), AppError> {
         Box::pin(async move {
             let meta = backup.meta.clone();
             let invalid = |why: &str| AppError::InvalidData(format!("the backup: {why}"));
@@ -1065,8 +1098,7 @@ impl App {
             }
             tx.put(records::LIST_DUE, &true)?;
             tx.local(&layer_writes)?;
-            tx.commit(&app.env.store).await?;
-            Ok(app)
+            Ok((app, tx))
         })
         .await
     }

@@ -515,6 +515,8 @@ const JOURNAL_KEY: &[u8] = b"journal";
 struct JournalProtocol {
     sample: SampleProtocol,
     name: Option<String>,
+    /// Refuse every layer, as a later version of the protocol might.
+    refuse: bool,
 }
 
 impl JournalProtocol {
@@ -522,6 +524,15 @@ impl JournalProtocol {
         Arc::new(Self {
             sample: SampleProtocol::default(),
             name: name.map(str::to_owned),
+            refuse: false,
+        })
+    }
+
+    fn refusing() -> Arc<Self> {
+        Arc::new(Self {
+            sample: SampleProtocol::default(),
+            name: Some(JOURNAL.into()),
+            refuse: true,
         })
     }
 }
@@ -570,6 +581,9 @@ impl Protocol for JournalProtocol {
         };
         if layer.data.is_empty() {
             return Err("journal: the journal is empty".into());
+        }
+        if self.refuse {
+            return Err("journal: a journal of another version".into());
         }
         Ok(vec![LocalWrite::Put {
             key: JOURNAL_KEY.to_vec(),
@@ -859,7 +873,7 @@ async fn test_restore_refused_protocol_layer_writes_nothing() {
         &protocol,
         &Arc::new(MemoryStore::new()),
         b"at the backup",
-        journal_layer(JOURNAL, b""),
+        journal_layer(JOURNAL, b"at the backup"),
     )
     .await;
     let store = Arc::new(MemoryStore::new());
@@ -869,14 +883,14 @@ async fn test_restore_refused_protocol_layer_writes_nothing() {
     ));
     let error = restore_on(
         &w,
-        protocol.clone(),
+        JournalProtocol::refusing(),
         fault.clone() as Arc<dyn StateStore>,
         &backup,
     )
     .await
     .unwrap_err();
     assert!(
-        matches!(&error, AppError::InvalidData(why) if why.contains("the journal is empty")),
+        matches!(&error, AppError::InvalidData(why) if why.contains("another version")),
         "{error:?}"
     );
     assert_eq!(fault.commits(), 0);
@@ -890,6 +904,39 @@ async fn test_restore_refused_protocol_layer_writes_nothing() {
     assert!(matches!(error, AppError::InvalidData(_)), "{error:?}");
     assert_eq!(fault.commits(), 0);
     assert!(snapshot(&store, &app.app_id()).is_empty());
+}
+
+#[tokio::test]
+async fn test_backup_with_a_layer_that_could_never_be_restored_is_refused() {
+    let w = World::new();
+    let protocol = JournalProtocol::new(Some(JOURNAL));
+    let request = w.approve(&app_keys("wallet"), &["scope-a"]);
+    let app = App::join(w.env(), protocol.clone(), World::config(), request)
+        .await
+        .unwrap();
+    // A layer the protocol refuses.
+    let error = app
+        .backup_with_protocol_layer(journal_layer(JOURNAL, b""))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, AppError::InvalidData(why) if why.contains("the journal is empty")),
+        "{error:?}"
+    );
+    // A layer whose value is over the store's value size.
+    let too_large = vec![7u8; usize::try_from(crate::store::MAX_VALUE_BYTES).unwrap() + 1];
+    let error = app
+        .backup_with_protocol_layer(journal_layer(JOURNAL, &too_large))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, AppError::Store(StoreError::Other(why)) if why.contains("value size")),
+        "{error:?}"
+    );
+    // Within the sizes, it backs up.
+    app.backup_with_protocol_layer(journal_layer(JOURNAL, b"fits"))
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
