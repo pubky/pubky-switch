@@ -246,6 +246,13 @@ async fn test_peers_admission_and_own_apps() {
         status_and_code(&from_shop(&replay, &doc("alice identity.json"), &at).await),
         (403, json!("not_admitted"))
     );
+    // Not even another admitted identity's: only its own identity's document.
+    let (carol, carol_v1) = stranger_doc(79);
+    add_contact(&replay, carol, 52, &at).await;
+    assert_eq!(
+        status_and_code(&from_shop(&replay, &carol_v1, &at).await),
+        (403, json!("not_admitted"))
+    );
     // A newer version is kept; the older one is then stale, another body at the version
     // held is equivocation.
     let bob_v2 = changed("bob", &bob_v1, |body| body.version = 2);
@@ -649,14 +656,15 @@ async fn test_peers_certificate_checks_in_order() {
             at_ms,
         )
     };
-    // A certificate of bob's for another of his apps: it doesn't name Switch-App.
+    // A certificate of bob's for another of his apps, the request signed with that app's
+    // key: it verifies, but doesn't name Switch-App.
     assert_eq!(
         status_and_code(
             &replay
                 .service
                 .handle(send(
                     "cap certificate, extension scope ext:paykit-cap",
-                    "shop",
+                    "cap",
                     ms(&at)
                 ))
                 .await
