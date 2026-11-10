@@ -1501,6 +1501,8 @@ impl App {
 
     /// Take an own copy outside the feed and commit what it changed.
     pub(crate) async fn take_own_copy(&mut self, doc: IdentityDoc) -> Result<bool, AppError> {
+        // A published `identity.json`: the erasure wait starts over (Switch spec 12.7).
+        self.clear_erasing().await?;
         let version = self.state.own_doc.version();
         let mut read = Read::outside(self.tx()?);
         let result = self.own_identity_copy(doc, &mut read).await;

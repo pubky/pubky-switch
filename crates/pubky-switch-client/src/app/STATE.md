@@ -100,7 +100,7 @@ uploads; `push.rs` holds the push registration. The peek (`peek.rs`) writes noth
 | `push` | the push setting: relay, device token, the service it is at, the push key, the handle, whether set, a rotation in flight | the device token |
 | `push/devices` | the handles of the app's other devices and the push key they are bound to, from the host's device sync, merged into the handles this device sets | the handles |
 | `gone` | the app isn't current any more, or its account is gone, and since when | |
-| `erasing` | since when every try met an unsigned `404` and no published `identity.json` | |
+| `erasing` | since when every try met an unsigned `404` and no published `identity.json`, the last try counted and how many were | |
 
 - **A move** commits each step: `Seen` (the freeze verified and kept), `Read` (the old feed
   read to its end, its chain view saved), `Uploaded` (the evidence sent to the next
@@ -133,7 +133,11 @@ uploads; `push.rs` holds the push registration. The peek (`peek.rs`) writes noth
 - **`gone`** stops every read; `push` goes with it. It is kept only once the newest verified
   own `identity.json` removes the app or doesn't list it, a `403 not_current` came while it
   lists the app with the certificate the app holds, or the account is erased: an unsigned
-  `404` and no published `identity.json` at every try for 24 hours, which `erasing` times.
+  `404` and no published `identity.json` at every try, counted at 5 tries at least 6 hours
+  apart by the app's clock, which `erasing` times. Any answer the account's key signs, or a
+  published `identity.json`, ends `erasing`. An erased account seen alive again, its
+  `identity.json` published and listing the app, ends `gone`: its `push` setting is kept,
+  no longer set, and the other devices' handles too; an app that isn't current drops both.
 
 ## Sending, admission, records and claims
 

@@ -395,6 +395,8 @@ pub(crate) struct AppState {
     pub(crate) service_time: Option<ServiceTime>,
     /// The app isn't current any more, or its account is gone: every read stops.
     pub(crate) gone: Option<provider::GoneRecord>,
+    /// The wait before the account counts as erased, while it runs.
+    pub(crate) erasing: Option<provider::ErasingRecord>,
 }
 
 /// One app of an identity, on top of the Switch.
@@ -551,6 +553,7 @@ impl App {
                 leave: None,
                 service_time: None,
                 gone: None,
+                erasing: None,
             };
             let mut app = App {
                 env,
@@ -746,6 +749,7 @@ impl App {
             leave,
             service_time: reader.get(key::SERVICE_TIME).await?,
             gone: reader.get(provider::keys::GONE).await?,
+            erasing: reader.get(provider::keys::ERASING).await?,
             meta,
         })
     }
@@ -915,6 +919,7 @@ impl App {
                 leave: None,
                 service_time: None,
                 gone: None,
+                erasing: None,
             };
             let ns = client_namespace(&meta.app_id);
             let client = Self::client_for(&env, &meta, &backup.keys, &cert)?;
@@ -1505,6 +1510,11 @@ impl App {
     pub(crate) async fn take<T>(&mut self, result: Result<T, ClientError>) -> Result<T, AppError> {
         if let Some(alarm) = self.note_service_time() {
             return Err(self.raise(alarm).await);
+        }
+        // An answer verified with the pinned key, an error answer included: the account is
+        // there, and the erasure wait starts over (Switch spec 12.7).
+        if matches!(result, Ok(_) | Err(ClientError::Switch { .. })) {
+            self.clear_erasing().await?;
         }
         match result {
             Ok(value) => Ok(value),

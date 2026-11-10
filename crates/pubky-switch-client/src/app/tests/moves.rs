@@ -1160,76 +1160,162 @@ async fn test_removed_in_identity_json_stops_for_good() {
     assert_eq!(app.follow_provider().await.unwrap(), ProviderStatus::Gone);
 }
 
-#[tokio::test]
-async fn test_erased_account_is_gone_once_the_identity_is_unpublished() {
-    let w = World::new();
-    let router = Router::of(&w);
-    let mut app = join(&w, &router).await;
-    w.switch.lock().erased = true;
-    // While the identity still publishes its identity.json, the unsigned 404 explains
-    // nothing: the error stands and the app isn't stopped.
-    let error = app.receive(None).await.unwrap_err();
+/// A read that meets an erased account and doesn't conclude: the service counts as
+/// unreachable (Switch spec 12.7).
+async fn unreachable_read(app: &mut App) {
+    let result = app.receive(None).await;
     assert!(
-        matches!(
-            error,
-            AppError::Switch(ClientError::BadServiceSignature { status: 404 })
-        ),
-        "{error:?}"
-    );
-    assert_eq!(
-        app.follow_provider().await.unwrap(),
-        ProviderStatus::Current
-    );
-    // The signer erased the account and deleted identity.json from the Homeserver. Until
-    // both have held for 24 hours, the service counts as unreachable (Switch spec 12.7).
-    w.homeserver.remove(w.alice.public(), IDENTITY_PATH);
-    let unreachable = |result: Result<_, AppError>| {
         matches!(
             result,
             Err(AppError::Switch(ClientError::BadServiceSignature {
                 status: 404
             }))
-        )
-    };
-    assert!(unreachable(app.receive(None).await));
-    w.clock
-        .advance_ms(crate::app::provider::ERASURE_WAIT_MS - 1);
-    assert!(unreachable(app.receive(None).await));
+        ),
+        "{result:?}"
+    );
+}
+
+/// Tries spaced as the erasure wait counts them, up to the last one before it concludes.
+async fn erasure_tries_but_the_last(w: &World, app: &mut App) {
+    unreachable_read(app).await;
+    for _ in 2..crate::app::provider::ERASURE_TRIES {
+        w.clock
+            .advance_ms(crate::app::provider::ERASURE_TRY_SPACING_MS);
+        unreachable_read(app).await;
+    }
+}
+
+#[tokio::test]
+async fn test_erased_account_is_gone_once_the_identity_is_unpublished() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join(&w, &router).await;
+    app.register_push(&NoRelay, "https://push.example/v1/hook", "token")
+        .await
+        .unwrap();
+    w.switch.lock().erased = true;
+    // While the identity still publishes its identity.json, the unsigned 404 explains
+    // nothing: the error stands and the app isn't stopped.
+    unreachable_read(&mut app).await;
+    assert!(app.state.erasing.is_none());
+    // The signer erased the account and deleted identity.json from the Homeserver. Until
+    // both have held at tries spread over 24 hours, the service counts as unreachable.
+    w.homeserver.remove(w.alice.public(), IDENTITY_PATH);
+    erasure_tries_but_the_last(&w, &mut app).await;
     assert_eq!(
         app.follow_provider().await.unwrap(),
         ProviderStatus::Current
     );
-    w.clock.advance_ms(1);
+    w.clock
+        .advance_ms(crate::app::provider::ERASURE_TRY_SPACING_MS);
     let report = app.receive(None).await.unwrap();
     assert!(report.stopped);
     assert!(has(&report.events, |e| matches!(e, AppEvent::AccountGone)));
     assert_eq!(app.follow_provider().await.unwrap(), ProviderStatus::Gone);
+    // The push setting is kept, only no longer set, for when the account shows again.
+    assert!(app.push_registration().await.unwrap().is_none());
+    assert!(app.push_record().await.unwrap().is_some());
 }
 
 #[tokio::test]
-async fn test_erasure_wait_starts_over_when_the_identity_shows_again() {
+async fn test_erasure_wait_starts_over_on_any_answer_the_account_key_signs() {
+    for clear in 0..3 {
+        let w = World::new();
+        let router = Router::of(&w);
+        let mut app = lists_app(&w, &router).await;
+        let published = w.homeserver.file(w.alice.public(), IDENTITY_PATH).unwrap();
+        // One coincident blip starts the wait.
+        w.switch.lock().erased = true;
+        w.homeserver.remove(w.alice.public(), IDENTITY_PATH);
+        unreachable_read(&mut app).await;
+        assert!(app.state.erasing.is_some());
+        w.switch.lock().erased = false;
+        match clear {
+            // identity.json shows again.
+            0 => {
+                w.homeserver
+                    .put(w.alice.public(), IDENTITY_PATH, published.clone());
+                app.refresh_identity().await.unwrap();
+            }
+            // A batch answer verifies with the account's key.
+            1 => {
+                let dave = IdentityKey::from_secret(seed("dave/identity")).public();
+                app.submit_batch(contact_batch(dave)).await.unwrap();
+            }
+            // A signed refusal.
+            _ => {
+                w.switch.fail_next(Fault::Error {
+                    path: "feed".into(),
+                    code: ErrorCode::RateLimited,
+                    current: json!({}),
+                });
+                assert!(app.receive(None).await.is_err());
+            }
+        }
+        assert!(app.state.erasing.is_none(), "case {clear}");
+        // A second blip a day later starts the wait again, and concludes nothing.
+        w.clock.advance_ms(crate::app::provider::ERASURE_WAIT_MS);
+        w.switch.lock().erased = true;
+        w.homeserver.remove(w.alice.public(), IDENTITY_PATH);
+        unreachable_read(&mut app).await;
+        assert_eq!(app.state.erasing.map(|e| e.tries), Some(1), "case {clear}");
+        assert_ne!(
+            app.follow_provider().await.unwrap(),
+            ProviderStatus::Gone,
+            "case {clear}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_erasure_wait_isnt_concluded_by_a_clock_jump() {
     let w = World::new();
     let router = Router::of(&w);
     let mut app = join(&w, &router).await;
+    w.switch.lock().erased = true;
+    w.homeserver.remove(w.alice.public(), IDENTITY_PATH);
+    unreachable_read(&mut app).await;
+    // The clock jumps a week ahead: that counts one try, and the tries right after it add
+    // nothing.
+    w.clock.advance_ms(7 * DAY_MS);
+    for _ in 0..10 {
+        unreachable_read(&mut app).await;
+        w.clock.advance_ms(60_000);
+    }
+    assert_eq!(app.state.erasing.map(|e| e.tries), Some(2));
+    assert_ne!(app.follow_provider().await.unwrap(), ProviderStatus::Gone);
+    // A clock gone back starts the wait over.
+    w.clock.set_ms(w.clock.now_ms() - 8 * DAY_MS);
+    unreachable_read(&mut app).await;
+    assert_eq!(app.state.erasing.map(|e| e.tries), Some(1));
+}
+
+#[tokio::test]
+async fn test_erased_account_seen_alive_again_comes_back() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join(&w, &router).await;
+    let me = app.app_id();
     let published = w.homeserver.file(w.alice.public(), IDENTITY_PATH).unwrap();
     w.switch.lock().erased = true;
     w.homeserver.remove(w.alice.public(), IDENTITY_PATH);
-    assert!(app.receive(None).await.is_err());
-    // A Homeserver fault ends: the file shows again, and the wait starts over.
+    erasure_tries_but_the_last(&w, &mut app).await;
     w.clock
-        .advance_ms(crate::app::provider::ERASURE_WAIT_MS / 2);
-    w.homeserver
-        .put(w.alice.public(), IDENTITY_PATH, published.clone());
-    assert!(app.receive(None).await.is_err());
-    w.homeserver.remove(w.alice.public(), IDENTITY_PATH);
-    w.clock
-        .advance_ms(crate::app::provider::ERASURE_WAIT_MS / 2);
-    assert!(app.receive(None).await.is_err());
-    w.clock
-        .advance_ms(crate::app::provider::ERASURE_WAIT_MS - 1);
-    assert!(app.receive(None).await.is_err());
-    w.clock.advance_ms(1);
+        .advance_ms(crate::app::provider::ERASURE_TRY_SPACING_MS);
     assert!(app.receive(None).await.unwrap().stopped);
+    assert_eq!(app.follow_provider().await.unwrap(), ProviderStatus::Gone);
+    // It was a fault: the account and its identity.json are there again.
+    w.switch.lock().erased = false;
+    w.homeserver.put(w.alice.public(), IDENTITY_PATH, published);
+    let seq = w.note(me, "after the fault").0;
+    let report = app.receive(None).await.unwrap();
+    assert!(
+        has(&report.events, |e| matches!(e, AppEvent::AccountBack)),
+        "{:?}",
+        report.events
+    );
+    assert!(received(&report.events, seq), "{:?}", report.events);
+    assert_ne!(app.follow_provider().await.unwrap(), ProviderStatus::Gone);
 }
 
 #[test]
