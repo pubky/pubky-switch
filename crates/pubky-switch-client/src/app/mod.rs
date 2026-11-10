@@ -1961,9 +1961,11 @@ impl App {
                 &self.state.keys,
                 &self.state.cert,
             )?;
-            self.reload = false;
             self.service_time_dirty = false;
+            // The reload is done only once the kept duty events it may owe the host are
+            // queued: a replay that fails is made again by the next call.
             self.queue_unreported_duties().await?;
+            self.reload = false;
         }
         Ok(())
     }

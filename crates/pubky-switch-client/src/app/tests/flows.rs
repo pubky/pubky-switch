@@ -2316,6 +2316,47 @@ async fn test_duty_event_reported_only_with_its_commit() {
 }
 
 #[tokio::test]
+async fn test_duty_event_replay_whose_read_fails_is_made_again() {
+    let mut found = false;
+    for n in 1..=8 {
+        let w = World::new();
+        let (app, seq, _) = refusing(&w).await;
+        let (mut app, store) = load_behind(&w, app, StoreFault::FailAfter(n)).await;
+        if app.receive(None).await.is_ok() {
+            continue;
+        }
+        if !refused_events(&app.take_events(), seq).is_empty()
+            || refused_events(&app.unacknowledged_events().await.unwrap(), seq).is_empty()
+        {
+            continue;
+        }
+        found = true;
+        // The refusal's commit was applied unreported. The reload's replay of the kept duty
+        // events fails once: the next call makes it again.
+        store.fail_scan(b"duty/", 1);
+        assert!(app.receive(None).await.is_err(), "commit {n}");
+        let mut events = app.take_events();
+        let later = refuse_next(&w, &mut app).await;
+        events.extend(later.iter().cloned());
+        assert_eq!(
+            refused_events(&events, seq).len(),
+            1,
+            "commit {n}: {events:?}"
+        );
+        // Acknowledged: nothing kept was removed unseen.
+        app.ack_events(last_id(&later)).await.unwrap();
+        for event in app.unacknowledged_events().await.unwrap() {
+            assert!(!events.contains(&event), "commit {n}: {event:?}");
+        }
+        break;
+    }
+    assert!(
+        found,
+        "a commit keeping the refusal answers that it can't tell"
+    );
+}
+
+#[tokio::test]
 async fn test_duty_event_kept_but_not_taken_survives_an_acknowledgement() {
     // The commit that keeps the refusal is applied, but answers that it can't tell: the
     // read fails, and nothing reports the refusal yet.
