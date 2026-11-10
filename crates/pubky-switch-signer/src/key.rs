@@ -419,15 +419,13 @@ impl BackupView {
         own_newest: Option<&IdentityDoc>,
         own_prev: Option<[u8; 32]>,
     ) -> bool {
-        let doc = &self.identity_doc;
-        if &doc.body().signer == own_signer {
-            return false;
-        }
-        let Some(mark) = own_newest else {
-            return true;
-        };
-        let losing = self.prev.is_some() && self.prev == own_prev && doc.signed() != mark.signed();
-        !losing && doc.version() >= mark.version()
+        pubky_switch_core::records::backup_taken_over(
+            &self.identity_doc,
+            self.prev,
+            own_signer,
+            own_newest,
+            own_prev,
+        )
     }
 }
 
