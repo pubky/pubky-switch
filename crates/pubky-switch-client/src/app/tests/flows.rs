@@ -1459,6 +1459,34 @@ async fn test_app_leaves_in_two_steps() {
 }
 
 #[tokio::test]
+async fn test_app_leaving_deletes_the_duty_events_and_owed_calls() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let me = app.app_id();
+    assert!(!refuse_next(&w, &mut app).await.is_empty());
+    let now = w.clock.now_ms();
+    w.switch.push_missed(1, now - HOUR, now);
+    *w.protocol.failing.lock().unwrap() = 1;
+    app.receive(None).await.unwrap();
+    assert_eq!(app.owed_protocol_calls().await.unwrap(), 1);
+    assert!(!app.reader().scan_raw("duty/").await.unwrap().is_empty());
+    app.leave(LeaveMode::TwoStep).await.unwrap();
+    w.next_doc(|body| {
+        body.apps.retain(|a| a.app_id != me);
+        body.removed.push(RemovedApp {
+            app_id: me,
+            distrust_from: START,
+        });
+    });
+    app.finish_leave().await.unwrap();
+    w.clock.advance_ms(11 * 60_000);
+    assert_eq!(app.finish_leave().await.unwrap(), LeaveReport::Done);
+    // With the keys, what the app owed its protocol is gone from the store.
+    assert!(app.reader().scan_raw("duty/").await.unwrap().is_empty());
+    assert!(app.reader().scan_raw("owed/").await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn test_app_leave_retried_after_a_lost_answer() {
     let w = World::new();
     let mut app = w.join("wallet").await;

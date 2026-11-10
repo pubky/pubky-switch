@@ -2873,6 +2873,134 @@ async fn test_loss_reports_the_attempts_of_a_kept_effect_it_drops() {
     assert!(has(&app.unacknowledged_events().await.unwrap(), dropped));
 }
 
+/// A kept effect at generation 1 for an entry at `seq`, written into `app`'s store as if a
+/// read had kept it, with `parked` and `past_held` set as given.
+async fn keep_an_effect(
+    w: &World,
+    app: &mut App,
+    seq: u64,
+    parked: bool,
+    past_held: bool,
+) -> crate::app::state::PendingEffect {
+    let batch = app
+        .sign_ops(
+            vec![(
+                Vec::new(),
+                OpKind::AllowPut {
+                    pubky: w.bob.public(),
+                    kind: AllowKind::Conversation,
+                },
+            )],
+            None,
+        )
+        .unwrap();
+    let entry = crate::app::state::KeptEntry {
+        cert: w.bob_cert.signed().clone(),
+        plaintext: b"kept".to_vec(),
+        context: None,
+    };
+    let pending = crate::app::state::PendingEffect {
+        body: batch.body().to_vec(),
+        seq,
+        sender: w.bob.public(),
+        msg_id: format!("kept-{seq}"),
+        hash: [2; 32],
+        accepted_at_ms: w.clock.now_ms(),
+        kind: "sample.note".into(),
+        local: Vec::new(),
+        cursor_to: None,
+        past_held,
+        parked,
+        deadlines: Vec::new(),
+        kept_ms: Some(w.clock.now_ms()),
+        entry: entry.clone(),
+    };
+    let mut tx = app.tx().unwrap();
+    tx.put(crate::app::state::key::PENDING_EFFECT, &pending)
+        .unwrap();
+    if parked {
+        let stored = crate::app::state::ParkedEntry {
+            sender: w.bob.public(),
+            cert: entry.cert,
+            accepted_at_ms: pending.accepted_at_ms,
+            plaintext: entry.plaintext,
+            context: None,
+            reason: ParkReason::Quota,
+        };
+        tx.put(&crate::app::state::key::parked(seq), &stored)
+            .unwrap();
+        app.state.parked.insert(seq, stored);
+    }
+    app.commit(tx).await.unwrap();
+    app.state.pending_effect = Some(pending.clone());
+    pending
+}
+
+#[tokio::test]
+async fn test_uncertain_park_of_an_entry_stored_before_changes_its_reason() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join(&w, &router).await;
+    let cursor = app.cursor().seq;
+    let seq = cursor + 40;
+    let pending = keep_an_effect(&w, &mut app, seq, true, false).await;
+    w.clock
+        .advance_ms(crate::app::provider::KEPT_BATCH_ANSWER_MS);
+    change_key(&w, &router);
+    let report = app.receive(None).await.unwrap();
+    assert!(
+        has(&report.events, |e| matches!(
+            e,
+            AppEvent::EffectUncertain { seq: s, .. } if *s == seq
+        )),
+        "{:?}",
+        report.events
+    );
+    // The entry stored before keeps its plaintext; only its reason changes, and it is
+    // processed.
+    let stored = app.state.parked.get(&seq).unwrap();
+    assert_eq!(stored.reason, ParkReason::Uncertain);
+    assert_eq!(stored.plaintext, pending.entry.plaintext);
+    assert!(
+        app.reader()
+            .exists(&crate::app::state::key::processed(
+                &pending.sender,
+                &pending.msg_id
+            ))
+            .await
+            .unwrap()
+    );
+    assert!(app.state.pending_effect.is_none());
+}
+
+#[tokio::test]
+async fn test_uncertain_park_of_an_entry_past_a_held_one_keeps_the_cursor() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join(&w, &router).await;
+    let seq = app.cursor().seq + 40;
+    keep_an_effect(&w, &mut app, seq, false, true).await;
+    w.clock
+        .advance_ms(crate::app::provider::KEPT_BATCH_ANSWER_MS);
+    change_key(&w, &router);
+    let report = app.receive(None).await.unwrap();
+    assert!(
+        has(&report.events, |e| matches!(
+            e,
+            AppEvent::EffectUncertain { seq: s, .. } if *s == seq
+        )),
+        "{:?}",
+        report.events
+    );
+    // Past a held entry, it is marked seen; the cursor doesn't pass the held one for it.
+    assert_eq!(
+        app.state.parked.get(&seq).map(|p| p.reason),
+        Some(ParkReason::Uncertain)
+    );
+    assert!(app.state.seen.contains(&seq));
+    assert!(app.cursor().seq < seq);
+}
+
 /// The app at `store`, loaded through the loss's router.
 async fn load_lost(lost: &Lost, store: Arc<dyn StateStore>) -> App {
     App::load(
