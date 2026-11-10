@@ -1616,6 +1616,8 @@ struct LifecycleProtocol {
     extra: OpKind,
     in_context: bool,
     answers: std::sync::Mutex<Vec<bool>>,
+    /// Whether the effects carry `extra` yet.
+    active: std::sync::atomic::AtomicBool,
 }
 
 impl Protocol for LifecycleProtocol {
@@ -1649,6 +1651,9 @@ impl Protocol for LifecycleProtocol {
         message: &crate::app::ReceivedMessage,
         cx: &mut crate::app::ReceiveContext<'_>,
     ) -> crate::app::Outcome {
+        if !self.active.load(std::sync::atomic::Ordering::SeqCst) {
+            return self.sample.receive(message);
+        }
         if self.in_context {
             let answer = cx.op(Vec::new(), self.extra.clone());
             self.answers.lock().unwrap().push(answer.is_ok());
@@ -1678,6 +1683,87 @@ impl Protocol for LifecycleProtocol {
     }
 }
 
+/// The entry at `seq` stored for good for a lifecycle operation in its effect, and the
+/// protocol told in `report`, durably.
+async fn lifecycle_effect_refused(app: &mut App, report: &crate::app::ReceiveReport, seq: u64) {
+    assert_eq!(
+        app.state.parked.get(&seq).map(|p| p.reason),
+        Some(ParkReason::LifecycleOperation)
+    );
+    assert!(app.state.pending_effect.is_none());
+    let refused =
+        |e: &AppEvent| matches!(e, AppEvent::EffectRefused { seq: s, code: None, .. } if *s == seq);
+    assert!(has(&report.events, refused), "{:?}", report.events);
+    assert!(has(&app.unacknowledged_events().await.unwrap(), refused));
+}
+
+#[tokio::test]
+async fn test_app_lifecycle_operation_in_an_effect_doesnt_stall_the_feed() {
+    let w = World::new();
+    let base = w.join("phone").await;
+    let protocol = Arc::new(LifecycleProtocol {
+        sample: SampleProtocol::default(),
+        extra: lifecycle_ops(&w, &base)[0].clone(),
+        in_context: false,
+        answers: std::sync::Mutex::new(Vec::new()),
+        active: std::sync::atomic::AtomicBool::new(true),
+    });
+    let request = w.approve(&app_keys("wallet"), &["scope-a"]);
+    let mut app = App::join(w.env(), protocol.clone(), World::config(), request)
+        .await
+        .unwrap();
+    let (first, _) = w.note(app.app_id(), "note");
+    let report = app.receive(None).await.unwrap();
+    lifecycle_effect_refused(&mut app, &report, first).await;
+    // Later entries go on, and the stored one isn't tried again.
+    let (second, _) = w.note(app.app_id(), "later note");
+    let report = app.receive(None).await.unwrap();
+    assert!(app.cursor().seq >= second);
+    assert!(
+        !has(&report.events, |e| matches!(e, AppEvent::Unparked { .. })),
+        "{:?}",
+        report.events
+    );
+}
+
+#[tokio::test]
+async fn test_app_lifecycle_operation_in_a_stored_entrys_effect_stores_it_for_good() {
+    let w = World::new();
+    let base = w.join("phone").await;
+    let protocol = Arc::new(LifecycleProtocol {
+        sample: SampleProtocol::default(),
+        extra: lifecycle_ops(&w, &base)[1].clone(),
+        in_context: false,
+        answers: std::sync::Mutex::new(Vec::new()),
+        active: std::sync::atomic::AtomicBool::new(false),
+    });
+    let request = w.approve(&app_keys("wallet"), &["scope-a"]);
+    let mut app = App::join(w.env(), protocol.clone(), World::config(), request)
+        .await
+        .unwrap();
+    // Stored for a quota, to be tried again.
+    let (seq, _) = w.note(app.app_id(), "note");
+    w.switch.fail_next(Fault::Error {
+        path: "ops".into(),
+        code: ErrorCode::QuotaExceeded,
+        current: json!(null),
+    });
+    app.receive(None).await.unwrap();
+    assert_eq!(
+        app.state.parked.get(&seq).map(|p| p.reason),
+        Some(ParkReason::Quota)
+    );
+    // Tried again, its effect now carries a lifecycle operation: stored for good, and the
+    // protocol told; the read goes on.
+    protocol
+        .active
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let applied = w.switch.applied().len();
+    let report = app.receive(None).await.unwrap();
+    lifecycle_effect_refused(&mut app, &report, seq).await;
+    assert_eq!(w.switch.applied().len(), applied);
+}
+
 #[tokio::test]
 async fn test_app_refuses_lifecycle_operations_in_a_protocol_effect() {
     let probe = World::new();
@@ -1693,6 +1779,7 @@ async fn test_app_refuses_lifecycle_operations_in_a_protocol_effect() {
                 extra,
                 in_context,
                 answers: std::sync::Mutex::new(Vec::new()),
+                active: std::sync::atomic::AtomicBool::new(true),
             });
             let request = w.approve(&app_keys("wallet"), &["scope-a"]);
             let mut app = App::join(w.env(), protocol.clone(), World::config(), request)
@@ -1700,20 +1787,17 @@ async fn test_app_refuses_lifecycle_operations_in_a_protocol_effect() {
                 .unwrap();
             let (seq, _) = w.note(app.app_id(), "note");
             let applied = w.switch.applied().len();
-            let result = app.receive(None).await;
+            let report = app.receive(None).await.unwrap();
             if in_context {
                 // The context refuses it; the effect goes without it.
                 assert_eq!(*protocol.answers.lock().unwrap(), vec![false]);
-                let report = result.unwrap();
                 assert!(received(&report.events, seq), "{:?}", report.events);
             } else {
-                // In the effect itself: refused before anything is kept or sent.
-                assert!(
-                    matches!(result, Err(AppError::Refused(Refusal::Usage(_)))),
-                    "{index}: {result:?}"
-                );
-                assert!(app.state.pending_effect.is_none());
-                assert_eq!(w.switch.applied().len(), applied);
+                // In the effect itself: never sent, the entry stored and passed, and the
+                // protocol told, so the feed goes on (Switch spec 8.2).
+                lifecycle_effect_refused(&mut app, &report, seq).await;
+                assert_eq!(w.switch.applied().len(), applied, "{index}");
+                assert!(app.cursor().seq >= seq);
             }
         }
     }

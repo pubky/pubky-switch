@@ -719,9 +719,20 @@ impl App {
             } = writes;
             effect.ops = ops.into_iter().chain(effect.ops).collect();
             effect.local = local.into_iter().chain(effect.local).collect();
-            // The app layer's own lifecycle operations aren't a protocol's to write: refused
-            // before anything is kept.
-            super::batch::refuse_lifecycle_ops(effect.ops.iter().map(|(_, kind)| kind))?;
+            // The app layer's own lifecycle operations aren't a protocol's to write: an effect
+            // carrying one is never sent. Its entry is stored and passed, so the feed goes on,
+            // and the protocol told, as for an effect refused for good (Switch spec 8.2).
+            if super::batch::refuse_lifecycle_ops(effect.ops.iter().map(|(_, kind)| kind)).is_err()
+            {
+                self.park(
+                    entry,
+                    &received.plaintext,
+                    ParkReason::LifecycleOperation,
+                    read,
+                )?;
+                self.effect_refused(entry, &received, None, read)?;
+                return Ok(Step::Pass);
+            }
             if effect.ops.len() >= MAX_BATCH_ENTRIES {
                 // Switch wire 6.4: at most 7 operations beside the cursor move. Stored and
                 // passed, so the feed goes on (Switch spec 8.2).
