@@ -124,6 +124,10 @@ pub enum SignerStatus {
         /// That version.
         version: u64,
     },
+    /// A rollback or an equivocation was seen, and the switch hasn't confirmed since that it
+    /// holds this signer's newest version: claims are held, and nothing is signed on top
+    /// until the user clears the alert ([`Signer::clear_alert`]).
+    Alarm,
 }
 
 /// The signer of one identity, on one install.
@@ -289,6 +293,7 @@ impl Signer {
             (None, _) if self.state.records_behind.is_some() => SignerStatus::RecordsBehind {
                 version: self.state.records_behind.unwrap_or_default(),
             },
+            (None, _) if self.state.switch_unconfirmed => SignerStatus::Alarm,
             (None, None) => SignerStatus::Enrolling,
             (None, Some(_)) => SignerStatus::Signing,
         }
@@ -352,6 +357,21 @@ impl Signer {
         }
         let mut state = self.state.clone();
         state.alerts.retain(|held| held != alert);
+        // Seen, another body on the Homeserver is published over with the switch's copy once
+        // the switch is confirmed to hold this signer's newest version (Switch wire 3.3).
+        let republish = matches!(
+            alert,
+            Alert::Equivocation {
+                source: Source::Homeserver,
+                ..
+            }
+        ) && state.homeserver_other.is_some();
+        if republish {
+            state.republish_over = state.homeserver_other;
+            if let Some(newest) = state.newest.as_mut() {
+                newest.published = false;
+            }
+        }
         // Delivered again only when the alarm saw a copy at the switch: one that holds nothing
         // has lost the account's state, and a version 1 delivered onto it would start the
         // account afresh at the same generation (Switch spec 6.5 "No restore and continue");
@@ -378,7 +398,7 @@ impl Signer {
         let deliver_again = again.is_some();
         let flow = again.or_else(|| self.flow.clone());
         self.commit(state, flow).await?;
-        if deliver_again {
+        if deliver_again || republish {
             self.resume().await?;
         }
         Ok(())
@@ -490,11 +510,24 @@ impl Signer {
             return Ok(false);
         }
         if copy.version() == mine.version() && copy.body_hash() != mine.body_hash() {
-            self.alarm(Alert::Equivocation {
+            // The switch decides which body is the version, and the Homeserver only publishes
+            // it (Switch wire 3.3 "Deliver, then publish"). Another body there needed the
+            // identity key, so the user is told first; once they have cleared the alert, the
+            // switch's copy is published over it.
+            let other = copy.hash();
+            if self.state.republish_over == Some(other) {
+                return Ok(false);
+            }
+            let alert = Alert::Equivocation {
                 source: Source::Homeserver,
                 version: mine.version(),
-            })
-            .await?;
+            };
+            let mut state = self.state.clone();
+            state.homeserver_other = Some(other);
+            state.alert(alert.clone());
+            state.switch_unconfirmed = true;
+            self.commit(state, None).await?;
+            return Err(SignerError::Alarm(alert));
         }
         Ok(copy.signed() == mine.signed())
     }
@@ -1021,6 +1054,8 @@ impl Signer {
             published: true,
             ..newest
         });
+        state.homeserver_other = None;
+        state.republish_over = None;
         self.commit(state, self.flow.clone()).await
     }
 }

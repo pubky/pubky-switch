@@ -636,11 +636,27 @@ async fn test_signer_a_resumed_publication_never_overwrites_a_newer_identity() {
     assert_eq!(world.published().unwrap().signed(), theirs.signed());
 }
 
+/// Another body at `doc`'s version, signed with the identity key.
+fn other_body(world: &World, doc: &IdentityDoc) -> IdentityDoc {
+    let mut body = doc.body().clone();
+    body.record_max_age = Some(7);
+    IdentityDoc::sign(&world.key, body).unwrap()
+}
+
+/// Publish `doc` on the Homeserver, as someone holding the identity key could.
+fn plant(world: &World, doc: &IdentityDoc) {
+    world.homeserver.set(
+        pubky_switch_core::records::IDENTITY_PATH,
+        serde_json::to_vec(doc.signed()).unwrap(),
+    );
+}
+
 #[tokio::test]
-async fn test_signer_another_body_at_the_mark_on_the_homeserver_is_an_alarm() {
+async fn test_signer_another_body_on_the_homeserver_is_an_alarm_then_republished_over() {
     // Version 2 reaches the switch but not the Homeserver, which then shows another body at
-    // version 2: equivocation, as from the switch, and it isn't written over (Switch spec
-    // 4.3).
+    // version 2. The user is told, claims are held and nothing is signed on top. Once the
+    // alert is cleared, the switch's copy, this signer's own, is published over it (Switch
+    // wire 3.3 "Deliver, then publish"), and signing goes on.
     let world = World::new();
     let (mut signer, _) = world.enrolled().await;
     *world.homeserver.failing_path.lock().unwrap() =
@@ -649,13 +665,8 @@ async fn test_signer_another_body_at_the_mark_on_the_homeserver_is_an_alarm() {
     assert!(matches!(error, SignerError::Homeserver(_)), "{error:?}");
     *world.homeserver.failing_path.lock().unwrap() = None;
     let two = world.switch.identity_doc().unwrap();
-    let mut body = two.body().clone();
-    body.record_max_age = Some(60);
-    let other = IdentityDoc::sign(&world.key, body).unwrap();
-    world.homeserver.set(
-        pubky_switch_core::records::IDENTITY_PATH,
-        serde_json::to_vec(other.signed()).unwrap(),
-    );
+    let other = other_body(&world, &two);
+    plant(&world, &other);
     let alert = Alert::Equivocation {
         source: Source::Homeserver,
         version: 2,
@@ -664,12 +675,62 @@ async fn test_signer_another_body_at_the_mark_on_the_homeserver_is_an_alarm() {
         signer.resume().await.unwrap_err(),
         SignerError::Alarm(alert.clone())
     );
+    // While the alert is held: kept as it is, and nothing signed on top.
+    assert_eq!(signer.status(), SignerStatus::Alarm);
+    let sent = world.sent_docs().len();
+    for seconds in [3_600, 60] {
+        let error = signer.set_record_max_age(Some(seconds)).await.unwrap_err();
+        assert_eq!(error, SignerError::Alarm(alert.clone()));
+    }
+    assert_eq!(world.sent_docs().len(), sent);
     assert!(signer.alerts().contains(&alert));
     assert_eq!(world.published().unwrap().signed(), other.signed());
-    // Nor is anything signed on top of it.
-    let sent = world.sent_docs().len();
-    signer.set_record_max_age(Some(3_600)).await.unwrap_err();
-    assert_eq!(world.sent_docs().len(), sent);
+    // Cleared: the switch's copy goes over it, and signing goes on.
+    signer.clear_alert(&alert).await.unwrap();
+    assert!(!signer.alerts().contains(&alert));
+    assert_eq!(world.published().unwrap().signed(), two.signed());
+    assert_eq!(signer.status(), SignerStatus::Signing);
+    let three = signer.set_record_max_age(Some(3_600)).await.unwrap();
+    assert_eq!(world.published().unwrap().signed(), three.signed());
+}
+
+#[tokio::test]
+async fn test_signer_another_body_replacing_a_published_version_is_republished_over_once_seen() {
+    // The Homeserver held this signer's version 2, and another body at version 2 replaced
+    // it: the next signing call raises the alarm before signing anything.
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let two = signer.set_record_max_age(Some(86_400)).await.unwrap();
+    let other = other_body(&world, &two);
+    plant(&world, &other);
+    let SignerError::Alarm(alert) = signer.set_record_max_age(Some(60)).await.unwrap_err() else {
+        panic!("no alarm")
+    };
+    assert_eq!(world.switch.identity_doc().unwrap().signed(), two.signed());
+    signer.clear_alert(&alert).await.unwrap();
+    assert_eq!(world.published().unwrap().signed(), two.signed());
+    signer.set_record_max_age(Some(60)).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_signer_another_body_on_the_homeserver_stays_once_another_install_signs() {
+    // Cleared, the alarm leads to publication only when the switch holds this signer's
+    // newest version: here another install's newer one stops it instead.
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let two = signer.set_record_max_age(Some(86_400)).await.unwrap();
+    let other = other_body(&world, &two);
+    plant(&world, &other);
+    let SignerError::Alarm(alert) = signer.set_record_max_age(Some(60)).await.unwrap_err() else {
+        panic!("no alarm")
+    };
+    world
+        .switch
+        .deliver_identity(&world.other_install_version(&two, [7; 16]))
+        .unwrap();
+    let error = signer.clear_alert(&alert).await.unwrap_err();
+    assert_eq!(error, SignerError::NotNamed { install: [7; 16] });
+    assert_eq!(world.published().unwrap().signed(), other.signed());
 }
 
 #[tokio::test]

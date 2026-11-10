@@ -92,6 +92,14 @@ pub(crate) struct SignerState {
     /// from the signer backup replaces them (a later flow).
     #[serde(default)]
     pub(crate) records_behind: Option<u64>,
+    /// The document hash of another body at the mark's version that the Homeserver
+    /// published, which raised [`Alert::Equivocation`].
+    #[serde(default)]
+    pub(crate) homeserver_other: Option<[u8; 32]>,
+    /// That copy, once the user has seen its alert: publication writes the switch's copy over
+    /// it (Switch wire 3.3 "Deliver, then publish").
+    #[serde(default)]
+    pub(crate) republish_over: Option<[u8; 32]>,
     /// The alerts the user hasn't cleared.
     pub(crate) alerts: Vec<Alert>,
     /// The certificate lifetime new certificates get, in milliseconds (Switch spec 3.2).
@@ -184,6 +192,8 @@ impl SignerState {
             bundle_parts: Vec::new(),
             managed_by: None,
             records_behind: None,
+            homeserver_other: None,
+            republish_over: None,
             alerts: Vec::new(),
             cert_lifetime_ms: DEFAULT_CERT_LIFETIME_MS,
             claims: Vec::new(),
