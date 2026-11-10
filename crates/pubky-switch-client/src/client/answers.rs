@@ -180,14 +180,17 @@ impl FeedItem {
         }
     }
 
-    fn read(o: Obj<'_>) -> Result<Self, ClientError> {
+    /// Read an item; `None` for one whose `type` this version doesn't know and that carries
+    /// no stub. Such an item that carries a stub reads as [`FeedItem::Stub`], so its stub is
+    /// still checked in the chain and nothing else is taken from it (Switch wire 7.5).
+    fn read(o: Obj<'_>) -> Result<Option<Self>, ClientError> {
         let seq = o.u64("seq")?;
         let stub = |o: &Obj<'_>| {
             o.get("stub")
                 .and_then(|value| Stub::from_value(value).ok())
                 .ok_or_else(|| bad("Switch wire 7.5: a feed item's stub doesn't read"))
         };
-        Ok(match o.str("type")? {
+        Ok(Some(match o.str("type")? {
             "entry" => FeedItem::Entry(EntryItem {
                 seq,
                 entry_id: o.b64n("entry_id")?,
@@ -228,8 +231,12 @@ impl FeedItem {
                 seq,
                 stub: stub(&o)?,
             },
-            _ => return Err(bad("Switch wire 7.5: a feed item of an unknown type")),
-        })
+            _ if o.get("stub").is_some() => FeedItem::Stub {
+                seq,
+                stub: stub(&o)?,
+            },
+            _ => return Ok(None),
+        }))
     }
 }
 
@@ -266,7 +273,7 @@ impl FeedPage {
             items: o
                 .objects("items")?
                 .into_iter()
-                .map(FeedItem::read)
+                .filter_map(|item| FeedItem::read(item).transpose())
                 .collect::<Result<_, _>>()?,
             next,
             scanned_through: o.u64("scanned_through")?,

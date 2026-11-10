@@ -19,6 +19,8 @@ use pubky_switch_core::sig::SignedDoc;
 use pubky_switch_core::time::rfc3339;
 use serde_json::{Value, json};
 
+use super::answers::{FeedItem, FeedPage};
+use super::read::Obj;
 use super::*;
 use crate::clock::TestClock;
 use crate::transport::MockTransport;
@@ -858,6 +860,63 @@ async fn test_put_identity_starting_a_generation_keeps_the_pin_on_errors() {
         .unwrap_err();
     assert!(matches!(error, ClientError::BadServiceSignature { .. }));
     assert_eq!(client.pinned_key(), Some(service_public()));
+}
+
+/// A feed page holding `items`, with a head, as the client reads it.
+fn feed_page_with(items: Value) -> Result<FeedPage, ClientError> {
+    let head = SignedHead::sign(
+        &service_key(),
+        &identity().public(),
+        &ChainTip {
+            generation: 1,
+            seq: 9,
+            chain_hash: [9; 32],
+        },
+    );
+    let value = json!({ "items": items, "next": "1:9", "scanned_through": 9, "more": false,
+                        "head": head.to_value() });
+    FeedPage::read(
+        Obj::of(&value, "a feed page").unwrap(),
+        &identity().public(),
+    )
+}
+
+#[test]
+fn test_feed_item_of_an_unknown_type_is_skipped_and_its_stub_kept() {
+    let tip = ChainTip {
+        generation: 1,
+        seq: 4,
+        chain_hash: [9; 32],
+    };
+    let (stub, _) = tip
+        .append(5, NOW, ItemType::Service, [3; 32], None)
+        .unwrap();
+    let page = feed_page_with(json!([
+        { "type": "later_kind", "seq": 5, "stub": stub.to_value(), "extra": 1 },
+        { "type": "later_kind", "seq": 6 },
+        { "type": "stub", "seq": 7, "stub": stub.to_value() },
+    ]))
+    .unwrap();
+    assert_eq!(
+        page.items,
+        vec![
+            FeedItem::Stub {
+                seq: 5,
+                stub: stub.clone()
+            },
+            FeedItem::Stub { seq: 7, stub },
+        ]
+    );
+}
+
+#[test]
+fn test_feed_item_of_an_unknown_type_with_a_bad_stub_is_refused() {
+    let items = json!([{ "type": "later_kind", "seq": 5, "stub": "not a stub" }]);
+    let error = feed_page_with(items).unwrap_err();
+    assert!(
+        matches!(error, ClientError::InvalidResponse(_)),
+        "{error:?}"
+    );
 }
 
 #[tokio::test]
