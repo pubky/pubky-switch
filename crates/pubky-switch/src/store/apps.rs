@@ -32,6 +32,9 @@ pub struct KeptAppId {
     /// The newest document's data epoch then, which its rotation goes above; `None` for an
     /// enrollment's, and for one kept before the service recorded it.
     pub data_epoch: Option<u64>,
+    /// Whether a delivered document has listed it in `removed` above that epoch: a
+    /// departure's rotation is done, for good.
+    pub rotated: bool,
 }
 
 /// An attempt that is `open` or `unknown`.
@@ -101,8 +104,14 @@ pub(super) async fn note_listings(
     epoch: u64,
 ) -> Result<(), StoreError> {
     for app in apps {
+        // An app the account holds anything of was listed before: by a document from before
+        // app_listings existed, if it has no row. Its first epoch is unknown, never this one.
         sqlx::query(
-            "INSERT INTO app_listings (account_id, app_id, listed_epoch) VALUES ($1, $2, $3) \
+            "INSERT INTO app_listings (account_id, app_id, listed_epoch) \
+             SELECT $1, $2, $3 WHERE NOT EXISTS \
+                 (SELECT 1 FROM apps WHERE account_id = $1 AND app_id = $2) \
+             AND NOT EXISTS \
+                 (SELECT 1 FROM key_bundle_parts WHERE account_id = $1 AND target_app_id = $2) \
              ON CONFLICT DO NOTHING",
         )
         .bind(account)
@@ -134,6 +143,30 @@ impl AccountTxn {
         note_listings(self.conn(), &id, apps, epoch).await
     }
 
+    /// Note the rotations `doc` makes: each departed app it lists in `removed` at a data epoch
+    /// above the one at its departure (Switch wire 7.4.12 `awaiting_rotation`). An App ID
+    /// kept without that epoch counts any.
+    pub async fn note_rotations(
+        &mut self,
+        removed: &[[u8; 16]],
+        epoch: u64,
+    ) -> Result<(), StoreError> {
+        let id = self.head().id.clone();
+        let removed: Vec<Vec<u8>> = removed.iter().map(|app| app.to_vec()).collect();
+        sqlx::query(
+            "UPDATE kept_app_ids SET rotated = true WHERE account_id = $1 \
+             AND reason = 'departed' AND app_id = ANY($2) \
+             AND (data_epoch IS NULL OR data_epoch < $3)",
+        )
+        .bind(id)
+        .bind(removed)
+        .bind(to_db(epoch, "data_epoch")?)
+        .execute(self.conn())
+        .await
+        .map_err(StoreError::from_db)?;
+        Ok(())
+    }
+
     /// What `GET /apps` reports (Switch wire 7.4.12), read under the account's lock.
     pub async fn apps_view(&mut self) -> Result<AppsView, StoreError> {
         let id = self.head().id.clone();
@@ -142,8 +175,8 @@ impl AccountTxn {
             ..AppsView::default()
         };
         for row in sqlx::query(
-            "SELECT app_id, reason, at_ms, data_epoch FROM kept_app_ids WHERE account_id = $1 \
-             ORDER BY app_id",
+            "SELECT app_id, reason, at_ms, data_epoch, rotated FROM kept_app_ids \
+             WHERE account_id = $1 ORDER BY app_id",
         )
         .bind(&id)
         .fetch_all(self.conn())
@@ -158,6 +191,7 @@ impl AccountTxn {
                 reason: reason(&reason_text)?,
                 at_ms: from_db(row.try_get("at_ms")?, "at_ms")?,
                 data_epoch: data_epoch.map(|e| from_db(e, "data_epoch")).transpose()?,
+                rotated: row.try_get("rotated")?,
             });
         }
         for row in sqlx::query(

@@ -90,6 +90,8 @@ struct Answer {
     head: Option<SignedHead>,
     retry_after: Option<u64>,
     cacheable: bool,
+    /// Never cached: `Cache-Control: no-store`.
+    no_store: bool,
     /// An answer whose body is read once the lock is gone.
     deferred: Option<Deferred>,
 }
@@ -111,6 +113,7 @@ impl Answer {
             head: None,
             retry_after: None,
             cacheable: false,
+            no_store: false,
             deferred: None,
         }
     }
@@ -122,6 +125,7 @@ impl Answer {
             head: None,
             retry_after: error.retry_after,
             cacheable: false,
+            no_store: false,
             deferred: None,
         }
     }
@@ -183,6 +187,9 @@ fn sign_answer(
     }
     if answer.cacheable {
         put("cache-control", "public, max-age=60".into());
+    }
+    if answer.no_store {
+        put("cache-control", "no-store".into());
     }
     SwitchResponse {
         status: answer.status,
@@ -321,7 +328,10 @@ impl Service {
             }
             Call::PutIdentity => {
                 match self.authenticate_signer(&account, &request, base_ms).await {
-                    Ok(claimed) => Some(claimed),
+                    Ok((claimed, app)) => {
+                        verified = app;
+                        Some(claimed)
+                    }
                     Err(error) => return refused_early(error).await,
                 }
             }
@@ -329,7 +339,10 @@ impl Service {
             // account holds for it (Switch wire 7.2).
             Call::Revoke(_) | Call::GetApps => {
                 match self.authenticate_signer(&account, &request, base_ms).await {
-                    Ok(claimed) => Some(claimed),
+                    Ok((claimed, app)) => {
+                        verified = app;
+                        Some(claimed)
+                    }
                     Err(error) => return refused_early(error).await,
                 }
             }
@@ -442,7 +455,7 @@ impl Service {
         account: &str,
         request: &SwitchRequest,
         base_ms: u64,
-    ) -> Result<Claimed, ApiError> {
+    ) -> Result<(Claimed, Option<batch::VerifiedApp>), ApiError> {
         if let Err(retry_after) = self.failed_auth.check(request.source, base_ms) {
             return Err(ApiError::rate_limited(
                 "9.4: too many failed authentications from this network source",
@@ -458,17 +471,71 @@ impl Service {
                     self.record_failure(request, account.to_string());
                 }
             })?;
-        if let Caller::OwnApp(app) = &claimed.caller {
-            let error = self
-                .refuse_app_at_signer_call(account, request, &claimed, app, base_ms)
-                .await;
-            if is_failed_authentication(error.code) {
-                self.record_failure(request, account.to_string());
+        match &claimed.caller {
+            // Verified as at its own calls, then refused under the lock, where the refusal
+            // carries the head like every refusal to a verified own app (Switch wire 7.1).
+            Caller::OwnApp(app) => {
+                let verified = self
+                    .verify_own_app(account, request, &claimed, app, false, base_ms)
+                    .await
+                    .inspect_err(|error| {
+                        if is_failed_authentication(error.code) {
+                            self.record_failure(request, account.to_string());
+                        }
+                    })?;
+                Ok((claimed, Some(verified)))
             }
-            return Err(error);
+            // Its certificate first, in 7.2's order (`400`, `401`), then the refusal.
+            Caller::OtherApp { app, .. } => {
+                self.verify_other_app(request, &claimed, app)
+                    .inspect_err(|error| {
+                        if is_failed_authentication(error.code) {
+                            self.record_failure(request, account.to_string());
+                        }
+                    })?;
+                rules::require_signer(&claimed.caller)?;
+                Ok((claimed, None))
+            }
+            Caller::Signer => Ok((claimed, None)),
         }
-        rules::require_signer(&claimed.caller)?;
-        Ok(claimed)
+    }
+
+    /// Verify an app of another identity by the certificate it sends (Switch wire 7.2):
+    /// `Switch-Cert` present (`400`), verifying for `Switch-Identity` and naming
+    /// `Switch-App` (`401 bad_signature`), and the request signed with its key (`401`).
+    fn verify_other_app(
+        &self,
+        request: &SwitchRequest,
+        claimed: &Claimed,
+        app: &str,
+    ) -> Result<AppCert, ApiError> {
+        let bad = |why: &'static str| ApiError::new(ErrorCode::BadSignature, why);
+        let text = claimed.headers.cert.as_deref().ok_or_else(|| {
+            ApiError::bad_request("7.2: an app of another identity sends Switch-Cert")
+        })?;
+        let signed = pubky_switch_core::sig::SignedDoc::from_compact(text)
+            .map_err(|_| bad("7.2: Switch-Cert isn't a signed certificate"))?;
+        let cert = AppCert::verify(&signed, &claimed.identity_key)
+            .map_err(|_| bad("7.2: Switch-Cert doesn't verify for Switch-Identity"))?;
+        let named = pubky_switch_core::enc::app_id_decode(app)
+            .map_err(|_| bad("7.2: Switch-Cert doesn't name Switch-App"))?;
+        if cert.app_id() != named {
+            return Err(bad("7.2: Switch-Cert doesn't name Switch-App"));
+        }
+        let target = RequestTarget {
+            method: &request.method,
+            path_and_query: &request.path_and_query,
+            body: &request.body,
+            origin: &self.origin,
+        };
+        wire_http::verify_request(
+            &cert.signing_key(),
+            &target,
+            &claimed.headers,
+            &claimed.signature,
+        )
+        .map_err(|_| bad("7.1: the request signature doesn't verify"))?;
+        Ok(cert)
     }
 
     /// The public read's limits (Switch wire 9.4), before the account's lock: per network
@@ -592,6 +659,7 @@ impl Service {
         };
         // A read answered once the lock is gone answers a refusal with the head this request
         // commits, as every refusal to a verified caller carries one (Switch wire 7.1).
+        let txn_account = txn.head().id.clone();
         let fallback_head = if answer.deferred.is_some() {
             self.head(&txn, &signer).await
         } else {
@@ -633,18 +701,17 @@ impl Service {
                                 let error = ApiError::unavailable("7.6: a temporary failure");
                                 self.operator_answer(signature, base_ms, &error).await
                             }
-                            Err(feed::FeedStop::Refused {
-                                error,
-                                head,
-                                fallback,
-                                time_ms: at,
-                            }) => {
-                                let head = if fallback { fallback_head } else { head };
+                            Err(feed::FeedStop::Refused(refusal)) => {
+                                // Every 401 counts against the network source (9.4).
+                                if is_failed_authentication(refusal.error.code) {
+                                    self.record_failure(request, txn_account.clone());
+                                }
+                                let head = if refusal.head { fallback_head } else { None };
                                 sign_answer(
                                     &signer,
                                     signature,
-                                    at,
-                                    Answer::error(&error).with_head(head),
+                                    refusal.time_ms,
+                                    Answer::error(&refusal.error).with_head(head),
                                 )
                             }
                         };
@@ -751,6 +818,17 @@ impl Service {
         {
             return Err(Refused::with_head(
                 ApiError::new(ErrorCode::CertExpired, "3.8: the certificate has expired"),
+                serving,
+            ));
+        }
+        // A call only the signer makes, from an own app that verified: refused with the head
+        // (Switch wire 7.4, 7.1).
+        if writer.is_some() && matches!(call, Call::PutIdentity | Call::Revoke(_) | Call::GetApps) {
+            return Err(Refused::with_head(
+                ApiError::new(
+                    ErrorCode::PermissionMissing,
+                    "7.4: a call only the signer may make",
+                ),
                 serving,
             ));
         }
@@ -936,45 +1014,6 @@ impl Service {
             })?;
         }
         Ok(claimed)
-    }
-
-    /// Verify an app of another identity by the certificate it sends (Switch wire 7.2):
-    /// `Switch-Cert` present (`400`), verifying for `Switch-Identity` and naming
-    /// `Switch-App` (`401 bad_signature`), and the request signed with its key (`401`). Its
-    /// expiry is checked under the lock, at the identity's service time.
-    fn verify_other_app(
-        &self,
-        request: &SwitchRequest,
-        claimed: &Claimed,
-        app: &str,
-    ) -> Result<AppCert, ApiError> {
-        let bad = |why: &'static str| ApiError::new(ErrorCode::BadSignature, why);
-        let text = claimed.headers.cert.as_deref().ok_or_else(|| {
-            ApiError::bad_request("7.2: an app of another identity sends Switch-Cert")
-        })?;
-        let signed = pubky_switch_core::sig::SignedDoc::from_compact(text)
-            .map_err(|_| bad("7.2: Switch-Cert isn't a signed certificate"))?;
-        let cert = AppCert::verify(&signed, &claimed.identity_key)
-            .map_err(|_| bad("7.2: Switch-Cert doesn't verify for Switch-Identity"))?;
-        let named = pubky_switch_core::enc::app_id_decode(app)
-            .map_err(|_| bad("7.2: Switch-Cert doesn't name Switch-App"))?;
-        if cert.app_id() != named {
-            return Err(bad("7.2: Switch-Cert doesn't name Switch-App"));
-        }
-        let target = RequestTarget {
-            method: &request.method,
-            path_and_query: &request.path_and_query,
-            body: &request.body,
-            origin: &self.origin,
-        };
-        wire_http::verify_request(
-            &cert.signing_key(),
-            &target,
-            &claimed.headers,
-            &claimed.signature,
-        )
-        .map_err(|_| bad("7.1: the request signature doesn't verify"))?;
-        Ok(cert)
     }
 
     fn record_failure(&self, request: &SwitchRequest, account: String) {

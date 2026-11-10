@@ -618,3 +618,11 @@ pub async fn replay_chain_through_revoke(replay: &Replay) {
         .await;
     assert_eq!(answer.status, 200, "revoked");
 }
+
+/// The public key of the vectors' operator key, which signs answers the service can't tie
+/// to an account.
+pub fn operator_public() -> [u8; 32] {
+    ed25519_dalek::SigningKey::from_bytes(&hex32(&Value::String(OPERATOR_SEED_HEX.into())))
+        .verifying_key()
+        .to_bytes()
+}

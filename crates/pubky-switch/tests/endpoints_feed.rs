@@ -443,7 +443,12 @@ async fn test_feed_long_poll_of_an_app_revoked_meanwhile_is_refused() {
         (answer.status, body(&answer)["code"].clone()),
         (403, json!("not_current"))
     );
-    assert!(header_text(&answer, header::HEAD).is_some(), "Switch-Head");
+    // Its head is the one the request committed, which the key's mark covers: never the
+    // newer head the page was read at.
+    let key = service_key(&replay).await;
+    let mark = replay.keys.mark(&key).await.expect("mark").expect("a mark");
+    assert_eq!(head_seq(&answer), Some(10));
+    assert!(mark.seq >= 10);
     let fresh = read(&replay, "wallet", "?after=1:11", at).await;
     assert_eq!(fresh.status, 403);
     let _ = stop.send(());
@@ -598,7 +603,25 @@ async fn test_feed_of_an_account_erased_meanwhile_is_unknown() {
     let Some(replay) = replay().await else { return };
     replay_chain_through_revoke(&replay).await;
     let at = revoke_time();
-    let (answer, ()) = tokio::join!(read(&replay, "wallet", "?after=1:9&wait=1", &at), async {
+    let keys = vectors("keys.json");
+    let request = app_request(
+        app(&keys, "wallet"),
+        "GET",
+        &format!("/v1/{}/feed?after=1:9&wait=1", alice_id()),
+        Vec::new(),
+        ms(&at),
+    );
+    let request_signature: [u8; 64] = pubky_switch_core::enc::unb64(
+        request
+            .headers
+            .get(header::SIGNATURE)
+            .and_then(|value| value.to_str().ok())
+            .expect("signature"),
+    )
+    .expect("b64")
+    .try_into()
+    .expect("64");
+    let (answer, ()) = tokio::join!(replay.service.handle(request), async {
         tokio::time::sleep(Duration::from_millis(200)).await;
         sql(&replay, "DELETE FROM accounts WHERE id = $1").await;
     });
@@ -607,5 +630,186 @@ async fn test_feed_of_an_account_erased_meanwhile_is_unknown() {
         (404, json!("not_found"))
     );
     assert!(header_text(&answer, header::HEAD).is_none());
+    // Signed with the operator key, as for an account the service doesn't hold.
+    let signature: [u8; 64] = pubky_switch_core::enc::unb64(
+        header_text(&answer, header::SERVICE_SIGNATURE).expect("signature"),
+    )
+    .expect("b64")
+    .try_into()
+    .expect("64");
+    assert!(
+        pubky_switch_core::http::verify_response(
+            &operator_public(),
+            404,
+            Some(&request_signature),
+            header_text(&answer, header::SERVER_TIME).expect("time"),
+            &answer.body,
+            &signature,
+        )
+        .is_ok()
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+fn head_seq(answer: &SwitchResponse) -> Option<u64> {
+    let text = header_text(answer, header::HEAD)?;
+    let head = pubky_switch_core::chain::SignedHead::from_header(text).ok()?;
+    head.to_value()["seq"].as_u64()
+}
+
+#[tokio::test]
+async fn test_feed_expiry_is_judged_at_the_snapshots_time() {
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let key = service_key(&replay).await;
+    let at = revoke_time();
+    // A commit during the wait stamps a time past the wallet's certificate: the page read
+    // after it refuses the wallet, by the snapshot's time, not the request's.
+    let expired = ms("2026-12-01T00:00:01.000Z");
+    let (answer, ()) = tokio::join!(read(&replay, "wallet", "?after=1:9&wait=1", &at), async {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        sql(
+            &replay,
+            &format!(
+                "UPDATE accounts SET last_seq = 10, chain_seq = 10, \
+                 chain_hash = decode(repeat('ab', 32), 'hex'), stamped_time_ms = {expired} \
+                 WHERE id = $1"
+            ),
+        )
+        .await;
+    });
+    assert_eq!(
+        (answer.status, body(&answer)["code"].clone()),
+        (403, json!("cert_expired"))
+    );
+    // The request's own head, at 9, which the mark covers; not the snapshot's 10.
+    let mark = replay.keys.mark(&key).await.expect("mark").expect("a mark");
+    assert_eq!(head_seq(&answer), Some(9));
+    assert!(mark.seq >= 9);
+    assert_eq!(
+        header_text(&answer, header::SERVER_TIME),
+        Some(pubky_switch_core::time::rfc3339(expired).as_str())
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_feed_store_failure_carries_the_requests_head() {
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let at = revoke_time();
+    let (answer, ()) = tokio::join!(read(&replay, "wallet", "?after=1:9&wait=1", &at), async {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        // A seq given out, so the page reads the chain, which then fails.
+        sql(&replay, "UPDATE accounts SET last_seq = 10 WHERE id = $1").await;
+        sql(
+            &replay,
+            "ALTER TABLE chain_items RENAME TO chain_items_gone",
+        )
+        .await;
+    });
+    assert_eq!(
+        (answer.status, body(&answer)["code"].clone()),
+        (503, json!("unavailable"))
+    );
+    assert_eq!(head_seq(&answer), Some(9));
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_feed_of_an_account_moved_away_meanwhile_is_staged() {
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let at = revoke_time();
+    // A version naming another switch arrives during the wait: the page is refused with
+    // 503 staged, as a fresh request would be (Switch wire 7.3 step 7).
+    let v3: SignedDoc = serde_json::from_value(
+        named(
+            &vectors("documents.json")["documents"],
+            "alice identity.json",
+        )["signed"]
+            .clone(),
+    )
+    .expect("v3");
+    let mut moved: pubky_switch_core::records::IdentityBody =
+        serde_json::from_slice(&v3.body_bytes().expect("body")).expect("body");
+    moved.version = 4;
+    moved.inbox.url = "https://other.example".into();
+    let key = pubky_switch_core::keys::IdentityKey::from_secret(hex32(
+        &alice(&vectors("keys.json"))["secret_hex"],
+    ));
+    let moved = pubky_switch_core::records::IdentityDoc::sign(&key, moved)
+        .expect("sign")
+        .signed()
+        .clone();
+    let delivery = pubky_switch_core::http::IdentityDelivery {
+        identity: moved,
+        prev: Some(v3.doc_hash().expect("hash")),
+    }
+    .to_json();
+    let path = format!("/v1/{}/identity", alice_id());
+    let (answer, ()) = tokio::join!(read(&replay, "wallet", "?after=1:9&wait=1", &at), async {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let delivered = replay
+            .service
+            .handle(signer_request("PUT", &path, delivery, ms(&at)))
+            .await;
+        assert_eq!(
+            delivered.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&delivered.body)
+        );
+    });
+    assert_eq!(
+        (answer.status, body(&answer)["code"].clone()),
+        (503, json!("staged"))
+    );
+    assert!(head_seq(&answer).is_some());
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_feed_401_from_the_page_check_counts_as_a_failed_authentication() {
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let at = revoke_time();
+    let keys = vectors("keys.json");
+    let wallet = app(&keys, "wallet")["app_id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    let wallet_bytes = hex::decode(
+        app(&keys, "wallet")["app_id_bytes_hex"]
+            .as_str()
+            .expect("hex"),
+    )
+    .expect("hex");
+    // The key the request verified with is no longer the app's by the next snapshot: its
+    // record is gone. The page is refused 401, without a head, and the 401 counts.
+    let (answer, ()) = tokio::join!(read(&replay, "wallet", "?after=1:9&wait=1", &at), async {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+            .await
+            .expect("conn");
+        sqlx::query("UPDATE apps SET record = NULL, receive_key = NULL WHERE app_id = $1")
+            .bind(wallet_bytes.as_slice())
+            .execute(&mut conn)
+            .await
+            .expect("update");
+    });
+    assert_eq!(
+        (answer.status, body(&answer)["code"].clone()),
+        (401, json!("bad_signature"))
+    );
+    assert!(header_text(&answer, header::HEAD).is_none());
+    let claimed = (alice_id(), alice_id(), Some(wallet));
+    assert_eq!(
+        replay
+            .service
+            .failed_authentications()
+            .claimed(&claimed, ms(&at)),
+        1
+    );
     replay.db.drop_database().await.expect("drop");
 }

@@ -116,18 +116,32 @@ pub(super) enum FeedStop {
     /// The account's key changed since the request: a temporary failure, signed with the
     /// operator key, since the request's key is retired.
     Retired,
-    /// An error answer at `time_ms`: with `head`, or, for `fallback`, with the head the
-    /// request committed; neither for the mark's `503` or an unauthenticated reader.
-    Refused {
-        /// The error.
-        error: Box<ApiError>,
-        /// The page's signed head.
-        head: Option<SignedHead>,
-        /// Whether it carries the request's own head instead.
-        fallback: bool,
-        /// The service time to sign at.
-        time_ms: u64,
-    },
+    /// An error answer.
+    Refused(Box<PageRefusal>),
+}
+
+/// An error answer to a feed read, at `time_ms`. With `head`, it carries the head the
+/// request itself committed, which the key's mark covers already: a refusal never carries
+/// a head read later, so no refusal can show a head the mark is behind (Switch wire 7.3
+/// step 10). The mark's `503` and an unauthenticated reader's `401` carry none.
+#[derive(Debug)]
+pub(super) struct PageRefusal {
+    /// The error.
+    pub(super) error: ApiError,
+    /// Whether it carries the request's own head.
+    pub(super) head: bool,
+    /// The service time to sign at.
+    pub(super) time_ms: u64,
+}
+
+impl FeedStop {
+    fn refused(error: ApiError, head: bool, time_ms: u64) -> Self {
+        Self::Refused(Box::new(PageRefusal {
+            error,
+            head,
+            time_ms,
+        }))
+    }
 }
 
 /// How an item shows to a reader (Switch wire 7.5).
@@ -279,6 +293,9 @@ enum Reader {
     Checked {
         identity_key: [u8; 32],
         service_key: String,
+        /// The service key's public key and the service's origin, for the staged gate.
+        service_public: [u8; 32],
+        origin: String,
         verified: VerifiedApp,
         time_ms: u64,
     },
@@ -421,9 +438,15 @@ impl PageReader for PageBuilder {
             Reader::Checked {
                 identity_key,
                 service_key,
+                service_public,
+                origin,
                 verified,
                 time_ms,
             } => {
+                // Expiry is judged in service time: the later of the request's stamp and the
+                // last time the account committed. A quiet wait with no commit can so answer
+                // an empty page a few seconds past the certificate's expiry; nothing new
+                // reaches the app, and any commit after the expiry refuses it.
                 self.time_ms = (*time_ms).max(snapshot.stamped_time_ms);
                 if snapshot.service_key != *service_key {
                     self.retired = true;
@@ -441,6 +464,15 @@ impl PageReader for PageBuilder {
                         return false;
                     }
                 };
+                // The staged gate of Switch wire 7.3 step 7: a version delivered during the
+                // wait that no longer names this service ends the page.
+                if !super::rules::names_this_service(doc.as_ref(), origin, service_public) {
+                    self.refusal = Some(Stop::Refused(ApiError::new(
+                        ErrorCode::Staged,
+                        "7.3: the account isn't named by its identity.json",
+                    )));
+                    return false;
+                }
                 match check_own_app(
                     identity_key,
                     doc.as_ref(),
@@ -616,12 +648,7 @@ impl Service {
             self.keys
                 .advance_mark(&read.service_key, mark)
                 .await
-                .map_err(|_| FeedStop::Refused {
-                    error: Box::new(temporary()),
-                    head: None,
-                    fallback: false,
-                    time_ms: answered.time_ms,
-                })?;
+                .map_err(|_| FeedStop::refused(temporary(), true, answered.time_ms))?;
         }
         Ok((answered.answer(), answered.time_ms))
     }
@@ -633,12 +660,7 @@ impl Service {
         read: &FeedRead,
         signer: &ServiceSigner,
     ) -> Result<Answered, FeedStop> {
-        let fallback = |error: ApiError, time_ms| FeedStop::Refused {
-            error: Box::new(error),
-            head: None,
-            fallback: true,
-            time_ms,
-        };
+        let fallback = |error: ApiError, time_ms| FeedStop::refused(error, true, time_ms);
         let mark = self
             .keys
             .mark(&read.service_key)
@@ -649,6 +671,8 @@ impl Service {
             Reader::Checked {
                 identity_key: read.identity_key,
                 service_key: read.service_key.as_str().to_string(),
+                service_public: super::PublicKeyBytes::public_key_bytes(signer),
+                origin: self.origin.clone(),
                 verified: read.reader.clone(),
                 time_ms: read.time_ms,
             },
@@ -679,31 +703,20 @@ impl Service {
             chain_hash,
         };
         let head = sign_head(signer, mark.as_ref(), &read.identity_key, &tip).map_err(|_| {
-            FeedStop::Refused {
-                error: Box::new(ApiError::unavailable(
+            FeedStop::refused(
+                ApiError::unavailable(
                     "7.3: the state is behind its service key's mark; a new generation is needed",
-                )),
-                head: None,
-                fallback: false,
+                ),
+                false,
                 time_ms,
-            }
+            )
         })?;
         match builder.refusal.take() {
             Some(Stop::Refused(error)) => {
-                return Err(FeedStop::Refused {
-                    error: Box::new(error),
-                    head: Some(head),
-                    fallback: false,
-                    time_ms,
-                });
+                return Err(FeedStop::refused(error, true, time_ms));
             }
             Some(Stop::Unauthenticated(error)) => {
-                return Err(FeedStop::Refused {
-                    error: Box::new(error),
-                    head: None,
-                    fallback: false,
-                    time_ms,
-                });
+                return Err(FeedStop::refused(error, false, time_ms));
             }
             None => {}
         }
@@ -1115,6 +1128,72 @@ mod tests {
         // Replaced, or carried by the record since, which drops it: a stub.
         current.apps.insert(target.app_id(), AppDocs::default());
         assert!(!full(&cert, &other, &current));
+    }
+
+    fn signed(name: &str) -> pubky_switch_core::sig::SignedDoc {
+        let documents = vectors("documents.json");
+        let doc = documents["documents"]
+            .as_array()
+            .expect("documents")
+            .iter()
+            .find(|doc| doc["name"] == name)
+            .unwrap_or_else(|| panic!("no {name}"))
+            .clone();
+        serde_json::from_value(doc["signed"].clone()).expect("signed")
+    }
+
+    #[test]
+    fn test_feed_reader_takes_a_reducing_renewal_in_the_snapshot() {
+        // The wallet's renewal, which drops manage_contacts, lands during a wait: the next
+        // page reads with the renewed certificate, the one the wallet is checked against now.
+        let alice = alice_key();
+        let op = SignedOp::peek(row(3).item.as_ref().expect("item")).expect("op");
+        let OpKind::AppPut { record } = &op.body().kind else {
+            panic!("seq 3 is the wallet's app.put");
+        };
+        let held =
+            pubky_switch_core::records::AppRecord::verify(record, &alice.public()).expect("record");
+        let renewed = signed("wallet certificate, renewed");
+        let renewed_cert = AppCert::verify(&renewed, &alice.public()).expect("renewed");
+        let doc = signed("alice identity.json, wallet renewal in progress");
+        let identity = IdentityDoc::verify(&doc, &alice.public()).expect("doc");
+        let app = held.cert().app_id();
+        let mut snapshot = snapshot(7, 9, 9);
+        snapshot.service_key = "key".into();
+        snapshot.stamped_time_ms = renewed_cert.issued_at() + 1;
+        snapshot.identity_doc = Some(doc);
+        snapshot.reader = Some(crate::store::StoredApp {
+            app_id: app,
+            record: Some(record.clone()),
+            record_at_ms: Some(0),
+            renewed_cert: Some(renewed.clone()),
+            receive_key: None,
+            cursor: None,
+            reachable_since: None,
+            full_requested_ms: None,
+        });
+        snapshot.current.records.insert(8, "manage_contacts".into());
+        let mut builder = PageBuilder::with(
+            Reader::Checked {
+                identity_key: alice.public(),
+                service_key: "key".into(),
+                service_public: identity.inbox().service_key,
+                origin: identity.inbox().url.clone(),
+                verified: VerifiedApp::reading(app, held.cert().signing_key()),
+                time_ms: 0,
+            },
+            100,
+            usize::MAX,
+        );
+        assert!(builder.begin(&snapshot));
+        assert_eq!(
+            builder.cert.as_ref().map(AppCert::hash),
+            Some(renewed_cert.hash())
+        );
+        assert!(builder.take(&snapshot, row(8)));
+        let page = builder.finish(&snapshot).expect("page");
+        let item: Value = serde_json::from_slice(&page.items[0]).expect("json");
+        assert_eq!(item["type"], "stub");
     }
 
     #[tokio::test]
