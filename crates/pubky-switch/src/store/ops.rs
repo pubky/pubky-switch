@@ -263,19 +263,6 @@ impl AccountTxn {
         Ok(())
     }
 
-    /// Note an own app's last authenticated request (Switch wire 7.3 step 6).
-    pub async fn set_last_seen(&mut self, app_id: &[u8; 16], at_ms: u64) -> Result<(), StoreError> {
-        let id = self.head().id.clone();
-        sqlx::query("UPDATE apps SET last_seen_ms = $3 WHERE account_id = $1 AND app_id = $2")
-            .bind(id)
-            .bind(app_id.as_slice())
-            .bind(to_db(at_ms, "last_seen_ms")?)
-            .execute(self.conn())
-            .await
-            .map_err(db)?;
-        Ok(())
-    }
-
     /// Which of `kids` some app of the account registered.
     pub async fn registered_kids(&mut self, kids: &[[u8; 8]]) -> Result<Vec<[u8; 8]>, StoreError> {
         let id = self.head().id.clone();

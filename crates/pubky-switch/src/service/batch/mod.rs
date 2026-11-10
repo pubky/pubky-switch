@@ -327,10 +327,9 @@ impl Service {
             return Ok(None);
         };
         let cert = self.authenticate_app(txn, held, verified, time_ms).await?;
-        // Step 6 of Switch wire 7.3: an authenticated own app's last-seen time.
-        txn.set_last_seen(&verified.app, time_ms)
-            .await
-            .map_err(|e| storage(&e))?;
+        // Step 6 of Switch wire 7.3: an authenticated own app's last-seen time, which a
+        // refusal of the endpoint doesn't undo.
+        txn.note_last_seen(verified.app, time_ms);
         Ok(Some(cert))
     }
 

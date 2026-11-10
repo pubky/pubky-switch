@@ -728,3 +728,123 @@ async fn test_ops_first_call_with_an_unlisted_certificate() {
     );
     replay.db.drop_database().await.expect("drop");
 }
+
+#[tokio::test]
+async fn test_ops_operation_signature_failures_count_against_the_source() {
+    let limits = Limits {
+        auth_failures_per_source_per_min: 1,
+        ..Limits::default()
+    };
+    let Some(replay) = registered(limits, false).await else {
+        return;
+    };
+    // A request the wallet signed, carrying an operation whose signature doesn't verify.
+    let keys = vectors("keys.json");
+    let ops = wallet_batch(21, 1, vec![contact(bob())]);
+    let mut entry = serde_json::to_value(ops[0].signed()).expect("op");
+    entry["sig"] = Value::String(pubky_switch_core::enc::b64(&[9; 64]));
+    let body = serde_json::to_vec(&serde_json::json!({ "ops": [entry] })).expect("body");
+    let send = || {
+        let mut request = app_request(
+            app(&keys, "wallet"),
+            "POST",
+            &ops_path(),
+            body.clone(),
+            ms(AT),
+        );
+        request.source = Some(pubky_switch::http::source::NetworkSource::of(
+            "203.0.113.7".parse().expect("ip"),
+        ));
+        request
+    };
+    let (status, body, _) = answer_of(replay.service.handle(send()).await);
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (401, Some("bad_signature"))
+    );
+    let (status, body, _) = answer_of(replay.service.handle(send()).await);
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (429, Some("rate_limited")),
+        "{body}"
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_ops_refusal_after_writing_leaves_nothing_but_the_stamp() {
+    let Some(replay) = registered(Limits::default(), false).await else {
+        return;
+    };
+    // The batch is chained, then keeping its claim entry fails.
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    for statement in [
+        "CREATE FUNCTION refuse() RETURNS trigger AS $$ BEGIN RAISE EXCEPTION 'refused'; END $$ \
+         LANGUAGE plpgsql",
+        "CREATE TRIGGER refuse BEFORE INSERT ON claim_entries FOR EACH ROW EXECUTE FUNCTION refuse()",
+    ] {
+        sqlx::query(statement)
+            .execute(&mut conn)
+            .await
+            .expect("trigger");
+    }
+    let attempt = OpKind::Claim(ClaimFields {
+        claim_key: vec![7; 32],
+        kind: ClaimType::Attempt,
+        expected_step: 0,
+        attempt_id: vec![8; 16],
+        orphan_after: Some(60),
+        deadline: None,
+        basis: None,
+        evidence_ref: None,
+    });
+    let ops = wallet_batch(22, 1, vec![contact(bob()), (Vec::new(), attempt)]);
+    let (status, body) = post_app(&replay, "wallet", &ops, None, AT).await;
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (503, Some("unavailable")),
+        "{body}"
+    );
+    let (last_seq, items, entries, claims, last_seen): (i64, i64, i64, i64, Option<i64>) =
+        sqlx::query_as(
+            "SELECT a.last_seq, \
+             (SELECT count(*) FROM chain_items c WHERE c.account_id = a.id), \
+             (SELECT count(*) FROM list_entries l WHERE l.account_id = a.id), \
+             (SELECT count(*) FROM claims k WHERE k.account_id = a.id), \
+             (SELECT max(last_seen_ms) FROM apps p WHERE p.account_id = a.id) \
+             FROM accounts a WHERE a.id = $1",
+        )
+        .bind(alice_id())
+        .fetch_one(&mut conn)
+        .await
+        .expect("account");
+    assert_eq!(
+        (last_seq, items, entries, claims),
+        (4, 4, 0, 0),
+        "nothing kept"
+    );
+    assert_eq!(
+        last_seen,
+        Some(i64::try_from(ms(AT)).expect("time")),
+        "the app was seen"
+    );
+    conn.close().await.expect("close");
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_ops_cursor_never_moves_back() {
+    let Some(replay) = registered(Limits::default(), false).await else {
+        return;
+    };
+    let at = |seq| Position { generation: 1, seq };
+    let (status, body) = post_app(&replay, "wallet", &[], Some(at(4)), AT).await;
+    assert_eq!(status, 200, "{body}");
+    // Behind the cursor: no error, and the cursor stays.
+    let (status, body) = post_app(&replay, "wallet", &[], Some(at(2)), AT).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(wallet_app(&replay).await.cursor, Some(at(4)));
+    replay.db.drop_database().await.expect("drop");
+}
