@@ -15,9 +15,9 @@ use serde_json::{Map, json};
 
 use super::*;
 use crate::app::{
-    Alarm, AppError, AppEvent, ClaimOp, Collection, Delivery, IdentityRefresh, ObligationDeadline,
-    OpBatch, OutgoingMessage, RecordContent, RecordJob, RecordTarget, Refusal, SentMessage,
-    claim_conflict,
+    Alarm, AppError, AppEvent, ClaimOp, Collection, Delivery, IdentityRefresh,
+    MAX_REGRESSION_REASON_BYTES, MAX_SEEN_MARK_BYTES, ObligationDeadline, OpBatch, OutgoingMessage,
+    RecordContent, RecordJob, RecordTarget, Refusal, SentMessage, claim_conflict,
 };
 use crate::store::StoreHandle;
 use crate::store::{Fault as StoreFault, FaultStore};
@@ -33,6 +33,10 @@ const HOUR: u64 = 3_600_000;
 #[derive(Default)]
 pub(crate) struct ItemsProtocol {
     pub(crate) sample: SampleProtocol,
+    /// Bytes added to each mark, and to each rule a regression gives.
+    pub(crate) pad: std::sync::Mutex<usize>,
+    /// Bytes added to the next marks, one each, ahead of `pad`.
+    pub(crate) pads: std::sync::Mutex<std::collections::VecDeque<usize>>,
 }
 
 pub(crate) fn items() -> Collection {
@@ -114,16 +118,21 @@ impl Protocol for ItemsProtocol {
             }
         }
         let all: Vec<&str> = all.iter().map(String::as_str).collect();
-        Some(super::shared_flows::value(&all))
+        let mut mark = super::shared_flows::value(&all);
+        let pad = self.pads.lock().unwrap().pop_front();
+        let pad = pad.unwrap_or(*self.pad.lock().unwrap());
+        mark.extend(std::iter::repeat_n(b' ', pad));
+        Some(mark)
     }
 
     fn record_regression(&self, _: &str, seen: &[u8], value: Option<&[u8]>) -> Option<String> {
         let value = value?;
         let held = ids(Some(value));
+        let pad = "é".repeat(*self.pad.lock().unwrap());
         ids(Some(seen))
             .iter()
             .any(|id| !held.contains(id))
-            .then(|| "sample: an item seen was dropped".to_owned())
+            .then(|| format!("sample: an item seen was dropped{pad}"))
     }
 
     fn sent_record(
@@ -1173,6 +1182,165 @@ async fn test_records_without_the_current_key_writes_nothing() {
             .record(&app.record_key(&target).unwrap())
             .is_none()
     );
+}
+
+fn uncheckable(events: &[AppEvent], key: &[u8; 32]) -> bool {
+    events.iter().any(|e| {
+        matches!(
+            e,
+            AppEvent::RecordUncheckable { key: k, mark_bytes, .. }
+                if k == key && *mark_bytes > MAX_SEEN_MARK_BYTES as u64
+        )
+    })
+}
+
+#[tokio::test]
+async fn test_records_unmarkable_write_from_another_app_keeps_the_mark_held() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    let target = s.target("n1");
+    let key = wallet.record_key(&target).unwrap();
+    wallet
+        .put_record(&target, &value(&["a", "b"]), vec![])
+        .await
+        .unwrap();
+    phone.receive(None).await.unwrap();
+    // The wallet's next write is one the phone's mark of can't be kept.
+    wallet
+        .put_record(&target, &value(&["a", "b", "c"]), vec![])
+        .await
+        .unwrap();
+    *s.protocol.pad.lock().unwrap() = MAX_SEEN_MARK_BYTES;
+    let report = phone.receive(None).await.unwrap();
+    *s.protocol.pad.lock().unwrap() = 0;
+    // The write is taken, the protocol is told, durably, and the mark held stays.
+    let shared = phone.shared_record(&key).await.unwrap().unwrap();
+    assert_eq!(ids(shared.content.value()), ["a", "b", "c"]);
+    assert!(uncheckable(&report.events, &key), "{:?}", report.events);
+    assert!(uncheckable(&phone.kept_duties().await.unwrap(), &key));
+    let held = phone.record_seen(&key).await.unwrap().unwrap();
+    assert_eq!(ids(Some(&held)), ["a", "b"]);
+    // So a later write that drops what was seen before is still flagged.
+    wallet
+        .put_record(&target, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    let report = phone.receive(None).await.unwrap();
+    assert!(
+        report
+            .events
+            .iter()
+            .any(|e| matches!(e, AppEvent::WriteFlagged { .. })),
+        "{:?}",
+        report.events
+    );
+}
+
+#[tokio::test]
+async fn test_records_own_write_whose_mark_wont_fit_is_refused() {
+    let s = Setup::new();
+    let mut phone = s.join("phone").await;
+    let target = s.target("n1");
+    let key = phone.record_key(&target).unwrap();
+    *s.protocol.pad.lock().unwrap() = MAX_SEEN_MARK_BYTES;
+    let error = phone
+        .put_record(&target, &value(&["a"]), vec![])
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, AppError::Refused(Refusal::Usage(_))),
+        "{error:?}"
+    );
+    assert!(s.w.switch.record(&key).is_none());
+    // Within the bound, it is sent.
+    *s.protocol.pad.lock().unwrap() = 0;
+    phone
+        .put_record(&target, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    assert!(s.w.switch.record(&key).is_some());
+}
+
+#[tokio::test]
+async fn test_records_own_write_unmarkable_once_taken_drops_the_mark_held() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    let target = s.target("n1");
+    let key = wallet.record_key(&target).unwrap();
+    wallet
+        .put_record(&target, &value(&["a", "b"]), vec![])
+        .await
+        .unwrap();
+    phone.receive(None).await.unwrap();
+    // The phone drops b itself. Its mark fits when the write is built, not once taken.
+    s.protocol
+        .pads
+        .lock()
+        .unwrap()
+        .extend([0, MAX_SEEN_MARK_BYTES]);
+    phone
+        .put_record(&target, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    assert!(s.protocol.pads.lock().unwrap().is_empty());
+    assert!(uncheckable(
+        &phone.unacknowledged_events().await.unwrap(),
+        &key
+    ));
+    assert_eq!(phone.record_seen(&key).await.unwrap(), None);
+    // The wallet builds on the phone's write, honestly: nothing it drops was seen after it.
+    wallet.receive(None).await.unwrap();
+    wallet
+        .put_record(&target, &value(&["a", "c"]), vec![])
+        .await
+        .unwrap();
+    let report = phone.receive(None).await.unwrap();
+    assert!(
+        !report
+            .events
+            .iter()
+            .any(|e| matches!(e, AppEvent::WriteFlagged { .. })),
+        "{:?}",
+        report.events
+    );
+    let shared = phone.shared_record(&key).await.unwrap().unwrap();
+    assert_eq!(ids(shared.content.value()), ["a", "c"]);
+}
+
+#[tokio::test]
+async fn test_records_flagged_rule_is_cut_to_its_bound() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    let target = s.target("n1");
+    wallet
+        .put_record(&target, &value(&["a", "b"]), vec![])
+        .await
+        .unwrap();
+    phone.receive(None).await.unwrap();
+    // A rule of two-byte characters, well over the bound.
+    *s.protocol.pad.lock().unwrap() = 300;
+    wallet
+        .put_record(&target, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    let report = phone.receive(None).await.unwrap();
+    let reason = report
+        .events
+        .iter()
+        .find_map(|e| match e {
+            AppEvent::WriteFlagged { reason, .. } => Some(reason.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(
+        reason.len() <= MAX_REGRESSION_REASON_BYTES,
+        "{}",
+        reason.len()
+    );
+    assert!(reason.starts_with("sample: an item seen was dropped"));
 }
 
 #[tokio::test]

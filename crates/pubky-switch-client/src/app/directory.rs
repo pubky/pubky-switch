@@ -98,6 +98,20 @@ pub(crate) struct CachedDirectory {
     pub(crate) read_ms: u64,
 }
 
+impl CachedDirectory {
+    /// The directory without its apps, always stale, for one too large to keep: what the
+    /// next read compares with, the switch, generation, versions and read time, so a
+    /// provider loss since is still found and its re-sends made (Switch spec 8.1). It
+    /// sends to nothing: a stale copy is read again before any send.
+    fn stub(&self) -> Self {
+        Self {
+            apps: Vec::new(),
+            stale: true,
+            ..self.clone()
+        }
+    }
+}
+
 /// `peer/<pubky>`: what a counterparty's switch holds of the own `identity.json`, and when
 /// the app last wrote there.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -906,11 +920,11 @@ impl App {
         let mut tx = self.tx()?;
         keep_directory(&mut tx, pubky, &cached)?;
         match self.commit(tx).await {
-            // A store that refuses it as too large keeps none either: this send uses it.
+            // A store that refuses it as too large keeps only its stub: this send uses it.
             Err(AppError::Store(StoreError::TooLarge { .. })) => {
                 self.reload_now().await?;
                 let mut tx = self.tx()?;
-                tx.delete(&dir_key(pubky))?;
+                tx.put(&dir_key(pubky), &cached.stub())?;
                 self.commit(tx).await?;
             }
             committed => committed?,
@@ -1150,6 +1164,11 @@ impl App {
         let Some(mut cached) = self.cached_directory(pubky).await? else {
             return Ok(());
         };
+        if cached.stale && cached.apps.is_empty() {
+            // A stub, or a copy without apps read again before the next seal anyway: the
+            // answer has nothing to update.
+            return Ok(());
+        }
         let mut tx = self.tx()?;
         let mut floors = HashMap::new();
         for entry in array(current, "receive_keys") {
@@ -1404,9 +1423,10 @@ impl App {
     }
 }
 
-/// Cache `cached` as `pubky`'s directory, or, when it is over the store's value size, cache
-/// none: a directory may take up to 104 MiB at an app limit of 255 (Switch wire 9), and one
-/// too large to keep is read again at each send instead, which then still goes.
+/// Cache `cached` as `pubky`'s directory, or, when it is over the store's value size, its
+/// stub ([`CachedDirectory::stub`]): a directory may take up to 104 MiB at an app limit of
+/// 255 (Switch wire 9), and one too large to keep is read again at each send instead, which
+/// then still goes, and still finds a provider loss since the read before (Switch spec 8.1).
 fn keep_directory(tx: &mut Tx, pubky: &[u8; 32], cached: &CachedDirectory) -> Result<(), AppError> {
     let key = dir_key(pubky);
     let size = super::state::encode(cached)?
@@ -1415,7 +1435,7 @@ fn keep_directory(tx: &mut Tx, pubky: &[u8; 32], cached: &CachedDirectory) -> Re
     if u64::try_from(size).unwrap_or(u64::MAX) <= crate::store::MAX_VALUE_BYTES {
         tx.put(&key, cached)
     } else {
-        tx.delete(&key)
+        tx.put(&key, &cached.stub())
     }
 }
 
@@ -1475,6 +1495,73 @@ mod tests {
         assert!(app_id_of(entry, "app_id").is_none());
         assert!(doc_of(entry, "record").is_none());
         assert_eq!(array(&current, "added_apps").count(), 0);
+    }
+
+    fn directory_of(apps: usize, record_bytes: usize) -> CachedDirectory {
+        CachedDirectory {
+            origin: "https://bob-switch.example".into(),
+            service_key: [3; 32],
+            generation: 4,
+            identity_version: 7,
+            directory_version: 9,
+            apps_version: 2,
+            apps: (0..apps)
+                .map(|n| CachedApp {
+                    app_id: [u8::try_from(n).unwrap(); 16],
+                    record: SignedDoc {
+                        body: "A".repeat(record_bytes),
+                        sig: "A".repeat(86),
+                    },
+                    receive_key: None,
+                })
+                .collect(),
+            stale: false,
+            read_ms: 11,
+        }
+    }
+
+    /// The value `tx` puts at `pubky`'s directory key.
+    fn kept(tx: &Tx, pubky: &[u8; 32]) -> CachedDirectory {
+        let key = dir_key(pubky);
+        let value = tx
+            .pending_writes()
+            .iter()
+            .find_map(|write| match write {
+                crate::store::Write::Put { key: k, value, .. } if k == key.as_bytes() => {
+                    Some(value.clone())
+                }
+                _ => None,
+            })
+            .unwrap();
+        super::super::state::decode(&value).unwrap()
+    }
+
+    #[test]
+    fn test_directory_over_the_value_size_is_kept_as_its_stub() {
+        // 38 apps of 450 KB each: over the 16 MiB value size, as a directory at an app limit
+        // of 255 may be (Switch wire 9).
+        let big = directory_of(38, 450_000);
+        let mut tx = Tx::new("ns");
+        keep_directory(&mut tx, &[1; 32], &big).unwrap();
+        let stub = kept(&tx, &[1; 32]);
+        assert!(stub.apps.is_empty() && stub.stale);
+        assert_eq!(
+            (stub.origin.as_str(), stub.generation, stub.read_ms),
+            (big.origin.as_str(), big.generation, big.read_ms)
+        );
+        assert_eq!(
+            (
+                stub.identity_version,
+                stub.directory_version,
+                stub.apps_version
+            ),
+            (7, 9, 2)
+        );
+        // One that fits is kept whole.
+        let small = directory_of(2, 1_000);
+        let mut tx = Tx::new("ns");
+        keep_directory(&mut tx, &[1; 32], &small).unwrap();
+        assert_eq!(kept(&tx, &[1; 32]), small);
     }
 
     #[test]

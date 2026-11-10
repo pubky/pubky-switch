@@ -38,6 +38,7 @@ use pubky_switch_core::enc::serde_b64;
 use super::error::Alarm;
 use super::feed::OwedCall;
 use super::protocol::{MissedEntries, ResendNeeded, StoreFailure};
+use super::recovery::ProviderLoss;
 
 /// The stable ID of a duty event ([`AppEvent::is_duty`]): the store's epoch, and a counter.
 ///
@@ -199,8 +200,10 @@ pub enum AppEvent {
     /// The entry stays unprocessed until a read processes it; the host repairs or frees its
     /// store.
     StoreFailing {
-        /// The entry's `seq`.
+        /// The entry's `seq`, the one it was read at for an entry stored locally.
         seq: u64,
+        /// The entry's local ID when it is stored locally.
+        stored_id: Option<u64>,
         /// The reads in a row that ended in a retry at the entry, this one included.
         reads: u32,
         /// When the first of them was, device time in Unix milliseconds.
@@ -220,8 +223,11 @@ pub enum AppEvent {
     Parked {
         /// The duty event's ID; `None` for an entry that later reads try again.
         id: Option<EventId>,
-        /// The entry's `seq`.
+        /// The `seq` the entry was read at.
         seq: u64,
+        /// The entry's local ID while it is stored ([`super::App`] keys stored entries by
+        /// it): it never changes, across provider changes too.
+        stored_id: u64,
         /// Why.
         reason: ParkReason,
     },
@@ -233,8 +239,12 @@ pub enum AppEvent {
     EffectRefused {
         /// The duty event's ID.
         id: EventId,
-        /// The entry's `seq`.
+        /// The `seq` the entry was read at.
         seq: u64,
+        /// The entry's local ID while it is stored ([`super::App`] keys stored entries by
+        /// it): it never changes, across provider changes too.
+        stored_id: u64,
+
         /// The sender identity.
         sender: [u8; 32],
         /// The message ID.
@@ -256,8 +266,12 @@ pub enum AppEvent {
     EffectUncertain {
         /// The duty event's ID.
         id: EventId,
-        /// The entry's `seq`.
+        /// The `seq` the entry was read at.
         seq: u64,
+        /// The entry's local ID while it is stored ([`super::App`] keys stored entries by
+        /// it): it never changes, across provider changes too.
+        stored_id: u64,
+
         /// The sender identity.
         sender: [u8; 32],
         /// The message ID.
@@ -269,8 +283,11 @@ pub enum AppEvent {
     },
     /// An entry stored locally was processed.
     Unparked {
-        /// The entry's `seq`.
+        /// The `seq` the entry was read at.
         seq: u64,
+        /// The entry's local ID while it is stored ([`super::App`] keys stored entries by
+        /// it): it never changes, across provider changes too.
+        stored_id: u64,
     },
     /// An entry wrapped to a key the app doesn't hold was passed with the cursor (Switch
     /// spec 8.2, 12.4); the protocol was asked to request a re-send when allowed.
@@ -587,6 +604,24 @@ pub enum AppEvent {
         /// The rule, without content.
         reason: String,
     },
+    /// The protocol's mark of what the app has seen in a record after a write
+    /// ([`super::Protocol::record_seen`]) was over [`super::MAX_SEEN_MARK_BYTES`], so the
+    /// record's writes can't be checked against what the app has seen from that write on
+    /// (Switch spec 8.2). For another app's write the record keeps the mark it held, so
+    /// what was seen before is still checked; for an own write the mark held goes. A duty
+    /// event, of the class of [`AppEvent::WriteFlagged`].
+    RecordUncheckable {
+        /// The duty event's ID.
+        id: EventId,
+        /// The record key.
+        key: [u8; 32],
+        /// The app the write names.
+        writer: [u8; 16],
+        /// The write's generation and `seq`.
+        version: pubky_switch_core::ops::RecordVersion,
+        /// The size of the mark that wasn't kept.
+        mark_bytes: u64,
+    },
     /// Uploads after a provider loss conflict with a record's current write (Switch spec
     /// 12.6).
     RecordDivergent {
@@ -639,6 +674,7 @@ impl AppEvent {
             | Self::RestoreLeftBehind { id, .. }
             | Self::AttemptDropped { id, .. }
             | Self::MessageUndelivered { id, .. }
+            | Self::RecordUncheckable { id, .. }
             | Self::LocalWritesRefused { id, .. } => Some(*id),
             _ => None,
         }
@@ -665,26 +701,44 @@ pub enum RefusedCall {
     },
     /// [`super::Protocol::missed`].
     Missed(MissedEntries),
-    /// [`super::Protocol::provider_lost`], its [`super::LossActions::local`], at the loss
-    /// of `lost_generation`; the loss went on without them.
-    ProviderLost {
-        /// The generation lost.
-        lost_generation: u64,
-    },
+    /// [`super::Protocol::provider_lost`], its [`super::LossActions::local`], at this loss;
+    /// the loss went on without them.
+    ProviderLost(ProviderLoss),
 }
 
 /// A [`RefusedCall`] as a duty event keeps it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum KeptRefusal {
-    Owed { seq: u64, call: OwedCall },
-    Loss { lost_generation: u64 },
+    Owed {
+        seq: u64,
+        call: OwedCall,
+    },
+    Loss {
+        lost_generation: u64,
+        generation: u64,
+        declared_at_ms: u64,
+        accepted_from_ms: u64,
+        uncertain_until_ms: u64,
+    },
 }
 
 impl KeptRefusal {
     fn call(self) -> RefusedCall {
         match self {
             Self::Owed { seq, call } => call.refused(seq),
-            Self::Loss { lost_generation } => RefusedCall::ProviderLost { lost_generation },
+            Self::Loss {
+                lost_generation,
+                generation,
+                declared_at_ms,
+                accepted_from_ms,
+                uncertain_until_ms,
+            } => RefusedCall::ProviderLost(ProviderLoss {
+                lost_generation,
+                generation,
+                declared_at_ms,
+                accepted_from_ms,
+                uncertain_until_ms,
+            }),
         }
     }
 }
@@ -705,10 +759,12 @@ pub struct ClaimAttempt {
 pub(crate) enum Duty {
     Parked {
         seq: u64,
+        stored_id: u64,
         reason: ParkReason,
     },
     EffectRefused {
         seq: u64,
+        stored_id: u64,
         #[serde(with = "serde_b64")]
         sender: [u8; 32],
         msg_id: String,
@@ -717,6 +773,7 @@ pub(crate) enum Duty {
     },
     EffectUncertain {
         seq: u64,
+        stored_id: u64,
         #[serde(with = "serde_b64")]
         sender: [u8; 32],
         msg_id: String,
@@ -746,6 +803,15 @@ pub(crate) enum Duty {
     LocalWritesRefused {
         call: KeptRefusal,
     },
+    RecordUncheckable {
+        #[serde(with = "serde_b64")]
+        key: [u8; 32],
+        #[serde(with = "serde_b64")]
+        writer: [u8; 16],
+        generation: u64,
+        version: u64,
+        mark_bytes: u64,
+    },
     RestoreLeftBehind {
         duty_events: u64,
         owed_calls: u64,
@@ -756,13 +822,19 @@ impl Duty {
     /// The event reported for it, with its ID.
     pub(crate) fn event(self, id: EventId) -> AppEvent {
         match self {
-            Self::Parked { seq, reason } => AppEvent::Parked {
+            Self::Parked {
+                seq,
+                stored_id,
+                reason,
+            } => AppEvent::Parked {
                 id: Some(id),
                 seq,
+                stored_id,
                 reason,
             },
             Self::EffectRefused {
                 seq,
+                stored_id,
                 sender,
                 msg_id,
                 kind,
@@ -770,6 +842,7 @@ impl Duty {
             } => AppEvent::EffectRefused {
                 id,
                 seq,
+                stored_id,
                 sender,
                 msg_id,
                 kind,
@@ -777,6 +850,7 @@ impl Duty {
             },
             Self::EffectUncertain {
                 seq,
+                stored_id,
                 sender,
                 msg_id,
                 kind,
@@ -784,6 +858,7 @@ impl Duty {
             } => AppEvent::EffectUncertain {
                 id,
                 seq,
+                stored_id,
                 sender,
                 msg_id,
                 kind,
@@ -805,6 +880,19 @@ impl Duty {
             Self::LocalWritesRefused { call } => AppEvent::LocalWritesRefused {
                 id,
                 call: call.call(),
+            },
+            Self::RecordUncheckable {
+                key,
+                writer,
+                generation,
+                version,
+                mark_bytes,
+            } => AppEvent::RecordUncheckable {
+                id,
+                key,
+                writer,
+                version: pubky_switch_core::ops::RecordVersion::new(generation, version),
+                mark_bytes,
             },
             Self::RestoreLeftBehind {
                 duty_events,

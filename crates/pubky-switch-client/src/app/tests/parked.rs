@@ -126,7 +126,7 @@ async fn load_on(w: &World, protocol: &Arc<ParkingProtocol>, store: Arc<dyn Stat
     .unwrap()
 }
 
-/// A note from bob stored as `mode` makes it. Returns its `seq` and message.
+/// A note from bob stored as `mode` makes it. Returns its local ID and message.
 async fn parked_as(
     w: &World,
     app: &mut App,
@@ -137,11 +137,11 @@ async fn parked_as(
     let (seq, message) = w.note(app.app_id(), "parked note");
     app.receive(None).await.unwrap();
     protocol.set(Mode::Plain);
-    (seq, message)
+    (app.stored_id_at(seq).unwrap(), message)
 }
 
 /// A note whose effect was applied but whose answer was lost, kept past the window in
-/// which a resend tells: stored as uncertain. Returns its `seq` and message.
+/// which a resend tells: stored as uncertain. Returns its local ID and message.
 async fn uncertain(w: &World, app: &mut App) -> (u64, Message) {
     let (seq, message) = w.note(app.app_id(), "uncertain note");
     w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
@@ -149,11 +149,12 @@ async fn uncertain(w: &World, app: &mut App) -> (u64, Message) {
     w.clock.advance_ms(31 * DAY_MS);
     w.switch.lock().batches.clear();
     app.receive(None).await.unwrap();
+    let id = app.stored_id_at(seq).unwrap();
     assert_eq!(
         app.parked_entries().await.unwrap(),
-        vec![(seq, ParkReason::Uncertain)]
+        vec![(id, ParkReason::Uncertain)]
     );
-    (seq, message)
+    (id, message)
 }
 
 /// Bob sends `message` again; returns whether the read took it as a duplicate.
@@ -190,7 +191,7 @@ async fn test_parked_entries_are_listed_and_viewed_in_seq_order() {
         ]
     );
     let view = app.parked_entry(wide).await.unwrap().unwrap();
-    assert_eq!(view.seq, wide);
+    assert_eq!(view.stored_id, wide);
     assert_eq!(view.sender, w.bob.public());
     assert_eq!(view.reason, ParkReason::TooManyOperations);
     let read = view.message.clone().unwrap();
@@ -232,6 +233,7 @@ async fn test_parked_forget_of_an_entry_tried_again_is_refused() {
     protocol.set(Mode::Rejected);
     let (seq, _) = w.note(app.app_id(), "parked note");
     app.receive(None).await.unwrap();
+    let seq = app.stored_id_at(seq).unwrap();
     assert!(usage(app.forget_parked(seq).await));
     assert_eq!(
         app.parked_entries().await.unwrap(),
@@ -258,7 +260,7 @@ async fn test_parked_release_of_an_uncertain_entry_runs_it_once() {
     assert!(
         has(
             &report.events,
-            |e| matches!(e, AppEvent::Unparked { seq: s } if *s == seq)
+            |e| matches!(e, AppEvent::Unparked { stored_id: s, .. } if *s == seq)
         ),
         "{:?}",
         report.events

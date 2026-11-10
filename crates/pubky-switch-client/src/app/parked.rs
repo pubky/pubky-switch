@@ -26,8 +26,9 @@ use crate::error::StoreError;
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct ParkedMessage {
-    /// The entry's `seq`, in the generation it was read at, renumbered after a provider
-    /// loss (`STATE.md`).
+    /// The entry's local ID, which never changes.
+    pub stored_id: u64,
+    /// The `seq` the entry was read at, in the generation it was read at.
     pub seq: u64,
     /// The sender identity.
     pub sender: [u8; 32],
@@ -55,7 +56,8 @@ impl std::fmt::Debug for ParkedMessage {
     // The plaintext and body are message content: only what names the entry is shown.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut out = f.debug_struct("ParkedMessage");
-        out.field("seq", &self.seq)
+        out.field("stored_id", &self.stored_id)
+            .field("seq", &self.seq)
             .field("sender", &pubky_id(&self.sender))
             .field("accepted_at_ms", &self.accepted_at_ms)
             .field("reason", &self.reason);
@@ -67,12 +69,13 @@ impl std::fmt::Debug for ParkedMessage {
     }
 }
 
-fn no_entry(seq: u64) -> AppError {
-    Refusal::Usage(format!("no entry is stored locally at seq {seq}")).into()
+fn no_entry(id: u64) -> AppError {
+    Refusal::Usage(format!("no entry is stored locally at local ID {id}")).into()
 }
 
 impl App {
-    /// The entries stored locally, with why each was stored, in `seq` order.
+    /// The entries stored locally, by local ID, with why each was stored, in local ID
+    /// order.
     ///
     /// # Errors
     ///
@@ -84,21 +87,21 @@ impl App {
                 .state
                 .parked
                 .iter()
-                .map(|(seq, stored)| (*seq, stored.reason))
+                .map(|(id, stored)| (*id, stored.reason))
                 .collect())
         })
         .await
     }
 
-    /// The entry stored locally at `seq`, `None` when there is none.
+    /// The entry stored locally at local ID `id`, `None` when there is none.
     ///
     /// # Errors
     ///
     /// A store failure; [`StoreError::Corrupt`] for a stored plaintext that doesn't decode.
-    pub async fn parked_entry(&mut self, seq: u64) -> Result<Option<ParkedMessage>, AppError> {
+    pub async fn parked_entry(&mut self, id: u64) -> Result<Option<ParkedMessage>, AppError> {
         Box::pin(async move {
             self.ready_local().await?;
-            let Some(stored) = self.state.parked.get(&seq).cloned() else {
+            let Some(stored) = self.state.parked.get(&id).cloned() else {
                 return Ok(None);
             };
             let plaintext = MessagePlaintext::decode(&stored.plaintext)
@@ -112,9 +115,10 @@ impl App {
                 })
                 .collect();
             let message = Message::parse(plaintext.json(), &opaque).ok();
-            let retry = self.state.retries.get(&seq).copied();
+            let retry = self.state.stored_retries.get(&id).copied();
             Ok(Some(ParkedMessage {
-                seq,
+                stored_id: id,
+                seq: stored.seq,
                 sender: stored.sender,
                 accepted_at_ms: stored.accepted_at_ms,
                 reason: stored.reason,
@@ -129,7 +133,7 @@ impl App {
         .await
     }
 
-    /// Forget the entry stored locally at `seq`, one that isn't tried again
+    /// Forget the entry stored locally at local ID `id`, one that isn't tried again
     /// ([`ParkReason::tried_again`] is `false`), once the host and its protocol are done
     /// with it. In one commit: the entry and the count of the store's retries at it go, and
     /// its message stays processed, so a re-send of it is a duplicate, not applied (Switch
@@ -141,16 +145,16 @@ impl App {
     ///
     /// # Errors
     ///
-    /// [`Refusal::Usage`] for a `seq` with no entry stored, or one that is tried again;
+    /// [`Refusal::Usage`] for an ID with no entry stored, or one that is tried again;
     /// [`StoreError::Corrupt`] for a stored plaintext that doesn't decode; a store failure,
     /// after which nothing was written.
-    pub async fn forget_parked(&mut self, seq: u64) -> Result<(), AppError> {
+    pub async fn forget_parked(&mut self, id: u64) -> Result<(), AppError> {
         Box::pin(async move {
             self.ready_local().await?;
-            let stored = self.stored(seq)?;
+            let stored = self.stored(id)?;
             if stored.reason.tried_again() {
                 return Err(Refusal::Usage(format!(
-                    "the entry at seq {seq} is tried again ({:?}): it can't be forgotten",
+                    "the entry at local ID {id} is tried again ({:?}): it can't be forgotten",
                     stored.reason
                 ))
                 .into());
@@ -159,22 +163,22 @@ impl App {
                 .map_err(|_| AppError::Store(StoreError::Corrupt))?;
             let msg_id = self.msg_id_of(&plaintext)?;
             let mut tx = self.tx()?;
-            tx.delete(&key::parked(seq))?;
-            tx.delete(&key::retry(seq))?;
+            tx.delete(&key::parked(id))?;
+            tx.delete(&key::stored_retry(id))?;
             let pair = key::processed(&stored.sender, &msg_id);
             if !self.reader().exists(&pair).await? {
                 let now = self.now();
                 processed_writes(&mut tx, &stored.sender, &msg_id, plaintext.hash(), now)?;
             }
             self.commit(tx).await?;
-            self.state.parked.remove(&seq);
-            self.state.retries.remove(&seq);
+            self.state.parked.remove(&id);
+            self.state.stored_retries.remove(&id);
             Ok(())
         })
         .await
     }
 
-    /// Release the entry stored locally at `seq` whose effect was uncertain
+    /// Release the entry stored locally at local ID `id` whose effect was uncertain
     /// ([`ParkReason::Uncertain`]), to be tried once more: in one commit its processed pair
     /// goes and it is stored as [`ParkReason::Released`], which a later read tries again as
     /// a fresh receive, building its effect again. The host releases it only once it knows
@@ -184,16 +188,16 @@ impl App {
     ///
     /// # Errors
     ///
-    /// [`Refusal::Usage`] for a `seq` with no entry stored, or one stored for another
+    /// [`Refusal::Usage`] for an ID with no entry stored, or one stored for another
     /// reason; [`StoreError::Corrupt`] for a stored plaintext that doesn't decode; a store
     /// failure, after which nothing was written.
-    pub async fn release_parked(&mut self, seq: u64) -> Result<(), AppError> {
+    pub async fn release_parked(&mut self, id: u64) -> Result<(), AppError> {
         Box::pin(async move {
             self.ready_local().await?;
-            let stored = self.stored(seq)?;
+            let stored = self.stored(id)?;
             if stored.reason != ParkReason::Uncertain {
                 return Err(Refusal::Usage(format!(
-                    "the entry at seq {seq} is stored as {:?}, not Uncertain: it can't be \
+                    "the entry at local ID {id} is stored as {:?}, not Uncertain: it can't be \
                      released",
                     stored.reason
                 ))
@@ -212,20 +216,20 @@ impl App {
                 tx.delete(&pair)?;
                 tx.delete(&key::processed_at(processed.at_ms, &stored.sender, &msg_id))?;
             }
-            tx.put(&key::parked(seq), &released)?;
+            tx.put(&key::parked(id), &released)?;
             self.commit(tx).await?;
-            self.state.parked.insert(seq, released);
+            self.state.parked.insert(id, released);
             Ok(())
         })
         .await
     }
 
-    fn stored(&self, seq: u64) -> Result<ParkedEntry, AppError> {
+    fn stored(&self, id: u64) -> Result<ParkedEntry, AppError> {
         self.state
             .parked
-            .get(&seq)
+            .get(&id)
             .cloned()
-            .ok_or_else(|| no_entry(seq))
+            .ok_or_else(|| no_entry(id))
     }
 
     /// The `msg_id` of a stored plaintext, which its processed pair is keyed by.

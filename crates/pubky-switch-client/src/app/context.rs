@@ -94,6 +94,7 @@ pub enum ClaimFetch {
 /// move, at most 7 operations beside it (Switch wire 6.4).
 pub struct ReceiveContext<'a> {
     state: &'a AppState,
+    protocol: &'a dyn super::Protocol,
     store: &'a dyn StateStore,
     ns: &'a str,
     may_attempt: bool,
@@ -305,8 +306,12 @@ impl<'a> RestoreContext<'a> {
 }
 
 impl<'a> ReceiveContext<'a> {
+    // Each argument is a borrow or a flag the context reads on its own; a struct of them
+    // would only be built here.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         state: &'a AppState,
+        protocol: &'a dyn super::Protocol,
         store: &'a dyn StateStore,
         ns: &'a str,
         may_attempt: bool,
@@ -316,6 +321,7 @@ impl<'a> ReceiveContext<'a> {
     ) -> Self {
         Self {
             state,
+            protocol,
             store,
             ns,
             may_attempt,
@@ -570,7 +576,8 @@ impl<'a> ReceiveContext<'a> {
     /// # Errors
     ///
     /// [`Refusal::Usage`] when the certificate holds none of the write scopes, the record is
-    /// written already in this batch (Switch wire 6.2), or the batch is full;
+    /// written already in this batch (Switch wire 6.2), the batch is full, or the
+    /// protocol's mark of the value is over [`super::MAX_SEEN_MARK_BYTES`];
     /// [`Refusal::NotNow`] while the app lacks the read scope's key at the current data
     /// epoch: the message then waits, whatever the protocol returns, and is handed over
     /// again at a later read; a store failure.
@@ -604,6 +611,7 @@ impl<'a> ReceiveContext<'a> {
         conditions: Vec<Condition>,
     ) -> Result<[u8; 32], AppError> {
         self.room()?;
+        super::records::refuse_unmarkable(self.protocol, target, value)?;
         let key = self.record_key(target)?;
         if self.writes.records.iter().any(|(k, _)| *k == key) {
             return Err(

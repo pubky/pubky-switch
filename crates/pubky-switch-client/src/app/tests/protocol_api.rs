@@ -11,7 +11,7 @@ use pubky_switch_core::claims::ClaimStatus;
 use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::ident::Policy;
 use pubky_switch_core::ops::{Condition, KeyBundlePut, OpKind, RecordVersion};
-use pubky_switch_core::records::{DAY_MS, IdentityDoc, seal_bundle_parts};
+use pubky_switch_core::records::{DAY_MS, IdentityDoc, Inbox, seal_bundle_parts};
 use pubky_switch_core::scopes::Permission;
 use pubky_switch_core::sig::SignedDoc;
 use serde_json::{Map, Value, json};
@@ -19,12 +19,13 @@ use serde_json::{Map, Value, json};
 use super::shared_flows::{ItemsProtocol, ids, items, value};
 use super::*;
 use crate::app::{
-    AppBackup, AppError, AppEvent, ClaimOp, Collection, Delivery, LISTS_TOO_LARGE_RETRY_MS,
-    MAX_CURSOR_DEFER_MS, ObligationDeadline, OpBatch, OutgoingMessage, PolicyFamily,
-    ReceiveContext, RecordJob, RecordTarget, Refusal, SenderDisposition, SentMessage, SwitchCopy,
+    AppBackup, AppError, AppEvent, ClaimOp, Collection, DOC_CACHE_MS, Delivery,
+    LISTS_TOO_LARGE_RETRY_MS, MAX_CURSOR_DEFER_MS, MAX_SEEN_MARK_BYTES, ObligationDeadline,
+    OpBatch, OutgoingMessage, PolicyFamily, ReceiveContext, RecordJob, RecordTarget, Refusal,
+    SenderDisposition, SentMessage, SwitchCopy,
 };
 use crate::store::{Fault as StoreFault, FaultStore};
-use crate::testing::{Fault, Router, SWITCH_ORIGIN};
+use crate::testing::{Fault, Router, SWITCH_ORIGIN, ScriptedSwitch};
 use crate::transport::Transport;
 
 const MINUTE: u64 = 60_000;
@@ -436,6 +437,20 @@ async fn test_receive_context_without_a_write_scope_is_refused() {
     assert!(refused.contains("write scopes"), "{refused}");
     assert_eq!(record_puts(&w), 0);
     // The effect without the write still applies: the cursor passes the entry.
+    assert_eq!(app.cursor().seq, seq);
+}
+
+#[tokio::test]
+async fn test_receive_context_write_whose_mark_wont_fit_is_refused() {
+    let w = World::new();
+    let protocol = ApiProtocol::new(Mode::Record);
+    let mut app = join(&w, &protocol, "wallet").await;
+    *protocol.items.pad.lock().unwrap() = MAX_SEEN_MARK_BYTES;
+    let (seq, _) = w.note(app.app_id(), "hello");
+    app.receive(None).await.unwrap();
+    let refused = protocol.seen()[0].writes[0].clone().unwrap_err();
+    assert!(refused.contains("mark"), "{refused}");
+    assert_eq!(record_puts(&w), 0);
     assert_eq!(app.cursor().seq, seq);
 }
 
@@ -1233,7 +1248,7 @@ async fn test_outbox_message_too_large_for_the_store_holds_up_no_later_one() {
 }
 
 #[tokio::test]
-async fn test_send_to_a_directory_too_large_to_cache_goes_and_caches_none() {
+async fn test_send_to_a_directory_too_large_to_cache_goes_and_caches_its_stub() {
     let p = Pair::new();
     let protocol = ApiProtocol::new(Mode::Plain);
     let store = Arc::new(FaultStore::new(
@@ -1250,8 +1265,8 @@ async fn test_send_to_a_directory_too_large_to_cache_goes_and_caches_none() {
         .await;
     let mut shop = p.join(&p.bob, "shop", &protocol).await;
     shop.invite(&p.alice.identity().public()).await.unwrap();
-    // Bob's directory doesn't fit one value of the wallet's store.
-    store.refuse_puts_as_too_large(Some(b"dir/"));
+    // Bob's directory doesn't fit one value of the wallet's store; its stub does.
+    store.refuse_puts_as_too_large_over(Some(b"dir/"), 1024);
     let reads = directory_reads(&p);
     for text in ["one", "two"] {
         let (msg_id, delivery) = wallet.send(Pair::note(&p.bob, text)).await.unwrap();
@@ -1264,16 +1279,156 @@ async fn test_send_to_a_directory_too_large_to_cache_goes_and_caches_none() {
             Some(Delivery::Accepted { .. })
         ));
     }
-    // Nothing cached: each send read it again.
+    // Only its stub cached, with no apps and stale: each send read it again.
     assert_eq!(directory_reads(&p), reads + 2);
     let ns = crate::store::client_namespace(&wallet.app_id());
+    let kept = store.inner().scan(&ns, b"dir/", None, 10).unwrap();
+    assert_eq!(kept.len(), 1);
+    let stub: crate::app::directory::CachedDirectory =
+        crate::app::state::decode(&kept[0].1).unwrap();
+    assert!(stub.apps.is_empty() && stub.stale);
+}
+
+/// Alice's wallet on a [`FaultStore`] over a new store, and bob's shop admitting her.
+async fn wallet_on_a_fault_store(
+    p: &Pair,
+    protocol: &Arc<ApiProtocol>,
+) -> (App, App, Arc<FaultStore>) {
+    let store = Arc::new(FaultStore::new(
+        Arc::new(MemoryStore::new()),
+        StoreFault::None,
+    ));
+    let wallet = p
+        .join_on(
+            &p.alice,
+            "wallet",
+            protocol.clone(),
+            Arc::clone(&store) as Arc<dyn StateStore>,
+        )
+        .await;
+    let mut shop = p.join(&p.bob, "shop", protocol).await;
+    shop.invite(&p.alice.identity().public()).await.unwrap();
+    (wallet, shop, store)
+}
+
+#[tokio::test]
+async fn test_outbox_give_up_of_an_accepted_message_keeps_its_owed_record_job() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let (mut wallet, _shop, store) = wallet_on_a_fault_store(&p, &protocol).await;
+    let signed = wallet.sign_message(Pair::note(&p.bob, "hello")).unwrap();
+    let target = RecordTarget::new(items(), &signed.hash());
+    let signed = signed.with_record(RecordJob {
+        target: target.clone(),
+        tag: b"sent".to_vec(),
+    });
+    let msg_id = wallet.queue_signed(signed).await.unwrap();
+    // Accepted, its record job failing for now (its batch, after the conversation entry's,
+    // can't reach the switch): kept, the record job owed.
+    let unreachable = |after| Fault::Unreachable {
+        path: "ops".into(),
+        after,
+    };
+    p.alice.switch().fail_next(unreachable(1));
+    wallet.flush_outbox().await.unwrap();
+    assert!(matches!(
+        wallet.delivery(&msg_id).await.unwrap(),
+        Some(Delivery::Accepted { .. })
+    ));
+    // The next try's own write is too large: only the re-send is given up.
+    p.alice.switch().lock().faults.clear();
+    p.alice.switch().fail_next(unreachable(0));
+    store.refuse_puts_as_too_large_once(format!("out/{msg_id}").as_bytes());
+    wallet.take_events();
+    let report = wallet.flush_outbox().await.unwrap();
+    assert_eq!(report.undelivered, vec![msg_id.clone()]);
+    assert!(wallet.take_events().iter().any(|e| matches!(
+        e,
+        AppEvent::MessageUndelivered { msg_id: m, resend: true, .. } if *m == msg_id
+    )));
+    assert!(matches!(
+        wallet.delivery(&msg_id).await.unwrap(),
+        Some(Delivery::Accepted { .. })
+    ));
+    // Its outbox record stays while the record job is owed, as `drop_undeliverable` keeps it.
+    let ns = crate::store::client_namespace(&wallet.app_id());
+    let out = format!("out/{msg_id}");
+    assert!(store.inner().get(&ns, out.as_bytes()).unwrap().is_some());
+    // Its record job is still made.
+    p.alice.switch().lock().faults.clear();
+    wallet.flush_outbox().await.unwrap();
+    let key = wallet.record_key(&target).unwrap();
+    let record = wallet.shared_record(&key).await.unwrap().unwrap();
+    assert_eq!(ids(record.content.value()), vec![msg_id]);
+}
+
+#[tokio::test]
+async fn test_outbox_give_up_reads_state_again_before_going_on() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let (mut wallet, _shop, store) = wallet_on_a_fault_store(&p, &protocol).await;
+    // Queued: bob's switch can't be reached.
+    p.bob.switch().fail_next(Fault::Unreachable {
+        path: "inbox".into(),
+        after: 0,
+    });
+    let (msg_id, delivery) = wallet.send(Pair::note(&p.bob, "hello")).await.unwrap();
+    assert!(matches!(delivery, Delivery::Queued { .. }), "{delivery:?}");
+    p.bob.switch().lock().faults.clear();
+    // The next try's own write is refused as too large: given up.
+    store.refuse_puts_as_too_large_once(format!("out/{msg_id}").as_bytes());
+    let report = wallet.flush_outbox().await.unwrap();
+    assert_eq!(report.undelivered, vec![msg_id]);
+    // The refused commit was read past: what the app holds is the store's again, so a
+    // backup, only ever of committed state, is given at once.
+    assert!(wallet.backup().is_ok(), "{:?}", wallet.backup().err());
+}
+
+#[tokio::test]
+async fn test_send_after_a_recipients_provider_loss_resends_with_a_directory_too_large_to_cache() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let (mut wallet, _shop, store) = wallet_on_a_fault_store(&p, &protocol).await;
+    // Bob's directory is over what the wallet's store keeps: only its stub is cached.
+    store.refuse_puts_as_too_large_over(Some(b"dir/"), 1024);
+    let (first, delivery) = wallet.send(Pair::note(&p.bob, "one")).await.unwrap();
     assert!(
-        store
-            .inner()
-            .scan(&ns, b"dir/", None, 10)
-            .unwrap()
-            .is_empty()
+        matches!(delivery, Delivery::Accepted { .. }),
+        "{delivery:?}"
     );
+    // Bob loses his provider and recovers at another.
+    const RECOVERED: &str = "https://bob-recovered.example";
+    let recovered =
+        ScriptedSwitch::recovering(p.bob.identity().key(), [9; 32], Arc::clone(&p.clock), 2, 1)
+            .unwrap();
+    p.router.add_switch(RECOVERED, &recovered);
+    let doc = p
+        .bob
+        .sign_next(|body| {
+            body.generation = 2;
+            body.inbox = Inbox::new(RECOVERED, recovered.service_key());
+            body.recovery_from = Some(1);
+        })
+        .unwrap();
+    recovered.deliver_identity(&doc).unwrap();
+    // Bob's contacts came back with his recovery: alice is admitted there.
+    recovered
+        .lock()
+        .shared
+        .add_contact(p.alice.identity().public());
+    p.clock.advance_ms(DOC_CACHE_MS + MINUTE);
+    wallet.take_events();
+    let _ = wallet.send(Pair::note(&p.bob, "two")).await;
+    // The stub held the switch and generation the directory was read under: the loss is
+    // found, and what bob's lost switch accepted is sent again.
+    assert!(
+        wallet.take_events().iter().any(|e| matches!(
+            e,
+            AppEvent::ResendAfterLoss { identity, messages: 1 } if *identity == p.bob.identity().public()
+        )),
+        "the re-send after the loss"
+    );
+    assert!(wallet.delivery(&first).await.unwrap().is_some());
 }
 
 #[tokio::test]

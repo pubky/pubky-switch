@@ -979,10 +979,21 @@ async fn test_app_holds_then_parks_an_unverifiable_sender() {
     // After the bounded wait it is stored locally and passed.
     w.clock.advance_ms(25 * HOUR);
     let report = wallet.receive(None).await.unwrap();
-    assert!(has(&report.events, |e| matches!(
-        e,
-        AppEvent::Parked { id: None, seq, reason: ParkReason::Unverifiable } if *seq == held
-    )));
+    let stored_id = report
+        .events
+        .iter()
+        .find_map(|e| match e {
+            AppEvent::Parked {
+                id: None,
+                seq,
+                stored_id,
+                reason: ParkReason::Unverifiable,
+            } if *seq == held => Some(*stored_id),
+            _ => None,
+        })
+        .unwrap();
+    // The event names the entry by its local ID, the key it is stored under.
+    assert_eq!(wallet.stored_id_at(held), Some(stored_id));
     assert!(wallet.cursor().seq >= later);
     assert_eq!(w.effects(), 0, "{:?}", report.events);
     // Once the sender can be checked, it is applied.
@@ -990,7 +1001,7 @@ async fn test_app_holds_then_parks_an_unverifiable_sender() {
     let report = wallet.receive(None).await.unwrap();
     assert!(has(
         &report.events,
-        |e| matches!(e, AppEvent::Unparked { seq } if *seq == held)
+        |e| matches!(e, AppEvent::Unparked { seq, stored_id: s } if *seq == held && *s == stored_id)
     ));
     assert_eq!(w.effects(), 1);
 }
@@ -1008,7 +1019,7 @@ async fn test_app_quota_parks_the_entry_and_writes_later() {
     let report = app.receive(None).await.unwrap();
     assert!(has(&report.events, |e| matches!(
         e,
-        AppEvent::Parked { id: None, seq: s, reason: ParkReason::Quota } if *s == seq
+        AppEvent::Parked { id: None, seq: s, reason: ParkReason::Quota, .. } if *s == seq
     )));
     assert!(app.cursor().seq >= seq, "the feed never stalls");
     assert_eq!(w.effects(), 0);
@@ -1517,7 +1528,7 @@ async fn test_parked_retry_effect_is_kept_at_a_fresh_service_time() {
     });
     app.receive(None).await.unwrap();
     assert_eq!(
-        app.state.parked.get(&seq).map(|p| p.reason),
+        app.stored_at(seq).map(|p| p.reason),
         Some(ParkReason::Quota)
     );
     // A month on, the stored entry is tried again before any feed read, and its effect
@@ -1627,7 +1638,7 @@ async fn test_kept_batch_past_the_window_by_the_device_clock_goes_without_a_read
     }
     let _ = app.receive(None).await;
     assert_eq!(
-        app.state.parked.get(&seq).map(|p| p.reason),
+        app.stored_at(seq).map(|p| p.reason),
         Some(ParkReason::Uncertain)
     );
     let _ = app.submit_batch(conversation([7; 32])).await;
@@ -1914,7 +1925,7 @@ impl Protocol for LifecycleProtocol {
 /// protocol told in `report`, durably.
 async fn lifecycle_effect_refused(app: &mut App, report: &crate::app::ReceiveReport, seq: u64) {
     assert_eq!(
-        app.state.parked.get(&seq).map(|p| p.reason),
+        app.stored_at(seq).map(|p| p.reason),
         Some(ParkReason::LifecycleOperation)
     );
     assert!(app.state.pending_effect.is_none());
@@ -1977,7 +1988,7 @@ async fn test_app_lifecycle_operation_in_a_stored_entrys_effect_stores_it_for_go
     });
     app.receive(None).await.unwrap();
     assert_eq!(
-        app.state.parked.get(&seq).map(|p| p.reason),
+        app.stored_at(seq).map(|p| p.reason),
         Some(ParkReason::Quota)
     );
     // Tried again, its effect now carries a lifecycle operation: stored for good, and the
@@ -2019,9 +2030,9 @@ async fn test_app_entry_stored_for_good_drops_its_retry_count() {
     // Stored for good, its effect carrying a lifecycle operation: the count goes with it.
     let report = app.receive(None).await.unwrap();
     lifecycle_effect_refused(&mut app, &report, seq).await;
-    assert!(app.state.retries.is_empty(), "{:?}", app.state.retries);
+    assert!(app.no_retries(), "{:?}", app.state.retries);
     let loaded = w.load(app.app_id()).await;
-    assert!(loaded.state.retries.is_empty(), "and in the store");
+    assert!(loaded.no_retries(), "and in the store");
 }
 
 #[tokio::test]
@@ -2800,7 +2811,7 @@ async fn test_app_effect_refused_for_good_is_parked_and_the_feed_goes_on() {
     let report = app.receive(None).await.unwrap();
     assert!(has(&report.events, |e| matches!(
         e,
-        AppEvent::Parked { id: Some(_), seq, reason: ParkReason::Refused } if *seq == refused
+        AppEvent::Parked { id: Some(_), seq, reason: ParkReason::Refused, .. } if *seq == refused
     )));
     // The protocol is told, with the code, so it may build the effect another way (Switch
     // spec 8.2).
@@ -2893,7 +2904,7 @@ async fn test_duty_event_kept_through_a_crash_before_it_is_taken() {
     assert_eq!(refused_events(&events, refused), first, "{events:?}");
     assert!(has(&events, |e| matches!(
         e,
-        AppEvent::Parked { id: Some(_), seq, reason: ParkReason::Refused } if *seq == refused
+        AppEvent::Parked { id: Some(_), seq, reason: ParkReason::Refused, .. } if *seq == refused
     )));
     assert_eq!(app.unacknowledged_events().await.unwrap(), events);
 }
@@ -3398,7 +3409,7 @@ async fn test_app_effect_over_one_batch_is_parked_and_the_feed_goes_on() {
     for seq in [first, second] {
         assert!(has(&report.events, |e| matches!(
             e,
-            AppEvent::Parked { id: Some(_), seq: s, reason: ParkReason::TooManyOperations } if *s == seq
+            AppEvent::Parked { id: Some(_), seq: s, reason: ParkReason::TooManyOperations, .. } if *s == seq
         )));
         assert!(has(&report.events, |e| matches!(
             e,
@@ -3539,7 +3550,7 @@ async fn big_effect_is_parked_with(protocol: Arc<BigProtocol>) {
     let report = app.receive(None).await.unwrap();
     assert!(has(&report.events, |e| matches!(
         e,
-        AppEvent::Parked { id: Some(_), seq: s, reason: ParkReason::EffectTooLarge } if *s == big
+        AppEvent::Parked { id: Some(_), seq: s, reason: ParkReason::EffectTooLarge, .. } if *s == big
     )));
     assert!(has(&report.events, |e| matches!(
         e,
@@ -3882,9 +3893,16 @@ impl Protocol for FillProtocol {
         if self.missed == 0 {
             return self.sample.missed(missed);
         }
+        let key = format!("missed/{}", missed.seq).into_bytes();
+        // `usize::MAX` stands for exactly the bound.
+        let size = if self.missed == usize::MAX {
+            MAX_STEP_LOCAL_BYTES - LOCAL_WRITE_OVERHEAD_BYTES - key.len()
+        } else {
+            self.missed
+        };
         Ok(vec![LocalWrite::Put {
-            key: format!("missed/{}", missed.seq).into_bytes(),
-            value: vec![0xff; self.missed],
+            key,
+            value: vec![0xff; size],
         }])
     }
 }
@@ -3953,6 +3971,53 @@ async fn test_missed_local_writes_near_the_bound_on_one_page_go_on() {
         assert!(app.protocol_get(key.as_bytes()).await.unwrap().is_some());
     }
     assert!(received(&report.events, plain));
+}
+
+#[tokio::test]
+async fn test_page_of_effects_at_the_bound_between_entries_stored_goes_on() {
+    let w = World::new();
+    let protocol = Arc::new(FillProtocol::default());
+    let mut app = fill_app(&w, &protocol).await;
+    // Nine effects near the bound, each followed by three entries stored as too large.
+    let pad = "x".repeat(40_000);
+    for _ in 0..9 {
+        w.note(app.app_id(), "fill");
+        for _ in 0..3 {
+            w.note(app.app_id(), &format!("huge{pad}"));
+        }
+    }
+    let (plain, _) = w.note(app.app_id(), "plain");
+    for _ in 0..3 {
+        app.receive(None).await.unwrap();
+    }
+    assert!(app.cursor().seq >= plain, "the feed goes on");
+}
+
+#[tokio::test]
+async fn test_missed_local_writes_at_the_bound_on_one_page_go_on() {
+    let w = World::new();
+    let protocol = Arc::new(FillProtocol {
+        missed: usize::MAX,
+        ..FillProtocol::default()
+    });
+    let mut app = fill_app(&w, &protocol).await;
+    w.note(app.app_id(), "first");
+    app.receive(None).await.unwrap();
+    let now = w.clock.now_ms();
+    for _ in 0..9 {
+        w.switch.push_missed(1, now - HOUR, now);
+    }
+    let (plain, _) = w.note(app.app_id(), "plain");
+    app.receive(None).await.unwrap();
+    assert!(app.cursor().seq >= plain, "the feed goes on");
+    assert!(
+        !app.kept_duties()
+            .await
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, AppEvent::LocalWritesRefused { .. })),
+        "at the bound, the writes are taken"
+    );
 }
 
 #[tokio::test]

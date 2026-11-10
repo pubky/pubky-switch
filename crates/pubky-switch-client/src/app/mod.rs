@@ -72,10 +72,11 @@ pub use identity::{DOC_CACHE_MS, HomeserverReader, IdentityRefresh, REVALIDATION
 pub use parked::ParkedMessage;
 pub use peek::{PeekReport, Peeked};
 pub use protocol::{
-    Effect, LOCAL_WRITE_OVERHEAD_BYTES, LocalWrite, MAX_CLAIM_READS, MAX_STEP_LOCAL_BYTES,
-    MissedEntries, Need, OpaqueRule, Outcome, PARKED_RETRIES_PER_READ, Protocol, ProtocolLayer,
-    RETRY_EVENT_READS, ReceivedMessage, ResendNeeded, ResendReason, StoreFailure,
-    decode_local_state, encode_local_state, local_writes_bytes,
+    Effect, LOCAL_WRITE_OVERHEAD_BYTES, LocalWrite, MAX_CLAIM_READS, MAX_LOSS_CONVERSATIONS,
+    MAX_REGRESSION_REASON_BYTES, MAX_SEEN_MARK_BYTES, MAX_STEP_LOCAL_BYTES, MissedEntries, Need,
+    OpaqueRule, Outcome, PARKED_RETRIES_PER_READ, Protocol, ProtocolLayer, RETRY_EVENT_READS,
+    ReceivedMessage, ResendNeeded, ResendReason, StoreFailure, decode_local_state,
+    encode_local_state, local_writes_bytes,
 };
 pub use provider::ProviderStatus;
 pub use push::{MAX_HANDLE_BYTES, MAX_HANDLES, PushHandles, PushRegistration, PushRelay};
@@ -343,7 +344,7 @@ pub struct AppBackup {
 /// reader that knows no layers, which takes only that version, refuses such a backup
 /// rather than restore it without the layer. A schema change gives both kinds of backup
 /// new versions.
-const LAYERED_BACKUP_VERSION: u32 = 3;
+const LAYERED_BACKUP_VERSION: u32 = 4;
 const _: () = assert!(LAYERED_BACKUP_VERSION != SCHEMA_VERSION);
 
 /// A [`ProtocolLayer`] as a backup's bytes carry it, with what the app's feed holds beyond
@@ -474,6 +475,10 @@ pub(crate) struct AppState {
     pub(crate) chain: Option<ChainView>,
     pub(crate) held: BTreeMap<u64, HeldEntry>,
     pub(crate) retries: BTreeMap<u64, RetryEntry>,
+    /// The counts of the store's retries at entries stored locally, by local ID.
+    pub(crate) stored_retries: BTreeMap<u64, RetryEntry>,
+    /// The local ID the next entry stored locally takes (`parkid`): it only goes up.
+    pub(crate) next_stored_id: u64,
     /// Where the retries of stored entries stand in their round (`parkn`), so a bounded
     /// number each read reaches every one in turn.
     pub(crate) parked_round: state::ParkedRound,
@@ -667,6 +672,8 @@ impl App {
                 chain: None,
                 held: BTreeMap::new(),
                 retries: BTreeMap::new(),
+                stored_retries: BTreeMap::new(),
+                next_stored_id: FIRST_STORED_ID,
                 parked_round: state::ParkedRound::default(),
                 seen: BTreeSet::new(),
                 asked: BTreeSet::new(),
@@ -868,6 +875,8 @@ impl App {
             let app = pubky_switch_core::enc::app_id_decode(&rest).map_err(|_| corrupt())?;
             departed.insert(app, at);
         }
+        let parked: BTreeMap<u64, ParkedEntry> = reader.scan_numbered("parked/").await?;
+        let next_stored_id = next_stored_id(reader.get::<u64>(key::STORED_NEXT).await?, &parked);
         Ok(AppState {
             keys,
             cert,
@@ -886,10 +895,12 @@ impl App {
             chain: ChainView::load(reader).await?,
             held: reader.scan_numbered("held/").await?,
             retries: reader.scan_numbered("retry/").await?,
+            stored_retries: reader.scan_numbered("sretry/").await?,
+            next_stored_id,
             parked_round: reader.get(key::PARKED_NEXT).await?.unwrap_or_default(),
             seen: reader.scan_numbers("seen/").await?,
             asked: reader.scan_numbers("asked/").await?,
-            parked: reader.scan_numbered("parked/").await?,
+            parked,
             departed,
             join: reader.get(key::JOIN).await?.ok_or_else(missing)?,
             pending_effect: reader.get(key::PENDING_EFFECT).await?,
@@ -1240,6 +1251,8 @@ impl App {
                 chain: Some(chain),
                 held: BTreeMap::new(),
                 retries: BTreeMap::new(),
+                stored_retries: BTreeMap::new(),
+                next_stored_id: next_stored_id(None, &parked),
                 parked_round: state::ParkedRound::default(),
                 seen,
                 asked: BTreeSet::new(),
@@ -1381,9 +1394,10 @@ impl App {
         for seq in &s.seen {
             tx.put(&key::seen(*seq), &())?;
         }
-        for (seq, parked) in &s.parked {
-            tx.put(&key::parked(*seq), parked)?;
+        for (id, parked) in &s.parked {
+            tx.put(&key::parked(*id), parked)?;
         }
+        tx.put(key::STORED_NEXT, &s.next_stored_id)?;
         tx.put(key::JOIN, &s.join)?;
         if let Some(restore) = &s.restore {
             tx.put(key::RESTORE, restore)?;
@@ -2266,4 +2280,17 @@ impl App {
 /// The generation a batch's signed operations name; `None` for a cursor-only batch.
 pub(crate) fn batch_generation(batch: &Batch) -> Option<u64> {
     batch.ops().first().map(|op| op.body().generation)
+}
+
+/// The local ID the first entry stored locally takes.
+const FIRST_STORED_ID: u64 = 1;
+
+/// The local ID the next entry stored locally takes: the one kept, and in any case past
+/// every one taken, so none is used twice.
+fn next_stored_id(kept: Option<u64>, parked: &BTreeMap<u64, ParkedEntry>) -> u64 {
+    let past = parked
+        .keys()
+        .next_back()
+        .map_or(FIRST_STORED_ID, |id| id.saturating_add(1));
+    kept.unwrap_or(FIRST_STORED_ID).max(past)
 }

@@ -2,7 +2,7 @@
 
 The app layer keeps all of one app's durable state in the host's `StateStore`, namespace
 `client/<app_id>` (the App ID in z-base-32). One record per key; no blob is rewritten whole.
-Every value is `{"v":2,"d":<record>}` (`SCHEMA_VERSION`): a reader refuses an earlier `v`
+Every value is `{"v":3,"d":<record>}` (`SCHEMA_VERSION`): a reader refuses an earlier `v`
 as an old schema (`StoreError::OldSchema`) and any other as corrupt, so a later
 schema adds a migration instead of reading old bytes wrongly. Keys are ASCII. Numbers in keys
 are zero-padded to 20 digits so keys sort numerically. The record types are in `state.rs`.
@@ -106,10 +106,12 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
 | `proct/<time>/<sender>/<msg_id>` | the time index for pruning processed pairs | |
 | `seen/<seq>` | an entry processed past a held one | |
 | `held/<seq>` | an entry held because its sender can't be checked, since when | |
-| `retry/<seq>` | an entry whose receive step the protocol's store or the host kept from finishing (`Outcome::Retry`): the reads in a row that ended so, and when the first was; kept while the entry is stored locally too, and it goes once the entry is processed | |
-| `parked/<seq>` | an entry stored locally and passed: the opened plaintext, sender, certificate, time, reason (an unverifiable sender, a quota or a store failure of the receive step, tried again; an effect refused for good, over one batch, too large for the store to keep or commit, carrying an operation the app layer builds itself, or kept past the window in which its resend tells whether it was applied, not tried again; one the host released after such a window, `Released`, tried again). The host forgets one not tried again (`App::forget_parked`), in one commit with its `retry/` count and, if none is kept, its processed pair, so a re-send stays a duplicate; or releases an uncertain one (`App::release_parked`), in one commit that removes its processed pair | yes |
+| `retry/<seq>` | an entry on the feed whose receive step the protocol's store or the host kept from finishing (`Outcome::Retry`): the reads in a row that ended so, and when the first was; it goes once the entry is processed, or moves to `sretry/<id>` when the entry is stored locally | |
+| `sretry/<id>` | the same count for the entry stored locally at local ID `id`, until it is processed or stored for good | |
+| `parked/<id>` | an entry stored locally and passed, keyed by its local ID, which never changes: the `seq` and generation it was read at, the opened plaintext, sender, certificate, time, reason (an unverifiable sender, a quota or a store failure of the receive step, tried again; an effect refused for good, over one batch, too large for the store to keep or commit, carrying an operation the app layer builds itself, or kept past the window in which its resend tells whether it was applied, not tried again; one the host released after such a window, `Released`, tried again). The host forgets one not tried again (`App::forget_parked`), in one commit with its `sretry/` count and, if none is kept, its processed pair, so a re-send stays a duplicate; or releases an uncertain one (`App::release_parked`), in one commit that removes its processed pair | yes |
 | `asked/<seq>` | a re-send was handed to the protocol for this item | |
-| `parkn` | where the retries of entries stored locally stand in their round: its number and the next `seq`. The round covers the entries stored in an earlier round, each `parked/` record naming the round it was stored in, not by `seq`, which a provider loss renumbers; each read tries at most `PARKED_RETRIES_PER_READ`, in `seq` order, and an entry stored later waits for the next round, so every entry is tried within two rounds | |
+| `parkn` | where the retries of entries stored locally stand in their round: its number and the next local ID. The round covers the entries stored in an earlier round, each `parked/` record naming the round it was stored in; each read tries at most `PARKED_RETRIES_PER_READ`, in local ID order, and an entry stored later waits for the next round, so every entry is tried within two rounds | |
+| `parkid` | the local ID the next entry stored locally takes: it only goes up, and is never below one past the highest `parked/` key, so no ID is used twice in one store | |
 | `owed/<generation>/<seq>` | a re-send or missed-entries call about this item that the protocol answered with an error: written in the commit that passes the item, made again at the start of each read, each call on its own, and gone in the commit of its answer's writes, or, for an answer whose writes are over `MAX_STEP_LOCAL_BYTES`, in the commit of the duty event that refuses them; `App::owed_protocol_calls` counts them. The key names the generation the item was read at | |
 | `departed/<app_id>` | another own app's departure verified in the chain, and its time | |
 | `join` | the join step: the registration batch while it is owed | |
@@ -131,6 +133,7 @@ Deleting the keys on a leave removes `keys`, `naming`, `rk/`, `scope/`, `parked/
 
 - New records take new keys under a prefix of their own; existing keys keep their meaning.
 - A changed record type bumps `SCHEMA_VERSION` with a migration that runs on load.
+- `SCHEMA_VERSION` 3: entries stored locally are keyed by a local ID (`parked/<id>`, `parkid`) instead of the `seq` they were read at, which they keep as fields with its generation; a provider loss no longer writes them again. `pending/effect` names its entry's local ID (`stored`) and generation, and retries of stored entries count under `sretry/<id>`. A layered backup carries version 4. No migration reads a store of schema 2: it fails to load as an old schema, and so does a backup of schema 2 or a layered backup of version 3. No released build wrote schema 2.
 - `SCHEMA_VERSION` 2: `pending/effect` keeps the opened entry it is for, a required field.
   No migration reads a store of schema 1; such a store fails to load as an old schema, and
   a backup an earlier schema wrote (schema 1, or a layered backup of version 2) is refused
@@ -148,7 +151,7 @@ uploads; `push.rs` holds the push registration. The peek (`peek.rs`) writes noth
 |---|---|---|
 | `mv` | a move in progress: the signed freeze (none for a key change), the generation left, the step, the re-registration batch signed once | |
 | `gens/<generation>` | a generation the app left: its origin and service key, and the last own `identity.json` taken there | |
-| `loss` | a provider loss followed: the step, the old newest head, the cursor's time there, the declaration time, the clocks' offset, the new key's `n`, the batch of the current step, the conversation entries still to add back | |
+| `loss` | a provider loss followed: the step, the old newest head, the cursor's time there, the declaration time, the clocks' offset, the new key's `n`, the batch of the current step, the conversation entries still to add back (at most `MAX_LOSS_CONVERSATIONS`, the first in key order) and how many past it were left out, shown in `RecoveryInfo::conversations_left_out` | |
 | `ev/op/<hash>` | a kept `record.put` or claim entry, with its writer's certificate and its proof when held | |
 | `ev/proof/<hash>` | a kept transition proof | |
 | `lc/contact/<pubky>`, `lc/deny/<pubky>` | the app's copy of the contacts and deny list, from the feed | |
@@ -204,7 +207,7 @@ uploads; `push.rs` holds the push registration. The peek (`peek.rs`) writes noth
 | `out/<msg_id>` | a queued message, queued alone or with the answer of the batch that carried it: its signed plaintext, signed once, the envelope sealed for one try with its `apps_version`, its jobs (conversation entry, delivery, record) and where each stands, a re-send owed, when it was refused for good, and when a delivery was first and last answered `403 not_admitted` or `403 not_current`, with the answers counted at least 7.5 days apart; a failed one goes after the sent-message retention, an undeliverable one when a try is answered so again 30 days after that first answer and 5 answers were counted, or at the first flush 45 days after it in any case | yes |
 | `sent/<msg_id>` | a message the recipient's inbox accepted, written in the commit that records the acceptance, kept 30 days from its first acceptance for re-sends | yes |
 | `sentt/<time>/<msg_id>` | the time index for pruning sent messages | |
-| `dir/<pubky>` | a counterparty's directory as signed, the switch, generation and `identity.json` version it was read under, its versions, and whether it is read again before the next send; none for a directory over the store's value size, which each send reads again | |
+| `dir/<pubky>` | a counterparty's directory as signed, the switch, generation and `identity.json` version it was read under, its versions, and whether it is read again before the next send; for a directory over the store's value size, only its stub: the switch, generation, versions and read time, no apps, always stale, so each send reads it again and a provider loss since is still found | |
 | `rkn/<pubky>/<app_id>` | the highest receive key `n` seen for a counterparty's app | |
 | `peer/<pubky>` | the version of the own `identity.json` a counterparty's switch last named, and when the app last wrote there | |
 | `peers_doc` | the own `identity.json` the deliveries to recent peers were last judged against, and the counterparties still owed it | |
@@ -217,8 +220,8 @@ uploads; `push.rs` holds the push registration. The peek (`peek.rs`) writes noth
 | `list_due` | a listing of the collections is owed: after joining, a restore or a `missed` item | |
 | `rec/<key>` | the shared record write the app took: the signed operation, certificate and proof, its version and whether a proof gave it, the opened value, and the refused write it follows | yes |
 | `recname/<key>` | the collection name of a record the app creates outside the protocol's collections, from a write or an effect, until its write is answered | |
-| `hw/<key>` | the protocol's mark of what the app has seen in a record | the protocol's |
-| `flag/<key>/<generation>/<version>` | a write the app refused, with the app it names and the rule | |
+| `hw/<key>` | the protocol's mark of what the app has seen in a record, at most `MAX_SEEN_MARK_BYTES` (1 KiB): a longer one isn't kept | the protocol's |
+| `flag/<key>/<generation>/<version>` | a write the app refused, with the app it names and the rule, cut to `MAX_REGRESSION_REASON_BYTES` (256 bytes) | |
 | `ocert/<app_id>/<cert_hash>` | a certificate of an own app, for checking its writes | |
 | `claim/<claim_key>` | the newest claim view, the proof that shows it SETTLED, the newest entry's time and the deadline the app computes, kept until the evidence's retention ends | |
 | `clent/<claim_key>/<step>` | a signed claim entry and its proof | |

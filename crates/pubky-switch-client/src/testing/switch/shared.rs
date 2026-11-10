@@ -373,6 +373,13 @@ impl Shared {
         }
     }
 
+    /// A contact the account holds without an operation that wrote it, as an upload after a
+    /// provider loss brings one back (Switch spec 12.6 step 2).
+    #[cfg(test)]
+    pub(crate) fn add_contact(&mut self, pubky: [u8; 32]) {
+        self.contacts.insert(pubky);
+    }
+
     /// `allow.delete` (Switch wire 6.2); a conversation entry goes whoever wrote it.
     pub(super) fn allow_delete(&mut self, pubky: &[u8; 32], kind: AllowKind) -> ProofState {
         match kind {

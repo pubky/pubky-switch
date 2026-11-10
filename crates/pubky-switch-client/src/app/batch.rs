@@ -57,6 +57,18 @@ const PENDING_PREFIX: &str = "opq/";
 /// can be, under 10.9 MiB kept (`MAX_STEP_LOCAL_BYTES`), always fits on its own.
 pub const MAX_KEPT_BATCHES_BYTES: usize = 12 * 1024 * 1024;
 
+// A batch's answer is settled in one commit: its local writes and queued messages (under
+// its stored size, itself under `MAX_KEPT_BATCHES_BYTES`), a cached record write with its
+// mark for each of its 8 operations at most, and the cursor, the chain view and the kept
+// batch removed (under 1 MiB).
+const _: () = assert!(
+    MAX_KEPT_BATCHES_BYTES as u64
+        + MAX_BATCH_ENTRIES as u64
+            * (super::feed::CACHED_RECORD_BYTES + super::feed::KEPT_MARK_BYTES)
+        + (1 << 20)
+        <= crate::store::MAX_BATCH_BYTES
+);
+
 /// Refuse the app's own lifecycle operations, and the signer's, in a batch a host or a
 /// protocol builds: `app.put`, `receive_key.put`, `key_bundle.put` and `cert.put`. The app
 /// layer builds and sends these itself, in batches of their own (joining, the record's
@@ -272,10 +284,15 @@ impl App {
     ///
     /// # Errors
     ///
-    /// [`Refusal::Usage`] for an empty batch or one over 8 entries; [`Refusal::Stopped`] or
-    /// [`Refusal::Left`]; [`Refusal::NotNow`] while a provider loss is followed and the
-    /// app's evidence isn't uploaded yet (Switch spec 12.6 step 3), or after `409
-    /// stale_epoch` while the app lacks a read scope's key at the new data epoch; an
+    /// [`Refusal::Usage`] for an empty batch, one over 8 entries, or one whose local writes
+    /// are over [`super::MAX_STEP_LOCAL_BYTES`], before anything is signed or kept;
+    /// [`Refusal::Stopped`] or [`Refusal::Left`]; [`Refusal::NotNow`] while a provider loss
+    /// is followed and the app's evidence isn't uploaded yet (Switch spec 12.6 step 3),
+    /// after `409 stale_epoch` while the app lacks a read scope's key at the new data
+    /// epoch, or when keeping the batch would take the batches kept unanswered past
+    /// [`MAX_KEPT_BATCHES_BYTES`]: it is then neither kept nor sent, and may be submitted
+    /// again once they are answered. Batches an earlier build kept count toward the cap but
+    /// were kept without it, so they may already be past it; an
     /// `attempt` while the app may not attempt ([`App::may_attempt`]); the switch's refusal
     /// for good, such as `409 conflict` with its `current`, after which nothing is kept; any
     /// other failure
