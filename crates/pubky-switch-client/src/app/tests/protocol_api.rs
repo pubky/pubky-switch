@@ -810,6 +810,68 @@ async fn test_check_attempt_writes_failed_for_a_bound_proof_of_another_state() {
     assert_eq!(claim.step, 2);
 }
 
+/// Stop `app` on equivocation: another body at the version of its own `identity.json`.
+async fn stop_on_equivocation(w: &World, app: &mut App) {
+    let doc = w.next_doc(|_| {});
+    app.receive(None).await.unwrap();
+    let mut body = doc.body().clone();
+    body.data_epoch += 1;
+    w.switch
+        .deliver_identity(&IdentityDoc::sign(&w.alice, body).unwrap())
+        .unwrap();
+    let error = app.receive(None).await.unwrap_err();
+    assert!(matches!(error, AppError::Alarm(_)), "{error:?}");
+    assert_eq!(app.may_attempt(false), Err(Refusal::Stopped));
+}
+
+#[tokio::test]
+async fn test_check_attempt_refuses_a_stopped_app() {
+    let w = World::new();
+    let mut app = join(&w, &ApiProtocol::new(Mode::Plain), "wallet").await;
+    let (batch, submitted) = send_apart(&mut app, 3600).await;
+    stop_on_equivocation(&w, &mut app).await;
+    let op = batch.ops()[0].signed();
+    // The genuine proof isn't taken.
+    let error = app
+        .check_attempt(op, submitted.proofs[0].signed())
+        .await
+        .unwrap_err();
+    assert_eq!(error, AppError::Refused(Refusal::Stopped));
+    // Nor is a proof of another state, and nothing is written failed.
+    let service = ed25519_dalek::SigningKey::from_bytes(&identity("alice").service_secret());
+    let mut body = submitted.proofs[0].body().clone();
+    body.state["state"] = "SETTLED".into();
+    let shown = TransitionProof::sign(&service, &w.alice.public(), body).unwrap();
+    let error = app.check_attempt(op, shown.signed()).await.unwrap_err();
+    assert_eq!(error, AppError::Refused(Refusal::Stopped));
+    assert_eq!(w.switch.claim(&CLAIM).unwrap().step, 1);
+}
+
+#[tokio::test]
+async fn test_record_op_and_key_fetch_refuse_a_stopped_app() {
+    let w = World::new();
+    let mut app = join(&w, &ApiProtocol::new(Mode::Plain), "wallet").await;
+    app.record_op(&inbox(), Some(&value(&["a"])), vec![])
+        .await
+        .unwrap();
+    app.fetch_key_bundle().await.unwrap();
+    stop_on_equivocation(&w, &mut app).await;
+    let error = app
+        .record_op(&inbox(), Some(&value(&["a"])), vec![])
+        .await
+        .unwrap_err();
+    assert_eq!(error, AppError::Refused(Refusal::Stopped));
+    let error = app
+        .put_record(&inbox(), &value(&["a"]), vec![])
+        .await
+        .unwrap_err();
+    assert_eq!(error, AppError::Refused(Refusal::Stopped));
+    assert_eq!(
+        app.fetch_key_bundle().await.unwrap_err(),
+        AppError::Refused(Refusal::Stopped)
+    );
+}
+
 #[tokio::test]
 async fn test_submit_batch_refuses_an_attempt_in_reconcile_mode() {
     let w = World::new();
