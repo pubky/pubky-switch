@@ -98,6 +98,7 @@ uploads; `push.rs` holds the push registration. The peek (`peek.rs`) writes noth
 | `lc/code/<hash>` | an invite code this app registered, from the feed | |
 | `push` | the push setting: relay, device token, the service it is at, the push key, the handle, whether set, a rotation in flight | the device token |
 | `gone` | the app isn't current any more, or its account is gone, and since when | |
+| `erasing` | since when every try met an unsigned `404` and no published `identity.json` | |
 
 - **A move** commits each step: `Seen` (the freeze verified and kept), `Read` (the old feed
   read to its end, its chain view saved), `Uploaded` (the evidence sent to the next
@@ -122,7 +123,9 @@ uploads; `push.rs` holds the push registration. The peek (`peek.rs`) writes noth
   protocol's re-send writes commit with their step, once. A registration another device
   of the app made first is adopted, and the record then goes alone.
 - **`gone`** stops every read; `push` goes with it. It is kept only once the newest verified
-  own `identity.json` removes the app or doesn't list it, or the account is erased.
+  own `identity.json` removes the app or doesn't list it, a `403 not_current` came while it
+  lists the app with the certificate the app holds, or the account is erased: an unsigned
+  `404` and no published `identity.json` at every try for 24 hours, which `erasing` times.
 
 ## Sending, admission, records and claims
 

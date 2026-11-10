@@ -1114,24 +1114,10 @@ async fn test_revoked_app_stops_and_drops_its_push_setting() {
     app.register_push(&NoRelay, "https://push.example/v1/hook", "token")
         .await
         .unwrap();
-    // The signer revokes the app at the service: every call is `403 not_current`. Until it
-    // publishes the revocation, the newest identity.json still lists the app, which reports
-    // the answer and isn't gone (Switch spec 12.2).
+    // The signer revokes the app at the service: every call is `403 not_current`. The
+    // newest identity.json still lists the app with the certificate it holds, so the answer
+    // is final: it is revoked (Switch wire 7.2, Switch spec 12.2).
     w.switch.revoke(me).unwrap();
-    let error = app.receive(None).await.unwrap_err();
-    assert_eq!(error.code(), Some(ErrorCode::NotCurrent));
-    assert_eq!(
-        app.follow_provider().await.unwrap(),
-        ProviderStatus::Current
-    );
-    // The signer publishes the app as removed (Switch spec 12.2 step 3).
-    w.next_doc(|body| {
-        body.apps.retain(|a| a.app_id != me);
-        body.removed.push(RemovedApp {
-            app_id: me,
-            distrust_from: START,
-        });
-    });
     let report = app.receive(None).await.unwrap();
     assert!(report.stopped);
     assert!(has(&report.events, |e| matches!(e, AppEvent::Removed)));
@@ -1194,12 +1180,56 @@ async fn test_erased_account_is_gone_once_the_identity_is_unpublished() {
         app.follow_provider().await.unwrap(),
         ProviderStatus::Current
     );
-    // The signer erased the account and deleted identity.json from the Homeserver.
+    // The signer erased the account and deleted identity.json from the Homeserver. Until
+    // both have held for 24 hours, the service counts as unreachable (Switch spec 12.7).
     w.homeserver.remove(w.alice.public(), IDENTITY_PATH);
+    let unreachable = |result: Result<_, AppError>| {
+        matches!(
+            result,
+            Err(AppError::Switch(ClientError::BadServiceSignature {
+                status: 404
+            }))
+        )
+    };
+    assert!(unreachable(app.receive(None).await));
+    w.clock
+        .advance_ms(crate::app::provider::ERASURE_WAIT_MS - 1);
+    assert!(unreachable(app.receive(None).await));
+    assert_eq!(
+        app.follow_provider().await.unwrap(),
+        ProviderStatus::Current
+    );
+    w.clock.advance_ms(1);
     let report = app.receive(None).await.unwrap();
     assert!(report.stopped);
     assert!(has(&report.events, |e| matches!(e, AppEvent::AccountGone)));
     assert_eq!(app.follow_provider().await.unwrap(), ProviderStatus::Gone);
+}
+
+#[tokio::test]
+async fn test_erasure_wait_starts_over_when_the_identity_shows_again() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join(&w, &router).await;
+    let published = w.homeserver.file(w.alice.public(), IDENTITY_PATH).unwrap();
+    w.switch.lock().erased = true;
+    w.homeserver.remove(w.alice.public(), IDENTITY_PATH);
+    assert!(app.receive(None).await.is_err());
+    // A Homeserver fault ends: the file shows again, and the wait starts over.
+    w.clock
+        .advance_ms(crate::app::provider::ERASURE_WAIT_MS / 2);
+    w.homeserver
+        .put(w.alice.public(), IDENTITY_PATH, published.clone());
+    assert!(app.receive(None).await.is_err());
+    w.homeserver.remove(w.alice.public(), IDENTITY_PATH);
+    w.clock
+        .advance_ms(crate::app::provider::ERASURE_WAIT_MS / 2);
+    assert!(app.receive(None).await.is_err());
+    w.clock
+        .advance_ms(crate::app::provider::ERASURE_WAIT_MS - 1);
+    assert!(app.receive(None).await.is_err());
+    w.clock.advance_ms(1);
+    assert!(app.receive(None).await.unwrap().stopped);
 }
 
 #[test]
@@ -1797,12 +1827,31 @@ async fn test_loss_registration_taken_by_a_foreign_key_is_a_compromise() {
 }
 
 #[tokio::test]
-async fn test_not_current_while_listed_with_its_own_certificate_isnt_gone() {
+async fn test_not_current_while_listed_with_its_own_certificate_is_final() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join(&w, &router).await;
+    // The newest identity.json lists the app with the certificate it presents: the answer
+    // is final (Switch wire 7.2).
+    w.switch.fail_next(Fault::Error {
+        path: "feed".into(),
+        code: ErrorCode::NotCurrent,
+        current: json!({}),
+    });
+    let report = app.receive(None).await.unwrap();
+    assert!(report.stopped);
+    assert!(has(&report.events, |e| matches!(e, AppEvent::Removed)));
+    assert_eq!(app.follow_provider().await.unwrap(), ProviderStatus::Gone);
+}
+
+#[tokio::test]
+async fn test_not_current_without_the_homeserver_isnt_final() {
     let w = World::new();
     let router = Router::of(&w);
     let mut app = join(&w, &router).await;
     let me = app.app_id();
-    // The newest identity.json lists the app with the certificate it presents.
+    // Without a read of the newest identity.json, the answer stands for now.
+    w.homeserver.set_down(true);
     w.switch.fail_next(Fault::Error {
         path: "feed".into(),
         code: ErrorCode::NotCurrent,
@@ -1810,11 +1859,11 @@ async fn test_not_current_while_listed_with_its_own_certificate_isnt_gone() {
     });
     let error = app.receive(None).await.unwrap_err();
     assert_eq!(error.code(), Some(ErrorCode::NotCurrent));
+    w.homeserver.set_down(false);
     assert_eq!(
         app.follow_provider().await.unwrap(),
         ProviderStatus::Current
     );
-    // The next read goes on.
     let seq = w.note(me, "after").0;
     let report = app.receive(None).await.unwrap();
     assert!(received(&report.events, seq), "{:?}", report.events);

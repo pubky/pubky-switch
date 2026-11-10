@@ -20,15 +20,17 @@
 //! - **A key change in place**, or a move the app never saw frozen, is followed the same way
 //!   from the switch on.
 //! - **Revocation and erasure.** An own `identity.json` that lists the app in `removed`, or a
-//!   `403 not_current` answer, means the app isn't current; a `404` that the account's key
-//!   didn't sign, while the identity publishes no `identity.json`, means its account is
-//!   gone. The app keeps that, stops, reports it and drops its push setting.
+//!   `403 not_current` answer while the newest one doesn't list the app with another
+//!   certificate, means the app isn't current; a `404` that the account's key didn't sign,
+//!   while the identity publishes no `identity.json`, held at every try for
+//!   [`ERASURE_WAIT_MS`], means its account is gone. The app keeps that, stops, reports it
+//!   and drops its push setting.
 
 use pubky_switch_core::claims::ClaimType;
 use pubky_switch_core::enc::{b64, pubky_id, pubky_key, serde_b64, serde_b64_vec};
 use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::ops::{AllowKind, Condition, MAX_BATCH_ENTRIES, OpBody, OpKind, Position};
-use pubky_switch_core::records::{Freeze, IdentityDoc, Inbox};
+use pubky_switch_core::records::{DAY_MS, Freeze, IdentityDoc, Inbox};
 use pubky_switch_core::scopes::Permission;
 use pubky_switch_core::sig::SignedDoc;
 use serde::{Deserialize, Serialize};
@@ -51,6 +53,8 @@ pub(crate) mod keys {
     pub(crate) const MOVE: &str = "mv";
     /// The app isn't current any more, or its account is gone.
     pub(crate) const GONE: &str = "gone";
+    /// Since when every try has met an unsigned `404` and no `identity.json`.
+    pub(crate) const ERASING: &str = "erasing";
 
     /// The service and last own `identity.json` of a generation the app left.
     pub(crate) fn generation(generation: u64) -> String {
@@ -118,6 +122,18 @@ pub(crate) enum GoneReason {
     NotCurrent,
     /// The account was erased (Switch spec 12.7).
     Erased,
+}
+
+/// How long an unsigned `404` and a missing `identity.json` must both hold, at every try,
+/// before the app takes its account as erased (Switch spec 12.7): nothing authenticates an
+/// erasure, and a Homeserver fault can read as a missing file.
+pub(crate) const ERASURE_WAIT_MS: u64 = DAY_MS;
+
+/// `erasing`: since when, app clock, every try has met an unsigned `404` and no
+/// `identity.json` (Switch spec 12.7).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ErasingRecord {
+    pub(crate) since_ms: u64,
 }
 
 /// `gone`: the app isn't current any more, or its account is gone.
@@ -270,6 +286,7 @@ impl App {
     ) -> Result<TakeOver, AppError> {
         let error = match result {
             Ok(report) => {
+                self.clear_erasing().await?;
                 if report.stopped && self.provider_change_due().await? {
                     return Ok(TakeOver::ReadAgain);
                 }
@@ -297,21 +314,26 @@ impl App {
                 if self.state.leave.is_some() {
                     return Ok(TakeOver::Done(Err(error)));
                 }
-                // Switch wire 7.2 check 5: a revoked or departed app, or one the newest
-                // identity.json doesn't list. The app is gone for good only once the newest
-                // verified identity.json removes it or doesn't list it (Switch spec 12.2).
-                // One listed, with its own certificate or with a renewal it hasn't taken yet,
-                // reports the answer and asks again later: a revocation the signer hasn't
-                // published yet shows as removed once it is.
+                // Switch wire 7.2: final unless the newest identity.json lists the app with
+                // another certificate than the one it holds, a renewal it takes before it
+                // asks again. Listed with its own, listed in `removed` or not listed, it is
+                // revoked, departed or dropped (Switch spec 12.2, 12.3). Without a read of
+                // the Homeserver, the newest isn't known: the answer stands for now.
                 let identity = self.state.meta.identity;
-                if let Ok(Some(doc)) =
-                    identity::read_homeserver(self.env.homeserver.as_ref(), &identity).await
-                {
-                    self.take_own_copy(doc).await?;
+                match identity::read_homeserver(self.env.homeserver.as_ref(), &identity).await {
+                    Ok(Some(doc)) => {
+                        self.take_own_copy(doc).await?;
+                    }
+                    Ok(None) => {}
+                    Err(_) => return Ok(TakeOver::Done(Err(error))),
                 }
                 let me = self.state.meta.app_id;
                 let doc = &self.state.own_doc;
-                if !doc.lists_removed(&me) && doc.listed_cert(&me).is_some() {
+                if !doc.lists_removed(&me)
+                    && doc
+                        .listed_cert(&me)
+                        .is_some_and(|listed| listed != self.state.cert.hash())
+                {
                     return Ok(TakeOver::Done(Err(error)));
                 }
                 self.mark_gone(GoneReason::NotCurrent).await?;
@@ -1319,19 +1341,25 @@ impl App {
 
     /// An answer the account's key didn't sign. A newer own `identity.json` is followed: a
     /// key change or a move the app hadn't seen yet. For a `404`, the account may be erased
-    /// (Switch spec 12.7): it is gone when the identity publishes no `identity.json` any
-    /// more, unless the verified own copy the app holds names a later generation than it
-    /// follows, a live account elsewhere, which is followed instead. Anything else the app
-    /// can't tell.
+    /// (Switch spec 12.7): it is gone once the identity has published no `identity.json` at
+    /// every try for [`ERASURE_WAIT_MS`], unless the verified own copy the app holds names a
+    /// later generation than it follows, a live account elsewhere, which is followed
+    /// instead. Until then the service counts as unreachable: the app keeps its state and
+    /// tries again. Anything else the app can't tell, and a published `identity.json` or
+    /// another status starts the wait over; a Homeserver it can't reach changes nothing.
     async fn unknown_account(&mut self, status: u16) -> Result<Unknown, AppError> {
         let identity = self.state.meta.identity;
         match identity::read_homeserver(self.env.homeserver.as_ref(), &identity).await {
             Ok(None) if status == 404 && self.provider_superseded() => Ok(Unknown::Moved),
             Ok(None) if status == 404 => {
+                if !self.erasure_held().await? {
+                    return Ok(Unknown::Unexplained);
+                }
                 self.mark_gone(GoneReason::Erased).await?;
                 Ok(Unknown::Gone)
             }
             Ok(Some(doc)) => {
+                self.clear_erasing().await?;
                 self.take_own_copy(doc).await?;
                 if self.state.own_doc.generation() > self.state.meta.generation {
                     Ok(Unknown::Moved)
@@ -1339,8 +1367,35 @@ impl App {
                     Ok(Unknown::Unexplained)
                 }
             }
-            Ok(None) | Err(_) => Ok(Unknown::Unexplained),
+            Ok(None) => {
+                self.clear_erasing().await?;
+                Ok(Unknown::Unexplained)
+            }
+            Err(_) => Ok(Unknown::Unexplained),
         }
+    }
+
+    /// Note an unsigned `404` with no `identity.json` published, and say whether both have
+    /// held since at least [`ERASURE_WAIT_MS`] ago (Switch spec 12.7).
+    async fn erasure_held(&mut self) -> Result<bool, AppError> {
+        let now = self.now();
+        if let Some(seen) = self.reader().get::<ErasingRecord>(keys::ERASING).await? {
+            return Ok(now.saturating_sub(seen.since_ms) >= ERASURE_WAIT_MS);
+        }
+        let mut tx = self.tx()?;
+        tx.put(keys::ERASING, &ErasingRecord { since_ms: now })?;
+        self.commit(tx).await?;
+        Ok(false)
+    }
+
+    /// A try that met something other than an erased account starts the wait over.
+    async fn clear_erasing(&mut self) -> Result<(), AppError> {
+        if !self.reader().exists(keys::ERASING).await? {
+            return Ok(());
+        }
+        let mut tx = self.tx()?;
+        tx.delete(keys::ERASING)?;
+        self.commit(tx).await
     }
 }
 
