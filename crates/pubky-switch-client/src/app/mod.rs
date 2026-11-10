@@ -92,7 +92,7 @@ pub use records::{
 };
 pub use send::{
     Delivery, OutboxReport, OutgoingMessage, RecordJob, SENT_RETENTION_MS, SentMessage,
-    SignedMessage, UNDELIVERABLE_MS,
+    SignedMessage, UNDELIVERABLE_MS, UNDELIVERABLE_TRIES, UNDELIVERABLE_TRY_SPACING_MS,
 };
 
 use std::collections::{BTreeMap, BTreeSet};
