@@ -1020,11 +1020,11 @@ async fn test_signer_clearing_an_alarm_once_another_install_signs_delivers_nothi
 }
 
 #[tokio::test]
-async fn test_signer_clearing_an_alarm_over_an_emptied_switch_delivers_nothing() {
-    // The switch held version 1 and answers that it holds none: it lost the account's state.
-    // Delivering version 1 again would start the account afresh at the same generation
-    // (Switch spec 6.5), so clearing the alert sends nothing and the switch stays
-    // unconfirmed; the way out is a provider loss.
+async fn test_signer_a_single_answer_without_a_copy_is_cleared_by_the_switchs_copy() {
+    // One `409 stale_identity` answers that the switch holds no copy: a rollback alarm.
+    // Nothing is delivered again for it, since a switch that lost the account's state must
+    // not start it afresh (Switch spec 6.5). Cleared, the switch's copy is read instead: it
+    // is the mark, so the switch is confirmed and signing goes on.
     use pubky_switch_client::testing::Fault as SwitchFault;
     use pubky_switch_core::http::ErrorCode;
     let world = World::new();
@@ -1043,4 +1043,30 @@ async fn test_signer_clearing_an_alarm_over_an_emptied_switch_delivers_nothing()
     signer.clear_alert(&alert).await.unwrap();
     assert_eq!(world.sent_docs().len(), sent);
     assert!(signer.alerts().is_empty());
+    assert_eq!(signer.status(), SignerStatus::Signing);
+    signer.set_record_max_age(Some(3_600)).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_signer_a_switch_that_lost_its_copy_stays_unconfirmed_after_the_clear() {
+    // The switch really holds nothing: clearing the alert reads its copy, finds none, and
+    // raises the alarm again. Nothing is signed; the way out is a provider loss.
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    world.switch.lose_identity();
+    let SignerError::Alarm(alert) = signer.set_record_max_age(Some(86_400)).await.unwrap_err()
+    else {
+        panic!("no alarm")
+    };
+    assert!(matches!(alert, Alert::Rollback { version: None, .. }));
+    assert_eq!(
+        signer.clear_alert(&alert).await.unwrap_err(),
+        SignerError::Alarm(alert.clone())
+    );
+    assert!(signer.alerts().contains(&alert));
+    assert_eq!(signer.status(), SignerStatus::Alarm);
+    let sent = world.sent_docs().len();
+    signer.set_record_max_age(Some(60)).await.unwrap_err();
+    assert_eq!(world.sent_docs().len(), sent);
+    assert!(world.switch.identity_doc().is_none());
 }

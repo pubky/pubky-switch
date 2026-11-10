@@ -195,9 +195,10 @@ impl Signer {
         if pending.is_empty() {
             return Ok(());
         }
+        let named = super::clients::Named::check(&self.state)?;
         let client = self.service_client()?;
         for app_id in &pending {
-            let answer = client.revoke(app_id).await?;
+            let answer = client.revoke(&named, app_id).await?;
             // The proof the client verified dates the revocation; one sent again gets none.
             let at = answer
                 .proofs

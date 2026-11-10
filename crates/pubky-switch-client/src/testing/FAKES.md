@@ -109,6 +109,7 @@ service.
   `request_full_bundle` are test calls for the app's own routes, and `forget_removal_time`
   scripts a faulty service that shows no time for a removal. Freeze and
   unfreeze are test calls, not routes.
+- **`lose_identity`** scripts a faulty service that lost the account's `identity.json`.
 - **Erasure** (Switch wire 7.4.16) is a flag; its answers are signed with a fixed operator
   key.
 - **Push** (Switch wire 8.1): registrations only; nothing is sent to a relay.
