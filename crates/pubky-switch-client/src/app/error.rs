@@ -203,11 +203,17 @@ pub(crate) enum RefusalPlace {
     /// lookup, the weaker reading: the entry is stored as uncertain where it was in fact
     /// refused.
     ///
-    /// The one `401 bad_signature` of step 9 is a key bundle's signature (`key_bundle.put`),
-    /// about the bytes; it never reaches an app's own batch, since `key_bundle.put` is the
-    /// signer's, and step 9 checks an operation's permission (`403 permission_missing`)
-    /// before its shape. So every `401 bad_signature` an app's batch gets is authentication's
-    /// or step 3's, about the caller's key.
+    /// Step 9 also answers about the bytes with codes this takes as about the caller: `401
+    /// bad_signature` for a `key_bundle.put` bundle, for an `app.put` record and for a
+    /// `receive_key.put` record that don't verify, and `403 not_current` for an `app.put`
+    /// whose certificate isn't the one `identity.json` lists. A `key_bundle.put` never
+    /// reaches an app's batch: it is the signer's, and step 9 checks permission (`403
+    /// permission_missing`) before shape. The app's own `app.put` and `receive_key.put` go
+    /// in batches of their own, sent again by their own steps (joining, the record's
+    /// delivery, a registration, a move's or a loss's re-registration), never through a
+    /// kept effect or a kept batch, whose answers this classifies; a protocol's effect or a
+    /// host's batch carrying one would be held here as about the caller until the window
+    /// ends.
     Bytes,
 }
 
