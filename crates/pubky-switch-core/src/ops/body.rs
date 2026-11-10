@@ -364,7 +364,35 @@ pub struct InviteCodePut {
     pub max_uses: u64,
     /// Any JSON: an opaque reference the service stores and shows in the clear, never
     /// personal data (Switch spec 7, 15).
-    pub context: Value,
+    pub context: InviteContext,
+}
+
+/// An invite code's `context` (Switch wire 6.2): any JSON value, with the bytes it takes as
+/// written in the signed body, which its limit measures.
+#[derive(Clone, Debug, PartialEq)]
+pub struct InviteContext {
+    value: Value,
+    written_len: usize,
+}
+
+impl InviteContext {
+    /// A context as a writer writes it: compact JSON.
+    pub fn new(value: Value) -> Self {
+        let written_len = serde_json::to_vec(&value).map_or(usize::MAX, |bytes| bytes.len());
+        Self { value, written_len }
+    }
+
+    /// The value.
+    pub fn value(&self) -> &Value {
+        &self.value
+    }
+
+    /// The bytes the value takes within the signed body it was read from, from its first
+    /// byte to its last, whitespace and escapes inside it included; for one made with
+    /// [`InviteContext::new`], its compact form's.
+    pub fn written_len(&self) -> usize {
+        self.written_len
+    }
 }
 
 /// The carrying form of a key bundle inside an operation body (Switch wire 3.5, 6.2):
@@ -587,7 +615,7 @@ impl OpKind {
                 o.str("pubky", &pubky_id(pubky));
             }
             OpKind::InviteCodePut(put) => {
-                let context = serde_json::to_vec(&put.context).map_err(|_| {
+                let context = serde_json::to_vec(put.context.value()).map_err(|_| {
                     Error::Invalid("Switch wire 6.2: the invite context can't be written".into())
                 })?;
                 o.str("code_hash", &b64(&put.code_hash))
@@ -646,7 +674,7 @@ impl OpKind {
                     code_hash: req_b64n::<32>(v, "code_hash", what)?,
                     expires_at: req_time(v, "expires_at", what)?,
                     max_uses: req_int(v, "max_uses", what)?,
-                    context: context.clone(),
+                    context: InviteContext::new(context.clone()),
                 })
             }
             "invite_code.delete" => OpKind::InviteCodeDelete {
@@ -794,7 +822,13 @@ impl OpBody {
                 None => return invalid("Switch wire 6.3: conditions isn't an array"),
             },
         };
-        let kind = OpKind::read(op, &v)?;
+        let mut kind = OpKind::read(op, &v)?;
+        // The context's limit counts the bytes as written, never a re-serialization (Switch
+        // wire 6.2).
+        if let OpKind::InviteCodePut(put) = &mut kind {
+            put.context.written_len =
+                crate::json::member_span(bytes, "context").map_or(usize::MAX, |span| span.len());
+        }
         Ok(Self {
             identity,
             app_id: app,
@@ -893,6 +927,48 @@ impl SignedOp {
         identity: &[u8; 32],
         app_id: Option<&[u8; 16]>,
     ) -> std::result::Result<Self, Refusal> {
+        let op = Self::verify_signature(signed, writer_key, identity)?;
+        if op.body.app_id.as_ref() != app_id {
+            return Err(Refusal::bad_request(
+                "Switch wire 6.1: app_id isn't the calling app",
+            ));
+        }
+        Ok(op)
+    }
+
+    /// Verify an app's signed operation with the certificate it is checked against, as the
+    /// next service checks a claim entry's or a shared record's operation (Switch wire 10.5):
+    /// its signature with the certificate's signing key, then the body strictly, its
+    /// `identity` the account's, and its `app_id` the certificate's App ID. The writer an
+    /// operation names comes from the operation itself, so this binds it to the certificate:
+    /// an operation that names one app, signed by another app under that app's certificate,
+    /// isn't the named app's.
+    ///
+    /// # Errors
+    ///
+    /// `401 bad_signature` for a signature that doesn't verify with the certificate's key or
+    /// an `app_id` that isn't the certificate's, `400 bad_request` for the other rules.
+    pub fn verify_with_cert(
+        signed: &SignedDoc,
+        cert: &crate::records::AppCert,
+        identity: &[u8; 32],
+    ) -> std::result::Result<Self, Refusal> {
+        let op = Self::verify_signature(signed, &cert.signing_key(), identity)?;
+        if op.body.app_id != Some(cert.app_id()) {
+            return Err(Refusal::new(
+                crate::http::ErrorCode::BadSignature,
+                "Switch wire 10.5: the operation's app_id isn't its certificate's App ID",
+            ));
+        }
+        Ok(op)
+    }
+
+    /// The signature with `writer_key`, then the body strictly, its `identity` the account's.
+    fn verify_signature(
+        signed: &SignedDoc,
+        writer_key: &[u8; 32],
+        identity: &[u8; 32],
+    ) -> std::result::Result<Self, Refusal> {
         // A signature that doesn't decode doesn't verify: `401` like one that fails.
         signed.sig_bytes().map_err(|_| {
             Refusal::new(
@@ -905,11 +981,6 @@ impl SignedOp {
         if &body.identity != identity {
             return Err(Refusal::bad_request(
                 "Switch wire 6.1: identity isn't the account's",
-            ));
-        }
-        if body.app_id.as_ref() != app_id {
-            return Err(Refusal::bad_request(
-                "Switch wire 6.1: app_id isn't the calling app",
             ));
         }
         Ok(Self {
@@ -1062,7 +1133,7 @@ mod tests {
                 code_hash: [4; 32],
                 expires_at: 1_767_225_600_000,
                 max_uses: 1,
-                context: serde_json::json!({"ref": 1.5}),
+                context: InviteContext::new(serde_json::json!({"ref": 1.5})),
             }),
             OpKind::InviteCodeDelete { code_hash: [4; 32] },
             OpKind::KeyBundlePut(KeyBundlePut {
@@ -1139,12 +1210,82 @@ mod tests {
     }
 
     #[test]
+    fn test_op_body_app_id_is_always_written() {
+        let mut v: Value = serde_json::from_slice(&body(attempt()).to_json().unwrap()).unwrap();
+        v["app_id"] = Value::Null;
+        assert_eq!(
+            OpBody::parse(&serde_json::to_vec(&v).unwrap())
+                .unwrap()
+                .app_id,
+            None,
+            "null: the signer"
+        );
+        v.as_object_mut().unwrap().remove("app_id");
+        let refused = OpBody::parse(&serde_json::to_vec(&v).unwrap()).unwrap_err();
+        assert_eq!(refused.status(), 400);
+    }
+
+    #[test]
+    fn test_signed_op_verifies_with_a_certificate_of_its_writer() {
+        use crate::records::{AppCert, AppCertBody};
+        let id = identity();
+        let cert_for = |keys: &AppKeys| {
+            AppCert::issue(
+                &id,
+                AppCertBody::new(
+                    id.public(),
+                    keys.signing_public(),
+                    keys.bundle_public(),
+                    vec!["scope-a".into()],
+                    &[crate::scopes::Permission::ClaimsWrite],
+                    1_767_225_600_000,
+                    1_767_225_600_000 + crate::records::DEFAULT_CERT_LIFETIME_MS,
+                ),
+            )
+            .unwrap()
+        };
+        let app = app();
+        let other = AppKeys::from_secrets([4; 32], [5; 32]);
+        let op = SignedOp::sign(&app, body(attempt())).unwrap();
+        let checked =
+            SignedOp::verify_with_cert(op.signed(), &cert_for(&app), &id.public()).unwrap();
+        assert_eq!(checked.body(), op.body());
+        // Another app's certificate: its key doesn't verify the app's signature.
+        let refused = SignedOp::verify_with_cert(op.signed(), &cert_for(&other), &id.public());
+        assert_eq!(refused.unwrap_err().status(), 401);
+        // The other app signs an operation naming the app: its own certificate verifies the
+        // signature, but the operation isn't that app's.
+        let bytes = body(attempt()).to_json().unwrap();
+        let sig =
+            crate::signing::Signs::sign_fields(&other, labels::sig::OP, &[&id.public(), &bytes]);
+        let forged = SignedDoc::from_parts(&bytes, &sig);
+        let refused =
+            SignedOp::verify_with_cert(&forged, &cert_for(&other), &id.public()).unwrap_err();
+        assert_eq!(refused.status(), 401);
+        assert!(
+            refused.reason.contains("isn't its certificate's App ID"),
+            "{refused}"
+        );
+        // SignedOp::verify with the operation's own app_id passes it: the binding is the
+        // certificate's.
+        assert!(
+            SignedOp::verify(
+                &forged,
+                &other.signing_public(),
+                &id.public(),
+                Some(&app.app_id_bytes())
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
     fn test_op_body_invite_context_is_opaque() {
         let b = body(OpKind::InviteCodePut(InviteCodePut {
             code_hash: [4; 32],
             expires_at: 1_767_225_600_000,
             max_uses: 1,
-            context: serde_json::json!({"rate": -2.5, "extra": {"n": 1e30}}),
+            context: InviteContext::new(serde_json::json!({"rate": -2.5, "extra": {"n": 1e30}})),
         }));
         assert!(OpBody::parse(&b.to_json().unwrap()).is_ok());
         // A fraction elsewhere is refused before any field is read.

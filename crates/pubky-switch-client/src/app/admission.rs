@@ -20,7 +20,7 @@
 use pubky_switch_core::enc::{b64, pubky_id, random_bytes, serde_b64};
 use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::ident::{invite_code_hash, invite_code_uri};
-use pubky_switch_core::ops::{AllowKind, InviteCodePut, OpKind, SignedOp};
+use pubky_switch_core::ops::{AllowKind, InviteCodePut, InviteContext, OpKind, SignedOp};
 use pubky_switch_core::scopes::Permission;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -95,7 +95,7 @@ pub(crate) fn keep_invite(tx: &mut Tx, put: &InviteCodePut, code: &str) -> Resul
             code_hash: put.code_hash,
             expires_at: put.expires_at,
             max_uses: put.max_uses,
-            context: put.context.clone(),
+            context: put.context.value().clone(),
         },
     )
 }
@@ -330,7 +330,7 @@ impl App {
                 code_hash,
                 expires_at,
                 max_uses,
-                context: context.clone(),
+                context: InviteContext::new(context.clone()),
             };
             self.submit_batch(
                 OpBatch::new()

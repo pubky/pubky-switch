@@ -32,17 +32,17 @@ pub enum Admission {
     ContactsAndConversations,
 }
 
-/// The connect request settings of the policy (Switch wire 3.3).
+/// The connect request settings of the policy (Switch wire 3.3): every member required and
+/// none `null`, so a reader refuses an object without one. A signer writes the defaults when
+/// the user sets none.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ConnectRequests {
     /// Whether strangers may ask to be invited; `false` by default.
-    #[serde(default)]
     pub enabled: bool,
-    /// The most pending connect requests; 50 by default.
-    #[serde(default = "default_max_pending")]
+    /// The most pending connect requests; 50 by default. Any `int`: the service caps it at
+    /// its `max_connect_pending` (Switch wire 9.2).
     pub max_pending: u64,
     /// Whether a connect request pushes; `false` by default.
-    #[serde(default)]
     pub push: bool,
 }
 
@@ -691,6 +691,19 @@ mod tests {
         IdentityDoc::verify(&resign(&v), &identity().public()).unwrap();
         v.as_object_mut().unwrap().remove("recovery_from");
         assert!(IdentityDoc::verify(&resign(&v), &identity().public()).is_err());
+        // A renewed entry's `until` is always written, `null` while the renewal is open.
+        let mut renewing = body();
+        renewing.renewed.push(RenewedCert {
+            app_id: app().app_id_bytes(),
+            cert: [6; 32],
+            until: None,
+        });
+        let mut v: serde_json::Value =
+            serde_json::from_slice(&renewing.to_json().unwrap()).unwrap();
+        assert!(v["renewed"][0]["until"].is_null());
+        IdentityDoc::verify(&resign(&v), &identity().public()).unwrap();
+        v["renewed"][0].as_object_mut().unwrap().remove("until");
+        assert!(IdentityDoc::verify(&resign(&v), &identity().public()).is_err());
         let mut no_signer: serde_json::Value =
             serde_json::from_slice(&body().to_json().unwrap()).unwrap();
         no_signer["signer"] = serde_json::json!(crate::enc::b64(&[1; 15]));
@@ -739,6 +752,26 @@ mod tests {
         let mut v: serde_json::Value = serde_json::from_slice(&body().to_json().unwrap()).unwrap();
         v["policy"]["admission"] = serde_json::json!("everyone");
         assert!(IdentityDoc::verify(&resign(&v), &identity().public()).is_err());
+        // Every connect_requests member is required, and none is null.
+        let mut v: serde_json::Value = serde_json::from_slice(&body().to_json().unwrap()).unwrap();
+        IdentityDoc::verify(&resign(&v), &identity().public()).unwrap();
+        v["policy"]["connect_requests"] = serde_json::json!({});
+        assert!(IdentityDoc::verify(&resign(&v), &identity().public()).is_err());
+        for member in ["enabled", "max_pending", "push"] {
+            let mut v: serde_json::Value =
+                serde_json::from_slice(&body().to_json().unwrap()).unwrap();
+            let connect = v["policy"]["connect_requests"].as_object_mut().unwrap();
+            connect.remove(member);
+            assert!(
+                IdentityDoc::verify(&resign(&v), &identity().public()).is_err(),
+                "{member} missing"
+            );
+            v["policy"]["connect_requests"][member] = serde_json::Value::Null;
+            assert!(
+                IdentityDoc::verify(&resign(&v), &identity().public()).is_err(),
+                "{member} null"
+            );
+        }
         let mut b = body();
         b.record_max_age = Some(30);
         assert_eq!(sign(b).record_max_age_ms(), 30_000);
@@ -855,6 +888,19 @@ mod tests {
         v1.check_successor(&v2).unwrap();
         assert!(v2.check_successor(&v1).is_err());
         assert!(v1.check_successor(&v1).is_err());
+        // data_epoch only increases: a later version that lowers it is refused (Switch wire
+        // 3.3 "Lists"); one that keeps or raises it isn't.
+        let mut raised = b2.clone();
+        raised.data_epoch = 2;
+        let raised = sign(raised);
+        v1.check_successor(&raised).unwrap();
+        let mut lowered = body();
+        lowered.version = 3;
+        let error = raised.check_successor(&sign(lowered)).unwrap_err();
+        assert!(
+            error.to_string().contains("data_epoch only increases"),
+            "{error}"
+        );
         // An App ID once removed is never listed again.
         let mut removed = body();
         removed.version = 4;

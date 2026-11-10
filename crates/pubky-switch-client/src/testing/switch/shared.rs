@@ -300,7 +300,7 @@ impl Shared {
                 uses: 0,
                 writer: cx.writer.unwrap_or_default(),
                 expires_at: put.expires_at,
-                context: put.context.clone(),
+                context: put.context.value().clone(),
             },
         );
         Ok(ProofState::InviteCodePut {
