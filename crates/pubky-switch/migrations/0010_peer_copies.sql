@@ -16,6 +16,10 @@ CREATE TABLE peer_copies (
     -- The hash of the document's body bytes, which a delivery at the held version is
     -- compared by (Switch wire 3.3).
     body_hash    BYTEA   NOT NULL CHECK (octet_length(body_hash) = 32),
+    -- The App IDs the copy lists in removed, so a removed app is answered like a stranger
+    -- without the document being read (Switch wire 7.2): the same work whether or not a
+    -- copy is held.
+    removed      BYTEA[] NOT NULL DEFAULT '{}',
     delivered    BIGINT  NOT NULL DEFAULT nextval('peer_delivery_order'),
     PRIMARY KEY (account_id, identity)
 );

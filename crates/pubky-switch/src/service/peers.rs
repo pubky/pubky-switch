@@ -79,8 +79,12 @@ impl Service {
     }
 
     /// `PUT /v1/{id}/peers` (Switch wire 7.4.5), from an own app or an app of another
-    /// identity; `trusted` says whether the service has trusted time, which an invite code's
-    /// expiry needs (7.3).
+    /// identity, of `delivered`, verified before the lock ([`verify_delivery`]); `trusted`
+    /// says whether the service has trusted time, which an invite code's expiry needs (7.3).
+    ///
+    /// Until admission decides, nothing here depends on whether a copy of the sender's
+    /// identity is held, so a refusal's work is the same either way (Switch wire 7.2): the
+    /// held copy's `removed` list is read on its own, without the document.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn put_peers(
         &self,
@@ -88,48 +92,35 @@ impl Service {
         signer: &ServiceSigner,
         held: Option<&IdentityDoc>,
         deliverer: Deliverer<'_>,
-        body: &[u8],
+        delivered: &Delivered,
         invite_code: Option<&str>,
         trusted: bool,
         time_ms: u64,
     ) -> Result<Answer, ApiError> {
-        let value: Value = serde_json::from_slice(body)
-            .map_err(|_| ApiError::bad_request("7.4.5: the body is a signed identity.json"))?;
-        let signed = SignedDoc::from_strict_value(&value)
-            .map_err(|_| ApiError::bad_request("7.4.5: the body is a signed identity.json"))?;
-        let doc = IdentityDoc::verify_named(&signed)
-            .map_err(|_| ApiError::bad_request("3.3: the identity.json doesn't verify"))?;
-        let identity = doc.identity();
+        let identity = delivered.doc.identity();
         let account = txn.head().clone();
         let copy = HeldPeer {
-            doc: signed,
-            version: doc.version(),
-            generation: doc.generation(),
-            body_hash: doc.body_hash(),
+            doc: delivered.signed.clone(),
+            version: delivered.doc.version(),
+            generation: delivered.doc.generation(),
+            body_hash: delivered.doc.body_hash(),
+            removed: delivered
+                .doc
+                .body()
+                .removed
+                .iter()
+                .map(|removed| removed.app_id)
+                .collect(),
         };
-        let cert = match deliverer {
-            Deliverer::OwnApp => {
-                if identity == account.identity_key {
-                    return Err(ApiError::bad_request(
-                        "7.4.5: an own app delivers counterparties' documents, not its own \
-                         identity's",
-                    ));
-                }
-                None
-            }
-            Deliverer::OtherApp(cert) => {
-                if identity != cert.identity() {
-                    return Err(not_admitted());
-                }
-                Some(cert)
-            }
-        };
-        let held_copy = txn.peer_copy(&identity).await.map_err(|e| storage(&e))?;
-        let standing = self.standing(txn, &identity).await?;
-        let Some(cert) = cert else {
+        let Deliverer::OtherApp(cert) = deliverer else {
             // An own app's delivery needs no admission and counts against no rate.
+            let admitted = txn
+                .peer_admitted(&identity)
+                .await
+                .map_err(|e| storage(&e))?;
+            let held_copy = txn.peer_copy(&identity).await.map_err(|e| storage(&e))?;
             let answer = self
-                .keep_copy(txn, &identity, held_copy.as_ref(), &copy, standing)
+                .keep_copy(txn, &identity, held_copy.as_ref(), &copy, admitted)
                 .await?;
             let head = self
                 .head(txn, signer)
@@ -142,13 +133,12 @@ impl Service {
         // allows it. One the held copy or the delivered document lists in removed is
         // answered like a stranger (Switch wire 7.2).
         let app = cert.app_id();
-        let removed = doc.lists_removed(&app)
-            || held_copy
-                .as_ref()
-                .map(|held| IdentityDoc::verify_named(&held.doc))
-                .transpose()
-                .map_err(|_| ApiError::unavailable("7.6: a temporary failure"))?
-                .is_some_and(|held| held.lists_removed(&app));
+        let removed = delivered.doc.lists_removed(&app)
+            || txn
+                .peer_lists_removed(&identity, &app)
+                .await
+                .map_err(|e| storage(&e))?;
+        let standing = self.standing(txn, &identity).await?;
         let connect_requests = held.is_some_and(|doc| doc.body().policy.connect_requests.enabled);
         let listed = !standing.denied && !removed && (standing.contact || standing.conversation);
         let invite = if listed {
@@ -185,9 +175,11 @@ impl Service {
                     })?;
             }
         }
+        let held_copy = txn.peer_copy(&identity).await.map_err(|e| storage(&e))?;
         if removed {
             // The delivered version, whatever the service holds, and no body compared. A
-            // newer document is still kept, never going back (Switch wire 7.4.5).
+            // newer document is still kept, as from a stranger, never going back (Switch
+            // wire 7.4.5).
             let floor = txn.peer_floor(&identity).await.map_err(|e| storage(&e))?;
             if judge(
                 held_copy.as_ref(),
@@ -197,13 +189,17 @@ impl Service {
                 &copy.body_hash,
             ) == Judgment::Keep
             {
-                self.keep_copy(txn, &identity, held_copy.as_ref(), &copy, standing)
+                self.keep_copy(txn, &identity, held_copy.as_ref(), &copy, false)
                     .await?;
             }
             return answer_of(&Kept::Version(copy.version), Some(copy.version));
         }
+        let admitted = txn
+            .peer_admitted(&identity)
+            .await
+            .map_err(|e| storage(&e))?;
         let answer = self
-            .keep_copy(txn, &identity, held_copy.as_ref(), &copy, standing)
+            .keep_copy(txn, &identity, held_copy.as_ref(), &copy, admitted)
             .await?;
         let known = match answer {
             Kept::Version(version) => Some(version),
@@ -213,16 +209,19 @@ impl Service {
     }
 
     /// Judge `copy` against what the account holds of `identity`, and keep it if it is
-    /// newer: within `max_peers`, the least recently delivered copy drops, strangers' first;
-    /// a stranger's new copy never pushes out an admitted identity's, it drops itself
-    /// instead; a dropped admitted copy leaves a floor (Switch wire 9.1).
+    /// newer (Switch wire 7.4.5, 9.1). Within `max_peers`, the least recently delivered copy
+    /// drops, strangers' first (a stranger here: neither a contact nor a conversation entry,
+    /// or denied); a new copy not `admitted` for keeping never pushes out an admitted
+    /// identity's, it drops itself instead; a dropped admitted copy leaves a floor. A floor
+    /// goes only when a copy of its identity is kept; a copy that drops itself raises its
+    /// floor instead, so what the account holds of an identity never goes back.
     async fn keep_copy(
         &self,
         txn: &mut AccountTxn,
         identity: &[u8; 32],
         held: Option<&HeldPeer>,
         copy: &HeldPeer,
-        standing: Standing,
+        admitted: bool,
     ) -> Result<Kept, ApiError> {
         let floor = match held {
             Some(_) => None,
@@ -247,12 +246,10 @@ impl Service {
             }
             Judgment::Keep => {}
         }
-        txn.put_peer(identity, copy)
-            .await
-            .map_err(|e| storage(&e))?;
-        let count = txn.peer_count().await.map_err(|e| storage(&e))?;
-        if count > self.limits.max_peers {
-            let admitted = !standing.denied && (standing.contact || standing.conversation);
+        // A new identity's copy needs room; a newer copy of one held takes its place.
+        let full = held.is_none()
+            && txn.peer_count().await.map_err(|e| storage(&e))? >= self.limits.max_peers;
+        if full {
             match txn
                 .oldest_peer(identity, true)
                 .await
@@ -264,9 +261,16 @@ impl Service {
                         .map_err(|e| storage(&e))?;
                 }
                 None if !admitted => {
-                    txn.drop_peer(identity, None)
+                    // Dropped at once: not kept, so its floor, if any, stays, raised to it.
+                    let raised = PeerFloor {
+                        version: copy.version,
+                        generation: copy.generation,
+                        body_hash: copy.body_hash,
+                    };
+                    txn.raise_peer_floor(identity, &raised)
                         .await
                         .map_err(|e| storage(&e))?;
+                    return Ok(Kept::Version(copy.version));
                 }
                 None => {
                     if let Some((oldest, dropped)) = txn
@@ -286,7 +290,47 @@ impl Service {
                 }
             }
         }
+        txn.put_peer(identity, copy)
+            .await
+            .map_err(|e| storage(&e))?;
         Ok(Kept::Version(copy.version))
+    }
+}
+
+/// A delivered `identity.json`, read and verified before the account's lock.
+#[derive(Clone, Debug)]
+pub(super) struct Delivered {
+    signed: SignedDoc,
+    doc: IdentityDoc,
+}
+
+/// Read and verify a `PUT /peers` body before the account's lock (Switch wire 7.2 Order:
+/// signature work before anything that needs the account's state), with the identity
+/// checks that need none: an app of another identity, of `other`, delivers only its own
+/// identity's document (`403 not_admitted`); an own app never delivers its account's
+/// (`400`). The same work for every caller, whatever the account holds.
+///
+/// # Errors
+///
+/// `400` for a body that isn't a signed `identity.json` that verifies, and the identity
+/// checks' answers.
+pub(super) fn verify_delivery(
+    body: &[u8],
+    account_identity: &[u8; 32],
+    other: Option<&[u8; 32]>,
+) -> Result<Delivered, ApiError> {
+    let value: Value = serde_json::from_slice(body)
+        .map_err(|_| ApiError::bad_request("7.4.5: the body is a signed identity.json"))?;
+    let signed = SignedDoc::from_strict_value(&value)
+        .map_err(|_| ApiError::bad_request("7.4.5: the body is a signed identity.json"))?;
+    let doc = IdentityDoc::verify_named(&signed)
+        .map_err(|_| ApiError::bad_request("3.3: the identity.json doesn't verify"))?;
+    match other {
+        Some(sender) if doc.identity() != *sender => Err(not_admitted()),
+        None if doc.identity() == *account_identity => Err(ApiError::bad_request(
+            "7.4.5: an own app delivers counterparties' documents, not its own identity's",
+        )),
+        _ => Ok(Delivered { signed, doc }),
     }
 }
 

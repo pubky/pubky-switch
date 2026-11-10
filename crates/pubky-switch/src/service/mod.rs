@@ -304,6 +304,7 @@ impl Service {
             }
         };
         let call = &request.route.call;
+        let stamped_ms = found.stamped_time_ms;
         let refused_early = |error: ApiError| {
             let signature = if *call == Call::GetIdentity {
                 None
@@ -348,7 +349,13 @@ impl Service {
             }
             Call::Ops | Call::GetClaim(_) | Call::Feed | Call::PutPeers => {
                 let others = *call == Call::PutPeers;
-                match self.authenticate_caller(&account, &request, base_ms, others) {
+                match self.authenticate_caller(
+                    &account,
+                    &request,
+                    base_ms,
+                    base_ms.max(stamped_ms),
+                    others,
+                ) {
                     Ok(claimed) => {
                         // An own app's request is verified here too, so nothing unverified
                         // takes the lock (Switch wire 7.2 Order).
@@ -390,6 +397,17 @@ impl Service {
                     .await;
             }
         };
+        // A delivered identity.json is read and verified before the lock too: signature work
+        // needs no account state (Switch wire 7.2 Order). Its refusal is answered under the
+        // lock, after the caller's own checks, with the head an own app's refusal carries.
+        let delivered = (*call == Call::PutPeers).then(|| {
+            let other = match caller.as_ref().map(|claimed| &claimed.caller) {
+                Some(Caller::OtherApp { identity, .. }) => Some(*identity),
+                _ => None,
+            };
+            let account_key = pubky_switch_core::enc::pubky_key(&account).unwrap_or([0; 32]);
+            peers::verify_delivery(&request.body, &account_key, other.as_ref())
+        });
         let txn = match self.store.begin(&account).await {
             Ok(Some(txn)) => txn,
             // Erased between the lookup and the lock.
@@ -417,6 +435,7 @@ impl Service {
             caller.as_ref(),
             verified.as_ref(),
             other.as_ref(),
+            delivered.as_ref(),
         )
         .await
     }
@@ -585,6 +604,7 @@ impl Service {
         caller: Option<&Claimed>,
         verified: Option<&batch::VerifiedApp>,
         other: Option<&AppCert>,
+        delivered: Option<&Result<peers::Delivered, ApiError>>,
     ) -> SwitchResponse {
         let signature = request_signature.as_ref();
         // The time the account last committed, for an answer whose commit fails.
@@ -625,7 +645,9 @@ impl Service {
             }
         };
         let (answer, marked) = match self
-            .run_at_account(&mut txn, &signer, request, verified, other, due, time_ms)
+            .run_at_account(
+                &mut txn, &signer, request, verified, other, delivered, due, time_ms,
+            )
             .await
         {
             Ok(done) => done,
@@ -741,6 +763,7 @@ impl Service {
         request: &SwitchRequest,
         verified: Option<&batch::VerifiedApp>,
         other: Option<&AppCert>,
+        delivered: Option<&Result<peers::Delivered, ApiError>>,
         due: Option<u64>,
         time_ms: u64,
     ) -> Result<(Answer, bool), Refused> {
@@ -882,6 +905,15 @@ impl Service {
                         ));
                     }
                 };
+                let delivered = delivered
+                    .ok_or_else(|| {
+                        Refused::with_head(
+                            ApiError::unavailable("7.6: a temporary failure"),
+                            serving,
+                        )
+                    })?
+                    .as_ref()
+                    .map_err(|error| Refused::with_head(error.clone(), serving))?;
                 let invite_code = request
                     .headers
                     .get(header::INVITE_CODE)
@@ -892,7 +924,7 @@ impl Service {
                         signer,
                         held.as_ref(),
                         deliverer,
-                        &request.body,
+                        delivered,
                         invite_code,
                         due.is_some(),
                         time_ms,
@@ -949,6 +981,7 @@ impl Service {
         account: &str,
         request: &SwitchRequest,
         base_ms: u64,
+        service_time_ms: u64,
         others: bool,
     ) -> Result<Claimed, ApiError> {
         if let Err(retry_after) = self.failed_auth.check(request.source, base_ms) {
@@ -971,12 +1004,21 @@ impl Service {
         {
             // Authenticated first, by its certificate (`400`, `401`, Switch wire 7.2):
             // permissions and the endpoint's refusal come after authentication.
-            self.verify_other_app(request, &claimed, app)
+            let cert = self
+                .verify_other_app(request, &claimed, app)
                 .inspect_err(|error| {
                     if is_failed_authentication(error.code) {
                         self.record_failure(request, account.to_string());
                     }
                 })?;
+            // Check 3, expiry, before any permission (Switch wire 3.8), at the identity's
+            // service time as far as it is known before the lock.
+            if cert.expired_at(service_time_ms) {
+                return Err(ApiError::new(
+                    ErrorCode::CertExpired,
+                    "3.8: the certificate has expired",
+                ));
+            }
             // The feed is for own apps only (Switch wire 7.4.4).
             if request.route.call == Call::Feed {
                 return Err(ApiError::new(
