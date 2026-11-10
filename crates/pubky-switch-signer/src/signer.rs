@@ -539,8 +539,8 @@ impl Signer {
     /// 3.13).
     async fn judge_backup(&mut self, found: &BackupView) -> Result<()> {
         let doc = &found.identity_doc;
-        let newest = self.high_water().map_or(0, |h| h.version);
-        if found.taken_over(&self.state.install, newest) {
+        let mark = self.state.newest_doc()?;
+        if found.taken_over(&self.state.install, mark.as_ref()) {
             return self.managed_by(doc.body().signer).await;
         }
         if doc.body().signer == self.state.install && doc.version() > self.state.signed_through {
@@ -764,15 +764,12 @@ impl Signer {
         prev: Option<[u8; 32]>,
         backup: Option<SignerBackup>,
     ) -> Result<()> {
-        let raised = self.check_backup_write().await?;
-        let mut state = self.state.clone();
-        if let Some(alert) = raised {
-            state.alert(alert);
-        }
+        self.check_named()?;
         let backup = match backup {
             Some(backup) => backup,
             None => {
-                // Sealed once and kept, so a retry writes the same bytes.
+                // Sealed once and kept, so a retry writes the same bytes. Sealed and committed
+                // before the check, so only the check's read comes before the write.
                 let backup = self.seal_backup(doc, prev)?;
                 let flow = Flow::Deliver {
                     doc: doc.clone(),
@@ -780,11 +777,16 @@ impl Signer {
                     backup: Some(backup.clone()),
                     step: DeliverStep::Signed,
                 };
-                self.commit(state.clone(), Some(flow)).await?;
+                self.commit(self.state.clone(), Some(flow)).await?;
                 backup
             }
         };
         let bytes = serde_json::to_vec(&backup).map_err(|e| SignerError::Records(e.to_string()))?;
+        let raised = self.check_backup_write().await?;
+        let mut state = self.state.clone();
+        if let Some(alert) = raised {
+            state.alert(alert);
+        }
         self.env
             .homeserver
             .put(SIGNER_BACKUP_PATH, bytes)
@@ -804,8 +806,10 @@ impl Signer {
 
     /// The checks before any write of this install's backup, over the one the Homeserver
     /// holds (Switch wire 3.13 "When it is written", "Another install's backup"): this
-    /// install is named, and the backup there names neither another install at or past the
-    /// high-water mark nor a newer version of this install's own ([`Signer::judge_backup`]).
+    /// install is named, and the backup there names neither another install that took over,
+    /// past the high-water mark or at it with the mark's own document, nor a newer version of
+    /// this install's own ([`Signer::judge_backup`]). One at the mark's version holding another
+    /// document is a losing delivery's, and is written over.
     /// One that doesn't open, or none where this signer has written one, is written over only
     /// while the switch still holds the newest version this signer delivered: then no other
     /// install has taken over, since one that takes over delivers before it writes its
