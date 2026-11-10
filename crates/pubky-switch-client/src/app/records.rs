@@ -1276,6 +1276,7 @@ impl App {
     ///
     /// # Errors
     ///
+    /// [`Refusal::Stopped`] or [`Refusal::Left`] for a stopped or departed app;
     /// [`Refusal::Usage`] when the certificate holds none of the write scopes;
     /// [`Refusal::NotNow`] while the app lacks the read scope's key at the current data
     /// epoch (it fetches its key bundle first); a store failure.
@@ -1286,6 +1287,7 @@ impl App {
         conditions: Vec<Condition>,
     ) -> Result<(Vec<Condition>, OpKind), AppError> {
         Box::pin(async move {
+            self.refuse_when_stopped()?;
             let epoch = self.state.own_doc.data_epoch();
             let read_scope = &target.collection.policy.read_scope;
             if self.state.scope_keys.get(epoch, read_scope).is_none() {

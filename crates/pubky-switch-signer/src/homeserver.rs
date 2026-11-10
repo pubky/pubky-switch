@@ -1,0 +1,31 @@
+//! The identity's own Homeserver, as the signer reads and writes it (Switch spec 4.1).
+//!
+//! The signer writes two public files there, which only it writes and no app's grant covers
+//! (Switch spec 3.4): `identity.json` (Switch wire 3.3) and the signer's backup (Switch wire
+//! 3.13). The host implements [`Homeserver`] on its Pubky client, with the identity's own
+//! session; how it signs in, and the request deadlines, are the host's.
+
+use pubky_switch_client::TransportError;
+use pubky_switch_client::transport::BoxFuture;
+
+/// The identity's Homeserver, through the host's Pubky session for the identity.
+///
+/// Object-safe; the signer holds an `Arc<dyn Homeserver>`. Paths are absolute, such as
+/// `/pub/pubky-switch/v1/identity.json`.
+pub trait Homeserver: Send + Sync {
+    /// The bytes of the identity's public file at `path`, `None` when there is no such file.
+    ///
+    /// # Errors
+    ///
+    /// A [`TransportError`] when the Homeserver can't be read now.
+    fn get(&self, path: &str) -> BoxFuture<'_, Result<Option<Vec<u8>>, TransportError>>;
+
+    /// Write `bytes` as the identity's file at `path`, replacing what is there. `Ok` means the
+    /// Homeserver took the write.
+    ///
+    /// # Errors
+    ///
+    /// A [`TransportError`] when the write failed or may not have arrived; the signer writes
+    /// the same bytes again.
+    fn put(&self, path: &str, bytes: Vec<u8>) -> BoxFuture<'_, Result<(), TransportError>>;
+}
