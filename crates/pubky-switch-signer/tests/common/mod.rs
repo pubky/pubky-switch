@@ -220,6 +220,9 @@ pub struct World {
     pub homeserver: Arc<TestHomeserver>,
     pub clock: Arc<TestClock>,
     pub vault: Arc<Vault>,
+    /// The scope keys each app got with its approval, by App ID: what it holds before it
+    /// fetches any bundle part (Switch wire 3.10).
+    pub approval_keys: Mutex<HashMap<[u8; 16], pubky_switch_core::keys::ScopeKeys>>,
 }
 
 impl World {
@@ -233,6 +236,7 @@ impl World {
             homeserver: Arc::new(TestHomeserver::default()),
             clock,
             vault: Arc::new(Vault(Mutex::new(Some(SECRET)))),
+            approval_keys: Mutex::new(HashMap::new()),
             key,
         }
     }
@@ -406,6 +410,10 @@ impl World {
             &|scope: &str| scope != "notes_tags",
         )
         .unwrap();
+        self.approval_keys
+            .lock()
+            .unwrap()
+            .insert(app.keys.app_id_bytes(), read.keys.clone());
         let record = AppRecord::sign(
             &app.keys,
             AppRecordBody::new(&read.cert, Vec::new(), START_MS),

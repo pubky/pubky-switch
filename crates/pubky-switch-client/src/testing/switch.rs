@@ -133,6 +133,12 @@ pub struct SwitchApp {
     pub departed_at: Option<(u64, u64)>,
     /// When the app asked for its full key bundle, until a bundle part answers it.
     pub full_requested: Option<u64>,
+    /// When the switch last took a request of the app's (`last_seen`, Switch wire 7.4.12).
+    pub last_seen: Option<u64>,
+    /// Whether a delivered `identity.json` listed the departed app in `removed` at a higher
+    /// data epoch than at its departure: its rotation is done for good (`awaiting_rotation`,
+    /// Switch wire 7.4.12).
+    pub rotated: bool,
 }
 
 /// The byte budget of a feed page's items and of a record page's views: 8 MiB (Switch wire
@@ -163,6 +169,14 @@ pub enum Fault {
         path: String,
         /// How many matching requests go through first.
         after: usize,
+    },
+    /// Apply an own app's or the signer's request, then sign an answer that leaves out the
+    /// top-level `member`, as a faulty service would.
+    LeaveOut {
+        /// A part of the request's path and query.
+        path: String,
+        /// The member left out.
+        member: String,
     },
 }
 
@@ -247,6 +261,9 @@ pub(crate) struct Inner {
     /// The App IDs the enrollment that made the account named, kept for good (Switch wire
     /// 3.7).
     pub(crate) kept_app_ids: Vec<[u8; 16]>,
+    /// The service time of the enrollment that named `kept_app_ids`, their `revoked_at` in
+    /// `GET /apps` (Switch wire 7.4.12).
+    pub(crate) kept_at: u64,
     /// The transition proof of the newest `identity.json` delivery, which a retry gets again
     /// (Switch wire 7.4.2).
     pub(crate) delivery_proof: Option<SignedDoc>,
@@ -312,6 +329,7 @@ impl Inner {
             directory_version: 1,
             enrolled: Some(signer::Enrolled::default()),
             kept_app_ids: Vec::new(),
+            kept_at: 0,
             delivery_proof: None,
             enroll_limits: pubky_switch_core::records::Limits::default(),
             listed_at_epoch: BTreeMap::new(),
@@ -623,10 +641,12 @@ impl ScriptedSwitch {
         let mut inner = self.lock();
         let path = request.path_and_query.clone();
         let mut lose = false;
+        let mut leave_out = None;
         let matching = inner.faults.iter().position(|fault| match fault {
             Fault::Error { path: p, .. }
             | Fault::LoseAnswer { path: p }
-            | Fault::Unreachable { path: p, .. } => path.contains(p.as_str()),
+            | Fault::Unreachable { path: p, .. }
+            | Fault::LeaveOut { path: p, .. } => path.contains(p.as_str()),
         });
         let passes = matching.is_some_and(|index| match inner.faults.get_mut(index) {
             Some(Fault::Unreachable { after, .. }) if *after > 0 => {
@@ -648,6 +668,7 @@ impl ScriptedSwitch {
                     return Ok(inner.respond(request, status, &body));
                 }
                 Some(Fault::LoseAnswer { .. }) => lose = true,
+                Some(Fault::LeaveOut { member, .. }) => leave_out = Some(member),
                 Some(Fault::Unreachable { .. }) => {
                     inner.unreached.push(request.body.clone());
                     return Err(TransportError::Connect("scripted".into()));
@@ -694,10 +715,19 @@ impl ScriptedSwitch {
             Some(answer) => Ok(answer),
             None => inner.route(request, caller, &rest),
         };
-        let (status, body) =
+        // An own app's request: its last-seen time (Switch wire 7.4.12), also for the request
+        // that registered it.
+        let now = inner.now();
+        if let Some(held) = caller.and_then(|app| inner.apps.get_mut(&app)) {
+            held.last_seen = Some(now);
+        }
+        let (status, mut body) =
             answer.map_err(|error| TransportError::Other(format!("scripted switch: {error}")))?;
         if lose {
             return Err(TransportError::Timeout);
+        }
+        if let (Some(member), Some(object)) = (leave_out, body.as_object_mut()) {
+            object.remove(&member);
         }
         Ok(inner.respond(request, status, &body))
     }

@@ -298,6 +298,9 @@ impl App {
         // A renewed certificate is taken before the kept effect goes again: the effect may
         // wait on it, refused for the expired one (`403 cert_expired`).
         self.adopt_renewal().await?;
+        // A copy of the lists not known to be complete is refreshed before any entry, the
+        // ones stored locally included, is handed over.
+        self.refresh_lists_if_owed().await?;
         self.resume_pending_effect().await?;
         self.deliver_record().await?;
         self.ensure_scope_keys().await?;
@@ -676,6 +679,7 @@ impl App {
                     may_attempt,
                     &fetched,
                     read.tx.pending_local(),
+                    read.tx.pending_writes(),
                 );
                 let outcome = protocol.receive_with(&message, &mut cx);
                 (outcome, cx.into_writes())

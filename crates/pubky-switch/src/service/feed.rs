@@ -464,15 +464,6 @@ impl PageReader for PageBuilder {
                         return false;
                     }
                 };
-                // The staged gate of Switch wire 7.3 step 7: a version delivered during the
-                // wait that no longer names this service ends the page.
-                if !super::rules::names_this_service(doc.as_ref(), origin, service_public) {
-                    self.refusal = Some(Stop::Refused(ApiError::new(
-                        ErrorCode::Staged,
-                        "7.3: the account isn't named by its identity.json",
-                    )));
-                    return false;
-                }
                 match check_own_app(
                     identity_key,
                     doc.as_ref(),
@@ -482,6 +473,16 @@ impl PageReader for PageBuilder {
                     self.time_ms,
                 ) {
                     Ok(cert) => {
+                        // Then the staged gate, step 7 after step 5, as for a new request
+                        // (Switch wire 7.3): a version delivered during the wait that no
+                        // longer names this service ends the page.
+                        if !super::rules::names_this_service(doc.as_ref(), origin, service_public) {
+                            self.refusal = Some(Stop::Refused(ApiError::new(
+                                ErrorCode::Staged,
+                                "7.3: the account isn't named by its identity.json",
+                            )));
+                            return false;
+                        }
                         self.cert = Some(cert);
                         true
                     }
@@ -627,12 +628,26 @@ impl Service {
         read: &FeedRead,
         signer: &ServiceSigner,
     ) -> Result<(Answer, u64), FeedStop> {
+        // The latest service time a read of this wait has seen: no answer is signed at an
+        // earlier one, so a refusal after a wait never shows the service's time going back
+        // behind a page the same client was answered meanwhile (Switch spec 10.1).
+        let latest = std::sync::atomic::AtomicU64::new(read.time_ms);
         let answered = long_poll(
             &self.changes,
             &read.account,
             Duration::from_secs(read.query.wait),
             || async {
-                let answered = self.read_page(read, signer).await?;
+                let answered = match self.read_page(read, signer).await {
+                    Ok(answered) => answered,
+                    Err(FeedStop::Refused(mut refusal)) => {
+                        refusal.time_ms = refusal
+                            .time_ms
+                            .max(latest.load(std::sync::atomic::Ordering::Relaxed));
+                        return Err(FeedStop::Refused(refusal));
+                    }
+                    Err(stop) => return Err(stop),
+                };
+                latest.fetch_max(answered.time_ms, std::sync::atomic::Ordering::Relaxed);
                 Ok(if answered.ready {
                     Polled::Ready(answered)
                 } else {

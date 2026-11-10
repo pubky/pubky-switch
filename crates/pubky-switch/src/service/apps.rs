@@ -27,10 +27,10 @@ fn time(at: Option<u64>) -> Value {
     at.map_or(Value::Null, |at| json!(rfc3339(at)))
 }
 
-/// A value's JSON. Values of these types always serialize; the empty object stands in if
-/// one ever didn't.
-fn json_of(value: &impl serde::Serialize) -> Vec<u8> {
-    serde_json::to_vec(value).unwrap_or_else(|_| b"{}".to_vec())
+/// A value's JSON. None of the types answered here can fail to serialize; if one ever did,
+/// the answer is a temporary failure, never a signed body with something left out.
+fn json_of(value: &impl serde::Serialize) -> Result<Vec<u8>, StoreError> {
+    serde_json::to_vec(value).map_err(|_| StoreError::Corrupt("an answer doesn't encode"))
 }
 
 /// A JSON object of `members`, in their order: the order of the wire's tables (Switch wire
@@ -41,7 +41,10 @@ fn object(members: &[(&str, Vec<u8>)]) -> Vec<u8> {
         if index > 0 {
             out.push(b',');
         }
-        out.extend_from_slice(&json_of(name));
+        // The members' names are this module's own ASCII identifiers: nothing to escape.
+        out.push(b'"');
+        out.extend_from_slice(name.as_bytes());
+        out.push(b'"');
         out.push(b':');
         out.extend_from_slice(value);
     }
@@ -136,16 +139,16 @@ pub(crate) fn statuses(
             .iter()
             .filter(|attempt| attempt.owner == id)
             .map(|attempt| {
-                object(&[
-                    ("claim_key", json_of(&b64(&attempt.claim_key))),
-                    ("attempt_id", json_of(&b64(&attempt.attempt_id))),
+                Ok(object(&[
+                    ("claim_key", json_of(&b64(&attempt.claim_key))?),
+                    ("attempt_id", json_of(&b64(&attempt.attempt_id))?),
                     (
                         "outcome",
-                        json_of(&if attempt.unknown { "unknown" } else { "open" }),
+                        json_of(&if attempt.unknown { "unknown" } else { "open" })?,
                     ),
-                ])
+                ]))
             })
-            .collect();
+            .collect::<Result<_, StoreError>>()?;
         let record_cert = held
             .and_then(|app| app.record.as_ref())
             .map(|record| b64(&AppRecord::cert(record).hash()));
@@ -154,44 +157,44 @@ pub(crate) fn statuses(
             .map(|part| [part.first_epoch, part.last_epoch])
             .collect();
         statuses.push(object(&[
-            ("app_id", json_of(&zbase32_encode(&id))),
-            ("current", json_of(&current)),
+            ("app_id", json_of(&zbase32_encode(&id))?),
+            ("current", json_of(&current)?),
             (
                 "last_seen",
-                json_of(&time(view.last_seen.get(&id).copied())),
+                json_of(&time(view.last_seen.get(&id).copied()))?,
             ),
-            ("revoked_at", json_of(&time(revoked_at))),
-            ("departed_at", json_of(&time(departed_at))),
+            ("revoked_at", json_of(&time(revoked_at))?),
+            ("departed_at", json_of(&time(departed_at))?),
             (
                 "awaiting_rotation",
-                json_of(&kept_id.is_some_and(awaiting_rotation)),
+                json_of(&kept_id.is_some_and(awaiting_rotation))?,
             ),
             ("open_attempts", array(&open_attempts)),
             // The inbox comes with POST /inbox: nothing is unread, no app is lagging.
-            ("unread_entries", json_of(&0)),
-            ("sole_target_unread", json_of(&0)),
-            ("record_cert", json_of(&record_cert)),
+            ("unread_entries", json_of(&0)?),
+            ("sole_target_unread", json_of(&0)?),
+            ("record_cert", json_of(&record_cert)?),
             (
                 "record_at",
-                json_of(&time(held.and_then(|app| app.record_at))),
+                json_of(&time(held.and_then(|app| app.record_at)))?,
             ),
-            ("lagging", json_of(&false)),
+            ("lagging", json_of(&false)?),
             (
                 "keys_through",
                 json_of(&keys_through(
                     view.listings.get(&id).copied(),
                     &spans,
                     cursor,
-                )),
+                ))?,
             ),
             (
                 "full_bundle_requested",
-                json_of(&time(held.and_then(|app| app.full_requested))),
+                json_of(&time(held.and_then(|app| app.full_requested)))?,
             ),
-            ("bundle_ranges", json_of(&ranges)),
+            ("bundle_ranges", json_of(&ranges)?),
             (
                 "cert_expires_at",
-                json_of(&time(state.checked_cert(&id).map(|cert| cert.expires_at()))),
+                json_of(&time(state.checked_cert(&id).map(|cert| cert.expires_at())))?,
             ),
         ]));
     }
@@ -219,13 +222,19 @@ impl Service {
         );
         let mut members = vec![
             ("apps", array(&apps)),
-            ("identity", json_of(&held.map(IdentityDoc::signed))),
+            (
+                "identity",
+                json_of(&held.map(IdentityDoc::signed)).map_err(|e| store_error(&e))?,
+            ),
             // Recovery comes with provider changes.
             ("recovery", b"null".to_vec()),
         ];
         // Absent when no kept proof names a generation (Switch wire 7.4.12).
         if !proof_generations.is_empty() {
-            members.push(("proof_generations", json_of(&proof_generations)));
+            members.push((
+                "proof_generations",
+                json_of(&proof_generations).map_err(|e| store_error(&e))?,
+            ));
         }
         let head = self
             .head(txn, signer)

@@ -10,15 +10,17 @@
 //!
 //! Served so far: `POST /v1/enroll`, `PUT /v1/{id}/identity`, the public
 //! `GET /v1/{id}/identity`, `POST /v1/{id}/ops`, `GET /v1/{id}/feed`,
-//! `GET /v1/{id}/claims/{claim_key}`, `GET /v1/{id}/apps` and
+//! `PUT /v1/{id}/peers`, `GET /v1/{id}/claims/{claim_key}`, `GET /v1/{id}/apps` and
 //! `POST /v1/{id}/apps/{app_id}/revoke`. Every other call is answered `503 unavailable`.
 
+mod admission;
 mod apps;
 pub mod batch;
 mod claims;
 mod enroll;
 mod feed;
 mod identity;
+mod peers;
 pub mod rules;
 
 pub use enroll::announced_limits;
@@ -67,6 +69,8 @@ pub struct Service {
     reads_per_account: MinuteWindows<String>,
     operation_rate: KeyedMinutes<(String, [u8; 16])>,
     control_rate: KeyedMinutes<(String, [u8; 16])>,
+    invite_rate: KeyedMinutes<(String, [u8; 32])>,
+    stranger_rate: KeyedMinutes<String>,
     changes: Arc<ChangeHub>,
 }
 
@@ -230,6 +234,8 @@ impl Service {
             reads_per_account: MinuteWindows::default(),
             operation_rate: KeyedMinutes::default(),
             control_rate: KeyedMinutes::default(),
+            invite_rate: KeyedMinutes::default(),
+            stranger_rate: KeyedMinutes::default(),
             changes: ChangeHub::new(),
         }
     }
@@ -298,6 +304,7 @@ impl Service {
             }
         };
         let call = &request.route.call;
+        let stamped_ms = found.stamped_time_ms;
         let refused_early = |error: ApiError| {
             let signature = if *call == Call::GetIdentity {
                 None
@@ -312,6 +319,7 @@ impl Service {
         // Everything that needs no account state comes before the lock: the limits that
         // apply before authentication, the headers and the signature (Switch wire 7.2).
         let mut verified = None;
+        let mut other = None;
         let caller = match call {
             Call::GetIdentity => {
                 if let Err(error) = self.public_read_limits(&account, request.source, base_ms) {
@@ -339,8 +347,15 @@ impl Service {
                     Err(error) => return refused_early(error).await,
                 }
             }
-            Call::Ops | Call::GetClaim(_) | Call::Feed => {
-                match self.authenticate_caller(&account, &request, base_ms) {
+            Call::Ops | Call::GetClaim(_) | Call::Feed | Call::PutPeers => {
+                let others = *call == Call::PutPeers;
+                match self.authenticate_caller(
+                    &account,
+                    &request,
+                    base_ms,
+                    base_ms.max(stamped_ms),
+                    others,
+                ) {
                     Ok(claimed) => {
                         // An own app's request is verified here too, so nothing unverified
                         // takes the lock (Switch wire 7.2 Order).
@@ -359,6 +374,19 @@ impl Service {
                                 }
                             }
                         }
+                        // An app of another identity, by the certificate it sends (Switch
+                        // wire 7.2 checks 1, 2 and 4); check 3 comes under the lock.
+                        if let Caller::OtherApp { app, .. } = &claimed.caller {
+                            match self.verify_other_app(&request, &claimed, app) {
+                                Ok(cert) => other = Some(cert),
+                                Err(error) => {
+                                    if is_failed_authentication(error.code) {
+                                        self.record_failure(&request, account.clone());
+                                    }
+                                    return refused_early(error).await;
+                                }
+                            }
+                        }
                         Some(claimed)
                     }
                     Err(error) => return refused_early(error).await,
@@ -369,6 +397,17 @@ impl Service {
                     .await;
             }
         };
+        // A delivered identity.json is read and verified before the lock too: signature work
+        // needs no account state (Switch wire 7.2 Order). Its refusal is answered under the
+        // lock, after the caller's own checks, with the head an own app's refusal carries.
+        let delivered = (*call == Call::PutPeers).then(|| {
+            let other = match caller.as_ref().map(|claimed| &claimed.caller) {
+                Some(Caller::OtherApp { identity, .. }) => Some(*identity),
+                _ => None,
+            };
+            let account_key = pubky_switch_core::enc::pubky_key(&account).unwrap_or([0; 32]);
+            peers::verify_delivery(&request.body, &account_key, other.as_ref())
+        });
         let txn = match self.store.begin(&account).await {
             Ok(Some(txn)) => txn,
             // Erased between the lookup and the lock.
@@ -395,6 +434,8 @@ impl Service {
             signature,
             caller.as_ref(),
             verified.as_ref(),
+            other.as_ref(),
+            delivered.as_ref(),
         )
         .await
     }
@@ -562,6 +603,8 @@ impl Service {
         request_signature: Option<[u8; 64]>,
         caller: Option<&Claimed>,
         verified: Option<&batch::VerifiedApp>,
+        other: Option<&AppCert>,
+        delivered: Option<&Result<peers::Delivered, ApiError>>,
     ) -> SwitchResponse {
         let signature = request_signature.as_ref();
         // The time the account last committed, for an answer whose commit fails.
@@ -602,7 +645,9 @@ impl Service {
             }
         };
         let (answer, marked) = match self
-            .run_at_account(&mut txn, &signer, request, verified, due, time_ms)
+            .run_at_account(
+                &mut txn, &signer, request, verified, other, delivered, due, time_ms,
+            )
             .await
         {
             Ok(done) => done,
@@ -624,7 +669,9 @@ impl Service {
                 }
                 // An error to the authenticated signer or own app carries the current head
                 // (Switch wire 7.1), except where the key's mark refuses one.
-                let head = if caller.is_some() && head {
+                // Not to an app of another identity, which no answer shows the head.
+                let own = caller.is_some_and(|c| !matches!(c.caller, Caller::OtherApp { .. }));
+                let head = if own && head {
                     self.head(&txn, &signer).await
                 } else {
                     None
@@ -707,12 +754,16 @@ impl Service {
 
     /// Steps 4 to 9 under the lock; the answer, and whether its commit moves the key's mark:
     /// whenever the account served before the request or serves after it.
+    // The request's verified callers and times, each from a different step of 7.3.
+    #[allow(clippy::too_many_arguments)]
     async fn run_at_account(
         &self,
         txn: &mut AccountTxn,
         signer: &ServiceSigner,
         request: &SwitchRequest,
         verified: Option<&batch::VerifiedApp>,
+        other: Option<&AppCert>,
+        delivered: Option<&Result<peers::Delivered, ApiError>>,
         due: Option<u64>,
         time_ms: u64,
     ) -> Result<(Answer, bool), Refused> {
@@ -783,6 +834,16 @@ impl Service {
             Ok(writer) => writer,
             Err(error) => return Err(stop(error)),
         };
+        // Check 3 of an app of another identity, at the identity's service time (Switch wire
+        // 7.2): its certificate hasn't expired.
+        if let Some(cert) = other
+            && cert.expired_at(time_ms)
+        {
+            return Err(Refused::with_head(
+                ApiError::new(ErrorCode::CertExpired, "3.8: the certificate has expired"),
+                serving,
+            ));
+        }
         // A call only the signer makes, from an own app that verified: refused with the head
         // (Switch wire 7.4, 7.1).
         if writer.is_some() && matches!(call, Call::PutIdentity | Call::Revoke(_) | Call::GetApps) {
@@ -830,6 +891,48 @@ impl Service {
                     .map(|answer| (answer, serving))
                     .map_err(|error| Refused::with_head(error, serving));
             }
+            Call::PutPeers => {
+                let deliverer = match (writer.as_ref(), other) {
+                    (Some(_), _) => peers::Deliverer::OwnApp,
+                    (None, Some(cert)) => peers::Deliverer::OtherApp(cert),
+                    (None, None) => {
+                        return Err(Refused::with_head(
+                            ApiError::new(
+                                ErrorCode::PermissionMissing,
+                                "7.4.5: apps deliver peers' documents",
+                            ),
+                            serving,
+                        ));
+                    }
+                };
+                let delivered = delivered
+                    .ok_or_else(|| {
+                        Refused::with_head(
+                            ApiError::unavailable("7.6: a temporary failure"),
+                            serving,
+                        )
+                    })?
+                    .as_ref()
+                    .map_err(|error| Refused::with_head(error.clone(), serving))?;
+                let invite_code = request
+                    .headers
+                    .get(header::INVITE_CODE)
+                    .and_then(|value| value.to_str().ok());
+                return self
+                    .put_peers(
+                        txn,
+                        signer,
+                        held.as_ref(),
+                        deliverer,
+                        delivered,
+                        invite_code,
+                        due.is_some(),
+                        time_ms,
+                    )
+                    .await
+                    .map(|answer| (answer, serving))
+                    .map_err(|error| Refused::with_head(error, serving));
+            }
             Call::GetApps => {
                 return self
                     .get_apps(txn, signer, held.as_ref(), time_ms)
@@ -871,12 +974,15 @@ impl Service {
     /// account state (Switch wire 7.2 Order): the network source's failed-authentication
     /// limit, the headers and the timestamp, and the signer's signature. An own app's
     /// signature is verified under the lock, with the key the account holds for it; an app
-    /// of another identity is `403 not_admitted` (Switch wire 6.4 step 1).
+    /// of another identity is `403 not_admitted` (Switch wire 6.4 step 1), unless the call
+    /// takes `others`.
     fn authenticate_caller(
         &self,
         account: &str,
         request: &SwitchRequest,
         base_ms: u64,
+        service_time_ms: u64,
+        others: bool,
     ) -> Result<Claimed, ApiError> {
         if let Err(retry_after) = self.failed_auth.check(request.source, base_ms) {
             return Err(ApiError::rate_limited(
@@ -893,7 +999,26 @@ impl Service {
                     self.record_failure(request, account.to_string());
                 }
             })?;
-        if let Caller::OtherApp { .. } = claimed.caller {
+        if let Caller::OtherApp { app, .. } = &claimed.caller
+            && !others
+        {
+            // Authenticated first, by its certificate (`400`, `401`, Switch wire 7.2):
+            // permissions and the endpoint's refusal come after authentication.
+            let cert = self
+                .verify_other_app(request, &claimed, app)
+                .inspect_err(|error| {
+                    if is_failed_authentication(error.code) {
+                        self.record_failure(request, account.to_string());
+                    }
+                })?;
+            // Check 3, expiry, before any permission (Switch wire 3.8), at the identity's
+            // service time as far as it is known before the lock.
+            if cert.expired_at(service_time_ms) {
+                return Err(ApiError::new(
+                    ErrorCode::CertExpired,
+                    "3.8: the certificate has expired",
+                ));
+            }
             // The feed is for own apps only (Switch wire 7.4.4).
             if request.route.call == Call::Feed {
                 return Err(ApiError::new(
