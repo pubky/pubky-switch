@@ -111,16 +111,9 @@ impl Service {
             Appender::OtherApp(cert) => (cert.identity(), cert, true),
         };
         let sender_app = cert.app_id();
-        let sealed_for = query
-            .get("apps_version")
-            .and_then(|text| {
-                (!text.is_empty() && text.len() <= 16 && text.bytes().all(|b| b.is_ascii_digit()))
-                    .then(|| text.parse::<u64>().ok())
-                    .flatten()
-            })
-            .ok_or_else(|| ApiError::bad_request("7.4.3: apps_version is required"))?;
 
-        // Check 1: a retry by content gets the stored answer, before any other check.
+        // Check 1: a retry by content gets the stored answer, before any other check, the
+        // query's included.
         let envelope_hash = hash(envelope);
         if let Some(stored) = txn
             .appended_answer(&sender, &envelope_hash)
@@ -129,6 +122,14 @@ impl Service {
         {
             return self.answer(txn, signer, stored, other).await;
         }
+        let sealed_for = query
+            .get("apps_version")
+            .and_then(|text| {
+                (!text.is_empty() && text.len() <= 16 && text.bytes().all(|b| b.is_ascii_digit()))
+                    .then(|| text.parse::<u64>().ok())
+                    .flatten()
+            })
+            .ok_or_else(|| ApiError::bad_request("7.4.3: apps_version is required"))?;
 
         // Check 2: admission and the listing, for an app of another identity.
         let mut by_code = None;
@@ -198,10 +199,14 @@ impl Service {
             }
         })?;
 
-        // Check 4: the rates, each refusal a hit against the sender (Switch wire 9.4).
+        // Check 4: the rates, each refusal a hit against a sender of another identity
+        // (Switch wire 9.4): flags let apps offer to block a sender, and the account's own
+        // identity is none.
         let limited = |txn: &mut AccountTxn, result: Result<(), u64>, what: &str| {
             result.map_err(|retry_after| {
-                txn.note_flag_hit(sender);
+                if other {
+                    txn.note_flag_hit(sender, self.limits.max_flags);
+                }
                 ApiError::rate_limited(format!("9.4: {what}"), retry_after)
             })
         };
@@ -361,8 +366,14 @@ impl Service {
         let mut stale = Vec::new();
         let mut not_current = Vec::new();
         let mut unknown = Vec::new();
+        // One app wrapped to twice is `400` (Switch wire 4.4). The header check sees a kid
+        // twice; two kids of one app show only here, as their holders resolve.
+        let mut wrapped = BTreeSet::new();
+        if holders.values().any(|holder| !wrapped.insert(*holder)) {
+            return Err(ApiError::bad_request("4.4: one app wrapped to twice"));
+        }
         // `receive_keys`, `not_current` and `added_apps` together name each app at most once
-        // (Switch wire 7.6), though an envelope may wrap to several kids of one app.
+        // (Switch wire 7.6): an app stale or no longer current isn't among `added_apps` too.
         let mut named = BTreeSet::new();
         for kid in &kids {
             let Some(holder) = holders.get(kid) else {
@@ -370,9 +381,8 @@ impl Service {
                 continue;
             };
             if !state.is_current(holder) {
-                if named.insert(*holder) {
-                    not_current.push(json!(zbase32_encode(holder)));
-                }
+                named.insert(*holder);
+                not_current.push(json!(zbase32_encode(holder)));
                 continue;
             }
             let current_key = state
@@ -381,7 +391,8 @@ impl Service {
                 .and_then(|app| app.receive_key.as_ref());
             if current_key.map(|key| key.kid()) == Some(*kid) {
                 targets.push(*holder);
-            } else if named.insert(*holder) {
+            } else {
+                named.insert(*holder);
                 stale.push(json!({
                     "app_id": zbase32_encode(holder),
                     "record": current_key.map(|key| key.signed().clone()),
