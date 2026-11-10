@@ -439,7 +439,6 @@ async fn test_receive_retry_unavailable_is_held_for_the_wait_then_parked_and_pro
     assert!(report.cursor.seq >= seq, "the cursor isn't pinned");
     app.flush_cursor().await.unwrap();
     assert!(w.switch.app(&app.app_id()).cursor >= seq);
-    assert!(app.state.retries.is_empty());
     assert_eq!(w.effects(), 0);
     // Stored, it is tried at the next read and stays stored while the store fails.
     let calls = protocol.calls();
@@ -463,6 +462,10 @@ async fn test_receive_retry_unavailable_is_held_for_the_wait_then_parked_and_pro
             .any(|e| matches!(e, AppEvent::Unparked { seq: s } if *s == seq))
     );
     assert!(app.state.parked.is_empty());
+    assert!(
+        app.state.retries.is_empty(),
+        "the count goes once it is processed"
+    );
     assert_eq!(w.effects(), 1);
     assert_eq!(protocol.applied(), 1);
     assert_eq!(
@@ -471,6 +474,40 @@ async fn test_receive_retry_unavailable_is_held_for_the_wait_then_parked_and_pro
     );
     app.receive(None).await.unwrap();
     assert_eq!(protocol.applied(), 1);
+}
+
+#[tokio::test]
+async fn test_receive_retry_count_goes_on_while_the_entry_is_stored_locally() {
+    let w = World::new();
+    let protocol = FlakyProtocol::new(u32::MAX);
+    let mut app = join_flaky(&w, &protocol, "wallet").await;
+    let (seq, _) = w.note(app.app_id(), FLAKY);
+    // Read 1: held. Read 2, past the wait: stored locally.
+    let report = app.receive(None).await.unwrap();
+    assert!(store_failing(&report.events).is_empty());
+    w.clock.advance_ms(PARK_AFTER_MS);
+    let report = app.receive(None).await.unwrap();
+    assert_eq!(
+        parked_for(&report.events, seq),
+        Some(ParkReason::StoreUnavailable)
+    );
+    assert!(store_failing(&report.events).is_empty());
+    assert_eq!(app.state.retries.get(&seq).map(|r| r.reads), Some(2));
+    // Stored, it is tried at each read with the store still failing: the count goes on,
+    // and the host learns of it from the third read in a row.
+    for reads in RETRY_EVENT_READS..RETRY_EVENT_READS + 3 {
+        let report = app.receive(None).await.unwrap();
+        assert_eq!(store_failing(&report.events), vec![(seq, reads)]);
+        assert!(app.state.parked.contains_key(&seq));
+    }
+    // Kept in the store with the entry: loaded again, the app counts on.
+    let mut app = load_flaky(&w, &protocol, app.app_id()).await;
+    let report = app.receive(None).await.unwrap();
+    assert_eq!(
+        store_failing(&report.events),
+        vec![(seq, RETRY_EVENT_READS + 3)]
+    );
+    assert_eq!(w.effects(), 0);
 }
 
 #[tokio::test]

@@ -48,11 +48,11 @@ pub enum AppEvent {
         seq: u64,
     },
     /// The protocol's receive step at an entry couldn't finish, because its store or the
-    /// host failed ([`super::Outcome::Retry`]), on `reads` reads of the feed in a row: raised
-    /// from the [`super::RETRY_EVENT_READS`]th on, on each such read. The entry stays
-    /// unprocessed and the cursor before it until a read processes it, or the bounded wait
-    /// passes and it is stored locally ([`ParkReason::StoreUnavailable`]); the host repairs
-    /// or frees its store.
+    /// host failed ([`super::Outcome::Retry`]), on `reads` reads in a row: raised from the
+    /// [`super::RETRY_EVENT_READS`]th on, on each such read, whether the entry is held on
+    /// the feed or, after the bounded wait, stored locally ([`ParkReason::StoreUnavailable`]).
+    /// The entry stays unprocessed until a read processes it; the host repairs or frees its
+    /// store.
     StoreFailing {
         /// The entry's `seq`.
         seq: u64,

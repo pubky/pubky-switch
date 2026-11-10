@@ -356,7 +356,10 @@ impl App {
             };
             match step {
                 Step::Pass => {
-                    self.clear_retry(seq, &mut read)?;
+                    // An entry stored locally isn't processed yet: its count stays.
+                    if !self.state.parked.contains_key(&seq) {
+                        self.clear_retry(seq, &mut read)?;
+                    }
                     if read.blocked.is_none_or(|b| seq < b) {
                         self.pass(seq, item, &mut read)?;
                     } else if matches!(item, FeedItem::Entry(_)) && !self.state.seen.contains(&seq)
@@ -965,12 +968,13 @@ impl App {
     }
 
     /// A receive step the protocol's store or the host kept from finishing
-    /// ([`Outcome::Retry`]), with nothing of the step committed. An entry stored locally
-    /// stays so. Otherwise a failure of the entry stores it and passes it at once; a store
-    /// unavailable for now holds it, the reads in a row counted to raise
-    /// [`AppEvent::StoreFailing`] from [`RETRY_EVENT_READS`] on, until the bounded wait since
-    /// the first retry, which an entry whose sender can't be checked gets too: then it is
-    /// stored and passed (Switch spec 8.2). Never dropped.
+    /// ([`Outcome::Retry`]), with nothing of the step committed. A failure of the entry
+    /// stores it and passes it at once. Otherwise the reads in a row that end so are
+    /// counted, to raise [`AppEvent::StoreFailing`] from [`RETRY_EVENT_READS`] on, and the
+    /// count is kept until the entry is processed, while it is stored locally too. An
+    /// entry stored locally stays so; one on the feed is held until the bounded wait since
+    /// the first retry, which an entry whose sender can't be checked gets too, then stored
+    /// and passed (Switch spec 8.2). Never dropped.
     fn retry_later(
         &mut self,
         entry: &Entry,
@@ -979,10 +983,7 @@ impl App {
         failure: StoreFailure,
         read: &mut Read,
     ) -> Result<Step, AppError> {
-        if parked {
-            return Ok(Step::Hold);
-        }
-        if failure.is_of_entry() {
+        if failure.is_of_entry() && !parked {
             self.park(entry, plaintext, ParkReason::StoreRejected, read)?;
             return Ok(Step::Pass);
         }
@@ -1002,6 +1003,10 @@ impl App {
                 failure,
             });
         }
+        if parked {
+            // Stored already: it stays so, and is tried again at the next read.
+            return Ok(Step::Hold);
+        }
         if now.saturating_sub(retry.since_ms) >= self.config.park_after_ms {
             self.park(entry, plaintext, ParkReason::StoreUnavailable, read)?;
             return Ok(Step::Pass);
@@ -1009,7 +1014,7 @@ impl App {
         Ok(Step::Hold)
     }
 
-    /// An entry processed at last: its count of retries goes.
+    /// An entry processed at last, and not stored locally: its count of retries goes.
     fn clear_retry(&mut self, seq: u64, read: &mut Read) -> Result<(), AppError> {
         if self.state.retries.remove(&seq).is_some() {
             read.tx.delete(&key::retry(seq))?;
@@ -1104,7 +1109,7 @@ impl App {
             let step = self
                 .check_and_apply(&entry, plaintext, true, &mut read)
                 .await?;
-            if step == Step::Pass {
+            if step == Step::Pass && !self.state.parked.contains_key(&seq) {
                 self.clear_retry(seq, &mut read)?;
             }
             self.commit(read.tx).await?;

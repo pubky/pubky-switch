@@ -312,7 +312,9 @@ pub enum Outcome {
     ///
     /// An entry stored locally is tried again at every read, and processed once its step
     /// finishes. A retry of an entry stored locally before ([`ReceivedMessage::parked`])
-    /// leaves it stored, for the next read. Claims read for the step ([`Outcome::Need`])
+    /// leaves it stored, for the next read, and counts on: the count of reads in a row is
+    /// kept from the feed into local storage until the entry is processed, so a store that
+    /// stays down raises [`super::AppEvent::StoreFailing`] whichever way the entry waits. Claims read for the step ([`Outcome::Need`])
     /// stay kept, in their own commits. A push extension's peek runs no receive step, so a
     /// retry doesn't change what it shows.
     Retry(StoreFailure),
