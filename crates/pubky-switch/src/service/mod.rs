@@ -37,7 +37,7 @@ use crate::{
     },
     keys::{KeyStore, MarkCheck, ServiceSigner, sign_head},
     limits::Limits,
-    ratelimit::{FailedAuthentications, MinuteWindows},
+    ratelimit::{FailedAuthentications, KeyedMinutes, MinuteWindows},
     store::{AccountTxn, Store, StoreError},
     time::TrustedTime,
 };
@@ -54,8 +54,8 @@ pub struct Service {
     failed_auth: FailedAuthentications,
     reads_per_source: MinuteWindows<(String, NetworkSource)>,
     reads_per_account: MinuteWindows<String>,
-    operation_rate: MinuteWindows<(String, [u8; 16])>,
-    control_rate: MinuteWindows<(String, [u8; 16])>,
+    operation_rate: KeyedMinutes<(String, [u8; 16])>,
+    control_rate: KeyedMinutes<(String, [u8; 16])>,
 }
 
 impl std::fmt::Debug for Service {
@@ -196,8 +196,8 @@ impl Service {
             failed_auth,
             reads_per_source: MinuteWindows::default(),
             reads_per_account: MinuteWindows::default(),
-            operation_rate: MinuteWindows::default(),
-            control_rate: MinuteWindows::default(),
+            operation_rate: KeyedMinutes::default(),
+            control_rate: KeyedMinutes::default(),
         }
     }
 
@@ -268,6 +268,7 @@ impl Service {
         };
         // Everything that needs no account state comes before the lock: the limits that
         // apply before authentication, the headers and the signature (Switch wire 7.2).
+        let mut verified = None;
         let caller = match call {
             Call::GetIdentity => {
                 if let Err(error) = self.public_read_limits(&account, request.source, base_ms) {
@@ -282,7 +283,22 @@ impl Service {
             // The signer is verified here; an own app under the lock, with the key the
             // account holds for it (Switch wire 7.2).
             Call::Ops => match self.authenticate_caller(&account, &request, base_ms) {
-                Ok(claimed) => Some(claimed),
+                Ok(claimed) => {
+                    // An own app's request is verified here too, so nothing unverified
+                    // takes the lock (Switch wire 7.2 Order).
+                    if let Caller::OwnApp(app) = &claimed.caller {
+                        match self.verify_own_app(&account, &request, &claimed, app).await {
+                            Ok(app) => verified = Some(app),
+                            Err(error) => {
+                                if is_failed_authentication(error.code) {
+                                    self.record_failure(&request, account.clone());
+                                }
+                                return refused_early(error).await;
+                            }
+                        }
+                    }
+                    Some(claimed)
+                }
                 Err(error) => return refused_early(error).await,
             },
             _ => {
@@ -308,8 +324,15 @@ impl Service {
             // signature, so it is the same for every reader (Switch wire 7.4.15).
             None
         };
-        self.at_account(txn, &request, base_ms, signature, caller.as_ref())
-            .await
+        self.at_account(
+            txn,
+            &request,
+            base_ms,
+            signature,
+            caller.as_ref(),
+            verified.as_ref(),
+        )
+        .await
     }
 
     /// An answer before the account's lock: signed with its service key, at the service time
@@ -407,6 +430,7 @@ impl Service {
         base_ms: u64,
         request_signature: Option<[u8; 64]>,
         caller: Option<&Claimed>,
+        verified: Option<&batch::VerifiedApp>,
     ) -> SwitchResponse {
         let signature = request_signature.as_ref();
         // The time the account last committed, for an answer whose commit fails.
@@ -422,7 +446,7 @@ impl Service {
             }
         };
         let (answer, marked) = match self
-            .run_at_account(&mut txn, &signer, request, caller, time_ms)
+            .run_at_account(&mut txn, &signer, request, verified, time_ms)
             .await
         {
             Ok(done) => done,
@@ -475,7 +499,7 @@ impl Service {
         txn: &mut AccountTxn,
         signer: &ServiceSigner,
         request: &SwitchRequest,
-        caller: Option<&Claimed>,
+        verified: Option<&batch::VerifiedApp>,
         time_ms: u64,
     ) -> Result<(Answer, bool), Refused> {
         let call = &request.route.call;
@@ -528,27 +552,46 @@ impl Service {
                 .map_err(|error| Refused::with_head(error, false));
         }
 
+        // Step 5 comes before the staged gate: an own app is authenticated in full first.
+        let stop = |stop: batch::Stop, txn: &AccountTxn| match stop {
+            batch::Stop::Refused(error) => Refused::with_head(error, serving),
+            // Not authenticated: no head, and a 401 counts against the source.
+            batch::Stop::Unauthenticated(error) => {
+                if is_failed_authentication(error.code) {
+                    self.record_failure(request, txn.head().id.clone());
+                }
+                Refused {
+                    error,
+                    serving,
+                    head: false,
+                }
+            }
+        };
+        let writer = if *call == Call::Ops {
+            match self.ops_writer(txn, held.as_ref(), verified, time_ms).await {
+                Ok(writer) => writer,
+                Err(error) => return Err(stop(error, txn)),
+            }
+        } else {
+            None
+        };
         // Step 7: the staged gate. Step 9: the endpoint.
         staged_gate(call, !serving).map_err(|error| Refused::with_head(error, serving))?;
         if *call == Call::Ops {
-            let claimed = caller.ok_or_else(|| unavailable(serving))?;
             return match self
-                .post_ops(txn, signer, request, held.as_ref(), claimed, time_ms)
+                .post_ops(
+                    txn,
+                    signer,
+                    request,
+                    held.as_ref(),
+                    verified,
+                    writer.as_ref(),
+                    time_ms,
+                )
                 .await
             {
                 Ok(answer) => Ok((answer, serving)),
-                Err(batch::Stop::Refused(error)) => Err(Refused::with_head(error, serving)),
-                // Not authenticated: no head, and a 401 counts against the source.
-                Err(batch::Stop::Unauthenticated(error)) => {
-                    if is_failed_authentication(error.code) {
-                        self.record_failure(request, txn.head().id.clone());
-                    }
-                    Err(Refused {
-                        error,
-                        serving,
-                        head: false,
-                    })
-                }
+                Err(error) => Err(stop(error, txn)),
             };
         }
         let (answer, serves_after) = self

@@ -12,9 +12,9 @@ use pubky_switch_core::{
     ops::{
         AppPutEffect, CertPutEffect, KeyBundleEffect, Limits, List, OpKind, Position, Quota,
         ReceiveKeyEffect, Refusal, SignedOp, StateAfter, StoredPart, Writer, check_app_put,
-        check_cert_put, check_conditions, check_invite_code_put, check_key_bundle_put,
-        check_permission, check_quota, check_receive_key_put, check_shape, covers,
-        invite_code_delete, proof_state,
+        check_cert_put, check_conditions, check_cursor, check_invite_code_put,
+        check_key_bundle_put, check_permission, check_quota, check_receive_key_put, check_shape,
+        covers, invite_code_delete, proof_state,
     },
     records::{AppCert, AppRecord, ReceiveKeyRecord},
     scopes::Permission,
@@ -100,11 +100,8 @@ fn set_cursor(
             "Switch wire 6.2: the signer's batch carries no cursor.set",
         ));
     };
-    if position.generation != state.generation || position.seq > state.newest_seq {
-        return Err(Refusal::bad_request(
-            "Switch wire 6.2: cursor.set names a position the account hasn't reached",
-        ));
-    }
+    // No account continues another's sequence before cooperative moves are served.
+    check_cursor(position, state.generation, None, state.newest_seq)?;
     state.apps.entry(cert.app_id()).or_default().cursor = Some(position);
     Ok(())
 }
@@ -363,6 +360,7 @@ fn receive_key_put(
                 entry.reachable_since = Some(apps_version);
             }
             entry.receive_key = Some(new.clone());
+            state.new_receive_keys.push((app, new.clone()));
             new
         }
     };

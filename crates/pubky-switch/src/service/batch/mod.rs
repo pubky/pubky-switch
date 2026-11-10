@@ -87,6 +87,17 @@ fn not_current(why: &str) -> ApiError {
     ApiError::new(ErrorCode::NotCurrent, why.to_string())
 }
 
+/// An own app's batch, verified before the account's lock (Switch wire 7.2 Order).
+#[derive(Debug)]
+pub(super) struct VerifiedApp {
+    /// The calling app.
+    app: [u8; 16],
+    /// The signing key its request verified with.
+    key: [u8; 32],
+    /// The body, parsed.
+    parsed: OpsRequest,
+}
+
 /// The app record of an own app's first call (Switch wire 7.2): the batch's first `app.put`
 /// naming the caller.
 fn first_app_put(request: &OpsRequest, app: &[u8; 16]) -> Option<SignedDoc> {
@@ -121,9 +132,14 @@ async fn load_state(
         state.apps.insert(app.app_id, held_app(&app, &identity)?);
     }
     state.kept = txn.kept_app_ids().await?.into_iter().collect();
-    state.kids = txn.kids().await?.into_iter().collect();
-    (state.directory_version, state.apps_version) = txn.directory_versions().await?;
     let needs = Needs::of(ops);
+    let named_kids: Vec<[u8; 8]> = needs.kids.iter().copied().collect();
+    state.kids = txn
+        .registered_kids(&named_kids)
+        .await?
+        .into_iter()
+        .collect();
+    (state.directory_version, state.apps_version) = txn.directory_versions().await?;
     for target in &needs.targets {
         let parts = txn.bundle_parts(target).await?;
         state.parts.insert(
@@ -250,113 +266,121 @@ fn held_part(part: &StoredBundlePart) -> Result<HeldPart, StoreError> {
 }
 
 impl Service {
-    /// `POST /v1/{id}/ops` (Switch wire 6.4), under the account's lock: the answer, and
-    /// whether the commit moves the key's mark.
+    /// An own app's `POST /ops` before the account's lock (Switch wire 7.2 Order): the body
+    /// parsed, the key the request is checked with found, and the request verified with it.
+    /// The key is the record's in the batch's first `app.put` naming the caller, for a
+    /// first call, else the one of the record the account holds, read without the lock; an
+    /// App ID derives from its signing key, so every record of the app has that key.
+    ///
+    /// # Errors
+    ///
+    /// `400` or `413` for the body, `401 bad_signature` (a failed authentication), or `403
+    /// not_current` for an app without a record whose batch carries no `app.put`.
+    pub(super) async fn verify_own_app(
+        &self,
+        account: &str,
+        request: &SwitchRequest,
+        claimed: &Claimed,
+        app: &str,
+    ) -> Result<VerifiedApp, ApiError> {
+        let app = zbase32_decode::<16>(app)
+            .map_err(|_| ApiError::bad_request("7.1: Switch-App isn't an App ID"))?;
+        // Step 2 of Switch wire 6.4: parse, before any signature is checked.
+        let parsed = OpsRequest::parse(&request.body).map_err(refused)?;
+        let key = match first_app_put(&parsed, &app) {
+            Some(record) => record_signing_key(&record)
+                .filter(|key| app_id_bytes(key) == app)
+                .ok_or_else(|| {
+                    bad_signature("7.2: the app.put's record doesn't give the caller's App ID")
+                })?,
+            None => self
+                .store
+                .app_record(account, &app)
+                .await
+                .map_err(|e| store_error(&e))?
+                .as_ref()
+                .and_then(record_signing_key)
+                .ok_or_else(|| not_current("7.2: an own app's first call carries its app.put"))?,
+        };
+        let target = RequestTarget {
+            method: &request.method,
+            path_and_query: &request.path_and_query,
+            body: &request.body,
+            origin: &self.origin,
+        };
+        wire_http::verify_request(&key, &target, &claimed.headers, &claimed.signature)
+            .map_err(|_| bad_signature("7.1: the request signature doesn't verify"))?;
+        Ok(VerifiedApp { app, key, parsed })
+    }
+
+    /// The writer of a `POST /ops` under the lock (Switch wire 7.2, 7.3 step 5), before the
+    /// staged gate: `None` for the signer, verified before the lock, or the certificate an
+    /// own app is checked against.
+    pub(super) async fn ops_writer(
+        &self,
+        txn: &mut AccountTxn,
+        held: Option<&IdentityDoc>,
+        verified: Option<&VerifiedApp>,
+        time_ms: u64,
+    ) -> Result<Option<AppCert>, Stop> {
+        let Some(verified) = verified else {
+            return Ok(None);
+        };
+        let cert = self.authenticate_app(txn, held, verified, time_ms).await?;
+        // Step 6 of Switch wire 7.3: an authenticated own app's last-seen time.
+        txn.set_last_seen(&verified.app, time_ms)
+            .await
+            .map_err(|e| storage(&e))?;
+        Ok(Some(cert))
+    }
+
+    /// `POST /v1/{id}/ops` (Switch wire 6.4) for an authenticated writer, under the
+    /// account's lock.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn post_ops(
         &self,
         txn: &mut AccountTxn,
         signer: &ServiceSigner,
         request: &SwitchRequest,
         held: Option<&IdentityDoc>,
-        claimed: &Claimed,
+        verified: Option<&VerifiedApp>,
+        writer: Option<&AppCert>,
         time_ms: u64,
     ) -> Result<Answer, Stop> {
         let identity = txn.head().identity_key;
-        // Step 2: parse, before any signature is checked.
-        let parsed =
-            OpsRequest::parse(&request.body).map_err(|r| Stop::Unauthenticated(refused(r)))?;
-        // The caller (Switch wire 7.2): the signer was verified before the lock.
-        let writer = match &claimed.caller {
-            super::rules::Caller::Signer => None,
-            super::rules::Caller::OwnApp(app) => {
-                let app = zbase32_decode::<16>(app).map_err(|_| {
-                    Stop::Unauthenticated(ApiError::bad_request("7.1: Switch-App isn't an App ID"))
-                })?;
-                let cert = self
-                    .authenticate_app(txn, request, claimed, held, &parsed, &app, time_ms)
-                    .await?;
-                Some(cert)
-            }
-            super::rules::Caller::OtherApp { .. } => {
-                return Err(Stop::Unauthenticated(ApiError::new(
-                    ErrorCode::NotAdmitted,
-                    "6.4: an app of another identity doesn't write here",
-                )));
+        // The signer's body is parsed here, so its refusals carry the head like its others.
+        let parsed_here;
+        let parsed = match verified {
+            Some(verified) => &verified.parsed,
+            None => {
+                parsed_here = OpsRequest::parse(&request.body)?;
+                &parsed_here
             }
         };
-        let caller_app = writer.as_ref().map(AppCert::app_id);
-        let answer = self
-            .run_batch(
-                txn,
-                signer,
-                held,
-                &parsed,
-                writer.as_ref(),
-                identity,
-                time_ms,
-            )
-            .await;
-        // Step 6 of Switch wire 7.3: an authenticated own app's last-seen time.
-        if let Some(app) = caller_app {
-            txn.set_last_seen(&app, time_ms)
-                .await
-                .map_err(|e| storage(&e))?;
-        }
-        answer
+        self.run_batch(txn, signer, held, parsed, writer, identity, time_ms)
+            .await
     }
 
-    /// Authenticate an own app (Switch wire 7.2 "Own app"), returning the certificate its
-    /// batch is checked against.
-    #[allow(clippy::too_many_arguments)]
+    /// Authenticate an own app under the lock (Switch wire 7.2 "Own app"), after its request
+    /// verified before the lock: the certificate its batch is checked against, the checks
+    /// on it, and that it has the key the request verified with.
     async fn authenticate_app(
         &self,
         txn: &mut AccountTxn,
-        request: &SwitchRequest,
-        claimed: &Claimed,
         held: Option<&IdentityDoc>,
-        parsed: &OpsRequest,
-        app: &[u8; 16],
+        verified: &VerifiedApp,
         time_ms: u64,
     ) -> Result<AppCert, Stop> {
         let identity = txn.head().identity_key;
-        let verify = |key: &[u8; 32]| {
-            let target = RequestTarget {
-                method: &request.method,
-                path_and_query: &request.path_and_query,
-                body: &request.body,
-                origin: &self.origin,
-            };
-            wire_http::verify_request(key, &target, &claimed.headers, &claimed.signature).map_err(
-                |_| {
-                    Stop::Unauthenticated(bad_signature(
-                        "7.1: the request signature doesn't verify",
-                    ))
-                },
-            )
+        let app = &verified.app;
+        let changed_key = || {
+            Stop::Unauthenticated(bad_signature(
+                "7.2: the key the request verified with isn't the app's",
+            ))
         };
-        let stored = txn
-            .apps()
-            .await
-            .map_err(|e| storage(&e))?
-            .into_iter()
-            .find(|stored| &stored.app_id == app);
-        let held_app = stored
-            .as_ref()
-            .map(|stored| held_app(stored, &identity))
-            .transpose()
-            .map_err(|e| storage(&e))?;
-        let (cert, record) = match first_app_put(parsed, app) {
-            // The first-call order: the record's signing key gives the App ID and verifies
-            // the request, then the record and its certificate verify.
+        let (cert, record) = match first_app_put(&verified.parsed, app) {
+            // The first call: the record and its certificate verify.
             Some(record) => {
-                let key = record_signing_key(&record)
-                    .filter(|key| &app_id_bytes(key) == app)
-                    .ok_or_else(|| {
-                        Stop::Unauthenticated(bad_signature(
-                            "7.2: the app.put's record doesn't give the caller's App ID",
-                        ))
-                    })?;
-                verify(&key)?;
                 let record = AppRecord::verify(&record, &identity).map_err(|_| {
                     Stop::Unauthenticated(bad_signature("7.2: the first call's app record"))
                 })?;
@@ -368,22 +392,29 @@ impl Service {
                 (record.cert().clone(), None)
             }
             None => {
+                let stored = txn
+                    .apps()
+                    .await
+                    .map_err(|e| storage(&e))?
+                    .into_iter()
+                    .find(|stored| &stored.app_id == app);
+                let held_app = stored
+                    .as_ref()
+                    .map(|stored| held_app(stored, &identity))
+                    .transpose()
+                    .map_err(|e| storage(&e))?
+                    .filter(|a| a.record.is_some())
+                    .ok_or_else(changed_key)?;
                 let mut state = OpsState::new(identity, 0, 0, time_ms);
                 state.doc = held.cloned();
-                let Some(held_app) = held_app.filter(|a| a.record.is_some()) else {
-                    return Err(Stop::Unauthenticated(not_current(
-                        "7.2: an own app's first call carries its app.put",
-                    )));
-                };
                 state.apps.insert(*app, held_app.clone());
-                let cert = state
-                    .checked_cert(app)
-                    .cloned()
-                    .ok_or_else(|| Stop::Unauthenticated(temporary()))?;
-                verify(&cert.signing_key())?;
+                let cert = state.checked_cert(app).cloned().ok_or_else(changed_key)?;
                 (cert, held_app.record)
             }
         };
+        if cert.signing_key() != verified.key {
+            return Err(changed_key());
+        }
         // Checks 1 to 3 on that certificate: it verified for the identity and names the app;
         // it hasn't expired.
         if cert.identity() != identity || cert.app_id() != *app {
@@ -665,17 +696,10 @@ async fn save_apps(
         if before.apps.get(app_id) != Some(app) {
             txn.put_app(&stored_app(*app_id, app)).await?;
         }
-        let new_key = app.receive_key.as_ref().filter(|key| {
-            before
-                .apps
-                .get(app_id)
-                .and_then(|a| a.receive_key.as_ref())
-                .is_none_or(|old| old.signed() != key.signed())
-        });
-        if let Some(key) = new_key {
-            txn.add_receive_key(app_id, key.n(), &key.kid(), key.signed())
-                .await?;
-        }
+    }
+    for (app_id, key) in &after.new_receive_keys {
+        txn.add_receive_key(app_id, key.n(), &key.kid(), key.signed())
+            .await?;
     }
     if (before.directory_version, before.apps_version)
         != (after.directory_version, after.apps_version)

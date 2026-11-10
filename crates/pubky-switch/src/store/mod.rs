@@ -311,6 +311,27 @@ impl Store {
         }))
     }
 
+    /// The app record account `id` holds for `app_id`, read without the account's lock, for
+    /// verifying an own app's request before it (Switch wire 7.2 Order). A plain read
+    /// doesn't wait for the lock; the endpoint checks under it that the key still holds.
+    pub async fn app_record(
+        &self,
+        id: &str,
+        app_id: &[u8; 16],
+    ) -> Result<Option<pubky_switch_core::sig::SignedDoc>, StoreError> {
+        let record: Option<Option<Vec<u8>>> =
+            sqlx::query_scalar("SELECT record FROM apps WHERE account_id = $1 AND app_id = $2")
+                .bind(id)
+                .bind(app_id.as_slice())
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(StoreError::from_db)?;
+        record
+            .flatten()
+            .map(|bytes| identity::decode_doc(&bytes, "app record"))
+            .transpose()
+    }
+
     /// Start a request to account `id`: a transaction holding the account's lock until it
     /// commits or is dropped. `None` when there is no such account. Waits at most
     /// `lock_timeout_ms` for the lock ([`StoreError::LockTimeout`]).

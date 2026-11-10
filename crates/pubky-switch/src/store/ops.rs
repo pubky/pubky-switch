@@ -276,15 +276,17 @@ impl AccountTxn {
         Ok(())
     }
 
-    /// Every kid any app of the account registered.
-    pub async fn kids(&mut self) -> Result<Vec<[u8; 8]>, StoreError> {
+    /// Which of `kids` some app of the account registered.
+    pub async fn registered_kids(&mut self, kids: &[[u8; 8]]) -> Result<Vec<[u8; 8]>, StoreError> {
         let id = self.head().id.clone();
-        let rows: Vec<Vec<u8>> =
-            sqlx::query_scalar("SELECT kid FROM receive_keys WHERE account_id = $1")
-                .bind(id)
-                .fetch_all(self.conn())
-                .await
-                .map_err(db)?;
+        let rows: Vec<Vec<u8>> = sqlx::query_scalar(
+            "SELECT kid FROM receive_keys WHERE account_id = $1 AND kid = ANY($2)",
+        )
+        .bind(id)
+        .bind(keys(kids))
+        .fetch_all(self.conn())
+        .await
+        .map_err(db)?;
         rows.iter().map(|kid| array(kid, "kid")).collect()
     }
 

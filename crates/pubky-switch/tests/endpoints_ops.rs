@@ -21,10 +21,13 @@ use pubky_switch_core::{
     claims::{ClaimFields, ClaimType},
     enc::pubky_key,
     http::header,
+    keys::{AppKeys, IdentityKey, ReceiveKey},
     ops::{AllowKind, Condition, OpKind, OpsRequest, Position, SignedOp, sign_batch},
+    records::{AppCert, AppCertBody, AppRecord, AppRecordBody, ReceiveKeyBody, ReceiveKeyRecord},
     sig::SignedDoc,
 };
 use serde_json::Value;
+use sqlx::Connection;
 use support::*;
 
 /// The time of the tests' batches, after the registration.
@@ -117,12 +120,28 @@ async fn post_app(
     cursor: Option<Position>,
     at: &str,
 ) -> (u16, Value) {
+    let (status, body, _) = post_app_with_head(replay, app_name, ops, cursor, at).await;
+    (status, body)
+}
+
+/// [`post_app`], with the answer's `Switch-Head`.
+async fn post_app_with_head(
+    replay: &Replay,
+    app_name: &str,
+    ops: &[SignedOp],
+    cursor: Option<Position>,
+    at: &str,
+) -> (u16, Value, Option<String>) {
     let keys = vectors("keys.json");
     let body = OpsRequest::new(ops, cursor).to_json();
     let request = app_request(app(&keys, app_name), "POST", &ops_path(), body, ms(at));
-    let answer = replay.service.handle(request).await;
+    answer_of(replay.service.handle(request).await)
+}
+
+fn answer_of(answer: pubky_switch::http::SwitchResponse) -> (u16, Value, Option<String>) {
+    let head = header_text(&answer, header::HEAD).map(str::to_string);
     let body = serde_json::from_slice(&answer.body).unwrap_or(Value::Null);
-    (answer.status, body)
+    (answer.status, body, head)
 }
 
 /// The head `seq` an answer names.
@@ -258,9 +277,9 @@ async fn test_ops_callers_and_authentication() {
         vec![contact(bob())],
     )
     .expect("batch");
-    let (status, body) = post_app(&replay, "phone", &ops, None, AT).await;
+    let (status, body, head) = post_app_with_head(&replay, "phone", &ops, None, AT).await;
     assert_eq!((status, body["code"].as_str()), (403, Some("not_current")));
-    assert!(body.get("head").is_none());
+    assert!(head.is_none(), "nothing verified the request");
 
     // The wallet's batch, with the request signed by another key: 401 bad_signature.
     let ops = wallet_batch(5, 1, vec![contact(bob())]);
@@ -468,5 +487,244 @@ async fn test_ops_without_trusted_time() {
     .await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["proofs"][0]["sig"].as_str().map(str::len), Some(86));
+    replay.db.drop_database().await.expect("drop");
+}
+
+/// The wallet's keys and the certificate its record carries.
+async fn wallet_keys(replay: &Replay) -> (AppKeys, AppCert) {
+    let keys = vectors("keys.json");
+    let wallet = app(&keys, "wallet");
+    let app_keys = AppKeys::from_secrets(
+        hex32(&wallet["signing_secret_hex"]),
+        hex32(&wallet["bundle_secret_hex"]),
+    );
+    let record = wallet_app(replay).await.record.expect("record");
+    let cert = AppRecord::verify(&record, &alice_key())
+        .expect("record")
+        .cert()
+        .clone();
+    (app_keys, cert)
+}
+
+fn receive_key_put(keys: &AppKeys, cert: &AppCert, n: u64, seed: u8) -> (Vec<Condition>, OpKind) {
+    let key = ReceiveKey::from_secret(n, [seed; 32]);
+    let record =
+        ReceiveKeyRecord::sign(keys, cert, ReceiveKeyBody::new(cert, &key)).expect("record");
+    (
+        Vec::new(),
+        OpKind::ReceiveKeyPut {
+            record: record.signed().clone(),
+        },
+    )
+}
+
+/// A request claiming to be the wallet's, with a signature nobody made.
+fn forged(at: &str) -> pubky_switch::http::SwitchRequest {
+    let keys = vectors("keys.json");
+    let body = OpsRequest::new(
+        &[],
+        Some(Position {
+            generation: 1,
+            seq: 0,
+        }),
+    )
+    .to_json();
+    let mut request = app_request(app(&keys, "wallet"), "POST", &ops_path(), body, ms(at));
+    request.headers.insert(
+        header::SIGNATURE,
+        pubky_switch_core::enc::b64(&[7; 64])
+            .parse()
+            .expect("header"),
+    );
+    request
+}
+
+async fn stamped_time(replay: &Replay) -> i64 {
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    let at: i64 = sqlx::query_scalar("SELECT stamped_time_ms FROM accounts WHERE id = $1")
+        .bind(alice_id())
+        .fetch_one(&mut conn)
+        .await
+        .expect("account");
+    conn.close().await.expect("close");
+    at
+}
+
+#[tokio::test]
+async fn test_ops_unverified_app_takes_no_lock_and_changes_nothing() {
+    let Some(replay) = registered(Limits::default(), false).await else {
+        return;
+    };
+    let before = stamped_time(&replay).await;
+    // The account's lock is held: an unverified request is answered without it.
+    let held = replay
+        .db
+        .store()
+        .begin(&alice_id())
+        .await
+        .expect("begin")
+        .expect("account");
+    let answer = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        replay.service.handle(forged(AT)),
+    )
+    .await
+    .expect("answered without waiting for the lock");
+    drop(held);
+    let (status, body, head) = answer_of(answer);
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (401, Some("bad_signature"))
+    );
+    assert!(head.is_none());
+    assert_eq!(stamped_time(&replay).await, before, "nothing was stamped");
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_ops_unverified_app_at_a_staged_account_gets_no_head() {
+    let Some(replay) = replay().await else { return };
+    // Enrolled, with no identity.json yet: staged.
+    let http = vectors("http.json");
+    set_time(&replay.clock, AT);
+    let enrollment = vector_request(named(&http["requests"], "signer: enrollment"));
+    let mut enrollment = enrollment;
+    let body = enrollment.body.clone();
+    enrollment = signer_request("POST", "/v1/enroll", body.to_vec(), ms(AT));
+    assert_eq!(replay.service.handle(enrollment).await.status, 200);
+    let (status, body, head) = answer_of(replay.service.handle(forged(AT)).await);
+    assert_ne!(status, 503, "{body}");
+    assert!(head.is_none(), "no head before the caller verifies");
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_ops_every_kid_a_batch_registers_is_kept() {
+    let Some(replay) = registered(Limits::default(), false).await else {
+        return;
+    };
+    let (keys, cert) = wallet_keys(&replay).await;
+    let two = wallet_batch(
+        15,
+        1,
+        vec![
+            receive_key_put(&keys, &cert, 1, 41),
+            receive_key_put(&keys, &cert, 2, 42),
+        ],
+    );
+    let (status, body) = post_app(&replay, "wallet", &two, None, AT).await;
+    assert_eq!(status, 200, "{body}");
+    // The first key's kid again, under the next n: registered already.
+    let again = wallet_batch(16, 1, vec![receive_key_put(&keys, &cert, 3, 41)]);
+    let (status, body) = post_app(&replay, "wallet", &again, None, AT).await;
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (400, Some("bad_request")),
+        "{body}"
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_ops_revoked_expired_and_unpermitted_apps() {
+    let Some(replay) = registered(Limits::default(), false).await else {
+        return;
+    };
+    // A signer-only operation from an app: 403 permission_missing, with the head.
+    let (_, cert) = wallet_keys(&replay).await;
+    let cert_put = wallet_batch(
+        17,
+        1,
+        vec![(
+            Vec::new(),
+            OpKind::CertPut {
+                target_app_id: cert.app_id(),
+                cert: cert.signed().clone(),
+            },
+        )],
+    );
+    let (status, body, head) = post_app_with_head(&replay, "wallet", &cert_put, None, AT).await;
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (403, Some("permission_missing"))
+    );
+    assert!(head.is_some(), "the caller verified");
+    // Revoked: 403 not_current.
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    sqlx::query(
+        "INSERT INTO kept_app_ids (account_id, app_id, reason, at_ms) VALUES ($1, $2, 'revoked', 0)",
+    )
+    .bind(alice_id())
+    .bind(cert.app_id().as_slice())
+    .execute(&mut conn)
+    .await
+    .expect("revoke");
+    conn.close().await.expect("close");
+    let ops = wallet_batch(19, 1, vec![contact(bob())]);
+    let (status, body) = post_app(&replay, "wallet", &ops, None, AT).await;
+    assert_eq!((status, body["code"].as_str()), (403, Some("not_current")));
+    // Expired too: 403 cert_expired, which comes before the standing. Last, as the stamped
+    // time never goes back.
+    let expired = "2026-12-01T00:00:00.000Z";
+    set_time(&replay.clock, expired);
+    let ops = wallet_batch(18, 1, vec![contact(bob())]);
+    let (status, body) = post_app(&replay, "wallet", &ops, None, expired).await;
+    assert_eq!((status, body["code"].as_str()), (403, Some("cert_expired")));
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_ops_first_call_with_an_unlisted_certificate() {
+    let Some(replay) = registered(Limits::default(), false).await else {
+        return;
+    };
+    // A certificate alice issued for an app her identity.json doesn't list.
+    let keys = AppKeys::from_secrets([21; 32], [22; 32]);
+    let alice = IdentityKey::from_secret(hex32(&alice(&vectors("keys.json"))["secret_hex"]));
+    let cert = AppCert::issue(
+        &alice,
+        AppCertBody::new(
+            alice_key(),
+            keys.signing_public(),
+            keys.bundle_public(),
+            vec!["neutral".into()],
+            &[],
+            ms("2025-12-01T00:00:00.000Z"),
+            ms("2026-06-01T00:00:00.000Z"),
+        ),
+    )
+    .expect("cert");
+    let record =
+        AppRecord::sign(&keys, AppRecordBody::new(&cert, Vec::new(), ms(AT))).expect("record");
+    let ops = sign_batch(
+        &keys,
+        &alice_key(),
+        Some(cert.app_id()),
+        1,
+        [20; 16],
+        vec![(
+            Vec::new(),
+            OpKind::AppPut {
+                record: record.signed().clone(),
+            },
+        )],
+    )
+    .expect("batch");
+    let caller = serde_json::json!({
+        "app_id": pubky_switch_core::enc::zbase32_encode(&cert.app_id()),
+        "signing_secret_hex": hex::encode([21u8; 32]),
+    });
+    let body = OpsRequest::new(&ops, None).to_json();
+    let request = app_request(&caller, "POST", &ops_path(), body, ms(AT));
+    let (status, body, _) = answer_of(replay.service.handle(request).await);
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (403, Some("not_current")),
+        "{body}"
+    );
     replay.db.drop_database().await.expect("drop");
 }

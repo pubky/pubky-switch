@@ -147,6 +147,15 @@ pub struct Needs {
     pub invites: BTreeSet<[u8; 32]>,
     /// Target apps of its `key_bundle.put`s.
     pub targets: BTreeSet<[u8; 16]>,
+    /// Kids its `receive_key.put`s name, as their bodies read before they verify.
+    pub kids: BTreeSet<[u8; 8]>,
+}
+
+/// The kid a receive key record names, read from its body before it verifies; `None` for
+/// a body that doesn't read, which its verification then refuses.
+fn peek_kid(record: &SignedDoc) -> Option<[u8; 8]> {
+    let body: Value = serde_json::from_slice(&record.body_bytes().ok()?).ok()?;
+    pubky_switch_core::enc::unb64_array::<8>(body.get("kid")?.as_str()?).ok()
 }
 
 impl Needs {
@@ -191,7 +200,10 @@ impl Needs {
                 OpKind::KeyBundlePut(put) => {
                     needs.targets.insert(put.target_app_id);
                 }
-                OpKind::AppPut { .. } | OpKind::ReceiveKeyPut { .. } | OpKind::CertPut { .. } => {}
+                OpKind::ReceiveKeyPut { record } => {
+                    needs.kids.extend(peek_kid(record));
+                }
+                OpKind::AppPut { .. } | OpKind::CertPut { .. } => {}
             }
         }
         needs
@@ -218,8 +230,11 @@ pub struct OpsState {
     pub apps: BTreeMap<[u8; 16], HeldApp>,
     /// App IDs kept for good: revoked, departed, or named by an enrollment.
     pub kept: BTreeSet<[u8; 16]>,
-    /// Every kid any app registered.
+    /// The kids the batch names that some app registered, and those the batch registers.
     pub kids: BTreeSet<[u8; 8]>,
+    /// The receive keys the batch registers, in order: each is kept, so no kid is
+    /// registered twice (Switch spec 3.6).
+    pub new_receive_keys: Vec<([u8; 16], ReceiveKeyRecord)>,
     /// The key bundle parts of the batch's targets, in `first_epoch` order.
     pub parts: BTreeMap<[u8; 16], Vec<HeldPart>>,
     /// The records the batch names that exist.
@@ -257,6 +272,7 @@ impl OpsState {
             apps: BTreeMap::new(),
             kept: BTreeSet::new(),
             kids: BTreeSet::new(),
+            new_receive_keys: Vec::new(),
             parts: BTreeMap::new(),
             records: BTreeMap::new(),
             claims: BTreeMap::new(),
