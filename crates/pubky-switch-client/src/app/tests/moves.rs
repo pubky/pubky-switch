@@ -1321,6 +1321,42 @@ async fn test_erasure_wait_starts_over_on_any_answer_the_account_key_signs() {
 }
 
 #[tokio::test]
+async fn test_erasure_wait_starts_over_on_a_signed_503() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join(&w, &router).await;
+    let published = w.homeserver.file(w.alice.public(), IDENTITY_PATH).unwrap();
+    // Hour 0: an unsigned 404 and no identity.json.
+    w.switch.lock().erased = true;
+    w.homeserver.remove(w.alice.public(), IDENTITY_PATH);
+    unreachable_read(&mut app).await;
+    assert!(app.state.erasing.is_some());
+    // Hour 12: a `503` signed with the account's key, an error the pinned key verifies.
+    w.clock.advance_ms(12 * 3_600_000);
+    w.switch.lock().erased = false;
+    w.homeserver.put(w.alice.public(), IDENTITY_PATH, published);
+    w.switch.fail_next(Fault::Error {
+        path: "feed".into(),
+        code: ErrorCode::Unavailable,
+        current: json!({}),
+    });
+    let error = app.receive(None).await.unwrap_err();
+    assert_eq!(error.code(), Some(ErrorCode::Unavailable));
+    assert!(app.state.erasing.is_none());
+    // Hour 24: another unsigned 404 starts the wait afresh.
+    w.clock.advance_ms(12 * 3_600_000);
+    w.switch.lock().erased = true;
+    w.homeserver.remove(w.alice.public(), IDENTITY_PATH);
+    unreachable_read(&mut app).await;
+    let now = w.clock.now_ms();
+    assert_eq!(
+        app.state.erasing.map(|e| (e.since_ms, e.tries)),
+        Some((now, 1))
+    );
+    assert_ne!(app.follow_provider().await.unwrap(), ProviderStatus::Gone);
+}
+
+#[tokio::test]
 async fn test_erasure_wait_isnt_concluded_by_a_clock_jump() {
     let w = World::new();
     let router = Router::of(&w);
@@ -2050,6 +2086,52 @@ async fn test_key_change_resend_past_the_window_drops_instead_of_signing_again()
     assert!(app.kept_batches().await.unwrap().is_empty());
     assert_eq!(allow_ops_for(&changed.applied(), carol), 0);
     assert_eq!(allow_ops_for(&w.switch.applied(), carol), 1);
+}
+
+#[tokio::test]
+async fn test_key_change_kept_contact_past_the_window_doesnt_undo_a_deletion() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = lists_app(&w, &router).await;
+    let phone = w.other_app("phone", &[Permission::ListsManage]);
+    let carol = IdentityKey::from_secret(seed("carol/identity")).public();
+    // A kept `allow.put`: applied at generation 1, its answer lost.
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.submit_batch(contact_batch(carol)).await.is_err());
+    // The provider changes on day 29, inside the window; the first resend can't connect.
+    w.clock.advance_ms(29 * DAY_MS);
+    let changed = change_key(&w, &router);
+    changed.fail_next(Fault::Unreachable {
+        path: "ops".into(),
+        after: 0,
+    });
+    assert!(app.receive(None).await.is_err());
+    // Another device deletes the contact.
+    changed
+        .app_op(
+            &phone,
+            OpKind::AllowDelete {
+                pubky: carol,
+                kind: AllowKind::Contact,
+            },
+        )
+        .unwrap();
+    // Later retries fall past the window, the batch ID forgotten: the batch is dropped,
+    // and the deletion stands (Switch spec 12.5 "Kept batches").
+    w.clock.advance_ms(2 * DAY_MS);
+    changed.lock().batches.clear();
+    let report = app.receive(None).await.unwrap();
+    assert!(
+        has(&report.events, |e| matches!(
+            e,
+            AppEvent::KeptBatchDropped { .. }
+        )),
+        "{:?}",
+        report.events
+    );
+    assert!(app.kept_batches().await.unwrap().is_empty());
+    assert_eq!(allow_ops_for(&changed.applied(), carol), 0);
+    assert!(!app.admits(&carol).await.unwrap());
 }
 
 #[tokio::test]
