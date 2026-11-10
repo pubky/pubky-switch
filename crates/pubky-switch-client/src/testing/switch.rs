@@ -190,6 +190,12 @@ pub(crate) struct Inner {
     pub(crate) recovery_from: Option<u64>,
     /// The generation an imported sequence continues from, after a cooperative move.
     pub(crate) continued_from: Option<u64>,
+    /// When the recovery was declared: its recovery record's time (Switch spec 12.6 step 1).
+    pub(crate) recovery_declared_at: Option<u64>,
+    /// The service keys of the earlier generations whose proofs an import carried, by
+    /// generation (Switch wire 3.3 "Service keys"); a proof of another generation is this
+    /// switch's own.
+    pub(crate) proof_keys: BTreeMap<u64, [u8; 32]>,
     /// An app's first receive key record may carry any `n` (after a provider loss).
     pub(crate) any_first_n: bool,
     /// The recovery uploads taken: the body, and whether it came with `Switch-Cert`.
@@ -262,6 +268,8 @@ impl Inner {
             erased: false,
             recovery_from: None,
             continued_from: None,
+            recovery_declared_at: None,
+            proof_keys: BTreeMap::new(),
             any_first_n: false,
             uploads: Vec::new(),
             push: BTreeMap::new(),
@@ -372,6 +380,7 @@ impl ScriptedSwitch {
             inner.recovery_from = Some(recovery_from);
             inner.any_first_n = true;
             let at = inner.now();
+            inner.recovery_declared_at = Some(at);
             inner.service_transition(ServiceTransition::Recovery { recovery_from, at })?;
         }
         Ok(switch)
@@ -390,6 +399,12 @@ impl ScriptedSwitch {
         );
         next.seq = inner.seq;
         next.continued_from = Some(inner.tip.generation);
+        // The proofs this switch signed travel with the records and claims, checked with its
+        // key for its generation (Switch wire 3.3).
+        next.proof_keys = inner.proof_keys.clone();
+        next.proof_keys
+            .entry(inner.tip.generation)
+            .or_insert_with(|| inner.service.verifying_key().to_bytes());
         next.items = inner.items.clone();
         next.tips = inner.tips.clone();
         next.doc = inner.doc.clone();

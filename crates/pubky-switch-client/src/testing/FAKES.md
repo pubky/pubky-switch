@@ -76,15 +76,19 @@ service.
   - a serving account is answered `400`, never a pending key for the next generation, so
     there is no key change in place and no provider loss at the same service.
 - **`PUT /identity`** (Switch wire 3.3, 7.4.2), in `switch/signer.rs`: judged by the core's
-  `check_delivery`, like the service, with no kept proofs (`kept_proofs` empty, as at the
-  service until it serves operations). Unlike the service: there is no pending key, so no
+  `check_delivery`, like the service, with the kept proofs taken from what it holds: each held
+  record's current write proof and each live claim's entry proofs, by the generation each
+  names, with the key of that generation (its own, or the earlier service's that
+  `import_into` carried). Unlike the service: there is no pending key, so no
   generation change at a serving account; a first document carrying `recovery_from`, or at
   another generation than the switch's, is chained where the service answers `503`; and the
   answer carries the head in its body only, not in `Switch-Head`. The test call `deliver_identity` takes any document, without those
   checks, for scripting what another signer or a faulty service did.
 - **`GET /apps`** (Switch wire 7.4.12): the apps the switch holds or the newest document
-  lists, with `current`, `record_cert` and `bundle_ranges`; no last-seen times, attempts,
-  unread counts, `keys_through`, departures or `proof_generations`.
+  lists, with `current`, `record_cert`, `bundle_ranges` and `cert_expires_at`, and the
+  account's `identity`, `recovery` (`declared_at` its recovery record's time) and
+  `proof_generations`, from the same kept proofs as the delivery; no last-seen times,
+  attempts, unread counts, `keys_through` or departures.
 - **Moves and recovery** (Switch spec 12.5, 12.6, Switch wire 10): `import_into` copies the
   account in memory, with no manifest, chunks or export transfer; a recovery upload is kept
   and answered with fixed changes, merging nothing.

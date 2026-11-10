@@ -333,17 +333,22 @@ impl Inner {
     /// certificate"): a stored renewed one once the newest `identity.json` lists it, else
     /// its record's; `None` before its first `app.put`.
     fn held_cert(&self, app: &[u8; 16]) -> Result<Option<AppCert>, Refusal> {
-        let held = self.apps.get(app);
-        if held.is_some_and(|a| a.departed) {
+        if self.apps.get(app).is_some_and(|a| a.departed) {
             return Err(not_current("the app is revoked or departed"));
         }
-        let Some(record_cert) = held.and_then(|a| a.cert.clone()) else {
-            return Ok(None);
-        };
-        Ok(Some(match held.and_then(|a| a.renewed.clone()) {
+        Ok(self.checked_cert(app))
+    }
+
+    /// The certificate the switch checks `app` against, whatever its standing (Switch wire
+    /// 3.8 "Which certificate", 7.4.12 `cert_expires_at`): a stored renewed one once the
+    /// newest `identity.json` lists it, else its record's; `None` before its first `app.put`.
+    pub(super) fn checked_cert(&self, app: &[u8; 16]) -> Option<AppCert> {
+        let held = self.apps.get(app)?;
+        let record_cert = held.cert.clone()?;
+        Some(match held.renewed.clone() {
             Some(renewed) if self.standing(app, &renewed) == Some(Standing::Listed) => renewed,
             _ => record_cert,
-        }))
+        })
     }
 
     fn standing(&self, app: &[u8; 16], cert: &AppCert) -> Option<Standing> {
