@@ -27,6 +27,10 @@
 
 mod batch;
 pub(crate) mod body;
+mod bundle_parts;
+mod invite;
+mod limits;
+mod proof_state;
 pub(crate) mod read;
 mod rules;
 
@@ -36,9 +40,13 @@ pub use batch::{
     ops_hash, random_batch_id, retry_check, sign_batch, unchanged,
 };
 pub use body::{
-    AllowKind, BatchRef, Condition, IdInputs, InviteCodePut, KeyBundlePut, MAX_OP_BYTES, OpBody,
-    OpKind, RecordPut, RecordVersion, SignedOp, carrying_len,
+    AllowKind, BatchRef, Condition, IdInputs, InviteCodePut, InviteContext, KeyBundlePut,
+    MAX_OP_BYTES, OpBody, OpKind, RecordPut, RecordVersion, SignedOp, carrying_len,
 };
+pub use bundle_parts::{StoredPart, covers, keys_through, parts_to_drop};
+pub use invite::invite_code_delete;
+pub use limits::{Limits, List, Quota, check_quota};
+pub use proof_state::{StateAfter, proof_state};
 pub use rules::{
     AppPutEffect, CertPutEffect, KeyBundleEffect, MAX_INVITE_CONTEXT_BYTES, MAX_INVITE_USES, Need,
     ReceiveKeyEffect, Writer, check_app_put, check_cert_put, check_invite_code_put,

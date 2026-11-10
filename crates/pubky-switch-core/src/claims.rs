@@ -1705,9 +1705,24 @@ mod tests {
         assert_eq!(bad(evidence), 400);
         let short = ClaimFields {
             evidence_ref: Some(vec![1; 3]),
-            ..done_fields
+            ..done_fields.clone()
         };
         assert_eq!(bad(short), 400);
+        // `orphan_after` only on an attempt, `basis` only on a done.
+        assert_eq!(
+            bad(ClaimFields {
+                orphan_after: Some(60),
+                ..done_fields.clone()
+            }),
+            400
+        );
+        assert_eq!(
+            bad(ClaimFields {
+                basis: Some(Basis::Owner),
+                ..good.clone()
+            }),
+            400
+        );
     }
 
     #[test]
