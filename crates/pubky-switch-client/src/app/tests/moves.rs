@@ -2713,36 +2713,96 @@ async fn test_key_change_kept_effect_resend_refused_before_the_lookup_stays_kept
 }
 
 #[tokio::test]
-async fn test_kept_effect_refused_before_the_lookup_past_the_window_is_parked() {
+async fn test_kept_effect_past_the_window_isnt_sent_again_at_the_same_generation() {
+    for forgotten in [false, true] {
+        let w = World::new();
+        let router = Router::of(&w);
+        let mut app = join(&w, &router).await;
+        let me = app.app_id();
+        let (seq, message) = w.note(me, "before");
+        // Applied, its answer lost.
+        w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+        assert!(app.receive(None).await.is_err());
+        assert_eq!(w.effects(), 1);
+        let built = w.protocol.received.lock().unwrap().len();
+        // 31 days on, the service dropped the batch's proofs, or forgot its ID: a resend
+        // would get `409 conflict`, read as a failed condition, or be applied again.
+        w.clock.advance_ms(31 * DAY_MS);
+        if forgotten {
+            w.switch.lock().batches.clear();
+        } else {
+            w.switch.fail_next(Fault::Error {
+                path: "ops".into(),
+                code: ErrorCode::Conflict,
+                current: json!(null),
+            });
+        }
+        let report = app.receive(None).await.unwrap();
+        // Not sent again: its entry is stored as uncertain, and the effect not built again.
+        assert!(
+            has(&report.events, |e| matches!(
+                e,
+                AppEvent::EffectUncertain { seq: s, .. } if *s == seq
+            )),
+            "{forgotten}: {:?}",
+            report.events
+        );
+        assert_eq!(w.effects(), 1, "{forgotten}");
+        assert_eq!(
+            w.protocol.received.lock().unwrap().len(),
+            built,
+            "{forgotten}"
+        );
+        assert_eq!(
+            app.state.parked.get(&seq).map(|p| p.reason),
+            Some(ParkReason::Uncertain)
+        );
+        w.switch.lock().faults.clear();
+        resend_is_a_duplicate(&w, &mut app, &w.switch.clone(), &message).await;
+    }
+}
+
+#[tokio::test]
+async fn test_kept_effect_window_is_measured_against_the_verified_service_time() {
     let w = World::new();
     let router = Router::of(&w);
     let mut app = join(&w, &router).await;
     let me = app.app_id();
-    let (seq, message) = w.note(me, "before");
+    let (seq, _) = w.note(me, "before");
     w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
     assert!(app.receive(None).await.is_err());
-    w.clock
-        .advance_ms(crate::app::provider::KEPT_BATCH_ANSWER_MS);
-    w.switch.fail_next(Fault::Error {
-        path: "ops".into(),
-        code: ErrorCode::CertExpired,
-        current: json!(null),
-    });
-    let report = app.receive(None).await.unwrap();
-    assert!(
-        has(&report.events, |e| matches!(
-            e,
-            AppEvent::EffectUncertain { seq: s, .. } if *s == seq
-        )),
-        "{:?}",
-        report.events
-    );
-    assert_eq!(
-        app.state.parked.get(&seq).map(|p| p.reason),
-        Some(ParkReason::Uncertain)
-    );
-    assert_eq!(w.effects(), 1);
-    resend_is_a_duplicate(&w, &mut app, &w.switch.clone(), &message).await;
+    // The device clock reads as when the effect was kept, but the app has verified a
+    // service time past the window: the window is closed.
+    app.ready_local().await.unwrap();
+    let kept = app.state.pending_effect.as_ref().unwrap().kept_ms;
+    assert_eq!(app.state.pending_effect.as_ref().map(|p| p.seq), Some(seq));
+    assert!(app.answer_decides(kept));
+    let past = w.clock.now_ms() + crate::app::provider::KEPT_BATCH_ANSWER_MS;
+    let time = app.state.service_time.as_mut().unwrap();
+    time.highest_ms = past;
+    assert_eq!(app.kept_window_now(), past);
+    assert!(!app.answer_decides(kept));
+}
+
+#[tokio::test]
+async fn test_kept_batch_past_the_window_isnt_sent_again_at_the_same_generation() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = lists_app(&w, &router).await;
+    let carol = IdentityKey::from_secret(seed("carol/identity")).public();
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.submit_batch(contact_batch(carol)).await.is_err());
+    w.clock.advance_ms(31 * DAY_MS);
+    w.switch.lock().batches.clear();
+    // The next write: the kept batch isn't sent again, but dropped and reported.
+    let dave = IdentityKey::from_secret(seed("dave/identity")).public();
+    app.submit_batch(contact_batch(dave)).await.unwrap();
+    assert!(app.kept_batches().await.unwrap().is_empty());
+    assert!(has(&app.take_events(), |e| matches!(
+        e,
+        AppEvent::KeptBatchDropped { .. }
+    )));
+    assert_eq!(allow_ops_for(&w.switch.applied(), carol), 1);
 }
 
 #[tokio::test]

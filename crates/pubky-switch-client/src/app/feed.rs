@@ -969,7 +969,7 @@ impl App {
                     ) =>
             {
                 if refused_at(&error) == Some(RefusalPlace::Caller)
-                    && super::provider::answer_decides(self.now(), pending.kept_ms)
+                    && self.answer_decides(pending.kept_ms)
                 {
                     return Err(error);
                 }
@@ -1085,7 +1085,7 @@ impl App {
             Err(AppError::Switch(ClientError::Switch {
                 code: ErrorCode::StaleGeneration,
                 ..
-            })) if !super::provider::answer_decides(self.now(), pending.kept_ms) => {
+            })) if !self.answer_decides(pending.kept_ms) => {
                 return self.effect_uncertain(&pending).await;
             }
             // Refused before the batch ID lookup, which tells nothing: about the caller, kept,
@@ -1098,7 +1098,7 @@ impl App {
                 ) =>
             {
                 if refused_at(&error) == Some(RefusalPlace::Caller)
-                    && super::provider::answer_decides(self.now(), pending.kept_ms)
+                    && self.answer_decides(pending.kept_ms)
                 {
                     return Err(error);
                 }
@@ -1206,6 +1206,13 @@ impl App {
             return Ok(());
         };
         let batch = Batch::from_body(pending.body.clone())?;
+        // Past the window no answer tells whether it was applied, at any generation: a
+        // retry after the service dropped its proofs gets `409 conflict`, and a forgotten
+        // ID takes the same bytes as new. It isn't sent again; its entry is stored as
+        // uncertain (Switch wire 6.4 step 5, Switch spec 12.5 "Kept batches").
+        if !self.answer_decides(pending.kept_ms) {
+            return self.effect_uncertain(&pending).await;
+        }
         if super::batch_generation(&batch).is_some_and(|g| g < self.state.meta.generation) {
             return self.resend_earlier_effect(pending, &batch).await;
         }

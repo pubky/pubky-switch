@@ -31,7 +31,7 @@ use pubky_switch_core::claims::ClaimType;
 use pubky_switch_core::enc::{b64, pubky_id, pubky_key, serde_b64, serde_b64_vec};
 use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::ops::{AllowKind, Condition, MAX_BATCH_ENTRIES, OpBody, OpKind, Position};
-use pubky_switch_core::records::{CLOCK_TOLERANCE_MS, DAY_MS, Freeze, IdentityDoc, Inbox};
+use pubky_switch_core::records::{DAY_MS, Freeze, IdentityDoc, Inbox};
 use pubky_switch_core::scopes::Permission;
 use pubky_switch_core::sig::SignedDoc;
 use serde::{Deserialize, Serialize};
@@ -217,16 +217,44 @@ pub(crate) enum Carry {
     AfterLoss,
 }
 
-/// How long after it was kept a batch's resend still tells whether it was applied: the
-/// service holds a batch's ID at least 30 days, less the clock tolerance (Switch spec
-/// 12.5 "Kept batches", 6.3).
-pub(crate) const KEPT_BATCH_ANSWER_MS: u64 = 30 * DAY_MS - CLOCK_TOLERANCE_MS;
+/// How long after it was kept a batch's resend still tells whether it was applied. The
+/// service keeps a batch's proofs `batch_proofs_ms`, 30 days from when it applied the batch
+/// (Switch wire 6.4 step 5, 9): a retry within that time gets them back, and after it a
+/// retry gets `409 conflict`, which then can't be told from a condition that failed, and an
+/// ID forgotten takes the same bytes as new. The window ends [`KEPT_BATCH_MARGIN_MS`]
+/// before those 30 days from when the app kept the batch, before its first send.
+pub(crate) const KEPT_BATCH_ANSWER_MS: u64 =
+    pubky_switch_core::ops::BATCH_PROOFS_MS - KEPT_BATCH_MARGIN_MS;
+
+/// How much sooner than the service's 30 days a kept batch's window ends. A resend sent just
+/// inside the window, measured at [`App::kept_window_now`], reaches the service within the
+/// device clock's tolerance of the service's (5 minutes, the clock tolerance), plus the
+/// 5 minutes a request's signed time is accepted for (Switch wire 7.1), after the app kept
+/// it, and the service applied it no sooner than the app kept it: some 20 minutes in the
+/// worst case. An hour leaves room past that.
+pub(crate) const KEPT_BATCH_MARGIN_MS: u64 = 60 * 60 * 1000;
 
 /// Whether a resend of a batch kept at `kept_ms` still tells whether it was applied, at
 /// `now`: kept less than [`KEPT_BATCH_ANSWER_MS`] ago. A batch without a time, kept by an
 /// earlier build, counts as too old.
 pub(crate) fn answer_decides(now: u64, kept_ms: Option<u64>) -> bool {
     kept_ms.is_some_and(|at| now.saturating_sub(at) < KEPT_BATCH_ANSWER_MS)
+}
+
+impl App {
+    /// The time a kept batch's age is measured at: the later of the device clock and the
+    /// highest service time the app verified, so a device clock set back doesn't hold the
+    /// window open (Switch spec 12.5 "Kept batches").
+    pub(crate) fn kept_window_now(&self) -> u64 {
+        let verified = self.state.service_time.map_or(0, |time| time.highest_ms);
+        self.now().max(verified)
+    }
+
+    /// Whether a resend of a batch kept at `kept_ms` still tells whether it was applied,
+    /// now ([`answer_decides`], at [`App::kept_window_now`]).
+    pub(crate) fn answer_decides(&self, kept_ms: Option<u64>) -> bool {
+        answer_decides(self.kept_window_now(), kept_ms)
+    }
 }
 
 /// How many provider changes one follow takes in a row, each given up for a newer own
@@ -1026,9 +1054,9 @@ impl App {
         carry: Carry,
     ) -> Result<Vec<AppEvent>, AppError> {
         let mut events = Vec::new();
-        let now = self.now();
         let resend_first = carry == Carry::ResendFirst;
-        let answer_decides = |kept_ms: Option<u64>| answer_decides(now, kept_ms);
+        let window_now = self.kept_window_now();
+        let answer_decides = |kept_ms: Option<u64>| answer_decides(window_now, kept_ms);
         if let Some(pending) = self.state.pending_effect.clone() {
             let applied = Batch::from_body(pending.body.clone())?
                 .id()

@@ -533,6 +533,16 @@ impl App {
             let id = pubky_switch_core::enc::unb64_array::<16>(&id)
                 .map_err(|_| AppError::Store(crate::error::StoreError::Corrupt))?;
             let batch = self.without_stale_cursor(Batch::from_body(pending.body.clone())?)?;
+            // Past the window no answer tells whether it was applied, at any generation: it
+            // isn't sent again, and goes, reported with its attempts (Switch wire 6.4 step
+            // 5, Switch spec 12.5 "Kept batches").
+            if !self.answer_decides(pending.kept_ms) {
+                let mut tx = self.tx()?;
+                Self::replace_kept_batch(&id, None, &mut tx)?;
+                self.kept_batch_dropped(&id, &batch, &mut tx)?;
+                self.commit(tx).await?;
+                continue;
+            }
             if super::batch_generation(&batch).is_some_and(|g| g < self.state.meta.generation) {
                 self.resend_earlier(&id, &pending, &batch).await?;
                 continue;
@@ -612,8 +622,7 @@ impl App {
         batch: &Batch,
         error: AppError,
     ) -> Result<(), AppError> {
-        if refused_at(&error) == Some(RefusalPlace::Caller)
-            && super::provider::answer_decides(self.now(), pending.kept_ms)
+        if refused_at(&error) == Some(RefusalPlace::Caller) && self.answer_decides(pending.kept_ms)
         {
             return Err(error);
         }
@@ -825,7 +834,7 @@ impl App {
             Err(AppError::Switch(ClientError::Switch {
                 code: ErrorCode::StaleGeneration,
                 ..
-            })) if !super::provider::answer_decides(self.now(), pending.kept_ms) => {
+            })) if !self.answer_decides(pending.kept_ms) => {
                 // The service may have forgotten a batch it applied: past the window the
                 // answer decides nothing, and the batch goes (Switch spec 12.5 "Kept
                 // batches"), reported in the commit that drops it.
