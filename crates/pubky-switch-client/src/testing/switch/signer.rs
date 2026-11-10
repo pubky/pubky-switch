@@ -48,6 +48,11 @@ impl ScriptedSwitch {
         switch
     }
 
+    /// Announce `limits` at the enrollment that makes the account, in place of the defaults.
+    pub fn set_enroll_limits(&self, limits: Limits) {
+        self.lock().enroll_limits = limits;
+    }
+
     /// The App IDs the account keeps for good from the enrollment that made it.
     pub fn kept_app_ids(&self) -> Vec<[u8; 16]> {
         self.lock().kept_app_ids.clone()
@@ -85,7 +90,11 @@ impl Inner {
             ));
         }
         let creating = self.enrolled.is_none();
-        let enrolled = self.enrolled.get_or_insert_with(Enrolled::default);
+        let limits = self.enroll_limits;
+        let enrolled = self.enrolled.get_or_insert_with(|| Enrolled {
+            limits,
+            answers: HashMap::new(),
+        });
         if let Some(answer) = enrolled.answers.get(&enrollment.hash()) {
             return Ok((200, answer.clone()));
         }

@@ -57,6 +57,7 @@ use pubky_switch_core::scopes::Permission;
 use pubky_switch_core::sig::SignedDoc;
 
 use super::Signer;
+use crate::alert::Alert;
 use crate::error::{Refusal, Result, SignerError};
 use crate::protocol::GrantPath;
 use crate::state::PendingClaim;
@@ -247,9 +248,14 @@ impl Signer {
             .ok_or_else(|| SignerError::Records("the approved version isn't the newest".into()))
     }
 
-    /// The claim of an approval whose version the switch has taken, until the host reports
-    /// it delivered ([`Signer::claim_delivered`]); `None` for a request this signer holds no
-    /// claim for, or whose version isn't delivered.
+    /// The claim of an approval whose version the switch has taken and the Homeserver
+    /// publishes, until the host reports it delivered ([`Signer::claim_delivered`]): the
+    /// version is delivered, published, then answered (Switch wire 3.9).
+    ///
+    /// `None` for a request this signer holds no claim for, or whose version isn't the newest
+    /// published one listing its certificate; also while another install is the signer, and
+    /// while a rollback or equivocation alert is uncleared, since the switch may no longer
+    /// hold that version ([`Signer::clear_alert`]).
     ///
     /// # Errors
     ///
@@ -258,16 +264,42 @@ impl Signer {
         let Some(held) = self.state.claims.iter().find(|c| &c.request == request) else {
             return Ok(None);
         };
-        let delivered = self
+        let alarmed = self
             .state
-            .newest_doc()?
-            .is_some_and(|doc| doc.listed_cert(&held.app_id) == Some(held.cert));
+            .alerts
+            .iter()
+            .any(|alert| matches!(alert, Alert::Rollback { .. } | Alert::Equivocation { .. }));
+        if alarmed || self.state.managed_by.is_some() {
+            return Ok(None);
+        }
+        let published = self.state.newest.as_ref().is_some_and(|n| n.published);
+        let delivered = published
+            && self
+                .state
+                .newest_doc()?
+                .is_some_and(|doc| doc.listed_cert(&held.app_id) == Some(held.cert));
         Ok(delivered.then(|| ApprovedRequest {
             request: held.request,
             app_id: held.app_id,
             caps: held.caps.clone(),
             claim: held.plaintext.clone(),
         }))
+    }
+
+    /// The certificates the newest version references, of its apps and of its `renewed`
+    /// entries, verified: the ones the signer issued and keeps.
+    ///
+    /// # Errors
+    ///
+    /// [`SignerError::InvalidData`] when a stored certificate no longer verifies.
+    pub fn certificates(&self) -> Result<Vec<AppCert>> {
+        let identity = self.state.identity;
+        Ok(self
+            .state
+            .certs
+            .iter()
+            .map(|cert| AppCert::verify(cert, &identity))
+            .collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     /// The host delivered the claim of `request` and approved its grant: the signer drops

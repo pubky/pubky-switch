@@ -57,6 +57,8 @@ pub struct TestHomeserver {
     pub down: Mutex<bool>,
     /// Writes fail while reads still answer.
     pub failing_puts: Mutex<bool>,
+    /// Writes to this path fail while reads and other writes go through.
+    pub failing_path: Mutex<Option<String>>,
 }
 
 impl TestHomeserver {
@@ -90,16 +92,18 @@ impl Homeserver for TestHomeserver {
         Box::pin(async move { answer })
     }
     fn put(&self, path: &str, bytes: Vec<u8>) -> BoxFuture<'_, Result<(), TransportError>> {
-        let answer = if *self.down.lock().unwrap() || *self.failing_puts.lock().unwrap() {
-            Err(TransportError::Connect("down".into()))
-        } else {
-            self.writes
-                .lock()
-                .unwrap()
-                .push((path.to_owned(), bytes.clone()));
-            self.set(path, bytes);
-            Ok(())
-        };
+        let failing_path = self.failing_path.lock().unwrap().as_deref() == Some(path);
+        let answer =
+            if *self.down.lock().unwrap() || *self.failing_puts.lock().unwrap() || failing_path {
+                Err(TransportError::Connect("down".into()))
+            } else {
+                self.writes
+                    .lock()
+                    .unwrap()
+                    .push((path.to_owned(), bytes.clone()));
+                self.set(path, bytes);
+                Ok(())
+            };
         Box::pin(async move { answer })
     }
 }
@@ -144,10 +148,10 @@ impl StateStore for FlakyStore {
     }
 }
 
-/// The path the test protocol adds to the grant of an app holding `tags`.
+/// The path the test protocol adds to the grant of an app holding `notes_tags`.
 pub const TAGS_PATH: &str = "/pub/notes/tags.json";
 
-/// A protocol with neutral scopes: `notes`, with keys, needing `claims.read`, and `tags`,
+/// A protocol with neutral scopes: `notes`, with keys, needing `claims.read`, and `notes_tags`,
 /// without keys, needing `lists.read` and adding [`TAGS_PATH`] to the app's grant.
 pub struct Notes;
 
@@ -156,7 +160,7 @@ impl Protocol for Notes {
         "notes"
     }
     fn scopes(&self) -> Vec<ScopeDef> {
-        vec![ScopeDef::keyed("notes"), ScopeDef::unkeyed("tags")]
+        vec![ScopeDef::keyed("notes"), ScopeDef::unkeyed("notes_tags")]
     }
     fn check_scopes(&self, _: &[&str]) -> Result<(), String> {
         Ok(())
@@ -166,13 +170,13 @@ impl Protocol for Notes {
         if scopes.contains(&"notes") {
             out.push(Permission::ClaimsRead);
         }
-        if scopes.contains(&"tags") {
+        if scopes.contains(&"notes_tags") {
             out.push(Permission::ListsRead);
         }
         out
     }
     fn grant_paths(&self, _: &[u8; 16], scopes: &[&str]) -> Vec<GrantPath> {
-        if scopes.contains(&"tags") {
+        if scopes.contains(&"notes_tags") {
             vec![GrantPath {
                 path: TAGS_PATH.into(),
                 purpose: "the public tag list".into(),
