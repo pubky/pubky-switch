@@ -84,7 +84,7 @@ pub use claims::{
     ClaimDoubt, ClaimEntryRead, ClaimEvidence, ClaimOp, ClaimRead, ClaimWritten,
     ObligationDeadline, claim_conflict,
 };
-pub use context::{ClaimFetch, LocalView, ReceiveContext};
+pub use context::{ClaimFetch, LocalView, ReceiveContext, RestoreContext};
 pub use directory::{
     HomeserverCopy, IdentityLookup, Initiator, MayAct, PEER_DELIVERY_MS, PeerIdentity,
     SwitchAnswer, SwitchCopy, SwitchLookup,
@@ -1061,7 +1061,8 @@ impl App {
     /// the backup carries beside it, in one commit: the app checks its own state, then the
     /// layer's name
     /// against [`Protocol::backup_name`], then has [`Protocol::restore_layer`] check the
-    /// layer and give its writes, all before it writes anything. When this returns `Ok`,
+    /// layer, with the backup's identity and naming key ([`RestoreContext`]), and give its
+    /// writes, all before it writes anything. When this returns `Ok`,
     /// both layers are in the store; on `Err`, neither is, and the store holds what it held
     /// before. The one exception is a commit whose outcome the store can't tell
     /// ([`StoreError::Unknown`]): it landed whole or not at all, and the host loads the app
@@ -1170,9 +1171,15 @@ impl App {
             {
                 return Err(invalid("its protocol layer is another protocol's"));
             }
-            let layer_writes = protocol.restore_layer(layer.as_ref()).map_err(|why| {
-                AppError::InvalidData(format!("the backup's protocol layer: {why}"))
-            })?;
+            // The protocol checks its layer against the identity's naming key, the one the
+            // restored app goes on with, before anything is written.
+            let restoring = RestoreContext::new(meta.identity, meta.app_id, &backup.naming);
+            let layer_writes =
+                protocol
+                    .restore_layer(layer.as_ref(), &restoring)
+                    .map_err(|why| {
+                        AppError::InvalidData(format!("the backup's protocol layer: {why}"))
+                    })?;
             let (seen, parked, processed) = match &backup.protocol {
                 Some(layer) => (
                     layer.seen.iter().copied().collect::<BTreeSet<u64>>(),

@@ -30,9 +30,12 @@
 //! service flagged it, and how fresh that is.
 //!
 //! The protocol's other callbacks get a [`LocalView`]: the identity, the App ID and the
-//! protocol's local state, read-only.
+//! protocol's local state, read-only. Its restore step gets a [`RestoreContext`]: the
+//! identity, the App ID and the naming key of the backup being restored, before anything
+//! is written.
 
 use pubky_switch_core::claims::{ClaimView, EntryKind};
+use pubky_switch_core::ident::NamingKey;
 use pubky_switch_core::ops::{Condition, MAX_BATCH_ENTRIES, OpKind, RecordVersion};
 use pubky_switch_core::records::AppCert;
 
@@ -244,6 +247,56 @@ impl<'a> LocalView<'a> {
     /// A store failure.
     pub fn local_scan(&self, prefix: &[u8]) -> Result<Vec<KeyValue>, AppError> {
         local_scan(self.store, self.ns, prefix)
+    }
+}
+
+/// What a protocol's restore step can read ([`super::Protocol::restore_layer`]): the
+/// identity, the App ID and the naming key of the backup being restored, which the restored
+/// app goes on with, before anything is written.
+///
+/// With the naming key the protocol checks its layer against the identity before the
+/// restore commits, such as that each claim key or record key it keeps is the one its
+/// inputs derive to under the naming key (Switch wire 1.5, Switch spec 13.3). A layer it
+/// refuses refuses the restore, and nothing of either layer is written. The naming key is
+/// sensitive: the protocol derives from it and keeps none of it.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct RestoreContext<'a> {
+    identity: [u8; 32],
+    app_id: [u8; 16],
+    naming: &'a NamingKey,
+}
+
+impl<'a> RestoreContext<'a> {
+    pub(crate) fn new(identity: [u8; 32], app_id: [u8; 16], naming: &'a NamingKey) -> Self {
+        Self {
+            identity,
+            app_id,
+            naming,
+        }
+    }
+
+    /// The identity.
+    pub fn identity(&self) -> [u8; 32] {
+        self.identity
+    }
+
+    /// The App ID.
+    pub fn app_id(&self) -> [u8; 16] {
+        self.app_id
+    }
+
+    /// The identity's naming key, as the backup carries it (Switch wire 1.5), as
+    /// [`super::App::naming_key`] gives it once restored. Sensitive.
+    pub fn naming_key(&self) -> &NamingKey {
+        self.naming
+    }
+
+    /// `blind(input)` under the naming key (Switch wire 1.5), as [`super::App::blind`] and
+    /// [`ReceiveContext::blind`] give it: what a protocol derives its shared keys from, such
+    /// as its claim keys (Switch spec 10.2, 13.3).
+    pub fn blind(&self, input: &[u8]) -> [u8; 32] {
+        self.naming.blind(input)
     }
 }
 
