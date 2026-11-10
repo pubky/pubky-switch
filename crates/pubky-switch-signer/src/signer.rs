@@ -14,7 +14,8 @@
 //! 2. sign the version, naming this install as `signer`, above every version this install
 //!    signed before, and commit it;
 //! 3. read the backup on the Homeserver: one naming another install at or past the high-water
-//!    mark means that install took over, and this one stops. One that doesn't open, or none
+//!    mark means that install took over, and this one stops, unless it builds on what the mark
+//!    built on: a losing delivery's, which this install writes over. One that doesn't open, or none
 //!    where this signer wrote one, stops it too, unless the switch still holds the high-water
 //!    version;
 //! 4. write the backup holding the new version; a failed write stops the delivery;
@@ -512,7 +513,8 @@ impl Signer {
     async fn judge_backup(&mut self, found: &BackupView) -> Result<()> {
         let doc = &found.identity_doc;
         let mark = self.state.newest_doc()?;
-        if found.taken_over(&self.state.install, mark.as_ref()) {
+        let mark_prev = self.state.newest.as_ref().and_then(|n| n.prev);
+        if found.taken_over(&self.state.install, mark.as_ref(), mark_prev) {
             return self.managed_by(doc.body().signer).await;
         }
         if doc.body().signer == self.state.install && doc.version() > self.state.signed_through {
@@ -723,7 +725,8 @@ impl Signer {
     /// (Switch wire 3.13 "When it is written", "Another install's backup").
     ///
     /// A backup that names another install at or past the high-water mark stops the signer
-    /// without writing. So does a backup that doesn't open, or none where this signer has
+    /// without writing, unless it builds on what the mark built on: a losing delivery's, which
+    /// is written over. So does a backup that doesn't open, or none where this signer has
     /// written one, unless the switch still holds the newest version this signer delivered:
     /// then no other install has taken over, since one that takes over delivers before it
     /// writes its backup, and the signer writes its own with an alert.
@@ -776,9 +779,10 @@ impl Signer {
     /// The checks before any write of this install's backup, over the one the Homeserver
     /// holds (Switch wire 3.13 "When it is written", "Another install's backup"): this
     /// install is named, and the backup there names neither another install that took over,
-    /// past the high-water mark or at it with the mark's own document, nor a newer version of
-    /// this install's own ([`Signer::judge_backup`]). One at the mark's version holding another
-    /// document is a losing delivery's, and is written over.
+    /// at or past the high-water mark, nor a newer version of this install's own
+    /// ([`Signer::judge_backup`]). Another install's backup that builds on what the mark built
+    /// on and isn't the mark itself is a losing delivery's, whatever its version, and is
+    /// written over.
     /// One that doesn't open, or none where this signer has written one, is written over only
     /// while the switch still holds the newest version this signer delivered: then no other
     /// install has taken over, since one that takes over delivers before it writes its

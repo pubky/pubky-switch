@@ -1122,3 +1122,48 @@ async fn test_restore_owed_backup_stops_at_an_unreadable_one_once_another_instal
         SignerStatus::ManagedBy { install: [7; 16] }
     );
 }
+
+#[tokio::test]
+async fn test_restore_winner_writes_over_a_losing_backup_past_its_mark() {
+    // The old install spent a version: its renewal was refused at the batch, so it signs its
+    // next one two versions past its mark, on that mark, and that version's backup write
+    // fails. A new install restores, wins at the version after the mark, and owes its backup.
+    // The old install's losing backup is past the winner's mark but built on what the
+    // winner's mark built on: a losing delivery's. The winner writes over it and signs on.
+    let world = World::new();
+    let (mut old, _) = world.enrolled().await;
+    let app = App::new(&["notes"], None, [9; 32]);
+    world.approve(&mut old, &app).await;
+    let mark = old.identity_doc().unwrap().unwrap();
+    world.switch.fail_next(SwitchFault::Error {
+        path: "/ops".into(),
+        code: ErrorCode::Conflict,
+        current: serde_json::Value::Null,
+    });
+    old.renew(app.keys.app_id_bytes(), CertChange::default())
+        .await
+        .unwrap_err();
+    assert_eq!(old.identity_doc().unwrap().unwrap().signed(), mark.signed());
+    *world.homeserver.failing_path.lock().unwrap() = Some(SIGNER_BACKUP_PATH.to_owned());
+    old.set_record_max_age(Some(60)).await.unwrap_err();
+    let mut winner = restored(&world).await.unwrap();
+    let won = winner.identity_doc().unwrap().unwrap();
+    assert_eq!(won.version(), mark.version() + 1);
+    *world.homeserver.failing_path.lock().unwrap() = None;
+    assert_eq!(
+        old.resume().await.unwrap_err(),
+        SignerError::NotNamed {
+            install: winner.install_id()
+        }
+    );
+    let losing = world.backup().identity_doc().clone();
+    assert_eq!(losing.body().signer, old.install_id());
+    assert!(losing.version() > won.version());
+    winner.resume().await.unwrap();
+    assert_eq!(winner.status(), SignerStatus::Signing);
+    assert_eq!(world.backup().identity_doc().signed(), won.signed());
+    // The winner signs on. Its next version reuses the number the loser spent, which the
+    // switch never took: each install signs every version once, and the switch takes one.
+    let next = winner.set_record_max_age(Some(120)).await.unwrap();
+    assert_eq!(world.switch.identity_doc().unwrap().signed(), next.signed());
+}
