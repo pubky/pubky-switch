@@ -133,6 +133,12 @@ pub struct SwitchApp {
     pub departed_at: Option<(u64, u64)>,
     /// When the app asked for its full key bundle, until a bundle part answers it.
     pub full_requested: Option<u64>,
+    /// When the switch last took a request of the app's (`last_seen`, Switch wire 7.4.12).
+    pub last_seen: Option<u64>,
+    /// Whether a delivered `identity.json` listed the departed app in `removed` at a higher
+    /// data epoch than at its departure: its rotation is done for good (`awaiting_rotation`,
+    /// Switch wire 7.4.12).
+    pub rotated: bool,
 }
 
 /// The byte budget of a feed page's items and of a record page's views: 8 MiB (Switch wire
@@ -255,6 +261,9 @@ pub(crate) struct Inner {
     /// The App IDs the enrollment that made the account named, kept for good (Switch wire
     /// 3.7).
     pub(crate) kept_app_ids: Vec<[u8; 16]>,
+    /// The service time of the enrollment that named `kept_app_ids`, their `revoked_at` in
+    /// `GET /apps` (Switch wire 7.4.12).
+    pub(crate) kept_at: u64,
     /// The transition proof of the newest `identity.json` delivery, which a retry gets again
     /// (Switch wire 7.4.2).
     pub(crate) delivery_proof: Option<SignedDoc>,
@@ -320,6 +329,7 @@ impl Inner {
             directory_version: 1,
             enrolled: Some(signer::Enrolled::default()),
             kept_app_ids: Vec::new(),
+            kept_at: 0,
             delivery_proof: None,
             enroll_limits: pubky_switch_core::records::Limits::default(),
             listed_at_epoch: BTreeMap::new(),
@@ -705,6 +715,12 @@ impl ScriptedSwitch {
             Some(answer) => Ok(answer),
             None => inner.route(request, caller, &rest),
         };
+        // An own app's request: its last-seen time (Switch wire 7.4.12), also for the request
+        // that registered it.
+        let now = inner.now();
+        if let Some(held) = caller.and_then(|app| inner.apps.get_mut(&app)) {
+            held.last_seen = Some(now);
+        }
         let (status, mut body) =
             answer.map_err(|error| TransportError::Other(format!("scripted switch: {error}")))?;
         if lose {
