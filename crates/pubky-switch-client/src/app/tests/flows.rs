@@ -886,6 +886,81 @@ async fn test_app_renewal_is_picked_up_once_listed() {
 }
 
 #[tokio::test]
+async fn test_app_expired_certificate_is_renewed_by_the_signer_alone() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let me = app.app_id();
+    let old = app.cert().clone();
+    // The certificate expires: the switch refuses the app everything, its feed read too.
+    w.clock.set_ms(old.expires_at() + 1);
+    let Err(AppError::Switch(crate::ClientError::Switch { code, .. })) = app.receive(None).await
+    else {
+        panic!("an expired app is refused");
+    };
+    assert_eq!(code, ErrorCode::CertExpired);
+    // Step 1: the signer stores the renewed certificate with a full bundle made for it, in
+    // one batch, while the document still lists the expired certificate.
+    let renewed = cert_for(
+        &w.alice,
+        &app_keys("wallet"),
+        w.clock.now_ms(),
+        &["scope-a"],
+    );
+    let has_keys = |s: &str| SampleProtocol::default().has_keys(s);
+    let epoch = w.switch.identity_doc().unwrap().data_epoch();
+    let mut batch = vec![OpKind::CertPut {
+        target_app_id: me,
+        cert: renewed.signed().clone(),
+    }];
+    for part in seal_bundle_parts(&w.alice, &renewed, 1, epoch, &has_keys).unwrap() {
+        batch.push(OpKind::KeyBundlePut(KeyBundlePut {
+            target_app_id: me,
+            bundle: part.bundle,
+            first_epoch: part.first_epoch,
+            last_epoch: part.last_epoch,
+        }));
+    }
+    w.switch.signer_batch(batch).unwrap();
+    // Still expired until the document lists the renewal.
+    assert!(app.receive(None).await.is_err());
+    // Step 2: the delivery listing the new certificate. From it the switch checks the app
+    // against the renewed certificate, so the app reads its feed again, takes the
+    // certificate and delivers its record carrying it.
+    w.next_doc(|body| {
+        body.apps.retain(|a| a.app_id != me);
+        body.apps.push(ListedApp {
+            app_id: me,
+            cert: renewed.hash(),
+        });
+        body.renewed.push(RenewedCert {
+            app_id: me,
+            cert: old.hash(),
+            until: None,
+        });
+    });
+    let report = app.receive(None).await.unwrap();
+    assert!(
+        has(&report.events, |e| matches!(
+            e,
+            AppEvent::CertificateTaken { .. }
+        )),
+        "{:?}",
+        report.events
+    );
+    assert_eq!(app.cert().hash(), renewed.hash());
+    assert_eq!(
+        w.switch.app(&me).cert.map(|c| c.hash()),
+        Some(renewed.hash())
+    );
+    // The app goes on with it, and holds the keys the renewal's bundle gave.
+    app.receive(None).await.unwrap();
+    assert_eq!(
+        app.scope_key(epoch, "scope-a"),
+        Some(w.alice.scope_key(epoch, "scope-a"))
+    );
+}
+
+#[tokio::test]
 async fn test_app_ignores_a_cert_put_of_other_keys() {
     let w = World::new();
     let mut app = w.join("wallet").await;
@@ -1643,4 +1718,119 @@ async fn test_app_effect_over_one_batch_is_parked_and_the_feed_goes_on() {
     );
     app.receive(None).await.unwrap();
     assert_eq!(protocol.0.received.lock().unwrap().len(), 2);
+}
+
+/// The wallet joined, then loaded again on a device clock `offset_ms` ahead of the switch's.
+async fn wallet_on_a_clock_ahead(w: &World, offset_ms: u64) -> App {
+    let me = w.join("wallet").await.app_id();
+    let clock = Arc::new(crate::clock::TestClock::new(w.clock.now_ms() + offset_ms));
+    let env = AppEnv {
+        clock: clock as Arc<dyn crate::clock::Clock>,
+        ..w.env()
+    };
+    App::load(env, w.protocol.clone(), World::config(), me)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn test_app_stale_timestamp_is_retried_once_at_the_service_time() {
+    let w = World::new();
+    let mut app = wallet_on_a_clock_ahead(&w, 60 * 60_000).await;
+    // The switch refuses the timestamp, and the client signs the call again at the time
+    // the refusal names.
+    let (seq, _) = w.note(app.app_id(), "hello");
+    let report = app.receive(None).await.unwrap();
+    assert!(received(&report.events, seq), "{:?}", report.events);
+    // Only once: a retry whose timestamp the switch refuses again is the answer.
+    w.switch.fail_next(Fault::Error {
+        path: "feed".into(),
+        code: ErrorCode::StaleTimestamp,
+        current: json!({ "server_time": pubky_switch_core::time::rfc3339(w.clock.now_ms() + 3_600_000) }),
+    });
+    let Err(AppError::Switch(crate::ClientError::Switch { code, .. })) = app.receive(None).await
+    else {
+        panic!("a second stale timestamp is the answer");
+    };
+    assert_eq!(code, ErrorCode::StaleTimestamp);
+}
+
+#[tokio::test]
+async fn test_app_refusal_before_the_lock_measures_no_service_time() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    app.receive(None).await.unwrap();
+    app.take_events();
+    let highest = app.highest_service_time();
+    let skew = app.clock_skew_ms();
+    assert!(highest.is_some());
+    // The account idles for days; its last stamped time stays where it was.
+    w.clock.advance_ms(3 * pubky_switch_core::records::DAY_MS);
+    // A refusal answered before the request verified carries that old time.
+    w.switch.fail_next(Fault::Error {
+        path: "feed".into(),
+        code: ErrorCode::BadSignature,
+        current: json!(null),
+    });
+    assert!(app.receive(None).await.is_err());
+    // So does a stale timestamp, whose retry at the time it names is refused again: that
+    // time, far ahead, counts for nothing either.
+    w.switch.fail_next(Fault::Error {
+        path: "feed".into(),
+        code: ErrorCode::StaleTimestamp,
+        current: json!({ "server_time": pubky_switch_core::time::rfc3339(w.clock.now_ms() + 30 * pubky_switch_core::records::DAY_MS) }),
+    });
+    assert!(app.receive(None).await.is_err());
+    let events = app.take_events();
+    assert!(
+        !has(&events, |e| matches!(e, AppEvent::ClockSkew { .. })),
+        "{events:?}"
+    );
+    assert_eq!(app.highest_service_time(), highest);
+    assert_eq!(app.clock_skew_ms(), skew);
+    // The next answer stamped at the switch measures the clock again.
+    app.receive(None).await.unwrap();
+    assert_eq!(app.highest_service_time(), Some(w.clock.now_ms()));
+    assert_eq!(app.clock_skew_ms(), Some(0));
+}
+
+#[tokio::test]
+async fn test_switch_cursor_set_behind_the_cursor_changes_nothing() {
+    use pubky_switch_core::ops::{OpsRequest, Position};
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let me = app.app_id();
+    w.note(me, "one");
+    app.receive(None).await.unwrap();
+    app.flush_cursor().await.unwrap();
+    let cursor = w.switch.app(&me).cursor;
+    assert!(cursor > 1);
+    let post = |seq: u64| {
+        let generation = w.switch.identity_doc().unwrap().generation();
+        let body = OpsRequest::new(&[], Some(Position { generation, seq })).to_json();
+        w.switch
+            .handle(&crate::transport::Request {
+                method: "POST".into(),
+                origin: crate::testing::SWITCH_ORIGIN.into(),
+                path_and_query: format!("/v1/{}/ops", w.alice.id()),
+                headers: vec![
+                    crate::transport::Header::new(
+                        pubky_switch_core::http::header::IDENTITY,
+                        &w.alice.id(),
+                    ),
+                    crate::transport::Header::new(
+                        pubky_switch_core::http::header::APP,
+                        &pubky_switch_core::enc::zbase32_encode(&me),
+                    ),
+                ],
+                body,
+            })
+            .unwrap()
+            .status
+    };
+    // Behind it, or at it: answered, and the cursor stays.
+    assert_eq!(post(cursor - 1), 200);
+    assert_eq!(w.switch.app(&me).cursor, cursor);
+    assert_eq!(post(cursor), 200);
+    assert_eq!(w.switch.app(&me).cursor, cursor);
 }

@@ -10,8 +10,8 @@ use std::collections::BTreeMap;
 use pubky_switch_core::chain::{ItemType, ProofState};
 use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::ops::{
-    AllowKind, AppPutEffect, BATCH_PROOFS_MS, BatchEffect, BatchRecord, CertPutEffect, Held,
-    KeyBundleEffect, KeyBundlePut, OpKind, Position, ReceiveKeyEffect, Refusal, RetryCheck,
+    AllowKind, AppPutEffect, BATCH_PROOFS_MS, BatchEffect, BatchRecord, CertPutEffect, CursorMove,
+    Held, KeyBundleEffect, KeyBundlePut, OpKind, Position, ReceiveKeyEffect, Refusal, RetryCheck,
     SignedOp, Writer, batch_effect, check_app_put, check_batch, check_cert_put, check_conditions,
     check_cursor, check_key_bundle_put, check_permission, check_receive_key_put, check_shape,
     ops_hash, retry_check,
@@ -242,8 +242,17 @@ impl Inner {
         };
         // Step 10, within the bounds of the sequence (Switch wire 6.2).
         if let (Some(app), Some(position)) = (caller, cursor) {
-            check_cursor(position, generation, self.continued_from, self.seq)?;
-            draft.apps.entry(app).or_default().cursor = position.seq;
+            let held = &mut draft.apps.entry(app).or_default().cursor;
+            if check_cursor(
+                position,
+                generation,
+                self.continued_from,
+                self.seq,
+                Some(*held),
+            )? == CursorMove::Moves
+            {
+                *held = position.seq;
+            }
         }
         if effect == BatchEffect::Unchanged {
             self.commit(draft);
@@ -307,34 +316,67 @@ impl Inner {
     /// an app without a record, the record of the batch's first `app.put` naming it. The app
     /// is current with it, and it hasn't expired.
     fn authenticate(&self, app: [u8; 16], signed: &[SignedDoc]) -> Result<AppCert, Fail> {
-        let held = self.apps.get(&app);
-        if held.is_some_and(|a| a.departed) {
-            return Err(not_current("the app is revoked or departed").into());
-        }
-        let listed = |cert: &AppCert| {
-            self.doc
-                .as_ref()
-                .map(|doc| doc.standing(&app, &cert.hash()))
-        };
-        let cert = match held.and_then(|a| a.cert.clone()) {
-            Some(record_cert) => match held.and_then(|a| a.renewed.clone()) {
-                Some(renewed) if listed(&renewed) == Some(Standing::Listed) => renewed,
-                _ => record_cert,
-            },
+        let cert = match self.held_cert(&app)? {
+            Some(cert) => cert,
             None => self.first_call(app, signed)?,
         };
+        Ok(self.current_with(&app, cert)?)
+    }
+
+    /// An own app's call other than a batch (Switch wire 7.2, 3.8): it must have delivered
+    /// its record, and be current, with an unexpired certificate, as for a batch. So an app
+    /// whose certificate has expired is refused everything, its feed read included, until
+    /// the newest `identity.json` lists a renewed certificate stored for it (Switch spec 3.2).
+    ///
+    /// # Errors
+    ///
+    /// `403 not_current` or `403 cert_expired`.
+    pub(super) fn own_call(&self, app: &[u8; 16]) -> Result<AppCert, Refusal> {
+        let cert = self
+            .held_cert(app)?
+            .ok_or_else(|| not_current("an own app's first call carries its app.put"))?;
+        self.current_with(app, cert)
+    }
+
+    /// The certificate the switch holds to check `app` against (Switch wire 3.8 "Which
+    /// certificate"): a stored renewed one once the newest `identity.json` lists it, else
+    /// its record's; `None` before its first `app.put`.
+    fn held_cert(&self, app: &[u8; 16]) -> Result<Option<AppCert>, Refusal> {
+        if self.apps.get(app).is_some_and(|a| a.departed) {
+            return Err(not_current("the app is revoked or departed"));
+        }
+        Ok(self.checked_cert(app))
+    }
+
+    /// The certificate the switch checks `app` against, whatever its standing (Switch wire
+    /// 3.8 "Which certificate", 7.4.12 `cert_expires_at`): a stored renewed one once the
+    /// newest `identity.json` lists it, else its record's; `None` before its first `app.put`.
+    pub(super) fn checked_cert(&self, app: &[u8; 16]) -> Option<AppCert> {
+        let held = self.apps.get(app)?;
+        let record_cert = held.cert.clone()?;
+        Some(match held.renewed.clone() {
+            Some(renewed) if self.standing(app, &renewed) == Some(Standing::Listed) => renewed,
+            _ => record_cert,
+        })
+    }
+
+    fn standing(&self, app: &[u8; 16], cert: &AppCert) -> Option<Standing> {
+        self.doc.as_ref().map(|doc| doc.standing(app, &cert.hash()))
+    }
+
+    /// Checks 5 and 3 of Switch wire 3.8 on the certificate `app` is checked against.
+    fn current_with(&self, app: &[u8; 16], cert: AppCert) -> Result<AppCert, Refusal> {
         if !matches!(
-            listed(&cert),
+            self.standing(app, &cert),
             Some(Standing::Listed | Standing::RenewedOpen)
         ) {
-            return Err(not_current("the app isn't listed with its certificate").into());
+            return Err(not_current("the app isn't listed with its certificate"));
         }
         if cert.expired_at(self.now()) {
             return Err(Refusal::new(
                 ErrorCode::CertExpired,
                 "Switch wire 7.2: the certificate has expired",
-            )
-            .into());
+            ));
         }
         Ok(cert)
     }
@@ -498,8 +540,9 @@ impl Inner {
         })
     }
 
-    /// `key_bundle.put`, by [`check_key_bundle_put`]. A pending full-bundle request ends once
-    /// the stored parts cover every data epoch from 1 to the current one (Switch wire 6.2).
+    /// `key_bundle.put`, by [`check_key_bundle_put`], for an app the newest `identity.json`
+    /// lists, whatever its certificate's expiry. A pending full-bundle request ends once the
+    /// stored parts cover every data epoch from 1 to the current one (Switch wire 6.2).
     fn key_bundle_put(
         &self,
         draft: &mut Draft,
@@ -507,10 +550,10 @@ impl Inner {
         seq: u64,
     ) -> Result<ProofState, Fail> {
         let target = put.target_app_id;
-        let current = self.app_current(&draft.apps, &target);
+        let withdrawn = draft.apps.get(&target).is_some_and(|app| app.departed);
         let parts = draft.bundles.entry(target).or_default();
         let stored: Vec<KeyBundlePut> = parts.iter().map(|(part, _)| part.clone()).collect();
-        let bundle_seq = match check_key_bundle_put(put, current, &stored)? {
+        let bundle_seq = match check_key_bundle_put(put, self.doc.as_ref(), withdrawn, &stored)? {
             KeyBundleEffect::Unchanged => parts
                 .iter()
                 .find(|(part, _)| part == put)
@@ -536,7 +579,8 @@ impl Inner {
         Ok(ProofState::KeyBundle { bundle_seq })
     }
 
-    /// `cert.put`, by [`check_cert_put`].
+    /// `cert.put`, by [`check_cert_put`], for an app the newest `identity.json` lists,
+    /// whatever its certificate's expiry.
     fn cert_put(
         &self,
         draft: &mut Draft,
@@ -545,9 +589,14 @@ impl Inner {
     ) -> Result<ProofState, Fail> {
         let renewed = AppCert::verify(cert, &self.identity.public()).map_err(Refusal::from)?;
         let held = draft.apps.entry(*target).or_default();
-        let active = !held.departed && held.record.is_some();
-        if check_cert_put(&renewed, held.cert.as_ref(), active, held.renewed.as_ref())?
-            == CertPutEffect::Stores
+        let record_cert = held.cert.as_ref().filter(|_| held.record.is_some());
+        if check_cert_put(
+            &renewed,
+            record_cert,
+            self.doc.as_ref(),
+            held.departed,
+            held.renewed.as_ref(),
+        )? == CertPutEffect::Stores
         {
             held.renewed = Some(renewed);
         }

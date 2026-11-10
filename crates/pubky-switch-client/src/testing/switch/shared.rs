@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use pubky_switch_core::chain::ProofState;
+use pubky_switch_core::chain::{ProofState, TransitionProof};
 use pubky_switch_core::claims::{
     Claim, ClaimFields, ClaimLimits, ClaimTally, EntryContext, MAX_CLAIM_AGE_MS, apply_entry,
 };
@@ -226,6 +226,29 @@ impl Shared {
             version: RecordVersion::new(generation, seq),
             deleted: put.value_sealed.looks_like_delete(),
         })
+    }
+
+    /// The generations the kept proofs name (Switch wire 3.3 "Service keys"): each held
+    /// record's current write's proof, and each entry proof of a live claim, not a
+    /// tombstone. A proof that doesn't read is left out.
+    pub(crate) fn kept_proof_generations(&self) -> (Vec<u64>, Vec<u64>) {
+        let generation = |proof: &SignedDoc| {
+            TransitionProof::peek(proof)
+                .ok()
+                .map(|p| p.envelope().generation)
+        };
+        let records = self
+            .records
+            .values()
+            .filter_map(|held| generation(&held.proof))
+            .collect();
+        let entries = self
+            .entries
+            .iter()
+            .filter(|(key, _)| self.claims.get(*key).is_some_and(|c| !c.tombstone))
+            .flat_map(|(_, entries)| entries.iter().filter_map(|e| generation(&e.proof)))
+            .collect();
+        (records, entries)
     }
 
     /// Keep a written record with its proof.

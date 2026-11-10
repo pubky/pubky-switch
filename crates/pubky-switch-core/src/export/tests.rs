@@ -11,7 +11,8 @@ use crate::chain::{
     TransitionProof, item_hash,
 };
 use crate::claims::{
-    Claim, ClaimFields, ClaimLimits, ClaimTally, ClaimType, EntryContext, Outcome, Pin, apply_entry,
+    Basis, Claim, ClaimFields, ClaimLimits, ClaimTally, ClaimType, EntryContext, Outcome, Pin,
+    apply_entry,
 };
 use crate::enc::{b64, pubky_id, zbase32_encode};
 use crate::http::ErrorCode;
@@ -3156,6 +3157,197 @@ fn test_activation_checkpoint_never_inside_a_batch() {
     refused(from(2), ErrorCode::Conflict, "the chain part at seq 4");
     // At the batch's last item, the export activates.
     from(3).unwrap();
+}
+
+const KEPT_FAILED: [u8; 16] = [42; 16];
+const KEPT_DONE: [u8; 16] = [43; 16];
+
+/// A claim's entries at the recovered account before compaction: the app opens and fails
+/// `KEPT_FAILED` (seqs 4 and 5, steps 0 and 1), then opens and settles `KEPT_DONE` (seqs 6
+/// and 7, steps 2 and 3). Every attempt is then `done` or `failed`, so the claim is
+/// compacted to a tombstone at step 4, which keeps its attempts and drops its entries.
+fn compacted_entries() -> Vec<ClaimFields> {
+    let mut done = claim_fields(ClaimType::Done, 3, KEPT_DONE);
+    done.basis = Some(Basis::Owner);
+    vec![
+        claim_fields(ClaimType::Attempt, 0, KEPT_FAILED),
+        claim_fields(ClaimType::Failed, 1, KEPT_FAILED),
+        claim_fields(ClaimType::Attempt, 2, KEPT_DONE),
+        done,
+    ]
+}
+
+/// The claim after an upload reopened that tombstone with the uploading app's open attempt
+/// `UPLOADED` (step 4): rebuilt from uploads, SETTLED, its kept attempts with the members
+/// the tombstone kept, at step 5.
+fn reopened_claim() -> ClaimState {
+    ClaimState {
+        step: 5,
+        attempts: vec![
+            attempt_state(KEPT_FAILED, Outcome::Failed, entry_time(4), false),
+            attempt_state(KEPT_DONE, Outcome::Done, entry_time(6), false),
+            attempt_state(UPLOADED, Outcome::Open, START - DAY, true),
+        ],
+        current: None,
+        settled: true,
+        divergent: false,
+        pinned_deadline: Pin::At(DEADLINE),
+        rebuilt: true,
+        creator: Some(app().app_id_bytes()),
+        last_entry_ms: Some(entry_time(7)),
+    }
+}
+
+#[test]
+fn test_activation_reopened_tombstone_activates_with_its_kept_attempts() {
+    // The compacted entries' chain items are stubs, and the claim carries none of them.
+    let (f, _) = recovered(&compacted_entries(), reopened_claim(), &[4, 5, 6, 7], &[]);
+    let import = f.run().unwrap();
+    assert_eq!(import.claims.len(), 1);
+    let claim = &import.claims[0].claim;
+    assert!(claim.rebuilt && claim.settled);
+    assert_eq!(claim.attempts.len(), 3);
+    // After the reopening, the owner reports `done` on its failed kept attempt (Switch wire
+    // 6.8 row 2, on a rebuilt claim; seq 8, step 5): its outcome is that entry's.
+    let mut entries = compacted_entries();
+    let mut done = claim_fields(ClaimType::Done, 5, KEPT_FAILED);
+    done.basis = Some(Basis::Owner);
+    entries.push(done);
+    let mut claim = reopened_claim();
+    claim.step = 6;
+    claim.attempts[0].outcome = Outcome::Done;
+    claim.attempts[0].duplicate = true;
+    claim.last_entry_ms = Some(entry_time(8));
+    recovered(&entries, claim.clone(), &[4, 5, 6, 7], &[8])
+        .0
+        .run()
+        .unwrap();
+    // That entry's outcome, not another.
+    claim.attempts[0].resolved_by = Some(other_app().app_id_bytes());
+    refused(
+        recovered(&entries, claim, &[4, 5, 6, 7], &[8]).0.run(),
+        ErrorCode::Conflict,
+        "an attempt's outcome isn't the one its latest entry gives",
+    );
+}
+
+#[test]
+fn test_activation_reopened_tombstone_refuses_what_no_tombstone_kept() {
+    let refused_with = |change: fn(&mut ClaimState), rule: &str| {
+        let mut claim = reopened_claim();
+        change(&mut claim);
+        let (f, _) = recovered(&compacted_entries(), claim, &[4, 5, 6, 7], &[]);
+        refused(f.run(), ErrorCode::Conflict, rule);
+    };
+    // A tombstone holds no open or unknown attempt.
+    for outcome in [Outcome::Open, Outcome::Unknown] {
+        let mut claim = reopened_claim();
+        claim.attempts[0].outcome = outcome;
+        if outcome == Outcome::Open {
+            claim.attempts[0].resolved_by = None;
+            claim.divergent = true;
+        }
+        let (f, _) = recovered(&compacted_entries(), claim, &[4, 5, 6, 7], &[]);
+        refused(
+            f.run(),
+            ErrorCode::Conflict,
+            "nor kept from a reopened tombstone",
+        );
+    }
+    // A tombstone is SETTLED, and the claim it reopens stays SETTLED: an attempt O calls kept
+    // can't free the obligation.
+    refused_with(
+        |c| {
+            c.attempts[1].outcome = Outcome::Failed;
+            c.settled = false;
+        },
+        "nor kept from a reopened tombstone",
+    );
+    // Kept attempts are never beside an attempt entry: compaction removed every entry before
+    // the reopening, and a SETTLED claim refuses every attempt after it.
+    let mut entries = compacted_entries();
+    entries.push(claim_fields(ClaimType::Attempt, 5, SECOND));
+    let mut claim = reopened_claim();
+    claim.step = 6;
+    claim
+        .attempts
+        .push(attempt_state(SECOND, Outcome::Open, entry_time(8), false));
+    claim.divergent = true;
+    claim.last_entry_ms = Some(entry_time(8));
+    refused(
+        recovered(&entries, claim, &[4, 5, 6, 7], &[8]).0.run(),
+        ErrorCode::Conflict,
+        "an attempt kept from a reopened tombstone beside an attempt entry",
+    );
+    // Only a rebuilt claim holds kept attempts: one not rebuilt is replayed from its entries.
+    let mut claim = reopened_claim();
+    claim.rebuilt = false;
+    claim.attempts.truncate(2);
+    refused(
+        recovered(&compacted_entries(), claim, &[4, 5, 6, 7], &[])
+            .0
+            .run(),
+        ErrorCode::Conflict,
+        "a live claim without entries",
+    );
+}
+
+#[test]
+fn test_activation_reopened_tombstone_evidence_of_a_kept_attempt() {
+    // The app's proof of its attempt `KEPT_FAILED` open, from before it was failed and the
+    // claim compacted: the reopened claim keeps it `failed`, which no entry it carries wrote,
+    // as a tombstone would. The claim stays SETTLED, so that frees nothing.
+    let (mut f, stubs) = recovered(&compacted_entries(), reopened_claim(), &[4, 5, 6, 7], &[]);
+    let shown = rebuilt_view(
+        1,
+        &[attempt_state(
+            KEPT_FAILED,
+            Outcome::Open,
+            entry_time(4),
+            false,
+        )],
+        Some(0),
+    );
+    let proof = TransitionProof::sign(
+        &old_key(),
+        &f.id,
+        ProofBody::new(
+            stubs[3].clone(),
+            b64(&CLAIM_KEY),
+            &ProofState::Claim(shown.to_value()),
+        ),
+    )
+    .unwrap();
+    f.uploads.proofs = vec![UploadedProof {
+        app_id: app().app_id_bytes(),
+        proof,
+    }];
+    f.run().unwrap();
+    // The uploading app's own uploaded attempt is still compared: shown open, held failed.
+    let shown = rebuilt_view(5, &reopened_claim().attempts, None);
+    let proof = TransitionProof::sign(
+        &old_key(),
+        &f.id,
+        ProofBody::new(
+            stubs[6].clone(),
+            b64(&CLAIM_KEY),
+            &ProofState::Claim(shown.to_value()),
+        ),
+    )
+    .unwrap();
+    let mut claim = reopened_claim();
+    claim.attempts[2].outcome = Outcome::Failed;
+    claim.attempts[2].resolved_by = Some(app().app_id_bytes());
+    let (mut f, _) = recovered(&compacted_entries(), claim, &[4, 5, 6, 7], &[]);
+    f.uploads.proofs = vec![UploadedProof {
+        app_id: app().app_id_bytes(),
+        proof,
+    }];
+    refused(
+        f.run(),
+        ErrorCode::Conflict,
+        "an attempt with another outcome than the import's",
+    );
 }
 
 #[test]

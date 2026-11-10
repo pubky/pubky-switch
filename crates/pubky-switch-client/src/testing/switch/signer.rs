@@ -10,8 +10,8 @@ use pubky_switch_core::enc::{b64, zbase32_encode};
 use pubky_switch_core::http::{ErrorCode, IdentityDelivery};
 use pubky_switch_core::json::parse_json;
 use pubky_switch_core::records::{
-    AccountView, AppCert, Delivery, DeliveryRefusal, Enrollment, EnrollmentAnswer, IdentityDoc,
-    KeptProofs, Limits, Standing, check_delivery,
+    AccountView, Delivery, DeliveryRefusal, Enrollment, EnrollmentAnswer, IdentityDoc, KeptProofs,
+    Limits, check_delivery, needed_generations,
 };
 use pubky_switch_core::sig::SignedDoc;
 use serde_json::{Value, json};
@@ -19,6 +19,9 @@ use serde_json::{Value, json};
 use super::{Answer, Inner, SWITCH_ORIGIN, ScriptedSwitch, bad};
 use crate::clock::TestClock;
 use crate::testing::ScriptError;
+
+/// A generation and the service key that verifies its proofs (Switch wire 3.3).
+type GenerationKey = (u64, [u8; 32]);
 
 /// What an enrolled account holds of its enrollments (Switch wire 3.7).
 #[derive(Clone, Debug, Default)]
@@ -196,6 +199,7 @@ impl Inner {
         };
         let app_limit = self.enrolled.as_ref().map_or(0, |e| e.limits.app_limit);
         let kept = self.kept_app_ids.clone();
+        let (records, claim_entries) = self.kept_proof_keys();
         let view = AccountView {
             held: self.doc.as_ref(),
             app_limit,
@@ -203,7 +207,10 @@ impl Inner {
             origin: SWITCH_ORIGIN,
             pending_key: None,
             kept_app_ids: &kept,
-            kept_proofs: KeptProofs::default(),
+            kept_proofs: KeptProofs {
+                records: &records,
+                claim_entries: &claim_entries,
+            },
         };
         match check_delivery(&view, &doc, delivery.prev.as_ref()) {
             Ok(Delivery::New(_)) => {
@@ -262,24 +269,25 @@ impl Inner {
         Some(held)
     }
 
-    /// The certificate the switch checks `app` against (Switch wire 7.2): a stored renewed
-    /// certificate once the newest `identity.json` lists it, else its record's.
-    fn checked_cert(&self, app: &[u8; 16]) -> Option<&AppCert> {
-        let held = self.apps.get(app)?;
-        let listed = |cert: &AppCert| {
-            self.doc
-                .as_ref()
-                .is_some_and(|doc| doc.standing(app, &cert.hash()) == Standing::Listed)
+    /// The kept proofs' generations, each with the key that verifies its proofs: an earlier
+    /// generation's an import carried, else this switch's own (Switch wire 3.3 "Service
+    /// keys"); held records' first, then live claims' entries'.
+    fn kept_proof_keys(&self) -> (Vec<GenerationKey>, Vec<GenerationKey>) {
+        let own = self.service.verifying_key().to_bytes();
+        let keyed = |generations: Vec<u64>| -> Vec<GenerationKey> {
+            generations
+                .into_iter()
+                .map(|g| (g, self.proof_keys.get(&g).copied().unwrap_or(own)))
+                .collect()
         };
-        held.renewed
-            .as_ref()
-            .filter(|renewed| listed(renewed))
-            .or(held.cert.as_ref())
+        let (records, entries) = self.shared.kept_proof_generations();
+        (keyed(records), keyed(entries))
     }
 
     /// `GET /v1/{id}/apps` (Switch wire 7.4.12): every app the switch holds or the newest
-    /// `identity.json` lists, the recovery in progress and the newest document. The scripted
-    /// switch reports no proof generations and no last-seen times.
+    /// `identity.json` lists, the recovery in progress, the newest document, and the
+    /// generations the kept proofs name but those the newest document declares lost. The
+    /// scripted switch reports no last-seen times.
     pub(super) fn apps_answer(&self) -> Answer {
         let mut ids: BTreeSet<[u8; 16]> = self.apps.keys().copied().collect();
         if let Some(doc) = &self.doc {
@@ -320,22 +328,30 @@ impl Inner {
                     "keys_through": self.keys_through(id),
                     "full_bundle_requested": null,
                     "bundle_ranges": ranges,
-                    "cert_expires_at": self.checked_cert(id)
-                        .map(|c| pubky_switch_core::time::rfc3339(c.expires_at())),
+                    "cert_expires_at": self
+                        .checked_cert(id)
+                        .map(|cert| pubky_switch_core::time::rfc3339(cert.expires_at())),
                 })
             })
             .collect();
         let recovery = self.recovery_from.map(|from| {
-            json!({ "recovery_from": from, "declared_at": pubky_switch_core::time::rfc3339(0),
+            let declared_at = self.recovery_declared_at.unwrap_or_default();
+            json!({ "recovery_from": from,
+                    "declared_at": pubky_switch_core::time::rfc3339(declared_at),
                     "admission_staged": false })
         });
-        let mut answer = json!({ "apps": apps, "proof_generations": [] });
-        if let Some(recovery) = recovery {
-            answer["recovery"] = recovery;
-        }
-        if let Some(doc) = &self.doc {
-            answer["identity"] = serde_json::to_value(doc.signed()).unwrap_or(Value::Null);
-        }
-        (200, answer)
+        let (records, entries) = self.shared.kept_proof_generations();
+        let recovery_from = self.doc.as_ref().and_then(|d| d.body().recovery_from);
+        let proof_generations = needed_generations(&records, &entries, recovery_from);
+        let identity = self
+            .doc
+            .as_ref()
+            .and_then(|doc| serde_json::to_value(doc.signed()).ok())
+            .unwrap_or(Value::Null);
+        (
+            200,
+            json!({ "apps": apps, "identity": identity, "recovery": recovery,
+                    "proof_generations": proof_generations }),
+        )
     }
 }

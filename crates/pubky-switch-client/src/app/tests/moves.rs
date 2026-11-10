@@ -2043,3 +2043,157 @@ async fn test_chain_hashes_behind_the_cursor_stay_bounded() {
     assert!(received(&app.receive(None).await.unwrap().events, seq));
     assert!(app.alarm().is_none());
 }
+
+// -------------------------------------------------------------------------------------
+// The signer's view of kept proofs (Switch wire 3.3 "Service keys", 7.4.12)
+
+/// A signer's call at `switch`, unsigned, as the scripted switch takes it.
+fn signer_call(
+    w: &World,
+    switch: &ScriptedSwitch,
+    method: &str,
+    route: &str,
+    body: Vec<u8>,
+) -> (u16, serde_json::Value) {
+    let response = switch
+        .handle(&crate::transport::Request {
+            method: method.into(),
+            origin: ORIGIN.into(),
+            path_and_query: format!("/v1/{}/{route}", w.alice.id()),
+            headers: Vec::new(),
+            body,
+        })
+        .unwrap();
+    (
+        response.status,
+        serde_json::from_slice(&response.body).unwrap(),
+    )
+}
+
+/// The signer delivers `doc`, built on `prev`, to `switch` (Switch wire 7.4.2).
+fn deliver(
+    w: &World,
+    switch: &ScriptedSwitch,
+    doc: &IdentityDoc,
+    prev: &IdentityDoc,
+) -> (u16, serde_json::Value) {
+    let delivery = pubky_switch_core::http::IdentityDelivery {
+        identity: doc.signed().clone(),
+        prev: Some(prev.hash()),
+    };
+    signer_call(w, switch, "PUT", "identity", delivery.to_json())
+}
+
+#[tokio::test]
+async fn test_move_kept_proofs_keep_their_generation_key() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let _app = join_on(
+        &w,
+        &router,
+        Arc::clone(&w.store) as Arc<dyn StateStore>,
+        w.protocol.clone(),
+        &[Permission::ClaimsWrite, Permission::ConversationAdd],
+    )
+    .await;
+    // A live claim at generation 1: its entry's proof is checked with generation 1's key.
+    w.switch
+        .app_op(
+            &app_keys("wallet"),
+            OpKind::Claim(pubky_switch_core::claims::ClaimFields {
+                claim_key: vec![7; 32],
+                kind: pubky_switch_core::claims::ClaimType::Attempt,
+                expected_step: 0,
+                attempt_id: vec![8; 16],
+                orphan_after: Some(86_400),
+                deadline: None,
+                basis: None,
+                evidence_ref: None,
+            }),
+        )
+        .unwrap();
+    assert_eq!(
+        signer_call(&w, &w.switch, "GET", "apps", Vec::new()).1["proof_generations"],
+        serde_json::json!([1])
+    );
+    let old_key = w.switch.service_key();
+    let n_key = next_key();
+    w.switch.freeze(&freeze_for(&w, &n_key, 2)).unwrap();
+    let next = w.switch.import_into(n_key.to_bytes());
+    let held = next.identity_doc().unwrap();
+    // The document naming the next service keeps generation 1's key.
+    let named = w
+        .signer
+        .sign_next(|body| {
+            body.generation = 2;
+            body.inbox = Inbox::new(NEXT, n_key.verifying_key().to_bytes());
+            body.service_keys = vec![pubky_switch_core::records::ServiceKeyEntry {
+                generation: 1,
+                key: old_key,
+            }];
+        })
+        .unwrap();
+    assert_eq!(deliver(&w, &next, &named, &held).0, 200);
+    let (status, apps) = signer_call(&w, &next, "GET", "apps", Vec::new());
+    assert_eq!(status, 200);
+    assert_eq!(apps["proof_generations"], serde_json::json!([1]));
+    // A later version that drops it is refused, naming the generation.
+    let dropped = w
+        .signer
+        .sign_next(|body| body.service_keys.clear())
+        .unwrap();
+    let (status, answer) = deliver(&w, &next, &dropped, &named);
+    assert_eq!(status, 409, "{answer}");
+    assert_eq!(answer["code"], "conflict");
+    assert_eq!(
+        answer["current"]["proof_generations"],
+        serde_json::json!([1])
+    );
+    // So is one that lists another key for it.
+    let wrong = w
+        .signer
+        .sign_next(|body| {
+            body.service_keys = vec![pubky_switch_core::records::ServiceKeyEntry {
+                generation: 1,
+                key: [9; 32],
+            }];
+        })
+        .unwrap();
+    assert_eq!(deliver(&w, &next, &wrong, &named).0, 409);
+    assert_eq!(next.identity_doc().unwrap().hash(), named.hash());
+}
+
+#[tokio::test]
+async fn test_apps_answer_reports_what_the_switch_holds() {
+    let w = World::new();
+    let app = w.join("wallet").await;
+    let (_, apps) = signer_call(&w, &w.switch, "GET", "apps", Vec::new());
+    assert_eq!(apps["recovery"], serde_json::Value::Null);
+    assert!(apps["identity"].is_object());
+    let wallet = apps["apps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["app_id"] == pubky_switch_core::enc::zbase32_encode(&app.app_id()))
+        .unwrap()
+        .clone();
+    assert_eq!(
+        wallet["cert_expires_at"],
+        pubky_switch_core::time::rfc3339(app.cert().expires_at())
+    );
+    // No document held: `identity` is null, not left out.
+    let empty = ScriptedSwitch::new(&w.alice, [5; 32], Arc::clone(&w.clock));
+    let (_, apps) = signer_call(&w, &empty, "GET", "apps", Vec::new());
+    assert_eq!(apps.get("identity"), Some(&serde_json::Value::Null));
+    // A recovery reports when it was declared.
+    w.clock.advance_ms(5_000);
+    let declared = w.clock.now_ms();
+    let recovering =
+        ScriptedSwitch::recovering(&w.alice, [6; 32], Arc::clone(&w.clock), 2, 1).unwrap();
+    w.clock.advance_ms(5_000);
+    let (_, apps) = signer_call(&w, &recovering, "GET", "apps", Vec::new());
+    assert_eq!(
+        apps["recovery"]["declared_at"],
+        pubky_switch_core::time::rfc3339(declared)
+    );
+}

@@ -192,6 +192,12 @@ pub(crate) struct Inner {
     pub(crate) recovery_from: Option<u64>,
     /// The generation an imported sequence continues from, after a cooperative move.
     pub(crate) continued_from: Option<u64>,
+    /// When the recovery was declared: its recovery record's time (Switch spec 12.6 step 1).
+    pub(crate) recovery_declared_at: Option<u64>,
+    /// The service keys of the earlier generations whose proofs an import carried, by
+    /// generation (Switch wire 3.3 "Service keys"); a proof of another generation is this
+    /// switch's own.
+    pub(crate) proof_keys: BTreeMap<u64, [u8; 32]>,
     /// An app's first receive key record may carry any `n` (after a provider loss).
     pub(crate) any_first_n: bool,
     /// The recovery uploads taken: the body, and whether it came with `Switch-Cert`.
@@ -236,6 +242,10 @@ pub(crate) struct Inner {
     pub(crate) enroll_limits: pubky_switch_core::records::Limits,
     /// The data epoch of the first delivered `identity.json` that listed each app.
     pub(crate) listed_at_epoch: BTreeMap<[u8; 16], u64>,
+    /// The identity's service time, the last the switch stamped: a request refused before
+    /// the account's lock, such as a `401 stale_timestamp`, answers with it and doesn't
+    /// move it (Switch wire 7.1).
+    pub(crate) stamped_ms: u64,
 }
 
 impl Inner {
@@ -245,7 +255,9 @@ impl Inner {
         clock: Arc<TestClock>,
         tip: ChainTip,
     ) -> Self {
+        let stamped_ms = clock.now_ms();
         Self {
+            stamped_ms,
             identity,
             service,
             clock,
@@ -268,6 +280,8 @@ impl Inner {
             erased: false,
             recovery_from: None,
             continued_from: None,
+            recovery_declared_at: None,
+            proof_keys: BTreeMap::new(),
             any_first_n: false,
             uploads: Vec::new(),
             push: BTreeMap::new(),
@@ -380,6 +394,7 @@ impl ScriptedSwitch {
             inner.recovery_from = Some(recovery_from);
             inner.any_first_n = true;
             let at = inner.now();
+            inner.recovery_declared_at = Some(at);
             inner.service_transition(ServiceTransition::Recovery { recovery_from, at })?;
         }
         Ok(switch)
@@ -398,6 +413,12 @@ impl ScriptedSwitch {
         );
         next.seq = inner.seq;
         next.continued_from = Some(inner.tip.generation);
+        // The proofs this switch signed travel with the records and claims, checked with its
+        // key for its generation (Switch wire 3.3).
+        next.proof_keys = inner.proof_keys.clone();
+        next.proof_keys
+            .entry(inner.tip.generation)
+            .or_insert_with(|| inner.service.verifying_key().to_bytes());
         next.items = inner.items.clone();
         next.tips = inner.tips.clone();
         next.doc = inner.doc.clone();
@@ -559,6 +580,12 @@ impl ScriptedSwitch {
             match inner.faults.remove(index) {
                 Some(Fault::Error { code, current, .. }) => {
                     let (status, body) = bad(code, "scripted", current);
+                    // A `401` is answered before the request verifies, so before the lock:
+                    // with the last stamped time and no head (Switch wire 7.1).
+                    if status == 401 {
+                        let at = inner.stamped_ms;
+                        return Ok(inner.respond_at(&inner.service, request, status, &body, at));
+                    }
                     return Ok(inner.respond(request, status, &body));
                 }
                 Some(Fault::LoseAnswer { .. }) => lose = true,
@@ -577,6 +604,9 @@ impl ScriptedSwitch {
                 return Err(TransportError::Timeout);
             }
             return Ok(inner.respond(request, status, &body));
+        }
+        if let Some(answer) = inner.stale_timestamp(request) {
+            return Ok(answer);
         }
         if let Some((status, body)) = inner.gate(&request.method, &path) {
             if inner.erased || inner.enrolled.is_none() {
@@ -750,8 +780,19 @@ impl ScriptedSwitch {
     /// [`ScriptError::Refused`] with the switch's error answer, or a batch or proof that
     /// doesn't sign.
     pub fn signer_op(&self, kind: OpKind) -> Result<u64, ScriptError> {
+        self.signer_batch(vec![kind])
+    }
+
+    /// Operations of the signer in one batch, applied as a submitted batch is, all or none,
+    /// such as a renewal's `cert.put` and the first `key_bundle.put` of its full bundle
+    /// (Switch wire 3.8 step 1). Returns the `seq` after them.
+    ///
+    /// # Errors
+    ///
+    /// As [`ScriptedSwitch::signer_op`].
+    pub fn signer_batch(&self, kinds: Vec<OpKind>) -> Result<u64, ScriptError> {
         let key = clone_key(&self.lock().identity);
-        self.inject(&key, None, kind)
+        self.inject(&key, None, kinds)
     }
 
     /// An operation an app with `keys` signs, in a batch of its own, applied as a submitted
@@ -763,14 +804,14 @@ impl ScriptedSwitch {
     ///
     /// As [`ScriptedSwitch::signer_op`].
     pub fn app_op(&self, keys: &AppKeys, kind: OpKind) -> Result<u64, ScriptError> {
-        self.inject(keys, Some(keys.app_id_bytes()), kind)
+        self.inject(keys, Some(keys.app_id_bytes()), vec![kind])
     }
 
     fn inject(
         &self,
         writer: &impl Signs,
         app_id: Option<[u8; 16]>,
-        kind: OpKind,
+        kinds: Vec<OpKind>,
     ) -> Result<u64, ScriptError> {
         let mut inner = self.lock();
         let account = inner.identity.public();
@@ -781,7 +822,7 @@ impl ScriptedSwitch {
             app_id,
             inner.tip.generation,
             random_batch_id()?,
-            vec![(vec![], kind)],
+            kinds.into_iter().map(|kind| (vec![], kind)).collect(),
         )?;
         let signed: Vec<SignedDoc> = ops.iter().map(|op| op.signed().clone()).collect();
         let (status, body) = match inner.gate("POST", &path) {
@@ -903,8 +944,46 @@ impl Inner {
         SignedHead::sign(&self.service, &self.identity.public(), &self.tip)
     }
 
+    /// An answer under the account's key. One to an own app or the signer carries the head
+    /// in `Switch-Head`, refusals included, once the request verified: never on a `401`,
+    /// answered before that, nor to an enrollment or an erasure (Switch wire 7.1).
     fn respond(&self, request: &Request, status: u16, body: &Value) -> Response {
-        self.respond_with(&self.service, request, status, body)
+        let mut response = self.respond_with(&self.service, request, status, body);
+        let own =
+            request.header(header::IDENTITY) == Some(pubky_id(&self.identity.public()).as_str());
+        let path = request.path_and_query.as_str();
+        if own && status != 401 && !path.ends_with("/enroll") && !path.ends_with("/erase") {
+            response
+                .headers
+                .push(Header::new(header::HEAD, &self.head().to_header()));
+        }
+        response
+    }
+
+    /// A `Switch-Timestamp` more than 5 minutes from the time base, at an account the switch
+    /// holds, is `401 stale_timestamp` (Switch wire 7.1, 7.6): `current.server_time` is the
+    /// time base, for the retry's timestamp, and `Switch-Server-Time` the last time stamped,
+    /// which the refusal, answered before the account's lock, doesn't move. A request that
+    /// passes stamps the time. A missing or unparsable timestamp isn't checked.
+    fn stale_timestamp(&mut self, request: &Request) -> Option<Response> {
+        if self.erased || self.enrolled.is_none() {
+            return None;
+        }
+        let now = self.now();
+        let stale = request
+            .header(header::TIMESTAMP)
+            .and_then(|text| pubky_switch_core::time::parse_rfc3339(text).ok())
+            .is_some_and(|at| at.abs_diff(now) > pubky_switch_core::records::CLOCK_TOLERANCE_MS);
+        if !stale {
+            self.stamped_ms = self.stamped_ms.max(now);
+            return None;
+        }
+        let (status, body) = bad(
+            ErrorCode::StaleTimestamp,
+            "Switch wire 7.1: the timestamp is more than 5 minutes from the service's time",
+            json!({ "server_time": rfc3339(now) }),
+        );
+        Some(self.respond_at(&self.service, request, status, &body, self.stamped_ms))
     }
 
     fn respond_with(
@@ -914,8 +993,20 @@ impl Inner {
         status: u16,
         body: &Value,
     ) -> Response {
+        self.respond_at(key, request, status, body, self.now())
+    }
+
+    /// An answer whose `Switch-Server-Time` is `at`.
+    fn respond_at(
+        &self,
+        key: &SigningKey,
+        request: &Request,
+        status: u16,
+        body: &Value,
+        at: u64,
+    ) -> Response {
         let bytes = body.to_string().into_bytes();
-        let server_time = rfc3339(self.now());
+        let server_time = rfc3339(at);
         let request_signature = request_signature_of(request.header(header::SIGNATURE));
         let signature = sign_response(
             key,
@@ -1102,8 +1193,8 @@ impl Inner {
         let Some(app) = caller else {
             return bad(ErrorCode::PermissionMissing, "own apps only", json!(null));
         };
-        if self.apps.get(&app).is_some_and(|a| a.departed) {
-            return bad(ErrorCode::NotCurrent, "departed", json!({}));
+        if let Err(refusal) = self.own_call(&app) {
+            return batch::refused(&refusal);
         }
         if self
             .feed_limit
