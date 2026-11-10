@@ -64,14 +64,20 @@ service.
   test switch only.
 - **App currency outside batches**: other routes check only that the app hasn't departed.
 - **`POST /v1/enroll`** (Switch wire 3.7, 7.4.1), in `switch/signer.rs`: only at
-  [`SWITCH_ORIGIN`], with the default limits. A switch made with `unenrolled` answers every
-  other call with the operator's `404` until then; the same enrollment again gets the same
-  answer. A serving account answers no pending key for the next generation, so no key change
-  in place or provider loss at the same service.
+  [`SWITCH_ORIGIN`], with the default limits, and without checking the request signature. A
+  switch made with `unenrolled` answers every other call with the operator's `404` until
+  then. As at the service, the enrollment that makes the account sets its kept App IDs, and
+  every later one gets the same key and changes nothing. Unlike the service:
+  - an enrollment's `identity_doc` isn't held, so the account starts with no document and
+    at the switch's own generation, whatever the enrollment names;
+  - a serving account is answered `400`, never a pending key for the next generation, so
+    there is no key change in place and no provider loss at the same service.
 - **`PUT /identity`** (Switch wire 3.3, 7.4.2), in `switch/signer.rs`: judged by the core's
-  `check_delivery`, but with no kept proofs (`proof_keys` empty) and no pending key, so it
-  never answers `409 conflict` for a left-out service key and takes no generation change at
-  a serving account. The test call `deliver_identity` takes any document, without those
+  `check_delivery`, like the service, with no kept proofs (`proof_keys` empty, as at the
+  service until it serves operations). Unlike the service: there is no pending key, so no
+  generation change at a serving account; a first document carrying `recovery_from`, or at
+  another generation than the switch's, is chained where the service answers `503`; and the
+  answer carries the head in its body only, not in `Switch-Head`. The test call `deliver_identity` takes any document, without those
   checks, for scripting what another signer or a faulty service did.
 - **`GET /apps`** (Switch wire 7.4.12): the apps the switch holds or the newest document
   lists, with `current`, `record_cert` and `bundle_ranges`; no last-seen times, attempts,

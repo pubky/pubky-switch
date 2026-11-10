@@ -48,7 +48,7 @@ impl ScriptedSwitch {
         switch
     }
 
-    /// The App IDs the account keeps for good from its enrollments.
+    /// The App IDs the account keeps for good from the enrollment that made it.
     pub fn kept_app_ids(&self) -> Vec<[u8; 16]> {
         self.lock().kept_app_ids.clone()
     }
@@ -84,6 +84,7 @@ impl Inner {
                 json!(null),
             ));
         }
+        let creating = self.enrolled.is_none();
         let enrolled = self.enrolled.get_or_insert_with(Enrolled::default);
         if let Some(answer) = enrolled.answers.get(&enrollment.hash()) {
             return Ok((200, answer.clone()));
@@ -92,14 +93,12 @@ impl Inner {
         let answer = EnrollmentAnswer::new(&enrollment, service_key, enrolled.limits);
         let value: Value = serde_json::from_slice(&answer.to_json()?)?;
         enrolled.answers.insert(enrollment.hash(), value.clone());
-        // The enrollments' App IDs are kept for good, from the first (Switch wire 3.7).
-        let kept: BTreeSet<[u8; 16]> = self
-            .kept_app_ids
-            .iter()
-            .chain(enrollment.revoked_apps())
-            .copied()
-            .collect();
-        self.kept_app_ids = kept.into_iter().collect();
+        // The enrollment that makes the account names the App IDs it keeps for good; another
+        // enrollment for an existing account changes nothing (Switch wire 3.7).
+        if creating {
+            let kept: BTreeSet<[u8; 16]> = enrollment.revoked_apps().iter().copied().collect();
+            self.kept_app_ids = kept.into_iter().collect();
+        }
         Ok((200, value))
     }
 

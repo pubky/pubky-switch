@@ -3,16 +3,20 @@
 //! its records (Switch spec 4.3, 12.8; Switch wire 3.3, 3.7, 3.13, 7.4.1, 7.4.2).
 //!
 //! Every network effect follows one rule: sign the artifact and commit it with the flow's
-//! next step, send exactly those bytes until there is an answer, then commit the outcome. A
-//! crash anywhere is finished by [`Signer::resume`], which resends the bytes kept, so
-//! nothing is signed twice (Switch wire 2.1).
+//! next step, send exactly those bytes until there is an answer, then commit the outcome. The
+//! signer takes a new state as its own only once the store holds it. A crash anywhere is
+//! finished by [`Signer::resume`], which resends the bytes kept, so nothing is signed twice
+//! (Switch wire 2.1).
 //!
 //! A new version takes these steps (Switch spec 4.3, Switch wire 3.13):
 //!
 //! 1. this install must be the one named;
-//! 2. sign the version, naming this install as `signer`, and commit it;
+//! 2. sign the version, naming this install as `signer`, above every version this install
+//!    signed before, and commit it;
 //! 3. read the backup on the Homeserver: one naming another install at or past the high-water
-//!    mark means that install took over, and this one stops;
+//!    mark means that install took over, and this one stops. One that doesn't open, or none
+//!    where this signer wrote one, stops it too, unless the switch still holds the high-water
+//!    version;
 //! 4. write the backup holding the new version; a failed write stops the delivery;
 //! 5. deliver it with `PUT /identity`, naming the version it builds on;
 //! 6. take the answer: success moves the high-water mark; `409 stale_identity` carries the
@@ -25,7 +29,7 @@ use std::sync::Arc;
 use pubky_switch_client::clock::Clock;
 use pubky_switch_client::store::StoreHandle;
 use pubky_switch_client::transport::Transport;
-use pubky_switch_client::{ClientError, Credentials, SwitchClient};
+use pubky_switch_client::{ClientError, Credentials, StoreError, SwitchClient};
 use pubky_switch_core::enc::{pubky_id, random_bytes};
 use pubky_switch_core::http::{ErrorCode, IdentityDelivery};
 use pubky_switch_core::keys::IdentityKey;
@@ -115,6 +119,9 @@ pub struct Signer {
     keyring: IdentityKeyring,
     state: SignerState,
     flow: Option<Flow>,
+    /// A commit answered that the store can't tell whether it applied: the records and the
+    /// flow are read again before the next step.
+    unsure: bool,
 }
 
 impl std::fmt::Debug for Signer {
@@ -159,18 +166,20 @@ impl Signer {
         };
         // The enrollment's own check refuses an origin that isn't a switch origin.
         Enrollment::verify(enrollment.signed(), &identity, origin)?;
-        let signer = Self {
+        let state = SignerState::new(identity, install);
+        let flow = Flow::Enroll {
+            origin: origin.to_owned(),
+            enrollment: enrollment.signed().clone(),
+            policy,
+        };
+        state::save(&env.store, &state, Some(&flow)).await?;
+        Ok(Self {
             env,
             keyring,
-            state: SignerState::new(identity, install),
-            flow: Some(Flow::Enroll {
-                origin: origin.to_owned(),
-                enrollment: enrollment.signed().clone(),
-                policy,
-            }),
-        };
-        signer.save().await?;
-        Ok(signer)
+            state,
+            flow: Some(flow),
+            unsure: false,
+        })
     }
 
     /// The signer whose records the store holds for the identity `keyring` holds the key of.
@@ -190,6 +199,7 @@ impl Signer {
             keyring,
             state,
             flow,
+            unsure: false,
         })
     }
 
@@ -203,6 +213,7 @@ impl Signer {
     /// rollback or an equivocation; [`Refusal::Superseded`] when the switch holds a newer
     /// version that this install adopted instead of its own.
     pub async fn resume(&mut self) -> Result<()> {
+        self.refresh().await?;
         while let Some(flow) = self.flow.clone() {
             match flow {
                 Flow::Enroll {
@@ -291,31 +302,39 @@ impl Signer {
             .await
     }
 
-    /// Sign the next version, built from the newest with `change`, and deliver it.
+    /// Sign the next version, built from the newest with `change`, and deliver it. Its
+    /// version is above every version this install committed a signed document at, so a
+    /// version whose document went out in a flow that was dropped is never signed again
+    /// (Switch spec 4.3, 13.2).
     async fn new_version(&mut self, change: impl FnOnce(&mut IdentityBody)) -> Result<IdentityDoc> {
+        self.refresh().await?;
         self.check_named()?;
         if self.flow.is_some() {
             return Err(Refusal::FlowInProgress.into());
         }
         let newest = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
-        let mut body = newest.body().clone();
-        body.version = body
-            .version
+        let version = newest
+            .version()
+            .max(self.state.signed_through)
             .checked_add(1)
             .ok_or_else(|| SignerError::Records("the version can't go higher".into()))?;
+        let mut body = newest.body().clone();
+        body.version = version;
         body.signer = self.state.install;
         change(&mut body);
         let doc = {
             let key = self.keyring.unlock()?;
             IdentityDoc::sign(&key, body)?
         };
-        self.flow = Some(Flow::Deliver {
+        let mut state = self.state.clone();
+        state.signed_through = version;
+        let flow = Flow::Deliver {
             doc: doc.signed().clone(),
             prev: Some(newest.hash()),
             backup: None,
             step: DeliverStep::Signed,
-        });
-        self.save().await?;
+        };
+        self.commit(state, Some(flow)).await?;
         self.resume().await?;
         Ok(doc)
     }
@@ -328,8 +347,38 @@ impl Signer {
         }
     }
 
-    async fn save(&self) -> Result<()> {
-        state::save(&self.env.store, &self.state, self.flow.as_ref()).await
+    /// Commit `state` and `flow`, and only then take them as the signer's own, so the signer
+    /// never acts on anything the store doesn't hold. A commit the store can't tell about
+    /// makes the signer read the store again before its next step.
+    async fn commit(&mut self, state: SignerState, flow: Option<Flow>) -> Result<()> {
+        match state::save(&self.env.store, &state, flow.as_ref()).await {
+            Ok(()) => {
+                self.state = state;
+                self.flow = flow;
+                self.unsure = false;
+                Ok(())
+            }
+            Err(SignerError::Store(StoreError::Unknown)) => {
+                self.unsure = true;
+                let _ = self.refresh().await;
+                Err(StoreError::Unknown.into())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// After a commit the store couldn't tell about, read the records and the flow again.
+    async fn refresh(&mut self) -> Result<()> {
+        if !self.unsure {
+            return Ok(());
+        }
+        let (state, flow) = state::load(&self.env.store, &self.state.identity)
+            .await?
+            .ok_or(Refusal::NotSetUp)?;
+        self.state = state;
+        self.flow = flow;
+        self.unsure = false;
+        Ok(())
     }
 
     fn service(&self) -> Result<Service> {
@@ -360,6 +409,13 @@ impl Signer {
         )?)
     }
 
+    /// A client of the switch the identity is enrolled at.
+    fn service_client(&self) -> Result<SwitchClient> {
+        let service = self.service()?;
+        let key = self.keyring.unlock()?;
+        self.client(&service.origin, Some(service.service_key), key)
+    }
+
     /// Enroll at the switch, then sign the first `identity.json` naming it (Switch spec 4.3
     /// steps 1 to 3, Switch wire 3.7).
     async fn enroll(
@@ -375,30 +431,37 @@ impl Signer {
             .client(origin, None, Arc::clone(&key))?
             .enroll(&enrollment)
             .await?;
-        let service = Service {
-            origin: origin.to_owned(),
-            service_key: answer.service_key,
-            limits: answer.limits,
-        };
         let body = IdentityBody::first(
             identity,
             self.state.install,
-            Inbox::new(origin, service.service_key),
+            Inbox::new(origin, answer.service_key),
             policy,
         );
         let doc = IdentityDoc::sign(&key, body)?;
-        self.state.service = Some(service);
-        self.flow = Some(Flow::Deliver {
+        let mut state = self.state.clone();
+        state.service = Some(Service {
+            origin: origin.to_owned(),
+            service_key: answer.service_key,
+            limits: answer.limits,
+        });
+        state.signed_through = state.signed_through.max(doc.version());
+        let flow = Flow::Deliver {
             doc: doc.signed().clone(),
             prev: None,
             backup: None,
             step: DeliverStep::Signed,
-        });
-        self.save().await
+        };
+        self.commit(state, Some(flow)).await
     }
 
     /// Check the backup the Homeserver holds, then write the one holding the new version
     /// (Switch wire 3.13 "When it is written", "Another install's backup").
+    ///
+    /// A backup that names another install at or past the high-water mark stops the signer
+    /// without writing. So does a backup that doesn't open, or none where this signer has
+    /// written one, unless the switch still holds the newest version this signer delivered:
+    /// then no other install has taken over, since one that takes over delivers before it
+    /// writes its backup, and the signer writes its own with an alert.
     async fn write_backup(
         &mut self,
         doc: &SignedDoc,
@@ -406,14 +469,15 @@ impl Signer {
         backup: Option<SignerBackup>,
     ) -> Result<()> {
         self.check_named()?;
-        if let Some(bytes) = self
+        let found = self
             .env
             .homeserver
             .get(SIGNER_BACKUP_PATH)
             .await
-            .map_err(SignerError::Homeserver)?
-        {
-            match self.open_backup(&bytes)? {
+            .map_err(SignerError::Homeserver)?;
+        let mut state = self.state.clone();
+        match found {
+            Some(bytes) => match self.open_backup(&bytes)? {
                 Some(found) => {
                     let newest = self.high_water().map_or(0, |h| h.version);
                     if taken_over(&found, &self.state.install, newest) {
@@ -421,21 +485,29 @@ impl Signer {
                         return self.managed_by(install).await;
                     }
                 }
-                None => self.state.alert(Alert::BackupUnreadable),
+                None => {
+                    self.switch_at_mark().await?;
+                    state.alert(Alert::BackupUnreadable);
+                }
+            },
+            None if self.state.newest.is_some() => {
+                self.switch_at_mark().await?;
+                state.alert(Alert::BackupMissing);
             }
+            None => {}
         }
         let backup = match backup {
             Some(backup) => backup,
             None => {
                 // Sealed once and kept, so a retry writes the same bytes.
                 let backup = self.seal_backup(doc, prev)?;
-                self.flow = Some(Flow::Deliver {
+                let flow = Flow::Deliver {
                     doc: doc.clone(),
                     prev,
                     backup: Some(backup.clone()),
                     step: DeliverStep::Signed,
-                });
-                self.save().await?;
+                };
+                self.commit(state.clone(), Some(flow)).await?;
                 backup
             }
         };
@@ -445,13 +517,32 @@ impl Signer {
             .put(SIGNER_BACKUP_PATH, bytes)
             .await
             .map_err(SignerError::Homeserver)?;
-        self.flow = Some(Flow::Deliver {
+        let flow = Flow::Deliver {
             doc: doc.clone(),
             prev,
             backup: Some(backup),
             step: DeliverStep::BackupWritten,
-        });
-        self.save().await
+        };
+        self.commit(state, Some(flow)).await
+    }
+
+    /// Check that the switch still holds the newest version this signer delivered (`GET
+    /// /apps` `identity`, Switch wire 7.4.12). Any other copy stops the flow, as
+    /// [`Signer::judge_copy`] says.
+    async fn switch_at_mark(&mut self) -> Result<()> {
+        let held = self.service_client()?.apps().await?.identity;
+        let copy = match held {
+            Some(signed) => Some(IdentityDoc::verify(&signed, &self.state.identity)?),
+            None => None,
+        };
+        match self.judge_copy(copy.as_ref()) {
+            Ok(Verdict::AtMark) => Ok(()),
+            Ok(Verdict::Newer) => match copy {
+                Some(copy) => self.adopt(copy).await,
+                None => Ok(()),
+            },
+            Err(alert) => self.alarm(alert).await,
+        }
     }
 
     /// The records a backup holds, opened with the identity key; `None` for one that doesn't
@@ -493,22 +584,19 @@ impl Signer {
     /// Deliver the new version (Switch wire 7.4.2) and take the answer.
     async fn deliver(&mut self, doc: SignedDoc, prev: Option<[u8; 32]>) -> Result<()> {
         self.check_named()?;
-        let service = self.service()?;
-        let key = self.keyring.unlock()?;
-        let client = self.client(&service.origin, Some(service.service_key), key)?;
         let delivery = IdentityDelivery {
             identity: doc.clone(),
             prev,
         };
-        match client.put_identity(&delivery).await {
+        match self.service_client()?.put_identity(&delivery).await {
             Ok(_) => {
-                self.state.newest = Some(Newest {
+                let mut state = self.state.clone();
+                state.newest = Some(Newest {
                     doc,
                     prev,
                     published: false,
                 });
-                self.flow = None;
-                self.save().await
+                self.commit(state, None).await
             }
             Err(ClientError::Switch {
                 code: ErrorCode::StaleIdentity,
@@ -516,9 +604,9 @@ impl Signer {
                 ..
             }) => self.stale(&current).await,
             Err(error @ ClientError::Switch { status: 400, .. }) => {
-                // A definite refusal: the same bytes would be refused again.
-                self.flow = None;
-                self.save().await?;
+                // A definite refusal: the same bytes would be refused again. The version stays
+                // spent (`signed_through`).
+                self.commit(self.state.clone(), None).await?;
                 Err(error.into())
             }
             Err(error) => Err(error.into()),
@@ -526,91 +614,119 @@ impl Signer {
     }
 
     /// `409 stale_identity`: the switch holds another version than the one this delivery
-    /// builds on, and its answer carries the copy (Switch wire 3.3 "Never back", 7.4.2).
+    /// builds on, and its answer carries the copy, or `null` when it holds none (Switch wire
+    /// 3.3 "Never back", 7.4.2). The delivery is over whatever the copy is.
     async fn stale(&mut self, current: &Value) -> Result<()> {
-        // The delivery is over whatever the copy is: its version can't be taken.
-        self.flow = None;
-        let copy = current
-            .get("identity")
-            .and_then(|doc| serde_json::from_value::<SignedDoc>(doc.clone()).ok())
-            .map(|signed| IdentityDoc::verify(&signed, &self.state.identity));
-        let copy = match copy {
-            Some(Ok(copy)) => copy,
-            Some(Err(error)) => {
-                self.save().await?;
-                return Err(error.into());
-            }
-            None => {
-                self.save().await?;
-                return Err(SignerError::InvalidData(pubky_switch_core::Error::Invalid(
-                    "Switch wire 7.4.2: a stale_identity answer without the copy".into(),
-                )));
+        let copy = match current.get("identity") {
+            None | Some(Value::Null) => None,
+            Some(doc) => {
+                let verified = serde_json::from_value::<SignedDoc>(doc.clone())
+                    .map_err(|e| pubky_switch_core::Error::Invalid(e.to_string()))
+                    .and_then(|signed| IdentityDoc::verify(&signed, &self.state.identity));
+                match verified {
+                    Ok(copy) => Some(copy),
+                    Err(error) => {
+                        self.commit(self.state.clone(), None).await?;
+                        return Err(error.into());
+                    }
+                }
             }
         };
-        if let Some(high) = self.high_water() {
-            if copy.version() < high.version || copy.generation() < high.generation {
-                return self
-                    .alarm(Alert::Rollback {
-                        source: Source::Switch,
-                        version: copy.version(),
-                        generation: copy.generation(),
-                        high_water_version: high.version,
-                    })
-                    .await;
-            }
-            if copy.version() == high.version {
-                if copy.body_hash() != high.body_hash {
-                    return self
-                        .alarm(Alert::Equivocation {
-                            source: Source::Switch,
-                            version: high.version,
-                        })
-                        .await;
+        match self.judge_copy(copy.as_ref()) {
+            Err(alert) => self.alarm(alert).await,
+            Ok(Verdict::Newer) => match copy {
+                Some(copy) => self.adopt(copy).await,
+                None => {
+                    self.commit(self.state.clone(), None).await?;
+                    Err(stale_without_copy())
                 }
-                self.save().await?;
-                return Err(Refusal::Superseded {
-                    version: high.version,
-                }
-                .into());
+            },
+            Ok(Verdict::AtMark) => {
+                // The switch holds the version this delivery builds on, yet refused it.
+                self.commit(self.state.clone(), None).await?;
+                Err(stale_without_copy())
             }
         }
-        // A strictly newer copy, another signer's: adopted (Switch spec 4.3). It isn't this
-        // install's to publish.
+    }
+
+    /// Judge a copy of `identity.json` from the switch against the high-water mark (Switch
+    /// spec 4.3, Switch wire 3.3 "Never back"): an older copy, or none under a mark, is a
+    /// rollback, and another body at the mark's version is equivocation.
+    fn judge_copy(&self, copy: Option<&IdentityDoc>) -> std::result::Result<Verdict, Alert> {
+        let Some(high) = self.high_water() else {
+            return Ok(Verdict::Newer);
+        };
+        let Some(copy) = copy else {
+            return Err(Alert::Rollback {
+                source: Source::Switch,
+                version: None,
+                generation: None,
+                high_water_version: high.version,
+            });
+        };
+        if copy.version() < high.version || copy.generation() < high.generation {
+            return Err(Alert::Rollback {
+                source: Source::Switch,
+                version: Some(copy.version()),
+                generation: Some(copy.generation()),
+                high_water_version: high.version,
+            });
+        }
+        if copy.version() == high.version {
+            if copy.body_hash() != high.body_hash {
+                return Err(Alert::Equivocation {
+                    source: Source::Switch,
+                    version: high.version,
+                });
+            }
+            return Ok(Verdict::AtMark);
+        }
+        Ok(Verdict::Newer)
+    }
+
+    /// Adopt a strictly newer copy, another signer's (Switch spec 4.3), ending the flow. It
+    /// isn't this install's to publish.
+    async fn adopt(&mut self, copy: IdentityDoc) -> Result<()> {
         let version = copy.version();
         let signer = copy.body().signer;
-        self.state.newest = Some(Newest {
+        let mut state = self.state.clone();
+        state.newest = Some(Newest {
             doc: copy.signed().clone(),
             prev: None,
             published: true,
         });
-        if signer != self.state.install {
-            return self.managed_by(signer).await;
+        state.signed_through = state.signed_through.max(version);
+        if signer != state.install {
+            state.managed_by = Some(signer);
+            state.alert(Alert::ManagedByOtherInstall { install: signer });
+            self.commit(state, None).await?;
+            return Err(SignerError::NotNamed { install: signer });
         }
-        self.save().await?;
+        self.commit(state, None).await?;
         Err(Refusal::Superseded { version }.into())
     }
 
     /// Another install is the signer: this one stops signing (Switch spec 4.3, 12.8).
     async fn managed_by(&mut self, install: [u8; 16]) -> Result<()> {
-        self.flow = None;
-        self.state.managed_by = Some(install);
-        self.state.alert(Alert::ManagedByOtherInstall { install });
-        self.save().await?;
+        let mut state = self.state.clone();
+        state.managed_by = Some(install);
+        state.alert(Alert::ManagedByOtherInstall { install });
+        self.commit(state, None).await?;
         Err(SignerError::NotNamed { install })
     }
 
     /// Keep `alert` and end the flow: the signer doesn't build on what it saw.
     async fn alarm(&mut self, alert: Alert) -> Result<()> {
-        self.flow = None;
-        self.state.alert(alert.clone());
-        self.save().await?;
+        let mut state = self.state.clone();
+        state.alert(alert.clone());
+        self.commit(state, None).await?;
         Err(SignerError::Alarm(alert))
     }
 
     /// Publish the newest version on the Homeserver once the switch accepted it (Switch spec
     /// 4.3: deliver first, publish after).
     async fn publish(&mut self) -> Result<()> {
-        let Some(newest) = self.state.newest.as_mut() else {
+        let Some(newest) = self.state.newest.clone() else {
             return Ok(());
         };
         if newest.published || self.state.managed_by.is_some() {
@@ -623,7 +739,26 @@ impl Signer {
             .put(IDENTITY_PATH, bytes)
             .await
             .map_err(SignerError::Homeserver)?;
-        newest.published = true;
-        self.save().await
+        let mut state = self.state.clone();
+        state.newest = Some(Newest {
+            published: true,
+            ..newest
+        });
+        self.commit(state, self.flow.clone()).await
     }
+}
+
+/// What a copy of `identity.json` is, next to the high-water mark.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Verdict {
+    /// The mark's own version.
+    AtMark,
+    /// Strictly newer, or any copy before there is a mark.
+    Newer,
+}
+
+fn stale_without_copy() -> SignerError {
+    SignerError::InvalidData(pubky_switch_core::Error::Invalid(
+        "Switch wire 7.4.2: stale_identity without a newer copy than the one built on".into(),
+    ))
 }

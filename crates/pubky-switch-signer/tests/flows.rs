@@ -13,9 +13,12 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
+use pubky_switch_client::StoreError;
 use pubky_switch_client::TransportError;
 use pubky_switch_client::clock::TestClock;
-use pubky_switch_client::store::{Fault, FaultStore, MemoryStore, StateStore, StoreHandle};
+use pubky_switch_client::store::{
+    Fault, FaultStore, KeyValue, MemoryStore, StateStore, StoreHandle, WriteBatch,
+};
 use pubky_switch_client::testing::{SWITCH_ORIGIN, ScriptedSwitch};
 use pubky_switch_client::transport::{BoxFuture, MockTransport};
 use pubky_switch_core::keys::IdentityKey;
@@ -60,6 +63,8 @@ struct TestHomeserver {
     files: Mutex<HashMap<String, Vec<u8>>>,
     writes: Mutex<Vec<(String, Vec<u8>)>>,
     down: Mutex<bool>,
+    /// Writes fail while reads still answer.
+    failing_puts: Mutex<bool>,
 }
 
 impl TestHomeserver {
@@ -93,7 +98,7 @@ impl Homeserver for TestHomeserver {
         Box::pin(async move { answer })
     }
     fn put(&self, path: &str, bytes: Vec<u8>) -> BoxFuture<'_, Result<(), TransportError>> {
-        let answer = if *self.down.lock().unwrap() {
+        let answer = if *self.down.lock().unwrap() || *self.failing_puts.lock().unwrap() {
             Err(TransportError::Connect("down".into()))
         } else {
             self.writes
@@ -104,6 +109,46 @@ impl Homeserver for TestHomeserver {
             Ok(())
         };
         Box::pin(async move { answer })
+    }
+}
+
+/// A store whose commits fail with `Unavailable`, applying nothing, while `failing` is set.
+struct FlakyStore {
+    inner: Arc<MemoryStore>,
+    failing: Mutex<bool>,
+}
+
+impl FlakyStore {
+    fn new(inner: Arc<MemoryStore>) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            failing: Mutex::new(false),
+        })
+    }
+
+    fn fail(&self, failing: bool) {
+        *self.failing.lock().unwrap() = failing;
+    }
+}
+
+impl StateStore for FlakyStore {
+    fn get(&self, ns: &str, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
+        self.inner.get(ns, key)
+    }
+    fn scan(
+        &self,
+        ns: &str,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: u32,
+    ) -> Result<Vec<KeyValue>, StoreError> {
+        self.inner.scan(ns, prefix, after, limit)
+    }
+    fn commit(&self, batch: WriteBatch) -> Result<(), StoreError> {
+        if *self.failing.lock().unwrap() {
+            return Err(StoreError::Unavailable);
+        }
+        self.inner.commit(batch)
     }
 }
 
@@ -198,6 +243,30 @@ impl World {
             .map(|r| r.body)
             .collect();
         bodies.len()
+    }
+
+    /// Every `identity.json` sent to the switch, in order.
+    fn sent_docs(&self) -> Vec<IdentityDoc> {
+        self.transport
+            .requests()
+            .into_iter()
+            .filter(|r| r.method == "PUT" && r.path_and_query.ends_with("/identity"))
+            .map(|r| {
+                let delivery = pubky_switch_core::http::IdentityDelivery::parse(&r.body).unwrap();
+                IdentityDoc::verify(&delivery.identity, &self.key.public()).unwrap()
+            })
+            .collect()
+    }
+
+    /// Fails when two different documents were sent at one version: the identity key never
+    /// signs equivocation (Switch spec 4.3, 13.2).
+    fn assert_no_version_sent_twice(&self) {
+        let mut seen: HashMap<u64, [u8; 32]> = HashMap::new();
+        for doc in self.sent_docs() {
+            let body = doc.body_hash();
+            let first = *seen.entry(doc.version()).or_insert(body);
+            assert_eq!(first, body, "two bodies sent at version {}", doc.version());
+        }
     }
 
     /// A version after `doc` signed by another install, delivered to the switch behind the
@@ -310,14 +379,16 @@ async fn test_signer_new_version_builds_on_the_newest() {
 async fn test_signer_a_backup_write_that_fails_stops_the_delivery() {
     let world = World::new();
     let (mut signer, _) = world.enrolled().await;
-    *world.homeserver.down.lock().unwrap() = true;
+    // Reads still answer, so the backup check passes and only the write fails.
+    *world.homeserver.failing_puts.lock().unwrap() = true;
     let error = signer.set_record_max_age(Some(86_400)).await.unwrap_err();
     assert!(matches!(error, SignerError::Homeserver(_)), "{error:?}");
     // Nothing reached the switch: the backup comes first (Switch wire 3.13).
     assert_eq!(world.switch.identity_doc().unwrap().version(), 1);
+    assert_eq!(world.distinct_requests("PUT", "/identity"), 1);
     assert_eq!(signer.high_water().unwrap().version, 1);
-    // Once the Homeserver is back, the same version goes out.
-    *world.homeserver.down.lock().unwrap() = false;
+    // Once the Homeserver takes writes again, the same version goes out.
+    *world.homeserver.failing_puts.lock().unwrap() = false;
     signer.resume().await.unwrap();
     assert_eq!(world.switch.identity_doc().unwrap().version(), 2);
     assert_eq!(world.distinct_requests("PUT", "/identity"), 2);
@@ -424,8 +495,8 @@ async fn test_signer_an_older_copy_at_the_switch_is_a_rollback_alarm() {
     let error = signer.set_record_max_age(None).await.unwrap_err();
     let alert = Alert::Rollback {
         source: Source::Switch,
-        version: 1,
-        generation: 1,
+        version: Some(1),
+        generation: Some(1),
         high_water_version: 2,
     };
     assert_eq!(error, SignerError::Alarm(alert.clone()));
@@ -537,6 +608,213 @@ async fn test_signer_enrollment_survives_a_crash_at_every_commit() {
             assert_eq!(
                 world.homeserver.distinct_writes(SIGNER_BACKUP_PATH),
                 1,
+                "{fault:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_signer_a_failed_commit_sends_nothing_it_didnt_commit() {
+    let world = World::new();
+    let memory = Arc::new(MemoryStore::new());
+    let flaky = FlakyStore::new(memory.clone());
+    let mut signer = Signer::create(world.env(flaky.clone()), world.keyring(), SWITCH_ORIGIN)
+        .await
+        .unwrap();
+    signer.resume().await.unwrap();
+    flaky.fail(true);
+    let error = signer.set_record_max_age(Some(86_400)).await.unwrap_err();
+    assert_eq!(error, SignerError::Store(StoreError::Unavailable));
+    for _ in 0..3 {
+        let _ = signer.resume().await;
+    }
+    // Nothing that wasn't committed reached the switch or the Homeserver.
+    assert_eq!(world.switch.identity_doc().unwrap().version(), 1);
+    assert_eq!(world.backup().identity_doc().version(), 1);
+    // A restart finds the store as committed, and the next change is signed once.
+    flaky.fail(false);
+    let mut restarted = Signer::open(world.env(memory), world.keyring())
+        .await
+        .unwrap();
+    restarted.set_record_max_age(Some(3_600)).await.unwrap();
+    assert_eq!(
+        world.switch.identity_doc().unwrap().body().record_max_age,
+        Some(3_600)
+    );
+    world.assert_no_version_sent_twice();
+}
+
+#[tokio::test]
+async fn test_signer_a_store_that_cant_tell_is_read_again() {
+    // The commit of the signed version is applied but answers `Unknown`: the signer reads its
+    // state again, so it goes on from what the store holds (Switch wire 2.1).
+    let world = World::new();
+    // The enrollment takes six commits; the seventh is the new version's first.
+    let faulty = Arc::new(FaultStore::new(
+        Arc::new(MemoryStore::new()),
+        Fault::FailAfter(7),
+    ));
+    let mut signer = Signer::create(world.env(faulty), world.keyring(), SWITCH_ORIGIN)
+        .await
+        .unwrap();
+    signer.resume().await.unwrap();
+    let error = signer.set_record_max_age(Some(86_400)).await.unwrap_err();
+    assert_eq!(error, SignerError::Store(StoreError::Unknown));
+    signer.resume().await.unwrap();
+    assert_eq!(world.switch.identity_doc().unwrap().version(), 2);
+    world.assert_no_version_sent_twice();
+}
+
+#[tokio::test]
+async fn test_signer_never_signs_a_version_twice_after_a_dropped_flow() {
+    let world = World::new();
+    let (mut signer, store) = world.enrolled().await;
+    let first = signer.identity_doc().unwrap().unwrap();
+    signer.set_record_max_age(Some(86_400)).await.unwrap();
+    world.switch.deliver_identity(&first).unwrap();
+    // Two changes, each refused with a rollback alarm after its document went out.
+    for seconds in [3_600, 7_200] {
+        let error = signer.set_record_max_age(Some(seconds)).await.unwrap_err();
+        assert!(
+            matches!(error, SignerError::Alarm(Alert::Rollback { .. })),
+            "{error:?}"
+        );
+    }
+    // And once more after a restart.
+    let mut restarted = Signer::open(world.env(store), world.keyring())
+        .await
+        .unwrap();
+    restarted.set_record_max_age(Some(60)).await.unwrap_err();
+    world.assert_no_version_sent_twice();
+}
+
+#[tokio::test]
+async fn test_signer_an_unreadable_backup_after_a_take_over_isnt_overwritten() {
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let first = signer.identity_doc().unwrap().unwrap();
+    let other = [5; 16];
+    world
+        .switch
+        .deliver_identity(&world.other_install_version(&first, other))
+        .unwrap();
+    let garbage = b"not a backup".to_vec();
+    world.homeserver.set(SIGNER_BACKUP_PATH, garbage.clone());
+    let error = signer.set_record_max_age(Some(86_400)).await.unwrap_err();
+    assert_eq!(error, SignerError::NotNamed { install: other });
+    // Nothing written over the other install's backup, nothing delivered (Switch wire 3.13).
+    assert_eq!(world.homeserver.file(SIGNER_BACKUP_PATH), Some(garbage));
+    assert!(world.sent_docs().iter().all(|d| d.version() == 1));
+}
+
+#[tokio::test]
+async fn test_signer_a_missing_backup_after_a_take_over_isnt_written() {
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let first = signer.identity_doc().unwrap().unwrap();
+    let other = [6; 16];
+    world
+        .switch
+        .deliver_identity(&world.other_install_version(&first, other))
+        .unwrap();
+    world
+        .homeserver
+        .files
+        .lock()
+        .unwrap()
+        .remove(SIGNER_BACKUP_PATH);
+    let error = signer.set_record_max_age(Some(86_400)).await.unwrap_err();
+    assert_eq!(error, SignerError::NotNamed { install: other });
+    assert_eq!(world.homeserver.file(SIGNER_BACKUP_PATH), None);
+}
+
+#[tokio::test]
+async fn test_signer_a_missing_backup_at_its_own_mark_is_written_again() {
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    world
+        .homeserver
+        .files
+        .lock()
+        .unwrap()
+        .remove(SIGNER_BACKUP_PATH);
+    signer.set_record_max_age(Some(86_400)).await.unwrap();
+    assert!(signer.alerts().contains(&Alert::BackupMissing));
+    assert_eq!(world.backup().identity_doc().version(), 2);
+}
+
+#[tokio::test]
+async fn test_signer_a_switch_holding_nothing_under_a_mark_is_a_rollback() {
+    use pubky_switch_client::testing::Fault as SwitchFault;
+    use pubky_switch_core::http::ErrorCode;
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    world.switch.fail_next(SwitchFault::Error {
+        path: "/identity".into(),
+        code: ErrorCode::StaleIdentity,
+        current: serde_json::Value::Null,
+    });
+    let error = signer.set_record_max_age(Some(86_400)).await.unwrap_err();
+    let alert = Alert::Rollback {
+        source: Source::Switch,
+        version: None,
+        generation: None,
+        high_water_version: 1,
+    };
+    assert_eq!(error, SignerError::Alarm(alert.clone()));
+    assert!(signer.alerts().contains(&alert));
+}
+
+#[tokio::test]
+async fn test_signer_a_new_version_survives_a_crash_at_every_commit() {
+    // Signed, backup sealed, backup written, delivered, published: five commits. Under each
+    // fault the signer is asked again on the failing store, then restarted and asked for a
+    // different change: no version may go out with two bodies (Switch wire 2.1, spec 4.3).
+    for n in 1..=6 {
+        for fault in [
+            Fault::StopBefore(n),
+            Fault::StopAfter(n),
+            Fault::FailBefore(n),
+            Fault::FailAfter(n),
+        ] {
+            let world = World::new();
+            let memory = Arc::new(MemoryStore::new());
+            let mut signer =
+                Signer::create(world.env(memory.clone()), world.keyring(), SWITCH_ORIGIN)
+                    .await
+                    .unwrap();
+            signer.resume().await.unwrap();
+            let faulty = Arc::new(FaultStore::new(memory.clone(), fault));
+            let mut signer = Signer::open(world.env(faulty), world.keyring())
+                .await
+                .unwrap();
+            let _ = signer.set_record_max_age(Some(86_400)).await;
+            for _ in 0..3 {
+                let _ = signer.resume().await;
+            }
+            let mut restarted = Signer::open(world.env(memory), world.keyring())
+                .await
+                .unwrap();
+            restarted
+                .resume()
+                .await
+                .unwrap_or_else(|e| panic!("{fault:?}: {e:?}"));
+            let last = restarted.set_record_max_age(Some(3_600)).await.unwrap();
+            world.assert_no_version_sent_twice();
+            assert_eq!(
+                world.switch.identity_doc().unwrap().signed(),
+                last.signed(),
+                "{fault:?}"
+            );
+            assert_eq!(
+                world.published().unwrap().signed(),
+                last.signed(),
+                "{fault:?}"
+            );
+            assert_eq!(
+                world.backup().identity_doc().signed(),
+                last.signed(),
                 "{fault:?}"
             );
         }

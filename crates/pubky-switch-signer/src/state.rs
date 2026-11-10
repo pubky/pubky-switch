@@ -68,6 +68,10 @@ pub(crate) struct SignerState {
     pub(crate) service: Option<Service>,
     /// The newest version accepted or adopted.
     pub(crate) newest: Option<Newest>,
+    /// The highest version this install committed a signed `identity.json` at, sent or not.
+    /// Every new version is signed above it, so no version is signed twice with two bodies
+    /// (Switch spec 4.3, 13.2).
+    pub(crate) signed_through: u64,
     /// Every App ID revoked or seen departing, kept for good (Switch spec 12.2).
     pub(crate) tombstones: Vec<[u8; 16]>,
     /// The certificates the newest document references, as signed.
@@ -89,6 +93,7 @@ impl SignerState {
             install,
             service: None,
             newest: None,
+            signed_through: 0,
             tombstones: Vec::new(),
             certs: Vec::new(),
             bundle_parts: Vec::new(),

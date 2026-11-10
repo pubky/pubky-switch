@@ -23,10 +23,10 @@ pub enum Alert {
     Rollback {
         /// Where the copy was seen.
         source: Source,
-        /// The copy's version.
-        version: u64,
-        /// The copy's generation.
-        generation: u64,
+        /// The copy's version; `None` when the source holds no copy at all.
+        version: Option<u64>,
+        /// The copy's generation; `None` when the source holds no copy at all.
+        generation: Option<u64>,
         /// The newest version a service accepted from this signer.
         high_water_version: u64,
     },
@@ -45,7 +45,12 @@ pub enum Alert {
         /// That install's signer ID.
         install: [u8; 16],
     },
-    /// The signer's backup on the Homeserver didn't open, so it couldn't tell whether another
-    /// install had taken over; the signer wrote its own backup over it (Switch wire 3.13).
+    /// The signer's backup on the Homeserver didn't open. The switch still held the newest
+    /// version this signer delivered, so no other install had taken over, and the signer
+    /// wrote its own backup over it (Switch wire 3.13).
     BackupUnreadable,
+    /// The Homeserver held no signer backup, though this signer had written one. The switch
+    /// still held the newest version this signer delivered, so the signer wrote its backup
+    /// again (Switch wire 3.13).
+    BackupMissing,
 }
