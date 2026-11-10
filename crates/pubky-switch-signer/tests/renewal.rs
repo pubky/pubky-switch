@@ -829,6 +829,56 @@ async fn test_renewal_a_closing_without_a_service_time_waits_for_the_next_delive
 }
 
 #[tokio::test]
+async fn test_renewal_an_owed_closing_isnt_signed_while_the_records_are_behind() {
+    // A reduction's closing is owed with no flow in progress, as after a refused closing
+    // delivery. Then the switch shows a newer version of this install's own: the records are
+    // behind, and the owed closing isn't signed either (Switch spec 4.3).
+    let world = World::new();
+    let (mut signer, memory) = world.enrolled().await;
+    let app = App::new(&["notes", "notes_tags"], None, [9; 32]);
+    world.approve(&mut signer, &app).await;
+    let id = app.keys.app_id_bytes();
+    world.switch.fail_next(SwitchFault::Unreachable {
+        path: "/identity".into(),
+        after: 1,
+    });
+    signer.renew(id, reduce(&["notes"])).await.unwrap_err();
+    world.switch.fail_next(SwitchFault::Error {
+        path: "/identity".into(),
+        code: ErrorCode::BadRequest,
+        current: serde_json::Value::Null,
+    });
+    signer.resume().await.unwrap_err();
+    let renewing = world.switch.identity_doc().unwrap();
+    assert_eq!(renewals(&renewing, &id), [None]);
+    let mut body = renewing.body().clone();
+    body.version = 9;
+    world
+        .switch
+        .deliver_identity(&IdentityDoc::sign(&world.key, body).unwrap())
+        .unwrap();
+    let behind = SignerError::Refused(Refusal::RecordsBehind { version: 9 });
+    assert_eq!(
+        signer.set_record_max_age(Some(60)).await.unwrap_err(),
+        behind
+    );
+    let sent = world.sent_docs().len();
+    let backup = world.backup().identity_doc().signed().clone();
+    assert_eq!(signer.resume().await.unwrap_err(), behind);
+    assert_eq!(world.sent_docs().len(), sent);
+    assert_eq!(world.backup().identity_doc().signed(), &backup);
+    // No closing version was signed, nor left as a flow to deliver.
+    let ns = format!(
+        "signer/{}",
+        pubky_switch_core::enc::zbase32_encode(&world.key.public())
+    );
+    assert!(memory.get(&ns, b"flow").unwrap().is_none());
+    let state: serde_json::Value =
+        serde_json::from_slice(&memory.get(&ns, b"state").unwrap().unwrap()).unwrap();
+    assert_eq!(state["signed_through"], 9);
+}
+
+#[tokio::test]
 async fn test_renewal_refuses_an_app_that_isnt_listed() {
     let world = World::new();
     let (mut signer, _) = world.enrolled().await;
