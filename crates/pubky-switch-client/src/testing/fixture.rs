@@ -413,12 +413,12 @@ impl Protocol for TestProtocol {
     fn resend_needed(
         &self,
         needed: &ResendNeeded,
-    ) -> Result<Vec<LocalWrite>, crate::error::StoreError> {
+    ) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
         lock(&self.resends).push(needed.clone());
         Ok(Vec::new())
     }
 
-    fn missed(&self, missed: &MissedEntries) -> Result<Vec<LocalWrite>, crate::error::StoreError> {
+    fn missed(&self, missed: &MissedEntries) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
         lock(&self.missed).push(missed.clone());
         Ok(Vec::new())
     }

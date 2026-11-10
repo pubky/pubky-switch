@@ -72,7 +72,7 @@ use super::state::{
 use super::{App, AppError, PROCESSED_RETENTION_MS};
 use crate::client::Batch;
 use crate::client::answers::{ChainItem, EntryItem, FeedItem, FeedPage, FeedQuery};
-use crate::error::{ClientError, StoreError};
+use crate::error::ClientError;
 
 /// What one read did.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -164,7 +164,7 @@ impl From<&ResendNeeded> for OwedCall {
 
 impl OwedCall {
     /// The call, made again.
-    fn make(&self, protocol: &dyn Protocol) -> Result<Vec<LocalWrite>, StoreError> {
+    fn make(&self, protocol: &dyn Protocol) -> Result<Vec<LocalWrite>, StoreFailure> {
         match *self {
             Self::Resend {
                 sender,

@@ -151,9 +151,9 @@ impl Protocol for SampleProtocol {
     fn resend_needed(
         &self,
         needed: &ResendNeeded,
-    ) -> Result<Vec<LocalWrite>, crate::error::StoreError> {
+    ) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
         if self.fails() {
-            return Err(crate::error::StoreError::Unavailable);
+            return Err(crate::error::StoreError::Unavailable.into());
         }
         self.resends.lock().unwrap().push(needed.clone());
         Ok(vec![LocalWrite::Put {
@@ -162,9 +162,9 @@ impl Protocol for SampleProtocol {
         }])
     }
 
-    fn missed(&self, missed: &MissedEntries) -> Result<Vec<LocalWrite>, crate::error::StoreError> {
+    fn missed(&self, missed: &MissedEntries) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
         if self.failing_missed.lock().unwrap().contains(&missed.seq) || self.fails() {
-            return Err(crate::error::StoreError::Unavailable);
+            return Err(crate::error::StoreError::Unavailable.into());
         }
         self.missed.lock().unwrap().push(missed.clone());
         Ok(vec![LocalWrite::Put {

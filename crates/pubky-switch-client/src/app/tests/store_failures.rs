@@ -152,11 +152,11 @@ impl Protocol for FlakyProtocol {
     fn resend_needed(
         &self,
         needed: &ResendNeeded,
-    ) -> Result<Vec<LocalWrite>, crate::error::StoreError> {
+    ) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
         self.sample.resend_needed(needed)
     }
 
-    fn missed(&self, missed: &MissedEntries) -> Result<Vec<LocalWrite>, crate::error::StoreError> {
+    fn missed(&self, missed: &MissedEntries) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
         self.sample.missed(missed)
     }
 }
@@ -600,11 +600,11 @@ impl Protocol for JournalProtocol {
     fn resend_needed(
         &self,
         needed: &ResendNeeded,
-    ) -> Result<Vec<LocalWrite>, crate::error::StoreError> {
+    ) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
         self.sample.resend_needed(needed)
     }
 
-    fn missed(&self, missed: &MissedEntries) -> Result<Vec<LocalWrite>, crate::error::StoreError> {
+    fn missed(&self, missed: &MissedEntries) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
         self.sample.missed(missed)
     }
 
@@ -1214,11 +1214,11 @@ impl Protocol for CounterProtocol {
     fn resend_needed(
         &self,
         needed: &ResendNeeded,
-    ) -> Result<Vec<LocalWrite>, crate::error::StoreError> {
+    ) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
         self.sample.resend_needed(needed)
     }
 
-    fn missed(&self, missed: &MissedEntries) -> Result<Vec<LocalWrite>, crate::error::StoreError> {
+    fn missed(&self, missed: &MissedEntries) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
         self.sample.missed(missed)
     }
 

@@ -115,20 +115,20 @@ impl Protocol for LossProtocol {
     fn resend_needed(
         &self,
         needed: &ResendNeeded,
-    ) -> Result<Vec<LocalWrite>, crate::error::StoreError> {
+    ) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
         self.sample.resend_needed(needed)
     }
 
-    fn missed(&self, missed: &MissedEntries) -> Result<Vec<LocalWrite>, crate::error::StoreError> {
+    fn missed(&self, missed: &MissedEntries) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
         self.sample.missed(missed)
     }
 
-    fn provider_lost(&self, loss: &ProviderLoss) -> Result<LossActions, StoreError> {
+    fn provider_lost(&self, loss: &ProviderLoss) -> Result<LossActions, crate::app::StoreFailure> {
         {
             let mut failing = self.failing.lock().unwrap();
             if *failing > 0 {
                 *failing -= 1;
-                return Err(StoreError::Unavailable);
+                return Err(StoreError::Unavailable.into());
             }
         }
         self.losses.lock().unwrap().push(*loss);
@@ -1061,12 +1061,14 @@ async fn test_loss_call_the_protocol_fails_is_made_again() {
     let store = Arc::new(MemoryStore::new());
     let lost = lost_world(Arc::clone(&store) as Arc<dyn StateStore>).await;
     // The protocol can't read its state: the recovery stops at the step, and the call
-    // fails with the protocol's error.
+    // fails with the protocol's error, which isn't the app's store failing.
     *lost.protocol.failing.lock().unwrap() = 1;
     let first = follow_loss(&lost, Arc::clone(&store) as Arc<dyn StateStore>).await;
     assert!(
-        matches!(first, Err(AppError::Store(StoreError::Unavailable))),
-        "{first:?}"
+        matches!(&first, Err(AppError::Protocol(failure))
+            if *failure.error() == StoreError::Unavailable),
+        "{:?}",
+        first.map(|_| ())
     );
     assert!(lost.protocol.losses.lock().unwrap().is_empty());
     // The next call asks again, and the recovery goes on.
@@ -2770,11 +2772,11 @@ impl Protocol for AttemptingProtocol {
     fn resend_needed(
         &self,
         needed: &ResendNeeded,
-    ) -> Result<Vec<LocalWrite>, crate::error::StoreError> {
+    ) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
         self.0.resend_needed(needed)
     }
 
-    fn missed(&self, missed: &MissedEntries) -> Result<Vec<LocalWrite>, crate::error::StoreError> {
+    fn missed(&self, missed: &MissedEntries) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
         self.0.missed(missed)
     }
 }

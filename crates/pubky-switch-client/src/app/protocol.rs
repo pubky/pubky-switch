@@ -20,7 +20,7 @@
 //! - **Re-sends** ([`Protocol::resend_needed`], [`Protocol::missed`]): the kind that asks a
 //!   counterparty to send again is a protocol's (Switch spec 11), so the app hands over
 //!   what it needs and the protocol queues its request with the local writes it returns.
-//!   A protocol that can't read its own state for it says so with a [`StoreError`]: the app
+//!   A protocol that can't read its own state for it says so with a [`StoreFailure`]: the app
 //!   keeps what it handed over and hands it over again later, so nothing is lost to a
 //!   default.
 //!
@@ -491,18 +491,19 @@ pub trait Protocol: Send + Sync {
     ///
     /// # Errors
     ///
-    /// A [`StoreError`] when the protocol can't build its writes now, such as when its own
-    /// state can't be read. The cursor still passes the entries, and the app keeps `needed`
-    /// in that same commit and calls this again with it at the start of each later read,
-    /// across loads, until it returns writes.
-    fn resend_needed(&self, needed: &ResendNeeded) -> Result<Vec<LocalWrite>, StoreError>;
+    /// A [`StoreFailure`] when the protocol can't build its writes now, such as when its own
+    /// state can't be read, of either kind. The cursor still passes the entries, and the app
+    /// keeps `needed` in that same commit and calls this again with it at the start of each
+    /// later read, across loads, until it returns writes
+    /// ([`super::App::owed_protocol_calls`]).
+    fn resend_needed(&self, needed: &ResendNeeded) -> Result<Vec<LocalWrite>, StoreFailure>;
 
     /// Entries missed while lagging: as [`Protocol::resend_needed`], failure included.
     ///
     /// # Errors
     ///
     /// As [`Protocol::resend_needed`].
-    fn missed(&self, missed: &MissedEntries) -> Result<Vec<LocalWrite>, StoreError>;
+    fn missed(&self, missed: &MissedEntries) -> Result<Vec<LocalWrite>, StoreFailure>;
 
     /// A provider loss the app follows (Switch spec 12.6 steps 2 and 4): the protocol queues
     /// its re-send requests to the counterparties of its unfinished activity, for what their
@@ -513,10 +514,11 @@ pub trait Protocol: Send + Sync {
     ///
     /// # Errors
     ///
-    /// A [`StoreError`] when the protocol can't build its actions now, such as when its own
+    /// A [`StoreFailure`] when the protocol can't build its actions now, such as when its own
     /// state can't be read. The recovery stays at this step, which its record keeps, and the
-    /// app's call fails with the error; the next call asks again.
-    fn provider_lost(&self, loss: &ProviderLoss) -> Result<LossActions, StoreError> {
+    /// app's call fails with [`super::AppError::Protocol`], apart from the app's own store
+    /// failing; the next call asks again.
+    fn provider_lost(&self, loss: &ProviderLoss) -> Result<LossActions, StoreFailure> {
         let _ = loss;
         Ok(LossActions::default())
     }
@@ -532,7 +534,7 @@ pub trait Protocol: Send + Sync {
         &self,
         loss: &ProviderLoss,
         view: &LocalView<'_>,
-    ) -> Result<LossActions, StoreError> {
+    ) -> Result<LossActions, StoreFailure> {
         let _ = view;
         self.provider_lost(loss)
     }

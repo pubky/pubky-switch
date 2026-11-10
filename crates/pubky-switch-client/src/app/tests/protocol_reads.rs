@@ -156,11 +156,11 @@ impl Protocol for ReadsProtocol {
     fn resend_needed(
         &self,
         needed: &ResendNeeded,
-    ) -> Result<Vec<LocalWrite>, crate::error::StoreError> {
+    ) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
         self.items.resend_needed(needed)
     }
 
-    fn missed(&self, missed: &MissedEntries) -> Result<Vec<LocalWrite>, crate::error::StoreError> {
+    fn missed(&self, missed: &MissedEntries) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
         self.items.missed(missed)
     }
 
