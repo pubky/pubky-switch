@@ -1190,6 +1190,11 @@ async fn test_app_expired_certificate_is_renewed_by_the_signer_alone() {
     );
 }
 
+/// A kept effect refused with `403 cert_expired` stays kept, and goes again once the renewal
+/// is listed. A service following Switch wire 7.2 checks an own app against the stored
+/// renewed certificate as soon as the newest `identity.json` lists it, so the resend can
+/// pass before the app adopts the certificate: this test passes whether or not the app
+/// takes the renewal before it sends the kept effect again.
 #[tokio::test]
 async fn test_app_kept_effect_refused_for_an_expired_certificate_waits_for_the_renewal() {
     let w = World::new();
