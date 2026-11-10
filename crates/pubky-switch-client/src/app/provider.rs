@@ -1041,7 +1041,7 @@ impl App {
                 let error = self
                     .raise(Alarm::Compromise {
                         n: shown.n(),
-                        distrust_from: None,
+                        distrust_from: self.distrust_bound(),
                     })
                     .await;
                 self.leave_on_compromise().await;
@@ -1073,6 +1073,7 @@ impl App {
             let mut tx = self.tx()?;
             if let Some(held) = self.state.receive_keys.get_mut(&n) {
                 held.reg_seq = Some(seq);
+                held.reg_time_ms = Some(proof.envelope().server_time);
                 tx.put(&key::receive_key(n), held)?;
             }
             self.commit(tx).await?;

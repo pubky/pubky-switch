@@ -679,6 +679,10 @@ async fn test_move_next_service_showing_a_foreign_key_is_a_compromise() {
         ),
         "{error:?}"
     );
+    // Without the registration's chain item, it distrusts from the latest service time it
+    // holds (Switch spec 3.6).
+    let distrust_from = app.compromise_distrust_from().unwrap();
+    assert!(distrust_from <= w.clock.now_ms(), "{distrust_from}");
     // It left at once, at the service it follows.
     assert!(next.app(&me).departed);
 }

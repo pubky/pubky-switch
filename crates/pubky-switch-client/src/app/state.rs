@@ -196,6 +196,9 @@ pub(crate) struct HeldKey {
     pub(crate) record: SignedDoc,
     /// The `seq` of its registration, once known.
     pub(crate) reg_seq: Option<u64>,
+    /// The service time of its registration's chain item, once known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) reg_time_ms: Option<u64>,
     /// The registration batch sent and not yet answered, its exact body.
     #[serde(with = "serde_b64_vec", default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) pending: Vec<u8>,

@@ -47,7 +47,7 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
 | `ident/<pubky>/sw` | when a counterparty's switch copy was last looked up, whether the read succeeded, and the lookup's number | |
 | `ident/<pubky>/swn` | the number of the last switch lookup begun for a counterparty, which orders the lookups whatever the clock reads | |
 | `ident/<pubky>/reads` | when a counterparty's `identity.json` was last read from its Homeserver, and from its switch | |
-| `rk/<n>` | a held receive key: secret, signed record, registration `seq`, pending batch | yes |
+| `rk/<n>` | a held receive key: secret, signed record, registration `seq` and service time, pending batch | yes |
 | `kid/<kid>` | a kid this app or one of its devices made, kept after the key is deleted | |
 | `reg/<n>` | a registration of the own app whose key this device doesn't hold: own, awaiting device sync, or unaccounted after a restore | |
 | `rotation` | the last rotation's time, and whether an envelope to the current key was opened since | |

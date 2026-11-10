@@ -510,6 +510,7 @@ impl App {
                 key: first.clone(),
                 record: key_record.signed().clone(),
                 reg_seq: None,
+                reg_time_ms: None,
                 pending: Vec::new(),
             };
             let state = AppState {
@@ -624,6 +625,7 @@ impl App {
         let key_seq = key_proof.envelope().seq;
         if let Some(held) = self.state.receive_keys.get_mut(&0) {
             held.reg_seq = Some(key_seq);
+            held.reg_time_ms = Some(key_proof.envelope().server_time);
             held.pending.clear();
         }
         self.state.cursor = Cursor {

@@ -302,6 +302,8 @@ async fn test_app_unexpected_registration_stops_and_leaves() {
 async fn test_app_conflict_naming_a_foreign_key_is_a_compromise() {
     let w = World::new();
     let mut app = w.join("wallet").await;
+    let joined = w.clock.now_ms();
+    w.clock.advance_ms(HOUR);
     let thief = ReceiveKey::from_secret(1, [43; 32]);
     let record = ReceiveKeyRecord::sign(
         &app_keys("wallet"),
@@ -317,17 +319,19 @@ async fn test_app_conflict_naming_a_foreign_key_is_a_compromise() {
             },
         )
         .unwrap();
+    let registered = w.clock.now_ms();
     // The app rotates before reading the thief's registration: `409 conflict` names it.
+    // Without its chain item, the app distrusts from its own registration, the latest
+    // service time it holds, which lies before the thief's (Switch spec 3.6).
     let error = app.rotate().await.unwrap_err();
     assert!(
-        matches!(
-            error,
-            AppError::Alarm(Alarm::Compromise {
-                n: 1,
-                distrust_from: None
-            })
-        ),
+        matches!(error, AppError::Alarm(Alarm::Compromise { n: 1, .. })),
         "{error:?}"
+    );
+    let distrust_from = app.compromise_distrust_from().unwrap();
+    assert!(
+        (joined..=registered).contains(&distrust_from),
+        "{distrust_from}"
     );
     assert!(w.switch.app(&app.app_id()).departed);
 }
