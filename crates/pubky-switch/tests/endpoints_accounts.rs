@@ -916,8 +916,6 @@ async fn test_refused_delivery_leaves_nothing_to_build_on() {
 }
 
 #[tokio::test]
-#[ignore = "the first-document path of check_delivery doesn't check the kept App IDs yet \
-            (Switch wire 3.3); run it once the core checks them"]
 async fn test_identity_first_delivery_refuses_an_enrolled_revoked_app() {
     let Some(replay) = replay().await else { return };
     let alice = alice_keys();
@@ -1026,5 +1024,38 @@ async fn test_enroll_retry_after_serving_gets_the_first_answer() {
         json(&other)["service_key"],
         vectors("keys.json")["service_keys"][0]["public"]
     );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_stale_timestamp_gives_a_time_to_retry_with() {
+    let Some(replay) = replay().await else { return };
+    // The account last committed on December 30, and is idle until January 1.
+    serving(&replay).await;
+    let alice = alice_keys();
+    let path = format!("/v1/{}/identity", alice.id);
+    let body = delivery(version("alice identity.json"), None);
+    let last_committed = "2025-12-30T00:00:02.000Z";
+    let stale = signer_request("PUT", &path, body.clone(), ms(last_committed));
+    let refused = replay.service.handle(stale).await;
+    assert_eq!(
+        (refused.status, code(&refused).as_str()),
+        (401, "stale_timestamp")
+    );
+    // The signed time stays the identity's service time; the body gives the time base.
+    assert_eq!(
+        header_of(&refused, header::SERVER_TIME),
+        Some(last_committed)
+    );
+    let retry_at = json(&refused)["current"]["server_time"]
+        .as_str()
+        .expect("current.server_time")
+        .to_string();
+    assert_eq!(retry_at, T);
+    let retried = replay
+        .service
+        .handle(signer_request("PUT", &path, body, ms(&retry_at)))
+        .await;
+    assert_ne!(code(&retried), "stale_timestamp");
     replay.db.drop_database().await.expect("drop");
 }

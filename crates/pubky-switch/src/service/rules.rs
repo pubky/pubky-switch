@@ -9,7 +9,7 @@ use pubky_switch_core::{
     enc::{pubky_key, unb64_array},
     http::{RequestHeaders, header},
     records::IdentityDoc,
-    time::parse_rfc3339,
+    time::{parse_rfc3339, rfc3339},
 };
 
 use crate::http::{
@@ -116,10 +116,13 @@ pub fn check_timestamp(text: &str, base_ms: u64) -> Result<u64, ApiError> {
         .filter(|_| well_formed)
         .ok_or_else(|| ApiError::bad_request("7.1: Switch-Timestamp isn't YYYY-MM-DDTHH:MM:SSZ"))?;
     if at.abs_diff(base_ms) > fixed::TIMESTAMP_WINDOW_MS {
+        // The time base, for the retry's timestamp: the answer's Switch-Server-Time stays
+        // the identity's last committed time, which a refusal before the lock can't move.
         return Err(ApiError::new(
             ErrorCode::StaleTimestamp,
             "7.1: Switch-Timestamp is more than 5 minutes from the service's time",
-        ));
+        )
+        .with_current(serde_json::json!({ "server_time": rfc3339(base_ms) })));
     }
     Ok(at)
 }
