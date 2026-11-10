@@ -19,6 +19,8 @@
 //! [`AccountTxn::mark_check`] finds a state behind it, as a restored backup would leave.
 
 mod account;
+mod chain;
+mod identity;
 #[cfg(any(test, feature = "test-util"))]
 pub mod testing;
 
@@ -31,6 +33,8 @@ use sqlx::{
 };
 
 pub use account::{AccountHead, AccountTxn, CommitError, Committed, NewAccount};
+pub use chain::NewChainItem;
+pub use identity::HeldIdentity;
 
 use crate::admin::{CheckFuture, ReadinessCheck};
 
@@ -282,6 +286,25 @@ impl Store {
         account::create(&self.pool, account).await
     }
 
+    /// Look account `id` up without taking its lock: its service key and the service time
+    /// it last committed, for the checks that come before the lock (Switch wire 7.2 Order).
+    pub async fn lookup(&self, id: &str) -> Result<Option<FoundAccount>, StoreError> {
+        let row = sqlx::query("SELECT service_key, stamped_time_ms FROM accounts WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(StoreError::from_db)?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let service_key: String = row.try_get("service_key")?;
+        Ok(Some(FoundAccount {
+            service_key: crate::keys::KeyId::parse(&service_key)
+                .map_err(|_| StoreError::Corrupt("service_key"))?,
+            stamped_time_ms: from_db(row.try_get("stamped_time_ms")?, "stamped_time_ms")?,
+        }))
+    }
+
     /// Start a request to account `id`: a transaction holding the account's lock until it
     /// commits or is dropped. `None` when there is no such account. Waits at most
     /// `lock_timeout_ms` for the lock ([`StoreError::LockTimeout`]).
@@ -339,6 +362,15 @@ async fn connect_first(
             Err(error) => return Err(error.into()),
         }
     }
+}
+
+/// An account found by [`Store::lookup`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FoundAccount {
+    /// Its service key.
+    pub service_key: crate::keys::KeyId,
+    /// The service time it last committed.
+    pub stamped_time_ms: u64,
 }
 
 /// The readiness check of the database: a round trip on a pooled connection.

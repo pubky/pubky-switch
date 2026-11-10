@@ -9,6 +9,20 @@
 # authenticated, so keep it on a private network.
 listen = "127.0.0.1:9090"
 
+[server]
+# The API listener. TLS is terminated in front of the service.
+# The switch origin, exactly as identity.json names it in inbox.url: https:// and the host,
+# no path. Requests sign it. Without it the API listener stays off.
+# origin = "https://switch.example"
+listen = "127.0.0.1:8080"
+allow_insecure_origin = false          # allow an http:// origin, for development only
+
+[server.proxy]
+# Reverse proxies whose X-Forwarded-For the service believes, as addresses or networks.
+# Without any, a request's network source is its connection's peer.
+trusted = []
+header = "x-forwarded-for"
+
 [log]
 # "json" (one object per line) or "text". The PUBKY_SWITCH_LOG environment variable
 # overrides the filter.
