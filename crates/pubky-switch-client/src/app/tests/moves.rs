@@ -2261,6 +2261,47 @@ async fn test_key_change_effect_resend_past_the_window_parks_its_entry() {
 }
 
 #[tokio::test]
+async fn test_store_of_the_earlier_schema_fails_as_an_old_schema() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join(&w, &router).await;
+    let me = app.app_id();
+    w.note(me, "before");
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.receive(None).await.is_err());
+    // The kept effect as schema 1 wrote it: without the entry it now keeps.
+    app.ready_local().await.unwrap();
+    let pending = app.state.pending_effect.clone().unwrap();
+    let mut value = serde_json::to_value(&pending).unwrap();
+    value.as_object_mut().unwrap().remove("entry");
+    let mut batch = crate::store::WriteBatch::new();
+    batch
+        .put(
+            &app.ns,
+            crate::app::state::key::PENDING_EFFECT.as_bytes().to_vec(),
+            serde_json::to_vec(&json!({ "v": 1, "d": value })).unwrap(),
+        )
+        .unwrap();
+    app.env.store.commit(batch).await.unwrap();
+    drop(app);
+    let loaded = App::load(
+        router.env(&w, Arc::clone(&w.store) as Arc<dyn StateStore>),
+        w.protocol.clone(),
+        World::config(),
+        me,
+    )
+    .await;
+    assert!(
+        matches!(
+            loaded,
+            Err(AppError::Store(StoreError::OldSchema { found: 1 }))
+        ),
+        "{:?}",
+        loaded.map(|_| ())
+    );
+}
+
+#[tokio::test]
 async fn test_kept_effect_without_its_entry_is_corrupt_state() {
     let w = World::new();
     let router = Router::of(&w);

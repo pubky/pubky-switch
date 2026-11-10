@@ -1812,7 +1812,7 @@ async fn test_app_backup_refuses_another_schema_or_bytes() {
     let bytes = app.backup().unwrap().to_bytes().unwrap();
     assert!(AppBackup::from_bytes(&bytes).is_ok());
     let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    value["v"] = json!(2);
+    value["v"] = json!(crate::app::SCHEMA_VERSION - 1);
     let other = serde_json::to_vec(&value).unwrap();
     assert!(matches!(
         AppBackup::from_bytes(&other),

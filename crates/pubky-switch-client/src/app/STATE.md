@@ -2,7 +2,8 @@
 
 The app layer keeps all of one app's durable state in the host's `StateStore`, namespace
 `client/<app_id>` (the App ID in z-base-32). One record per key; no blob is rewritten whole.
-Every value is `{"v":1,"d":<record>}`: a reader refuses another `v` as corrupt, so a later
+Every value is `{"v":2,"d":<record>}` (`SCHEMA_VERSION`): a reader refuses an earlier `v`
+as an old schema (`StoreError::OldSchema`) and any other as corrupt, so a later
 schema adds a migration instead of reading old bytes wrongly. Keys are ASCII. Numbers in keys
 are zero-padded to 20 digits so keys sort numerically. The record types are in `state.rs`.
 
@@ -121,6 +122,8 @@ Deleting the keys on a leave removes `keys`, `naming`, `rk/`, `scope/`, `parked/
 
 - New records take new keys under a prefix of their own; existing keys keep their meaning.
 - A changed record type bumps `SCHEMA_VERSION` with a migration that runs on load.
+- `SCHEMA_VERSION` 2: `pending/effect` keeps the opened entry it is for, a required field.
+  No migration reads a store of schema 1; such a store fails to load as an old schema.
 - Protocol state stays under `p/`, written only through `LocalWrite`.
 
 ## Moves, recovery and push

@@ -339,7 +339,7 @@ pub struct AppBackup {
 /// reader that knows no layers, which takes only that version, refuses such a backup
 /// rather than restore it without the layer. A schema change gives both kinds of backup
 /// new versions.
-const LAYERED_BACKUP_VERSION: u32 = 2;
+const LAYERED_BACKUP_VERSION: u32 = 3;
 const _: () = assert!(LAYERED_BACKUP_VERSION != SCHEMA_VERSION);
 
 /// A [`ProtocolLayer`] as a backup's bytes carry it, with what the app's feed holds beyond

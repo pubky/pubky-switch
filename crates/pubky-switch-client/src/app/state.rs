@@ -6,8 +6,9 @@
 //! every network effect follows one pattern (`store` module): sign an artifact and commit it
 //! with the next step, send those bytes until there is an answer, then commit the outcome.
 //!
-//! Every value is `{"v":1,"d":<record>}`. A reader refuses another `v` as corrupt, so a later
-//! schema adds a migration instead of reading old bytes wrongly.
+//! Every value is `{"v":<SCHEMA_VERSION>,"d":<record>}`. A reader refuses an earlier `v` as
+//! an old schema and a later or unreadable one as corrupt, so a later schema adds a
+//! migration instead of reading old bytes wrongly.
 //!
 //! Sensitive records (the app's keys, receive keys, scope keys, the naming key and parked
 //! plaintexts) rely on the store's guarantees: device-bound and encrypted at rest (Switch
@@ -29,8 +30,9 @@ use super::protocol::LocalWrite;
 use crate::error::StoreError;
 use crate::store::{StoreHandle, WriteBatch};
 
-/// The schema version of every value the app layer writes.
-pub const SCHEMA_VERSION: u32 = 1;
+/// The schema version of every value the app layer writes. 2: a kept effect keeps the
+/// entry it is for (`pending/effect`).
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// The prefix of the protocol's own keys in the app's namespace.
 pub const PROTOCOL_PREFIX: &[u8] = b"p/";
@@ -41,13 +43,13 @@ struct Out<'a, T> {
     d: &'a T,
 }
 
+/// A record's bytes as read, once their version is checked ([`Version`]).
 #[derive(Deserialize)]
 struct In<T> {
-    v: u32,
     d: T,
 }
 
-/// A record's bytes: `{"v":1,"d":<record>}`.
+/// A record's bytes: `{"v":<SCHEMA_VERSION>,"d":<record>}`.
 pub(crate) fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, AppError> {
     serde_json::to_vec(&Out {
         v: SCHEMA_VERSION,
@@ -56,13 +58,26 @@ pub(crate) fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, AppError> {
     .map_err(|_| AppError::Store(StoreError::Other("a record can't be written".into())))
 }
 
-/// Read a record's bytes; another schema version or bytes that don't read are corrupt.
+/// The version of a record's bytes, read before its record, whose shape it decides.
+#[derive(Deserialize)]
+struct Version {
+    v: u32,
+}
+
+/// Read a record's bytes. An earlier schema version is an old schema, read from the version
+/// alone, before the record, whose shape that schema may not have; a later one, or bytes
+/// that don't read, are corrupt.
 pub(crate) fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, AppError> {
-    let read: In<T> =
+    let version: Version =
         serde_json::from_slice(bytes).map_err(|_| AppError::Store(StoreError::Corrupt))?;
-    if read.v != SCHEMA_VERSION {
+    if version.v < SCHEMA_VERSION {
+        return Err(AppError::Store(StoreError::OldSchema { found: version.v }));
+    }
+    if version.v != SCHEMA_VERSION {
         return Err(AppError::Store(StoreError::Corrupt));
     }
+    let read: In<T> =
+        serde_json::from_slice(bytes).map_err(|_| AppError::Store(StoreError::Corrupt))?;
     Ok(read.d)
 }
 
@@ -732,13 +747,22 @@ mod tests {
             time_ms: 11,
         };
         let bytes = encode(&cursor).unwrap();
-        assert!(bytes.starts_with(b"{\"v\":1,\"d\":"));
+        assert!(bytes.starts_with(b"{\"v\":2,\"d\":"));
         assert_eq!(decode::<Cursor>(&bytes).unwrap(), cursor);
     }
 
     #[test]
+    fn test_record_of_an_earlier_schema_is_an_old_schema() {
+        let bytes = br#"{"v":1,"d":{"generation":1}}"#;
+        assert_eq!(
+            decode::<Floor>(bytes).unwrap_err(),
+            AppError::Store(StoreError::OldSchema { found: 1 })
+        );
+    }
+
+    #[test]
     fn test_record_of_another_schema_is_corrupt() {
-        let bytes = br#"{"v":2,"d":{"generation":1}}"#;
+        let bytes = br#"{"v":3,"d":{"generation":1}}"#;
         assert_eq!(
             decode::<Floor>(bytes).unwrap_err(),
             AppError::Store(StoreError::Corrupt)
