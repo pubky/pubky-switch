@@ -187,7 +187,8 @@ fn shape_case(
 /// shape (Switch wire 6.2, 6.4 step 9) fails, its key derived again for that policy (wire
 /// 1.5), so only the scope rule decides, and signed again by its writer: a `read_scope`,
 /// with the sealed value's `scope`, or a `write_scopes` entry that isn't a scope (wire 3.1
-/// "Scope names").
+/// "Scope names"); and the signer's `key_bundle.put` with a range from data epoch 0, or one
+/// whose first epoch is above its last (wire 3.5, 6.2).
 fn check_shape_rejections(keys: &Keys, v: &Value, identity: &[u8; 32]) {
     let based_on = "record.put create";
     let base = arr(v, "operations")
@@ -258,8 +259,39 @@ fn check_shape_rejections(keys: &Keys, v: &Value, identity: &[u8; 32]) {
             &more_writes,
         ),
     ];
+    // The signer's key_bundle.put with its range changed: data epochs start at 1 (wire 3.5,
+    // spec 4.3), and a range's first epoch is at most its last.
+    let bundle_base = "key_bundle.put";
+    let bundle: Value = serde_json::from_str(st(
+        arr(v, "operations")
+            .iter()
+            .find(|o| st(o, "name") == bundle_base)
+            .unwrap(),
+        "body",
+    ))
+    .unwrap();
+    let range = |first: u64, last: u64| format!(r#""first_epoch":{first},"last_epoch":{last}"#);
+    let held = range(int(&bundle, "first_epoch"), int(&bundle, "last_epoch"));
+    let last = int(&bundle, "last_epoch");
+    let mut cases = cases;
+    cases.push(shape_case(
+        keys,
+        v,
+        identity,
+        "key_bundle.put: first_epoch 0",
+        bundle_base,
+        &[(&held, &range(0, last))],
+    ));
+    cases.push(shape_case(
+        keys,
+        v,
+        identity,
+        "key_bundle.put: first_epoch above last_epoch",
+        bundle_base,
+        &[(&held, &range(last, last - 1))],
+    ));
     let section = json!({
-        "description": "Wire 6.2, 6.4 step 9: operations whose shape the service refuses, 400 bad_request, before it compares them with what it holds. Each case is the operation of operations named in based_on with the change its name gives made in its signed body, its record key derived again for the policy it then has (wire 1.5), and signed again by its writer, so its signature verifies and only the shape decides. A record's read_scope, its value_sealed's scope with it, and each write_scopes entry follow the scope rule of wire 3.1 \"Scope names\".",
+        "description": "Wire 6.2, 6.4 step 9: operations whose shape the service refuses, 400 bad_request, before it compares them with what it holds. Each case is the operation of operations named in based_on with the change its name gives made in its signed body, its record key derived again for the policy it then has (wire 1.5), and signed again by its writer, so its signature verifies and only the shape decides. A record's read_scope, its value_sealed's scope with it, and each write_scopes entry follow the scope rule of wire 3.1 \"Scope names\"; a key_bundle.put's range starts at data epoch 1 and its first_epoch is at most its last_epoch (wire 3.5, 6.2).",
         "cases": cases,
     });
     generated(

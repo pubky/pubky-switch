@@ -189,8 +189,21 @@ pub fn check_shape(body: &OpBody) -> std::result::Result<(), Refusal> {
             shape().map_err(|e| Refusal::bad_request(reason(e)))
         }
         OpKind::KeyBundlePut(put) => {
+            // Data epochs start at 1 (Switch spec 4.3), and a part's range runs from its
+            // first epoch to its last (Switch wire 3.5).
+            if put.first_epoch == 0 {
+                return bad("key_bundle.put: first_epoch is at least 1 (wire 3.5)");
+            }
             if put.first_epoch > put.last_epoch {
                 return bad("key_bundle.put: first_epoch above last_epoch");
+            }
+            // Each part's envelope is within the envelope cap, which bounds the epochs one
+            // part holds (Switch wire 3.5 "Parts", 4.4, 7.6).
+            if put.bundle.envelope().len() > crate::envelope::MAX_ENVELOPE_LEN {
+                return Err(Refusal::new(
+                    ErrorCode::TooLarge,
+                    "Switch wire 3.5: a key bundle part's envelope over 64 KiB",
+                ));
             }
             put.bundle
                 .verify(identity, &put.target_app_id)
@@ -779,7 +792,38 @@ mod tests {
         put.first_epoch = 3;
         signer.kind = OpKind::KeyBundlePut(put.clone());
         assert_eq!(check_shape(&signer).unwrap_err().status(), 400);
+        // Data epochs start at 1: a range from 0 is refused, whatever its last epoch.
+        for last in [0, 2] {
+            put.first_epoch = 0;
+            put.last_epoch = last;
+            signer.kind = OpKind::KeyBundlePut(put.clone());
+            assert_eq!(
+                check_shape(&signer).unwrap_err().status(),
+                400,
+                "0 to {last}"
+            );
+        }
+        put.last_epoch = 2;
         put.first_epoch = 1;
+        // A part's envelope is within the envelope cap: at it, taken; one byte over, 413.
+        for (len, status) in [
+            (crate::envelope::MAX_ENVELOPE_LEN, None),
+            (crate::envelope::MAX_ENVELOPE_LEN + 1, Some(413)),
+        ] {
+            let envelope = vec![1u8; len];
+            let sig = id.sign(
+                crate::labels::sig::KEY_BUNDLE,
+                &[&id.public(), &target, &envelope],
+            );
+            let mut large = put.clone();
+            large.bundle = KeyBundle::from_parts(envelope, sig);
+            signer.kind = OpKind::KeyBundlePut(large);
+            assert_eq!(
+                check_shape(&signer).err().map(|r| r.status()),
+                status,
+                "{len}"
+            );
+        }
         put.target_app_id = [6; 16];
         signer.kind = OpKind::KeyBundlePut(put);
         assert_eq!(check_shape(&signer).unwrap_err().status(), 401);

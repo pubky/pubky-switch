@@ -197,13 +197,15 @@ async fn test_vectors_ops_operations() {
     let create = named(&operations["operations"], "record.put create");
     let at = item_time(chain_item(&chain, 6));
     set_time(&replay.clock, &at);
-    // Creates whose scopes aren't scopes: 400 at their shape, before anything is stored, so
-    // their batch ID stays free for the create that follows.
+    // Operations whose shape fails, creates whose scopes aren't scopes and key bundle parts
+    // whose range is out of the rule: 400 at their shape, before anything is stored, so the
+    // create's batch ID stays free for the create that follows.
     for case in operations["shape_rejections"]["cases"]
         .as_array()
         .expect("cases")
     {
-        let (status, answer) = post_body(&replay, "wallet", body_of(&[case]), &at).await;
+        let writer = case["writer"].as_str().expect("writer");
+        let (status, answer) = post_body(&replay, writer, body_of(&[case]), &at).await;
         expect_refused(case, status, &answer);
     }
     let (status, answer) = post_body(&replay, "wallet", body_of(&[create]), &at).await;
