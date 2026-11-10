@@ -56,6 +56,8 @@ pub(crate) fn deny_key(pubky: &[u8; 32]) -> String {
 }
 
 /// A flagged sender in the copy of the lists, from `GET /allow` only (Switch wire 7.4.6).
+/// The flagged senders are kept whole, bounded by the transport and batch caps as the
+/// other lists are, and never cut: a cut list would read a flagged sender as not flagged.
 pub(crate) fn flag_key(pubky: &[u8; 32]) -> String {
     format!("lc/flag/{}", pubky_id(pubky))
 }
@@ -290,10 +292,12 @@ impl App {
     /// conversation entries, deny list, flagged senders and its own invite codes, with the
     /// answer's service time ([`SenderDisposition::lists_as_of_ms`]).
     ///
-    /// Each list is kept whole, as the answer holds it. At the default limits that is at
-    /// most `max_flags`, 1,000, flagged senders (Switch wire 9.2); beyond the limits, the
-    /// answer's size and the store's batch size bound it, as they bound the other lists, and
-    /// a copy over the batch size fails the commit and leaves the copy as it was.
+    /// Each list is kept whole, as the answer holds it, the flagged senders included. The
+    /// copy is bounded as the other lists are: by the transport's cap on an answer's size
+    /// and the store's batch size; a copy over the batch size fails the commit and leaves
+    /// the copy as it was. At the default limits the flagged senders are at most
+    /// `max_flags`, 1,000 (Switch wire 9.2). The list isn't cut to a count of its own: a
+    /// cut list would read a flagged sender as not flagged.
     ///
     /// # Errors
     ///
