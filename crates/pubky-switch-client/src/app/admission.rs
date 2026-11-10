@@ -15,7 +15,9 @@
 //! from the feed, in the copy of the lists under `lc/` (`lc/contact/`, `lc/conv/`,
 //! `lc/deny/`, `lc/code/`), and the codes themselves
 //! it registered, `invite/<code_hash>`. A send consults them to skip a conversation entry
-//! the identity already holds.
+//! the identity already holds. The flagged senders (`lc/flag/`), which no feed item
+//! carries, come only from `GET /allow` ([`App::allow_list`]), which also keeps when the
+//! copy was last replaced (`lc/lists_at`).
 
 use pubky_switch_core::enc::{b64, pubky_id, random_bytes, serde_b64};
 use pubky_switch_core::http::ErrorCode;
@@ -51,6 +53,15 @@ pub(crate) fn allow_key(kind: AllowKind, pubky: &[u8; 32]) -> String {
 pub(crate) fn deny_key(pubky: &[u8; 32]) -> String {
     format!("lc/deny/{}", pubky_id(pubky))
 }
+
+/// A flagged sender in the copy of the lists, from `GET /allow` only (Switch wire 7.4.6).
+pub(crate) fn flag_key(pubky: &[u8; 32]) -> String {
+    format!("lc/flag/{}", pubky_id(pubky))
+}
+
+/// When [`App::allow_list`] last replaced the copy of the lists: the service time of its
+/// answer, Unix milliseconds. Absent until the first.
+pub(crate) const LISTS_AT: &str = "lc/lists_at";
 
 /// An invite code this app registered, in the copy of the lists.
 pub(crate) fn code_key(code_hash: &[u8; 32]) -> String {
@@ -243,7 +254,14 @@ impl App {
 
     /// The lists the switch holds (`GET /allow`, `lists.read`, Switch wire 7.4.6): contacts,
     /// conversation entries with their writers, the deny list, flagged senders and the live
-    /// invite codes. What the app keeps of them is brought up to date.
+    /// invite codes. What the app keeps of them is replaced in one commit: the contacts,
+    /// conversation entries, deny list, flagged senders and its own invite codes, with the
+    /// answer's service time (`lc/lists_at`).
+    ///
+    /// Each list is kept whole, as the answer holds it. At the default limits that is at
+    /// most `max_flags`, 1,000, flagged senders (Switch wire 9.2); beyond the limits, the
+    /// answer's size and the store's batch size bound it, as they bound the other lists, and
+    /// a copy over the batch size fails the commit and leaves the copy as it was.
     ///
     /// # Errors
     ///
@@ -255,9 +273,23 @@ impl App {
             self.need(Permission::ListsRead)?;
             let result = self.client.allow().await;
             let list = self.take(result).await?;
+            // The answer's own stamped time (Switch spec 10.1). For an answer without one, the
+            // highest service time verified before it, which is older, so a protocol refreshes
+            // no later than it means to; the device clock only when the app verified none.
+            let as_of = self
+                .client
+                .latest_server_time()
+                .or_else(|| self.highest_service_time())
+                .unwrap_or_else(|| self.now());
             let me = self.state.meta.app_id;
             let mut tx = self.tx()?;
-            for prefix in ["lc/contact/", "lc/conv/", "lc/deny/", "lc/code/"] {
+            for prefix in [
+                "lc/contact/",
+                "lc/conv/",
+                "lc/deny/",
+                "lc/flag/",
+                "lc/code/",
+            ] {
                 tx.delete_prefix(prefix)?;
             }
             for pubky in &list.contacts {
@@ -269,6 +301,10 @@ impl App {
             for pubky in &list.deny {
                 tx.put(&deny_key(pubky), &())?;
             }
+            for flagged in &list.flagged {
+                tx.put(&flag_key(&flagged.pubky), &())?;
+            }
+            tx.put(LISTS_AT, &as_of)?;
             for code in list.invite_codes.iter().filter(|c| c.written_by == me) {
                 tx.put(&code_key(&code.code_hash), &())?;
             }
@@ -470,6 +506,7 @@ mod tests {
         assert!(allow_key(AllowKind::Contact, &[1; 32]).starts_with("lc/contact/"));
         assert!(allow_key(AllowKind::Conversation, &[1; 32]).starts_with("lc/conv/"));
         assert!(deny_key(&[1; 32]).starts_with("lc/deny/"));
+        assert!(flag_key(&[1; 32]).starts_with("lc/flag/"));
         assert!(code_key(&[1; 32]).starts_with("lc/code/"));
     }
 

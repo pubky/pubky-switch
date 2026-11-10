@@ -203,6 +203,8 @@ uploads; `push.rs` holds the push registration. The peek (`peek.rs`) writes noth
 | `peer/<pubky>` | the version of the own `identity.json` a counterparty's switch last named, and when the app last wrote there | |
 | `peers_doc` | the own `identity.json` the deliveries to recent peers were last judged against, and the counterparties still owed it | |
 | `lc/conv/<pubky>` | a conversation entry in the app's copy of the lists, from its writes, the feed and `GET /allow`; its writes and `GET /allow` also keep `lc/contact/`, `lc/deny/` and `lc/code/` | |
+| `lc/flag/<pubky>` | a flagged sender in the app's copy of the lists, from `GET /allow` only, which replaces it with `lc/contact/`, `lc/conv/`, `lc/deny/` and `lc/code/` in one commit; kept whole, as the answer holds it | |
+| `lc/lists_at` | the service time of the `GET /allow` answer the copy of the lists was last replaced from, written in that commit; absent until the first, so a receive step tells a copy never refreshed from one that holds no flag for a sender | |
 | `invite/<code_hash>` | the code of an invite code the app registered, to show it again | yes |
 | `opq/<batch_id>` | a batch of operations, signed and kept before it is sent, with what its answer settles: the protocol's local writes and the signed messages it puts in the outbox; it goes with its answer or a refusal for good, and stays through anything else | the messages' |
 | `list_due` | a listing of the collections is owed: after joining, a restore or a `missed` item | |

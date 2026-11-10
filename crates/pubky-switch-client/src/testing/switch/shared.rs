@@ -75,6 +75,8 @@ pub(crate) struct Shared {
     /// `conversation.add`).
     pub(crate) service_conversations: BTreeMap<[u8; 32], ([u8; 32], u64)>,
     deny: BTreeSet<[u8; 32]>,
+    /// The flagged senders `GET /allow` shows, with their hits (Switch wire 7.4.6).
+    pub(crate) flagged: BTreeMap<[u8; 32], u64>,
     /// Answer the next record read without its proof, as after a recovery upload.
     pub(crate) hide_proofs: bool,
     /// A faulty listing: every page names these two keys as `next` in turn, for the first
@@ -652,7 +654,12 @@ impl Inner {
                 "contacts": self.shared.contacts.iter().map(pubky_id).collect::<Vec<_>>(),
                 "conversations": conversations,
                 "deny": self.shared.deny.iter().map(pubky_id).collect::<Vec<_>>(),
-                "flagged": [],
+                "flagged": self
+                    .shared
+                    .flagged
+                    .iter()
+                    .map(|(pubky, hits)| json!({ "pubky": pubky_id(pubky), "hits": hits }))
+                    .collect::<Vec<_>>(),
                 "invite_codes": codes,
             }),
         )
