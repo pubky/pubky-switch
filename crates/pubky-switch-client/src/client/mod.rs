@@ -174,6 +174,10 @@ pub(crate) struct Auth<'a> {
     /// The signing time to send instead of the clock's: the `current.server_time` of a
     /// `401 stale_timestamp`, for its one retry (Switch wire 7.1).
     pub(crate) timestamp_ms: Option<u64>,
+    /// The key that signs a `2xx` answer instead of the pinned one: the pending key named by
+    /// a delivery that starts a generation (Switch wire 7.4.2). Other statuses are still
+    /// checked with the pinned key.
+    pub(crate) success_key: Option<[u8; 32]>,
 }
 
 /// The `Content-Type` of a request body (Switch wire 7.1).
@@ -690,9 +694,7 @@ impl SwitchClient {
         self.set_latest(None);
         let retry_body = body.clone();
         let signed = self.build(method, path_and_query, body, content, auth)?;
-        let response = self.transport.send(signed.request).await?;
-        let checked = check_response(&key, &self.account, signed.signature.as_ref(), &response);
-        self.note_server_time(&key, &checked, &response);
+        let checked = self.send_checked(signed, key, auth.success_key).await?;
         let Some(at) = stale_timestamp_hint(&checked) else {
             return checked;
         };
@@ -701,10 +703,25 @@ impl SwitchClient {
             ..auth
         };
         let signed = self.build(method, path_and_query, retry_body, content, auth)?;
+        self.send_checked(signed, key, auth.success_key).await?
+    }
+
+    /// Send a signed request and check its answer: a `2xx` with `success_key` where given,
+    /// anything else with `key`. The outer error is the transport's.
+    async fn send_checked(
+        &self,
+        signed: SignedRequest,
+        key: [u8; 32],
+        success_key: Option<[u8; 32]>,
+    ) -> Result<Result<CheckedResponse, ClientError>, ClientError> {
         let response = self.transport.send(signed.request).await?;
+        let key = match success_key {
+            Some(success) if (200..300).contains(&response.status) => success,
+            _ => key,
+        };
         let checked = check_response(&key, &self.account, signed.signature.as_ref(), &response);
         self.note_server_time(&key, &checked, &response);
-        checked
+        Ok(checked)
     }
 
     /// The public read without a pinned key (Switch wire 7.1 "An unpinned public read",
@@ -758,10 +775,7 @@ impl SwitchClient {
     pub async fn send(&self, signed: SignedRequest) -> Result<CheckedResponse, ClientError> {
         let key = self.pinned_key().ok_or(ClientError::Unpinned)?;
         self.set_latest(None);
-        let response = self.transport.send(signed.request).await?;
-        let checked = check_response(&key, &self.account, signed.signature.as_ref(), &response);
-        self.note_server_time(&key, &checked, &response);
-        checked
+        self.send_checked(signed, key, None).await?
     }
 
     pub(crate) fn transport(&self) -> &dyn Transport {

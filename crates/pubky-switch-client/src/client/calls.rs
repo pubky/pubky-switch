@@ -7,7 +7,9 @@ use pubky_switch_core::export::{
 };
 use pubky_switch_core::http::{IdentityDelivery, erase_body};
 use pubky_switch_core::json::{Doc, parse_json};
-use pubky_switch_core::records::{DiscardAnswer, Enrollment, EnrollmentAnswer, Freeze, Unfreeze};
+use pubky_switch_core::records::{
+    DiscardAnswer, Enrollment, EnrollmentAnswer, Freeze, IdentityDoc, Unfreeze,
+};
 use pubky_switch_core::sig::SignedDoc;
 use serde_json::json;
 
@@ -70,9 +72,9 @@ impl SwitchClient {
             .await
     }
 
-    /// Verify a proof with the pinned key (Switch wire 6.5).
-    fn proof(&self, signed: &SignedDoc) -> Result<TransitionProof, ClientError> {
-        TransitionProof::verify(signed, &self.key()?, &self.account())
+    /// Verify a proof with `key` (Switch wire 6.5).
+    fn proof(&self, signed: &SignedDoc, key: &[u8; 32]) -> Result<TransitionProof, ClientError> {
+        TransitionProof::verify(signed, key, &self.account())
             .map_err(|error| ClientError::Chain(ChainError::Signature(error.to_string())))
     }
 
@@ -84,17 +86,27 @@ impl SwitchClient {
         checked: &CheckedResponse,
         expect: Expect<'_>,
     ) -> Result<WriteAnswer, ClientError> {
+        self.write_answer_under(checked, expect, &self.key()?)
+    }
+
+    /// [`SwitchClient::write_answer`], with the head and the proofs verified with `key`.
+    fn write_answer_under(
+        &self,
+        checked: &CheckedResponse,
+        expect: Expect<'_>,
+        key: &[u8; 32],
+    ) -> Result<WriteAnswer, ClientError> {
         let (value, what) = read::body(&checked.body, Doc::Plain, "a write answer")?;
         let o = Obj::of(&value, what)?;
         let head = o.head("head")?;
-        verify_head(&head, &self.key()?, &self.account())?;
+        verify_head(&head, key, &self.account())?;
         let docs = o.each("proofs", read::doc)?;
         if docs.len() > 1 {
             return Err(proof_error("one proof for one item written"));
         }
         let proofs = docs
             .iter()
-            .map(|signed| self.proof(signed))
+            .map(|signed| self.proof(signed, key))
             .collect::<Result<Vec<_>, _>>()?;
         for proof in &proofs {
             let envelope = proof.envelope();
@@ -134,7 +146,7 @@ impl SwitchClient {
     /// The answer is checked as the core checks it, and its response signature with the key
     /// it names. A client without a pinned key pins that key. One that holds a key keeps it:
     /// at a serving account the answer names the pending key of the next generation, which
-    /// the signer pins once the `identity.json` naming it is delivered ([`SwitchClient::pin`]).
+    /// [`SwitchClient::put_identity`] pins once the delivery naming it is accepted.
     ///
     /// # Errors
     ///
@@ -189,6 +201,12 @@ impl SwitchClient {
     /// `PUT /v1/{id}/identity` (signer, Switch wire 7.4.2): deliver an `identity.json`,
     /// naming the version it builds on. The answer's proof is checked as the delivery's.
     ///
+    /// A delivery whose document names this origin with another service key than the pinned
+    /// one starts a generation under that pending key, which signs its `200`: the answer, its
+    /// proof and its head are checked with the pending key, which is pinned once they verify.
+    /// Any other status is checked with the pinned key, which stays pinned (Switch wire
+    /// 7.4.2 "Which key signs the answer").
+    ///
     /// # Errors
     ///
     /// As every call; `409 stale_identity` and `409 conflict` carry `current`.
@@ -197,10 +215,31 @@ impl SwitchClient {
         delivery: &IdentityDelivery,
     ) -> Result<WriteAnswer, ClientError> {
         self.signer_only()?;
+        let pinned = self.key()?;
+        let pending = IdentityDoc::verify(&delivery.identity, &self.account())
+            .ok()
+            .filter(|doc| doc.inbox().url == self.origin())
+            .map(|doc| doc.inbox().service_key)
+            .filter(|named| *named != pinned);
         let checked = self
-            .send_json("PUT", "identity", delivery.to_json())
+            .call(
+                "PUT",
+                &self.path("identity"),
+                delivery.to_json(),
+                Body::Json,
+                Auth {
+                    success_key: pending,
+                    ..Auth::default()
+                },
+            )
             .await?;
-        self.write_answer(&checked, Expect::Identity(&delivery.identity))
+        let key = pending.unwrap_or(pinned);
+        let answer =
+            self.write_answer_under(&checked, Expect::Identity(&delivery.identity), &key)?;
+        if pending.is_some() {
+            self.pin(key);
+        }
+        Ok(answer)
     }
 
     /// `POST /v1/{id}/inbox` (Switch wire 7.4.3): append an envelope sealed for the
@@ -707,7 +746,7 @@ impl SwitchClient {
         answer.proof = match o.opt_doc("proof")? {
             None => None,
             Some(signed) => {
-                let proof = self.proof(&signed)?;
+                let proof = self.proof(&signed, &self.key()?)?;
                 if proof.envelope().item_type != ItemType::Service
                     || proof.body().object != "upload"
                 {

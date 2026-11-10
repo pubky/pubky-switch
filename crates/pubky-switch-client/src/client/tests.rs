@@ -3,9 +3,11 @@
 use std::sync::Arc;
 
 use ed25519_dalek::SigningKey;
-use pubky_switch_core::chain::{ChainTip, ItemType, ProofBody, ProofState, TransitionProof};
+use pubky_switch_core::chain::{
+    ChainTip, ItemType, ProofBody, ProofState, TransitionProof, item_hash,
+};
 use pubky_switch_core::enc::{b64, pubky_id};
-use pubky_switch_core::http::{self, ErrorCode, header, sign_response};
+use pubky_switch_core::http::{self, ErrorCode, IdentityDelivery, header, sign_response};
 use pubky_switch_core::keys::{AppKeys, IdentityKey};
 use pubky_switch_core::ops::{AllowKind, Condition, OpKind, OpsRequest, Position, SignedOp};
 use pubky_switch_core::records::{
@@ -742,6 +744,120 @@ async fn test_public_read_unpinned_refuses_what_it_cant_check() {
         assert_eq!(client.pinned_key(), None);
         assert_eq!(client.last_server_time(), None);
     }
+}
+
+/// A delivery of the account's `identity.json` naming `named` as its service key here.
+fn delivery_naming(named: [u8; 32]) -> IdentityDelivery {
+    let mut body = IdentityBody::first(
+        identity().public(),
+        [0; 16],
+        Inbox::new(ORIGIN, named),
+        IdentityPolicy::default(),
+    );
+    body.generation = 2;
+    body.version = 2;
+    IdentityDelivery {
+        identity: IdentityDoc::sign(&identity(), body)
+            .unwrap()
+            .signed()
+            .clone(),
+        prev: Some([4; 32]),
+    }
+}
+
+/// A switch that answers a delivery `200` with its proof, signed with `key`.
+fn delivery_switch(key: SigningKey) -> Arc<MockTransport> {
+    Arc::new(MockTransport::with_handler(move |request| {
+        let delivery = IdentityDelivery::parse(&request.body).unwrap();
+        let doc = IdentityDoc::verify(&delivery.identity, &identity().public()).unwrap();
+        let tip = ChainTip {
+            generation: 2,
+            seq: 4,
+            chain_hash: [9; 32],
+        };
+        let bytes = delivery.identity.doc_bytes().unwrap();
+        let (stub, next) = tip
+            .append(
+                5,
+                NOW,
+                ItemType::Identity,
+                item_hash(ItemType::Identity, &bytes),
+                None,
+            )
+            .unwrap();
+        let state = ProofState::Identity {
+            version: doc.version(),
+            generation: doc.generation(),
+            data_epoch: doc.data_epoch(),
+        };
+        let account = identity().public();
+        let proof = TransitionProof::sign(
+            &key,
+            &account,
+            ProofBody::new(stub, "identity".into(), &state),
+        )
+        .unwrap();
+        let head = SignedHead::sign(&key, &account, &next);
+        let body = json!({ "proofs": [proof.signed()], "head": head.to_value() });
+        Ok(respond(&key, request, 200, body.to_string().as_bytes()))
+    }))
+}
+
+#[tokio::test]
+async fn test_put_identity_starting_a_generation_pins_the_pending_key() {
+    let pending = SigningKey::from_bytes(&[6; 32]);
+    let pending_public = pending.verifying_key().to_bytes();
+    let transport = delivery_switch(pending);
+    let client = client_with(signer(), Some(service_public()), transport);
+    let answer = client
+        .put_identity(&delivery_naming(pending_public))
+        .await
+        .unwrap();
+    assert_eq!(answer.proofs.len(), 1);
+    assert_eq!(client.pinned_key(), Some(pending_public));
+}
+
+#[tokio::test]
+async fn test_put_identity_starting_a_generation_keeps_the_pin_on_errors() {
+    let pending = SigningKey::from_bytes(&[6; 32]);
+    let pending_public = pending.verifying_key().to_bytes();
+    // A refusal comes under the old key, and keeps its pin.
+    let refusal = fixed(
+        service_key(),
+        409,
+        json!({ "code": "conflict", "message": "m" }),
+    );
+    let client = client_with(signer(), Some(service_public()), refusal);
+    let error = client
+        .put_identity(&delivery_naming(pending_public))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Some(ErrorCode::Conflict));
+    assert_eq!(client.pinned_key(), Some(service_public()));
+    // A refusal signed with the pending key doesn't verify.
+    let refusal = fixed(
+        pending.clone(),
+        409,
+        json!({ "code": "conflict", "message": "m" }),
+    );
+    let client = client_with(signer(), Some(service_public()), refusal);
+    let error = client
+        .put_identity(&delivery_naming(pending_public))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ClientError::BadServiceSignature { .. }));
+    // A `200` signed with the old key doesn't verify either.
+    let client = client_with(
+        signer(),
+        Some(service_public()),
+        delivery_switch(service_key()),
+    );
+    let error = client
+        .put_identity(&delivery_naming(pending_public))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ClientError::BadServiceSignature { .. }));
+    assert_eq!(client.pinned_key(), Some(service_public()));
 }
 
 #[tokio::test]
