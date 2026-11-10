@@ -893,6 +893,48 @@ impl SignedOp {
         identity: &[u8; 32],
         app_id: Option<&[u8; 16]>,
     ) -> std::result::Result<Self, Refusal> {
+        let op = Self::verify_signature(signed, writer_key, identity)?;
+        if op.body.app_id.as_ref() != app_id {
+            return Err(Refusal::bad_request(
+                "Switch wire 6.1: app_id isn't the calling app",
+            ));
+        }
+        Ok(op)
+    }
+
+    /// Verify an app's signed operation with the certificate it is checked against, as the
+    /// next service checks a claim entry's or a shared record's operation (Switch wire 10.5):
+    /// its signature with the certificate's signing key, then the body strictly, its
+    /// `identity` the account's, and its `app_id` the certificate's App ID. The writer an
+    /// operation names comes from the operation itself, so this binds it to the certificate:
+    /// an operation that names one app, signed by another app under that app's certificate,
+    /// isn't the named app's.
+    ///
+    /// # Errors
+    ///
+    /// `401 bad_signature` for a signature that doesn't verify with the certificate's key or
+    /// an `app_id` that isn't the certificate's, `400 bad_request` for the other rules.
+    pub fn verify_with_cert(
+        signed: &SignedDoc,
+        cert: &crate::records::AppCert,
+        identity: &[u8; 32],
+    ) -> std::result::Result<Self, Refusal> {
+        let op = Self::verify_signature(signed, &cert.signing_key(), identity)?;
+        if op.body.app_id != Some(cert.app_id()) {
+            return Err(Refusal::new(
+                crate::http::ErrorCode::BadSignature,
+                "Switch wire 10.5: the operation's app_id isn't its certificate's App ID",
+            ));
+        }
+        Ok(op)
+    }
+
+    /// The signature with `writer_key`, then the body strictly, its `identity` the account's.
+    fn verify_signature(
+        signed: &SignedDoc,
+        writer_key: &[u8; 32],
+        identity: &[u8; 32],
+    ) -> std::result::Result<Self, Refusal> {
         // A signature that doesn't decode doesn't verify: `401` like one that fails.
         signed.sig_bytes().map_err(|_| {
             Refusal::new(
@@ -905,11 +947,6 @@ impl SignedOp {
         if &body.identity != identity {
             return Err(Refusal::bad_request(
                 "Switch wire 6.1: identity isn't the account's",
-            ));
-        }
-        if body.app_id.as_ref() != app_id {
-            return Err(Refusal::bad_request(
-                "Switch wire 6.1: app_id isn't the calling app",
             ));
         }
         Ok(Self {
@@ -1136,6 +1173,60 @@ mod tests {
         let mut short = v;
         short["bundle"]["sig"] = b64(&[6; 63]).into();
         assert!(OpBody::parse(&serde_json::to_vec(&short).unwrap()).is_err());
+    }
+
+    #[test]
+    fn test_signed_op_verifies_with_a_certificate_of_its_writer() {
+        use crate::records::{AppCert, AppCertBody};
+        let id = identity();
+        let cert_for = |keys: &AppKeys| {
+            AppCert::issue(
+                &id,
+                AppCertBody::new(
+                    id.public(),
+                    keys.signing_public(),
+                    keys.bundle_public(),
+                    vec!["scope-a".into()],
+                    &[crate::scopes::Permission::ClaimsWrite],
+                    1_767_225_600_000,
+                    1_767_225_600_000 + crate::records::DEFAULT_CERT_LIFETIME_MS,
+                ),
+            )
+            .unwrap()
+        };
+        let app = app();
+        let other = AppKeys::from_secrets([4; 32], [5; 32]);
+        let op = SignedOp::sign(&app, body(attempt())).unwrap();
+        let checked =
+            SignedOp::verify_with_cert(op.signed(), &cert_for(&app), &id.public()).unwrap();
+        assert_eq!(checked.body(), op.body());
+        // Another app's certificate: its key doesn't verify the app's signature.
+        let refused = SignedOp::verify_with_cert(op.signed(), &cert_for(&other), &id.public());
+        assert_eq!(refused.unwrap_err().status(), 401);
+        // The other app signs an operation naming the app: its own certificate verifies the
+        // signature, but the operation isn't that app's.
+        let bytes = body(attempt()).to_json().unwrap();
+        let sig =
+            crate::signing::Signs::sign_fields(&other, labels::sig::OP, &[&id.public(), &bytes]);
+        let forged = SignedDoc::from_parts(&bytes, &sig);
+        let refused =
+            SignedOp::verify_with_cert(&forged, &cert_for(&other), &id.public()).unwrap_err();
+        assert_eq!(refused.status(), 401);
+        assert!(
+            refused.reason.contains("isn't its certificate's App ID"),
+            "{refused}"
+        );
+        // SignedOp::verify with the operation's own app_id passes it: the binding is the
+        // certificate's.
+        assert!(
+            SignedOp::verify(
+                &forged,
+                &other.signing_public(),
+                &id.public(),
+                Some(&app.app_id_bytes())
+            )
+            .is_ok()
+        );
     }
 
     #[test]

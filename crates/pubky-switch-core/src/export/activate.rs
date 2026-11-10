@@ -4,9 +4,10 @@
 //! The old service may be faulty or hostile, so the activation takes nothing on its word that
 //! the chain or a signature can vouch for: the chain verifies under the old service's key up
 //! to the freeze transition; apps' records and receive keys are those the chain holds; every
-//! shared record is derived from its signed operation and carries the transition proof of
-//! that write; every live claim is replayed from its entries ([`apply_entry`]); and the
-//! heads and evidence apps uploaded must hold on the import.
+//! shared record is derived from its signed operation, verified with a certificate of the
+//! writer it names, and carries the transition proof of that write; every live claim is
+//! replayed from its entries ([`apply_entry`]), each verified the same way, with a proof of
+//! its own generation; and the heads and evidence apps uploaded must hold on the import.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -24,8 +25,8 @@ use crate::chain::{
     ChainEnvelope, ItemType, ServiceTransition, SignedHead, TransitionProof, Verifier, item_hash,
 };
 use crate::claims::{
-    Attempt, Claim, ClaimEntry, ClaimLimits, ClaimStatus, ClaimTally, ClaimView, EntryContext,
-    MAX_CLAIM_AGE_MS, Pin, RECONCILIATION_MS, apply_entry,
+    Attempt, Claim, ClaimEntry, ClaimLimits, ClaimStatus, ClaimTally, ClaimType, ClaimView,
+    EntryContext, MAX_CLAIM_AGE_MS, Outcome, Pin, RECONCILIATION_MS, apply_entry,
 };
 use crate::enc::{b64, unb64_array, zbase32_encode};
 use crate::http::ErrorCode;
@@ -118,8 +119,8 @@ impl ImportedApp {
 pub struct ImportedClaim {
     /// The claim key.
     pub claim_key: [u8; 32],
-    /// The claim: replayed from its entries for a live claim not rebuilt from uploads, else
-    /// as its part gives it.
+    /// The claim: a live claim replayed from its entries, from nothing or, for one rebuilt
+    /// from uploads, from the attempts the uploads added; a tombstone as its part gives it.
     pub claim: Claim,
     /// A live claim's entries with their proofs; none for a tombstone.
     pub entries: Vec<ClaimEntryPart>,
@@ -841,11 +842,30 @@ fn check_records(
                 .map(|rec| rec.cert().clone())
                 .ok_or_else(|| fail("no certificate: cert is null and the writer has no record"))?,
         };
-        let op = SignedOp::verify(op_doc, &cert.signing_key(), &identity, Some(&r.writer))
-            .map_err(|e| match e.code {
-                ErrorCode::BadSignature => e,
+        // The operation verifies with a certificate of the app it names, and that app is the
+        // part's writer: the writer comes from the operation, so the certificate binds it.
+        let not_its_writers = |why: &str| {
+            bad_signature(format!(
+                "Switch wire 10.5: a shared record: its operation isn't its writer's: {why}"
+            ))
+        };
+        let named = SignedOp::peek(op_doc)
+            .map_err(|e| fail(&format!("its operation doesn't read: {}", e.reason)))?
+            .body()
+            .app_id;
+        if named.is_some_and(|app| app != cert.app_id()) {
+            return Err(not_its_writers("its certificate is another app's"));
+        }
+        let op =
+            SignedOp::verify_with_cert(op_doc, &cert, &identity).map_err(|e| match e.code {
+                ErrorCode::BadSignature => {
+                    not_its_writers("it doesn't verify with its writer's certificate")
+                }
                 _ => fail(&format!("its operation doesn't verify: {}", e.reason)),
             })?;
+        if op.body().app_id != Some(r.writer) {
+            return Err(fail("a member isn't its operation's: its writer"));
+        }
         let OpKind::RecordPut(put) = &op.body().kind else {
             return Err(fail("its op isn't a record.put"));
         };
@@ -1121,13 +1141,25 @@ impl ClaimCheck<'_> {
         }
     }
 
-    /// An entry's proof, verified with the service key of its stub's generation: the old
-    /// service's for g, else the one the imported `identity.json` lists in `service_keys`.
-    fn entry_proof(&self, signed: &SignedDoc) -> std::result::Result<TransitionProof, Refusal> {
+    /// An entry's proof, of the generation its signed operation names (`generation`), and
+    /// verified with the service key of that generation: the old service's for g, else the
+    /// one the imported `identity.json` lists in `service_keys`. A service applies only
+    /// operations of its own generation (Switch wire 6.4 step 6), so a proof of another
+    /// generation is no proof of the entry, whichever key signed it.
+    fn entry_proof(
+        &self,
+        signed: &SignedDoc,
+        generation: u64,
+    ) -> std::result::Result<TransitionProof, Refusal> {
         let peeked = TransitionProof::peek(signed).map_err(|e| {
             claim_conflict(&format!("an entry's proof doesn't read: {}", reason(e)))
         })?;
         let at = peeked.envelope().generation;
+        if at != generation {
+            return Err(claim_conflict(&format!(
+                "an entry's proof is of generation {at}, not of its operation's generation {generation}"
+            )));
+        }
         let key = if at == self.generation {
             Some(self.o_key)
         } else if at < self.generation {
@@ -1148,10 +1180,11 @@ impl ClaimCheck<'_> {
     }
 
     /// One entry of a live claim (Switch wire 10.5): its operation is a `claim` of this
-    /// identity for this claim at the entry's step, signed by its writer under a certificate
-    /// that holds `claims.write`; its proof verifies with its generation's service key and is
-    /// that entry's; after the checkpoint, it is the chain item at its `seq`. Returns the
-    /// entry, checked, with its writer and proof.
+    /// identity for this claim at the entry's step, verified with a certificate whose App ID
+    /// is the operation's writer and that holds `claims.write`; its proof is of the
+    /// operation's generation, verifies with that generation's service key and is that
+    /// entry's; after the checkpoint, it is the chain item at its `seq`. Returns the entry,
+    /// checked, with its writer and proof.
     fn entry(
         &self,
         key: &[u8; 32],
@@ -1165,22 +1198,28 @@ impl ClaimCheck<'_> {
             .app_id
             .ok_or_else(|| fail("an entry without an app"))?;
         let cert = self.writer_cert(entry, &writer)?;
-        let op = SignedOp::verify(
-            &entry.op,
-            &cert.signing_key(),
-            &self.identity,
-            Some(&writer),
-        )
-        .map_err(|e| match e.code {
-            ErrorCode::BadSignature => bad_signature(
-                "Switch wire 10.5: a live claim: an entry's operation isn't its writer's: \
-                     it doesn't verify with its writer's certificate",
-            ),
-            _ => fail(&format!(
-                "an entry isn't a claim of this identity: {}",
-                e.reason
-            )),
-        })?;
+        // The certificate is one of the app the operation names: a certificate in the part
+        // is O's word, and the writer comes from the operation itself.
+        let not_its_writers = |why: &str| {
+            bad_signature(format!(
+                "Switch wire 10.5: a live claim: an entry's operation isn't its writer's: {why}"
+            ))
+        };
+        if cert.app_id() != writer {
+            return Err(not_its_writers("its certificate is another app's"));
+        }
+        let op =
+            SignedOp::verify_with_cert(&entry.op, &cert, &self.identity).map_err(|e| {
+                match e.code {
+                    ErrorCode::BadSignature => {
+                        not_its_writers("it doesn't verify with its writer's certificate")
+                    }
+                    _ => fail(&format!(
+                        "an entry isn't a claim of this identity: {}",
+                        e.reason
+                    )),
+                }
+            })?;
         let OpKind::Claim(fields) = &op.body().kind else {
             return Err(fail("an entry isn't a claim entry"));
         };
@@ -1200,7 +1239,7 @@ impl ClaimCheck<'_> {
         let checked = fields
             .check()
             .map_err(|e| fail(&format!("an entry doesn't read: {}", e.reason)))?;
-        let proof = self.entry_proof(&entry.proof)?;
+        let proof = self.entry_proof(&entry.proof, op.body().generation)?;
         let env = proof.envelope();
         let item = op.item_hash().map_err(doc_refusal)?;
         if proof.body().object != b64(key)
@@ -1229,84 +1268,84 @@ fn claim_conflict(why: &str) -> Refusal {
     conflict(format!("Switch wire 10.5: a live claim: {why}"))
 }
 
+/// One live claim's entries, each checked ([`ClaimCheck::entry`]), in order.
+type CheckedEntries = Vec<(ClaimEntry, [u8; 16], TransitionProof)>;
+
 /// The live claims and tombstones (Switch wire 10.5). Every live claim is replayed from its
-/// entries: each is checked ([`ClaimCheck::entry`]) and, unless the claim was rebuilt from
-/// uploads, applied in order by the rows of Switch wire 6.8 at the time its proof's stub
-/// carries, the state after it being the state its proof shows; the claim is then the state
-/// its entries lead to, member for member.
+/// entries, each checked ([`ClaimCheck::entry`]) and applied in order by the rows of Switch
+/// wire 6.8 at the time its proof's stub carries: from nothing, the state after each being
+/// the state its proof shows ([`replay_live`]); or, for a claim rebuilt from uploads after a
+/// provider loss, from the attempts the uploads added ([`replay_rebuilt`]). The claim is then
+/// the state its entries lead to, member for member.
 fn check_claims(
     g: &Gathered<'_>,
     cx: &ClaimCheck<'_>,
 ) -> std::result::Result<(Vec<ImportedClaim>, Vec<ImportedClaim>), Refusal> {
-    let nobody = |_: &[u8; 16]| false;
     let mut claims = Vec::new();
     for (part, entries) in &g.claims {
         let fail = |why: &str| claim_conflict(why);
         let key = part.claim_key;
         let state = &part.claim;
-        let mut replayed: Option<Claim> = None;
-        let mut last: Option<(u64, TransitionProof)> = None;
+        // Only a provider loss rebuilds a claim from uploads (Switch spec 12.6), and the
+        // identity.json keeps the generation it lost from then on.
+        if state.rebuilt && cx.doc.body().recovery_from.is_none() {
+            return Err(fail(
+                "rebuilt from uploads, but the identity.json declares no provider loss",
+            ));
+        }
+        let mut checked: CheckedEntries = Vec::new();
         for entry in entries {
-            if last.as_ref().is_some_and(|(step, _)| entry.step <= *step) {
+            if checked
+                .last()
+                .is_some_and(|(last, _, _)| entry.step <= last.expected_step)
+            {
                 return Err(fail("its entries' steps don't increase"));
             }
-            let (checked, writer, proof) = cx.entry(&key, entry)?;
-            if !state.rebuilt {
-                let at = proof.envelope().server_time;
-                let rc = replay_context(writer, at, &nobody);
-                let next = apply_entry(replayed.as_ref(), &checked, &rc)
-                    .map_err(|e| fail(&format!("an entry doesn't apply: {}", e.reason)))?;
-                let shown = ClaimView::from_value(&proof.body().state)
-                    .map_err(|_| fail("an entry's proof shows no claim view"))?;
-                if timeless(next.view(&key, at, &nobody)) != timeless(shown) {
-                    return Err(fail(
-                        "an entry's proof doesn't show the state its entry leads to",
-                    ));
-                }
-                replayed = Some(next);
-            }
-            last = Some((entry.step, proof));
+            checked.push(cx.entry(&key, entry)?);
         }
-        let first_owner = state.attempts.first().map(|a| a.owner);
-        let claim = match (&last, state.rebuilt) {
-            (None, false) => return Err(fail("a live claim without entries")),
-            (Some((step, _)), _)
-                if state.step <= *step
-                    || (!state.rebuilt && Some(state.step) != step.checked_add(1)) =>
-            {
-                return Err(fail("its step isn't one after its last entry"));
-            }
-            (_, true) => {
-                if state.creator != first_owner {
-                    return Err(fail("its creator isn't the owner of its first attempt"));
-                }
-                claim_of(state)?
-            }
-            (Some((_, proof)), false) => {
-                let Some(claim) = replayed else {
-                    return Err(fail("a live claim without entries"));
-                };
-                if state.creator != claim.creator || state.creator != first_owner {
-                    return Err(fail("its creator isn't the owner of its first attempt"));
-                }
-                if state.last_entry_ms != Some(proof.envelope().server_time) {
-                    return Err(fail("its last_entry_ms isn't its last entry's time"));
-                }
-                let pinned = claim.pin.deadline();
-                if claim.tombstone
-                    || claim_of(state)? != claim
-                    || state.attempts.iter().any(|a| a.deadline_ms != pinned)
-                {
-                    return Err(fail("its state isn't the state its entries give"));
-                }
-                claim
-            }
+        if state.creator != state.attempts.first().map(|a| a.owner) {
+            return Err(fail("its creator isn't the owner of its first attempt"));
+        }
+        let claim = if state.rebuilt {
+            replay_rebuilt(state, &checked)?
+        } else {
+            replay_live(&key, state, &checked)?
         };
         claims.push(ImportedClaim {
             claim_key: key,
             claim,
             entries: entries.clone(),
         });
+    }
+    // Every entry of a live claim that the chain parts hold with its document, from the
+    // claim's first entry on, is one of the claim's `claim_entry` parts: O can't leave out an
+    // entry, such as the newest, to roll the claim back.
+    let live: HashMap<[u8; 32], (Option<u64>, HashSet<u64>)> = claims
+        .iter()
+        .map(|c| {
+            let seqs: HashSet<u64> = c.entries.iter().map(|e| e.seq).collect();
+            (c.claim_key, (seqs.iter().min().copied(), seqs))
+        })
+        .collect();
+    for chained in cx.facts.at.values() {
+        let Some(op) = chained.op()? else {
+            continue;
+        };
+        let OpKind::Claim(fields) = &op.body().kind else {
+            continue;
+        };
+        let Ok(key) = <[u8; 32]>::try_from(fields.claim_key.as_slice()) else {
+            continue;
+        };
+        let seq = chained.part.seq;
+        if let Some((first, seqs)) = live.get(&key)
+            && first.is_none_or(|first| seq >= first)
+            && !seqs.contains(&seq)
+        {
+            return Err(claim_conflict(&format!(
+                "the claim entry at seq {seq}, which the chain parts hold, isn't one of its claim's entries"
+            )));
+        }
     }
     let mut tombstones = Vec::new();
     for (key, t) in &g.tombstones {
@@ -1335,12 +1374,170 @@ fn check_claims(
     Ok((claims, tombstones))
 }
 
+/// A claim not rebuilt (Switch wire 10.5): replayed from nothing, the state after each entry
+/// being the state its proof shows, leaving out what depends on when it is read; its `step`
+/// one after its last entry, its `last_entry_ms` that entry's time, and every member the
+/// replay's.
+fn replay_live(
+    key: &[u8; 32],
+    state: &ClaimState,
+    checked: &CheckedEntries,
+) -> std::result::Result<Claim, Refusal> {
+    let fail = |why: &str| claim_conflict(why);
+    let nobody = |_: &[u8; 16]| false;
+    let mut replayed: Option<Claim> = None;
+    for (entry, writer, proof) in checked {
+        let at = proof.envelope().server_time;
+        let rc = replay_context(*writer, at, &nobody);
+        let next = apply_entry(replayed.as_ref(), entry, &rc)
+            .map_err(|e| fail(&format!("an entry doesn't apply: {}", e.reason)))?;
+        let shown = ClaimView::from_value(&proof.body().state)
+            .map_err(|_| fail("an entry's proof shows no claim view"))?;
+        if timeless(next.view(key, at, &nobody)) != timeless(shown) {
+            return Err(fail(
+                "an entry's proof doesn't show the state its entry leads to",
+            ));
+        }
+        replayed = Some(next);
+    }
+    let (Some(claim), Some((last, _, proof))) = (replayed, checked.last()) else {
+        return Err(fail("a live claim without entries"));
+    };
+    if Some(state.step) != last.expected_step.checked_add(1) {
+        return Err(fail("its step isn't one after its last entry"));
+    }
+    if state.creator != claim.creator {
+        return Err(fail("its creator isn't the owner of its first attempt"));
+    }
+    if state.last_entry_ms != Some(proof.envelope().server_time) {
+        return Err(fail("its last_entry_ms isn't its last entry's time"));
+    }
+    same_state(state, &claim)?;
+    Ok(claim)
+}
+
+/// A claim rebuilt from uploads after a provider loss (Switch wire 10.5, Switch spec 12.6).
+/// The uploads change it without entries, and the export carries no uploads, so the only
+/// state taken unchecked is the attempts the part marks `from_upload`. The replay starts from
+/// them alone: each as written, except that one an entry names is open and unresolved, its
+/// outcome then coming from the entries; the part's `current` if it is one of the others;
+/// SETTLED if one is `done`; the part's pin, which the uploaded attempts carry, and its
+/// `divergent`, which only uploads set. Each entry then applies in turn, its `expected_step`
+/// raising the step first, since uploads count steps too, and the claim is the state the
+/// entries lead to, member for member: every attempt not marked `from_upload` comes from an
+/// entry. Its `step` may be past its last entry, and its `last_entry_ms` is taken as written,
+/// since uploads after the last entry change both; and two open attempts keep it divergent,
+/// since only an upload beside an open attempt opens a second one and only resolving them
+/// clears it. The proofs of a rebuilt claim's entries show the uploads merged between them,
+/// so they aren't compared with the replay; each is still checked as the entry's.
+fn replay_rebuilt(
+    state: &ClaimState,
+    checked: &CheckedEntries,
+) -> std::result::Result<Claim, Refusal> {
+    let fail = |why: &str| claim_conflict(why);
+    let nobody = |_: &[u8; 16]| false;
+    let named: HashSet<[u8; 16]> = checked.iter().map(|(e, _, _)| e.attempt_id).collect();
+    let attempts: Vec<Attempt> = state
+        .attempts
+        .iter()
+        .filter(|a| a.from_upload)
+        .map(|a| {
+            let mut base = to_attempt(a);
+            if named.contains(&a.attempt_id) {
+                base.outcome = Outcome::Open;
+                base.resolved_by = None;
+                base.duplicate = false;
+            }
+            base
+        })
+        .collect();
+    let current = state.current.and_then(|id| {
+        attempts
+            .iter()
+            .position(|a| a.attempt_id == id && !named.contains(&id))
+    });
+    let mut claim = Claim {
+        step: checked
+            .first()
+            .map_or(state.step, |(e, _, _)| e.expected_step),
+        settled: attempts.iter().any(|a| a.outcome == Outcome::Done),
+        current,
+        pin: if attempts.is_empty() {
+            Pin::Unpinned
+        } else {
+            state.pinned_deadline
+        },
+        creator: attempts.first().map(|a| a.owner),
+        attempts,
+        tombstone: false,
+        divergent: state.divergent,
+        rebuilt: true,
+        last_entry: None,
+    };
+    for (entry, writer, proof) in checked {
+        claim.step = claim.step.max(entry.expected_step);
+        let rc = replay_context(*writer, proof.envelope().server_time, &nobody);
+        claim = apply_entry(Some(&claim), entry, &rc)
+            .map_err(|e| fail(&format!("an entry doesn't apply: {}", e.reason)))?;
+    }
+    if state.step < claim.step {
+        return Err(fail("its step isn't after its last entry"));
+    }
+    claim.step = state.step;
+    claim.last_entry = state.last_entry_ms;
+    claim.divergent = state.divergent;
+    claim.creator = state.creator;
+    let open = claim
+        .attempts
+        .iter()
+        .filter(|a| a.outcome == Outcome::Open)
+        .count();
+    if open > 1 && !claim.divergent {
+        return Err(fail("two open attempts, but not divergent"));
+    }
+    // Uploads may have added an attempt before an entry that the replay places after it:
+    // the attempts compare by ID, in the part's order.
+    let current_id = claim
+        .current
+        .and_then(|i| claim.attempts.get(i))
+        .map(|a| a.attempt_id);
+    let mut ordered = Vec::with_capacity(claim.attempts.len());
+    for a in &state.attempts {
+        match claim.attempts.iter().find(|r| r.attempt_id == a.attempt_id) {
+            Some(r) => ordered.push(r.clone()),
+            None => return Err(fail("its state isn't the state its entries give")),
+        }
+    }
+    if ordered.len() != claim.attempts.len() {
+        return Err(fail("its state isn't the state its entries give"));
+    }
+    claim.current = current_id.and_then(|id| ordered.iter().position(|a| a.attempt_id == id));
+    claim.attempts = ordered;
+    same_state(state, &claim)?;
+    Ok(claim)
+}
+
+/// The part's claim is the replayed one, member for member, those no claim view shows
+/// included, such as each attempt's `deadline_ms`, the pinned deadline, and `from_upload`.
+fn same_state(state: &ClaimState, claim: &Claim) -> std::result::Result<(), Refusal> {
+    let pinned = claim.pin.deadline();
+    if claim.tombstone
+        || claim_of(state)? != *claim
+        || state.attempts.iter().any(|a| a.deadline_ms != pinned)
+    {
+        return Err(claim_conflict("its state isn't the state its entries give"));
+    }
+    Ok(())
+}
+
 /// The uploaded evidence (Switch wire 10.5, Switch spec 12.5 step 3), compared by what the
 /// operations signed: a claim a proof shows SETTLED is SETTLED here, live or as a tombstone,
 /// unless the old service may have deleted it by `last_time`; a claim a proof shows with an
-/// attempt is held with that attempt, at that step or later; a record a proof shows at a
-/// version is that very write, or one whose signed `expected_version` is that version or
-/// later, or absent when that version deletes.
+/// attempt is held with that attempt, at that step or later; a live claim holds each attempt
+/// a proof shows with the outcome it shows, unless one of the claim's verified entries after
+/// that proof wrote another ([`resolved_after`]); a record a proof shows at a version is that
+/// very write, or one whose signed `expected_version` is that version or later, or absent
+/// when that version deletes.
 fn check_evidence(
     cx: &Activation<'_>,
     claims: &[ImportedClaim],
@@ -1395,6 +1592,22 @@ fn check_evidence(
                 }
                 _ => {}
             }
+            // An attempt's state, not only its presence: a rebuilt claim takes its uploaded
+            // attempts as written, so an outcome the evidence contradicts must come from an
+            // entry. A tombstone keeps no entries; it is SETTLED, so it frees nothing.
+            if let Some(c) = live.filter(|c| c.claim.step >= view.step) {
+                for shown in &view.attempts {
+                    let changed =
+                        c.claim.attempts.iter().any(|a| {
+                            a.attempt_id == shown.attempt_id && a.outcome != shown.outcome
+                        });
+                    if changed && !resolved_after(c, &shown.attempt_id, view.step) {
+                        return fail(
+                            "an attempt with another outcome than the import's, which no entry after it wrote",
+                        );
+                    }
+                }
+            }
         } else if let (Some(deleted), Some(generation), Some(version)) = (
             state.get("deleted").and_then(Value::as_bool),
             state.get("generation").and_then(Value::as_u64),
@@ -1423,6 +1636,19 @@ fn check_evidence(
         }
     }
     Ok(())
+}
+
+/// Whether one of a live claim's entries at `step` or later, all verified, writes an outcome
+/// of `attempt`: a `done`, `failed` or `unknown` naming it.
+fn resolved_after(claim: &ImportedClaim, attempt: &[u8; 16], step: u64) -> bool {
+    claim.entries.iter().filter(|e| e.step >= step).any(|e| {
+        SignedOp::peek(&e.op).is_ok_and(|op| match &op.body().kind {
+            OpKind::Claim(fields) => {
+                fields.kind != ClaimType::Attempt && fields.attempt_id.as_slice() == attempt
+            }
+            _ => false,
+        })
+    })
 }
 
 /// The tombstone of an app the enrollment named revoked, which the export doesn't carry.

@@ -90,6 +90,26 @@ fn op(kind: OpKind, batch: BatchRef) -> SignedOp {
     .unwrap()
 }
 
+/// An operation naming the fixture's app as its writer, signed by `signer`: the app itself,
+/// or another app forging it.
+fn op_by(signer: &AppKeys, kind: OpKind, batch: BatchRef) -> SignedOp {
+    let body = OpBody {
+        identity: identity().public(),
+        app_id: Some(app().app_id_bytes()),
+        generation: 1,
+        batch,
+        conditions: Vec::new(),
+        kind,
+    };
+    let bytes = body.to_json().unwrap();
+    let sig = crate::signing::Signs::sign_fields(
+        signer,
+        crate::labels::sig::OP,
+        &[&body.identity, &bytes],
+    );
+    SignedOp::peek(&SignedDoc::from_parts(&bytes, &sig)).unwrap()
+}
+
 fn record_put() -> RecordPut {
     let id = identity();
     let naming = NamingKey::from_root(&id.switch_root());
@@ -142,6 +162,12 @@ struct Fixture {
 }
 
 fn fixture() -> Fixture {
+    fixture_signed_by(&app(), &app())
+}
+
+/// The fixture, its shared record's write and its claim's attempt signed by these keys: the
+/// app's own, or another app's naming the app as their writer.
+fn fixture_signed_by(write_signer: &AppKeys, attempt_signer: &AppKeys) -> Fixture {
     let ik = identity();
     let id = ik.public();
     let keys = app();
@@ -186,8 +212,12 @@ fn fixture() -> Fixture {
         batch(10, 2),
     );
     let put = record_put();
-    let write = op(OpKind::RecordPut(put.clone()), batch(11, 1));
-    let attempt = op(OpKind::Claim(attempt_fields()), batch(12, 1));
+    let write = op_by(write_signer, OpKind::RecordPut(put.clone()), batch(11, 1));
+    let attempt = op_by(
+        attempt_signer,
+        OpKind::Claim(attempt_fields()),
+        batch(12, 1),
+    );
     let freeze_at = START + 4_000;
     let transition = ServiceTransition::Freeze {
         freeze_hash: freeze.hash(),
@@ -1936,18 +1966,32 @@ fn test_activation_claims() {
         ErrorCode::Conflict,
         "a live claim without entries",
     );
-    let parts = f.with(|p| {
-        p.remove(ci + 1);
-        claim_mut(p).rebuilt = true;
-    });
-    f.run_with(&parts).unwrap();
-    let parts = f.with(|p| {
-        p.remove(ci + 1);
-        let c = claim_mut(p);
-        c.rebuilt = true;
-        c.creator = Some(other);
-    });
-    refused(f.run_with(&parts), ErrorCode::Conflict, "its creator");
+    // Marked rebuilt from uploads, which would skip the replay from nothing: the open
+    // attempt failed and its claim freed, on an account that had no provider loss.
+    for drop_entry in [false, true] {
+        let parts = f.with(|p| {
+            if drop_entry {
+                p.remove(ci + 1);
+            }
+            let c = claim_mut(p);
+            c.rebuilt = true;
+            c.attempts[0].outcome = Outcome::Failed;
+            c.attempts[0].resolved_by = Some(app_id);
+            c.current = None;
+        });
+        refused(
+            f.run_with(&parts),
+            ErrorCode::Conflict,
+            "rebuilt from uploads, but the identity.json declares no provider loss",
+        );
+    }
+    let parts = f.with(|p| claim_mut(p).rebuilt = true);
+    refused(
+        f.run_with(&parts),
+        ErrorCode::Conflict,
+        "declares no provider loss",
+    );
+    let _ = other;
     // An entry's proof: forged, another entry's, or not the chain item.
     let parts = f.with(|p| {
         if let Part::ClaimEntry(e) = &mut p[ci + 1] {
@@ -2285,6 +2329,660 @@ fn test_activation_claim_entry_of_an_earlier_generation() {
         ErrorCode::Conflict,
         "an entry's proof doesn't verify with generation 1's service key",
     );
+}
+
+#[test]
+fn test_activation_entry_writer_is_its_certificates_app() {
+    // The executor-like other app holds claims.write and signs an attempt naming the app as
+    // its writer; the old service carries the other app's certificate with it, and signs
+    // the chain and the proof over that operation.
+    let other = cert_of(&other_app());
+    let f = fixture_signed_by(&app(), &other_app());
+    let parts = f.with(|p| entry_mut(p).cert = Some(other.signed().clone()));
+    refused(
+        f.run_with(&parts),
+        ErrorCode::BadSignature,
+        "an entry's operation isn't its writer's: its certificate is another app's",
+    );
+    // With the app's own certificate the signature doesn't verify.
+    refused(
+        f.run(),
+        ErrorCode::BadSignature,
+        "an entry's operation isn't its writer's",
+    );
+    // A shared record's write, the same way.
+    let f = fixture_signed_by(&other_app(), &app());
+    let parts = f.with(|p| record_mut(p).cert = Some(other.signed().clone()));
+    refused(
+        f.run_with(&parts),
+        ErrorCode::BadSignature,
+        "a shared record: its operation isn't its writer's: its certificate is another app's",
+    );
+    // The part's writer is the operation's.
+    let f = fixture();
+    let parts = f.with(|p| {
+        let r = record_mut(p);
+        r.writer = other_app().app_id_bytes();
+        r.cert = Some(f.cert.signed().clone());
+    });
+    refused(
+        f.run_with(&parts),
+        ErrorCode::Conflict,
+        "a member isn't its operation's: its writer",
+    );
+}
+
+#[test]
+fn test_activation_entry_proof_of_its_operations_generation() {
+    // Behind the checkpoint, the generation 1 attempt with a proof the generation 2 service
+    // signed, and no generation 1 key in the identity.json.
+    let key2 = SigningKey::from_bytes(&[15; 32]);
+    let f = second_generation(Vec::new());
+    let f = Fixture {
+        parts: f.with(|p| p.retain(|x| x.kind() != "record")),
+        ..f
+    };
+    let attempt = match &f.parts.iter().find(|p| p.kind() == "claim_entry") {
+        Some(Part::ClaimEntry(e)) => e.op.clone(),
+        _ => unreachable!(),
+    };
+    let item = item_hash(ItemType::Op, &attempt.doc_bytes().unwrap());
+    let (stub, _) = ChainTip {
+        generation: 2,
+        seq: 5,
+        chain_hash: f.stubs[3].chain_hash,
+    }
+    .append(6, START + 3_000, ItemType::Op, item, Some(batch(12, 1)))
+    .unwrap();
+    let later = TransitionProof::sign(
+        &key2,
+        &f.id,
+        ProofBody::new(
+            stub,
+            b64(&CLAIM_KEY),
+            &ProofState::Claim(f.claim_proof.body().state.clone()),
+        ),
+    )
+    .unwrap();
+    let parts = f.with(|p| entry_mut(p).proof = later.signed().clone());
+    refused(
+        f.run_signed(&key2, &parts),
+        ErrorCode::Conflict,
+        "an entry's proof is of generation 2, not of its operation's generation 1",
+    );
+    // A record's proof, the same way: the generation 1 write with a generation 2 proof.
+    let f = second_generation(vec![ServiceKeyEntry {
+        generation: 1,
+        key: old_key().verifying_key().to_bytes(),
+    }]);
+    let write = record_mut(&mut f.parts.clone()).op.clone().unwrap();
+    let item = item_hash(ItemType::Op, &write.doc_bytes().unwrap());
+    let (stub, _) = ChainTip {
+        generation: 2,
+        seq: 3,
+        chain_hash: f.stubs[2].chain_hash,
+    }
+    .append(4, START + 2_000, ItemType::Op, item, Some(batch(11, 1)))
+    .unwrap();
+    let key = record_mut(&mut f.parts.clone()).key;
+    let later = TransitionProof::sign(
+        &key2,
+        &f.id,
+        ProofBody::new(
+            stub,
+            b64(&key),
+            &ProofState::Record {
+                version: RecordVersion::new(1, 4),
+                deleted: false,
+            },
+        ),
+    )
+    .unwrap();
+    let parts = f.with(|p| record_mut(p).proof = Some(later.signed().clone()));
+    refused(
+        f.run_signed(&key2, &parts),
+        ErrorCode::Conflict,
+        "isn't the proof of its current write",
+    );
+}
+
+const UPLOADED: [u8; 16] = [40; 16];
+const SECOND: [u8; 16] = [41; 16];
+const DEADLINE: u64 = START + 2 * DAY;
+
+/// The time of the recovered account's entry at `seq`.
+fn entry_time(seq: u64) -> u64 {
+    START + seq * 1_000
+}
+
+/// A claim entry of the recovered account's claim by the app.
+fn claim_fields(kind: ClaimType, expected_step: u64, attempt_id: [u8; 16]) -> ClaimFields {
+    ClaimFields {
+        claim_key: CLAIM_KEY.to_vec(),
+        kind,
+        expected_step,
+        attempt_id: attempt_id.to_vec(),
+        orphan_after: (kind == ClaimType::Attempt).then_some(86_400),
+        deadline: (kind == ClaimType::Attempt).then_some(DEADLINE),
+        basis: None,
+        evidence_ref: None,
+    }
+}
+
+/// An attempt of the recovered account's claim, owned by the app.
+fn attempt_state(
+    attempt_id: [u8; 16],
+    outcome: Outcome,
+    opened_at_ms: u64,
+    from_upload: bool,
+) -> AttemptState {
+    AttemptState {
+        attempt_id,
+        owner: app().app_id_bytes(),
+        outcome,
+        opened_at_ms,
+        orphan_after_s: 86_400,
+        possibly_duplicate: false,
+        duplicate: false,
+        deadline_ms: Some(DEADLINE),
+        from_upload,
+        resolved_by: (outcome != Outcome::Open).then(|| app().app_id_bytes()),
+    }
+}
+
+/// An account after a provider loss of generation 1 (Switch spec 12.6), frozen for a move:
+/// generation 2 starts afresh at seq 1, its `identity.json` with `recovery_from` 1 naming
+/// the old service's key, then the app's record and receive key at seqs 2 and 3, then the
+/// app's `entries` of the claim at seqs 4 on, each its own batch, then the freeze. The claim
+/// was rebuilt from uploads, which added `UPLOADED`; its part is `claim`. The chain parts at
+/// `stub_only` drop their documents, and the claim carries the entries at seqs `carried`.
+/// Returns the fixture and the chain's stubs, the one at seq n at index n - 1.
+fn recovered(
+    entries: &[ClaimFields],
+    claim: ClaimState,
+    stub_only: &[u64],
+    carried: &[u64],
+) -> (Fixture, Vec<Stub>) {
+    let f = fixture();
+    let ik = identity();
+    let keys = app();
+    let app_id = keys.app_id_bytes();
+    let mut body = f.doc.body().clone();
+    body.version = 2;
+    body.generation = 2;
+    body.recovery_from = Some(1);
+    let doc = IdentityDoc::sign(&ik, body).unwrap();
+    let freeze = Freeze::sign(
+        &ik,
+        FreezeBody {
+            identity: f.id,
+            inbox: Inbox::new(NEXT, next_key().verifying_key().to_bytes()),
+            next_generation: 3,
+            issued_at: START + 30_000,
+            nonce: [4; 16],
+        },
+    )
+    .unwrap();
+    let op2 = |kind: OpKind, batch: BatchRef| {
+        SignedOp::sign(
+            &keys,
+            OpBody {
+                identity: f.id,
+                app_id: Some(app_id),
+                generation: 2,
+                batch,
+                conditions: Vec::new(),
+                kind,
+            },
+        )
+        .unwrap()
+    };
+    let record = AppRecord::sign(&keys, AppRecordBody::new(&f.cert, Vec::new(), START)).unwrap();
+    let rk = ReceiveKey::from_secret(0, [8; 32]);
+    let rk_record =
+        ReceiveKeyRecord::sign(&keys, &f.cert, ReceiveKeyBody::new(&f.cert, &rk)).unwrap();
+    let app_put = op2(
+        OpKind::AppPut {
+            record: record.signed().clone(),
+        },
+        batch(10, 2),
+    );
+    let key_put = op2(
+        OpKind::ReceiveKeyPut {
+            record: rk_record.signed().clone(),
+        },
+        batch(10, 2),
+    );
+    let mut items: Vec<(ItemType, SignedDoc, Option<BatchRef>, u64)> = vec![
+        (ItemType::Identity, doc.signed().clone(), None, START),
+        (
+            ItemType::Op,
+            app_put.signed().clone(),
+            Some(batch(10, 2)),
+            START + 1_000,
+        ),
+        (
+            ItemType::Op,
+            key_put.signed().clone(),
+            Some(batch(10, 2)),
+            START + 1_000,
+        ),
+    ];
+    let mut batches = vec![(10, START + 1_000, vec![app_put, key_put])];
+    let mut entry_ops = Vec::new();
+    for (i, fields) in entries.iter().enumerate() {
+        let seq = 4 + i as u64;
+        let id = 20 + i as u8;
+        let entry = op2(OpKind::Claim(fields.clone()), batch(id, 1));
+        items.push((
+            ItemType::Op,
+            entry.signed().clone(),
+            Some(batch(id, 1)),
+            entry_time(seq),
+        ));
+        batches.push((id, entry_time(seq), vec![entry.clone()]));
+        entry_ops.push((seq, fields.expected_step, entry));
+    }
+    let freeze_at = START + 40_000;
+    let transition = ServiceTransition::Freeze {
+        freeze_hash: freeze.hash(),
+        next_generation: 3,
+        inbox: freeze.next().clone(),
+        at: freeze_at,
+    }
+    .sign(&old_key(), &f.id)
+    .unwrap();
+    items.push((ItemType::Service, transition, None, freeze_at));
+    let mut tip = ChainTip {
+        generation: 2,
+        seq: 0,
+        chain_hash: [0; 32],
+    };
+    let mut stubs = Vec::new();
+    let mut chain = Vec::new();
+    for (i, (item_type, signed, batch, time)) in items.iter().enumerate() {
+        let seq = 1 + i as u64;
+        let hash = item_hash(*item_type, &signed.doc_bytes().unwrap());
+        let (stub, next) = tip.append(seq, *time, *item_type, hash, *batch).unwrap();
+        tip = next;
+        stubs.push(stub.clone());
+        chain.push(Part::Chain(ChainPart {
+            seq,
+            stub,
+            item_type: *item_type,
+            doc: (!stub_only.contains(&seq)).then(|| signed.clone()),
+            context: Value::Null,
+        }));
+    }
+    let head = SignedHead::sign(&old_key(), &f.id, &tip);
+    let mut parts = vec![Part::Meta(MetaPart {
+        identity: doc.signed().clone(),
+        generation: 2,
+        seq: tip.seq,
+        directory_version: 1,
+        apps_version: 1,
+        app_added_at: vec![(app_id, 1)],
+    })];
+    parts.extend(chain);
+    parts.push(Part::App(AppPart {
+        app_id,
+        record: Some(record.signed().clone()),
+        record_seq: Some(2),
+        record_at_ms: Some(START + 1_000),
+        receive_keys: vec![(rk_record.signed().clone(), 3)],
+        cursor: tip.seq,
+        last_seen_ms: Some(START + 1_000),
+        revoked_at_ms: None,
+        departed_at_ms: None,
+        departure_epoch: None,
+        rotated: false,
+        renewed_cert: None,
+        lagging: false,
+        keys_through: Some(1),
+        full_bundle_requested_ms: None,
+    }));
+    // A claim not rebuilt has proofs showing its replay; a rebuilt one's aren't compared.
+    let rebuilt = claim.rebuilt;
+    let nobody = |_: &[u8; 16]| false;
+    let mut replayed: Option<Claim> = None;
+    let mut shown_at = Vec::new();
+    for (seq, step, entry) in &entry_ops {
+        let at = entry_time(*seq);
+        let shown = if rebuilt {
+            Claim {
+                step: step + 1,
+                ..Claim::default()
+            }
+        } else {
+            let OpKind::Claim(fields) = &entry.body().kind else {
+                unreachable!()
+            };
+            let cx = EntryContext {
+                writer: app_id,
+                now: at,
+                can_read: false,
+                is_current: &nobody,
+                limits: ClaimLimits::default(),
+                tally: ClaimTally::default(),
+            };
+            let next = apply_entry(replayed.as_ref(), &fields.check().unwrap(), &cx).unwrap();
+            replayed = Some(next.clone());
+            next
+        };
+        shown_at.push(shown.view(&CLAIM_KEY, at, &nobody));
+    }
+    parts.push(Part::Claim(ClaimPart {
+        claim_key: CLAIM_KEY,
+        claim,
+    }));
+    for ((seq, step, entry), shown) in entry_ops.iter().zip(shown_at) {
+        if !carried.contains(seq) {
+            continue;
+        }
+        let proof = TransitionProof::sign(
+            &old_key(),
+            &f.id,
+            ProofBody::new(
+                stubs[*seq as usize - 1].clone(),
+                b64(&CLAIM_KEY),
+                &ProofState::Claim(shown.to_value()),
+            ),
+        )
+        .unwrap();
+        parts.push(Part::ClaimEntry(ClaimEntryPart {
+            claim_key: CLAIM_KEY,
+            step: *step,
+            seq: *seq,
+            op: entry.signed().clone(),
+            proof: proof.signed().clone(),
+            cert: None,
+        }));
+    }
+    batches.sort_by_key(|(id, _, _)| b64(&[*id; 16]));
+    for (id, at, ops) in batches {
+        parts.push(Part::Batch(BatchPart {
+            id: [id; 16],
+            ops_hash: crate::ops::ops_hash(&ops).unwrap(),
+            at_ms: at,
+        }));
+    }
+    let chunks = pack(&parts, DEFAULT_CHUNK_TARGET).unwrap();
+    let manifest = Manifest::sign(
+        &old_key(),
+        ManifestBody::new(
+            f.id,
+            freeze.hash(),
+            2,
+            freeze_at,
+            head,
+            None,
+            chunks.iter().map(|(r, _)| r.clone()).collect(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let fixture = Fixture {
+        doc,
+        freeze,
+        parts,
+        manifest,
+        chunks,
+        stubs: stubs.clone(),
+        now: freeze_at,
+        ..f
+    };
+    (fixture, stubs)
+}
+
+/// The rebuilt claim the recovered account's honest export carries after its app failed the
+/// uploaded attempt (seq 4, step 1, the upload having taken step 0) and opened `SECOND`
+/// (seq 5, step 2).
+fn rebuilt_claim() -> ClaimState {
+    ClaimState {
+        step: 3,
+        attempts: vec![
+            attempt_state(UPLOADED, Outcome::Failed, START - DAY, true),
+            attempt_state(SECOND, Outcome::Open, entry_time(5), false),
+        ],
+        current: Some(SECOND),
+        settled: false,
+        divergent: false,
+        pinned_deadline: Pin::At(DEADLINE),
+        rebuilt: true,
+        creator: Some(app().app_id_bytes()),
+        last_entry_ms: Some(entry_time(5)),
+    }
+}
+
+fn rebuilt_entries() -> Vec<ClaimFields> {
+    vec![
+        claim_fields(ClaimType::Failed, 1, UPLOADED),
+        claim_fields(ClaimType::Attempt, 2, SECOND),
+    ]
+}
+
+/// A claim view of the recovered account's claim at `step`, its attempts as given.
+fn rebuilt_view(
+    step: u64,
+    attempts: &[AttemptState],
+    current: Option<usize>,
+) -> crate::claims::ClaimView {
+    Claim {
+        step,
+        attempts: attempts
+            .iter()
+            .map(|a| crate::claims::Attempt {
+                attempt_id: a.attempt_id,
+                owner: a.owner,
+                outcome: a.outcome,
+                opened_at: a.opened_at_ms,
+                orphan_after: a.orphan_after_s,
+                possibly_duplicate: a.possibly_duplicate,
+                duplicate: a.duplicate,
+                resolved_by: a.resolved_by,
+                from_upload: a.from_upload,
+            })
+            .collect(),
+        current,
+        pin: Pin::At(DEADLINE),
+        rebuilt: true,
+        creator: Some(app().app_id_bytes()),
+        ..Claim::default()
+    }
+    .view(&CLAIM_KEY, START, &|_| true)
+}
+
+#[test]
+fn test_activation_rebuilt_claim_replays_its_entries() {
+    // The honest export imports: the uploaded attempt failed by an entry, the second
+    // attempt opened by one.
+    let (f, _) = recovered(&rebuilt_entries(), rebuilt_claim(), &[], &[4, 5]);
+    let import = f.run().unwrap();
+    assert_eq!(import.claims.len(), 1);
+    assert!(import.claims[0].claim.rebuilt);
+    assert_eq!(import.proof_generations, [2]);
+    // Anything not from an upload comes from an entry: the second attempt failed without
+    // one, or its current cleared, is refused.
+    for change in [
+        (|c: &mut ClaimState| {
+            c.attempts[1].outcome = Outcome::Failed;
+            c.attempts[1].resolved_by = Some(app().app_id_bytes());
+            c.current = None;
+        }) as fn(&mut ClaimState),
+        |c| c.current = None,
+        |c| c.attempts[0].outcome = Outcome::Open,
+        |c| c.settled = true,
+        |c| c.attempts[1].possibly_duplicate = true,
+        |c| c.attempts[1].deadline_ms = None,
+    ] {
+        let mut claim = rebuilt_claim();
+        change(&mut claim);
+        let (f, _) = recovered(&rebuilt_entries(), claim, &[], &[4, 5]);
+        refused(
+            f.run(),
+            ErrorCode::Conflict,
+            "its state isn't the state its entries give",
+        );
+    }
+    // Its step may be past its last entry, never behind it; its creator is its first
+    // attempt's owner.
+    let mut claim = rebuilt_claim();
+    claim.step = 5;
+    recovered(&rebuilt_entries(), claim, &[], &[4, 5])
+        .0
+        .run()
+        .unwrap();
+    let mut claim = rebuilt_claim();
+    claim.step = 2;
+    let (f, _) = recovered(&rebuilt_entries(), claim, &[], &[4, 5]);
+    refused(
+        f.run(),
+        ErrorCode::Conflict,
+        "its step isn't after its last entry",
+    );
+    let mut claim = rebuilt_claim();
+    claim.creator = Some(other_app().app_id_bytes());
+    let (f, _) = recovered(&rebuilt_entries(), claim, &[], &[4, 5]);
+    refused(f.run(), ErrorCode::Conflict, "its creator");
+    // An entry that opens an attempt an upload added doesn't apply.
+    let entries = vec![
+        claim_fields(ClaimType::Failed, 1, UPLOADED),
+        claim_fields(ClaimType::Attempt, 2, UPLOADED),
+    ];
+    let (f, _) = recovered(&entries, rebuilt_claim(), &[], &[4, 5]);
+    refused(f.run(), ErrorCode::Conflict, "an entry doesn't apply");
+    // Two open attempts are divergent: uploads open a second one only beside an open one.
+    let mut claim = rebuilt_claim();
+    claim.step = 1;
+    claim.attempts = vec![
+        attempt_state(UPLOADED, Outcome::Open, START - DAY, true),
+        attempt_state(SECOND, Outcome::Open, START - DAY, true),
+    ];
+    claim.current = Some(UPLOADED);
+    let (f, _) = recovered(&[], claim.clone(), &[], &[]);
+    refused(
+        f.run(),
+        ErrorCode::Conflict,
+        "two open attempts, but not divergent",
+    );
+    claim.divergent = true;
+    recovered(&[], claim, &[], &[]).0.run().unwrap();
+}
+
+#[test]
+fn test_activation_rebuilt_claim_keeps_every_entry_the_chain_holds() {
+    // The second attempt marked as an upload's, its entry left out while the chain holds it.
+    let mut claim = rebuilt_claim();
+    claim.attempts[1].from_upload = true;
+    let (f, _) = recovered(&rebuilt_entries(), claim.clone(), &[], &[4]);
+    refused(
+        f.run(),
+        ErrorCode::Conflict,
+        "the claim entry at seq 5, which the chain parts hold, isn't one of its claim's entries",
+    );
+    // Its newest entry left out, the claim as it was before it.
+    let mut claim = rebuilt_claim();
+    claim.step = 2;
+    claim.attempts.truncate(1);
+    claim.current = None;
+    claim.last_entry_ms = Some(entry_time(4));
+    let (f, _) = recovered(&rebuilt_entries(), claim.clone(), &[], &[4]);
+    refused(
+        f.run(),
+        ErrorCode::Conflict,
+        "isn't one of its claim's entries",
+    );
+    // With the chain's document of it dropped too, nothing shows it.
+    recovered(&rebuilt_entries(), claim, &[5], &[4])
+        .0
+        .run()
+        .unwrap();
+    // A claim not rebuilt, the same way: its `failed` left out, the attempt still open.
+    let entries = vec![
+        claim_fields(ClaimType::Attempt, 0, SECOND),
+        claim_fields(ClaimType::Failed, 1, SECOND),
+    ];
+    let open = ClaimState {
+        step: 1,
+        attempts: vec![attempt_state(SECOND, Outcome::Open, entry_time(4), false)],
+        current: Some(SECOND),
+        settled: false,
+        divergent: false,
+        pinned_deadline: Pin::At(DEADLINE),
+        rebuilt: false,
+        creator: Some(app().app_id_bytes()),
+        last_entry_ms: Some(entry_time(4)),
+    };
+    let (f, _) = recovered(&entries, open.clone(), &[], &[4]);
+    refused(
+        f.run(),
+        ErrorCode::Conflict,
+        "the claim entry at seq 5, which the chain parts hold, isn't one of its claim's entries",
+    );
+    let mut failed = open;
+    failed.step = 2;
+    failed.attempts[0].outcome = Outcome::Failed;
+    failed.attempts[0].resolved_by = Some(app().app_id_bytes());
+    failed.current = None;
+    failed.last_entry_ms = Some(entry_time(5));
+    recovered(&entries, failed, &[], &[4, 5]).0.run().unwrap();
+}
+
+#[test]
+fn test_activation_rebuilt_claim_evidence_compares_attempt_state() {
+    // The second attempt marked as an upload's and failed, its entry and the chain's
+    // document of it left out: the uploads' attempts are taken as written, so only the
+    // evidence shows it.
+    let mut claim = rebuilt_claim();
+    claim.attempts[1].from_upload = true;
+    claim.attempts[1].outcome = Outcome::Failed;
+    claim.attempts[1].resolved_by = Some(app().app_id_bytes());
+    claim.current = None;
+    let (mut f, stubs) = recovered(&rebuilt_entries(), claim, &[5], &[4]);
+    f.run().unwrap();
+    // The app's proof of its attempt shows it open, at step 3.
+    let shown = rebuilt_view(
+        3,
+        &[
+            attempt_state(UPLOADED, Outcome::Failed, START - DAY, true),
+            attempt_state(SECOND, Outcome::Open, entry_time(5), false),
+        ],
+        Some(1),
+    );
+    let proof = TransitionProof::sign(
+        &old_key(),
+        &f.id,
+        ProofBody::new(
+            stubs[4].clone(),
+            b64(&CLAIM_KEY),
+            &ProofState::Claim(shown.to_value()),
+        ),
+    )
+    .unwrap();
+    f.uploads.proofs = vec![UploadedProof {
+        app_id: app().app_id_bytes(),
+        proof: proof.clone(),
+    }];
+    refused(
+        f.run(),
+        ErrorCode::Conflict,
+        "an attempt with another outcome than the import's, which no entry after it wrote",
+    );
+    // The honest export, where a later entry failed it, holds against the same proof.
+    let mut entries = rebuilt_entries();
+    entries.push(claim_fields(ClaimType::Failed, 3, SECOND));
+    let mut claim = rebuilt_claim();
+    claim.step = 4;
+    claim.attempts[1].outcome = Outcome::Failed;
+    claim.attempts[1].resolved_by = Some(app().app_id_bytes());
+    claim.current = None;
+    claim.last_entry_ms = Some(entry_time(6));
+    let (mut f, _) = recovered(&entries, claim, &[], &[4, 5, 6]);
+    f.uploads.proofs = vec![UploadedProof {
+        app_id: app().app_id_bytes(),
+        proof,
+    }];
+    f.run().unwrap();
 }
 
 #[test]

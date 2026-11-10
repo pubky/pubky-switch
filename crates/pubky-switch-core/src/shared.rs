@@ -149,10 +149,17 @@ pub fn date_write(
         return crate::error::invalid("Switch wire 6.2: the operation isn't a record.put");
     };
     let bad = |why: &str| Err(Error::Invalid(format!("Switch wire 6.2 step 2: {why}")));
+    // A service applies only operations of its own generation (Switch wire 6.4 step 6), so a
+    // proof whose stub names another generation than the operation is no proof of it.
+    let of_its_generation =
+        |env: &crate::chain::ChainEnvelope| env.generation == op.body().generation;
     if let Ok(checked) = TransitionProof::verify(proof, &identity.inbox().service_key, &id) {
         let env = checked.envelope();
         if env.item_type != ItemType::Op || env.item_hash != item {
             return bad("the proof's stub isn't the operation's");
+        }
+        if !of_its_generation(env) {
+            return bad("the proof's stub isn't of the operation's generation");
         }
         if checked.body().object != b64(&put.key) {
             return bad("the proof's object isn't the record key");
@@ -187,6 +194,9 @@ pub fn date_write(
     let checked = TransitionProof::verify(proof, &key, &id)?;
     if checked.envelope().item_hash != item {
         return bad("the proof's stub isn't the operation's");
+    }
+    if !of_its_generation(checked.envelope()) {
+        return bad("the proof's stub isn't of the operation's generation");
     }
     Ok(Dated {
         time: checked.envelope().server_time,
@@ -343,6 +353,17 @@ mod tests {
         seq: u64,
         service: &ed25519_dalek::SigningKey,
     ) -> (SignedOp, crate::sig::SignedDoc) {
+        written_at(generation, generation, seq, service)
+    }
+
+    /// A record write of `op_generation`, chained at (`generation`, `seq`), and the proof of
+    /// it signed by `service`.
+    fn written_at(
+        op_generation: u64,
+        generation: u64,
+        seq: u64,
+        service: &ed25519_dalek::SigningKey,
+    ) -> (SignedOp, crate::sig::SignedDoc) {
         use crate::chain::{ChainTip, ProofBody, ProofState, ZERO_HASH};
         use crate::keys::AppKeys;
         use crate::ops::{BatchRef, OpBody, OpKind};
@@ -351,7 +372,7 @@ mod tests {
         let body = OpBody {
             identity: id.public(),
             app_id: Some(app.app_id_bytes()),
-            generation,
+            generation: op_generation,
             batch: BatchRef {
                 id: [7; 16],
                 count: 1,
@@ -438,6 +459,20 @@ mod tests {
         let (other, _) = written(2, 7, &new);
         let (_, proof) = written(2, 6, &new);
         assert!(date_write(&proof, &other, &doc).is_err());
+        // A proof of another generation than the operation's dates nothing, whichever key
+        // signed it: the current one, or the one listed for the stub's generation.
+        let (op, proof) = written_at(1, 2, 6, &new);
+        let error = date_write(&proof, &op, &doc).unwrap_err();
+        assert!(
+            error.to_string().contains("operation's generation"),
+            "{error}"
+        );
+        let (op, proof) = written_at(2, 1, 6, &old);
+        let error = date_write(&proof, &op, &doc).unwrap_err();
+        assert!(
+            error.to_string().contains("operation's generation"),
+            "{error}"
+        );
     }
 
     #[test]
