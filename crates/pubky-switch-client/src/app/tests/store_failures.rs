@@ -1,11 +1,17 @@
 //! A protocol whose store or host fails: a receive step that can't finish for now
-//! ([`Outcome::Retry`]) leaves its entry unprocessed until a later read (Switch spec 8.2).
+//! ([`Outcome::Retry`]) leaves its entry unprocessed until a later read (Switch spec 8.2),
+//! and a restore installs the protocol's backup layer with the app's state, in one commit,
+//! or neither (Switch spec 12.4).
 
 use std::sync::Mutex;
 
 use super::*;
-use crate::app::{AppError, AppEvent, Peeked, RETRY_EVENT_READS, ReceiveContext, StoreFailure};
+use crate::app::{
+    AppBackup, AppError, AppEvent, Peeked, ProtocolLayer, RETRY_EVENT_READS, ReceiveContext,
+    StoreFailure,
+};
 use crate::error::StoreError;
+use crate::store::{Fault as StoreFault, FaultStore};
 
 /// [`SampleProtocol`], whose receive step fails for want of its store while `fails` is
 /// above zero for a note whose text is [`FLAKY`]: it adds a record write and a local write
@@ -285,4 +291,367 @@ fn test_store_failure_is_built_only_from_a_store_error() {
     // Any other error isn't a store failure, and is given back.
     let other = AppError::InvalidData("a body".into());
     assert_eq!(StoreFailure::try_from(other.clone()).unwrap_err(), other);
+}
+
+// -------------------------------------------------------------------------------------
+// Restoring the protocol's layer with the app's (Switch spec 12.4)
+
+/// The backup name of [`JournalProtocol`].
+const JOURNAL: &str = "journal-protocol";
+
+/// The local key the protocol keeps its journal under.
+const JOURNAL_KEY: &[u8] = b"journal";
+
+/// [`SampleProtocol`], with a journal it backs up as a layer: the journal's bytes, under the
+/// name `name`, refused when empty.
+struct JournalProtocol {
+    sample: SampleProtocol,
+    name: Option<String>,
+}
+
+impl JournalProtocol {
+    fn new(name: Option<&str>) -> Arc<Self> {
+        Arc::new(Self {
+            sample: SampleProtocol::default(),
+            name: name.map(str::to_owned),
+        })
+    }
+}
+
+impl Protocol for JournalProtocol {
+    fn has_keys(&self, scope: &str) -> bool {
+        self.sample.has_keys(scope)
+    }
+
+    fn sent_between_own_apps(&self, kind: &str) -> bool {
+        self.sample.sent_between_own_apps(kind)
+    }
+
+    fn check_scopes(
+        &self,
+        message: &Message,
+        sender: &AppCert,
+        own: &AppCert,
+    ) -> Result<(), String> {
+        self.sample.check_scopes(message, sender, own)
+    }
+
+    fn accepts(&self, cert: &AppCert) -> Vec<String> {
+        self.sample.accepts(cert)
+    }
+
+    fn check_body(&self, message: &ReceivedMessage) -> Result<(), String> {
+        self.sample.check_body(message)
+    }
+
+    fn resend_needed(&self, needed: &ResendNeeded) -> Vec<LocalWrite> {
+        self.sample.resend_needed(needed)
+    }
+
+    fn missed(&self, missed: &MissedEntries) -> Vec<LocalWrite> {
+        self.sample.missed(missed)
+    }
+
+    fn backup_name(&self) -> Option<String> {
+        self.name.clone()
+    }
+
+    fn restore_layer(&self, layer: Option<&ProtocolLayer>) -> Result<Vec<LocalWrite>, String> {
+        let Some(layer) = layer else {
+            return Err("journal: the backup has no journal".into());
+        };
+        if layer.data.is_empty() {
+            return Err("journal: the journal is empty".into());
+        }
+        Ok(vec![LocalWrite::Put {
+            key: JOURNAL_KEY.to_vec(),
+            value: layer.data.clone(),
+        }])
+    }
+}
+
+/// A journal layer of `data`, under `name`.
+fn journal_layer(name: &str, data: &[u8]) -> ProtocolLayer {
+    ProtocolLayer {
+        protocol: name.into(),
+        data: data.to_vec(),
+    }
+}
+
+/// An app with the journal protocol on `store`, its journal at `journal`, and its backup
+/// with the journal layer `layer`, read back from its bytes.
+async fn journaled(
+    w: &World,
+    protocol: &Arc<JournalProtocol>,
+    store: &Arc<MemoryStore>,
+    journal: &[u8],
+    layer: ProtocolLayer,
+) -> (App, AppBackup) {
+    let request = w.approve(&app_keys("wallet"), &["scope-a"]);
+    let mut app = App::join(
+        w.env_on(Arc::clone(store) as Arc<dyn StateStore>),
+        protocol.clone(),
+        World::config(),
+        request,
+    )
+    .await
+    .unwrap();
+    app.protocol_commit(&[LocalWrite::Put {
+        key: JOURNAL_KEY.to_vec(),
+        value: journal.to_vec(),
+    }])
+    .await
+    .unwrap();
+    let backup = app.backup().unwrap().with_protocol_layer(layer);
+    let backup = AppBackup::from_bytes(&backup.to_bytes().unwrap()).unwrap();
+    (app, backup)
+}
+
+async fn restore_on(
+    w: &World,
+    protocol: Arc<dyn Protocol>,
+    store: Arc<dyn StateStore>,
+    backup: &AppBackup,
+) -> Result<App, AppError> {
+    App::restore(w.env_on(store), protocol, World::config(), backup).await
+}
+
+fn snapshot(store: &MemoryStore, app: &[u8; 16]) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let ns = crate::store::client_namespace(app);
+    store.scan(&ns, b"", None, u32::MAX).unwrap()
+}
+
+#[tokio::test]
+async fn test_restore_installs_the_protocol_layer_with_the_app_state() {
+    let w = World::new();
+    let protocol = JournalProtocol::new(Some(JOURNAL));
+    let (app, backup) = journaled(
+        &w,
+        &protocol,
+        &Arc::new(MemoryStore::new()),
+        b"at the backup",
+        journal_layer(JOURNAL, b"at the backup"),
+    )
+    .await;
+    assert_eq!(
+        backup.protocol_layer().unwrap(),
+        Some(journal_layer(JOURNAL, b"at the backup"))
+    );
+    let store = Arc::new(MemoryStore::new());
+    let restored = restore_on(
+        &w,
+        protocol.clone(),
+        Arc::clone(&store) as Arc<dyn StateStore>,
+        &backup,
+    )
+    .await
+    .unwrap();
+    assert!(restored.reconcile_mode());
+    assert_eq!(
+        restored.protocol_get(JOURNAL_KEY).await.unwrap(),
+        Some(b"at the backup".to_vec())
+    );
+    // Both layers load from the store.
+    let loaded = App::load(
+        w.env_on(store as Arc<dyn StateStore>),
+        protocol,
+        World::config(),
+        app.app_id(),
+    )
+    .await
+    .unwrap();
+    assert!(loaded.reconcile_mode());
+    assert_eq!(
+        loaded.protocol_get(JOURNAL_KEY).await.unwrap(),
+        Some(b"at the backup".to_vec())
+    );
+}
+
+#[tokio::test]
+async fn test_restore_failed_commit_writes_neither_layer() {
+    let w = World::new();
+    let protocol = JournalProtocol::new(Some(JOURNAL));
+    let store = Arc::new(MemoryStore::new());
+    let (app, backup) = journaled(
+        &w,
+        &protocol,
+        &store,
+        b"before the restore",
+        journal_layer(JOURNAL, b"from the backup"),
+    )
+    .await;
+    let before = snapshot(&store, &app.app_id());
+    let fault = Arc::new(FaultStore::new(
+        Arc::clone(&store) as Arc<dyn StateStore>,
+        StoreFault::FailBefore(1),
+    ));
+    let error = restore_on(
+        &w,
+        protocol.clone(),
+        fault.clone() as Arc<dyn StateStore>,
+        &backup,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error, AppError::Store(StoreError::Unavailable));
+    assert_eq!(fault.commits(), 1, "one commit for both layers");
+    // The store holds what it held: neither the app's restored state nor the journal.
+    assert_eq!(snapshot(&store, &app.app_id()), before);
+    let loaded = App::load(
+        w.env_on(store as Arc<dyn StateStore>),
+        protocol,
+        World::config(),
+        app.app_id(),
+    )
+    .await
+    .unwrap();
+    assert!(!loaded.reconcile_mode());
+    assert_eq!(
+        loaded.protocol_get(JOURNAL_KEY).await.unwrap(),
+        Some(b"before the restore".to_vec())
+    );
+}
+
+#[tokio::test]
+async fn test_restore_commit_of_unknown_outcome_holds_both_layers_or_neither() {
+    let w = World::new();
+    let protocol = JournalProtocol::new(Some(JOURNAL));
+    let (app, backup) = journaled(
+        &w,
+        &protocol,
+        &Arc::new(MemoryStore::new()),
+        b"at the backup",
+        journal_layer(JOURNAL, b"at the backup"),
+    )
+    .await;
+    let store = Arc::new(MemoryStore::new());
+    let fault = Arc::new(FaultStore::new(
+        Arc::clone(&store) as Arc<dyn StateStore>,
+        StoreFault::FailAfter(1),
+    ));
+    let error = restore_on(&w, protocol.clone(), fault as Arc<dyn StateStore>, &backup)
+        .await
+        .unwrap_err();
+    assert_eq!(error, AppError::Store(StoreError::Unknown));
+    // Applied after all: the store, read again, holds both.
+    let loaded = App::load(
+        w.env_on(store as Arc<dyn StateStore>),
+        protocol,
+        World::config(),
+        app.app_id(),
+    )
+    .await
+    .unwrap();
+    assert!(loaded.reconcile_mode());
+    assert_eq!(
+        loaded.protocol_get(JOURNAL_KEY).await.unwrap(),
+        Some(b"at the backup".to_vec())
+    );
+}
+
+#[tokio::test]
+async fn test_restore_refused_protocol_layer_writes_nothing() {
+    let w = World::new();
+    let protocol = JournalProtocol::new(Some(JOURNAL));
+    let (app, backup) = journaled(
+        &w,
+        &protocol,
+        &Arc::new(MemoryStore::new()),
+        b"at the backup",
+        journal_layer(JOURNAL, b""),
+    )
+    .await;
+    let store = Arc::new(MemoryStore::new());
+    let fault = Arc::new(FaultStore::new(
+        Arc::clone(&store) as Arc<dyn StateStore>,
+        StoreFault::None,
+    ));
+    let error = restore_on(
+        &w,
+        protocol.clone(),
+        fault.clone() as Arc<dyn StateStore>,
+        &backup,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(&error, AppError::InvalidData(why) if why.contains("the journal is empty")),
+        "{error:?}"
+    );
+    assert_eq!(fault.commits(), 0);
+    assert!(snapshot(&store, &app.app_id()).is_empty());
+    // A backup without the layer the protocol needs is refused the same way.
+    let bare = AppBackup::from_bytes(&app.backup().unwrap().to_bytes().unwrap()).unwrap();
+    assert_eq!(bare.protocol_layer().unwrap(), None);
+    let error = restore_on(&w, protocol, fault.clone() as Arc<dyn StateStore>, &bare)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, AppError::InvalidData(_)), "{error:?}");
+    assert_eq!(fault.commits(), 0);
+    assert!(snapshot(&store, &app.app_id()).is_empty());
+}
+
+#[tokio::test]
+async fn test_restore_layer_of_a_protocol_not_registered_is_refused() {
+    let w = World::new();
+    let protocol = JournalProtocol::new(Some(JOURNAL));
+    let (app, backup) = journaled(
+        &w,
+        &protocol,
+        &Arc::new(MemoryStore::new()),
+        b"at the backup",
+        journal_layer(JOURNAL, b"at the backup"),
+    )
+    .await;
+    let store = Arc::new(MemoryStore::new());
+    let fault = Arc::new(FaultStore::new(
+        Arc::clone(&store) as Arc<dyn StateStore>,
+        StoreFault::None,
+    ));
+    // A protocol with no backup name, and one of another name: the layer isn't theirs, and
+    // the restore is refused rather than drop it.
+    let others: [Arc<dyn Protocol>; 2] = [
+        w.protocol.clone(),
+        JournalProtocol::new(Some("another-protocol")),
+    ];
+    for other in others {
+        let error = restore_on(&w, other, fault.clone() as Arc<dyn StateStore>, &backup)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, AppError::InvalidData(why) if why.contains("another protocol's")),
+            "{error:?}"
+        );
+    }
+    assert_eq!(fault.commits(), 0);
+    assert!(snapshot(&store, &app.app_id()).is_empty());
+}
+
+#[tokio::test]
+async fn test_restore_without_a_layer_by_a_protocol_that_takes_none() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    app.protocol_commit(&[LocalWrite::Put {
+        key: JOURNAL_KEY.to_vec(),
+        value: b"not in the backup".to_vec(),
+    }])
+    .await
+    .unwrap();
+    let backup = AppBackup::from_bytes(&app.backup().unwrap().to_bytes().unwrap()).unwrap();
+    // The bytes of a backup without a layer carry no member for it.
+    assert!(
+        !String::from_utf8(backup.to_bytes().unwrap())
+            .unwrap()
+            .contains("\"protocol\"")
+    );
+    let store = Arc::new(MemoryStore::new());
+    let restored = restore_on(
+        &w,
+        w.protocol.clone(),
+        Arc::clone(&store) as Arc<dyn StateStore>,
+        &backup,
+    )
+    .await
+    .unwrap();
+    assert_eq!(restored.protocol_get(JOURNAL_KEY).await.unwrap(), None);
 }

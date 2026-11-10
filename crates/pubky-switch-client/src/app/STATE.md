@@ -29,6 +29,8 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
 - **Any commit carries everything read before it.** A page's writes go in the next commit
   point, so no commit records a cursor past items whose writes it lacks.
 - **After a failed commit the app reloads** from the store before its next call.
+- **A restore is one commit:** the namespace cleared, the app's restored state and the
+  protocol's backup layer under `p/`, both checked before it, so a failure leaves neither.
 
 ## Keys
 

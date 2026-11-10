@@ -68,7 +68,7 @@ pub use identity::{DOC_CACHE_MS, HomeserverReader, IdentityRefresh, REVALIDATION
 pub use peek::{PeekReport, Peeked};
 pub use protocol::{
     Effect, LocalWrite, MAX_CLAIM_READS, MissedEntries, Need, OpaqueRule, Outcome, Protocol,
-    RETRY_EVENT_READS, ReceivedMessage, ResendNeeded, ResendReason, StoreFailure,
+    ProtocolLayer, RETRY_EVENT_READS, ReceivedMessage, ResendNeeded, ResendReason, StoreFailure,
 };
 pub use provider::ProviderStatus;
 pub use push::{MAX_HANDLE_BYTES, PushRegistration, PushRelay};
@@ -326,6 +326,16 @@ pub struct AppBackup {
     chain_batches: Vec<(String, u64)>,
     departed: Vec<(String, u64)>,
     bundle: BundleState,
+    /// The protocol's layer, if it added one; absent from the bytes otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    protocol: Option<LayerOut>,
+}
+
+/// A [`ProtocolLayer`] as a backup's bytes carry it.
+#[derive(Clone, Serialize, Deserialize)]
+struct LayerOut {
+    name: String,
+    data: String,
 }
 
 impl std::fmt::Debug for AppBackup {
@@ -359,6 +369,37 @@ impl AppBackup {
             ));
         }
         Ok(backup)
+    }
+
+    /// The backup with the protocol's layer, replacing any it held: its local state, taken
+    /// by the host with the backup ([`App::backup`]) and no commit between them, so the two
+    /// layers are of one moment. [`App::restore`] installs both in one commit.
+    #[must_use]
+    pub fn with_protocol_layer(mut self, layer: ProtocolLayer) -> Self {
+        self.protocol = Some(LayerOut {
+            name: layer.protocol,
+            data: pubky_switch_core::enc::b64(&layer.data),
+        });
+        self
+    }
+
+    /// The protocol's layer, if the backup holds one.
+    ///
+    /// # Errors
+    ///
+    /// [`AppError::InvalidData`] if its data doesn't read.
+    pub fn protocol_layer(&self) -> Result<Option<ProtocolLayer>, AppError> {
+        self.protocol
+            .as_ref()
+            .map(|layer| {
+                Ok(ProtocolLayer {
+                    protocol: layer.name.clone(),
+                    data: pubky_switch_core::enc::unb64(&layer.data).map_err(|_| {
+                        AppError::InvalidData("the backup: its protocol layer doesn't read".into())
+                    })?,
+                })
+            })
+            .transpose()
     }
 }
 
@@ -803,6 +844,7 @@ impl App {
                 .map(|(app, at)| (zbase32_encode(app), *at))
                 .collect(),
             bundle: self.state.bundle.clone(),
+            protocol: None,
         })
     }
 
@@ -816,9 +858,20 @@ impl App {
     /// record, registers a fresh key if it rotated after the backup, and asks the user
     /// about registrations it can't account for ([`App::restore_question`]).
     ///
+    /// The protocol's layer ([`AppBackup::with_protocol_layer`]) is installed with the app's
+    /// own state, in one commit: the app checks its own state, then the layer's name
+    /// against [`Protocol::backup_name`], then has [`Protocol::restore_layer`] check the
+    /// layer and give its writes, all before it writes anything. When this returns `Ok`,
+    /// both layers are in the store; on `Err`, neither is, and the store holds what it held
+    /// before. The one exception is a commit whose outcome the store can't tell
+    /// ([`StoreError::Unknown`]): it landed whole or not at all, and the host loads the app
+    /// ([`App::load`]) to learn which.
+    ///
     /// # Errors
     ///
-    /// [`AppError::InvalidData`] for a backup that doesn't verify; a store failure.
+    /// [`AppError::InvalidData`] for a backup that doesn't verify, for a protocol layer that
+    /// another protocol, or a protocol without a backup name, made, or for one the protocol
+    /// refuses; a store failure, writes over the store's sizes included.
     pub async fn restore(
         env: AppEnv,
         protocol: Arc<dyn Protocol>,
@@ -879,6 +932,17 @@ impl App {
             // The service may hold a later cursor: the first move after the restore is sent.
             cursor.at_service = 0;
             cursor.deferred_since_ms = Some(env.clock.now_ms());
+            // The protocol's layer, checked before anything is written: a layer that another
+            // protocol made, or that this one refuses, refuses the restore.
+            let layer = backup.protocol_layer()?;
+            if let Some(layer) = &layer
+                && protocol.backup_name().as_deref() != Some(layer.protocol.as_str())
+            {
+                return Err(invalid("its protocol layer is another protocol's"));
+            }
+            let layer_writes = protocol.restore_layer(layer.as_ref()).map_err(|why| {
+                AppError::InvalidData(format!("the backup's protocol layer: {why}"))
+            })?;
             let state = AppState {
                 meta: meta.clone(),
                 keys: backup.keys.clone(),
@@ -936,6 +1000,7 @@ impl App {
             tx.delete_prefix("")?;
             app.write_all(&mut tx).await?;
             tx.put(records::LIST_DUE, &true)?;
+            tx.local(&layer_writes)?;
             tx.commit(&app.env.store).await?;
             Ok(app)
         })

@@ -118,6 +118,31 @@ impl std::fmt::Debug for LocalWrite {
     }
 }
 
+/// The protocol's layer of an app backup (Switch spec 12.4): its own local state, such as
+/// its journal, in a form it chooses, carried in the [`super::AppBackup`]
+/// ([`super::AppBackup::with_protocol_layer`]) and installed by [`super::App::restore`] in
+/// the same commit as the app's own state ([`Protocol::restore_layer`]). Opaque to the app.
+/// Sensitive: its `Debug` shows only the protocol's name and the data's size.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ProtocolLayer {
+    /// The protocol that made it, as its [`Protocol::backup_name`] gives it: a restore takes
+    /// the layer only with a protocol of that name.
+    pub protocol: String,
+    /// The protocol's data.
+    pub data: Vec<u8>,
+}
+
+impl std::fmt::Debug for ProtocolLayer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ProtocolLayer({}, {} bytes)",
+            self.protocol,
+            self.data.len()
+        )
+    }
+}
+
 /// What a received message does: the operations committed in one batch with the cursor
 /// move, and the protocol's local writes committed with the outcome. The writes added
 /// through the [`ReceiveContext`] come first, then these.
@@ -463,6 +488,35 @@ pub trait Protocol: Send + Sync {
     ) -> Option<String> {
         let _ = (collection, seen, value);
         None
+    }
+
+    /// The name of the layers the protocol adds to app backups ([`ProtocolLayer`]):
+    /// [`super::App::restore`] takes a backup's layer only with a protocol that gives the
+    /// same name, and refuses a backup whose layer another protocol, or a protocol without a
+    /// name, made, rather than drop that data. `None` by default: the protocol takes no
+    /// layer.
+    fn backup_name(&self) -> Option<String> {
+        None
+    }
+
+    /// The writes that install a backup's protocol layer at a restore (Switch spec 12.4),
+    /// or that a backup without one, `None`, needs. [`super::App::restore`] calls it once,
+    /// after it checked the backup's own state and the layer's name and before it writes
+    /// anything, and commits the writes in the one commit that installs its own restored
+    /// state, after it cleared the app's namespace: so the protocol starts from an empty
+    /// local state and its writes stay under its prefix. It checks the layer in full here;
+    /// nothing is written until it returns. By default it takes no layer, and needs no
+    /// writes for none.
+    ///
+    /// # Errors
+    ///
+    /// Why the layer, or a backup without one, can't be installed, without content: the
+    /// restore is refused and nothing is written.
+    fn restore_layer(&self, layer: Option<&ProtocolLayer>) -> Result<Vec<LocalWrite>, String> {
+        match layer {
+            None => Ok(Vec::new()),
+            Some(_) => Err("the protocol takes no backup layer".into()),
+        }
     }
 
     /// The shared record write of a sent message (Switch spec 8.2): the record's next value
