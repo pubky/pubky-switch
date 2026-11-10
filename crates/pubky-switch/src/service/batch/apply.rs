@@ -179,7 +179,7 @@ fn apply_op(
             let entry = fields.check()?;
             let writer = cert.app_id();
             let claim = {
-                let current = |app: &[u8; 16]| state.is_current(app);
+                let current = |app: &[u8; 16]| state.is_served(app);
                 let cx = EntryContext {
                     writer,
                     now,

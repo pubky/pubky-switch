@@ -380,7 +380,9 @@ impl Service {
                 unknown.push(json!(b64(kid)));
                 continue;
             };
-            if !state.is_current(holder) {
+            // Served, not only current: an envelope wraps to an app the service serves now,
+            // its certificate unexpired (Switch wire 7.4.3 check 5, 3.8 check 3).
+            if !state.is_served(holder) {
                 named.insert(*holder);
                 not_current.push(json!(zbase32_encode(holder)));
                 continue;
@@ -411,7 +413,7 @@ impl Service {
                 || targets.contains(&app.app_id)
                 || named.contains(&app.app_id)
                 || own == Some(app.app_id)
-                || !state.is_current(&app.app_id)
+                || !state.is_served(&app.app_id)
             {
                 continue;
             }

@@ -194,9 +194,10 @@ impl AccountTxn {
         Ok(deleted)
     }
 
-    /// Each current app's unread entries, and of those, the ones it is the only current
-    /// target of (Switch wire 7.4.12 `unread_entries`, `sole_target_unread`), for the apps
-    /// with any; `current` holds the App IDs current now.
+    /// Each app's unread entries, the entries held that target it and that its cursor
+    /// hasn't passed, whether or not it is current; and of those, the ones it is the only
+    /// current target of (Switch wire 7.4.12 `unread_entries`, `sole_target_unread`), for the
+    /// apps with any. `current` holds the App IDs current.
     pub async fn unread_counts(
         &mut self,
         current: &[[u8; 16]],
@@ -206,7 +207,7 @@ impl AccountTxn {
         let rows = sqlx::query(
             "WITH unread AS ( \
                  SELECT e.seq, t.app_id FROM inbox_entries e, unnest(e.targets) AS t(app_id) \
-                 WHERE e.account_id = $1 AND e.generation = $2 AND t.app_id = ANY($3) \
+                 WHERE e.account_id = $1 AND e.generation = $2 \
                  AND NOT EXISTS (SELECT 1 FROM apps a \
                                  WHERE a.account_id = e.account_id AND a.app_id = t.app_id \
                                  AND a.cursor_generation = e.generation \
@@ -216,8 +217,8 @@ impl AccountTxn {
                  WHERE e.account_id = $1 AND e.generation = $2 AND t.app_id = ANY($3) \
                  GROUP BY e.seq) \
              SELECT u.app_id, count(*)::BIGINT AS unread, \
-                    (count(*) FILTER (WHERE c.n = 1))::BIGINT AS sole \
-             FROM unread u JOIN current_targets c ON c.seq = u.seq GROUP BY u.app_id",
+                    (count(*) FILTER (WHERE c.n = 1 AND u.app_id = ANY($3)))::BIGINT AS sole \
+             FROM unread u LEFT JOIN current_targets c ON c.seq = u.seq GROUP BY u.app_id",
         )
         .bind(&head.id)
         .bind(to_db(head.generation, "generation")?)
