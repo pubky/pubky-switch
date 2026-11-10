@@ -384,6 +384,55 @@ async fn test_inbox_stale_key_names_apps_added_since() {
 }
 
 #[tokio::test]
+async fn test_inbox_stale_key_names_each_app_once() {
+    let Some(replay) = replay().await else { return };
+    with_bob(&replay).await;
+    let version = apps_version(&replay).await;
+    // Two retired receive keys of the wallet's.
+    let keys = vectors("keys.json");
+    let wallet = pubky_switch_core::enc::app_id_decode(
+        app(&keys, "wallet")["app_id"].as_str().expect("app id"),
+    )
+    .expect("app id");
+    let retired = [[9u8; 32], [10u8; 32]];
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    for (n, public) in retired.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO receive_keys (account_id, kid, app_id, n, record) \
+             VALUES ($1, $2, $3, $4, '\\x00')",
+        )
+        .bind(alice_id())
+        .bind(pubky_switch_core::enc::kid(public).as_slice())
+        .bind(wallet.as_slice())
+        .bind(100 + i64::try_from(n).expect("n"))
+        .execute(&mut conn)
+        .await
+        .expect("retired key");
+    }
+    // Wrapped to both, sealed for an apps_version before the wallet's: the wallet is stale
+    // twice and added since, and is named once, in receive_keys.
+    let envelope = seal(
+        &hex32(&alice(&keys)["public_hex"]),
+        &retired.map(Recipient::new),
+        &[0; 10],
+        false,
+    )
+    .expect("seal");
+    let answer = from_shop(&replay, envelope, Some(version - 1), None).await;
+    assert_eq!(code_of(&answer), (409, json!("stale_key")));
+    let current = &body(&answer)["current"];
+    assert_eq!(current["receive_keys"].as_array().map(Vec::len), Some(1));
+    assert_eq!(
+        current["receive_keys"][0]["app_id"],
+        app(&keys, "wallet")["app_id"]
+    );
+    assert_eq!(current["added_apps"], json!([]));
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
 async fn test_inbox_rates_and_flags() {
     let limits = Limits {
         sender_per_min: 1,

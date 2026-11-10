@@ -5,7 +5,7 @@
 //! The checks run in 7.4.3's order: a retry by content, admission and the sender's listing,
 //! size and header, the rates, the targets, the quota, then the invite code's use.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use pubky_switch_core::{
     chain::{ItemType, ServiceTransition, item_hash},
@@ -367,13 +367,18 @@ impl Service {
         let mut stale = Vec::new();
         let mut not_current = Vec::new();
         let mut unknown = Vec::new();
+        // `receive_keys`, `not_current` and `added_apps` together name each app at most once
+        // (Switch wire 7.6), though an envelope may wrap to several kids of one app.
+        let mut named = BTreeSet::new();
         for kid in &kids {
             let Some(holder) = holders.get(kid) else {
                 unknown.push(json!(b64(kid)));
                 continue;
             };
             if !state.is_current(holder) {
-                not_current.push(json!(zbase32_encode(holder)));
+                if named.insert(*holder) {
+                    not_current.push(json!(zbase32_encode(holder)));
+                }
                 continue;
             }
             let current_key = state
@@ -382,7 +387,7 @@ impl Service {
                 .and_then(|app| app.receive_key.as_ref());
             if current_key.map(|key| key.kid()) == Some(*kid) {
                 targets.push(*holder);
-            } else {
+            } else if named.insert(*holder) {
                 stale.push(json!({
                     "app_id": zbase32_encode(holder),
                     "record": current_key.map(|key| key.signed().clone()),
@@ -399,6 +404,7 @@ impl Service {
             if app.reachable_since.is_none()
                 || since <= sealed_for
                 || targets.contains(&app.app_id)
+                || named.contains(&app.app_id)
                 || own == Some(app.app_id)
                 || !state.is_current(&app.app_id)
             {
