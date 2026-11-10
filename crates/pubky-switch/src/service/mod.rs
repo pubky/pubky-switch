@@ -18,6 +18,7 @@ mod admission;
 mod apps;
 pub mod batch;
 mod claims;
+mod directory;
 mod enroll;
 mod feed;
 mod identity;
@@ -385,7 +386,12 @@ impl Service {
                     Err(error) => return refused_early(error).await,
                 }
             }
-            Call::Ops | Call::GetClaim(_) | Call::Feed | Call::PutPeers | Call::Append => {
+            Call::Ops
+            | Call::GetClaim(_)
+            | Call::Feed
+            | Call::PutPeers
+            | Call::Append
+            | Call::Directory => {
                 match self.authenticate_caller(&account, &request, base_ms, base_ms.max(stamped_ms))
                 {
                     Ok((claimed, cert)) => {
@@ -945,6 +951,38 @@ impl Service {
                         appender,
                         &request.body,
                         query,
+                        invite_code,
+                        due.is_some(),
+                        time_ms,
+                    )
+                    .await
+                    .map(|answer| (answer, serving))
+                    .map_err(|error| Refused::with_head(error, serving));
+            }
+            Call::Directory => {
+                let reader = match (writer.as_ref(), other) {
+                    (Some(_), _) => directory::Reader::OwnApp,
+                    (None, Some(cert)) => directory::Reader::OtherApp(cert),
+                    (None, None) => {
+                        return Err(Refused::with_head(
+                            ApiError::new(
+                                ErrorCode::PermissionMissing,
+                                "7.4.10: apps read the directory; the signer doesn't",
+                            ),
+                            serving,
+                        ));
+                    }
+                };
+                let invite_code = request
+                    .headers
+                    .get(header::INVITE_CODE)
+                    .and_then(|value| value.to_str().ok());
+                return self
+                    .directory(
+                        txn,
+                        signer,
+                        held.as_ref(),
+                        reader,
                         invite_code,
                         due.is_some(),
                         time_ms,
