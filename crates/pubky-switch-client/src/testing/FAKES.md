@@ -126,4 +126,5 @@ once it serves those calls:
 - revocations, departures, removal times and their bounds, full-bundle requests, purge and
   record cleanup (`revocation.rs`);
 - the one-signer checks, alarms and their clearing, records behind, and publication
-  (`flows.rs`).
+  (`flows.rs`);
+- restore from the signer backup, in place and on a new install (`restore.rs`).
