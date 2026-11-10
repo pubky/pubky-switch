@@ -1464,6 +1464,7 @@ impl App {
             "pending/",
             "p/",
             key::DUTY_PREFIX,
+            key::OWED_PREFIX,
         ] {
             tx.delete_prefix(prefix)?;
         }

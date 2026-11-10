@@ -599,7 +599,9 @@ impl App {
                         &self.ns,
                     );
                     self.protocol.provider_lost_with(&loss.view(), &view)
-                };
+                }
+                // The step stays `Resend` in the record: the next call asks again.
+                .map_err(AppError::Store)?;
                 let copy = self.lists_copy().await?;
                 let me = self.state.meta.identity;
                 let may_add = self.state.cert.has_permission(Permission::ConversationAdd);

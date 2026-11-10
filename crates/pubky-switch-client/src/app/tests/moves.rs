@@ -18,8 +18,8 @@ use crate::app::{
     AppError, AppEvent, ClaimOp, Evidence, LossActions, ObligationDeadline, ParkReason,
     ProviderLoss, ProviderStatus, PushRelay, UserConfirmed,
 };
-use crate::error::ClientError;
 use crate::error::TransportError;
+use crate::error::{ClientError, StoreError};
 use crate::store::{Fault as StoreFault, FaultStore};
 use crate::testing::{self, Fault, Item, SWITCH_ORIGIN as ORIGIN};
 
@@ -78,6 +78,8 @@ pub(crate) struct LossProtocol {
     pub(crate) sample: SampleProtocol,
     pub(crate) losses: Mutex<Vec<ProviderLoss>>,
     pub(crate) counterparties: Vec<[u8; 32]>,
+    /// How many of the next loss calls fail, as when the protocol can't read its state.
+    pub(crate) failing: Mutex<u32>,
 }
 
 impl Protocol for LossProtocol {
@@ -110,23 +112,33 @@ impl Protocol for LossProtocol {
         self.sample.receive(message)
     }
 
-    fn resend_needed(&self, needed: &ResendNeeded) -> Vec<LocalWrite> {
+    fn resend_needed(
+        &self,
+        needed: &ResendNeeded,
+    ) -> Result<Vec<LocalWrite>, crate::error::StoreError> {
         self.sample.resend_needed(needed)
     }
 
-    fn missed(&self, missed: &MissedEntries) -> Vec<LocalWrite> {
+    fn missed(&self, missed: &MissedEntries) -> Result<Vec<LocalWrite>, crate::error::StoreError> {
         self.sample.missed(missed)
     }
 
-    fn provider_lost(&self, loss: &ProviderLoss) -> LossActions {
+    fn provider_lost(&self, loss: &ProviderLoss) -> Result<LossActions, StoreError> {
+        {
+            let mut failing = self.failing.lock().unwrap();
+            if *failing > 0 {
+                *failing -= 1;
+                return Err(StoreError::Unavailable);
+            }
+        }
         self.losses.lock().unwrap().push(*loss);
-        LossActions {
+        Ok(LossActions {
             conversations: self.counterparties.clone(),
             local: vec![LocalWrite::Put {
                 key: format!("lost/{}", loss.lost_generation).into_bytes(),
                 value: b"1".to_vec(),
             }],
-        }
+        })
     }
 }
 
@@ -991,6 +1003,41 @@ async fn test_loss_recovers_at_the_new_generation() {
     // Nothing is asked again.
     app.receive(None).await.unwrap();
     assert_eq!(lost.protocol.losses.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn test_loss_call_the_protocol_fails_is_made_again() {
+    let store = Arc::new(MemoryStore::new());
+    let lost = lost_world(Arc::clone(&store) as Arc<dyn StateStore>).await;
+    // The protocol can't read its state: the recovery stops at the step, and the call
+    // fails with the protocol's error.
+    *lost.protocol.failing.lock().unwrap() = 1;
+    let first = follow_loss(&lost, Arc::clone(&store) as Arc<dyn StateStore>).await;
+    assert!(
+        matches!(first, Err(AppError::Store(StoreError::Unavailable))),
+        "{first:?}"
+    );
+    assert!(lost.protocol.losses.lock().unwrap().is_empty());
+    // The next call asks again, and the recovery goes on.
+    let (app, events) = follow_loss(&lost, Arc::clone(&store) as Arc<dyn StateStore>)
+        .await
+        .unwrap();
+    assert!(
+        has(&events, |e| matches!(
+            e,
+            AppEvent::ProviderRecovered { generation: 2 }
+        )),
+        "{events:?}"
+    );
+    let losses = lost.protocol.losses.lock().unwrap().clone();
+    assert_eq!(losses.len(), 1);
+    assert_eq!(losses[0].lost_generation, 1);
+    assert_eq!(losses[0].accepted_from_ms, lost.note_at_ms);
+    assert_eq!(
+        app.protocol_get(b"lost/1").await.unwrap(),
+        Some(b"1".to_vec())
+    );
+    assert_eq!(conversations_at(&lost.next), 1);
 }
 
 #[tokio::test]

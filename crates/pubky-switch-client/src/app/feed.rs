@@ -24,7 +24,8 @@
 //! - **An entry no held key opens** is passed; the protocol is asked to request a re-send,
 //!   never for a time before the cursor's less the clock tolerance. So is an entry a departed
 //!   own app left unread, accepted at or before a departure the app verified in its chain;
-//!   and entries missed while lagging.
+//!   and entries missed while lagging. A call the protocol answers with an error is kept with
+//!   the item's pass and made again by later reads.
 //! - **Chain items** must match their stubs. The app takes its own `identity.json`
 //!   deliveries, its own receive key registrations, key bundle parts (fetched before the
 //!   cursor passes them), renewed certificates, and the departures of other own apps.
@@ -53,8 +54,8 @@ use super::error::{Alarm, Refusal, refused_for_good};
 use super::events::{AppEvent, Duty, ParkReason};
 use super::identity::{self, DOC_CACHE_MS, Taken};
 use super::protocol::{
-    Effect, LocalWrite, MAX_CLAIM_READS, MissedEntries, Need, OpaqueRule, Outcome, ReceivedMessage,
-    ResendNeeded, ResendReason, Rules,
+    Effect, LocalWrite, MAX_CLAIM_READS, MissedEntries, Need, OpaqueRule, Outcome, Protocol,
+    ReceivedMessage, ResendNeeded, ResendReason, Rules,
 };
 use super::provider::TakeOver;
 use super::records::{Collection, pending_name_key};
@@ -65,7 +66,7 @@ use super::state::{
 use super::{App, AppError, PROCESSED_RETENTION_MS};
 use crate::client::Batch;
 use crate::client::answers::{ChainItem, EntryItem, FeedItem, FeedPage, FeedQuery};
-use crate::error::ClientError;
+use crate::error::{ClientError, StoreError};
 
 /// What one read did.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -119,6 +120,69 @@ enum Sent {
     Quota,
     /// Refused for good, with the error code: the entry is stored and passed.
     Refused(String),
+}
+
+/// `owed/<generation>/<seq>`: a protocol call about a feed item that the protocol couldn't
+/// answer (`Protocol::resend_needed`, `Protocol::missed`), kept until it does.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+enum OwedCall {
+    Resend {
+        #[serde(with = "pubky_switch_core::enc::serde_b64")]
+        sender: [u8; 32],
+        accepted_from_ms: u64,
+        accepted_until_ms: u64,
+        /// Whether the entry was one a departed own app left unread, rather than one
+        /// wrapped to a key the app doesn't hold.
+        unreadable: bool,
+    },
+    Missed {
+        seq: u64,
+        entries: u64,
+        accepted_from_ms: u64,
+    },
+}
+
+impl From<&ResendNeeded> for OwedCall {
+    fn from(needed: &ResendNeeded) -> Self {
+        Self::Resend {
+            sender: needed.sender,
+            accepted_from_ms: needed.accepted_from_ms,
+            accepted_until_ms: needed.accepted_until_ms,
+            unreadable: needed.reason == ResendReason::Unreadable,
+        }
+    }
+}
+
+impl OwedCall {
+    /// The call, made again.
+    fn make(&self, protocol: &dyn Protocol) -> Result<Vec<LocalWrite>, StoreError> {
+        match *self {
+            Self::Resend {
+                sender,
+                accepted_from_ms,
+                accepted_until_ms,
+                unreadable,
+            } => protocol.resend_needed(&ResendNeeded {
+                sender,
+                accepted_from_ms,
+                accepted_until_ms,
+                reason: if unreadable {
+                    ResendReason::Unreadable
+                } else {
+                    ResendReason::Unopenable
+                },
+            }),
+            Self::Missed {
+                seq,
+                entries,
+                accepted_from_ms,
+            } => protocol.missed(&MissedEntries {
+                seq,
+                entries,
+                accepted_from_ms,
+            }),
+        }
+    }
 }
 
 /// An entry as the feed carries it, or as the app stored it.
@@ -227,6 +291,7 @@ impl App {
         self.ensure_scope_keys().await?;
         self.prune_processed().await?;
         self.retry_parked().await?;
+        self.retry_owed().await?;
         self.list_collections_if_due().await?;
         let mut report = ReceiveReport::default();
         let mut wait = wait.map(|w| w.min(25));
@@ -1225,10 +1290,38 @@ impl App {
         if !self.state.asked.insert(seq) {
             return Ok(false);
         }
-        let writes = self.protocol.resend_needed(&needed);
-        read.tx.local(&writes)?;
+        match self.protocol.resend_needed(&needed) {
+            Ok(writes) => read.tx.local(&writes)?,
+            Err(_) => self.owe(seq, OwedCall::from(&needed), read)?,
+        }
         read.tx.put(&key::asked(seq), &())?;
         Ok(true)
+    }
+
+    /// A call the protocol couldn't answer: kept in the commit that passes its item, and
+    /// made again by later reads ([`App::retry_owed`]), so the cursor never passes what the
+    /// protocol wasn't told.
+    fn owe(&mut self, seq: u64, call: OwedCall, read: &mut Read) -> Result<(), AppError> {
+        read.tx
+            .put(&key::owed(self.state.cursor.generation, seq), &call)
+    }
+
+    /// The calls the protocol couldn't answer before, made again, oldest first; each one
+    /// answered commits its writes and goes, in one commit. The first that fails again
+    /// stops this pass; the next read goes on from it.
+    async fn retry_owed(&mut self) -> Result<(), AppError> {
+        let owed = self.reader().scan::<OwedCall>(key::OWED_PREFIX).await?;
+        for (rest, call) in owed {
+            let answer = call.make(self.protocol.as_ref());
+            let Ok(writes) = answer else {
+                break;
+            };
+            let mut tx = self.tx()?;
+            tx.local(&writes)?;
+            tx.delete(&format!("{}{rest}", key::OWED_PREFIX))?;
+            self.commit(tx).await?;
+        }
+        Ok(())
     }
 
     fn handle_unreadable(
@@ -1281,8 +1374,18 @@ impl App {
                 entries,
                 accepted_from_ms: from.max(self.resend_floor()),
             };
-            let writes = self.protocol.missed(&missed);
-            read.tx.local(&writes)?;
+            match self.protocol.missed(&missed) {
+                Ok(writes) => read.tx.local(&writes)?,
+                Err(_) => self.owe(
+                    seq,
+                    OwedCall::Missed {
+                        seq,
+                        entries,
+                        accepted_from_ms: missed.accepted_from_ms,
+                    },
+                    read,
+                )?,
+            }
             read.tx.put(&key::asked(seq), &())?;
             read.tx.put(super::records::LIST_DUE, &true)?;
             self.events.push(AppEvent::Missed { seq, entries });

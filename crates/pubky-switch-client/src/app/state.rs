@@ -94,6 +94,15 @@ pub(crate) mod key {
     /// The prefix of the kept duty events.
     pub(crate) const DUTY_PREFIX: &str = "duty/";
 
+    /// The prefix of the protocol calls owed.
+    pub(crate) const OWED_PREFIX: &str = "owed/";
+
+    /// A protocol call about the feed item at (`generation`, `seq`) the protocol couldn't
+    /// answer yet.
+    pub(crate) fn owed(generation: u64, seq: u64) -> String {
+        format!("owed/{}/{}", num(generation), num(seq))
+    }
+
     /// A duty event kept until acknowledged.
     pub(crate) fn duty(id: u64) -> String {
         format!("duty/{}", num(id))

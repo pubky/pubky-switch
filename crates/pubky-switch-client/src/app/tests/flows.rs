@@ -669,6 +669,75 @@ async fn test_app_missed_entries_go_to_the_protocol_from_the_cursor_time() {
 }
 
 #[tokio::test]
+async fn test_app_missed_call_the_protocol_fails_is_made_again() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let me = app.app_id();
+    w.note(me, "first");
+    app.receive(None).await.unwrap();
+    let now = w.clock.now_ms();
+    let seq = w.switch.push_missed(3, now - 10 * HOUR, now);
+    // The protocol can't read its state: the item is passed, its call kept.
+    *w.protocol.failing.lock().unwrap() = 1;
+    app.receive(None).await.unwrap();
+    assert!(app.cursor().seq >= seq);
+    assert!(w.protocol.missed.lock().unwrap().is_empty());
+    let mark = format!("missed/{seq}");
+    assert_eq!(app.protocol_get(mark.as_bytes()).await.unwrap(), None);
+    // Made again by the next read, after a load too, with what the item gave.
+    let mut app = w.load(me).await;
+    app.receive(None).await.unwrap();
+    let missed = w.protocol.missed.lock().unwrap().clone();
+    assert_eq!(missed.len(), 1);
+    assert_eq!(missed[0].seq, seq);
+    assert_eq!(missed[0].entries, 3);
+    assert_eq!(missed[0].accepted_from_ms, now - CLOCK_TOLERANCE_MS);
+    assert_eq!(
+        app.protocol_get(mark.as_bytes()).await.unwrap(),
+        Some(b"1".to_vec())
+    );
+    // Once.
+    app.receive(None).await.unwrap();
+    assert_eq!(w.protocol.missed.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn test_app_resend_call_the_protocol_fails_is_made_again() {
+    let w = World::new();
+    let mut wallet = w.join("wallet").await;
+    let mut phone = w.join("phone").await;
+    wallet.receive(None).await.unwrap();
+    let accepted = w.clock.now_ms();
+    w.clock.advance_ms(1000);
+    phone
+        .leave(LeaveMode::Immediate(UserConfirmed::new()))
+        .await
+        .unwrap();
+    let seq = w.switch.push_unreadable(w.bob.public(), accepted);
+    // Twice in a row the protocol can't answer: the item is passed, its call kept.
+    *w.protocol.failing.lock().unwrap() = 2;
+    wallet.receive(None).await.unwrap();
+    assert!(wallet.cursor().seq >= seq);
+    wallet.receive(None).await.unwrap();
+    assert!(w.protocol.resends.lock().unwrap().is_empty());
+    let mark = format!("resend/{accepted}");
+    assert_eq!(wallet.protocol_get(mark.as_bytes()).await.unwrap(), None);
+    // Then it answers: the same request, once.
+    wallet.receive(None).await.unwrap();
+    wallet.receive(None).await.unwrap();
+    let resends = w.protocol.resends.lock().unwrap().clone();
+    assert_eq!(resends.len(), 1);
+    assert_eq!(resends[0].sender, w.bob.public());
+    assert_eq!(resends[0].accepted_from_ms, accepted);
+    assert_eq!(resends[0].accepted_until_ms, accepted);
+    assert_eq!(resends[0].reason, crate::app::ResendReason::Unreadable);
+    assert_eq!(
+        wallet.protocol_get(mark.as_bytes()).await.unwrap(),
+        Some(b"1".to_vec())
+    );
+}
+
+#[tokio::test]
 async fn test_app_holds_then_parks_an_unverifiable_sender() {
     let w = World::new();
     let mut wallet = w.join("wallet").await;
@@ -1922,11 +1991,14 @@ impl Protocol for WideProtocol {
         })
     }
 
-    fn resend_needed(&self, needed: &ResendNeeded) -> Vec<LocalWrite> {
+    fn resend_needed(
+        &self,
+        needed: &ResendNeeded,
+    ) -> Result<Vec<LocalWrite>, crate::error::StoreError> {
         self.0.resend_needed(needed)
     }
 
-    fn missed(&self, missed: &MissedEntries) -> Vec<LocalWrite> {
+    fn missed(&self, missed: &MissedEntries) -> Result<Vec<LocalWrite>, crate::error::StoreError> {
         self.0.missed(missed)
     }
 }

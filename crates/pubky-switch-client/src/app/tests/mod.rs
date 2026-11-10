@@ -64,6 +64,19 @@ pub(crate) struct SampleProtocol {
     pub(crate) received: Mutex<Vec<(u64, String, bool)>>,
     pub(crate) resends: Mutex<Vec<ResendNeeded>>,
     pub(crate) missed: Mutex<Vec<MissedEntries>>,
+    /// How many of the next re-send and missed calls fail, as when the protocol can't read
+    /// its own state.
+    pub(crate) failing: Mutex<u32>,
+}
+
+impl SampleProtocol {
+    /// Whether this call fails, counting it down.
+    fn fails(&self) -> bool {
+        let mut failing = self.failing.lock().unwrap();
+        let fails = *failing > 0;
+        *failing = failing.saturating_sub(1);
+        fails
+    }
 }
 
 impl Protocol for SampleProtocol {
@@ -132,20 +145,29 @@ impl Protocol for SampleProtocol {
         Outcome::Apply(Effect { ops, local })
     }
 
-    fn resend_needed(&self, needed: &ResendNeeded) -> Vec<LocalWrite> {
+    fn resend_needed(
+        &self,
+        needed: &ResendNeeded,
+    ) -> Result<Vec<LocalWrite>, crate::error::StoreError> {
+        if self.fails() {
+            return Err(crate::error::StoreError::Unavailable);
+        }
         self.resends.lock().unwrap().push(needed.clone());
-        vec![LocalWrite::Put {
+        Ok(vec![LocalWrite::Put {
             key: format!("resend/{}", needed.accepted_from_ms).into_bytes(),
             value: b"1".to_vec(),
-        }]
+        }])
     }
 
-    fn missed(&self, missed: &MissedEntries) -> Vec<LocalWrite> {
+    fn missed(&self, missed: &MissedEntries) -> Result<Vec<LocalWrite>, crate::error::StoreError> {
+        if self.fails() {
+            return Err(crate::error::StoreError::Unavailable);
+        }
         self.missed.lock().unwrap().push(missed.clone());
-        vec![LocalWrite::Put {
+        Ok(vec![LocalWrite::Put {
             key: format!("missed/{}", missed.seq).into_bytes(),
             value: b"1".to_vec(),
-        }]
+        }])
     }
 }
 

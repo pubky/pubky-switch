@@ -410,14 +410,17 @@ impl Protocol for TestProtocol {
         Outcome::Apply(Effect::default())
     }
 
-    fn resend_needed(&self, needed: &ResendNeeded) -> Vec<LocalWrite> {
+    fn resend_needed(
+        &self,
+        needed: &ResendNeeded,
+    ) -> Result<Vec<LocalWrite>, crate::error::StoreError> {
         lock(&self.resends).push(needed.clone());
-        Vec::new()
+        Ok(Vec::new())
     }
 
-    fn missed(&self, missed: &MissedEntries) -> Vec<LocalWrite> {
+    fn missed(&self, missed: &MissedEntries) -> Result<Vec<LocalWrite>, crate::error::StoreError> {
         lock(&self.missed).push(missed.clone());
-        Vec::new()
+        Ok(Vec::new())
     }
 
     fn collections(&self) -> Vec<Collection> {

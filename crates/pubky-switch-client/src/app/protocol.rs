@@ -20,6 +20,9 @@
 //! - **Re-sends** ([`Protocol::resend_needed`], [`Protocol::missed`]): the kind that asks a
 //!   counterparty to send again is a protocol's (Switch spec 11), so the app hands over
 //!   what it needs and the protocol queues its request with the local writes it returns.
+//!   A protocol that can't read its own state for it says so with a [`StoreError`]: the app
+//!   keeps what it handed over and hands it over again later, so nothing is lost to a
+//!   default.
 //!
 //! The protocol's local state lives in the app's namespace under [`LocalWrite`] keys, which
 //! the app keeps apart from its own (`STATE.md`).
@@ -35,6 +38,7 @@ use super::context::{LocalView, ReceiveContext};
 use super::records::Collection;
 use super::recovery::{LossActions, ProviderLoss};
 use super::send::{RecordJob, SentMessage};
+use crate::error::StoreError;
 
 /// An opaque member of a protocol's message bodies (Switch wire 1.1): its numbers aren't
 /// checked against the integer range.
@@ -305,10 +309,21 @@ pub trait Protocol: Send + Sync {
 
     /// Entries the app can't read: the protocol queues its re-send request and returns the
     /// local writes that queue it, committed with the cursor passing the entries.
-    fn resend_needed(&self, needed: &ResendNeeded) -> Vec<LocalWrite>;
+    ///
+    /// # Errors
+    ///
+    /// A [`StoreError`] when the protocol can't build its writes now, such as when its own
+    /// state can't be read. The cursor still passes the entries, and the app keeps `needed`
+    /// in that same commit and calls this again with it at the start of each later read,
+    /// across loads, until it returns writes.
+    fn resend_needed(&self, needed: &ResendNeeded) -> Result<Vec<LocalWrite>, StoreError>;
 
-    /// Entries missed while lagging: as [`Protocol::resend_needed`].
-    fn missed(&self, missed: &MissedEntries) -> Vec<LocalWrite>;
+    /// Entries missed while lagging: as [`Protocol::resend_needed`], failure included.
+    ///
+    /// # Errors
+    ///
+    /// As [`Protocol::resend_needed`].
+    fn missed(&self, missed: &MissedEntries) -> Result<Vec<LocalWrite>, StoreError>;
 
     /// A provider loss the app follows (Switch spec 12.6 steps 2 and 4): the protocol queues
     /// its re-send requests to the counterparties of its unfinished activity, for what their
@@ -316,15 +331,29 @@ pub trait Protocol: Send + Sync {
     /// counterparties whose conversation entries the app adds back. The app commits the
     /// local writes once, with that step; a crash before that commit calls it again.
     /// Nothing by default.
-    fn provider_lost(&self, loss: &ProviderLoss) -> LossActions {
+    ///
+    /// # Errors
+    ///
+    /// A [`StoreError`] when the protocol can't build its actions now, such as when its own
+    /// state can't be read. The recovery stays at this step, which its record keeps, and the
+    /// app's call fails with the error; the next call asks again.
+    fn provider_lost(&self, loss: &ProviderLoss) -> Result<LossActions, StoreError> {
         let _ = loss;
-        LossActions::default()
+        Ok(LossActions::default())
     }
 
     /// [`Protocol::provider_lost`], with the protocol's local state at hand, read-only
     /// (`view`), such as to find the counterparties of its unfinished activity. The app
     /// calls this one; by default it calls [`Protocol::provider_lost`].
-    fn provider_lost_with(&self, loss: &ProviderLoss, view: &LocalView<'_>) -> LossActions {
+    ///
+    /// # Errors
+    ///
+    /// As [`Protocol::provider_lost`].
+    fn provider_lost_with(
+        &self,
+        loss: &ProviderLoss,
+        view: &LocalView<'_>,
+    ) -> Result<LossActions, StoreError> {
         let _ = view;
         self.provider_lost(loss)
     }

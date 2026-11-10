@@ -65,6 +65,7 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
 | `held/<seq>` | an entry held because its sender can't be checked, since when | |
 | `parked/<seq>` | an entry stored locally and passed: the opened plaintext, sender, certificate, time, reason (an unverifiable sender or a quota, tried again; an effect refused for good, over one batch, or kept past the batch ID window, not tried again) | yes |
 | `asked/<seq>` | a re-send was handed to the protocol for this item | |
+| `owed/<generation>/<seq>` | a re-send or missed-entries call about this item that the protocol answered with an error: written in the commit that passes the item, made again at the start of each read, and gone in the commit of its answer's writes | |
 | `departed/<app_id>` | another own app's departure verified in the chain, and its time | |
 | `join` | the join step: the registration batch while it is owed | |
 | `pending/effect` | a received message's effect batch and its outcome writes, with the deadlines of the claims it writes, and the opened entry, to store it locally if the batch outlives the batch ID window | yes |
@@ -78,7 +79,7 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
 | `dutyn` | the ID the next duty event takes; a restore keeps it, so an ID is never given twice | |
 
 Deleting the keys on a leave removes `keys`, `naming`, `rk/`, `scope/`, `parked/`,
-`pending/`, `p/` and `duty/`, and marks `leave`.
+`pending/`, `p/`, `duty/` and `owed/`, and marks `leave`.
 
 ## Extending the schema
 
@@ -133,7 +134,8 @@ uploads; `push.rs` holds the push registration. The peek (`peek.rs`) writes noth
   view as at a move (a kept batch holding an `attempt` goes instead of being signed
   again), `restore.reconcile` on, and `loss`. Each step then commits as done; the
   protocol's re-send writes commit with their step, once. A registration another device
-  of the app made first is adopted, and the record then goes alone.
+  of the app made first is adopted, and the record then goes alone. A protocol that answers
+  the re-send step with an error leaves the loss at that step, to be asked again.
 - **`gone`** stops every read; `push` goes with it. It is kept only once the newest verified
   own `identity.json` removes the app or doesn't list it, a `403 not_current` came while it
   lists the app with the certificate the app holds, or the account is erased: an unsigned

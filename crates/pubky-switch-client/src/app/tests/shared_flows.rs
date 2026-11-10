@@ -87,11 +87,14 @@ impl Protocol for ItemsProtocol {
         self.sample.receive(message)
     }
 
-    fn resend_needed(&self, needed: &ResendNeeded) -> Vec<LocalWrite> {
+    fn resend_needed(
+        &self,
+        needed: &ResendNeeded,
+    ) -> Result<Vec<LocalWrite>, crate::error::StoreError> {
         self.sample.resend_needed(needed)
     }
 
-    fn missed(&self, missed: &MissedEntries) -> Vec<LocalWrite> {
+    fn missed(&self, missed: &MissedEntries) -> Result<Vec<LocalWrite>, crate::error::StoreError> {
         self.sample.missed(missed)
     }
 
