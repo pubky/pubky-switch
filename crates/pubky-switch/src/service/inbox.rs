@@ -135,15 +135,12 @@ impl Service {
         // Check 2: admission and the listing, for an app of another identity.
         let mut by_code = None;
         if other {
-            let copy = txn.peer_copy(&sender).await.map_err(|e| store_error(&e))?;
-            let copy = copy
-                .as_ref()
-                .map(|held| IdentityDoc::verify_named(&held.doc))
-                .transpose()
-                .map_err(|_| temporary())?;
-            let removed = copy
-                .as_ref()
-                .is_some_and(|doc| doc.lists_removed(&sender_app));
+            // Read from its own column, not the document: a refusal costs the same whether
+            // or not a copy is held.
+            let removed = txn
+                .peer_lists_removed(&sender, &sender_app)
+                .await
+                .map_err(|e| store_error(&e))?;
             let standing = self.standing(txn, &sender).await?;
             let listed =
                 !standing.denied && !removed && (standing.contact || standing.conversation);
@@ -169,6 +166,13 @@ impl Service {
             if removed {
                 return Err(identity_needed(None));
             }
+            // The held copy is read and verified only once the sender is admitted.
+            let copy = txn.peer_copy(&sender).await.map_err(|e| store_error(&e))?;
+            let copy = copy
+                .as_ref()
+                .map(|held| IdentityDoc::verify_named(&held.doc))
+                .transpose()
+                .map_err(|_| temporary())?;
             match copy
                 .as_ref()
                 .map(|doc| doc.standing(&sender_app, &cert.hash()))

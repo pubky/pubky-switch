@@ -8,7 +8,7 @@
 use crate::store::{HeldPeer, PeerFloor};
 
 /// The one message of every admission refusal (Switch spec 7).
-pub(crate) const NOT_ADMITTED: &str = "7: the sender isn't admitted";
+pub(crate) const NOT_ADMITTED: &str = "7: sender not admitted";
 
 /// Where the account's lists put a sender identity.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -168,6 +168,7 @@ mod tests {
             version,
             generation,
             body_hash: [body; 32],
+            removed: Vec::new(),
         }
     }
 

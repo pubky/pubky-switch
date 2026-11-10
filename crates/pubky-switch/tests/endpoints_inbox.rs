@@ -287,7 +287,7 @@ async fn test_inbox_checks_in_order() {
     // Not admitted: bob isn't a contact.
     let answer = from_shop(&replay, to_wallet(2, false), Some(version), None).await;
     assert_eq!(code_of(&answer), (403, json!("not_admitted")));
-    assert_eq!(body(&answer)["message"], "7: the sender isn't admitted");
+    assert_eq!(body(&answer)["message"], "7: sender not admitted");
     // Admitted, with no copy of bob's identity.json: 409 identity_needed, version null.
     wallet_op(
         &replay,
