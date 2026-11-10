@@ -16,7 +16,7 @@
 //!
 //! The install then takes the backup's records as its own, with these additions:
 //! - the App IDs `GET /apps` shows revoked or departed join the tombstones, and, in place, so
-//!   do this install's own, with the revocations it asked for and the deletions it owes;
+//!   do this install's own, with the revocations it asked for;
 //! - the epoch floor is the highest epoch whose keys the records or the switch show were
 //!   sent, at most one past `data_epoch`;
 //! - the removed apps are left for the routine run to check, whose record still on the
@@ -140,8 +140,8 @@ impl Signer {
         state.certs = view.certs.iter().map(|c| c.signed().clone()).collect();
         state.bundle_parts = view.bundle_parts.clone();
         // Revoked for good: the backup's, `identity_doc`'s `removed`, what the switch shows,
-        // and, in place, this install's own, with the revocations it asked for and the
-        // deletions it owes.
+        // and, in place, this install's own, with the revocations it asked for. The deletions
+        // it owes come back through `deletion_checks`, as any removed app's do.
         let mut tombstones = view.revoked_apps.clone();
         tombstones.extend(doc.body().removed.iter().map(|r| r.app_id));
         tombstones.extend(
@@ -154,7 +154,6 @@ impl Signer {
         if in_place {
             tombstones.extend(self.state.tombstones.iter().copied());
             state.revoking.clone_from(&self.state.revoking);
-            state.cleanup.clone_from(&self.state.cleanup);
         }
         tombstones.sort_unstable();
         tombstones.dedup();
@@ -243,9 +242,10 @@ impl Signer {
     /// passes by construction. Returns, when the backup's own version is to be delivered
     /// first, the `prev` it builds on.
     ///
-    /// - In place, the records' own state: no alarm stands, since a restore never clears
-    ///   one, and the backup isn't below the mark, by version or generation, nor another
-    ///   body at its version (Switch wire 3.3 "Never back").
+    /// - In place, the records' own state: no alarm's alert stands, since a restore never
+    ///   clears one, and the backup isn't below the mark, by version or generation, nor
+    ///   another body at its version, nor below a newer version of this install's own the
+    ///   switch showed (`RecordsBehind`) (Switch wire 3.3 "Never back").
     /// - The switch's copy, `held`, is the backup's version, or the one it builds on, or
     ///   none under a backup of the account's first version.
     /// - The Homeserver's copy is neither newer than the backup's version nor another
@@ -262,8 +262,12 @@ impl Signer {
             if let Some(alarm) = gate::held_alarm(&self.state) {
                 return Err(SignerError::Alarm(alarm.clone()));
             }
-            if self.state.switch_unconfirmed {
-                return Err(Refusal::SwitchUnconfirmed.into());
+            // A version of this install's own seen at the switch counts as the mark does:
+            // the backup never goes below it either.
+            if let Some(seen) = self.state.records_behind
+                && doc.version() < seen
+            {
+                return Err(Refusal::StaleBackup.into());
             }
             if let Some(mark) = self.high_water() {
                 let below = doc.version() < mark.version

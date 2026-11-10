@@ -647,3 +647,142 @@ async fn test_restore_keeps_a_departure_time_from_before_it() {
     let doc = signer.identity_doc().unwrap().unwrap();
     assert_eq!(doc.body().removed[0].distrust_from, START_MS + 86_400_000);
 }
+
+/// Another install's records holding `doc`, as its backup.
+fn others_backup(world: &World, doc: &IdentityDoc) -> Vec<u8> {
+    let records = SignerRecords::new(
+        IdentityKey::from_secret(SECRET),
+        doc.clone(),
+        &[],
+        &[],
+        Limits::default(),
+        &[],
+        None,
+    )
+    .unwrap();
+    serde_json::to_vec(&SignerBackup::seal(&world.key, &records).unwrap()).unwrap()
+}
+
+/// `doc` as the switch's copy, the published copy and the backup's, all at once.
+fn everywhere(world: &World, doc: &IdentityDoc, backup: Vec<u8>) {
+    world.switch.deliver_identity(doc).unwrap();
+    world
+        .homeserver
+        .set(IDENTITY_PATH, serde_json::to_vec(doc.signed()).unwrap());
+    world.homeserver.set(SIGNER_BACKUP_PATH, backup);
+}
+
+#[tokio::test]
+async fn test_restore_in_place_never_goes_below_its_own_version_it_saw() {
+    // The records are at version 1, and the install saw its own version 9 at the switch.
+    // Then everything goes back to its own version 6: restoring that would roll versions 7 to
+    // 9 back, so it is refused.
+    let world = World::new();
+    let (signer, memory) = world.enrolled().await;
+    let first = signer.identity_doc().unwrap().unwrap();
+    drop(signer);
+    let (nine, backup) = own_newer(&world, &first, 9);
+    everywhere(&world, &nine, backup);
+    let mut signer = Signer::open(world.env(memory), world.keyring())
+        .await
+        .unwrap();
+    signer.set_record_max_age(Some(60)).await.unwrap_err();
+    assert_eq!(signer.status(), SignerStatus::RecordsBehind { version: 9 });
+    let (six, backup) = own_newer(&world, &first, 6);
+    everywhere(&world, &six, backup);
+    let sent = world.sent_docs().len();
+    assert_eq!(
+        signer.restore(confirmed()).await.unwrap_err(),
+        SignerError::Refused(Refusal::StaleBackup)
+    );
+    assert_eq!(world.sent_docs().len(), sent);
+}
+
+#[tokio::test]
+async fn test_restore_in_place_after_an_alarm_and_a_take_over() {
+    // The switch went back and the install raised the alarm; then another install took over
+    // at version 3. Once the user has cleared the alert, the install restores in place from
+    // that install's backup and signs again.
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let first = signer.identity_doc().unwrap().unwrap();
+    let two = signer.set_record_max_age(Some(86_400)).await.unwrap();
+    world.switch.deliver_identity(&first).unwrap();
+    let SignerError::Alarm(alarm) = signer.set_record_max_age(Some(60)).await.unwrap_err() else {
+        panic!("no alarm")
+    };
+    let theirs = world.other_install_version(&two, [7; 16]);
+    everywhere(&world, &theirs, others_backup(&world, &theirs));
+    assert_eq!(
+        signer.restore(confirmed()).await.unwrap_err(),
+        SignerError::Alarm(alarm.clone())
+    );
+    signer.clear_alert(&alarm).await.unwrap_err();
+    let restored = signer.restore(confirmed()).await.unwrap();
+    assert_eq!(restored.version(), 4);
+    assert_eq!(restored.body().signer, signer.install_id());
+    assert_eq!(signer.status(), SignerStatus::Signing);
+}
+
+#[tokio::test]
+async fn test_restore_in_place_refuses_a_backup_at_a_lower_generation() {
+    // The install adopted another install's version 5 at generation 2. A backup, switch and
+    // Homeserver at version 6 but generation 1 are below that mark by generation.
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let first = signer.identity_doc().unwrap().unwrap();
+    let mut body = first.body().clone();
+    body.version = 5;
+    body.generation = 2;
+    body.signer = [7; 16];
+    let five = IdentityDoc::sign(&world.key, body).unwrap();
+    world.switch.deliver_identity(&five).unwrap();
+    signer.set_record_max_age(Some(60)).await.unwrap_err();
+    assert_eq!(signer.high_water().unwrap().generation, 2);
+    let mut body = first.body().clone();
+    body.version = 6;
+    body.signer = [7; 16];
+    let six = IdentityDoc::sign(&world.key, body).unwrap();
+    everywhere(&world, &six, others_backup(&world, &six));
+    assert_eq!(
+        signer.restore(confirmed()).await.unwrap_err(),
+        SignerError::Refused(Refusal::StaleBackup)
+    );
+}
+
+#[tokio::test]
+async fn test_restore_in_place_refuses_another_body_at_the_mark() {
+    // The mark is this install's version 2; the backup, the switch and the Homeserver all
+    // hold another body at version 2.
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let two = signer.set_record_max_age(Some(86_400)).await.unwrap();
+    let mut body = two.body().clone();
+    body.record_max_age = Some(7);
+    let other = IdentityDoc::sign(&world.key, body).unwrap();
+    everywhere(&world, &other, others_backup(&world, &other));
+    assert_eq!(
+        signer.restore(confirmed()).await.unwrap_err(),
+        SignerError::Refused(Refusal::StaleBackup)
+    );
+}
+
+#[tokio::test]
+async fn test_restore_in_place_keeps_an_owed_record_deletion() {
+    // `a`'s record couldn't be deleted after its removal. Restored in place, the install
+    // still deletes it once the Homeserver takes it.
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let (a, _) = two_joined(&world, &mut signer).await;
+    let id = a.keys.app_id_bytes();
+    world
+        .homeserver
+        .set(&app_record_path(&id), b"a's record".to_vec());
+    *world.homeserver.failing_path.lock().unwrap() = Some(app_record_path(&id));
+    signer.revoke(id, None, confirmed()).await.unwrap();
+    signer.restore(confirmed()).await.unwrap();
+    assert!(world.homeserver.file(&app_record_path(&id)).is_some());
+    *world.homeserver.failing_path.lock().unwrap() = None;
+    signer.run_due().await.unwrap();
+    assert!(world.homeserver.file(&app_record_path(&id)).is_none());
+}
