@@ -764,32 +764,10 @@ impl Signer {
         prev: Option<[u8; 32]>,
         backup: Option<SignerBackup>,
     ) -> Result<()> {
-        self.check_named()?;
-        let found = self
-            .env
-            .homeserver
-            .get(SIGNER_BACKUP_PATH)
-            .await
-            .map_err(SignerError::Homeserver)?;
+        let raised = self.check_backup_write().await?;
         let mut state = self.state.clone();
-        match found {
-            Some(bytes) => match self.open_backup(&bytes)? {
-                Some(found) => self.judge_backup(&found).await?,
-                None if self.state.newest.is_none() => {
-                    // No mark yet, so no copy of the switch to judge: a staged account shows
-                    // none. The backup may be another install's, so nothing is written.
-                    return self.unreadable_before_mark().await;
-                }
-                None => {
-                    self.switch_at_mark().await?;
-                    state.alert(Alert::BackupUnreadable);
-                }
-            },
-            None if self.state.newest.is_some() => {
-                self.switch_at_mark().await?;
-                state.alert(Alert::BackupMissing);
-            }
-            None => {}
+        if let Some(alert) = raised {
+            state.alert(alert);
         }
         let backup = match backup {
             Some(backup) => backup,
@@ -822,6 +800,49 @@ impl Signer {
             step: DeliverStep::BackupWritten,
         };
         self.commit(state, Some(flow)).await
+    }
+
+    /// The checks before any write of this install's backup, over the one the Homeserver
+    /// holds (Switch wire 3.13 "When it is written", "Another install's backup"): this
+    /// install is named, and the backup there names neither another install at or past the
+    /// high-water mark nor a newer version of this install's own ([`Signer::judge_backup`]).
+    /// One that doesn't open, or none where this signer has written one, is written over only
+    /// while the switch still holds the newest version this signer delivered: then no other
+    /// install has taken over, since one that takes over delivers before it writes its
+    /// backup. Returns the alert the write raises, if any.
+    ///
+    /// The Homeserver has no conditional write, so a backup written between this read and
+    /// the write can't be told apart: the check narrows the race to that window.
+    async fn check_backup_write(&mut self) -> Result<Option<Alert>> {
+        self.check_named()?;
+        let found = self
+            .env
+            .homeserver
+            .get(SIGNER_BACKUP_PATH)
+            .await
+            .map_err(SignerError::Homeserver)?;
+        match found {
+            Some(bytes) => match self.open_backup(&bytes)? {
+                Some(found) => {
+                    self.judge_backup(&found).await?;
+                    Ok(None)
+                }
+                None if self.state.newest.is_none() => {
+                    // No mark yet, so no copy of the switch to judge: a staged account shows
+                    // none. The backup may be another install's, so nothing is written.
+                    self.unreadable_before_mark().await.map(|()| None)
+                }
+                None => {
+                    self.switch_at_mark().await?;
+                    Ok(Some(Alert::BackupUnreadable))
+                }
+            },
+            None if self.state.newest.is_some() => {
+                self.switch_at_mark().await?;
+                Ok(Some(Alert::BackupMissing))
+            }
+            None => Ok(None),
+        }
     }
 
     /// A backup this install can't open, found before its first version was delivered: keep
@@ -1109,6 +1130,7 @@ impl Signer {
             delivered_at: None,
         });
         state.signed_through = state.signed_through.max(version);
+        state.backup_owed = false;
         state.managed_by = Some(signer);
         state.alert(Alert::ManagedByOtherInstall { install: signer });
         self.commit(state, None).await?;
@@ -1119,6 +1141,8 @@ impl Signer {
     /// behind, and it signs nothing more until a restore, ending the flow.
     async fn records_behind(&mut self, source: Source, version: u64) -> Result<()> {
         let mut state = self.state.clone();
+        // A backup owed would hold the older records: the one there is newer.
+        state.backup_owed = false;
         state.records_behind = Some(version);
         state.signed_through = state.signed_through.max(version);
         state.alert(Alert::RecordsBehind {
@@ -1133,6 +1157,8 @@ impl Signer {
     /// Another install is the signer: this one stops signing (Switch spec 4.3, 12.8).
     async fn managed_by(&mut self, install: [u8; 16]) -> Result<()> {
         let mut state = self.state.clone();
+        // Another install's backup is never written over.
+        state.backup_owed = false;
         state.managed_by = Some(install);
         state.alert(Alert::ManagedByOtherInstall { install });
         self.commit(state, None).await?;
