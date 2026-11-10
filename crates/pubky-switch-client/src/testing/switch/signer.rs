@@ -10,8 +10,8 @@ use pubky_switch_core::enc::{b64, zbase32_encode};
 use pubky_switch_core::http::{ErrorCode, IdentityDelivery};
 use pubky_switch_core::json::parse_json;
 use pubky_switch_core::records::{
-    AccountView, Delivery, DeliveryRefusal, Enrollment, EnrollmentAnswer, IdentityDoc, Limits,
-    check_delivery,
+    AccountView, Delivery, DeliveryRefusal, Enrollment, EnrollmentAnswer, IdentityDoc, KeptProofs,
+    Limits, check_delivery,
 };
 use pubky_switch_core::sig::SignedDoc;
 use serde_json::{Value, json};
@@ -160,7 +160,7 @@ impl Inner {
             origin: SWITCH_ORIGIN,
             pending_key: None,
             kept_app_ids: &kept,
-            proof_keys: &[],
+            kept_proofs: KeptProofs::default(),
         };
         match check_delivery(&view, &doc, delivery.prev.as_ref()) {
             Ok(Delivery::New(_)) => {
