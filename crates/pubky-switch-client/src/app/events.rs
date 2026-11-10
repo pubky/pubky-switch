@@ -5,6 +5,7 @@
 //! Events carry facts, never wording, and never message content: a host words them.
 
 use super::error::Alarm;
+use super::protocol::StoreFailure;
 
 /// One thing that happened, for the host to show or act on.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -46,8 +47,31 @@ pub enum AppEvent {
         /// The entry's `seq`.
         seq: u64,
     },
+    /// The protocol's receive step at an entry couldn't finish, because its store or the
+    /// host failed ([`super::Outcome::Retry`]), on `reads` reads in a row: raised from the
+    /// [`super::RETRY_EVENT_READS`]th on, on each such read, whether the entry is held on
+    /// the feed or, after the bounded wait, stored locally ([`ParkReason::StoreUnavailable`]).
+    /// The entry stays unprocessed until a read processes it; the host repairs or frees its
+    /// store.
+    StoreFailing {
+        /// The entry's `seq`.
+        seq: u64,
+        /// The reads in a row that ended in a retry at the entry, this one included.
+        reads: u32,
+        /// When the first of them was, device time in Unix milliseconds.
+        since_ms: u64,
+        /// The store's failure on this read.
+        failure: StoreFailure,
+    },
+    /// A layered backup was refused ([`super::App::backup_layered`]), so the host knows it
+    /// has no current backup.
+    BackupRefused {
+        /// Why.
+        reason: BackupRefusal,
+    },
     /// An entry was stored locally and the cursor moved past it (Switch spec 8.2): its
-    /// sender stayed unverifiable too long, or its write hit a quota.
+    /// sender stayed unverifiable too long, its write hit a quota, or the store failed for
+    /// its receive step ([`ParkReason`]).
     Parked {
         /// The entry's `seq`.
         seq: u64,
@@ -394,6 +418,15 @@ pub enum AppEvent {
     },
 }
 
+/// Why a backup was refused ([`AppEvent::BackupRefused`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum BackupRefusal {
+    /// The restore's one commit wouldn't fit the store's value or batch size: the layer, or
+    /// the entries stored locally and the processed pairs it carries, are too large for now.
+    TooLarge,
+}
+
 /// Why an entry was stored locally (Switch spec 8.2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
@@ -412,6 +445,14 @@ pub enum ParkReason {
     /// ([`super::MAX_CLAIM_READS`]), or again for what it was given: it is kept, not
     /// applied, and not tried again.
     TooManyReads,
+    /// Its receive step was retried for want of the store ([`super::Outcome::Retry`],
+    /// [`super::StoreFailure::unavailable`]) for longer than the bounded wait: it is tried
+    /// again at every read.
+    StoreUnavailable,
+    /// The store failed for its receive step in a way that retrying can't mend
+    /// ([`super::StoreFailure::of_entry`]), such as a corrupt value: it is tried again at
+    /// every read, in case the host repaired it.
+    StoreRejected,
     /// Its effect was kept from before a provider change longer than a resend's answer
     /// tells whether it was applied (Switch spec 12.5 "Kept batches"): it may have been, so
     /// it is kept, not applied again, and not tried again.
