@@ -563,6 +563,7 @@ impl Service {
         };
         // A read answered once the lock is gone answers a refusal with the head this request
         // commits, as every refusal to a verified caller carries one (Switch wire 7.1).
+        let txn_account = txn.head().id.clone();
         let fallback_head = if answer.deferred.is_some() {
             self.head(&txn, &signer).await
         } else {
@@ -605,11 +606,11 @@ impl Service {
                                 self.operator_answer(signature, base_ms, &error).await
                             }
                             Err(feed::FeedStop::Refused(refusal)) => {
-                                let head = if refusal.fallback {
-                                    fallback_head
-                                } else {
-                                    refusal.head
-                                };
+                                // Every 401 counts against the network source (9.4).
+                                if is_failed_authentication(refusal.error.code) {
+                                    self.record_failure(request, txn_account.clone());
+                                }
+                                let head = if refusal.head { fallback_head } else { None };
                                 sign_answer(
                                     &signer,
                                     signature,
