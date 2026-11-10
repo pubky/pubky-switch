@@ -4,8 +4,9 @@
 //! A [`SwitchClient`] acts with one set of [`Credentials`] on one account at one switch
 //! origin. It signs every request (Switch wire 7.1, 7.2) and checks every answer with the
 //! service key it pinned before it uses anything in it. Without a pinned key it sends only
-//! an enrollment, whose answer names the key; every other call fails closed before it is
-//! sent (Switch wire 7.1, Switch spec 6.1).
+//! an enrollment, whose answer names the key, and the public read, checked with the key its
+//! verified `identity.json` names; every other call fails closed before it is sent (Switch
+//! wire 7.1, Switch spec 6.1).
 //!
 //! - [`answers`]: the answer and body types of the calls.
 //! - [`Batch`]: signed operations kept with their exact request body, so a retry resends the
@@ -27,7 +28,7 @@ use pubky_switch_core::http::{
 };
 use pubky_switch_core::keys::AppKeys;
 use pubky_switch_core::labels;
-use pubky_switch_core::records::{AppCert, ExportTransfer};
+use pubky_switch_core::records::{AppCert, ExportTransfer, IdentityDoc};
 use pubky_switch_core::signing::Signs;
 use pubky_switch_core::time::{parse_rfc3339, rfc3339_seconds};
 use serde_json::Value;
@@ -173,6 +174,10 @@ pub(crate) struct Auth<'a> {
     /// The signing time to send instead of the clock's: the `current.server_time` of a
     /// `401 stale_timestamp`, for its one retry (Switch wire 7.1).
     pub(crate) timestamp_ms: Option<u64>,
+    /// The key that signs a `2xx` answer instead of the pinned one: the pending key named by
+    /// a delivery that starts a generation (Switch wire 7.4.2). Other statuses are still
+    /// checked with the pinned key.
+    pub(crate) success_key: Option<[u8; 32]>,
 }
 
 /// The `Content-Type` of a request body (Switch wire 7.1).
@@ -279,9 +284,6 @@ pub(crate) fn verify_head(
         .map_err(|error| ClientError::Chain(ChainError::Signature(error.to_string())))
 }
 
-/// Read a checked error body: `{ "code", "message", "current", "known_version",
-/// "retry_after" }` (Switch wire 7.1, 7.6). The code must be one the wire format defines,
-/// with the status it fixes.
 /// `Switch-Head`, where present and verified with the service key for `account`.
 fn verified_head(
     service_key: &[u8; 32],
@@ -294,6 +296,9 @@ fn verified_head(
         .filter(|head| verify_head(head, service_key, account).is_ok())
 }
 
+/// Read a checked error body: `{ "code", "message", "current", "known_version",
+/// "retry_after" }` (Switch wire 7.1, 7.6). The code must be one the wire format defines,
+/// with the status it fixes.
 pub(crate) fn parse_error(status: u16, body: &[u8]) -> ClientError {
     let invalid =
         |why: &str| ClientError::InvalidResponse(format!("Switch wire 7.6: an error body {why}"));
@@ -377,7 +382,8 @@ impl SwitchClient {
     ///
     /// `pinned_key` is the account's service key the caller pinned: from the `identity.json`
     /// naming the service or, for the signer, from its enrollment answer or the freeze naming
-    /// the next service (Switch wire 7.1). Without one, the client sends only an enrollment.
+    /// the next service (Switch wire 7.1). Without one, the client sends only an enrollment
+    /// and the public read.
     ///
     /// # Errors
     ///
@@ -667,9 +673,9 @@ impl SwitchClient {
     }
 
     /// Sign, send and check a call with the pinned key. Without a pinned key nothing is
-    /// sent (Switch wire 7.1). A verified `401 stale_timestamp` that carries
-    /// `current.server_time` is retried once, the same call signed at that time; the time is
-    /// used for nothing else, and a second `stale_timestamp` is the answer.
+    /// sent but the public read (Switch wire 7.1). A verified `401 stale_timestamp` that
+    /// carries `current.server_time` is retried once, the same call signed at that time; the
+    /// time is used for nothing else, and a second `stale_timestamp` is the answer.
     pub(crate) async fn call(
         &self,
         method: &str,
@@ -678,13 +684,17 @@ impl SwitchClient {
         content: Body,
         auth: Auth<'_>,
     ) -> Result<CheckedResponse, ClientError> {
-        let key = self.pinned_key().ok_or(ClientError::Unpinned)?;
+        let key = match self.pinned_key() {
+            Some(key) => key,
+            None if auth.public => {
+                return self.unpinned_public_read(method, path_and_query).await;
+            }
+            None => return Err(ClientError::Unpinned),
+        };
         self.set_latest(None);
         let retry_body = body.clone();
         let signed = self.build(method, path_and_query, body, content, auth)?;
-        let response = self.transport.send(signed.request).await?;
-        let checked = check_response(&key, &self.account, signed.signature.as_ref(), &response);
-        self.note_server_time(&key, &checked, &response);
+        let checked = self.send_checked(signed, key, auth.success_key).await?;
         let Some(at) = stale_timestamp_hint(&checked) else {
             return checked;
         };
@@ -693,10 +703,66 @@ impl SwitchClient {
             ..auth
         };
         let signed = self.build(method, path_and_query, retry_body, content, auth)?;
+        self.send_checked(signed, key, auth.success_key).await?
+    }
+
+    /// Send a signed request and check its answer: a `2xx` with `success_key` where given,
+    /// anything else with `key`. The outer error is the transport's.
+    async fn send_checked(
+        &self,
+        signed: SignedRequest,
+        key: [u8; 32],
+        success_key: Option<[u8; 32]>,
+    ) -> Result<Result<CheckedResponse, ClientError>, ClientError> {
         let response = self.transport.send(signed.request).await?;
+        let key = match success_key {
+            Some(success) if (200..300).contains(&response.status) => success,
+            _ => key,
+        };
         let checked = check_response(&key, &self.account, signed.signature.as_ref(), &response);
         self.note_server_time(&key, &checked, &response);
+        Ok(checked)
+    }
+
+    /// The public read without a pinned key (Switch wire 7.1 "An unpinned public read",
+    /// 7.4.15). The `identity.json` in the answer is verified with the account's identity key
+    /// and nothing else is used before the response signature verifies with the service key
+    /// that document names, which it does only when the document names this origin. That key
+    /// is then pinned. Any answer that can't be checked so, an error included, is
+    /// [`ClientError::BadServiceSignature`]: a failed lookup, never a sign that the service
+    /// holds no document.
+    async fn unpinned_public_read(
+        &self,
+        method: &str,
+        path_and_query: &str,
+    ) -> Result<CheckedResponse, ClientError> {
+        self.set_latest(None);
+        let auth = Auth {
+            public: true,
+            ..Auth::default()
+        };
+        let signed = self.build(method, path_and_query, Vec::new(), Body::Empty, auth)?;
+        let response = self.transport.send(signed.request).await?;
+        let key =
+            self.named_service_key(&response.body)
+                .ok_or(ClientError::BadServiceSignature {
+                    status: response.status,
+                })?;
+        let checked = check_response(&key, &self.account, None, &response);
+        self.note_server_time(&key, &checked, &response);
+        if checked.is_ok() {
+            self.pin(key);
+        }
         checked
+    }
+
+    /// The service key an unchecked public-read body names for this origin: that of its
+    /// `identity`, once it verifies with the account's identity key; `None` otherwise.
+    fn named_service_key(&self, body: &[u8]) -> Option<[u8; 32]> {
+        let value: Value = pubky_switch_core::json::parse_json(body).ok()?;
+        let signed = read::doc(value.get("identity")?)?;
+        let doc = IdentityDoc::verify(&signed, &self.account).ok()?;
+        (doc.inbox().url == self.origin).then_some(doc.inbox().service_key)
     }
 
     /// Send a request this client signed, as built by [`SwitchClient::sign_request`], and
@@ -709,10 +775,7 @@ impl SwitchClient {
     pub async fn send(&self, signed: SignedRequest) -> Result<CheckedResponse, ClientError> {
         let key = self.pinned_key().ok_or(ClientError::Unpinned)?;
         self.set_latest(None);
-        let response = self.transport.send(signed.request).await?;
-        let checked = check_response(&key, &self.account, signed.signature.as_ref(), &response);
-        self.note_server_time(&key, &checked, &response);
-        checked
+        self.send_checked(signed, key, None).await?
     }
 
     pub(crate) fn transport(&self) -> &dyn Transport {

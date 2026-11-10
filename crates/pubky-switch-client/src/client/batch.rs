@@ -185,6 +185,19 @@ impl SwitchClient {
     /// key didn't sign. Nothing in such an answer is acted on; as a signed contradiction it
     /// is misbehaviour (Switch spec 10.1). Otherwise as every call.
     pub async fn submit(&self, batch: &Batch) -> Result<Submitted, ClientError> {
+        let key = self.pinned_key().ok_or(ClientError::Unpinned)?;
+        self.submit_proved_by(batch, &key).await
+    }
+
+    /// [`SwitchClient::submit`], with the proofs checked with `proof_key`: the key of the
+    /// generation a kept batch was signed for, whose original proofs a key change in place
+    /// keeps and a resend returns (Switch wire 6.4 step 6). The head is checked with the
+    /// pinned key.
+    pub(crate) async fn submit_proved_by(
+        &self,
+        batch: &Batch,
+        proof_key: &[u8; 32],
+    ) -> Result<Submitted, ClientError> {
         let checked = self
             .call(
                 "POST",
@@ -201,7 +214,7 @@ impl SwitchClient {
         let head = o.head("head")?;
         verify_head(&head, &key, &self.account())?;
         let docs = o.each("proofs", read::doc)?;
-        let proofs = bind_answer(&batch.ops, &docs, &key, &self.account())?;
+        let proofs = bind_answer(&batch.ops, &docs, proof_key, &self.account())?;
         Ok(Submitted { proofs, head })
     }
 }

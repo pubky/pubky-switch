@@ -99,6 +99,62 @@ async fn test_push_starts_registers_with_the_relay_and_sets_the_handle() {
 }
 
 #[tokio::test]
+async fn test_push_sets_the_handles_merged_with_the_other_devices() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join(&w, &router).await;
+    let me = app.app_id();
+    let relay = FakeRelay::default();
+    // Another device registered first, under the push key both share.
+    app.register_push(&relay, RELAY, "device-1").await.unwrap();
+    let (_, key, _) = w.switch.push_of(&me).unwrap();
+    let theirs = crate::app::PushHandles {
+        push_key: key,
+        handles: vec!["their-handle".into()],
+    };
+    app.take_device_push_handles(theirs).await.unwrap();
+    // This device's new handle goes with the other device's: the list replaces the one the
+    // service holds (Switch wire 8.1).
+    relay.answer.lock().unwrap().replace("my-handle".into());
+    let registration = app.register_push(&relay, RELAY, "device-2").await.unwrap();
+    assert_eq!(registration.handles, 2);
+    let (_, _, handles) = w.switch.push_of(&me).unwrap();
+    assert_eq!(
+        handles,
+        vec!["my-handle".to_owned(), "their-handle".to_owned()]
+    );
+    let mine = app.push_handles().await.unwrap().unwrap();
+    assert_eq!(mine.push_key, key);
+    assert_eq!(mine.handles, vec!["my-handle".to_owned()]);
+    assert_eq!(format!("{mine:?}"), "PushHandles(1 handles)");
+}
+
+#[tokio::test]
+async fn test_push_leaves_out_handles_of_another_push_key_or_too_many() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join(&w, &router).await;
+    let me = app.app_id();
+    let relay = FakeRelay::default();
+    let stale = crate::app::PushHandles {
+        push_key: [9; 32],
+        handles: vec!["stale-handle".into()],
+    };
+    app.take_device_push_handles(stale).await.unwrap();
+    app.register_push(&relay, RELAY, "device-1").await.unwrap();
+    let (_, _, handles) = w.switch.push_of(&me).unwrap();
+    assert_eq!(handles.len(), 1);
+    let too_many = crate::app::PushHandles {
+        push_key: [9; 32],
+        handles: (0..8).map(|i| format!("h{i}")).collect(),
+    };
+    assert!(matches!(
+        app.take_device_push_handles(too_many).await.unwrap_err(),
+        AppError::Refused(Refusal::Usage(_))
+    ));
+}
+
+#[tokio::test]
 async fn test_push_start_again_keeps_the_registration() {
     let w = World::new();
     let router = Router::of(&w);
