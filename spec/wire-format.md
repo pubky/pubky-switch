@@ -242,7 +242,7 @@ A list with a name not among them, one repeated or out of order is malformed, an
 
 **Scope roots** (spec 3.3). A scope's root is its `name`, the part before any `:`. Each protocol has a name, the one it uses under `protocols` in app records (3.2) and as the prefix of its kinds (5.1), and each root belongs to one protocol, so a reader never takes one protocol's scope for another's:
 
-- Paykit's roots are reserved for Paykit: `pay`, `request`, `allowance`, `allowance_execute`, `contacts`, `manage_contacts` and `ext` (Paykit spec 3.1). Its name is `paykit`.
+- Paykit's roots are reserved for Paykit: `pay`, `request`, `allowance`, `allowance_execute`, `contacts`, `manage_contacts` and `ext` (Paykit spec 3.1). Its name is `paykit`. `spec/reserved-roots.json` holds this list in machine-readable form, with the same name and roots.
 - Every other protocol's roots are its name, or its name followed by `_` or `-` and more characters, such as `chat` and `chat_read` for a protocol named `chat`.
 - A protocol's name other than Paykit's is 1 to 32 characters of `a-z` and `0-9`, starting with a letter, without `_` or `-`, so no protocol's root is another's; it isn't `paykit` or a reserved root, and no reserved root is it followed by `_` or `-` and more characters (so `manage` isn't one, since `manage_contacts` is reserved).
 - A signer refuses to take a protocol whose name breaks these rules, or that claims a root other than its own, so two independent signers can't give one root to two protocols, even where only one of them is installed.
