@@ -720,9 +720,20 @@ impl App {
             } = writes;
             effect.ops = ops.into_iter().chain(effect.ops).collect();
             effect.local = local.into_iter().chain(effect.local).collect();
-            // The app layer's own lifecycle operations aren't a protocol's to write: refused
-            // before anything is kept.
-            super::batch::refuse_lifecycle_ops(effect.ops.iter().map(|(_, kind)| kind))?;
+            // The app layer's own lifecycle operations aren't a protocol's to write: an effect
+            // carrying one is never sent. Its entry is stored and passed, so the feed goes on,
+            // and the protocol told, as for an effect refused for good (Switch spec 8.2).
+            if super::batch::refuse_lifecycle_ops(effect.ops.iter().map(|(_, kind)| kind)).is_err()
+            {
+                self.park(
+                    entry,
+                    &received.plaintext,
+                    ParkReason::LifecycleOperation,
+                    read,
+                )?;
+                self.effect_refused(entry, &received, None, read)?;
+                return Ok(Step::Pass);
+            }
             if effect.ops.len() >= MAX_BATCH_ENTRIES {
                 // Switch wire 6.4: at most 7 operations beside the cursor move. Stored and
                 // passed, so the feed goes on (Switch spec 8.2).
@@ -903,6 +914,9 @@ impl App {
         } else {
             Some(entry.seq)
         };
+        // Kept at a service time verified in this call ([`App::kept_stamp`]): the feed read
+        // brought one, a retry of an entry stored locally may come before it.
+        self.fresh_service_time().await?;
         let batch = self.sign_ops(effect.ops, cursor_to)?;
         let pending = PendingEffect {
             body: batch.body().to_vec(),
@@ -1215,11 +1229,15 @@ impl App {
             return Ok(());
         };
         let batch = Batch::from_body(pending.body.clone())?;
-        self.fresh_service_time().await?;
         // Past the window no answer tells whether it was applied, at any generation: a
         // retry after the service dropped its proofs gets `409 conflict`, and a forgotten
         // ID takes the same bytes as new. It isn't sent again; its entry is stored as
-        // uncertain (Switch wire 6.4 step 5, Switch spec 12.5 "Kept batches").
+        // uncertain (Switch wire 6.4 step 5, Switch spec 12.5 "Kept batches"). Past it by
+        // the clocks at hand is past it; only a "still inside" needs a fresh service time.
+        if !self.answer_decides(pending.kept_ms) {
+            return self.effect_uncertain(&pending).await;
+        }
+        self.fresh_service_time().await?;
         if !self.answer_decides(pending.kept_ms) {
             return self.effect_uncertain(&pending).await;
         }

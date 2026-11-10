@@ -239,7 +239,9 @@ pub enum AppEvent {
         msg_id: String,
         /// The message kind.
         kind: String,
-        /// The error code of the refusal; `None` for an effect over one batch.
+        /// The error code of the refusal; `None` for an effect the app refused itself, over
+        /// one batch or carrying an operation the app layer builds ([`ParkReason`] says
+        /// which).
         code: Option<String>,
     },
     /// A received message's effect was kept unanswered across a provider change for longer
@@ -782,6 +784,10 @@ pub enum ParkReason {
     /// ([`super::MAX_CLAIM_READS`]), or again for what it was given: it is kept, not
     /// applied, and not tried again.
     TooManyReads,
+    /// Its effect carries an operation the app layer builds itself (`app.put`,
+    /// `receive_key.put`, `key_bundle.put`, `cert.put`), which a protocol may not write: it
+    /// is kept, not applied, and not tried again ([`AppEvent::EffectRefused`]).
+    LifecycleOperation,
     /// Its receive step was retried for want of the store ([`super::Outcome::Retry`],
     /// [`super::StoreFailure::unavailable`]) for longer than the bounded wait: it is tried
     /// again at every read.

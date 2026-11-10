@@ -187,6 +187,10 @@ pub(crate) enum RefusalPlace {
     /// write is refused, the cursor move included, so the feed can't advance at that
     /// service with or without a kept effect in front of it, and stopping the read at the
     /// `410` and having the move carry the effect across loses nothing.
+    ///
+    /// `401 stale_timestamp`, `410 moved` and `503 staged` are listed for completeness: they
+    /// never reach [`refused_at`], since [`refused_for_good`] leaves them out (their Retry is
+    /// not "No"), and they are retried as any transient answer is, the batch kept as it is.
     Caller,
     /// Before the lookup, about these bytes: the same bytes get the same answer, so the
     /// batch is never answered and is handled at once as one kept past the window: an
@@ -208,13 +212,17 @@ pub(crate) enum RefusalPlace {
     /// `receive_key.put` record that don't verify, and `403 not_current` for an `app.put`
     /// whose certificate isn't the one `identity.json` lists. A `key_bundle.put` never
     /// reaches an app's batch: it is the signer's, and step 9 checks permission (`403
-    /// permission_missing`) before shape. The app's own `app.put` and `receive_key.put` go
-    /// in batches of their own, sent again by their own steps (joining, the record's
-    /// delivery, a registration, a move's or a loss's re-registration), never through a
-    /// kept effect or a kept batch, whose answers this classifies. A protocol's effect and a
-    /// host's batch may carry none of them (`refuse_lifecycle_ops`), which is what makes
-    /// [`RefusalPlace::Caller`] safe until the wire's answers name the operation: otherwise
-    /// one refused at step 9 would be held here as about the caller until the window ends.
+    /// permission_missing`) before shape. The caller's own `app.put` is checked at
+    /// authentication (Switch wire 7.2: an own app's first call verifies the record and its
+    /// certificate, and every later one is checked against the record held), before the
+    /// lookup, where such a refusal is about the caller. The app's own `app.put` and
+    /// `receive_key.put` go in batches of their own, sent again by their own steps
+    /// (joining, the record's delivery, a registration, a move's or a loss's
+    /// re-registration), never through a kept effect or a kept batch, whose answers this
+    /// classifies. A protocol's effect and a host's batch may carry none of them
+    /// (`refuse_lifecycle_ops`), which is what makes [`RefusalPlace::Caller`] safe until
+    /// the wire's answers name the operation: otherwise one refused at step 9 would be held
+    /// here as about the caller until the window ends.
     Bytes,
 }
 

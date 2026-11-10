@@ -1125,6 +1125,50 @@ async fn test_loss_keeps_an_owed_call_from_the_lost_generation_and_makes_it() {
 }
 
 #[tokio::test]
+async fn test_loss_a_second_time_keeps_every_entry_stored_locally() {
+    let store = Arc::new(MemoryStore::new());
+    let lost = lost_world(Arc::clone(&store) as Arc<dyn StateStore>).await;
+    let load = || async {
+        App::load(
+            lost.router
+                .env(&lost.w, Arc::clone(&store) as Arc<dyn StateStore>),
+            Arc::clone(&lost.protocol) as Arc<dyn Protocol>,
+            World::config(),
+            app_keys("wallet").app_id_bytes(),
+        )
+        .await
+        .unwrap()
+    };
+    // Two entries stored for good before the first loss.
+    {
+        let mut app = load().await;
+        let mut tx = app.tx().unwrap();
+        for seq in [3u64, 4] {
+            let stored = crate::app::state::ParkedEntry {
+                sender: lost.w.bob.public(),
+                cert: lost.w.bob_cert.signed().clone(),
+                accepted_at_ms: lost.w.clock.now_ms(),
+                plaintext: b"kept".to_vec(),
+                context: None,
+                reason: ParkReason::Refused,
+                round: 0,
+            };
+            tx.put(&crate::app::state::key::parked(seq), &stored)
+                .unwrap();
+        }
+        app.commit(tx).await.unwrap();
+    }
+    // The first loss renumbers them to the top of the `seq`s, the second again.
+    lost.router.remove(NEXT);
+    let _ = follow_loss(&lost, Arc::clone(&store) as Arc<dyn StateStore>).await;
+    assert_eq!(load().await.state.parked.len(), 2);
+    let _third = third_recovering(&lost.w, &lost.router, 3, 2);
+    let _ = follow_loss(&lost, Arc::clone(&store) as Arc<dyn StateStore>).await;
+    let app = load().await;
+    assert_eq!(app.state.parked.len(), 2, "{:?}", app.state.parked.keys());
+}
+
+#[tokio::test]
 async fn test_loss_refused_upload_is_reported_and_recovery_goes_on() {
     let store = Arc::new(MemoryStore::new());
     let lost = lost_world(Arc::clone(&store) as Arc<dyn StateStore>).await;

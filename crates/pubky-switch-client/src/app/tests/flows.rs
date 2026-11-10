@@ -1349,6 +1349,188 @@ async fn test_kept_effect_window_holds_with_the_device_clock_ahead_at_the_keep()
     assert_eq!(w.effects(), 0, "not sent");
 }
 
+/// A batch writing a conversation entry for `pubky`.
+fn conversation(pubky: [u8; 32]) -> crate::app::OpBatch {
+    crate::app::OpBatch::new().op(OpKind::AllowPut {
+        pubky,
+        kind: pubky_switch_core::ops::AllowKind::Conversation,
+    })
+}
+
+#[tokio::test]
+async fn test_kept_batch_window_holds_with_the_device_clock_ahead_after_a_restore() {
+    let w = World::new();
+    let a = w.join("wallet").await;
+    let backup = a.backup().unwrap();
+    drop(a);
+    // Restored on a device whose clock reads two hours ahead: it holds no service time.
+    let clock = Arc::new(TestClock::new(w.clock.now_ms() + 2 * HOUR));
+    let store_b = Arc::new(MemoryStore::new());
+    let mut env = w.env_on(Arc::clone(&store_b) as Arc<dyn StateStore>);
+    env.clock = Arc::clone(&clock) as Arc<dyn Clock>;
+    let mut b = App::restore(env, w.protocol.clone(), World::config(), &backup)
+        .await
+        .unwrap();
+    // Its first call keeps a batch, which is applied and its answer lost. (A first try
+    // may be answered `401 stale_timestamp`, the device clock ahead, before the lost one.)
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(b.submit_batch(conversation(w.bob.public())).await.is_err());
+    w.switch.lock().faults.clear();
+    let kept = b.kept_batches().await.unwrap();
+    assert_eq!(kept.len(), 1);
+    // Kept in service time, not at the device's.
+    assert!(kept[0].1.kept_ms.unwrap() <= w.clock.now_ms());
+    // 30 days and half an hour on, the clock set right: the proofs are gone, and a resend
+    // would be answered `409 conflict`.
+    w.clock.advance_ms(30 * 24 * HOUR + HOUR / 2);
+    clock.set_ms(w.clock.now_ms());
+    w.switch.fail_next(Fault::Error {
+        path: "ops".into(),
+        code: ErrorCode::Conflict,
+        current: json!(null),
+    });
+    let _ = b.submit_batch(conversation([7; 32])).await;
+    let events = b.unacknowledged_events().await.unwrap();
+    // Past the window: dropped unsent, never read as refused.
+    assert!(
+        has(&events, |e| matches!(e, AppEvent::KeptBatchDropped { .. })),
+        "{events:?}"
+    );
+    assert!(
+        !has(&events, |e| matches!(e, AppEvent::BatchRefused { .. })),
+        "{events:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_kept_batch_window_holds_with_the_device_clock_behind_at_the_resend() {
+    let w = World::new();
+    let (mut app, clock) = app_with_its_own_clock(&w, 0).await;
+    let me = app.app_id();
+    // Applied, its answer lost: kept.
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(
+        app.submit_batch(conversation(w.bob.public()))
+            .await
+            .is_err()
+    );
+    assert_eq!(app.kept_batches().await.unwrap().len(), 1);
+    // A fresh load, the service time it holds from before; 30 days and half an hour on,
+    // the device clock reads two hours behind.
+    let mut env = w.env();
+    env.clock = Arc::clone(&clock) as Arc<dyn Clock>;
+    drop(app);
+    let mut app = App::load(env, w.protocol.clone(), World::config(), me)
+        .await
+        .unwrap();
+    w.clock.advance_ms(30 * 24 * HOUR + HOUR / 2);
+    clock.set_ms(w.clock.now_ms() - 2 * HOUR);
+    w.switch.fail_next(Fault::Error {
+        path: "ops".into(),
+        code: ErrorCode::Conflict,
+        current: json!(null),
+    });
+    // The next write sends the kept batch again first: a service time read before it shows
+    // it past the window, so it is dropped unsent, never read as refused.
+    let _ = app.submit_batch(conversation([7; 32])).await;
+    let events = app.unacknowledged_events().await.unwrap();
+    assert!(
+        has(&events, |e| matches!(e, AppEvent::KeptBatchDropped { .. })),
+        "{events:?}"
+    );
+    assert!(
+        !has(&events, |e| matches!(e, AppEvent::BatchRefused { .. })),
+        "{events:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_kept_batch_kept_after_an_idle_month_is_resent_after_a_lost_answer() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    // Idle for 30 days, the device clock and the service's agreeing: the service time the
+    // app holds is a month old.
+    w.clock.advance_ms(30 * 24 * HOUR);
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(
+        app.submit_batch(conversation(w.bob.public()))
+            .await
+            .is_err()
+    );
+    let kept = app.kept_batches().await.unwrap();
+    assert_eq!(kept.len(), 1);
+    // Kept at the service time of this call, not the month-old one.
+    assert!(w.clock.now_ms() - kept[0].1.kept_ms.unwrap() < HOUR);
+    // A minute later the app writes again: the kept batch goes again, and its proofs show
+    // it applied; it isn't dropped.
+    w.clock.advance_ms(60_000);
+    app.submit_batch(conversation([7; 32])).await.unwrap();
+    assert!(app.kept_batches().await.unwrap().is_empty());
+    let events = app.unacknowledged_events().await.unwrap();
+    assert!(
+        !has(&events, |e| matches!(e, AppEvent::KeptBatchDropped { .. })),
+        "{events:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_kept_batch_past_the_window_by_the_device_clock_goes_without_a_read() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let (seq, _) = w.note(app.app_id(), "before");
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.receive(None).await.is_err());
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(
+        app.submit_batch(conversation(w.bob.public()))
+            .await
+            .is_err()
+    );
+    assert_eq!(app.kept_batches().await.unwrap().len(), 1);
+    // Past the window by the device clock alone, with no feed read to be had: the kept
+    // effect and batch are judged without one.
+    w.clock.advance_ms(31 * 24 * HOUR);
+    for _ in 0..4 {
+        w.switch.fail_next(Fault::Unreachable {
+            path: "feed".into(),
+            after: 0,
+        });
+    }
+    let _ = app.receive(None).await;
+    assert_eq!(
+        app.state.parked.get(&seq).map(|p| p.reason),
+        Some(ParkReason::Uncertain)
+    );
+    let _ = app.submit_batch(conversation([7; 32])).await;
+    w.switch.lock().faults.clear();
+    assert!(has(&app.kept_duties().await.unwrap(), |e| matches!(
+        e,
+        AppEvent::KeptBatchDropped { .. }
+    )));
+}
+
+#[tokio::test]
+async fn test_fresh_service_time_is_read_again_once_it_has_aged() {
+    let w = World::new();
+    let (mut app, clock) = app_with_its_own_clock(&w, 0).await;
+    app.receive(None).await.unwrap();
+    let read_at = app.time_fresh_at.unwrap();
+    // Within the bound, the time read in the call counts.
+    clock.advance_ms(crate::app::provider::FRESH_SERVICE_TIME_MS);
+    app.fresh_service_time().await.unwrap();
+    assert_eq!(app.time_fresh_at, Some(read_at));
+    // Past it, by the device clock, it is read again.
+    clock.advance_ms(1);
+    app.fresh_service_time().await.unwrap();
+    assert_eq!(app.time_fresh_at, Some(clock.now_ms()));
+    // A device clock gone back since counts as not fresh either.
+    let again = clock.now_ms();
+    clock.set_ms(again - 60_000);
+    app.fresh_service_time().await.unwrap();
+    assert_eq!(app.time_fresh_at, Some(again - 60_000));
+}
+
 #[tokio::test]
 async fn test_kept_effect_window_holds_with_the_device_clock_behind_at_the_resend() {
     let w = World::new();
@@ -1533,6 +1715,8 @@ struct LifecycleProtocol {
     extra: OpKind,
     in_context: bool,
     answers: std::sync::Mutex<Vec<bool>>,
+    /// Whether the effects carry `extra` yet.
+    active: std::sync::atomic::AtomicBool,
 }
 
 impl Protocol for LifecycleProtocol {
@@ -1566,6 +1750,9 @@ impl Protocol for LifecycleProtocol {
         message: &crate::app::ReceivedMessage,
         cx: &mut crate::app::ReceiveContext<'_>,
     ) -> crate::app::Outcome {
+        if !self.active.load(std::sync::atomic::Ordering::SeqCst) {
+            return self.sample.receive(message);
+        }
         if self.in_context {
             let answer = cx.op(Vec::new(), self.extra.clone());
             self.answers.lock().unwrap().push(answer.is_ok());
@@ -1595,6 +1782,87 @@ impl Protocol for LifecycleProtocol {
     }
 }
 
+/// The entry at `seq` stored for good for a lifecycle operation in its effect, and the
+/// protocol told in `report`, durably.
+async fn lifecycle_effect_refused(app: &mut App, report: &crate::app::ReceiveReport, seq: u64) {
+    assert_eq!(
+        app.state.parked.get(&seq).map(|p| p.reason),
+        Some(ParkReason::LifecycleOperation)
+    );
+    assert!(app.state.pending_effect.is_none());
+    let refused =
+        |e: &AppEvent| matches!(e, AppEvent::EffectRefused { seq: s, code: None, .. } if *s == seq);
+    assert!(has(&report.events, refused), "{:?}", report.events);
+    assert!(has(&app.unacknowledged_events().await.unwrap(), refused));
+}
+
+#[tokio::test]
+async fn test_app_lifecycle_operation_in_an_effect_doesnt_stall_the_feed() {
+    let w = World::new();
+    let base = w.join("phone").await;
+    let protocol = Arc::new(LifecycleProtocol {
+        sample: SampleProtocol::default(),
+        extra: lifecycle_ops(&w, &base)[0].clone(),
+        in_context: false,
+        answers: std::sync::Mutex::new(Vec::new()),
+        active: std::sync::atomic::AtomicBool::new(true),
+    });
+    let request = w.approve(&app_keys("wallet"), &["scope-a"]);
+    let mut app = App::join(w.env(), protocol.clone(), World::config(), request)
+        .await
+        .unwrap();
+    let (first, _) = w.note(app.app_id(), "note");
+    let report = app.receive(None).await.unwrap();
+    lifecycle_effect_refused(&mut app, &report, first).await;
+    // Later entries go on, and the stored one isn't tried again.
+    let (second, _) = w.note(app.app_id(), "later note");
+    let report = app.receive(None).await.unwrap();
+    assert!(app.cursor().seq >= second);
+    assert!(
+        !has(&report.events, |e| matches!(e, AppEvent::Unparked { .. })),
+        "{:?}",
+        report.events
+    );
+}
+
+#[tokio::test]
+async fn test_app_lifecycle_operation_in_a_stored_entrys_effect_stores_it_for_good() {
+    let w = World::new();
+    let base = w.join("phone").await;
+    let protocol = Arc::new(LifecycleProtocol {
+        sample: SampleProtocol::default(),
+        extra: lifecycle_ops(&w, &base)[1].clone(),
+        in_context: false,
+        answers: std::sync::Mutex::new(Vec::new()),
+        active: std::sync::atomic::AtomicBool::new(false),
+    });
+    let request = w.approve(&app_keys("wallet"), &["scope-a"]);
+    let mut app = App::join(w.env(), protocol.clone(), World::config(), request)
+        .await
+        .unwrap();
+    // Stored for a quota, to be tried again.
+    let (seq, _) = w.note(app.app_id(), "note");
+    w.switch.fail_next(Fault::Error {
+        path: "ops".into(),
+        code: ErrorCode::QuotaExceeded,
+        current: json!(null),
+    });
+    app.receive(None).await.unwrap();
+    assert_eq!(
+        app.state.parked.get(&seq).map(|p| p.reason),
+        Some(ParkReason::Quota)
+    );
+    // Tried again, its effect now carries a lifecycle operation: stored for good, and the
+    // protocol told; the read goes on.
+    protocol
+        .active
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let applied = w.switch.applied().len();
+    let report = app.receive(None).await.unwrap();
+    lifecycle_effect_refused(&mut app, &report, seq).await;
+    assert_eq!(w.switch.applied().len(), applied);
+}
+
 #[tokio::test]
 async fn test_app_refuses_lifecycle_operations_in_a_protocol_effect() {
     let probe = World::new();
@@ -1610,6 +1878,7 @@ async fn test_app_refuses_lifecycle_operations_in_a_protocol_effect() {
                 extra,
                 in_context,
                 answers: std::sync::Mutex::new(Vec::new()),
+                active: std::sync::atomic::AtomicBool::new(true),
             });
             let request = w.approve(&app_keys("wallet"), &["scope-a"]);
             let mut app = App::join(w.env(), protocol.clone(), World::config(), request)
@@ -1617,20 +1886,17 @@ async fn test_app_refuses_lifecycle_operations_in_a_protocol_effect() {
                 .unwrap();
             let (seq, _) = w.note(app.app_id(), "note");
             let applied = w.switch.applied().len();
-            let result = app.receive(None).await;
+            let report = app.receive(None).await.unwrap();
             if in_context {
                 // The context refuses it; the effect goes without it.
                 assert_eq!(*protocol.answers.lock().unwrap(), vec![false]);
-                let report = result.unwrap();
                 assert!(received(&report.events, seq), "{:?}", report.events);
             } else {
-                // In the effect itself: refused before anything is kept or sent.
-                assert!(
-                    matches!(result, Err(AppError::Refused(Refusal::Usage(_)))),
-                    "{index}: {result:?}"
-                );
-                assert!(app.state.pending_effect.is_none());
-                assert_eq!(w.switch.applied().len(), applied);
+                // In the effect itself: never sent, the entry stored and passed, and the
+                // protocol told, so the feed goes on (Switch spec 8.2).
+                lifecycle_effect_refused(&mut app, &report, seq).await;
+                assert_eq!(w.switch.applied().len(), applied, "{index}");
+                assert!(app.cursor().seq >= seq);
             }
         }
     }

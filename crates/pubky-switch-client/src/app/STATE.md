@@ -32,13 +32,16 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
 - **After a failed commit the app reloads** from the store before its next call.
 - **A kept batch or effect is never sent again past its window**, whatever the
   generation: 30 days from when it was kept, less an hour, both ends in verified service
-  time, erring older. It is kept at the earlier of the device clock and the highest service
-  time verified; its age is judged at the later of the device clock and a service time
-  verified in the same call, which a one-item feed read fetches first when no answer of
-  the call brought one. Past it a retry would get `409
-  conflict` once the service dropped its proofs, or be taken as new once it forgot the ID
-  (Switch wire 6.4 step 5): the effect's entry is parked as uncertain, the batch dropped
-  with its attempts, unsent.
+  time, erring older. It is kept at the earlier of the device clock and the service time
+  verified in the call that keeps it, which a one-item feed read fetches first when
+  no answer of the call brought one; its age is judged at the later of the device clock
+  and a service time verified in the call that sends it again, fetched the same way; a
+  time verified more than 10 minutes before by the device clock, or with the device clock
+  gone back since, is read again. One past the window by the clocks at hand already, the
+  device clock or the service time held, needs no reading. Past
+  it a retry would get `409 conflict` once the service dropped its proofs, or be taken as
+  new once it forgot the ID (Switch wire 6.4 step 5): the effect's entry is parked as
+  uncertain, the batch dropped with its attempts, unsent.
 - **A refusal of a batch sent again tells only from the batch ID lookup on** (Switch wire
   6.4 step 5). One made before it is about the caller, such as `403 cert_expired`, or about
   these bytes, such as `400`. About the caller, it tells nothing of the batch: a kept effect
@@ -101,7 +104,7 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
 | `seen/<seq>` | an entry processed past a held one | |
 | `held/<seq>` | an entry held because its sender can't be checked, since when | |
 | `retry/<seq>` | an entry whose receive step the protocol's store or the host kept from finishing (`Outcome::Retry`): the reads in a row that ended so, and when the first was; kept while the entry is stored locally too, and it goes once the entry is processed | |
-| `parked/<seq>` | an entry stored locally and passed: the opened plaintext, sender, certificate, time, reason (an unverifiable sender, a quota or a store failure of the receive step, tried again; an effect refused for good, over one batch, or kept past the window in which its resend tells whether it was applied, not tried again) | yes |
+| `parked/<seq>` | an entry stored locally and passed: the opened plaintext, sender, certificate, time, reason (an unverifiable sender, a quota or a store failure of the receive step, tried again; an effect refused for good, over one batch, carrying an operation the app layer builds itself, or kept past the window in which its resend tells whether it was applied, not tried again) | yes |
 | `asked/<seq>` | a re-send was handed to the protocol for this item | |
 | `parkn` | where the retries of entries stored locally stand in their round: its number and the next `seq`. The round covers the entries stored in an earlier round, each `parked/` record naming the round it was stored in, not by `seq`, which a provider loss renumbers; each read tries at most `PARKED_RETRIES_PER_READ`, in `seq` order, and an entry stored later waits for the next round, so every entry is tried within two rounds | |
 | `owed/<generation>/<seq>` | a re-send or missed-entries call about this item that the protocol answered with an error: written in the commit that passes the item, made again at the start of each read, each call on its own, and gone in the commit of its answer's writes; `App::owed_protocol_calls` counts them. The key names the generation the item was read at | |
