@@ -113,3 +113,17 @@ service.
 - **Erasure** (Switch wire 7.4.16) is a flag; its answers are signed with a fixed operator
   key.
 - **Push** (Switch wire 8.1): registrations only; nothing is sent to a relay.
+
+## Signer flows tested only here
+
+The service in this workspace doesn't serve `GET /apps`, `POST /apps/{app_id}/leave` or
+`POST /apps/{app_id}/keys` yet, and the signer reads `GET /apps` before every signing step.
+So these signer flows run only against the scripted switch; re-run them against the service
+once it serves those calls:
+
+- approval, renewals and reductions, their closings, and epoch completion
+  (`crates/pubky-switch-signer/tests/approval.rs`, `renewal.rs`);
+- revocations, departures, removal times and their bounds, full-bundle requests, purge and
+  record cleanup (`revocation.rs`);
+- the one-signer checks, alarms and their clearing, records behind, and publication
+  (`flows.rs`).

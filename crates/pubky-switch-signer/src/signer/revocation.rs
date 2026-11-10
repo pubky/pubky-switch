@@ -29,9 +29,12 @@
 use pubky_switch_client::ClientError;
 use pubky_switch_client::client::answers::AppStatus;
 use pubky_switch_core::ops::OpKind;
-use pubky_switch_core::records::{IdentityDoc, RemovedApp, app_record_path, seal_bundle_parts};
+use pubky_switch_core::records::{
+    IdentityDoc, RemovedApp, SIGNER_BACKUP_PATH, app_record_path, seal_bundle_parts,
+};
 
 use super::Signer;
+use super::clients::Named;
 use super::renewal::{Op, keyed, push_parts};
 use crate::alert::Alert;
 use crate::error::{Refusal, Result, SignerError};
@@ -140,17 +143,7 @@ impl Signer {
     async fn remove_now(&mut self) -> Result<(bool, Vec<([u8; 16], SignerError)>)> {
         self.refresh().await?;
         self.check_named()?;
-        let failures = self.send_revocations().await?;
-        if !failures.is_empty() {
-            let mut state = self.state.clone();
-            for (app_id, _) in &failures {
-                state.alert(Alert::RevocationPending {
-                    app_id: *app_id,
-                    at_switch: false,
-                });
-            }
-            self.commit(state, self.flow.clone()).await?;
-        }
+        let failures = self.revoke_at_switch().await?;
         self.ready().await?;
         let mut newest = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
         let (mut statuses, mut answered_at) = self.switch_apps_at().await?;
@@ -214,6 +207,49 @@ impl Signer {
         Ok((true, failures))
     }
 
+    /// Send the revocations asked for to the switch, as [`Signer::send_revocations`] does, and
+    /// raise [`Alert::RevocationPending`] for each it didn't take. [`Signer::run_due`] runs it
+    /// also when an alarm stops the rest, since it signs nothing new and cutting an app off is
+    /// the safe step.
+    pub(super) async fn revoke_at_switch(&mut self) -> Result<Vec<([u8; 16], SignerError)>> {
+        let failures = self.send_revocations().await?;
+        if !failures.is_empty() {
+            let mut state = self.state.clone();
+            for (app_id, _) in &failures {
+                state.alert(Alert::RevocationPending {
+                    app_id: *app_id,
+                    at_switch: false,
+                });
+            }
+            self.commit(state, self.flow.clone()).await?;
+        }
+        Ok(failures)
+    }
+
+    /// Check that this install is still the signer before a revocation goes to the switch:
+    /// named in the records, and neither the switch's copy nor the backup shows another
+    /// install that took over or a newer version of this install's own (Switch spec 4.3,
+    /// 12.8; Switch wire 3.13). A rollback or an equivocation the copy shows doesn't stop
+    /// it: a revocation signs nothing new, and goes out while an alarm holds signing back.
+    async fn named_for_revoking(&mut self) -> Result<Named> {
+        self.check_named()?;
+        let held = self.service_client()?.apps().await?.identity;
+        match self.confirm_copy(held.as_ref()).await {
+            Ok(()) | Err(SignerError::Alarm(_)) => {}
+            Err(error) => return Err(error),
+        }
+        let found = self
+            .env
+            .homeserver
+            .get(SIGNER_BACKUP_PATH)
+            .await
+            .map_err(SignerError::Homeserver)?;
+        if let Some(found) = found.and_then(|bytes| self.open_backup(&bytes).transpose()) {
+            self.judge_backup(&found?).await?;
+        }
+        Named::check(&self.state)
+    }
+
     /// Revoke at the switch every app a revocation was asked for that the newest version
     /// still lists (Switch spec 12.2 step 1). It is a request and signs nothing new; the
     /// switch answers a revocation sent again with no proof (Switch wire 7.4.12).
@@ -231,7 +267,7 @@ impl Signer {
         if pending.is_empty() {
             return Ok(Vec::new());
         }
-        let named = super::clients::Named::check(&self.state)?;
+        let named = self.named_for_revoking().await?;
         let client = self.service_client()?;
         let mut failures = Vec::new();
         for app_id in &pending {
@@ -346,7 +382,8 @@ impl Signer {
             .cleanup
             .iter()
             .copied()
-            .filter(|app| newest.body().removed.iter().any(|r| &r.app_id == app))
+            // Once no version lists the app: removed, or purged from `removed` since.
+            .filter(|app| newest.listed_cert(app).is_none())
             .collect();
         for app_id in done {
             self.env

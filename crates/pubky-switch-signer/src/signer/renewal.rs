@@ -631,6 +631,9 @@ impl Signer {
         if let Err(error) = &resumed
             && (self.flow.is_some() || !matches!(error, SignerError::Homeserver(_)))
         {
+            // A pending revocation still goes to the switch: it signs nothing new, and
+            // cutting the app off is the safe step. What it can't send stays pending.
+            let _ = self.revoke_at_switch().await;
             return resumed;
         }
         self.complete_removals().await?;
