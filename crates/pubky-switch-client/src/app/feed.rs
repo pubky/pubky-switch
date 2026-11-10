@@ -60,8 +60,9 @@ use super::error::{Alarm, Refusal, refused_after_lookup, refused_for_good};
 use super::events::{AppEvent, Duty, ParkReason};
 use super::identity::{self, DOC_CACHE_MS, Taken};
 use super::protocol::{
-    Effect, LocalWrite, MAX_CLAIM_READS, MissedEntries, Need, OpaqueRule, Outcome, Protocol,
-    RETRY_EVENT_READS, ReceivedMessage, ResendNeeded, ResendReason, Rules, StoreFailure,
+    Effect, LocalWrite, MAX_CLAIM_READS, MissedEntries, Need, OpaqueRule, Outcome,
+    PARKED_RETRIES_PER_READ, Protocol, RETRY_EVENT_READS, ReceivedMessage, ResendNeeded,
+    ResendReason, Rules, StoreFailure,
 };
 use super::provider::TakeOver;
 use super::records::{Collection, pending_name_key};
@@ -1234,7 +1235,10 @@ impl App {
         retry.reads = retry.reads.saturating_add(1);
         let retry = *retry;
         read.tx.put(&key::retry(entry.seq), &retry)?;
-        if retry.reads >= RETRY_EVENT_READS {
+        // Raised from the count's threshold on, and at every try of an entry stored
+        // locally for the store, which waited out the bounded wait or can't be mended by
+        // waiting: the host hears of it again at each, however few its tries.
+        if retry.reads >= RETRY_EVENT_READS || parked {
             self.events.push(AppEvent::StoreFailing {
                 seq: entry.seq,
                 reads: retry.reads,
@@ -1354,8 +1358,33 @@ impl App {
 
     /// Entries stored locally, checked and applied again now (Switch spec 8.2); the cursor is
     /// past them.
+    ///
+    /// At most [`PARKED_RETRIES_PER_READ`] each read, starting where the last read stopped
+    /// and going round, so none waits for ever behind others the store keeps failing.
     async fn retry_parked(&mut self) -> Result<(), AppError> {
-        let seqs: Vec<u64> = self.state.parked.keys().copied().collect();
+        let due: Vec<u64> = self
+            .state
+            .parked
+            .iter()
+            .filter(|(_, stored)| stored.reason.tried_again())
+            .map(|(seq, _)| *seq)
+            .collect();
+        if due.is_empty() {
+            return Ok(());
+        }
+        let start = self.state.parked_next;
+        let (before, after): (Vec<u64>, Vec<u64>) = due.iter().partition(|seq| **seq < start);
+        let seqs: Vec<u64> = after
+            .into_iter()
+            .chain(before)
+            .take(PARKED_RETRIES_PER_READ)
+            .collect();
+        if let Some(last) = seqs.last() {
+            self.state.parked_next = last.saturating_add(1);
+            let mut tx = self.tx()?;
+            tx.put(key::PARKED_NEXT, &self.state.parked_next)?;
+            self.commit(tx).await?;
+        }
         for seq in seqs {
             let Some(stored) = self.state.parked.get(&seq).cloned() else {
                 continue;

@@ -69,9 +69,9 @@ pub use feed::ReceiveReport;
 pub use identity::{DOC_CACHE_MS, HomeserverReader, IdentityRefresh, REVALIDATION_MS};
 pub use peek::{PeekReport, Peeked};
 pub use protocol::{
-    Effect, LocalWrite, MAX_CLAIM_READS, MissedEntries, Need, OpaqueRule, Outcome, Protocol,
-    ProtocolLayer, RETRY_EVENT_READS, ReceivedMessage, ResendNeeded, ResendReason, StoreFailure,
-    decode_local_state, encode_local_state,
+    Effect, LocalWrite, MAX_CLAIM_READS, MissedEntries, Need, OpaqueRule, Outcome,
+    PARKED_RETRIES_PER_READ, Protocol, ProtocolLayer, RETRY_EVENT_READS, ReceivedMessage,
+    ResendNeeded, ResendReason, StoreFailure, decode_local_state, encode_local_state,
 };
 pub use provider::ProviderStatus;
 pub use push::{MAX_HANDLE_BYTES, MAX_HANDLES, PushHandles, PushRegistration, PushRelay};
@@ -448,6 +448,9 @@ pub(crate) struct AppState {
     pub(crate) chain: Option<ChainView>,
     pub(crate) held: BTreeMap<u64, HeldEntry>,
     pub(crate) retries: BTreeMap<u64, RetryEntry>,
+    /// The `seq` the next read's retries of stored entries start from (`parkn`), so a
+    /// bounded number each read reaches every one in turn.
+    pub(crate) parked_next: u64,
     pub(crate) seen: BTreeSet<u64>,
     pub(crate) asked: BTreeSet<u64>,
     pub(crate) parked: BTreeMap<u64, ParkedEntry>,
@@ -619,6 +622,7 @@ impl App {
                 chain: None,
                 held: BTreeMap::new(),
                 retries: BTreeMap::new(),
+                parked_next: 0,
                 seen: BTreeSet::new(),
                 asked: BTreeSet::new(),
                 parked: BTreeMap::new(),
@@ -835,6 +839,7 @@ impl App {
             chain: ChainView::load(reader).await?,
             held: reader.scan_numbered("held/").await?,
             retries: reader.scan_numbered("retry/").await?,
+            parked_next: reader.get(key::PARKED_NEXT).await?.unwrap_or(0),
             seen: reader.scan_numbers("seen/").await?,
             asked: reader.scan_numbers("asked/").await?,
             parked: reader.scan_numbered("parked/").await?,
@@ -1181,6 +1186,7 @@ impl App {
                 chain: Some(chain),
                 held: BTreeMap::new(),
                 retries: BTreeMap::new(),
+                parked_next: 0,
                 seen,
                 asked: BTreeSet::new(),
                 parked,

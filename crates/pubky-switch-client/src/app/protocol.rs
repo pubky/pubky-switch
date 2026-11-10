@@ -209,6 +209,10 @@ pub enum Need {
 /// every later one until the entry is processed or stored locally.
 pub const RETRY_EVENT_READS: u32 = 3;
 
+/// The most entries stored locally that one read tries again: the next read goes on after
+/// the last one tried, in `seq` order and round again, so each is reached in turn.
+pub const PARKED_RETRIES_PER_READ: usize = 16;
+
 /// A failure of the store or the host that kept a receive step from finishing
 /// ([`Outcome::Retry`]). It is built only from a [`StoreError`]: what the host's
 /// [`crate::store::StateStore`] answers, through the [`ReceiveContext`]'s or a

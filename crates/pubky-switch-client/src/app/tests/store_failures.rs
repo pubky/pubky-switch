@@ -505,6 +505,72 @@ async fn test_receive_retry_count_goes_on_while_the_entry_is_stored_locally() {
 }
 
 #[tokio::test]
+async fn test_receive_retries_a_bounded_number_of_stored_entries_each_read_in_turn() {
+    let w = World::new();
+    let protocol = FlakyProtocol::new(u32::MAX);
+    let mut app = join_flaky(&w, &protocol, "wallet").await;
+    let cap = crate::app::PARKED_RETRIES_PER_READ;
+    let count = cap + cap / 2;
+    let seqs: Vec<u64> = (0..count).map(|_| w.note(app.app_id(), FLAKY).0).collect();
+    // Held, then past the wait stored locally for the store.
+    app.receive(None).await.unwrap();
+    w.clock.advance_ms(PARK_AFTER_MS);
+    app.receive(None).await.unwrap();
+    for seq in &seqs {
+        assert_eq!(
+            app.state.parked.get(seq).map(|p| p.reason),
+            Some(ParkReason::StoreUnavailable)
+        );
+    }
+    // Each read tries at most the cap, from where the last stopped, and the host hears of
+    // the failing store at each.
+    let mut tried = std::collections::BTreeSet::new();
+    for _ in 0..2 {
+        let calls = protocol.calls();
+        let report = app.receive(None).await.unwrap();
+        let tries = u32::try_from(cap).unwrap();
+        assert_eq!(protocol.calls(), calls + tries);
+        let failing = store_failing(&report.events);
+        assert_eq!(failing.len(), cap, "{failing:?}");
+        tried.extend(failing.iter().map(|(seq, _)| *seq));
+    }
+    // Two reads reached every entry.
+    assert_eq!(tried, seqs.iter().copied().collect());
+    // Healed, every one is processed, once.
+    protocol.heal();
+    for _ in 0..2 {
+        app.receive(None).await.unwrap();
+    }
+    assert!(app.state.parked.is_empty());
+    assert_eq!(protocol.applied(), count);
+}
+
+#[tokio::test]
+async fn test_receive_retry_rotation_goes_on_after_a_load() {
+    let w = World::new();
+    let protocol = FlakyProtocol::new(u32::MAX);
+    let mut app = join_flaky(&w, &protocol, "wallet").await;
+    let cap = crate::app::PARKED_RETRIES_PER_READ;
+    let seqs: Vec<u64> = (0..cap + 1)
+        .map(|_| w.note(app.app_id(), FLAKY).0)
+        .collect();
+    app.receive(None).await.unwrap();
+    w.clock.advance_ms(PARK_AFTER_MS);
+    app.receive(None).await.unwrap();
+    let report = app.receive(None).await.unwrap();
+    assert!(
+        !store_failing(&report.events)
+            .iter()
+            .any(|(seq, _)| seq == seqs.last().unwrap())
+    );
+    // Loaded again, the next read starts at the one the last read didn't reach.
+    let mut app = load_flaky(&w, &protocol, app.app_id()).await;
+    let report = app.receive(None).await.unwrap();
+    let failing = store_failing(&report.events);
+    assert_eq!(failing.first().map(|(seq, _)| *seq), seqs.last().copied());
+}
+
+#[tokio::test]
 async fn test_receive_retry_of_the_entry_is_parked_at_once() {
     let w = World::new();
     let protocol = FlakyProtocol::failing(1, StoreError::Corrupt, Mode::Plain);

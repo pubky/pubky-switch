@@ -85,6 +85,7 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
 | `retry/<seq>` | an entry whose receive step the protocol's store or the host kept from finishing (`Outcome::Retry`): the reads in a row that ended so, and when the first was; kept while the entry is stored locally too, and it goes once the entry is processed | |
 | `parked/<seq>` | an entry stored locally and passed: the opened plaintext, sender, certificate, time, reason (an unverifiable sender, a quota or a store failure of the receive step, tried again; an effect refused for good, over one batch, or kept past the window in which its resend tells whether it was applied, not tried again) | yes |
 | `asked/<seq>` | a re-send was handed to the protocol for this item | |
+| `parkn` | the `seq` the next read's retries of entries stored locally start from: each read tries at most `PARKED_RETRIES_PER_READ` of them, going round | |
 | `owed/<generation>/<seq>` | a re-send or missed-entries call about this item that the protocol answered with an error: written in the commit that passes the item, made again at the start of each read, each call on its own, and gone in the commit of its answer's writes; `App::owed_protocol_calls` counts them. The key names the generation the item was read at | |
 | `departed/<app_id>` | another own app's departure verified in the chain, and its time | |
 | `join` | the join step: the registration batch while it is owed | |

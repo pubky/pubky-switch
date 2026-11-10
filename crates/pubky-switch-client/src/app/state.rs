@@ -96,6 +96,8 @@ pub(crate) mod key {
     /// The prefix of the kept duty events.
     pub(crate) const DUTY_PREFIX: &str = "duty/";
 
+    /// The `seq` the next read's retries of stored entries start from.
+    pub(crate) const PARKED_NEXT: &str = "parkn";
     /// The prefix of the protocol calls owed.
     pub(crate) const OWED_PREFIX: &str = "owed/";
 
