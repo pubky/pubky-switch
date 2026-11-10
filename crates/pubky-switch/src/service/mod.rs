@@ -409,6 +409,17 @@ impl Service {
                 return self.operator_answer(signature, base_ms, &error).await;
             }
         };
+        // What the endpoint writes is undone if it is refused, whatever step refuses it: a
+        // refusal commits the stamped time and nothing else, so no later request can build
+        // on a write it was never answered for (step 10).
+        let savepoint = match txn.savepoint().await {
+            Ok(savepoint) => savepoint,
+            Err(error) => {
+                let _ = store_error(&error);
+                let error = ApiError::unavailable("7.6: a temporary failure");
+                return sign_answer(&signer, signature, committed_ms, Answer::error(&error));
+            }
+        };
         let (answer, marked) = match self
             .run_at_account(&mut txn, &signer, request, time_ms)
             .await
@@ -419,6 +430,12 @@ impl Service {
                 serving,
                 head,
             }) => {
+                if let Err(failure) = txn.rollback_to(savepoint).await {
+                    // Dropped uncommitted: nothing of the request stays, the stamp included.
+                    tracing::error!(%failure, "rolling back a refused request");
+                    let error = ApiError::unavailable("7.6: a temporary failure");
+                    return sign_answer(&signer, signature, committed_ms, Answer::error(&error));
+                }
                 // An error to the authenticated signer carries the current head (Switch wire
                 // 7.1), except where the key's mark refuses one.
                 let head = if signer_call && head {

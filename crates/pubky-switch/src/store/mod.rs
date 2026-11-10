@@ -32,7 +32,7 @@ use sqlx::{
     postgres::{PgConnectOptions, PgPoolOptions},
 };
 
-pub use account::{AccountHead, AccountTxn, CommitError, Committed, NewAccount};
+pub use account::{AccountHead, AccountTxn, CommitError, Committed, NewAccount, Savepoint};
 pub use chain::NewChainItem;
 pub use identity::HeldIdentity;
 

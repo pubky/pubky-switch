@@ -846,3 +846,71 @@ async fn test_concurrent_first_enrollments_share_one_account() {
     assert_eq!(json(&a)["service_key"], json(&b)["service_key"]);
     replay.db.drop_database().await.expect("drop");
 }
+
+#[tokio::test]
+async fn test_refused_delivery_leaves_nothing_to_build_on() {
+    let Some(replay) = replay().await else { return };
+    serving(&replay).await;
+    let alice = alice_keys();
+    // A backup from before the first delivery is restored: no document and no chain, while
+    // the key's mark is at the first delivery's seq 1.
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    for statement in [
+        "UPDATE accounts SET last_seq = 0, chain_seq = NULL, chain_hash = NULL, \
+         identity_doc = NULL, identity_proof = NULL WHERE id = $1",
+        "DELETE FROM chain_items WHERE account_id = $1",
+    ] {
+        sqlx::query(statement)
+            .bind(&alice.id)
+            .execute(&mut conn)
+            .await
+            .expect("restore");
+    }
+    // Version 1 again, at another time: a seq 1 beside the mark, which no head may show.
+    let path = format!("/v1/{}/identity", alice.id);
+    let version_1 = version("alice identity.json, first delivery (version 1)");
+    let refused = replay
+        .service
+        .handle(signer_request(
+            "PUT",
+            &path,
+            delivery(version_1.clone(), None),
+            ms(T),
+        ))
+        .await;
+    assert_eq!(
+        (refused.status, code(&refused).as_str()),
+        (503, "unavailable")
+    );
+    // Nothing of the refused delivery was kept, so a later one can't extend it.
+    let (last_seq, doc): (i64, Option<Vec<u8>>) =
+        sqlx::query_as("SELECT last_seq, identity_doc FROM accounts WHERE id = $1")
+            .bind(&alice.id)
+            .fetch_one(&mut conn)
+            .await
+            .expect("account");
+    assert_eq!((last_seq, doc), (0, None));
+    let extended = replay
+        .service
+        .handle(signer_request(
+            "PUT",
+            &path,
+            delivery(
+                version("alice identity.json"),
+                Some(version_1.doc_hash().expect("hash")),
+            ),
+            ms(T),
+        ))
+        .await;
+    assert_ne!(
+        extended.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&extended.body)
+    );
+    assert!(header_of(&extended, header::HEAD).is_none());
+    conn.close().await.expect("close");
+    replay.db.drop_database().await.expect("drop");
+}

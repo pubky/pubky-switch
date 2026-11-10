@@ -96,6 +96,14 @@ impl Committed {
     }
 }
 
+/// Where a request's endpoint started, so a refusal can undo what it wrote
+/// ([`AccountTxn::rollback_to`]).
+#[derive(Debug)]
+pub struct Savepoint {
+    head: AccountHead,
+    changed: bool,
+}
+
 /// Why a commit gave no [`Committed`].
 #[derive(Debug, thiserror::Error)]
 pub enum CommitError {
@@ -276,6 +284,37 @@ impl AccountTxn {
     /// chain head counts as a change without this; one that only stamps the time doesn't.
     pub fn note_change(&mut self) {
         self.changed = true;
+    }
+
+    /// Mark the start of the request's endpoint. Everything it writes after this, its
+    /// `seq`s and chain head included, can be undone with [`AccountTxn::rollback_to`],
+    /// while the stamped time stays.
+    pub async fn savepoint(&mut self) -> Result<Savepoint, StoreError> {
+        sqlx::query("SAVEPOINT endpoint")
+            .execute(&mut *self.tx)
+            .await
+            .map_err(StoreError::from_db)?;
+        Ok(Savepoint {
+            head: self.head.clone(),
+            changed: self.changed,
+        })
+    }
+
+    /// Undo everything written since `savepoint`, keeping the time this request stamped:
+    /// a refused request commits its stamp and nothing else (Switch wire 7.3 steps 3 and
+    /// 10). If this fails the transaction must not be committed.
+    pub async fn rollback_to(&mut self, savepoint: Savepoint) -> Result<(), StoreError> {
+        sqlx::query("ROLLBACK TO SAVEPOINT endpoint")
+            .execute(&mut *self.tx)
+            .await
+            .map_err(StoreError::from_db)?;
+        let stamped_time_ms = self.head.stamped_time_ms;
+        self.head = AccountHead {
+            stamped_time_ms,
+            ..savepoint.head
+        };
+        self.changed = savepoint.changed;
+        Ok(())
     }
 
     /// The transaction's connection, for the queries of the account's other state. Every
