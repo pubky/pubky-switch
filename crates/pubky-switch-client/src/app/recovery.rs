@@ -48,7 +48,9 @@ use super::context::LocalView;
 use super::error::{AppError, Refusal};
 use super::events::{AppEvent, Duty, KeptRefusal};
 use super::identity::REVALIDATION_MS;
-use super::protocol::{LocalWrite, MAX_STEP_LOCAL_BYTES, local_writes_bytes};
+use super::protocol::{
+    LocalWrite, MAX_LOSS_CONVERSATIONS, MAX_STEP_LOCAL_BYTES, local_writes_bytes,
+};
 use super::state::{Cursor, HeldKey, KnownKid, RestoreState, key};
 use crate::client::Batch;
 use crate::client::answers::{FeedItem, FeedQuery, RecoveryUpload, UploadLists, UploadedOp};
@@ -624,6 +626,8 @@ impl App {
                     .collect();
                 loss.conversations.sort();
                 loss.conversations.dedup();
+                // Bounded, so the loss record and its batches stay within the store's sizes.
+                loss.conversations.truncate(MAX_LOSS_CONVERSATIONS);
                 loss.step = LossStep::Conversations;
                 let mut tx = self.tx()?;
                 if local_writes_bytes(&actions.local) > MAX_STEP_LOCAL_BYTES {
@@ -633,8 +637,15 @@ impl App {
                     self.keep_duty(
                         &mut tx,
                         Duty::LocalWritesRefused {
-                            call: KeptRefusal::Loss {
-                                lost_generation: loss.lost_generation,
+                            call: {
+                                let view = loss.view();
+                                KeptRefusal::Loss {
+                                    lost_generation: view.lost_generation,
+                                    generation: view.generation,
+                                    declared_at_ms: view.declared_at_ms,
+                                    accepted_from_ms: view.accepted_from_ms,
+                                    uncertain_until_ms: view.uncertain_until_ms,
+                                }
                             },
                         },
                     )?;

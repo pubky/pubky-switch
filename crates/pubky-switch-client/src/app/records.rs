@@ -39,6 +39,7 @@ use serde::{Deserialize, Serialize};
 use super::batch::OpBatch;
 use super::error::{Alarm, Refusal};
 use super::events::AppEvent;
+use super::protocol::{MAX_REGRESSION_REASON_BYTES, MAX_SEEN_MARK_BYTES};
 use super::state::{Tx, key};
 use super::{App, AppError, IdentityRefresh};
 use crate::client::answers::{ChainItem, SharedRecordView};
@@ -801,6 +802,7 @@ impl App {
         reason: String,
         tx: &mut Tx,
     ) -> Result<(), AppError> {
+        let reason = cut_reason(reason);
         let flagged = FlaggedWrite {
             key: *key,
             version,
@@ -1190,6 +1192,13 @@ impl App {
             new_value,
         );
         match marked {
+            // A mark over its bound isn't kept: the record keeps the one it held.
+            Some(mark) if mark.len() > MAX_SEEN_MARK_BYTES => {
+                self.events.push(AppEvent::SeenMarkDropped {
+                    key,
+                    bytes: mark.len(),
+                });
+            }
             Some(mark) => tx.put(&seen_key(&key), &SeenMark { mark })?,
             None if own => tx.delete(&seen_key(&key))?,
             None => {}
@@ -1568,6 +1577,18 @@ fn check_shape(
 
 fn store_corrupt() -> AppError {
     AppError::Store(crate::error::StoreError::Corrupt)
+}
+
+/// A protocol's rule, cut to [`MAX_REGRESSION_REASON_BYTES`] at a character boundary.
+fn cut_reason(mut reason: String) -> String {
+    if reason.len() > MAX_REGRESSION_REASON_BYTES {
+        let mut end = MAX_REGRESSION_REASON_BYTES;
+        while !reason.is_char_boundary(end) {
+            end = end.saturating_sub(1);
+        }
+        reason.truncate(end);
+    }
+    reason
 }
 
 #[cfg(test)]

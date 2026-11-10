@@ -103,6 +103,18 @@ pub struct ReceivedMessage {
 ///   value), under 13 MiB in all, below the 32 MiB batch size.
 pub const MAX_STEP_LOCAL_BYTES: usize = 4 * 1024 * 1024;
 
+/// The most bytes a [`Protocol::record_seen`] mark takes: 1 KiB. A longer one isn't kept.
+pub const MAX_SEEN_MARK_BYTES: usize = 1024;
+
+/// The most bytes a [`Protocol::record_regression`] rule takes: 256. A longer one is cut
+/// there.
+pub const MAX_REGRESSION_REASON_BYTES: usize = 256;
+
+/// The most counterparties a [`LossActions::conversations`](super::LossActions) list takes:
+/// 100,000, the `max_conversations` a service keeps at its default limits (Switch wire
+/// 9.2). The app adds back the first this many, in key order, and no more.
+pub const MAX_LOSS_CONVERSATIONS: usize = 100_000;
+
 /// What each write counts against [`MAX_STEP_LOCAL_BYTES`] beside its key and value: the
 /// room its stored and kept forms take around them.
 pub const LOCAL_WRITE_OVERHEAD_BYTES: usize = 64;
@@ -650,6 +662,10 @@ pub trait Protocol: Send + Sync {
     /// What the app has seen of a record, its high water (Switch spec 8.2): the protocol's
     /// mark after `value`, from the mark held (`None` for a write of the app's own, built on
     /// what it trusts), or `None` to keep no mark. None by default.
+    ///
+    /// A mark is at most [`MAX_SEEN_MARK_BYTES`], 1 KiB. A longer one isn't kept: the
+    /// record keeps the mark it held, and the host is told with
+    /// [`super::AppEvent::SeenMarkDropped`].
     fn record_seen(
         &self,
         collection: &str,
@@ -664,6 +680,9 @@ pub trait Protocol: Send + Sync {
     /// spec 8.2), such as dropping or replacing a message of a role it saw: the rule it
     /// breaks, without content, and the write is flagged and not acted on. `value` is
     /// `None` for a delete or an unreadable value. Never by default.
+    ///
+    /// The rule is at most [`MAX_REGRESSION_REASON_BYTES`], 256 bytes; a longer one is cut
+    /// there, at a character boundary.
     fn record_regression(
         &self,
         collection: &str,

@@ -15,9 +15,9 @@ use serde_json::{Map, json};
 
 use super::*;
 use crate::app::{
-    Alarm, AppError, AppEvent, ClaimOp, Collection, Delivery, IdentityRefresh, ObligationDeadline,
-    OpBatch, OutgoingMessage, RecordContent, RecordJob, RecordTarget, Refusal, SentMessage,
-    claim_conflict,
+    Alarm, AppError, AppEvent, ClaimOp, Collection, Delivery, IdentityRefresh,
+    MAX_REGRESSION_REASON_BYTES, MAX_SEEN_MARK_BYTES, ObligationDeadline, OpBatch, OutgoingMessage,
+    RecordContent, RecordJob, RecordTarget, Refusal, SentMessage, claim_conflict,
 };
 use crate::store::StoreHandle;
 use crate::store::{Fault as StoreFault, FaultStore};
@@ -33,6 +33,8 @@ const HOUR: u64 = 3_600_000;
 #[derive(Default)]
 pub(crate) struct ItemsProtocol {
     pub(crate) sample: SampleProtocol,
+    /// Bytes added to each mark, and to each rule a regression gives.
+    pub(crate) pad: std::sync::Mutex<usize>,
 }
 
 pub(crate) fn items() -> Collection {
@@ -114,16 +116,19 @@ impl Protocol for ItemsProtocol {
             }
         }
         let all: Vec<&str> = all.iter().map(String::as_str).collect();
-        Some(super::shared_flows::value(&all))
+        let mut mark = super::shared_flows::value(&all);
+        mark.extend(std::iter::repeat_n(b' ', *self.pad.lock().unwrap()));
+        Some(mark)
     }
 
     fn record_regression(&self, _: &str, seen: &[u8], value: Option<&[u8]>) -> Option<String> {
         let value = value?;
         let held = ids(Some(value));
+        let pad = "é".repeat(*self.pad.lock().unwrap());
         ids(Some(seen))
             .iter()
             .any(|id| !held.contains(id))
-            .then(|| "sample: an item seen was dropped".to_owned())
+            .then(|| format!("sample: an item seen was dropped{pad}"))
     }
 
     fn sent_record(
@@ -1173,6 +1178,74 @@ async fn test_records_without_the_current_key_writes_nothing() {
             .record(&app.record_key(&target).unwrap())
             .is_none()
     );
+}
+
+#[tokio::test]
+async fn test_records_seen_mark_over_its_bound_isnt_kept() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    let target = s.target("n1");
+    let key = wallet.record_key(&target).unwrap();
+    *s.protocol.pad.lock().unwrap() = MAX_SEEN_MARK_BYTES;
+    wallet
+        .put_record(&target, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    let report = phone.receive(None).await.unwrap();
+    assert!(
+        report.events.iter().any(|e| matches!(
+            e,
+            AppEvent::SeenMarkDropped { key: k, bytes } if *k == key && *bytes > MAX_SEEN_MARK_BYTES
+        )),
+        "{:?}",
+        report.events
+    );
+    // The record is taken; its mark isn't kept.
+    assert!(phone.shared_record(&key).await.unwrap().is_some());
+    assert_eq!(phone.record_seen(&key).await.unwrap(), None);
+    // A mark within the bound is.
+    *s.protocol.pad.lock().unwrap() = 0;
+    wallet
+        .put_record(&target, &value(&["a", "b"]), vec![])
+        .await
+        .unwrap();
+    phone.receive(None).await.unwrap();
+    assert!(phone.record_seen(&key).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn test_records_flagged_rule_is_cut_to_its_bound() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    let target = s.target("n1");
+    wallet
+        .put_record(&target, &value(&["a", "b"]), vec![])
+        .await
+        .unwrap();
+    phone.receive(None).await.unwrap();
+    // A rule of two-byte characters, well over the bound.
+    *s.protocol.pad.lock().unwrap() = 300;
+    wallet
+        .put_record(&target, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    let report = phone.receive(None).await.unwrap();
+    let reason = report
+        .events
+        .iter()
+        .find_map(|e| match e {
+            AppEvent::WriteFlagged { reason, .. } => Some(reason.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(
+        reason.len() <= MAX_REGRESSION_REASON_BYTES,
+        "{}",
+        reason.len()
+    );
+    assert!(reason.starts_with("sample: an item seen was dropped"));
 }
 
 #[tokio::test]

@@ -217,8 +217,8 @@ uploads; `push.rs` holds the push registration. The peek (`peek.rs`) writes noth
 | `list_due` | a listing of the collections is owed: after joining, a restore or a `missed` item | |
 | `rec/<key>` | the shared record write the app took: the signed operation, certificate and proof, its version and whether a proof gave it, the opened value, and the refused write it follows | yes |
 | `recname/<key>` | the collection name of a record the app creates outside the protocol's collections, from a write or an effect, until its write is answered | |
-| `hw/<key>` | the protocol's mark of what the app has seen in a record | the protocol's |
-| `flag/<key>/<generation>/<version>` | a write the app refused, with the app it names and the rule | |
+| `hw/<key>` | the protocol's mark of what the app has seen in a record, at most `MAX_SEEN_MARK_BYTES` (1 KiB): a longer one isn't kept | the protocol's |
+| `flag/<key>/<generation>/<version>` | a write the app refused, with the app it names and the rule, cut to `MAX_REGRESSION_REASON_BYTES` (256 bytes) | |
 | `ocert/<app_id>/<cert_hash>` | a certificate of an own app, for checking its writes | |
 | `claim/<claim_key>` | the newest claim view, the proof that shows it SETTLED, the newest entry's time and the deadline the app computes, kept until the evidence's retention ends | |
 | `clent/<claim_key>/<step>` | a signed claim entry and its proof | |

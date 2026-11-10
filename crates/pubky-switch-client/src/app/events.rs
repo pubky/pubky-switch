@@ -38,6 +38,7 @@ use pubky_switch_core::enc::serde_b64;
 use super::error::Alarm;
 use super::feed::OwedCall;
 use super::protocol::{MissedEntries, ResendNeeded, StoreFailure};
+use super::recovery::ProviderLoss;
 
 /// The stable ID of a duty event ([`AppEvent::is_duty`]): the store's epoch, and a counter.
 ///
@@ -587,6 +588,15 @@ pub enum AppEvent {
         /// The rule, without content.
         reason: String,
     },
+    /// The protocol's mark of what the app has seen in a record
+    /// ([`super::Protocol::record_seen`]) was over [`super::MAX_SEEN_MARK_BYTES`]: it wasn't
+    /// kept, and the record keeps the mark it held.
+    SeenMarkDropped {
+        /// The record key.
+        key: [u8; 32],
+        /// The mark's size.
+        bytes: usize,
+    },
     /// Uploads after a provider loss conflict with a record's current write (Switch spec
     /// 12.6).
     RecordDivergent {
@@ -665,26 +675,44 @@ pub enum RefusedCall {
     },
     /// [`super::Protocol::missed`].
     Missed(MissedEntries),
-    /// [`super::Protocol::provider_lost`], its [`super::LossActions::local`], at the loss
-    /// of `lost_generation`; the loss went on without them.
-    ProviderLost {
-        /// The generation lost.
-        lost_generation: u64,
-    },
+    /// [`super::Protocol::provider_lost`], its [`super::LossActions::local`], at this loss;
+    /// the loss went on without them.
+    ProviderLost(ProviderLoss),
 }
 
 /// A [`RefusedCall`] as a duty event keeps it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum KeptRefusal {
-    Owed { seq: u64, call: OwedCall },
-    Loss { lost_generation: u64 },
+    Owed {
+        seq: u64,
+        call: OwedCall,
+    },
+    Loss {
+        lost_generation: u64,
+        generation: u64,
+        declared_at_ms: u64,
+        accepted_from_ms: u64,
+        uncertain_until_ms: u64,
+    },
 }
 
 impl KeptRefusal {
     fn call(self) -> RefusedCall {
         match self {
             Self::Owed { seq, call } => call.refused(seq),
-            Self::Loss { lost_generation } => RefusedCall::ProviderLost { lost_generation },
+            Self::Loss {
+                lost_generation,
+                generation,
+                declared_at_ms,
+                accepted_from_ms,
+                uncertain_until_ms,
+            } => RefusedCall::ProviderLost(ProviderLoss {
+                lost_generation,
+                generation,
+                declared_at_ms,
+                accepted_from_ms,
+                uncertain_until_ms,
+            }),
         }
     }
 }

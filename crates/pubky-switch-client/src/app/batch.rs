@@ -272,10 +272,15 @@ impl App {
     ///
     /// # Errors
     ///
-    /// [`Refusal::Usage`] for an empty batch or one over 8 entries; [`Refusal::Stopped`] or
-    /// [`Refusal::Left`]; [`Refusal::NotNow`] while a provider loss is followed and the
-    /// app's evidence isn't uploaded yet (Switch spec 12.6 step 3), or after `409
-    /// stale_epoch` while the app lacks a read scope's key at the new data epoch; an
+    /// [`Refusal::Usage`] for an empty batch, one over 8 entries, or one whose local writes
+    /// are over [`super::MAX_STEP_LOCAL_BYTES`], before anything is signed or kept;
+    /// [`Refusal::Stopped`] or [`Refusal::Left`]; [`Refusal::NotNow`] while a provider loss
+    /// is followed and the app's evidence isn't uploaded yet (Switch spec 12.6 step 3),
+    /// after `409 stale_epoch` while the app lacks a read scope's key at the new data
+    /// epoch, or when keeping the batch would take the batches kept unanswered past
+    /// [`MAX_KEPT_BATCHES_BYTES`]: it is then neither kept nor sent, and may be submitted
+    /// again once they are answered. Batches an earlier build kept count toward the cap but
+    /// were kept without it, so they may already be past it; an
     /// `attempt` while the app may not attempt ([`App::may_attempt`]); the switch's refusal
     /// for good, such as `409 conflict` with its `current`, after which nothing is kept; any
     /// other failure

@@ -60,9 +60,10 @@ use super::error::{Alarm, Refusal, RefusalPlace, refused_at, refused_for_good};
 use super::events::{AppEvent, Duty, KeptRefusal, ParkReason, RefusedCall};
 use super::identity::{self, DOC_CACHE_MS, Taken};
 use super::protocol::{
-    Effect, LocalWrite, MAX_CLAIM_READS, MAX_STEP_LOCAL_BYTES, MissedEntries, Need, OpaqueRule,
-    Outcome, PARKED_RETRIES_PER_READ, Protocol, RETRY_EVENT_READS, ReceivedMessage, ResendNeeded,
-    ResendReason, Rules, StoreFailure, local_writes_bytes,
+    Effect, LocalWrite, MAX_CLAIM_READS, MAX_REGRESSION_REASON_BYTES, MAX_SEEN_MARK_BYTES,
+    MAX_STEP_LOCAL_BYTES, MissedEntries, Need, OpaqueRule, Outcome, PARKED_RETRIES_PER_READ,
+    Protocol, RETRY_EVENT_READS, ReceivedMessage, ResendNeeded, ResendReason, Rules, StoreFailure,
+    local_writes_bytes,
 };
 use super::provider::TakeOver;
 use super::records::{Collection, pending_name_key};
@@ -2175,14 +2176,42 @@ const ITEM_ROOM_BYTES: u64 = 12 * 1024 * 1024;
 const CACHED_RECORD_BYTES: u64 = 1_258_291; // 1.2 MiB
 
 // An applied effect's outcome is committed on its own: its local writes, at most
-// `MAX_STEP_LOCAL_BYTES` as stored, at most 7 cached record writes, and what processing
-// its entry writes always fit one commit, so an applied effect can't fail to commit its
-// outcome for its size.
+// `MAX_STEP_LOCAL_BYTES` as stored, at most 7 cached record writes with their marks, and
+// what processing its entry writes always fit one commit, so an applied effect can't fail
+// to commit its outcome for its size.
 const _: () = assert!(
-    (MAX_STEP_LOCAL_BYTES as u64) + 7 * CACHED_RECORD_BYTES + ENTRY_RESERVE_BYTES
+    (MAX_STEP_LOCAL_BYTES as u64)
+        + 7 * (CACHED_RECORD_BYTES + MAX_SEEN_MARK_BYTES as u64)
+        + ENTRY_RESERVE_BYTES
         <= MAX_BATCH_BYTES
 );
-// One more item always fits beside the read's writes kept to the high-water mark.
+/// The `POST /ops` body cap (Switch wire 7.1), what a kept effect's batch takes at most.
+const OPS_BODY_BYTES: u64 = 4 * 1024 * 1024;
+
+/// A kept effect at its largest (`pending/effect`, `MAX_STEP_LOCAL_BYTES`): its batch and
+/// its local writes in base64, its plaintext in base64 (the 64 KiB envelope), the
+/// certificate (33 KiB), a context (1 KiB) and its other fields (8 KiB).
+const KEPT_EFFECT_BYTES: u64 =
+    (OPS_BODY_BYTES + MAX_STEP_LOCAL_BYTES as u64).div_ceil(3) * 4 + 87_382 + (42 << 10);
+
+// What one feed item writes, at most, fits [`ITEM_ROOM_BYTES`]:
+// - a kept effect, which also fits one value;
+const _: () = assert!(KEPT_EFFECT_BYTES <= MAX_VALUE_BYTES);
+const _: () = assert!(KEPT_EFFECT_BYTES + ENTRY_RESERVE_BYTES <= ITEM_ROOM_BYTES);
+// - an effect without operations, or a call's local writes, with a duty event or an entry
+//   stored locally;
+const _: () = assert!(
+    (MAX_STEP_LOCAL_BYTES as u64) + PARK_ROOM_BYTES + ENTRY_RESERVE_BYTES <= ITEM_ROOM_BYTES
+);
+// - a chain item's cached record write, its mark and a flagged write's rule.
+const _: () = assert!(
+    CACHED_RECORD_BYTES
+        + (MAX_SEEN_MARK_BYTES as u64)
+        + (MAX_REGRESSION_REASON_BYTES as u64)
+        + ENTRY_RESERVE_BYTES
+        <= ITEM_ROOM_BYTES
+);
+// So one more item always fits beside the read's writes kept to the high-water mark.
 const _: () = assert!(ITEM_ROOM_BYTES + ENTRY_RESERVE_BYTES < MAX_BATCH_BYTES);
 
 /// The bytes a write of `value_len` value bytes at `key` counts against a batch in `ns`.
