@@ -136,6 +136,146 @@ fn test_vectors_operations() {
     check_integer_bounds(&keys, &v, &identity);
     check_attempt_deadlines(&v, &by_name);
     check_invite_context(&keys, &v, &identity);
+    check_shape_rejections(&keys, &v, &identity);
+}
+
+/// One case of `shape_rejections`: the operation `based_on` with each `(from, to)` of
+/// `changes` made in its signed body, signed again by its writer, so its signature verifies
+/// and only the shape check (Switch wire 6.4 step 9) decides.
+fn shape_case(
+    keys: &Keys,
+    v: &Value,
+    identity: &[u8; 32],
+    name: &str,
+    based_on: &str,
+    changes: &[(&str, &str)],
+) -> Value {
+    let base = arr(v, "operations")
+        .iter()
+        .find(|o| st(o, "name") == based_on)
+        .unwrap();
+    let mut body = st(base, "body").to_owned();
+    for (from, to) in changes {
+        assert_eq!(body.matches(from).count(), 1, "{name}: {from}");
+        body = body.replace(from, to);
+    }
+    let (writer_key, _) = writer_of(keys, st(base, "writer"), identity);
+    let secret = keys.secret(&writer_key).unwrap();
+    let sig = sig::sign(
+        &ed25519_dalek::SigningKey::from_bytes(&secret),
+        labels::sig::OP,
+        &[identity, body.as_bytes()],
+    );
+    let signed = SignedDoc::from_parts(body.as_bytes(), &sig);
+    let (key, app_id) = writer_of(keys, st(base, "writer"), identity);
+    let op = SignedOp::verify(&signed, &key, identity, app_id.as_ref())
+        .unwrap_or_else(|e| panic!("{name}: {e}"));
+    let refused = check_shape(op.body()).expect_err(name);
+    json!({
+        "name": name,
+        "based_on": based_on,
+        "writer": st(base, "writer"),
+        "body": body,
+        "signed": signed,
+        "expect": { "status": refused.status(), "code": refused.code.as_str() },
+        "rule": quoted(&refused.reason),
+    })
+}
+
+/// `shape_rejections`, which `pubky-switch-core` generates (README "How the files were
+/// generated"): the `record.put create` of `operations` with its policy changed so that its
+/// shape (Switch wire 6.2, 6.4 step 9) fails, its key derived again for that policy (wire
+/// 1.5), so only the scope rule decides, and signed again by its writer: a `read_scope`,
+/// with the sealed value's `scope`, or a `write_scopes` entry that isn't a scope (wire 3.1
+/// "Scope names").
+fn check_shape_rejections(keys: &Keys, v: &Value, identity: &[u8; 32]) {
+    let based_on = "record.put create";
+    let base = arr(v, "operations")
+        .iter()
+        .find(|o| st(o, "name") == based_on)
+        .unwrap();
+    let body: Value = serde_json::from_str(st(base, "body")).unwrap();
+    let read = st(&body, "read_scope").to_owned();
+    let writes = strings(&body["write_scopes"]);
+    let key = st(&body, "key").to_owned();
+    let collection = st(&body["id_inputs"], "collection").to_owned();
+    let blinded: [u8; 32] = b64n(st(&body["id_inputs"], "blinded_key"));
+    let text = |value: &Value| serde_json::to_string(value).unwrap();
+    // The changes that give the operation `new_read` and `new_writes`, with the key they
+    // derive.
+    let changes = |new_read: &str, new_writes: &[String]| -> Vec<(String, String)> {
+        let refs: Vec<&str> = new_writes.iter().map(String::as_str).collect();
+        let policy = pubky_switch_core::ident::Policy::new(new_read, &refs);
+        let new_key = pubky_switch_core::ident::record_key_from_blinded(
+            &collection,
+            &blinded,
+            &policy.hash().unwrap(),
+        );
+        vec![
+            (
+                format!(r#""key":{}"#, text(&json!(key))),
+                format!(r#""key":{}"#, text(&json!(b64e(&new_key)))),
+            ),
+            (
+                format!(r#""read_scope":{}"#, text(&json!(read))),
+                format!(r#""read_scope":{}"#, text(&json!(new_read))),
+            ),
+            (
+                format!(r#""write_scopes":{}"#, text(&json!(writes))),
+                format!(r#""write_scopes":{}"#, text(&json!(new_writes))),
+            ),
+            (
+                format!(r#""scope":{},"nonce""#, text(&json!(read))),
+                format!(r#""scope":{},"nonce""#, text(&json!(new_read))),
+            ),
+        ]
+    };
+    let case = |name: &str, new_read: &str, new_writes: &[String]| {
+        let changes = changes(new_read, new_writes);
+        let pairs: Vec<(&str, &str)> = changes
+            .iter()
+            .filter(|(from, to)| from != to)
+            .map(|(from, to)| (from.as_str(), to.as_str()))
+            .collect();
+        shape_case(keys, v, identity, name, based_on, &pairs)
+    };
+    let mut more_writes = writes.clone();
+    more_writes.push(format!("{}:", writes[0]));
+    let cases = vec![
+        case(
+            "record.put: read_scope with a NUL character",
+            &format!("{read}\u{0}"),
+            &writes,
+        ),
+        case(
+            "record.put: read_scope in upper case",
+            &read.to_uppercase(),
+            &writes,
+        ),
+        case(
+            "record.put: a write_scopes entry that isn't a scope",
+            &read,
+            &more_writes,
+        ),
+    ];
+    let section = json!({
+        "description": "Wire 6.2, 6.4 step 9: operations whose shape the service refuses, 400 bad_request, before it compares them with what it holds. Each case is the operation of operations named in based_on with the change its name gives made in its signed body, its record key derived again for the policy it then has (wire 1.5), and signed again by its writer, so its signature verifies and only the shape decides. A record's read_scope, its value_sealed's scope with it, and each write_scopes entry follow the scope rule of wire 3.1 \"Scope names\".",
+        "cases": cases,
+    });
+    generated(
+        "operations.json",
+        &[(Place::Member("/shape_rejections"), section)],
+    );
+    let file = load("operations.json");
+    for c in arr(&file["shape_rejections"], "cases") {
+        let name = st(c, "name");
+        let signed = signed_of(&c["signed"]);
+        assert_eq!(signed.body, b64e(st(c, "body").as_bytes()), "{name}");
+        let (key, app_id) = writer_of(keys, st(c, "writer"), identity);
+        let op = SignedOp::verify(&signed, &key, identity, app_id.as_ref())
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        expect_refusal(c, &check_shape(op.body()).unwrap_err(), name);
+    }
 }
 
 /// `invite_context`, which `pubky-switch-core` generates (README "How the files were

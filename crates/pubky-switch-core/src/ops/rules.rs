@@ -124,6 +124,20 @@ pub fn check_shape(body: &OpBody) -> std::result::Result<(), Refusal> {
     match &body.kind {
         OpKind::Claim(fields) => fields.check().map(drop),
         OpKind::RecordPut(put) => {
+            // A record's scopes follow the scope rule, as every scope the switch compares
+            // (Switch wire 3.1 "Scope names"): another string names no scope, and would
+            // reach the service's storage unchecked.
+            let policy = &put.policy;
+            if !crate::scopes::is_scope(&policy.read_scope) {
+                return bad("record.put: read_scope isn't a scope (wire 3.1)");
+            }
+            if !policy
+                .write_scopes
+                .iter()
+                .all(|s| crate::scopes::is_scope(s))
+            {
+                return bad("record.put: a write_scopes entry isn't a scope (wire 3.1)");
+            }
             let policy_hash = put.policy.hash()?;
             put.value_sealed.check_shape(&put.policy.read_scope)?;
             match (put.expected_version.is_none(), &put.id_inputs) {
@@ -626,6 +640,38 @@ mod tests {
                 "{}",
                 kind.name()
             );
+        }
+    }
+
+    #[test]
+    fn test_shape_of_a_record_put_scopes() {
+        let with = |read: &str, writes: &[&str]| {
+            let mut put = record_put(RecordVersion::new(1, 6), false);
+            put.policy = Policy::new(read, writes);
+            let id = identity();
+            put.value_sealed = SealedValue::seal(
+                &id.scope_key(1, read),
+                &id.public(),
+                1,
+                read,
+                &put.key,
+                b"{}",
+            )
+            .unwrap();
+            check_shape(&body(OpKind::RecordPut(put)))
+        };
+        assert!(with("notes", &["notes", "notes:a"]).is_ok());
+        for (read, writes) in [
+            ("no\u{0}tes", &["notes"][..]),
+            ("", &["notes"]),
+            ("Notes", &["notes"]),
+            ("notes:", &["notes"]),
+            ("notes", &["notes", "bad scope"]),
+            ("notes", &["no\u{0}tes"]),
+            ("notes", &["notes:A"]),
+        ] {
+            let refused = with(read, writes).unwrap_err();
+            assert_eq!(refused.code, ErrorCode::BadRequest, "{read:?} {writes:?}");
         }
     }
 
