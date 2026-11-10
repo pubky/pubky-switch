@@ -769,6 +769,29 @@ async fn test_app_lost_answer_resends_the_same_batch() {
 }
 
 #[tokio::test]
+async fn test_scripted_switch_refuses_a_cursor_outside_the_sequence() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let me = app.app_id();
+    let newest = w.switch.seq();
+    let before = w.switch.app(&me).cursor;
+    let cursor = |generation, seq| {
+        crate::client::Batch::cursor_only(pubky_switch_core::ops::Position { generation, seq })
+    };
+    for (generation, seq) in [(77, 10_000), (1, newest + 1), (2, 0)] {
+        let error = app.submit(&cursor(generation, seq)).await.unwrap_err();
+        assert_eq!(
+            error.code(),
+            Some(ErrorCode::BadRequest),
+            "{generation}:{seq}"
+        );
+        assert_eq!(w.switch.app(&me).cursor, before);
+    }
+    app.submit(&cursor(1, newest)).await.unwrap();
+    assert_eq!(w.switch.app(&me).cursor, newest);
+}
+
+#[tokio::test]
 async fn test_app_defers_a_cursor_only_move() {
     let w = World::new();
     let mut wallet = w.join("wallet").await;

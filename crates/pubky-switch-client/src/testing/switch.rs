@@ -187,6 +187,8 @@ pub(crate) struct Inner {
     pub(crate) erased: bool,
     /// The generation a recovery started from, at a recovering account.
     pub(crate) recovery_from: Option<u64>,
+    /// The generation an imported sequence continues from, after a cooperative move.
+    pub(crate) continued_from: Option<u64>,
     /// An app's first receive key record may carry any `n` (after a provider loss).
     pub(crate) any_first_n: bool,
     /// The recovery uploads taken: the body, and whether it came with `Switch-Cert`.
@@ -249,6 +251,7 @@ impl Inner {
             staged: false,
             erased: false,
             recovery_from: None,
+            continued_from: None,
             any_first_n: false,
             uploads: Vec::new(),
             push: BTreeMap::new(),
@@ -373,6 +376,7 @@ impl ScriptedSwitch {
             inner.tip,
         );
         next.seq = inner.seq;
+        next.continued_from = Some(inner.tip.generation);
         next.items = inner.items.clone();
         next.tips = inner.tips.clone();
         next.doc = inner.doc.clone();
