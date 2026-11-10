@@ -508,13 +508,18 @@ async fn test_send_not_admitted_is_deleted_after_30_days() {
     s.peer.lock().admitted = Some(Default::default());
     let (msg_id, _) = app.send(s.note("one")).await.unwrap();
     app.take_events();
-    // Queued for 30 days from the first such answer (Switch spec 11).
-    s.w.clock.advance_ms(crate::app::UNDELIVERABLE_MS - 1);
-    assert_eq!(
-        app.flush_outbox().await.unwrap().queued,
-        vec![msg_id.clone()]
-    );
-    s.w.clock.advance_ms(1);
+    // Queued for 30 days from the first such answer, over tries spread across them
+    // (Switch spec 11).
+    for _ in 2..crate::app::UNDELIVERABLE_TRIES {
+        s.w.clock
+            .advance_ms(crate::app::UNDELIVERABLE_TRY_SPACING_MS);
+        assert_eq!(
+            app.flush_outbox().await.unwrap().queued,
+            vec![msg_id.clone()]
+        );
+    }
+    s.w.clock
+        .advance_ms(crate::app::UNDELIVERABLE_TRY_SPACING_MS);
     let report = app.flush_outbox().await.unwrap();
     assert_eq!(report.undelivered, vec![msg_id.clone()]);
     assert!(report.queued.is_empty(), "{report:?}");
@@ -544,6 +549,41 @@ async fn test_send_not_admitted_is_deleted_after_30_days() {
     let report = app.flush_outbox().await.unwrap();
     assert!(report.done.is_empty(), "{report:?}");
     assert!(s.peer.received().is_empty());
+}
+
+#[tokio::test]
+async fn test_send_not_admitted_is_tried_once_more_before_it_is_deleted() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    s.peer.lock().admitted = Some(Default::default());
+    let (msg_id, _) = app.send(s.note("one")).await.unwrap();
+    for _ in 2..crate::app::UNDELIVERABLE_TRIES {
+        s.w.clock
+            .advance_ms(crate::app::UNDELIVERABLE_TRY_SPACING_MS);
+        app.flush_outbox().await.unwrap();
+    }
+    // Admitted on day 29; the next flush comes past day 30, and the message goes.
+    s.peer.lock().admitted = None;
+    s.w.clock.advance_ms(9 * DAY_MS);
+    let report = app.flush_outbox().await.unwrap();
+    assert_eq!(report.done, vec![msg_id.clone()], "{report:?}");
+    assert_eq!(s.peer.received(), vec![msg_id]);
+}
+
+#[tokio::test]
+async fn test_send_not_admitted_isnt_deleted_by_a_clock_jump() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    s.peer.lock().admitted = Some(Default::default());
+    let (msg_id, _) = app.send(s.note("one")).await.unwrap();
+    // The clock jumps 40 days ahead: one try counts, and the tries right after add none.
+    s.w.clock.advance_ms(40 * DAY_MS);
+    for _ in 0..5 {
+        let report = app.flush_outbox().await.unwrap();
+        assert_eq!(report.queued, vec![msg_id.clone()], "{report:?}");
+        s.w.clock.advance_ms(60_000);
+    }
+    assert!(app.delivery(&msg_id).await.unwrap().is_some());
 }
 
 #[tokio::test]

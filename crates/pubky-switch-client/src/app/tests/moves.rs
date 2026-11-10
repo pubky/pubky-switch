@@ -8,7 +8,7 @@ use pubky_switch_core::chain::ItemType;
 use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::ops::{AllowKind, OpKind};
 use pubky_switch_core::records::{
-    CLOCK_TOLERANCE_MS, Freeze, FreezeBody, IDENTITY_PATH, RemovedApp,
+    CLOCK_TOLERANCE_MS, DAY_MS, Freeze, FreezeBody, IDENTITY_PATH, RemovedApp,
 };
 use pubky_switch_core::scopes::Permission;
 use pubky_switch_core::sig::SignedDoc;
@@ -657,6 +657,11 @@ async fn test_move_next_service_showing_a_foreign_key_is_a_compromise() {
     let router = Router::of(&w);
     let mut app = join(&w, &router).await;
     let me = app.app_id();
+    let registered_at = w.clock.now_ms();
+    // The freeze, an hour later, is the newest chain item the app verifies at the old
+    // service.
+    w.clock.advance_ms(3_600_000);
+    let frozen_at = w.clock.now_ms();
     let n_key = next_key();
     w.switch.freeze(&freeze_for(&w, &n_key, 2)).unwrap();
     let next = w.switch.import_into(n_key.to_bytes());
@@ -676,6 +681,7 @@ async fn test_move_next_service_showing_a_foreign_key_is_a_compromise() {
         held.receive_n = Some(1);
     }
     app.receive(None).await.unwrap();
+    w.clock.advance_ms(3_600_000);
     publish_at(
         &w,
         &next,
@@ -691,10 +697,10 @@ async fn test_move_next_service_showing_a_foreign_key_is_a_compromise() {
         ),
         "{error:?}"
     );
-    // Without the registration's chain item, it distrusts from the latest service time it
-    // holds (Switch spec 3.6).
-    let distrust_from = app.compromise_distrust_from().unwrap();
-    assert!(distrust_from <= w.clock.now_ms(), "{distrust_from}");
+    // Without the registration's chain item, it distrusts from the later of the newest
+    // chain item it verified, the freeze, and its own last registration (Switch spec 3.6).
+    assert!(registered_at < frozen_at);
+    assert_eq!(app.compromise_distrust_from(), Some(frozen_at));
     // It left at once, at the service it follows.
     assert!(next.app(&me).departed);
 }
@@ -1207,76 +1213,162 @@ async fn test_removed_in_identity_json_stops_for_good() {
     assert_eq!(app.follow_provider().await.unwrap(), ProviderStatus::Gone);
 }
 
-#[tokio::test]
-async fn test_erased_account_is_gone_once_the_identity_is_unpublished() {
-    let w = World::new();
-    let router = Router::of(&w);
-    let mut app = join(&w, &router).await;
-    w.switch.lock().erased = true;
-    // While the identity still publishes its identity.json, the unsigned 404 explains
-    // nothing: the error stands and the app isn't stopped.
-    let error = app.receive(None).await.unwrap_err();
+/// A read that meets an erased account and doesn't conclude: the service counts as
+/// unreachable (Switch spec 12.7).
+async fn unreachable_read(app: &mut App) {
+    let result = app.receive(None).await;
     assert!(
-        matches!(
-            error,
-            AppError::Switch(ClientError::BadServiceSignature { status: 404 })
-        ),
-        "{error:?}"
-    );
-    assert_eq!(
-        app.follow_provider().await.unwrap(),
-        ProviderStatus::Current
-    );
-    // The signer erased the account and deleted identity.json from the Homeserver. Until
-    // both have held for 24 hours, the service counts as unreachable (Switch spec 12.7).
-    w.homeserver.remove(w.alice.public(), IDENTITY_PATH);
-    let unreachable = |result: Result<_, AppError>| {
         matches!(
             result,
             Err(AppError::Switch(ClientError::BadServiceSignature {
                 status: 404
             }))
-        )
-    };
-    assert!(unreachable(app.receive(None).await));
-    w.clock
-        .advance_ms(crate::app::provider::ERASURE_WAIT_MS - 1);
-    assert!(unreachable(app.receive(None).await));
+        ),
+        "{result:?}"
+    );
+}
+
+/// Tries spaced as the erasure wait counts them, up to the last one before it concludes.
+async fn erasure_tries_but_the_last(w: &World, app: &mut App) {
+    unreachable_read(app).await;
+    for _ in 2..crate::app::provider::ERASURE_TRIES {
+        w.clock
+            .advance_ms(crate::app::provider::ERASURE_TRY_SPACING_MS);
+        unreachable_read(app).await;
+    }
+}
+
+#[tokio::test]
+async fn test_erased_account_is_gone_once_the_identity_is_unpublished() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join(&w, &router).await;
+    app.register_push(&NoRelay, "https://push.example/v1/hook", "token")
+        .await
+        .unwrap();
+    w.switch.lock().erased = true;
+    // While the identity still publishes its identity.json, the unsigned 404 explains
+    // nothing: the error stands and the app isn't stopped.
+    unreachable_read(&mut app).await;
+    assert!(app.state.erasing.is_none());
+    // The signer erased the account and deleted identity.json from the Homeserver. Until
+    // both have held at tries spread over 24 hours, the service counts as unreachable.
+    w.homeserver.remove(w.alice.public(), IDENTITY_PATH);
+    erasure_tries_but_the_last(&w, &mut app).await;
     assert_eq!(
         app.follow_provider().await.unwrap(),
         ProviderStatus::Current
     );
-    w.clock.advance_ms(1);
+    w.clock
+        .advance_ms(crate::app::provider::ERASURE_TRY_SPACING_MS);
     let report = app.receive(None).await.unwrap();
     assert!(report.stopped);
     assert!(has(&report.events, |e| matches!(e, AppEvent::AccountGone)));
     assert_eq!(app.follow_provider().await.unwrap(), ProviderStatus::Gone);
+    // The push setting is kept, only no longer set, for when the account shows again.
+    assert!(app.push_registration().await.unwrap().is_none());
+    assert!(app.push_record().await.unwrap().is_some());
 }
 
 #[tokio::test]
-async fn test_erasure_wait_starts_over_when_the_identity_shows_again() {
+async fn test_erasure_wait_starts_over_on_any_answer_the_account_key_signs() {
+    for clear in 0..3 {
+        let w = World::new();
+        let router = Router::of(&w);
+        let mut app = lists_app(&w, &router).await;
+        let published = w.homeserver.file(w.alice.public(), IDENTITY_PATH).unwrap();
+        // One coincident blip starts the wait.
+        w.switch.lock().erased = true;
+        w.homeserver.remove(w.alice.public(), IDENTITY_PATH);
+        unreachable_read(&mut app).await;
+        assert!(app.state.erasing.is_some());
+        w.switch.lock().erased = false;
+        match clear {
+            // identity.json shows again.
+            0 => {
+                w.homeserver
+                    .put(w.alice.public(), IDENTITY_PATH, published.clone());
+                app.refresh_identity().await.unwrap();
+            }
+            // A batch answer verifies with the account's key.
+            1 => {
+                let dave = IdentityKey::from_secret(seed("dave/identity")).public();
+                app.submit_batch(contact_batch(dave)).await.unwrap();
+            }
+            // A signed refusal.
+            _ => {
+                w.switch.fail_next(Fault::Error {
+                    path: "feed".into(),
+                    code: ErrorCode::RateLimited,
+                    current: json!({}),
+                });
+                assert!(app.receive(None).await.is_err());
+            }
+        }
+        assert!(app.state.erasing.is_none(), "case {clear}");
+        // A second blip a day later starts the wait again, and concludes nothing.
+        w.clock.advance_ms(crate::app::provider::ERASURE_WAIT_MS);
+        w.switch.lock().erased = true;
+        w.homeserver.remove(w.alice.public(), IDENTITY_PATH);
+        unreachable_read(&mut app).await;
+        assert_eq!(app.state.erasing.map(|e| e.tries), Some(1), "case {clear}");
+        assert_ne!(
+            app.follow_provider().await.unwrap(),
+            ProviderStatus::Gone,
+            "case {clear}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_erasure_wait_isnt_concluded_by_a_clock_jump() {
     let w = World::new();
     let router = Router::of(&w);
     let mut app = join(&w, &router).await;
+    w.switch.lock().erased = true;
+    w.homeserver.remove(w.alice.public(), IDENTITY_PATH);
+    unreachable_read(&mut app).await;
+    // The clock jumps a week ahead: that counts one try, and the tries right after it add
+    // nothing.
+    w.clock.advance_ms(7 * DAY_MS);
+    for _ in 0..10 {
+        unreachable_read(&mut app).await;
+        w.clock.advance_ms(60_000);
+    }
+    assert_eq!(app.state.erasing.map(|e| e.tries), Some(2));
+    assert_ne!(app.follow_provider().await.unwrap(), ProviderStatus::Gone);
+    // A clock gone back starts the wait over.
+    w.clock.set_ms(w.clock.now_ms() - 8 * DAY_MS);
+    unreachable_read(&mut app).await;
+    assert_eq!(app.state.erasing.map(|e| e.tries), Some(1));
+}
+
+#[tokio::test]
+async fn test_erased_account_seen_alive_again_comes_back() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join(&w, &router).await;
+    let me = app.app_id();
     let published = w.homeserver.file(w.alice.public(), IDENTITY_PATH).unwrap();
     w.switch.lock().erased = true;
     w.homeserver.remove(w.alice.public(), IDENTITY_PATH);
-    assert!(app.receive(None).await.is_err());
-    // A Homeserver fault ends: the file shows again, and the wait starts over.
+    erasure_tries_but_the_last(&w, &mut app).await;
     w.clock
-        .advance_ms(crate::app::provider::ERASURE_WAIT_MS / 2);
-    w.homeserver
-        .put(w.alice.public(), IDENTITY_PATH, published.clone());
-    assert!(app.receive(None).await.is_err());
-    w.homeserver.remove(w.alice.public(), IDENTITY_PATH);
-    w.clock
-        .advance_ms(crate::app::provider::ERASURE_WAIT_MS / 2);
-    assert!(app.receive(None).await.is_err());
-    w.clock
-        .advance_ms(crate::app::provider::ERASURE_WAIT_MS - 1);
-    assert!(app.receive(None).await.is_err());
-    w.clock.advance_ms(1);
+        .advance_ms(crate::app::provider::ERASURE_TRY_SPACING_MS);
     assert!(app.receive(None).await.unwrap().stopped);
+    assert_eq!(app.follow_provider().await.unwrap(), ProviderStatus::Gone);
+    // It was a fault: the account and its identity.json are there again.
+    w.switch.lock().erased = false;
+    w.homeserver.put(w.alice.public(), IDENTITY_PATH, published);
+    let seq = w.note(me, "after the fault").0;
+    let report = app.receive(None).await.unwrap();
+    assert!(
+        has(&report.events, |e| matches!(e, AppEvent::AccountBack)),
+        "{:?}",
+        report.events
+    );
+    assert!(received(&report.events, seq), "{:?}", report.events);
+    assert_ne!(app.follow_provider().await.unwrap(), ProviderStatus::Gone);
 }
 
 #[test]
@@ -1360,7 +1452,7 @@ const ATTEMPT: [u8; 16] = [6; 16];
 /// The same origin under a new key at generation 2, published (a key change in place).
 fn change_key(w: &World, router: &Router) -> Arc<ScriptedSwitch> {
     let pending = SigningKey::from_bytes(&seed("service/alice/pending"));
-    let changed = w.switch.import_into(pending.to_bytes());
+    let changed = w.switch.change_key_into(pending.to_bytes());
     router.add(ORIGIN, &changed);
     publish_at(
         w,
@@ -1750,7 +1842,7 @@ fn contact_batch(pubky: [u8; 32]) -> crate::app::OpBatch {
 }
 
 #[tokio::test]
-async fn test_key_change_sends_a_kept_batch_again_and_its_answer_shows_it_applied() {
+async fn test_key_change_sends_a_kept_batch_again_and_its_original_proofs_show_it_applied() {
     let w = World::new();
     let router = Router::of(&w);
     let mut app = lists_app(&w, &router).await;
@@ -1759,9 +1851,21 @@ async fn test_key_change_sends_a_kept_batch_again_and_its_answer_shows_it_applie
     w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
     assert!(app.submit_batch(contact_batch(carol)).await.is_err());
     let changed = change_key(&w, &router);
-    // Sent again unchanged, it is answered `409 conflict`: applied, and never signed again
-    // (Switch spec 12.5 "Kept batches").
+    // Sent again unchanged, it gets its original proofs, which a key change in place keeps,
+    // checked with generation 1's key: applied, and never signed again (Switch spec 12.5
+    // "Kept batches", Switch wire 6.4 step 6).
     let report = app.receive(None).await.unwrap();
+    assert!(app.alarm().is_none(), "{:?}", app.alarm());
+    assert_eq!(
+        changed
+            .lock()
+            .batches
+            .values()
+            .filter(|record| record.proofs.is_some())
+            .count(),
+        w.switch.lock().batches.len(),
+        "the original proofs are kept"
+    );
     assert!(
         has(&report.events, |e| matches!(
             e,
@@ -1781,6 +1885,42 @@ async fn test_key_change_sends_a_kept_batch_again_and_its_answer_shows_it_applie
     assert!(app.kept_batches().await.unwrap().is_empty());
     assert_eq!(allow_ops_for(&changed.applied(), carol), 0);
     assert_eq!(allow_ops_for(&w.switch.applied(), carol), 1);
+    assert!(app.admits(&carol).await.unwrap());
+}
+
+#[tokio::test]
+async fn test_unseen_move_sends_a_kept_batch_again_and_its_conflict_shows_it_applied() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = lists_app(&w, &router).await;
+    let carol = IdentityKey::from_secret(seed("carol/identity")).public();
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.submit_batch(contact_batch(carol)).await.is_err());
+    // A move the app never saw frozen: the import carries the batch's ID without its
+    // proofs, so the resend is answered `409 conflict`, which shows it applied.
+    let n_key = next_key();
+    let next = w.switch.import_into(n_key.to_bytes());
+    router.add(NEXT, &next);
+    publish_at(
+        &w,
+        &next,
+        Inbox::new(NEXT, n_key.verifying_key().to_bytes()),
+        2,
+        None,
+    );
+    // The app learns of the move from its identity.json, before reading the old feed.
+    app.refresh_identity().await.unwrap();
+    let report = app.receive(None).await.unwrap();
+    assert!(
+        has(&report.events, |e| matches!(
+            e,
+            AppEvent::KeptBatchApplied { .. }
+        )),
+        "{:?}",
+        report.events
+    );
+    assert!(app.kept_batches().await.unwrap().is_empty());
+    assert_eq!(allow_ops_for(&next.applied(), carol), 0);
     assert!(app.admits(&carol).await.unwrap());
 }
 
@@ -1812,6 +1952,153 @@ async fn test_key_change_signs_a_kept_batch_again_only_on_stale_generation() {
         && matches!(op.body().kind, OpKind::AllowPut { pubky, .. } if pubky == carol)));
     assert_eq!(allow_ops_for(&applied, carol), 1);
     assert!(app.kept_batches().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_key_change_resend_past_the_window_drops_instead_of_signing_again() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = lists_app(&w, &router).await;
+    let carol = IdentityKey::from_secret(seed("carol/identity")).public();
+    // Applied at generation 1, its answer lost.
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.submit_batch(contact_batch(carol)).await.is_err());
+    // On day 29 the key changes: the batch is kept to be sent again, but the first resend
+    // can't connect.
+    w.clock.advance_ms(29 * DAY_MS);
+    let changed = change_key(&w, &router);
+    changed.fail_next(Fault::Unreachable {
+        path: "ops".into(),
+        after: 0,
+    });
+    assert!(app.receive(None).await.is_err());
+    assert_eq!(app.kept_batches().await.unwrap().len(), 1);
+    // On day 31 the service has forgotten the batch ID: `409 stale_generation` no longer
+    // shows the batch was never applied (Switch spec 12.5 "Kept batches").
+    w.clock.advance_ms(2 * DAY_MS);
+    changed.lock().batches.clear();
+    let report = app.receive(None).await.unwrap();
+    assert!(
+        has(&report.events, |e| matches!(
+            e,
+            AppEvent::KeptBatchDropped { .. }
+        )),
+        "{:?}",
+        report.events
+    );
+    assert!(!has(&report.events, |e| matches!(
+        e,
+        AppEvent::KeptBatchSignedAgain { .. }
+    )));
+    assert!(app.kept_batches().await.unwrap().is_empty());
+    assert_eq!(allow_ops_for(&changed.applied(), carol), 0);
+    assert_eq!(allow_ops_for(&w.switch.applied(), carol), 1);
+}
+
+#[tokio::test]
+async fn test_key_change_effect_resend_past_the_window_parks_its_entry() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join(&w, &router).await;
+    let me = app.app_id();
+    let (seq, _) = w.note(me, "before");
+    // The effect is applied at generation 1, and its answer lost.
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.receive(None).await.is_err());
+    assert_eq!(w.effects(), 1);
+    w.clock.advance_ms(29 * DAY_MS);
+    let changed = change_key(&w, &router);
+    changed.fail_next(Fault::Unreachable {
+        path: "ops".into(),
+        after: 0,
+    });
+    assert!(app.receive(None).await.is_err());
+    w.clock.advance_ms(2 * DAY_MS);
+    changed.lock().batches.clear();
+    // The entry is stored and passed, never applied again, and the protocol told.
+    let report = app.receive(None).await.unwrap();
+    assert!(
+        has(&report.events, |e| matches!(
+            e,
+            AppEvent::Parked { id: Some(_), seq: s, reason: ParkReason::Uncertain } if *s == seq
+        )),
+        "{:?}",
+        report.events
+    );
+    assert!(has(&report.events, |e| matches!(
+        e,
+        AppEvent::EffectUncertain { seq: s, .. } if *s == seq
+    )));
+    assert!(!has(&report.events, |e| matches!(
+        e,
+        AppEvent::EffectRefused { .. }
+    )));
+    assert!(!received(&report.events, seq), "{:?}", report.events);
+    assert_eq!(conversations_at(&changed), 0);
+    assert!(app.cursor().seq >= seq);
+    // Not tried again.
+    let report = app.receive(None).await.unwrap();
+    assert!(!received(&report.events, seq));
+    assert_eq!(conversations_at(&changed), 0);
+}
+
+#[tokio::test]
+async fn test_key_change_effect_kept_without_its_entry_parks_it_when_read_again() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join(&w, &router).await;
+    let me = app.app_id();
+    let (seq, _) = w.note(me, "before");
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.receive(None).await.is_err());
+    // A kept effect written without its entry, as an earlier build kept it.
+    app.ready_local().await.unwrap();
+    let mut pending = app.state.pending_effect.clone().unwrap();
+    pending.entry = None;
+    let mut tx = app.tx().unwrap();
+    tx.put(crate::app::state::key::PENDING_EFFECT, &pending)
+        .unwrap();
+    app.commit(tx).await.unwrap();
+    app.state.pending_effect = Some(pending);
+    w.clock
+        .advance_ms(crate::app::provider::KEPT_BATCH_ANSWER_MS);
+    let changed = change_key(&w, &router);
+    changed.lock().batches.clear();
+    // Its resend leaves a marker, and the entry the feed shows again is stored and passed
+    // in that read's commit, with its duty events.
+    let report = app.receive(None).await.unwrap();
+    assert!(
+        has(&report.events, |e| matches!(
+            e,
+            AppEvent::EffectUncertain { id, seq: s, .. } if *s == seq && e.id() == Some(*id)
+        )),
+        "{:?}",
+        report.events
+    );
+    assert!(!received(&report.events, seq), "{:?}", report.events);
+    assert_eq!(conversations_at(&changed), 0);
+    assert_eq!(
+        app.state.parked.get(&seq).map(|p| p.reason),
+        Some(ParkReason::Uncertain)
+    );
+    // The marker went with the park.
+    assert!(app.reader().scan_raw("uncert/").await.unwrap().is_empty());
+    let loaded = App::load(
+        router.env(&w, Arc::clone(&w.store) as Arc<dyn StateStore>),
+        w.protocol.clone(),
+        World::config(),
+        me,
+    )
+    .await
+    .unwrap()
+    .take_events();
+    assert!(
+        has(
+            &loaded,
+            |e| matches!(e, AppEvent::EffectUncertain { seq: s, .. } if *s == seq)
+        ),
+        "{loaded:?}"
+    );
 }
 
 #[tokio::test]
@@ -1964,10 +2251,12 @@ async fn test_key_change_parks_a_kept_effect_older_than_the_batch_window() {
     assert_eq!(w.effects(), 1);
     w.clock
         .advance_ms(crate::app::provider::KEPT_BATCH_ANSWER_MS);
+    // The key changes past the window, and the service has forgotten the batch ID.
     let changed = change_key(&w, &router);
-    // The answer can't tell any more whether it was applied: the entry is stored and
-    // passed, its effect not built again, and the protocol told (Switch spec 12.5 "Kept
-    // batches").
+    changed.lock().batches.clear();
+    // Sent again at the switch, `409 stale_generation` can't tell any more whether it was
+    // applied: the entry is stored and passed, its effect not built again, and the
+    // protocol told (Switch spec 12.5 "Kept batches").
     let report = app.receive(None).await.unwrap();
     assert!(
         has(&report.events, |e| matches!(
@@ -1988,6 +2277,7 @@ async fn test_key_change_parks_a_kept_effect_older_than_the_batch_window() {
     );
     assert!(!received(&report.events, seq), "{:?}", report.events);
     assert_eq!(conversations_at(&changed), 0);
+    assert_eq!(w.effects(), 1);
     assert!(app.cursor().seq >= seq);
     assert_eq!(
         app.state.parked.get(&seq).map(|p| p.reason),
@@ -2021,96 +2311,6 @@ async fn test_key_change_parks_a_kept_effect_older_than_the_batch_window() {
         "{loaded:?}"
     );
     assert!(loaded.iter().all(AppEvent::is_duty), "{loaded:?}");
-}
-
-#[tokio::test]
-async fn test_key_change_parks_a_kept_effect_that_outlives_the_window_before_its_resend() {
-    let w = World::new();
-    let router = Router::of(&w);
-    let mut app = join(&w, &router).await;
-    let me = app.app_id();
-    let (seq, message) = w.note(me, "before");
-    // The effect's batch is lost on its way at generation 1.
-    w.switch.fail_next(Fault::Unreachable {
-        path: "ops".into(),
-        after: 0,
-    });
-    assert!(app.receive(None).await.is_err());
-    let changed = change_key(&w, &router);
-    // Within the window at the switch it stays, to go again unchanged, but the new
-    // service can't be reached for it once the re-registration went.
-    changed.fail_next(Fault::Unreachable {
-        path: "ops".into(),
-        after: 1,
-    });
-    assert!(app.receive(None).await.is_err());
-    assert_eq!(app.cursor().generation, 2);
-    assert!(app.state.pending_effect.is_some());
-    // By its resend the answer can't tell any more: `409 stale_generation` doesn't show
-    // it was never applied, so the entry is stored and passed, not built again.
-    w.clock
-        .advance_ms(crate::app::provider::KEPT_BATCH_ANSWER_MS);
-    let report = app.receive(None).await.unwrap();
-    assert!(
-        has(&report.events, |e| matches!(
-            e,
-            AppEvent::EffectUncertain { seq: s, msg_id, .. }
-                if *s == seq && *msg_id == message.msg_id
-        )),
-        "{:?}",
-        report.events
-    );
-    assert!(!received(&report.events, seq), "{:?}", report.events);
-    assert!(app.state.pending_effect.is_none());
-    assert_eq!(
-        app.state.parked.get(&seq).map(|p| p.reason),
-        Some(ParkReason::Uncertain)
-    );
-    assert_eq!(conversations_at(&changed), 0);
-    assert!(app.cursor().seq >= seq);
-}
-
-#[tokio::test]
-async fn test_key_change_drops_a_kept_batch_that_outlives_the_window_before_its_resend() {
-    let w = World::new();
-    let router = Router::of(&w);
-    let mut app = lists_app(&w, &router).await;
-    let carol = IdentityKey::from_secret(seed("carol/identity")).public();
-    w.switch.fail_next(Fault::Unreachable {
-        path: "ops".into(),
-        after: 0,
-    });
-    assert!(app.submit_batch(contact_batch(carol)).await.is_err());
-    let changed = change_key(&w, &router);
-    changed.fail_next(Fault::Unreachable {
-        path: "ops".into(),
-        after: 0,
-    });
-    assert!(app.receive(None).await.is_err());
-    assert_eq!(app.cursor().generation, 2);
-    assert_eq!(app.kept_batches().await.unwrap().len(), 1);
-    w.clock
-        .advance_ms(crate::app::provider::KEPT_BATCH_ANSWER_MS);
-    // `409 stale_generation` past the window: dropped and reported, never signed again.
-    let report = app.receive(None).await.unwrap();
-    assert!(
-        has(&report.events, |e| matches!(
-            e,
-            AppEvent::KeptBatchDropped { .. }
-        )),
-        "{:?}",
-        report.events
-    );
-    assert!(
-        !has(&report.events, |e| matches!(
-            e,
-            AppEvent::KeptBatchSignedAgain { .. }
-        )),
-        "{:?}",
-        report.events
-    );
-    assert!(app.kept_batches().await.unwrap().is_empty());
-    assert_eq!(allow_ops_for(&changed.applied(), carol), 0);
 }
 
 /// The app at `store`, loaded through the loss's router.
@@ -2234,6 +2434,43 @@ async fn test_not_current_while_listed_with_its_own_certificate_is_final() {
     assert!(report.stopped);
     assert!(has(&report.events, |e| matches!(e, AppEvent::Removed)));
     assert_eq!(app.follow_provider().await.unwrap(), ProviderStatus::Gone);
+}
+
+#[tokio::test]
+async fn test_not_current_from_a_service_the_identity_left_follows_the_move() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join(&w, &router).await;
+    let me = app.app_id();
+    // The identity publishes generation 2 at another service, still listing the app with
+    // the certificate it holds.
+    let n_key = next_key();
+    let next = w.switch.import_into(n_key.to_bytes());
+    router.add(NEXT, &next);
+    publish_at(
+        &w,
+        &next,
+        Inbox::new(NEXT, n_key.verifying_key().to_bytes()),
+        2,
+        None,
+    );
+    // The old service answers `403 not_current`, which says nothing once the identity left
+    // it (Switch wire 7.2).
+    w.switch.fail_next(Fault::Error {
+        path: "feed".into(),
+        code: ErrorCode::NotCurrent,
+        current: json!({}),
+    });
+    let seq = note_at(&w, &next, me, "at the next service");
+    let report = app.receive(None).await.unwrap();
+    assert!(
+        !has(&report.events, |e| matches!(e, AppEvent::Removed)),
+        "{:?}",
+        report.events
+    );
+    assert!(received(&report.events, seq), "{:?}", report.events);
+    assert_eq!(app.cursor().generation, 2);
+    assert_ne!(app.follow_provider().await.unwrap(), ProviderStatus::Gone);
 }
 
 #[tokio::test]

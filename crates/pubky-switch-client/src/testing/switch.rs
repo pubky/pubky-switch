@@ -412,6 +412,18 @@ impl ScriptedSwitch {
     /// sequence, chain, apps, cursors and shared state, under its own service key (Switch
     /// spec 12.5 step 3). It serves once it is delivered an `identity.json` naming its key.
     pub fn import_into(&self, service_secret: [u8; 32]) -> Arc<Self> {
+        self.continue_into(service_secret, false)
+    }
+
+    /// The same account under a new service key at the next generation, a key change in
+    /// place: as [`ScriptedSwitch::import_into`], but the batch records keep their proofs,
+    /// so a batch sent again unchanged gets its original proofs, signed with the earlier
+    /// generation's key (Switch wire 6.4 step 6).
+    pub fn change_key_into(&self, service_secret: [u8; 32]) -> Arc<Self> {
+        self.continue_into(service_secret, true)
+    }
+
+    fn continue_into(&self, service_secret: [u8; 32], keep_proofs: bool) -> Arc<Self> {
         let inner = self.lock();
         let mut next = Inner::fresh(
             clone_key(&inner.identity),
@@ -433,13 +445,16 @@ impl ScriptedSwitch {
         next.apps = inner.apps.clone();
         next.bundles = inner.bundles.clone();
         next.kids = inner.kids.clone();
-        // Batch records travel without their proofs (Switch wire 10.1).
+        // An export carries batch records without their proofs (Switch wire 10.1); a key
+        // change in place keeps them.
         next.batches = inner
             .batches
             .iter()
             .map(|(id, record)| {
                 let mut record = record.clone();
-                record.proofs = None;
+                if !keep_proofs {
+                    record.proofs = None;
+                }
                 (*id, record)
             })
             .collect();

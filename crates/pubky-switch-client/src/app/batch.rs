@@ -769,7 +769,10 @@ impl App {
             Err(AppError::Switch(ClientError::Switch {
                 code: ErrorCode::StaleGeneration,
                 ..
-            })) if !super::provider::answer_decides(pending.kept_ms, self.now()) => {
+            })) if !super::provider::answer_decides(self.now(), pending.kept_ms) => {
+                // The service may have forgotten a batch it applied: past the window the
+                // answer decides nothing, and the batch goes (Switch spec 12.5 "Kept
+                // batches"), reported in the commit that drops it.
                 let mut tx = self.tx()?;
                 Self::replace_kept_batch(id, None, &mut tx)?;
                 self.kept_batch_dropped(id, batch, &mut tx)?;

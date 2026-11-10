@@ -156,6 +156,11 @@ pub(crate) mod key {
         format!("parked/{}", num(seq))
     }
 
+    /// A message whose kept effect may have been applied: its entry is parked when read.
+    pub(crate) fn uncertain(sender: &[u8; 32], msg_id: &str) -> String {
+        format!("uncert/{}/{msg_id}", pubky_id(sender))
+    }
+
     pub(crate) fn asked(seq: u64) -> String {
         format!("asked/{}", num(seq))
     }

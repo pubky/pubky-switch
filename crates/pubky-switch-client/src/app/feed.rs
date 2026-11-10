@@ -615,6 +615,25 @@ impl App {
             });
             return Ok(Step::Pass);
         }
+        // A kept effect that may have been applied: never built again (Switch spec 12.5
+        // "Kept batches").
+        let uncertain = key::uncertain(&entry.sender, &received.message.msg_id);
+        if self.reader().exists(&uncertain).await? {
+            read.tx.delete(&uncertain)?;
+            // The park and its duty events go in this read's commit, with the marker's
+            // deletion.
+            self.park(entry, &received.plaintext, ParkReason::Uncertain, read)?;
+            self.keep_duty(
+                &mut read.tx,
+                Duty::EffectUncertain {
+                    seq: entry.seq,
+                    sender: entry.sender,
+                    msg_id: received.message.msg_id.clone(),
+                    kind: received.message.kind.clone(),
+                },
+            )?;
+            return Ok(Step::Pass);
+        }
         self.apply(entry, received, parked, read).await
     }
 
@@ -1017,10 +1036,9 @@ impl App {
     /// batches", Switch wire 6.4 step 6). Its original proofs, or `409 conflict` after an
     /// import, show it applied, and its outcome commits; any other refusal for good, `409
     /// stale_generation` among them, means it wasn't: it goes, and its entry is read again
-    /// and its effect signed anew. That holds only while the answer can tell: once the
-    /// effect has been kept longer than the service holds batch IDs, it may have been
-    /// applied, so its entry is stored and passed instead ([`App::park_uncertain`]). Any
-    /// other failure keeps it.
+    /// and its effect signed anew. `409 stale_generation` tells that only while the service
+    /// still holds the batch's ID: past the window, the effect's entry is stored and
+    /// passed instead ([`App::effect_uncertain`]). Any other failure keeps it.
     async fn resend_earlier_effect(
         &mut self,
         pending: PendingEffect,
@@ -1032,16 +1050,14 @@ impl App {
                 code: ErrorCode::Conflict,
                 ..
             })) => Vec::new(),
+            Err(AppError::Switch(ClientError::Switch {
+                code: ErrorCode::StaleGeneration,
+                ..
+            })) if !super::provider::answer_decides(self.now(), pending.kept_ms) => {
+                return self.effect_uncertain(&pending).await;
+            }
             Err(error) if refused_for_good(&error).is_some() => {
-                if super::provider::answer_decides(pending.kept_ms, self.now()) {
-                    return self.drop_pending_effect().await;
-                }
-                let mut tx = self.tx()?;
-                tx.delete(key::PENDING_EFFECT)?;
-                self.state.pending_effect = None;
-                self.park_uncertain(&pending, &mut tx)?;
-                tx.put(key::CURSOR, &self.state.cursor)?;
-                return self.commit(tx).await;
+                return self.drop_pending_effect().await;
             }
             Err(error) => return Err(error),
         };
@@ -1053,6 +1069,83 @@ impl App {
             sender: pending.sender,
         });
         Ok(())
+    }
+
+    /// A kept effect answered `409 stale_generation` past the window in which that answer
+    /// means it was never applied (Switch spec 12.5 "Kept batches"): the service may have
+    /// forgotten a batch it applied, so the effect goes and is never built again. Its entry
+    /// is stored and passed, and the protocol told, in the commit that drops it
+    /// ([`App::park_uncertain`]); an effect kept without its entry, by an earlier build,
+    /// leaves a marker in that commit instead, and its entry is stored when the feed shows
+    /// it again.
+    async fn effect_uncertain(&mut self, pending: &PendingEffect) -> Result<(), AppError> {
+        let mut tx = self.tx()?;
+        tx.delete(key::PENDING_EFFECT)?;
+        if !self.park_uncertain(pending, &mut tx)? {
+            tx.put(&key::uncertain(&pending.sender, &pending.msg_id), &())?;
+        }
+        tx.put(key::CURSOR, &self.state.cursor)?;
+        self.state.pending_effect = None;
+        self.commit(tx).await
+    }
+
+    /// The entry of a kept effect whose fate can't be known: building the effect again
+    /// could apply it twice, so the entry is stored locally and passed, like an effect
+    /// refused for good (Switch spec 8.2), and the protocol is told ([`Duty::Parked`],
+    /// [`Duty::EffectUncertain`]), all in `tx`; it decides from the current state. One
+    /// stored before only changes its reason. Returns `false`, writing nothing, for an
+    /// effect kept without its entry.
+    fn park_uncertain(&mut self, pending: &PendingEffect, tx: &mut Tx) -> Result<bool, AppError> {
+        let reason = ParkReason::Uncertain;
+        let parked = match (self.state.parked.get(&pending.seq), &pending.entry) {
+            (Some(stored), _) if pending.parked => ParkedEntry {
+                reason,
+                ..stored.clone()
+            },
+            (_, Some(entry)) => ParkedEntry {
+                sender: pending.sender,
+                cert: entry.cert.clone(),
+                accepted_at_ms: pending.accepted_at_ms,
+                plaintext: entry.plaintext.clone(),
+                context: entry.context.clone(),
+                reason,
+            },
+            _ => return Ok(false),
+        };
+        tx.put(&key::parked(pending.seq), &parked)?;
+        self.state.parked.insert(pending.seq, parked);
+        if pending.parked {
+            // Stored before, and passed then.
+        } else if pending.past_held {
+            tx.put(&key::seen(pending.seq), &())?;
+            self.state.seen.insert(pending.seq);
+        } else {
+            let now = self.now();
+            let cursor = &mut self.state.cursor;
+            cursor.seq = cursor.seq.max(pending.seq);
+            cursor.time_ms = cursor.time_ms.max(pending.accepted_at_ms);
+            if cursor.seq > cursor.at_service && cursor.deferred_since_ms.is_none() {
+                cursor.deferred_since_ms = Some(now);
+            }
+        }
+        // Duty events, kept in `tx`, the commit that stores the entry.
+        self.keep_duty(
+            tx,
+            Duty::Parked {
+                seq: pending.seq,
+                reason,
+            },
+        )?;
+        self.keep_duty(
+            tx,
+            Duty::EffectUncertain {
+                seq: pending.seq,
+                sender: pending.sender,
+                msg_id: pending.msg_id.clone(),
+                kind: pending.kind.clone(),
+            },
+        )?;
+        Ok(true)
     }
 
     async fn drop_pending_effect(&mut self) -> Result<(), AppError> {
@@ -1591,6 +1684,8 @@ impl App {
 
     /// Take an own copy outside the feed and commit what it changed.
     pub(crate) async fn take_own_copy(&mut self, doc: IdentityDoc) -> Result<bool, AppError> {
+        // A published `identity.json`: the erasure wait starts over (Switch spec 12.7).
+        self.clear_erasing().await?;
         let version = self.state.own_doc.version();
         let mut read = Read::outside(self.tx()?);
         let result = self.own_identity_copy(doc, &mut read).await;

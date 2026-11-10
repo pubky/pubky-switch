@@ -365,6 +365,11 @@ pub enum AppEvent {
     /// The account the app used is gone: the service answers as for an identity it doesn't
     /// host and the identity publishes no `identity.json` (Switch spec 12.7).
     AccountGone,
+    /// An account taken as erased was seen alive again: the identity publishes an
+    /// `identity.json` listing the app (Switch spec 12.7). The app reads on; its push
+    /// registration, which the service dropped, is set again with
+    /// [`super::App::reregister_push`].
+    AccountBack,
     /// The app's push registration is set (Switch spec 9 steps 1 to 3).
     PushRegistered {
         /// The handles the service keeps.

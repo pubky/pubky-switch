@@ -20,11 +20,12 @@
 //! - **A key change in place**, or a move the app never saw frozen, is followed the same way
 //!   from the switch on.
 //! - **Revocation and erasure.** An own `identity.json` that lists the app in `removed`, or a
-//!   `403 not_current` answer while the newest one doesn't list the app with another
-//!   certificate, means the app isn't current; a `404` that the account's key didn't sign,
-//!   while the identity publishes no `identity.json`, held at every try for
-//!   [`ERASURE_WAIT_MS`], means its account is gone. The app keeps that, stops, reports it
-//!   and drops its push setting.
+//!   `403 not_current` answer from the service and generation the newest one names, while
+//!   it doesn't list the app with another certificate, means the app isn't current. A `404`
+//!   that the account's key didn't sign, while the identity publishes no `identity.json`,
+//!   held at [`ERASURE_TRIES`] tries spread over [`ERASURE_WAIT_MS`], means its account is
+//!   gone. The app keeps that, stops and reports it; an erased account seen alive again
+//!   comes back.
 
 use pubky_switch_core::claims::ClaimType;
 use pubky_switch_core::enc::{b64, pubky_id, pubky_key, serde_b64, serde_b64_vec};
@@ -36,10 +37,10 @@ use pubky_switch_core::sig::SignedDoc;
 use serde::{Deserialize, Serialize};
 
 use super::error::{Alarm, AppError};
-use super::events::{AppEvent, Duty, ParkReason};
+use super::events::{AppEvent, Duty};
 use super::feed::{ReceiveReport, processed_writes};
 use super::identity;
-use super::state::{ParkedEntry, PendingEffect, Tx, key};
+use super::state::{Tx, key};
 use super::{App, OpBatch, push};
 use crate::client::answers::{FeedQuery, RecoveryUpload};
 use crate::client::{Batch, Credentials, SwitchClient};
@@ -129,11 +130,28 @@ pub(crate) enum GoneReason {
 /// erasure, and a Homeserver fault can read as a missing file.
 pub(crate) const ERASURE_WAIT_MS: u64 = DAY_MS;
 
+/// How many tries must meet an erased account, each at least [`ERASURE_TRY_SPACING_MS`]
+/// after the one counted before, so the wait spans [`ERASURE_WAIT_MS`] at the least. No
+/// answer in the wait carries a time any key vouches for, so the app's clock is the only
+/// measure: spread over separate tries, one forward jump of it counts one try, never the
+/// whole wait.
+pub(crate) const ERASURE_TRIES: u32 = 5;
+
+/// The least time, app clock, between two tries the erasure wait counts.
+pub(crate) const ERASURE_TRY_SPACING_MS: u64 = ERASURE_WAIT_MS / 4;
+
 /// `erasing`: since when, app clock, every try has met an unsigned `404` and no
-/// `identity.json` (Switch spec 12.7).
+/// `identity.json`, and the tries counted (Switch spec 12.7).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ErasingRecord {
+    /// The first try, app clock.
     pub(crate) since_ms: u64,
+    /// The last try counted, app clock.
+    #[serde(default)]
+    pub(crate) last_ms: u64,
+    /// The tries counted.
+    #[serde(default)]
+    pub(crate) tries: u32,
 }
 
 /// `gone`: the app isn't current any more, or its account is gone.
@@ -204,11 +222,11 @@ pub(crate) enum Carry {
 /// 12.5 "Kept batches", 6.3).
 pub(crate) const KEPT_BATCH_ANSWER_MS: u64 = 30 * DAY_MS - CLOCK_TOLERANCE_MS;
 
-/// Whether a resend's answer still tells whether a batch kept at `kept_ms` was applied, at
-/// `now` (Switch spec 12.5 "Kept batches"). A batch kept without its time is from before
-/// the app kept it, and is let the answer decide.
-pub(crate) fn answer_decides(kept_ms: Option<u64>, now: u64) -> bool {
-    kept_ms.is_none_or(|at| now.saturating_sub(at) < KEPT_BATCH_ANSWER_MS)
+/// Whether a resend of a batch kept at `kept_ms` still tells whether it was applied, at
+/// `now`: kept less than [`KEPT_BATCH_ANSWER_MS`] ago. A batch without a time, kept by an
+/// earlier build, counts as too old.
+pub(crate) fn answer_decides(now: u64, kept_ms: Option<u64>) -> bool {
+    kept_ms.is_some_and(|at| now.saturating_sub(at) < KEPT_BATCH_ANSWER_MS)
 }
 
 /// How many provider changes one follow takes in a row, each given up for a newer own
@@ -311,7 +329,6 @@ impl App {
     ) -> Result<TakeOver, AppError> {
         let error = match result {
             Ok(report) => {
-                self.clear_erasing().await?;
                 if report.stopped && self.provider_change_due().await? {
                     return Ok(TakeOver::ReadAgain);
                 }
@@ -339,10 +356,12 @@ impl App {
                 if self.state.leave.is_some() {
                     return Ok(TakeOver::Done(Err(error)));
                 }
-                // Switch wire 7.2: final unless the newest identity.json lists the app with
-                // another certificate than the one it holds, a renewal it takes before it
-                // asks again. Listed with its own, listed in `removed` or not listed, it is
-                // revoked, departed or dropped (Switch spec 12.2, 12.3). Without a read of
+                // Switch wire 7.2: final only from the service and generation the newest
+                // identity.json names, and unless it lists the app with another certificate
+                // than the one it holds, a renewal it takes before it asks again. Listed with
+                // its own, listed in `removed` or not listed, it is revoked, departed or
+                // dropped (Switch spec 12.2, 12.3). A service the identity has left may say
+                // anything: the app follows the newer document instead. Without a read of
                 // the Homeserver, the newest isn't known: the answer stands for now.
                 let identity = self.state.meta.identity;
                 match identity::read_homeserver(self.env.homeserver.as_ref(), &identity).await {
@@ -352,8 +371,14 @@ impl App {
                     Ok(None) => {}
                     Err(_) => return Ok(TakeOver::Done(Err(error))),
                 }
-                let me = self.state.meta.app_id;
+                let meta = &self.state.meta;
                 let doc = &self.state.own_doc;
+                if doc.generation() > meta.generation
+                    || doc.inbox() != &Inbox::new(&meta.origin, meta.service_key)
+                {
+                    return Ok(TakeOver::ReadAgain);
+                }
+                let me = self.state.meta.app_id;
                 if !doc.lists_removed(&me)
                     && doc
                         .listed_cert(&me)
@@ -419,7 +444,9 @@ impl App {
     /// (Switch spec 12.5 "Abort", 12.6), at most [`FOLLOW_PASSES`] times in a row.
     async fn provider_step(&mut self) -> Result<ProviderStatus, AppError> {
         let reader = self.reader();
-        if let Some(gone) = reader.get::<GoneRecord>(keys::GONE).await? {
+        if let Some(gone) = reader.get::<GoneRecord>(keys::GONE).await?
+            && !(gone.reason == GoneReason::Erased && self.revive_erased().await?)
+        {
             self.events.push(gone_event(gone.reason));
             return Ok(ProviderStatus::Gone);
         }
@@ -971,8 +998,9 @@ impl App {
     /// - **With [`Carry::ResendFirst`],** a kept batch or effect the chain doesn't show
     ///   applied stays as it is, to be sent again unchanged, and its answer decides (Switch
     ///   spec 12.5 "Kept batches"). One kept longer than the service holds batch IDs, 30
-    ///   days less the clock tolerance, goes instead: a batch reported as dropped, an
-    ///   effect with its entry stored locally and passed ([`App::park_uncertain`]).
+    ///   days less the clock tolerance, goes instead, reported as dropped. A kept effect
+    ///   stays whatever its age: when the answer can't decide, its entry is stored and
+    ///   passed, never applied again.
     ///
     /// Returns the informational events to report once `tx` commits; the duty events are
     /// kept in `tx`, and reported by its commit.
@@ -984,19 +1012,18 @@ impl App {
         let mut events = Vec::new();
         let now = self.now();
         let resend_first = carry == Carry::ResendFirst;
-        let answer_decides = |kept_ms: Option<u64>| answer_decides(kept_ms, now);
+        let answer_decides = |kept_ms: Option<u64>| answer_decides(now, kept_ms);
         if let Some(pending) = self.state.pending_effect.clone() {
             let applied = Batch::from_body(pending.body.clone())?
                 .id()
                 .is_some_and(|id| self.applied_by_old_service(&id));
-            let answerable = answer_decides(pending.kept_ms);
-            let stays = !applied && resend_first && answerable;
+            // A kept effect stays to be sent again whatever its age: an answer that can't
+            // decide parks its entry instead of building the effect again
+            // (`feed.rs`).
+            let stays = !applied && resend_first;
             if !stays {
                 tx.delete(key::PENDING_EFFECT)?;
                 self.state.pending_effect = None;
-            }
-            if !applied && resend_first && !answerable {
-                self.park_uncertain(&pending, tx)?;
             }
             if applied {
                 let now = self.now();
@@ -1069,67 +1096,6 @@ impl App {
             });
         }
         Ok(events)
-    }
-
-    /// A kept effect the chain doesn't show applied, kept longer than a resend's answer can
-    /// tell whether it was (Switch spec 12.5 "Kept batches"): building it again could apply
-    /// it twice, so its entry is stored locally and passed, like an effect refused for good
-    /// (Switch spec 8.2), and the protocol is told; it decides from the current state. A
-    /// kept effect written without its entry can't be stored: its entry is read again.
-    pub(crate) fn park_uncertain(
-        &mut self,
-        pending: &PendingEffect,
-        tx: &mut Tx,
-    ) -> Result<(), AppError> {
-        let reason = ParkReason::Uncertain;
-        let parked = match (self.state.parked.get(&pending.seq), &pending.entry) {
-            (Some(stored), _) if pending.parked => ParkedEntry {
-                reason,
-                ..stored.clone()
-            },
-            (_, Some(entry)) => ParkedEntry {
-                sender: pending.sender,
-                cert: entry.cert.clone(),
-                accepted_at_ms: pending.accepted_at_ms,
-                plaintext: entry.plaintext.clone(),
-                context: entry.context.clone(),
-                reason,
-            },
-            _ => return Ok(()),
-        };
-        tx.put(&key::parked(pending.seq), &parked)?;
-        self.state.parked.insert(pending.seq, parked);
-        if pending.parked {
-            // Stored before, and passed then.
-        } else if pending.past_held {
-            tx.put(&key::seen(pending.seq), &())?;
-            self.state.seen.insert(pending.seq);
-        } else {
-            let now = self.now();
-            let cursor = &mut self.state.cursor;
-            cursor.seq = cursor.seq.max(pending.seq);
-            cursor.time_ms = cursor.time_ms.max(pending.accepted_at_ms);
-            if cursor.seq > cursor.at_service && cursor.deferred_since_ms.is_none() {
-                cursor.deferred_since_ms = Some(now);
-            }
-        }
-        // Duty events, kept in `tx`, the commit that stores the entry.
-        self.keep_duty(
-            tx,
-            Duty::Parked {
-                seq: pending.seq,
-                reason,
-            },
-        )?;
-        self.keep_duty(
-            tx,
-            Duty::EffectUncertain {
-                seq: pending.seq,
-                sender: pending.sender,
-                msg_id: pending.msg_id.clone(),
-                kind: pending.kind.clone(),
-            },
-        )
     }
 
     /// A kept batch dropped at a provider change: reported, with each `attempt` in it, so
@@ -1462,8 +1428,11 @@ impl App {
     // ---------------------------------------------------------------------------------
     // Revocation and erasure (Switch spec 12.2, 12.7)
 
-    /// The app isn't current any more, or its account is gone: kept, reported, and the
-    /// push setting, which the service drops with it, goes too.
+    /// The app isn't current any more, or its account is gone: kept and reported. The
+    /// service drops the push registration with it. An app that isn't current drops its push
+    /// setting and the other devices' handles; an erased account may be seen alive again
+    /// ([`App::revive_erased`]), so its setting is kept, only no longer set, for
+    /// [`App::reregister_push`].
     pub(crate) async fn mark_gone(&mut self, reason: GoneReason) -> Result<(), AppError> {
         let gone = GoneRecord {
             reason,
@@ -1471,18 +1440,56 @@ impl App {
         };
         let mut tx = self.tx()?;
         tx.put(keys::GONE, &gone)?;
-        let had_push = self.reader().exists(push::KEY).await?;
-        if had_push {
-            tx.delete(push::KEY)?;
+        tx.delete(keys::ERASING)?;
+        let held = self.push_record().await?;
+        let had_push = held.is_some();
+        match (reason, held) {
+            (GoneReason::Erased, Some(mut record)) => {
+                record.push_key = None;
+                record.handle = None;
+                record.set = false;
+                record.handles = 0;
+                record.replacing = None;
+                tx.put(push::KEY, &record)?;
+            }
+            (GoneReason::Erased, None) => {}
+            (GoneReason::NotCurrent, _) => {
+                tx.delete(push::KEY)?;
+                tx.delete(push::DEVICES_KEY)?;
+            }
         }
-        tx.delete(push::DEVICES_KEY)?;
         self.commit(tx).await?;
         self.state.gone = Some(gone);
+        self.state.erasing = None;
         if had_push {
             self.events.push(AppEvent::PushRemoved);
         }
         self.events.push(gone_event(reason));
         Ok(())
+    }
+
+    /// An erased account seen alive again: the identity publishes an `identity.json` that
+    /// lists the app (Switch spec 12.7). `gone` goes, the copy is taken, and the app reads
+    /// on; one that lists it no longer, or in `removed`, is followed as any copy is.
+    /// Returns whether the app came back.
+    async fn revive_erased(&mut self) -> Result<bool, AppError> {
+        let identity = self.state.meta.identity;
+        let Ok(Some(doc)) =
+            identity::read_homeserver(self.env.homeserver.as_ref(), &identity).await
+        else {
+            return Ok(false);
+        };
+        let me = self.state.meta.app_id;
+        if doc.listed_cert(&me).is_none() || doc.lists_removed(&me) {
+            return Ok(false);
+        }
+        let mut tx = self.tx()?;
+        tx.delete(keys::GONE)?;
+        self.commit(tx).await?;
+        self.state.gone = None;
+        self.take_own_copy(doc).await?;
+        self.events.push(AppEvent::AccountBack);
+        Ok(true)
     }
 
     /// An answer the account's key didn't sign. A newer own `identity.json` is followed: a
@@ -1505,7 +1512,6 @@ impl App {
                 Ok(Unknown::Gone)
             }
             Ok(Some(doc)) => {
-                self.clear_erasing().await?;
                 self.take_own_copy(doc).await?;
                 if self.state.own_doc.generation() > self.state.meta.generation {
                     Ok(Unknown::Moved)
@@ -1522,26 +1528,50 @@ impl App {
     }
 
     /// Note an unsigned `404` with no `identity.json` published, and say whether both have
-    /// held since at least [`ERASURE_WAIT_MS`] ago (Switch spec 12.7).
+    /// held at [`ERASURE_TRIES`] tries spaced [`ERASURE_TRY_SPACING_MS`] apart, over at
+    /// least [`ERASURE_WAIT_MS`] (Switch spec 12.7). A try sooner after the last one counted
+    /// adds nothing; a clock gone back starts the wait over.
     async fn erasure_held(&mut self) -> Result<bool, AppError> {
         let now = self.now();
-        if let Some(seen) = self.reader().get::<ErasingRecord>(keys::ERASING).await? {
-            return Ok(now.saturating_sub(seen.since_ms) >= ERASURE_WAIT_MS);
+        let first = ErasingRecord {
+            since_ms: now,
+            last_ms: now,
+            tries: 1,
+        };
+        let record = match self.state.erasing {
+            Some(seen) if now >= seen.last_ms && now >= seen.since_ms => {
+                if now.saturating_sub(seen.last_ms) >= ERASURE_TRY_SPACING_MS {
+                    ErasingRecord {
+                        last_ms: now,
+                        tries: seen.tries.saturating_add(1),
+                        ..seen
+                    }
+                } else {
+                    seen
+                }
+            }
+            _ => first,
+        };
+        if self.state.erasing != Some(record) {
+            let mut tx = self.tx()?;
+            tx.put(keys::ERASING, &record)?;
+            self.commit(tx).await?;
+            self.state.erasing = Some(record);
         }
-        let mut tx = self.tx()?;
-        tx.put(keys::ERASING, &ErasingRecord { since_ms: now })?;
-        self.commit(tx).await?;
-        Ok(false)
+        Ok(record.tries >= ERASURE_TRIES && now.saturating_sub(record.since_ms) >= ERASURE_WAIT_MS)
     }
 
-    /// A try that met something other than an erased account starts the wait over.
-    async fn clear_erasing(&mut self) -> Result<(), AppError> {
-        if !self.reader().exists(keys::ERASING).await? {
+    /// A try that met something other than an erased account, an answer verified with the
+    /// pinned key or a published `identity.json`, starts the wait over.
+    pub(crate) async fn clear_erasing(&mut self) -> Result<(), AppError> {
+        if self.state.erasing.is_none() {
             return Ok(());
         }
         let mut tx = self.tx()?;
         tx.delete(keys::ERASING)?;
-        self.commit(tx).await
+        self.commit(tx).await?;
+        self.state.erasing = None;
+        Ok(())
     }
 }
 

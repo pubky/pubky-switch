@@ -31,9 +31,10 @@
 //! Only a refusal for good marks a message failed: the Retry column of Switch spec 6.4 says
 //! "No". `403 not_admitted` and `403 not_current` stay queued, as admission changes when the
 //! counterparty adds a contact or an invite, and a certificate renewal makes the app current
-//! again (Switch spec 7, Switch wire 3.8), but for at most [`UNDELIVERABLE_MS`] from the
-//! first such answer: then the message is deleted, plaintext and all, and
-//! [`AppEvent::MessageUndelivered`] tells the protocol (Switch spec 11). A failed message
+//! again (Switch spec 7, Switch wire 3.8), but only for [`UNDELIVERABLE_MS`] from the
+//! first such answer: once a try is answered so again past that time, at
+//! [`UNDELIVERABLE_TRIES`] tries spread over it, the message is deleted, plaintext and all,
+//! and [`AppEvent::MessageUndelivered`] tells the protocol (Switch spec 11). A failed message
 //! is forgotten, plaintext and all, after the retention of sent messages.
 
 use pubky_switch_core::enc::{serde_b64, serde_b64_vec};
@@ -63,6 +64,15 @@ pub const SENT_RETENTION_MS: u64 = 30 * DAY_MS;
 /// How long a message answered `403 not_admitted` or `403 not_current` stays queued, from
 /// the first such answer: 30 days (Switch spec 11).
 pub const UNDELIVERABLE_MS: u64 = 30 * DAY_MS;
+
+/// How many tries answered `403 not_admitted` or `403 not_current`, each at least
+/// [`UNDELIVERABLE_TRY_SPACING_MS`] after the one counted before, a message needs before it
+/// is given up: the 30 days are measured on the app's clock, and spread over separate tries
+/// one forward jump of it counts one try, never the whole wait.
+pub const UNDELIVERABLE_TRIES: u32 = 5;
+
+/// The least time, app clock, between two tries [`UNDELIVERABLE_TRIES`] counts.
+pub const UNDELIVERABLE_TRY_SPACING_MS: u64 = UNDELIVERABLE_MS / 4;
 
 /// How many times one delivery seals again after `409 stale_key` before it waits for the
 /// next flush.
@@ -355,6 +365,12 @@ pub(crate) struct OutboxItem {
     /// The first `403 not_admitted` or `403 not_current` answer to a delivery, app clock.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     undeliverable_ms: Option<u64>,
+    /// The last such answer counted, app clock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    undeliverable_last_ms: Option<u64>,
+    /// The such answers counted ([`UNDELIVERABLE_TRIES`]).
+    #[serde(default)]
+    undeliverable_tries: u32,
 }
 
 impl std::fmt::Debug for OutboxItem {
@@ -375,6 +391,32 @@ impl OutboxItem {
     /// Whether a delivery is owed: never accepted, or a re-send asked since.
     fn delivery_owed(&self) -> bool {
         self.accepted_at_ms.is_none() || self.resend
+    }
+
+    /// Count a `403 not_admitted` or `403 not_current` answer at `now`: the first starts the
+    /// wait, a later one counts once [`UNDELIVERABLE_TRY_SPACING_MS`] passed since the last
+    /// counted, and a clock gone back starts the wait over.
+    fn count_undeliverable(&mut self, now: u64) {
+        match (self.undeliverable_ms, self.undeliverable_last_ms) {
+            (Some(since), last) if now >= since && last.is_none_or(|last| now >= last) => {
+                let last = last.unwrap_or(since);
+                if now.saturating_sub(last) >= UNDELIVERABLE_TRY_SPACING_MS {
+                    self.undeliverable_last_ms = Some(now);
+                    self.undeliverable_tries = self.undeliverable_tries.saturating_add(1);
+                }
+            }
+            _ => {
+                self.undeliverable_ms = Some(now);
+                self.undeliverable_last_ms = Some(now);
+                self.undeliverable_tries = 1;
+            }
+        }
+    }
+
+    fn clear_undeliverable(&mut self) {
+        self.undeliverable_ms = None;
+        self.undeliverable_last_ms = None;
+        self.undeliverable_tries = 0;
     }
 
     fn plaintext(&self) -> Result<MessagePlaintext, AppError> {
@@ -565,6 +607,8 @@ impl App {
             failed_ms: None,
             resend: false,
             undeliverable_ms: None,
+            undeliverable_last_ms: None,
+            undeliverable_tries: 0,
         })
     }
 
@@ -648,6 +692,8 @@ impl App {
             failed_ms: None,
             resend: false,
             undeliverable_ms: None,
+            undeliverable_last_ms: None,
+            undeliverable_tries: 0,
         };
         let mut tx = self.tx()?;
         tx.put(&out_key(&item.msg_id), &item)?;
@@ -819,9 +865,6 @@ impl App {
         if item.failed.is_some() {
             return Ok(false);
         }
-        if self.drop_undeliverable(&mut item).await? {
-            return Ok(true);
-        }
         item.tries = item.tries.saturating_add(1);
         if item.conversation {
             match self.conversation_entry(&item.to).await {
@@ -844,7 +887,7 @@ impl App {
                 }
                 Tried::Undeliverable(why) => {
                     item.last_error = Some(why);
-                    item.undeliverable_ms.get_or_insert(self.now());
+                    item.count_undeliverable(self.now());
                     self.save_item(&item).await?;
                     if self.drop_undeliverable(&mut item).await? {
                         return Ok(true);
@@ -875,21 +918,24 @@ impl App {
     }
 
     /// End a delivery answered `403 not_admitted` or `403 not_current` for
-    /// [`UNDELIVERABLE_MS`] (Switch spec 11): a message never accepted is deleted, plaintext
-    /// and all; a re-send is no longer owed. The protocol is told. Returns whether the
-    /// delivery was given up.
+    /// [`UNDELIVERABLE_MS`], at [`UNDELIVERABLE_TRIES`] spaced tries, the last one this
+    /// flush's (Switch spec 11): a message never accepted is deleted, plaintext and all; a
+    /// re-send is no longer owed. The protocol is told. Returns whether the delivery was
+    /// given up.
     async fn drop_undeliverable(&mut self, item: &mut OutboxItem) -> Result<bool, AppError> {
         let Some(since) = item.undeliverable_ms else {
             return Ok(false);
         };
-        if self.now().saturating_sub(since) < UNDELIVERABLE_MS {
+        if item.undeliverable_tries < UNDELIVERABLE_TRIES
+            || self.now().saturating_sub(since) < UNDELIVERABLE_MS
+        {
             return Ok(false);
         }
         // A re-send: of an item accepted before, or queued again from `sent/`.
         let resend =
             item.accepted_at_ms.is_some() || self.reader().exists(&sent_key(&item.msg_id)).await?;
         item.resend = false;
-        item.undeliverable_ms = None;
+        item.clear_undeliverable();
         let gone = item.accepted_at_ms.is_none() || item.complete();
         let mut tx = self.tx()?;
         if gone {
@@ -928,7 +974,7 @@ impl App {
         let first = *item.accepted_at_ms.get_or_insert(at);
         item.resend = false;
         item.last_error = None;
-        item.undeliverable_ms = None;
+        item.clear_undeliverable();
         let mut tx = self.tx()?;
         tx.put(&out_key(&item.msg_id), &*item)?;
         let sent = match self

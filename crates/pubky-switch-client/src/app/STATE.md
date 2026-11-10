@@ -63,7 +63,8 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
 | `proct/<time>/<sender>/<msg_id>` | the time index for pruning processed pairs | |
 | `seen/<seq>` | an entry processed past a held one | |
 | `held/<seq>` | an entry held because its sender can't be checked, since when | |
-| `parked/<seq>` | an entry stored locally and passed: the opened plaintext, sender, certificate, time, reason (an unverifiable sender or a quota, tried again; an effect refused for good, over one batch, or kept past the batch ID window, not tried again) | yes |
+| `parked/<seq>` | an entry stored locally and passed: the opened plaintext, sender, certificate, time, reason (an unverifiable sender or a quota, tried again; an effect refused for good, over one batch, or kept past the window in which its resend tells whether it was applied, not tried again) | yes |
+| `uncert/<sender>/<msg_id>` | a message whose kept effect may have been applied, kept without its entry by an earlier build: its entry is parked when the feed shows it again, and the protocol told in that commit | |
 | `asked/<seq>` | a re-send was handed to the protocol for this item | |
 | `owed/<generation>/<seq>` | a re-send or missed-entries call about this item that the protocol answered with an error: written in the commit that passes the item, made again at the start of each read, and gone in the commit of its answer's writes | |
 | `departed/<app_id>` | another own app's departure verified in the chain, and its time | |
@@ -105,7 +106,7 @@ uploads; `push.rs` holds the push registration. The peek (`peek.rs`) writes noth
 | `push` | the push setting: relay, device token, the service it is at, the push key, the handle, whether set, a rotation in flight | the device token |
 | `push/devices` | the handles of the app's other devices and the push key they are bound to, from the host's device sync, merged into the handles this device sets | the handles |
 | `gone` | the app isn't current any more, or its account is gone, and since when | |
-| `erasing` | since when every try met an unsigned `404` and no published `identity.json` | |
+| `erasing` | since when every try met an unsigned `404` and no published `identity.json`, the last try counted and how many were | |
 
 - **A move** commits each step: `Seen` (the freeze verified and kept), `Read` (the old feed
   read to its end, its chain view saved), `Uploaded` (the evidence sent to the next
@@ -120,10 +121,11 @@ uploads; `push.rs` holds the push registration. The peek (`peek.rs`) writes noth
   frozen service's `410 moved` keeps them for the switch. A move the app never saw frozen,
   or a key change in place, didn't read the old feed to its end: its kept batches and
   effect stay unchanged and go again first, and the answer decides (original proofs or
-  `409 conflict`: applied; `409 stale_generation`: signed again); one kept 30 days less
-  the clock tolerance or more goes instead. Such an effect may have been applied, so its
-  entry isn't read again: it is stored in `parked/` and passed in the switch's commit, and
-  the protocol is told (`EffectUncertain`).
+  `409 conflict`: applied; `409 stale_generation`: signed again). Past 30 days less the
+  clock tolerance from when it was kept, at the switch or at any later resend, or with no
+  time kept, `409 stale_generation` decides nothing: a batch goes, reported as dropped,
+  and an effect's entry is parked in the commit that drops the effect, never applied
+  again, and the protocol is told (`EffectUncertain`).
 - **A newer own `identity.json`** that names a later generation, a loss of the generation
   moved from, or another service than the freeze, supersedes a move or a loss at any step,
   a stuck one included: after a step fails at a service the app reads its `identity.json`
@@ -139,13 +141,17 @@ uploads; `push.rs` holds the push registration. The peek (`peek.rs`) writes noth
 - **`gone`** stops every read; `push` goes with it. It is kept only once the newest verified
   own `identity.json` removes the app or doesn't list it, a `403 not_current` came while it
   lists the app with the certificate the app holds, or the account is erased: an unsigned
-  `404` and no published `identity.json` at every try for 24 hours, which `erasing` times.
+  `404` and no published `identity.json` at every try, counted at 5 tries at least 6 hours
+  apart by the app's clock, which `erasing` times. Any answer the account's key signs, or a
+  published `identity.json`, ends `erasing`. An erased account seen alive again, its
+  `identity.json` published and listing the app, ends `gone`: its `push` setting is kept,
+  no longer set, and the other devices' handles too; an app that isn't current drops both.
 
 ## Sending, admission, records and claims
 
 | Key | Holds | Sensitive |
 |---|---|---|
-| `out/<msg_id>` | a queued message, queued alone or with the answer of the batch that carried it: its signed plaintext, signed once, the envelope sealed for one try with its `apps_version`, its jobs (conversation entry, delivery, record) and where each stands, a re-send owed, when it was refused for good, and when a delivery was first answered `403 not_admitted` or `403 not_current`; a failed one goes after the sent-message retention, an undeliverable one 30 days after that first answer | yes |
+| `out/<msg_id>` | a queued message, queued alone or with the answer of the batch that carried it: its signed plaintext, signed once, the envelope sealed for one try with its `apps_version`, its jobs (conversation entry, delivery, record) and where each stands, a re-send owed, when it was refused for good, and when a delivery was first and last answered `403 not_admitted` or `403 not_current`, with the answers counted at least 7.5 days apart; a failed one goes after the sent-message retention, an undeliverable one when a try is answered so again 30 days after that first answer and 5 answers were counted | yes |
 | `sent/<msg_id>` | a message the recipient's inbox accepted, written in the commit that records the acceptance, kept 30 days from its first acceptance for re-sends | yes |
 | `sentt/<time>/<msg_id>` | the time index for pruning sent messages | |
 | `dir/<pubky>` | a counterparty's directory as signed, the switch, generation and `identity.json` version it was read under, its versions, and whether it is read again before the next send | |

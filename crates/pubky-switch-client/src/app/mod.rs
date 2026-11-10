@@ -92,7 +92,7 @@ pub use records::{
 };
 pub use send::{
     Delivery, OutboxReport, OutgoingMessage, RecordJob, SENT_RETENTION_MS, SentMessage,
-    SignedMessage, UNDELIVERABLE_MS,
+    SignedMessage, UNDELIVERABLE_MS, UNDELIVERABLE_TRIES, UNDELIVERABLE_TRY_SPACING_MS,
 };
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -397,6 +397,8 @@ pub(crate) struct AppState {
     pub(crate) gone: Option<provider::GoneRecord>,
     /// The ID the next duty event takes (`dutyn`).
     pub(crate) next_duty: u64,
+    /// The wait before the account counts as erased, while it runs.
+    pub(crate) erasing: Option<provider::ErasingRecord>,
 }
 
 /// One app of an identity, on top of the Switch.
@@ -557,6 +559,7 @@ impl App {
                 service_time: None,
                 gone: None,
                 next_duty: FIRST_DUTY,
+                erasing: None,
             };
             let mut app = App {
                 env,
@@ -756,6 +759,7 @@ impl App {
             service_time: reader.get(key::SERVICE_TIME).await?,
             gone: reader.get(provider::keys::GONE).await?,
             next_duty: Self::next_duty(reader).await?,
+            erasing: reader.get(provider::keys::ERASING).await?,
             meta,
         })
     }
@@ -926,6 +930,7 @@ impl App {
                 service_time: None,
                 gone: None,
                 next_duty: FIRST_DUTY,
+                erasing: None,
             };
             let ns = client_namespace(&meta.app_id);
             // The store's duty event IDs go on rising, so an ID the host acknowledged before
@@ -1597,6 +1602,11 @@ impl App {
     pub(crate) async fn take<T>(&mut self, result: Result<T, ClientError>) -> Result<T, AppError> {
         if let Some(alarm) = self.note_service_time() {
             return Err(self.raise(alarm).await);
+        }
+        // An answer verified with the pinned key, an error answer included: the account is
+        // there, and the erasure wait starts over (Switch spec 12.7).
+        if matches!(result, Ok(_) | Err(ClientError::Switch { .. })) {
+            self.clear_erasing().await?;
         }
         match result {
             Ok(value) => Ok(value),
