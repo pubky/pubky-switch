@@ -423,6 +423,34 @@
       }
     }
   ],
+  "record_delete": {
+    "description": "A record.put that deletes (wire 6.2): the wallet deletes the record of seq 8, expected_version (1, 8), in a batch of one chained after seq 9 at 2026-01-01T00:00:05.000Z. Its value_sealed.ct is the tag alone, so the switch takes it as a delete without opening it, and its transition proof's state shows deleted true (wire 6.5). No other file continues the chain this way: export.json freezes the account after seq 9, and operations.json pays at seqs 10 and 11.",
+    "item": {
+      "chain_hash": "3roXoRUWRoBp4P2l43otOq7lQaY8pwSS17og9sGEdOM",
+      "envelope_json": "{\"chain_version\":1,\"generation\":1,\"seq\":10,\"prev_chain_hash\":\"7cnQjhJhU6AcoBWbYkGqHkYpCA-dn_qkjLalmGaky9g\",\"server_time\":\"2026-01-01T00:00:05.000Z\",\"item_type\":\"op\",\"item_hash\":\"kntGMOe3yLjQrVIkmuo060ClzmrbotWJ19li-d3FqoY\",\"batch_id\":\"EC0ZWlJKld_sNJfJlDdqHQ\",\"batch_count\":1}",
+      "item": {
+        "body": "eyJpZGVudGl0eSI6IjZmcmFvOHc5c3M1Y241NDRxZDY0aHluaWtyYnI5N2FlMXM1OTQxYzdtYTVlMWVwaWZoZ3kiLCJhcHBfaWQiOiJ3ZWpmMzduZ3I3cWl6ZWozZW9pam4zaHE0YyIsImdlbmVyYXRpb24iOjEsImJhdGNoIjp7ImlkIjoiRUMwWldsSktsZF9zTkpmSmxEZHFIUSIsImNvdW50IjoxfSwib3AiOiJyZWNvcmQucHV0Iiwia2V5IjoicGo1S3p5X3RwSW50Y2ljUVQyLW5sSXJSRE42eDlxUm0zT0RKcnM5blVwWSIsImNvbGxlY3Rpb24iOiJ0LVlmRVNQSUw5TDl1VkUyWTZJZk9ySG5HWTNlRWc3NG82em91S3VwcWRJIiwicmVhZF9zY29wZSI6InBheSIsIndyaXRlX3Njb3BlcyI6WyJwYXkiXSwiZXhwZWN0ZWRfdmVyc2lvbiI6eyJnZW5lcmF0aW9uIjoxLCJ2ZXJzaW9uIjo4fSwidmFsdWVfc2VhbGVkIjp7ImRhdGFfZXBvY2giOjIsInNjb3BlIjoicGF5Iiwibm9uY2UiOiJubEE4T2k2NG9mb3VEWXFSeGpZclZGVWQxWlp5TXNCNyIsImN0IjoiaURwX0ZsZXNPMDh4RUVNbHJ0OERSUSJ9fQ",
+        "sig": "mUrWGDEMULOzbxq1kFdqoWcpBs0sWAkuXHRLKqH951jHPQiyOyFTH_Wbs-_aJKl4lZ4ZCDN4trHh4UdMqmmeCQ"
+      },
+      "item_bytes_hex": "000001fc7b226964656e74697479223a22366672616f387739737335636e3534347164363468796e696b7262723937616531733539343163376d6135653165706966686779222c226170705f6964223a2277656a6633376e67723771697a656a33656f696a6e3368713463222c2267656e65726174696f6e223a312c226261746368223a7b226964223a224543305a576c4a4b6c645f734e4a664a6c4464714851222c22636f756e74223a317d2c226f70223a227265636f72642e707574222c226b6579223a22706a354b7a795f7470496e746369635154322d6e6c497252444e36783971526d334f444a7273396e557059222c22636f6c6c656374696f6e223a22742d5966455350494c394c3975564532593649664f72486e47593365456737346f367a6f754b7570716449222c22726561645f73636f7065223a22706179222c2277726974655f73636f706573223a5b22706179225d2c2265787065637465645f76657273696f6e223a7b2267656e65726174696f6e223a312c2276657273696f6e223a387d2c2276616c75655f7365616c6564223a7b22646174615f65706f6368223a322c2273636f7065223a22706179222c226e6f6e6365223a226e6c41384f6936346f666f7544597152786a597256465564315a5a794d734237222c226374223a226944705f466c65734f30387845454d6c727438445251227d7d00000040994ad618310c50b3b36f1ab590576aa1672906cd2c58092e5c744b2aa1fde758c73d08b23b21531ff59bb3efda24a978959e19083378b6b1e1e1474caa699e09",
+      "item_hash": "kntGMOe3yLjQrVIkmuo060ClzmrbotWJ19li-d3FqoY",
+      "item_type": "op",
+      "prev_chain_hash": "7cnQjhJhU6AcoBWbYkGqHkYpCA-dn_qkjLalmGaky9g",
+      "seq": 10,
+      "stub": {
+        "chain_hash": "3roXoRUWRoBp4P2l43otOq7lQaY8pwSS17og9sGEdOM",
+        "envelope": "eyJjaGFpbl92ZXJzaW9uIjoxLCJnZW5lcmF0aW9uIjoxLCJzZXEiOjEwLCJwcmV2X2NoYWluX2hhc2giOiI3Y25RamhKaFU2QWNvQldiWWtHcUhrWXBDQS1kbl9xa2pMYWxtR2FreTlnIiwic2VydmVyX3RpbWUiOiIyMDI2LTAxLTAxVDAwOjAwOjA1LjAwMFoiLCJpdGVtX3R5cGUiOiJvcCIsIml0ZW1faGFzaCI6ImtudEdNT2UzeUxqUXJWSWttdW8wNjBDbHptcmJvdFdKMTlsaS1kM0Zxb1kiLCJiYXRjaF9pZCI6IkVDMFpXbEpLbGRfc05KZkpsRGRxSFEiLCJiYXRjaF9jb3VudCI6MX0"
+      }
+    },
+    "transition_proof": {
+      "body": "{\"chain\":{\"envelope\":\"eyJjaGFpbl92ZXJzaW9uIjoxLCJnZW5lcmF0aW9uIjoxLCJzZXEiOjEwLCJwcmV2X2NoYWluX2hhc2giOiI3Y25RamhKaFU2QWNvQldiWWtHcUhrWXBDQS1kbl9xa2pMYWxtR2FreTlnIiwic2VydmVyX3RpbWUiOiIyMDI2LTAxLTAxVDAwOjAwOjA1LjAwMFoiLCJpdGVtX3R5cGUiOiJvcCIsIml0ZW1faGFzaCI6ImtudEdNT2UzeUxqUXJWSWttdW8wNjBDbHptcmJvdFdKMTlsaS1kM0Zxb1kiLCJiYXRjaF9pZCI6IkVDMFpXbEpLbGRfc05KZkpsRGRxSFEiLCJiYXRjaF9jb3VudCI6MX0\",\"chain_hash\":\"3roXoRUWRoBp4P2l43otOq7lQaY8pwSS17og9sGEdOM\"},\"object\":\"pj5Kzy_tpIntcicQT2-nlIrRDN6x9qRm3ODJrs9nUpY\",\"version\":10,\"state\":{\"deleted\":true,\"generation\":1,\"version\":10}}",
+      "name": "record.put delete (seq 10): deleted at version (1, 10)",
+      "signed": {
+        "body": "eyJjaGFpbiI6eyJlbnZlbG9wZSI6ImV5SmphR0ZwYmw5MlpYSnphVzl1SWpveExDSm5aVzVsY21GMGFXOXVJam94TENKelpYRWlPakV3TENKd2NtVjJYMk5vWVdsdVgyaGhjMmdpT2lJM1kyNVJhbWhLYUZVMlFXTnZRbGRpV1d0SGNVaHJXWEJEUVMxa2JsOXhhMnBNWVd4dFIyRnJlVGxuSWl3aWMyVnlkbVZ5WDNScGJXVWlPaUl5TURJMkxUQXhMVEF4VkRBd09qQXdPakExTGpBd01Gb2lMQ0pwZEdWdFgzUjVjR1VpT2lKdmNDSXNJbWwwWlcxZmFHRnphQ0k2SW10dWRFZE5UMlV6ZVV4cVVYSldTV3R0ZFc4d05qQkRiSHB0Y21KdmRGZEtNVGxzYVMxa00wWnhiMWtpTENKaVlYUmphRjlwWkNJNklrVkRNRnBYYkVwTGJHUmZjMDVLWmtwc1JHUnhTRkVpTENKaVlYUmphRjlqYjNWdWRDSTZNWDAiLCJjaGFpbl9oYXNoIjoiM3JvWG9SVVdSb0JwNFAybDQzb3RPcTdsUWFZOHB3U1MxN29nOXNHRWRPTSJ9LCJvYmplY3QiOiJwajVLenlfdHBJbnRjaWNRVDItbmxJclJETjZ4OXFSbTNPREpyczluVXBZIiwidmVyc2lvbiI6MTAsInN0YXRlIjp7ImRlbGV0ZWQiOnRydWUsImdlbmVyYXRpb24iOjEsInZlcnNpb24iOjEwfX0",
+        "sig": "_UwaroWJMXSQDM-yJJuaUFM5h1L0vFkhWxMbhQF43vM8m0Tuo9mrqOpw0m9oFKQnSeuaIYyKzSfLyh7mEiscBA"
+      }
+    }
+  },
   "rejections": [
     {
       "error": "incomplete batch: fuxhWO9sDP7fAJpVefkHXg",
