@@ -501,7 +501,21 @@ impl Inner {
                 let cert = caller
                     .and_then(|app| self.apps.get(&app))
                     .and_then(|app| app.cert.clone());
-                let views: Vec<Value> = self
+                let mut after: Option<String> = None;
+                let mut limit = 1000usize;
+                for pair in query.split('&') {
+                    match pair.split_once('=') {
+                        Some(("after", value)) => after = Some(value.to_owned()),
+                        Some(("limit", value)) => match value.parse() {
+                            Ok(value @ 1..=1000) => limit = value,
+                            _ => return Some(bad(ErrorCode::BadRequest, "limit", json!(null))),
+                        },
+                        _ => {}
+                    }
+                }
+                // Ordered by the base64url text of their keys, after `after` (Switch wire
+                // 7.4.9).
+                let mut listed: Vec<(String, Value)> = self
                     .shared
                     .records
                     .values()
@@ -510,8 +524,33 @@ impl Inner {
                         cert.as_ref()
                             .is_none_or(|cert| cert.holds_scope(&held.state.policy.read_scope))
                     })
-                    .map(|held| record_view(held, &self.apps, !self.shared.hide_proofs))
+                    .map(|held| {
+                        (
+                            b64(&held.state.key),
+                            record_view(held, &self.apps, !self.shared.hide_proofs),
+                        )
+                    })
+                    .filter(|(key, _)| after.as_ref().is_none_or(|after| key > after))
                     .collect();
+                listed.sort_by(|a, b| a.0.cmp(&b.0));
+                let mut views = Vec::new();
+                let mut bytes = 0usize;
+                let mut last = None;
+                let mut more = false;
+                for (key, view) in listed {
+                    let size = view.to_string().len();
+                    // `limit`, or the byte budget, ends the page; its first view is shown
+                    // whatever its size.
+                    if views.len() >= limit
+                        || (!views.is_empty() && bytes.saturating_add(size) > self.max_page_bytes)
+                    {
+                        more = true;
+                        break;
+                    }
+                    bytes = bytes.saturating_add(size);
+                    views.push(view);
+                    last = Some(key);
+                }
                 self.shared.listings += 1;
                 let next = match self.shared.alternate_next {
                     Some((a, b)) if self.shared.listings <= 50 => {
@@ -521,6 +560,7 @@ impl Inner {
                             &b
                         }))
                     }
+                    _ if more => json!(last),
                     _ => json!(null),
                 };
                 (

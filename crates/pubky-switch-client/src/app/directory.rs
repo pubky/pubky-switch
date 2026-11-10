@@ -20,7 +20,7 @@
 //!   (`peer/<pubky>`, from `known_version`), and, after an own delivery that removes an app
 //!   or closes a renewal, to the switches the app wrote to in the last 30 days.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use pubky_switch_core::enc::{b64, pubky_id, serde_b64, zbase32_encode};
 use pubky_switch_core::envelope::Recipient;
@@ -1123,12 +1123,17 @@ impl App {
     /// The records of a `409 stale_key` answer (Switch wire 7.6): each current record is
     /// checked as a directory's and replaces the cached one; apps no longer current leave
     /// the cache; apps added since are checked, against an `identity.json` read again if the
-    /// one held doesn't list them, and join it; the `apps_version` moves on.
+    /// one held doesn't list them, and join it; the `apps_version` moves on. A `current`
+    /// whose `receive_keys`, `not_current` and `added_apps` together name an App ID twice is
+    /// refused: nothing is taken from it, and the directory is read again.
     pub(crate) async fn take_stale_key(
         &mut self,
         pubky: &[u8; 32],
         current: &Value,
     ) -> Result<(), AppError> {
+        if names_an_app_twice(current) {
+            return self.mark_directory_stale(pubky).await;
+        }
         let Some(mut cached) = self.cached_directory(pubky).await? else {
             return Ok(());
         };
@@ -1400,6 +1405,20 @@ fn app_id_of(value: &Value, name: &str) -> Option<[u8; 16]> {
 
 fn doc_of(value: &Value, name: &str) -> Option<SignedDoc> {
     SignedDoc::from_strict_value(value.get(name)?).ok()
+}
+
+/// Whether a `409 stale_key`'s `current` names an App ID more than once across its
+/// `receive_keys`, `not_current` and `added_apps` (Switch wire 7.6).
+fn names_an_app_twice(current: &Value) -> bool {
+    let not_current = array(current, "not_current")
+        .filter_map(Value::as_str)
+        .filter_map(|text| pubky_switch_core::enc::app_id_decode(text).ok());
+    let mut seen = HashSet::new();
+    array(current, "receive_keys")
+        .chain(array(current, "added_apps"))
+        .filter_map(|entry| app_id_of(entry, "app_id"))
+        .chain(not_current)
+        .any(|app_id| !seen.insert(app_id))
 }
 
 #[cfg(test)]

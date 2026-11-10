@@ -142,6 +142,11 @@ pub(crate) mod key {
         format!("parked/{}", num(seq))
     }
 
+    /// A message whose kept effect may have been applied: its entry is parked when read.
+    pub(crate) fn uncertain(sender: &[u8; 32], msg_id: &str) -> String {
+        format!("uncert/{}/{msg_id}", pubky_id(sender))
+    }
+
     pub(crate) fn asked(seq: u64) -> String {
         format!("asked/{}", num(seq))
     }
@@ -200,6 +205,9 @@ pub(crate) struct HeldKey {
     pub(crate) record: SignedDoc,
     /// The `seq` of its registration, once known.
     pub(crate) reg_seq: Option<u64>,
+    /// The service time of its registration's chain item, once known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) reg_time_ms: Option<u64>,
     /// The registration batch sent and not yet answered, its exact body.
     #[serde(with = "serde_b64_vec", default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) pending: Vec<u8>,
@@ -399,6 +407,9 @@ pub(crate) struct PendingEffect {
     /// their evidence once it is applied (Switch wire 6.8), by claim key (base64url).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) deadlines: Vec<(String, super::claims::ObligationDeadline)>,
+    /// When it was kept, before its first send, app clock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) kept_ms: Option<u64>,
 }
 
 impl std::fmt::Debug for ParkedEntry {

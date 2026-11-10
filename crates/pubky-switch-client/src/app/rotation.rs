@@ -9,7 +9,8 @@
 //! - **Unexpected registrations:** one of the own app with a kid no device of the app made
 //!   is a compromise: the app stops, alerts the user, leaves at once and reports the
 //!   `distrust_from` to ask the signer for, the service time of the registration's chain
-//!   item. So is a `409 conflict` naming such a key.
+//!   item. So is a `409 conflict` naming such a key; without its chain item, the app gives
+//!   the later of the newest verified chain item's and its own last registration's times.
 //! - **Devices:** an app that shares its keys across devices learns its devices' kids
 //!   through its own device sync ([`App::device_keys`], [`App::take_device_keys`]); a
 //!   registration it doesn't know waits for that sync, and one newer than every key it holds
@@ -26,6 +27,7 @@ use pubky_switch_core::ops::{Condition, OpKind};
 use pubky_switch_core::records::{ReceiveKeyBody, ReceiveKeyRecord};
 use pubky_switch_core::sig::SignedDoc;
 
+use super::chain::ChainView;
 use super::error::{Alarm, Refusal};
 use super::events::AppEvent;
 use super::state::{HeldKey, KnownKid, RegStatus, Registration, Tx, key};
@@ -114,6 +116,7 @@ impl App {
             key: key.clone(),
             record: record.signed().clone(),
             reg_seq: None,
+            reg_time_ms: None,
             pending: batch.body().to_vec(),
         };
         let mut tx = self.tx()?;
@@ -132,8 +135,11 @@ impl App {
         let batch = Batch::from_body(held.pending.clone())?;
         match self.submit(&batch).await {
             Ok(submitted) => {
-                let seq = submitted.proofs.first().map(|p| p.envelope().seq);
-                self.key_registered(n, seq).await?;
+                let at = submitted
+                    .proofs
+                    .first()
+                    .map(|p| (p.envelope().seq, p.envelope().server_time));
+                self.key_registered(n, at).await?;
                 Ok(true)
             }
             Err(AppError::Switch(ClientError::Switch {
@@ -145,12 +151,16 @@ impl App {
         }
     }
 
-    /// Key `n` is registered: note it with the `seq` of its chain item when known.
-    async fn key_registered(&mut self, n: u64, seq: Option<u64>) -> Result<(), AppError> {
+    /// Key `n` is registered: note it with the `seq` and service time of its chain item
+    /// when known.
+    async fn key_registered(&mut self, n: u64, at: Option<(u64, u64)>) -> Result<(), AppError> {
         let now = self.now();
         let mut tx = self.tx()?;
         if let Some(held) = self.state.receive_keys.get_mut(&n) {
-            held.reg_seq = seq.or(held.reg_seq);
+            if let Some((seq, time)) = at {
+                held.reg_seq = Some(seq);
+                held.reg_time_ms = Some(time);
+            }
             held.pending.clear();
             tx.put(&key::receive_key(n), held)?;
         }
@@ -244,11 +254,28 @@ impl App {
         self.commit(tx).await?;
         let alarm = Alarm::Compromise {
             n: record.n(),
-            distrust_from: None,
+            distrust_from: self.distrust_bound(),
         };
         let error = self.raise(alarm).await;
         self.leave_on_compromise().await;
         Err(error)
+    }
+
+    /// The `distrust_from` for a registration of the own app learned of without its chain
+    /// item, from a `409 conflict` or a directory (Switch spec 3.6): the later of the service
+    /// times of the newest chain item the app verified and of its own last registration. The
+    /// foreign registration lies after both, and service time never goes back, so this
+    /// distrusts no less than the registration's own time. `None` when the app holds
+    /// neither.
+    pub(crate) fn distrust_bound(&self) -> Option<u64> {
+        let chain = self.state.chain.as_ref().and_then(ChainView::highest_time);
+        let own = self
+            .state
+            .receive_keys
+            .values()
+            .filter_map(|held| held.reg_time_ms)
+            .max();
+        chain.max(own)
     }
 
     /// The own current receive key record from the directory, verified.
@@ -283,6 +310,7 @@ impl App {
             // A registration whose answer was lost shows here: the rotation is done.
             let was_pending = !held.pending.is_empty() || held.reg_seq.is_none();
             held.reg_seq = Some(seq);
+            held.reg_time_ms = Some(at_ms);
             held.pending.clear();
             tx.put(&key::receive_key(n), held)?;
             if was_pending && current == Some(n) && n > 0 {
@@ -594,11 +622,12 @@ impl App {
                         "device sync: a receive key record doesn't verify".into(),
                     ));
                 }
-                let reg_seq = self.state.registrations.get(&n).and_then(|r| r.seq);
+                let registration = self.state.registrations.get(&n);
                 let held = HeldKey {
                     key: shared.key,
                     record: shared.record,
-                    reg_seq,
+                    reg_seq: registration.and_then(|r| r.seq),
+                    reg_time_ms: registration.and_then(|r| r.at_ms),
                     pending: Vec::new(),
                 };
                 tx.put(&key::receive_key(n), &held)?;

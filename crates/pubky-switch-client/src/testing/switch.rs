@@ -130,6 +130,10 @@ pub struct SwitchApp {
     pub full_requested: Option<u64>,
 }
 
+/// The byte budget of a feed page's items and of a record page's views: 8 MiB (Switch wire
+/// 9.2 `max_page_bytes`).
+pub const MAX_PAGE_BYTES: usize = 8 * 1024 * 1024;
+
 /// A fault the switch applies to the next request whose path contains `path`.
 #[derive(Clone, Debug)]
 pub enum Fault {
@@ -215,6 +219,9 @@ pub(crate) struct Inner {
     /// Feed reads answered before every later one is `503 unavailable`: a bound for tests
     /// of reads that must end.
     pub(crate) feed_limit: Option<u64>,
+    /// The byte budget of a feed page's items and a record page's views, [`MAX_PAGE_BYTES`]
+    /// unless a test lowers it (Switch wire 7.4.4, 7.4.9).
+    pub(crate) max_page_bytes: usize,
     /// The bodies of the requests an `Unreachable` fault failed.
     pub(crate) unreached: Vec<Vec<u8>>,
     /// The peer copies of other identities' `identity.json` (Switch wire 7.4.5).
@@ -290,6 +297,7 @@ impl Inner {
             shared: shared::Shared::default(),
             feed_reads: 0,
             feed_limit: None,
+            max_page_bytes: MAX_PAGE_BYTES,
             unreached: Vec::new(),
             peers: HashMap::new(),
             appended: HashMap::new(),
@@ -404,6 +412,18 @@ impl ScriptedSwitch {
     /// sequence, chain, apps, cursors and shared state, under its own service key (Switch
     /// spec 12.5 step 3). It serves once it is delivered an `identity.json` naming its key.
     pub fn import_into(&self, service_secret: [u8; 32]) -> Arc<Self> {
+        self.continue_into(service_secret, false)
+    }
+
+    /// The same account under a new service key at the next generation, a key change in
+    /// place: as [`ScriptedSwitch::import_into`], but the batch records keep their proofs,
+    /// so a batch sent again unchanged gets its original proofs, signed with the earlier
+    /// generation's key (Switch wire 6.4 step 6).
+    pub fn change_key_into(&self, service_secret: [u8; 32]) -> Arc<Self> {
+        self.continue_into(service_secret, true)
+    }
+
+    fn continue_into(&self, service_secret: [u8; 32], keep_proofs: bool) -> Arc<Self> {
         let inner = self.lock();
         let mut next = Inner::fresh(
             clone_key(&inner.identity),
@@ -425,13 +445,16 @@ impl ScriptedSwitch {
         next.apps = inner.apps.clone();
         next.bundles = inner.bundles.clone();
         next.kids = inner.kids.clone();
-        // Batch records travel without their proofs (Switch wire 10.1).
+        // An export carries batch records without their proofs (Switch wire 10.1); a key
+        // change in place keeps them.
         next.batches = inner
             .batches
             .iter()
             .map(|(id, record)| {
                 let mut record = record.clone();
-                record.proofs = None;
+                if !keep_proofs {
+                    record.proofs = None;
+                }
                 (*id, record)
             })
             .collect();
@@ -481,6 +504,11 @@ impl ScriptedSwitch {
         })?;
         inner.frozen = None;
         Ok(())
+    }
+
+    /// A faulty service that lost the account's `identity.json`: it holds none from now on.
+    pub fn lose_identity(&self) {
+        self.lock().doc = None;
     }
 
     /// The signer revokes `app` (Switch spec 12.2 step 1).
@@ -1221,23 +1249,41 @@ impl Inner {
         let mut items = Vec::new();
         let mut last = after;
         let mut truncated = false;
-        let candidates: Vec<Item> = self
-            .items
-            .iter()
-            .filter(|item| item.seq() > after)
-            .cloned()
-            .collect();
-        let mut open_batch: Option<[u8; 16]> = None;
-        for item in candidates {
-            if items.len() >= limit && open_batch.is_none_or(|b| item.batch() != Some(b)) {
+        let mut bytes = 0usize;
+        // A batch's items go together: a page never ends inside one (Switch wire 7.4.4).
+        let mut groups: Vec<Vec<&Item>> = Vec::new();
+        for item in self.items.iter().filter(|item| item.seq() > after) {
+            match groups.last_mut() {
+                Some(group)
+                    if item.batch().is_some()
+                        && group.last().and_then(|held| held.batch()) == item.batch() =>
+                {
+                    group.push(item);
+                }
+                _ => groups.push(vec![item]),
+            }
+        }
+        for group in groups {
+            if items.len() >= limit {
                 truncated = true;
                 break;
             }
-            last = item.seq();
-            open_batch = item.batch();
-            if let Some(value) = self.show(&item, app) {
-                items.push(value);
+            let shown: Vec<Value> = group
+                .iter()
+                .filter_map(|item| self.show(item, app))
+                .collect();
+            let size: usize = shown.iter().map(|value| value.to_string().len()).sum();
+            // The byte budget ends a page before a group that would pass it, but the page's
+            // first item or batch is shown whatever its size.
+            if !items.is_empty() && bytes.saturating_add(size) > self.max_page_bytes {
+                truncated = true;
+                break;
             }
+            bytes = bytes.saturating_add(size);
+            if let Some(item) = group.last() {
+                last = item.seq();
+            }
+            items.extend(shown);
         }
         if !truncated {
             last = last.max(self.seq);

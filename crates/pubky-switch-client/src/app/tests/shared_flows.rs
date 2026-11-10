@@ -344,6 +344,66 @@ async fn test_send_stale_key_with_an_older_record_is_not_sealed_to() {
 }
 
 #[tokio::test]
+async fn test_send_stale_key_naming_an_app_twice_reads_the_directory_again() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    app.send(s.note("one")).await.unwrap();
+    let (record, app_id) = {
+        let inner = s.peer.lock();
+        (
+            inner.apps[0].receive_keys[0].1.clone(),
+            pubky_switch_core::enc::zbase32_encode(&inner.apps[0].cert.app_id()),
+        )
+    };
+    s.peer.fail_next(
+        "inbox",
+        ErrorCode::StaleKey,
+        json!({ "receive_keys": [ { "app_id": app_id, "record": record },
+                                  { "app_id": app_id, "record": record } ],
+                "not_current": [], "unknown_kids": [], "added_apps": [], "apps_version": 1 }),
+    );
+    s.peer.lock().requests.clear();
+    let (_, delivery) = app.send(s.note("two")).await.unwrap();
+    assert!(accepted(&delivery), "{delivery:?}");
+    // Nothing is taken from it: the directory is read again (Switch wire 7.6).
+    let routes = s.peer.routes();
+    assert_eq!(
+        routes,
+        vec!["POST inbox", "GET directory", "POST inbox"],
+        "{routes:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_directory_naming_an_app_twice_is_refused() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    s.peer
+        .add_app("till", &AppSpec::new(&["scope-a"]), &["sample.note"], true)
+        .unwrap();
+    {
+        let mut inner = s.peer.lock();
+        let copy = crate::testing::PeerApp {
+            keys: inner.apps[1].keys.clone(),
+            cert: inner.apps[1].cert.clone(),
+            record: inner.apps[1].record.clone(),
+            receive_keys: inner.apps[1].receive_keys.clone(),
+            since: inner.apps[1].since,
+        };
+        inner.apps.push(copy);
+    }
+    // None of it is used, not even the app listed once: the message waits for a directory
+    // read again later (Switch wire 7.4.10).
+    let (msg_id, delivery) = app.send(s.note("hello")).await.unwrap();
+    assert!(matches!(delivery, Delivery::Queued { .. }), "{delivery:?}");
+    assert!(s.peer.received().is_empty());
+    s.peer.lock().apps.pop();
+    let report = app.flush_outbox().await.unwrap();
+    assert_eq!(report.done, vec![msg_id.clone()]);
+    assert_eq!(s.peer.received(), vec![msg_id]);
+}
+
+#[tokio::test]
 async fn test_send_added_app_joins_the_recipients_after_stale_key() {
     let s = Setup::new();
     let mut app = s.join("wallet").await;
@@ -439,6 +499,121 @@ async fn test_send_not_admitted_stays_queued_and_goes_once_admitted() {
 }
 
 #[tokio::test]
+async fn test_send_not_admitted_is_deleted_after_30_days() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    s.peer.lock().admitted = Some(Default::default());
+    let (msg_id, _) = app.send(s.note("one")).await.unwrap();
+    app.take_events();
+    // Queued for 30 days from the first such answer, over tries spread across them
+    // (Switch spec 11).
+    for _ in 2..crate::app::UNDELIVERABLE_TRIES {
+        s.w.clock
+            .advance_ms(crate::app::UNDELIVERABLE_TRY_SPACING_MS);
+        assert_eq!(
+            app.flush_outbox().await.unwrap().queued,
+            vec![msg_id.clone()]
+        );
+    }
+    s.w.clock
+        .advance_ms(crate::app::UNDELIVERABLE_TRY_SPACING_MS);
+    let report = app.flush_outbox().await.unwrap();
+    assert_eq!(report.undelivered, vec![msg_id.clone()]);
+    assert!(report.queued.is_empty(), "{report:?}");
+    // Deleted, plaintext and all, and the protocol told.
+    assert_eq!(app.delivery(&msg_id).await.unwrap(), None);
+    assert!(
+        app.take_events().contains(&AppEvent::MessageUndelivered {
+            msg_id: msg_id.clone(),
+            resend: false
+        }),
+        "the protocol is told"
+    );
+    // Admitted later, it isn't sent.
+    s.peer.lock().admitted = None;
+    let report = app.flush_outbox().await.unwrap();
+    assert!(report.done.is_empty(), "{report:?}");
+    assert!(s.peer.received().is_empty());
+}
+
+#[tokio::test]
+async fn test_send_not_admitted_is_tried_once_more_before_it_is_deleted() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    s.peer.lock().admitted = Some(Default::default());
+    let (msg_id, _) = app.send(s.note("one")).await.unwrap();
+    for _ in 2..crate::app::UNDELIVERABLE_TRIES {
+        s.w.clock
+            .advance_ms(crate::app::UNDELIVERABLE_TRY_SPACING_MS);
+        app.flush_outbox().await.unwrap();
+    }
+    // Admitted on day 29; the next flush comes past day 30, and the message goes.
+    s.peer.lock().admitted = None;
+    s.w.clock.advance_ms(9 * DAY_MS);
+    let report = app.flush_outbox().await.unwrap();
+    assert_eq!(report.done, vec![msg_id.clone()], "{report:?}");
+    assert_eq!(s.peer.received(), vec![msg_id]);
+}
+
+#[tokio::test]
+async fn test_send_not_admitted_is_deleted_at_45_days_with_sparse_flushes() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    s.peer.lock().admitted = Some(Default::default());
+    let (msg_id, _) = app.send(s.note("one")).await.unwrap();
+    app.take_events();
+    // Two flushes in 45 days: far fewer answers than confirm the 30 days.
+    s.w.clock.advance_ms(20 * DAY_MS);
+    app.flush_outbox().await.unwrap();
+    s.w.clock
+        .advance_ms(crate::app::UNDELIVERABLE_MAX_MS - 20 * DAY_MS - 1);
+    let report = app.flush_outbox().await.unwrap();
+    assert_eq!(report.queued, vec![msg_id.clone()], "{report:?}");
+    // At 45 days from the first answer it goes, plaintext and all, untried.
+    s.w.clock.advance_ms(1);
+    s.peer.lock().admitted = None;
+    let report = app.flush_outbox().await.unwrap();
+    assert_eq!(report.undelivered, vec![msg_id.clone()], "{report:?}");
+    assert_eq!(app.delivery(&msg_id).await.unwrap(), None);
+    assert!(s.peer.received().is_empty());
+    assert!(app.take_events().contains(&AppEvent::MessageUndelivered {
+        msg_id,
+        resend: false
+    }));
+}
+
+#[tokio::test]
+async fn test_send_not_admitted_isnt_deleted_by_a_31_day_clock_jump() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    s.peer.lock().admitted = Some(Default::default());
+    let (msg_id, _) = app.send(s.note("one")).await.unwrap();
+    s.w.clock.advance_ms(31 * DAY_MS);
+    for _ in 0..5 {
+        let report = app.flush_outbox().await.unwrap();
+        assert_eq!(report.queued, vec![msg_id.clone()], "{report:?}");
+        s.w.clock.advance_ms(60_000);
+    }
+    assert!(app.delivery(&msg_id).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn test_send_not_admitted_isnt_deleted_by_a_clock_jump() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    s.peer.lock().admitted = Some(Default::default());
+    let (msg_id, _) = app.send(s.note("one")).await.unwrap();
+    // The clock jumps 40 days ahead: one try counts, and the tries right after add none.
+    s.w.clock.advance_ms(40 * DAY_MS);
+    for _ in 0..5 {
+        let report = app.flush_outbox().await.unwrap();
+        assert_eq!(report.queued, vec![msg_id.clone()], "{report:?}");
+        s.w.clock.advance_ms(60_000);
+    }
+    assert!(app.delivery(&msg_id).await.unwrap().is_some());
+}
+
+#[tokio::test]
 async fn test_send_with_an_invite_code_is_admitted() {
     let s = Setup::new();
     let mut app = s.join("wallet").await;
@@ -482,6 +657,51 @@ async fn test_send_resend_seals_the_same_plaintext_again() {
     }
     let sent = app.sent_to(&s.w.bob.public(), 0, u64::MAX).await.unwrap();
     assert_eq!(sent.len(), 1);
+}
+
+#[tokio::test]
+async fn test_send_sent_message_shows_every_acceptance_time() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    let (msg_id, delivery) = app.send(s.note("hello")).await.unwrap();
+    let Delivery::Accepted {
+        accepted_at_ms: first,
+    } = delivery
+    else {
+        panic!("{delivery:?}");
+    };
+    s.w.clock.advance_ms(1000);
+    s.peer.rotate(0).unwrap();
+    app.resend(&msg_id).await.unwrap();
+    s.w.clock.advance_ms(1000);
+    app.resend(&msg_id).await.unwrap();
+    let times = |sent: &[crate::app::SentMessage]| {
+        sent.iter()
+            .map(crate::app::SentMessage::accepted_times_ms)
+            .collect::<Vec<_>>()
+    };
+    let all = app.sent_to(&s.w.bob.public(), 0, u64::MAX).await.unwrap();
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].accepted_at_ms, Some(first));
+    assert_eq!(all[0].resent_at_ms.len(), 2);
+    let every = all[0].accepted_times_ms();
+    assert_eq!(every.len(), 3);
+    assert_eq!(every[0], first);
+    assert!(every.windows(2).all(|w| w[0] < w[1]), "{every:?}");
+    // A window around a re-send's acceptance alone selects it too, with all its times
+    // (Switch spec 11).
+    let resent = every[2];
+    let selected = app
+        .sent_to(&s.w.bob.public(), resent, resent)
+        .await
+        .unwrap();
+    assert_eq!(times(&selected), vec![every.clone()]);
+    // A time no acceptance has selects nothing.
+    let none = app
+        .sent_to(&s.w.bob.public(), first + 1, every[1] - 1)
+        .await
+        .unwrap();
+    assert!(none.is_empty());
 }
 
 #[tokio::test]
@@ -1894,43 +2114,28 @@ async fn test_directory_floor_only_rises_within_one_answer() {
 }
 
 #[tokio::test]
-async fn test_directory_bad_or_repeated_app_is_skipped_and_the_others_used() {
+async fn test_directory_bad_app_is_skipped_and_the_others_used() {
     let s = Setup::new();
     let mut app = s.join("wallet").await;
     let till = s
         .peer
         .add_app("till", &AppSpec::new(&["scope-a"]), &["sample.note"], true)
         .unwrap();
-    let kiosk = s
-        .peer
-        .add_app("kiosk", &AppSpec::new(&["scope-a"]), &["sample.note"], true)
-        .unwrap();
     {
         let mut inner = s.peer.lock();
         // Till's entry carries the shop's record: it doesn't verify for its App ID.
         inner.apps[1].record = inner.apps[0].record.clone();
-        // Kiosk is listed twice.
-        let copy = crate::testing::PeerApp {
-            keys: inner.apps[2].keys.clone(),
-            cert: inner.apps[2].cert.clone(),
-            record: inner.apps[2].record.clone(),
-            receive_keys: inner.apps[2].receive_keys.clone(),
-            since: inner.apps[2].since,
-        };
-        inner.apps.push(copy);
     }
     let (msg_id, delivery) = app.send(s.note("hello")).await.unwrap();
     assert!(accepted(&delivery), "{delivery:?}");
     assert_eq!(s.peer.received(), vec![msg_id]);
     let events = app.take_events();
-    for skipped in [till, kiosk] {
-        assert!(
-            events.iter().any(
-                |e| matches!(e, AppEvent::UnreachableApp { app_id, .. } if *app_id == skipped)
-            ),
-            "{events:?}"
-        );
-    }
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AppEvent::UnreachableApp { app_id, .. } if *app_id == till)),
+        "{events:?}"
+    );
     let inner = s.peer.lock();
     let last = &inner.inbox.last().unwrap().envelope;
     assert_eq!(parse_header(last).unwrap().kids().count(), 1);
@@ -1945,6 +2150,35 @@ async fn test_records_listing_stops_when_next_doesnt_move_on() {
     app.list_collection(&items()).await.unwrap();
     let pages = s.w.switch.lock().shared.listings - listed_before;
     assert_eq!(pages, 2);
+}
+
+#[tokio::test]
+async fn test_records_listing_pages_by_bytes() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    for name in ["n1", "n2", "n3"] {
+        app.put_record(&s.target(name), &value(&[name]), vec![])
+            .await
+            .unwrap();
+    }
+    // A budget below one view: each page holds its first view alone (Switch wire 7.4.9).
+    s.w.switch.lock().max_page_bytes = 1;
+    let id = items().id(&s.w.alice.public());
+    let first = app.client.records(&id, None, None).await.unwrap();
+    assert_eq!(first.records.len(), 1);
+    let next = first.next.unwrap();
+    let second = app.client.records(&id, Some(&next), None).await.unwrap();
+    assert_eq!(second.records.len(), 1);
+    assert_ne!(second.records[0].key, first.records[0].key);
+    // The app lists the whole collection by `next`.
+    let before = s.w.switch.lock().shared.listings;
+    assert_eq!(app.list_collection(&items()).await.unwrap(), 3);
+    assert_eq!(s.w.switch.lock().shared.listings - before, 3);
+    // Within the budget, one page holds them all.
+    s.w.switch.lock().max_page_bytes = crate::testing::MAX_PAGE_BYTES;
+    let all = app.client.records(&id, None, None).await.unwrap();
+    assert_eq!(all.records.len(), 3);
+    assert!(all.next.is_none());
 }
 
 #[test]

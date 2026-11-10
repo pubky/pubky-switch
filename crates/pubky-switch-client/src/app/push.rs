@@ -9,8 +9,12 @@
 //!    `replaces` is `409 conflict` naming the current key, which the app then names.
 //! 2. **Relay**: the device registers its token with the vendor's relay, bound to that push
 //!    key, through the host's [`PushRelay`]; the relay answers an opaque handle.
-//! 3. **Set** (`PUT /push` with the handle and the push key): a push key that isn't the
-//!    current registration's is `409 conflict`, and the app starts again.
+//! 3. **Set** (`PUT /push` with the handles and the push key): a push key that isn't the
+//!    current registration's is `409 conflict`, and the app starts again. The list replaces
+//!    the service's, so an app on several devices sends the merged list: this device's
+//!    handle and those of its other devices bound to the same push key, which the host
+//!    shares through its own device sync ([`App::push_handles`],
+//!    [`App::take_device_push_handles`]; Switch wire 8.1).
 //!
 //! Each step is committed as it completes, so a crash resumes with the same requests: a
 //! start is idempotent without a nonce. A rotation whose answer was lost is retried naming
@@ -34,8 +38,32 @@ use crate::transport::BoxFuture;
 /// (Switch spec 9 step 2).
 pub const MAX_HANDLE_BYTES: usize = 1024;
 
+/// The most handles one registration holds, one per device (Switch wire 8.1).
+pub const MAX_HANDLES: usize = 8;
+
 /// The key of the push setting (`STATE.md`, "Moves, recovery and push").
 pub(crate) const KEY: &str = "push";
+
+/// The key of the handles of the app's other devices.
+pub(crate) const DEVICES_KEY: &str = "push/devices";
+
+/// Push handles bound to one push key: this device's, from [`App::push_handles`], for the
+/// host's device sync to share, and the other devices', given back through
+/// [`App::take_device_push_handles`]. Its `Debug` shows no handle.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PushHandles {
+    /// The push key the handles are bound to.
+    #[serde(with = "pubky_switch_core::enc::serde_b64")]
+    pub push_key: [u8; 32],
+    /// The handles.
+    pub handles: Vec<String>,
+}
+
+impl std::fmt::Debug for PushHandles {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "PushHandles({} handles)", self.handles.len())
+    }
+}
 
 /// The vendor's push relay, as the app registers its device there (Switch spec 9 step 2,
 /// Switch wire 8.3). The host implements it; object-safe, the app takes `&dyn PushRelay`.
@@ -243,6 +271,69 @@ impl App {
             }))
     }
 
+    /// This device's handle and the push key it is bound to, once the relay answered:
+    /// what the host's device sync shares with the app's other devices (Switch wire 8.1).
+    ///
+    /// # Errors
+    ///
+    /// A store failure.
+    pub async fn push_handles(&self) -> Result<Option<PushHandles>, AppError> {
+        Ok(self.push_record().await?.and_then(|r| {
+            Some(PushHandles {
+                push_key: r.push_key?,
+                handles: vec![r.handle?],
+            })
+        }))
+    }
+
+    /// Keep the handles of the app's other devices, from the host's device sync, so the
+    /// next set of this device's handles sends the merged list (Switch wire 8.1). They
+    /// replace those kept before; only those bound to the push key being set are sent.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::Usage`] for more handles than a registration holds besides this
+    /// device's, or a handle the app doesn't keep; a store failure.
+    pub async fn take_device_push_handles(&mut self, others: PushHandles) -> Result<(), AppError> {
+        Box::pin(async move {
+            self.ready_local().await?;
+            if others.handles.len() >= MAX_HANDLES {
+                return Err(usage(
+                    "Switch wire 8.1: at most 8 handles, this device's included",
+                ));
+            }
+            if others
+                .handles
+                .iter()
+                .any(|h| h.is_empty() || h.len() > MAX_HANDLE_BYTES)
+            {
+                return Err(usage(
+                    "Switch spec 9 step 2: a device's handle isn't one the app keeps",
+                ));
+            }
+            let mut tx = self.tx()?;
+            tx.put(DEVICES_KEY, &others)?;
+            self.commit(tx).await
+        })
+        .await
+    }
+
+    /// The handles to set for `key`: this device's first, then those of its other devices
+    /// bound to the same key, each once.
+    async fn merged_handles(&self, key: [u8; 32], own: String) -> Result<Vec<String>, AppError> {
+        let mut handles = vec![own];
+        if let Some(others) = self.reader().get::<PushHandles>(DEVICES_KEY).await?
+            && others.push_key == key
+        {
+            for handle in others.handles {
+                if !handles.contains(&handle) && handles.len() < MAX_HANDLES {
+                    handles.push(handle);
+                }
+            }
+        }
+        Ok(handles)
+    }
+
     pub(crate) async fn push_record(&self) -> Result<Option<PushRecord>, AppError> {
         self.reader().get(KEY).await
     }
@@ -341,10 +432,10 @@ impl App {
             }
             record.handle = Some(handle.clone());
             self.save_push(&record).await?;
-            // Step 3: the handles.
+            // Step 3: the handles, merged with the other devices' (Switch wire 8.1).
             let set = PushSetting {
                 relay_url: relay_url.to_owned(),
-                handles: vec![handle],
+                handles: self.merged_handles(key, handle).await?,
                 push_key: Some(key),
                 replaces: None,
             };

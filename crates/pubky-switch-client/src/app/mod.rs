@@ -72,7 +72,7 @@ pub use protocol::{
     decode_local_state, encode_local_state,
 };
 pub use provider::ProviderStatus;
-pub use push::{MAX_HANDLE_BYTES, PushRegistration, PushRelay};
+pub use push::{MAX_HANDLE_BYTES, MAX_HANDLES, PushHandles, PushRegistration, PushRelay};
 pub use recovery::{Evidence, LossActions, ProviderLoss, RESIDUAL_WINDOW_MS, RecoveryInfo};
 pub use state::{PROTOCOL_PREFIX, SCHEMA_VERSION};
 
@@ -93,7 +93,8 @@ pub use records::{
 };
 pub use send::{
     Delivery, OutboxReport, OutgoingMessage, RecordJob, SENT_RETENTION_MS, SentMessage,
-    SignedMessage,
+    SignedMessage, UNDELIVERABLE_MAX_MS, UNDELIVERABLE_MS, UNDELIVERABLE_TRIES,
+    UNDELIVERABLE_TRY_SPACING_MS,
 };
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -458,6 +459,8 @@ pub(crate) struct AppState {
     pub(crate) service_time: Option<ServiceTime>,
     /// The app isn't current any more, or its account is gone: every read stops.
     pub(crate) gone: Option<provider::GoneRecord>,
+    /// The wait before the account counts as erased, while it runs.
+    pub(crate) erasing: Option<provider::ErasingRecord>,
 }
 
 /// One app of an identity, on top of the Switch.
@@ -573,6 +576,7 @@ impl App {
                 key: first.clone(),
                 record: key_record.signed().clone(),
                 reg_seq: None,
+                reg_time_ms: None,
                 pending: Vec::new(),
             };
             let state = AppState {
@@ -614,6 +618,7 @@ impl App {
                 leave: None,
                 service_time: None,
                 gone: None,
+                erasing: None,
             };
             let mut app = App {
                 env,
@@ -688,6 +693,7 @@ impl App {
         let key_seq = key_proof.envelope().seq;
         if let Some(held) = self.state.receive_keys.get_mut(&0) {
             held.reg_seq = Some(key_seq);
+            held.reg_time_ms = Some(key_proof.envelope().server_time);
             held.pending.clear();
         }
         self.state.cursor = Cursor {
@@ -809,6 +815,7 @@ impl App {
             leave,
             service_time: reader.get(key::SERVICE_TIME).await?,
             gone: reader.get(provider::keys::GONE).await?,
+            erasing: reader.get(provider::keys::ERASING).await?,
             meta,
         })
     }
@@ -1143,6 +1150,7 @@ impl App {
                 leave: None,
                 service_time: None,
                 gone: None,
+                erasing: None,
             };
             let ns = client_namespace(&meta.app_id);
             let client = Self::client_for(&env, &meta, &backup.keys, &cert)?;
@@ -1751,6 +1759,11 @@ impl App {
         if let Some(alarm) = self.note_service_time() {
             return Err(self.raise(alarm).await);
         }
+        // An answer verified with the pinned key, an error answer included: the account is
+        // there, and the erasure wait starts over (Switch spec 12.7).
+        if matches!(result, Ok(_) | Err(ClientError::Switch { .. })) {
+            self.clear_erasing().await?;
+        }
         match result {
             Ok(value) => Ok(value),
             Err(ClientError::Chain(error)) => Err(self
@@ -1813,9 +1826,20 @@ impl App {
     }
 
     /// `POST /ops` with a batch whose body the caller committed: the answer's head goes to
-    /// the chain view, and a signed answer that contradicts itself is a rollback.
+    /// the chain view, and a signed answer that contradicts itself is a rollback. Nothing
+    /// but a provider loss's registration goes before the loss's upload (Switch spec 12.6
+    /// step 3). A kept batch signed for an earlier generation has its proofs checked with
+    /// that generation's key (Switch wire 6.4 step 6).
     pub(crate) async fn submit(&mut self, batch: &Batch) -> Result<Submitted, AppError> {
-        let result = self.client.submit(batch).await;
+        self.refuse_before_upload_of(Some(batch)).await?;
+        let generation = batch_generation(batch);
+        let result = match generation.filter(|g| *g < self.state.meta.generation) {
+            Some(earlier) => match self.service_key_of(earlier).await? {
+                Some(key) => self.client.submit_proved_by(batch, &key).await,
+                None => self.client.submit(batch).await,
+            },
+            None => self.client.submit(batch).await,
+        };
         let submitted = self.take(result).await?;
         if let Err(alarm) = self.note_answer_head(submitted.head, &submitted.proofs) {
             return Err(self.raise(alarm).await);
@@ -1890,4 +1914,9 @@ impl App {
         )?;
         Ok(())
     }
+}
+
+/// The generation a batch's signed operations name; `None` for a cursor-only batch.
+pub(crate) fn batch_generation(batch: &Batch) -> Option<u64> {
+    batch.ops().first().map(|op| op.body().generation)
 }

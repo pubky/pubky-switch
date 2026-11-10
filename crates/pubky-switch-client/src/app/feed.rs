@@ -123,8 +123,8 @@ enum Sent {
     Conflict(serde_json::Value),
     StaleEpoch,
     Quota,
-    /// Refused for good: the entry is stored and passed.
-    Refused,
+    /// Refused for good, with the error code: the entry is stored and passed.
+    Refused(String),
 }
 
 /// An entry as the feed carries it, or as the app stored it.
@@ -560,6 +560,22 @@ impl App {
             });
             return Ok(Step::Pass);
         }
+        // A kept effect that may have been applied: never built again (Switch spec 12.5
+        // "Kept batches").
+        let uncertain = key::uncertain(&entry.sender, &received.message.msg_id);
+        if self.reader().exists(&uncertain).await? {
+            read.tx.delete(&uncertain)?;
+            uncertain_processed(
+                &mut read.tx,
+                &entry.sender,
+                &received.message.msg_id,
+                received.hash(),
+                self.now(),
+            )?;
+            self.park(entry, &received.plaintext, ParkReason::Uncertain, read)?;
+            self.effect_refused(entry, &received, Some("stale_generation".into()));
+            return Ok(Step::Pass);
+        }
         self.apply(entry, received, parked, read).await
     }
 
@@ -657,6 +673,7 @@ impl App {
                     ParkReason::TooManyOperations,
                     read,
                 )?;
+                self.effect_refused(entry, &received, None);
                 return Ok(Step::Pass);
             }
             if effect.ops.is_empty() {
@@ -700,8 +717,9 @@ impl App {
                     self.park(entry, &received.plaintext, ParkReason::Quota, read)?;
                     return Ok(Step::Pass);
                 }
-                Sent::Refused => {
+                Sent::Refused(code) => {
                     self.park(entry, &received.plaintext, ParkReason::Refused, read)?;
+                    self.effect_refused(entry, &received, Some(code));
                     return Ok(Step::Pass);
                 }
             }
@@ -842,6 +860,7 @@ impl App {
                 .iter()
                 .map(|(claim_key, deadline)| (pubky_switch_core::enc::b64(claim_key), *deadline))
                 .collect(),
+            kept_ms: Some(self.now()),
         };
         // The collection name of a record the effect creates outside the protocol's
         // collections, until its write is answered: the switch knows only its ID.
@@ -901,12 +920,27 @@ impl App {
                         return Err(error);
                     }
                     // This effect is refused for good, the app's other writes aren't.
-                    _ => Sent::Refused,
+                    (code, _) => Sent::Refused(code.as_str().to_owned()),
                 };
                 self.drop_pending_effect().await?;
                 return Ok(sent);
             }
         };
+        self.commit_effect(&pending, batch, &submitted.proofs)
+            .await?;
+        self.check_attempts_of(batch, &submitted).await?;
+        Ok(Sent::Applied)
+    }
+
+    /// The outcome of an applied effect, with the proofs its answer carried, if any: what
+    /// its operations settle, the processed pair, the protocol's local writes and the
+    /// cursor, in one commit.
+    async fn commit_effect(
+        &mut self,
+        pending: &PendingEffect,
+        batch: &Batch,
+        proofs: &[pubky_switch_core::chain::TransitionProof],
+    ) -> Result<(), AppError> {
         let now = self.now();
         let mut tx = self.tx()?;
         let settles = PendingBatch {
@@ -914,8 +948,8 @@ impl App {
             ..PendingBatch::default()
         };
         for (index, op) in batch.ops().iter().enumerate() {
-            let proof = submitted.proofs.get(index);
-            self.settle_op(op, proof, &settles, &mut tx).await?;
+            self.settle_op(op, proofs.get(index), &settles, &mut tx)
+                .await?;
         }
         processed_writes(&mut tx, &pending.sender, &pending.msg_id, pending.hash, now)?;
         tx.local(&pending.local)?;
@@ -935,9 +969,84 @@ impl App {
             chain.write(&mut tx)?;
         }
         self.state.pending_effect = None;
-        self.commit(tx).await?;
-        self.check_attempts_of(batch, &submitted).await?;
-        Ok(Sent::Applied)
+        self.commit(tx).await
+    }
+
+    /// A kept effect signed for a generation before a provider change that the app's chain
+    /// can't tell about, sent again unchanged: the answer decides (Switch spec 12.5 "Kept
+    /// batches", Switch wire 6.4 step 6). Its original proofs, or `409 conflict` after an
+    /// import, show it applied, and its outcome commits; any other refusal for good, `409
+    /// stale_generation` among them, means it wasn't: it goes, and its entry is read again
+    /// and its effect signed anew. Any other failure keeps it.
+    async fn resend_earlier_effect(
+        &mut self,
+        pending: PendingEffect,
+        batch: &Batch,
+    ) -> Result<(), AppError> {
+        let proofs = match self.submit(batch).await {
+            Ok(submitted) => submitted.proofs,
+            Err(AppError::Switch(ClientError::Switch {
+                code: ErrorCode::Conflict,
+                ..
+            })) => Vec::new(),
+            Err(AppError::Switch(ClientError::Switch {
+                code: ErrorCode::StaleGeneration,
+                ..
+            })) if !super::provider::answer_decides(self.now(), pending.kept_ms) => {
+                return self.effect_uncertain(&pending).await;
+            }
+            Err(error) if refused_for_good(&error).is_some() => {
+                return self.drop_pending_effect().await;
+            }
+            Err(error) => return Err(error),
+        };
+        self.commit_effect(&pending, batch, &proofs).await?;
+        self.events.push(AppEvent::MessageReceived {
+            seq: pending.seq,
+            kind: pending.kind,
+            msg_id: pending.msg_id,
+            sender: pending.sender,
+        });
+        Ok(())
+    }
+
+    /// A kept effect answered `409 stale_generation` past the window in which that answer
+    /// means it was never applied: the service may have forgotten a batch it applied, so
+    /// the effect goes and its entry is stored and passed, never applied again. An entry
+    /// stored before keeps its plaintext and changes reason; another is stored when the
+    /// feed shows it again, since the cursor didn't pass it.
+    async fn effect_uncertain(&mut self, pending: &PendingEffect) -> Result<(), AppError> {
+        let mut tx = self.tx()?;
+        tx.delete(key::PENDING_EFFECT)?;
+        let stored = self.state.parked.get(&pending.seq).cloned();
+        match stored {
+            Some(mut entry) if pending.parked => {
+                entry.reason = ParkReason::Uncertain;
+                uncertain_processed(
+                    &mut tx,
+                    &pending.sender,
+                    &pending.msg_id,
+                    pending.hash,
+                    self.now(),
+                )?;
+                tx.put(&key::parked(pending.seq), &entry)?;
+                self.state.parked.insert(pending.seq, entry);
+                self.events.push(AppEvent::Parked {
+                    seq: pending.seq,
+                    reason: ParkReason::Uncertain,
+                });
+                self.events.push(AppEvent::EffectRefused {
+                    seq: pending.seq,
+                    sender: pending.sender,
+                    msg_id: pending.msg_id.clone(),
+                    kind: pending.kind.clone(),
+                    code: Some("stale_generation".into()),
+                });
+            }
+            _ => tx.put(&key::uncertain(&pending.sender, &pending.msg_id), &())?,
+        }
+        self.state.pending_effect = None;
+        self.commit(tx).await
     }
 
     async fn drop_pending_effect(&mut self) -> Result<(), AppError> {
@@ -953,6 +1062,9 @@ impl App {
             return Ok(());
         };
         let batch = Batch::from_body(pending.body.clone())?;
+        if super::batch_generation(&batch).is_some_and(|g| g < self.state.meta.generation) {
+            return self.resend_earlier_effect(pending, &batch).await;
+        }
         match self.run_effect(pending.clone(), &batch).await? {
             Sent::Applied => self.events.push(AppEvent::MessageReceived {
                 seq: pending.seq,
@@ -962,7 +1074,7 @@ impl App {
             }),
             // The entry is read again from the cursor, which didn't pass it, or from the
             // local store, and its effect built again.
-            Sent::Conflict(_) | Sent::StaleEpoch | Sent::Quota | Sent::Refused => {}
+            Sent::Conflict(_) | Sent::StaleEpoch | Sent::Quota | Sent::Refused(_) => {}
         }
         Ok(())
     }
@@ -1080,6 +1192,17 @@ impl App {
         Ok(())
     }
 
+    /// Tell the protocol that the effect of `received` won't be sent again (Switch spec 8.2).
+    fn effect_refused(&mut self, entry: &Entry, received: &Received, code: Option<String>) {
+        self.events.push(AppEvent::EffectRefused {
+            seq: entry.seq,
+            sender: entry.sender,
+            msg_id: received.message.msg_id.clone(),
+            kind: received.message.kind.clone(),
+            code,
+        });
+    }
+
     /// Entries stored locally, checked and applied again now (Switch spec 8.2); the cursor is
     /// past them.
     async fn retry_parked(&mut self) -> Result<(), AppError> {
@@ -1092,7 +1215,10 @@ impl App {
             // reads than an entry gets, isn't tried again.
             if matches!(
                 stored.reason,
-                ParkReason::Refused | ParkReason::TooManyOperations | ParkReason::TooManyReads
+                ParkReason::Refused
+                    | ParkReason::TooManyOperations
+                    | ParkReason::TooManyReads
+                    | ParkReason::Uncertain
             ) {
                 continue;
             }
@@ -1463,6 +1589,18 @@ impl App {
 
     /// Take an own copy outside the feed and commit what it changed.
     pub(crate) async fn take_own_copy(&mut self, doc: IdentityDoc) -> Result<bool, AppError> {
+        self.take_own_copy_with(doc, |_| Ok(())).await
+    }
+
+    /// [`App::take_own_copy`], with `also` written in the same commit as the copy, and only
+    /// if the copy is taken.
+    pub(crate) async fn take_own_copy_with(
+        &mut self,
+        doc: IdentityDoc,
+        also: impl FnOnce(&mut Tx) -> Result<(), AppError>,
+    ) -> Result<bool, AppError> {
+        // A published `identity.json`: the erasure wait starts over (Switch spec 12.7).
+        self.clear_erasing().await?;
         let version = self.state.own_doc.version();
         let mut read = Read::outside(self.tx()?);
         let result = self.own_identity_copy(doc, &mut read).await;
@@ -1470,6 +1608,7 @@ impl App {
             self.reload = true;
         }
         result?;
+        also(&mut read.tx)?;
         let epoch_rose = read.epoch_rose;
         self.commit(read.tx).await?;
         if epoch_rose {
@@ -1568,6 +1707,20 @@ impl App {
 }
 
 /// The processed pair and its time index.
+/// The processed pair of a message whose entry is parked as [`ParkReason::Uncertain`]: its
+/// effect may have been applied, so a re-send of it is a duplicate and never applies it
+/// again (Switch spec 11, 12.5 "Kept batches"). Every park as `Uncertain` writes it, in the
+/// same commit.
+pub(crate) fn uncertain_processed(
+    tx: &mut Tx,
+    sender: &[u8; 32],
+    msg_id: &str,
+    hash: [u8; 32],
+    now: u64,
+) -> Result<(), AppError> {
+    processed_writes(tx, sender, msg_id, hash, now)
+}
+
 pub(crate) fn processed_writes(
     tx: &mut Tx,
     sender: &[u8; 32],

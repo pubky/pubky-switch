@@ -77,6 +77,11 @@ fn rollback(error: ChainError) -> AppError {
 }
 
 impl ChainView {
+    /// The highest service time of a chain item verified, if any.
+    pub(crate) fn highest_time(&self) -> Option<u64> {
+        self.verifier.highest_time()
+    }
+
     /// A view anchored at `seq`, whose chain hash is `chain_hash`: a new app's anchor, just
     /// before the batch that registered its first receive key (Switch spec 8.3), taken
     /// from the transition proof the service signed for that batch.
