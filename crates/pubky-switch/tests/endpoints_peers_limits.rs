@@ -559,7 +559,8 @@ async fn test_peers_expired_certificate_comes_before_permissions_elsewhere() {
             "{method} {path}"
         );
     }
-    // Expired, `cert_expired` comes first.
+    // Expired, `cert_expired` comes first, signed at the service time it was judged at,
+    // which its refusal commits: after the certificate's expiry, not the last time stamped.
     let expired = "2026-12-01T00:00:00.000Z";
     set_time(&replay.clock, expired);
     for (method, path, _) in &calls {
@@ -567,6 +568,11 @@ async fn test_peers_expired_certificate_comes_before_permissions_elsewhere() {
         assert_eq!(
             (answer.status, body(&answer)["code"].clone()),
             (403, json!("cert_expired")),
+            "{method} {path}"
+        );
+        assert_eq!(
+            header_text(&answer, "switch-server-time"),
+            Some(expired),
             "{method} {path}"
         );
         assert!(header_text(&answer, "switch-head").is_none());

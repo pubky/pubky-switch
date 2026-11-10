@@ -852,14 +852,19 @@ impl Service {
             Err(error) => return Err(stop(error)),
         };
         // Check 3 of an app of another identity, at the identity's service time (Switch wire
-        // 7.2): its certificate hasn't expired.
-        if let Some(cert) = other
-            && cert.expired_at(time_ms)
-        {
-            return Err(Refused::with_head(
-                ApiError::new(ErrorCode::CertExpired, "3.8: the certificate has expired"),
-                serving,
-            ));
+        // 7.2): its certificate hasn't expired. The refusal commits this time and is signed
+        // at it. Then, at a call it doesn't make, the refusal it would have got before the
+        // lock (3.8: expiry first).
+        if let Some(cert) = other {
+            if cert.expired_at(time_ms) {
+                return Err(Refused::with_head(
+                    ApiError::new(ErrorCode::CertExpired, "3.8: the certificate has expired"),
+                    serving,
+                ));
+            }
+            if !rules::takes_other_apps(call) {
+                return Err(Refused::with_head(rules::other_app_refusal(call), serving));
+            }
         }
         // A call only the signer makes, from an own app that verified: refused with the head
         // (Switch wire 7.4, 7.1).
@@ -1071,9 +1076,10 @@ impl Service {
     /// An app of another identity before the lock (Switch wire 7.2): its certificate
     /// checked (`400`, `401`, counted against the network source), then the call. A call
     /// it makes goes on, its expiry judged under the lock. At any other call it is refused
-    /// here: `403 cert_expired` when its certificate has expired by the identity's service
-    /// time as far as it is known before the lock, since expiry comes before permissions
-    /// (3.8), else `rules::other_app_refusal`.
+    /// here (`rules::other_app_refusal`), unless its certificate has expired by the
+    /// identity's service time as far as it is known before the lock: expiry comes before
+    /// that refusal (3.8), so it goes on to the lock too, where its `403 cert_expired` is
+    /// judged and signed at the time the refusal commits.
     fn other_app_before_lock(
         &self,
         account: &str,
@@ -1090,14 +1096,8 @@ impl Service {
                 }
             })?;
         let call = &request.route.call;
-        if rules::takes_other_apps(call) {
+        if rules::takes_other_apps(call) || cert.expired_at(service_time_ms) {
             return Ok(cert);
-        }
-        if cert.expired_at(service_time_ms) {
-            return Err(ApiError::new(
-                ErrorCode::CertExpired,
-                "3.8: the certificate has expired",
-            ));
         }
         Err(rules::other_app_refusal(call))
     }
