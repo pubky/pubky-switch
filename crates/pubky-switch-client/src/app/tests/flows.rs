@@ -1390,6 +1390,10 @@ impl Protocol for WideProtocol {
         self.0.accepts(cert)
     }
 
+    fn check_body(&self, message: &ReceivedMessage) -> Result<(), String> {
+        self.0.check_body(message)
+    }
+
     fn receive(&self, message: &ReceivedMessage) -> Outcome {
         let ops = (0..8u8)
             .map(|n| (Vec::new(), OpKind::DenyPut { pubky: [n; 32] }))

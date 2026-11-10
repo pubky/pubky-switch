@@ -523,7 +523,7 @@ impl App {
         self.apply(entry, received, parked, read).await
     }
 
-    /// The protocol's check 10 and effect, at most twice after a conflict.
+    /// The protocol's check 10, then its effect, at most twice after a conflict.
     async fn apply(
         &mut self,
         entry: &Entry,
@@ -543,6 +543,10 @@ impl App {
             parked,
             conflict: None,
         };
+        if let Err(reason) = self.protocol.check_body(&message) {
+            self.note_processed(entry, &received, &[], parked, read)?;
+            return Ok(self.dropped(entry.seq, 10, reason));
+        }
         for _ in 0..2 {
             let protocol = Arc::clone(&self.protocol);
             let effect = match protocol.receive(&message) {

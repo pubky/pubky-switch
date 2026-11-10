@@ -77,6 +77,10 @@ impl Protocol for ItemsProtocol {
         kinds
     }
 
+    fn check_body(&self, message: &ReceivedMessage) -> Result<(), String> {
+        self.sample.check_body(message)
+    }
+
     fn receive(&self, message: &ReceivedMessage) -> Outcome {
         self.sample.receive(message)
     }
