@@ -810,12 +810,25 @@ impl App {
     /// The app should take one at every rotation, replacing the previous one (Switch spec
     /// 3.6).
     ///
+    /// A backup is only ever of committed state. After a failed commit the app's memory may
+    /// be ahead of its store, such as a cursor past an entry whose processed pair and local
+    /// writes weren't written, until its next call reads the store again: until then this
+    /// refuses, since a backup of that memory would restore past an entry never processed.
+    ///
     /// # Errors
     ///
-    /// [`Refusal::Stopped`] or [`Refusal::Left`] when there is nothing to back up.
+    /// [`Refusal::Stopped`] or [`Refusal::Left`] when there is nothing to back up;
+    /// [`Refusal::NotNow`] after a failed commit, until the app's next call reads its store
+    /// again.
     pub fn backup(&self) -> Result<AppBackup, AppError> {
         if self.state.leave.is_some() {
             return Err(Refusal::Left.into());
+        }
+        if self.reload {
+            return Err(Refusal::NotNow(
+                "a commit failed: the app reads its store again at its next call".into(),
+            )
+            .into());
         }
         let chain =
             self.state.chain.as_ref().ok_or_else(|| {

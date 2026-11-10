@@ -1174,3 +1174,68 @@ async fn test_receive_context_reads_the_local_writes_of_earlier_entries_in_the_r
     app.receive(None).await.unwrap();
     assert_eq!(count_of(app.protocol_get(COUNT).await.unwrap()), 3);
 }
+
+// -------------------------------------------------------------------------------------
+// A backup is of committed state
+
+/// The commit of the read below that commits its page, the second of the read: the test
+/// checks that memory is ahead of the store after it fails.
+const FAILING_COMMIT: u64 = 2;
+
+#[tokio::test]
+async fn test_backup_after_a_failed_commit_is_refused_until_the_store_is_read_again() {
+    let w = World::new();
+    let protocol = Arc::new(CounterProtocol {
+        sample: SampleProtocol::default(),
+        fails: Mutex::new(0),
+    });
+    let request = w.approve(&app_keys("wallet"), &["scope-a"]);
+    let mut app = App::join(w.env(), protocol.clone(), World::config(), request)
+        .await
+        .unwrap();
+    // A first read does what the join left due, so the next read's first commit is its
+    // page's.
+    app.receive(None).await.unwrap();
+    let me = app.app_id();
+    drop(app);
+    // The page's commit fails: memory moves past the note, the store doesn't.
+    let fault = Arc::new(FaultStore::new(
+        Arc::clone(&w.store) as Arc<dyn StateStore>,
+        StoreFault::FailBefore(FAILING_COMMIT),
+    ));
+    let mut app = App::load(
+        w.env_on(fault as Arc<dyn StateStore>),
+        protocol.clone(),
+        World::config(),
+        me,
+    )
+    .await
+    .unwrap();
+    let (seq, _) = w.note(me, "one");
+    let error = app.receive(None).await.unwrap_err();
+    assert_eq!(error, AppError::Store(StoreError::Unavailable));
+    assert!(app.cursor().seq >= seq, "memory is ahead");
+    assert_eq!(
+        app.protocol_get(COUNT).await.unwrap(),
+        None,
+        "the store isn't"
+    );
+    let error = app.backup().unwrap_err();
+    assert!(
+        matches!(error, AppError::Refused(crate::app::Refusal::NotNow(_))),
+        "{error:?}"
+    );
+    // The next call reads the store again and processes the note; then it backs up.
+    app.receive(None).await.unwrap();
+    assert_eq!(count_of(app.protocol_get(COUNT).await.unwrap()), 1);
+    let backup = app.backup().unwrap();
+    let restored = App::restore(
+        w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
+        protocol,
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    assert!(restored.cursor().seq >= seq);
+}
