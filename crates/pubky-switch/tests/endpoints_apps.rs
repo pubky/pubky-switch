@@ -192,6 +192,36 @@ async fn test_apps_after_the_chain() {
     assert_eq!(phone["open_attempts"], json!([]));
     // Never cached.
     assert_eq!(header_text(&answer, "cache-control"), Some("no-store"));
+    // Written in the order of the wire's tables (Switch wire 7.4.12).
+    let text = String::from_utf8(answer.body.clone()).expect("utf-8");
+    let at = |member: &str| {
+        text.find(&format!("\"{member}\":"))
+            .unwrap_or_else(|| panic!("no {member}"))
+    };
+    let members = [
+        "apps",
+        "app_id",
+        "current",
+        "last_seen",
+        "revoked_at",
+        "departed_at",
+        "awaiting_rotation",
+        "open_attempts",
+        "unread_entries",
+        "sole_target_unread",
+        "record_cert",
+        "record_at",
+        "lagging",
+        "keys_through",
+        "full_bundle_requested",
+        "bundle_ranges",
+        "cert_expires_at",
+    ];
+    for pair in members.windows(2) {
+        assert!(at(pair[0]) < at(pair[1]), "{} before {}", pair[0], pair[1]);
+    }
+    assert!(text.rfind("\"cert_expires_at\":").expect("last") < at("identity"));
+    assert!(at("identity") < at("recovery") && at("recovery") < at("proof_generations"));
     replay.db.drop_database().await.expect("drop");
 }
 

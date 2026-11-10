@@ -27,6 +27,41 @@ fn time(at: Option<u64>) -> Value {
     at.map_or(Value::Null, |at| json!(rfc3339(at)))
 }
 
+/// A value's JSON. Values of these types always serialize; the empty object stands in if
+/// one ever didn't.
+fn json_of(value: &impl serde::Serialize) -> Vec<u8> {
+    serde_json::to_vec(value).unwrap_or_else(|_| b"{}".to_vec())
+}
+
+/// A JSON object of `members`, in their order: the order of the wire's tables (Switch wire
+/// 7.4.12), which a map of `serde_json` would sort.
+fn object(members: &[(&str, Vec<u8>)]) -> Vec<u8> {
+    let mut out = vec![b'{'];
+    for (index, (name, value)) in members.iter().enumerate() {
+        if index > 0 {
+            out.push(b',');
+        }
+        out.extend_from_slice(&json_of(name));
+        out.push(b':');
+        out.extend_from_slice(value);
+    }
+    out.push(b'}');
+    out
+}
+
+/// A JSON array of `items`, each already JSON.
+fn array(items: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = vec![b'['];
+    for (index, item) in items.iter().enumerate() {
+        if index > 0 {
+            out.push(b',');
+        }
+        out.extend_from_slice(item);
+    }
+    out.push(b']');
+    out
+}
+
 /// Whether a departed app still awaits its rotation (Switch wire 7.4.12): until a delivered
 /// `identity.json` lists it in `removed` at a higher data epoch than the newest document's
 /// at its departure, which is done for good. Only a departure awaits one: the signer
@@ -35,8 +70,9 @@ pub(crate) fn awaiting_rotation(kept: &KeptAppId) -> bool {
     kept.reason == KeptReason::Departed && !kept.rotated
 }
 
-/// The statuses of `GET /apps`, at service time `now`, by App ID (Switch wire 7.4.12):
-/// every app with a row, every App ID kept for good, and every app `doc` lists.
+/// The statuses of `GET /apps`, at service time `now`, by App ID, each as JSON in the order
+/// of the wire's table (Switch wire 7.4.12): every app with a row, every App ID kept for
+/// good, and every app `doc` lists.
 ///
 /// # Errors
 ///
@@ -47,7 +83,7 @@ pub(crate) fn statuses(
     view: &AppsView,
     doc: Option<&IdentityDoc>,
     now: u64,
-) -> Result<Vec<Value>, StoreError> {
+) -> Result<Vec<Vec<u8>>, StoreError> {
     let mut state = OpsState::new(identity, generation, 0, now);
     state.doc = doc.cloned();
     for app in &view.apps {
@@ -95,42 +131,69 @@ pub(crate) fn statuses(
             .and_then(|row| row.cursor)
             .filter(|cursor| cursor.generation == generation)
             .map_or(0, |cursor| cursor.seq);
-        let open_attempts: Vec<Value> = view
+        let open_attempts: Vec<Vec<u8>> = view
             .open_attempts
             .iter()
             .filter(|attempt| attempt.owner == id)
             .map(|attempt| {
-                json!({
-                    "claim_key": b64(&attempt.claim_key),
-                    "attempt_id": b64(&attempt.attempt_id),
-                    "outcome": if attempt.unknown { "unknown" } else { "open" },
-                })
+                object(&[
+                    ("claim_key", json_of(&b64(&attempt.claim_key))),
+                    ("attempt_id", json_of(&b64(&attempt.attempt_id))),
+                    (
+                        "outcome",
+                        json_of(&if attempt.unknown { "unknown" } else { "open" }),
+                    ),
+                ])
             })
             .collect();
-        statuses.push(json!({
-            "app_id": zbase32_encode(&id),
-            "current": current,
-            "last_seen": time(view.last_seen.get(&id).copied()),
-            "revoked_at": time(revoked_at),
-            "departed_at": time(departed_at),
-            "awaiting_rotation": kept_id.is_some_and(awaiting_rotation),
-            "open_attempts": open_attempts,
+        let record_cert = held
+            .and_then(|app| app.record.as_ref())
+            .map(|record| b64(&AppRecord::cert(record).hash()));
+        let ranges: Vec<[u64; 2]> = parts
+            .iter()
+            .map(|part| [part.first_epoch, part.last_epoch])
+            .collect();
+        statuses.push(object(&[
+            ("app_id", json_of(&zbase32_encode(&id))),
+            ("current", json_of(&current)),
+            (
+                "last_seen",
+                json_of(&time(view.last_seen.get(&id).copied())),
+            ),
+            ("revoked_at", json_of(&time(revoked_at))),
+            ("departed_at", json_of(&time(departed_at))),
+            (
+                "awaiting_rotation",
+                json_of(&kept_id.is_some_and(awaiting_rotation)),
+            ),
+            ("open_attempts", array(&open_attempts)),
             // The inbox comes with POST /inbox: nothing is unread, no app is lagging.
-            "unread_entries": 0,
-            "sole_target_unread": 0,
-            "record_cert": held
-                .and_then(|app| app.record.as_ref())
-                .map_or(Value::Null, |record| json!(b64(&AppRecord::cert(record).hash()))),
-            "record_at": time(held.and_then(|app| app.record_at)),
-            "lagging": false,
-            "keys_through": keys_through(view.listings.get(&id).copied(), &spans, cursor),
-            "full_bundle_requested": time(held.and_then(|app| app.full_requested)),
-            "bundle_ranges": parts
-                .iter()
-                .map(|part| json!([part.first_epoch, part.last_epoch]))
-                .collect::<Vec<_>>(),
-            "cert_expires_at": time(state.checked_cert(&id).map(|cert| cert.expires_at())),
-        }));
+            ("unread_entries", json_of(&0)),
+            ("sole_target_unread", json_of(&0)),
+            ("record_cert", json_of(&record_cert)),
+            (
+                "record_at",
+                json_of(&time(held.and_then(|app| app.record_at))),
+            ),
+            ("lagging", json_of(&false)),
+            (
+                "keys_through",
+                json_of(&keys_through(
+                    view.listings.get(&id).copied(),
+                    &spans,
+                    cursor,
+                )),
+            ),
+            (
+                "full_bundle_requested",
+                json_of(&time(held.and_then(|app| app.full_requested))),
+            ),
+            ("bundle_ranges", json_of(&ranges)),
+            (
+                "cert_expires_at",
+                json_of(&time(state.checked_cert(&id).map(|cert| cert.expires_at()))),
+            ),
+        ]));
     }
     Ok(statuses)
 }
@@ -154,22 +217,21 @@ impl Service {
             &view.claim_entry_generations,
             recovery_from,
         );
-        let mut body = json!({
-            "apps": apps,
-            "identity": held.map_or(Value::Null, |doc| json!(doc.signed())),
+        let mut members = vec![
+            ("apps", array(&apps)),
+            ("identity", json_of(&held.map(IdentityDoc::signed))),
             // Recovery comes with provider changes.
-            "recovery": null,
-        });
+            ("recovery", b"null".to_vec()),
+        ];
         // Absent when no kept proof names a generation (Switch wire 7.4.12).
         if !proof_generations.is_empty() {
-            body["proof_generations"] = json!(proof_generations);
+            members.push(("proof_generations", json_of(&proof_generations)));
         }
         let head = self
             .head(txn, signer)
             .await
             .ok_or_else(|| ApiError::unavailable("7.6: a temporary failure"))?;
-        let body = serde_json::to_vec(&body)
-            .map_err(|_| ApiError::unavailable("7.6: a temporary failure"))?;
+        let body = object(&members);
         let mut answer = Answer::ok(body).with_head(Some(head));
         // Never cached (Switch wire 7.4.12).
         answer.no_store = true;
