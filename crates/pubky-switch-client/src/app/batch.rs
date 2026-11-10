@@ -562,10 +562,9 @@ impl App {
             return Ok(());
         }
         let kept = self.reader().scan::<PendingBatch>(PENDING_PREFIX).await?;
-        if !kept.is_empty() {
-            self.fresh_service_time().await?;
-        }
         for (id, pending) in kept {
+            // Fresh again before each, should the sends before it have taken long.
+            self.fresh_service_time().await?;
             let id = pubky_switch_core::enc::unb64_array::<16>(&id)
                 .map_err(|_| AppError::Store(crate::error::StoreError::Corrupt))?;
             let batch = self.without_stale_cursor(Batch::from_body(pending.body.clone())?)?;

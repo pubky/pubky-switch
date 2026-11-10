@@ -505,8 +505,9 @@ pub struct App {
     /// The highest duty event counter handed to the host since the app was made: no
     /// acknowledgement removes one above it.
     duty_handed: u64,
-    /// A verified service time came with an answer in this call ([`App::fresh_service_time`]).
-    time_fresh: bool,
+    /// When, by the device clock, an answer in this call last brought a verified service
+    /// time ([`App::fresh_service_time`]).
+    time_fresh_at: Option<u64>,
 }
 
 impl std::fmt::Debug for App {
@@ -684,7 +685,7 @@ impl App {
                 events: Vec::new(),
                 duty_queued: 0,
                 duty_handed: 0,
-                time_fresh: false,
+                time_fresh_at: None,
             };
             app.update_keys_through();
             app.events.clear();
@@ -804,7 +805,7 @@ impl App {
                 events: Vec::new(),
                 duty_queued: 0,
                 duty_handed: 0,
-                time_fresh: false,
+                time_fresh_at: None,
             };
             // A store an earlier build wrote keeps the epoch read now.
             if !app.reader().exists(key::DUTY_EPOCH).await? {
@@ -1271,7 +1272,7 @@ impl App {
                 events: Vec::new(),
                 duty_queued: 0,
                 duty_handed: 0,
-                time_fresh: false,
+                time_fresh_at: None,
             };
             // Every write of the one commit; what fails here is a write the store can't
             // take in one batch, over its sizes.
@@ -2040,7 +2041,7 @@ impl App {
     /// Reload after a failed commit, and refuse calls the app's state forbids.
     async fn ready_local(&mut self) -> Result<(), AppError> {
         // Each call takes a service time of its own before it judges a kept batch's age.
-        self.time_fresh = false;
+        self.time_fresh_at = None;
         if self.reload {
             self.state = Self::read_state(&self.reader()).await?;
             self.client = Self::client_for(
@@ -2106,8 +2107,8 @@ impl App {
         // Only the latest call's own stamped time: a refusal answered before the request
         // verified carries the last committed time, and measures nothing (Switch wire 7.1).
         let time = self.client.latest_server_time()?;
-        self.time_fresh = true;
         let now = self.now();
+        self.time_fresh_at = Some(now);
         let key = self.state.meta.service_key;
         let offset = i64::try_from(time)
             .unwrap_or(i64::MAX)

@@ -1433,6 +1433,27 @@ async fn test_kept_batch_kept_after_an_idle_month_is_resent_after_a_lost_answer(
 }
 
 #[tokio::test]
+async fn test_fresh_service_time_is_read_again_once_it_has_aged() {
+    let w = World::new();
+    let (mut app, clock) = app_with_its_own_clock(&w, 0).await;
+    app.receive(None).await.unwrap();
+    let read_at = app.time_fresh_at.unwrap();
+    // Within the bound, the time read in the call counts.
+    clock.advance_ms(crate::app::provider::FRESH_SERVICE_TIME_MS);
+    app.fresh_service_time().await.unwrap();
+    assert_eq!(app.time_fresh_at, Some(read_at));
+    // Past it, by the device clock, it is read again.
+    clock.advance_ms(1);
+    app.fresh_service_time().await.unwrap();
+    assert_eq!(app.time_fresh_at, Some(clock.now_ms()));
+    // A device clock gone back since counts as not fresh either.
+    let again = clock.now_ms();
+    clock.set_ms(again - 60_000);
+    app.fresh_service_time().await.unwrap();
+    assert_eq!(app.time_fresh_at, Some(again - 60_000));
+}
+
+#[tokio::test]
 async fn test_kept_effect_window_holds_with_the_device_clock_behind_at_the_resend() {
     let w = World::new();
     let (mut app, clock) = app_with_its_own_clock(&w, 0).await;

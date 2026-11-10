@@ -255,13 +255,18 @@ impl App {
 
     /// A service time verified in this call, before a kept batch's age is judged: a read of
     /// one feed item, the cheapest authenticated request, when no answer of this call
-    /// brought one yet ([`App::kept_window_now`]).
+    /// brought one within [`FRESH_SERVICE_TIME_MS`] on the device clock
+    /// ([`App::kept_window_now`]).
     ///
     /// # Errors
     ///
     /// The read's: the age isn't judged, and the kept batch stays as it is.
     pub(crate) async fn fresh_service_time(&mut self) -> Result<(), AppError> {
-        if self.time_fresh {
+        let now = self.now();
+        let fresh = self
+            .time_fresh_at
+            .is_some_and(|at| now >= at && now - at <= FRESH_SERVICE_TIME_MS);
+        if fresh {
             return Ok(());
         }
         let query = crate::client::answers::FeedQuery {
@@ -292,6 +297,14 @@ impl App {
         answer_decides(self.kept_window_now(), kept_ms)
     }
 }
+
+/// How long, by the device clock, a service time verified in a call counts as fresh for
+/// judging a kept batch's age ([`App::fresh_service_time`]); a device clock gone back since
+/// it came counts as not fresh. The window ends an hour before the service's 30 days, and
+/// the worst case of the clocks and a request's accepted time takes some 20 minutes of it
+/// ([`KEPT_BATCH_MARGIN_MS`]): 10 minutes between the reading and the send leaves half an
+/// hour.
+pub(crate) const FRESH_SERVICE_TIME_MS: u64 = 10 * 60 * 1000;
 
 /// How many provider changes one follow takes in a row, each given up for a newer own
 /// `identity.json` met on the way; the next call goes on from there.
