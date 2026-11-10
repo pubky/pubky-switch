@@ -25,6 +25,10 @@
 //! keeps what it checked, and calls the step again with the answer in the context
 //! ([`ReceiveContext::switch_claim`]), at most [`super::MAX_CLAIM_READS`] claims per entry.
 //!
+//! The step can also ask what the app knows of a sender's standing in the own identity's
+//! lists ([`ReceiveContext::sender_disposition`]): whether the user blocked it or the
+//! service flagged it, and how fresh that is.
+//!
 //! The protocol's other callbacks get a [`LocalView`]: the identity, the App ID and the
 //! protocol's local state, read-only.
 
@@ -32,6 +36,7 @@ use pubky_switch_core::claims::{ClaimView, EntryKind};
 use pubky_switch_core::ops::{Condition, MAX_BATCH_ENTRIES, OpKind, RecordVersion};
 use pubky_switch_core::records::AppCert;
 
+use super::admission::{LISTS_AT, SenderDisposition, deny_key, flag_key};
 use super::claims::{ClaimOp, ClaimRead, KeptClaim, ObligationDeadline, claim_key_of};
 use super::error::Refusal;
 use super::protocol::LocalWrite;
@@ -41,7 +46,7 @@ use super::records::{
 };
 use super::state::{PROTOCOL_PREFIX, decode};
 use super::{AppError, AppState};
-use crate::store::{KeyValue, StateStore};
+use crate::store::{KeyValue, StateStore, Write};
 
 /// The most entries one store scan returns; scans page through larger sets.
 const SCAN_PAGE: u32 = 256;
@@ -90,6 +95,9 @@ pub struct ReceiveContext<'a> {
     /// The local writes of the entries processed before this one in the same read, not yet
     /// committed.
     pending: &'a [LocalWrite],
+    /// Every write of the same read not yet committed, such as a deny list change the feed
+    /// showed before this entry.
+    pending_app: &'a [Write],
     writes: ContextWrites,
 }
 
@@ -116,6 +124,21 @@ fn pending_get(pending: &[LocalWrite], key: &[u8]) -> Option<Option<Vec<u8>>> {
         LocalWrite::Put { key: k, value } if k.as_slice() == key => Some(Some(value.clone())),
         LocalWrite::Delete { key: k } if k.as_slice() == key => Some(None),
         LocalWrite::DeletePrefix { prefix } if key.starts_with(prefix) => Some(None),
+        _ => None,
+    })
+}
+
+/// An app key's value after `pending`, the read's writes not yet committed: as
+/// [`pending_get`], for the app's own keys in `ns`.
+fn pending_app_get(pending: &[Write], ns: &str, key: &[u8]) -> Option<Option<Vec<u8>>> {
+    pending.iter().rev().find_map(|write| match write {
+        Write::Put {
+            ns: n,
+            key: k,
+            value,
+        } if n == ns && k.as_slice() == key => Some(Some(value.clone())),
+        Write::Delete { ns: n, key: k } if n == ns && k.as_slice() == key => Some(None),
+        Write::DeletePrefix { ns: n, prefix } if n == ns && key.starts_with(prefix) => Some(None),
         _ => None,
     })
 }
@@ -232,6 +255,7 @@ impl<'a> ReceiveContext<'a> {
         may_attempt: bool,
         fetched: &'a [([u8; 32], ClaimFetch)],
         pending: &'a [LocalWrite],
+        pending_app: &'a [Write],
     ) -> Self {
         Self {
             state,
@@ -240,6 +264,7 @@ impl<'a> ReceiveContext<'a> {
             may_attempt,
             fetched,
             pending,
+            pending_app,
             writes: ContextWrites::default(),
         }
     }
@@ -393,6 +418,41 @@ impl<'a> ReceiveContext<'a> {
             .iter()
             .find(|(key, _)| key == claim_key)
             .map(|(_, fetch)| fetch)
+    }
+
+    /// What the app knows of `pubky`'s standing in the own identity's lists before this
+    /// message: on the app's copy of the deny list, among the flagged senders of its last
+    /// [`super::App::allow_list`], and when that was ([`SenderDisposition`]). It reads the
+    /// copy as committed, with the changes the feed showed earlier in the same read, which
+    /// aren't committed yet.
+    ///
+    /// A protocol that keeps only a count of messages from a blocked or flagged sender
+    /// (Switch spec 7 "Spam") asks for the message's sender. Both values are only as fresh
+    /// as the app's copy of the lists: an app with `lists.read` refreshes it with
+    /// [`super::App::allow_list`] when [`SenderDisposition::lists_as_of_ms`] is `None` or
+    /// older than it accepts.
+    ///
+    /// # Errors
+    ///
+    /// A store failure, or a kept time that doesn't read.
+    pub fn sender_disposition(&self, pubky: &[u8; 32]) -> Result<SenderDisposition, AppError> {
+        let lists_as_of_ms = match self.app_get(LISTS_AT)? {
+            None => None,
+            Some(bytes) => Some(decode::<u64>(&bytes)?),
+        };
+        Ok(SenderDisposition {
+            blocked: self.app_get(&deny_key(pubky))?.is_some(),
+            flagged: self.app_get(&flag_key(pubky))?.is_some(),
+            lists_as_of_ms,
+        })
+    }
+
+    /// An app key's stored value, with the read's writes not yet committed.
+    fn app_get(&self, key: &str) -> Result<Option<Vec<u8>>, AppError> {
+        match pending_app_get(self.pending_app, self.ns, key.as_bytes()) {
+            Some(value) => Ok(value),
+            None => self.store.get(self.ns, key.as_bytes()).map_err(store_error),
+        }
     }
 
     /// A value of the protocol's own local state before this message: as committed, with

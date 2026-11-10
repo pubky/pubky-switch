@@ -28,7 +28,7 @@ use super::error::AppError;
 use super::events::{AppEvent, ParkReason};
 use super::protocol::LocalWrite;
 use crate::error::StoreError;
-use crate::store::{StoreHandle, WriteBatch};
+use crate::store::{StoreHandle, Write, WriteBatch};
 
 /// The schema version of every value the app layer writes. 2: a kept effect keeps the
 /// entry it is for (`pending/effect`).
@@ -679,6 +679,11 @@ impl Tx {
     /// The protocol's local writes in the batch, not yet committed, in order.
     pub(crate) fn pending_local(&self) -> &[LocalWrite] {
         &self.local
+    }
+
+    /// Every write in the batch, not yet committed, in order.
+    pub(crate) fn pending_writes(&self) -> &[Write] {
+        &self.batch.writes
     }
 
     pub(crate) fn is_empty(&self) -> bool {

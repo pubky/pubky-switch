@@ -21,7 +21,7 @@ use super::*;
 use crate::app::{
     AppError, AppEvent, ClaimOp, Collection, Delivery, MAX_CURSOR_DEFER_MS, ObligationDeadline,
     OpBatch, OutgoingMessage, PolicyFamily, ReceiveContext, RecordJob, RecordTarget, Refusal,
-    SentMessage, SwitchCopy,
+    SenderDisposition, SentMessage, SwitchCopy,
 };
 use crate::store::{Fault as StoreFault, FaultStore};
 use crate::testing::{Router, SWITCH_ORIGIN};
@@ -60,6 +60,8 @@ struct Seen {
     /// The context's answers to the writes, as text.
     writes: Vec<Result<(), String>>,
     context: Option<Value>,
+    /// What the context knew of the sender's standing in the lists.
+    disposition: Option<SenderDisposition>,
 }
 
 /// [`ItemsProtocol`], with a receive step that uses the [`ReceiveContext`].
@@ -137,6 +139,7 @@ impl Protocol for ApiProtocol {
             conflict: message.conflict.is_some(),
             writes: Vec::new(),
             context: message.context.clone(),
+            disposition: cx.sender_disposition(&message.sender).ok(),
         };
         let outcome = match mode {
             Mode::Plain => self.receive(message),
@@ -1602,6 +1605,171 @@ async fn test_identity_of_refuses_an_equivocating_counterparty() {
     let alice = p.alice.identity().public();
     let own = wallet.identity_of(&alice, false).await.unwrap_err();
     assert!(matches!(own, AppError::Refused(Refusal::Usage(_))));
+}
+
+// -------------------------------------------------------------------------------------
+// A sender's standing in the lists, as a receive step reads it (Switch spec 7 "Spam")
+
+/// The disposition the receive step saw for the last message.
+fn last_disposition(protocol: &ApiProtocol) -> SenderDisposition {
+    protocol.seen().last().unwrap().disposition.unwrap()
+}
+
+/// Bob's shop with alice invited, and a note from alice's wallet waiting in its inbox.
+async fn shop_with_a_note(p: &Pair, protocol: &Arc<ApiProtocol>) -> App {
+    let mut wallet = p.join(&p.alice, "wallet", protocol).await;
+    let mut shop = p.join(&p.bob, "shop", protocol).await;
+    shop.invite(&p.alice.identity().public()).await.unwrap();
+    let (_, delivery) = wallet.send(Pair::note(&p.bob, "hello")).await.unwrap();
+    assert!(
+        matches!(delivery, Delivery::Accepted { .. }),
+        "{delivery:?}"
+    );
+    shop
+}
+
+#[tokio::test]
+async fn test_sender_disposition_neither_after_a_refresh() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let mut shop = shop_with_a_note(&p, &protocol).await;
+    // Another sender is flagged and blocked; alice is neither.
+    let carol = p.carol.identity().public();
+    p.bob.switch().lock().shared.flagged.insert(carol, 3);
+    shop.deny(&carol).await.unwrap();
+    shop.allow_list().await.unwrap();
+    let as_of = shop.highest_service_time();
+    shop.receive(None).await.unwrap();
+    let seen = last_disposition(&protocol);
+    assert!(!seen.blocked && !seen.flagged, "{seen:?}");
+    assert!(as_of.is_some());
+    assert_eq!(seen.lists_as_of_ms, as_of);
+}
+
+#[tokio::test]
+async fn test_sender_disposition_blocked() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let mut shop = shop_with_a_note(&p, &protocol).await;
+    // Denied after the inbox accepted the note.
+    shop.deny(&p.alice.identity().public()).await.unwrap();
+    shop.allow_list().await.unwrap();
+    shop.receive(None).await.unwrap();
+    let seen = last_disposition(&protocol);
+    assert!(seen.blocked && !seen.flagged, "{seen:?}");
+}
+
+#[tokio::test]
+async fn test_sender_disposition_flagged() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let mut shop = shop_with_a_note(&p, &protocol).await;
+    let alice = p.alice.identity().public();
+    p.bob.switch().lock().shared.flagged.insert(alice, 4);
+    let list = shop.allow_list().await.unwrap();
+    assert_eq!(list.flagged.len(), 1);
+    shop.receive(None).await.unwrap();
+    let seen = last_disposition(&protocol);
+    assert!(seen.flagged && !seen.blocked, "{seen:?}");
+    assert!(seen.lists_as_of_ms.is_some());
+}
+
+#[tokio::test]
+async fn test_sender_disposition_refresh_clears_a_flag() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let mut shop = shop_with_a_note(&p, &protocol).await;
+    let alice = p.alice.identity().public();
+    p.bob.switch().lock().shared.flagged.insert(alice, 3);
+    shop.allow_list().await.unwrap();
+    let first = shop.highest_service_time().unwrap();
+    // The service drops the flag; the next refresh replaces the copy.
+    p.bob.switch().lock().shared.flagged.clear();
+    p.clock.advance_ms(MINUTE);
+    shop.allow_list().await.unwrap();
+    shop.receive(None).await.unwrap();
+    let seen = last_disposition(&protocol);
+    assert!(!seen.flagged && !seen.blocked, "{seen:?}");
+    assert!(seen.lists_as_of_ms.unwrap() >= first + MINUTE, "{seen:?}");
+}
+
+#[tokio::test]
+async fn test_sender_disposition_never_refreshed_shows_only_own_deny_changes() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let mut shop = shop_with_a_note(&p, &protocol).await;
+    let alice = p.alice.identity().public();
+    // The service flags alice, but the shop never read its lists: only its own deny shows.
+    p.bob.switch().lock().shared.flagged.insert(alice, 3);
+    shop.deny(&alice).await.unwrap();
+    shop.receive(None).await.unwrap();
+    let seen = last_disposition(&protocol);
+    assert_eq!(seen.lists_as_of_ms, None);
+    assert!(seen.blocked && !seen.flagged, "{seen:?}");
+}
+
+#[tokio::test]
+async fn test_sender_disposition_sees_an_undeny_earlier_in_the_same_read() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let mut wallet = p.join(&p.alice, "wallet", &protocol).await;
+    let mut shop = p.join(&p.bob, "shop", &protocol).await;
+    let mut kiosk = p.join(&p.bob, "kiosk", &protocol).await;
+    let alice = p.alice.identity().public();
+    shop.invite(&alice).await.unwrap();
+    shop.deny(&alice).await.unwrap();
+    // Another of bob's apps lifts the block; alice writes again.
+    kiosk.undeny(&alice).await.unwrap();
+    let (msg_id, delivery) = wallet.send(Pair::note(&p.bob, "hello")).await.unwrap();
+    assert!(
+        matches!(delivery, Delivery::Accepted { .. }),
+        "{delivery:?}"
+    );
+    // The shop's copy still holds its own deny until the feed's undeny commits, which is in
+    // the same read as the note.
+    shop.receive(None).await.unwrap();
+    let seen = protocol.seen();
+    let seen = seen.iter().find(|s| s.msg_id == msg_id).unwrap();
+    assert!(!seen.disposition.unwrap().blocked, "{seen:?}");
+}
+
+#[tokio::test]
+async fn test_sender_disposition_flagged_list_is_kept_whole() {
+    // `max_flags` at the default limits (Switch wire 9.2), and one more, as a service with a
+    // raised limit may answer: every flagged sender is kept, as every entry of the other
+    // lists is.
+    const MAX_FLAGS: u32 = 1_000;
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let store = Arc::new(MemoryStore::new());
+    let mut wallet = p.join(&p.alice, "wallet", &protocol).await;
+    let mut shop = p
+        .join_on(
+            &p.bob,
+            "shop",
+            protocol.clone(),
+            Arc::clone(&store) as Arc<dyn StateStore>,
+        )
+        .await;
+    let alice = p.alice.identity().public();
+    shop.invite(&alice).await.unwrap();
+    wallet.send(Pair::note(&p.bob, "hello")).await.unwrap();
+    {
+        let mut switch = p.bob.switch().lock();
+        for n in 0..MAX_FLAGS {
+            let mut pubky = [7u8; 32];
+            pubky[..4].copy_from_slice(&n.to_be_bytes());
+            switch.shared.flagged.insert(pubky, 3);
+        }
+        switch.shared.flagged.insert(alice, 3);
+    }
+    let list = shop.allow_list().await.unwrap();
+    assert_eq!(list.flagged.len(), 1_001);
+    let ns = crate::store::client_namespace(&shop.app_id());
+    let kept = store.scan(&ns, b"lc/flag/", None, 10_000).unwrap();
+    assert_eq!(kept.len(), 1_001);
+    shop.receive(None).await.unwrap();
+    assert!(last_disposition(&protocol).flagged);
 }
 
 // -------------------------------------------------------------------------------------

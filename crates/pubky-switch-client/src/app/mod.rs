@@ -78,7 +78,7 @@ pub use push::{MAX_HANDLE_BYTES, MAX_HANDLES, PushHandles, PushRegistration, Pus
 pub use recovery::{Evidence, LossActions, ProviderLoss, RESIDUAL_WINDOW_MS, RecoveryInfo};
 pub use state::{PROTOCOL_PREFIX, SCHEMA_VERSION};
 
-pub use admission::{INVITE_CODE_BYTES, InviteCode};
+pub use admission::{INVITE_CODE_BYTES, InviteCode, SenderDisposition};
 pub use batch::{OpBatch, server_time_in};
 pub use claims::{
     ClaimDoubt, ClaimEntryRead, ClaimEvidence, ClaimOp, ClaimRead, ClaimWritten,

@@ -17,7 +17,8 @@
 //! it registered, `invite/<code_hash>`. A send consults them to skip a conversation entry
 //! the identity already holds. The flagged senders (`lc/flag/`), which no feed item
 //! carries, come only from `GET /allow` ([`App::allow_list`]), which also keeps when the
-//! copy was last replaced (`lc/lists_at`).
+//! copy was last replaced (`lc/lists_at`); a protocol's receive step reads both, with the
+//! deny list, as a [`SenderDisposition`].
 
 use pubky_switch_core::enc::{b64, pubky_id, random_bytes, serde_b64};
 use pubky_switch_core::http::ErrorCode;
@@ -62,6 +63,37 @@ pub(crate) fn flag_key(pubky: &[u8; 32]) -> String {
 /// When [`App::allow_list`] last replaced the copy of the lists: the service time of its
 /// answer, Unix milliseconds. Absent until the first.
 pub(crate) const LISTS_AT: &str = "lc/lists_at";
+
+/// What the app knows of a sender's standing in the own identity's lists, for a protocol's
+/// receive step ([`super::ReceiveContext::sender_disposition`]), such as to keep only a
+/// count of messages from a sender the user blocked or the service flagged (Switch spec 7
+/// "Spam").
+///
+/// Both values are as fresh as the app's copy of the lists. `blocked` follows the app's own
+/// deny and undeny, the deny list changes the feed shows an app with `lists.read`, and the
+/// last [`App::allow_list`]. `flagged` follows only the last [`App::allow_list`]: no feed
+/// item carries the flags, so it is `false` for every sender until the app first refreshes
+/// its lists, which [`SenderDisposition::lists_as_of_ms`] tells apart.
+///
+/// The service refuses a denied sender at the inbox (Switch spec 7), so `blocked` reaches a
+/// protocol only for a message accepted before the block, or after a deny that another app
+/// made and this one hasn't seen yet.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SenderDisposition {
+    /// The sender is on the app's copy of the deny list.
+    pub blocked: bool,
+    /// The sender was among the flagged senders of the last [`App::allow_list`] (Switch
+    /// wire 7.4.6): it hit the rate limits at least 3 times.
+    pub flagged: bool,
+    /// The service time, Unix milliseconds, of the `GET /allow` answer the copy of the
+    /// lists was last replaced from, to compare with
+    /// [`super::ReceiveContext::highest_service_time`] when deciding to refresh; `None`
+    /// when the app never refreshed its lists, as an app without `lists.read`: `flagged`
+    /// is then `false`, and `blocked` reflects only the app's own deny changes and those
+    /// the feed showed it.
+    pub lists_as_of_ms: Option<u64>,
+}
 
 /// An invite code this app registered, in the copy of the lists.
 pub(crate) fn code_key(code_hash: &[u8; 32]) -> String {
@@ -256,7 +288,7 @@ impl App {
     /// conversation entries with their writers, the deny list, flagged senders and the live
     /// invite codes. What the app keeps of them is replaced in one commit: the contacts,
     /// conversation entries, deny list, flagged senders and its own invite codes, with the
-    /// answer's service time (`lc/lists_at`).
+    /// answer's service time ([`SenderDisposition::lists_as_of_ms`]).
     ///
     /// Each list is kept whole, as the answer holds it. At the default limits that is at
     /// most `max_flags`, 1,000, flagged senders (Switch wire 9.2); beyond the limits, the

@@ -676,6 +676,7 @@ impl App {
                     may_attempt,
                     &fetched,
                     read.tx.pending_local(),
+                    read.tx.pending_writes(),
                 );
                 let outcome = protocol.receive_with(&message, &mut cx);
                 (outcome, cx.into_writes())
