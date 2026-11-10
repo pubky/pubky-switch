@@ -35,9 +35,10 @@ pub(crate) mod read;
 mod rules;
 
 pub use batch::{
-    BATCH_PROOFS_MS, BatchEffect, BatchRecord, ConditionState, Entry, Held, MAX_BATCH_ENTRIES,
-    OpsRequest, Position, RetryCheck, batch_effect, check_batch, check_conditions, check_cursor,
-    depends_on_time, ops_hash, random_batch_id, retry_check, sign_batch, unchanged,
+    BATCH_PROOFS_MS, BatchEffect, BatchRecord, ConditionState, CursorMove, Entry, Held,
+    MAX_BATCH_ENTRIES, OpsRequest, Position, RetryCheck, batch_effect, check_batch,
+    check_conditions, check_cursor, depends_on_time, ops_hash, random_batch_id, retry_check,
+    sign_batch, unchanged,
 };
 pub use body::{
     AllowKind, BatchRef, Condition, IdInputs, InviteCodePut, InviteContext, KeyBundlePut,

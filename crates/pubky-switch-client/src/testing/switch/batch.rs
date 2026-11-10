@@ -10,8 +10,8 @@ use std::collections::BTreeMap;
 use pubky_switch_core::chain::{ItemType, ProofState};
 use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::ops::{
-    AllowKind, AppPutEffect, BATCH_PROOFS_MS, BatchEffect, BatchRecord, CertPutEffect, Held,
-    KeyBundleEffect, KeyBundlePut, OpKind, Position, ReceiveKeyEffect, Refusal, RetryCheck,
+    AllowKind, AppPutEffect, BATCH_PROOFS_MS, BatchEffect, BatchRecord, CertPutEffect, CursorMove,
+    Held, KeyBundleEffect, KeyBundlePut, OpKind, Position, ReceiveKeyEffect, Refusal, RetryCheck,
     SignedOp, Writer, batch_effect, check_app_put, check_batch, check_cert_put, check_conditions,
     check_cursor, check_key_bundle_put, check_permission, check_receive_key_put, check_shape,
     ops_hash, retry_check,
@@ -242,8 +242,17 @@ impl Inner {
         };
         // Step 10, within the bounds of the sequence (Switch wire 6.2).
         if let (Some(app), Some(position)) = (caller, cursor) {
-            check_cursor(position, generation, self.continued_from, self.seq)?;
-            draft.apps.entry(app).or_default().cursor = position.seq;
+            let held = &mut draft.apps.entry(app).or_default().cursor;
+            if check_cursor(
+                position,
+                generation,
+                self.continued_from,
+                self.seq,
+                Some(*held),
+            )? == CursorMove::Moves
+            {
+                *held = position.seq;
+            }
         }
         if effect == BatchEffect::Unchanged {
             self.commit(draft);

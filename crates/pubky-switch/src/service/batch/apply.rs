@@ -10,8 +10,8 @@ use pubky_switch_core::{
     chain::ProofState,
     claims::{EntryContext, apply_entry},
     ops::{
-        AppPutEffect, CertPutEffect, KeyBundleEffect, Limits, List, OpKind, Position, Quota,
-        ReceiveKeyEffect, Refusal, SignedOp, StateAfter, StoredPart, Writer, check_app_put,
+        AppPutEffect, CertPutEffect, CursorMove, KeyBundleEffect, Limits, List, OpKind, Position,
+        Quota, ReceiveKeyEffect, Refusal, SignedOp, StateAfter, StoredPart, Writer, check_app_put,
         check_cert_put, check_conditions, check_cursor, check_invite_code_put,
         check_key_bundle_put, check_permission, check_quota, check_receive_key_put, check_shape,
         covers, invite_code_delete, proof_state,
@@ -100,12 +100,13 @@ fn set_cursor(
             "Switch wire 6.2: the signer's batch carries no cursor.set",
         ));
     };
-    // No account continues another's sequence before cooperative moves are served.
-    check_cursor(position, state.generation, None, state.newest_seq)?;
     // The cursor only moves forward: a position at or behind it leaves it where it is, and
-    // isn't an error (Switch spec 8.3, Switch wire 6.2).
+    // isn't an error (Switch spec 8.3, Switch wire 6.2). No account continues another's
+    // sequence before cooperative moves are served.
     let cursor = &mut state.apps.entry(cert.app_id()).or_default().cursor;
-    if cursor.is_none_or(|current| position > current) {
+    let held = cursor.map(|current| current.seq);
+    if check_cursor(position, state.generation, None, state.newest_seq, held)? == CursorMove::Moves
+    {
         *cursor = Some(position);
     }
     Ok(())

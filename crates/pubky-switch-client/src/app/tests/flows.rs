@@ -1793,3 +1793,44 @@ async fn test_app_refusal_before_the_lock_measures_no_service_time() {
     assert_eq!(app.highest_service_time(), Some(w.clock.now_ms()));
     assert_eq!(app.clock_skew_ms(), Some(0));
 }
+
+#[tokio::test]
+async fn test_switch_cursor_set_behind_the_cursor_changes_nothing() {
+    use pubky_switch_core::ops::{OpsRequest, Position};
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let me = app.app_id();
+    w.note(me, "one");
+    app.receive(None).await.unwrap();
+    app.flush_cursor().await.unwrap();
+    let cursor = w.switch.app(&me).cursor;
+    assert!(cursor > 1);
+    let post = |seq: u64| {
+        let generation = w.switch.identity_doc().unwrap().generation();
+        let body = OpsRequest::new(&[], Some(Position { generation, seq })).to_json();
+        w.switch
+            .handle(&crate::transport::Request {
+                method: "POST".into(),
+                origin: crate::testing::SWITCH_ORIGIN.into(),
+                path_and_query: format!("/v1/{}/ops", w.alice.id()),
+                headers: vec![
+                    crate::transport::Header::new(
+                        pubky_switch_core::http::header::IDENTITY,
+                        &w.alice.id(),
+                    ),
+                    crate::transport::Header::new(
+                        pubky_switch_core::http::header::APP,
+                        &pubky_switch_core::enc::zbase32_encode(&me),
+                    ),
+                ],
+                body,
+            })
+            .unwrap()
+            .status
+    };
+    // Behind it, or at it: answered, and the cursor stays.
+    assert_eq!(post(cursor - 1), 200);
+    assert_eq!(w.switch.app(&me).cursor, cursor);
+    assert_eq!(post(cursor), 200);
+    assert_eq!(w.switch.app(&me).cursor, cursor);
+}
