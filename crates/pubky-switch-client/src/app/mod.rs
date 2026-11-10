@@ -113,8 +113,8 @@ use serde::{Deserialize, Serialize};
 use self::chain::ChainView;
 use self::state::{
     BundleState, CachedDoc, Cursor, Device, HeldEntry, HeldKey, JoinStep, KnownKid, LeaveState,
-    Meta, ParkedEntry, PendingEffect, PendingRecord, Reader, Registration, RestorePending,
-    RestoreState, RetryEntry, Rotation, ServiceTime, Tx, key,
+    Meta, ParkedEntry, PendingEffect, PendingRecord, Processed, Reader, Registration,
+    RestorePending, RestoreState, RetryEntry, Rotation, ServiceTime, Tx, key,
 };
 use crate::client::{Batch, Credentials, Submitted, SwitchClient};
 use crate::clock::Clock;
@@ -331,11 +331,22 @@ pub struct AppBackup {
     protocol: Option<LayerOut>,
 }
 
-/// A [`ProtocolLayer`] as a backup's bytes carry it.
+/// A [`ProtocolLayer`] as a backup's bytes carry it, with what the app's feed holds beyond
+/// its cursor at the same moment: the entries processed past a held one, the entries
+/// stored locally, and the processed pairs (Switch spec 11). The layer reflects those
+/// entries, so a restore that brought it back without them would hand them to the protocol
+/// again.
 #[derive(Clone, Serialize, Deserialize)]
 struct LayerOut {
     name: String,
     data: String,
+    #[serde(default)]
+    seen: Vec<u64>,
+    #[serde(default)]
+    parked: Vec<(u64, ParkedEntry)>,
+    /// Each pair's key after `proc/`, and its record.
+    #[serde(default)]
+    processed: Vec<(String, Processed)>,
 }
 
 impl std::fmt::Debug for AppBackup {
@@ -369,18 +380,6 @@ impl AppBackup {
             ));
         }
         Ok(backup)
-    }
-
-    /// The backup with the protocol's layer, replacing any it held: its local state, taken
-    /// by the host with the backup ([`App::backup`]) and no commit between them, so the two
-    /// layers are of one moment. [`App::restore`] installs both in one commit.
-    #[must_use]
-    pub fn with_protocol_layer(mut self, layer: ProtocolLayer) -> Self {
-        self.protocol = Some(LayerOut {
-            name: layer.protocol,
-            data: pubky_switch_core::enc::b64(&layer.data),
-        });
-        self
     }
 
     /// The protocol's layer, if the backup holds one.
@@ -848,6 +847,41 @@ impl App {
         })
     }
 
+    /// The app's backup with the protocol's layer (Switch spec 12.4): its own local state,
+    /// such as its journal, which the host reads ([`App::protocol_scan`]) with no commit
+    /// between that read and this call, so the two layers are of one moment. Beside what
+    /// [`App::backup`] holds, the backup then carries what the feed holds beyond the cursor
+    /// that the layer may reflect: the entries processed past a held one, the entries
+    /// stored locally, and the processed pairs, so a restore hands none of those messages
+    /// to the protocol again. [`App::restore`] installs it all in one commit.
+    ///
+    /// # Errors
+    ///
+    /// As [`App::backup`]; a store failure reading the processed pairs.
+    pub async fn backup_with_protocol_layer(
+        &self,
+        layer: ProtocolLayer,
+    ) -> Result<AppBackup, AppError> {
+        Box::pin(async move {
+            let mut backup = self.backup()?;
+            let processed = self.reader().scan::<Processed>("proc/").await?;
+            backup.protocol = Some(LayerOut {
+                name: layer.protocol,
+                data: pubky_switch_core::enc::b64(&layer.data),
+                seen: self.state.seen.iter().copied().collect(),
+                parked: self
+                    .state
+                    .parked
+                    .iter()
+                    .map(|(seq, entry)| (*seq, entry.clone()))
+                    .collect(),
+                processed,
+            });
+            Ok(backup)
+        })
+        .await
+    }
+
     /// Restore from a backup (Switch spec 12.4) into the store, replacing whatever the store
     /// holds for the app. The host asked the user first whether the device the backup came
     /// from is still in the user's hands; for a lost or stolen one it revokes the app and
@@ -858,8 +892,10 @@ impl App {
     /// record, registers a fresh key if it rotated after the backup, and asks the user
     /// about registrations it can't account for ([`App::restore_question`]).
     ///
-    /// The protocol's layer ([`AppBackup::with_protocol_layer`]) is installed with the app's
-    /// own state, in one commit: the app checks its own state, then the layer's name
+    /// The protocol's layer ([`App::backup_with_protocol_layer`]) is installed with the
+    /// app's own state, and with the entries and processed pairs of the same moment that
+    /// the backup carries beside it, in one commit: the app checks its own state, then the
+    /// layer's name
     /// against [`Protocol::backup_name`], then has [`Protocol::restore_layer`] check the
     /// layer and give its writes, all before it writes anything. When this returns `Ok`,
     /// both layers are in the store; on `Err`, neither is, and the store holds what it held
@@ -943,6 +979,31 @@ impl App {
             let layer_writes = protocol.restore_layer(layer.as_ref()).map_err(|why| {
                 AppError::InvalidData(format!("the backup's protocol layer: {why}"))
             })?;
+            let (seen, parked, processed) = match &backup.protocol {
+                Some(layer) => (
+                    layer.seen.iter().copied().collect::<BTreeSet<u64>>(),
+                    layer.parked.iter().cloned().collect::<BTreeMap<_, _>>(),
+                    layer
+                        .processed
+                        .iter()
+                        .map(|(rest, record)| {
+                            let (sender, msg_id) = rest
+                                .split_once('/')
+                                .filter(|(_, msg_id)| !msg_id.is_empty())
+                                .ok_or_else(|| invalid("processed pairs"))?;
+                            let sender = pubky_switch_core::enc::pubky_key(sender)
+                                .map_err(|_| invalid("processed pairs"))?;
+                            Ok((sender, msg_id.to_owned(), *record))
+                        })
+                        .collect::<Result<Vec<_>, AppError>>()?,
+                ),
+                None => (BTreeSet::new(), BTreeMap::new(), Vec::new()),
+            };
+            // An entry the cursor passed needs no mark.
+            let seen: BTreeSet<u64> = seen
+                .into_iter()
+                .filter(|seq| *seq > backup.cursor.seq)
+                .collect();
             let state = AppState {
                 meta: meta.clone(),
                 keys: backup.keys.clone(),
@@ -964,9 +1025,9 @@ impl App {
                 chain: Some(chain),
                 held: BTreeMap::new(),
                 retries: BTreeMap::new(),
-                seen: BTreeSet::new(),
+                seen,
                 asked: BTreeSet::new(),
-                parked: BTreeMap::new(),
+                parked,
                 departed,
                 join: JoinStep::Done,
                 pending_effect: None,
@@ -999,6 +1060,9 @@ impl App {
             let mut tx = Tx::new(&app.ns);
             tx.delete_prefix("")?;
             app.write_all(&mut tx).await?;
+            for (sender, msg_id, record) in &processed {
+                feed::processed_writes(&mut tx, sender, msg_id, record.hash, record.at_ms)?;
+            }
             tx.put(records::LIST_DUE, &true)?;
             tx.local(&layer_writes)?;
             tx.commit(&app.env.store).await?;
@@ -1052,6 +1116,12 @@ impl App {
         tx.put(key::CURSOR, &s.cursor)?;
         for (app, at) in &s.departed {
             tx.put(&key::departed(app), at)?;
+        }
+        for seq in &s.seen {
+            tx.put(&key::seen(*seq), &())?;
+        }
+        for (seq, parked) in &s.parked {
+            tx.put(&key::parked(*seq), parked)?;
         }
         tx.put(key::JOIN, &s.join)?;
         if let Some(restore) = &s.restore {

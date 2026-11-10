@@ -32,6 +32,8 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
 - **After a failed commit the app reloads** from the store before its next call.
 - **A restore is one commit:** the namespace cleared, the app's restored state and the
   protocol's backup layer under `p/`, both checked before it, so a failure leaves neither.
+  A backup with a layer also carries `seen/`, `parked/` and `proc/` of the same moment,
+  which the layer may reflect, so no entry is handed to the protocol twice.
 
 ## Keys
 

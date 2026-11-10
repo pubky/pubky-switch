@@ -144,6 +144,20 @@ impl Protocol for FlakyProtocol {
         self.sample.receive(message)
     }
 
+    fn backup_name(&self) -> Option<String> {
+        Some(JOURNAL.into())
+    }
+
+    fn restore_layer(&self, layer: Option<&ProtocolLayer>) -> Result<Vec<LocalWrite>, String> {
+        Ok(layer
+            .map(|layer| LocalWrite::Put {
+                key: JOURNAL_KEY.to_vec(),
+                value: layer.data.clone(),
+            })
+            .into_iter()
+            .collect())
+    }
+
     fn resend_needed(&self, needed: &ResendNeeded) -> Vec<LocalWrite> {
         self.sample.resend_needed(needed)
     }
@@ -596,7 +610,7 @@ async fn journaled(
     }])
     .await
     .unwrap();
-    let backup = app.backup().unwrap().with_protocol_layer(layer);
+    let backup = app.backup_with_protocol_layer(layer).await.unwrap();
     let backup = AppBackup::from_bytes(&backup.to_bytes().unwrap()).unwrap();
     (app, backup)
 }
@@ -613,6 +627,99 @@ async fn restore_on(
 fn snapshot(store: &MemoryStore, app: &[u8; 16]) -> Vec<(Vec<u8>, Vec<u8>)> {
     let ns = crate::store::client_namespace(app);
     store.scan(&ns, b"", None, u32::MAX).unwrap()
+}
+
+/// The msg IDs `protocol` was handed, in order.
+fn handed(protocol: &FlakyProtocol) -> Vec<String> {
+    protocol
+        .sample
+        .received
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(_, msg_id, _)| msg_id.clone())
+        .collect()
+}
+
+/// `app`'s backup with a layer of its notes, read back from its bytes.
+async fn layered(app: &App) -> AppBackup {
+    let notes = app.protocol_scan(b"notes/").await.unwrap();
+    let layer = journal_layer(JOURNAL, &serde_json::to_vec(&notes).unwrap());
+    let backup = app.backup_with_protocol_layer(layer).await.unwrap();
+    AppBackup::from_bytes(&backup.to_bytes().unwrap()).unwrap()
+}
+
+#[tokio::test]
+async fn test_restore_of_a_backup_taken_during_a_hold_hands_no_entry_over_twice() {
+    let w = World::new();
+    let protocol = FlakyProtocol::new(1);
+    let mut app = join_flaky(&w, &protocol, "wallet").await;
+    let (held, held_message) = w.note(app.app_id(), FLAKY);
+    let (past, past_message) = w.note(app.app_id(), "steady");
+    app.receive(None).await.unwrap();
+    assert!(app.cursor().seq < held, "held");
+    assert_eq!(handed(&protocol), vec![past_message.msg_id.clone()]);
+    assert_eq!(w.effects(), 1);
+    // The layer reflects the note applied past the held one.
+    let backup = layered(&app).await;
+    let again = FlakyProtocol::new(0);
+    let store = Arc::new(MemoryStore::new());
+    let mut restored = App::restore(
+        w.env_on(Arc::clone(&store) as Arc<dyn StateStore>),
+        again.clone(),
+        flaky_config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    // The processed pair came back with the layer.
+    let pair: Option<crate::app::state::Processed> = restored
+        .reader()
+        .get(&crate::app::state::key::processed(
+            &w.bob.public(),
+            &past_message.msg_id,
+        ))
+        .await
+        .unwrap();
+    assert!(pair.is_some());
+    let report = restored.receive(None).await.unwrap();
+    // Only the held note is handed over; the one applied past it isn't, again.
+    assert_eq!(handed(&again), vec![held_message.msg_id.clone()]);
+    assert_eq!(w.effects(), 2, "one effect per message");
+    assert!(report.cursor.seq >= past);
+    restored.receive(None).await.unwrap();
+    assert_eq!(handed(&again).len(), 1);
+}
+
+#[tokio::test]
+async fn test_restore_of_a_layered_backup_keeps_the_entries_stored_locally() {
+    let w = World::new();
+    let protocol = FlakyProtocol::failing(u32::MAX, StoreError::Corrupt, Mode::Plain);
+    let mut app = join_flaky(&w, &protocol, "wallet").await;
+    let (seq, message) = w.note(app.app_id(), FLAKY);
+    app.receive(None).await.unwrap();
+    assert!(app.state.parked.contains_key(&seq));
+    assert!(app.cursor().seq >= seq, "passed");
+    let backup = layered(&app).await;
+    // Restored with a store that works: the entry the cursor passed is still processed.
+    let again = FlakyProtocol::new(0);
+    let mut restored = App::restore(
+        w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
+        again.clone(),
+        flaky_config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    let report = restored.receive(None).await.unwrap();
+    assert!(
+        report
+            .events
+            .iter()
+            .any(|e| matches!(e, AppEvent::Unparked { seq: s } if *s == seq))
+    );
+    assert_eq!(handed(&again), vec![message.msg_id.clone()]);
+    assert_eq!(w.effects(), 1);
 }
 
 #[tokio::test]

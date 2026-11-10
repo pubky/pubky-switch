@@ -120,7 +120,7 @@ impl std::fmt::Debug for LocalWrite {
 
 /// The protocol's layer of an app backup (Switch spec 12.4): its own local state, such as
 /// its journal, in a form it chooses, carried in the [`super::AppBackup`]
-/// ([`super::AppBackup::with_protocol_layer`]) and installed by [`super::App::restore`] in
+/// ([`super::App::backup_with_protocol_layer`]) and installed by [`super::App::restore`] in
 /// the same commit as the app's own state ([`Protocol::restore_layer`]). Opaque to the app.
 /// Sensitive: its `Debug` shows only the protocol's name and the data's size.
 #[derive(Clone, PartialEq, Eq)]
