@@ -141,6 +141,16 @@ pub fn check_delivery(
                 "Switch wire 3.3: the account holds no version, so prev is null",
             ));
         }
+        // The App IDs an enrollment named are kept from the start (Switch wire 3.7, 9.1).
+        if body
+            .apps
+            .iter()
+            .any(|app| account.kept_app_ids.contains(&app.app_id))
+        {
+            return Err(DeliveryRefusal::BadRequest(
+                "Switch wire 3.3: apps lists an App ID the service revoked or saw depart",
+            ));
+        }
         return Ok(Delivery::New(None));
     };
     if held.signed() == doc.signed() {
@@ -466,6 +476,22 @@ mod tests {
             records: keys,
             claim_entries: &[],
         }
+    }
+
+    #[test]
+    fn test_delivery_first_document_refuses_kept_app_ids() {
+        // An enrollment named the wallet in `revoked_apps`; the first version lists it.
+        let v1 = sign(body(1));
+        let kept = [app().app_id_bytes()];
+        let mut view = account(None);
+        view.kept_app_ids = &kept;
+        assert!(matches!(
+            check_delivery(&view, &v1, None),
+            Err(DeliveryRefusal::BadRequest(_))
+        ));
+        let other = [other_app().app_id_bytes()];
+        view.kept_app_ids = &other;
+        assert_eq!(check_delivery(&view, &v1, None), Ok(Delivery::New(None)));
     }
 
     #[test]
