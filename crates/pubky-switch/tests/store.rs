@@ -736,3 +736,90 @@ async fn test_store_upgrade_marks_the_creating_enrollment_answer() {
     conn.close().await.expect("close");
     db.drop_database().await.expect("drop");
 }
+
+/// A tombstone written before migration 0006: the service learns when it may go from its
+/// state, and deletes it on time.
+#[tokio::test]
+#[allow(clippy::panic)]
+async fn test_store_upgrade_deletes_claims_from_before_0006() {
+    use pubky_switch::store::{DatabaseConfig, MIGRATIONS, testing::TestDatabase};
+    let db = match TestDatabase::create_with(&DatabaseConfig::default(), false).await {
+        Ok(db) => db,
+        Err(pubky_switch::store::testing::TestDatabaseError::Skipped) => return,
+        Err(error) => panic!("test database: {error}"),
+    };
+    let mut conn = PgConnection::connect_with(db.options())
+        .await
+        .expect("conn");
+    let before = sqlx::migrate::Migrator {
+        migrations: std::borrow::Cow::Owned(MIGRATIONS.iter().take(5).cloned().collect()),
+        ignore_missing: false,
+        locking: true,
+        no_tx: false,
+    };
+    before
+        .run(&mut conn)
+        .await
+        .expect("migrations 0001 to 0005");
+    let deadline: u64 = 1_767_312_000_000;
+    // A settled claim, compacted, pinned to `deadline`, in the service's encoding.
+    let (attempt, owner) = (vec![8u8; 16], vec![5u8; 16]);
+    let state = serde_json::json!({
+        "step": 2,
+        "attempts": [{
+            "attempt_id": attempt, "owner": owner, "outcome": "done",
+            "opened_at": 1_767_225_600_000u64, "orphan_after": 60,
+            "possibly_duplicate": false, "duplicate": false,
+            "resolved_by": owner, "from_upload": false,
+        }],
+        "current": null, "settled": true, "tombstone": true, "pin": deadline,
+        "divergent": false, "rebuilt": false, "creator": owner,
+        "last_entry": 1_767_225_600_000u64,
+    });
+    sqlx::query(
+        "INSERT INTO accounts (id, identity_key, generation, service_key, created_at_ms, \
+         announced_limits) VALUES ('old', $1, 1, '00000000000000000000000000000000', 5, \
+         '\\x7b7d')",
+    )
+    .bind([7u8; 32].as_slice())
+    .execute(&mut conn)
+    .await
+    .expect("account");
+    sqlx::query(
+        "INSERT INTO claims (account_id, claim_key, state, creator, tombstone, open_owners) \
+         VALUES ('old', $1, $2, $3, true, '{}')",
+    )
+    .bind([9u8; 32].as_slice())
+    .bind(serde_json::to_vec(&state).expect("state"))
+    .bind([5u8; 16].as_slice())
+    .execute(&mut conn)
+    .await
+    .expect("a claim under 0005");
+    let announced =
+        pubky_switch::service::announced_limits(&pubky_switch::limits::Limits::default());
+    db.store().migrate(&announced).await.expect("upgrade");
+    let age = pubky_switch::limits::Limits::default().max_claim_age_ms;
+    let reconciliation = pubky_switch_core::claims::RECONCILIATION_MS;
+    let mut txn = db
+        .store()
+        .begin("old")
+        .await
+        .expect("begin")
+        .expect("account");
+    // Not yet due: it is kept, now with when it may go.
+    let early = deadline + reconciliation - 1;
+    assert_eq!(
+        txn.delete_due_claims(early, age, 64).await.expect("delete"),
+        0
+    );
+    // Due: it goes.
+    assert_eq!(
+        txn.delete_due_claims(deadline + reconciliation, age, 64)
+            .await
+            .expect("delete"),
+        1
+    );
+    drop(txn);
+    conn.close().await.expect("close");
+    db.drop_database().await.expect("drop");
+}

@@ -203,32 +203,7 @@ impl AccountTxn {
         .fetch_all(self.conn())
         .await
         .map_err(db)?;
-        rows.iter()
-            .map(|row| {
-                let app_id: Vec<u8> = row.try_get("app_id")?;
-                let cursor = match (
-                    opt_u64(row.try_get("cursor_generation")?, "cursor_generation")?,
-                    opt_u64(row.try_get("cursor_seq")?, "cursor_seq")?,
-                ) {
-                    (Some(generation), Some(seq)) => Some(Position { generation, seq }),
-                    (None, None) => None,
-                    _ => return Err(StoreError::Corrupt("an app's cursor")),
-                };
-                Ok(StoredApp {
-                    app_id: array(&app_id, "app_id")?,
-                    record: opt_doc(row.try_get("record")?, "app record")?,
-                    record_at_ms: opt_u64(row.try_get("record_at_ms")?, "record_at_ms")?,
-                    renewed_cert: opt_doc(row.try_get("renewed_cert")?, "renewed cert")?,
-                    receive_key: opt_doc(row.try_get("receive_key")?, "receive key")?,
-                    cursor,
-                    reachable_since: opt_u64(row.try_get("reachable_since")?, "reachable_since")?,
-                    full_requested_ms: opt_u64(
-                        row.try_get("full_requested_ms")?,
-                        "full_requested_ms",
-                    )?,
-                })
-            })
-            .collect()
+        rows.iter().map(app_of).collect()
     }
 
     /// Store an own app, replacing what the account held for it.
@@ -478,20 +453,20 @@ impl AccountTxn {
         })
     }
 
-    /// Store a claim's state, with when it may be deleted: `max_claim_age_ms` after its last
-    /// entry for a claim pinned to no deadline (Switch wire 6.8).
+    /// Store a claim's state, with when it may be deleted (Switch wire 6.8).
     pub async fn put_claim(
         &mut self,
         claim_key: &[u8; 32],
         claim: &Claim,
-        max_claim_age_ms: u64,
     ) -> Result<(), StoreError> {
         let id = self.head().id.clone();
         sqlx::query(
             "INSERT INTO claims (account_id, claim_key, state, creator, tombstone, open_owners, \
-             deletable_at_ms) VALUES ($1, $2, $3, $4, $5, $6, $7) \
+             delete_known, delete_after_ms, delete_after_entry_ms) \
+             VALUES ($1, $2, $3, $4, $5, $6, true, $7, $8) \
              ON CONFLICT (account_id, claim_key) DO UPDATE SET state = $3, creator = $4, \
-             tombstone = $5, open_owners = $6, deletable_at_ms = $7",
+             tombstone = $5, open_owners = $6, delete_known = true, delete_after_ms = $7, \
+             delete_after_entry_ms = $8",
         )
         .bind(id)
         .bind(claim_key.as_slice())
@@ -500,8 +475,12 @@ impl AccountTxn {
         .bind(claim.tombstone)
         .bind(claim_codec::open_owners(claim))
         .bind(opt_to_db(
-            claim.deletable_from(max_claim_age_ms),
-            "deletable_at_ms",
+            claim_codec::deletion(claim).0,
+            "delete_after_ms",
+        )?)
+        .bind(opt_to_db(
+            claim_codec::deletion(claim).1,
+            "delete_after_entry_ms",
         )?)
         .execute(self.conn())
         .await
@@ -509,16 +488,54 @@ impl AccountTxn {
         Ok(())
     }
 
-    /// Delete the claims that may be deleted at `base_ms`, the time base, with their entries
-    /// (Switch wire 7.3 step 4). Returns how many went.
-    pub async fn delete_due_claims(&mut self, base_ms: u64) -> Result<u64, StoreError> {
+    /// Delete up to `bound` claims that may be deleted at `base_ms`, the time base, with
+    /// their entries (Switch wire 7.3 step 4). First, up to `bound` claims written before the
+    /// service kept when they may be deleted get it, from their state. Returns how many went.
+    pub async fn delete_due_claims(
+        &mut self,
+        base_ms: u64,
+        max_claim_age_ms: u64,
+        bound: u64,
+    ) -> Result<u64, StoreError> {
         let id = self.head().id.clone();
-        let deleted = sqlx::query(
-            "DELETE FROM claims WHERE account_id = $1 AND deletable_at_ms IS NOT NULL \
-             AND deletable_at_ms <= $2",
+        let unknown = sqlx::query(
+            "SELECT claim_key, state FROM claims WHERE account_id = $1 AND NOT delete_known \
+             LIMIT $2",
         )
-        .bind(id)
+        .bind(&id)
+        .bind(to_db(bound, "bound")?)
+        .fetch_all(self.conn())
+        .await
+        .map_err(db)?;
+        for row in &unknown {
+            let key: Vec<u8> = row.try_get("claim_key")?;
+            let state: Vec<u8> = row.try_get("state")?;
+            let (after, after_entry) = claim_codec::deletion(&claim_codec::decode(&state)?);
+            sqlx::query(
+                "UPDATE claims SET delete_known = true, delete_after_ms = $3, \
+                 delete_after_entry_ms = $4 WHERE account_id = $1 AND claim_key = $2",
+            )
+            .bind(&id)
+            .bind(key)
+            .bind(opt_to_db(after, "delete_after_ms")?)
+            .bind(opt_to_db(after_entry, "delete_after_entry_ms")?)
+            .execute(self.conn())
+            .await
+            .map_err(db)?;
+        }
+        // A last entry this long ago or more has aged out; none has before the epoch.
+        let aged_before = base_ms
+            .checked_sub(max_claim_age_ms)
+            .map_or(Ok(-1), |at| to_db(at, "time"))?;
+        let deleted = sqlx::query(
+            "DELETE FROM claims WHERE account_id = $1 AND claim_key IN ( \
+             SELECT claim_key FROM claims WHERE account_id = $1 AND delete_known \
+             AND (delete_after_ms <= $2 OR delete_after_entry_ms <= $3) LIMIT $4)",
+        )
+        .bind(&id)
         .bind(to_db(base_ms, "time")?)
+        .bind(aged_before)
+        .bind(to_db(bound, "bound")?)
         .execute(self.conn())
         .await
         .map_err(db)?
@@ -529,33 +546,17 @@ impl AccountTxn {
         Ok(deleted)
     }
 
-    /// A claim's entries with their proofs, by step (Switch wire 7.4.8).
-    pub async fn claim_entries(
-        &mut self,
-        claim_key: &[u8; 32],
-    ) -> Result<Vec<StoredClaimEntry>, StoreError> {
+    /// Delete the claim at `claim_key`, with its entries, as step 4 would.
+    pub async fn delete_claim(&mut self, claim_key: &[u8; 32]) -> Result<(), StoreError> {
         let id = self.head().id.clone();
-        let rows = sqlx::query(
-            "SELECT step, seq, op, proof FROM claim_entries \
-             WHERE account_id = $1 AND claim_key = $2 ORDER BY step",
-        )
-        .bind(id)
-        .bind(claim_key.as_slice())
-        .fetch_all(self.conn())
-        .await
-        .map_err(db)?;
-        rows.iter()
-            .map(|row| {
-                let op: Vec<u8> = row.try_get("op")?;
-                let proof: Vec<u8> = row.try_get("proof")?;
-                Ok(StoredClaimEntry {
-                    step: from_db(row.try_get("step")?, "step")?,
-                    seq: from_db(row.try_get("seq")?, "seq")?,
-                    op: decode_doc(&op, "claim entry")?,
-                    proof: decode_doc(&proof, "claim entry proof")?,
-                })
-            })
-            .collect()
+        sqlx::query("DELETE FROM claims WHERE account_id = $1 AND claim_key = $2")
+            .bind(id)
+            .bind(claim_key.as_slice())
+            .execute(self.conn())
+            .await
+            .map_err(db)?;
+        self.note_change();
+        Ok(())
     }
 
     /// Keep `app_id` as revoked at `at_ms`, for good, and withdraw the invite codes it
@@ -878,4 +879,77 @@ fn record_of(row: &sqlx::postgres::PgRow) -> Result<StoredRecord, StoreError> {
         op: decode_doc(&op, "record op")?,
         proof: decode_doc(&proof, "record proof")?,
     })
+}
+
+/// The first `steps` entries of a claim, by step (Switch wire 7.4.8).
+pub(super) async fn claim_entries_before(
+    pool: &sqlx::PgPool,
+    id: &str,
+    claim_key: &[u8; 32],
+    steps: u64,
+) -> Result<Vec<StoredClaimEntry>, StoreError> {
+    let rows = sqlx::query(
+        "SELECT step, seq, op, proof FROM claim_entries \
+         WHERE account_id = $1 AND claim_key = $2 AND step < $3 ORDER BY step",
+    )
+    .bind(id)
+    .bind(claim_key.as_slice())
+    .bind(to_db(steps, "steps")?)
+    .fetch_all(pool)
+    .await
+    .map_err(db)?;
+    rows.iter()
+        .map(|row| {
+            let op: Vec<u8> = row.try_get("op")?;
+            let proof: Vec<u8> = row.try_get("proof")?;
+            Ok(StoredClaimEntry {
+                step: from_db(row.try_get("step")?, "step")?,
+                seq: from_db(row.try_get("seq")?, "seq")?,
+                op: decode_doc(&op, "claim entry")?,
+                proof: decode_doc(&proof, "claim entry proof")?,
+            })
+        })
+        .collect()
+}
+
+/// An `apps` row as a [`StoredApp`].
+fn app_of(row: &sqlx::postgres::PgRow) -> Result<StoredApp, StoreError> {
+    let app_id: Vec<u8> = row.try_get("app_id")?;
+    let cursor = match (
+        opt_u64(row.try_get("cursor_generation")?, "cursor_generation")?,
+        opt_u64(row.try_get("cursor_seq")?, "cursor_seq")?,
+    ) {
+        (Some(generation), Some(seq)) => Some(Position { generation, seq }),
+        (None, None) => None,
+        _ => return Err(StoreError::Corrupt("an app's cursor")),
+    };
+    Ok(StoredApp {
+        app_id: array(&app_id, "app_id")?,
+        record: opt_doc(row.try_get("record")?, "app record")?,
+        record_at_ms: opt_u64(row.try_get("record_at_ms")?, "record_at_ms")?,
+        renewed_cert: opt_doc(row.try_get("renewed_cert")?, "renewed cert")?,
+        receive_key: opt_doc(row.try_get("receive_key")?, "receive key")?,
+        cursor,
+        reachable_since: opt_u64(row.try_get("reachable_since")?, "reachable_since")?,
+        full_requested_ms: opt_u64(row.try_get("full_requested_ms")?, "full_requested_ms")?,
+    })
+}
+
+/// The `apps` row of `app_id` at account `id`, read without the account's lock.
+pub(super) async fn app_row(
+    pool: &sqlx::PgPool,
+    id: &str,
+    app_id: &[u8; 16],
+) -> Result<Option<StoredApp>, StoreError> {
+    let row = sqlx::query(
+        "SELECT app_id, record, record_at_ms, renewed_cert, receive_key, cursor_generation, \
+         cursor_seq, reachable_since, full_requested_ms FROM apps \
+         WHERE account_id = $1 AND app_id = $2",
+    )
+    .bind(id)
+    .bind(app_id.as_slice())
+    .fetch_optional(pool)
+    .await
+    .map_err(db)?;
+    row.as_ref().map(app_of).transpose()
 }

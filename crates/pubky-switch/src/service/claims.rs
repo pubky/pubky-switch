@@ -17,31 +17,26 @@ use crate::{
     store::{AccountTxn, NewChainItem},
 };
 
+/// A `GET /claims` read taken under the lock, whose entries are read after it.
+#[derive(Debug)]
+pub(super) struct ClaimRead {
+    account: String,
+    claim_key: [u8; 32],
+    view: serde_json::Value,
+    /// How many entries the claim had: its step, 0 for a tombstone.
+    steps: u64,
+}
+
 fn temporary() -> ApiError {
     ApiError::unavailable("7.6: a temporary failure")
 }
 
 impl Service {
-    /// Step 4 of Switch wire 7.3, with trusted time only: delete the tombstones and failed
-    /// claims whose deadline plus the reconciliation window has passed (6.8), by the time
-    /// base, never the stamped time, which a reading without trusted time may have moved
-    /// ahead.
-    pub(super) async fn delete_due_claims(
-        &self,
-        txn: &mut AccountTxn,
-        base_ms: u64,
-        trusted: bool,
-    ) -> Result<(), ApiError> {
-        if trusted {
-            txn.delete_due_claims(base_ms)
-                .await
-                .map_err(|e| store_error(&e))?;
-        }
-        Ok(())
-    }
-
     /// `GET /v1/{id}/claims/{claim_key}`, from an own app holding `claims.read` (Switch wire
-    /// 7.4.8): the claim view at the service time, and its entries, none for a tombstone.
+    /// 7.4.8): the claim view at the service time, under the lock. Its entries, none for a
+    /// tombstone, are read once the lock is gone ([`ClaimRead`]): entries never change once
+    /// written, so the first `step` of them are the claim's at this read.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn get_claim(
         &self,
         txn: &mut AccountTxn,
@@ -49,6 +44,7 @@ impl Service {
         held: Option<&IdentityDoc>,
         writer: Option<&AppCert>,
         claim_key: &str,
+        due: Option<u64>,
         time_ms: u64,
     ) -> Result<Answer, ApiError> {
         if !writer.is_some_and(|cert| cert.has_permission(Permission::ClaimsRead)) {
@@ -59,6 +55,7 @@ impl Service {
         }
         let claim_key = unb64_array::<32>(claim_key)
             .map_err(|_| ApiError::bad_request("7.4.8: a claim key is b64(32)"))?;
+        let not_found = || ApiError::not_found("7.4.8: no such claim");
         let Some((_, claim)) = txn
             .claims(&[claim_key])
             .await
@@ -66,27 +63,53 @@ impl Service {
             .into_iter()
             .next()
         else {
-            return Err(ApiError::not_found("7.4.8: no such claim"));
+            return Err(not_found());
         };
+        // A claim that is due is gone, whatever step 4's batch reached (Switch wire 7.3).
+        if due.is_some_and(|base| claim.deletable(Some(base), self.limits.max_claim_age_ms)) {
+            txn.delete_claim(&claim_key)
+                .await
+                .map_err(|e| store_error(&e))?;
+            return Err(not_found());
+        }
         let apps = batch::load_apps(txn, held, time_ms)
             .await
             .map_err(|e| store_error(&e))?;
         let current = |app: &[u8; 16]| apps.is_current(app);
         let view = claim.view(&claim_key, time_ms, &current).to_value();
-        let entries = if claim.tombstone {
-            Vec::new()
-        } else {
-            txn.claim_entries(&claim_key)
-                .await
-                .map_err(|e| store_error(&e))?
-                .into_iter()
-                .map(|e| json!({ "step": e.step, "seq": e.seq, "op": e.op, "proof": e.proof }))
-                .collect()
-        };
-        let body = serde_json::to_vec(&json!({ "claim": view, "entries": entries }))
-            .map_err(|_| temporary())?;
         let head = self.head(txn, signer).await.ok_or_else(temporary)?;
-        Ok(Answer::ok(body).with_head(Some(head)))
+        let mut answer = Answer::ok(Vec::new()).with_head(Some(head));
+        answer.claim_read = Some(ClaimRead {
+            account: txn.head().id.clone(),
+            claim_key,
+            view,
+            steps: if claim.tombstone { 0 } else { claim.step },
+        });
+        Ok(answer)
+    }
+
+    /// The body of a `GET /claims` answer, once the account's lock is gone: the view, and
+    /// the entries of the claim at the read.
+    ///
+    /// # Errors
+    ///
+    /// `503 unavailable` if they can't be read, or the claim lost them since, as a
+    /// deletion would.
+    pub(super) async fn claim_body(&self, read: &ClaimRead) -> Result<Vec<u8>, ApiError> {
+        let entries = self
+            .store
+            .claim_entries_before(&read.account, &read.claim_key, read.steps)
+            .await
+            .map_err(|e| store_error(&e))?;
+        if u64::try_from(entries.len()).ok() != Some(read.steps) {
+            return Err(temporary());
+        }
+        let entries: Vec<_> = entries
+            .into_iter()
+            .map(|e| json!({ "step": e.step, "seq": e.seq, "op": e.op, "proof": e.proof }))
+            .collect();
+        serde_json::to_vec(&json!({ "claim": read.view, "entries": entries }))
+            .map_err(|_| temporary())
     }
 
     /// `POST /v1/{id}/apps/{app_id}/revoke`, from the signer (Switch wire 7.4.12, Switch spec

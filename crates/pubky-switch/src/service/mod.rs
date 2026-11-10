@@ -47,6 +47,10 @@ use crate::{
 
 use self::rules::{Caller, Claimed, decode_claim, names_this_service, staged_gate};
 
+/// How many claims whose time has passed one request deletes at most (Switch wire 7.3
+/// step 4); the rest go with the next requests.
+const DUE_CLAIMS_PER_REQUEST: u64 = 64;
+
 /// The service.
 pub struct Service {
     origin: String,
@@ -77,6 +81,8 @@ struct Answer {
     head: Option<SignedHead>,
     retry_after: Option<u64>,
     cacheable: bool,
+    /// A `GET /claims` answer, whose body is built once the lock is gone.
+    claim_read: Option<claims::ClaimRead>,
 }
 
 impl Answer {
@@ -87,6 +93,7 @@ impl Answer {
             head: None,
             retry_after: None,
             cacheable: false,
+            claim_read: None,
         }
     }
 
@@ -97,6 +104,7 @@ impl Answer {
             head: None,
             retry_after: error.retry_after,
             cacheable: false,
+            claim_read: None,
         }
     }
 
@@ -226,7 +234,11 @@ impl Service {
     }
 
     async fn serve(&self, request: SwitchRequest) -> SwitchResponse {
-        let base_ms = self.time.read().base_ms;
+        // One reading gives both the time base and whether it is trusted, so nothing that
+        // waits for trusted time runs on a base read without it.
+        let reading = self.time.read();
+        let base_ms = reading.base_ms;
+        let due = reading.trusted.then_some(base_ms);
         let request_signature = wire_http::request_signature_of(
             request
                 .headers
@@ -299,7 +311,7 @@ impl Service {
                         if let Caller::OwnApp(app) = &claimed.caller {
                             let batch = *call == Call::Ops;
                             match self
-                                .verify_own_app(&account, &request, &claimed, app, batch)
+                                .verify_own_app(&account, &request, &claimed, app, batch, base_ms)
                                 .await
                             {
                                 Ok(app) => verified = Some(app),
@@ -343,6 +355,7 @@ impl Service {
             txn,
             &request,
             base_ms,
+            due,
             signature,
             caller.as_ref(),
             verified.as_ref(),
@@ -401,13 +414,13 @@ impl Service {
                 }
             })?;
         if let Caller::OwnApp(app) = &claimed.caller {
-            self.verify_own_app(account, request, &claimed, app, false)
-                .await
-                .inspect_err(|error| {
-                    if is_failed_authentication(error.code) {
-                        self.record_failure(request, account.to_string());
-                    }
-                })?;
+            let error = self
+                .refuse_app_at_signer_call(account, request, &claimed, app, base_ms)
+                .await;
+            if is_failed_authentication(error.code) {
+                self.record_failure(request, account.to_string());
+            }
+            return Err(error);
         }
         rules::require_signer(&claimed.caller)?;
         Ok(claimed)
@@ -449,11 +462,13 @@ impl Service {
 
     /// The processing order under the account's lock (Switch wire 7.3 steps 3 to 10), for a
     /// request already authenticated as the signer, or the public read.
+    #[allow(clippy::too_many_arguments)]
     async fn at_account(
         &self,
         mut txn: AccountTxn,
         request: &SwitchRequest,
         base_ms: u64,
+        due: Option<u64>,
         request_signature: Option<[u8; 64]>,
         caller: Option<&Claimed>,
         verified: Option<&batch::VerifiedApp>,
@@ -471,6 +486,20 @@ impl Service {
                 return self.operator_answer(signature, base_ms, &error).await;
             }
         };
+        // Step 4, with trusted time only, for a caller that has verified: a bounded batch of
+        // the claims whose time has passed goes, by the time base (Switch wire 7.3). It comes
+        // before the endpoint, so a refusal doesn't undo it; an unauthenticated request, or
+        // the public read, pays for none of it. A claim a request reads or writes goes when
+        // it is due, whatever the batch reached.
+        if let (Some(base), Some(_)) = (due, caller)
+            && let Err(error) = txn
+                .delete_due_claims(base, self.limits.max_claim_age_ms, DUE_CLAIMS_PER_REQUEST)
+                .await
+        {
+            let _ = store_error(&error);
+            let error = ApiError::unavailable("7.6: a temporary failure");
+            return sign_answer(&signer, signature, committed_ms, Answer::error(&error));
+        }
         // What the endpoint writes is undone if it is refused, whatever step refuses it: a
         // refusal commits the stamped time and nothing else, so no later request can build
         // on a write it was never answered for (step 10).
@@ -483,7 +512,7 @@ impl Service {
             }
         };
         let (answer, marked) = match self
-            .run_at_account(&mut txn, &signer, request, verified, base_ms, time_ms)
+            .run_at_account(&mut txn, &signer, request, verified, due, time_ms)
             .await
         {
             Ok(done) => done,
@@ -529,7 +558,16 @@ impl Service {
             })
         };
         match committed {
-            Ok(()) => sign_answer(&signer, signature, time_ms, answer),
+            Ok(()) => {
+                let mut answer = answer;
+                if let Some(read) = answer.claim_read.take() {
+                    match self.claim_body(&read).await {
+                        Ok(body) => answer.body = body,
+                        Err(error) => answer = Answer::error(&error),
+                    }
+                }
+                sign_answer(&signer, signature, time_ms, answer)
+            }
             // Nothing committed, the stamp included: answer at the time last committed.
             Err(()) => sign_answer(
                 &signer,
@@ -548,7 +586,7 @@ impl Service {
         signer: &ServiceSigner,
         request: &SwitchRequest,
         verified: Option<&batch::VerifiedApp>,
-        base_ms: u64,
+        due: Option<u64>,
         time_ms: u64,
     ) -> Result<(Answer, bool), Refused> {
         let call = &request.route.call;
@@ -594,11 +632,6 @@ impl Service {
             }
         }
 
-        // Step 4: claims whose time has passed go, with trusted time only.
-        self.delete_due_claims(txn, base_ms, self.time.peek().trusted)
-            .await
-            .map_err(|error| Refused::with_head(error, serving))?;
-
         if *call == Call::GetIdentity {
             return self
                 .public_identity(held.as_ref(), serving)
@@ -634,6 +667,7 @@ impl Service {
                     held.as_ref(),
                     verified,
                     writer.as_ref(),
+                    due,
                     time_ms,
                 )
                 .await
@@ -651,6 +685,7 @@ impl Service {
                         held.as_ref(),
                         writer.as_ref(),
                         claim_key,
+                        due,
                         time_ms,
                     )
                     .await

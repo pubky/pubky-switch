@@ -336,25 +336,55 @@ impl Store {
         }))
     }
 
-    /// The app record account `id` holds for `app_id`, read without the account's lock, for
-    /// verifying an own app's request before it (Switch wire 7.2 Order). A plain read
-    /// doesn't wait for the lock; the endpoint checks under it that the key still holds.
-    pub async fn app_record(
+    /// The app row account `id` holds for `app_id`, read without the account's lock, for
+    /// the checks of an own app's request before it (Switch wire 7.2 Order). A plain read
+    /// doesn't wait for the lock; the endpoint checks again under it.
+    pub async fn app_row(
         &self,
         id: &str,
         app_id: &[u8; 16],
-    ) -> Result<Option<pubky_switch_core::sig::SignedDoc>, StoreError> {
-        let record: Option<Option<Vec<u8>>> =
-            sqlx::query_scalar("SELECT record FROM apps WHERE account_id = $1 AND app_id = $2")
+    ) -> Result<Option<StoredApp>, StoreError> {
+        ops::app_row(&self.pool, id, app_id).await
+    }
+
+    /// Whether account `id` keeps `app_id` for good, revoked, departed or named by an
+    /// enrollment, read without the account's lock.
+    pub async fn app_kept(&self, id: &str, app_id: &[u8; 16]) -> Result<bool, StoreError> {
+        let kept: Option<i32> =
+            sqlx::query_scalar("SELECT 1 FROM kept_app_ids WHERE account_id = $1 AND app_id = $2")
                 .bind(id)
                 .bind(app_id.as_slice())
                 .fetch_optional(&self.pool)
                 .await
                 .map_err(StoreError::from_db)?;
-        record
-            .flatten()
-            .map(|bytes| identity::decode_doc(&bytes, "app record"))
+        Ok(kept.is_some())
+    }
+
+    /// The newest `identity.json` account `id` holds, read without the account's lock.
+    pub async fn identity_doc(
+        &self,
+        id: &str,
+    ) -> Result<Option<pubky_switch_core::sig::SignedDoc>, StoreError> {
+        let doc: Option<Option<Vec<u8>>> =
+            sqlx::query_scalar("SELECT identity_doc FROM accounts WHERE id = $1")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(StoreError::from_db)?;
+        doc.flatten()
+            .map(|bytes| identity::decode_doc(&bytes, "identity_doc"))
             .transpose()
+    }
+
+    /// The first `steps` entries of claim `claim_key` at account `id`, by step, read without
+    /// the account's lock (Switch wire 7.4.8): entries never change once written.
+    pub async fn claim_entries_before(
+        &self,
+        id: &str,
+        claim_key: &[u8; 32],
+        steps: u64,
+    ) -> Result<Vec<StoredClaimEntry>, StoreError> {
+        ops::claim_entries_before(&self.pool, id, claim_key, steps).await
     }
 
     /// Start a request to account `id`: a transaction holding the account's lock until it

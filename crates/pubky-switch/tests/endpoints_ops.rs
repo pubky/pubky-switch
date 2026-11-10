@@ -939,10 +939,20 @@ async fn test_ops_self_made_key_takes_no_lock() {
 }
 
 fn claim(kind: ClaimType, expected_step: u64, deadline: Option<u64>) -> (Vec<Condition>, OpKind) {
+    claim_at(7, kind, expected_step, deadline)
+}
+
+/// A claim entry of the claim key `[key; 32]`.
+fn claim_at(
+    key: u8,
+    kind: ClaimType,
+    expected_step: u64,
+    deadline: Option<u64>,
+) -> (Vec<Condition>, OpKind) {
     (
         Vec::new(),
         OpKind::Claim(ClaimFields {
-            claim_key: vec![7; 32],
+            claim_key: vec![key; 32],
             kind,
             expected_step,
             attempt_id: vec![8; 16],
@@ -1101,6 +1111,245 @@ async fn test_revoke_rules() {
     drop(txn);
     let ops = wallet_batch(33, 1, vec![contact(bob())]);
     let (status, body) = post_app(&replay, "wallet", &ops, None, AT).await;
+    assert_eq!((status, body["code"].as_str()), (403, Some("not_current")));
+    replay.db.drop_database().await.expect("drop");
+}
+
+const DAY_MS: u64 = 86_400_000;
+
+async fn claim_count(replay: &Replay) -> i64 {
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM claims WHERE account_id = $1")
+        .bind(alice_id())
+        .fetch_one(&mut conn)
+        .await
+        .expect("count");
+    conn.close().await.expect("close");
+    count
+}
+
+/// The public read of alice's `identity.json` at `at`: it authenticates nothing.
+async fn public_read(replay: &Replay, at: &str) {
+    set_time(&replay.clock, at);
+    let read = pubky_switch::http::SwitchRequest {
+        ..request(
+            "GET",
+            &format!("/v1/{}/identity", alice_id()),
+            &[],
+            Vec::new(),
+        )
+    };
+    assert_eq!(replay.service.handle(read).await.status, 200);
+}
+
+#[tokio::test]
+async fn test_claims_deletion_goes_by_the_time_base() {
+    let Some(replay) = registered(Limits::default(), false).await else {
+        return;
+    };
+    let deadline = ms(AT) + 60_000;
+    let ops = wallet_batch(
+        40,
+        1,
+        vec![
+            claim(ClaimType::Attempt, 0, Some(deadline)),
+            claim(ClaimType::Done, 1, None),
+        ],
+    );
+    let (status, body) = post_app(&replay, "wallet", &ops, None, AT).await;
+    assert_eq!(status, 200, "{body}");
+    // The wall clock runs past the deadline plus 30 days; the public read stamps that time.
+    let ahead = pubky_switch_core::time::rfc3339(deadline + 31 * DAY_MS);
+    public_read(&replay, &ahead).await;
+    // It steps back: the stamped time stays ahead, the time base doesn't.
+    let back = pubky_switch_core::time::rfc3339(ms(AT) + 120_000);
+    set_time(&replay.clock, &back);
+    let (status, body) = read_claim(&replay, &back).await;
+    assert_eq!(status, 200, "not due by the time base: {body}");
+    set_time(&replay.clock, &ahead);
+    let (status, _) = read_claim(&replay, &ahead).await;
+    assert_eq!(status, 404, "due by the time base");
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_claims_open_attempts_and_no_deadline_pins() {
+    // A short claim age, so the wallet's certificate is still current when it passes.
+    let limits = Limits {
+        max_claim_age_ms: 10 * DAY_MS,
+        ..Limits::default()
+    };
+    let Some(replay) = registered(limits.clone(), false).await else {
+        return;
+    };
+    // Claim 7: an attempt pinned to a deadline, left open. Claim 9: pinned to no deadline,
+    // then failed by its owner.
+    let deadline = ms(AT) + 60_000;
+    let ops = wallet_batch(
+        41,
+        1,
+        vec![
+            claim(ClaimType::Attempt, 0, Some(deadline)),
+            claim_at(9, ClaimType::Attempt, 0, None),
+            claim_at(9, ClaimType::Failed, 1, None),
+        ],
+    );
+    let (status, body) = post_app(&replay, "wallet", &ops, None, AT).await;
+    assert_eq!(status, 200, "{body}");
+    let read = |key: u8, at: String| {
+        let keys = vectors("keys.json");
+        let path = format!(
+            "/v1/{}/claims/{}",
+            alice_id(),
+            pubky_switch_core::enc::b64(&[key; 32])
+        );
+        app_request(app(&keys, "wallet"), "GET", &path, Vec::new(), ms(&at))
+    };
+    // 31 days on, past the deadline plus the reconciliation window: the open attempt stays.
+    let at = pubky_switch_core::time::rfc3339(ms(AT) + 31 * DAY_MS);
+    set_time(&replay.clock, &at);
+    // An operator raised max_claim_age_ms to 40 days: the failed claim stays too.
+    let raised = replay.restarted_with(Limits {
+        max_claim_age_ms: 40 * DAY_MS,
+        ..limits
+    });
+    assert_eq!(raised.handle(read(7, at.clone())).await.status, 200, "open");
+    assert_eq!(
+        raised.handle(read(9, at.clone())).await.status,
+        200,
+        "under the raised age"
+    );
+    // At 10 days, it goes.
+    assert_eq!(replay.service.handle(read(9, at.clone())).await.status, 404);
+    assert_eq!(replay.service.handle(read(7, at)).await.status, 200);
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_claims_deletion_is_bounded_and_kept() {
+    let limits = Limits {
+        max_claims: 1_000,
+        claim_share_percent: 100,
+        open_attempts_per_app: 1_000,
+        ..Limits::default()
+    };
+    let Some(replay) = registered(limits, false).await else {
+        return;
+    };
+    // 68 tombstones pinned to one deadline, four a batch.
+    let deadline = ms(AT) + 60_000;
+    for batch in 0..17u8 {
+        let mut entries = Vec::new();
+        for claim in 0..4u8 {
+            let key = 100 + batch * 4 + claim;
+            entries.push(claim_at(key, ClaimType::Attempt, 0, Some(deadline)));
+            entries.push(claim_at(key, ClaimType::Done, 1, None));
+        }
+        let (status, body) = post_app(
+            &replay,
+            "wallet",
+            &wallet_batch(50 + batch, 1, entries),
+            None,
+            AT,
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+    }
+    assert_eq!(claim_count(&replay).await, 68);
+    // All are due. The public read deletes none.
+    let due = pubky_switch_core::time::rfc3339(deadline + 31 * DAY_MS);
+    public_read(&replay, &due).await;
+    assert_eq!(claim_count(&replay).await, 68);
+    // A refused request of a verified caller deletes a bounded batch, which its refusal
+    // doesn't undo.
+    let stale = wallet_batch(90, 2, vec![contact(bob())]);
+    let (status, _) = post_app(&replay, "wallet", &stale, None, &due).await;
+    assert_eq!(status, 409);
+    assert_eq!(claim_count(&replay).await, 4);
+    let (status, _) = post_app(&replay, "wallet", &stale, None, &due).await;
+    assert_eq!(status, 409);
+    assert_eq!(claim_count(&replay).await, 0);
+    replay.db.drop_database().await.expect("drop");
+}
+
+async fn revoke_wallet(replay: &Replay) {
+    let keys = vectors("keys.json");
+    let wallet = app(&keys, "wallet")["app_id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    let path = format!("/v1/{}/apps/{wallet}/revoke", alice_id());
+    let answer = replay
+        .service
+        .handle(signer_request("POST", &path, Vec::new(), ms(AT)))
+        .await;
+    assert_eq!(answer.status, 200);
+}
+
+#[tokio::test]
+async fn test_revoked_app_is_refused_before_the_lock() {
+    let Some(replay) = registered(Limits::default(), false).await else {
+        return;
+    };
+    revoke_wallet(&replay).await;
+    let before = stamped_time(&replay).await;
+    let held = replay
+        .db
+        .store()
+        .begin(&alice_id())
+        .await
+        .expect("begin")
+        .expect("account");
+    let keys = vectors("keys.json");
+    let body = OpsRequest::new(&wallet_batch(60, 1, vec![contact(bob())]), None).to_json();
+    let request = app_request(app(&keys, "wallet"), "POST", &ops_path(), body, ms(AT));
+    let answer = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        replay.service.handle(request),
+    )
+    .await
+    .expect("answered without waiting for the lock");
+    drop(held);
+    let (status, body, head) = answer_of(answer);
+    assert_eq!((status, body["code"].as_str()), (403, Some("not_current")));
+    assert!(head.is_none());
+    assert_eq!(stamped_time(&replay).await, before, "nothing was stamped");
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_app_at_a_signer_call_keeps_the_check_order() {
+    let Some(replay) = registered(Limits::default(), false).await else {
+        return;
+    };
+    let keys = vectors("keys.json");
+    let identity = format!("/v1/{}/identity", alice_id());
+    let put = |at: &str| {
+        app_request(
+            app(&keys, "wallet"),
+            "PUT",
+            &identity,
+            b"{}".to_vec(),
+            ms(at),
+        )
+    };
+    // A current app: refused as a caller the call isn't for.
+    let (status, body, _) = answer_of(replay.service.handle(put(AT)).await);
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (403, Some("permission_missing"))
+    );
+    // Its certificate expired: cert_expired comes first.
+    let expired = "2026-12-01T00:00:00.000Z";
+    set_time(&replay.clock, expired);
+    let (status, body, _) = answer_of(replay.service.handle(put(expired)).await);
+    assert_eq!((status, body["code"].as_str()), (403, Some("cert_expired")));
+    set_time(&replay.clock, AT);
+    // Revoked: not_current.
+    revoke_wallet(&replay).await;
+    let (status, body, _) = answer_of(replay.service.handle(put(AT)).await);
     assert_eq!((status, body["code"].as_str()), (403, Some("not_current")));
     replay.db.drop_database().await.expect("drop");
 }

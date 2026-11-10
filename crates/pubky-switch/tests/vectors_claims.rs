@@ -276,6 +276,45 @@ fn assert_error(step: &Value, answer: &pubky_switch::http::SwitchResponse) {
     assert_eq!(body["current"], expect["current"], "step {n}: current");
 }
 
+/// A transition proof's body.
+fn proof_body(proof: &Value) -> Value {
+    serde_json::from_slice(&signed(proof).body_bytes().expect("proof body")).expect("json")
+}
+
+/// A claims answer's entries: none for a tombstone, else one per step, each a `claim`
+/// operation of this claim key at its step, with a proof of the claim at the next step
+/// (Switch wire 7.4.8).
+fn assert_entries(body: &Value, claim_key: &str, step: &Value) {
+    let n = &step["n"];
+    let claim = &step["expect"]["claim"];
+    let entries = body["entries"].as_array().expect("entries");
+    if claim["tombstone"] == true {
+        assert!(entries.is_empty(), "step {n}: a tombstone has no entries");
+        return;
+    }
+    assert_eq!(
+        Some(entries.len() as u64),
+        claim["step"].as_u64(),
+        "step {n}: entries"
+    );
+    for (index, entry) in (0u64..).zip(entries) {
+        assert_eq!(entry["step"], index, "step {n}: entry order");
+        let op = SignedOp::peek(&signed(&entry["op"])).expect("op");
+        let pubky_switch_core::ops::OpKind::Claim(fields) = &op.body().kind else {
+            panic!("step {n}: an entry that isn't a claim");
+        };
+        assert_eq!(
+            b64(&fields.claim_key),
+            claim_key,
+            "step {n}: the entry's claim"
+        );
+        assert_eq!(fields.expected_step, index, "step {n}: the entry's step");
+        let proof = proof_body(&entry["proof"]);
+        assert_eq!(proof["object"], claim_key, "step {n}: the proof's object");
+        assert_eq!(proof["step"], index + 1, "step {n}: the proof's step");
+    }
+}
+
 /// `GET /claims/{claim_key}` as `reader` sees it, against the step's `expect`.
 async fn assert_claim(
     replay: &Replay,
@@ -298,6 +337,7 @@ async fn assert_claim(
             "step {}: the claim",
             step["n"]
         );
+        assert_entries(&body, claim_key, step);
     } else {
         assert_error(step, &answer);
     }
@@ -372,6 +412,18 @@ async fn run(
                     "step {n}: {}",
                     String::from_utf8_lossy(&answer.body)
                 );
+                // One proof, of the revoke transition naming the app, and the head.
+                let body = json_of(&answer);
+                let proofs = body["proofs"].as_array().expect("proofs");
+                assert_eq!(proofs.len(), 1, "step {n}: one proof");
+                let proof = proof_body(&proofs[0]);
+                assert_eq!(
+                    proof["object"],
+                    app.as_str(),
+                    "step {n}: the proof's object"
+                );
+                assert_eq!(proof["state"]["type"], "revoke", "step {n}: the transition");
+                assert!(body["head"]["sig"].is_string(), "step {n}: the head");
             }
             "noop_batch" | "app_put" => {
                 let name = step["app"].as_str().expect("app");

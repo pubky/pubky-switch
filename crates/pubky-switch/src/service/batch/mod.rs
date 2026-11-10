@@ -98,6 +98,101 @@ pub(super) struct VerifiedApp {
     parsed: Option<OpsRequest>,
 }
 
+/// The checks of an own app whose request verified with `verified.key` (Switch wire 7.2 "Own
+/// app", 3.8), over what the account holds: `stored`, its row, and `kept`, whether its App ID
+/// is kept for good. They come in the order of 7.2: the certificate it is checked against
+/// (the first call's record's, or a stored renewed one the newest `identity.json` lists, else
+/// its record's), which has the key the request verified with; checks 1 to 3 on it; not
+/// revoked or departed, and the certificate listed or in an open renewal (check 5); then
+/// check 6 on the record it holds.
+///
+/// # Errors
+///
+/// A [`Stop`]: `401 bad_signature` before the app is known to be its key's, then `403
+/// cert_expired` or `403 not_current`.
+pub(super) fn check_own_app(
+    identity: &[u8; 32],
+    held: Option<&IdentityDoc>,
+    stored: Option<&StoredApp>,
+    kept: bool,
+    verified: &VerifiedApp,
+    time_ms: u64,
+) -> Result<AppCert, Stop> {
+    let app = &verified.app;
+    let changed_key = || {
+        Stop::Unauthenticated(bad_signature(
+            "7.2: the key the request verified with isn't the app's",
+        ))
+    };
+    let first_call = verified
+        .parsed
+        .as_ref()
+        .and_then(|parsed| first_app_put(parsed, app));
+    let (cert, record) = match first_call {
+        // The first call: the record and its certificate verify.
+        Some(record) => {
+            let record = AppRecord::verify(&record, identity).map_err(|_| {
+                Stop::Unauthenticated(bad_signature("7.2: the first call's app record"))
+            })?;
+            if record.cert().app_id() != *app {
+                return Err(Stop::Unauthenticated(bad_signature(
+                    "7.2: the record names another app",
+                )));
+            }
+            (record.cert().clone(), None)
+        }
+        None => {
+            let held_app = stored
+                .map(|stored| held_app(stored, identity))
+                .transpose()
+                .map_err(|e| storage(&e))?
+                .filter(|a| a.record.is_some())
+                .ok_or_else(changed_key)?;
+            let mut state = OpsState::new(*identity, 0, 0, time_ms);
+            state.doc = held.cloned();
+            state.apps.insert(*app, held_app.clone());
+            let cert = state.checked_cert(app).cloned().ok_or_else(changed_key)?;
+            (cert, held_app.record)
+        }
+    };
+    if cert.signing_key() != verified.key {
+        return Err(changed_key());
+    }
+    // Checks 1 to 3 on that certificate: it verified for the identity and names the app; it
+    // hasn't expired.
+    if cert.identity() != *identity || cert.app_id() != *app {
+        return Err(Stop::Unauthenticated(bad_signature(
+            "3.8: the certificate isn't the caller's",
+        )));
+    }
+    if cert.expired_at(time_ms) {
+        return Err(Stop::Refused(ApiError::new(
+            ErrorCode::CertExpired,
+            "3.8: the certificate has expired",
+        )));
+    }
+    // Not revoked or departed, and the certificate listed or in an open renewal.
+    if kept {
+        return Err(Stop::Refused(not_current(
+            "7.2: the app is revoked or departed",
+        )));
+    }
+    if !held.is_some_and(|doc| doc.current_now(app, &cert.hash())) {
+        return Err(Stop::Refused(not_current(
+            "3.8: the newest identity.json doesn't list the certificate",
+        )));
+    }
+    // Check 6 on the record the service holds.
+    if let Some(record) = record
+        && !record.carries(&cert)
+    {
+        return Err(Stop::Refused(not_current(
+            "3.8: the held record doesn't carry the certificate",
+        )));
+    }
+    Ok(cert)
+}
+
 /// The app record of an own app's first call (Switch wire 7.2): the batch's first `app.put`
 /// naming the caller.
 fn first_app_put(request: &OpsRequest, app: &[u8; 16]) -> Option<SignedDoc> {
@@ -122,6 +217,7 @@ async fn load_state(
     held: Option<&IdentityDoc>,
     ops: &[SignedOp],
     writer: Option<&[u8; 16]>,
+    due: Option<(u64, u64)>,
     now: u64,
 ) -> Result<OpsState, StoreError> {
     let head = txn.head().clone();
@@ -166,6 +262,20 @@ async fn load_state(
     }
     let claim_keys: Vec<[u8; 32]> = needs.claims.iter().copied().collect();
     state.claims = txn.claims(&claim_keys).await?.into_iter().collect();
+    // A claim the batch names that is due goes now, whatever step 4's batch reached
+    // (Switch wire 7.3 step 4): `due` is the trusted time base and `max_claim_age_ms`.
+    if let Some((base, max_age)) = due {
+        let gone: Vec<[u8; 32]> = state
+            .claims
+            .iter()
+            .filter(|(_, claim)| claim.deletable(Some(base), max_age))
+            .map(|(key, _)| *key)
+            .collect();
+        for key in gone {
+            txn.delete_claim(&key).await?;
+            state.claims.remove(&key);
+        }
+    }
     let pubkys: Vec<[u8; 32]> = needs.pubkys.iter().copied().collect();
     let entries = |list: Vec<StoredListEntry>| {
         list.into_iter()
@@ -302,6 +412,7 @@ impl Service {
         claimed: &Claimed,
         app: &str,
         batch: bool,
+        base_ms: u64,
     ) -> Result<VerifiedApp, ApiError> {
         let app = zbase32_decode::<16>(app)
             .map_err(|_| ApiError::bad_request("7.1: Switch-App isn't an App ID"))?;
@@ -321,9 +432,10 @@ impl Service {
                 })?,
             None => self
                 .store
-                .app_record(account, &app)
+                .app_row(account, &app)
                 .await
                 .map_err(|e| store_error(&e))?
+                .and_then(|row| row.record)
                 .as_ref()
                 .and_then(record_signing_key)
                 .ok_or_else(|| not_current("7.2: an own app's first call carries its app.put"))?,
@@ -348,7 +460,62 @@ impl Service {
                 return Err(bad_signature("7.2: the record names another app"));
             }
         }
-        Ok(VerifiedApp { app, key, parsed })
+        let verified = VerifiedApp { app, key, parsed };
+        // Then the app's checks, in their order, from what the account holds read without
+        // the lock, so a revoked, departed or expired app takes no lock either (Switch spec
+        // 12.2). Under the lock they run again.
+        let identity = pubky_switch_core::enc::pubky_key(account)
+            .map_err(|_| ApiError::not_found("no such account"))?;
+        let held = self
+            .store
+            .identity_doc(account)
+            .await
+            .map_err(|e| store_error(&e))?
+            .and_then(|doc| IdentityDoc::verify(&doc, &identity).ok());
+        let stored = self
+            .store
+            .app_row(account, &app)
+            .await
+            .map_err(|e| store_error(&e))?;
+        let kept = self
+            .store
+            .app_kept(account, &app)
+            .await
+            .map_err(|e| store_error(&e))?;
+        if let Err(Stop::Refused(error) | Stop::Unauthenticated(error)) = check_own_app(
+            &identity,
+            held.as_ref(),
+            stored.as_ref(),
+            kept,
+            &verified,
+            base_ms,
+        ) {
+            return Err(error);
+        }
+        Ok(verified)
+    }
+
+    /// An own app's request at a call only the signer makes, before the lock: verified, then
+    /// checked as at its own calls in the order of Switch wire 7.2, from what the account
+    /// holds read without the lock, and only then refused with `403 permission_missing`.
+    pub(super) async fn refuse_app_at_signer_call(
+        &self,
+        account: &str,
+        request: &SwitchRequest,
+        claimed: &Claimed,
+        app: &str,
+        base_ms: u64,
+    ) -> ApiError {
+        if let Err(error) = self
+            .verify_own_app(account, request, claimed, app, false, base_ms)
+            .await
+        {
+            return error;
+        }
+        ApiError::new(
+            ErrorCode::PermissionMissing,
+            "7.4: a call only the signer may make",
+        )
     }
 
     /// The caller under the lock (Switch wire 7.2, 7.3 step 5), before the staged gate:
@@ -382,6 +549,7 @@ impl Service {
         held: Option<&IdentityDoc>,
         verified: Option<&VerifiedApp>,
         writer: Option<&AppCert>,
+        due: Option<u64>,
         time_ms: u64,
     ) -> Result<Answer, Stop> {
         let identity = txn.head().identity_key;
@@ -394,7 +562,7 @@ impl Service {
                 &parsed_here
             }
         };
-        self.run_batch(txn, signer, held, parsed, writer, identity, time_ms)
+        self.run_batch(txn, signer, held, parsed, writer, identity, due, time_ms)
             .await
     }
 
@@ -409,87 +577,18 @@ impl Service {
         time_ms: u64,
     ) -> Result<AppCert, Stop> {
         let identity = txn.head().identity_key;
-        let app = &verified.app;
-        let changed_key = || {
-            Stop::Unauthenticated(bad_signature(
-                "7.2: the key the request verified with isn't the app's",
-            ))
-        };
-        let first_call = verified
-            .parsed
-            .as_ref()
-            .and_then(|parsed| first_app_put(parsed, app));
-        let (cert, record) = match first_call {
-            // The first call: the record and its certificate verify.
-            Some(record) => {
-                let record = AppRecord::verify(&record, &identity).map_err(|_| {
-                    Stop::Unauthenticated(bad_signature("7.2: the first call's app record"))
-                })?;
-                if record.cert().app_id() != *app {
-                    return Err(Stop::Unauthenticated(bad_signature(
-                        "7.2: the record names another app",
-                    )));
-                }
-                (record.cert().clone(), None)
-            }
-            None => {
-                let stored = txn
-                    .apps()
-                    .await
-                    .map_err(|e| storage(&e))?
-                    .into_iter()
-                    .find(|stored| &stored.app_id == app);
-                let held_app = stored
-                    .as_ref()
-                    .map(|stored| held_app(stored, &identity))
-                    .transpose()
-                    .map_err(|e| storage(&e))?
-                    .filter(|a| a.record.is_some())
-                    .ok_or_else(changed_key)?;
-                let mut state = OpsState::new(identity, 0, 0, time_ms);
-                state.doc = held.cloned();
-                state.apps.insert(*app, held_app.clone());
-                let cert = state.checked_cert(app).cloned().ok_or_else(changed_key)?;
-                (cert, held_app.record)
-            }
-        };
-        if cert.signing_key() != verified.key {
-            return Err(changed_key());
-        }
-        // Checks 1 to 3 on that certificate: it verified for the identity and names the app;
-        // it hasn't expired.
-        if cert.identity() != identity || cert.app_id() != *app {
-            return Err(Stop::Unauthenticated(bad_signature(
-                "3.8: the certificate isn't the caller's",
-            )));
-        }
-        if cert.expired_at(time_ms) {
-            return Err(Stop::Refused(ApiError::new(
-                ErrorCode::CertExpired,
-                "3.8: the certificate has expired",
-            )));
-        }
-        // Not revoked or departed, and the certificate listed or in an open renewal.
-        let kept = txn.kept_app_ids().await.map_err(|e| storage(&e))?;
-        if kept.contains(app) {
-            return Err(Stop::Refused(not_current(
-                "7.2: the app is revoked or departed",
-            )));
-        }
-        if !held.is_some_and(|doc| doc.current_now(app, &cert.hash())) {
-            return Err(Stop::Refused(not_current(
-                "3.8: the newest identity.json doesn't list the certificate",
-            )));
-        }
-        // Check 6 on the record the service holds.
-        if let Some(record) = record
-            && !record.carries(&cert)
-        {
-            return Err(Stop::Refused(not_current(
-                "3.8: the held record doesn't carry the certificate",
-            )));
-        }
-        Ok(cert)
+        let stored = txn
+            .apps()
+            .await
+            .map_err(|e| storage(&e))?
+            .into_iter()
+            .find(|stored| stored.app_id == verified.app);
+        let kept = txn
+            .kept_app_ids()
+            .await
+            .map_err(|e| storage(&e))?
+            .contains(&verified.app);
+        check_own_app(&identity, held, stored.as_ref(), kept, verified, time_ms)
     }
 
     /// Steps 3 to 11 of a batch whose caller is authenticated.
@@ -502,6 +601,7 @@ impl Service {
         parsed: &OpsRequest,
         writer: Option<&AppCert>,
         identity: [u8; 32],
+        due: Option<u64>,
         time_ms: u64,
     ) -> Result<Answer, Stop> {
         let cert = writer;
@@ -548,9 +648,16 @@ impl Service {
             .with_current(json!({ "generation": generation }))
             .into());
         }
-        let before = load_state(txn, held, &ops, caller_app.as_ref(), time_ms)
-            .await
-            .map_err(|e| storage(&e))?;
+        let before = load_state(
+            txn,
+            held,
+            &ops,
+            caller_app.as_ref(),
+            due.map(|base| (base, self.limits.max_claim_age_ms)),
+            time_ms,
+        )
+        .await
+        .map_err(|e| storage(&e))?;
         // Step 7: no-ops, time and rates.
         let effect = batch_effect(&ops, &before, parsed.cursor().is_some());
         if effect == BatchEffect::NoOp {
@@ -605,16 +712,9 @@ impl Service {
         // Step 11: the chain items and their proofs, then the state, all at once.
         let first_seq = txn.head().last_seq.saturating_add(1);
         let proofs = self.chain_ops(txn, signer, &ops, &applied, time_ms).await?;
-        save(
-            txn,
-            &before,
-            &mut after,
-            &ops,
-            &proofs,
-            self.limits.max_claim_age_ms,
-        )
-        .await
-        .map_err(|e| storage(&e))?;
+        save(txn, &before, &mut after, &ops, &proofs)
+            .await
+            .map_err(|e| storage(&e))?;
         if let (Some(first), Some(ops_hash)) = (ops.first(), hash) {
             txn.put_batch(
                 &first.body().batch.id,
@@ -766,7 +866,6 @@ async fn save(
     after: &mut OpsState,
     ops: &[SignedOp],
     proofs: &[SignedDoc],
-    max_claim_age_ms: u64,
 ) -> Result<(), StoreError> {
     // The records and claim entries this batch wrote keep their operation's proof.
     let proof_at = |seq: u64| -> Option<SignedDoc> {
@@ -815,7 +914,7 @@ async fn save(
     }
     for (key, claim) in &after.claims {
         if before.claims.get(key) != Some(claim) {
-            txn.put_claim(key, claim, max_claim_age_ms).await?;
+            txn.put_claim(key, claim).await?;
         }
     }
     for entry in &after.new_entries {
