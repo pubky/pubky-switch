@@ -136,6 +136,9 @@ impl App {
     /// spec 8.2, 11). The processed pair is written if the entry had none, and goes with
     /// the other processed pairs after their retention.
     ///
+    /// A host that might want the message later, for example once the cause of a refusal
+    /// is fixed, doesn't forget it: nothing brings a forgotten entry back.
+    ///
     /// # Errors
     ///
     /// [`Refusal::Usage`] for a `seq` with no entry stored, or one that is tried again;
