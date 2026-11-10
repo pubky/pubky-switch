@@ -466,22 +466,14 @@ impl Service {
         // 12.2). Under the lock they run again.
         let identity = pubky_switch_core::enc::pubky_key(account)
             .map_err(|_| ApiError::not_found("no such account"))?;
-        let held = self
+        // One statement, so the document, the row and the kept flag are of one state.
+        let (doc, stored, kept) = self
             .store
-            .identity_doc(account)
+            .own_app_view(account, &app)
             .await
             .map_err(|e| store_error(&e))?
-            .and_then(|doc| IdentityDoc::verify(&doc, &identity).ok());
-        let stored = self
-            .store
-            .app_row(account, &app)
-            .await
-            .map_err(|e| store_error(&e))?;
-        let kept = self
-            .store
-            .app_kept(account, &app)
-            .await
-            .map_err(|e| store_error(&e))?;
+            .ok_or_else(|| ApiError::not_found("no such account"))?;
+        let held = doc.and_then(|doc| IdentityDoc::verify(&doc, &identity).ok());
         if let Err(Stop::Refused(error) | Stop::Unauthenticated(error)) = check_own_app(
             &identity,
             held.as_ref(),

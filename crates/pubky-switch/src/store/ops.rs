@@ -510,7 +510,15 @@ impl AccountTxn {
         for row in &unknown {
             let key: Vec<u8> = row.try_get("claim_key")?;
             let state: Vec<u8> = row.try_get("state")?;
-            let (after, after_entry) = claim_codec::deletion(&claim_codec::decode(&state)?);
+            // A state that doesn't decode is marked known with no deletion time, so it
+            // blocks nothing; the log names no content.
+            let (after, after_entry) = match claim_codec::decode(&state) {
+                Ok(claim) => claim_codec::deletion(&claim),
+                Err(error) => {
+                    tracing::warn!(%error, "a stored claim doesn't decode; it isn't deleted on time");
+                    (None, None)
+                }
+            };
             sqlx::query(
                 "UPDATE claims SET delete_known = true, delete_after_ms = $3, \
                  delete_after_entry_ms = $4 WHERE account_id = $1 AND claim_key = $2",
@@ -544,6 +552,25 @@ impl AccountTxn {
             self.note_change();
         }
         Ok(deleted)
+    }
+
+    /// The `seq` of the entry at `step` of the claim at `claim_key`.
+    pub async fn claim_entry_seq(
+        &mut self,
+        claim_key: &[u8; 32],
+        step: u64,
+    ) -> Result<Option<u64>, StoreError> {
+        let id = self.head().id.clone();
+        let seq: Option<i64> = sqlx::query_scalar(
+            "SELECT seq FROM claim_entries WHERE account_id = $1 AND claim_key = $2 AND step = $3",
+        )
+        .bind(id)
+        .bind(claim_key.as_slice())
+        .bind(to_db(step, "step")?)
+        .fetch_optional(self.conn())
+        .await
+        .map_err(db)?;
+        seq.map(|seq| from_db(seq, "seq")).transpose()
     }
 
     /// Delete the claim at `claim_key`, with its entries, as step 4 would.
@@ -933,6 +960,36 @@ fn app_of(row: &sqlx::postgres::PgRow) -> Result<StoredApp, StoreError> {
         reachable_since: opt_u64(row.try_get("reachable_since")?, "reachable_since")?,
         full_requested_ms: opt_u64(row.try_get("full_requested_ms")?, "full_requested_ms")?,
     })
+}
+
+/// What an own app's checks before the lock read (Switch wire 7.2 Order), in one statement
+/// so they see one state: the account's newest `identity.json`, the app's row, and whether
+/// its App ID is kept for good. `None` for an account that isn't there.
+pub(super) async fn own_app_view(
+    pool: &sqlx::PgPool,
+    id: &str,
+    app_id: &[u8; 16],
+) -> Result<Option<(Option<SignedDoc>, Option<StoredApp>, bool)>, StoreError> {
+    let row = sqlx::query(
+        "SELECT a.identity_doc, p.app_id, p.record, p.record_at_ms, p.renewed_cert, \
+         p.receive_key, p.cursor_generation, p.cursor_seq, p.reachable_since, \
+         p.full_requested_ms, EXISTS (SELECT 1 FROM kept_app_ids k \
+         WHERE k.account_id = a.id AND k.app_id = $2) AS kept \
+         FROM accounts a LEFT JOIN apps p ON p.account_id = a.id AND p.app_id = $2 \
+         WHERE a.id = $1",
+    )
+    .bind(id)
+    .bind(app_id.as_slice())
+    .fetch_optional(pool)
+    .await
+    .map_err(db)?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let doc = opt_doc(row.try_get("identity_doc")?, "identity_doc")?;
+    let app: Option<Vec<u8>> = row.try_get("app_id")?;
+    let app = app.map(|_| app_of(&row)).transpose()?;
+    Ok(Some((doc, app, row.try_get("kept")?)))
 }
 
 /// The `apps` row of `app_id` at account `id`, read without the account's lock.

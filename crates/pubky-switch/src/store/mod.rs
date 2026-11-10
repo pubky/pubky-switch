@@ -347,33 +347,22 @@ impl Store {
         ops::app_row(&self.pool, id, app_id).await
     }
 
-    /// Whether account `id` keeps `app_id` for good, revoked, departed or named by an
-    /// enrollment, read without the account's lock.
-    pub async fn app_kept(&self, id: &str, app_id: &[u8; 16]) -> Result<bool, StoreError> {
-        let kept: Option<i32> =
-            sqlx::query_scalar("SELECT 1 FROM kept_app_ids WHERE account_id = $1 AND app_id = $2")
-                .bind(id)
-                .bind(app_id.as_slice())
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(StoreError::from_db)?;
-        Ok(kept.is_some())
-    }
-
-    /// The newest `identity.json` account `id` holds, read without the account's lock.
-    pub async fn identity_doc(
+    /// What an own app's checks before the lock read, in one statement: account `id`'s
+    /// newest `identity.json`, the row of `app_id`, and whether it is kept for good (Switch
+    /// wire 7.2 Order). `None` for an account that isn't there.
+    pub async fn own_app_view(
         &self,
         id: &str,
-    ) -> Result<Option<pubky_switch_core::sig::SignedDoc>, StoreError> {
-        let doc: Option<Option<Vec<u8>>> =
-            sqlx::query_scalar("SELECT identity_doc FROM accounts WHERE id = $1")
-                .bind(id)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(StoreError::from_db)?;
-        doc.flatten()
-            .map(|bytes| identity::decode_doc(&bytes, "identity_doc"))
-            .transpose()
+        app_id: &[u8; 16],
+    ) -> Result<
+        Option<(
+            Option<pubky_switch_core::sig::SignedDoc>,
+            Option<StoredApp>,
+            bool,
+        )>,
+        StoreError,
+    > {
+        ops::own_app_view(&self.pool, id, app_id).await
     }
 
     /// The first `steps` entries of claim `claim_key` at account `id`, by step, read without

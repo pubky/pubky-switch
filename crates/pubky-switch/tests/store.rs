@@ -795,6 +795,34 @@ async fn test_store_upgrade_deletes_claims_from_before_0006() {
     .execute(&mut conn)
     .await
     .expect("a claim under 0005");
+    // A failed claim pinned to no deadline, and a row whose state doesn't decode.
+    let last_entry: u64 = 1_767_225_600_000;
+    let failed = serde_json::json!({
+        "step": 2,
+        "attempts": [{
+            "attempt_id": attempt, "owner": owner, "outcome": "failed",
+            "opened_at": last_entry, "orphan_after": 60,
+            "possibly_duplicate": false, "duplicate": false,
+            "resolved_by": owner, "from_upload": false,
+        }],
+        "current": null, "settled": false, "tombstone": false, "pin": "none",
+        "divergent": false, "rebuilt": false, "creator": owner, "last_entry": last_entry,
+    });
+    for (key, state) in [
+        ([10u8; 32], serde_json::to_vec(&failed).expect("state")),
+        ([11u8; 32], b"not a claim".to_vec()),
+    ] {
+        sqlx::query(
+            "INSERT INTO claims (account_id, claim_key, state, creator, tombstone, open_owners) \
+             VALUES ('old', $1, $2, $3, false, '{}')",
+        )
+        .bind(key.as_slice())
+        .bind(state)
+        .bind([5u8; 16].as_slice())
+        .execute(&mut conn)
+        .await
+        .expect("a claim under 0005");
+    }
     let announced =
         pubky_switch::service::announced_limits(&pubky_switch::limits::Limits::default());
     db.store().migrate(&announced).await.expect("upgrade");
@@ -818,6 +846,26 @@ async fn test_store_upgrade_deletes_claims_from_before_0006() {
             .await
             .expect("delete"),
         1
+    );
+    // The failed claim goes once its last entry is max_claim_age_ms old; the row that
+    // doesn't decode blocks nothing, and stays.
+    assert_eq!(
+        txn.delete_due_claims(last_entry + age - 1, age, 64)
+            .await
+            .expect("delete"),
+        0
+    );
+    assert_eq!(
+        txn.delete_due_claims(last_entry + age, age, 64)
+            .await
+            .expect("delete"),
+        1
+    );
+    assert_eq!(
+        txn.delete_due_claims(u64::MAX >> 12, age, 64)
+            .await
+            .expect("delete"),
+        0
     );
     drop(txn);
     conn.close().await.expect("close");

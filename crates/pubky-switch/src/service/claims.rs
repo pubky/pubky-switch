@@ -25,6 +25,9 @@ pub(super) struct ClaimRead {
     view: serde_json::Value,
     /// How many entries the claim had: its step, 0 for a tombstone.
     steps: u64,
+    /// The `seq` of its last entry, which only this claim holds: entries read after the
+    /// lock are this claim's, not those of one made again at its key since.
+    last_seq: Option<u64>,
 }
 
 fn temporary() -> ApiError {
@@ -77,13 +80,24 @@ impl Service {
             .map_err(|e| store_error(&e))?;
         let current = |app: &[u8; 16]| apps.is_current(app);
         let view = claim.view(&claim_key, time_ms, &current).to_value();
+        let steps = if claim.tombstone { 0 } else { claim.step };
+        let last_seq = match steps.checked_sub(1) {
+            Some(last) => Some(
+                txn.claim_entry_seq(&claim_key, last)
+                    .await
+                    .map_err(|e| store_error(&e))?
+                    .ok_or_else(temporary)?,
+            ),
+            None => None,
+        };
         let head = self.head(txn, signer).await.ok_or_else(temporary)?;
         let mut answer = Answer::ok(Vec::new()).with_head(Some(head));
         answer.claim_read = Some(ClaimRead {
             account: txn.head().id.clone(),
             claim_key,
             view,
-            steps: if claim.tombstone { 0 } else { claim.step },
+            steps,
+            last_seq,
         });
         Ok(answer)
     }
@@ -101,7 +115,11 @@ impl Service {
             .claim_entries_before(&read.account, &read.claim_key, read.steps)
             .await
             .map_err(|e| store_error(&e))?;
-        if u64::try_from(entries.len()).ok() != Some(read.steps) {
+        // The claim lost entries since, or another claim took its key: a temporary failure,
+        // never a view with entries of another claim.
+        if u64::try_from(entries.len()).ok() != Some(read.steps)
+            || entries.last().map(|e| e.seq) != read.last_seq
+        {
             return Err(temporary());
         }
         let entries: Vec<_> = entries
