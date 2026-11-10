@@ -154,6 +154,43 @@ async fn test_revocation_keeps_the_app_id_before_the_switch_answers() {
 }
 
 #[tokio::test]
+async fn test_revocation_reaches_the_switch_while_an_alarm_holds_signing_back() {
+    // The switch went back: an alarm. The revocation still cuts the app off at the switch,
+    // which signs nothing new; the version that removes it waits for the alarm to be cleared.
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let (a, _) = two_joined(&world, &mut signer).await;
+    let id = a.keys.app_id_bytes();
+    let before = signer.identity_doc().unwrap().unwrap();
+    signer.set_record_max_age(Some(86_400)).await.unwrap();
+    world.switch.deliver_identity(&before).unwrap();
+    let SignerError::Alarm(alarm) = signer.set_record_max_age(Some(60)).await.unwrap_err() else {
+        panic!("no alarm")
+    };
+    let current = signer.identity_doc().unwrap().unwrap();
+    world.switch.deliver_identity(&current).unwrap();
+    let sent = world.sent_docs().len();
+    assert_eq!(
+        signer.revoke(id, None, confirmed()).await.unwrap_err(),
+        SignerError::Alarm(alarm.clone())
+    );
+    assert!(world.switch.app(&id).departed);
+    assert!(refused_for_good(&signer, &a));
+    assert_eq!(world.sent_docs().len(), sent);
+    // Cleared, the next run removes it.
+    signer.clear_alert(&alarm).await.unwrap();
+    signer.run_due().await.unwrap();
+    assert!(
+        signer
+            .identity_doc()
+            .unwrap()
+            .unwrap()
+            .listed_cert(&id)
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn test_revocation_refuses_an_app_that_isnt_listed() {
     let world = World::new();
     let (mut signer, _) = world.enrolled().await;

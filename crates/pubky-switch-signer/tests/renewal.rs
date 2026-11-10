@@ -879,6 +879,63 @@ async fn test_renewal_an_owed_closing_isnt_signed_while_the_records_are_behind()
 }
 
 #[tokio::test]
+async fn test_renewal_an_owed_closing_waits_for_a_held_alarm_to_be_cleared() {
+    // A reduction's closing is owed with no flow in progress, as after a refused closing
+    // delivery. The Homeserver then shows another body at the renewing version: an alarm.
+    // While it is held nothing is signed, the closing included, and the user is told the
+    // reduction stays open. Once the alarm is cleared, the closing goes out and is published
+    // over the other body.
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let app = App::new(&["notes", "notes_tags"], None, [9; 32]);
+    world.approve(&mut signer, &app).await;
+    let id = app.keys.app_id_bytes();
+    world.switch.fail_next(SwitchFault::Unreachable {
+        path: "/identity".into(),
+        after: 1,
+    });
+    signer.renew(id, reduce(&["notes"])).await.unwrap_err();
+    world.switch.fail_next(SwitchFault::Error {
+        path: "/identity".into(),
+        code: ErrorCode::BadRequest,
+        current: serde_json::Value::Null,
+    });
+    signer.resume().await.unwrap_err();
+    let renewing = world.switch.identity_doc().unwrap();
+    let mut body = renewing.body().clone();
+    body.record_max_age = Some(7);
+    let other = IdentityDoc::sign(&world.key, body).unwrap();
+    world
+        .homeserver
+        .set(IDENTITY_PATH, serde_json::to_vec(other.signed()).unwrap());
+    let SignerError::Alarm(alarm) = signer.set_record_max_age(Some(60)).await.unwrap_err() else {
+        panic!("no alarm")
+    };
+    // Held: nothing new is signed or sent, however often it resumes.
+    let sent = world.sent_docs().len();
+    for _ in 0..2 {
+        assert_eq!(
+            signer.resume().await.unwrap_err(),
+            SignerError::Alarm(alarm.clone())
+        );
+    }
+    assert_eq!(world.sent_docs().len(), sent);
+    assert_eq!(renewals(&world.switch.identity_doc().unwrap(), &id), [None]);
+    assert_eq!(world.published().unwrap().signed(), other.signed());
+    assert_eq!(signer.status(), pubky_switch_signer::SignerStatus::Alarm);
+    let open = Alert::ReductionNotClosed { apps: vec![id] };
+    assert!(signer.alerts().contains(&open));
+    // Cleared: the switch is confirmed, the closing is delivered, and it is published.
+    signer.clear_alert(&alarm).await.unwrap();
+    let closed = world.switch.identity_doc().unwrap();
+    assert!(renewals(&closed, &id)[0].is_some());
+    assert_eq!(world.published().unwrap().signed(), closed.signed());
+    assert!(!signer.alerts().contains(&open));
+    assert_eq!(signer.status(), pubky_switch_signer::SignerStatus::Signing);
+    world.assert_no_version_sent_twice();
+}
+
+#[tokio::test]
 async fn test_renewal_refuses_an_app_that_isnt_listed() {
     let world = World::new();
     let (mut signer, _) = world.enrolled().await;

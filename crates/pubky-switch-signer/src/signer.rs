@@ -32,7 +32,7 @@ use pubky_switch_client::transport::Transport;
 use pubky_switch_client::{ClientError, Credentials, StoreError, SwitchClient};
 use pubky_switch_core::enc::{pubky_id, random_bytes};
 use pubky_switch_core::http::{ErrorCode, IdentityDelivery};
-use pubky_switch_core::keys::IdentityKey;
+
 use pubky_switch_core::records::{
     AppCert, ConnectRequests, Enrollment, EnrollmentBody, IDENTITY_PATH, IdentityBody, IdentityDoc,
     IdentityPolicy, Inbox, SIGNER_BACKUP_PATH, SignerBackup, SignerRecords, taken_over,
@@ -44,11 +44,12 @@ use serde_json::Value;
 use crate::alert::{Alert, Source};
 use crate::error::{Refusal, Result, SignerError};
 use crate::homeserver::Homeserver;
-use crate::key::{ExportReason, IdentityKeyring};
+use crate::key::{ExportReason, IdentityKeyring, SigningKey};
 use crate::protocol::Protocols;
 use crate::state::{self, DeliverStep, Flow, Newest, Service, SignerState};
 
 mod approval;
+pub(crate) mod gate;
 mod renewal;
 mod revocation;
 
@@ -126,10 +127,25 @@ pub enum SignerStatus {
         /// That version.
         version: u64,
     },
-    /// A rollback or an equivocation was seen, and the switch hasn't confirmed since that it
-    /// holds this signer's newest version: claims are held, and nothing is signed on top
-    /// until the user clears the alert ([`Signer::clear_alert`]).
+    /// A rollback or an equivocation was seen: its alert is held, or the switch hasn't
+    /// confirmed since that it holds this signer's newest version. Claims are held, and
+    /// nothing is signed, an owed closing included, until the user clears the alert
+    /// ([`Signer::clear_alert`]) and the switch is confirmed again.
     Alarm,
+}
+
+/// Where the records `state` stand: what holds signing back is the signing gate's verdict
+/// ([`gate::refusal`]), so the status says signing only when the gate lets it through.
+fn status_of(state: &SignerState) -> SignerStatus {
+    match gate::refusal(state) {
+        Some(SignerError::NotNamed { install }) => SignerStatus::ManagedBy { install },
+        Some(SignerError::Refused(Refusal::RecordsBehind { version })) => {
+            SignerStatus::RecordsBehind { version }
+        }
+        Some(_) => SignerStatus::Alarm,
+        None if state.newest.is_none() => SignerStatus::Enrolling,
+        None => SignerStatus::Signing,
+    }
 }
 
 /// The signer of one identity, on one install.
@@ -171,8 +187,9 @@ impl Signer {
         }
         let install = random_bytes::<16>()?;
         let policy = IdentityPolicy::default();
+        let state = SignerState::new(identity, install);
         let enrollment = {
-            let key = keyring.unlock()?;
+            let key = gate::signing_key(&keyring, &state)?;
             let body = EnrollmentBody {
                 identity,
                 origin: origin.to_owned(),
@@ -185,7 +202,6 @@ impl Signer {
         };
         // The enrollment's own check refuses an origin that isn't a switch origin.
         Enrollment::verify(enrollment.signed(), &identity, origin)?;
-        let state = SignerState::new(identity, install);
         let flow = Flow::Enroll {
             origin: origin.to_owned(),
             enrollment: enrollment.signed().clone(),
@@ -293,15 +309,7 @@ impl Signer {
 
     /// Where the signer stands.
     pub fn status(&self) -> SignerStatus {
-        match (self.state.managed_by, &self.state.newest) {
-            (Some(install), _) => SignerStatus::ManagedBy { install },
-            (None, _) if self.state.records_behind.is_some() => SignerStatus::RecordsBehind {
-                version: self.state.records_behind.unwrap_or_default(),
-            },
-            (None, _) if self.state.switch_unconfirmed => SignerStatus::Alarm,
-            (None, None) => SignerStatus::Enrolling,
-            (None, Some(_)) => SignerStatus::Signing,
-        }
+        status_of(&self.state)
     }
 
     /// The newest `identity.json` a service accepted from this signer, or that it adopted.
@@ -437,7 +445,7 @@ impl Signer {
     /// (Switch spec 4.3, 13.2).
     async fn new_version(&mut self, change: impl FnOnce(&mut IdentityBody)) -> Result<IdentityDoc> {
         self.ready().await?;
-        let key = self.keyring.unlock()?;
+        let key = self.signing_key()?;
         let (doc, flow) = self.next_version(&key, change)?;
         drop(key);
         let mut state = self.state.clone();
@@ -448,14 +456,20 @@ impl Signer {
     }
 
     /// Ready for a new signing call: the store read again if a commit left it unsure, this
-    /// install named, and no flow in progress.
+    /// install named, no flow in progress, the copies checked, and the signing gate passed
+    /// ([`gate::refusal`]).
     pub(crate) async fn ready(&mut self) -> Result<()> {
         self.refresh().await?;
         self.check_named()?;
         if self.flow.is_some() {
             return Err(Refusal::FlowInProgress.into());
         }
+        // The copies are read first, so a take-over or records behind are found also while an
+        // alarm holds signing back; then the signing gate decides.
         self.check_copies().await?;
+        if let Some(refused) = gate::refusal(&self.state) {
+            return Err(refused);
+        }
         if self.owes_closing()? {
             self.resume().await?;
         }
@@ -541,7 +555,7 @@ impl Signer {
     /// flow that delivers it. Nothing is committed.
     pub(crate) fn next_version(
         &self,
-        key: &IdentityKey,
+        key: &SigningKey,
         change: impl FnOnce(&mut IdentityBody),
     ) -> Result<(IdentityDoc, Flow)> {
         let newest = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
@@ -630,9 +644,8 @@ impl Signer {
         &self,
         origin: &str,
         pinned: Option<[u8; 32]>,
-        key: Arc<IdentityKey>,
+        key: Arc<dyn Signs + Send + Sync>,
     ) -> Result<SwitchClient> {
-        let key: Arc<dyn Signs + Send + Sync> = key;
         Ok(SwitchClient::new(
             origin,
             self.state.identity,
@@ -646,11 +659,25 @@ impl Signer {
         )?)
     }
 
-    /// A client of the switch the identity is enrolled at.
+    /// A client of the switch the identity is enrolled at, for requests: it signs no
+    /// operation ([`crate::key::IdentityKeyring::request_signer`]).
     fn service_client(&self) -> Result<SwitchClient> {
         let service = self.service()?;
-        let key = self.keyring.unlock()?;
+        let key = self.keyring.request_signer()?;
         self.client(&service.origin, Some(service.service_key), key)
+    }
+
+    /// A client of the switch the identity is enrolled at that signs operations with `key`,
+    /// which the signing gate handed out.
+    fn signing_client(&self, key: &SigningKey) -> Result<SwitchClient> {
+        let service = self.service()?;
+        self.client(&service.origin, Some(service.service_key), key.shared())
+    }
+
+    /// The identity key for this call's signing steps, through the signing gate
+    /// ([`gate::signing_key`]).
+    pub(crate) fn signing_key(&self) -> Result<SigningKey> {
+        gate::signing_key(&self.keyring, &self.state)
     }
 
     /// Enroll at the switch, then sign the first `identity.json` naming it (Switch spec 4.3
@@ -663,11 +690,11 @@ impl Signer {
     ) -> Result<()> {
         let identity = self.state.identity;
         let enrollment = Enrollment::verify(signed, &identity, origin)?;
-        let key = self.keyring.unlock()?;
         let answer = self
-            .client(origin, None, Arc::clone(&key))?
+            .client(origin, None, self.keyring.request_signer()?)?
             .enroll(&enrollment)
             .await?;
+        let key = self.signing_key()?;
         let body = IdentityBody::first(
             identity,
             self.state.install,
@@ -1078,4 +1105,34 @@ fn stale_without_copy() -> SignerError {
     SignerError::InvalidData(pubky_switch_core::Error::Invalid(
         "Switch wire 7.4.2: stale_identity without a newer copy than the one built on".into(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_status_follows_the_signing_gate() {
+        let mut state = SignerState::new([1; 32], [2; 16]);
+        assert_eq!(status_of(&state), SignerStatus::Enrolling);
+        // A held alarm reads as one also once a delivery confirmed the switch.
+        state.alert(Alert::Equivocation {
+            source: Source::Homeserver,
+            version: 2,
+        });
+        assert_eq!(status_of(&state), SignerStatus::Alarm);
+        state.alerts.clear();
+        state.switch_unconfirmed = true;
+        assert_eq!(status_of(&state), SignerStatus::Alarm);
+        state.records_behind = Some(9);
+        assert_eq!(
+            status_of(&state),
+            SignerStatus::RecordsBehind { version: 9 }
+        );
+        state.managed_by = Some([7; 16]);
+        assert_eq!(
+            status_of(&state),
+            SignerStatus::ManagedBy { install: [7; 16] }
+        );
+    }
 }

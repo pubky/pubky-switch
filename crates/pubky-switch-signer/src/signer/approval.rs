@@ -208,7 +208,7 @@ impl Signer {
         let expires = now.saturating_add(self.state.cert_lifetime_ms);
         let protocols = self.env.protocols.clone();
         let has_keys = |scope: &str| protocols.has_keys(scope);
-        let key = self.keyring.unlock()?;
+        let key = self.signing_key()?;
         let cert = AppCert::issue(
             &key,
             AppCertBody::new(

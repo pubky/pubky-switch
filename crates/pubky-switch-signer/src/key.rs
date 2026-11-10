@@ -38,7 +38,11 @@ use std::sync::Arc;
 
 use pubky_switch_core::enc::{kid, pubky_id};
 use pubky_switch_core::keys::IdentityKey;
+use pubky_switch_core::labels;
+use pubky_switch_core::signing::Signs;
 use zeroize::{Zeroize, ZeroizeOnDrop};
+
+use crate::signer::gate::GatePassed;
 
 /// The identity's 32-byte Ed25519 secret, its seed (Switch spec 13.3). Zeroized on drop, and
 /// never shown by `Debug`.
@@ -290,17 +294,33 @@ impl IdentityKeyring {
         Ok(secret)
     }
 
-    /// The identity key, loaded and checked, for one step of a flow: the requests and the
-    /// documents one call to the switch or the Homeserver signs. The client signs requests
-    /// through it, so it is shared; it is zeroized when the last holder drops it, at the end
-    /// of the step. Never kept in the signer's state.
+    /// The identity key, loaded and checked, for the signing steps of one call: documents,
+    /// certificates, key bundles and operations. Only the signing gate passes `passed`
+    /// (`crate::signer::gate`), so nothing is signed without its checks. It is zeroized when
+    /// the last holder drops it, at the end of the step. Never kept in the signer's state.
     ///
     /// # Errors
     ///
     /// The errors of [`IdentityKeyring::with_key`].
-    pub(crate) fn unlock(&self) -> Result<Arc<IdentityKey>, KeyError> {
+    pub(crate) fn signing_key(&self, passed: GatePassed) -> Result<SigningKey, KeyError> {
         let secret = self.load()?;
-        Ok(Arc::new(secret.key()))
+        Ok(SigningKey {
+            key: Arc::new(secret.key()),
+            _passed: passed,
+        })
+    }
+
+    /// The identity key for request signatures only (Switch wire 7.1), as a client's
+    /// credentials: it signs nothing but the `Switch-Signature` of a request, so a client
+    /// made with it reads and delivers what was signed already, and signs no operation or
+    /// document.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`IdentityKeyring::with_key`].
+    pub(crate) fn request_signer(&self) -> Result<Arc<dyn Signs + Send + Sync>, KeyError> {
+        let secret = self.load()?;
+        Ok(Arc::new(RequestSigner(secret.key())))
     }
 
     /// Run `use_key` with the identity key, for one signature or derivation over an input this
@@ -350,6 +370,47 @@ impl IdentityKeyring {
     pub(crate) fn destroy(&self) -> Result<(), KeyError> {
         self.vault.delete()?;
         Ok(())
+    }
+}
+
+/// The identity key for one call's signing steps, which only the signing gate hands out
+/// ([`IdentityKeyring::signing_key`]).
+pub(crate) struct SigningKey {
+    key: Arc<IdentityKey>,
+    _passed: GatePassed,
+}
+
+impl SigningKey {
+    /// The key, shared, for a client that signs operations with it.
+    pub(crate) fn shared(&self) -> Arc<IdentityKey> {
+        Arc::clone(&self.key)
+    }
+}
+
+impl std::ops::Deref for SigningKey {
+    type Target = IdentityKey;
+
+    fn deref(&self) -> &IdentityKey {
+        &self.key
+    }
+}
+
+/// The identity key behind a request-only credential: it signs `Switch-Signature` (Switch
+/// wire 7.1) and nothing else. Any other label gets an all-zero signature, which no reader
+/// takes.
+struct RequestSigner(IdentityKey);
+
+impl Signs for RequestSigner {
+    fn public_key(&self) -> [u8; 32] {
+        self.0.public()
+    }
+
+    fn sign_fields(&self, label: &str, fields: &[&[u8]]) -> [u8; 64] {
+        if label == labels::sig::HTTP {
+            self.0.sign(label, fields)
+        } else {
+            [0; 64]
+        }
     }
 }
 
@@ -653,6 +714,21 @@ pub(crate) mod tests {
                 IdentitySecret::from_slice(&vec![1; len]).unwrap_err(),
                 KeyError::Malformed
             );
+        }
+    }
+
+    #[test]
+    fn test_request_signer_signs_requests_and_nothing_else() {
+        let keyring = IdentityKeyring::open(MemoryVault::holding([7; 32])).unwrap();
+        let key = IdentityKey::from_secret([7; 32]);
+        let request = keyring.request_signer().unwrap();
+        let fields: &[&[u8]] = &[b"request"];
+        assert_eq!(
+            request.sign_fields(labels::sig::HTTP, fields),
+            key.sign(labels::sig::HTTP, fields)
+        );
+        for label in [labels::sig::OP, labels::sig::HTTP_RESPONSE] {
+            assert_eq!(request.sign_fields(label, fields), [0; 64]);
         }
     }
 }

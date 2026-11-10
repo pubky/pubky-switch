@@ -61,14 +61,17 @@ impl Signer {
     /// # Errors
     ///
     /// [`Refusal::NotListed`] for an app the newest `identity.json` doesn't list; otherwise
-    /// as [`Signer::resume`]. A revocation cut short goes on at [`Signer::run_due`].
+    /// as [`Signer::resume`]. A revocation cut short goes on at [`Signer::run_due`]. While an
+    /// alarm holds signing back, the app is still revoked at the switch, and the error is the
+    /// alarm's: the version that removes it waits until the alarm is cleared.
     pub async fn revoke(
         &mut self,
         app_id: [u8; 16],
         distrust_from: Option<u64>,
         _confirmed: UserConfirmed,
     ) -> Result<IdentityDoc> {
-        self.ready().await?;
+        self.refresh().await?;
+        self.check_named()?;
         let newest = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
         if newest.listed_cert(&app_id).is_none() {
             return Err(Refusal::NotListed.into());
@@ -82,7 +85,7 @@ impl Signer {
             app_id,
             distrust_from,
         });
-        self.commit(state, None).await?;
+        self.commit(state, self.flow.clone()).await?;
         self.complete_removals().await?;
         self.state
             .newest_doc()?
@@ -90,36 +93,20 @@ impl Signer {
     }
 
     /// Remove every app that is revoked or departed and still listed, in one version with a
-    /// rotation (Switch spec 12.2 steps 2 to 4, 12.3). Revocations asked for are sent to the switch first. Returns whether a
-    /// version was delivered.
+    /// rotation (Switch spec 12.2 steps 2 to 4, 12.3). The revocations asked for are sent to
+    /// the switch first, also while an alarm holds signing back, since they sign nothing new.
+    /// Returns whether a version was delivered.
     ///
     /// # Errors
     ///
     /// As [`Signer::resume`].
     pub async fn complete_removals(&mut self) -> Result<bool> {
+        self.refresh().await?;
+        self.check_named()?;
+        self.send_revocations().await?;
         self.ready().await?;
         let mut newest = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
         let mut statuses = self.switch_apps().await?;
-        // Step 2, for the revocations asked for that the switch doesn't show yet.
-        let unsent: Vec<[u8; 16]> = self
-            .state
-            .revoking
-            .iter()
-            .filter(|r| newest.listed_cert(&r.app_id).is_some())
-            .filter(|r| {
-                !statuses
-                    .iter()
-                    .any(|s| s.app_id == r.app_id && s.revoked_at.is_some())
-            })
-            .map(|r| r.app_id)
-            .collect();
-        if !unsent.is_empty() {
-            let client = self.service_client()?;
-            for app_id in &unsent {
-                client.revoke(app_id).await?;
-            }
-            statuses = self.switch_apps().await?;
-        }
         if self.removals(&newest, &statuses).is_empty() {
             self.drop_revoked_requests().await?;
             return Ok(false);
@@ -136,10 +123,10 @@ impl Signer {
             .data_epoch()
             .checked_add(1)
             .ok_or_else(|| SignerError::Records("the data epoch can't go higher".into()))?;
-        let key = self.keyring.unlock()?;
+        let key = self.signing_key()?;
         // The apps the switch no longer serves get no part, the removed ones among them.
         let (ops, alerts) = self.catch_up(&key, &newest, &statuses, None, last)?;
-        let batches = self.sign_batches(newest.generation(), ops)?;
+        let batches = self.sign_batches(&key, newest.generation(), ops)?;
         let (doc, flow) = self.next_version(&key, |body| {
             for removed in &removing {
                 body.apps.retain(|a| a.app_id != removed.app_id);
@@ -163,6 +150,30 @@ impl Signer {
             .await?;
         self.resume().await?;
         Ok(true)
+    }
+
+    /// Revoke at the switch every app a revocation was asked for that the newest version
+    /// still lists (Switch spec 12.2 step 1). It is a request and signs nothing new; the
+    /// switch answers a revocation sent again with no proof (Switch wire 7.4.12).
+    async fn send_revocations(&mut self) -> Result<()> {
+        let Some(newest) = self.state.newest_doc()? else {
+            return Ok(());
+        };
+        let pending: Vec<[u8; 16]> = self
+            .state
+            .revoking
+            .iter()
+            .map(|r| r.app_id)
+            .filter(|app| newest.listed_cert(app).is_some())
+            .collect();
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let client = self.service_client()?;
+        for app_id in &pending {
+            client.revoke(app_id).await?;
+        }
+        Ok(())
     }
 
     /// The listed apps the switch shows revoked or departed, each with its `distrust_from`:
@@ -270,7 +281,7 @@ impl Signer {
         let current = newest.data_epoch();
         let protocols = self.env.protocols.clone();
         let keyed = keyed(&protocols);
-        let key = self.keyring.unlock()?;
+        let key = self.signing_key()?;
         let mut ops: Vec<Op> = Vec::new();
         let mut alerts = Vec::new();
         let mut answered = Vec::new();
@@ -332,7 +343,6 @@ impl Signer {
             }
             answered.push(listed.app_id);
         }
-        drop(key);
         let mut state = self.state.clone();
         for alert in alerts {
             state.alert(alert);
@@ -343,7 +353,8 @@ impl Signer {
             }
             return Ok(answered);
         }
-        let batches = self.sign_batches(newest.generation(), ops)?;
+        let batches = self.sign_batches(&key, newest.generation(), ops)?;
+        drop(key);
         let held = self.state.newest.clone().ok_or(Refusal::NotSetUp)?;
         // After the parts, the newest version again: its backup lists them, and its delivery
         // is a retry the switch answers with its proof (Switch wire 3.13, 7.4.2).
