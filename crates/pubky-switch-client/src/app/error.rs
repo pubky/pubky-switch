@@ -211,9 +211,10 @@ pub(crate) enum RefusalPlace {
     /// permission_missing`) before shape. The app's own `app.put` and `receive_key.put` go
     /// in batches of their own, sent again by their own steps (joining, the record's
     /// delivery, a registration, a move's or a loss's re-registration), never through a
-    /// kept effect or a kept batch, whose answers this classifies; a protocol's effect or a
-    /// host's batch carrying one would be held here as about the caller until the window
-    /// ends.
+    /// kept effect or a kept batch, whose answers this classifies. A protocol's effect and a
+    /// host's batch may carry none of them (`refuse_lifecycle_ops`), which is what makes
+    /// [`RefusalPlace::Caller`] safe until the wire's answers name the operation: otherwise
+    /// one refused at step 9 would be held here as about the caller until the window ends.
     Bytes,
 }
 

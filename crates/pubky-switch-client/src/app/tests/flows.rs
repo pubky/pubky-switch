@@ -1464,6 +1464,178 @@ async fn test_app_kept_effect_refused_for_an_expired_certificate_waits_for_the_r
     assert_eq!(app.cert().hash(), renewed.hash());
 }
 
+/// The app layer's own lifecycle operations, and the signer's, for `app`.
+fn lifecycle_ops(w: &World, app: &App) -> Vec<OpKind> {
+    let has_keys = |s: &str| SampleProtocol::default().has_keys(s);
+    let epoch = w.switch.identity_doc().unwrap().data_epoch();
+    let part = seal_bundle_parts(&w.alice, app.cert(), 1, epoch, &has_keys)
+        .unwrap()
+        .remove(0);
+    vec![
+        OpKind::AppPut {
+            record: app.record().clone(),
+        },
+        OpKind::ReceiveKeyPut {
+            record: app
+                .state
+                .receive_keys
+                .values()
+                .next()
+                .unwrap()
+                .record
+                .clone(),
+        },
+        OpKind::KeyBundlePut(KeyBundlePut {
+            target_app_id: app.app_id(),
+            bundle: part.bundle,
+            first_epoch: part.first_epoch,
+            last_epoch: part.last_epoch,
+        }),
+        OpKind::CertPut {
+            target_app_id: app.app_id(),
+            cert: app.cert().signed().clone(),
+        },
+    ]
+}
+
+#[tokio::test]
+async fn test_app_refuses_lifecycle_operations_in_a_host_batch() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let applied = w.switch.applied().len();
+    for kind in lifecycle_ops(&w, &app) {
+        let error = app
+            .submit_batch(crate::app::OpBatch::new().op(kind.clone()))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, AppError::Refused(Refusal::Usage(_))),
+            "{kind:?}: {error:?}"
+        );
+        // Refused before anything is kept or sent.
+        assert!(app.kept_batches().await.unwrap().is_empty());
+        assert_eq!(w.switch.applied().len(), applied);
+    }
+    // A batch of the host's own writes still goes.
+    app.submit_batch(crate::app::OpBatch::new().op(OpKind::AllowPut {
+        pubky: w.bob.public(),
+        kind: pubky_switch_core::ops::AllowKind::Conversation,
+    }))
+    .await
+    .unwrap();
+    assert_eq!(w.switch.applied().len(), applied + 1);
+}
+
+/// The sample protocol, whose effect for a note also carries `extra`, through the context
+/// or in the effect itself, recording what the context answered.
+struct LifecycleProtocol {
+    sample: SampleProtocol,
+    extra: OpKind,
+    in_context: bool,
+    answers: std::sync::Mutex<Vec<bool>>,
+}
+
+impl Protocol for LifecycleProtocol {
+    fn has_keys(&self, scope: &str) -> bool {
+        self.sample.has_keys(scope)
+    }
+
+    fn sent_between_own_apps(&self, kind: &str) -> bool {
+        self.sample.sent_between_own_apps(kind)
+    }
+
+    fn check_scopes(
+        &self,
+        message: &pubky_switch_core::message::Message,
+        sender: &pubky_switch_core::records::AppCert,
+        own: &pubky_switch_core::records::AppCert,
+    ) -> Result<(), String> {
+        self.sample.check_scopes(message, sender, own)
+    }
+
+    fn accepts(&self, cert: &pubky_switch_core::records::AppCert) -> Vec<String> {
+        self.sample.accepts(cert)
+    }
+
+    fn check_body(&self, message: &crate::app::ReceivedMessage) -> Result<(), String> {
+        self.sample.check_body(message)
+    }
+
+    fn receive_with(
+        &self,
+        message: &crate::app::ReceivedMessage,
+        cx: &mut crate::app::ReceiveContext<'_>,
+    ) -> crate::app::Outcome {
+        if self.in_context {
+            let answer = cx.op(Vec::new(), self.extra.clone());
+            self.answers.lock().unwrap().push(answer.is_ok());
+            return self.sample.receive(message);
+        }
+        match self.sample.receive(message) {
+            crate::app::Outcome::Apply(mut effect) => {
+                effect.ops.push((Vec::new(), self.extra.clone()));
+                crate::app::Outcome::Apply(effect)
+            }
+            other => other,
+        }
+    }
+
+    fn resend_needed(
+        &self,
+        needed: &crate::app::ResendNeeded,
+    ) -> Result<Vec<crate::app::LocalWrite>, crate::app::StoreFailure> {
+        self.sample.resend_needed(needed)
+    }
+
+    fn missed(
+        &self,
+        missed: &crate::app::MissedEntries,
+    ) -> Result<Vec<crate::app::LocalWrite>, crate::app::StoreFailure> {
+        self.sample.missed(missed)
+    }
+}
+
+#[tokio::test]
+async fn test_app_refuses_lifecycle_operations_in_a_protocol_effect() {
+    let probe = World::new();
+    let probe_app = probe.join("wallet").await;
+    let kinds = lifecycle_ops(&probe, &probe_app);
+    for (index, _) in kinds.iter().enumerate() {
+        for in_context in [true, false] {
+            let w = World::new();
+            let base = w.join("phone").await;
+            let extra = lifecycle_ops(&w, &base)[index].clone();
+            let protocol = Arc::new(LifecycleProtocol {
+                sample: SampleProtocol::default(),
+                extra,
+                in_context,
+                answers: std::sync::Mutex::new(Vec::new()),
+            });
+            let request = w.approve(&app_keys("wallet"), &["scope-a"]);
+            let mut app = App::join(w.env(), protocol.clone(), World::config(), request)
+                .await
+                .unwrap();
+            let (seq, _) = w.note(app.app_id(), "note");
+            let applied = w.switch.applied().len();
+            let result = app.receive(None).await;
+            if in_context {
+                // The context refuses it; the effect goes without it.
+                assert_eq!(*protocol.answers.lock().unwrap(), vec![false]);
+                let report = result.unwrap();
+                assert!(received(&report.events, seq), "{:?}", report.events);
+            } else {
+                // In the effect itself: refused before anything is kept or sent.
+                assert!(
+                    matches!(result, Err(AppError::Refused(Refusal::Usage(_)))),
+                    "{index}: {result:?}"
+                );
+                assert!(app.state.pending_effect.is_none());
+                assert_eq!(w.switch.applied().len(), applied);
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn test_app_ignores_a_cert_put_of_other_keys() {
     let w = World::new();

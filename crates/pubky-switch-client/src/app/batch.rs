@@ -44,6 +44,36 @@ use crate::error::ClientError;
 /// The prefix of the kept batches.
 const PENDING_PREFIX: &str = "opq/";
 
+/// Refuse the app's own lifecycle operations, and the signer's, in a batch a host or a
+/// protocol builds: `app.put`, `receive_key.put`, `key_bundle.put` and `cert.put`. The app
+/// layer builds and sends these itself, in batches of their own (joining, the record's
+/// delivery, a registration, a move's or a loss's re-registration), and a kept effect or
+/// batch carrying one could be refused at step 9 in a way that reads as about the caller
+/// ([`RefusalPlace::Caller`]).
+///
+/// # Errors
+///
+/// [`Refusal::Usage`] for such an operation.
+pub(crate) fn refuse_lifecycle_ops<'a>(
+    mut kinds: impl Iterator<Item = &'a OpKind>,
+) -> Result<(), AppError> {
+    if kinds.any(|kind| {
+        matches!(
+            kind,
+            OpKind::AppPut { .. }
+                | OpKind::ReceiveKeyPut { .. }
+                | OpKind::KeyBundlePut(_)
+                | OpKind::CertPut { .. }
+        )
+    }) {
+        return Err(Refusal::Usage(
+            "app.put, receive_key.put, key_bundle.put and cert.put are the app layer's own".into(),
+        )
+        .into());
+    }
+    Ok(())
+}
+
 /// Whether `error` refuses a batch for good before the service's batch ID lookup, about the
 /// caller or about these bytes ([`RefusalPlace`]).
 fn refused_before_lookup(error: &AppError) -> bool {
@@ -247,6 +277,7 @@ impl App {
     ) -> Result<(Submitted, Vec<ClaimView>), AppError> {
         self.ready_local().await?;
         self.refuse_when_stopped()?;
+        refuse_lifecycle_ops(batch.ops.iter().map(|(_, kind)| kind))?;
         self.refuse_before_upload().await?;
         match self.resume_batches().await {
             Ok(()) => {}
