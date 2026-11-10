@@ -149,17 +149,12 @@ pub fn staged_gate(call: &Call, staged: bool) -> Result<(), ApiError> {
     Ok(())
 }
 
-/// The caller a signer-only call takes (Switch wire 7.2, 7.4.2): the signer, or the refusal
-/// for anyone else.
+/// The caller a signer-only call takes (Switch wire 7.2, 7.4.2): the signer, or `403
+/// permission_missing` for any other, once its request has verified (7.6).
 pub fn require_signer(caller: &Caller) -> Result<(), ApiError> {
     match caller {
         Caller::Signer => Ok(()),
-        // No app is current until it has delivered its record (Switch wire 7.2).
-        Caller::OwnApp(_) => Err(ApiError::new(
-            ErrorCode::NotCurrent,
-            "7.2: the app isn't current",
-        )),
-        Caller::OtherApp { .. } => Err(ApiError::new(
+        Caller::OwnApp(_) | Caller::OtherApp { .. } => Err(ApiError::new(
             ErrorCode::PermissionMissing,
             "7.4: a call only the signer may make",
         )),
@@ -318,7 +313,7 @@ mod tests {
             require_signer(&Caller::OwnApp("a".into()))
                 .expect_err("app")
                 .code,
-            ErrorCode::NotCurrent
+            ErrorCode::PermissionMissing
         );
         let other = Caller::OtherApp {
             identity: [1; 32],

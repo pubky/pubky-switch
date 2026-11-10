@@ -9,57 +9,9 @@ mod common;
 
 use common::*;
 use pubky_switch_core::keys::AppKeys;
-use pubky_switch_core::records::{
-    AppRequest, AppRequestBody, Approval, ApprovalClaim, AuthRequest, app_record_path,
-};
+use pubky_switch_core::records::{AppRequest, Approval, ApprovalClaim, app_record_path};
 use pubky_switch_core::scopes::Permission;
-use pubky_switch_core::sig::SignedDoc;
 use pubky_switch_signer::{Refusal, SignerError};
-
-/// An app asking for `scopes`, with the auth request its request binds.
-struct App {
-    keys: AppKeys,
-    auth: AuthRequest,
-    request: SignedDoc,
-}
-
-impl App {
-    fn new(scopes: &[&str], caps: Option<String>, secret: [u8; 32]) -> Self {
-        Self::with_keys(
-            AppKeys::from_secrets([3; 32], [4; 32]),
-            scopes,
-            caps,
-            secret,
-        )
-    }
-
-    fn with_keys(keys: AppKeys, scopes: &[&str], caps: Option<String>, secret: [u8; 32]) -> Self {
-        let record = format!("{}:rw", app_record_path(&keys.app_id_bytes()));
-        let caps = caps.unwrap_or_else(|| {
-            if scopes.contains(&"notes_tags") {
-                format!("{record},{TAGS_PATH}:rw")
-            } else {
-                record
-            }
-        });
-        let auth = AuthRequest {
-            client_id: "app.example".into(),
-            client_key: [8; 32],
-            caps,
-            secret,
-        };
-        let scopes = scopes.iter().map(|s| (*s).to_owned()).collect();
-        let request = AppRequest::sign(&keys, AppRequestBody::new(&keys, scopes, &auth))
-            .unwrap()
-            .signed()
-            .clone();
-        Self {
-            keys,
-            auth,
-            request,
-        }
-    }
-}
 
 fn refusal(error: SignerError) -> Refusal {
     match error {
@@ -270,13 +222,14 @@ async fn test_review_refuses_a_grant_that_covers_identity_json() {
 #[tokio::test]
 async fn test_review_refuses_an_app_id_the_newest_version_lists_as_removed() {
     // Wire 3.9 step 4. The revocations PR writes the signer's own tombstones; here the
-    // newest version, adopted from the switch, lists the app in `removed`.
+    // newest version, adopted from the switch, another install's, lists the app in `removed`.
     let world = World::new();
     let (mut signer, _) = world.enrolled().await;
     let app = App::new(&["notes"], None, [9; 32]);
     let newest = signer.identity_doc().unwrap().unwrap();
     let mut body = newest.body().clone();
     body.version += 1;
+    body.signer = [7; 16];
     body.removed.push(pubky_switch_core::records::RemovedApp {
         app_id: app.keys.app_id_bytes(),
         distrust_from: START_MS,
@@ -284,10 +237,7 @@ async fn test_review_refuses_an_app_id_the_newest_version_lists_as_removed() {
     let removing = pubky_switch_core::records::IdentityDoc::sign(&world.key, body).unwrap();
     world.switch.deliver_identity(&removing).unwrap();
     let error = signer.set_record_max_age(Some(86_400)).await.unwrap_err();
-    assert!(
-        matches!(error, SignerError::Refused(Refusal::Superseded { .. })),
-        "{error:?}"
-    );
+    assert_eq!(error, SignerError::NotNamed { install: [7; 16] });
     let error = signer.review(&app.request, &app.auth).unwrap_err();
     assert!(matches!(refusal(error), Refusal::AppRequest(ref why) if why.contains("step 4")),);
 }
@@ -408,6 +358,28 @@ async fn test_approval_claim_is_held_while_another_install_signs() {
         .deliver_identity(&world.other_install_version(&newest, [7; 16]))
         .unwrap();
     signer.set_record_max_age(Some(86_400)).await.unwrap_err();
+    assert!(signer.approved(&approved.request).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn test_approval_claim_is_held_while_the_records_are_behind() {
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let app = App::new(&["notes"], None, [9; 32]);
+    let review = signer.review(&app.request, &app.auth).unwrap();
+    let approved = signer.approve(review).await.unwrap();
+    assert!(signer.approved(&approved.request).unwrap().is_some());
+    // The switch then shows a newer version of this install's own.
+    let newest = signer.identity_doc().unwrap().unwrap();
+    world
+        .switch
+        .deliver_identity(&world.other_install_version(&newest, signer.install_id()))
+        .unwrap();
+    let error = signer.set_record_max_age(Some(86_400)).await.unwrap_err();
+    assert!(
+        matches!(error, SignerError::Refused(Refusal::RecordsBehind { .. })),
+        "{error:?}"
+    );
     assert!(signer.approved(&approved.request).unwrap().is_none());
 }
 

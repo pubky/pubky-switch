@@ -90,6 +90,9 @@ pub enum Refusal {
     /// here.
     #[error("refused: the app is listed already")]
     AlreadyListed,
+    /// The app isn't listed in the newest `identity.json`, so it has no certificate to renew.
+    #[error("refused: the app isn't listed")]
+    NotListed,
     /// The approval's version is delivered, but its claim is held: the switch isn't confirmed
     /// to hold the signer's newest version since a rollback or an equivocation, named here
     /// when its alert is still held ([`crate::Signer::clear_alert`]).
@@ -98,9 +101,20 @@ pub enum Refusal {
         /// The rollback or equivocation alert behind it, if still held.
         alert: Option<crate::alert::Alert>,
     },
+    /// The app hasn't joined: the switch holds no record of it, so it takes no certificate or
+    /// bundle for it yet (Switch wire 6.2, spec 12.1 step 2).
+    #[error("refused: the app hasn't joined the switch")]
+    NotJoined,
     /// The store already holds this identity's signer records, so it isn't set up again.
     #[error("refused: the signer is already set up for this identity")]
     AlreadySetUp,
+    /// This install's records are behind a newer `identity.json` it signed itself, so it
+    /// signs nothing until they are restored from the signer backup (Switch wire 3.13).
+    #[error("refused: this install's records are behind its own version {version}")]
+    RecordsBehind {
+        /// The newer version.
+        version: u64,
+    },
     /// The store holds no signer records for this identity.
     #[error("refused: the signer isn't set up for this identity")]
     NotSetUp,

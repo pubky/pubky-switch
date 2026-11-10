@@ -55,6 +55,11 @@ pub(crate) struct Newest {
     pub(crate) prev: Option<[u8; 32]>,
     /// Whether it is published on the Homeserver.
     pub(crate) published: bool,
+    /// The service time at which the switch took it, from its delivery's transition proof;
+    /// `None` for an adopted copy. A reduction's cutoff is this time plus the clock tolerance
+    /// (Switch wire 3.8).
+    #[serde(default)]
+    pub(crate) delivered_at: Option<u64>,
 }
 
 /// The signer's records.
@@ -82,6 +87,19 @@ pub(crate) struct SignerState {
     pub(crate) bundle_parts: Vec<StoredPart>,
     /// Another install that the newest document or the backup names as the signer.
     pub(crate) managed_by: Option<[u8; 16]>,
+    /// The version of a newer `identity.json` this install signed itself that the switch or
+    /// the Homeserver holds: the records are behind, and nothing is signed until a restore
+    /// from the signer backup replaces them (a later flow).
+    #[serde(default)]
+    pub(crate) records_behind: Option<u64>,
+    /// The document hash of another body at the mark's version that the Homeserver
+    /// published, which raised [`Alert::Equivocation`].
+    #[serde(default)]
+    pub(crate) homeserver_other: Option<[u8; 32]>,
+    /// That copy, once the user has seen its alert: publication writes the switch's copy over
+    /// it (Switch wire 3.3 "Deliver, then publish").
+    #[serde(default)]
+    pub(crate) republish_over: Option<[u8; 32]>,
     /// The alerts the user hasn't cleared.
     pub(crate) alerts: Vec<Alert>,
     /// The certificate lifetime new certificates get, in milliseconds (Switch spec 3.2).
@@ -96,6 +114,26 @@ pub(crate) struct SignerState {
     /// no claim.
     #[serde(default)]
     pub(crate) switch_unconfirmed: bool,
+    /// The highest data epoch whose keys this signer ever sent in a bundle, by a rotation it
+    /// gave up too. While it is above the newest version's `data_epoch`, some apps may hold
+    /// keys of an epoch no version raised: before its next rotation the signer completes that
+    /// epoch, giving every current app holding each keyed scope its keys through it and
+    /// delivering a version that raises `data_epoch` to it, then rotates by one (Switch spec
+    /// 3.2, 3.5). A restore or a hand-over takes it as the highest `last_epoch` of the parts
+    /// it receives and of `keys_through` and `bundle_ranges` in `GET /apps` (Switch wire 3.5,
+    /// 3.12, 7.4.12), never below the newest `data_epoch`.
+    #[serde(default)]
+    pub(crate) epoch_through: u64,
+    /// The version that was delivered again for its service time, because a closing delivery
+    /// is owed and the delivery's answer was lost: its retry's answer must carry that time
+    /// (Switch wire 7.4.2). It concerns only that version.
+    #[serde(default)]
+    pub(crate) time_asked: Option<u64>,
+    /// The version whose retry gave no service time either: the closing stays owed, with
+    /// [`Alert::ReductionNotClosed`] shown, until a later version's delivery carries a service
+    /// time to close at.
+    #[serde(default)]
+    pub(crate) closing_unavailable: Option<u64>,
 }
 
 /// An approval's companion claim, signed with the version that lists its certificate and
@@ -153,10 +191,16 @@ impl SignerState {
             certs: Vec::new(),
             bundle_parts: Vec::new(),
             managed_by: None,
+            records_behind: None,
+            homeserver_other: None,
+            republish_over: None,
             alerts: Vec::new(),
             cert_lifetime_ms: DEFAULT_CERT_LIFETIME_MS,
             claims: Vec::new(),
             switch_unconfirmed: false,
+            epoch_through: 0,
+            time_asked: None,
+            closing_unavailable: None,
         }
     }
 
@@ -198,6 +242,19 @@ pub(crate) enum Flow {
         /// The policy the first `identity.json` carries.
         policy: IdentityPolicy,
     },
+    /// Renewing an app's certificate (Switch spec 3.2, Switch wire 3.8), or completing a data
+    /// epoch before a rotation: storing the new certificate and the key bundles at the switch,
+    /// batch by batch, then delivering the version.
+    Renew {
+        /// The signed batches, each sent again with the same bytes until it is answered.
+        batches: Vec<RenewBatch>,
+        /// How many batches the switch took.
+        sent: usize,
+        /// The renewing version, as signed.
+        doc: SignedDoc,
+        /// The document hash of the version it builds on.
+        prev: Option<[u8; 32]>,
+    },
     /// Delivering a new `identity.json` version, then publishing it.
     Deliver {
         /// The new version, as signed.
@@ -210,6 +267,22 @@ pub(crate) enum Flow {
         step: DeliverStep,
     },
 }
+
+/// One signed batch of a renewal or an epoch's completion, and the key bundle parts it stores.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RenewBatch {
+    /// The batch, as signed.
+    pub(crate) bytes: Bytes,
+    /// The key bundle parts it stores (Switch wire 3.5).
+    pub(crate) parts: Vec<StoredPart>,
+}
+
+/// Bytes kept as they were signed, stored in base64url.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub(crate) struct Bytes(
+    #[serde(with = "pubky_switch_core::enc::serde_b64_vec")] pub(crate) Vec<u8>,
+);
 
 /// Read the records and the flow of `identity`; `None` when the store holds none.
 pub(crate) async fn load(

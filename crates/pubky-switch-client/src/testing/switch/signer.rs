@@ -51,6 +51,35 @@ impl ScriptedSwitch {
         switch
     }
 
+    /// The epoch ranges of the key bundle parts the switch holds for `app`, in order.
+    pub fn bundles_of(&self, app: &[u8; 16]) -> Vec<(u64, u64)> {
+        self.lock()
+            .bundles
+            .get(app)
+            .map(|parts| {
+                parts
+                    .iter()
+                    .map(|(part, _)| (part.first_epoch, part.last_epoch))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Forget the transition proof of the newest delivery, so a retry of it answers with no
+    /// proof, as for a version the service took by enrollment or import (Switch wire 7.4.2).
+    pub fn forget_delivery_proof(&self) {
+        self.lock().delivery_proof = None;
+    }
+
+    /// The key bundle parts the switch holds for `app`, in order.
+    pub fn bundle_parts_of(&self, app: &[u8; 16]) -> Vec<pubky_switch_core::ops::KeyBundlePut> {
+        self.lock()
+            .bundles
+            .get(app)
+            .map(|parts| parts.iter().map(|(part, _)| part.clone()).collect())
+            .unwrap_or_default()
+    }
+
     /// Announce `limits` at the enrollment that makes the account, in place of the defaults.
     pub fn set_enroll_limits(&self, limits: Limits) {
         self.lock().enroll_limits = limits;
@@ -140,6 +169,11 @@ impl Inner {
             &state,
             None,
         )?;
+        for app in &doc.body().apps {
+            self.listed_at_epoch
+                .entry(app.app_id)
+                .or_insert(doc.data_epoch());
+        }
         self.doc = Some(doc.clone());
         self.delivery_proof = Some(proof.clone());
         self.directory_version += 1;
@@ -211,6 +245,30 @@ impl Inner {
         }
     }
 
+    /// The newest data epoch through which `app` holds every key (Switch wire 7.4.12): the
+    /// epoch of the first version that listed it, raised by each stored part that continues
+    /// it, as if the app had fetched every part; `None` for an app never listed.
+    fn keys_through(&self, app: &[u8; 16]) -> Option<u64> {
+        let mut held = *self.listed_at_epoch.get(app)?;
+        let mut ranges: Vec<(u64, u64)> = self
+            .bundles
+            .get(app)
+            .map(|parts| {
+                parts
+                    .iter()
+                    .map(|(p, _)| (p.first_epoch, p.last_epoch))
+                    .collect()
+            })
+            .unwrap_or_default();
+        ranges.sort_unstable();
+        for (first, last) in ranges {
+            if first <= held.saturating_add(1) {
+                held = held.max(last);
+            }
+        }
+        Some(held)
+    }
+
     /// The kept proofs' generations, each with the key that verifies its proofs: an earlier
     /// generation's an import carried, else this switch's own (Switch wire 3.3 "Service
     /// keys"); held records' first, then live claims' entries'.
@@ -265,9 +323,9 @@ impl Inner {
                     "unread_entries": 0,
                     "sole_target_unread": 0,
                     "record_cert": held.and_then(|a| a.cert.as_ref()).map(|c| b64(&c.hash())),
-                    "record_at": null,
+                    "record_at": held.and_then(|a| a.record_at).map(pubky_switch_core::time::rfc3339),
                     "lagging": false,
-                    "keys_through": null,
+                    "keys_through": self.keys_through(id),
                     "full_bundle_requested": null,
                     "bundle_ranges": ranges,
                     "cert_expires_at": self

@@ -29,6 +29,9 @@ service.
 - **`invite_code.delete`** of a code the switch doesn't hold is `404`; the core has no rule
   for it.
 - **Key bundle parts** the target's cursor passed are never dropped (Switch wire 6.2).
+- **`keys_through`** (Switch wire 7.4.12) counts every stored part as fetched, whatever the
+  app's cursor: the epoch of the first version listing the app, raised by each part that
+  continues it.
 
 ## State and retention
 
@@ -89,12 +92,14 @@ service.
   `import_into` carried). Unlike the service: there is no pending key, so no
   generation change at a serving account; and a first document carrying `recovery_from`, or
   at another generation than the switch's, is chained where the service answers `503`. The test call `deliver_identity` takes any document, without those
-  checks, for scripting what another signer or a faulty service did.
+  checks, for scripting what another signer or a faulty service did. `forget_delivery_proof`
+  makes a retry answer with no proof.
 - **`GET /apps`** (Switch wire 7.4.12): the apps the switch holds or the newest document
-  lists, with `current`, `record_cert`, `bundle_ranges` and `cert_expires_at`, and the
+  lists, with `current`, `record_cert`, `record_at`, `bundle_ranges`, `keys_through` and
+  `cert_expires_at`, and the
   account's `identity`, `recovery` (`declared_at` its recovery record's time) and
   `proof_generations`, from the same kept proofs as the delivery; no last-seen times,
-  attempts, unread counts, `keys_through` or departures.
+  attempts, unread counts or departures.
 - **Moves and recovery** (Switch spec 12.5, 12.6, Switch wire 10): `import_into` copies the
   account in memory, with no manifest, chunks or export transfer; a recovery upload is kept
   and answered with fixed changes, merging nothing.

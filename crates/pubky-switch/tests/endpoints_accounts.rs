@@ -1096,9 +1096,10 @@ async fn test_enroll_answers_keep_the_creating_one_and_drop_the_oldest() {
     .await
     .expect("answers");
     conn.close().await.expect("close");
-    assert_eq!(kept.len(), 2);
+    // The creating answer stays for good; of the pending key's, the newest two.
+    assert_eq!(kept.len(), 3);
     assert!(kept[0].1, "the creating enrollment's answer stays");
-    assert_eq!(kept[1].0, newest.to_vec(), "the newest of the others stays");
+    assert_eq!(kept[2].0, newest.to_vec(), "the newest of the others stays");
     // The creating enrollment again: its own answer, not the pending key.
     let http = vectors("http.json");
     let vector = named(&http["requests"], "signer: enrollment");
@@ -1116,5 +1117,83 @@ async fn test_enroll_answers_keep_the_creating_one_and_drop_the_oldest() {
         String::from_utf8_lossy(&again.body),
         first["body"].as_str().expect("body")
     );
+    replay.db.drop_database().await.expect("drop");
+}
+
+/// An enrollment at alice's account, by its nonce.
+async fn enroll(replay: &Replay, nonce: u8) -> pubky_switch::http::SwitchResponse {
+    replay
+        .service
+        .handle(signer_request(
+            "POST",
+            "/v1/enroll",
+            enrollment_body(nonce, ORIGIN),
+            ms(T),
+        ))
+        .await
+}
+
+#[tokio::test]
+async fn test_enroll_answers_given_while_staged_are_kept() {
+    let Some(replay) = replay().await else { return };
+    set_time(&replay.clock, T);
+    // The creating enrollment, then a second while the account is staged: the account's key.
+    let first = enroll(&replay, 20).await;
+    let second = enroll(&replay, 21).await;
+    assert_eq!(second.status, 200);
+    assert_eq!(json(&second)["service_key"], json(&first)["service_key"]);
+    // The account serves, and 16 fresh enrollments get the pending key.
+    let alice = alice_keys();
+    let delivered = replay
+        .service
+        .handle(signer_request(
+            "PUT",
+            &format!("/v1/{}/identity", alice.id),
+            delivery(
+                version("alice identity.json, first delivery (version 1)"),
+                None,
+            ),
+            ms(T),
+        ))
+        .await;
+    assert_eq!(
+        delivered.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&delivered.body)
+    );
+    for nonce in 30..46 {
+        let answer = enroll(&replay, nonce).await;
+        assert_ne!(json(&answer)["service_key"], json(&first)["service_key"]);
+    }
+    // The second enrollment again: its own answer, byte for byte.
+    let again = enroll(&replay, 21).await;
+    assert_eq!(
+        again.body, second.body,
+        "the same enrollment, the same answer"
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_enroll_staged_account_takes_at_most_max_enrollments() {
+    let limits = Limits {
+        max_enrollments: 2,
+        ..Limits::default()
+    };
+    let Some(replay) = replay_with(limits).await else {
+        return;
+    };
+    set_time(&replay.clock, T);
+    assert_eq!(enroll(&replay, 50).await.status, 200);
+    assert_eq!(enroll(&replay, 51).await.status, 200);
+    let third = enroll(&replay, 52).await;
+    assert_eq!(
+        (third.status, code(&third).as_str()),
+        (429, "quota_exceeded")
+    );
+    assert_eq!(json(&third)["current"]["limit"], "enrollments");
+    // Those it took still get their answers.
+    assert_eq!(enroll(&replay, 51).await.status, 200);
     replay.db.drop_database().await.expect("drop");
 }

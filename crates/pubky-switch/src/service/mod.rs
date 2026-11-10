@@ -9,10 +9,11 @@
 //! (Switch wire 7.3 step 10).
 //!
 //! Served so far: `POST /v1/enroll`, `PUT /v1/{id}/identity`, the public
-//! `GET /v1/{id}/identity` and `POST /v1/{id}/ops`. Every other call is answered
-//! `503 unavailable`.
+//! `GET /v1/{id}/identity`, `POST /v1/{id}/ops`, `GET /v1/{id}/claims/{claim_key}` and
+//! `POST /v1/{id}/apps/{app_id}/revoke`. Every other call is answered `503 unavailable`.
 
 pub mod batch;
+mod claims;
 mod enroll;
 mod identity;
 pub mod rules;
@@ -46,6 +47,10 @@ use crate::{
 
 use self::rules::{Caller, Claimed, decode_claim, names_this_service, staged_gate};
 
+/// How many claims whose time has passed one request deletes at most (Switch wire 7.3
+/// step 4); the rest go with the next requests.
+const DUE_CLAIMS_PER_REQUEST: u64 = 64;
+
 /// The service.
 pub struct Service {
     origin: String,
@@ -76,6 +81,8 @@ struct Answer {
     head: Option<SignedHead>,
     retry_after: Option<u64>,
     cacheable: bool,
+    /// A `GET /claims` answer, whose body is built once the lock is gone.
+    claim_read: Option<claims::ClaimRead>,
 }
 
 impl Answer {
@@ -86,6 +93,7 @@ impl Answer {
             head: None,
             retry_after: None,
             cacheable: false,
+            claim_read: None,
         }
     }
 
@@ -96,6 +104,7 @@ impl Answer {
             head: None,
             retry_after: error.retry_after,
             cacheable: false,
+            claim_read: None,
         }
     }
 
@@ -225,7 +234,11 @@ impl Service {
     }
 
     async fn serve(&self, request: SwitchRequest) -> SwitchResponse {
-        let base_ms = self.time.read().base_ms;
+        // One reading gives both the time base and whether it is trusted, so nothing that
+        // waits for trusted time runs on a base read without it.
+        let reading = self.time.read();
+        let base_ms = reading.base_ms;
+        let due = reading.trusted.then_some(base_ms);
         let request_signature = wire_http::request_signature_of(
             request
                 .headers
@@ -278,31 +291,43 @@ impl Service {
                 }
                 None
             }
-            Call::PutIdentity => match self.authenticate_signer(&account, &request, base_ms) {
+            Call::PutIdentity => {
+                match self.authenticate_signer(&account, &request, base_ms).await {
+                    Ok(claimed) => Some(claimed),
+                    Err(error) => return refused_early(error).await,
+                }
+            }
+            // The signer is verified here; an own app under the lock, with the key the
+            // account holds for it (Switch wire 7.2).
+            Call::Revoke(_) => match self.authenticate_signer(&account, &request, base_ms).await {
                 Ok(claimed) => Some(claimed),
                 Err(error) => return refused_early(error).await,
             },
-            // The signer is verified here; an own app under the lock, with the key the
-            // account holds for it (Switch wire 7.2).
-            Call::Ops => match self.authenticate_caller(&account, &request, base_ms) {
-                Ok(claimed) => {
-                    // An own app's request is verified here too, so nothing unverified
-                    // takes the lock (Switch wire 7.2 Order).
-                    if let Caller::OwnApp(app) = &claimed.caller {
-                        match self.verify_own_app(&account, &request, &claimed, app).await {
-                            Ok(app) => verified = Some(app),
-                            Err(error) => {
-                                if is_failed_authentication(error.code) {
-                                    self.record_failure(&request, account.clone());
+            Call::Ops | Call::GetClaim(_) => {
+                match self.authenticate_caller(&account, &request, base_ms) {
+                    Ok(claimed) => {
+                        // An own app's request is verified here too, so nothing unverified
+                        // takes the lock (Switch wire 7.2 Order).
+                        if let Caller::OwnApp(app) = &claimed.caller {
+                            let batch = *call == Call::Ops;
+                            match self
+                                .verify_own_app(&account, &request, &claimed, app, batch, base_ms)
+                                .await
+                            {
+                                Ok(app) => verified = Some(app),
+                                Err(error) => {
+                                    if is_failed_authentication(error.code) {
+                                        self.record_failure(&request, account.clone());
+                                    }
+                                    return refused_early(error).await;
                                 }
-                                return refused_early(error).await;
                             }
                         }
+                        Some(claimed)
                     }
-                    Some(claimed)
+                    Err(error) => return refused_early(error).await,
                 }
-                Err(error) => return refused_early(error).await,
-            },
+            }
             _ => {
                 return refused_early(ApiError::unavailable("7.4: this call isn't served yet"))
                     .await;
@@ -330,6 +355,7 @@ impl Service {
             txn,
             &request,
             base_ms,
+            due,
             signature,
             caller.as_ref(),
             verified.as_ref(),
@@ -361,10 +387,12 @@ impl Service {
         }
     }
 
-    /// The signer's authentication, before any account state (Switch wire 7.2 Order): the
+    /// The signer's authentication, before the account's lock (Switch wire 7.2 Order): the
     /// network source's failed-authentication limit, then the headers, the timestamp and
-    /// the request signature, verified with the identity key `{id}` names.
-    fn authenticate_signer(
+    /// the request signature, verified with the identity key `{id}` names. An own app's
+    /// request is verified as at its own calls, then refused: `403 permission_missing`
+    /// for a call only the signer makes (7.6).
+    async fn authenticate_signer(
         &self,
         account: &str,
         request: &SwitchRequest,
@@ -385,6 +413,15 @@ impl Service {
                     self.record_failure(request, account.to_string());
                 }
             })?;
+        if let Caller::OwnApp(app) = &claimed.caller {
+            let error = self
+                .refuse_app_at_signer_call(account, request, &claimed, app, base_ms)
+                .await;
+            if is_failed_authentication(error.code) {
+                self.record_failure(request, account.to_string());
+            }
+            return Err(error);
+        }
         rules::require_signer(&claimed.caller)?;
         Ok(claimed)
     }
@@ -425,11 +462,13 @@ impl Service {
 
     /// The processing order under the account's lock (Switch wire 7.3 steps 3 to 10), for a
     /// request already authenticated as the signer, or the public read.
+    #[allow(clippy::too_many_arguments)]
     async fn at_account(
         &self,
         mut txn: AccountTxn,
         request: &SwitchRequest,
         base_ms: u64,
+        due: Option<u64>,
         request_signature: Option<[u8; 64]>,
         caller: Option<&Claimed>,
         verified: Option<&batch::VerifiedApp>,
@@ -447,6 +486,20 @@ impl Service {
                 return self.operator_answer(signature, base_ms, &error).await;
             }
         };
+        // Step 4, with trusted time only, for a caller that has verified: a bounded batch of
+        // the claims whose time has passed goes, by the time base (Switch wire 7.3). It comes
+        // before the endpoint, so a refusal doesn't undo it; an unauthenticated request, or
+        // the public read, pays for none of it. A claim a request reads or writes goes when
+        // it is due, whatever the batch reached.
+        if let (Some(base), Some(_)) = (due, caller)
+            && let Err(error) = txn
+                .delete_due_claims(base, self.limits.max_claim_age_ms, DUE_CLAIMS_PER_REQUEST)
+                .await
+        {
+            let _ = store_error(&error);
+            let error = ApiError::unavailable("7.6: a temporary failure");
+            return sign_answer(&signer, signature, committed_ms, Answer::error(&error));
+        }
         // What the endpoint writes is undone if it is refused, whatever step refuses it: a
         // refusal commits the stamped time and nothing else, so no later request can build
         // on a write it was never answered for (step 10).
@@ -459,7 +512,7 @@ impl Service {
             }
         };
         let (answer, marked) = match self
-            .run_at_account(&mut txn, &signer, request, verified, time_ms)
+            .run_at_account(&mut txn, &signer, request, verified, due, time_ms)
             .await
         {
             Ok(done) => done,
@@ -505,7 +558,16 @@ impl Service {
             })
         };
         match committed {
-            Ok(()) => sign_answer(&signer, signature, time_ms, answer),
+            Ok(()) => {
+                let mut answer = answer;
+                if let Some(read) = answer.claim_read.take() {
+                    match self.claim_body(&read).await {
+                        Ok(body) => answer.body = body,
+                        Err(error) => answer = Answer::error(&error),
+                    }
+                }
+                sign_answer(&signer, signature, time_ms, answer)
+            }
             // Nothing committed, the stamp included: answer at the time last committed.
             Err(()) => sign_answer(
                 &signer,
@@ -524,6 +586,7 @@ impl Service {
         signer: &ServiceSigner,
         request: &SwitchRequest,
         verified: Option<&batch::VerifiedApp>,
+        due: Option<u64>,
         time_ms: u64,
     ) -> Result<(Answer, bool), Refused> {
         let call = &request.route.call;
@@ -586,13 +649,12 @@ impl Service {
                 head: false,
             },
         };
-        let writer = if *call == Call::Ops {
-            match self.ops_writer(txn, held.as_ref(), verified, time_ms).await {
-                Ok(writer) => writer,
-                Err(error) => return Err(stop(error)),
-            }
-        } else {
-            None
+        let writer = match self
+            .own_app_writer(txn, held.as_ref(), verified, time_ms)
+            .await
+        {
+            Ok(writer) => writer,
+            Err(error) => return Err(stop(error)),
         };
         // Step 7: the staged gate. Step 9: the endpoint.
         staged_gate(call, !serving).map_err(|error| Refused::with_head(error, serving))?;
@@ -605,6 +667,7 @@ impl Service {
                     held.as_ref(),
                     verified,
                     writer.as_ref(),
+                    due,
                     time_ms,
                 )
                 .await
@@ -612,6 +675,31 @@ impl Service {
                 Ok(answer) => Ok((answer, serving)),
                 Err(error) => Err(stop(error)),
             };
+        }
+        match call {
+            Call::GetClaim(claim_key) => {
+                return self
+                    .get_claim(
+                        txn,
+                        signer,
+                        held.as_ref(),
+                        writer.as_ref(),
+                        claim_key,
+                        due,
+                        time_ms,
+                    )
+                    .await
+                    .map(|answer| (answer, serving))
+                    .map_err(|error| Refused::with_head(error, serving));
+            }
+            Call::Revoke(app_id) => {
+                return self
+                    .revoke(txn, signer, held.as_ref(), app_id, &request.body, time_ms)
+                    .await
+                    .map(|answer| (answer, serving))
+                    .map_err(|error| Refused::with_head(error, serving));
+            }
+            _ => {}
         }
         let (answer, serves_after) = self
             .put_identity(txn, signer, request, held.as_ref(), time_ms)
