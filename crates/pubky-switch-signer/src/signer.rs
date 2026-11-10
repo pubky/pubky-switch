@@ -310,12 +310,21 @@ impl Signer {
         &self.state.alerts
     }
 
-    /// Clear `alert`, once the user has seen it and dealt with it. A rollback or equivocation
-    /// alert holds back every approval's claim until it is cleared.
+    /// Clear `alert`, once the user has seen it.
+    ///
+    /// A rollback or an equivocation leaves the switch unconfirmed: the signer doesn't know that
+    /// it holds the high-water version, so it releases no claim (Switch spec 4.3). Clearing such
+    /// an alert doesn't confirm it. The signer delivers the newest version it signed again, the
+    /// same bytes naming the version they build on (Switch wire 2.1, 7.4.2). A switch that went
+    /// back to that version takes it, and the signer is confirmed again; a switch that holds an
+    /// older version, none, or another body at the high-water version raises the alarm again,
+    /// and everything stays held. If it keeps coming back, the user moves to another provider,
+    /// or declares a provider loss.
     ///
     /// # Errors
     ///
-    /// The store's error.
+    /// The store's error, or the delivery's as [`Signer::resume`] gives it, the alarm again
+    /// among them.
     pub async fn clear_alert(&mut self, alert: &Alert) -> Result<()> {
         self.refresh().await?;
         if !self.state.alerts.contains(alert) {
@@ -323,7 +332,23 @@ impl Signer {
         }
         let mut state = self.state.clone();
         state.alerts.retain(|held| held != alert);
-        self.commit(state, self.flow.clone()).await
+        let alarm = matches!(alert, Alert::Rollback { .. } | Alert::Equivocation { .. });
+        let again = match (&self.state.newest, &self.flow) {
+            (Some(newest), None) if alarm && state.switch_unconfirmed => Some(Flow::Deliver {
+                doc: newest.doc.clone(),
+                prev: newest.prev,
+                backup: None,
+                step: DeliverStep::BackupWritten,
+            }),
+            _ => None,
+        };
+        let deliver_again = again.is_some();
+        let flow = again.or_else(|| self.flow.clone());
+        self.commit(state, flow).await?;
+        if deliver_again {
+            self.resume().await?;
+        }
+        Ok(())
     }
 
     /// Set the record age limit, in seconds, or clear it for the 90-day default (Switch spec
@@ -695,6 +720,8 @@ impl Signer {
                     published,
                     delivered_at,
                 });
+                // The switch took this version, built on the one before: it holds the mark.
+                state.switch_unconfirmed = false;
                 self.commit(state, None).await
             }
             Err(ClientError::Switch {
@@ -819,6 +846,7 @@ impl Signer {
     async fn alarm(&mut self, alert: Alert) -> Result<()> {
         let mut state = self.state.clone();
         state.alert(alert.clone());
+        state.switch_unconfirmed = true;
         self.commit(state, None).await?;
         Err(SignerError::Alarm(alert))
     }

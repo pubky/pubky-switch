@@ -96,6 +96,11 @@ pub(crate) struct SignerState {
     /// (Switch wire 3.10).
     #[serde(default)]
     pub(crate) claims: Vec<PendingClaim>,
+    /// The switch showed a rollback or an equivocation, and no delivery has succeeded since:
+    /// the signer doesn't know that the switch holds its high-water version, so it releases
+    /// no claim.
+    #[serde(default)]
+    pub(crate) switch_unconfirmed: bool,
 }
 
 /// An approval's companion claim, signed with the version that lists its certificate and
@@ -156,6 +161,7 @@ impl SignerState {
             alerts: Vec::new(),
             cert_lifetime_ms: DEFAULT_CERT_LIFETIME_MS,
             claims: Vec::new(),
+            switch_unconfirmed: false,
         }
     }
 
