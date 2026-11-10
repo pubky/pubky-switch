@@ -107,6 +107,17 @@ impl Homeserver for TestHomeserver {
             };
         Box::pin(async move { answer })
     }
+    fn delete(&self, path: &str) -> BoxFuture<'_, Result<(), TransportError>> {
+        let failing_path = self.failing_path.lock().unwrap().as_deref() == Some(path);
+        let answer =
+            if *self.down.lock().unwrap() || *self.failing_puts.lock().unwrap() || failing_path {
+                Err(TransportError::Connect("down".into()))
+            } else {
+                self.files.lock().unwrap().remove(path);
+                Ok(())
+            };
+        Box::pin(async move { answer })
+    }
 }
 
 /// A store whose commits fail with `Unavailable`, applying nothing, while `failing` is set.

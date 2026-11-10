@@ -100,6 +100,22 @@ pub(crate) struct SignerState {
     /// it (Switch wire 3.3 "Deliver, then publish").
     #[serde(default)]
     pub(crate) republish_over: Option<[u8; 32]>,
+    /// The revocations asked for whose removal isn't delivered yet, with the earlier
+    /// `distrust_from` the user picked, if any (Switch spec 12.2).
+    #[serde(default)]
+    pub(crate) revoking: Vec<Revoking>,
+    /// The removed apps whose Homeserver record is still to be deleted (Switch spec 12.2
+    /// step 4).
+    #[serde(default)]
+    pub(crate) cleanup: Vec<[u8; 16]>,
+    /// The full-bundle requests whose answer the switch refused, not tried again until the
+    /// app asks anew.
+    #[serde(default)]
+    pub(crate) refused_requests: Vec<RefusedRequest>,
+    /// The service time at which the switch took the first version this signer delivered
+    /// that lists each app: no app left or was revoked before it (Switch spec 12.3).
+    #[serde(default)]
+    pub(crate) listed_at: Vec<([u8; 16], u64)>,
     /// The alerts the user hasn't cleared.
     pub(crate) alerts: Vec<Alert>,
     /// The certificate lifetime new certificates get, in milliseconds (Switch spec 3.2).
@@ -134,6 +150,31 @@ pub(crate) struct SignerState {
     /// time to close at.
     #[serde(default)]
     pub(crate) closing_unavailable: Option<u64>,
+}
+
+/// A revocation asked for, until the version that removes the app is delivered.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Revoking {
+    /// The App ID.
+    pub(crate) app_id: [u8; 16],
+    /// An earlier `distrust_from` than the revocation time, which the user picked after a
+    /// compromise.
+    pub(crate) distrust_from: Option<u64>,
+    /// The revocation's time, from the proof of the switch's answer (Switch wire 7.4.12).
+    #[serde(default)]
+    pub(crate) revoked_at: Option<u64>,
+    /// Whether the switch answered the revocation, so it serves the app no more.
+    #[serde(default)]
+    pub(crate) taken: bool,
+}
+
+/// A full-bundle request the switch refused an answer to, by the time the app asked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RefusedRequest {
+    /// The app.
+    pub(crate) app_id: [u8; 16],
+    /// When it asked (`full_bundle_requested`, Switch wire 7.4.12).
+    pub(crate) requested: u64,
 }
 
 /// An approval's companion claim, signed with the version that lists its certificate and
@@ -194,6 +235,10 @@ impl SignerState {
             records_behind: None,
             homeserver_other: None,
             republish_over: None,
+            revoking: Vec::new(),
+            cleanup: Vec::new(),
+            refused_requests: Vec::new(),
+            listed_at: Vec::new(),
             alerts: Vec::new(),
             cert_lifetime_ms: DEFAULT_CERT_LIFETIME_MS,
             claims: Vec::new(),

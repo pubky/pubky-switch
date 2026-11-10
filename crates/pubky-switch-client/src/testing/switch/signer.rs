@@ -198,7 +198,13 @@ impl Inner {
             ));
         };
         let app_limit = self.enrolled.as_ref().map_or(0, |e| e.limits.app_limit);
-        let kept = self.kept_app_ids.clone();
+        // The App IDs enrollments named, and those revoked or seen departing (Switch wire 3.3).
+        let mut kept = self.kept_app_ids.clone();
+        for (id, app) in &self.apps {
+            if app.departed && !kept.contains(id) {
+                kept.push(*id);
+            }
+        }
         let (records, claim_entries) = self.kept_proof_keys();
         let view = AccountView {
             held: self.doc.as_ref(),
@@ -284,6 +290,31 @@ impl Inner {
         (keyed(records), keyed(entries))
     }
 
+    /// `POST /v1/{id}/apps/{app_id}/revoke` from the signer (Switch wire 7.4.12): the
+    /// `revoke` transition's proof, none for an app revoked or departed already, `404` for an
+    /// app neither the switch nor `identity.json` knows.
+    pub(super) fn revoke_answer(&mut self, route: &str) -> Result<Answer, ScriptError> {
+        let id = route
+            .strip_prefix("apps/")
+            .and_then(|r| r.strip_suffix("/revoke"))
+            .and_then(|id| pubky_switch_core::enc::app_id_decode(id).ok());
+        let known = id.is_some_and(|id| {
+            self.apps.contains_key(&id)
+                || self.doc.as_ref().is_some_and(|doc| {
+                    doc.listed_cert(&id).is_some()
+                        || doc.body().removed.iter().any(|r| r.app_id == id)
+                })
+        });
+        let Some(id) = id.filter(|_| known) else {
+            return Ok(bad(ErrorCode::NotFound, "no such app", json!(null)));
+        };
+        let proofs: Vec<SignedDoc> = self.revoke(id)?.into_iter().collect();
+        Ok((
+            200,
+            json!({ "proofs": proofs, "head": self.head().to_value() }),
+        ))
+    }
+
     /// `GET /v1/{id}/apps` (Switch wire 7.4.12): every app the switch holds or the newest
     /// `identity.json` lists, the recovery in progress, the newest document, and the
     /// generations the kept proofs name but those the newest document declares lost. The
@@ -316,9 +347,16 @@ impl Inner {
                     "app_id": zbase32_encode(id),
                     "current": listed && !departed,
                     "last_seen": null,
-                    "revoked_at": null,
-                    "departed_at": null,
-                    "awaiting_rotation": false,
+                    "revoked_at": held.and_then(|a| a.revoked_at).map(pubky_switch_core::time::rfc3339),
+                    "departed_at": held
+                        .and_then(|a| a.departed_at)
+                        .map(|(at, _)| pubky_switch_core::time::rfc3339(at)),
+                    "awaiting_rotation": held.and_then(|a| a.departed_at).is_some_and(|(_, epoch)| {
+                        !self.doc.as_ref().is_some_and(|doc| {
+                            doc.body().removed.iter().any(|r| &r.app_id == id)
+                                && doc.data_epoch() > epoch
+                        })
+                    }),
                     "open_attempts": [],
                     "unread_entries": 0,
                     "sole_target_unread": 0,
@@ -326,7 +364,9 @@ impl Inner {
                     "record_at": held.and_then(|a| a.record_at).map(pubky_switch_core::time::rfc3339),
                     "lagging": false,
                     "keys_through": self.keys_through(id),
-                    "full_bundle_requested": null,
+                    "full_bundle_requested": held
+                        .and_then(|a| a.full_requested)
+                        .map(pubky_switch_core::time::rfc3339),
                     "bundle_ranges": ranges,
                     "cert_expires_at": self
                         .checked_cert(id)
