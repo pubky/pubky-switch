@@ -340,7 +340,7 @@ pub(super) async fn load_apps(
     Ok(state)
 }
 
-fn held_app(app: &StoredApp, identity: &[u8; 32]) -> Result<HeldApp, StoreError> {
+pub(crate) fn held_app(app: &StoredApp, identity: &[u8; 32]) -> Result<HeldApp, StoreError> {
     let corrupt = |_| StoreError::Corrupt("a stored app document doesn't verify");
     let record = app
         .record

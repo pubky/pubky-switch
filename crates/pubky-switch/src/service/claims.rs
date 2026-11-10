@@ -165,7 +165,9 @@ impl Service {
         if stored_app.is_none() && !listed {
             return Err(unknown());
         }
-        txn.revoke_app(&app, time_ms)
+        // The data epoch its rotation goes above (Switch wire 7.4.12 awaiting_rotation).
+        let data_epoch = held.map_or(1, IdentityDoc::data_epoch);
+        txn.revoke_app(&app, time_ms, data_epoch)
             .await
             .map_err(|e| store_error(&e))?;
         // It leaves the directory: its record and receive key no longer show, and a

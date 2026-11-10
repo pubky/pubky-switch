@@ -10,8 +10,10 @@
 //!
 //! Served so far: `POST /v1/enroll`, `PUT /v1/{id}/identity`, the public
 //! `GET /v1/{id}/identity`, `POST /v1/{id}/ops`, `GET /v1/{id}/feed`,
-//! `GET /v1/{id}/claims/{claim_key}` and `POST /v1/{id}/apps/{app_id}/revoke`. Every other call is answered `503 unavailable`.
+//! `GET /v1/{id}/claims/{claim_key}`, `GET /v1/{id}/apps` and
+//! `POST /v1/{id}/apps/{app_id}/revoke`. Every other call is answered `503 unavailable`.
 
+mod apps;
 pub mod batch;
 mod claims;
 mod enroll;
@@ -318,10 +320,12 @@ impl Service {
             }
             // The signer is verified here; an own app under the lock, with the key the
             // account holds for it (Switch wire 7.2).
-            Call::Revoke(_) => match self.authenticate_signer(&account, &request, base_ms).await {
-                Ok(claimed) => Some(claimed),
-                Err(error) => return refused_early(error).await,
-            },
+            Call::Revoke(_) | Call::GetApps => {
+                match self.authenticate_signer(&account, &request, base_ms).await {
+                    Ok(claimed) => Some(claimed),
+                    Err(error) => return refused_early(error).await,
+                }
+            }
             Call::Ops | Call::GetClaim(_) | Call::Feed => {
                 match self.authenticate_caller(&account, &request, base_ms) {
                     Ok(claimed) => {
@@ -712,6 +716,13 @@ impl Service {
                         due,
                         time_ms,
                     )
+                    .await
+                    .map(|answer| (answer, serving))
+                    .map_err(|error| Refused::with_head(error, serving));
+            }
+            Call::GetApps => {
+                return self
+                    .get_apps(txn, signer, held.as_ref(), time_ms)
                     .await
                     .map(|answer| (answer, serving))
                     .map_err(|error| Refused::with_head(error, serving));
