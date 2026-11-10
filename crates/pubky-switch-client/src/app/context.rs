@@ -542,10 +542,13 @@ impl<'a> ReceiveContext<'a> {
     ///
     /// # Errors
     ///
-    /// [`Refusal::Usage`] when the batch is full, or for a `record.put` or a claim entry,
-    /// which go through [`ReceiveContext::put_record`] and [`ReceiveContext::claim`].
+    /// [`Refusal::Usage`] when the batch is full, for a `record.put` or a claim entry,
+    /// which go through [`ReceiveContext::put_record`] and [`ReceiveContext::claim`], or for
+    /// `app.put`, `receive_key.put`, `key_bundle.put` or `cert.put`, which the app layer
+    /// builds itself.
     pub fn op(&mut self, conditions: Vec<Condition>, kind: OpKind) -> Result<(), AppError> {
         self.room()?;
+        super::batch::refuse_lifecycle_ops(std::iter::once(&kind))?;
         if matches!(kind, OpKind::RecordPut(_) | OpKind::Claim(_)) {
             return Err(Refusal::Usage(
                 "a record write or claim entry goes through put_record or claim".into(),

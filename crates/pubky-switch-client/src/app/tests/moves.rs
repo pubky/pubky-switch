@@ -15,11 +15,11 @@ use pubky_switch_core::sig::SignedDoc;
 
 use super::*;
 use crate::app::{
-    AppError, AppEvent, ClaimOp, Evidence, LossActions, ObligationDeadline, ProviderLoss,
-    ProviderStatus, PushRelay, UserConfirmed,
+    AppError, AppEvent, ClaimOp, Evidence, LossActions, ObligationDeadline, ParkReason,
+    ProviderLoss, ProviderStatus, PushRelay, UserConfirmed,
 };
-use crate::error::ClientError;
 use crate::error::TransportError;
+use crate::error::{ClientError, StoreError};
 use crate::store::{Fault as StoreFault, FaultStore};
 use crate::testing::{self, Fault, Item, SWITCH_ORIGIN as ORIGIN};
 
@@ -78,6 +78,8 @@ pub(crate) struct LossProtocol {
     pub(crate) sample: SampleProtocol,
     pub(crate) losses: Mutex<Vec<ProviderLoss>>,
     pub(crate) counterparties: Vec<[u8; 32]>,
+    /// How many of the next loss calls fail, as when the protocol can't read its state.
+    pub(crate) failing: Mutex<u32>,
 }
 
 impl Protocol for LossProtocol {
@@ -110,23 +112,33 @@ impl Protocol for LossProtocol {
         self.sample.receive(message)
     }
 
-    fn resend_needed(&self, needed: &ResendNeeded) -> Vec<LocalWrite> {
+    fn resend_needed(
+        &self,
+        needed: &ResendNeeded,
+    ) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
         self.sample.resend_needed(needed)
     }
 
-    fn missed(&self, missed: &MissedEntries) -> Vec<LocalWrite> {
+    fn missed(&self, missed: &MissedEntries) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
         self.sample.missed(missed)
     }
 
-    fn provider_lost(&self, loss: &ProviderLoss) -> LossActions {
+    fn provider_lost(&self, loss: &ProviderLoss) -> Result<LossActions, crate::app::StoreFailure> {
+        {
+            let mut failing = self.failing.lock().unwrap();
+            if *failing > 0 {
+                *failing -= 1;
+                return Err(StoreError::Unavailable.into());
+            }
+        }
         self.losses.lock().unwrap().push(*loss);
-        LossActions {
+        Ok(LossActions {
             conversations: self.counterparties.clone(),
             local: vec![LocalWrite::Put {
                 key: format!("lost/{}", loss.lost_generation).into_bytes(),
                 value: b"1".to_vec(),
             }],
-        }
+        })
     }
 }
 
@@ -773,6 +785,51 @@ async fn follow_move(
 }
 
 #[tokio::test]
+async fn test_move_keeps_an_owed_call_and_makes_it_at_the_next_service() {
+    let store = Arc::new(MemoryStore::new());
+    let (w, router, _next, _) = moved_world(Arc::clone(&store) as Arc<dyn StateStore>).await;
+    // A re-send call the protocol couldn't answer at generation 1.
+    let mut app = App::load(
+        router.env(&w, Arc::clone(&store) as Arc<dyn StateStore>),
+        w.protocol.clone(),
+        World::config(),
+        app_keys("wallet").app_id_bytes(),
+    )
+    .await
+    .unwrap();
+    let call = crate::app::feed::OwedCall::Resend {
+        sender: w.bob.public(),
+        accepted_from_ms: 5,
+        accepted_until_ms: 6,
+        unreadable: false,
+    };
+    let mut tx = app.tx().unwrap();
+    tx.put(&crate::app::state::key::owed(1, 7), &call).unwrap();
+    app.commit(tx).await.unwrap();
+    drop(app);
+    follow_move(&w, &router, Arc::clone(&store) as Arc<dyn StateStore>)
+        .await
+        .unwrap();
+    let resends = w.protocol.resends.lock().unwrap().clone();
+    assert!(
+        resends.iter().any(|r| r.sender == w.bob.public()
+            && r.accepted_from_ms == 5
+            && r.accepted_until_ms == 6),
+        "{resends:?}"
+    );
+    let app = App::load(
+        router.env(&w, Arc::clone(&store) as Arc<dyn StateStore>),
+        w.protocol.clone(),
+        World::config(),
+        app_keys("wallet").app_id_bytes(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(app.cursor().generation, 2);
+    assert!(app.reader().scan_raw("owed/").await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn test_move_crash_at_each_commit_point_resumes() {
     let counting_inner = Arc::new(MemoryStore::new());
     let (w, router, _, _) = moved_world(Arc::clone(&counting_inner) as Arc<dyn StateStore>).await;
@@ -997,6 +1054,118 @@ async fn test_loss_recovers_at_the_new_generation() {
     // Nothing is asked again.
     app.receive(None).await.unwrap();
     assert_eq!(lost.protocol.losses.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn test_loss_call_the_protocol_fails_is_made_again() {
+    let store = Arc::new(MemoryStore::new());
+    let lost = lost_world(Arc::clone(&store) as Arc<dyn StateStore>).await;
+    // The protocol can't read its state: the recovery stops at the step, and the call
+    // fails with the protocol's error, which isn't the app's store failing.
+    *lost.protocol.failing.lock().unwrap() = 1;
+    let first = follow_loss(&lost, Arc::clone(&store) as Arc<dyn StateStore>).await;
+    assert!(
+        matches!(&first, Err(AppError::Protocol(failure))
+            if *failure.error() == StoreError::Unavailable),
+        "{:?}",
+        first.map(|_| ())
+    );
+    assert!(lost.protocol.losses.lock().unwrap().is_empty());
+    // The next call asks again, and the recovery goes on.
+    let (app, events) = follow_loss(&lost, Arc::clone(&store) as Arc<dyn StateStore>)
+        .await
+        .unwrap();
+    assert!(
+        has(&events, |e| matches!(
+            e,
+            AppEvent::ProviderRecovered { generation: 2 }
+        )),
+        "{events:?}"
+    );
+    let losses = lost.protocol.losses.lock().unwrap().clone();
+    assert_eq!(losses.len(), 1);
+    assert_eq!(losses[0].lost_generation, 1);
+    assert_eq!(losses[0].accepted_from_ms, lost.note_at_ms);
+    assert_eq!(
+        app.protocol_get(b"lost/1").await.unwrap(),
+        Some(b"1".to_vec())
+    );
+    assert_eq!(conversations_at(&lost.next), 1);
+}
+
+#[tokio::test]
+async fn test_loss_keeps_an_owed_call_from_the_lost_generation_and_makes_it() {
+    let store = Arc::new(MemoryStore::new());
+    let lost = lost_world(Arc::clone(&store) as Arc<dyn StateStore>).await;
+    // A missed-entries call the protocol couldn't answer at generation 1.
+    let mut app = load_lost(&lost, Arc::clone(&store) as Arc<dyn StateStore>).await;
+    let call = crate::app::feed::OwedCall::Missed {
+        seq: 9,
+        entries: 2,
+        accepted_from_ms: lost.note_at_ms,
+    };
+    let mut tx = app.tx().unwrap();
+    tx.put(&crate::app::state::key::owed(1, 9), &call).unwrap();
+    app.commit(tx).await.unwrap();
+    drop(app);
+    // Recovered at generation 2, the call is still made, with what it named then: the
+    // re-sends it asks for are the counterparties' to answer, wherever the app reads.
+    let (app, _) = follow_loss(&lost, Arc::clone(&store) as Arc<dyn StateStore>)
+        .await
+        .unwrap();
+    assert_eq!(app.cursor().generation, 2);
+    let missed = lost.protocol.sample.missed.lock().unwrap().clone();
+    assert!(
+        missed
+            .iter()
+            .any(|m| m.seq == 9 && m.entries == 2 && m.accepted_from_ms == lost.note_at_ms),
+        "{missed:?}"
+    );
+    assert!(app.reader().scan_raw("owed/").await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_loss_a_second_time_keeps_every_entry_stored_locally() {
+    let store = Arc::new(MemoryStore::new());
+    let lost = lost_world(Arc::clone(&store) as Arc<dyn StateStore>).await;
+    let load = || async {
+        App::load(
+            lost.router
+                .env(&lost.w, Arc::clone(&store) as Arc<dyn StateStore>),
+            Arc::clone(&lost.protocol) as Arc<dyn Protocol>,
+            World::config(),
+            app_keys("wallet").app_id_bytes(),
+        )
+        .await
+        .unwrap()
+    };
+    // Two entries stored for good before the first loss.
+    {
+        let mut app = load().await;
+        let mut tx = app.tx().unwrap();
+        for seq in [3u64, 4] {
+            let stored = crate::app::state::ParkedEntry {
+                sender: lost.w.bob.public(),
+                cert: lost.w.bob_cert.signed().clone(),
+                accepted_at_ms: lost.w.clock.now_ms(),
+                plaintext: b"kept".to_vec(),
+                context: None,
+                reason: ParkReason::Refused,
+                round: 0,
+            };
+            tx.put(&crate::app::state::key::parked(seq), &stored)
+                .unwrap();
+        }
+        app.commit(tx).await.unwrap();
+    }
+    // The first loss renumbers them to the top of the `seq`s, the second again.
+    lost.router.remove(NEXT);
+    let _ = follow_loss(&lost, Arc::clone(&store) as Arc<dyn StateStore>).await;
+    assert_eq!(load().await.state.parked.len(), 2);
+    let _third = third_recovering(&lost.w, &lost.router, 3, 2);
+    let _ = follow_loss(&lost, Arc::clone(&store) as Arc<dyn StateStore>).await;
+    let app = load().await;
+    assert_eq!(app.state.parked.len(), 2, "{:?}", app.state.parked.keys());
 }
 
 #[tokio::test]
@@ -2112,15 +2281,18 @@ async fn test_key_change_effect_resend_past_the_window_parks_its_entry() {
     assert!(
         has(&report.events, |e| matches!(
             e,
-            AppEvent::Parked { seq: s, reason: crate::app::ParkReason::Uncertain } if *s == seq
+            AppEvent::Parked { id: Some(_), seq: s, reason: ParkReason::Uncertain } if *s == seq
         )),
         "{:?}",
         report.events
     );
     assert!(has(&report.events, |e| matches!(
         e,
-        AppEvent::EffectRefused { seq: s, code: Some(code), .. }
-            if *s == seq && code == "stale_generation"
+        AppEvent::EffectUncertain { seq: s, .. } if *s == seq
+    )));
+    assert!(!has(&report.events, |e| matches!(
+        e,
+        AppEvent::EffectRefused { .. }
     )));
     assert!(!received(&report.events, seq), "{:?}", report.events);
     assert_eq!(conversations_at(&changed), 0);
@@ -2129,23 +2301,81 @@ async fn test_key_change_effect_resend_past_the_window_parks_its_entry() {
     let report = app.receive(None).await.unwrap();
     assert!(!received(&report.events, seq));
     assert_eq!(conversations_at(&changed), 0);
-    // The sender re-sends the same signed message: a duplicate, never applied again (Switch
-    // spec 11).
-    let plaintext = message.sign(&w.bob_keys).unwrap();
-    let again = changed
-        .send_plaintext(w.bob.public(), &w.bob_cert, &plaintext, &[me])
+    resend_is_a_duplicate(&w, &mut app, &changed, &message).await;
+}
+
+#[tokio::test]
+async fn test_store_of_the_earlier_schema_fails_as_an_old_schema() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join(&w, &router).await;
+    let me = app.app_id();
+    w.note(me, "before");
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.receive(None).await.is_err());
+    // The kept effect as schema 1 wrote it: without the entry it now keeps.
+    app.ready_local().await.unwrap();
+    let pending = app.state.pending_effect.clone().unwrap();
+    let mut value = serde_json::to_value(&pending).unwrap();
+    value.as_object_mut().unwrap().remove("entry");
+    let mut batch = crate::store::WriteBatch::new();
+    batch
+        .put(
+            &app.ns,
+            crate::app::state::key::PENDING_EFFECT.as_bytes().to_vec(),
+            serde_json::to_vec(&json!({ "v": 1, "d": value })).unwrap(),
+        )
         .unwrap();
-    let report = app.receive(None).await.unwrap();
+    app.env.store.commit(batch).await.unwrap();
+    drop(app);
+    let loaded = App::load(
+        router.env(&w, Arc::clone(&w.store) as Arc<dyn StateStore>),
+        w.protocol.clone(),
+        World::config(),
+        me,
+    )
+    .await;
     assert!(
-        has(&report.events, |e| matches!(
-            e,
-            AppEvent::Duplicate { seq, conflicting: false } if *seq == again
-        )),
+        matches!(
+            loaded,
+            Err(AppError::Store(StoreError::OldSchema { found: 1 }))
+        ),
         "{:?}",
-        report.events
+        loaded.map(|_| ())
     );
-    assert!(!received(&report.events, again), "{:?}", report.events);
-    assert_eq!(conversations_at(&changed), 0);
+}
+
+#[tokio::test]
+async fn test_kept_effect_without_its_entry_is_corrupt_state() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join(&w, &router).await;
+    let me = app.app_id();
+    w.note(me, "before");
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.receive(None).await.is_err());
+    // A kept effect without the entry it keeps: no build writes one.
+    app.ready_local().await.unwrap();
+    let pending = app.state.pending_effect.clone().unwrap();
+    let mut value = serde_json::to_value(&pending).unwrap();
+    value.as_object_mut().unwrap().remove("entry");
+    let mut tx = app.tx().unwrap();
+    tx.put(crate::app::state::key::PENDING_EFFECT, &value)
+        .unwrap();
+    app.commit(tx).await.unwrap();
+    drop(app);
+    let loaded = App::load(
+        router.env(&w, Arc::clone(&w.store) as Arc<dyn StateStore>),
+        w.protocol.clone(),
+        World::config(),
+        me,
+    )
+    .await;
+    assert!(
+        matches!(loaded, Err(AppError::Store(StoreError::Corrupt))),
+        "{:?}",
+        loaded.map(|_| ())
+    );
 }
 
 #[tokio::test]
@@ -2187,13 +2417,76 @@ async fn test_key_change_drops_a_kept_batch_older_than_the_batch_window() {
     assert!(
         has(&report.events, |e| matches!(
             e,
-            AppEvent::AttemptDropped { claim_key, attempt_id }
+            AppEvent::AttemptDropped { claim_key, attempt_id, .. }
                 if *claim_key == CLAIM && *attempt_id == ATTEMPT
         )),
         "{:?}",
         report.events
     );
     assert_eq!(allow_ops_for(&changed.applied(), carol), 0);
+    // Both are duty events: a load delivers them again until acknowledged.
+    let mut loaded = App::load(
+        router.env(&w, Arc::clone(&w.store) as Arc<dyn StateStore>),
+        w.protocol.clone(),
+        World::config(),
+        app.app_id(),
+    )
+    .await
+    .unwrap();
+    let events = loaded.take_events();
+    let duties: Vec<AppEvent> = report
+        .events
+        .iter()
+        .filter(|e| e.is_duty())
+        .cloned()
+        .collect();
+    assert_eq!(duties.len(), 2, "{:?}", report.events);
+    assert_eq!(events, duties);
+}
+
+#[tokio::test]
+async fn test_move_settling_an_applied_effect_clears_its_retry_count() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join(&w, &router).await;
+    let me = app.app_id();
+    let (seq, _) = w.note(me, "before");
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.receive(None).await.is_err());
+    // The entry's receive step had been retried for the store before.
+    app.ready_local().await.unwrap();
+    let retry = crate::app::state::RetryEntry {
+        reads: 1,
+        since_ms: w.clock.now_ms(),
+    };
+    let mut tx = app.tx().unwrap();
+    tx.put(&crate::app::state::key::retry(seq), &retry).unwrap();
+    app.commit(tx).await.unwrap();
+    app.state.retries.insert(seq, retry);
+    let n_key = next_key();
+    w.switch.freeze(&freeze_for(&w, &n_key, 2)).unwrap();
+    let next = w.switch.import_into(n_key.to_bytes());
+    router.add(NEXT, &next);
+    publish_at(
+        &w,
+        &next,
+        Inbox::new(NEXT, n_key.verifying_key().to_bytes()),
+        2,
+        None,
+    );
+    let report = app.receive(None).await.unwrap();
+    assert!(received(&report.events, seq), "{:?}", report.events);
+    // Settled at the switch: processed, its count gone, in memory and in the store.
+    assert!(app.state.retries.is_empty());
+    let loaded = App::load(
+        router.env(&w, Arc::clone(&w.store) as Arc<dyn StateStore>),
+        w.protocol.clone(),
+        World::config(),
+        me,
+    )
+    .await
+    .unwrap();
+    assert!(loaded.state.retries.is_empty());
 }
 
 #[tokio::test]
@@ -2264,6 +2557,952 @@ async fn test_key_change_sends_a_kept_effect_again_and_settles_it_once() {
             .await
             .unwrap(),
         Some(b"before".to_vec())
+    );
+}
+
+#[tokio::test]
+async fn test_key_change_keeps_an_owed_call_and_makes_it_at_the_new_generation() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join(&w, &router).await;
+    w.note(app.app_id(), "first");
+    app.receive(None).await.unwrap();
+    let now = w.clock.now_ms();
+    let seq = w.switch.push_missed(3, now - 3_600_000, now);
+    // The protocol can't answer at generation 1: the call is kept.
+    *w.protocol.failing.lock().unwrap() = 1;
+    app.receive(None).await.unwrap();
+    assert!(w.protocol.missed.lock().unwrap().is_empty());
+    // After the key change the next read makes it, with the item's `seq` at generation 1.
+    let _changed = change_key(&w, &router);
+    app.receive(None).await.unwrap();
+    assert_eq!(app.cursor().generation, 2);
+    let missed = w.protocol.missed.lock().unwrap().clone();
+    assert_eq!(missed.len(), 1, "{missed:?}");
+    assert_eq!(missed[0].seq, seq);
+    assert_eq!(missed[0].entries, 3);
+    assert!(app.reader().scan_raw("owed/").await.unwrap().is_empty());
+}
+
+/// After an uncertain park of `message`'s entry: the same signed message again, as a
+/// re-send at `switch`, is a duplicate, not applied (Switch spec 11).
+async fn resend_is_a_duplicate(
+    w: &World,
+    app: &mut App,
+    switch: &Arc<ScriptedSwitch>,
+    message: &pubky_switch_core::message::Message,
+) {
+    let plaintext = message.sign(&w.bob_keys).unwrap();
+    let again = switch
+        .send_plaintext(w.bob.public(), &w.bob_cert, &plaintext, &[app.app_id()])
+        .unwrap();
+    let before = conversations_at(switch);
+    let report = app.receive(None).await.unwrap();
+    assert!(
+        has(&report.events, |e| matches!(
+            e,
+            AppEvent::Duplicate { seq, conflicting: false } if *seq == again
+        )),
+        "{:?}",
+        report.events
+    );
+    assert!(
+        !has(&report.events, |e| matches!(
+            e,
+            AppEvent::MessageReceived { .. }
+        )),
+        "{:?}",
+        report.events
+    );
+    assert_eq!(conversations_at(switch), before);
+    assert!(app.cursor().seq >= again);
+}
+
+#[tokio::test]
+async fn test_key_change_parks_a_kept_effect_older_than_the_batch_window() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join(&w, &router).await;
+    let me = app.app_id();
+    let (seq, message) = w.note(me, "before");
+    // The effect is applied at generation 1, and its answer lost.
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.receive(None).await.is_err());
+    assert_eq!(w.effects(), 1);
+    w.clock
+        .advance_ms(crate::app::provider::KEPT_BATCH_ANSWER_MS);
+    // The key changes past the window, and the service has forgotten the batch ID.
+    let changed = change_key(&w, &router);
+    changed.lock().batches.clear();
+    // Sent again at the switch, `409 stale_generation` can't tell any more whether it was
+    // applied: the entry is stored and passed, its effect not built again, and the
+    // protocol told (Switch spec 12.5 "Kept batches").
+    let report = app.receive(None).await.unwrap();
+    assert!(
+        has(&report.events, |e| matches!(
+            e,
+            AppEvent::Parked { seq: s, reason: ParkReason::Uncertain, .. } if *s == seq
+        )),
+        "{:?}",
+        report.events
+    );
+    assert!(
+        has(&report.events, |e| matches!(
+            e,
+            AppEvent::EffectUncertain { seq: s, msg_id, .. }
+                if *s == seq && *msg_id == message.msg_id
+        )),
+        "{:?}",
+        report.events
+    );
+    assert!(!received(&report.events, seq), "{:?}", report.events);
+    assert_eq!(conversations_at(&changed), 0);
+    assert_eq!(w.effects(), 1);
+    assert!(app.cursor().seq >= seq);
+    assert_eq!(
+        app.state.parked.get(&seq).map(|p| p.reason),
+        Some(ParkReason::Uncertain)
+    );
+    assert_eq!(
+        app.protocol_get(format!("notes/{}", message.msg_id).as_bytes())
+            .await
+            .unwrap(),
+        None
+    );
+    // Later reads don't try it again, nor apply a re-send.
+    let report = app.receive(None).await.unwrap();
+    assert!(!received(&report.events, seq), "{:?}", report.events);
+    assert_eq!(conversations_at(&changed), 0);
+    resend_is_a_duplicate(&w, &mut app, &changed, &message).await;
+    // The protocol is told durably: a load delivers it again until it is acknowledged.
+    let loaded = App::load(
+        router.env(&w, Arc::clone(&w.store) as Arc<dyn StateStore>),
+        w.protocol.clone(),
+        World::config(),
+        me,
+    )
+    .await
+    .unwrap()
+    .take_events();
+    assert!(
+        has(&loaded, |e| matches!(
+            e,
+            AppEvent::EffectUncertain { id, seq: s, .. } if *s == seq && e.id() == Some(*id)
+        )),
+        "{loaded:?}"
+    );
+    assert!(loaded.iter().all(AppEvent::is_duty), "{loaded:?}");
+}
+
+#[tokio::test]
+async fn test_kept_effect_resend_refused_before_the_lookup_stays_kept() {
+    for code in [ErrorCode::CertExpired, ErrorCode::BadSignature] {
+        let w = World::new();
+        let router = Router::of(&w);
+        let mut app = join(&w, &router).await;
+        let me = app.app_id();
+        let (seq, _) = w.note(me, "before");
+        // Applied, its answer lost.
+        w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+        assert!(app.receive(None).await.is_err());
+        assert_eq!(w.effects(), 1);
+        // Sent again, refused before the service looks at its batch ID: that tells
+        // nothing, so the effect stays kept (Switch wire 6.4 steps 1 to 5).
+        w.switch.fail_next(Fault::Error {
+            path: "ops".into(),
+            code,
+            current: json!(null),
+        });
+        let built = w.protocol.received.lock().unwrap().len();
+        assert!(app.receive(None).await.is_err(), "{code:?}");
+        assert!(app.state.pending_effect.is_some(), "{code:?}");
+        assert_eq!(w.protocol.received.lock().unwrap().len(), built, "{code:?}");
+        // The cause gone, the same bytes show it applied: once in all.
+        let report = app.receive(None).await.unwrap();
+        assert!(
+            received(&report.events, seq),
+            "{code:?}: {:?}",
+            report.events
+        );
+        assert_eq!(w.effects(), 1, "{code:?}");
+        assert!(app.state.pending_effect.is_none());
+    }
+}
+
+/// A key change followed to its end, with an effect applied at generation 1, its answer
+/// lost, still kept: its resend at generation 2 couldn't connect. `None` when the
+/// unreachable send at `after` doesn't leave that state.
+async fn key_change_with_a_kept_effect(
+    after: usize,
+) -> Option<(World, App, Arc<ScriptedSwitch>, u64)> {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join(&w, &router).await;
+    let me = app.app_id();
+    let (seq, _) = w.note(me, "before");
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.receive(None).await.is_err());
+    let changed = change_key(&w, &router);
+    changed.fail_next(Fault::Unreachable {
+        path: "ops".into(),
+        after,
+    });
+    let failed = app.receive(None).await.is_err();
+    changed.lock().faults.clear();
+    let done = failed
+        && app.cursor().generation == 2
+        && !app.reader().exists("mv").await.unwrap()
+        && app.state.pending_effect.is_some();
+    done.then_some((w, app, changed, seq))
+}
+
+#[tokio::test]
+async fn test_key_change_kept_effect_resend_refused_before_the_lookup_stays_kept() {
+    for code in [ErrorCode::CertExpired, ErrorCode::BadSignature] {
+        let mut found = false;
+        for after in 0..6 {
+            let Some((w, mut app, changed, seq)) = key_change_with_a_kept_effect(after).await
+            else {
+                continue;
+            };
+            found = true;
+            let kept = app.state.pending_effect.as_ref().unwrap().body.clone();
+            let built = w.protocol.received.lock().unwrap().len();
+            // Its resend is refused before the batch ID lookup: kept, the same bytes, and
+            // the effect not built again (Switch wire 6.4 steps 1 to 5).
+            changed.fail_next(Fault::Error {
+                path: "ops".into(),
+                code,
+                current: json!(null),
+            });
+            assert!(app.receive(None).await.is_err(), "{code:?}");
+            assert_eq!(
+                app.state.pending_effect.as_ref().map(|p| p.body.clone()),
+                Some(kept),
+                "{code:?}"
+            );
+            assert_eq!(w.protocol.received.lock().unwrap().len(), built, "{code:?}");
+            // Then its answer shows it applied: never built again.
+            let report = app.receive(None).await.unwrap();
+            assert!(
+                received(&report.events, seq),
+                "{code:?}: {:?}",
+                report.events
+            );
+            assert_eq!(w.protocol.received.lock().unwrap().len(), built, "{code:?}");
+            assert_eq!(conversations_at(&changed), 0, "{code:?}");
+            break;
+        }
+        assert!(found, "a resend at generation 2 is reached");
+    }
+}
+
+#[tokio::test]
+async fn test_kept_effect_past_the_window_isnt_sent_again_at_the_same_generation() {
+    for forgotten in [false, true] {
+        let w = World::new();
+        let router = Router::of(&w);
+        let mut app = join(&w, &router).await;
+        let me = app.app_id();
+        let (seq, message) = w.note(me, "before");
+        // Applied, its answer lost.
+        w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+        assert!(app.receive(None).await.is_err());
+        assert_eq!(w.effects(), 1);
+        let built = w.protocol.received.lock().unwrap().len();
+        // 31 days on, the service dropped the batch's proofs, or forgot its ID: a resend
+        // would get `409 conflict`, read as a failed condition, or be applied again.
+        w.clock.advance_ms(31 * DAY_MS);
+        if forgotten {
+            w.switch.lock().batches.clear();
+        } else {
+            w.switch.fail_next(Fault::Error {
+                path: "ops".into(),
+                code: ErrorCode::Conflict,
+                current: json!(null),
+            });
+        }
+        let report = app.receive(None).await.unwrap();
+        // Not sent again: its entry is stored as uncertain, and the effect not built again.
+        assert!(
+            has(&report.events, |e| matches!(
+                e,
+                AppEvent::EffectUncertain { seq: s, .. } if *s == seq
+            )),
+            "{forgotten}: {:?}",
+            report.events
+        );
+        assert_eq!(w.effects(), 1, "{forgotten}");
+        assert_eq!(
+            w.protocol.received.lock().unwrap().len(),
+            built,
+            "{forgotten}"
+        );
+        assert_eq!(
+            app.state.parked.get(&seq).map(|p| p.reason),
+            Some(ParkReason::Uncertain)
+        );
+        w.switch.lock().faults.clear();
+        resend_is_a_duplicate(&w, &mut app, &w.switch.clone(), &message).await;
+    }
+}
+
+#[tokio::test]
+async fn test_kept_effect_window_is_measured_against_the_verified_service_time() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join(&w, &router).await;
+    let me = app.app_id();
+    let (seq, _) = w.note(me, "before");
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.receive(None).await.is_err());
+    // The device clock reads as when the effect was kept, but the app has verified a
+    // service time past the window: the window is closed.
+    app.ready_local().await.unwrap();
+    let kept = app.state.pending_effect.as_ref().unwrap().kept_ms;
+    assert_eq!(app.state.pending_effect.as_ref().map(|p| p.seq), Some(seq));
+    assert!(app.answer_decides(kept));
+    let past = w.clock.now_ms() + crate::app::provider::KEPT_BATCH_ANSWER_MS;
+    let time = app.state.service_time.as_mut().unwrap();
+    time.highest_ms = past;
+    assert_eq!(app.kept_window_now(), past);
+    assert!(!app.answer_decides(kept));
+}
+
+#[tokio::test]
+async fn test_kept_batch_past_the_window_isnt_sent_again_at_the_same_generation() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = lists_app(&w, &router).await;
+    let carol = IdentityKey::from_secret(seed("carol/identity")).public();
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.submit_batch(contact_batch(carol)).await.is_err());
+    w.clock.advance_ms(31 * DAY_MS);
+    w.switch.lock().batches.clear();
+    // The next write: the kept batch isn't sent again, but dropped and reported.
+    let dave = IdentityKey::from_secret(seed("dave/identity")).public();
+    app.submit_batch(contact_batch(dave)).await.unwrap();
+    assert!(app.kept_batches().await.unwrap().is_empty());
+    assert!(has(&app.take_events(), |e| matches!(
+        e,
+        AppEvent::KeptBatchDropped { .. }
+    )));
+    assert_eq!(allow_ops_for(&w.switch.applied(), carol), 1);
+}
+
+#[tokio::test]
+async fn test_kept_batch_resend_refused_before_the_lookup_stays_kept() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = lists_app(&w, &router).await;
+    let carol = IdentityKey::from_secret(seed("carol/identity")).public();
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.submit_batch(contact_batch(carol)).await.is_err());
+    // The next write sends it again first; refused before the batch ID lookup, it stays.
+    let dave = IdentityKey::from_secret(seed("dave/identity")).public();
+    w.switch.fail_next(Fault::Error {
+        path: "ops".into(),
+        code: ErrorCode::CertExpired,
+        current: json!(null),
+    });
+    assert!(app.submit_batch(contact_batch(dave)).await.is_err());
+    assert_eq!(app.kept_batches().await.unwrap().len(), 1);
+    assert!(!has(&app.take_events(), |e| matches!(
+        e,
+        AppEvent::BatchRefused { .. }
+    )));
+    // Then its answer shows it applied: once in all.
+    app.submit_batch(contact_batch(dave)).await.unwrap();
+    assert!(app.kept_batches().await.unwrap().is_empty());
+    assert_eq!(allow_ops_for(&w.switch.applied(), carol), 1);
+}
+
+/// The sample protocol, whose effect for a note also writes an own `attempt`.
+struct AttemptingProtocol(SampleProtocol);
+
+impl Protocol for AttemptingProtocol {
+    fn has_keys(&self, scope: &str) -> bool {
+        self.0.has_keys(scope)
+    }
+
+    fn sent_between_own_apps(&self, kind: &str) -> bool {
+        self.0.sent_between_own_apps(kind)
+    }
+
+    fn check_scopes(
+        &self,
+        message: &Message,
+        sender: &AppCert,
+        own: &AppCert,
+    ) -> Result<(), String> {
+        self.0.check_scopes(message, sender, own)
+    }
+
+    fn accepts(&self, cert: &AppCert) -> Vec<String> {
+        self.0.accepts(cert)
+    }
+
+    fn check_body(&self, message: &ReceivedMessage) -> Result<(), String> {
+        self.0.check_body(message)
+    }
+
+    fn receive(&self, message: &ReceivedMessage) -> Outcome {
+        match self.0.receive(message) {
+            Outcome::Apply(mut effect) => {
+                effect.ops.push((
+                    Vec::new(),
+                    ClaimOp::attempt(CLAIM, 0, ATTEMPT, 3600, None).kind(),
+                ));
+                Outcome::Apply(effect)
+            }
+            other => other,
+        }
+    }
+
+    fn resend_needed(
+        &self,
+        needed: &ResendNeeded,
+    ) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
+        self.0.resend_needed(needed)
+    }
+
+    fn missed(&self, missed: &MissedEntries) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
+        self.0.missed(missed)
+    }
+}
+
+#[tokio::test]
+async fn test_kept_effect_parked_uncertain_reports_its_attempts() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join_on(
+        &w,
+        &router,
+        Arc::clone(&w.store) as Arc<dyn StateStore>,
+        Arc::new(AttemptingProtocol(SampleProtocol::default())),
+        &Permission::ALL,
+    )
+    .await;
+    let me = app.app_id();
+    let (seq, _) = w.note(me, "before");
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.receive(None).await.is_err());
+    w.clock
+        .advance_ms(crate::app::provider::KEPT_BATCH_ANSWER_MS);
+    let changed = change_key(&w, &router);
+    changed.lock().batches.clear();
+    let report = app.receive(None).await.unwrap();
+    let attempt = crate::app::ClaimAttempt {
+        claim_key: CLAIM,
+        attempt_id: ATTEMPT,
+    };
+    assert!(
+        has(&report.events, |e| matches!(
+            e,
+            AppEvent::EffectUncertain { seq: s, attempts, .. }
+                if *s == seq && *attempts == vec![attempt]
+        )),
+        "{:?}",
+        report.events
+    );
+    // Kept with them.
+    assert!(has(
+        &app.unacknowledged_events().await.unwrap(),
+        |e| matches!(
+            e,
+            AppEvent::EffectUncertain { attempts, .. } if *attempts == vec![attempt]
+        )
+    ));
+}
+
+#[tokio::test]
+async fn test_loss_reports_the_attempts_of_a_kept_effect_it_drops() {
+    let store = Arc::new(MemoryStore::new());
+    let lost = lost_world(Arc::clone(&store) as Arc<dyn StateStore>).await;
+    // A kept effect from before the loss, carrying an `attempt`.
+    let mut app = load_lost(&lost, Arc::clone(&store) as Arc<dyn StateStore>).await;
+    let attempt = ClaimOp::attempt(CLAIM, 0, ATTEMPT, 3600, None);
+    let batch = app
+        .sign_ops(vec![(Vec::new(), attempt.kind())], None)
+        .unwrap();
+    let pending = crate::app::state::PendingEffect {
+        body: batch.body().to_vec(),
+        seq: 99,
+        sender: lost.w.bob.public(),
+        msg_id: "kept".into(),
+        hash: [1; 32],
+        accepted_at_ms: lost.note_at_ms,
+        kind: "sample.note".into(),
+        local: Vec::new(),
+        cursor_to: None,
+        past_held: false,
+        parked: false,
+        deadlines: Vec::new(),
+        kept_ms: Some(lost.note_at_ms),
+        entry: crate::app::state::KeptEntry {
+            cert: app.cert().signed().clone(),
+            plaintext: Vec::new(),
+            context: None,
+        },
+    };
+    let mut tx = app.tx().unwrap();
+    tx.put(crate::app::state::key::PENDING_EFFECT, &pending)
+        .unwrap();
+    app.commit(tx).await.unwrap();
+    drop(app);
+    let (mut app, events) = follow_loss(&lost, Arc::clone(&store) as Arc<dyn StateStore>)
+        .await
+        .unwrap();
+    let dropped = |e: &AppEvent| {
+        matches!(
+            e,
+            AppEvent::AttemptDropped { claim_key, attempt_id, .. }
+                if *claim_key == CLAIM && *attempt_id == ATTEMPT
+        )
+    };
+    assert!(has(&events, dropped), "{events:?}");
+    assert!(app.state.pending_effect.is_none());
+    assert!(has(&app.unacknowledged_events().await.unwrap(), dropped));
+}
+
+/// A kept effect at generation 1 for an entry at `seq`, written into `app`'s store as if a
+/// read had kept it, with `parked` and `past_held` set as given.
+async fn keep_an_effect(
+    w: &World,
+    app: &mut App,
+    seq: u64,
+    parked: bool,
+    past_held: bool,
+) -> crate::app::state::PendingEffect {
+    let batch = app
+        .sign_ops(
+            vec![(
+                Vec::new(),
+                OpKind::AllowPut {
+                    pubky: w.bob.public(),
+                    kind: AllowKind::Conversation,
+                },
+            )],
+            None,
+        )
+        .unwrap();
+    let entry = crate::app::state::KeptEntry {
+        cert: w.bob_cert.signed().clone(),
+        plaintext: b"kept".to_vec(),
+        context: None,
+    };
+    let pending = crate::app::state::PendingEffect {
+        body: batch.body().to_vec(),
+        seq,
+        sender: w.bob.public(),
+        msg_id: format!("kept-{seq}"),
+        hash: [2; 32],
+        accepted_at_ms: w.clock.now_ms(),
+        kind: "sample.note".into(),
+        local: Vec::new(),
+        cursor_to: None,
+        past_held,
+        parked,
+        deadlines: Vec::new(),
+        kept_ms: Some(w.clock.now_ms()),
+        entry: entry.clone(),
+    };
+    let mut tx = app.tx().unwrap();
+    tx.put(crate::app::state::key::PENDING_EFFECT, &pending)
+        .unwrap();
+    if parked {
+        let stored = crate::app::state::ParkedEntry {
+            sender: w.bob.public(),
+            cert: entry.cert,
+            accepted_at_ms: pending.accepted_at_ms,
+            plaintext: entry.plaintext,
+            context: None,
+            reason: ParkReason::Quota,
+            round: 0,
+        };
+        tx.put(&crate::app::state::key::parked(seq), &stored)
+            .unwrap();
+        app.state.parked.insert(seq, stored);
+    }
+    app.commit(tx).await.unwrap();
+    app.state.pending_effect = Some(pending.clone());
+    pending
+}
+
+#[tokio::test]
+async fn test_uncertain_park_of_an_entry_stored_before_changes_its_reason() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join(&w, &router).await;
+    let cursor = app.cursor().seq;
+    let seq = cursor + 40;
+    let pending = keep_an_effect(&w, &mut app, seq, true, false).await;
+    w.clock
+        .advance_ms(crate::app::provider::KEPT_BATCH_ANSWER_MS);
+    change_key(&w, &router);
+    let report = app.receive(None).await.unwrap();
+    assert!(
+        has(&report.events, |e| matches!(
+            e,
+            AppEvent::EffectUncertain { seq: s, .. } if *s == seq
+        )),
+        "{:?}",
+        report.events
+    );
+    // The entry stored before keeps its plaintext; only its reason changes, and it is
+    // processed.
+    let stored = app.state.parked.get(&seq).unwrap();
+    assert_eq!(stored.reason, ParkReason::Uncertain);
+    assert_eq!(stored.plaintext, pending.entry.plaintext);
+    assert!(
+        app.reader()
+            .exists(&crate::app::state::key::processed(
+                &pending.sender,
+                &pending.msg_id
+            ))
+            .await
+            .unwrap()
+    );
+    assert!(app.state.pending_effect.is_none());
+}
+
+#[tokio::test]
+async fn test_uncertain_park_of_an_entry_past_a_held_one_keeps_the_cursor() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join(&w, &router).await;
+    let seq = app.cursor().seq + 40;
+    keep_an_effect(&w, &mut app, seq, false, true).await;
+    w.clock
+        .advance_ms(crate::app::provider::KEPT_BATCH_ANSWER_MS);
+    change_key(&w, &router);
+    let report = app.receive(None).await.unwrap();
+    assert!(
+        has(&report.events, |e| matches!(
+            e,
+            AppEvent::EffectUncertain { seq: s, .. } if *s == seq
+        )),
+        "{:?}",
+        report.events
+    );
+    // Past a held entry, it is marked seen; the cursor doesn't pass the held one for it.
+    assert_eq!(
+        app.state.parked.get(&seq).map(|p| p.reason),
+        Some(ParkReason::Uncertain)
+    );
+    assert!(app.state.seen.contains(&seq));
+    assert!(app.cursor().seq < seq);
+}
+
+#[tokio::test]
+async fn test_kept_effect_refused_for_its_bytes_is_parked_at_once() {
+    for code in [ErrorCode::BadRequest, ErrorCode::TooLarge] {
+        let w = World::new();
+        let router = Router::of(&w);
+        let mut app = join(&w, &router).await;
+        let me = app.app_id();
+        let (seq, message) = w.note(me, "before");
+        w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+        assert!(app.receive(None).await.is_err());
+        let (later, _) = w.note(me, "later");
+        // Sent again, refused for its own shape: the same bytes would be again, so the
+        // entry is stored as uncertain at once, and the read goes on to the feed.
+        w.switch.fail_next(Fault::Error {
+            path: "ops".into(),
+            code,
+            current: json!(null),
+        });
+        let report = app.receive(None).await.unwrap();
+        assert!(
+            has(&report.events, |e| matches!(
+                e,
+                AppEvent::EffectUncertain { seq: s, .. } if *s == seq
+            )),
+            "{code:?}: {:?}",
+            report.events
+        );
+        assert!(
+            received(&report.events, later),
+            "{code:?}: {:?}",
+            report.events
+        );
+        assert_eq!(
+            app.state.parked.get(&seq).map(|p| p.reason),
+            Some(ParkReason::Uncertain)
+        );
+        assert!(app.state.pending_effect.is_none());
+        // Never applied twice, and a re-send is a duplicate: one effect for each note.
+        assert_eq!(w.effects(), 2, "{code:?}");
+        resend_is_a_duplicate(&w, &mut app, &w.switch.clone(), &message).await;
+    }
+}
+
+#[tokio::test]
+async fn test_kept_batch_refused_for_its_bytes_is_dropped_at_once() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = lists_app(&w, &router).await;
+    let carol = IdentityKey::from_secret(seed("carol/identity")).public();
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.submit_batch(contact_batch(carol)).await.is_err());
+    // The next write sends it again first; refused for its shape, it is dropped and
+    // reported at once, and the write goes on.
+    let dave = IdentityKey::from_secret(seed("dave/identity")).public();
+    w.switch.fail_next(Fault::Error {
+        path: "ops".into(),
+        code: ErrorCode::BadRequest,
+        current: json!(null),
+    });
+    app.submit_batch(contact_batch(dave)).await.unwrap();
+    assert!(app.kept_batches().await.unwrap().is_empty());
+    let events = app.take_events();
+    assert!(
+        has(&events, |e| matches!(e, AppEvent::KeptBatchDropped { .. })),
+        "{events:?}"
+    );
+    assert!(has(
+        &app.unacknowledged_events().await.unwrap(),
+        |e| matches!(e, AppEvent::KeptBatchDropped { .. })
+    ));
+    assert_eq!(allow_ops_for(&w.switch.applied(), dave), 1);
+    assert_eq!(allow_ops_for(&w.switch.applied(), carol), 1);
+}
+
+#[tokio::test]
+async fn test_kept_batch_signed_again_then_refused_for_good_is_reported() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join_on(
+        &w,
+        &router,
+        Arc::clone(&w.store) as Arc<dyn StateStore>,
+        w.protocol.clone(),
+        &Permission::ALL,
+    )
+    .await;
+    let carol = IdentityKey::from_secret(seed("carol/identity")).public();
+    // The claim is at step 1 already.
+    app.write_claim(
+        ClaimOp::attempt(CLAIM, 0, [9; 16], 3600, None),
+        vec![],
+        ObligationDeadline::NoDeadline,
+    )
+    .await
+    .unwrap();
+    // A batch with an attempt built on step 0, never sent.
+    w.switch.fail_next(Fault::Unreachable {
+        path: "ops".into(),
+        after: 0,
+    });
+    let attempt = ClaimOp::attempt(CLAIM, 0, ATTEMPT, 3600, None);
+    assert!(
+        app.submit_batch(contact_batch(carol).op(attempt.kind()))
+            .await
+            .is_err()
+    );
+    app.take_events();
+    let changed = change_key(&w, &router);
+    // `409 stale_generation`: signed again and sent, then refused for good with `409
+    // conflict`; dropped with what it carried, and the protocol told in that commit.
+    let mut events = Vec::new();
+    for _ in 0..3 {
+        match app.receive(None).await {
+            Ok(report) => events.extend(report.events),
+            Err(_) => events.extend(app.take_events()),
+        }
+    }
+    assert!(
+        has(&events, |e| matches!(
+            e,
+            AppEvent::KeptBatchSignedAgain { .. }
+        )),
+        "{events:?}"
+    );
+    let refused = |e: &AppEvent| {
+        matches!(e, AppEvent::BatchRefused { code, .. } if code == "conflict") && e.is_duty()
+    };
+    assert!(has(&events, refused), "{events:?}");
+    assert!(has(&app.unacknowledged_events().await.unwrap(), refused));
+    assert!(app.kept_batches().await.unwrap().is_empty());
+    assert_eq!(allow_ops_for(&changed.applied(), carol), 0);
+}
+
+/// The kept batch of `app`, with its attempt, never sent.
+async fn kept_attempt_batch(
+    w: &World,
+    app: &mut App,
+) -> (
+    [u8; 16],
+    crate::app::batch::PendingBatch,
+    crate::client::Batch,
+) {
+    let carol = IdentityKey::from_secret(seed("carol/identity")).public();
+    w.switch.fail_next(Fault::Unreachable {
+        path: "ops".into(),
+        after: 0,
+    });
+    let attempt = ClaimOp::attempt(CLAIM, 0, ATTEMPT, 3600, None);
+    assert!(
+        app.submit_batch(contact_batch(carol).op(attempt.kind()))
+            .await
+            .is_err()
+    );
+    let (id, pending) = app.kept_batches().await.unwrap().pop().unwrap();
+    let batch = crate::client::Batch::from_body(pending.body.clone()).unwrap();
+    (id, pending, batch)
+}
+
+fn refused(code: ErrorCode) -> AppError {
+    AppError::Switch(ClientError::Switch {
+        status: 403,
+        code,
+        message: "scripted".into(),
+        current: json!(null),
+        known_version: None,
+        retry_after: None,
+    })
+}
+
+/// Dropped and reported, with its attempt, in one commit.
+async fn dropped_with_its_attempt(app: &mut App) {
+    assert!(app.kept_batches().await.unwrap().is_empty());
+    let kept = app.unacknowledged_events().await.unwrap();
+    assert!(
+        has(&kept, |e| matches!(e, AppEvent::KeptBatchDropped { .. })),
+        "{kept:?}"
+    );
+    assert!(
+        has(&kept, |e| matches!(
+            e,
+            AppEvent::AttemptDropped { claim_key, attempt_id, .. }
+                if *claim_key == CLAIM && *attempt_id == ATTEMPT
+        )),
+        "{kept:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_kept_batch_refused_about_the_caller_past_the_window_is_dropped() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join_on(
+        &w,
+        &router,
+        Arc::clone(&w.store) as Arc<dyn StateStore>,
+        w.protocol.clone(),
+        &Permission::ALL,
+    )
+    .await;
+    let (id, pending, batch) = kept_attempt_batch(&w, &mut app).await;
+    // Within the window a refusal about the caller keeps it.
+    let kept = app
+        .kept_refused_before_lookup(&id, &pending, &batch, refused(ErrorCode::CertExpired))
+        .await;
+    assert!(kept.is_err());
+    assert_eq!(app.kept_batches().await.unwrap().len(), 1);
+    // Past it, the same refusal drops it.
+    w.clock
+        .advance_ms(crate::app::provider::KEPT_BATCH_ANSWER_MS);
+    app.kept_refused_before_lookup(&id, &pending, &batch, refused(ErrorCode::CertExpired))
+        .await
+        .unwrap();
+    dropped_with_its_attempt(&mut app).await;
+}
+
+#[tokio::test]
+async fn test_kept_batch_of_an_earlier_generation_past_the_window_is_dropped_at_its_resend() {
+    for code in [Some(ErrorCode::CertExpired), None] {
+        let w = World::new();
+        let router = Router::of(&w);
+        let mut app = join_on(
+            &w,
+            &router,
+            Arc::clone(&w.store) as Arc<dyn StateStore>,
+            w.protocol.clone(),
+            &Permission::ALL,
+        )
+        .await;
+        let (id, pending, batch) = kept_attempt_batch(&w, &mut app).await;
+        let changed = change_key(&w, &router);
+        // Followed to generation 2 with the batch still kept for generation 1.
+        let mut followed = false;
+        for after in 0..6 {
+            changed.fail_next(Fault::Unreachable {
+                path: "ops".into(),
+                after,
+            });
+            let _ = app.receive(None).await;
+            changed.lock().faults.clear();
+            if app.cursor().generation == 2 && app.kept_batches().await.unwrap().len() == 1 {
+                followed = true;
+                break;
+            }
+        }
+        assert!(followed);
+        // Past the window, its resend is refused about the caller, or answered `409
+        // stale_generation`: either way it is dropped, not kept or signed again.
+        w.clock
+            .advance_ms(crate::app::provider::KEPT_BATCH_ANSWER_MS);
+        if let Some(code) = code {
+            changed.fail_next(Fault::Error {
+                path: "ops".into(),
+                code,
+                current: json!(null),
+            });
+        }
+        app.ready_local().await.unwrap();
+        app.resend_earlier(&id, &pending, &batch).await.unwrap();
+        dropped_with_its_attempt(&mut app).await;
+        assert!(!has(&app.take_events(), |e| matches!(
+            e,
+            AppEvent::KeptBatchSignedAgain { .. }
+        )));
+    }
+}
+
+#[tokio::test]
+async fn test_key_change_signs_a_batch_never_sent_again_without_resending_it() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = lists_app(&w, &router).await;
+    let carol = IdentityKey::from_secret(seed("carol/identity")).public();
+    // Written while the service can't be reached: kept, never sent.
+    w.switch.fail_next(Fault::Unreachable {
+        path: "feed".into(),
+        after: 0,
+    });
+    w.switch.fail_next(Fault::Unreachable {
+        path: "ops".into(),
+        after: 0,
+    });
+    assert!(app.submit_batch(contact_batch(carol)).await.is_err());
+    w.switch.lock().faults.clear();
+    let kept = app.kept_batches().await.unwrap();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].1.kept_ms, None);
+    let old_id = kept[0].0;
+    // The key changes before its first send: it is signed again for the new generation,
+    // its old bytes never sent, then sent once.
+    let changed = change_key(&w, &router);
+    let report = app.receive(None).await.unwrap();
+    assert!(
+        has(&report.events, |e| matches!(
+            e,
+            AppEvent::KeptBatchSignedAgain { batch_id, .. } if *batch_id == old_id
+        )),
+        "{:?}",
+        report.events
+    );
+    assert_eq!(allow_ops_for(&w.switch.applied(), carol), 0);
+    let dave = IdentityKey::from_secret(seed("dave/identity")).public();
+    app.submit_batch(contact_batch(dave)).await.unwrap();
+    assert!(app.kept_batches().await.unwrap().is_empty());
+    assert_eq!(allow_ops_for(&changed.applied(), carol), 1);
+    assert!(
+        changed
+            .applied()
+            .iter()
+            .all(|op| op.body().batch.id != old_id)
     );
 }
 
