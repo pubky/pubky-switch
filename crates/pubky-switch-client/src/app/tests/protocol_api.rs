@@ -1935,6 +1935,38 @@ async fn test_sender_disposition_failed_refresh_after_a_restore_leaves_it_unknow
 }
 
 #[tokio::test]
+async fn test_sender_disposition_lists_too_large_for_one_commit_let_the_read_go_on() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let mut shop = shop_with_a_note(&p, &protocol).await;
+    // More flagged senders than one commit's batch size holds, as at raised limits.
+    {
+        let mut switch = p.bob.switch().lock();
+        for n in 0..310_000u32 {
+            let mut pubky = [9u8; 32];
+            pubky[..4].copy_from_slice(&n.to_be_bytes());
+            switch.shared.flagged.insert(pubky, 3);
+        }
+    }
+    // The owed refresh fails the same way at every read, and the reads go on.
+    for _ in 0..2 {
+        let result = shop.receive(None).await;
+        assert!(result.is_ok(), "the read goes on: {result:?}");
+    }
+    let seen = last_disposition(&protocol);
+    assert_eq!(seen.lists_as_of_ms, None);
+    // The host's own refresh gets the refusal.
+    let error = shop.allow_list().await.unwrap_err();
+    assert!(
+        matches!(
+            error,
+            AppError::Store(crate::error::StoreError::TooLarge { .. })
+        ),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
 async fn test_sender_disposition_sees_an_undeny_earlier_in_the_same_read() {
     let p = Pair::new();
     let protocol = ApiProtocol::new(Mode::Plain);

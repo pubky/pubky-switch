@@ -270,12 +270,12 @@ impl StoreFailure {
 }
 
 impl From<StoreError> for StoreFailure {
-    /// [`StoreError::Corrupt`] fails for the entry ([`StoreFailure::of_entry`]); every other
-    /// error is the store unavailable for now ([`StoreFailure::unavailable`]), bounded by
-    /// the wait.
+    /// [`StoreError::Corrupt`] and [`StoreError::TooLarge`] fail for the entry
+    /// ([`StoreFailure::of_entry`]), the same every time; every other error is the store
+    /// unavailable for now ([`StoreFailure::unavailable`]), bounded by the wait.
     fn from(error: StoreError) -> Self {
         match error {
-            StoreError::Corrupt => Self::of_entry(error),
+            StoreError::Corrupt | StoreError::TooLarge { .. } => Self::of_entry(error),
             error => Self::unavailable(error),
         }
     }

@@ -345,6 +345,9 @@ fn test_store_failure_is_built_only_from_a_store_error() {
     // A corrupt value fails for the entry every time.
     let corrupt = StoreFailure::try_from(AppError::Store(StoreError::Corrupt)).unwrap();
     assert!(corrupt.is_of_entry());
+    // So do writes over the store's sizes: refused again however often they are retried.
+    let too_large = StoreError::TooLarge { size: 2, cap: 1 };
+    assert!(StoreFailure::from(too_large).is_of_entry());
     assert!(StoreFailure::of_entry(StoreError::Other("refused".into())).is_of_entry());
     // Any other error isn't a store failure, and is given back.
     let other = AppError::InvalidData("a body".into());
@@ -1244,7 +1247,7 @@ async fn test_backup_with_a_layer_that_could_never_be_restored_is_refused() {
     app.protocol_commit(&journal(HUGE)).await.unwrap();
     let error = app.backup_layered().await.unwrap_err();
     assert!(
-        matches!(&error, AppError::Store(StoreError::Other(why)) if why.contains("value size")),
+        matches!(&error, AppError::Store(StoreError::TooLarge { cap, .. }) if *cap == MAX_VALUE_BYTES),
         "{error:?}"
     );
     assert_eq!(
@@ -1276,7 +1279,7 @@ async fn test_backup_layered_over_the_batch_size_is_refused_until_it_drains() {
     }
     let error = app.backup_layered().await.unwrap_err();
     assert!(
-        matches!(&error, AppError::Store(StoreError::Other(why)) if why.contains("batch")),
+        matches!(&error, AppError::Store(StoreError::TooLarge { cap, .. }) if *cap == MAX_BATCH_BYTES),
         "{error:?}"
     );
     assert_eq!(

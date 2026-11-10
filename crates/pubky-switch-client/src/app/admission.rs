@@ -33,7 +33,7 @@ use super::error::Refusal;
 use super::state::Tx;
 use super::{App, AppError};
 use crate::client::answers::{AllowList, ChainItem, ConnectList};
-use crate::error::ClientError;
+use crate::error::{ClientError, StoreError};
 
 /// The random bytes in an invite code the app makes (Switch spec 7: at least 16).
 pub const INVITE_CODE_BYTES: usize = 32;
@@ -303,14 +303,21 @@ impl App {
     ///
     /// Each list is kept whole, as the answer holds it, the flagged senders included. The
     /// copy is bounded as the other lists are: by the transport's cap on an answer's size
-    /// and the store's batch size; a copy over the batch size fails the commit and leaves
-    /// the copy as it was. At the default limits the flagged senders are at most
+    /// and the store's batch size. At the default limits the flagged senders are at most
     /// `max_flags`, 1,000 (Switch wire 9.2). The list isn't cut to a count of its own: a
     /// cut list would read a flagged sender as not flagged.
     ///
+    /// The whole copy is replaced in one commit, which must fit the store's batch size,
+    /// [`crate::store::MAX_BATCH_BYTES`]. Lists that don't fit, as they may at raised
+    /// limits, fail this call with [`StoreError::TooLarge`] and leave the copy as it was:
+    /// such an app can't refresh its copy today. Its reads go on, the refresh they owe
+    /// failing the same way, so [`SenderDisposition::lists_as_of_ms`] stays as it was,
+    /// `None` when the copy was never refreshed.
+    ///
     /// # Errors
     ///
-    /// [`Refusal::Usage`] without `lists.read`; a failed call or commit.
+    /// [`Refusal::Usage`] without `lists.read`; a failed call or commit;
+    /// [`StoreError::TooLarge`] for lists too large for one commit.
     pub async fn allow_list(&mut self) -> Result<AllowList, AppError> {
         Box::pin(async move {
             self.ready_local().await?;
@@ -325,8 +332,9 @@ impl App {
     /// (`lc/lists_at` absent: never refreshed, restored, or after a provider loss) and the
     /// app holds `lists.read`: [`App::allow_list`], before the read hands any entry over.
     /// Not while a move or a provider loss is in progress, whose steps read and upload the
-    /// copy as the app kept it. Best effort: a refused or failed call leaves the copy as it
-    /// was, still owed, and the read goes on; an alarm or a store failure stops it.
+    /// copy as the app kept it. Best effort: a refused or failed call, or a copy too large
+    /// for one commit, leaves the copy as it was, still owed, and the read goes on; an alarm
+    /// or a store failure stops it.
     pub(crate) async fn refresh_lists_if_owed(&mut self) -> Result<(), AppError> {
         if !self.state.cert.has_permission(Permission::ListsRead) {
             return Ok(());
@@ -340,6 +348,9 @@ impl App {
         }
         match self.refresh_lists().await {
             Ok(_) => Ok(()),
+            // A copy too large for one commit is refused the same way every time: the
+            // refresh failed, not the store, and the read goes on (Switch spec 8.2).
+            Err(AppError::Store(StoreError::TooLarge { .. })) => Ok(()),
             Err(error @ (AppError::Alarm(_) | AppError::Store(_))) => Err(error),
             Err(_) => Ok(()),
         }
