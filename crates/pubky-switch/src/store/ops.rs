@@ -112,8 +112,9 @@ impl ListName {
 pub struct StoredListEntry {
     /// The Pubky ID.
     pub pubky: [u8; 32],
-    /// The writing app.
-    pub written_by: [u8; 16],
+    /// The writing app; `None` for a conversation entry the service wrote for a sender an
+    /// invite code admitted.
+    pub written_by: Option<[u8; 16]>,
     /// The service time of the write.
     pub at_ms: u64,
 }
@@ -659,10 +660,10 @@ impl AccountTxn {
         rows.iter()
             .map(|row| {
                 let pubky: Vec<u8> = row.try_get("pubky")?;
-                let by: Vec<u8> = row.try_get("written_by")?;
+                let by: Option<Vec<u8>> = row.try_get("written_by")?;
                 Ok(StoredListEntry {
                     pubky: array(&pubky, "pubky")?,
-                    written_by: array(&by, "written_by")?,
+                    written_by: by.map(|by| array(&by, "written_by")).transpose()?,
                     at_ms: from_db(row.try_get("at_ms")?, "at_ms")?,
                 })
             })
@@ -704,7 +705,7 @@ impl AccountTxn {
         .bind(id)
         .bind(list.as_str())
         .bind(entry.pubky.as_slice())
-        .bind(entry.written_by.as_slice())
+        .bind(entry.written_by.map(|app| app.to_vec()))
         .bind(to_db(entry.at_ms, "at_ms")?)
         .execute(self.conn())
         .await

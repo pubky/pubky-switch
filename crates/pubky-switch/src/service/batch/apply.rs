@@ -226,7 +226,7 @@ fn apply_op(
                 .allow_list_mut(*kind)
                 .entry(*pubky)
                 .or_insert(ListEntry {
-                    written_by: cert.app_id(),
+                    written_by: Some(cert.app_id()),
                     at: now,
                 });
             StateAfter::Op
@@ -246,7 +246,7 @@ fn apply_op(
                 batch.limits,
             )?;
             state.deny.entry(*pubky).or_insert(ListEntry {
-                written_by: cert.app_id(),
+                written_by: Some(cert.app_id()),
                 at: now,
             });
             StateAfter::Op

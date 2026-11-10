@@ -63,8 +63,9 @@ pub struct HeldRecord {
 /// A list entry: the app that wrote it, and when.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ListEntry {
-    /// The writing app.
-    pub written_by: [u8; 16],
+    /// The writing app; `None` for the service's conversation entry for a sender an invite
+    /// code admitted.
+    pub written_by: Option<[u8; 16]>,
     /// The service time of the write.
     pub at: u64,
 }

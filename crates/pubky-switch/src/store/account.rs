@@ -126,6 +126,8 @@ pub struct AccountTxn {
     loaded: AccountHead,
     changed: bool,
     last_seen: Option<([u8; 16], u64)>,
+    /// Sender identities that hit an append limit in this request (Switch wire 9.4 Flags).
+    flag_hits: Vec<[u8; 32]>,
 }
 
 impl std::fmt::Debug for AccountTxn {
@@ -250,6 +252,7 @@ impl AccountTxn {
             head,
             changed: false,
             last_seen: None,
+            flag_hits: Vec::new(),
         }))
     }
 
@@ -315,6 +318,13 @@ impl AccountTxn {
     /// written with the commit, also when the endpoint is refused and rolled back.
     pub fn note_last_seen(&mut self, app_id: [u8; 16], at_ms: u64) {
         self.last_seen = Some((app_id, at_ms));
+    }
+
+    /// Note a hit of `sender` against an append limit (Switch wire 9.4 Flags). It is written
+    /// with the commit, also when the append is refused and rolled back, as the refusal is
+    /// what it counts.
+    pub fn note_flag_hit(&mut self, sender: [u8; 32]) {
+        self.flag_hits.push(sender);
     }
 
     /// Mark the start of the request's endpoint. Everything it writes after this, its
@@ -395,6 +405,17 @@ impl AccountTxn {
                 .execute(&mut *self.tx)
                 .await
                 .map_err(StoreError::from_db)?;
+        }
+        for sender in std::mem::take(&mut self.flag_hits) {
+            sqlx::query(
+                "INSERT INTO sender_flags (account_id, pubky, hits) VALUES ($1, $2, 1) \
+                 ON CONFLICT (account_id, pubky) DO UPDATE SET hits = sender_flags.hits + 1",
+            )
+            .bind(&self.head.id)
+            .bind(sender.as_slice())
+            .execute(&mut *self.tx)
+            .await
+            .map_err(StoreError::from_db)?;
         }
         if self.changed {
             // Sent with the commit, and only if it commits.
