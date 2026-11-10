@@ -1191,6 +1191,78 @@ async fn test_app_expired_certificate_is_renewed_by_the_signer_alone() {
 }
 
 #[tokio::test]
+async fn test_app_kept_effect_refused_for_an_expired_certificate_waits_for_the_renewal() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let me = app.app_id();
+    let old = app.cert().clone();
+    // A day before the certificate expires, a note's effect is applied, its answer lost:
+    // the effect is kept.
+    w.clock.set_ms(old.expires_at() - 24 * HOUR);
+    let (seq, _) = w.note(me, "before");
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.receive(None).await.is_err());
+    assert_eq!(w.effects(), 1);
+    // The certificate expires: the resend is refused about the caller, so the effect stays.
+    w.clock.set_ms(old.expires_at() + 1);
+    let Err(AppError::Switch(crate::ClientError::Switch { code, .. })) = app.receive(None).await
+    else {
+        panic!("an expired app is refused");
+    };
+    assert_eq!(code, ErrorCode::CertExpired);
+    assert!(app.state.pending_effect.is_some());
+    // The signer renews it and lists the renewal.
+    let renewed = cert_for(
+        &w.alice,
+        &app_keys("wallet"),
+        w.clock.now_ms(),
+        &["scope-a"],
+    );
+    let has_keys = |s: &str| SampleProtocol::default().has_keys(s);
+    let epoch = w.switch.identity_doc().unwrap().data_epoch();
+    let mut batch = vec![OpKind::CertPut {
+        target_app_id: me,
+        cert: renewed.signed().clone(),
+    }];
+    for part in seal_bundle_parts(&w.alice, &renewed, 1, epoch, &has_keys).unwrap() {
+        batch.push(OpKind::KeyBundlePut(KeyBundlePut {
+            target_app_id: me,
+            bundle: part.bundle,
+            first_epoch: part.first_epoch,
+            last_epoch: part.last_epoch,
+        }));
+    }
+    w.switch.signer_batch(batch).unwrap();
+    w.next_doc(|body| {
+        body.apps.retain(|a| a.app_id != me);
+        body.apps.push(ListedApp {
+            app_id: me,
+            cert: renewed.hash(),
+        });
+        body.renewed.push(RenewedCert {
+            app_id: me,
+            cert: old.hash(),
+            until: None,
+        });
+    });
+    // The renewal is taken, the same bytes go again and show the effect applied: once.
+    let mut events = Vec::new();
+    for _ in 0..2 {
+        if let Ok(report) = app.receive(None).await {
+            events.extend(report.events);
+        }
+    }
+    assert!(
+        has(&events, |e| matches!(e, AppEvent::CertificateTaken { .. })),
+        "{events:?}"
+    );
+    assert!(received(&events, seq), "{events:?}");
+    assert_eq!(w.effects(), 1);
+    assert!(app.state.pending_effect.is_none());
+    assert_eq!(app.cert().hash(), renewed.hash());
+}
+
+#[tokio::test]
 async fn test_app_ignores_a_cert_put_of_other_keys() {
     let w = World::new();
     let mut app = w.join("wallet").await;

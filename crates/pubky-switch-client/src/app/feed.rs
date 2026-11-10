@@ -295,9 +295,11 @@ impl App {
             self.take_listed_cert().await?;
             self.check_key_after_restore().await?;
         }
+        // A renewed certificate is taken before the kept effect goes again: the effect may
+        // wait on it, refused for the expired one (`403 cert_expired`).
+        self.adopt_renewal().await?;
         self.resume_pending_effect().await?;
         self.deliver_record().await?;
-        self.adopt_renewal().await?;
         self.ensure_scope_keys().await?;
         self.prune_processed().await?;
         self.retry_parked().await?;
