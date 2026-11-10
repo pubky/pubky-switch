@@ -785,8 +785,8 @@ async fn test_inbox_removed_app_and_closed_renewal() {
     assert_eq!(code_of(&answer), (403, json!("not_current")));
     replay.db.drop_database().await.expect("drop");
 
-    // A copy listing the shop as removed: answered like a stranger with no copy, 409
-    // identity_needed with version null, though bob is a contact.
+    // A copy listing the shop as removed: bob's contact entry doesn't count for it, so it's
+    // refused like a stranger.
     let Some(replay) = support::replay().await else {
         return;
     };
@@ -802,6 +802,89 @@ async fn test_inbox_removed_app_and_closed_renewal() {
     .await;
     let answer = from_shop(&replay, to_wallet(31, false), Some(version), None).await;
     assert_eq!(code_of(&answer), (403, json!("not_admitted")));
+    // Admitted by an invite code, it's answered like a stranger with no copy held: 409
+    // identity_needed with version null, though a copy of version 2 is held.
+    let code = "IRrC78oNIjZ4hcet2fYnJQ";
+    wallet_op(
+        &replay,
+        OpKind::InviteCodePut(InviteCodePut {
+            code_hash: pubky_switch_core::ident::invite_code_hash(code).expect("hash"),
+            expires_at: ms(&at()) + 3_600_000,
+            max_uses: 1,
+            context: InviteContext::new(json!(null)),
+        }),
+        72,
+        None,
+    )
+    .await;
+    let answer = from_shop(&replay, to_wallet(32, false), Some(version), Some(code)).await;
+    assert_eq!(code_of(&answer), (409, json!("identity_needed")));
+    assert_eq!(body(&answer)["current"], json!({ "version": null }));
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_inbox_code_only_append_needs_trusted_time() {
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    // bob's copy, delivered by alice's wallet, and a live code he holds.
+    deliver_bob_version(&replay, |_| {}).await;
+    let code = "IRrC78oNIjZ4hcet2fYnJQ";
+    wallet_op(
+        &replay,
+        OpKind::InviteCodePut(InviteCodePut {
+            code_hash: pubky_switch_core::ident::invite_code_hash(code).expect("hash"),
+            expires_at: ms(&at()) + 3_600_000,
+            max_uses: 1,
+            context: InviteContext::new(json!(null)),
+        }),
+        71,
+        None,
+    )
+    .await;
+    let version = apps_version(&replay).await;
+    // At a service with no trusted time, only the code admits bob, and its expiry can't be
+    // judged: 503, and the code unused.
+    let untrusted = replay.without_trusted_time();
+    let append = |code: Option<&str>| {
+        other_request(
+            "shop",
+            ORIGIN,
+            "POST",
+            &format!("/v1/{}/inbox?apps_version={version}", alice_id()),
+            to_wallet(40, false),
+            code,
+            ms(&at()),
+        )
+    };
+    let answer = untrusted.handle(append(Some(code))).await;
+    assert_eq!(code_of(&answer), (503, json!("unavailable")));
+    assert_eq!(
+        sql_value(
+            &replay,
+            "SELECT uses FROM invite_codes WHERE account_id = $1"
+        )
+        .await,
+        0
+    );
+    // A contact needs no time: the same append is taken.
+    wallet_op(
+        &replay,
+        OpKind::AllowPut {
+            pubky: hex32(&bob()["public_hex"]),
+            kind: AllowKind::Contact,
+        },
+        72,
+        None,
+    )
+    .await;
+    let answer = untrusted.handle(append(Some(code))).await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
     replay.db.drop_database().await.expect("drop");
 }
 
