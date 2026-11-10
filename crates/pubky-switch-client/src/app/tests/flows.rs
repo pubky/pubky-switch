@@ -796,6 +796,54 @@ async fn test_scripted_switch_refuses_a_cursor_outside_the_sequence() {
 }
 
 #[tokio::test]
+async fn test_scripted_switch_pages_the_feed_by_bytes_never_inside_a_batch() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let me = app.app_id();
+    let notes: Vec<u64> = (0..3).map(|i| w.note(me, &format!("note {i}")).0).collect();
+    // A budget below one item: each page holds its first item or batch alone (Switch wire
+    // 7.4.4).
+    w.switch.lock().max_page_bytes = 1;
+    let query = |seq| crate::client::answers::FeedQuery {
+        after: Some(pubky_switch_core::ops::Position { generation: 1, seq }),
+        limit: Some(100),
+        wait: None,
+    };
+    // A batch comes whole, as the join's record and first receive key do.
+    let batch_of = |item: &crate::client::answers::FeedItem| match item {
+        crate::client::answers::FeedItem::Chain(chain) => chain
+            .stub
+            .open()
+            .ok()
+            .and_then(|env| env.batch)
+            .map(|b| b.id),
+        _ => None,
+    };
+    let mut after = 0;
+    let mut whole_batch = false;
+    loop {
+        let page = app.client.feed(query(after)).await.unwrap();
+        if page.items.len() > 1 {
+            let first = batch_of(&page.items[0]);
+            assert!(first.is_some(), "{:?}", page.items);
+            assert!(page.items.iter().all(|item| batch_of(item) == first));
+            whole_batch = true;
+        }
+        if !page.more {
+            break;
+        }
+        assert!(!page.items.is_empty(), "a page holds at least one item");
+        after = page.next.seq;
+    }
+    assert!(whole_batch);
+    // The app reads them all, a page at a time.
+    let report = app.receive(None).await.unwrap();
+    for seq in notes {
+        assert!(received(&report.events, seq), "{:?}", report.events);
+    }
+}
+
+#[tokio::test]
 async fn test_app_defers_a_cursor_only_move() {
     let w = World::new();
     let mut wallet = w.join("wallet").await;

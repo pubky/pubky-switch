@@ -80,7 +80,7 @@ pub use fixture::{AppSpec, ProtocolSpec, TestProtocol, TestSigner, issue_cert};
 pub use homeserver::TestHomeserver;
 pub use peer::{PEER_ORIGIN, PeerApp, PeerSwitch};
 pub use router::Router;
-pub use switch::{Fault, HeldRecord, SWITCH_ORIGIN, ScriptedSwitch, SwitchApp};
+pub use switch::{Fault, HeldRecord, MAX_PAGE_BYTES, SWITCH_ORIGIN, ScriptedSwitch, SwitchApp};
 
 #[cfg(test)]
 pub(crate) use switch::{Item, PushReg};

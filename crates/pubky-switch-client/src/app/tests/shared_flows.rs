@@ -2025,6 +2025,35 @@ async fn test_records_listing_stops_when_next_doesnt_move_on() {
     assert_eq!(pages, 2);
 }
 
+#[tokio::test]
+async fn test_records_listing_pages_by_bytes() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    for name in ["n1", "n2", "n3"] {
+        app.put_record(&s.target(name), &value(&[name]), vec![])
+            .await
+            .unwrap();
+    }
+    // A budget below one view: each page holds its first view alone (Switch wire 7.4.9).
+    s.w.switch.lock().max_page_bytes = 1;
+    let id = items().id(&s.w.alice.public());
+    let first = app.client.records(&id, None, None).await.unwrap();
+    assert_eq!(first.records.len(), 1);
+    let next = first.next.unwrap();
+    let second = app.client.records(&id, Some(&next), None).await.unwrap();
+    assert_eq!(second.records.len(), 1);
+    assert_ne!(second.records[0].key, first.records[0].key);
+    // The app lists the whole collection by `next`.
+    let before = s.w.switch.lock().shared.listings;
+    assert_eq!(app.list_collection(&items()).await.unwrap(), 3);
+    assert_eq!(s.w.switch.lock().shared.listings - before, 3);
+    // Within the budget, one page holds them all.
+    s.w.switch.lock().max_page_bytes = crate::testing::MAX_PAGE_BYTES;
+    let all = app.client.records(&id, None, None).await.unwrap();
+    assert_eq!(all.records.len(), 3);
+    assert!(all.next.is_none());
+}
+
 #[test]
 fn test_push_setting_debug_hides_the_handles() {
     let setting = crate::client::answers::PushSetting {
