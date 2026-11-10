@@ -3122,6 +3122,65 @@ async fn test_kept_batch_refused_for_its_bytes_is_dropped_at_once() {
     assert_eq!(allow_ops_for(&w.switch.applied(), carol), 1);
 }
 
+#[tokio::test]
+async fn test_kept_batch_signed_again_then_refused_for_good_is_reported() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join_on(
+        &w,
+        &router,
+        Arc::clone(&w.store) as Arc<dyn StateStore>,
+        w.protocol.clone(),
+        &Permission::ALL,
+    )
+    .await;
+    let carol = IdentityKey::from_secret(seed("carol/identity")).public();
+    // The claim is at step 1 already.
+    app.write_claim(
+        ClaimOp::attempt(CLAIM, 0, [9; 16], 3600, None),
+        vec![],
+        ObligationDeadline::NoDeadline,
+    )
+    .await
+    .unwrap();
+    // A batch with an attempt built on step 0, never sent.
+    w.switch.fail_next(Fault::Unreachable {
+        path: "ops".into(),
+        after: 0,
+    });
+    let attempt = ClaimOp::attempt(CLAIM, 0, ATTEMPT, 3600, None);
+    assert!(
+        app.submit_batch(contact_batch(carol).op(attempt.kind()))
+            .await
+            .is_err()
+    );
+    app.take_events();
+    let changed = change_key(&w, &router);
+    // `409 stale_generation`: signed again and sent, then refused for good with `409
+    // conflict`; dropped with what it carried, and the protocol told in that commit.
+    let mut events = Vec::new();
+    for _ in 0..3 {
+        match app.receive(None).await {
+            Ok(report) => events.extend(report.events),
+            Err(_) => events.extend(app.take_events()),
+        }
+    }
+    assert!(
+        has(&events, |e| matches!(
+            e,
+            AppEvent::KeptBatchSignedAgain { .. }
+        )),
+        "{events:?}"
+    );
+    let refused = |e: &AppEvent| {
+        matches!(e, AppEvent::BatchRefused { code, .. } if code == "conflict") && e.is_duty()
+    };
+    assert!(has(&events, refused), "{events:?}");
+    assert!(has(&app.unacknowledged_events().await.unwrap(), refused));
+    assert!(app.kept_batches().await.unwrap().is_empty());
+    assert_eq!(allow_ops_for(&changed.applied(), carol), 0);
+}
+
 /// The app at `store`, loaded through the loss's router.
 async fn load_lost(lost: &Lost, store: Arc<dyn StateStore>) -> App {
     App::load(

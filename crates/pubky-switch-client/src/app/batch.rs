@@ -859,7 +859,19 @@ impl App {
                     batch_id: *id,
                     new_batch_id: new_id,
                 });
-                let submitted = self.run_pending(&new_id, &renewed, &signed, false).await?;
+                // Its first send: a refusal for good, other than one about the caller, which
+                // keeps it, drops it with what it carried, and tells the protocol in that
+                // commit, as a kept batch's refusal does; no caller waits for this one.
+                let submitted = match self.run_pending(&new_id, &renewed, &signed, true).await {
+                    Ok(submitted) => submitted,
+                    Err(error) if refused_at(&error) == Some(RefusalPlace::Caller) => {
+                        return Err(error);
+                    }
+                    Err(error) => match refused_for_good(&error) {
+                        Some(code) => return self.kept_batch_refused(&new_id, code).await,
+                        None => return Err(error),
+                    },
+                };
                 return self.check_attempts_of(&signed, &submitted).await;
             }
             Err(error) if refused_before_lookup(&error) => {
