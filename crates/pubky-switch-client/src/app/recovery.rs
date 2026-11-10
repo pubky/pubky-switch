@@ -494,7 +494,8 @@ impl App {
         self.state.held.clear();
         self.state.seen.clear();
         self.state.asked.clear();
-        for prefix in ["reg/", "held/", "seen/", "asked/"] {
+        self.state.retries.clear();
+        for prefix in ["reg/", "held/", "seen/", "asked/", "retry/"] {
             tx.delete_prefix(prefix)?;
         }
         // Entries stored locally keep their plaintext; their old `seq`s are renumbered past

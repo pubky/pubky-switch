@@ -18,7 +18,9 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
   operations settle (record writes cached at their proofs' versions, claim proofs kept), the
   protocol's local writes and the cursor are committed together with the answer. A claim
   the receive step asks for (`Outcome::Need`) is read and kept (`claim/`, `clent/`) in a
-  commit of its own, which moves no cursor; the step then runs again.
+  commit of its own, which moves no cursor; the step then runs again. A step that ends in
+  `Outcome::Retry` commits nothing of its own: only its count under `retry/`, with the
+  page, while the cursor stays before the entry.
 - **A batch refused with `409 stale_epoch`** is gone from `opq/` with the refusal; the app
   takes the newer `identity.json` and key bundle, each in its own commit, and the batch
   sealed again is signed and kept under a new batch ID before it is first sent.
@@ -60,6 +62,7 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
 | `proct/<time>/<sender>/<msg_id>` | the time index for pruning processed pairs | |
 | `seen/<seq>` | an entry processed past a held one | |
 | `held/<seq>` | an entry held because its sender can't be checked, since when | |
+| `retry/<seq>` | an entry whose receive step the protocol's store or the host kept from finishing (`Outcome::Retry`): the reads in a row that ended so, and when the first was; it goes once the entry is processed | |
 | `parked/<seq>` | an entry stored locally and passed: the opened plaintext, sender, certificate, time, reason (an unverifiable sender or a quota, tried again; an effect refused for good or over one batch, not tried again) | yes |
 | `asked/<seq>` | a re-send was handed to the protocol for this item | |
 | `departed/<app_id>` | another own app's departure verified in the chain, and its time | |

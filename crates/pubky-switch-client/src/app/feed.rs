@@ -21,6 +21,10 @@
 //!   good, or that has more operations than one batch takes, which isn't tried again: a
 //!   permanent refusal never stalls the feed. Pages are read from a position that moves on
 //!   to each page's `scanned_through`, while the cursor stays before the held entry.
+//! - **An entry whose receive step the protocol's store or the host kept from finishing**
+//!   ([`Outcome::Retry`]) is held the same way, with nothing of the step committed, and comes
+//!   again at the next read. It is never stored and passed: from the
+//!   [`RETRY_EVENT_READS`]th read in a row the app raises [`AppEvent::StoreFailing`] instead.
 //! - **An entry no held key opens** is passed; the protocol is asked to request a re-send,
 //!   never for a time before the cursor's less the clock tolerance. So is an entry a departed
 //!   own app left unread, accepted at or before a departure the app verified in its chain;
@@ -53,13 +57,15 @@ use super::error::{Alarm, Refusal, refused_for_good};
 use super::events::{AppEvent, ParkReason};
 use super::identity::{self, DOC_CACHE_MS, Taken};
 use super::protocol::{
-    Effect, LocalWrite, MAX_CLAIM_READS, MissedEntries, Need, OpaqueRule, Outcome, ReceivedMessage,
-    ResendNeeded, ResendReason, Rules,
+    Effect, LocalWrite, MAX_CLAIM_READS, MissedEntries, Need, OpaqueRule, Outcome,
+    RETRY_EVENT_READS, ReceivedMessage, ResendNeeded, ResendReason, Rules, StoreFailure,
 };
 use super::provider::TakeOver;
 use super::records::{Collection, pending_name_key};
 use super::rotation::RegistrationStep;
-use super::state::{CachedDoc, HeldEntry, ParkedEntry, PendingEffect, Processed, Tx, key};
+use super::state::{
+    CachedDoc, HeldEntry, ParkedEntry, PendingEffect, Processed, RetryEntry, Tx, key,
+};
 use super::{App, AppError, PROCESSED_RETENTION_MS};
 use crate::client::Batch;
 use crate::client::answers::{ChainItem, EntryItem, FeedItem, FeedPage, FeedQuery};
@@ -348,6 +354,7 @@ impl App {
             };
             match step {
                 Step::Pass => {
+                    self.clear_retry(seq, &mut read)?;
                     if read.blocked.is_none_or(|b| seq < b) {
                         self.pass(seq, item, &mut read)?;
                     } else if matches!(item, FeedItem::Entry(_)) && !self.state.seen.contains(&seq)
@@ -609,6 +616,7 @@ impl App {
                         return Ok(Step::Pass);
                     }
                 },
+                Outcome::Retry(failure) => return self.retry_later(entry, failure, read),
                 Outcome::Apply(effect) => effect,
             };
             if writes.not_now.is_some() {
@@ -951,6 +959,43 @@ impl App {
         Ok(())
     }
 
+    /// A receive step the protocol's store or the host kept from finishing
+    /// ([`Outcome::Retry`]): held, with nothing of the step committed, and the reads in a
+    /// row counted, to raise [`AppEvent::StoreFailing`] once they reach
+    /// [`RETRY_EVENT_READS`]. Never stored locally or passed (Switch spec 8.2).
+    fn retry_later(
+        &mut self,
+        entry: &Entry,
+        failure: StoreFailure,
+        read: &mut Read,
+    ) -> Result<Step, AppError> {
+        let now = self.now();
+        let retry = self.state.retries.entry(entry.seq).or_insert(RetryEntry {
+            reads: 0,
+            since_ms: now,
+        });
+        retry.reads = retry.reads.saturating_add(1);
+        let retry = *retry;
+        read.tx.put(&key::retry(entry.seq), &retry)?;
+        if retry.reads >= RETRY_EVENT_READS {
+            self.events.push(AppEvent::StoreFailing {
+                seq: entry.seq,
+                reads: retry.reads,
+                since_ms: retry.since_ms,
+                failure,
+            });
+        }
+        Ok(Step::Hold)
+    }
+
+    /// An entry processed at last: its count of retries goes.
+    fn clear_retry(&mut self, seq: u64, read: &mut Read) -> Result<(), AppError> {
+        if self.state.retries.remove(&seq).is_some() {
+            read.tx.delete(&key::retry(seq))?;
+        }
+        Ok(())
+    }
+
     fn dropped(&mut self, seq: u64, check: u8, reason: String) -> Step {
         self.events
             .push(AppEvent::MessageDropped { seq, check, reason });
@@ -1038,6 +1083,9 @@ impl App {
             let step = self
                 .check_and_apply(&entry, plaintext, true, &mut read)
                 .await?;
+            if step == Step::Pass {
+                self.clear_retry(seq, &mut read)?;
+            }
             self.commit(read.tx).await?;
             if step == Step::Pass && !self.state.parked.contains_key(&seq) {
                 self.events.push(AppEvent::Unparked { seq });

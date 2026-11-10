@@ -5,6 +5,7 @@
 //! Events carry facts, never wording, and never message content: a host words them.
 
 use super::error::Alarm;
+use super::protocol::StoreFailure;
 
 /// One thing that happened, for the host to show or act on.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -45,6 +46,21 @@ pub enum AppEvent {
     Held {
         /// The entry's `seq`.
         seq: u64,
+    },
+    /// The protocol's receive step at an entry couldn't finish, because its store or the
+    /// host failed ([`super::Outcome::Retry`]), on `reads` reads of the feed in a row: raised
+    /// from the [`super::RETRY_EVENT_READS`]th on, on each such read. The entry stays
+    /// unprocessed and the cursor before it until a read processes it; the host repairs or
+    /// frees its store.
+    StoreFailing {
+        /// The entry's `seq`.
+        seq: u64,
+        /// The reads in a row that ended in a retry at the entry, this one included.
+        reads: u32,
+        /// When the first of them was, device time in Unix milliseconds.
+        since_ms: u64,
+        /// The store's failure on this read.
+        failure: StoreFailure,
     },
     /// An entry was stored locally and the cursor moved past it (Switch spec 8.2): its
     /// sender stayed unverifiable too long, or its write hit a quota.

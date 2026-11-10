@@ -134,6 +134,10 @@ pub(crate) mod key {
         format!("held/{}", num(seq))
     }
 
+    pub(crate) fn retry(seq: u64) -> String {
+        format!("retry/{}", num(seq))
+    }
+
     pub(crate) fn parked(seq: u64) -> String {
         format!("parked/{}", num(seq))
     }
@@ -313,6 +317,15 @@ pub(crate) struct Processed {
 /// `held/<seq>`: an entry held because its sender can't be checked yet (Switch spec 8.2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct HeldEntry {
+    pub(crate) since_ms: u64,
+}
+
+/// `retry/<seq>`: an entry whose receive step couldn't finish because the protocol's store
+/// or the host failed (`Outcome::Retry`): the reads in a row that ended so, and when the
+/// first was. Kept until the entry is processed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RetryEntry {
+    pub(crate) reads: u32,
     pub(crate) since_ms: u64,
 }
 

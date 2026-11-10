@@ -68,7 +68,7 @@ pub use identity::{DOC_CACHE_MS, HomeserverReader, IdentityRefresh, REVALIDATION
 pub use peek::{PeekReport, Peeked};
 pub use protocol::{
     Effect, LocalWrite, MAX_CLAIM_READS, MissedEntries, Need, OpaqueRule, Outcome, Protocol,
-    ReceivedMessage, ResendNeeded, ResendReason,
+    RETRY_EVENT_READS, ReceivedMessage, ResendNeeded, ResendReason, StoreFailure,
 };
 pub use provider::ProviderStatus;
 pub use push::{MAX_HANDLE_BYTES, PushRegistration, PushRelay};
@@ -114,7 +114,7 @@ use self::chain::ChainView;
 use self::state::{
     BundleState, CachedDoc, Cursor, Device, HeldEntry, HeldKey, JoinStep, KnownKid, LeaveState,
     Meta, ParkedEntry, PendingEffect, PendingRecord, Reader, Registration, RestorePending,
-    RestoreState, Rotation, ServiceTime, Tx, key,
+    RestoreState, RetryEntry, Rotation, ServiceTime, Tx, key,
 };
 use crate::client::{Batch, Credentials, Submitted, SwitchClient};
 use crate::clock::Clock;
@@ -382,6 +382,7 @@ pub(crate) struct AppState {
     pub(crate) cursor: Cursor,
     pub(crate) chain: Option<ChainView>,
     pub(crate) held: BTreeMap<u64, HeldEntry>,
+    pub(crate) retries: BTreeMap<u64, RetryEntry>,
     pub(crate) seen: BTreeSet<u64>,
     pub(crate) asked: BTreeSet<u64>,
     pub(crate) parked: BTreeMap<u64, ParkedEntry>,
@@ -536,6 +537,7 @@ impl App {
                 },
                 chain: None,
                 held: BTreeMap::new(),
+                retries: BTreeMap::new(),
                 seen: BTreeSet::new(),
                 asked: BTreeSet::new(),
                 parked: BTreeMap::new(),
@@ -732,6 +734,7 @@ impl App {
             cursor: reader.get(key::CURSOR).await?.ok_or_else(missing)?,
             chain: ChainView::load(reader).await?,
             held: reader.scan_numbered("held/").await?,
+            retries: reader.scan_numbered("retry/").await?,
             seen: reader.scan_numbers("seen/").await?,
             asked: reader.scan_numbers("asked/").await?,
             parked: reader.scan_numbered("parked/").await?,
@@ -896,6 +899,7 @@ impl App {
                 cursor,
                 chain: Some(chain),
                 held: BTreeMap::new(),
+                retries: BTreeMap::new(),
                 seen: BTreeSet::new(),
                 asked: BTreeSet::new(),
                 parked: BTreeMap::new(),

@@ -32,9 +32,11 @@ use pubky_switch_core::records::{AppCert, AppRecord, Standing};
 use serde_json::Value;
 
 use super::context::{LocalView, ReceiveContext};
+use super::error::AppError;
 use super::records::Collection;
 use super::recovery::{LossActions, ProviderLoss};
 use super::send::{RecordJob, SentMessage};
+use crate::error::StoreError;
 
 /// An opaque member of a protocol's message bodies (Switch wire 1.1): its numbers aren't
 /// checked against the integer range.
@@ -148,6 +150,53 @@ pub enum Need {
     Claim([u8; 32]),
 }
 
+/// The reads of the feed in a row, each ending in [`Outcome::Retry`] at one entry, after
+/// which the app raises [`super::AppEvent::StoreFailing`] for it, on that read and every
+/// later one until the entry is processed.
+pub const RETRY_EVENT_READS: u32 = 3;
+
+/// A failure of the store or the host that kept a receive step from finishing
+/// ([`Outcome::Retry`]). It is built only from a [`StoreError`]: what the host's
+/// [`crate::store::StateStore`] answers, through the [`ReceiveContext`]'s or a
+/// [`LocalView`]'s reads or a store handle of the protocol's own, or what a binding maps
+/// its own host's storage failure to. A protocol never builds one for a message it can't
+/// handle: that is an [`Outcome::Drop`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoreFailure(StoreError);
+
+impl StoreFailure {
+    /// The store's error.
+    pub fn error(&self) -> &StoreError {
+        &self.0
+    }
+}
+
+impl From<StoreError> for StoreFailure {
+    fn from(error: StoreError) -> Self {
+        Self(error)
+    }
+}
+
+impl TryFrom<AppError> for StoreFailure {
+    /// Any other error, given back: it isn't a failure of the store.
+    type Error = AppError;
+
+    /// The failure of an [`AppError::Store`], such as a [`ReceiveContext::local_get`] whose
+    /// store failed; any other error is given back.
+    fn try_from(error: AppError) -> Result<Self, AppError> {
+        match error {
+            AppError::Store(error) => Ok(Self(error)),
+            other => Err(other),
+        }
+    }
+}
+
+impl std::fmt::Display for StoreFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 /// The protocol's answer for a received message.
 #[derive(Clone, Debug)]
 pub enum Outcome {
@@ -169,6 +218,27 @@ pub enum Outcome {
     /// ([`super::ParkReason::TooManyReads`]). A read that fails for now (the network, `429`,
     /// `503`) leaves the entry waiting for the next read of the feed.
     Need(Vec<Need>),
+    /// The step couldn't finish for now because the protocol's store or the host failed,
+    /// such as a read of its own state: never for a message the protocol can't handle,
+    /// which is an [`Outcome::Drop`]. A valid message is never consumed by a failure that
+    /// passes (Switch spec 8.2), so the entry stays unprocessed, as an entry whose sender
+    /// can't be checked yet: the app keeps no processed pair for it, commits nothing the
+    /// step built (what the context added and the step's local writes are discarded), and
+    /// keeps its cursor before it. The read goes on with later items, which are processed
+    /// past it and remembered, as past any held entry; the cursor stays before the oldest
+    /// one not processed, so the inbox keeps them all. The entry comes again at the next
+    /// read of the feed, never twice in one read, and the step runs again from the start.
+    ///
+    /// The entry isn't stored locally or passed after a wait, as an entry whose sender
+    /// stays unverifiable is: the store that failed is the one it would go to, and a
+    /// failing store is never a reason to skip a message. Instead the app counts the reads
+    /// in a row that end in a retry at the entry, in its own store, and from the
+    /// [`RETRY_EVENT_READS`]th on raises [`super::AppEvent::StoreFailing`] on each, so the
+    /// host learns its store is failing. Claims read for the step ([`Outcome::Need`]) stay
+    /// kept, in their own commits. An entry stored locally before
+    /// ([`ReceivedMessage::parked`]) stays stored and is tried again at the next read. A
+    /// push extension's peek runs no receive step, so a retry doesn't change what it shows.
+    Retry(StoreFailure),
 }
 
 /// Entries the app can't read and whose senders it asks to send again (Switch spec 8.2):
@@ -273,7 +343,8 @@ pub trait Protocol: Send + Sync {
     /// The effect of a message whose body passed [`Protocol::check_body`], for a protocol
     /// that needs nothing of the app's state: [`Protocol::receive_with`] calls it by default.
     /// A protocol that implements [`Protocol::receive_with`] need not implement this one; by
-    /// default it drops every message.
+    /// default it drops every message. A step that can't finish because the protocol's
+    /// store or the host failed returns [`Outcome::Retry`], never [`Outcome::Drop`].
     fn receive(&self, message: &ReceivedMessage) -> Outcome {
         let _ = message;
         Outcome::Drop {
@@ -285,9 +356,12 @@ pub trait Protocol: Send + Sync {
     /// state at hand (Switch spec 8.2): `cx` derives record keys and blinded inputs, reads
     /// the writes the app holds and the claims it keeps, and adds record writes and claim
     /// entries to the effect's batch, which carries the cursor move. What `cx` added goes
-    /// only with [`Outcome::Apply`]; a [`Outcome::Drop`] or an [`Outcome::Need`] discards
-    /// it. After an [`Outcome::Need`] the app reads what it names and calls this again, the
-    /// answers in [`ReceiveContext::switch_claim`]. After `409 conflict` on the batch the
+    /// only with [`Outcome::Apply`]; a [`Outcome::Drop`], an [`Outcome::Need`] or an
+    /// [`Outcome::Retry`] discards it. After an [`Outcome::Need`] the app reads what it
+    /// names and calls this again, the answers in [`ReceiveContext::switch_claim`]. A read
+    /// of the context, or of the protocol's own store, that fails with a store error is an
+    /// [`Outcome::Retry`] ([`StoreFailure::try_from`]): the entry comes again at the next
+    /// read of the feed. After `409 conflict` on the batch the
     /// app reads the records and claims `cx` wrote again and calls this once more, with
     /// [`ReceivedMessage::conflict`] set. [`Protocol::receive`] by default.
     fn receive_with(&self, message: &ReceivedMessage, cx: &mut ReceiveContext<'_>) -> Outcome {
