@@ -158,6 +158,19 @@ pub enum Alert {
     /// wire 3.13). The backup on the Homeserver is the one restored from; the next version's
     /// backup write replaces it.
     BackupNotWritten,
+    /// The switch refused to store the hand-over to this app for good (Switch wire 7.4.17),
+    /// as when it isn't current there. An earlier send may still be stored, so the hand-over
+    /// stays in progress: it takes effect if that app takes over, and the user aborts it
+    /// otherwise.
+    HandOverRefused {
+        /// The new signer's App ID.
+        to_app: [u8; 16],
+    },
+    /// The take-over's delivery won, but the vault didn't take the received secret, or didn't
+    /// give it back (Switch wire 3.12). The take-over keeps the hand-over as received, and
+    /// [`crate::Signer::resume`] puts the secret in the vault again; nothing is signed until
+    /// then.
+    KeyNotInstalled,
     /// A restore found the switch or the backup claiming keys sent past the next data
     /// epoch, which can't be: epochs never skip, and at most one is in progress beyond
     /// `data_epoch` (Switch spec 3.2, 3.5). The floor is kept at the next epoch.

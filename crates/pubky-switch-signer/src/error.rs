@@ -53,6 +53,15 @@ pub enum SignerError {
     /// it (Switch spec 4.3, Switch wire 3.3 "Never back").
     #[error("alarm: {0:?}")]
     Alarm(Alert),
+    /// The hand-over took effect: the switch holds the version after the one handed over,
+    /// naming `install`, so this install deleted the identity key and its records (Switch
+    /// wire 3.12, Switch spec 12.8). That install is the hand-over's target, or one that
+    /// restored the target's backup in the meantime: the switch's copy can't tell them apart.
+    #[error("the identity was handed over, and this install deleted its key and records")]
+    HandedOver {
+        /// The signer ID the switch's copy names.
+        install: [u8; 16],
+    },
 }
 
 /// A rule of the Switch or of a protocol said no.
@@ -119,6 +128,47 @@ pub enum Refusal {
     /// or key (Switch spec 12.2).
     #[error("refused: the App ID is revoked or being revoked")]
     CutOff,
+    /// This install is handing the identity over to the app `to_app`: it signs nothing but
+    /// the abort until the hand-over takes effect or is aborted (Switch wire 3.12).
+    #[error("refused: the identity is being handed over")]
+    HandingOver {
+        /// The new signer's App ID.
+        to_app: [u8; 16],
+    },
+    /// No hand-over is in progress to abort.
+    #[error("refused: no hand-over is in progress")]
+    NotHandingOver,
+    /// This install is taking the identity over: it signs nothing but its first delivery
+    /// until that has won (Switch wire 3.12).
+    #[error("refused: the identity is being taken over")]
+    TakingOver,
+    /// The target of a hand-over isn't current at the switch with the certificate the newest
+    /// `identity.json` lists for it (Switch wire 3.12, 7.4.17).
+    #[error("refused: the hand-over's target isn't current")]
+    TargetNotCurrent,
+    /// A revocation is asked for whose version isn't delivered yet: no hand-over until it is,
+    /// since the abort and the new signer's first version would still list the app, which the
+    /// switch refuses (Switch wire 3.3, 3.12).
+    #[error("refused: a revocation is owed")]
+    RevocationOwed,
+    /// A reduction's closing delivery is owed: no hand-over until it is made (Switch wire
+    /// 3.12).
+    #[error("refused: a closing delivery is owed")]
+    ClosingOwed,
+    /// The take-over's check 3 failed (Switch wire 3.12): the switch's copy of `identity.json`
+    /// isn't the version handed over, or the Homeserver's is newer or another at its version.
+    /// An abort that won, a newer version, or a switch that went back. Nothing was sent, and
+    /// nothing received is kept.
+    #[error("refused: the switch's or the Homeserver's copy isn't the version handed over")]
+    StaleHandOver,
+    /// The store holds no take-over in progress for this identity.
+    #[error("refused: no take-over is in progress")]
+    NotTakingOver,
+    /// The take-over was cancelled: the switch holds a newer version that isn't this
+    /// install's first delivery, as after an abort (Switch wire 3.12). What was received, the
+    /// records and the take-over, are deleted.
+    #[error("refused: the take-over was cancelled")]
+    TakeOverCancelled,
     /// The Homeserver holds no signer backup to restore from (Switch wire 3.13).
     #[error("refused: there is no signer backup")]
     NoBackup,

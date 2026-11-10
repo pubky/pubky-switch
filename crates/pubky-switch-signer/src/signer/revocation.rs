@@ -76,6 +76,14 @@ impl Signer {
     ) -> Result<IdentityDoc> {
         self.refresh().await?;
         self.check_named()?;
+        // The abort carries the version handed over, so it must still list the app: the user
+        // aborts first, then revokes (Switch wire 3.12).
+        if let Some(handing) = &self.state.handing_over {
+            return Err(Refusal::HandingOver {
+                to_app: handing.to_app,
+            }
+            .into());
+        }
         let newest = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
         if newest.listed_cert(&app_id).is_none() {
             return Err(Refusal::NotListed.into());

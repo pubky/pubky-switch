@@ -110,6 +110,11 @@ service.
   scripts a faulty service that shows no time for a removal. Freeze and
   unfreeze are test calls, not routes.
 - **`lose_identity`** scripts a faulty service that lost the account's `identity.json`.
+- **The signer hand-over** (Switch wire 7.4.17): `PUT /handover` runs the core's checks of a
+  stored hand-over (`SignerHandover::check_stored`) for a current target with a checked
+  certificate, and keeps one, replacing any it held; `GET /handover` serves it to the signer
+  and to its target; the next `identity.json` version, whoever delivered it, drops it.
+  `stored_handover` names the target held.
 - **Erasure** (Switch wire 7.4.16) is a flag; its answers are signed with a fixed operator
   key.
 - **Push** (Switch wire 8.1): registrations only; nothing is sent to a relay.
@@ -127,4 +132,6 @@ once it serves those calls:
   record cleanup (`revocation.rs`);
 - the one-signer checks, alarms and their clearing, records behind, and publication
   (`flows.rs`);
-- restore from the signer backup, in place and on a new install (`restore.rs`).
+- restore from the signer backup, in place and on a new install (`restore.rs`);
+- the hand-over both ways, the abort, the take-over's checks and its lost answers, and which
+  copies delete a key (`handover.rs`).

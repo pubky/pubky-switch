@@ -6,12 +6,15 @@
 //! nothing is signed twice (Switch wire 2.1). Nothing in the Switch spec fixes this layout;
 //! it is the crate's own, versioned by [`SCHEMA_VERSION`].
 //!
-//! The records hold no secret: the identity key stays in the host's vault.
+//! The records hold no secret: the identity key stays in the host's vault. A take-over's flow
+//! holds the hand-over as the switch served it, sealed to the new signer's bundle key, until
+//! the secret it carries is in the vault (Switch wire 3.12).
 
 use pubky_switch_client::store::{StoreHandle, WriteBatch};
 use pubky_switch_core::enc::zbase32_encode;
 use pubky_switch_core::records::{
-    DEFAULT_CERT_LIFETIME_MS, IdentityDoc, IdentityPolicy, Limits, SignerBackup, StoredPart,
+    DEFAULT_CERT_LIFETIME_MS, IdentityDoc, IdentityPolicy, Limits, SignerBackup, SignerHandover,
+    StoredPart,
 };
 use pubky_switch_core::sig::SignedDoc;
 use serde::{Deserialize, Serialize};
@@ -120,6 +123,14 @@ pub(crate) struct SignerState {
     /// delivery has won (Switch wire 3.13).
     #[serde(default)]
     pub(crate) backup_owed: bool,
+    /// The hand-over this install is making, until it takes effect or is aborted (Switch wire
+    /// 3.12): it signs nothing for the identity but the abort meanwhile.
+    #[serde(default)]
+    pub(crate) handing_over: Option<HandingOver>,
+    /// This install is taking the identity over from a hand-over, until its first delivery
+    /// has won and the received secret is in the vault (Switch wire 3.12).
+    #[serde(default)]
+    pub(crate) taking_over: bool,
     /// The full-bundle requests whose answer the switch refused, not tried again until the
     /// app asks anew.
     #[serde(default)]
@@ -162,6 +173,46 @@ pub(crate) struct SignerState {
     /// time to close at.
     #[serde(default)]
     pub(crate) closing_unavailable: Option<u64>,
+}
+
+/// A hand-over this install is making (Switch wire 3.12).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct HandingOver {
+    /// The new signer's App ID.
+    pub(crate) to_app: [u8; 16],
+    /// The version handed over, as signed: the newest the switch accepted from this install.
+    pub(crate) doc: SignedDoc,
+    /// The hand-over, sealed to the new signer's bundle key and signed once, and sent again
+    /// with the same bytes. It is ciphertext only that app opens.
+    pub(crate) handover: SignerHandover,
+    /// Where its `PUT /handover` is.
+    pub(crate) sent: HandOverSent,
+    /// The document hash of the abort, once it is signed: never taken for the new signer's
+    /// version.
+    pub(crate) abort: Option<[u8; 32]>,
+}
+
+/// Where a hand-over's `PUT /handover` is (Switch wire 7.4.17).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum HandOverSent {
+    /// Not answered yet: it is sent again, the same bytes.
+    Pending,
+    /// The switch stores it for the new signer.
+    Stored,
+    /// The switch refused it for good. An earlier send may still be stored, so the hand-over
+    /// stays in progress until it takes effect or the user aborts it.
+    Refused,
+}
+
+/// A take-over's first delivery (Switch wire 3.12), signed once with the received key.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct TakeOverDelivery {
+    /// The version, as signed: the handed-over one plus 1, naming this install.
+    pub(crate) doc: SignedDoc,
+    /// The document hash of the handed-over version it builds on.
+    pub(crate) prev: [u8; 32],
+    /// Whether it won: the secret is put in the vault next, and nothing is sent again.
+    pub(crate) won: bool,
 }
 
 /// A revocation asked for, until the version that removes the app is delivered.
@@ -252,6 +303,8 @@ impl SignerState {
             grant_reminded: Vec::new(),
             deletion_checks: Vec::new(),
             backup_owed: false,
+            handing_over: None,
+            taking_over: false,
             refused_requests: Vec::new(),
             listed_at: Vec::new(),
             alerts: Vec::new(),
@@ -315,6 +368,18 @@ pub(crate) enum Flow {
         /// The document hash of the version it builds on.
         prev: Option<[u8; 32]>,
     },
+    /// Taking the identity over from a hand-over (Switch wire 3.12), until the first
+    /// delivery has won and the secret is in the vault.
+    TakingOver {
+        /// The hand-over as the switch served it, sealed to this app's bundle key: the secret
+        /// is opened from it in memory, to sign and to send, and goes to the vault only once
+        /// the delivery has won.
+        handover: SignerHandover,
+        /// This app's App ID, the hand-over's target.
+        app_id: [u8; 16],
+        /// The first delivery, once check 3 has passed and it is signed.
+        delivery: Option<TakeOverDelivery>,
+    },
     /// Delivering a new `identity.json` version, then publishing it.
     Deliver {
         /// The new version, as signed.
@@ -343,6 +408,20 @@ pub(crate) struct RenewBatch {
 pub(crate) struct Bytes(
     #[serde(with = "pubky_switch_core::enc::serde_b64_vec")] pub(crate) Vec<u8>,
 );
+
+/// Delete the records and the flow of `identity`, in one atomic write: once the identity was
+/// handed over, or a take-over was cancelled (Switch spec 12.8).
+pub(crate) async fn delete(store: &StoreHandle, identity: &[u8; 32]) -> Result<()> {
+    let ns = signer_namespace(identity);
+    let mut batch = WriteBatch::new();
+    for key in [STATE_KEY, FLOW_KEY] {
+        batch
+            .delete(&ns, key)
+            .map_err(|e| SignerError::Records(e.to_string()))?;
+    }
+    store.commit(batch).await?;
+    Ok(())
+}
 
 /// Read the records and the flow of `identity`; `None` when the store holds none.
 pub(crate) async fn load(

@@ -75,7 +75,7 @@ pub enum ExportReason { HandOver { to_app: [u8; 16] }, Backup }
 
 - **It holds no secret.** It holds the vault and the identity's public key. Each use loads the secret, checks that its public key is still this identity's, makes the core's `IdentityKey` for one operation and drops it, zeroized.
 - **No signing in the public API, and none outside the gate.** Every signature over a document, certificate, approval, claim, key bundle, operation or backup is made with a `SigningKey`, which only the signing gate hands out (section 4.4). Clients of the switch get a key that signs `Switch-Signature` only. The keyring's other uses are narrow calls that sign nothing: the backup key's derivation (spec 13.3) and opening a backup.
-- **The secret leaves for two reasons only,** named by `ExportReason`, and only sealed: in the signer's backup (`SigningKey::seal_backup`, wire 3.13), or in a hand-over to `to_app` (wire 3.12, a later PR).
+- **The secret leaves for two reasons only,** named by `ExportReason`, and only sealed: in the signer's backup (`SigningKey::seal_backup`, wire 3.13), or in a hand-over to `to_app` (`SigningKey::seal_hand_over`, wire 3.12).
 - **Received keys:** `install` adds the secret of a hand-over or a backup to the vault only when it is the identity's key. A vault that already holds that same secret, as after a retry, is fine; another secret is `Occupied`.
 - **`KeyError`** says which of these went wrong: the vault failed, it holds no secret, it already holds one, the secret isn't this identity's, the bytes aren't 32 long, or the random generator failed.
 
@@ -204,7 +204,7 @@ Two exceptions:
 5. Set `until` for cooperative renewals whose app record now carries the new certificate (`record_cert`, `record_at`).
 6. Serve full-bundle requests, resuming from `bundle_ranges`, with `cert.put` where `record_cert` lags.
 7. Renew certificates past half their lifetime.
-8. Check a pending hand-over. If the switch holds a newer version this signer didn't deliver, finish: destroy the key and the records.
+8. Check a pending hand-over. While one is in progress, nothing else here runs: its `PUT /handover` is sent again until answered, and the switch's copy is read. A copy at the version handed over plus 1, same generation, naming another install and not the abort, finishes it: destroy the key, then the records. Any other newer copy is adopted and the key stays.
 9. Republish the switch's copy if the Homeserver copy differs.
 
 It returns a report and refreshes the alerts.
@@ -295,21 +295,24 @@ impl Signer {
 
     // Hand-over, sending side
     async fn hand_over_to(&mut self, app: AppId, ok: UserConfirmed) -> Result<()>; // seal, PUT /handover
-    async fn abort_hand_over(&mut self, ok: UserConfirmed) -> Result<AbortOutcome>; // aborted | already succeeded
+    async fn abort_hand_over(&mut self, ok: UserConfirmed) -> Result<AbortOutcome>; // Aborted | SucceededBy { install }
 }
 
 /// Hand-over, receiving side: run by the target app with its own app keys.
-async fn receive_hand_over(env: SignerEnv, app: AppCredentials, vault: Arc<dyn SecretVault>)
-    -> Result<Signer, HandOverRefused>;   // GET /handover, checks 1-3, the version + 1 delivery
+async fn receive_hand_over(env: SignerEnv, app: &ReceivingApp, vault: Arc<dyn SecretVault>)
+    -> Result<Signer>;   // GET /handover, checks 1-3, the version + 1 delivery
+async fn resume_take_over(env: SignerEnv, identity: [u8; 32], keys: &AppKeys, vault: Arc<dyn SecretVault>)
+    -> Result<Signer>;   // the secret opened again from the flow's hand-over
 ```
 
 - **`UserConfirmed`** is a token the host makes only after it has shown the user the consequence: a revocation, a loss, an erasure, a hand-over or a take-over.
 - **`SignerEnv`** bundles the store, the clock, the Switch client factory, the Pubky handles and the `Protocols`.
 - **Approval:** `approve` signs the certificate, the version that lists it, the approval with the app's full key bundle and its companion claim, commits them together, then delivers. The claim is released only once the switch took that version. The host delivers it to the auth request's relay and then approves the Pubky grant for exactly the capabilities checked, which include the protocols' grant paths the review showed; the user's approval covers them, since the grant can't be narrowed below the auth request's capabilities.
 - **`receive_hand_over`:**
-  - After any refusal, it destroys whatever it opened (wire 3.12).
-  - A delivery that loses the compare-and-swap counts as a refusal.
-  - On success, it stores the secret in the vault only once its delivery has won.
+  - After a refusal of checks 1 to 3, it keeps nothing it opened (wire 3.12). Check 3 also refuses a switch that holds no copy, or an older one: it went back.
+  - It commits a take-over flow holding the hand-over as received, sealed to its bundle key, never the opened secret. The secret is opened in memory from that flow only, at the start and by `resume_take_over`, as the keyring's received form, and the gate lets that form sign only the first delivery.
+  - The delivery loses only to a `409` whose copy verifies, is at or above its version and isn't it: then the records and the flow go. A `409` carrying the delivery itself is a win. Any other answer deletes nothing.
+  - On a win, it adds the secret to the vault, reads it back and checks it, and only then drops the flow. A vault that fails keeps the flow with `KeyNotInstalled`.
 
 ### 5.1 Alerts
 
