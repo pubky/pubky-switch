@@ -222,11 +222,13 @@ impl Signer {
         self.refresh().await?;
         loop {
             self.finish_flow().await?;
-            self.publish().await?;
-            // A closing delivery a reduction owes comes before anything else (Switch wire
-            // 3.8 "A closing delivery owed").
+            // A closing delivery a reduction owes comes before anything else, publication
+            // included: it cuts the earlier certificate off at the switch, and a Homeserver
+            // that refuses writes must not hold it back (Switch wire 3.8 "A closing delivery
+            // owed"). Only the backup write comes before it, as before every delivery
+            // (Switch wire 3.13).
             if !self.queue_owed_closing().await? {
-                return Ok(());
+                return self.publish().await;
             }
         }
     }

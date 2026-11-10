@@ -19,8 +19,8 @@ use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::keys::{AppKeys, IdentityKey};
 use pubky_switch_core::ops::OpKind;
 use pubky_switch_core::records::{
-    AppRecord, AppRecordBody, CLOCK_TOLERANCE_MS, IdentityDoc, KeyBundleContents, Limits,
-    SIGNER_BACKUP_PATH, SignerBackup, SignerRecords,
+    AppRecord, AppRecordBody, CLOCK_TOLERANCE_MS, IDENTITY_PATH, IdentityDoc, KeyBundleContents,
+    Limits, SIGNER_BACKUP_PATH, SignerBackup, SignerRecords,
 };
 use pubky_switch_core::scopes::Permission;
 use pubky_switch_signer::{
@@ -195,6 +195,66 @@ async fn test_renewal_a_reduction_closes_at_the_renewing_deliverys_time() {
     );
     assert_eq!(world.published().unwrap().signed(), closed.signed());
     world.assert_no_version_sent_twice();
+}
+
+#[tokio::test]
+async fn test_renewal_a_failing_publication_doesnt_hold_back_a_reductions_closing() {
+    // The Homeserver refuses `identity.json` writes: the closing still reaches the switch,
+    // which cuts the earlier certificate off; only publication waits (Switch wire 3.8).
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let app = App::new(&["notes", "notes_tags"], None, [9; 32]);
+    world.approve(&mut signer, &app).await;
+    let id = app.keys.app_id_bytes();
+    world.clock.advance_ms(DAY_MS);
+    *world.homeserver.failing_path.lock().unwrap() = Some(IDENTITY_PATH.into());
+    let error = signer.renew(id, reduce(&["notes"])).await.unwrap_err();
+    assert!(matches!(error, SignerError::Homeserver(_)), "{error:?}");
+    let held = world.switch.identity_doc().unwrap();
+    assert_eq!(
+        renewals(&held, &id),
+        [Some(START_MS + DAY_MS + CLOCK_TOLERANCE_MS)]
+    );
+    // Once the Homeserver takes writes again, the closing version is published.
+    *world.homeserver.failing_path.lock().unwrap() = None;
+    signer.resume().await.unwrap();
+    assert_eq!(world.published().unwrap().signed(), held.signed());
+}
+
+#[tokio::test]
+async fn test_renewal_a_failing_publication_doesnt_hold_back_a_cooperative_closing() {
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let app = App::new(&["notes"], None, [9; 32]);
+    world.approve(&mut signer, &app).await;
+    let id = app.keys.app_id_bytes();
+    *world.homeserver.failing_path.lock().unwrap() = Some(IDENTITY_PATH.into());
+    let change = CertChange {
+        scopes: None,
+        expires_at: Some(START_MS + 400 * DAY_MS),
+    };
+    signer.renew(id, change).await.unwrap_err();
+    world.clock.advance_ms(3_600_000);
+    let new = world.switch.app(&id).renewed.unwrap();
+    let record_at = START_MS + 3_600_000;
+    let record =
+        AppRecord::sign(&app.keys, AppRecordBody::new(&new, Vec::new(), record_at)).unwrap();
+    world
+        .switch
+        .app_op(
+            &app.keys,
+            OpKind::AppPut {
+                record: record.signed().clone(),
+            },
+        )
+        .unwrap();
+    // The renewing version still isn't published, yet the closing goes to the switch.
+    let error = signer.run_due().await.unwrap_err();
+    assert!(matches!(error, SignerError::Homeserver(_)), "{error:?}");
+    assert_eq!(
+        renewals(&world.switch.identity_doc().unwrap(), &id),
+        [Some(record_at + CLOCK_TOLERANCE_MS)]
+    );
 }
 
 #[tokio::test]

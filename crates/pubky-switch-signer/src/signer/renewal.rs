@@ -579,9 +579,15 @@ impl Signer {
     ///
     /// As [`Signer::resume`].
     pub async fn run_due(&mut self) -> Result<()> {
-        self.resume().await?;
+        // A publication that failed doesn't hold back the closings owed at the switch.
+        let resumed = self.resume().await;
+        if let Err(error) = &resumed
+            && (self.flow.is_some() || !matches!(error, SignerError::Homeserver(_)))
+        {
+            return resumed;
+        }
         self.complete_renewals().await?;
-        Ok(())
+        resumed
     }
 }
 
