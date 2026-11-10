@@ -875,6 +875,59 @@ async fn test_restore_of_a_layered_backup_keeps_the_entries_stored_locally() {
 }
 
 #[tokio::test]
+async fn test_restore_of_a_layered_backup_in_place_keeps_what_the_app_owes_its_protocol() {
+    let w = World::new();
+    let protocol = FlakyProtocol::new(0);
+    let mut app = join_flaky(&w, &protocol, "wallet").await;
+    let me = app.app_id();
+    let backup = app.backup_layered().await.unwrap();
+    // After the backup: a duty event, and a call the protocol couldn't answer.
+    w.note(me, "refused");
+    w.switch.fail_next(Fault::Error {
+        path: "ops".into(),
+        code: ErrorCode::PermissionMissing,
+        current: serde_json::json!(null),
+    });
+    let report = app.receive(None).await.unwrap();
+    let duties: Vec<AppEvent> = report
+        .events
+        .into_iter()
+        .filter(AppEvent::is_duty)
+        .collect();
+    assert!(!duties.is_empty());
+    let now = w.clock.now_ms();
+    w.switch.push_missed(1, now.saturating_sub(1000), now);
+    *protocol.sample.failing.lock().unwrap() = 1;
+    app.receive(None).await.unwrap();
+    assert_eq!(app.owed_protocol_calls().await.unwrap(), 1);
+    drop(app);
+    // Restored in place from the layered backup: both stay, the duty events with their
+    // IDs, and the store's epoch and counter go on.
+    let mut restored = App::restore(w.env(), protocol.clone(), flaky_config(), &backup)
+        .await
+        .unwrap();
+    assert_eq!(restored.take_events(), duties);
+    assert_eq!(restored.owed_protocol_calls().await.unwrap(), 1);
+    let last = duties
+        .iter()
+        .filter_map(AppEvent::id)
+        .max_by_key(crate::app::EventId::counter)
+        .unwrap();
+    w.note(me, "refused again");
+    w.switch.fail_next(Fault::Error {
+        path: "ops".into(),
+        code: ErrorCode::PermissionMissing,
+        current: serde_json::json!(null),
+    });
+    let report = restored.receive(None).await.unwrap();
+    let next: Vec<_> = report.events.iter().filter_map(AppEvent::id).collect();
+    assert!(!next.is_empty(), "{:?}", report.events);
+    for id in next {
+        assert_eq!(id.cmp_same_store(&last), Some(std::cmp::Ordering::Greater));
+    }
+}
+
+#[tokio::test]
 async fn test_restore_installs_the_protocol_layer_with_the_app_state() {
     let w = World::new();
     let protocol = JournalProtocol::new(Some(JOURNAL));
