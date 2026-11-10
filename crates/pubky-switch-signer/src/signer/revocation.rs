@@ -237,12 +237,11 @@ impl Signer {
     /// it: a revocation signs nothing new, and goes out while an alarm holds signing back.
     ///
     /// The copy of the version a flow in progress delivers, as after a lost answer, is this
-    /// install's own: it is left for [`Signer::resume`], never taken as records behind. When
-    /// the copy confirms this install, its mark or that version, a backup that can't be read
-    /// adds nothing, since a take-over shows at the switch first (Switch wire 3.13), and the
-    /// revocation, the user's safety step, goes out. A backup that is read and shows a
-    /// take-over or records behind still stops it, and so does an unreadable one when the
-    /// copy shows an alarm.
+    /// install's own: it is left for [`Signer::resume`], never taken as records behind. A
+    /// backup that is read and shows a take-over or records behind stops the revocation,
+    /// alarm or not. One that can't be read, is missing or doesn't open adds nothing, alarm
+    /// or not: a take-over shows at the switch first, as a newer copy, which stops it already
+    /// (Switch wire 3.13), and the revocation is the user's confirmed safety step.
     async fn named_for_revoking(&mut self) -> Result<Named> {
         self.check_named()?;
         let held = self.service_client()?.apps().await?.identity;
@@ -250,23 +249,16 @@ impl Signer {
             Some(Flow::Deliver { doc, .. } | Flow::Renew { doc, .. }) => Some(doc.clone()),
             _ => None,
         };
-        let confirmed = if held.is_some() && held == in_flow {
-            true
-        } else {
+        if held.is_none() || held != in_flow {
             match self.confirm_copy(held.as_ref()).await {
-                Ok(()) => true,
-                Err(SignerError::Alarm(_)) => false,
+                Ok(()) | Err(SignerError::Alarm(_)) => {}
                 Err(error) => return Err(error),
             }
-        };
-        match self.env.homeserver.get(SIGNER_BACKUP_PATH).await {
-            Ok(found) => {
-                if let Some(found) = found.and_then(|bytes| self.open_backup(&bytes).transpose()) {
-                    self.judge_backup(&found?).await?;
-                }
-            }
-            Err(_) if confirmed => {}
-            Err(error) => return Err(SignerError::Homeserver(error)),
+        }
+        if let Ok(Some(bytes)) = self.env.homeserver.get(SIGNER_BACKUP_PATH).await
+            && let Some(found) = self.open_backup(&bytes)?
+        {
+            self.judge_backup(&found).await?;
         }
         Named::check(&self.state)
     }
@@ -418,8 +410,8 @@ impl Signer {
             // Once no version lists the app: removed, or purged from `removed` since.
             .filter(|app| newest.listed_cert(app).is_none())
             .collect();
-        // The grant reminder is raised whether or not the record goes now; a deletion that
-        // fails stays owed, and doesn't hold back the next app's.
+        // The grant reminder is raised once for each owed deletion, whether or not the record
+        // goes now; a deletion that fails stays owed, and doesn't hold back the next app's.
         for app_id in done {
             let deleted = self
                 .env
@@ -428,11 +420,15 @@ impl Signer {
                 .await
                 .is_ok();
             let mut state = self.state.clone();
+            if !state.grant_reminded.contains(&app_id) {
+                state.alert(Alert::GrantRevocationOwed { app_id });
+                state.grant_reminded.push(app_id);
+            }
             if deleted {
                 state.cleanup.retain(|a| *a != app_id);
                 state.revoking.retain(|r| r.app_id != app_id);
+                state.grant_reminded.retain(|a| *a != app_id);
             }
-            state.alert(Alert::GrantRevocationOwed { app_id });
             if state != self.state {
                 self.commit(state, self.flow.clone()).await?;
             }

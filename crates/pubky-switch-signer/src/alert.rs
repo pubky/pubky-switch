@@ -101,7 +101,8 @@ pub enum Alert {
     },
     /// A removed app's Pubky grant still lets it write its Homeserver paths: the Pubky SDK
     /// offers no call to revoke a grant yet, so the user revokes it in the Homeserver's own
-    /// settings (Switch spec 3.4, 12.2 step 1; design note, decision 4).
+    /// settings (Switch spec 3.4, 12.2 step 1; design note, decision 4). Raised once for each
+    /// removed app, also while its record's deletion keeps failing.
     GrantRevocationOwed {
         /// The removed app.
         app_id: [u8; 16],
@@ -149,7 +150,8 @@ pub enum Alert {
         /// The app.
         app_id: [u8; 16],
         /// Whether the switch took the revocation, so it serves the app no more, while
-        /// `identity.json` still lists it.
+        /// `identity.json` still lists it. An alert raised with `false` isn't rewritten when a
+        /// later send succeeds.
         at_switch: bool,
     },
 }
