@@ -595,6 +595,34 @@ async fn test_receive_retry_count_goes_when_a_resumed_effect_applies_a_stored_en
 }
 
 #[tokio::test]
+async fn test_receive_retry_count_goes_when_a_stored_entry_is_parked_as_uncertain() {
+    let w = World::new();
+    let protocol = FlakyProtocol::new(u32::MAX);
+    let mut app = join_flaky(&w, &protocol, "wallet").await;
+    let (seq, _) = w.note(app.app_id(), FLAKY);
+    app.receive(None).await.unwrap();
+    w.clock.advance_ms(PARK_AFTER_MS);
+    app.receive(None).await.unwrap();
+    assert_eq!(app.state.retries.get(&seq).map(|r| r.reads), Some(2));
+    // The store heals; the stored entry's effect is sent, its answer lost.
+    protocol.heal();
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.receive(None).await.is_err());
+    assert!(app.state.pending_effect.is_some());
+    // Past the window it isn't sent again: stored as uncertain, its count gone.
+    w.clock
+        .advance_ms(crate::app::provider::KEPT_BATCH_ANSWER_MS);
+    app.receive(None).await.unwrap();
+    assert_eq!(
+        app.state.parked.get(&seq).map(|p| p.reason),
+        Some(ParkReason::Uncertain)
+    );
+    assert!(app.state.retries.is_empty(), "{:?}", app.state.retries);
+    let app = load_flaky(&w, &protocol, app.app_id()).await;
+    assert!(app.state.retries.is_empty(), "and in the store");
+}
+
+#[tokio::test]
 async fn test_receive_retry_of_the_entry_is_parked_at_once() {
     let w = World::new();
     let protocol = FlakyProtocol::failing(1, StoreError::Corrupt, Mode::Plain);

@@ -1157,6 +1157,10 @@ impl App {
         };
         tx.put(&key::parked(pending.seq), &parked)?;
         self.state.parked.insert(pending.seq, parked);
+        // Stored for good: a count of the store's retries at it goes.
+        if self.state.retries.remove(&pending.seq).is_some() {
+            tx.delete(&key::retry(pending.seq))?;
+        }
         // Processed, so a re-send of the message is a duplicate, not applied (Switch spec
         // 11).
         let now = self.now();
