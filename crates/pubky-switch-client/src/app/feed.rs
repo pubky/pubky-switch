@@ -917,7 +917,7 @@ impl App {
                 .iter()
                 .map(|(claim_key, deadline)| (pubky_switch_core::enc::b64(claim_key), *deadline))
                 .collect(),
-            kept_ms: Some(self.now()),
+            kept_ms: Some(self.kept_stamp()),
             entry: KeptEntry {
                 cert: entry.cert.clone(),
                 plaintext: received.plaintext.encode(),
@@ -1206,6 +1206,7 @@ impl App {
             return Ok(());
         };
         let batch = Batch::from_body(pending.body.clone())?;
+        self.fresh_service_time().await?;
         // Past the window no answer tells whether it was applied, at any generation: a
         // retry after the service dropped its proofs gets `409 conflict`, and a forgotten
         // ID takes the same bytes as new. It isn't sent again; its entry is stored as

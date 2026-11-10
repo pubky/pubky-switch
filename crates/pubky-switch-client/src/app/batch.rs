@@ -403,7 +403,7 @@ impl App {
                 .collect(),
             local: batch.local,
             queued,
-            kept_ms: Some(self.now()),
+            kept_ms: Some(self.kept_stamp()),
         };
         let mut tx = self.tx()?;
         tx.put(&pending_key(&id), &pending)?;
@@ -529,6 +529,9 @@ impl App {
             return Ok(());
         }
         let kept = self.reader().scan::<PendingBatch>(PENDING_PREFIX).await?;
+        if !kept.is_empty() {
+            self.fresh_service_time().await?;
+        }
         for (id, pending) in kept {
             let id = pubky_switch_core::enc::unb64_array::<16>(&id)
                 .map_err(|_| AppError::Store(crate::error::StoreError::Corrupt))?;
@@ -858,7 +861,7 @@ impl App {
                 })?;
                 let renewed = PendingBatch {
                     body: signed.body().to_vec(),
-                    kept_ms: Some(self.now()),
+                    kept_ms: Some(self.kept_stamp()),
                     ..pending.clone()
                 };
                 let mut tx = self.tx()?;

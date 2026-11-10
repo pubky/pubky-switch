@@ -1287,6 +1287,106 @@ async fn test_app_expired_certificate_is_renewed_by_the_signer_alone() {
     );
 }
 
+/// An app of `w` whose device clock is its own, starting `offset_ms` from the service's.
+async fn app_with_its_own_clock(w: &World, offset_ms: i64) -> (App, Arc<TestClock>) {
+    let start = w.clock.now_ms().saturating_add_signed(offset_ms);
+    let clock = Arc::new(TestClock::new(start));
+    let mut env = w.env();
+    env.clock = Arc::clone(&clock) as Arc<dyn Clock>;
+    let request = w.approve(&app_keys("wallet"), &["scope-a"]);
+    let app = App::join(env, w.protocol.clone(), World::config(), request)
+        .await
+        .unwrap();
+    (app, clock)
+}
+
+#[tokio::test]
+async fn test_kept_effect_window_holds_with_the_device_clock_ahead_at_the_keep() {
+    let w = World::new();
+    // The device clock reads two hours ahead; its requests still pass, a `401
+    // stale_timestamp` being retried at the service's time.
+    let (mut app, clock) = app_with_its_own_clock(&w, 2 * HOUR as i64).await;
+    let me = app.app_id();
+    let (seq, _) = w.note(me, "before");
+    // Its effect is kept, the send not reaching the service, whichever of the read's
+    // requests that send is.
+    for after in 0..4 {
+        w.switch.fail_next(Fault::Unreachable {
+            path: "ops".into(),
+            after,
+        });
+        let _ = app.receive(None).await;
+        w.switch.lock().faults.clear();
+        if app.state.pending_effect.is_some() {
+            break;
+        }
+    }
+    assert!(app.state.pending_effect.is_some());
+    // Kept in service time, whatever the device read.
+    let kept = app.state.pending_effect.as_ref().unwrap().kept_ms.unwrap();
+    assert!(kept <= w.clock.now_ms(), "{kept}");
+    // The clock is set right. 30 days and half an hour after the service applied it, its
+    // proofs are gone and a retry would be answered `409 conflict`.
+    w.clock.advance_ms(30 * 24 * HOUR + HOUR / 2);
+    clock.set_ms(w.clock.now_ms());
+    w.switch.fail_next(Fault::Error {
+        path: "ops".into(),
+        code: ErrorCode::Conflict,
+        current: json!(null),
+    });
+    let built = w.protocol.received.lock().unwrap().len();
+    let report = app.receive(None).await.unwrap();
+    // Past the window: not sent again, stored as uncertain, never built again.
+    assert!(
+        has(&report.events, |e| matches!(
+            e,
+            AppEvent::EffectUncertain { seq: s, .. } if *s == seq
+        )),
+        "{:?}",
+        report.events
+    );
+    assert_eq!(w.protocol.received.lock().unwrap().len(), built);
+    assert_eq!(w.effects(), 0, "not sent");
+}
+
+#[tokio::test]
+async fn test_kept_effect_window_holds_with_the_device_clock_behind_at_the_resend() {
+    let w = World::new();
+    let (mut app, clock) = app_with_its_own_clock(&w, 0).await;
+    let me = app.app_id();
+    let (seq, _) = w.note(me, "before");
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.receive(None).await.is_err());
+    // A fresh load, the service time it holds from before; 30 days and half an hour on,
+    // the device clock reads two hours behind.
+    let mut env = w.env();
+    env.clock = Arc::clone(&clock) as Arc<dyn Clock>;
+    drop(app);
+    let mut app = App::load(env, w.protocol.clone(), World::config(), me)
+        .await
+        .unwrap();
+    w.clock.advance_ms(30 * 24 * HOUR + HOUR / 2);
+    clock.set_ms(w.clock.now_ms() - 2 * HOUR);
+    w.switch.fail_next(Fault::Error {
+        path: "ops".into(),
+        code: ErrorCode::Conflict,
+        current: json!(null),
+    });
+    let built = w.protocol.received.lock().unwrap().len();
+    let report = app.receive(None).await.unwrap();
+    // A service time read first shows it past the window: not sent again.
+    assert!(
+        has(&report.events, |e| matches!(
+            e,
+            AppEvent::EffectUncertain { seq: s, .. } if *s == seq
+        )),
+        "{:?}",
+        report.events
+    );
+    assert_eq!(w.protocol.received.lock().unwrap().len(), built);
+    assert_eq!(w.effects(), 1);
+}
+
 /// A kept effect refused with `403 cert_expired` stays kept, and goes again once the renewal
 /// is listed. A service following Switch wire 7.2 checks an own app against the stored
 /// renewed certificate as soon as the newest `identity.json` lists it, so the resend can

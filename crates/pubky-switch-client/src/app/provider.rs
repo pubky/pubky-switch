@@ -242,9 +242,45 @@ pub(crate) fn answer_decides(now: u64, kept_ms: Option<u64>) -> bool {
 }
 
 impl App {
+    /// The time a batch is kept at, before its first send: the earlier of the device clock
+    /// and the highest service time the app verified, so a device clock ahead doesn't make
+    /// it look younger. A batch kept with no service time verified in this call takes the
+    /// highest one kept from before, which can only make it look older.
+    pub(crate) fn kept_stamp(&self) -> u64 {
+        let now = self.now();
+        self.state
+            .service_time
+            .map_or(now, |time| now.min(time.highest_ms))
+    }
+
+    /// A service time verified in this call, before a kept batch's age is judged: a read of
+    /// one feed item, the cheapest authenticated request, when no answer of this call
+    /// brought one yet ([`App::kept_window_now`]).
+    ///
+    /// # Errors
+    ///
+    /// The read's: the age isn't judged, and the kept batch stays as it is.
+    pub(crate) async fn fresh_service_time(&mut self) -> Result<(), AppError> {
+        if self.time_fresh {
+            return Ok(());
+        }
+        let query = crate::client::answers::FeedQuery {
+            after: Some(Position {
+                generation: self.state.cursor.generation,
+                seq: self.state.cursor.seq,
+            }),
+            limit: Some(1),
+            wait: None,
+        };
+        let result = self.client.feed(query).await;
+        self.take(result).await?;
+        Ok(())
+    }
+
     /// The time a kept batch's age is measured at: the later of the device clock and the
-    /// highest service time the app verified, so a device clock set back doesn't hold the
-    /// window open (Switch spec 12.5 "Kept batches").
+    /// highest service time the app verified, in this call before any resend
+    /// ([`App::fresh_service_time`]), so a device clock set back doesn't hold the window
+    /// open (Switch spec 12.5 "Kept batches").
     pub(crate) fn kept_window_now(&self) -> u64 {
         let verified = self.state.service_time.map_or(0, |time| time.highest_ms);
         self.now().max(verified)
