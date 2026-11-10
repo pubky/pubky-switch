@@ -1,0 +1,199 @@
+//! Certificate renewal, the app's side (Switch spec 3.2 steps 3 and 4; Switch wire 3.8).
+//!
+//! The signer stores the app's renewed certificate at the service (`cert.put`, in the
+//! feed), then delivers an `identity.json` listing its hash. The app keeps the certificate
+//! from `cert.put` and takes it once its own `identity.json` lists it: it presents it from
+//! then on, and delivers its record carrying it (`app.put`), signed once and kept before it
+//! is sent. An app without the `cert.put`, such as one restored from a backup older than
+//! the renewal, takes the listed certificate from its own record in its directory, under
+//! the checks of Switch spec 3.2 step 3.
+
+use pubky_switch_core::http::ErrorCode;
+use pubky_switch_core::ops::{Condition, OpKind};
+use pubky_switch_core::records::{AppCert, AppRecord, is_renewal};
+use pubky_switch_core::sig::SignedDoc;
+
+use super::events::AppEvent;
+use super::state::{PendingRecord, Tx, key};
+use super::{App, AppError};
+use crate::client::Batch;
+use crate::error::ClientError;
+
+impl App {
+    /// A `cert.put` for this app seen in the feed: kept if it renews the certificate the
+    /// app presents (the same App ID, signing key and bundle key, a later `issued_at`).
+    pub(crate) fn note_renewal(&mut self, signed: &SignedDoc, tx: &mut Tx) -> Result<(), AppError> {
+        let Ok(cert) = AppCert::verify(signed, &self.state.meta.identity) else {
+            return Ok(());
+        };
+        let newer_than_kept = self
+            .state
+            .renewal
+            .as_ref()
+            .is_none_or(|kept| cert.issued_at() > kept.issued_at());
+        if is_renewal(&self.state.cert, &cert) && newer_than_kept {
+            tx.put(key::CERT_RENEWAL, cert.signed())?;
+            self.state.renewal = Some(cert);
+            self.events.push(AppEvent::RenewalSeen);
+        }
+        Ok(())
+    }
+
+    /// Take the kept renewal once the own `identity.json` lists it, and deliver the record
+    /// carrying it. Returns whether the certificate changed.
+    pub(crate) async fn adopt_renewal(&mut self) -> Result<bool, AppError> {
+        let Some(renewal) = self.state.renewal.clone() else {
+            return Ok(false);
+        };
+        let me = self.state.meta.app_id;
+        if self.state.own_doc.listed_cert(&me) != Some(renewal.hash()) {
+            return Ok(false);
+        }
+        let old = AppRecord::verify(&self.state.record, &self.state.meta.identity)?;
+        let mut body = old.body().clone();
+        body.cert = renewal.signed().clone();
+        body.accepts = self.protocol.accepts(&renewal);
+        body.updated_at = self.now().max(old.updated_at().saturating_add(1));
+        let record = AppRecord::sign(&self.state.keys, body)?;
+        self.take_cert(renewal, record.signed().clone(), true)
+            .await?;
+        self.deliver_record().await?;
+        Ok(true)
+    }
+
+    /// Present `cert` from now on, with `record`; `deliver` signs its `app.put` and keeps it
+    /// before it is sent.
+    async fn take_cert(
+        &mut self,
+        cert: AppCert,
+        record: SignedDoc,
+        deliver: bool,
+    ) -> Result<(), AppError> {
+        let issued_at = cert.issued_at();
+        self.state.cert = cert;
+        self.rebuild_client()?;
+        let mut tx = self.tx()?;
+        tx.put(key::CERT, self.state.cert.signed())?;
+        tx.put(key::RECORD, &record)?;
+        tx.delete(key::CERT_RENEWAL)?;
+        if deliver {
+            let pending = PendingRecord {
+                body: self.record_batch(&record)?.body().to_vec(),
+            };
+            tx.put(key::PENDING_RECORD, &pending)?;
+            self.state.pending_record = Some(pending);
+        }
+        self.state.record = record;
+        self.state.renewal = None;
+        self.commit(tx).await?;
+        self.events.push(AppEvent::CertificateTaken { issued_at });
+        Ok(())
+    }
+
+    /// The `app.put` batch. It is kept and may be sent again after the cursor moved on: a
+    /// cursor move in it could take the service's cursor back, so it carries none (Switch
+    /// spec 8.2).
+    fn record_batch(&self, record: &SignedDoc) -> Result<Batch, AppError> {
+        self.sign_ops(
+            vec![(
+                Vec::<Condition>::new(),
+                OpKind::AppPut {
+                    record: record.clone(),
+                },
+            )],
+            None,
+        )
+    }
+
+    /// Send the kept `app.put` until answered. A `409 conflict` naming a record of this app
+    /// with an `updated_at` at or after this one's (another device's) is written again
+    /// once, later than the held one (Switch spec 4.2).
+    pub(crate) async fn deliver_record(&mut self) -> Result<(), AppError> {
+        let Some(pending) = self.state.pending_record.clone() else {
+            return Ok(());
+        };
+        let batch = Batch::from_body(pending.body)?;
+        let result = self.submit(&batch).await;
+        let held = match result {
+            Ok(_) => None,
+            Err(AppError::Switch(ClientError::Switch {
+                code: ErrorCode::Conflict,
+                current,
+                ..
+            })) => current
+                .get("record")
+                .and_then(|value| SignedDoc::from_strict_value(value).ok())
+                .and_then(|doc| AppRecord::verify(&doc, &self.state.meta.identity).ok()),
+            Err(error) => return Err(error),
+        };
+        if let Some(held) = held {
+            let mine = AppRecord::verify(&self.state.record, &self.state.meta.identity)?;
+            if held.cert().app_id() != self.state.meta.app_id {
+                return Err(AppError::InvalidData(
+                    "Switch wire 6.2: an app.put conflict naming another app's record".into(),
+                ));
+            }
+            let mut body = mine.body().clone();
+            body.updated_at = self
+                .now()
+                .max(held.updated_at().saturating_add(1))
+                .max(mine.updated_at().saturating_add(1));
+            let record = AppRecord::sign(&self.state.keys, body)?;
+            let batch = self.record_batch(record.signed())?;
+            let mut tx = self.tx()?;
+            tx.put(key::RECORD, record.signed())?;
+            let pending = PendingRecord {
+                body: batch.body().to_vec(),
+            };
+            tx.put(key::PENDING_RECORD, &pending)?;
+            self.state.record = record.signed().clone();
+            self.state.pending_record = Some(pending);
+            self.commit(tx).await?;
+            self.submit(&batch).await?;
+        }
+        let mut tx = self.tx()?;
+        tx.delete(key::PENDING_RECORD)?;
+        tx.put(key::CURSOR, &self.state.cursor)?;
+        self.state.pending_record = None;
+        self.commit(tx).await
+    }
+
+    /// The listed certificate from the own record in the directory, when the own
+    /// `identity.json` lists another certificate than the one the app presents and it holds
+    /// no `cert.put` for it (Switch spec 3.2 step 3): taken only if the record is signed
+    /// with the app's own signing key, and its certificate renews the one held and has the
+    /// listed hash. The service holds that record, so nothing is delivered.
+    pub(crate) async fn take_listed_cert(&mut self) -> Result<(), AppError> {
+        let me = self.state.meta.app_id;
+        let Some(listed) = self.state.own_doc.listed_cert(&me) else {
+            return Ok(());
+        };
+        if listed == self.state.cert.hash() {
+            return Ok(());
+        }
+        if self
+            .state
+            .renewal
+            .as_ref()
+            .is_some_and(|r| r.hash() == listed)
+        {
+            self.adopt_renewal().await?;
+            return Ok(());
+        }
+        let result = self.client.directory(None).await;
+        let directory = self.take(result).await?;
+        let Some(entry) = directory.apps.into_iter().find(|app| app.app_id == me) else {
+            return Ok(());
+        };
+        let cert = entry.record.cert().clone();
+        if cert.signing_key() == self.state.keys.signing_public()
+            && cert.bundle_key() == self.state.keys.bundle_public()
+            && is_renewal(&self.state.cert, &cert)
+            && cert.hash() == listed
+        {
+            self.take_cert(cert, entry.record.signed().clone(), false)
+                .await?;
+        }
+        Ok(())
+    }
+}

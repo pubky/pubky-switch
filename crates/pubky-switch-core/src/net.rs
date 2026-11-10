@@ -172,11 +172,12 @@ pub enum UrlUse {
     },
 }
 
-/// A URL that passed the syntax, scheme and port checks. Its host's addresses are still to
-/// be checked after resolution, with [`check_addresses`].
+/// A URL that passed the syntax, scheme and port checks. A host name's addresses are still
+/// to be checked after resolution, with [`check_addresses`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CheckedUrl {
-    /// The host name or address literal, without brackets, in lower case.
+    /// The host: a domain name in lower case, or an address literal in its canonical text,
+    /// without brackets.
     pub host: String,
     /// The port: 443 unless the URL names another the policy allows.
     pub port: u16,
@@ -184,10 +185,16 @@ pub struct CheckedUrl {
 
 /// Check a URL's syntax, scheme and port for `use_`, and an address literal host.
 ///
+/// The host must be spelled so that every URL parser reads it as the same host: a
+/// dotted-quad IPv4 address, a bracketed IPv6 address without a zone, or a domain name (see
+/// `is_domain_name`). Any other spelling is refused rather than read the way one parser
+/// would, since the client connects to the host its HTTP library parses.
+///
 /// # Errors
 ///
-/// [`Error::Invalid`] for another scheme, user info, an empty host, a path on a switch
-/// origin, a port the policy doesn't allow, or an address literal that isn't public.
+/// [`Error::Invalid`] for another scheme, user info, a host in another spelling, a path on
+/// a switch origin, a port the policy doesn't allow, or an address literal that isn't
+/// public.
 pub fn check_url(url: &str, use_: &UrlUse) -> Result<CheckedUrl> {
     let Some(rest) = url.strip_prefix("https://") else {
         return invalid("Switch wire 7.1: HTTPS URLs only");
@@ -232,18 +239,51 @@ pub fn check_url(url: &str, use_: &UrlUse) -> Result<CheckedUrl> {
     if !allowed {
         return invalid(format!("Switch wire 7.1: port {port} isn't allowed here"));
     }
-    if host.is_empty() {
-        return invalid("Switch wire 7.1: the URL has no host");
-    }
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        check_addresses(&[ip])?;
-    } else if authority.starts_with('[') {
-        return invalid("Switch wire 7.1: a bracketed host that isn't an IPv6 address");
-    }
-    Ok(CheckedUrl {
-        host: host.to_ascii_lowercase(),
-        port,
-    })
+    let host = if authority.starts_with('[') {
+        let Ok(ip) = host.parse::<Ipv6Addr>() else {
+            return invalid("Switch wire 7.1: a bracketed host that isn't an IPv6 address");
+        };
+        check_addresses(&[IpAddr::V6(ip)])?;
+        ip.to_string()
+    } else if let Ok(ip) = host.parse::<Ipv4Addr>() {
+        check_addresses(&[IpAddr::V4(ip)])?;
+        ip.to_string()
+    } else if is_domain_name(host) {
+        host.to_ascii_lowercase()
+    } else {
+        return invalid(
+            "Switch wire 7.1: the host isn't a dotted-quad IPv4 address, a bracketed IPv6 \
+             address or a domain name",
+        );
+    };
+    Ok(CheckedUrl { host, port })
+}
+
+/// Whether `host` is a domain name in the one spelling every URL parser reads alike: labels
+/// of ASCII letters, digits and hyphens, 1 to 63 bytes each, not starting or ending with a
+/// hyphen, at most 253 bytes in all, no empty label (so no trailing dot), and a last label
+/// that starts with a letter.
+///
+/// A URL parser reads a host whose last label is a number, such as `127.1`, `2130706433`,
+/// `0x7f000001` or `127.0.0.1.`, as an IPv4 address, which the client would then connect to
+/// without resolving it, so without the address check (Switch wire 7.1, 8.2). Escapes,
+/// other characters and non-ASCII names, which a URL parser maps to other hosts, are
+/// refused for the same reason.
+fn is_domain_name(host: &str) -> bool {
+    let label_ok = |label: &str| {
+        (1..=63).contains(&label.len())
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+    };
+    host.len() <= 253
+        && host.split('.').all(label_ok)
+        && host
+            .rsplit('.')
+            .next()
+            .is_some_and(|last| last.starts_with(|c: char| c.is_ascii_alphabetic()))
 }
 
 /// Check every address a host resolves to (Switch wire 8.2).
@@ -358,6 +398,74 @@ mod tests {
         assert!(check_url("https://switch.example:9000", &origin).is_err());
         assert!(check_url("https://[::1]", &origin).is_err());
         assert!(check_url("https://[2606:4700::1111]:08443", &origin).is_err());
+    }
+
+    #[test]
+    fn test_check_url_refuses_hosts_a_url_parser_reads_as_another_address() {
+        let origin = UrlUse::SwitchOrigin {
+            extra_ports: Vec::new(),
+        };
+        for url in [
+            // Short, integer, hex and octal IPv4 forms, which a URL parser reads as
+            // 127.0.0.1 or 10.0.0.1.
+            "https://127.1",
+            "https://127.0.1",
+            "https://2130706433",
+            "https://0x7f000001",
+            "https://0x7f.0.0.1",
+            "https://0177.0.0.1",
+            "https://010.0.0.1",
+            "https://127.000.0.1",
+            // Trailing dots, empty labels and escapes.
+            "https://127.0.0.1.",
+            "https://localhost.",
+            "https://example.com.",
+            "https://.example.com",
+            "https://inbox..example",
+            "https://127%2E0%2E0%2E1",
+            "https://inbox.example\\.evil",
+            // A last label that is a number, or not a name at all.
+            "https://inbox.123",
+            "https://inbox.0x7f",
+            "https://-inbox.example",
+            "https://inbox-.example",
+            "https://inbox_1.example",
+            "https://xn--nxa\u{3b1}.example",
+            "https://inbox\u{3002}example",
+            // IPv6: loopback, mapped loopback in either spelling, zone IDs, non-addresses.
+            "https://[::1]",
+            "https://[0:0:0:0:0:0:0:1]",
+            "https://[::ffff:127.0.0.1]",
+            "https://[::FFFF:7F00:1]",
+            "https://[fe80::1%25eth0]",
+            "https://[fe80::1%eth0]",
+            "https://[inbox.example]",
+            "https://[1.1.1.1]",
+        ] {
+            assert!(check_url(url, &origin).is_err(), "{url}");
+        }
+        assert!(check_url("https://", &origin).is_err());
+        let long = format!("https://{}.example", "a".repeat(64));
+        assert!(check_url(&long, &origin).is_err());
+    }
+
+    #[test]
+    fn test_check_url_normalizes_hosts_it_takes() {
+        let origin = UrlUse::SwitchOrigin {
+            extra_ports: Vec::new(),
+        };
+        for (url, host) in [
+            ("https://Inbox.EXAMPLE", "inbox.example"),
+            ("https://inbox-1.example", "inbox-1.example"),
+            ("https://1.1.1.1", "1.1.1.1"),
+            ("https://[2606:4700:0:0:0:0:0:1111]", "2606:4700::1111"),
+            ("https://[2606:4700::1111]", "2606:4700::1111"),
+            ("https://[2606:4700::ABCD]:443", "2606:4700::abcd"),
+            ("https://[::ffff:1.1.1.1]", "::ffff:1.1.1.1"),
+            ("https://xn--nxasmq6b.example", "xn--nxasmq6b.example"),
+        ] {
+            assert_eq!(check_url(url, &origin).unwrap().host, host, "{url}");
+        }
     }
 
     #[test]
