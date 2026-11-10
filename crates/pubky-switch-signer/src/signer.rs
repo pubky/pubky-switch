@@ -820,13 +820,45 @@ impl Signer {
         if newest.published || self.state.managed_by.is_some() {
             return Ok(());
         }
-        let bytes =
-            serde_json::to_vec(&newest.doc).map_err(|e| SignerError::Records(e.to_string()))?;
-        self.env
+        // A publication may come after a crash, once another install has signed and published
+        // since: it goes out only while this install still signs and the Homeserver holds
+        // nothing newer (Switch spec 4.3).
+        self.switch_at_mark().await?;
+        let held = self
+            .env
             .homeserver
-            .put(IDENTITY_PATH, bytes)
+            .get(IDENTITY_PATH)
             .await
             .map_err(SignerError::Homeserver)?;
+        let held = held
+            .and_then(|bytes| serde_json::from_slice::<SignedDoc>(&bytes).ok())
+            .and_then(|signed| IdentityDoc::verify(&signed, &self.state.identity).ok());
+        let mine = IdentityDoc::verify(&newest.doc, &self.state.identity)?;
+        let already = held
+            .as_ref()
+            .is_some_and(|copy| copy.signed() == mine.signed());
+        if let Some(copy) = held
+            .as_ref()
+            .filter(|copy| copy.version() > mine.version() || copy.generation() > mine.generation())
+        {
+            let alert = Alert::HomeserverAhead {
+                version: copy.version(),
+                high_water_version: mine.version(),
+            };
+            let mut state = self.state.clone();
+            state.alert(alert.clone());
+            self.commit(state, self.flow.clone()).await?;
+            return Err(SignerError::Alarm(alert));
+        }
+        if !already {
+            let bytes =
+                serde_json::to_vec(&newest.doc).map_err(|e| SignerError::Records(e.to_string()))?;
+            self.env
+                .homeserver
+                .put(IDENTITY_PATH, bytes)
+                .await
+                .map_err(SignerError::Homeserver)?;
+        }
         let mut state = self.state.clone();
         state.newest = Some(Newest {
             published: true,

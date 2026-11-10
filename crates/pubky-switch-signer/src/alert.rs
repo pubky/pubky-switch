@@ -59,4 +59,13 @@ pub enum Alert {
     /// still held the newest version this signer delivered, so the signer wrote its backup
     /// again (Switch wire 3.13).
     BackupMissing,
+    /// The Homeserver publishes a newer `identity.json` than the one the switch holds as this
+    /// signer's mark. The signer writes nothing over it: a version the switch never took, or a
+    /// switch behind its Homeserver, is for the user to look into (Switch spec 4.3).
+    HomeserverAhead {
+        /// The Homeserver's version.
+        version: u64,
+        /// The newest version a service accepted from this signer.
+        high_water_version: u64,
+    },
 }
