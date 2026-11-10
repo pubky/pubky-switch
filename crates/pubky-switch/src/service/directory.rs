@@ -120,8 +120,9 @@ impl Service {
                 super::batch::held_app(app, &account.identity_key).map_err(|e| store_error(&e))?,
             );
         }
-        // The current apps, each once, in the order the newest identity.json lists them.
-        let mut listed = Vec::new();
+        // The current apps, in the order the newest identity.json lists them: each once,
+        // since a document naming an App ID twice doesn't verify (Switch wire 3.3).
+        let mut listed: Vec<Value> = Vec::new();
         for entry in &doc.body().apps {
             let Some(app) = apps.iter().find(|app| app.app_id == entry.app_id) else {
                 continue;
@@ -129,17 +130,14 @@ impl Service {
             let Some(record) = &app.record else {
                 continue;
             };
-            if !state.is_current(&app.app_id) || listed.iter().any(|(id, _)| *id == app.app_id) {
+            if !state.is_current(&app.app_id) {
                 continue;
             }
-            listed.push((
-                app.app_id,
-                json!({
-                    "app_id": pubky_switch_core::enc::zbase32_encode(&app.app_id),
-                    "record": record,
-                    "receive_key": app.receive_key,
-                }),
-            ));
+            listed.push(json!({
+                "app_id": pubky_switch_core::enc::zbase32_encode(&app.app_id),
+                "record": record,
+                "receive_key": app.receive_key,
+            }));
         }
         let (directory_version, apps_version) = txn
             .directory_versions()
@@ -148,7 +146,7 @@ impl Service {
         // Members sorted, the order of `http.json`'s directory, which serde_json's map keeps.
         let mut body = json!({
             "identity": doc.signed(),
-            "apps": listed.into_iter().map(|(_, app)| app).collect::<Vec<Value>>(),
+            "apps": listed,
             "directory_version": directory_version,
             "apps_version": apps_version,
         });
