@@ -1771,22 +1771,43 @@ async fn test_key_change_signs_a_kept_batch_again_only_on_stale_generation() {
 async fn test_key_change_drops_a_kept_batch_older_than_the_batch_window() {
     let w = World::new();
     let router = Router::of(&w);
-    let mut app = lists_app(&w, &router).await;
+    let mut app = join_on(
+        &w,
+        &router,
+        Arc::clone(&w.store) as Arc<dyn StateStore>,
+        w.protocol.clone(),
+        &Permission::ALL,
+    )
+    .await;
     let carol = IdentityKey::from_secret(seed("carol/identity")).public();
     w.switch.fail_next(Fault::Unreachable {
         path: "ops".into(),
         after: 0,
     });
-    assert!(app.submit_batch(contact_batch(carol)).await.is_err());
+    let attempt = crate::app::ClaimOp::attempt(CLAIM, 0, ATTEMPT, 3600, None);
+    assert!(
+        app.submit_batch(contact_batch(carol).op(attempt.kind()))
+            .await
+            .is_err()
+    );
     w.clock
         .advance_ms(crate::app::provider::KEPT_BATCH_ANSWER_MS);
     let changed = change_key(&w, &router);
     let report = app.receive(None).await.unwrap();
-    // The answer can't tell any more: dropped, and the protocol told.
+    // The answer can't tell any more: dropped, and the protocol told of its attempt.
     assert!(
         has(&report.events, |e| matches!(
             e,
             AppEvent::KeptBatchDropped { .. }
+        )),
+        "{:?}",
+        report.events
+    );
+    assert!(
+        has(&report.events, |e| matches!(
+            e,
+            AppEvent::AttemptDropped { claim_key, attempt_id }
+                if *claim_key == CLAIM && *attempt_id == ATTEMPT
         )),
         "{:?}",
         report.events

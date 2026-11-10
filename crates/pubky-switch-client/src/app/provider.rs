@@ -212,6 +212,24 @@ fn corrupt() -> AppError {
     AppError::Store(StoreError::Corrupt)
 }
 
+/// A kept batch dropped at a provider change: reported, with each `attempt` in it, so the
+/// protocol treats those obligations as uncertain (Switch spec 12.5 "Kept batches", 12.6
+/// step 5).
+fn dropped(id: &[u8; 16], batch: &Batch, events: &mut Vec<AppEvent>) {
+    events.push(AppEvent::KeptBatchDropped { batch_id: *id });
+    for op in batch.ops() {
+        if let OpKind::Claim(fields) = &op.body().kind
+            && fields.kind == ClaimType::Attempt
+            && let Ok(entry) = fields.check()
+        {
+            events.push(AppEvent::AttemptDropped {
+                claim_key: entry.claim_key,
+                attempt_id: entry.attempt_id,
+            });
+        }
+    }
+}
+
 /// A kept batch's operations, with their conditions, to sign again.
 fn ops_of(batch: &Batch) -> Vec<(Vec<Condition>, OpKind)> {
     batch
@@ -1029,21 +1047,21 @@ impl App {
                 events.push(AppEvent::KeptBatchApplied { batch_id: id });
                 continue;
             }
+            let kept = Batch::from_body(pending.body.clone())?;
             if resend_first {
                 if !answer_decides(pending.kept_ms) {
                     Self::replace_kept_batch(&id, None, tx)?;
-                    events.push(AppEvent::KeptBatchDropped { batch_id: id });
+                    dropped(&id, &kept, &mut events);
                 }
                 continue;
             }
-            let kept = Batch::from_body(pending.body.clone())?;
             let ops = ops_of(&kept);
             let attempts = ops.iter().any(|(_, kind)| {
                 matches!(kind, OpKind::Claim(claim) if claim.kind == ClaimType::Attempt)
             });
             if carry == Carry::AfterLoss && attempts {
                 Self::replace_kept_batch(&id, None, tx)?;
-                events.push(AppEvent::KeptBatchDropped { batch_id: id });
+                dropped(&id, &kept, &mut events);
                 continue;
             }
             let signed = self.sign_ops(ops, None)?;

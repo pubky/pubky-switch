@@ -115,8 +115,8 @@ enum Sent {
     Conflict(serde_json::Value),
     StaleEpoch,
     Quota,
-    /// Refused for good: the entry is stored and passed.
-    Refused,
+    /// Refused for good, with the error code: the entry is stored and passed.
+    Refused(String),
 }
 
 /// An entry as the feed carries it, or as the app stored it.
@@ -641,6 +641,7 @@ impl App {
                     ParkReason::TooManyOperations,
                     read,
                 )?;
+                self.effect_refused(entry, &received, None);
                 return Ok(Step::Pass);
             }
             if effect.ops.is_empty() {
@@ -684,8 +685,9 @@ impl App {
                     self.park(entry, &received.plaintext, ParkReason::Quota, read)?;
                     return Ok(Step::Pass);
                 }
-                Sent::Refused => {
+                Sent::Refused(code) => {
                     self.park(entry, &received.plaintext, ParkReason::Refused, read)?;
+                    self.effect_refused(entry, &received, Some(code));
                     return Ok(Step::Pass);
                 }
             }
@@ -886,7 +888,7 @@ impl App {
                         return Err(error);
                     }
                     // This effect is refused for good, the app's other writes aren't.
-                    _ => Sent::Refused,
+                    (code, _) => Sent::Refused(code.as_str().to_owned()),
                 };
                 self.drop_pending_effect().await?;
                 return Ok(sent);
@@ -995,7 +997,7 @@ impl App {
             }),
             // The entry is read again from the cursor, which didn't pass it, or from the
             // local store, and its effect built again.
-            Sent::Conflict(_) | Sent::StaleEpoch | Sent::Quota | Sent::Refused => {}
+            Sent::Conflict(_) | Sent::StaleEpoch | Sent::Quota | Sent::Refused(_) => {}
         }
         Ok(())
     }
@@ -1056,6 +1058,17 @@ impl App {
             reason,
         });
         Ok(())
+    }
+
+    /// Tell the protocol that the effect of `received` won't be sent again (Switch spec 8.2).
+    fn effect_refused(&mut self, entry: &Entry, received: &Received, code: Option<String>) {
+        self.events.push(AppEvent::EffectRefused {
+            seq: entry.seq,
+            sender: entry.sender,
+            msg_id: received.message.msg_id.clone(),
+            kind: received.message.kind.clone(),
+            code,
+        });
     }
 
     /// Entries stored locally, checked and applied again now (Switch spec 8.2); the cursor is

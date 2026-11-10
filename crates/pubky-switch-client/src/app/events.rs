@@ -54,6 +54,22 @@ pub enum AppEvent {
         /// Why.
         reason: ParkReason,
     },
+    /// A received message's effect was refused for good, or has more operations than one
+    /// batch takes with the cursor move: its entry was stored locally and passed
+    /// ([`AppEvent::Parked`]), and the effect isn't sent again (Switch spec 8.2). The
+    /// protocol may build it again in another form.
+    EffectRefused {
+        /// The entry's `seq`.
+        seq: u64,
+        /// The sender identity.
+        sender: [u8; 32],
+        /// The message ID.
+        msg_id: String,
+        /// The message kind.
+        kind: String,
+        /// The error code of the refusal; `None` for an effect over one batch.
+        code: Option<String>,
+    },
     /// An entry stored locally was processed.
     Unparked {
         /// The entry's `seq`.
@@ -258,12 +274,24 @@ pub enum AppEvent {
         /// The batch ID it has now.
         new_batch_id: [u8; 16],
     },
-    /// A kept batch holding an `attempt` wasn't carried to the new service after a provider
-    /// loss: no automatic attempt is made on an obligation from before the loss (Switch spec
-    /// 12.6 step 5). The protocol decides what to write instead.
+    /// A kept batch wasn't carried to the new service: one holding an `attempt` after a
+    /// provider loss, since no automatic attempt is made on an obligation from before the
+    /// loss (Switch spec 12.6 step 5), or one kept longer than a resend's answer can tell
+    /// whether it was applied (Switch spec 12.5 "Kept batches"). Each attempt in it follows
+    /// as [`AppEvent::AttemptDropped`]. The protocol decides what to write instead.
     KeptBatchDropped {
         /// The batch ID.
         batch_id: [u8; 16],
+    },
+    /// An `attempt` in a kept batch that was dropped ([`AppEvent::KeptBatchDropped`]): it
+    /// is never signed again, and whether it was applied can't be known, so its obligation
+    /// is uncertain (Switch spec 12.5 "Kept batches", 12.6 step 5). The protocol treats it
+    /// so.
+    AttemptDropped {
+        /// The claim key.
+        claim_key: [u8; 32],
+        /// The attempt.
+        attempt_id: [u8; 16],
     },
     /// The account the app used is gone: the service answers as for an identity it doesn't
     /// host and the identity publishes no `identity.json` (Switch spec 12.7).

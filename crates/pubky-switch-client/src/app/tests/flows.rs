@@ -1612,6 +1612,17 @@ async fn test_app_effect_refused_for_good_is_parked_and_the_feed_goes_on() {
         e,
         AppEvent::Parked { seq, reason: ParkReason::Refused } if *seq == refused
     )));
+    // The protocol is told, with the code, so it may build the effect another way (Switch
+    // spec 8.2).
+    assert!(
+        has(&report.events, |e| matches!(
+            e,
+            AppEvent::EffectRefused { seq, code: Some(code), kind, .. }
+                if *seq == refused && code == "permission_missing" && kind == "sample.note"
+        )),
+        "{:?}",
+        report.events
+    );
     assert!(received(&report.events, after), "{:?}", report.events);
     assert!(app.cursor().seq >= after);
     assert_eq!(w.effects(), 1);
@@ -1711,6 +1722,10 @@ async fn test_app_effect_over_one_batch_is_parked_and_the_feed_goes_on() {
         assert!(has(&report.events, |e| matches!(
             e,
             AppEvent::Parked { seq: s, reason: ParkReason::TooManyOperations } if *s == seq
+        )));
+        assert!(has(&report.events, |e| matches!(
+            e,
+            AppEvent::EffectRefused { seq: s, code: None, .. } if *s == seq
         )));
     }
     assert!(app.cursor().seq >= second);
