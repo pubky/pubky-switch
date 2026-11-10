@@ -122,6 +122,102 @@ pub fn check_json_as(bytes: &[u8], doc: Doc<'_>) -> Result<()> {
     Ok(())
 }
 
+/// The bytes a top-level member's value takes in a JSON object as written, from its first
+/// byte to its last, whitespace and escapes inside it included (Switch wire 6.2 measures an
+/// invite code's `context` so, never a re-serialization). `None` if `bytes` isn't an object
+/// or has no such member. Meant for a document the strict reader took, which has no
+/// duplicate member names.
+pub(crate) fn member_span(bytes: &[u8], name: &str) -> Option<std::ops::Range<usize>> {
+    let mut i = skip_whitespace(bytes, 0);
+    if bytes.get(i) != Some(&b'{') {
+        return None;
+    }
+    i = i.saturating_add(1);
+    loop {
+        i = skip_whitespace(bytes, i);
+        match bytes.get(i)? {
+            b'}' => return None,
+            b',' => {
+                i = i.saturating_add(1);
+                continue;
+            }
+            _ => {}
+        }
+        let key_end = skip_string(bytes, i)?;
+        let key: String = serde_json::from_slice(bytes.get(i..key_end)?).ok()?;
+        i = skip_whitespace(bytes, key_end);
+        if bytes.get(i) != Some(&b':') {
+            return None;
+        }
+        let start = skip_whitespace(bytes, i.saturating_add(1));
+        let end = skip_value(bytes, start)?;
+        if key == name {
+            return Some(start..end);
+        }
+        i = end;
+    }
+}
+
+fn skip_whitespace(bytes: &[u8], mut i: usize) -> usize {
+    while matches!(bytes.get(i), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+        i = i.saturating_add(1);
+    }
+    i
+}
+
+/// The index just after the string that starts at `i`.
+fn skip_string(bytes: &[u8], i: usize) -> Option<usize> {
+    if bytes.get(i) != Some(&b'"') {
+        return None;
+    }
+    let mut j = i.saturating_add(1);
+    loop {
+        match bytes.get(j)? {
+            b'\\' => j = j.saturating_add(2),
+            b'"' => return Some(j.saturating_add(1)),
+            _ => j = j.saturating_add(1),
+        }
+    }
+}
+
+/// The index just after the value that starts at `i`.
+fn skip_value(bytes: &[u8], i: usize) -> Option<usize> {
+    match bytes.get(i)? {
+        b'"' => skip_string(bytes, i),
+        b'{' | b'[' => {
+            let mut depth = 0usize;
+            let mut j = i;
+            loop {
+                match bytes.get(j)? {
+                    b'"' => {
+                        j = skip_string(bytes, j)?;
+                        continue;
+                    }
+                    b'{' | b'[' => depth = depth.saturating_add(1),
+                    b'}' | b']' => {
+                        depth = depth.checked_sub(1)?;
+                        if depth == 0 {
+                            return Some(j.saturating_add(1));
+                        }
+                    }
+                    _ => {}
+                }
+                j = j.saturating_add(1);
+            }
+        }
+        _ => {
+            let mut j = i;
+            while bytes
+                .get(j)
+                .is_some_and(|b| !matches!(b, b',' | b'}' | b']' | b' ' | b'\t' | b'\n' | b'\r'))
+            {
+                j = j.saturating_add(1);
+            }
+            Some(j)
+        }
+    }
+}
+
 /// Check that `text` is a lower-case UUID version 4: `8-4-4-4-12` hex, version nibble 4,
 /// variant bits `10` (Switch wire 1.7).
 ///
@@ -449,6 +545,18 @@ mod tests {
             member: "proof",
         },
     ];
+
+    #[test]
+    fn test_member_span_measures_the_value_as_written() {
+        let text = br#" { "a" : 1, "c\u006fntext" : { "k" : [ "x\"}" , 2 ] } , "b":null}"#;
+        let span = member_span(text, "context").unwrap();
+        assert_eq!(&text[span], br#"{ "k" : [ "x\"}" , 2 ] }"#);
+        assert_eq!(&text[member_span(text, "a").unwrap()], b"1");
+        assert_eq!(&text[member_span(text, "b").unwrap()], b"null");
+        assert_eq!(member_span(text, "d"), None);
+        assert_eq!(member_span(b"[1]", "a"), None);
+        assert_eq!(member_span(br#"{"a":"#, "a"), None);
+    }
 
     #[test]
     fn test_strict_json_refuses_duplicates_and_trailing_values() {

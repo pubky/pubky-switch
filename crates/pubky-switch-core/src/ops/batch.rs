@@ -188,6 +188,22 @@ impl OpsRequest {
             Entry::Signed(_) => None,
         })
     }
+
+    /// The batch rules that depend on the caller (Switch wire 6.2 "The signer's operations",
+    /// 6.4 step 4): the signer has no cursor, so a `cursor.set` in its batch is refused.
+    /// `signer` is whether the request verified with the identity key.
+    ///
+    /// # Errors
+    ///
+    /// `400 bad_request`.
+    pub fn check_caller(&self, signer: bool) -> std::result::Result<(), Refusal> {
+        if signer && self.cursor().is_some() {
+            return Err(Refusal::bad_request(
+                "Switch wire 6.2: the signer's batch carries no cursor.set",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// The batch rules (Switch wire 6.4 step 4) for a request's verified signed operations: every
@@ -674,6 +690,21 @@ mod tests {
         assert!(OpsRequest::parse(nine.as_bytes()).is_err());
         let two = br#"{"ops":[{"op":"cursor.set","position":"1:0"},{"op":"cursor.set","position":"1:1"}]}"#;
         assert!(OpsRequest::parse(two).is_err());
+    }
+
+    #[test]
+    fn test_ops_request_signer_carries_no_cursor() {
+        let ops = batch(vec![claim(ClaimType::Attempt)]);
+        let position = Position {
+            generation: 1,
+            seq: 0,
+        };
+        let with_cursor = OpsRequest::new(&ops, Some(position));
+        with_cursor.check_caller(false).unwrap();
+        assert_eq!(with_cursor.check_caller(true).unwrap_err().status(), 400);
+        let cursor_only = OpsRequest::new(&[], Some(position));
+        assert_eq!(cursor_only.check_caller(true).unwrap_err().status(), 400);
+        OpsRequest::new(&ops, None).check_caller(true).unwrap();
     }
 
     #[test]

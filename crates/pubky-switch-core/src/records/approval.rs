@@ -102,7 +102,7 @@ impl Approval {
     /// An approval from its parts, checked as the signer sends it: `cert` names the
     /// request's App ID and keys, `identity` lists it for the app, and the parts, in
     /// `first_epoch` order without overlap, cover every data epoch from 1 to the document's
-    /// `data_epoch`.
+    /// `data_epoch`, and none goes past it.
     ///
     /// # Errors
     ///
@@ -125,6 +125,9 @@ impl Approval {
         let ranges: Vec<(u64, u64)> = bundles.iter().map(BundlePart::range).collect();
         if !covers_from_one(&ranges, identity.data_epoch()) {
             return invalid("Switch wire 3.10: the parts don't cover epochs 1 to data_epoch");
+        }
+        if ranges.iter().any(|(_, last)| *last > identity.data_epoch()) {
+            return invalid("Switch wire 3.10: a part goes past data_epoch");
         }
         Ok(Self {
             request: request.hash(),
@@ -183,7 +186,7 @@ impl Approval {
     ///    yet: every part names the approval's certificate and is taken, so each holds
     ///    exactly one key for each scope with keys (`has_keys`) of the certificate and each
     ///    data epoch of its range, and together they cover every epoch from 1 to the
-    ///    document's `data_epoch`.
+    ///    document's `data_epoch`, and none goes past it.
     ///
     /// Unknown members are ignored (Switch wire 1.1). The caller verifies the companion
     /// claim's signature first ([`ApprovalClaim::verify`]).
@@ -247,6 +250,16 @@ impl Approval {
             return invalid(
                 "Switch wire 3.10 step 4: the parts don't cover epochs 1 to data_epoch",
             );
+        }
+        // At approval there is no next epoch (Switch wire 3.5 "Reading"): the signer makes
+        // the bundle for the document the approval carries, so no part goes past its
+        // `data_epoch`.
+        if reading
+            .taken
+            .iter()
+            .any(|(_, last)| *last > doc.data_epoch())
+        {
+            return invalid("Switch wire 3.10 step 4: a part goes past data_epoch");
         }
         let Some(naming_key) = reading.naming_key else {
             return invalid("Switch wire 3.10 step 4: no part");
@@ -548,6 +561,36 @@ mod tests {
         };
         let gap = serde_json::to_value(vec![part]).unwrap();
         assert_eq!(refuse(&|v| v["bundles"] = gap.clone()), 4);
+        // Parts past the document's data_epoch: at approval there is no next epoch, so a
+        // part through epoch 3 at data_epoch 2 is refused, whole or split.
+        let through_three = KeyBundleContents::derive(&identity(), &c, 1, 3, &has_keys).unwrap();
+        let past = BundlePart {
+            bundle: KeyBundle::seal(&identity(), &c, &through_three).unwrap(),
+            first_epoch: 1,
+            last_epoch: 3,
+        };
+        let past = serde_json::to_value(vec![past]).unwrap();
+        let error = read(
+            &serde_json::to_vec(&{
+                let mut v = good.clone();
+                v["bundles"] = past.clone();
+                v
+            })
+            .unwrap(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("past data_epoch"), "{error}");
+        let third = KeyBundleContents::derive(&identity(), &c, 3, 3, &has_keys).unwrap();
+        let mut split = good["bundles"].clone();
+        split.as_array_mut().unwrap().push(
+            serde_json::to_value(BundlePart {
+                bundle: KeyBundle::seal(&identity(), &c, &third).unwrap(),
+                first_epoch: 3,
+                last_epoch: 3,
+            })
+            .unwrap(),
+        );
+        assert_eq!(refuse(&|v| v["bundles"] = split.clone()), 4);
     }
 
     #[test]
@@ -558,6 +601,8 @@ mod tests {
         Approval::new(&request(), c.clone(), doc.clone(), bundles.clone()).unwrap();
         let short = seal_bundle_parts(&identity(), &c, 1, 1, &has_keys).unwrap();
         assert!(Approval::new(&request(), c.clone(), doc.clone(), short).is_err());
+        let past = seal_bundle_parts(&identity(), &c, 1, 3, &has_keys).unwrap();
+        assert!(Approval::new(&request(), c.clone(), doc.clone(), past).is_err());
         let other = AppCert::issue(
             &identity(),
             crate::records::fixtures::cert_body_for(&other_app(), &scopes()),

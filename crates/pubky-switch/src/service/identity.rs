@@ -5,7 +5,7 @@ use pubky_switch_core::{
     chain::{ItemType, ProofBody, ProofState, TransitionProof, item_hash},
     enc::b64,
     http::IdentityDelivery,
-    records::{AccountView, Delivery, DeliveryRefusal, IdentityDoc, check_delivery},
+    records::{AccountView, Delivery, DeliveryRefusal, IdentityDoc, KeptProofs, check_delivery},
 };
 use serde_json::{Value, json};
 
@@ -94,7 +94,7 @@ impl Service {
             pending_key,
             kept_app_ids: &kept_app_ids,
             // No record or claim proofs are kept before operations are served.
-            proof_keys: &[],
+            kept_proofs: KeptProofs::default(),
         };
         match check_delivery(&view, &doc, delivery.prev.as_ref()) {
             Err(DeliveryRefusal::BadRequest(why)) => Err(ApiError::bad_request(why)),

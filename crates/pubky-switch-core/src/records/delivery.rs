@@ -24,9 +24,36 @@ pub struct AccountView<'a> {
     /// The App IDs the service revoked or saw depart, and those enrollments named, kept for
     /// good.
     pub kept_app_ids: &'a [[u8; 16]],
-    /// Each generation that some current record's kept proof names, with the key that
-    /// verifies those proofs.
-    pub proof_keys: &'a [(u64, [u8; 32])],
+    /// The kept proofs: each generation that some current record's or live claim's entry's
+    /// kept proof names, with the key that verifies those proofs.
+    pub kept_proofs: KeptProofs<'a>,
+}
+
+/// The transition proofs a switch keeps that are checked with their generation's service key
+/// (Switch wire 3.3, "Service keys"): the proof of each current record's write (Switch wire
+/// 7.4.9) and the proof of each entry of a live claim (Switch wire 6.8). Each kind is given
+/// as the generations its proofs name, with the key that verifies them; a generation may
+/// appear in both, and more than once.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KeptProofs<'a> {
+    /// Each generation some current record's kept proof names, with its key.
+    pub records: &'a [(u64, [u8; 32])],
+    /// Each generation some live claim's entry proof names, with its key.
+    pub claim_entries: &'a [(u64, [u8; 32])],
+}
+
+impl KeptProofs<'_> {
+    /// Every kept proof's generation and key, records' first.
+    fn all(&self) -> impl Iterator<Item = &(u64, [u8; 32])> {
+        self.records.iter().chain(self.claim_entries)
+    }
+
+    /// The generations whose service keys a document must keep (Switch wire 3.3, 7.4.12):
+    /// those some kept proof names, less the ones `recovery_from` declares lost, ascending,
+    /// each once. This is the `proof_generations` that `GET /apps` reports.
+    pub fn generations(&self, recovery_from: Option<u64>) -> Vec<u64> {
+        without_lost(self.all().map(|(g, _)| *g), recovery_from)
+    }
 }
 
 /// How a generation change is taken at the service (Switch wire 3.3).
@@ -97,7 +124,7 @@ pub fn check_delivery(
             "Switch wire 3.3: more apps than the app limit",
         ));
     }
-    if let Err(left_out) = check_kept_service_keys(doc, account.proof_keys) {
+    if let Err(left_out) = check_kept_service_keys(doc, &account.kept_proofs) {
         return Err(DeliveryRefusal::Conflict {
             proof_generations: left_out,
         });
@@ -163,12 +190,21 @@ pub fn check_delivery(
     Ok(Delivery::New(change))
 }
 
-/// The generations a document must keep the service key of (Switch wire 3.3): those given,
-/// less the ones `recovery_from` declares lost (it and earlier), ascending, each once.
-pub fn needed_generations(generations: &[u64], recovery_from: Option<u64>) -> Vec<u64> {
+/// The generations a document must keep the service key of (Switch wire 3.3, 7.4.12), the
+/// `proof_generations` that `GET /apps` reports: those some current record's kept proof names
+/// (`records`) and those some live claim's entry proof names (`claim_entries`), less the ones
+/// `recovery_from` declares lost (it and earlier), ascending, each once.
+pub fn needed_generations(
+    records: &[u64],
+    claim_entries: &[u64],
+    recovery_from: Option<u64>,
+) -> Vec<u64> {
+    without_lost(records.iter().chain(claim_entries).copied(), recovery_from)
+}
+
+/// `generations` less the ones `recovery_from` declares lost, ascending, each once.
+fn without_lost(generations: impl Iterator<Item = u64>, recovery_from: Option<u64>) -> Vec<u64> {
     let mut out: Vec<u64> = generations
-        .iter()
-        .copied()
         .filter(|g| recovery_from.is_none_or(|lost| *g > lost))
         .collect();
     out.sort_unstable();
@@ -178,7 +214,9 @@ pub fn needed_generations(generations: &[u64], recovery_from: Option<u64>) -> Ve
 
 /// The service's check of the kept service keys (Switch wire 3.3): the document gives, in
 /// `inbox.service_key` or `service_keys`, the key that verifies the kept proofs of every
-/// generation in `proof_keys`, except those it declares lost.
+/// generation they name, current records' and live claims' entries' alike, except those it
+/// declares lost. A generation counts as left out unless every kept proof of it verifies
+/// with the key the document gives for it.
 ///
 /// # Errors
 ///
@@ -186,14 +224,15 @@ pub fn needed_generations(generations: &[u64], recovery_from: Option<u64>) -> Ve
 /// `current.proof_generations`.
 pub fn check_kept_service_keys(
     doc: &IdentityDoc,
-    proof_keys: &[(u64, [u8; 32])],
+    kept: &KeptProofs<'_>,
 ) -> std::result::Result<(), Vec<u64>> {
-    let generations: Vec<u64> = proof_keys.iter().map(|(g, _)| *g).collect();
-    let left_out: Vec<u64> = needed_generations(&generations, doc.body().recovery_from)
+    let left_out: Vec<u64> = kept
+        .generations(doc.body().recovery_from)
         .into_iter()
         .filter(|g| {
-            let key = proof_keys.iter().find(|(x, _)| x == g).map(|(_, k)| *k);
-            doc.service_key_of(*g) != key
+            let given = doc.service_key_of(*g);
+            kept.all()
+                .any(|(x, key)| x == g && given.as_ref() != Some(key))
         })
         .collect();
     if left_out.is_empty() {
@@ -240,7 +279,7 @@ pub fn signer_service_keys(
             .chain(std::iter::once(outgoing.generation))
             .collect(),
     };
-    let generations = needed_generations(&generations, recovery_from);
+    let generations = without_lost(generations.into_iter(), recovery_from);
     if generations.len() > MAX_SERVICE_KEYS {
         return invalid("Switch wire 3.3: the move or key change needs more than 256 service keys");
     }
@@ -291,7 +330,7 @@ mod tests {
             origin: ORIGIN,
             pending_key: Some([9; 32]),
             kept_app_ids: &[],
-            proof_keys: &[],
+            kept_proofs: KeptProofs::default(),
         }
     }
 
@@ -421,6 +460,14 @@ mod tests {
         check_delivery(&view, &sign(body(2)), Some(&purged.hash())).unwrap();
     }
 
+    /// Kept proofs of current records only.
+    fn records(keys: &[(u64, [u8; 32])]) -> KeptProofs<'_> {
+        KeptProofs {
+            records: keys,
+            claim_entries: &[],
+        }
+    }
+
     #[test]
     fn test_kept_service_keys() {
         let mut next = body(7);
@@ -430,18 +477,23 @@ mod tests {
             key: [8; 32],
         }];
         let doc = sign(next.clone());
-        check_kept_service_keys(&doc, &[(1, [8; 32]), (2, [8; 32])]).unwrap();
-        assert_eq!(check_kept_service_keys(&doc, &[(1, [6; 32])]), Err(vec![1]));
+        check_kept_service_keys(&doc, &records(&[(1, [8; 32]), (2, [8; 32])])).unwrap();
+        assert_eq!(
+            check_kept_service_keys(&doc, &records(&[(1, [6; 32])])),
+            Err(vec![1])
+        );
         next.service_keys.clear();
         let without = sign(next.clone());
         assert_eq!(
-            check_kept_service_keys(&without, &[(1, [8; 32])]),
+            check_kept_service_keys(&without, &records(&[(1, [8; 32])])),
             Err(vec![1])
         );
         next.recovery_from = Some(1);
-        check_kept_service_keys(&sign(next), &[(1, [8; 32])]).expect("a lost generation is exempt");
+        check_kept_service_keys(&sign(next), &records(&[(1, [8; 32])]))
+            .expect("a lost generation is exempt");
+        let kept = [(1, [8; 32])];
         let view = AccountView {
-            proof_keys: &[(1, [8; 32])],
+            kept_proofs: records(&kept),
             ..account(None)
         };
         assert_eq!(
@@ -450,6 +502,56 @@ mod tests {
                 proof_generations: vec![1]
             })
         );
+    }
+
+    #[test]
+    fn test_kept_service_keys_claim_entries() {
+        let mut next = body(7);
+        next.generation = 2;
+        next.service_keys = vec![ServiceKeyEntry {
+            generation: 1,
+            key: [8; 32],
+        }];
+        let doc = sign(next.clone());
+        // A live claim's entry proof of generation 1, with no record's: its key is kept.
+        let entries = [(1, [8; 32])];
+        let kept = KeptProofs {
+            records: &[],
+            claim_entries: &entries,
+        };
+        assert_eq!(kept.generations(None), vec![1]);
+        check_kept_service_keys(&doc, &kept).unwrap();
+        next.service_keys.clear();
+        let without = sign(next.clone());
+        assert_eq!(check_kept_service_keys(&without, &kept), Err(vec![1]));
+        let view = AccountView {
+            kept_proofs: kept,
+            ..account(None)
+        };
+        assert_eq!(
+            check_delivery(&view, &without, None),
+            Err(DeliveryRefusal::Conflict {
+                proof_generations: vec![1]
+            })
+        );
+        // A record's proof and an entry's of one generation must both verify with its key.
+        let records = [(1, [8; 32])];
+        let other = [(1, [6; 32])];
+        let split = KeptProofs {
+            records: &records,
+            claim_entries: &other,
+        };
+        assert_eq!(check_kept_service_keys(&doc, &split), Err(vec![1]));
+    }
+
+    #[test]
+    fn test_needed_generations_cover_claim_entries() {
+        // Records' and live claims' entries' generations together, ascending, each once.
+        assert_eq!(needed_generations(&[3, 2], &[1, 3], None), vec![1, 2, 3]);
+        assert_eq!(needed_generations(&[], &[2], None), vec![2]);
+        // Generations recovery_from declares lost are left out, an entry's too.
+        assert_eq!(needed_generations(&[3], &[1, 2], Some(2)), vec![3]);
+        assert!(needed_generations(&[], &[1], Some(1)).is_empty());
     }
 
     #[test]
