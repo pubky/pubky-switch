@@ -213,7 +213,7 @@ impl SwitchClient {
         let key = self.pinned_key().ok_or(ClientError::Unpinned)?;
         let head = o.head("head")?;
         verify_head(&head, &key, &self.account())?;
-        let docs = o.each("proofs", read::doc)?;
+        let docs = o.required_each("proofs", read::doc)?;
         let proofs = bind_answer(&batch.ops, &docs, proof_key, &self.account())?;
         Ok(Submitted { proofs, head })
     }

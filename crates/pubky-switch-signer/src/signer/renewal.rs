@@ -273,10 +273,29 @@ impl Signer {
                 .bundle_parts
                 .iter()
                 .any(|p| p.app_id == listed.app_id && p.cert != listed.cert);
+            // The parts this signer stored for the listed certificate that the switch still
+            // holds: the app may not have fetched them, so the next part starts after them.
+            let stored: Vec<(u64, u64)> = self
+                .state
+                .bundle_parts
+                .iter()
+                .filter(|p| p.app_id == listed.app_id && p.cert == listed.cert)
+                .map(|p| (p.first_epoch, p.last_epoch))
+                .filter(|(first, last)| {
+                    status
+                        .bundle_ranges
+                        .iter()
+                        .any(|r| r.first == *first && r.last == *last)
+                })
+                .collect();
             let first = if foreign {
                 1
             } else {
-                incremental_first_epoch(status.keys_through, status.full_bundle_requested.is_some())
+                incremental_first_epoch(
+                    status.keys_through,
+                    &stored,
+                    status.full_bundle_requested.is_some(),
+                )
             };
             if first > last {
                 continue;

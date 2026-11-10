@@ -33,9 +33,33 @@ pub enum StoreError {
         /// The schema version the value carries.
         found: u32,
     },
+    /// A write batch, or one value in it, over the working sizes
+    /// ([`crate::store::MAX_VALUE_BYTES`], [`crate::store::MAX_BATCH_BYTES`]), refused before
+    /// the host sees it. Nothing was applied. It is the writes' fault, not the store's: the
+    /// same writes are refused again, however often they are retried.
+    #[error("the writes would take {size} bytes, over the {cap}-byte size")]
+    TooLarge {
+        /// The size in bytes of the value, or of the batch with the refused write.
+        size: u64,
+        /// The cap.
+        cap: u64,
+    },
     /// Any other failure, described by the host. Nothing was applied.
     #[error("store: {0}")]
     Other(String),
+}
+
+impl From<BatchError> for StoreError {
+    /// A size refusal is [`StoreError::TooLarge`]; a write in another namespace,
+    /// [`StoreError::Other`].
+    fn from(error: BatchError) -> Self {
+        match error {
+            BatchError::ValueTooLarge { size, cap } | BatchError::BatchTooLarge { size, cap } => {
+                StoreError::TooLarge { size, cap }
+            }
+            BatchError::Namespace => StoreError::Other(error.to_string()),
+        }
+    }
 }
 
 /// A write batch over the working sizes, refused before the host sees it

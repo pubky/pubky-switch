@@ -280,6 +280,31 @@ fn item_json(row: &FeedRow, shown: Shown) -> Vec<u8> {
     out
 }
 
+/// An inbox entry's feed item (Switch wire 7.5), in the member order of the wire's example
+/// (7.4.4): `type, seq, entry_id, sender, cert, accepted_at`, the invite code's `context` as
+/// stored when one admitted the sender, then `envelope`.
+fn entry_json(entry: &crate::store::StoredEntry) -> Vec<u8> {
+    let mut out = b"{\"type\":\"entry\",\"seq\":".to_vec();
+    out.extend_from_slice(entry.seq.to_string().as_bytes());
+    out.extend_from_slice(b",\"entry_id\":\"");
+    out.extend_from_slice(pubky_switch_core::enc::b64(&entry.entry_id).as_bytes());
+    out.extend_from_slice(b"\",\"sender\":\"");
+    out.extend_from_slice(pubky_switch_core::enc::pubky_id(&entry.sender).as_bytes());
+    out.extend_from_slice(b"\",\"cert\":");
+    out.extend_from_slice(&doc_json(&entry.cert));
+    out.extend_from_slice(b",\"accepted_at\":\"");
+    out.extend_from_slice(pubky_switch_core::time::rfc3339(entry.accepted_at_ms).as_bytes());
+    out.push(b'"');
+    if let Some(context) = &entry.context {
+        out.extend_from_slice(b",\"context\":");
+        out.extend_from_slice(context);
+    }
+    out.extend_from_slice(b",\"envelope\":\"");
+    out.extend_from_slice(pubky_switch_core::enc::b64(&entry.envelope).as_bytes());
+    out.extend_from_slice(b"\"}");
+    out
+}
+
 /// A signed document's carrying form, `{"body","sig"}` (Switch wire 2.2).
 fn doc_json(doc: &pubky_switch_core::sig::SignedDoc) -> Vec<u8> {
     // Two strings: their serialization can't fail; the empty object stands in if it did.
@@ -424,6 +449,28 @@ impl PageBuilder {
 }
 
 impl PageReader for PageBuilder {
+    /// An entry shows to its target apps only, and to no other app at all: no stub, and
+    /// nothing counted against the page's limit or budget (Switch wire 7.5). The page's
+    /// query reads only the entries wrapped to the reader (`store::feed::read_feed`), so
+    /// every entry seen here is one. It is never part of a batch.
+    fn take_entry(&mut self, snapshot: &FeedSnapshot, entry: crate::store::StoredEntry) -> bool {
+        if self.cert.is_none() {
+            return false;
+        }
+        if entry.seq > snapshot.window_end {
+            return false;
+        }
+        if !self.close_group() {
+            return false;
+        }
+        let item = entry_json(&entry);
+        self.group_bytes = self.group_bytes.saturating_add(item.len());
+        self.group.push(item);
+        self.group_batch = None;
+        self.group_last = entry.seq;
+        true
+    }
+
     /// Check the reader against the snapshot as a fresh request is checked (Switch wire 7.2):
     /// the account's key unchanged; the certificate it is checked against, with the key its
     /// request verified with; unexpired at the page's service time; not revoked or departed,
@@ -464,15 +511,6 @@ impl PageReader for PageBuilder {
                         return false;
                     }
                 };
-                // The staged gate of Switch wire 7.3 step 7: a version delivered during the
-                // wait that no longer names this service ends the page.
-                if !super::rules::names_this_service(doc.as_ref(), origin, service_public) {
-                    self.refusal = Some(Stop::Refused(ApiError::new(
-                        ErrorCode::Staged,
-                        "7.3: the account isn't named by its identity.json",
-                    )));
-                    return false;
-                }
                 match check_own_app(
                     identity_key,
                     doc.as_ref(),
@@ -482,6 +520,16 @@ impl PageReader for PageBuilder {
                     self.time_ms,
                 ) {
                     Ok(cert) => {
+                        // Then the staged gate, step 7 after step 5, as for a new request
+                        // (Switch wire 7.3): a version delivered during the wait that no
+                        // longer names this service ends the page.
+                        if !super::rules::names_this_service(doc.as_ref(), origin, service_public) {
+                            self.refusal = Some(Stop::Refused(ApiError::new(
+                                ErrorCode::Staged,
+                                "7.3: the account isn't named by its identity.json",
+                            )));
+                            return false;
+                        }
                         self.cert = Some(cert);
                         true
                     }
@@ -627,12 +675,26 @@ impl Service {
         read: &FeedRead,
         signer: &ServiceSigner,
     ) -> Result<(Answer, u64), FeedStop> {
+        // The latest service time a read of this wait has seen: no answer is signed at an
+        // earlier one, so a refusal after a wait never shows the service's time going back
+        // behind a page the same client was answered meanwhile (Switch spec 10.1).
+        let latest = std::sync::atomic::AtomicU64::new(read.time_ms);
         let answered = long_poll(
             &self.changes,
             &read.account,
             Duration::from_secs(read.query.wait),
             || async {
-                let answered = self.read_page(read, signer).await?;
+                let answered = match self.read_page(read, signer).await {
+                    Ok(answered) => answered,
+                    Err(FeedStop::Refused(mut refusal)) => {
+                        refusal.time_ms = refusal
+                            .time_ms
+                            .max(latest.load(std::sync::atomic::Ordering::Relaxed));
+                        return Err(FeedStop::Refused(refusal));
+                    }
+                    Err(stop) => return Err(stop),
+                };
+                latest.fetch_max(answered.time_ms, std::sync::atomic::Ordering::Relaxed);
                 Ok(if answered.ready {
                     Polled::Ready(answered)
                 } else {

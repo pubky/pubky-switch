@@ -25,7 +25,9 @@ mod claim_codec;
 mod enrollments;
 mod feed;
 mod identity;
+mod inbox;
 mod ops;
+mod peers;
 #[cfg(any(test, feature = "test-util"))]
 pub mod testing;
 
@@ -42,10 +44,12 @@ pub use apps::{AppsView, KeptAppId, KeptReason, OpenAttempt, PartSpan, newly_lis
 pub use chain::NewChainItem;
 pub use feed::{AppDocs, CurrentDocs, FeedRow, FeedSnapshot, PageReader};
 pub use identity::HeldIdentity;
+pub use inbox::{InboxUsage, NewEntry, StoredEntry};
 pub use ops::{
     ListName, StoredApp, StoredBundlePart, StoredClaimEntry, StoredInvite, StoredListEntry,
     StoredRecord,
 };
+pub use peers::{HeldPeer, PeerFloor};
 
 use crate::admin::{CheckFuture, ReadinessCheck};
 

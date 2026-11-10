@@ -15,7 +15,10 @@
 //! from the feed, in the copy of the lists under `lc/` (`lc/contact/`, `lc/conv/`,
 //! `lc/deny/`, `lc/code/`), and the codes themselves
 //! it registered, `invite/<code_hash>`. A send consults them to skip a conversation entry
-//! the identity already holds.
+//! the identity already holds. The flagged senders (`lc/flag/`), which no feed item
+//! carries, come only from `GET /allow` ([`App::allow_list`]), which also keeps when the
+//! copy was last replaced (`lc/lists_at`); a protocol's receive step reads both, with the
+//! deny list, as a [`SenderDisposition`].
 
 use pubky_switch_core::enc::{b64, pubky_id, random_bytes, serde_b64};
 use pubky_switch_core::http::ErrorCode;
@@ -30,7 +33,7 @@ use super::error::Refusal;
 use super::state::Tx;
 use super::{App, AppError};
 use crate::client::answers::{AllowList, ChainItem, ConnectList};
-use crate::error::ClientError;
+use crate::error::{ClientError, StoreError};
 
 /// The random bytes in an invite code the app makes (Switch spec 7: at least 16).
 pub const INVITE_CODE_BYTES: usize = 32;
@@ -50,6 +53,58 @@ pub(crate) fn allow_key(kind: AllowKind, pubky: &[u8; 32]) -> String {
 
 pub(crate) fn deny_key(pubky: &[u8; 32]) -> String {
     format!("lc/deny/{}", pubky_id(pubky))
+}
+
+/// A flagged sender in the copy of the lists, from `GET /allow` only (Switch wire 7.4.6).
+/// The flagged senders are kept whole, bounded by the transport and batch caps as the
+/// other lists are, and never cut: a cut list would read a flagged sender as not flagged.
+pub(crate) fn flag_key(pubky: &[u8; 32]) -> String {
+    format!("lc/flag/{}", pubky_id(pubky))
+}
+
+/// When [`App::allow_list`] last replaced the copy of the lists: the service time of its
+/// answer, Unix milliseconds. Absent until the first.
+pub(crate) const LISTS_AT: &str = "lc/lists_at";
+
+/// What the app knows of a sender's standing in the own identity's lists, for a protocol's
+/// receive step ([`super::ReceiveContext::sender_disposition`]), such as to keep only a
+/// count of messages from a sender the user blocked or the service flagged (Switch spec 7
+/// "Spam").
+///
+/// Both values are as fresh as the app's copy of the lists. `blocked` follows the app's own
+/// deny and undeny, the deny list changes the feed shows an app with `lists.read`, and the
+/// last [`App::allow_list`]. `flagged` follows only the last [`App::allow_list`]: no feed
+/// item carries the flags, so it is `false` for every sender until the app first refreshes
+/// its lists. [`SenderDisposition::lists_as_of_ms`] is `None` while the copy isn't known to
+/// be complete, and both values then say nothing.
+///
+/// It has no `Default`: a disposition that defaulted to neither blocked nor flagged would
+/// be the unsafe answer to a failed read.
+///
+/// The service refuses a denied sender at the inbox (Switch spec 7), so `blocked` reaches a
+/// protocol only for a message accepted before the block, or after a deny that another app
+/// made and this one hasn't seen yet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SenderDisposition {
+    /// The sender is on the app's copy of the deny list.
+    pub blocked: bool,
+    /// The sender was among the flagged senders of the last [`App::allow_list`] (Switch
+    /// wire 7.4.6): it hit the rate limits at least 3 times.
+    pub flagged: bool,
+    /// The service time, Unix milliseconds, of the `GET /allow` answer the copy of the
+    /// lists was last replaced from, to compare with
+    /// [`super::ReceiveContext::highest_service_time`] when deciding to refresh.
+    ///
+    /// `None` when the copy isn't known to be complete: the app never refreshed its lists
+    /// (as an app without `lists.read`), was restored from a backup, which carries no copy,
+    /// or followed a provider loss since. `blocked` and `flagged` then say nothing of the
+    /// sender: a `false` may be a deny or a flag the app never saw, such as its own deny made
+    /// before the backup. A protocol must not read `None` as neither blocked nor flagged,
+    /// unless the protocol states its own rule for an unknown sender. An
+    /// app with `lists.read` refreshes a copy in that state at its next
+    /// [`App::receive`](super::App::receive), before it hands any entry over, when it can.
+    pub lists_as_of_ms: Option<u64>,
 }
 
 /// An invite code this app registered, in the copy of the lists.
@@ -243,21 +298,87 @@ impl App {
 
     /// The lists the switch holds (`GET /allow`, `lists.read`, Switch wire 7.4.6): contacts,
     /// conversation entries with their writers, the deny list, flagged senders and the live
-    /// invite codes. What the app keeps of them is brought up to date.
+    /// invite codes. What the app keeps of them is replaced in one commit: the contacts,
+    /// conversation entries, deny list, flagged senders and its own invite codes, with the
+    /// answer's service time ([`SenderDisposition::lists_as_of_ms`]).
+    ///
+    /// Each list is kept whole, as the answer holds it, the flagged senders included. The
+    /// copy is bounded as the other lists are: by the transport's cap on an answer's size
+    /// and the store's batch size. At the default limits the flagged senders are at most
+    /// `max_flags`, 1,000 (Switch wire 9.2). The list isn't cut to a count of its own: a
+    /// cut list would read a flagged sender as not flagged.
+    ///
+    /// The whole copy is replaced in one commit, which must fit the store's batch size,
+    /// [`crate::store::MAX_BATCH_BYTES`]. Lists that don't fit, as they may at raised
+    /// limits, fail this call with [`StoreError::TooLarge`] and leave the copy as it was:
+    /// such an app can't refresh its copy today. Its reads go on, the refresh they owe
+    /// failing the same way, so [`SenderDisposition::lists_as_of_ms`] stays as it was,
+    /// `None` when the copy was never refreshed.
     ///
     /// # Errors
     ///
-    /// [`Refusal::Usage`] without `lists.read`; a failed call or commit.
+    /// [`Refusal::Usage`] without `lists.read`; a failed call or commit;
+    /// [`StoreError::TooLarge`] for lists too large for one commit.
     pub async fn allow_list(&mut self) -> Result<AllowList, AppError> {
         Box::pin(async move {
             self.ready_local().await?;
             self.refuse_when_stopped()?;
             self.need(Permission::ListsRead)?;
+            self.refresh_lists().await
+        })
+        .await
+    }
+
+    /// The refresh a read owes when the copy of the lists isn't known to be complete
+    /// (`lc/lists_at` absent: never refreshed, restored, or after a provider loss) and the
+    /// app holds `lists.read`: [`App::allow_list`], before the read hands any entry over.
+    /// Not while a move or a provider loss is in progress, whose steps read and upload the
+    /// copy as the app kept it. Best effort: a refused or failed call, or a copy too large
+    /// for one commit, leaves the copy as it was, still owed, and the read goes on; an alarm
+    /// or a store failure stops it.
+    pub(crate) async fn refresh_lists_if_owed(&mut self) -> Result<(), AppError> {
+        if !self.state.cert.has_permission(Permission::ListsRead) {
+            return Ok(());
+        }
+        let reader = self.reader();
+        if reader.exists(LISTS_AT).await?
+            || reader.exists(super::provider::keys::MOVE).await?
+            || self.loss_record().await?.is_some_and(|loss| !loss.done())
+        {
+            return Ok(());
+        }
+        match self.refresh_lists().await {
+            Ok(_) => Ok(()),
+            // A copy too large for one commit is refused the same way every time: the
+            // refresh failed, not the store, and the read goes on (Switch spec 8.2).
+            Err(AppError::Store(StoreError::TooLarge { .. })) => Ok(()),
+            Err(error @ (AppError::Alarm(_) | AppError::Store(_))) => Err(error),
+            Err(_) => Ok(()),
+        }
+    }
+
+    /// `GET /allow`, and the copy of the lists replaced from it in one commit.
+    async fn refresh_lists(&mut self) -> Result<AllowList, AppError> {
+        Box::pin(async move {
             let result = self.client.allow().await;
             let list = self.take(result).await?;
+            // The answer's own stamped time (Switch spec 10.1). For an answer without one, the
+            // highest service time verified before it, which is older, so a protocol refreshes
+            // no later than it means to; the device clock only when the app verified none.
+            let as_of = self
+                .client
+                .latest_server_time()
+                .or_else(|| self.highest_service_time())
+                .unwrap_or_else(|| self.now());
             let me = self.state.meta.app_id;
             let mut tx = self.tx()?;
-            for prefix in ["lc/contact/", "lc/conv/", "lc/deny/", "lc/code/"] {
+            for prefix in [
+                "lc/contact/",
+                "lc/conv/",
+                "lc/deny/",
+                "lc/flag/",
+                "lc/code/",
+            ] {
                 tx.delete_prefix(prefix)?;
             }
             for pubky in &list.contacts {
@@ -269,6 +390,10 @@ impl App {
             for pubky in &list.deny {
                 tx.put(&deny_key(pubky), &())?;
             }
+            for flagged in &list.flagged {
+                tx.put(&flag_key(&flagged.pubky), &())?;
+            }
+            tx.put(LISTS_AT, &as_of)?;
             for code in list.invite_codes.iter().filter(|c| c.written_by == me) {
                 tx.put(&code_key(&code.code_hash), &())?;
             }
@@ -470,6 +595,7 @@ mod tests {
         assert!(allow_key(AllowKind::Contact, &[1; 32]).starts_with("lc/contact/"));
         assert!(allow_key(AllowKind::Conversation, &[1; 32]).starts_with("lc/conv/"));
         assert!(deny_key(&[1; 32]).starts_with("lc/deny/"));
+        assert!(flag_key(&[1; 32]).starts_with("lc/flag/"));
         assert!(code_key(&[1; 32]).starts_with("lc/code/"));
     }
 

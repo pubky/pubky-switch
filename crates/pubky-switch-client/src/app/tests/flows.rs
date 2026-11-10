@@ -18,6 +18,7 @@ use crate::app::{
     Alarm, AppBackup, AppError, AppEvent, EventId, IdentityRefresh, LeaveMode, LeaveReport,
     ParkReason, REVALIDATION_MS, Refusal, UserConfirmed,
 };
+use crate::error::ClientError;
 use crate::store::{Fault as StoreFault, FaultStore};
 use crate::testing::Fault;
 
@@ -1045,6 +1046,44 @@ async fn test_app_lost_answer_resends_the_same_batch() {
     let report = app.receive(None).await.unwrap();
     assert!(received(&report.events, seq), "{:?}", report.events);
     assert_eq!(w.effects(), 1);
+}
+
+#[tokio::test]
+async fn test_feed_page_without_items_is_refused_and_moves_nothing() {
+    // Read as an empty page scanned through `next`, a page without `items` would pass over
+    // an entry unseen, since entries aren't chained, and would stop the app on a rollback
+    // alarm when it skips a chain item. So the page is refused, and nothing moves.
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    app.receive(None).await.unwrap();
+    let leave_out_items = || {
+        w.switch.fail_next(Fault::LeaveOut {
+            path: "feed".into(),
+            member: "items".into(),
+        });
+    };
+    let refused = |error: AppError| {
+        assert!(
+            matches!(error, AppError::Switch(ClientError::InvalidResponse(_))),
+            "{error:?}"
+        );
+    };
+    // An entry.
+    let before = app.cursor();
+    let (seq, _) = w.note(app.app_id(), "kept");
+    leave_out_items();
+    refused(app.receive(None).await.unwrap_err());
+    assert_eq!(app.cursor(), before);
+    let report = app.receive(None).await.unwrap();
+    assert!(received(&report.events, seq), "{:?}", report.events);
+    // A chain item.
+    let before = app.cursor();
+    w.next_doc(|_| {});
+    leave_out_items();
+    refused(app.receive(None).await.unwrap_err());
+    assert_eq!(app.cursor(), before);
+    app.receive(None).await.unwrap();
+    assert_eq!(app.cursor().seq, w.switch.tip_seq());
 }
 
 #[tokio::test]
@@ -3489,4 +3528,49 @@ async fn test_switch_cursor_set_behind_the_cursor_changes_nothing() {
     assert_eq!(w.switch.app(&me).cursor, cursor);
     assert_eq!(post(cursor), 200);
     assert_eq!(w.switch.app(&me).cursor, cursor);
+}
+
+/// A kept batch stored without its stamp (`kept_ms: None`) was never sent: the stamp is
+/// committed before the request leaves, so a crash before that commit leaves the batch
+/// unsent, and its first send later goes under the same batch ID with nothing to settle.
+#[tokio::test]
+async fn test_kept_batch_unstamped_after_a_crash_was_never_sent() {
+    let w = World::new();
+    let app = w.join("wallet").await;
+    let me = app.app_id();
+    drop(app);
+    w.clock.advance_ms(20 * 60 * 1000);
+    // Reopened over a store that stops before its second commit from here: the first keeps
+    // the batch, the second is its stamp.
+    let fault = Arc::new(FaultStore::new(
+        Arc::clone(&w.store) as Arc<dyn StateStore>,
+        StoreFault::StopBefore(2),
+    ));
+    let mut app = App::load(
+        w.env_on(fault.clone() as Arc<dyn StateStore>),
+        w.protocol.clone(),
+        World::config(),
+        me,
+    )
+    .await
+    .unwrap();
+    assert!(
+        app.submit_batch(conversation(w.bob.public()))
+            .await
+            .is_err()
+    );
+    drop(app);
+    let mut app = w.load(me).await;
+    let kept = app.kept_batches().await.unwrap();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].1.kept_ms, None);
+    assert_eq!(
+        conversations_for(&w, w.bob.public()),
+        0,
+        "stored unstamped, yet sent"
+    );
+    // Its first send applies it once.
+    app.submit_batch(conversation([7; 32])).await.unwrap();
+    assert!(app.kept_batches().await.unwrap().is_empty());
+    assert_eq!(conversations_for(&w, w.bob.public()), 1);
 }

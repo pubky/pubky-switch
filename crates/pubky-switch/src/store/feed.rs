@@ -147,6 +147,8 @@ pub trait PageReader {
     fn begin(&mut self, snapshot: &FeedSnapshot) -> bool;
     /// See the next item; whether the page wants the one after.
     fn take(&mut self, snapshot: &FeedSnapshot, row: FeedRow) -> bool;
+    /// See the next inbox entry; whether the page wants the item after it.
+    fn take_entry(&mut self, snapshot: &FeedSnapshot, entry: super::StoredEntry) -> bool;
 }
 
 /// Read one page of account `id` for its app `reader` from one snapshot: the sequence and
@@ -226,18 +228,34 @@ pub(super) async fn read_feed(
     let db_generation = to_db(generation, "generation")?;
     snapshot.current = current_docs(&mut tx, id, db_generation, low, high).await?;
 
+    // Chain items and inbox entries, in one sequence by seq: only the entries wrapped to the
+    // reader, so another app's envelopes are never read (Switch wire 7.5).
     let mut rows = sqlx::query(
-        "SELECT seq, item_type, item_bytes, envelope, chain_hash, proof, only_for \
+        "SELECT 'chain' AS kind, seq, item_type, item_bytes, envelope, chain_hash, proof, \
+                only_for, NULL::BYTEA AS entry_id, NULL::BYTEA AS sender, NULL::BYTEA AS cert, \
+                NULL::BIGINT AS accepted_at_ms, NULL::BYTEA[] AS targets, NULL::BYTEA AS context \
          FROM chain_items WHERE account_id = $1 AND generation = $2 AND seq > $3 AND seq <= $4 \
+         UNION ALL \
+         SELECT 'entry', seq, NULL, NULL, envelope, NULL, NULL, NULL, entry_id, sender, cert, \
+                accepted_at_ms, targets, context \
+         FROM inbox_entries WHERE account_id = $1 AND generation = $2 AND seq > $3 AND seq <= $4 \
+         AND $5 = ANY(targets) \
          ORDER BY seq",
     )
     .bind(id)
     .bind(db_generation)
     .bind(low)
     .bind(high)
+    .bind(reader.as_slice())
     .fetch(&mut *tx);
     while let Some(row) = rows.try_next().await.map_err(StoreError::from_db)? {
-        if !page.take(&snapshot, row_of(&row)?) {
+        let kind: String = row.try_get("kind")?;
+        let wants = if kind == "entry" {
+            page.take_entry(&snapshot, super::inbox::entry_of(&row)?)
+        } else {
+            page.take(&snapshot, row_of(&row)?)
+        };
+        if !wants {
             break;
         }
     }

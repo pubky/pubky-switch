@@ -299,7 +299,7 @@ impl From<StoreError> for AppError {
 
 impl From<BatchError> for AppError {
     fn from(error: BatchError) -> Self {
-        AppError::Store(StoreError::Other(error.to_string()))
+        AppError::Store(error.into())
     }
 }
 

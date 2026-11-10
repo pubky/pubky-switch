@@ -147,32 +147,49 @@ impl<'a> Obj<'a> {
         self.opt(name, Self::head)
     }
 
-    /// An array member; an absent or `null` one reads as empty.
-    pub(crate) fn list(&self, name: &str) -> Result<&'a [Value], ClientError> {
-        match self.get(name) {
-            None => Ok(&[]),
-            Some(value) => value
-                .as_array()
-                .map(Vec::as_slice)
-                .ok_or_else(|| bad(self.what, name)),
-        }
+    /// A required array member: an absent or `null` one is malformed. Every array member
+    /// of an answer is required unless the wire's table marks it optional, so a missing list
+    /// never reads as an empty one.
+    pub(crate) fn required_list(&self, name: &str) -> Result<&'a [Value], ClientError> {
+        self.req(name)?
+            .as_array()
+            .map(Vec::as_slice)
+            .ok_or_else(|| bad(self.what, name))
     }
 
-    /// Each element of an array member, read as an object.
-    pub(crate) fn objects(&self, name: &str) -> Result<Vec<Obj<'a>>, ClientError> {
-        self.list(name)?
+    /// Each element of a required array member, read as an object.
+    pub(crate) fn required_objects(&self, name: &str) -> Result<Vec<Obj<'a>>, ClientError> {
+        self.required_list(name)?
             .iter()
             .map(|value| Obj::of(value, self.what))
             .collect()
     }
 
-    /// Each element of an array member, read with `read`.
-    pub(crate) fn each<T>(
+    /// Each element of a required array member, read with `read`.
+    pub(crate) fn required_each<T>(
         &self,
         name: &str,
         read: impl Fn(&'a Value) -> Option<T>,
     ) -> Result<Vec<T>, ClientError> {
-        self.list(name)?
+        self.required_list(name)?
+            .iter()
+            .map(|value| read(value).ok_or_else(|| bad(self.what, name)))
+            .collect()
+    }
+
+    /// Each element of an optional array member, read with `read`: one the wire's table
+    /// marks optional or absent when empty, so an absent or `null` one reads as empty.
+    pub(crate) fn opt_each<T>(
+        &self,
+        name: &str,
+        read: impl Fn(&'a Value) -> Option<T>,
+    ) -> Result<Vec<T>, ClientError> {
+        let Some(value) = self.get(name) else {
+            return Ok(Vec::new());
+        };
+        value
+            .as_array()
+            .ok_or_else(|| bad(self.what, name))?
             .iter()
             .map(|value| read(value).ok_or_else(|| bad(self.what, name)))
             .collect()
