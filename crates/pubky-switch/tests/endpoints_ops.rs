@@ -732,7 +732,7 @@ async fn test_ops_first_call_with_an_unlisted_certificate() {
 #[tokio::test]
 async fn test_ops_operation_signature_failures_count_against_the_source() {
     let limits = Limits {
-        auth_failures_per_source_per_min: 1,
+        auth_failures_per_source_per_min: 2,
         ..Limits::default()
     };
     let Some(replay) = registered(limits, false).await else {
@@ -762,6 +762,26 @@ async fn test_ops_operation_signature_failures_count_against_the_source() {
         (status, body["code"].as_str()),
         (401, Some("bad_signature"))
     );
+    // One bad request counts once.
+    let claimed = (
+        alice_id(),
+        alice_id(),
+        Some(
+            app(&keys, "wallet")["app_id"]
+                .as_str()
+                .expect("id")
+                .to_string(),
+        ),
+    );
+    assert_eq!(
+        replay
+            .service
+            .failed_authentications()
+            .claimed(&claimed, ms(AT)),
+        1
+    );
+    let (status, _, _) = answer_of(replay.service.handle(send()).await);
+    assert_eq!(status, 401, "the second of two");
     let (status, body, _) = answer_of(replay.service.handle(send()).await);
     assert_eq!(
         (status, body["code"].as_str()),
@@ -846,5 +866,74 @@ async fn test_ops_cursor_never_moves_back() {
     let (status, body) = post_app(&replay, "wallet", &[], Some(at(2)), AT).await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(wallet_app(&replay).await.cursor, Some(at(4)));
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_ops_self_made_key_takes_no_lock() {
+    let Some(replay) = registered(Limits::default(), false).await else {
+        return;
+    };
+    // A key of the caller's own, named by a record whose certificate alice never signed.
+    let keys = AppKeys::from_secrets([31; 32], [32; 32]);
+    let stranger = IdentityKey::from_secret([33; 32]);
+    let cert = AppCert::issue(
+        &stranger,
+        AppCertBody::new(
+            pubky_switch_core::signing::Signs::public_key(&stranger),
+            keys.signing_public(),
+            keys.bundle_public(),
+            vec!["neutral".into()],
+            &[],
+            ms("2025-12-01T00:00:00.000Z"),
+            ms("2026-06-01T00:00:00.000Z"),
+        ),
+    )
+    .expect("cert");
+    let record =
+        AppRecord::sign(&keys, AppRecordBody::new(&cert, Vec::new(), ms(AT))).expect("record");
+    let ops = sign_batch(
+        &keys,
+        &alice_key(),
+        Some(cert.app_id()),
+        1,
+        [23; 16],
+        vec![(
+            Vec::new(),
+            OpKind::AppPut {
+                record: record.signed().clone(),
+            },
+        )],
+    )
+    .expect("batch");
+    let caller = serde_json::json!({
+        "app_id": pubky_switch_core::enc::zbase32_encode(&cert.app_id()),
+        "signing_secret_hex": hex::encode([31u8; 32]),
+    });
+    let body = OpsRequest::new(&ops, None).to_json();
+    let request = app_request(&caller, "POST", &ops_path(), body, ms(AT));
+    let before = stamped_time(&replay).await;
+    let held = replay
+        .db
+        .store()
+        .begin(&alice_id())
+        .await
+        .expect("begin")
+        .expect("account");
+    let answer = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        replay.service.handle(request),
+    )
+    .await
+    .expect("answered without waiting for the lock");
+    drop(held);
+    let (status, body, head) = answer_of(answer);
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (401, Some("bad_signature")),
+        "{body}"
+    );
+    assert!(head.is_none());
+    assert_eq!(stamped_time(&replay).await, before, "nothing was stamped");
     replay.db.drop_database().await.expect("drop");
 }

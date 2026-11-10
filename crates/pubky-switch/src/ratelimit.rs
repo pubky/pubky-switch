@@ -103,13 +103,23 @@ impl<K: Eq + Hash> MinuteWindows<K> {
 /// account's time, stamped ahead, moves only its own minute.
 #[derive(Debug)]
 pub struct KeyedMinutes<K> {
-    state: Mutex<HashMap<K, (u64, u32)>>,
+    state: Mutex<Keyed<K>>,
+}
+
+#[derive(Debug)]
+struct Keyed<K> {
+    windows: HashMap<K, (u64, u32)>,
+    /// The minute of the last prune.
+    pruned: u64,
 }
 
 impl<K: Eq + Hash> Default for KeyedMinutes<K> {
     fn default() -> Self {
         Self {
-            state: Mutex::new(HashMap::new()),
+            state: Mutex::new(Keyed {
+                windows: HashMap::new(),
+                pruned: 0,
+            }),
         }
     }
 }
@@ -123,14 +133,17 @@ impl<K: Eq + Hash> KeyedMinutes<K> {
     /// in that minute, so a clock that steps back can't open a fresh one.
     pub fn take(&self, key: K, limit: u32, now_ms: u64) -> Result<(), u64> {
         let minute = now_ms / MINUTE_MS;
-        let mut windows = self.state.lock();
-        if windows.len() >= KEYED_PRUNE_AT {
-            // Windows two minutes or more behind this time are almost always over: accounts'
-            // times all follow the time base. One dropped early only opens its key a fresh
-            // window, never refuses it.
-            windows.retain(|_, (at, _)| at.saturating_add(1) >= minute);
+        let mut state = self.state.lock();
+        if state.windows.len() >= KEYED_PRUNE_AT && minute > state.pruned {
+            // At most once a minute. Windows two minutes or more behind this time are almost
+            // always over: accounts' times all follow the time base. One dropped early only
+            // opens its key a fresh window, never refuses it.
+            state.pruned = minute;
+            state
+                .windows
+                .retain(|_, (at, _)| at.saturating_add(1) >= minute);
         }
-        let (at, count) = windows.entry(key).or_insert((minute, 0));
+        let (at, count) = state.windows.entry(key).or_insert((minute, 0));
         if minute > *at {
             *at = minute;
             *count = 0;
@@ -145,7 +158,7 @@ impl<K: Eq + Hash> KeyedMinutes<K> {
 
     /// Keys counted.
     pub fn len(&self) -> usize {
-        self.state.lock().len()
+        self.state.lock().windows.len()
     }
 
     /// Whether nothing is counted.

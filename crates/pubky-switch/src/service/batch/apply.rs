@@ -102,7 +102,8 @@ fn set_cursor(
     };
     // No account continues another's sequence before cooperative moves are served.
     check_cursor(position, state.generation, None, state.newest_seq)?;
-    // A position at or behind the app's cursor leaves it where it is (Switch wire 6.2).
+    // The cursor only moves forward: a position at or behind it leaves it where it is, and
+    // isn't an error (Switch spec 8.3, Switch wire 6.2).
     let cursor = &mut state.apps.entry(cert.app_id()).or_default().cursor;
     if cursor.is_none_or(|current| position > current) {
         *cursor = Some(position);

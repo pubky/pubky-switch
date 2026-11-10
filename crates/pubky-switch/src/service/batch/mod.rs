@@ -287,8 +287,9 @@ impl Service {
             .map_err(|_| ApiError::bad_request("7.1: Switch-App isn't an App ID"))?;
         // Step 2 of Switch wire 6.4: parse, before any signature is checked.
         let parsed = OpsRequest::parse(&request.body).map_err(refused)?;
-        let key = match first_app_put(&parsed, &app) {
-            Some(record) => record_signing_key(&record)
+        let first_call = first_app_put(&parsed, &app);
+        let key = match &first_call {
+            Some(record) => record_signing_key(record)
                 .filter(|key| app_id_bytes(key) == app)
                 .ok_or_else(|| {
                     bad_signature("7.2: the app.put's record doesn't give the caller's App ID")
@@ -310,6 +311,18 @@ impl Service {
         };
         wire_http::verify_request(&key, &target, &claimed.headers, &claimed.signature)
             .map_err(|_| bad_signature("7.1: the request signature doesn't verify"))?;
+        // A first call's record, and the certificate it carries, verify for the identity the
+        // path names: a key the identity never certified doesn't reach the lock (Switch wire
+        // 7.2 "An own app's first call").
+        if let Some(record) = &first_call {
+            let identity = pubky_switch_core::enc::pubky_key(account)
+                .map_err(|_| ApiError::not_found("no such account"))?;
+            let record = AppRecord::verify(record, &identity)
+                .map_err(|_| bad_signature("7.2: the first call's app record"))?;
+            if record.cert().app_id() != app {
+                return Err(bad_signature("7.2: the record names another app"));
+            }
+        }
         Ok(VerifiedApp { app, key, parsed })
     }
 
