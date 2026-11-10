@@ -209,18 +209,26 @@ async fn test_scripted_apps_lists_the_app_ids_an_enrollment_kept() {
 }
 
 #[tokio::test]
-async fn test_scripted_apps_current_follows_the_certificates_expiry() {
-    // Listed, with a record, and its certificate expired: not current.
+async fn test_scripted_apps_current_isnt_expiry() {
+    // Spec 3.4's sense: a listed app whose certificate lapsed is still current, and
+    // `cert_expires_at` shows the lapse. Once revoked, it isn't current.
     let s = Setup::new();
     let keys = s.alice.identity().app_keys("lapsed");
     s.alice
         .register_app(&keys, &AppSpec::new(&["notes"]))
         .unwrap();
-    assert!(s.status(&keys.app_id_bytes()).await.current);
+    let id = keys.app_id_bytes();
+    assert!(s.status(&id).await.current);
     s.clock.advance_ms(800 * DAY_MS);
-    let lapsed = s.status(&keys.app_id_bytes()).await;
-    assert!(!lapsed.current);
-    assert!(lapsed.revoked_at.is_none() && lapsed.departed_at.is_none());
+    let lapsed = s.status(&id).await;
+    assert!(lapsed.current);
+    assert!(
+        lapsed
+            .cert_expires_at
+            .is_some_and(|at| at < START_MS + 800 * DAY_MS)
+    );
+    s.alice.switch().revoke(id).unwrap();
+    assert!(!s.status(&id).await.current);
 }
 
 #[tokio::test]

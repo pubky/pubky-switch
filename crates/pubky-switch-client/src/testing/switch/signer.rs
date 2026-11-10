@@ -372,10 +372,11 @@ impl Inner {
                     .unwrap_or_default();
                 json!({
                     "app_id": zbase32_encode(id),
-                    // By the full rule once the app has a record: listed, or renewed and open,
-                    // with a certificate that hasn't expired (Switch spec 3.4).
+                    // Spec 3.4's sense once the app has a record: listed with its certificate,
+                    // or renewed and open, not revoked or departed. Expiry isn't part of it:
+                    // `cert_expires_at` carries that (Switch wire 7.4.12).
                     "current": if held.is_some_and(|a| a.cert.is_some()) {
-                        !enrolled_kept && self.app_current(&self.apps, id)
+                        !enrolled_kept && self.app_current_by(&self.apps, id, false)
                     } else {
                         listed && !kept
                     },

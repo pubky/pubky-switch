@@ -98,9 +98,10 @@ service.
   by member, but `recovery` (below):
   - every app the switch holds, every App ID it keeps for good, and every app the newest
     document lists. An App ID an enrollment named shows `revoked_at` at the enrollment's time;
-  - `current` by the full rule once the app has a record: listed, or renewed and open, with a
-    certificate that hasn't expired, and never once revoked, departed or kept. An app with no
-    record is current while it is listed and not kept;
+  - `current` in spec 3.4's sense once the app has a record: listed with its certificate, or
+    renewed and open, and never once revoked, departed or kept. Expiry isn't part of it:
+    `cert_expires_at` carries that, and a signer that serves an app checks both. An app with
+    no record is current while it is listed and not kept;
   - `last_seen`: the time of the app's latest request past authentication, a staged
     account's refusal and a scripted error other than a `401` included. The scripted switch
     takes an app with a record that isn't revoked, departed or kept as authenticated;
