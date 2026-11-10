@@ -1651,13 +1651,13 @@ Vectors: `claims.json` runs 69 steps through every row above, the deadline pin a
 | Answer | At most | What bounds it |
 |---|---|---|
 | an export chunk (10.3) | 1.4 MiB | a chunk of 1 MiB in base64url |
-| `GET /apps` (7.4.12) | 4 MiB | 32 apps with 1,000 open attempts each, and `identity.json`; about 350 bytes more for each purged App ID the service keeps |
+| `GET /apps` (7.4.12) | 4 MiB, and more with the account's history | 32 apps with 1,000 open attempts each, and `identity.json`: 4 MiB. It then grows for the identity's life, with no fixed bound: about 350 bytes for each purged App ID, which the service keeps for good (9.1), and one `bundle_ranges` pair for each key bundle part it stores for an app. An enrollment can name at most 6,766 revoked App IDs (3.12), and that many add 2.4 MiB |
 | `GET /handover` (7.4.17) | 12 MiB | the body cap of its `PUT` |
 | `GET /directory` (7.4.10), and a `409 stale_key`'s `current` (7.6) | 13.2 MiB | `identity.json` (262,119 bytes) and 32 apps, each with an app record (392,924) and a receive key record (about 30,000; 10.3 Part sizes); 104 MiB at an app limit of 255 |
 | `GET /claims/{claim_key}` (7.4.8) | 134 MiB | 256 entries, four for each of 64 attempts, each an operation of 512 KiB with its proof (24,522); under 7 MiB when the operations are of ordinary size, about 1 KB |
 | `GET /allow` (7.4.6) | 134 MiB | 100,000 contacts and 100,000 deny entries of 55 bytes each, and 100,000 conversation entries of up to 1,292 bytes with a full context; about 28 MiB when no entry has a context |
 
-So the largest answer this version defines is under 135 MiB at the default limits. The answers not listed are smaller there, but for an app's key bundle parts (7.4.11), which grow by one part of at most 87,645 bytes with each rotation the app missed. A client may refuse an answer larger than the bound of its call without reading it to the end, as it refuses a malformed one. A client that sets itself a lower cap and refuses an answer for its size treats the call as failed.
+So the largest answer the limits bound is under 135 MiB at the default limits, and the bounded answers not listed are smaller there. Two answers have no fixed bound, since they grow with the account's history: `GET /apps`, as the table says, and an app's key bundle parts (7.4.11), which grow by one part of at most 87,645 bytes with each rotation the app missed. A client may refuse a bounded answer that is larger than the bound of its call without reading it to the end, as it refuses a malformed one. For the two without a bound, the signer and the app, their only readers, set a cap of their own with room for that growth. A client that sets itself a lower cap and refuses an answer for its size treats the call as failed.
 
 **Body rules:**
 
