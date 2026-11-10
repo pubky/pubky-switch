@@ -1,8 +1,9 @@
 -- What an account holds of its identity (Switch wire 3.3, 3.7), and its chain (6.6).
 
 ALTER TABLE accounts
-    -- The app limit announced at enrollment (Switch wire 3.7).
-    ADD COLUMN app_limit       BIGINT  NOT NULL DEFAULT 32 CHECK (app_limit BETWEEN 1 AND 255),
+    -- The limits announced at the first enrollment, as the answer writes them; every later
+    -- enrollment announces the same (Switch wire 3.7).
+    ADD COLUMN announced_limits BYTEA  NOT NULL,
     -- The key store ID of the next generation's pending key, once an enrollment at the
     -- serving account asked for one (Switch wire 3.7).
     ADD COLUMN pending_key     TEXT,

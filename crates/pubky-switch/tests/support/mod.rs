@@ -53,7 +53,23 @@ pub struct Replay {
     pub db: TestDatabase,
     pub clock: Arc<ManualClock>,
     pub service: Service,
+    pub keys: Arc<FixedKeys>,
+    pub time: Arc<TrustedTime>,
     _key_dir: tempfile::TempDir,
+}
+
+impl Replay {
+    /// Another service on the same database, keys and clock, with `limits`, as after the
+    /// operator changes its configuration.
+    pub fn restarted_with(&self, limits: Limits) -> Service {
+        Service::new(
+            ORIGIN.into(),
+            self.db.store().clone(),
+            self.keys.clone(),
+            self.time.clone(),
+            limits,
+        )
+    }
 }
 
 pub async fn replay() -> Option<Replay> {
@@ -76,11 +92,11 @@ pub async fn replay_with(limits: Limits) -> Option<Replay> {
     let operator = hex32(&Value::String(OPERATOR_SEED_HEX.into()));
     let key_dir = tempfile::tempdir().expect("key dir");
     let store = FileKeyStore::open(key_dir.path()).expect("key store");
-    let keys = FixedKeys::new(
+    let keys = Arc::new(FixedKeys::new(
         store,
         vec![hex32(&alice_service["secret_hex"])],
         Some(operator),
-    );
+    ));
     let clock = Arc::new(ManualClock::new(0));
     let time = Arc::new(TrustedTime::new(
         TrustedTimeConfig {
@@ -92,14 +108,16 @@ pub async fn replay_with(limits: Limits) -> Option<Replay> {
     let service = Service::new(
         ORIGIN.into(),
         db.store().clone(),
-        Arc::new(keys),
-        time,
+        keys.clone(),
+        time.clone(),
         limits,
     );
     Some(Replay {
         db,
         clock,
         service,
+        keys,
+        time,
         _key_dir: key_dir,
     })
 }

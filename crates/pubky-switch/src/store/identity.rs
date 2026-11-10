@@ -5,7 +5,7 @@
 use pubky_switch_core::sig::SignedDoc;
 use sqlx::Row;
 
-use super::{AccountTxn, StoreError, from_db, to_db};
+use super::{AccountTxn, StoreError, to_db};
 use crate::keys::KeyId;
 
 /// A signed document in its carrying form, as the store keeps it.
@@ -65,15 +65,18 @@ impl AccountTxn {
         Ok(())
     }
 
-    /// The app limit announced at enrollment.
-    pub async fn app_limit(&mut self) -> Result<u64, StoreError> {
+    /// The limits announced at the account's first enrollment.
+    pub async fn announced_limits(
+        &mut self,
+    ) -> Result<pubky_switch_core::records::Limits, StoreError> {
         let id = self.head().id.clone();
-        let limit: i64 = sqlx::query_scalar("SELECT app_limit FROM accounts WHERE id = $1")
-            .bind(id)
-            .fetch_one(self.conn())
-            .await
-            .map_err(StoreError::from_db)?;
-        from_db(limit, "app_limit")
+        let bytes: Vec<u8> =
+            sqlx::query_scalar("SELECT announced_limits FROM accounts WHERE id = $1")
+                .bind(id)
+                .fetch_one(self.conn())
+                .await
+                .map_err(StoreError::from_db)?;
+        serde_json::from_slice(&bytes).map_err(|_| StoreError::Corrupt("announced_limits"))
     }
 
     /// The pending key of the next generation, if an enrollment asked for one.

@@ -81,7 +81,11 @@ impl Service {
             None => None,
         };
         let kept_app_ids = txn.kept_app_ids().await.map_err(|e| store_error(&e))?;
-        let app_limit = txn.app_limit().await.map_err(|e| store_error(&e))?;
+        let app_limit = txn
+            .announced_limits()
+            .await
+            .map_err(|e| store_error(&e))?
+            .app_limit;
         let view = AccountView {
             held,
             app_limit,
@@ -121,6 +125,18 @@ impl Service {
             Ok(Delivery::New(Some(_))) => Err(ApiError::unavailable(
                 "7.4.2: a generation change isn't served yet",
             )),
+            // A first document that starts a recovery, or at another generation than the
+            // account's: its chain starts with the recovery transition, at its own
+            // generation (Switch wire 7.4.2), which comes with recovery.
+            Ok(Delivery::New(None))
+                if held.is_none()
+                    && (doc.body().recovery_from.is_some()
+                        || doc.generation() != txn.head().generation) =>
+            {
+                Err(ApiError::unavailable(
+                    "7.4.2: a generation change isn't served yet",
+                ))
+            }
             Ok(Delivery::New(None)) => self.chain_delivery(txn, signer, &doc, time_ms).await,
         }
     }
@@ -179,39 +195,13 @@ impl Service {
         Ok((Answer::ok(body).with_head(Some(head)), serving))
     }
 
-    /// The public read of the newest `identity.json` (Switch wire 7.4.15): unauthenticated,
-    /// limited per network source and, as a backstop, per account.
+    /// The public read of the newest `identity.json` (Switch wire 7.4.15): its limits are
+    /// checked before the account's lock.
     pub(super) fn public_identity(
         &self,
-        txn: &AccountTxn,
-        request: &SwitchRequest,
         held: Option<&IdentityDoc>,
         serving: bool,
-        time_ms: u64,
     ) -> Result<Answer, ApiError> {
-        let account = txn.head().id.clone();
-        // A source's refused reads don't count against the account's backstop (9.4).
-        if let Some(source) = request.source
-            && let Err(retry_after) = self.reads_per_source.take(
-                (account.clone(), source),
-                self.limits.identity_reads_per_source_per_min,
-                time_ms,
-            )
-        {
-            return Err(ApiError::rate_limited(
-                "9.4: public identity.json reads from this network source",
-                retry_after,
-            ));
-        }
-        if let Err(retry_after) =
-            self.reads_per_account
-                .take(account, self.limits.identity_reads_per_min, time_ms)
-        {
-            return Err(ApiError::rate_limited(
-                "9.4: public identity.json reads of this account",
-                retry_after,
-            ));
-        }
         let Some(doc) = held else {
             return Err(ApiError::not_found("7.4.15: no identity.json held"));
         };

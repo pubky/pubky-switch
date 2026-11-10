@@ -79,9 +79,8 @@ impl Service {
             .answer_enrollment(&enrollment, &identity_text, base_ms)
             .await
         {
-            Ok((key, time_ms)) => {
-                let answer =
-                    EnrollmentAnswer::new(&enrollment, key.public, announced_limits(&self.limits));
+            Ok((key, time_ms, limits)) => {
+                let answer = EnrollmentAnswer::new(&enrollment, key.public, limits);
                 let body = match answer.to_json() {
                     Ok(body) => body,
                     Err(_) => {
@@ -139,14 +138,15 @@ impl Service {
         Ok((enrollment, identity_text))
     }
 
-    /// The key that answers the enrollment, and the service time of the answer: a new
-    /// account's key, a staged account's own, or a serving account's pending key.
+    /// The key that answers the enrollment, the service time of the answer, and the limits
+    /// it announces: a new account's key, a staged account's own, or a serving account's
+    /// pending key, with the limits the account announced at its first enrollment.
     async fn answer_enrollment(
         &self,
         enrollment: &Enrollment,
         identity_text: &str,
         base_ms: u64,
-    ) -> Result<(ServiceKey, u64), ApiError> {
+    ) -> Result<(ServiceKey, u64, AnnouncedLimits), ApiError> {
         let unavailable = || ApiError::unavailable("7.6: a temporary failure");
         // An account that doesn't exist yet is made, then answered like any other.
         if self
@@ -163,7 +163,7 @@ impl Service {
                 generation: enrollment.identity_doc().map_or(1, IdentityDoc::generation),
                 service_key: key.id.clone(),
                 created_at_ms: base_ms,
-                app_limit: u64::from(self.limits.app_limit),
+                limits: announced_limits(&self.limits),
                 identity_doc: enrollment.identity_doc().map(|doc| doc.signed().clone()),
                 revoked_apps: enrollment.revoked_apps().to_vec(),
             };
@@ -173,7 +173,7 @@ impl Service {
                 .await
                 .map_err(|e| store_error(&e))?;
             if created {
-                return Ok((key, base_ms));
+                return Ok((key, base_ms, account.limits));
             }
             // Another enrollment made the account first: its key answers.
             if let Err(failure) = self.keys.delete(&key.id).await {
@@ -201,6 +201,7 @@ impl Service {
             .transpose()
             .map_err(|_| unavailable())?;
         let pending = txn.pending_key().await.map_err(|e| store_error(&e))?;
+        let limits = txn.announced_limits().await.map_err(|e| store_error(&e))?;
         let state = AccountState {
             serving: names_this_service(held.as_ref(), &self.origin, &account_public),
             pending_key: pending.is_some(),
@@ -222,6 +223,6 @@ impl Service {
             .public_key(&key_id)
             .await
             .map_err(|_| unavailable())?;
-        Ok((ServiceKey { id: key_id, public }, time_ms))
+        Ok((ServiceKey { id: key_id, public }, time_ms, limits))
     }
 }

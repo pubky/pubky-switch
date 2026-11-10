@@ -99,6 +99,25 @@ impl Answer {
     }
 }
 
+/// A refusal under the account's lock: the error, whether the commit moves the key's mark,
+/// and whether the answer may carry the current head.
+#[derive(Debug)]
+struct Refused {
+    error: ApiError,
+    serving: bool,
+    head: bool,
+}
+
+impl Refused {
+    fn with_head(error: ApiError, serving: bool) -> Self {
+        Self {
+            error,
+            serving,
+            head: true,
+        }
+    }
+}
+
 /// Sign `answer` (Switch wire 7.1): the response signature over its status, the request
 /// signature, `Switch-Server-Time` and the body.
 fn sign_answer(
@@ -214,8 +233,9 @@ impl Service {
                 .operator_answer(request_signature.as_ref(), base_ms, &error)
                 .await;
         };
-        let txn = match self.store.begin(&account).await {
-            Ok(Some(txn)) => txn,
+        // Step 2: the account, looked up without taking its lock (Switch wire 7.2 Order).
+        let found = match self.store.lookup(&account).await {
+            Ok(Some(found)) => found,
             Ok(None) => {
                 let error = ApiError::not_found("no such account");
                 return self
@@ -228,25 +248,157 @@ impl Service {
                     .await;
             }
         };
-        self.at_account(txn, &request, base_ms, request_signature)
+        let call = &request.route.call;
+        let refused_early = |error: ApiError| {
+            let signature = if *call == Call::GetIdentity {
+                None
+            } else {
+                request_signature
+            };
+            async move {
+                self.early_answer(&found, signature.as_ref(), base_ms, &error)
+                    .await
+            }
+        };
+        // Everything that needs no account state comes before the lock: the limits that
+        // apply before authentication, the headers and the signature (Switch wire 7.2).
+        let caller = match call {
+            Call::GetIdentity => {
+                if let Err(error) = self.public_read_limits(&account, request.source, base_ms) {
+                    return refused_early(error).await;
+                }
+                None
+            }
+            Call::PutIdentity => match self.authenticate_signer(&account, &request, base_ms) {
+                Ok(claimed) => Some(claimed),
+                Err(error) => return refused_early(error).await,
+            },
+            _ => {
+                return refused_early(ApiError::unavailable("7.4: this call isn't served yet"))
+                    .await;
+            }
+        };
+        let txn = match self.store.begin(&account).await {
+            Ok(Some(txn)) => txn,
+            // Erased between the lookup and the lock.
+            Ok(None) => {
+                let error = ApiError::not_found("no such account");
+                return self
+                    .operator_answer(request_signature.as_ref(), base_ms, &error)
+                    .await;
+            }
+            Err(error) => return refused_early(store_error(&error)).await,
+        };
+        let signature = if caller.is_some() {
+            request_signature
+        } else {
+            // The public read's answer signs the hash of the empty string as the request
+            // signature, so it is the same for every reader (Switch wire 7.4.15).
+            None
+        };
+        self.at_account(txn, &request, base_ms, signature, caller.is_some())
             .await
     }
 
-    /// The processing order at an existing account (Switch wire 7.3 steps 3 to 10).
+    /// An answer before the account's lock: signed with its service key, at the service time
+    /// it last committed, which no answer it shows later is behind (Switch wire 7.3 step 3).
+    async fn early_answer(
+        &self,
+        found: &crate::store::FoundAccount,
+        request_signature: Option<&[u8; 64]>,
+        base_ms: u64,
+        error: &ApiError,
+    ) -> SwitchResponse {
+        match self.keys.signer(&found.service_key).await {
+            Ok(signer) => sign_answer(
+                &signer,
+                request_signature,
+                found.stamped_time_ms,
+                Answer::error(error),
+            ),
+            Err(failure) => {
+                tracing::error!(%failure, "an account's service key");
+                self.operator_answer(request_signature, base_ms, error)
+                    .await
+            }
+        }
+    }
+
+    /// The signer's authentication, before any account state (Switch wire 7.2 Order): the
+    /// network source's failed-authentication limit, then the headers, the timestamp and
+    /// the request signature, verified with the identity key `{id}` names.
+    fn authenticate_signer(
+        &self,
+        account: &str,
+        request: &SwitchRequest,
+        base_ms: u64,
+    ) -> Result<Claimed, ApiError> {
+        if let Err(retry_after) = self.failed_auth.check(request.source, base_ms) {
+            return Err(ApiError::rate_limited(
+                "9.4: too many failed authentications from this network source",
+                retry_after,
+            ));
+        }
+        let identity_key = pubky_switch_core::enc::pubky_key(account)
+            .map_err(|_| ApiError::not_found("no such account"))?;
+        let claimed = self
+            .authenticate(&identity_key, request, base_ms)
+            .inspect_err(|error| {
+                if is_failed_authentication(error.code) {
+                    self.record_failure(request, account.to_string());
+                }
+            })?;
+        rules::require_signer(&claimed.caller)?;
+        Ok(claimed)
+    }
+
+    /// The public read's limits (Switch wire 9.4), before the account's lock: per network
+    /// source per account, then the account's backstop, which a source's refused reads
+    /// don't count against.
+    fn public_read_limits(
+        &self,
+        account: &str,
+        source: Option<NetworkSource>,
+        base_ms: u64,
+    ) -> Result<(), ApiError> {
+        if let Some(source) = source
+            && let Err(retry_after) = self.reads_per_source.take(
+                (account.to_string(), source),
+                self.limits.identity_reads_per_source_per_min,
+                base_ms,
+            )
+        {
+            return Err(ApiError::rate_limited(
+                "9.4: public identity.json reads from this network source",
+                retry_after,
+            ));
+        }
+        if let Err(retry_after) = self.reads_per_account.take(
+            account.to_string(),
+            self.limits.identity_reads_per_min,
+            base_ms,
+        ) {
+            return Err(ApiError::rate_limited(
+                "9.4: public identity.json reads of this account",
+                retry_after,
+            ));
+        }
+        Ok(())
+    }
+
+    /// The processing order under the account's lock (Switch wire 7.3 steps 3 to 10), for a
+    /// request already authenticated as the signer, or the public read.
     async fn at_account(
         &self,
         mut txn: AccountTxn,
         request: &SwitchRequest,
         base_ms: u64,
         request_signature: Option<[u8; 64]>,
+        signer_call: bool,
     ) -> SwitchResponse {
-        // The public read's answer signs the hash of the empty string as the request
-        // signature, so it is the same for every reader (Switch wire 7.4.15).
-        let signature = if request.route.call == Call::GetIdentity {
-            None
-        } else {
-            request_signature.as_ref()
-        };
+        let signature = request_signature.as_ref();
+        // The time the account last committed, for an answer whose commit fails.
+        let committed_ms = txn.head().stamped_time_ms;
         // Step 3: the identity's service time, which never goes back.
         let time_ms = txn.stamp(base_ms);
         let signer = match self.keys.signer(&txn.head().service_key).await {
@@ -257,15 +409,29 @@ impl Service {
                 return self.operator_answer(signature, base_ms, &error).await;
             }
         };
-        let outcome = self
-            .run_at_account(&mut txn, &signer, request, base_ms, time_ms)
-            .await;
-        let (answer, marked) = match outcome {
+        let (answer, marked) = match self
+            .run_at_account(&mut txn, &signer, request, time_ms)
+            .await
+        {
             Ok(done) => done,
-            Err(error) => (Answer::error(&error), false),
+            Err(Refused {
+                error,
+                serving,
+                head,
+            }) => {
+                // An error to the authenticated signer carries the current head (Switch wire
+                // 7.1), except where the key's mark refuses one.
+                let head = if signer_call && head {
+                    self.head(&txn, &signer).await
+                } else {
+                    None
+                };
+                (Answer::error(&error).with_head(head), serving)
+            }
         };
         // Durable, then answered (step 10). An answer is sent even when the request only
-        // stamped the time, which must be durable before it is shown.
+        // stamped the time, which must be durable before it is shown. A serving account's
+        // commit moves the key's mark to the head the answer carries.
         let committed = if marked {
             txn.commit_marked(self.keys.as_ref())
                 .await
@@ -278,85 +444,84 @@ impl Service {
                 tracing::error!(%failure, "commit");
             })
         };
-        let answer = match committed {
-            Ok(_) => answer,
-            Err(()) => Answer::error(&ApiError::unavailable("7.6: a temporary failure")),
-        };
-        sign_answer(&signer, signature, time_ms, answer)
+        match committed {
+            Ok(()) => sign_answer(&signer, signature, time_ms, answer),
+            // Nothing committed, the stamp included: answer at the time last committed.
+            Err(()) => sign_answer(
+                &signer,
+                signature,
+                committed_ms,
+                Answer::error(&ApiError::unavailable("7.6: a temporary failure")),
+            ),
+        }
     }
 
-    /// Steps 4 to 9 at an account; the answer, and whether its commit moves the key's mark.
+    /// Steps 4 to 9 under the lock; the answer, and whether its commit moves the key's mark:
+    /// whenever the account served before the request or serves after it.
     async fn run_at_account(
         &self,
         txn: &mut AccountTxn,
         signer: &ServiceSigner,
         request: &SwitchRequest,
-        base_ms: u64,
         time_ms: u64,
-    ) -> Result<(Answer, bool), ApiError> {
+    ) -> Result<(Answer, bool), Refused> {
         let call = &request.route.call;
         let identity_key = txn.head().identity_key;
-        let held = match txn.held_identity().await.map_err(|e| store_error(&e))? {
-            Some(held) => Some(
-                IdentityDoc::verify(&held.doc, &identity_key)
-                    .map_err(|_| ApiError::unavailable("7.6: a temporary failure"))?,
+        let unavailable = |serving| {
+            Refused::with_head(ApiError::unavailable("7.6: a temporary failure"), serving)
+        };
+        let held = match txn.held_identity().await {
+            Ok(Some(held)) => Some(
+                IdentityDoc::verify(&held.doc, &identity_key).map_err(|_| unavailable(false))?,
             ),
-            None => None,
+            Ok(None) => None,
+            Err(error) => {
+                let _ = store_error(&error);
+                return Err(unavailable(false));
+            }
         };
         let serving = names_this_service(held.as_ref(), &self.origin, &signer.public_key_bytes());
 
-        // A serving account whose state is behind its key's mark fails stop (step 10).
+        // A serving account whose state is behind its key's mark fails stop, with no head
+        // (step 10).
         if serving {
             match txn.mark_check(self.keys.as_ref()).await {
                 Ok(MarkCheck::Behind | MarkCheck::Fork) => {
-                    return Err(ApiError::unavailable(
-                        "7.3: the state is behind its service key's mark; a new generation is \
-                         needed",
-                    ));
+                    return Err(Refused {
+                        error: ApiError::unavailable(
+                            "7.3: the state is behind its service key's mark; a new \
+                             generation is needed",
+                        ),
+                        serving: false,
+                        head: false,
+                    });
                 }
                 Ok(_) => {}
                 Err(failure) => {
                     tracing::error!(%failure, "the key's mark");
-                    return Err(ApiError::unavailable("7.6: a temporary failure"));
+                    return Err(Refused {
+                        error: ApiError::unavailable("7.6: a temporary failure"),
+                        serving: false,
+                        head: false,
+                    });
                 }
             }
         }
 
         if *call == Call::GetIdentity {
             return self
-                .public_identity(txn, request, held.as_ref(), serving, time_ms)
-                .map(|answer| (answer, false));
-        }
-        if !matches!(call, Call::PutIdentity) {
-            return Err(ApiError::unavailable("7.4: this call isn't served yet"));
+                .public_identity(held.as_ref(), serving)
+                .map(|answer| (answer, false))
+                .map_err(|error| Refused::with_head(error, false));
         }
 
-        // Step 5: authenticate, after the network source's failed-authentication limit.
-        if call.limits_failed_authentication()
-            && let Err(retry_after) = self.failed_auth.check(request.source, base_ms)
-        {
-            return Err(ApiError::rate_limited(
-                "9.4: too many failed authentications from this network source",
-                retry_after,
-            ));
-        }
-        let claimed = self
-            .authenticate(&identity_key, request, base_ms)
-            .inspect_err(|error| {
-                if is_failed_authentication(error.code) {
-                    self.record_failure(request, txn.head().id.clone());
-                }
-            })?;
-        rules::require_signer(&claimed.caller)?;
-
-        // Step 7: the staged gate.
-        staged_gate(call, !serving)?;
-
-        // Step 9.
-        let answer = self
+        // Step 7: the staged gate. Step 9: the endpoint.
+        staged_gate(call, !serving).map_err(|error| Refused::with_head(error, serving))?;
+        let (answer, serves_after) = self
             .put_identity(txn, signer, request, held.as_ref(), time_ms)
-            .await?;
-        Ok(answer)
+            .await
+            .map_err(|error| Refused::with_head(error, serving))?;
+        Ok((answer, serving || serves_after))
     }
 
     /// Decode and verify a request's signature (Switch wire 7.2). Only the signer is

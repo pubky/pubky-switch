@@ -488,3 +488,361 @@ async fn test_calls_not_served_yet() {
     assert!(signature_key(&feed).is_some());
     replay.db.drop_database().await.expect("drop");
 }
+
+/// alice's version 1 with `change` applied, signed by her identity key.
+fn alice_version(change: impl FnOnce(&mut pubky_switch_core::records::IdentityBody)) -> SignedDoc {
+    let version_1 = version("alice identity.json, first delivery (version 1)");
+    let mut body: pubky_switch_core::records::IdentityBody =
+        serde_json::from_slice(&version_1.body_bytes().expect("body")).expect("identity body");
+    change(&mut body);
+    pubky_switch_core::records::IdentityDoc::sign(&alice_keys().key, body)
+        .expect("sign")
+        .signed()
+        .clone()
+}
+
+fn header_of<'a>(response: &'a SwitchResponse, name: &str) -> Option<&'a str> {
+    response
+        .headers
+        .iter()
+        .find(|(header, _)| header.as_str() == name)
+        .and_then(|(_, value)| value.to_str().ok())
+}
+
+/// The account's service key ID, read from the database.
+async fn service_key_id(replay: &Replay, id: &str) -> pubky_switch::keys::KeyId {
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    let key: String = sqlx::query_scalar("SELECT service_key FROM accounts WHERE id = $1")
+        .bind(id)
+        .fetch_one(&mut conn)
+        .await
+        .expect("key");
+    conn.close().await.expect("close");
+    pubky_switch::keys::KeyId::parse(&key).expect("key id")
+}
+
+#[tokio::test]
+async fn test_identity_first_document_of_a_recovery_isnt_served_yet() {
+    let Some(replay) = replay().await else { return };
+    let alice = alice_keys();
+    set_time(&replay.clock, T);
+    let enrolled = replay
+        .service
+        .handle(signer_request(
+            "POST",
+            "/v1/enroll",
+            enrollment_body(1, ORIGIN),
+            ms(T),
+        ))
+        .await;
+    assert_eq!(enrolled.status, 200);
+    // A first document that starts a recovery at generation 3: the recovery transition comes
+    // with recovery, so the service doesn't chain it at the account's generation 1.
+    let recovery = alice_version(|body| {
+        body.version = 9;
+        body.generation = 3;
+        body.recovery_from = Some(2);
+    });
+    let path = format!("/v1/{}/identity", alice.id);
+    let answer = replay
+        .service
+        .handle(signer_request(
+            "PUT",
+            &path,
+            delivery(recovery, None),
+            ms(T),
+        ))
+        .await;
+    assert_eq!(
+        (answer.status, code(&answer).as_str()),
+        (503, "unavailable"),
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    let key = service_key_id(&replay, &alice.id).await;
+    assert_eq!(
+        pubky_switch::keys::KeyStore::mark(replay.keys.as_ref(), &key)
+            .await
+            .expect("mark"),
+        None,
+        "nothing chained"
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_authentication_takes_no_account_lock() {
+    let Some(replay) = replay().await else { return };
+    serving(&replay).await;
+    let alice = alice_keys();
+    let path = format!("/v1/{}/identity", alice.id);
+    // Another request holds the account's lock.
+    let held = replay
+        .db
+        .store()
+        .begin(&alice.id)
+        .await
+        .expect("begin")
+        .expect("account");
+    let mut garbage = signer_request(
+        "PUT",
+        &path,
+        delivery(version("alice identity.json"), None),
+        ms(T),
+    );
+    garbage
+        .headers
+        .insert(header::SIGNATURE, b64(&[7u8; 64]).parse().expect("value"));
+    let refused = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        replay.service.handle(garbage),
+    )
+    .await
+    .expect("answered without waiting for the lock");
+    assert_eq!(
+        (refused.status, code(&refused).as_str()),
+        (401, "bad_signature")
+    );
+    drop(held);
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_authentication_refusals_at_put_identity() {
+    let Some(replay) = replay_with(Limits {
+        auth_failures_per_source_per_min: 2,
+        ..Limits::default()
+    })
+    .await
+    else {
+        return;
+    };
+    serving(&replay).await;
+    let alice = alice_keys();
+    let path = format!("/v1/{}/identity", alice.id);
+    let body = delivery(version("alice identity.json"), None);
+    let source = Some(pubky_switch::http::source::NetworkSource::of(
+        "203.0.113.9".parse().expect("ip"),
+    ));
+
+    // Signed with another key than alice's identity key.
+    let keys = vectors("keys.json");
+    let bob = keys["identities"]
+        .as_array()
+        .expect("identities")
+        .iter()
+        .find(|identity| identity["name"] == "bob")
+        .expect("bob");
+    let mut wrong_key = signer_request("PUT", &path, body.clone(), ms(T));
+    let bob_key = ed25519_dalek::SigningKey::from_bytes(&hex32(&bob["secret_hex"]));
+    let timestamp = pubky_switch_core::time::rfc3339_seconds(ms(T));
+    let forged = pubky_switch_core::http::sign_request(
+        &bob_key,
+        &pubky_switch_core::http::RequestTarget {
+            method: "PUT",
+            path_and_query: &path,
+            body: &body,
+            origin: ORIGIN,
+        },
+        &pubky_switch_core::http::RequestHeaders {
+            timestamp,
+            identity: alice.id.clone(),
+            ..Default::default()
+        },
+    );
+    wrong_key
+        .headers
+        .insert(header::SIGNATURE, b64(&forged).parse().expect("value"));
+    wrong_key.source = source;
+    let refused = replay.service.handle(wrong_key).await;
+    assert_eq!(
+        (refused.status, code(&refused).as_str()),
+        (401, "bad_signature")
+    );
+
+    // Another identity's signer.
+    let mut other = signer_request("PUT", &path, body.clone(), ms(T));
+    other.headers.insert(
+        header::IDENTITY,
+        bob["pubky_id"]
+            .as_str()
+            .expect("id")
+            .parse()
+            .expect("value"),
+    );
+    assert_eq!(code(&replay.service.handle(other).await), "not_admitted");
+
+    // The second failure from the source fills its limit of 2; the next request from it is
+    // refused before any signature work, even a correctly signed one.
+    let mut stale = signer_request("PUT", &path, body.clone(), ms(T) - 301_000);
+    stale.source = source;
+    assert_eq!(code(&replay.service.handle(stale).await), "stale_timestamp");
+    let mut good = signer_request("PUT", &path, body, ms(T));
+    good.source = source;
+    let limited = replay.service.handle(good).await;
+    assert_eq!(
+        (limited.status, code(&limited).as_str()),
+        (429, "rate_limited")
+    );
+    assert!(header_of(&limited, header::RETRY_AFTER).is_some());
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_signer_error_answers_carry_the_head() {
+    let Some(replay) = replay().await else { return };
+    serving(&replay).await;
+    let alice = alice_keys();
+    let stale = replay
+        .service
+        .handle(signer_request(
+            "PUT",
+            &format!("/v1/{}/identity", alice.id),
+            delivery(version("alice identity.json"), Some([9; 32])),
+            ms(T),
+        ))
+        .await;
+    assert_eq!(code(&stale), "stale_identity");
+    let head = pubky_switch_core::chain::SignedHead::from_header(
+        header_of(&stale, header::HEAD).expect("a head on the signer's error answer"),
+    )
+    .expect("head");
+    let service_key: [u8; 32] = pubky_switch_core::enc::unb64(
+        vectors("keys.json")["service_keys"][0]["public"]
+            .as_str()
+            .expect("public"),
+    )
+    .expect("b64")
+    .try_into()
+    .expect("32 bytes");
+    head.verify(&service_key, &alice.key.public())
+        .expect("the head verifies");
+    assert_eq!(head.seq, 1);
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_delivery_away_from_this_service_moves_the_mark() {
+    let Some(replay) = replay().await else { return };
+    serving(&replay).await;
+    let alice = alice_keys();
+    let version_1 = version("alice identity.json, first delivery (version 1)");
+    let away = alice_version(|body| {
+        body.version = 2;
+        body.inbox.url = "https://other.example".into();
+    });
+    let answer = replay
+        .service
+        .handle(signer_request(
+            "PUT",
+            &format!("/v1/{}/identity", alice.id),
+            delivery(away, Some(version_1.doc_hash().expect("hash"))),
+            ms(T),
+        ))
+        .await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    assert_eq!(json(&answer)["head"]["seq"], 2);
+    let key = service_key_id(&replay, &alice.id).await;
+    let mark = pubky_switch::keys::KeyStore::mark(replay.keys.as_ref(), &key)
+        .await
+        .expect("mark")
+        .expect("marked");
+    assert_eq!(mark.seq, 2, "the head the answer carried is marked");
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_enrollment_answer_keeps_its_limits_after_a_config_change() {
+    let Some(replay) = replay().await else { return };
+    set_time(&replay.clock, T);
+    let body = enrollment_body(1, ORIGIN);
+    let first = replay
+        .service
+        .handle(signer_request("POST", "/v1/enroll", body.clone(), ms(T)))
+        .await;
+    assert_eq!(first.status, 200);
+    let restarted = replay.restarted_with(Limits {
+        app_limit: 40,
+        quota_bytes: 2 * Limits::default().quota_bytes,
+        ..Limits::default()
+    });
+    let again = restarted
+        .handle(signer_request("POST", "/v1/enroll", body, ms(T)))
+        .await;
+    assert_eq!(
+        String::from_utf8_lossy(&again.body),
+        String::from_utf8_lossy(&first.body),
+        "the same enrollment, the same answer"
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_commit_failure_answer_keeps_the_committed_time() {
+    let Some(replay) = replay().await else { return };
+    set_time(&replay.clock, T);
+    let enrolled = replay
+        .service
+        .handle(signer_request(
+            "POST",
+            "/v1/enroll",
+            enrollment_body(1, ORIGIN),
+            ms(T),
+        ))
+        .await;
+    assert_eq!(enrolled.status, 200);
+    // Every commit that changes the account now fails, at the commit itself.
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    for statement in [
+        "CREATE FUNCTION refuse() RETURNS trigger LANGUAGE plpgsql AS \
+         $$ BEGIN RAISE EXCEPTION 'refused at commit'; END $$",
+        "CREATE CONSTRAINT TRIGGER refuse_at_commit AFTER UPDATE ON accounts \
+         DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION refuse()",
+    ] {
+        sqlx::query(statement)
+            .execute(&mut conn)
+            .await
+            .expect("trigger");
+    }
+    conn.close().await.expect("close");
+    let later = ms(T) + 60_000;
+    set_time(&replay.clock, &pubky_switch_core::time::rfc3339(later));
+    let http = vectors("http.json");
+    let mut put = vector_request(named(&http["requests"], "signer: identity.json delivery"));
+    put = signer_request("PUT", &put.path_and_query, put.body.to_vec(), later);
+    let failed = replay.service.handle(put).await;
+    assert_eq!(code(&failed), "unavailable");
+    assert_eq!(
+        header_of(&failed, header::SERVER_TIME),
+        Some(pubky_switch_core::time::rfc3339(ms(T)).as_str()),
+        "the answer shows the committed time, not the stamp that didn't commit"
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_concurrent_first_enrollments_share_one_account() {
+    let Some(replay) = replay().await else { return };
+    set_time(&replay.clock, T);
+    let body = enrollment_body(1, ORIGIN);
+    let (a, b) = tokio::join!(
+        replay
+            .service
+            .handle(signer_request("POST", "/v1/enroll", body.clone(), ms(T))),
+        replay
+            .service
+            .handle(signer_request("POST", "/v1/enroll", body, ms(T))),
+    );
+    assert_eq!((a.status, b.status), (200, 200));
+    assert_eq!(json(&a)["service_key"], json(&b)["service_key"]);
+    replay.db.drop_database().await.expect("drop");
+}

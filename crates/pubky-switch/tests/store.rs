@@ -40,7 +40,7 @@ impl Fixture {
             generation: 1,
             service_key: key.id,
             created_at_ms: T0,
-            app_limit: 32,
+            limits: pubky_switch_core::records::Limits::default(),
             identity_doc: None,
             revoked_apps: Vec::new(),
         };

@@ -26,8 +26,8 @@ pub struct NewAccount {
     pub service_key: KeyId,
     /// The service time of the enrollment.
     pub created_at_ms: u64,
-    /// The app limit announced at enrollment.
-    pub app_limit: u64,
+    /// The limits the enrollment announces, kept for every later enrollment.
+    pub limits: pubky_switch_core::records::Limits,
     /// The `identity.json` the enrollment carried, for a new provider (Switch wire 3.7).
     pub identity_doc: Option<SignedDoc>,
     /// The App IDs the enrollment's `revoked_apps` names, kept for good from the start
@@ -134,7 +134,7 @@ pub(super) async fn create(pool: &PgPool, account: &NewAccount) -> Result<bool, 
     let mut tx = pool.begin().await.map_err(StoreError::from_db)?;
     let created = sqlx::query(
         "INSERT INTO accounts (id, identity_key, generation, service_key, created_at_ms, \
-         stamped_time_ms, app_limit, identity_doc) VALUES ($1, $2, $3, $4, $5, $5, $6, $7) \
+         stamped_time_ms, announced_limits, identity_doc) VALUES ($1, $2, $3, $4, $5, $5, $6, $7) \
          ON CONFLICT (id) DO NOTHING",
     )
     .bind(&account.id)
@@ -142,7 +142,10 @@ pub(super) async fn create(pool: &PgPool, account: &NewAccount) -> Result<bool, 
     .bind(to_db(account.generation, "generation")?)
     .bind(account.service_key.as_str())
     .bind(to_db(account.created_at_ms, "created_at_ms")?)
-    .bind(to_db(account.app_limit, "app_limit")?)
+    .bind(
+        serde_json::to_vec(&account.limits)
+            .map_err(|_| StoreError::Corrupt("the announced limits don't encode"))?,
+    )
     .bind(identity_doc)
     .execute(&mut *tx)
     .await
