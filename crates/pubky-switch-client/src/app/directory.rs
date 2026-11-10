@@ -38,6 +38,7 @@ use super::identity::{self, DOC_CACHE_MS, Taken};
 use super::state::CachedDoc;
 use super::{App, AppError};
 use crate::client::answers::Directory;
+use crate::client::read::Obj;
 use crate::client::{Credentials, SwitchClient};
 use crate::error::ClientError;
 
@@ -1125,13 +1126,16 @@ impl App {
     /// the cache; apps added since are checked, against an `identity.json` read again if the
     /// one held doesn't list them, and join it; the `apps_version` moves on. A `current`
     /// whose `receive_keys`, `not_current` and `added_apps` together name an App ID twice is
-    /// refused: nothing is taken from it, and the directory is read again.
+    /// refused: nothing is taken from it, and the directory is read again. So is one missing
+    /// any member the wire lists as required, or holding one as `null`: `receive_keys`,
+    /// `not_current`, `unknown_kids`, `added_apps` and `apps_version`. A sender then never
+    /// seals again for a set of apps that part of an answer left out.
     pub(crate) async fn take_stale_key(
         &mut self,
         pubky: &[u8; 32],
         current: &Value,
     ) -> Result<(), AppError> {
-        if names_an_app_twice(current) {
+        if !stale_key_reads(current) || names_an_app_twice(current) {
             return self.mark_directory_stale(pubky).await;
         }
         let Some(mut cached) = self.cached_directory(pubky).await? else {
@@ -1405,6 +1409,18 @@ fn app_id_of(value: &Value, name: &str) -> Option<[u8; 16]> {
 
 fn doc_of(value: &Value, name: &str) -> Option<SignedDoc> {
     SignedDoc::from_strict_value(value.get(name)?).ok()
+}
+
+/// Whether a `409 stale_key`'s `current` holds every member Switch wire 7.6 lists, none
+/// marked optional there: the four lists, present and arrays, and `apps_version`.
+fn stale_key_reads(current: &Value) -> bool {
+    let Ok(current) = Obj::of(current, "Switch wire 7.6: a stale_key's current") else {
+        return false;
+    };
+    ["receive_keys", "not_current", "unknown_kids", "added_apps"]
+        .iter()
+        .all(|name| current.required_list(name).is_ok())
+        && current.u64("apps_version").is_ok()
 }
 
 /// Whether a `409 stale_key`'s `current` names an App ID more than once across its

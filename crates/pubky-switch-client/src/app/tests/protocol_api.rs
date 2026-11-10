@@ -1291,6 +1291,59 @@ fn inbox_appends(p: &Pair) -> usize {
         .count()
 }
 
+fn directory_reads(p: &Pair) -> usize {
+    p.router
+        .log()
+        .iter()
+        .filter(|line| {
+            line.starts_with(&format!("GET {BOB_ORIGIN}")) && line.contains("/directory")
+        })
+        .count()
+}
+
+#[tokio::test]
+async fn test_stale_key_answer_missing_a_member_reads_the_directory_again() {
+    let members = [
+        "receive_keys",
+        "not_current",
+        "unknown_kids",
+        "added_apps",
+        "apps_version",
+    ];
+    for member in members {
+        for null in [false, true] {
+            let p = Pair::new();
+            let protocol = ApiProtocol::new(Mode::Plain);
+            let mut wallet = p.join(&p.alice, "wallet", &protocol).await;
+            let mut shop = p.join(&p.bob, "shop", &protocol).await;
+            shop.invite(&p.alice.identity().public()).await.unwrap();
+            wallet.send(Pair::note(&p.bob, "one")).await.unwrap();
+            let mut current = json!({
+                "receive_keys": [], "not_current": [], "unknown_kids": [], "added_apps": [],
+                "apps_version": 1,
+            });
+            if null {
+                current[member] = Value::Null;
+            } else {
+                current.as_object_mut().unwrap().remove(member);
+            }
+            p.bob.switch().fail_next(Fault::Error {
+                path: "/inbox".into(),
+                code: ErrorCode::StaleKey,
+                current,
+            });
+            let reads = directory_reads(&p);
+            let (_, delivery) = wallet.send(Pair::note(&p.bob, "two")).await.unwrap();
+            assert!(
+                matches!(delivery, Delivery::Accepted { .. }),
+                "{member}, null {null}: {delivery:?}"
+            );
+            // Nothing taken from the answer: sealed again for the directory read again.
+            assert_eq!(directory_reads(&p), reads + 1, "{member}, null {null}");
+        }
+    }
+}
+
 #[tokio::test]
 async fn test_scripted_inbox_identity_needed_delivers_the_copy_again() {
     let p = Pair::new();
