@@ -164,6 +164,48 @@ pub fn receive(
     // Check 1: open the envelope and read its plaintext.
     let plaintext = MessagePlaintext::open(entry.envelope, own_identity, receive_secret)
         .map_err(|e| dropped_by(1, e))?;
+    let opened = OpenedEntry {
+        sender: entry.sender,
+        cert: entry.cert,
+        accepted_at_ms: entry.accepted_at_ms,
+    };
+    check_opened(
+        plaintext,
+        &opened,
+        own_identity,
+        sender_identity,
+        rules,
+        processed,
+    )
+}
+
+/// An inbox entry whose envelope the app opened already: one it held or stored locally
+/// because its sender couldn't be checked, and checks again later (Switch spec 8.2, Switch
+/// wire 5.1 "A sender that can't be checked").
+#[derive(Clone, Copy, Debug)]
+pub struct OpenedEntry<'a> {
+    /// The entry's `sender` identity.
+    pub sender: [u8; 32],
+    /// The certificate the entry carries, the feed's `cert`.
+    pub cert: &'a SignedDoc,
+    /// When the inbox accepted the entry, a time on the recipient's service.
+    pub accepted_at_ms: u64,
+}
+
+/// Run checks 2 to 9 of Switch wire 5.1 on an entry whose envelope is open already, in
+/// their order, stopping at the first that fails. [`receive`] runs check 1 and then this.
+///
+/// # Errors
+///
+/// As [`receive`].
+pub fn check_opened(
+    plaintext: MessagePlaintext,
+    entry: &OpenedEntry<'_>,
+    own_identity: &[u8; 32],
+    sender_identity: SenderIdentity<'_>,
+    rules: &dyn KindRules,
+    processed: &Processed<'_>,
+) -> Result<Received, Refusal> {
     // Check 2: the entry's certificate, as a certificate of the entry's sender, for the app
     // the plaintext names (Switch wire 3.8 checks 1 and 2).
     let cert = AppCert::verify(entry.cert, &entry.sender).map_err(|e| dropped_by(2, e))?;
@@ -379,6 +421,59 @@ mod tests {
             &Rules,
             &|_, _| seen,
         )
+    }
+
+    #[test]
+    fn test_check_opened_checks_a_stored_plaintext_again() {
+        let w = world();
+        let env = envelope(&w, &w.bob, &w.bob_app, "sample.kind", w.alice.public());
+        let plaintext =
+            MessagePlaintext::open(&env, &w.alice.public(), &w.receive.secret()).unwrap();
+        let entry = OpenedEntry {
+            sender: w.bob.public(),
+            cert: w.cert.signed(),
+            accepted_at_ms: START,
+        };
+        let doc = listing(&w, &w.cert);
+        // Unverifiable while the sender's document can't be read, then accepted.
+        assert_eq!(
+            check_opened(
+                plaintext.clone(),
+                &entry,
+                &w.alice.public(),
+                SenderIdentity::Unavailable,
+                &Rules,
+                &|_, _| None,
+            )
+            .unwrap_err(),
+            Refusal::SenderUnverifiable
+        );
+        let got = check_opened(
+            plaintext.clone(),
+            &entry,
+            &w.alice.public(),
+            SenderIdentity::Held(&doc),
+            &Rules,
+            &|_, _| None,
+        )
+        .unwrap();
+        assert_eq!(got.message.kind, "sample.kind");
+        // Another sender than the certificate's fails check 2, as for a fresh entry.
+        let carol = IdentityKey::from_secret([7; 32]);
+        let other = OpenedEntry {
+            sender: carol.public(),
+            ..entry
+        };
+        let error = check_opened(
+            plaintext,
+            &other,
+            &w.alice.public(),
+            SenderIdentity::Held(&doc),
+            &Rules,
+            &|_, _| None,
+        )
+        .unwrap_err();
+        assert_eq!(check_of(error), 2);
     }
 
     fn check_of(refusal: Refusal) -> u8 {

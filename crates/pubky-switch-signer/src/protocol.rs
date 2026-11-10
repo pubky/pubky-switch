@@ -656,6 +656,19 @@ mod tests {
         );
         assert_eq!(terms.keyed, owned(&["write", "read", "tag:shop-1"]));
 
+        // Exactly the union, nothing more: alpha's `read` needs claims.read and beta's `lists`
+        // lists.read, lists.manage and claims.read again.
+        let some = protocols.terms(&owned(&["lists", "read", "tag"])).unwrap();
+        assert_eq!(
+            some.permissions,
+            [
+                Permission::ClaimsRead,
+                Permission::ListsRead,
+                Permission::ListsManage
+            ]
+        );
+        assert_eq!(some.keyed, owned(&["read", "tag"]));
+
         let none = protocols.terms(&owned(&["notes"])).unwrap();
         assert!(none.permissions.is_empty());
         assert!(none.keyed.is_empty());

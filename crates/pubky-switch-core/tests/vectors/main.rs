@@ -23,3 +23,10 @@ mod keys;
 mod operations;
 mod sealed;
 mod signatures;
+
+#[test]
+fn test_spec_vectors_dir_holds_the_vectors() {
+    let dir = pubky_switch_core::spec_vectors_dir();
+    assert!(dir.join("keys.json").is_file(), "{}", dir.display());
+    assert!(dir.join("README.md").is_file());
+}

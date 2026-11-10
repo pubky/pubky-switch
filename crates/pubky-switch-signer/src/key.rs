@@ -16,11 +16,23 @@
 //!
 //! # For hosts
 //!
-//! - **iOS:** one keychain item of a class ending in `ThisDeviceOnly` (Switch spec 3.1).
-//! - **Android:** a file encrypted under a Keystore key and excluded from backups.
-//! - **A key derived from a wallet seed:** `load` may derive it each time. `delete` then can't
-//!   make the key unrecoverable, and the host tells the user so before a hand-over (Switch spec
-//!   12.8, "The limit").
+//! The vault's one storing call, [`SecretVault::add`], never replaces a secret: it stores one only
+//! into an empty vault, as a single atomic step for every caller sharing the vault, so two
+//! identities created at once can't both succeed. How to get that atomicity:
+//!
+//! - **iOS:** one keychain item, of a class ending in `ThisDeviceOnly` (Switch spec 3.1), with
+//!   a fixed service and account and one access group for every process that uses it. `add` is
+//!   `SecItemAdd`, and `errSecDuplicateItem` is [`AddOutcome::Occupied`]. Never use
+//!   `SecItemUpdate`, or a delete followed by an add.
+//! - **Android:** the secret encrypted under a Keystore key, in a file excluded from backups.
+//!   `add` checks for the file and writes it under one lock that every handle and process of
+//!   the app takes: a `FileChannel` lock on a lock file, held together with an in-process mutex,
+//!   since the file lock alone doesn't exclude threads of one process. Alternatively it writes a
+//!   temporary file, syncs it, and links it into place with a call that fails when the target
+//!   exists (`Os.link`). A rename that replaces the target isn't a store-if-empty.
+//! - **A key derived from a wallet seed:** `load` may derive it each time, and `add` then
+//!   returns [`AddOutcome::Occupied`]. `delete` can't make such a key unrecoverable, and the
+//!   host tells the user so before a hand-over (Switch spec 12.8, "The limit").
 
 use std::sync::Arc;
 
@@ -67,11 +79,21 @@ impl std::fmt::Debug for IdentitySecret {
     }
 }
 
+/// What [`SecretVault::add`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AddOutcome {
+    /// The vault held no secret, and now holds this one.
+    Stored,
+    /// The vault already held a secret, and kept it unchanged.
+    Occupied,
+}
+
 /// Where the host keeps the identity secret. Implemented by the host app, for example on the
-/// iOS keychain or the Android Keystore.
+/// iOS keychain or the Android Keystore (see the module's "For hosts").
 ///
 /// The calls are synchronous, so Swift and Kotlin implement them without async callbacks.
-/// Each is atomic: after `store` returns `Ok`, `load` returns that secret, also after a crash.
+/// "Every caller sharing the vault" means every handle, thread and process that reads or
+/// writes the same stored secret.
 pub trait SecretVault: Send + Sync {
     /// The secret the vault holds, or `None` when it holds none.
     ///
@@ -80,12 +102,18 @@ pub trait SecretVault: Send + Sync {
     /// [`VaultError`] when the vault can't be read, for example while the device is locked.
     fn load(&self) -> Result<Option<IdentitySecret>, VaultError>;
 
-    /// Store `secret`, replacing any the vault holds.
+    /// Store `secret` if, and only if, the vault holds none.
+    ///
+    /// The check and the write are one atomic step for every caller sharing the vault: of any
+    /// number of `add` calls on an empty vault, exactly one returns [`AddOutcome::Stored`] and
+    /// the others [`AddOutcome::Occupied`], whatever their timing. `add` never replaces a held
+    /// secret, not even with the same bytes. After `Stored`, `load` returns this secret, also
+    /// after a crash or a power loss.
     ///
     /// # Errors
     ///
-    /// [`VaultError`] when the vault can't be written.
-    fn store(&self, secret: &IdentitySecret) -> Result<(), VaultError>;
+    /// [`VaultError`] when the vault can't be written. It then holds what it held before.
+    fn add(&self, secret: &IdentitySecret) -> Result<AddOutcome, VaultError>;
 
     /// Delete the secret from every copy the host keeps (Switch spec 3.1, "Deleting a key").
     /// Deleting a secret the vault doesn't hold succeeds.
@@ -165,22 +193,23 @@ impl IdentityKeyring {
         Ok(Self { vault, public })
     }
 
-    /// A new identity: a fresh secret from the secure random generator, stored in `vault`,
-    /// which must hold none. The secret is read back and checked before this returns, so a
-    /// vault that loses writes is found now, not at the first signature.
+    /// A new identity: a fresh secret from the secure random generator, added to `vault`,
+    /// which must hold none. Creations that race on one vault leave exactly one identity, since
+    /// the vault's [`SecretVault::add`] is atomic. The secret is read back and checked before
+    /// this returns, so a vault that loses writes is found now, not at the first signature.
     ///
     /// # Errors
     ///
-    /// [`KeyError::Occupied`] when the vault already holds a secret, [`KeyError::Crypto`] when
-    /// the generator fails, [`KeyError::Mismatch`] when the vault returns another secret than
-    /// the one stored, or the vault's error.
+    /// [`KeyError::Occupied`] when the vault already holds a secret, which is kept,
+    /// [`KeyError::Crypto`] when the generator fails, [`KeyError::Missing`] or
+    /// [`KeyError::Mismatch`] when the vault doesn't return the secret added, or the vault's
+    /// error.
     pub fn create(vault: Arc<dyn SecretVault>) -> Result<Self, KeyError> {
-        if vault.load()?.is_some() {
-            return Err(KeyError::Occupied);
-        }
         let key = IdentityKey::generate().map_err(|e| KeyError::Crypto(e.to_string()))?;
         let secret = IdentitySecret::from_bytes(key.secret_bytes());
-        vault.store(&secret)?;
+        if vault.add(&secret)? == AddOutcome::Occupied {
+            return Err(KeyError::Occupied);
+        }
         let keyring = Self {
             vault,
             public: key.public(),
@@ -190,13 +219,14 @@ impl IdentityKeyring {
     }
 
     /// Take the identity secret received in a hand-over, or opened from the signer's backup,
-    /// into `vault` (Switch spec 12.8). The secret must be the key of `identity`, and the vault
-    /// must hold none, or that same secret already, as after a retry.
+    /// into `vault` (Switch spec 12.8). The secret must be the key of `identity`. It is added
+    /// like a new one, so it never replaces another identity's secret, even one added at the
+    /// same moment. A vault that already holds this same secret, as after a retry, is fine.
     ///
     /// # Errors
     ///
     /// [`KeyError::Mismatch`] when `secret` isn't the key of `identity`, [`KeyError::Occupied`]
-    /// when the vault holds another secret, or the vault's error.
+    /// when the vault holds another secret, which is kept, or the vault's error.
     #[cfg_attr(
         not(test),
         expect(
@@ -212,10 +242,13 @@ impl IdentityKeyring {
         if secret.key().public() != *identity {
             return Err(KeyError::Mismatch);
         }
-        match vault.load()? {
-            Some(held) if held.as_bytes() == secret.as_bytes() => {}
-            Some(_) => return Err(KeyError::Occupied),
-            None => vault.store(secret)?,
+        if vault.add(secret)? == AddOutcome::Occupied {
+            // Fine only when the held secret is this one. A vault emptied since the `add`
+            // answered is reported as occupied too: the caller retries, and never overwrites.
+            match vault.load()? {
+                Some(held) if held.as_bytes() == secret.as_bytes() => {}
+                _ => return Err(KeyError::Occupied),
+            }
         }
         let keyring = Self {
             vault,
@@ -258,10 +291,9 @@ impl IdentityKeyring {
     }
 
     /// Run `use_key` with the identity key, for one signature or derivation over an input this
-    /// crate built: an identity-key format of Switch wire 2.3, the approval's companion claim
-    /// (Switch wire 3.10), the Switch root and the keys it yields, or the backup key (Switch
-    /// wire 1.5). The key is dropped, and zeroized, when `use_key` returns. `use_key` never
-    /// reads the secret bytes: that is [`IdentityKeyring::for_export`]'s alone.
+    /// crate built (see the module docs). The key is dropped, and zeroized, when `use_key`
+    /// returns. `use_key` never reads the secret bytes: that is
+    /// [`IdentityKeyring::for_export`]'s alone.
     ///
     /// # Errors
     ///
@@ -317,49 +349,65 @@ pub(crate) mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    /// A vault in process memory, for tests.
+    #[derive(Default)]
+    struct State {
+        secret: Option<[u8; 32]>,
+        failing: bool,
+    }
+
+    /// A vault in process memory, for tests. Every handle from [`MemoryVault::handle`] shares
+    /// one store, as handles in several threads or processes of one app share a keychain item,
+    /// and `add` checks and writes under the store's one lock.
     #[derive(Default)]
     pub(crate) struct MemoryVault {
-        secret: Mutex<Option<[u8; 32]>>,
-        failing: Mutex<bool>,
+        state: Arc<Mutex<State>>,
     }
 
     impl MemoryVault {
         pub(crate) fn holding(secret: [u8; 32]) -> Arc<Self> {
             let vault = Self::default();
-            *vault.secret.lock().unwrap() = Some(secret);
+            vault.replace(Some(secret));
             Arc::new(vault)
         }
 
+        /// Another handle to the same store.
+        fn handle(&self) -> Arc<Self> {
+            Arc::new(Self {
+                state: Arc::clone(&self.state),
+            })
+        }
+
         fn replace(&self, secret: Option<[u8; 32]>) {
-            *self.secret.lock().unwrap() = secret;
+            self.state.lock().unwrap().secret = secret;
         }
 
         fn fail(&self) {
-            *self.failing.lock().unwrap() = true;
+            self.state.lock().unwrap().failing = true;
         }
 
-        fn check(&self) -> Result<(), VaultError> {
-            if *self.failing.lock().unwrap() {
+        fn open(&self) -> Result<std::sync::MutexGuard<'_, State>, VaultError> {
+            let state = self.state.lock().unwrap();
+            if state.failing {
                 return Err(VaultError("locked".into()));
             }
-            Ok(())
+            Ok(state)
         }
     }
 
     impl SecretVault for MemoryVault {
         fn load(&self) -> Result<Option<IdentitySecret>, VaultError> {
-            self.check()?;
-            Ok(self.secret.lock().unwrap().map(IdentitySecret::from_bytes))
+            Ok(self.open()?.secret.map(IdentitySecret::from_bytes))
         }
-        fn store(&self, secret: &IdentitySecret) -> Result<(), VaultError> {
-            self.check()?;
-            self.replace(Some(*secret.as_bytes()));
-            Ok(())
+        fn add(&self, secret: &IdentitySecret) -> Result<AddOutcome, VaultError> {
+            let mut state = self.open()?;
+            if state.secret.is_some() {
+                return Ok(AddOutcome::Occupied);
+            }
+            state.secret = Some(*secret.as_bytes());
+            Ok(AddOutcome::Stored)
         }
         fn delete(&self) -> Result<(), VaultError> {
-            self.check()?;
-            self.replace(None);
+            self.open()?.secret = None;
             Ok(())
         }
     }
@@ -371,8 +419,8 @@ pub(crate) mod tests {
         fn load(&self) -> Result<Option<IdentitySecret>, VaultError> {
             Ok(None)
         }
-        fn store(&self, _: &IdentitySecret) -> Result<(), VaultError> {
-            Ok(())
+        fn add(&self, _: &IdentitySecret) -> Result<AddOutcome, VaultError> {
+            Ok(AddOutcome::Stored)
         }
         fn delete(&self) -> Result<(), VaultError> {
             Ok(())
@@ -414,6 +462,71 @@ pub(crate) mod tests {
             IdentityKeyring::open(vault).unwrap().public_key(),
             public_of([1; 32])
         );
+    }
+
+    /// Run `each` on `n` threads at once, each with its own handle to `vault`.
+    fn race<T: Send>(
+        vault: &MemoryVault,
+        n: usize,
+        each: impl Fn(usize, Arc<dyn SecretVault>) -> T + Sync,
+    ) -> Vec<T> {
+        let start = std::sync::Barrier::new(n);
+        std::thread::scope(|scope| {
+            let threads: Vec<_> = (0..n)
+                .map(|i| {
+                    let handle: Arc<dyn SecretVault> = vault.handle();
+                    let (start, each) = (&start, &each);
+                    scope.spawn(move || {
+                        start.wait();
+                        each(i, handle)
+                    })
+                })
+                .collect();
+            threads.into_iter().map(|t| t.join().unwrap()).collect()
+        })
+    }
+
+    #[test]
+    fn test_key_concurrent_creations_leave_exactly_one_identity() {
+        for _ in 0..20 {
+            let vault = MemoryVault::default();
+            let results = race(&vault, 8, |_, handle| IdentityKeyring::create(handle));
+            let (won, lost): (Vec<_>, Vec<_>) = results.into_iter().partition(Result::is_ok);
+            assert_eq!(won.len(), 1, "exactly one creation succeeds");
+            for error in lost {
+                assert_eq!(error.unwrap_err(), KeyError::Occupied);
+            }
+            // The winner's key is the one held, and still works through any handle.
+            let winner = won.into_iter().next().unwrap().unwrap();
+            assert_eq!(
+                winner.with_key(|key| key.public()).unwrap(),
+                winner.public_key()
+            );
+            let reopened = IdentityKeyring::open(vault.handle()).unwrap();
+            assert_eq!(reopened.public_key(), winner.public_key());
+        }
+    }
+
+    #[test]
+    fn test_key_install_racing_a_creation_never_overwrites() {
+        let identity = public_of([3; 32]);
+        for _ in 0..20 {
+            let vault = MemoryVault::default();
+            let results = race(&vault, 2, |i, handle| {
+                if i == 0 {
+                    IdentityKeyring::create(handle)
+                } else {
+                    let secret = IdentitySecret::from_bytes([3; 32]);
+                    IdentityKeyring::install(handle, &identity, &secret)
+                }
+            });
+            let won: Vec<_> = results.iter().filter_map(|r| r.as_ref().ok()).collect();
+            assert_eq!(won.len(), 1, "{results:?}");
+            assert!(results.iter().any(|r| matches!(r, Err(KeyError::Occupied))));
+            let held = IdentityKeyring::open(vault.handle()).unwrap();
+            assert_eq!(held.public_key(), won[0].public_key());
+            won[0].with_key(|_| ()).unwrap();
+        }
     }
 
     #[test]

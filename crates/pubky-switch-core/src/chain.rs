@@ -1408,6 +1408,77 @@ impl Verifier {
         self.at = self.at.split_off(&seq);
         self.pending_heads.retain(|h| h.seq > seq);
     }
+
+    /// The verifier's whole state, as plain data an app persists between runs, so that
+    /// rollback detection survives a restart (Switch spec 10.1).
+    pub fn state(&self) -> VerifierState {
+        VerifierState {
+            generation: self.generation,
+            last_seq: self.last_seq,
+            last_hash: self.last_hash,
+            last_time: self.last_time,
+            open_batch: self.open_batch,
+            batches: self.batches.iter().map(|(id, t)| (*id, *t)).collect(),
+            at: self.at.clone(),
+            pending_heads: self.pending_heads.clone(),
+            checkpoint_seq: self.checkpoint_seq,
+            pruned_seq: self.pruned_seq,
+            pending_checkpoint: self.pending_checkpoint,
+            highest_time: self.highest_time,
+        }
+    }
+
+    /// A verifier with a state [`Verifier::state`] gave, as an app reloads it. A state the
+    /// app builds itself, such as an anchor at its own first registration (Switch spec
+    /// 8.3), is taken as given: where it starts verifying is the app's own decision.
+    pub fn from_state(state: VerifierState) -> Self {
+        Self {
+            generation: state.generation,
+            last_seq: state.last_seq,
+            last_hash: state.last_hash,
+            last_time: state.last_time,
+            open_batch: state.open_batch,
+            batches: state.batches.into_iter().collect(),
+            at: state.at,
+            pending_heads: state.pending_heads,
+            checkpoint_seq: state.checkpoint_seq,
+            pruned_seq: state.pruned_seq,
+            pending_checkpoint: state.pending_checkpoint,
+            highest_time: state.highest_time,
+        }
+    }
+}
+
+/// The state of a [`Verifier`] as plain data (Switch wire 6.6, 6.7, 7.4.4), for an app to
+/// persist and reload. It holds no secret.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VerifierState {
+    /// The generation followed.
+    pub generation: u64,
+    /// The last verified `seq`.
+    pub last_seq: u64,
+    /// Its chain hash.
+    pub last_hash: [u8; 32],
+    /// The last verified stub's `server_time`; `None` right after continuing from a
+    /// checkpoint or an anchor.
+    pub last_time: Option<u64>,
+    /// The open batch and the number of its items seen.
+    pub open_batch: Option<(BatchRef, u64)>,
+    /// The batch IDs within the 30-day window, each with its first stub's `server_time`.
+    pub batches: BTreeMap<[u8; 16], u64>,
+    /// The chain hash at each verified `seq` from the latest checkpoint on.
+    pub at: BTreeMap<u64, [u8; 32]>,
+    /// Heads beyond the verified chain, waiting for the stubs to reach them.
+    pub pending_heads: Vec<SignedHead>,
+    /// The latest checkpoint accepted from the current service, 0 for none.
+    pub checkpoint_seq: u64,
+    /// The newest checkpoint accepted from any service, 0 for none: no chain hash is kept
+    /// behind it.
+    pub pruned_seq: u64,
+    /// A checkpoint beyond the verified chain, accepted once the stubs reach it.
+    pub pending_checkpoint: Option<SignedHead>,
+    /// The highest `server_time` verified.
+    pub highest_time: Option<u64>,
 }
 
 /// The newest chain item a checkpoint may lie at, and stubs be dropped up to, at or before
@@ -1970,6 +2041,28 @@ mod tests {
         assert!(check_attempt_proof(&proof, &stale, &app, 1).is_err());
         let (_, late, entry) = attempt_and_proof(Some(START), START);
         assert!(check_attempt_proof(&late, &entry, &app, 1).is_err());
+    }
+
+    #[test]
+    fn test_verifier_state_round_trips_and_keeps_checking() {
+        let id = [4; 16];
+        let (stubs, _) = chain(&[(None, START), (Some((id, 2)), START + 1)]);
+        let mut v = Verifier::new(1);
+        v.push(&stubs[0]).unwrap();
+        v.push(&stubs[1]).unwrap();
+        // Saved inside the open batch: the reloaded verifier still needs its last item.
+        let reloaded = Verifier::from_state(v.state());
+        assert_eq!(reloaded.state(), v.state());
+        assert!(reloaded.holds_batch(&id));
+        assert!(reloaded.end_of_feed().is_err());
+        let mut reloaded = reloaded;
+        reloaded.push(&stubs[2]).unwrap();
+        assert!(reloaded.end_of_feed().is_ok());
+        // A reloaded verifier refuses what the original refuses: the same stub again.
+        assert!(matches!(
+            reloaded.push(&stubs[2]),
+            Err(ChainError::Seq { .. })
+        ));
     }
 
     #[test]

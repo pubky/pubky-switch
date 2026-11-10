@@ -28,17 +28,24 @@ From the moment an install becomes the signer, keeping the key safe and backed u
 
 ```rust
 pub trait SecretVault: Send + Sync {
-    fn load(&self) -> Result<Option<IdentitySecret>, VaultError>; // per operation, zeroized after
-    fn store(&self, secret: &IdentitySecret) -> Result<(), VaultError>; // first setup, take-over, restore
+    fn load(&self) -> Result<Option<IdentitySecret>, VaultError>;     // per operation, zeroized after
+    fn add(&self, secret: &IdentitySecret) -> Result<AddOutcome, VaultError>; // store only into an empty vault
     fn delete(&self) -> Result<(), VaultError>;
 }
+
+pub enum AddOutcome { Stored, Occupied }
 ```
 
+- **`add` never replaces a secret.** It stores one only when the vault holds none, and the check and the write are one atomic step for every caller sharing the vault: every handle, thread and process that reads or writes the same stored secret. Of two `add` calls on an empty vault, exactly one returns `Stored`; the other returns `Occupied` and the held secret is unchanged. So two identities created at once can't both succeed while one of their keys is lost.
+  - **iOS:** `SecItemAdd` on one item with a fixed service, account and access group; `errSecDuplicateItem` is `Occupied`. Never `SecItemUpdate`, or a delete followed by an add.
+  - **Android:** check and write under one lock every handle and process takes (a `FileChannel` lock on a lock file together with an in-process mutex), or write a temporary file and link it into place with a call that fails when the target exists (`Os.link`). A replacing rename doesn't qualify.
+- **No caller overwrites.** Creating an identity, taking over, restoring from the backup and receiving a hand-over all go through `add`. A received key that is already held, as after a retry, counts as stored; any other held secret is `Occupied`, and the host resolves it explicitly, for example by deleting an identity the user gave up. An install that isn't named but holds the key takes over without writing the vault.
+
 - **`IdentitySecret`** is the 32-byte Ed25519 secret (seed). It zeroizes on drop and `Debug` never shows it; the host builds one from the bytes it keeps and reads them back with `as_bytes` to store them.
-- **Synchronous:** Swift and Kotlin implement the three calls without async callbacks. Each is atomic: after `store` returns `Ok`, `load` returns that secret, also after a crash.
+- **Synchronous:** Swift and Kotlin implement the three calls without async callbacks. After `add` returns `Stored`, `load` returns that secret, also after a crash; after an error the vault holds what it held before.
 - **Where it lives:** on iOS, one keychain item of a `...ThisDeviceOnly` class. On Android, a Keystore-wrapped file excluded from backups (spec 3.1).
 - **What the host code does:** Swift and Kotlin never sign, derive or parse anything. They move 32 opaque bytes.
-- **Hosts that derive the key:** a host that already controls the key, for example one that derives it from a wallet seed, implements `load` as that derivation. It implements `store` and `delete` by its own policy. For a derived key, `delete` can't make the key unrecoverable, and the host tells the user so at a hand-over (spec 12.8, "The limit").
+- **Hosts that derive the key:** a host that already controls the key, for example one that derives it from a wallet seed, implements `load` as that derivation, and `add` answers `Occupied`. It implements `delete` by its own policy. For a derived key, `delete` can't make the key unrecoverable, and the host tells the user so at a hand-over (spec 12.8, "The limit").
 - **Backups:** the identity key itself is the host's to back up. The signer's records are backed up by the crate (section 4.4).
 
 ### 2.2 `IdentityKeyring` (the crate's side)
@@ -64,7 +71,7 @@ pub enum ExportReason { HandOver { to_app: [u8; 16] }, Backup }
 - **It holds no secret.** It holds the vault and the identity's public key. Each use loads the secret, checks that its public key is still this identity's, makes the core's `IdentityKey` for one operation and drops it, zeroized.
 - **No signing in the public API.** `with_key` is the crate's alone. The crate calls it only to sign inputs it builds, through the core's builders, for the identity-key rows of wire 2.3 and the approval's companion claim (wire 3.10), and for the derivations of spec 13.3: the Switch root and the keys it yields, and the backup key. The core's builders sign Pubky's own formats from typed inputs too.
 - **The secret leaves for two reasons only.** `for_export` is the one place the secret bytes may be read, and only to seal them at once, in a hand-over to `to_app` (wire 3.12) or in the signer's backup (wire 3.13).
-- **Received keys:** `install` takes the secret of a hand-over or a backup into the vault only when it is the identity's key, and only into a vault that holds none or that same secret, as after a retry.
+- **Received keys:** `install` adds the secret of a hand-over or a backup to the vault only when it is the identity's key. A vault that already holds that same secret, as after a retry, is fine; another secret is `Occupied`.
 - **`KeyError`** says which of these went wrong: the vault failed, it holds no secret, it already holds one, the secret isn't this identity's, the bytes aren't 32 long, or the random generator failed.
 
 ## 3. Protocols
