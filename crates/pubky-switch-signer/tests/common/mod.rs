@@ -13,9 +13,10 @@ use pubky_switch_client::clock::TestClock;
 use pubky_switch_client::store::{KeyValue, MemoryStore, StateStore, StoreHandle, WriteBatch};
 use pubky_switch_client::testing::{SWITCH_ORIGIN, ScriptedSwitch};
 use pubky_switch_client::transport::{BoxFuture, MockTransport};
-use pubky_switch_core::keys::IdentityKey;
+use pubky_switch_core::keys::{AppKeys, IdentityKey};
 use pubky_switch_core::records::{
-    IDENTITY_PATH, IdentityDoc, SIGNER_BACKUP_PATH, SignerBackup, SignerRecords,
+    AppRequest, AppRequestBody, AuthRequest, IDENTITY_PATH, IdentityDoc, SIGNER_BACKUP_PATH,
+    SignerBackup, SignerRecords, app_record_path,
 };
 use pubky_switch_core::scopes::Permission;
 use pubky_switch_core::sig::SignedDoc;
@@ -160,7 +161,11 @@ impl Protocol for Notes {
         "notes"
     }
     fn scopes(&self) -> Vec<ScopeDef> {
-        vec![ScopeDef::keyed("notes"), ScopeDef::unkeyed("notes_tags")]
+        vec![
+            ScopeDef::keyed("notes"),
+            ScopeDef::keyed("notes_sync"),
+            ScopeDef::unkeyed("notes_tags"),
+        ]
     }
     fn check_scopes(&self, _: &[&str]) -> Result<(), String> {
         Ok(())
@@ -213,12 +218,17 @@ impl World {
     }
 
     pub fn env(&self, store: Arc<dyn StateStore>) -> SignerEnv {
+        self.env_with(store, Protocols::new(vec![Arc::new(Notes)]).unwrap())
+    }
+
+    /// The env with `protocols` registered in place of the test protocol.
+    pub fn env_with(&self, store: Arc<dyn StateStore>, protocols: Protocols) -> SignerEnv {
         SignerEnv {
             store: StoreHandle::inline(store),
             clock: self.clock.clone(),
             transport: self.transport.clone(),
             homeserver: self.homeserver.clone(),
-            protocols: Protocols::new(vec![Arc::new(Notes)]).unwrap(),
+            protocols,
         }
     }
 
@@ -293,5 +303,101 @@ impl World {
         body.version += 1;
         body.signer = install;
         IdentityDoc::sign(&self.key, body).unwrap()
+    }
+}
+
+/// An app asking for `scopes`, with the auth request its request binds.
+pub struct App {
+    pub keys: AppKeys,
+    pub auth: AuthRequest,
+    pub request: SignedDoc,
+}
+
+impl App {
+    pub fn new(scopes: &[&str], caps: Option<String>, secret: [u8; 32]) -> Self {
+        Self::with_keys(
+            AppKeys::from_secrets([3; 32], [4; 32]),
+            scopes,
+            caps,
+            secret,
+        )
+    }
+
+    /// An app with `keys` asking for `scopes`.
+    pub fn with_keys(
+        keys: AppKeys,
+        scopes: &[&str],
+        caps: Option<String>,
+        secret: [u8; 32],
+    ) -> Self {
+        let record = format!("{}:rw", app_record_path(&keys.app_id_bytes()));
+        let caps = caps.unwrap_or_else(|| {
+            if scopes.contains(&"notes_tags") {
+                format!("{record},{TAGS_PATH}:rw")
+            } else {
+                record
+            }
+        });
+        let auth = AuthRequest {
+            client_id: "app.example".into(),
+            client_key: [8; 32],
+            caps,
+            secret,
+        };
+        let scopes = scopes.iter().map(|s| (*s).to_owned()).collect();
+        let request = AppRequest::sign(&keys, AppRequestBody::new(&keys, scopes, &auth))
+            .unwrap()
+            .signed()
+            .clone();
+        Self {
+            keys,
+            auth,
+            request,
+        }
+    }
+}
+
+impl World {
+    /// Approve `app` with `signer`: review, approve and report the claim delivered. The app
+    /// then joins ([`World::join`]).
+    pub async fn approve(&self, signer: &mut Signer, app: &App) -> IdentityDoc {
+        let review = signer.review(&app.request, &app.auth).unwrap();
+        let approved = signer.approve(review).await.unwrap();
+        signer.claim_delivered(&approved.request).await.unwrap();
+        self.join(app, &approved);
+        signer.identity_doc().unwrap().unwrap()
+    }
+
+    /// `app` joins as Switch spec 12.1 step 2 says: it reads its approval's claim and delivers
+    /// its record with the certificate the approval names.
+    pub fn join(&self, app: &App, approved: &pubky_switch_signer::ApprovedRequest) {
+        use pubky_switch_core::ops::OpKind;
+        use pubky_switch_core::records::{AppRecord, AppRecordBody, Approval, ApprovalClaim};
+        let identity = self.key.public();
+        let claim = ApprovalClaim::from_plaintext(&approved.claim).unwrap();
+        let json = claim.verify(&identity, &app.auth).unwrap();
+        let request = AppRequest::verify(&app.request).unwrap();
+        let read = Approval::read(
+            json,
+            &request,
+            &identity,
+            &app.keys.bundle_secret(),
+            // Every test scope has keys but `notes_tags`.
+            &|scope: &str| scope != "notes_tags",
+        )
+        .unwrap();
+        let record = AppRecord::sign(
+            &app.keys,
+            AppRecordBody::new(&read.cert, Vec::new(), START_MS),
+        )
+        .unwrap();
+        self.switch
+            .app_op(
+                &app.keys,
+                OpKind::AppPut {
+                    record: record.signed().clone(),
+                },
+            )
+            .unwrap();
     }
 }

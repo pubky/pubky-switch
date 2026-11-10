@@ -141,6 +141,20 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Claim, StoreError> {
     })
 }
 
+/// When a claim may be deleted, as stored (Switch wire 6.8), from the core's rule: for a pin
+/// to a deadline, the deadline plus the reconciliation window; for a pin to none, its last
+/// entry's time, to which the deletion adds `max_claim_age_ms`. Both `None` while it may not
+/// be deleted.
+pub(crate) fn deletion(claim: &Claim) -> (Option<u64>, Option<u64>) {
+    // With an age of 0, the rule gives a pin to none its last entry's time.
+    let from = claim.deletable_from(0);
+    match claim.pin {
+        Pin::At(_) => (from, None),
+        Pin::NoDeadline => (None, from),
+        Pin::Unpinned => (None, None),
+    }
+}
+
 /// The owner of each attempt open or unknown, once per attempt, which the per-app limit on
 /// open attempts counts (Switch wire 6.8); none for a tombstone.
 pub(crate) fn open_owners(claim: &Claim) -> Vec<Vec<u8>> {

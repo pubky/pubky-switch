@@ -112,6 +112,8 @@ pub(crate) struct PushReg {
 pub struct SwitchApp {
     /// The app record it registered (signed).
     pub record: Option<SignedDoc>,
+    /// When the switch took that record (`record_at`, Switch wire 7.4.12).
+    pub record_at: Option<u64>,
     /// The certificate of that record, verified.
     pub cert: Option<AppCert>,
     /// The renewed certificate a `cert.put` stored, verified.
@@ -238,6 +240,8 @@ pub(crate) struct Inner {
     pub(crate) delivery_proof: Option<SignedDoc>,
     /// The limits an enrollment announces.
     pub(crate) enroll_limits: pubky_switch_core::records::Limits,
+    /// The data epoch of the first delivered `identity.json` that listed each app.
+    pub(crate) listed_at_epoch: BTreeMap<[u8; 16], u64>,
     /// The identity's service time, the last the switch stamped: a request refused before
     /// the account's lock, such as a `401 stale_timestamp`, answers with it and doesn't
     /// move it (Switch wire 7.1).
@@ -297,6 +301,7 @@ impl Inner {
             kept_app_ids: Vec::new(),
             delivery_proof: None,
             enroll_limits: pubky_switch_core::records::Limits::default(),
+            listed_at_epoch: BTreeMap::new(),
         }
     }
 }

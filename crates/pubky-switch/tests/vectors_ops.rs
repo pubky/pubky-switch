@@ -101,6 +101,72 @@ async fn test_vectors_ops_replay_chain() {
     assert_eq!(replay.db.give_out_seq(&alice_id).await.expect("seq"), 5);
     replay_batch(&replay, &chain, &[6]).await;
     replay_batch(&replay, &chain, &[7, 8]).await;
+
+    // The signer revokes the phone: the revoke transition at seq 9 (Switch wire 7.4.12).
+    let revoke = chain_item(&chain, 9);
+    let at = item_time(revoke);
+    set_time(&replay.clock, &at);
+    let phone = app(&keys, "phone")["app_id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    let path = format!("/v1/{alice_id}/apps/{phone}/revoke");
+    let answer = replay
+        .service
+        .handle(signer_request("POST", &path, Vec::new(), ms(&at)))
+        .await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    let body: Value = serde_json::from_slice(&answer.body).expect("json");
+    assert_eq!(
+        body["proofs"],
+        serde_json::json!([proof_at(&chain, 9)]),
+        "the revoke proof"
+    );
+    assert_eq!(body["head"]["chain_hash"], revoke["chain_hash"]);
+    // Again: revoked already, no proof.
+    let again = replay
+        .service
+        .handle(signer_request("POST", &path, Vec::new(), ms(&at)))
+        .await;
+    let body: Value = serde_json::from_slice(&again.body).expect("json");
+    assert_eq!(
+        (again.status, body["proofs"].clone()),
+        (200, serde_json::json!([]))
+    );
+
+    // The wallet deletes the record: seq 10, its proof showing deleted (Switch wire 6.2).
+    let delete = &chain["record_delete"];
+    let at = item_time(&delete["item"]);
+    set_time(&replay.clock, &at);
+    let signed: SignedDoc = serde_json::from_value(delete["item"]["item"].clone()).expect("op");
+    let body = OpsRequest::new(&[SignedOp::peek(&signed).expect("op")], None).to_json();
+    let wallet = app(&keys, "wallet");
+    let request = app_request(
+        wallet,
+        "POST",
+        &format!("/v1/{alice_id}/ops"),
+        body,
+        ms(&at),
+    );
+    let answer = replay.service.handle(request).await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    let body: Value = serde_json::from_slice(&answer.body).expect("json");
+    assert_eq!(
+        body["proofs"],
+        serde_json::json!([delete["transition_proof"]["signed"]]),
+        "the delete's proof"
+    );
+    assert_eq!(body["head"]["chain_hash"], delete["item"]["chain_hash"]);
     replay.db.drop_database().await.expect("drop");
 }
 

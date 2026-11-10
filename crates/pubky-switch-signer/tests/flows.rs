@@ -915,3 +915,57 @@ async fn test_signer_a_newer_homeserver_version_by_another_install_stops_signing
     assert!(world.sent_docs().iter().all(|d| d.version() < 4));
     assert_eq!(world.published().unwrap().signed(), theirs.signed());
 }
+
+#[tokio::test]
+async fn test_signer_clearing_an_alarm_once_another_install_signs_delivers_nothing() {
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let first = signer.identity_doc().unwrap().unwrap();
+    signer.set_record_max_age(Some(86_400)).await.unwrap();
+    world.switch.deliver_identity(&first).unwrap();
+    let SignerError::Alarm(alert) = signer.set_record_max_age(Some(60)).await.unwrap_err() else {
+        panic!("no alarm")
+    };
+    // Another install then takes over.
+    let second = signer.identity_doc().unwrap().unwrap();
+    world
+        .switch
+        .deliver_identity(&world.other_install_version(&second, [7; 16]))
+        .unwrap();
+    signer.set_record_max_age(Some(120)).await.unwrap_err();
+    assert_eq!(
+        signer.status(),
+        pubky_switch_signer::SignerStatus::ManagedBy { install: [7; 16] }
+    );
+    let sent = world.sent_docs().len();
+    signer.clear_alert(&alert).await.unwrap();
+    assert_eq!(world.sent_docs().len(), sent);
+    // No flow is left behind: resuming has nothing to do.
+    signer.resume().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_signer_clearing_an_alarm_over_an_emptied_switch_delivers_nothing() {
+    // The switch held version 1 and answers that it holds none: it lost the account's state.
+    // Delivering version 1 again would start the account afresh at the same generation
+    // (Switch spec 6.5), so clearing the alert sends nothing and the switch stays
+    // unconfirmed; the way out is a provider loss.
+    use pubky_switch_client::testing::Fault as SwitchFault;
+    use pubky_switch_core::http::ErrorCode;
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    world.switch.fail_next(SwitchFault::Error {
+        path: "/identity".into(),
+        code: ErrorCode::StaleIdentity,
+        current: serde_json::Value::Null,
+    });
+    let SignerError::Alarm(alert) = signer.set_record_max_age(Some(86_400)).await.unwrap_err()
+    else {
+        panic!("no alarm")
+    };
+    assert!(matches!(alert, Alert::Rollback { version: None, .. }));
+    let sent = world.sent_docs().len();
+    signer.clear_alert(&alert).await.unwrap();
+    assert_eq!(world.sent_docs().len(), sent);
+    assert!(signer.alerts().is_empty());
+}

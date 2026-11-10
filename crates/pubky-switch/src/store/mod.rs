@@ -336,25 +336,44 @@ impl Store {
         }))
     }
 
-    /// The app record account `id` holds for `app_id`, read without the account's lock, for
-    /// verifying an own app's request before it (Switch wire 7.2 Order). A plain read
-    /// doesn't wait for the lock; the endpoint checks under it that the key still holds.
-    pub async fn app_record(
+    /// The app row account `id` holds for `app_id`, read without the account's lock, for
+    /// the checks of an own app's request before it (Switch wire 7.2 Order). A plain read
+    /// doesn't wait for the lock; the endpoint checks again under it.
+    pub async fn app_row(
         &self,
         id: &str,
         app_id: &[u8; 16],
-    ) -> Result<Option<pubky_switch_core::sig::SignedDoc>, StoreError> {
-        let record: Option<Option<Vec<u8>>> =
-            sqlx::query_scalar("SELECT record FROM apps WHERE account_id = $1 AND app_id = $2")
-                .bind(id)
-                .bind(app_id.as_slice())
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(StoreError::from_db)?;
-        record
-            .flatten()
-            .map(|bytes| identity::decode_doc(&bytes, "app record"))
-            .transpose()
+    ) -> Result<Option<StoredApp>, StoreError> {
+        ops::app_row(&self.pool, id, app_id).await
+    }
+
+    /// What an own app's checks before the lock read, in one statement: account `id`'s
+    /// newest `identity.json`, the row of `app_id`, and whether it is kept for good (Switch
+    /// wire 7.2 Order). `None` for an account that isn't there.
+    pub async fn own_app_view(
+        &self,
+        id: &str,
+        app_id: &[u8; 16],
+    ) -> Result<
+        Option<(
+            Option<pubky_switch_core::sig::SignedDoc>,
+            Option<StoredApp>,
+            bool,
+        )>,
+        StoreError,
+    > {
+        ops::own_app_view(&self.pool, id, app_id).await
+    }
+
+    /// The first `steps` entries of claim `claim_key` at account `id`, by step, read without
+    /// the account's lock (Switch wire 7.4.8): entries never change once written.
+    pub async fn claim_entries_before(
+        &self,
+        id: &str,
+        claim_key: &[u8; 32],
+        steps: u64,
+    ) -> Result<Vec<StoredClaimEntry>, StoreError> {
+        ops::claim_entries_before(&self.pool, id, claim_key, steps).await
     }
 
     /// Start a request to account `id`: a transaction holding the account's lock until it

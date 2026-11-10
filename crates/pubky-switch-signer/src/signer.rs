@@ -49,8 +49,10 @@ use crate::protocol::Protocols;
 use crate::state::{self, DeliverStep, Flow, Newest, Service, SignerState};
 
 mod approval;
+mod renewal;
 
 pub use approval::{AppReview, ApprovedRequest};
+pub use renewal::CertChange;
 
 /// What the signer works with, from the host.
 #[derive(Clone)]
@@ -225,8 +227,29 @@ impl Signer {
     /// Homeserver holds a newer version this install signed itself.
     pub async fn resume(&mut self) -> Result<()> {
         self.refresh().await?;
+        loop {
+            self.finish_flow().await?;
+            // A closing delivery a reduction owes comes before anything else, publication
+            // included: it cuts the earlier certificate off at the switch, and a Homeserver
+            // that refuses writes must not hold it back (Switch wire 3.8 "A closing delivery
+            // owed"). Only the backup write comes before it, as before every delivery
+            // (Switch wire 3.13).
+            if !self.queue_owed_closing().await? {
+                return self.publish().await;
+            }
+        }
+    }
+
+    /// Run the flow in progress to its end.
+    async fn finish_flow(&mut self) -> Result<()> {
         while let Some(flow) = self.flow.clone() {
             match flow {
+                Flow::Renew {
+                    batches,
+                    sent,
+                    doc,
+                    prev,
+                } => self.send_renewal(&batches, sent, doc, prev).await?,
                 Flow::Enroll {
                     origin,
                     enrollment,
@@ -246,7 +269,7 @@ impl Signer {
                 } => self.deliver(doc, prev).await?,
             }
         }
-        self.publish().await
+        Ok(())
     }
 
     /// The identity.
@@ -294,7 +317,8 @@ impl Signer {
         &self.state.alerts
     }
 
-    /// Clear `alert`, once the user has seen it.
+    /// Clear `alert`, once the user has seen it. [`Alert::ReductionNotClosed`] stays until its
+    /// renewals are closed.
     ///
     /// A rollback or an equivocation leaves the switch unconfirmed: the signer doesn't know that
     /// it holds the high-water version, so it releases no claim (Switch spec 4.3). Clearing such
@@ -304,6 +328,10 @@ impl Signer {
     /// older version, none, or another body at the high-water version raises the alarm again,
     /// and everything stays held. If it keeps coming back, the user moves to another provider,
     /// or declares a provider loss.
+    ///
+    /// Nothing is delivered again when the alarm saw no copy at all, since that switch lost
+    /// the account's state and must not serve it again under this generation (Switch spec
+    /// 6.5): the user declares a provider loss. Nor once another install is the signer.
     ///
     /// # Errors
     ///
@@ -318,16 +346,33 @@ impl Signer {
         if matches!(alert, Alert::RecordsBehind { .. }) && self.state.records_behind.is_some() {
             return Ok(());
         }
+        // A reduction's alert stays until its renewals are closed (Switch wire 3.8).
+        if matches!(alert, Alert::ReductionNotClosed { .. }) && !self.owed()?.is_empty() {
+            return Ok(());
+        }
         let mut state = self.state.clone();
         state.alerts.retain(|held| held != alert);
-        let alarm = matches!(alert, Alert::Rollback { .. } | Alert::Equivocation { .. });
+        // Delivered again only when the alarm saw a copy at the switch: one that holds nothing
+        // has lost the account's state, and a version 1 delivered onto it would start the
+        // account afresh at the same generation (Switch spec 6.5 "No restore and continue");
+        // the way out is a provider loss. Never once another install signs.
+        let alarm = matches!(
+            alert,
+            Alert::Rollback {
+                version: Some(_),
+                ..
+            } | Alert::Equivocation { .. }
+        );
+        let named = self.state.managed_by.is_none();
         let again = match (&self.state.newest, &self.flow) {
-            (Some(newest), None) if alarm && state.switch_unconfirmed => Some(Flow::Deliver {
-                doc: newest.doc.clone(),
-                prev: newest.prev,
-                backup: None,
-                step: DeliverStep::BackupWritten,
-            }),
+            (Some(newest), None) if alarm && named && state.switch_unconfirmed => {
+                Some(Flow::Deliver {
+                    doc: newest.doc.clone(),
+                    prev: newest.prev,
+                    backup: None,
+                    step: DeliverStep::BackupWritten,
+                })
+            }
             _ => None,
         };
         let deliver_again = again.is_some();
@@ -385,7 +430,11 @@ impl Signer {
         if self.flow.is_some() {
             return Err(Refusal::FlowInProgress.into());
         }
-        self.check_copies().await
+        self.check_copies().await?;
+        if self.owes_closing()? {
+            self.resume().await?;
+        }
+        Ok(())
     }
 
     /// Before a new version is signed, check every copy that could show this install's
@@ -397,17 +446,7 @@ impl Signer {
         let Some(newest) = self.state.newest_doc()? else {
             return Ok(());
         };
-        self.switch_at_mark().await?;
-        let found = self
-            .env
-            .homeserver
-            .get(SIGNER_BACKUP_PATH)
-            .await
-            .map_err(SignerError::Homeserver)?;
-        // A backup that doesn't open, or none, is the backup write's to judge.
-        if let Some(found) = found.and_then(|bytes| self.open_backup(&bytes).transpose()) {
-            self.judge_backup(&found?).await?;
-        }
+        self.ensure_signer().await?;
         self.judge_homeserver(&newest).await?;
         Ok(())
     }
@@ -700,8 +739,18 @@ impl Signer {
     /// [`Signer::judge_copy`] says.
     async fn switch_at_mark(&mut self) -> Result<()> {
         let held = self.service_client()?.apps().await?.identity;
+        self.confirm_copy(held.as_ref()).await
+    }
+
+    /// Judge the switch's copy of `identity.json`, `held` as `GET /apps` gave it, against the
+    /// mark: its own version goes on; a newer one is adopted and an older one, none or another
+    /// body at the mark raises the alarm, and either stops the flow (Switch spec 4.3).
+    pub(crate) async fn confirm_copy(
+        &mut self,
+        held: Option<&pubky_switch_core::sig::SignedDoc>,
+    ) -> Result<()> {
         let copy = match held {
-            Some(signed) => Some(IdentityDoc::verify(&signed, &self.state.identity)?),
+            Some(signed) => Some(IdentityDoc::verify(signed, &self.state.identity)?),
             None => None,
         };
         match self.judge_copy(copy.as_ref()) {
@@ -712,6 +761,26 @@ impl Signer {
             },
             Err(alert) => self.alarm(alert).await,
         }
+    }
+
+    /// Check that this install still signs before a write at the switch: it is named, the
+    /// switch's copy is its mark, and the backup on the Homeserver names neither another
+    /// install that took over nor a newer version of this install's own (Switch spec 4.3,
+    /// 12.8; Switch wire 3.13).
+    pub(crate) async fn ensure_signer(&mut self) -> Result<()> {
+        self.check_named()?;
+        self.switch_at_mark().await?;
+        let found = self
+            .env
+            .homeserver
+            .get(SIGNER_BACKUP_PATH)
+            .await
+            .map_err(SignerError::Homeserver)?;
+        // A backup that doesn't open, or none, is the backup write's to judge.
+        if let Some(found) = found.and_then(|bytes| self.open_backup(&bytes).transpose()) {
+            self.judge_backup(&found?).await?;
+        }
+        Ok(())
     }
 
     /// The records a backup holds, opened with the identity key; `None` for one that doesn't
@@ -758,12 +827,22 @@ impl Signer {
             prev,
         };
         match self.service_client()?.put_identity(&delivery).await {
-            Ok(_) => {
+            Ok(answer) => {
+                let delivered_at = answer
+                    .proofs
+                    .first()
+                    .and_then(|proof| proof.body().chain.open().ok())
+                    .map(|envelope| envelope.server_time);
                 let mut state = self.state.clone();
+                let published = state
+                    .newest
+                    .as_ref()
+                    .is_some_and(|n| n.doc == doc && n.published);
                 state.newest = Some(Newest {
                     doc,
                     prev,
-                    published: false,
+                    published,
+                    delivered_at,
                 });
                 // The switch took this version, built on the one before: it holds the mark.
                 state.switch_unconfirmed = false;
@@ -871,6 +950,7 @@ impl Signer {
             doc: copy.signed().clone(),
             prev: None,
             published: true,
+            delivered_at: None,
         });
         state.signed_through = state.signed_through.max(version);
         state.managed_by = Some(signer);
