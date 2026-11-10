@@ -1152,6 +1152,7 @@ impl App {
                 plaintext: pending.entry.plaintext.clone(),
                 context: pending.entry.context.clone(),
                 reason,
+                round: self.state.parked_round.number,
             },
         };
         tx.put(&key::parked(pending.seq), &parked)?;
@@ -1339,6 +1340,7 @@ impl App {
             plaintext: plaintext.encode(),
             context: entry.context.clone(),
             reason,
+            round: self.state.parked_round.number,
         };
         read.tx.put(&key::parked(entry.seq), &parked)?;
         read.tx.delete(&key::held(entry.seq))?;
@@ -1390,12 +1392,12 @@ impl App {
     /// At most [`PARKED_RETRIES_PER_READ`] each read, starting where the last read stopped
     /// and going round, so none waits for ever behind others the store keeps failing.
     async fn retry_parked(&mut self) -> Result<(), AppError> {
-        let due: Vec<u64> = self
+        let due: Vec<(u64, u64)> = self
             .state
             .parked
             .iter()
             .filter(|(_, stored)| stored.reason.tried_again())
-            .map(|(seq, _)| *seq)
+            .map(|(seq, stored)| (*seq, stored.round))
             .collect();
         if due.is_empty() {
             return Ok(());

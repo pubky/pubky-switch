@@ -376,43 +376,49 @@ impl DutyEpoch {
 }
 
 /// `parkn`: where the retries of entries stored locally stand. A round covers the entries
-/// stored when it began, `seq` at most `end`, in `seq` order from `next` on; one stored
-/// later waits for the next round, so every entry is tried within two rounds, each of
-/// at most as many reads as it covers entries over the per-read bound.
+/// stored before it began, by the round each was stored in, not by `seq`, which a provider
+/// loss renumbers; it tries them in `seq` order from `next` on. One stored later waits for
+/// the next round, so every entry is tried within two rounds, each of at most as many reads
+/// as it covers entries over the per-read bound.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ParkedRound {
     /// The lowest `seq` the round has yet to try.
     pub(crate) next: u64,
-    /// The highest `seq` the round covers.
-    pub(crate) end: u64,
+    /// The round's number: it covers the entries stored in an earlier one.
+    pub(crate) number: u64,
 }
 
 impl ParkedRound {
-    /// The entries of `due`, in ascending `seq` order, one read tries, at most `cap`, and
-    /// where the round stands after them. A round that runs out begins the next one, over
-    /// every entry of `due`, which fills the rest of the read.
-    pub(crate) fn turn(self, due: &[u64], cap: usize) -> (Vec<u64>, ParkedRound) {
-        let covers = |round: &ParkedRound, seq: u64| seq >= round.next && seq <= round.end;
+    /// The entries of `due`, `(seq, round stored in)` in ascending `seq` order, one read
+    /// tries, at most `cap`, and where the round stands after them. A round that runs out
+    /// begins the next one, over every entry of `due`, which fills the rest of the read.
+    pub(crate) fn turn(self, due: &[(u64, u64)], cap: usize) -> (Vec<u64>, ParkedRound) {
+        let covers = |round: &ParkedRound, (seq, stored): (u64, u64)| {
+            stored < round.number && seq >= round.next
+        };
         let mut round = self;
         let mut seqs: Vec<u64> = due
             .iter()
             .copied()
-            .filter(|seq| covers(&round, *seq))
+            .filter(|entry| covers(&round, *entry))
             .take(cap)
+            .map(|(seq, _)| seq)
             .collect();
         if let Some(last) = seqs.last() {
             round.next = last.saturating_add(1);
         }
         if seqs.len() < cap {
+            let newest = due.iter().map(|(_, stored)| *stored).max().unwrap_or(0);
             round = ParkedRound {
                 next: 0,
-                end: due.last().copied().unwrap_or(0),
+                number: round.number.max(newest).saturating_add(1),
             };
             let more: Vec<u64> = due
                 .iter()
                 .copied()
-                .filter(|seq| covers(&round, *seq) && !seqs.contains(seq))
+                .filter(|entry| covers(&round, *entry) && !seqs.contains(&entry.0))
                 .take(cap.saturating_sub(seqs.len()))
+                .map(|(seq, _)| seq)
                 .collect();
             if let Some(last) = more.last() {
                 round.next = last.saturating_add(1);
@@ -451,6 +457,10 @@ pub(crate) struct ParkedEntry {
     pub(crate) plaintext: Vec<u8>,
     pub(crate) context: Option<Value>,
     pub(crate) reason: ParkReason,
+    /// The round of retries in which it was stored ([`ParkedRound`]): only a later round
+    /// tries it, whatever its `seq`.
+    #[serde(default)]
+    pub(crate) round: u64,
 }
 
 /// `ident/<identity>/doc`: the newest `identity.json` held for an identity.
@@ -785,15 +795,17 @@ mod tests {
     use crate::store::{MemoryStore, StateStore};
     use std::sync::Arc;
 
-    #[test]
-    fn test_parked_round_reaches_every_entry_however_many_come_later() {
+    /// Reads of retries over `due` while each read stores more entries than the bound,
+    /// at `seq`s `stored_at` gives; returns how many times each of the first was tried.
+    fn rounds_over(first: &[u64], stored_at: impl Fn(u64) -> u64) -> BTreeMap<u64, usize> {
         let cap = 4;
-        let mut due: Vec<u64> = (1..=6).collect();
+        let mut due: Vec<(u64, u64)> = first.iter().map(|seq| (*seq, 0)).collect();
         let mut round = ParkedRound::default();
-        let mut last_try: BTreeMap<u64, usize> = BTreeMap::new();
         let mut tries: BTreeMap<u64, usize> = BTreeMap::new();
-        let mut next_seq = 100;
+        let mut last_try: BTreeMap<u64, usize> = BTreeMap::new();
+        let mut stored = 0u64;
         for read in 1..=60usize {
+            due.sort_unstable();
             let (seqs, after) = round.turn(&due, cap);
             assert!(seqs.len() <= cap);
             let mut unique = seqs.clone();
@@ -804,23 +816,42 @@ mod tests {
                 last_try.insert(seq, read);
                 *tries.entry(seq).or_insert(0) += 1;
             }
-            // The earliest entries are tried again within two rounds of the entries there
-            // are: however many come later, none waits for ever.
+            // None of the first waits longer than two rounds of the entries there are.
             let rounds = 2 * due.len().div_ceil(cap) + 1;
-            for seq in 1..=6u64 {
-                let at = last_try.get(&seq).copied().unwrap_or(0);
+            for seq in first {
+                let at = last_try.get(seq).copied().unwrap_or(0);
                 assert!(read - at <= rounds, "{seq}: last tried {at}, now {read}");
             }
-            // Each read stores more entries than the bound, all above every earlier one.
+            // Each read stores more entries than the bound, in the round now under way.
             for _ in 0..cap + 2 {
-                due.push(next_seq);
-                next_seq += 1;
+                due.push((stored_at(stored), round.number));
+                stored += 1;
             }
         }
-        // Round after round, the earliest entries come back.
+        tries
+    }
+
+    #[test]
+    fn test_parked_round_reaches_every_entry_however_many_come_later() {
+        // Later entries above every earlier one.
+        let tries = rounds_over(&[1, 2, 3, 4, 5, 6], |n| 100 + n);
         for seq in 1..=6u64 {
             assert!(
                 tries.get(&seq).copied().unwrap_or(0) >= 3,
+                "{seq}: {tries:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parked_round_reaches_every_entry_after_a_loss_renumbers_them() {
+        // After a provider loss the entries stored before it sit at the top of the `seq`s,
+        // and later ones below them, in the new sequence.
+        let first: Vec<u64> = (0..6).map(|i| u64::MAX - i).collect();
+        let tries = rounds_over(&first, |n| 10 + n);
+        for seq in &first {
+            assert!(
+                tries.get(seq).copied().unwrap_or(0) >= 3,
                 "{seq}: {tries:?}"
             );
         }
@@ -871,6 +902,7 @@ mod tests {
             plaintext: b"secret message".to_vec(),
             context: None,
             reason: ParkReason::Quota,
+            round: 0,
         };
         let text = format!("{parked:?}");
         assert!(!text.contains("secret"), "{text}");

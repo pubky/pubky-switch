@@ -3074,6 +3074,7 @@ async fn keep_an_effect(
             plaintext: entry.plaintext,
             context: None,
             reason: ParkReason::Quota,
+            round: 0,
         };
         tx.put(&crate::app::state::key::parked(seq), &stored)
             .unwrap();
