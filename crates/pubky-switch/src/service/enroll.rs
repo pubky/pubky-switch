@@ -191,7 +191,9 @@ impl Service {
         let time_ms = txn.stamp(base_ms);
         let limits = txn.announced_limits().await.map_err(|e| store_error(&e))?;
         // The same enrollment again gets the same answer, whatever the account did since
-        // (Switch wire 3.7): the key it named, recognized by the enrollment's hash.
+        // (Switch wire 3.7): the key it named, recognized by the enrollment's hash. The rows
+        // name keys of this generation: a key rotation or a recovery in place, once served,
+        // must clear them, so a retry never names a retired or deleted key.
         if let Some(key_id) = txn
             .enrollment_answer(&enrollment_hash)
             .await

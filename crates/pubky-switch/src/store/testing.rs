@@ -109,6 +109,19 @@ impl TestDatabase {
         Ok(PgConnection::connect_with(&self.admin).await?)
     }
 
+    /// Give out account `id`'s next `seq` without a chain item, as an inbox entry takes
+    /// one (Switch spec 6.3), and commit.
+    pub async fn give_out_seq(&self, id: &str) -> Result<u64, StoreError> {
+        let mut txn = self
+            .store
+            .begin(id)
+            .await?
+            .ok_or(StoreError::Corrupt("no such account"))?;
+        let seq = txn.next_seq()?;
+        txn.commit().await?;
+        Ok(seq)
+    }
+
     /// Close the store and drop the database.
     pub async fn drop_database(self) -> Result<(), StoreError> {
         self.store.close().await;

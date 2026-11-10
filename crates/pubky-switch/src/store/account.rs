@@ -125,6 +125,7 @@ pub struct AccountTxn {
     head: AccountHead,
     loaded: AccountHead,
     changed: bool,
+    last_seen: Option<([u8; 16], u64)>,
 }
 
 impl std::fmt::Debug for AccountTxn {
@@ -185,6 +186,7 @@ pub(super) async fn create(pool: &PgPool, account: &NewAccount) -> Result<bool, 
         &account.service_key,
         account.created_at_ms,
         u64::MAX >> 1,
+        true,
     )
     .await?;
     tx.commit().await.map_err(StoreError::from_db)?;
@@ -238,6 +240,7 @@ impl AccountTxn {
             loaded: head.clone(),
             head,
             changed: false,
+            last_seen: None,
         }))
     }
 
@@ -297,6 +300,12 @@ impl AccountTxn {
     /// chain head counts as a change without this; one that only stamps the time doesn't.
     pub fn note_change(&mut self) {
         self.changed = true;
+    }
+
+    /// Note an own app's authenticated request at `at_ms` (Switch wire 7.3 step 6). It is
+    /// written with the commit, also when the endpoint is refused and rolled back.
+    pub fn note_last_seen(&mut self, app_id: [u8; 16], at_ms: u64) {
+        self.last_seen = Some((app_id, at_ms));
     }
 
     /// Mark the start of the request's endpoint. Everything it writes after this, its
@@ -368,6 +377,15 @@ impl AccountTxn {
             if self.head.last_seq != self.loaded.last_seq || self.head.chain != self.loaded.chain {
                 self.changed = true;
             }
+        }
+        if let Some((app_id, at_ms)) = self.last_seen {
+            sqlx::query("UPDATE apps SET last_seen_ms = $3 WHERE account_id = $1 AND app_id = $2")
+                .bind(&self.head.id)
+                .bind(app_id.as_slice())
+                .bind(to_db(at_ms, "last_seen_ms")?)
+                .execute(&mut *self.tx)
+                .await
+                .map_err(StoreError::from_db)?;
         }
         if self.changed {
             // Sent with the commit, and only if it commits.
