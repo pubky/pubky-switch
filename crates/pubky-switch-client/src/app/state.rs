@@ -6,8 +6,9 @@
 //! every network effect follows one pattern (`store` module): sign an artifact and commit it
 //! with the next step, send those bytes until there is an answer, then commit the outcome.
 //!
-//! Every value is `{"v":1,"d":<record>}`. A reader refuses another `v` as corrupt, so a later
-//! schema adds a migration instead of reading old bytes wrongly.
+//! Every value is `{"v":<SCHEMA_VERSION>,"d":<record>}`. A reader refuses an earlier `v` as
+//! an old schema and a later or unreadable one as corrupt, so a later schema adds a
+//! migration instead of reading old bytes wrongly.
 //!
 //! Sensitive records (the app's keys, receive keys, scope keys, the naming key and parked
 //! plaintexts) rely on the store's guarantees: device-bound and encrypted at rest (Switch
@@ -24,13 +25,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::error::AppError;
-use super::events::ParkReason;
+use super::events::{AppEvent, ParkReason};
 use super::protocol::LocalWrite;
 use crate::error::StoreError;
-use crate::store::{StoreHandle, WriteBatch};
+use crate::store::{StoreHandle, Write, WriteBatch};
 
-/// The schema version of every value the app layer writes.
-pub const SCHEMA_VERSION: u32 = 1;
+/// The schema version of every value the app layer writes. 2: a kept effect keeps the
+/// entry it is for (`pending/effect`).
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// The prefix of the protocol's own keys in the app's namespace.
 pub const PROTOCOL_PREFIX: &[u8] = b"p/";
@@ -41,13 +43,13 @@ struct Out<'a, T> {
     d: &'a T,
 }
 
+/// A record's bytes as read, once their version is checked ([`Version`]).
 #[derive(Deserialize)]
 struct In<T> {
-    v: u32,
     d: T,
 }
 
-/// A record's bytes: `{"v":1,"d":<record>}`.
+/// A record's bytes: `{"v":<SCHEMA_VERSION>,"d":<record>}`.
 pub(crate) fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, AppError> {
     serde_json::to_vec(&Out {
         v: SCHEMA_VERSION,
@@ -56,13 +58,26 @@ pub(crate) fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, AppError> {
     .map_err(|_| AppError::Store(StoreError::Other("a record can't be written".into())))
 }
 
-/// Read a record's bytes; another schema version or bytes that don't read are corrupt.
+/// The version of a record's bytes, read before its record, whose shape it decides.
+#[derive(Deserialize)]
+struct Version {
+    v: u32,
+}
+
+/// Read a record's bytes. An earlier schema version is an old schema, read from the version
+/// alone, before the record, whose shape that schema may not have; a later one, or bytes
+/// that don't read, are corrupt.
 pub(crate) fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, AppError> {
-    let read: In<T> =
+    let version: Version =
         serde_json::from_slice(bytes).map_err(|_| AppError::Store(StoreError::Corrupt))?;
-    if read.v != SCHEMA_VERSION {
+    if version.v < SCHEMA_VERSION {
+        return Err(AppError::Store(StoreError::OldSchema { found: version.v }));
+    }
+    if version.v != SCHEMA_VERSION {
         return Err(AppError::Store(StoreError::Corrupt));
     }
+    let read: In<T> =
+        serde_json::from_slice(bytes).map_err(|_| AppError::Store(StoreError::Corrupt))?;
     Ok(read.d)
 }
 
@@ -89,6 +104,28 @@ pub(crate) mod key {
     pub(crate) const SERVICE_TIME: &str = "service_time";
     pub(crate) const PENDING_EFFECT: &str = "pending/effect";
     pub(crate) const PENDING_RECORD: &str = "pending/record";
+    /// The ID the next duty event takes.
+    pub(crate) const DUTY_NEXT: &str = "dutyn";
+    /// The store's event epoch.
+    pub(crate) const DUTY_EPOCH: &str = "dutye";
+    /// The prefix of the kept duty events.
+    pub(crate) const DUTY_PREFIX: &str = "duty/";
+
+    /// The `seq` the next read's retries of stored entries start from.
+    pub(crate) const PARKED_NEXT: &str = "parkn";
+    /// The prefix of the protocol calls owed.
+    pub(crate) const OWED_PREFIX: &str = "owed/";
+
+    /// A protocol call about the feed item at (`generation`, `seq`) the protocol couldn't
+    /// answer yet.
+    pub(crate) fn owed(generation: u64, seq: u64) -> String {
+        format!("owed/{}/{}", num(generation), num(seq))
+    }
+
+    /// A duty event kept until acknowledged.
+    pub(crate) fn duty(id: u64) -> String {
+        format!("duty/{}", num(id))
+    }
 
     pub(crate) fn num(n: u64) -> String {
         format!("{n:020}")
@@ -140,11 +177,6 @@ pub(crate) mod key {
 
     pub(crate) fn parked(seq: u64) -> String {
         format!("parked/{}", num(seq))
-    }
-
-    /// A message whose kept effect may have been applied: its entry is parked when read.
-    pub(crate) fn uncertain(sender: &[u8; 32], msg_id: &str) -> String {
-        format!("uncert/{}/{msg_id}", pubky_id(sender))
     }
 
     pub(crate) fn asked(seq: u64) -> String {
@@ -322,6 +354,81 @@ pub(crate) struct Processed {
     pub(crate) at_ms: u64,
 }
 
+/// `dutye`: the store's event epoch, chosen at random once the store starts empty
+/// ([`super::EventId`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct DutyEpoch {
+    #[serde(with = "serde_b64")]
+    pub(crate) epoch: [u8; super::events::EPOCH_LEN],
+}
+
+impl DutyEpoch {
+    /// A new epoch, from the system's randomness.
+    pub(crate) fn random() -> Result<Self, AppError> {
+        let mut epoch = [0u8; super::events::EPOCH_LEN];
+        getrandom::fill(&mut epoch).map_err(|_| {
+            AppError::Store(StoreError::Other(
+                "no randomness for the event epoch".into(),
+            ))
+        })?;
+        Ok(Self { epoch })
+    }
+}
+
+/// `parkn`: where the retries of entries stored locally stand. A round covers the entries
+/// stored before it began, by the round each was stored in, not by `seq`, which a provider
+/// loss renumbers; it tries them in `seq` order from `next` on. One stored later waits for
+/// the next round, so every entry is tried within two rounds, each of at most as many reads
+/// as it covers entries over the per-read bound.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ParkedRound {
+    /// The lowest `seq` the round has yet to try.
+    pub(crate) next: u64,
+    /// The round's number: it covers the entries stored in an earlier one.
+    pub(crate) number: u64,
+}
+
+impl ParkedRound {
+    /// The entries of `due`, `(seq, round stored in)` in ascending `seq` order, one read
+    /// tries, at most `cap`, and where the round stands after them. A round that runs out
+    /// begins the next one, over every entry of `due`, which fills the rest of the read.
+    pub(crate) fn turn(self, due: &[(u64, u64)], cap: usize) -> (Vec<u64>, ParkedRound) {
+        let covers = |round: &ParkedRound, (seq, stored): (u64, u64)| {
+            stored < round.number && seq >= round.next
+        };
+        let mut round = self;
+        let mut seqs: Vec<u64> = due
+            .iter()
+            .copied()
+            .filter(|entry| covers(&round, *entry))
+            .take(cap)
+            .map(|(seq, _)| seq)
+            .collect();
+        if let Some(last) = seqs.last() {
+            round.next = last.saturating_add(1);
+        }
+        if seqs.len() < cap {
+            let newest = due.iter().map(|(_, stored)| *stored).max().unwrap_or(0);
+            round = ParkedRound {
+                next: 0,
+                number: round.number.max(newest).saturating_add(1),
+            };
+            let more: Vec<u64> = due
+                .iter()
+                .copied()
+                .filter(|entry| covers(&round, *entry) && !seqs.contains(&entry.0))
+                .take(cap.saturating_sub(seqs.len()))
+                .map(|(seq, _)| seq)
+                .collect();
+            if let Some(last) = more.last() {
+                round.next = last.saturating_add(1);
+            }
+            seqs.extend(more);
+        }
+        (seqs, round)
+    }
+}
+
 /// `held/<seq>`: an entry held because its sender can't be checked yet (Switch spec 8.2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct HeldEntry {
@@ -350,6 +457,10 @@ pub(crate) struct ParkedEntry {
     pub(crate) plaintext: Vec<u8>,
     pub(crate) context: Option<Value>,
     pub(crate) reason: ParkReason,
+    /// The round of retries in which it was stored ([`ParkedRound`]): only a later round
+    /// tries it, whatever its `seq`.
+    #[serde(default)]
+    pub(crate) round: u64,
 }
 
 /// `ident/<identity>/doc`: the newest `identity.json` held for an identity.
@@ -410,6 +521,21 @@ pub(crate) struct PendingEffect {
     /// When it was kept, before its first send, app clock.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) kept_ms: Option<u64>,
+    /// What storing the entry locally takes, beside the fields above: the entry is stored
+    /// when the effect is kept so long that its fate can't be known (Switch spec 12.5
+    /// "Kept batches"). Required: a kept effect without it doesn't read.
+    pub(crate) entry: KeptEntry,
+}
+
+/// The part of an entry a kept effect keeps so the entry can be stored locally
+/// ([`PendingEffect::entry`]). Sensitive: it holds the opened message.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct KeptEntry {
+    pub(crate) cert: SignedDoc,
+    /// The signed plaintext's bytes (Switch wire 4.5).
+    #[serde(with = "serde_b64_vec")]
+    pub(crate) plaintext: Vec<u8>,
+    pub(crate) context: Option<Value>,
 }
 
 impl std::fmt::Debug for ParkedEntry {
@@ -480,11 +606,13 @@ pub(crate) struct ServiceTime {
     pub(crate) offset_ms: i64,
 }
 
-/// A transaction: the writes of one commit, in the app's namespace.
+/// A transaction: the writes of one commit, in the app's namespace, and the duty events
+/// it keeps, reported once it commits.
 #[derive(Debug)]
 pub(crate) struct Tx {
     ns: String,
     batch: WriteBatch,
+    duties: Vec<AppEvent>,
     /// The protocol's local writes in the batch, in order, which a receive step later in
     /// the same read sees before they are committed.
     local: Vec<LocalWrite>,
@@ -495,8 +623,20 @@ impl Tx {
         Self {
             ns: ns.to_owned(),
             batch: WriteBatch::new(),
+            duties: Vec::new(),
             local: Vec::new(),
         }
+    }
+
+    /// A duty event whose record this transaction writes: reported once it commits, and
+    /// never if it doesn't.
+    pub(crate) fn report(&mut self, event: AppEvent) {
+        self.duties.push(event);
+    }
+
+    /// The duty events to report once this transaction commits.
+    pub(crate) fn take_reports(&mut self) -> Vec<AppEvent> {
+        std::mem::take(&mut self.duties)
     }
 
     pub(crate) fn put<T: Serialize>(&mut self, key: &str, value: &T) -> Result<(), AppError> {
@@ -539,6 +679,11 @@ impl Tx {
     /// The protocol's local writes in the batch, not yet committed, in order.
     pub(crate) fn pending_local(&self) -> &[LocalWrite] {
         &self.local
+    }
+
+    /// Every write in the batch, not yet committed, in order.
+    pub(crate) fn pending_writes(&self) -> &[Write] {
+        &self.batch.writes
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -655,6 +800,68 @@ mod tests {
     use crate::store::{MemoryStore, StateStore};
     use std::sync::Arc;
 
+    /// Reads of retries over `due` while each read stores more entries than the bound,
+    /// at `seq`s `stored_at` gives; returns how many times each of the first was tried.
+    fn rounds_over(first: &[u64], stored_at: impl Fn(u64) -> u64) -> BTreeMap<u64, usize> {
+        let cap = 4;
+        let mut due: Vec<(u64, u64)> = first.iter().map(|seq| (*seq, 0)).collect();
+        let mut round = ParkedRound::default();
+        let mut tries: BTreeMap<u64, usize> = BTreeMap::new();
+        let mut last_try: BTreeMap<u64, usize> = BTreeMap::new();
+        let mut stored = 0u64;
+        for read in 1..=60usize {
+            due.sort_unstable();
+            let (seqs, after) = round.turn(&due, cap);
+            assert!(seqs.len() <= cap);
+            let mut unique = seqs.clone();
+            unique.dedup();
+            assert_eq!(unique.len(), seqs.len(), "no entry twice in a read");
+            round = after;
+            for seq in seqs {
+                last_try.insert(seq, read);
+                *tries.entry(seq).or_insert(0) += 1;
+            }
+            // None of the first waits longer than two rounds of the entries there are.
+            let rounds = 2 * due.len().div_ceil(cap) + 1;
+            for seq in first {
+                let at = last_try.get(seq).copied().unwrap_or(0);
+                assert!(read - at <= rounds, "{seq}: last tried {at}, now {read}");
+            }
+            // Each read stores more entries than the bound, in the round now under way.
+            for _ in 0..cap + 2 {
+                due.push((stored_at(stored), round.number));
+                stored += 1;
+            }
+        }
+        tries
+    }
+
+    #[test]
+    fn test_parked_round_reaches_every_entry_however_many_come_later() {
+        // Later entries above every earlier one.
+        let tries = rounds_over(&[1, 2, 3, 4, 5, 6], |n| 100 + n);
+        for seq in 1..=6u64 {
+            assert!(
+                tries.get(&seq).copied().unwrap_or(0) >= 3,
+                "{seq}: {tries:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parked_round_reaches_every_entry_after_a_loss_renumbers_them() {
+        // After a provider loss the entries stored before it sit at the top of the `seq`s,
+        // and later ones below them, in the new sequence.
+        let first: Vec<u64> = (0..6).map(|i| u64::MAX - i).collect();
+        let tries = rounds_over(&first, |n| 10 + n);
+        for seq in &first {
+            assert!(
+                tries.get(seq).copied().unwrap_or(0) >= 3,
+                "{seq}: {tries:?}"
+            );
+        }
+    }
+
     #[test]
     fn test_record_round_trips_with_its_schema_version() {
         let cursor = Cursor {
@@ -665,13 +872,22 @@ mod tests {
             time_ms: 11,
         };
         let bytes = encode(&cursor).unwrap();
-        assert!(bytes.starts_with(b"{\"v\":1,\"d\":"));
+        assert!(bytes.starts_with(b"{\"v\":2,\"d\":"));
         assert_eq!(decode::<Cursor>(&bytes).unwrap(), cursor);
     }
 
     #[test]
+    fn test_record_of_an_earlier_schema_is_an_old_schema() {
+        let bytes = br#"{"v":1,"d":{"generation":1}}"#;
+        assert_eq!(
+            decode::<Floor>(bytes).unwrap_err(),
+            AppError::Store(StoreError::OldSchema { found: 1 })
+        );
+    }
+
+    #[test]
     fn test_record_of_another_schema_is_corrupt() {
-        let bytes = br#"{"v":2,"d":{"generation":1}}"#;
+        let bytes = br#"{"v":3,"d":{"generation":1}}"#;
         assert_eq!(
             decode::<Floor>(bytes).unwrap_err(),
             AppError::Store(StoreError::Corrupt)
@@ -691,6 +907,7 @@ mod tests {
             plaintext: b"secret message".to_vec(),
             context: None,
             reason: ParkReason::Quota,
+            round: 0,
         };
         let text = format!("{parked:?}");
         assert!(!text.contains("secret"), "{text}");

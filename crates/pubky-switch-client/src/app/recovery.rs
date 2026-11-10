@@ -502,12 +502,21 @@ impl App {
         for prefix in ["reg/", "held/", "seen/", "asked/", "retry/"] {
             tx.delete_prefix(prefix)?;
         }
+        // The copy of the lists wasn't read from the new service: it reads as not refreshed,
+        // and the first read after the loss refreshes it. The flagged senders stay until
+        // then, the old service's being all the app knows.
+        tx.delete(super::admission::LISTS_AT)?;
         // Entries stored locally keep their plaintext; their old `seq`s are renumbered past
         // any `seq` of the new sequence.
+        // Every old key is deleted before any new one is written: after an earlier loss the
+        // old `seq`s are already at the top, where the new ones go, and a delete after a put
+        // of the same key in this one ordered commit would remove the entry just written.
         let parked = std::mem::take(&mut self.state.parked);
-        for (index, (old_seq, entry)) in parked.into_iter().enumerate() {
+        for old_seq in parked.keys() {
+            tx.delete(&key::parked(*old_seq))?;
+        }
+        for (index, (_, entry)) in parked.into_iter().enumerate() {
             let renumbered = u64::MAX.saturating_sub(u64::try_from(index).unwrap_or(u64::MAX));
-            tx.delete(&key::parked(old_seq))?;
             tx.put(&key::parked(renumbered), &entry)?;
             self.state.parked.insert(renumbered, entry);
         }
@@ -600,7 +609,9 @@ impl App {
                         &self.ns,
                     );
                     self.protocol.provider_lost_with(&loss.view(), &view)
-                };
+                }
+                // The step stays `Resend` in the record: the next call asks again.
+                .map_err(AppError::Protocol)?;
                 let copy = self.lists_copy().await?;
                 let me = self.state.meta.identity;
                 let may_add = self.state.cert.has_permission(Permission::ConversationAdd);

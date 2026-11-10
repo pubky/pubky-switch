@@ -74,9 +74,7 @@ impl StateStore for MemoryStore {
     }
 
     fn commit(&self, batch: WriteBatch) -> Result<(), StoreError> {
-        batch
-            .check_size()
-            .map_err(|error| StoreError::Other(error.to_string()))?;
+        batch.check_size().map_err(StoreError::from)?;
         let mut entries = self.lock();
         let mut next = entries.clone();
         for write in batch.writes {
@@ -141,7 +139,10 @@ mod tests {
             key: b"b".to_vec(),
             value: vec![0; size + 1],
         });
-        assert!(matches!(store.commit(oversized), Err(StoreError::Other(_))));
+        assert!(matches!(
+            store.commit(oversized),
+            Err(StoreError::TooLarge { .. })
+        ));
         // Atomic: nothing of it was applied.
         assert_eq!(store.get("ns", b"a").unwrap(), None);
     }

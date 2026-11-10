@@ -13,7 +13,8 @@ use std::sync::{Arc, Mutex};
 use pubky_switch_client::app::{
     App, AppConfig, AppError, Collection, Delivery, Effect, Initiator, LocalWrite,
     MAX_CURSOR_DEFER_MS, MayAct, MissedEntries, OpBatch, Outcome, OutgoingMessage, Protocol,
-    ReceiveContext, ReceivedMessage, RecordTarget, ResendNeeded, SwitchCopy,
+    ProtocolLayer, ReceiveContext, ReceivedMessage, RecordTarget, ResendNeeded, StoreFailure,
+    SwitchCopy,
 };
 use pubky_switch_client::clock::TestClock;
 use pubky_switch_client::store::{MemoryStore, StateStore};
@@ -134,12 +135,12 @@ impl Protocol for NotesProtocol {
         Outcome::Apply(Effect::default())
     }
 
-    fn resend_needed(&self, _needed: &ResendNeeded) -> Vec<LocalWrite> {
-        Vec::new()
+    fn resend_needed(&self, _needed: &ResendNeeded) -> Result<Vec<LocalWrite>, StoreFailure> {
+        Ok(Vec::new())
     }
 
-    fn missed(&self, _missed: &MissedEntries) -> Vec<LocalWrite> {
-        Vec::new()
+    fn missed(&self, _missed: &MissedEntries) -> Result<Vec<LocalWrite>, StoreFailure> {
+        Ok(Vec::new())
     }
 
     fn collections(&self) -> Vec<Collection> {
@@ -385,5 +386,30 @@ async fn test_protocol_api_identity_lookup_in_two_halves() {
     assert_eq!(
         found.may_act(START_MS + grace_ms, Initiator::Automatic, grace_ms),
         MayAct::Now
+    );
+}
+
+/// A protocol in another crate tests its own restore step: the context the testing module
+/// builds blinds under the naming key it was given, as the restored app does.
+#[test]
+fn test_restore_context_for_a_protocols_own_tests() {
+    let naming = pubky_switch_core::ident::NamingKey::from_bytes([3; 32]);
+    let restoring = pubky_switch_client::testing::restore_context([1; 32], [2; 16], &naming);
+    assert_eq!(restoring.identity(), [1; 32]);
+    assert_eq!(restoring.app_id(), [2; 16]);
+    assert_eq!(restoring.blind(b"input"), naming.blind(b"input"));
+    let layer = ProtocolLayer {
+        protocol: "example".into(),
+        data: pubky_switch_client::app::encode_local_state(&[(b"k".to_vec(), b"v".to_vec())]),
+    };
+    let writes = NotesProtocol::default()
+        .restore_layer(Some(&layer), &restoring)
+        .unwrap();
+    assert_eq!(
+        writes,
+        vec![LocalWrite::Put {
+            key: b"k".to_vec(),
+            value: b"v".to_vec()
+        }]
     );
 }

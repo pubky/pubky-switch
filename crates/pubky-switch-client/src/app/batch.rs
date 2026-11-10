@@ -31,7 +31,7 @@ use pubky_switch_core::sig::SignedDoc;
 use serde::{Deserialize, Serialize};
 
 use super::claims::ObligationDeadline;
-use super::error::{Refusal, refused_for_good};
+use super::error::{Refusal, RefusalPlace, refused_at, refused_for_good};
 use super::events::AppEvent;
 use super::protocol::LocalWrite;
 use super::recovery::LossStep;
@@ -43,6 +43,45 @@ use crate::error::ClientError;
 
 /// The prefix of the kept batches.
 const PENDING_PREFIX: &str = "opq/";
+
+/// Refuse the app's own lifecycle operations, and the signer's, in a batch a host or a
+/// protocol builds: `app.put`, `receive_key.put`, `key_bundle.put` and `cert.put`. The app
+/// layer builds and sends these itself, in batches of their own (joining, the record's
+/// delivery, a registration, a move's or a loss's re-registration), and a kept effect or
+/// batch carrying one could be refused at step 9 in a way that reads as about the caller
+/// ([`RefusalPlace::Caller`]).
+///
+/// # Errors
+///
+/// [`Refusal::Usage`] for such an operation.
+pub(crate) fn refuse_lifecycle_ops<'a>(
+    mut kinds: impl Iterator<Item = &'a OpKind>,
+) -> Result<(), AppError> {
+    if kinds.any(|kind| {
+        matches!(
+            kind,
+            OpKind::AppPut { .. }
+                | OpKind::ReceiveKeyPut { .. }
+                | OpKind::KeyBundlePut(_)
+                | OpKind::CertPut { .. }
+        )
+    }) {
+        return Err(Refusal::Usage(
+            "app.put, receive_key.put, key_bundle.put and cert.put are the app layer's own".into(),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Whether `error` refuses a batch for good before the service's batch ID lookup, about the
+/// caller or about these bytes ([`RefusalPlace`]).
+fn refused_before_lookup(error: &AppError) -> bool {
+    matches!(
+        refused_at(error),
+        Some(RefusalPlace::Caller | RefusalPlace::Bytes)
+    )
+}
 
 fn pending_key(batch_id: &[u8; 16]) -> String {
     format!("{PENDING_PREFIX}{}", b64(batch_id))
@@ -183,7 +222,9 @@ pub(crate) struct PendingBatch {
     /// The messages put in the outbox with the answer.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) queued: Vec<OutboxItem>,
-    /// When it was kept, before its first send, app clock.
+    /// When its first send left, at a service time verified in that call
+    /// ([`App::kept_stamp`]), committed before the request; `None` while it was never sent,
+    /// which can't be ambiguous and so has no window yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) kept_ms: Option<u64>,
 }
@@ -238,6 +279,7 @@ impl App {
     ) -> Result<(Submitted, Vec<ClaimView>), AppError> {
         self.ready_local().await?;
         self.refuse_when_stopped()?;
+        refuse_lifecycle_ops(batch.ops.iter().map(|(_, kind)| kind))?;
         self.refuse_before_upload().await?;
         match self.resume_batches().await {
             Ok(()) => {}
@@ -394,12 +436,14 @@ impl App {
                 .collect(),
             local: batch.local,
             queued,
-            kept_ms: Some(self.now()),
+            // Stamped at its first send ([`App::run_pending`]): kept now, it goes out with
+            // the next call that writes when this one can't reach the service.
+            kept_ms: None,
         };
         let mut tx = self.tx()?;
         tx.put(&pending_key(&id), &pending)?;
         self.commit(tx).await?;
-        self.run_pending(&id, &pending, &signed).await
+        self.run_pending(&id, &pending, &signed, false).await
     }
 
     /// After `409 stale_epoch` on `batch` (Switch spec 3.5, 6.4): the switch refused it for
@@ -524,17 +568,41 @@ impl App {
             let id = pubky_switch_core::enc::unb64_array::<16>(&id)
                 .map_err(|_| AppError::Store(crate::error::StoreError::Corrupt))?;
             let batch = self.without_stale_cursor(Batch::from_body(pending.body.clone())?)?;
+            // Never sent, as its record shows: no answer of it can be ambiguous, so it has
+            // no window, and goes out as a first send would.
+            if pending.kept_ms.is_none() {
+                self.send_unsent(&id, &pending, &batch).await?;
+                continue;
+            }
+            // Past the window no answer tells whether it was applied, at any generation: it
+            // isn't sent again, and goes, reported with its attempts (Switch wire 6.4 step
+            // 5, Switch spec 12.5 "Kept batches"). Past it by the clocks at hand is past it;
+            // only a "still inside" needs a fresh service time, taken again before each
+            // batch, should the sends before it have taken long.
+            let mut past = !self.answer_decides(pending.kept_ms);
+            if !past {
+                self.fresh_service_time().await?;
+                past = !self.answer_decides(pending.kept_ms);
+            }
+            if past {
+                let mut tx = self.tx()?;
+                Self::replace_kept_batch(&id, None, &mut tx)?;
+                self.kept_batch_dropped(&id, &batch, &mut tx)?;
+                self.commit(tx).await?;
+                continue;
+            }
             if super::batch_generation(&batch).is_some_and(|g| g < self.state.meta.generation) {
                 self.resend_earlier(&id, &pending, &batch).await?;
                 continue;
             }
-            match self.run_pending(&id, &pending, &batch).await {
+            match self.run_pending(&id, &pending, &batch, true).await {
                 Ok(submitted) => self.check_attempts_of(&batch, &submitted).await?,
+                Err(error) if refused_before_lookup(&error) => {
+                    self.kept_refused_before_lookup(&id, &pending, &batch, error)
+                        .await?;
+                }
                 Err(error) => match refused_for_good(&error) {
-                    Some(code) => self.events.push(AppEvent::BatchRefused {
-                        batch_id: id,
-                        code: code.as_str().to_owned(),
-                    }),
+                    Some(code) => self.kept_batch_refused(&id, code).await?,
                     None => return Err(error),
                 },
             }
@@ -572,6 +640,88 @@ impl App {
         Ok(())
     }
 
+    /// A kept batch never sent ([`PendingBatch::kept_ms`]), sent now: signed again first for
+    /// the generation followed if it was signed for an earlier one, since no old bytes need
+    /// an answer. A refusal for good, other than one about the caller, which keeps it, drops
+    /// it with what it carried and tells the protocol in that commit ([`AppEvent::BatchRefused`]);
+    /// it was never applied.
+    async fn send_unsent(
+        &mut self,
+        id: &[u8; 16],
+        pending: &PendingBatch,
+        batch: &Batch,
+    ) -> Result<(), AppError> {
+        let (id, pending, batch) =
+            if super::batch_generation(batch).is_some_and(|g| g < self.state.meta.generation) {
+                let signed = self.sign_ops(super::provider::ops_of(batch), None)?;
+                let new_id = signed.id().ok_or_else(|| {
+                    AppError::InvalidData("a batch of operations has an ID".into())
+                })?;
+                let renewed = PendingBatch {
+                    body: signed.body().to_vec(),
+                    ..pending.clone()
+                };
+                let mut tx = self.tx()?;
+                Self::replace_kept_batch(id, Some((&new_id, &renewed)), &mut tx)?;
+                self.commit(tx).await?;
+                self.events.push(AppEvent::KeptBatchSignedAgain {
+                    batch_id: *id,
+                    new_batch_id: new_id,
+                });
+                (new_id, renewed, signed)
+            } else {
+                (*id, pending.clone(), batch.clone())
+            };
+        match self.run_pending(&id, &pending, &batch, true).await {
+            Ok(submitted) => self.check_attempts_of(&batch, &submitted).await,
+            Err(error) if refused_at(&error) == Some(RefusalPlace::Caller) => Err(error),
+            Err(error) => match refused_for_good(&error) {
+                Some(code) => self.kept_batch_refused(&id, code).await,
+                None => Err(error),
+            },
+        }
+    }
+
+    /// A kept batch sent again and refused for good at or after its batch ID lookup: it was
+    /// never applied, and goes with the local writes and outbox messages it carried; the
+    /// protocol is told in that commit ([`AppEvent::BatchRefused`]).
+    async fn kept_batch_refused(&mut self, id: &[u8; 16], code: ErrorCode) -> Result<(), AppError> {
+        let mut tx = self.tx()?;
+        tx.delete(&pending_key(id))?;
+        self.keep_duty(
+            &mut tx,
+            super::events::Duty::BatchRefused {
+                batch_id: *id,
+                code: code.as_str().to_owned(),
+            },
+        )?;
+        self.commit(tx).await
+    }
+
+    /// A kept batch sent again and refused before the service looked at its batch ID, which
+    /// tells nothing of whether it was applied ([`RefusalPlace`]). Refused about the caller,
+    /// it stays kept, to go again unchanged once the cause is gone, and the error is the
+    /// caller's; past the window in which a resend tells, it is dropped and reported with
+    /// its attempts instead (Switch spec 12.5 "Kept batches"). Refused about these bytes,
+    /// which will be refused again, it is dropped and reported so at once, and the next
+    /// kept batch goes on.
+    pub(crate) async fn kept_refused_before_lookup(
+        &mut self,
+        id: &[u8; 16],
+        pending: &PendingBatch,
+        batch: &Batch,
+        error: AppError,
+    ) -> Result<(), AppError> {
+        if refused_at(&error) == Some(RefusalPlace::Caller) && self.answer_decides(pending.kept_ms)
+        {
+            return Err(error);
+        }
+        let mut tx = self.tx()?;
+        Self::replace_kept_batch(id, None, &mut tx)?;
+        self.kept_batch_dropped(id, batch, &mut tx)?;
+        self.commit(tx).await
+    }
+
     /// A kept batch to send again: its signed operations are its exact bytes (Switch wire
     /// 2.1), but its unsigned `cursor.set` may name a position the service's cursor has
     /// passed since, which would take that cursor back. Such a cursor move is left out; the
@@ -590,16 +740,37 @@ impl App {
 
     /// Send a kept batch and commit its outcome. A refusal for good drops it; any other
     /// failure keeps it, to be sent again with the same bytes (Switch wire 2.1, 6.4).
+    /// `resent` for a batch that may have been sent before: one refused before the batch ID
+    /// lookup stays kept ([`RefusalPlace`]). A batch's first send is stamped first, at a
+    /// service time verified in this call, committed before the request leaves; a call
+    /// that can't verify one leaves it kept and unsent.
     async fn run_pending(
         &mut self,
         id: &[u8; 16],
         pending: &PendingBatch,
         batch: &Batch,
+        resent: bool,
     ) -> Result<Submitted, AppError> {
+        let stamped;
+        let pending = if pending.kept_ms.is_none() {
+            self.fresh_service_time().await?;
+            stamped = PendingBatch {
+                kept_ms: Some(self.kept_stamp()),
+                ..pending.clone()
+            };
+            let mut tx = self.tx()?;
+            tx.put(&pending_key(id), &stamped)?;
+            self.commit(tx).await?;
+            &stamped
+        } else {
+            pending
+        };
         let submitted = match self.submit(batch).await {
             Ok(submitted) => submitted,
             Err(error) => {
-                if refused_for_good(&error).is_some() {
+                // A first send's refusal is its caller's; one sent again is dropped and
+                // reported by its caller, in one commit.
+                if refused_for_good(&error).is_some() && !resent {
                     let mut tx = self.tx()?;
                     tx.delete(&pending_key(id))?;
                     self.commit(tx).await?;
@@ -749,11 +920,12 @@ impl App {
     /// can't tell about, sent again unchanged: the answer decides (Switch spec 12.5 "Kept
     /// batches", Switch wire 6.4 step 6). Its original proofs, or `409 conflict` after an
     /// import, show it applied: what it settles commits and nothing is signed again. `409
-    /// stale_generation` shows it never applied, for a batch kept less than the window the
-    /// service holds batch IDs: its operations are signed again for the generation
-    /// followed, under a new batch ID, and sent. Kept longer, it is dropped and reported. Another refusal for good drops
-    /// it; any other failure keeps it, and is the caller's error.
-    async fn resend_earlier(
+    /// stale_generation` shows it never applied: its operations are signed again for the
+    /// generation followed, under a new batch ID, and sent, but only while the answer can
+    /// tell: one kept longer than the service holds batch IDs is dropped instead, and
+    /// reported with each `attempt` in it. Another refusal for good drops it; any other
+    /// failure keeps it, and is the caller's error.
+    pub(crate) async fn resend_earlier(
         &mut self,
         id: &[u8; 16],
         pending: &PendingBatch,
@@ -768,15 +940,14 @@ impl App {
             Err(AppError::Switch(ClientError::Switch {
                 code: ErrorCode::StaleGeneration,
                 ..
-            })) if !super::provider::answer_decides(self.now(), pending.kept_ms) => {
+            })) if !self.answer_decides(pending.kept_ms) => {
                 // The service may have forgotten a batch it applied: past the window the
                 // answer decides nothing, and the batch goes (Switch spec 12.5 "Kept
-                // batches").
+                // batches"), reported in the commit that drops it.
                 let mut tx = self.tx()?;
-                tx.delete(&pending_key(id))?;
-                self.commit(tx).await?;
-                super::provider::dropped(id, batch, &mut self.events);
-                return Ok(());
+                Self::replace_kept_batch(id, None, &mut tx)?;
+                self.kept_batch_dropped(id, batch, &mut tx)?;
+                return self.commit(tx).await;
             }
             Err(AppError::Switch(ClientError::Switch {
                 code: ErrorCode::StaleGeneration,
@@ -791,9 +962,10 @@ impl App {
                 let new_id = signed.id().ok_or_else(|| {
                     AppError::InvalidData("a batch of operations has an ID".into())
                 })?;
+                // New bytes, never sent: stamped at their first send.
                 let renewed = PendingBatch {
                     body: signed.body().to_vec(),
-                    kept_ms: Some(self.now()),
+                    kept_ms: None,
                     ..pending.clone()
                 };
                 let mut tx = self.tx()?;
@@ -803,19 +975,29 @@ impl App {
                     batch_id: *id,
                     new_batch_id: new_id,
                 });
-                let submitted = self.run_pending(&new_id, &renewed, &signed).await?;
+                // Its first send: a refusal for good, other than one about the caller, which
+                // keeps it, drops it with what it carried, and tells the protocol in that
+                // commit, as a kept batch's refusal does; no caller waits for this one.
+                let submitted = match self.run_pending(&new_id, &renewed, &signed, true).await {
+                    Ok(submitted) => submitted,
+                    Err(error) if refused_at(&error) == Some(RefusalPlace::Caller) => {
+                        return Err(error);
+                    }
+                    Err(error) => match refused_for_good(&error) {
+                        Some(code) => return self.kept_batch_refused(&new_id, code).await,
+                        None => return Err(error),
+                    },
+                };
                 return self.check_attempts_of(&signed, &submitted).await;
+            }
+            Err(error) if refused_before_lookup(&error) => {
+                return self
+                    .kept_refused_before_lookup(id, pending, batch, error)
+                    .await;
             }
             Err(error) => {
                 if let Some(code) = refused_for_good(&error) {
-                    let mut tx = self.tx()?;
-                    tx.delete(&pending_key(id))?;
-                    self.commit(tx).await?;
-                    self.events.push(AppEvent::BatchRefused {
-                        batch_id: *id,
-                        code: code.as_str().to_owned(),
-                    });
-                    return Ok(());
+                    return self.kept_batch_refused(id, code).await;
                 }
                 return Err(error);
             }

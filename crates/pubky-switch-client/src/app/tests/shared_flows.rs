@@ -87,11 +87,14 @@ impl Protocol for ItemsProtocol {
         self.sample.receive(message)
     }
 
-    fn resend_needed(&self, needed: &ResendNeeded) -> Vec<LocalWrite> {
+    fn resend_needed(
+        &self,
+        needed: &ResendNeeded,
+    ) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
         self.sample.resend_needed(needed)
     }
 
-    fn missed(&self, missed: &MissedEntries) -> Vec<LocalWrite> {
+    fn missed(&self, missed: &MissedEntries) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
         self.sample.missed(missed)
     }
 
@@ -523,11 +526,23 @@ async fn test_send_not_admitted_is_deleted_after_30_days() {
     // Deleted, plaintext and all, and the protocol told.
     assert_eq!(app.delivery(&msg_id).await.unwrap(), None);
     assert!(
-        app.take_events().contains(&AppEvent::MessageUndelivered {
-            msg_id: msg_id.clone(),
-            resend: false
-        }),
+        app.take_events().iter().any(|e| matches!(
+            e,
+            AppEvent::MessageUndelivered { msg_id: m, resend: false, .. } if *m == msg_id
+        )),
         "the protocol is told"
+    );
+    // Durably: a load tells it again until it is acknowledged.
+    let mut loaded = App::load(s.env(), s.protocol.clone(), World::config(), app.app_id())
+        .await
+        .unwrap();
+    let told = loaded.take_events();
+    assert!(
+        told.iter().any(|e| matches!(
+            e,
+            AppEvent::MessageUndelivered { msg_id: m, .. } if *m == msg_id
+        )),
+        "{told:?}"
     );
     // Admitted later, it isn't sent.
     s.peer.lock().admitted = None;
@@ -576,10 +591,10 @@ async fn test_send_not_admitted_is_deleted_at_45_days_with_sparse_flushes() {
     assert_eq!(report.undelivered, vec![msg_id.clone()], "{report:?}");
     assert_eq!(app.delivery(&msg_id).await.unwrap(), None);
     assert!(s.peer.received().is_empty());
-    assert!(app.take_events().contains(&AppEvent::MessageUndelivered {
-        msg_id,
-        resend: false
-    }));
+    assert!(app.take_events().iter().any(|e| matches!(
+        e,
+        AppEvent::MessageUndelivered { id: _, msg_id: m, resend: false } if *m == msg_id
+    )));
 }
 
 #[tokio::test]
@@ -1879,6 +1894,16 @@ async fn test_batch_kept_and_refused_for_good_later_is_reported() {
     // Dropped: not sent again.
     app.flush_outbox().await.unwrap();
     assert_eq!(denied(&s, [9; 32]), 0);
+    // A duty event: a load delivers it again until it is acknowledged.
+    let mut loaded = App::load(s.env(), s.protocol.clone(), World::config(), app.app_id())
+        .await
+        .unwrap();
+    let again = loaded.take_events();
+    assert!(
+        again.iter().any(|e| e.is_duty()
+            && matches!(e, AppEvent::BatchRefused { code, .. } if code == "permission_missing")),
+        "{again:?}"
+    );
 }
 
 #[tokio::test]

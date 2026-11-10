@@ -9,7 +9,7 @@ use std::sync::Mutex;
 use super::*;
 use crate::app::{
     AppBackup, AppError, AppEvent, BackupRefusal, Need, ParkReason, Peeked, ProtocolLayer,
-    RETRY_EVENT_READS, ReceiveContext, StoreFailure,
+    RETRY_EVENT_READS, ReceiveContext, RestoreContext, StoreFailure,
 };
 use crate::error::StoreError;
 use crate::store::{Fault as StoreFault, FaultStore, MAX_BATCH_BYTES, MAX_VALUE_BYTES};
@@ -149,11 +149,14 @@ impl Protocol for FlakyProtocol {
         Some(JOURNAL.into())
     }
 
-    fn resend_needed(&self, needed: &ResendNeeded) -> Vec<LocalWrite> {
+    fn resend_needed(
+        &self,
+        needed: &ResendNeeded,
+    ) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
         self.sample.resend_needed(needed)
     }
 
-    fn missed(&self, missed: &MissedEntries) -> Vec<LocalWrite> {
+    fn missed(&self, missed: &MissedEntries) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
         self.sample.missed(missed)
     }
 }
@@ -342,6 +345,9 @@ fn test_store_failure_is_built_only_from_a_store_error() {
     // A corrupt value fails for the entry every time.
     let corrupt = StoreFailure::try_from(AppError::Store(StoreError::Corrupt)).unwrap();
     assert!(corrupt.is_of_entry());
+    // So do writes over the store's sizes: refused again however often they are retried.
+    let too_large = StoreError::TooLarge { size: 2, cap: 1 };
+    assert!(StoreFailure::from(too_large).is_of_entry());
     assert!(StoreFailure::of_entry(StoreError::Other("refused".into())).is_of_entry());
     // Any other error isn't a store failure, and is given back.
     let other = AppError::InvalidData("a body".into());
@@ -402,7 +408,7 @@ async fn test_receive_retry_after_a_conflict_commits_nothing_and_applies_later()
 
 fn parked_for(events: &[AppEvent], seq: u64) -> Option<ParkReason> {
     events.iter().find_map(|e| match e {
-        AppEvent::Parked { seq: s, reason } if *s == seq => Some(*reason),
+        AppEvent::Parked { seq: s, reason, .. } if *s == seq => Some(*reason),
         _ => None,
     })
 }
@@ -502,6 +508,124 @@ async fn test_receive_retry_count_goes_on_while_the_entry_is_stored_locally() {
 }
 
 #[tokio::test]
+async fn test_receive_retries_a_bounded_number_of_stored_entries_each_read_in_turn() {
+    let w = World::new();
+    let protocol = FlakyProtocol::new(u32::MAX);
+    let mut app = join_flaky(&w, &protocol, "wallet").await;
+    let cap = crate::app::PARKED_RETRIES_PER_READ;
+    let count = cap + cap / 2;
+    let seqs: Vec<u64> = (0..count).map(|_| w.note(app.app_id(), FLAKY).0).collect();
+    // Held, then past the wait stored locally for the store.
+    app.receive(None).await.unwrap();
+    w.clock.advance_ms(PARK_AFTER_MS);
+    app.receive(None).await.unwrap();
+    for seq in &seqs {
+        assert_eq!(
+            app.state.parked.get(seq).map(|p| p.reason),
+            Some(ParkReason::StoreUnavailable)
+        );
+    }
+    // Each read tries at most the cap, from where the last stopped, and the host hears of
+    // the failing store at each.
+    let mut tried = std::collections::BTreeSet::new();
+    for _ in 0..2 {
+        let calls = protocol.calls();
+        let report = app.receive(None).await.unwrap();
+        let tries = u32::try_from(cap).unwrap();
+        assert_eq!(protocol.calls(), calls + tries);
+        let failing = store_failing(&report.events);
+        assert_eq!(failing.len(), cap, "{failing:?}");
+        tried.extend(failing.iter().map(|(seq, _)| *seq));
+    }
+    // Two reads reached every entry.
+    assert_eq!(tried, seqs.iter().copied().collect());
+    // Healed, every one is processed, once.
+    protocol.heal();
+    for _ in 0..2 {
+        app.receive(None).await.unwrap();
+    }
+    assert!(app.state.parked.is_empty());
+    assert_eq!(protocol.applied(), count);
+}
+
+#[tokio::test]
+async fn test_receive_retry_rotation_goes_on_after_a_load() {
+    let w = World::new();
+    let protocol = FlakyProtocol::new(u32::MAX);
+    let mut app = join_flaky(&w, &protocol, "wallet").await;
+    let cap = crate::app::PARKED_RETRIES_PER_READ;
+    let seqs: Vec<u64> = (0..cap + 1)
+        .map(|_| w.note(app.app_id(), FLAKY).0)
+        .collect();
+    app.receive(None).await.unwrap();
+    w.clock.advance_ms(PARK_AFTER_MS);
+    app.receive(None).await.unwrap();
+    let report = app.receive(None).await.unwrap();
+    assert!(
+        !store_failing(&report.events)
+            .iter()
+            .any(|(seq, _)| seq == seqs.last().unwrap())
+    );
+    // Loaded again, the next read starts at the one the last read didn't reach.
+    let mut app = load_flaky(&w, &protocol, app.app_id()).await;
+    let report = app.receive(None).await.unwrap();
+    let failing = store_failing(&report.events);
+    assert_eq!(failing.first().map(|(seq, _)| *seq), seqs.last().copied());
+}
+
+#[tokio::test]
+async fn test_receive_retry_count_goes_when_a_resumed_effect_applies_a_stored_entry() {
+    let w = World::new();
+    let protocol = FlakyProtocol::new(u32::MAX);
+    let mut app = join_flaky(&w, &protocol, "wallet").await;
+    let (seq, _) = w.note(app.app_id(), FLAKY);
+    app.receive(None).await.unwrap();
+    w.clock.advance_ms(PARK_AFTER_MS);
+    app.receive(None).await.unwrap();
+    assert_eq!(app.state.retries.get(&seq).map(|r| r.reads), Some(2));
+    // The store heals; the stored entry's effect is applied, but its answer is lost.
+    protocol.heal();
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.receive(None).await.is_err());
+    assert!(app.state.pending_effect.is_some());
+    // The next read sends it again: applied once, the entry processed, its count gone.
+    app.receive(None).await.unwrap();
+    assert!(app.state.parked.is_empty());
+    assert!(app.state.retries.is_empty(), "{:?}", app.state.retries);
+    assert_eq!(w.effects(), 1);
+    let app = load_flaky(&w, &protocol, app.app_id()).await;
+    assert!(app.state.retries.is_empty(), "and in the store");
+}
+
+#[tokio::test]
+async fn test_receive_retry_count_goes_when_a_stored_entry_is_parked_as_uncertain() {
+    let w = World::new();
+    let protocol = FlakyProtocol::new(u32::MAX);
+    let mut app = join_flaky(&w, &protocol, "wallet").await;
+    let (seq, _) = w.note(app.app_id(), FLAKY);
+    app.receive(None).await.unwrap();
+    w.clock.advance_ms(PARK_AFTER_MS);
+    app.receive(None).await.unwrap();
+    assert_eq!(app.state.retries.get(&seq).map(|r| r.reads), Some(2));
+    // The store heals; the stored entry's effect is sent, its answer lost.
+    protocol.heal();
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.receive(None).await.is_err());
+    assert!(app.state.pending_effect.is_some());
+    // Past the window it isn't sent again: stored as uncertain, its count gone.
+    w.clock
+        .advance_ms(crate::app::provider::KEPT_BATCH_ANSWER_MS);
+    app.receive(None).await.unwrap();
+    assert_eq!(
+        app.state.parked.get(&seq).map(|p| p.reason),
+        Some(ParkReason::Uncertain)
+    );
+    assert!(app.state.retries.is_empty(), "{:?}", app.state.retries);
+    let app = load_flaky(&w, &protocol, app.app_id()).await;
+    assert!(app.state.retries.is_empty(), "and in the store");
+}
+
+#[tokio::test]
 async fn test_receive_retry_of_the_entry_is_parked_at_once() {
     let w = World::new();
     let protocol = FlakyProtocol::failing(1, StoreError::Corrupt, Mode::Plain);
@@ -548,23 +672,37 @@ struct JournalProtocol {
     name: Option<String>,
     /// Refuse every layer, as a later version of the protocol might.
     refuse: bool,
+    /// Take only a journal that is [`JOURNAL_BINDING`] blinded under the naming key the
+    /// restore gives, as a protocol checks the keys its layer holds.
+    bound: bool,
+    /// The identity and [`JOURNAL_BINDING`] blinded, as each restore step was given them.
+    restoring: Mutex<Vec<([u8; 32], [u8; 32])>>,
 }
 
+/// The input a bound journal is [`RestoreContext::blind`] of.
+const JOURNAL_BINDING: &[u8] = b"sample journal binding";
+
 impl JournalProtocol {
-    fn new(name: Option<&str>) -> Arc<Self> {
+    fn with(name: Option<&str>, refuse: bool, bound: bool) -> Arc<Self> {
         Arc::new(Self {
             sample: SampleProtocol::default(),
             name: name.map(str::to_owned),
-            refuse: false,
+            refuse,
+            bound,
+            restoring: Mutex::new(Vec::new()),
         })
     }
 
+    fn new(name: Option<&str>) -> Arc<Self> {
+        Self::with(name, false, false)
+    }
+
     fn refusing() -> Arc<Self> {
-        Arc::new(Self {
-            sample: SampleProtocol::default(),
-            name: Some(JOURNAL.into()),
-            refuse: true,
-        })
+        Self::with(Some(JOURNAL), true, false)
+    }
+
+    fn bound() -> Arc<Self> {
+        Self::with(Some(JOURNAL), false, true)
     }
 }
 
@@ -594,11 +732,14 @@ impl Protocol for JournalProtocol {
         self.sample.check_body(message)
     }
 
-    fn resend_needed(&self, needed: &ResendNeeded) -> Vec<LocalWrite> {
+    fn resend_needed(
+        &self,
+        needed: &ResendNeeded,
+    ) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
         self.sample.resend_needed(needed)
     }
 
-    fn missed(&self, missed: &MissedEntries) -> Vec<LocalWrite> {
+    fn missed(&self, missed: &MissedEntries) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
         self.sample.missed(missed)
     }
 
@@ -620,7 +761,15 @@ impl Protocol for JournalProtocol {
         Ok(journal)
     }
 
-    fn restore_layer(&self, layer: Option<&ProtocolLayer>) -> Result<Vec<LocalWrite>, String> {
+    fn restore_layer(
+        &self,
+        layer: Option<&ProtocolLayer>,
+        restoring: &RestoreContext<'_>,
+    ) -> Result<Vec<LocalWrite>, String> {
+        self.restoring
+            .lock()
+            .unwrap()
+            .push((restoring.identity(), restoring.blind(JOURNAL_BINDING)));
         let Some(layer) = layer else {
             return Err("journal: the backup has no journal".into());
         };
@@ -629,6 +778,9 @@ impl Protocol for JournalProtocol {
         }
         if self.refuse {
             return Err("journal: a journal of another version".into());
+        }
+        if self.bound && layer.data != restoring.blind(JOURNAL_BINDING) {
+            return Err("journal: a journal the naming key doesn't derive".into());
         }
         Ok(vec![LocalWrite::Put {
             key: JOURNAL_KEY.to_vec(),
@@ -776,6 +928,59 @@ async fn test_restore_of_a_layered_backup_keeps_the_entries_stored_locally() {
     );
     assert_eq!(handed(&again), vec![message.msg_id.clone()]);
     assert_eq!(w.effects(), 1);
+}
+
+#[tokio::test]
+async fn test_restore_of_a_layered_backup_in_place_keeps_what_the_app_owes_its_protocol() {
+    let w = World::new();
+    let protocol = FlakyProtocol::new(0);
+    let mut app = join_flaky(&w, &protocol, "wallet").await;
+    let me = app.app_id();
+    let backup = app.backup_layered().await.unwrap();
+    // After the backup: a duty event, and a call the protocol couldn't answer.
+    w.note(me, "refused");
+    w.switch.fail_next(Fault::Error {
+        path: "ops".into(),
+        code: ErrorCode::PermissionMissing,
+        current: serde_json::json!(null),
+    });
+    let report = app.receive(None).await.unwrap();
+    let duties: Vec<AppEvent> = report
+        .events
+        .into_iter()
+        .filter(AppEvent::is_duty)
+        .collect();
+    assert!(!duties.is_empty());
+    let now = w.clock.now_ms();
+    w.switch.push_missed(1, now.saturating_sub(1000), now);
+    *protocol.sample.failing.lock().unwrap() = 1;
+    app.receive(None).await.unwrap();
+    assert_eq!(app.owed_protocol_calls().await.unwrap(), 1);
+    drop(app);
+    // Restored in place from the layered backup: both stay, the duty events with their
+    // IDs, and the store's epoch and counter go on.
+    let mut restored = App::restore(w.env(), protocol.clone(), flaky_config(), &backup)
+        .await
+        .unwrap();
+    assert_eq!(restored.take_events(), duties);
+    assert_eq!(restored.owed_protocol_calls().await.unwrap(), 1);
+    let last = duties
+        .iter()
+        .filter_map(AppEvent::id)
+        .max_by_key(crate::app::EventId::counter)
+        .unwrap();
+    w.note(me, "refused again");
+    w.switch.fail_next(Fault::Error {
+        path: "ops".into(),
+        code: ErrorCode::PermissionMissing,
+        current: serde_json::json!(null),
+    });
+    let report = restored.receive(None).await.unwrap();
+    let next: Vec<_> = report.events.iter().filter_map(AppEvent::id).collect();
+    assert!(!next.is_empty(), "{:?}", report.events);
+    for id in next {
+        assert_eq!(id.cmp_same_store(&last), Some(std::cmp::Ordering::Greater));
+    }
 }
 
 #[tokio::test]
@@ -943,6 +1148,81 @@ async fn test_restore_refused_protocol_layer_writes_nothing() {
 }
 
 #[tokio::test]
+async fn test_restore_layer_is_given_the_identitys_naming_key() {
+    let w = World::new();
+    let protocol = JournalProtocol::bound();
+    let request = w.approve(&app_keys("wallet"), &["scope-a"]);
+    let mut app = App::join(w.env(), protocol.clone(), World::config(), request)
+        .await
+        .unwrap();
+    let journal = app.blind(JOURNAL_BINDING);
+    app.protocol_commit(&[LocalWrite::Put {
+        key: JOURNAL_KEY.to_vec(),
+        value: journal.to_vec(),
+    }])
+    .await
+    .unwrap();
+    // The layered backup checks the restore, with the same key.
+    let backup = layered(&mut app).await;
+    let store = Arc::new(MemoryStore::new());
+    let restored = restore_on(
+        &w,
+        protocol.clone(),
+        Arc::clone(&store) as Arc<dyn StateStore>,
+        &backup,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        restored.protocol_get(JOURNAL_KEY).await.unwrap(),
+        Some(journal.to_vec())
+    );
+    let expected = (app.identity(), journal);
+    assert_eq!(*protocol.restoring.lock().unwrap(), vec![expected; 2]);
+    assert_eq!(restored.blind(JOURNAL_BINDING), journal);
+}
+
+#[tokio::test]
+async fn test_restore_layer_refused_by_the_naming_key_writes_neither_layer() {
+    let w = World::new();
+    // A journal that isn't what the naming key derives, backed up by a protocol that
+    // doesn't check it.
+    let store = Arc::new(MemoryStore::new());
+    let (app, backup) =
+        journaled(&w, &JournalProtocol::new(Some(JOURNAL)), &store, &[9u8; 32]).await;
+    let before = snapshot(&store, &app.app_id());
+    assert!(!before.is_empty());
+    // Restored in place and onto an empty store: refused before any commit.
+    let empty = Arc::new(MemoryStore::new());
+    for target in [&store, &empty] {
+        let fault = Arc::new(FaultStore::new(
+            Arc::clone(target) as Arc<dyn StateStore>,
+            StoreFault::None,
+        ));
+        let protocol = JournalProtocol::bound();
+        let error = restore_on(
+            &w,
+            protocol.clone(),
+            fault.clone() as Arc<dyn StateStore>,
+            &backup,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&error, AppError::InvalidData(why) if why.contains("naming key")),
+            "{error:?}"
+        );
+        assert_eq!(fault.commits(), 0);
+        assert_eq!(
+            *protocol.restoring.lock().unwrap(),
+            vec![(app.identity(), app.blind(JOURNAL_BINDING))]
+        );
+    }
+    assert_eq!(snapshot(&store, &app.app_id()), before);
+    assert!(snapshot(&empty, &app.app_id()).is_empty());
+}
+
+#[tokio::test]
 async fn test_backup_with_a_layer_that_could_never_be_restored_is_refused() {
     let w = World::new();
     let protocol = JournalProtocol::new(Some(JOURNAL));
@@ -967,7 +1247,7 @@ async fn test_backup_with_a_layer_that_could_never_be_restored_is_refused() {
     app.protocol_commit(&journal(HUGE)).await.unwrap();
     let error = app.backup_layered().await.unwrap_err();
     assert!(
-        matches!(&error, AppError::Store(StoreError::Other(why)) if why.contains("value size")),
+        matches!(&error, AppError::Store(StoreError::TooLarge { cap, .. }) if *cap == MAX_VALUE_BYTES),
         "{error:?}"
     );
     assert_eq!(
@@ -999,7 +1279,7 @@ async fn test_backup_layered_over_the_batch_size_is_refused_until_it_drains() {
     }
     let error = app.backup_layered().await.unwrap_err();
     assert!(
-        matches!(&error, AppError::Store(StoreError::Other(why)) if why.contains("batch")),
+        matches!(&error, AppError::Store(StoreError::TooLarge { cap, .. }) if *cap == MAX_BATCH_BYTES),
         "{error:?}"
     );
     assert_eq!(
@@ -1041,12 +1321,12 @@ async fn test_backup_with_a_layer_carries_a_version_a_reader_without_layers_refu
     assert_ne!(version(&layered), json!(crate::app::SCHEMA_VERSION));
     assert!(AppBackup::from_bytes(&bare).is_ok());
     assert!(AppBackup::from_bytes(&layered).is_ok());
-    // A layer under the schema's version, or the layered version without a layer, doesn't
-    // read.
+    // A layer under the schema's version, as an earlier schema wrote layered backups, is
+    // an old schema; the layered version without a layer doesn't read.
     let layer_as_bare = with(&layered, crate::app::SCHEMA_VERSION);
     assert!(matches!(
         AppBackup::from_bytes(&layer_as_bare),
-        Err(AppError::InvalidData(_))
+        Err(AppError::Store(StoreError::OldSchema { .. }))
     ));
     let bare_as_layered = with(&bare, version(&layered).as_u64().unwrap() as u32);
     assert!(matches!(
@@ -1205,11 +1485,14 @@ impl Protocol for CounterProtocol {
         })
     }
 
-    fn resend_needed(&self, needed: &ResendNeeded) -> Vec<LocalWrite> {
+    fn resend_needed(
+        &self,
+        needed: &ResendNeeded,
+    ) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
         self.sample.resend_needed(needed)
     }
 
-    fn missed(&self, missed: &MissedEntries) -> Vec<LocalWrite> {
+    fn missed(&self, missed: &MissedEntries) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
         self.sample.missed(missed)
     }
 

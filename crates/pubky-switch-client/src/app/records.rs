@@ -892,7 +892,7 @@ impl App {
         match standing {
             Standing::Listed | Standing::RenewedOpen => {}
             Standing::RenewedClosed { until } => {
-                if !time.is_some_and(|t| t < until) {
+                if time.is_none_or(|t| t >= until) {
                     return invalid(
                         "Switch wire 6.2 step 4: an earlier certificate's write not dated before \
                          its renewal closed",

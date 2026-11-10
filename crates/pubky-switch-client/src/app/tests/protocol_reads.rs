@@ -153,11 +153,14 @@ impl Protocol for ReadsProtocol {
         }
     }
 
-    fn resend_needed(&self, needed: &ResendNeeded) -> Vec<LocalWrite> {
+    fn resend_needed(
+        &self,
+        needed: &ResendNeeded,
+    ) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
         self.items.resend_needed(needed)
     }
 
-    fn missed(&self, missed: &MissedEntries) -> Vec<LocalWrite> {
+    fn missed(&self, missed: &MissedEntries) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
         self.items.missed(missed)
     }
 
@@ -361,7 +364,7 @@ async fn test_receive_need_asked_again_parks_the_entry() {
     assert_eq!(protocol.seen().len(), 2);
     assert!(report.events.iter().any(|e| matches!(
         e,
-        AppEvent::Parked { seq: s, reason: ParkReason::TooManyReads } if *s == seq
+        AppEvent::Parked { id: Some(_), seq: s, reason: ParkReason::TooManyReads } if *s == seq
     )));
     assert_eq!(wallet.cursor().seq, seq);
     // Not tried again.

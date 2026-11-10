@@ -137,6 +137,11 @@ pub enum AppError {
     /// before it goes on.
     #[error(transparent)]
     Store(StoreError),
+    /// The protocol's own store failed in a callback the app must make, such as
+    /// [`super::Protocol::provider_lost_with`]: the step waits, and the next call makes the
+    /// callback again. The app's store didn't fail.
+    #[error("the protocol's store failed: {}", .0.error())]
+    Protocol(super::protocol::StoreFailure),
     /// Data from the network or the store that doesn't verify or doesn't read: the text
     /// names the rule.
     #[error("invalid data: {0}")]
@@ -157,6 +162,92 @@ impl AppError {
             _ => None,
         }
     }
+}
+
+/// Where the service made a refusal for good of a batch sent again (Switch wire 6.4), which
+/// decides what the refusal tells of the batch. A batch whose ID the service holds is
+/// answered at the batch ID lookup (step 5), by its original proofs or `409 conflict`,
+/// before any later check; what comes before that lookup tells nothing of whether it was
+/// applied.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RefusalPlace {
+    /// At or after the batch ID lookup: the batch was never applied. `409 conflict` (step
+    /// 5, or a condition or rule at steps 8 and 9), `409 stale_generation` (step 6), `403
+    /// permission_missing` (step 9), `409 stale_epoch` (a sealed field's rule, step 9),
+    /// `429 quota_exceeded` (step 9).
+    AfterLookup,
+    /// Before the lookup, about the caller: every request the app sends gets it until
+    /// something outside the batch changes, so it tells nothing of the batch, which stays
+    /// kept, the same bytes, and is handled as the same answer to any request.
+    /// Authentication's `401 bad_signature`, `401 stale_timestamp`, `403 not_current`, `403
+    /// cert_expired`, `410 moved` and `503 staged` (Switch wire 7.2, 7.3), and `403
+    /// not_admitted` (step 1, a caller of another identity, decided from the request's
+    /// identity and the account, not from the batch). `410 moved` is the one of these that
+    /// lets feed reads go on (Switch wire 7.3 step 8); that is fine: during a freeze every
+    /// write is refused, the cursor move included, so the feed can't advance at that
+    /// service with or without a kept effect in front of it, and stopping the read at the
+    /// `410` and having the move carry the effect across loses nothing.
+    ///
+    /// `401 stale_timestamp`, `410 moved` and `503 staged` are listed for completeness: they
+    /// never reach [`refused_at`], since [`refused_for_good`] leaves them out (their Retry is
+    /// not "No"), and they are retried as any transient answer is, the batch kept as it is.
+    Caller,
+    /// Before the lookup, about these bytes: the same bytes get the same answer, so the
+    /// batch is never answered and is handled at once as one kept past the window: an
+    /// effect's entry stored as uncertain, a batch dropped with its attempts. It is
+    /// uncertain, not refused: a batch applied under an earlier service can be refused for
+    /// its shape by a later one. `400` (steps 2 to 4), `413 too_large` (step 2), and every
+    /// code not classified above.
+    ///
+    /// `400`, `413 too_large` and `404 not_found` also come from step 9, an operation's
+    /// shape or its rules (an invite code not held), after the lookup, which would prove the
+    /// batch never applied. The answer can't tell them apart from the request's: its body
+    /// is the code, a message that isn't normative, and `current`, which none of them
+    /// carries, with no operation named (Switch wire 7.6). So they are taken as before the
+    /// lookup, the weaker reading: the entry is stored as uncertain where it was in fact
+    /// refused.
+    ///
+    /// Step 9 also answers about the bytes with codes this takes as about the caller: `401
+    /// bad_signature` for a `key_bundle.put` bundle, for an `app.put` record and for a
+    /// `receive_key.put` record that don't verify, and `403 not_current` for an `app.put`
+    /// whose certificate isn't the one `identity.json` lists. A `key_bundle.put` never
+    /// reaches an app's batch: it is the signer's, and step 9 checks permission (`403
+    /// permission_missing`) before shape. The caller's own `app.put` is checked at
+    /// authentication, before the lookup, where such a refusal is about the caller: any
+    /// batch carrying it is authenticated against that record, the batch's first `app.put`
+    /// naming the caller (Switch wire 7.2, 6.4 step 7). The app's own `app.put` and
+    /// `receive_key.put` go in batches of their own, sent again by their own steps
+    /// (joining, the record's delivery, a registration, a move's or a loss's
+    /// re-registration), never through a kept effect or a kept batch, whose answers this
+    /// classifies. A protocol's effect and a host's batch may carry none of them
+    /// (`refuse_lifecycle_ops`), which is what makes [`RefusalPlace::Caller`] safe until
+    /// the wire's answers name the operation: otherwise one refused at step 9 would be held
+    /// here as about the caller until the window ends.
+    Bytes,
+}
+
+/// The place of a refusal for good of a batch sent again ([`RefusalPlace`]).
+pub(crate) fn refusal_place(code: ErrorCode) -> RefusalPlace {
+    match code {
+        ErrorCode::Conflict
+        | ErrorCode::StaleGeneration
+        | ErrorCode::PermissionMissing
+        | ErrorCode::StaleEpoch
+        | ErrorCode::QuotaExceeded => RefusalPlace::AfterLookup,
+        ErrorCode::BadSignature
+        | ErrorCode::StaleTimestamp
+        | ErrorCode::NotCurrent
+        | ErrorCode::CertExpired
+        | ErrorCode::Moved
+        | ErrorCode::Staged
+        | ErrorCode::NotAdmitted => RefusalPlace::Caller,
+        _ => RefusalPlace::Bytes,
+    }
+}
+
+/// The place of an error that refuses a batch for good; `None` for any other error.
+pub(crate) fn refused_at(error: &AppError) -> Option<RefusalPlace> {
+    refused_for_good(error).map(refusal_place)
 }
 
 /// Whether the switch refused these exact bytes for good, so that sending them again can't
@@ -208,7 +299,7 @@ impl From<StoreError> for AppError {
 
 impl From<BatchError> for AppError {
     fn from(error: BatchError) -> Self {
-        AppError::Store(StoreError::Other(error.to_string()))
+        AppError::Store(error.into())
     }
 }
 

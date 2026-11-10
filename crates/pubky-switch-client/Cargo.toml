@@ -24,6 +24,7 @@ test-support = ["dep:blake3", "dep:ed25519-dalek"]
 [dependencies]
 blake3 = { workspace = true, optional = true }
 ed25519-dalek = { workspace = true, optional = true }
+getrandom.workspace = true
 pubky-switch-core.workspace = true
 reqwest = { workspace = true, optional = true }
 serde.workspace = true
