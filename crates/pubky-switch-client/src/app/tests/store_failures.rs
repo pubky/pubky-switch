@@ -1190,12 +1190,12 @@ async fn test_backup_with_a_layer_carries_a_version_a_reader_without_layers_refu
     assert_ne!(version(&layered), json!(crate::app::SCHEMA_VERSION));
     assert!(AppBackup::from_bytes(&bare).is_ok());
     assert!(AppBackup::from_bytes(&layered).is_ok());
-    // A layer under the schema's version, or the layered version without a layer, doesn't
-    // read.
+    // A layer under the schema's version, as an earlier schema wrote layered backups, is
+    // an old schema; the layered version without a layer doesn't read.
     let layer_as_bare = with(&layered, crate::app::SCHEMA_VERSION);
     assert!(matches!(
         AppBackup::from_bytes(&layer_as_bare),
-        Err(AppError::InvalidData(_))
+        Err(AppError::Store(StoreError::OldSchema { .. }))
     ));
     let bare_as_layered = with(&bare, version(&layered).as_u64().unwrap() as u32);
     assert!(matches!(

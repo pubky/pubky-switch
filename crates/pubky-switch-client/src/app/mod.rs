@@ -382,16 +382,28 @@ impl AppBackup {
     ///
     /// # Errors
     ///
-    /// [`AppError::InvalidData`] if they don't read as a backup of this schema, or their
-    /// version isn't the one of a backup with, or without, a layer.
+    /// [`StoreError::OldSchema`] for a backup an earlier schema wrote, as for a store of
+    /// one; [`AppError::InvalidData`] if they don't read as a backup, or their version isn't
+    /// the one of a backup with, or without, a layer.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, AppError> {
-        let backup: Self = serde_json::from_slice(bytes)
+        #[derive(Deserialize)]
+        struct Version {
+            v: u32,
+            #[serde(default)]
+            protocol: Option<serde_json::Value>,
+        }
+        let version: Version = serde_json::from_slice(bytes)
             .map_err(|_| AppError::InvalidData("the backup doesn't read".into()))?;
-        let expected = if backup.protocol.is_some() {
+        let expected = if version.protocol.is_some() {
             LAYERED_BACKUP_VERSION
         } else {
             SCHEMA_VERSION
         };
+        if version.v < expected {
+            return Err(AppError::Store(StoreError::OldSchema { found: version.v }));
+        }
+        let backup: Self = serde_json::from_slice(bytes)
+            .map_err(|_| AppError::InvalidData("the backup doesn't read".into()))?;
         if backup.v != expected {
             return Err(AppError::InvalidData(
                 "the backup is of another schema version".into(),

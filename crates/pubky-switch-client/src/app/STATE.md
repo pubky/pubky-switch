@@ -126,7 +126,10 @@ Deleting the keys on a leave removes `keys`, `naming`, `rk/`, `scope/`, `parked/
 - New records take new keys under a prefix of their own; existing keys keep their meaning.
 - A changed record type bumps `SCHEMA_VERSION` with a migration that runs on load.
 - `SCHEMA_VERSION` 2: `pending/effect` keeps the opened entry it is for, a required field.
-  No migration reads a store of schema 1; such a store fails to load as an old schema.
+  No migration reads a store of schema 1; such a store fails to load as an old schema, and
+  a backup an earlier schema wrote (schema 1, or a layered backup of version 2) is refused
+  the same way (`StoreError::OldSchema`). A store or backup of an earlier schema has no way
+  forward but a new join; no tagged or pinned build wrote schema 1.
 - Protocol state stays under `p/`, written only through `LocalWrite`.
 
 ## Moves, recovery and push
