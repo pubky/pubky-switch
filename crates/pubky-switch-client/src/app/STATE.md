@@ -30,6 +30,11 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
 - **A duty event goes in the commit of what it reports** (`duty/<id>`), and is reported
   only once that commit is done: a failed commit reports nothing, and a crash after it
   loses nothing, since every load reports the kept duty events again.
+- **Only the host's acknowledgement removes a duty event.** The app sets no cap on
+  `duty/`: a cap would have to lose a duty event, or stop reading the feed (which never
+  stalls, Switch spec 8.2), giving up undeliverable messages (Switch spec 11) or following
+  a provider change (Switch spec 12.5, 12.6). A host acknowledges each one once its
+  protocol has kept what it says.
 
 ## Keys
 
@@ -76,7 +81,7 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
 | `leave` | a leave in progress or done | |
 | `service_time` | the highest service time verified, its key, the offset from the device clock | |
 | `p/...` | the protocol's own local state (`LocalWrite`) | the protocol's |
-| `duty/<id>` | a duty event (`AppEvent::is_duty`), written in the commit of the change it reports, until the host acknowledges it (`App::ack_events`); one per entry stored for good, kept batch or `attempt` dropped, or outbox message given up | |
+| `duty/<id>` | a duty event (`AppEvent::is_duty`), written in the commit of the change it reports, until the host acknowledges it (`App::ack_events`); one per entry stored for good, kept batch or `attempt` dropped, or outbox message given up. Only acknowledgements remove them: nothing bounds them for a host that never acknowledges | |
 | `dutyn` | the ID the next duty event takes; a restore keeps it, so an ID is never given twice | |
 
 Deleting the keys on a leave removes `keys`, `naming`, `rk/`, `scope/`, `parked/`,

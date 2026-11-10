@@ -1199,7 +1199,8 @@ impl App {
     }
 
     /// The duty events kept and not acknowledged yet, by ascending ID: what a host that
-    /// lost its copy of the reports still has to act on.
+    /// lost its copy of the reports still has to act on. Nothing but [`App::ack_events`]
+    /// shortens this list (`events` module, "Duty events").
     ///
     /// # Errors
     ///
@@ -1219,6 +1220,11 @@ impl App {
     /// [`App::load`] delivers them again. IDs rise in the order the events are reported,
     /// so a host acknowledges after acting on every duty event it took up to that ID. An
     /// ID no event has yet acknowledges only those before it.
+    ///
+    /// The host must call this once it has handed the events to its protocol and the
+    /// protocol has kept what they say: nothing else removes a kept duty event, so a host
+    /// that never acknowledges keeps them all, without limit (`events` module, "Duty
+    /// events").
     ///
     /// # Errors
     ///

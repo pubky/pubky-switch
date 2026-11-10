@@ -20,9 +20,14 @@
 //!
 //! Every other event is informational: kept in memory only, and shown once.
 //!
-//! Stored duty events are bounded by what they report: each is written once, for one
-//! entry stored for good, one kept batch or `attempt` dropped, or one outbox message given
-//! up, and goes when acknowledged.
+//! Nothing in the app bounds the stored duty events: only the host's acknowledgements
+//! remove them. Each is written once, for one entry stored for good, one kept batch or
+//! `attempt` dropped, or one outbox message given up, so they grow with those facts, and
+//! without limit for a host that never acknowledges. The app sets no cap, since a cap would
+//! have to lose a duty event or stop the work that makes them: reading the feed, which never
+//! stalls (Switch spec 8.2), giving up an undeliverable message (Switch spec 11), or
+//! following a provider change (Switch spec 12.5, 12.6). A host acknowledges each duty
+//! event once it has handed it to its protocol and the protocol has kept what it says.
 
 use serde::{Deserialize, Serialize};
 
