@@ -71,7 +71,7 @@ pub use protocol::{
     ReceivedMessage, ResendNeeded, ResendReason,
 };
 pub use provider::ProviderStatus;
-pub use push::{MAX_HANDLE_BYTES, PushRegistration, PushRelay};
+pub use push::{MAX_HANDLE_BYTES, MAX_HANDLES, PushHandles, PushRegistration, PushRelay};
 pub use recovery::{Evidence, LossActions, ProviderLoss, RESIDUAL_WINDOW_MS, RecoveryInfo};
 pub use state::{PROTOCOL_PREFIX, SCHEMA_VERSION};
 

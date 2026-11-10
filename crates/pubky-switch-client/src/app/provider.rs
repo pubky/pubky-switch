@@ -1377,6 +1377,7 @@ impl App {
         if had_push {
             tx.delete(push::KEY)?;
         }
+        tx.delete(push::DEVICES_KEY)?;
         self.commit(tx).await?;
         self.state.gone = Some(gone);
         if had_push {

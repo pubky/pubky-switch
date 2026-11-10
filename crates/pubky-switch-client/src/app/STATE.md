@@ -97,6 +97,7 @@ uploads; `push.rs` holds the push registration. The peek (`peek.rs`) writes noth
 | `lc/contact/<pubky>`, `lc/deny/<pubky>` | the app's copy of the contacts and deny list, from the feed | |
 | `lc/code/<hash>` | an invite code this app registered, from the feed | |
 | `push` | the push setting: relay, device token, the service it is at, the push key, the handle, whether set, a rotation in flight | the device token |
+| `push/devices` | the handles of the app's other devices and the push key they are bound to, from the host's device sync, merged into the handles this device sets | the handles |
 | `gone` | the app isn't current any more, or its account is gone, and since when | |
 | `erasing` | since when every try met an unsigned `404` and no published `identity.json` | |
 
