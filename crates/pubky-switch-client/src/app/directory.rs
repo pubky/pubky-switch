@@ -478,7 +478,8 @@ impl App {
     /// under the version floor and the equivocation check, and keep when the switch was
     /// looked up and whether it answered, which counts until the next lookup. The answer
     /// counts from when its read completed ([`SwitchAnswer::read_ms`]), not from this call:
-    /// one held more than 10 minutes gives a copy to look up again.
+    /// one held more than 10 minutes gives a copy to look up again, and one older than the
+    /// last lookup's outcome leaves that outcome standing.
     ///
     /// # Errors
     ///
@@ -608,21 +609,28 @@ impl App {
             self.take_peer_copy(&pubky, copy, CopySource::Switch { read_ms })
                 .await?;
         }
-        let mut tx = self.tx()?;
-        tx.put(
-            &switch_read_key(&pubky),
-            &SwitchRead {
-                at_ms: read_ms,
-                read,
-            },
-        )?;
-        self.commit(tx).await?;
-        let switch_copy = if read {
+        // An answer older than the last lookup's outcome changes nothing of it: a lookup that
+        // failed later, perhaps on a newer copy, still counts (Switch spec 4.3).
+        let last: Option<SwitchRead> = self.reader().get(&switch_read_key(&pubky)).await?;
+        let outcome = match last {
+            Some(last) if last.at_ms > read_ms => last,
+            _ => {
+                let outcome = SwitchRead {
+                    at_ms: read_ms,
+                    read,
+                };
+                let mut tx = self.tx()?;
+                tx.put(&switch_read_key(&pubky), &outcome)?;
+                self.commit(tx).await?;
+                outcome
+            }
+        };
+        let switch_copy = if outcome.read {
             SwitchCopy::Read
         } else {
             SwitchCopy::Unavailable
         };
-        self.peer_identity_held(&pubky, answer.homeserver, switch_copy, read_ms)
+        self.peer_identity_held(&pubky, answer.homeserver, switch_copy, outcome.at_ms)
             .await
     }
 
