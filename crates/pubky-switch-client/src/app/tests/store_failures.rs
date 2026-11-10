@@ -9,7 +9,7 @@ use std::sync::Mutex;
 use super::*;
 use crate::app::{
     AppBackup, AppError, AppEvent, BackupRefusal, Need, ParkReason, Peeked, ProtocolLayer,
-    RETRY_EVENT_READS, ReceiveContext, StoreFailure,
+    RETRY_EVENT_READS, ReceiveContext, RestoreContext, StoreFailure,
 };
 use crate::error::StoreError;
 use crate::store::{Fault as StoreFault, FaultStore, MAX_BATCH_BYTES, MAX_VALUE_BYTES};
@@ -345,6 +345,9 @@ fn test_store_failure_is_built_only_from_a_store_error() {
     // A corrupt value fails for the entry every time.
     let corrupt = StoreFailure::try_from(AppError::Store(StoreError::Corrupt)).unwrap();
     assert!(corrupt.is_of_entry());
+    // So do writes over the store's sizes: refused again however often they are retried.
+    let too_large = StoreError::TooLarge { size: 2, cap: 1 };
+    assert!(StoreFailure::from(too_large).is_of_entry());
     assert!(StoreFailure::of_entry(StoreError::Other("refused".into())).is_of_entry());
     // Any other error isn't a store failure, and is given back.
     let other = AppError::InvalidData("a body".into());
@@ -669,23 +672,37 @@ struct JournalProtocol {
     name: Option<String>,
     /// Refuse every layer, as a later version of the protocol might.
     refuse: bool,
+    /// Take only a journal that is [`JOURNAL_BINDING`] blinded under the naming key the
+    /// restore gives, as a protocol checks the keys its layer holds.
+    bound: bool,
+    /// The identity and [`JOURNAL_BINDING`] blinded, as each restore step was given them.
+    restoring: Mutex<Vec<([u8; 32], [u8; 32])>>,
 }
 
+/// The input a bound journal is [`RestoreContext::blind`] of.
+const JOURNAL_BINDING: &[u8] = b"sample journal binding";
+
 impl JournalProtocol {
-    fn new(name: Option<&str>) -> Arc<Self> {
+    fn with(name: Option<&str>, refuse: bool, bound: bool) -> Arc<Self> {
         Arc::new(Self {
             sample: SampleProtocol::default(),
             name: name.map(str::to_owned),
-            refuse: false,
+            refuse,
+            bound,
+            restoring: Mutex::new(Vec::new()),
         })
     }
 
+    fn new(name: Option<&str>) -> Arc<Self> {
+        Self::with(name, false, false)
+    }
+
     fn refusing() -> Arc<Self> {
-        Arc::new(Self {
-            sample: SampleProtocol::default(),
-            name: Some(JOURNAL.into()),
-            refuse: true,
-        })
+        Self::with(Some(JOURNAL), true, false)
+    }
+
+    fn bound() -> Arc<Self> {
+        Self::with(Some(JOURNAL), false, true)
     }
 }
 
@@ -744,7 +761,15 @@ impl Protocol for JournalProtocol {
         Ok(journal)
     }
 
-    fn restore_layer(&self, layer: Option<&ProtocolLayer>) -> Result<Vec<LocalWrite>, String> {
+    fn restore_layer(
+        &self,
+        layer: Option<&ProtocolLayer>,
+        restoring: &RestoreContext<'_>,
+    ) -> Result<Vec<LocalWrite>, String> {
+        self.restoring
+            .lock()
+            .unwrap()
+            .push((restoring.identity(), restoring.blind(JOURNAL_BINDING)));
         let Some(layer) = layer else {
             return Err("journal: the backup has no journal".into());
         };
@@ -753,6 +778,9 @@ impl Protocol for JournalProtocol {
         }
         if self.refuse {
             return Err("journal: a journal of another version".into());
+        }
+        if self.bound && layer.data != restoring.blind(JOURNAL_BINDING) {
+            return Err("journal: a journal the naming key doesn't derive".into());
         }
         Ok(vec![LocalWrite::Put {
             key: JOURNAL_KEY.to_vec(),
@@ -1120,6 +1148,81 @@ async fn test_restore_refused_protocol_layer_writes_nothing() {
 }
 
 #[tokio::test]
+async fn test_restore_layer_is_given_the_identitys_naming_key() {
+    let w = World::new();
+    let protocol = JournalProtocol::bound();
+    let request = w.approve(&app_keys("wallet"), &["scope-a"]);
+    let mut app = App::join(w.env(), protocol.clone(), World::config(), request)
+        .await
+        .unwrap();
+    let journal = app.blind(JOURNAL_BINDING);
+    app.protocol_commit(&[LocalWrite::Put {
+        key: JOURNAL_KEY.to_vec(),
+        value: journal.to_vec(),
+    }])
+    .await
+    .unwrap();
+    // The layered backup checks the restore, with the same key.
+    let backup = layered(&mut app).await;
+    let store = Arc::new(MemoryStore::new());
+    let restored = restore_on(
+        &w,
+        protocol.clone(),
+        Arc::clone(&store) as Arc<dyn StateStore>,
+        &backup,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        restored.protocol_get(JOURNAL_KEY).await.unwrap(),
+        Some(journal.to_vec())
+    );
+    let expected = (app.identity(), journal);
+    assert_eq!(*protocol.restoring.lock().unwrap(), vec![expected; 2]);
+    assert_eq!(restored.blind(JOURNAL_BINDING), journal);
+}
+
+#[tokio::test]
+async fn test_restore_layer_refused_by_the_naming_key_writes_neither_layer() {
+    let w = World::new();
+    // A journal that isn't what the naming key derives, backed up by a protocol that
+    // doesn't check it.
+    let store = Arc::new(MemoryStore::new());
+    let (app, backup) =
+        journaled(&w, &JournalProtocol::new(Some(JOURNAL)), &store, &[9u8; 32]).await;
+    let before = snapshot(&store, &app.app_id());
+    assert!(!before.is_empty());
+    // Restored in place and onto an empty store: refused before any commit.
+    let empty = Arc::new(MemoryStore::new());
+    for target in [&store, &empty] {
+        let fault = Arc::new(FaultStore::new(
+            Arc::clone(target) as Arc<dyn StateStore>,
+            StoreFault::None,
+        ));
+        let protocol = JournalProtocol::bound();
+        let error = restore_on(
+            &w,
+            protocol.clone(),
+            fault.clone() as Arc<dyn StateStore>,
+            &backup,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&error, AppError::InvalidData(why) if why.contains("naming key")),
+            "{error:?}"
+        );
+        assert_eq!(fault.commits(), 0);
+        assert_eq!(
+            *protocol.restoring.lock().unwrap(),
+            vec![(app.identity(), app.blind(JOURNAL_BINDING))]
+        );
+    }
+    assert_eq!(snapshot(&store, &app.app_id()), before);
+    assert!(snapshot(&empty, &app.app_id()).is_empty());
+}
+
+#[tokio::test]
 async fn test_backup_with_a_layer_that_could_never_be_restored_is_refused() {
     let w = World::new();
     let protocol = JournalProtocol::new(Some(JOURNAL));
@@ -1144,7 +1247,7 @@ async fn test_backup_with_a_layer_that_could_never_be_restored_is_refused() {
     app.protocol_commit(&journal(HUGE)).await.unwrap();
     let error = app.backup_layered().await.unwrap_err();
     assert!(
-        matches!(&error, AppError::Store(StoreError::Other(why)) if why.contains("value size")),
+        matches!(&error, AppError::Store(StoreError::TooLarge { cap, .. }) if *cap == MAX_VALUE_BYTES),
         "{error:?}"
     );
     assert_eq!(
@@ -1176,7 +1279,7 @@ async fn test_backup_layered_over_the_batch_size_is_refused_until_it_drains() {
     }
     let error = app.backup_layered().await.unwrap_err();
     assert!(
-        matches!(&error, AppError::Store(StoreError::Other(why)) if why.contains("batch")),
+        matches!(&error, AppError::Store(StoreError::TooLarge { cap, .. }) if *cap == MAX_BATCH_BYTES),
         "{error:?}"
     );
     assert_eq!(

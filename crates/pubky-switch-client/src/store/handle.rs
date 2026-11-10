@@ -127,12 +127,10 @@ impl StoreHandle {
     ///
     /// # Errors
     ///
-    /// [`StoreError::Other`] for an oversized batch, with nothing applied; otherwise as
+    /// [`StoreError::TooLarge`] for an oversized batch, with nothing applied; otherwise as
     /// [`StateStore::commit`].
     pub async fn commit(&self, batch: WriteBatch) -> Result<(), StoreError> {
-        batch
-            .check_size()
-            .map_err(|error| StoreError::Other(error.to_string()))?;
+        batch.check_size().map_err(StoreError::from)?;
         self.run(move |store| store.commit(batch)).await
     }
 }
@@ -162,7 +160,7 @@ mod tests {
         });
         assert!(matches!(
             handle.commit(batch).await,
-            Err(StoreError::Other(_))
+            Err(StoreError::TooLarge { .. })
         ));
         assert_eq!(handle.get("ns", b"big").await.unwrap(), None);
     }

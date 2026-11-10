@@ -19,12 +19,12 @@ use serde_json::{Map, Value, json};
 use super::shared_flows::{ItemsProtocol, ids, items, value};
 use super::*;
 use crate::app::{
-    AppError, AppEvent, ClaimOp, Collection, Delivery, MAX_CURSOR_DEFER_MS, ObligationDeadline,
-    OpBatch, OutgoingMessage, PolicyFamily, ReceiveContext, RecordJob, RecordTarget, Refusal,
-    SentMessage, SwitchCopy,
+    AppBackup, AppError, AppEvent, ClaimOp, Collection, Delivery, MAX_CURSOR_DEFER_MS,
+    ObligationDeadline, OpBatch, OutgoingMessage, PolicyFamily, ReceiveContext, RecordJob,
+    RecordTarget, Refusal, SenderDisposition, SentMessage, SwitchCopy,
 };
 use crate::store::{Fault as StoreFault, FaultStore};
-use crate::testing::{Router, SWITCH_ORIGIN};
+use crate::testing::{Fault, Router, SWITCH_ORIGIN};
 use crate::transport::Transport;
 
 const MINUTE: u64 = 60_000;
@@ -60,6 +60,8 @@ struct Seen {
     /// The context's answers to the writes, as text.
     writes: Vec<Result<(), String>>,
     context: Option<Value>,
+    /// What the context knew of the sender's standing in the lists.
+    disposition: Option<SenderDisposition>,
 }
 
 /// [`ItemsProtocol`], with a receive step that uses the [`ReceiveContext`].
@@ -68,6 +70,9 @@ struct ApiProtocol {
     mode: Mutex<Mode>,
     collections: Mutex<Vec<Collection>>,
     seen: Mutex<Vec<Seen>>,
+    /// How many of the next receive steps the store rejects for their entry, which is then
+    /// stored locally ([`StoreFailure::of_entry`]).
+    reject: Mutex<u32>,
 }
 
 impl ApiProtocol {
@@ -77,6 +82,7 @@ impl ApiProtocol {
             mode: Mutex::new(mode),
             collections: Mutex::new(vec![items()]),
             seen: Mutex::new(Vec::new()),
+            reject: Mutex::new(0),
         })
     }
 
@@ -137,7 +143,18 @@ impl Protocol for ApiProtocol {
             conflict: message.conflict.is_some(),
             writes: Vec::new(),
             context: message.context.clone(),
+            disposition: cx.sender_disposition(&message.sender).ok(),
         };
+        {
+            let mut reject = self.reject.lock().unwrap();
+            if *reject > 0 {
+                *reject -= 1;
+                self.seen.lock().unwrap().push(seen);
+                return Outcome::Retry(crate::app::StoreFailure::of_entry(
+                    crate::error::StoreError::Corrupt,
+                ));
+            }
+        }
         let outcome = match mode {
             Mode::Plain => self.receive(message),
             Mode::Record | Mode::RecordTwice | Mode::DropAfterWrite => {
@@ -226,6 +243,10 @@ impl Protocol for ApiProtocol {
         current: Option<&[u8]>,
     ) -> Option<Vec<u8>> {
         self.items.sent_record(job, sent, current)
+    }
+
+    fn backup_name(&self) -> Option<String> {
+        Some("sample.api".into())
     }
 }
 
@@ -1081,11 +1102,29 @@ impl Pair {
         protocol: Arc<dyn Protocol>,
         store: Arc<dyn StateStore>,
     ) -> App {
+        self.join_with(signer, name, protocol, store, &Permission::ALL)
+            .await
+    }
+
+    /// `name` of `signer`'s identity on `store`, with `permissions`.
+    async fn join_with(
+        &self,
+        signer: &TestSigner,
+        name: &str,
+        protocol: Arc<dyn Protocol>,
+        store: Arc<dyn StateStore>,
+        permissions: &[Permission],
+    ) -> App {
         let keys = signer.identity().app_keys(name);
-        let app = AppSpec::new(&["scope-a"]).with_permissions(&Permission::ALL);
+        let app = AppSpec::new(&["scope-a"]).with_permissions(permissions);
         let request = signer.approve(&keys, &app).unwrap();
-        let env = signer.env_with(store, Arc::clone(&self.router) as Arc<dyn Transport>);
-        App::join(env, protocol, config(), request).await.unwrap()
+        App::join(self.env(signer, store), protocol, config(), request)
+            .await
+            .unwrap()
+    }
+
+    fn env(&self, signer: &TestSigner, store: Arc<dyn StateStore>) -> AppEnv {
+        signer.env_with(store, Arc::clone(&self.router) as Arc<dyn Transport>)
     }
 
     async fn join(&self, signer: &TestSigner, name: &str, protocol: &Arc<ApiProtocol>) -> App {
@@ -1602,6 +1641,393 @@ async fn test_identity_of_refuses_an_equivocating_counterparty() {
     let alice = p.alice.identity().public();
     let own = wallet.identity_of(&alice, false).await.unwrap_err();
     assert!(matches!(own, AppError::Refused(Refusal::Usage(_))));
+}
+
+// -------------------------------------------------------------------------------------
+// A sender's standing in the lists, as a receive step reads it (Switch spec 7 "Spam")
+
+/// The disposition the receive step saw for the last message.
+fn last_disposition(protocol: &ApiProtocol) -> SenderDisposition {
+    protocol.seen().last().unwrap().disposition.unwrap()
+}
+
+/// Bob's shop with alice invited, and a note from alice's wallet waiting in its inbox.
+async fn shop_with_a_note(p: &Pair, protocol: &Arc<ApiProtocol>) -> App {
+    let mut wallet = p.join(&p.alice, "wallet", protocol).await;
+    let mut shop = p.join(&p.bob, "shop", protocol).await;
+    shop.invite(&p.alice.identity().public()).await.unwrap();
+    let (_, delivery) = wallet.send(Pair::note(&p.bob, "hello")).await.unwrap();
+    assert!(
+        matches!(delivery, Delivery::Accepted { .. }),
+        "{delivery:?}"
+    );
+    shop
+}
+
+#[tokio::test]
+async fn test_sender_disposition_neither_after_a_refresh() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let mut shop = shop_with_a_note(&p, &protocol).await;
+    // Another sender is flagged and blocked; alice is neither.
+    let carol = p.carol.identity().public();
+    p.bob.switch().lock().shared.flagged.insert(carol, 3);
+    shop.deny(&carol).await.unwrap();
+    shop.allow_list().await.unwrap();
+    let as_of = shop.highest_service_time();
+    shop.receive(None).await.unwrap();
+    let seen = last_disposition(&protocol);
+    assert!(!seen.blocked && !seen.flagged, "{seen:?}");
+    assert!(as_of.is_some());
+    assert_eq!(seen.lists_as_of_ms, as_of);
+}
+
+#[tokio::test]
+async fn test_sender_disposition_blocked() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let mut shop = shop_with_a_note(&p, &protocol).await;
+    // Denied after the inbox accepted the note.
+    shop.deny(&p.alice.identity().public()).await.unwrap();
+    shop.allow_list().await.unwrap();
+    shop.receive(None).await.unwrap();
+    let seen = last_disposition(&protocol);
+    assert!(seen.blocked && !seen.flagged, "{seen:?}");
+}
+
+#[tokio::test]
+async fn test_sender_disposition_flagged() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let mut shop = shop_with_a_note(&p, &protocol).await;
+    let alice = p.alice.identity().public();
+    p.bob.switch().lock().shared.flagged.insert(alice, 4);
+    let list = shop.allow_list().await.unwrap();
+    assert_eq!(list.flagged.len(), 1);
+    shop.receive(None).await.unwrap();
+    let seen = last_disposition(&protocol);
+    assert!(seen.flagged && !seen.blocked, "{seen:?}");
+    assert!(seen.lists_as_of_ms.is_some());
+}
+
+#[tokio::test]
+async fn test_sender_disposition_refresh_clears_a_flag() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let mut shop = shop_with_a_note(&p, &protocol).await;
+    let alice = p.alice.identity().public();
+    p.bob.switch().lock().shared.flagged.insert(alice, 3);
+    shop.allow_list().await.unwrap();
+    let first = shop.highest_service_time().unwrap();
+    // The service drops the flag; the next refresh replaces the copy.
+    p.bob.switch().lock().shared.flagged.clear();
+    p.clock.advance_ms(MINUTE);
+    shop.allow_list().await.unwrap();
+    shop.receive(None).await.unwrap();
+    let seen = last_disposition(&protocol);
+    assert!(!seen.flagged && !seen.blocked, "{seen:?}");
+    assert!(seen.lists_as_of_ms.unwrap() >= first + MINUTE, "{seen:?}");
+}
+
+#[tokio::test]
+async fn test_sender_disposition_never_refreshed_shows_only_own_deny_changes() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let mut wallet = p.join(&p.alice, "wallet", &protocol).await;
+    // Without `lists.read` the shop never reads its lists.
+    let mut shop = p
+        .join_with(
+            &p.bob,
+            "shop",
+            protocol.clone(),
+            Arc::new(MemoryStore::new()),
+            &[Permission::ListsManage, Permission::ConversationAdd],
+        )
+        .await;
+    let alice = p.alice.identity().public();
+    shop.invite(&alice).await.unwrap();
+    wallet.send(Pair::note(&p.bob, "hello")).await.unwrap();
+    // The service flags alice; only the shop's own deny shows, and the copy is unknown.
+    p.bob.switch().lock().shared.flagged.insert(alice, 3);
+    shop.deny(&alice).await.unwrap();
+    shop.receive(None).await.unwrap();
+    let seen = last_disposition(&protocol);
+    assert_eq!(seen.lists_as_of_ms, None);
+    assert!(seen.blocked && !seen.flagged, "{seen:?}");
+}
+
+#[tokio::test]
+async fn test_sender_disposition_first_read_refreshes_a_copy_never_refreshed() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let mut shop = shop_with_a_note(&p, &protocol).await;
+    let alice = p.alice.identity().public();
+    p.bob.switch().lock().shared.flagged.insert(alice, 3);
+    // No allow_list(): the read refreshes the copy before it hands the note over.
+    shop.receive(None).await.unwrap();
+    let seen = last_disposition(&protocol);
+    assert!(seen.flagged, "{seen:?}");
+    assert!(seen.lists_as_of_ms.is_some());
+}
+
+#[tokio::test]
+async fn test_sender_disposition_lists_as_of_is_service_time() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let mut wallet = p.join(&p.alice, "wallet", &protocol).await;
+    // The shop's device clock runs two minutes ahead of the service, within the timestamp
+    // tolerance.
+    let keys = p.bob.identity().app_keys("shop");
+    let request = p
+        .bob
+        .approve(
+            &keys,
+            &AppSpec::new(&["scope-a"]).with_permissions(&Permission::ALL),
+        )
+        .unwrap();
+    let mut env = p.env(&p.bob, Arc::new(MemoryStore::new()));
+    let device = Arc::new(crate::clock::TestClock::new(p.clock.now_ms() + 2 * MINUTE));
+    env.clock = device.clone();
+    let mut shop = App::join(env, protocol.clone(), config(), request)
+        .await
+        .unwrap();
+    shop.invite(&p.alice.identity().public()).await.unwrap();
+    wallet.send(Pair::note(&p.bob, "hello")).await.unwrap();
+    shop.allow_list().await.unwrap();
+    shop.receive(None).await.unwrap();
+    let as_of = last_disposition(&protocol).lists_as_of_ms.unwrap();
+    assert_eq!(as_of, p.clock.now_ms());
+    assert_ne!(as_of, device.now_ms());
+}
+
+#[tokio::test]
+async fn test_sender_disposition_answer_without_flagged_replaces_nothing() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let mut shop = shop_with_a_note(&p, &protocol).await;
+    let alice = p.alice.identity().public();
+    p.bob.switch().lock().shared.flagged.insert(alice, 3);
+    shop.allow_list().await.unwrap();
+    let as_of = shop.highest_service_time();
+    // A faulty answer leaves `flagged` out: malformed, so the copy stays as it was.
+    p.clock.advance_ms(MINUTE);
+    p.bob.switch().lock().allow = Some(json!({
+        "contacts": [], "conversations": [], "deny": [], "invite_codes": []
+    }));
+    let error = shop.allow_list().await.unwrap_err();
+    assert!(
+        matches!(
+            error,
+            AppError::Switch(crate::ClientError::InvalidResponse(_))
+        ),
+        "{error:?}"
+    );
+    shop.receive(None).await.unwrap();
+    let seen = last_disposition(&protocol);
+    assert!(seen.flagged, "{seen:?}");
+    assert_eq!(seen.lists_as_of_ms, as_of);
+}
+
+/// A restore of bob's shop after it denied alice: her note, accepted before the deny, is
+/// stored locally, and the shop's feed read has passed the deny. Returns the restored shop,
+/// on the returned new store, with alice's note to be tried again.
+async fn shop_restored_after_a_deny(
+    p: &Pair,
+    protocol: &Arc<ApiProtocol>,
+    permissions: &[Permission],
+) -> (App, Arc<MemoryStore>) {
+    let mut wallet = p.join(&p.alice, "wallet", protocol).await;
+    let mut shop = p
+        .join_with(
+            &p.bob,
+            "shop",
+            protocol.clone(),
+            Arc::new(MemoryStore::new()),
+            permissions,
+        )
+        .await;
+    let alice = p.alice.identity().public();
+    shop.invite(&alice).await.unwrap();
+    wallet.send(Pair::note(&p.bob, "hello")).await.unwrap();
+    // The store rejects the note: it is stored locally, and stays so at the next read.
+    *protocol.reject.lock().unwrap() = 2;
+    shop.receive(None).await.unwrap();
+    shop.deny(&alice).await.unwrap();
+    shop.receive(None).await.unwrap();
+    let backup = shop.backup_layered().await.unwrap();
+    let backup = AppBackup::from_bytes(&backup.to_bytes().unwrap()).unwrap();
+    protocol.seen.lock().unwrap().clear();
+    let store = Arc::new(MemoryStore::new());
+    let restored = App::restore(
+        p.env(&p.bob, Arc::clone(&store) as Arc<dyn StateStore>),
+        protocol.clone(),
+        config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    (restored, store)
+}
+
+/// Whether `shop`'s copy of the lists holds a refresh time.
+fn refreshed(store: &MemoryStore, shop: &App) -> bool {
+    let ns = crate::store::client_namespace(&shop.app_id());
+    store.get(&ns, b"lc/lists_at").unwrap().is_some()
+}
+
+/// The disposition the receive step saw for alice's note after the restore, read until it
+/// is handed over.
+async fn restored_disposition(shop: &mut App, protocol: &ApiProtocol) -> SenderDisposition {
+    for _ in 0..3 {
+        shop.receive(None).await.unwrap();
+        if let Some(seen) = protocol.seen().last() {
+            return seen.disposition.unwrap();
+        }
+    }
+    panic!("the stored note was never tried again");
+}
+
+#[tokio::test]
+async fn test_sender_disposition_after_a_restore_refreshes_before_a_stored_entry() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let (mut shop, _) = shop_restored_after_a_deny(&p, &protocol, &Permission::ALL).await;
+    let seen = restored_disposition(&mut shop, &protocol).await;
+    assert!(seen.blocked, "{seen:?}");
+    assert!(seen.lists_as_of_ms.is_some());
+}
+
+#[tokio::test]
+async fn test_sender_disposition_after_a_restore_without_lists_read_is_unknown() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let (mut shop, store) = shop_restored_after_a_deny(
+        &p,
+        &protocol,
+        &[Permission::ListsManage, Permission::ConversationAdd],
+    )
+    .await;
+    // The deny was made before the backup: nothing of it is known, and `None` says so.
+    let seen = restored_disposition(&mut shop, &protocol).await;
+    assert_eq!(seen.lists_as_of_ms, None);
+    assert!(!seen.blocked, "{seen:?}");
+    assert!(!refreshed(&store, &shop));
+}
+
+#[tokio::test]
+async fn test_sender_disposition_failed_refresh_after_a_restore_leaves_it_unknown() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let (mut shop, store) = shop_restored_after_a_deny(&p, &protocol, &Permission::ALL).await;
+    p.bob.switch().fail_next(Fault::Error {
+        path: "allow".into(),
+        code: ErrorCode::Unavailable,
+        current: json!(null),
+    });
+    // The read goes on without the refresh, and the copy stays unknown.
+    let seen = restored_disposition(&mut shop, &protocol).await;
+    assert_eq!(seen.lists_as_of_ms, None);
+    assert!(!seen.blocked, "{seen:?}");
+    assert!(!refreshed(&store, &shop));
+    // It is still owed: the next read refreshes.
+    shop.receive(None).await.unwrap();
+    assert!(refreshed(&store, &shop));
+}
+
+#[tokio::test]
+async fn test_sender_disposition_lists_too_large_for_one_commit_let_the_read_go_on() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let mut shop = shop_with_a_note(&p, &protocol).await;
+    // More flagged senders than one commit's batch size holds, as at raised limits.
+    {
+        let mut switch = p.bob.switch().lock();
+        for n in 0..310_000u32 {
+            let mut pubky = [9u8; 32];
+            pubky[..4].copy_from_slice(&n.to_be_bytes());
+            switch.shared.flagged.insert(pubky, 3);
+        }
+    }
+    // The owed refresh fails the same way at every read, and the reads go on.
+    for _ in 0..2 {
+        let result = shop.receive(None).await;
+        assert!(result.is_ok(), "the read goes on: {result:?}");
+    }
+    let seen = last_disposition(&protocol);
+    assert_eq!(seen.lists_as_of_ms, None);
+    // The host's own refresh gets the refusal.
+    let error = shop.allow_list().await.unwrap_err();
+    assert!(
+        matches!(
+            error,
+            AppError::Store(crate::error::StoreError::TooLarge { .. })
+        ),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_sender_disposition_sees_an_undeny_earlier_in_the_same_read() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let mut wallet = p.join(&p.alice, "wallet", &protocol).await;
+    let mut shop = p.join(&p.bob, "shop", &protocol).await;
+    let mut kiosk = p.join(&p.bob, "kiosk", &protocol).await;
+    let alice = p.alice.identity().public();
+    shop.invite(&alice).await.unwrap();
+    shop.deny(&alice).await.unwrap();
+    // Another of bob's apps lifts the block; alice writes again.
+    kiosk.undeny(&alice).await.unwrap();
+    let (msg_id, delivery) = wallet.send(Pair::note(&p.bob, "hello")).await.unwrap();
+    assert!(
+        matches!(delivery, Delivery::Accepted { .. }),
+        "{delivery:?}"
+    );
+    // The shop's copy still holds its own deny until the feed's undeny commits, which is in
+    // the same read as the note.
+    shop.receive(None).await.unwrap();
+    let seen = protocol.seen();
+    let seen = seen.iter().find(|s| s.msg_id == msg_id).unwrap();
+    assert!(!seen.disposition.unwrap().blocked, "{seen:?}");
+}
+
+#[tokio::test]
+async fn test_sender_disposition_flagged_list_is_kept_whole() {
+    // `max_flags` at the default limits (Switch wire 9.2), and one more, as a service with a
+    // raised limit may answer: every flagged sender is kept, as every entry of the other
+    // lists is.
+    const MAX_FLAGS: u32 = 1_000;
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let store = Arc::new(MemoryStore::new());
+    let mut wallet = p.join(&p.alice, "wallet", &protocol).await;
+    let mut shop = p
+        .join_on(
+            &p.bob,
+            "shop",
+            protocol.clone(),
+            Arc::clone(&store) as Arc<dyn StateStore>,
+        )
+        .await;
+    let alice = p.alice.identity().public();
+    shop.invite(&alice).await.unwrap();
+    wallet.send(Pair::note(&p.bob, "hello")).await.unwrap();
+    {
+        let mut switch = p.bob.switch().lock();
+        for n in 0..MAX_FLAGS {
+            let mut pubky = [7u8; 32];
+            pubky[..4].copy_from_slice(&n.to_be_bytes());
+            switch.shared.flagged.insert(pubky, 3);
+        }
+        switch.shared.flagged.insert(alice, 3);
+    }
+    let list = shop.allow_list().await.unwrap();
+    assert_eq!(list.flagged.len(), 1_001);
+    let ns = crate::store::client_namespace(&shop.app_id());
+    let kept = store.scan(&ns, b"lc/flag/", None, 10_000).unwrap();
+    assert_eq!(kept.len(), 1_001);
+    shop.receive(None).await.unwrap();
+    assert!(last_disposition(&protocol).flagged);
 }
 
 // -------------------------------------------------------------------------------------

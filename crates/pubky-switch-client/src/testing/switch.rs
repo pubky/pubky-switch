@@ -170,6 +170,14 @@ pub enum Fault {
         /// How many matching requests go through first.
         after: usize,
     },
+    /// Apply an own app's or the signer's request, then sign an answer that leaves out the
+    /// top-level `member`, as a faulty service would.
+    LeaveOut {
+        /// A part of the request's path and query.
+        path: String,
+        /// The member left out.
+        member: String,
+    },
 }
 
 pub(crate) struct Inner {
@@ -633,10 +641,12 @@ impl ScriptedSwitch {
         let mut inner = self.lock();
         let path = request.path_and_query.clone();
         let mut lose = false;
+        let mut leave_out = None;
         let matching = inner.faults.iter().position(|fault| match fault {
             Fault::Error { path: p, .. }
             | Fault::LoseAnswer { path: p }
-            | Fault::Unreachable { path: p, .. } => path.contains(p.as_str()),
+            | Fault::Unreachable { path: p, .. }
+            | Fault::LeaveOut { path: p, .. } => path.contains(p.as_str()),
         });
         let passes = matching.is_some_and(|index| match inner.faults.get_mut(index) {
             Some(Fault::Unreachable { after, .. }) if *after > 0 => {
@@ -658,6 +668,7 @@ impl ScriptedSwitch {
                     return Ok(inner.respond(request, status, &body));
                 }
                 Some(Fault::LoseAnswer { .. }) => lose = true,
+                Some(Fault::LeaveOut { member, .. }) => leave_out = Some(member),
                 Some(Fault::Unreachable { .. }) => {
                     inner.unreached.push(request.body.clone());
                     return Err(TransportError::Connect("scripted".into()));
@@ -710,10 +721,13 @@ impl ScriptedSwitch {
         if let Some(held) = caller.and_then(|app| inner.apps.get_mut(&app)) {
             held.last_seen = Some(now);
         }
-        let (status, body) =
+        let (status, mut body) =
             answer.map_err(|error| TransportError::Other(format!("scripted switch: {error}")))?;
         if lose {
             return Err(TransportError::Timeout);
+        }
+        if let (Some(member), Some(object)) = (leave_out, body.as_object_mut()) {
+            object.remove(&member);
         }
         Ok(inner.respond(request, status, &body))
     }
