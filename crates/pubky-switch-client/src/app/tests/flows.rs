@@ -13,13 +13,13 @@ use pubky_switch_core::records::{
 };
 use serde_json::{Map, json};
 
-use super::fake::Fault;
 use super::*;
 use crate::app::{
     Alarm, AppBackup, AppError, AppEvent, IdentityRefresh, LeaveMode, LeaveReport, ParkReason,
     REVALIDATION_MS, Refusal, UserConfirmed,
 };
 use crate::store::{Fault as StoreFault, FaultStore};
+use crate::testing::Fault;
 
 const HOUR: u64 = 3_600_000;
 
@@ -412,7 +412,7 @@ async fn test_app_equivocation_stops_the_app() {
     let mut body = doc.body().clone();
     body.data_epoch += 1;
     let other = IdentityDoc::sign(&w.alice, body).unwrap();
-    w.switch.deliver_identity(&other);
+    w.switch.deliver_identity(&other).unwrap();
     let error = app.receive(None).await.unwrap_err();
     assert_eq!(
         error,
@@ -470,10 +470,10 @@ async fn test_app_fork_is_detected() {
     app.receive(None).await.unwrap();
     // The service replaces its last item with another one at the same place.
     w.switch.roll_back_to(before);
-    let mut body = w.body.lock().unwrap().clone();
+    let mut body = w.signer.body();
     body.version += 1;
     let other = IdentityDoc::sign(&w.alice, body).unwrap();
-    w.switch.deliver_identity(&other);
+    w.switch.deliver_identity(&other).unwrap();
     let error = app.receive(None).await.unwrap_err();
     assert!(matches!(error, AppError::Alarm(_)), "{error:?}");
 }
@@ -489,7 +489,8 @@ async fn test_app_duplicate_message_is_applied_once() {
     let plaintext = message.sign(&w.bob_keys).unwrap();
     let again = w
         .switch
-        .send_plaintext(w.bob.public(), &w.bob_cert, &plaintext, &[me]);
+        .send_plaintext(w.bob.public(), &w.bob_cert, &plaintext, &[me])
+        .unwrap();
     let report = app.receive(None).await.unwrap();
     assert!(has(&report.events, |e| matches!(
         e,
@@ -502,7 +503,8 @@ async fn test_app_duplicate_message_is_applied_once() {
     let plaintext = other.sign(&w.bob_keys).unwrap();
     let third = w
         .switch
-        .send_plaintext(w.bob.public(), &w.bob_cert, &plaintext, &[me]);
+        .send_plaintext(w.bob.public(), &w.bob_cert, &plaintext, &[me])
+        .unwrap();
     let report = app.receive(None).await.unwrap();
     assert!(has(&report.events, |e| matches!(
         e,
@@ -517,14 +519,17 @@ async fn test_app_body_that_fails_check_10_is_dropped_and_passed() {
     let w = World::new();
     let mut app = w.join("wallet").await;
     let me = app.app_id();
-    let (seq, _) = w.switch.send(
-        &w.bob,
-        &w.bob_keys,
-        &w.bob_cert,
-        "sample.note",
-        json!({ "other": 1 }),
-        &[me],
-    );
+    let (seq, _) = w
+        .switch
+        .send(
+            &w.bob,
+            &w.bob_keys,
+            &w.bob_cert,
+            "sample.note",
+            json!({ "other": 1 }),
+            &[me],
+        )
+        .unwrap();
     let report = app.receive(None).await.unwrap();
     assert!(has(&report.events, |e| matches!(
         e,
@@ -538,14 +543,17 @@ async fn test_app_body_that_fails_check_10_is_dropped_and_passed() {
 async fn test_app_message_failing_a_scope_check_is_dropped() {
     let w = World::new();
     let mut app = w.join("wallet").await;
-    let (seq, _) = w.switch.send(
-        &w.bob,
-        &w.bob_keys,
-        &w.bob_cert,
-        "sample.unknown",
-        json!({ "text": "x" }),
-        &[app.app_id()],
-    );
+    let (seq, _) = w
+        .switch
+        .send(
+            &w.bob,
+            &w.bob_keys,
+            &w.bob_cert,
+            "sample.unknown",
+            json!({ "text": "x" }),
+            &[app.app_id()],
+        )
+        .unwrap();
     let report = app.receive(None).await.unwrap();
     assert!(has(&report.events, |e| matches!(
         e,
@@ -662,17 +670,20 @@ async fn test_app_holds_then_parks_an_unverifiable_sender() {
     let mut wallet = w.join("wallet").await;
     let phone = w.join("phone").await;
     let me = wallet.app_id();
-    *w.homeserver.down.lock().unwrap() = true;
+    w.homeserver.set_down(true);
     let (held, _) = w.note(me, "held");
     // A message from an own app after it goes on.
-    let (later, _) = w.switch.send(
-        &w.alice,
-        &app_keys("phone"),
-        phone.cert(),
-        "sample.notice",
-        json!({ "text": "hi" }),
-        &[me],
-    );
+    let (later, _) = w
+        .switch
+        .send(
+            &w.alice,
+            &app_keys("phone"),
+            phone.cert(),
+            "sample.notice",
+            json!({ "text": "hi" }),
+            &[me],
+        )
+        .unwrap();
     let report = wallet.receive(None).await.unwrap();
     assert!(has(
         &report.events,
@@ -694,7 +705,7 @@ async fn test_app_holds_then_parks_an_unverifiable_sender() {
     assert!(wallet.cursor().seq >= later);
     assert_eq!(w.effects(), 0, "{:?}", report.events);
     // Once the sender can be checked, it is applied.
-    *w.homeserver.down.lock().unwrap() = false;
+    w.homeserver.set_down(false);
     let report = wallet.receive(None).await.unwrap();
     assert!(has(
         &report.events,
@@ -763,14 +774,17 @@ async fn test_app_defers_a_cursor_only_move() {
     let mut wallet = w.join("wallet").await;
     let phone = w.join("phone").await;
     let me = wallet.app_id();
-    let (seq, _) = w.switch.send(
-        &w.alice,
-        &app_keys("phone"),
-        phone.cert(),
-        "sample.notice",
-        json!({ "text": "no effect" }),
-        &[me],
-    );
+    let (seq, _) = w
+        .switch
+        .send(
+            &w.alice,
+            &app_keys("phone"),
+            phone.cert(),
+            "sample.notice",
+            json!({ "text": "no effect" }),
+            &[me],
+        )
+        .unwrap();
     wallet.receive(None).await.unwrap();
     assert!(wallet.cursor().seq >= seq);
     assert!(w.switch.app(&me).cursor < seq, "deferred");
@@ -778,14 +792,17 @@ async fn test_app_defers_a_cursor_only_move() {
     wallet.receive(None).await.unwrap();
     assert!(w.switch.app(&me).cursor >= seq);
     // A move before going to the background is sent at once.
-    let (seq, _) = w.switch.send(
-        &w.alice,
-        &app_keys("phone"),
-        phone.cert(),
-        "sample.notice",
-        json!({ "text": "again" }),
-        &[me],
-    );
+    let (seq, _) = w
+        .switch
+        .send(
+            &w.alice,
+            &app_keys("phone"),
+            phone.cert(),
+            "sample.notice",
+            json!({ "text": "again" }),
+            &[me],
+        )
+        .unwrap();
     wallet.receive(None).await.unwrap();
     wallet.flush_cursor().await.unwrap();
     assert!(w.switch.app(&me).cursor >= seq);
@@ -803,10 +820,12 @@ async fn test_app_renewal_is_picked_up_once_listed() {
         w.clock.now_ms() + 1000,
         &["scope-a"],
     );
-    w.switch.signer_op(OpKind::CertPut {
-        target_app_id: me,
-        cert: renewed.signed().clone(),
-    });
+    w.switch
+        .signer_op(OpKind::CertPut {
+            target_app_id: me,
+            cert: renewed.signed().clone(),
+        })
+        .unwrap();
     let report = app.receive(None).await.unwrap();
     assert!(has(&report.events, |e| matches!(e, AppEvent::RenewalSeen)));
     assert_eq!(app.cert().hash(), old.hash(), "not listed yet");
@@ -853,10 +872,17 @@ async fn test_app_ignores_a_cert_put_of_other_keys() {
         w.clock.now_ms() + 1000,
         &["scope-a"],
     );
-    w.switch.signer_op(OpKind::CertPut {
-        target_app_id: app.app_id(),
-        cert: other.signed().clone(),
-    });
+    // A compliant switch refuses this cert.put; a faulty one chains it.
+    w.switch
+        .chain_unchecked(
+            &w.alice,
+            None,
+            OpKind::CertPut {
+                target_app_id: app.app_id(),
+                cert: other.signed().clone(),
+            },
+        )
+        .unwrap();
     let report = app.receive(None).await.unwrap();
     assert!(!has(&report.events, |e| matches!(e, AppEvent::RenewalSeen)));
 }
@@ -872,12 +898,14 @@ async fn test_app_key_bundle_with_a_missing_epoch_asks_for_a_full_bundle() {
     // The epoch rises to 3, but only epoch 3's part is stored.
     w.next_doc(|body| body.data_epoch = 3);
     for part in seal_bundle_parts(&w.alice, &cert, 3, 3, &has_keys).unwrap() {
-        w.switch.signer_op(OpKind::KeyBundlePut(KeyBundlePut {
-            target_app_id: me,
-            bundle: part.bundle,
-            first_epoch: part.first_epoch,
-            last_epoch: part.last_epoch,
-        }));
+        w.switch
+            .signer_op(OpKind::KeyBundlePut(KeyBundlePut {
+                target_app_id: me,
+                bundle: part.bundle,
+                first_epoch: part.first_epoch,
+                last_epoch: part.last_epoch,
+            }))
+            .unwrap();
     }
     let report = app.receive(None).await.unwrap();
     assert!(
@@ -894,12 +922,14 @@ async fn test_app_key_bundle_with_a_missing_epoch_asks_for_a_full_bundle() {
     assert!(w.switch.app(&me).full_requested.is_some());
     // The signer stores a full bundle: every epoch held, the request done.
     for part in seal_bundle_parts(&w.alice, &cert, 1, 3, &has_keys).unwrap() {
-        w.switch.signer_op(OpKind::KeyBundlePut(KeyBundlePut {
-            target_app_id: me,
-            bundle: part.bundle,
-            first_epoch: part.first_epoch,
-            last_epoch: part.last_epoch,
-        }));
+        w.switch
+            .signer_op(OpKind::KeyBundlePut(KeyBundlePut {
+                target_app_id: me,
+                bundle: part.bundle,
+                first_epoch: part.first_epoch,
+                last_epoch: part.last_epoch,
+            }))
+            .unwrap();
     }
     app.receive(None).await.unwrap();
     assert_eq!(app.keys_through(), 3);
@@ -915,7 +945,8 @@ async fn test_app_skips_a_bundle_part_with_another_naming_key() {
     let mut app = w.join("wallet").await;
     let me = app.app_id();
     // Another identity's parts, sealed to the app's bundle key: they don't verify for
-    // alice and are skipped; nothing is taken.
+    // alice, so a compliant switch refuses them; a faulty one chains them, and the app skips
+    // them and takes nothing.
     let mallory = IdentityKey::from_secret([46; 32]);
     let fake_cert = cert_for(
         &mallory,
@@ -927,12 +958,18 @@ async fn test_app_skips_a_bundle_part_with_another_naming_key() {
     let part = seal_bundle_parts(&mallory, &fake_cert, 1, 1, &has_keys)
         .unwrap()
         .remove(0);
-    w.switch.signer_op(OpKind::KeyBundlePut(KeyBundlePut {
-        target_app_id: me,
-        bundle: part.bundle,
-        first_epoch: 1,
-        last_epoch: 1,
-    }));
+    w.switch
+        .chain_unchecked(
+            &w.alice,
+            None,
+            OpKind::KeyBundlePut(KeyBundlePut {
+                target_app_id: me,
+                bundle: part.bundle,
+                first_epoch: 1,
+                last_epoch: 1,
+            }),
+        )
+        .unwrap();
     let report = app.receive(None).await.unwrap();
     assert!(has(&report.events, |e| matches!(
         e,
@@ -1152,10 +1189,10 @@ async fn test_app_refresh_identity_takes_a_newer_homeserver_copy() {
     let mut app = w.join("wallet").await;
     let before = app.own_identity().version();
     // Published on the Homeserver, not yet read in the feed.
-    let mut body = w.body.lock().unwrap().clone();
+    let mut body = w.signer.body();
     body.version += 1;
     let newer = IdentityDoc::sign(&w.alice, body.clone()).unwrap();
-    w.homeserver.publish(&newer);
+    w.homeserver.publish(&newer).unwrap();
     assert_eq!(
         app.refresh_identity().await.unwrap(),
         IdentityRefresh::Newer {
@@ -1177,7 +1214,7 @@ async fn test_app_refresh_identity_takes_a_newer_homeserver_copy() {
     // Another body at that version, from the switch: equivocation across sources.
     body.data_epoch += 1;
     let other = IdentityDoc::sign(&w.alice, body).unwrap();
-    w.switch.deliver_identity(&other);
+    w.switch.deliver_identity(&other).unwrap();
     let error = app.receive(None).await.unwrap_err();
     assert!(
         matches!(error, AppError::Alarm(Alarm::Equivocation { .. })),
@@ -1202,7 +1239,7 @@ async fn test_app_refresh_identity_of_an_older_copy_confirms_nothing() {
     // The copy taken from the feed isn't the one the Homeserver confirmed.
     assert_eq!(app.identity_confirmed_at(), None);
     // A stale Homeserver serves the earlier version.
-    w.homeserver.publish(&first);
+    w.homeserver.publish(&first).unwrap();
     assert_eq!(
         app.refresh_identity().await.unwrap(),
         IdentityRefresh::Older {
@@ -1227,7 +1264,8 @@ async fn test_app_refresh_identity_missing_or_unavailable_confirms_nothing() {
     );
     // The Homeserver stops serving the document: the last confirmation stays where it was,
     // so it ages past the window.
-    w.homeserver.files.lock().unwrap().clear();
+    w.homeserver
+        .remove(w.alice.public(), pubky_switch_core::records::IDENTITY_PATH);
     w.clock.set_ms(START + REVALIDATION_MS);
     let missing = app.refresh_identity().await.unwrap();
     assert_eq!(missing, IdentityRefresh::Missing);
@@ -1239,14 +1277,14 @@ async fn test_app_refresh_identity_missing_or_unavailable_confirms_nothing() {
     };
     assert!(!fresh(&app, START + REVALIDATION_MS));
     // A Homeserver that can't be read confirms nothing either.
-    *w.homeserver.down.lock().unwrap() = true;
+    w.homeserver.set_down(true);
     let unavailable = app.refresh_identity().await.unwrap();
     assert_eq!(unavailable, IdentityRefresh::Unavailable);
     assert_eq!(unavailable.confirmed_at(), None);
     assert_eq!(app.identity_confirmed_at(), Some(START));
     // Served again, it confirms the copy held anew.
-    *w.homeserver.down.lock().unwrap() = false;
-    w.homeserver.publish(app.own_identity());
+    w.homeserver.set_down(false);
+    w.homeserver.publish(app.own_identity()).unwrap();
     let again = app.refresh_identity().await.unwrap();
     assert_eq!(again.confirmed_at(), Some(START + REVALIDATION_MS));
     assert!(fresh(&app, START + REVALIDATION_MS));
@@ -1297,14 +1335,16 @@ fn notice(
     to: [u8; 16],
     text: &str,
 ) -> (u64, pubky_switch_core::message::Message) {
-    w.switch.send(
-        &w.alice,
-        &app_keys("phone"),
-        phone.cert(),
-        "sample.notice",
-        json!({ "text": text }),
-        &[to],
-    )
+    w.switch
+        .send(
+            &w.alice,
+            &app_keys("phone"),
+            phone.cert(),
+            "sample.notice",
+            json!({ "text": text }),
+            &[to],
+        )
+        .unwrap()
 }
 
 #[tokio::test]
@@ -1321,7 +1361,7 @@ async fn test_app_held_entry_doesnt_hold_up_later_pages() {
     let phone = w.join("phone").await;
     let me = wallet.app_id();
     wallet.receive(None).await.unwrap();
-    *w.homeserver.down.lock().unwrap() = true;
+    w.homeserver.set_down(true);
     let (held, _) = w.note(me, "held");
     let later: Vec<u64> = (0..5)
         .map(|n| notice(&w, &phone, me, &format!("later {n}")).0)
@@ -1364,13 +1404,15 @@ async fn test_app_same_pair_twice_on_one_page_is_applied_once() {
     let plaintext = message.sign(&app_keys("phone")).unwrap();
     let again = w
         .switch
-        .send_plaintext(w.alice.public(), phone.cert(), &plaintext, &[me]);
+        .send_plaintext(w.alice.public(), phone.cert(), &plaintext, &[me])
+        .unwrap();
     let mut other = message.clone();
     other.body.insert("text".into(), json!("changed"));
     let plaintext = other.sign(&app_keys("phone")).unwrap();
     let third = w
         .switch
-        .send_plaintext(w.alice.public(), phone.cert(), &plaintext, &[me]);
+        .send_plaintext(w.alice.public(), phone.cert(), &plaintext, &[me])
+        .unwrap();
     let report = wallet.receive(None).await.unwrap();
     assert!(received(&report.events, first));
     assert!(has(&report.events, |e| matches!(
