@@ -213,9 +213,9 @@ pub(crate) enum RefusalPlace {
     /// whose certificate isn't the one `identity.json` lists. A `key_bundle.put` never
     /// reaches an app's batch: it is the signer's, and step 9 checks permission (`403
     /// permission_missing`) before shape. The caller's own `app.put` is checked at
-    /// authentication (Switch wire 7.2: an own app's first call verifies the record and its
-    /// certificate, and every later one is checked against the record held), before the
-    /// lookup, where such a refusal is about the caller. The app's own `app.put` and
+    /// authentication, before the lookup, where such a refusal is about the caller: any
+    /// batch carrying it is authenticated against that record, the batch's first `app.put`
+    /// naming the caller (Switch wire 7.2, 6.4 step 7). The app's own `app.put` and
     /// `receive_key.put` go in batches of their own, sent again by their own steps
     /// (joining, the record's delivery, a registration, a move's or a loss's
     /// re-registration), never through a kept effect or a kept batch, whose answers this
