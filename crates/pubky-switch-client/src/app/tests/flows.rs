@@ -886,6 +886,81 @@ async fn test_app_renewal_is_picked_up_once_listed() {
 }
 
 #[tokio::test]
+async fn test_app_expired_certificate_is_renewed_by_the_signer_alone() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let me = app.app_id();
+    let old = app.cert().clone();
+    // The certificate expires: the switch refuses the app everything, its feed read too.
+    w.clock.set_ms(old.expires_at() + 1);
+    let Err(AppError::Switch(crate::ClientError::Switch { code, .. })) = app.receive(None).await
+    else {
+        panic!("an expired app is refused");
+    };
+    assert_eq!(code, ErrorCode::CertExpired);
+    // Step 1: the signer stores the renewed certificate with a full bundle made for it, in
+    // one batch, while the document still lists the expired certificate.
+    let renewed = cert_for(
+        &w.alice,
+        &app_keys("wallet"),
+        w.clock.now_ms(),
+        &["scope-a"],
+    );
+    let has_keys = |s: &str| SampleProtocol::default().has_keys(s);
+    let epoch = w.switch.identity_doc().unwrap().data_epoch();
+    let mut batch = vec![OpKind::CertPut {
+        target_app_id: me,
+        cert: renewed.signed().clone(),
+    }];
+    for part in seal_bundle_parts(&w.alice, &renewed, 1, epoch, &has_keys).unwrap() {
+        batch.push(OpKind::KeyBundlePut(KeyBundlePut {
+            target_app_id: me,
+            bundle: part.bundle,
+            first_epoch: part.first_epoch,
+            last_epoch: part.last_epoch,
+        }));
+    }
+    w.switch.signer_batch(batch).unwrap();
+    // Still expired until the document lists the renewal.
+    assert!(app.receive(None).await.is_err());
+    // Step 2: the delivery listing the new certificate. From it the switch checks the app
+    // against the renewed certificate, so the app reads its feed again, takes the
+    // certificate and delivers its record carrying it.
+    w.next_doc(|body| {
+        body.apps.retain(|a| a.app_id != me);
+        body.apps.push(ListedApp {
+            app_id: me,
+            cert: renewed.hash(),
+        });
+        body.renewed.push(RenewedCert {
+            app_id: me,
+            cert: old.hash(),
+            until: None,
+        });
+    });
+    let report = app.receive(None).await.unwrap();
+    assert!(
+        has(&report.events, |e| matches!(
+            e,
+            AppEvent::CertificateTaken { .. }
+        )),
+        "{:?}",
+        report.events
+    );
+    assert_eq!(app.cert().hash(), renewed.hash());
+    assert_eq!(
+        w.switch.app(&me).cert.map(|c| c.hash()),
+        Some(renewed.hash())
+    );
+    // The app goes on with it, and holds the keys the renewal's bundle gave.
+    app.receive(None).await.unwrap();
+    assert_eq!(
+        app.scope_key(epoch, "scope-a"),
+        Some(w.alice.scope_key(epoch, "scope-a"))
+    );
+}
+
+#[tokio::test]
 async fn test_app_ignores_a_cert_put_of_other_keys() {
     let w = World::new();
     let mut app = w.join("wallet").await;

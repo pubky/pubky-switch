@@ -62,7 +62,10 @@ service.
   `forget_peer_copy`.
 - **`open_admission`** (`admit_everyone`) admits every sender the deny list doesn't hold, a
   test switch only.
-- **App currency outside batches**: other routes check only that the app hasn't departed.
+- **App currency outside batches**: a feed read is checked as a batch is, for an app that
+  delivered its record: current, with an unexpired certificate, the stored renewed one once
+  the newest `identity.json` lists it (Switch wire 7.2, 3.8). Other routes check only that
+  the app hasn't departed.
 - **`POST /v1/enroll`** (Switch wire 3.7, 7.4.1), in `switch/signer.rs`: only at
   [`SWITCH_ORIGIN`], with the default limits, and without checking the request signature. A
   switch made with `unenrolled` answers every other call with the operator's `404` until

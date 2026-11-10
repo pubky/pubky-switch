@@ -50,7 +50,7 @@ pub use proof_state::{StateAfter, proof_state};
 pub use rules::{
     AppPutEffect, CertPutEffect, KeyBundleEffect, MAX_INVITE_CONTEXT_BYTES, MAX_INVITE_USES, Need,
     ReceiveKeyEffect, Writer, check_app_put, check_cert_put, check_invite_code_put,
-    check_key_bundle_put, check_permission, check_receive_key_put, check_shape,
+    check_key_bundle_put, check_permission, check_receive_key_put, check_shape, is_signer_target,
 };
 
 use crate::error::{Error, SizeRefusal};

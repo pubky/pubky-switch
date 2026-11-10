@@ -742,8 +742,19 @@ impl ScriptedSwitch {
     /// [`ScriptError::Refused`] with the switch's error answer, or a batch or proof that
     /// doesn't sign.
     pub fn signer_op(&self, kind: OpKind) -> Result<u64, ScriptError> {
+        self.signer_batch(vec![kind])
+    }
+
+    /// Operations of the signer in one batch, applied as a submitted batch is, all or none,
+    /// such as a renewal's `cert.put` and the first `key_bundle.put` of its full bundle
+    /// (Switch wire 3.8 step 1). Returns the `seq` after them.
+    ///
+    /// # Errors
+    ///
+    /// As [`ScriptedSwitch::signer_op`].
+    pub fn signer_batch(&self, kinds: Vec<OpKind>) -> Result<u64, ScriptError> {
         let key = clone_key(&self.lock().identity);
-        self.inject(&key, None, kind)
+        self.inject(&key, None, kinds)
     }
 
     /// An operation an app with `keys` signs, in a batch of its own, applied as a submitted
@@ -755,14 +766,14 @@ impl ScriptedSwitch {
     ///
     /// As [`ScriptedSwitch::signer_op`].
     pub fn app_op(&self, keys: &AppKeys, kind: OpKind) -> Result<u64, ScriptError> {
-        self.inject(keys, Some(keys.app_id_bytes()), kind)
+        self.inject(keys, Some(keys.app_id_bytes()), vec![kind])
     }
 
     fn inject(
         &self,
         writer: &impl Signs,
         app_id: Option<[u8; 16]>,
-        kind: OpKind,
+        kinds: Vec<OpKind>,
     ) -> Result<u64, ScriptError> {
         let mut inner = self.lock();
         let account = inner.identity.public();
@@ -773,7 +784,7 @@ impl ScriptedSwitch {
             app_id,
             inner.tip.generation,
             random_batch_id()?,
-            vec![(vec![], kind)],
+            kinds.into_iter().map(|kind| (vec![], kind)).collect(),
         )?;
         let signed: Vec<SignedDoc> = ops.iter().map(|op| op.signed().clone()).collect();
         let (status, body) = match inner.gate("POST", &path) {
@@ -1094,8 +1105,8 @@ impl Inner {
         let Some(app) = caller else {
             return bad(ErrorCode::PermissionMissing, "own apps only", json!(null));
         };
-        if self.apps.get(&app).is_some_and(|a| a.departed) {
-            return bad(ErrorCode::NotCurrent, "departed", json!({}));
+        if let Err(refusal) = self.own_call(&app) {
+            return batch::refused(&refusal);
         }
         if self
             .feed_limit
