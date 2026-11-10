@@ -603,3 +603,47 @@ async fn test_restore_keeps_the_backups_revoked_apps() {
         Err(SignerError::Refused(Refusal::AppRequest(ref why))) if why.contains("step 4")
     ));
 }
+
+#[tokio::test]
+async fn test_restore_whose_take_over_answer_is_lost_writes_its_backup_on_reopen() {
+    // The take-over delivery reaches the switch and its answer is lost. Reopened, the install
+    // finishes the take-over at the next run, and writes the backup it owes: the backup holds
+    // the switch's version, so a later restore isn't stale.
+    let world = World::new();
+    let (old, _) = world.enrolled().await;
+    drop(old);
+    let store = Arc::new(MemoryStore::new());
+    world.switch.fail_next(SwitchFault::LoseAnswer {
+        path: "/identity".into(),
+    });
+    Signer::restore_new(world.env(store.clone()), world.keyring(), confirmed())
+        .await
+        .unwrap_err();
+    let mut signer = Signer::open(world.env(store), world.keyring())
+        .await
+        .unwrap();
+    signer.run_due().await.unwrap();
+    let active = world.switch.identity_doc().unwrap();
+    assert_eq!(active.version(), 2);
+    assert_eq!(world.backup().identity_doc().signed(), active.signed());
+    assert!(!signer.alerts().contains(&Alert::BackupNotWritten));
+    restored(&world).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_restore_keeps_a_departure_time_from_before_it() {
+    // `a` leaves on day 1, and a new install restores on day 2: the removal keeps the
+    // departure's own time.
+    let world = World::new();
+    let (mut old, _) = world.enrolled().await;
+    let (a, _) = two_joined(&world, &mut old).await;
+    drop(old);
+    let id = a.keys.app_id_bytes();
+    world.clock.advance_ms(86_400_000);
+    world.switch.leave(id).unwrap();
+    world.clock.advance_ms(86_400_000);
+    let mut signer = restored(&world).await.unwrap();
+    signer.run_due().await.unwrap();
+    let doc = signer.identity_doc().unwrap().unwrap();
+    assert_eq!(doc.body().removed[0].distrust_from, START_MS + 86_400_000);
+}
