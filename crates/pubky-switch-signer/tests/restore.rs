@@ -786,3 +786,58 @@ async fn test_restore_in_place_keeps_an_owed_record_deletion() {
     signer.run_due().await.unwrap();
     assert!(world.homeserver.file(&app_record_path(&id)).is_none());
 }
+
+#[tokio::test]
+async fn test_restore_in_place_keeps_an_owed_deletion_whose_record_is_gone() {
+    // `a`'s removal is delivered and published, and the process stops at the cleanup's
+    // commit: the deletion is owed and no reminder raised, while `a` has no record on the
+    // Homeserver. Restored in place, the install still raises the grant reminder.
+    use pubky_switch_client::store::{Fault, FaultStore, StateStore};
+    let setup = || async {
+        let world = World::new();
+        let (mut signer, memory) = world.enrolled().await;
+        let (a, _) = two_joined(&world, &mut signer).await;
+        drop(signer);
+        (world, memory, a)
+    };
+    // The revocation's commits, counted on a run that doesn't stop: the cleanup's is the last.
+    let (world, memory, a) = setup().await;
+    let counting = Arc::new(FaultStore::new(memory, Fault::None));
+    let store: Arc<dyn StateStore> = counting.clone();
+    let mut signer = Signer::open(world.env(store), world.keyring())
+        .await
+        .unwrap();
+    signer
+        .revoke(a.keys.app_id_bytes(), None, confirmed())
+        .await
+        .unwrap();
+    let last = counting.commits();
+    // The same, stopping before that commit.
+    let (world, memory, a) = setup().await;
+    let id = a.keys.app_id_bytes();
+    let faulty: Arc<dyn StateStore> =
+        Arc::new(FaultStore::new(memory.clone(), Fault::StopBefore(last)));
+    let mut signer = Signer::open(world.env(faulty), world.keyring())
+        .await
+        .unwrap();
+    // The removal is done, so `revoke` answers `Ok`; only the cleanup's commit stopped.
+    let _ = signer.revoke(id, None, confirmed()).await;
+    let mut signer = Signer::open(world.env(memory), world.keyring())
+        .await
+        .unwrap();
+    let reminder = Alert::GrantRevocationOwed { app_id: id };
+    assert!(!signer.alerts().contains(&reminder));
+    assert!(
+        signer
+            .identity_doc()
+            .unwrap()
+            .unwrap()
+            .listed_cert(&id)
+            .is_none()
+    );
+    assert!(world.homeserver.file(&app_record_path(&id)).is_none());
+    signer.restore(confirmed()).await.unwrap();
+    signer.run_due().await.unwrap();
+    signer.run_due().await.unwrap();
+    assert!(signer.alerts().contains(&reminder));
+}
