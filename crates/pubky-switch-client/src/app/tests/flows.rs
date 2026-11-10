@@ -1754,3 +1754,42 @@ async fn test_app_stale_timestamp_is_retried_once_at_the_service_time() {
     };
     assert_eq!(code, ErrorCode::StaleTimestamp);
 }
+
+#[tokio::test]
+async fn test_app_refusal_before_the_lock_measures_no_service_time() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    app.receive(None).await.unwrap();
+    app.take_events();
+    let highest = app.highest_service_time();
+    let skew = app.clock_skew_ms();
+    assert!(highest.is_some());
+    // The account idles for days; its last stamped time stays where it was.
+    w.clock.advance_ms(3 * pubky_switch_core::records::DAY_MS);
+    // A refusal answered before the request verified carries that old time.
+    w.switch.fail_next(Fault::Error {
+        path: "feed".into(),
+        code: ErrorCode::BadSignature,
+        current: json!(null),
+    });
+    assert!(app.receive(None).await.is_err());
+    // So does a stale timestamp, whose retry at the time it names is refused again: that
+    // time, far ahead, counts for nothing either.
+    w.switch.fail_next(Fault::Error {
+        path: "feed".into(),
+        code: ErrorCode::StaleTimestamp,
+        current: json!({ "server_time": pubky_switch_core::time::rfc3339(w.clock.now_ms() + 30 * pubky_switch_core::records::DAY_MS) }),
+    });
+    assert!(app.receive(None).await.is_err());
+    let events = app.take_events();
+    assert!(
+        !has(&events, |e| matches!(e, AppEvent::ClockSkew { .. })),
+        "{events:?}"
+    );
+    assert_eq!(app.highest_service_time(), highest);
+    assert_eq!(app.clock_skew_ms(), skew);
+    // The next answer stamped at the switch measures the clock again.
+    app.receive(None).await.unwrap();
+    assert_eq!(app.highest_service_time(), Some(w.clock.now_ms()));
+    assert_eq!(app.clock_skew_ms(), Some(0));
+}

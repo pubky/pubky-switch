@@ -575,6 +575,12 @@ impl ScriptedSwitch {
             match inner.faults.remove(index) {
                 Some(Fault::Error { code, current, .. }) => {
                     let (status, body) = bad(code, "scripted", current);
+                    // A `401` is answered before the request verifies, so before the lock:
+                    // with the last stamped time and no head (Switch wire 7.1).
+                    if status == 401 {
+                        let at = inner.stamped_ms;
+                        return Ok(inner.respond_at(&inner.service, request, status, &body, at));
+                    }
                     return Ok(inner.respond(request, status, &body));
                 }
                 Some(Fault::LoseAnswer { .. }) => lose = true,
@@ -933,8 +939,20 @@ impl Inner {
         SignedHead::sign(&self.service, &self.identity.public(), &self.tip)
     }
 
+    /// An answer under the account's key. One to an own app or the signer carries the head
+    /// in `Switch-Head`, refusals included, once the request verified: never on a `401`,
+    /// answered before that, nor to an enrollment or an erasure (Switch wire 7.1).
     fn respond(&self, request: &Request, status: u16, body: &Value) -> Response {
-        self.respond_with(&self.service, request, status, body)
+        let mut response = self.respond_with(&self.service, request, status, body);
+        let own =
+            request.header(header::IDENTITY) == Some(pubky_id(&self.identity.public()).as_str());
+        let path = request.path_and_query.as_str();
+        if own && status != 401 && !path.ends_with("/enroll") && !path.ends_with("/erase") {
+            response
+                .headers
+                .push(Header::new(header::HEAD, &self.head().to_header()));
+        }
+        response
     }
 
     /// A `Switch-Timestamp` more than 5 minutes from the time base, at an account the switch

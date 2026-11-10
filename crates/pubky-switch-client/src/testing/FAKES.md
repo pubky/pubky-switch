@@ -12,8 +12,10 @@ service.
   another identity is the `Switch-Identity` header as sent. A `Switch-Timestamp` more than 5
   minutes from the switch's clock is `401 stale_timestamp`, with `current.server_time` and
   the last stamped time in `Switch-Server-Time`, as at the service; a missing or unparsable
-  one isn't refused. Every other request stamps the clock's time, and injected faults
-  answer with the clock's time. Each operation's signature is
+  one isn't refused. Every other request stamps the clock's time. Answers to own apps and
+  the signer carry `Switch-Head`, refusals included, but a `401`, the enrollment and the
+  erasure. An injected `401` fault is answered as before the lock, with the last stamped
+  time and no head; other injected faults with the clock's time and the head. Each operation's signature is
   verified, and an own app must be current with an unexpired certificate.
 - **Rates** (Switch wire 6.4 step 7, 9.4): no operation, control, per-caller or
   failed-authentication limits; never `429 rate_limited`.
@@ -85,9 +87,8 @@ service.
   record's current write proof and each live claim's entry proofs, by the generation each
   names, with the key of that generation (its own, or the earlier service's that
   `import_into` carried). Unlike the service: there is no pending key, so no
-  generation change at a serving account; a first document carrying `recovery_from`, or at
-  another generation than the switch's, is chained where the service answers `503`; and the
-  answer carries the head in its body only, not in `Switch-Head`. The test call `deliver_identity` takes any document, without those
+  generation change at a serving account; and a first document carrying `recovery_from`, or
+  at another generation than the switch's, is chained where the service answers `503`. The test call `deliver_identity` takes any document, without those
   checks, for scripting what another signer or a faulty service did.
 - **`GET /apps`** (Switch wire 7.4.12): the apps the switch holds or the newest document
   lists, with `current`, `record_cert`, `bundle_ranges` and `cert_expires_at`, and the
