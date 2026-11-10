@@ -243,9 +243,9 @@ pub(crate) fn answer_decides(now: u64, kept_ms: Option<u64>) -> bool {
 
 impl App {
     /// The time a batch is kept at, before its first send: the earlier of the device clock
-    /// and the highest service time the app verified, so a device clock ahead doesn't make
-    /// it look younger. A batch kept with no service time verified in this call takes the
-    /// highest one kept from before, which can only make it look older.
+    /// and the service time verified in this call, which every path that keeps a batch
+    /// fetches first ([`App::fresh_service_time`]), so a device clock ahead doesn't make it
+    /// look younger, and a time from long before doesn't make it look older.
     pub(crate) fn kept_stamp(&self) -> u64 {
         let now = self.now();
         self.state

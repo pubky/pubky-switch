@@ -420,6 +420,8 @@ impl App {
             .iter()
             .map(|message| self.outbox_item(message))
             .collect::<Result<Vec<_>, _>>()?;
+        // Kept at a service time verified in this call ([`App::kept_stamp`]).
+        self.fresh_service_time().await?;
         let signed = self.sign_ops(batch.ops, carry)?;
         let id = signed
             .id()

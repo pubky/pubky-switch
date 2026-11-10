@@ -32,13 +32,13 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
 - **After a failed commit the app reloads** from the store before its next call.
 - **A kept batch or effect is never sent again past its window**, whatever the
   generation: 30 days from when it was kept, less an hour, both ends in verified service
-  time, erring older. It is kept at the earlier of the device clock and the highest service
-  time verified; its age is judged at the later of the device clock and a service time
-  verified in the same call, which a one-item feed read fetches first when no answer of
-  the call brought one. Past it a retry would get `409
-  conflict` once the service dropped its proofs, or be taken as new once it forgot the ID
-  (Switch wire 6.4 step 5): the effect's entry is parked as uncertain, the batch dropped
-  with its attempts, unsent.
+  time, erring older. It is kept at the earlier of the device clock and the service time
+  verified in the call that keeps it, which a one-item feed read fetches first when
+  no answer of the call brought one; its age is judged at the later of the device clock
+  and a service time verified in the call that sends it again, fetched the same way. Past
+  it a retry would get `409 conflict` once the service dropped its proofs, or be taken as
+  new once it forgot the ID (Switch wire 6.4 step 5): the effect's entry is parked as
+  uncertain, the batch dropped with its attempts, unsent.
 - **A refusal of a batch sent again tells only from the batch ID lookup on** (Switch wire
   6.4 step 5). One made before it is about the caller, such as `403 cert_expired`, or about
   these bytes, such as `400`. About the caller, it tells nothing of the batch: a kept effect

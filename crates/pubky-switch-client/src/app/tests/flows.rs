@@ -1349,6 +1349,89 @@ async fn test_kept_effect_window_holds_with_the_device_clock_ahead_at_the_keep()
     assert_eq!(w.effects(), 0, "not sent");
 }
 
+/// A batch writing a conversation entry for `pubky`.
+fn conversation(pubky: [u8; 32]) -> crate::app::OpBatch {
+    crate::app::OpBatch::new().op(OpKind::AllowPut {
+        pubky,
+        kind: pubky_switch_core::ops::AllowKind::Conversation,
+    })
+}
+
+#[tokio::test]
+async fn test_kept_batch_window_holds_with_the_device_clock_ahead_after_a_restore() {
+    let w = World::new();
+    let a = w.join("wallet").await;
+    let backup = a.backup().unwrap();
+    drop(a);
+    // Restored on a device whose clock reads two hours ahead: it holds no service time.
+    let clock = Arc::new(TestClock::new(w.clock.now_ms() + 2 * HOUR));
+    let store_b = Arc::new(MemoryStore::new());
+    let mut env = w.env_on(Arc::clone(&store_b) as Arc<dyn StateStore>);
+    env.clock = Arc::clone(&clock) as Arc<dyn Clock>;
+    let mut b = App::restore(env, w.protocol.clone(), World::config(), &backup)
+        .await
+        .unwrap();
+    // Its first call keeps a batch, which is applied and its answer lost. (A first try
+    // may be answered `401 stale_timestamp`, the device clock ahead, before the lost one.)
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(b.submit_batch(conversation(w.bob.public())).await.is_err());
+    w.switch.lock().faults.clear();
+    let kept = b.kept_batches().await.unwrap();
+    assert_eq!(kept.len(), 1);
+    // Kept in service time, not at the device's.
+    assert!(kept[0].1.kept_ms.unwrap() <= w.clock.now_ms());
+    // 30 days and half an hour on, the clock set right: the proofs are gone, and a resend
+    // would be answered `409 conflict`.
+    w.clock.advance_ms(30 * 24 * HOUR + HOUR / 2);
+    clock.set_ms(w.clock.now_ms());
+    w.switch.fail_next(Fault::Error {
+        path: "ops".into(),
+        code: ErrorCode::Conflict,
+        current: json!(null),
+    });
+    let _ = b.submit_batch(conversation([7; 32])).await;
+    let events = b.unacknowledged_events().await.unwrap();
+    // Past the window: dropped unsent, never read as refused.
+    assert!(
+        has(&events, |e| matches!(e, AppEvent::KeptBatchDropped { .. })),
+        "{events:?}"
+    );
+    assert!(
+        !has(&events, |e| matches!(e, AppEvent::BatchRefused { .. })),
+        "{events:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_kept_batch_kept_after_an_idle_month_is_resent_after_a_lost_answer() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    // Idle for 30 days, the device clock and the service's agreeing: the service time the
+    // app holds is a month old.
+    w.clock.advance_ms(30 * 24 * HOUR);
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(
+        app.submit_batch(conversation(w.bob.public()))
+            .await
+            .is_err()
+    );
+    let kept = app.kept_batches().await.unwrap();
+    assert_eq!(kept.len(), 1);
+    // Kept at the service time of this call, not the month-old one.
+    assert!(w.clock.now_ms() - kept[0].1.kept_ms.unwrap() < HOUR);
+    // A minute later the app writes again: the kept batch goes again, and its proofs show
+    // it applied; it isn't dropped.
+    w.clock.advance_ms(60_000);
+    app.submit_batch(conversation([7; 32])).await.unwrap();
+    assert!(app.kept_batches().await.unwrap().is_empty());
+    let events = app.unacknowledged_events().await.unwrap();
+    assert!(
+        !has(&events, |e| matches!(e, AppEvent::KeptBatchDropped { .. })),
+        "{events:?}"
+    );
+}
+
 #[tokio::test]
 async fn test_kept_effect_window_holds_with_the_device_clock_behind_at_the_resend() {
     let w = World::new();

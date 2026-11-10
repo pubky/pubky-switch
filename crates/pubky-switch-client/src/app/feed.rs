@@ -902,6 +902,9 @@ impl App {
         } else {
             Some(entry.seq)
         };
+        // Kept at a service time verified in this call ([`App::kept_stamp`]): the feed read
+        // brought one, a retry of an entry stored locally may come before it.
+        self.fresh_service_time().await?;
         let batch = self.sign_ops(effect.ops, cursor_to)?;
         let pending = PendingEffect {
             body: batch.body().to_vec(),
