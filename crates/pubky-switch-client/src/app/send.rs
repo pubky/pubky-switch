@@ -34,7 +34,10 @@
 //! again (Switch spec 7, Switch wire 3.8), but only for [`UNDELIVERABLE_MS`] from the
 //! first such answer: once a try is answered so again past that time, at
 //! [`UNDELIVERABLE_TRIES`] tries spread over it, the message is deleted, plaintext and all,
-//! and [`AppEvent::MessageUndelivered`] tells the protocol (Switch spec 11). A failed message
+//! and [`AppEvent::MessageUndelivered`] tells the protocol (Switch spec 11). Whatever the
+//! tries, it is deleted so at [`UNDELIVERABLE_MAX_MS`] from that first answer, at the next
+//! flush, without another try: plaintext at rest has a firm bound, and a forward jump of
+//! the clock shorter than that still deletes nothing. A failed message
 //! is forgotten, plaintext and all, after the retention of sent messages.
 
 use pubky_switch_core::enc::{serde_b64, serde_b64_vec};
@@ -73,6 +76,11 @@ pub const UNDELIVERABLE_TRIES: u32 = 5;
 
 /// The least time, app clock, between two tries [`UNDELIVERABLE_TRIES`] counts.
 pub const UNDELIVERABLE_TRY_SPACING_MS: u64 = UNDELIVERABLE_MS / 4;
+
+/// The longest a message answered `403 not_admitted` or `403 not_current` stays queued, app
+/// clock, from the first such answer, however few tries confirmed [`UNDELIVERABLE_MS`]: 45
+/// days. Then it is deleted, plaintext and all, without another try.
+pub const UNDELIVERABLE_MAX_MS: u64 = 45 * DAY_MS;
 
 /// How many times one delivery seals again after `409 stale_key` before it waits for the
 /// next flush.
@@ -865,6 +873,14 @@ impl App {
         if item.failed.is_some() {
             return Ok(false);
         }
+        // Past the firm bound, the message goes before it is tried again.
+        if item
+            .undeliverable_ms
+            .is_some_and(|since| self.now().saturating_sub(since) >= UNDELIVERABLE_MAX_MS)
+            && self.drop_undeliverable(&mut item).await?
+        {
+            return Ok(true);
+        }
         item.tries = item.tries.saturating_add(1);
         if item.conversation {
             match self.conversation_entry(&item.to).await {
@@ -919,16 +935,17 @@ impl App {
 
     /// End a delivery answered `403 not_admitted` or `403 not_current` for
     /// [`UNDELIVERABLE_MS`], at [`UNDELIVERABLE_TRIES`] spaced tries, the last one this
-    /// flush's (Switch spec 11): a message never accepted is deleted, plaintext and all; a
-    /// re-send is no longer owed. The protocol is told. Returns whether the delivery was
-    /// given up.
+    /// flush's, or for [`UNDELIVERABLE_MAX_MS`] however few tries (Switch spec 11): a
+    /// message never accepted is deleted, plaintext and all; a re-send is no longer owed.
+    /// The protocol is told. Returns whether the delivery was given up.
     async fn drop_undeliverable(&mut self, item: &mut OutboxItem) -> Result<bool, AppError> {
         let Some(since) = item.undeliverable_ms else {
             return Ok(false);
         };
-        if item.undeliverable_tries < UNDELIVERABLE_TRIES
-            || self.now().saturating_sub(since) < UNDELIVERABLE_MS
-        {
+        let elapsed = self.now().saturating_sub(since);
+        let confirmed =
+            item.undeliverable_tries >= UNDELIVERABLE_TRIES && elapsed >= UNDELIVERABLE_MS;
+        if !confirmed && elapsed < UNDELIVERABLE_MAX_MS {
             return Ok(false);
         }
         // A re-send: of an item accepted before, or queued again from `sent/`.

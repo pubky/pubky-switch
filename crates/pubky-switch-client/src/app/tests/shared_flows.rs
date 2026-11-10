@@ -556,6 +556,48 @@ async fn test_send_not_admitted_is_tried_once_more_before_it_is_deleted() {
 }
 
 #[tokio::test]
+async fn test_send_not_admitted_is_deleted_at_45_days_with_sparse_flushes() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    s.peer.lock().admitted = Some(Default::default());
+    let (msg_id, _) = app.send(s.note("one")).await.unwrap();
+    app.take_events();
+    // Two flushes in 45 days: far fewer answers than confirm the 30 days.
+    s.w.clock.advance_ms(20 * DAY_MS);
+    app.flush_outbox().await.unwrap();
+    s.w.clock
+        .advance_ms(crate::app::UNDELIVERABLE_MAX_MS - 20 * DAY_MS - 1);
+    let report = app.flush_outbox().await.unwrap();
+    assert_eq!(report.queued, vec![msg_id.clone()], "{report:?}");
+    // At 45 days from the first answer it goes, plaintext and all, untried.
+    s.w.clock.advance_ms(1);
+    s.peer.lock().admitted = None;
+    let report = app.flush_outbox().await.unwrap();
+    assert_eq!(report.undelivered, vec![msg_id.clone()], "{report:?}");
+    assert_eq!(app.delivery(&msg_id).await.unwrap(), None);
+    assert!(s.peer.received().is_empty());
+    assert!(app.take_events().contains(&AppEvent::MessageUndelivered {
+        msg_id,
+        resend: false
+    }));
+}
+
+#[tokio::test]
+async fn test_send_not_admitted_isnt_deleted_by_a_31_day_clock_jump() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    s.peer.lock().admitted = Some(Default::default());
+    let (msg_id, _) = app.send(s.note("one")).await.unwrap();
+    s.w.clock.advance_ms(31 * DAY_MS);
+    for _ in 0..5 {
+        let report = app.flush_outbox().await.unwrap();
+        assert_eq!(report.queued, vec![msg_id.clone()], "{report:?}");
+        s.w.clock.advance_ms(60_000);
+    }
+    assert!(app.delivery(&msg_id).await.unwrap().is_some());
+}
+
+#[tokio::test]
 async fn test_send_not_admitted_isnt_deleted_by_a_clock_jump() {
     let s = Setup::new();
     let mut app = s.join("wallet").await;
