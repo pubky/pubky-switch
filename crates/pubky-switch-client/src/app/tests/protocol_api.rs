@@ -2220,6 +2220,14 @@ async fn test_lists_too_large_refresh_is_tried_again_after_a_day() {
     shop.receive(None).await.unwrap();
     assert_eq!(allow_reads(&p), reads, "not before a day");
     p.clock.advance_ms(2 * MINUTE);
+    // The day is judged on the highest service time verified, which this read's page
+    // moves on: the next read refreshes.
+    shop.receive(None).await.unwrap();
+    assert_eq!(
+        allow_reads(&p),
+        reads,
+        "judged on the time before this read"
+    );
     shop.receive(None).await.unwrap();
     assert_eq!(allow_reads(&p), reads + 1);
     assert!(lists_key(&store, &shop, b"lc/lists_at"));
