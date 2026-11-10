@@ -43,6 +43,22 @@ It serves:
 
 The listener isn't authenticated. Keep it on a private network.
 
+### `[server]`
+
+The API listener.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `origin` | none | the switch origin, exactly as `identity.json` names it in `inbox.url`: `https://` and the host, with an optional port, no path or trailing slash. Requests sign it (Switch wire 7.1). Without it the API listener stays off |
+| `listen` | `127.0.0.1:8080` | address of the API listener; terminate TLS in front of it |
+| `allow_insecure_origin` | `false` | allow an `http://` origin, for development only |
+| `proxy.trusted` | `[]` | reverse proxies whose `proxy.header` the service believes, as addresses or networks such as `10.0.0.0/8` |
+| `proxy.header` | `x-forwarded-for` | the header those proxies append the client's address to |
+
+A request's network source, which the failed-authentication and public-read limits count by, is an IPv4 address or an IPv6 /64 (Switch wire 7.2). Behind a trusted proxy it is the nearest address in the header that isn't a trusted proxy; otherwise it is the connection's peer.
+
+Served so far: `POST /v1/enroll`, `PUT /v1/{id}/identity` and the public `GET /v1/{id}/identity`. Every other call is answered `503 unavailable` until its endpoint lands.
+
 ### `[log]`
 
 | Setting | Default | Meaning |

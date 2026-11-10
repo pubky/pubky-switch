@@ -19,6 +19,8 @@
 //! [`AccountTxn::mark_check`] finds a state behind it, as a restored backup would leave.
 
 mod account;
+mod chain;
+mod identity;
 #[cfg(any(test, feature = "test-util"))]
 pub mod testing;
 
@@ -31,6 +33,8 @@ use sqlx::{
 };
 
 pub use account::{AccountHead, AccountTxn, CommitError, Committed, NewAccount};
+pub use chain::NewChainItem;
+pub use identity::HeldIdentity;
 
 use crate::admin::{CheckFuture, ReadinessCheck};
 

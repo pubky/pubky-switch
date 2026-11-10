@@ -9,6 +9,8 @@
 use sqlx::{PgConnection, PgPool, Postgres, Row, Transaction};
 
 use super::{StoreError, from_db, to_db};
+use pubky_switch_core::sig::SignedDoc;
+
 use crate::keys::{KeyId, KeyStore, KeyStoreError, Mark, MarkCheck, check_mark};
 
 /// A new account, at enrollment (Switch wire 7.4.1).
@@ -24,6 +26,13 @@ pub struct NewAccount {
     pub service_key: KeyId,
     /// The service time of the enrollment.
     pub created_at_ms: u64,
+    /// The app limit announced at enrollment.
+    pub app_limit: u64,
+    /// The `identity.json` the enrollment carried, for a new provider (Switch wire 3.7).
+    pub identity_doc: Option<SignedDoc>,
+    /// The App IDs the enrollment's `revoked_apps` names, kept for good from the start
+    /// (Switch wire 3.7).
+    pub revoked_apps: Vec<[u8; 16]>,
 }
 
 /// An account's position: its generation and key, the last `seq` given out, the chain head
@@ -49,6 +58,19 @@ pub struct AccountHead {
 }
 
 impl AccountHead {
+    /// The chain tip the next chain item links to: the newest item's `seq` and chain hash,
+    /// or `seq` 0 and the zero hash before any (Switch wire 6.6).
+    pub fn chain_tip(&self) -> pubky_switch_core::chain::ChainTip {
+        let (seq, chain_hash) = self
+            .chain
+            .unwrap_or((0, pubky_switch_core::chain::ZERO_HASH));
+        pubky_switch_core::chain::ChainTip {
+            generation: self.generation,
+            seq,
+            chain_hash,
+        }
+    }
+
     /// The chain head as a mark, `None` before the first chain item.
     pub fn head_mark(&self) -> Option<Mark> {
         self.chain.map(|(seq, chain_hash)| Mark {
@@ -104,19 +126,45 @@ impl std::fmt::Debug for AccountTxn {
 
 /// Insert an account unless one exists.
 pub(super) async fn create(pool: &PgPool, account: &NewAccount) -> Result<bool, StoreError> {
+    let identity_doc = account
+        .identity_doc
+        .as_ref()
+        .map(super::identity::encode_doc)
+        .transpose()?;
+    let mut tx = pool.begin().await.map_err(StoreError::from_db)?;
     let created = sqlx::query(
         "INSERT INTO accounts (id, identity_key, generation, service_key, created_at_ms, \
-         stamped_time_ms) VALUES ($1, $2, $3, $4, $5, $5) ON CONFLICT (id) DO NOTHING",
+         stamped_time_ms, app_limit, identity_doc) VALUES ($1, $2, $3, $4, $5, $5, $6, $7) \
+         ON CONFLICT (id) DO NOTHING",
     )
     .bind(&account.id)
     .bind(account.identity_key.as_slice())
     .bind(to_db(account.generation, "generation")?)
     .bind(account.service_key.as_str())
     .bind(to_db(account.created_at_ms, "created_at_ms")?)
-    .execute(pool)
-    .await?
+    .bind(to_db(account.app_limit, "app_limit")?)
+    .bind(identity_doc)
+    .execute(&mut *tx)
+    .await
+    .map_err(StoreError::from_db)?
     .rows_affected();
-    Ok(created == 1)
+    if created != 1 {
+        return Ok(false);
+    }
+    for app_id in &account.revoked_apps {
+        sqlx::query(
+            "INSERT INTO kept_app_ids (account_id, app_id, reason, at_ms) \
+             VALUES ($1, $2, 'enrolled', $3) ON CONFLICT DO NOTHING",
+        )
+        .bind(&account.id)
+        .bind(app_id.as_slice())
+        .bind(to_db(account.created_at_ms, "created_at_ms")?)
+        .execute(&mut *tx)
+        .await
+        .map_err(StoreError::from_db)?;
+    }
+    tx.commit().await.map_err(StoreError::from_db)?;
+    Ok(true)
 }
 
 impl AccountTxn {

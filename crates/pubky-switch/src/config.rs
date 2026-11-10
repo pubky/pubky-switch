@@ -16,6 +16,8 @@ use crate::{keys::KeysConfig, limits::Limits, store::DatabaseConfig, time::Trust
 pub struct Config {
     /// The operator listener: health and metrics.
     pub admin: AdminConfig,
+    /// The API listener.
+    pub server: crate::http::ServerConfig,
     /// Logs.
     pub log: LogConfig,
     /// Limits, quotas and rates (Switch wire 9.2).
@@ -97,6 +99,9 @@ pub enum ConfigError {
     /// A database setting is invalid.
     #[error(transparent)]
     Database(#[from] crate::store::DatabaseConfigError),
+    /// A server setting is invalid.
+    #[error(transparent)]
+    Server(#[from] crate::http::ServerConfigError),
     /// The log filter doesn't parse.
     #[error("log.filter: {0}")]
     LogFilter(String),
@@ -124,6 +129,7 @@ impl Config {
         self.limits.validate()?;
         self.trusted_time.validate()?;
         self.database.validate()?;
+        self.server.validate()?;
         tracing_subscriber::EnvFilter::try_new(&self.log.filter)
             .map_err(|error| ConfigError::LogFilter(error.to_string()))?;
         Ok(())

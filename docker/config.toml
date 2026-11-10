@@ -6,6 +6,11 @@
 # only.
 listen = "0.0.0.0:9090"
 
+[server]
+# Set the switch origin to serve the API, for example with a mounted config file:
+# origin = "https://switch.example"
+listen = "0.0.0.0:8080"
+
 [database]
 # Set PUBKY_SWITCH_DATABASE_URL.
 
