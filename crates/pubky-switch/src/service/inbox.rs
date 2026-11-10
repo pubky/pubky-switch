@@ -20,7 +20,6 @@ use serde_json::{Value, json};
 use super::{
     Answer, Service,
     admission::{Admitted, NOT_ADMITTED, admit},
-    batch::state::OpsState,
     store_error,
 };
 use crate::{
@@ -343,18 +342,11 @@ impl Service {
         own: Option<[u8; 16]>,
         time_ms: u64,
     ) -> Result<Vec<[u8; 16]>, ApiError> {
-        let identity = txn.head().identity_key;
-        let apps = txn.apps().await.map_err(|e| store_error(&e))?;
-        let kept = txn.kept_app_ids().await.map_err(|e| store_error(&e))?;
-        let mut state = OpsState::new(identity, txn.head().generation, 0, time_ms);
-        state.doc = held.cloned();
-        state.kept = kept.into_iter().collect();
-        for app in &apps {
-            state.apps.insert(
-                app.app_id,
-                super::batch::held_app(app, &identity).map_err(|e| store_error(&e))?,
-            );
-        }
+        // Current by the service's one rule, as the entries' release and the directory judge
+        // it (Switch spec 3.4).
+        let (state, apps) = super::batch::load_apps_and_rows(txn, held, time_ms)
+            .await
+            .map_err(|e| store_error(&e))?;
         let kids: Vec<[u8; 8]> = header.kids().collect();
         let holders: BTreeMap<[u8; 8], [u8; 16]> = txn
             .kid_holders(&kids)

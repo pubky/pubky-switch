@@ -347,15 +347,28 @@ pub(super) async fn load_apps(
     held: Option<&IdentityDoc>,
     now: u64,
 ) -> Result<OpsState, StoreError> {
+    Ok(load_apps_and_rows(txn, held, now).await?.0)
+}
+
+/// As [`load_apps`], with the app rows it read. The one loader behind every judgment of
+/// which apps are current outside a batch ([`OpsState::is_current`]): the inbox's targets,
+/// the entries' release, the directory and the claims' views; `GET /apps` builds the same
+/// state from its own read ([`super::apps`]).
+pub(super) async fn load_apps_and_rows(
+    txn: &mut AccountTxn,
+    held: Option<&IdentityDoc>,
+    now: u64,
+) -> Result<(OpsState, Vec<StoredApp>), StoreError> {
     let head = txn.head().clone();
     let identity = head.identity_key;
     let mut state = OpsState::new(identity, head.generation, head.last_seq, now);
     state.doc = held.cloned();
-    for app in txn.apps().await? {
-        state.apps.insert(app.app_id, held_app(&app, &identity)?);
+    let apps = txn.apps().await?;
+    for app in &apps {
+        state.apps.insert(app.app_id, held_app(app, &identity)?);
     }
     state.kept = txn.kept_app_ids().await?.into_iter().collect();
-    Ok(state)
+    Ok((state, apps))
 }
 
 /// Delete the inbox entries every current target has passed (Switch wire 9.1), judged by

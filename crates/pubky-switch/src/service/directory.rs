@@ -8,7 +8,6 @@ use serde_json::{Value, json};
 use super::{
     Answer, Service,
     admission::{Admitted, NOT_ADMITTED, admit},
-    batch::state::OpsState,
     store_error,
 };
 use crate::{
@@ -109,17 +108,11 @@ impl Service {
             ));
         };
 
-        let apps = txn.apps().await.map_err(|e| store_error(&e))?;
-        let kept = txn.kept_app_ids().await.map_err(|e| store_error(&e))?;
-        let mut state = OpsState::new(account.identity_key, account.generation, 0, time_ms);
-        state.doc = Some(doc.clone());
-        state.kept = kept.into_iter().collect();
-        for app in &apps {
-            state.apps.insert(
-                app.app_id,
-                super::batch::held_app(app, &account.identity_key).map_err(|e| store_error(&e))?,
-            );
-        }
+        // Current by the service's one rule, as the inbox's targets and the entries' release
+        // judge it (Switch spec 3.4).
+        let (state, apps) = super::batch::load_apps_and_rows(txn, Some(doc), time_ms)
+            .await
+            .map_err(|e| store_error(&e))?;
         // The current apps, in the order the newest identity.json lists them: each once,
         // since a document naming an App ID twice doesn't verify (Switch wire 3.3).
         let mut listed: Vec<Value> = Vec::new();
