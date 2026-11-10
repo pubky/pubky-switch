@@ -326,21 +326,30 @@ async fn test_approval_clearing_an_alarm_the_switch_still_shows_keeps_the_claim_
 }
 
 #[tokio::test]
-async fn test_approval_after_an_old_alarm_is_released_once_its_delivery_succeeds() {
-    // A delivery the switch takes shows it holds the signer's mark again, whatever alert is
-    // still listed.
+async fn test_approval_after_an_old_alarm_waits_for_the_alert_to_be_cleared() {
+    // The switch went back and is put back as it was: nothing is signed while the alert is
+    // held. Once the user clears it, the re-delivery confirms the switch, and the approval and
+    // its claim go through.
     let world = World::new();
     let (mut signer, _) = world.enrolled().await;
     let first = signer.identity_doc().unwrap().unwrap();
     signer.set_record_max_age(Some(86_400)).await.unwrap();
     world.switch.deliver_identity(&first).unwrap();
-    signer.set_record_max_age(Some(3_600)).await.unwrap_err();
-    assert!(!signer.alerts().is_empty());
-    // The switch is put back as it was.
+    let SignerError::Alarm(alert) = signer.set_record_max_age(Some(3_600)).await.unwrap_err()
+    else {
+        panic!("no alarm")
+    };
     let second = signer.identity_doc().unwrap().unwrap();
     world.switch.deliver_identity(&second).unwrap();
     let app = App::new(&["notes"], None, [9; 32]);
     let review = signer.review(&app.request, &app.auth).unwrap();
+    let sent = world.sent_docs().len();
+    assert_eq!(
+        signer.approve(review.clone()).await.unwrap_err(),
+        SignerError::Alarm(alert.clone())
+    );
+    assert_eq!(world.sent_docs().len(), sent);
+    signer.clear_alert(&alert).await.unwrap();
     let approved = signer.approve(review).await.unwrap();
     assert_eq!(signer.approved(&approved.request).unwrap(), Some(approved));
 }

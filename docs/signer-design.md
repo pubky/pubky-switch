@@ -172,7 +172,7 @@ Each step is one idempotent call. `Revoke`, for example, runs these steps:
 
 Every new version takes the same path (spec 4.3, 12.8; wire 3.3, 3.13):
 
-1. **Check this install may sign.** If `managed_by` is set, refuse.
+1. **Check this install may sign.** One gate decides it for every signed document, certificate, approval, claim, key bundle and operation: the identity key for signing is handed out only through it. It refuses while another install is named, while the records are behind this install's own newer version, and while an alarm is latched (the switch unconfirmed since a rollback or an equivocation) or its alert is held. An owed reduction closing goes through the same gate: it waits, with `ReductionNotClosed`, until the alarm is cleared and the switch confirmed, while a failed Homeserver write doesn't hold it back. Clients of the switch get a key that signs requests only, so a read or a re-delivery can't sign anything new. The status reports `Alarm` whenever the gate refuses for an alarm.
 2. **Sign** the version, naming this install as `signer`, and commit it.
 3. **Read the backup** on the Homeserver. If it names another install at or past the high-water mark, set `managed_by` and stop (wire 3.13 "Another install's backup").
 4. **Write the backup** holding the new version and its `prev`, sealed to the backup key. A failed write stops the delivery.

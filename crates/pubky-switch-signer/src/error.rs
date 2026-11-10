@@ -115,6 +115,11 @@ pub enum Refusal {
         /// The newer version.
         version: u64,
     },
+    /// An alarm's alert was cleared, and the re-delivery that confirms the switch holds this
+    /// signer's newest version hasn't succeeded yet: nothing new is signed until it has
+    /// ([`crate::Signer::resume`] sends it).
+    #[error("refused: the switch isn't confirmed since an alarm")]
+    SwitchUnconfirmed,
     /// The store holds no signer records for this identity.
     #[error("refused: the signer isn't set up for this identity")]
     NotSetUp,

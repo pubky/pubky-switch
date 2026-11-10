@@ -76,9 +76,11 @@ pub enum Alert {
         /// The newest version this signer's records hold.
         high_water_version: u64,
     },
-    /// The switch gave no service time for a reduction's renewing delivery, even on a retry,
-    /// so the earlier certificates of these apps aren't cut off yet: a reduction's cutoff is
-    /// the service's time, never the signer's own (Switch wire 3.8). The signer closes them at
+    /// A reduction's closing is owed and can't be delivered now, so the earlier certificates
+    /// of these apps aren't cut off yet. Either an alarm blocks every signing step: the
+    /// closing is delivered once the user has cleared the alarm and the switch is confirmed
+    /// again. Or the switch gave no service time for the renewing delivery, even on a retry:
+    /// a reduction's cutoff is the service's time, never the signer's own (Switch wire 3.8). The signer closes them at
     /// the service time of the next version the user signs, and the alert stays until then.
     /// Nothing is delivered on its own to get a time: to force the cut-off, the user makes a
     /// change, or revokes the app, which cuts it off at once. A switch that keeps doing this
