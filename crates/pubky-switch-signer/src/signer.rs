@@ -321,6 +321,10 @@ impl Signer {
     /// and everything stays held. If it keeps coming back, the user moves to another provider,
     /// or declares a provider loss.
     ///
+    /// Nothing is delivered again when the alarm saw no copy at all, since that switch lost
+    /// the account's state and must not serve it again under this generation (Switch spec
+    /// 6.5): the user declares a provider loss. Nor once another install is the signer.
+    ///
     /// # Errors
     ///
     /// The store's error, or the delivery's as [`Signer::resume`] gives it, the alarm again
@@ -332,14 +336,27 @@ impl Signer {
         }
         let mut state = self.state.clone();
         state.alerts.retain(|held| held != alert);
-        let alarm = matches!(alert, Alert::Rollback { .. } | Alert::Equivocation { .. });
+        // Delivered again only when the alarm saw a copy at the switch: one that holds nothing
+        // has lost the account's state, and a version 1 delivered onto it would start the
+        // account afresh at the same generation (Switch spec 6.5 "No restore and continue");
+        // the way out is a provider loss. Never once another install signs.
+        let alarm = matches!(
+            alert,
+            Alert::Rollback {
+                version: Some(_),
+                ..
+            } | Alert::Equivocation { .. }
+        );
+        let named = self.state.managed_by.is_none();
         let again = match (&self.state.newest, &self.flow) {
-            (Some(newest), None) if alarm && state.switch_unconfirmed => Some(Flow::Deliver {
-                doc: newest.doc.clone(),
-                prev: newest.prev,
-                backup: None,
-                step: DeliverStep::BackupWritten,
-            }),
+            (Some(newest), None) if alarm && named && state.switch_unconfirmed => {
+                Some(Flow::Deliver {
+                    doc: newest.doc.clone(),
+                    prev: newest.prev,
+                    backup: None,
+                    step: DeliverStep::BackupWritten,
+                })
+            }
             _ => None,
         };
         let deliver_again = again.is_some();
