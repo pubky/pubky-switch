@@ -40,7 +40,7 @@ use sqlx::{
 pub use account::{AccountHead, AccountTxn, CommitError, Committed, NewAccount, Savepoint};
 pub use apps::{AppsView, KeptAppId, KeptReason, OpenAttempt, PartSpan, newly_listed};
 pub use chain::NewChainItem;
-pub use feed::{AppDocs, CurrentDocs, FeedRow, FeedSnapshot};
+pub use feed::{AppDocs, CurrentDocs, FeedRow, FeedSnapshot, PageReader};
 pub use identity::HeldIdentity;
 pub use ops::{
     ListName, StoredApp, StoredBundlePart, StoredClaimEntry, StoredInvite, StoredListEntry,
@@ -385,18 +385,17 @@ impl Store {
     /// `positions` positions on and `batch_tail` more to finish a batch, each given to
     /// `take`, which answers whether the page wants the next. `None` for an account that
     /// isn't there.
-    pub async fn read_feed<F>(
+    #[allow(clippy::too_many_arguments)]
+    pub async fn read_feed(
         &self,
         id: &str,
+        reader: &[u8; 16],
         after: Option<pubky_switch_core::ops::Position>,
         positions: u64,
         batch_tail: u64,
-        take: F,
-    ) -> Result<Option<FeedSnapshot>, StoreError>
-    where
-        F: FnMut(&FeedSnapshot, FeedRow) -> bool,
-    {
-        feed::read_feed(&self.pool, id, after, positions, batch_tail, take).await
+        page: &mut impl PageReader,
+    ) -> Result<Option<FeedSnapshot>, StoreError> {
+        feed::read_feed(&self.pool, id, reader, after, positions, batch_tail, page).await
     }
 
     /// Start a request to account `id`: a transaction holding the account's lock until it
