@@ -35,26 +35,118 @@ use pubky_switch_core::enc::serde_b64;
 
 use super::error::Alarm;
 
-/// The stable ID of a duty event ([`AppEvent::is_duty`]). IDs rise in the order the events
-/// were kept and are never given twice: a restore ([`super::App::restore`]) starts them
-/// past the store's counter and past a floor from the restore time, so even a backup older
-/// than IDs the host acknowledged gives none of them again. The floor holds while the
-/// device clock at a restore is later than at any earlier restore of the app.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct EventId(u64);
+/// The stable ID of a duty event ([`AppEvent::is_duty`]): the store's epoch, and a counter.
+///
+/// The epoch is random, chosen once when the app's store starts empty: at the first
+/// [`super::App::join`], and at a [`super::App::restore`] onto a store that holds none. A
+/// restore in place keeps it. Within one store every kept event has the same epoch and the
+/// counter only goes up, in the order the events were kept; a store started on another
+/// device, or after a wipe, has another epoch, so its IDs never equal one from before.
+///
+/// IDs compare only within one store: [`EventId::cmp_same_store`] orders two of the same
+/// epoch and gives `None` otherwise. There is no total order across stores. A host keeps an
+/// ID as [`EventId::to_bytes`] or its string form ([`std::fmt::Display`], parsed with
+/// [`std::str::FromStr`]), both stable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct EventId {
+    epoch: [u8; EPOCH_LEN],
+    counter: u64,
+}
+
+/// The length of a store's event epoch, in bytes.
+pub(crate) const EPOCH_LEN: usize = 16;
+
+/// The length of [`EventId::to_bytes`].
+pub const EVENT_ID_LEN: usize = EPOCH_LEN + 8;
 
 impl EventId {
-    /// The ID with this number, as [`EventId::get`] gave it: for a host that keeps how far
-    /// it acknowledged.
-    pub fn new(n: u64) -> Self {
-        Self(n)
+    pub(crate) fn new(epoch: [u8; EPOCH_LEN], counter: u64) -> Self {
+        Self { epoch, counter }
     }
 
-    /// The ID's number.
-    pub fn get(self) -> u64 {
-        self.0
+    pub(crate) fn epoch(&self) -> [u8; EPOCH_LEN] {
+        self.epoch
+    }
+
+    /// The counter: the event's place among its store's duty events.
+    pub fn counter(&self) -> u64 {
+        self.counter
+    }
+
+    /// Whether `other` comes from the same store.
+    pub fn same_store(&self, other: &Self) -> bool {
+        self.epoch == other.epoch
+    }
+
+    /// The order of two IDs of the same store, by counter; `None` for IDs of different
+    /// stores, which have no order.
+    pub fn cmp_same_store(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        self.same_store(other)
+            .then(|| self.counter.cmp(&other.counter))
+    }
+
+    /// The ID's stable bytes: the epoch, then the counter, big-endian.
+    pub fn to_bytes(&self) -> [u8; EVENT_ID_LEN] {
+        let mut bytes = [0u8; EVENT_ID_LEN];
+        let (epoch, counter) = bytes.split_at_mut(EPOCH_LEN);
+        epoch.copy_from_slice(&self.epoch);
+        counter.copy_from_slice(&self.counter.to_be_bytes());
+        bytes
+    }
+
+    /// An ID from [`EventId::to_bytes`].
+    ///
+    /// # Errors
+    ///
+    /// [`EventIdError`] for bytes of another length.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, EventIdError> {
+        if bytes.len() != EVENT_ID_LEN {
+            return Err(EventIdError);
+        }
+        let (epoch, counter) = bytes.split_at(EPOCH_LEN);
+        Ok(Self {
+            epoch: epoch.try_into().map_err(|_| EventIdError)?,
+            counter: u64::from_be_bytes(counter.try_into().map_err(|_| EventIdError)?),
+        })
     }
 }
+
+/// The string form: the epoch in lowercase hex, a `-`, then the counter in decimal.
+impl std::fmt::Display for EventId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for byte in self.epoch {
+            write!(f, "{byte:02x}")?;
+        }
+        write!(f, "-{}", self.counter)
+    }
+}
+
+impl std::str::FromStr for EventId {
+    type Err = EventIdError;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let (hex, counter) = text.split_once('-').ok_or(EventIdError)?;
+        if hex.len() != EPOCH_LEN * 2 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(EventIdError);
+        }
+        let mut epoch = [0u8; EPOCH_LEN];
+        for (index, byte) in epoch.iter_mut().enumerate() {
+            let at = index.saturating_mul(2);
+            let pair = hex.get(at..at.saturating_add(2)).ok_or(EventIdError)?;
+            *byte = u8::from_str_radix(pair, 16).map_err(|_| EventIdError)?;
+        }
+        if counter.is_empty() || !counter.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(EventIdError);
+        }
+        let counter = counter.parse().map_err(|_| EventIdError)?;
+        Ok(Self { epoch, counter })
+    }
+}
+
+/// Bytes or a string that aren't an [`EventId`]'s stable form.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("not an event ID")]
+pub struct EventIdError;
 
 /// One thing that happened, for the host to show or act on.
 #[derive(Clone, Debug, PartialEq, Eq)]

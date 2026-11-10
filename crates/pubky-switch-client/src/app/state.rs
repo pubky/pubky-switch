@@ -91,6 +91,8 @@ pub(crate) mod key {
     pub(crate) const PENDING_RECORD: &str = "pending/record";
     /// The ID the next duty event takes.
     pub(crate) const DUTY_NEXT: &str = "dutyn";
+    /// The store's event epoch.
+    pub(crate) const DUTY_EPOCH: &str = "dutye";
     /// The prefix of the kept duty events.
     pub(crate) const DUTY_PREFIX: &str = "duty/";
 
@@ -334,6 +336,27 @@ pub(crate) struct Processed {
     pub(crate) hash: [u8; 32],
     /// When it was processed, app clock, for the retention.
     pub(crate) at_ms: u64,
+}
+
+/// `dutye`: the store's event epoch, chosen at random once the store starts empty
+/// ([`super::EventId`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct DutyEpoch {
+    #[serde(with = "serde_b64")]
+    pub(crate) epoch: [u8; super::events::EPOCH_LEN],
+}
+
+impl DutyEpoch {
+    /// A new epoch, from the system's randomness.
+    pub(crate) fn random() -> Result<Self, AppError> {
+        let mut epoch = [0u8; super::events::EPOCH_LEN];
+        getrandom::fill(&mut epoch).map_err(|_| {
+            AppError::Store(StoreError::Other(
+                "no randomness for the event epoch".into(),
+            ))
+        })?;
+        Ok(Self { epoch })
+    }
 }
 
 /// `held/<seq>`: an entry held because its sender can't be checked yet (Switch spec 8.2).

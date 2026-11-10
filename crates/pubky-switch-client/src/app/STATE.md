@@ -82,7 +82,8 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
 | `service_time` | the highest service time verified, its key, the offset from the device clock | |
 | `p/...` | the protocol's own local state (`LocalWrite`) | the protocol's |
 | `duty/<id>` | a duty event (`AppEvent::is_duty`), written in the commit of the change it reports, until the host acknowledges it (`App::ack_events`); one per entry stored for good, kept batch or `attempt` dropped, or outbox message given up. Only acknowledgements remove them: nothing bounds them for a host that never acknowledges | |
-| `dutyn` | the ID the next duty event takes; a restore sets it past the store's counter and past the restore time in milliseconds times 1024, so an ID is never given twice, even after a backup older than IDs the host acknowledged | |
+| `dutyn` | the counter the next duty event takes; it only goes up in one store, and a restore in place keeps it | |
+| `dutye` | the store's event epoch, random, chosen once when the store starts empty (the first join, or a restore onto a store without one); every duty event ID carries it with its counter | |
 
 Deleting the keys on a leave removes `keys`, `naming`, `rk/`, `scope/`, `parked/`,
 `pending/`, `p/`, `duty/` and `owed/`, and marks `leave`.
@@ -182,21 +183,22 @@ uploads carry (`App::shared_evidence`).
 
 ## What the app owes its protocol: restores and provider changes
 
-`duty/<id>`, `dutyn` and `owed/<generation>/<seq>` hold what the app still has to tell its
-protocol, so neither a restore nor a provider change drops them.
+`duty/<id>`, `dutyn`, `dutye` and `owed/<generation>/<seq>` hold what the app still has to
+tell its protocol, so neither a restore nor a provider change drops them.
 
 - **A backup carries none of them.** They are the store's, not the app's keys or position.
-- **A restore in place** (into the store that holds them) carries `duty/` and `owed/`
-  across the namespace's replacement, in its one commit: the duty events keep their IDs
-  and are delivered again, and the owed calls are made by the next read. What the store
-  can't read is not carried. The restored cursor may meet the same items again; the
-  protocol then hears of them twice, which it tolerates.
-- **A restore on another device** starts with none: their facts stayed with the lost store.
-- **`dutyn` never goes back.** A restore sets it to the highest of the store's counter, the
-  kept IDs plus one, and the restore time (app clock, milliseconds) times 1024. A backup
-  older than IDs the host acknowledged then gives none of them again, as long as the
-  device clock at a restore is later than at any earlier restore of the app and the app
-  gave fewer than 1024 duty events per millisecond since.
+- **A restore in place** (into a store that holds an epoch) keeps `dutye`, sets `dutyn` to
+  the higher of the store's counter and the highest kept counter plus one, and carries
+  `duty/` and `owed/` across the namespace's replacement, all in its one commit: the duty
+  events keep their IDs and are delivered again, and the owed calls are made by the next
+  read. The restored cursor may meet the same items again; the protocol then hears of them
+  twice, which it tolerates.
+- **A restore on another device, or onto a wiped store** (one without an epoch, or one
+  that can't be read), starts a new random epoch at the first counter, with none of them:
+  their facts stayed with the lost store. Its IDs can't equal any the host acknowledged
+  before, whatever the counters or the clock, since an ID is its epoch and its counter.
+- **IDs compare only within one store.** `App::ack_events` refuses an ID of another epoch
+  and acknowledges nothing.
 - **A provider change keeps them** (a move, a key change in place, a provider loss). The
   duty events report facts that stay true. An owed call is still made at the generation
   followed: a re-send call names a sender and acceptance times, which the counterparty

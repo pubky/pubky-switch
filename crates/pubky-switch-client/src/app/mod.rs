@@ -62,7 +62,7 @@ mod tests;
 
 pub use chain::{HELD_MARKS, STUBS_KEPT_FOR_MS};
 pub use error::{Alarm, AppError, Refusal};
-pub use events::{AppEvent, EventId, ParkReason};
+pub use events::{AppEvent, EVENT_ID_LEN, EventId, EventIdError, ParkReason};
 pub use feed::ReceiveReport;
 pub use identity::{DOC_CACHE_MS, HomeserverReader, IdentityRefresh, REVALIDATION_MS};
 pub use peek::{PeekReport, Peeked};
@@ -398,6 +398,8 @@ pub(crate) struct AppState {
     pub(crate) gone: Option<provider::GoneRecord>,
     /// The ID the next duty event takes (`dutyn`).
     pub(crate) next_duty: u64,
+    /// The store's event epoch (`dutye`).
+    pub(crate) duty_epoch: state::DutyEpoch,
     /// The wait before the account counts as erased, while it runs.
     pub(crate) erasing: Option<provider::ErasingRecord>,
 }
@@ -431,11 +433,6 @@ fn corrupt() -> AppError {
 
 /// The ID of a store's first duty event.
 const FIRST_DUTY: u64 = 1;
-
-/// After a restore, duty event IDs start at the restore time in milliseconds times this:
-/// above any ID an app restored before then gave, unless it gave this many in one
-/// millisecond since its own restore.
-const DUTY_IDS_PER_MS: u64 = 1024;
 
 fn missing() -> AppError {
     AppError::Store(StoreError::Corrupt)
@@ -565,6 +562,7 @@ impl App {
                 service_time: None,
                 gone: None,
                 next_duty: FIRST_DUTY,
+                duty_epoch: state::DutyEpoch::random()?,
                 erasing: None,
             };
             let mut app = App {
@@ -607,6 +605,7 @@ impl App {
             tx.put(key::CURSOR, &app.state.cursor)?;
             tx.put(key::JOIN, &app.state.join)?;
             tx.put(records::LIST_DUE, &true)?;
+            tx.put(key::DUTY_EPOCH, &app.state.duty_epoch)?;
             tx.commit(&app.env.store).await?;
             app.finish_join().await?;
             Ok(app)
@@ -695,6 +694,12 @@ impl App {
                 identity_confirmed: None,
                 events: Vec::new(),
             };
+            // A store an earlier build wrote keeps the epoch read now.
+            if !app.reader().exists(key::DUTY_EPOCH).await? {
+                let mut tx = Tx::new(&app.ns);
+                tx.put(key::DUTY_EPOCH, &app.state.duty_epoch)?;
+                tx.commit(&app.env.store).await?;
+            }
             // Duty events not acknowledged before are delivered again (`events` module).
             app.events = app.unacknowledged_events().await?;
             Ok(app)
@@ -765,6 +770,11 @@ impl App {
             service_time: reader.get(key::SERVICE_TIME).await?,
             gone: reader.get(provider::keys::GONE).await?,
             next_duty: Self::next_duty(reader).await?,
+            duty_epoch: match reader.get(key::DUTY_EPOCH).await? {
+                Some(epoch) => epoch,
+                // A store an earlier build wrote: `App::load` keeps this one.
+                None => state::DutyEpoch::random()?,
+            },
             erasing: reader.get(provider::keys::ERASING).await?,
             meta,
         })
@@ -838,8 +848,8 @@ impl App {
     /// What the store holds that the app still owes its protocol stays: the duty events
     /// not acknowledged, with their IDs, delivered again as after [`App::load`], and the
     /// protocol calls it couldn't answer, made again by the next read. A backup carries
-    /// neither, so a restore on another device starts without them. Duty event IDs never
-    /// go back ([`EventId`]).
+    /// neither, so a restore on another device starts without them, under a new event epoch
+    /// ([`EventId`]).
     ///
     /// # Errors
     ///
@@ -942,23 +952,31 @@ impl App {
                 service_time: None,
                 gone: None,
                 next_duty: FIRST_DUTY,
+                duty_epoch: state::DutyEpoch::random()?,
                 erasing: None,
             };
             let ns = client_namespace(&meta.app_id);
-            // What the store holds of what the app still owes its protocol, the duty events
-            // not acknowledged and the calls the protocol couldn't answer, is carried across
-            // (`STATE.md`, "Restore"). A store that can't be read carries nothing.
+            // A restore in place keeps the store's event epoch and counter, and what the store
+            // holds of what the app still owes its protocol: the duty events not
+            // acknowledged and the calls the protocol couldn't answer. A store with no epoch,
+            // on another device or wiped, starts a new epoch at the first counter, and a
+            // store that can't be read is taken as one (`STATE.md`, "What the app owes its
+            // protocol").
             let old = Reader {
                 ns: ns.clone(),
                 store: env.store.clone(),
             };
-            let carried = Self::owed_to_protocol(&old).await.unwrap_or_default();
-            // Duty event IDs never go back: past the store's counter, and past the restore
-            // time's floor, above any ID an app restored earlier could have given, so a
-            // backup older than IDs the host acknowledged gives none of them again.
-            let floor = env.clock.now_ms().saturating_mul(DUTY_IDS_PER_MS);
-            let next_duty = Self::next_duty(&old).await.unwrap_or(FIRST_DUTY).max(floor);
-            let state = AppState { next_duty, ..state };
+            let (state, carried) = match Self::kept_for_protocol(&old).await {
+                Ok(Some((duty_epoch, next_duty, carried))) => (
+                    AppState {
+                        duty_epoch,
+                        next_duty,
+                        ..state
+                    },
+                    carried,
+                ),
+                Ok(None) | Err(_) => (state, Vec::new()),
+            };
             let client = Self::client_for(&env, &meta, &backup.keys, &cert)?;
             let mut app = App {
                 env,
@@ -977,6 +995,7 @@ impl App {
             app.write_all(&mut tx).await?;
             tx.put(records::LIST_DUE, &true)?;
             tx.put(key::DUTY_NEXT, &app.state.next_duty)?;
+            tx.put(key::DUTY_EPOCH, &app.state.duty_epoch)?;
             for (stored, value) in &carried {
                 tx.put(stored, value)?;
             }
@@ -1232,7 +1251,7 @@ impl App {
             .scan_numbered::<events::Duty>(key::DUTY_PREFIX)
             .await?
             .into_iter()
-            .map(|(n, duty)| duty.event(EventId::new(n)))
+            .map(|(n, duty)| duty.event(EventId::new(self.state.duty_epoch.epoch, n)))
             .collect())
     }
 
@@ -1240,7 +1259,8 @@ impl App {
     /// kept what they say, and the store no longer keeps them, so no later
     /// [`App::load`] delivers them again. IDs rise in the order the events are reported,
     /// so a host acknowledges after acting on every duty event it took up to that ID. An
-    /// ID no event has yet acknowledges only those before it.
+    /// ID no event has yet acknowledges only those before it. IDs compare only within one
+    /// store ([`EventId::cmp_same_store`]).
     ///
     /// The host must call this once it has handed the events to its protocol and the
     /// protocol has kept what they say: nothing else removes a kept duty event, so a host
@@ -1249,13 +1269,21 @@ impl App {
     ///
     /// # Errors
     ///
-    /// A failed store read or commit; nothing is acknowledged then.
+    /// [`Refusal::Usage`] for an ID of another store, such as one from before a restore on
+    /// another device: nothing is acknowledged. A failed store read or commit; nothing is
+    /// acknowledged then either.
     pub async fn ack_events(&mut self, up_to: EventId) -> Result<(), AppError> {
         Box::pin(async move {
             self.ready_local().await?;
+            if up_to.epoch() != self.state.duty_epoch.epoch {
+                return Err(Refusal::Usage(
+                    "an event ID of another store: nothing acknowledged".into(),
+                )
+                .into());
+            }
             let kept = self.reader().scan_numbers(key::DUTY_PREFIX).await?;
             let mut tx = self.tx()?;
-            for n in kept.range(..=up_to.get()) {
+            for n in kept.range(..=up_to.counter()) {
                 tx.delete(&key::duty(*n))?;
             }
             self.commit(tx).await
@@ -1271,22 +1299,27 @@ impl App {
         tx.put(&key::duty(n), &duty)?;
         tx.put(key::DUTY_NEXT, &next)?;
         self.state.next_duty = next;
-        tx.report(duty.event(EventId::new(n)));
+        tx.report(duty.event(EventId::new(self.state.duty_epoch.epoch, n)));
         Ok(())
     }
 
-    /// The kept duty events and owed protocol calls, by key, as stored: what a restore
-    /// carries across.
-    async fn owed_to_protocol(
+    /// What a restore in place carries across: the store's event epoch, the next counter,
+    /// and the kept duty events and owed protocol calls, by key, as stored. `None` for a
+    /// store that holds no epoch.
+    #[allow(clippy::type_complexity)]
+    async fn kept_for_protocol(
         reader: &Reader,
-    ) -> Result<Vec<(String, serde_json::Value)>, AppError> {
+    ) -> Result<Option<(state::DutyEpoch, u64, Vec<(String, serde_json::Value)>)>, AppError> {
+        let Some(epoch) = reader.get::<state::DutyEpoch>(key::DUTY_EPOCH).await? else {
+            return Ok(None);
+        };
         let mut owed = Vec::new();
         for prefix in [key::DUTY_PREFIX, key::OWED_PREFIX] {
             for (rest, value) in reader.scan::<serde_json::Value>(prefix).await? {
                 owed.push((format!("{prefix}{rest}"), value));
             }
         }
-        Ok(owed)
+        Ok(Some((epoch, Self::next_duty(reader).await?, owed)))
     }
 
     /// The ID the next duty event takes: past the counter and every kept event.

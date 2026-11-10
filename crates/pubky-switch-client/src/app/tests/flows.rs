@@ -1892,7 +1892,7 @@ async fn test_duty_event_delivered_again_until_acknowledged() {
         assert!(!received(&events, after), "{events:?}");
     }
     // Acknowledged up to the last: gone, across a reload too.
-    let last = duties.iter().filter_map(AppEvent::id).max().unwrap();
+    let last = last_id(&duties);
     app.ack_events(last).await.unwrap();
     assert!(app.unacknowledged_events().await.unwrap().is_empty());
     let mut app = w.load(me).await;
@@ -1907,7 +1907,9 @@ async fn test_duty_event_delivered_again_until_acknowledged() {
     let report = app.receive(None).await.unwrap();
     let next = refused_events(&report.events, again);
     assert!(
-        next.iter().filter_map(AppEvent::id).all(|id| id > last),
+        next.iter()
+            .filter_map(AppEvent::id)
+            .all(|id| id.cmp_same_store(&last) == Some(std::cmp::Ordering::Greater)),
         "{next:?}"
     );
 }
@@ -1926,7 +1928,10 @@ async fn test_duty_event_acknowledged_in_part_keeps_the_later_ones() {
     let report = app.receive(None).await.unwrap();
     let ids: Vec<EventId> = report.events.iter().filter_map(AppEvent::id).collect();
     assert_eq!(ids.len(), 2, "{:?}", report.events);
-    assert!(ids[0] < ids[1]);
+    assert_eq!(
+        ids[0].cmp_same_store(&ids[1]),
+        Some(std::cmp::Ordering::Less)
+    );
     app.ack_events(ids[0]).await.unwrap();
     let mut app = w.load(me).await;
     let events = app.take_events();
@@ -1953,17 +1958,49 @@ async fn refuse_next(w: &World, app: &mut App) -> Vec<AppEvent> {
         .collect()
 }
 
+/// The duty event of the highest counter among `events`, all of one store.
+fn last_id(events: &[AppEvent]) -> EventId {
+    let ids: Vec<EventId> = events.iter().filter_map(AppEvent::id).collect();
+    assert!(ids.iter().all(|id| ids[0].same_store(id)), "{ids:?}");
+    ids.into_iter().max_by_key(EventId::counter).unwrap()
+}
+
+#[test]
+fn test_duty_event_id_round_trips_its_stable_forms() {
+    let id = EventId::new([7; 16], 42);
+    assert_eq!(EventId::from_bytes(&id.to_bytes()), Ok(id));
+    assert_eq!(id.to_string().parse::<EventId>(), Ok(id));
+    assert_eq!(id.to_string(), format!("{}-42", "07".repeat(16)));
+    for bad in [
+        "",
+        "07-1",
+        &format!("{}-", "07".repeat(16)),
+        &format!("{}-x", "07".repeat(16)),
+    ] {
+        assert!(bad.parse::<EventId>().is_err(), "{bad}");
+    }
+    assert!(EventId::from_bytes(&[0; 23]).is_err());
+    // Ordered within one store only.
+    let other = EventId::new([8; 16], 1);
+    assert_eq!(id.cmp_same_store(&other), None);
+    assert_eq!(
+        id.cmp_same_store(&EventId::new([7; 16], 1)),
+        Some(std::cmp::Ordering::Greater)
+    );
+}
+
 #[tokio::test]
-async fn test_duty_event_ids_never_repeat_after_a_restore_from_an_older_backup() {
+async fn test_duty_event_ids_after_a_restore_on_a_fresh_store_are_new() {
     let w = World::new();
     let mut app = w.join("wallet").await;
     let backup = app.backup().unwrap();
+    let start = w.clock.now_ms();
     let before = refuse_next(&w, &mut app).await;
-    let acked = before.iter().filter_map(AppEvent::id).max().unwrap();
+    let acked = last_id(&before);
     app.ack_events(acked).await.unwrap();
     // The device is lost; the backup, older than the IDs the host acknowledged, is
-    // restored on a new one.
-    w.clock.advance_ms(1000);
+    // restored on a new one whose clock reads earlier.
+    w.clock.set_ms(start);
     let store = Arc::new(MemoryStore::new());
     let mut restored = App::restore(
         w.env_on(Arc::clone(&store) as Arc<dyn StateStore>),
@@ -1975,11 +2012,27 @@ async fn test_duty_event_ids_never_repeat_after_a_restore_from_an_older_backup()
     .unwrap();
     assert!(restored.take_events().is_empty());
     let after = refuse_next(&w, &mut restored).await;
-    assert!(!after.is_empty());
+    assert_eq!(after.len(), before.len(), "{after:?}");
+    // The same counters, under a new epoch: no ID equals one from before.
+    let counters = |events: &[AppEvent]| {
+        events
+            .iter()
+            .filter_map(AppEvent::id)
+            .map(|id| id.counter())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(counters(&after), counters(&before));
+    for id in after.iter().filter_map(AppEvent::id) {
+        assert!(!id.same_store(&acked), "{id}");
+        assert!(before.iter().filter_map(AppEvent::id).all(|old| old != id));
+    }
+    // An acknowledgement of the old store's ID removes nothing here, and says so.
+    let error = restored.ack_events(acked).await.unwrap_err();
     assert!(
-        after.iter().filter_map(AppEvent::id).all(|id| id > acked),
-        "{after:?} after {acked:?}"
+        matches!(error, AppError::Refused(Refusal::Usage(_))),
+        "{error:?}"
     );
+    assert_eq!(restored.unacknowledged_events().await.unwrap(), after);
 }
 
 #[tokio::test]
@@ -2002,6 +2055,17 @@ async fn test_duty_events_and_owed_calls_carried_across_a_restore_in_place() {
         .unwrap();
     assert_eq!(restored.take_events(), duties);
     assert_eq!(restored.unacknowledged_events().await.unwrap(), duties);
+    // Its next duty events continue the store's epoch and counter.
+    let last = last_id(&duties);
+    let next = refuse_next(&w, &mut restored).await;
+    assert!(!next.is_empty());
+    for id in next.iter().filter_map(AppEvent::id) {
+        assert_eq!(
+            id.cmp_same_store(&last),
+            Some(std::cmp::Ordering::Greater),
+            "{id} after {last}"
+        );
+    }
     restored.receive(None).await.unwrap();
     assert!(
         w.protocol
