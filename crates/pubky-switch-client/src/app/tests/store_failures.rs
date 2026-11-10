@@ -926,6 +926,33 @@ async fn test_restore_of_a_layered_backup_keeps_the_entries_stored_locally() {
 }
 
 #[tokio::test]
+async fn test_restore_of_a_layered_backup_stores_the_next_entry_under_a_new_id() {
+    let w = World::new();
+    let protocol = FlakyProtocol::failing(u32::MAX, StoreError::Corrupt, Mode::Plain);
+    let mut app = join_flaky(&w, &protocol, "wallet").await;
+    let (first, _) = w.note(app.app_id(), FLAKY);
+    app.receive(None).await.unwrap();
+    let first_id = app.stored_id_at(first).unwrap();
+    let backup = layered(&mut app).await;
+    // Restored into an empty store, whose protocol still fails: the next entry stored
+    // takes an ID past the restored one's, so neither replaces the other.
+    let mut restored = App::restore(
+        w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
+        protocol.clone(),
+        flaky_config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    let (second, _) = w.note(restored.app_id(), FLAKY);
+    restored.receive(None).await.unwrap();
+    assert_eq!(restored.stored_id_at(first), Some(first_id));
+    let second_id = restored.stored_id_at(second).unwrap();
+    assert!(second_id > first_id, "{second_id} after {first_id}");
+    assert_eq!(restored.stored_seqs(), vec![first, second]);
+}
+
+#[tokio::test]
 async fn test_restore_of_a_layered_backup_in_place_keeps_what_the_app_owes_its_protocol() {
     let w = World::new();
     let protocol = FlakyProtocol::new(0);
