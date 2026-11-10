@@ -59,15 +59,19 @@ pub enum Alert {
     /// still held the newest version this signer delivered, so the signer wrote its backup
     /// again (Switch wire 3.13).
     BackupMissing,
-    /// The Homeserver published a newer `identity.json` of this install's own than the one the
-    /// switch holds as its mark, as after its records went back. The signer signed its newest
-    /// version again above it, which the switch took and which was then published over it;
-    /// nothing else is needed. (A newer one by another install isn't this
-    /// alert: this install adopts it and stops, as for a newer copy from the switch.)
-    HomeserverAhead {
-        /// The Homeserver's version.
+    /// The switch or the Homeserver holds a newer `identity.json` that this install signed
+    /// itself: its records are behind, as after a restore of an old device backup. Signing
+    /// on top of its older records would roll the identity's state back (its data epoch,
+    /// apps and renewals), so it signs nothing more. The way forward is a restore from the
+    /// signer backup, which is written before every delivery and so holds that newer
+    /// version (Switch wire 3.13). (A newer one by another install isn't this alert: this
+    /// install adopts it and stops.)
+    RecordsBehind {
+        /// Where the newer copy was.
+        source: Source,
+        /// Its version.
         version: u64,
-        /// The newest version a service accepted from this signer.
+        /// The newest version this signer's records hold.
         high_water_version: u64,
     },
 }

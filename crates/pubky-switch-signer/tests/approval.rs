@@ -270,13 +270,14 @@ async fn test_review_refuses_a_grant_that_covers_identity_json() {
 #[tokio::test]
 async fn test_review_refuses_an_app_id_the_newest_version_lists_as_removed() {
     // Wire 3.9 step 4. The revocations PR writes the signer's own tombstones; here the
-    // newest version, adopted from the switch, lists the app in `removed`.
+    // newest version, adopted from the switch, another install's, lists the app in `removed`.
     let world = World::new();
     let (mut signer, _) = world.enrolled().await;
     let app = App::new(&["notes"], None, [9; 32]);
     let newest = signer.identity_doc().unwrap().unwrap();
     let mut body = newest.body().clone();
     body.version += 1;
+    body.signer = [7; 16];
     body.removed.push(pubky_switch_core::records::RemovedApp {
         app_id: app.keys.app_id_bytes(),
         distrust_from: START_MS,
@@ -284,10 +285,7 @@ async fn test_review_refuses_an_app_id_the_newest_version_lists_as_removed() {
     let removing = pubky_switch_core::records::IdentityDoc::sign(&world.key, body).unwrap();
     world.switch.deliver_identity(&removing).unwrap();
     let error = signer.set_record_max_age(Some(86_400)).await.unwrap_err();
-    assert!(
-        matches!(error, SignerError::Refused(Refusal::Superseded { .. })),
-        "{error:?}"
-    );
+    assert_eq!(error, SignerError::NotNamed { install: [7; 16] });
     let error = signer.review(&app.request, &app.auth).unwrap_err();
     assert!(matches!(refusal(error), Refusal::AppRequest(ref why) if why.contains("step 4")),);
 }

@@ -659,34 +659,85 @@ async fn test_signer_publishes_nothing_over_a_newer_homeserver_copy() {
         world.published().unwrap().signed(),
         world.switch.identity_doc().unwrap().signed()
     );
-    // A version 9 of its own there, as after its records went back, is newer than anything
-    // the switch took, so readers keep it: the change is signed again above it, as version
-    // 10, delivered and published in the same call.
+    world.assert_no_version_sent_twice();
+}
+
+#[tokio::test]
+async fn test_signer_a_newer_homeserver_version_of_its_own_stops_signing() {
+    // The Homeserver holds a version 9 this install signed, at data epoch 2, as after its
+    // records went back. Signing above it with the older records would roll the identity's
+    // state back, so the change is refused, and nothing more is signed (Switch spec 4.3).
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let first = signer.identity_doc().unwrap().unwrap();
     let mut body = first.body().clone();
     body.version = 9;
+    body.data_epoch = 2;
     let nine = IdentityDoc::sign(&world.key, body).unwrap();
     world.homeserver.set(
         pubky_switch_core::records::IDENTITY_PATH,
         serde_json::to_vec(nine.signed()).unwrap(),
     );
-    let changed = signer.set_record_max_age(Some(3_600)).await.unwrap();
-    assert_eq!(changed.version(), 10);
-    assert_eq!(changed.body().record_max_age, Some(3_600));
-    assert_eq!(world.published().unwrap().signed(), changed.signed());
+    let behind = SignerError::Refused(Refusal::RecordsBehind { version: 9 });
+    let error = signer.set_record_max_age(Some(3_600)).await.unwrap_err();
+    assert_eq!(error, behind);
+    let alert = Alert::RecordsBehind {
+        source: Source::Homeserver,
+        version: 9,
+        high_water_version: 2,
+    };
+    assert!(signer.alerts().contains(&alert));
+    assert_eq!(signer.status(), SignerStatus::RecordsBehind { version: 9 });
+    // It stays so, cleared alert or not, and the Homeserver keeps version 9.
+    signer.clear_alert(&alert).await.unwrap();
+    assert!(signer.alerts().contains(&alert));
+    let sent = world.sent_docs().len();
+    for seconds in [60, 120] {
+        let error = signer.set_record_max_age(Some(seconds)).await.unwrap_err();
+        assert_eq!(error, behind);
+    }
+    assert_eq!(world.sent_docs().len(), sent);
+    assert!(world.sent_docs().iter().all(|d| d.version() < 9));
+    assert_eq!(world.published().unwrap().signed(), nine.signed());
+}
+
+#[tokio::test]
+async fn test_signer_a_newer_switch_version_of_its_own_isnt_adopted() {
+    // The switch holds a version 2 this install signed, listing an app and a renewal its
+    // records don't hold. It isn't adopted, nor built on: this install's records are behind
+    // (Switch spec 4.3).
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let first = signer.identity_doc().unwrap().unwrap();
+    let mut body = first.body().clone();
+    body.version = 2;
+    body.apps.push(pubky_switch_core::records::ListedApp {
+        app_id: [3; 16],
+        cert: [4; 32],
+    });
+    body.renewed.push(pubky_switch_core::records::RenewedCert {
+        app_id: [3; 16],
+        cert: [5; 32],
+        until: None,
+    });
+    let two = IdentityDoc::sign(&world.key, body).unwrap();
+    world.switch.deliver_identity(&two).unwrap();
+    let error = signer.set_record_max_age(Some(3_600)).await.unwrap_err();
     assert_eq!(
-        world.switch.identity_doc().unwrap().signed(),
-        changed.signed()
+        error,
+        SignerError::Refused(Refusal::RecordsBehind { version: 2 })
     );
-    assert!(
-        signer
-            .alerts()
-            .iter()
-            .any(|a| matches!(a, Alert::HomeserverAhead { version: 9, .. }))
+    assert_eq!(
+        signer.identity_doc().unwrap().unwrap().signed(),
+        first.signed()
     );
-    let next = signer.set_record_max_age(Some(60)).await.unwrap();
-    assert_eq!(next.version(), 11);
-    assert_eq!(world.published().unwrap().signed(), next.signed());
-    world.assert_no_version_sent_twice();
+    assert!(signer.alerts().contains(&Alert::RecordsBehind {
+        source: Source::Switch,
+        version: 2,
+        high_water_version: 1,
+    }));
+    assert_eq!(world.switch.identity_doc().unwrap().signed(), two.signed());
+    assert!(world.sent_docs().iter().all(|d| d.version() <= 2));
 }
 
 #[tokio::test]

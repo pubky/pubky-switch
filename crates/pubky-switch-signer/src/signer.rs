@@ -115,6 +115,13 @@ pub enum SignerStatus {
         /// That install's signer ID.
         install: [u8; 16],
     },
+    /// The switch or the Homeserver holds a newer version this install signed itself: its
+    /// records are behind, and it signs nothing until they are restored from the signer
+    /// backup ([`Alert::RecordsBehind`]).
+    RecordsBehind {
+        /// That version.
+        version: u64,
+    },
 }
 
 /// The signer of one identity, on one install.
@@ -214,23 +221,10 @@ impl Signer {
     ///
     /// The error of the step that failed: a switch, Homeserver, store or key error;
     /// [`SignerError::NotNamed`] when another install took over; [`SignerError::Alarm`] for a
-    /// rollback or an equivocation; [`Refusal::Superseded`] when the switch holds a newer
-    /// version that this install adopted instead of its own.
+    /// rollback or an equivocation; [`Refusal::RecordsBehind`] when the switch or the
+    /// Homeserver holds a newer version this install signed itself.
     pub async fn resume(&mut self) -> Result<()> {
         self.refresh().await?;
-        loop {
-            self.finish_flow().await?;
-            self.publish().await?;
-            // A publication that found this install's own newer copy signed the newest change
-            // again above it: that version goes out too.
-            if self.flow.is_none() {
-                return Ok(());
-            }
-        }
-    }
-
-    /// Run the flow in progress to its end.
-    async fn finish_flow(&mut self) -> Result<()> {
         while let Some(flow) = self.flow.clone() {
             match flow {
                 Flow::Enroll {
@@ -252,7 +246,7 @@ impl Signer {
                 } => self.deliver(doc, prev).await?,
             }
         }
-        Ok(())
+        self.publish().await
     }
 
     /// The identity.
@@ -269,6 +263,9 @@ impl Signer {
     pub fn status(&self) -> SignerStatus {
         match (self.state.managed_by, &self.state.newest) {
             (Some(install), _) => SignerStatus::ManagedBy { install },
+            (None, _) if self.state.records_behind.is_some() => SignerStatus::RecordsBehind {
+                version: self.state.records_behind.unwrap_or_default(),
+            },
             (None, None) => SignerStatus::Enrolling,
             (None, Some(_)) => SignerStatus::Signing,
         }
@@ -317,6 +314,10 @@ impl Signer {
         if !self.state.alerts.contains(alert) {
             return Ok(());
         }
+        // Records that are behind stay so until a restore, and so does their alert.
+        if matches!(alert, Alert::RecordsBehind { .. }) && self.state.records_behind.is_some() {
+            return Ok(());
+        }
         let mut state = self.state.clone();
         state.alerts.retain(|held| held != alert);
         let alarm = matches!(alert, Alert::Rollback { .. } | Alert::Equivocation { .. });
@@ -360,12 +361,10 @@ impl Signer {
             .await
     }
 
-    /// Sign the next version, built from the newest with `change`, and deliver and publish it.
-    /// Its version is above every version this install committed a signed document at, so a
+    /// Sign the next version, built from the newest with `change`, and deliver it. Its
+    /// version is above every version this install committed a signed document at, so a
     /// version whose document went out in a flow that was dropped is never signed again
-    /// (Switch spec 4.3, 13.2). Returns the version readers see carrying the change: when the
-    /// Homeserver held a newer version of this install's own, the change signed again above
-    /// it.
+    /// (Switch spec 4.3, 13.2).
     async fn new_version(&mut self, change: impl FnOnce(&mut IdentityBody)) -> Result<IdentityDoc> {
         self.ready().await?;
         let key = self.keyring.unlock()?;
@@ -375,7 +374,7 @@ impl Signer {
         state.signed_through = doc.version();
         self.commit(state, Some(flow)).await?;
         self.resume().await?;
-        Ok(self.state.newest_doc()?.unwrap_or(doc))
+        Ok(doc)
     }
 
     /// Ready for a new signing call: the store read again if a commit left it unsure, this
@@ -417,11 +416,15 @@ impl Signer {
     }
 
     /// Refuse every signing call while another install is the signer (Switch spec 4.3).
+    /// Nor while its records are behind its own newer version.
     fn check_named(&self) -> Result<()> {
-        match self.state.managed_by {
-            Some(install) => Err(SignerError::NotNamed { install }),
-            None => Ok(()),
+        if let Some(install) = self.state.managed_by {
+            return Err(SignerError::NotNamed { install });
         }
+        if let Some(version) = self.state.records_behind {
+            return Err(Refusal::RecordsBehind { version }.into());
+        }
+        Ok(())
     }
 
     /// Commit `state` and `flow`, and only then take them as the signer's own, so the signer
@@ -638,7 +641,7 @@ impl Signer {
         match self.judge_copy(copy.as_ref()) {
             Ok(Verdict::AtMark) => Ok(()),
             Ok(Verdict::Newer) => match copy {
-                Some(copy) => self.adopt(copy).await,
+                Some(copy) => self.adopt(copy, Source::Switch).await,
                 None => Ok(()),
             },
             Err(alert) => self.alarm(alert).await,
@@ -737,7 +740,7 @@ impl Signer {
         match self.judge_copy(copy.as_ref()) {
             Err(alert) => self.alarm(alert).await,
             Ok(Verdict::Newer) => match copy {
-                Some(copy) => self.adopt(copy).await,
+                Some(copy) => self.adopt(copy, Source::Switch).await,
                 None => {
                     self.commit(self.state.clone(), None).await?;
                     Err(stale_without_copy())
@@ -786,26 +789,36 @@ impl Signer {
         Ok(Verdict::Newer)
     }
 
-    /// Adopt a strictly newer copy, another signer's (Switch spec 4.3), ending the flow. It
-    /// isn't this install's to publish.
-    async fn adopt(&mut self, copy: IdentityDoc) -> Result<()> {
+    /// Take a strictly newer copy from `source`, ending the flow (Switch spec 4.3). Another
+    /// signer's is adopted, and it isn't this install's to publish. This install's own means
+    /// its records are behind: nothing it holds accounts for that version, so it is neither
+    /// adopted nor signed over, and this install stops until a restore from the signer
+    /// backup.
+    async fn adopt(&mut self, copy: IdentityDoc, source: Source) -> Result<()> {
         let version = copy.version();
         let signer = copy.body().signer;
         let mut state = self.state.clone();
+        if signer == state.install {
+            state.records_behind = Some(version);
+            state.signed_through = state.signed_through.max(version);
+            state.alert(Alert::RecordsBehind {
+                source,
+                version,
+                high_water_version: self.high_water().map_or(0, |h| h.version),
+            });
+            self.commit(state, None).await?;
+            return Err(Refusal::RecordsBehind { version }.into());
+        }
         state.newest = Some(Newest {
             doc: copy.signed().clone(),
             prev: None,
             published: true,
         });
         state.signed_through = state.signed_through.max(version);
-        if signer != state.install {
-            state.managed_by = Some(signer);
-            state.alert(Alert::ManagedByOtherInstall { install: signer });
-            self.commit(state, None).await?;
-            return Err(SignerError::NotNamed { install: signer });
-        }
+        state.managed_by = Some(signer);
+        state.alert(Alert::ManagedByOtherInstall { install: signer });
         self.commit(state, None).await?;
-        Err(Refusal::Superseded { version }.into())
+        Err(SignerError::NotNamed { install: signer })
     }
 
     /// Another install is the signer: this one stops signing (Switch spec 4.3, 12.8).
@@ -857,27 +870,9 @@ impl Signer {
         }) {
             // A newer version, verified for the identity, is handled as a newer copy from the
             // switch is (Switch spec 4.3): a higher version at no lower generation. Another
-            // install's is adopted, and this install stops. This install's own, which the
-            // switch doesn't hold, as after its records went back, isn't published over:
-            // readers would keep the higher version. The newest version is signed again above
-            // it, the same body, and that one is delivered and published, so the change it
-            // carries is seen.
-            if copy.body().signer != self.state.install {
-                return self.adopt(copy).await;
-            }
-            let mut state = self.state.clone();
-            state.alert(Alert::HomeserverAhead {
-                version: copy.version(),
-                high_water_version: mine.version(),
-            });
-            state.signed_through = state.signed_through.max(copy.version());
-            self.commit(state, None).await?;
-            let key = self.keyring.unlock()?;
-            let (again, flow) = self.next_version(&key, |_| {})?;
-            drop(key);
-            let mut state = self.state.clone();
-            state.signed_through = again.version();
-            return self.commit(state, Some(flow)).await;
+            // install's is adopted, and this install stops; this install's own means its
+            // records are behind.
+            return self.adopt(copy, Source::Homeserver).await;
         }
         if !already {
             let bytes =
