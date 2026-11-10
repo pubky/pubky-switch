@@ -2793,7 +2793,7 @@ fn rebuilt_view(
 }
 
 #[test]
-fn test_activation_rebuilt_claim_replays_its_entries() {
+fn test_activation_rebuilt_claim_checks_each_attempt() {
     // The honest export imports: the uploaded attempt failed by an entry, the second
     // attempt opened by one.
     let (f, _) = recovered(&rebuilt_entries(), rebuilt_claim(), &[], &[4, 5]);
@@ -2801,56 +2801,98 @@ fn test_activation_rebuilt_claim_replays_its_entries() {
     assert_eq!(import.claims.len(), 1);
     assert!(import.claims[0].claim.rebuilt);
     assert_eq!(import.proof_generations, [2]);
-    // Anything not from an upload comes from an entry: the second attempt failed without
-    // one, or its current cleared, is refused.
-    for change in [
-        (|c: &mut ClaimState| {
-            c.attempts[1].outcome = Outcome::Failed;
-            c.attempts[1].resolved_by = Some(app().app_id_bytes());
-            c.current = None;
-        }) as fn(&mut ClaimState),
-        |c| c.current = None,
-        |c| c.attempts[0].outcome = Outcome::Open,
-        |c| c.settled = true,
-        |c| c.attempts[1].possibly_duplicate = true,
-        |c| c.attempts[1].deadline_ms = None,
-    ] {
+    let refused_with = |change: fn(&mut ClaimState), rule: &str| {
         let mut claim = rebuilt_claim();
         change(&mut claim);
         let (f, _) = recovered(&rebuilt_entries(), claim, &[], &[4, 5]);
-        refused(
-            f.run(),
-            ErrorCode::Conflict,
-            "its state isn't the state its entries give",
-        );
-    }
-    // Its step may be past its last entry, never behind it; its creator is its first
-    // attempt's owner.
-    let mut claim = rebuilt_claim();
-    claim.step = 5;
-    recovered(&rebuilt_entries(), claim, &[], &[4, 5])
-        .0
-        .run()
-        .unwrap();
-    let mut claim = rebuilt_claim();
-    claim.step = 2;
-    let (f, _) = recovered(&rebuilt_entries(), claim, &[], &[4, 5]);
-    refused(
-        f.run(),
-        ErrorCode::Conflict,
-        "its step isn't after its last entry",
+        refused(f.run(), ErrorCode::Conflict, rule);
+    };
+    // The members an attempt entry gives, and the outcome its latest entry gives.
+    refused_with(
+        |c| c.attempts[1].deadline_ms = None,
+        "an attempt isn't the one its attempt entry wrote",
     );
-    let mut claim = rebuilt_claim();
-    claim.creator = Some(other_app().app_id_bytes());
-    let (f, _) = recovered(&rebuilt_entries(), claim, &[], &[4, 5]);
-    refused(f.run(), ErrorCode::Conflict, "its creator");
-    // An entry that opens an attempt an upload added doesn't apply.
+    refused_with(
+        |c| c.attempts[1].owner = other_app().app_id_bytes(),
+        "an attempt isn't the one its attempt entry wrote",
+    );
+    refused_with(
+        |c| c.attempts[1].opened_at_ms += 1,
+        "an attempt isn't the one its attempt entry wrote",
+    );
+    refused_with(
+        |c| c.attempts[0].outcome = Outcome::Open,
+        "an attempt's outcome isn't the one its latest entry gives",
+    );
+    refused_with(
+        |c| c.attempts[0].resolved_by = Some(other_app().app_id_bytes()),
+        "an attempt's outcome isn't the one its latest entry gives",
+    );
+    // An attempt neither uploaded nor written by an entry, or both.
+    refused_with(
+        |c| {
+            c.attempts
+                .push(attempt_state([42; 16], Outcome::Failed, START, false));
+        },
+        "an attempt neither marked from_upload nor written by an attempt entry",
+    );
+    refused_with(
+        |c| c.attempts[1].from_upload = true,
+        "an attempt isn't the one its attempt entry wrote, marked from_upload",
+    );
     let entries = vec![
         claim_fields(ClaimType::Failed, 1, UPLOADED),
         claim_fields(ClaimType::Attempt, 2, UPLOADED),
     ];
     let (f, _) = recovered(&entries, rebuilt_claim(), &[], &[4, 5]);
-    refused(f.run(), ErrorCode::Conflict, "an entry doesn't apply");
+    refused(f.run(), ErrorCode::Conflict, "marked from_upload");
+    // An entry naming an attempt the claim doesn't hold.
+    refused_with(
+        |c| {
+            c.attempts.remove(0);
+        },
+        "an entry names an attempt the claim doesn't hold",
+    );
+    // The bounds that hold whatever the uploads' order.
+    refused_with(
+        |c| c.settled = true,
+        "SETTLED isn't the same as an attempt being done",
+    );
+    refused_with(
+        |c| c.current = Some(UPLOADED),
+        "its current attempt isn't an open attempt it holds",
+    );
+    // What only uploads change is taken as written.
+    for change in [
+        (|c: &mut ClaimState| c.current = None) as fn(&mut ClaimState),
+        |c| c.attempts[1].possibly_duplicate = true,
+        |c| c.divergent = true,
+        |c| c.last_entry_ms = Some(START),
+        |c| c.step = 5,
+    ] {
+        let mut claim = rebuilt_claim();
+        change(&mut claim);
+        recovered(&rebuilt_entries(), claim, &[], &[4, 5])
+            .0
+            .run()
+            .unwrap();
+    }
+    // An uploaded `done` settles an uploaded attempt whatever its outcome, after an entry
+    // too; it settles the claim.
+    let mut claim = rebuilt_claim();
+    claim.attempts[0].outcome = Outcome::Done;
+    claim.attempts[0].resolved_by = Some(other_app().app_id_bytes());
+    claim.settled = true;
+    recovered(&rebuilt_entries(), claim, &[], &[4, 5])
+        .0
+        .run()
+        .unwrap();
+    // Its step is after its last entry; its creator is its first attempt's owner.
+    refused_with(|c| c.step = 2, "its step isn't after its last entry");
+    refused_with(
+        |c| c.creator = Some(other_app().app_id_bytes()),
+        "its creator",
+    );
     // Two open attempts are divergent: uploads open a second one only beside an open one.
     let mut claim = rebuilt_claim();
     claim.step = 1;
@@ -2867,6 +2909,72 @@ fn test_activation_rebuilt_claim_replays_its_entries() {
     );
     claim.divergent = true;
     recovered(&[], claim, &[], &[]).0.run().unwrap();
+}
+
+#[test]
+fn test_activation_rebuilt_claim_takes_a_late_upload_between_entries() {
+    // The app opens SECOND at N (seq 4, step 0). An app that was offline uploads its open
+    // attempt from the lost generation afterwards, which N records beside the open one,
+    // the claim divergent, counting a step. The app then fails SECOND (seq 5, step 2).
+    let entries = vec![
+        claim_fields(ClaimType::Attempt, 0, SECOND),
+        claim_fields(ClaimType::Failed, 2, SECOND),
+    ];
+    let mut second = attempt_state(SECOND, Outcome::Failed, entry_time(4), false);
+    second.resolved_by = Some(app().app_id_bytes());
+    let claim = ClaimState {
+        step: 3,
+        attempts: vec![
+            second,
+            attempt_state(UPLOADED, Outcome::Open, START - DAY, true),
+        ],
+        current: None,
+        settled: false,
+        divergent: true,
+        pinned_deadline: Pin::At(DEADLINE),
+        rebuilt: true,
+        creator: Some(app().app_id_bytes()),
+        last_entry_ms: Some(entry_time(5)),
+    };
+    let (f, _) = recovered(&entries, claim, &[], &[4, 5]);
+    let import = f.run().unwrap();
+    assert_eq!(import.claims[0].claim.attempts.len(), 2);
+}
+
+#[test]
+fn test_activation_rebuilt_claim_pins_what_entries_wrote() {
+    // O flips the outcome of the attempt the app opened at N, which no entry resolved:
+    // failed or unknown frees the claim, done settles it; each is refused.
+    for (outcome, by) in [
+        (Outcome::Failed, app().app_id_bytes()),
+        (Outcome::Unknown, other_app().app_id_bytes()),
+        (Outcome::Done, other_app().app_id_bytes()),
+    ] {
+        let mut claim = rebuilt_claim();
+        claim.attempts[1].outcome = outcome;
+        claim.attempts[1].resolved_by = Some(by);
+        claim.current = None;
+        claim.settled = outcome == Outcome::Done;
+        let (f, _) = recovered(&rebuilt_entries(), claim, &[], &[4, 5]);
+        refused(
+            f.run(),
+            ErrorCode::Conflict,
+            "an attempt's outcome isn't the one its latest entry gives",
+        );
+    }
+    // Or marks it as an upload's to take it as written, its entry left out: the chain
+    // holds the entry, so that is refused too.
+    let mut claim = rebuilt_claim();
+    claim.attempts[1].from_upload = true;
+    claim.attempts[1].outcome = Outcome::Failed;
+    claim.attempts[1].resolved_by = Some(app().app_id_bytes());
+    claim.current = None;
+    let (f, _) = recovered(&rebuilt_entries(), claim, &[], &[4]);
+    refused(
+        f.run(),
+        ErrorCode::Conflict,
+        "isn't one of its claim's entries",
+    );
 }
 
 #[test]
@@ -2980,6 +3088,44 @@ fn test_activation_rebuilt_claim_evidence_compares_attempt_state() {
     let (mut f, _) = recovered(&entries, claim, &[], &[4, 5, 6]);
     f.uploads.proofs = vec![UploadedProof {
         app_id: app().app_id_bytes(),
+        proof: proof.clone(),
+    }];
+    f.run().unwrap();
+    // A late upload's `done` settles an uploaded attempt whatever its outcome: the app's
+    // proof shows UPLOADED open, and the import holds it done, which no entry wrote.
+    let mut uploaded_open = rebuilt_claim();
+    uploaded_open.attempts[0] = attempt_state(UPLOADED, Outcome::Open, START - DAY, true);
+    let shown = rebuilt_view(3, &uploaded_open.attempts, Some(1));
+    let open_proof = TransitionProof::sign(
+        &old_key(),
+        &f.id,
+        ProofBody::new(
+            stubs[4].clone(),
+            b64(&CLAIM_KEY),
+            &ProofState::Claim(shown.to_value()),
+        ),
+    )
+    .unwrap();
+    let mut settled = rebuilt_claim();
+    settled.attempts[0].outcome = Outcome::Done;
+    settled.attempts[0].resolved_by = Some(other_app().app_id_bytes());
+    settled.settled = true;
+    let (mut f, _) = recovered(&rebuilt_entries(), settled, &[], &[4, 5]);
+    f.uploads.proofs = vec![UploadedProof {
+        app_id: app().app_id_bytes(),
+        proof: open_proof.clone(),
+    }];
+    f.run().unwrap();
+    // Another app's proof shows the app's attempts, which it doesn't vouch for: only an
+    // attempt's own owner's evidence pins its outcome.
+    let mut claim = rebuilt_claim();
+    claim.attempts[1].from_upload = true;
+    claim.attempts[1].outcome = Outcome::Failed;
+    claim.attempts[1].resolved_by = Some(app().app_id_bytes());
+    claim.current = None;
+    let (mut f, _) = recovered(&rebuilt_entries(), claim, &[5], &[4]);
+    f.uploads.proofs = vec![UploadedProof {
+        app_id: other_app().app_id_bytes(),
         proof,
     }];
     f.run().unwrap();

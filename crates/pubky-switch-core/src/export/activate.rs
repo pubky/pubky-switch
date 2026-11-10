@@ -26,7 +26,7 @@ use crate::chain::{
 };
 use crate::claims::{
     Attempt, Claim, ClaimEntry, ClaimLimits, ClaimStatus, ClaimTally, ClaimType, ClaimView,
-    EntryContext, MAX_CLAIM_AGE_MS, Outcome, Pin, RECONCILIATION_MS, apply_entry,
+    EntryContext, EntryKind, MAX_CLAIM_AGE_MS, Outcome, Pin, RECONCILIATION_MS, apply_entry,
 };
 use crate::enc::{b64, unb64_array, zbase32_encode};
 use crate::http::ErrorCode;
@@ -119,8 +119,9 @@ impl ImportedApp {
 pub struct ImportedClaim {
     /// The claim key.
     pub claim_key: [u8; 32],
-    /// The claim: a live claim replayed from its entries, from nothing or, for one rebuilt
-    /// from uploads, from the attempts the uploads added; a tombstone as its part gives it.
+    /// The claim: a live claim replayed from its entries, or, rebuilt from uploads, as its
+    /// part gives it once each attempt is checked against its entries; a tombstone as its
+    /// part gives it.
     pub claim: Claim,
     /// A live claim's entries with their proofs; none for a tombstone.
     pub entries: Vec<ClaimEntryPart>,
@@ -1274,9 +1275,8 @@ type CheckedEntries = Vec<(ClaimEntry, [u8; 16], TransitionProof)>;
 /// The live claims and tombstones (Switch wire 10.5). Every live claim is replayed from its
 /// entries, each checked ([`ClaimCheck::entry`]) and applied in order by the rows of Switch
 /// wire 6.8 at the time its proof's stub carries: from nothing, the state after each being
-/// the state its proof shows ([`replay_live`]); or, for a claim rebuilt from uploads after a
-/// provider loss, from the attempts the uploads added ([`replay_rebuilt`]). The claim is then
-/// the state its entries lead to, member for member.
+/// the state its proof shows ([`replay_live`]); a claim rebuilt from uploads after a
+/// provider loss is checked attempt by attempt instead ([`check_rebuilt`]).
 fn check_claims(
     g: &Gathered<'_>,
     cx: &ClaimCheck<'_>,
@@ -1307,7 +1307,7 @@ fn check_claims(
             return Err(fail("its creator isn't the owner of its first attempt"));
         }
         let claim = if state.rebuilt {
-            replay_rebuilt(state, &checked)?
+            check_rebuilt(state, &checked)?
         } else {
             replay_live(&key, state, &checked)?
         };
@@ -1416,105 +1416,116 @@ fn replay_live(
     Ok(claim)
 }
 
-/// A claim rebuilt from uploads after a provider loss (Switch wire 10.5, Switch spec 12.6).
-/// The uploads change it without entries, and the export carries no uploads, so the only
-/// state taken unchecked is the attempts the part marks `from_upload`. The replay starts from
-/// them alone: each as written, except that one an entry names is open and unresolved, its
-/// outcome then coming from the entries; the part's `current` if it is one of the others;
-/// SETTLED if one is `done`; the part's pin, which the uploaded attempts carry, and its
-/// `divergent`, which only uploads set. Each entry then applies in turn, its `expected_step`
-/// raising the step first, since uploads count steps too, and the claim is the state the
-/// entries lead to, member for member: every attempt not marked `from_upload` comes from an
-/// entry. Its `step` may be past its last entry, and its `last_entry_ms` is taken as written,
-/// since uploads after the last entry change both; and two open attempts keep it divergent,
-/// since only an upload beside an open attempt opens a second one and only resolving them
-/// clears it. The proofs of a rebuilt claim's entries show the uploads merged between them,
-/// so they aren't compared with the replay; each is still checked as the entry's.
-fn replay_rebuilt(
+/// A claim rebuilt from uploads after a provider loss (Switch wire 10.5, Switch spec 12.6),
+/// checked attempt by attempt, so that where uploads fell between its entries doesn't
+/// matter. The export carries no uploads, which merge per attempt and only add attempts or
+/// settle; so every attempt the part holds is either marked `from_upload`, or the one an
+/// `attempt` entry of the claim wrote, with the members that entry gives, never both; and
+/// each attempt's outcome is the one the latest entry naming it gives (`open` for its
+/// `attempt` entry), or, for an attempt marked `from_upload`, `done`, since an uploaded
+/// `done` settles an attempt whatever its outcome. An uploaded attempt no entry names keeps
+/// its outcome as written, which the uploaded evidence checks. What only uploads change is
+/// taken as written (`divergent`, `last_entry_ms`, the pin, `possibly_duplicate`,
+/// `duplicate`, and the entries' proof states), within the bounds that hold whatever the
+/// order of the uploads: SETTLED exactly when an attempt is `done`, `current` an open attempt
+/// the claim holds, and two open attempts divergent.
+fn check_rebuilt(
     state: &ClaimState,
     checked: &CheckedEntries,
 ) -> std::result::Result<Claim, Refusal> {
     let fail = |why: &str| claim_conflict(why);
-    let nobody = |_: &[u8; 16]| false;
-    let named: HashSet<[u8; 16]> = checked.iter().map(|(e, _, _)| e.attempt_id).collect();
-    let attempts: Vec<Attempt> = state
-        .attempts
-        .iter()
-        .filter(|a| a.from_upload)
-        .map(|a| {
-            let mut base = to_attempt(a);
-            if named.contains(&a.attempt_id) {
-                base.outcome = Outcome::Open;
-                base.resolved_by = None;
-                base.duplicate = false;
-            }
-            base
-        })
-        .collect();
-    let current = state.current.and_then(|id| {
-        attempts
-            .iter()
-            .position(|a| a.attempt_id == id && !named.contains(&id))
-    });
-    let mut claim = Claim {
-        step: checked
-            .first()
-            .map_or(state.step, |(e, _, _)| e.expected_step),
-        settled: attempts.iter().any(|a| a.outcome == Outcome::Done),
-        current,
-        pin: if attempts.is_empty() {
-            Pin::Unpinned
-        } else {
-            state.pinned_deadline
-        },
-        creator: attempts.first().map(|a| a.owner),
-        attempts,
-        tombstone: false,
-        divergent: state.divergent,
-        rebuilt: true,
-        last_entry: None,
-    };
-    for (entry, writer, proof) in checked {
-        claim.step = claim.step.max(entry.expected_step);
-        let rc = replay_context(*writer, proof.envelope().server_time, &nobody);
-        claim = apply_entry(Some(&claim), entry, &rc)
-            .map_err(|e| fail(&format!("an entry doesn't apply: {}", e.reason)))?;
-    }
-    if state.step < claim.step {
+    if let Some((last, _, _)) = checked.last()
+        && state.step <= last.expected_step
+    {
         return Err(fail("its step isn't after its last entry"));
     }
-    claim.step = state.step;
-    claim.last_entry = state.last_entry_ms;
-    claim.divergent = state.divergent;
-    claim.creator = state.creator;
-    let open = claim
+    // Each attempt an `attempt` entry wrote, with its writer and time; and the outcome the
+    // latest entry naming each attempt gives, with its writer.
+    let mut opened: HashMap<[u8; 16], (&ClaimEntry, [u8; 16], u64)> = HashMap::new();
+    let mut latest: HashMap<[u8; 16], (Outcome, Option<[u8; 16]>)> = HashMap::new();
+    for (entry, writer, proof) in checked {
+        let id = entry.attempt_id;
+        let outcome = match entry.kind {
+            EntryKind::Attempt { .. } => {
+                if opened
+                    .insert(id, (entry, *writer, proof.envelope().server_time))
+                    .is_some()
+                {
+                    return Err(fail("two attempt entries for one attempt"));
+                }
+                (Outcome::Open, None)
+            }
+            EntryKind::Done { .. } => (Outcome::Done, Some(*writer)),
+            EntryKind::Failed => (Outcome::Failed, Some(*writer)),
+            EntryKind::Unknown => (Outcome::Unknown, Some(*writer)),
+        };
+        latest.insert(id, outcome);
+    }
+    if latest
+        .keys()
+        .any(|id| !state.attempts.iter().any(|a| &a.attempt_id == id))
+    {
+        return Err(fail("an entry names an attempt the claim doesn't hold"));
+    }
+    for a in &state.attempts {
+        match opened.get(&a.attempt_id) {
+            Some((entry, writer, at)) => {
+                let EntryKind::Attempt {
+                    orphan_after,
+                    deadline,
+                } = entry.kind
+                else {
+                    return Err(fail("its state isn't the state its entries give"));
+                };
+                if a.from_upload
+                    || a.owner != *writer
+                    || a.opened_at_ms != *at
+                    || a.orphan_after_s != orphan_after
+                    || a.deadline_ms != deadline
+                {
+                    return Err(fail(
+                        "an attempt isn't the one its attempt entry wrote, marked from_upload or with other members",
+                    ));
+                }
+            }
+            None if !a.from_upload => {
+                return Err(fail(
+                    "an attempt neither marked from_upload nor written by an attempt entry",
+                ));
+            }
+            None => {}
+        }
+        if let Some((outcome, by)) = latest.get(&a.attempt_id) {
+            let as_entries = a.outcome == *outcome && a.resolved_by == *by;
+            let settled_by_upload = a.from_upload && a.outcome == Outcome::Done;
+            if !as_entries && !settled_by_upload {
+                return Err(fail(
+                    "an attempt's outcome isn't the one its latest entry gives",
+                ));
+            }
+        }
+    }
+    let done = state.attempts.iter().any(|a| a.outcome == Outcome::Done);
+    if state.settled != done {
+        return Err(fail("SETTLED isn't the same as an attempt being done"));
+    }
+    if let Some(id) = state.current
+        && !state
+            .attempts
+            .iter()
+            .any(|a| a.attempt_id == id && a.outcome == Outcome::Open)
+    {
+        return Err(fail("its current attempt isn't an open attempt it holds"));
+    }
+    let open = state
         .attempts
         .iter()
         .filter(|a| a.outcome == Outcome::Open)
         .count();
-    if open > 1 && !claim.divergent {
+    if open > 1 && !state.divergent {
         return Err(fail("two open attempts, but not divergent"));
     }
-    // Uploads may have added an attempt before an entry that the replay places after it:
-    // the attempts compare by ID, in the part's order.
-    let current_id = claim
-        .current
-        .and_then(|i| claim.attempts.get(i))
-        .map(|a| a.attempt_id);
-    let mut ordered = Vec::with_capacity(claim.attempts.len());
-    for a in &state.attempts {
-        match claim.attempts.iter().find(|r| r.attempt_id == a.attempt_id) {
-            Some(r) => ordered.push(r.clone()),
-            None => return Err(fail("its state isn't the state its entries give")),
-        }
-    }
-    if ordered.len() != claim.attempts.len() {
-        return Err(fail("its state isn't the state its entries give"));
-    }
-    claim.current = current_id.and_then(|id| ordered.iter().position(|a| a.attempt_id == id));
-    claim.attempts = ordered;
-    same_state(state, &claim)?;
-    Ok(claim)
+    claim_of(state)
 }
 
 /// The part's claim is the replayed one, member for member, those no claim view shows
@@ -1534,8 +1545,9 @@ fn same_state(state: &ClaimState, claim: &Claim) -> std::result::Result<(), Refu
 /// operations signed: a claim a proof shows SETTLED is SETTLED here, live or as a tombstone,
 /// unless the old service may have deleted it by `last_time`; a claim a proof shows with an
 /// attempt is held with that attempt, at that step or later; a live claim holds each attempt
-/// a proof shows with the outcome it shows, unless one of the claim's verified entries after
-/// that proof wrote another ([`resolved_after`]); a record a proof shows at a version is that
+/// a proof shows of the app that uploaded it with the outcome it shows, unless one of the
+/// claim's verified entries after that proof wrote another ([`resolved_after`]), or, for an
+/// uploaded attempt of a rebuilt claim, an upload settled it `done`; a record a proof shows at a version is that
 /// very write, or one whose signed `expected_version` is that version or later, or absent
 /// when that version deletes.
 fn check_evidence(
@@ -1593,14 +1605,17 @@ fn check_evidence(
                 _ => {}
             }
             // An attempt's state, not only its presence: a rebuilt claim takes its uploaded
-            // attempts as written, so an outcome the evidence contradicts must come from an
-            // entry. A tombstone keeps no entries; it is SETTLED, so it frees nothing.
+            // attempts as written, so an outcome the evidence of the attempt's own owner
+            // contradicts must come from an entry, or be an upload's `done`, which settles an
+            // uploaded attempt whatever its outcome. A tombstone keeps no entries; it is
+            // SETTLED, so it frees nothing.
             if let Some(c) = live.filter(|c| c.claim.step >= view.step) {
-                for shown in &view.attempts {
-                    let changed =
-                        c.claim.attempts.iter().any(|a| {
-                            a.attempt_id == shown.attempt_id && a.outcome != shown.outcome
-                        });
+                for shown in view.attempts.iter().filter(|a| a.owner == uploaded.app_id) {
+                    let changed = c.claim.attempts.iter().any(|a| {
+                        a.attempt_id == shown.attempt_id
+                            && a.outcome != shown.outcome
+                            && !(c.claim.rebuilt && a.from_upload && a.outcome == Outcome::Done)
+                    });
                     if changed && !resolved_after(c, &shown.attempt_id, view.step) {
                         return fail(
                             "an attempt with another outcome than the import's, which no entry after it wrote",
