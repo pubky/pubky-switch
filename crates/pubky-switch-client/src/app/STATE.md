@@ -27,6 +27,11 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
 - **Any commit carries everything read before it.** A page's writes go in the next commit
   point, so no commit records a cursor past items whose writes it lacks.
 - **After a failed commit the app reloads** from the store before its next call.
+- **A refusal of a batch sent again tells only from the batch ID lookup on** (Switch wire
+  6.4 step 5): one refused before it, such as `403 cert_expired` or `401 bad_signature`,
+  may have been applied, so a kept effect or batch stays as it is, to go again unchanged,
+  until a resend answers, or it outlives the window and is parked or dropped as uncertain.
+  The codes are classified in one place (`refused_after_lookup`).
 - **A duty event goes in the commit of what it reports** (`duty/<id>`), and is reported
   only once that commit is done: a failed commit reports nothing, and a crash after it
   loses nothing, since every load reports the kept duty events again. A commit that

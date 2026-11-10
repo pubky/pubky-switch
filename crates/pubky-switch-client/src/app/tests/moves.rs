@@ -2589,6 +2589,169 @@ async fn test_key_change_parks_a_kept_effect_older_than_the_batch_window() {
     assert!(loaded.iter().all(AppEvent::is_duty), "{loaded:?}");
 }
 
+#[tokio::test]
+async fn test_kept_effect_resend_refused_before_the_lookup_stays_kept() {
+    for code in [ErrorCode::CertExpired, ErrorCode::BadSignature] {
+        let w = World::new();
+        let router = Router::of(&w);
+        let mut app = join(&w, &router).await;
+        let me = app.app_id();
+        let (seq, _) = w.note(me, "before");
+        // Applied, its answer lost.
+        w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+        assert!(app.receive(None).await.is_err());
+        assert_eq!(w.effects(), 1);
+        // Sent again, refused before the service looks at its batch ID: that tells
+        // nothing, so the effect stays kept (Switch wire 6.4 steps 1 to 5).
+        w.switch.fail_next(Fault::Error {
+            path: "ops".into(),
+            code,
+            current: json!(null),
+        });
+        let built = w.protocol.received.lock().unwrap().len();
+        assert!(app.receive(None).await.is_err(), "{code:?}");
+        assert!(app.state.pending_effect.is_some(), "{code:?}");
+        assert_eq!(w.protocol.received.lock().unwrap().len(), built, "{code:?}");
+        // The cause gone, the same bytes show it applied: once in all.
+        let report = app.receive(None).await.unwrap();
+        assert!(
+            received(&report.events, seq),
+            "{code:?}: {:?}",
+            report.events
+        );
+        assert_eq!(w.effects(), 1, "{code:?}");
+        assert!(app.state.pending_effect.is_none());
+    }
+}
+
+/// A key change followed to its end, with an effect applied at generation 1, its answer
+/// lost, still kept: its resend at generation 2 couldn't connect. `None` when the
+/// unreachable send at `after` doesn't leave that state.
+async fn key_change_with_a_kept_effect(
+    after: usize,
+) -> Option<(World, App, Arc<ScriptedSwitch>, u64)> {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join(&w, &router).await;
+    let me = app.app_id();
+    let (seq, _) = w.note(me, "before");
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.receive(None).await.is_err());
+    let changed = change_key(&w, &router);
+    changed.fail_next(Fault::Unreachable {
+        path: "ops".into(),
+        after,
+    });
+    let failed = app.receive(None).await.is_err();
+    changed.lock().faults.clear();
+    let done = failed
+        && app.cursor().generation == 2
+        && !app.reader().exists("mv").await.unwrap()
+        && app.state.pending_effect.is_some();
+    done.then_some((w, app, changed, seq))
+}
+
+#[tokio::test]
+async fn test_key_change_kept_effect_resend_refused_before_the_lookup_stays_kept() {
+    for code in [ErrorCode::CertExpired, ErrorCode::BadSignature] {
+        let mut found = false;
+        for after in 0..6 {
+            let Some((w, mut app, changed, seq)) = key_change_with_a_kept_effect(after).await
+            else {
+                continue;
+            };
+            found = true;
+            let kept = app.state.pending_effect.as_ref().unwrap().body.clone();
+            let built = w.protocol.received.lock().unwrap().len();
+            // Its resend is refused before the batch ID lookup: kept, the same bytes, and
+            // the effect not built again (Switch wire 6.4 steps 1 to 5).
+            changed.fail_next(Fault::Error {
+                path: "ops".into(),
+                code,
+                current: json!(null),
+            });
+            assert!(app.receive(None).await.is_err(), "{code:?}");
+            assert_eq!(
+                app.state.pending_effect.as_ref().map(|p| p.body.clone()),
+                Some(kept),
+                "{code:?}"
+            );
+            assert_eq!(w.protocol.received.lock().unwrap().len(), built, "{code:?}");
+            // Then its answer shows it applied: never built again.
+            let report = app.receive(None).await.unwrap();
+            assert!(
+                received(&report.events, seq),
+                "{code:?}: {:?}",
+                report.events
+            );
+            assert_eq!(w.protocol.received.lock().unwrap().len(), built, "{code:?}");
+            assert_eq!(conversations_at(&changed), 0, "{code:?}");
+            break;
+        }
+        assert!(found, "a resend at generation 2 is reached");
+    }
+}
+
+#[tokio::test]
+async fn test_kept_effect_refused_before_the_lookup_past_the_window_is_parked() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join(&w, &router).await;
+    let me = app.app_id();
+    let (seq, message) = w.note(me, "before");
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.receive(None).await.is_err());
+    w.clock
+        .advance_ms(crate::app::provider::KEPT_BATCH_ANSWER_MS);
+    w.switch.fail_next(Fault::Error {
+        path: "ops".into(),
+        code: ErrorCode::CertExpired,
+        current: json!(null),
+    });
+    let report = app.receive(None).await.unwrap();
+    assert!(
+        has(&report.events, |e| matches!(
+            e,
+            AppEvent::EffectUncertain { seq: s, .. } if *s == seq
+        )),
+        "{:?}",
+        report.events
+    );
+    assert_eq!(
+        app.state.parked.get(&seq).map(|p| p.reason),
+        Some(ParkReason::Uncertain)
+    );
+    assert_eq!(w.effects(), 1);
+    resend_is_a_duplicate(&w, &mut app, &w.switch.clone(), &message).await;
+}
+
+#[tokio::test]
+async fn test_kept_batch_resend_refused_before_the_lookup_stays_kept() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = lists_app(&w, &router).await;
+    let carol = IdentityKey::from_secret(seed("carol/identity")).public();
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.submit_batch(contact_batch(carol)).await.is_err());
+    // The next write sends it again first; refused before the batch ID lookup, it stays.
+    let dave = IdentityKey::from_secret(seed("dave/identity")).public();
+    w.switch.fail_next(Fault::Error {
+        path: "ops".into(),
+        code: ErrorCode::CertExpired,
+        current: json!(null),
+    });
+    assert!(app.submit_batch(contact_batch(dave)).await.is_err());
+    assert_eq!(app.kept_batches().await.unwrap().len(), 1);
+    assert!(!has(&app.take_events(), |e| matches!(
+        e,
+        AppEvent::BatchRefused { .. }
+    )));
+    // Then its answer shows it applied: once in all.
+    app.submit_batch(contact_batch(dave)).await.unwrap();
+    assert!(app.kept_batches().await.unwrap().is_empty());
+    assert_eq!(allow_ops_for(&w.switch.applied(), carol), 1);
+}
+
 /// The app at `store`, loaded through the loss's router.
 async fn load_lost(lost: &Lost, store: Arc<dyn StateStore>) -> App {
     App::load(

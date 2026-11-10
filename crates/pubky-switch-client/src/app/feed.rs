@@ -50,7 +50,7 @@ use pubky_switch_core::sig::SignedDoc;
 use super::batch::PendingBatch;
 use super::claims::{ClaimRead, ObligationDeadline};
 use super::context::{ClaimFetch, ContextWrites, ReceiveContext};
-use super::error::{Alarm, Refusal, refused_for_good};
+use super::error::{Alarm, Refusal, refused_after_lookup, refused_for_good};
 use super::events::{AppEvent, Duty, ParkReason};
 use super::identity::{self, DOC_CACHE_MS, Taken};
 use super::protocol::{
@@ -120,6 +120,9 @@ enum Sent {
     Quota,
     /// Refused for good, with the error code: the entry is stored and passed.
     Refused(String),
+    /// Sent again and refused before the service looked at its batch ID, past the window in
+    /// which a resend tells: its entry is stored and passed as uncertain.
+    Uncertain,
 }
 
 /// `owed/<generation>/<seq>`: a protocol call about a feed item that the protocol couldn't
@@ -781,6 +784,8 @@ impl App {
                     self.effect_refused(entry, &received, Some(code), read)?;
                     return Ok(Step::Pass);
                 }
+                // A first send isn't a resend; the entry was stored if it ever is.
+                Sent::Uncertain => return Ok(Step::Pass),
             }
         }
     }
@@ -939,21 +944,38 @@ impl App {
         let tx = std::mem::replace(&mut read.tx, self.tx()?);
         self.state.pending_effect = Some(pending.clone());
         self.commit(tx).await?;
-        self.run_effect(pending, &batch).await
+        self.run_effect(pending, &batch, false).await
     }
 
     /// Send a kept effect and commit its outcome: what its operations settle (a record
     /// write cached at the version its proof gives, a claim entry's proof and view kept),
     /// the processed pair, the protocol's local writes and the cursor. An own `attempt` in
     /// it then gets the checks of its proof (Switch wire 6.5 "Binding").
+    ///
+    /// `resent` for an effect that may have been sent before, its answer lost: a refusal
+    /// the service made before its batch ID lookup tells nothing of whether it was applied
+    /// ([`refused_after_lookup`]), so the effect stays kept, to go again unchanged once the
+    /// cause is gone, such as after a renewed certificate. Past the window in which a resend
+    /// tells, its entry is stored and passed as uncertain instead ([`App::effect_uncertain`]).
     async fn run_effect(
         &mut self,
         pending: PendingEffect,
         batch: &Batch,
+        resent: bool,
     ) -> Result<Sent, AppError> {
         let result = self.submit(batch).await;
         let submitted = match result {
             Ok(submitted) => submitted,
+            Err(error)
+                if resent
+                    && refused_for_good(&error).is_some_and(|code| !refused_after_lookup(code)) =>
+            {
+                if super::provider::answer_decides(self.now(), pending.kept_ms) {
+                    return Err(error);
+                }
+                self.effect_uncertain(&pending).await?;
+                return Ok(Sent::Uncertain);
+            }
             // A quota is stored and passed, and applied once there is room (Switch spec 8.2).
             Err(error) if error.code() == Some(ErrorCode::QuotaExceeded) => {
                 self.drop_pending_effect().await?;
@@ -1059,6 +1081,16 @@ impl App {
                 code: ErrorCode::StaleGeneration,
                 ..
             })) if !super::provider::answer_decides(self.now(), pending.kept_ms) => {
+                return self.effect_uncertain(&pending).await;
+            }
+            // Refused before the batch ID lookup: nothing told, so kept, to go again
+            // unchanged, or past the window stored as uncertain.
+            Err(error)
+                if refused_for_good(&error).is_some_and(|code| !refused_after_lookup(code)) =>
+            {
+                if super::provider::answer_decides(self.now(), pending.kept_ms) {
+                    return Err(error);
+                }
                 return self.effect_uncertain(&pending).await;
             }
             Err(error) if refused_for_good(&error).is_some() => {
@@ -1172,7 +1204,7 @@ impl App {
         if super::batch_generation(&batch).is_some_and(|g| g < self.state.meta.generation) {
             return self.resend_earlier_effect(pending, &batch).await;
         }
-        match self.run_effect(pending.clone(), &batch).await? {
+        match self.run_effect(pending.clone(), &batch, true).await? {
             Sent::Applied => self.events.push(AppEvent::MessageReceived {
                 seq: pending.seq,
                 kind: pending.kind,
@@ -1181,7 +1213,11 @@ impl App {
             }),
             // The entry is read again from the cursor, which didn't pass it, or from the
             // local store, and its effect built again.
-            Sent::Conflict(_) | Sent::StaleEpoch | Sent::Quota | Sent::Refused(_) => {}
+            Sent::Conflict(_)
+            | Sent::StaleEpoch
+            | Sent::Quota
+            | Sent::Refused(_)
+            | Sent::Uncertain => {}
         }
         Ok(())
     }

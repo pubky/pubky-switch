@@ -31,7 +31,7 @@ use pubky_switch_core::sig::SignedDoc;
 use serde::{Deserialize, Serialize};
 
 use super::claims::ObligationDeadline;
-use super::error::{Refusal, refused_for_good};
+use super::error::{Refusal, refused_after_lookup, refused_for_good};
 use super::events::AppEvent;
 use super::protocol::LocalWrite;
 use super::recovery::LossStep;
@@ -43,6 +43,11 @@ use crate::error::ClientError;
 
 /// The prefix of the kept batches.
 const PENDING_PREFIX: &str = "opq/";
+
+/// Whether `error` refuses a batch for good before the service's batch ID lookup.
+fn refused_before_lookup(error: &AppError) -> bool {
+    refused_for_good(error).is_some_and(|code| !refused_after_lookup(code))
+}
 
 fn pending_key(batch_id: &[u8; 16]) -> String {
     format!("{PENDING_PREFIX}{}", b64(batch_id))
@@ -399,7 +404,7 @@ impl App {
         let mut tx = self.tx()?;
         tx.put(&pending_key(&id), &pending)?;
         self.commit(tx).await?;
-        self.run_pending(&id, &pending, &signed).await
+        self.run_pending(&id, &pending, &signed, false).await
     }
 
     /// After `409 stale_epoch` on `batch` (Switch spec 3.5, 6.4): the switch refused it for
@@ -528,8 +533,12 @@ impl App {
                 self.resend_earlier(&id, &pending, &batch).await?;
                 continue;
             }
-            match self.run_pending(&id, &pending, &batch).await {
+            match self.run_pending(&id, &pending, &batch, true).await {
                 Ok(submitted) => self.check_attempts_of(&batch, &submitted).await?,
+                Err(error) if refused_before_lookup(&error) => {
+                    self.kept_refused_before_lookup(&id, &pending, &batch, error)
+                        .await?;
+                }
                 Err(error) => match refused_for_good(&error) {
                     Some(code) => self.events.push(AppEvent::BatchRefused {
                         batch_id: id,
@@ -572,6 +581,27 @@ impl App {
         Ok(())
     }
 
+    /// A kept batch sent again and refused before the service looked at its batch ID, which
+    /// tells nothing of whether it was applied ([`refused_after_lookup`]): it stays kept, to
+    /// go again unchanged once the cause is gone, and the error is the caller's. Past the
+    /// window in which a resend tells, it is dropped and reported with its attempts instead
+    /// (Switch spec 12.5 "Kept batches").
+    async fn kept_refused_before_lookup(
+        &mut self,
+        id: &[u8; 16],
+        pending: &PendingBatch,
+        batch: &Batch,
+        error: AppError,
+    ) -> Result<(), AppError> {
+        if super::provider::answer_decides(self.now(), pending.kept_ms) {
+            return Err(error);
+        }
+        let mut tx = self.tx()?;
+        Self::replace_kept_batch(id, None, &mut tx)?;
+        self.kept_batch_dropped(id, batch, &mut tx)?;
+        self.commit(tx).await
+    }
+
     /// A kept batch to send again: its signed operations are its exact bytes (Switch wire
     /// 2.1), but its unsigned `cursor.set` may name a position the service's cursor has
     /// passed since, which would take that cursor back. Such a cursor move is left out; the
@@ -590,16 +620,20 @@ impl App {
 
     /// Send a kept batch and commit its outcome. A refusal for good drops it; any other
     /// failure keeps it, to be sent again with the same bytes (Switch wire 2.1, 6.4).
+    /// `resent` for a batch that may have been sent before: one refused before the batch ID
+    /// lookup stays kept ([`refused_after_lookup`]).
     async fn run_pending(
         &mut self,
         id: &[u8; 16],
         pending: &PendingBatch,
         batch: &Batch,
+        resent: bool,
     ) -> Result<Submitted, AppError> {
         let submitted = match self.submit(batch).await {
             Ok(submitted) => submitted,
             Err(error) => {
-                if refused_for_good(&error).is_some() {
+                if refused_for_good(&error).is_some() && !(resent && refused_before_lookup(&error))
+                {
                     let mut tx = self.tx()?;
                     tx.delete(&pending_key(id))?;
                     self.commit(tx).await?;
@@ -803,8 +837,13 @@ impl App {
                     batch_id: *id,
                     new_batch_id: new_id,
                 });
-                let submitted = self.run_pending(&new_id, &renewed, &signed).await?;
+                let submitted = self.run_pending(&new_id, &renewed, &signed, false).await?;
                 return self.check_attempts_of(&signed, &submitted).await;
+            }
+            Err(error) if refused_before_lookup(&error) => {
+                return self
+                    .kept_refused_before_lookup(id, pending, batch, error)
+                    .await;
             }
             Err(error) => {
                 if let Some(code) = refused_for_good(&error) {
