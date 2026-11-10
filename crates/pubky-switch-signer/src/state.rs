@@ -55,6 +55,11 @@ pub(crate) struct Newest {
     pub(crate) prev: Option<[u8; 32]>,
     /// Whether it is published on the Homeserver.
     pub(crate) published: bool,
+    /// The service time at which the switch took it, from its delivery's transition proof;
+    /// `None` for an adopted copy. A reduction's cutoff is this time plus the clock tolerance
+    /// (Switch wire 3.8).
+    #[serde(default)]
+    pub(crate) delivered_at: Option<u64>,
 }
 
 /// The signer's records.
@@ -166,6 +171,23 @@ pub(crate) enum Flow {
         /// The policy the first `identity.json` carries.
         policy: IdentityPolicy,
     },
+    /// Renewing an app's certificate (Switch spec 3.2, Switch wire 3.8): storing the new
+    /// certificate and the key bundles at the switch, batch by batch, then delivering the
+    /// renewing version.
+    Renew {
+        /// The renewed app.
+        app_id: [u8; 16],
+        /// The signed batches, each sent again with the same bytes until it is answered.
+        batches: Vec<Bytes>,
+        /// How many batches the switch took.
+        sent: usize,
+        /// The key bundle parts the batches store.
+        parts: Vec<StoredPart>,
+        /// The renewing version, as signed.
+        doc: SignedDoc,
+        /// The document hash of the version it builds on.
+        prev: Option<[u8; 32]>,
+    },
     /// Delivering a new `identity.json` version, then publishing it.
     Deliver {
         /// The new version, as signed.
@@ -178,6 +200,13 @@ pub(crate) enum Flow {
         step: DeliverStep,
     },
 }
+
+/// Bytes kept as they were signed, stored in base64url.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub(crate) struct Bytes(
+    #[serde(with = "pubky_switch_core::enc::serde_b64_vec")] pub(crate) Vec<u8>,
+);
 
 /// Read the records and the flow of `identity`; `None` when the store holds none.
 pub(crate) async fn load(

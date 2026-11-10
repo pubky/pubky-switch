@@ -263,7 +263,8 @@ impl Signer {
     async fn approve(&mut self, review: AppReview) -> Result<ApprovedRequest>;      // cert, version, approval and claim
     fn approved(&self, request: &[u8; 32]) -> Result<Option<ApprovedRequest>>;     // the claim, once its version is delivered
     async fn claim_delivered(&mut self, request: &[u8; 32]) -> Result<()>;          // the host sent the claim and the grant
-    async fn renew(&mut self, app: AppId, change: CertChange) -> Result<RenewalOutcome>;     // reductions included
+    async fn renew(&mut self, app: [u8; 16], change: CertChange) -> Result<IdentityDoc>;   // a reduction's closing follows at once
+    async fn complete_renewals(&mut self) -> Result<Vec<[u8; 16]>>;                         // cooperative: until = record_at + 5 min
     async fn revoke(&mut self, app: AppId, distrust_from: Option<Time>, ok: UserConfirmed) -> Result<Rotation>;
     async fn purge_removed(&mut self, app: AppId) -> Result<()>;
 

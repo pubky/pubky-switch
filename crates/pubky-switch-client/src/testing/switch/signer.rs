@@ -48,6 +48,20 @@ impl ScriptedSwitch {
         switch
     }
 
+    /// The epoch ranges of the key bundle parts the switch holds for `app`, in order.
+    pub fn bundles_of(&self, app: &[u8; 16]) -> Vec<(u64, u64)> {
+        self.lock()
+            .bundles
+            .get(app)
+            .map(|parts| {
+                parts
+                    .iter()
+                    .map(|(part, _)| (part.first_epoch, part.last_epoch))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// The App IDs the account keeps for good from the enrollment that made it.
     pub fn kept_app_ids(&self) -> Vec<[u8; 16]> {
         self.lock().kept_app_ids.clone()
@@ -233,7 +247,7 @@ impl Inner {
                     "unread_entries": 0,
                     "sole_target_unread": 0,
                     "record_cert": held.and_then(|a| a.cert.as_ref()).map(|c| b64(&c.hash())),
-                    "record_at": null,
+                    "record_at": held.and_then(|a| a.record_at).map(pubky_switch_core::time::rfc3339),
                     "lagging": false,
                     "keys_through": null,
                     "full_bundle_requested": null,

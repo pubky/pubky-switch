@@ -112,6 +112,8 @@ pub(crate) struct PushReg {
 pub struct SwitchApp {
     /// The app record it registered (signed).
     pub record: Option<SignedDoc>,
+    /// When the switch took that record (`record_at`, Switch wire 7.4.12).
+    pub record_at: Option<u64>,
     /// The certificate of that record, verified.
     pub cert: Option<AppCert>,
     /// The renewed certificate a `cert.put` stored, verified.

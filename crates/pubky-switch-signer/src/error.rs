@@ -90,6 +90,9 @@ pub enum Refusal {
     /// here.
     #[error("refused: the app is listed already")]
     AlreadyListed,
+    /// The app isn't listed in the newest `identity.json`, so it has no certificate to renew.
+    #[error("refused: the app isn't listed")]
+    NotListed,
     /// The store already holds this identity's signer records, so it isn't set up again.
     #[error("refused: the signer is already set up for this identity")]
     AlreadySetUp,

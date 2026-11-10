@@ -80,7 +80,7 @@ service.
   answer carries the head in its body only, not in `Switch-Head`. The test call `deliver_identity` takes any document, without those
   checks, for scripting what another signer or a faulty service did.
 - **`GET /apps`** (Switch wire 7.4.12): the apps the switch holds or the newest document
-  lists, with `current`, `record_cert` and `bundle_ranges`; no last-seen times, attempts,
+  lists, with `current`, `record_cert`, `record_at` and `bundle_ranges`; no last-seen times, attempts,
   unread counts, `keys_through`, departures or `proof_generations`.
 - **Moves and recovery** (Switch spec 12.5, 12.6, Switch wire 10): `import_into` copies the
   account in memory, with no manifest, chunks or export transfer; a recovery upload is kept

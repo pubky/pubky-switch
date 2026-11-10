@@ -444,6 +444,7 @@ impl Inner {
         if check_app_put(&app, &new, listed, held.as_ref())? != AppPutEffect::Unchanged {
             let entry = draft.apps.entry(app).or_default();
             entry.record = Some(record.clone());
+            entry.record_at = Some(self.now());
             entry.cert = Some(new.cert().clone());
             draft.directory_version += 1;
         }

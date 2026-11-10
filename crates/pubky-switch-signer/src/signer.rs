@@ -49,8 +49,10 @@ use crate::protocol::Protocols;
 use crate::state::{self, DeliverStep, Flow, Newest, Service, SignerState};
 
 mod approval;
+mod renewal;
 
 pub use approval::{AppReview, ApprovedRequest};
+pub use renewal::CertChange;
 
 /// What the signer works with, from the host.
 #[derive(Clone)]
@@ -218,8 +220,32 @@ impl Signer {
     /// version that this install adopted instead of its own.
     pub async fn resume(&mut self) -> Result<()> {
         self.refresh().await?;
+        loop {
+            self.finish_flow().await?;
+            self.publish().await?;
+            // A closing delivery a reduction owes comes before anything else (Switch wire
+            // 3.8 "A closing delivery owed").
+            if !self.queue_owed_closing().await? {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Run the flow in progress to its end.
+    async fn finish_flow(&mut self) -> Result<()> {
         while let Some(flow) = self.flow.clone() {
             match flow {
+                Flow::Renew {
+                    app_id,
+                    batches,
+                    sent,
+                    parts,
+                    doc,
+                    prev,
+                } => {
+                    self.send_renewal(app_id, &batches, sent, &parts, doc, prev)
+                        .await?
+                }
                 Flow::Enroll {
                     origin,
                     enrollment,
@@ -239,7 +265,7 @@ impl Signer {
                 } => self.deliver(doc, prev).await?,
             }
         }
-        self.publish().await
+        Ok(())
     }
 
     /// The identity.
@@ -329,6 +355,9 @@ impl Signer {
         self.check_named()?;
         if self.flow.is_some() {
             return Err(Refusal::FlowInProgress.into());
+        }
+        if self.owes_closing()? {
+            self.resume().await?;
         }
         Ok(())
     }
@@ -625,12 +654,22 @@ impl Signer {
             prev,
         };
         match self.service_client()?.put_identity(&delivery).await {
-            Ok(_) => {
+            Ok(answer) => {
+                let delivered_at = answer
+                    .proofs
+                    .first()
+                    .and_then(|proof| proof.body().chain.open().ok())
+                    .map(|envelope| envelope.server_time);
                 let mut state = self.state.clone();
+                let published = state
+                    .newest
+                    .as_ref()
+                    .is_some_and(|n| n.doc == doc && n.published);
                 state.newest = Some(Newest {
                     doc,
                     prev,
-                    published: false,
+                    published,
+                    delivered_at,
                 });
                 self.commit(state, None).await
             }
@@ -730,6 +769,7 @@ impl Signer {
             doc: copy.signed().clone(),
             prev: None,
             published: true,
+            delivered_at: None,
         });
         state.signed_through = state.signed_through.max(version);
         if signer != state.install {
