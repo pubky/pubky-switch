@@ -131,7 +131,7 @@ pub fn newly_listed(earlier: Option<&IdentityDoc>, later: &IdentityDoc) -> Vec<[
         .apps
         .iter()
         .map(|app| app.app_id)
-        .filter(|app| !earlier.is_some_and(|doc| doc.listed_cert(app).is_some()))
+        .filter(|app| earlier.is_none_or(|doc| doc.listed_cert(app).is_none()))
         .collect()
 }
 
