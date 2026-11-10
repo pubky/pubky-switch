@@ -810,17 +810,25 @@ pub enum ParkReason {
     /// applied (Switch spec 12.5 "Kept batches"): it is kept, and not tried again
     /// ([`AppEvent::EffectUncertain`]).
     Uncertain,
+    /// It was stored as [`ParkReason::Uncertain`], and the host released it
+    /// ([`super::App::release_parked`]): its processed pair is gone, and a later read tries
+    /// it again as a fresh receive.
+    Released,
 }
 
 impl ParkReason {
     /// Whether an entry stored for this reason is processed again by a later read: one
-    /// whose sender couldn't be checked, whose write hit a quota, or whose receive step
-    /// the store kept from finishing. The others stay stored until the protocol acts on
-    /// them.
+    /// whose sender couldn't be checked, whose write hit a quota, whose receive step the
+    /// store kept from finishing, or that the host released. The others stay stored until
+    /// the protocol or the host acts on them ([`super::App::forget_parked`]).
     pub fn tried_again(self) -> bool {
         matches!(
             self,
-            Self::Unverifiable | Self::Quota | Self::StoreUnavailable | Self::StoreRejected
+            Self::Unverifiable
+                | Self::Quota
+                | Self::StoreUnavailable
+                | Self::StoreRejected
+                | Self::Released
         )
     }
 }

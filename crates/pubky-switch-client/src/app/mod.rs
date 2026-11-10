@@ -40,6 +40,7 @@ mod events;
 mod feed;
 mod identity;
 mod keys;
+mod parked;
 mod peek;
 mod protocol;
 mod provider;
@@ -67,6 +68,7 @@ pub use events::{
 };
 pub use feed::ReceiveReport;
 pub use identity::{DOC_CACHE_MS, HomeserverReader, IdentityRefresh, REVALIDATION_MS};
+pub use parked::ParkedMessage;
 pub use peek::{PeekReport, Peeked};
 pub use protocol::{
     Effect, LocalWrite, MAX_CLAIM_READS, MAX_STEP_LOCAL_BYTES, MissedEntries, Need, OpaqueRule,
