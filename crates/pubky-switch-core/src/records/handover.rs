@@ -899,11 +899,29 @@ pub fn check_restore_copies(
 }
 
 /// Whether a backup found before writing shows that another install has taken over (Switch
-/// wire 3.13 "Another install's backup"): it names another install than `own_signer` at or
-/// past `own_newest`, the newest version a service accepted from this signer. Then the
-/// signer writes nothing and refuses this and every later signing call.
-pub fn taken_over(found: &SignerRecords, own_signer: &[u8; 16], own_newest: u64) -> bool {
-    &found.identity_doc.body().signer != own_signer && found.identity_doc.version() >= own_newest
+/// wire 3.13 "Another install's backup"): it names another install than `own_signer`, past
+/// `own_newest`, the newest version a service accepted from this signer, or at its version
+/// holding that same document, compared whole. Then the signer writes nothing and refuses
+/// this and every later signing call. With no such version yet, any other install's backup
+/// shows it.
+///
+/// A backup at `own_newest`'s version holding another document is one a delivery that lost
+/// wrote: both built on the same `prev`, and the switch took this signer's. It shows no
+/// take-over, and this signer's write replaces it.
+pub fn taken_over(
+    found: &SignerRecords,
+    own_signer: &[u8; 16],
+    own_newest: Option<&IdentityDoc>,
+) -> bool {
+    let doc = &found.identity_doc;
+    if &doc.body().signer == own_signer {
+        return false;
+    }
+    let Some(mark) = own_newest else {
+        return true;
+    };
+    doc.version() > mark.version()
+        || (doc.version() == mark.version() && doc.signed() == mark.signed())
 }
 
 /// A delivery of a new `identity.json` version, by when it writes the backup (Switch wire
@@ -1338,9 +1356,18 @@ mod tests {
             RestoreStart::DeliverBackupFirst
         );
 
-        assert!(taken_over(&opened, &[8; 16], 3));
-        assert!(!taken_over(&opened, &[8; 16], 4));
-        assert!(!taken_over(&opened, &[1; 16], 3));
+        // Past this signer's newest version, or at it with the same document: taken over.
+        assert!(taken_over(&opened, &[8; 16], Some(&doc(2, &[]))));
+        assert!(taken_over(&opened, &[8; 16], Some(&held)));
+        assert!(taken_over(&opened, &[8; 16], None));
+        // At its version with another document: a delivery that lost wrote it.
+        let other_at_mark = doc(3, &[]);
+        assert_eq!(other_at_mark.version(), held.version());
+        assert_ne!(other_at_mark.signed(), held.signed());
+        assert!(!taken_over(&opened, &[8; 16], Some(&other_at_mark)));
+        // Behind it, or this signer's own.
+        assert!(!taken_over(&opened, &[8; 16], Some(&doc(4, &[]))));
+        assert!(!taken_over(&opened, &[1; 16], Some(&doc(2, &[]))));
         assert!(DeliveryKind::NewVersion.backup_before());
         for kind in [
             DeliveryKind::TakeOver,
