@@ -1028,3 +1028,86 @@ async fn test_directory_versions_at_a_cert_put() {
     );
     replay.db.drop_database().await.expect("drop");
 }
+
+/// A renewal of app `name`'s certificate by alice, issued at `issued_ms`.
+fn renewal_of(name: &str, issued_ms: u64) -> pubky_switch_core::records::AppCert {
+    let keys = vectors("keys.json");
+    let app_keys = AppKeys::from_secrets(
+        hex32(&app(&keys, name)["signing_secret_hex"]),
+        hex32(&app(&keys, name)["bundle_secret_hex"]),
+    );
+    let identity =
+        pubky_switch_core::keys::IdentityKey::from_secret(hex32(&alice(&keys)["secret_hex"]));
+    let old = pubky_switch_core::records::AppCert::verify(
+        &signed(
+            &named(
+                &vectors("documents.json")["documents"],
+                &format!("{name} certificate"),
+            )["signed"],
+        ),
+        &identity.public(),
+    )
+    .expect("cert");
+    pubky_switch_core::records::AppCert::issue(
+        &identity,
+        pubky_switch_core::records::AppCertBody::new(
+            identity.public(),
+            app_keys.signing_public(),
+            app_keys.bundle_public(),
+            old.scopes().to_vec(),
+            old.permissions(),
+            issued_ms,
+            issued_ms + 180 * 86_400_000,
+        ),
+    )
+    .expect("cert")
+}
+
+#[tokio::test]
+async fn test_directory_versions_at_a_renewal_after_a_lapse() {
+    let Some(replay) = replay().await else { return };
+    alice_with_three_apps(&replay).await;
+    // The executor's certificate lapses on 2026-12-01; it stays current and reachable.
+    let between = "2026-12-15T00:00:00.000Z";
+    set_time(&replay.clock, between);
+    let lapsed = read_as(&replay, "phone", between).await;
+    // The signer renews it: stores the new certificate, then lists it with the earlier one
+    // renewed and open. The app was current all along, so apps_version stays; the delivery
+    // moves directory_version.
+    let renewed = renewal_of("executor", ms(between) - 1_000);
+    let executor = app_id_of("executor");
+    let old_hash = signed(
+        &named(
+            &vectors("documents.json")["documents"],
+            "executor certificate",
+        )["signed"],
+    )
+    .doc_hash()
+    .expect("hash");
+    cert_put(&replay, &renewed, 160, between).await;
+    let stored = read_as(&replay, "phone", between).await;
+    assert_eq!(
+        moved(&lapsed, &stored),
+        (false, false),
+        "a cert.put not yet listed"
+    );
+    let new_hash = renewed.hash();
+    deliver_after(&replay, between, &alice_v3(), |body| {
+        if let Some(entry) = body.apps.iter_mut().find(|entry| entry.app_id == executor) {
+            entry.cert = new_hash;
+        }
+        body.renewed.push(pubky_switch_core::records::RenewedCert {
+            app_id: executor,
+            cert: old_hash,
+            until: None,
+        });
+    })
+    .await;
+    let listed = read_as(&replay, "phone", between).await;
+    assert_eq!(
+        moved(&stored, &listed),
+        (true, false),
+        "the renewal's delivery"
+    );
+    replay.db.drop_database().await.expect("drop");
+}
