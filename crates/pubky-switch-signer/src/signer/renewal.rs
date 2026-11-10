@@ -290,7 +290,7 @@ impl Signer {
                 let batch = client.sign_batch(generation, entries, None)?;
                 Ok(RenewBatch {
                     bytes: Bytes(batch.body().to_vec()),
-                    parts: chunk.iter().filter_map(|(_, part)| part.clone()).collect(),
+                    parts: chunk.iter().filter_map(|(_, part)| *part).collect(),
                 })
             })
             .collect()
@@ -373,7 +373,7 @@ impl Signer {
                                 || held.last_epoch < part.first_epoch
                                 || part.last_epoch < held.first_epoch
                         });
-                        state.bundle_parts.push(part.clone());
+                        state.bundle_parts.push(*part);
                     }
                     let flow = Flow::Renew {
                         batches: batches.to_vec(),
