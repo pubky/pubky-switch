@@ -31,8 +31,8 @@
 //!
 //! The protocol's other callbacks get a [`LocalView`]: the identity, the App ID and the
 //! protocol's local state, read-only. Its restore step gets a [`RestoreContext`]: the
-//! identity, the App ID and the naming key of the backup being restored, before anything
-//! is written.
+//! identity, the App ID and `blind` under the naming key of the backup being restored,
+//! before anything is written.
 
 use pubky_switch_core::claims::{ClaimView, EntryKind};
 use pubky_switch_core::ident::NamingKey;
@@ -257,8 +257,14 @@ impl<'a> LocalView<'a> {
 /// With the naming key the protocol checks its layer against the identity before the
 /// restore commits, such as that each claim key or record key it keeps is the one its
 /// inputs derive to under the naming key (Switch wire 1.5, Switch spec 13.3). A layer it
-/// refuses refuses the restore, and nothing of either layer is written. The naming key is
-/// sensitive: the protocol derives from it and keeps none of it.
+/// refuses refuses the restore, and nothing of either layer is written. The naming key
+/// itself stays with the app: the protocol derives through [`RestoreContext::blind`].
+///
+/// The naming key is the one the backup carries. The app can't verify it before the
+/// restore, since it derives from the identity's Switch root, which the app doesn't hold;
+/// it is the key the restored app goes on with, so a check here gives what a check after
+/// the restore would. It doesn't protect against a forged backup that carries a consistent
+/// wrong key.
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct RestoreContext<'a> {
@@ -286,15 +292,10 @@ impl<'a> RestoreContext<'a> {
         self.app_id
     }
 
-    /// The identity's naming key, as the backup carries it (Switch wire 1.5), as
-    /// [`super::App::naming_key`] gives it once restored. Sensitive.
-    pub fn naming_key(&self) -> &NamingKey {
-        self.naming
-    }
-
-    /// `blind(input)` under the naming key (Switch wire 1.5), as [`super::App::blind`] and
-    /// [`ReceiveContext::blind`] give it: what a protocol derives its shared keys from, such
-    /// as its claim keys (Switch spec 10.2, 13.3).
+    /// `blind(input)` under the backup's naming key (Switch wire 1.5), as
+    /// [`super::App::blind`] and [`ReceiveContext::blind`] give it once restored: what a
+    /// protocol derives its shared keys from, such as its claim keys (Switch spec 10.2,
+    /// 13.3).
     pub fn blind(&self, input: &[u8]) -> [u8; 32] {
         self.naming.blind(input)
     }

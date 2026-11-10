@@ -672,7 +672,7 @@ struct JournalProtocol {
     /// Take only a journal that is [`JOURNAL_BINDING`] blinded under the naming key the
     /// restore gives, as a protocol checks the keys its layer holds.
     bound: bool,
-    /// The identity and naming key each restore step was given.
+    /// The identity and [`JOURNAL_BINDING`] blinded, as each restore step was given them.
     restoring: Mutex<Vec<([u8; 32], [u8; 32])>>,
 }
 
@@ -766,7 +766,7 @@ impl Protocol for JournalProtocol {
         self.restoring
             .lock()
             .unwrap()
-            .push((restoring.identity(), restoring.naming_key().to_bytes()));
+            .push((restoring.identity(), restoring.blind(JOURNAL_BINDING)));
         let Some(layer) = layer else {
             return Err("journal: the backup has no journal".into());
         };
@@ -1174,9 +1174,9 @@ async fn test_restore_layer_is_given_the_identitys_naming_key() {
         restored.protocol_get(JOURNAL_KEY).await.unwrap(),
         Some(journal.to_vec())
     );
-    let expected = (app.identity(), app.naming_key().to_bytes());
+    let expected = (app.identity(), journal);
     assert_eq!(*protocol.restoring.lock().unwrap(), vec![expected; 2]);
-    assert_eq!(restored.naming_key().to_bytes(), expected.1);
+    assert_eq!(restored.blind(JOURNAL_BINDING), journal);
 }
 
 #[tokio::test]
@@ -1212,7 +1212,7 @@ async fn test_restore_layer_refused_by_the_naming_key_writes_neither_layer() {
         assert_eq!(fault.commits(), 0);
         assert_eq!(
             *protocol.restoring.lock().unwrap(),
-            vec![(app.identity(), app.naming_key().to_bytes())]
+            vec![(app.identity(), app.blind(JOURNAL_BINDING))]
         );
     }
     assert_eq!(snapshot(&store, &app.app_id()), before);

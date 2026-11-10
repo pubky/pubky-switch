@@ -1061,7 +1061,7 @@ impl App {
     /// the backup carries beside it, in one commit: the app checks its own state, then the
     /// layer's name
     /// against [`Protocol::backup_name`], then has [`Protocol::restore_layer`] check the
-    /// layer, with the backup's identity and naming key ([`RestoreContext`]), and give its
+    /// layer, with the backup's identity and `blind` under its naming key ([`RestoreContext`]), and give its
     /// writes, all before it writes anything. When this returns `Ok`,
     /// both layers are in the store; on `Err`, neither is, and the store holds what it held
     /// before. The one exception is a commit whose outcome the store can't tell

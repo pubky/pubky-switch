@@ -646,10 +646,11 @@ pub trait Protocol: Send + Sync {
     /// writes it ([`decode_local_state`]) and puts every key back, and needs no writes for a
     /// backup without a layer.
     ///
-    /// `restoring` gives the identity, the App ID and the naming key of the backup, the ones
-    /// the restored app goes on with ([`RestoreContext`]), so the protocol can check its
-    /// layer against them here, such as that each claim key it keeps is the one its inputs
-    /// blind to, rather than after the restore commits. The default ignores it.
+    /// `restoring` gives the identity, the App ID and `blind` under the naming key of the
+    /// backup, the ones the restored app goes on with ([`RestoreContext`]), so the protocol
+    /// can check its layer against them here, such as that each claim key it keeps is the
+    /// one its inputs blind to, rather than after the restore commits. The default ignores
+    /// it.
     ///
     /// # Errors
     ///
