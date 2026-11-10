@@ -87,15 +87,29 @@ pub async fn replay_with(limits: Limits) -> Option<Replay> {
 /// A service with `limits`, on a fresh test database; with `time_required`, it needs
 /// trusted time, and has no sample.
 pub async fn replay_with_time(limits: Limits, time_required: bool) -> Option<Replay> {
+    replay_at(ORIGIN, "service/alice", limits, time_required).await
+}
+
+/// bob's switch origin in the vectors.
+pub const BOB_ORIGIN: &str = "https://inbox.bob.example";
+
+/// A service at `origin` whose new accounts take the vectors' service key of
+/// `service_label`, on a fresh test database.
+pub async fn replay_at(
+    origin: &str,
+    service_label: &str,
+    limits: Limits,
+    time_required: bool,
+) -> Option<Replay> {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
     let db = test_database().await?;
     let keys = vectors("keys.json");
-    let alice_service = keys["service_keys"]
+    let service = keys["service_keys"]
         .as_array()
         .expect("service keys")
         .iter()
-        .find(|key| key["seed_label"] == "service/alice")
-        .expect("alice's service key");
+        .find(|key| key["seed_label"] == service_label)
+        .expect("the service key");
     // The vectors' operator key: the seed of label `service/operator`, by the seed rule of
     // `spec/vectors/README.md`.
     let operator = hex32(&Value::String(OPERATOR_SEED_HEX.into()));
@@ -103,7 +117,7 @@ pub async fn replay_with_time(limits: Limits, time_required: bool) -> Option<Rep
     let store = FileKeyStore::open(key_dir.path()).expect("key store");
     let keys = Arc::new(FixedKeys::new(
         store,
-        vec![hex32(&alice_service["secret_hex"])],
+        vec![hex32(&service["secret_hex"])],
         Some(operator),
     ));
     let clock = Arc::new(ManualClock::new(0));
@@ -115,7 +129,7 @@ pub async fn replay_with_time(limits: Limits, time_required: bool) -> Option<Rep
         clock.clone(),
     ));
     let service = Service::new(
-        ORIGIN.into(),
+        origin.into(),
         db.store().clone(),
         keys.clone(),
         time.clone(),
@@ -129,6 +143,125 @@ pub async fn replay_with_time(limits: Limits, time_required: bool) -> Option<Rep
         time,
         _key_dir: key_dir,
     })
+}
+
+/// bob's account at a switch made by `replay_at(BOB_ORIGIN, "service/bob", ..)`, serving,
+/// with his `identity.json` version 1 (`documents.json` "bob identity.json"): his Pubky ID.
+pub async fn serve_bob(replay: &Replay) -> String {
+    use pubky_switch::keys::KeyStore;
+    let keys = vectors("keys.json");
+    let bob = keys["identities"]
+        .as_array()
+        .expect("identities")
+        .iter()
+        .find(|identity| identity["name"] == "bob")
+        .expect("bob");
+    let id = bob["pubky_id"].as_str().expect("id").to_string();
+    let key = replay.keys.generate().await.expect("key");
+    let doc: pubky_switch_core::sig::SignedDoc = serde_json::from_value(
+        named(&vectors("documents.json")["documents"], "bob identity.json")["signed"].clone(),
+    )
+    .expect("document");
+    replay
+        .db
+        .store()
+        .create_account(&pubky_switch::store::NewAccount {
+            id: id.clone(),
+            identity_key: hex32(&bob["public_hex"]),
+            generation: 1,
+            service_key: key.id,
+            created_at_ms: 0,
+            limits: pubky_switch_core::records::Limits::default(),
+            identity_doc: Some(doc),
+            revoked_apps: Vec::new(),
+            enrollment_hash: [0; 32],
+        })
+        .await
+        .expect("bob's account");
+    id
+}
+
+/// A request from `app` (a `keys.json` app) to another identity's switch at `origin`,
+/// carrying its certificate (`documents.json` "<app> certificate") in `Switch-Cert` and,
+/// if given, an invite code, signed at `at_ms`.
+#[allow(clippy::too_many_arguments)]
+pub fn other_request(
+    app_name: &str,
+    origin: &str,
+    method: &str,
+    path: &str,
+    body: Vec<u8>,
+    invite_code: Option<&str>,
+    at_ms: u64,
+) -> SwitchRequest {
+    other_request_as(
+        app_name,
+        &format!("{app_name} certificate"),
+        app_name,
+        origin,
+        method,
+        path,
+        body,
+        invite_code,
+        at_ms,
+    )
+}
+
+/// As [`other_request`], claiming `app_name`'s identity and App ID, but carrying the
+/// certificate `cert_name` (a `documents.json` name) and signed with `signing_app`'s key:
+/// for the certificate checks of an app of another identity (Switch wire 7.2).
+#[allow(clippy::too_many_arguments)]
+pub fn other_request_as(
+    app_name: &str,
+    cert_name: &str,
+    signing_app: &str,
+    origin: &str,
+    method: &str,
+    path: &str,
+    body: Vec<u8>,
+    invite_code: Option<&str>,
+    at_ms: u64,
+) -> SwitchRequest {
+    let keys = vectors("keys.json");
+    let signer = app(&keys, signing_app)["signing_secret_hex"].clone();
+    let app = app(&keys, app_name);
+    let cert: pubky_switch_core::sig::SignedDoc = serde_json::from_value(
+        named(&vectors("documents.json")["documents"], cert_name)["signed"].clone(),
+    )
+    .expect("certificate");
+    let identity = app["identity"].as_str().expect("identity").to_string();
+    let app_id = app["app_id"].as_str().expect("app id").to_string();
+    let timestamp = rfc3339_seconds(at_ms);
+    let signed_headers = RequestHeaders {
+        timestamp: timestamp.clone(),
+        identity: identity.clone(),
+        app: Some(app_id.clone()),
+        cert: Some(cert.compact()),
+        invite_code: invite_code.map(str::to_string),
+    };
+    let secret = ed25519_dalek::SigningKey::from_bytes(&hex32(&signer));
+    let signature = b64(&wire_http::sign_request(
+        &secret,
+        &RequestTarget {
+            method,
+            path_and_query: path,
+            body: &body,
+            origin,
+        },
+        &signed_headers,
+    ));
+    let compact = cert.compact();
+    let mut headers = vec![
+        (header::IDENTITY, identity.as_str()),
+        (header::APP, app_id.as_str()),
+        (header::CERT, compact.as_str()),
+        (header::TIMESTAMP, timestamp.as_str()),
+        (header::SIGNATURE, signature.as_str()),
+    ];
+    if let Some(code) = invite_code {
+        headers.push((header::INVITE_CODE, code));
+    }
+    request(method, path, &headers, body)
 }
 
 pub fn request(method: &str, path: &str, headers: &[(&str, &str)], body: Vec<u8>) -> SwitchRequest {
