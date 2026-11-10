@@ -176,6 +176,8 @@ Each step is one idempotent call. A revocation, for example, runs these steps:
 
 The rotation's batches and its delivery are one `Renew` flow; what is asked for and still owed (the revocation, the record deletion) is kept in the records, so `run_due` finishes it after a crash. A departure, or a revocation the switch shows that the records don't, is completed by steps 3 to 7 at the next run.
 
+While a revocation waits, `RevocationPending` says whether the switch took it (`at_switch`). An alert raised with `at_switch: false` before the send isn't rewritten when a later send succeeds; the later state is what the next alert, or its absence once the app is removed, shows. `GrantRevocationOwed` is raised once for each owed record deletion, whether or not that deletion succeeds, and stays cleared once the user clears it.
+
 ### 4.4 Delivering a version, with the backup
 
 Every new version takes the same path (spec 4.3, 12.8; wire 3.3, 3.13):

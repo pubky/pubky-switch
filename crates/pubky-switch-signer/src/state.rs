@@ -108,6 +108,10 @@ pub(crate) struct SignerState {
     /// step 4).
     #[serde(default)]
     pub(crate) cleanup: Vec<[u8; 16]>,
+    /// The apps of `cleanup` whose [`Alert::GrantRevocationOwed`] was raised: once for each
+    /// owed deletion, so the user can clear it while a deletion keeps failing.
+    #[serde(default)]
+    pub(crate) grant_reminded: Vec<[u8; 16]>,
     /// The full-bundle requests whose answer the switch refused, not tried again until the
     /// app asks anew.
     #[serde(default)]
@@ -237,6 +241,7 @@ impl SignerState {
             republish_over: None,
             revoking: Vec::new(),
             cleanup: Vec::new(),
+            grant_reminded: Vec::new(),
             refused_requests: Vec::new(),
             listed_at: Vec::new(),
             alerts: Vec::new(),

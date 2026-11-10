@@ -263,25 +263,103 @@ async fn test_revocation_goes_out_when_the_backup_cant_be_read() {
     );
 }
 
+/// Two joined apps, then a switch that goes back a version and still shows it: a rollback
+/// alarm is due at the next read of its copy.
+async fn rolled_back(world: &World) -> (Signer, App, App) {
+    let (mut signer, _) = world.enrolled().await;
+    let (a, b) = two_joined(world, &mut signer).await;
+    let before = signer.identity_doc().unwrap().unwrap();
+    signer.set_record_max_age(Some(86_400)).await.unwrap();
+    world.switch.deliver_identity(&before).unwrap();
+    (signer, a, b)
+}
+
+/// A backup holding another install's newer version above `signer`'s newest, for its apps.
+fn taken_over_backup(world: &World, signer: &Signer, apps: &[&App]) -> Vec<u8> {
+    let newest = signer.identity_doc().unwrap().unwrap();
+    let certs: Vec<_> = apps
+        .iter()
+        .map(|app| world.switch.app(&app.keys.app_id_bytes()).cert.unwrap())
+        .collect();
+    let records = SignerRecords::new(
+        IdentityKey::from_secret(SECRET),
+        world.other_install_version(&newest, [7; 16]),
+        &[],
+        &certs,
+        Limits::default(),
+        &[],
+        Some(newest.hash()),
+    )
+    .unwrap();
+    serde_json::to_vec(&SignerBackup::seal(&world.key, &records).unwrap()).unwrap()
+}
+
 #[tokio::test]
-async fn test_revocation_isnt_sent_with_an_unreadable_backup_and_a_rollback() {
-    // The switch shows an older version, so it doesn't confirm this install, and the backup
-    // can't be read: nothing shows that no other install took over, so nothing is sent.
+async fn test_revocation_under_a_rollback_goes_out_whatever_the_backup_read() {
+    // The switch shows a rollback, so its copy confirms nothing, and the backup gives no
+    // evidence either way: unreachable, missing, or not opening. The revocation goes out in
+    // each case, since a take-over shows at the switch first.
+    for case in ["unreachable", "missing", "unopenable"] {
+        let world = World::new();
+        let (mut signer, a, _) = rolled_back(&world).await;
+        let id = a.keys.app_id_bytes();
+        match case {
+            "unreachable" => *world.homeserver.down.lock().unwrap() = true,
+            "missing" => {
+                world
+                    .homeserver
+                    .files
+                    .lock()
+                    .unwrap()
+                    .remove(SIGNER_BACKUP_PATH);
+            }
+            _ => world
+                .homeserver
+                .set(SIGNER_BACKUP_PATH, b"not a backup".to_vec()),
+        }
+        signer.revoke(id, None, confirmed()).await.unwrap_err();
+        assert!(world.switch.app(&id).departed, "{case}");
+    }
+}
+
+#[tokio::test]
+async fn test_revocation_under_a_rollback_isnt_sent_when_the_backup_shows_a_take_over() {
+    let world = World::new();
+    let (mut signer, a, b) = rolled_back(&world).await;
+    let id = a.keys.app_id_bytes();
+    let backup = taken_over_backup(&world, &signer, &[&a, &b]);
+    world.homeserver.set(SIGNER_BACKUP_PATH, backup);
+    assert_eq!(
+        signer.revoke(id, None, confirmed()).await.unwrap_err(),
+        SignerError::NotNamed { install: [7; 16] }
+    );
+    assert!(!world.switch.app(&id).departed);
+}
+
+#[tokio::test]
+async fn test_revocation_isnt_sent_for_another_installs_document_at_the_in_flow_version() {
+    // A version is in flow, not yet delivered, and the switch holds another install's
+    // document at that same version: it isn't the flow's own, so it took over, and no
+    // revocation goes out.
     let world = World::new();
     let (mut signer, _) = world.enrolled().await;
     let (a, _) = two_joined(&world, &mut signer).await;
     let id = a.keys.app_id_bytes();
-    let before = signer.identity_doc().unwrap().unwrap();
-    signer.set_record_max_age(Some(86_400)).await.unwrap();
-    world.switch.deliver_identity(&before).unwrap();
-    *world.homeserver.down.lock().unwrap() = true;
-    let error = signer.revoke(id, None, confirmed()).await.unwrap_err();
-    assert!(matches!(error, SignerError::Homeserver(_)), "{error:?}");
+    let newest = signer.identity_doc().unwrap().unwrap();
+    world.switch.fail_next(SwitchFault::Unreachable {
+        path: "/identity".into(),
+        after: 0,
+    });
+    signer.set_record_max_age(Some(86_400)).await.unwrap_err();
+    world
+        .switch
+        .deliver_identity(&world.other_install_version(&newest, [7; 16]))
+        .unwrap();
+    assert_eq!(
+        signer.revoke(id, None, confirmed()).await.unwrap_err(),
+        SignerError::NotNamed { install: [7; 16] }
+    );
     assert!(!world.switch.app(&id).departed);
-    assert!(signer.alerts().contains(&Alert::RevocationPending {
-        app_id: id,
-        at_switch: false,
-    }));
 }
 
 #[tokio::test]
@@ -454,11 +532,17 @@ async fn test_failing_record_delete_still_raises_the_grant_reminder() {
             .alerts()
             .contains(&Alert::GrantRevocationOwed { app_id: id })
     );
+    // Raised once for the owed deletion: cleared, it stays cleared while the deletion
+    // keeps failing.
+    let reminder = Alert::GrantRevocationOwed { app_id: id };
+    signer.clear_alert(&reminder).await.unwrap();
     signer.run_due().await.unwrap();
     assert!(world.homeserver.file(&app_record_path(&id)).is_some());
+    assert!(!signer.alerts().contains(&reminder));
     *world.homeserver.failing_path.lock().unwrap() = None;
     signer.run_due().await.unwrap();
     assert!(world.homeserver.file(&app_record_path(&id)).is_none());
+    assert!(!signer.alerts().contains(&reminder));
 }
 
 #[tokio::test]
