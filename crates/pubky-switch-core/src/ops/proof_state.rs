@@ -3,6 +3,7 @@
 use crate::chain::ProofState;
 use crate::claims::ClaimView;
 use crate::error::{Result, invalid};
+use crate::shared::RecordState;
 
 use super::{OpKind, RecordVersion};
 
@@ -10,13 +11,8 @@ use super::{OpKind, RecordVersion};
 /// it (Switch wire 6.5).
 #[derive(Clone, Debug, PartialEq)]
 pub enum StateAfter {
-    /// `record.put`: the write's generation and `seq`, the record's new version.
-    Record {
-        /// The write's generation.
-        generation: u64,
-        /// The write's `seq`.
-        seq: u64,
-    },
+    /// `record.put`: the record's new version, the write's (generation, `seq`).
+    Record(RecordVersion),
     /// A claim entry: the claim's view after it, as [`crate::claims::Claim::view`] gives it.
     Claim(ClaimView),
     /// `app.put`: the calling app.
@@ -50,14 +46,15 @@ pub enum StateAfter {
 /// `cert.put`'s certificate doesn't decode.
 pub fn proof_state(op: &OpKind, after: &StateAfter) -> Result<ProofState> {
     Ok(match (op, after) {
-        (OpKind::RecordPut(put), StateAfter::Record { generation, seq }) => ProofState::Record {
-            version: RecordVersion {
-                generation: *generation,
-                version: *seq,
-            },
-            // A delete writes an empty value (Switch wire 6.2).
-            deleted: put.value_sealed.ct.is_empty(),
-        },
+        (OpKind::RecordPut(put), StateAfter::Record(version)) => {
+            // The record the switch holds after the write decides `deleted`, so the proof
+            // and the record can't disagree (Switch wire 6.2).
+            let record = RecordState::after(put, version.generation, version.version);
+            ProofState::Record {
+                version: record.version,
+                deleted: record.deleted,
+            }
+        }
         (OpKind::Claim(_), StateAfter::Claim(view)) => ProofState::Claim(view.to_value()),
         (OpKind::AllowPut { kind, .. }, StateAfter::Op) => ProofState::Allow {
             kind: *kind,

@@ -27,6 +27,9 @@ pub struct Limits {
     pub max_deny: u64,
     /// `max_invite_codes`: live invite codes.
     pub max_invite_codes: u64,
+    /// `max_invite_uses`: the most uses an `invite_code.put` may name, which
+    /// [`super::check_invite_code_put`] checks.
+    pub max_invite_uses: u64,
 }
 
 impl Default for Limits {
@@ -39,6 +42,7 @@ impl Default for Limits {
             max_conversations: 100_000,
             max_deny: 100_000,
             max_invite_codes: 1_000,
+            max_invite_uses: super::MAX_INVITE_USES,
         }
     }
 }

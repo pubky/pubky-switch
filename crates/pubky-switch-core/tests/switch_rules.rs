@@ -13,8 +13,9 @@ use pubky_switch_core::{
     enc::{pubky_key, unb64},
     http::ErrorCode,
     ops::{
-        Limits, List, OpKind, Quota, Refusal, SignedOp, StateAfter, StoredPart, check_quota,
-        covers, invite_code_delete, keys_through, parts_to_drop, proof_state,
+        Limits, List, MAX_INVITE_USES, OpKind, Quota, RecordVersion, Refusal, SignedOp, StateAfter,
+        StoredPart, check_quota, covers, invite_code_delete, keys_through, parts_to_drop,
+        proof_state,
     },
     sig::SignedDoc,
 };
@@ -37,7 +38,7 @@ fn hex32(value: &Value) -> [u8; 32] {
 fn state_after(op: &SignedOp, seq: u64, generation: u64, view: &Value) -> StateAfter {
     let body = op.body();
     match &body.kind {
-        OpKind::RecordPut(_) => StateAfter::Record { generation, seq },
+        OpKind::RecordPut(_) => StateAfter::Record(RecordVersion::new(generation, seq)),
         OpKind::Claim(_) => StateAfter::Claim(ClaimView::from_value(view).expect("claim view")),
         OpKind::AppPut { .. } => StateAfter::App {
             app_id: body.app_id.expect("app"),
@@ -134,10 +135,7 @@ fn test_switch_rules_state_after_must_fit_the_operation() {
     let op = SignedOp::peek(&signed).expect("op");
     assert!(matches!(op.body().kind, OpKind::AppPut { .. }));
     // An app.put given a record's version is a mistake, not a state.
-    let wrong = StateAfter::Record {
-        generation: 1,
-        seq: 3,
-    };
+    let wrong = StateAfter::Record(RecordVersion::new(1, 3));
     assert!(proof_state(&op.body().kind, &wrong).is_err());
 }
 
@@ -243,6 +241,7 @@ fn test_switch_rules_list_and_invite_quota() {
         pubky_switch_core::claims::ClaimLimits::default()
     );
     assert_eq!(Limits::default().max_invite_codes, 1_000);
+    assert_eq!(Limits::default().max_invite_uses, MAX_INVITE_USES);
 }
 
 fn part(first_epoch: u64, last_epoch: u64, seq: u64) -> StoredPart {
@@ -289,4 +288,35 @@ fn test_switch_rules_parts_to_drop_and_cover() {
     assert!(covers(&parts, 5));
     assert!(!covers(&parts, 6));
     assert!(!covers(&[part(2, 5, 1)], 5), "epoch 1 missing");
+}
+
+#[test]
+fn test_switch_rules_a_delete_shows_deleted() {
+    let operations = vectors("operations.json");
+    let named = |name: &str| {
+        let case = operations["operations"]
+            .as_array()
+            .expect("operations")
+            .iter()
+            .find(|case| case["name"] == name)
+            .unwrap_or_else(|| panic!("no {name}"));
+        let signed: SignedDoc = serde_json::from_value(case["signed"].clone()).expect("signed");
+        SignedOp::peek(&signed).expect("op")
+    };
+    // The vectors' delete: its `ct` is the AEAD tag alone.
+    let delete = named("record.put delete");
+    let after = StateAfter::Record(RecordVersion::new(1, 12));
+    match proof_state(&delete.body().kind, &after).expect("state") {
+        ProofState::Record { version, deleted } => {
+            assert!(deleted, "a delete's proof shows deleted");
+            assert_eq!((version.generation, version.version), (1, 12));
+        }
+        other => panic!("not a record state: {other:?}"),
+    }
+    // A write with a value isn't a delete.
+    let update = named("record.put update");
+    assert!(matches!(
+        proof_state(&update.body().kind, &after).expect("state"),
+        ProofState::Record { deleted: false, .. }
+    ));
 }
