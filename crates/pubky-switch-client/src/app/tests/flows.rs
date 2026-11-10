@@ -792,22 +792,119 @@ async fn test_app_unreadable_entry_whose_call_fails_isnt_reported_asked() {
 }
 
 #[tokio::test]
-async fn test_app_restore_in_place_over_a_store_that_doesnt_read_fails() {
+async fn test_app_restore_in_place_over_a_store_that_cant_be_read_fails() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let me = app.app_id();
+    let backup = app.backup().unwrap();
+    assert!(!refuse_next(&w, &mut app).await.is_empty());
+    drop(app);
+    // The store can't be read right now: the restore fails, to be tried again.
+    let store = Arc::new(FaultStore::new(
+        Arc::clone(&w.store) as Arc<dyn StateStore>,
+        StoreFault::None,
+    ));
+    store.fail_scan(b"duty/", 0);
+    let failed = App::restore(
+        w.env_on(Arc::clone(&store) as Arc<dyn StateStore>),
+        w.protocol.clone(),
+        World::config(),
+        &backup,
+    )
+    .await;
+    assert!(
+        matches!(failed, Err(AppError::Store(crate::StoreError::Unavailable))),
+        "{:?}",
+        failed.map(|_| ())
+    );
+    // Tried again, it restores, the duty events kept.
+    let mut restored = App::restore(
+        w.env_on(Arc::clone(&store) as Arc<dyn StateStore>),
+        w.protocol.clone(),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    assert_eq!(restored.app_id(), me);
+    assert_eq!(restored.unacknowledged_events().await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn test_app_restore_in_place_leaves_behind_what_doesnt_read_and_says_so() {
     let w = World::new();
     let mut app = w.join("wallet").await;
     let backup = app.backup().unwrap();
+    let duties = refuse_next(&w, &mut app).await;
+    assert_eq!(duties.len(), 2);
+    let now = w.clock.now_ms();
+    w.switch.push_missed(1, now - HOUR, now);
+    *w.protocol.failing.lock().unwrap() = 1;
+    app.receive(None).await.unwrap();
+    // One duty event's value and the owed call's don't read.
+    let first = duties[0].id().unwrap().counter();
+    let owed = app.reader().scan_raw("owed/").await.unwrap();
+    assert_eq!(owed.len(), 1);
+    let mut batch = crate::store::WriteBatch::new();
+    batch
+        .put(
+            &app.ns,
+            crate::app::state::key::duty(first).into_bytes(),
+            b"not a value".to_vec(),
+        )
+        .unwrap();
+    batch
+        .put(
+            &app.ns,
+            format!("owed/{}", owed[0].0).into_bytes(),
+            b"not a value".to_vec(),
+        )
+        .unwrap();
+    app.env.store.commit(batch).await.unwrap();
+    drop(app);
+    let mut restored = App::restore(w.env(), w.protocol.clone(), World::config(), &backup)
+        .await
+        .unwrap();
+    let events = restored.take_events();
+    // The one that reads is carried with its ID; the protocol is told what was left.
+    assert!(events.contains(&duties[1]), "{events:?}");
+    assert!(!events.contains(&duties[0]), "{events:?}");
+    assert!(
+        has(&events, |e| e.is_duty()
+            && matches!(
+                e,
+                AppEvent::RestoreLeftBehind {
+                    duty_events: 1,
+                    owed_calls: 1,
+                    ..
+                }
+            )),
+        "{events:?}"
+    );
+    assert_eq!(restored.owed_protocol_calls().await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn test_app_restore_in_place_over_a_damaged_epoch_starts_a_new_one() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let backup = app.backup().unwrap();
+    let duties = refuse_next(&w, &mut app).await;
+    let old = last_id(&duties);
     // The store's event epoch doesn't read.
     let mut tx = app.tx().unwrap();
     tx.put(crate::app::state::key::DUTY_EPOCH, &"not an epoch")
         .unwrap();
     app.commit(tx).await.unwrap();
     drop(app);
-    let restored = App::restore(w.env(), w.protocol.clone(), World::config(), &backup).await;
-    assert!(
-        matches!(restored, Err(AppError::Store(_))),
-        "{:?}",
-        restored.map(|_| ())
-    );
+    let mut restored = App::restore(w.env(), w.protocol.clone(), World::config(), &backup)
+        .await
+        .unwrap();
+    // A new epoch: the kept duty events come again, under IDs of the new store.
+    let events = restored.take_events();
+    let ids: Vec<EventId> = events.iter().filter_map(AppEvent::id).collect();
+    assert_eq!(ids.len(), duties.len(), "{events:?}");
+    assert!(ids.iter().all(|id| !id.same_store(&old)), "{ids:?}");
 }
 
 #[tokio::test]

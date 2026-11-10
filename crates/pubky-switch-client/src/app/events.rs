@@ -493,6 +493,17 @@ pub enum AppEvent {
         /// The attempt.
         attempt_id: [u8; 16],
     },
+    /// A restore in place left behind kept duty events and owed protocol calls whose stored
+    /// values didn't read: what they said is lost, and the protocol learns only how many
+    /// (`STATE.md`, "What the app owes its protocol"). A duty event.
+    RestoreLeftBehind {
+        /// The duty event's ID.
+        id: EventId,
+        /// The duty events left behind.
+        duty_events: u64,
+        /// The owed protocol calls left behind.
+        owed_calls: u64,
+    },
     /// The account the app used is gone: the service answers as for an identity it doesn't
     /// host and the identity publishes no `identity.json` (Switch spec 12.7).
     AccountGone,
@@ -608,6 +619,7 @@ impl AppEvent {
             | Self::EffectUncertain { id, .. }
             | Self::KeptBatchDropped { id, .. }
             | Self::BatchRefused { id, .. }
+            | Self::RestoreLeftBehind { id, .. }
             | Self::AttemptDropped { id, .. }
             | Self::MessageUndelivered { id, .. } => Some(*id),
             _ => None,
@@ -675,6 +687,10 @@ pub(crate) enum Duty {
         msg_id: String,
         resend: bool,
     },
+    RestoreLeftBehind {
+        duty_events: u64,
+        owed_calls: u64,
+    },
 }
 
 impl Duty {
@@ -727,6 +743,14 @@ impl Duty {
             Self::MessageUndelivered { msg_id, resend } => {
                 AppEvent::MessageUndelivered { id, msg_id, resend }
             }
+            Self::RestoreLeftBehind {
+                duty_events,
+                owed_calls,
+            } => AppEvent::RestoreLeftBehind {
+                id,
+                duty_events,
+                owed_calls,
+            },
         }
     }
 }

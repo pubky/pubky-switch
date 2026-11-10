@@ -225,6 +225,11 @@ tell its protocol, so neither a restore nor a provider change drops them.
   events keep their IDs and are delivered again, and the owed calls are made by the next
   read. The restored cursor may meet the same items again; the protocol then hears of them
   twice, which it tolerates.
+- **A restore in place is the way out of a damaged store.** A store that can't be read
+  now fails it, to be tried again. A duty event or owed call whose value reads but
+  doesn't decode is left behind, and the protocol told how many with `RestoreLeftBehind`,
+  a duty event in the restore's commit. A damaged `dutye` or `dutyn` starts a new epoch,
+  the readable duty events kept under it.
 - **A restore on another device, or onto a wiped store** (one without an epoch), starts a new random epoch at the first counter, with none of them:
   their facts stayed with the lost store. Its IDs can't equal any the host acknowledged
   before, whatever the counters or the clock, since an ID is its epoch and its counter.

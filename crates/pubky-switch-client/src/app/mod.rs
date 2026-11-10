@@ -508,6 +508,22 @@ fn corrupt() -> AppError {
 /// The ID of a store's first duty event.
 const FIRST_DUTY: u64 = 1;
 
+/// What a restore in place carries of what the app owes its protocol
+/// ([`App::kept_for_protocol`]).
+#[derive(Default)]
+struct Carried {
+    /// The store's epoch; `None` for one that didn't read, which a new epoch replaces.
+    epoch: Option<state::DutyEpoch>,
+    /// The counter the next duty event takes.
+    next_duty: u64,
+    /// The kept duty events and owed calls that read, by key, as stored.
+    values: Vec<(String, serde_json::Value)>,
+    /// The kept duty events left behind, their values unreadable.
+    lost_duties: u64,
+    /// The owed calls left behind, their values unreadable.
+    lost_owed: u64,
+}
+
 fn missing() -> AppError {
     AppError::Store(StoreError::Corrupt)
 }
@@ -1219,16 +1235,11 @@ impl App {
                 ns: ns.clone(),
                 store: env.store.clone(),
             };
-            let (state, carried) = match Self::kept_for_protocol(&old).await? {
-                Some((duty_epoch, next_duty, carried)) => (
-                    AppState {
-                        duty_epoch,
-                        next_duty,
-                        ..state
-                    },
-                    carried,
-                ),
-                None => (state, Vec::new()),
+            let carried = Self::kept_for_protocol(&old).await?.unwrap_or_default();
+            let state = AppState {
+                duty_epoch: carried.epoch.unwrap_or(state.duty_epoch),
+                next_duty: carried.next_duty.max(FIRST_DUTY),
+                ..state
             };
             let client = Self::client_for(&env, &meta, &backup.keys, &cert)?;
             let mut app = App {
@@ -1258,8 +1269,18 @@ impl App {
                 tx.local(&layer_writes)?;
                 tx.put(key::DUTY_NEXT, &app.state.next_duty)?;
                 tx.put(key::DUTY_EPOCH, &app.state.duty_epoch)?;
-                for (stored, value) in &carried {
+                for (stored, value) in &carried.values {
                     tx.put(stored, value)?;
+                }
+                // What didn't read is left behind, and the protocol told how much.
+                if carried.lost_duties > 0 || carried.lost_owed > 0 {
+                    app.keep_duty(
+                        &mut tx,
+                        events::Duty::RestoreLeftBehind {
+                            duty_events: carried.lost_duties,
+                            owed_calls: carried.lost_owed,
+                        },
+                    )?;
                 }
                 Ok(())
             }
@@ -1628,23 +1649,54 @@ impl App {
         Ok(())
     }
 
-    /// What a restore in place carries across: the store's event epoch, the next counter,
-    /// and the kept duty events and owed protocol calls, by key, as stored. `None` for a
-    /// store that holds no epoch.
-    #[allow(clippy::type_complexity)]
-    async fn kept_for_protocol(
-        reader: &Reader,
-    ) -> Result<Option<(state::DutyEpoch, u64, Vec<(String, serde_json::Value)>)>, AppError> {
-        let Some(epoch) = reader.get::<state::DutyEpoch>(key::DUTY_EPOCH).await? else {
+    /// What a restore in place carries across. `None` for a store that holds no epoch. A
+    /// failed store read is the error: the restore can be tried again. A value that reads
+    /// but doesn't decode is left behind and counted; a damaged epoch or counter starts a
+    /// new epoch, since the kept counters may then be below IDs the host acknowledged.
+    async fn kept_for_protocol(reader: &Reader) -> Result<Option<Carried>, AppError> {
+        let Some(epoch) = reader.get_raw(key::DUTY_EPOCH.as_bytes()).await? else {
             return Ok(None);
         };
-        let mut owed = Vec::new();
-        for prefix in [key::DUTY_PREFIX, key::OWED_PREFIX] {
-            for (rest, value) in reader.scan::<serde_json::Value>(prefix).await? {
-                owed.push((format!("{prefix}{rest}"), value));
+        let epoch = state::decode::<state::DutyEpoch>(&epoch).ok();
+        let counter = match reader.get_raw(key::DUTY_NEXT.as_bytes()).await? {
+            None => Some(FIRST_DUTY),
+            Some(bytes) => state::decode::<u64>(&bytes).ok(),
+        };
+        let mut carried = Carried::default();
+        let mut past_kept = FIRST_DUTY;
+        for (rest, bytes) in reader.scan_raw(key::DUTY_PREFIX).await? {
+            let read = state::parse_num(&rest).and_then(|n| {
+                state::decode::<events::Duty>(&bytes)?;
+                Ok((n, state::decode::<serde_json::Value>(&bytes)?))
+            });
+            match read {
+                Ok((n, value)) => {
+                    past_kept = past_kept.max(n.checked_add(1).ok_or_else(corrupt)?);
+                    carried
+                        .values
+                        .push((format!("{}{rest}", key::DUTY_PREFIX), value));
+                }
+                Err(_) => carried.lost_duties = carried.lost_duties.saturating_add(1),
             }
         }
-        Ok(Some((epoch, Self::next_duty(reader).await?, owed)))
+        for (rest, bytes) in reader.scan_raw(key::OWED_PREFIX).await? {
+            let read = state::decode::<feed::OwedCall>(&bytes)
+                .and_then(|_| state::decode::<serde_json::Value>(&bytes));
+            match read {
+                Ok(value) => carried
+                    .values
+                    .push((format!("{}{rest}", key::OWED_PREFIX), value)),
+                Err(_) => carried.lost_owed = carried.lost_owed.saturating_add(1),
+            }
+        }
+        match (epoch, counter) {
+            (Some(epoch), Some(counter)) => {
+                carried.epoch = Some(epoch);
+                carried.next_duty = counter.max(past_kept);
+            }
+            _ => carried.next_duty = past_kept,
+        }
+        Ok(Some(carried))
     }
 
     /// The ID the next duty event takes: past the counter and every kept event.
