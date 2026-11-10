@@ -11,6 +11,8 @@ pub enum Source {
     Switch,
     /// The Homeserver's copy.
     Homeserver,
+    /// The signer backup on the Homeserver.
+    Backup,
 }
 
 /// Something the user needs to know.

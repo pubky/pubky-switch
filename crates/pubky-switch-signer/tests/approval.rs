@@ -410,6 +410,28 @@ async fn test_approval_claim_is_held_while_another_install_signs() {
 }
 
 #[tokio::test]
+async fn test_approval_claim_is_held_while_the_records_are_behind() {
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let app = App::new(&["notes"], None, [9; 32]);
+    let review = signer.review(&app.request, &app.auth).unwrap();
+    let approved = signer.approve(review).await.unwrap();
+    assert!(signer.approved(&approved.request).unwrap().is_some());
+    // The switch then shows a newer version of this install's own.
+    let newest = signer.identity_doc().unwrap().unwrap();
+    world
+        .switch
+        .deliver_identity(&world.other_install_version(&newest, signer.install_id()))
+        .unwrap();
+    let error = signer.set_record_max_age(Some(86_400)).await.unwrap_err();
+    assert!(
+        matches!(error, SignerError::Refused(Refusal::RecordsBehind { .. })),
+        "{error:?}"
+    );
+    assert!(signer.approved(&approved.request).unwrap().is_none());
+}
+
+#[tokio::test]
 async fn test_approval_a_refused_delivery_leaves_no_certificate() {
     use pubky_switch_client::testing::Fault as SwitchFault;
     use pubky_switch_core::http::ErrorCode;

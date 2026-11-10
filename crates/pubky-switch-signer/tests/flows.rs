@@ -143,7 +143,7 @@ async fn test_signer_a_backup_write_that_fails_stops_the_delivery() {
 async fn test_signer_refuses_a_new_version_while_a_flow_is_in_progress() {
     let world = World::new();
     let (mut signer, _) = world.enrolled().await;
-    *world.homeserver.down.lock().unwrap() = true;
+    *world.homeserver.failing_puts.lock().unwrap() = true;
     signer.set_record_max_age(Some(86_400)).await.unwrap_err();
     let error = signer.set_record_max_age(Some(3_600)).await.unwrap_err();
     assert_eq!(error, SignerError::Refused(Refusal::FlowInProgress));
@@ -637,29 +637,39 @@ async fn test_signer_a_resumed_publication_never_overwrites_a_newer_identity() {
 }
 
 #[tokio::test]
-async fn test_signer_publishes_nothing_over_a_newer_homeserver_copy() {
+async fn test_signer_another_body_at_the_mark_on_the_homeserver_is_an_alarm() {
+    // Version 2 reaches the switch but not the Homeserver, which then shows another body at
+    // version 2: equivocation, as from the switch, and it isn't written over (Switch spec
+    // 4.3).
     let world = World::new();
     let (mut signer, _) = world.enrolled().await;
-    let first = signer.identity_doc().unwrap().unwrap();
-    // The Homeserver holds a version 2 the switch never took.
-    let ahead = world.other_install_version(&first, signer.install_id());
-    world.homeserver.set(
-        pubky_switch_core::records::IDENTITY_PATH,
-        serde_json::to_vec(ahead.signed()).unwrap(),
-    );
     *world.homeserver.failing_path.lock().unwrap() =
         Some(pubky_switch_core::records::IDENTITY_PATH.into());
     let error = signer.set_record_max_age(Some(86_400)).await.unwrap_err();
     assert!(matches!(error, SignerError::Homeserver(_)), "{error:?}");
     *world.homeserver.failing_path.lock().unwrap() = None;
-    // Its own version 2 is at the switch; the Homeserver's other version 2 isn't newer, so
-    // the switch's copy is published over it, as wire 3.3 says.
-    signer.resume().await.unwrap();
-    assert_eq!(
-        world.published().unwrap().signed(),
-        world.switch.identity_doc().unwrap().signed()
+    let two = world.switch.identity_doc().unwrap();
+    let mut body = two.body().clone();
+    body.record_max_age = Some(60);
+    let other = IdentityDoc::sign(&world.key, body).unwrap();
+    world.homeserver.set(
+        pubky_switch_core::records::IDENTITY_PATH,
+        serde_json::to_vec(other.signed()).unwrap(),
     );
-    world.assert_no_version_sent_twice();
+    let alert = Alert::Equivocation {
+        source: Source::Homeserver,
+        version: 2,
+    };
+    assert_eq!(
+        signer.resume().await.unwrap_err(),
+        SignerError::Alarm(alert.clone())
+    );
+    assert!(signer.alerts().contains(&alert));
+    assert_eq!(world.published().unwrap().signed(), other.signed());
+    // Nor is anything signed on top of it.
+    let sent = world.sent_docs().len();
+    signer.set_record_max_age(Some(3_600)).await.unwrap_err();
+    assert_eq!(world.sent_docs().len(), sent);
 }
 
 #[tokio::test]
@@ -679,19 +689,21 @@ async fn test_signer_a_newer_homeserver_version_of_its_own_stops_signing() {
         serde_json::to_vec(nine.signed()).unwrap(),
     );
     let behind = SignerError::Refused(Refusal::RecordsBehind { version: 9 });
+    let sent = world.sent_docs().len();
     let error = signer.set_record_max_age(Some(3_600)).await.unwrap_err();
     assert_eq!(error, behind);
+    // Found before anything was signed: nothing was sent.
+    assert_eq!(world.sent_docs().len(), sent);
     let alert = Alert::RecordsBehind {
         source: Source::Homeserver,
         version: 9,
-        high_water_version: 2,
+        high_water_version: 1,
     };
     assert!(signer.alerts().contains(&alert));
     assert_eq!(signer.status(), SignerStatus::RecordsBehind { version: 9 });
     // It stays so, cleared alert or not, and the Homeserver keeps version 9.
     signer.clear_alert(&alert).await.unwrap();
     assert!(signer.alerts().contains(&alert));
-    let sent = world.sent_docs().len();
     for seconds in [60, 120] {
         let error = signer.set_record_max_age(Some(seconds)).await.unwrap_err();
         assert_eq!(error, behind);
@@ -699,6 +711,115 @@ async fn test_signer_a_newer_homeserver_version_of_its_own_stops_signing() {
     assert_eq!(world.sent_docs().len(), sent);
     assert!(world.sent_docs().iter().all(|d| d.version() < 9));
     assert_eq!(world.published().unwrap().signed(), nine.signed());
+}
+
+/// A version `version` of this install's own above `doc`, at data epoch 2, and its signer
+/// backup, as the install wrote them before its records went back.
+fn own_newer(world: &World, doc: &IdentityDoc, version: u64) -> (IdentityDoc, Vec<u8>) {
+    let mut body = doc.body().clone();
+    body.version = version;
+    body.data_epoch = 2;
+    let newer = IdentityDoc::sign(&world.key, body).unwrap();
+    let records = SignerRecords::new(
+        IdentityKey::from_secret(SECRET),
+        newer.clone(),
+        &[],
+        &[],
+        Limits::default(),
+        &[],
+        None,
+    )
+    .unwrap();
+    let backup = SignerBackup::seal(&world.key, &records).unwrap();
+    (newer, serde_json::to_vec(&backup).unwrap())
+}
+
+#[tokio::test]
+async fn test_signer_records_behind_keep_the_backup_to_restore_from() {
+    // The switch and the signer backup hold this install's own version 9, and the store,
+    // reopened, holds its records at version 1, as after a restore of an old device backup.
+    // A change is refused before anything is signed: no version 2 is backed up or sent, so
+    // the backup still holds version 9 to restore from (Switch wire 3.13).
+    let world = World::new();
+    let (signer, memory) = world.enrolled().await;
+    let first = signer.identity_doc().unwrap().unwrap();
+    drop(signer);
+    let (nine, backup) = own_newer(&world, &first, 9);
+    world.switch.deliver_identity(&nine).unwrap();
+    world.homeserver.set(SIGNER_BACKUP_PATH, backup);
+    let sent = world.sent_docs().len();
+    let mut signer = Signer::open(world.env(memory.clone()), world.keyring())
+        .await
+        .unwrap();
+    let behind = SignerError::Refused(Refusal::RecordsBehind { version: 9 });
+    assert_eq!(
+        signer.set_record_max_age(Some(3_600)).await.unwrap_err(),
+        behind
+    );
+    assert_eq!(world.backup().identity_doc().signed(), nine.signed());
+    assert_eq!(world.sent_docs().len(), sent);
+    assert_eq!(world.switch.identity_doc().unwrap().signed(), nine.signed());
+    // Reopened again, it stays behind.
+    drop(signer);
+    let mut signer = Signer::open(world.env(memory), world.keyring())
+        .await
+        .unwrap();
+    assert_eq!(signer.status(), SignerStatus::RecordsBehind { version: 9 });
+    assert_eq!(
+        signer.set_record_max_age(Some(60)).await.unwrap_err(),
+        behind
+    );
+    assert_eq!(world.backup().identity_doc().signed(), nine.signed());
+    assert_eq!(world.sent_docs().len(), sent);
+}
+
+#[tokio::test]
+async fn test_signer_a_newer_own_backup_alone_shows_the_records_behind() {
+    // Only the backup holds the newer version: the switch is still at version 1.
+    let world = World::new();
+    let (signer, memory) = world.enrolled().await;
+    let first = signer.identity_doc().unwrap().unwrap();
+    drop(signer);
+    let (nine, backup) = own_newer(&world, &first, 9);
+    world.homeserver.set(SIGNER_BACKUP_PATH, backup);
+    let mut signer = Signer::open(world.env(memory), world.keyring())
+        .await
+        .unwrap();
+    let error = signer.set_record_max_age(Some(3_600)).await.unwrap_err();
+    assert_eq!(
+        error,
+        SignerError::Refused(Refusal::RecordsBehind { version: 9 })
+    );
+    assert!(signer.alerts().contains(&Alert::RecordsBehind {
+        source: Source::Backup,
+        version: 9,
+        high_water_version: 1,
+    }));
+    assert_eq!(world.backup().identity_doc().signed(), nine.signed());
+    assert_eq!(world.switch.identity_doc().unwrap().version(), 1);
+}
+
+#[tokio::test]
+async fn test_signer_a_resumed_backup_write_never_overwrites_a_newer_own_backup() {
+    // A version 2 was signed and its backup write failed. Meanwhile the Homeserver shows a
+    // backup of this install's own version 9: the resumed write stops there, so the backup
+    // to restore from stays, and version 2 is never sent.
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let first = signer.identity_doc().unwrap().unwrap();
+    *world.homeserver.failing_path.lock().unwrap() = Some(SIGNER_BACKUP_PATH.into());
+    let error = signer.set_record_max_age(Some(3_600)).await.unwrap_err();
+    assert!(matches!(error, SignerError::Homeserver(_)), "{error:?}");
+    *world.homeserver.failing_path.lock().unwrap() = None;
+    let (nine, backup) = own_newer(&world, &first, 9);
+    world.homeserver.set(SIGNER_BACKUP_PATH, backup);
+    let error = signer.resume().await.unwrap_err();
+    assert_eq!(
+        error,
+        SignerError::Refused(Refusal::RecordsBehind { version: 9 })
+    );
+    assert_eq!(world.backup().identity_doc().signed(), nine.signed());
+    assert!(world.sent_docs().iter().all(|d| d.version() < 2));
 }
 
 #[tokio::test]

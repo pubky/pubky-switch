@@ -275,7 +275,10 @@ impl Signer {
         let Some(held) = self.state.claims.iter().find(|c| &c.request == request) else {
             return Ok(None);
         };
-        if self.state.switch_unconfirmed || self.state.managed_by.is_some() {
+        if self.state.switch_unconfirmed
+            || self.state.managed_by.is_some()
+            || self.state.records_behind.is_some()
+        {
             return Ok(None);
         }
         let published = self.state.newest.as_ref().is_some_and(|n| n.published);
