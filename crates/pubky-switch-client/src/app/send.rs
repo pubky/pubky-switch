@@ -868,14 +868,17 @@ impl App {
     /// One try of each job of one message. Returns whether a delivery was given up as
     /// undeliverable.
     ///
-    /// A try whose writes are over the store's sizes ([`StoreError::TooLarge`]) would be
-    /// refused the same way at every flush, and hold up none of the others: the message is
-    /// given up for good, deleted from the outbox with its plaintext in one commit with
-    /// [`AppEvent::MessageUndelivered`](super::AppEvent::MessageUndelivered) for the
-    /// protocol, and the flush goes on.
+    /// A try whose own writes are over the store's sizes ([`StoreError::TooLarge`]), the
+    /// message's outbox record or its sent copy, would be refused the same way at every
+    /// flush: the delivery is given up for good, as [`App::drop_undeliverable`] gives one
+    /// up, and the flush goes on. A counterparty's directory too large to cache isn't one
+    /// of its writes: it is read again at each send instead (`directory.rs`).
     async fn flush_item(&mut self, msg_id: &str) -> Result<bool, AppError> {
         match self.try_item(msg_id).await {
             Err(AppError::Store(StoreError::TooLarge { .. })) => {
+                // The refused commit may have left memory ahead of the store: read it again
+                // before going on.
+                self.reload_now().await?;
                 self.give_up_too_large(msg_id).await?;
                 Ok(true)
             }
@@ -883,24 +886,45 @@ impl App {
         }
     }
 
-    /// Give up a message whose try is too large for the store: see [`App::flush_item`].
+    /// Give up the delivery of a message whose try is too large for the store, in one
+    /// commit with [`AppEvent::MessageUndelivered`](super::AppEvent::MessageUndelivered): a
+    /// message never accepted is deleted, plaintext and all; one accepted before keeps its
+    /// record while its record job is owed, and only the re-send is given up.
     async fn give_up_too_large(&mut self, msg_id: &str) -> Result<(), AppError> {
-        let accepted = self
-            .reader()
-            .get::<OutboxItem>(&out_key(msg_id))
-            .await?
-            .is_some_and(|item| item.accepted_at_ms.is_some());
-        let resend = accepted || self.reader().exists(&sent_key(msg_id)).await?;
-        let mut tx = self.tx()?;
-        tx.delete(&out_key(msg_id))?;
-        self.keep_duty(
-            &mut tx,
-            Duty::MessageUndelivered {
-                msg_id: msg_id.to_owned(),
-                resend,
-            },
-        )?;
-        self.commit(tx).await
+        let Some(mut item) = self.reader().get::<OutboxItem>(&out_key(msg_id)).await? else {
+            return Ok(());
+        };
+        let resend =
+            item.accepted_at_ms.is_some() || self.reader().exists(&sent_key(msg_id)).await?;
+        item.resend = false;
+        item.sealed = None;
+        item.clear_undeliverable();
+        let fits = u64::try_from(super::state::encode(&item)?.len())
+            .is_ok_and(|size| size <= crate::store::MAX_VALUE_BYTES);
+        let mut gone = item.accepted_at_ms.is_none() || item.complete() || !fits;
+        loop {
+            let mut tx = self.tx()?;
+            if gone {
+                tx.delete(&out_key(msg_id))?;
+            } else {
+                tx.put(&out_key(msg_id), &item)?;
+            }
+            self.keep_duty(
+                &mut tx,
+                Duty::MessageUndelivered {
+                    msg_id: msg_id.to_owned(),
+                    resend,
+                },
+            )?;
+            match self.commit(tx).await {
+                // A record that still doesn't fit goes too, its record job with it.
+                Err(AppError::Store(StoreError::TooLarge { .. })) if !gone => {
+                    self.reload_now().await?;
+                    gone = true;
+                }
+                committed => return committed,
+            }
+        }
     }
 
     async fn try_item(&mut self, msg_id: &str) -> Result<bool, AppError> {

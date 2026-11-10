@@ -1201,6 +1201,82 @@ async fn test_outbox_try_too_large_for_the_store_gives_the_message_up() {
 }
 
 #[tokio::test]
+async fn test_outbox_message_too_large_for_the_store_holds_up_no_later_one() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let store = Arc::new(FaultStore::new(
+        Arc::new(MemoryStore::new()),
+        StoreFault::None,
+    ));
+    let mut wallet = p
+        .join_on(
+            &p.alice,
+            "wallet",
+            protocol.clone(),
+            Arc::clone(&store) as Arc<dyn StateStore>,
+        )
+        .await;
+    let mut shop = p.join(&p.bob, "shop", &protocol).await;
+    let (first, _) = wallet.send(Pair::note(&p.bob, "first")).await.unwrap();
+    let (second, _) = wallet.send(Pair::note(&p.bob, "second")).await.unwrap();
+    // Only the first message's own writes are over the store's sizes now.
+    store.refuse_puts_as_too_large(Some(format!("out/{first}").as_bytes()));
+    shop.invite(&p.alice.identity().public()).await.unwrap();
+    let report = wallet.flush_outbox().await.unwrap();
+    assert_eq!(report.undelivered, vec![first.clone()]);
+    // The flush went on to the later message, which is delivered.
+    assert_eq!(report.done, vec![second.clone()], "{report:?}");
+    assert!(matches!(
+        wallet.delivery(&second).await.unwrap(),
+        Some(Delivery::Accepted { .. })
+    ));
+}
+
+#[tokio::test]
+async fn test_send_to_a_directory_too_large_to_cache_goes_and_caches_none() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let store = Arc::new(FaultStore::new(
+        Arc::new(MemoryStore::new()),
+        StoreFault::None,
+    ));
+    let mut wallet = p
+        .join_on(
+            &p.alice,
+            "wallet",
+            protocol.clone(),
+            Arc::clone(&store) as Arc<dyn StateStore>,
+        )
+        .await;
+    let mut shop = p.join(&p.bob, "shop", &protocol).await;
+    shop.invite(&p.alice.identity().public()).await.unwrap();
+    // Bob's directory doesn't fit one value of the wallet's store.
+    store.refuse_puts_as_too_large(Some(b"dir/"));
+    let reads = directory_reads(&p);
+    for text in ["one", "two"] {
+        let (msg_id, delivery) = wallet.send(Pair::note(&p.bob, text)).await.unwrap();
+        assert!(
+            matches!(delivery, Delivery::Accepted { .. }),
+            "{delivery:?}"
+        );
+        assert!(matches!(
+            wallet.delivery(&msg_id).await.unwrap(),
+            Some(Delivery::Accepted { .. })
+        ));
+    }
+    // Nothing cached: each send read it again.
+    assert_eq!(directory_reads(&p), reads + 2);
+    let ns = crate::store::client_namespace(&wallet.app_id());
+    assert!(
+        store
+            .inner()
+            .scan(&ns, b"dir/", None, 10)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
 async fn test_scripted_inbox_admits_after_an_invite_and_delivers() {
     let p = Pair::new();
     let protocol = ApiProtocol::new(Mode::Plain);
