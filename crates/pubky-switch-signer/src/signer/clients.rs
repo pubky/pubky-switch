@@ -7,15 +7,51 @@
 //! freeze, an unfreeze, an erasure or a hand-over, belongs on it. Each has only the calls its
 //! kind may make.
 
+use std::sync::Arc;
+
 use pubky_switch_client::client::answers::{AppsAnswer, WriteAnswer};
 use pubky_switch_client::client::{Batch, Submitted};
-use pubky_switch_client::{ClientError, SwitchClient};
+use pubky_switch_client::{ClientError, Credentials, SwitchClient};
 use pubky_switch_core::http::IdentityDelivery;
 use pubky_switch_core::ops::{Condition, OpKind, Position};
 use pubky_switch_core::records::{Enrollment, EnrollmentAnswer};
+use pubky_switch_core::signing::Signs;
 
+use super::SignerEnv;
 use crate::error::{Refusal, Result, SignerError};
+use crate::key::{IdentityKeyring, SigningKey};
 use crate::state::SignerState;
+
+/// Where a client of the identity goes: the switch's origin, its pinned service key if known,
+/// and the identity.
+pub(crate) struct Target<'a> {
+    /// The switch's origin.
+    pub(crate) origin: &'a str,
+    /// The pinned service key; `None` before the enrollment answers.
+    pub(crate) pinned: Option<[u8; 32]>,
+    /// The identity.
+    pub(crate) identity: [u8; 32],
+}
+
+/// A client for `target`, signing with `key` (Switch wire 7.2). Private: each client type
+/// makes its own, from the key its kind may hold.
+fn client(
+    env: &SignerEnv,
+    target: &Target<'_>,
+    key: Arc<dyn Signs + Send + Sync>,
+) -> Result<SwitchClient> {
+    Ok(SwitchClient::new(
+        target.origin,
+        target.identity,
+        Credentials::Signer {
+            identity: target.identity,
+            key,
+        },
+        target.pinned,
+        Arc::clone(&env.transport),
+        Arc::clone(&env.clock),
+    )?)
+}
 
 /// That this install is the one named and its records aren't behind: only [`Named::check`]
 /// makes one. A revocation at the switch takes it instead of the full signing gate, so an
@@ -42,9 +78,19 @@ impl Named {
 }
 
 /// A switch client whose credentials sign requests only.
-pub(crate) struct RequestClient(pub(super) SwitchClient);
+pub(crate) struct RequestClient(SwitchClient);
 
 impl RequestClient {
+    /// A client for `target` whose credentials sign requests only
+    /// ([`IdentityKeyring::request_signer`]).
+    pub(crate) fn new(
+        env: &SignerEnv,
+        target: &Target<'_>,
+        keyring: &IdentityKeyring,
+    ) -> Result<Self> {
+        Ok(Self(client(env, target, keyring.request_signer()?)?))
+    }
+
     /// `GET /apps` (Switch wire 7.4.12).
     pub(crate) async fn apps(&self) -> std::result::Result<AppsAnswer, ClientError> {
         self.0.apps().await
@@ -87,9 +133,14 @@ impl RequestClient {
 }
 
 /// A switch client made from the gated key.
-pub(crate) struct SigningClient(pub(super) SwitchClient);
+pub(crate) struct SigningClient(SwitchClient);
 
 impl SigningClient {
+    /// A client for `target` that signs with `key`, which only the signing gate hands out.
+    pub(crate) fn new(env: &SignerEnv, target: &Target<'_>, key: &SigningKey) -> Result<Self> {
+        Ok(Self(client(env, target, key.signer())?))
+    }
+
     /// Sign `ops` as one batch at `generation` (Switch wire 6.4).
     pub(crate) fn sign_batch(
         &self,

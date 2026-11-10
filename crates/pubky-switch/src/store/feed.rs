@@ -19,12 +19,23 @@ use sqlx::Row;
 
 use super::{StoreError, from_db, identity::decode_doc, to_db};
 
-/// The account's sequence as one page reads it, and the documents current among the seqs
-/// the page may cover.
+/// The account's sequence as one page reads it, what the reader's authentication reads,
+/// and the documents current among the seqs the page may cover.
 #[derive(Clone, Debug, Default)]
 pub struct FeedSnapshot {
     /// The generation the account serves.
     pub generation: u64,
+    /// The generation's service key, by its key store ID.
+    pub service_key: String,
+    /// The last service time the account stamped.
+    pub stamped_time_ms: u64,
+    /// The newest `identity.json` the account holds.
+    pub identity_doc: Option<SignedDoc>,
+    /// The reader's app row.
+    pub reader: Option<super::StoredApp>,
+    /// Whether the reader's App ID is kept for good: revoked, departed, or named by an
+    /// enrollment.
+    pub reader_kept: bool,
     /// The last `seq` given out.
     pub last_seq: u64,
     /// The newest chain item's `seq` and chain hash; `None` before the first.
@@ -129,28 +140,37 @@ fn row_of(row: &sqlx::postgres::PgRow) -> Result<FeedRow, StoreError> {
     })
 }
 
-/// Read one page of account `id` from one snapshot: the sequence, then the chain items
-/// after `after` up to `positions` positions on, and as many after those as finish a batch
-/// (`batch_tail`), in `seq` order. `take` sees each item and answers whether the page
-/// wants the next. `None` for an account that isn't there.
-pub(super) async fn read_feed<F>(
+/// What builds a page from a snapshot: it decides first, from what the reader's
+/// authentication reads, whether to read any item, then sees the items in `seq` order.
+pub trait PageReader {
+    /// Whether the page reads items at all; `false` stops before the first.
+    fn begin(&mut self, snapshot: &FeedSnapshot) -> bool;
+    /// See the next item; whether the page wants the one after.
+    fn take(&mut self, snapshot: &FeedSnapshot, row: FeedRow) -> bool;
+}
+
+/// Read one page of account `id` for its app `reader` from one snapshot: the sequence and
+/// what the reader's authentication reads, then, if `page` begins, the chain items after
+/// `after` up to `positions` positions on, and as many after those as finish a batch
+/// (`batch_tail`), in `seq` order. `None` for an account that isn't there.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn read_feed(
     pool: &sqlx::PgPool,
     id: &str,
+    reader: &[u8; 16],
     after: Option<Position>,
     positions: u64,
     batch_tail: u64,
-    mut take: F,
-) -> Result<Option<FeedSnapshot>, StoreError>
-where
-    F: FnMut(&FeedSnapshot, FeedRow) -> bool,
-{
+    page: &mut impl PageReader,
+) -> Result<Option<FeedSnapshot>, StoreError> {
     let mut tx = pool.begin().await.map_err(StoreError::from_db)?;
     sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
         .execute(&mut *tx)
         .await
         .map_err(StoreError::from_db)?;
     let Some(row) = sqlx::query(
-        "SELECT generation, last_seq, chain_seq, chain_hash FROM accounts WHERE id = $1",
+        "SELECT generation, last_seq, chain_seq, chain_hash, service_key, stamped_time_ms, \
+         identity_doc FROM accounts WHERE id = $1",
     )
     .bind(id)
     .fetch_optional(&mut *tx)
@@ -173,15 +193,31 @@ where
         .filter(|position| position.generation == generation)
         .map_or(0, |position| position.seq);
     let window_end = start.saturating_add(positions).min(last_seq);
+    let identity_doc: Option<Vec<u8>> = row.try_get("identity_doc")?;
+    let reader_kept: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM kept_app_ids WHERE account_id = $1 AND app_id = $2)",
+    )
+    .bind(id)
+    .bind(reader.as_slice())
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(StoreError::from_db)?;
     let mut snapshot = FeedSnapshot {
         generation,
+        service_key: row.try_get("service_key")?,
+        stamped_time_ms: from_db(row.try_get("stamped_time_ms")?, "stamped_time_ms")?,
+        identity_doc: identity_doc
+            .map(|bytes| decode_doc(&bytes, "identity_doc"))
+            .transpose()?,
+        reader: super::ops::app_row(&mut *tx, id, reader).await?,
+        reader_kept,
         last_seq,
         chain,
         start,
         window_end,
         current: CurrentDocs::default(),
     };
-    if start >= last_seq {
+    if !page.begin(&snapshot) || start >= last_seq {
         tx.rollback().await.map_err(StoreError::from_db)?;
         return Ok(Some(snapshot));
     }
@@ -201,7 +237,7 @@ where
     .bind(high)
     .fetch(&mut *tx);
     while let Some(row) = rows.try_next().await.map_err(StoreError::from_db)? {
-        if !take(&snapshot, row_of(&row)?) {
+        if !page.take(&snapshot, row_of(&row)?) {
             break;
         }
     }

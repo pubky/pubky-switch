@@ -999,8 +999,8 @@ pub(super) async fn own_app_view(
 }
 
 /// The `apps` row of `app_id` at account `id`, read without the account's lock.
-pub(super) async fn app_row(
-    pool: &sqlx::PgPool,
+pub(super) async fn app_row<'c>(
+    conn: impl sqlx::PgExecutor<'c>,
     id: &str,
     app_id: &[u8; 16],
 ) -> Result<Option<StoredApp>, StoreError> {
@@ -1011,7 +1011,7 @@ pub(super) async fn app_row(
     )
     .bind(id)
     .bind(app_id.as_slice())
-    .fetch_optional(pool)
+    .fetch_optional(conn)
     .await
     .map_err(db)?;
     row.as_ref().map(app_of).transpose()
