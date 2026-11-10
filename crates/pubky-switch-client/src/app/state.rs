@@ -375,6 +375,54 @@ impl DutyEpoch {
     }
 }
 
+/// `parkn`: where the retries of entries stored locally stand. A round covers the entries
+/// stored when it began, `seq` at most `end`, in `seq` order from `next` on; one stored
+/// later waits for the next round, so every entry is tried within two rounds, each of
+/// at most as many reads as it covers entries over the per-read bound.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ParkedRound {
+    /// The lowest `seq` the round has yet to try.
+    pub(crate) next: u64,
+    /// The highest `seq` the round covers.
+    pub(crate) end: u64,
+}
+
+impl ParkedRound {
+    /// The entries of `due`, in ascending `seq` order, one read tries, at most `cap`, and
+    /// where the round stands after them. A round that runs out begins the next one, over
+    /// every entry of `due`, which fills the rest of the read.
+    pub(crate) fn turn(self, due: &[u64], cap: usize) -> (Vec<u64>, ParkedRound) {
+        let covers = |round: &ParkedRound, seq: u64| seq >= round.next && seq <= round.end;
+        let mut round = self;
+        let mut seqs: Vec<u64> = due
+            .iter()
+            .copied()
+            .filter(|seq| covers(&round, *seq))
+            .take(cap)
+            .collect();
+        if let Some(last) = seqs.last() {
+            round.next = last.saturating_add(1);
+        }
+        if seqs.len() < cap {
+            round = ParkedRound {
+                next: 0,
+                end: due.last().copied().unwrap_or(0),
+            };
+            let more: Vec<u64> = due
+                .iter()
+                .copied()
+                .filter(|seq| covers(&round, *seq) && !seqs.contains(seq))
+                .take(cap.saturating_sub(seqs.len()))
+                .collect();
+            if let Some(last) = more.last() {
+                round.next = last.saturating_add(1);
+            }
+            seqs.extend(more);
+        }
+        (seqs, round)
+    }
+}
+
 /// `held/<seq>`: an entry held because its sender can't be checked yet (Switch spec 8.2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct HeldEntry {
@@ -736,6 +784,47 @@ mod tests {
     use super::*;
     use crate::store::{MemoryStore, StateStore};
     use std::sync::Arc;
+
+    #[test]
+    fn test_parked_round_reaches_every_entry_however_many_come_later() {
+        let cap = 4;
+        let mut due: Vec<u64> = (1..=6).collect();
+        let mut round = ParkedRound::default();
+        let mut last_try: BTreeMap<u64, usize> = BTreeMap::new();
+        let mut tries: BTreeMap<u64, usize> = BTreeMap::new();
+        let mut next_seq = 100;
+        for read in 1..=60usize {
+            let (seqs, after) = round.turn(&due, cap);
+            assert!(seqs.len() <= cap);
+            let mut unique = seqs.clone();
+            unique.dedup();
+            assert_eq!(unique.len(), seqs.len(), "no entry twice in a read");
+            round = after;
+            for seq in seqs {
+                last_try.insert(seq, read);
+                *tries.entry(seq).or_insert(0) += 1;
+            }
+            // The earliest entries are tried again within two rounds of the entries there
+            // are: however many come later, none waits for ever.
+            let rounds = 2 * due.len().div_ceil(cap) + 1;
+            for seq in 1..=6u64 {
+                let at = last_try.get(&seq).copied().unwrap_or(0);
+                assert!(read - at <= rounds, "{seq}: last tried {at}, now {read}");
+            }
+            // Each read stores more entries than the bound, all above every earlier one.
+            for _ in 0..cap + 2 {
+                due.push(next_seq);
+                next_seq += 1;
+            }
+        }
+        // Round after round, the earliest entries come back.
+        for seq in 1..=6u64 {
+            assert!(
+                tries.get(&seq).copied().unwrap_or(0) >= 3,
+                "{seq}: {tries:?}"
+            );
+        }
+    }
 
     #[test]
     fn test_record_round_trips_with_its_schema_version() {

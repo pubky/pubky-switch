@@ -448,9 +448,9 @@ pub(crate) struct AppState {
     pub(crate) chain: Option<ChainView>,
     pub(crate) held: BTreeMap<u64, HeldEntry>,
     pub(crate) retries: BTreeMap<u64, RetryEntry>,
-    /// The `seq` the next read's retries of stored entries start from (`parkn`), so a
-    /// bounded number each read reaches every one in turn.
-    pub(crate) parked_next: u64,
+    /// Where the retries of stored entries stand in their round (`parkn`), so a bounded
+    /// number each read reaches every one in turn.
+    pub(crate) parked_round: state::ParkedRound,
     pub(crate) seen: BTreeSet<u64>,
     pub(crate) asked: BTreeSet<u64>,
     pub(crate) parked: BTreeMap<u64, ParkedEntry>,
@@ -638,7 +638,7 @@ impl App {
                 chain: None,
                 held: BTreeMap::new(),
                 retries: BTreeMap::new(),
-                parked_next: 0,
+                parked_round: state::ParkedRound::default(),
                 seen: BTreeSet::new(),
                 asked: BTreeSet::new(),
                 parked: BTreeMap::new(),
@@ -855,7 +855,7 @@ impl App {
             chain: ChainView::load(reader).await?,
             held: reader.scan_numbered("held/").await?,
             retries: reader.scan_numbered("retry/").await?,
-            parked_next: reader.get(key::PARKED_NEXT).await?.unwrap_or(0),
+            parked_round: reader.get(key::PARKED_NEXT).await?.unwrap_or_default(),
             seen: reader.scan_numbers("seen/").await?,
             asked: reader.scan_numbers("asked/").await?,
             parked: reader.scan_numbered("parked/").await?,
@@ -1202,7 +1202,7 @@ impl App {
                 chain: Some(chain),
                 held: BTreeMap::new(),
                 retries: BTreeMap::new(),
-                parked_next: 0,
+                parked_round: state::ParkedRound::default(),
                 seen,
                 asked: BTreeSet::new(),
                 parked,

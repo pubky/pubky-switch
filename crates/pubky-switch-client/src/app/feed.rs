@@ -1399,17 +1399,11 @@ impl App {
         if due.is_empty() {
             return Ok(());
         }
-        let start = self.state.parked_next;
-        let (before, after): (Vec<u64>, Vec<u64>) = due.iter().partition(|seq| **seq < start);
-        let seqs: Vec<u64> = after
-            .into_iter()
-            .chain(before)
-            .take(PARKED_RETRIES_PER_READ)
-            .collect();
-        if let Some(last) = seqs.last() {
-            self.state.parked_next = last.saturating_add(1);
+        let (seqs, round) = self.state.parked_round.turn(&due, PARKED_RETRIES_PER_READ);
+        if round != self.state.parked_round {
+            self.state.parked_round = round;
             let mut tx = self.tx()?;
-            tx.put(key::PARKED_NEXT, &self.state.parked_next)?;
+            tx.put(key::PARKED_NEXT, &round)?;
             self.commit(tx).await?;
         }
         for seq in seqs {
