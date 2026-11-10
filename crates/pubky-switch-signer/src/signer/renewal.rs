@@ -38,7 +38,7 @@
 use pubky_switch_client::ClientError;
 use pubky_switch_client::client::Batch;
 use pubky_switch_client::client::answers::AppStatus;
-use pubky_switch_core::keys::IdentityKey;
+
 use pubky_switch_core::ops::{KeyBundlePut, OpKind};
 use pubky_switch_core::records::{
     AppCert, AppCertBody, BundlePart, CLOCK_TOLERANCE_MS, IdentityDoc, MAX_CERT_LIFETIME_MS,
@@ -50,6 +50,7 @@ use pubky_switch_core::sig::SignedDoc;
 use super::Signer;
 use crate::alert::Alert;
 use crate::error::{Refusal, Result, SignerError};
+use crate::key::SigningKey;
 use crate::protocol::Protocols;
 use crate::state::{Bytes, DeliverStep, Flow, RenewBatch, SignerState};
 
@@ -108,7 +109,7 @@ impl Signer {
             return Err(Refusal::NotJoined.into());
         }
 
-        let key = self.keyring.unlock()?;
+        let key = self.signing_key()?;
         let new = AppCert::issue(
             &key,
             AppCertBody::new(
@@ -150,7 +151,7 @@ impl Signer {
             current
         };
 
-        let key = self.keyring.unlock()?;
+        let key = self.signing_key()?;
         // The full bundle for the new certificate, the cert.put in its first batch.
         let mut ops = vec![(
             OpKind::CertPut {
@@ -168,7 +169,7 @@ impl Signer {
             ops.extend(more);
             alerts = skipped;
         }
-        let batches = self.sign_batches(newest.generation(), ops)?;
+        let batches = self.sign_batches(&key, newest.generation(), ops)?;
         let (doc, flow) = self.next_version(&key, |body| {
             if let Some(listed) = body.apps.iter_mut().find(|a| a.app_id == app_id) {
                 listed.cert = new.hash();
@@ -198,9 +199,9 @@ impl Signer {
     async fn complete_epoch(&mut self, statuses: &[AppStatus]) -> Result<()> {
         let newest = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
         let through = self.state.epoch_through;
-        let key = self.keyring.unlock()?;
+        let key = self.signing_key()?;
         let (ops, alerts) = self.catch_up(&key, &newest, statuses, None, through)?;
-        let batches = self.sign_batches(newest.generation(), ops)?;
+        let batches = self.sign_batches(&key, newest.generation(), ops)?;
         let (doc, flow) = self.next_version(&key, |body| body.data_epoch = through)?;
         drop(key);
         let state = self.state.clone();
@@ -219,7 +220,7 @@ impl Signer {
     /// starts after `keys_through`.
     fn catch_up(
         &self,
-        key: &IdentityKey,
+        key: &SigningKey,
         newest: &IdentityDoc,
         statuses: &[AppStatus],
         except: Option<[u8; 16]>,
@@ -279,8 +280,13 @@ impl Signer {
     }
 
     /// Sign `ops` in batches at `generation`, each with the parts it stores.
-    fn sign_batches(&self, generation: u64, ops: Vec<Op>) -> Result<Vec<RenewBatch>> {
-        let client = self.service_client()?;
+    fn sign_batches(
+        &self,
+        key: &SigningKey,
+        generation: u64,
+        ops: Vec<Op>,
+    ) -> Result<Vec<RenewBatch>> {
+        let client = self.signing_client(key)?;
         ops.chunks(MAX_OPS)
             .map(|chunk| {
                 let entries = chunk
@@ -440,9 +446,12 @@ impl Signer {
             && self.state.closing_unavailable == self.high_water().map(|h| h.version)
     }
 
-    /// Whether a closing delivery is owed and can be made now.
+    /// Whether a closing delivery is owed and can be made now: the signing gate lets it
+    /// through ([`super::gate::refusal`]).
     pub(super) fn owes_closing(&self) -> Result<bool> {
-        Ok(self.state.managed_by.is_none() && !self.closing_stalled() && !self.owed()?.is_empty())
+        Ok(super::gate::refusal(&self.state).is_none()
+            && !self.closing_stalled()
+            && !self.owed()?.is_empty())
     }
 
     /// When a closing delivery is owed and no flow is in progress, commit it as the next
@@ -451,14 +460,20 @@ impl Signer {
     /// time, or, when the switch never gave that one, the time of a later delivery, which
     /// cuts off later but never on the signer's own clock. Without the newest version's
     /// time, as after a crash before the answer was kept, that version is delivered again,
-    /// a retry, whose answer carries its delivery's proof. [`Alert::ReductionNotClosed`]
-    /// is shown while a retry gave no time, and goes once the renewals are closed.
+    /// a retry, whose answer carries its delivery's proof.
+    ///
+    /// The closing goes through the signing gate like every other version: while an alarm is
+    /// latched or held, or the records are behind, it stays owed, and is delivered once the
+    /// user has cleared the alarm and the switch is confirmed again. A failed Homeserver write
+    /// doesn't hold it back. [`Alert::ReductionNotClosed`] is shown while it waits, for an
+    /// alarm or for a retry that gave no time, and goes once the renewals are closed; another
+    /// install that signs closes them itself.
     pub(super) async fn queue_owed_closing(&mut self) -> Result<bool> {
         if self.flow.is_some() || self.state.managed_by.is_some() {
             return Ok(false);
         }
         let owed = self.owed()?;
-        let stalled = self.closing_stalled();
+        let stalled = self.closing_stalled() || super::gate::refusal(&self.state).is_some();
         let mut state = self.state.clone();
         state
             .alerts
@@ -506,7 +521,7 @@ impl Signer {
             return Ok(true);
         };
         let until = delivered_at.saturating_add(CLOCK_TOLERANCE_MS);
-        let key = self.keyring.unlock()?;
+        let key = self.signing_key()?;
         let (doc, flow) = self.next_version(&key, |body| {
             for app in &owed {
                 body.close_renewals(app, until);
@@ -564,7 +579,7 @@ impl Signer {
         if closing.is_empty() {
             return Ok(Vec::new());
         }
-        let key = self.keyring.unlock()?;
+        let key = self.signing_key()?;
         let (next, flow) = self.next_version(&key, |body| {
             for (app, until) in &closing {
                 body.close_renewals(app, *until);

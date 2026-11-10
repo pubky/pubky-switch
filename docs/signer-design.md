@@ -59,18 +59,23 @@ impl IdentityKeyring {
     pub fn backup_public(&self) -> Result<([u8; 32], [u8; 8]), KeyError>;  // backup key and kid
 
     pub(crate) fn install(vault, identity, secret) -> Result<Self, KeyError>; // a received key
-    pub(crate) fn with_key<T>(&self, use_key: impl FnOnce(&IdentityKey) -> T) -> Result<T, KeyError>;
-    pub(crate) fn for_export<T>(&self, reason: ExportReason,
-                                seal: impl FnOnce(ExportReason, &IdentityKey) -> T) -> Result<T, KeyError>;
+    pub(crate) fn signing_key(&self, passed: GatePassed) -> Result<SigningKey, KeyError>; // the gate's alone
+    pub(crate) fn request_signer(&self) -> Result<Arc<dyn Signs + Send + Sync>, KeyError>; // Switch-Signature only
+    pub(crate) fn open_backup(&self, backup: &SignerBackup) -> Result<Option<SignerRecords>, KeyError>;
     pub(crate) fn destroy(&self) -> Result<(), KeyError>;
+}
+
+impl SigningKey {                                   // made only by the signing gate
+    pub(crate) fn signer(&self) -> Arc<dyn Signs + Send + Sync>;   // a signing client's credentials
+    pub(crate) fn seal_backup(&self, doc, revoked, issued, limits, parts, prev) -> Result<SignerBackup, Error>;
 }
 
 pub enum ExportReason { HandOver { to_app: [u8; 16] }, Backup }
 ```
 
 - **It holds no secret.** It holds the vault and the identity's public key. Each use loads the secret, checks that its public key is still this identity's, makes the core's `IdentityKey` for one operation and drops it, zeroized.
-- **No signing in the public API.** `with_key` is the crate's alone. The crate calls it only to sign inputs it builds, through the core's builders, for the identity-key rows of wire 2.3 and the approval's companion claim (wire 3.10), and for the derivations of spec 13.3: the Switch root and the keys it yields, and the backup key. The core's builders sign Pubky's own formats from typed inputs too.
-- **The secret leaves for two reasons only.** `for_export` is the one place the secret bytes may be read, and only to seal them at once, in a hand-over to `to_app` (wire 3.12) or in the signer's backup (wire 3.13).
+- **No signing in the public API, and none outside the gate.** Every signature over a document, certificate, approval, claim, key bundle, operation or backup is made with a `SigningKey`, which only the signing gate hands out (section 4.4). Clients of the switch get a key that signs `Switch-Signature` only. The keyring's other uses are narrow calls that sign nothing: the backup key's derivation (spec 13.3) and opening a backup.
+- **The secret leaves for two reasons only,** named by `ExportReason`, and only sealed: in the signer's backup (`SigningKey::seal_backup`, wire 3.13), or in a hand-over to `to_app` (wire 3.12, a later PR).
 - **Received keys:** `install` adds the secret of a hand-over or a backup to the vault only when it is the identity's key. A vault that already holds that same secret, as after a retry, is fine; another secret is `Occupied`.
 - **`KeyError`** says which of these went wrong: the vault failed, it holds no secret, it already holds one, the secret isn't this identity's, the bytes aren't 32 long, or the random generator failed.
 
@@ -172,7 +177,7 @@ Each step is one idempotent call. `Revoke`, for example, runs these steps:
 
 Every new version takes the same path (spec 4.3, 12.8; wire 3.3, 3.13):
 
-1. **Check this install may sign.** If `managed_by` is set, refuse.
+1. **Check this install may sign.** One gate decides it for every signed document, certificate, approval, claim, key bundle and operation: the identity key for signing is handed out only through it. It refuses while another install is named, while the records are behind this install's own newer version, and while an alarm is latched (the switch unconfirmed since a rollback or an equivocation) or its alert is held. An owed reduction closing goes through the same gate: it waits, with `ReductionNotClosed`, until the alarm is cleared and the switch confirmed, while a failed Homeserver write doesn't hold it back. Clients of the switch get a key that signs requests only, so a read or a re-delivery can't sign anything new. The status reports `Alarm` whenever the gate refuses for an alarm.
 2. **Sign** the version, naming this install as `signer`, and commit it.
 3. **Read the backup** on the Homeserver. If it names another install at or past the high-water mark, set `managed_by` and stop (wire 3.13 "Another install's backup").
 4. **Write the backup** holding the new version and its `prev`, sealed to the backup key. A failed write stops the delivery.

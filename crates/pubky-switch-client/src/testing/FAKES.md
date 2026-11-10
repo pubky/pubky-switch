@@ -104,6 +104,7 @@ service.
   account in memory, with no manifest, chunks or export transfer; a recovery upload is kept
   and answered with fixed changes, merging nothing.
 - **Revocation, freeze and unfreeze** are test calls, not routes.
+- **`lose_identity`** scripts a faulty service that lost the account's `identity.json`.
 - **Erasure** (Switch wire 7.4.16) is a flag; its answers are signed with a fixed operator
   key.
 - **Push** (Switch wire 8.1): registrations only; nothing is sent to a relay.

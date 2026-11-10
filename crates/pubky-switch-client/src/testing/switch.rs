@@ -506,6 +506,11 @@ impl ScriptedSwitch {
         Ok(())
     }
 
+    /// A faulty service that lost the account's `identity.json`: it holds none from now on.
+    pub fn lose_identity(&self) {
+        self.lock().doc = None;
+    }
+
     /// The signer revokes `app` (Switch spec 12.2 step 1).
     ///
     /// # Errors
