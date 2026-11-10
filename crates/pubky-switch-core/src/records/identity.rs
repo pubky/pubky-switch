@@ -32,17 +32,17 @@ pub enum Admission {
     ContactsAndConversations,
 }
 
-/// The connect request settings of the policy (Switch wire 3.3).
+/// The connect request settings of the policy (Switch wire 3.3): every member required and
+/// none `null`, so a reader refuses an object without one. A signer writes the defaults when
+/// the user sets none.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ConnectRequests {
     /// Whether strangers may ask to be invited; `false` by default.
-    #[serde(default)]
     pub enabled: bool,
-    /// The most pending connect requests; 50 by default.
-    #[serde(default = "default_max_pending")]
+    /// The most pending connect requests; 50 by default. Any `int`: the service caps it at
+    /// its `max_connect_pending` (Switch wire 9.2).
     pub max_pending: u64,
     /// Whether a connect request pushes; `false` by default.
-    #[serde(default)]
     pub push: bool,
 }
 
@@ -739,6 +739,26 @@ mod tests {
         let mut v: serde_json::Value = serde_json::from_slice(&body().to_json().unwrap()).unwrap();
         v["policy"]["admission"] = serde_json::json!("everyone");
         assert!(IdentityDoc::verify(&resign(&v), &identity().public()).is_err());
+        // Every connect_requests member is required, and none is null.
+        let mut v: serde_json::Value = serde_json::from_slice(&body().to_json().unwrap()).unwrap();
+        IdentityDoc::verify(&resign(&v), &identity().public()).unwrap();
+        v["policy"]["connect_requests"] = serde_json::json!({});
+        assert!(IdentityDoc::verify(&resign(&v), &identity().public()).is_err());
+        for member in ["enabled", "max_pending", "push"] {
+            let mut v: serde_json::Value =
+                serde_json::from_slice(&body().to_json().unwrap()).unwrap();
+            let connect = v["policy"]["connect_requests"].as_object_mut().unwrap();
+            connect.remove(member);
+            assert!(
+                IdentityDoc::verify(&resign(&v), &identity().public()).is_err(),
+                "{member} missing"
+            );
+            v["policy"]["connect_requests"][member] = serde_json::Value::Null;
+            assert!(
+                IdentityDoc::verify(&resign(&v), &identity().public()).is_err(),
+                "{member} null"
+            );
+        }
         let mut b = body();
         b.record_max_age = Some(30);
         assert_eq!(sign(b).record_max_age_ms(), 30_000);
