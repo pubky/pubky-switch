@@ -10,7 +10,9 @@
 
 use pubky_switch_client::store::{StoreHandle, WriteBatch};
 use pubky_switch_core::enc::zbase32_encode;
-use pubky_switch_core::records::{IdentityDoc, IdentityPolicy, Limits, SignerBackup, StoredPart};
+use pubky_switch_core::records::{
+    DEFAULT_CERT_LIFETIME_MS, IdentityDoc, IdentityPolicy, Limits, SignerBackup, StoredPart,
+};
 use pubky_switch_core::sig::SignedDoc;
 use serde::{Deserialize, Serialize};
 
@@ -82,9 +84,62 @@ pub(crate) struct SignerState {
     pub(crate) managed_by: Option<[u8; 16]>,
     /// The alerts the user hasn't cleared.
     pub(crate) alerts: Vec<Alert>,
+    /// The certificate lifetime new certificates get, in milliseconds (Switch spec 3.2).
+    #[serde(default = "default_cert_lifetime")]
+    pub(crate) cert_lifetime_ms: u64,
+    /// The companion claims of approvals, signed once, until the host has delivered them
+    /// (Switch wire 3.10).
+    #[serde(default)]
+    pub(crate) claims: Vec<PendingClaim>,
+    /// The switch showed a rollback or an equivocation, and no delivery has succeeded since:
+    /// the signer doesn't know that the switch holds its high-water version, so it releases
+    /// no claim.
+    #[serde(default)]
+    pub(crate) switch_unconfirmed: bool,
+}
+
+/// An approval's companion claim, signed with the version that lists its certificate and
+/// released to the host once the switch took that version (Switch wire 3.10).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PendingClaim {
+    /// The document hash of the app request it answers.
+    pub(crate) request: [u8; 32],
+    /// The approved app.
+    pub(crate) app_id: [u8; 16],
+    /// The document hash of its certificate.
+    pub(crate) cert: [u8; 32],
+    /// The capabilities of the Pubky grant, as the auth request carries them.
+    pub(crate) caps: String,
+    /// The claim's plaintext: the approval's JSON bytes, then the identity key's signature.
+    #[serde(with = "pubky_switch_core::enc::serde_b64_vec")]
+    pub(crate) plaintext: Vec<u8>,
+}
+
+/// The certificate lifetime of records written before it was kept: the default.
+fn default_cert_lifetime() -> u64 {
+    DEFAULT_CERT_LIFETIME_MS
 }
 
 impl SignerState {
+    /// Keep only the certificates the newest version references, of its apps and its
+    /// `renewed` entries, and the claims of certificates it lists: a version that wasn't
+    /// delivered leaves none of its own behind.
+    pub(crate) fn prune_unreferenced(&mut self) {
+        let doc = self.newest_doc().ok().flatten();
+        let referenced = |hash: &[u8; 32]| {
+            doc.as_ref().is_some_and(|doc| {
+                doc.body().apps.iter().any(|a| &a.cert == hash)
+                    || doc.body().renewed.iter().any(|r| &r.cert == hash)
+            })
+        };
+        self.certs
+            .retain(|cert| cert.doc_hash().is_ok_and(|hash| referenced(&hash)));
+        self.claims.retain(|claim| {
+            doc.as_ref()
+                .is_some_and(|doc| doc.listed_cert(&claim.app_id) == Some(claim.cert))
+        });
+    }
+
     /// The records of a new identity, for this install.
     pub(crate) fn new(identity: [u8; 32], install: [u8; 16]) -> Self {
         Self {
@@ -99,6 +154,9 @@ impl SignerState {
             bundle_parts: Vec::new(),
             managed_by: None,
             alerts: Vec::new(),
+            cert_lifetime_ms: DEFAULT_CERT_LIFETIME_MS,
+            claims: Vec::new(),
+            switch_unconfirmed: false,
         }
     }
 
@@ -207,4 +265,24 @@ fn decode<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T> {
     // only the position is kept.
     serde_json::from_slice(bytes)
         .map_err(|e| SignerError::Records(format!("at line {} column {}", e.line(), e.column())))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_state_written_before_the_approval_fields_still_reads() {
+        // The records as they were written before the certificate lifetime and the claims
+        // were kept: both take their defaults.
+        let state = SignerState::new([1; 32], [2; 16]);
+        let mut value = serde_json::to_value(&state).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("cert_lifetime_ms");
+        object.remove("claims");
+        let read: SignerState = decode(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(read.cert_lifetime_ms, DEFAULT_CERT_LIFETIME_MS);
+        assert!(read.claims.is_empty());
+        assert_eq!(read, state);
+    }
 }

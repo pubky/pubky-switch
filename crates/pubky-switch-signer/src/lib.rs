@@ -39,4 +39,4 @@ pub use key::{
     AddOutcome, ExportReason, IdentityKeyring, IdentitySecret, KeyError, SecretVault, VaultError,
 };
 pub use protocol::{GrantPath, Protocol, ProtocolError, Protocols, ScopeDef, ScopeTerms};
-pub use signer::{HighWater, Signer, SignerEnv, SignerStatus};
+pub use signer::{AppReview, ApprovedRequest, HighWater, Signer, SignerEnv, SignerStatus};

@@ -260,7 +260,9 @@ impl Signer {
 
     // Apps
     fn review(&self, request: SignedDoc, auth: AuthRequest) -> Result<AppReview>;           // wire 3.9 checks 1-6
-    async fn approve(&mut self, review: AppReview, allow: GrantChoices) -> Result<Approval>; // cert, delivery, claim, grant
+    async fn approve(&mut self, review: AppReview) -> Result<ApprovedRequest>;      // cert, version, approval and claim
+    fn approved(&self, request: &[u8; 32]) -> Result<Option<ApprovedRequest>>;     // the claim, once its version is delivered
+    async fn claim_delivered(&mut self, request: &[u8; 32]) -> Result<()>;          // the host sent the claim and the grant
     async fn renew(&mut self, app: AppId, change: CertChange) -> Result<RenewalOutcome>;     // reductions included
     async fn revoke(&mut self, app: AppId, distrust_from: Option<Time>, ok: UserConfirmed) -> Result<Rotation>;
     async fn purge_removed(&mut self, app: AppId) -> Result<()>;
@@ -290,7 +292,7 @@ async fn receive_hand_over(env: SignerEnv, app: AppCredentials, vault: Arc<dyn S
 
 - **`UserConfirmed`** is a token the host makes only after it has shown the user the consequence: a revocation, a loss, an erasure, a hand-over or a take-over.
 - **`SignerEnv`** bundles the store, the clock, the Switch client factory, the Pubky handles and the `Protocols`.
-- **`GrantChoices`** says which of the protocols' extra paths the user allowed.
+- **Approval:** `approve` signs the certificate, the version that lists it, the approval with the app's full key bundle and its companion claim, commits them together, then delivers. The claim is released only once the switch took that version. The host delivers it to the auth request's relay and then approves the Pubky grant for exactly the capabilities checked, which include the protocols' grant paths the review showed; the user's approval covers them, since the grant can't be narrowed below the auth request's capabilities.
 - **`receive_hand_over`:**
   - After any refusal, it destroys whatever it opened (wire 3.12).
   - A delivery that loses the compare-and-swap counts as a refusal.
