@@ -146,9 +146,9 @@ pub enum Refusal {
     /// `identity.json` lists for it (Switch wire 3.12, 7.4.17).
     #[error("refused: the hand-over's target isn't current")]
     TargetNotCurrent,
-    /// A revocation is asked for whose version isn't delivered yet: no hand-over until it is,
-    /// since the abort and the new signer's first version would still list the app, which the
-    /// switch refuses (Switch wire 3.3, 3.12).
+    /// A revocation is asked for whose version isn't delivered yet: no hand-over until it is.
+    /// The hand-over carries the records, not a revocation in progress, so one the switch
+    /// hadn't taken would never be sent (Switch spec 12.2, Switch wire 3.12).
     #[error("refused: a revocation is owed")]
     RevocationOwed,
     /// A reduction's closing delivery is owed: no hand-over until it is made (Switch wire

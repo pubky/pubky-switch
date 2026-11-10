@@ -76,8 +76,9 @@ impl Signer {
     ) -> Result<IdentityDoc> {
         self.refresh().await?;
         self.check_named()?;
-        // The abort carries the version handed over, so it must still list the app: the user
-        // aborts first, then revokes (Switch wire 3.12).
+        // The hand-over was sealed before this revocation: one the switch hadn't taken when it
+        // took effect would be lost with these records. The user aborts first, then revokes
+        // (Switch wire 3.12).
         if let Some(handing) = &self.state.handing_over {
             return Err(Refusal::HandingOver {
                 to_app: handing.to_app,

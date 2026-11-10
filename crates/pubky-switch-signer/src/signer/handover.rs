@@ -7,9 +7,9 @@
 //! newest version the switch accepted from it, with no closing delivery owed. From then on it
 //! signs nothing for the identity but the abort: the signing gate refuses every routine step
 //! ([`crate::Refusal::HandingOver`]), and the routine run keeps the work it owes for later. No
-//! revocation is asked for meanwhile either, nor is one owed when it starts: the abort and the
-//! new signer's first version carry the version handed over, whose apps the switch must still
-//! take.
+//! revocation is owed when it starts, nor asked for meanwhile: the hand-over carries the
+//! records as sealed, not a revocation in progress, so one the switch hadn't taken when it took
+//! effect would be lost with this install's records. The user aborts first, then revokes.
 //!
 //! The hand-over ends one of two ways, whichever wins the switch's compare-and-swap on the
 //! version handed over:

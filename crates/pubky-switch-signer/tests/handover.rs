@@ -489,7 +489,7 @@ async fn test_hand_over_target_must_be_listed_and_current() {
 #[tokio::test]
 async fn test_hand_over_and_revocation_wait_for_each_other() {
     // A revocation owed holds a hand-over back, and a hand-over holds a revocation back: the
-    // abort carries the version handed over, which still lists the app.
+    // hand-over carries the records as sealed, not a revocation in progress.
     let world = World::new();
     let mut s = setup(&world).await;
     let other = App::with_keys(
