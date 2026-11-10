@@ -65,6 +65,27 @@ fn opened(world: &World, app: &App) -> Vec<KeyBundleContents> {
         .collect()
 }
 
+/// Whether `app` holds the key of `scope` at `epoch`, and it is the identity's: from the
+/// keys its approval gave it, or from `parts`, its bundle parts at the switch. An incremental
+/// part starts after the epochs the app holds (`keys_through`), so it may replace a part
+/// whose keys the app has from its approval (Switch wire 3.5 "Incremental bundles").
+fn app_holds(
+    world: &World,
+    app: &App,
+    parts: &[KeyBundleContents],
+    epoch: u64,
+    scope: &str,
+) -> bool {
+    let approved = world
+        .approval_keys
+        .lock()
+        .unwrap()
+        .get(&app.keys.app_id_bytes())
+        .and_then(|keys| keys.get(epoch, scope))
+        == Some(world.key.scope_key(epoch, scope));
+    approved || holds(world, parts, epoch, scope)
+}
+
 /// Whether `parts` give the key of `scope` at `epoch`, and it is the identity's.
 fn holds(world: &World, parts: &[KeyBundleContents], epoch: u64, scope: &str) -> bool {
     parts
@@ -331,7 +352,7 @@ async fn test_renewal_a_given_up_rotation_is_completed_before_the_next() {
     // `a` holds `notes` through epoch 3 again, in parts made for its listed certificate.
     let parts = opened(&world, &a);
     assert!(parts.iter().all(|p| p.cert == listed));
-    assert!((1..=3).all(|epoch| holds(&world, &parts, epoch, "notes")));
+    assert!((1..=3).all(|epoch| app_holds(&world, &a, &parts, epoch, "notes")));
 }
 
 #[tokio::test]
@@ -375,7 +396,7 @@ async fn test_renewal_a_given_up_epoch_reaches_its_app_after_a_renewal_in_betwee
     signer.renew(b_id, reduce(&["notes_sync"])).await.unwrap();
     let parts = opened(&world, &a);
     assert!(parts.iter().all(|p| p.cert == listed));
-    assert!((1..=3).all(|epoch| holds(&world, &parts, epoch, "notes")));
+    assert!((1..=3).all(|epoch| app_holds(&world, &a, &parts, epoch, "notes")));
 }
 
 #[tokio::test]
@@ -472,7 +493,7 @@ async fn test_renewal_a_refused_batch_keeps_the_parts_stored_before_it() {
         .unwrap();
     let parts = opened(&world, &a);
     assert!(parts.iter().all(|p| p.cert == listed));
-    assert!((1..=3).all(|epoch| holds(&world, &parts, epoch, "notes")));
+    assert!((1..=3).all(|epoch| app_holds(&world, &a, &parts, epoch, "notes")));
 }
 
 #[tokio::test]
@@ -1053,5 +1074,58 @@ async fn test_renewal_a_reductions_closing_survives_a_crash_at_every_commit() {
             );
             world.assert_no_version_sent_twice();
         }
+    }
+}
+
+#[tokio::test]
+async fn test_renewal_an_added_scope_survives_the_next_rotation_unfetched() {
+    // A renewal adds `notes_sync` to `a`, storing a full bundle with its earlier keys, which
+    // `a` hasn't fetched when the next rotation comes: `keys_through(a)` doesn't vouch for
+    // them. The rotation's part starts after the parts stored for `a`'s listed certificate,
+    // so it replaces none of them, and `a` still gets every epoch of `notes_sync` (Switch
+    // wire 3.5 "Incremental bundles").
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let app = |n: u8| {
+        App::with_keys(
+            AppKeys::from_secrets([n; 32], [n + 1; 32]),
+            &["notes"],
+            None,
+            [n + 2; 32],
+        )
+    };
+    let (a, b, c) = (app(3), app(13), app(23));
+    for each in [&a, &b, &c] {
+        world.approve(&mut signer, each).await;
+    }
+    let a_id = a.keys.app_id_bytes();
+    let confirmed = pubky_switch_signer::UserConfirmed::shown_and_confirmed;
+    signer
+        .revoke(b.keys.app_id_bytes(), None, confirmed())
+        .await
+        .unwrap();
+    let widening = CertChange {
+        scopes: scopes(&["notes", "notes_sync"]),
+        expires_at: None,
+    };
+    signer.renew(a_id, widening).await.unwrap();
+    signer
+        .revoke(c.keys.app_id_bytes(), None, confirmed())
+        .await
+        .unwrap();
+    let doc = signer.identity_doc().unwrap().unwrap();
+    assert_eq!(doc.data_epoch(), 3);
+    let parts = opened(&world, &a);
+    let mut ranges: Vec<(u64, u64)> = parts
+        .iter()
+        .map(|p| (p.first_epoch, p.last_epoch))
+        .collect();
+    ranges.sort_unstable();
+    assert_eq!(ranges, [(1, 2), (3, 3)]);
+    for scope in ["notes", "notes_sync"] {
+        assert!(
+            (1..=3).all(|epoch| app_holds(&world, &a, &parts, epoch, scope)),
+            "{scope}"
+        );
     }
 }

@@ -762,13 +762,28 @@ pub fn covers_from_one(ranges: &[(u64, u64)], current: u64) -> bool {
 
 /// The first data epoch of an app's next bundle (Switch wire 3.5 "Incremental bundles"):
 /// the one after `keys_through`, the newest epoch through which the app holds every key, as
-/// `GET /apps` shows it; epoch 1, a full bundle, when the service shows none or a full
-/// bundle is requested.
-pub fn incremental_first_epoch(keys_through: Option<u64>, full_requested: bool) -> u64 {
-    match keys_through {
-        Some(held) if !full_requested => held.saturating_add(1),
-        _ => 1,
+/// `GET /apps` shows it, carried on through `stored`, the ranges of the parts stored for the
+/// app's listed certificate, which it may not have fetched yet. So the bundle never overlaps a
+/// stored part, and never replaces one the app hasn't fetched (the parts stored for an app
+/// never overlap): a renewal that adds a scope stores a full bundle with that scope's earlier
+/// keys, which `keys_through` doesn't vouch for. Epoch 1, a full bundle, when the service
+/// shows no `keys_through` or a full bundle is requested.
+pub fn incremental_first_epoch(
+    keys_through: Option<u64>,
+    stored: &[(u64, u64)],
+    full_requested: bool,
+) -> u64 {
+    let Some(mut held) = keys_through.filter(|_| !full_requested) else {
+        return 1;
+    };
+    let mut sorted = stored.to_vec();
+    sorted.sort_unstable();
+    for (first, last) in sorted {
+        if first <= held.saturating_add(1) {
+            held = held.max(last);
+        }
     }
+    held.saturating_add(1)
 }
 
 /// A key bundle part the signer stored for an app, as the signer keeps it and a hand-over
@@ -1277,9 +1292,25 @@ mod tests {
 
     #[test]
     fn test_key_bundle_incremental_and_full_requests() {
-        assert_eq!(incremental_first_epoch(Some(3), false), 4);
-        assert_eq!(incremental_first_epoch(Some(3), true), 1);
-        assert_eq!(incremental_first_epoch(None, false), 1);
+        assert_eq!(incremental_first_epoch(Some(3), &[], false), 4);
+        assert_eq!(incremental_first_epoch(Some(3), &[], true), 1);
+        assert_eq!(incremental_first_epoch(None, &[], false), 1);
+        // Carried on through the stored parts it continues, in any order, so it never
+        // overlaps one; a part after a gap doesn't count.
+        assert_eq!(incremental_first_epoch(Some(1), &[(1, 2)], false), 3);
+        assert_eq!(
+            incremental_first_epoch(Some(1), &[(4, 5), (2, 3)], false),
+            6
+        );
+        assert_eq!(incremental_first_epoch(Some(1), &[(3, 4)], false), 2);
+        assert_eq!(incremental_first_epoch(Some(5), &[(1, 2)], false), 6);
+        // A full bundle all the same when none is shown or one is requested.
+        assert_eq!(incremental_first_epoch(None, &[(1, 2)], false), 1);
+        assert_eq!(incremental_first_epoch(Some(1), &[(1, 2)], true), 1);
+        assert_eq!(
+            incremental_first_epoch(Some(u64::MAX), &[], false),
+            u64::MAX
+        );
 
         let cert = the_cert();
         let app_id = cert.app_id();
