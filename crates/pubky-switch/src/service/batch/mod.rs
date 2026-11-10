@@ -88,7 +88,7 @@ fn not_current(why: &str) -> ApiError {
 }
 
 /// An own app's batch, verified before the account's lock (Switch wire 7.2 Order).
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(super) struct VerifiedApp {
     /// The calling app.
     app: [u8; 16],
@@ -96,6 +96,23 @@ pub(super) struct VerifiedApp {
     key: [u8; 32],
     /// A `POST /ops` body, parsed.
     parsed: Option<OpsRequest>,
+}
+
+impl VerifiedApp {
+    /// An app whose request, not a batch, verified with `key`: a read, checked again later
+    /// against the state it reads.
+    pub(super) fn reading(app: [u8; 16], key: [u8; 32]) -> Self {
+        Self {
+            app,
+            key,
+            parsed: None,
+        }
+    }
+
+    /// The App ID.
+    pub(super) fn app_id(&self) -> [u8; 16] {
+        self.app
+    }
 }
 
 /// The checks of an own app whose request verified with `verified.key` (Switch wire 7.2 "Own
@@ -774,16 +791,6 @@ impl Service {
                 .chain_tip()
                 .append(seq, time_ms, ItemType::Op, hash, Some(body.batch))
                 .map_err(|_| temporary())?;
-            txn.append_chain_item(&NewChainItem {
-                seq,
-                item_type: ItemType::Op,
-                item_bytes: &item_bytes,
-                stub: &stub,
-                server_time_ms: time_ms,
-                only_for: applied.only_for,
-            })
-            .await
-            .map_err(|e| storage(&e))?;
             let object = body
                 .kind
                 .proof_object(body.app_id.as_ref())
@@ -791,9 +798,21 @@ impl Service {
             let proof = TransitionProof::sign(
                 signer,
                 &identity,
-                ProofBody::new(stub, object, &applied.state),
+                ProofBody::new(stub.clone(), object, &applied.state),
             )
             .map_err(|_| temporary())?;
+            // The item keeps its proof, which the feed shows with it (Switch wire 7.5).
+            txn.append_chain_item(&NewChainItem {
+                seq,
+                item_type: ItemType::Op,
+                item_bytes: &item_bytes,
+                stub: &stub,
+                server_time_ms: time_ms,
+                only_for: applied.only_for,
+                proof: Some(proof.signed()),
+            })
+            .await
+            .map_err(|e| storage(&e))?;
             proofs.push(proof.signed().clone());
         }
         Ok(proofs)

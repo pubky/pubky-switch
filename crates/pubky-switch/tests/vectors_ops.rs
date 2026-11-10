@@ -15,79 +15,11 @@ mod support;
 
 use pubky_switch::http::Handler;
 use pubky_switch_core::{
-    http::header,
     ops::{OpsRequest, SignedOp},
     sig::SignedDoc,
 };
 use serde_json::Value;
 use support::*;
-
-/// The signed operations of `chain.json`'s items at `seqs`.
-fn ops_at(chain: &Value, seqs: &[u64]) -> Vec<SignedOp> {
-    seqs.iter()
-        .map(|seq| {
-            let item = chain_item(chain, *seq);
-            let signed: SignedDoc = serde_json::from_value(item["item"].clone()).expect("op");
-            SignedOp::peek(&signed).expect("op")
-        })
-        .collect()
-}
-
-fn chain_item(chain: &Value, seq: u64) -> &Value {
-    chain["items"]
-        .as_array()
-        .expect("items")
-        .iter()
-        .find(|item| item["seq"].as_u64() == Some(seq))
-        .unwrap_or_else(|| panic!("no item {seq}"))
-}
-
-/// The transition proof `chain.json` gives the item at `seq`.
-fn proof_at(chain: &Value, seq: u64) -> SignedDoc {
-    let prefix = format!("(seq {seq})");
-    let proof = chain["transition_proofs"]
-        .as_array()
-        .expect("proofs")
-        .iter()
-        .find(|proof| proof["name"].as_str().is_some_and(|n| n.contains(&prefix)))
-        .unwrap_or_else(|| panic!("no proof for seq {seq}"));
-    serde_json::from_value(proof["signed"].clone()).expect("proof")
-}
-
-/// Send the batch of the items at `seqs` from the wallet at the first item's time, and check
-/// its answer: one proof per item, `chain.json`'s, and the head at the last item.
-async fn replay_batch(replay: &Replay, chain: &Value, seqs: &[u64]) {
-    let keys = vectors("keys.json");
-    let wallet = app(&keys, "wallet");
-    let alice_id = alice(&keys)["pubky_id"].as_str().expect("id").to_string();
-    let at = item_time(chain_item(chain, seqs[0]));
-    set_time(&replay.clock, &at);
-    let body = OpsRequest::new(&ops_at(chain, seqs), None).to_json();
-    let request = app_request(
-        wallet,
-        "POST",
-        &format!("/v1/{alice_id}/ops"),
-        body,
-        ms(&at),
-    );
-    let answer = replay.service.handle(request).await;
-    let text = String::from_utf8_lossy(&answer.body).into_owned();
-    assert_eq!(answer.status, 200, "seqs {seqs:?}: {text}");
-    let body: Value = serde_json::from_slice(&answer.body).expect("json");
-    let proofs: Vec<SignedDoc> = serde_json::from_value(body["proofs"].clone()).expect("proofs");
-    let expected: Vec<SignedDoc> = seqs.iter().map(|seq| proof_at(chain, *seq)).collect();
-    assert_eq!(proofs, expected, "seqs {seqs:?}: the proofs");
-    let last = chain_item(chain, *seqs.last().expect("seq"));
-    assert_eq!(
-        body["head"]["seq"], last["seq"],
-        "seqs {seqs:?}: the head's seq"
-    );
-    assert_eq!(
-        body["head"]["chain_hash"], last["chain_hash"],
-        "seqs {seqs:?}: the head's chain hash"
-    );
-    assert!(header_text(&answer, header::HEAD).is_some(), "Switch-Head");
-}
 
 #[tokio::test]
 async fn test_vectors_ops_replay_chain() {

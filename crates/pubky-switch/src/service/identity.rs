@@ -166,6 +166,7 @@ impl Service {
             stub: &stub,
             server_time_ms: time_ms,
             only_for: None,
+            proof: None,
         })
         .await
         .map_err(|e| store_error(&e))?;

@@ -5,6 +5,7 @@ use std::{path::PathBuf, process::ExitCode, sync::Arc};
 use clap::{Parser, Subcommand};
 use pubky_switch::{
     admin::{self, AdminState},
+    changes::ChangeListener,
     config::Config,
     http,
     keys::{FileKeyStore, KeyStoreReadiness},
@@ -146,6 +147,9 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
                 time.clone(),
                 config.limits.clone(),
             ));
+            // Changes made by any instance wake the feed reads waiting here.
+            let changes = ChangeListener::connect(&store).await?;
+            tokio::spawn(changes.run(service.changes(), until_stopped(stopped.clone())));
             let router = http::router(service, config.server.proxy.clone());
             let listener = tokio::net::TcpListener::bind(config.server.listen).await?;
             tracing::info!(api = %listener.local_addr()?, %origin, "serving the API");

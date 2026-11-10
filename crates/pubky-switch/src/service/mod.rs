@@ -9,12 +9,13 @@
 //! (Switch wire 7.3 step 10).
 //!
 //! Served so far: `POST /v1/enroll`, `PUT /v1/{id}/identity`, the public
-//! `GET /v1/{id}/identity`, `POST /v1/{id}/ops`, `GET /v1/{id}/claims/{claim_key}` and
-//! `POST /v1/{id}/apps/{app_id}/revoke`. Every other call is answered `503 unavailable`.
+//! `GET /v1/{id}/identity`, `POST /v1/{id}/ops`, `GET /v1/{id}/feed`,
+//! `GET /v1/{id}/claims/{claim_key}` and `POST /v1/{id}/apps/{app_id}/revoke`. Every other call is answered `503 unavailable`.
 
 pub mod batch;
 mod claims;
 mod enroll;
+mod feed;
 mod identity;
 pub mod rules;
 
@@ -32,6 +33,7 @@ use pubky_switch_core::{
 };
 
 use crate::{
+    changes::ChangeHub,
     http::{
         Handler, HandlerFuture, Refusal, SwitchRequest, SwitchResponse,
         error::{ApiError, ErrorCode, is_failed_authentication},
@@ -63,6 +65,7 @@ pub struct Service {
     reads_per_account: MinuteWindows<String>,
     operation_rate: KeyedMinutes<(String, [u8; 16])>,
     control_rate: KeyedMinutes<(String, [u8; 16])>,
+    changes: Arc<ChangeHub>,
 }
 
 impl std::fmt::Debug for Service {
@@ -81,8 +84,17 @@ struct Answer {
     head: Option<SignedHead>,
     retry_after: Option<u64>,
     cacheable: bool,
-    /// A `GET /claims` answer, whose body is built once the lock is gone.
-    claim_read: Option<claims::ClaimRead>,
+    /// An answer whose body is read once the lock is gone.
+    deferred: Option<Deferred>,
+}
+
+/// A read whose answer is built once the request's lock is gone.
+#[derive(Debug)]
+enum Deferred {
+    /// A `GET /claims` answer's entries.
+    Claim(claims::ClaimRead),
+    /// A feed page, after its long-poll.
+    Feed(Box<feed::FeedRead>),
 }
 
 impl Answer {
@@ -93,7 +105,7 @@ impl Answer {
             head: None,
             retry_after: None,
             cacheable: false,
-            claim_read: None,
+            deferred: None,
         }
     }
 
@@ -104,7 +116,7 @@ impl Answer {
             head: None,
             retry_after: error.retry_after,
             cacheable: false,
-            claim_read: None,
+            deferred: None,
         }
     }
 
@@ -209,7 +221,14 @@ impl Service {
             reads_per_account: MinuteWindows::default(),
             operation_rate: KeyedMinutes::default(),
             control_rate: KeyedMinutes::default(),
+            changes: ChangeHub::new(),
         }
+    }
+
+    /// The hub that wakes waiting feed reads. Run a [`crate::changes::ChangeListener`]
+    /// into it, so changes made by any instance wake them.
+    pub fn changes(&self) -> Arc<ChangeHub> {
+        self.changes.clone()
     }
 
     /// The failed-authentication counts, for monitoring.
@@ -303,7 +322,7 @@ impl Service {
                 Ok(claimed) => Some(claimed),
                 Err(error) => return refused_early(error).await,
             },
-            Call::Ops | Call::GetClaim(_) => {
+            Call::Ops | Call::GetClaim(_) | Call::Feed => {
                 match self.authenticate_caller(&account, &request, base_ms) {
                     Ok(claimed) => {
                         // An own app's request is verified here too, so nothing unverified
@@ -542,6 +561,14 @@ impl Service {
                 (Answer::error(&error).with_head(head), serving)
             }
         };
+        // A read answered once the lock is gone answers a refusal with the head this request
+        // commits, as every refusal to a verified caller carries one (Switch wire 7.1).
+        let txn_account = txn.head().id.clone();
+        let fallback_head = if answer.deferred.is_some() {
+            self.head(&txn, &signer).await
+        } else {
+            None
+        };
         // Durable, then answered (step 10). An answer is sent even when the request only
         // stamped the time, which must be durable before it is shown. A serving account's
         // commit moves the key's mark to the head the answer carries.
@@ -560,11 +587,40 @@ impl Service {
         match committed {
             Ok(()) => {
                 let mut answer = answer;
-                if let Some(read) = answer.claim_read.take() {
-                    match self.claim_body(&read).await {
+                match answer.deferred.take() {
+                    Some(Deferred::Claim(read)) => match self.claim_body(&read).await {
                         Ok(body) => answer.body = body,
-                        Err(error) => answer = Answer::error(&error),
+                        Err(error) => answer = Answer::error(&error).with_head(fallback_head),
+                    },
+                    Some(Deferred::Feed(read)) => {
+                        return match self.feed_page(&read, &signer).await {
+                            Ok((page, at)) => sign_answer(&signer, signature, at, page),
+                            // Erased while the read waited: as an unknown account (step 2).
+                            Err(feed::FeedStop::Gone) => {
+                                let error = ApiError::not_found("no such account");
+                                self.operator_answer(signature, base_ms, &error).await
+                            }
+                            // Its key retired while the read waited: never signed with it.
+                            Err(feed::FeedStop::Retired) => {
+                                let error = ApiError::unavailable("7.6: a temporary failure");
+                                self.operator_answer(signature, base_ms, &error).await
+                            }
+                            Err(feed::FeedStop::Refused(refusal)) => {
+                                // Every 401 counts against the network source (9.4).
+                                if is_failed_authentication(refusal.error.code) {
+                                    self.record_failure(request, txn_account.clone());
+                                }
+                                let head = if refusal.head { fallback_head } else { None };
+                                sign_answer(
+                                    &signer,
+                                    signature,
+                                    refusal.time_ms,
+                                    Answer::error(&refusal.error).with_head(head),
+                                )
+                            }
+                        };
                     }
+                    None => {}
                 }
                 sign_answer(&signer, signature, time_ms, answer)
             }
@@ -692,6 +748,20 @@ impl Service {
                     .map(|answer| (answer, serving))
                     .map_err(|error| Refused::with_head(error, serving));
             }
+            Call::Feed => {
+                let head = txn.head();
+                return self
+                    .feed(
+                        &head.id,
+                        head.identity_key,
+                        &head.service_key,
+                        writer.as_ref(),
+                        &request.route.query,
+                        time_ms,
+                    )
+                    .map(|answer| (answer, serving))
+                    .map_err(|error| Refused::with_head(error, serving));
+            }
             Call::Revoke(app_id) => {
                 return self
                     .revoke(txn, signer, held.as_ref(), app_id, &request.body, time_ms)
@@ -735,6 +805,13 @@ impl Service {
                 }
             })?;
         if let Caller::OtherApp { .. } = claimed.caller {
+            // The feed is for own apps only (Switch wire 7.4.4).
+            if request.route.call == Call::Feed {
+                return Err(ApiError::new(
+                    ErrorCode::PermissionMissing,
+                    "7.4.4: only own apps read the feed",
+                ));
+            }
             return Err(ApiError::new(
                 ErrorCode::NotAdmitted,
                 "6.4: an app of another identity doesn't write here",
