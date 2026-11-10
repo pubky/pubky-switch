@@ -20,7 +20,9 @@
 
 mod account;
 mod chain;
+mod claim_codec;
 mod identity;
+mod ops;
 #[cfg(any(test, feature = "test-util"))]
 pub mod testing;
 
@@ -35,6 +37,10 @@ use sqlx::{
 pub use account::{AccountHead, AccountTxn, CommitError, Committed, NewAccount};
 pub use chain::NewChainItem;
 pub use identity::HeldIdentity;
+pub use ops::{
+    ListName, StoredApp, StoredBundlePart, StoredClaimEntry, StoredInvite, StoredListEntry,
+    StoredRecord,
+};
 
 use crate::admin::{CheckFuture, ReadinessCheck};
 

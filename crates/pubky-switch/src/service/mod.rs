@@ -8,9 +8,11 @@
 //! proof or a head goes out only once the commit is durable and the key's mark has moved
 //! (Switch wire 7.3 step 10).
 //!
-//! Served so far: `POST /v1/enroll`, `PUT /v1/{id}/identity` and the public
-//! `GET /v1/{id}/identity`. Every other call is answered `503 unavailable`.
+//! Served so far: `POST /v1/enroll`, `PUT /v1/{id}/identity`, the public
+//! `GET /v1/{id}/identity` and `POST /v1/{id}/ops`. Every other call is answered
+//! `503 unavailable`.
 
+pub mod batch;
 mod enroll;
 mod identity;
 pub mod rules;
@@ -52,6 +54,8 @@ pub struct Service {
     failed_auth: FailedAuthentications,
     reads_per_source: MinuteWindows<(String, NetworkSource)>,
     reads_per_account: MinuteWindows<String>,
+    operation_rate: MinuteWindows<(String, [u8; 16])>,
+    control_rate: MinuteWindows<(String, [u8; 16])>,
 }
 
 impl std::fmt::Debug for Service {
@@ -192,6 +196,8 @@ impl Service {
             failed_auth,
             reads_per_source: MinuteWindows::default(),
             reads_per_account: MinuteWindows::default(),
+            operation_rate: MinuteWindows::default(),
+            control_rate: MinuteWindows::default(),
         }
     }
 
@@ -273,6 +279,12 @@ impl Service {
                 Ok(claimed) => Some(claimed),
                 Err(error) => return refused_early(error).await,
             },
+            // The signer is verified here; an own app under the lock, with the key the
+            // account holds for it (Switch wire 7.2).
+            Call::Ops => match self.authenticate_caller(&account, &request, base_ms) {
+                Ok(claimed) => Some(claimed),
+                Err(error) => return refused_early(error).await,
+            },
             _ => {
                 return refused_early(ApiError::unavailable("7.4: this call isn't served yet"))
                     .await;
@@ -296,7 +308,7 @@ impl Service {
             // signature, so it is the same for every reader (Switch wire 7.4.15).
             None
         };
-        self.at_account(txn, &request, base_ms, signature, caller.is_some())
+        self.at_account(txn, &request, base_ms, signature, caller.as_ref())
             .await
     }
 
@@ -394,7 +406,7 @@ impl Service {
         request: &SwitchRequest,
         base_ms: u64,
         request_signature: Option<[u8; 64]>,
-        signer_call: bool,
+        caller: Option<&Claimed>,
     ) -> SwitchResponse {
         let signature = request_signature.as_ref();
         // The time the account last committed, for an answer whose commit fails.
@@ -410,7 +422,7 @@ impl Service {
             }
         };
         let (answer, marked) = match self
-            .run_at_account(&mut txn, &signer, request, time_ms)
+            .run_at_account(&mut txn, &signer, request, caller, time_ms)
             .await
         {
             Ok(done) => done,
@@ -419,9 +431,9 @@ impl Service {
                 serving,
                 head,
             }) => {
-                // An error to the authenticated signer carries the current head (Switch wire
-                // 7.1), except where the key's mark refuses one.
-                let head = if signer_call && head {
+                // An error to the authenticated signer or own app carries the current head
+                // (Switch wire 7.1), except where the key's mark refuses one.
+                let head = if caller.is_some() && head {
                     self.head(&txn, &signer).await
                 } else {
                     None
@@ -463,6 +475,7 @@ impl Service {
         txn: &mut AccountTxn,
         signer: &ServiceSigner,
         request: &SwitchRequest,
+        caller: Option<&Claimed>,
         time_ms: u64,
     ) -> Result<(Answer, bool), Refused> {
         let call = &request.route.call;
@@ -517,6 +530,27 @@ impl Service {
 
         // Step 7: the staged gate. Step 9: the endpoint.
         staged_gate(call, !serving).map_err(|error| Refused::with_head(error, serving))?;
+        if *call == Call::Ops {
+            let claimed = caller.ok_or_else(|| unavailable(serving))?;
+            return match self
+                .post_ops(txn, signer, request, held.as_ref(), claimed, time_ms)
+                .await
+            {
+                Ok(answer) => Ok((answer, serving)),
+                Err(batch::Stop::Refused(error)) => Err(Refused::with_head(error, serving)),
+                // Not authenticated: no head, and a 401 counts against the source.
+                Err(batch::Stop::Unauthenticated(error)) => {
+                    if is_failed_authentication(error.code) {
+                        self.record_failure(request, txn.head().id.clone());
+                    }
+                    Err(Refused {
+                        error,
+                        serving,
+                        head: false,
+                    })
+                }
+            };
+        }
         let (answer, serves_after) = self
             .put_identity(txn, signer, request, held.as_ref(), time_ms)
             .await
@@ -524,8 +558,43 @@ impl Service {
         Ok((answer, serving || serves_after))
     }
 
-    /// Decode and verify a request's signature (Switch wire 7.2). Only the signer is
-    /// verified so far: no app is current before app records are served.
+    /// Authenticate the caller of a call the signer or an own app makes, as far as needs no
+    /// account state (Switch wire 7.2 Order): the network source's failed-authentication
+    /// limit, the headers and the timestamp, and the signer's signature. An own app's
+    /// signature is verified under the lock, with the key the account holds for it; an app
+    /// of another identity is `403 not_admitted` (Switch wire 6.4 step 1).
+    fn authenticate_caller(
+        &self,
+        account: &str,
+        request: &SwitchRequest,
+        base_ms: u64,
+    ) -> Result<Claimed, ApiError> {
+        if let Err(retry_after) = self.failed_auth.check(request.source, base_ms) {
+            return Err(ApiError::rate_limited(
+                "9.4: too many failed authentications from this network source",
+                retry_after,
+            ));
+        }
+        let identity_key = pubky_switch_core::enc::pubky_key(account)
+            .map_err(|_| ApiError::not_found("no such account"))?;
+        let claimed = self
+            .authenticate(&identity_key, request, base_ms)
+            .inspect_err(|error| {
+                if is_failed_authentication(error.code) {
+                    self.record_failure(request, account.to_string());
+                }
+            })?;
+        if let Caller::OtherApp { .. } = claimed.caller {
+            return Err(ApiError::new(
+                ErrorCode::NotAdmitted,
+                "6.4: an app of another identity doesn't write here",
+            ));
+        }
+        Ok(claimed)
+    }
+
+    /// Decode and verify a request's signature (Switch wire 7.2): the signer's with the
+    /// identity key. An own app's is verified under the lock, by the endpoint.
     fn authenticate(
         &self,
         account: &[u8; 32],
