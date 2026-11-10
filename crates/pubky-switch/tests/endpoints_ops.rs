@@ -678,6 +678,77 @@ async fn test_ops_revoked_expired_and_unpermitted_apps() {
 }
 
 #[tokio::test]
+async fn test_ops_signer_renews_an_app_whose_certificate_expired() {
+    let Some(replay) = registered(Limits::default(), false).await else {
+        return;
+    };
+    let (app_keys, old) = wallet_keys(&replay).await;
+    // The wallet's certificate has expired: it is refused.
+    let expired = "2026-12-01T00:00:00.000Z";
+    set_time(&replay.clock, expired);
+    let ops = wallet_batch(30, 1, vec![contact(bob())]);
+    let (status, body) = post_app(&replay, "wallet", &ops, None, expired).await;
+    assert_eq!((status, body["code"].as_str()), (403, Some("cert_expired")));
+    // The signer's renewal, a cert.put and the first part of a full bundle made for it, in
+    // one batch: taken although identity.json still lists the expired certificate (Switch
+    // wire 3.8 step 1, 6.2).
+    let alice = IdentityKey::from_secret(hex32(&alice(&vectors("keys.json"))["secret_hex"]));
+    let issued = ms(expired) - 1_000;
+    let renewed = AppCert::issue(
+        &alice,
+        AppCertBody::new(
+            alice_key(),
+            app_keys.signing_public(),
+            app_keys.bundle_public(),
+            old.scopes().to_vec(),
+            old.permissions(),
+            issued,
+            issued + 180 * 86_400_000,
+        ),
+    )
+    .expect("cert");
+    let part = pubky_switch_core::records::seal_bundle_parts(&alice, &renewed, 1, 1, &|_| true)
+        .expect("bundle")
+        .remove(0);
+    let renewal = sign_batch(
+        &alice,
+        &alice_key(),
+        None,
+        1,
+        [31; 16],
+        vec![
+            (
+                Vec::new(),
+                OpKind::CertPut {
+                    target_app_id: renewed.app_id(),
+                    cert: renewed.signed().clone(),
+                },
+            ),
+            (
+                Vec::new(),
+                OpKind::KeyBundlePut(pubky_switch_core::ops::KeyBundlePut {
+                    target_app_id: renewed.app_id(),
+                    bundle: part.bundle,
+                    first_epoch: part.first_epoch,
+                    last_epoch: part.last_epoch,
+                }),
+            ),
+        ],
+    )
+    .expect("batch");
+    let request = signer_request(
+        "POST",
+        &ops_path(),
+        OpsRequest::new(&renewal, None).to_json(),
+        ms(expired),
+    );
+    let (status, body, _) = answer_of(replay.service.handle(request).await);
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["proofs"].as_array().map(Vec::len), Some(2));
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
 async fn test_ops_first_call_with_an_unlisted_certificate() {
     let Some(replay) = registered(Limits::default(), false).await else {
         return;

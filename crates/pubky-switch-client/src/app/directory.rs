@@ -123,14 +123,27 @@ struct PeersDoc {
 
 /// `ident/<pubky>/sw`: when the app last looked up a counterparty's switch copy of its
 /// `identity.json`, and whether the read succeeded (Switch spec 4.3, "The switch's copy").
+/// `lookup` is the number the lookup took when it began ([`switch_lookups_key`]): which
+/// lookup is the newer is judged by it, not by the clock, which may give two lookups the
+/// same millisecond or move back between them. A record kept before the number reads as 0,
+/// older than any lookup begun since.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct SwitchRead {
     at_ms: u64,
     read: bool,
+    #[serde(default)]
+    lookup: u64,
 }
 
 fn switch_read_key(pubky: &[u8; 32]) -> String {
     format!("ident/{}/sw", pubky_id(pubky))
+}
+
+/// `ident/<pubky>/swn`: the number of the last switch lookup begun for a counterparty, one
+/// higher at each. It is kept in the store with the lookup's outcome, so the order holds
+/// across restarts as the outcome does.
+fn switch_lookups_key(pubky: &[u8; 32]) -> String {
+    format!("ident/{}/swn", pubky_id(pubky))
 }
 
 /// `ident/<pubky>/reads`: when the app last read a counterparty's `identity.json` from each
@@ -305,6 +318,7 @@ pub struct IdentityLookup {
 pub struct SwitchLookup {
     pubky: [u8; 32],
     homeserver: HomeserverCopy,
+    lookup: u64,
     clock: std::sync::Arc<dyn crate::clock::Clock>,
     future: crate::transport::BoxFuture<'static, Option<Vec<IdentityDoc>>>,
 }
@@ -327,6 +341,7 @@ impl std::future::Future for SwitchLookup {
         std::task::Poll::Ready(SwitchAnswer {
             pubky: this.pubky,
             homeserver: this.homeserver,
+            lookup: this.lookup,
             read_ms: this.clock.now_ms(),
             copies,
         })
@@ -337,11 +352,13 @@ impl std::future::Future for SwitchLookup {
 /// [`App::finish_identity_lookup`]. Its copies are verified with the identity's key, and
 /// still go through the version floor and the equivocation check there. Its freshness
 /// counts from when the read completed, however long the answer is held before it is
-/// finished (Switch spec 4.3).
+/// finished (Switch spec 4.3); whether it is newer than another lookup's outcome is judged
+/// by the order the lookups began in.
 #[derive(Clone, Debug)]
 pub struct SwitchAnswer {
     pubky: [u8; 32],
     homeserver: HomeserverCopy,
+    lookup: u64,
     read_ms: u64,
     copies: Option<Vec<IdentityDoc>>,
 }
@@ -478,8 +495,9 @@ impl App {
     /// under the version floor and the equivocation check, and keep when the switch was
     /// looked up and whether it answered, which counts until the next lookup. The answer
     /// counts from when its read completed ([`SwitchAnswer::read_ms`]), not from this call:
-    /// one held more than 10 minutes gives a copy to look up again, and one older than the
-    /// last lookup's outcome leaves that outcome standing.
+    /// one held more than 10 minutes gives a copy to look up again. An answer of a lookup
+    /// begun before the one whose outcome is kept leaves that outcome standing, whatever
+    /// the clock read at either.
     ///
     /// # Errors
     ///
@@ -587,12 +605,22 @@ impl App {
             )
             .into());
         };
-        // Then the switch's copy, at the switch the newest copy names.
+        // Then the switch's copy, at the switch the newest copy names. The lookup takes the
+        // next number now, so a later one is newer whatever the clock does.
+        let lookup = self
+            .reader()
+            .get::<u64>(&switch_lookups_key(pubky))
+            .await?
+            .unwrap_or(0)
+            .saturating_add(1);
+        let mut tx = self.tx()?;
+        tx.put(&switch_lookups_key(pubky), &lookup)?;
+        self.commit(tx).await?;
         let started = self.now();
         let identity = self
             .peer_identity_held(pubky, homeserver, SwitchCopy::Pending, started)
             .await?;
-        let switch = self.switch_lookup(pubky, &named, homeserver);
+        let switch = self.switch_lookup(pubky, &named, homeserver, lookup);
         Ok(IdentityLookup {
             identity,
             switch: Some(switch),
@@ -609,15 +637,18 @@ impl App {
             self.take_peer_copy(&pubky, copy, CopySource::Switch { read_ms })
                 .await?;
         }
-        // An answer older than the last lookup's outcome changes nothing of it: a lookup that
-        // failed later, perhaps on a newer copy, still counts (Switch spec 4.3).
+        // An answer of a lookup begun before the last outcome's changes nothing of it: a
+        // lookup begun later, perhaps on a newer copy, that failed still counts until the
+        // reader looks up again (Switch spec 4.3). The order is the lookups' numbers, not
+        // their times, which may be equal or run backward.
         let last: Option<SwitchRead> = self.reader().get(&switch_read_key(&pubky)).await?;
         let outcome = match last {
-            Some(last) if last.at_ms > read_ms => last,
+            Some(last) if last.lookup >= answer.lookup => last,
             _ => {
                 let outcome = SwitchRead {
                     at_ms: read_ms,
                     read,
+                    lookup: answer.lookup,
                 };
                 let mut tx = self.tx()?;
                 tx.put(&switch_read_key(&pubky), &outcome)?;
@@ -644,6 +675,7 @@ impl App {
         pubky: &[u8; 32],
         doc: &IdentityDoc,
         homeserver: HomeserverCopy,
+        lookup: u64,
     ) -> SwitchLookup {
         let first = self.peer_client(pubky, doc).ok();
         let credentials = Credentials::App {
@@ -685,6 +717,7 @@ impl App {
         SwitchLookup {
             pubky: *pubky,
             homeserver,
+            lookup,
             clock: std::sync::Arc::clone(&self.env.clock),
             future: Box::pin(future),
         }

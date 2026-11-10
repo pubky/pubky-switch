@@ -1083,6 +1083,101 @@ async fn test_identity_lookup_split_older_answer_keeps_a_later_failure() {
     assert_eq!(held.switch_lookup_ms, failed_ms);
 }
 
+/// A first lookup's answer, read and not yet finished, then a second lookup that fails and
+/// is finished, with the clock moved to `second_at` between them; then the first answer,
+/// finished last. The older answer leaves the newer failure standing.
+async fn older_answer_after_newer_failure(second_at: impl Fn(u64) -> u64) {
+    let p = Pair::new();
+    let protocol = ReadsProtocol::new(Mode::Settle);
+    let mut wallet = p
+        .join_on(
+            &p.alice,
+            "wallet",
+            protocol.clone(),
+            Arc::new(MemoryStore::new()),
+        )
+        .await;
+    let _shop = p
+        .join_on(&p.bob, "shop", protocol, Arc::new(MemoryStore::new()))
+        .await;
+    let bob = p.bob.identity().public();
+    let first = wallet.begin_identity_lookup(&bob, true).await.unwrap();
+    let older = first.switch.unwrap().await;
+    assert!(older.read());
+    p.clock.set_ms(second_at(older.read_ms()));
+    p.router.remove(BOB_ORIGIN);
+    let second = wallet.begin_identity_lookup(&bob, true).await.unwrap();
+    let failed = second.switch.unwrap().await;
+    assert!(!failed.read());
+    assert!(failed.read_ms() <= older.read_ms());
+    let failed_ms = failed.read_ms();
+    let found = wallet.finish_identity_lookup(failed).await.unwrap();
+    assert_eq!(found.switch_copy, SwitchCopy::Unavailable);
+    let found = wallet.finish_identity_lookup(older).await.unwrap();
+    let now = p.clock.now_ms();
+    assert_eq!(found.switch_copy, SwitchCopy::Unavailable);
+    assert_eq!(found.switch_lookup_ms, failed_ms);
+    assert_eq!(found.may_act(now, Initiator::Automatic, GRACE), MayAct::No);
+    let held = wallet.identity_of(&bob, false).await.unwrap();
+    assert_eq!(held.homeserver, HomeserverCopy::Held);
+    assert_eq!(held.switch_copy, SwitchCopy::Unavailable);
+    assert_eq!(
+        held.may_act(p.clock.now_ms(), Initiator::Automatic, GRACE),
+        MayAct::No
+    );
+}
+
+#[tokio::test]
+async fn test_identity_lookup_split_older_answer_in_the_same_millisecond_keeps_the_failure() {
+    older_answer_after_newer_failure(|read_ms| read_ms).await;
+}
+
+#[tokio::test]
+async fn test_identity_lookup_split_older_answer_after_the_clock_moves_back_keeps_the_failure() {
+    older_answer_after_newer_failure(|read_ms| read_ms - MINUTE).await;
+}
+
+#[tokio::test]
+async fn test_identity_lookup_split_order_holds_across_a_reload() {
+    let p = Pair::new();
+    let protocol = ReadsProtocol::new(Mode::Settle);
+    let store: Arc<dyn crate::store::StateStore> = Arc::new(MemoryStore::new());
+    let mut wallet = p
+        .join_on(&p.alice, "wallet", protocol.clone(), Arc::clone(&store))
+        .await;
+    let _shop = p
+        .join_on(
+            &p.bob,
+            "shop",
+            protocol.clone(),
+            Arc::new(MemoryStore::new()),
+        )
+        .await;
+    let bob = p.bob.identity().public();
+    let first = wallet.begin_identity_lookup(&bob, true).await.unwrap();
+    let older = first.switch.unwrap().await;
+    assert!(older.read());
+    // The app is loaded again from its store, and looks up again in the same millisecond.
+    let app_id = wallet.app_id();
+    drop(wallet);
+    let env = p.alice.env_with(
+        Arc::clone(&store),
+        Arc::clone(&p.router) as Arc<dyn crate::transport::Transport>,
+    );
+    let mut wallet = App::load(env, protocol, config(), app_id).await.unwrap();
+    p.router.remove(BOB_ORIGIN);
+    let second = wallet.begin_identity_lookup(&bob, true).await.unwrap();
+    let failed = second.switch.unwrap().await;
+    assert!(!failed.read());
+    wallet.finish_identity_lookup(failed).await.unwrap();
+    let found = wallet.finish_identity_lookup(older).await.unwrap();
+    assert_eq!(found.switch_copy, SwitchCopy::Unavailable);
+    assert_eq!(
+        found.may_act(p.clock.now_ms(), Initiator::Automatic, GRACE),
+        MayAct::No
+    );
+}
+
 #[test]
 fn test_may_act_follows_the_rule_of_the_switch_copy() {
     let doc = World::new().signer.switch().identity_doc();

@@ -804,4 +804,15 @@ async fn test_last_server_time_follows_checked_answers_only() {
     let client = client_with(app(), Some(service_public()), forged);
     assert!(client.allow().await.is_err());
     assert_eq!(client.last_server_time(), None);
+    // A refusal answered before the request verified, without a head, carries no stamped
+    // time (Switch wire 7.1).
+    let early = fixed(
+        service_key(),
+        401,
+        json!({ "code": "bad_signature", "message": "7.2" }),
+    );
+    let client = client_with(app(), Some(service_public()), early);
+    assert!(client.allow().await.is_err());
+    assert_eq!(client.last_server_time(), None);
+    assert_eq!(client.latest_server_time(), None);
 }

@@ -10,8 +10,8 @@ use pubky_switch_core::{
     chain::ProofState,
     claims::{EntryContext, apply_entry},
     ops::{
-        AppPutEffect, CertPutEffect, KeyBundleEffect, Limits, List, OpKind, Position, Quota,
-        ReceiveKeyEffect, Refusal, SignedOp, StateAfter, StoredPart, Writer, check_app_put,
+        AppPutEffect, CertPutEffect, CursorMove, KeyBundleEffect, Limits, List, OpKind, Position,
+        Quota, ReceiveKeyEffect, Refusal, SignedOp, StateAfter, StoredPart, Writer, check_app_put,
         check_cert_put, check_conditions, check_cursor, check_invite_code_put,
         check_key_bundle_put, check_permission, check_quota, check_receive_key_put, check_shape,
         covers, invite_code_delete, proof_state,
@@ -100,12 +100,13 @@ fn set_cursor(
             "Switch wire 6.2: the signer's batch carries no cursor.set",
         ));
     };
-    // No account continues another's sequence before cooperative moves are served.
-    check_cursor(position, state.generation, None, state.newest_seq)?;
     // The cursor only moves forward: a position at or behind it leaves it where it is, and
-    // isn't an error (Switch spec 8.3, Switch wire 6.2).
+    // isn't an error (Switch spec 8.3, Switch wire 6.2). No account continues another's
+    // sequence before cooperative moves are served.
     let cursor = &mut state.apps.entry(cert.app_id()).or_default().cursor;
-    if cursor.is_none_or(|current| position > current) {
+    let held = cursor.map(|current| current.seq);
+    if check_cursor(position, state.generation, None, state.newest_seq, held)? == CursorMove::Moves
+    {
         *cursor = Some(position);
     }
     Ok(())
@@ -375,8 +376,9 @@ fn receive_key_put(
     })
 }
 
-/// `key_bundle.put`, by [`check_key_bundle_put`]. A pending full-bundle request ends once the
-/// stored parts cover every data epoch from 1 to the current one (Switch wire 6.2).
+/// `key_bundle.put`, by [`check_key_bundle_put`], for an app the newest `identity.json` lists,
+/// whatever its certificate's expiry. A pending full-bundle request ends once the stored
+/// parts cover every data epoch from 1 to the current one (Switch wire 6.2).
 fn key_bundle_put(
     state: &mut OpsState,
     op: &SignedOp,
@@ -384,11 +386,11 @@ fn key_bundle_put(
     seq: u64,
 ) -> Result<StateAfter, Refusal> {
     let target = put.target_app_id;
-    let current = state.is_current(&target);
+    let withdrawn = state.kept.contains(&target);
     let epoch = state.data_epoch();
     let parts = state.parts.entry(target).or_default();
     let stored: Vec<_> = parts.iter().map(|part| part.put.clone()).collect();
-    let bundle_seq = match check_key_bundle_put(put, current, &stored)? {
+    let bundle_seq = match check_key_bundle_put(put, state.doc.as_ref(), withdrawn, &stored)? {
         KeyBundleEffect::Unchanged => parts
             .iter()
             .find(|part| &part.put == put)
@@ -425,14 +427,20 @@ fn key_bundle_put(
     Ok(StateAfter::KeyBundle { bundle_seq })
 }
 
-/// `cert.put`, by [`check_cert_put`].
+/// `cert.put`, by [`check_cert_put`], for an app the newest `identity.json` lists, whatever its
+/// certificate's expiry.
 fn cert_put(state: &mut OpsState, target: &[u8; 16], cert: &SignedDoc) -> Result<(), Refusal> {
     let renewed = AppCert::verify(cert, &state.identity).map_err(Refusal::from)?;
-    let active = !state.kept.contains(target);
+    let withdrawn = state.kept.contains(target);
     let held = state.apps.entry(*target).or_default();
     let record_cert = held.record.as_ref().map(AppRecord::cert);
-    if check_cert_put(&renewed, record_cert, active, held.renewed.as_ref())?
-        == CertPutEffect::Stores
+    if check_cert_put(
+        &renewed,
+        record_cert,
+        state.doc.as_ref(),
+        withdrawn,
+        held.renewed.as_ref(),
+    )? == CertPutEffect::Stores
     {
         held.renewed = Some(renewed);
     }
