@@ -41,7 +41,7 @@ pub(super) enum Deliverer<'a> {
 
 impl Service {
     /// Where the account's lists put `identity`.
-    async fn standing(
+    pub(super) async fn standing(
         &self,
         txn: &mut AccountTxn,
         identity: &[u8; 32],
@@ -62,7 +62,7 @@ impl Service {
     }
 
     /// The hash of the invite code `header` presents, if it names a code live at `now`.
-    async fn live_invite(
+    pub(super) async fn live_invite(
         &self,
         txn: &mut AccountTxn,
         header: Option<&str>,

@@ -149,15 +149,30 @@ pub fn staged_gate(call: &Call, staged: bool) -> Result<(), ApiError> {
     Ok(())
 }
 
-/// The caller a signer-only call takes (Switch wire 7.2, 7.4.2): the signer, or `403
-/// permission_missing` for any other, once its request has verified (7.6).
-pub fn require_signer(caller: &Caller) -> Result<(), ApiError> {
-    match caller {
-        Caller::Signer => Ok(()),
-        Caller::OwnApp(_) | Caller::OtherApp { .. } => Err(ApiError::new(
+/// Whether apps of other identities make `call`: `PUT /peers` and `POST /inbox` (Switch
+/// wire 7.2, 7.4).
+pub fn takes_other_apps(call: &Call) -> bool {
+    matches!(call, Call::PutPeers | Call::Append)
+}
+
+/// The refusal of an app of another identity at a call it doesn't make, once its
+/// certificate has passed every check, expiry included (Switch wire 7.2, 3.8): `403
+/// permission_missing` at the feed (7.4.4) and the signer's calls (7.4), `403
+/// not_admitted` elsewhere (6.4).
+pub fn other_app_refusal(call: &Call) -> ApiError {
+    match call {
+        Call::Feed => ApiError::new(
+            ErrorCode::PermissionMissing,
+            "7.4.4: only own apps read the feed",
+        ),
+        Call::PutIdentity | Call::Revoke(_) | Call::GetApps => ApiError::new(
             ErrorCode::PermissionMissing,
             "7.4: a call only the signer may make",
-        )),
+        ),
+        _ => ApiError::new(
+            ErrorCode::NotAdmitted,
+            "6.4: an app of another identity doesn't write here",
+        ),
     }
 }
 
@@ -307,22 +322,13 @@ mod tests {
     }
 
     #[test]
-    fn test_rules_require_signer() {
-        assert!(require_signer(&Caller::Signer).is_ok());
-        assert_eq!(
-            require_signer(&Caller::OwnApp("a".into()))
-                .expect_err("app")
-                .code,
-            ErrorCode::PermissionMissing
-        );
-        let other = Caller::OtherApp {
-            identity: [1; 32],
-            app: "a".into(),
-        };
-        assert_eq!(
-            require_signer(&other).expect_err("other").code,
-            ErrorCode::PermissionMissing
-        );
+    fn test_rules_other_app_refusal() {
+        assert!(takes_other_apps(&Call::PutPeers) && takes_other_apps(&Call::Append));
+        assert!(!takes_other_apps(&Call::Feed) && !takes_other_apps(&Call::Ops));
+        for call in [Call::Feed, Call::PutIdentity, Call::GetApps] {
+            assert_eq!(other_app_refusal(&call).code, ErrorCode::PermissionMissing);
+        }
+        assert_eq!(other_app_refusal(&Call::Ops).code, ErrorCode::NotAdmitted);
     }
 
     #[test]

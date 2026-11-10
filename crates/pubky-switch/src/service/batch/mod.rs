@@ -320,6 +320,7 @@ async fn load_state(
                 writer: invite.writer,
                 expires_at: invite.expires_at_ms,
                 context: invite.context,
+                context_written: invite.context_written,
             },
         );
     }
@@ -355,6 +356,19 @@ pub(super) async fn load_apps(
     }
     state.kept = txn.kept_app_ids().await?.into_iter().collect();
     Ok(state)
+}
+
+/// Delete the inbox entries every current target has passed (Switch wire 9.1), current by
+/// [`OpsState::is_current`], expired certificates included: after anything that changes
+/// which apps are current outside a batch, such as a revocation or an `identity.json`
+/// delivery.
+pub(super) async fn release_entries(
+    txn: &mut AccountTxn,
+    held: Option<&IdentityDoc>,
+    now: u64,
+) -> Result<u64, StoreError> {
+    let state = load_apps(txn, held, now).await?;
+    txn.delete_passed_entries(&state.current_app_ids()).await
 }
 
 pub(crate) fn held_app(app: &StoredApp, identity: &[u8; 32]) -> Result<HeldApp, StoreError> {
@@ -658,7 +672,7 @@ impl Service {
                 before.claims.get(&entry.claim_key),
                 &entry,
                 writer,
-                &|app| before.current_without_expiry(app),
+                &|app| before.is_current(app),
             )
         };
         if !self.time.read().trusted && depends_on_time(&ops, &outcome_depends) {
@@ -828,10 +842,16 @@ async fn save_apps(
     before: &OpsState,
     after: &OpsState,
 ) -> Result<(), StoreError> {
+    let mut cursor_moved = false;
     for (app_id, app) in &after.apps {
         if before.apps.get(app_id) != Some(app) {
             txn.put_app(&stored_app(*app_id, app)).await?;
+            cursor_moved |= before.apps.get(app_id).map(|held| held.cursor) != Some(app.cursor);
         }
+    }
+    // An entry every current target has passed goes (Switch wire 9.1).
+    if cursor_moved {
+        txn.delete_passed_entries(&after.current_app_ids()).await?;
     }
     for (app_id, key) in &after.new_receive_keys {
         txn.add_receive_key(app_id, key.n(), &key.kid(), key.signed())
@@ -954,6 +974,7 @@ async fn save(
                 writer: invite.writer,
                 expires_at_ms: invite.expires_at,
                 context: invite.context.clone(),
+                context_written: invite.context_written.clone(),
             })
             .await?;
         }

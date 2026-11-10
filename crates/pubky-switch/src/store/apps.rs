@@ -76,6 +76,10 @@ pub struct AppsView {
     pub parts: BTreeMap<[u8; 16], Vec<PartSpan>>,
     /// Every attempt open or unknown.
     pub open_attempts: Vec<OpenAttempt>,
+    /// Each current app's unread entries, and of those the ones it is the only current
+    /// target of: filled by the service, which judges which apps are current
+    /// ([`AccountTxn::unread_counts`]).
+    pub unread: BTreeMap<[u8; 16], (u64, u64)>,
     /// The generations that some current record's kept proof names (Switch wire 7.4.9).
     pub record_generations: Vec<u64>,
     /// The generations that some live claim's entry proof names (Switch wire 6.8).
