@@ -341,8 +341,58 @@ async fn test_approval_claim_waits_for_the_publish_and_for_alarms() {
         panic!("{error:?}")
     };
     assert!(signer.approved(&request).unwrap().is_none());
+    // Clearing it delivers the newest version again; the switch, back at version 1, takes it,
+    // and only then is the claim released.
     signer.clear_alert(&alert).await.unwrap();
+    let at_switch = world.switch.identity_doc().unwrap();
+    assert_eq!(at_switch.version(), 2);
+    assert!(at_switch.listed_cert(&app.keys.app_id_bytes()).is_some());
     assert!(signer.approved(&request).unwrap().is_some());
+    world.assert_no_version_sent_twice();
+}
+
+#[tokio::test]
+async fn test_approval_clearing_an_alarm_the_switch_still_shows_keeps_the_claim_held() {
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let first = signer.identity_doc().unwrap().unwrap();
+    let app = App::new(&["notes"], None, [9; 32]);
+    let review = signer.review(&app.request, &app.auth).unwrap();
+    let approved = signer.approve(review).await.unwrap();
+    // The switch holds another version 2: equivocation.
+    let mut body = first.body().clone();
+    body.version = 2;
+    body.record_max_age = Some(60);
+    let forked = pubky_switch_core::records::IdentityDoc::sign(&world.key, body).unwrap();
+    world.switch.deliver_identity(&forked).unwrap();
+    let error = signer.set_record_max_age(Some(86_400)).await.unwrap_err();
+    let SignerError::Alarm(alert) = error else {
+        panic!("{error:?}")
+    };
+    // Clearing it delivers version 2 again, which the switch refuses: the alarm comes back.
+    let error = signer.clear_alert(&alert).await.unwrap_err();
+    assert_eq!(error, SignerError::Alarm(alert));
+    assert!(signer.approved(&approved.request).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn test_approval_after_an_old_alarm_is_released_once_its_delivery_succeeds() {
+    // A delivery the switch takes shows it holds the signer's mark again, whatever alert is
+    // still listed.
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let first = signer.identity_doc().unwrap().unwrap();
+    signer.set_record_max_age(Some(86_400)).await.unwrap();
+    world.switch.deliver_identity(&first).unwrap();
+    signer.set_record_max_age(Some(3_600)).await.unwrap_err();
+    assert!(!signer.alerts().is_empty());
+    // The switch is put back as it was.
+    let second = signer.identity_doc().unwrap().unwrap();
+    world.switch.deliver_identity(&second).unwrap();
+    let app = App::new(&["notes"], None, [9; 32]);
+    let review = signer.review(&app.request, &app.auth).unwrap();
+    let approved = signer.approve(review).await.unwrap();
+    assert_eq!(signer.approved(&approved.request).unwrap(), Some(approved));
 }
 
 #[tokio::test]
@@ -386,26 +436,22 @@ async fn test_approval_a_refused_delivery_leaves_no_certificate() {
 
 #[tokio::test]
 async fn test_approval_a_reopened_signer_releases_the_same_claim_bytes() {
+    // The bytes `approve` returned are the bytes a reopened signer gives: signed once, never
+    // again (the approval seals its bundle with fresh randomness, so a second signing would
+    // differ).
     let world = World::new();
     let (mut signer, store) = world.enrolled().await;
     let app = App::new(&["notes"], None, [9; 32]);
     let review = signer.review(&app.request, &app.auth).unwrap();
     let request = review.request_hash();
-    *world.homeserver.failing_path.lock().unwrap() =
-        Some(pubky_switch_core::records::IDENTITY_PATH.into());
-    signer.approve(review).await.unwrap_err();
+    let before = signer.approve(review).await.unwrap();
     drop(signer);
-    *world.homeserver.failing_path.lock().unwrap() = None;
-    let mut reopened = pubky_switch_signer::Signer::open(world.env(store.clone()), world.keyring())
+    let mut reopened = pubky_switch_signer::Signer::open(world.env(store), world.keyring())
         .await
         .unwrap();
     reopened.resume().await.unwrap();
     let first = reopened.approved(&request).unwrap().unwrap();
-    let again = pubky_switch_signer::Signer::open(world.env(store), world.keyring())
-        .await
-        .unwrap();
-    let second = again.approved(&request).unwrap().unwrap();
-    assert_eq!(first.claim, second.claim);
+    assert_eq!(first.claim, before.claim);
     ApprovalClaim::from_plaintext(&first.claim)
         .unwrap()
         .verify(&world.key.public(), &app.auth)

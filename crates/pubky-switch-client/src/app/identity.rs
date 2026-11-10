@@ -48,7 +48,7 @@ pub enum IdentityRefresh {
     Newer {
         /// The version taken.
         version: u64,
-        /// When the read was answered.
+        /// When the read was answered, before the copy was taken.
         confirmed_at: u64,
     },
     /// The Homeserver serves the version the app holds: it is confirmed.
@@ -113,13 +113,15 @@ impl App {
                 Err(AppError::Transport(_)) => return Ok(IdentityRefresh::Unavailable),
                 Err(error) => return Err(error),
             };
+            // The read's own time: taking the copy may commit and fetch keys first, and the
+            // confirmation is only as fresh as the read (Switch spec 12.6).
+            let confirmed_at = self.now();
             let served = doc.version();
             let newer = self.take_own_copy(doc).await?;
             let held = self.state.own_doc.version();
             if !newer && served != held {
                 return Ok(IdentityRefresh::Older { served });
             }
-            let confirmed_at = self.now();
             self.identity_confirmed = Some(Confirmed {
                 version: held,
                 at_ms: confirmed_at,

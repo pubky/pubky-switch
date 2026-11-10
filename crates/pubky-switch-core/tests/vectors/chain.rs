@@ -5,7 +5,8 @@
 //! The chain is rebuilt item by item from the items and the service's times, every proof is
 //! rebuilt from the state the core computes for its item (the claim view from the claim
 //! rules, the record's version from its `seq`) and signed again with the fixed service key,
-//! and every head is signed again, byte for byte.
+//! and every head is signed again, byte for byte. The record delete after the chain
+//! (`record_delete`) is generated here (README "How the files were generated").
 
 use std::collections::HashMap;
 
@@ -16,10 +17,15 @@ use pubky_switch_core::chain::{
 };
 use pubky_switch_core::claims::{ClaimLimits, ClaimTally, EntryContext, apply_entry};
 use pubky_switch_core::enc::{app_id_decode, b64 as b64e};
-use pubky_switch_core::ops::{OpKind, RecordVersion, SignedOp, ops_hash};
+use pubky_switch_core::keys::{AppKeys as SwitchAppKeys, IdentityKey};
+use pubky_switch_core::ops::{
+    OpKind, RecordVersion, SignedOp, StateAfter, ops_hash, proof_state, sign_batch,
+};
 use pubky_switch_core::records::{AppRecord, IdentityDoc, ReceiveKeyRecord};
+use pubky_switch_core::sealed::{RecordValue, SealedValue};
 use pubky_switch_core::sig::SignedDoc;
-use serde_json::Value;
+use pubky_switch_core::time::rfc3339;
+use serde_json::{Value, json};
 
 use crate::common::*;
 
@@ -167,6 +173,7 @@ fn test_vectors_chain() {
     check_rejections(&v, &items, &identity, &service_key);
     check_batch_id_window(&v);
     check_export_batches(&ops);
+    check_record_delete(&keys, &items, &ops, &identity, &service);
 }
 
 /// The state the core computes for an operation's item: the claim view after the claim's
@@ -477,4 +484,140 @@ fn find_batch_parts(value: &Value, out: &mut Vec<Value>) {
         }
         _ => {}
     }
+}
+
+/// `record_delete`, which `pubky-switch-core` generates (README "How the files were
+/// generated"): the wallet deletes the record of seq 8, in a batch of its own chained after
+/// seq 9. Its sealed value is the tag alone (wire 6.2), sealed with the seed
+/// `chain/record_delete/nonce`, under the batch ID of the seed `chain/record_delete/batch`.
+/// The proof's state shows `deleted: true`, as the record rule gives it (wire 6.5).
+fn check_record_delete(
+    keys: &Keys,
+    items: &[Item],
+    ops: &HashMap<u64, SignedOp>,
+    identity: &[u8; 32],
+    service: &ed25519_dalek::SigningKey,
+) {
+    let wallet = keys.app("wallet");
+    let app_id = app_id_decode(&wallet.app_id).unwrap();
+    let updated = &ops[&8];
+    let OpKind::RecordPut(update) = &updated.body().kind else {
+        panic!("seq 8 is the record's update");
+    };
+    let sealed = &update.value_sealed;
+    let scope_key = IdentityKey::from_secret(keys.identity_secrets[identity])
+        .scope_key(sealed.data_epoch, &sealed.scope);
+    let nonce: [u8; 24] = seed("chain/record_delete/nonce")[..24].try_into().unwrap();
+    let mut put = update.clone();
+    put.expected_version = RecordVersion::new(1, 8);
+    put.value_sealed = SealedValue::seal_with_nonce(
+        &scope_key,
+        identity,
+        sealed.data_epoch,
+        &sealed.scope,
+        &put.key,
+        b"",
+        &nonce,
+    )
+    .unwrap();
+    assert!(put.value_sealed.looks_like_delete());
+    let batch_id: [u8; 16] = seed("chain/record_delete/batch")[..16].try_into().unwrap();
+    let signer = SwitchAppKeys::from_secrets(wallet.signing_secret, wallet.bundle_secret);
+    let op = sign_batch(
+        &signer,
+        identity,
+        Some(app_id),
+        updated.body().generation,
+        batch_id,
+        vec![(Vec::new(), OpKind::RecordPut(put.clone()))],
+    )
+    .unwrap()
+    .remove(0);
+
+    // Chained after the chain's last item, a second after it.
+    let last = items.last().unwrap();
+    let tip = ChainTip {
+        generation: last.envelope.generation,
+        seq: last.seq,
+        chain_hash: last.stub.chain_hash,
+    };
+    let bytes = op.signed().doc_bytes().unwrap();
+    let hash = item_hash(ItemType::Op, &bytes);
+    let at = last.envelope.server_time + 1000;
+    let seq = last.seq + 1;
+    let (stub, _) = tip
+        .append(seq, at, ItemType::Op, hash, Some(op.body().batch))
+        .unwrap();
+    let item = json!({
+        "chain_hash": b64e(&stub.chain_hash),
+        "envelope_json": String::from_utf8(stub.envelope.clone()).unwrap(),
+        "item": op.signed(),
+        "item_bytes_hex": hex::encode(&bytes),
+        "item_hash": b64e(&hash),
+        "item_type": "op",
+        "prev_chain_hash": b64e(&tip.chain_hash),
+        "seq": seq,
+        "stub": stub.to_value(),
+    });
+
+    // The proof, with the state the record rule gives a delete.
+    let state = proof_state(
+        &OpKind::RecordPut(put.clone()),
+        &StateAfter::Record(RecordVersion::new(tip.generation, seq)),
+    )
+    .unwrap();
+    assert_eq!(
+        state,
+        ProofState::Record {
+            version: RecordVersion::new(tip.generation, seq),
+            deleted: true,
+        }
+    );
+    let object = op.body().kind.proof_object(Some(&app_id)).unwrap();
+    let body = ProofBody::new(stub.clone(), object, &state);
+    let proof = TransitionProof::sign(service, identity, body).unwrap();
+    let body_text = String::from_utf8(proof.signed().body_bytes().unwrap()).unwrap();
+    let section = json!({
+        "description": format!(
+            "A record.put that deletes (wire 6.2): the wallet deletes the record of seq 8, \
+             expected_version (1, 8), in a batch of one chained after seq 9 at {}. Its \
+             value_sealed.ct is the tag alone, so the switch takes it as a delete without \
+             opening it, and its transition proof's state shows deleted true (wire 6.5). No \
+             other file continues the chain this way: export.json freezes the account after \
+             seq 9, and operations.json pays at seqs 10 and 11.",
+            rfc3339(at)
+        ),
+        "item": item,
+        "transition_proof": {
+            "body": body_text,
+            "name": format!("record.put delete (seq {seq}): deleted at version (1, {seq})"),
+            "signed": proof.signed(),
+        },
+    });
+    generated("chain.json", &[(Place::Member("/record_delete"), section)]);
+
+    // The case as the file holds it: the item reads and links to the chain, the delete opens
+    // as one, and the proof verifies, binds the operation and shows the delete.
+    let file = load("chain.json");
+    let case = &file["record_delete"];
+    let read = read_item(&case["item"]);
+    assert_eq!(read.envelope.prev_chain_hash, last.stub.chain_hash);
+    let op = SignedOp::verify(&read.item, &wallet.signing_public, identity, Some(&app_id)).unwrap();
+    let OpKind::RecordPut(put) = &op.body().kind else {
+        panic!("record_delete is a record.put");
+    };
+    assert_eq!(
+        put.value_sealed
+            .open(&scope_key, identity, &put.key)
+            .unwrap(),
+        RecordValue::Delete
+    );
+    let p = &case["transition_proof"];
+    let signed = signed_of(&p["signed"]);
+    assert_eq!(signed.body, b64e(st(p, "body").as_bytes()));
+    let proof =
+        TransitionProof::verify(&signed, &service.verifying_key().to_bytes(), identity).unwrap();
+    proof.check_binds(&op).unwrap();
+    assert_eq!(proof.body().chain, read.stub);
+    assert_eq!(proof.body().state["deleted"], Value::Bool(true));
 }
