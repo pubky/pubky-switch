@@ -9,7 +9,8 @@
 //! compared with those files.
 
 use ed25519_dalek::SigningKey;
-use pubky_switch_core::chain::{SignedHead, Stub, TransitionProof};
+use pubky_switch_core::chain::{ChainTip, ProofBody, SignedHead, Stub, TransitionProof, item_hash};
+use pubky_switch_core::claims::Outcome;
 use pubky_switch_core::enc::{app_id_decode, b64 as b64e, hash};
 use pubky_switch_core::export::{
     Activation, Chunk, ChunkAnswer, DEFAULT_CHUNK_TARGET, ExportCaller, ExportRead, Import,
@@ -19,7 +20,9 @@ use pubky_switch_core::export::{
 use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::labels;
 use pubky_switch_core::ops::Refusal;
-use pubky_switch_core::records::{CLOCK_TOLERANCE_MS, ExportTransfer, Freeze, IdentityDoc};
+use pubky_switch_core::records::{
+    AppRecord, CLOCK_TOLERANCE_MS, ExportTransfer, Freeze, IdentityDoc,
+};
 use pubky_switch_core::sig::SignedDoc;
 use serde_json::{Value, json};
 
@@ -115,6 +118,7 @@ fn test_vectors_export() {
     check_parts_byte_for_byte(&f);
     let import = check_activation(&f);
     check_record_rejections(&f);
+    check_generated_claim_rejections(&f);
     check_claim_rejections(&f);
     check_activation_rules(&f);
     check_uploads(&f);
@@ -228,6 +232,14 @@ fn check_parts_byte_for_byte(f: &Fixture) {
         assert_eq!(Part::read(raw).unwrap(), *part, "{}", part.kind());
         written.push(bytes);
     }
+    // The claim entry's `cert` is always written: `null` here, since the wallet's app part
+    // carries the certificate; a part without it doesn't read (Switch wire 10.3).
+    let ci = f.index("claim_entry");
+    assert!(matches!(&f.parts[ci], Part::ClaimEntry(e) if e.cert.is_none()));
+    assert!(raw[ci]["cert"].is_null());
+    let mut without = raw[ci].clone();
+    without.as_object_mut().unwrap().remove("cert");
+    assert_eq!(Part::read(&without).unwrap_err().status(), 400);
     let chunk = Chunk::parse(&f.chunk).unwrap();
     assert_eq!((chunk.index, chunk.first), (0, 0));
     assert_eq!(
@@ -295,6 +307,12 @@ fn check_activation(f: &Fixture) -> Import {
     let claim = &import.claims[0].claim;
     assert_eq!((claim.step, claim.creator), (1, Some(wallet)));
     assert_eq!(claim.last_entry, Some(1_767_225_603_000));
+    // The entry was checked against the certificate the wallet's app part carries.
+    let entries = &import.claims[0].entries;
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].cert, None);
+    // The kept proofs, the record's and the claim entry's, all name generation 1.
+    assert_eq!(import.proof_generations, [1]);
     assert_eq!(import.batches.len(), 3);
     assert_eq!(
         import.freeze_at,
@@ -366,30 +384,161 @@ fn check_record_rejections(f: &Fixture) {
 }
 
 /// `claim_rejections`: the claim part as a faulty old service could send it, each refused at
-/// the activation for its rule (Switch wire 6.8, 10.5).
+/// the activation for its rule, with its status (Switch wire 6.8, 10.5). Where a case
+/// carries `entry_proof`, it stands for the claim's entry's proof; where it carries
+/// `claim_entry`, that part follows the claim's own entry.
 fn check_claim_rejections(f: &Fixture) {
     let v = load("export.json");
     let ci = f.index("claim");
     let cases = arr(&v, "claim_rejections");
-    assert_eq!(cases.len(), 2);
+    assert_eq!(cases.len(), 6);
     for case in cases {
         let name = st(case, "name");
         let rule = match name {
             "a creator other than the owner of its first attempt" => "its creator",
             "a last_entry_ms before its last entry's time" => "its last_entry_ms",
+            "the open attempt shown failed, with its entry's proof signed again to match" => {
+                "an entry's proof doesn't show the state its entry leads to"
+            }
+            "a failed entry O signed itself, freeing the wallet's open attempt" => {
+                "an entry's operation isn't its writer's"
+            }
+            ANOTHER_WRITER => "its certificate is another app's",
+            REBUILT => "the identity.json declares no provider loss",
             other => panic!("unknown claim rejection {other}"),
+        };
+        assert!(st(case, "rule").contains("10.5)"), "{name}");
+        let code = match case.get("status").and_then(Value::as_u64) {
+            None | Some(409) => ErrorCode::Conflict,
+            Some(401) => ErrorCode::BadSignature,
+            Some(other) => panic!("{name}: status {other}"),
         };
         let mut parts = f.parts.clone();
         parts[ci] = Part::read(&json!({
             "part": "claim", "claim_key": case["claim_key"], "claim": case["claim"]
         }))
         .unwrap();
-        refused(
-            f.run(&f.manifest, &parts, &Uploads::default(), f.now()),
-            ErrorCode::Conflict,
-            rule,
-        );
+        if let Some(proof) = case.get("entry_proof") {
+            let Part::ClaimEntry(entry) = &mut parts[ci + 1] else {
+                panic!("{name}: the claim's entry");
+            };
+            entry.proof = serde_json::from_value(proof.clone()).unwrap();
+            // Signed again by the old service: the proof alone verifies.
+            TransitionProof::verify(&entry.proof, &f.o_key, &f.alice).unwrap();
+        }
+        if let Some(raw) = case.get("claim_entry") {
+            let part = Part::read(raw).unwrap();
+            assert_eq!(part.kind(), "claim_entry", "{name}");
+            parts.insert(ci + 2, part);
+        }
+        refused(f.run_parts(&parts), code, rule);
     }
+}
+
+const ANOTHER_WRITER: &str = "a failed entry the executor signed under its own certificate, naming the wallet as its writer, freeing the wallet's open attempt";
+const REBUILT: &str = "the claim marked rebuilt from uploads on an account without a provider loss, its open attempt failed and the claim freed";
+
+/// The `claim_rejections` cases `pubky-switch-core` generates (README "How the files were
+/// generated"), from the fixed keys and the file's own parts, each with its refusal's reason
+/// as `error`:
+///
+/// - the further `failed` entry of the case O signed itself, signed instead by the executor,
+///   which holds `claims.write`, its operation still naming the wallet, with the executor's
+///   certificate as the part's `cert` and the entry's proof signed again by O over it: the
+///   certificate isn't one of the app the operation names (`401`);
+/// - the live claim with its open attempt `failed` by the wallet and `current` cleared,
+///   marked `rebuilt`, its entry kept: alice's `identity.json` declares no provider loss.
+fn generated_claim_rejections(f: &Fixture) -> Vec<Value> {
+    let keys = keys();
+    let v = load("export.json");
+    let ci = f.index("claim");
+    let base = arr(&v, "claim_rejections")
+        .iter()
+        .find(|c| {
+            st(c, "name") == "a failed entry O signed itself, freeing the wallet's open attempt"
+        })
+        .unwrap();
+    let Part::ClaimEntry(mut entry) = Part::read(&base["claim_entry"]).unwrap() else {
+        panic!("a claim_entry part");
+    };
+    let executor = keys.app("executor");
+    let body = entry.op.body_bytes().unwrap();
+    let sig = pubky_switch_core::sig::sign(
+        &SigningKey::from_bytes(&executor.signing_secret),
+        labels::sig::OP,
+        &[&f.alice, &body],
+    );
+    entry.op = SignedDoc::from_parts(&body, &sig);
+    let proof = TransitionProof::peek(&entry.proof).unwrap();
+    let env = proof.envelope();
+    let item = item_hash(env.item_type, &entry.op.doc_bytes().unwrap());
+    let (stub, _) = ChainTip {
+        generation: env.generation,
+        seq: env.seq - 1,
+        chain_hash: env.prev_chain_hash,
+    }
+    .append(env.seq, env.server_time, env.item_type, item, env.batch)
+    .unwrap();
+    let resigned = ProofBody {
+        chain: stub,
+        ..proof.body().clone()
+    };
+    entry.proof = TransitionProof::sign(&f.o_secret, &f.alice, resigned)
+        .unwrap()
+        .signed()
+        .clone();
+    entry.cert = Some(document("executor certificate"));
+    let claim_entry: Value =
+        serde_json::from_slice(&Part::ClaimEntry(entry).to_json().unwrap()).unwrap();
+    let mut parts = f.parts.clone();
+    parts[ci] = Part::read(&json!({
+        "part": "claim", "claim_key": base["claim_key"], "claim": base["claim"]
+    }))
+    .unwrap();
+    parts.insert(ci + 2, Part::read(&claim_entry).unwrap());
+    let another_writer = f.run_parts(&parts).unwrap_err();
+    // The claim marked rebuilt.
+    let wallet = app_id_decode(&keys.app("wallet").app_id).unwrap();
+    let mut parts = f.parts.clone();
+    let Part::Claim(claim) = &mut parts[ci] else {
+        panic!("the claim part");
+    };
+    let state = &mut claim.claim;
+    state.attempts[0].outcome = Outcome::Failed;
+    state.attempts[0].resolved_by = Some(wallet);
+    state.current = None;
+    state.rebuilt = true;
+    let rebuilt: Value = serde_json::from_slice(&parts[ci].to_json().unwrap()).unwrap();
+    let refused_rebuilt = f.run_parts(&parts).unwrap_err();
+    vec![
+        json!({
+            "name": ANOTHER_WRITER,
+            "rule": "each claim entry's operation verifies with a certificate whose App ID is the operation's writer, so an app's valid claims.write certificate verifies only its own entries (wire 10.5)",
+            "claim_key": base["claim_key"],
+            "claim": base["claim"],
+            "claim_entry": claim_entry,
+            "status": another_writer.status(),
+            "error": quoted(&another_writer.reason),
+        }),
+        json!({
+            "name": REBUILT,
+            "rule": "a claim marked rebuilt is accepted only when the imported identity.json declares a provider loss in recovery_from (wire 10.5)",
+            "claim_key": rebuilt["claim_key"],
+            "claim": rebuilt["claim"],
+            "error": quoted(&refused_rebuilt.reason),
+        }),
+    ]
+}
+
+/// The generated `claim_rejections` cases are the file's, byte for byte (README "How the
+/// files were generated").
+fn check_generated_claim_rejections(f: &Fixture) {
+    let cases = generated_claim_rejections(f);
+    let places: Vec<(Place<'_>, Value)> = cases
+        .into_iter()
+        .map(|c| (Place::Case("/claim_rejections"), c))
+        .collect();
+    generated("export.json", &places);
 }
 
 /// More of the activation's checks on the vector's export, each refused for its rule.
@@ -571,6 +720,28 @@ fn check_activation_rules(f: &Fixture) {
     let mut parts = f.parts.clone();
     if let Part::Record(r) = &mut parts[ri] {
         r.op = op8;
+    }
+    f.run_parts(&parts).unwrap();
+    // The claim entry's certificate carried in its part: the same certificate imports.
+    let wallet_cert = f
+        .parts
+        .iter()
+        .find_map(|p| match p {
+            Part::App(a) => a.record.as_ref(),
+            _ => None,
+        })
+        .map(|d| {
+            AppRecord::verify(d, &f.alice)
+                .unwrap()
+                .cert()
+                .signed()
+                .clone()
+        })
+        .unwrap();
+    let ei = f.index("claim_entry");
+    let mut parts = f.parts.clone();
+    if let Part::ClaimEntry(e) = &mut parts[ei] {
+        e.cert = Some(wallet_cert);
     }
     f.run_parts(&parts).unwrap();
     // A live claim without its entry.

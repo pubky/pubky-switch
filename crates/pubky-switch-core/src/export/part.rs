@@ -243,6 +243,10 @@ pub struct ClaimEntryPart {
     pub op: SignedDoc,
     /// Its transition proof.
     pub proof: SignedDoc,
+    /// The writer's certificate the entry was checked against, or `None` for the one the
+    /// record in the writer's `app` part carries, as in a `record` part. Always written
+    /// (Switch wire 10.3).
+    pub cert: Option<SignedDoc>,
 }
 
 /// A tombstone's state in a `tombstone` part (Switch wire 10.3).
@@ -589,6 +593,14 @@ impl<'a> Members<'a> {
         self.doc_of(member, self.req(member)?)
     }
 
+    /// A signed document marked "always written": present, and `null` or a document.
+    fn written_doc(&self, member: &str) -> Result<Option<SignedDoc>> {
+        match self.present(member)? {
+            Value::Null => Ok(None),
+            v => self.doc_of(member, v).map(Some),
+        }
+    }
+
     fn opt_doc(&self, member: &str) -> Result<Option<SignedDoc>> {
         self.nullable(member)
             .map(|v| self.doc_of(member, v))
@@ -853,6 +865,7 @@ impl Part {
                 seq: m.int("seq")?,
                 op: m.doc("op")?,
                 proof: m.doc("proof")?,
+                cert: m.written_doc("cert")?,
             }),
             "tombstone" => {
                 let t = m.object("tombstone")?;
@@ -1101,6 +1114,7 @@ impl Part {
                     .int("seq", p.seq)
                     .raw("op", &carrying(&p.op))
                     .raw("proof", &carrying(&p.proof));
+                opt_raw(&mut o, "cert", p.cert.as_ref().map(carrying));
             }
             Part::Tombstone(p) => {
                 let t = &p.tombstone;

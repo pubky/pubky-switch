@@ -43,7 +43,7 @@ pub use approval::{
 };
 pub use cert::{AppCert, AppCertBody, CERT_KIND, DEFAULT_CERT_LIFETIME_MS, MAX_CERT_LIFETIME_MS};
 pub use delivery::{
-    AccountView, Delivery, DeliveryRefusal, GenerationChange, check_delivery,
+    AccountView, Delivery, DeliveryRefusal, GenerationChange, KeptProofs, check_delivery,
     check_kept_service_keys, needed_generations, signer_service_keys,
 };
 pub use enroll::{

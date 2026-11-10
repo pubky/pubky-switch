@@ -73,7 +73,7 @@ service.
   - a serving account is answered `400`, never a pending key for the next generation, so
     there is no key change in place and no provider loss at the same service.
 - **`PUT /identity`** (Switch wire 3.3, 7.4.2), in `switch/signer.rs`: judged by the core's
-  `check_delivery`, like the service, with no kept proofs (`proof_keys` empty, as at the
+  `check_delivery`, like the service, with no kept proofs (`kept_proofs` empty, as at the
   service until it serves operations). Unlike the service: there is no pending key, so no
   generation change at a serving account; a first document carrying `recovery_from`, or at
   another generation than the switch's, is chained where the service answers `503`; and the
