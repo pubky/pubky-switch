@@ -543,6 +543,12 @@ impl Signer {
             return Ok(true);
         };
         let until = delivered_at.saturating_add(CLOCK_TOLERANCE_MS);
+        // The copies are checked as before every new version (`ready`), so a closing isn't
+        // signed over an install that took over, or over records that are behind.
+        self.check_copies().await?;
+        if self.flow.is_some() || super::gate::refusal(&self.state).is_some() {
+            return Ok(false);
+        }
         let key = self.signing_key()?;
         let (doc, flow) = self.next_version(&key, |body| {
             for app in &owed {

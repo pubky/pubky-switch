@@ -60,6 +60,8 @@ pub struct TestHomeserver {
     pub failing_puts: Mutex<bool>,
     /// Writes to this path fail while reads and other writes go through.
     pub failing_path: Mutex<Option<String>>,
+    /// Writes to this path apply, and their answer is lost: the writer sees a failure.
+    pub losing_path: Mutex<Option<String>>,
 }
 
 impl TestHomeserver {
@@ -103,7 +105,11 @@ impl Homeserver for TestHomeserver {
                     .unwrap()
                     .push((path.to_owned(), bytes.clone()));
                 self.set(path, bytes);
-                Ok(())
+                if self.losing_path.lock().unwrap().as_deref() == Some(path) {
+                    Err(TransportError::Connect("answer lost".into()))
+                } else {
+                    Ok(())
+                }
             };
         Box::pin(async move { answer })
     }

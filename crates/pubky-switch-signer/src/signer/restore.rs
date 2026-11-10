@@ -309,14 +309,30 @@ impl Signer {
     }
 
     /// Write the backup a restore owes, holding the newest version, once its delivery has won
-    /// (Switch wire 3.13 "When it is written"). A write that fails raises
-    /// [`Alert::BackupNotWritten`] and stays owed; nothing is held back by it.
+    /// (Switch wire 3.13 "When it is written"). It passes the checks of every backup write
+    /// first ([`Signer::check_backup_write`]): a backup there that another install wrote at or
+    /// past the mark, or a newer one of this install's own, is never written over, and the
+    /// install stops as those checks say. A write, or a check, that fails on the Homeserver or
+    /// the switch raises [`Alert::BackupNotWritten`] and stays owed; nothing is held back by
+    /// it.
     pub(super) async fn write_owed_backup(&mut self) -> Result<()> {
         if !self.state.backup_owed || self.flow.is_some() || gate::refusal(&self.state).is_some() {
             return Ok(());
         }
         let Some(newest) = self.state.newest.clone() else {
             return Ok(());
+        };
+        let raised = match self.check_backup_write().await {
+            Ok(raised) => raised,
+            Err(SignerError::Homeserver(_) | SignerError::Switch(_)) => {
+                let mut state = self.state.clone();
+                state.alert(Alert::BackupNotWritten);
+                if state != self.state {
+                    self.commit(state, None).await?;
+                }
+                return Ok(());
+            }
+            Err(error) => return Err(error),
         };
         let backup = self.seal_backup(&newest.doc, newest.prev)?;
         let bytes = serde_json::to_vec(&backup).map_err(|e| SignerError::Records(e.to_string()))?;
@@ -327,6 +343,9 @@ impl Signer {
             .await
             .is_ok();
         let mut state = self.state.clone();
+        if let Some(alert) = raised {
+            state.alert(alert);
+        }
         if written {
             state.backup_owed = false;
             state.alerts.retain(|a| *a != Alert::BackupNotWritten);
