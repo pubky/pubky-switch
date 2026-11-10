@@ -601,6 +601,41 @@ async fn test_move_compares_the_admission_lists() {
 }
 
 #[tokio::test]
+async fn test_sender_disposition_move_keeps_the_flags_and_the_refresh_time() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join_on(
+        &w,
+        &router,
+        Arc::clone(&w.store) as Arc<dyn StateStore>,
+        w.protocol.clone(),
+        &[Permission::ListsRead, Permission::ConversationAdd],
+    )
+    .await;
+    w.switch.lock().shared.flagged.insert(FLAGGED, 3);
+    app.receive(None).await.unwrap();
+    let before = lists_copy_in(&w.store);
+    assert!(before.0 && before.1.is_some());
+    let n_key = next_key();
+    w.switch.freeze(&freeze_for(&w, &n_key, 2)).unwrap();
+    let next = w.switch.import_into(n_key.to_bytes());
+    router.add(NEXT, &next);
+    w.clock.advance_ms(60_000);
+    app.receive(None).await.unwrap();
+    publish_at(
+        &w,
+        &next,
+        Inbox::new(NEXT, n_key.verifying_key().to_bytes()),
+        2,
+        None,
+    );
+    app.receive(None).await.unwrap();
+    assert_eq!(app.cursor().generation, 2);
+    // The export carried the flags: the copy stays as it was, refreshed no sooner.
+    assert_eq!(lists_copy_in(&w.store), before);
+}
+
+#[tokio::test]
 async fn test_move_registers_again_a_key_the_next_service_rolled_back() {
     let w = World::new();
     let router = Router::of(&w);
@@ -893,6 +928,22 @@ struct Lost {
     note_at_ms: u64,
 }
 
+/// A sender the old service flags in [`lost_world`] and the move tests.
+const FLAGGED: [u8; 32] = [44; 32];
+
+/// The app's copy of the lists in `store`: whether it holds [`FLAGGED`], and its refresh
+/// time.
+fn lists_copy_in(store: &MemoryStore) -> (bool, Option<u64>) {
+    let ns = crate::store::client_namespace(&app_keys("wallet").app_id_bytes());
+    let flag = format!("lc/flag/{}", pubky_switch_core::enc::pubky_id(&FLAGGED));
+    let flagged = store.get(&ns, flag.as_bytes()).unwrap().is_some();
+    let at = store
+        .get(&ns, b"lc/lists_at")
+        .unwrap()
+        .map(|bytes| crate::app::state::decode::<u64>(&bytes).unwrap());
+    (flagged, at)
+}
+
 /// An app with the list permissions, a contact and a deny entry in its copy, a note
 /// processed, and kept evidence; then the signer declares generation 1 lost at a new
 /// service, and the old one is gone.
@@ -934,6 +985,8 @@ async fn lost_world(store: Arc<dyn StateStore>) -> Lost {
     w.clock.advance_ms(1000);
     let note_at_ms = w.clock.now_ms();
     w.note(me, "before the loss");
+    // The old service flags a sender; the read refreshes the copy of the lists with it.
+    w.switch.lock().shared.flagged.insert(FLAGGED, 3);
     app.receive(None).await.unwrap();
     app.keep_evidence(vec![Evidence::Proof(first_proof(&w.switch))])
         .await
@@ -1054,6 +1107,27 @@ async fn test_loss_recovers_at_the_new_generation() {
     // Nothing is asked again.
     app.receive(None).await.unwrap();
     assert_eq!(lost.protocol.losses.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn test_sender_disposition_loss_clears_the_refresh_time_and_keeps_the_flags() {
+    let store = Arc::new(MemoryStore::new());
+    let lost = lost_world(Arc::clone(&store) as Arc<dyn StateStore>).await;
+    let (flagged, at) = lists_copy_in(&store);
+    assert!(flagged && at.is_some());
+    // The new service's lists don't read for now, so the owed refresh fails.
+    lost.next.lock().allow = Some(json!({}));
+    let (mut app, _) = follow_loss(&lost, Arc::clone(&store) as Arc<dyn StateStore>)
+        .await
+        .unwrap();
+    assert_eq!(app.cursor().generation, 2);
+    assert_eq!(lists_copy_in(&store), (true, None));
+    // Once they read, the next read refreshes the copy from the new service.
+    lost.next.lock().allow = None;
+    app.receive(None).await.unwrap();
+    let (flagged, at) = lists_copy_in(&store);
+    assert!(!flagged);
+    assert!(at.is_some());
 }
 
 #[tokio::test]

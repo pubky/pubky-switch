@@ -85,6 +85,17 @@ pub use switch::{Fault, HeldRecord, MAX_PAGE_BYTES, SWITCH_ORIGIN, ScriptedSwitc
 #[cfg(test)]
 pub(crate) use switch::{Item, PushReg};
 
+/// A [`RestoreContext`](crate::app::RestoreContext) for a protocol's own tests of its
+/// [`Protocol::restore_layer`](crate::app::Protocol::restore_layer): the identity, App ID
+/// and naming key of a backup the test builds, as [`crate::app::App::restore`] passes them.
+pub fn restore_context(
+    identity: [u8; 32],
+    app_id: [u8; 16],
+    naming: &pubky_switch_core::ident::NamingKey,
+) -> crate::app::RestoreContext<'_> {
+    crate::app::RestoreContext::new(identity, app_id, naming)
+}
+
 use pubky_switch_core::keys::{AppKeys, IdentityKey, ReceiveKey};
 
 /// The time test clocks start at by default: 2026-01-01T00:00:00Z, in Unix milliseconds.

@@ -34,7 +34,7 @@ use pubky_switch_core::receive::KindRules;
 use pubky_switch_core::records::{AppCert, AppRecord, Standing};
 use serde_json::Value;
 
-use super::context::{LocalView, ReceiveContext};
+use super::context::{LocalView, ReceiveContext, RestoreContext};
 use super::error::AppError;
 use super::records::Collection;
 use super::recovery::{LossActions, ProviderLoss};
@@ -270,12 +270,12 @@ impl StoreFailure {
 }
 
 impl From<StoreError> for StoreFailure {
-    /// [`StoreError::Corrupt`] fails for the entry ([`StoreFailure::of_entry`]); every other
-    /// error is the store unavailable for now ([`StoreFailure::unavailable`]), bounded by
-    /// the wait.
+    /// [`StoreError::Corrupt`] and [`StoreError::TooLarge`] fail for the entry
+    /// ([`StoreFailure::of_entry`]), the same every time; every other error is the store
+    /// unavailable for now ([`StoreFailure::unavailable`]), bounded by the wait.
     fn from(error: StoreError) -> Self {
         match error {
-            StoreError::Corrupt => Self::of_entry(error),
+            StoreError::Corrupt | StoreError::TooLarge { .. } => Self::of_entry(error),
             error => Self::unavailable(error),
         }
     }
@@ -646,11 +646,22 @@ pub trait Protocol: Send + Sync {
     /// writes it ([`decode_local_state`]) and puts every key back, and needs no writes for a
     /// backup without a layer.
     ///
+    /// `restoring` gives the identity, the App ID and `blind` under the naming key of the
+    /// backup, the ones the restored app goes on with ([`RestoreContext`]), so the protocol
+    /// can check its layer against them here, such as that each claim key it keeps is the
+    /// one its inputs blind to, rather than after the restore commits. The default ignores
+    /// it.
+    ///
     /// # Errors
     ///
     /// Why the layer, or a backup without one, can't be installed, without content: the
     /// restore is refused and nothing is written.
-    fn restore_layer(&self, layer: Option<&ProtocolLayer>) -> Result<Vec<LocalWrite>, String> {
+    fn restore_layer(
+        &self,
+        layer: Option<&ProtocolLayer>,
+        restoring: &RestoreContext<'_>,
+    ) -> Result<Vec<LocalWrite>, String> {
+        let _ = restoring;
         let Some(layer) = layer else {
             return Ok(Vec::new());
         };

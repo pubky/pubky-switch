@@ -158,6 +158,34 @@ impl<'a> Obj<'a> {
         }
     }
 
+    /// A required array member: an absent or `null` one is malformed.
+    pub(crate) fn required_list(&self, name: &str) -> Result<&'a [Value], ClientError> {
+        self.req(name)?
+            .as_array()
+            .map(Vec::as_slice)
+            .ok_or_else(|| bad(self.what, name))
+    }
+
+    /// Each element of a required array member, read as an object.
+    pub(crate) fn required_objects(&self, name: &str) -> Result<Vec<Obj<'a>>, ClientError> {
+        self.required_list(name)?
+            .iter()
+            .map(|value| Obj::of(value, self.what))
+            .collect()
+    }
+
+    /// Each element of a required array member, read with `read`.
+    pub(crate) fn required_each<T>(
+        &self,
+        name: &str,
+        read: impl Fn(&'a Value) -> Option<T>,
+    ) -> Result<Vec<T>, ClientError> {
+        self.required_list(name)?
+            .iter()
+            .map(|value| read(value).ok_or_else(|| bad(self.what, name)))
+            .collect()
+    }
+
     /// Each element of an array member, read as an object.
     pub(crate) fn objects(&self, name: &str) -> Result<Vec<Obj<'a>>, ClientError> {
         self.list(name)?

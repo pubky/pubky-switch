@@ -3490,3 +3490,48 @@ async fn test_switch_cursor_set_behind_the_cursor_changes_nothing() {
     assert_eq!(post(cursor), 200);
     assert_eq!(w.switch.app(&me).cursor, cursor);
 }
+
+/// A kept batch stored without its stamp (`kept_ms: None`) was never sent: the stamp is
+/// committed before the request leaves, so a crash before that commit leaves the batch
+/// unsent, and its first send later goes under the same batch ID with nothing to settle.
+#[tokio::test]
+async fn test_kept_batch_unstamped_after_a_crash_was_never_sent() {
+    let w = World::new();
+    let app = w.join("wallet").await;
+    let me = app.app_id();
+    drop(app);
+    w.clock.advance_ms(20 * 60 * 1000);
+    // Reopened over a store that stops before its second commit from here: the first keeps
+    // the batch, the second is its stamp.
+    let fault = Arc::new(FaultStore::new(
+        Arc::clone(&w.store) as Arc<dyn StateStore>,
+        StoreFault::StopBefore(2),
+    ));
+    let mut app = App::load(
+        w.env_on(fault.clone() as Arc<dyn StateStore>),
+        w.protocol.clone(),
+        World::config(),
+        me,
+    )
+    .await
+    .unwrap();
+    assert!(
+        app.submit_batch(conversation(w.bob.public()))
+            .await
+            .is_err()
+    );
+    drop(app);
+    let mut app = w.load(me).await;
+    let kept = app.kept_batches().await.unwrap();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].1.kept_ms, None);
+    assert_eq!(
+        conversations_for(&w, w.bob.public()),
+        0,
+        "stored unstamped, yet sent"
+    );
+    // Its first send applies it once.
+    app.submit_batch(conversation([7; 32])).await.unwrap();
+    assert!(app.kept_batches().await.unwrap().is_empty());
+    assert_eq!(conversations_for(&w, w.bob.public()), 1);
+}
