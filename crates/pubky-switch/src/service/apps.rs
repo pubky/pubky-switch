@@ -122,11 +122,12 @@ pub(crate) fn statuses(
         let row = rows.get(&id).copied();
         let kept_id = kept.get(&id).copied();
         let held = state.apps.get(&id);
-        // An app with a record: `current` is served, its certificate unexpired too, as
-        // `GET /apps` has reported it since it was first served; one the document lists that
-        // hasn't registered yet, while it isn't kept.
+        // An app with a record is current in spec 3.4's sense, its certificate's expiry
+        // apart: wire 7.4.12's `current` row says nothing of the certificate, and
+        // `cert_expires_at` beside it says the rest. One the document lists that hasn't
+        // registered yet, while it isn't kept.
         let current = if held.is_some_and(|app| app.record.is_some()) {
-            state.is_served(&id)
+            state.is_current(&id)
         } else {
             kept_id.is_none() && doc.is_some_and(|doc| doc.listed_cert(&id).is_some())
         };
