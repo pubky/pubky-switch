@@ -298,8 +298,9 @@ impl Signer {
 
     /// Commit `state` with the flow that sends `batches` and then delivers `doc`, the
     /// version `flow` delivers, built on `newest`; `alerts` are added. Parts the switch no
-    /// longer keeps go: those of apps `newest` doesn't list, and those an app has passed,
-    /// which the switch may drop (Switch wire 3.5, 7.4.12).
+    /// longer keeps go: those of apps `newest` doesn't list, and those made for the listed
+    /// certificate that an app has passed, which the switch may drop (Switch wire 3.5,
+    /// 7.4.12).
     #[allow(clippy::too_many_arguments)]
     async fn commit_batches(
         &mut self,
@@ -321,8 +322,14 @@ impl Signer {
             state.alert(alert);
         }
         state.bundle_parts.retain(|held| {
-            newest.listed_cert(&held.app_id).is_some()
-                && statuses
+            let Some(listed) = newest.listed_cert(&held.app_id) else {
+                return false;
+            };
+            // A part made for another certificate stays until a part for the listed one
+            // replaces it: the app skipped it, so `keys_through`, which counts the parts the
+            // app's cursor passed, says nothing of the keys it holds (Switch wire 3.5).
+            held.cert != listed
+                || statuses
                     .iter()
                     .find(|s| s.app_id == held.app_id)
                     .and_then(|s| s.keys_through)

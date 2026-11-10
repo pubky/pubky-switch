@@ -335,6 +335,94 @@ async fn test_renewal_a_given_up_rotation_is_completed_before_the_next() {
 }
 
 #[tokio::test]
+async fn test_renewal_a_given_up_epoch_reaches_its_app_after_a_renewal_in_between() {
+    // A rotation is given up after its batches, leaving `a`'s parts made for a certificate
+    // never listed. A renewal that doesn't rotate comes in between, and the switch shows
+    // `keys_through(a) = 2`, counting parts `a` skipped. The part record stays, so the next
+    // rotation's completion still gives `a` a full bundle for its listed certificate
+    // (Switch wire 3.5).
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let (a, b) = two_apps(&["notes", "notes_sync"], &["notes", "notes_sync"]);
+    world.approve(&mut signer, &a).await;
+    world.approve(&mut signer, &b).await;
+    let (a_id, b_id) = (a.keys.app_id_bytes(), b.keys.app_id_bytes());
+    let listed = signer
+        .identity_doc()
+        .unwrap()
+        .unwrap()
+        .listed_cert(&a_id)
+        .unwrap();
+    world.switch.fail_next(SwitchFault::Error {
+        path: "/identity".into(),
+        code: ErrorCode::BadRequest,
+        current: serde_json::Value::Null,
+    });
+    signer
+        .renew(a_id, reduce(&["notes_sync"]))
+        .await
+        .unwrap_err();
+    signer
+        .renew(
+            b_id,
+            CertChange {
+                scopes: None,
+                expires_at: Some(START_MS + 400 * DAY_MS),
+            },
+        )
+        .await
+        .unwrap();
+    signer.renew(b_id, reduce(&["notes_sync"])).await.unwrap();
+    let parts = opened(&world, &a);
+    assert!(parts.iter().all(|p| p.cert == listed));
+    assert!((1..=3).all(|epoch| holds(&world, &parts, epoch, "notes")));
+}
+
+#[tokio::test]
+async fn test_renewal_brings_back_an_app_whose_certificate_expired() {
+    // The app's certificate expired, so the switch refuses its requests. The renewal's
+    // batch is taken all the same; the app is refused until the renewing version is
+    // delivered, then it works again (Switch wire 3.8 "An expired certificate").
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let app = App::new(&["notes"], None, [9; 32]);
+    world.approve(&mut signer, &app).await;
+    let id = app.keys.app_id_bytes();
+    world.clock.advance_ms(366 * DAY_MS);
+    // An app request: its record, carrying the certificate the switch checks it against.
+    let app_put = |cert: &pubky_switch_core::records::AppCert, at: u64| OpKind::AppPut {
+        record: AppRecord::sign(&app.keys, AppRecordBody::new(cert, Vec::new(), at))
+            .unwrap()
+            .signed()
+            .clone(),
+    };
+    let now = START_MS + 366 * DAY_MS;
+    let old = world.switch.app(&id).cert.unwrap();
+    let error = world
+        .switch
+        .app_op(&app.keys, app_put(&old, now))
+        .unwrap_err();
+    assert!(format!("{error:?}").contains("cert_expired"), "{error:?}");
+    // Step 1 alone: the certificate and the bundle are stored, the delivery doesn't arrive.
+    world.switch.fail_next(SwitchFault::Unreachable {
+        path: "/identity".into(),
+        after: 0,
+    });
+    signer.renew(id, CertChange::default()).await.unwrap_err();
+    let new = world.switch.app(&id).renewed.unwrap();
+    assert!(opened(&world, &app).iter().any(|p| p.cert == new.hash()));
+    let error = world
+        .switch
+        .app_op(&app.keys, app_put(&new, now))
+        .unwrap_err();
+    assert!(format!("{error:?}").contains("cert_expired"), "{error:?}");
+    // Delivered, the renewed certificate is the one checked: the app works again.
+    signer.resume().await.unwrap();
+    world.switch.app_op(&app.keys, app_put(&new, now)).unwrap();
+    assert!(holds(&world, &opened(&world, &app), 1, "notes"));
+}
+
+#[tokio::test]
 async fn test_renewal_a_refused_batch_keeps_the_parts_stored_before_it() {
     // A rotation in two batches: the first stores `a`'s full bundle for its new certificate,
     // and the second is refused. The signer records what the first stored, so the next

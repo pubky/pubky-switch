@@ -62,9 +62,10 @@ pub enum Alert {
     /// The switch gave no service time for a reduction's renewing delivery, even on a retry,
     /// so the earlier certificates of these apps aren't cut off yet: a reduction's cutoff is
     /// the service's time, never the signer's own (Switch wire 3.8). The signer closes them at
-    /// the service time of its next delivery, and the alert stays until then. Revoking an app
-    /// cuts it off at once; a switch that keeps doing this is faulty, and the user moves to
-    /// another provider.
+    /// the service time of the next version the user signs, and the alert stays until then.
+    /// Nothing is delivered on its own to get a time: to force the cut-off, the user makes a
+    /// change, or revokes the app, which cuts it off at once. A switch that keeps doing this
+    /// is faulty, and the user moves to another provider.
     ReductionNotClosed {
         /// The apps whose reduction stays open.
         apps: Vec<[u8; 16]>,
