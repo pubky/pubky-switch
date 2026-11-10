@@ -9,7 +9,8 @@
 //! compared with those files.
 
 use ed25519_dalek::SigningKey;
-use pubky_switch_core::chain::{SignedHead, Stub, TransitionProof};
+use pubky_switch_core::chain::{ChainTip, ProofBody, SignedHead, Stub, TransitionProof, item_hash};
+use pubky_switch_core::claims::Outcome;
 use pubky_switch_core::enc::{app_id_decode, b64 as b64e, hash};
 use pubky_switch_core::export::{
     Activation, Chunk, ChunkAnswer, DEFAULT_CHUNK_TARGET, ExportCaller, ExportRead, Import,
@@ -117,6 +118,7 @@ fn test_vectors_export() {
     check_parts_byte_for_byte(&f);
     let import = check_activation(&f);
     check_record_rejections(&f);
+    check_generated_claim_rejections(&f);
     check_claim_rejections(&f);
     check_activation_rules(&f);
     check_uploads(&f);
@@ -389,7 +391,7 @@ fn check_claim_rejections(f: &Fixture) {
     let v = load("export.json");
     let ci = f.index("claim");
     let cases = arr(&v, "claim_rejections");
-    assert_eq!(cases.len(), 4);
+    assert_eq!(cases.len(), 6);
     for case in cases {
         let name = st(case, "name");
         let rule = match name {
@@ -401,6 +403,8 @@ fn check_claim_rejections(f: &Fixture) {
             "a failed entry O signed itself, freeing the wallet's open attempt" => {
                 "an entry's operation isn't its writer's"
             }
+            ANOTHER_WRITER => "its certificate is another app's",
+            REBUILT => "the identity.json declares no provider loss",
             other => panic!("unknown claim rejection {other}"),
         };
         assert!(st(case, "rule").contains("10.5)"), "{name}");
@@ -429,6 +433,112 @@ fn check_claim_rejections(f: &Fixture) {
         }
         refused(f.run_parts(&parts), code, rule);
     }
+}
+
+const ANOTHER_WRITER: &str = "a failed entry the executor signed under its own certificate, naming the wallet as its writer, freeing the wallet's open attempt";
+const REBUILT: &str = "the claim marked rebuilt from uploads on an account without a provider loss, its open attempt failed and the claim freed";
+
+/// The `claim_rejections` cases `pubky-switch-core` generates (README "How the files were
+/// generated"), from the fixed keys and the file's own parts, each with its refusal's reason
+/// as `error`:
+///
+/// - the further `failed` entry of the case O signed itself, signed instead by the executor,
+///   which holds `claims.write`, its operation still naming the wallet, with the executor's
+///   certificate as the part's `cert` and the entry's proof signed again by O over it: the
+///   certificate isn't one of the app the operation names (`401`);
+/// - the live claim with its open attempt `failed` by the wallet and `current` cleared,
+///   marked `rebuilt`, its entry kept: alice's `identity.json` declares no provider loss.
+fn generated_claim_rejections(f: &Fixture) -> Vec<Value> {
+    let keys = keys();
+    let v = load("export.json");
+    let ci = f.index("claim");
+    let base = arr(&v, "claim_rejections")
+        .iter()
+        .find(|c| {
+            st(c, "name") == "a failed entry O signed itself, freeing the wallet's open attempt"
+        })
+        .unwrap();
+    let Part::ClaimEntry(mut entry) = Part::read(&base["claim_entry"]).unwrap() else {
+        panic!("a claim_entry part");
+    };
+    let executor = keys.app("executor");
+    let body = entry.op.body_bytes().unwrap();
+    let sig = pubky_switch_core::sig::sign(
+        &SigningKey::from_bytes(&executor.signing_secret),
+        labels::sig::OP,
+        &[&f.alice, &body],
+    );
+    entry.op = SignedDoc::from_parts(&body, &sig);
+    let proof = TransitionProof::peek(&entry.proof).unwrap();
+    let env = proof.envelope();
+    let item = item_hash(env.item_type, &entry.op.doc_bytes().unwrap());
+    let (stub, _) = ChainTip {
+        generation: env.generation,
+        seq: env.seq - 1,
+        chain_hash: env.prev_chain_hash,
+    }
+    .append(env.seq, env.server_time, env.item_type, item, env.batch)
+    .unwrap();
+    let resigned = ProofBody {
+        chain: stub,
+        ..proof.body().clone()
+    };
+    entry.proof = TransitionProof::sign(&f.o_secret, &f.alice, resigned)
+        .unwrap()
+        .signed()
+        .clone();
+    entry.cert = Some(document("executor certificate"));
+    let claim_entry: Value =
+        serde_json::from_slice(&Part::ClaimEntry(entry).to_json().unwrap()).unwrap();
+    let mut parts = f.parts.clone();
+    parts[ci] = Part::read(&json!({
+        "part": "claim", "claim_key": base["claim_key"], "claim": base["claim"]
+    }))
+    .unwrap();
+    parts.insert(ci + 2, Part::read(&claim_entry).unwrap());
+    let another_writer = f.run_parts(&parts).unwrap_err();
+    // The claim marked rebuilt.
+    let wallet = app_id_decode(&keys.app("wallet").app_id).unwrap();
+    let mut parts = f.parts.clone();
+    let Part::Claim(claim) = &mut parts[ci] else {
+        panic!("the claim part");
+    };
+    let state = &mut claim.claim;
+    state.attempts[0].outcome = Outcome::Failed;
+    state.attempts[0].resolved_by = Some(wallet);
+    state.current = None;
+    state.rebuilt = true;
+    let rebuilt: Value = serde_json::from_slice(&parts[ci].to_json().unwrap()).unwrap();
+    let refused_rebuilt = f.run_parts(&parts).unwrap_err();
+    vec![
+        json!({
+            "name": ANOTHER_WRITER,
+            "rule": "each claim entry's operation verifies with a certificate whose App ID is the operation's writer, so an app's valid claims.write certificate verifies only its own entries (wire 10.5)",
+            "claim_key": base["claim_key"],
+            "claim": base["claim"],
+            "claim_entry": claim_entry,
+            "status": another_writer.status(),
+            "error": quoted(&another_writer.reason),
+        }),
+        json!({
+            "name": REBUILT,
+            "rule": "a claim marked rebuilt is accepted only when the imported identity.json declares a provider loss in recovery_from (wire 10.5)",
+            "claim_key": rebuilt["claim_key"],
+            "claim": rebuilt["claim"],
+            "error": quoted(&refused_rebuilt.reason),
+        }),
+    ]
+}
+
+/// The generated `claim_rejections` cases are the file's, byte for byte (README "How the
+/// files were generated").
+fn check_generated_claim_rejections(f: &Fixture) {
+    let cases = generated_claim_rejections(f);
+    let places: Vec<(Place<'_>, Value)> = cases
+        .into_iter()
+        .map(|c| (Place::Case("/claim_rejections"), c))
+        .collect();
+    generated("export.json", &places);
 }
 
 /// More of the activation's checks on the vector's export, each refused for its rule.

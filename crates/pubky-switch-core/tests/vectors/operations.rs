@@ -20,7 +20,7 @@ use pubky_switch_core::records::AppCert;
 use pubky_switch_core::sealed::RecordValue;
 use pubky_switch_core::sig::{self, SignedDoc};
 use pubky_switch_core::time::{parse_rfc3339, rfc3339};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::common::*;
 
@@ -135,6 +135,93 @@ fn test_vectors_operations() {
     check_batch_entries(&keys, &v, &identity);
     check_integer_bounds(&keys, &v, &identity);
     check_attempt_deadlines(&v, &by_name);
+    check_invite_context(&keys, &v, &identity);
+}
+
+/// `invite_context`, which `pubky-switch-core` generates (README "How the files were
+/// generated"): the wallet's `invite_code.put` with its context padded with spaces inside
+/// its object, signed again by the wallet. The limit counts the context as written in the
+/// signed body (wire 6.2): 1,024 bytes are taken, and 1,025 are `413 too_large`, though the
+/// context compacted is 1,000 bytes. Each signature verifies; only the shape check decides.
+fn check_invite_context(keys: &Keys, v: &Value, identity: &[u8; 32]) {
+    let wallet = keys.app("wallet");
+    let app_id = app_id_decode(&wallet.app_id).unwrap();
+    let based_on = arr(v, "operations")
+        .iter()
+        .find(|o| st(o, "name") == "invite_code.put")
+        .unwrap();
+    let text = st(based_on, "body");
+    let context = r#""context":{"order":"order-1042"}"#;
+    assert!(text.contains(context));
+    let compact = format!(r#"{{"order":"{}"}}"#, "x".repeat(988));
+    assert_eq!(compact.len(), 1000);
+    let case = |name: &str, written: usize, expect: Value| {
+        let padded = format!(
+            r#"{{{}"order":"{}"}}"#,
+            " ".repeat(written - 1000),
+            "x".repeat(988)
+        );
+        let body = text.replace(context, &format!(r#""context":{padded}"#));
+        let sig = sig::sign(
+            &ed25519_dalek::SigningKey::from_bytes(&wallet.signing_secret),
+            labels::sig::OP,
+            &[identity, body.as_bytes()],
+        );
+        json!({
+            "name": name,
+            "based_on": "invite_code.put",
+            "writer": "wallet",
+            "body": body,
+            "signed": SignedDoc::from_parts(body.as_bytes(), &sig),
+            "context_bytes": written,
+            "compact_bytes": compact.len(),
+            "expect": expect,
+        })
+    };
+    let section = json!({
+        "description": "Wire 6.2: an invite code's context is at most 1024 bytes as the writer serialized it, the bytes of its value within the signed body from its first byte to its last, whitespace included, never a re-serialization; else 413 too_large. Each case is the invite_code.put of operations with its context written with spaces inside its object, signed again by the wallet, so its signature verifies and only the length decides. context_bytes is the context as written, compact_bytes compacted.",
+        "cases": [
+            case("1024 bytes as written: taken", 1024, json!({"valid": true})),
+            case(
+                "1025 bytes as written, 1000 compacted: refused",
+                1025,
+                json!({"status": 413, "code": "too_large"}),
+            ),
+        ],
+    });
+    generated(
+        "operations.json",
+        &[(Place::Member("/invite_context"), section)],
+    );
+    let file = load("operations.json");
+    let cases = arr(&file["invite_context"], "cases");
+    assert_eq!(cases.len(), 2);
+    for c in cases {
+        let name = st(c, "name");
+        let signed = signed_of(&c["signed"]);
+        assert_eq!(signed.body, b64e(st(c, "body").as_bytes()), "{name}");
+        let op = SignedOp::verify(&signed, &wallet.signing_public, identity, Some(&app_id))
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        let OpKind::InviteCodePut(put) = &op.body().kind else {
+            panic!("{name}: an invite_code.put");
+        };
+        assert_eq!(
+            put.context.written_len() as u64,
+            int(c, "context_bytes"),
+            "{name}"
+        );
+        assert_eq!(
+            serde_json::to_vec(put.context.value()).unwrap().len() as u64,
+            int(c, "compact_bytes"),
+            "{name}"
+        );
+        let outcome = check_shape(op.body());
+        if c["expect"]["valid"] == Value::Bool(true) {
+            outcome.unwrap_or_else(|e| panic!("{name}: {e}"));
+        } else {
+            expect_refusal(c, &outcome.unwrap_err(), name);
+        }
+    }
 }
 
 /// Each app's operation is one its certificate allows; the signer's only the signer writes

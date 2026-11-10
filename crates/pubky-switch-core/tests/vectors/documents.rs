@@ -161,6 +161,7 @@ fn test_vectors_documents() {
     check_app_record_conflict(&keys, &v, &docs);
     check_app_record_protocols(&keys, &v);
     check_approval(&keys, &v, &docs, &certs);
+    check_identity_rejections(&keys, &docs);
     // Bob's documents verify for bob only.
     assert!(AppCert::verify(doc("shop certificate"), &alice).is_err());
     IdentityDoc::verify(doc("bob identity.json"), &bob).unwrap();
@@ -1159,6 +1160,152 @@ fn check_approval(
     let mut future = ap.clone();
     future["future"] = json!({"x": 1});
     read(&serde_json::to_vec(&future).unwrap(), &wallet.bundle_secret).unwrap();
+
+    // `approval.rejections`, which `pubky-switch-core` generates (README "How the files were
+    // generated"): the approval with its one part made through data epoch 3 instead, at
+    // version 3's data epoch 2, sealed with the fixed randomness of the seeds
+    // `approval/past-data-epoch/cek`, `/nonce` and `/ikm-e`. Every key in it verifies and
+    // opens; at approval there is no next epoch, so the app refuses it at step 4.
+    let through_three = KeyBundleContents::derive(&key, cert, 1, 3, &has_keys).unwrap();
+    let past_part = BundlePart {
+        bundle: KeyBundle::seal_json_with(
+            &key,
+            &wallet_id,
+            &wallet.bundle_public,
+            &through_three.to_json().unwrap(),
+            &fixed_from_seeds("approval/past-data-epoch"),
+        )
+        .unwrap(),
+        first_epoch: 1,
+        last_epoch: 3,
+    };
+    let mut past = ap.clone();
+    past["bundles"] = serde_json::to_value(vec![past_part]).unwrap();
+    let refused = read(&serde_json::to_vec(&past).unwrap(), &wallet.bundle_secret).unwrap_err();
+    let reason = refused.to_string();
+    let reason = &reason[reason.find("Switch ").unwrap()..];
+    let cases = json!([{
+        "name": "a part through data epoch 3, at data epoch 2",
+        "rule": "an approval's key bundle parts cover every data epoch from 1 to its identity.json's data_epoch and none goes past it, since at approval there is no next epoch (wire 3.5, 3.10 step 4)",
+        "approval": past,
+        "step": 4,
+        "error": quoted(reason),
+    }]);
+    generated(
+        "documents.json",
+        &[(Place::Member("/approval/rejections"), cases)],
+    );
+    let file = load("documents.json");
+    for case in arr(&file["approval"], "rejections") {
+        let name = st(case, "name");
+        let approval = serde_json::to_vec(&case["approval"]).unwrap();
+        assert_eq!(
+            step(&case["approval"], &wallet.bundle_secret),
+            int(case, "step") as usize,
+            "{name}"
+        );
+        let error = read(&approval, &wallet.bundle_secret).unwrap_err();
+        assert!(
+            error.to_string().contains("past data_epoch"),
+            "{name}: {error}"
+        );
+        // Its parts verify, open and carry their keys: only the epoch refuses them.
+        let parts: Vec<BundlePart> =
+            serde_json::from_value(case["approval"]["bundles"].clone()).unwrap();
+        for part in &parts {
+            part.bundle.verify(&alice, &wallet_id).unwrap();
+            pubky_switch_core::envelope::open_framed(
+                part.bundle.envelope(),
+                &alice,
+                &wallet.bundle_secret,
+            )
+            .unwrap();
+        }
+    }
+}
+
+/// `identity_rejections`, which `pubky-switch-core` generates (README "How the files were
+/// generated"): alice's version 3 with one rule of wire 3.3 broken in its body text, signed
+/// again with her identity key. Each signature verifies; every reader refuses the document,
+/// the switch included.
+fn check_identity_rejections(keys: &Keys, docs: &HashMap<String, Doc>) {
+    let alice = keys.identity("alice");
+    let key = identity_key(keys, &alice);
+    let v3 = &docs["alice identity.json"].signed;
+    let text = String::from_utf8(v3.body_bytes().unwrap()).unwrap();
+    let connect = r#""connect_requests":{"enabled":false,"max_pending":50,"push":false}"#;
+    assert!(text.contains(connect));
+    let case = |name: &str, rule: &str, replacement: &str| {
+        let body = text.replace(connect, replacement);
+        let signed = key.sign_doc(labels::sig::IDENTITY, &[], body.clone().into_bytes());
+        let Error::Invalid(error) = IdentityDoc::verify(&signed, &alice).unwrap_err() else {
+            panic!("{name}: refused by the document's rules");
+        };
+        let error = error.trim_end_matches(" at line 0 column 0");
+        json!({
+            "name": name,
+            "rule": rule,
+            "body": body,
+            "signed": signed,
+            "error": error.strip_prefix("json: ").unwrap_or(error),
+        })
+    };
+    let section = json!({
+        "description": "Wire 3.3: identity.json documents every reader refuses, the switch included. Each is alice's identity.json version 3 with one member of its body text changed, signed again by her identity key, so its signature verifies and only the document's rules refuse it. error is the core's wording.",
+        "cases": [
+            case(
+                "connect_requests without its members",
+                "every member of connect_requests is required, and none is null (wire 3.3)",
+                r#""connect_requests":{}"#,
+            ),
+            case(
+                "connect_requests with push null",
+                "every member of connect_requests is required, and none is null (wire 3.3)",
+                r#""connect_requests":{"enabled":false,"max_pending":50,"push":null}"#,
+            ),
+        ],
+    });
+    generated(
+        "documents.json",
+        &[(Place::Member("/identity_rejections"), section)],
+    );
+    let file = load("documents.json");
+    let cases = arr(&file["identity_rejections"], "cases");
+    assert!(!cases.is_empty());
+    for c in cases {
+        let name = st(c, "name");
+        let signed: SignedDoc = serde_json::from_value(c["signed"].clone()).unwrap();
+        assert_eq!(
+            signed.body_bytes().unwrap(),
+            st(c, "body").as_bytes(),
+            "{name}"
+        );
+        assert!(
+            reproduce(
+                keys,
+                &alice,
+                labels::sig::IDENTITY,
+                &[st(c, "body").as_bytes()],
+                &signed.sig_bytes().unwrap()
+            ),
+            "{name}"
+        );
+        signed.verify(&alice, labels::sig::IDENTITY, &[]).unwrap();
+        assert!(
+            matches!(IdentityDoc::verify(&signed, &alice), Err(Error::Invalid(_))),
+            "{name}"
+        );
+        // The same body with the members it lacks reads.
+        let mut value: Value = serde_json::from_str(st(c, "body")).unwrap();
+        value["policy"]["connect_requests"] =
+            json!({"enabled": false, "max_pending": 50, "push": false});
+        let fixed = key.sign_doc(
+            labels::sig::IDENTITY,
+            &[],
+            serde_json::to_vec(&value).unwrap(),
+        );
+        IdentityDoc::verify(&fixed, &alice).unwrap_or_else(|e| panic!("{name}: {e}"));
+    }
 }
 
 /// `app_record_protocols` (Switch wire 3.2, "Protocols' members"): the wallet's record with a

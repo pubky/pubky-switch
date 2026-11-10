@@ -144,6 +144,85 @@
       "name": "a failed entry O signed itself, freeing the wallet's open attempt",
       "rule": "each claim entry's operation verifies with its writer's certificate, the part's cert or the one in the writer's app part (wire 10.5)",
       "status": 401
+    },
+    {
+      "claim": {
+        "attempts": [
+          {
+            "attempt_id": "DgCVYQKL1eyDacZvG6YhZg",
+            "deadline_ms": 1767312000001,
+            "duplicate": false,
+            "from_upload": false,
+            "opened_at_ms": 1767225603000,
+            "orphan_after_s": 86400,
+            "outcome": "failed",
+            "owner": "wejf37ngr7qizej3eoijn3hq4c",
+            "possibly_duplicate": false,
+            "resolved_by": "wejf37ngr7qizej3eoijn3hq4c"
+          }
+        ],
+        "creator": "wejf37ngr7qizej3eoijn3hq4c",
+        "current": null,
+        "divergent": false,
+        "last_entry_ms": 1775865601000,
+        "pinned_deadline": 1767312000001,
+        "rebuilt": false,
+        "settled": false,
+        "step": 2
+      },
+      "claim_entry": {
+        "cert": {
+          "body": "eyJ2IjoxLCJraW5kIjoicHVia3ktc3dpdGNoLmFwcF9jZXJ0IiwiaWRlbnRpdHkiOiI2ZnJhbzh3OXNzNWNuNTQ0cWQ2NGh5bmlrcmJyOTdhZTFzNTk0MWM3bWE1ZTFlcGlmaGd5IiwiYXBwX2lkIjoiY3c1YWh0ZGtpeGNhZm5hOXpoMXk1eTVvMXciLCJzaWduaW5nX2tleSI6IlhuQUp4Mlc1d2N1M3RFV3VDTUN2SW1jM2JSRlN4V1AxLThsblJDc3J6Y1kiLCJidW5kbGVfa2V5IjoiY3dYQzVYdHRWdFpjTDJjZ1diVXVOeFRNY3U0bnJGc0p5ekYxeHMwX2J3byIsInNjb3BlcyI6WyJwYXkiLCJhbGxvd2FuY2UiLCJhbGxvd2FuY2VfZXhlY3V0ZSJdLCJwZXJtaXNzaW9ucyI6WyJjbGFpbXMucmVhZCIsImNsYWltcy53cml0ZSIsImNvbnZlcnNhdGlvbi5hZGQiXSwiaXNzdWVkX2F0IjoiMjAyNS0xMi0wMVQwMDowMDowMC4wMDBaIiwiZXhwaXJlc19hdCI6IjIwMjYtMTItMDFUMDA6MDA6MDAuMDAwWiJ9",
+          "sig": "NME2u7XfjKa1BildhigSTz3Yoq1YHgteEWWPSbVxva9DLho8TrNB9hy6b-2fQyArPR1IXlCzL9-jE1xHqcYDBQ"
+        },
+        "claim_key": "sTqkmOg6G5PIHULuqwOHIuIiZBdkPJL2uxE_kuo8K5Y",
+        "op": {
+          "body": "eyJpZGVudGl0eSI6IjZmcmFvOHc5c3M1Y241NDRxZDY0aHluaWtyYnI5N2FlMXM1OTQxYzdtYTVlMWVwaWZoZ3kiLCJhcHBfaWQiOiJ3ZWpmMzduZ3I3cWl6ZWozZW9pam4zaHE0YyIsImdlbmVyYXRpb24iOjEsImJhdGNoIjp7ImlkIjoiSlZzVk5aZ25Mb1EwV2pCVUxkZVVEQSIsImNvdW50IjoxfSwib3AiOiJjbGFpbSIsImNsYWltX2tleSI6InNUcWttT2c2RzVQSUhVTHVxd09ISXVJaVpCZGtQSkwydXhFX2t1bzhLNVkiLCJ0eXBlIjoiZmFpbGVkIiwiZXhwZWN0ZWRfc3RlcCI6MSwiYXR0ZW1wdF9pZCI6IkRnQ1ZZUUtMMWV5RGFjWnZHNlloWmcifQ",
+          "sig": "ekDc7GagOQjHPwpd-virmXm0hZN5MuINle7lclYsOx3eQ1rYeL0vuMKnNUstDKyC9OpmunVXL6l9ew4Wm2KYCA"
+        },
+        "part": "claim_entry",
+        "proof": {
+          "body": "eyJjaGFpbiI6eyJlbnZlbG9wZSI6ImV5SmphR0ZwYmw5MlpYSnphVzl1SWpveExDSm5aVzVsY21GMGFXOXVJam94TENKelpYRWlPakV4TENKd2NtVjJYMk5vWVdsdVgyaGhjMmdpT2lKcWMwOW9TMFJWWVVwdVJ6WXdVMDVPYTJ4Rk1uVk1aV1paVEVZMU9GOTVWamxNVjBGeWNDMDVibEJSSWl3aWMyVnlkbVZ5WDNScGJXVWlPaUl5TURJMkxUQTBMVEV4VkRBd09qQXdPakF4TGpBd01Gb2lMQ0pwZEdWdFgzUjVjR1VpT2lKdmNDSXNJbWwwWlcxZmFHRnphQ0k2SW5kWmNsSkVkVGg1YkdOZlUwVlRWa2xWWDA5RVlqRjNNSFY1WlVwblkyNTNhRXBRU3psdGNHMWhYMEVpTENKaVlYUmphRjlwWkNJNklrcFdjMVpPV21kdVRHOVJNRmRxUWxWTVpHVlZSRUVpTENKaVlYUmphRjlqYjNWdWRDSTZNWDAiLCJjaGFpbl9oYXNoIjoic1Q5YzhiNmZKVklRVkYyVnRkRHFkYVRFUkE3OElmMjA3RDBvQ0xrU2JtWSJ9LCJvYmplY3QiOiJzVHFrbU9nNkc1UElIVUx1cXdPSEl1SWlaQmRrUEpMMnV4RV9rdW84SzVZIiwic3RlcCI6Miwic3RhdGUiOnsiYXR0ZW1wdHMiOlt7ImF0dGVtcHRfaWQiOiJEZ0NWWVFLTDFleURhY1p2RzZZaFpnIiwiZHVwbGljYXRlIjpmYWxzZSwib3BlbmVkX2F0IjoiMjAyNi0wMS0wMVQwMDowMDowMy4wMDBaIiwib3JwaGFuX2FmdGVyIjo4NjQwMCwib3JwaGFuZWQiOmZhbHNlLCJvdXRjb21lIjoiZmFpbGVkIiwib3duZXIiOiJ3ZWpmMzduZ3I3cWl6ZWozZW9pam4zaHE0YyIsInBvc3NpYmx5X2R1cGxpY2F0ZSI6ZmFsc2UsInJlc29sdmVkX2J5Ijoid2VqZjM3bmdyN3FpemVqM2VvaWpuM2hxNGMifV0sImNsYWltX2tleSI6InNUcWttT2c2RzVQSUhVTHVxd09ISXVJaVpCZGtQSkwydXhFX2t1bzhLNVkiLCJkZWFkbGluZSI6IjIwMjYtMDEtMDJUMDA6MDA6MDAuMDAxWiIsImRpdmVyZ2VudCI6ZmFsc2UsIm5leHRfcG9zc2libHlfZHVwbGljYXRlIjpmYWxzZSwic3RhdGUiOiJGUkVFIiwic3RlcCI6MiwidG9tYnN0b25lIjpmYWxzZX19",
+          "sig": "88hYlHYkEHFjayy4sfKijlzd1LjOwVXTzMqG_41yQ7T18okuvS7hUvmal4yAHrODSGqSrLoDzGCHz8Wlq3f2AA"
+        },
+        "seq": 11,
+        "step": 1
+      },
+      "claim_key": "sTqkmOg6G5PIHULuqwOHIuIiZBdkPJL2uxE_kuo8K5Y",
+      "error": "a live claim: an entry's operation isn't its writer's: its certificate is another app's",
+      "name": "a failed entry the executor signed under its own certificate, naming the wallet as its writer, freeing the wallet's open attempt",
+      "rule": "each claim entry's operation verifies with a certificate whose App ID is the operation's writer, so an app's valid claims.write certificate verifies only its own entries (wire 10.5)",
+      "status": 401
+    },
+    {
+      "claim": {
+        "attempts": [
+          {
+            "attempt_id": "DgCVYQKL1eyDacZvG6YhZg",
+            "deadline_ms": 1767312000001,
+            "duplicate": false,
+            "from_upload": false,
+            "opened_at_ms": 1767225603000,
+            "orphan_after_s": 86400,
+            "outcome": "failed",
+            "owner": "wejf37ngr7qizej3eoijn3hq4c",
+            "possibly_duplicate": false,
+            "resolved_by": "wejf37ngr7qizej3eoijn3hq4c"
+          }
+        ],
+        "creator": "wejf37ngr7qizej3eoijn3hq4c",
+        "current": null,
+        "divergent": false,
+        "last_entry_ms": 1767225603000,
+        "pinned_deadline": 1767312000001,
+        "rebuilt": true,
+        "settled": false,
+        "step": 1
+      },
+      "claim_key": "sTqkmOg6G5PIHULuqwOHIuIiZBdkPJL2uxE_kuo8K5Y",
+      "error": "a live claim: rebuilt from uploads, but the identity.json declares no provider loss",
+      "name": "the claim marked rebuilt from uploads on an account without a provider loss, its open attempt failed and the claim freed",
+      "rule": "a claim marked rebuilt is accepted only when the imported identity.json declares a provider loss in recovery_from (wire 10.5)"
     }
   ],
   "description": "A complete export (wire 10.2, 10.3) of alice's account, signed with the fixed service key of keys.json (service/alice) over lp(\"pubky-switch/v1/export-manifest\", identity, body). It is the account frozen right after chain.json's last item (operations.json continues the account past that item instead). It activates under wire 10.5 at a next service enrolled with alice's current identity.json (version 3) whose trusted time is the freeze's. One chunk holds, in the order of wire 10.3: the meta part; the chain, the items of chain.json (seqs 1 to 9) and then the freeze transition (seq 10, wire 6.5) for documents.json's freeze, with the record.put of seq 6 as a stub only, since seq 8 supersedes it (wire 7.5); an app part for each app the identity.json lists: the wallet with its record and receive key of seqs 3 and 4 and its cursor at 9, the phone revoked at seq 9, and the executor, the phone and the executor having registered nowhere in this chain; the live claim of seq 7, its creator the wallet, then its one entry as a claim_entry part with that entry's transition proof, which the claim is replayed from, and cert null, since the wallet's app part carries the certificate the entry was checked against; the shared record at (1, 8), its op and cert null since the chain part at seq 8 and the wallet's app part carry them, and its proof the transition proof of that write (chain.json, seq 8), which O keeps with the record; and a batch part for each of the three batches the stubs name, with its operation hash and time and no proofs. The inbox entry at seq 5 (bob's request) isn't exported: the wallet, its one target, moved its cursor past it, so O deleted it. The head is the freeze transition, and last_time is its time, after the freeze's issued_at (wire 10.5). The meta part's app_added_at maps each app reachable at the freeze (current, with a receive key) to the apps_version at which it became reachable: the wallet alone, at 1, since the phone is revoked and neither it nor the executor holds a receive key; apps_version is 4, as http.json's append names it. The manifest names the freeze by its hash; its chunk entry gives the chunk's length and BLAKE3 hash. record_rejections are the chunk's record part as a faulty O could send it instead, each refused at the activation (409): without its proof, with a signature that doesn't verify with O's key (another proof's), and with the proof of another write; the chunk with such a part also has another hash, which a check of the part alone needn't recompute. claim_rejections are the chunk's claim part as a faulty O could send it, each refused at the activation for its rule (409 unless status says otherwise): with the phone as its creator; with a last_entry_ms 1 ms before its entry's time; with the open attempt shown failed and the entry's proof (entry_proof) signed again by O to show that state, which the replay of the entry refuses; and with the attempt failed by a further claim_entry part (claim_entry, inserted after the claim's own entry) whose operation O signed with its service key in place of the wallet's signing key, refused at that entry's first check (401).",
