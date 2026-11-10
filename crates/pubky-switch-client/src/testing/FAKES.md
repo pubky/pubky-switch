@@ -63,8 +63,25 @@ service.
 - **`open_admission`** (`admit_everyone`) admits every sender the deny list doesn't hold, a
   test switch only.
 - **App currency outside batches**: other routes check only that the app hasn't departed.
-- **`PUT /identity`** (Switch wire 7.4.2): `deliver_identity` takes any document, without
-  the version and `prev` checks.
+- **`POST /v1/enroll`** (Switch wire 3.7, 7.4.1), in `switch/signer.rs`: only at
+  [`SWITCH_ORIGIN`], with the default limits, and without checking the request signature. A
+  switch made with `unenrolled` answers every other call with the operator's `404` until
+  then. As at the service, the enrollment that makes the account sets its kept App IDs, and
+  every later one gets the same key and changes nothing. Unlike the service:
+  - an enrollment's `identity_doc` isn't held, so the account starts with no document and
+    at the switch's own generation, whatever the enrollment names;
+  - a serving account is answered `400`, never a pending key for the next generation, so
+    there is no key change in place and no provider loss at the same service.
+- **`PUT /identity`** (Switch wire 3.3, 7.4.2), in `switch/signer.rs`: judged by the core's
+  `check_delivery`, like the service, with no kept proofs (`kept_proofs` empty, as at the
+  service until it serves operations). Unlike the service: there is no pending key, so no
+  generation change at a serving account; a first document carrying `recovery_from`, or at
+  another generation than the switch's, is chained where the service answers `503`; and the
+  answer carries the head in its body only, not in `Switch-Head`. The test call `deliver_identity` takes any document, without those
+  checks, for scripting what another signer or a faulty service did.
+- **`GET /apps`** (Switch wire 7.4.12): the apps the switch holds or the newest document
+  lists, with `current`, `record_cert` and `bundle_ranges`; no last-seen times, attempts,
+  unread counts, `keys_through`, departures or `proof_generations`.
 - **Moves and recovery** (Switch spec 12.5, 12.6, Switch wire 10): `import_into` copies the
   account in memory, with no manifest, chunks or export transfer; a recovery upload is kept
   and answered with fixed changes, merging nothing.

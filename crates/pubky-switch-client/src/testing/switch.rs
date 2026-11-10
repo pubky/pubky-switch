@@ -35,6 +35,7 @@ use crate::transport::{Header, MockTransport, Request, Response};
 mod batch;
 mod inbox;
 mod shared;
+mod signer;
 
 pub use shared::HeldRecord;
 
@@ -218,6 +219,15 @@ pub(crate) struct Inner {
     pub(crate) open_admission: bool,
     /// The `directory_version`: it moves whenever the directory changes.
     pub(crate) directory_version: u64,
+    /// The account's enrollment: its limits, and the answer to each enrollment taken, by
+    /// enrollment hash. `None` for an account that doesn't exist until it is enrolled.
+    pub(crate) enrolled: Option<signer::Enrolled>,
+    /// The App IDs the enrollment that made the account named, kept for good (Switch wire
+    /// 3.7).
+    pub(crate) kept_app_ids: Vec<[u8; 16]>,
+    /// The transition proof of the newest `identity.json` delivery, which a retry gets again
+    /// (Switch wire 7.4.2).
+    pub(crate) delivery_proof: Option<SignedDoc>,
 }
 
 impl Inner {
@@ -264,6 +274,9 @@ impl Inner {
             reachable_since: BTreeMap::new(),
             open_admission: false,
             directory_version: 1,
+            enrolled: Some(signer::Enrolled::default()),
+            kept_app_ids: Vec::new(),
+            delivery_proof: None,
         }
     }
 }
@@ -544,8 +557,17 @@ impl ScriptedSwitch {
                 None => {}
             }
         }
+        if request.method == "POST" && path == "/v1/enroll" {
+            let (status, body) = inner
+                .enroll(request)
+                .map_err(|error| TransportError::Other(format!("scripted switch: {error}")))?;
+            if lose {
+                return Err(TransportError::Timeout);
+            }
+            return Ok(inner.respond(request, status, &body));
+        }
         if let Some((status, body)) = inner.gate(&request.method, &path) {
-            if inner.erased {
+            if inner.erased || inner.enrolled.is_none() {
                 // Switch wire 7.4.16: signed with the operator key.
                 let operator = SigningKey::from_bytes(&[42; 32]);
                 return Ok(inner.respond_with(&operator, request, status, &body));
@@ -586,34 +608,7 @@ impl ScriptedSwitch {
     ///
     /// When the document's bytes don't read or its proof doesn't sign.
     pub fn deliver_identity(&self, doc: &IdentityDoc) -> Result<(), ScriptError> {
-        let mut inner = self.lock();
-        // A document naming this service at the next generation makes it serve, and its
-        // chain go on under that generation (Switch wire 6.5 "Import").
-        if doc.generation() > inner.tip.generation {
-            inner.tip.generation = doc.generation();
-        }
-        if doc.inbox().service_key == inner.service.verifying_key().to_bytes() {
-            inner.staged = false;
-        }
-        let bytes = doc.signed().doc_bytes()?;
-        let hash = item_hash(ItemType::Identity, &bytes);
-        let state = ProofState::Identity {
-            version: doc.version(),
-            generation: doc.generation(),
-            data_epoch: doc.data_epoch(),
-        };
-        inner.chain_item(
-            ItemType::Identity,
-            doc.signed().clone(),
-            hash,
-            None,
-            "identity",
-            &state,
-            None,
-        )?;
-        inner.doc = Some(doc.clone());
-        inner.directory_version += 1;
-        Ok(())
+        self.lock().chain_identity(doc).map(|_| ())
     }
 
     /// An entry from `from`'s app `keys` (certificate `cert`): a message of `kind` with
@@ -975,11 +970,13 @@ impl Inner {
     /// erased account's `404`, a staged account's `503 staged` (but for uploads), and a
     /// frozen account's `410 moved` for writes.
     fn gate(&self, method: &str, path: &str) -> Option<Answer> {
-        if self.erased {
+        if self.erased || self.enrolled.is_none() {
             return Some(bad(ErrorCode::NotFound, "no such account", json!(null)));
         }
         let upload = method == "POST" && path.contains("recovery/upload");
-        if self.staged && !upload {
+        // A staged account takes the delivery that makes it serve (Switch wire 7.3 step 7).
+        let delivery = method == "PUT" && path.ends_with("/identity");
+        if self.staged && !upload && !delivery {
             return Some(bad(ErrorCode::Staged, "staged", json!(null)));
         }
         if let Some(freeze) = &self.frozen
@@ -999,6 +996,8 @@ impl Inner {
         let (route, query) = rest.split_once('?').unwrap_or((rest, ""));
         let Some(app) = caller else {
             return Ok(match (request.method.as_str(), route) {
+                ("PUT", "identity") => self.put_identity(&request.body)?,
+                ("GET", "apps") => self.apps_answer(),
                 ("GET", "directory") => self.directory(),
                 ("GET", "identity") => self.identity_answer(),
                 ("POST", "recovery/upload") => self.upload(request, None)?,
