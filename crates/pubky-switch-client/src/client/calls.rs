@@ -720,12 +720,16 @@ impl SwitchClient {
     }
 
     /// `GET /v1/{id}/identity`, the unauthenticated public read (Switch wire 7.4.15): sent
-    /// without any `Switch-*` header, its answer checked with the pinned key like every
-    /// answer, and the document and the freeze verified with the account's identity key.
+    /// without any `Switch-*` header, and the document and the freeze verified with the
+    /// account's identity key. The answer is checked with the pinned key, or, without one,
+    /// with the key the verified document names for this origin, which is then pinned
+    /// (Switch wire 7.1 "An unpinned public read").
     ///
     /// # Errors
     ///
-    /// As every call; [`ClientError::Core`] for a document that doesn't verify.
+    /// As every call; [`ClientError::Core`] for a document that doesn't verify. Without a
+    /// pinned key, [`ClientError::BadServiceSignature`] for any answer that can't be checked
+    /// so, an error answer included: a failed lookup.
     pub async fn public_identity(&self) -> Result<PublicIdentity, ClientError> {
         let checked = self
             .call(

@@ -10,7 +10,7 @@ use pubky_switch_core::keys::{AppKeys, IdentityKey};
 use pubky_switch_core::ops::{AllowKind, Condition, OpKind, OpsRequest, Position, SignedOp};
 use pubky_switch_core::records::{
     AppCert, AppCertBody, DEFAULT_CERT_LIFETIME_MS, Enrollment, EnrollmentAnswer, EnrollmentBody,
-    IdentityPolicy, Limits,
+    IdentityBody, IdentityDoc, IdentityPolicy, Inbox, Limits,
 };
 use pubky_switch_core::scopes::Permission;
 use pubky_switch_core::sig::SignedDoc;
@@ -195,10 +195,6 @@ async fn test_unpinned_client_sends_nothing() {
     let transport = fixed(service_key(), 200, json!({}));
     let client = client_with(app(), None, Arc::clone(&transport));
     assert_eq!(client.allow().await.unwrap_err(), ClientError::Unpinned);
-    assert_eq!(
-        client.public_identity().await.unwrap_err(),
-        ClientError::Unpinned
-    );
     let batch = client.sign_batch(1, two_lists(), None).unwrap();
     assert_eq!(
         client.submit(&batch).await.unwrap_err(),
@@ -694,6 +690,57 @@ fn test_credentials_debug_shows_no_key() {
     for secret in [[1u8; 32], [2; 32], [3; 32]] {
         assert!(!text.contains(&b64(&secret)), "{text}");
         assert!(!text.contains(&format!("{secret:?}")), "{text}");
+    }
+}
+
+/// A public-read answer holding the account's `identity.json`, naming `origin` and
+/// `named` as its inbox, signed by `signing` as the switch signs it.
+fn public_read_switch(origin: &str, named: [u8; 32], signing: SigningKey) -> Arc<MockTransport> {
+    let body = IdentityBody::first(
+        identity().public(),
+        [0; 16],
+        Inbox::new(origin, named),
+        IdentityPolicy::default(),
+    );
+    let doc = IdentityDoc::sign(&identity(), body).unwrap();
+    fixed(signing, 200, json!({ "identity": doc.signed() }))
+}
+
+#[tokio::test]
+async fn test_public_read_unpinned_pins_the_named_key() {
+    let transport = public_read_switch(ORIGIN, service_public(), service_key());
+    let client = client_with(app(), None, Arc::clone(&transport));
+    let public = client.public_identity().await.unwrap();
+    assert_eq!(public.identity.inbox().service_key, service_public());
+    assert_eq!(client.pinned_key(), Some(service_public()));
+    let sent = transport.last_request().unwrap();
+    assert!(sent.headers.iter().all(|h| !h.name.starts_with("switch-")));
+}
+
+#[tokio::test]
+async fn test_public_read_unpinned_refuses_what_it_cant_check() {
+    let other = SigningKey::from_bytes(&[6; 32]);
+    let cases = [
+        // Signed with another key than the document names.
+        public_read_switch(ORIGIN, service_public(), other.clone()),
+        // A document naming another origin.
+        public_read_switch("https://other.example", service_public(), service_key()),
+        // An error answer: nothing names a key.
+        fixed(
+            service_key(),
+            404,
+            json!({ "code": "not_found", "message": "m" }),
+        ),
+    ];
+    for transport in cases {
+        let client = client_with(app(), None, Arc::clone(&transport));
+        let error = client.public_identity().await.unwrap_err();
+        assert!(
+            matches!(error, ClientError::BadServiceSignature { .. }),
+            "{error:?}"
+        );
+        assert_eq!(client.pinned_key(), None);
+        assert_eq!(client.last_server_time(), None);
     }
 }
 
