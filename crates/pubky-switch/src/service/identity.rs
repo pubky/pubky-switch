@@ -218,6 +218,11 @@ impl Service {
         txn.note_listings(&listed, doc.data_epoch())
             .await
             .map_err(|e| store_error(&e))?;
+        // The departures whose rotation this version makes.
+        let removed: Vec<[u8; 16]> = doc.body().removed.iter().map(|app| app.app_id).collect();
+        txn.note_rotations(&removed, doc.data_epoch())
+            .await
+            .map_err(|e| store_error(&e))?;
         let head = self
             .head(txn, signer)
             .await

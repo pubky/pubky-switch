@@ -27,20 +27,12 @@ fn time(at: Option<u64>) -> Value {
     at.map_or(Value::Null, |at| json!(rfc3339(at)))
 }
 
-/// Whether a departed app still awaits its rotation (Switch wire 7.4.12): until a
-/// delivered `identity.json` no longer lists it as an app, in `removed` or purged, at a
-/// higher data epoch than the newest document's at its departure. Only a departure awaits
-/// one: the signer revokes, and rotates for its own revocations. One kept without that
-/// epoch awaits only while the newest document still lists it.
-pub(crate) fn awaiting_rotation(kept: &KeptAppId, doc: Option<&IdentityDoc>) -> bool {
-    if kept.reason != KeptReason::Departed {
-        return false;
-    }
-    let listed = doc.is_some_and(|doc| doc.listed_cert(&kept.app_id).is_some());
-    match kept.data_epoch {
-        Some(epoch) => listed || !doc.is_some_and(|doc| doc.data_epoch() > epoch),
-        None => listed,
-    }
+/// Whether a departed app still awaits its rotation (Switch wire 7.4.12): until a delivered
+/// `identity.json` lists it in `removed` at a higher data epoch than the newest document's
+/// at its departure, which is done for good. Only a departure awaits one: the signer
+/// revokes, and rotates for its own revocations.
+pub(crate) fn awaiting_rotation(kept: &KeptAppId) -> bool {
+    kept.reason == KeptReason::Departed && !kept.rotated
 }
 
 /// The statuses of `GET /apps`, at service time `now`, by App ID (Switch wire 7.4.12):
@@ -121,7 +113,7 @@ pub(crate) fn statuses(
             "last_seen": time(view.last_seen.get(&id).copied()),
             "revoked_at": time(revoked_at),
             "departed_at": time(departed_at),
-            "awaiting_rotation": kept_id.is_some_and(|kept| awaiting_rotation(kept, doc)),
+            "awaiting_rotation": kept_id.is_some_and(awaiting_rotation),
             "open_attempts": open_attempts,
             // The inbox comes with POST /inbox: nothing is unread, no app is lagging.
             "unread_entries": 0,
@@ -178,7 +170,10 @@ impl Service {
             .ok_or_else(|| ApiError::unavailable("7.6: a temporary failure"))?;
         let body = serde_json::to_vec(&body)
             .map_err(|_| ApiError::unavailable("7.6: a temporary failure"))?;
-        Ok(Answer::ok(body).with_head(Some(head)))
+        let mut answer = Answer::ok(body).with_head(Some(head));
+        // Never cached (Switch wire 7.4.12).
+        answer.no_store = true;
+        Ok(answer)
     }
 }
 
@@ -186,70 +181,26 @@ impl Service {
 mod tests {
     use super::*;
 
-    fn kept(app_id: [u8; 16], reason: KeptReason, data_epoch: Option<u64>) -> KeptAppId {
+    fn kept(reason: KeptReason, rotated: bool) -> KeptAppId {
         KeptAppId {
-            app_id,
+            app_id: [1; 16],
             reason,
             at_ms: 0,
-            data_epoch,
+            data_epoch: Some(2),
+            rotated,
         }
-    }
-
-    /// alice's version 3 (data epoch 2), which lists the wallet.
-    fn version_3() -> IdentityDoc {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../spec/vectors/documents.json");
-        let documents: Value =
-            serde_json::from_slice(&std::fs::read(path).expect("vectors")).expect("json");
-        let doc = documents["documents"]
-            .as_array()
-            .expect("documents")
-            .iter()
-            .find(|doc| doc["name"] == "alice identity.json")
-            .expect("version 3");
-        let signed = serde_json::from_value(doc["signed"].clone()).expect("signed");
-        IdentityDoc::verify_named(&signed).expect("verify")
     }
 
     #[test]
     fn test_apps_awaiting_rotation_of_a_departure() {
-        let doc = version_3();
-        let wallet = doc.body().apps[0].app_id;
-        let gone = [1; 16];
-        // No document above the departure's epoch yet: awaiting.
-        assert!(awaiting_rotation(
-            &kept(gone, KeptReason::Departed, Some(2)),
-            None
-        ));
-        assert!(awaiting_rotation(
-            &kept(gone, KeptReason::Departed, Some(2)),
-            Some(&doc)
-        ));
-        // Version 3 is above epoch 1 and doesn't list it: done.
-        assert!(!awaiting_rotation(
-            &kept(gone, KeptReason::Departed, Some(1)),
-            Some(&doc)
-        ));
-        // Still listed as an app: awaiting, whatever the epoch.
-        assert!(awaiting_rotation(
-            &kept(wallet, KeptReason::Departed, Some(1)),
-            Some(&doc)
-        ));
-        // Kept without its epoch: awaiting only while listed.
-        assert!(awaiting_rotation(
-            &kept(wallet, KeptReason::Departed, None),
-            Some(&doc)
-        ));
-        assert!(!awaiting_rotation(
-            &kept(gone, KeptReason::Departed, None),
-            Some(&doc)
-        ));
+        assert!(awaiting_rotation(&kept(KeptReason::Departed, false)));
+        assert!(!awaiting_rotation(&kept(KeptReason::Departed, true)));
     }
 
     #[test]
     fn test_apps_revocations_await_no_rotation() {
         for reason in [KeptReason::Revoked, KeptReason::Enrolled] {
-            assert!(!awaiting_rotation(&kept([1; 16], reason, Some(2)), None));
+            assert!(!awaiting_rotation(&kept(reason, false)));
         }
     }
 }
