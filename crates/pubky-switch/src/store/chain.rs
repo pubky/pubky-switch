@@ -18,6 +18,8 @@ pub struct NewChainItem<'a> {
     pub stub: &'a Stub,
     /// The service time it was chained at.
     pub server_time_ms: u64,
+    /// The app it is shown in full to, for a key bundle part (Switch wire 7.5).
+    pub only_for: Option<[u8; 16]>,
 }
 
 impl AccountTxn {
@@ -28,7 +30,8 @@ impl AccountTxn {
         let head = self.head().clone();
         sqlx::query(
             "INSERT INTO chain_items (account_id, generation, seq, item_type, item_bytes, \
-             envelope, chain_hash, server_time_ms) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+             envelope, chain_hash, server_time_ms, only_for) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
         )
         .bind(&head.id)
         .bind(to_db(head.generation, "generation")?)
@@ -38,6 +41,7 @@ impl AccountTxn {
         .bind(item.stub.envelope.as_slice())
         .bind(item.stub.chain_hash.as_slice())
         .bind(time_to_db(item.server_time_ms)?)
+        .bind(item.only_for.map(|app| app.to_vec()))
         .execute(self.conn())
         .await
         .map_err(StoreError::from_db)?;

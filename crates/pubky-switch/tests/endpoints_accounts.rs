@@ -1059,3 +1059,62 @@ async fn test_stale_timestamp_gives_a_time_to_retry_with() {
     assert_ne!(code(&retried), "stale_timestamp");
     replay.db.drop_database().await.expect("drop");
 }
+
+#[tokio::test]
+async fn test_enroll_answers_keep_the_creating_one_and_drop_the_oldest() {
+    let limits = Limits {
+        max_enrollments: 2,
+        ..Limits::default()
+    };
+    let Some(replay) = replay_with(limits).await else {
+        return;
+    };
+    serving(&replay).await;
+    let alice = alice_keys();
+    // Three more enrollments, all at one time.
+    let mut newest = [0; 32];
+    for nonce in 11..=13 {
+        let body = enrollment_body(nonce, ORIGIN);
+        let value: Value = serde_json::from_slice(&body).expect("json");
+        let signed: SignedDoc = serde_json::from_value(value["enrollment"].clone()).expect("doc");
+        newest = signed.doc_hash().expect("hash");
+        let answer = replay
+            .service
+            .handle(signer_request("POST", "/v1/enroll", body, ms(T)))
+            .await;
+        assert_eq!(answer.status, 200);
+    }
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    let kept: Vec<(Vec<u8>, bool)> = sqlx::query_as(
+        "SELECT enrollment_hash, creating FROM enrollment_answers WHERE account_id = $1 \
+         ORDER BY kept_order",
+    )
+    .bind(&alice.id)
+    .fetch_all(&mut conn)
+    .await
+    .expect("answers");
+    conn.close().await.expect("close");
+    assert_eq!(kept.len(), 2);
+    assert!(kept[0].1, "the creating enrollment's answer stays");
+    assert_eq!(kept[1].0, newest.to_vec(), "the newest of the others stays");
+    // The creating enrollment again: its own answer, not the pending key.
+    let http = vectors("http.json");
+    let vector = named(&http["requests"], "signer: enrollment");
+    let body =
+        pubky_switch_core::enc::unb64(vector["body_b64"].as_str().expect("body")).expect("b64");
+    let again = replay
+        .service
+        .handle(signer_request("POST", "/v1/enroll", body, ms(T)))
+        .await;
+    let first = named(
+        &http["responses"],
+        "signer: enrollment answer, signed with the new account's key",
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&again.body),
+        first["body"].as_str().expect("body")
+    );
+    replay.db.drop_database().await.expect("drop");
+}

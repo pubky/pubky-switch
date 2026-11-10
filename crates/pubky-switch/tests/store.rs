@@ -683,3 +683,56 @@ async fn test_store_upgrade_gives_existing_accounts_the_limits_in_force() {
     conn.close().await.expect("close");
     db.drop_database().await.expect("drop");
 }
+
+/// Enrollment answers kept before migration 0005: the creating one is found and marked.
+#[tokio::test]
+#[allow(clippy::panic)]
+async fn test_store_upgrade_marks_the_creating_enrollment_answer() {
+    use pubky_switch::store::{DatabaseConfig, MIGRATIONS, testing::TestDatabase};
+    let db = match TestDatabase::create_with(&DatabaseConfig::default(), false).await {
+        Ok(db) => db,
+        Err(pubky_switch::store::testing::TestDatabaseError::Skipped) => return,
+        Err(error) => panic!("test database: {error}"),
+    };
+    let mut conn = PgConnection::connect_with(db.options())
+        .await
+        .expect("conn");
+    let before = sqlx::migrate::Migrator {
+        migrations: std::borrow::Cow::Owned(MIGRATIONS.iter().take(4).cloned().collect()),
+        ignore_missing: false,
+        locking: true,
+        no_tx: false,
+    };
+    before
+        .run(&mut conn)
+        .await
+        .expect("migrations 0001 to 0004");
+    for statement in [
+        "INSERT INTO accounts (id, identity_key, generation, service_key, created_at_ms, \
+         announced_limits) VALUES ('old', '\\x0707070707070707070707070707070707070707070707070707070707070707', \
+         1, 'key', 5, '\\x7b7d')",
+        "INSERT INTO enrollment_answers (account_id, enrollment_hash, service_key, answered_at_ms) \
+         VALUES ('old', '\\x0101010101010101010101010101010101010101010101010101010101010101', 'key', 5), \
+         ('old', '\\x0202020202020202020202020202020202020202020202020202020202020202', 'pending', 9)",
+    ] {
+        sqlx::query(statement)
+            .execute(&mut conn)
+            .await
+            .expect("rows under 0004");
+    }
+    let announced =
+        pubky_switch::service::announced_limits(&pubky_switch::limits::Limits::default());
+    db.store().migrate(&announced).await.expect("upgrade");
+    let creating: Vec<(Vec<u8>, bool)> = sqlx::query_as(
+        "SELECT enrollment_hash, creating FROM enrollment_answers ORDER BY enrollment_hash",
+    )
+    .fetch_all(&mut conn)
+    .await
+    .expect("answers");
+    assert_eq!(
+        creating.iter().map(|(_, c)| *c).collect::<Vec<_>>(),
+        vec![true, false]
+    );
+    conn.close().await.expect("close");
+    db.drop_database().await.expect("drop");
+}

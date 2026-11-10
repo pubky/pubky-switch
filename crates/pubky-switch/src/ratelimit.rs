@@ -98,6 +98,75 @@ impl<K: Eq + Hash> MinuteWindows<K> {
     }
 }
 
+/// Counts per key, each in the fixed minute of its own time: for limits whose minutes are an
+/// account's service time, which differs between accounts (Switch wire 6.4, 9.4). One
+/// account's time, stamped ahead, moves only its own minute.
+#[derive(Debug)]
+pub struct KeyedMinutes<K> {
+    state: Mutex<Keyed<K>>,
+}
+
+#[derive(Debug)]
+struct Keyed<K> {
+    windows: HashMap<K, (u64, u32)>,
+    /// The minute of the last prune.
+    pruned: u64,
+}
+
+impl<K: Eq + Hash> Default for KeyedMinutes<K> {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(Keyed {
+                windows: HashMap::new(),
+                pruned: 0,
+            }),
+        }
+    }
+}
+
+/// Keys kept before the windows of earlier minutes are dropped.
+const KEYED_PRUNE_AT: usize = 4096;
+
+impl<K: Eq + Hash> KeyedMinutes<K> {
+    /// Take one of `limit` for `key` in the minute of `now_ms`, or refuse with the seconds
+    /// to the next one; a refusal doesn't count. A time earlier than the key's minute counts
+    /// in that minute, so a clock that steps back can't open a fresh one.
+    pub fn take(&self, key: K, limit: u32, now_ms: u64) -> Result<(), u64> {
+        let minute = now_ms / MINUTE_MS;
+        let mut state = self.state.lock();
+        if state.windows.len() >= KEYED_PRUNE_AT && minute > state.pruned {
+            // At most once a minute. Windows two minutes or more behind this time are almost
+            // always over: accounts' times all follow the time base. One dropped early only
+            // opens its key a fresh window, never refuses it.
+            state.pruned = minute;
+            state
+                .windows
+                .retain(|_, (at, _)| at.saturating_add(1) >= minute);
+        }
+        let (at, count) = state.windows.entry(key).or_insert((minute, 0));
+        if minute > *at {
+            *at = minute;
+            *count = 0;
+        }
+        if *count >= limit {
+            let next = at.saturating_add(1).saturating_mul(MINUTE_MS);
+            return Err(next.saturating_sub(now_ms).div_ceil(1000).max(1));
+        }
+        *count += 1;
+        Ok(())
+    }
+
+    /// Keys counted.
+    pub fn len(&self) -> usize {
+        self.state.lock().windows.len()
+    }
+
+    /// Whether nothing is counted.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 /// A claimed caller: the account, and the `Switch-Identity` and `Switch-App` a request
 /// claimed. Counted for monitoring only.
 pub type ClaimedCaller = (String, String, Option<String>);
@@ -239,5 +308,18 @@ mod tests {
         limiter.record(None, caller("a"), T0);
         limiter.record(None, caller("a"), T0);
         assert_eq!(limiter.check(None, T0), Ok(()));
+    }
+
+    #[test]
+    fn test_keyed_minutes_follow_each_keys_own_time() {
+        let minute = |m: u64| m * MINUTE_MS;
+        let windows = KeyedMinutes::default();
+        // One account's time, stamped ahead, doesn't move another's minute.
+        assert!(windows.take("ahead", 1, minute(100)).is_ok());
+        assert!(windows.take("behind", 1, minute(50)).is_ok());
+        assert_eq!(windows.take("behind", 1, minute(50) + 1_000), Err(59));
+        assert!(windows.take("behind", 1, minute(51)).is_ok());
+        // A time stepping back counts in the key's minute, and waits for its end.
+        assert_eq!(windows.take("ahead", 1, minute(99)), Err(120));
     }
 }

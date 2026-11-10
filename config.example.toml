@@ -57,6 +57,7 @@ control_per_min = 60
 cursor_hold_ms = 2592000000            # 30 days
 max_divergent_uploads = 8
 max_import_bytes = 4294967296
+max_page_bytes = 8388608               # 8 MiB
 sender_per_min = 120
 sender_app_per_min = 120
 invite_reads_per_min = 30
