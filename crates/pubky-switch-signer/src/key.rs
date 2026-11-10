@@ -345,7 +345,8 @@ impl IdentityKeyring {
     /// Open the signer's backup `backup` with the identity key (Switch wire 3.13): what it
     /// holds, without the identity key it carries, or `None` for one that doesn't open or
     /// verify. The key opens it and does nothing else; the key in the records goes with them
-    /// here, zeroized, so only a restore, through the signing gate, takes it (a later flow).
+    /// here, zeroized. A restore takes the records it shows, never that key: the install
+    /// restores with the key its keyring holds, and signs through the gate.
     ///
     /// # Errors
     ///
@@ -380,10 +381,6 @@ impl IdentityKeyring {
 
 /// What an opened signer backup holds, but its identity key (Switch wire 3.13).
 #[derive(Clone, Debug)]
-#[expect(
-    dead_code,
-    reason = "the records but the document are for the restore flow, a later PR"
-)]
 pub(crate) struct BackupView {
     /// The newest `identity.json` the backup's signer signed.
     pub(crate) identity_doc: IdentityDoc,
