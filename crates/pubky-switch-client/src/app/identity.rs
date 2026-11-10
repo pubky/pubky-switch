@@ -103,34 +103,37 @@ impl App {
     /// The alarm a copy raises (equivocation, a removed app listed again); a copy that
     /// doesn't verify; a failed commit.
     pub async fn refresh_identity(&mut self) -> Result<IdentityRefresh, AppError> {
-        self.ready_local().await?;
-        self.refuse_when_stopped()?;
-        let identity = self.state.meta.identity;
-        let doc = match read_homeserver(self.env.homeserver.as_ref(), &identity).await {
-            Ok(Some(doc)) => doc,
-            Ok(None) => return Ok(IdentityRefresh::Missing),
-            Err(AppError::Transport(_)) => return Ok(IdentityRefresh::Unavailable),
-            Err(error) => return Err(error),
-        };
-        let served = doc.version();
-        let newer = self.take_own_copy(doc).await?;
-        let held = self.state.own_doc.version();
-        if !newer && served != held {
-            return Ok(IdentityRefresh::Older { served });
-        }
-        let confirmed_at = self.now();
-        self.identity_confirmed = Some(Confirmed {
-            version: held,
-            at_ms: confirmed_at,
-        });
-        Ok(if newer {
-            IdentityRefresh::Newer {
-                version: held,
-                confirmed_at,
+        Box::pin(async move {
+            self.ready_local().await?;
+            self.refuse_when_stopped()?;
+            let identity = self.state.meta.identity;
+            let doc = match read_homeserver(self.env.homeserver.as_ref(), &identity).await {
+                Ok(Some(doc)) => doc,
+                Ok(None) => return Ok(IdentityRefresh::Missing),
+                Err(AppError::Transport(_)) => return Ok(IdentityRefresh::Unavailable),
+                Err(error) => return Err(error),
+            };
+            let served = doc.version();
+            let newer = self.take_own_copy(doc).await?;
+            let held = self.state.own_doc.version();
+            if !newer && served != held {
+                return Ok(IdentityRefresh::Older { served });
             }
-        } else {
-            IdentityRefresh::Current { confirmed_at }
+            let confirmed_at = self.now();
+            self.identity_confirmed = Some(Confirmed {
+                version: held,
+                at_ms: confirmed_at,
+            });
+            Ok(if newer {
+                IdentityRefresh::Newer {
+                    version: held,
+                    confirmed_at,
+                }
+            } else {
+                IdentityRefresh::Current { confirmed_at }
+            })
         })
+        .await
     }
 
     /// When a Homeserver read last confirmed the own `identity.json` the app holds now, on

@@ -70,22 +70,25 @@ impl App {
     ///
     /// A failed call or commit; the key and its batch are kept and sent again.
     pub async fn rotate(&mut self) -> Result<bool, AppError> {
-        self.ready_local().await?;
-        self.refuse_when_stopped()?;
-        let current = self
-            .current_n()
-            .ok_or_else(|| AppError::Refused(Refusal::NotNow("no receive key held".into())))?;
-        if let Some(held) = self.state.receive_keys.get(&current)
-            && !held.pending.is_empty()
-        {
-            // A key kept before a crash, its registration not answered yet.
-            return self.register(current).await;
-        }
-        let n = current
-            .checked_add(1)
-            .ok_or_else(|| AppError::InvalidData("receive key numbers ran out".into()))?;
-        self.new_key(n).await?;
-        self.register(n).await
+        Box::pin(async move {
+            self.ready_local().await?;
+            self.refuse_when_stopped()?;
+            let current = self
+                .current_n()
+                .ok_or_else(|| AppError::Refused(Refusal::NotNow("no receive key held".into())))?;
+            if let Some(held) = self.state.receive_keys.get(&current)
+                && !held.pending.is_empty()
+            {
+                // A key kept before a crash, its registration not answered yet.
+                return self.register(current).await;
+            }
+            let n = current
+                .checked_add(1)
+                .ok_or_else(|| AppError::InvalidData("receive key numbers ran out".into()))?;
+            self.new_key(n).await?;
+            self.register(n).await
+        })
+        .await
     }
 
     /// Make and keep key `n` with its signed registration batch, before anything is sent.
@@ -474,17 +477,20 @@ impl App {
         &mut self,
         _confirmed: UserConfirmed,
     ) -> Result<(), AppError> {
-        self.ready_local().await?;
-        let mut tx = self.tx()?;
-        for (n, registration) in self.state.registrations.iter_mut() {
-            if registration.status == RegStatus::Unaccounted {
-                registration.status = RegStatus::Own;
-                tx.put(&key::registration(*n), registration)?;
-                tx.put(&key::kid(&registration.kid), &KnownKid { n: *n })?;
-                self.state.known_kids.insert(registration.kid, *n);
+        Box::pin(async move {
+            self.ready_local().await?;
+            let mut tx = self.tx()?;
+            for (n, registration) in self.state.registrations.iter_mut() {
+                if registration.status == RegStatus::Unaccounted {
+                    registration.status = RegStatus::Own;
+                    tx.put(&key::registration(*n), registration)?;
+                    tx.put(&key::kid(&registration.kid), &KnownKid { n: *n })?;
+                    self.state.known_kids.insert(registration.kid, *n);
+                }
             }
-        }
-        self.commit(tx).await
+            self.commit(tx).await
+        })
+        .await
     }
 
     /// The user says the registrations since the backup weren't the app's, or can't tell:
@@ -495,23 +501,26 @@ impl App {
     ///
     /// [`Refusal::NotNow`] when no question is open; otherwise the alarm.
     pub async fn refuse_restored_registrations(&mut self) -> Result<(), AppError> {
-        self.ready_local().await?;
-        let Some((n, registration)) = self
-            .state
-            .registrations
-            .iter()
-            .find(|(_, r)| r.status == RegStatus::Unaccounted)
-            .map(|(n, r)| (*n, r.clone()))
-        else {
-            return Err(Refusal::NotNow("no restore question is open".into()).into());
-        };
-        let alarm = Alarm::Compromise {
-            n,
-            distrust_from: registration.at_ms,
-        };
-        let error = self.raise(alarm).await;
-        self.leave_on_compromise().await;
-        Err(error)
+        Box::pin(async move {
+            self.ready_local().await?;
+            let Some((n, registration)) = self
+                .state
+                .registrations
+                .iter()
+                .find(|(_, r)| r.status == RegStatus::Unaccounted)
+                .map(|(n, r)| (*n, r.clone()))
+            else {
+                return Err(Refusal::NotNow("no restore question is open".into()).into());
+            };
+            let alarm = Alarm::Compromise {
+                n,
+                distrust_from: registration.at_ms,
+            };
+            let error = self.raise(alarm).await;
+            self.leave_on_compromise().await;
+            Err(error)
+        })
+        .await
     }
 
     /// Whether the app runs on several devices sharing its keys (Switch spec 3.1).
@@ -520,11 +529,14 @@ impl App {
     ///
     /// A store failure.
     pub async fn set_multi_device(&mut self, multi_device: bool) -> Result<(), AppError> {
-        self.ready_local().await?;
-        self.state.device.multi_device = multi_device;
-        let mut tx = self.tx()?;
-        tx.put(key::DEVICE, &self.state.device)?;
-        self.commit(tx).await
+        Box::pin(async move {
+            self.ready_local().await?;
+            self.state.device.multi_device = multi_device;
+            let mut tx = self.tx()?;
+            tx.put(key::DEVICE, &self.state.device)?;
+            self.commit(tx).await
+        })
+        .await
     }
 
     /// The receive keys and kids this device shares with the app's other devices through
@@ -558,73 +570,77 @@ impl App {
     ///
     /// The compromise alarm; a store failure.
     pub async fn take_device_keys(&mut self, keys: DeviceKeys) -> Result<(), AppError> {
-        self.ready_local().await?;
-        let mut tx = self.tx()?;
-        self.state.device.multi_device = true;
-        tx.put(key::DEVICE, &self.state.device)?;
-        for (kid, n) in &keys.known {
-            let kid = pubky_switch_core::enc::unb64_array::<8>(kid)
-                .map_err(|_| AppError::InvalidData("device sync: a kid doesn't read".into()))?;
-            if self.state.known_kids.insert(kid, *n).is_none() {
-                tx.put(&key::kid(&kid), &KnownKid { n: *n })?;
+        Box::pin(async move {
+            self.ready_local().await?;
+            let mut tx = self.tx()?;
+            self.state.device.multi_device = true;
+            tx.put(key::DEVICE, &self.state.device)?;
+            for (kid, n) in &keys.known {
+                let kid = pubky_switch_core::enc::unb64_array::<8>(kid)
+                    .map_err(|_| AppError::InvalidData("device sync: a kid doesn't read".into()))?;
+                if self.state.known_kids.insert(kid, *n).is_none() {
+                    tx.put(&key::kid(&kid), &KnownKid { n: *n })?;
+                }
             }
-        }
-        for shared in keys.receive_keys {
-            let n = shared.key.n;
-            // A retired key this device deleted once the cursor passed its successor's
-            // registration doesn't come back from another device (Switch spec 3.6).
-            if self.state.receive_keys.contains_key(&n) || self.successor_passed(n) {
-                continue;
+            for shared in keys.receive_keys {
+                let n = shared.key.n;
+                // A retired key this device deleted once the cursor passed its successor's
+                // registration doesn't come back from another device (Switch spec 3.6).
+                if self.state.receive_keys.contains_key(&n) || self.successor_passed(n) {
+                    continue;
+                }
+                if ReceiveKeyRecord::verify(&shared.record, &self.state.cert).is_err() {
+                    return Err(AppError::InvalidData(
+                        "device sync: a receive key record doesn't verify".into(),
+                    ));
+                }
+                let reg_seq = self.state.registrations.get(&n).and_then(|r| r.seq);
+                let held = HeldKey {
+                    key: shared.key,
+                    record: shared.record,
+                    reg_seq,
+                    pending: Vec::new(),
+                };
+                tx.put(&key::receive_key(n), &held)?;
+                self.state.receive_keys.insert(n, held);
+                if self.state.registrations.remove(&n).is_some() {
+                    tx.delete(&key::registration(n))?;
+                }
             }
-            if ReceiveKeyRecord::verify(&shared.record, &self.state.cert).is_err() {
-                return Err(AppError::InvalidData(
-                    "device sync: a receive key record doesn't verify".into(),
-                ));
+            if keys.rotation_ms > self.state.rotation.last_ms {
+                self.state.rotation.last_ms = keys.rotation_ms;
+                tx.put(key::ROTATION, &self.state.rotation)?;
             }
-            let reg_seq = self.state.registrations.get(&n).and_then(|r| r.seq);
-            let held = HeldKey {
-                key: shared.key,
-                record: shared.record,
-                reg_seq,
-                pending: Vec::new(),
-            };
-            tx.put(&key::receive_key(n), &held)?;
-            self.state.receive_keys.insert(n, held);
-            if self.state.registrations.remove(&n).is_some() {
-                tx.delete(&key::registration(n))?;
+            let unknown = self
+                .state
+                .registrations
+                .iter()
+                .find(|(_, r)| {
+                    r.status == RegStatus::AwaitingSync
+                        && !self.state.known_kids.contains_key(&r.kid)
+                })
+                .map(|(n, r)| (*n, r.at_ms));
+            for (n, registration) in self.state.registrations.iter_mut() {
+                if registration.status == RegStatus::AwaitingSync
+                    && self.state.known_kids.contains_key(&registration.kid)
+                {
+                    registration.status = RegStatus::Own;
+                    tx.put(&key::registration(*n), registration)?;
+                }
             }
-        }
-        if keys.rotation_ms > self.state.rotation.last_ms {
-            self.state.rotation.last_ms = keys.rotation_ms;
-            tx.put(key::ROTATION, &self.state.rotation)?;
-        }
-        let unknown = self
-            .state
-            .registrations
-            .iter()
-            .find(|(_, r)| {
-                r.status == RegStatus::AwaitingSync && !self.state.known_kids.contains_key(&r.kid)
-            })
-            .map(|(n, r)| (*n, r.at_ms));
-        for (n, registration) in self.state.registrations.iter_mut() {
-            if registration.status == RegStatus::AwaitingSync
-                && self.state.known_kids.contains_key(&registration.kid)
-            {
-                registration.status = RegStatus::Own;
-                tx.put(&key::registration(*n), registration)?;
+            self.commit(tx).await?;
+            if let Some((n, at_ms)) = unknown {
+                let alarm = Alarm::Compromise {
+                    n,
+                    distrust_from: at_ms,
+                };
+                let error = self.raise(alarm).await;
+                self.leave_on_compromise().await;
+                return Err(error);
             }
-        }
-        self.commit(tx).await?;
-        if let Some((n, at_ms)) = unknown {
-            let alarm = Alarm::Compromise {
-                n,
-                distrust_from: at_ms,
-            };
-            let error = self.raise(alarm).await;
-            self.leave_on_compromise().await;
-            return Err(error);
-        }
-        Ok(())
+            Ok(())
+        })
+        .await
     }
 
     /// Refuse a call that would read or write while the app is stopped or gone: `gone`

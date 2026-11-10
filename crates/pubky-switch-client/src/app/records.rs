@@ -61,7 +61,7 @@ pub(crate) fn record_key_of(key: &[u8; 32]) -> String {
     format!("{RECORD_PREFIX}{}", b64(key))
 }
 
-fn seen_key(key: &[u8; 32]) -> String {
+pub(crate) fn seen_key(key: &[u8; 32]) -> String {
     format!("{SEEN_PREFIX}{}", b64(key))
 }
 
@@ -82,29 +82,137 @@ fn cert_key(app_id: &[u8; 16], cert_hash: &[u8; 32]) -> String {
     )
 }
 
+/// Which policies a collection's records may have (Switch spec 3.3, 10.3).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PolicyFamily {
+    /// The fixed policy alone.
+    #[default]
+    Fixed,
+    /// The fixed policy, whose read scope is a name, and one policy per sub-scope of that
+    /// name: for `<sub>`, the read scope `<name>:<sub>`, and the write scopes with `<name>`
+    /// narrowed to `<name>:<sub>` and the others kept. An app holding `<name>` reads every
+    /// member, one holding only `<name>:<sub>` its own (Switch spec 3.3, 8.2).
+    SubScopes,
+}
+
 /// A collection of a protocol and its fixed policy (Switch spec 10.3). The collection name
-/// is the protocol's opaque string; one name may come with several policies, such as one per
-/// sub-scope, each a collection of its own here.
+/// is the protocol's opaque string. One name may come with several policies, such as one per
+/// sub-scope: either each as a collection of its own here, or as one collection with the
+/// family [`PolicyFamily::SubScopes`], which lists and reads every member the app holds
+/// the read scope of.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Collection {
     /// The collection name.
     pub name: String,
-    /// The fixed policy.
+    /// The fixed policy; with [`PolicyFamily::SubScopes`], the name scope's.
     pub policy: Policy,
+    /// The policies besides the fixed one.
+    pub family: PolicyFamily,
 }
 
 impl Collection {
-    /// A collection with its policy.
+    /// A collection with its fixed policy alone.
     pub fn new(name: &str, policy: Policy) -> Self {
         Self {
             name: name.to_owned(),
             policy,
+            family: PolicyFamily::Fixed,
+        }
+    }
+
+    /// A collection with the name scope's `policy` and one policy per sub-scope
+    /// ([`PolicyFamily::SubScopes`]).
+    pub fn with_sub_scopes(name: &str, policy: Policy) -> Self {
+        Self {
+            name: name.to_owned(),
+            policy,
+            family: PolicyFamily::SubScopes,
         }
     }
 
     /// The collection ID of `identity` (Switch spec 13.3).
     pub fn id(&self, identity: &[u8; 32]) -> [u8; 32] {
         collection_id(&self.name, identity)
+    }
+
+    /// The policy of sub-scope `sub` ([`PolicyFamily::SubScopes`]).
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::Usage`] for a collection without sub-scope policies, a fixed read scope
+    /// that isn't a name, or a `sub` that isn't a sub-scope (Switch spec 3.3).
+    pub fn sub_scope_policy(&self, sub: &str) -> Result<Policy, AppError> {
+        let name = self.policy.read_scope.as_str();
+        if self.family != PolicyFamily::SubScopes
+            || !pubky_switch_core::scopes::is_name(name)
+            || !pubky_switch_core::scopes::is_sub(sub)
+        {
+            return Err(Refusal::Usage(
+                "Switch spec 3.3: no sub-scope policy of this collection for that sub-scope".into(),
+            )
+            .into());
+        }
+        let narrowed = format!("{name}:{sub}");
+        let writes: Vec<&str> = self
+            .policy
+            .write_scopes
+            .iter()
+            .map(|scope| {
+                if scope == name {
+                    narrowed.as_str()
+                } else {
+                    scope.as_str()
+                }
+            })
+            .collect();
+        Ok(Policy::new(&narrowed, &writes))
+    }
+
+    /// The collection of sub-scope `sub` alone: its records, read and written under that
+    /// sub-scope's policy, for a [`RecordTarget`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Collection::sub_scope_policy`].
+    pub fn sub_scope(&self, sub: &str) -> Result<Collection, AppError> {
+        Ok(Collection::new(&self.name, self.sub_scope_policy(sub)?))
+    }
+
+    /// Which member of the family `policy` is: `Some(None)` for the fixed policy,
+    /// `Some(Some(sub))` for the policy of sub-scope `sub`, `None` for a policy the
+    /// collection doesn't have.
+    pub fn member(&self, policy: &Policy) -> Option<Option<String>> {
+        if *policy == self.policy {
+            return Some(None);
+        }
+        if self.family != PolicyFamily::SubScopes {
+            return None;
+        }
+        let (name, sub) = pubky_switch_core::scopes::split(&policy.read_scope)?;
+        let sub = sub?;
+        if name != self.policy.read_scope {
+            return None;
+        }
+        let expected = self.sub_scope_policy(sub).ok()?;
+        (expected == *policy).then(|| Some(sub.to_owned()))
+    }
+
+    /// Whether a record may have `policy` in this collection.
+    pub fn admits(&self, policy: &Policy) -> bool {
+        self.member(policy).is_some()
+    }
+
+    /// Whether a certificate holds the read scope of any member, so its app lists the
+    /// collection (Switch spec 8.3).
+    pub fn readable_by(&self, cert: &AppCert) -> bool {
+        if cert.holds_scope(&self.policy.read_scope) {
+            return true;
+        }
+        self.family == PolicyFamily::SubScopes
+            && cert.scopes().iter().any(|scope| {
+                pubky_switch_core::scopes::split(scope)
+                    .is_some_and(|(name, sub)| sub.is_some() && name == self.policy.read_scope)
+            })
     }
 }
 
@@ -327,7 +435,7 @@ impl HeldRecord {
         }
     }
 
-    fn shared(&self, key: &[u8; 32]) -> SharedRecord {
+    pub(crate) fn shared(&self, key: &[u8; 32]) -> SharedRecord {
         SharedRecord {
             key: *key,
             collection: self.collection.clone(),
@@ -506,14 +614,17 @@ impl App {
         &mut self,
         target: &RecordTarget,
     ) -> Result<Option<SharedRecord>, AppError> {
-        self.ready_local().await?;
-        self.refuse_when_stopped()?;
-        let key = self.record_key(target)?;
-        self.fetch_record(&key, &target.collection).await?;
-        self.shared_record(&key).await
+        Box::pin(async move {
+            self.ready_local().await?;
+            self.refuse_when_stopped()?;
+            let key = self.record_key(target)?;
+            self.fetch_record(&key, &target.collection).await?;
+            self.shared_record(&key).await
+        })
+        .await
     }
 
-    async fn fetch_record(
+    pub(crate) async fn fetch_record(
         &mut self,
         key: &[u8; 32],
         collection: &Collection,
@@ -538,35 +649,38 @@ impl App {
     ///
     /// A rollback for signed evidence of misbehaviour; a failed call or commit.
     pub async fn list_collection(&mut self, collection: &Collection) -> Result<u64, AppError> {
-        self.ready_local().await?;
-        self.refuse_when_stopped()?;
-        let id = collection.id(&self.state.meta.identity);
-        let mut after: Option<[u8; 32]> = None;
-        let mut listed = 0u64;
-        loop {
-            let result = self
-                .client
-                .records(&id, after.as_ref(), Some(LIST_PAGE))
-                .await;
-            let page = self.take(result).await?;
-            let mut tx = self.tx()?;
-            for view in &page.records {
-                self.take_view(view, Some((&view.key, collection)), &mut tx)
-                    .await?;
-                listed = listed.saturating_add(1);
-            }
-            self.commit(tx).await?;
-            // Records are listed by the base64url text of their keys, compared as ASCII
-            // (Switch wire 7.4.9): a `next` that doesn't move past the key asked after ends
-            // the listing, so a service that names keys back and forth can't keep the app
-            // reading.
-            match page.next {
-                Some(next) if after.is_none_or(|after| b64(&next) > b64(&after)) => {
-                    after = Some(next);
+        Box::pin(async move {
+            self.ready_local().await?;
+            self.refuse_when_stopped()?;
+            let id = collection.id(&self.state.meta.identity);
+            let mut after: Option<[u8; 32]> = None;
+            let mut listed = 0u64;
+            loop {
+                let result = self
+                    .client
+                    .records(&id, after.as_ref(), Some(LIST_PAGE))
+                    .await;
+                let page = self.take(result).await?;
+                let mut tx = self.tx()?;
+                for view in &page.records {
+                    self.take_view(view, Some((&view.key, collection)), &mut tx)
+                        .await?;
+                    listed = listed.saturating_add(1);
                 }
-                _ => return Ok(listed),
+                self.commit(tx).await?;
+                // Records are listed by the base64url text of their keys, compared as ASCII
+                // (Switch wire 7.4.9): a `next` that doesn't move past the key asked after ends
+                // the listing, so a service that names keys back and forth can't keep the app
+                // reading.
+                match page.next {
+                    Some(next) if after.is_none_or(|after| b64(&next) > b64(&after)) => {
+                        after = Some(next);
+                    }
+                    _ => return Ok(listed),
+                }
             }
-        }
+        })
+        .await
     }
 
     /// List every collection of the protocol whose read scope the app's certificate holds
@@ -576,18 +690,21 @@ impl App {
     ///
     /// As [`App::list_collection`].
     pub async fn list_collections(&mut self) -> Result<(), AppError> {
-        let collections: Vec<Collection> = self
-            .protocol
-            .collections()
-            .into_iter()
-            .filter(|c| self.state.cert.holds_scope(&c.policy.read_scope))
-            .collect();
-        for collection in &collections {
-            self.list_collection(collection).await?;
-        }
-        let mut tx = self.tx()?;
-        tx.delete(LIST_DUE)?;
-        self.commit(tx).await
+        Box::pin(async move {
+            let collections: Vec<Collection> = self
+                .protocol
+                .collections()
+                .into_iter()
+                .filter(|c| c.readable_by(&self.state.cert))
+                .collect();
+            for collection in &collections {
+                self.list_collection(collection).await?;
+            }
+            let mut tx = self.tx()?;
+            tx.delete(LIST_DUE)?;
+            self.commit(tx).await
+        })
+        .await
     }
 
     /// List the collections when a listing is owed: after joining, and after a `missed` item
@@ -749,6 +866,8 @@ impl App {
         if let Some(reason) = check_shape(put, &collection, &identity) {
             return invalid(reason);
         }
+        // The member of the collection's policy family the write names.
+        let collection = Collection::new(&collection.name, put.policy.clone());
         // Step 1: the writer's certificate and the signature.
         let Some((cert, op)) = self.writer_cert(evidence, &writer).await? else {
             return Ok(Err(Refused::Ignored));
@@ -858,13 +977,15 @@ impl App {
         }))
     }
 
-    /// The protocol's collection a write names, by its collection ID and policy.
+    /// The protocol's collection a write names, by its collection ID and a policy of the
+    /// collection's family: the member it names.
     fn collection_of(&self, put: &RecordPut) -> Option<Collection> {
         let identity = self.state.meta.identity;
         self.protocol
             .collections()
             .into_iter()
-            .find(|c| c.id(&identity) == put.collection && c.policy == put.policy)
+            .find(|c| c.id(&identity) == put.collection && c.admits(&put.policy))
+            .map(|c| Collection::new(&c.name, put.policy.clone()))
     }
 
     /// The writer's certificate whose key verifies the operation: the record view's, the
@@ -1164,66 +1285,18 @@ impl App {
         value: Option<&[u8]>,
         conditions: Vec<Condition>,
     ) -> Result<(Vec<Condition>, OpKind), AppError> {
-        let policy = &target.collection.policy;
-        if !policy
-            .write_scopes
-            .iter()
-            .any(|scope| self.state.cert.holds_scope(scope))
-        {
-            return Err(Refusal::Usage(
-                "Switch spec 10.3: the certificate holds none of the record's write scopes".into(),
-            )
-            .into());
-        }
-        let identity = self.state.meta.identity;
-        let epoch = self.state.own_doc.data_epoch();
-        if self
-            .state
-            .scope_keys
-            .get(epoch, &policy.read_scope)
-            .is_none()
-        {
-            self.ensure_scope_keys().await?;
-        }
-        let scope_key = self
-            .state
-            .scope_keys
-            .get(epoch, &policy.read_scope)
-            .ok_or_else(|| {
-                AppError::Refused(Refusal::NotNow(
-                    "Switch spec 3.5: no key of the read scope at the current data epoch yet"
-                        .into(),
-                ))
-            })?;
-        let key = self.record_key(target)?;
-        let sealed = SealedValue::seal(
-            &scope_key,
-            &identity,
-            epoch,
-            &policy.read_scope,
-            &key,
-            value.unwrap_or_default(),
-        )?;
-        let held = self.held_record(&key).await?;
-        let base = match &held {
-            Some(held) if held.follow.is_some() || held.content != RecordContent::Deleted => {
-                held.base_version()
+        Box::pin(async move {
+            let epoch = self.state.own_doc.data_epoch();
+            let read_scope = &target.collection.policy.read_scope;
+            if self.state.scope_keys.get(epoch, read_scope).is_none() {
+                self.ensure_scope_keys().await?;
             }
-            _ => RecordVersion::NONE,
-        };
-        let id_inputs = base.is_none().then(|| IdInputs {
-            collection: target.collection.name.clone(),
-            blinded_key: self.state.naming.blind(&target.natural_key),
-        });
-        let put = RecordPut {
-            key,
-            collection: target.collection.id(&identity),
-            policy: policy.clone(),
-            expected_version: base,
-            value_sealed: sealed,
-            id_inputs,
-        };
-        Ok((conditions, OpKind::RecordPut(put)))
+            let key = self.record_key(target)?;
+            let held = self.held_record(&key).await?;
+            let put = record_put(&self.state, target, value, held.as_ref())?;
+            Ok((conditions, OpKind::RecordPut(put)))
+        })
+        .await
     }
 
     /// Write `value` at `target` with `conditions`, compare-and-swap on the version the app
@@ -1241,7 +1314,7 @@ impl App {
         value: &[u8],
         conditions: Vec<Condition>,
     ) -> Result<SharedRecord, AppError> {
-        self.write_record(target, Some(value), conditions).await
+        Box::pin(async move { self.write_record(target, Some(value), conditions).await }).await
     }
 
     /// Delete the record at `target`: a write whose sealed value is empty (Switch spec
@@ -1255,7 +1328,7 @@ impl App {
         target: &RecordTarget,
         conditions: Vec<Condition>,
     ) -> Result<SharedRecord, AppError> {
-        self.write_record(target, None, conditions).await
+        Box::pin(async move { self.write_record(target, None, conditions).await }).await
     }
 
     async fn write_record(
@@ -1266,27 +1339,20 @@ impl App {
     ) -> Result<SharedRecord, AppError> {
         self.ready_local().await?;
         let key = self.record_key(target)?;
-        let mut epoch_retried = false;
-        loop {
-            let entry = self.record_op(target, value, conditions.clone()).await?;
-            self.note_pending_name(&key, &target.collection).await?;
-            match self.submit_batch(OpBatch::new().entry(entry)).await {
-                Ok(_) => {
-                    return self.shared_record(&key).await?.ok_or_else(|| {
-                        AppError::InvalidData("the record written isn't held".into())
-                    });
-                }
-                Err(error) if error.code() == Some(ErrorCode::StaleEpoch) && !epoch_retried => {
-                    epoch_retried = true;
-                    self.refresh_identity().await?;
-                    self.fetch_key_bundle().await?;
-                }
-                Err(error) if error.code() == Some(ErrorCode::Conflict) => {
-                    self.fetch_record(&key, &target.collection).await?;
-                    return Err(error);
-                }
-                Err(error) => return Err(error),
+        let entry = self.record_op(target, value, conditions).await?;
+        self.note_pending_name(&key, &target.collection).await?;
+        // `409 stale_epoch` is followed inside `submit_batch`: the write is sealed again at
+        // the new data epoch and sent once more.
+        match self.submit_batch(OpBatch::new().entry(entry)).await {
+            Ok(_) => self
+                .shared_record(&key)
+                .await?
+                .ok_or_else(|| AppError::InvalidData("the record written isn't held".into())),
+            Err(error) if error.code() == Some(ErrorCode::Conflict) => {
+                self.fetch_record(&key, &target.collection).await?;
+                Err(error)
             }
+            Err(error) => Err(error),
         }
     }
 
@@ -1305,23 +1371,26 @@ impl App {
         conditions: Vec<Condition>,
         mut change: impl FnMut(Option<&[u8]>) -> Option<Vec<u8>> + Send,
     ) -> Result<Option<SharedRecord>, AppError> {
-        let key = self.record_key(target)?;
-        let mut last = None;
-        for _ in 0..UPDATE_TRIES {
-            let current = self.shared_record(&key).await?;
-            let value = current.as_ref().and_then(|r| r.content.value());
-            let Some(next) = change(value) else {
-                return Ok(None);
-            };
-            match self.put_record(target, &next, conditions.clone()).await {
-                Ok(record) => return Ok(Some(record)),
-                Err(error) if error.code() == Some(ErrorCode::Conflict) => last = Some(error),
-                Err(error) => return Err(error),
+        Box::pin(async move {
+            let key = self.record_key(target)?;
+            let mut last = None;
+            for _ in 0..UPDATE_TRIES {
+                let current = self.shared_record(&key).await?;
+                let value = current.as_ref().and_then(|r| r.content.value());
+                let Some(next) = change(value) else {
+                    return Ok(None);
+                };
+                match self.put_record(target, &next, conditions.clone()).await {
+                    Ok(record) => return Ok(Some(record)),
+                    Err(error) if error.code() == Some(ErrorCode::Conflict) => last = Some(error),
+                    Err(error) => return Err(error),
+                }
             }
-        }
-        Err(last.unwrap_or_else(|| {
-            AppError::Switch(ClientError::Usage("the record kept changing".into()))
-        }))
+            Err(last.unwrap_or_else(|| {
+                AppError::Switch(ClientError::Usage("the record kept changing".into()))
+            }))
+        })
+        .await
     }
 
     /// A chain item of the shared state in the feed: a record write, a claim entry, a list
@@ -1358,9 +1427,81 @@ impl App {
         self.commit(tx).await
     }
 
-    fn collection_of_name(&self, collection: &Collection) -> bool {
-        self.protocol.collections().iter().any(|c| c == collection)
+    pub(crate) fn collection_of_name(&self, collection: &Collection) -> bool {
+        self.protocol
+            .collections()
+            .iter()
+            .any(|c| c.name == collection.name && c.admits(&collection.policy))
     }
+}
+
+/// The `record.put` of `value` at `target` (`None` a delete), built on `held`, the write the
+/// app holds there: on its version, or a create (`{0, 0}` with `id_inputs`) for a record it
+/// holds nothing of or holds deleted, sealed under the read scope's key at the current data
+/// epoch (Switch spec 3.5, 10.3, 13.4).
+///
+/// # Errors
+///
+/// [`Refusal::Usage`] when the certificate holds none of the write scopes;
+/// [`Refusal::NotNow`] while the app lacks the read scope's key at the current data epoch.
+pub(crate) fn record_put(
+    state: &super::AppState,
+    target: &RecordTarget,
+    value: Option<&[u8]>,
+    held: Option<&HeldRecord>,
+) -> Result<RecordPut, AppError> {
+    let policy = &target.collection.policy;
+    if !policy
+        .write_scopes
+        .iter()
+        .any(|scope| state.cert.holds_scope(scope))
+    {
+        return Err(Refusal::Usage(
+            "Switch spec 10.3: the certificate holds none of the record's write scopes".into(),
+        )
+        .into());
+    }
+    let identity = state.meta.identity;
+    let epoch = state.own_doc.data_epoch();
+    let scope_key = state
+        .scope_keys
+        .get(epoch, &policy.read_scope)
+        .ok_or_else(|| {
+            AppError::Refused(Refusal::NotNow(
+                "Switch spec 3.5: no key of the read scope at the current data epoch yet".into(),
+            ))
+        })?;
+    let key = state.naming.record_key(
+        &target.collection.name,
+        &target.natural_key,
+        &policy.hash()?,
+    );
+    let sealed = SealedValue::seal(
+        &scope_key,
+        &identity,
+        epoch,
+        &policy.read_scope,
+        &key,
+        value.unwrap_or_default(),
+    )?;
+    let base = match held {
+        Some(held) if held.follow.is_some() || held.content != RecordContent::Deleted => {
+            held.base_version()
+        }
+        _ => RecordVersion::NONE,
+    };
+    let id_inputs = base.is_none().then(|| IdInputs {
+        collection: target.collection.name.clone(),
+        blinded_key: state.naming.blind(&target.natural_key),
+    });
+    Ok(RecordPut {
+        key,
+        collection: target.collection.id(&identity),
+        policy: policy.clone(),
+        expected_version: base,
+        value_sealed: sealed,
+        id_inputs,
+    })
 }
 
 /// Delete, with the keys on a leave, every record of the shared state, the outbox and the
@@ -1381,26 +1522,26 @@ pub(crate) fn destroy_shared(tx: &mut Tx) -> Result<(), AppError> {
     Ok(())
 }
 
-fn pending_name_key(key: &[u8; 32]) -> String {
+pub(crate) fn pending_name_key(key: &[u8; 32]) -> String {
     format!("recname/{}", b64(key))
 }
 
 /// `hw/<key>`: the protocol's mark of what the app has seen in a record.
 #[derive(Clone, Serialize, Deserialize)]
-struct SeenMark {
+pub(crate) struct SeenMark {
     #[serde(with = "serde_b64_vec")]
-    mark: Vec<u8>,
+    pub(crate) mark: Vec<u8>,
 }
 
-/// Step 3's checks that need no state: the policy is the collection's fixed one, the
-/// collection ID is the name's, the sealed value's scope is the read scope, and a create's
-/// key derives from its `id_inputs`.
+/// Step 3's checks that need no state: the policy is one the collection fixes (its fixed
+/// policy, or a member of its family), the collection ID is the name's, the sealed value's
+/// scope is the read scope, and a create's key derives from its `id_inputs`.
 fn check_shape(
     put: &RecordPut,
     collection: &Collection,
     identity: &[u8; 32],
 ) -> Option<&'static str> {
-    if put.policy != collection.policy || put.collection != collection.id(identity) {
+    if !collection.admits(&put.policy) || put.collection != collection.id(identity) {
         return Some("Switch wire 6.2 step 3: not the collection's fixed policy");
     }
     if put.value_sealed.scope != put.policy.read_scope {

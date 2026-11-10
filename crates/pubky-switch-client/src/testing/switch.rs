@@ -2,7 +2,7 @@
 //! signed by the account's service key, built from the core's types. Batches go through the
 //! core's rules (`batch`); `FAKES.md` lists what it leaves out.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use ed25519_dalek::SigningKey;
@@ -33,6 +33,7 @@ use crate::error::TransportError;
 use crate::transport::{Header, MockTransport, Request, Response};
 
 mod batch;
+mod inbox;
 mod shared;
 
 pub use shared::HeldRecord;
@@ -54,6 +55,8 @@ pub(crate) enum Item {
         accepted_at: u64,
         envelope: Vec<u8>,
         targets: Vec<[u8; 16]>,
+        /// The context of the invite code that admitted it.
+        context: Option<Value>,
     },
     Chain {
         seq: u64,
@@ -163,8 +166,9 @@ pub(crate) struct Inner {
     pub(crate) apps: BTreeMap<[u8; 16], SwitchApp>,
     /// The key bundle parts stored for each app, with the `seq` of each.
     pub(crate) bundles: BTreeMap<[u8; 16], Vec<(KeyBundlePut, u64)>>,
-    /// Every kid an app of the account registered (Switch spec 3.6).
-    pub(crate) kids: BTreeSet<[u8; 8]>,
+    /// Every kid an app of the account registered (Switch spec 3.6), with the app it
+    /// belongs to.
+    pub(crate) kids: BTreeMap<[u8; 8], [u8; 16]>,
     /// The batch records by batch ID (Switch wire 6.4 step 5).
     pub(crate) batches: HashMap<[u8; 16], BatchRecord>,
     pub(crate) checkpoint: Option<SignedHead>,
@@ -202,6 +206,18 @@ pub(crate) struct Inner {
     pub(crate) feed_limit: Option<u64>,
     /// The bodies of the requests an `Unreachable` fault failed.
     pub(crate) unreached: Vec<Vec<u8>>,
+    /// The peer copies of other identities' `identity.json` (Switch wire 7.4.5).
+    pub(crate) peers: HashMap<[u8; 32], IdentityDoc>,
+    /// The answers to appends, by sender and envelope, for retries by content.
+    pub(crate) appended: HashMap<([u8; 32], Vec<u8>), Value>,
+    /// The `apps_version`: it moves when an app becomes reachable or stops being so.
+    pub(crate) apps_version: u64,
+    /// The `apps_version` at which each reachable app became reachable.
+    pub(crate) reachable_since: BTreeMap<[u8; 16], u64>,
+    /// Every sender is admitted, whatever the lists say.
+    pub(crate) open_admission: bool,
+    /// The `directory_version`: it moves whenever the directory changes.
+    pub(crate) directory_version: u64,
 }
 
 impl Inner {
@@ -222,7 +238,7 @@ impl Inner {
             doc: None,
             apps: BTreeMap::new(),
             bundles: BTreeMap::new(),
-            kids: BTreeSet::new(),
+            kids: BTreeMap::new(),
             batches: HashMap::new(),
             checkpoint: None,
             dropped_through: 0,
@@ -242,6 +258,12 @@ impl Inner {
             feed_reads: 0,
             feed_limit: None,
             unreached: Vec::new(),
+            peers: HashMap::new(),
+            appended: HashMap::new(),
+            apps_version: 1,
+            reachable_since: BTreeMap::new(),
+            open_admission: false,
+            directory_version: 1,
         }
     }
 }
@@ -370,6 +392,11 @@ impl ScriptedSwitch {
         next.dropped_through = inner.dropped_through;
         next.staged = true;
         next.shared = inner.shared.clone();
+        next.peers = inner.peers.clone();
+        next.apps_version = inner.apps_version;
+        next.reachable_since = inner.reachable_since.clone();
+        next.open_admission = inner.open_admission;
+        next.directory_version = inner.directory_version;
         Arc::new(Self {
             inner: Mutex::new(next),
         })
@@ -418,6 +445,7 @@ impl ScriptedSwitch {
     pub fn revoke(&self, app: [u8; 16]) -> Result<(), ScriptError> {
         let mut inner = self.lock();
         inner.apps.entry(app).or_default().departed = true;
+        inner.unreachable(&app);
         inner.push.remove(&app);
         let at = inner.now();
         inner.service_transition(ServiceTransition::Revoke { app_id: app, at })?;
@@ -528,7 +556,18 @@ impl ScriptedSwitch {
             .header(header::APP)
             .and_then(|text| app_id_decode(text).ok());
         let rest = path.splitn(4, '/').nth(3).unwrap_or_default().to_owned();
-        let answer = match inner.route_shared(request, &rest) {
+        let account = inner.identity.public();
+        if let Some(sender) = inbox::Sender::foreign(request, &account) {
+            // An app of another identity: the routes a sender calls (Switch wire 7.2).
+            let (status, body) = inner
+                .route_foreign(request, &sender, &rest)
+                .map_err(|error| TransportError::Other(format!("scripted switch: {error}")))?;
+            if lose {
+                return Err(TransportError::Timeout);
+            }
+            return Ok(inner.respond(request, status, &body));
+        }
+        let answer = match inner.route_shared(request, caller, &rest) {
             Some(answer) => Ok(answer),
             None => inner.route(request, caller, &rest),
         };
@@ -573,6 +612,7 @@ impl ScriptedSwitch {
             None,
         )?;
         inner.doc = Some(doc.clone());
+        inner.directory_version += 1;
         Ok(())
     }
 
@@ -663,6 +703,7 @@ impl ScriptedSwitch {
             accepted_at,
             envelope,
             targets: to.to_vec(),
+            context: None,
         });
         seq
     }
@@ -838,6 +879,14 @@ impl Inner {
         self.clock.now_ms()
     }
 
+    /// `app` departed: it stops being reachable (Switch wire 7.4.10).
+    fn unreachable(&mut self, app: &[u8; 16]) {
+        self.directory_version += 1;
+        if self.reachable_since.remove(app).is_some() {
+            self.apps_version += 1;
+        }
+    }
+
     fn next_seq(&mut self) -> u64 {
         self.seq += 1;
         self.seq
@@ -965,6 +1014,7 @@ impl Inner {
         let own_leave = format!("apps/{me}/leave");
         Ok(match (request.method.as_str(), route) {
             ("POST", "ops") => self.ops(caller, &request.body)?,
+            ("POST", "inbox") => self.append(request, None, query)?,
             ("GET", "feed") => self.feed(caller, query),
             ("GET", "directory") => self.directory(),
             ("GET", "identity") => self.identity_answer(),
@@ -996,6 +1046,7 @@ impl Inner {
                     return Ok(bad(ErrorCode::NotCurrent, "departed", json!({})));
                 }
                 self.apps.entry(app).or_default().departed = true;
+                self.unreachable(&app);
                 let at = self.now();
                 let proof =
                     self.service_transition(ServiceTransition::Leave { app_id: app, at })?;
@@ -1121,13 +1172,19 @@ impl Inner {
                 accepted_at,
                 envelope,
                 targets,
+                context,
             } => {
                 if !targets.contains(&app) {
                     return None;
                 }
-                json!({ "type": "entry", "seq": seq, "entry_id": Self::entry_id(*seq),
-                        "sender": pubky_id(sender), "cert": cert,
-                        "accepted_at": rfc3339(*accepted_at), "envelope": b64(envelope) })
+                let mut value = json!({ "type": "entry", "seq": seq,
+                        "entry_id": Self::entry_id(*seq), "sender": pubky_id(sender),
+                        "cert": cert, "accepted_at": rfc3339(*accepted_at),
+                        "envelope": b64(envelope) });
+                if let Some(context) = context {
+                    value["context"] = context.clone();
+                }
+                value
             }
             Item::Chain {
                 seq,
@@ -1309,7 +1366,8 @@ impl Inner {
         (
             200,
             json!({ "identity": self.doc.as_ref().map(|d| d.signed().clone()),
-                    "apps": apps, "directory_version": self.seq, "apps_version": 1 }),
+                    "apps": apps, "directory_version": self.directory_version,
+                    "apps_version": self.apps_version }),
         )
     }
 }

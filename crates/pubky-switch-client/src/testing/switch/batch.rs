@@ -5,7 +5,7 @@
 //! the writer, the same checks, the same state changes, proofs and chain items. The rules are
 //! the core's; `FAKES.md` lists what it leaves out.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use pubky_switch_core::chain::{ItemType, ProofState};
 use pubky_switch_core::http::ErrorCode;
@@ -61,8 +61,12 @@ pub(super) fn refused(refusal: &Refusal) -> Answer {
 struct Draft {
     apps: BTreeMap<[u8; 16], SwitchApp>,
     bundles: BTreeMap<[u8; 16], Vec<(KeyBundlePut, u64)>>,
-    kids: BTreeSet<[u8; 8]>,
+    kids: BTreeMap<[u8; 8], [u8; 16]>,
     shared: Shared,
+    /// The directory's versions (Switch wire 7.4.10).
+    directory_version: u64,
+    apps_version: u64,
+    reachable_since: BTreeMap<[u8; 16], u64>,
 }
 
 /// What the no-op and rate rules compare a batch with, before it (Switch wire 6.4 step 7).
@@ -360,6 +364,9 @@ impl Inner {
             bundles: self.bundles.clone(),
             kids: self.kids.clone(),
             shared: self.shared.clone(),
+            directory_version: self.directory_version,
+            apps_version: self.apps_version,
+            reachable_since: self.reachable_since.clone(),
         }
     }
 
@@ -368,6 +375,9 @@ impl Inner {
         self.bundles = draft.bundles;
         self.kids = draft.kids;
         self.shared = draft.shared;
+        self.directory_version = draft.directory_version;
+        self.apps_version = draft.apps_version;
+        self.reachable_since = draft.reachable_since;
     }
 
     /// One operation's own rules (Switch wire 6.2, 6.8), against `draft`, which it changes:
@@ -414,7 +424,8 @@ impl Inner {
         Ok((state, None))
     }
 
-    /// `app.put`, by [`check_app_put`].
+    /// `app.put`, by [`check_app_put`]; a stored record changes the directory (Switch wire
+    /// 7.4.10).
     fn app_put(
         &self,
         draft: &mut Draft,
@@ -434,12 +445,15 @@ impl Inner {
             let entry = draft.apps.entry(app).or_default();
             entry.record = Some(record.clone());
             entry.cert = Some(new.cert().clone());
+            draft.directory_version += 1;
         }
         Ok(ProofState::App { app_id: app })
     }
 
     /// `receive_key.put`, by [`check_receive_key_put`]; an unchanged one's proof shows the
-    /// current `n` and kid (Switch wire 6.4 "No-ops").
+    /// current `n` and kid (Switch wire 6.4 "No-ops"). A stored key changes the directory,
+    /// and an app's first makes it reachable, which moves `apps_version` (Switch wire
+    /// 7.4.10).
     fn receive_key_put(
         &self,
         draft: &mut Draft,
@@ -459,14 +473,20 @@ impl Inner {
             current.as_ref(),
             entry.record.is_some(),
             self.any_first_n,
-            draft.kids.contains(&new.kid()),
+            draft.kids.contains_key(&new.kid()),
         )?;
         let shown = match (effect, current) {
             (ReceiveKeyEffect::Unchanged, Some(current)) => current,
             _ => {
+                let first = entry.receive_key.is_none() && !entry.departed;
                 entry.receive_key = Some(record.clone());
                 entry.receive_n = Some(new.n());
-                draft.kids.insert(new.kid());
+                draft.kids.insert(new.kid(), app);
+                draft.directory_version += 1;
+                if first {
+                    draft.apps_version += 1;
+                    draft.reachable_since.insert(app, draft.apps_version);
+                }
                 new
             }
         };

@@ -40,6 +40,16 @@ pub struct HeldRecord {
     pub seq: u64,
 }
 
+/// An invite code the switch holds (Switch spec 7).
+#[derive(Clone, Debug)]
+pub(crate) struct Invite {
+    pub(crate) max_uses: u64,
+    pub(crate) uses: u64,
+    pub(crate) writer: [u8; 16],
+    pub(crate) expires_at: u64,
+    pub(crate) context: Value,
+}
+
 /// One claim entry as `GET /claims` returns it.
 #[derive(Clone, Debug)]
 pub(crate) struct HeldEntry {
@@ -55,11 +65,15 @@ pub(crate) struct Shared {
     pub(crate) claims: BTreeMap<[u8; 32], Claim>,
     entries: BTreeMap<[u8; 32], Vec<HeldEntry>>,
     pub(crate) connect: Vec<([u8; 32], u64)>,
-    /// By code hash: `max_uses`, uses, and the writer.
-    invites: BTreeMap<[u8; 32], (u64, u64, [u8; 16])>,
+    /// By code hash.
+    pub(crate) invites: BTreeMap<[u8; 32], Invite>,
     contacts: BTreeSet<[u8; 32]>,
     /// By Pubky ID: the writer and the time of the entry.
     conversations: BTreeMap<[u8; 32], ([u8; 16], u64)>,
+    /// Conversation entries the service wrote for senders an invite code admitted, by Pubky
+    /// ID: the code's hash and the time of the entry (Switch spec 7, Switch wire 6.5
+    /// `conversation.add`).
+    pub(crate) service_conversations: BTreeMap<[u8; 32], ([u8; 32], u64)>,
     deny: BTreeSet<[u8; 32]>,
     /// Answer the next record read without its proof, as after a recovery upload.
     pub(crate) hide_proofs: bool,
@@ -74,7 +88,16 @@ pub(crate) struct Shared {
 impl Shared {
     /// Hold an invite code as if `writer` had registered it, for a faulty service's export.
     pub(crate) fn plant_invite(&mut self, code_hash: [u8; 32], max_uses: u64, writer: [u8; 16]) {
-        self.invites.insert(code_hash, (max_uses, 0, writer));
+        self.invites.insert(
+            code_hash,
+            Invite {
+                max_uses,
+                uses: 0,
+                writer,
+                expires_at: u64::MAX,
+                context: Value::Null,
+            },
+        );
     }
 }
 
@@ -272,7 +295,13 @@ impl Shared {
         )?;
         self.invites.insert(
             put.code_hash,
-            (put.max_uses, 0, cx.writer.unwrap_or_default()),
+            Invite {
+                max_uses: put.max_uses,
+                uses: 0,
+                writer: cx.writer.unwrap_or_default(),
+                expires_at: put.expires_at,
+                context: put.context.clone(),
+            },
         );
         Ok(ProofState::InviteCodePut {
             max_uses: put.max_uses,
@@ -319,11 +348,14 @@ impl Shared {
         }
     }
 
-    /// `allow.delete` (Switch wire 6.2).
+    /// `allow.delete` (Switch wire 6.2); a conversation entry goes whoever wrote it.
     pub(super) fn allow_delete(&mut self, pubky: &[u8; 32], kind: AllowKind) -> ProofState {
         match kind {
             AllowKind::Contact => self.contacts.remove(pubky),
-            AllowKind::Conversation => self.conversations.remove(pubky).is_some(),
+            AllowKind::Conversation => {
+                let service = self.service_conversations.remove(pubky).is_some();
+                self.conversations.remove(pubky).is_some() || service
+            }
         };
         ProofState::Allow {
             kind,
@@ -353,7 +385,10 @@ impl Shared {
     pub(super) fn allowed(&self, pubky: &[u8; 32], kind: AllowKind) -> bool {
         match kind {
             AllowKind::Contact => self.contacts.contains(pubky),
-            AllowKind::Conversation => self.conversations.contains_key(pubky),
+            AllowKind::Conversation => {
+                self.conversations.contains_key(pubky)
+                    || self.service_conversations.contains_key(pubky)
+            }
         }
     }
 
@@ -397,8 +432,14 @@ impl ScriptedSwitch {
 }
 
 impl Inner {
-    /// The reads of the shared state; `None` for any other route.
-    pub(super) fn route_shared(&mut self, request: &Request, rest: &str) -> Option<Answer> {
+    /// The reads of the shared state, for `caller` (`None` for the signer); `None` for any
+    /// other route.
+    pub(super) fn route_shared(
+        &mut self,
+        request: &Request,
+        caller: Option<[u8; 16]>,
+        rest: &str,
+    ) -> Option<Answer> {
         let (route, query) = rest.split_once('?').unwrap_or((rest, ""));
         Some(match (request.method.as_str(), route) {
             // A scripted answer, for a faulty service, takes precedence.
@@ -432,11 +473,20 @@ impl Inner {
                         Some(("collection", value)) => unb64_array::<32>(value).ok(),
                         _ => None,
                     })?;
+                // The records the caller may read: its certificate holds the read scope, a
+                // name covering its sub-scopes (Switch wire 7.4.9).
+                let cert = caller
+                    .and_then(|app| self.apps.get(&app))
+                    .and_then(|app| app.cert.clone());
                 let views: Vec<Value> = self
                     .shared
                     .records
                     .values()
                     .filter(|held| held.state.collection == collection && !held.state.deleted)
+                    .filter(|held| {
+                        cert.as_ref()
+                            .is_none_or(|cert| cert.holds_scope(&held.state.policy.read_scope))
+                    })
                     .map(|held| record_view(held, &self.apps, !self.shared.hide_proofs))
                     .collect();
                 self.shared.listings += 1;
@@ -501,14 +551,16 @@ impl Inner {
     }
 
     fn allow_list(&self) -> Answer {
-        let now = rfc3339(self.now());
+        let now = self.now();
         let codes: Vec<Value> = self
             .shared
             .invites
             .iter()
-            .map(|(hash, (max, uses, by))| {
-                json!({ "code_hash": b64(hash), "expires_at": now, "max_uses": max,
-                        "uses": uses, "written_by": zbase32_encode(by) })
+            .filter(|(_, invite)| invite.uses < invite.max_uses && now < invite.expires_at)
+            .map(|(hash, invite)| {
+                json!({ "code_hash": b64(hash), "expires_at": rfc3339(invite.expires_at),
+                        "max_uses": invite.max_uses, "uses": invite.uses,
+                        "written_by": zbase32_encode(&invite.writer) })
             })
             .collect();
         let conversations: Vec<Value> = self
@@ -519,6 +571,17 @@ impl Inner {
                 json!({ "pubky": pubky_id(pubky), "written_by": zbase32_encode(by),
                         "at": rfc3339(*at) })
             })
+            // The entries the service wrote (Switch wire 7.4.8).
+            .chain(
+                self.shared
+                    .service_conversations
+                    .iter()
+                    .filter(|(pubky, _)| !self.shared.conversations.contains_key(*pubky))
+                    .map(|(pubky, (code, at))| {
+                        json!({ "pubky": pubky_id(pubky), "written_by": "service",
+                                "code_hash": b64(code), "at": rfc3339(*at) })
+                    }),
+            )
             .collect();
         (
             200,

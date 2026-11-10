@@ -13,8 +13,15 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
   Examples: the join batch (`join`), a registration (`rk/<n>.pending`), a received message's
   effect (`pending/effect`), a record delivery (`pending/record`).
 - **The cursor moves only with, or after, what it covers** (Switch spec 8.2, 11). The
-  effect's batch carries the cursor move. The processed pair, the protocol's local writes and
-  the cursor are committed together with the answer.
+  effect's batch carries the cursor move, with the record writes and claim entries the
+  protocol added through its receive context. The processed pair, what the batch's
+  operations settle (record writes cached at their proofs' versions, claim proofs kept), the
+  protocol's local writes and the cursor are committed together with the answer. A claim
+  the receive step asks for (`Outcome::Need`) is read and kept (`claim/`, `clent/`) in a
+  commit of its own, which moves no cursor; the step then runs again.
+- **A batch refused with `409 stale_epoch`** is gone from `opq/` with the refusal; the app
+  takes the newer `identity.json` and key bundle, each in its own commit, and the batch
+  sealed again is signed and kept under a new batch ID before it is first sent.
 - **A retired receive key goes only after the cursor's commit** that passes the next key's
   registration (Switch spec 3.6).
 - **Any commit carries everything read before it.** A page's writes go in the next commit
@@ -37,6 +44,8 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
 | `ident/<pubky>/floor` | the highest version and generation seen | |
 | `ident/<pubky>/body/<version>` | the body hash seen at a version, for equivocation | |
 | `ident/<pubky>/equivocated` | the version at which another body was seen | |
+| `ident/<pubky>/sw` | when a counterparty's switch copy was last looked up, and whether the read succeeded | |
+| `ident/<pubky>/reads` | when a counterparty's `identity.json` was last read from its Homeserver, and from its switch | |
 | `rk/<n>` | a held receive key: secret, signed record, registration `seq`, pending batch | yes |
 | `kid/<kid>` | a kid this app or one of its devices made, kept after the key is deleted | |
 | `reg/<n>` | a registration of the own app whose key this device doesn't hold: own, awaiting device sync, or unaccounted after a restore | |
@@ -54,7 +63,7 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
 | `asked/<seq>` | a re-send was handed to the protocol for this item | |
 | `departed/<app_id>` | another own app's departure verified in the chain, and its time | |
 | `join` | the join step: the registration batch while it is owed | |
-| `pending/effect` | a received message's effect batch and its outcome writes | |
+| `pending/effect` | a received message's effect batch and its outcome writes, with the deadlines of the claims it writes | |
 | `pending/record` | an `app.put` batch | |
 | `alarm` | the alarm that stopped the app | |
 | `restore` | after a restore: the backup's highest `n`, the key check, the app's own new key, reconcile mode | |
@@ -118,7 +127,7 @@ uploads; `push.rs` holds the push registration. The peek (`peek.rs`) writes noth
 
 | Key | Holds | Sensitive |
 |---|---|---|
-| `out/<msg_id>` | a queued message: its signed plaintext, signed once, the envelope sealed for one try with its `apps_version`, its jobs (conversation entry, delivery, record) and where each stands, a re-send owed, and when it was refused for good; a failed one goes after the sent-message retention | yes |
+| `out/<msg_id>` | a queued message, queued alone or with the answer of the batch that carried it: its signed plaintext, signed once, the envelope sealed for one try with its `apps_version`, its jobs (conversation entry, delivery, record) and where each stands, a re-send owed, and when it was refused for good; a failed one goes after the sent-message retention | yes |
 | `sent/<msg_id>` | a message the recipient's inbox accepted, written in the commit that records the acceptance, kept 30 days from its first acceptance for re-sends | yes |
 | `sentt/<time>/<msg_id>` | the time index for pruning sent messages | |
 | `dir/<pubky>` | a counterparty's directory as signed, the switch, generation and `identity.json` version it was read under, its versions, and whether it is read again before the next send | |
@@ -127,10 +136,10 @@ uploads; `push.rs` holds the push registration. The peek (`peek.rs`) writes noth
 | `peers_doc` | the own `identity.json` the deliveries to recent peers were last judged against, and the counterparties still owed it | |
 | `lc/conv/<pubky>` | a conversation entry in the app's copy of the lists, from its writes, the feed and `GET /allow`; its writes and `GET /allow` also keep `lc/contact/`, `lc/deny/` and `lc/code/` | |
 | `invite/<code_hash>` | the code of an invite code the app registered, to show it again | yes |
-| `opq/<batch_id>` | a batch of operations, signed and kept before it is sent, with what its answer settles; it goes with its answer or a refusal for good, and stays through anything else | |
+| `opq/<batch_id>` | a batch of operations, signed and kept before it is sent, with what its answer settles: the protocol's local writes and the signed messages it puts in the outbox; it goes with its answer or a refusal for good, and stays through anything else | the messages' |
 | `list_due` | a listing of the collections is owed: after joining, a restore or a `missed` item | |
 | `rec/<key>` | the shared record write the app took: the signed operation, certificate and proof, its version and whether a proof gave it, the opened value, and the refused write it follows | yes |
-| `recname/<key>` | the collection name of a record the app creates, until its write is answered | |
+| `recname/<key>` | the collection name of a record the app creates outside the protocol's collections, from a write or an effect, until its write is answered | |
 | `hw/<key>` | the protocol's mark of what the app has seen in a record | the protocol's |
 | `flag/<key>/<generation>/<version>` | a write the app refused, with the app it names and the rule | |
 | `ocert/<app_id>/<cert_hash>` | a certificate of an own app, for checking its writes | |

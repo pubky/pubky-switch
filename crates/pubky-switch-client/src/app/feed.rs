@@ -46,14 +46,18 @@ use pubky_switch_core::receive::{
 use pubky_switch_core::records::{CLOCK_TOLERANCE_MS, IdentityDoc};
 use pubky_switch_core::sig::SignedDoc;
 
+use super::batch::PendingBatch;
+use super::claims::{ClaimRead, ObligationDeadline};
+use super::context::{ClaimFetch, ContextWrites, ReceiveContext};
 use super::error::{Alarm, Refusal, refused_for_good};
 use super::events::{AppEvent, ParkReason};
 use super::identity::{self, DOC_CACHE_MS, Taken};
 use super::protocol::{
-    Effect, LocalWrite, MissedEntries, OpaqueRule, Outcome, ReceivedMessage, ResendNeeded,
-    ResendReason, Rules,
+    Effect, LocalWrite, MAX_CLAIM_READS, MissedEntries, Need, OpaqueRule, Outcome, ReceivedMessage,
+    ResendNeeded, ResendReason, Rules,
 };
 use super::provider::TakeOver;
+use super::records::{Collection, pending_name_key};
 use super::rotation::RegistrationStep;
 use super::state::{CachedDoc, HeldEntry, ParkedEntry, PendingEffect, Processed, Tx, key};
 use super::{App, AppError, PROCESSED_RETENTION_MS};
@@ -82,6 +86,27 @@ enum Step {
     Hold,
     /// Read no further.
     Stop,
+}
+
+/// What an effect's context wrote, for the kept batch and the reads after a conflict.
+#[derive(Clone, Copy)]
+struct Written<'a> {
+    records: &'a [([u8; 32], Collection)],
+    deadlines: &'a [([u8; 32], ObligationDeadline)],
+}
+
+/// How many times an effect is built for one entry in one read: once, and once more after a
+/// `409 conflict`; then the entry waits for the next read.
+const EFFECT_TRIES: usize = 2;
+
+/// What became of the reads a receive step asked for.
+enum Needs {
+    /// Read: the step is called again.
+    Read,
+    /// A read failed for now: the entry waits for the next read of the feed.
+    Wait,
+    /// Nothing new, or past the bound: the entry is stored and passed.
+    TooMany,
 }
 
 /// What became of an effect's batch.
@@ -149,20 +174,23 @@ impl App {
     /// read raised; a failed call or commit, after which nothing past the last commit counts
     /// and the next read resumes from the store.
     pub async fn receive(&mut self, wait: Option<u32>) -> Result<ReceiveReport, AppError> {
-        self.ready_local().await?;
-        let result = self.receive_inner(wait).await;
-        // A move, a provider change, a revocation or an erasure met during the read is
-        // followed (`provider.rs`), and the read goes on once at the service followed.
-        let result = match self.take_over(result).await {
-            TakeOver::Done(result) => result,
-            TakeOver::ReadAgain => self.receive_inner(None).await,
-        };
-        if result.is_err() {
-            self.reload = true;
-        }
-        let mut report = result?;
-        report.events = self.take_events();
-        Ok(report)
+        Box::pin(async move {
+            self.ready_local().await?;
+            let result = self.receive_inner(wait).await;
+            // A move, a provider change, a revocation or an erasure met during the read is
+            // followed (`provider.rs`), and the read goes on once at the service followed.
+            let result = match self.take_over(result).await {
+                TakeOver::Done(result) => result,
+                TakeOver::ReadAgain => self.receive_inner(None).await,
+            };
+            if result.is_err() {
+                self.reload = true;
+            }
+            let mut report = result?;
+            report.events = self.take_events();
+            Ok(report)
+        })
+        .await
     }
 
     async fn receive_inner(&mut self, wait: Option<u32>) -> Result<ReceiveReport, AppError> {
@@ -523,7 +551,9 @@ impl App {
         self.apply(entry, received, parked, read).await
     }
 
-    /// The protocol's check 10, then its effect, at most twice after a conflict.
+    /// The protocol's check 10, then its effect, at most twice after a conflict: the records
+    /// and claims the effect wrote are read again before the second try (Switch spec 8.2,
+    /// 10.3).
     async fn apply(
         &mut self,
         entry: &Entry,
@@ -547,15 +577,61 @@ impl App {
             self.note_processed(entry, &received, &[], parked, read)?;
             return Ok(self.dropped(entry.seq, 10, reason));
         }
-        for _ in 0..2 {
+        let mut tries = 0usize;
+        let mut keys_fetched = false;
+        // The claims read from the switch at the step's request, for this entry.
+        let mut fetched: Vec<([u8; 32], ClaimFetch)> = Vec::new();
+        loop {
             let protocol = Arc::clone(&self.protocol);
-            let effect = match protocol.receive(&message) {
+            let store = Arc::clone(self.env.store.store());
+            let may_attempt = self.may_attempt(false).is_ok();
+            let (outcome, writes) = {
+                let mut cx = ReceiveContext::new(
+                    &self.state,
+                    store.as_ref(),
+                    &self.ns,
+                    may_attempt,
+                    &fetched,
+                );
+                let outcome = protocol.receive_with(&message, &mut cx);
+                (outcome, cx.into_writes())
+            };
+            let mut effect = match outcome {
                 Outcome::Drop { reason } => {
                     self.note_processed(entry, &received, &[], parked, read)?;
                     return Ok(self.dropped(entry.seq, 10, reason));
                 }
+                Outcome::Need(needs) => match self.read_needs(&needs, &mut fetched).await? {
+                    Needs::Read => continue,
+                    Needs::Wait => return Ok(Step::Hold),
+                    Needs::TooMany => {
+                        self.park(entry, &received.plaintext, ParkReason::TooManyReads, read)?;
+                        return Ok(Step::Pass);
+                    }
+                },
                 Outcome::Apply(effect) => effect,
             };
+            if writes.not_now.is_some() {
+                // A write the effect needs can't be built yet, for want of a scope key: the
+                // key bundle is fetched and the effect built again once; without the key
+                // still, the entry waits (Switch spec 3.5).
+                if keys_fetched {
+                    return Ok(Step::Hold);
+                }
+                keys_fetched = true;
+                self.fetch_key_bundle().await?;
+                continue;
+            }
+            let ContextWrites {
+                ops,
+                local,
+                records,
+                claims,
+                deadlines,
+                not_now: _,
+            } = writes;
+            effect.ops = ops.into_iter().chain(effect.ops).collect();
+            effect.local = local.into_iter().chain(effect.local).collect();
             if effect.ops.len() >= MAX_BATCH_ENTRIES {
                 // Switch wire 6.4: at most 7 operations beside the cursor move. Stored and
                 // passed, so the feed goes on (Switch spec 8.2).
@@ -572,8 +648,12 @@ impl App {
                 self.received_event(entry, &received);
                 return Ok(Step::Pass);
             }
+            let written = Written {
+                records: &records,
+                deadlines: &deadlines,
+            };
             match self
-                .send_effect(entry, &received, effect, parked, read)
+                .send_effect(entry, &received, effect, written, parked, read)
                 .await?
             {
                 Sent::Applied => {
@@ -584,7 +664,18 @@ impl App {
                     self.received_event(entry, &received);
                     return Ok(Step::Pass);
                 }
-                Sent::Conflict(current) => message.conflict = Some(current),
+                Sent::Conflict(current) => {
+                    tries = tries.saturating_add(1);
+                    if tries >= EFFECT_TRIES {
+                        return Ok(Step::Hold);
+                    }
+                    message.conflict = Some(current);
+                    for (key, read) in self.read_written_again(&records, &claims).await? {
+                        if let Some((_, fetch)) = fetched.iter_mut().find(|(k, _)| *k == key) {
+                            *fetch = read.map_or(ClaimFetch::Absent, ClaimFetch::Read);
+                        }
+                    }
+                }
                 Sent::StaleEpoch => {
                     self.fetch_key_bundle().await?;
                     return Ok(Step::Hold);
@@ -599,7 +690,65 @@ impl App {
                 }
             }
         }
-        Ok(Step::Hold)
+    }
+
+    /// After `409 conflict` on an effect: the records and claims it wrote, read again from
+    /// the switch, so the next effect builds on what it holds (Switch spec 10.3). Returns
+    /// the claims as read.
+    async fn read_written_again(
+        &mut self,
+        records: &[([u8; 32], Collection)],
+        claims: &[[u8; 32]],
+    ) -> Result<Vec<([u8; 32], Option<ClaimRead>)>, AppError> {
+        for (key, collection) in records {
+            self.fetch_record(key, collection).await?;
+        }
+        let mut read = Vec::new();
+        for claim_key in claims {
+            read.push((*claim_key, self.read_claim_inner(claim_key).await?));
+        }
+        Ok(read)
+    }
+
+    /// The reads a receive step asked for ([`Outcome::Need`]), added to `fetched`: each
+    /// claim read and checked as [`App::read_claim`] reads it, its view kept in that call's
+    /// own commit, which records no cursor move. At most [`MAX_CLAIM_READS`] claims for one
+    /// entry, and each once.
+    async fn read_needs(
+        &mut self,
+        needs: &[Need],
+        fetched: &mut Vec<([u8; 32], ClaimFetch)>,
+    ) -> Result<Needs, AppError> {
+        let mut new: Vec<[u8; 32]> = Vec::new();
+        for need in needs {
+            match need {
+                Need::Claim(key) => {
+                    if !fetched.iter().any(|(k, _)| k == key) && !new.contains(key) {
+                        new.push(*key);
+                    }
+                }
+            }
+        }
+        if new.is_empty() || fetched.len().saturating_add(new.len()) > MAX_CLAIM_READS {
+            return Ok(Needs::TooMany);
+        }
+        for claim_key in new {
+            let fetch = match self.read_claim_inner(&claim_key).await {
+                Ok(Some(read)) => ClaimFetch::Read(read),
+                Ok(None) => ClaimFetch::Absent,
+                Err(error) => match &error {
+                    AppError::Switch(_) => match refused_for_good(&error) {
+                        Some(code) => ClaimFetch::Refused(code.as_str().to_owned()),
+                        // `429`, `503`, an answer that doesn't verify: read again later.
+                        None => return Ok(Needs::Wait),
+                    },
+                    AppError::Transport(_) | AppError::InvalidData(_) => return Ok(Needs::Wait),
+                    _ => return Err(error),
+                },
+            };
+            fetched.push((claim_key, fetch));
+        }
+        Ok(Needs::Read)
     }
 
     fn received_event(&mut self, entry: &Entry, received: &Received) {
@@ -647,6 +796,7 @@ impl App {
         entry: &Entry,
         received: &Received,
         effect: Effect,
+        written: Written<'_>,
         parked: bool,
         read: &mut Read,
     ) -> Result<Sent, AppError> {
@@ -671,7 +821,19 @@ impl App {
             cursor_to,
             past_held,
             parked,
+            deadlines: written
+                .deadlines
+                .iter()
+                .map(|(claim_key, deadline)| (pubky_switch_core::enc::b64(claim_key), *deadline))
+                .collect(),
         };
+        // The collection name of a record the effect creates outside the protocol's
+        // collections, until its write is answered: the switch knows only its ID.
+        for (key, collection) in written.records {
+            if !self.collection_of_name(collection) && self.held_record(key).await?.is_none() {
+                read.tx.put(&pending_name_key(key), &collection.name)?;
+            }
+        }
         // Everything read so far, with the kept batch, before it is sent.
         read.tx.put(key::PENDING_EFFECT, &pending)?;
         read.tx.put(key::CURSOR, &self.state.cursor)?;
@@ -681,17 +843,23 @@ impl App {
         self.run_effect(pending, &batch).await
     }
 
-    /// Send a kept effect and commit its outcome.
+    /// Send a kept effect and commit its outcome: what its operations settle (a record
+    /// write cached at the version its proof gives, a claim entry's proof and view kept),
+    /// the processed pair, the protocol's local writes and the cursor. An own `attempt` in
+    /// it then gets the checks of its proof (Switch wire 6.5 "Binding").
     async fn run_effect(
         &mut self,
         pending: PendingEffect,
         batch: &Batch,
     ) -> Result<Sent, AppError> {
         let result = self.submit(batch).await;
-        let sent = match result {
-            Ok(_) => Sent::Applied,
+        let submitted = match result {
+            Ok(submitted) => submitted,
             // A quota is stored and passed, and applied once there is room (Switch spec 8.2).
-            Err(error) if error.code() == Some(ErrorCode::QuotaExceeded) => Sent::Quota,
+            Err(error) if error.code() == Some(ErrorCode::QuotaExceeded) => {
+                self.drop_pending_effect().await?;
+                return Ok(Sent::Quota);
+            }
             Err(error) => {
                 let Some(code) = refused_for_good(&error) else {
                     // It may pass unchanged later (`429`, `503`, the network, an answer that
@@ -699,7 +867,7 @@ impl App {
                     // read (Switch wire 2.1).
                     return Err(error);
                 };
-                match (code, error) {
+                let sent = match (code, error) {
                     (
                         ErrorCode::Conflict,
                         AppError::Switch(ClientError::Switch { current, .. }),
@@ -718,15 +886,21 @@ impl App {
                     }
                     // This effect is refused for good, the app's other writes aren't.
                     _ => Sent::Refused,
-                }
+                };
+                self.drop_pending_effect().await?;
+                return Ok(sent);
             }
         };
-        if !matches!(sent, Sent::Applied) {
-            self.drop_pending_effect().await?;
-            return Ok(sent);
-        }
         let now = self.now();
         let mut tx = self.tx()?;
+        let settles = PendingBatch {
+            deadlines: pending.deadlines.clone(),
+            ..PendingBatch::default()
+        };
+        for (index, op) in batch.ops().iter().enumerate() {
+            let proof = submitted.proofs.get(index);
+            self.settle_op(op, proof, &settles, &mut tx).await?;
+        }
         processed_writes(&mut tx, &pending.sender, &pending.msg_id, pending.hash, now)?;
         tx.local(&pending.local)?;
         if pending.parked {
@@ -746,6 +920,7 @@ impl App {
         }
         self.state.pending_effect = None;
         self.commit(tx).await?;
+        self.check_attempts_of(batch, &submitted).await?;
         Ok(Sent::Applied)
     }
 
@@ -842,10 +1017,11 @@ impl App {
             let Some(stored) = self.state.parked.get(&seq).cloned() else {
                 continue;
             };
-            // A refusal for good, or an effect over one batch, isn't tried again.
+            // A refusal for good, an effect over one batch, or a step that asked for more
+            // reads than an entry gets, isn't tried again.
             if matches!(
                 stored.reason,
-                ParkReason::Refused | ParkReason::TooManyOperations
+                ParkReason::Refused | ParkReason::TooManyOperations | ParkReason::TooManyReads
             ) {
                 continue;
             }
@@ -1249,9 +1425,12 @@ impl App {
     ///
     /// A failed call or commit.
     pub async fn flush_cursor(&mut self) -> Result<(), AppError> {
-        self.ready_local().await?;
-        self.refuse_when_stopped()?;
-        self.send_cursor().await
+        Box::pin(async move {
+            self.ready_local().await?;
+            self.refuse_when_stopped()?;
+            self.send_cursor().await
+        })
+        .await
     }
 
     async fn send_cursor(&mut self) -> Result<(), AppError> {

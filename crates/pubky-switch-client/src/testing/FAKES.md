@@ -8,8 +8,9 @@ service.
 ## Batches
 
 - **Request authentication** (Switch wire 7.1, 7.2): no request signature, timestamp or
-  `Switch-Identity` check; the caller is the `Switch-App` header as sent. Each operation's
-  signature is verified, and an own app must be current with an unexpired certificate.
+  `Switch-Identity` check; the caller is the `Switch-App` header as sent, and an app of
+  another identity is the `Switch-Identity` header as sent. Each operation's signature is
+  verified, and an own app must be current with an unexpired certificate.
 - **Rates** (Switch wire 6.4 step 7, 9.4): no operation, control, per-caller or
   failed-authentication limits; never `429 rate_limited`.
 - **Quotas and per-kind limits** (Switch wire 9.3): only the claim limits, at the core's
@@ -31,15 +32,36 @@ service.
   checkpoints and dropped stubs exist only when a test scripts them; claims are deleted only
   when `GET /claims` finds them deletable; batch records are never dropped, and their proofs
   go only when a retry finds them past `batch_proofs_ms`.
-- **Invite codes** are never used and never expire; `expires_at` shows the read time.
-- **Lists**: `flagged` is always empty; connect requests are never full.
+- **Invite codes**: a revoked app's codes aren't withdrawn (Switch wire 7.4.3 "After a
+  revocation"); a code planted for a faulty export never expires.
+- **Lists**: `flagged` is always empty; connect requests are never full. Conversation
+  entries carry no `last_used`, and those the service wrote carry no `context`.
 - **Records**: `divergent` is always `false`.
-- **Directory**: `directory_version` is the last `seq`, `apps_version` always 1.
+- **Directory** (Switch wire 7.4.10): an app is reachable from its first receive key until
+  it is revoked or leaves; one that stops being current otherwise, with an expired or
+  closed certificate, stays reachable, and `apps_version` doesn't move for it.
 
 ## Other calls
 
-- **Inbox appends** (Switch wire 7.4.3): `send` and `send_envelope` add entries without
-  admission, quotas, size buckets or `409 stale_key`; entry IDs are made up from the `seq`.
+- **Injected entries**: `send` and `send_envelope` add entries without admission, quotas,
+  size buckets or `409 stale_key`; entry IDs are made up from the `seq`.
+- **`POST /inbox`** (Switch wire 7.4.3), in `switch/inbox.rs`, from apps of other
+  identities and own apps:
+  - the sender's `Switch-Cert` is verified against its identity, but its expiry and the
+    sender identity's service time aren't checked (Switch wire 7.2 checks 3 and 4);
+  - an app whose renewal has closed gets `409 identity_needed`, never `403 not_current`;
+    an app the peer copy lists as removed isn't answered like a stranger before
+    admission, only refused with `409 identity_needed`;
+  - no size check (step 3), rate limits (step 4) or quotas and sender shares (step 6);
+    only the envelope's header is parsed;
+  - an own app's append uses its record's certificate, and isn't checked for being
+    current;
+  - retries by content are answered for as long as the switch lives, and `import_into`
+    doesn't carry the stored answers, so a retry after a move appends again.
+- **`PUT /peers`** (Switch wire 7.4.5) keeps every copy it takes: no peer limit, but for
+  `forget_peer_copy`.
+- **`open_admission`** (`admit_everyone`) admits every sender the deny list doesn't hold, a
+  test switch only.
 - **App currency outside batches**: other routes check only that the app hasn't departed.
 - **`PUT /identity`** (Switch wire 7.4.2): `deliver_identity` takes any document, without
   the version and `prev` checks.

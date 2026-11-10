@@ -132,20 +132,23 @@ impl App {
         relay_url: &str,
         device_token: &str,
     ) -> Result<PushRegistration, AppError> {
-        self.ready_local().await?;
-        self.refuse_when_stopped()?;
-        let service = self.state.meta.service_key;
-        let held = self.push_record().await?;
-        let replaces = held
-            .filter(|r| r.service_key == service && r.relay_url != relay_url)
-            .and_then(|r| r.push_key);
-        let result = self
-            .push_flow(relay, relay_url, device_token, replaces)
-            .await;
-        if result.is_err() {
-            self.reload = true;
-        }
-        result
+        Box::pin(async move {
+            self.ready_local().await?;
+            self.refuse_when_stopped()?;
+            let service = self.state.meta.service_key;
+            let held = self.push_record().await?;
+            let replaces = held
+                .filter(|r| r.service_key == service && r.relay_url != relay_url)
+                .and_then(|r| r.push_key);
+            let result = self
+                .push_flow(relay, relay_url, device_token, replaces)
+                .await;
+            if result.is_err() {
+                self.reload = true;
+            }
+            result
+        })
+        .await
     }
 
     /// Rotate the push key: a start naming the current one, then the relay and the handles
@@ -159,27 +162,30 @@ impl App {
         &mut self,
         relay: &dyn PushRelay,
     ) -> Result<PushRegistration, AppError> {
-        self.ready_local().await?;
-        self.refuse_when_stopped()?;
-        let service = self.state.meta.service_key;
-        let Some(held) = self
-            .push_record()
-            .await?
-            .filter(|r| r.service_key == service)
-        else {
-            return Err(Refusal::NotNow("no push registration at this service".into()).into());
-        };
-        // A rotation in flight goes on naming the key it replaces.
-        let Some(replaces) = held.replacing.or(held.push_key) else {
-            return Err(Refusal::NotNow("no push key to replace".into()).into());
-        };
-        let result = self
-            .push_flow(relay, &held.relay_url, &held.device_token, Some(replaces))
-            .await;
-        if result.is_err() {
-            self.reload = true;
-        }
-        result
+        Box::pin(async move {
+            self.ready_local().await?;
+            self.refuse_when_stopped()?;
+            let service = self.state.meta.service_key;
+            let Some(held) = self
+                .push_record()
+                .await?
+                .filter(|r| r.service_key == service)
+            else {
+                return Err(Refusal::NotNow("no push registration at this service".into()).into());
+            };
+            // A rotation in flight goes on naming the key it replaces.
+            let Some(replaces) = held.replacing.or(held.push_key) else {
+                return Err(Refusal::NotNow("no push key to replace".into()).into());
+            };
+            let result = self
+                .push_flow(relay, &held.relay_url, &held.device_token, Some(replaces))
+                .await;
+            if result.is_err() {
+                self.reload = true;
+            }
+            result
+        })
+        .await
     }
 
     /// Register again with the setting the app keeps when its registration isn't set at
@@ -193,25 +199,28 @@ impl App {
         &mut self,
         relay: &dyn PushRelay,
     ) -> Result<Option<PushRegistration>, AppError> {
-        self.ready_local().await?;
-        self.refuse_when_stopped()?;
-        let Some(held) = self.push_record().await? else {
-            return Ok(None);
-        };
-        if held.set && held.service_key == self.state.meta.service_key {
-            return self.push_registration().await;
-        }
-        let replaces = held
-            .replacing
-            .filter(|_| held.service_key == self.state.meta.service_key);
-        let result = self
-            .push_flow(relay, &held.relay_url, &held.device_token, replaces)
-            .await
-            .map(Some);
-        if result.is_err() {
-            self.reload = true;
-        }
-        result
+        Box::pin(async move {
+            self.ready_local().await?;
+            self.refuse_when_stopped()?;
+            let Some(held) = self.push_record().await? else {
+                return Ok(None);
+            };
+            if held.set && held.service_key == self.state.meta.service_key {
+                return self.push_registration().await;
+            }
+            let replaces = held
+                .replacing
+                .filter(|_| held.service_key == self.state.meta.service_key);
+            let result = self
+                .push_flow(relay, &held.relay_url, &held.device_token, replaces)
+                .await
+                .map(Some);
+            if result.is_err() {
+                self.reload = true;
+            }
+            result
+        })
+        .await
     }
 
     /// The app's push registration at its current service, once set.

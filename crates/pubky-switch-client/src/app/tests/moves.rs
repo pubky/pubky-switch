@@ -614,7 +614,7 @@ async fn test_move_registers_again_a_key_the_next_service_rolled_back() {
         let held = inner.apps.get_mut(&me).unwrap();
         held.receive_key = first;
         held.receive_n = Some(0);
-        inner.kids.retain(|kid| Some(*kid) == first_kid);
+        inner.kids.retain(|kid, _| Some(*kid) == first_kid);
     }
     app.receive(None).await.unwrap();
     publish_at(

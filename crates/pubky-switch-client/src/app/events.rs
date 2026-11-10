@@ -364,4 +364,8 @@ pub enum ParkReason {
     /// Its effect has more operations than one batch takes with the cursor move (Switch
     /// wire 6.4): it is kept, not applied, and not tried again.
     TooManyOperations,
+    /// Its receive step asked for more reads from the switch than one entry gets
+    /// ([`super::MAX_CLAIM_READS`]), or again for what it was given: it is kept, not
+    /// applied, and not tried again.
+    TooManyReads,
 }

@@ -134,6 +134,70 @@ impl OutgoingMessage {
     }
 }
 
+/// A message signed once and not yet queued ([`App::sign_message`]): its signed plaintext
+/// and hash are known before anything is kept, so a protocol builds from them the shared
+/// record write and claim entries that go with it, in the batch that queues it
+/// ([`super::OpBatch::queue`]), or queues it alone ([`App::queue_signed`]). Its `Debug`
+/// shows only the kind and `msg_id`.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SignedMessage {
+    to: [u8; 32],
+    kind: String,
+    msg_id: String,
+    plaintext: MessagePlaintext,
+    notify: bool,
+    invite_code: Option<String>,
+    conversation: bool,
+    record: Option<RecordJob>,
+}
+
+impl std::fmt::Debug for SignedMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SignedMessage({}, {})", self.kind, self.msg_id)
+    }
+}
+
+impl SignedMessage {
+    /// The recipient identity.
+    pub fn to(&self) -> [u8; 32] {
+        self.to
+    }
+
+    /// The kind.
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
+
+    /// The message ID.
+    pub fn msg_id(&self) -> &str {
+        &self.msg_id
+    }
+
+    /// The signed plaintext, as it is sealed and as a record stores it (Switch spec 8.2).
+    pub fn plaintext(&self) -> &MessagePlaintext {
+        &self.plaintext
+    }
+
+    /// The message hash (Switch wire 4.5), which a message referring to it names.
+    pub fn hash(&self) -> [u8; 32] {
+        self.plaintext.hash()
+    }
+
+    /// The shared record write that goes with it once the recipient's inbox accepts it,
+    /// built through [`super::Protocol::sent_record`], if any.
+    pub fn record(&self) -> Option<&RecordJob> {
+        self.record.as_ref()
+    }
+
+    /// The same message with the record job `job`, whose target may derive from the
+    /// message's own hash: the plaintext isn't signed again.
+    #[must_use]
+    pub fn with_record(mut self, job: RecordJob) -> Self {
+        self.record = Some(job);
+        self
+    }
+}
+
 /// A message the app sent, kept for re-sends. Its `Debug` shows no content.
 #[derive(Clone, PartialEq, Eq)]
 pub struct SentMessage {
@@ -234,7 +298,7 @@ impl KeptJob {
 /// `out/<msg_id>`: a queued message and its jobs. Sensitive: it holds the message and any
 /// invite code.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct OutboxItem {
+pub(crate) struct OutboxItem {
     #[serde(with = "serde_b64")]
     to: [u8; 32],
     kind: String,
@@ -269,6 +333,10 @@ impl std::fmt::Debug for OutboxItem {
 }
 
 impl OutboxItem {
+    pub(crate) fn msg_id(&self) -> &str {
+        &self.msg_id
+    }
+
     fn complete(&self) -> bool {
         self.accepted_at_ms.is_some() && !self.resend && (self.record.is_none() || self.record_done)
     }
@@ -304,6 +372,14 @@ impl std::fmt::Debug for SentStored {
     }
 }
 
+/// Put a queued message in the outbox, in `tx`.
+pub(crate) fn put_outbox_item(
+    tx: &mut super::state::Tx,
+    item: &OutboxItem,
+) -> Result<(), AppError> {
+    tx.put(&out_key(&item.msg_id), item)
+}
+
 /// What one delivery try came to.
 enum Tried {
     Accepted(AppendAnswer),
@@ -328,13 +404,16 @@ impl App {
     /// the core refuses (its kind, its size); a store failure. Failures to deliver aren't
     /// errors: the message stays queued, or is marked failed for good.
     pub async fn send(&mut self, message: OutgoingMessage) -> Result<(String, Delivery), AppError> {
-        let msg_id = self.queue(message).await?;
-        self.flush_item(&msg_id).await?;
-        let delivery = self
-            .delivery(&msg_id)
-            .await?
-            .ok_or_else(|| AppError::InvalidData("the message left the outbox".into()))?;
-        Ok((msg_id, delivery))
+        Box::pin(async move {
+            let msg_id = self.queue(message).await?;
+            self.flush_item(&msg_id).await?;
+            let delivery = self
+                .delivery(&msg_id)
+                .await?
+                .ok_or_else(|| AppError::InvalidData("the message left the outbox".into()))?;
+            Ok((msg_id, delivery))
+        })
+        .await
     }
 
     /// Sign `message` once and record it in the outbox, sending nothing. Returns its
@@ -344,7 +423,23 @@ impl App {
     ///
     /// As [`App::send`].
     pub async fn queue(&mut self, message: OutgoingMessage) -> Result<String, AppError> {
-        self.ready_local().await?;
+        Box::pin(async move {
+            self.ready_local().await?;
+            let signed = self.sign_message(message)?;
+            self.queue_signed(signed).await
+        })
+        .await
+    }
+
+    /// Sign `message` once, keeping nothing and sending nothing: its plaintext and hash are
+    /// known before it is queued, with [`App::queue_signed`] or in a batch
+    /// ([`super::OpBatch::queue`]). A signed message that is never queued was never sent.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::Stopped`] or [`Refusal::Left`]; [`AppError::InvalidData`] for a message
+    /// the core refuses (its kind, its size) or an invite code that isn't one.
+    pub fn sign_message(&self, message: OutgoingMessage) -> Result<SignedMessage, AppError> {
         self.refuse_when_stopped()?;
         if let Some(code) = &message.invite_code {
             pubky_switch_core::ident::invite_code_hash(code)?;
@@ -362,14 +457,61 @@ impl App {
             message.body,
         )?;
         let plaintext = built.sign(&self.state.keys)?;
-        let item = OutboxItem {
+        Ok(SignedMessage {
             to: message.to,
-            kind: message.kind.clone(),
-            msg_id: built.msg_id.clone(),
-            plaintext: plaintext.encode(),
+            conversation: message.to != me && self.protocol.adds_conversation(&message.kind),
+            kind: message.kind,
+            msg_id: built.msg_id,
+            plaintext,
             notify: message.notify,
             invite_code: message.invite_code,
-            conversation: message.to != me && self.protocol.adds_conversation(&message.kind),
+            record: message.record,
+        })
+    }
+
+    /// Record a message signed by [`App::sign_message`] in the outbox, with its jobs,
+    /// sending nothing. Returns its `msg_id`. A message already in the outbox, or sent, is
+    /// left as it is.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::Stopped`] or [`Refusal::Left`]; [`Refusal::Usage`] for a message another
+    /// app signed; a store failure.
+    pub async fn queue_signed(&mut self, message: SignedMessage) -> Result<String, AppError> {
+        Box::pin(async move {
+            self.ready_local().await?;
+            self.refuse_when_stopped()?;
+            let item = self.outbox_item(&message)?;
+            if self.knows_message(&item.msg_id).await? {
+                return Ok(item.msg_id);
+            }
+            let mut tx = self.tx()?;
+            put_outbox_item(&mut tx, &item)?;
+            self.commit(tx).await?;
+            Ok(item.msg_id)
+        })
+        .await
+    }
+
+    /// Whether the outbox holds the message `msg_id`, or the app keeps it as sent.
+    pub(crate) async fn knows_message(&self, msg_id: &str) -> Result<bool, AppError> {
+        let reader = self.reader();
+        Ok(reader.exists(&out_key(msg_id)).await? || reader.exists(&sent_key(msg_id)).await?)
+    }
+
+    /// The outbox item of a signed message, its jobs owed.
+    pub(crate) fn outbox_item(&self, message: &SignedMessage) -> Result<OutboxItem, AppError> {
+        if message.plaintext.sender_app_id() != self.state.meta.app_id {
+            return Err(Refusal::Usage("a message this app didn't sign".into()).into());
+        }
+        Ok(OutboxItem {
+            to: message.to,
+            kind: message.kind.clone(),
+            msg_id: message.msg_id.clone(),
+            plaintext: message.plaintext.encode(),
+            notify: message.notify,
+            invite_code: message.invite_code.clone(),
+            conversation: message.conversation,
             sealed: None,
             record: message.record.as_ref().map(KeptJob::of),
             record_done: false,
@@ -380,11 +522,27 @@ impl App {
             queued_ms: self.now(),
             failed_ms: None,
             resend: false,
-        };
-        let mut tx = self.tx()?;
-        tx.put(&out_key(&item.msg_id), &item)?;
-        self.commit(tx).await?;
-        Ok(built.msg_id)
+        })
+    }
+
+    /// Try the jobs of the queued message `msg_id` once, as [`App::flush_outbox`] does for
+    /// every message, and return where it is; `None` for one the app doesn't keep.
+    ///
+    /// # Errors
+    ///
+    /// As [`App::flush_outbox`].
+    pub async fn flush_message(&mut self, msg_id: &str) -> Result<Option<Delivery>, AppError> {
+        Box::pin(async move {
+            self.ready_local().await?;
+            self.refuse_when_stopped()?;
+            match self.resume_batches().await {
+                Err(error) if is_local(&error) => return Err(error),
+                _ => {}
+            }
+            self.flush_item(msg_id).await?;
+            self.delivery(msg_id).await
+        })
+        .await
     }
 
     /// Send again a message sent in the last 30 days: the same signed plaintext, and so the
@@ -395,19 +553,22 @@ impl App {
     ///
     /// [`Refusal::Usage`] for a message the app doesn't keep; as [`App::send`].
     pub async fn resend(&mut self, msg_id: &str) -> Result<Delivery, AppError> {
-        self.ready_local().await?;
-        self.refuse_when_stopped()?;
-        if !self.ask_resend_of_queued(msg_id).await? {
-            let sent: SentStored =
-                self.reader().get(&sent_key(msg_id)).await?.ok_or_else(|| {
-                    AppError::Refused(Refusal::Usage("no sent message with this msg_id".into()))
-                })?;
-            self.queue_resend(&sent).await?;
-        }
-        self.flush_item(msg_id).await?;
-        self.delivery(msg_id)
-            .await?
-            .ok_or_else(|| AppError::InvalidData("the message left the outbox".into()))
+        Box::pin(async move {
+            self.ready_local().await?;
+            self.refuse_when_stopped()?;
+            if !self.ask_resend_of_queued(msg_id).await? {
+                let sent: SentStored =
+                    self.reader().get(&sent_key(msg_id)).await?.ok_or_else(|| {
+                        AppError::Refused(Refusal::Usage("no sent message with this msg_id".into()))
+                    })?;
+                self.queue_resend(&sent).await?;
+            }
+            self.flush_item(msg_id).await?;
+            self.delivery(msg_id)
+                .await?
+                .ok_or_else(|| AppError::InvalidData("the message left the outbox".into()))
+        })
+        .await
     }
 
     /// A message still in the outbox: one already accepted, whose other jobs are owed, is
@@ -558,43 +719,46 @@ impl App {
     ///
     /// A store failure, or an alarm. A message that can't be delivered now stays queued.
     pub async fn flush_outbox(&mut self) -> Result<OutboxReport, AppError> {
-        self.ready_local().await?;
-        self.refuse_when_stopped()?;
-        // A kept batch that can't be sent now holds up no delivery: it is sent again by the
-        // next call that writes.
-        match self.resume_batches().await {
-            Err(error) if is_local(&error) => return Err(error),
-            _ => {}
-        }
-        self.deliver_to_recent_peers().await?;
-        let mut items = self.reader().scan::<OutboxItem>(OUT_PREFIX).await?;
-        items.sort_by_key(|(_, item)| item.queued_ms);
-        let mut report = OutboxReport::default();
-        let cutoff = self.now().saturating_sub(SENT_RETENTION_MS);
-        for (msg_id, item) in items {
-            if item.failed.is_some() {
-                // Forgotten, plaintext and all, after the retention of sent messages.
-                if item.failed_ms.unwrap_or(item.queued_ms) <= cutoff {
-                    let mut tx = self.tx()?;
-                    tx.delete(&out_key(&msg_id))?;
-                    self.commit(tx).await?;
-                } else {
-                    report.failed.push(msg_id);
-                }
-                continue;
+        Box::pin(async move {
+            self.ready_local().await?;
+            self.refuse_when_stopped()?;
+            // A kept batch that can't be sent now holds up no delivery: it is sent again by the
+            // next call that writes.
+            match self.resume_batches().await {
+                Err(error) if is_local(&error) => return Err(error),
+                _ => {}
             }
-            self.flush_item(&msg_id).await?;
-            match self.delivery(&msg_id).await? {
-                Some(Delivery::Failed { .. }) => report.failed.push(msg_id),
-                Some(Delivery::Queued { .. }) => report.queued.push(msg_id),
-                _ if self.reader().exists(&out_key(&msg_id)).await? => {
-                    report.queued.push(msg_id);
+            self.deliver_to_recent_peers().await?;
+            let mut items = self.reader().scan::<OutboxItem>(OUT_PREFIX).await?;
+            items.sort_by_key(|(_, item)| item.queued_ms);
+            let mut report = OutboxReport::default();
+            let cutoff = self.now().saturating_sub(SENT_RETENTION_MS);
+            for (msg_id, item) in items {
+                if item.failed.is_some() {
+                    // Forgotten, plaintext and all, after the retention of sent messages.
+                    if item.failed_ms.unwrap_or(item.queued_ms) <= cutoff {
+                        let mut tx = self.tx()?;
+                        tx.delete(&out_key(&msg_id))?;
+                        self.commit(tx).await?;
+                    } else {
+                        report.failed.push(msg_id);
+                    }
+                    continue;
                 }
-                _ => report.done.push(msg_id),
+                self.flush_item(&msg_id).await?;
+                match self.delivery(&msg_id).await? {
+                    Some(Delivery::Failed { .. }) => report.failed.push(msg_id),
+                    Some(Delivery::Queued { .. }) => report.queued.push(msg_id),
+                    _ if self.reader().exists(&out_key(&msg_id)).await? => {
+                        report.queued.push(msg_id);
+                    }
+                    _ => report.done.push(msg_id),
+                }
             }
-        }
-        self.prune_sent().await?;
-        Ok(report)
+            self.prune_sent().await?;
+            Ok(report)
+        })
+        .await
     }
 
     /// One try of each job of one message.

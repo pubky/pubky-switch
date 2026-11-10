@@ -130,10 +130,13 @@ impl App {
     ///
     /// [`Refusal::Usage`] without the permission; as [`App::submit_batch`].
     pub async fn add_contact(&mut self, pubky: &[u8; 32]) -> Result<(), AppError> {
-        self.need(Permission::ListsManage)?;
-        self.list_op(OpKind::AllowPut {
-            pubky: *pubky,
-            kind: AllowKind::Contact,
+        Box::pin(async move {
+            self.need(Permission::ListsManage)?;
+            self.list_op(OpKind::AllowPut {
+                pubky: *pubky,
+                kind: AllowKind::Contact,
+            })
+            .await
         })
         .await
     }
@@ -144,10 +147,13 @@ impl App {
     ///
     /// As [`App::add_contact`].
     pub async fn remove_contact(&mut self, pubky: &[u8; 32]) -> Result<(), AppError> {
-        self.need(Permission::ListsManage)?;
-        self.list_op(OpKind::AllowDelete {
-            pubky: *pubky,
-            kind: AllowKind::Contact,
+        Box::pin(async move {
+            self.need(Permission::ListsManage)?;
+            self.list_op(OpKind::AllowDelete {
+                pubky: *pubky,
+                kind: AllowKind::Contact,
+            })
+            .await
         })
         .await
     }
@@ -160,10 +166,13 @@ impl App {
     ///
     /// As [`App::add_contact`], with `conversation.add`.
     pub async fn invite(&mut self, pubky: &[u8; 32]) -> Result<(), AppError> {
-        self.need(Permission::ConversationAdd)?;
-        self.list_op(OpKind::AllowPut {
-            pubky: *pubky,
-            kind: AllowKind::Conversation,
+        Box::pin(async move {
+            self.need(Permission::ConversationAdd)?;
+            self.list_op(OpKind::AllowPut {
+                pubky: *pubky,
+                kind: AllowKind::Conversation,
+            })
+            .await
         })
         .await
     }
@@ -175,10 +184,13 @@ impl App {
     ///
     /// As [`App::add_contact`].
     pub async fn remove_conversation(&mut self, pubky: &[u8; 32]) -> Result<(), AppError> {
-        self.need(Permission::ListsManage)?;
-        self.list_op(OpKind::AllowDelete {
-            pubky: *pubky,
-            kind: AllowKind::Conversation,
+        Box::pin(async move {
+            self.need(Permission::ListsManage)?;
+            self.list_op(OpKind::AllowDelete {
+                pubky: *pubky,
+                kind: AllowKind::Conversation,
+            })
+            .await
         })
         .await
     }
@@ -190,8 +202,11 @@ impl App {
     ///
     /// As [`App::add_contact`].
     pub async fn deny(&mut self, pubky: &[u8; 32]) -> Result<(), AppError> {
-        self.need(Permission::ListsManage)?;
-        self.list_op(OpKind::DenyPut { pubky: *pubky }).await
+        Box::pin(async move {
+            self.need(Permission::ListsManage)?;
+            self.list_op(OpKind::DenyPut { pubky: *pubky }).await
+        })
+        .await
     }
 
     /// Unblock `pubky` (`deny.delete`, `lists.manage`).
@@ -200,8 +215,11 @@ impl App {
     ///
     /// As [`App::add_contact`].
     pub async fn undeny(&mut self, pubky: &[u8; 32]) -> Result<(), AppError> {
-        self.need(Permission::ListsManage)?;
-        self.list_op(OpKind::DenyDelete { pubky: *pubky }).await
+        Box::pin(async move {
+            self.need(Permission::ListsManage)?;
+            self.list_op(OpKind::DenyDelete { pubky: *pubky }).await
+        })
+        .await
     }
 
     async fn list_op(&mut self, kind: OpKind) -> Result<(), AppError> {
@@ -231,30 +249,33 @@ impl App {
     ///
     /// [`Refusal::Usage`] without `lists.read`; a failed call or commit.
     pub async fn allow_list(&mut self) -> Result<AllowList, AppError> {
-        self.ready_local().await?;
-        self.refuse_when_stopped()?;
-        self.need(Permission::ListsRead)?;
-        let result = self.client.allow().await;
-        let list = self.take(result).await?;
-        let me = self.state.meta.app_id;
-        let mut tx = self.tx()?;
-        for prefix in ["lc/contact/", "lc/conv/", "lc/deny/", "lc/code/"] {
-            tx.delete_prefix(prefix)?;
-        }
-        for pubky in &list.contacts {
-            tx.put(&allow_key(AllowKind::Contact, pubky), &())?;
-        }
-        for entry in &list.conversations {
-            tx.put(&allow_key(AllowKind::Conversation, &entry.pubky), &())?;
-        }
-        for pubky in &list.deny {
-            tx.put(&deny_key(pubky), &())?;
-        }
-        for code in list.invite_codes.iter().filter(|c| c.written_by == me) {
-            tx.put(&code_key(&code.code_hash), &())?;
-        }
-        self.commit(tx).await?;
-        Ok(list)
+        Box::pin(async move {
+            self.ready_local().await?;
+            self.refuse_when_stopped()?;
+            self.need(Permission::ListsRead)?;
+            let result = self.client.allow().await;
+            let list = self.take(result).await?;
+            let me = self.state.meta.app_id;
+            let mut tx = self.tx()?;
+            for prefix in ["lc/contact/", "lc/conv/", "lc/deny/", "lc/code/"] {
+                tx.delete_prefix(prefix)?;
+            }
+            for pubky in &list.contacts {
+                tx.put(&allow_key(AllowKind::Contact, pubky), &())?;
+            }
+            for entry in &list.conversations {
+                tx.put(&allow_key(AllowKind::Conversation, &entry.pubky), &())?;
+            }
+            for pubky in &list.deny {
+                tx.put(&deny_key(pubky), &())?;
+            }
+            for code in list.invite_codes.iter().filter(|c| c.written_by == me) {
+                tx.put(&code_key(&code.code_hash), &())?;
+            }
+            self.commit(tx).await?;
+            Ok(list)
+        })
+        .await
     }
 
     /// A conversation entry added or removed in the feed (with `lists.read`): the copy of
@@ -296,31 +317,36 @@ impl App {
         max_uses: u64,
         context: Value,
     ) -> Result<InviteCode, AppError> {
-        self.need(Permission::ConversationAdd)?;
-        if max_uses == 0 {
-            return Err(Refusal::Usage("Switch wire 6.2: max_uses is at least 1".into()).into());
-        }
-        let code = b64(&random_bytes::<INVITE_CODE_BYTES>()?);
-        let code_hash = invite_code_hash(&code)?;
-        let put = InviteCodePut {
-            code_hash,
-            expires_at,
-            max_uses,
-            context: context.clone(),
-        };
-        self.submit_batch(
-            OpBatch::new()
-                .op(OpKind::InviteCodePut(put))
-                .invite(&code_hash, &code),
-        )
-        .await?;
-        Ok(InviteCode {
-            code,
-            code_hash,
-            expires_at,
-            max_uses,
-            context,
+        Box::pin(async move {
+            self.need(Permission::ConversationAdd)?;
+            if max_uses == 0 {
+                return Err(
+                    Refusal::Usage("Switch wire 6.2: max_uses is at least 1".into()).into(),
+                );
+            }
+            let code = b64(&random_bytes::<INVITE_CODE_BYTES>()?);
+            let code_hash = invite_code_hash(&code)?;
+            let put = InviteCodePut {
+                code_hash,
+                expires_at,
+                max_uses,
+                context: context.clone(),
+            };
+            self.submit_batch(
+                OpBatch::new()
+                    .op(OpKind::InviteCodePut(put))
+                    .invite(&code_hash, &code),
+            )
+            .await?;
+            Ok(InviteCode {
+                code,
+                code_hash,
+                expires_at,
+                max_uses,
+                context,
+            })
         })
+        .await
     }
 
     /// Withdraw an invite code (`invite_code.delete`, `conversation.add`).
@@ -329,9 +355,12 @@ impl App {
     ///
     /// As [`App::register_invite_code`]; `404` for a code the switch doesn't hold.
     pub async fn withdraw_invite_code(&mut self, code_hash: &[u8; 32]) -> Result<(), AppError> {
-        self.need(Permission::ConversationAdd)?;
-        self.list_op(OpKind::InviteCodeDelete {
-            code_hash: *code_hash,
+        Box::pin(async move {
+            self.need(Permission::ConversationAdd)?;
+            self.list_op(OpKind::InviteCodeDelete {
+                code_hash: *code_hash,
+            })
+            .await
         })
         .await
     }
@@ -363,27 +392,30 @@ impl App {
     /// `403 not_admitted` where the identity takes no connect requests; `429` when its list
     /// is full; a failed call.
     pub async fn ask_to_connect(&mut self, pubky: &[u8; 32]) -> Result<bool, AppError> {
-        self.ready_local().await?;
-        self.refuse_when_stopped()?;
-        let mut delivered = false;
-        loop {
-            let doc = self.peer_identity(pubky, false).await?;
-            let client = self.peer_client(pubky, &doc)?;
-            match client.connect().await {
-                Ok(answer) => {
-                    self.note_known_version(pubky, answer.known_version).await?;
-                    return Ok(answer.pending);
+        Box::pin(async move {
+            self.ready_local().await?;
+            self.refuse_when_stopped()?;
+            let mut delivered = false;
+            loop {
+                let doc = self.peer_identity(pubky, false).await?;
+                let client = self.peer_client(pubky, &doc)?;
+                match client.connect().await {
+                    Ok(answer) => {
+                        self.note_known_version(pubky, answer.known_version).await?;
+                        return Ok(answer.pending);
+                    }
+                    Err(ClientError::Switch {
+                        code: ErrorCode::IdentityNeeded,
+                        ..
+                    }) if !delivered => {
+                        delivered = true;
+                        self.deliver_own_identity(pubky, None, true).await?;
+                    }
+                    Err(error) => return Err(error.into()),
                 }
-                Err(ClientError::Switch {
-                    code: ErrorCode::IdentityNeeded,
-                    ..
-                }) if !delivered => {
-                    delivered = true;
-                    self.deliver_own_identity(pubky, None, true).await?;
-                }
-                Err(error) => return Err(error.into()),
             }
-        }
+        })
+        .await
     }
 
     /// The connect requests pending at the own switch (`GET /connect`, `lists.read`).
@@ -392,11 +424,14 @@ impl App {
     ///
     /// [`Refusal::Usage`] without the permission; a failed call.
     pub async fn connect_requests(&mut self) -> Result<ConnectList, AppError> {
-        self.ready_local().await?;
-        self.refuse_when_stopped()?;
-        self.need(Permission::ListsRead)?;
-        let result = self.client.connect_requests().await;
-        self.take(result).await
+        Box::pin(async move {
+            self.ready_local().await?;
+            self.refuse_when_stopped()?;
+            self.need(Permission::ListsRead)?;
+            let result = self.client.connect_requests().await;
+            self.take(result).await
+        })
+        .await
     }
 
     /// Allow a connect request: an invite, which removes it (Switch spec 7).
@@ -405,7 +440,7 @@ impl App {
     ///
     /// As [`App::invite`].
     pub async fn allow_connect(&mut self, pubky: &[u8; 32]) -> Result<(), AppError> {
-        self.invite(pubky).await
+        Box::pin(async move { self.invite(pubky).await }).await
     }
 
     /// Decline a connect request (`DELETE /connect/{pubky}`, `conversation.add`).
@@ -414,12 +449,15 @@ impl App {
     ///
     /// [`Refusal::Usage`] without the permission; `404` when none is pending from it.
     pub async fn decline_connect(&mut self, pubky: &[u8; 32]) -> Result<(), AppError> {
-        self.ready_local().await?;
-        self.refuse_when_stopped()?;
-        self.need(Permission::ConversationAdd)?;
-        let result = self.client.decline_connect(pubky).await;
-        self.take(result).await?;
-        Ok(())
+        Box::pin(async move {
+            self.ready_local().await?;
+            self.refuse_when_stopped()?;
+            self.need(Permission::ConversationAdd)?;
+            let result = self.client.decline_connect(pubky).await;
+            self.take(result).await?;
+            Ok(())
+        })
+        .await
     }
 }
 

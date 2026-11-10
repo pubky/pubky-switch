@@ -201,13 +201,16 @@ impl App {
     /// [`super::Refusal::Stopped`] or [`super::Refusal::Left`]; an alarm a step raised; a
     /// failed call or commit, after which the next call resumes at the step it stopped in.
     pub async fn follow_provider(&mut self) -> Result<ProviderStatus, AppError> {
-        self.ready_local().await?;
-        self.refuse_when_halted()?;
-        let result = self.provider_step().await;
-        if result.is_err() {
-            self.reload = true;
-        }
-        result
+        Box::pin(async move {
+            self.ready_local().await?;
+            self.refuse_when_halted()?;
+            let result = self.provider_step().await;
+            if result.is_err() {
+                self.reload = true;
+            }
+            result
+        })
+        .await
     }
 
     /// Ask the own service's public read of `identity.json` whether the account is frozen
@@ -219,18 +222,21 @@ impl App {
     /// As [`App::follow_provider`]; [`AppError::InvalidData`] for a freeze that doesn't
     /// follow the generation the app follows.
     pub async fn check_for_move(&mut self) -> Result<ProviderStatus, AppError> {
-        self.ready_local().await?;
-        self.refuse_when_halted()?;
-        if self.state.gone.is_some() {
-            // `gone` stops every read: nothing is asked.
-            return self.follow_provider().await;
-        }
-        let result = self.client.public_identity().await;
-        let public = self.take(result).await?;
-        if let Some(freeze) = &public.freeze {
-            self.note_freeze(freeze).await?;
-        }
-        self.follow_provider().await
+        Box::pin(async move {
+            self.ready_local().await?;
+            self.refuse_when_halted()?;
+            if self.state.gone.is_some() {
+                // `gone` stops every read: nothing is asked.
+                return self.follow_provider().await;
+            }
+            let result = self.client.public_identity().await;
+            let public = self.take(result).await?;
+            if let Some(freeze) = &public.freeze {
+                self.note_freeze(freeze).await?;
+            }
+            self.follow_provider().await
+        })
+        .await
     }
 
     // ---------------------------------------------------------------------------------
@@ -922,6 +928,14 @@ impl App {
                 .is_some_and(|id| self.applied_by_old_service(&id));
             if applied {
                 let now = self.now();
+                // What its operations settle without their proofs, such as a list change.
+                let settles = super::batch::PendingBatch {
+                    deadlines: pending.deadlines.clone(),
+                    ..super::batch::PendingBatch::default()
+                };
+                for op in Batch::from_body(pending.body.clone())?.ops() {
+                    self.settle_op(op, None, &settles, tx).await?;
+                }
                 processed_writes(tx, &pending.sender, &pending.msg_id, pending.hash, now)?;
                 tx.local(&pending.local)?;
                 if pending.parked {
