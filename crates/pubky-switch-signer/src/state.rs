@@ -10,7 +10,9 @@
 
 use pubky_switch_client::store::{StoreHandle, WriteBatch};
 use pubky_switch_core::enc::zbase32_encode;
-use pubky_switch_core::records::{IdentityDoc, IdentityPolicy, Limits, SignerBackup, StoredPart};
+use pubky_switch_core::records::{
+    DEFAULT_CERT_LIFETIME_MS, IdentityDoc, IdentityPolicy, Limits, SignerBackup, StoredPart,
+};
 use pubky_switch_core::sig::SignedDoc;
 use serde::{Deserialize, Serialize};
 
@@ -82,6 +84,28 @@ pub(crate) struct SignerState {
     pub(crate) managed_by: Option<[u8; 16]>,
     /// The alerts the user hasn't cleared.
     pub(crate) alerts: Vec<Alert>,
+    /// The certificate lifetime new certificates get, in milliseconds (Switch spec 3.2).
+    pub(crate) cert_lifetime_ms: u64,
+    /// The companion claims of approvals, signed once, until the host has delivered them
+    /// (Switch wire 3.10).
+    pub(crate) claims: Vec<PendingClaim>,
+}
+
+/// An approval's companion claim, signed with the version that lists its certificate and
+/// released to the host once the switch took that version (Switch wire 3.10).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PendingClaim {
+    /// The document hash of the app request it answers.
+    pub(crate) request: [u8; 32],
+    /// The approved app.
+    pub(crate) app_id: [u8; 16],
+    /// The document hash of its certificate.
+    pub(crate) cert: [u8; 32],
+    /// The capabilities of the Pubky grant, as the auth request carries them.
+    pub(crate) caps: String,
+    /// The claim's plaintext: the approval's JSON bytes, then the identity key's signature.
+    #[serde(with = "pubky_switch_core::enc::serde_b64_vec")]
+    pub(crate) plaintext: Vec<u8>,
 }
 
 impl SignerState {
@@ -99,6 +123,8 @@ impl SignerState {
             bundle_parts: Vec::new(),
             managed_by: None,
             alerts: Vec::new(),
+            cert_lifetime_ms: DEFAULT_CERT_LIFETIME_MS,
+            claims: Vec::new(),
         }
     }
 

@@ -48,6 +48,10 @@ use crate::key::{ExportReason, IdentityKeyring};
 use crate::protocol::Protocols;
 use crate::state::{self, DeliverStep, Flow, Newest, Service, SignerState};
 
+mod approval;
+
+pub use approval::{AppReview, ApprovedRequest};
+
 /// What the signer works with, from the host.
 #[derive(Clone)]
 pub struct SignerEnv {
@@ -307,11 +311,35 @@ impl Signer {
     /// version whose document went out in a flow that was dropped is never signed again
     /// (Switch spec 4.3, 13.2).
     async fn new_version(&mut self, change: impl FnOnce(&mut IdentityBody)) -> Result<IdentityDoc> {
+        self.ready().await?;
+        let key = self.keyring.unlock()?;
+        let (doc, flow) = self.next_version(&key, change)?;
+        drop(key);
+        let mut state = self.state.clone();
+        state.signed_through = doc.version();
+        self.commit(state, Some(flow)).await?;
+        self.resume().await?;
+        Ok(doc)
+    }
+
+    /// Ready for a new signing call: the store read again if a commit left it unsure, this
+    /// install named, and no flow in progress.
+    pub(crate) async fn ready(&mut self) -> Result<()> {
         self.refresh().await?;
         self.check_named()?;
         if self.flow.is_some() {
             return Err(Refusal::FlowInProgress.into());
         }
+        Ok(())
+    }
+
+    /// The next version, built from the newest with `change` and signed with `key`, and the
+    /// flow that delivers it. Nothing is committed.
+    pub(crate) fn next_version(
+        &self,
+        key: &IdentityKey,
+        change: impl FnOnce(&mut IdentityBody),
+    ) -> Result<(IdentityDoc, Flow)> {
         let newest = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
         let version = newest
             .version()
@@ -322,21 +350,14 @@ impl Signer {
         body.version = version;
         body.signer = self.state.install;
         change(&mut body);
-        let doc = {
-            let key = self.keyring.unlock()?;
-            IdentityDoc::sign(&key, body)?
-        };
-        let mut state = self.state.clone();
-        state.signed_through = version;
+        let doc = IdentityDoc::sign(key, body)?;
         let flow = Flow::Deliver {
             doc: doc.signed().clone(),
             prev: Some(newest.hash()),
             backup: None,
             step: DeliverStep::Signed,
         };
-        self.commit(state, Some(flow)).await?;
-        self.resume().await?;
-        Ok(doc)
+        Ok((doc, flow))
     }
 
     /// Refuse every signing call while another install is the signer (Switch spec 4.3).
@@ -350,7 +371,7 @@ impl Signer {
     /// Commit `state` and `flow`, and only then take them as the signer's own, so the signer
     /// never acts on anything the store doesn't hold. A commit the store can't tell about
     /// makes the signer read the store again before its next step.
-    async fn commit(&mut self, state: SignerState, flow: Option<Flow>) -> Result<()> {
+    pub(crate) async fn commit(&mut self, state: SignerState, flow: Option<Flow>) -> Result<()> {
         match state::save(&self.env.store, &state, flow.as_ref()).await {
             Ok(()) => {
                 self.state = state;
