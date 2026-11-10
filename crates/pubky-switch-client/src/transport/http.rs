@@ -3,10 +3,12 @@
 //! A switch origin comes from an `identity.json` someone else controls, so the transport
 //! connects only where Switch wire 7.1 allows: `https`, no user info, path, query or
 //! fragment, port 443 or a port the operator allows, an address literal that is public, and a
-//! host name every address of which is public (Switch wire 8.2). The resolver refuses a host
-//! with any address that isn't public and hands the connector only the addresses it checked,
-//! at every new connection, so DNS rebinding can't move a connection to a private address.
-//! Redirects aren't followed.
+//! host name every address of which is public (Switch wire 8.2). The host is judged as
+//! reqwest's URL parser reads it, since that is where it connects; a host the parser reads
+//! as another one, such as `127.1`, is refused. The resolver refuses a host with any address
+//! that isn't public and hands the connector only the addresses it checked, at every new
+//! connection, so DNS rebinding can't move a connection to a private address. Redirects
+//! aren't followed.
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -150,18 +152,19 @@ impl HttpTransport {
     }
 
     async fn call(&self, request: Request) -> Result<Response, TransportError> {
-        if let Some(origin_use) = &self.origin_use {
-            check_url(&request.origin, origin_use)
-                .map_err(|error| TransportError::Refused(error.to_string()))?;
-        }
         if !request.path_and_query.starts_with('/') {
             return Err(TransportError::InvalidRequest(
                 "the path doesn't start with '/'".into(),
             ));
         }
+        let url = match &self.origin_use {
+            Some(origin_use) => checked_destination(&request.origin, &request.url(), origin_use)?,
+            None => reqwest::Url::parse(&request.url())
+                .map_err(|_| TransportError::InvalidRequest("the URL doesn't parse".into()))?,
+        };
         let method = reqwest::Method::from_bytes(request.method.as_bytes())
             .map_err(|_| TransportError::InvalidRequest("the method".into()))?;
-        let mut call = self.client.request(method, request.url());
+        let mut call = self.client.request(method, url);
         for Header { name, value } in &request.headers {
             let name = HeaderName::from_bytes(name.as_bytes())
                 .map_err(|_| TransportError::InvalidRequest("a header name".into()))?;
@@ -204,6 +207,41 @@ impl HttpTransport {
             body,
         })
     }
+}
+
+/// The URL a request goes to, checked (Switch wire 7.1, 8.2): the origin's text passes the
+/// core's check, and `url`, as reqwest's parser reads it, names the same scheme, host and
+/// port, with no user info. reqwest connects to an address literal without the resolver, so
+/// the literal is checked here as the parsed URL holds it; a spelling the two parsers read
+/// as different hosts is refused.
+fn checked_destination(
+    origin: &str,
+    url: &str,
+    origin_use: &UrlUse,
+) -> Result<reqwest::Url, TransportError> {
+    let refused = |reason: &str| TransportError::Refused(format!("Switch wire 7.1: {reason}"));
+    let checked = check_url(origin, origin_use)
+        .map_err(|error| TransportError::Refused(error.to_string()))?;
+    let url = reqwest::Url::parse(url).map_err(|_| refused("the URL doesn't parse"))?;
+    if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
+        return Err(refused("the URL isn't https without user info"));
+    }
+    if url.port_or_known_default() != Some(checked.port) {
+        return Err(refused("the URL's port reads differently"));
+    }
+    let ip = match url.host() {
+        Some(url::Host::Domain(name)) if name == checked.host => None,
+        Some(url::Host::Ipv4(ip)) => Some(IpAddr::V4(ip)),
+        Some(url::Host::Ipv6(ip)) => Some(IpAddr::V6(ip)),
+        _ => return Err(refused("the URL's host reads differently")),
+    };
+    if let Some(ip) = ip {
+        if checked.host.parse::<IpAddr>().ok() != Some(ip) {
+            return Err(refused("the URL's host reads differently"));
+        }
+        check_addresses(&[ip]).map_err(|error| TransportError::Refused(error.to_string()))?;
+    }
+    Ok(url)
 }
 
 /// A reqwest error as a transport error, without the URL.
@@ -262,6 +300,70 @@ mod tests {
             assert!(
                 matches!(error, TransportError::Refused(_)),
                 "{origin}: {error:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_http_transport_refuses_other_spellings_of_private_addresses() {
+        let transport = HttpTransport::new(HttpConfig::default()).unwrap();
+        for origin in [
+            "https://127.1",
+            "https://2130706433",
+            "https://0x7f000001",
+            "https://0177.0.0.1",
+            "https://127.0.0.1.",
+            "https://localhost.",
+            "https://LOCALHOST",
+            "https://[::ffff:127.0.0.1]",
+            "https://[0:0:0:0:0:0:0:1]",
+            "https://[fe80::1%25eth0]",
+            "https://127%2E0%2E0%2E1",
+        ] {
+            let error = transport.send(request(origin)).await.unwrap_err();
+            assert!(
+                matches!(error, TransportError::Refused(_)),
+                "{origin}: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_http_destination_is_the_parsed_url() {
+        let origin = UrlUse::SwitchOrigin {
+            extra_ports: vec![8443],
+        };
+        let check = |origin_text: &str, url: &str| checked_destination(origin_text, url, &origin);
+        // The URL reqwest parses names the same host and port as the origin's text.
+        assert!(check("https://Inbox.Example", "https://inbox.example/v1").is_ok());
+        assert!(
+            check(
+                "https://inbox.example:8443",
+                "https://inbox.example:8443/v1"
+            )
+            .is_ok()
+        );
+        assert!(
+            check(
+                "https://[2606:4700::1111]",
+                "https://[2606:4700:0::1111]/v1"
+            )
+            .is_ok()
+        );
+        // A URL that reads as another destination than the origin is refused.
+        for (origin_text, url) in [
+            ("https://inbox.example", "https://other.example/v1"),
+            ("https://inbox.example", "https://inbox.example:8443/v1"),
+            ("https://inbox.example", "https://127.0.0.1/v1"),
+            ("https://1.1.1.1", "https://1.1.1.2/v1"),
+            ("https://1.1.1.1", "https://[::ffff:1.1.1.1]/v1"),
+            ("https://inbox.example", "https://user@inbox.example/v1"),
+            ("https://inbox.example", "http://inbox.example/v1"),
+        ] {
+            let error = check(origin_text, url).unwrap_err();
+            assert!(
+                matches!(error, TransportError::Refused(_)),
+                "{origin_text} {url}: {error:?}"
             );
         }
     }
