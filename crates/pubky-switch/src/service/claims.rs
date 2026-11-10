@@ -92,13 +92,13 @@ impl Service {
         };
         let head = self.head(txn, signer).await.ok_or_else(temporary)?;
         let mut answer = Answer::ok(Vec::new()).with_head(Some(head));
-        answer.claim_read = Some(ClaimRead {
+        answer.deferred = Some(super::Deferred::Claim(ClaimRead {
             account: txn.head().id.clone(),
             claim_key,
             view,
             steps,
             last_seq,
-        });
+        }));
         Ok(answer)
     }
 
@@ -165,7 +165,9 @@ impl Service {
         if stored_app.is_none() && !listed {
             return Err(unknown());
         }
-        txn.revoke_app(&app, time_ms)
+        // The data epoch its rotation goes above (Switch wire 7.4.12 awaiting_rotation).
+        let data_epoch = held.map_or(1, IdentityDoc::data_epoch);
+        txn.revoke_app(&app, time_ms, data_epoch)
             .await
             .map_err(|e| store_error(&e))?;
         // It leaves the directory: its record and receive key no longer show, and a
@@ -204,6 +206,7 @@ impl Service {
             stub: &stub,
             server_time_ms: time_ms,
             only_for: None,
+            proof: None,
         })
         .await
         .map_err(|e| store_error(&e))?;

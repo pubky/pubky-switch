@@ -1403,6 +1403,94 @@ async fn test_kept_batch_window_holds_with_the_device_clock_ahead_after_a_restor
     );
 }
 
+/// How many conversation entries for `pubky` the switch applied.
+fn conversations_for(w: &World, pubky: [u8; 32]) -> usize {
+    w.switch
+        .applied()
+        .iter()
+        .filter(|op| matches!(op.body().kind, OpKind::AllowPut { pubky: p, .. } if p == pubky))
+        .count()
+}
+
+/// A write while the service can't be reached: kept, never sent.
+async fn write_offline(w: &World, app: &mut App) {
+    w.switch.fail_next(Fault::Unreachable {
+        path: "feed".into(),
+        after: 0,
+    });
+    w.switch.fail_next(Fault::Unreachable {
+        path: "ops".into(),
+        after: 0,
+    });
+    let result = app.submit_batch(conversation(w.bob.public())).await;
+    assert!(matches!(result, Err(AppError::Transport(_))), "{result:?}");
+    w.switch.lock().faults.clear();
+    let kept = app.kept_batches().await.unwrap();
+    assert_eq!(kept.len(), 1, "a network failure keeps the batch");
+    assert_eq!(kept[0].1.kept_ms, None, "never sent, so not stamped");
+    assert_eq!(conversations_for(w, w.bob.public()), 0);
+}
+
+#[tokio::test]
+async fn test_kept_batch_written_offline_goes_once_the_service_is_back() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    w.clock.advance_ms(20 * 60 * 1000);
+    write_offline(&w, &mut app).await;
+    // The next write sends it first, as its first send: applied once.
+    app.submit_batch(conversation([7; 32])).await.unwrap();
+    assert!(app.kept_batches().await.unwrap().is_empty());
+    assert_eq!(conversations_for(&w, w.bob.public()), 1);
+    assert_eq!(conversations_for(&w, [7; 32]), 1);
+}
+
+#[tokio::test]
+async fn test_kept_batch_written_offline_survives_a_restart_unsent() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let me = app.app_id();
+    w.clock.advance_ms(20 * 60 * 1000);
+    write_offline(&w, &mut app).await;
+    drop(app);
+    // Loaded again a month on: still unsent, with no window, so not judged for age.
+    w.clock.advance_ms(31 * 24 * HOUR);
+    let mut app = w.load(me).await;
+    assert_eq!(app.kept_batches().await.unwrap()[0].1.kept_ms, None);
+    app.submit_batch(conversation([7; 32])).await.unwrap();
+    assert!(app.kept_batches().await.unwrap().is_empty());
+    assert_eq!(conversations_for(&w, w.bob.public()), 1);
+    assert!(!has(
+        &app.unacknowledged_events().await.unwrap(),
+        |e| matches!(e, AppEvent::KeptBatchDropped { .. })
+    ));
+}
+
+#[tokio::test]
+async fn test_parked_retry_effect_is_kept_at_a_fresh_service_time() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let (seq, _) = w.note(app.app_id(), "note");
+    w.switch.fail_next(Fault::Error {
+        path: "ops".into(),
+        code: ErrorCode::QuotaExceeded,
+        current: json!(null),
+    });
+    app.receive(None).await.unwrap();
+    assert_eq!(
+        app.state.parked.get(&seq).map(|p| p.reason),
+        Some(ParkReason::Quota)
+    );
+    // A month on, the stored entry is tried again before any feed read, and its effect
+    // kept: at a service time read in this call, not the month-old one.
+    w.clock.advance_ms(30 * 24 * HOUR);
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    let _ = app.receive(None).await;
+    let pending = app.state.pending_effect.as_ref().unwrap();
+    assert_eq!(pending.seq, seq);
+    let age = w.clock.now_ms() - pending.kept_ms.unwrap();
+    assert!(age < HOUR, "kept {age} ms before now");
+}
+
 #[tokio::test]
 async fn test_kept_batch_window_holds_with_the_device_clock_behind_at_the_resend() {
     let w = World::new();
@@ -1861,6 +1949,39 @@ async fn test_app_lifecycle_operation_in_a_stored_entrys_effect_stores_it_for_go
     let report = app.receive(None).await.unwrap();
     lifecycle_effect_refused(&mut app, &report, seq).await;
     assert_eq!(w.switch.applied().len(), applied);
+}
+
+#[tokio::test]
+async fn test_app_entry_stored_for_good_drops_its_retry_count() {
+    let w = World::new();
+    let base = w.join("phone").await;
+    let protocol = Arc::new(LifecycleProtocol {
+        sample: SampleProtocol::default(),
+        extra: lifecycle_ops(&w, &base)[0].clone(),
+        in_context: false,
+        answers: std::sync::Mutex::new(Vec::new()),
+        active: std::sync::atomic::AtomicBool::new(true),
+    });
+    let request = w.approve(&app_keys("wallet"), &["scope-a"]);
+    let mut app = App::join(w.env(), protocol.clone(), World::config(), request)
+        .await
+        .unwrap();
+    let (seq, _) = w.note(app.app_id(), "note");
+    // Its receive step had been retried for the store before.
+    let retry = crate::app::state::RetryEntry {
+        reads: 1,
+        since_ms: w.clock.now_ms(),
+    };
+    let mut tx = app.tx().unwrap();
+    tx.put(&crate::app::state::key::retry(seq), &retry).unwrap();
+    app.commit(tx).await.unwrap();
+    app.state.retries.insert(seq, retry);
+    // Stored for good, its effect carrying a lifecycle operation: the count goes with it.
+    let report = app.receive(None).await.unwrap();
+    lifecycle_effect_refused(&mut app, &report, seq).await;
+    assert!(app.state.retries.is_empty(), "{:?}", app.state.retries);
+    let loaded = w.load(app.app_id()).await;
+    assert!(loaded.state.retries.is_empty(), "and in the store");
 }
 
 #[tokio::test]

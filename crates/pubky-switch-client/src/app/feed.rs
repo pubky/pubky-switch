@@ -1379,7 +1379,11 @@ impl App {
                 reason,
             });
         } else {
-            // Stored for good: a duty event, kept in the commit that stores the entry.
+            // Stored for good, never tried again: a count of the store's retries at it goes.
+            if self.state.retries.remove(&entry.seq).is_some() {
+                read.tx.delete(&key::retry(entry.seq))?;
+            }
+            // A duty event, kept in the commit that stores the entry.
             self.keep_duty(
                 &mut read.tx,
                 Duty::Parked {

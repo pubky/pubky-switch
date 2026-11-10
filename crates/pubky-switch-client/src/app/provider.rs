@@ -242,10 +242,11 @@ pub(crate) fn answer_decides(now: u64, kept_ms: Option<u64>) -> bool {
 }
 
 impl App {
-    /// The time a batch is kept at, before its first send: the earlier of the device clock
-    /// and the service time verified in this call, which every path that keeps a batch
-    /// fetches first ([`App::fresh_service_time`]), so a device clock ahead doesn't make it
-    /// look younger, and a time from long before doesn't make it look older.
+    /// The time a batch's first send is stamped at: the earlier of the device clock and the
+    /// service time verified in this call, which every path fetches first, before a kept
+    /// batch's first send and before an effect is kept ([`App::fresh_service_time`]), so a
+    /// device clock ahead doesn't make it look younger, and a time from long before doesn't
+    /// make it look older.
     pub(crate) fn kept_stamp(&self) -> u64 {
         let now = self.now();
         self.state
@@ -303,7 +304,9 @@ impl App {
 /// it came counts as not fresh. The window ends an hour before the service's 30 days, and
 /// the worst case of the clocks and a request's accepted time takes some 20 minutes of it
 /// ([`KEPT_BATCH_MARGIN_MS`]): 10 minutes between the reading and the send leaves half an
-/// hour.
+/// hour. A known limit: a device clock stepped back by about the length of a suspend
+/// between the reading and the send, and left more than about 45 minutes behind true time,
+/// still passes this test, since the device clock is all it measures the gap by.
 pub(crate) const FRESH_SERVICE_TIME_MS: u64 = 10 * 60 * 1000;
 
 /// How many provider changes one follow takes in a row, each given up for a newer own
@@ -331,7 +334,7 @@ pub(crate) fn attempts_in(batch: &Batch) -> Vec<super::events::ClaimAttempt> {
 }
 
 /// A kept batch's operations, with their conditions, to sign again.
-fn ops_of(batch: &Batch) -> Vec<(Vec<Condition>, OpKind)> {
+pub(crate) fn ops_of(batch: &Batch) -> Vec<(Vec<Condition>, OpKind)> {
     batch
         .ops()
         .iter()
@@ -1170,7 +1173,10 @@ impl App {
                 continue;
             }
             let kept = Batch::from_body(pending.body.clone())?;
-            if resend_first {
+            // A batch never sent has no answer to wait for: it is signed again for the new
+            // generation, and sent as a first send, its old bytes never resent.
+            let never_sent = pending.kept_ms.is_none();
+            if resend_first && !never_sent {
                 if !answer_decides(pending.kept_ms) {
                     Self::replace_kept_batch(&id, None, tx)?;
                     self.kept_batch_dropped(&id, &kept, tx)?;
@@ -1190,8 +1196,10 @@ impl App {
             let new_id = signed
                 .id()
                 .ok_or_else(|| AppError::InvalidData("a batch of operations has an ID".into()))?;
+            // New bytes, never sent: stamped at their first send.
             let mut renewed = pending.clone();
             renewed.body = signed.body().to_vec();
+            renewed.kept_ms = None;
             Self::replace_kept_batch(&id, Some((&new_id, &renewed)), tx)?;
             events.push(AppEvent::KeptBatchSignedAgain {
                 batch_id: id,

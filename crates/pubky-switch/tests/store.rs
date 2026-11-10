@@ -871,3 +871,104 @@ async fn test_store_upgrade_deletes_claims_from_before_0006() {
     conn.close().await.expect("close");
     db.drop_database().await.expect("drop");
 }
+
+/// Chain items written before migration 0008 take their proofs from their batch's record
+/// while it keeps them, by their place in the batch; the others stay without.
+#[tokio::test]
+#[allow(clippy::panic)]
+async fn test_store_upgrade_gives_chain_items_their_batch_proofs() {
+    use pubky_switch::store::{DatabaseConfig, MIGRATIONS, testing::TestDatabase};
+    use pubky_switch_core::sig::SignedDoc;
+    let db = match TestDatabase::create_with(&DatabaseConfig::default(), false).await {
+        Ok(db) => db,
+        Err(pubky_switch::store::testing::TestDatabaseError::Skipped) => return,
+        Err(error) => panic!("test database: {error}"),
+    };
+    let mut conn = PgConnection::connect_with(db.options())
+        .await
+        .expect("conn");
+    let before = sqlx::migrate::Migrator {
+        migrations: std::borrow::Cow::Owned(MIGRATIONS.iter().take(7).cloned().collect()),
+        ignore_missing: false,
+        locking: true,
+        no_tx: false,
+    };
+    before
+        .run(&mut conn)
+        .await
+        .expect("migrations 0001 to 0007");
+    sqlx::query(
+        "INSERT INTO accounts (id, identity_key, generation, service_key, created_at_ms, \
+         announced_limits) VALUES ('old', $1, 1, '00000000000000000000000000000000', 5, \
+         '\\x7b7d')",
+    )
+    .bind([7u8; 32].as_slice())
+    .execute(&mut conn)
+    .await
+    .expect("account");
+    let proof = |n: u8| SignedDoc::from_parts(format!("{{\"proof\":{n}}}").as_bytes(), &[n; 64]);
+    // A batch of seqs 2 and 3 whose proofs are kept, and one at seq 5 whose proofs went.
+    for (id, proofs, first, last) in [
+        (
+            [1u8; 16],
+            Some(serde_json::to_vec(&[proof(2), proof(3)]).expect("proofs")),
+            2i64,
+            3i64,
+        ),
+        ([2u8; 16], None, 5, 5),
+    ] {
+        sqlx::query(
+            "INSERT INTO batches (account_id, batch_id, ops_hash, proofs, at_ms, generation, \
+             first_seq, last_seq) VALUES ('old', $1, $2, $3, 0, 1, $4, $5)",
+        )
+        .bind(id.as_slice())
+        .bind([0u8; 32].as_slice())
+        .bind(proofs)
+        .bind(first)
+        .bind(last)
+        .execute(&mut conn)
+        .await
+        .expect("batch");
+    }
+    for (seq, item_type) in [(1i64, "identity"), (2, "op"), (3, "op"), (5, "op")] {
+        sqlx::query(
+            "INSERT INTO chain_items (account_id, generation, seq, item_type, item_bytes, \
+             envelope, chain_hash, server_time_ms) VALUES ('old', 1, $1, $2, '\\x7b7d', \
+             '\\x7b7d', $3, 0)",
+        )
+        .bind(seq)
+        .bind(item_type)
+        .bind([0u8; 32].as_slice())
+        .execute(&mut conn)
+        .await
+        .expect("chain item");
+    }
+    let announced =
+        pubky_switch::service::announced_limits(&pubky_switch::limits::Limits::default());
+    db.store().migrate(&announced).await.expect("upgrade");
+    let rows: Vec<(i64, Option<Vec<u8>>)> =
+        sqlx::query_as("SELECT seq, proof FROM chain_items WHERE account_id = 'old' ORDER BY seq")
+            .fetch_all(&mut conn)
+            .await
+            .expect("rows");
+    let proofs: Vec<(i64, Option<SignedDoc>)> = rows
+        .into_iter()
+        .map(|(seq, proof)| {
+            (
+                seq,
+                proof.map(|bytes| serde_json::from_slice(&bytes).expect("a proof")),
+            )
+        })
+        .collect();
+    assert_eq!(
+        proofs,
+        vec![
+            (1, None),
+            (2, Some(proof(2))),
+            (3, Some(proof(3))),
+            (5, None)
+        ]
+    );
+    drop(conn);
+    db.drop_database().await.expect("drop");
+}

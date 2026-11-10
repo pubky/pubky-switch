@@ -3460,6 +3460,52 @@ async fn test_kept_batch_of_an_earlier_generation_past_the_window_is_dropped_at_
     }
 }
 
+#[tokio::test]
+async fn test_key_change_signs_a_batch_never_sent_again_without_resending_it() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = lists_app(&w, &router).await;
+    let carol = IdentityKey::from_secret(seed("carol/identity")).public();
+    // Written while the service can't be reached: kept, never sent.
+    w.switch.fail_next(Fault::Unreachable {
+        path: "feed".into(),
+        after: 0,
+    });
+    w.switch.fail_next(Fault::Unreachable {
+        path: "ops".into(),
+        after: 0,
+    });
+    assert!(app.submit_batch(contact_batch(carol)).await.is_err());
+    w.switch.lock().faults.clear();
+    let kept = app.kept_batches().await.unwrap();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].1.kept_ms, None);
+    let old_id = kept[0].0;
+    // The key changes before its first send: it is signed again for the new generation,
+    // its old bytes never sent, then sent once.
+    let changed = change_key(&w, &router);
+    let report = app.receive(None).await.unwrap();
+    assert!(
+        has(&report.events, |e| matches!(
+            e,
+            AppEvent::KeptBatchSignedAgain { batch_id, .. } if *batch_id == old_id
+        )),
+        "{:?}",
+        report.events
+    );
+    assert_eq!(allow_ops_for(&w.switch.applied(), carol), 0);
+    let dave = IdentityKey::from_secret(seed("dave/identity")).public();
+    app.submit_batch(contact_batch(dave)).await.unwrap();
+    assert!(app.kept_batches().await.unwrap().is_empty());
+    assert_eq!(allow_ops_for(&changed.applied(), carol), 1);
+    assert!(
+        changed
+            .applied()
+            .iter()
+            .all(|op| op.body().batch.id != old_id)
+    );
+}
+
 /// The app at `store`, loaded through the loss's router.
 async fn load_lost(lost: &Lost, store: Arc<dyn StateStore>) -> App {
     App::load(

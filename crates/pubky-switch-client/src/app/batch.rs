@@ -222,7 +222,9 @@ pub(crate) struct PendingBatch {
     /// The messages put in the outbox with the answer.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) queued: Vec<OutboxItem>,
-    /// When it was kept, before its first send, app clock.
+    /// When its first send left, at a service time verified in that call
+    /// ([`App::kept_stamp`]), committed before the request; `None` while it was never sent,
+    /// which can't be ambiguous and so has no window yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) kept_ms: Option<u64>,
 }
@@ -420,8 +422,6 @@ impl App {
             .iter()
             .map(|message| self.outbox_item(message))
             .collect::<Result<Vec<_>, _>>()?;
-        // Kept at a service time verified in this call ([`App::kept_stamp`]).
-        self.fresh_service_time().await?;
         let signed = self.sign_ops(batch.ops, carry)?;
         let id = signed
             .id()
@@ -436,7 +436,9 @@ impl App {
                 .collect(),
             local: batch.local,
             queued,
-            kept_ms: Some(self.kept_stamp()),
+            // Stamped at its first send ([`App::run_pending`]): kept now, it goes out with
+            // the next call that writes when this one can't reach the service.
+            kept_ms: None,
         };
         let mut tx = self.tx()?;
         tx.put(&pending_key(&id), &pending)?;
@@ -566,6 +568,12 @@ impl App {
             let id = pubky_switch_core::enc::unb64_array::<16>(&id)
                 .map_err(|_| AppError::Store(crate::error::StoreError::Corrupt))?;
             let batch = self.without_stale_cursor(Batch::from_body(pending.body.clone())?)?;
+            // Never sent, as its record shows: no answer of it can be ambiguous, so it has
+            // no window, and goes out as a first send would.
+            if pending.kept_ms.is_none() {
+                self.send_unsent(&id, &pending, &batch).await?;
+                continue;
+            }
             // Past the window no answer tells whether it was applied, at any generation: it
             // isn't sent again, and goes, reported with its attempts (Switch wire 6.4 step
             // 5, Switch spec 12.5 "Kept batches"). Past it by the clocks at hand is past it;
@@ -632,6 +640,48 @@ impl App {
         Ok(())
     }
 
+    /// A kept batch never sent ([`PendingBatch::kept_ms`]), sent now: signed again first for
+    /// the generation followed if it was signed for an earlier one, since no old bytes need
+    /// an answer. A refusal for good, other than one about the caller, which keeps it, drops
+    /// it with what it carried and tells the protocol in that commit ([`AppEvent::BatchRefused`]);
+    /// it was never applied.
+    async fn send_unsent(
+        &mut self,
+        id: &[u8; 16],
+        pending: &PendingBatch,
+        batch: &Batch,
+    ) -> Result<(), AppError> {
+        let (id, pending, batch) =
+            if super::batch_generation(batch).is_some_and(|g| g < self.state.meta.generation) {
+                let signed = self.sign_ops(super::provider::ops_of(batch), None)?;
+                let new_id = signed.id().ok_or_else(|| {
+                    AppError::InvalidData("a batch of operations has an ID".into())
+                })?;
+                let renewed = PendingBatch {
+                    body: signed.body().to_vec(),
+                    ..pending.clone()
+                };
+                let mut tx = self.tx()?;
+                Self::replace_kept_batch(id, Some((&new_id, &renewed)), &mut tx)?;
+                self.commit(tx).await?;
+                self.events.push(AppEvent::KeptBatchSignedAgain {
+                    batch_id: *id,
+                    new_batch_id: new_id,
+                });
+                (new_id, renewed, signed)
+            } else {
+                (*id, pending.clone(), batch.clone())
+            };
+        match self.run_pending(&id, &pending, &batch, true).await {
+            Ok(submitted) => self.check_attempts_of(&batch, &submitted).await,
+            Err(error) if refused_at(&error) == Some(RefusalPlace::Caller) => Err(error),
+            Err(error) => match refused_for_good(&error) {
+                Some(code) => self.kept_batch_refused(&id, code).await,
+                None => Err(error),
+            },
+        }
+    }
+
     /// A kept batch sent again and refused for good at or after its batch ID lookup: it was
     /// never applied, and goes with the local writes and outbox messages it carried; the
     /// protocol is told in that commit ([`AppEvent::BatchRefused`]).
@@ -691,7 +741,9 @@ impl App {
     /// Send a kept batch and commit its outcome. A refusal for good drops it; any other
     /// failure keeps it, to be sent again with the same bytes (Switch wire 2.1, 6.4).
     /// `resent` for a batch that may have been sent before: one refused before the batch ID
-    /// lookup stays kept ([`RefusalPlace`]).
+    /// lookup stays kept ([`RefusalPlace`]). A batch's first send is stamped first, at a
+    /// service time verified in this call, committed before the request leaves; a call
+    /// that can't verify one leaves it kept and unsent.
     async fn run_pending(
         &mut self,
         id: &[u8; 16],
@@ -699,6 +751,20 @@ impl App {
         batch: &Batch,
         resent: bool,
     ) -> Result<Submitted, AppError> {
+        let stamped;
+        let pending = if pending.kept_ms.is_none() {
+            self.fresh_service_time().await?;
+            stamped = PendingBatch {
+                kept_ms: Some(self.kept_stamp()),
+                ..pending.clone()
+            };
+            let mut tx = self.tx()?;
+            tx.put(&pending_key(id), &stamped)?;
+            self.commit(tx).await?;
+            &stamped
+        } else {
+            pending
+        };
         let submitted = match self.submit(batch).await {
             Ok(submitted) => submitted,
             Err(error) => {
@@ -896,9 +962,10 @@ impl App {
                 let new_id = signed.id().ok_or_else(|| {
                     AppError::InvalidData("a batch of operations has an ID".into())
                 })?;
+                // New bytes, never sent: stamped at their first send.
                 let renewed = PendingBatch {
                     body: signed.body().to_vec(),
-                    kept_ms: Some(self.kept_stamp()),
+                    kept_ms: None,
                     ..pending.clone()
                 };
                 let mut tx = self.tx()?;
