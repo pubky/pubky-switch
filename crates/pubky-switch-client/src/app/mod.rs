@@ -69,7 +69,7 @@ pub use events::{
 };
 pub use feed::ReceiveReport;
 pub use identity::{DOC_CACHE_MS, HomeserverReader, IdentityRefresh, REVALIDATION_MS};
-pub use parked::ParkedMessage;
+pub use parked::{ParkedMessage, ParkedSummary};
 pub use peek::{PeekReport, Peeked};
 pub use protocol::{
     Effect, LOCAL_WRITE_OVERHEAD_BYTES, LocalWrite, MAX_CLAIM_READS, MAX_LOSS_CONVERSATIONS,
