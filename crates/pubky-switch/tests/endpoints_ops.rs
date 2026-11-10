@@ -301,10 +301,11 @@ async fn test_ops_callers_and_authentication() {
     );
     assert!(header_text(&answer, header::HEAD).is_none());
 
-    // An app of another identity: 403 not_admitted.
+    // An app of another identity: authenticated by its certificate first (Switch wire
+    // 7.2), so 400 without one, then 403 not_admitted.
     let shop = app(&keys, "shop");
     let ops = OpsRequest::new(&wallet_batch(6, 1, vec![contact(bob())]), None).to_json();
-    let mut request = app_request(shop, "POST", &ops_path(), ops, ms(AT));
+    let mut request = app_request(shop, "POST", &ops_path(), ops.clone(), ms(AT));
     request.headers.insert(
         header::IDENTITY,
         shop["identity"]
@@ -313,6 +314,8 @@ async fn test_ops_callers_and_authentication() {
             .parse()
             .expect("header"),
     );
+    assert_eq!(replay.service.handle(request).await.status, 400);
+    let request = other_request("shop", ORIGIN, "POST", &ops_path(), ops, None, ms(AT));
     let answer = replay.service.handle(request).await;
     let body: Value = serde_json::from_slice(&answer.body).expect("json");
     assert_eq!(
