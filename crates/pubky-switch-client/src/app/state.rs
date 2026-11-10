@@ -389,6 +389,9 @@ pub(crate) struct PendingEffect {
     /// their evidence once it is applied (Switch wire 6.8), by claim key (base64url).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) deadlines: Vec<(String, super::claims::ObligationDeadline)>,
+    /// When it was kept, before its first send, app clock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) kept_ms: Option<u64>,
 }
 
 impl std::fmt::Debug for ParkedEntry {

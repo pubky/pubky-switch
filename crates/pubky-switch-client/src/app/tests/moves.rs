@@ -1683,6 +1683,117 @@ async fn test_move_carries_kept_batches_to_the_next_service() {
     assert_eq!(allow_ops_for(&applied, erin), 1);
 }
 
+/// An app with contacts to write, joined at the first service.
+async fn lists_app(w: &World, router: &Router) -> App {
+    join_on(
+        w,
+        router,
+        Arc::clone(&w.store) as Arc<dyn StateStore>,
+        w.protocol.clone(),
+        &[Permission::ListsManage, Permission::ConversationAdd],
+    )
+    .await
+}
+
+fn contact_batch(pubky: [u8; 32]) -> crate::app::OpBatch {
+    crate::app::OpBatch::new().op(OpKind::AllowPut {
+        pubky,
+        kind: AllowKind::Contact,
+    })
+}
+
+#[tokio::test]
+async fn test_key_change_sends_a_kept_batch_again_and_its_answer_shows_it_applied() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = lists_app(&w, &router).await;
+    let carol = IdentityKey::from_secret(seed("carol/identity")).public();
+    // Applied at generation 1, its answer lost; the app never reads it there.
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.submit_batch(contact_batch(carol)).await.is_err());
+    let changed = change_key(&w, &router);
+    // Sent again unchanged, it is answered `409 conflict`: applied, and never signed again
+    // (Switch spec 12.5 "Kept batches").
+    let report = app.receive(None).await.unwrap();
+    assert!(
+        has(&report.events, |e| matches!(
+            e,
+            AppEvent::KeptBatchApplied { .. }
+        )),
+        "{:?}",
+        report.events
+    );
+    assert!(
+        !has(&report.events, |e| matches!(
+            e,
+            AppEvent::KeptBatchSignedAgain { .. }
+        )),
+        "{:?}",
+        report.events
+    );
+    assert!(app.kept_batches().await.unwrap().is_empty());
+    assert_eq!(allow_ops_for(&changed.applied(), carol), 0);
+    assert_eq!(allow_ops_for(&w.switch.applied(), carol), 1);
+    assert!(app.admits(&carol).await.unwrap());
+}
+
+#[tokio::test]
+async fn test_key_change_signs_a_kept_batch_again_only_on_stale_generation() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = lists_app(&w, &router).await;
+    let carol = IdentityKey::from_secret(seed("carol/identity")).public();
+    // Never applied at generation 1.
+    w.switch.fail_next(Fault::Unreachable {
+        path: "ops".into(),
+        after: 0,
+    });
+    assert!(app.submit_batch(contact_batch(carol)).await.is_err());
+    let changed = change_key(&w, &router);
+    // `409 stale_generation`: signed again for generation 2 under a new batch ID, and sent.
+    let report = app.receive(None).await.unwrap();
+    assert!(
+        has(&report.events, |e| matches!(
+            e,
+            AppEvent::KeptBatchSignedAgain { .. }
+        )),
+        "{:?}",
+        report.events
+    );
+    let applied = changed.applied();
+    assert!(applied.iter().any(|op| op.body().generation == 2
+        && matches!(op.body().kind, OpKind::AllowPut { pubky, .. } if pubky == carol)));
+    assert_eq!(allow_ops_for(&applied, carol), 1);
+    assert!(app.kept_batches().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_key_change_drops_a_kept_batch_older_than_the_batch_window() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = lists_app(&w, &router).await;
+    let carol = IdentityKey::from_secret(seed("carol/identity")).public();
+    w.switch.fail_next(Fault::Unreachable {
+        path: "ops".into(),
+        after: 0,
+    });
+    assert!(app.submit_batch(contact_batch(carol)).await.is_err());
+    w.clock
+        .advance_ms(crate::app::provider::KEPT_BATCH_ANSWER_MS);
+    let changed = change_key(&w, &router);
+    let report = app.receive(None).await.unwrap();
+    // The answer can't tell any more: dropped, and the protocol told.
+    assert!(
+        has(&report.events, |e| matches!(
+            e,
+            AppEvent::KeptBatchDropped { .. }
+        )),
+        "{:?}",
+        report.events
+    );
+    assert_eq!(allow_ops_for(&changed.applied(), carol), 0);
+}
+
 #[tokio::test]
 async fn test_move_settles_an_effect_the_old_service_applied() {
     let w = World::new();
@@ -1717,6 +1828,33 @@ async fn test_move_settles_an_effect_the_old_service_applied() {
     assert!(received(&report.events, seq));
     // Applied once, at the old service: the entry isn't processed again at the next one.
     assert_eq!(conversations_at(&next), 0);
+    assert_eq!(w.effects(), 1);
+    assert!(app.cursor().seq >= seq);
+    assert_eq!(
+        app.protocol_get(format!("notes/{}", message.msg_id).as_bytes())
+            .await
+            .unwrap(),
+        Some(b"before".to_vec())
+    );
+}
+
+#[tokio::test]
+async fn test_key_change_sends_a_kept_effect_again_and_settles_it_once() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join(&w, &router).await;
+    let me = app.app_id();
+    let (seq, message) = w.note(me, "before");
+    // The effect is applied at generation 1, and its answer lost.
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.receive(None).await.is_err());
+    assert_eq!(w.effects(), 1);
+    let changed = change_key(&w, &router);
+    // Sent again unchanged at generation 2, its answer shows it applied: its outcome
+    // commits, and the entry isn't processed again (Switch spec 12.5 "Kept batches").
+    let report = app.receive(None).await.unwrap();
+    assert!(received(&report.events, seq), "{:?}", report.events);
+    assert_eq!(conversations_at(&changed), 0);
     assert_eq!(w.effects(), 1);
     assert!(app.cursor().seq >= seq);
     assert_eq!(

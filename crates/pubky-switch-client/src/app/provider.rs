@@ -30,7 +30,7 @@ use pubky_switch_core::claims::ClaimType;
 use pubky_switch_core::enc::{b64, pubky_id, pubky_key, serde_b64, serde_b64_vec};
 use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::ops::{AllowKind, Condition, MAX_BATCH_ENTRIES, OpBody, OpKind, Position};
-use pubky_switch_core::records::{DAY_MS, Freeze, IdentityDoc, Inbox};
+use pubky_switch_core::records::{CLOCK_TOLERANCE_MS, DAY_MS, Freeze, IdentityDoc, Inbox};
 use pubky_switch_core::scopes::Permission;
 use pubky_switch_core::sig::SignedDoc;
 use serde::{Deserialize, Serialize};
@@ -185,6 +185,24 @@ enum Unknown {
     /// Nothing the app can tell.
     Unexplained,
 }
+
+/// How a provider change carries the batches kept for the generation left
+/// ([`App::carry_kept_writes`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Carry {
+    /// A cooperative move whose old feed the app read to its end: its chain tells.
+    ReadToEnd,
+    /// A move never seen frozen, or a key change in place: kept batches go again unchanged
+    /// first (Switch spec 12.5 "Kept batches").
+    ResendFirst,
+    /// A provider loss (Switch spec 12.6).
+    AfterLoss,
+}
+
+/// How long after it was kept a batch's resend still tells whether it was applied: the
+/// service holds a batch's ID at least 30 days, less the clock tolerance (Switch spec
+/// 12.5 "Kept batches", 6.3).
+pub(crate) const KEPT_BATCH_ANSWER_MS: u64 = 30 * DAY_MS - CLOCK_TOLERANCE_MS;
 
 /// How many provider changes one follow takes in a row, each given up for a newer own
 /// `identity.json` met on the way; the next call goes on from there.
@@ -898,7 +916,15 @@ impl App {
                 tx.put(&key::receive_key(*n), held)?;
             }
         }
-        let events = self.carry_kept_writes(&mut tx, false).await?;
+        // A move seen frozen read the old feed to its end, so its chain tells which kept
+        // batches were applied; a move never seen frozen, or a key change in place, can't
+        // tell, and sends them again unchanged first (Switch spec 12.5 "Kept batches").
+        let carry = if mv.freeze.is_some() {
+            Carry::ReadToEnd
+        } else {
+            Carry::ResendFirst
+        };
+        let events = self.carry_kept_writes(&mut tx, carry).await?;
         if self.state.pending_record.take().is_some() {
             tx.delete(key::PENDING_RECORD)?;
         }
@@ -935,19 +961,33 @@ impl App {
     ///   sent with the next write. After a loss, one holding an `attempt` goes instead: no
     ///   automatic attempt is made on an obligation from before the loss (Switch spec 12.6
     ///   step 5).
+    /// - **With [`Carry::ResendFirst`],** a kept batch or effect the chain doesn't show
+    ///   applied stays as it is, to be sent again unchanged, and its answer decides (Switch
+    ///   spec 12.5 "Kept batches"). One kept longer than the service holds batch IDs, 30
+    ///   days less the clock tolerance, goes instead: a batch reported as dropped, an
+    ///   effect with its entry read again.
     ///
     /// Returns the events to report once `tx` commits.
     pub(crate) async fn carry_kept_writes(
         &mut self,
         tx: &mut Tx,
-        after_loss: bool,
+        carry: Carry,
     ) -> Result<Vec<AppEvent>, AppError> {
         let mut events = Vec::new();
-        if let Some(pending) = self.state.pending_effect.take() {
-            tx.delete(key::PENDING_EFFECT)?;
+        let now = self.now();
+        let resend_first = carry == Carry::ResendFirst;
+        let answer_decides = |kept_ms: Option<u64>| {
+            kept_ms.is_none_or(|at| now.saturating_sub(at) < KEPT_BATCH_ANSWER_MS)
+        };
+        if let Some(pending) = self.state.pending_effect.clone() {
             let applied = Batch::from_body(pending.body.clone())?
                 .id()
                 .is_some_and(|id| self.applied_by_old_service(&id));
+            let stays = !applied && resend_first && answer_decides(pending.kept_ms);
+            if !stays {
+                tx.delete(key::PENDING_EFFECT)?;
+                self.state.pending_effect = None;
+            }
             if applied {
                 let now = self.now();
                 // What its operations settle without their proofs, such as a list change.
@@ -989,12 +1029,19 @@ impl App {
                 events.push(AppEvent::KeptBatchApplied { batch_id: id });
                 continue;
             }
+            if resend_first {
+                if !answer_decides(pending.kept_ms) {
+                    Self::replace_kept_batch(&id, None, tx)?;
+                    events.push(AppEvent::KeptBatchDropped { batch_id: id });
+                }
+                continue;
+            }
             let kept = Batch::from_body(pending.body.clone())?;
             let ops = ops_of(&kept);
             let attempts = ops.iter().any(|(_, kind)| {
                 matches!(kind, OpKind::Claim(claim) if claim.kind == ClaimType::Attempt)
             });
-            if after_loss && attempts {
+            if carry == Carry::AfterLoss && attempts {
                 Self::replace_kept_batch(&id, None, tx)?;
                 events.push(AppEvent::KeptBatchDropped { batch_id: id });
                 continue;

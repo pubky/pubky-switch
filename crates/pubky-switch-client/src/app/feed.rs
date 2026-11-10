@@ -826,6 +826,7 @@ impl App {
                 .iter()
                 .map(|(claim_key, deadline)| (pubky_switch_core::enc::b64(claim_key), *deadline))
                 .collect(),
+            kept_ms: Some(self.now()),
         };
         // The collection name of a record the effect creates outside the protocol's
         // collections, until its write is answered: the switch knows only its ID.
@@ -891,6 +892,21 @@ impl App {
                 return Ok(sent);
             }
         };
+        self.commit_effect(&pending, batch, &submitted.proofs)
+            .await?;
+        self.check_attempts_of(batch, &submitted).await?;
+        Ok(Sent::Applied)
+    }
+
+    /// The outcome of an applied effect, with the proofs its answer carried, if any: what
+    /// its operations settle, the processed pair, the protocol's local writes and the
+    /// cursor, in one commit.
+    async fn commit_effect(
+        &mut self,
+        pending: &PendingEffect,
+        batch: &Batch,
+        proofs: &[pubky_switch_core::chain::TransitionProof],
+    ) -> Result<(), AppError> {
         let now = self.now();
         let mut tx = self.tx()?;
         let settles = PendingBatch {
@@ -898,8 +914,8 @@ impl App {
             ..PendingBatch::default()
         };
         for (index, op) in batch.ops().iter().enumerate() {
-            let proof = submitted.proofs.get(index);
-            self.settle_op(op, proof, &settles, &mut tx).await?;
+            self.settle_op(op, proofs.get(index), &settles, &mut tx)
+                .await?;
         }
         processed_writes(&mut tx, &pending.sender, &pending.msg_id, pending.hash, now)?;
         tx.local(&pending.local)?;
@@ -919,9 +935,39 @@ impl App {
             chain.write(&mut tx)?;
         }
         self.state.pending_effect = None;
-        self.commit(tx).await?;
-        self.check_attempts_of(batch, &submitted).await?;
-        Ok(Sent::Applied)
+        self.commit(tx).await
+    }
+
+    /// A kept effect signed for a generation before a provider change that the app's chain
+    /// can't tell about, sent again unchanged: the answer decides (Switch spec 12.5 "Kept
+    /// batches", Switch wire 6.4 step 6). Its original proofs, or `409 conflict` after an
+    /// import, show it applied, and its outcome commits; any other refusal for good, `409
+    /// stale_generation` among them, means it wasn't: it goes, and its entry is read again
+    /// and its effect signed anew. Any other failure keeps it.
+    async fn resend_earlier_effect(
+        &mut self,
+        pending: PendingEffect,
+        batch: &Batch,
+    ) -> Result<(), AppError> {
+        let proofs = match self.submit(batch).await {
+            Ok(submitted) => submitted.proofs,
+            Err(AppError::Switch(ClientError::Switch {
+                code: ErrorCode::Conflict,
+                ..
+            })) => Vec::new(),
+            Err(error) if refused_for_good(&error).is_some() => {
+                return self.drop_pending_effect().await;
+            }
+            Err(error) => return Err(error),
+        };
+        self.commit_effect(&pending, batch, &proofs).await?;
+        self.events.push(AppEvent::MessageReceived {
+            seq: pending.seq,
+            kind: pending.kind,
+            msg_id: pending.msg_id,
+            sender: pending.sender,
+        });
+        Ok(())
     }
 
     async fn drop_pending_effect(&mut self) -> Result<(), AppError> {
@@ -937,6 +983,9 @@ impl App {
             return Ok(());
         };
         let batch = Batch::from_body(pending.body.clone())?;
+        if super::batch_generation(&batch).is_some_and(|g| g < self.state.meta.generation) {
+            return self.resend_earlier_effect(pending, &batch).await;
+        }
         match self.run_effect(pending.clone(), &batch).await? {
             Sent::Applied => self.events.push(AppEvent::MessageReceived {
                 seq: pending.seq,

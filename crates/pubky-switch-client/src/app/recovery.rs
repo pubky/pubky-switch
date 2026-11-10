@@ -444,7 +444,9 @@ impl App {
         self.rebuild_client()?;
         // The kept writes, judged against the old chain view before it goes (Switch spec
         // 12.6 step 1, 13.5).
-        let events = self.carry_kept_writes(&mut tx, true).await?;
+        let events = self
+            .carry_kept_writes(&mut tx, super::provider::Carry::AfterLoss)
+            .await?;
         let batch = self.sign_ops(
             vec![
                 (

@@ -110,7 +110,11 @@ uploads; `push.rs` holds the push registration. The peek (`peek.rs`) writes noth
   `pending/effect` or `opq/<batch_id>` whose batch ID the old chain holds was applied: its
   outcome commits at the switch. Otherwise the effect goes, and its entry is read again;
   a kept `opq/` batch is signed again for the new generation under a new batch ID. A
-  frozen service's `410 moved` keeps them for the switch.
+  frozen service's `410 moved` keeps them for the switch. A move the app never saw frozen,
+  or a key change in place, didn't read the old feed to its end: its kept batches and
+  effect stay unchanged and go again first, and the answer decides (original proofs or
+  `409 conflict`: applied; `409 stale_generation`: signed again); one kept 30 days less
+  the clock tolerance or more goes instead.
 - **A newer own `identity.json`** that names a later generation, a loss of the generation
   moved from, or another service than the freeze, supersedes a move or a loss at any step,
   a stuck one included: after a step fails at a service the app reads its `identity.json`
