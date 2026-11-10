@@ -588,14 +588,23 @@ pub enum AppEvent {
         /// The rule, without content.
         reason: String,
     },
-    /// The protocol's mark of what the app has seen in a record
-    /// ([`super::Protocol::record_seen`]) was over [`super::MAX_SEEN_MARK_BYTES`]: it wasn't
-    /// kept, and the record keeps the mark it held.
-    SeenMarkDropped {
+    /// The protocol's mark of what the app has seen in a record after a write
+    /// ([`super::Protocol::record_seen`]) was over [`super::MAX_SEEN_MARK_BYTES`], so the
+    /// record's writes can't be checked against what the app has seen from that write on
+    /// (Switch spec 8.2). For another app's write the record keeps the mark it held, so
+    /// what was seen before is still checked; for an own write the mark held goes. A duty
+    /// event, of the class of [`AppEvent::WriteFlagged`].
+    RecordUncheckable {
+        /// The duty event's ID.
+        id: EventId,
         /// The record key.
         key: [u8; 32],
-        /// The mark's size.
-        bytes: usize,
+        /// The app the write names.
+        writer: [u8; 16],
+        /// The write's generation and `seq`.
+        version: pubky_switch_core::ops::RecordVersion,
+        /// The size of the mark that wasn't kept.
+        mark_bytes: u64,
     },
     /// Uploads after a provider loss conflict with a record's current write (Switch spec
     /// 12.6).
@@ -649,6 +658,7 @@ impl AppEvent {
             | Self::RestoreLeftBehind { id, .. }
             | Self::AttemptDropped { id, .. }
             | Self::MessageUndelivered { id, .. }
+            | Self::RecordUncheckable { id, .. }
             | Self::LocalWritesRefused { id, .. } => Some(*id),
             _ => None,
         }
@@ -774,6 +784,15 @@ pub(crate) enum Duty {
     LocalWritesRefused {
         call: KeptRefusal,
     },
+    RecordUncheckable {
+        #[serde(with = "serde_b64")]
+        key: [u8; 32],
+        #[serde(with = "serde_b64")]
+        writer: [u8; 16],
+        generation: u64,
+        version: u64,
+        mark_bytes: u64,
+    },
     RestoreLeftBehind {
         duty_events: u64,
         owed_calls: u64,
@@ -833,6 +852,19 @@ impl Duty {
             Self::LocalWritesRefused { call } => AppEvent::LocalWritesRefused {
                 id,
                 call: call.call(),
+            },
+            Self::RecordUncheckable {
+                key,
+                writer,
+                generation,
+                version,
+                mark_bytes,
+            } => AppEvent::RecordUncheckable {
+                id,
+                key,
+                writer,
+                version: pubky_switch_core::ops::RecordVersion::new(generation, version),
+                mark_bytes,
             },
             Self::RestoreLeftBehind {
                 duty_events,
