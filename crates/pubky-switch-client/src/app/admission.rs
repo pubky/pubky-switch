@@ -100,7 +100,8 @@ pub struct SenderDisposition {
     /// (as an app without `lists.read`), was restored from a backup, which carries no copy,
     /// or followed a provider loss since. `blocked` and `flagged` then say nothing of the
     /// sender: a `false` may be a deny or a flag the app never saw, such as its own deny made
-    /// before the backup. A protocol must not read `None` as neither blocked nor flagged. An
+    /// before the backup. A protocol must not read `None` as neither blocked nor flagged,
+    /// unless the protocol states its own rule for an unknown sender. An
     /// app with `lists.read` refreshes a copy in that state at its next
     /// [`App::receive`](super::App::receive), before it hands any entry over, when it can.
     pub lists_as_of_ms: Option<u64>,

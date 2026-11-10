@@ -100,7 +100,7 @@ impl SwitchClient {
         let o = Obj::of(&value, what)?;
         let head = o.head("head")?;
         verify_head(&head, key, &self.account())?;
-        let docs = o.each("proofs", read::doc)?;
+        let docs = o.required_each("proofs", read::doc)?;
         if docs.len() > 1 {
             return Err(proof_error("one proof for one item written"));
         }
