@@ -1113,20 +1113,26 @@ async fn test_records_write_by_a_removed_app_after_distrust_is_flagged() {
         .await
         .unwrap();
     phone.receive(None).await.unwrap();
-    // The signer removes the wallet, distrusted from an hour ago; its later write has no
-    // standing.
+    // The signer removes the wallet, distrusted from an hour ago, and publishes the document
+    // before the switch takes it: the wallet's write the switch still accepts has no
+    // standing for the phone, which read the document first.
     let me = wallet.app_id();
-    s.w.next_doc(|body| {
-        body.apps.retain(|app| app.app_id != me);
-        body.removed.push(RemovedApp {
-            app_id: me,
-            distrust_from: START - HOUR,
-        })
-    });
+    let doc =
+        s.w.signer
+            .sign_next(|body| {
+                body.apps.retain(|app| app.app_id != me);
+                body.removed.push(RemovedApp {
+                    app_id: me,
+                    distrust_from: START - HOUR,
+                })
+            })
+            .unwrap();
     wallet
         .put_record(&target, &value(&["a", "z"]), vec![])
         .await
         .unwrap();
+    assert!(phone.refresh_identity().await.unwrap());
+    s.w.switch.deliver_identity(&doc).unwrap();
     phone.receive(None).await.unwrap();
     let key = phone.record_key(&target).unwrap();
     let held = phone.shared_record(&key).await.unwrap().unwrap();

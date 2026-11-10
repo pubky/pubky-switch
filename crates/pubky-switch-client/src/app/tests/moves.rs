@@ -155,7 +155,7 @@ pub(crate) async fn join(w: &World, router: &Router) -> App {
         router,
         Arc::clone(&w.store) as Arc<dyn StateStore>,
         w.protocol.clone(),
-        &[],
+        &[Permission::ConversationAdd],
     )
     .await
 }
@@ -305,11 +305,14 @@ async fn test_move_followed_from_a_frozen_feed() {
     )));
     assert_eq!(app.cursor().generation, 2);
     assert_eq!(app.own_identity().generation(), 2);
-    // The record and the current key went to the next service at generation 2.
-    let reregistered = next.applied();
+    // The record and the current key went to the next service at generation 2: the bytes
+    // it imported, so the batch chains nothing (Switch wire 6.4 "No-ops").
+    assert_eq!(next.app(&me).receive_key, w.switch.app(&me).receive_key);
+    let ops_at_next = format!("POST {NEXT} /v1/{}/ops", w.alice.id());
     assert!(
-        reregistered.iter().any(|op| op.body().generation == 2
-            && matches!(op.body().kind, OpKind::ReceiveKeyPut { .. }))
+        router.0.log().contains(&ops_at_next),
+        "{:?}",
+        router.0.log()
     );
     // The old service's proofs went again once the move was published, without the cert.
     let uploads = next.uploads();
@@ -517,11 +520,15 @@ async fn test_move_compares_the_admission_lists() {
     let me = app.app_id();
     let carol = IdentityKey::from_secret(seed("carol/identity")).public();
     let erin = IdentityKey::from_secret(seed("erin/identity")).public();
+    let phone = w.other_app("phone", &[Permission::ListsManage]);
     w.switch
-        .signer_op(OpKind::AllowPut {
-            pubky: carol,
-            kind: AllowKind::Contact,
-        })
+        .app_op(
+            &phone,
+            OpKind::AllowPut {
+                pubky: carol,
+                kind: AllowKind::Contact,
+            },
+        )
         .unwrap();
     app.receive(None).await.unwrap();
     let n_key = next_key();
@@ -592,12 +599,18 @@ async fn test_move_registers_again_a_key_the_next_service_rolled_back() {
     w.switch.freeze(&freeze_for(&w, &n_key, 2)).unwrap();
     let next = w.switch.import_into(n_key.to_bytes());
     router.add(NEXT, &next);
-    // The export shows the app's older key as current.
+    // The export shows the app's older key as current, and its kid index holds that key's
+    // kid alone.
+    let first_kid = first.as_ref().map(|record| {
+        let value: serde_json::Value = record.peek().unwrap();
+        pubky_switch_core::enc::unb64_array::<8>(value["kid"].as_str().unwrap()).unwrap()
+    });
     {
         let mut inner = next.lock();
         let held = inner.apps.get_mut(&me).unwrap();
         held.receive_key = first;
         held.receive_n = Some(0);
+        inner.kids.retain(|kid| Some(*kid) == first_kid);
     }
     app.receive(None).await.unwrap();
     publish_at(
@@ -698,7 +711,14 @@ async fn test_key_change_in_place_is_followed_without_a_freeze() {
 async fn moved_world(store: Arc<dyn StateStore>) -> (World, Router, Arc<ScriptedSwitch>, u64) {
     let w = World::new();
     let router = Router::of(&w);
-    let mut app = join_on(&w, &router, store, w.protocol.clone(), &[]).await;
+    let mut app = join_on(
+        &w,
+        &router,
+        store,
+        w.protocol.clone(),
+        &[Permission::ConversationAdd],
+    )
+    .await;
     let me = app.app_id();
     w.note(me, "before");
     app.receive(None).await.unwrap();
@@ -827,13 +847,19 @@ async fn lost_world(store: Arc<dyn StateStore>) -> Lost {
     let me = app.app_id();
     let carol = IdentityKey::from_secret(seed("carol/identity")).public();
     let dave = IdentityKey::from_secret(seed("dave/identity")).public();
+    let phone = w.other_app("phone", &[Permission::ListsManage]);
     w.switch
-        .signer_op(OpKind::AllowPut {
-            pubky: carol,
-            kind: AllowKind::Contact,
-        })
+        .app_op(
+            &phone,
+            OpKind::AllowPut {
+                pubky: carol,
+                kind: AllowKind::Contact,
+            },
+        )
         .unwrap();
-    w.switch.signer_op(OpKind::DenyPut { pubky: dave }).unwrap();
+    w.switch
+        .app_op(&phone, OpKind::DenyPut { pubky: dave })
+        .unwrap();
     w.clock.advance_ms(1000);
     let note_at_ms = w.clock.now_ms();
     w.note(me, "before the loss");
@@ -1424,7 +1450,7 @@ async fn test_move_reads_the_old_feed_past_pages_of_entries_alone() {
         router.env(&w, Arc::clone(&w.store) as Arc<dyn StateStore>),
         w.protocol.clone(),
         config,
-        approve_with(&w, &[]),
+        approve_with(&w, &[Permission::ConversationAdd]),
     )
     .await
     .unwrap();
@@ -1552,7 +1578,14 @@ async fn test_loss_stuck_at_a_gone_service_follows_a_newer_loss() {
 async fn test_move_carries_kept_batches_to_the_next_service() {
     let w = World::new();
     let router = Router::of(&w);
-    let mut app = join(&w, &router).await;
+    let mut app = join_on(
+        &w,
+        &router,
+        Arc::clone(&w.store) as Arc<dyn StateStore>,
+        w.protocol.clone(),
+        &[Permission::ListsManage, Permission::ConversationAdd],
+    )
+    .await;
     let carol = IdentityKey::from_secret(seed("carol/identity")).public();
     let erin = IdentityKey::from_secret(seed("erin/identity")).public();
     let dave = IdentityKey::from_secret(seed("dave/identity")).public();
@@ -1675,6 +1708,24 @@ fn wallet_key_record(
     .unwrap()
 }
 
+/// A copy of the wallet's signing key registers `record` first at the new service, after
+/// delivering the wallet's app record there, as an own app's first call must.
+fn register_first(lost: &Lost, app: &App, record: &pubky_switch_core::records::ReceiveKeyRecord) {
+    let keys = app_keys("wallet");
+    let app_record = app.record().clone();
+    lost.next
+        .app_op(&keys, OpKind::AppPut { record: app_record })
+        .unwrap();
+    lost.next
+        .app_op(
+            &keys,
+            OpKind::ReceiveKeyPut {
+                record: record.signed().clone(),
+            },
+        )
+        .unwrap();
+}
+
 #[tokio::test]
 async fn test_loss_registration_taken_by_another_device_is_adopted() {
     let store = Arc::new(MemoryStore::new());
@@ -1689,16 +1740,7 @@ async fn test_loss_registration_taken_by_another_device_is_adopted() {
     // Another device of the app registers its key first, and shares its kid.
     let mut app = load_lost(&lost, Arc::clone(&store) as Arc<dyn StateStore>).await;
     let other = pubky_switch_core::keys::ReceiveKey::generate(1).unwrap();
-    let record = wallet_key_record(&app, &other);
-    lost.next
-        .app_op(
-            &app_keys("wallet"),
-            OpKind::ReceiveKeyPut {
-                record: record.signed().clone(),
-            },
-        )
-        .unwrap()
-        .unwrap();
+    register_first(&lost, &app, &wallet_key_record(&app, &other));
     app.take_device_keys(crate::app::DeviceKeys {
         receive_keys: Vec::new(),
         known: vec![(pubky_switch_core::enc::b64(&other.kid), 1)],
@@ -1730,17 +1772,8 @@ async fn test_loss_registration_taken_by_a_foreign_key_is_a_compromise() {
     let app = load_lost(&lost, Arc::clone(&store) as Arc<dyn StateStore>).await;
     let me = app.app_id();
     let thief = pubky_switch_core::keys::ReceiveKey::generate(1).unwrap();
-    let record = wallet_key_record(&app, &thief);
+    register_first(&lost, &app, &wallet_key_record(&app, &thief));
     drop(app);
-    lost.next
-        .app_op(
-            &app_keys("wallet"),
-            OpKind::ReceiveKeyPut {
-                record: record.signed().clone(),
-            },
-        )
-        .unwrap()
-        .unwrap();
     let error = follow_loss(&lost, store as Arc<dyn StateStore>)
         .await
         .unwrap_err();
@@ -1816,12 +1849,13 @@ async fn test_registration_sent_again_never_takes_the_service_cursor_back() {
     let router = Router::of(&w);
     let mut app = join(&w, &router).await;
     let me = app.app_id();
+    let phone = w.other_app("phone", &[Permission::ListsManage]);
     w.note(me, "one");
     app.receive(None).await.unwrap();
     // A chain item the cursor passes with its move deferred, then the rotation, whose
     // registration doesn't reach the service.
     w.switch
-        .signer_op(OpKind::DenyPut { pubky: [9; 32] })
+        .app_op(&phone, OpKind::DenyPut { pubky: [9; 32] })
         .unwrap();
     w.clock.advance_ms(25 * 3_600_000);
     w.switch.fail_next(Fault::Unreachable {
@@ -1868,15 +1902,23 @@ async fn test_move_lists_batch_is_kept_and_sent_again_unchanged() {
         &router,
         Arc::clone(&w.store) as Arc<dyn StateStore>,
         w.protocol.clone(),
-        &[Permission::ListsRead, Permission::ListsManage],
+        &[
+            Permission::ListsRead,
+            Permission::ListsManage,
+            Permission::ConversationAdd,
+        ],
     )
     .await;
     let carol = IdentityKey::from_secret(seed("carol/identity")).public();
+    let phone = w.other_app("phone", &[Permission::ListsManage]);
     w.switch
-        .signer_op(OpKind::AllowPut {
-            pubky: carol,
-            kind: AllowKind::Contact,
-        })
+        .app_op(
+            &phone,
+            OpKind::AllowPut {
+                pubky: carol,
+                kind: AllowKind::Contact,
+            },
+        )
         .unwrap();
     app.receive(None).await.unwrap();
     let n_key = next_key();
@@ -1969,12 +2011,16 @@ async fn test_chain_hashes_behind_the_cursor_stay_bounded() {
             .unwrap()
             .len()
     };
+    let phone = w.other_app("phone", &[Permission::ListsManage]);
     for round in 0..3u8 {
         for i in 0..100u8 {
             w.switch
-                .signer_op(OpKind::DenyPut {
-                    pubky: [round.wrapping_mul(100).wrapping_add(i); 32],
-                })
+                .app_op(
+                    &phone,
+                    OpKind::DenyPut {
+                        pubky: [round.wrapping_mul(100).wrapping_add(i); 32],
+                    },
+                )
                 .unwrap();
         }
         app.receive(None).await.unwrap();

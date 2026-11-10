@@ -1,6 +1,7 @@
 //! The public `testing` module, used as a crate built on the Switch uses it: an identity and
 //! an app with a neutral sample protocol join a scripted switch, receive a message from a
-//! peer, write a shared record, and write a claim attempt and its `done`.
+//! peer, write a shared record, and write a claim attempt and its `done`; another own app's
+//! operations, injected, are applied as the switch applies a submitted batch.
 
 // The helpers set up fixed test state, where a failure is a test failure.
 #![allow(clippy::unwrap_used)]
@@ -13,14 +14,17 @@ use pubky_switch_client::app::{
 use pubky_switch_client::clock::TestClock;
 use pubky_switch_client::store::{MemoryStore, StateStore};
 use pubky_switch_client::testing::{
-    AppSpec, PEER_ORIGIN, PeerSwitch, ProtocolSpec, Router, START_MS, SWITCH_ORIGIN, Seeds,
-    TestHomeserver, TestIdentity, TestProtocol, TestSigner,
+    AppSpec, PEER_ORIGIN, PeerSwitch, ProtocolSpec, Router, START_MS, SWITCH_ORIGIN, ScriptError,
+    Seeds, TestHomeserver, TestIdentity, TestProtocol, TestSigner,
 };
 use pubky_switch_client::transport::Transport;
-use pubky_switch_core::claims::{Basis, ClaimStatus};
-use pubky_switch_core::ident::Policy;
+use pubky_switch_core::claims::{Basis, ClaimFields, ClaimStatus, ClaimType};
+use pubky_switch_core::ident::{NamingKey, Policy, collection_id, record_key_from_blinded};
+use pubky_switch_core::keys::AppKeys;
+use pubky_switch_core::ops::{IdInputs, OpKind, RecordPut, RecordVersion};
 use pubky_switch_core::records::DAY_MS;
 use pubky_switch_core::scopes::Permission;
+use pubky_switch_core::sealed::SealedValue;
 use serde_json::json;
 
 /// A neutral sample protocol: scope `notes` has keys, apps accept `example.note`, and one
@@ -90,6 +94,49 @@ impl Setup {
             .await
             .unwrap()
     }
+
+    /// Another own app, `name`, registered with `app`, whose operations the test injects.
+    fn other_app(&self, name: &str, app: &AppSpec) -> AppKeys {
+        let keys = self.alice.identity().app_keys(name);
+        self.alice.register_app(&keys, app).unwrap();
+        keys
+    }
+
+    /// A first write of `value` at `natural_key` of `example.items`, as an app of alice
+    /// builds it.
+    fn create(&self, natural_key: &[u8], value: &[u8]) -> RecordPut {
+        let identity = self.alice.identity().key();
+        let policy = items().policy;
+        let blinded = NamingKey::from_root(&identity.switch_root()).blind(natural_key);
+        let key = record_key_from_blinded("example.items", &blinded, &policy.hash().unwrap());
+        let scope_key = identity.scope_key(1, "notes");
+        let sealed =
+            SealedValue::seal(&scope_key, &identity.public(), 1, "notes", &key, value).unwrap();
+        RecordPut {
+            key,
+            collection: collection_id("example.items", &identity.public()),
+            policy,
+            expected_version: RecordVersion::NONE,
+            value_sealed: sealed,
+            id_inputs: Some(IdInputs {
+                collection: "example.items".into(),
+                blinded_key: blinded,
+            }),
+        }
+    }
+}
+
+fn attempt(claim_key: [u8; 32], attempt_id: [u8; 16], expected_step: u64) -> OpKind {
+    OpKind::Claim(ClaimFields {
+        claim_key: claim_key.to_vec(),
+        kind: ClaimType::Attempt,
+        expected_step,
+        attempt_id: attempt_id.to_vec(),
+        orphan_after: Some(3600),
+        deadline: Some(START_MS + DAY_MS),
+        basis: None,
+        evidence_ref: None,
+    })
 }
 
 #[tokio::test]
@@ -205,4 +252,115 @@ async fn test_testing_app_writes_a_claim_attempt_and_done() {
         )
         .await;
     assert!(refused.is_err());
+}
+
+#[tokio::test]
+async fn test_testing_injected_claim_attempt_is_applied() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let phone = s.other_app(
+        "phone",
+        &AppSpec::new(&["notes"]).with_permissions(&Permission::ALL),
+    );
+    let switch = s.alice.switch();
+    let (claim_key, attempt_id) = ([5; 32], [6; 16]);
+    let seq = switch
+        .app_op(&phone, attempt(claim_key, attempt_id, 0))
+        .unwrap();
+    assert_eq!(seq, switch.seq());
+    let claim = switch.claim(&claim_key).unwrap();
+    assert_eq!(claim.step, 1);
+    let current = claim.current_attempt().unwrap();
+    assert_eq!(
+        (current.attempt_id, current.owner),
+        (attempt_id, phone.app_id_bytes())
+    );
+    // The wallet reads and checks the claim the phone wrote, with its entry and proof.
+    let read = wallet.read_claim(&claim_key).await.unwrap().unwrap();
+    assert_eq!(read.view.status, ClaimStatus::Attempting);
+    assert_eq!(read.view.owner, Some(phone.app_id_bytes()));
+    assert_eq!(read.entries.len(), 1);
+}
+
+#[tokio::test]
+async fn test_testing_injected_claim_refused_changes_nothing() {
+    let s = Setup::new();
+    let switch = s.alice.switch();
+    let phone = s.other_app(
+        "phone",
+        &AppSpec::new(&["notes"]).with_permissions(&Permission::ALL),
+    );
+    let reader = s.other_app("reader", &AppSpec::new(&["notes"]));
+    let claim_key = [5; 32];
+    switch
+        .app_op(&phone, attempt(claim_key, [6; 16], 0))
+        .unwrap();
+    let seq = switch.seq();
+    // Without `claims.write`, and at a step the claim isn't at.
+    let missing = switch.app_op(&reader, attempt(claim_key, [7; 16], 1));
+    assert!(
+        matches!(missing, Err(ScriptError::Refused { status: 403, .. })),
+        "{missing:?}"
+    );
+    let stale = switch.app_op(&phone, attempt(claim_key, [7; 16], 0));
+    assert!(
+        matches!(stale, Err(ScriptError::Refused { status: 409, .. })),
+        "{stale:?}"
+    );
+    // An app that never delivered its record.
+    let stranger = s.alice.identity().app_keys("stranger");
+    let unknown = switch.app_op(&stranger, attempt([8; 32], [9; 16], 0));
+    assert!(
+        matches!(unknown, Err(ScriptError::Refused { status: 403, .. })),
+        "{unknown:?}"
+    );
+    assert_eq!(switch.seq(), seq);
+    assert_eq!(switch.claim(&claim_key).unwrap().step, 1);
+    assert!(switch.claim(&[8; 32]).is_none());
+}
+
+#[tokio::test]
+async fn test_testing_injected_record_write_is_applied() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let phone = s.other_app("phone", &AppSpec::new(&["notes"]));
+    let switch = s.alice.switch();
+    let value = json!({ "items": ["b"] }).to_string().into_bytes();
+    let put = s.create(b"n1", &value);
+    let key = put.key;
+    let seq = switch.app_op(&phone, OpKind::RecordPut(put)).unwrap();
+    let held = switch.record(&key).unwrap();
+    assert_eq!(held.writer, phone.app_id_bytes());
+    assert_eq!(held.seq, seq);
+    assert_eq!(held.state.version, RecordVersion::new(1, seq));
+    // The wallet reads the phone's write.
+    let target = RecordTarget::new(items(), b"n1");
+    assert_eq!(wallet.record_key(&target).unwrap(), key);
+    let read = wallet.read_record(&target).await.unwrap().unwrap();
+    assert_eq!(read.content.value(), Some(value.as_slice()));
+}
+
+#[tokio::test]
+async fn test_testing_injected_record_conflict_changes_nothing() {
+    let s = Setup::new();
+    let phone = s.other_app("phone", &AppSpec::new(&["notes"]));
+    let switch = s.alice.switch();
+    let other = s.other_app("other", &AppSpec::new(&["other"]));
+    let first = s.create(b"n1", b"{}");
+    let key = first.key;
+    let seq = switch.app_op(&phone, OpKind::RecordPut(first)).unwrap();
+    // A second create of the same record: its expected version isn't the record's.
+    let again = switch.app_op(&phone, OpKind::RecordPut(s.create(b"n1", b"[]")));
+    assert!(
+        matches!(again, Err(ScriptError::Refused { status: 409, .. })),
+        "{again:?}"
+    );
+    // Without a write scope of the record.
+    let unscoped = switch.app_op(&other, OpKind::RecordPut(s.create(b"n2", b"{}")));
+    assert!(
+        matches!(unscoped, Err(ScriptError::Refused { status: 403, .. })),
+        "{unscoped:?}"
+    );
+    assert_eq!(switch.seq(), seq);
+    assert_eq!(switch.record(&key).unwrap().seq, seq);
 }

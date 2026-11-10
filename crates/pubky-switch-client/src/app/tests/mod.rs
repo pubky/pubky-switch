@@ -14,6 +14,7 @@ use pubky_switch_core::ops::{AllowKind, OpKind};
 use pubky_switch_core::records::{
     AppCert, IdentityBody, IdentityDoc, IdentityPolicy, Inbox, ListedApp,
 };
+use pubky_switch_core::scopes::Permission;
 use serde_json::{Value, json};
 
 use super::{
@@ -154,13 +155,21 @@ pub(crate) struct World {
     pub(crate) protocol: Arc<SampleProtocol>,
 }
 
+/// A certificate for `keys` with `scopes` and `conversation.add`, as [`World::approve`]
+/// grants.
 pub(crate) fn cert_for(
     identity: &IdentityKey,
     keys: &AppKeys,
     issued: u64,
     scopes: &[&str],
 ) -> AppCert {
-    issue_cert(identity, keys, &AppSpec::new(scopes), issued).unwrap()
+    issue_cert(identity, keys, &sample_app(scopes), issued).unwrap()
+}
+
+/// What the sample protocol's apps are approved for: `scopes`, and `conversation.add` for its
+/// conversation entries.
+pub(crate) fn sample_app(scopes: &[&str]) -> AppSpec {
+    AppSpec::new(scopes).with_permissions(&[Permission::ConversationAdd])
 }
 
 impl World {
@@ -222,10 +231,20 @@ impl World {
         self.signer.next_doc(change).unwrap()
     }
 
-    /// The signer approves `keys` for `scopes`: a certificate, the document that lists it,
-    /// and the approval.
+    /// The signer approves `keys` for [`sample_app`] with `scopes`: a certificate, the
+    /// document that lists it, and the approval.
     pub(crate) fn approve(&self, keys: &AppKeys, scopes: &[&str]) -> JoinRequest {
-        self.signer.approve(keys, &AppSpec::new(scopes)).unwrap()
+        self.signer.approve(keys, &sample_app(scopes)).unwrap()
+    }
+
+    /// Another own app, `name`, listed and registered at the switch with `permissions`, as
+    /// another device of the account: for operations a test injects with
+    /// [`ScriptedSwitch::app_op`].
+    pub(crate) fn other_app(&self, name: &str, permissions: &[Permission]) -> AppKeys {
+        let keys = app_keys(name);
+        let spec = AppSpec::new(&["scope-a"]).with_permissions(permissions);
+        self.signer.register_app(&keys, &spec).unwrap();
+        keys
     }
 
     pub(crate) async fn join(&self, name: &str) -> App {

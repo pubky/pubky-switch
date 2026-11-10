@@ -274,7 +274,6 @@ async fn test_app_unexpected_registration_stops_and_leaves() {
                 record: record.signed().clone(),
             },
         )
-        .unwrap()
         .unwrap();
     let at = w.clock.now_ms();
     let error = app.receive(None).await.unwrap_err();
@@ -317,7 +316,6 @@ async fn test_app_conflict_naming_a_foreign_key_is_a_compromise() {
                 record: record.signed().clone(),
             },
         )
-        .unwrap()
         .unwrap();
     // The app rotates before reading the thief's registration: `409 conflict` names it.
     let error = app.rotate().await.unwrap_err();
@@ -384,7 +382,6 @@ async fn test_app_device_sync_without_the_key_is_a_compromise() {
                 record: record.signed().clone(),
             },
         )
-        .unwrap()
         .unwrap();
     // A newer key than every one held: the read stops and waits for device sync.
     let report = app.receive(None).await.unwrap();
@@ -875,11 +872,16 @@ async fn test_app_ignores_a_cert_put_of_other_keys() {
         w.clock.now_ms() + 1000,
         &["scope-a"],
     );
+    // A compliant switch refuses this cert.put; a faulty one chains it.
     w.switch
-        .signer_op(OpKind::CertPut {
-            target_app_id: app.app_id(),
-            cert: other.signed().clone(),
-        })
+        .chain_unchecked(
+            &w.alice,
+            None,
+            OpKind::CertPut {
+                target_app_id: app.app_id(),
+                cert: other.signed().clone(),
+            },
+        )
         .unwrap();
     let report = app.receive(None).await.unwrap();
     assert!(!has(&report.events, |e| matches!(e, AppEvent::RenewalSeen)));
@@ -943,7 +945,8 @@ async fn test_app_skips_a_bundle_part_with_another_naming_key() {
     let mut app = w.join("wallet").await;
     let me = app.app_id();
     // Another identity's parts, sealed to the app's bundle key: they don't verify for
-    // alice and are skipped; nothing is taken.
+    // alice, so a compliant switch refuses them; a faulty one chains them, and the app skips
+    // them and takes nothing.
     let mallory = IdentityKey::from_secret([46; 32]);
     let fake_cert = cert_for(
         &mallory,
@@ -956,12 +959,16 @@ async fn test_app_skips_a_bundle_part_with_another_naming_key() {
         .unwrap()
         .remove(0);
     w.switch
-        .signer_op(OpKind::KeyBundlePut(KeyBundlePut {
-            target_app_id: me,
-            bundle: part.bundle,
-            first_epoch: 1,
-            last_epoch: 1,
-        }))
+        .chain_unchecked(
+            &w.alice,
+            None,
+            OpKind::KeyBundlePut(KeyBundlePut {
+                target_app_id: me,
+                bundle: part.bundle,
+                first_epoch: 1,
+                last_epoch: 1,
+            }),
+        )
         .unwrap();
     let report = app.receive(None).await.unwrap();
     assert!(has(&report.events, |e| matches!(
@@ -1070,7 +1077,6 @@ async fn test_app_restore_registration_after_its_own_key_is_a_compromise() {
                 record: record.signed().clone(),
             },
         )
-        .unwrap()
         .unwrap();
     let error = restored.receive(None).await.unwrap_err();
     assert!(

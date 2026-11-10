@@ -6,10 +6,11 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use pubky_switch_core::keys::{AppKeys, IdentityKey};
 use pubky_switch_core::message::Message;
+use pubky_switch_core::ops::OpKind;
 use pubky_switch_core::records::{
-    AppCert, AppCertBody, AppRequest, AppRequestBody, Approval, AuthRequest,
-    DEFAULT_CERT_LIFETIME_MS, IdentityBody, IdentityDoc, IdentityPolicy, Inbox, ListedApp,
-    app_record_path,
+    AppCert, AppCertBody, AppRecord, AppRecordBody, AppRequest, AppRequestBody, Approval,
+    AuthRequest, DEFAULT_CERT_LIFETIME_MS, IdentityBody, IdentityDoc, IdentityPolicy, Inbox,
+    ListedApp, app_record_path,
 };
 use pubky_switch_core::scopes::Permission;
 
@@ -262,6 +263,33 @@ impl TestSigner {
             request,
             approval: approval.to_json()?,
         })
+    }
+
+    /// The signer approves the app with `keys` for what `app` names, and the app delivers
+    /// its record to the account's switch without joining: another own app, such as a
+    /// second device, whose operations a test injects with [`ScriptedSwitch::app_op`].
+    /// Returns its certificate.
+    ///
+    /// # Errors
+    ///
+    /// When a document doesn't sign, or the switch refuses the record.
+    pub fn register_app(&self, keys: &AppKeys, app: &AppSpec) -> Result<AppCert, ScriptError> {
+        let now = self.clock.now_ms();
+        let cert = issue_cert(self.identity.key(), keys, app, now)?;
+        self.next_doc(|body| {
+            body.apps.push(ListedApp {
+                app_id: cert.app_id(),
+                cert: cert.hash(),
+            })
+        })?;
+        let record = AppRecord::sign(keys, AppRecordBody::new(&cert, Vec::new(), now))?;
+        self.switch.app_op(
+            keys,
+            OpKind::AppPut {
+                record: record.signed().clone(),
+            },
+        )?;
+        Ok(cert)
     }
 
     /// An app's environment on `store`, talking to the account's switch only.

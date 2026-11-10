@@ -442,13 +442,17 @@ async fn test_peek_on_a_chain_that_doesnt_verify_is_generic_and_raises_nothing()
     let router = Router::of(&w);
     let mut app = join(&w, &router).await;
     let me = app.app_id();
+    let phone = w.other_app("phone", &[Permission::ListsManage]);
     w.note(me, "first");
     app.receive(None).await.unwrap();
     let verified = w.switch.tip_seq();
     // The service rolls back its chain and forks it.
     w.switch.roll_back_to(verified - 1);
     w.switch
-        .signer_op(pubky_switch_core::ops::OpKind::DenyPut { pubky: [5; 32] })
+        .app_op(
+            &phone,
+            pubky_switch_core::ops::OpKind::DenyPut { pubky: [5; 32] },
+        )
         .unwrap();
     let seq = w.note(me, "second").0;
     let before = snapshot(&w.store, &me);
