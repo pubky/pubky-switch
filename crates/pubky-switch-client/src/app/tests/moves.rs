@@ -2965,7 +2965,7 @@ async fn test_loss_reports_the_attempts_of_a_kept_effect_it_drops() {
         .unwrap();
     app.commit(tx).await.unwrap();
     drop(app);
-    let (app, events) = follow_loss(&lost, Arc::clone(&store) as Arc<dyn StateStore>)
+    let (mut app, events) = follow_loss(&lost, Arc::clone(&store) as Arc<dyn StateStore>)
         .await
         .unwrap();
     let dropped = |e: &AppEvent| {

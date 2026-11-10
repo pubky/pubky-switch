@@ -48,7 +48,8 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
   loses nothing, since every load reports the kept duty events again. A commit that
   answers `StoreError::Unknown` may have been applied: the reload after it reports every
   kept duty event no call reported yet. An acknowledgement removes only events handed to
-  the host since the app was loaded.
+  the host since the app was loaded, by `take_events`, a call's report or
+  `unacknowledged_events`.
 - **Only the host's acknowledgement removes a duty event.** The app sets no cap on
   `duty/`: a cap would have to lose a duty event, or stop reading the feed (which never
   stalls, Switch spec 8.2), giving up undeliverable messages (Switch spec 11) or following

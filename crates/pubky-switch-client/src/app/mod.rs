@@ -781,7 +781,7 @@ impl App {
                 tx.commit(&app.env.store).await?;
             }
             // Duty events not acknowledged before are delivered again (`events` module).
-            let kept = app.unacknowledged_events().await?;
+            let kept = app.kept_duties().await?;
             app.queue_duties(kept);
             Ok(app)
         })
@@ -1057,7 +1057,7 @@ impl App {
                 Restorable::Ready(app, tx) => {
                     tx.commit(&app.env.store).await?;
                     let mut app = *app;
-                    let kept = app.unacknowledged_events().await?;
+                    let kept = app.kept_duties().await?;
                     app.queue_duties(kept);
                     Ok(app)
                 }
@@ -1527,7 +1527,7 @@ impl App {
     async fn queue_unreported_duties(&mut self) -> Result<(), AppError> {
         let queued = self.duty_queued;
         let kept: Vec<AppEvent> = self
-            .unacknowledged_events()
+            .kept_duties()
             .await?
             .into_iter()
             .filter(|event| event.id().is_some_and(|id| id.counter() > queued))
@@ -1550,12 +1550,23 @@ impl App {
 
     /// The duty events kept and not acknowledged yet, by ascending ID: what a host that
     /// lost its copy of the reports still has to act on. Nothing but [`App::ack_events`]
-    /// shortens this list (`events` module, "Duty events").
+    /// shortens this list (`events` module, "Duty events"). Listing them hands them to the
+    /// host, as [`App::take_events`] does, so an acknowledgement up to the last of them
+    /// removes them all.
     ///
     /// # Errors
     ///
     /// A failed store read.
-    pub async fn unacknowledged_events(&self) -> Result<Vec<AppEvent>, AppError> {
+    pub async fn unacknowledged_events(&mut self) -> Result<Vec<AppEvent>, AppError> {
+        let kept = self.kept_duties().await?;
+        for id in kept.iter().filter_map(AppEvent::id) {
+            self.duty_handed = self.duty_handed.max(id.counter());
+        }
+        Ok(kept)
+    }
+
+    /// The duty events kept, by ascending ID, without handing them to the host.
+    pub(crate) async fn kept_duties(&self) -> Result<Vec<AppEvent>, AppError> {
         Ok(self
             .reader()
             .scan_numbered::<events::Duty>(key::DUTY_PREFIX)

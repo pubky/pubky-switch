@@ -2254,7 +2254,7 @@ async fn test_duty_events_and_owed_calls_carried_across_a_restore_in_place() {
     );
     // Restored on another device, nothing of this store is carried.
     let store = Arc::new(MemoryStore::new());
-    let other = App::restore(
+    let mut other = App::restore(
         w.env_on(Arc::clone(&store) as Arc<dyn StateStore>),
         w.protocol.clone(),
         World::config(),
@@ -2369,16 +2369,16 @@ async fn test_duty_event_kept_but_not_taken_survives_an_acknowledgement() {
             continue;
         }
         if !refused_events(&app.take_events(), seq).is_empty()
-            || refused_events(&app.unacknowledged_events().await.unwrap(), seq).is_empty()
+            || refused_events(&app.kept_duties().await.unwrap(), seq).is_empty()
         {
             continue;
         }
         found = true;
-        let kept = app.unacknowledged_events().await.unwrap();
-        // An acknowledgement before the host takes it leaves it kept.
+        // An acknowledgement of its ID before the host was handed it leaves it kept.
+        let kept = app.kept_duties().await.unwrap();
         app.ack_events(last_id(&kept)).await.unwrap();
         assert_eq!(
-            refused_events(&app.unacknowledged_events().await.unwrap(), seq).len(),
+            refused_events(&app.kept_duties().await.unwrap(), seq).len(),
             1,
             "commit {n}"
         );
@@ -2390,13 +2390,29 @@ async fn test_duty_event_kept_but_not_taken_survives_an_acknowledgement() {
             "commit {n}: {taken:?}"
         );
         app.ack_events(last_id(&taken)).await.unwrap();
-        assert!(app.unacknowledged_events().await.unwrap().is_empty());
+        assert!(app.kept_duties().await.unwrap().is_empty());
         break;
     }
     assert!(
         found,
         "a commit keeping the refusal answers that it can't tell"
     );
+}
+
+#[tokio::test]
+async fn test_duty_event_listed_after_a_load_can_be_acknowledged() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let me = app.app_id();
+    assert_eq!(refuse_next(&w, &mut app).await.len(), 2);
+    drop(app);
+    // A new session: the host reads what it still has to act on, acts, and acknowledges,
+    // without taking the call's events.
+    let mut app = w.load(me).await;
+    let listed = app.unacknowledged_events().await.unwrap();
+    assert_eq!(listed.len(), 2);
+    app.ack_events(last_id(&listed)).await.unwrap();
+    assert!(app.unacknowledged_events().await.unwrap().is_empty());
 }
 
 #[tokio::test]
