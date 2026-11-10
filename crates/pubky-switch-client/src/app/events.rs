@@ -36,7 +36,8 @@ use serde::{Deserialize, Serialize};
 use pubky_switch_core::enc::serde_b64;
 
 use super::error::Alarm;
-use super::protocol::StoreFailure;
+use super::feed::OwedCall;
+use super::protocol::{MissedEntries, ResendNeeded, StoreFailure};
 
 /// The stable ID of a duty event ([`AppEvent::is_duty`]): the store's epoch, and a counter.
 ///
@@ -544,6 +545,17 @@ pub enum AppEvent {
         /// Whether it was a re-send of a message accepted before.
         resend: bool,
     },
+    /// The local writes the protocol answered `call` with were over
+    /// [`super::MAX_STEP_LOCAL_BYTES`]: they weren't committed, and the call isn't made
+    /// again, since the same answer would come. The read went on. The protocol acts on what
+    /// the call said from its own state, such as asking for the re-send with writes that
+    /// fit. A duty event.
+    LocalWritesRefused {
+        /// The duty event's ID.
+        id: EventId,
+        /// The call whose writes were refused.
+        call: RefusedCall,
+    },
     /// An app of a counterparty has no receive key record that passes the checks, so a
     /// message went to its other apps (Switch spec 8.1).
     UnreachableApp {
@@ -626,7 +638,8 @@ impl AppEvent {
             | Self::BatchRefused { id, .. }
             | Self::RestoreLeftBehind { id, .. }
             | Self::AttemptDropped { id, .. }
-            | Self::MessageUndelivered { id, .. } => Some(*id),
+            | Self::MessageUndelivered { id, .. }
+            | Self::LocalWritesRefused { id, .. } => Some(*id),
             _ => None,
         }
     }
@@ -635,6 +648,44 @@ impl AppEvent {
     /// the store and delivered until acknowledged (module docs, "Duty events").
     pub fn is_duty(&self) -> bool {
         self.id().is_some()
+    }
+}
+
+/// A protocol call whose local writes were over the bound
+/// ([`AppEvent::LocalWritesRefused`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RefusedCall {
+    /// [`super::Protocol::resend_needed`], about the feed item at `seq`.
+    ResendNeeded {
+        /// The feed item's `seq`.
+        seq: u64,
+        /// What the call asked.
+        needed: ResendNeeded,
+    },
+    /// [`super::Protocol::missed`].
+    Missed(MissedEntries),
+    /// [`super::Protocol::provider_lost`], its [`super::LossActions::local`], at the loss
+    /// of `lost_generation`; the loss went on without them.
+    ProviderLost {
+        /// The generation lost.
+        lost_generation: u64,
+    },
+}
+
+/// A [`RefusedCall`] as a duty event keeps it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum KeptRefusal {
+    Owed { seq: u64, call: OwedCall },
+    Loss { lost_generation: u64 },
+}
+
+impl KeptRefusal {
+    fn call(self) -> RefusedCall {
+        match self {
+            Self::Owed { seq, call } => call.refused(seq),
+            Self::Loss { lost_generation } => RefusedCall::ProviderLost { lost_generation },
+        }
     }
 }
 
@@ -692,6 +743,9 @@ pub(crate) enum Duty {
         msg_id: String,
         resend: bool,
     },
+    LocalWritesRefused {
+        call: KeptRefusal,
+    },
     RestoreLeftBehind {
         duty_events: u64,
         owed_calls: u64,
@@ -748,6 +802,10 @@ impl Duty {
             Self::MessageUndelivered { msg_id, resend } => {
                 AppEvent::MessageUndelivered { id, msg_id, resend }
             }
+            Self::LocalWritesRefused { call } => AppEvent::LocalWritesRefused {
+                id,
+                call: call.call(),
+            },
             Self::RestoreLeftBehind {
                 duty_events,
                 owed_calls,
