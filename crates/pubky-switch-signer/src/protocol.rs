@@ -21,8 +21,8 @@ use pubky_switch_core::scopes::{self, Permission};
 
 use crate::error::{Refusal, Result};
 
-/// The longest protocol name, in characters.
-pub const MAX_PROTOCOL_NAME: usize = 64;
+/// The longest protocol name, in characters (Switch wire 3.1 "Scope roots").
+pub const MAX_PROTOCOL_NAME: usize = 32;
 
 /// The Switch's own Homeserver folders. Only the Switch's formats live there, so a protocol
 /// adds no grant path inside them (Switch spec 3.4, 4.1).
@@ -73,12 +73,14 @@ pub struct GrantPath {
 /// time, on every install, since a signer that receives the identity in a hand-over must judge
 /// the same certificates the same way.
 pub trait Protocol: Send + Sync {
-    /// The protocol's name, for messages and errors: 1 to 64 characters of `a-z`, `0-9`, `.`,
-    /// `_` and `-`.
+    /// The protocol's name: 1 to 32 characters of `a-z` and `0-9`, starting with a letter. It is
+    /// the root of its scopes, and the name it uses in app records and as the prefix of its
+    /// kinds (Switch wire 3.1 "Scope roots").
     fn name(&self) -> &str;
 
-    /// The scope names the protocol owns, each once. The [`Protocols`] set reads them once,
-    /// when it is built.
+    /// The scope names the protocol owns, each once: its name, or its name followed by `_` or
+    /// `-` and more characters (Switch wire 3.1 "Scope roots"). The [`Protocols`] set reads them
+    /// once, when it is built.
     fn scopes(&self) -> Vec<ScopeDef>;
 
     /// The protocol's own rule on a requested set of its scopes, beyond the Switch's scope
@@ -112,9 +114,31 @@ pub enum ProtocolError {
     /// No protocol was registered.
     #[error("protocols: none registered")]
     NoProtocols,
-    /// A protocol name that is empty, too long or has characters outside the allowed set.
-    #[error("protocols: a protocol name that isn't 1 to 64 of a-z, 0-9, '.', '_' or '-'")]
+    /// A protocol name that isn't 1 to 32 characters of `a-z` and `0-9` starting with a letter
+    /// (Switch wire 3.1 "Scope roots").
+    #[error("protocols: a protocol name that isn't 1 to 32 of a-z and 0-9, starting with a letter")]
     BadName,
+    /// A protocol name that is a reserved root, or the beginning of one followed by `_` or `-`
+    /// (Switch wire 3.1 "Scope roots", `spec/reserved-roots.json`).
+    #[error("protocols: protocol name {name} is reserved")]
+    ReservedName {
+        /// The name.
+        name: String,
+    },
+    /// The reserved list didn't read, so no protocol is taken.
+    #[error("protocols: the reserved roots don't read: {0}")]
+    ReservedList(String),
+    /// A scope name that isn't the protocol's own root: its name, or its name followed by `_`
+    /// or `-` and more characters, or for a reserved name the roots listed with it (Switch
+    /// wire 3.1 "Scope roots"). A protocol claims no other root, even where it is the only one
+    /// installed.
+    #[error("protocols: protocol {protocol} declares the scope {scope}, a root that isn't its own")]
+    ForeignRoot {
+        /// The protocol.
+        protocol: String,
+        /// The scope name it declared.
+        scope: String,
+    },
     /// Two protocols registered under one name.
     #[error("protocols: protocol {name} registered twice")]
     DuplicateProtocol {
@@ -209,6 +233,8 @@ impl Protocols {
         if protocols.is_empty() {
             return Err(ProtocolError::NoProtocols);
         }
+        let reserved =
+            scopes::reserved().map_err(|error| ProtocolError::ReservedList(error.to_string()))?;
         let mut owners: BTreeMap<String, Owner> = BTreeMap::new();
         for (index, protocol) in protocols.iter().enumerate() {
             let name = protocol.name();
@@ -217,6 +243,18 @@ impl Protocols {
             }
             if protocols[..index].iter().any(|p| p.name() == name) {
                 return Err(ProtocolError::DuplicateProtocol {
+                    name: name.to_owned(),
+                });
+            }
+            // A reserved name claims only its own roots; any other name is none of them and the
+            // beginning of none (Switch wire 3.1 "Scope roots").
+            let own = reserved.iter().find(|r| r.name == name);
+            let takes_reserved = reserved
+                .iter()
+                .flat_map(|r| &r.roots)
+                .any(|root| owns_root(name, root));
+            if own.is_none() && takes_reserved {
+                return Err(ProtocolError::ReservedName {
                     name: name.to_owned(),
                 });
             }
@@ -230,6 +268,16 @@ impl Protocols {
                 if !scopes::is_name(&def.name) {
                     return Err(ProtocolError::BadScopeName {
                         protocol: name.to_owned(),
+                    });
+                }
+                let allowed = match own {
+                    Some(own) => own.roots.contains(&def.name),
+                    None => owns_root(name, &def.name),
+                };
+                if !allowed {
+                    return Err(ProtocolError::ForeignRoot {
+                        protocol: name.to_owned(),
+                        scope: def.name,
                     });
                 }
                 if let Some(owner) = owners.get(&def.name) {
@@ -384,12 +432,23 @@ impl Protocols {
     }
 }
 
-/// Whether `name` is a protocol name: 1 to 64 characters of `a-z`, `0-9`, `.`, `_` and `-`.
+/// Whether `name` is a protocol name: 1 to 32 characters of `a-z` and `0-9`, starting with a
+/// letter, so that no protocol's root is another's (Switch wire 3.1 "Scope roots").
 fn is_protocol_name(name: &str) -> bool {
     (1..=MAX_PROTOCOL_NAME).contains(&name.len())
-        && name.bytes().all(|b| {
-            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-')
-        })
+        && name.bytes().next().is_some_and(|b| b.is_ascii_lowercase())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+}
+
+/// Whether the protocol `name` may claim the root `root`: its name, or its name followed by
+/// `_` or `-` and more characters (Switch wire 3.1 "Scope roots").
+fn owns_root(name: &str, root: &str) -> bool {
+    root == name
+        || root
+            .strip_prefix(name)
+            .is_some_and(|rest| rest.len() > 1 && (rest.starts_with('_') || rest.starts_with('-')))
 }
 
 /// Whether `path`, a capability's path, covers `target`: it is that path, or a folder it lies
@@ -442,13 +501,13 @@ mod tests {
         }
         fn scopes(&self) -> Vec<ScopeDef> {
             vec![
-                ScopeDef::keyed("read"),
-                ScopeDef::keyed("write"),
-                ScopeDef::unkeyed("notes"),
+                ScopeDef::keyed("alpha"),
+                ScopeDef::keyed("alpha_write"),
+                ScopeDef::unkeyed("alpha-notes"),
             ]
         }
         fn check_scopes(&self, scopes: &[&str]) -> std::result::Result<(), String> {
-            if scopes.contains(&"write") && !scopes.contains(&"read") {
+            if scopes.contains(&"alpha_write") && !scopes.contains(&"alpha") {
                 return Err("write needs read".into());
             }
             Ok(())
@@ -457,8 +516,10 @@ mod tests {
             let mut out = Vec::new();
             for scope in scopes {
                 match *scope {
-                    "write" => out.extend([Permission::ConversationAdd, Permission::ClaimsWrite]),
-                    "read" => out.push(Permission::ClaimsRead),
+                    "alpha_write" => {
+                        out.extend([Permission::ConversationAdd, Permission::ClaimsWrite])
+                    }
+                    "alpha" => out.push(Permission::ClaimsRead),
                     _ => {}
                 }
             }
@@ -476,13 +537,13 @@ mod tests {
             "beta"
         }
         fn scopes(&self) -> Vec<ScopeDef> {
-            vec![ScopeDef::keyed("tag"), ScopeDef::unkeyed("lists")]
+            vec![ScopeDef::keyed("beta"), ScopeDef::unkeyed("beta_lists")]
         }
         fn check_scopes(&self, _: &[&str]) -> std::result::Result<(), String> {
             Ok(())
         }
         fn permissions(&self, scopes: &[&str]) -> Vec<Permission> {
-            if scopes.contains(&"lists") {
+            if scopes.contains(&"beta_lists") {
                 vec![
                     Permission::ListsManage,
                     Permission::ListsRead,
@@ -493,7 +554,7 @@ mod tests {
             }
         }
         fn grant_paths(&self, _: &[u8; 16], scopes: &[&str]) -> Vec<GrantPath> {
-            if scopes.iter().any(|s| s.starts_with("tag")) {
+            if scopes.iter().any(|s| s.starts_with("beta")) {
                 vec![GrantPath {
                     path: self.path.to_owned(),
                     purpose: "the public tag file".into(),
@@ -548,12 +609,12 @@ mod tests {
         let protocols = set();
         assert_eq!(protocols.names(), ["alpha", "beta"]);
         let debug = format!("{protocols:?}");
-        assert!(debug.contains("alpha") && debug.contains("tag"), "{debug}");
+        assert!(debug.contains("alpha") && debug.contains("beta"), "{debug}");
     }
 
     #[test]
     fn test_protocols_registration_refusals() {
-        let keyed = ScopeDef::keyed("one");
+        let keyed = ScopeDef::keyed("p");
         let cases: Vec<(Vec<Arc<dyn Protocol>>, ProtocolError)> = vec![
             (Vec::new(), ProtocolError::NoProtocols),
             (
@@ -567,7 +628,7 @@ mod tests {
             (
                 vec![
                     custom("p", vec![keyed.clone()]),
-                    custom("p", vec![ScopeDef::keyed("two")]),
+                    custom("p", vec![ScopeDef::keyed("p_two")]),
                 ],
                 ProtocolError::DuplicateProtocol { name: "p".into() },
             ),
@@ -578,7 +639,7 @@ mod tests {
                 },
             ),
             (
-                vec![custom("p", vec![ScopeDef::keyed("one:sub")])],
+                vec![custom("p", vec![ScopeDef::keyed("p:sub")])],
                 ProtocolError::BadScopeName {
                     protocol: "p".into(),
                 },
@@ -590,19 +651,18 @@ mod tests {
                 },
             ),
             (
-                vec![custom("p", vec![keyed.clone(), ScopeDef::unkeyed("one")])],
+                vec![custom("p", vec![keyed.clone(), ScopeDef::unkeyed("p")])],
                 ProtocolError::ScopeClaimedTwice {
-                    scope: "one".into(),
+                    scope: "p".into(),
                     first: "p".into(),
                     second: "p".into(),
                 },
             ),
             (
                 vec![custom("p", vec![keyed.clone()]), custom("q", vec![keyed])],
-                ProtocolError::ScopeClaimedTwice {
-                    scope: "one".into(),
-                    first: "p".into(),
-                    second: "q".into(),
+                ProtocolError::ForeignRoot {
+                    protocol: "q".into(),
+                    scope: "p".into(),
                 },
             ),
         ];
@@ -612,25 +672,28 @@ mod tests {
         let long = "a".repeat(MAX_PROTOCOL_NAME + 1);
         assert!(!is_protocol_name(&long));
         assert!(is_protocol_name(&long[1..]));
+        for bad in ["9chat", "chat_x", "chat-x", "chat.x", "Chat", ""] {
+            assert!(!is_protocol_name(bad), "{bad}");
+        }
     }
 
     #[test]
     fn test_protocols_scope_ownership_and_keys() {
         let protocols = set();
-        for scope in ["read", "notes", "tag", "tag:shop-1", "lists"] {
+        for scope in ["alpha", "alpha-notes", "beta", "beta:shop-1", "beta_lists"] {
             assert!(protocols.knows_scope(scope), "{scope}");
         }
-        for scope in ["other", "other:sub", "Read", "tag:", ""] {
+        for scope in ["other", "other:sub", "Read", "beta:", ""] {
             assert!(!protocols.knows_scope(scope), "{scope}");
         }
         // A sub-scope has keys exactly when its name does (Switch spec 3.5).
-        assert!(protocols.has_keys("tag"));
-        assert!(protocols.has_keys("tag:shop-1"));
-        assert!(!protocols.has_keys("notes"));
-        assert!(!protocols.has_keys("lists:x"));
+        assert!(protocols.has_keys("beta"));
+        assert!(protocols.has_keys("beta:shop-1"));
+        assert!(!protocols.has_keys("alpha-notes"));
+        assert!(!protocols.has_keys("beta_lists:x"));
         assert!(!protocols.has_keys("other"));
         assert_eq!(
-            protocols.unowned(&owned(&["read", "other", "tag:a", "x:y"])),
+            protocols.unowned(&owned(&["alpha", "other", "beta:a", "x:y"])),
             owned(&["other", "x:y"])
         );
     }
@@ -639,7 +702,13 @@ mod tests {
     fn test_protocols_terms_union_in_fixed_order() {
         let protocols = set();
         let terms = protocols
-            .terms(&owned(&["lists", "write", "read", "tag:shop-1", "notes"]))
+            .terms(&owned(&[
+                "beta_lists",
+                "alpha_write",
+                "alpha",
+                "beta:shop-1",
+                "alpha-notes",
+            ]))
             .unwrap();
         // Alpha gives claims.read, claims.write and conversation.add; beta lists.read,
         // lists.manage and claims.read again: one list, each once, in the fixed order.
@@ -654,11 +723,13 @@ mod tests {
                 "conversation.add"
             ])
         );
-        assert_eq!(terms.keyed, owned(&["write", "read", "tag:shop-1"]));
+        assert_eq!(terms.keyed, owned(&["alpha_write", "alpha", "beta:shop-1"]));
 
         // Exactly the union, nothing more: alpha's `read` needs claims.read and beta's `lists`
         // lists.read, lists.manage and claims.read again.
-        let some = protocols.terms(&owned(&["lists", "read", "tag"])).unwrap();
+        let some = protocols
+            .terms(&owned(&["beta_lists", "alpha", "beta"]))
+            .unwrap();
         assert_eq!(
             some.permissions,
             [
@@ -667,9 +738,9 @@ mod tests {
                 Permission::ListsManage
             ]
         );
-        assert_eq!(some.keyed, owned(&["read", "tag"]));
+        assert_eq!(some.keyed, owned(&["alpha", "beta"]));
 
-        let none = protocols.terms(&owned(&["notes"])).unwrap();
+        let none = protocols.terms(&owned(&["alpha-notes"])).unwrap();
         assert!(none.permissions.is_empty());
         assert!(none.keyed.is_empty());
     }
@@ -677,12 +748,12 @@ mod tests {
     #[test]
     fn test_protocols_terms_refuse_the_scope_rule() {
         let protocols = set();
-        let too_many: Vec<String> = (0..33).map(|i| format!("tag:t{i}")).collect();
+        let too_many: Vec<String> = (0..33).map(|i| format!("beta:t{i}")).collect();
         for scopes in [
-            owned(&["read", "read"]),
-            owned(&["tag", "tag:shop-1"]),
+            owned(&["alpha", "alpha"]),
+            owned(&["beta", "beta:shop-1"]),
             owned(&["Read"]),
-            owned(&["read:"]),
+            owned(&["alpha:"]),
             too_many,
         ] {
             let error = protocols.terms(&scopes).unwrap_err();
@@ -697,7 +768,7 @@ mod tests {
     fn test_protocols_terms_refuse_unknown_scopes() {
         let protocols = set();
         let error = protocols
-            .terms(&owned(&["read", "secret-thing", "other:sub"]))
+            .terms(&owned(&["alpha", "secret-thing", "other:sub"]))
             .unwrap_err();
         assert_eq!(
             error,
@@ -714,7 +785,9 @@ mod tests {
     #[test]
     fn test_protocols_terms_apply_each_protocols_rule() {
         let protocols = set();
-        let error = protocols.terms(&owned(&["write", "tag"])).unwrap_err();
+        let error = protocols
+            .terms(&owned(&["alpha_write", "beta"]))
+            .unwrap_err();
         assert_eq!(
             error,
             SignerError::Refused(Refusal::ProtocolRule {
@@ -722,7 +795,9 @@ mod tests {
                 reason: "write needs read".into()
             })
         );
-        protocols.terms(&owned(&["tag", "read", "write"])).unwrap();
+        protocols
+            .terms(&owned(&["beta", "alpha", "alpha_write"]))
+            .unwrap();
     }
 
     #[test]
@@ -730,7 +805,7 @@ mod tests {
         let protocols = set();
         let id = [7u8; 16];
         let paths = protocols
-            .grant_paths(&id, &owned(&["read", "tag:a"]))
+            .grant_paths(&id, &owned(&["alpha", "beta:a"]))
             .unwrap();
         assert_eq!(
             paths,
@@ -742,7 +817,7 @@ mod tests {
         // A protocol that owns none of the app's scopes adds nothing.
         assert!(
             protocols
-                .grant_paths(&id, &owned(&["read"]))
+                .grant_paths(&id, &owned(&["alpha"]))
                 .unwrap()
                 .is_empty()
         );
@@ -766,7 +841,7 @@ mod tests {
         ] {
             let protocols = Protocols::new(vec![Arc::new(Beta { path })]).unwrap();
             let error = protocols
-                .grant_paths(&[1; 16], &owned(&["tag"]))
+                .grant_paths(&[1; 16], &owned(&["beta"]))
                 .unwrap_err();
             assert!(
                 matches!(
@@ -790,7 +865,7 @@ mod tests {
                 "gamma"
             }
             fn scopes(&self) -> Vec<ScopeDef> {
-                vec![ScopeDef::unkeyed("mark")]
+                vec![ScopeDef::unkeyed("gamma")]
             }
             fn check_scopes(&self, _: &[&str]) -> std::result::Result<(), String> {
                 Ok(())
@@ -813,7 +888,7 @@ mod tests {
         ])
         .unwrap();
         let error = protocols
-            .grant_paths(&[1; 16], &owned(&["tag", "mark"]))
+            .grant_paths(&[1; 16], &owned(&["beta", "gamma"]))
             .unwrap_err();
         assert_eq!(
             error,
@@ -832,10 +907,158 @@ mod tests {
         use pubky_switch_core::records::{app_record_path, check_caps};
         let protocols = set();
         let id = [9u8; 16];
-        let paths = protocols.grant_paths(&id, &owned(&["tag"])).unwrap();
+        let paths = protocols.grant_paths(&id, &owned(&["beta"])).unwrap();
         let extra: Vec<&str> = paths.iter().map(|p| p.path.as_str()).collect();
         let record = app_record_path(&id);
         check_caps(&format!("{record}:rw,{}:rw", extra[0]), &id, &extra).unwrap();
         assert!(check_caps(&format!("{record}:rw,/pub/other.json:rw"), &id, &extra).is_err());
+    }
+}
+
+#[cfg(test)]
+mod roots {
+    use super::*;
+
+    struct Claims(&'static str, &'static str);
+
+    impl Protocol for Claims {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn scopes(&self) -> Vec<ScopeDef> {
+            vec![ScopeDef::keyed(self.1)]
+        }
+        fn check_scopes(&self, _: &[&str]) -> std::result::Result<(), String> {
+            Ok(())
+        }
+        fn permissions(&self, _: &[&str]) -> Vec<Permission> {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn test_protocols_a_protocol_claims_only_its_own_roots() {
+        for root in ["chat", "chat_read", "chat-history"] {
+            Protocols::new(vec![Arc::new(Claims("chat", root))]).unwrap();
+        }
+        // Another root, even with only this protocol installed (Switch wire 3.1 "Scope roots").
+        for root in ["request", "chatter", "chat_", "cha", "other_chat"] {
+            let error = Protocols::new(vec![Arc::new(Claims("chat", root))]).unwrap_err();
+            assert_eq!(
+                error,
+                ProtocolError::ForeignRoot {
+                    protocol: "chat".into(),
+                    scope: root.into()
+                },
+                "{root}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod reserved_roots {
+    //! The reserved list's rules, with the names and roots read from the spec's file, so the
+    //! tests name no protocol of their own beyond neutral ones.
+
+    use super::*;
+
+    struct Owned(String, Vec<String>);
+
+    impl Protocol for Owned {
+        fn name(&self) -> &str {
+            &self.0
+        }
+        fn scopes(&self) -> Vec<ScopeDef> {
+            self.1.iter().map(|s| ScopeDef::keyed(s)).collect()
+        }
+        fn check_scopes(&self, _: &[&str]) -> std::result::Result<(), String> {
+            Ok(())
+        }
+        fn permissions(&self, _: &[&str]) -> Vec<Permission> {
+            Vec::new()
+        }
+    }
+
+    fn one(name: &str, scopes: &[&str]) -> std::result::Result<Protocols, ProtocolError> {
+        let scopes = scopes.iter().map(|s| (*s).to_owned()).collect();
+        Protocols::new(vec![Arc::new(Owned(name.to_owned(), scopes))])
+    }
+
+    fn list() -> &'static scopes::ReservedProtocol {
+        scopes::reserved().unwrap().first().unwrap()
+    }
+
+    #[test]
+    fn test_protocols_a_reserved_name_takes_its_roots() {
+        let own = list();
+        let roots: Vec<&str> = own.roots.iter().map(String::as_str).collect();
+        let protocols = one(&own.name, &roots).unwrap();
+        for root in &roots {
+            assert!(protocols.knows_scope(root));
+        }
+    }
+
+    #[test]
+    fn test_protocols_a_reserved_name_claims_no_other_root() {
+        let own = list();
+        for other in [own.name.as_str(), "chat"] {
+            assert_eq!(
+                one(&own.name, &[other]).unwrap_err(),
+                ProtocolError::ForeignRoot {
+                    protocol: own.name.clone(),
+                    scope: other.into()
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn test_protocols_no_other_protocol_claims_a_reserved_root() {
+        // The reviewer's case: `chat` claiming a reserved root, with only `chat` installed.
+        for root in &list().roots {
+            assert_eq!(
+                one("chat", &[root.as_str()]).unwrap_err(),
+                ProtocolError::ForeignRoot {
+                    protocol: "chat".into(),
+                    scope: root.clone()
+                },
+                "{root}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_protocols_a_name_that_is_a_reserved_root_is_refused() {
+        for root in list().roots.iter().filter(|r| !r.contains(['_', '-'])) {
+            assert_eq!(
+                one(root, &[root]).unwrap_err(),
+                ProtocolError::ReservedName {
+                    name: root.to_string()
+                },
+                "{root}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_protocols_a_name_that_begins_a_reserved_root_is_refused() {
+        // A name whose own roots would take a reserved one, such as the part before the `_` of
+        // a reserved root, when that part isn't itself reserved.
+        let own = list();
+        let prefixes: Vec<&str> = own
+            .roots
+            .iter()
+            .filter_map(|root| root.split_once(['_', '-']).map(|(head, _)| head))
+            .filter(|head| !own.roots.iter().any(|r| r == head))
+            .collect();
+        assert!(!prefixes.is_empty(), "the list has such a root");
+        for name in prefixes {
+            assert_eq!(
+                one(name, &[name]).unwrap_err(),
+                ProtocolError::ReservedName { name: name.into() },
+                "{name}"
+            );
+        }
     }
 }

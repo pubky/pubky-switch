@@ -67,7 +67,8 @@ service.
   the newest `identity.json` lists it (Switch wire 7.2, 3.8). Other routes check only that
   the app hasn't departed.
 - **`POST /v1/enroll`** (Switch wire 3.7, 7.4.1), in `switch/signer.rs`: only at
-  [`SWITCH_ORIGIN`], with the default limits, and without checking the request signature. A
+  [`SWITCH_ORIGIN`], with the default limits unless a test sets others
+  (`set_enroll_limits`), and without checking the request signature. A
   switch made with `unenrolled` answers every other call with the operator's `404` until
   then. As at the service, the enrollment that makes the account sets its kept App IDs, and
   every later one gets the same key and changes nothing. Unlike the service:

@@ -48,6 +48,10 @@ use crate::key::{ExportReason, IdentityKeyring};
 use crate::protocol::Protocols;
 use crate::state::{self, DeliverStep, Flow, Newest, Service, SignerState};
 
+mod approval;
+
+pub use approval::{AppReview, ApprovedRequest};
+
 /// What the signer works with, from the host.
 #[derive(Clone)]
 pub struct SignerEnv {
@@ -280,6 +284,47 @@ impl Signer {
         &self.state.alerts
     }
 
+    /// Clear `alert`, once the user has seen it.
+    ///
+    /// A rollback or an equivocation leaves the switch unconfirmed: the signer doesn't know that
+    /// it holds the high-water version, so it releases no claim (Switch spec 4.3). Clearing such
+    /// an alert doesn't confirm it. The signer delivers the newest version it signed again, the
+    /// same bytes naming the version they build on (Switch wire 2.1, 7.4.2). A switch that went
+    /// back to that version takes it, and the signer is confirmed again; a switch that holds an
+    /// older version, none, or another body at the high-water version raises the alarm again,
+    /// and everything stays held. If it keeps coming back, the user moves to another provider,
+    /// or declares a provider loss.
+    ///
+    /// # Errors
+    ///
+    /// The store's error, or the delivery's as [`Signer::resume`] gives it, the alarm again
+    /// among them.
+    pub async fn clear_alert(&mut self, alert: &Alert) -> Result<()> {
+        self.refresh().await?;
+        if !self.state.alerts.contains(alert) {
+            return Ok(());
+        }
+        let mut state = self.state.clone();
+        state.alerts.retain(|held| held != alert);
+        let alarm = matches!(alert, Alert::Rollback { .. } | Alert::Equivocation { .. });
+        let again = match (&self.state.newest, &self.flow) {
+            (Some(newest), None) if alarm && state.switch_unconfirmed => Some(Flow::Deliver {
+                doc: newest.doc.clone(),
+                prev: newest.prev,
+                backup: None,
+                step: DeliverStep::BackupWritten,
+            }),
+            _ => None,
+        };
+        let deliver_again = again.is_some();
+        let flow = again.or_else(|| self.flow.clone());
+        self.commit(state, flow).await?;
+        if deliver_again {
+            self.resume().await?;
+        }
+        Ok(())
+    }
+
     /// Set the record age limit, in seconds, or clear it for the 90-day default (Switch spec
     /// 4.3), in a new version. Returns that version once it is delivered and published.
     ///
@@ -307,11 +352,35 @@ impl Signer {
     /// version whose document went out in a flow that was dropped is never signed again
     /// (Switch spec 4.3, 13.2).
     async fn new_version(&mut self, change: impl FnOnce(&mut IdentityBody)) -> Result<IdentityDoc> {
+        self.ready().await?;
+        let key = self.keyring.unlock()?;
+        let (doc, flow) = self.next_version(&key, change)?;
+        drop(key);
+        let mut state = self.state.clone();
+        state.signed_through = doc.version();
+        self.commit(state, Some(flow)).await?;
+        self.resume().await?;
+        Ok(doc)
+    }
+
+    /// Ready for a new signing call: the store read again if a commit left it unsure, this
+    /// install named, and no flow in progress.
+    pub(crate) async fn ready(&mut self) -> Result<()> {
         self.refresh().await?;
         self.check_named()?;
         if self.flow.is_some() {
             return Err(Refusal::FlowInProgress.into());
         }
+        Ok(())
+    }
+
+    /// The next version, built from the newest with `change` and signed with `key`, and the
+    /// flow that delivers it. Nothing is committed.
+    pub(crate) fn next_version(
+        &self,
+        key: &IdentityKey,
+        change: impl FnOnce(&mut IdentityBody),
+    ) -> Result<(IdentityDoc, Flow)> {
         let newest = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
         let version = newest
             .version()
@@ -322,21 +391,14 @@ impl Signer {
         body.version = version;
         body.signer = self.state.install;
         change(&mut body);
-        let doc = {
-            let key = self.keyring.unlock()?;
-            IdentityDoc::sign(&key, body)?
-        };
-        let mut state = self.state.clone();
-        state.signed_through = version;
+        let doc = IdentityDoc::sign(key, body)?;
         let flow = Flow::Deliver {
             doc: doc.signed().clone(),
             prev: Some(newest.hash()),
             backup: None,
             step: DeliverStep::Signed,
         };
-        self.commit(state, Some(flow)).await?;
-        self.resume().await?;
-        Ok(doc)
+        Ok((doc, flow))
     }
 
     /// Refuse every signing call while another install is the signer (Switch spec 4.3).
@@ -350,7 +412,15 @@ impl Signer {
     /// Commit `state` and `flow`, and only then take them as the signer's own, so the signer
     /// never acts on anything the store doesn't hold. A commit the store can't tell about
     /// makes the signer read the store again before its next step.
-    async fn commit(&mut self, state: SignerState, flow: Option<Flow>) -> Result<()> {
+    pub(crate) async fn commit(
+        &mut self,
+        mut state: SignerState,
+        flow: Option<Flow>,
+    ) -> Result<()> {
+        if flow.is_none() {
+            // A flow that ended without its version delivered leaves no certificate or claim.
+            state.prune_unreferenced();
+        }
         match state::save(&self.env.store, &state, flow.as_ref()).await {
             Ok(()) => {
                 self.state = state;
@@ -611,6 +681,8 @@ impl Signer {
                     prev,
                     published: false,
                 });
+                // The switch took this version, built on the one before: it holds the mark.
+                state.switch_unconfirmed = false;
                 self.commit(state, None).await
             }
             Err(ClientError::Switch {
@@ -734,6 +806,7 @@ impl Signer {
     async fn alarm(&mut self, alert: Alert) -> Result<()> {
         let mut state = self.state.clone();
         state.alert(alert.clone());
+        state.switch_unconfirmed = true;
         self.commit(state, None).await?;
         Err(SignerError::Alarm(alert))
     }

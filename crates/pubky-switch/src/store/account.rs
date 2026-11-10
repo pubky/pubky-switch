@@ -33,6 +33,9 @@ pub struct NewAccount {
     /// The App IDs the enrollment's `revoked_apps` names, kept for good from the start
     /// (Switch wire 3.7).
     pub revoked_apps: Vec<[u8; 16]>,
+    /// The document hash of the enrollment that creates the account, whose answer the
+    /// account keeps (Switch wire 3.7).
+    pub enrollment_hash: [u8; 32],
 }
 
 /// An account's position: its generation and key, the last `seq` given out, the chain head
@@ -96,6 +99,14 @@ impl Committed {
     }
 }
 
+/// Where a request's endpoint started, so a refusal can undo what it wrote
+/// ([`AccountTxn::rollback_to`]).
+#[derive(Debug)]
+pub struct Savepoint {
+    head: AccountHead,
+    changed: bool,
+}
+
 /// Why a commit gave no [`Committed`].
 #[derive(Debug, thiserror::Error)]
 pub enum CommitError {
@@ -114,6 +125,7 @@ pub struct AccountTxn {
     head: AccountHead,
     loaded: AccountHead,
     changed: bool,
+    last_seen: Option<([u8; 16], u64)>,
 }
 
 impl std::fmt::Debug for AccountTxn {
@@ -166,6 +178,17 @@ pub(super) async fn create(pool: &PgPool, account: &NewAccount) -> Result<bool, 
         .await
         .map_err(StoreError::from_db)?;
     }
+    // The first enrollment's answer: an account keeps far fewer than any limit allows.
+    super::enrollments::keep(
+        &mut tx,
+        &account.id,
+        &account.enrollment_hash,
+        &account.service_key,
+        account.created_at_ms,
+        u64::MAX >> 1,
+        true,
+    )
+    .await?;
     tx.commit().await.map_err(StoreError::from_db)?;
     Ok(true)
 }
@@ -217,6 +240,7 @@ impl AccountTxn {
             loaded: head.clone(),
             head,
             changed: false,
+            last_seen: None,
         }))
     }
 
@@ -278,6 +302,43 @@ impl AccountTxn {
         self.changed = true;
     }
 
+    /// Note an own app's authenticated request at `at_ms` (Switch wire 7.3 step 6). It is
+    /// written with the commit, also when the endpoint is refused and rolled back.
+    pub fn note_last_seen(&mut self, app_id: [u8; 16], at_ms: u64) {
+        self.last_seen = Some((app_id, at_ms));
+    }
+
+    /// Mark the start of the request's endpoint. Everything it writes after this, its
+    /// `seq`s and chain head included, can be undone with [`AccountTxn::rollback_to`],
+    /// while the stamped time stays.
+    pub async fn savepoint(&mut self) -> Result<Savepoint, StoreError> {
+        sqlx::query("SAVEPOINT endpoint")
+            .execute(&mut *self.tx)
+            .await
+            .map_err(StoreError::from_db)?;
+        Ok(Savepoint {
+            head: self.head.clone(),
+            changed: self.changed,
+        })
+    }
+
+    /// Undo everything written since `savepoint`, keeping the time this request stamped:
+    /// a refused request commits its stamp and nothing else (Switch wire 7.3 steps 3 and
+    /// 10). If this fails the transaction must not be committed.
+    pub async fn rollback_to(&mut self, savepoint: Savepoint) -> Result<(), StoreError> {
+        sqlx::query("ROLLBACK TO SAVEPOINT endpoint")
+            .execute(&mut *self.tx)
+            .await
+            .map_err(StoreError::from_db)?;
+        let stamped_time_ms = self.head.stamped_time_ms;
+        self.head = AccountHead {
+            stamped_time_ms,
+            ..savepoint.head
+        };
+        self.changed = savepoint.changed;
+        Ok(())
+    }
+
     /// The transaction's connection, for the queries of the account's other state. Every
     /// query on it is part of this request, and commits or rolls back with it.
     pub fn conn(&mut self) -> &mut PgConnection {
@@ -316,6 +377,15 @@ impl AccountTxn {
             if self.head.last_seq != self.loaded.last_seq || self.head.chain != self.loaded.chain {
                 self.changed = true;
             }
+        }
+        if let Some((app_id, at_ms)) = self.last_seen {
+            sqlx::query("UPDATE apps SET last_seen_ms = $3 WHERE account_id = $1 AND app_id = $2")
+                .bind(&self.head.id)
+                .bind(app_id.as_slice())
+                .bind(to_db(at_ms, "last_seen_ms")?)
+                .execute(&mut *self.tx)
+                .await
+                .map_err(StoreError::from_db)?;
         }
         if self.changed {
             // Sent with the commit, and only if it commits.

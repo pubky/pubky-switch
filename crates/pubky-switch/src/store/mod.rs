@@ -20,7 +20,10 @@
 
 mod account;
 mod chain;
+mod claim_codec;
+mod enrollments;
 mod identity;
+mod ops;
 #[cfg(any(test, feature = "test-util"))]
 pub mod testing;
 
@@ -32,9 +35,13 @@ use sqlx::{
     postgres::{PgConnectOptions, PgPoolOptions},
 };
 
-pub use account::{AccountHead, AccountTxn, CommitError, Committed, NewAccount};
+pub use account::{AccountHead, AccountTxn, CommitError, Committed, NewAccount, Savepoint};
 pub use chain::NewChainItem;
 pub use identity::HeldIdentity;
+pub use ops::{
+    ListName, StoredApp, StoredBundlePart, StoredClaimEntry, StoredInvite, StoredListEntry,
+    StoredRecord,
+};
 
 use crate::admin::{CheckFuture, ReadinessCheck};
 
@@ -275,8 +282,32 @@ impl Store {
     }
 
     /// Apply pending schema migrations. Safe to run from several processes at once.
-    pub async fn migrate(&self) -> Result<(), StoreError> {
-        MIGRATIONS.run(&self.pool).await?;
+    ///
+    /// `announced` is what the service announces at enrollment now: an account enrolled
+    /// before the schema kept its announced limits inherits these (migration 0002).
+    pub async fn migrate(
+        &self,
+        announced: &pubky_switch_core::records::Limits,
+    ) -> Result<(), StoreError> {
+        let announced = serde_json::to_string(announced)
+            .map_err(|_| StoreError::Corrupt("the announced limits don't encode"))?;
+        let mut conn = self.pool.acquire().await.map_err(StoreError::from_db)?;
+        sqlx::query("SELECT set_config('pubky_switch.announced_limits', $1, false)")
+            .bind(&announced)
+            .execute(&mut *conn)
+            .await
+            .map_err(StoreError::from_db)?;
+        if let Err(error) = MIGRATIONS.run(&mut *conn).await {
+            // A failed run keeps the migrator's lock on its connection: close it rather
+            // than hand it back to the pool.
+            let _ = conn.detach().close().await;
+            return Err(error.into());
+        }
+        // The connection goes back to the pool without the setting.
+        sqlx::query("RESET pubky_switch.announced_limits")
+            .execute(&mut *conn)
+            .await
+            .map_err(StoreError::from_db)?;
         Ok(())
     }
 
@@ -303,6 +334,27 @@ impl Store {
                 .map_err(|_| StoreError::Corrupt("service_key"))?,
             stamped_time_ms: from_db(row.try_get("stamped_time_ms")?, "stamped_time_ms")?,
         }))
+    }
+
+    /// The app record account `id` holds for `app_id`, read without the account's lock, for
+    /// verifying an own app's request before it (Switch wire 7.2 Order). A plain read
+    /// doesn't wait for the lock; the endpoint checks under it that the key still holds.
+    pub async fn app_record(
+        &self,
+        id: &str,
+        app_id: &[u8; 16],
+    ) -> Result<Option<pubky_switch_core::sig::SignedDoc>, StoreError> {
+        let record: Option<Option<Vec<u8>>> =
+            sqlx::query_scalar("SELECT record FROM apps WHERE account_id = $1 AND app_id = $2")
+                .bind(id)
+                .bind(app_id.as_slice())
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(StoreError::from_db)?;
+        record
+            .flatten()
+            .map(|bytes| identity::decode_doc(&bytes, "app record"))
+            .transpose()
     }
 
     /// Start a request to account `id`: a transaction holding the account's lock until it

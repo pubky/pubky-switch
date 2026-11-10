@@ -82,6 +82,22 @@ pub enum Refusal {
         /// The protocol's reason.
         reason: String,
     },
+    /// The app request fails a check of Switch wire 3.9: the reason names the step.
+    #[error("refused: {0}")]
+    AppRequest(String),
+    /// The app request names an App ID listed with the same keys, which would renew its
+    /// certificate (Switch wire 3.8, 3.9 step 5); renewals aren't approved through a request
+    /// here.
+    #[error("refused: the app is listed already")]
+    AlreadyListed,
+    /// The approval's version is delivered, but its claim is held: the switch isn't confirmed
+    /// to hold the signer's newest version since a rollback or an equivocation, named here
+    /// when its alert is still held ([`crate::Signer::clear_alert`]).
+    #[error("refused: the claim is held until the switch is confirmed")]
+    ClaimHeld {
+        /// The rollback or equivocation alert behind it, if still held.
+        alert: Option<crate::alert::Alert>,
+    },
     /// The store already holds this identity's signer records, so it isn't set up again.
     #[error("refused: the signer is already set up for this identity")]
     AlreadySetUp,

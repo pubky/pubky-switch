@@ -44,6 +44,15 @@ pub enum TestDatabaseError {
 impl TestDatabase {
     /// Create a database with `config`'s pool settings, and migrate it.
     pub async fn create(config: &DatabaseConfig) -> Result<Self, TestDatabaseError> {
+        Self::create_with(config, true).await
+    }
+
+    /// Create a database with `config`'s pool settings, migrated or empty, for an upgrade
+    /// test that applies the migrations itself.
+    pub async fn create_with(
+        config: &DatabaseConfig,
+        migrate: bool,
+    ) -> Result<Self, TestDatabaseError> {
         let url = match std::env::var(TEST_DATABASE_URL_ENV) {
             Ok(url) if !url.is_empty() => url,
             _ if std::env::var_os(REQUIRE_DB_ENV).is_some() => {
@@ -65,7 +74,13 @@ impl TestDatabase {
         conn.close().await.map_err(StoreError::Database)?;
         let options = admin.clone().database(&name);
         let store = Store::connect_with(options.clone(), config).await?;
-        store.migrate().await?;
+        if migrate {
+            store
+                .migrate(&crate::service::announced_limits(
+                    &crate::limits::Limits::default(),
+                ))
+                .await?;
+        }
         Ok(Self {
             admin,
             name,
@@ -92,6 +107,19 @@ impl TestDatabase {
     /// Open a connection to the server that may manage the test database.
     pub async fn admin(&self) -> Result<PgConnection, StoreError> {
         Ok(PgConnection::connect_with(&self.admin).await?)
+    }
+
+    /// Give out account `id`'s next `seq` without a chain item, as an inbox entry takes
+    /// one (Switch spec 6.3), and commit.
+    pub async fn give_out_seq(&self, id: &str) -> Result<u64, StoreError> {
+        let mut txn = self
+            .store
+            .begin(id)
+            .await?
+            .ok_or(StoreError::Corrupt("no such account"))?;
+        let seq = txn.next_seq()?;
+        txn.commit().await?;
+        Ok(seq)
     }
 
     /// Close the store and drop the database.
