@@ -627,12 +627,26 @@ impl Service {
         read: &FeedRead,
         signer: &ServiceSigner,
     ) -> Result<(Answer, u64), FeedStop> {
+        // The latest service time a read of this wait has seen: no answer is signed at an
+        // earlier one, so a refusal after a wait never shows the service's time going back
+        // behind a page the same client was answered meanwhile (Switch spec 10.1).
+        let latest = std::sync::atomic::AtomicU64::new(read.time_ms);
         let answered = long_poll(
             &self.changes,
             &read.account,
             Duration::from_secs(read.query.wait),
             || async {
-                let answered = self.read_page(read, signer).await?;
+                let answered = match self.read_page(read, signer).await {
+                    Ok(answered) => answered,
+                    Err(FeedStop::Refused(mut refusal)) => {
+                        refusal.time_ms = refusal
+                            .time_ms
+                            .max(latest.load(std::sync::atomic::Ordering::Relaxed));
+                        return Err(FeedStop::Refused(refusal));
+                    }
+                    Err(stop) => return Err(stop),
+                };
+                latest.fetch_max(answered.time_ms, std::sync::atomic::Ordering::Relaxed);
                 Ok(if answered.ready {
                     Polled::Ready(answered)
                 } else {

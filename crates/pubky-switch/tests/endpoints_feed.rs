@@ -817,3 +817,43 @@ async fn test_feed_401_from_the_page_check_counts_as_a_failed_authentication() {
     );
     replay.db.drop_database().await.expect("drop");
 }
+
+#[tokio::test]
+async fn test_feed_refusal_after_a_wait_is_never_signed_earlier_than_a_read() {
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let (stop, task) = listen(&replay).await;
+    let at = revoke_time();
+    let later = ms(&at) + 30_000;
+    // The wait reads once at its own time, again after a commit stamped 30 s later, then
+    // its last read fails: the refusal is signed at the later time, not the request's.
+    let (answer, ()) = tokio::join!(read(&replay, "wallet", "?after=1:9&wait=1", &at), async {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        sql(
+            &replay,
+            &format!("UPDATE accounts SET stamped_time_ms = {later} WHERE id = $1"),
+        )
+        .await;
+        sql(&replay, "SELECT pg_notify('pubky_switch_changes', $1)").await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        sql(&replay, "UPDATE accounts SET last_seq = 10 WHERE id = $1").await;
+        sql(
+            &replay,
+            "ALTER TABLE chain_items RENAME TO chain_items_gone",
+        )
+        .await;
+    });
+    assert_eq!(
+        answer.status,
+        503,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    assert_eq!(
+        header_text(&answer, header::SERVER_TIME),
+        Some(pubky_switch_core::time::rfc3339(later).as_str())
+    );
+    let _ = stop.send(());
+    task.await.expect("listener");
+    replay.db.drop_database().await.expect("drop");
+}
