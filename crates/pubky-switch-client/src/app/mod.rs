@@ -62,7 +62,7 @@ mod tests;
 
 pub use chain::{HELD_MARKS, STUBS_KEPT_FOR_MS};
 pub use error::{Alarm, AppError, Refusal};
-pub use events::{AppEvent, ParkReason};
+pub use events::{AppEvent, BackupRefusal, ParkReason};
 pub use feed::ReceiveReport;
 pub use identity::{DOC_CACHE_MS, HomeserverReader, IdentityRefresh, REVALIDATION_MS};
 pub use peek::{PeekReport, Peeked};
@@ -415,6 +415,13 @@ impl AppBackup {
             })
             .transpose()
     }
+}
+
+/// A restore, built: the app and its one commit, or the error of a write the store can't
+/// take in one batch.
+enum Restorable {
+    Ready(Box<App>, Tx),
+    TooLarge(AppError),
 }
 
 /// The app's state in memory, as the store holds it.
@@ -895,14 +902,21 @@ impl App {
     /// The restore of the backup is built, without writing anything, before it is
     /// returned: [`Protocol::restore_layer`] checks the layer, and the one commit that would
     /// install it must fit the store's sizes ([`crate::store::MAX_VALUE_BYTES`] for each
-    /// value, [`crate::store::MAX_BATCH_BYTES`] for the whole).
+    /// value, [`crate::store::MAX_BATCH_BYTES`], 32 MiB, for the whole).
+    ///
+    /// That commit holds, beside the app's own state and the layer, every entry stored
+    /// locally and every processed pair the app keeps (for 30 days plus the clock
+    /// tolerance). While they add up to more than the batch size, every layered backup is
+    /// refused, with [`AppEvent::BackupRefused`] for the host, until they drain: entries
+    /// stored locally as they are processed, processed pairs as they age out.
     ///
     /// # Errors
     ///
     /// [`Refusal::NotNow`] for a protocol with no backup name; [`Refusal::Left`] or
     /// [`Refusal::NotNow`] when there is nothing to back up; a store failure; as
     /// [`App::restore`] for a backup it would refuse, such as a layer the protocol refuses
-    /// ([`AppError::InvalidData`]) or one over the store's sizes ([`AppError::Store`]).
+    /// ([`AppError::InvalidData`]) or one over the store's sizes ([`AppError::Store`], with
+    /// [`AppEvent::BackupRefused`]).
     pub async fn backup_layered(&mut self) -> Result<AppBackup, AppError> {
         Box::pin(async move {
             let Some(name) = self.protocol.backup_name() else {
@@ -931,13 +945,19 @@ impl App {
             // The restore is built, not committed, so a layer the protocol refuses, or one
             // over the store's sizes, is refused now rather than at a restore that can
             // never succeed.
-            Self::restore_commit(
+            let restorable = Self::restore_commit(
                 self.env.clone(),
                 Arc::clone(&self.protocol),
                 self.config.clone(),
                 &backup,
             )
             .await?;
+            if let Restorable::TooLarge(error) = restorable {
+                self.events.push(AppEvent::BackupRefused {
+                    reason: BackupRefusal::TooLarge,
+                });
+                return Err(error);
+            }
             Ok(backup)
         })
         .await
@@ -976,9 +996,13 @@ impl App {
         backup: &AppBackup,
     ) -> Result<App, AppError> {
         Box::pin(async move {
-            let (app, tx) = Self::restore_commit(env, protocol, config, backup).await?;
-            tx.commit(&app.env.store).await?;
-            Ok(app)
+            match Self::restore_commit(env, protocol, config, backup).await? {
+                Restorable::Ready(app, tx) => {
+                    tx.commit(&app.env.store).await?;
+                    Ok(*app)
+                }
+                Restorable::TooLarge(error) => Err(error),
+            }
         })
         .await
     }
@@ -990,7 +1014,7 @@ impl App {
         protocol: Arc<dyn Protocol>,
         config: AppConfig,
         backup: &AppBackup,
-    ) -> Result<(App, Tx), AppError> {
+    ) -> Result<Restorable, AppError> {
         Box::pin(async move {
             let meta = backup.meta.clone();
             let invalid = |why: &str| AppError::InvalidData(format!("the backup: {why}"));
@@ -1134,15 +1158,23 @@ impl App {
                 identity_confirmed: None,
                 events: Vec::new(),
             };
+            // Every write of the one commit; what fails here is a write the store can't
+            // take in one batch, over its sizes.
             let mut tx = Tx::new(&app.ns);
-            tx.delete_prefix("")?;
-            app.write_all(&mut tx).await?;
-            for (sender, msg_id, record) in &processed {
-                feed::processed_writes(&mut tx, sender, msg_id, record.hash, record.at_ms)?;
+            let built: Result<(), AppError> = async {
+                tx.delete_prefix("")?;
+                app.write_all(&mut tx).await?;
+                for (sender, msg_id, record) in &processed {
+                    feed::processed_writes(&mut tx, sender, msg_id, record.hash, record.at_ms)?;
+                }
+                tx.put(records::LIST_DUE, &true)?;
+                tx.local(&layer_writes)
             }
-            tx.put(records::LIST_DUE, &true)?;
-            tx.local(&layer_writes)?;
-            Ok((app, tx))
+            .await;
+            Ok(match built {
+                Ok(()) => Restorable::Ready(Box::new(app), tx),
+                Err(error) => Restorable::TooLarge(error),
+            })
         })
         .await
     }

@@ -8,11 +8,11 @@ use std::sync::Mutex;
 
 use super::*;
 use crate::app::{
-    AppBackup, AppError, AppEvent, Need, ParkReason, Peeked, ProtocolLayer, RETRY_EVENT_READS,
-    ReceiveContext, StoreFailure,
+    AppBackup, AppError, AppEvent, BackupRefusal, Need, ParkReason, Peeked, ProtocolLayer,
+    RETRY_EVENT_READS, ReceiveContext, StoreFailure,
 };
 use crate::error::StoreError;
-use crate::store::{Fault as StoreFault, FaultStore, MAX_VALUE_BYTES};
+use crate::store::{Fault as StoreFault, FaultStore, MAX_BATCH_BYTES, MAX_VALUE_BYTES};
 use crate::testing::Fault;
 use pubky_switch_core::http::ErrorCode;
 
@@ -956,22 +956,64 @@ async fn test_backup_with_a_layer_that_could_never_be_restored_is_refused() {
             value: value.to_vec(),
         }]
     };
-    // A layer the protocol refuses: no journal.
+    // A layer the protocol refuses: no journal. Not a matter of size.
     let error = app.backup_layered().await.unwrap_err();
     assert!(
         matches!(&error, AppError::InvalidData(why) if why.contains("the journal is empty")),
         "{error:?}"
     );
-    // A layer whose value is over the store's value size.
+    assert!(app.take_events().is_empty());
+    // A layer whose value is over the store's value size: refused, and the host told.
     app.protocol_commit(&journal(HUGE)).await.unwrap();
     let error = app.backup_layered().await.unwrap_err();
     assert!(
         matches!(&error, AppError::Store(StoreError::Other(why)) if why.contains("value size")),
         "{error:?}"
     );
+    assert_eq!(
+        app.take_events(),
+        vec![AppEvent::BackupRefused {
+            reason: BackupRefusal::TooLarge
+        }]
+    );
     // Within the sizes, it backs up.
     app.protocol_commit(&journal(b"fits")).await.unwrap();
     app.backup_layered().await.unwrap();
+    assert!(app.take_events().is_empty());
+}
+
+#[tokio::test]
+async fn test_backup_layered_over_the_batch_size_is_refused_until_it_drains() {
+    let w = World::new();
+    let protocol = FlakyProtocol::new(0);
+    let mut app = join_flaky(&w, &protocol, "wallet").await;
+    // Three values, each within the value size, together over the batch size.
+    let part = usize::try_from(MAX_BATCH_BYTES / 3).unwrap() + 1;
+    for n in 0..3u8 {
+        app.protocol_commit(&[LocalWrite::Put {
+            key: vec![b'b', n],
+            value: vec![n; part],
+        }])
+        .await
+        .unwrap();
+    }
+    let error = app.backup_layered().await.unwrap_err();
+    assert!(
+        matches!(&error, AppError::Store(StoreError::Other(why)) if why.contains("batch")),
+        "{error:?}"
+    );
+    assert_eq!(
+        app.take_events(),
+        vec![AppEvent::BackupRefused {
+            reason: BackupRefusal::TooLarge
+        }]
+    );
+    // Once the state drains below it, the backup goes through.
+    app.protocol_commit(&[LocalWrite::Delete { key: vec![b'b', 0] }])
+        .await
+        .unwrap();
+    app.backup_layered().await.unwrap();
+    assert!(app.take_events().is_empty());
 }
 
 #[tokio::test]

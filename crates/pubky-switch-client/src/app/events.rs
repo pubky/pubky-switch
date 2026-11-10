@@ -63,6 +63,12 @@ pub enum AppEvent {
         /// The store's failure on this read.
         failure: StoreFailure,
     },
+    /// A layered backup was refused ([`super::App::backup_layered`]), so the host knows it
+    /// has no current backup.
+    BackupRefused {
+        /// Why.
+        reason: BackupRefusal,
+    },
     /// An entry was stored locally and the cursor moved past it (Switch spec 8.2): its
     /// sender stayed unverifiable too long, its write hit a quota, or the store failed for
     /// its receive step ([`ParkReason`]).
@@ -366,6 +372,15 @@ pub enum AppEvent {
         /// The attempt.
         attempt_id: [u8; 16],
     },
+}
+
+/// Why a backup was refused ([`AppEvent::BackupRefused`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum BackupRefusal {
+    /// The restore's one commit wouldn't fit the store's value or batch size: the layer, or
+    /// the entries stored locally and the processed pairs it carries, are too large for now.
+    TooLarge,
 }
 
 /// Why an entry was stored locally (Switch spec 8.2).
