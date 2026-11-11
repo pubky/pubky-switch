@@ -551,9 +551,27 @@ fn test_upload_settled_proof_rebuilds_a_tombstone_only_for_nothing_held() {
     let tombstone = merge.claim.unwrap();
     assert!(merge.changed && tombstone.tombstone && tombstone.settled);
     assert!(tombstone.attempts.iter().all(|a| a.from_upload));
-    // A claim the service holds isn't rebuilt from the proof.
+    // A claim the service holds settled isn't rebuilt from the proof, nor changed.
     let held = super::super::tombstone_from_proof(&view, NOW - 9_000).unwrap();
     let merge = merge_upload_claim(Some(&held), Some(settled), &[], NOW, 64);
+    assert!(!merge.changed);
+    // One it holds open and unsettled the proof makes divergent: a change, one step on.
+    let anyone = |_: &[u8; 16]| true;
+    let cx = EntryContext {
+        writer: app().app_id_bytes(),
+        now: NOW,
+        can_read: true,
+        is_current: &anyone,
+        limits: ClaimLimits::default(),
+        tally: ClaimTally::default(),
+    };
+    let open = apply_entry(None, &attempt_fields().check().unwrap(), &cx).unwrap();
+    let merge = merge_upload_claim(Some(&open), Some(settled), &[], NOW, 64);
+    let claim = merge.claim.clone().unwrap();
+    assert!(merge.changed && merge.divergent && claim.divergent && claim.rebuilt);
+    assert_eq!(claim.step, open.step + 1);
+    // Divergent already, it stays so, unchanged.
+    let merge = merge_upload_claim(Some(&claim), Some(settled), &[], NOW, 64);
     assert!(!merge.changed);
     // An open claim's proof rebuilds nothing.
     let attempt = op_at(LOST, OpKind::Claim(attempt_fields()));

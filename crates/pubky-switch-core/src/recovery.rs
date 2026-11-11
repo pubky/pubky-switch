@@ -576,7 +576,10 @@ pub fn tombstone_from_proof(view: &ClaimView, at: u64) -> Option<Claim> {
 /// Merge an upload's evidence for one claim key: on an obligation the service holds nothing
 /// for, a SETTLED proof among the upload's `proofs` (`settled`, the view and the proof's
 /// time) first rebuilds its tombstone (Switch wire 7.4.14 "`heads` and `proofs`"), and the
-/// entries then merge into it as into any claim ([`merge_claim`]).
+/// entries then merge into it as into any claim ([`merge_claim`]). On one it holds open and
+/// unsettled after the entries, the proof makes it divergent (doubtful), so an app that
+/// attempted again here is warned by another app's settled evidence, as after a move; one
+/// it holds settled the proof doesn't change.
 pub fn merge_upload_claim(
     held: Option<&Claim>,
     settled: Option<&(ClaimView, u64)>,
@@ -589,7 +592,24 @@ pub fn merge_upload_claim(
         _ => None,
     };
     let Some(tombstone) = rebuilt else {
-        return merge_claim(held, entries, now, max_attempts);
+        let mut merge = merge_claim(held, entries, now, max_attempts);
+        if held.is_some()
+            && settled.is_some()
+            && let Some(claim) = merge.claim.as_mut()
+            && !claim.settled
+            && !claim.tombstone
+            && !claim.divergent
+        {
+            claim.divergent = true;
+            if !merge.changed {
+                claim.rebuilt = true;
+                claim.step = claim.step.saturating_add(1);
+                claim.last_entry = Some(now);
+                merge.changed = true;
+            }
+            merge.divergent = true;
+        }
+        return merge;
     };
     let mut merge = merge_claim(Some(&tombstone), entries, now, max_attempts);
     merge.changed = true;
