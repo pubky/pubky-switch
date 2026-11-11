@@ -5,6 +5,15 @@ members = [
     "crates/pubky-switch-client",
     "crates/pubky-switch-signer",
     "crates/pubky-switch",
+    "crates/pubky-switch-harness",
+]
+# The harness is for tests only, and turns on the other crates' test-only features: a
+# plain build or test at the root leaves it out. `--workspace` takes it in.
+default-members = [
+    "crates/pubky-switch-core",
+    "crates/pubky-switch-client",
+    "crates/pubky-switch-signer",
+    "crates/pubky-switch",
 ]
 
 [workspace.package]
