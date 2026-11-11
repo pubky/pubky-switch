@@ -159,9 +159,10 @@ pub enum Alert {
     /// deletes and changes nothing, and signs nothing while the switch can't be read (Switch
     /// wire 7.3 step 2, 7.4.16). The account may have been erased from another copy of this
     /// install; the way out is the user's, a restore or an enrollment elsewhere. It clears
-    /// itself at the next check whose `GET /apps` the pinned key signs: every signing step
-    /// checks first, so it outlasts the switch's recovery by one check at most. Never raised
-    /// once the account is erased.
+    /// itself at the next check whose `GET /apps` gets an answer the pinned key signs, an
+    /// error included, since only a hosted account's key signs one; an unsigned answer or no
+    /// answer leaves it. Every signing step checks first, so it outlasts the switch's
+    /// recovery by one check at most. Never raised once the account is erased.
     AccountNotHosted,
     /// A removed app's Pubky grant still lets it write its Homeserver paths: the Pubky SDK
     /// offers no call to revoke a grant yet, so the user revokes it in the Homeserver's own

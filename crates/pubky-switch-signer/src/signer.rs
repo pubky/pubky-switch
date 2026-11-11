@@ -444,15 +444,20 @@ impl Signer {
         if self.state.erased {
             return self.commit(state, self.flow.clone()).await;
         }
+        // Nothing is delivered, published or read for an install that isn't the one to sign:
+        // another install named, or records behind (Switch spec 4.3, wire 3.13).
+        let named = self.check_named().is_ok();
         // Seen, another body on the Homeserver is published over with the switch's copy once
         // the switch is confirmed to hold this signer's newest version (Switch wire 3.3).
-        let republish = matches!(
-            alert,
-            Alert::Equivocation {
-                source: Source::Homeserver,
-                ..
-            }
-        ) && state.homeserver_other.is_some();
+        let republish = named
+            && matches!(
+                alert,
+                Alert::Equivocation {
+                    source: Source::Homeserver,
+                    ..
+                }
+            )
+            && state.homeserver_other.is_some();
         if republish {
             state.republish_over = state.homeserver_other;
             if let Some(newest) = state.newest.as_mut() {
@@ -462,7 +467,8 @@ impl Signer {
         // Delivered again only when the alarm saw a copy at the switch: one that holds nothing
         // has lost the account's state, and a version 1 delivered onto it would start the
         // account afresh at the same generation (Switch spec 6.5 "No restore and continue");
-        // the way out is a provider loss. Never once another install signs.
+        // the way out is a provider loss. Never once another install signs, or while the
+        // records are behind, where the delivery could never go.
         let alarm = matches!(
             alert,
             Alert::Rollback {
@@ -470,7 +476,6 @@ impl Signer {
                 ..
             } | Alert::Equivocation { .. }
         );
-        let named = self.state.managed_by.is_none();
         let again = match (&self.state.newest, &self.flow) {
             (Some(newest), None) if alarm && named && state.switch_unconfirmed => {
                 Some(Flow::Deliver {
@@ -977,9 +982,9 @@ impl Signer {
     /// `GET /apps` (Switch wire 7.4.12), for a check of the switch's copy: the answer, with the
     /// device clock when it came. A `404` the pinned key didn't sign, with no erasure of this
     /// install's in progress, raises [`Alert::AccountNotHosted`] and is returned as the error
-    /// it is; the next answer the pinned key signs clears it. Never raised once the account is
-    /// erased. Nothing else changes: an unauthenticated `404` with no request in doubt is never
-    /// an erasure (Switch wire 7.4.16).
+    /// it is; the next answer the pinned key signs clears it, an error included. Never raised
+    /// once the account is erased. Nothing else changes: an unauthenticated `404` with no
+    /// request in doubt is never an erasure (Switch wire 7.4.16).
     pub(crate) async fn read_apps(&mut self) -> Result<SwitchRead> {
         let read = self.service_client()?.apps().await;
         // The device clock when the answer came, before the alert's commit below, so a step
@@ -989,7 +994,8 @@ impl Signer {
         // An erasure in progress judges the `404` itself (Switch wire 7.4.16).
         let erasing = matches!(self.flow, Some(Flow::Erase { .. }));
         let raise = match &read {
-            Ok(_) if raised => Some(false),
+            // Any answer the pinned key signs, an error included, shows the account hosted.
+            Ok(_) | Err(ClientError::Switch { .. }) if raised => Some(false),
             Err(ClientError::BadServiceSignature { status: 404 })
                 if !raised && !erasing && !self.state.erased =>
             {
