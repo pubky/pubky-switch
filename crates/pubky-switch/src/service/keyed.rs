@@ -219,12 +219,16 @@ impl Service {
     /// The answer to a request whose transaction failed under the account's lock: a database
     /// that ended the transaction released its lock, and an erasure may have committed
     /// since. So the transaction is dropped first, holding no second connection, and the
-    /// answer is signed only in a keyed section (the module's doc).
+    /// answer is signed only in a keyed section (the module's doc). `key` is the key `signer`
+    /// was loaded for, not the transaction's: a request that changed the account's key in
+    /// it (Switch wire 3.3) holds the new one there, and a retry may have committed that
+    /// change since, so the section checks the key that signs.
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn sign_after_failure(
         &self,
         txn: AccountTxn,
         signer: &ServiceSigner,
+        key: &KeyId,
         request_signature: Option<&[u8; 64]>,
         time_ms: u64,
         answer: Answer,
@@ -232,7 +236,7 @@ impl Service {
         by_signer: bool,
     ) -> SwitchResponse {
         let account = txn.head().id.clone();
-        let key = txn.head().service_key.clone();
+        let key = key.clone();
         drop(txn);
         self.sign_keyed(
             Proof::checked(&account, &key),

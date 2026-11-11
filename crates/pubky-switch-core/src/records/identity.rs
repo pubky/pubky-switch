@@ -512,19 +512,23 @@ impl IdentityDoc {
     }
 
     /// The first-document rule (Switch wire 3.3): the first document of an account enrolled
-    /// without one has version, generation and data epoch 1, or carries `recovery_from`.
+    /// without one has version, generation and data epoch 1, or carries `recovery_from`, its
+    /// `generation` less one (a provider loss), at any generation above 1.
     ///
     /// # Errors
     ///
     /// [`crate::Error::Invalid`] otherwise (`400 bad_request` at the service).
     pub fn check_first(&self) -> Result<()> {
         let b = &self.body;
-        if b.recovery_from.is_some() || (b.version, b.generation, b.data_epoch) == (1, 1, 1) {
+        let recovers = b.generation > 1 && b.recovery_from == b.generation.checked_sub(1);
+        if recovers
+            || (b.recovery_from.is_none() && (b.version, b.generation, b.data_epoch) == (1, 1, 1))
+        {
             Ok(())
         } else {
             invalid(
                 "Switch wire 3.3: a first document has version, generation and data_epoch 1, \
-                 or recovery_from",
+                 or recovery_from, its generation less one",
             )
         }
     }
@@ -856,8 +860,24 @@ mod tests {
         let mut later = body();
         later.version = 3;
         assert!(sign(later.clone()).check_first().is_err());
+        // A provider loss: `recovery_from` is the generation less one, at a generation above 1.
         later.recovery_from = Some(1);
-        sign(later).check_first().unwrap();
+        assert!(
+            sign(later.clone()).check_first().is_err(),
+            "at generation 1"
+        );
+        later.generation = 2;
+        sign(later.clone()).check_first().unwrap();
+        later.generation = 3;
+        assert!(
+            sign(later.clone()).check_first().is_err(),
+            "not the generation less one"
+        );
+        later.recovery_from = None;
+        assert!(
+            sign(later).check_first().is_err(),
+            "above generation 1 without it"
+        );
     }
 
     #[test]

@@ -133,7 +133,7 @@ pub fn check_delivery(
         if doc.check_first().is_err() {
             return Err(DeliveryRefusal::BadRequest(
                 "Switch wire 3.3: a first document has version, generation and data_epoch 1, \
-                 or recovery_from",
+                 or recovery_from, its generation less one",
             ));
         }
         if prev.is_some() {
@@ -156,12 +156,21 @@ pub fn check_delivery(
     if held.signed() == doc.signed() {
         return Ok(Delivery::Retry);
     }
-    if prev != Some(&held.hash()) {
+    let (held_body, held_generation) = (held.body(), held.generation());
+    // In place, the next generation naming the pending key (Switch wire 3.3).
+    let next_in_place = !account.staged
+        && Some(body.generation) == held_generation.checked_add(1)
+        && body.inbox.url == account.origin
+        && Some(body.inbox.service_key) == account.pending_key;
+    // A provider loss in place may follow a loss of the very versions it builds on, so its
+    // `prev` isn't compared: a higher version than the one held is enough, the identity's
+    // signature, the pending key and the generation step bounding it (wire 3.3).
+    let recovers = next_in_place && body.recovery_from == Some(held_generation);
+    if prev != Some(&held.hash()) && !recovers {
         return Err(DeliveryRefusal::StaleIdentity(
             "Switch wire 3.3: prev isn't the newest version held",
         ));
     }
-    let (held_body, held_generation) = (held.body(), held.generation());
     if body.version <= held_body.version || body.generation < held_generation {
         return Err(DeliveryRefusal::StaleIdentity(
             "Switch wire 3.3: not a higher version at no lower generation",
@@ -171,11 +180,8 @@ pub fn check_delivery(
         None
     } else if account.staged {
         Some(GenerationChange::Staged)
-    } else if Some(body.generation) == held_generation.checked_add(1)
-        && body.inbox.url == account.origin
-        && Some(body.inbox.service_key) == account.pending_key
-    {
-        if body.recovery_from == Some(held_generation) {
+    } else if next_in_place {
+        if recovers {
             Some(GenerationChange::ProviderLoss)
         } else {
             Some(GenerationChange::KeyRotation)

@@ -5,7 +5,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
-use pubky_switch_core::chain::{ItemType, ProofState, item_hash};
+use pubky_switch_core::chain::{ItemType, ProofState, ServiceTransition, item_hash};
 use pubky_switch_core::claims::Outcome;
 use pubky_switch_core::enc::{b64, zbase32_encode};
 use pubky_switch_core::http::{ErrorCode, IdentityDelivery};
@@ -289,6 +289,32 @@ impl Inner {
         };
         match check_delivery(&view, &doc, delivery.prev.as_ref()) {
             Ok(Delivery::New(_)) => {
+                // A first document that starts a recovery, as at the service: the account
+                // takes its generation, and its chain starts with the `recovery` transition
+                // (Switch wire 3.3, 7.4.2), unless the switch was made recovering, which
+                // chained it already.
+                if self.doc.is_none()
+                    && self.recovery_from.is_none()
+                    && let Some(recovery_from) = doc.body().recovery_from
+                {
+                    // It names this switch: its origin and its key (Switch wire 7.4.2).
+                    if doc.inbox().url != self.origin
+                        || doc.inbox().service_key != self.service.verifying_key().to_bytes()
+                    {
+                        return Ok(bad(
+                            ErrorCode::BadRequest,
+                            "a recovery's first document names this service",
+                            json!(null),
+                        ));
+                    }
+                    // An app's first receive key may carry any `n` (Switch spec 3.6).
+                    self.any_first_n = true;
+                    self.tip.generation = doc.generation();
+                    let at = self.now();
+                    self.recovery_from = Some(recovery_from);
+                    self.recovery_declared_at = Some(at);
+                    self.service_transition(ServiceTransition::Recovery { recovery_from, at })?;
+                }
                 let proof = self.chain_identity(&doc)?;
                 Ok((
                     200,
@@ -629,6 +655,75 @@ mod tests {
         let (status, _) = inner.erase_answer(&erase_body(&key, None));
         assert_eq!(status, 200);
         assert!(inner.erased);
+    }
+
+    #[test]
+    fn test_scripted_first_document_of_a_recovery_starts_its_generation() {
+        // As at the service: the account takes the first document's generation, its chain
+        // starts with the `recovery` transition, and `GET /apps` reports the recovery; a
+        // `recovery_from` that isn't the generation less one is `400` (Switch wire 3.3, 7.4.2).
+        use pubky_switch_core::records::{IdentityBody, IdentityPolicy, Inbox};
+        let identity = pubky_switch_core::keys::IdentityKey::from_secret([1; 32]);
+        let switch = ScriptedSwitch::new(
+            &identity,
+            [2; 32],
+            Arc::new(crate::clock::TestClock::new(1_000)),
+        );
+        let mut inner = switch.lock();
+        let (origin, key) = (
+            inner.origin.clone(),
+            inner.service.verifying_key().to_bytes(),
+        );
+        let first = |generation: u64, recovery_from: u64| {
+            let mut body = IdentityBody::first(
+                identity.public(),
+                [3; 16],
+                Inbox {
+                    url: origin.clone(),
+                    service_key: key,
+                },
+                IdentityPolicy::default(),
+            );
+            body.generation = generation;
+            body.recovery_from = Some(recovery_from);
+            let doc = IdentityDoc::sign(&identity, body).unwrap();
+            IdentityDelivery {
+                identity: doc.signed().clone(),
+                prev: None,
+            }
+            .to_json()
+        };
+        let wrong = first(3, 1);
+        let (status, _) = inner.put_identity(&wrong).unwrap();
+        assert_eq!(status, 400);
+        let elsewhere = {
+            let mut body = IdentityBody::first(
+                identity.public(),
+                [3; 16],
+                Inbox {
+                    url: "https://elsewhere.example".into(),
+                    service_key: key,
+                },
+                IdentityPolicy::default(),
+            );
+            body.generation = 3;
+            body.recovery_from = Some(2);
+            let doc = IdentityDoc::sign(&identity, body).unwrap();
+            IdentityDelivery {
+                identity: doc.signed().clone(),
+                prev: None,
+            }
+            .to_json()
+        };
+        let (status, _) = inner.put_identity(&elsewhere).unwrap();
+        assert_eq!(status, 400, "another service");
+        let right = first(3, 2);
+        let (status, _) = inner.put_identity(&right).unwrap();
+        assert_eq!(status, 200);
+        assert_eq!((inner.tip.generation, inner.tip.seq), (3, 2));
+        assert_eq!(inner.recovery_from, Some(2));
+        assert_eq!(inner.recovery_declared_at, Some(1_000));
+        assert!(inner.any_first_n);
     }
 
     #[test]

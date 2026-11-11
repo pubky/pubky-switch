@@ -1303,6 +1303,54 @@ async fn test_store_records_page_keeps_key_text_order_under_any_join() {
     fx.finish().await;
 }
 
+/// A key an erasure owed before migration 0017: it stays an erasure's, whose deletion the
+/// ledger records, not a retired one.
+#[tokio::test]
+#[allow(clippy::panic)]
+async fn test_store_upgrade_keeps_owed_keys_as_erasures() {
+    use pubky_switch::store::{DatabaseConfig, MIGRATIONS, testing::TestDatabase};
+    let db = match TestDatabase::create_with(&DatabaseConfig::default(), false).await {
+        Ok(db) => db,
+        Err(pubky_switch::store::testing::TestDatabaseError::Skipped) => return,
+        Err(error) => panic!("test database: {error}"),
+    };
+    let mut conn = PgConnection::connect_with(db.options())
+        .await
+        .expect("conn");
+    let before = sqlx::migrate::Migrator {
+        migrations: std::borrow::Cow::Owned(
+            MIGRATIONS
+                .iter()
+                .take_while(|m| m.version < 17)
+                .cloned()
+                .collect(),
+        ),
+        ignore_missing: false,
+        locking: true,
+        no_tx: false,
+    };
+    before
+        .run(&mut conn)
+        .await
+        .expect("migrations through 0016");
+    sqlx::query(
+        "INSERT INTO erased_keys (key_id, account_id, erased_at_ms) VALUES ('owed', 'gone', 5)",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("an owed key under 0016");
+    let announced =
+        pubky_switch::service::announced_limits(&pubky_switch::limits::Limits::default());
+    db.store().migrate(&announced).await.expect("upgrade");
+    let reason: String = sqlx::query_scalar("SELECT reason FROM erased_keys WHERE key_id = 'owed'")
+        .fetch_one(&mut conn)
+        .await
+        .expect("reason");
+    assert_eq!(reason, "erasure");
+    conn.close().await.expect("close");
+    db.drop_database().await.expect("drop");
+}
+
 /// A record taken from a recovery upload after a provider loss, at `version` of generation 1,
 /// listed by the `upload` transition at `seq`.
 fn uploaded_record(key: [u8; 32], version: u64, seq: u64) -> pubky_switch::store::StoredRecord {
