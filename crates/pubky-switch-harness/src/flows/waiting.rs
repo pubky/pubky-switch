@@ -1,12 +1,5 @@
 //! A feed read that waits (Switch wire 7.4.4 `wait`): an app with nothing to read asks the
 //! switch to hold its read, and a write of another app answers it.
-//!
-//! This flow isn't among [`super::FLOWS`], whose runs are compared. The service holds a
-//! read with `wait` until its account changes. The scripted switch doesn't read `wait`: it
-//! answers at once, with nothing, and the app finds the write at its next read. The two
-//! runs make their calls in different orders then, which the comparison can't set side by
-//! side. The flow's test runs it against each and holds what each does; once the scripted
-//! switch holds a waiting read, the flow belongs in `FLOWS`.
 
 use std::cell::Cell;
 use std::time::Duration;
@@ -31,20 +24,20 @@ const WAIT_S: u32 = 25;
 const STEP_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// alice's watch has read its feed to the end. It reads again and asks the switch to wait;
-/// while the read is held, her wallet writes a record. At a switch that holds the read,
-/// the write answers it: the watch gets the record without asking again, and a read after
-/// that finds nothing new.
+/// while the read is held, her wallet writes a record. The write answers the read: the
+/// watch gets the record without asking again, and a read after that finds nothing new.
 ///
 /// The two calls are in flight at once. The write starts when the switch holds the read
-/// ([`World::held_reads`]), or when the read was answered already, as it is at a switch
-/// that doesn't hold one: it waits on that state, not for a time.
+/// ([`World::held_reads`]): it waits on that state, not for a time. A read answered before
+/// the write started wasn't held, and fails the flow.
 ///
 /// Calls: `GET /v1/{id}/feed` with `wait`, answered by another app's `POST /v1/{id}/ops`.
 ///
 /// # Errors
 ///
-/// When a step that should succeed against any switch fails, or when the read and the
-/// write together take 15 seconds, well short of the wait: the write didn't answer the read.
+/// When a step that should succeed against any switch fails; when the switch answers the
+/// read without holding it; or when the read and the write together take 15 seconds, well
+/// short of the wait: the write didn't answer the read.
 pub async fn waiting_read(world: &World) -> FlowResult {
     let alice = world.identity("alice")?;
     world.add_switch(ORIGIN, &[&alice]).await?;
@@ -97,6 +90,9 @@ pub async fn waiting_read(world: &World) -> FlowResult {
     };
     written?;
     let report = read?;
+    if !held_at_the_write.get() {
+        return Err("the switch answered the waiting read without holding it".into());
+    }
     world.outcome(
         "the watch's waiting read, answered by the wallet's write",
         &json!({

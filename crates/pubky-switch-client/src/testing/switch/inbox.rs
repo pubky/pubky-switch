@@ -403,13 +403,23 @@ impl Inner {
             let at = self.now();
             self.shared
                 .service_conversations
-                .insert(identity, (hash, at));
+                .insert(identity, (hash, at, invite_context.clone()));
             self.service_transition(ServiceTransition::ConversationAdd {
                 pubky: identity,
                 code_hash: hash,
-                context: invite_context,
+                context: invite_context.clone(),
                 at,
             })?;
+            // The feed shows the entry with its code's context (Switch wire 7.5).
+            if let Some(Item::Chain { context, .. }) = self.items.last_mut() {
+                *context = Some(invite_context);
+            }
+        } else if sender.is_some() {
+            // An append a conversation entry may have admitted: its time is the entry's
+            // `last_used` (Switch wire 7.4.6). The append a code admits writes the entry,
+            // and counts for none.
+            let at = self.now();
+            self.shared.note_conversation_used(&identity, at);
         }
         let seq = self.next_seq();
         let accepted_at = self.now();

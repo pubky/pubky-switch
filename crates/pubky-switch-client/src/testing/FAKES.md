@@ -49,6 +49,13 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
 
 - **Durability** (Switch spec 6.5): everything is in memory, answered at once; the service
   key's mark isn't kept. Per-account order is a mutex.
+- **Waiting reads** (Switch wire 7.4.4 `wait`): the transport of `holding_transport` holds a
+  feed read with `wait` that has nothing to show its app, until the account's sequence
+  grows or the wait has passed. The wait passes by the switch's clock, a test clock that
+  wakes nobody: a held read notices at the next request to the switch or at
+  `release_held_reads`, where the service answers by itself when its time is up. The
+  transport of `transport` holds nothing and answers such a read at once. A `wait` that
+  isn't an integer from 0 to 25 is `400`.
 - **Retention and sweeps** (Switch wire 9.1): entries never expire; `missed` items,
   checkpoints and dropped stubs exist only when a test scripts them, and a scripted `missed`
   item (`push_missed`) is shown to every app, where the service shows one only to its app;
@@ -61,8 +68,7 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   their proofs go only when a retry finds them past `batch_proofs_ms`.
 - **Invite codes**: a revoked app's codes aren't withdrawn (Switch wire 7.4.3 "After a
   revocation"); a code planted for a faulty export never expires.
-- **Lists**: `flagged` is always empty; connect requests are never full. Conversation
-  entries carry no `last_used`, and those the service wrote carry no `context`.
+- **Lists**: `flagged` is always empty; connect requests are never full.
 - **Records**: `divergent` is always `false`.
 - **Directory** (Switch wire 7.4.10): an app is reachable from its first receive key until
   it is revoked or leaves; one that stops being current otherwise, with an expired or

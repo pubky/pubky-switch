@@ -199,10 +199,7 @@ impl World {
                         identity.service_secret(),
                         self.clock.clone(),
                     );
-                    accounts.push((
-                        identity.key().id(),
-                        switch.transport() as Arc<dyn Transport>,
-                    ));
+                    accounts.push((identity.key().id(), switch.holding_transport()));
                     lock(&self.scripted).push(switch);
                 }
                 self.router.add(origin, Arc::new(Accounts { accounts }));
@@ -232,6 +229,10 @@ impl World {
         self.clock.advance_ms(ms);
         for switch in lock(&self.services).iter() {
             switch.sample_time();
+        }
+        // A read the scripted switch holds looks at the clock when told to.
+        for switch in lock(&self.scripted).iter() {
+            switch.release_held_reads();
         }
     }
 
@@ -332,14 +333,18 @@ impl World {
         self.recorder.faults_left()
     }
 
-    /// How many accounts have a feed read held at a switch now, waiting for a change
-    /// (Switch wire 7.4.4 `wait`). The scripted switch holds none: it answers a waiting
-    /// read at once.
+    /// How many feed reads a switch holds now, waiting for a change (Switch wire 7.4.4
+    /// `wait`): at the service, the accounts with one.
     pub fn held_reads(&self) -> usize {
-        lock(&self.services)
+        let service: usize = lock(&self.services)
             .iter()
             .map(RealSwitch::held_reads)
-            .sum()
+            .sum();
+        let scripted: usize = lock(&self.scripted)
+            .iter()
+            .map(|switch| switch.held_reads())
+            .sum();
+        service.saturating_add(scripted)
     }
 
     /// A request no key signs, as any reader of the network sends it: `method path` at

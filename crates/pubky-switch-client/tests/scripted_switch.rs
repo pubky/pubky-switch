@@ -17,7 +17,7 @@ use pubky_switch_client::testing::{
     AppSpec, PEER_ORIGIN, PeerSwitch, ProtocolSpec, Router, START_MS, SWITCH_ORIGIN, ScriptError,
     Seeds, TestHomeserver, TestIdentity, TestProtocol, TestSigner,
 };
-use pubky_switch_client::transport::Transport;
+use pubky_switch_client::transport::{Header, Request, Response, Transport};
 use pubky_switch_core::claims::{Basis, ClaimFields, ClaimStatus, ClaimType};
 use pubky_switch_core::ident::{NamingKey, Policy, collection_id, record_key_from_blinded};
 use pubky_switch_core::keys::AppKeys;
@@ -43,6 +43,7 @@ fn items() -> Collection {
 
 /// Alice's signer and account, bob's switch with one app, and a router between them.
 struct Setup {
+    clock: Arc<TestClock>,
     alice: TestSigner,
     bob: Arc<PeerSwitch>,
     shop: [u8; 16],
@@ -74,6 +75,7 @@ impl Setup {
         router.add_switch(SWITCH_ORIGIN, alice.switch());
         router.add(PEER_ORIGIN, bob.transport());
         Self {
+            clock,
             alice,
             bob,
             shop,
@@ -363,4 +365,132 @@ async fn test_testing_injected_record_conflict_changes_nothing() {
     );
     assert_eq!(switch.seq(), seq);
     assert_eq!(switch.record(&key).unwrap().seq, seq);
+}
+
+/// A feed read by `app` past everything it has read, with `wait`, as the client sends it.
+fn waiting_read(s: &Setup, app: &App, wait: &str) -> Request {
+    let cursor = app.cursor();
+    Request {
+        method: "GET".into(),
+        origin: SWITCH_ORIGIN.into(),
+        path_and_query: format!(
+            "/v1/{}/feed?after={}:{}&wait={wait}",
+            s.alice.identity().key().id(),
+            cursor.generation,
+            cursor.seq
+        ),
+        headers: vec![Header::new(
+            "switch-app",
+            &pubky_switch_core::enc::zbase32_encode(&app.app_id()),
+        )],
+        body: Vec::new(),
+    }
+}
+
+/// Poll `read` once: its answer, or `None` while the switch holds it.
+fn poll_once(
+    read: &mut std::pin::Pin<Box<dyn std::future::Future<Output = AnswerOrError> + Send + '_>>,
+) -> Option<Response> {
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    match read.as_mut().poll(&mut context) {
+        std::task::Poll::Ready(answer) => Some(answer.unwrap()),
+        std::task::Poll::Pending => None,
+    }
+}
+
+type AnswerOrError = Result<Response, pubky_switch_client::TransportError>;
+
+fn items_of(answer: &Response) -> usize {
+    let body: serde_json::Value = serde_json::from_slice(&answer.body).unwrap();
+    body["items"].as_array().unwrap().len()
+}
+
+#[tokio::test]
+async fn test_testing_holding_transport_holds_a_waiting_read_until_an_item_comes() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    app.receive(None).await.unwrap();
+    let me = app.app_id();
+    let switch = s.alice.switch();
+    let transport = switch.holding_transport();
+
+    // Nothing to show: the read is held (Switch wire 7.4.4).
+    let mut read = transport.send(waiting_read(&s, &app, "25"));
+    assert!(poll_once(&mut read).is_none());
+    assert_eq!(switch.held_reads(), 1);
+    // An entry for the app comes: the read is woken and answered with it.
+    s.bob
+        .send_to(
+            switch,
+            s.shop,
+            "example.note",
+            json!({ "text": "hello" }),
+            &[me],
+        )
+        .unwrap();
+    assert_eq!(switch.held_reads(), 0, "the entry woke the read");
+    let answer = poll_once(&mut read).expect("answered");
+    assert_eq!((answer.status, items_of(&answer)), (200, 1));
+}
+
+#[tokio::test]
+async fn test_testing_holding_transport_answers_a_waiting_read_once_its_wait_passed() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    app.receive(None).await.unwrap();
+    let switch = s.alice.switch();
+    let transport = switch.holding_transport();
+
+    let mut read = transport.send(waiting_read(&s, &app, "25"));
+    assert!(poll_once(&mut read).is_none());
+    // One second short of the wait: still held, and told to look, it holds on.
+    s.clock.advance_ms(24_000);
+    switch.release_held_reads();
+    assert!(poll_once(&mut read).is_none());
+    assert_eq!(switch.held_reads(), 1);
+    // The wait has passed by the switch's clock: an empty page.
+    s.clock.advance_ms(1_000);
+    switch.release_held_reads();
+    assert_eq!(switch.held_reads(), 0);
+    let answer = poll_once(&mut read).expect("answered");
+    assert_eq!((answer.status, items_of(&answer)), (200, 0));
+}
+
+#[tokio::test]
+async fn test_testing_waiting_read_is_not_held_without_cause() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    app.receive(None).await.unwrap();
+    let me = app.app_id();
+    let switch = s.alice.switch();
+    let holding = switch.holding_transport();
+
+    // A `wait` out of its range is refused at once.
+    for wait in ["26", "soon"] {
+        let mut read = holding.send(waiting_read(&s, &app, wait));
+        let answer = poll_once(&mut read).expect("refused at once");
+        assert_eq!(answer.status, 400, "wait={wait}");
+    }
+    // `wait=0` is no wait.
+    let mut read = holding.send(waiting_read(&s, &app, "0"));
+    assert_eq!(poll_once(&mut read).map(|answer| answer.status), Some(200));
+    // The plain transport holds nothing.
+    let plain = switch.transport();
+    let mut read = plain.send(waiting_read(&s, &app, "25"));
+    let answer = poll_once(&mut read).expect("answered at once");
+    assert_eq!((answer.status, items_of(&answer)), (200, 0));
+    // With something to show, a waiting read is answered at once.
+    s.bob
+        .send_to(
+            switch,
+            s.shop,
+            "example.note",
+            json!({ "text": "hello" }),
+            &[me],
+        )
+        .unwrap();
+    let mut read = holding.send(waiting_read(&s, &app, "25"));
+    let answer = poll_once(&mut read).expect("answered at once");
+    assert_eq!((answer.status, items_of(&answer)), (200, 1));
+    assert_eq!(switch.held_reads(), 0);
 }

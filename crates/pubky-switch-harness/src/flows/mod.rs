@@ -110,6 +110,7 @@ pub const FLOWS: &[(&str, Flow)] = &[
     ("renewed twice", |world| Box::pin(renewed_twice(world))),
     ("third epoch", |world| Box::pin(third_epoch(world))),
     ("two collections", |world| Box::pin(two_collections(world))),
+    ("waiting read", |world| Box::pin(waiting_read(world))),
 ];
 
 /// The flow that sends `call` to the service; `None` for a call the service doesn't serve
