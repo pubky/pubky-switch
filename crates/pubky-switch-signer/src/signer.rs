@@ -1482,14 +1482,23 @@ impl Signer {
 
     /// Whether `copy`, while a recovery is in progress, is a version of that recovery this
     /// install signed: its own, declaring the same generation lost, at a version it spent
-    /// (Switch spec 12.6 step 1). An earlier declaration's version the service took, its
-    /// answer lost.
+    /// (Switch spec 12.6 step 1), as an earlier declaration's version the service took, its
+    /// answer lost; or, after a restore mid-recovery, the backup's version it was restored
+    /// from.
     pub(super) fn own_recovery_version(&self, copy: &IdentityDoc) -> bool {
+        // A restore's recovery is built on the backup's version itself, which the install
+        // the backup came from signed (Switch wire 3.13).
+        let restored = self
+            .state
+            .recovery_base
+            .as_ref()
+            .is_some_and(|base| base == copy.signed() && copy.body().recovery_from.is_some());
         self.state.recovering
-            && copy.body().signer == self.state.install
-            && copy.body().recovery_from.is_some()
-            && copy.body().recovery_from == self.state.lost_generation
-            && copy.version() <= self.state.signed_through
+            && (restored
+                || (copy.body().signer == self.state.install
+                    && copy.body().recovery_from.is_some()
+                    && copy.body().recovery_from == self.state.lost_generation
+                    && copy.version() <= self.state.signed_through))
     }
 
     /// The service holds `copy`, a version of the recovery in progress ([`Signer::

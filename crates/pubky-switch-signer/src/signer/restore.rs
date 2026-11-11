@@ -193,6 +193,11 @@ impl Signer {
             state.recovering = true;
             state.recovery_base = Some(doc.signed().clone());
             state.lost_generation = Some(lost);
+            // The service the recovery went to, under the key its version names: declared
+            // again there, it is read under that key first.
+            if let Some(service) = state.service.clone() {
+                state.recovery_services = vec![service];
+            }
         }
         state.newest = Some(Newest {
             doc: doc.signed().clone(),

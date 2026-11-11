@@ -2052,21 +2052,54 @@ async fn test_provider_loss_later_version_restored_while_the_service_is_unreacha
     );
 }
 
+/// The enrollments sent to `origin`, as `router` logged them.
+fn enrollments_at(router: &Router, origin: &str) -> usize {
+    router
+        .log()
+        .iter()
+        .filter(|line| line.contains(origin) && line.contains("/enroll"))
+        .count()
+}
+
+/// The service's next `n` enrollments are answered `code`, signed with its key.
+fn enrollment_errors(service: &ScriptedSwitch, code: pubky_switch_core::http::ErrorCode, n: usize) {
+    for _ in 0..n {
+        service.fail_next(Fault::Error {
+            path: "/enroll".into(),
+            code,
+            current: serde_json::Value::Null,
+        });
+    }
+}
+
 #[tokio::test]
-async fn test_provider_loss_enrollment_refused_ends_the_flow() {
-    // An enrollment the service refuses for good isn't sent again: the recovery shows as
-    // refused there, and declaring it again there enrolls afresh (Switch wire 7.4.1).
+async fn test_provider_loss_enrollment_sent_again_after_an_unverified_refusal() {
+    // A `400` no key the signer holds verifies, as an intermediary could forge it, isn't the
+    // service's word: the same enrollment goes again, and the recovery completes (Switch
+    // wire 7.4.1).
     let world = World::new();
     let (mut signer, service, router) = lost_with_an_app(&world, notes()).await;
-    service.fail_next(Fault::Error {
-        path: "/enroll".into(),
-        code: pubky_switch_core::http::ErrorCode::BadRequest,
-        current: serde_json::Value::Null,
-    });
+    enrollment_errors(&service, pubky_switch_core::http::ErrorCode::BadRequest, 1);
+    let recovered = signer
+        .declare_provider_loss(NEW_ORIGIN, confirmed())
+        .await
+        .unwrap();
+    assert_eq!(service.identity_doc().unwrap().hash(), recovered.hash());
+    assert_eq!(enrollments_at(&router, NEW_ORIGIN), 2);
+}
+
+#[tokio::test]
+async fn test_provider_loss_enrollment_refused_ends_the_flow() {
+    // Unverified refusals past the bound end the flow: the failure is shown, nothing is sent
+    // again, and declaring again there enrolls afresh (Switch wire 7.4.1).
+    let world = World::new();
+    let (mut signer, service, router) = lost_with_an_app(&world, notes()).await;
+    enrollment_errors(&service, pubky_switch_core::http::ErrorCode::BadRequest, 3);
     signer
         .declare_provider_loss(NEW_ORIGIN, confirmed())
         .await
         .unwrap_err();
+    assert_eq!(enrollments_at(&router, NEW_ORIGIN), 3);
     assert_eq!(
         signer.status(),
         SignerStatus::RecoveryRefused {
@@ -2076,12 +2109,91 @@ async fn test_provider_loss_enrollment_refused_ends_the_flow() {
     let sent = router.log().len();
     signer.resume().await.unwrap();
     assert_eq!(router.log().len(), sent, "not sent again");
-    let recovered = signer
+    signer
         .declare_provider_loss(NEW_ORIGIN, confirmed())
         .await
         .unwrap();
     signs_again(&world, &mut signer, &service).await;
-    let _ = recovered;
+}
+
+#[tokio::test]
+async fn test_provider_loss_enrollment_refused_for_good_by_the_service() {
+    // A `400` the key of an earlier enrollment there verifies is the service's word: the
+    // flow ends at once (Switch wire 7.4.1).
+    let world = World::new();
+    let (mut signer, service, router) = lost_with_an_app(&world, notes()).await;
+    service.fail_next(Fault::Error {
+        path: "/identity".into(),
+        code: pubky_switch_core::http::ErrorCode::BadRequest,
+        current: serde_json::Value::Null,
+    });
+    signer
+        .declare_provider_loss(NEW_ORIGIN, confirmed())
+        .await
+        .unwrap_err();
+    let before = enrollments_at(&router, NEW_ORIGIN);
+    enrollment_errors(&service, pubky_switch_core::http::ErrorCode::BadRequest, 1);
+    signer
+        .declare_provider_loss(NEW_ORIGIN, confirmed())
+        .await
+        .unwrap_err();
+    assert_eq!(
+        enrollments_at(&router, NEW_ORIGIN),
+        before + 1,
+        "not sent again"
+    );
+    assert_eq!(
+        signer.status(),
+        SignerStatus::RecoveryRefused {
+            origin: NEW_ORIGIN.into()
+        }
+    );
+}
+
+#[tokio::test]
+async fn test_provider_loss_enrolls_anew_after_a_conflict() {
+    // A `409 conflict` asks for a new enrollment: the signer signs one with a new nonce,
+    // keeps it for its retries, and the recovery completes (Switch wire 3.7, 7.4.1).
+    let world = World::new();
+    let (mut signer, service, _) = lost_with_an_app(&world, notes()).await;
+    service.fail_next(Fault::Unreachable {
+        path: "/enroll".into(),
+        after: 0,
+    });
+    signer
+        .declare_provider_loss(NEW_ORIGIN, confirmed())
+        .await
+        .unwrap_err();
+    enrollment_errors(&service, pubky_switch_core::http::ErrorCode::Conflict, 1);
+    service.fail_next(Fault::Unreachable {
+        path: "/enroll".into(),
+        after: 0,
+    });
+    signer.resume().await.unwrap_err();
+    let kept = service.unreached_bodies();
+    assert_eq!(kept.len(), 2);
+    assert_ne!(kept[0], kept[1], "a new enrollment");
+    signer.resume().await.unwrap();
+    assert!(service.identity_doc().is_some());
+}
+
+#[tokio::test]
+async fn test_provider_loss_conflicts_past_the_bound_end_the_flow() {
+    // Conflicts past the bound end the flow, shown as refused (Switch wire 7.4.1).
+    let world = World::new();
+    let (mut signer, service, router) = lost_with_an_app(&world, notes()).await;
+    enrollment_errors(&service, pubky_switch_core::http::ErrorCode::Conflict, 3);
+    signer
+        .declare_provider_loss(NEW_ORIGIN, confirmed())
+        .await
+        .unwrap_err();
+    assert_eq!(enrollments_at(&router, NEW_ORIGIN), 3);
+    assert_eq!(
+        signer.status(),
+        SignerStatus::RecoveryRefused {
+            origin: NEW_ORIGIN.into()
+        }
+    );
 }
 
 #[tokio::test]
@@ -2206,4 +2318,49 @@ async fn test_provider_loss_declared_again_resends_the_version_in_flight() {
         .unwrap();
     assert_eq!(recovered.hash(), in_flight.hash());
     assert_eq!(enrollments(&router), enrolled);
+}
+
+#[tokio::test]
+async fn test_provider_loss_restored_then_declared_again_where_the_version_was_taken() {
+    // A new install restored mid-recovery is refused there; the first install's resend then
+    // gets the version taken. Declared again there, the restored install reads it under the
+    // key the backup's version names, takes it as the recovery delivered, and signs the
+    // version naming itself (Switch spec 12.6 step 1, wire 3.13).
+    let world = World::new();
+    let (mut original, service, router) = lost_with_an_app(&world, notes()).await;
+    service.fail_next(Fault::Unreachable {
+        path: "/identity".into(),
+        after: 0,
+    });
+    original
+        .declare_provider_loss(NEW_ORIGIN, confirmed())
+        .await
+        .unwrap_err();
+    let backed_up = world.backup().identity_doc().clone();
+    service.fail_next(Fault::Error {
+        path: "/identity".into(),
+        code: pubky_switch_core::http::ErrorCode::BadRequest,
+        current: serde_json::Value::Null,
+    });
+    let mut env = world.env_with(Arc::new(MemoryStore::new()), notes());
+    env.transport = router.clone();
+    let mut restored = Signer::restore_new(env, world.keyring(), confirmed())
+        .await
+        .unwrap();
+    assert_eq!(
+        restored.status(),
+        SignerStatus::RecoveryRefused {
+            origin: NEW_ORIGIN.into()
+        }
+    );
+    original.resume().await.unwrap();
+    assert_eq!(service.identity_doc().unwrap().hash(), backed_up.hash());
+    restored
+        .declare_provider_loss(NEW_ORIGIN, confirmed())
+        .await
+        .unwrap();
+    let held = service.identity_doc().unwrap();
+    assert_eq!(held.body().signer, restored.install_id());
+    assert_eq!(held.generation(), backed_up.generation());
+    assert_eq!(restored.status(), SignerStatus::Signing);
 }

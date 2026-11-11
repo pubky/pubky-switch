@@ -49,6 +49,10 @@ use crate::alert::{Alert, Source};
 use crate::error::{Refusal, Result, SignerError};
 use crate::state::{DeliverStep, Flow, Service, SignerState};
 
+/// How many times a recovery's enrollment is sent, or signed anew, before its failure is
+/// shown (Switch wire 7.4.1).
+const ENROLL_TRIES: u32 = 3;
+
 impl Signer {
     /// Declare the service the identity is enrolled at lost, and recover at the service at
     /// `origin`: the same operator's or another's (Switch spec 12.6 step 1). Shown and
@@ -402,31 +406,7 @@ impl Signer {
     /// Enroll at the service at `origin` with `signed`, then sign the version that recovers
     /// there and commit its delivery (the module's doc, steps 1 and 2).
     pub(super) async fn recover(&mut self, origin: &str, signed: &SignedDoc) -> Result<()> {
-        let identity = self.state.identity;
-        let enrollment = Enrollment::verify(signed, &identity, origin)?;
-        let target = Target {
-            origin,
-            pinned: None,
-            identity,
-        };
-        let answer = match RequestClient::new(&self.env, &target, &self.keyring)?
-            .enroll(&enrollment)
-            .await
-        {
-            Ok(answer) => answer,
-            // Refused for good (Switch wire 7.4.1): the same enrollment would be refused
-            // again, so the recovery waits to be declared again, which enrolls afresh.
-            Err(
-                error @ (ClientError::Switch {
-                    status: 400 | 409, ..
-                }
-                | ClientError::BadServiceSignature { status: 400 | 409 }),
-            ) => {
-                self.commit(self.state.clone(), None).await?;
-                return Err(error.into());
-            }
-            Err(error) => return Err(error.into()),
-        };
+        let answer = self.enroll_for_recovery(origin, signed).await?;
         let base = self.recovery_base()?;
         let lost = self.lost_generation(&base);
         let until = self.env.clock.now_ms().saturating_add(CLOCK_TOLERANCE_MS);
@@ -453,6 +433,86 @@ impl Signer {
             step: DeliverStep::Signed,
         };
         self.commit(state, Some(flow)).await
+    }
+
+    /// Enroll at the service at `origin` with `signed`, as the errors of `POST /enroll` ask
+    /// (Switch wire 7.4.1). They are the operator's, which no client can check, but where a
+    /// key an earlier declaration enrolled under is pinned and verifies them:
+    ///
+    /// - an unverified `400` isn't the service's word: the same enrollment is sent again, up
+    ///   to [`ENROLL_TRIES`] times in all, and only then is the failure shown;
+    /// - a `409 conflict` asks for a new enrollment: one with a new nonce is signed, kept in
+    ///   the flow and sent, up to [`ENROLL_TRIES`] times in all;
+    /// - a verified `400`, or either one past its bound, ends the flow: the recovery waits to
+    ///   be declared again ([`crate::SignerStatus::RecoveryRefused`]), which enrolls afresh.
+    ///
+    /// Any other failure keeps the flow, for the next run.
+    async fn enroll_for_recovery(
+        &mut self,
+        origin: &str,
+        signed: &SignedDoc,
+    ) -> Result<pubky_switch_core::records::EnrollmentAnswer> {
+        let identity = self.state.identity;
+        let pinned = self
+            .state
+            .recovery_services
+            .iter()
+            .rev()
+            .find(|service| service.origin == origin)
+            .map(|service| service.service_key);
+        let target = Target {
+            origin,
+            pinned,
+            identity,
+        };
+        let mut signed = signed.clone();
+        let (mut sent, mut anew) = (0, 0);
+        loop {
+            let enrollment = Enrollment::verify(&signed, &identity, origin)?;
+            let error = match RequestClient::new(&self.env, &target, &self.keyring)?
+                .enroll(&enrollment)
+                .await
+            {
+                Ok(answer) => return Ok(answer),
+                Err(error) => error,
+            };
+            match error {
+                ClientError::Switch { status: 409, .. }
+                | ClientError::BadServiceSignature { status: 409 }
+                    if anew + 1 < ENROLL_TRIES =>
+                {
+                    anew += 1;
+                    signed = self.enroll_anew(origin, &enrollment).await?;
+                }
+                ClientError::BadServiceSignature { status: 400 } if sent + 1 < ENROLL_TRIES => {
+                    sent += 1;
+                }
+                ClientError::Switch {
+                    status: 400 | 409, ..
+                }
+                | ClientError::BadServiceSignature { status: 400 | 409 } => {
+                    self.commit(self.state.clone(), None).await?;
+                    return Err(error.into());
+                }
+                error => return Err(error.into()),
+            }
+        }
+    }
+
+    /// A new enrollment for `enrollment`'s, with a new nonce, committed as the flow's, so a
+    /// retry after a crash sends its bytes (Switch wire 3.7 "enroll again").
+    async fn enroll_anew(&mut self, origin: &str, enrollment: &Enrollment) -> Result<SignedDoc> {
+        let mut body = enrollment.body().clone();
+        body.nonce = pubky_switch_core::enc::random_bytes()?;
+        let key = gate::recovery_key(&self.keyring, &self.state)?;
+        let anew = Enrollment::sign(&key, body)?;
+        drop(key);
+        let flow = Flow::Recover {
+            origin: origin.to_owned(),
+            enrollment: anew.signed().clone(),
+        };
+        self.commit(self.state.clone(), Some(flow)).await?;
+        Ok(anew.signed().clone())
     }
 
     /// Complete at the new service every revocation the recovery's version still lists the
