@@ -243,3 +243,45 @@ impl Service {
         sign_head(signer, mark.as_ref(), &head.identity_key, &head.chain_tip()).ok()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    /// Every Rust source of the service under `dir`, with its path.
+    fn sources(dir: &std::path::Path, out: &mut Vec<(std::path::PathBuf, String)>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                sources(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs")
+                && let Ok(text) = std::fs::read_to_string(&path)
+            {
+                out.push((path, text));
+            }
+        }
+    }
+
+    #[test]
+    fn test_keyed_signing_happens_only_here() {
+        // An answer or a head signed anywhere else in the service could be signed with a key
+        // its account no longer names (Switch wire 7.4.16): this module is the only place.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/service");
+        let mut found = Vec::new();
+        sources(&dir, &mut found);
+        assert!(found.len() > 10, "the service's sources");
+        for (path, text) in found {
+            if path.ends_with("keyed.rs") {
+                continue;
+            }
+            for needle in ["sign_response(", "sign_head(", "fn sign_answer("] {
+                assert!(
+                    !text.contains(needle),
+                    "{} signs outside keyed.rs: {needle}",
+                    path.display()
+                );
+            }
+        }
+    }
+}

@@ -2609,3 +2609,286 @@ async fn settle_the_chains_claim(replay: &Replay) -> Vec<u8> {
     );
     claim_key
 }
+
+/// `request` answered while the test holds alice's keying lock exclusive, as an erasure or a
+/// key change does before it commits: the request parks on the lock in its keyed section
+/// (seen in `pg_locks`, not granted), and `then` runs in the holder's transaction before it
+/// commits. The answer, once the lock is free.
+async fn parked_while<F>(
+    replay: &Replay,
+    request: pubky_switch::http::SwitchRequest,
+    then: F,
+) -> SwitchResponse
+where
+    F: for<'c> FnOnce(
+        &'c mut sqlx::PgConnection,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'c>>,
+{
+    let mut holder = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    sqlx::query("BEGIN")
+        .execute(&mut holder)
+        .await
+        .expect("begin");
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(pubky_switch::store::keying_lock_key(&alice_id()))
+        .execute(&mut holder)
+        .await
+        .expect("exclusive");
+    let (answer, ()) = tokio::join!(replay.service.handle(request), async {
+        let mut watcher = sqlx::PgConnection::connect_with(replay.db.options())
+            .await
+            .expect("conn");
+        // Parked: a shared advisory lock waited for, not granted.
+        let mut waited = 0;
+        loop {
+            let parked: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted \
+                 AND database = (SELECT oid FROM pg_database WHERE datname = current_database())",
+            )
+            .fetch_one(&mut watcher)
+            .await
+            .expect("locks");
+            if parked == 1 {
+                break;
+            }
+            waited += 1;
+            assert!(waited < 500, "the keyed section never parked on the lock");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        then(&mut holder).await;
+        sqlx::query("COMMIT")
+            .execute(&mut holder)
+            .await
+            .expect("commit");
+    });
+    answer
+}
+
+/// alice's signer's `GET /apps`.
+fn signer_apps() -> pubky_switch::http::SwitchRequest {
+    signer_request(
+        "GET",
+        &format!("/v1/{}/apps", alice_id()),
+        Vec::new(),
+        ms(&revoke_time()),
+    )
+}
+
+/// The holder's step of an erasure: the account's row deleted.
+fn erase_row(
+    conn: &mut sqlx::PgConnection,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+    Box::pin(async move {
+        sqlx::query("DELETE FROM accounts WHERE id = $1")
+            .bind(alice_id())
+            .execute(conn)
+            .await
+            .expect("erased");
+    })
+}
+
+/// The wallet's `GET path`.
+fn wallet_get(path: &str) -> pubky_switch::http::SwitchRequest {
+    app_request(
+        app(&vectors("keys.json"), "wallet"),
+        "GET",
+        &format!("/v1/{}/{path}", alice_id()),
+        Vec::new(),
+        ms(&revoke_time()),
+    )
+}
+
+/// `request`, parked on the keying lock while the account is erased: the operator's `404`,
+/// without a head, never signed with the erased key (7.4.16).
+async fn assert_parked_across_an_erasure(request: pubky_switch::http::SwitchRequest) {
+    let Some(replay) = replay().await else {
+        return;
+    };
+    replay_chain_through_revoke(&replay).await;
+    let request_signature = signature_of(&request);
+    let answer = parked_while(&replay, request, erase_row).await;
+    assert_eq!(
+        code_of(&answer),
+        (404, json!("not_found")),
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    assert!(no_head(&answer));
+    assert!(operator_signed(&answer, Some(&request_signature)));
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_erase_signer_parked_on_the_keying_lock_answers_as_after_the_erasure() {
+    // The erasure commits while a request that committed before it waits to sign: the
+    // request's key read, a statement of its own, sees the account gone, and its answer is
+    // the operator's, as for an account the service doesn't host (7.4.16, store/keying.rs).
+    assert_parked_across_an_erasure(signer_apps()).await;
+}
+
+#[tokio::test]
+async fn test_erase_signer_parked_on_the_keying_lock_across_a_key_change_isnt_signed() {
+    // The same, across a change of the account's key: the key the request loaded is no
+    // longer the account's, so the operator's `503` goes out instead.
+    let Some(replay) = replay().await else {
+        return;
+    };
+    replay_chain_through_revoke(&replay).await;
+    let request = signer_apps();
+    let request_signature = signature_of(&request);
+    let answer = parked_while(&replay, request, |conn| {
+        Box::pin(async move {
+            sqlx::query("UPDATE accounts SET service_key = $2 WHERE id = $1")
+                .bind(alice_id())
+                .bind("00000000000000000000000000000000")
+                .execute(conn)
+                .await
+                .expect("rekeyed");
+        })
+    })
+    .await;
+    assert_eq!(code_of(&answer), (503, json!("unavailable")));
+    assert!(no_head(&answer));
+    assert!(operator_signed(&answer, Some(&request_signature)));
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_erase_signer_parked_on_the_keying_lock_signs_once_it_is_free() {
+    // A holder that changes nothing: the parked request signs with the account's key once
+    // the lock is free, as at any time the account names it.
+    let Some(replay) = replay().await else {
+        return;
+    };
+    replay_chain_through_revoke(&replay).await;
+    let request = signer_apps();
+    let request_signature = signature_of(&request);
+    let answer = parked_while(&replay, request, |_| Box::pin(async {})).await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    assert!(alice_signed(&answer, Some(&request_signature)));
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_erase_pre_lock_refusal_parked_on_the_keying_lock_isnt_signed() {
+    // A refusal before the lock, a request signature that doesn't verify, is signed with the
+    // account's key only while the account names it (7.4.16).
+    assert_parked_across_an_erasure(tampered(wallet_get("feed?after=1:0"))).await;
+}
+
+#[tokio::test]
+async fn test_erase_refusal_under_the_lock_parked_on_the_keying_lock_isnt_signed() {
+    // A refusal under the lock, an app calling the signer's `GET /apps`, committed its
+    // stamp, then parked: as for an account the service doesn't host.
+    assert_parked_across_an_erasure(wallet_get("apps")).await;
+}
+
+#[tokio::test]
+async fn test_erase_records_page_parked_on_the_keying_lock_isnt_signed() {
+    // A `GET /records` page read after the lock, from its snapshot, then parked.
+    assert_parked_across_an_erasure(wallet_get(&format!(
+        "records?collection={}",
+        pubky_switch_core::enc::b64(&[1; 32])
+    )))
+    .await;
+}
+
+#[tokio::test]
+async fn test_erase_feed_page_parked_on_the_keying_lock_isnt_signed() {
+    // A feed page read after the lock, whose head is signed only inside its keyed section.
+    assert_parked_across_an_erasure(wallet_get("feed?after=1:0")).await;
+}
+
+#[tokio::test]
+async fn test_erase_enrollment_parked_on_the_keying_lock_isnt_signed() {
+    // An enrollment that created its account, then waited to sign with the account's new
+    // key while the account was erased: the operator's `503`, never signed with that key,
+    // and the signer enrolls again (7.4.16).
+    let Some(replay) = replay().await else {
+        return;
+    };
+    let http = vectors("http.json");
+    let enrolled = named(
+        &http["responses"],
+        "signer: enrollment answer, signed with the new account's key",
+    );
+    set_time(
+        &replay.clock,
+        enrolled["headers"]["switch-server-time"]
+            .as_str()
+            .expect("time"),
+    );
+    let enrollment = vector_request(named(&http["requests"], "signer: enrollment"));
+    let request_signature = signature_of(&enrollment);
+    let answer = parked_while(&replay, enrollment, erase_row).await;
+    assert_eq!(code_of(&answer), (503, json!("unavailable")));
+    assert!(operator_signed(&answer, Some(&request_signature)));
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_erase_waits_for_a_keyed_section_in_progress() {
+    // An erasure takes the keying lock exclusive before it signs its answer, the last its
+    // key signs: while a keyed section holds it shared, the erasure waits (seen in
+    // `pg_locks`), and goes on once the section ends (7.4.16, store/keying.rs).
+    let Some(replay) = replay().await else {
+        return;
+    };
+    replay_chain_through_revoke(&replay).await;
+    let mut section = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    sqlx::query("BEGIN")
+        .execute(&mut section)
+        .await
+        .expect("begin");
+    sqlx::query("SELECT pg_advisory_xact_lock_shared($1)")
+        .bind(pubky_switch::store::keying_lock_key(&alice_id()))
+        .execute(&mut section)
+        .await
+        .expect("shared");
+    let at = revoke_time();
+    let key = alice_service_key();
+    let (erased, ()) = tokio::join!(erase(&replay, &key, &at), async {
+        let mut watcher = sqlx::PgConnection::connect_with(replay.db.options())
+            .await
+            .expect("conn");
+        let mut waited = 0;
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted \
+                 AND database = (SELECT oid FROM pg_database WHERE datname = current_database())",
+            )
+            .fetch_one(&mut watcher)
+            .await
+            .expect("locks");
+            if waiting == 1 {
+                break;
+            }
+            waited += 1;
+            assert!(
+                waited < 500,
+                "the erasure never waited for the keyed section"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        sqlx::query("COMMIT")
+            .execute(&mut section)
+            .await
+            .expect("commit");
+    });
+    assert_eq!(
+        erased.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&erased.body)
+    );
+    replay.db.drop_database().await.expect("drop");
+}
