@@ -11,6 +11,7 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::extract::connect_info::MockConnectInfo;
 use axum::http::{Request as HttpRequest, header};
+use pubky_switch::changes::ChangeListener;
 use pubky_switch::http::source::ProxyConfig;
 use pubky_switch::keys::{FileKeyStore, FixedKeys};
 use pubky_switch::limits::Limits;
@@ -146,6 +147,9 @@ pub struct RealSwitch {
     time: Arc<TrustedTime>,
     clock: Arc<SharedClock>,
     transport: Arc<ServiceTransport>,
+    /// The task that forwards the database's change notifications to the service, which
+    /// wake its waiting feed reads (Switch wire 7.4.4), as the service's own `main` runs it.
+    listening: Option<tokio::task::JoinHandle<()>>,
     _key_dir: tempfile::TempDir,
 }
 
@@ -165,7 +169,7 @@ impl RealSwitch {
     ///
     /// # Errors
     ///
-    /// When the key store can't be made.
+    /// When the key store can't be made, or the change listener can't connect.
     pub async fn start(
         origin: &str,
         clock: Arc<TestClock>,
@@ -198,12 +202,17 @@ impl RealSwitch {
             time.clone(),
             limits,
         );
+        let listener = ChangeListener::connect(database.store())
+            .await
+            .map_err(|error| HarnessError::Setup(error.to_string()))?;
+        let listening = tokio::spawn(listener.run(service.changes(), std::future::pending()));
         let switch = Self {
             origin: origin.to_owned(),
             database: Some(database),
             time,
             clock,
             transport: Arc::new(ServiceTransport::new(origin, service)),
+            listening: Some(listening),
             _key_dir: key_dir,
         };
         switch.sample_time();
@@ -245,12 +254,29 @@ impl RealSwitch {
     ///
     /// When the server refuses.
     pub async fn close(mut self) -> Result<(), HarnessError> {
+        // The listener goes first: left running, it would try to connect to a database
+        // that is gone.
+        if let Some(listening) = self.listening.take() {
+            listening.abort();
+            // Its end, aborted or not, is all this waits for.
+            let _ = listening.await;
+        }
         match self.database.take() {
             Some(database) => database
                 .drop_database()
                 .await
                 .map_err(|error| HarnessError::Setup(error.to_string())),
             None => Ok(()),
+        }
+    }
+}
+
+impl Drop for RealSwitch {
+    fn drop(&mut self) {
+        // A switch dropped without `close`, as when its test panics: the listener stops
+        // with it.
+        if let Some(listening) = self.listening.take() {
+            listening.abort();
         }
     }
 }
