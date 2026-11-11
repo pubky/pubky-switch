@@ -317,3 +317,41 @@ impl World {
             .count()
     }
 }
+
+/// What the tests read of the entries stored locally, by the `seq` each was read at.
+impl App {
+    /// The entry stored locally that was read at `seq`.
+    pub(crate) fn stored_at(&self, seq: u64) -> Option<&crate::app::state::ParkedEntry> {
+        self.state.parked.values().find(|entry| entry.seq == seq)
+    }
+
+    /// The local ID of the entry stored locally that was read at `seq`.
+    pub(crate) fn stored_id_at(&self, seq: u64) -> Option<u64> {
+        self.state
+            .parked
+            .iter()
+            .find(|(_, entry)| entry.seq == seq)
+            .map(|(id, _)| *id)
+    }
+
+    /// The `seq`s the entries stored locally were read at, in local ID order.
+    pub(crate) fn stored_seqs(&self) -> Vec<u64> {
+        self.state.parked.values().map(|entry| entry.seq).collect()
+    }
+
+    /// The reads in a row the store kept the entry read at `seq` from finishing, whether it
+    /// is on the feed or stored locally.
+    pub(crate) fn retry_reads_at(&self, seq: u64) -> Option<u32> {
+        let stored = self
+            .stored_id_at(seq)
+            .and_then(|id| self.state.stored_retries.get(&id));
+        stored
+            .or_else(|| self.state.retries.get(&seq))
+            .map(|retry| retry.reads)
+    }
+
+    /// Whether no count of the store's retries is kept, for entries on the feed or stored.
+    pub(crate) fn no_retries(&self) -> bool {
+        self.state.retries.is_empty() && self.state.stored_retries.is_empty()
+    }
+}

@@ -57,6 +57,8 @@ mod renewal;
 mod restore;
 mod revocation;
 mod takeover;
+#[cfg(test)]
+mod vector_cases;
 
 pub use approval::{AppReview, ApprovedRequest};
 use clients::{RequestClient, SigningClient, Target};

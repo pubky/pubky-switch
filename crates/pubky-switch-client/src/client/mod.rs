@@ -15,7 +15,7 @@
 pub mod answers;
 mod batch;
 mod calls;
-mod read;
+pub(crate) mod read;
 
 pub use batch::{Batch, Submitted};
 

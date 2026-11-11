@@ -64,22 +64,25 @@ pub use chain::{HELD_MARKS, STUBS_KEPT_FOR_MS};
 pub use error::{Alarm, AppError, Refusal};
 pub use events::{
     AppEvent, BackupRefusal, ClaimAttempt, EVENT_ID_LEN, EventId, EventIdError, ParkReason,
+    RefusedCall,
 };
 pub use feed::ReceiveReport;
 pub use identity::{DOC_CACHE_MS, HomeserverReader, IdentityRefresh, REVALIDATION_MS};
 pub use peek::{PeekReport, Peeked};
 pub use protocol::{
-    Effect, LocalWrite, MAX_CLAIM_READS, MissedEntries, Need, OpaqueRule, Outcome,
-    PARKED_RETRIES_PER_READ, Protocol, ProtocolLayer, RETRY_EVENT_READS, ReceivedMessage,
-    ResendNeeded, ResendReason, StoreFailure, decode_local_state, encode_local_state,
+    Effect, LOCAL_WRITE_OVERHEAD_BYTES, LocalWrite, MAX_CLAIM_READS, MAX_LOSS_CONVERSATIONS,
+    MAX_REGRESSION_REASON_BYTES, MAX_SEEN_MARK_BYTES, MAX_STEP_LOCAL_BYTES, MissedEntries, Need,
+    OpaqueRule, Outcome, PARKED_RETRIES_PER_READ, Protocol, ProtocolLayer, RETRY_EVENT_READS,
+    ReceivedMessage, ResendNeeded, ResendReason, StoreFailure, decode_local_state,
+    encode_local_state, local_writes_bytes,
 };
 pub use provider::ProviderStatus;
 pub use push::{MAX_HANDLE_BYTES, MAX_HANDLES, PushHandles, PushRegistration, PushRelay};
 pub use recovery::{Evidence, LossActions, ProviderLoss, RESIDUAL_WINDOW_MS, RecoveryInfo};
 pub use state::{PROTOCOL_PREFIX, SCHEMA_VERSION};
 
-pub use admission::{INVITE_CODE_BYTES, InviteCode, SenderDisposition};
-pub use batch::{OpBatch, server_time_in};
+pub use admission::{INVITE_CODE_BYTES, InviteCode, LISTS_TOO_LARGE_RETRY_MS, SenderDisposition};
+pub use batch::{MAX_KEPT_BATCHES_BYTES, OpBatch, server_time_in};
 pub use claims::{
     ClaimDoubt, ClaimEntryRead, ClaimEvidence, ClaimOp, ClaimRead, ClaimWritten,
     ObligationDeadline, claim_conflict,
@@ -330,6 +333,9 @@ pub struct AppBackup {
     chain_batches: Vec<(String, u64)>,
     departed: Vec<(String, u64)>,
     bundle: BundleState,
+    /// The local ID the next entry stored locally takes (`parkid`), so a restore gives out
+    /// none the app gave out before the backup, whether or not the backup carries its entry.
+    stored_next: u64,
     /// The protocol's layer, if it added one; absent from the bytes otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     protocol: Option<LayerOut>,
@@ -339,7 +345,7 @@ pub struct AppBackup {
 /// reader that knows no layers, which takes only that version, refuses such a backup
 /// rather than restore it without the layer. A schema change gives both kinds of backup
 /// new versions.
-const LAYERED_BACKUP_VERSION: u32 = 3;
+const LAYERED_BACKUP_VERSION: u32 = 4;
 const _: () = assert!(LAYERED_BACKUP_VERSION != SCHEMA_VERSION);
 
 /// A [`ProtocolLayer`] as a backup's bytes carry it, with what the app's feed holds beyond
@@ -439,6 +445,16 @@ enum Restorable {
     TooLarge(AppError),
 }
 
+/// The error of building a restore's commit: [`Restorable::TooLarge`] for writes over the
+/// store's sizes ([`StoreError::TooLarge`]), which [`App::backup_layered`] reports as
+/// [`BackupRefusal::TooLarge`]; any other error is returned as it is, unlabelled.
+fn restore_build_error(error: AppError) -> Result<Restorable, AppError> {
+    match error {
+        AppError::Store(StoreError::TooLarge { .. }) => Ok(Restorable::TooLarge(error)),
+        error => Err(error),
+    }
+}
+
 /// The app's state in memory, as the store holds it.
 #[derive(Clone, Debug)]
 pub(crate) struct AppState {
@@ -460,6 +476,10 @@ pub(crate) struct AppState {
     pub(crate) chain: Option<ChainView>,
     pub(crate) held: BTreeMap<u64, HeldEntry>,
     pub(crate) retries: BTreeMap<u64, RetryEntry>,
+    /// The counts of the store's retries at entries stored locally, by local ID.
+    pub(crate) stored_retries: BTreeMap<u64, RetryEntry>,
+    /// The local ID the next entry stored locally takes (`parkid`): it only goes up.
+    pub(crate) next_stored_id: u64,
     /// Where the retries of stored entries stand in their round (`parkn`), so a bounded
     /// number each read reaches every one in turn.
     pub(crate) parked_round: state::ParkedRound,
@@ -537,6 +557,8 @@ struct Carried {
     lost_duties: u64,
     /// The owed calls left behind, their values unreadable.
     lost_owed: u64,
+    /// One past every local ID of an entry stored locally that a carried duty event names.
+    stored_past: u64,
 }
 
 fn missing() -> AppError {
@@ -653,6 +675,8 @@ impl App {
                 chain: None,
                 held: BTreeMap::new(),
                 retries: BTreeMap::new(),
+                stored_retries: BTreeMap::new(),
+                next_stored_id: FIRST_STORED_ID,
                 parked_round: state::ParkedRound::default(),
                 seen: BTreeSet::new(),
                 asked: BTreeSet::new(),
@@ -854,6 +878,8 @@ impl App {
             let app = pubky_switch_core::enc::app_id_decode(&rest).map_err(|_| corrupt())?;
             departed.insert(app, at);
         }
+        let parked: BTreeMap<u64, ParkedEntry> = reader.scan_numbered("parked/").await?;
+        let next_stored_id = next_stored_id(reader.get::<u64>(key::STORED_NEXT).await?, &parked);
         Ok(AppState {
             keys,
             cert,
@@ -872,10 +898,12 @@ impl App {
             chain: ChainView::load(reader).await?,
             held: reader.scan_numbered("held/").await?,
             retries: reader.scan_numbered("retry/").await?,
+            stored_retries: reader.scan_numbered("sretry/").await?,
+            next_stored_id,
             parked_round: reader.get(key::PARKED_NEXT).await?.unwrap_or_default(),
             seen: reader.scan_numbers("seen/").await?,
             asked: reader.scan_numbers("asked/").await?,
-            parked: reader.scan_numbered("parked/").await?,
+            parked,
             departed,
             join: reader.get(key::JOIN).await?.ok_or_else(missing)?,
             pending_effect: reader.get(key::PENDING_EFFECT).await?,
@@ -967,6 +995,7 @@ impl App {
                 .map(|(app, at)| (zbase32_encode(app), *at))
                 .collect(),
             bundle: state.bundle.clone(),
+            stored_next: state.next_stored_id,
             protocol: None,
         })
     }
@@ -1226,6 +1255,8 @@ impl App {
                 chain: Some(chain),
                 held: BTreeMap::new(),
                 retries: BTreeMap::new(),
+                stored_retries: BTreeMap::new(),
+                next_stored_id: next_stored_id(None, &parked),
                 parked_round: state::ParkedRound::default(),
                 seen,
                 asked: BTreeSet::new(),
@@ -1260,9 +1291,19 @@ impl App {
                 store: env.store.clone(),
             };
             let carried = Self::kept_for_protocol(&old).await?.unwrap_or_default();
+            // No local ID is given out twice: past the backup's counter, the counter of the
+            // store restored in place, every ID a carried duty event names, and every entry
+            // the backup brings back.
+            let old_next = Self::stored_next_of(&old).await?;
+            let next_stored_id = state
+                .next_stored_id
+                .max(backup.stored_next)
+                .max(old_next)
+                .max(carried.stored_past);
             let state = AppState {
                 duty_epoch: carried.epoch.unwrap_or(state.duty_epoch),
                 next_duty: carried.next_duty.max(FIRST_DUTY),
+                next_stored_id,
                 ..state
             };
             let client = Self::client_for(&env, &meta, &backup.keys, &cert)?;
@@ -1281,8 +1322,8 @@ impl App {
                 duty_handed: 0,
                 time_fresh_at: None,
             };
-            // Every write of the one commit; what fails here is a write the store can't
-            // take in one batch, over its sizes.
+            // Every write of the one commit; what fails here is mostly a write the store
+            // can't take in one batch, over its sizes.
             let mut tx = Tx::new(&app.ns);
             let built: Result<(), AppError> = async {
                 tx.delete_prefix("")?;
@@ -1310,10 +1351,10 @@ impl App {
                 Ok(())
             }
             .await;
-            Ok(match built {
-                Ok(()) => Restorable::Ready(Box::new(app), tx),
-                Err(error) => Restorable::TooLarge(error),
-            })
+            match built {
+                Ok(()) => Ok(Restorable::Ready(Box::new(app), tx)),
+                Err(error) => restore_build_error(error),
+            }
         })
         .await
     }
@@ -1367,9 +1408,10 @@ impl App {
         for seq in &s.seen {
             tx.put(&key::seen(*seq), &())?;
         }
-        for (seq, parked) in &s.parked {
-            tx.put(&key::parked(*seq), parked)?;
+        for (id, parked) in &s.parked {
+            tx.put(&key::parked(*id), parked)?;
         }
+        tx.put(key::STORED_NEXT, &s.next_stored_id)?;
         tx.put(key::JOIN, &s.join)?;
         if let Some(restore) = &s.restore {
             tx.put(key::RESTORE, restore)?;
@@ -1697,12 +1739,15 @@ impl App {
         let mut past_kept = FIRST_DUTY;
         for (rest, bytes) in reader.scan_raw(key::DUTY_PREFIX).await? {
             let read = state::parse_num(&rest).and_then(|n| {
-                state::decode::<events::Duty>(&bytes)?;
-                Ok((n, state::decode::<serde_json::Value>(&bytes)?))
+                let duty = state::decode::<events::Duty>(&bytes)?;
+                Ok((n, duty, state::decode::<serde_json::Value>(&bytes)?))
             });
             match read {
-                Ok((n, value)) => {
+                Ok((n, duty, value)) => {
                     past_kept = past_kept.max(n.checked_add(1).ok_or_else(corrupt)?);
+                    if let Some(id) = duty.stored_id() {
+                        carried.stored_past = carried.stored_past.max(id.saturating_add(1));
+                    }
                     carried
                         .values
                         .push((format!("{}{rest}", key::DUTY_PREFIX), value));
@@ -1728,6 +1773,26 @@ impl App {
             _ => carried.next_duty = past_kept,
         }
         Ok(Some(carried))
+    }
+
+    /// The local ID the store's next entry stored locally would take, for a restore in
+    /// place: its counter (`parkid`) and, past it, every `parked/` and `sretry/` key it
+    /// holds. A counter that doesn't read, from a store that was damaged or of another
+    /// schema, gives way to those keys rather than to the first ID.
+    async fn stored_next_of(reader: &Reader) -> Result<u64, AppError> {
+        let counter = match reader.get_raw(key::STORED_NEXT.as_bytes()).await? {
+            Some(bytes) => state::decode::<u64>(&bytes).ok(),
+            None => None,
+        };
+        let mut next = counter.unwrap_or(FIRST_STORED_ID);
+        for prefix in ["parked/", "sretry/"] {
+            for (rest, _) in reader.scan_raw(prefix).await? {
+                if let Ok(id) = state::parse_num(&rest) {
+                    next = next.max(id.saturating_add(1));
+                }
+            }
+        }
+        Ok(next)
     }
 
     /// The ID the next duty event takes: past the counter and every kept event.
@@ -2252,4 +2317,17 @@ impl App {
 /// The generation a batch's signed operations name; `None` for a cursor-only batch.
 pub(crate) fn batch_generation(batch: &Batch) -> Option<u64> {
     batch.ops().first().map(|op| op.body().generation)
+}
+
+/// The local ID the first entry stored locally takes.
+const FIRST_STORED_ID: u64 = 1;
+
+/// The local ID the next entry stored locally takes: the one kept, and in any case past
+/// every one taken, so none is used twice.
+fn next_stored_id(kept: Option<u64>, parked: &BTreeMap<u64, ParkedEntry>) -> u64 {
+    let past = parked
+        .keys()
+        .next_back()
+        .map_or(FIRST_STORED_ID, |id| id.saturating_add(1));
+    kept.unwrap_or(FIRST_STORED_ID).max(past)
 }

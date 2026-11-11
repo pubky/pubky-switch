@@ -38,7 +38,8 @@ use serde::{Deserialize, Serialize};
 
 use super::batch::OpBatch;
 use super::error::{Alarm, Refusal};
-use super::events::AppEvent;
+use super::events::{AppEvent, Duty};
+use super::protocol::{MAX_REGRESSION_REASON_BYTES, MAX_SEEN_MARK_BYTES};
 use super::state::{Tx, key};
 use super::{App, AppError, IdentityRefresh};
 use crate::client::answers::{ChainItem, SharedRecordView};
@@ -53,6 +54,15 @@ pub(crate) const LIST_DUE: &str = "list_due";
 
 /// The most records one listing page asks for (Switch wire 7.4.9).
 const LIST_PAGE: u32 = 1000;
+
+/// What taking one listed record writes, at most: its cached write (its operation, 512 KiB,
+/// and opened value, 256 KiB, in base64, with its proof: 1.2 MiB), its mark as stored
+/// ([`MAX_SEEN_MARK_BYTES`] in base64), a flagged write's rule, and its duty events.
+const LISTED_RECORD_ROOM_BYTES: u64 =
+    super::feed::CACHED_RECORD_BYTES + super::feed::KEPT_MARK_BYTES + (64 << 10);
+
+// One listed record always fits a commit of its own.
+const _: () = assert!(LISTED_RECORD_ROOM_BYTES < crate::store::MAX_BATCH_BYTES);
 
 /// How many times a write is built again after a conflict before the call gives up.
 const UPDATE_TRIES: usize = 4;
@@ -663,6 +673,14 @@ impl App {
                 let page = self.take(result).await?;
                 let mut tx = self.tx()?;
                 for view in &page.records {
+                    // A page holds up to 1,000 views, each cached with its mark: the views
+                    // taken so far are committed first once one more might not fit.
+                    if tx.size().saturating_add(LISTED_RECORD_ROOM_BYTES)
+                        > crate::store::MAX_BATCH_BYTES
+                    {
+                        let full = std::mem::replace(&mut tx, self.tx()?);
+                        self.commit(full).await?;
+                    }
                     self.take_view(view, Some((&view.key, collection)), &mut tx)
                         .await?;
                     listed = listed.saturating_add(1);
@@ -801,6 +819,7 @@ impl App {
         reason: String,
         tx: &mut Tx,
     ) -> Result<(), AppError> {
+        let reason = cut_reason(reason);
         let flagged = FlaggedWrite {
             key: *key,
             version,
@@ -1190,6 +1209,25 @@ impl App {
             new_value,
         );
         match marked {
+            // A mark over its bound isn't kept, and nothing of it is silent: another app's
+            // write leaves the mark held, so what was seen before is still checked; an own
+            // write's never leaves a mark that doesn't describe it. Either way the protocol
+            // is told, in this change's commit, that the record can't be checked from here.
+            Some(mark) if mark.len() > MAX_SEEN_MARK_BYTES => {
+                if own {
+                    tx.delete(&seen_key(&key))?;
+                }
+                self.keep_duty(
+                    tx,
+                    Duty::RecordUncheckable {
+                        key,
+                        writer: accepted.writer,
+                        generation: accepted.version.version.generation,
+                        version: accepted.version.version.version,
+                        mark_bytes: u64::try_from(mark.len()).unwrap_or(u64::MAX),
+                    },
+                )?;
+            }
             Some(mark) => tx.put(&seen_key(&key), &SeenMark { mark })?,
             None if own => tx.delete(&seen_key(&key))?,
             None => {}
@@ -1277,9 +1315,11 @@ impl App {
     /// # Errors
     ///
     /// [`Refusal::Stopped`] or [`Refusal::Left`] for a stopped or departed app;
-    /// [`Refusal::Usage`] when the certificate holds none of the write scopes;
-    /// [`Refusal::NotNow`] while the app lacks the read scope's key at the current data
-    /// epoch (it fetches its key bundle first); a store failure.
+    /// [`Refusal::Usage`] when the certificate holds none of the write scopes, or when the
+    /// protocol's mark of the value ([`super::Protocol::record_seen`]) is over
+    /// [`super::MAX_SEEN_MARK_BYTES`]; [`Refusal::NotNow`] while the app lacks the read
+    /// scope's key at the current data epoch (it fetches its key bundle first); a store
+    /// failure.
     pub async fn record_op(
         &mut self,
         target: &RecordTarget,
@@ -1293,6 +1333,7 @@ impl App {
             if self.state.scope_keys.get(epoch, read_scope).is_none() {
                 self.ensure_scope_keys().await?;
             }
+            refuse_unmarkable(self.protocol.as_ref(), target, value)?;
             let key = self.record_key(target)?;
             let held = self.held_record(&key).await?;
             let put = record_put(&self.state, target, value, held.as_ref())?;
@@ -1437,6 +1478,24 @@ impl App {
     }
 }
 
+/// Refuse an own write whose mark ([`super::Protocol::record_seen`] after `value`, from
+/// nothing, as for every own write) would be over [`MAX_SEEN_MARK_BYTES`]: the app couldn't
+/// keep it, and the record couldn't be checked from that write on.
+pub(crate) fn refuse_unmarkable(
+    protocol: &dyn super::Protocol,
+    target: &RecordTarget,
+    value: Option<&[u8]>,
+) -> Result<(), AppError> {
+    match protocol.record_seen(&target.collection.name, None, value) {
+        Some(mark) if mark.len() > MAX_SEEN_MARK_BYTES => Err(Refusal::Usage(format!(
+            "the protocol's mark of this write takes {} bytes, over {MAX_SEEN_MARK_BYTES}",
+            mark.len()
+        ))
+        .into()),
+        _ => Ok(()),
+    }
+}
+
 /// The `record.put` of `value` at `target` (`None` a delete), built on `held`, the write the
 /// app holds there: on its version, or a create (`{0, 0}` with `id_inputs`) for a record it
 /// holds nothing of or holds deleted, sealed under the read scope's key at the current data
@@ -1568,6 +1627,18 @@ fn check_shape(
 
 fn store_corrupt() -> AppError {
     AppError::Store(crate::error::StoreError::Corrupt)
+}
+
+/// A protocol's rule, cut to [`MAX_REGRESSION_REASON_BYTES`] at a character boundary.
+fn cut_reason(mut reason: String) -> String {
+    if reason.len() > MAX_REGRESSION_REASON_BYTES {
+        let mut end = MAX_REGRESSION_REASON_BYTES;
+        while !reason.is_char_boundary(end) {
+            end = end.saturating_sub(1);
+        }
+        reason.truncate(end);
+    }
+    reason
 }
 
 #[cfg(test)]

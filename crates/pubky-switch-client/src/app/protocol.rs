@@ -56,7 +56,10 @@ pub struct OpaqueRule {
 /// protocol for check 10 ([`Protocol::check_body`]) and its effect ([`Protocol::receive`]).
 #[derive(Clone, Debug)]
 pub struct ReceivedMessage {
-    /// The entry's `seq` in the current generation.
+    /// The `seq` the entry was read at: in the current generation for an entry of the
+    /// feed, and for one stored locally (`parked`) in the generation it was read at, which
+    /// a provider change since may have left behind. A stored entry's handle is its local
+    /// ID ([`super::AppEvent::Parked`]), not this `seq`.
     pub seq: u64,
     /// The sender identity.
     pub sender: [u8; 32],
@@ -77,6 +80,67 @@ pub struct ReceivedMessage {
     /// After a `409 conflict` on the effect's batch: the answer's `current`, so the
     /// protocol builds its effect again on what the service holds now.
     pub conflict: Option<Value>,
+}
+
+/// The most bytes of local writes a protocol or host hands over at once: one receive step,
+/// one [`Protocol::resend_needed`] or [`Protocol::missed`] answer, or one
+/// [`super::OpBatch`]'s local writes ([`Protocol`], "Limits a receive step plans for").
+/// 4 MiB, counted by [`local_writes_bytes`].
+///
+/// It is chosen so that whatever the app keeps or commits with such writes fits the store
+/// ([`crate::store::MAX_VALUE_BYTES`] 16 MiB per value, [`crate::store::MAX_BATCH_BYTES`]
+/// 32 MiB per commit):
+///
+/// - **Kept, in base64:** each write is kept as `{"Put":{"key":"…","value":"…"}},`, its
+///   key and value in base64url, at most `4/3 (k + v) + 40` bytes, which is under
+///   `4/3 (k + v + 64)` since 4/3 x 64 > 40. So writes at the bound keep in at most
+///   4/3 x 4 MiB = 5.34 MiB.
+/// - **A kept effect** (`pending/effect`) adds its batch, at most the 4 MiB `POST /ops`
+///   body (Switch wire 7.1), 5.34 MiB in base64, and its entry: the plaintext (at most the
+///   64 KiB envelope, 87 KiB in base64), the certificate (under 33 KiB) and a context (1
+///   KiB), with under 8 KiB of other fields: under 10.9 MiB, below the 16 MiB value size.
+///   A kept batch (`opq/`) carries the same body and writes, and the messages it queues.
+/// - **Committed:** each write takes its key and value, the namespace (at most 33 bytes)
+///   and the `p/` prefix, under `k + v + 64`: at most 4 MiB. An applied effect's outcome
+///   adds at most 7 cached record writes (each under 1.2 MiB with its proof and opened
+///   value), under 13 MiB in all, below the 32 MiB batch size.
+pub const MAX_STEP_LOCAL_BYTES: usize = 4 * 1024 * 1024;
+
+/// The most bytes a [`Protocol::record_seen`] mark takes: 64 KiB, 85.6 KiB as stored in
+/// base64 with its key. The commits that keep marks stay within the 32 MiB batch size: a
+/// feed item or a listed record caches at most one record write with its mark (1.2 MiB
+/// and 85.6 KiB, within a read's 12 MiB room for one item); an applied effect's outcome at
+/// most 7, with its 4 MiB of local writes and what its entry writes (256 KiB): 4 MiB + 7 x
+/// (1.2 MiB + 85.6 KiB) + 256 KiB = 13.2 MiB; and a batch's answer at most 8, with what the
+/// batch kept (under 12 MiB) and 1 MiB more: 12 MiB + 8 x (1.2 MiB + 85.6 KiB) + 1 MiB =
+/// 23.3 MiB. The `const` assertions of `feed.rs`, `records.rs` and `batch.rs` check each.
+pub const MAX_SEEN_MARK_BYTES: usize = 64 * 1024;
+
+/// The most bytes a [`Protocol::record_regression`] rule takes: 256. A longer one is cut
+/// there.
+pub const MAX_REGRESSION_REASON_BYTES: usize = 256;
+
+/// The most counterparties a [`LossActions::conversations`](super::LossActions) list takes:
+/// 100,000, the `max_conversations` a service keeps at its default limits (Switch wire
+/// 9.2). The app adds back the first this many, in key order, and no more.
+pub const MAX_LOSS_CONVERSATIONS: usize = 100_000;
+
+/// What each write counts against [`MAX_STEP_LOCAL_BYTES`] beside its key and value: the
+/// room its stored and kept forms take around them.
+pub const LOCAL_WRITE_OVERHEAD_BYTES: usize = 64;
+
+/// The bytes `writes` count against [`MAX_STEP_LOCAL_BYTES`]: for each write, the raw
+/// length of its key (a prefix for [`LocalWrite::DeletePrefix`]) and of its value, plus
+/// [`LOCAL_WRITE_OVERHEAD_BYTES`].
+pub fn local_writes_bytes(writes: &[LocalWrite]) -> usize {
+    writes.iter().fold(0usize, |total, write| {
+        let bytes = match write {
+            LocalWrite::Put { key, value } => key.len().saturating_add(value.len()),
+            LocalWrite::Delete { key } => key.len(),
+            LocalWrite::DeletePrefix { prefix } => prefix.len(),
+        };
+        total.saturating_add(bytes.saturating_add(LOCAL_WRITE_OVERHEAD_BYTES))
+    })
 }
 
 /// A write of the protocol's own local state, under keys the app prefixes so they never
@@ -409,6 +473,25 @@ pub struct MissedEntries {
 /// beside them could land without the outcome it belongs to, or after a crash that
 /// discards it.
 ///
+/// # Limits a receive step plans for
+///
+/// - **Operations:** at most 7 beside the cursor move (Switch wire 6.4).
+/// - **Local writes:** at most [`MAX_STEP_LOCAL_BYTES`], 4 MiB, counted as
+///   [`local_writes_bytes`] counts them, for each set of local writes handed over at once.
+///   The bound keeps every set within what the app's store keeps and commits, whatever
+///   else the read holds; a protocol keeps larger state in its own store. Over it:
+///   - **a receive step**, its [`ReceiveContext::local`] writes and its [`Effect`]'s
+///     together: a write that would take [`ReceiveContext::local`] past it is refused
+///     there, and an effect over it is stored and passed as
+///     [`super::ParkReason::EffectTooLarge`], with [`super::AppEvent::EffectRefused`],
+///     never applied (Switch spec 8.2);
+///   - **[`Protocol::resend_needed`] and [`Protocol::missed`]**, made at once or again
+///     later: the writes aren't committed and the call isn't made again, since the same
+///     answer would come; the item is passed, and the protocol told with
+///     [`super::AppEvent::LocalWritesRefused`], a duty event;
+///   - **an [`super::OpBatch`]'s local writes**: [`super::App::submit_batch`] refuses the
+///     batch before it signs or keeps it ([`super::Refusal::Usage`]).
+///
 /// # Duty events
 ///
 /// What the app must tell its protocol outside a callback comes as a duty event
@@ -512,9 +595,12 @@ pub trait Protocol: Send + Sync {
     /// A provider loss the app follows (Switch spec 12.6 steps 2 and 4): the protocol queues
     /// its re-send requests to the counterparties of its unfinished activity, for what their
     /// inboxes accepted from [`ProviderLoss::accepted_from_ms`] on, and names the
-    /// counterparties whose conversation entries the app adds back. The app commits the
-    /// local writes once, with that step; a crash before that commit calls it again.
-    /// Nothing by default.
+    /// counterparties whose conversation entries the app adds back, at most
+    /// [`MAX_LOSS_CONVERSATIONS`]: how many past it were left out is kept with the loss
+    /// ([`super::RecoveryInfo::conversations_left_out`]). The app commits the local writes
+    /// once, with that step; a crash before that commit calls it again. Writes over
+    /// [`MAX_STEP_LOCAL_BYTES`] aren't committed and the loss goes on, with
+    /// [`super::AppEvent::LocalWritesRefused`]. Nothing by default.
     ///
     /// # Errors
     ///
@@ -589,6 +675,23 @@ pub trait Protocol: Send + Sync {
     /// What the app has seen of a record, its high water (Switch spec 8.2): the protocol's
     /// mark after `value`, from the mark held (`None` for a write of the app's own, built on
     /// what it trusts), or `None` to keep no mark. None by default.
+    ///
+    /// A mark is at most [`MAX_SEEN_MARK_BYTES`], 64 KiB. Past it, nothing is silent:
+    ///
+    /// - **The app's own write**, built through [`super::App::put_record`],
+    ///   [`super::App::record_op`] or [`super::ReceiveContext::put_record`]: the write is
+    ///   refused there, before anything is signed ([`super::Refusal::Usage`]), since the
+    ///   protocol's own value gives a mark it can't keep.
+    /// - **An own write whose mark is over it only once taken**, such as a kept batch
+    ///   answered after the protocol's marks grew: the mark held goes, as for `None`, so it
+    ///   never stands for the own write, and the protocol is told the record can't be
+    ///   checked from that write on ([`super::AppEvent::RecordUncheckable`], a duty event).
+    /// - **Another app's write:** the record keeps the mark it held, so what was seen before
+    ///   is still checked against later writes, and the protocol is told the same way.
+    ///
+    /// It is called once more for every own write, when the write is built, to refuse one
+    /// whose mark won't fit, and again when the write is taken: it has no side effects, and
+    /// gives the same mark for the same arguments.
     fn record_seen(
         &self,
         collection: &str,
@@ -603,6 +706,9 @@ pub trait Protocol: Send + Sync {
     /// spec 8.2), such as dropping or replacing a message of a role it saw: the rule it
     /// breaks, without content, and the write is flagged and not acted on. `value` is
     /// `None` for a delete or an unreadable value. Never by default.
+    ///
+    /// The rule is at most [`MAX_REGRESSION_REASON_BYTES`], 256 bytes; a longer one is cut
+    /// there, at a character boundary.
     fn record_regression(
         &self,
         collection: &str,
