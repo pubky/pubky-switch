@@ -234,6 +234,7 @@ async fn load_state(
     held: Option<&IdentityDoc>,
     ops: &[SignedOp],
     writer: Option<&[u8; 16]>,
+    cursor: bool,
     due: Option<(u64, u64)>,
     now: u64,
 ) -> Result<OpsState, StoreError> {
@@ -253,7 +254,13 @@ async fn load_state(
         .into_iter()
         .collect();
     (state.directory_version, state.apps_version) = txn.directory_versions().await?;
-    for target in &needs.targets {
+    // A cursor move may drop the moving app's passed key bundle parts (Switch wire 6.2), so
+    // its parts are read too.
+    let mut targets = needs.targets.clone();
+    if let (true, Some(app)) = (cursor, writer) {
+        targets.insert(*app);
+    }
+    for target in &targets {
         if let Some(epoch) = txn.listed_epoch(target).await? {
             state.listed_epochs.insert(*target, epoch);
         }
@@ -683,6 +690,7 @@ impl Service {
             held,
             &ops,
             caller_app.as_ref(),
+            parsed.cursor().is_some(),
             due.map(|base| (base, self.limits.max_claim_age_ms)),
             time_ms,
         )

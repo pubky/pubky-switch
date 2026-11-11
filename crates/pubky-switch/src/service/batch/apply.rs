@@ -87,6 +87,44 @@ pub fn apply(state: &mut OpsState, batch: &Batch<'_>) -> Result<Vec<Applied>, Re
     Ok(applied)
 }
 
+/// Drop `target`'s key bundle parts its cursor has passed and its `keys_through` covers, the
+/// app holding their keys, unless `full`, a full bundle requested (Switch wire 6.2): at a
+/// `key_bundle.put` and at a `cursor.set`. A part passed before the gap below it was filled
+/// isn't covered yet, and goes at a later move once it is.
+fn drop_passed_parts(state: &mut OpsState, target: &[u8; 16], full: bool) {
+    let Some(parts) = state.parts.get(target) else {
+        return;
+    };
+    let spans: Vec<StoredPart> = parts
+        .iter()
+        .map(|part| StoredPart {
+            first_epoch: part.put.first_epoch,
+            last_epoch: part.put.last_epoch,
+            seq: part.seq,
+        })
+        .collect();
+    let generation = state.generation;
+    let cursor = state
+        .apps
+        .get(target)
+        .and_then(|app| app.cursor)
+        .filter(|cursor| cursor.generation == generation)
+        .map_or(0, |cursor| cursor.seq);
+    let through = keys_through(state.listed_epochs.get(target).copied(), &spans, cursor);
+    let gone = parts_to_drop(&spans, cursor, through, full);
+    if gone.is_empty() {
+        return;
+    }
+    if let Some(parts) = state.parts.get_mut(target) {
+        let mut index = 0;
+        parts.retain(|_| {
+            let keep = !gone.contains(&index);
+            index += 1;
+            keep
+        });
+    }
+}
+
 /// `cursor.set` (Switch wire 6.2): the current generation, and a `seq` given out already.
 fn set_cursor(
     state: &mut OpsState,
@@ -108,6 +146,13 @@ fn set_cursor(
     if check_cursor(position, state.generation, None, state.newest_seq, held)? == CursorMove::Moves
     {
         *cursor = Some(position);
+        // The parts it now holds the keys of go (Switch wire 6.2).
+        let app = cert.app_id();
+        let full = state
+            .apps
+            .get(&app)
+            .is_some_and(|held| held.full_requested.is_some());
+        drop_passed_parts(state, &app, full);
     }
     Ok(())
 }
@@ -410,12 +455,10 @@ fn key_bundle_put(
                     seq: part.seq,
                 })
                 .collect();
-            // Unless a full bundle is requested, the parts the target's cursor has passed and
-            // that its `keys_through` covers go: it holds their keys (Switch wire 6.2). The
-            // request is judged pending as it was before this part, so a request this part
-            // completes still keeps them at this put: the app asked for them and hasn't read
-            // the parts that complete it. The part just stored is past every cursor, so it
-            // stays.
+            // The request is judged pending as it was before this part, so a request this
+            // part completes still keeps the passed parts at this put: the app asked for them
+            // and hasn't read the parts that complete it. The part just stored is past every
+            // cursor, so it stays.
             let full = state
                 .apps
                 .get(&target)
@@ -425,23 +468,7 @@ fn key_bundle_put(
             {
                 app.full_requested = None;
             }
-            let generation = state.generation;
-            let cursor = state
-                .apps
-                .get(&target)
-                .and_then(|app| app.cursor)
-                .filter(|cursor| cursor.generation == generation)
-                .map_or(0, |cursor| cursor.seq);
-            let through = keys_through(state.listed_epochs.get(&target).copied(), &spans, cursor);
-            let gone = parts_to_drop(&spans, cursor, through, full);
-            if let Some(parts) = state.parts.get_mut(&target) {
-                let mut index = 0;
-                parts.retain(|_| {
-                    let keep = !gone.contains(&index);
-                    index += 1;
-                    keep
-                });
-            }
+            drop_passed_parts(state, &target, full);
             seq
         }
     };
