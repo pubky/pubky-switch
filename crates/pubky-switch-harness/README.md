@@ -1,0 +1,39 @@
+# pubky-switch-harness
+
+Tests only. Runs flows of the real signer and the real app against the Switch service of
+this workspace, in process on PostgreSQL, and against the client's scripted switch, and
+compares what the two answered. Nothing depends on this crate, and it isn't among the
+workspace's default members: `cargo test --workspace` takes it in.
+
+```sh
+export PUBKY_SWITCH_TEST_DATABASE_URL=postgres://switch:switch@127.0.0.1:5432/postgres
+cargo test -p pubky-switch-harness
+cargo run -p pubky-switch-harness --example trace -- join          # a flow's calls, both runs
+cargo run -p pubky-switch-harness --example trace -- join facts    # every fact kept
+```
+
+Without the variable the service's half is skipped; with `PUBKY_SWITCH_REQUIRE_DB` set it
+fails instead.
+
+- `src/flows/`: the flows, each written once. `flows::FLOWS` names them, and
+  `flows::flow_of` says which flow sends each call the service routes.
+- `src/allowed.rs`: where the scripted switch answers an honest flow differently from the
+  service, and why. A flow's test fails on a difference the list doesn't hold, and on an
+  entry that no longer shows.
+- `src/check.rs`: what the harness verifies itself in both runs (answer signatures, heads,
+  chain stubs, feed items, transition proofs), and what it leaves to the client and the
+  signer.
+
+## Adding a flow
+
+Write it in `src/flows/` against `World`, using only the real `Signer` and `App`; note what
+they return and raise with `World::outcome`; add it to `FLOWS` and its calls to `flow_of`.
+Run the `trace` example to see what the two switches answered, and list each difference in
+`allowed.rs` with its wire clause, one step and one member per entry.
+
+## Run time and databases
+
+Each flow's run against the service makes one test database and drops it, also when its
+test panics; the flows run one after another. Ten flows take about 20 seconds in a debug
+build. If that grows too long, the service's halves could share one service and one
+database, with identities of their own per flow: a later option, not needed yet.
