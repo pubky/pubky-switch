@@ -2184,3 +2184,67 @@ async fn test_restore_in_place_refused_for_what_it_carries_says_so_and_writes_no
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn test_restore_of_a_backup_whose_app_record_carries_another_cert_writes_nothing() {
+    let w = World::new();
+    let store = Arc::new(MemoryStore::new());
+    let protocol = CertCheckProtocol::new(Some(JOURNAL), None);
+    let mut app = cert_checked(&w, &protocol, &store).await;
+    let backup = layered(&mut app).await;
+    let cert = app.cert().clone();
+    // The app record swapped for one carrying another certificate of the same app and keys,
+    // with a scope the backup's doesn't hold, signed by the app's own key.
+    let keys = app_keys("wallet");
+    let other = crate::testing::issue_cert(
+        &w.alice,
+        &keys,
+        &crate::testing::AppSpec::new(&["scope-a", "scope-b"]),
+        w.clock.now_ms(),
+    )
+    .unwrap();
+    assert_ne!(other.hash(), cert.hash());
+    let record = pubky_switch_core::records::AppRecord::sign(
+        &keys,
+        pubky_switch_core::records::AppRecordBody::new(&other, vec![], w.clock.now_ms()),
+    )
+    .unwrap();
+    let mut value: serde_json::Value = serde_json::from_slice(&backup.to_bytes().unwrap()).unwrap();
+    value["record"] = serde_json::to_value(record.signed()).unwrap();
+    let swapped = AppBackup::from_bytes(&serde_json::to_vec(&value).unwrap()).unwrap();
+    // Refused in place and onto an empty store, before any commit and before the protocol
+    // is asked, which would have taken the backup's certificate.
+    let empty = Arc::new(MemoryStore::new());
+    for target in [&store, &empty] {
+        let before = snapshot(target, &cert.app_id());
+        let fault = Arc::new(FaultStore::new(
+            Arc::clone(target) as Arc<dyn StateStore>,
+            StoreFault::None,
+        ));
+        let checking = CertCheckProtocol::new(Some(JOURNAL), Some("scope-a"));
+        let error = restore_on(
+            &w,
+            checking.clone(),
+            fault.clone() as Arc<dyn StateStore>,
+            &swapped,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&error, AppError::InvalidData(why) if why.contains("another certificate")),
+            "{error:?}"
+        );
+        assert_eq!(fault.commits(), 0);
+        assert_eq!(snapshot(target, &cert.app_id()), before);
+        assert!(checking.given().is_empty());
+    }
+    // The backup as taken restores.
+    restore_on(
+        &w,
+        protocol.clone(),
+        Arc::new(MemoryStore::new()) as Arc<dyn StateStore>,
+        &backup,
+    )
+    .await
+    .unwrap();
+}

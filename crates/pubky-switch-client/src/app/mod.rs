@@ -1161,6 +1161,15 @@ impl App {
             if cert.app_id() != meta.app_id || cert.signing_key() != backup.keys.signing_public() {
                 return Err(invalid("its certificate isn't its keys'"));
             }
+            // The app record the restore installs carries that very certificate, so what the
+            // protocol checks below is all that is installed: the app writes the two
+            // together, at a join and when it takes a certificate, so they never differ in a
+            // backup it took.
+            let record = AppRecord::verify(&backup.record, &meta.identity)
+                .map_err(|_| invalid("its app record doesn't verify"))?;
+            if record.cert().hash() != cert.hash() {
+                return Err(invalid("its app record carries another certificate"));
+            }
             let own_doc = IdentityDoc::verify(&backup.own_doc, &meta.identity)
                 .map_err(|_| invalid("its identity.json doesn't verify"))?;
             let mut at = BTreeMap::new();

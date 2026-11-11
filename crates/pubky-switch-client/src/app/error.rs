@@ -106,8 +106,10 @@ pub enum Refusal {
     /// still owes its protocol than one commit takes beside the backup, which fits on its
     /// own: the duty events not acknowledged and the protocol calls owed, counted here.
     /// Nothing was written. The host acknowledges the duty events it has acted on
-    /// ([`super::App::ack_events`]), lets the protocol answer the owed calls, or restores
-    /// onto an empty store, then restores again.
+    /// ([`super::App::ack_events`]) through the app loaded on that store, lets the protocol
+    /// answer the owed calls, or restores onto an empty store, then restores again. If the
+    /// store can't be loaded, the host clears the app's namespace itself and restores onto
+    /// the empty store: no API of the app does that for it.
     CarriedTooLarge {
         /// The duty events the restore would carry.
         duty_events: u64,
