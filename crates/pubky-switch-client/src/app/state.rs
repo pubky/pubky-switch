@@ -115,6 +115,8 @@ pub(crate) mod key {
     pub(crate) const PARKED_NEXT: &str = "parkn";
     /// The local ID the next entry stored locally takes.
     pub(crate) const STORED_NEXT: &str = "parkid";
+    /// Where telling the protocol again of the entries a restore brought back stands.
+    pub(crate) const RETELL: &str = "retell";
     /// The prefix of the protocol calls owed.
     pub(crate) const OWED_PREFIX: &str = "owed/";
 

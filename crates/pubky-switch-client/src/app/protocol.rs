@@ -77,6 +77,18 @@ pub struct ReceivedMessage {
     pub context: Option<Value>,
     /// Whether the entry was stored locally before and the cursor is past it already.
     pub parked: bool,
+    /// Whether the host released the entry ([`super::App::release_parked`]) after its
+    /// effect was uncertain ([`super::AppEvent::EffectUncertain`]): the app no longer counts
+    /// it processed, and builds its effect again. The host releases it only once it knows
+    /// the effect wasn't applied; a protocol that may have compensated from its own state
+    /// since, or can't tell, declines with [`Outcome::Drop`], which keeps the message
+    /// processed.
+    ///
+    /// The service refuses an effect run again this way where an operation depends on what
+    /// its first application changed, such as a record write's expected version or a
+    /// claim's step, and it checks conditions for the whole batch (Switch spec 8.2, 10.1);
+    /// otherwise its operations, and its local writes, may apply twice.
+    pub released: bool,
     /// After a `409 conflict` on the effect's batch: the answer's `current`, so the
     /// protocol builds its effect again on what the service holds now.
     pub conflict: Option<Value>,
@@ -752,11 +764,16 @@ pub trait Protocol: Send + Sync {
     /// writes it ([`decode_local_state`]) and puts every key back, and needs no writes for a
     /// backup without a layer.
     ///
-    /// `restoring` gives the identity, the App ID and `blind` under the naming key of the
-    /// backup, the ones the restored app goes on with ([`RestoreContext`]), so the protocol
-    /// can check its layer against them here, such as that each claim key it keeps is the
-    /// one its inputs blind to, rather than after the restore commits. The default ignores
-    /// it.
+    /// It runs at every restore and at every [`super::App::backup_layered`], so it has no
+    /// side effects: it returns the writes, and the app commits them or doesn't.
+    ///
+    /// `restoring` gives the identity, the App ID, the certificate and `blind` under the
+    /// naming key of the backup, the ones the restored app goes on with
+    /// ([`RestoreContext`]), so the protocol can check its layer and the backup against
+    /// them here, rather than after the restore commits: such as that each claim key it
+    /// keeps is the one its inputs blind to, or that the certificate holds the scopes and
+    /// permissions the protocol requires. In [`super::App::backup_layered`]'s check it gives
+    /// the app's current ones, which the backup carries. The default ignores it.
     ///
     /// # Errors
     ///

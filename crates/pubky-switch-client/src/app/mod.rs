@@ -40,6 +40,7 @@ mod events;
 mod feed;
 mod identity;
 mod keys;
+mod parked;
 mod peek;
 mod protocol;
 mod provider;
@@ -69,6 +70,7 @@ pub use events::{
 };
 pub use feed::ReceiveReport;
 pub use identity::{DOC_CACHE_MS, HomeserverReader, IdentityRefresh, REVALIDATION_MS};
+pub use parked::{ParkedMessage, ParkedSummary};
 pub use peek::{PeekReport, Peeked};
 pub use protocol::{
     Effect, LOCAL_WRITE_OVERHEAD_BYTES, LocalWrite, MAX_CLAIM_READS, MAX_LOSS_CONVERSATIONS,
@@ -444,10 +446,12 @@ impl AppBackup {
 }
 
 /// A restore, built: the app and its one commit, or the error of a write the store can't
-/// take in one batch.
+/// take in one batch: of the backup's own state, or of what a restore in place carries
+/// beside it ([`Refusal::CarriedTooLarge`]).
 enum Restorable {
     Ready(Box<App>, Tx),
     TooLarge(AppError),
+    CarriedTooLarge { duty_events: u64, owed_calls: u64 },
 }
 
 /// The error of building a restore's commit: [`Restorable::TooLarge`] for writes over the
@@ -1075,7 +1079,9 @@ impl App {
             });
             // The restore is built, not committed, so a layer the protocol refuses, or one
             // over the store's sizes, is refused now rather than at a restore that can
-            // never succeed.
+            // never succeed. What this store would carry beside it at a restore in place
+            // doesn't refuse the backup, which fits on its own: that restore is refused
+            // until the host acknowledges, or restores onto an empty store.
             let restorable = Self::restore_commit(
                 self.env.clone(),
                 Arc::clone(&self.protocol),
@@ -1127,7 +1133,10 @@ impl App {
     ///
     /// [`AppError::InvalidData`] for a backup that doesn't verify, for a protocol layer that
     /// another protocol, or a protocol without a backup name, made, or for one the protocol
-    /// refuses; a store failure, writes over the store's sizes included.
+    /// refuses; [`Refusal::CarriedTooLarge`] for a restore in place whose backup fits one
+    /// commit but not with the duty events and owed calls the store would carry beside it;
+    /// a store failure, writes over the store's sizes included. Nothing is written on any
+    /// of them.
     pub async fn restore(
         env: AppEnv,
         protocol: Arc<dyn Protocol>,
@@ -1139,11 +1148,21 @@ impl App {
                 Restorable::Ready(app, tx) => {
                     tx.commit(&app.env.store).await?;
                     let mut app = *app;
+                    // Committed: a failure here leaves the rest to the next read.
+                    let _ = app.retell_restored().await;
                     let kept = app.kept_duties().await?;
                     app.queue_duties(kept);
                     Ok(app)
                 }
                 Restorable::TooLarge(error) => Err(error),
+                Restorable::CarriedTooLarge {
+                    duty_events,
+                    owed_calls,
+                } => Err(Refusal::CarriedTooLarge {
+                    duty_events,
+                    owed_calls,
+                }
+                .into()),
             }
         })
         .await
@@ -1164,6 +1183,15 @@ impl App {
                 .map_err(|_| invalid("its certificate doesn't verify"))?;
             if cert.app_id() != meta.app_id || cert.signing_key() != backup.keys.signing_public() {
                 return Err(invalid("its certificate isn't its keys'"));
+            }
+            // The app record the restore installs carries that very certificate, so what the
+            // protocol checks below is all that is installed: the app writes the two
+            // together, at a join and when it takes a certificate, so they never differ in a
+            // backup it took.
+            let record = AppRecord::verify(&backup.record, &meta.identity)
+                .map_err(|_| invalid("its app record doesn't verify"))?;
+            if record.cert().hash() != cert.hash() {
+                return Err(invalid("its app record carries another certificate"));
             }
             let own_doc = IdentityDoc::verify(&backup.own_doc, &meta.identity)
                 .map_err(|_| invalid("its identity.json doesn't verify"))?;
@@ -1221,7 +1249,7 @@ impl App {
             }
             // The protocol checks its layer against the identity's naming key, the one the
             // restored app goes on with, before anything is written.
-            let restoring = RestoreContext::new(meta.identity, meta.app_id, &backup.naming);
+            let restoring = RestoreContext::new(meta.identity, meta.app_id, &backup.naming, &cert);
             let layer_writes =
                 protocol
                     .restore_layer(layer.as_ref(), &restoring)
@@ -1344,6 +1372,9 @@ impl App {
             // Every write of the one commit; what fails here is mostly a write the store
             // can't take in one batch, over its sizes.
             let mut tx = Tx::new(&app.ns);
+            // Set once the backup's own writes are in: a size refusal after it is the
+            // carried part's.
+            let mut carrying = false;
             let built: Result<(), AppError> = async {
                 tx.delete_prefix("")?;
                 app.write_all(&mut tx).await?;
@@ -1351,9 +1382,13 @@ impl App {
                     feed::processed_writes(&mut tx, sender, msg_id, record.hash, record.at_ms)?;
                 }
                 tx.put(records::LIST_DUE, &true)?;
+                // The entries it brings back are told to the protocol again, in steps after
+                // the restore commits (Switch spec 12.4).
+                parked::Retell::start(&app.state, &mut tx)?;
                 tx.local(&layer_writes)?;
                 tx.put(key::DUTY_NEXT, &app.state.next_duty)?;
                 tx.put(key::DUTY_EPOCH, &app.state.duty_epoch)?;
+                carrying = true;
                 for (stored, value) in &carried.values {
                     tx.put(stored, value)?;
                 }
@@ -1372,6 +1407,20 @@ impl App {
             .await;
             match built {
                 Ok(()) => Ok(Restorable::Ready(Box::new(app), tx)),
+                Err(AppError::Store(StoreError::TooLarge { .. })) if carrying => {
+                    let count = |prefix: &str| {
+                        let n = carried
+                            .values
+                            .iter()
+                            .filter(|(stored, _)| stored.starts_with(prefix))
+                            .count();
+                        u64::try_from(n).unwrap_or(u64::MAX)
+                    };
+                    Ok(Restorable::CarriedTooLarge {
+                        duty_events: count(key::DUTY_PREFIX),
+                        owed_calls: count(key::OWED_PREFIX),
+                    })
+                }
                 Err(error) => restore_build_error(error),
             }
         })
