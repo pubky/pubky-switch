@@ -17,7 +17,7 @@ use serde_json::Value;
 use sqlx::Row;
 
 use super::{
-    AccountTxn, StoreError, claim_codec, from_db,
+    AccountTxn, KeptReason, StoreError, claim_codec, from_db,
     identity::{decode_doc, encode_doc},
     to_db,
 };
@@ -590,21 +590,31 @@ impl AccountTxn {
         Ok(())
     }
 
-    /// Keep `app_id` as revoked at `at_ms`, for good, and withdraw the invite codes it
-    /// registered (Switch spec 7, 12.2, Switch wire 9.1).
-    pub async fn revoke_app(
+    /// Keep `app_id` for good as removed for `reason`, revoked or departed, at `at_ms` and
+    /// the newest document's `data_epoch`, a departure awaiting its rotation above it, and
+    /// withdraw the invite codes it registered: a leave is treated exactly as a revocation
+    /// (Switch spec 7, 12.2, 12.3; Switch wire 7.4.12, 9.1).
+    pub async fn keep_removed(
         &mut self,
         app_id: &[u8; 16],
+        reason: KeptReason,
         at_ms: u64,
         data_epoch: u64,
     ) -> Result<(), StoreError> {
+        let reason = match reason {
+            KeptReason::Revoked => "revoked",
+            KeptReason::Departed => "departed",
+            // An enrollment's App IDs are kept when it is taken, never removed here.
+            KeptReason::Enrolled => return Err(StoreError::Corrupt("not a removal")),
+        };
         let id = self.head().id.clone();
         sqlx::query(
             "INSERT INTO kept_app_ids (account_id, app_id, reason, at_ms, data_epoch) \
-             VALUES ($1, $2, 'revoked', $3, $4)",
+             VALUES ($1, $2, $3, $4, $5)",
         )
         .bind(&id)
         .bind(app_id.as_slice())
+        .bind(reason)
         .bind(to_db(at_ms, "time")?)
         .bind(to_db(data_epoch, "data_epoch")?)
         .execute(self.conn())

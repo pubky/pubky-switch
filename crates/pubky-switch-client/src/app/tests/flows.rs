@@ -2152,6 +2152,40 @@ async fn test_app_key_bundle_with_a_missing_epoch_asks_for_a_full_bundle() {
 }
 
 #[tokio::test]
+async fn test_app_keys_calls_without_a_record_are_not_current() {
+    // An app listed but holding no record at the switch isn't current: its `GET` and `POST
+    // /apps/{app_id}/keys` are refused `403 not_current`, as the service refuses them, and no
+    // request for a full bundle is kept for it (Switch wire 7.2, 7.4.11).
+    let w = World::new();
+    let keys = app_keys("phone");
+    let cert = cert_for(&w.alice, &keys, START, &["scope-a"]);
+    w.next_doc(|body| {
+        body.apps.push(ListedApp {
+            app_id: cert.app_id(),
+            cert: cert.hash(),
+        })
+    });
+    let env = w.env();
+    let client = crate::client::SwitchClient::new(
+        w.signer.origin(),
+        w.alice.public(),
+        crate::client::Credentials::App {
+            identity: w.alice.public(),
+            keys: keys.clone(),
+            cert,
+        },
+        Some(w.switch.service_key()),
+        Arc::clone(&env.transport),
+        Arc::clone(&env.clock),
+    )
+    .unwrap();
+    let not_current = |error: ClientError| error.code() == Some(ErrorCode::NotCurrent);
+    assert!(not_current(client.request_full_bundle().await.unwrap_err()));
+    assert!(not_current(client.keys().await.unwrap_err()));
+    assert!(w.switch.app(&keys.app_id_bytes()).full_requested.is_none());
+}
+
+#[tokio::test]
 async fn test_app_skips_a_bundle_part_with_another_naming_key() {
     let w = World::new();
     let mut app = w.join("wallet").await;

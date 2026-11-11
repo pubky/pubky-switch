@@ -1111,3 +1111,85 @@ async fn test_directory_versions_at_a_renewal_after_a_lapse() {
     );
     replay.db.drop_database().await.expect("drop");
 }
+
+#[tokio::test]
+async fn test_directory_leave_is_treated_as_a_revocation() {
+    // The wallet, which registered an invite code, leaves: as after a revocation, it leaves
+    // the directory, both versions move, its invite codes are withdrawn, and it is refused
+    // at its other calls (Switch spec 12.3, 7; Switch wire 7.4.10, 7.4.12).
+    use sqlx::Connection;
+    let Some(replay) = replay().await else { return };
+    alice_with_three_apps(&replay).await;
+    put_code(&replay, 120).await;
+    let at = setup_time();
+    let before = read_as(&replay, "phone", &at).await;
+    let wallet = app(&vectors("keys.json"), "wallet")["app_id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    let path = format!("/v1/{}/apps/{wallet}/leave", alice_id());
+    let keys = vectors("keys.json");
+    let answer = replay
+        .service
+        .handle(app_request(
+            app(&keys, "wallet"),
+            "POST",
+            &path,
+            Vec::new(),
+            ms(&at),
+        ))
+        .await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    let after = read_as(&replay, "phone", &at).await;
+    assert_eq!(moved(&before, &after), (true, true));
+    assert!(!ids_of(&after).contains(&json!(wallet)));
+    // Another own app sees the departure in its feed: the `leave` item, in full (7.5).
+    let feed = replay
+        .service
+        .handle(app_request(
+            app(&keys, "phone"),
+            "GET",
+            &format!("/v1/{}/feed", alice_id()),
+            Vec::new(),
+            ms(&at),
+        ))
+        .await;
+    let page: Value = serde_json::from_slice(&feed.body).expect("a feed page");
+    let last = page["items"]
+        .as_array()
+        .and_then(|items| items.last())
+        .unwrap_or_else(|| panic!("{page}"))
+        .clone();
+    let item: pubky_switch_core::sig::SignedDoc =
+        serde_json::from_value(last["item"].clone()).unwrap_or_else(|_| panic!("{last}"));
+    let transition: Value =
+        serde_json::from_slice(&item.body_bytes().expect("body")).expect("a transition");
+    assert_eq!(transition["type"], "leave", "{transition}");
+    assert_eq!(transition["app_id"], json!(wallet));
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    let codes: i64 = sqlx::query_scalar("SELECT count(*) FROM invite_codes WHERE account_id = $1")
+        .bind(alice_id())
+        .fetch_one(&mut conn)
+        .await
+        .expect("codes");
+    assert_eq!(codes, 0, "its invite codes are withdrawn");
+    let refused = replay
+        .service
+        .handle(app_request(
+            app(&keys, "wallet"),
+            "GET",
+            &directory_path(),
+            Vec::new(),
+            ms(&at),
+        ))
+        .await;
+    assert_eq!(code_of(&refused), (403, json!("not_current")));
+    replay.db.drop_database().await.expect("drop");
+}

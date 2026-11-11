@@ -12,8 +12,8 @@
 //! `GET /v1/{id}/identity`, `POST /v1/{id}/ops`, `GET /v1/{id}/feed`,
 //! `POST /v1/{id}/inbox`, `PUT /v1/{id}/peers`, `GET /v1/{id}/claims/{claim_key}`,
 //! `GET /v1/{id}/apps`, `POST /v1/{id}/apps/{app_id}/revoke`, `GET /v1/{id}/directory`,
-//! and `GET` and `POST /v1/{id}/apps/{app_id}/keys`. Every other call is answered `503
-//! unavailable`.
+//! `GET` and `POST /v1/{id}/apps/{app_id}/keys`, and `POST /v1/{id}/apps/{app_id}/leave`.
+//! Every other call is answered `503 unavailable`.
 
 mod admission;
 mod app_keys;
@@ -395,7 +395,8 @@ impl Service {
             | Call::Append
             | Call::Directory
             | Call::GetKeys(_)
-            | Call::RequestKeys(_) => {
+            | Call::RequestKeys(_)
+            | Call::Leave(_) => {
                 match self.authenticate_caller(&account, &request, base_ms, base_ms.max(stamped_ms))
                 {
                     Ok((claimed, cert)) => {
@@ -1055,6 +1056,31 @@ impl Service {
                         &request.route.query,
                         time_ms,
                     )
+                    .map(|answer| (answer, serving))
+                    .map_err(|error| Refused::with_head(error, serving));
+            }
+            Call::Leave(app_id) => {
+                // Only the app itself leaves (Switch wire 7.4.12).
+                let Some(caller) = writer.as_ref() else {
+                    return Err(Refused::with_head(
+                        ApiError::new(
+                            ErrorCode::PermissionMissing,
+                            "7.4.12: only the app itself leaves",
+                        ),
+                        serving,
+                    ));
+                };
+                return self
+                    .leave(
+                        txn,
+                        signer,
+                        held.as_ref(),
+                        caller,
+                        app_id,
+                        &request.body,
+                        time_ms,
+                    )
+                    .await
                     .map(|answer| (answer, serving))
                     .map_err(|error| Refused::with_head(error, serving));
             }
