@@ -30,7 +30,7 @@ use pubky_switch_core::enc::{b64, serde_b64, serde_b64_vec, unb64_array};
 use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::ident::{Policy, collection_id, record_key_from_blinded};
 use pubky_switch_core::ops::{Condition, IdInputs, OpKind, RecordPut, RecordVersion, SignedOp};
-use pubky_switch_core::records::{AppCert, AppRecord, Standing};
+use pubky_switch_core::records::{AppCert, AppRecord, IdentityDoc, Standing};
 use pubky_switch_core::sealed::{RecordValue, SealedValue};
 use pubky_switch_core::shared::{WriteVersion, date_write};
 use pubky_switch_core::sig::SignedDoc;
@@ -473,6 +473,27 @@ pub(crate) struct Evidence<'a> {
     pub(crate) view_version: Option<RecordVersion>,
 }
 
+/// Whether a certificate of `standing` counts for a write at `time` (Switch wire 6.2
+/// "Accepting a write" step 4): listed, or renewed with `until` `null`, at any time;
+/// renewed and closed, for a write dated before `until`; of a removed app, for a write
+/// dated at or before `distrust_from`, or one nothing dates, as doubtful.
+fn counts_at(standing: Standing, time: Option<u64>) -> bool {
+    match standing {
+        Standing::Listed | Standing::RenewedOpen => true,
+        Standing::RenewedClosed { until } => time.is_some_and(|t| t < until),
+        Standing::Removed { distrust_from } => time.is_none_or(|t| t <= distrust_from),
+        Standing::None => false,
+    }
+}
+
+/// Whether `cert` was in force at a write at `time`, by the newest own `identity.json`:
+/// its standing counts then, and it hadn't expired (Switch wire 6.2 "Accepting a write"
+/// step 4).
+fn in_force(doc: &IdentityDoc, cert: &AppCert, time: Option<u64>) -> bool {
+    counts_at(doc.standing(&cert.app_id(), &cert.hash()), time)
+        && time.is_none_or(|t| !cert.expired_at(t))
+}
+
 /// The writer's certificates whose key verifies a write's operation (Switch wire 6.2
 /// "Accepting a write" step 1), with the operation they verify.
 struct WriterCerts {
@@ -509,6 +530,11 @@ enum Refused {
     Invalid { writer: [u8; 16], reason: String },
     /// Not a write the app takes: another collection, or a writer it can't find.
     Ignored,
+    /// A write without a record view, that no certificate the app holds authorizes, while
+    /// the newest own `identity.json` names a certificate of the writer in force at its
+    /// time that the app doesn't hold: the record's view decides (Switch wire 6.2
+    /// "Accepting a write" step 1). It names the member of the collection.
+    Unheld(Collection),
 }
 
 /// What [`App::take_write`] did.
@@ -652,16 +678,24 @@ impl App {
         key: &[u8; 32],
         collection: &Collection,
     ) -> Result<(), AppError> {
-        let result = self.client.record(key).await;
-        let view = match self.take(result).await {
-            Ok(view) => view,
-            Err(error) if error.code() == Some(ErrorCode::NotFound) => return Ok(()),
-            Err(error) => return Err(error),
+        let Some(view) = self.record_view(key).await? else {
+            return Ok(());
         };
         let mut tx = self.tx()?;
         self.take_view(&view, Some((key, collection)), &mut tx)
             .await?;
         self.commit(tx).await
+    }
+
+    /// The switch's view of record `key` (`GET /records/{key}`, Switch wire 7.4.9); `None`
+    /// for a key it doesn't know, or forgot.
+    async fn record_view(&mut self, key: &[u8; 32]) -> Result<Option<SharedRecordView>, AppError> {
+        let result = self.client.record(key).await;
+        match self.take(result).await {
+            Ok(view) => Ok(Some(view)),
+            Err(error) if error.code() == Some(ErrorCode::NotFound) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     /// List `collection`'s current records at the switch, page by page (Switch wire
@@ -801,7 +835,38 @@ impl App {
         shown_key: [u8; 32],
         tx: &mut Tx,
     ) -> Result<(), AppError> {
-        match self.accept_write(evidence, expect).await? {
+        let mut outcome = self.accept_write(evidence, expect).await?;
+        let mut version = evidence
+            .stub
+            .map(|env| RecordVersion::new(env.generation, env.seq))
+            .or(evidence.view_version)
+            .unwrap_or(RecordVersion::NONE);
+        // A write the app holds no certificate in force at its time for: the record's view,
+        // whose `cert` is the one the service checked the write against, decides (Switch
+        // wire 6.2 "Accepting a write" step 1, 7.4.9).
+        if let Err(Refused::Unheld(collection)) = &outcome {
+            let collection = collection.clone();
+            outcome = match self.record_view(&shown_key).await? {
+                Some(view) => {
+                    if view.divergent {
+                        self.events
+                            .push(AppEvent::RecordDivergent { key: view.key });
+                    }
+                    version = RecordVersion::new(view.generation, view.version);
+                    let evidence = Evidence {
+                        op: &view.op,
+                        cert: Some(&view.cert),
+                        proof: view.proof.as_ref(),
+                        stub: None,
+                        view_version: Some(version),
+                    };
+                    self.accept_write(&evidence, Some((&shown_key, &collection)))
+                        .await?
+                }
+                None => Err(Refused::Ignored),
+            };
+        }
+        match outcome {
             Ok(accepted) => {
                 self.take_write(accepted, false, tx).await?;
             }
@@ -809,15 +874,10 @@ impl App {
                 return Err(self.raise(Alarm::Rollback { reason }).await);
             }
             Err(Refused::Invalid { writer, reason }) => {
-                let version = evidence
-                    .stub
-                    .map(|env| RecordVersion::new(env.generation, env.seq))
-                    .or(evidence.view_version)
-                    .unwrap_or(RecordVersion::NONE);
                 self.flag_write(&shown_key, version, writer, reason, tx)
                     .await?;
             }
-            Err(Refused::Ignored) => {}
+            Err(Refused::Ignored | Refused::Unheld(_)) => {}
         }
         Ok(())
     }
@@ -927,6 +987,15 @@ impl App {
             cert = again;
             standing = self.state.own_doc.standing(&writer, &cert.hash());
         }
+        let holds_write_scope =
+            |cert: &AppCert| write_scopes.iter().any(|scope| cert.holds_scope(scope));
+        if evidence.cert.is_none()
+            && let Some(at) = time
+            && !(in_force(&self.state.own_doc, &cert, time) && holds_write_scope(&cert))
+            && self.unheld_in_force(&writer, &certs, at)
+        {
+            return Ok(Err(Refused::Unheld(collection)));
+        }
         match standing {
             Standing::Listed | Standing::RenewedOpen => {}
             Standing::RenewedClosed { until } => {
@@ -954,12 +1023,7 @@ impl App {
             return invalid("Switch wire 6.2 step 4: the certificate had expired at the write");
         }
         // Step 5: a write scope.
-        if !put
-            .policy
-            .write_scopes
-            .iter()
-            .any(|scope| cert.holds_scope(scope))
-        {
+        if !holds_write_scope(&cert) {
             return invalid("Switch wire 6.2 step 5: the writer holds none of the write scopes");
         }
         // Step 6: the version.
@@ -1073,13 +1137,13 @@ impl App {
         }))
     }
 
-    /// The certificate a write is judged with (Switch wire 6.2 "Accepting a write" step 4,
-    /// 7.4.9). A record view's `cert` is the one the service checked the write against, and
-    /// the write is judged with it, whatever certificate the writer holds now: a renewal
-    /// later doesn't change which certificate a write was made under. Without one (a write
-    /// from the feed), the earliest known certificate in force at the write's time, one that
-    /// holds a write scope first; only for a write nothing dates, or that no known
-    /// certificate was in force for, the one in the best standing now.
+    /// The certificate a write is judged with (Switch wire 6.2 "Accepting a write" steps 1
+    /// and 4, 7.4.9). A record view's `cert` is the one the service checked the write
+    /// against, and the write is judged with it, whatever certificate the writer holds now:
+    /// a renewal later doesn't change which certificate a write was made under. Without one
+    /// (a write from the feed), the earliest known certificate in force at the write's time,
+    /// one that holds a write scope first; only when no known certificate was in force, the
+    /// one in the best standing now.
     fn write_cert(
         &self,
         certs: &WriterCerts,
@@ -1090,28 +1154,18 @@ impl App {
             return Some(cert.clone());
         }
         let doc = &self.state.own_doc;
-        if let Some(time) = time {
-            let mut in_force: Vec<&AppCert> = certs
-                .known
-                .iter()
-                .filter(|cert| {
-                    !cert.expired_at(time)
-                        && match doc.standing(&cert.app_id(), &cert.hash()) {
-                            Standing::Listed | Standing::RenewedOpen => true,
-                            Standing::RenewedClosed { until } => time < until,
-                            Standing::Removed { distrust_from } => time <= distrust_from,
-                            Standing::None => false,
-                        }
-                })
-                .collect();
-            in_force.sort_by_key(|cert| cert.issued_at());
-            let found = in_force
-                .iter()
-                .find(|cert| write_scopes.iter().any(|scope| cert.holds_scope(scope)))
-                .or(in_force.first());
-            if let Some(cert) = found {
-                return Some((*cert).clone());
-            }
+        let mut counting: Vec<&AppCert> = certs
+            .known
+            .iter()
+            .filter(|cert| in_force(doc, cert, time))
+            .collect();
+        counting.sort_by_key(|cert| cert.issued_at());
+        let found = counting
+            .iter()
+            .find(|cert| write_scopes.iter().any(|scope| cert.holds_scope(scope)))
+            .or(counting.first());
+        if let Some(cert) = found {
+            return Some((*cert).clone());
         }
         let rank = |cert: &&AppCert| match doc.standing(&cert.app_id(), &cert.hash()) {
             Standing::Listed => 0,
@@ -1121,6 +1175,23 @@ impl App {
             Standing::None => 4,
         };
         certs.known.iter().min_by_key(rank).cloned()
+    }
+
+    /// Whether the newest own `identity.json` names a certificate of `writer` in force at
+    /// `time` that the app doesn't hold (Switch wire 6.2 "Accepting a write" step 1).
+    fn unheld_in_force(&self, writer: &[u8; 16], certs: &WriterCerts, time: u64) -> bool {
+        let doc = &self.state.own_doc;
+        let held: Vec<[u8; 32]> = certs.known.iter().map(AppCert::hash).collect();
+        doc.listed_cert(writer)
+            .into_iter()
+            .chain(
+                doc.body()
+                    .renewed
+                    .iter()
+                    .filter(|entry| &entry.app_id == writer)
+                    .map(|entry| entry.cert),
+            )
+            .any(|hash| counts_at(doc.standing(writer, &hash), Some(time)) && !held.contains(&hash))
     }
 
     async fn kept_certs(&self, app_id: &[u8; 16]) -> Result<Vec<AppCert>, AppError> {

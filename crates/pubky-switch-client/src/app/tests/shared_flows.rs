@@ -1729,11 +1729,14 @@ async fn test_records_write_before_a_reduction_is_kept_by_every_reader() {
     assert_eq!(evidence.ops[0].cert, *earlier.signed());
 }
 
-/// The failure path: a write under the earlier certificate dated after its `until`. The
-/// signer publishes the closed renewal before the switch takes it, so the switch still
-/// checks the wallet against the earlier certificate and takes a write ten minutes past the
-/// cutoff. Every reader flags it (Switch wire 6.2 "Accepting a write" step 4), from the
-/// feed and from the record view alike: the phone, and a tablet that joins afterwards.
+/// The failure path: a write under the earlier certificate dated after its `until`. It
+/// models a faulty ordering, which an honest switch refuses: the signer publishes the
+/// closed renewal before the switch takes it, so the switch still checks the wallet against
+/// the earlier certificate and takes a write ten minutes past the cutoff. A compliant
+/// switch checks the wallet against the renewed certificate from the renewing delivery on
+/// (Switch wire 3.8), so no write under the earlier one is dated past `until`. Every reader
+/// flags it (Switch wire 6.2 "Accepting a write" step 4), from the feed and from the record
+/// view alike: the phone, and a tablet that joins afterwards.
 #[tokio::test]
 async fn test_records_write_after_a_reduction_closed_is_flagged_by_every_reader() {
     let s = Setup::new();
@@ -1989,6 +1992,119 @@ async fn test_records_feed_write_under_a_scope_a_renewal_added_is_taken() {
     phone.refresh_own_apps().await.unwrap();
     let report = phone.receive(None).await.unwrap();
     let events = report.events;
+    assert!(flagged_rules(&events).is_empty(), "{events:?}");
+    let held = phone.shared_record(&key).await.unwrap().unwrap();
+    assert_eq!(ids(held.content.value()), vec!["a"]);
+}
+
+/// A feed write under a certificate the reader never held: the phone joined after the
+/// wallet and kept none of its certificates, the wallet wrote while the phone was away, and
+/// a reduction dropped the record's scope. The newest `identity.json` names the earlier
+/// certificate as in force at the write's time, so the phone reads the record's view and
+/// judges the write with its `cert` (Switch wire 6.2 "Accepting a write" step 1, 7.4.9),
+/// and takes it, as a reader that kept that certificate does.
+#[tokio::test]
+async fn test_records_feed_write_under_a_certificate_never_held_is_judged_by_its_view() {
+    let s = Setup::new();
+    let mut wallet = join_scoped(&s, "wallet", &["scope-a", "scope-c"]).await;
+    let mut phone = s.join("phone").await;
+    phone.receive(None).await.unwrap();
+    let target = s.target("n1");
+    wallet
+        .put_record(&target, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    let key = wallet.record_key(&target).unwrap();
+
+    s.w.clock.advance_ms(DAY_MS);
+    let earlier = wallet.cert().clone();
+    let renewed = renewed_cert(&s, "wallet", &["scope-c"]);
+    s.w.next_doc(|body| list_renewal(body, &earlier, &renewed, None));
+    let until = s.w.clock.now_ms() + CLOCK_TOLERANCE_MS;
+    s.w.next_doc(|body| list_renewal(body, &earlier, &renewed, Some(until)));
+    wallet.receive(None).await.unwrap();
+    assert_eq!(wallet.cert().hash(), renewed.hash());
+
+    let report = phone.receive(None).await.unwrap();
+    assert!(
+        flagged_rules(&report.events).is_empty(),
+        "{:?}",
+        report.events
+    );
+    assert!(phone.flagged_writes().await.unwrap().is_empty());
+    let held = phone.shared_record(&key).await.unwrap().unwrap();
+    assert_eq!(ids(held.content.value()), vec!["a"]);
+    let evidence = phone.shared_evidence().await.unwrap();
+    assert_eq!(evidence.ops[0].cert, *earlier.signed());
+}
+
+/// The failure path of a feed write under a certificate the reader never held: the view's
+/// `cert` decides, and a write it doesn't authorize is flagged. The switch shows the record
+/// with the renewed certificate, which lacks the write scope, as a faulty switch would.
+#[tokio::test]
+async fn test_records_feed_write_whose_view_lacks_the_write_scope_is_flagged() {
+    let s = Setup::new();
+    let mut wallet = join_scoped(&s, "wallet", &["scope-a", "scope-c"]).await;
+    let mut phone = s.join("phone").await;
+    phone.receive(None).await.unwrap();
+    let target = s.target("n1");
+    wallet
+        .put_record(&target, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    let key = wallet.record_key(&target).unwrap();
+
+    s.w.clock.advance_ms(DAY_MS);
+    let earlier = wallet.cert().clone();
+    let renewed = renewed_cert(&s, "wallet", &["scope-c"]);
+    s.w.next_doc(|body| list_renewal(body, &earlier, &renewed, None));
+    let until = s.w.clock.now_ms() + CLOCK_TOLERANCE_MS;
+    s.w.next_doc(|body| list_renewal(body, &earlier, &renewed, Some(until)));
+    wallet.receive(None).await.unwrap();
+    s.w.switch.lock().shared.records.get_mut(&key).unwrap().cert = Some(renewed.signed().clone());
+
+    let report = phone.receive(None).await.unwrap();
+    let rules = flagged_rules(&report.events);
+    assert!(
+        rules.iter().any(|rule| rule.contains("step 5")),
+        "{rules:?}"
+    );
+    assert!(phone.shared_record(&key).await.unwrap().is_none());
+}
+
+/// A write nothing dates, read from a view whose `cert` isn't the writer's: of the
+/// writer's certificates that count without a time (listed, or renewed with `until`
+/// `null`), the reader takes one that holds a write scope (Switch wire 6.2 "Accepting a
+/// write" steps 1, 4 and 5). The renewal drops the scope and is still open.
+#[tokio::test]
+async fn test_records_undated_write_is_judged_with_a_certificate_holding_a_write_scope() {
+    let s = Setup::new();
+    let mut wallet = join_scoped(&s, "wallet", &["scope-a", "scope-c"]).await;
+    let mut phone = s.join("phone").await;
+    phone.receive(None).await.unwrap();
+    phone.refresh_own_apps().await.unwrap();
+    let target = s.target("n1");
+    wallet
+        .put_record(&target, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    let key = wallet.record_key(&target).unwrap();
+
+    s.w.clock.advance_ms(HOUR);
+    let earlier = wallet.cert().clone();
+    let renewed = renewed_cert(&s, "wallet", &["scope-c"]);
+    s.w.next_doc(|body| list_renewal(body, &earlier, &renewed, None));
+    wallet.receive(None).await.unwrap();
+    assert_eq!(wallet.cert().hash(), renewed.hash());
+    {
+        let mut inner = s.w.switch.lock();
+        inner.shared.records.get_mut(&key).unwrap().cert = Some(phone.cert().signed().clone());
+        inner.shared.hide_proofs = true;
+    }
+    phone.refresh_identity().await.unwrap();
+    phone.refresh_own_apps().await.unwrap();
+    phone.read_record(&target).await.unwrap();
+    let events = phone.take_events();
     assert!(flagged_rules(&events).is_empty(), "{events:?}");
     let held = phone.shared_record(&key).await.unwrap().unwrap();
     assert_eq!(ids(held.content.value()), vec!["a"]);
