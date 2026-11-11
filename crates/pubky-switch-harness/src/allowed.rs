@@ -143,6 +143,72 @@ pub static ALLOWED: &[Allowed] = &[
                  that prunes idle entries by it finds every entry never used.",
         reference: "Switch wire 7.4.6, `last_used`",
     },
+    Allowed {
+        flow: "renewal, a scope dropped",
+        label: "{alice/phone} GET /v1/{alice}/records/*",
+        fact: "body.cert.*",
+        service: "*",
+        scripted: "*",
+        reason: "fake batch pending: a record view carries the certificate the service checked \
+                 the write against, which a later renewal doesn't change; the scripted switch \
+                 gives the writer's current certificate, here one without the write scope.",
+        reference: "Switch wire 7.4.9, the record view's `cert`",
+    },
+    Allowed {
+        flow: "renewal, a scope dropped",
+        label: "{alice/tablet} GET /v1/{alice}/records",
+        fact: "body.records[0].cert.*",
+        service: "*",
+        scripted: "*",
+        reason: "fake batch pending: a record view carries the certificate the service checked \
+                 the write against, which a later renewal doesn't change; the scripted switch \
+                 gives the writer's current certificate, here one without the write scope.",
+        reference: "Switch wire 7.4.9, the record view's `cert`",
+    },
+    Allowed {
+        flow: "renewal, a scope dropped",
+        label: "{alice/tablet} GET /v1/{alice}/records/*",
+        fact: "body.cert.*",
+        service: "*",
+        scripted: "*",
+        reason: "fake batch pending: a record view carries the certificate the service checked \
+                 the write against, which a later renewal doesn't change; the scripted switch \
+                 gives the writer's current certificate, here one without the write scope.",
+        reference: "Switch wire 7.4.9, the record view's `cert`",
+    },
+    Allowed {
+        flow: "renewal, a scope dropped",
+        label: "outcome the tablet joined after the renewal and listed the collection",
+        fact: "outcome.listed",
+        service: "number 1",
+        scripted: "number 0",
+        reason: "fake batch pending: with the writer's current certificate in the record view, \
+                 an app that joins after the renewal refuses the write (Switch wire 6.2 \
+                 step 5), where with the certificate of the write it takes it.",
+        reference: "Switch wire 7.4.9, the record view's `cert`",
+    },
+    Allowed {
+        flow: "renewal, a scope dropped",
+        label: "outcome what the tablet holds of the record",
+        fact: "outcome.*",
+        service: "*",
+        scripted: "*",
+        reason: "fake batch pending: with the writer's current certificate in the record view, \
+                 an app that joins after the renewal refuses the write (Switch wire 6.2 \
+                 step 5), where with the certificate of the write it takes it.",
+        reference: "Switch wire 7.4.9, the record view's `cert`",
+    },
+    Allowed {
+        flow: "renewal, a scope dropped",
+        label: "outcome what the tablet reads of the record",
+        fact: "outcome.*",
+        service: "*",
+        scripted: "*",
+        reason: "fake batch pending: with the writer's current certificate in the record view, \
+                 an app that joins after the renewal refuses the write (Switch wire 6.2 \
+                 step 5), where with the certificate of the write it takes it.",
+        reference: "Switch wire 7.4.9, the record view's `cert`",
+    },
 ];
 
 #[cfg(test)]
