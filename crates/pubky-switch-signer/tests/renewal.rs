@@ -1732,6 +1732,124 @@ async fn test_renewal_users_renewal_whose_publication_fails_starts_the_count_aga
     assert!(!renewals_stopped(&signer));
 }
 
+/// The untaken renewals stored for `app`, as the signer committed them.
+fn untaken_stored(store: &MemoryStore, signer: &Signer, app: &[u8; 16]) -> usize {
+    let ns = pubky_switch_signer::state::signer_namespace(&signer.identity());
+    let state: serde_json::Value =
+        serde_json::from_slice(&store.get(&ns, b"state").unwrap().unwrap()).unwrap();
+    let app = serde_json::to_value(app).unwrap();
+    state["untaken_renewals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| entry[0] == app)
+        .count()
+}
+
+#[tokio::test]
+async fn test_renewal_finished_by_resume_counts_once() {
+    // Twice, an automatic renewal's publication fails and the next `resume` finishes it: each
+    // counts once, so the third due renewal is stopped (Switch spec 3.1).
+    let world = World::new();
+    let (mut signer, store) = world.enrolled().await;
+    let (a, _) = two_apps(&["notes"], &["notes"]);
+    world.approve(&mut signer, &a).await;
+    let id = a.keys.app_id_bytes();
+    for round in 1..=2 {
+        world.clock.advance_ms(LIFETIME_MS / 2 + DAY_MS);
+        *world.homeserver.failing_path.lock().unwrap() = Some(IDENTITY_PATH.to_owned());
+        signer.renew_expiring().await.unwrap_err();
+        *world.homeserver.failing_path.lock().unwrap() = None;
+        signer.resume().await.unwrap();
+        assert_eq!(untaken_stored(&store, &signer, &id), round);
+    }
+    world.clock.advance_ms(LIFETIME_MS / 2 + DAY_MS);
+    assert!(signer.renew_expiring().await.unwrap().is_empty());
+    assert!(renewals_stopped(&signer));
+    let newest = signer.identity_doc().unwrap().unwrap();
+    assert_eq!(renewals(&newest, &id).len(), 2);
+}
+
+#[tokio::test]
+async fn test_renewal_interrupted_before_its_delivery_counts_once() {
+    // The switch can't be reached for the renewing version's delivery, and the signer stops
+    // there, as after a crash. Reopened, it delivers the version: one renewal, counted once,
+    // so the next one is renewed too, and only the third is stopped (Switch spec 3.1).
+    let world = World::new();
+    let (mut signer, store) = world.enrolled().await;
+    let (a, _) = two_apps(&["notes"], &["notes"]);
+    world.approve(&mut signer, &a).await;
+    let id = a.keys.app_id_bytes();
+    world.clock.advance_ms(LIFETIME_MS / 2 + DAY_MS);
+    world.switch.fail_next(SwitchFault::Unreachable {
+        path: "/identity".into(),
+        after: 0,
+    });
+    signer.renew_expiring().await.unwrap_err();
+    assert_eq!(untaken_stored(&store, &signer, &id), 1);
+    drop(signer);
+    let mut signer = Signer::open(world.env(store.clone()), world.keyring())
+        .await
+        .unwrap();
+    signer.resume().await.unwrap();
+    assert_eq!(untaken_stored(&store, &signer, &id), 1);
+    world.clock.advance_ms(LIFETIME_MS / 2 + DAY_MS);
+    assert_eq!(signer.renew_expiring().await.unwrap(), [id]);
+    world.clock.advance_ms(LIFETIME_MS / 2 + DAY_MS);
+    assert!(signer.renew_expiring().await.unwrap().is_empty());
+    assert!(renewals_stopped(&signer));
+}
+
+#[tokio::test]
+async fn test_renewal_given_up_isnt_counted() {
+    // The switch refuses an automatic renewal's version (`400`): the renewal is given up, its
+    // certificate dropped, and it doesn't count. Two delivered renewals later the app is
+    // stopped (Switch spec 3.1).
+    let world = World::new();
+    let (mut signer, store) = world.enrolled().await;
+    let (a, _) = two_apps(&["notes"], &["notes"]);
+    world.approve(&mut signer, &a).await;
+    let id = a.keys.app_id_bytes();
+    world.clock.advance_ms(LIFETIME_MS / 2 + DAY_MS);
+    world.switch.fail_next(SwitchFault::Error {
+        path: "/identity".into(),
+        code: ErrorCode::BadRequest,
+        current: serde_json::Value::Null,
+    });
+    signer.renew_expiring().await.unwrap_err();
+    assert_eq!(untaken_stored(&store, &signer, &id), 0);
+    assert_eq!(signer.renew_expiring().await.unwrap(), [id]);
+    world.clock.advance_ms(LIFETIME_MS / 2 + DAY_MS);
+    assert_eq!(signer.renew_expiring().await.unwrap(), [id]);
+    world.clock.advance_ms(LIFETIME_MS / 2 + DAY_MS);
+    assert!(signer.renew_expiring().await.unwrap().is_empty());
+    assert!(renewals_stopped(&signer));
+}
+
+#[tokio::test]
+async fn test_renewal_users_renewal_finished_by_resume_starts_the_count_again() {
+    // Stopped after two untaken renewals. The user's renewal fails at its publication and the
+    // next `resume` finishes it: the count started again with it (Switch spec 3.1).
+    let world = World::new();
+    let (mut signer, store) = world.enrolled().await;
+    let (a, _) = two_apps(&["notes"], &["notes"]);
+    world.approve(&mut signer, &a).await;
+    let id = a.keys.app_id_bytes();
+    for _ in 1..=3 {
+        world.clock.advance_ms(LIFETIME_MS / 2 + DAY_MS);
+        signer.run_due().await.unwrap();
+    }
+    assert!(renewals_stopped(&signer));
+    *world.homeserver.failing_path.lock().unwrap() = Some(IDENTITY_PATH.to_owned());
+    signer.renew(id, CertChange::default()).await.unwrap_err();
+    *world.homeserver.failing_path.lock().unwrap() = None;
+    signer.resume().await.unwrap();
+    assert!(!renewals_stopped(&signer));
+    assert_eq!(untaken_stored(&store, &signer, &id), 0);
+    world.clock.advance_ms(LIFETIME_MS / 2 + DAY_MS);
+    assert_eq!(signer.renew_expiring().await.unwrap(), [id]);
+}
+
 #[tokio::test]
 async fn test_renewal_count_and_alert_go_with_a_removed_app() {
     // Stopped after two untaken renewals; the user revokes the app. Once the version that
@@ -1760,10 +1878,7 @@ async fn test_renewal_count_and_alert_go_with_a_removed_app() {
             .is_none()
     );
     assert!(!renewals_stopped(&signer));
-    let ns = pubky_switch_signer::state::signer_namespace(&signer.identity());
-    let state: serde_json::Value =
-        serde_json::from_slice(&store.get(&ns, b"state").unwrap().unwrap()).unwrap();
-    assert_eq!(state["untaken_renewals"], serde_json::json!([]));
+    assert_eq!(untaken_stored(&store, &signer, &id), 0);
 }
 
 #[tokio::test]

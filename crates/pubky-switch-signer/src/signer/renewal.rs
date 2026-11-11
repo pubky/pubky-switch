@@ -70,7 +70,7 @@ pub struct CertChange {
 
 /// How many automatic renewals in a row no record of an app may leave untaken before the
 /// signer stops renewing it by itself (Switch spec 3.1).
-const RENEWALS_LEFT_UNTAKEN: u32 = 2;
+const RENEWALS_LEFT_UNTAKEN: usize = 2;
 
 /// Who a renewal is for, which sets its expiry and what it does to the count of untaken
 /// automatic renewals, committed with the renewing version itself (Switch spec 3.1).
@@ -254,14 +254,7 @@ impl Signer {
         }
         state.epoch_through = state.epoch_through.max(last);
         match by {
-            RenewedBy::Automatic { .. } => match state
-                .untaken_renewals
-                .iter_mut()
-                .find(|(id, _)| *id == app_id)
-            {
-                Some((_, count)) => *count = count.saturating_add(1),
-                None => state.untaken_renewals.push((app_id, 1)),
-            },
+            RenewedBy::Automatic { .. } => state.untaken_renewals.push((app_id, new.hash())),
             RenewedBy::User => renewals_taken_in(&mut state, &[app_id]),
         }
         self.commit_batches(state, &newest, &statuses, alerts, batches, &doc, flow)
@@ -923,12 +916,12 @@ impl Signer {
     }
 
     /// How many automatic renewals of `app_id` in a row no record has taken up.
-    fn untaken_renewals(&self, app_id: &[u8; 16]) -> u32 {
+    fn untaken_renewals(&self, app_id: &[u8; 16]) -> usize {
         self.state
             .untaken_renewals
             .iter()
-            .find(|(id, _)| id == app_id)
-            .map_or(0, |(_, count)| *count)
+            .filter(|(id, _)| id == app_id)
+            .count()
     }
 
     /// The apps in `apps` are back: their count of untaken renewals starts again, and
