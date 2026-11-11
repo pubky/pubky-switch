@@ -2,11 +2,12 @@
 //! its routing, its body caps and its signed refusals.
 
 // Helpers of tests fail the test on any error.
-#![allow(clippy::expect_used)]
+#![allow(clippy::expect_used, clippy::panic)]
 
 use std::sync::Arc;
 
 use pubky_switch::limits::Limits;
+use pubky_switch::store::testing::TEST_DATABASE_URL_ENV;
 use pubky_switch_client::TransportError;
 use pubky_switch_client::clock::TestClock;
 use pubky_switch_client::testing::START_MS;
@@ -92,5 +93,45 @@ async fn test_service_transport_takes_the_services_own_path() {
     );
 
     drop(transport);
+    let name = switch.database_name().to_owned();
     switch.close().await.expect("closed");
+    assert!(!database_exists(&name).await, "{name} was left behind");
+}
+
+/// Whether the test server holds a database named `name`.
+async fn database_exists(name: &str) -> bool {
+    use std::str::FromStr;
+
+    use sqlx::Connection;
+
+    let url = std::env::var(TEST_DATABASE_URL_ENV).expect("the test database's URL");
+    let options = sqlx::postgres::PgConnectOptions::from_str(&url).expect("options");
+    let mut admin = sqlx::PgConnection::connect_with(&options)
+        .await
+        .expect("a connection");
+    let found: Option<(i32,)> = sqlx::query_as("SELECT 1 FROM pg_database WHERE datname = $1")
+        .bind(name)
+        .fetch_optional(&mut admin)
+        .await
+        .expect("the query");
+    admin.close().await.expect("closed");
+    found.is_some()
+}
+
+/// A switch that is dropped without being closed, as when its test panics, leaves no
+/// database behind.
+#[tokio::test]
+async fn test_service_dropped_without_close_drops_its_database() {
+    let Some(switch) = switch(Arc::new(TestClock::new(START_MS))).await else {
+        return;
+    };
+    let name = switch.database_name().to_owned();
+    assert!(database_exists(&name).await);
+    // The unwinding of a panic drops it like this.
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _held = switch;
+        panic!("a failing test");
+    }));
+    assert!(unwound.is_err());
+    assert!(!database_exists(&name).await, "{name} was left behind");
 }

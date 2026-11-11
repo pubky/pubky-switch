@@ -10,9 +10,16 @@
 //! - of each JSON body, every member's name and type, the length of each array, and the
 //!   value of each integer, boolean and time. Both runs use one set of key seeds and one
 //!   clock, so sequence numbers, versions, counters and service times must agree;
-//! - of each string, its length; its value where it is too short to be key material
-//!   (under [`SHORT`] characters: positions, scope names, item types) or where the member is
-//!   one of the wire format's fixed words ([`WORDS`]);
+//! - of each string, its value where it is too short to be key material (under [`SHORT`]
+//!   characters: positions, scope names, item types) or where the member is one of the wire
+//!   format's fixed words ([`WORDS`]);
+//! - of every other string (a key, a hash, a signature, an ID without a name), its length
+//!   and which string of the run it is: the same value gets the same number wherever it
+//!   shows. The values differ from run to run, so the comparison doesn't compare the
+//!   numbers themselves; it checks that two strings are the same in one run exactly where
+//!   they are the same in the other ([`crate::compare`]). A `prev` that isn't the hash
+//!   delivered before, a head whose `chain_hash` isn't the proof's, or a listed certificate
+//!   that isn't the one the record carries, shows;
 //! - inside each signed document and each base64url JSON value, the same facts again.
 //!
 //! An error's `message` is for people (Switch wire 7.6): it isn't kept.
@@ -22,7 +29,7 @@
 //! that where two switches write their members in different orders the allowed list says
 //! so once, instead of the comparison passing over it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use pubky_switch::http::route::route;
@@ -33,6 +40,8 @@ use pubky_switch_core::http::header;
 use pubky_switch_core::time::parse_rfc3339;
 use serde::de::{Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde_json::Value;
+
+use crate::HarnessError;
 
 /// The members whose string value is one of the wire format's fixed words or a name the
 /// flow chose, kept by value whatever its length: error codes, document kinds, operations,
@@ -81,9 +90,31 @@ pub struct Names {
 }
 
 impl Names {
-    /// Call `id` (a Pubky ID or an App ID, as text) `name` from now on.
-    pub fn add(&self, id: &str, name: &str) {
-        lock(&self.names).insert(id.to_owned(), name.to_owned());
+    /// Call `id` (a Pubky ID or an App ID, as text) `name` from now on. Naming it so again
+    /// changes nothing.
+    ///
+    /// # Errors
+    ///
+    /// When `name` already stands for another ID, or `id` already has another name: two
+    /// IDs under one name would read as one in the trace.
+    pub fn add(&self, id: &str, name: &str) -> Result<(), HarnessError> {
+        let mut names = lock(&self.names);
+        if let Some((other, _)) = names.iter().find(|(_, held)| *held == name)
+            && other != id
+        {
+            return Err(HarnessError::Setup(format!(
+                "the name {name} already stands for another ID"
+            )));
+        }
+        if let Some(held) = names.get(id)
+            && held != name
+        {
+            return Err(HarnessError::Setup(format!(
+                "the ID named {name} is already named {held}"
+            )));
+        }
+        names.insert(id.to_owned(), name.to_owned());
+        Ok(())
     }
 
     /// The name of `id`, if it has one.
@@ -142,6 +173,8 @@ pub struct Recorder {
     inner: Arc<dyn Transport>,
     names: Arc<Names>,
     lines: Mutex<Vec<Line>>,
+    /// The number of each long string the run showed, by its value, in order of appearance.
+    strings: Mutex<HashMap<String, usize>>,
     distortion: Mutex<Option<Distortion>>,
 }
 
@@ -161,6 +194,7 @@ impl Recorder {
             inner,
             names,
             lines: Mutex::new(Vec::new()),
+            strings: Mutex::new(HashMap::new()),
             distortion: Mutex::new(None),
         }
     }
@@ -179,6 +213,7 @@ impl Recorder {
         let mut facts = BTreeMap::new();
         Facts {
             names: &self.names,
+            strings: &self.strings,
             out: &mut facts,
             plain: true,
         }
@@ -205,7 +240,11 @@ impl Recorder {
         ) {
             (None, _) => "public".to_owned(),
             (Some(identity), None) => format!("{{{}}}", name(identity)),
-            (Some(identity), Some(app)) => format!("{{{}/{}}}", name(identity), name(app)),
+            // An app's name carries its identity's.
+            (Some(identity), Some(app)) => match self.names.of(app) {
+                Some(app) => format!("{{{app}}}"),
+                None => format!("{{{}/?}}", name(identity)),
+            },
         };
         let (path, _) = request
             .path_and_query
@@ -217,6 +256,7 @@ impl Recorder {
     fn request_facts(&self, request: &Request, out: &mut BTreeMap<String, String>) {
         let mut facts = Facts {
             names: &self.names,
+            strings: &self.strings,
             out,
             plain: false,
         };
@@ -240,6 +280,7 @@ impl Recorder {
     fn answer_facts(&self, answer: &Response, out: &mut BTreeMap<String, String>) {
         let mut facts = Facts {
             names: &self.names,
+            strings: &self.strings,
             out,
             plain: false,
         };
@@ -308,6 +349,7 @@ impl Transport for Recorder {
 /// Collects the facts of JSON values.
 struct Facts<'a> {
     names: &'a Names,
+    strings: &'a Mutex<HashMap<String, usize>>,
     out: &'a mut BTreeMap<String, String>,
     /// Keep every string by its value.
     plain: bool,
@@ -380,16 +422,41 @@ impl Facts<'_> {
             && let Some(carried) = carried_json(body)
         {
             // A compact signed document (Switch wire 2.2).
-            self.out.insert(
-                at.to_owned(),
-                format!("compact signed document, signature of {}", sig.len()),
-            );
+            self.out
+                .insert(at.to_owned(), "compact signed document".to_owned());
+            self.long(&format!("{at} signature"), sig);
             self.value(&format!("{at}~"), None, &carried);
         } else {
-            self.out
-                .insert(at.to_owned(), format!("string of {}", text.len()));
+            self.long(at, text);
         }
     }
+
+    /// The fact of a long string: its length, and its number among the run's long strings,
+    /// the same wherever the same value shows ([`string_number`] reads it back).
+    fn long(&mut self, at: &str, text: &str) {
+        let number = {
+            let mut strings = lock(self.strings);
+            let next = strings.len() + 1;
+            *strings.entry(text.to_owned()).or_insert(next)
+        };
+        self.out.insert(
+            at.to_owned(),
+            format!("string of {}{NUMBER}{number}", text.len()),
+        );
+    }
+}
+
+/// What sets a long string's number off from its length, as in `string of 43 #12`.
+const NUMBER: &str = " #";
+
+/// A long string's fact without its number, and the number: `("string of 43", 12)` of
+/// `string of 43 #12`. `None` for any other fact.
+pub fn string_number(fact: &str) -> Option<(&str, usize)> {
+    let (kept, number) = fact.rsplit_once(NUMBER)?;
+    if !kept.starts_with("string of ") {
+        return None;
+    }
+    Some((kept, number.parse().ok()?))
 }
 
 /// A JSON value as written: its objects' members in the order of the text, which a
@@ -500,10 +567,14 @@ mod tests {
 
     fn facts_of(value: &Value) -> BTreeMap<String, String> {
         let names = Names::default();
-        names.add("ybndrfg8ejkmcpqxot1uwisza345h769", "alice");
+        names
+            .add("ybndrfg8ejkmcpqxot1uwisza345h769", "alice")
+            .unwrap();
         let mut out = BTreeMap::new();
+        let strings = Mutex::new(HashMap::new());
         Facts {
             names: &names,
+            strings: &strings,
             out: &mut out,
             plain: false,
         }
@@ -535,8 +606,8 @@ mod tests {
         );
         assert_eq!(fact("body.identity"), Some("id {alice}"));
         assert_eq!(fact("body.code"), Some("text not_current"));
-        // A byte string: its length, never its value.
-        assert_eq!(fact("body.kid"), Some("string of 11"));
+        // A byte string: its length and its number in the run, never its value.
+        assert_eq!(fact("body.kid"), Some("string of 11 #1"));
         // Too short to be one: its value.
         assert_eq!(fact("body.next"), Some("text 1.4"));
         assert_eq!(fact("body.apps"), Some("array of 2"));
@@ -554,12 +625,16 @@ mod tests {
         );
         assert_eq!(
             carrying.get("body.head.sig").map(String::as_str),
-            Some("string of 86")
+            Some("string of 86 #1")
         );
         let compact = facts_of(&json!({ "cert": format!("{body}.{sig}") }));
         assert_eq!(
             compact.get("body.cert").map(String::as_str),
-            Some("compact signed document, signature of 86")
+            Some("compact signed document")
+        );
+        assert_eq!(
+            compact.get("body.cert signature").map(String::as_str),
+            Some("string of 86 #1")
         );
         assert_eq!(
             compact.get("body.cert~.seq").map(String::as_str),
@@ -574,7 +649,7 @@ mod tests {
         assert!(carried_json("eyJ-not-json").is_none());
         assert_eq!(
             facts.get("body.value").map(String::as_str),
-            Some("string of 12")
+            Some("string of 12 #1")
         );
     }
 
@@ -615,9 +690,35 @@ mod tests {
     }
 
     #[test]
+    fn test_long_strings_are_numbered_by_value() {
+        let facts = facts_of(&json!({
+            "first": "AAAAAAAAAAAAAAAAAAAAAA",
+            "other": "BBBBBBBBBBBBBBBBBBBBBB",
+            "same": "AAAAAAAAAAAAAAAAAAAAAA",
+        }));
+        let fact = |at: &str| facts.get(at).map(String::as_str);
+        assert_eq!(fact("body.first"), Some("string of 22 #1"));
+        assert_eq!(fact("body.other"), Some("string of 22 #2"));
+        assert_eq!(fact("body.same"), Some("string of 22 #1"));
+        assert_eq!(string_number("string of 22 #2"), Some(("string of 22", 2)));
+        assert_eq!(string_number("text 1.4"), None);
+        assert_eq!(string_number("number 4"), None);
+    }
+
+    #[test]
+    fn test_names_refuse_one_name_for_two_ids_and_two_names_for_one() {
+        let names = Names::default();
+        names.add("abc", "alice/wallet").unwrap();
+        names.add("abc", "alice/wallet").unwrap();
+        assert!(names.add("xyz", "alice/wallet").is_err());
+        assert!(names.add("abc", "bob/wallet").is_err());
+        assert_eq!(names.of("abc").as_deref(), Some("alice/wallet"));
+    }
+
+    #[test]
     fn test_names_replace_known_path_segments_only() {
         let names = Names::default();
-        names.add("abc", "alice");
+        names.add("abc", "alice").unwrap();
         assert_eq!(
             names.path("/v1/abc/apps/xyz/keys"),
             "/v1/{alice}/apps/xyz/keys"

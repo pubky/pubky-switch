@@ -1722,6 +1722,7 @@ dependencies = [
  "pubky-switch-signer",
  "serde",
  "serde_json",
+ "sqlx",
  "tempfile",
  "thiserror",
  "tokio",
