@@ -22,7 +22,28 @@ fails instead.
   entry that no longer shows.
 - `src/check.rs`: what the harness verifies itself in both runs (answer signatures, heads,
   chain stubs, feed items, transition proofs), and what it leaves to the client and the
-  signer.
+  signer. A failed check fails the flow's test and no allowed entry can cover it,
+  so every answer of the service and of the scripted switch passes these checks in every
+  flow.
+
+## Retries
+
+`World::lose_answer` and `World::unreachable` put a fault of the network in front of either
+switch: an answer lost after the switch took the request, or a request that never arrives.
+The retry flows send each of these again, and the service and the scripted switch answer
+every one alike:
+
+| Sent again | After | The answer to the retry |
+|---|---|---|
+| `POST /v1/enroll`, the same enrollment | a lost answer | the same service key |
+| `PUT /v1/{id}/identity`, the same bytes | a lost answer | the proof of the first try |
+| `PUT /v1/{id}/identity` | a failed connection | its proof |
+| the signer's `POST /v1/{id}/ops` (`cert.put`, `key_bundle.put`), the same batch | a lost answer | the original proofs |
+| an app's registration (`app.put`, `receive_key.put`), the same batch | a lost answer | the original proofs |
+| an app's `POST /v1/{id}/ops` (`allow.put`), the same batch | a lost answer | the original proof, at the current head |
+| a `cursor.set` alone | a lost answer | no proofs |
+| an app's `POST /v1/{id}/ops` (`allow.put`) | a failed connection | its proof |
+| `POST /v1/{id}/inbox`, the same envelope | a lost answer | the same `entry_id` and `accepted_at` |
 
 ## Adding a flow
 
