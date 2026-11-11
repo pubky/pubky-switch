@@ -1032,14 +1032,19 @@ impl App {
     /// stored locally as they are processed, processed pairs as they age out. It applies the
     /// bounds on entries stored unverified first, as a read does (Switch spec 8.2), so the
     /// backup holds at most [`MAX_UNVERIFIED_TOTAL`] of them, and keeps the duty events of
-    /// what they drop. So it needs a writable store, and those drops stay committed even
-    /// if the backup is then refused. An app a read wouldn't run on (stopped by an alarm,
-    /// left, or no longer current here) skips the bounds and only reads its store.
+    /// what they drop. Before them it takes a renewed certificate and settles a kept effect,
+    /// as a read does; a stored entry's effect still kept after that refuses the backup,
+    /// since a restore can't carry it. So it needs a writable store and may send the kept
+    /// effect again, and what it commits stays committed even if the backup is then
+    /// refused. An app a read wouldn't run on (stopped by an alarm, left, or no longer
+    /// current here) does none of this and only reads its store.
     ///
     /// # Errors
     ///
-    /// [`Refusal::NotNow`] for a protocol with no backup name; [`Refusal::Left`] or
-    /// [`Refusal::NotNow`] when there is nothing to back up; a store failure; as
+    /// [`Refusal::NotNow`] for a protocol with no backup name, or while a stored entry's
+    /// effect is kept and can't be settled now; [`Refusal::Left`] or [`Refusal::NotNow`]
+    /// when there is nothing to back up; the errors of settling a kept effect, as a read
+    /// has them; a store failure; as
     /// [`App::restore`] for a backup it would refuse, such as a layer the protocol refuses
     /// ([`AppError::InvalidData`]) or one over the store's sizes ([`AppError::Store`], with
     /// [`AppEvent::BackupRefused`]).
@@ -1055,6 +1060,26 @@ impl App {
             self.ready_local().await?;
             let halted = self.refuse_when_halted().is_err() || self.not_current_here().is_some();
             if !halted {
+                // What a read runs before its bounds, so they meet the same state: a renewed
+                // certificate taken, then a kept effect settled (`feed.rs`).
+                self.adopt_renewal().await?;
+                self.resume_pending_effect().await?;
+                // A restore never carries a kept effect: one still kept for a stored entry
+                // would leave the restored app holding that entry without it, unable to
+                // finish its outcome, and its bounds free to drop it. The backup waits until
+                // the effect settles.
+                if self
+                    .state
+                    .pending_effect
+                    .as_ref()
+                    .is_some_and(|pending| pending.stored.is_some())
+                {
+                    return Err(Refusal::NotNow(
+                        "a stored entry's effect is kept unsettled: a restore couldn't finish it"
+                            .into(),
+                    )
+                    .into());
+                }
                 self.bound_unverified().await?;
             }
             let reader = self.reader();

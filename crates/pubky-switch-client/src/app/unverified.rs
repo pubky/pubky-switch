@@ -130,12 +130,22 @@ impl App {
     /// drop every entry past them, at most [`UNVERIFIED_DROPS_PER_COMMIT`] per commit, each
     /// commit deleting the entries with their retry counts and keeping a
     /// [`super::AppEvent::StoredEntryDropped`] for each.
+    ///
+    /// The entry a kept effect belongs to ([`super::state::PendingEffect::stored`]) is
+    /// neither counted nor dropped, whoever calls this: its effect may have been applied,
+    /// and its outcome is finished only with it, by the app or by one restored from a
+    /// backup taken meanwhile. It is bounded again once its effect settles.
     pub(crate) async fn bound_unverified(&mut self) -> Result<(), AppError> {
+        let kept = self
+            .state
+            .pending_effect
+            .as_ref()
+            .and_then(|pending| pending.stored);
         let counted: Vec<Counted> = self
             .state
             .parked
             .iter()
-            .filter(|(_, stored)| stored.reason == ParkReason::Unverifiable)
+            .filter(|(id, stored)| stored.reason == ParkReason::Unverifiable && Some(**id) != kept)
             .map(|(id, stored)| Counted {
                 id: *id,
                 sender: stored.sender,

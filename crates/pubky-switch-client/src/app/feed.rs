@@ -1324,7 +1324,7 @@ impl App {
     }
 
     /// A kept effect from before a crash or a lost answer: sent again, the same bytes.
-    async fn resume_pending_effect(&mut self) -> Result<(), AppError> {
+    pub(crate) async fn resume_pending_effect(&mut self) -> Result<(), AppError> {
         let Some(pending) = self.state.pending_effect.clone() else {
             return Ok(());
         };

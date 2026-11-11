@@ -611,3 +611,73 @@ async fn test_unverified_bound_skipped_by_a_layered_backup_of_a_halted_app() {
     app.backup_layered().await.unwrap();
     assert_eq!(app.stored_seqs().len(), MAX_UNVERIFIED_TOTAL);
 }
+
+/// Alice's wallet holding 65 of bob's entries stored unverified, one over his bound, the
+/// one over accepted earliest, whose effect was applied and its answer lost, so the effect
+/// is kept. Returns that entry's `seq`.
+async fn over_with_a_kept_effect(w: &World, app: &mut App) -> u64 {
+    let bob = Peer {
+        identity: w.bob.clone(),
+        keys: w.bob_keys.clone(),
+        cert: w.bob_cert.clone(),
+    };
+    let seqs = stored_unverified(w, app, &[(&bob, MAX_UNVERIFIED_PER_SENDER)]).await;
+    let earliest = seqs[0][0];
+    w.homeserver.set_down(false);
+    w.switch
+        .fail_next(crate::testing::Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.receive(None).await.is_err());
+    let kept = app.state.pending_effect.as_ref().and_then(|p| p.stored);
+    assert_eq!(kept, app.stored_id_at(earliest));
+    let now = w.clock.now_ms();
+    write_stored(
+        app,
+        vec![entry_of(w, &bob, 10_000, now, ParkReason::Unverifiable)],
+    )
+    .await;
+    earliest
+}
+
+#[tokio::test]
+async fn test_unverified_bound_keeps_the_entry_a_kept_effect_belongs_to() {
+    // However the bounds are reached, they never drop the entry a kept effect belongs to:
+    // its effect may have been applied, and its outcome is finished only with it.
+    let w = World::new();
+    let mut app = wallet(&w, w.env()).await;
+    let earliest = over_with_a_kept_effect(&w, &mut app).await;
+    let kept = app.stored_id_at(earliest);
+    app.bound_unverified().await.unwrap();
+    assert_eq!(app.stored_id_at(earliest), kept);
+    let duties = app.kept_duties().await.unwrap();
+    assert!(dropped(&duties).iter().all(|(seq, _)| *seq != earliest));
+}
+
+#[tokio::test]
+async fn test_unverified_bound_layered_backup_settles_a_kept_effect_first() {
+    let w = World::new();
+    let mut app = wallet(&w, w.env()).await;
+    let earliest = over_with_a_kept_effect(&w, &mut app).await;
+    // While the kept effect can't be settled, no backup is taken: a restore couldn't
+    // finish the entry, and nothing is dropped.
+    w.switch
+        .fail_next(crate::testing::Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.backup_layered().await.is_err());
+    assert!(app.stored_id_at(earliest).is_some());
+    let duties = app.kept_duties().await.unwrap();
+    assert!(dropped(&duties).iter().all(|(seq, _)| *seq != earliest));
+    // Once it can, the backup settles it first, as a read does: the outcome is finished
+    // with the effect applied once, and the backup holds no trace of the entry to lose.
+    let backup = app.backup_layered().await.unwrap();
+    assert!(app.state.pending_effect.is_none());
+    assert_eq!(app.stored_id_at(earliest), None);
+    assert_eq!(w.effects(), 1);
+    let restored = App::restore(
+        w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
+        Arc::new(BackedUp::default()),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    assert_eq!(restored.stored_id_at(earliest), None);
+}
