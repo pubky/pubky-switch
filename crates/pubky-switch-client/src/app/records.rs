@@ -20,7 +20,7 @@
 //!   ignored and shown with the app it names (Switch spec 8.2).
 //! - **A write replaces the one held** only if it is newer by the core's rule
 //!   ([`WriteVersion::replaces`]), and only if the protocol finds it doesn't go back on what
-//!   the app has seen there ([`super::Protocol::record_regression`]). A write refused that
+//!   the app has seen there ([`super::Protocol::record_regression_on`]). A write refused that
 //!   way is flagged, its content not acted on, but its version followed, so the app's next
 //!   write builds on it and puts back the content it trusts (Switch spec 8.2).
 //! - **Listing** runs at join, after a restore, after a `missed` item, and after a certificate
@@ -40,7 +40,7 @@ use serde::{Deserialize, Serialize};
 use super::batch::OpBatch;
 use super::error::{Alarm, Refusal};
 use super::events::{AppEvent, Duty};
-use super::protocol::{MAX_REGRESSION_REASON_BYTES, MAX_SEEN_MARK_BYTES};
+use super::protocol::{MAX_REGRESSION_REASON_BYTES, MAX_SEEN_MARK_BYTES, WriteBase};
 use super::state::{Tx, key};
 use super::{App, AppError, IdentityRefresh};
 use crate::client::answers::{ChainItem, SharedRecordView};
@@ -1371,11 +1371,23 @@ impl App {
         }
         let seen: Option<SeenMark> = self.reader().get(&seen_key(&key)).await?;
         let new_value = accepted.content.value();
+        // What the write builds on, and whether the app holds it (Switch spec 8.2, 10.3).
+        let expected_version = accepted.version.expected_version;
+        let base = WriteBase {
+            expected_version,
+            held: match &held {
+                Some(held) => held.version == expected_version,
+                None => expected_version.is_none(),
+            },
+        };
         if !own
             && let Some(mark) = &seen
-            && let Some(reason) =
-                self.protocol
-                    .record_regression(&accepted.collection.name, &mark.mark, new_value)
+            && let Some(reason) = self.protocol.record_regression_on(
+                &accepted.collection.name,
+                &mark.mark,
+                new_value,
+                base,
+            )
         {
             let version = accepted.version.version;
             self.flag_write(&key, version, accepted.writer, reason, tx)

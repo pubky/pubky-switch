@@ -19,7 +19,7 @@ use super::*;
 use crate::app::{
     Alarm, AppError, AppEvent, ClaimOp, Collection, Delivery, IdentityRefresh,
     MAX_REGRESSION_REASON_BYTES, MAX_SEEN_MARK_BYTES, ObligationDeadline, OpBatch, OutgoingMessage,
-    RecordContent, RecordJob, RecordTarget, Refusal, SentMessage, UndeliverableReason,
+    RecordContent, RecordJob, RecordTarget, Refusal, SentMessage, UndeliverableReason, WriteBase,
     claim_conflict,
 };
 use crate::store::StoreHandle;
@@ -40,6 +40,8 @@ pub(crate) struct ItemsProtocol {
     pub(crate) pad: std::sync::Mutex<usize>,
     /// Bytes added to the next marks, one each, ahead of `pad`.
     pub(crate) pads: std::sync::Mutex<std::collections::VecDeque<usize>>,
+    /// What each newer write checked against a mark built on.
+    pub(crate) bases: std::sync::Mutex<Vec<WriteBase>>,
 }
 
 pub(crate) fn items() -> Collection {
@@ -126,6 +128,17 @@ impl Protocol for ItemsProtocol {
         let pad = pad.unwrap_or(*self.pad.lock().unwrap());
         mark.extend(std::iter::repeat_n(b' ', pad));
         Some(mark)
+    }
+
+    fn record_regression_on(
+        &self,
+        collection: &str,
+        seen: &[u8],
+        value: Option<&[u8]>,
+        base: WriteBase,
+    ) -> Option<String> {
+        self.bases.lock().unwrap().push(base);
+        self.record_regression(collection, seen, value)
     }
 
     fn record_regression(&self, _: &str, seen: &[u8], value: Option<&[u8]>) -> Option<String> {
@@ -1401,6 +1414,58 @@ async fn test_records_own_write_unmarkable_once_taken_drops_the_mark_held() {
     );
     let shared = phone.shared_record(&key).await.unwrap().unwrap();
     assert_eq!(ids(shared.content.value()), ["a", "c"]);
+}
+
+/// The later-write check is told what the write builds on, and whether the app holds that
+/// version: it does for a write read in the feed after the one it holds, and doesn't for
+/// the current view of a record written twice since.
+#[tokio::test]
+async fn test_records_regression_check_sees_the_write_base() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    let target = s.target("n1");
+    let key = wallet.record_key(&target).unwrap();
+    let version = |record: Option<crate::app::SharedRecord>| record.unwrap().version;
+    wallet
+        .put_record(&target, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    phone.receive(None).await.unwrap();
+    let first = version(phone.shared_record(&key).await.unwrap());
+    wallet
+        .put_record(&target, &value(&["a", "b"]), vec![])
+        .await
+        .unwrap();
+    phone.receive(None).await.unwrap();
+    let second = version(phone.shared_record(&key).await.unwrap());
+    assert_eq!(
+        *s.protocol.bases.lock().unwrap(),
+        vec![WriteBase {
+            expected_version: first,
+            held: true
+        }]
+    );
+    // Two writes later, the phone reads only the record's current view: it builds on the
+    // write after the one the phone holds.
+    wallet
+        .put_record(&target, &value(&["a", "b", "c"]), vec![])
+        .await
+        .unwrap();
+    let third = version(wallet.shared_record(&key).await.unwrap());
+    wallet
+        .put_record(&target, &value(&["a", "b", "c", "d"]), vec![])
+        .await
+        .unwrap();
+    let fourth = version(phone.read_record(&target).await.unwrap());
+    assert!(second < third && third < fourth);
+    assert_eq!(
+        s.protocol.bases.lock().unwrap().last(),
+        Some(&WriteBase {
+            expected_version: third,
+            held: false
+        })
+    );
 }
 
 #[tokio::test]

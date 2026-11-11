@@ -76,7 +76,7 @@ pub use protocol::{
     Effect, LOCAL_WRITE_OVERHEAD_BYTES, LocalWrite, MAX_CLAIM_READS, MAX_LOSS_CONVERSATIONS,
     MAX_REGRESSION_REASON_BYTES, MAX_SEEN_MARK_BYTES, MAX_STEP_LOCAL_BYTES, MissedEntries, Need,
     OpaqueRule, Outcome, PARKED_RETRIES_PER_READ, Protocol, ProtocolLayer, RETRY_EVENT_READS,
-    ReceivedMessage, ResendNeeded, ResendReason, StoreFailure, decode_local_state,
+    ReceivedMessage, ResendNeeded, ResendReason, StoreFailure, WriteBase, decode_local_state,
     encode_local_state, local_writes_bytes,
 };
 pub use provider::ProviderStatus;

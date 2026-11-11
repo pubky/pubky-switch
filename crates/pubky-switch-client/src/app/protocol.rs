@@ -29,7 +29,7 @@
 
 use pubky_switch_core::json::OpaqueMember;
 use pubky_switch_core::message::{Message, MessagePlaintext};
-use pubky_switch_core::ops::{Condition, OpKind};
+use pubky_switch_core::ops::{Condition, OpKind, RecordVersion};
 use pubky_switch_core::receive::KindRules;
 use pubky_switch_core::records::{AppCert, AppRecord, Standing};
 use serde_json::Value;
@@ -41,6 +41,21 @@ use super::recovery::{LossActions, ProviderLoss};
 use super::send::{RecordJob, SentMessage};
 use crate::error::StoreError;
 use crate::store::KeyValue;
+
+/// What a newer write of a record builds on, as the reading app sees it
+/// ([`Protocol::record_regression_on`], Switch spec 8.2, 10.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct WriteBase {
+    /// The version the write builds on: the `expected_version` its operation signed,
+    /// `{0, 0}` for a create.
+    pub expected_version: RecordVersion,
+    /// Whether the app holds that version: the write it holds of the record is at
+    /// `expected_version`, or, for a create, it holds none. `false` when the write builds
+    /// on a version the app never took, such as one it skipped by reading the record's
+    /// current view.
+    pub held: bool,
+}
 
 /// An opaque member of a protocol's message bodies (Switch wire 1.1): its numbers aren't
 /// checked against the integer range.
@@ -729,6 +744,25 @@ pub trait Protocol: Send + Sync {
     ) -> Option<String> {
         let _ = (collection, seen, value);
         None
+    }
+
+    /// [`Protocol::record_regression`], told what the newer write builds on
+    /// ([`WriteBase`]): its `expected_version`, and whether the app holds that version. A
+    /// protocol whose rules hold only for a writer that built on the value the app holds,
+    /// such as one that may drop only what it held itself, applies them when `base.held`.
+    /// The app calls this one; by default it calls [`Protocol::record_regression`], so a
+    /// protocol that implements only that keeps its rules as they are.
+    ///
+    /// The same bound on the rule applies, [`MAX_REGRESSION_REASON_BYTES`].
+    fn record_regression_on(
+        &self,
+        collection: &str,
+        seen: &[u8],
+        value: Option<&[u8]>,
+        base: WriteBase,
+    ) -> Option<String> {
+        let _ = base;
+        self.record_regression(collection, seen, value)
     }
 
     /// The name of the layers the protocol adds to app backups ([`ProtocolLayer`]):
