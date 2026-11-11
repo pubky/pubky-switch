@@ -84,11 +84,11 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   and keep nothing for it; they don't check the certificate's expiry (the service answers
   `403 cert_expired`), take any body, and answer `404` ("no route") for another app's path or
   the signer, where the service answers `403 permission_missing` (Switch wire 7.4.11).
-- **`POST /v1/enroll`** (Switch wire 3.7, 7.4.1), in `switch/signer.rs`: only at
-  [`SWITCH_ORIGIN`], with the default limits unless a test sets others
-  (`set_enroll_limits`), and without checking the request signature. A
-  switch made with `unenrolled` answers every other call with the operator's `404` until
-  then. As at the service, the enrollment that makes the account sets its kept App IDs, and
+- **`POST /v1/enroll`** (Switch wire 3.7, 7.4.1), in `switch/signer.rs`: at the switch's
+  origin, [`SWITCH_ORIGIN`] unless it was made with `unenrolled_at`, with the default limits
+  unless a test sets others (`set_enroll_limits`), and without checking the request
+  signature. A switch made with `unenrolled` or `unenrolled_at` answers every other call
+  with the operator's `404` until then. As at the service, the enrollment that makes the account sets its kept App IDs, and
   every later one gets the same key and changes nothing. Unlike the service:
   - an enrollment's `identity_doc` isn't held, so the account starts with no document and
     at the switch's own generation, whatever the enrollment names;
@@ -112,7 +112,7 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
     `cert_expires_at` carries that, and a signer that serves an app checks both. An app with
     no record is current while it is listed and not kept;
   - `last_seen`: the time of the app's latest request past authentication, a staged
-    account's refusal included. The scripted switch doesn't authenticate an own app's
+    account's refusal and its `leave` included. The scripted switch doesn't authenticate an own app's
     requests one by one: it takes any app with a record that isn't revoked, departed or kept
     as authenticated. So, unlike the service, it counts an app whose certificate expired or
     isn't listed, which the service refuses at authentication (`cert_expired`,
@@ -138,7 +138,8 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   `lagging` is false, as on the service. The test call `forget_bundle_parts` scripts a faulty service
   that lost an app's stored parts.
 - **Moves and recovery** (Switch spec 12.5, 12.6, Switch wire 10): `import_into` copies the
-  account in memory, with no manifest, chunks or export transfer; a recovery upload is kept
+  account in memory, with no manifest, chunks or export transfer, to serve at the origin the
+  freeze names (`import_into_at` names one for a move a test scripts without a freeze); a recovery upload is kept
   and answered with fixed changes, merging nothing.
 - **Revocation** is `POST /apps/{app_id}/revoke` from the signer, and the test call
   `revoke`; an app that left is answered as one revoked already, with no proof. `leave` is a
@@ -159,7 +160,10 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   and to its target, also when that target isn't current, where the service answers `403
   not_current` (Switch wire 7.2): so a test can script a faulty switch that serves a
   hand-over while holding no copy of the version handed over; the next `identity.json`
-  version, whoever delivered it, drops it.
+  version, whoever delivered it, drops it. Unlike the service, it serves the body it parsed
+  again as JSON, not the bytes the signer sent; it answers an own app's `PUT` `404` ("no
+  route") where the service answers `403 permission_missing` with the head, and an app of
+  another identity `403 not_admitted` where the service answers `403 permission_missing`.
   `stored_handover` names the target held; `stored_handover_body` and
   `store_handover_again` script a hand-over stored or served again after it was dropped.
 - **`Fault::LeaveOut`** scripts a faulty service whose answer to an own app or the signer
@@ -178,8 +182,8 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
 These signer flows run only against the scripted switch, whose `GET /apps` follows the
 service's rules (above). The service in this workspace serves `GET /apps`, `GET` and `POST
 /apps/{app_id}/keys` and `POST /apps/{app_id}/leave`, so the full-bundle requests, reading the
-stored parts and the departures can run against it now; the hand-over and the erasure wait for
-`PUT` and `GET /handover` and `POST /erase`:
+stored parts, the departures and the hand-over can run against it now (`PUT` and `GET
+/handover` too); the erasure waits for `POST /erase`:
 
 - approval, renewals and reductions, their closings, and epoch completion
   (`crates/pubky-switch-signer/tests/approval.rs`, `renewal.rs`);
@@ -189,6 +193,6 @@ stored parts and the departures can run against it now; the hand-over and the er
   (`flows.rs`);
 - restore from the signer backup, in place and on a new install (`restore.rs`);
 - the hand-over both ways, the abort, the take-over's checks and its lost answers, and which
-  copies delete a key (`handover.rs`);
+  copies delete a key (`handover.rs`), save the scripted faults;
 - the account's erasure, its lost answer, retry and refusal (`erasure.rs`): the service
   doesn't serve `POST /erase` yet.

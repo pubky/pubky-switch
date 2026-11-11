@@ -22,6 +22,7 @@ use pubky_switch_core::ops::{
     sign_batch,
 };
 use pubky_switch_core::records::{AppCert, Freeze, IdentityDoc};
+use pubky_switch_core::scopes::Permission;
 use pubky_switch_core::sig::SignedDoc;
 use pubky_switch_core::signing::Signs;
 use pubky_switch_core::time::rfc3339;
@@ -65,8 +66,8 @@ pub(crate) enum Item {
         item_type: ItemType,
         item: SignedDoc,
         proof: Option<SignedDoc>,
-        /// Shown in full only to this app (a key bundle part).
-        only_for: Option<[u8; 16]>,
+        /// Who may read it in full; every other app gets its stub (Switch wire 7.5).
+        readers: Readers,
     },
     Unreadable {
         seq: u64,
@@ -258,6 +259,8 @@ pub(crate) struct Inner {
     pub(crate) open_admission: bool,
     /// The `directory_version`: it moves whenever the directory changes.
     pub(crate) directory_version: u64,
+    /// The origin the switch serves at, which an enrollment names (Switch wire 3.7).
+    pub(crate) origin: String,
     /// The account's enrollment: its limits, and the answer to each enrollment taken, by
     /// enrollment hash. `None` for an account that doesn't exist until it is enrolled.
     pub(crate) enrolled: Option<signer::Enrolled>,
@@ -329,10 +332,11 @@ impl Inner {
             unreached: Vec::new(),
             peers: HashMap::new(),
             appended: HashMap::new(),
-            apps_version: 1,
+            apps_version: 0,
             reachable_since: BTreeMap::new(),
             open_admission: false,
-            directory_version: 1,
+            directory_version: 0,
+            origin: SWITCH_ORIGIN.to_owned(),
             enrolled: Some(signer::Enrolled::default()),
             kept_app_ids: Vec::new(),
             kept_at: 0,
@@ -365,11 +369,69 @@ impl std::fmt::Debug for ScriptedSwitch {
     }
 }
 
+/// An error answer (Switch wire 7.1, 7.6). `current` goes only where there is one: a writer
+/// omits an absent member rather than writing `null` (Switch wire, Conventions, "Absent and
+/// null"), so `Value::Null` stands for none.
 pub(crate) fn bad(code: ErrorCode, message: &str, current: Value) -> Answer {
-    (
-        code.status(),
-        json!({ "code": code.as_str(), "message": message, "current": current }),
-    )
+    let mut body = json!({ "code": code.as_str(), "message": message });
+    if !current.is_null() {
+        body["current"] = current;
+    }
+    (code.status(), body)
+}
+
+/// Who may read a chain item in full (Switch wire 7.5, "Who may read a chain item in
+/// full"); every other own app gets its stub. Taken when the item is appended; whether the
+/// item's document is still the current one is judged when a page is read, from the
+/// switch's state then, as the service does: a superseded document shows as a stub to
+/// every app.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Readers {
+    /// Every own app: `identity.json` deliveries, `receive_key.put`, and service
+    /// transitions other than `conversation.add`.
+    Every,
+    /// Apps holding this switch permission: `lists.read` for `allow.*`, `deny.*` and the
+    /// service's `conversation.add`.
+    Permission(Permission),
+    /// Apps with `lists.read` or `conversation.add`: `invite_code.*`.
+    ListsOrConversation,
+    /// Apps with `claims.read`, while the entry belongs to the claim held at this key and
+    /// that claim isn't a tombstone: a compacted or deleted claim's entries show as stubs
+    /// to every app (Switch wire 6.8 "Tombstones").
+    Claim(Vec<u8>),
+    /// Apps holding the read scope of the record at this key, while the item is its
+    /// current write: a `record.put`.
+    Record([u8; 32]),
+    /// The target app only, while the part is stored: a `key_bundle.put`.
+    Bundle([u8; 16]),
+    /// Every own app, while the writing app holds this record: an `app.put`. One without
+    /// a writing app shows as a stub.
+    AppRecord(Option<[u8; 16]>, SignedDoc),
+    /// Every own app, while the target holds this renewed certificate, neither replaced nor
+    /// carried by its record: a `cert.put`.
+    RenewedCert([u8; 16], SignedDoc),
+}
+
+impl Readers {
+    /// The readers of an operation of `kind` written by `app_id` (`None` for the signer).
+    pub(crate) fn of_op(kind: &OpKind, app_id: Option<&[u8; 16]>) -> Self {
+        match kind {
+            OpKind::Claim(fields) => Self::Claim(fields.claim_key.clone()),
+            OpKind::RecordPut(put) => Self::Record(put.key),
+            OpKind::AllowPut { .. }
+            | OpKind::AllowDelete { .. }
+            | OpKind::DenyPut { .. }
+            | OpKind::DenyDelete { .. } => Self::Permission(Permission::ListsRead),
+            OpKind::InviteCodePut(_) | OpKind::InviteCodeDelete { .. } => Self::ListsOrConversation,
+            OpKind::AppPut { record } => Self::AppRecord(app_id.copied(), record.clone()),
+            OpKind::ReceiveKeyPut { .. } => Self::Every,
+            OpKind::KeyBundlePut(put) => Self::Bundle(put.target_app_id),
+            OpKind::CertPut {
+                target_app_id,
+                cert,
+            } => Self::RenewedCert(*target_app_id, cert.clone()),
+        }
+    }
 }
 
 fn missing(what: &str) -> ScriptError {
@@ -440,20 +502,34 @@ impl ScriptedSwitch {
 
     /// The next service of a cooperative move, staged, with this account imported: the same
     /// sequence, chain, apps, cursors and shared state, under its own service key (Switch
-    /// spec 12.5 step 3). It serves once it is delivered an `identity.json` naming its key.
+    /// spec 12.5 step 3), at the origin the freeze names, or this switch's own when it isn't
+    /// frozen. It serves once it is delivered an `identity.json` naming that origin and its
+    /// key.
     pub fn import_into(&self, service_secret: [u8; 32]) -> Arc<Self> {
-        self.continue_into(service_secret, false)
+        self.continue_into(service_secret, false, None)
+    }
+
+    /// [`ScriptedSwitch::import_into`] at `origin`, whatever the freeze names: for a move
+    /// a test scripts without a freeze.
+    pub fn import_into_at(&self, service_secret: [u8; 32], origin: &str) -> Arc<Self> {
+        self.continue_into(service_secret, false, Some(origin))
     }
 
     /// The same account under a new service key at the next generation, a key change in
-    /// place: as [`ScriptedSwitch::import_into`], but the batch records keep their proofs,
+    /// place, at this switch's origin: as [`ScriptedSwitch::import_into`], but the batch
+    /// records keep their proofs,
     /// so a batch sent again unchanged gets its original proofs, signed with the earlier
     /// generation's key (Switch wire 6.4 step 6).
     pub fn change_key_into(&self, service_secret: [u8; 32]) -> Arc<Self> {
-        self.continue_into(service_secret, true)
+        self.continue_into(service_secret, true, None)
     }
 
-    fn continue_into(&self, service_secret: [u8; 32], keep_proofs: bool) -> Arc<Self> {
+    fn continue_into(
+        &self,
+        service_secret: [u8; 32],
+        keep_proofs: bool,
+        origin: Option<&str>,
+    ) -> Arc<Self> {
         let inner = self.lock();
         let mut next = Inner::fresh(
             clone_key(&inner.identity),
@@ -497,6 +573,16 @@ impl ScriptedSwitch {
         next.reachable_since = inner.reachable_since.clone();
         next.open_admission = inner.open_admission;
         next.directory_version = inner.directory_version;
+        // A key change in place serves where this switch does; the next service of a move
+        // serves where the freeze names it (Switch spec 12.5).
+        next.origin = match origin {
+            Some(origin) => origin.to_owned(),
+            None => inner
+                .frozen
+                .as_ref()
+                .and_then(|signed| Freeze::verify(signed, &inner.identity.public()).ok())
+                .map_or_else(|| inner.origin.clone(), |freeze| freeze.next().url.clone()),
+        };
         Arc::new(Self {
             inner: Mutex::new(next),
         })
@@ -743,7 +829,8 @@ impl ScriptedSwitch {
     }
 
     /// Deliver an own `identity.json` (the signer's `PUT /identity`): an `identity` chain
-    /// item. A document naming this switch's service key makes a staged switch serve.
+    /// item. A document naming this switch's origin and service key makes a staged switch
+    /// serve.
     ///
     /// # Errors
     ///
@@ -934,9 +1021,39 @@ impl ScriptedSwitch {
         Ok(inner.seq)
     }
 
+    /// The feed items `app` is shown, in order, read page by page through the feed route
+    /// itself (Switch wire 3.8, 7.4.4, 7.5), so a test judges what the route shows, with the
+    /// certificate the route checks the app against; the read isn't counted against a
+    /// scripted feed limit. Empty for an app the route refuses. For tests of what the fake
+    /// shows each app.
+    #[cfg(test)]
+    pub(crate) fn shown(&self, app: [u8; 16]) -> Vec<Value> {
+        let mut inner = self.lock();
+        let reads = inner.feed_reads;
+        let mut items = Vec::new();
+        let mut query = String::new();
+        loop {
+            let (status, page) = inner.feed(Some(app), &query);
+            if status != 200 {
+                break;
+            }
+            if let Some(shown) = page["items"].as_array() {
+                items.extend(shown.iter().cloned());
+            }
+            match (page["more"].as_bool(), page["next"].as_str()) {
+                (Some(true), Some(next)) => query = format!("after={next}"),
+                _ => break,
+            }
+        }
+        inner.feed_reads = reads;
+        items
+    }
+
     /// Chain an operation without checking it, as a faulty service does, and store a key
-    /// bundle part it carries; nothing else is applied. For tests of what an app does with
-    /// an item a compliant switch refuses.
+    /// bundle part or a renewed certificate it carries, so the feed shows that item in full
+    /// to its readers; nothing else is applied, so an unchecked `record.put`, `claim` or
+    /// `app.put` has no current document and shows as a stub to every app. For tests of what
+    /// an app does with an item a compliant switch refuses.
     #[cfg(test)]
     pub(crate) fn chain_unchecked(
         &self,
@@ -947,10 +1064,6 @@ impl ScriptedSwitch {
         let mut inner = self.lock();
         let account = inner.identity.public();
         let generation = inner.tip.generation;
-        let only_for = match &kind {
-            OpKind::KeyBundlePut(put) => Some(put.target_app_id),
-            _ => None,
-        };
         let ops = sign_batch(
             writer,
             &account,
@@ -966,6 +1079,14 @@ impl ScriptedSwitch {
                 let parts = inner.bundles.entry(put.target_app_id).or_default();
                 parts.push((put.clone(), seq));
             }
+            if let OpKind::CertPut {
+                target_app_id,
+                cert,
+            } = &body.kind
+            {
+                let renewed = AppCert::verify(cert, &account)?;
+                inner.apps.entry(*target_app_id).or_default().renewed = Some(renewed);
+            }
             let object = body
                 .kind
                 .proof_object(body.app_id.as_ref())
@@ -977,7 +1098,7 @@ impl ScriptedSwitch {
                 Some(body.batch),
                 &object,
                 &ProofState::Deny { denied: false },
-                only_for,
+                Readers::of_op(&body.kind, body.app_id.as_ref()),
             )?;
         }
         Ok(inner.seq)
@@ -1155,7 +1276,7 @@ impl Inner {
         batch: Option<BatchRef>,
         object: &str,
         state: &ProofState,
-        only_for: Option<[u8; 16]>,
+        readers: Readers,
     ) -> Result<SignedDoc, ScriptError> {
         let seq = self.next_seq();
         let now = self.now();
@@ -1173,7 +1294,7 @@ impl Inner {
             item_type,
             item,
             proof: Some(proof.signed().clone()),
-            only_for,
+            readers,
         });
         Ok(proof.signed().clone())
     }
@@ -1221,7 +1342,25 @@ impl Inner {
         let hash = item_hash(ItemType::Service, &signed.doc_bytes()?);
         let object = transition.proof_object().unwrap_or_default();
         let state = ProofState::Service(transition.to_value());
-        self.chain_item(ItemType::Service, signed, hash, None, &object, &state, None)
+        let readers = match transition {
+            ServiceTransition::ConversationAdd { .. } => Readers::Permission(Permission::ListsRead),
+            ServiceTransition::Revoke { .. }
+            | ServiceTransition::Leave { .. }
+            | ServiceTransition::Freeze { .. }
+            | ServiceTransition::Unfreeze { .. }
+            | ServiceTransition::Recovery { .. }
+            | ServiceTransition::Admission { .. }
+            | ServiceTransition::Upload { .. } => Readers::Every,
+        };
+        self.chain_item(
+            ItemType::Service,
+            signed,
+            hash,
+            None,
+            &object,
+            &state,
+            readers,
+        )
     }
 
     /// The answer an account gives every call `method` `path` makes, before routing: an
@@ -1320,13 +1459,18 @@ impl Inner {
                 let at = *held.full_requested.get_or_insert(now);
                 (200, json!({ "requested": rfc3339(at) }))
             }
-            ("POST", r) if r == own_leave => match self.leave(app)? {
-                Some(proof) => (
-                    200,
-                    json!({ "proofs": [proof], "head": self.head().to_value() }),
-                ),
-                None => bad(ErrorCode::NotCurrent, "departed", json!({})),
-            },
+            // The leave is the app's latest request past authentication (Switch wire 7.4.12
+            // `last_seen`), seen before it departs the app.
+            ("POST", r) if r == own_leave => {
+                self.seen(request);
+                match self.leave(app)? {
+                    Some(proof) => (
+                        200,
+                        json!({ "proofs": [proof], "head": self.head().to_value() }),
+                    ),
+                    None => bad(ErrorCode::NotCurrent, "departed", json!(null)),
+                }
+            }
             _ => bad(ErrorCode::NotFound, "no route", json!(null)),
         })
     }
@@ -1363,9 +1507,12 @@ impl Inner {
         let Some(app) = caller else {
             return bad(ErrorCode::PermissionMissing, "own apps only", json!(null));
         };
-        if let Err(refusal) = self.own_call(&app) {
-            return batch::refused(&refusal);
-        }
+        // Visibility is judged with the certificate the app is checked against: a stored
+        // renewed one once the newest `identity.json` lists it (Switch wire 3.8, 7.5).
+        let cert = match self.own_call(&app) {
+            Ok(cert) => cert,
+            Err(refusal) => return batch::refused(&refusal),
+        };
         if self
             .feed_limit
             .is_some_and(|limit| self.feed_reads >= limit)
@@ -1412,7 +1559,7 @@ impl Inner {
             }
             let shown: Vec<Value> = group
                 .iter()
-                .filter_map(|item| self.show(item, app))
+                .filter_map(|item| self.show(item, app, Some(&cert)))
                 .collect();
             let size: usize = shown.iter().map(|value| value.to_string().len()).sum();
             // The byte budget ends a page before a group that would pass it, but the page's
@@ -1448,12 +1595,60 @@ impl Inner {
         (200, page)
     }
 
+    /// Whether own app `app`, checked against `cert`, reads chain item `seq` in full: it is
+    /// among the item's `readers`, and the item's document is still the current one (Switch
+    /// wire 7.5).
+    fn reads_in_full(
+        &self,
+        readers: &Readers,
+        seq: u64,
+        app: [u8; 16],
+        cert: Option<&AppCert>,
+    ) -> bool {
+        let holds = |permission| cert.is_some_and(|c| c.has_permission(permission));
+        match readers {
+            Readers::Every => true,
+            Readers::Permission(permission) => holds(*permission),
+            Readers::ListsOrConversation => {
+                holds(Permission::ListsRead) || holds(Permission::ConversationAdd)
+            }
+            Readers::Claim(key) => {
+                holds(Permission::ClaimsRead)
+                    && <[u8; 32]>::try_from(key.as_slice())
+                        .is_ok_and(|key| self.shared.claim_entry_current(&key, seq))
+            }
+            Readers::Record(key) => self.shared.records.get(key).is_some_and(|held| {
+                held.seq == seq
+                    && cert.is_some_and(|c| c.holds_scope(&held.state.policy.read_scope))
+            }),
+            Readers::Bundle(target) => {
+                *target == app
+                    && self
+                        .bundles
+                        .get(target)
+                        .is_some_and(|parts| parts.iter().any(|(_, at)| *at == seq))
+            }
+            Readers::AppRecord(writer, record) => writer.is_some_and(|writer| {
+                self.apps
+                    .get(&writer)
+                    .is_some_and(|held| held.record.as_ref() == Some(record))
+            }),
+            Readers::RenewedCert(target, renewed) => self
+                .apps
+                .get(target)
+                .and_then(|held| held.renewed.as_ref())
+                .is_some_and(|held| held.signed() == renewed),
+        }
+    }
+
     /// An entry ID for the item at `seq`: its low byte, repeated.
     fn entry_id(seq: u64) -> String {
         b64(&[seq.to_le_bytes()[0]; 16])
     }
 
-    fn show(&self, item: &Item, app: [u8; 16]) -> Option<Value> {
+    /// How `item` shows to own app `app`, checked against `cert` (Switch wire 7.5); `None`
+    /// for an item it isn't shown at all.
+    fn show(&self, item: &Item, app: [u8; 16], cert: Option<&AppCert>) -> Option<Value> {
         Some(match item {
             Item::Entry {
                 seq,
@@ -1482,12 +1677,12 @@ impl Inner {
                 item_type,
                 item,
                 proof,
-                only_for,
+                readers,
             } => {
                 if *seq <= self.dropped_through {
                     return None;
                 }
-                if only_for.is_some_and(|target| target != app) {
+                if !self.reads_in_full(readers, *seq, app, cert) {
                     return Some(json!({ "type": "stub", "seq": seq, "stub": stub.to_value() }));
                 }
                 let mut value = json!({ "type": "chain", "seq": seq, "stub": stub.to_value(),
@@ -1643,14 +1838,21 @@ impl Inner {
         }
     }
 
+    /// `GET /directory` (Switch wire 7.4.10): the current apps holding a record, in the
+    /// order the newest `identity.json` lists them, as the service lists them. Current, not
+    /// served: an app whose certificate has expired stays (Switch spec 3.4).
     fn directory(&self) -> Answer {
-        let apps: Vec<Value> = self
-            .apps
-            .iter()
-            .filter(|(_, app)| !app.departed && app.record.is_some())
-            .map(|(id, app)| {
-                json!({ "app_id": zbase32_encode(id), "record": app.record,
-                        "receive_key": app.receive_key })
+        let listed = self.doc.iter().flat_map(|doc| &doc.body().apps);
+        let apps: Vec<Value> = listed
+            .filter(|entry| {
+                !self.kept_app_ids.contains(&entry.app_id)
+                    && self.app_current_by(&self.apps, &entry.app_id, false)
+            })
+            .filter_map(|entry| {
+                let app = self.apps.get(&entry.app_id)?;
+                Some(json!({ "app_id": zbase32_encode(&entry.app_id),
+                             "record": app.record.as_ref()?,
+                             "receive_key": app.receive_key }))
             })
             .collect();
         (
