@@ -1377,3 +1377,25 @@ async fn test_take_back_asked_again_after_a_refusal_is_the_same_bytes() {
     assert_eq!(back.signed(), first.signed());
     assert_eq!(world.distinct_requests("PUT", "/identity"), distinct + 1);
 }
+
+#[tokio::test]
+async fn test_resume_take_over_opens_a_take_over_that_won() {
+    // The host calls `resume_take_over` again after the take-over won: it opens the signer
+    // with the vault's keyring instead of refusing.
+    let world = World::new();
+    let mut s = setup(&world).await;
+    s.old.hand_over_to(s.app_id(), confirmed()).await.unwrap();
+    let store = Arc::new(MemoryStore::new());
+    let vault = empty_vault();
+    let new = Signer::receive_hand_over(world.env(store.clone()), &s.target, vault.clone())
+        .await
+        .unwrap();
+    let install = new.install_id();
+    drop(new);
+    let again =
+        Signer::resume_take_over(world.env(store), world.key.public(), &s.target.keys, vault)
+            .await
+            .unwrap();
+    assert_eq!(again.status(), SignerStatus::Signing);
+    assert_eq!(again.install_id(), install);
+}
