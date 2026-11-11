@@ -22,6 +22,7 @@ use pubky_switch_core::ops::{
     sign_batch,
 };
 use pubky_switch_core::records::{AppCert, Freeze, IdentityDoc};
+use pubky_switch_core::scopes::Permission;
 use pubky_switch_core::sig::SignedDoc;
 use pubky_switch_core::signing::Signs;
 use pubky_switch_core::time::rfc3339;
@@ -65,8 +66,8 @@ pub(crate) enum Item {
         item_type: ItemType,
         item: SignedDoc,
         proof: Option<SignedDoc>,
-        /// Shown in full only to this app (a key bundle part).
-        only_for: Option<[u8; 16]>,
+        /// Who may read it in full; every other app gets its stub (Switch wire 7.5).
+        readers: Readers,
     },
     Unreadable {
         seq: u64,
@@ -258,6 +259,8 @@ pub(crate) struct Inner {
     pub(crate) open_admission: bool,
     /// The `directory_version`: it moves whenever the directory changes.
     pub(crate) directory_version: u64,
+    /// The origin the switch serves at, which an enrollment names (Switch wire 3.7).
+    pub(crate) origin: String,
     /// The account's enrollment: its limits, and the answer to each enrollment taken, by
     /// enrollment hash. `None` for an account that doesn't exist until it is enrolled.
     pub(crate) enrolled: Option<signer::Enrolled>,
@@ -329,10 +332,11 @@ impl Inner {
             unreached: Vec::new(),
             peers: HashMap::new(),
             appended: HashMap::new(),
-            apps_version: 1,
+            apps_version: 0,
             reachable_since: BTreeMap::new(),
             open_admission: false,
-            directory_version: 1,
+            directory_version: 0,
+            origin: SWITCH_ORIGIN.to_owned(),
             enrolled: Some(signer::Enrolled::default()),
             kept_app_ids: Vec::new(),
             kept_at: 0,
@@ -365,11 +369,64 @@ impl std::fmt::Debug for ScriptedSwitch {
     }
 }
 
+/// An error answer (Switch wire 7.1, 7.6). `current` goes only where there is one: a writer
+/// omits an absent member rather than writing `null` (Switch wire, Conventions, "Absent and
+/// null"), so `Value::Null` stands for none.
 pub(crate) fn bad(code: ErrorCode, message: &str, current: Value) -> Answer {
-    (
-        code.status(),
-        json!({ "code": code.as_str(), "message": message, "current": current }),
-    )
+    let mut body = json!({ "code": code.as_str(), "message": message });
+    if !current.is_null() {
+        body["current"] = current;
+    }
+    (code.status(), body)
+}
+
+/// Who may read a chain item in full (Switch wire 7.5, "Who may read a chain item in
+/// full"); every other own app gets its stub.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Readers {
+    /// Every own app: `identity.json` deliveries, `app.put`, `receive_key.put`,
+    /// `cert.put`, and service transitions other than `conversation.add`.
+    Every,
+    /// The target app only: a `key_bundle.put`.
+    App([u8; 16]),
+    /// Apps holding this switch permission: `claims.read` for a claim entry, `lists.read`
+    /// for `allow.*`, `deny.*` and the service's `conversation.add`.
+    Permission(Permission),
+    /// Apps with `lists.read` or `conversation.add`: `invite_code.*`.
+    ListsOrConversation,
+    /// Apps holding the record's read scope: a `record.put`.
+    Scope(String),
+}
+
+impl Readers {
+    /// The readers of an operation of `kind`.
+    pub(crate) fn of_op(kind: &OpKind) -> Self {
+        match kind {
+            OpKind::Claim(_) => Self::Permission(Permission::ClaimsRead),
+            OpKind::RecordPut(put) => Self::Scope(put.policy.read_scope.clone()),
+            OpKind::AllowPut { .. }
+            | OpKind::AllowDelete { .. }
+            | OpKind::DenyPut { .. }
+            | OpKind::DenyDelete { .. } => Self::Permission(Permission::ListsRead),
+            OpKind::InviteCodePut(_) | OpKind::InviteCodeDelete { .. } => Self::ListsOrConversation,
+            OpKind::KeyBundlePut(put) => Self::App(put.target_app_id),
+            _ => Self::Every,
+        }
+    }
+
+    /// Whether `app`, with certificate `cert`, reads the item in full.
+    fn read_by(&self, app: [u8; 16], cert: Option<&AppCert>) -> bool {
+        let holds = |permission| cert.is_some_and(|c| c.has_permission(permission));
+        match self {
+            Self::Every => true,
+            Self::App(target) => *target == app,
+            Self::Permission(permission) => holds(*permission),
+            Self::ListsOrConversation => {
+                holds(Permission::ListsRead) || holds(Permission::ConversationAdd)
+            }
+            Self::Scope(scope) => cert.is_some_and(|c| c.holds_scope(scope)),
+        }
+    }
 }
 
 fn missing(what: &str) -> ScriptError {
@@ -934,6 +991,18 @@ impl ScriptedSwitch {
         Ok(inner.seq)
     }
 
+    /// The feed items `app` is shown, in order, as its feed would page them (Switch wire
+    /// 7.4.4, 7.5): for tests of what the fake shows each app.
+    #[cfg(test)]
+    pub(crate) fn shown(&self, app: [u8; 16]) -> Vec<Value> {
+        let inner = self.lock();
+        inner
+            .items
+            .iter()
+            .filter_map(|item| inner.show(item, app))
+            .collect()
+    }
+
     /// Chain an operation without checking it, as a faulty service does, and store a key
     /// bundle part it carries; nothing else is applied. For tests of what an app does with
     /// an item a compliant switch refuses.
@@ -947,10 +1016,6 @@ impl ScriptedSwitch {
         let mut inner = self.lock();
         let account = inner.identity.public();
         let generation = inner.tip.generation;
-        let only_for = match &kind {
-            OpKind::KeyBundlePut(put) => Some(put.target_app_id),
-            _ => None,
-        };
         let ops = sign_batch(
             writer,
             &account,
@@ -977,7 +1042,7 @@ impl ScriptedSwitch {
                 Some(body.batch),
                 &object,
                 &ProofState::Deny { denied: false },
-                only_for,
+                Readers::of_op(&body.kind),
             )?;
         }
         Ok(inner.seq)
@@ -1155,7 +1220,7 @@ impl Inner {
         batch: Option<BatchRef>,
         object: &str,
         state: &ProofState,
-        only_for: Option<[u8; 16]>,
+        readers: Readers,
     ) -> Result<SignedDoc, ScriptError> {
         let seq = self.next_seq();
         let now = self.now();
@@ -1173,7 +1238,7 @@ impl Inner {
             item_type,
             item,
             proof: Some(proof.signed().clone()),
-            only_for,
+            readers,
         });
         Ok(proof.signed().clone())
     }
@@ -1221,7 +1286,19 @@ impl Inner {
         let hash = item_hash(ItemType::Service, &signed.doc_bytes()?);
         let object = transition.proof_object().unwrap_or_default();
         let state = ProofState::Service(transition.to_value());
-        self.chain_item(ItemType::Service, signed, hash, None, &object, &state, None)
+        let readers = match transition {
+            ServiceTransition::ConversationAdd { .. } => Readers::Permission(Permission::ListsRead),
+            _ => Readers::Every,
+        };
+        self.chain_item(
+            ItemType::Service,
+            signed,
+            hash,
+            None,
+            &object,
+            &state,
+            readers,
+        )
     }
 
     /// The answer an account gives every call `method` `path` makes, before routing: an
@@ -1482,12 +1559,13 @@ impl Inner {
                 item_type,
                 item,
                 proof,
-                only_for,
+                readers,
             } => {
                 if *seq <= self.dropped_through {
                     return None;
                 }
-                if only_for.is_some_and(|target| target != app) {
+                let cert = self.apps.get(&app).and_then(|held| held.cert.as_ref());
+                if !readers.read_by(app, cert) {
                     return Some(json!({ "type": "stub", "seq": seq, "stub": stub.to_value() }));
                 }
                 let mut value = json!({ "type": "chain", "seq": seq, "stub": stub.to_value(),

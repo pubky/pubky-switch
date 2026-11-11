@@ -43,11 +43,23 @@ impl ScriptedSwitch {
         service_secret: [u8; 32],
         clock: Arc<TestClock>,
     ) -> Arc<Self> {
+        Self::unenrolled_at(identity, service_secret, clock, SWITCH_ORIGIN)
+    }
+
+    /// [`ScriptedSwitch::unenrolled`], at `origin`: the origin an enrollment must name, so
+    /// two signers can enroll at two scripted switches of different origins.
+    pub fn unenrolled_at(
+        identity: &pubky_switch_core::keys::IdentityKey,
+        service_secret: [u8; 32],
+        clock: Arc<TestClock>,
+        origin: &str,
+    ) -> Arc<Self> {
         let switch = Self::new(identity, service_secret, clock);
         {
             let mut inner = switch.lock();
             inner.enrolled = None;
             inner.staged = true;
+            inner.origin = origin.to_owned();
         }
         switch
     }
@@ -137,7 +149,7 @@ impl Inner {
         else {
             return Ok(bad(ErrorCode::BadRequest, "no enrollment", json!(null)));
         };
-        let enrollment = match Enrollment::verify(&signed, &identity, SWITCH_ORIGIN) {
+        let enrollment = match Enrollment::verify(&signed, &identity, &self.origin) {
             Ok(enrollment) => enrollment,
             Err(_) => return Ok(bad(ErrorCode::BadRequest, "bad enrollment", json!(null))),
         };
@@ -197,7 +209,7 @@ impl Inner {
             None,
             "identity",
             &state,
-            None,
+            super::Readers::Every,
         )?;
         // A first listing is kept, as the service keeps it, only for an app with no row and
         // no stored part yet; any other's holdings start unknown (Switch wire 7.4.12).
@@ -258,7 +270,7 @@ impl Inner {
             held: self.doc.as_ref(),
             app_limit,
             staged: self.staged,
-            origin: SWITCH_ORIGIN,
+            origin: &self.origin,
             pending_key: None,
             kept_app_ids: &kept,
             kept_proofs: KeptProofs {

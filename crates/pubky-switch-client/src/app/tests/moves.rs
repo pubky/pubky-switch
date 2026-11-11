@@ -2048,7 +2048,13 @@ async fn test_claim_entry_of_an_earlier_generation_in_the_feed_is_kept() {
         router.env(&w, Arc::clone(&phone_store) as Arc<dyn StateStore>),
         w.protocol.clone(),
         World::config(),
-        w.approve(&app_keys("phone"), &["scope-a"]),
+        // `claims.read`, to read the claim entry in full (Switch wire 7.5).
+        w.signer
+            .approve(
+                &app_keys("phone"),
+                &AppSpec::new(&["scope-a"]).with_permissions(&[Permission::ClaimsRead]),
+            )
+            .unwrap(),
     )
     .await
     .unwrap();

@@ -264,6 +264,31 @@ mod tests {
     use crate::error::TransportError;
     use crate::transport::{Request, Transport};
 
+    #[test]
+    fn test_scripted_error_body_omits_an_absent_current() {
+        // Switch wire, Conventions, "Absent and null": a writer omits an absent member.
+        let (_, body) = switch::bad(
+            pubky_switch_core::http::ErrorCode::NotFound,
+            "x",
+            serde_json::Value::Null,
+        );
+        assert!(body.get("current").is_none(), "{body}");
+        let (_, body) = switch::bad(
+            pubky_switch_core::http::ErrorCode::Conflict,
+            "x",
+            json!({ "server_time": 1 }),
+        );
+        assert_eq!(body["current"], json!({ "server_time": 1 }));
+    }
+
+    #[test]
+    fn test_scripted_versions_start_at_zero_as_the_services() {
+        let identity = pubky_switch_core::keys::IdentityKey::from_secret([3; 32]);
+        let switch = ScriptedSwitch::new(&identity, [4; 32], Arc::new(TestClock::new(0)));
+        assert_eq!(switch.apps_version(), 0);
+        assert_eq!(switch.lock().directory_version, 0);
+    }
+
     fn request(origin: &str, path: &str) -> Request {
         Request {
             method: "GET".into(),

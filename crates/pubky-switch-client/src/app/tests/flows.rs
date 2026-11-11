@@ -4140,3 +4140,48 @@ async fn test_submit_batch_local_writes_over_the_bound_are_refused_unkept() {
     assert!(app.kept_batches().await.unwrap().is_empty());
     assert_eq!(conversations_for(&w, w.bob.public()), 0);
 }
+
+/// An own app of alice's, `name`, holding `permissions`, joined on its own store.
+async fn join_holding(w: &World, name: &str, permissions: &[Permission]) -> App {
+    let request = w
+        .signer
+        .approve(
+            &app_keys(name),
+            &AppSpec::new(&["scope-a"]).with_permissions(permissions),
+        )
+        .unwrap();
+    App::join(
+        w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
+        w.protocol.clone(),
+        World::config(),
+        request,
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn test_scripted_feed_shows_an_allow_put_in_full_only_to_lists_read() {
+    // Switch wire 7.5: `allow.*` is read in full by apps with `lists.read`. An app with
+    // `lists.manage` alone writes a contact and is shown its own `allow.put` as a stub.
+    let w = World::new();
+    let mut manager = join_holding(&w, "manager", &[Permission::ListsManage]).await;
+    let reader = join_holding(&w, "reader", &[Permission::ListsRead]).await;
+    let before = w.switch.shown(manager.app_id()).len();
+    manager.add_contact(&w.bob.public()).await.unwrap();
+    let shown = w.switch.shown(manager.app_id());
+    let put = shown[before..]
+        .iter()
+        .find(|item| item.get("stub").is_some())
+        .expect("the allow.put's item");
+    assert_eq!(put["type"], "stub", "{put}");
+    let seq = put["seq"].clone();
+    let full = w
+        .switch
+        .shown(reader.app_id())
+        .into_iter()
+        .find(|item| item["seq"] == seq)
+        .unwrap();
+    assert_eq!(full["type"], "chain", "{full}");
+    assert_eq!(full["item_type"], "op");
+}

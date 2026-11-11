@@ -21,7 +21,7 @@ use pubky_switch_core::sig::SignedDoc;
 use serde_json::{Value, json};
 
 use super::shared::{Before, OpContext, Shared, Written};
-use super::{Answer, Inner, SwitchApp, missing};
+use super::{Answer, Inner, Readers, SwitchApp, missing};
 use crate::testing::ScriptError;
 
 /// Why a batch ends: a refusal the switch answers, or a failure of the script itself.
@@ -273,7 +273,7 @@ impl Inner {
         // Step 11: the chain items and their proofs, then the state, all at once.
         let first_seq = self.seq + 1;
         let mut proofs = Vec::with_capacity(ops.len());
-        for (op, (state, only_for)) in ops.iter().zip(states) {
+        for (op, state) in ops.iter().zip(states) {
             let body = op.body();
             let object = body
                 .kind
@@ -286,7 +286,7 @@ impl Inner {
                 Some(body.batch),
                 &object,
                 &state,
-                only_for,
+                Readers::of_op(&body.kind),
             )?;
             let written = Written {
                 op,
@@ -436,7 +436,7 @@ impl Inner {
     }
 
     /// One operation's own rules (Switch wire 6.2, 6.8), against `draft`, which it changes:
-    /// the proof's state, and the app a key bundle part is shown in full to.
+    /// the proof's state.
     fn apply_op(
         &self,
         draft: &mut Draft,
@@ -444,7 +444,7 @@ impl Inner {
         cx: &OpContext<'_>,
         cert: Option<&AppCert>,
         seq: u64,
-    ) -> Result<(ProofState, Option<[u8; 16]>), Fail> {
+    ) -> Result<ProofState, Fail> {
         let body = op.body();
         let generation = self.tip.generation;
         // `check_permission` let only an app write its own record and receive key.
@@ -469,14 +469,14 @@ impl Inner {
             }
             OpKind::KeyBundlePut(put) => {
                 let state = self.key_bundle_put(draft, put, seq)?;
-                return Ok((state, Some(put.target_app_id)));
+                return Ok(state);
             }
             OpKind::CertPut {
                 target_app_id,
                 cert,
             } => self.cert_put(draft, target_app_id, cert)?,
         };
-        Ok((state, None))
+        Ok(state)
     }
 
     /// `app.put`, by [`check_app_put`]; a stored record changes the directory (Switch wire
