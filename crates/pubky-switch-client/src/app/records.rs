@@ -835,7 +835,7 @@ impl App {
         shown_key: [u8; 32],
         tx: &mut Tx,
     ) -> Result<(), AppError> {
-        let mut outcome = self.accept_write(evidence, expect).await?;
+        let mut outcome = self.accept_write(evidence, expect, tx).await?;
         let mut version = evidence
             .stub
             .map(|env| RecordVersion::new(env.generation, env.seq))
@@ -860,7 +860,7 @@ impl App {
                         stub: None,
                         view_version: Some(version),
                     };
-                    self.accept_write(&evidence, Some((&shown_key, &collection)))
+                    self.accept_write(&evidence, Some((&shown_key, &collection)), tx)
                         .await?
                 }
                 None => Err(Refused::Ignored),
@@ -917,10 +917,13 @@ impl App {
     // ---------------------------------------------------------------------------------
     // The checks of Switch wire 6.2 "Accepting a write"
 
+    /// `tx` is the transaction at hand, whose certificates kept but not committed yet
+    /// count as known.
     async fn accept_write(
         &mut self,
         evidence: &Evidence<'_>,
         expect: Option<(&[u8; 32], &Collection)>,
+        tx: &Tx,
     ) -> Result<Result<Accepted, Refused>, AppError> {
         let identity = self.state.meta.identity;
         let Ok(peeked) = SignedOp::peek(evidence.op) else {
@@ -961,7 +964,17 @@ impl App {
         // The member of the collection's policy family the write names.
         let collection = Collection::new(&collection.name, put.policy.clone());
         // Step 1: the writer's certificates and the signature.
-        let Some(certs) = self.writer_certs(evidence, &writer).await? else {
+        let Some(certs) = self.writer_certs(evidence, &writer, tx).await? else {
+            // A feed write by a writer the newest own `identity.json` names, a removed one
+            // included, whose certificate neither the app nor its directory holds: the
+            // directory lists only current apps, and its read may fail. The record's view
+            // decides (Switch wire 6.2 "Accepting a write" step 1).
+            let doc = &self.state.own_doc;
+            if evidence.cert.is_none()
+                && (doc.listed_cert(&writer).is_some() || doc.lists_removed(&writer))
+            {
+                return Ok(Err(Refused::Unheld(collection)));
+            }
             return Ok(Err(Refused::Ignored));
         };
         // Step 2: what dates the write and gives its version.
@@ -1091,12 +1104,14 @@ impl App {
     }
 
     /// The writer's certificates whose key verifies the operation: the record view's, and
-    /// those the app knows, its own and the ones kept from the directory and the feed; the
-    /// own directory is read again once for a writer the app doesn't know.
+    /// those the app knows, its own and the ones kept from the directory and the feed,
+    /// those `tx` keeps included; the own directory is read again once for a writer the app
+    /// doesn't know.
     async fn writer_certs(
         &mut self,
         evidence: &Evidence<'_>,
         writer: &[u8; 16],
+        tx: &Tx,
     ) -> Result<Option<WriterCerts>, AppError> {
         let identity = self.state.meta.identity;
         let verify = |cert: AppCert| -> Option<(AppCert, SignedOp)> {
@@ -1114,6 +1129,7 @@ impl App {
         let mut candidates: Vec<AppCert> = vec![self.state.cert.clone()];
         candidates.extend(self.state.renewal.iter().cloned());
         candidates.extend(self.kept_certs(writer).await?);
+        candidates.extend(self.pending_certs(tx, writer));
         let mut known: Vec<(AppCert, SignedOp)> =
             candidates.into_iter().filter_map(verify).collect();
         if view.is_none() && known.is_empty() {
@@ -1154,6 +1170,13 @@ impl App {
             return Some(cert.clone());
         }
         let doc = &self.state.own_doc;
+        let rank = |cert: &&AppCert| match doc.standing(&cert.app_id(), &cert.hash()) {
+            Standing::Listed => 0,
+            Standing::RenewedOpen => 1,
+            Standing::RenewedClosed { .. } => 2,
+            Standing::Removed { .. } => 3,
+            Standing::None => 4,
+        };
         let mut counting: Vec<&AppCert> = certs
             .known
             .iter()
@@ -1167,13 +1190,6 @@ impl App {
         if let Some(cert) = found {
             return Some((*cert).clone());
         }
-        let rank = |cert: &&AppCert| match doc.standing(&cert.app_id(), &cert.hash()) {
-            Standing::Listed => 0,
-            Standing::RenewedOpen => 1,
-            Standing::RenewedClosed { .. } => 2,
-            Standing::Removed { .. } => 3,
-            Standing::None => 4,
-        };
         certs.known.iter().min_by_key(rank).cloned()
     }
 
@@ -1192,6 +1208,33 @@ impl App {
                     .map(|entry| entry.cert),
             )
             .any(|hash| counts_at(doc.standing(writer, &hash), Some(time)) && !held.contains(&hash))
+    }
+
+    /// The certificates of `app_id` that `tx` keeps, not committed yet: those of the writes
+    /// taken earlier in the same read, so one view read serves a page's writes under one
+    /// certificate. Each is read once, however often `tx` keeps it.
+    fn pending_certs(&self, tx: &Tx, app_id: &[u8; 16]) -> Vec<AppCert> {
+        let prefix = format!(
+            "{CERT_PREFIX}{}/",
+            pubky_switch_core::enc::zbase32_encode(app_id)
+        );
+        let identity = self.state.meta.identity;
+        let mut seen: Vec<&[u8]> = Vec::new();
+        let mut certs = Vec::new();
+        for write in tx.pending_writes() {
+            if let crate::store::Write::Put { key, value, .. } = write
+                && key.starts_with(prefix.as_bytes())
+                && !seen.contains(&key.as_slice())
+            {
+                seen.push(key);
+                if let Ok(signed) = super::state::decode::<SignedDoc>(value)
+                    && let Ok(cert) = AppCert::verify(&signed, &identity)
+                {
+                    certs.push(cert);
+                }
+            }
+        }
+        certs
     }
 
     async fn kept_certs(&self, app_id: &[u8; 16]) -> Result<Vec<AppCert>, AppError> {
@@ -1418,7 +1461,7 @@ impl App {
         };
         let key = put.key;
         match self
-            .accept_write(&evidence, Some((&key, &collection)))
+            .accept_write(&evidence, Some((&key, &collection)), tx)
             .await?
         {
             Ok(accepted) => {
