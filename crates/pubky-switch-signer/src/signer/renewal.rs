@@ -676,8 +676,10 @@ impl Signer {
     /// What is due at each start, in order (design note, section 4.5): finish the flow in
     /// progress and any closing delivery owed (Switch wire 3.8), remove the apps revoked or
     /// departed (Switch spec 12.2, 12.3), close the cooperative renewals whose apps took their
-    /// new certificate, answer the full-bundle requests (Switch wire 3.5), and renew the
-    /// certificates past half their lifetime ([`Signer::renew_expiring`]).
+    /// new certificate, answer the full-bundle requests (Switch wire 3.5), renew the
+    /// certificates past half their lifetime ([`Signer::renew_expiring`]), and publish the
+    /// newest version again where the Homeserver's copy is older, missing or unreadable
+    /// (Switch wire 3.3).
     ///
     /// # Errors
     ///
@@ -703,6 +705,7 @@ impl Signer {
         self.complete_renewals().await?;
         self.serve_full_bundles().await?;
         self.renew_expiring().await?;
+        self.republish().await?;
         resumed
     }
 

@@ -1336,6 +1336,43 @@ async fn test_hand_over_writes_nothing_to_the_homeserver_meanwhile() {
 }
 
 #[tokio::test]
+async fn test_hand_over_republishing_waits_for_the_new_signers_backup() {
+    // The new signer's delivery won, and its backup couldn't be written, so its version isn't
+    // published. Neither side's run puts it, or anything else, on the Homeserver before that
+    // backup: the old signer is still handing over, and the new signer's first publication
+    // waits for its backup (Switch wire 3.12). Once the backup is written, the version is
+    // published, and the old signer then finds its proof.
+    let world = World::new();
+    let mut s = setup(&world).await;
+    s.old.hand_over_to(s.app_id(), confirmed()).await.unwrap();
+    *world.homeserver.failing_path.lock().unwrap() = Some(SIGNER_BACKUP_PATH.to_owned());
+    let store = Arc::new(MemoryStore::new());
+    let vault = empty_vault();
+    let _ = Signer::receive_hand_over(world.env(store.clone()), &s.target, vault.clone()).await;
+    let first = world.switch.identity_doc().unwrap();
+    assert_eq!(first.version(), s.handed.version() + 1);
+    assert_eq!(world.published().unwrap().signed(), s.handed.signed());
+    let writes = world.homeserver.writes.lock().unwrap().len();
+    let _ = s.old.run_due().await;
+    let identity = world.key.public();
+    let mut new = Signer::resume_take_over(world.env(store), identity, &s.target.keys, vault)
+        .await
+        .unwrap();
+    let _ = new.run_due().await;
+    assert_eq!(world.homeserver.writes.lock().unwrap().len(), writes);
+    assert_eq!(world.published().unwrap().signed(), s.handed.signed());
+
+    *world.homeserver.failing_path.lock().unwrap() = None;
+    new.run_due().await.unwrap();
+    assert_eq!(world.backup().identity_doc().signed(), first.signed());
+    assert_eq!(world.published().unwrap().signed(), first.signed());
+    assert!(matches!(
+        s.old.run_due().await.unwrap_err(),
+        SignerError::HandedOver { .. }
+    ));
+}
+
+#[tokio::test]
 async fn test_take_back_sent_again_and_read_back_has_won() {
     // The take-back's answer is lost: it is sent again, the same bytes. And when its flow
     // ended on a refusal though the switch took it, the switch's copy of its own take-back
