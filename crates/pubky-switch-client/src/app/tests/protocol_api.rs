@@ -3136,3 +3136,40 @@ async fn test_backup_outbox_over_its_budget_carries_the_oldest() {
     }
     assert!(carried > 0 && carried < queued.len(), "{carried}");
 }
+
+/// The deadline's base is the service time the backup's app had verified, not its device
+/// clock: a device clock ahead at the backup doesn't move the window on.
+#[tokio::test]
+async fn test_backup_outbox_deadline_starts_at_the_verified_service_time() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let _shop = p.join(&p.bob, "shop", &protocol).await;
+    // The wallet's device clock runs four minutes ahead of its switch.
+    let ahead = Arc::new(crate::clock::TestClock::new(START + 4 * MINUTE));
+    let keys = p.alice.identity().app_keys("wallet");
+    let request = p
+        .alice
+        .approve(
+            &keys,
+            &AppSpec::new(&["scope-a"]).with_permissions(&Permission::ALL),
+        )
+        .unwrap();
+    let mut env = p.env(&p.alice, Arc::new(MemoryStore::new()));
+    env.clock = Arc::clone(&ahead) as Arc<dyn crate::clock::Clock>;
+    let mut wallet = App::join(env, protocol.clone(), config(), request)
+        .await
+        .unwrap();
+    wallet.receive(None).await.unwrap();
+    let signed = wallet.sign_message(Pair::note(&p.bob, "hello")).unwrap();
+    wallet.queue_signed(signed.clone()).await.unwrap();
+    let backup = wallet.backup().await.unwrap();
+    drop(wallet);
+    let restored = restored_wallet(&p, &protocol, &backup).await;
+    let deadline = restored
+        .outbox_record(signed.msg_id())
+        .await
+        .unwrap()
+        .replay_until_ms()
+        .unwrap();
+    assert_eq!(deadline, START + SENT_RETENTION_MS - CLOCK_TOLERANCE_MS);
+}
