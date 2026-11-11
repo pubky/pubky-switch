@@ -15,6 +15,7 @@ mod handover;
 mod join;
 mod lists;
 mod messaging;
+mod pages;
 mod records;
 mod removal;
 mod renewal;
@@ -34,6 +35,7 @@ pub use handover::{hand_over, hand_over_aborted};
 pub use join::join;
 pub use lists::lists_without_read;
 pub use messaging::messaging;
+pub use pages::pages;
 pub use records::records;
 pub use removal::{departure, revocation};
 pub use renewal::renewal;
@@ -87,6 +89,7 @@ pub const FLOWS: &[(&str, Flow)] = &[
     ("erasure, answer lost", |world| {
         Box::pin(erasure_answer_lost(world))
     }),
+    ("pages", |world| Box::pin(pages(world))),
 ];
 
 /// The flow that sends `call` to the service; `None` for a call the service doesn't serve
