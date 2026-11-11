@@ -1138,11 +1138,13 @@ impl UploadChanges {
             divergent: o.required_each("divergent", read::b64_32)?,
             claims: o.required_each("claims", read::b64_32)?,
             divergent_claims: o.required_each("divergent_claims", read::b64_32)?,
-            unverified: o.opt_u64("unverified")?.unwrap_or(0),
-            distrusted: o.opt_u64("distrusted")?.unwrap_or(0),
-            refused: o.opt_u64("refused")?.unwrap_or(0),
-            heads: o.opt_u64("heads")?.unwrap_or(0),
-            lists: o.opt_bool("lists")?.unwrap_or(false),
+            // Every member is required, as the wire's answer lists them (7.4.14) and the
+            // core's `UploadChanges` reads them.
+            unverified: o.u64("unverified")?,
+            distrusted: o.u64("distrusted")?,
+            refused: o.u64("refused")?,
+            heads: o.u64("heads")?,
+            lists: o.bool("lists")?,
         })
     }
 }
@@ -1266,6 +1268,23 @@ mod tests {
         serde_json::json!({
             "contacts": [], "conversations": [], "deny": [], "flagged": [], "invite_codes": []
         })
+    }
+
+    #[test]
+    fn test_upload_changes_require_every_member() {
+        // The wire's answer lists every member (Switch wire 7.4.14), as core's reader reads
+        // them: a count left out is malformed, not 0.
+        let changes = pubky_switch_core::recovery::UploadChanges::default().to_value();
+        let full = serde_json::json!({ "result": changes });
+        assert!(UploadAnswer::read_counts(Obj::of(&full, "answer").unwrap()).is_ok());
+        for member in ["unverified", "distrusted", "refused", "heads", "lists"] {
+            let mut answer = full.clone();
+            answer["result"].as_object_mut().unwrap().remove(member);
+            assert!(
+                UploadAnswer::read_counts(Obj::of(&answer, "answer").unwrap()).is_err(),
+                "{member}"
+            );
+        }
     }
 
     #[test]
