@@ -91,8 +91,8 @@ pub use unverified::{
 pub use admission::{INVITE_CODE_BYTES, InviteCode, LISTS_TOO_LARGE_RETRY_MS, SenderDisposition};
 pub use batch::{MAX_KEPT_BATCHES_BYTES, OpBatch, server_time_in};
 pub use claims::{
-    ClaimDoubt, ClaimEntryRead, ClaimEvidence, ClaimOp, ClaimRead, ClaimWritten,
-    ObligationDeadline, claim_conflict,
+    CLAIM_REREADS_PER_READ, ClaimDoubt, ClaimEntryRead, ClaimEvidence, ClaimOp, ClaimRead,
+    ClaimWritten, ObligationDeadline, claim_conflict,
 };
 pub use context::{ClaimFetch, LocalView, ReceiveContext, RestoreContext};
 pub use directory::{
@@ -106,7 +106,7 @@ pub use records::{
 pub use send::{
     Delivery, OutboxReport, OutgoingMessage, RecordJob, SENT_RETENTION_MS, SentMessage,
     SignedMessage, UNDELIVERABLE_MAX_MS, UNDELIVERABLE_MS, UNDELIVERABLE_TRIES,
-    UNDELIVERABLE_TRY_SPACING_MS,
+    UNDELIVERABLE_TRY_SPACING_MS, UndeliverableReason,
 };
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -537,6 +537,11 @@ pub struct App {
     /// When, by the device clock, an answer in this call last brought a verified service
     /// time ([`App::fresh_service_time`]).
     time_fresh_at: Option<u64>,
+    /// When a kept batch was last answered `429 rate_limited`, and the end of the wait its
+    /// `retry_after` asked, both device clock: no read sends the kept batches again in
+    /// between (`App::resume_batches_before_feed`). Kept in memory only: a restart sends
+    /// them at its first read.
+    kept_rate_limited: Option<(u64, u64)>,
 }
 
 impl std::fmt::Debug for App {
@@ -578,22 +583,23 @@ fn uncertain_copy(
     state: &AppState,
     pending: &PendingEffect,
     reserved: Option<u64>,
-) -> (u64, ParkedEntry) {
-    if let Some((id, stored)) = pending
-        .stored
-        .and_then(|id| state.parked.get(&id).map(|stored| (id, stored)))
-    {
-        return (
+) -> Result<(u64, ParkedEntry), AppError> {
+    // An entry stored locally under a kept effect is kept until the effect settles
+    // (`STATE.md`, `parked/`), and an entry read from the feed has its ID reserved: either
+    // missing is a corrupt store.
+    if let Some(id) = pending.stored {
+        let stored = state.parked.get(&id).ok_or_else(missing)?;
+        return Ok((
             id,
             ParkedEntry {
                 reason: ParkReason::Uncertain,
                 released: stored.was_released(),
                 ..stored.clone()
             },
-        );
+        ));
     }
-    (
-        reserved.unwrap_or(state.next_stored_id),
+    Ok((
+        reserved.ok_or_else(missing)?,
         ParkedEntry {
             seq: pending.seq,
             generation: pending.generation,
@@ -606,7 +612,7 @@ fn uncertain_copy(
             round: state.parked_round.number,
             released: false,
         },
-    )
+    ))
 }
 
 fn missing() -> AppError {
@@ -758,6 +764,7 @@ impl App {
                 duty_queued: 0,
                 duty_handed: 0,
                 time_fresh_at: None,
+                kept_rate_limited: None,
             };
             app.update_keys_through();
             app.events.clear();
@@ -878,6 +885,7 @@ impl App {
                 duty_queued: 0,
                 duty_handed: 0,
                 time_fresh_at: None,
+                kept_rate_limited: None,
             };
             // A store an earlier build wrote keeps the epoch read now.
             if !app.reader().exists(key::DUTY_EPOCH).await? {
@@ -1080,14 +1088,17 @@ impl App {
     /// carries one: the backup holds the effect's entry as what it is once the effect is
     /// gone, one whose effect's fate is unknown, stored as [`ParkReason::Uncertain`] (its
     /// flags, such as a release, kept) with the processed pair of its message, an entry read
-    /// from the feed included. The restored app's bounds never drop it, its host may release
-    /// it, and its read of the feed entry again is a duplicate, never a second application.
+    /// from the feed included. The restored app's bounds never drop it and its host may
+    /// release it. Its read passes the feed entry, whose `seq` the backup's `seen` holds,
+    /// with no event and no second application; the processed pair still catches a re-send
+    /// of the message at a new `seq` within 30 days.
     /// The live store keeps the kept effect, which the app's next read settles. An entry
     /// read from the feed takes a local ID the live store reserves for it first, by moving
     /// its stored-entry counter on (`parkid`), on a halted app too: the backup's counter is
     /// one past it, and the live store never gives that ID to another entry, which a restore
-    /// in place would install the copy over. The counter is the one write; it changes
-    /// nothing a read or the protocol sees.
+    /// in place would install the copy over. The counter is the one write of its own; its
+    /// commit also keeps a service time verified earlier and not yet committed, as every
+    /// commit does. Neither changes anything a read or the protocol sees.
     ///
     /// The restored app tells its protocol of the copy as stored `Uncertain`
     /// ([`AppEvent::Parked`]), but not which of the kept batch's attempts are uncertain, as
@@ -1116,8 +1127,9 @@ impl App {
                 self.bound_unverified().await?;
             }
             // The local ID the copy of a kept effect's feed entry takes is reserved in the
-            // live store first, for a halted app too: the backup's only write there, which
-            // changes nothing a read or the protocol sees. Without it, the next entry the
+            // live store first, for a halted app too: the backup's only write of its own
+            // there (its commit also keeps a service time not yet committed), which changes
+            // nothing a read or the protocol sees. Without it, the next entry the
             // live store stored would take the same ID, and a restore in place would install
             // the copy under an ID its carried duty events give another message.
             let reserved = if self
@@ -1139,16 +1151,25 @@ impl App {
             let local = self.protocol_scan(b"").await?;
             let mut processed = reader.scan::<Processed>("proc/").await?;
             let mut parked = state.parked.clone();
+            let mut seen = state.seen.clone();
             if let Some(pending) = &state.pending_effect {
                 // A restore never carries a kept effect, so the backup holds its entry as
                 // what it is once the effect is gone: one whose effect's fate is unknown,
                 // stored as `Uncertain` with the processed pair of its message, as the app
                 // itself stores it when it can't tell (`feed.rs`, `park_uncertain`). The
-                // bounds never drop it, the host may release it, and a read of its feed
-                // entry again is a duplicate, never a second application. The live store
-                // isn't touched.
-                let (id, entry) = uncertain_copy(&state, pending, reserved);
+                // bounds never drop it and the host may release it. A read passes its feed
+                // entry (its `seq` is put in `seen` below), with no event and no second
+                // application; the processed pair still catches a re-send at a new `seq`
+                // within 30 days. The live store isn't touched.
+                let (id, entry) = uncertain_copy(&state, pending, reserved)?;
                 parked.insert(id, entry);
+                // Its feed `seq` is passed, as the app passes it when it stores an entry: the
+                // processed pair ages out after 30 days, and a restore from an older backup
+                // must still never hand the entry over again unless the host releases the
+                // stored copy. An entry stored before was passed when it was stored.
+                if pending.stored.is_none() {
+                    seen.insert(pending.seq);
+                }
                 let pair = key::processed(&pending.sender, &pending.msg_id);
                 let rest = pair.strip_prefix("proc/").unwrap_or(&pair).to_owned();
                 processed.retain(|(held, _)| *held != rest);
@@ -1167,7 +1188,7 @@ impl App {
             backup.protocol = Some(LayerOut {
                 name,
                 data: pubky_switch_core::enc::b64(&data),
-                seen: state.seen.iter().copied().collect(),
+                seen: seen.into_iter().collect(),
                 parked: parked.into_iter().collect(),
                 processed,
             });
@@ -1462,6 +1483,7 @@ impl App {
                 duty_queued: 0,
                 duty_handed: 0,
                 time_fresh_at: None,
+                kept_rate_limited: None,
             };
             // Every write of the one commit; what fails here is mostly a write the store
             // can't take in one batch, over its sizes.

@@ -1,48 +1,44 @@
 //! A feed read that waits (Switch wire 7.4.4 `wait`): an app with nothing to read asks the
 //! switch to hold its read, and a write of another app answers it.
-//!
-//! This flow isn't among [`super::FLOWS`], whose runs are compared. The service holds a
-//! read with `wait` until its account changes. The scripted switch doesn't read `wait`: it
-//! answers at once, with nothing, and the app finds the write at its next read. The two
-//! runs make their calls in different orders then, which the comparison can't set side by
-//! side. The flow's test runs it against each and holds what each does; once the scripted
-//! switch holds a waiting read, the flow belongs in `FLOWS`.
 
-use std::time::{Duration, Instant};
+use std::cell::Cell;
+use std::time::Duration;
 
 use pubky_switch_client::app::{App, AppConfig, RecordTarget};
+use pubky_switch_signer::UserConfirmed;
 use serde_json::json;
 
-use super::enrollment::enroll;
+use super::enrollment::{enroll, status};
 use super::join::{app_status, events};
 use super::messaging::joined_with;
 use super::{ORIGIN, STEP_MS};
 use crate::parties::{Asking, notes_collection, notes_protocol_with_records};
 use crate::{FlowResult, World};
 
-/// How long the watch asks the switch to hold its read, in seconds.
-const WAIT_S: u32 = 10;
+/// How long the watch asks the switch to hold its read, in seconds: the most a read may
+/// ask for.
+const WAIT_S: u32 = 25;
 
-/// How long after the read was sent the wallet writes: time for the read to reach its wait.
-const BEFORE_THE_WRITE: Duration = Duration::from_millis(300);
-
-/// The longest the waiting read may take when a write answers it: well short of the wait.
-const ANSWERED_WITHIN: Duration = Duration::from_secs(5);
+/// How long the read and the write may take together. It is well short of the wait, so a
+/// read that is held and then answered within it was answered by the write, not by its
+/// wait running out; and long enough for one write at any runner's pace.
+const STEP_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// alice's watch has read its feed to the end. It reads again and asks the switch to wait;
-/// while the read is held, her wallet writes a record. At a switch that holds the read,
-/// the write answers it: the watch gets the record without asking again, and a read after
-/// that finds nothing new.
+/// while the read is held, her wallet writes a record. The write answers the read: the
+/// watch gets the record without asking again, and a read after that finds nothing new.
 ///
-/// The two calls are in flight at once, the read sent first. The delay before the write
-/// is of the real clock, not the world's.
+/// The two calls are in flight at once. The write starts when the switch holds the read
+/// ([`World::held_reads`]): it waits on that state, not for a time. A read answered before
+/// the write started wasn't held, and fails the flow.
 ///
 /// Calls: `GET /v1/{id}/feed` with `wait`, answered by another app's `POST /v1/{id}/ops`.
 ///
 /// # Errors
 ///
-/// When a step that should succeed against any switch fails, or when the waiting read
-/// takes about as long as its wait: the write didn't answer it.
+/// When a step that should succeed against any switch fails; when the switch answers the
+/// read without holding it; or when the read and the write together take 15 seconds, well
+/// short of the wait: the write didn't answer the read.
 pub async fn waiting_read(world: &World) -> FlowResult {
     let alice = world.identity("alice")?;
     world.add_switch(ORIGIN, &[&alice]).await?;
@@ -72,32 +68,41 @@ pub async fn waiting_read(world: &World) -> FlowResult {
     look(world, &mut watch, "the watch before the wait").await?;
 
     let target = RecordTarget::new(notes_collection(), b"shopping list");
-    let started = Instant::now();
+    let answered = Cell::new(false);
+    let held_at_the_write = Cell::new(false);
+    let read = async {
+        let report = watch.receive(Some(WAIT_S)).await;
+        answered.set(true);
+        report
+    };
     let write = async {
-        tokio::time::sleep(BEFORE_THE_WRITE).await;
+        // Until the switch holds the read, or answered it without holding it.
+        while world.held_reads() == 0 && !answered.get() {
+            tokio::task::yield_now().await;
+        }
+        held_at_the_write.set(world.held_reads() > 0);
         wallet
             .put_record(&target, br#"{"items":["milk"]}"#, Vec::new())
             .await
     };
-    let (read, written) = futures_util::future::join(watch.receive(Some(WAIT_S)), write).await;
-    let took = started.elapsed();
+    let both = futures_util::future::join(read, write);
+    let Ok((read, written)) = tokio::time::timeout(STEP_TIMEOUT, both).await else {
+        return Err("the write didn't answer the waiting read: the read is still held".into());
+    };
     written?;
     let report = read?;
+    if !held_at_the_write.get() {
+        return Err("the switch answered the waiting read without holding it".into());
+    }
     world.outcome(
         "the watch's waiting read, answered by the wallet's write",
         &json!({
+            "held_when_the_wallet_wrote": held_at_the_write.get(),
             "events": events(&report.events),
             "stopped": report.stopped,
             "app": app_status(&mut watch),
         }),
     );
-    if took >= ANSWERED_WITHIN {
-        return Err(format!(
-            "the waiting read took {} ms: the write didn't answer it",
-            took.as_millis()
-        )
-        .into());
-    }
     world.advance_ms(STEP_MS);
     look(world, &mut watch, "the watch's next read").await?;
     look(world, &mut wallet, "the wallet after its write").await?;
@@ -118,5 +123,66 @@ async fn look(world: &World, app: &mut App, name: &str) -> FlowResult {
         }),
     );
     world.advance_ms(STEP_MS);
+    Ok(())
+}
+
+/// A waiting read held while the signer closes the account (Switch wire 7.4.16). alice's
+/// watch, her only app, has read its feed to the end and reads again with `wait`: nothing
+/// is pending, and the switch holds the read. The erasure, the account's first change since
+/// the read arrived, wakes it, and it is answered as for an account the switch doesn't
+/// host: the operator's `404`, never a page under the erased account's key.
+///
+/// The flow notes that the read was held when the signer acted. How the read ended for
+/// the app isn't noted; the trace holds what the switch answered it.
+///
+/// Calls: `GET /v1/{id}/feed` with `wait`, answered by `POST /v1/{id}/erase`.
+///
+/// # Errors
+///
+/// As [`waiting_read`].
+pub async fn waiting_read_erased(world: &World) -> FlowResult {
+    let alice = world.identity("alice")?;
+    world.add_switch(ORIGIN, &[&alice]).await?;
+    let mut signer = enroll(world, &alice, ORIGIN).await?;
+    let (mut watch, _) = joined_with(
+        world,
+        &alice,
+        &mut signer,
+        Asking::new(world.app_keys(&alice, "watch")?)?,
+        notes_protocol_with_records(),
+        AppConfig::default(),
+    )
+    .await?;
+    look(world, &mut watch, "the watch before the wait").await?;
+
+    let answered = Cell::new(false);
+    let held_then = Cell::new(false);
+    let read = async {
+        let report = watch.receive(Some(WAIT_S)).await;
+        answered.set(true);
+        report.is_ok()
+    };
+    let erase = async {
+        // Until the switch holds the read, or answered it without holding it.
+        while world.held_reads() == 0 && !answered.get() {
+            tokio::task::yield_now().await;
+        }
+        held_then.set(world.held_reads() > 0);
+        signer
+            .close_account(UserConfirmed::shown_and_confirmed())
+            .await
+    };
+    let both = futures_util::future::join(read, erase);
+    let Ok((_, erased)) = tokio::time::timeout(STEP_TIMEOUT, both).await else {
+        return Err("the held read wasn't answered: it is still held".into());
+    };
+    erased?;
+    if !held_then.get() {
+        return Err("the switch answered the waiting read without holding it".into());
+    }
+    world.outcome(
+        "the signer closed the account while the watch's read was held",
+        &json!({ "held_when_the_signer_acted": held_then.get(), "signer": status(&signer)? }),
+    );
     Ok(())
 }

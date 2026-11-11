@@ -147,6 +147,23 @@ impl World {
         origin: &str,
         identities: &[&TestIdentity],
     ) -> Result<(), HarnessError> {
+        self.add_switch_with(origin, identities, Limits::default())
+            .await
+    }
+
+    /// As [`World::add_switch`], the service running with `limits` (Switch wire 9.2) in
+    /// place of its defaults, as an operator may configure it. The scripted switch takes the
+    /// inbox quota of them, the one limit it has a setting for.
+    ///
+    /// # Errors
+    ///
+    /// When the service can't be started.
+    pub async fn add_switch_with(
+        &self,
+        origin: &str,
+        identities: &[&TestIdentity],
+        limits: Limits,
+    ) -> Result<(), HarnessError> {
         // Each account's answers are verified with the service key of its identity's seed
         // (an Ed25519 key, as an identity key is).
         for identity in identities {
@@ -166,7 +183,7 @@ impl World {
                         .map(|identity| identity.service_secret())
                         .collect(),
                     OPERATOR_SECRET,
-                    Limits::default(),
+                    limits,
                 )
                 .await?
                 .ok_or_else(|| HarnessError::Setup("no test database".into()))?;
@@ -182,10 +199,8 @@ impl World {
                         identity.service_secret(),
                         self.clock.clone(),
                     );
-                    accounts.push((
-                        identity.key().id(),
-                        switch.transport() as Arc<dyn Transport>,
-                    ));
+                    switch.set_inbox_quota(limits.quota_bytes);
+                    accounts.push((identity.key().id(), switch.holding_transport()));
                     lock(&self.scripted).push(switch);
                 }
                 self.router.add(origin, Arc::new(Accounts { accounts }));
@@ -215,6 +230,10 @@ impl World {
         self.clock.advance_ms(ms);
         for switch in lock(&self.services).iter() {
             switch.sample_time();
+        }
+        // A read the scripted switch holds looks at the clock when told to.
+        for switch in lock(&self.scripted).iter() {
+            switch.release_held_reads();
         }
     }
 
@@ -313,6 +332,20 @@ impl World {
     /// The faults asked for that no request has met yet.
     pub fn faults_left(&self) -> usize {
         self.recorder.faults_left()
+    }
+
+    /// How many feed reads a switch holds now, waiting for a change (Switch wire 7.4.4
+    /// `wait`): at the service, the accounts with one.
+    pub fn held_reads(&self) -> usize {
+        let service: usize = lock(&self.services)
+            .iter()
+            .map(RealSwitch::held_reads)
+            .sum();
+        let scripted: usize = lock(&self.scripted)
+            .iter()
+            .map(|switch| switch.held_reads())
+            .sum();
+        service.saturating_add(scripted)
     }
 
     /// A request no key signs, as any reader of the network sends it: `method path` at

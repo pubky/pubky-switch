@@ -174,14 +174,93 @@ pub enum AppError {
     /// A rule of the app layer refused the call.
     #[error("refused: {0}")]
     Refused(Refusal),
+    /// The switch answers as for an account it doesn't host, an error its operator signed
+    /// and the account's key didn't (an unsigned `404`), and the identity publishes no
+    /// `identity.json`: the account may have been erased (Switch spec 12.7). Nothing
+    /// authenticates an erasure, so the app waits: it takes the account as gone only once
+    /// both hold at 5 tries at least 6 hours apart over 24 hours by its clock, then stops
+    /// with [`super::AppEvent::AccountGone`]. Until then each read, and
+    /// [`super::App::check_for_move`], counts a try and fails with this; `since_ms` is the
+    /// first try of the wait, app clock. An answer the pinned key doesn't verify in any
+    /// other case stays [`ClientError::BadServiceSignature`].
+    ///
+    /// It is an error, not a stopped read: nothing was read, and the app tries again at its
+    /// next call, as for a service it can't reach. It is the app's own conclusion from the
+    /// switch's answer, the Homeserver and the wait it keeps (`erasing`), so it is an
+    /// [`AppError`], not a [`ClientError`], which only says what one answer showed.
+    #[error("the switch doesn't answer as the account's, since {since_ms} (app clock)")]
+    NotAnsweringAsAccount {
+        /// The first try of the wait, app clock, in Unix milliseconds.
+        since_ms: u64,
+    },
+    /// The call's own batch was signed and kept, and couldn't be settled now; `error` says
+    /// why. Most often the network failed, or the switch answered `429`, `503`, `410
+    /// moved`, `401 stale_timestamp` or `409 identity_needed`, or an answer didn't verify;
+    /// also a refusal about the caller met before the batch was sent, such as `403
+    /// cert_expired` on the service time read first, an alarm, or a failed commit after the
+    /// batch was kept. The app sends it again, the same bytes, before its next write and at
+    /// the start of its next read ([`super::App::submit_batch`], [`super::App::receive`]),
+    /// once nothing holds it back, and the switch answers a batch it applied with its
+    /// original proofs (Switch wire 6.4 step 5), so the caller doesn't build it again: what
+    /// the batch settles is committed when that answer comes.
+    ///
+    /// The store decides it: a call of [`super::App::submit_batch`] or
+    /// [`super::App::write_claim`], or one that writes through them such as
+    /// [`super::App::put_record`], fails with this exactly when its own batch is still kept
+    /// under `opq/` when it returns. A bare error means the batch isn't kept: it was never
+    /// signed or stored, a batch kept from an earlier call couldn't be sent first, or it was
+    /// refused for good and dropped. When the store can't be read to tell, the call fails
+    /// with that store error, bare: whether the batch is kept can't be told then, and a
+    /// kept one goes again with the next write or read.
+    /// Other calls keep their own signed artifacts elsewhere and may fail bare after keeping
+    /// one: [`super::App::rotate`] its receive key registration, a join its batch, and the
+    /// delivery of the app record its batch; each is sent again by itself (`STATE.md`).
+    /// [`AppError::code`] and [`AppError::unkept`] see through this variant.
+    #[error("the batch is kept, to be sent again: {error}")]
+    Kept {
+        /// The batch's ID, under which it is kept.
+        batch_id: [u8; 16],
+        /// Why it couldn't be settled now.
+        error: Box<AppError>,
+    },
 }
 
 impl AppError {
-    /// The error code of an answer of the switch.
+    /// The error code of an answer of the switch, also of one that left the call's batch
+    /// kept ([`AppError::Kept`]).
     pub fn code(&self) -> Option<ErrorCode> {
-        match self {
+        match self.unkept() {
             AppError::Switch(error) => error.code(),
             _ => None,
+        }
+    }
+
+    /// The error, without the [`AppError::Kept`] around it.
+    pub fn unkept(&self) -> &AppError {
+        match self {
+            AppError::Kept { error, .. } => error,
+            other => other,
+        }
+    }
+
+    /// The ID of the call's own batch, when the call kept it ([`AppError::Kept`]).
+    pub fn kept_batch(&self) -> Option<[u8; 16]> {
+        match self {
+            AppError::Kept { batch_id, .. } => Some(*batch_id),
+            _ => None,
+        }
+    }
+
+    /// `error` of a call whose own batch `batch_id` was kept, given whether the store still
+    /// keeps it: [`AppError::Kept`] when it does, `error` as it is when it doesn't.
+    pub(crate) fn kept_or(batch_id: [u8; 16], error: AppError, still_kept: bool) -> AppError {
+        if still_kept {
+            AppError::Kept {
+                batch_id,
+                error: Box::new(error),
+            }
+        } else {
+            error
         }
     }
 }

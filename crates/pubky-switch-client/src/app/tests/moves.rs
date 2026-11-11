@@ -1669,16 +1669,15 @@ async fn test_removed_in_identity_json_stops_for_good() {
     assert_eq!(app.follow_provider().await.unwrap(), ProviderStatus::Gone);
 }
 
-/// A read that meets an erased account and doesn't conclude: the service counts as
-/// unreachable (Switch spec 12.7).
+/// A read that meets an erased account and doesn't conclude: the read fails as the wait's
+/// own outcome, naming its first try (Switch spec 12.7).
 async fn unreachable_read(app: &mut App) {
     let result = app.receive(None).await;
+    let since = app.state.erasing.map(|e| e.since_ms);
     assert!(
         matches!(
             result,
-            Err(AppError::Switch(ClientError::BadServiceSignature {
-                status: 404
-            }))
+            Err(AppError::NotAnsweringAsAccount { since_ms }) if Some(since_ms) == since
         ),
         "{result:?}"
     );
@@ -1704,8 +1703,17 @@ async fn test_erased_account_is_gone_once_the_identity_is_unpublished() {
         .unwrap();
     w.switch.lock().erased = true;
     // While the identity still publishes its identity.json, the unsigned 404 explains
-    // nothing: the error stands and the app isn't stopped.
-    unreachable_read(&mut app).await;
+    // nothing: the error stands, an answer that doesn't verify, and the app isn't stopped.
+    let result = app.receive(None).await;
+    assert!(
+        matches!(
+            result,
+            Err(AppError::Switch(ClientError::BadServiceSignature {
+                status: 404
+            }))
+        ),
+        "{result:?}"
+    );
     assert!(app.state.erasing.is_none());
     // The signer erased the account and deleted identity.json from the Homeserver. Until
     // both have held at tries spread over 24 hours, the service counts as unreachable.
@@ -1719,11 +1727,50 @@ async fn test_erased_account_is_gone_once_the_identity_is_unpublished() {
         .advance_ms(crate::app::provider::ERASURE_TRY_SPACING_MS);
     let report = app.receive(None).await.unwrap();
     assert!(report.stopped);
-    assert!(has(&report.events, |e| matches!(e, AppEvent::AccountGone)));
+    let gone = |events: &[AppEvent]| {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                AppEvent::AccountGone { id } => Some(*id),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let ids = gone(&report.events);
+    assert_eq!(ids.len(), 1, "{:?}", report.events);
     assert_eq!(app.follow_provider().await.unwrap(), ProviderStatus::Gone);
+    // A duty event: kept in the store, and delivered again until it is acknowledged.
+    assert_eq!(gone(&app.unacknowledged_events().await.unwrap()), ids);
+    app.ack_events(ids[0]).await.unwrap();
+    assert!(gone(&app.unacknowledged_events().await.unwrap()).is_empty());
     // The push setting is kept, only no longer set, for when the account shows again.
     assert!(app.push_registration().await.unwrap().is_none());
     assert!(app.push_record().await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn test_erasure_wait_counts_the_tries_of_check_for_move() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join(&w, &router).await;
+    w.switch.lock().erased = true;
+    w.homeserver.remove(w.alice.public(), IDENTITY_PATH);
+    // The public read meets the same unsigned 404: each spaced try counts in the wait's
+    // record, and fails as the wait's outcome.
+    for tries in 1..crate::app::provider::ERASURE_TRIES {
+        let error = app.check_for_move().await.unwrap_err();
+        let since = app.state.erasing.map(|e| e.since_ms);
+        assert!(
+            matches!(error, AppError::NotAnsweringAsAccount { since_ms } if Some(since_ms) == since),
+            "{error:?}"
+        );
+        assert_eq!(app.state.erasing.map(|e| e.tries), Some(tries));
+        w.clock
+            .advance_ms(crate::app::provider::ERASURE_TRY_SPACING_MS);
+    }
+    // A read makes the last try: the account is gone.
+    assert!(app.receive(None).await.unwrap().stopped);
+    assert_eq!(app.check_for_move().await.unwrap(), ProviderStatus::Gone);
 }
 
 #[tokio::test]
@@ -1920,6 +1967,44 @@ async fn test_erased_account_seen_alive_again_comes_back() {
     assert_ne!(app.follow_provider().await.unwrap(), ProviderStatus::Gone);
 }
 
+/// An `AccountGone` the host took but didn't acknowledge, and the account seen alive again
+/// (`AccountBack`): the event no longer holds, so it goes in the commit that brings the
+/// account back, and no later load delivers it for a live account.
+#[tokio::test]
+async fn test_erased_account_back_drops_its_unacknowledged_account_gone() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join(&w, &router).await;
+    let published = w.homeserver.file(w.alice.public(), IDENTITY_PATH).unwrap();
+    w.switch.lock().erased = true;
+    w.homeserver.remove(w.alice.public(), IDENTITY_PATH);
+    erasure_tries_but_the_last(&w, &mut app).await;
+    w.clock
+        .advance_ms(crate::app::provider::ERASURE_TRY_SPACING_MS);
+    let report = app.receive(None).await.unwrap();
+    assert!(has(&report.events, |e| matches!(
+        e,
+        AppEvent::AccountGone { .. }
+    )));
+    w.switch.lock().erased = false;
+    w.homeserver.put(w.alice.public(), IDENTITY_PATH, published);
+    let report = app.receive(None).await.unwrap();
+    assert!(has(&report.events, |e| matches!(e, AppEvent::AccountBack)));
+    let kept = app.unacknowledged_events().await.unwrap();
+    assert!(
+        !has(&kept, |e| matches!(e, AppEvent::AccountGone { .. })),
+        "{kept:?}"
+    );
+    drop(app);
+    let mut app = w_load(&w, &router).await;
+    let events = app.take_events();
+    assert!(
+        !has(&events, |e| matches!(e, AppEvent::AccountGone { .. })),
+        "{events:?}"
+    );
+    assert_ne!(app.follow_provider().await.unwrap(), ProviderStatus::Gone);
+}
+
 #[test]
 fn test_residual_window_is_a_minute_and_the_tolerance() {
     assert_eq!(crate::app::RESIDUAL_WINDOW_MS, 60_000 + CLOCK_TOLERANCE_MS);
@@ -2039,6 +2124,41 @@ async fn test_claim_read_after_a_key_change_checks_earlier_proofs_with_their_key
     let read = app.read_claim(&CLAIM).await.unwrap().unwrap();
     assert_eq!(read.entries.len(), 1);
     assert!(app.alarm().is_none(), "{:?}", app.alarm());
+}
+
+/// The own attempt asked again after a key change: the proof the app holds for it is of
+/// generation 1, not the generation its `identity.json` names now, so it doesn't pass the
+/// checks of an own attempt (Switch wire 6.5 "Binding"), and the conflict stands.
+#[tokio::test]
+async fn test_claim_attempt_made_again_after_a_key_change_gets_the_conflict() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join_on(
+        &w,
+        &router,
+        Arc::clone(&w.store) as Arc<dyn StateStore>,
+        w.protocol.clone(),
+        &Permission::ALL,
+    )
+    .await;
+    let attempt = ClaimOp::attempt(CLAIM, 0, ATTEMPT, 3600, None);
+    app.write_claim(attempt, vec![], ObligationDeadline::NoDeadline)
+        .await
+        .unwrap();
+    change_key(&w, &router);
+    app.receive(None).await.unwrap();
+    assert_eq!(app.cursor().generation, 2);
+    let error = app
+        .write_claim(attempt, vec![], ObligationDeadline::NoDeadline)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Some(ErrorCode::Conflict), "{error:?}");
+    // The conflict shows the app's own attempt open, current and not orphaned: only the
+    // proof's generation keeps it from being returned as held.
+    let view = crate::app::claim_conflict(&error).unwrap();
+    assert_eq!(view.attempt_id, Some(ATTEMPT));
+    assert_eq!(view.owner, Some(app.app_id()));
+    assert!(!view.attempt(&ATTEMPT).unwrap().orphaned);
 }
 
 #[tokio::test]

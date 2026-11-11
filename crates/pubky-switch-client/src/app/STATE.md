@@ -60,7 +60,9 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
   kept duty event no call reported yet. An acknowledgement removes only events handed to
   the host since the app was loaded, by `take_events`, a call's report or
   `unacknowledged_events`.
-- **Only the host's acknowledgement removes a duty event.** The app sets no cap on
+- **Only the host's acknowledgement removes a duty event,** with one exception: the commit
+  that takes an erased account back (`AccountBack`, Switch spec 12.7) removes the
+  `AccountGone` events not yet acknowledged, which no longer hold. The app sets no cap on
   `duty/`: a cap would have to lose a duty event, or stop reading the feed (which never
   stalls, Switch spec 8.2), giving up undeliverable messages (Switch spec 11) or following
   a provider change (Switch spec 12.5, 12.6). A host acknowledges each one once its
@@ -68,7 +70,11 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
 - **A restore is one commit:** the namespace cleared, the app's restored state and the
   protocol's backup layer under `p/`, both checked before it, so a failure leaves neither.
   A backup with a layer also carries `seen/`, `parked/` and `proc/` of the same moment,
-  which the layer may reflect, so no entry is handed to the protocol twice.
+  which the layer may reflect, so no entry is handed to the protocol twice. A kept
+  effect's entry goes in as a stored uncertain copy with its `seq` in `seen`, as the app
+  passes an entry it stores: its processed pair ages out after 30 days, and the `seq`
+  keeps a restore from an older backup from handing it over again unless the host
+  releases the copy.
 - **A layered backup reads one moment:** `App::backup_layered` is several store reads in
   sequence, and they agree because the call takes `&mut self`, so no call of the app commits
   between them, and the store allows one writer per namespace (`StateStore`, rule 4), so no
@@ -80,7 +86,8 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
   with the processed pair of its message, since a restore never carries the kept effect;
   the live store keeps the effect as it is. An entry read from the feed takes a local ID the
   live store reserves first by moving `parkid` on, on a halted app too (the backup's one
-  write), so no later entry of the live store takes it.
+  write of its own; its commit also keeps a service time not yet committed), so no later
+  entry of the live store takes it.
 
 ## Keys
 
@@ -131,7 +138,7 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
 | `leave` | a leave in progress or done | |
 | `service_time` | the highest service time verified, its key, the offset from the device clock | |
 | `p/...` | the protocol's own local state (`LocalWrite`) | the protocol's |
-| `duty/<id>` | a duty event (`AppEvent::is_duty`), written in the commit of the change it reports, until the host acknowledges it (`App::ack_events`); one per entry stored for good, kept batch or `attempt` dropped, kept batch refused for good, outbox message given up, protocol call whose local writes were over the bound (`LocalWritesRefused`), record write whose mark was over its bound (`RecordUncheckable`), entry stored unverified that was dropped past its bounds (`StoredEntryDropped`), or released entry that ran as a duplicate (`ReleasedDuplicate`). Only acknowledgements remove them: nothing bounds them for a host that never acknowledges | |
+| `duty/<id>` | a duty event (`AppEvent::is_duty`), written in the commit of the change it reports, until the host acknowledges it (`App::ack_events`); one per entry stored for good, kept batch or `attempt` dropped, kept batch refused for good, outbox message given up, protocol call whose local writes were over the bound (`LocalWritesRefused`), record write whose mark was over its bound (`RecordUncheckable`), entry stored unverified that was dropped past its bounds (`StoredEntryDropped`), released entry that ran as a duplicate (`ReleasedDuplicate`), or account taken as erased (`AccountGone`, in the commit that writes `gone`, and removed unacknowledged in the commit that takes the account back). Only acknowledgements remove them, apart from that: nothing bounds them for a host that never acknowledges | |
 | `dutyn` | the counter the next duty event takes; it only goes up in one store, and a restore in place keeps it | |
 | `dutye` | the store's event epoch, random, chosen once when the store starts empty (the first join, or a restore onto a store without one); every duty event ID carries it with its counter | |
 
@@ -213,7 +220,7 @@ uploads; `push.rs` holds the push registration. The peek (`peek.rs`) writes noth
 
 | Key | Holds | Sensitive |
 |---|---|---|
-| `out/<msg_id>` | a queued message, queued alone or with the answer of the batch that carried it: its signed plaintext, signed once, the envelope sealed for one try with its `apps_version`, its jobs (conversation entry, delivery, record) and where each stands, a re-send owed, when it was refused for good, and when a delivery was first and last answered `403 not_admitted` or `403 not_current`, with the answers counted at least 7.5 days apart; a failed one goes after the sent-message retention, an undeliverable one when a try is answered so again 30 days after that first answer and 5 answers were counted, or at the first flush 45 days after it in any case | yes |
+| `out/<msg_id>` | a queued message, queued alone or with the answer of the batch that carried it: its signed plaintext, signed once, the envelope sealed for one try with its `apps_version`, its jobs (conversation entry, delivery, record) and where each stands, a re-send owed, when it was refused for good, and when a delivery was first and last answered `403 not_admitted` or `403 not_current`, which of the two the last answer was (`UndeliverableReason`), with the answers counted at least 7.5 days apart; a failed one goes after the sent-message retention, an undeliverable one when a try is answered so again 30 days after that first answer and 5 answers were counted, or at the first flush 45 days after it in any case | yes |
 | `sent/<msg_id>` | a message the recipient's inbox accepted, written in the commit that records the acceptance, kept 30 days from its first acceptance for re-sends | yes |
 | `sentt/<time>/<msg_id>` | the time index for pruning sent messages | |
 | `dir/<pubky>` | a counterparty's directory as signed, the switch, generation and `identity.json` version it was read under, its versions, and whether it is read again before the next send; for a directory over the store's value size, only its stub: the switch, generation, versions and read time, no apps, always stale, so each send reads it again and a provider loss since is still found | |
@@ -225,7 +232,7 @@ uploads; `push.rs` holds the push registration. The peek (`peek.rs`) writes noth
 | `lc/lists_at` | the service time of the `GET /allow` answer the copy of the lists was last replaced from, written in that commit; absent until the first, after a restore, and from the commit that starts a provider loss, which keeps `lc/flag/`; while it is absent the copy isn't known to be complete, and a read by an app with `lists.read` refreshes it first, best effort, outside a move or a loss in progress | |
 | `lc/too_large` | the service time of the last `GET /allow` answer whose lists didn't fit one commit, in a commit of its own; while it is less than `LISTS_TOO_LARGE_RETRY_MS` (a day) old by the highest service time verified, which each read's page moves on, a read doesn't refresh the copy it owes; `allow_list()` always does; a refresh that fits, a provider change (the commit that switches the service, or that starts a loss) and a restore remove it | |
 | `invite/<code_hash>` | the code of an invite code the app registered, to show it again | yes |
-| `opq/<batch_id>` | a batch of operations, signed and kept before it is sent, with what its answer settles and, from its first send on, when that left (`kept_ms`, absent while never sent): the protocol's local writes, kept in base64 as in `pending/effect`, and the signed messages it puts in the outbox; it goes with its answer or a refusal for good, and stays through anything else. All of them together take at most `MAX_KEPT_BATCHES_BYTES` (12 MiB), so a provider change carries them in its one commit: `submit_batch` keeps no batch past it | the messages' |
+| `opq/<batch_id>` | a batch of operations, signed and kept before it is sent, with what its answer settles and, from its first send on, when that left (`kept_ms`, absent while never sent): the protocol's local writes, kept in base64 as in `pending/effect`, and the signed messages it puts in the outbox; it goes with its answer or a refusal for good, and stays through anything else, except that one never sent that holds an `attempt` goes unsent, reported as dropped with its attempts, when it would be sent while the app may not attempt (reconcile mode, Switch spec 12.4). All of them together take at most `MAX_KEPT_BATCHES_BYTES` (12 MiB), so a provider change carries them in its one commit: `submit_batch` keeps no batch past it | the messages' |
 | `list_due` | a listing of the collections is owed: after joining, a restore or a `missed` item | |
 | `rec/<key>` | the shared record write the app took: the signed operation, certificate and proof, its version and whether a proof gave it, the opened value, and the refused write it follows | yes |
 | `recname/<key>` | the collection name of a record the app creates outside the protocol's collections, from a write or an effect, until its write is answered | |
@@ -234,6 +241,8 @@ uploads; `push.rs` holds the push registration. The peek (`peek.rs`) writes noth
 | `ocert/<app_id>/<cert_hash>` | a certificate of an own app, for checking its writes | |
 | `claim/<claim_key>` | the newest claim view, the proof that shows it SETTLED, the newest entry's time and the deadline the app computes, kept until the evidence's retention ends | |
 | `clent/<claim_key>/<step>` | a signed claim entry and its proof | |
+| `clstub` | the feed showed the stub of an operation since the claims the app follows were last marked: written with the page that passes the stub, by an app with `claims.read`, and removed in the commit that marks them (Switch wire 7.5) | |
+| `clread/<claim_key>` | a claim the app holds and doesn't hold as finished (SETTLED with every attempt `done` or `failed`), to read again, with the device time it was marked; read at the end of a read, at most `CLAIM_REREADS_PER_READ` (16) per read, oldest mark first, and removed in the commit of any read of the claim, a `404` included, or when its evidence goes | |
 
 Deleting the keys on a leave also removes `rec/`, `hw/`, `recname/`, `out/`, `sent/`,
 `sentt/`, `invite/` and `opq/`. A restore replaces the namespace, these keys included, and

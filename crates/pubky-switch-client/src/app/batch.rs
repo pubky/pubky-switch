@@ -18,8 +18,9 @@
 //! sent again from an earlier call is reported as
 //! [`AppEvent::BatchRefused`]. A batch whose answer didn't come back, or may pass unchanged
 //! later (`429`, `503`, `401 stale_timestamp`, an answer that doesn't verify), stays kept,
-//! and the next call that writes sends it again, the same bytes, so the service answers it
-//! as a retry (Switch spec 6.4; Switch wire 2.1, 6.4 step 5).
+//! and the next call that writes, and the next read before its feed, sends it again, the
+//! same bytes, so the service answers it as a retry (Switch spec 6.4; Switch wire 2.1, 6.4
+//! step 5).
 
 use pubky_switch_core::chain::TransitionProof;
 use pubky_switch_core::claims::{ClaimEntry, ClaimType, ClaimView, EntryKind};
@@ -294,12 +295,16 @@ impl App {
     /// again once they are answered. Batches an earlier build kept count toward the cap but
     /// were kept without it, so they may already be past it; an
     /// `attempt` while the app may not attempt ([`App::may_attempt`]); the switch's refusal
-    /// for good, such as `409 conflict` with its `current`, after which nothing is kept; any
-    /// other failure
-    /// (the network, `429`, `503`, an answer that doesn't verify), after which the batch is
-    /// kept and sent again, the same bytes, by the next call that writes. A batch kept from
-    /// an earlier call that still can't be sent fails the call the same way, before the new
-    /// batch is signed. [`AppError::InvalidData`] when an attempt's proof shows another
+    /// for good, such as `409 conflict` with its `current`, after which nothing is kept;
+    /// [`AppError::Kept`] with the batch's ID, wrapping the cause, for any failure that leaves
+    /// the batch kept, as the store shows it when the call returns (the network, `429`,
+    /// `503`, an answer that doesn't verify, a refusal about the caller before its first
+    /// send, an alarm, a failed commit): the batch is sent again, the same bytes, by the
+    /// next call that writes and by the next read ([`App::receive`]) before its feed. A
+    /// batch kept from an
+    /// earlier call that still can't be sent fails the call with its bare error
+    /// ([`AppError::Transport`], [`AppError::Switch`]) before the new batch is signed, so
+    /// nothing of this call is kept. [`AppError::InvalidData`] when an attempt's proof shows another
     /// state: the batch was applied and its outcome committed, and the attempt is written
     /// `failed`; a rollback for an attempt stamped at or after its deadline.
     pub async fn submit_batch(&mut self, batch: OpBatch) -> Result<Submitted, AppError> {
@@ -502,8 +507,31 @@ impl App {
         }
         let mut tx = self.tx()?;
         tx.put(&pending_key(&id), &pending)?;
-        self.commit(tx).await?;
-        self.run_pending(&id, &pending, &signed, false).await
+        // From the commit that keeps it, a failure that leaves the batch kept says so, so
+        // the caller can tell its own batch kept from an earlier one that couldn't be sent:
+        // a commit answered `StoreError::Unknown` may have kept it too.
+        let result = match self.commit(tx).await {
+            Ok(()) => self.run_pending(&id, &pending, &signed, false).await,
+            Err(error) => Err(error),
+        };
+        match result {
+            Ok(submitted) => Ok(submitted),
+            Err(error) => Err(self.kept_or_dropped(id, error).await),
+        }
+    }
+
+    /// `error` of a call whose own batch `id` was kept, as the store shows it now: wrapped
+    /// as [`AppError::Kept`] when the batch is still under `opq/`, bare when it is gone
+    /// (settled, or dropped after a refusal for good). The store decides, not the step that
+    /// failed, so no failure after the batch was kept, before its send included, returns a
+    /// bare error for a batch that stays kept. A store that can't be read to tell gives its
+    /// own error, bare, unless `error` is already a store failure, which is kept as it is.
+    pub(crate) async fn kept_or_dropped(&self, id: [u8; 16], error: AppError) -> AppError {
+        match self.reader().exists(&pending_key(&id)).await {
+            Ok(still_kept) => AppError::kept_or(id, error, still_kept),
+            Err(_) if matches!(error, AppError::Store(_)) => error,
+            Err(unread) => unread,
+        }
     }
 
     /// After `409 stale_epoch` on `batch` (Switch spec 3.5, 6.4): the switch refused it for
@@ -618,7 +646,11 @@ impl App {
     /// answers. One refused for good is dropped and reported ([`AppEvent::BatchRefused`]);
     /// any other failure stops here, the batch still kept, and is the caller's error, so
     /// later writes don't overtake it. Nothing is sent while the evidence of a provider loss
-    /// isn't uploaded yet.
+    /// isn't uploaded yet. A batch never sent that holds an `attempt` is a new attempt, so
+    /// it goes only while the app may attempt ([`App::may_attempt`]), as the call that kept
+    /// it checked; otherwise, in reconcile mode begun since (Switch spec 8.3, 12.4), it is
+    /// dropped unsent, never applied, and reported with its attempts
+    /// ([`AppEvent::KeptBatchDropped`]).
     pub(crate) async fn resume_batches(&mut self) -> Result<(), AppError> {
         if self.refuse_before_upload().await.is_err() {
             return Ok(());
@@ -629,8 +661,18 @@ impl App {
                 .map_err(|_| AppError::Store(crate::error::StoreError::Corrupt))?;
             let batch = self.without_stale_cursor(Batch::from_body(pending.body.clone())?)?;
             // Never sent, as its record shows: no answer of it can be ambiguous, so it has
-            // no window, and goes out as a first send would.
+            // no window, and goes out as a first send would, an attempt in it only while the
+            // app may attempt (Switch spec 12.4).
             if pending.kept_ms.is_none() {
+                if !super::provider::attempts_in(&batch).is_empty()
+                    && self.may_attempt(false).is_err()
+                {
+                    let mut tx = self.tx()?;
+                    Self::replace_kept_batch(&id, None, &mut tx)?;
+                    self.kept_batch_dropped(&id, &batch, &mut tx)?;
+                    self.commit(tx).await?;
+                    continue;
+                }
                 self.send_unsent(&id, &pending, &batch).await?;
                 continue;
             }
@@ -698,6 +740,63 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    /// At the start of a read, before the feed: the batches kept from earlier calls are
+    /// sent again ([`App::resume_batches`]), so an answer that was lost is settled by the
+    /// next read, not only by the next write. The switch answers a batch it applied with
+    /// its original proofs (Switch wire 6.4 step 5), so a batch whose operations the feed
+    /// already shows applied is settled and cleared by that answer, its proofs kept as an
+    /// answer of its first send would have been. A resend that fails on the network or the
+    /// switch doesn't fail the read: the batch stays kept, and the read reports it
+    /// ([`AppEvent::KeptBatchesWaiting`], returned for the read's own report) and goes on to
+    /// the feed. After a kept batch was answered `429 rate_limited`, no read sends the kept
+    /// batches again until the `retry_after` it asked has passed by the device clock: each
+    /// read until then reports them waiting with that code, and sends nothing (Switch wire
+    /// 7.6). An alarm, a store failure or a refusal of the app's own rules fails the read,
+    /// as any of its steps does; so does a kept batch whose record under `opq/` doesn't
+    /// read, at every read until the store is repaired or restored, since corruption must
+    /// not pass silently, and a write would meet it as well.
+    pub(crate) async fn resume_batches_before_feed(
+        &mut self,
+    ) -> Result<Option<AppEvent>, AppError> {
+        let now = self.now();
+        let waiting = |kept: usize, code: Option<ErrorCode>| AppEvent::KeptBatchesWaiting {
+            kept: u64::try_from(kept).unwrap_or(u64::MAX),
+            code: code.map(|code| code.as_str().to_owned()),
+        };
+        if self
+            .kept_rate_limited
+            .is_some_and(|(from, until)| from <= now && now < until)
+        {
+            let kept = self.reader().scan_raw(PENDING_PREFIX).await?.len();
+            if kept > 0 {
+                return Ok(Some(waiting(kept, Some(ErrorCode::RateLimited))));
+            }
+        }
+        match self.resume_batches().await {
+            Ok(()) => Ok(None),
+            Err(error @ (AppError::Transport(_) | AppError::Switch(_))) => {
+                let kept = self.reader().scan_raw(PENDING_PREFIX).await?.len();
+                Ok(Some(waiting(kept, error.code())))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Note a kept batch's send answered `429 rate_limited`: the wait its `retry_after`
+    /// asks, from now by the device clock ([`App::resume_batches_before_feed`]).
+    fn note_kept_rate_limited(&mut self, error: &AppError) {
+        if let AppError::Switch(ClientError::Switch {
+            code: ErrorCode::RateLimited,
+            retry_after: Some(seconds),
+            ..
+        }) = error
+        {
+            let now = self.now();
+            let until = now.saturating_add(seconds.saturating_mul(1000));
+            self.kept_rate_limited = Some((now, until));
+        }
     }
 
     /// A kept batch never sent ([`PendingBatch::kept_ms`]), sent now: signed again first for
@@ -828,6 +927,7 @@ impl App {
         let submitted = match self.submit(batch).await {
             Ok(submitted) => submitted,
             Err(error) => {
+                self.note_kept_rate_limited(&error);
                 // A first send's refusal is its caller's; one sent again is dropped and
                 // reported by its caller, in one commit.
                 if refused_for_good(&error).is_some() && !resent {
@@ -991,7 +1091,11 @@ impl App {
         pending: &PendingBatch,
         batch: &Batch,
     ) -> Result<(), AppError> {
-        let proofs = match self.submit(batch).await {
+        let sent = self.submit(batch).await;
+        if let Err(error) = &sent {
+            self.note_kept_rate_limited(error);
+        }
+        let proofs = match sent {
             Ok(submitted) => submitted.proofs,
             Err(AppError::Switch(ClientError::Switch {
                 code: ErrorCode::Conflict,

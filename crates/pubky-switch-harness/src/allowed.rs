@@ -111,39 +111,6 @@ pub static ALLOWED: &[Allowed] = &[
         reference: "Switch wire 1.1, \"Exact bytes\"",
     },
     Allowed {
-        flow: "invite code",
-        label: "{alice/wallet} GET /v1/{alice}/feed",
-        fact: "body.items[1].context*",
-        service: "*",
-        scripted: NOTHING,
-        reason: "fake batch pending: the service shows the invite code's context on the \
-                 conversation entry it wrote at the code's first use, as a feed item; the \
-                 scripted switch shows it on the entry the code admitted and leaves it off \
-                 the conversation entry.",
-        reference: "Switch wire 7.5, the `chain` item's `context`",
-    },
-    Allowed {
-        flow: "invite code",
-        label: "{alice/wallet} GET /v1/{alice}/allow",
-        fact: "body.conversations[0].context*",
-        service: "*",
-        scripted: NOTHING,
-        reason: "fake batch pending: the service lists a conversation entry an invite code \
-                 made with the code's context; the scripted switch lists it without.",
-        reference: "Switch wire 7.4.6, `conversations`",
-    },
-    Allowed {
-        flow: "invite code",
-        label: "{alice/wallet} GET /v1/{alice}/allow",
-        fact: "body.conversations[0].last_used",
-        service: "time *",
-        scripted: NOTHING,
-        reason: "fake batch pending: the service keeps the time of the last append a \
-                 conversation entry admitted; the scripted switch keeps none, so an app \
-                 that prunes idle entries by it finds every entry never used.",
-        reference: "Switch wire 7.4.6, `last_used`",
-    },
-    Allowed {
         flow: "renewal, a scope dropped",
         label: "{alice/phone} GET /v1/{alice}/records/*",
         fact: "body.cert.*",
@@ -208,6 +175,50 @@ pub static ALLOWED: &[Allowed] = &[
                  an app that joins after the renewal refuses the write (Switch wire 6.2 \
                  step 5), where with the certificate of the write it takes it.",
         reference: "Switch wire 7.4.9, the record view's `cert`",
+    },
+    Allowed {
+        flow: "two collections",
+        label: "{alice/*} GET /v1/{alice}/records/*",
+        fact: "status",
+        service: "403",
+        scripted: "200",
+        reason: "fake batch pending: the service refuses a read of a record whose read scope the \
+                 caller's certificate lacks; the scripted switch answers it with the record's \
+                 view, and the app then keeps a record it can't open.",
+        reference: "Switch wire 7.4.9, `GET /records/{key}`",
+    },
+    Allowed {
+        flow: "two collections",
+        label: "{alice/*} GET /v1/{alice}/records/*",
+        fact: "body.code",
+        service: "text permission_missing",
+        scripted: NOTHING,
+        reason: "fake batch pending: the service refuses a read of a record whose read scope the \
+                 caller's certificate lacks; the scripted switch answers it with the record's \
+                 view, and the app then keeps a record it can't open.",
+        reference: "Switch wire 7.4.9, `GET /records/{key}`",
+    },
+    Allowed {
+        flow: "two collections",
+        label: "{alice/*} GET /v1/{alice}/records/*",
+        fact: "body.*",
+        service: NOTHING,
+        scripted: "*",
+        reason: "fake batch pending: the service refuses a read of a record whose read scope the \
+                 caller's certificate lacks; the scripted switch answers it with the record's \
+                 view, and the app then keeps a record it can't open.",
+        reference: "Switch wire 7.4.9, `GET /records/{key}`",
+    },
+    Allowed {
+        flow: "two collections",
+        label: "outcome what the * reads of *, outside its scope",
+        fact: "outcome.*",
+        service: "*",
+        scripted: "*",
+        reason: "fake batch pending: the service refuses a read of a record whose read scope the \
+                 caller's certificate lacks; the scripted switch answers it with the record's \
+                 view, and the app then keeps a record it can't open.",
+        reference: "Switch wire 7.4.9, `GET /records/{key}`",
     },
 ];
 

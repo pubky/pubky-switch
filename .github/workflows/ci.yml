@@ -41,10 +41,15 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
+  # The workspace's tests, split by crate into jobs that run side by side, each within its
+  # own time limit. Together they run every crate's tests, doc-tests included, as
+  # `cargo test --workspace --all-features` did. The service and the harness need
+  # PostgreSQL; with `PUBKY_SWITCH_REQUIRE_DB` set a missing database fails their tests
+  # rather than skipping them. The others use none.
   test:
     name: Tests
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     services:
       postgres:
         image: postgres:17
@@ -67,7 +72,59 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - run: cargo test --workspace --all-features --locked
+      - run: cargo test -p pubky-switch --all-features --locked
+
+  test-harness:
+    name: Tests (harness)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: switch
+          POSTGRES_PASSWORD: switch
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U switch"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      PUBKY_SWITCH_TEST_DATABASE_URL: postgres://switch:switch@localhost:5432/postgres
+      PUBKY_SWITCH_REQUIRE_DB: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo test -p pubky-switch-harness --all-features --locked
+
+  test-signer:
+    name: Tests (signer)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo test -p pubky-switch-signer --all-features --locked
+
+  test-client-core:
+    name: Tests (client and core)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo test -p pubky-switch-client -p pubky-switch-core --all-features --locked
 
   doc:
     name: Docs

@@ -990,9 +990,9 @@ async fn test_parked_release_by_an_earlier_build_still_reads_as_released() {
 }
 
 #[tokio::test]
-async fn test_parked_release_survives_a_backup_of_its_kept_effect() {
-    // A released entry whose run applies its effect and loses the answer: the effect is
-    // kept, and a backup holds the entry as uncertain, still released.
+async fn test_parked_backup_of_a_kept_effect_whose_stored_entry_is_gone_is_corrupt() {
+    // A kept effect names an entry stored locally that the store no longer holds, which no
+    // path leaves: the backup is refused as a corrupt store, never given a made-up ID.
     let w = World::new();
     let protocol = ParkingProtocol::new(Mode::Plain);
     let mut app = wallet_on(&w, &protocol, Arc::clone(&w.store) as Arc<dyn StateStore>).await;
@@ -1000,6 +1000,37 @@ async fn test_parked_release_survives_a_backup_of_its_kept_effect() {
     app.release_parked(entry.stored_id, &entry.hash)
         .await
         .unwrap();
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.receive(None).await.is_err());
+    let mut tx = app.tx().unwrap();
+    tx.delete(&crate::app::state::key::parked(entry.stored_id))
+        .unwrap();
+    app.commit(tx).await.unwrap();
+    let error = app.backup_layered().await.unwrap_err();
+    assert_eq!(error, AppError::Store(crate::error::StoreError::Corrupt));
+}
+
+#[tokio::test]
+async fn test_parked_release_survives_a_backup_of_its_kept_effect() {
+    // A released entry whose run applies its effect and loses the answer: the effect is
+    // kept, and a backup holds the entry as uncertain, still released. The release is kept
+    // in its reason only, as an earlier build wrote it, so this pins that the backup's copy
+    // reads the release from either (`ParkedEntry::was_released`), not from the flag alone.
+    let w = World::new();
+    let protocol = ParkingProtocol::new(Mode::Plain);
+    let mut app = wallet_on(&w, &protocol, Arc::clone(&w.store) as Arc<dyn StateStore>).await;
+    let (entry, _) = uncertain(&w, &mut app).await;
+    app.release_parked(entry.stored_id, &entry.hash)
+        .await
+        .unwrap();
+    let mut stored = app.state.parked.get(&entry.stored_id).cloned().unwrap();
+    assert_eq!(stored.reason, ParkReason::Released);
+    stored.released = false;
+    let mut tx = app.tx().unwrap();
+    tx.put(&crate::app::state::key::parked(entry.stored_id), &stored)
+        .unwrap();
+    app.commit(tx).await.unwrap();
+    app.state.parked.insert(entry.stored_id, stored);
     w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
     assert!(app.receive(None).await.is_err());
     assert_eq!(
@@ -1018,4 +1049,158 @@ async fn test_parked_release_survives_a_backup_of_its_kept_effect() {
     let copy = restored.state.parked.get(&entry.stored_id).unwrap();
     assert_eq!(copy.reason, ParkReason::Uncertain);
     assert!(copy.released, "the copy lost its release");
+}
+
+#[tokio::test]
+async fn test_parked_backup_of_a_kept_effect_never_hands_its_entry_over_again() {
+    // A feed entry's effect is applied and its answer lost: the effect is kept. A backup
+    // then holds the entry as uncertain. Restored after the processed pair of its message
+    // has aged out, the app still never hands the entry over again by itself; the host's
+    // release of the stored copy hands it over once.
+    let w = World::new();
+    let protocol = ParkingProtocol::new(Mode::Plain);
+    let mut app = wallet_on(&w, &protocol, Arc::clone(&w.store) as Arc<dyn StateStore>).await;
+    let (seq, _) = w.note(app.app_id(), "kept note");
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.receive(None).await.is_err());
+    assert!(
+        app.state
+            .pending_effect
+            .as_ref()
+            .is_some_and(|p| p.seq == seq && p.stored.is_none())
+    );
+    let backup = app.backup_layered().await.unwrap();
+    drop(app);
+    // Past the processed pair's 30 days and the tolerance.
+    w.clock.advance_ms(31 * DAY_MS);
+    w.switch.lock().batches.clear();
+    let restored_protocol = ParkingProtocol::new(Mode::Plain);
+    let mut restored = App::restore(
+        w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
+        restored_protocol.clone(),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    restored.receive(None).await.unwrap();
+    assert_eq!(
+        restored_protocol.handed(),
+        0,
+        "the entry was handed over again"
+    );
+    restored.receive(None).await.unwrap();
+    assert_eq!(
+        restored_protocol.handed(),
+        0,
+        "the entry was handed over again"
+    );
+    let id = restored.stored_id_at(seq).unwrap();
+    let entry = listed(&mut restored, id).await.unwrap();
+    assert_eq!(entry.reason, ParkReason::Uncertain);
+    restored
+        .release_parked(entry.stored_id, &entry.hash)
+        .await
+        .unwrap();
+    restored.receive(None).await.unwrap();
+    assert_eq!(restored_protocol.handed(), 1);
+    assert_eq!(restored_protocol.released(), vec![true]);
+}
+
+#[tokio::test]
+async fn test_parked_backup_of_a_released_kept_effect_never_hands_its_entry_over_again() {
+    // A released entry's run applies its effect and loses the answer: the backup's copy is
+    // uncertain (released kept). Restored past 31 days, its feed entry and its copy are
+    // never handed over again until the host releases the copy again.
+    let w = World::new();
+    let protocol = ParkingProtocol::new(Mode::Plain);
+    let mut app = wallet_on(&w, &protocol, Arc::clone(&w.store) as Arc<dyn StateStore>).await;
+    let (entry, _) = uncertain(&w, &mut app).await;
+    app.release_parked(entry.stored_id, &entry.hash)
+        .await
+        .unwrap();
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.receive(None).await.is_err());
+    assert_eq!(
+        app.state.pending_effect.as_ref().and_then(|p| p.stored),
+        Some(entry.stored_id)
+    );
+    let effects = w.effects();
+    let backup = app.backup_layered().await.unwrap();
+    drop(app);
+    w.clock.advance_ms(31 * DAY_MS);
+    w.switch.lock().batches.clear();
+    let restored_protocol = ParkingProtocol::new(Mode::Plain);
+    let mut restored = App::restore(
+        w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
+        restored_protocol.clone(),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    assert!(!restored.state.seen.contains(&entry.seq));
+    assert!(restored.cursor().seq >= entry.seq, "the entry was passed");
+    restored.receive(None).await.unwrap();
+    restored.receive(None).await.unwrap();
+    assert_eq!(restored_protocol.handed(), 0, "handed over again");
+    assert_eq!(w.effects(), effects);
+    let copy = listed(&mut restored, entry.stored_id).await.unwrap();
+    assert_eq!(copy.reason, ParkReason::Uncertain);
+    restored
+        .release_parked(copy.stored_id, &copy.hash)
+        .await
+        .unwrap();
+    restored.receive(None).await.unwrap();
+    assert_eq!(restored_protocol.handed(), 1);
+    assert_eq!(restored_protocol.released(), vec![true]);
+}
+
+#[tokio::test]
+async fn test_parked_backup_of_a_kept_effect_leaves_the_live_store_to_settle_it() {
+    // The backup puts the kept effect's `seq` in its own `seen`, never the live one; the
+    // live app's next read settles the effect, handing nothing over again.
+    let w = World::new();
+    let protocol = ParkingProtocol::new(Mode::Plain);
+    let mut app = wallet_on(&w, &protocol, Arc::clone(&w.store) as Arc<dyn StateStore>).await;
+    let (seq, _) = w.note(app.app_id(), "kept note");
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.receive(None).await.is_err());
+    assert!(
+        app.state
+            .pending_effect
+            .as_ref()
+            .is_some_and(|p| p.seq == seq && p.stored.is_none())
+    );
+    let seen_before = app.state.seen.clone();
+    let stored_before = app.reader().scan_numbers("seen/").await.unwrap();
+    let backup = app.backup_layered().await.unwrap();
+    assert!(
+        backup
+            .protocol
+            .as_ref()
+            .is_some_and(|layer| layer.seen.contains(&seq)),
+        "the backup's seen lacks the kept effect's seq"
+    );
+    assert_eq!(app.state.seen, seen_before);
+    assert!(!app.state.seen.contains(&seq));
+    assert_eq!(
+        app.reader().scan_numbers("seen/").await.unwrap(),
+        stored_before
+    );
+    assert!(app.state.pending_effect.is_some());
+    let report = app.receive(None).await.unwrap();
+    assert!(app.state.pending_effect.is_none(), "the kept effect stayed");
+    assert!(app.cursor().seq >= seq);
+    assert!(has(
+        &report.events,
+        |e| matches!(e, AppEvent::MessageReceived { seq: s, .. } if *s == seq)
+    ));
+    assert_eq!(protocol.handed(), 1, "handed over again");
+    assert_eq!(w.effects(), 1);
+    // A load of the live store reads the same.
+    drop(app);
+    let app = load_on(&w, &protocol, Arc::clone(&w.store) as Arc<dyn StateStore>).await;
+    assert!(app.state.pending_effect.is_none());
+    assert!(!app.state.seen.contains(&seq));
 }

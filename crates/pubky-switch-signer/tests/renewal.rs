@@ -28,7 +28,7 @@ use pubky_switch_core::records::{
 use pubky_switch_core::scopes::Permission;
 use pubky_switch_signer::{
     Alert, CertChange, Protocol, Protocols, Refusal, RenewalSkip, ScopeDef, Signer, SignerEnv,
-    SignerError,
+    SignerError, UserConfirmed,
 };
 
 const DAY_MS: u64 = 86_400_000;
@@ -1505,24 +1505,43 @@ async fn test_renewal_on_expiry_waits_while_the_device_clock_is_off() {
 }
 
 #[tokio::test]
-async fn test_renewal_on_expiry_keeps_an_app_away_for_lifetimes_served() {
-    // The app never takes its renewals: each half lifetime it is renewed again, its listed
-    // certificate never expires, and once it comes back with the newest one, every open
-    // renewal closes (Switch spec 3.2).
+async fn test_renewal_stops_after_two_untaken_and_starts_again_on_the_users_renewal() {
+    // The app never takes its renewals. It is renewed at half its lifetime, twice, and then
+    // not again by itself: the user is told, and the app would lapse at its expiry. The
+    // user renews it: the count starts again. Once it comes back with the newest certificate,
+    // every open renewal closes (Switch spec 3.1, 3.2).
     let world = World::new();
     let (mut signer, _) = world.enrolled().await;
     let (a, _) = two_apps(&["notes"], &["notes"]);
     world.approve(&mut signer, &a).await;
     let id = a.keys.app_id_bytes();
-    for round in 1..=3 {
+    for round in 1..=2 {
         world.clock.advance_ms(LIFETIME_MS / 2 + DAY_MS);
         signer.run_due().await.unwrap();
         let newest = signer.identity_doc().unwrap().unwrap();
         assert_eq!(renewals(&newest, &id), vec![None; round]);
-        let cert = listed_cert(&signer, &newest, &id);
-        assert!(cert.expires_at() > world.clock.now_ms());
     }
+    world.clock.advance_ms(LIFETIME_MS / 2 + DAY_MS);
+    signer.run_due().await.unwrap();
     let newest = signer.identity_doc().unwrap().unwrap();
+    assert_eq!(renewals(&newest, &id), vec![None; 2], "not renewed again");
+    let cert = listed_cert(&signer, &newest, &id);
+    assert!(signer.alerts().contains(&Alert::RenewalsStopped {
+        app_id: id,
+        expires_at: cert.expires_at(),
+    }));
+    // The user renews it: the alert goes, and automatic renewals start again.
+    signer.renew(id, CertChange::default()).await.unwrap();
+    assert!(
+        !signer
+            .alerts()
+            .iter()
+            .any(|alert| matches!(alert, Alert::RenewalsStopped { .. }))
+    );
+    world.clock.advance_ms(LIFETIME_MS / 2 + DAY_MS);
+    signer.run_due().await.unwrap();
+    let newest = signer.identity_doc().unwrap().unwrap();
+    assert_eq!(renewals(&newest, &id), vec![None; 4]);
     let cert = listed_cert(&signer, &newest, &id);
     let record = AppRecord::sign(
         &a.keys,
@@ -1546,6 +1565,398 @@ async fn test_renewal_on_expiry_keeps_an_app_away_for_lifetimes_served() {
         "{entries:?}"
     );
     world.assert_no_version_sent_twice();
+}
+
+#[tokio::test]
+async fn test_renewal_record_carrying_the_newest_certificate_starts_the_count_again() {
+    // The app takes up its first two renewals, then stays away. A record carrying the newest
+    // certificate starts the count again each time, so it is renewed twice more after it
+    // stops coming back, and only then stopped (Switch spec 3.1).
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let (a, _) = two_apps(&["notes"], &["notes"]);
+    world.approve(&mut signer, &a).await;
+    let id = a.keys.app_id_bytes();
+    for round in 1..=5 {
+        world.clock.advance_ms(LIFETIME_MS / 2 + DAY_MS);
+        signer.run_due().await.unwrap();
+        let newest = signer.identity_doc().unwrap().unwrap();
+        let entries = renewals(&newest, &id).len();
+        let stopped = signer
+            .alerts()
+            .iter()
+            .any(|alert| matches!(alert, Alert::RenewalsStopped { .. }));
+        if round <= 4 {
+            assert_eq!(entries, round, "renewed at round {round}");
+            assert!(!stopped, "round {round}");
+        } else {
+            assert_eq!(entries, 4, "not renewed at round {round}");
+            assert!(stopped);
+        }
+        // Back with the newest certificate after the first two renewals only.
+        if round <= 2 {
+            let cert = listed_cert(&signer, &newest, &id);
+            let record = AppRecord::sign(
+                &a.keys,
+                AppRecordBody::new(&cert, Vec::new(), world.clock.now_ms()),
+            )
+            .unwrap();
+            world
+                .switch
+                .app_op(
+                    &a.keys,
+                    OpKind::AppPut {
+                        record: record.signed().clone(),
+                    },
+                )
+                .unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_renewal_approved_again_starts_the_count_again() {
+    // An app stopped for its untaken renewals asks again with the same keys, and the user
+    // approves it: a renewal the user asked for, so the alert goes at once (Switch spec 3.1,
+    // wire 3.9).
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let (a, _) = two_apps(&["notes"], &["notes"]);
+    world.approve(&mut signer, &a).await;
+    let id = a.keys.app_id_bytes();
+    for _ in 0..3 {
+        world.clock.advance_ms(LIFETIME_MS / 2 + DAY_MS);
+        signer.run_due().await.unwrap();
+    }
+    assert!(
+        signer
+            .alerts()
+            .iter()
+            .any(|alert| matches!(alert, Alert::RenewalsStopped { app_id, .. } if *app_id == id))
+    );
+    let again = App::with_keys(a.keys.clone(), &["notes"], None, [21; 32]);
+    let review = signer.review(&again.request, &again.auth).unwrap();
+    assert!(review.renews);
+    signer.approve(review).await.unwrap();
+    assert!(
+        !signer
+            .alerts()
+            .iter()
+            .any(|alert| matches!(alert, Alert::RenewalsStopped { .. }))
+    );
+}
+
+#[tokio::test]
+async fn test_renewal_keeps_a_short_lifetime_the_user_chose() {
+    // The user renewed the app for 30 days. Past half of that, the automatic renewal gives it
+    // 30 days again, from then, not the default year (Switch spec 3.1).
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let (a, _) = two_apps(&["notes"], &["notes"]);
+    world.approve(&mut signer, &a).await;
+    let id = a.keys.app_id_bytes();
+    let month = 30 * DAY_MS;
+    signer
+        .renew(
+            id,
+            CertChange {
+                scopes: None,
+                expires_at: Some(world.clock.now_ms() + month),
+            },
+        )
+        .await
+        .unwrap();
+    let chosen = listed_cert(&signer, &signer.identity_doc().unwrap().unwrap(), &id);
+    let lifetime = chosen.expires_at() - chosen.issued_at();
+    assert!(lifetime <= month && lifetime > month - DAY_MS);
+    world.clock.advance_ms(16 * DAY_MS);
+    assert_eq!(signer.renew_expiring().await.unwrap(), [id]);
+    let newest = signer.identity_doc().unwrap().unwrap();
+    let cert = listed_cert(&signer, &newest, &id);
+    assert_eq!(cert.expires_at() - cert.issued_at(), lifetime);
+    assert_eq!(cert.issued_at(), world.clock.now_ms());
+}
+
+fn renewals_stopped(signer: &Signer) -> bool {
+    signer
+        .alerts()
+        .iter()
+        .any(|alert| matches!(alert, Alert::RenewalsStopped { .. }))
+}
+
+#[tokio::test]
+async fn test_renewal_count_holds_when_the_publication_fails() {
+    // The Homeserver refuses `identity.json`: each automatic renewal is delivered, and its
+    // publication fails, so the run fails after the renewing version is committed. The app
+    // never takes a renewal: it is renewed twice, and then stopped all the same (Switch spec
+    // 3.1).
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let (a, _) = two_apps(&["notes"], &["notes"]);
+    world.approve(&mut signer, &a).await;
+    let id = a.keys.app_id_bytes();
+    *world.homeserver.failing_path.lock().unwrap() = Some(IDENTITY_PATH.to_owned());
+    for _ in 1..=4 {
+        world.clock.advance_ms(LIFETIME_MS / 2 + DAY_MS);
+        let _ = signer.run_due().await;
+    }
+    let newest = signer.identity_doc().unwrap().unwrap();
+    assert_eq!(renewals(&newest, &id).len(), 2);
+    assert!(renewals_stopped(&signer));
+}
+
+#[tokio::test]
+async fn test_renewal_users_renewal_whose_publication_fails_starts_the_count_again() {
+    // Stopped after two untaken renewals. The user renews while the Homeserver refuses
+    // `identity.json`: delivered, its publication failed. It is the user's renewal all the
+    // same: the alert goes, and the app is renewed at its next half lifetime (Switch spec 3.1).
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let (a, _) = two_apps(&["notes"], &["notes"]);
+    world.approve(&mut signer, &a).await;
+    let id = a.keys.app_id_bytes();
+    for _ in 1..=3 {
+        world.clock.advance_ms(LIFETIME_MS / 2 + DAY_MS);
+        signer.run_due().await.unwrap();
+    }
+    assert!(renewals_stopped(&signer));
+    *world.homeserver.failing_path.lock().unwrap() = Some(IDENTITY_PATH.to_owned());
+    signer.renew(id, CertChange::default()).await.unwrap_err();
+    assert!(!renewals_stopped(&signer));
+    *world.homeserver.failing_path.lock().unwrap() = None;
+    let before = renewals(&signer.identity_doc().unwrap().unwrap(), &id).len();
+    world.clock.advance_ms(LIFETIME_MS / 2 + DAY_MS);
+    signer.run_due().await.unwrap();
+    let after = renewals(&signer.identity_doc().unwrap().unwrap(), &id).len();
+    assert_eq!(after, before + 1);
+    assert!(!renewals_stopped(&signer));
+}
+
+/// The untaken renewals stored for `app`, as the signer committed them.
+fn untaken_stored(store: &MemoryStore, signer: &Signer, app: &[u8; 16]) -> usize {
+    let ns = pubky_switch_signer::state::signer_namespace(&signer.identity());
+    let state: serde_json::Value =
+        serde_json::from_slice(&store.get(&ns, b"state").unwrap().unwrap()).unwrap();
+    let app = serde_json::to_value(app).unwrap();
+    state["untaken_renewals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| entry[0] == app)
+        .count()
+}
+
+#[tokio::test]
+async fn test_renewal_finished_by_resume_counts_once() {
+    // Twice, an automatic renewal's publication fails and the next `resume` finishes it: each
+    // counts once, so the third due renewal is stopped (Switch spec 3.1).
+    let world = World::new();
+    let (mut signer, store) = world.enrolled().await;
+    let (a, _) = two_apps(&["notes"], &["notes"]);
+    world.approve(&mut signer, &a).await;
+    let id = a.keys.app_id_bytes();
+    for round in 1..=2 {
+        world.clock.advance_ms(LIFETIME_MS / 2 + DAY_MS);
+        *world.homeserver.failing_path.lock().unwrap() = Some(IDENTITY_PATH.to_owned());
+        signer.renew_expiring().await.unwrap_err();
+        *world.homeserver.failing_path.lock().unwrap() = None;
+        signer.resume().await.unwrap();
+        assert_eq!(untaken_stored(&store, &signer, &id), round);
+    }
+    world.clock.advance_ms(LIFETIME_MS / 2 + DAY_MS);
+    assert!(signer.renew_expiring().await.unwrap().is_empty());
+    assert!(renewals_stopped(&signer));
+    let newest = signer.identity_doc().unwrap().unwrap();
+    assert_eq!(renewals(&newest, &id).len(), 2);
+}
+
+#[tokio::test]
+async fn test_renewal_interrupted_before_its_delivery_counts_once() {
+    // The switch can't be reached for the renewing version's delivery, and the signer stops
+    // there, as after a crash. Reopened, it delivers the version: one renewal, counted once,
+    // so the next one is renewed too, and only the third is stopped (Switch spec 3.1).
+    let world = World::new();
+    let (mut signer, store) = world.enrolled().await;
+    let (a, _) = two_apps(&["notes"], &["notes"]);
+    world.approve(&mut signer, &a).await;
+    let id = a.keys.app_id_bytes();
+    world.clock.advance_ms(LIFETIME_MS / 2 + DAY_MS);
+    world.switch.fail_next(SwitchFault::Unreachable {
+        path: "/identity".into(),
+        after: 0,
+    });
+    signer.renew_expiring().await.unwrap_err();
+    assert_eq!(untaken_stored(&store, &signer, &id), 1);
+    drop(signer);
+    let mut signer = Signer::open(world.env(store.clone()), world.keyring())
+        .await
+        .unwrap();
+    signer.resume().await.unwrap();
+    assert_eq!(untaken_stored(&store, &signer, &id), 1);
+    world.clock.advance_ms(LIFETIME_MS / 2 + DAY_MS);
+    assert_eq!(signer.renew_expiring().await.unwrap(), [id]);
+    world.clock.advance_ms(LIFETIME_MS / 2 + DAY_MS);
+    assert!(signer.renew_expiring().await.unwrap().is_empty());
+    assert!(renewals_stopped(&signer));
+}
+
+#[tokio::test]
+async fn test_renewal_given_up_isnt_counted() {
+    // The switch refuses an automatic renewal's version (`400`): the renewal is given up, its
+    // certificate dropped, and it doesn't count. Two delivered renewals later the app is
+    // stopped (Switch spec 3.1).
+    let world = World::new();
+    let (mut signer, store) = world.enrolled().await;
+    let (a, _) = two_apps(&["notes"], &["notes"]);
+    world.approve(&mut signer, &a).await;
+    let id = a.keys.app_id_bytes();
+    world.clock.advance_ms(LIFETIME_MS / 2 + DAY_MS);
+    world.switch.fail_next(SwitchFault::Error {
+        path: "/identity".into(),
+        code: ErrorCode::BadRequest,
+        current: serde_json::Value::Null,
+    });
+    signer.renew_expiring().await.unwrap_err();
+    assert_eq!(untaken_stored(&store, &signer, &id), 0);
+    assert_eq!(signer.renew_expiring().await.unwrap(), [id]);
+    world.clock.advance_ms(LIFETIME_MS / 2 + DAY_MS);
+    assert_eq!(signer.renew_expiring().await.unwrap(), [id]);
+    world.clock.advance_ms(LIFETIME_MS / 2 + DAY_MS);
+    assert!(signer.renew_expiring().await.unwrap().is_empty());
+    assert!(renewals_stopped(&signer));
+}
+
+#[tokio::test]
+async fn test_renewal_users_renewal_finished_by_resume_starts_the_count_again() {
+    // Stopped after two untaken renewals. The user's renewal fails at its publication and the
+    // next `resume` finishes it: the count started again with it (Switch spec 3.1).
+    let world = World::new();
+    let (mut signer, store) = world.enrolled().await;
+    let (a, _) = two_apps(&["notes"], &["notes"]);
+    world.approve(&mut signer, &a).await;
+    let id = a.keys.app_id_bytes();
+    for _ in 1..=3 {
+        world.clock.advance_ms(LIFETIME_MS / 2 + DAY_MS);
+        signer.run_due().await.unwrap();
+    }
+    assert!(renewals_stopped(&signer));
+    *world.homeserver.failing_path.lock().unwrap() = Some(IDENTITY_PATH.to_owned());
+    signer.renew(id, CertChange::default()).await.unwrap_err();
+    *world.homeserver.failing_path.lock().unwrap() = None;
+    signer.resume().await.unwrap();
+    assert!(!renewals_stopped(&signer));
+    assert_eq!(untaken_stored(&store, &signer, &id), 0);
+    world.clock.advance_ms(LIFETIME_MS / 2 + DAY_MS);
+    assert_eq!(signer.renew_expiring().await.unwrap(), [id]);
+}
+
+#[tokio::test]
+async fn test_renewal_count_and_alert_go_with_a_removed_app() {
+    // Stopped after two untaken renewals; the user revokes the app. Once the version that
+    // removes it is delivered, its alert and its count go too (Switch spec 3.1, 12.2).
+    let world = World::new();
+    let (mut signer, store) = world.enrolled().await;
+    let (a, _) = two_apps(&["notes"], &["notes"]);
+    world.approve(&mut signer, &a).await;
+    let id = a.keys.app_id_bytes();
+    for _ in 1..=3 {
+        world.clock.advance_ms(LIFETIME_MS / 2 + DAY_MS);
+        signer.run_due().await.unwrap();
+    }
+    assert!(renewals_stopped(&signer));
+    signer
+        .revoke(id, None, UserConfirmed::shown_and_confirmed())
+        .await
+        .unwrap();
+    signer.run_due().await.unwrap();
+    assert!(
+        signer
+            .identity_doc()
+            .unwrap()
+            .unwrap()
+            .listed_cert(&id)
+            .is_none()
+    );
+    assert!(!renewals_stopped(&signer));
+    assert_eq!(untaken_stored(&store, &signer, &id), 0);
+}
+
+#[tokio::test]
+async fn test_renewal_keeps_a_lifetime_of_minutes_exactly() {
+    // A lifetime of 2 minutes the user chose. The automatic renewal's check of this install
+    // takes 3 minutes: the expiry still comes from the time the certificate is issued at, so
+    // the lifetime stays 2 minutes, and the next run renews it again (Switch spec 3.1).
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let (a, _) = two_apps(&["notes"], &["notes"]);
+    world.approve(&mut signer, &a).await;
+    let id = a.keys.app_id_bytes();
+    let minutes = 2 * 60_000;
+    signer
+        .renew(
+            id,
+            CertChange {
+                scopes: None,
+                expires_at: Some(world.clock.now_ms() + minutes),
+            },
+        )
+        .await
+        .unwrap();
+    let chosen = listed_cert(&signer, &signer.identity_doc().unwrap().unwrap(), &id);
+    let lifetime = chosen.expires_at() - chosen.issued_at();
+    world.clock.advance_ms(90_000);
+    // The backup's second read, in the check before the renewal, takes 3 minutes.
+    let clock = Arc::clone(&world.clock);
+    *world.homeserver.after_get.lock().unwrap() = Some((
+        SIGNER_BACKUP_PATH.to_owned(),
+        2,
+        Box::new(move || clock.advance_ms(3 * 60_000)),
+    ));
+    assert_eq!(signer.renew_expiring().await.unwrap(), [id]);
+    let cert = listed_cert(&signer, &signer.identity_doc().unwrap().unwrap(), &id);
+    assert_eq!(cert.expires_at() - cert.issued_at(), lifetime);
+    world.clock.advance_ms(90_000);
+    signer.run_due().await.unwrap();
+    let again = listed_cert(&signer, &signer.identity_doc().unwrap().unwrap(), &id);
+    assert_ne!(again.hash(), cert.hash());
+    assert_eq!(again.expires_at() - again.issued_at(), lifetime);
+}
+
+#[tokio::test]
+async fn test_renewal_record_back_in_the_run_it_falls_due_renews_at_a_count_of_two() {
+    // Two automatic renewals untaken; the app's record then carries the newest certificate,
+    // and the next renewal falls due in the same run: the record counts first, so it is
+    // renewed, not stopped (Switch spec 3.1).
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let (a, _) = two_apps(&["notes"], &["notes"]);
+    world.approve(&mut signer, &a).await;
+    let id = a.keys.app_id_bytes();
+    for _ in 1..=2 {
+        world.clock.advance_ms(LIFETIME_MS / 2 + DAY_MS);
+        signer.run_due().await.unwrap();
+    }
+    let newest = signer.identity_doc().unwrap().unwrap();
+    let cert = listed_cert(&signer, &newest, &id);
+    world.clock.advance_ms(LIFETIME_MS / 2 + DAY_MS);
+    let record = AppRecord::sign(
+        &a.keys,
+        AppRecordBody::new(&cert, Vec::new(), world.clock.now_ms()),
+    )
+    .unwrap();
+    world
+        .switch
+        .app_op(
+            &a.keys,
+            OpKind::AppPut {
+                record: record.signed().clone(),
+            },
+        )
+        .unwrap();
+    assert_eq!(signer.renew_expiring().await.unwrap(), [id]);
+    assert!(!renewals_stopped(&signer));
+    let newest = signer.identity_doc().unwrap().unwrap();
+    assert_eq!(renewals(&newest, &id).len(), 3);
 }
 
 /// The test protocol's scopes, `notes` giving `permissions`: as after an update of its table.
