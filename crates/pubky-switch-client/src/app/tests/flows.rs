@@ -1305,9 +1305,11 @@ async fn test_app_restore_takes_a_renewal_another_device_took() {
     );
 }
 
-/// The failure path: the current `identity.json` lists a renewal, but the own record in the
-/// directory carries another certificate, and the renewal's `cert.put` is a stub. Nothing
-/// shows the listed certificate, so the restored app keeps the one it holds.
+/// The failure path: the current `identity.json` lists a newer renewal while the one the
+/// other device took is still open, so the own record in the directory carries a
+/// certificate that isn't the listed one, and the cert.put of the listed one never came.
+/// The restored app takes neither: not the record's, which isn't listed, nor the listed
+/// one, which nothing shows it.
 #[tokio::test]
 async fn test_app_restore_takes_no_listed_certificate_it_cant_verify() {
     let w = World::new();
@@ -1315,8 +1317,6 @@ async fn test_app_restore_takes_no_listed_certificate_it_cant_verify() {
     let me = app.app_id();
     let backup = app.backup().await.unwrap();
     let earlier = app.cert().clone();
-    // The signer stores one renewal, which the other device takes and delivers, then a
-    // newer document lists a certificate no record carries.
     w.clock.advance_ms(HOUR);
     renew_listed(&w, &app);
     app.receive(None).await.unwrap();
@@ -1336,21 +1336,29 @@ async fn test_app_restore_takes_no_listed_certificate_it_cant_verify() {
             app_id: me,
             cert: unshown.hash(),
         });
+        body.renewed.push(RenewedCert {
+            app_id: me,
+            cert: renewed.hash(),
+            until: None,
+        });
     });
     drop(app);
     let (mut restored, _) = restored(&w, &backup).await;
-    // The switch doesn't serve an app listed with a certificate no record carries.
-    let error = restored.receive(None).await.unwrap_err();
-    assert_eq!(error.code(), Some(ErrorCode::NotCurrent), "{error:?}");
-    // Neither the listed certificate, which no record shows, nor the record's, which the
-    // newest document doesn't list, is taken.
+    let report = restored.receive(None).await.unwrap();
+    assert!(
+        !has(&report.events, |e| matches!(
+            e,
+            AppEvent::CertificateTaken { .. }
+        )),
+        "{:?}",
+        report.events
+    );
     assert_eq!(restored.cert().hash(), earlier.hash());
     assert_eq!(
         restored.own_identity().listed_cert(&me),
         Some(unshown.hash()),
         "the newest document was read"
     );
-    assert_ne!(renewed.hash(), unshown.hash());
 }
 
 #[tokio::test]
