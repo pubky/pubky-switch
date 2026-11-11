@@ -727,11 +727,13 @@ impl Service {
             Ok(mark) => mark,
             // An erasure deletes the account, then its key (Switch wire 7.4.16): a read that
             // waited on an account erased meanwhile answers as for one the service doesn't
-            // host (7.3 step 2).
+            // host (7.3 step 2). Never with the key it loaded, which the erasure's answer was
+            // the last to use: an account found again, as after a new enrollment, or one that
+            // can't be looked up, gets the operator's temporary failure.
             Err(KeyStoreError::NotFound) => {
                 return Err(match self.store.lookup(&read.account).await {
                     Ok(None) => FeedStop::Gone,
-                    _ => fallback(temporary(), read.time_ms),
+                    Ok(Some(_)) | Err(_) => FeedStop::Retired,
                 });
             }
             Err(_) => return Err(fallback(temporary(), read.time_ms)),

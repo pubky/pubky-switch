@@ -709,7 +709,10 @@ impl Service {
                 } else {
                     None
                 };
-                (Answer::error(&error).with_head(head), serving)
+                // No head, so the commit moves no mark: an erasure's refusals commit only the
+                // stamped time (7.4.16).
+                let marked = serving && request.route.call != Call::Erase;
+                (Answer::error(&error).with_head(head), marked)
             }
         };
         // A read answered once the lock is gone answers a refusal with the head this request
@@ -746,7 +749,15 @@ impl Service {
                 match answer.deferred.take() {
                     Some(Deferred::Claim(read)) => match self.claim_body(&read).await {
                         Ok(body) => answer.body = body,
-                        Err(error) => answer = Answer::error(&error).with_head(fallback_head),
+                        Err(error) => {
+                            // Erased once the lock was gone: as an unknown account (7.3 step 2,
+                            // 7.4.16), never signed with the erased account's key.
+                            if matches!(self.store.lookup(&txn_account).await, Ok(None)) {
+                                let error = ApiError::not_found("no such account");
+                                return self.operator_answer(signature, base_ms, &error).await;
+                            }
+                            answer = Answer::error(&error).with_head(fallback_head);
+                        }
                     },
                     Some(Deferred::Feed(read)) => {
                         return match self.feed_page(&read, &signer).await {

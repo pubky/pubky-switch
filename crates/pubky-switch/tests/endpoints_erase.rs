@@ -198,7 +198,48 @@ async fn test_erase_deletes_the_account_and_nothing_else() {
     let Some(replay) = replay().await else { return };
     replay_chain_through_revoke(&replay).await;
     let bob = serve_bob(&replay).await;
+    // bob's account names alice: a contact, and a copy of her identity.json. They are bob's,
+    // and stay (7.4.16 Not erased).
+    let alice_key = hex32(&alice(&vectors("keys.json"))["public_hex"]);
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    sqlx::query(
+        "INSERT INTO list_entries (account_id, list, pubky, written_by, at_ms) \
+         VALUES ($1, 'contact', $2, $3, 0)",
+    )
+    .bind(&bob)
+    .bind(alice_key.as_slice())
+    .bind([0u8; 16].as_slice())
+    .execute(&mut conn)
+    .await
+    .expect("contact");
+    let copy = serde_json::to_vec(
+        &named(
+            &vectors("documents.json")["documents"],
+            "alice identity.json",
+        )["signed"],
+    )
+    .expect("copy");
+    sqlx::query(
+        "INSERT INTO peer_copies (account_id, identity, doc, version, generation, body_hash) \
+         VALUES ($1, $2, $3, 3, 1, $4)",
+    )
+    .bind(&bob)
+    .bind(alice_key.as_slice())
+    .bind(copy)
+    .bind([0u8; 32].as_slice())
+    .execute(&mut conn)
+    .await
+    .expect("peer copy");
+    conn.close().await.expect("close");
     let bob_before = rows(&replay, &bob).await;
+    for table in ["list_entries", "peer_copies"] {
+        assert!(
+            bob_before.iter().any(|(t, n)| *t == table && *n > 0),
+            "bob holds {table} rows naming alice"
+        );
+    }
     let alice_before = rows(&replay, &alice_id()).await;
     for table in [
         "accounts",
@@ -326,6 +367,23 @@ async fn test_erase_then_enrollment_starts_a_new_account() {
     );
     let new_key = service_key_id(&replay, &alice_id()).await;
     assert_ne!(new_key, old_key);
+    assert_ne!(
+        body(&answer)["service_key"],
+        json!(pubky_switch_core::enc::b64(&alice_service_key()))
+    );
+    // Staged: it serves nothing until its first delivery (7.3 step 7).
+    let apps = replay
+        .service
+        .handle(signer_request(
+            "GET",
+            &format!("/v1/{}/apps", alice_id()),
+            Vec::new(),
+            ms(enrolled["headers"]["switch-server-time"]
+                .as_str()
+                .expect("time")),
+        ))
+        .await;
+    assert_eq!(code_of(&apps), (503, json!("staged")));
     replay.db.drop_database().await.expect("drop");
 }
 
@@ -399,6 +457,9 @@ async fn test_erase_only_the_signer() {
         .await;
     assert_eq!(code_of(&other), (403, json!("not_admitted")));
     assert!(no_head(&other));
+    let stale = erase(&replay, &alice_service_key(), "2026-01-01T00:30:00.000Z").await;
+    assert_eq!(code_of(&stale), (401, json!("stale_timestamp")));
+    assert!(no_head(&stale));
     assert_eq!(rows(&replay, &alice_id()).await[0], ("accounts", 1));
     replay.db.drop_database().await.expect("drop");
 }
@@ -509,5 +570,252 @@ async fn test_erase_forgets_the_accounts_counts() {
             .claimed(&claimed, base),
         0
     );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_erase_every_account_table_cascades() {
+    // Every table with an account column references `accounts` with `ON DELETE CASCADE`, so
+    // the erasure's one `DELETE` reaches it, and `ACCOUNT_TABLES` names them all (7.4.16).
+    let Some(replay) = replay().await else { return };
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    let tables: Vec<(String, String)> = sqlx::query_as(
+        "SELECT c.table_name::text, c.column_name::text FROM information_schema.columns c \
+         WHERE c.table_schema = current_schema() AND c.column_name = 'account_id' \
+         AND c.table_name <> 'erased_keys' ORDER BY 1",
+    )
+    .fetch_all(&mut conn)
+    .await
+    .expect("columns");
+    let cascading: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT rc.table_name::text FROM information_schema.referential_constraints r \
+         JOIN information_schema.table_constraints rc ON rc.constraint_name = r.constraint_name \
+         WHERE rc.table_schema = current_schema() AND r.delete_rule = 'CASCADE'",
+    )
+    .fetch_all(&mut conn)
+    .await
+    .expect("constraints");
+    conn.close().await.expect("close");
+    for (table, _) in &tables {
+        assert!(cascading.contains(table), "{table} cascades from accounts");
+        assert!(
+            ACCOUNT_TABLES.iter().any(|(t, _)| t == table),
+            "{table} is in ACCOUNT_TABLES"
+        );
+    }
+    assert_eq!(
+        tables.len() + 1,
+        ACCOUNT_TABLES.len(),
+        "and `accounts` itself"
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_erase_commit_failure_deletes_nothing() {
+    // The deletion doesn't commit: `503`, signed with the account's key, without a head, and
+    // nothing deleted, the key, the ledger and the rows included; the retry erases (7.4.16).
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    for statement in [
+        "CREATE FUNCTION refuse_erasure() RETURNS trigger LANGUAGE plpgsql AS \
+         $$ BEGIN RAISE EXCEPTION 'refused'; END $$",
+        "CREATE CONSTRAINT TRIGGER refuse_erasure AFTER DELETE ON accounts \
+         DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION refuse_erasure()",
+    ] {
+        sqlx::query(statement)
+            .execute(&mut conn)
+            .await
+            .expect("trigger");
+    }
+    let before = rows(&replay, &alice_id()).await;
+    let key = service_key_id(&replay, &alice_id()).await;
+    let at = revoke_time();
+    let request = signer_request(
+        "POST",
+        &erase_path(),
+        erase_body(&alice_service_key()),
+        ms(&at),
+    );
+    let request_signature = signature_of(&request);
+    let answer = replay.service.handle(request).await;
+    assert_eq!(code_of(&answer), (503, json!("unavailable")));
+    assert!(no_head(&answer));
+    let signature: [u8; 64] = pubky_switch_core::enc::unb64(
+        header_text(&answer, header::SERVICE_SIGNATURE).expect("signature"),
+    )
+    .expect("b64")
+    .try_into()
+    .expect("64");
+    assert!(
+        pubky_switch_core::http::verify_response(
+            &alice_service_key(),
+            503,
+            Some(&request_signature),
+            header_text(&answer, header::SERVER_TIME).expect("time"),
+            &answer.body,
+            &signature,
+        )
+        .is_ok(),
+        "signed with the account's key"
+    );
+    assert_eq!(rows(&replay, &alice_id()).await, before);
+    assert!(replay.keys.public_key(&key).await.is_ok(), "the key stays");
+    assert_eq!(
+        replay.keys.erasure(&alice_id()).await.expect("ledger"),
+        None
+    );
+    sqlx::query("DROP TRIGGER refuse_erasure ON accounts")
+        .execute(&mut conn)
+        .await
+        .expect("drop trigger");
+    conn.close().await.expect("close");
+    assert_eq!(erase(&replay, &alice_service_key(), &at).await.status, 200);
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_erase_deletes_the_pending_key() {
+    // A fresh enrollment at the serving account made a pending key of the next generation
+    // (Switch wire 3.7): it goes with the account (7.4.16).
+    let Some(replay) = replay().await else { return };
+    serve_alice(&replay).await;
+    let served = item_time(&vectors("chain.json")["items"][1]);
+    let again = fresh_enrollment(3);
+    let answer = replay
+        .service
+        .handle(signer_request("POST", "/v1/enroll", again, ms(&served)))
+        .await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    let pending: Option<String> =
+        sqlx::query_scalar("SELECT pending_key FROM accounts WHERE id = $1")
+            .bind(alice_id())
+            .fetch_one(&mut conn)
+            .await
+            .expect("pending");
+    conn.close().await.expect("close");
+    let pending = KeyId::parse(&pending.expect("a pending key")).expect("key id");
+    assert!(replay.keys.public_key(&pending).await.is_ok());
+    assert_eq!(
+        erase(&replay, &alice_service_key(), &served).await.status,
+        200
+    );
+    assert!(
+        replay.keys.public_key(&pending).await.is_err(),
+        "the pending key is gone"
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_erase_owed_keys_swept_later() {
+    // A key an erasure owes deleting, left by a key store failure or a crash, goes at the
+    // next sweep, its erasure recorded in the ledger first (7.4.16, spec 6.5).
+    let Some(replay) = replay().await else { return };
+    let key = replay.keys.generate().await.expect("key");
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    sqlx::query("INSERT INTO erased_keys (key_id, account_id, erased_at_ms) VALUES ($1, $2, 7)")
+        .bind(key.id.as_str())
+        .bind(alice_id())
+        .execute(&mut conn)
+        .await
+        .expect("owed");
+    replay.service.sweep_erased_keys().await;
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM erased_keys")
+        .fetch_one(&mut conn)
+        .await
+        .expect("count");
+    conn.close().await.expect("close");
+    assert_eq!(left, 0);
+    assert!(replay.keys.public_key(&key.id).await.is_err());
+    assert_eq!(
+        replay.keys.erasure(&alice_id()).await.expect("ledger"),
+        Some(7)
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+/// The vectors' enrollment with another nonce, signed by alice: a fresh one, not a retry.
+fn fresh_enrollment(nonce: u8) -> Vec<u8> {
+    use pubky_switch_core::{
+        keys::IdentityKey,
+        records::{Enrollment, EnrollmentBody},
+        sig::SignedDoc,
+    };
+    let http = vectors("http.json");
+    let vector = named(&http["requests"], "signer: enrollment");
+    let body: Value = serde_json::from_slice(
+        &pubky_switch_core::enc::unb64(vector["body_b64"].as_str().expect("body")).expect("b64"),
+    )
+    .expect("json");
+    let signed: SignedDoc = serde_json::from_value(body["enrollment"].clone()).expect("signed");
+    let mut fields: EnrollmentBody =
+        serde_json::from_slice(&signed.body_bytes().expect("body")).expect("enrollment body");
+    fields.nonce = [nonce; 16];
+    let key = IdentityKey::from_secret(hex32(&alice(&vectors("keys.json"))["secret_hex"]));
+    let enrollment = Enrollment::sign(&key, fields).expect("sign");
+    serde_json::to_vec(&json!({ "enrollment": enrollment.signed() })).expect("json")
+}
+
+#[tokio::test]
+async fn test_erase_waiting_feed_read_never_signs_with_the_erased_key() {
+    // A feed read waits; the account is erased and enrolled again meanwhile. The read finds
+    // its key gone and another account in its place: the operator's temporary failure, never
+    // an answer signed with the erased key (Switch wire 7.4.16).
+    use std::time::Duration;
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let at = revoke_time();
+    let keys = vectors("keys.json");
+    let request = app_request(
+        app(&keys, "wallet"),
+        "GET",
+        &format!("/v1/{}/feed?after=1:9&wait=2", alice_id()),
+        Vec::new(),
+        ms(&at),
+    );
+    let request_signature = signature_of(&request);
+    let (answer, ()) = tokio::join!(replay.service.handle(request), async {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(erase(&replay, &alice_service_key(), &at).await.status, 200);
+        let enrolled = replay
+            .service
+            .handle(signer_request(
+                "POST",
+                "/v1/enroll",
+                fresh_enrollment(5),
+                ms(&at),
+            ))
+            .await;
+        assert_eq!(
+            enrolled.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&enrolled.body)
+        );
+    });
+    assert_eq!(
+        answer.status,
+        503,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    assert!(no_head(&answer));
+    assert!(operator_signed(&answer, Some(&request_signature)));
     replay.db.drop_database().await.expect("drop");
 }

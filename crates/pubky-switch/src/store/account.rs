@@ -38,16 +38,6 @@ pub struct NewAccount {
     pub enrollment_hash: [u8; 32],
 }
 
-/// The keys of an erased account, which the key store deletes once the erasure committed
-/// (Switch wire 7.4.16).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ErasedKeys {
-    /// The account's service key.
-    pub service_key: KeyId,
-    /// The next generation's pending key, if an enrollment made one (Switch wire 3.7).
-    pub pending_key: Option<KeyId>,
-}
-
 /// An account's position: its generation and key, the last `seq` given out, the chain head
 /// and the stamped service time.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -462,12 +452,14 @@ impl AccountTxn {
     }
 
     /// Erase the account (Switch wire 7.4.16): delete its row, and with it every row of its
-    /// state, which all reference it with `ON DELETE CASCADE`, then commit. A request waiting
-    /// on the account's changes wakes, and finds it gone. Returns the key store IDs of its
-    /// service key and of a pending key of the next generation, for the caller to delete
-    /// once this has committed: a key deleted first, by an erasure that then failed to
-    /// commit, would leave an account no key can answer for.
-    pub async fn erase(mut self) -> Result<ErasedKeys, StoreError> {
+    /// state, which all reference it with `ON DELETE CASCADE`; owe the deletion of its service
+    /// key and of a pending key of the next generation, in `erased_keys`, stamped `erased_at`;
+    /// then commit. A request waiting on the account's changes wakes, and finds it gone. The
+    /// keys go after the commit ([`Store::erased_keys`]): a key deleted first, by an erasure
+    /// that then failed to commit, would leave an account no key can answer for.
+    ///
+    /// [`Store::erased_keys`]: super::Store::erased_keys
+    pub async fn erase(mut self, erased_at: u64) -> Result<(), StoreError> {
         let pending_key = self.pending_key().await?;
         let deleted = sqlx::query("DELETE FROM accounts WHERE id = $1")
             .bind(&self.head.id)
@@ -478,6 +470,18 @@ impl AccountTxn {
         if deleted != 1 {
             return Err(StoreError::Corrupt("account row vanished under its lock"));
         }
+        for key in std::iter::once(&self.head.service_key).chain(pending_key.as_ref()) {
+            sqlx::query(
+                "INSERT INTO erased_keys (key_id, account_id, erased_at_ms) VALUES ($1, $2, $3) \
+                 ON CONFLICT (key_id) DO NOTHING",
+            )
+            .bind(key.as_str())
+            .bind(&self.head.id)
+            .bind(to_db(erased_at, "erased_at_ms")?)
+            .execute(&mut *self.tx)
+            .await
+            .map_err(StoreError::from_db)?;
+        }
         sqlx::query("SELECT pg_notify($1, $2)")
             .bind(crate::changes::CHANNEL)
             .bind(&self.head.id)
@@ -485,10 +489,7 @@ impl AccountTxn {
             .await
             .map_err(StoreError::from_db)?;
         self.tx.commit().await.map_err(StoreError::from_db)?;
-        Ok(ErasedKeys {
-            service_key: self.head.service_key,
-            pending_key,
-        })
+        Ok(())
     }
 
     /// Commit the request, then move the service key's mark to the committed chain head,

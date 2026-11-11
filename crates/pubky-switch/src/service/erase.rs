@@ -6,11 +6,16 @@
 //! An account behind its key's mark still takes it (7.3 step 10), since the answer carries
 //! no head. Then the order is fixed:
 //! 1. the answer `{ "erased": true }` is signed while the key exists;
-//! 2. the account's row is deleted, and with it every row of its state, and committed;
-//! 3. its service key and mark, and a pending key of the next generation, are deleted from
-//!    the key store, the erasure recorded in the key store's ledger (spec 6.5), and the
-//!    account's rate-limit and failed-authentication counts forgotten;
+//! 2. the account's row is deleted, and with it every row of its state; the deletion of its
+//!    service key and mark, and of a pending key of the next generation, is owed in the same
+//!    transaction (`erased_keys`); all of it is committed;
+//! 3. the owed keys are deleted from the key store and the erasure recorded in its ledger
+//!    (spec 6.5), and the account's rate-limit and failed-authentication counts forgotten;
 //! 4. only then is the answer released.
+//!
+//! A key the key store fails to delete stays owed, durably: [`Service::sweep_erased_keys`]
+//! deletes it at the next erasure and at start. Nothing names it any more, so it signs nothing
+//! meanwhile.
 //!
 //! If the deletion can't commit, nothing is deleted and the answer is `503`, signed with the
 //! account's key, without a head; the signer retries. Afterwards every request for the
@@ -65,8 +70,8 @@ impl Service {
         answer.deferred = None;
         let signed = sign_answer(signer, signature, time_ms, answer);
         let account = txn.head().id.clone();
-        let keys = match txn.erase().await {
-            Ok(keys) => keys,
+        match txn.erase(time_ms).await {
+            Ok(()) => {}
             Err(failure) => {
                 // Dropped uncommitted: nothing is deleted, and the signer retries.
                 tracing::error!(%failure, "an erasure");
@@ -74,19 +79,43 @@ impl Service {
                 return sign_answer(signer, signature, committed_ms, Answer::error(&error));
             }
         };
-        // The state is gone for good. The keys go after it: a key deleted before a commit
-        // that then failed would leave an account no key answers for. A key left by a
-        // failure here signs nothing more, since no account names it.
-        for key in std::iter::once(&keys.service_key).chain(keys.pending_key.as_ref()) {
-            if let Err(failure) = self.keys.delete(key).await {
-                tracing::error!(%failure, "deleting an erased account's key");
-            }
-        }
-        if let Err(failure) = self.keys.record_erasure(&account, time_ms).await {
-            tracing::error!(%failure, "recording an erasure");
-        }
+        // The state is gone for good, and the keys' deletion owed with it. The keys go after
+        // it: a key deleted before a commit that then failed would leave an account no key
+        // answers for.
+        self.sweep_erased_keys().await;
         self.forget_account(&account);
         signed
+    }
+
+    /// Delete every key an erasure still owes deleting, recording each erasure in the key
+    /// store's ledger first (Switch wire 7.4.16, spec 6.5), and drop what is done. A failure
+    /// leaves the key owed for the next sweep: at the next erasure, and at start. Run at
+    /// start by the service's binary.
+    pub async fn sweep_erased_keys(&self) {
+        let owed = match self.store.erased_keys().await {
+            Ok(owed) => owed,
+            Err(failure) => {
+                tracing::error!(%failure, "reading the keys erasures owe deleting");
+                return;
+            }
+        };
+        for erased in owed {
+            if let Err(failure) = self
+                .keys
+                .record_erasure(&erased.account, erased.erased_at_ms)
+                .await
+            {
+                tracing::error!(%failure, "recording an erasure");
+                continue;
+            }
+            if let Err(failure) = self.keys.delete(&erased.key).await {
+                tracing::error!(%failure, "deleting an erased account's key");
+                continue;
+            }
+            if let Err(failure) = self.store.forget_erased_key(&erased.key).await {
+                tracing::error!(%failure, "dropping a deleted key's row");
+            }
+        }
     }
 
     /// Forget every count the service keeps for `account` (Switch wire 7.4.16, 9.4).
