@@ -373,13 +373,23 @@ pub struct InviteCodePut {
 pub struct InviteContext {
     value: Value,
     written_len: usize,
+    written: Vec<u8>,
 }
 
 impl InviteContext {
     /// A context as a writer writes it: compact JSON.
     pub fn new(value: Value) -> Self {
-        let written_len = serde_json::to_vec(&value).map_or(usize::MAX, |bytes| bytes.len());
-        Self { value, written_len }
+        let written = serde_json::to_vec(&value).unwrap_or_default();
+        let written_len = if written.is_empty() {
+            usize::MAX
+        } else {
+            written.len()
+        };
+        Self {
+            value,
+            written_len,
+            written,
+        }
     }
 
     /// The value.
@@ -392,6 +402,13 @@ impl InviteContext {
     /// [`InviteContext::new`], its compact form's.
     pub fn written_len(&self) -> usize {
         self.written_len
+    }
+
+    /// The bytes the value takes within the signed body it was read from, exactly as
+    /// written, which every reader repeats (Switch wire 1.1); for one made with
+    /// [`InviteContext::new`], its compact form.
+    pub fn written_bytes(&self) -> &[u8] {
+        &self.written
     }
 }
 
@@ -826,8 +843,13 @@ impl OpBody {
         // The context's limit counts the bytes as written, never a re-serialization (Switch
         // wire 6.2).
         if let OpKind::InviteCodePut(put) = &mut kind {
-            put.context.written_len =
-                crate::json::member_span(bytes, "context").map_or(usize::MAX, |span| span.len());
+            match crate::json::member_span(bytes, "context") {
+                Some(span) => {
+                    put.context.written_len = span.len();
+                    put.context.written = bytes.get(span).unwrap_or_default().to_vec();
+                }
+                None => put.context.written_len = usize::MAX,
+            }
         }
         Ok(Self {
             identity,
@@ -1293,6 +1315,33 @@ mod tests {
             .unwrap()
             .replace("\"orphan_after\":60", "\"orphan_after\":60.0");
         assert!(OpBody::parse(text.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn test_op_body_invite_context_keeps_its_written_bytes() {
+        // Opaque numbers that a re-serialization would change come back byte for byte
+        // (Switch wire 1.1), as every reader repeats them.
+        let b = body(OpKind::InviteCodePut(InviteCodePut {
+            code_hash: [4; 32],
+            expires_at: 1_767_225_600_000,
+            max_uses: 1,
+            context: InviteContext::new(serde_json::json!({"rate": -2.5})),
+        }));
+        let written = r#"{"n":12345678901234567890123,"r":1.50}"#;
+        let text = String::from_utf8(b.to_json().unwrap()).unwrap().replace(
+            r#""context":{"rate":-2.5}"#,
+            &format!(r#""context":{written}"#),
+        );
+        assert!(text.contains(written));
+        let parsed = OpBody::parse(text.as_bytes()).unwrap();
+        let OpKind::InviteCodePut(put) = parsed.kind else {
+            panic!("an invite_code.put");
+        };
+        assert_eq!(put.context.written_bytes(), written.as_bytes());
+        assert_eq!(put.context.written_len(), written.len());
+        // One made by a writer holds its compact form.
+        let made = InviteContext::new(serde_json::json!({"a": 1}));
+        assert_eq!(made.written_bytes(), br#"{"a":1}"#);
     }
 
     #[test]

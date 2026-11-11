@@ -126,6 +126,10 @@ pub struct AccountTxn {
     loaded: AccountHead,
     changed: bool,
     last_seen: Option<([u8; 16], u64)>,
+    /// Sender identities that hit an append limit in this request (Switch wire 9.4 Flags).
+    flag_hits: Vec<[u8; 32]>,
+    /// The flagged senders kept (`max_flags`), for the hits above.
+    max_flags: u64,
 }
 
 impl std::fmt::Debug for AccountTxn {
@@ -250,6 +254,8 @@ impl AccountTxn {
             head,
             changed: false,
             last_seen: None,
+            flag_hits: Vec::new(),
+            max_flags: 0,
         }))
     }
 
@@ -315,6 +321,14 @@ impl AccountTxn {
     /// written with the commit, also when the endpoint is refused and rolled back.
     pub fn note_last_seen(&mut self, app_id: [u8; 16], at_ms: u64) {
         self.last_seen = Some((app_id, at_ms));
+    }
+
+    /// Note a hit of `sender` against an append limit (Switch wire 9.4 Flags). It is written
+    /// with the commit, also when the append is refused and rolled back, as the refusal is
+    /// what it counts.
+    pub fn note_flag_hit(&mut self, sender: [u8; 32], max_flags: u64) {
+        self.flag_hits.push(sender);
+        self.max_flags = max_flags;
     }
 
     /// Mark the start of the request's endpoint. Everything it writes after this, its
@@ -395,6 +409,34 @@ impl AccountTxn {
                 .execute(&mut *self.tx)
                 .await
                 .map_err(StoreError::from_db)?;
+        }
+        let flag_hits = std::mem::take(&mut self.flag_hits);
+        for sender in &flag_hits {
+            sqlx::query(
+                "INSERT INTO sender_flags (account_id, pubky, hits, last_hit_ms) \
+                 VALUES ($1, $2, 1, $3) ON CONFLICT (account_id, pubky) DO UPDATE \
+                 SET hits = sender_flags.hits + 1, last_hit_ms = $3",
+            )
+            .bind(&self.head.id)
+            .bind(sender.as_slice())
+            .bind(to_db(self.head.stamped_time_ms, "last_hit_ms")?)
+            .execute(&mut *self.tx)
+            .await
+            .map_err(StoreError::from_db)?;
+        }
+        // At most `max_flags` flagged senders, the least frequent dropping, and of those
+        // equally frequent the one hit longest ago (Switch wire 9.1).
+        if !flag_hits.is_empty() {
+            sqlx::query(
+                "DELETE FROM sender_flags WHERE account_id = $1 AND pubky IN ( \
+                     SELECT pubky FROM sender_flags WHERE account_id = $1 \
+                     ORDER BY hits DESC, last_hit_ms DESC, pubky OFFSET $2)",
+            )
+            .bind(&self.head.id)
+            .bind(to_db(self.max_flags, "max_flags")?)
+            .execute(&mut *self.tx)
+            .await
+            .map_err(StoreError::from_db)?;
         }
         if self.changed {
             // Sent with the commit, and only if it commits.

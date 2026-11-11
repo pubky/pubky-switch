@@ -320,6 +320,7 @@ async fn load_state(
                 writer: invite.writer,
                 expires_at: invite.expires_at_ms,
                 context: invite.context,
+                context_written: invite.context_written,
             },
         );
     }
@@ -346,15 +347,59 @@ pub(super) async fn load_apps(
     held: Option<&IdentityDoc>,
     now: u64,
 ) -> Result<OpsState, StoreError> {
+    Ok(load_apps_and_rows(txn, held, now).await?.0)
+}
+
+/// As [`load_apps`], with the app rows it read. The one loader behind every judgment of
+/// which apps are current ([`OpsState::is_current`]) or served ([`OpsState::is_served`])
+/// outside a batch: the inbox's targets, the entries' release and the directory take
+/// current, and the claims' views served; `GET /apps` builds the same state
+/// from its own read ([`super::apps`]).
+pub(super) async fn load_apps_and_rows(
+    txn: &mut AccountTxn,
+    held: Option<&IdentityDoc>,
+    now: u64,
+) -> Result<(OpsState, Vec<StoredApp>), StoreError> {
     let head = txn.head().clone();
     let identity = head.identity_key;
     let mut state = OpsState::new(identity, head.generation, head.last_seq, now);
     state.doc = held.cloned();
-    for app in txn.apps().await? {
-        state.apps.insert(app.app_id, held_app(&app, &identity)?);
+    let apps = txn.apps().await?;
+    for app in &apps {
+        state.apps.insert(app.app_id, held_app(app, &identity)?);
     }
     state.kept = txn.kept_app_ids().await?.into_iter().collect();
-    Ok(state)
+    Ok((state, apps))
+}
+
+/// A change outside a batch to the directory and to which apps are current: an
+/// `identity.json` delivery (`delivered` replacing `held`) or a revocation (`revoked`).
+/// `directory_version` moves, since the directory's `identity` or apps change with it;
+/// `apps_version` moves if the set of reachable apps changed, and an app that became
+/// reachable takes the new version (Switch wire 7.4.10, [`OpsState::settle_directory`]);
+/// and the inbox entries every current target has passed go (9.1). Called before the
+/// revocation is written, so the state before it is read from the store.
+pub(super) async fn settle_change(
+    txn: &mut AccountTxn,
+    held: Option<&IdentityDoc>,
+    delivered: Option<&IdentityDoc>,
+    revoked: Option<[u8; 16]>,
+    now: u64,
+) -> Result<(), StoreError> {
+    let mut before = load_apps(txn, held, now).await?;
+    (before.directory_version, before.apps_version) = txn.directory_versions().await?;
+    let mut after = before.clone();
+    if let Some(doc) = delivered {
+        after.doc = Some(doc.clone());
+    }
+    if let Some(app) = revoked {
+        after.kept.insert(app);
+    }
+    after.directory_version = after.directory_version.saturating_add(1);
+    after.settle_directory(&before);
+    save_apps(txn, &before, &after).await?;
+    txn.delete_passed_entries(&after.current_app_ids()).await?;
+    Ok(())
 }
 
 pub(crate) fn held_app(app: &StoredApp, identity: &[u8; 32]) -> Result<HeldApp, StoreError> {
@@ -658,7 +703,7 @@ impl Service {
                 before.claims.get(&entry.claim_key),
                 &entry,
                 writer,
-                &|app| before.current_without_expiry(app),
+                &|app| before.is_current(app),
             )
         };
         if !self.time.read().trusted && depends_on_time(&ops, &outcome_depends) {
@@ -689,6 +734,9 @@ impl Service {
                 limits: &self.limits.ops_limits(),
             },
         )?;
+        // An app record, a receive key or a renewed certificate can make an app reachable
+        // or stop it being so (Switch wire 7.4.10).
+        after.settle_directory(&before);
         if effect == BatchEffect::Unchanged {
             save_apps(txn, &before, &after)
                 .await
@@ -828,10 +876,16 @@ async fn save_apps(
     before: &OpsState,
     after: &OpsState,
 ) -> Result<(), StoreError> {
+    let mut cursor_moved = false;
     for (app_id, app) in &after.apps {
         if before.apps.get(app_id) != Some(app) {
             txn.put_app(&stored_app(*app_id, app)).await?;
+            cursor_moved |= before.apps.get(app_id).map(|held| held.cursor) != Some(app.cursor);
         }
+    }
+    // An entry every current target has passed goes (Switch wire 9.1).
+    if cursor_moved {
+        txn.delete_passed_entries(&after.current_app_ids()).await?;
     }
     for (app_id, key) in &after.new_receive_keys {
         txn.add_receive_key(app_id, key.n(), &key.kid(), key.signed())
@@ -954,6 +1008,7 @@ async fn save(
                 writer: invite.writer,
                 expires_at_ms: invite.expires_at,
                 context: invite.context.clone(),
+                context_written: invite.context_written.clone(),
             })
             .await?;
         }
