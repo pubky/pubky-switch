@@ -3343,3 +3343,92 @@ async fn test_erase_keyed_section_during_the_deletion_waits_for_its_commit() {
     assert!(operator_signed(&answer, Some(&refused_signature)));
     replay.db.drop_database().await.expect("drop");
 }
+
+/// A signer `GET /apps` paused under the lock after its signer is loaded, its transaction
+/// ended by the database, the account erased meanwhile (with `owed`, a key of it then left
+/// owed), then resumed: its answer, and its request's signature.
+async fn lost_lock_answer(owed: bool) -> (SwitchResponse, [u8; 64]) {
+    let mut replay = replay().await.expect("database");
+    replay_chain_through_revoke(&replay).await;
+    let key = service_key_id(&replay, &alice_id()).await;
+    let pause = std::sync::Arc::new(SignerPause {
+        inner: replay.keys.clone(),
+        armed: std::sync::atomic::AtomicBool::new(false),
+        paused: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    replay.service = pubky_switch::service::Service::new(
+        ORIGIN.into(),
+        replay.db.store().clone(),
+        pause.clone(),
+        replay.time.clone(),
+        pubky_switch::limits::Limits::default(),
+    );
+    pause.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+    let request = signer_apps();
+    let request_signature = signature_of(&request);
+    let (answer, ()) = tokio::join!(replay.service.handle(request), async {
+        pause.paused.notified().await;
+        let mut admin = sqlx::PgConnection::connect_with(replay.db.options())
+            .await
+            .expect("conn");
+        let killed: i64 = sqlx::query_scalar(
+            "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity \
+             WHERE datname = current_database() AND state = 'idle in transaction' \
+             AND query LIKE '%FOR UPDATE%'",
+        )
+        .fetch_one(&mut admin)
+        .await
+        .expect("terminate");
+        assert_eq!(killed, 1);
+        assert_eq!(
+            erase(&replay, &alice_service_key(), &revoke_time())
+                .await
+                .status,
+            200
+        );
+        if owed {
+            sqlx::query(
+                "INSERT INTO erased_keys (key_id, account_id, erased_at_ms) VALUES ($1, $2, 1)",
+            )
+            .bind(key.as_str())
+            .bind(alice_id())
+            .execute(&mut admin)
+            .await
+            .expect("owed");
+        }
+        pause.release.notify_one();
+    });
+    replay.db.drop_database().await.expect("drop");
+    (answer, request_signature)
+}
+
+#[tokio::test]
+async fn test_erase_lost_lock_failure_is_the_operators_404() {
+    // A request whose transaction the database ended under the lock, the account erased
+    // since: the operator's answer for an account the service doesn't host.
+    let (answer, signature) = lost_lock_answer(false).await;
+    assert_eq!(
+        code_of(&answer),
+        (404, json!("not_found")),
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    assert!(no_head(&answer));
+    assert!(operator_signed(&answer, Some(&signature)));
+}
+
+#[tokio::test]
+async fn test_erase_lost_lock_failure_to_the_signer_while_a_key_is_owed_is_the_503() {
+    // The same, to the signer while a key of the erased account is still owed: the
+    // operator's `503`, as `no_such_account` answers the signer then.
+    let (answer, signature) = lost_lock_answer(true).await;
+    assert_eq!(
+        code_of(&answer),
+        (503, json!("unavailable")),
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    assert!(no_head(&answer));
+    assert!(operator_signed(&answer, Some(&signature)));
+}
