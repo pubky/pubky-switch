@@ -10,11 +10,11 @@ use pubky_switch_core::{
     time::rfc3339,
 };
 
-use super::{Answer, Service, store_error};
+use super::{Answer, Deferred, Service, store_error};
 use crate::{
     http::error::{ApiError, ErrorCode},
     keys::ServiceSigner,
-    store::{AccountTxn, AllowEntry, AllowInvite, ListName},
+    store::{AccountTxn, AllowEntry, AllowInvite, ListName, SnapshotRead},
 };
 
 /// A JSON string: the encodings this answer writes (a Pubky ID, an App ID, b64, a time)
@@ -120,16 +120,22 @@ fn answer_body(
     out
 }
 
+/// A `GET /allow` answer's lists, read once the lock is gone from the snapshot of the state
+/// under it, so a long read holds no lock other requests wait for.
+#[derive(Debug)]
+pub(super) struct AllowRead {
+    snapshot: SnapshotRead,
+    time_ms: u64,
+    flag_after: u64,
+}
+
 impl Service {
     /// `GET /v1/{id}/allow` (Switch wire 7.4.6) under the lock, for the own app `reader`,
-    /// which needs `lists.read` (`403 permission_missing`).
-    ///
-    /// The lists are read in the request's own transaction, under the account's lock, so
-    /// they are the state at its stamped service time `time_ms`, the `Switch-Server-Time`
-    /// the answer is signed at, which the client keeps as the time its copy of the lists
-    /// is as of. Each list is whole and never cut: `flagged` holds every sender with at least
-    /// `flag_after` hits, bounded by `max_flags` (9.4), and `invite_codes` every code with
-    /// uses left and unexpired at `time_ms`.
+    /// which needs `lists.read` (`403 permission_missing`). The lists are read after the
+    /// lock ([`Service::allow_body`]) from the snapshot this transaction exports under it:
+    /// every write to them takes the account's lock, so they are the state at its stamped
+    /// service time `time_ms`, the `Switch-Server-Time` the answer is signed at, which the
+    /// client keeps as the time its copy of the lists is as of.
     pub(super) async fn get_allow(
         &self,
         txn: &mut AccountTxn,
@@ -143,32 +149,58 @@ impl Service {
                 "7.4.6: reading the lists needs lists.read",
             ));
         }
-        let contacts = txn
-            .allow_entries(ListName::Contact)
-            .await
-            .map_err(|e| store_error(&e))?;
-        let conversations = txn
-            .allow_entries(ListName::Conversation)
-            .await
-            .map_err(|e| store_error(&e))?;
-        let deny = txn
-            .allow_entries(ListName::Deny)
-            .await
-            .map_err(|e| store_error(&e))?;
-        let flagged = txn
-            .flagged_senders(u64::from(self.limits.flag_after))
-            .await
-            .map_err(|e| store_error(&e))?;
-        let invites = txn
-            .live_invite_codes(time_ms)
-            .await
-            .map_err(|e| store_error(&e))?;
-        let body = answer_body(&contacts, &conversations, &deny, &flagged, &invites);
         let head = self
             .head(txn, signer)
             .await
             .ok_or_else(|| ApiError::unavailable("7.6: a temporary failure"))?;
-        Ok(Answer::ok(body).with_head(Some(head)))
+        let snapshot = txn.snapshot_read().map_err(|e| store_error(&e))?;
+        let mut answer = Answer::ok(Vec::new()).with_head(Some(head));
+        answer.deferred = Some(Deferred::Allow(AllowRead {
+            snapshot,
+            time_ms,
+            flag_after: u64::from(self.limits.flag_after),
+        }));
+        Ok(answer)
+    }
+
+    /// The lists of `read`, whole (Switch wire 7.4.6): `flagged` holds every sender with at
+    /// least `flag_after` hits, bounded by `max_flags` (9.4), and `invite_codes` every code
+    /// with uses left and unexpired at the request's service time.
+    pub(super) async fn allow_body(read: AllowRead) -> Result<Vec<u8>, ApiError> {
+        let AllowRead {
+            mut snapshot,
+            time_ms,
+            flag_after,
+        } = read;
+        let fail = |e: &crate::store::StoreError| store_error(e);
+        let contacts = snapshot
+            .allow_entries(ListName::Contact)
+            .await
+            .map_err(|e| fail(&e))?;
+        let conversations = snapshot
+            .allow_entries(ListName::Conversation)
+            .await
+            .map_err(|e| fail(&e))?;
+        let deny = snapshot
+            .allow_entries(ListName::Deny)
+            .await
+            .map_err(|e| fail(&e))?;
+        let flagged = snapshot
+            .flagged_senders(flag_after)
+            .await
+            .map_err(|e| fail(&e))?;
+        let invites = snapshot
+            .live_invite_codes(time_ms)
+            .await
+            .map_err(|e| fail(&e))?;
+        snapshot.finish().await.map_err(|e| fail(&e))?;
+        Ok(answer_body(
+            &contacts,
+            &conversations,
+            &deny,
+            &flagged,
+            &invites,
+        ))
     }
 }
 

@@ -1,10 +1,11 @@
 //! The lists `GET /allow` shows (Switch wire 7.4.6): contacts, conversation entries, the deny
 //! list, flagged senders and live invite codes, each whole, read in the request's own
-//! transaction so they are the state at its stamped service time.
+//! request's snapshot, after the lock ([`SnapshotRead`]), so they are the state at its
+//! stamped service time.
 
 use sqlx::Row;
 
-use super::{AccountTxn, ListName, StoreError, from_db, to_db};
+use super::{ListName, SnapshotRead, StoreError, from_db, to_db};
 
 /// A list entry as `GET /allow` shows it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -43,17 +44,17 @@ fn array<const N: usize>(bytes: &[u8], what: &'static str) -> Result<[u8; N], St
     <[u8; N]>::try_from(bytes).map_err(|_| StoreError::Corrupt(what))
 }
 
-impl AccountTxn {
+impl SnapshotRead {
     /// Every entry of `list`, by Pubky ID.
     pub async fn allow_entries(&mut self, list: ListName) -> Result<Vec<AllowEntry>, StoreError> {
-        let id = self.head().id.clone();
+        let id = self.id.clone();
         let rows = sqlx::query(
             "SELECT pubky, written_by, at_ms, code_hash, context, last_used_ms FROM list_entries \
              WHERE account_id = $1 AND list = $2 ORDER BY pubky",
         )
         .bind(id)
         .bind(list.as_str())
-        .fetch_all(self.conn())
+        .fetch_all(&mut *self.tx)
         .await
         .map_err(StoreError::from_db)?;
         rows.iter()
@@ -80,14 +81,14 @@ impl AccountTxn {
         &mut self,
         min_hits: u64,
     ) -> Result<Vec<([u8; 32], u64)>, StoreError> {
-        let id = self.head().id.clone();
+        let id = self.id.clone();
         let rows = sqlx::query(
             "SELECT pubky, hits FROM sender_flags WHERE account_id = $1 AND hits >= $2 \
              ORDER BY hits DESC, pubky",
         )
         .bind(id)
         .bind(to_db(min_hits, "flag_after")?)
-        .fetch_all(self.conn())
+        .fetch_all(&mut *self.tx)
         .await
         .map_err(StoreError::from_db)?;
         rows.iter()
@@ -103,14 +104,14 @@ impl AccountTxn {
 
     /// The invite codes live at `now_ms`, with uses left and unexpired, by code hash.
     pub async fn live_invite_codes(&mut self, now_ms: u64) -> Result<Vec<AllowInvite>, StoreError> {
-        let id = self.head().id.clone();
+        let id = self.id.clone();
         let rows = sqlx::query(
             "SELECT code_hash, expires_at_ms, max_uses, uses, writer FROM invite_codes \
              WHERE account_id = $1 AND uses < max_uses AND expires_at_ms > $2 ORDER BY code_hash",
         )
         .bind(id)
         .bind(to_db(now_ms, "now_ms")?)
-        .fetch_all(self.conn())
+        .fetch_all(&mut *self.tx)
         .await
         .map_err(StoreError::from_db)?;
         rows.iter()

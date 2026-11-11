@@ -130,6 +130,11 @@ pub struct AccountTxn {
     flag_hits: Vec<[u8; 32]>,
     /// The flagged senders kept (`max_flags`), for the hits above.
     max_flags: u64,
+    /// A transaction on the reader pool, begun before the lock, to export this one's
+    /// snapshot to ([`AccountTxn::snapshot_read`]).
+    pub(super) reader: Option<Transaction<'static, Postgres>>,
+    /// The reader, once this transaction's snapshot is exported to it.
+    pub(super) snapshot: Option<super::SnapshotRead>,
 }
 
 impl std::fmt::Debug for AccountTxn {
@@ -256,6 +261,8 @@ impl AccountTxn {
             last_seen: None,
             flag_hits: Vec::new(),
             max_flags: 0,
+            reader: None,
+            snapshot: None,
         }))
     }
 

@@ -125,6 +125,10 @@ enum Deferred {
     Claim(claims::ClaimRead),
     /// A feed page, after its long-poll.
     Feed(Box<feed::FeedRead>),
+    /// `GET /allow`'s lists, from the snapshot of the state under the lock.
+    Allow(allow::AllowRead),
+    /// `GET /directory`'s apps, from the snapshot of the state under the lock.
+    Directory(Box<directory::DirectoryRead>),
 }
 
 impl Answer {
@@ -441,7 +445,14 @@ impl Service {
             let account_key = pubky_switch_core::enc::pubky_key(&account).unwrap_or([0; 32]);
             peers::verify_delivery(&request.body, &account_key, other.as_ref())
         });
-        let txn = match self.store.begin(&account).await {
+        // The reads that run after the lock on its snapshot take their reader first, so the
+        // lock is never held waiting for one.
+        let begun = if matches!(call, Call::GetAllow | Call::Directory) {
+            self.store.begin_reading(&account).await
+        } else {
+            self.store.begin(&account).await
+        };
+        let txn = match begun {
             Ok(Some(txn)) => txn,
             // Erased between the lookup and the lock.
             Ok(None) => {
@@ -663,6 +674,13 @@ impl Service {
             let error = ApiError::unavailable("7.6: a temporary failure");
             return sign_answer(&signer, signature, committed_ms, Answer::error(&error));
         }
+        // A read after the lock takes this transaction's snapshot now, outside the endpoint's
+        // savepoint, which can't export one.
+        if let Err(failure) = txn.prepare_snapshot().await {
+            tracing::error!(%failure, "a snapshot for a read after the lock");
+            let error = ApiError::unavailable("7.6: a temporary failure");
+            return sign_answer(&signer, signature, committed_ms, Answer::error(&error));
+        }
         // What the endpoint writes is undone if it is refused, whatever step refuses it: a
         // refusal commits the stamped time and nothing else, so no later request can build
         // on a write it was never answered for (step 10).
@@ -739,6 +757,18 @@ impl Service {
                     Some(Deferred::Claim(read)) => match self.claim_body(&read).await {
                         Ok(body) => answer.body = body,
                         Err(error) => answer = Answer::error(&error).with_head(fallback_head),
+                    },
+                    Some(Deferred::Allow(read)) => match Self::allow_body(read).await {
+                        Ok(body) => answer.body = body,
+                        Err(error) => answer = Answer::error(&error).with_head(fallback_head),
+                    },
+                    Some(Deferred::Directory(read)) => match Self::directory_body(*read).await {
+                        Ok(body) => answer.body = body,
+                        // An app of another identity's refusal carries no head.
+                        Err(error) => {
+                            let head = answer.head.is_some().then_some(fallback_head).flatten();
+                            answer = Answer::error(&error).with_head(head);
+                        }
                     },
                     Some(Deferred::Feed(read)) => {
                         return match self.feed_page(&read, &signer).await {
