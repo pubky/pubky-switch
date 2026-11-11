@@ -45,10 +45,11 @@ use pubky_switch_core::records::{
     CLOCK_TOLERANCE_MS, IdentityDoc, MAX_CERT_LIFETIME_MS, RenewedCert, StoredPart,
     incremental_first_epoch, is_reduction, owed_closings, reduction_rotates, seal_bundle_parts,
 };
+use pubky_switch_core::scopes::Permission;
 use pubky_switch_core::sig::SignedDoc;
 
 use super::Signer;
-use crate::alert::Alert;
+use crate::alert::{Alert, RenewalSkip};
 use crate::error::{Refusal, Result, SignerError};
 use crate::key::SigningKey;
 use crate::protocol::Protocols;
@@ -115,9 +116,11 @@ impl Signer {
             .expires_at
             .unwrap_or_else(|| issued.saturating_add(self.state.cert_lifetime_ms))
             .min(issued.saturating_add(MAX_CERT_LIFETIME_MS));
-        // The switch's view, read before anything is signed: this install still signs, and
-        // the app has joined.
-        let statuses = self.switch_apps().await?;
+        // The switch's view, read before anything is signed: this install still signs, the
+        // app has joined, and the device clock the certificate is stamped with agrees with
+        // the switch's time.
+        let (statuses, switch_time) = self.switch_apps_at().await?;
+        clock_agrees(now, switch_time)?;
         let joined = statuses
             .iter()
             .any(|s| s.app_id == app_id && s.record_cert.is_some());
@@ -717,17 +720,19 @@ impl Signer {
     ///   `identity.json` lists the app, and it is neither revoked, being revoked, nor departed.
     ///   An app whose certificate has expired already is renewed too, which is how it comes
     ///   back: the switch takes the signer's renewal for it although its certificate has
-    ///   expired (Switch wire 3.8 "An expired certificate").
-    /// - An app with a renewal still open is left for a later run: its listed certificate
-    ///   isn't the one it presents yet. So is one that hasn't joined, or one the switch shows
-    ///   departed, whose removal comes first.
-    /// - The lifetime is judged on the signer's clock, as `issued_at` is. The switch takes the
-    ///   signer's requests only within the clock tolerance of its own time (Switch wire 7.1),
-    ///   so that clock can't be far off while a renewal goes out. A renewal needs no trusted
-    ///   time at the switch (Switch spec 10.1).
-    /// - An app whose certificate holds a scope no registered protocol owns can't be renewed
-    ///   with it (design note, decision 2): it is skipped, with [`Alert::RenewalSkipped`]. A
-    ///   refusal that concerns one app only doesn't hold back the others.
+    ///   expired (Switch wire 3.8 "An expired certificate"). One that hasn't joined is left:
+    ///   the switch takes no `cert.put` for it yet (Switch wire 6.2).
+    /// - An app with a renewal still open is renewed again all the same, so an app that stays
+    ///   away never lapses: each renewal adds a `renewed` entry, and a newer `cert.put`
+    ///   replaces the one the switch stores (Switch wire 3.3, 3.8).
+    /// - Half the lifetime is judged on the switch's signed time, from its `GET /apps` answer.
+    ///   The certificate is stamped with the device clock, so while that clock and the
+    ///   switch's time differ by more than the clock tolerance, nothing is renewed by itself,
+    ///   with [`Alert::ClockOff`] (Switch spec 10.1).
+    /// - A renewal the user didn't ask for never changes what a certificate grants: an app
+    ///   whose scopes a registered protocol no longer owns, or which the protocols' tables now
+    ///   give other switch permissions, is skipped, with [`Alert::RenewalSkipped`] (design
+    ///   note, decision 2). A refusal that concerns one app only doesn't hold back the others.
     ///
     /// # Errors
     ///
@@ -737,49 +742,58 @@ impl Signer {
     pub async fn renew_expiring(&mut self) -> Result<Vec<[u8; 16]>> {
         self.ready().await?;
         let newest = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
-        let statuses = self.switch_apps().await?;
+        let (statuses, switch_time) = self.switch_apps_at().await?;
+        if clock_agrees(self.env.clock.now_ms(), switch_time).is_err() {
+            return self.skip_renewals(vec![Alert::ClockOff]).await;
+        }
         let certs = self.held_certs()?;
-        let now = self.env.clock.now_ms();
-        let due: Vec<[u8; 16]> = newest
-            .body()
-            .apps
-            .iter()
-            .filter(|listed| {
-                let removed = statuses.iter().any(|s| {
-                    s.app_id == listed.app_id && (s.revoked_at.is_some() || s.departed_at.is_some())
-                });
-                let open = newest
-                    .body()
-                    .renewed
-                    .iter()
-                    .any(|r| r.app_id == listed.app_id && r.until.is_none());
-                let past_half = certs
-                    .iter()
-                    .find(|c| c.hash() == listed.cert)
-                    .is_some_and(|cert| past_half_lifetime(cert, now));
-                past_half && !open && !removed
-            })
-            .map(|listed| listed.app_id)
-            .collect();
+        let mut due = Vec::new();
+        let mut skipped = Vec::new();
+        for listed in &newest.body().apps {
+            let removed = statuses.iter().any(|s| {
+                s.app_id == listed.app_id && (s.revoked_at.is_some() || s.departed_at.is_some())
+            });
+            let Some(cert) = certs.iter().find(|c| c.hash() == listed.cert) else {
+                continue;
+            };
+            if removed || !past_half_lifetime(cert, switch_time) {
+                continue;
+            }
+            // The certificate as it is: the same scopes, and the permissions it holds.
+            let reason = match self.env.protocols.terms(cert.scopes()) {
+                Err(SignerError::Refused(Refusal::UnknownScopes { scopes })) => {
+                    Some(RenewalSkip::UnownedScopes { scopes })
+                }
+                Err(_) => continue,
+                Ok(terms) if terms.permissions != cert.permissions() => {
+                    let names = |all: &[Permission]| all.iter().map(ToString::to_string).collect();
+                    Some(RenewalSkip::PermissionsChanged {
+                        held: names(cert.permissions()),
+                        now: names(&terms.permissions),
+                    })
+                }
+                Ok(_) => None,
+            };
+            match reason {
+                Some(reason) => skipped.push(Alert::RenewalSkipped {
+                    app_id: listed.app_id,
+                    reason,
+                }),
+                None => due.push(listed.app_id),
+            }
+        }
+        self.skip_renewals(skipped).await?;
         let mut renewed = Vec::new();
         for app_id in due {
             match self.renew(app_id, CertChange::default()).await {
                 Ok(_) => renewed.push(app_id),
-                Err(SignerError::Refused(Refusal::UnknownScopes { scopes }))
-                    if self.flow.is_none() =>
-                {
-                    let mut state = self.state.clone();
-                    state.alert(Alert::RenewalSkipped { app_id, scopes });
-                    if state != self.state {
-                        self.commit(state, None).await?;
-                    }
-                }
                 Err(SignerError::Refused(
                     Refusal::NotJoined
                     | Refusal::NotListed
                     | Refusal::CutOff
                     | Refusal::Superseded { .. }
                     | Refusal::Scopes { .. }
+                    | Refusal::UnknownScopes { .. }
                     | Refusal::ProtocolRule { .. },
                 )) if self.flow.is_none() => {}
                 Err(error) => return Err(error),
@@ -787,6 +801,31 @@ impl Signer {
         }
         Ok(renewed)
     }
+
+    /// Raise `alerts` for renewals the signer leaves to the user; renews nothing.
+    async fn skip_renewals(&mut self, alerts: Vec<Alert>) -> Result<Vec<[u8; 16]>> {
+        let mut state = self.state.clone();
+        for alert in alerts {
+            state.alert(alert);
+        }
+        if state != self.state {
+            self.commit(state, None).await?;
+        }
+        Ok(Vec::new())
+    }
+}
+
+/// Whether the device clock, `now`, agrees with the switch's signed time within the clock
+/// tolerance (Switch spec 10.1): a certificate is stamped with the device clock.
+pub(super) fn clock_agrees(now: u64, switch_time: u64) -> Result<()> {
+    if now.abs_diff(switch_time) > CLOCK_TOLERANCE_MS {
+        return Err(Refusal::ClockOff {
+            device_ms: now,
+            switch_ms: switch_time,
+        }
+        .into());
+    }
+    Ok(())
 }
 
 /// Whether less than half of `cert`'s lifetime remains at `now` (Switch spec 3.2).

@@ -15,6 +15,27 @@ pub enum Source {
     Backup,
 }
 
+/// Why the signer didn't renew a certificate past half its lifetime by itself.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum RenewalSkip {
+    /// The certificate holds scopes no registered protocol owns, which a renewal can only
+    /// remove (design note, decision 2).
+    UnownedScopes {
+        /// Those scopes.
+        scopes: Vec<String>,
+    },
+    /// The registered protocols now give the certificate's scopes other switch permissions
+    /// than it holds. A renewal the user didn't ask for never changes what a certificate
+    /// grants: the user renews it, and sees the change.
+    PermissionsChanged {
+        /// The permissions the certificate holds.
+        held: Vec<String>,
+        /// The permissions a renewal would give it now.
+        now: Vec<String>,
+    },
+}
+
 /// Something the user needs to know.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -99,17 +120,19 @@ pub enum Alert {
         /// Its scopes that no registered protocol owns.
         scopes: Vec<String>,
     },
-    /// This app's certificate is past half its lifetime, and the signer can't renew it as it
-    /// is: it holds scopes no registered protocol owns, which a renewal can only remove
-    /// (design note, decision 2). Unless the user renews it without them, or a protocol comes
-    /// to own them, the certificate expires and the switch stops serving the app (Switch spec
-    /// 3.2).
+    /// This app's certificate is past half its lifetime, and the signer doesn't renew it by
+    /// itself, for `reason` (Switch spec 3.2). Unless the user renews it, the certificate
+    /// expires and the switch stops serving the app.
     RenewalSkipped {
         /// The app whose certificate isn't renewed.
         app_id: [u8; 16],
-        /// Its scopes that no registered protocol owns.
-        scopes: Vec<String>,
+        /// Why.
+        reason: RenewalSkip,
     },
+    /// The device clock and the switch's signed time differ by more than the clock tolerance
+    /// (Switch spec 10.1): certificates are stamped with the device clock, so the signer
+    /// renews none by itself, and refuses to issue or renew one, until they agree again.
+    ClockOff,
     /// A removed app's Pubky grant still lets it write its Homeserver paths: the Pubky SDK
     /// offers no call to revoke a grant yet, so the user revokes it in the Homeserver's own
     /// settings (Switch spec 3.4, 12.2 step 1; design note, decision 4). Raised once for each

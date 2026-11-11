@@ -64,7 +64,7 @@ use pubky_switch_core::scopes::Permission;
 use pubky_switch_core::sig::SignedDoc;
 
 use super::Signer;
-use super::renewal::{Answering, CertChange};
+use super::renewal::{Answering, CertChange, clock_agrees};
 use crate::alert::Alert;
 use crate::error::{Refusal, Result, SignerError};
 use crate::protocol::GrantPath;
@@ -235,6 +235,10 @@ impl Signer {
         let identity = self.state.identity;
         let body = review.request.body();
         let now = self.env.clock.now_ms();
+        // The certificate is stamped with the device clock: it must agree with the switch's
+        // time.
+        let (_, switch_time) = self.switch_apps_at().await?;
+        clock_agrees(now, switch_time)?;
         let expires = now.saturating_add(self.state.cert_lifetime_ms);
         let protocols = self.env.protocols.clone();
         let has_keys = |scope: &str| protocols.has_keys(scope);

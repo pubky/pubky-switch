@@ -1215,8 +1215,6 @@ impl Signer {
         Err(SignerError::Alarm(alert))
     }
 
-    /// Publish the newest version on the Homeserver once the switch accepted it (Switch spec
-    /// 4.3: deliver first, publish after).
     /// Publish the newest version again where the Homeserver's copy is older, missing or
     /// doesn't verify (Switch wire 3.3 "Deliver, then publish"; design note, section 4.5 step
     /// 9). It passes the gate of every signing step first ([`Signer::ready`]): this install
@@ -1244,6 +1242,8 @@ impl Signer {
         Ok(())
     }
 
+    /// Publish the newest version on the Homeserver once the switch accepted it (Switch spec
+    /// 4.3: deliver first, publish after).
     async fn publish(&mut self) -> Result<()> {
         let Some(newest) = self.state.newest.clone() else {
             return Ok(());

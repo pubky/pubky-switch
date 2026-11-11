@@ -130,6 +130,16 @@ pub enum Refusal {
         /// The new signer's App ID.
         to_app: [u8; 16],
     },
+    /// The device clock and the switch's signed time differ by more than the clock tolerance
+    /// (Switch spec 10.1): a certificate would be stamped with a time the switch doesn't
+    /// share, so none is issued or renewed until they agree.
+    #[error("refused: the device clock is off the switch's time")]
+    ClockOff {
+        /// The device clock, in Unix milliseconds.
+        device_ms: u64,
+        /// The switch's signed time, in Unix milliseconds.
+        switch_ms: u64,
+    },
     /// No hand-over is in progress to abort.
     #[error("refused: no hand-over is in progress")]
     NotHandingOver,
