@@ -36,6 +36,9 @@
 //!   deliveries, its own receive key registrations, key bundle parts (fetched before the
 //!   cursor passes them), renewed certificates, and the departures of other own apps.
 //!
+//! Before the feed, a read sends the batches kept from earlier calls again
+//! ([`App::submit_batch`]), so a lost answer is settled by the next read too.
+//!
 //! Cursor moves that apply nothing are deferred, for at most a few seconds while the app
 //! runs, and go with the next batch or alone ([`App::flush_cursor`]).
 
@@ -51,6 +54,7 @@ use pubky_switch_core::receive::{
     OpenedEntry, Received, Refusal as CheckRefusal, SenderIdentity, check_opened,
 };
 use pubky_switch_core::records::{CLOCK_TOLERANCE_MS, IdentityDoc};
+use pubky_switch_core::scopes::Permission;
 use pubky_switch_core::sig::SignedDoc;
 
 use super::batch::PendingBatch;
@@ -264,22 +268,28 @@ impl Read {
 impl App {
     /// Read the feed to its end and process it (Switch spec 8.2, 8.3), then delete the
     /// retired receive keys the cursor passed, rotate if due, and send a deferred cursor
-    /// move that is due. `wait` long-polls the first page, at most 25 seconds.
+    /// move that is due. `wait` long-polls the first page, at most 25 seconds. Before the
+    /// feed, the batches kept from earlier calls are sent again; one that still can't be
+    /// sent stays kept and is reported in this read's report
+    /// ([`AppEvent::KeptBatchesWaiting`]), and the read goes on.
     ///
     /// # Errors
     ///
     /// [`Refusal::Stopped`] or [`Refusal::Left`] for a stopped or departed app; an alarm the
-    /// read raised; a failed call or commit, after which nothing past the last commit counts
+    /// read raised; [`AppError::NotAnsweringAsAccount`] while the account may be erased
+    /// (Switch spec 12.7); a kept batch whose record doesn't read
+    /// ([`crate::error::StoreError::Corrupt`]), at every read until the store is repaired or
+    /// restored; a failed call or commit, after which nothing past the last commit counts
     /// and the next read resumes from the store.
     pub async fn receive(&mut self, wait: Option<u32>) -> Result<ReceiveReport, AppError> {
         Box::pin(async move {
             self.ready_local().await?;
-            let result = self.receive_inner(wait).await;
+            let result = self.receive_once(wait).await;
             // A move, a provider change, a revocation or an erasure met during the read is
             // followed (`provider.rs`), and the read goes on once at the service followed.
             let result = match self.take_over(result).await {
                 TakeOver::Done(result) => result,
-                TakeOver::ReadAgain => self.receive_inner(None).await,
+                TakeOver::ReadAgain => self.receive_once(None).await,
             };
             if result.is_err() {
                 self.reload = true;
@@ -289,6 +299,22 @@ impl App {
             Ok(report)
         })
         .await
+    }
+
+    /// One read. [`AppEvent::KeptBatchesWaiting`] goes only in the report of the read that
+    /// met it: a read that fails drops it, its error being the outcome, so no later report
+    /// carries a stale one.
+    async fn receive_once(&mut self, wait: Option<u32>) -> Result<ReceiveReport, AppError> {
+        let raised = self.events.len();
+        let result = self.receive_inner(wait).await;
+        if result.is_err() {
+            let mut index = 0;
+            self.events.retain(|event| {
+                index += 1;
+                index <= raised || !matches!(event, AppEvent::KeptBatchesWaiting { .. })
+            });
+        }
+        result
     }
 
     async fn receive_inner(&mut self, wait: Option<u32>) -> Result<ReceiveReport, AppError> {
@@ -324,6 +350,13 @@ impl App {
         // ones stored locally included, is handed over.
         self.refresh_lists_if_owed().await?;
         self.resume_pending_effect().await?;
+        // The batches kept from earlier calls go before the feed, and before anything the
+        // read writes itself, so a lost answer is settled by this read (Switch wire 6.4
+        // step 5).
+        let waiting = self.resume_batches_before_feed().await?;
+        if let Some(waiting) = waiting {
+            self.events.push(waiting);
+        }
         self.deliver_record().await?;
         self.ensure_scope_keys().await?;
         self.prune_processed().await?;
@@ -367,6 +400,10 @@ impl App {
             }
         }
         if self.state.alarm.is_none() {
+            // A stopped read leaves the claims it marked for the next one.
+            if !report.stopped {
+                self.reread_claims().await?;
+            }
             self.delete_retired_keys().await?;
             self.forget_chain_behind_cursor().await?;
             self.maybe_rotate().await?;
@@ -425,6 +462,10 @@ impl App {
             return Ok(None);
         }
         let mut stopped = None;
+        // A stub names no object: once the page shows the stub of an operation, the claims
+        // the app follows are read again at the end of the read (Switch wire 7.5), noted in
+        // the commit that passes it.
+        let mut stub_noted = !self.state.cert.has_permission(Permission::ClaimsRead);
         for item in &page.items {
             let seq = item.seq();
             if seq <= start {
@@ -455,7 +496,18 @@ impl App {
                     };
                     self.handle_chain(chain_item, &envelope, &mut read).await?
                 }
-                FeedItem::Stub { .. } => Step::Pass,
+                FeedItem::Stub { .. } => {
+                    if !stub_noted
+                        && checked
+                            .envelopes
+                            .get(&seq)
+                            .is_some_and(|envelope| envelope.item_type == ItemType::Op)
+                    {
+                        read.tx.put(super::claims::STUB_SEEN, &())?;
+                        stub_noted = true;
+                    }
+                    Step::Pass
+                }
             };
             match step {
                 Step::Pass => {

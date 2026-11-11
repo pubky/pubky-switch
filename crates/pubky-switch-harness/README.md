@@ -87,16 +87,14 @@ The flows send every call the service serves, each at both switches. What they l
   and that the byte budget ends, and a records list in pages the byte budget ends; a
   records list that `limit` ends takes more than a thousand records, and no flow writes
   that many. The directory has no pages (Switch wire 7.4.10).
-- **A waiting read, compared.** `flows::waiting_read` sends a feed read with `wait`, which
-  a write of another app answers. It runs against each switch on its own: the scripted
-  switch doesn't hold a read, so the two runs make their calls in different orders, which
-  the comparison can't set side by side. Its test holds what each switch does.
-- **A feed with gaps, compared.** `flows::lagging_app`, `flows::missed_item` and
-  `flows::unreadable_after_revoke` run against each switch on its own, like the waiting
-  read: the service marks an app lagging, writes it a `missed` item, and turns an entry
-  left without a reader into an `unreadable` item; the scripted switch does none of it, and
-  each such item takes a `seq`, so every later `seq` of the two runs differs. Their tests
-  hold what each switch does. The first two start the service with a small inbox quota.
+- **A wait that runs out, and a held read refused.** The `waiting read` flows' reads are
+  answered by a write and by an erasure. A read whose wait passes with nothing written
+  takes real seconds at the service, and no flow sends one; nor one held while its app is
+  revoked or leaves, where what the app does next depends on when the answer comes.
+- **A full inbox.** The `lagging app`, `missed item` and `unreadable after a revoke` flows
+  run with an app that falls behind while another reads. An inbox no app reads, where the
+  quota refuses senders, an unreadable item at a leave or at a delivery, and a lagging app
+  that still finds entries to read are left to the service's own tests.
 - **More of the lists:** an invite code withdrawn or used several times, an invite, a
   conversation entry pruned, a connection request.
 - **Longer lives:** a renewal that adds a scope, a claim that runs out by time, an
@@ -122,6 +120,6 @@ Run the `trace` example to see what the two switches answered, and list each dif
 ## Run time and databases
 
 Each flow's run against the service makes one test database and drops it, also when its
-test panics; the flows run one after another. Twenty-eight flows take about a minute in a
+test panics; the flows run one after another. Thirty-three flows take about a minute in a
 debug build. If that grows too long, the service's halves could share one service and one
 database, with identities of their own per flow: a later option, not needed yet.

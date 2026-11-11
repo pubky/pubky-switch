@@ -71,9 +71,12 @@ pub(crate) struct Shared {
     /// By Pubky ID: the writer and the time of the entry.
     conversations: BTreeMap<[u8; 32], ([u8; 16], u64)>,
     /// Conversation entries the service wrote for senders an invite code admitted, by Pubky
-    /// ID: the code's hash and the time of the entry (Switch spec 7, Switch wire 6.5
-    /// `conversation.add`).
-    pub(crate) service_conversations: BTreeMap<[u8; 32], ([u8; 32], u64)>,
+    /// ID: the code's hash, the time of the entry and the code's context (Switch spec 7,
+    /// Switch wire 6.5 `conversation.add`).
+    pub(crate) service_conversations: BTreeMap<[u8; 32], ([u8; 32], u64, Value)>,
+    /// The service time of the last append each conversation entry admitted, by Pubky ID
+    /// (Switch wire 7.4.6 `last_used`): none until one.
+    conversation_used: BTreeMap<[u8; 32], u64>,
     deny: BTreeSet<[u8; 32]>,
     /// The flagged senders `GET /allow` shows, with their hits (Switch wire 7.4.6).
     pub(crate) flagged: BTreeMap<[u8; 32], u64>,
@@ -391,11 +394,22 @@ impl Shared {
         self.contacts.insert(pubky);
     }
 
+    /// Note an admitted append's time on `sender`'s conversation entry, an app's or the
+    /// service's, if it has one (Switch spec 7 "Pruning", Switch wire 7.4.6 `last_used`).
+    pub(super) fn note_conversation_used(&mut self, sender: &[u8; 32], at: u64) {
+        if self.conversations.contains_key(sender)
+            || self.service_conversations.contains_key(sender)
+        {
+            self.conversation_used.insert(*sender, at);
+        }
+    }
+
     /// `allow.delete` (Switch wire 6.2); a conversation entry goes whoever wrote it.
     pub(super) fn allow_delete(&mut self, pubky: &[u8; 32], kind: AllowKind) -> ProofState {
         match kind {
             AllowKind::Contact => self.contacts.remove(pubky),
             AllowKind::Conversation => {
+                self.conversation_used.remove(pubky);
                 let service = self.service_conversations.remove(pubky).is_some();
                 self.conversations.remove(pubky).is_some() || service
             }
@@ -651,20 +665,35 @@ impl Inner {
             .conversations
             .iter()
             .map(|(pubky, (by, at))| {
-                json!({ "pubky": pubky_id(pubky), "written_by": zbase32_encode(by),
-                        "at": rfc3339(*at) })
+                (
+                    pubky,
+                    json!({ "pubky": pubky_id(pubky), "written_by": zbase32_encode(by),
+                            "at": rfc3339(*at) }),
+                )
             })
-            // The entries the service wrote (Switch wire 7.4.8).
+            // The entries the service wrote, each with its code's context (Switch wire
+            // 7.4.6).
             .chain(
                 self.shared
                     .service_conversations
                     .iter()
                     .filter(|(pubky, _)| !self.shared.conversations.contains_key(*pubky))
-                    .map(|(pubky, (code, at))| {
-                        json!({ "pubky": pubky_id(pubky), "written_by": "service",
-                                "code_hash": b64(code), "at": rfc3339(*at) })
+                    .map(|(pubky, (code, at, context))| {
+                        (
+                            pubky,
+                            json!({ "pubky": pubky_id(pubky), "written_by": "service",
+                                    "code_hash": b64(code), "context": context,
+                                    "at": rfc3339(*at) }),
+                        )
                     }),
             )
+            // `last_used`, once an append the entry admitted.
+            .map(|(pubky, mut entry)| {
+                if let Some(used) = self.shared.conversation_used.get(pubky) {
+                    entry["last_used"] = json!(rfc3339(*used));
+                }
+                entry
+            })
             .collect();
         (
             200,
