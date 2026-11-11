@@ -2346,7 +2346,7 @@ async fn test_batch_error_says_kept_exactly_when_the_batch_stays() {
 
 /// An alarm raised once the write's own batch is kept, here by a service time that goes
 /// back (Switch spec 10.1): the app stops, the batch stays kept, and the error says so
-/// around the alarm.
+/// with the alarm inside.
 #[tokio::test]
 async fn test_batch_kept_when_an_alarm_stops_the_write_says_so() {
     let s = Setup::new();

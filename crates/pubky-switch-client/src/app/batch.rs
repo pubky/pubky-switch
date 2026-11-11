@@ -296,7 +296,7 @@ impl App {
     /// were kept without it, so they may already be past it; an
     /// `attempt` while the app may not attempt ([`App::may_attempt`]); the switch's refusal
     /// for good, such as `409 conflict` with its `current`, after which nothing is kept;
-    /// [`AppError::Kept`] with the batch's ID, around the cause, for any failure that leaves
+    /// [`AppError::Kept`] with the batch's ID, wrapping the cause, for any failure that leaves
     /// the batch kept, as the store shows it when the call returns (the network, `429`,
     /// `503`, an answer that doesn't verify, a refusal about the caller before its first
     /// send, an alarm, a failed commit): the batch is sent again, the same bytes, by the
