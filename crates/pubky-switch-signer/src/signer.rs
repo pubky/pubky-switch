@@ -623,7 +623,7 @@ impl Signer {
             state.homeserver_other = Some(other);
             state.alert(alert.clone());
             state.switch_unconfirmed = true;
-            self.commit(state, None).await?;
+            self.commit(state, self.erasure_kept()).await?;
             return Err(SignerError::Alarm(alert));
         }
         Ok(copy.signed() == mine.signed())
@@ -988,6 +988,12 @@ impl Signer {
     pub(crate) async fn ensure_signer(&mut self) -> Result<()> {
         self.check_named()?;
         self.switch_at_mark().await?;
+        self.check_backup_copy().await
+    }
+
+    /// Read the signer backup on the Homeserver and stop at one that shows another install
+    /// took over, or a newer version of this install's own ([`Signer::judge_backup`]).
+    pub(crate) async fn check_backup_copy(&mut self) -> Result<()> {
         let found = self
             .env
             .homeserver
@@ -1250,6 +1256,8 @@ impl Signer {
         state.backup_owed = false;
         state.managed_by = Some(signer);
         state.alert(Alert::ManagedByOtherInstall { install: signer });
+        // An erasure in progress ends without erasing, in the same commit (Switch spec 12.7).
+        self.end_erasure_in(&mut state)?;
         self.commit(state, None).await?;
         Err(SignerError::NotNamed { install: signer })
     }
@@ -1267,7 +1275,7 @@ impl Signer {
             version,
             high_water_version: self.high_water().map_or(0, |h| h.version),
         });
-        self.commit(state, None).await?;
+        self.commit(state, self.erasure_kept()).await?;
         Err(Refusal::RecordsBehind { version }.into())
     }
 
@@ -1278,17 +1286,29 @@ impl Signer {
         state.backup_owed = false;
         state.managed_by = Some(install);
         state.alert(Alert::ManagedByOtherInstall { install });
+        // An erasure in progress ends without erasing, in the same commit (Switch spec 12.7).
+        self.end_erasure_in(&mut state)?;
         self.commit(state, None).await?;
         Err(SignerError::NotNamed { install })
     }
 
-    /// Keep `alert` and end the flow: the signer doesn't build on what it saw.
+    /// Keep `alert` and end the flow: the signer doesn't build on what it saw. An erasure in
+    /// progress is kept ([`Signer::erasure_kept`]).
     async fn alarm(&mut self, alert: Alert) -> Result<()> {
         let mut state = self.state.clone();
         state.alert(alert.clone());
         state.switch_unconfirmed = true;
-        self.commit(state, None).await?;
+        self.commit(state, self.erasure_kept()).await?;
         Err(SignerError::Alarm(alert))
+    }
+
+    /// The flow an alarm or records behind keep: an erasure in progress, whose request may be
+    /// in doubt, in the same commit, so neither a crash nor another caller loses it; any other
+    /// flow ends (Switch spec 12.7). The signing gate holds the erasure's steps back meanwhile.
+    fn erasure_kept(&self) -> Option<Flow> {
+        self.flow
+            .clone()
+            .filter(|flow| matches!(flow, Flow::Erase { .. }))
     }
 
     /// Publish the newest version again where the Homeserver's copy is older, missing or

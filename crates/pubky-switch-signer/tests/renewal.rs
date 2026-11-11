@@ -1707,3 +1707,48 @@ async fn test_renewal_by_the_user_applies_the_protocols_table_now() {
         assert_eq!(closed, now.is_empty(), "{now:?}");
     }
 }
+
+#[tokio::test]
+async fn test_renewal_each_batch_checked_against_another_install() {
+    // A renewal in two batches: another install delivering right after the check before the
+    // first stops the second, which this install no longer signs for (Switch spec 4.3).
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let (a, b) = two_apps(&["notes", "notes_sync"], &["notes", "notes_sync"]);
+    world.approve(&mut signer, &a).await;
+    world.approve(&mut signer, &b).await;
+    // Six more apps holding `notes`: nine operations, two batches.
+    for n in 0..6u8 {
+        let more = App::with_keys(
+            AppKeys::from_secrets([20 + 2 * n; 32], [21 + 2 * n; 32]),
+            &["notes"],
+            None,
+            [40 + n; 32],
+        );
+        world.approve(&mut signer, &more).await;
+    }
+    let ops = |world: &World| {
+        world
+            .transport
+            .requests()
+            .iter()
+            .filter(|r| r.method == "POST" && r.path_and_query.ends_with("/ops"))
+            .count()
+    };
+    let before = ops(&world);
+    let other = world.other_install_version(&signer.identity_doc().unwrap().unwrap(), [9; 16]);
+    let switch = Arc::clone(&world.switch);
+    // The signer backup's second read is the check before the first batch; the first is the
+    // signing gate's.
+    *world.homeserver.after_get.lock().unwrap() = Some((
+        pubky_switch_core::records::SIGNER_BACKUP_PATH.to_owned(),
+        2,
+        Box::new(move || switch.deliver_identity(&other).unwrap()),
+    ));
+    let error = signer
+        .renew(a.keys.app_id_bytes(), reduce(&["notes_sync"]))
+        .await
+        .unwrap_err();
+    assert_eq!(error, SignerError::NotNamed { install: [9; 16] });
+    assert_eq!(ops(&world), before + 1, "the second batch isn't sent");
+}
