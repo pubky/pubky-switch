@@ -2181,21 +2181,73 @@ async fn test_scripted_keys_passed_parts_go_when_the_next_part_is_stored() {
     let me = app.app_id();
     let cert = app.cert().clone();
     w.next_doc(|body| body.data_epoch = 2);
-    // A full bundle asked for, so the cursor passing epoch 1's part keeps it.
-    w.switch.request_full_bundle(me);
+    // Epoch 1's part, passed before the switch dropped parts at cursor moves.
     let first = store_part(&w, me, &cert, 1, 1);
-    w.switch.move_cursor(me, first).unwrap();
+    w.switch.set_cursor_unchecked(me, first);
     assert_eq!(w.switch.bundles_of(&me), vec![(1, 1)]);
-    // Epoch 2's part completes the request; judged as it was before the part, the passed
-    // part stays at this put.
-    store_part(&w, me, &cert, 2, 2);
-    assert!(w.switch.app(&me).full_requested.is_none(), "covered");
-    assert_eq!(w.switch.bundles_of(&me), vec![(1, 1), (2, 2)]);
-    // The next part stored, with no request pending: the passed part goes, and keys_through
-    // keeps its height.
+    // The next part stored: the passed part goes there.
     store_part(&w, me, &cert, 2, 2);
     assert_eq!(w.switch.bundles_of(&me), vec![(2, 2)]);
     assert_eq!(w.switch.keys_through_of(&me), Some(1));
+}
+
+#[tokio::test]
+async fn test_scripted_keys_a_request_stays_in_force_until_the_completing_part_is_passed() {
+    let w = World::new();
+    let app = w.join("wallet").await;
+    let me = app.app_id();
+    let cert = app.cert().clone();
+    w.next_doc(|body| body.data_epoch = 3);
+    // Asked for, then epoch 1's part passed: kept. Epoch 2's part completes the request.
+    w.switch.request_full_bundle(me);
+    let first = store_part(&w, me, &cert, 1, 1);
+    w.switch.move_cursor(me, first).unwrap();
+    let second = store_part(&w, me, &cert, 2, 2);
+    // Not covered through epoch 3 yet: the request is still pending. Epoch 3's part
+    // completes it.
+    let third = store_part(&w, me, &cert, 3, 3);
+    assert!(w.switch.app(&me).full_requested.is_none(), "covered");
+    assert_eq!(w.switch.bundles_of(&me), vec![(1, 1), (2, 2), (3, 3)]);
+    // The next put comes before the cursor passes the part that completed it: the request
+    // is still in force, and nothing goes.
+    store_part(&w, me, &cert, 3, 3);
+    assert_eq!(w.switch.bundles_of(&me), vec![(1, 1), (2, 2), (3, 3)]);
+    // A move short of the completing part keeps them too; the move that passes it ends the
+    // request's force and drops the parts it passed and holds.
+    w.switch.move_cursor(me, second).unwrap();
+    assert_eq!(w.switch.bundles_of(&me), vec![(1, 1), (2, 2), (3, 3)]);
+    let newest = third.max(second) + 1;
+    w.switch.move_cursor(me, newest).unwrap();
+    assert_eq!(w.switch.bundles_of(&me), Vec::<(u64, u64)>::new());
+    assert_eq!(w.switch.keys_through_of(&me), Some(3));
+}
+
+#[tokio::test]
+async fn test_scripted_keys_a_request_stays_in_force_for_the_rest_of_the_completing_batch() {
+    let w = World::new();
+    let app = w.join("wallet").await;
+    let me = app.app_id();
+    let cert = app.cert().clone();
+    w.next_doc(|body| body.data_epoch = 2);
+    w.switch.request_full_bundle(me);
+    let first = store_part(&w, me, &cert, 1, 1);
+    w.switch.move_cursor(me, first).unwrap();
+    // The completing part and the next one in one batch.
+    let has_keys = |s: &str| SampleProtocol::default().has_keys(s);
+    let mut kinds = Vec::new();
+    for (first_epoch, last_epoch) in [(2, 2), (3, 3)] {
+        for part in seal_bundle_parts(&w.alice, &cert, first_epoch, last_epoch, &has_keys).unwrap()
+        {
+            kinds.push(OpKind::KeyBundlePut(KeyBundlePut {
+                target_app_id: me,
+                bundle: part.bundle,
+                first_epoch: part.first_epoch,
+                last_epoch: part.last_epoch,
+            }));
+        }
+    }
+    w.switch.signer_batch(kinds).unwrap();
+    assert_eq!(w.switch.bundles_of(&me), vec![(1, 1), (2, 2), (3, 3)]);
 }
 
 #[tokio::test]

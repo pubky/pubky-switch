@@ -266,11 +266,9 @@ impl Inner {
             )? == CursorMove::Moves
             {
                 *held = position.seq;
-                // The parts it now holds the keys of go (Switch wire 6.2).
-                let full = draft
-                    .apps
-                    .get(&app)
-                    .is_some_and(|held| held.full_requested.is_some());
+                // The parts it now holds the keys of go (Switch wire 6.2), unless a
+                // full-bundle request is still in force at its new position.
+                let full = draft.apps.get(&app).is_some_and(in_force);
                 drop_passed_parts(&mut draft, &app, full);
             }
         }
@@ -583,11 +581,9 @@ impl Inner {
         let withdrawn = draft.apps.get(&target).is_some_and(|app| app.departed);
         let parts = draft.bundles.entry(target).or_default();
         let stored: Vec<KeyBundlePut> = parts.iter().map(|(part, _)| part.clone()).collect();
-        // A full-bundle request is judged as it was before this part (Switch wire 6.2).
-        let full = draft
-            .apps
-            .get(&target)
-            .is_some_and(|app| app.full_requested.is_some());
+        // A full-bundle request in force is judged as it was before this part (Switch wire
+        // 6.2).
+        let full = draft.apps.get(&target).is_some_and(in_force);
         let parts = draft.bundles.entry(target).or_default();
         let bundle_seq = match check_key_bundle_put(put, self.doc.as_ref(), withdrawn, &stored)? {
             KeyBundleEffect::Unchanged => parts
@@ -606,8 +602,10 @@ impl Inner {
                 let epoch = self.doc.as_ref().map_or(1, |doc| doc.data_epoch());
                 if covers(parts, epoch)
                     && let Some(app) = draft.apps.get_mut(&target)
+                    && app.full_requested.is_some()
                 {
                     app.full_requested = None;
+                    app.full_completed = Some(seq);
                 }
                 drop_passed_parts(draft, &target, full);
                 seq
@@ -654,6 +652,12 @@ impl Inner {
             contacts.push(id);
         }
     }
+}
+
+/// Whether `app`'s full-bundle request is in force for dropping its parts (Switch wire 6.2):
+/// from the `POST /keys` until its cursor has passed the part that completed it.
+fn in_force(app: &SwitchApp) -> bool {
+    app.full_requested.is_some() || app.full_completed.is_some_and(|done| app.cursor < done)
 }
 
 /// Drop `target`'s key bundle parts its cursor has passed and its `keys_through` covers,

@@ -618,29 +618,21 @@ async fn test_keys_passed_parts_go_when_the_next_part_is_stored() {
     let Some(replay) = replay().await else { return };
     replay_chain_through_revoke(&replay).await;
     let at = revoke_time();
-    // The wallet asks for a full bundle, so its cursor passing epoch 1's part keeps it.
-    let asked = keys_call(&replay, "wallet", "POST", "wallet", Vec::new(), &at).await;
-    assert_eq!(
-        asked.status,
-        200,
-        "{}",
-        String::from_utf8_lossy(&asked.body)
-    );
+    // Epoch 1's part, passed before the service dropped parts at cursor moves: the wallet's
+    // cursor set past it directly.
     store_parts(&replay, &[(1, 1)], 60, &at).await;
-    wallet_cursor(&replay, 10, &at).await;
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    sqlx::query("UPDATE apps SET cursor_generation = 1, cursor_seq = 10 WHERE account_id = $1")
+        .bind(alice_id())
+        .execute(&mut conn)
+        .await
+        .expect("cursor");
+    drop(conn);
     assert_eq!(bundle_ranges(&replay, &at).await, json!([[1, 1]]));
-    // Epoch 2's part completes the request; judged as it was before the part, the passed
-    // part still stays at this put: the wallet hasn't read the parts it asked for.
-    store_parts(&replay, &[(2, 2)], 61, &at).await;
-    assert_eq!(
-        full_bundle_requested(&replay, &at).await,
-        Value::Null,
-        "covered"
-    );
-    assert_eq!(bundle_ranges(&replay, &at).await, json!([[1, 1], [2, 2]]));
-    // The next part stored, with no request pending: the passed part goes, and only the
-    // new one is read.
-    let bundles = store_parts(&replay, &[(2, 2)], 62, &at).await;
+    // The next part stored: the passed part goes there, and only the new one is read.
+    let bundles = store_parts(&replay, &[(2, 2)], 61, &at).await;
     assert_eq!(bundle_ranges(&replay, &at).await, json!([[2, 2]]));
     let answer = keys_call(&replay, "wallet", "GET", "wallet", Vec::new(), &at).await;
     assert_eq!(
@@ -790,14 +782,12 @@ async fn test_keys_through_keeps_its_height_once_passed_parts_go() {
 
 #[tokio::test]
 async fn test_keys_a_request_stays_in_force_until_the_completing_part_is_passed() {
-    // The wallet, restored from an old backup, passed epoch 1's part before the restore and
-    // now lacks its keys: it asks for a full bundle. The signer stores only what isn't
-    // stored yet, epoch 2, which completes the request with epoch 1's part.
+    // The wallet asks for a full bundle; its cursor passing epoch 1's part keeps it. The
+    // signer stores only what isn't stored yet, epoch 2, which completes the request with
+    // epoch 1's part.
     let Some(replay) = replay().await else { return };
     replay_chain_through_revoke(&replay).await;
     let at = revoke_time();
-    store_parts(&replay, &[(1, 1)], 60, &at).await;
-    wallet_cursor(&replay, 10, &at).await;
     let asked = keys_call(&replay, "wallet", "POST", "wallet", Vec::new(), &at).await;
     assert_eq!(
         asked.status,
@@ -805,24 +795,25 @@ async fn test_keys_a_request_stays_in_force_until_the_completing_part_is_passed(
         "{}",
         String::from_utf8_lossy(&asked.body)
     );
+    store_parts(&replay, &[(1, 1)], 60, &at).await;
+    wallet_cursor(&replay, 10, &at).await;
     store_parts(&replay, &[(2, 2)], 61, &at).await;
     assert_eq!(
         full_bundle_requested(&replay, &at).await,
         Value::Null,
         "covered"
     );
-    // Before the wallet reads the part that completed it, the request is still in force:
-    // the next part stored drops nothing the wallet asked for.
+    // The next put comes before the wallet's cursor passes the part that completed it: the
+    // request is still in force, and nothing the wallet asked for goes.
     store_parts(&replay, &[(3, 3)], 62, &at).await;
     assert_eq!(
         bundle_ranges(&replay, &at).await,
         json!([[1, 1], [2, 2], [3, 3]])
     );
-    // Once its cursor has passed the completing part, the request's force ends: the next
-    // part stored drops the parts it passed and holds.
+    // The move that passes the completing part ends the request's force, and drops the
+    // parts it passed and holds at once.
     wallet_cursor(&replay, 11, &at).await;
-    store_parts(&replay, &[(4, 4)], 63, &at).await;
-    assert_eq!(bundle_ranges(&replay, &at).await, json!([[3, 3], [4, 4]]));
+    assert_eq!(bundle_ranges(&replay, &at).await, json!([[3, 3]]));
     assert_eq!(keys_through(&replay, &at).await, 2);
     replay.db.drop_database().await.expect("drop");
 }
@@ -834,8 +825,6 @@ async fn test_keys_a_request_stays_in_force_for_the_rest_of_the_completing_batch
     let Some(replay) = replay().await else { return };
     replay_chain_through_revoke(&replay).await;
     let at = revoke_time();
-    store_parts(&replay, &[(1, 1)], 60, &at).await;
-    wallet_cursor(&replay, 10, &at).await;
     let asked = keys_call(&replay, "wallet", "POST", "wallet", Vec::new(), &at).await;
     assert_eq!(
         asked.status,
@@ -843,6 +832,8 @@ async fn test_keys_a_request_stays_in_force_for_the_rest_of_the_completing_batch
         "{}",
         String::from_utf8_lossy(&asked.body)
     );
+    store_parts(&replay, &[(1, 1)], 60, &at).await;
+    wallet_cursor(&replay, 10, &at).await;
     store_parts(&replay, &[(2, 2), (3, 3)], 61, &at).await;
     assert_eq!(
         bundle_ranges(&replay, &at).await,
