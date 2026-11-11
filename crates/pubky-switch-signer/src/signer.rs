@@ -55,6 +55,7 @@ mod clients;
 mod erasure;
 pub(crate) mod gate;
 mod handover;
+mod recovery;
 mod renewal;
 mod restore;
 mod revocation;
@@ -302,6 +303,11 @@ impl Signer {
             if self.state.erased {
                 return Ok(());
             }
+            // Right after a recovery's delivery, the staged admission it started, when no
+            // listed app could end it (Switch spec 12.6 step 2).
+            if self.state.admission_owed {
+                self.end_owed_admission().await?;
+            }
             // While a hand-over is in progress nothing routine is signed: its own step only,
             // and owed work stays owed (Switch wire 3.12).
             if self.state.handing_over.is_some() {
@@ -347,6 +353,7 @@ impl Signer {
                     policy,
                 } => self.enroll(&origin, &enrollment, policy).await?,
                 Flow::TakingOver { delivery, .. } => self.take_over(delivery).await?,
+                Flow::Recover { origin, enrollment } => self.recover(&origin, &enrollment).await?,
                 Flow::Erase {
                     unpublished,
                     reminded,
@@ -962,11 +969,15 @@ impl Signer {
                     // none. The backup may be another install's, so nothing is written.
                     self.unreadable_before_mark().await.map(|()| None)
                 }
+                // A recovery can't ask the lost service whether another install took over:
+                // its backup is written over, with the alert (Switch spec 12.6 step 1).
+                None if self.state.recovering => Ok(Some(Alert::BackupUnreadable)),
                 None => {
                     self.switch_at_mark().await?;
                     Ok(Some(Alert::BackupUnreadable))
                 }
             },
+            None if self.state.recovering => Ok(Some(Alert::BackupMissing)),
             None if self.state.newest.is_some() => {
                 self.switch_at_mark().await?;
                 Ok(Some(Alert::BackupMissing))
@@ -1128,8 +1139,13 @@ impl Signer {
             .map(|cert| AppCert::verify(cert, &identity))
             .collect::<std::result::Result<Vec<_>, _>>()?;
         let limits = self.service()?.limits;
-        // Sealing signs the backup, so it takes the gated key.
-        let key = self.signing_key()?;
+        // Sealing signs the backup, so it takes the gated key: a recovery's, while one is
+        // delivered (Switch spec 12.6 step 1).
+        let key = if self.state.recovering {
+            gate::recovery_key(&self.keyring, &self.state)?
+        } else {
+            self.signing_key()?
+        };
         Ok(key.seal_backup(
             doc,
             &self.state.tombstones,
@@ -1186,6 +1202,11 @@ impl Signer {
     ) -> Result<()> {
         let mut state = self.state.clone();
         let verified = IdentityDoc::verify(&doc, &state.identity);
+        // A recovery's version, the only delivery while one is declared: the new service's
+        // account is the one served from here (Switch spec 12.6 step 1).
+        if state.recovering {
+            Self::recovered_in(&mut state);
+        }
         if let (Some(at), Ok(delivered)) = (delivered_at, &verified) {
             for app in &delivered.body().apps {
                 if !state.listed_at.iter().any(|(id, _)| *id == app.app_id) {

@@ -1174,6 +1174,16 @@ impl ScriptedSwitch {
         self.lock().seq
     }
 
+    /// Whether admission is staged after a provider loss (Switch spec 12.6 step 2).
+    pub fn admission_staged(&self) -> bool {
+        self.lock().admission_staged
+    }
+
+    /// The generation the switch's account serves.
+    pub fn generation(&self) -> u64 {
+        self.lock().tip.generation
+    }
+
     /// The newest own `identity.json` delivered.
     pub fn identity_doc(&self) -> Option<IdentityDoc> {
         self.lock().doc.clone()

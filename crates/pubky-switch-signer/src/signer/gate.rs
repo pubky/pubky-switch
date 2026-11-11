@@ -92,6 +92,34 @@ pub(crate) fn signing_key(keyring: &IdentityKeyring, state: &SignerState) -> Res
     Ok(keyring.signing_key(GatePassed(()))?)
 }
 
+/// The identity key for a provider loss's own steps (Switch spec 12.6 step 1): its
+/// enrollment, its version and the backup holding it. A provider loss is the way out of an
+/// alarm, of an erased account and of an erasure, so neither holds it back; records behind,
+/// another install named, a hand-over and a take-over do, as for every step.
+///
+/// # Errors
+///
+/// [`SignerError::NotNamed`], [`Refusal::RecordsBehind`], [`Refusal::HandingOver`],
+/// [`Refusal::TakingOver`], or the key's error.
+pub(crate) fn recovery_key(keyring: &IdentityKeyring, state: &SignerState) -> Result<SigningKey> {
+    if let Some(install) = state.managed_by {
+        return Err(SignerError::NotNamed { install });
+    }
+    if let Some(version) = state.records_behind {
+        return Err(Refusal::RecordsBehind { version }.into());
+    }
+    if let Some(handing) = &state.handing_over {
+        return Err(Refusal::HandingOver {
+            to_app: handing.to_app,
+        }
+        .into());
+    }
+    if state.taking_over || keyring.is_received() {
+        return Err(Refusal::TakingOver.into());
+    }
+    Ok(keyring.signing_key(GatePassed(()))?)
+}
+
 /// The identity key for a hand-over's own steps, while this install hands the identity over
 /// (Switch wire 3.12): storing it at the switch, and the abort. The base checks still apply.
 ///

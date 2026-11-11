@@ -946,3 +946,41 @@ async fn test_vectors_old_signer_closes_a_reduction_within_the_headroom() {
     );
     assert_eq!(old.signer.identity_doc().unwrap().unwrap().version(), 5);
 }
+
+/// alice rotated her key in place before the loss: her version 4, at generation 2, names
+/// generation 1's key in `service_keys`. Her service then loses everything, and she recovers
+/// there: the version leaves out every generation at or below `recovery_from`, so nothing
+/// resolves a lost generation's key (Switch wire 3.3, spec 12.6 step 1).
+#[tokio::test]
+async fn test_vectors_old_signer_recovers_without_the_lost_generations_service_keys() {
+    let mut old = old_signer().await;
+    let v3 = IdentityDoc::verify(&document("alice identity.json"), &old.key.public()).unwrap();
+    let mut body = v3.body().clone();
+    body.version = 4;
+    body.generation = 2;
+    body.service_keys
+        .push(pubky_switch_core::records::ServiceKeyEntry {
+            generation: 1,
+            key: [0x11; 32],
+        });
+    let rotated = IdentityDoc::sign(&old.key, body).unwrap();
+    old.switch.deliver_identity(&rotated).unwrap();
+    old.signer
+        .delivered(rotated.signed().clone(), Some(v3.hash()), None)
+        .await
+        .unwrap();
+    old.switch.lose_identity();
+    // At the scripted switch's own origin, which its enrollment names.
+    let recovered = old
+        .signer
+        .declare_provider_loss(
+            pubky_switch_client::testing::SWITCH_ORIGIN,
+            UserConfirmed::shown_and_confirmed(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(recovered.generation(), 3);
+    assert_eq!(recovered.body().recovery_from, Some(2));
+    assert!(recovered.body().service_keys.is_empty());
+    assert_eq!(old.switch.identity_doc().unwrap().hash(), recovered.hash());
+}

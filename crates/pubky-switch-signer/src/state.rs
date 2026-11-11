@@ -196,6 +196,16 @@ pub(crate) struct SignerState {
     /// and nothing more is signed for that account.
     #[serde(default)]
     pub(crate) erased: bool,
+    /// A provider loss is declared and its version not delivered yet (Switch spec 12.6 step
+    /// 1): its own steps pass the recovery's gate ([`crate::signer::gate::recovery_key`])
+    /// while an alarm about the lost service is held.
+    #[serde(default)]
+    pub(crate) recovering: bool,
+    /// The staged admission the recovery started is the signer's to end, since no listed app
+    /// holds `lists.manage` (Switch spec 12.6 step 2): `POST /recovery/admission` is owed,
+    /// sent again at every run until `GET /apps` shows it ended.
+    #[serde(default)]
+    pub(crate) admission_owed: bool,
 }
 
 /// A hand-over this install is making (Switch wire 3.12).
@@ -357,6 +367,8 @@ impl SignerState {
             time_asked: None,
             closing_unavailable: None,
             erased: false,
+            recovering: false,
+            admission_owed: false,
         }
     }
 
@@ -414,6 +426,15 @@ pub(crate) enum Flow {
         enrollment: SignedDoc,
         /// The policy the first `identity.json` carries.
         policy: IdentityPolicy,
+    },
+    /// Recovering from a provider loss (Switch spec 12.6 step 1): enrolling at the service
+    /// at `origin`, then signing the next generation's `identity.json` with `recovery_from`,
+    /// which a delivery then takes there.
+    Recover {
+        /// The service's origin.
+        origin: String,
+        /// The signed enrollment, sent again until it is answered.
+        enrollment: SignedDoc,
     },
     /// Renewing an app's certificate (Switch spec 3.2, Switch wire 3.8), or completing a data
     /// epoch before a rotation: storing the new certificate and the key bundles at the switch,
