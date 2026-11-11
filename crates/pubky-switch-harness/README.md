@@ -58,8 +58,16 @@ A revocation whose answer was lost isn't sent again while the signer can read th
 reads the account's apps and finds it done.
 
 An erasure whose answer was lost isn't sent again either (Switch wire 7.4.16): the signer's
-next read of the account's apps gets the operator's `404`, and it concludes the account is
-erased.
+next read of the account's apps gets the operator's `404`, which nobody can authenticate, so
+it holds the account as erased but unconfirmed. It concludes the account is erased at its
+first run 24 hours after that `404`, every read in between having met it too. The flow moves
+the world's clock, which is the signer's device clock, by those 24 hours.
+
+An app of an erased account waits too (Switch spec 12.7 step 5): its reads meet the
+operator's `404` and no `identity.json` on the Homeserver, which the signer's erasure took
+off, and it takes the account as gone at the fifth read, each at least 6 hours after the one
+before, 24 hours after the first. Both erasure flows run that wait, and a read short of the
+24 hours that raises nothing.
 
 ## Not covered
 
@@ -75,18 +83,20 @@ The flows send every call the service serves, each at both switches. What they l
   lost and no connection fails in front of `GET /allow`, `/claims/{claim_key}`,
   `/directory`, `/apps/{app_id}/keys`, `/records`, `/records/{key}`, `/handover` or the
   public `/identity`, nor in front of `POST /apps/{app_id}/keys` or a record write.
-- **A waiting read, and a list `limit` ends.** No feed read waits (`wait`). The `pages`
-  flow reads a feed in pages that `limit` ends and that the byte budget ends, and a records
-  list in pages the byte budget ends; a records list that `limit` ends takes more than a
-  thousand records, and no flow writes that many. The directory has no pages (Switch wire
-  7.4.10).
+- **A list that `limit` ends.** The `pages` flow reads a feed in pages that `limit` ends
+  and that the byte budget ends, and a records list in pages the byte budget ends; a
+  records list that `limit` ends takes more than a thousand records, and no flow writes
+  that many. The directory has no pages (Switch wire 7.4.10).
+- **A waiting read, compared.** `flows::waiting_read` sends a feed read with `wait`, which
+  a write of another app answers. It runs against each switch on its own: the scripted
+  switch doesn't hold a read, so the two runs make their calls in different orders, which
+  the comparison can't set side by side. Its test holds what each switch does.
 - **A feed with gaps:** a lagging app, a `missed` item, an item an app can't read after a
   revocation.
-- **Lists in use:** an invite code issued and used, and a deny list entry that refuses a
-  sender.
-- **Longer lives:** a renewal that changes an app's scopes, a second renewal, a data epoch
-  past 2, a claim that runs out by time, an app with several collections, an identity that
-  enrolls again after an erasure.
+- **More of the lists:** an invite code withdrawn or used several times, an invite, a
+  conversation entry pruned, a connection request.
+- **Longer lives:** a renewal that adds a scope, a claim that runs out by time, an app
+  with several collections, an identity that enrolls again after an erasure.
 - **More than one switch with traffic between them:** the identities of a flow share one
   origin.
 
@@ -108,6 +118,6 @@ Run the `trace` example to see what the two switches answered, and list each dif
 ## Run time and databases
 
 Each flow's run against the service makes one test database and drops it, also when its
-test panics; the flows run one after another. Twenty-two flows take about a minute in a
+test panics; the flows run one after another. Twenty-seven flows take about a minute in a
 debug build. If that grows too long, the service's halves could share one service and one
 database, with identities of their own per flow: a later option, not needed yet.

@@ -245,6 +245,18 @@ impl Service {
             )
             .await?;
 
+        // The append brings the pressure: marks first, so a lagging app stops holding the
+        // quota before it is judged (Switch wire 7.4.4).
+        if trusted {
+            let current = super::batch::load_apps(txn, held, time_ms)
+                .await
+                .map_err(|e| store_error(&e))?
+                .current_app_ids();
+            self.release(true)
+                .mark(txn, &current)
+                .await
+                .map_err(|e| store_error(&e))?;
+        }
         // Check 6: the inbox quota, then the sender's share of it (Switch wire 9.3).
         let quota_bytes = u64::try_from(envelope.len())
             .unwrap_or(u64::MAX)
@@ -310,6 +322,18 @@ impl Service {
         })
         .await
         .map_err(|e| store_error(&e))?;
+        // An append brings the pressure lagging marks answer, with trusted time (Switch wire
+        // 7.4.4).
+        if trusted {
+            let current = super::batch::load_apps(txn, held, time_ms)
+                .await
+                .map_err(|e| store_error(&e))?
+                .current_app_ids();
+            self.release(true)
+                .mark(txn, &current)
+                .await
+                .map_err(|e| store_error(&e))?;
+        }
         self.answer(txn, signer, stored, other).await
     }
 

@@ -50,7 +50,7 @@ pub use chain::NewChainItem;
 pub use feed::{AppDocs, CurrentDocs, FeedRow, FeedSnapshot, PageReader};
 pub use handover::StoredHandover;
 pub use identity::HeldIdentity;
-pub use inbox::{InboxUsage, NewEntry, StoredEntry};
+pub use inbox::{InboxItem, InboxUsage, NewEntry, StoredEntry};
 pub use ops::{
     DivergentUpload, ListName, RecordOrigin, StoredApp, StoredBundlePart, StoredClaimEntry,
     StoredInvite, StoredListEntry, StoredRecord,

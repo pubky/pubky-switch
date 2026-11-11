@@ -156,6 +156,15 @@ pub enum SignerStatus {
     /// `identity.json` may be off the Homeserver already, and nothing else is signed until
     /// the erasure is done or aborted ([`Signer::abort_erasure`]).
     Erasing,
+    /// The erasure's request may have landed, and a check or a retry met an unsigned `404` at
+    /// `since_ms`, by the device clock, with no answer the pinned key signs since: the account
+    /// looks erased, unconfirmed until the `404` has held for 24 hours (Switch wire 7.4.16,
+    /// spec 12.7 step 5). Nothing else is signed, the revocations included, and the erasure
+    /// can't be aborted.
+    ErasedUnconfirmed {
+        /// When a check first met the `404`, in Unix milliseconds, by the device clock.
+        since_ms: u64,
+    },
     /// The identity's account at its switch is erased ([`Signer::close_account`]): the
     /// records stay, and nothing more is signed for it.
     Erased,
@@ -342,6 +351,7 @@ impl Signer {
                     unpublished,
                     reminded,
                     unanswered,
+                    ..
                 } => self.erase(unpublished, reminded, unanswered).await?,
                 Flow::Deliver {
                     doc,
@@ -372,8 +382,13 @@ impl Signer {
 
     /// Where the signer stands.
     pub fn status(&self) -> SignerStatus {
-        if matches!(self.flow, Some(Flow::Erase { .. })) {
-            return SignerStatus::Erasing;
+        match self.flow {
+            Some(Flow::Erase {
+                first_404_ms: Some(since_ms),
+                ..
+            }) => return SignerStatus::ErasedUnconfirmed { since_ms },
+            Some(Flow::Erase { .. }) => return SignerStatus::Erasing,
+            _ => {}
         }
         status_of(&self.state)
     }
@@ -993,9 +1008,16 @@ impl Signer {
         let raised = self.state.alerts.contains(&Alert::AccountNotHosted);
         // An erasure in progress judges the `404` itself (Switch wire 7.4.16).
         let erasing = matches!(self.flow, Some(Flow::Erase { .. }));
+        // Any answer the pinned key signs, an error included, shows the account hosted: it
+        // clears the alert, and ends an erasure's wait for the operator's `404` to hold, here
+        // where it arrives, whatever the step that read it does next (Switch wire 7.3 step 2,
+        // 7.4.16).
+        let signed = matches!(
+            &read,
+            Ok(_) | Err(ClientError::Switch { .. } | ClientError::InvalidResponse(_))
+        );
         let raise = match &read {
-            // Any answer the pinned key signs, an error included, shows the account hosted.
-            Ok(_) | Err(ClientError::Switch { .. }) if raised => Some(false),
+            _ if signed && raised => Some(false),
             Err(ClientError::BadServiceSignature { status: 404 })
                 if !raised && !erasing && !self.state.erased =>
             {
@@ -1003,16 +1025,20 @@ impl Signer {
             }
             _ => None,
         };
-        if let Some(raise) = raise {
-            let mut state = self.state.clone();
-            if raise {
-                state.alert(Alert::AccountNotHosted);
-            } else {
-                state
-                    .alerts
-                    .retain(|alert| *alert != Alert::AccountNotHosted);
-            }
-            self.commit(state, self.flow.clone()).await?;
+        let mut state = self.state.clone();
+        match raise {
+            Some(true) => state.alert(Alert::AccountNotHosted),
+            Some(false) => state
+                .alerts
+                .retain(|alert| *alert != Alert::AccountNotHosted),
+            None => {}
+        }
+        let mut flow = self.flow.clone();
+        if signed && let Some(Flow::Erase { first_404_ms, .. }) = flow.as_mut() {
+            *first_404_ms = None;
+        }
+        if state != self.state || flow != self.flow {
+            self.commit(state, flow).await?;
         }
         Ok(SwitchRead {
             answer: read?,

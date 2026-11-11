@@ -146,7 +146,7 @@ pub async fn records(world: &World) -> FlowResult {
 }
 
 /// What a shared record shows, for the trace.
-fn shown(record: Option<&SharedRecord>) -> Value {
+pub(crate) fn shown(record: Option<&SharedRecord>) -> Value {
     match record {
         None => json!({ "held": false }),
         Some(record) => json!({
@@ -165,7 +165,7 @@ fn shown(record: Option<&SharedRecord>) -> Value {
 
 /// `app` follows its feed and moves its cursor: the events it raises at this read, and
 /// where it stands.
-async fn look(world: &World, app: &mut App, name: &str) -> FlowResult {
+pub(crate) async fn look(world: &World, app: &mut App, name: &str) -> FlowResult {
     let report = app.receive(None).await?;
     app.flush_cursor().await?;
     world.outcome(
