@@ -171,8 +171,11 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   An app's call is `403 permission_missing`. Then every call, the retry included, gets the
   `404` signed with a fixed operator key. `erased` tells a test it happened; app tests set the
   flag directly. The service keeps no freeze or import state yet, so it refuses no erasure for
-  a move; and after an erasure it takes `POST /v1/enroll` again, creating a new staged account,
-  where this switch answers it with the operator's `404` too.
+  a move; it answers an app of another identity `403 permission_missing`, where this switch
+  answers `403 not_admitted`; and after an erasure it takes `POST /v1/enroll` again, creating a
+  new staged account, where this switch answers it with the operator's `404` too. That account
+  can't serve at the service yet either: its first `identity.json`, at the next generation with
+  `recovery_from` (Switch wire 7.4.16), gets the `503` "a generation change isn't served yet".
 - **Push** (Switch wire 8.1): registrations only; nothing is sent to a relay.
 
 ## Signer flows tested only here

@@ -707,10 +707,18 @@ impl Service {
         // is behind, also when the page shows a commit whose own request hasn't moved it
         // yet (Switch wire 7.3 step 10).
         if let Some(mark) = answered.mark {
-            self.keys
-                .advance_mark(&read.service_key, mark)
-                .await
-                .map_err(|_| FeedStop::refused(temporary(), true, answered.time_ms))?;
+            match self.keys.advance_mark(&read.service_key, mark).await {
+                Ok(_) => {}
+                // Erased once the page was read, its key deleted: never answered with it
+                // (Switch wire 7.4.16).
+                Err(KeyStoreError::NotFound) => {
+                    return Err(match self.store.lookup(&read.account).await {
+                        Ok(None) => FeedStop::Gone,
+                        Ok(Some(_)) | Err(_) => FeedStop::Retired,
+                    });
+                }
+                Err(_) => return Err(FeedStop::refused(temporary(), true, answered.time_ms)),
+            }
         }
         Ok((answered.answer(), answered.time_ms))
     }

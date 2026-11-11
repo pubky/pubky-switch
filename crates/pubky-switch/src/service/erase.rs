@@ -57,7 +57,9 @@ impl Service {
 
     /// Erase the account whose lock `txn` holds and answer `answer`, signed first, while
     /// the key exists (Switch wire 7.4.16 Order). `committed_ms` is the time the account
-    /// last committed, for the `503` of an erasure that doesn't commit.
+    /// last committed, for the `503` of an erasure that doesn't commit; `base_ms` the time
+    /// base, for the operator's answer.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn finish_erasure(
         &self,
         txn: AccountTxn,
@@ -65,6 +67,7 @@ impl Service {
         signature: Option<&[u8; 64]>,
         committed_ms: u64,
         time_ms: u64,
+        base_ms: u64,
         mut answer: Answer,
     ) -> SwitchResponse {
         answer.deferred = None;
@@ -82,8 +85,17 @@ impl Service {
         // The state is gone for good, and the keys' deletion owed with it. The keys go after
         // it: a key deleted before a commit that then failed would leave an account no key
         // answers for.
-        self.sweep_erased_keys().await;
+        let left = self.sweep_erased_keys().await;
         self.forget_account(&account);
+        // The answer is released only once the key and its mark are deleted and the erasure
+        // recorded (7.4.16 Order). Otherwise the operator's `503`, without a head: the signer
+        // keeps the request in doubt and retries, and its retry gets the operator's `404`
+        // once the next sweep has deleted the key.
+        let done = left.is_some_and(|left| !left.iter().any(|owed| owed == &account));
+        if !done {
+            let error = ApiError::unavailable("7.6: a temporary failure");
+            return self.operator_answer(signature, base_ms, &error).await;
+        }
         signed
     }
 
@@ -91,14 +103,18 @@ impl Service {
     /// store's ledger first (Switch wire 7.4.16, spec 6.5), and drop what is done. A failure
     /// leaves the key owed for the next sweep: at the next erasure, and at start. Run at
     /// start by the service's binary.
-    pub async fn sweep_erased_keys(&self) {
+    ///
+    /// Returns the accounts whose keys are still owed, a key not deleted or its erasure not
+    /// recorded; `None` when the owed keys can't be read.
+    pub async fn sweep_erased_keys(&self) -> Option<Vec<String>> {
         let owed = match self.store.erased_keys().await {
             Ok(owed) => owed,
             Err(failure) => {
                 tracing::error!(%failure, "reading the keys erasures owe deleting");
-                return;
+                return None;
             }
         };
+        let mut left = Vec::new();
         for erased in owed {
             if let Err(failure) = self
                 .keys
@@ -106,16 +122,21 @@ impl Service {
                 .await
             {
                 tracing::error!(%failure, "recording an erasure");
+                left.push(erased.account);
                 continue;
             }
             if let Err(failure) = self.keys.delete(&erased.key).await {
                 tracing::error!(%failure, "deleting an erased account's key");
+                left.push(erased.account);
                 continue;
             }
+            // The key is gone and the erasure recorded: a row left behind is deleted again,
+            // which deletes nothing more.
             if let Err(failure) = self.store.forget_erased_key(&erased.key).await {
                 tracing::error!(%failure, "dropping a deleted key's row");
             }
         }
+        Some(left)
     }
 
     /// Forget every count the service keeps for `account` (Switch wire 7.4.16, 9.4).

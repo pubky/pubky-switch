@@ -51,7 +51,7 @@ use crate::{
         route::Call,
         source::NetworkSource,
     },
-    keys::{KeyStore, MarkCheck, ServiceSigner, sign_head},
+    keys::{KeyId, KeyStore, MarkCheck, ServiceSigner, sign_head},
     limits::Limits,
     ratelimit::{FailedAuthentications, KeyedMinutes, MinuteWindows},
     store::{AccountTxn, Store, StoreError},
@@ -240,6 +240,21 @@ fn store_error(error: &StoreError) -> ApiError {
 }
 
 impl Service {
+    /// A service at `origin`, the switch origin `identity.json` names, started: the keys an
+    /// erasure left owed, by a key store failure or a crash, are deleted first (Switch wire
+    /// 7.4.16). The service's binary starts it so.
+    pub async fn start(
+        origin: String,
+        store: Store,
+        keys: Arc<dyn KeyStore>,
+        time: Arc<TrustedTime>,
+        limits: Limits,
+    ) -> Self {
+        let service = Self::new(origin, store, keys, time, limits);
+        let _ = service.sweep_erased_keys().await;
+        service
+    }
+
     /// A service at `origin`, the switch origin `identity.json` names.
     pub fn new(
         origin: String,
@@ -276,6 +291,22 @@ impl Service {
     pub fn with_entry_ids(mut self, ids: impl Fn() -> [u8; 16] + Send + Sync + 'static) -> Self {
         self.entry_ids = Arc::new(ids);
         self
+    }
+
+    /// How many counts of its rate limits and of failed authentications the service keeps
+    /// for `account`, for tests of what an erasure forgets (Switch wire 7.4.16, 9.4).
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn counted_at(&self, account: &str) -> usize {
+        self.failed_auth.counted_at(account)
+            + self.reads_per_source.counted(|(at, _)| at == account)
+            + self.reads_per_account.counted(|at| at == account)
+            + self.operation_rate.counted(|(at, _)| at == account)
+            + self.control_rate.counted(|(at, _)| at == account)
+            + self.invite_rate.counted(|(at, _)| at == account)
+            + self.stranger_rate.counted(|at| at == account)
+            + self.sender_rate.counted(|(at, _)| at == account)
+            + self.sender_app_rate.counted(|(at, _)| at == account)
+            + self.notify_rate.counted(|(at, _)| at == account)
     }
 
     /// The hub that wakes waiting feed reads. Run a [`crate::changes::ChangeListener`]
@@ -721,10 +752,19 @@ impl Service {
         // commits, as every refusal to a verified caller carries one (Switch wire 7.1).
         if matches!(answer.deferred, Some(Deferred::Erase)) {
             return self
-                .finish_erasure(txn, &signer, signature, committed_ms, time_ms, answer)
+                .finish_erasure(
+                    txn,
+                    &signer,
+                    signature,
+                    committed_ms,
+                    time_ms,
+                    base_ms,
+                    answer,
+                )
                 .await;
         }
         let txn_account = txn.head().id.clone();
+        let txn_key = txn.head().service_key.clone();
         let fallback_head = if answer.deferred.is_some() {
             self.head(&txn, &signer).await
         } else {
@@ -752,10 +792,10 @@ impl Service {
                     Some(Deferred::Claim(read)) => match self.claim_body(&read).await {
                         Ok(body) => answer.body = body,
                         Err(error) => {
-                            // Erased once the lock was gone: as an unknown account (7.3 step 2,
-                            // 7.4.16), never signed with the erased account's key.
-                            if matches!(self.store.lookup(&txn_account).await, Ok(None)) {
-                                let error = ApiError::not_found("no such account");
+                            // Erased, or erased and enrolled again, once the lock was gone:
+                            // never signed with the erased account's key (7.4.16).
+                            if let Some(error) = self.no_longer_keyed(&txn_account, &txn_key).await
+                            {
                                 return self.operator_answer(signature, base_ms, &error).await;
                             }
                             answer = Answer::error(&error).with_head(fallback_head);
@@ -794,13 +834,34 @@ impl Service {
                 }
                 sign_answer(&signer, signature, time_ms, answer)
             }
-            // Nothing committed, the stamp included: answer at the time last committed.
-            Err(()) => sign_answer(
-                &signer,
-                signature,
-                committed_ms,
-                Answer::error(&ApiError::unavailable("7.6: a temporary failure")),
-            ),
+            // Nothing committed, the stamp included, or committed with the key's mark left
+            // behind: answer at the time last committed. A mark that didn't move because an
+            // erasure deleted the key once the lock was gone is never answered with it.
+            Err(()) => {
+                if let Some(error) = self.no_longer_keyed(&txn_account, &txn_key).await {
+                    return self.operator_answer(signature, base_ms, &error).await;
+                }
+                sign_answer(
+                    &signer,
+                    signature,
+                    committed_ms,
+                    Answer::error(&ApiError::unavailable("7.6: a temporary failure")),
+                )
+            }
+        }
+    }
+
+    /// Before an answer is signed, once the account's lock is gone, with `key`, the key the
+    /// request loaded: `None` while `account` still names it. Otherwise the operator's answer
+    /// to give instead: `404` for an account erased since, as for one the service doesn't host
+    /// (Switch wire 7.3 step 2), and `503` for one enrolled again under another key, or one
+    /// that can't be looked up. So nothing is signed with a key after its account's erasure
+    /// was answered (7.4.16).
+    async fn no_longer_keyed(&self, account: &str, key: &KeyId) -> Option<ApiError> {
+        match self.store.lookup(account).await {
+            Ok(Some(found)) if found.service_key == *key => None,
+            Ok(None) => Some(ApiError::not_found("no such account")),
+            Ok(Some(_)) | Err(_) => Some(ApiError::unavailable("7.6: a temporary failure")),
         }
     }
 
