@@ -453,6 +453,12 @@ fn key_bundle_put(
             .find(|part| &part.put == put)
             .map_or(seq, |part| part.seq),
         KeyBundleEffect::Stores { replaces } => {
+            let replaced: Vec<u64> = parts
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| replaces.contains(index))
+                .map(|(_, part)| part.seq)
+                .collect();
             let mut index = 0;
             parts.retain(|_| {
                 let keep = !replaces.contains(&index);
@@ -476,7 +482,8 @@ fn key_bundle_put(
             // Unless a full-bundle request is in force, the parts the target's cursor has
             // passed and that its `keys_through` covers go: it holds their keys (Switch wire
             // 6.2). A request is in force from the `POST /keys` until the target's cursor has
-            // passed the part that completed it: until then the app hasn't read the parts it
+            // passed the part that completed it, or the part that replaced that one: until then
+            // the app hasn't read the parts it
             // asked for, which may include ones it passed before a restore. It is judged as it
             // was before this part, so a request this part completes keeps them at this put,
             // and this part's `seq` keeps it in force after. The part just stored is past
@@ -490,6 +497,17 @@ fn key_bundle_put(
                 && app.full_requested.is_some()
             {
                 app.full_requested = None;
+                app.full_completed = Some(seq);
+            }
+            // A part that replaces the one that completed a request in force carries the
+            // force on: the replaced item now shows as a stub, which the app passes without
+            // fetching, so the force runs until the app passes this part (Switch wire 6.2).
+            if full
+                && let Some(app) = state.apps.get_mut(&target)
+                && app
+                    .full_completed
+                    .is_some_and(|done| replaced.contains(&done))
+            {
                 app.full_completed = Some(seq);
             }
             drop_passed_parts(state, &target, full);

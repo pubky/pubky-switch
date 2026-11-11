@@ -843,3 +843,40 @@ async fn test_keys_a_request_stays_in_force_for_the_rest_of_the_completing_batch
     );
     replay.db.drop_database().await.expect("drop");
 }
+
+#[tokio::test]
+async fn test_keys_a_part_replacing_the_completing_one_carries_the_force() {
+    // The wallet asks; epoch 2's part (seq 11) completes the request with epoch 1's (seq 10).
+    // Before the wallet reads it, a part over epochs 2 and 3 (seq 12) replaces it while the
+    // request is in force.
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let at = revoke_time();
+    let asked = keys_call(&replay, "wallet", "POST", "wallet", Vec::new(), &at).await;
+    assert_eq!(
+        asked.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&asked.body)
+    );
+    store_parts(&replay, &[(1, 1)], 60, &at).await;
+    wallet_cursor(&replay, 10, &at).await;
+    store_parts(&replay, &[(2, 2)], 61, &at).await;
+    store_parts(&replay, &[(2, 3)], 62, &at).await;
+    assert_eq!(bundle_ranges(&replay, &at).await, json!([[1, 1], [2, 3]]));
+    // The completing item is now a stub, which the wallet passes without fetching: the force
+    // runs on to the part that replaced it, so passing the stub drops nothing.
+    assert_eq!(wallet_item(&replay, 10, 11, &at).await["type"], "stub");
+    wallet_cursor(&replay, 11, &at).await;
+    assert_eq!(bundle_ranges(&replay, &at).await, json!([[1, 1], [2, 3]]));
+    store_parts(&replay, &[(4, 4)], 63, &at).await;
+    assert_eq!(
+        bundle_ranges(&replay, &at).await,
+        json!([[1, 1], [2, 3], [4, 4]])
+    );
+    // Passing the replacing part ends the force.
+    wallet_cursor(&replay, 12, &at).await;
+    assert_eq!(bundle_ranges(&replay, &at).await, json!([[4, 4]]));
+    assert_eq!(keys_through(&replay, &at).await, 3);
+    replay.db.drop_database().await.expect("drop");
+}

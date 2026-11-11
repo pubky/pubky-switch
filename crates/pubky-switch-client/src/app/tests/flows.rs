@@ -2223,6 +2223,33 @@ async fn test_scripted_keys_a_request_stays_in_force_until_the_completing_part_i
 }
 
 #[tokio::test]
+async fn test_scripted_keys_a_part_replacing_the_completing_one_carries_the_force() {
+    let w = World::new();
+    let app = w.join("wallet").await;
+    let me = app.app_id();
+    let cert = app.cert().clone();
+    w.next_doc(|body| body.data_epoch = 2);
+    w.switch.request_full_bundle(me);
+    let first = store_part(&w, me, &cert, 1, 1);
+    w.switch.move_cursor(me, first).unwrap();
+    // Epoch 2's part completes the request; a part over epochs 2 and 3 replaces it while
+    // the request is in force.
+    let completing = store_part(&w, me, &cert, 2, 2);
+    let replacing = store_part(&w, me, &cert, 2, 3);
+    assert_eq!(w.switch.bundles_of(&me), vec![(1, 1), (2, 3)]);
+    // Passing the completing item, now a stub, drops nothing: the force runs on to the part
+    // that replaced it.
+    w.switch.move_cursor(me, completing).unwrap();
+    assert_eq!(w.switch.bundles_of(&me), vec![(1, 1), (2, 3)]);
+    store_part(&w, me, &cert, 4, 4);
+    assert_eq!(w.switch.bundles_of(&me), vec![(1, 1), (2, 3), (4, 4)]);
+    // Passing the replacing part ends the force.
+    w.switch.move_cursor(me, replacing).unwrap();
+    assert_eq!(w.switch.bundles_of(&me), vec![(4, 4)]);
+    assert_eq!(w.switch.keys_through_of(&me), Some(3));
+}
+
+#[tokio::test]
 async fn test_scripted_keys_a_request_stays_in_force_for_the_rest_of_the_completing_batch() {
     let w = World::new();
     let app = w.join("wallet").await;
