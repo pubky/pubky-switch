@@ -662,6 +662,116 @@
       "signature": "ynxfok5dU_49fO8fMt5lxcCiaSLkyVLKN_kdHN9MKcGahMlaN0DzI41Ivg7YpCdCL6e05NPAOAGkYJGfWSzABw",
       "signed_bytes_hex": "000000147075626b792d7377697463682f76312f6874747000000003474554000000412f76312f366672616f387739737335636e3534347164363468796e696b7262723937616531733539343163376d61356531657069666867792f68616e646f76657200000020af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f326200000014323032362d30312d30315430303a31313a30315a0000001568747470733a2f2f696e626f782e6578616d706c6500000034366672616f387739737335636e3534347164363468796e696b7262723937616531733539343163376d61356531657069666867790000001a673774656966396b31757237356a726d6964716b377a377536770000000000000000",
       "signer": "own app: the phone fetches the hand-over stored for it"
+    },
+    {
+      "body_b64": "eyJzZXJ2aWNlX2tleSI6IkwzeWtjakhVaHNNa2lfQU5QNTFueS1iQm5Sd2dRYnBkREtOQXMxQm90TkkiLCJpZGVudGl0eV9oYXNoIjoiYndISzJ4Uzc0bnJMUzV0VU5PemdVVlNhYXotbndIRXNEaTlScHc2UFhqMCJ9",
+      "fields": [
+        {
+          "hex": "504f5354",
+          "name": "method"
+        },
+        {
+          "hex": "2f76312f366672616f387739737335636e3534347164363468796e696b7262723937616531733539343163376d61356531657069666867792f6572617365",
+          "name": "path and query"
+        },
+        {
+          "hex": "ba4bf708836ebd92a5eef1c01a3c66d1e16e3ed71749a4a9e28f0fe0b898f66f",
+          "name": "BLAKE3(body)"
+        },
+        {
+          "hex": "323032362d30312d30315430303a30373a30305a",
+          "name": "Switch-Timestamp"
+        },
+        {
+          "hex": "68747470733a2f2f696e626f782e6578616d706c65",
+          "name": "switch origin"
+        },
+        {
+          "hex": "366672616f387739737335636e3534347164363468796e696b7262723937616531733539343163376d6135653165706966686779",
+          "name": "Switch-Identity"
+        },
+        {
+          "hex": "",
+          "name": "Switch-App"
+        },
+        {
+          "hex": "",
+          "name": "Switch-Cert"
+        },
+        {
+          "hex": "",
+          "name": "Switch-Invite-Code"
+        }
+      ],
+      "headers": {
+        "switch-identity": "6frao8w9ss5cn544qd64hynikrbr97ae1s5941c7ma5e1epifhgy",
+        "switch-signature": "R-73v8NfW_AHXriyQV6PHQHVsEjzSuz1WZJRBo4WKzQ3lqHr92ULoJznXDJe0BjbNCgIPK0Mel7ya9_M48YbAg",
+        "switch-timestamp": "2026-01-01T00:07:00Z"
+      },
+      "label": "pubky-switch/v1/http",
+      "method": "POST",
+      "name": "signer: account erasure, naming the account's service key and the identity.json it follows",
+      "origin": "https://inbox.example",
+      "path": "/v1/6frao8w9ss5cn544qd64hynikrbr97ae1s5941c7ma5e1epifhgy/erase",
+      "public_key": "8UmIHp-1tsFvWnD9rgBVUQJP9wiVt_1JnV42iSG1Lww",
+      "signature": "R-73v8NfW_AHXriyQV6PHQHVsEjzSuz1WZJRBo4WKzQ3lqHr92ULoJznXDJe0BjbNCgIPK0Mel7ya9_M48YbAg",
+      "signed_bytes_hex": "000000147075626b792d7377697463682f76312f6874747000000004504f53540000003e2f76312f366672616f387739737335636e3534347164363468796e696b7262723937616531733539343163376d61356531657069666867792f657261736500000020ba4bf708836ebd92a5eef1c01a3c66d1e16e3ed71749a4a9e28f0fe0b898f66f00000014323032362d30312d30315430303a30373a30305a0000001568747470733a2f2f696e626f782e6578616d706c6500000034366672616f387739737335636e3534347164363468796e696b7262723937616531733539343163376d6135653165706966686779000000000000000000000000",
+      "signer": "signer: account erasure, naming the account's service key and the identity.json it follows"
+    },
+    {
+      "body_b64": "eyJzZXJ2aWNlX2tleSI6IkwzeWtjakhVaHNNa2lfQU5QNTFueS1iQm5Sd2dRYnBkREtOQXMxQm90TkkiLCJpZGVudGl0eV9oYXNoIjoibkZPNUhyS1lMdGZ2Mnl4clY3MUgwSVc5QTJ1Q181VVVOaFVybkxmcUR1OCJ9",
+      "fields": [
+        {
+          "hex": "504f5354",
+          "name": "method"
+        },
+        {
+          "hex": "2f76312f366672616f387739737335636e3534347164363468796e696b7262723937616531733539343163376d61356531657069666867792f6572617365",
+          "name": "path and query"
+        },
+        {
+          "hex": "f90d9c5135427e2cb134911747fe31267a0eab472da7317bcae23b44cc72c322",
+          "name": "BLAKE3(body)"
+        },
+        {
+          "hex": "323032362d30312d30315430303a30373a30305a",
+          "name": "Switch-Timestamp"
+        },
+        {
+          "hex": "68747470733a2f2f696e626f782e6578616d706c65",
+          "name": "switch origin"
+        },
+        {
+          "hex": "366672616f387739737335636e3534347164363468796e696b7262723937616531733539343163376d6135653165706966686779",
+          "name": "Switch-Identity"
+        },
+        {
+          "hex": "",
+          "name": "Switch-App"
+        },
+        {
+          "hex": "",
+          "name": "Switch-Cert"
+        },
+        {
+          "hex": "",
+          "name": "Switch-Invite-Code"
+        }
+      ],
+      "headers": {
+        "switch-identity": "6frao8w9ss5cn544qd64hynikrbr97ae1s5941c7ma5e1epifhgy",
+        "switch-signature": "yLFGzzQ7RSX7G9i-wYdspgKgB--9JTgVBjnVYSj4M3rHBLM4KUKPNLq6daTCaUqdoWhiWUEI0_Q-ZDCTmZQjBQ",
+        "switch-timestamp": "2026-01-01T00:07:00Z"
+      },
+      "label": "pubky-switch/v1/http",
+      "method": "POST",
+      "name": "signer: account erasure naming an identity.json the account doesn't hold",
+      "origin": "https://inbox.example",
+      "path": "/v1/6frao8w9ss5cn544qd64hynikrbr97ae1s5941c7ma5e1epifhgy/erase",
+      "public_key": "8UmIHp-1tsFvWnD9rgBVUQJP9wiVt_1JnV42iSG1Lww",
+      "signature": "yLFGzzQ7RSX7G9i-wYdspgKgB--9JTgVBjnVYSj4M3rHBLM4KUKPNLq6daTCaUqdoWhiWUEI0_Q-ZDCTmZQjBQ",
+      "signed_bytes_hex": "000000147075626b792d7377697463682f76312f6874747000000004504f53540000003e2f76312f366672616f387739737335636e3534347164363468796e696b7262723937616531733539343163376d61356531657069666867792f657261736500000020f90d9c5135427e2cb134911747fe31267a0eab472da7317bcae23b44cc72c32200000014323032362d30312d30315430303a30373a30305a0000001568747470733a2f2f696e626f782e6578616d706c6500000034366672616f387739737335636e3534347164363468796e696b7262723937616531733539343163376d6135653165706966686779000000000000000000000000",
+      "signer": "signer: account erasure naming an identity.json the account doesn't hold"
     }
   ],
   "responses": [
@@ -1267,6 +1377,72 @@
       "signed_bytes_hex": "0000001d7075626b792d7377697463682f76312f687474702d726573706f6e73650000000800000000000000c800000020b63f6f3229a25c4b84fe212ecdc28ed068090e16f0fab3cfaaf0a24514b042a900000018323032362d30312d30315430303a31313a30312e3033305a000000206917af962624218e0b785db7a2cbf7f80cb0bed435c6e5ce14adf68574aa580e",
       "signer": "service key",
       "status": 200
+    },
+    {
+      "body": "{\"erased\":true}",
+      "fields": [
+        {
+          "hex": "00000000000000c8",
+          "name": "u64(status)"
+        },
+        {
+          "hex": "b44727ef097c345ce45981615f2f0dbf5e4800ea5a6adeb41ada6e6c80ee7d11",
+          "name": "BLAKE3(request signature)"
+        },
+        {
+          "hex": "323032362d30312d30315430303a30373a30302e3033305a",
+          "name": "server time"
+        },
+        {
+          "hex": "a82342dd7a71f2196c80e2ffc1e658f77d7c7cb90edf025b21553a3d3c3504b5",
+          "name": "BLAKE3(body)"
+        }
+      ],
+      "headers": {
+        "switch-server-time": "2026-01-01T00:07:00.030Z",
+        "switch-service-signature": "fDwJLrkohJMuc4ON5Ez2wtZ1I6LjpJrJol8fxxS3lAFvGVK4wUT7yjDNbzRDyGVDi52T1uvgi5vk3YBHlRNBCQ"
+      },
+      "label": "pubky-switch/v1/http-response",
+      "name": "signer: account erasure answer to the request naming its identity.json, signed with the account's key, no head",
+      "public_key": "L3ykcjHUhsMki_ANP51ny-bBnRwgQbpdDKNAs1BotNI",
+      "request_signature": "R-73v8NfW_AHXriyQV6PHQHVsEjzSuz1WZJRBo4WKzQ3lqHr92ULoJznXDJe0BjbNCgIPK0Mel7ya9_M48YbAg",
+      "signature": "fDwJLrkohJMuc4ON5Ez2wtZ1I6LjpJrJol8fxxS3lAFvGVK4wUT7yjDNbzRDyGVDi52T1uvgi5vk3YBHlRNBCQ",
+      "signed_bytes_hex": "0000001d7075626b792d7377697463682f76312f687474702d726573706f6e73650000000800000000000000c800000020b44727ef097c345ce45981615f2f0dbf5e4800ea5a6adeb41ada6e6c80ee7d1100000018323032362d30312d30315430303a30373a30302e3033305a00000020a82342dd7a71f2196c80e2ffc1e658f77d7c7cb90edf025b21553a3d3c3504b5",
+      "signer": "service key",
+      "status": 200
+    },
+    {
+      "body": "{\"code\":\"conflict\",\"message\":\"7.4.16: the account holds another identity.json\"}",
+      "fields": [
+        {
+          "hex": "0000000000000199",
+          "name": "u64(status)"
+        },
+        {
+          "hex": "eb856950b7882b2fefa611d68360f7798b2aff1d66ae2cc72f922406903cd23f",
+          "name": "BLAKE3(request signature)"
+        },
+        {
+          "hex": "323032362d30312d30315430303a30373a30302e3033305a",
+          "name": "server time"
+        },
+        {
+          "hex": "024ec5453a0f1243b26f3de9a7e155f9a7804f519bb1191c91c700929d023689",
+          "name": "BLAKE3(body)"
+        }
+      ],
+      "headers": {
+        "switch-server-time": "2026-01-01T00:07:00.030Z",
+        "switch-service-signature": "hWaGxty4jbPFX2QZtvNJW5h-limOB1TIRNtDSmajUIyyuKroQkgw93FMq3Iu27m9v088UxzFldTC1o2k4g7UCg"
+      },
+      "label": "pubky-switch/v1/http-response",
+      "name": "signer: account erasure refused, the account holds another identity.json, 409 conflict, no head",
+      "public_key": "L3ykcjHUhsMki_ANP51ny-bBnRwgQbpdDKNAs1BotNI",
+      "request_signature": "yLFGzzQ7RSX7G9i-wYdspgKgB--9JTgVBjnVYSj4M3rHBLM4KUKPNLq6daTCaUqdoWhiWUEI0_Q-ZDCTmZQjBQ",
+      "signature": "hWaGxty4jbPFX2QZtvNJW5h-limOB1TIRNtDSmajUIyyuKroQkgw93FMq3Iu27m9v088UxzFldTC1o2k4g7UCg",
+      "signed_bytes_hex": "0000001d7075626b792d7377697463682f76312f687474702d726573706f6e736500000008000000000000019900000020eb856950b7882b2fefa611d68360f7798b2aff1d66ae2cc72f922406903cd23f00000018323032362d30312d30315430303a30373a30302e3033305a00000020024ec5453a0f1243b26f3de9a7e155f9a7804f519bb1191c91c700929d023689",
+      "signer": "service key",
+      "status": 409
     }
   ],
   "webhook": {
