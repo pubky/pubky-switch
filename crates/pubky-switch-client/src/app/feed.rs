@@ -2101,7 +2101,7 @@ impl App {
     /// Whether the newest own `identity.json` says the app isn't current at this service:
     /// removed, or the identity moved to another generation, which the provider-change flow
     /// follows.
-    fn not_current_here(&self) -> Option<AppEvent> {
+    pub(crate) fn not_current_here(&self) -> Option<AppEvent> {
         let doc = &self.state.own_doc;
         if doc.lists_removed(&self.state.meta.app_id) {
             return Some(AppEvent::Removed);

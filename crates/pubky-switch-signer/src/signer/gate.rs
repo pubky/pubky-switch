@@ -1,9 +1,9 @@
 //! The signing gate: the one way to the identity key for anything that signs (Switch spec 4.3).
 //!
 //! Every signed document, certificate, approval, claim, key bundle and operation is made with
-//! a [`SigningKey`], and only [`signing_key`] hands one out, once its checks pass: this install
-//! is the one named, its records aren't behind its own newer version, and no rollback or
-//! equivocation alarm is latched or held. Clients of the switch get a request-only key
+//! a [`SigningKey`], and only [`signing_key`] hands one out, once its checks pass: the account
+//! isn't erased, this install is the one named, its records aren't behind its own newer
+//! version, and no rollback or equivocation alarm is latched or held. Clients of the switch get a request-only key
 //! ([`crate::key::IdentityKeyring::request_signer`]) for their `Switch-Signature`, so they
 //! read, and deliver what was signed already, but sign nothing new.
 //!
@@ -20,7 +20,8 @@ use crate::state::SignerState;
 /// That the gate's checks passed for one call: only [`signing_key`] makes one.
 pub(crate) struct GatePassed(());
 
-/// Why the records `state` sign nothing now, if they don't: another install is the signer
+/// Why the records `state` sign nothing now, if they don't: the account is erased
+/// ([`Refusal::Erased`]), another install is the signer
 /// ([`SignerError::NotNamed`]), the records are behind this install's own newer version
 /// ([`Refusal::RecordsBehind`]), or an alarm is latched or held: the switch hasn't confirmed
 /// the mark since a rollback or an equivocation, or the user hasn't cleared its alert
@@ -49,6 +50,9 @@ pub(crate) fn refusal(state: &SignerState) -> Option<SignerError> {
 
 /// The checks every signing step passes, a hand-over's or a take-over's included.
 fn base_refusal(state: &SignerState) -> Option<SignerError> {
+    if state.erased {
+        return Some(Refusal::Erased.into());
+    }
     if let Some(install) = state.managed_by {
         return Some(SignerError::NotNamed { install });
     }

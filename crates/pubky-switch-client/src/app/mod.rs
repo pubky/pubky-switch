@@ -1029,7 +1029,12 @@ impl App {
     /// locally and every processed pair the app keeps (for 30 days plus the clock
     /// tolerance). While they add up to more than the batch size, every layered backup is
     /// refused, with [`AppEvent::BackupRefused`] for the host, until they drain: entries
-    /// stored locally as they are processed, processed pairs as they age out.
+    /// stored locally as they are processed, processed pairs as they age out. It applies the
+    /// bounds on entries stored unverified first, as a read does (Switch spec 8.2), so the
+    /// backup holds at most [`MAX_UNVERIFIED_TOTAL`] of them, and keeps the duty events of
+    /// what they drop. So it needs a writable store, and those drops stay committed even
+    /// if the backup is then refused. An app a read wouldn't run on (stopped by an alarm,
+    /// left, or no longer current here) skips the bounds and only reads its store.
     ///
     /// # Errors
     ///
@@ -1043,6 +1048,15 @@ impl App {
             let Some(name) = self.protocol.backup_name() else {
                 return Err(Refusal::NotNow("the protocol names no backup layer".into()).into());
             };
+            // The bounds on entries stored unverified first, as at a read, so a pile stored
+            // during the last read doesn't go into the backup (Switch spec 8.2). An app a read
+            // wouldn't run on, halted by an alarm, left, or no longer current here, commits
+            // nothing: its backup is taken read-only, the entries as they are.
+            self.ready_local().await?;
+            let halted = self.refuse_when_halted().is_err() || self.not_current_here().is_some();
+            if !halted {
+                self.bound_unverified().await?;
+            }
             let reader = self.reader();
             let state = Self::read_state(&reader).await?;
             let mut backup = Self::backup_of(&state)?;
