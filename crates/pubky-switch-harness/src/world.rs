@@ -292,9 +292,15 @@ impl World {
     /// Make the switch unreachable for the next `method` request whose path contains
     /// `path`: nothing is applied, and the caller fails to connect.
     pub fn unreachable(&self, method: &str, path: &str) {
+        self.unreachable_after(method, path, 0);
+    }
+
+    /// As [`World::unreachable`], once `after` matching requests went through.
+    pub fn unreachable_after(&self, method: &str, path: &str, after: usize) {
         self.recorder.fail_next(Fault::Unreachable {
             method: method.to_owned(),
             path: path.to_owned(),
+            after,
         });
     }
 
