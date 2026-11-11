@@ -622,9 +622,17 @@ impl Signer {
         body.signer = self.state.install;
         change(&mut body);
         // Never a version the switch can't take: its delivery would be over `PUT /identity`'s
-        // body cap (Switch wire 7.1), and could never be delivered. A removal, which drops the
-        // app's `renewed` entries with it, makes the document smaller.
-        let bytes = delivery_len(body.to_json()?.len());
+        // body cap (Switch wire 7.1), and could never be delivered. Nor one whose closings
+        // couldn't be: an open `renewed` entry is closed in a later version, its `null` turned
+        // into a time (wire 3.3, 3.8), so the version is measured with every open entry closed.
+        // Otherwise a closing owed past the cap would stop every later step. A removal, which
+        // drops the app's `renewed` entries with it, makes the document smaller.
+        let mut closed = body.clone();
+        for entry in &mut closed.renewed {
+            // Every time is written at the same length, three fraction digits (wire 1.6).
+            entry.until.get_or_insert(0);
+        }
+        let bytes = delivery_len(closed.to_json()?.len());
         if let Some(limit) = identity_limit()
             && bytes > limit
         {

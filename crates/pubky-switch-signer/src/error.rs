@@ -141,8 +141,9 @@ pub enum Refusal {
         switch_ms: u64,
     },
     /// The version would be larger than a delivery may carry (`PUT /identity`'s body cap,
-    /// Switch wire 7.1), so the switch could never take it: nothing is signed. A revocation,
-    /// which drops the app's `renewed` entries, makes the document smaller.
+    /// Switch wire 7.1), measured with its open `renewed` entries closed, as later versions
+    /// close them: the switch could never take it, or its closings. Nothing is signed. A
+    /// revocation, which drops the app's `renewed` entries, makes the document smaller.
     #[error("refused: identity.json would be over the size a delivery may carry")]
     IdentityTooLarge {
         /// The delivery's size, in bytes.
