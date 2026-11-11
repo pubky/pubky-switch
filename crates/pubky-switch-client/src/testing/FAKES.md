@@ -33,13 +33,11 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   view.
 - **`invite_code.delete`** of a code the switch doesn't hold is `404`; the core has no rule
   for it.
-- **Key bundle parts** the target's cursor passed are never dropped, neither when a part is
-  stored nor at the cursor move that passes them (Switch wire 6.2); so their items never turn
-  to stubs, `GET /apps/{app_id}/keys` keeps answering them, and `bundle_ranges` never
-  shrinks.
-- **`keys_through`** (Switch wire 7.4.12) counts every stored part as fetched, whatever the
-  app's cursor: the epoch of the first version listing the app, raised by each part that
-  continues it.
+- **Key bundle parts** go as the service drops them, by the core's `parts_to_drop`: at a
+  `key_bundle.put` and at the `cursor.set` that passes them, the parts the target's cursor
+  has passed and its `keys_through` covers, unless a full bundle was requested before the
+  part (Switch wire 6.2). Where `keys_through` starts rises to the height the dropped parts
+  gave. `keys_through` itself is the core's (7.4.12), over the parts the cursor passed.
 
 ## State and retention
 
@@ -193,7 +191,16 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   fetched, and at a staged one holding an import (not one staged for a key change in place).
   An app's call is `403 permission_missing`. Then every call, the retry included, gets the
   `404` signed with a fixed operator key. `erased` tells a test it happened; app tests set the
-  flag directly.
+  flag directly. The service keeps no freeze or import state yet, so it refuses no erasure for
+  a move; it answers an app of another identity `403 permission_missing`, where this switch
+  answers `403 not_admitted`; and after an erasure it takes `POST /v1/enroll` again, creating a
+  new staged account, where this switch answers it with the operator's `404` too. That account
+  can't serve at the service yet either: its first `identity.json`, at the next generation with
+  `recovery_from` (Switch wire 7.4.16), gets the `503` "a generation change isn't served yet".
+  This switch deletes everything at once and owes no key: its `404` comes right after the
+  erasure. The service can owe the erased account's key when its key store fails, and until
+  the key is gone it answers a request signed with the identity key, whatever its timestamp,
+  with the operator's `503` in place of that `404`; every other caller gets the `404` at once.
 - **Push** (Switch wire 8.1): registrations only; nothing is sent to a relay.
 
 ## Signer flows tested only here
@@ -201,8 +208,8 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
 These signer flows run only against the scripted switch, whose `GET /apps` follows the
 service's rules (above). The service in this workspace serves `GET /apps`, `GET` and `POST
 /apps/{app_id}/keys` and `POST /apps/{app_id}/leave`, so the full-bundle requests, reading the
-stored parts, the departures and the hand-over can run against it now (`PUT` and `GET
-/handover` too); the erasure waits for `POST /erase`:
+stored parts, the departures, the hand-over (`PUT` and `GET /handover`) and the erasure can run
+against it now:
 
 - approval, renewals and reductions, their closings, and epoch completion
   (`crates/pubky-switch-signer/tests/approval.rs`, `renewal.rs`);
@@ -213,5 +220,5 @@ stored parts, the departures and the hand-over can run against it now (`PUT` and
 - restore from the signer backup, in place and on a new install (`restore.rs`);
 - the hand-over both ways, the abort, the take-over's checks and its lost answers, and which
   copies delete a key (`handover.rs`), save the scripted faults;
-- the account's erasure, its lost answer, retry and refusal (`erasure.rs`): the service
-  doesn't serve `POST /erase` yet.
+- the account's erasure, its lost answer, retry and refusal (`erasure.rs`), save the scripted
+  faults.

@@ -216,7 +216,7 @@ impl Signer {
     /// claim stays held: [`Signer::approved`] gives it once a later [`Signer::resume`] has
     /// delivered the version.
     pub async fn approve(&mut self, review: AppReview) -> Result<ApprovedRequest> {
-        self.ready().await?;
+        let read = self.ready_and_read().await?;
         let review = self.review(review.request.signed(), &review.auth)?;
         if review.renews {
             let change = CertChange {
@@ -236,9 +236,13 @@ impl Signer {
         let body = review.request.body();
         let now = self.env.clock.now_ms();
         // The certificate is stamped with the device clock: it must agree with the switch's
-        // time.
-        let (_, switch_time) = self.switch_apps_at().await?;
-        clock_agrees(now, switch_time)?;
+        // time, from the read that checked its copy, against the device clock when that
+        // answer came, not after the backup and Homeserver reads since (Switch spec 10.1).
+        let (device_ms, switch_time) = match read {
+            Some(read) => (read.device_ms, read.answer.server_time),
+            None => (now, self.switch_apps_at().await?.1),
+        };
+        clock_agrees(device_ms, switch_time)?;
         let expires = now.saturating_add(self.state.cert_lifetime_ms);
         let protocols = self.env.protocols.clone();
         let has_keys = |scope: &str| protocols.has_keys(scope);

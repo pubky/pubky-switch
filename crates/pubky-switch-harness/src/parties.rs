@@ -3,8 +3,9 @@
 
 use std::sync::Arc;
 
-use pubky_switch_client::app::JoinRequest;
+use pubky_switch_client::app::{Collection, JoinRequest};
 use pubky_switch_client::testing::{ProtocolSpec, TestProtocol};
+use pubky_switch_core::ident::Policy;
 use pubky_switch_core::keys::AppKeys;
 use pubky_switch_core::records::{
     AppRequest, AppRequestBody, ApprovalClaim, AuthRequest, app_record_path,
@@ -62,6 +63,22 @@ pub fn notes_protocol() -> Arc<TestProtocol> {
         keyed_scopes: vec![NOTES.to_owned()],
         accepts: vec![NOTE_KIND.to_owned()],
         ..ProtocolSpec::default()
+    }))
+}
+
+/// The collection of shared records the [`Notes`] protocol's apps keep, read and written
+/// with the [`NOTES`] scope.
+pub fn notes_collection() -> Collection {
+    Collection::new("example.items", Policy::new(NOTES, &[NOTES]))
+}
+
+/// The app's side of the [`Notes`] protocol with its [`notes_collection`]: an app with it
+/// lists the collection's records when it joins.
+pub fn notes_protocol_with_records() -> Arc<TestProtocol> {
+    Arc::new(TestProtocol::new(ProtocolSpec {
+        keyed_scopes: vec![NOTES.to_owned()],
+        accepts: vec![NOTE_KIND.to_owned()],
+        collections: vec![notes_collection()],
     }))
 }
 

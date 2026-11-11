@@ -1355,3 +1355,74 @@ async fn test_owed_record_cleanup_waits_for_a_fresh_check() {
     );
     assert!(world.homeserver.file(&app_record_path(&id)).is_some());
 }
+
+#[tokio::test]
+async fn test_revocation_checks_the_switch_again_after_completing_a_given_up_epoch() {
+    // The revocation completes a given-up epoch in a version of its own, then another
+    // install delivers the next version before the rotation goes out. The switch is checked
+    // again before the rotation's batches: the other install is named, and nothing more is
+    // sent, no batch and no version (Switch spec 4.3, 3.2).
+    use pubky_switch_client::transport::MockTransport;
+    let world = World::new();
+    let (mut signer, store) = world.enrolled().await;
+    let (_, b) = two_joined(&world, &mut signer).await;
+    world.switch.fail_next(SwitchFault::Error {
+        path: "/identity".into(),
+        code: pubky_switch_core::http::ErrorCode::BadRequest,
+        current: serde_json::Value::Null,
+    });
+    signer
+        .renew(
+            b.keys.app_id_bytes(),
+            CertChange {
+                scopes: Some(vec!["notes_tags".into()]),
+                expires_at: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    drop(signer);
+    let switch = Arc::clone(&world.switch);
+    let key = IdentityKey::from_secret(world.key.secret_bytes());
+    let other = [7; 16];
+    let delivered = Arc::new(std::sync::Mutex::new(false));
+    // The writes sent once the other install delivered.
+    let after = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let writes = Arc::clone(&after);
+    let transport = Arc::new(MockTransport::with_handler(move |request| {
+        let mut delivered = delivered.lock().unwrap();
+        if *delivered && request.method != "GET" {
+            writes
+                .lock()
+                .unwrap()
+                .push(format!("{} {}", request.method, request.path_and_query));
+        }
+        let answer = switch.handle(request);
+        if request.method == "PUT" && request.path_and_query.ends_with("/identity") && !*delivered {
+            // Right after the completing version lands, the other install delivers.
+            *delivered = true;
+            let mark = switch.identity_doc().unwrap();
+            let mut body = mark.body().clone();
+            body.version += 1;
+            body.signer = other;
+            switch
+                .deliver_identity(&IdentityDoc::sign(&key, body).unwrap())
+                .unwrap();
+        }
+        answer
+    }));
+    let mut env = world.env(store);
+    env.transport = transport;
+    let mut signer = Signer::open(env, world.keyring()).await.unwrap();
+    let error = signer
+        .revoke(b.keys.app_id_bytes(), None, confirmed())
+        .await
+        .unwrap_err();
+    assert_eq!(error, SignerError::NotNamed { install: other }, "{error:?}");
+    assert_eq!(world.switch.identity_doc().unwrap().body().signer, other);
+    assert_eq!(
+        *after.lock().unwrap(),
+        Vec::<String>::new(),
+        "nothing more signed"
+    );
+}

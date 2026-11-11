@@ -142,8 +142,10 @@ pub fn newly_listed(earlier: Option<&IdentityDoc>, later: &IdentityDoc) -> Vec<[
 }
 
 impl AccountTxn {
-    /// The data epoch of the first `identity.json` that listed `app`, where it is known
-    /// (Switch wire 7.4.12 `keys_through`).
+    /// Where `app`'s `keys_through` starts, where it is known (Switch wire 7.4.12): the data
+    /// epoch of the first `identity.json` that listed it, raised as the key bundle parts it
+    /// passed went ([`Self::raise_keys_start`]). `app_listings.listed_epoch` holds it; the
+    /// column kept its first name, since migration 0009 can't change.
     pub async fn listed_epoch(&mut self, app: &[u8; 16]) -> Result<Option<u64>, StoreError> {
         let id = self.head().id.clone();
         let epoch: Option<i64> = sqlx::query_scalar(

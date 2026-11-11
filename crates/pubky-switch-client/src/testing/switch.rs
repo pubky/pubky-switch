@@ -134,6 +134,9 @@ pub struct SwitchApp {
     pub departed_at: Option<(u64, u64)>,
     /// When the app asked for its full key bundle, until a bundle part answers it.
     pub full_requested: Option<u64>,
+    /// The `seq` of the part that completed its last full-bundle request: the request stays
+    /// in force for dropping parts until its cursor has passed it (Switch wire 6.2).
+    pub full_completed: Option<u64>,
     /// When the switch last took a request of the app's (`last_seen`, Switch wire 7.4.12).
     pub last_seen: Option<u64>,
     /// Whether a delivered `identity.json` listed the departed app in `removed` at a higher
@@ -1019,6 +1022,36 @@ impl ScriptedSwitch {
             return Err(ScriptError::Refused { status, body });
         }
         Ok(inner.seq)
+    }
+
+    /// Move `app`'s cursor to `seq`, in a batch of its own, as a submitted `cursor.set` does
+    /// (Switch wire 6.2). For tests of what a cursor move changes.
+    ///
+    /// # Errors
+    ///
+    /// As [`ScriptedSwitch::signer_op`].
+    #[cfg(test)]
+    pub(crate) fn move_cursor(&self, app: [u8; 16], seq: u64) -> Result<(), ScriptError> {
+        let mut inner = self.lock();
+        let generation = inner.tip.generation;
+        let (status, body) = inner.submit(Some(app), &[], Some(Position { generation, seq }))?;
+        if status != 200 {
+            return Err(ScriptError::Refused { status, body });
+        }
+        Ok(())
+    }
+
+    /// Set `app`'s cursor to `seq` directly, with none of a move's rules: the state a switch
+    /// left from before it dropped parts at cursor moves. For tests.
+    #[cfg(test)]
+    pub(crate) fn set_cursor_unchecked(&self, app: [u8; 16], seq: u64) {
+        self.lock().apps.entry(app).or_default().cursor = seq;
+    }
+
+    /// `app`'s `keys_through` as `GET /apps` shows it (Switch wire 7.4.12). For tests.
+    #[cfg(test)]
+    pub(crate) fn keys_through_of(&self, app: &[u8; 16]) -> Option<u64> {
+        self.lock().keys_through(app)
     }
 
     /// The feed items `app` is shown, in order, read page by page through the feed route
