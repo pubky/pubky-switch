@@ -28,6 +28,7 @@ mod feed;
 mod handover;
 mod identity;
 mod inbox;
+mod keying;
 mod ops;
 mod peers;
 mod records;
@@ -51,6 +52,7 @@ pub use feed::{AppDocs, CurrentDocs, FeedRow, FeedSnapshot, PageReader};
 pub use handover::StoredHandover;
 pub use identity::HeldIdentity;
 pub use inbox::{InboxItem, InboxUsage, NewEntry, StoredEntry};
+pub use keying::{Keyed, keying_lock_key};
 pub use ops::{
     DivergentUpload, ListName, RecordOrigin, StoredApp, StoredBundlePart, StoredClaimEntry,
     StoredInvite, StoredListEntry, StoredRecord,

@@ -24,7 +24,7 @@
 
 use pubky_switch_core::http::{ERASED_BODY, parse_erase_body};
 
-use super::{Answer, Deferred, PublicKeyBytes, Service, sign_answer};
+use super::{Answer, Deferred, PublicKeyBytes, Service, keyed::Proof};
 use crate::{
     http::{
         SwitchResponse,
@@ -77,7 +77,7 @@ impl Service {
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn finish_erasure(
         &self,
-        txn: AccountTxn,
+        mut txn: AccountTxn,
         signer: &ServiceSigner,
         signature: Option<&[u8; 64]>,
         committed_ms: u64,
@@ -86,15 +86,56 @@ impl Service {
         mut answer: Answer,
     ) -> SwitchResponse {
         answer.deferred = None;
-        let signed = sign_answer(signer, signature, time_ms, answer);
+        let unavailable = || ApiError::unavailable("7.6: a temporary failure");
+        // No keyed section signs with the key from here on: the erasure's answer is the last
+        // it signs (7.4.16, store/keying.rs). The confirmation is signed in place, under the
+        // row lock this transaction holds, since it goes out only once the deletion commits;
+        // a failure here may have ended the transaction, so its `503` is signed only in a
+        // keyed section.
+        if let Err(failure) = txn.exclude_signers().await {
+            tracing::error!(%failure, "excluding an erased account's signers");
+            return self
+                .sign_after_failure(
+                    txn,
+                    signer,
+                    signature,
+                    committed_ms,
+                    Answer::error(&unavailable()),
+                    base_ms,
+                    true,
+                )
+                .await;
+        }
+        let signed = self
+            .sign_keyed(
+                Proof::Locked(&txn),
+                signer,
+                signature,
+                time_ms,
+                answer,
+                base_ms,
+                true,
+            )
+            .await;
         let account = txn.head().id.clone();
+        let key = txn.head().service_key.clone();
         match txn.erase(time_ms).await {
             Ok(()) => {}
             Err(failure) => {
-                // Dropped uncommitted: nothing is deleted, and the signer retries.
+                // Dropped uncommitted: nothing is deleted, and the signer retries. The lock is
+                // gone, so the `503` is signed only while the account still names the key.
                 tracing::error!(%failure, "an erasure");
-                let error = ApiError::unavailable("7.6: a temporary failure");
-                return sign_answer(signer, signature, committed_ms, Answer::error(&error));
+                return self
+                    .sign_keyed(
+                        Proof::checked(&account, &key),
+                        signer,
+                        signature,
+                        committed_ms,
+                        Answer::error(&unavailable()),
+                        base_ms,
+                        true,
+                    )
+                    .await;
             }
         };
         // The state is gone for good, and the keys' deletion owed with it. The keys go after
