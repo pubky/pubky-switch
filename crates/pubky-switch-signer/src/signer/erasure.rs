@@ -9,11 +9,12 @@
 //!    whose reminder isn't raised yet ([`Alert::GrantRevocationOwed`]), since the Pubky SDK
 //!    offers no call for it (design note, decision 4);
 //! 2. sends `POST /v1/{id}/erase` naming the pinned service key, again until it is answered,
-//!    marking before each request that it may land. A `200` confirms the erasure. So does the
-//!    operator's `404`, but only after a request that may have landed, as a lost `200`
-//!    leaves it (Switch wire 7.4.16): on a first request a `404` is an error. Only an answer
-//!    the pinned key signed shows the account still exists, so only such an answer clears the
-//!    mark; no answer, or an unsigned one such as a proxy's, keeps it.
+//!    marking before each request that it may land. A `200` confirms the erasure. So does an
+//!    unsigned `404`, the operator's, but only after a request that may have landed, as a
+//!    lost `200` leaves it (Switch wire 7.4.16). A `404` is never itself a lost answer: with
+//!    no request in doubt it is an error, and the mark goes back. No answer, or another
+//!    answer the pinned key didn't sign, such as a gateway's `503`, keeps the mark; only an
+//!    answer the pinned key signed shows the account still exists, and clears it.
 //!
 //! A `409 conflict` is the switch refusing it, as during a move: the erasure ends without
 //! erasing, `identity.json` is published again, and the grant reminders it raised for apps
@@ -134,8 +135,21 @@ impl Signer {
             Err(ClientError::BadServiceSignature { status: 404 }) if unanswered => {
                 self.erased().await
             }
-            // No answer, or one the pinned key didn't sign, as a proxy's: nothing shows that
-            // the account still exists, so the request may have landed and the mark stays.
+            // A `404` is never a lost answer: the operator's means the switch hosted no account
+            // when it answered, an intermediary's that the request wasn't routed. With no
+            // request in doubt before, it erased nothing, and it never sets the doubt itself.
+            Err(error @ ClientError::BadServiceSignature { status: 404 }) => {
+                let flow = Flow::Erase {
+                    unpublished,
+                    reminded,
+                    unanswered: false,
+                };
+                self.commit(self.state.clone(), Some(flow)).await?;
+                Err(error.into())
+            }
+            // No answer, or another answer the pinned key didn't sign, such as a gateway's
+            // `502`, `503` or `504`, which can hide a forwarded request: the request may have
+            // landed, and the mark stays.
             Err(error @ (ClientError::Transport(_) | ClientError::BadServiceSignature { .. })) => {
                 Err(error.into())
             }

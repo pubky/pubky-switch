@@ -250,25 +250,25 @@ fn unsigned_404_for_erasure(world: &World, store: Arc<MemoryStore>) -> SignerEnv
 
 #[tokio::test]
 async fn test_erasure_404_to_a_first_request_isnt_taken_as_done() {
-    // A `404` to the first request can't be the account erased already: the erasure stays in
-    // progress. An unsigned answer doesn't show the account still exists either, so the
-    // request may have landed: it can't be aborted, and a `404` to the next request is the
-    // erasure done (Switch wire 7.4.16).
+    // A `404` is never a lost answer: to a request with none in doubt before, it erased
+    // nothing, however often it comes, as from an intermediary that never routes the request.
+    // The erasure stays in progress and the user can abort it (Switch wire 7.4.16).
     let world = World::new();
     let (signer, _, store) = with_an_app(&world).await;
     drop(signer);
     let mut signer = Signer::open(unsigned_404_for_erasure(&world, store), world.keyring())
         .await
         .unwrap();
+    let newest = signer.identity_doc().unwrap().unwrap();
     let error = signer.close_account(confirmed()).await.unwrap_err();
     assert!(matches!(error, SignerError::Switch(_)), "{error:?}");
-    assert_eq!(signer.status(), SignerStatus::Erasing);
-    assert_eq!(
-        signer.abort_erasure().await.unwrap_err(),
-        SignerError::Refused(Refusal::ErasureUnanswered)
-    );
-    signer.resume().await.unwrap();
-    assert_eq!(signer.status(), SignerStatus::Erased);
+    for _ in 0..10 {
+        signer.resume().await.unwrap_err();
+        assert_eq!(signer.status(), SignerStatus::Erasing);
+    }
+    signer.abort_erasure().await.unwrap();
+    assert_eq!(signer.status(), SignerStatus::Signing);
+    assert_eq!(world.published().unwrap().signed(), newest.signed());
 }
 
 #[tokio::test]
