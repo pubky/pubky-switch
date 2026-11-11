@@ -56,16 +56,22 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   `release_held_reads`, where the service answers by itself when its time is up. The
   transport of `transport` holds nothing and answers such a read at once. A `wait` that
   isn't an integer from 0 to 25 is `400`.
-- **Retention and sweeps** (Switch wire 9.1): entries never expire; `missed` items,
-  checkpoints and dropped stubs exist only when a test scripts them, and a scripted `missed`
-  item (`push_missed`) is shown to every app, where the service shows one only to its app;
-  no app is ever marked lagging (`lagging` is always `false`), so entries always wait for
-  every current target and no `missed` item is written (7.4.4);
-  `unreadable` items exist only when a test scripts them (`push_unreadable`), with an
-  `entry_id` of their own rather than the entry's: a revocation, leave or delivery that
-  leaves an entry with no current target writes none, and the entry stays; claims are
-  deleted only when `GET /claims` finds them deletable; batch records are never dropped, and
-  their proofs go only when a retry finds them past `batch_proofs_ms`.
+- **Retention and sweeps** (Switch wire 9.1, 7.4.4): an entry goes once every current
+  target that isn't lagging has passed it, as at the service, judged at cursor moves, at
+  appends and at deliveries, revocations and leaves (`keep_passed_entries` turns that off
+  for a test that reads an entry again); entries never expire by time. An app whose unread
+  entries pass its share of the inbox quota (`set_inbox_quota`, 64 MiB unless set) is
+  marked lagging while another current app reads, the mark ending at its feed read or its
+  departure, and it gets a `missed` item for what goes unread, replaced while unpassed; an
+  entry left with no current target at a delivery, revocation or leave becomes an
+  `unreadable` item with the entry's `entry_id`. The quota refuses nothing here: no append
+  is `429 quota_exceeded`, so a full inbox with no app reading, where the service refuses
+  senders, isn't shown. Marks are judged at every such request, the switch's clock being
+  trusted. A scripted `missed` item (`push_missed`) is shown to every app and a scripted
+  `unreadable` item (`push_unreadable`) has an `entry_id` of its own, and both stay
+  whatever the cursors. Checkpoints and dropped stubs exist only when a test scripts them;
+  claims are deleted only when `GET /claims` finds them deletable; batch records are never
+  dropped, and their proofs go only when a retry finds them past `batch_proofs_ms`.
 - **Invite codes**: a revoked app's codes aren't withdrawn (Switch wire 7.4.3 "After a
   revocation"); a code planted for a faulty export never expires.
 - **Lists**: `flagged` is always empty; connect requests are never full.
@@ -170,11 +176,9 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
     `proof_generations` from the same kept proofs as the delivery, the member left out when
     there are none.
 
-  `unread_entries` and `sole_target_unread` are always 0, where the service counts them over
-  the current targets, expired certificates included; no signer or app code reads them.
-  `lagging` is always false, where the service marks lagging apps (Retention and sweeps,
-  above). The test call `forget_bundle_parts` scripts a faulty service
-  that lost an app's stored parts.
+  `unread_entries`, `sole_target_unread` and `lagging` are counted and set as at the
+  service (Retention and sweeps, above). The test call `forget_bundle_parts` scripts a
+  faulty service that lost an app's stored parts.
 - **Moves and recovery** (Switch spec 12.5, 12.6, Switch wire 10): `import_into` copies the
   account in memory, with no manifest, chunks or export transfer, to serve at the origin the
   freeze names (`import_into_at` names one for a move a test scripts without a freeze); a recovery upload is kept

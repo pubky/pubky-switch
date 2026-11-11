@@ -111,6 +111,11 @@ pub const FLOWS: &[(&str, Flow)] = &[
     ("third epoch", |world| Box::pin(third_epoch(world))),
     ("two collections", |world| Box::pin(two_collections(world))),
     ("waiting read", |world| Box::pin(waiting_read(world))),
+    ("lagging app", |world| Box::pin(lagging_app(world))),
+    ("missed item", |world| Box::pin(missed_item(world))),
+    ("unreadable after a revoke", |world| {
+        Box::pin(unreadable_after_revoke(world))
+    }),
 ];
 
 /// The flow that sends `call` to the service; `None` for a call the service doesn't serve

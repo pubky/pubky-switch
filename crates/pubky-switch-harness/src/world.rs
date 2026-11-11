@@ -152,8 +152,8 @@ impl World {
     }
 
     /// As [`World::add_switch`], the service running with `limits` (Switch wire 9.2) in
-    /// place of its defaults, as an operator may configure it. The scripted switch has no
-    /// such setting: it keeps its own.
+    /// place of its defaults, as an operator may configure it. The scripted switch takes the
+    /// inbox quota of them, the one limit it has a setting for.
     ///
     /// # Errors
     ///
@@ -199,6 +199,7 @@ impl World {
                         identity.service_secret(),
                         self.clock.clone(),
                     );
+                    switch.set_inbox_quota(limits.quota_bytes);
                     accounts.push((identity.key().id(), switch.holding_transport()));
                     lock(&self.scripted).push(switch);
                 }

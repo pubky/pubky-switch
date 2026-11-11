@@ -494,3 +494,150 @@ async fn test_testing_waiting_read_is_not_held_without_cause() {
     assert_eq!((answer.status, items_of(&answer)), (200, 1));
     assert_eq!(switch.held_reads(), 0);
 }
+
+/// The items of `app`'s feed past `after`, read without moving anything: their types, and
+/// the whole page.
+async fn feed_past(s: &Setup, app: &App, after: u64) -> (Vec<String>, serde_json::Value) {
+    let request = Request {
+        method: "GET".into(),
+        origin: SWITCH_ORIGIN.into(),
+        path_and_query: format!(
+            "/v1/{}/feed?after={}:{after}",
+            s.alice.identity().key().id(),
+            app.cursor().generation
+        ),
+        headers: vec![Header::new(
+            "switch-app",
+            &pubky_switch_core::enc::zbase32_encode(&app.app_id()),
+        )],
+        body: Vec::new(),
+    };
+    let answer = s.alice.switch().transport().send(request).await.unwrap();
+    assert_eq!(answer.status, 200);
+    let page: serde_json::Value = serde_json::from_slice(&answer.body).unwrap();
+    let types = page["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|item| item["type"].as_str())
+        .filter(|kind| *kind != "chain" && *kind != "stub")
+        .map(str::to_owned)
+        .collect();
+    (types, page)
+}
+
+fn note(s: &Setup, to: &[[u8; 16]]) -> u64 {
+    s.bob
+        .send_to(
+            s.alice.switch(),
+            s.shop,
+            "example.note",
+            json!({ "text": "hello" }),
+            to,
+        )
+        .unwrap()
+        .0
+}
+
+#[tokio::test]
+async fn test_testing_entry_goes_once_its_reader_passed_it() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    app.receive(None).await.unwrap();
+    app.flush_cursor().await.unwrap();
+    let before = app.cursor().seq;
+    // Read and not yet passed: the entry waits for its target (Switch wire 9.1).
+    note(&s, &[app.app_id()]);
+    app.receive(None).await.unwrap();
+    assert_eq!(feed_past(&s, &app, before).await.0, ["entry"]);
+    // Passed: it goes.
+    app.flush_cursor().await.unwrap();
+    assert!(feed_past(&s, &app, before).await.0.is_empty());
+    // Unless the test keeps passed entries, to read one again.
+    s.alice.switch().keep_passed_entries();
+    let before = app.cursor().seq;
+    note(&s, &[app.app_id()]);
+    app.receive(None).await.unwrap();
+    app.flush_cursor().await.unwrap();
+    assert_eq!(feed_past(&s, &app, before).await.0, ["entry"]);
+}
+
+#[tokio::test]
+async fn test_testing_lagging_app_is_marked_and_told_what_it_missed() {
+    let s = Setup::new();
+    let switch = s.alice.switch();
+    // Two apps share 4 KiB: more than one unread note of 1 KiB and its overhead passes a
+    // share (Switch wire 7.4.4).
+    switch.set_inbox_quota(4096);
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    for app in [&mut wallet, &mut phone] {
+        app.receive(None).await.unwrap();
+        app.flush_cursor().await.unwrap();
+    }
+    let both = [wallet.app_id(), phone.app_id()];
+    let start = phone.cursor().seq;
+
+    // The wallet reads each note; the phone reads none.
+    note(&s, &both);
+    wallet.receive(None).await.unwrap();
+    wallet.flush_cursor().await.unwrap();
+    assert!(!switch.app(&phone.app_id()).lagging, "within its share");
+    note(&s, &both);
+    assert!(switch.app(&phone.app_id()).lagging, "past its share");
+    assert!(!switch.app(&wallet.app_id()).lagging, "the wallet reads");
+    wallet.receive(None).await.unwrap();
+    wallet.flush_cursor().await.unwrap();
+
+    // One `missed` item covers both notes, shown to the phone alone.
+    let (types, page) = feed_past(&s, &phone, start).await;
+    assert_eq!(types, ["missed"]);
+    let missed = page["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["type"] == "missed")
+        .unwrap();
+    assert_eq!(missed["entries"], json!(2));
+    assert!(feed_past(&s, &wallet, start).await.0.is_empty());
+    // The phone's read ended its mark.
+    assert!(!switch.app(&phone.app_id()).lagging);
+}
+
+#[tokio::test]
+async fn test_testing_entry_without_a_reader_becomes_unreadable_with_its_entry_id() {
+    let s = Setup::new();
+    let switch = s.alice.switch();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    for app in [&mut wallet, &mut phone] {
+        app.receive(None).await.unwrap();
+        app.flush_cursor().await.unwrap();
+    }
+    let start = wallet.cursor().seq;
+    // A note for the phone alone, which the phone never reads.
+    note(&s, &[phone.app_id()]);
+    let (types, page) = feed_past(&s, &phone, start).await;
+    assert_eq!(types, ["entry"]);
+    let entry_id = page["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["type"] == "entry")
+        .unwrap()["entry_id"]
+        .clone();
+    assert!(feed_past(&s, &wallet, start).await.0.is_empty());
+
+    // The phone is revoked: the wallet finds the entry as an unreadable item, under the
+    // entry's ID (Switch wire 7.4.4).
+    switch.revoke(phone.app_id()).unwrap();
+    let (types, page) = feed_past(&s, &wallet, start).await;
+    assert_eq!(types, ["unreadable"]);
+    let unreadable = page["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["type"] == "unreadable")
+        .unwrap();
+    assert_eq!(unreadable["entry_id"], entry_id);
+}

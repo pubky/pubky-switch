@@ -733,6 +733,8 @@ async fn test_unverified_bound_halted_apps_backup_holds_a_kept_effects_entry_as_
 #[tokio::test]
 async fn test_unverified_bound_backup_of_a_feed_entrys_kept_effect_never_applies_it_twice() {
     let w = World::new();
+    // The note stays at the switch after the app's cursor passed it, to be read again.
+    w.switch.keep_passed_entries();
     let mut app = wallet(&w, w.env()).await;
     // A note read from the feed, its effect applied and the answer lost: kept, not stored.
     let (seq, _) = w.note(app.app_id(), "kept");

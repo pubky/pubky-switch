@@ -391,6 +391,9 @@ impl Inner {
                         "apps_version": self.apps_version }),
             ));
         }
+        // The append brings the pressure: the lagging marks are judged first, so a lagging
+        // app stops holding the quota before it is counted (Switch wire 7.4.4).
+        self.judge_lagging();
         // Step 7: a code that admitted the sender is used, and the service writes its
         // conversation entry (the `conversation.add` transition, Switch wire 6.5).
         let mut context = None;
@@ -432,6 +435,8 @@ impl Inner {
             targets,
             context,
         });
+        // And judged again with the entry in.
+        self.judge_lagging();
         let answer = json!({
             "entry_id": Self::entry_id(seq),
             "accepted_at": rfc3339(accepted_at),

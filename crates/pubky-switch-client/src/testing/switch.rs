@@ -38,6 +38,7 @@ use crate::transport::{BoxFuture, Header, MockTransport, Request, Response, Tran
 
 mod batch;
 mod inbox;
+mod retention;
 mod shared;
 mod signer;
 
@@ -76,11 +77,20 @@ pub(crate) enum Item {
     },
     Unreadable {
         seq: u64,
+        /// The ID of the entry it stands for; one of its own for an item a test scripted.
+        entry_id: String,
         sender: [u8; 32],
         accepted_at: u64,
+        /// A test scripted it ([`ScriptedSwitch::push_unreadable`]): it is kept whatever
+        /// the cursors.
+        scripted: bool,
     },
     Missed {
         seq: u64,
+        /// The lagging app it is for, which alone is shown it; `None` for an item a test
+        /// scripted ([`ScriptedSwitch::push_missed`]), shown to every app and kept
+        /// whatever the cursors.
+        app: Option<[u8; 16]>,
         entries: u64,
         from: u64,
         until: u64,
@@ -130,6 +140,9 @@ pub struct SwitchApp {
     pub receive_n: Option<u64>,
     /// The cursor's `seq`.
     pub cursor: u64,
+    /// Whether the app is marked lagging: its unread entries passed its share of the inbox
+    /// quota, and entries no longer wait for it (Switch wire 7.4.4).
+    pub lagging: bool,
     /// Whether the app left or was revoked.
     pub departed: bool,
     /// When the signer revoked it (`revoked_at`, Switch wire 7.4.12).
@@ -247,6 +260,9 @@ pub(crate) struct Inner {
     pub(crate) shared: shared::Shared,
     /// Feed reads answered so far.
     pub(crate) feed_reads: u64,
+    /// Keep the entries every reader they wait for has passed
+    /// ([`ScriptedSwitch::keep_passed_entries`]).
+    keep_passed: bool,
     /// The wakers of the feed reads the switch holds (Switch wire 7.4.4 `wait`): each is
     /// woken when the account's sequence grows, at the next request, and when a test says
     /// the clock moved.
@@ -339,6 +355,7 @@ impl Inner {
             allow: None,
             shared: shared::Shared::default(),
             feed_reads: 0,
+            keep_passed: false,
             held: Vec::new(),
             feed_limit: None,
             max_page_bytes: MAX_PAGE_BYTES,
@@ -1036,6 +1053,9 @@ impl ScriptedSwitch {
         to: &[[u8; 16]],
     ) -> u64 {
         let mut inner = self.lock();
+        // As an append: the lagging marks are judged before it and with it in (Switch wire
+        // 7.4.4).
+        inner.judge_lagging();
         let seq = inner.next_seq();
         let accepted_at = inner.clock.now_ms();
         inner.items.push(Item::Entry {
@@ -1047,6 +1067,7 @@ impl ScriptedSwitch {
             targets: to.to_vec(),
             context: None,
         });
+        inner.judge_lagging();
         seq
     }
 
@@ -1057,10 +1078,27 @@ impl ScriptedSwitch {
         let seq = inner.next_seq();
         inner.items.push(Item::Unreadable {
             seq,
+            entry_id: Inner::entry_id(seq),
             sender,
             accepted_at,
+            scripted: true,
         });
         seq
+    }
+
+    /// Keep the entries every reader they wait for has passed, where the switch deletes
+    /// them as the service does (Switch wire 9.1): the state of an inbox whose entries
+    /// another target still holds, for a test that reads an entry again from an earlier
+    /// cursor, as after a restore.
+    pub fn keep_passed_entries(&self) {
+        self.lock().keep_passed = true;
+    }
+
+    /// Set the inbox quota (Switch wire 9.2 `quota_bytes`), which an enrollment announces
+    /// and the current apps share: an app whose unread entries pass its share is marked
+    /// lagging (Switch wire 7.4.4). The switch refuses no append for it.
+    pub fn set_inbox_quota(&self, quota_bytes: u64) {
+        self.lock().enroll_limits.quota_bytes = quota_bytes;
     }
 
     /// A `missed` item: `entries` entries accepted from `from` until `until` were deleted
@@ -1070,6 +1108,7 @@ impl ScriptedSwitch {
         let seq = inner.next_seq();
         inner.items.push(Item::Missed {
             seq,
+            app: None,
             entries,
             from,
             until,
@@ -1475,14 +1514,16 @@ impl Inner {
             return Ok(None);
         }
         let at = self.now();
+        let was = self.current_app_ids();
         let held = self.apps.entry(app).or_default();
         held.departed = true;
         held.revoked_at = Some(at);
         self.unreachable(&app);
         self.push.remove(&app);
-        Ok(Some(self.service_transition(
-            ServiceTransition::Revoke { app_id: app, at },
-        )?))
+        let proof = self.service_transition(ServiceTransition::Revoke { app_id: app, at })?;
+        // After its chain item (Switch wire 7.4.4).
+        self.after_departure(was);
+        Ok(Some(proof))
     }
 
     /// `app` leaves (Switch spec 12.3): the `leave` transition's proof, or `None` for an app
@@ -1493,14 +1534,15 @@ impl Inner {
         }
         let at = self.now();
         let epoch = self.doc.as_ref().map_or(0, IdentityDoc::data_epoch);
+        let was = self.current_app_ids();
         let held = self.apps.entry(app).or_default();
         held.departed = true;
         held.departed_at = Some((at, epoch));
         self.unreachable(&app);
-        Ok(Some(self.service_transition(ServiceTransition::Leave {
-            app_id: app,
-            at,
-        })?))
+        let proof = self.service_transition(ServiceTransition::Leave { app_id: app, at })?;
+        // After its chain item (Switch wire 7.4.4).
+        self.after_departure(was);
+        Ok(Some(proof))
     }
 
     fn service_transition(
@@ -1765,6 +1807,10 @@ impl Inner {
         {
             page["freeze"] = json!(freeze);
         }
+        // The reader's feed read ends its lagging mark (Switch wire 7.4.4).
+        if let Some(held) = self.apps.get_mut(&app) {
+            held.lagging = false;
+        }
         (200, page)
     }
 
@@ -1873,17 +1919,26 @@ impl Inner {
             }
             Item::Unreadable {
                 seq,
+                entry_id,
                 sender,
                 accepted_at,
-            } => json!({ "type": "unreadable", "seq": seq, "entry_id": Self::entry_id(*seq),
+                ..
+            } => json!({ "type": "unreadable", "seq": seq, "entry_id": entry_id,
                          "sender": pubky_id(sender), "accepted_at": rfc3339(*accepted_at) }),
             Item::Missed {
                 seq,
+                app: of,
                 entries,
                 from,
                 until,
-            } => json!({ "type": "missed", "seq": seq, "entries": entries,
-                         "accepted_from": rfc3339(*from), "accepted_until": rfc3339(*until) }),
+            } => {
+                // The lagging app it was made for alone is shown it (Switch wire 7.5).
+                if of.is_some_and(|of| of != app) {
+                    return None;
+                }
+                json!({ "type": "missed", "seq": seq, "entries": entries,
+                        "accepted_from": rfc3339(*from), "accepted_until": rfc3339(*until) })
+            }
         })
     }
 
