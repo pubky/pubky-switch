@@ -10,10 +10,11 @@ use pubky_switch_core::{
 
 use super::{
     Answer, Service,
+    keyed::Proof,
     rules::{
         AccountState, Caller, EnrollmentKey, decode_claim, enrollment_key, names_this_service,
     },
-    sign_answer, store_error,
+    store_error,
 };
 use crate::{
     http::{
@@ -89,7 +90,27 @@ impl Service {
                     }
                 };
                 match self.keys.signer(&key.id).await {
-                    Ok(signer) => sign_answer(&signer, signature, time_ms, Answer::ok(body)),
+                    // Signed only while the account still has the key, as its service key or
+                    // its pending key: an erasure deletes both (7.4.16).
+                    Ok(signer) => {
+                        let proof = Proof::Checked {
+                            account: &identity_text,
+                            key: &key.id,
+                            pending: true,
+                        };
+                        match self
+                            .try_sign_keyed(proof, &signer, signature, |_| {
+                                (Answer::ok(body), time_ms)
+                            })
+                            .await
+                        {
+                            Ok(signed) => signed,
+                            Err(_) => {
+                                let error = ApiError::unavailable("7.6: a temporary failure");
+                                self.operator_answer(signature, base_ms, &error).await
+                            }
+                        }
+                    }
                     Err(_) => {
                         let error = ApiError::unavailable("7.6: a temporary failure");
                         self.operator_answer(signature, base_ms, &error).await
