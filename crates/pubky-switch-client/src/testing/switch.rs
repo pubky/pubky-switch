@@ -1220,7 +1220,8 @@ impl Inner {
     }
 
     /// The answer an account gives every call `method` `path` makes, before routing: an
-    /// erased account's `404`, a staged account's `503 staged` (but for uploads), and a
+    /// erased account's `404`, a staged account's `503 staged` (but for uploads, the
+    /// delivery that makes it serve and the erasure), and a
     /// frozen account's `410 moved` for writes.
     fn gate(&self, method: &str, path: &str) -> Option<Answer> {
         if self.erased || self.enrolled.is_none() {
@@ -1229,7 +1230,9 @@ impl Inner {
         let upload = method == "POST" && path.contains("recovery/upload");
         // A staged account takes the delivery that makes it serve (Switch wire 7.3 step 7).
         let delivery = method == "PUT" && path.ends_with("/identity");
-        if self.staged && !upload && !delivery {
+        // And the erasure, which a staged account holding an import refuses (7.4.16).
+        let erasure = method == "POST" && path.ends_with("/erase");
+        if self.staged && !upload && !delivery && !erasure {
             return Some(bad(ErrorCode::Staged, "staged", json!(null)));
         }
         if let Some(freeze) = &self.frozen
@@ -1253,6 +1256,7 @@ impl Inner {
                 ("GET", "apps") => self.apps_answer(),
                 ("PUT", "handover") => self.put_handover(&request.body),
                 ("GET", "handover") => self.handover_answer(None),
+                ("POST", "erase") => self.erase_answer(&request.body),
                 ("POST", r) if r.starts_with("apps/") && r.ends_with("/revoke") => {
                     self.revoke_answer(r)?
                 }

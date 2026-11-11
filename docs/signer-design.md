@@ -160,7 +160,7 @@ Flow = Approve     { request_hash, cert, step }
      | KeyChange   { pending_key, step }               // service key in place
      | Move        { next, freeze, manifest, transfer, step }
      | Loss        { next, step }
-     | Erase       { service, step }
+     | Erase       { unpublished }                     // the Homeserver's files, then the switch
      | HandingOver { to_app, version, doc_hash, abort: Option<signed doc> }
      | TakingOver  { source: HandOver | Backup | NotNamed, version, step }
 ```
@@ -357,7 +357,7 @@ There are no panics on network input, and all arithmetic is checked.
 | 5 Service keys | `rotate_service_key`, `move_to` | `service_keys` from `proof_generations`; refused past 256, or for a reported generation whose key it lacks |
 | 6 Provider moves | `move_to`, `abort_move` | rotations owed done first; import limit check; the freeze kept before it is sent; direct transfer under the export transfer, with a relay fallback; the abort sends the unfreeze to N, then to O with N's discard answer |
 | 7 Provider loss | `declare_provider_loss`, `end_staged_admission` | a new generation with `recovery_from`; no service key added |
-| 8 Erasure | `erase_previous`, `close_account` | refused during a move; a lost `200` followed by a `404` counts as done |
+| 8 Erasure | `close_account` (`erase_previous` comes with the moves) | `identity.json` and the app records leave the Homeserver first, with a grant reminder for each app; then `POST /erase` naming the pinned key, sent again until answered; a `200`, or a lost `200` followed by the operator's `404`, counts as done; a `409 conflict` (a move in progress) ends it and publishes `identity.json` again; the records and the backup stay, and nothing more is signed |
 | 9 Hand-over | `hand_over_to`, `abort_hand_over`, `receive_hand_over` | up to 128 envelopes through `PUT`/`GET /handover`; the abort at version + 2; checks 1 to 3 on the receiving side, then the version + 1 delivery; a refusal destroys the received secret |
 | 10 Backup and the one-signer rule | section 4.4, `restore`, `take_over`, `status` | written before each delivery and after bundle parts; another install's backup or document stops signing; a restore or a received hand-over takes the highest epoch whose keys were sent from the `bundle_parts` it carries and from `keys_through` and `bundle_ranges` in `GET /apps` |
 | 11 Key interface | section 2 | |

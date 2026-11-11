@@ -49,6 +49,9 @@ pub(crate) fn refusal(state: &SignerState) -> Option<SignerError> {
 
 /// The checks every signing step passes, a hand-over's or a take-over's included.
 fn base_refusal(state: &SignerState) -> Option<SignerError> {
+    if state.erased {
+        return Some(Refusal::Erased.into());
+    }
     if let Some(install) = state.managed_by {
         return Some(SignerError::NotNamed { install });
     }

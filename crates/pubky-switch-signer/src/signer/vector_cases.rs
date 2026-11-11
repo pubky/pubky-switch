@@ -1,6 +1,7 @@
 //! The old signer's cases of the Switch vector set (`spec/vectors/`): the hand-over to the
 //! phone (`envelopes.json` `signer_handover`), the abort and the version after it, and the
-//! wallet's renewal (`documents.json`, `envelopes.json` `reduction_key_bundle`).
+//! wallet's renewal (`documents.json`, `envelopes.json` `reduction_key_bundle`), and the
+//! account's erasure (`http.json`).
 //!
 //! Those vectors are alice's signer at her version 3, under the signer ID her documents name.
 //! A signer draws its own ID at random, so this module, alone, writes that signer's records
@@ -18,7 +19,7 @@ use pubky_switch_client::TransportError;
 use pubky_switch_client::clock::TestClock;
 use pubky_switch_client::store::{MemoryStore, StoreHandle};
 use pubky_switch_client::testing::{Fault, ScriptedSwitch};
-use pubky_switch_client::transport::{BoxFuture, MockTransport};
+use pubky_switch_client::transport::{BoxFuture, Header, MockTransport, Response};
 use pubky_switch_core::enc::{app_id_decode, unb64, unb64_array};
 use pubky_switch_core::keys::{AppKeys, IdentityKey};
 use pubky_switch_core::ops::OpKind;
@@ -213,6 +214,11 @@ struct OldSigner {
 }
 
 async fn old_signer() -> OldSigner {
+    old_signer_answering(None).await
+}
+
+/// [`old_signer`], whose switch gives `erasure` as its answer to `POST /erase`, when given.
+async fn old_signer_answering(erasure: Option<Response>) -> OldSigner {
     let keys = load("keys.json");
     let identity = named(&keys["identities"], "alice");
     let key = IdentityKey::from_secret(hex32(text(identity, "secret_hex")));
@@ -290,7 +296,19 @@ async fn old_signer() -> OldSigner {
     state.epoch_through = v3.data_epoch();
 
     let store = Arc::new(MemoryStore::new());
-    let transport = switch.transport();
+    let transport = match erasure {
+        None => switch.transport(),
+        Some(answer) => {
+            let scripted = Arc::clone(&switch);
+            Arc::new(MockTransport::with_handler(move |request| {
+                if request.method == "POST" && request.path_and_query.ends_with("/erase") {
+                    Ok(answer.clone())
+                } else {
+                    scripted.handle(request)
+                }
+            }))
+        }
+    };
     let env = SignerEnv {
         store: StoreHandle::inline(store),
         clock: clock.clone(),
@@ -509,4 +527,60 @@ async fn test_vectors_old_signer_renews_the_wallet_as_the_vectors_do() {
         *text(reduction, "plaintext_json").as_bytes(),
         "the reduction's full bundle"
     );
+}
+
+/// `http.json`'s account erasure and its answer (Switch wire 7.4.16): at the vector's time,
+/// the erasure alice's signer sends is the vector's request, its body naming her account's
+/// service key, its headers and signature byte for byte; the vector's answer, signed with that
+/// key and carrying no head, confirms it, and the signer then signs nothing more.
+#[tokio::test]
+async fn test_vectors_old_signer_erases_the_account_as_the_vectors_do() {
+    let http = load("http.json");
+    let request = http["requests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| text(r, "name").starts_with("signer: account erasure"))
+        .unwrap();
+    let answer = http["responses"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| text(r, "name").starts_with("signer: account erasure answer"))
+        .unwrap();
+    let response = Response {
+        status: u16::try_from(answer["status"].as_u64().unwrap()).unwrap(),
+        headers: answer["headers"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(name, value)| Header::new(name, value.as_str().unwrap()))
+            .collect(),
+        body: text(answer, "body").as_bytes().to_vec(),
+    };
+    let mut old = old_signer_answering(Some(response)).await;
+    let timestamp = text(&request["headers"], "switch-timestamp");
+    old.clock
+        .set_ms(pubky_switch_core::time::parse_rfc3339(timestamp).unwrap());
+    old.signer
+        .close_account(UserConfirmed::shown_and_confirmed())
+        .await
+        .unwrap();
+    let sent = old
+        .transport
+        .requests()
+        .into_iter()
+        .find(|r| r.method == "POST" && r.path_and_query.ends_with("/erase"))
+        .unwrap();
+    assert_eq!(sent.path_and_query, text(request, "path"));
+    assert_eq!(sent.body, unb64(text(request, "body_b64")).unwrap());
+    for (name, value) in request["headers"].as_object().unwrap() {
+        assert_eq!(
+            sent.header(name),
+            Some(value.as_str().unwrap()),
+            "the {name} header"
+        );
+    }
+    assert_eq!(old.signer.status(), super::SignerStatus::Erased);
+    assert!(!old.homeserver.0.lock().unwrap().contains_key(IDENTITY_PATH));
 }

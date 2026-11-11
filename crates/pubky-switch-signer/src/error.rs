@@ -138,6 +138,15 @@ pub enum Refusal {
     /// No hand-over is in progress to abort.
     #[error("refused: no hand-over is in progress")]
     NotHandingOver,
+    /// The identity's account at its switch is erased (Switch spec 12.7): nothing more is
+    /// signed for it.
+    #[error("refused: the account is erased")]
+    Erased,
+    /// The switch refused the erasure (`409 conflict`): during a move, or for a service key
+    /// that isn't the account's (Switch wire 7.4.16). Nothing was erased, and `identity.json`
+    /// is published again.
+    #[error("refused: the switch refused the erasure")]
+    ErasureRefused,
     /// This install is taking the identity over: it signs nothing but its first delivery
     /// until that has won (Switch wire 3.12).
     #[error("refused: the identity is being taken over")]

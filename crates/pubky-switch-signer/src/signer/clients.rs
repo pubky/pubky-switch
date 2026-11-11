@@ -173,6 +173,12 @@ impl SigningClient {
     ) -> std::result::Result<HandoverStored, ClientError> {
         self.0.put_handover(stored).await
     }
+
+    /// `POST /erase` (Switch wire 7.4.16): erase the identity's account, naming the pinned
+    /// service key. Only the gated key's client sends it.
+    pub(crate) async fn erase(&self) -> std::result::Result<(), ClientError> {
+        self.0.erase().await
+    }
 }
 
 /// A switch client with an app's credentials: a new signer's before it holds the identity

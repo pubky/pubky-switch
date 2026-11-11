@@ -182,6 +182,10 @@ pub(crate) struct SignerState {
     /// time to close at.
     #[serde(default)]
     pub(crate) closing_unavailable: Option<u64>,
+    /// The identity's account at its switch is erased (Switch spec 12.7): the records stay,
+    /// and nothing more is signed for that account.
+    #[serde(default)]
+    pub(crate) erased: bool,
 }
 
 /// A hand-over this install is making (Switch wire 3.12).
@@ -339,6 +343,7 @@ impl SignerState {
             epoch_through: 0,
             time_asked: None,
             closing_unavailable: None,
+            erased: false,
         }
     }
 
@@ -404,6 +409,13 @@ pub(crate) enum Flow {
         app_id: [u8; 16],
         /// The first delivery, once check 3 has passed and it is signed.
         delivery: Option<TakeOverDelivery>,
+    },
+    /// Erasing the identity's account at its switch (Switch spec 12.7, Switch wire 7.4.16):
+    /// first `identity.json` and the app records leave the Homeserver, then the erasure is
+    /// sent until it is answered.
+    Erase {
+        /// The Homeserver's files are deleted.
+        unpublished: bool,
     },
     /// Delivering a new `identity.json` version, then publishing it.
     Deliver {

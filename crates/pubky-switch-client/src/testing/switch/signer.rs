@@ -109,6 +109,11 @@ impl ScriptedSwitch {
         self.lock().enroll_limits = limits;
     }
 
+    /// Whether the account is erased (Switch wire 7.4.16).
+    pub fn erased(&self) -> bool {
+        self.lock().erased
+    }
+
     /// The App IDs the account keeps for good from the enrollment that made it.
     pub fn kept_app_ids(&self) -> Vec<[u8; 16]> {
         self.lock().kept_app_ids.clone()
@@ -401,6 +406,31 @@ impl Inner {
             Some((target, body)) if caller.is_none_or(|app| app == *target) => (200, body.clone()),
             _ => bad(ErrorCode::NotFound, "no hand-over", json!(null)),
         }
+    }
+
+    /// `POST /v1/{id}/erase` from the signer (Switch wire 7.4.16): the body names the
+    /// account's service key (`409 conflict` for another), and a move in progress refuses it
+    /// (`409 conflict`): a frozen account, whose export this switch doesn't track, and a staged
+    /// one holding an import. Then the account is erased, and every later call, a retry
+    /// included, gets the operator's `404`. The answer is signed with the service key, without
+    /// a head.
+    pub(super) fn erase_answer(&mut self, body: &[u8]) -> Answer {
+        let key = match pubky_switch_core::http::parse_erase_body(body) {
+            Ok(key) => key,
+            Err(error) => return bad(ErrorCode::BadRequest, &error.to_string(), json!(null)),
+        };
+        if key != self.service.verifying_key().to_bytes() {
+            return bad(
+                ErrorCode::Conflict,
+                "not the account's service key",
+                json!(null),
+            );
+        }
+        if self.frozen.is_some() || (self.staged && self.continued_from.is_some()) {
+            return bad(ErrorCode::Conflict, "a move is in progress", json!(null));
+        }
+        self.erased = true;
+        (200, json!({ "erased": true }))
     }
 
     /// The stored hand-over, as the test reads it.
