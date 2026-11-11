@@ -4717,3 +4717,124 @@ async fn test_apps_answer_reports_what_the_switch_holds() {
         pubky_switch_core::time::rfc3339(declared)
     );
 }
+
+#[tokio::test]
+async fn test_loss_claim_changed_by_an_upload_after_an_entry_here_is_read() {
+    // After the loss the app writes an attempt at the new switch (an entry at step 0).
+    // Another app's recovery upload then changes the claim as the core merge does (an
+    // attempt beside it: divergent, step 2, no entry). The switch lists the one entry, and
+    // the app reads the gapped claim without an alarm (Switch wire 7.4.8).
+    let store = Arc::new(MemoryStore::new());
+    let lost = lost_world_with(
+        Arc::clone(&store) as Arc<dyn StateStore>,
+        &Permission::ALL,
+        false,
+    )
+    .await;
+    let (mut app, _) = follow_loss(&lost, store as Arc<dyn StateStore>)
+        .await
+        .unwrap();
+    if app.reconcile_mode() {
+        app.end_reconcile(UserConfirmed::new()).await.unwrap();
+    }
+    app.write_claim(
+        ClaimOp::attempt(CLAIM, 0, ATTEMPT, 3600, None),
+        vec![],
+        ObligationDeadline::NoDeadline,
+    )
+    .await
+    .unwrap();
+    upload_beside(&lost.next);
+    let read = app.read_claim(&CLAIM).await;
+    assert!(read.is_ok(), "the gapped claim is read: {read:?}");
+    assert!(app.alarm().is_none(), "{:?}", app.alarm());
+}
+
+#[tokio::test]
+async fn test_loss_claim_step_before_its_last_entry_is_a_rollback() {
+    // Even after a provider loss, a claim's step is never before its last entry's: a switch
+    // that shows one contradicts its answer (Switch wire 7.4.8).
+    let store = Arc::new(MemoryStore::new());
+    let lost = lost_world_with(
+        Arc::clone(&store) as Arc<dyn StateStore>,
+        &Permission::ALL,
+        false,
+    )
+    .await;
+    let (mut app, _) = follow_loss(&lost, store as Arc<dyn StateStore>)
+        .await
+        .unwrap();
+    if app.reconcile_mode() {
+        app.end_reconcile(UserConfirmed::new()).await.unwrap();
+    }
+    app.write_claim(
+        ClaimOp::attempt(CLAIM, 0, ATTEMPT, 3600, None),
+        vec![],
+        ObligationDeadline::NoDeadline,
+    )
+    .await
+    .unwrap();
+    if let Some(claim) = lost.next.lock().shared.claims.get_mut(&CLAIM) {
+        claim.step = 0;
+    }
+    assert!(app.read_claim(&CLAIM).await.is_err());
+    assert!(
+        matches!(app.alarm(), Some(crate::app::Alarm::Rollback { .. })),
+        "{:?}",
+        app.alarm()
+    );
+}
+
+/// Another app's uploaded attempt beside the one `switch` holds at [`CLAIM`], merged as the
+/// core merges an upload: divergent, one step on, no entry.
+fn upload_beside(switch: &ScriptedSwitch) {
+    let mut next = switch.lock();
+    let held = next.shared.claims.get(&CLAIM).cloned();
+    let entry = pubky_switch_core::recovery::UploadedEntry {
+        entry: pubky_switch_core::claims::ClaimEntry {
+            claim_key: CLAIM,
+            attempt_id: [77; 16],
+            expected_step: 0,
+            kind: pubky_switch_core::claims::EntryKind::Attempt {
+                orphan_after: 60,
+                deadline: None,
+            },
+        },
+        writer: [9; 16],
+        proof: None,
+    };
+    let merge =
+        pubky_switch_core::recovery::merge_upload_claim(held.as_ref(), None, &[entry], START, 64);
+    assert!(merge.changed && merge.divergent, "{merge:?}");
+    next.shared.claims.insert(CLAIM, merge.claim.unwrap());
+}
+
+#[tokio::test]
+async fn test_claim_step_past_its_last_entry_outside_a_loss_is_a_rollback() {
+    // Outside a generation that began with a provider loss, a claim whose step is past its
+    // last entry's contradicts the answer: the read alarms.
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join_on(
+        &w,
+        &router,
+        Arc::clone(&w.store) as Arc<dyn StateStore>,
+        w.protocol.clone(),
+        &Permission::ALL,
+    )
+    .await;
+    app.write_claim(
+        ClaimOp::attempt(CLAIM, 0, ATTEMPT, 3600, None),
+        vec![],
+        ObligationDeadline::NoDeadline,
+    )
+    .await
+    .unwrap();
+    upload_beside(&w.switch);
+    assert!(app.read_claim(&CLAIM).await.is_err());
+    assert!(
+        matches!(app.alarm(), Some(crate::app::Alarm::Rollback { .. })),
+        "{:?}",
+        app.alarm()
+    );
+}

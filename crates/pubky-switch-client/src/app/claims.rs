@@ -841,9 +841,19 @@ impl App {
         if let Some(next) = next
             && next != answer.claim.step
         {
-            return Ok(Err(
-                "Switch wire 7.4.8: the claim's step doesn't follow its last entry".into(),
-            ));
+            // In a generation that began with a provider loss, a claim rebuilt from uploads
+            // lists the entries written here: an upload's step has none, so the claim's step
+            // may be past the last entry's, never before it (Switch wire 7.4.8, 7.4.14).
+            let after_loss = next < answer.claim.step
+                && self
+                    .loss_record()
+                    .await?
+                    .is_some_and(|loss| loss.generation == generation);
+            if !after_loss {
+                return Ok(Err(
+                    "Switch wire 7.4.8: the claim's step doesn't follow its last entry".into(),
+                ));
+            }
         }
         Ok(Ok(ClaimRead {
             view: answer.claim.clone(),
