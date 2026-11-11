@@ -481,13 +481,14 @@ impl Signer {
             .await
     }
 
-    /// Answer every pending full-bundle request of a current app (Switch wire 3.5 "Full
-    /// bundles on request", 7.4.11): the parts for every epoch from 1 to the current one, also
-    /// when the parts stored for its listed certificate cover them already, since the app
-    /// that asks may have lost its copy; with `cert.put` first when its record carries
-    /// another certificate. A request answered only in part, as after a failure, is finished
-    /// by [`Signer::resume`], which sends the rest of its batches. Then the backup is written again, at the same
-    /// version. Returns the apps answered.
+    /// Answer every pending full-bundle request of a current app (Switch spec 3.5, wire 3.5
+    /// "Full bundles on request", 7.4.11): the parts for every epoch from 1 to the current
+    /// one, also when the parts stored for its listed certificate cover them already, since
+    /// the app that asks may have lost its copy and only a put that completes the range
+    /// answers the request; with `cert.put` first when its record carries another
+    /// certificate. A request answered only in part, as after a failure, is finished by
+    /// [`Signer::resume`], which sends the rest of its batches. Then the backup is written
+    /// again, at the same version. Returns the apps answered.
     ///
     /// An app whose certificate holds a scope no registered protocol owns gets nothing, with
     /// [`Alert::RotationSkipped`] (design note, decision 2).

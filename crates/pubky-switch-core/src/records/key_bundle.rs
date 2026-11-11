@@ -14,7 +14,8 @@
 //! The signer builds parts with [`seal_bundle_parts`]; an app reads them with
 //! [`PartReader`], which applies every skip rule of Switch wire 3.5 "Reading". The pure rules
 //! of incremental bundles and full bundles on request are [`incremental_first_epoch`],
-//! [`missing_ranges`], [`full_bundle_ranges`] and [`covers_from_one`].
+//! [`missing_ranges`] and [`covers_from_one`]; a full bundle on request covers every epoch
+//! from 1 to the current one (Switch wire 3.5 "Full bundles on request").
 
 use std::collections::BTreeSet;
 
@@ -815,42 +816,6 @@ pub fn note_stored(stored: &mut Vec<StoredPart>, part: StoredPart) {
     stored.push(part);
 }
 
-/// The ranges of `shown`, an app's `bundle_ranges` at the service (Switch wire 7.4.12),
-/// whose part this signer stored for the certificate `cert`, by what it keeps in `stored`.
-/// A range whose part names another certificate, or one it can't tell, isn't among them.
-pub fn ranges_for_cert(
-    shown: &[(u64, u64)],
-    stored: &[StoredPart],
-    app_id: &[u8; 16],
-    cert: &[u8; 32],
-) -> Vec<(u64, u64)> {
-    shown
-        .iter()
-        .filter(|range| {
-            stored.iter().any(|part| {
-                &part.app_id == app_id
-                    && &part.cert == cert
-                    && (part.first_epoch, part.last_epoch) == **range
-            })
-        })
-        .copied()
-        .collect()
-}
-
-/// The ranges of a full bundle the signer still stores for an app with a pending request
-/// (Switch wire 3.5 "Full bundles on request"): those from epoch 1 to `current` that the
-/// parts it stored for the app's current certificate `cert` don't cover yet. A range whose
-/// part names another certificate, or one it can't tell, counts as missing.
-pub fn full_bundle_ranges(
-    shown: &[(u64, u64)],
-    stored: &[StoredPart],
-    app_id: &[u8; 16],
-    cert: &[u8; 32],
-    current: u64,
-) -> Vec<(u64, u64)> {
-    missing_ranges(&ranges_for_cert(shown, stored, app_id, cert), 1, current)
-}
-
 /// Whether the batch of a full bundle's first part also stores the current certificate
 /// with `cert.put` (Switch wire 3.5 "Full bundles on request"): when the app's record at the
 /// service carries another certificate (`record_cert`, Switch wire 7.4.12), as at a renewal.
@@ -1329,28 +1294,6 @@ mod tests {
         note_stored(&mut stored, part(app_id, 2, 3, cert.hash()));
         assert_eq!(stored.len(), 2);
         assert!(stored.contains(&part(other_id, 1, 9, cert.hash())));
-
-        let mut stored = vec![
-            part(app_id, 1, 2, cert.hash()),
-            part(app_id, 3, 4, [8; 32]),
-            part(other_id, 5, 6, cert.hash()),
-        ];
-        let shown = [(1, 2), (3, 4), (5, 6)];
-        assert_eq!(
-            ranges_for_cert(&shown, &stored, &app_id, &cert.hash()),
-            [(1, 2)]
-        );
-        // The range made for another certificate, and one the signer can't tell, count as
-        // missing.
-        assert_eq!(
-            full_bundle_ranges(&shown, &stored, &app_id, &cert.hash(), 6),
-            [(3, 6)]
-        );
-        stored.clear();
-        assert_eq!(
-            full_bundle_ranges(&shown, &stored, &app_id, &cert.hash(), 2),
-            [(1, 2)]
-        );
 
         assert!(needs_cert_put(Some(&[1; 32]), &cert));
         assert!(!needs_cert_put(Some(&cert.hash()), &cert));

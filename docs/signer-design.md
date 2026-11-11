@@ -128,7 +128,7 @@ pub trait Protocol: Send + Sync {
 | the working `identity.json`: signed bytes, `prev`, delivered and published flags | sign once, deliver then publish, compare-and-swap | wire 2.1, 7.4.2 |
 | certificates the newest document references (listed and `renewed`) | renewals, owed closings, hand-over and backup contents | 3.2, wire 3.12 |
 | tombstones: every App ID revoked or seen departing, kept for good | refusing approvals; `revoked_apps` in every enrollment | 12.2, wire 3.7 |
-| stored key bundle parts per app: range and certificate hash | resuming cut-short deliveries, full-bundle requests, `bundle_parts` | wire 3.5 |
+| stored key bundle parts per app: range and certificate hash | where a rotation's catch-up starts, `bundle_parts` | wire 3.5 |
 | the last backup: its signed bytes, the version it holds and its `prev` | sign once; rewriting after key bundle parts | wire 3.13 |
 | `managed_by`: another install's ID, when a newer document names it | refuse every signing call, offer take-over | 4.3 |
 | settings: certificate lifetime, `record_max_age`, policy | | 3.2, 4.3 |
