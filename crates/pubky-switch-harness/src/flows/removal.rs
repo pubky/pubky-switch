@@ -25,7 +25,7 @@ use crate::{FlowResult, World};
 ///
 /// When a step that should succeed against any switch fails.
 pub async fn revocation(world: &World) -> FlowResult {
-    let alice = world.identity("alice");
+    let alice = world.identity("alice")?;
     world.add_switch(ORIGIN, &[&alice]).await?;
     let mut signer = enroll(world, &alice, ORIGIN).await?;
     let (mut wallet, _) = joined(world, &alice, &mut signer, "wallet").await?;
@@ -72,7 +72,7 @@ pub async fn revocation(world: &World) -> FlowResult {
 ///
 /// When a step that should succeed against any switch fails.
 pub async fn departure(world: &World) -> FlowResult {
-    let alice = world.identity("alice");
+    let alice = world.identity("alice")?;
     world.add_switch(ORIGIN, &[&alice]).await?;
     let mut signer = enroll(world, &alice, ORIGIN).await?;
     let (mut wallet, _) = joined(world, &alice, &mut signer, "wallet").await?;

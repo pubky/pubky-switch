@@ -262,7 +262,7 @@ pub static ALLOWED: &[Allowed] = &[
     },
     Allowed {
         flow: "revocation",
-        label: "{alice/phone} GET /v1/{alice}/apps/{phone}/keys",
+        label: "{alice/phone} GET /v1/{alice}/apps/{alice/phone}/keys",
         fact: "body.current",
         service: NOTHING,
         scripted: "null",
@@ -271,7 +271,7 @@ pub static ALLOWED: &[Allowed] = &[
     },
     Allowed {
         flow: "revocation",
-        label: "{alice/tablet} GET /v1/{alice}/apps/{tablet}/keys",
+        label: "{alice/tablet} GET /v1/{alice}/apps/{alice/tablet}/keys",
         fact: "body.current",
         service: NOTHING,
         scripted: "null",
