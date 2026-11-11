@@ -54,6 +54,7 @@ use pubky_switch_core::receive::{
     OpenedEntry, Received, Refusal as CheckRefusal, SenderIdentity, check_opened,
 };
 use pubky_switch_core::records::{CLOCK_TOLERANCE_MS, IdentityDoc};
+use pubky_switch_core::scopes::Permission;
 use pubky_switch_core::sig::SignedDoc;
 
 use super::batch::PendingBatch;
@@ -377,6 +378,10 @@ impl App {
             }
         }
         if self.state.alarm.is_none() {
+            // A stopped read leaves the claims it marked for the next one.
+            if !report.stopped {
+                self.reread_claims().await?;
+            }
             self.delete_retired_keys().await?;
             self.forget_chain_behind_cursor().await?;
             self.maybe_rotate().await?;
@@ -435,6 +440,10 @@ impl App {
             return Ok(None);
         }
         let mut stopped = None;
+        // A stub names no object: once the page shows the stub of an operation, the claims
+        // the app follows are read again at the end of the read (Switch wire 7.5), noted in
+        // the commit that passes it.
+        let mut stub_noted = !self.state.cert.has_permission(Permission::ClaimsRead);
         for item in &page.items {
             let seq = item.seq();
             if seq <= start {
@@ -465,7 +474,18 @@ impl App {
                     };
                     self.handle_chain(chain_item, &envelope, &mut read).await?
                 }
-                FeedItem::Stub { .. } => Step::Pass,
+                FeedItem::Stub { .. } => {
+                    if !stub_noted
+                        && checked
+                            .envelopes
+                            .get(&seq)
+                            .is_some_and(|envelope| envelope.item_type == ItemType::Op)
+                    {
+                        read.tx.put(super::claims::STUB_SEEN, &())?;
+                        stub_noted = true;
+                    }
+                    Step::Pass
+                }
             };
             match step {
                 Step::Pass => {

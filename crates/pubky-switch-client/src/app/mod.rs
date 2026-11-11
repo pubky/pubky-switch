@@ -91,8 +91,8 @@ pub use unverified::{
 pub use admission::{INVITE_CODE_BYTES, InviteCode, LISTS_TOO_LARGE_RETRY_MS, SenderDisposition};
 pub use batch::{MAX_KEPT_BATCHES_BYTES, OpBatch, server_time_in};
 pub use claims::{
-    ClaimDoubt, ClaimEntryRead, ClaimEvidence, ClaimOp, ClaimRead, ClaimWritten,
-    ObligationDeadline, claim_conflict,
+    CLAIM_REREADS_PER_READ, ClaimDoubt, ClaimEntryRead, ClaimEvidence, ClaimOp, ClaimRead,
+    ClaimWritten, ObligationDeadline, claim_conflict,
 };
 pub use context::{ClaimFetch, LocalView, ReceiveContext, RestoreContext};
 pub use directory::{

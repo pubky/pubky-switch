@@ -27,6 +27,7 @@ use pubky_switch_core::enc::{b64, unb64_array};
 use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::ops::{Condition, OpKind, SignedOp};
 use pubky_switch_core::records::{AppCert, Standing};
+use pubky_switch_core::scopes::Permission;
 use pubky_switch_core::sig::SignedDoc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -42,9 +43,28 @@ use crate::error::ClientError;
 
 const CLAIM_PREFIX: &str = "claim/";
 const ENTRY_PREFIX: &str = "clent/";
+/// A claim the app follows that a read reads again (`clread/<claim_key>`), with when it was
+/// marked, device time: the oldest marks go first.
+const REREAD_PREFIX: &str = "clread/";
+/// The feed showed the stub of an operation since the claims the app follows were last
+/// marked to read again (`clstub`).
+pub(crate) const STUB_SEEN: &str = "clstub";
+
+/// The most claims one read reads again after its feed showed the stub of an operation
+/// (Switch wire 7.5). Each is a request of its own (`GET /claims/{claim_key}`), so the
+/// bound keeps a read's cost and time bounded when the app follows many claims at once,
+/// while covering the claims a protocol has in flight together, such as one obligation's
+/// attempt and its outcome, in one read. 16 is also how many entries stored locally a read
+/// tries again ([`super::PARKED_RETRIES_PER_READ`]). The claims past it stay marked, oldest
+/// mark first, for the next read.
+pub const CLAIM_REREADS_PER_READ: usize = 16;
 
 pub(crate) fn claim_key_of(claim_key: &[u8; 32]) -> String {
     format!("{CLAIM_PREFIX}{}", b64(claim_key))
+}
+
+fn reread_key(claim_key: &[u8; 32]) -> String {
+    format!("{REREAD_PREFIX}{}", b64(claim_key))
 }
 
 fn entry_key(claim_key: &[u8; 32], step: u64) -> String {
@@ -295,6 +315,33 @@ fn deletable_from(view: &ClaimView, last_entry: u64) -> Option<u64> {
     }
 }
 
+/// Whether the app holds a claim as finished: SETTLED with every attempt `done` or
+/// `failed`, the state that compacts it (Switch wire 6.8 "Tombstones"). A SETTLED claim with
+/// an attempt still open isn't: that attempt's outcome comes as a stub too (Switch wire 7.5).
+fn finished(view: &ClaimView) -> bool {
+    view.status == ClaimStatus::Settled && finished_or_failed(view)
+}
+
+/// Whether a claim the app holds is one it reads again after its feed showed the stub of an
+/// operation (Switch wire 7.5): any claim it doesn't hold as finished, and whose view it can
+/// read, but one whose every attempt failed past the time the service may delete it (Switch
+/// wire 6.8 "Failed claims"), which nothing changes any more.
+fn followed(kept: &KeptClaim, now: u64) -> bool {
+    let Ok(view) = kept.view() else {
+        return true;
+    };
+    if finished(&view) {
+        return false;
+    }
+    let deletable = finished_or_failed(&view)
+        .then(|| {
+            kept.last_entry_ms
+                .and_then(|last| deletable_from(&view, last))
+        })
+        .flatten();
+    deletable.is_none_or(|from| now < from)
+}
+
 fn finished_or_failed(view: &ClaimView) -> bool {
     let resolved = view
         .attempts
@@ -466,6 +513,12 @@ impl App {
             Ok(answer) => answer,
             Err(error) if error.code() == Some(ErrorCode::NotFound) => {
                 self.check_missing_claim(claim_key).await?;
+                // Nothing more to read of it: a mark to read it again goes.
+                if self.reader().exists(&reread_key(claim_key)).await? {
+                    let mut tx = self.tx()?;
+                    tx.delete(&reread_key(claim_key))?;
+                    self.commit(tx).await?;
+                }
                 return Ok(None);
             }
             Err(error) => return Err(error),
@@ -506,8 +559,73 @@ impl App {
             }
         }
         tx.put(&claim_key_of(claim_key), &kept)?;
+        // Any read of the claim is the read again a stub asked for (Switch wire 7.5).
+        tx.delete(&reread_key(claim_key))?;
         self.commit(tx).await?;
         Ok(Some(read))
+    }
+
+    /// At the end of a read: read again the claims the app follows, after its feed showed
+    /// the stub of an operation (Switch wire 7.5). A stub names no object, so it may be an
+    /// entry of any claim the app holds and doesn't hold as finished, compacted since, its
+    /// own entries included: every such claim is marked (`clread/`), in the commit that
+    /// clears the feed's note of the stub (`clstub`, written with the page that passed it,
+    /// so a crash loses no mark). Then at most [`CLAIM_REREADS_PER_READ`] of them, the
+    /// oldest marks first, are read (`GET /claims/{claim_key}`, one request each), and
+    /// [`AppEvent::ClaimChanged`] is raised for each whose held view or SETTLED proof the
+    /// read changed. A claim read is unmarked in the commit of what it read; the rest stay
+    /// marked for the next read. A read that fails on the network or the switch stops the
+    /// reads here, its claim and the rest still marked, and the feed's read still succeeds;
+    /// an alarm or a store failure fails it. Reading a claim writes no chain item, so it
+    /// shows no stub and can't mark again by itself. An app without `claims.read` can't
+    /// read claims, and marks none.
+    pub(crate) async fn reread_claims(&mut self) -> Result<(), AppError> {
+        if !self.state.cert.has_permission(Permission::ClaimsRead) {
+            return Ok(());
+        }
+        if self.reader().exists(STUB_SEEN).await? {
+            let now = self.service_now();
+            let marked: std::collections::BTreeSet<String> = self
+                .reader()
+                .scan_raw(REREAD_PREFIX)
+                .await?
+                .into_iter()
+                .map(|(rest, _)| rest)
+                .collect();
+            let at = self.now();
+            let mut tx = self.tx()?;
+            for (rest, kept) in self.reader().scan::<KeptClaim>(CLAIM_PREFIX).await? {
+                if !marked.contains(&rest) && followed(&kept, now) {
+                    tx.put(&format!("{REREAD_PREFIX}{rest}"), &at)?;
+                }
+            }
+            tx.delete(STUB_SEEN)?;
+            self.commit(tx).await?;
+        }
+        let mut marks = self.reader().scan::<u64>(REREAD_PREFIX).await?;
+        marks.sort_by(|(a_key, a_at), (b_key, b_at)| a_at.cmp(b_at).then(a_key.cmp(b_key)));
+        for (rest, _) in marks.into_iter().take(CLAIM_REREADS_PER_READ) {
+            let claim_key = unb64_array::<32>(&rest)
+                .map_err(|_| AppError::Store(crate::error::StoreError::Corrupt))?;
+            let held = |kept: Option<KeptClaim>| kept.map(|kept| (kept.view, kept.settled_proof));
+            let before = held(self.kept_claim(&claim_key).await?);
+            if before.is_none() {
+                // No longer held: its evidence went.
+                let mut tx = self.tx()?;
+                tx.delete(&reread_key(&claim_key))?;
+                self.commit(tx).await?;
+                continue;
+            }
+            match self.read_claim_inner(&claim_key).await {
+                Ok(_) => {}
+                Err(AppError::Transport(_) | AppError::Switch(_)) => break,
+                Err(error) => return Err(error),
+            }
+            if held(self.kept_claim(&claim_key).await?) != before {
+                self.events.push(AppEvent::ClaimChanged { claim_key });
+            }
+        }
+        Ok(())
     }
 
     /// The checks of a claim answer; `Err` names the contradiction (Switch wire 7.4.8).
@@ -703,6 +821,7 @@ impl App {
                         .map_err(|_| AppError::Store(crate::error::StoreError::Corrupt))?;
                     tx.delete(&claim_key_of(&claim_key))?;
                     tx.delete_prefix(&format!("{ENTRY_PREFIX}{}/", b64(&claim_key)))?;
+                    tx.delete(&reread_key(&claim_key))?;
                     dropped = dropped.saturating_add(1);
                 }
             }

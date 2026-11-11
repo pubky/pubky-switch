@@ -234,6 +234,8 @@ uploads; `push.rs` holds the push registration. The peek (`peek.rs`) writes noth
 | `ocert/<app_id>/<cert_hash>` | a certificate of an own app, for checking its writes | |
 | `claim/<claim_key>` | the newest claim view, the proof that shows it SETTLED, the newest entry's time and the deadline the app computes, kept until the evidence's retention ends | |
 | `clent/<claim_key>/<step>` | a signed claim entry and its proof | |
+| `clstub` | the feed showed the stub of an operation since the claims the app follows were last marked: written with the page that passes the stub, by an app with `claims.read`, and removed in the commit that marks them (Switch wire 7.5) | |
+| `clread/<claim_key>` | a claim the app holds and doesn't hold as finished (SETTLED with every attempt `done` or `failed`), to read again, with the device time it was marked; read at the end of a read, at most `CLAIM_REREADS_PER_READ` (16) per read, oldest mark first, and removed in the commit of any read of the claim, a `404` included, or when its evidence goes | |
 
 Deleting the keys on a leave also removes `rec/`, `hw/`, `recname/`, `out/`, `sent/`,
 `sentt/`, `invite/` and `opq/`. A restore replaces the namespace, these keys included, and

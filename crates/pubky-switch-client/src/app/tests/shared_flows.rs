@@ -2164,6 +2164,196 @@ async fn test_claims_entry_met_again_raises_one_change() {
     assert_eq!(claim_changes(&app.take_events()), 1);
 }
 
+/// The claim reads (`GET /claims`) in the router's log from `from` on.
+fn claim_reads(s: &Setup, from: usize) -> usize {
+    s.log()[from..]
+        .iter()
+        .filter(|line| line.starts_with("GET ") && line.contains("/claims/"))
+        .count()
+}
+
+async fn attempt_as(app: &mut App, claim: [u8; 32], step: u64, attempt: [u8; 16]) {
+    app.write_claim(
+        ClaimOp::attempt(claim, step, attempt, 3600, None),
+        vec![],
+        ObligationDeadline::NoDeadline,
+    )
+    .await
+    .unwrap();
+}
+
+async fn report_as(app: &mut App, claim: [u8; 32], step: u64, attempt: [u8; 16], done: bool) {
+    let op = if done {
+        ClaimOp::done(claim, step, attempt, Basis::Owner, None).unwrap()
+    } else {
+        ClaimOp::failed(claim, step, attempt)
+    };
+    app.write_claim(op, vec![], ObligationDeadline::NoDeadline)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn test_claims_compacted_entry_has_the_claim_read_again() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    attempt_as(&mut wallet, CLAIM, 0, ATTEMPT).await;
+    phone.receive(None).await.unwrap();
+    let held = phone.claim_evidence(&CLAIM).await.unwrap().unwrap();
+    assert_eq!(held.view.status, ClaimStatus::Attempting);
+    // The done settles the claim, which is compacted at once: the phone's feed shows both
+    // entries as stubs, naming no claim, so it reads the claim again at the end of its read.
+    report_as(&mut wallet, CLAIM, 1, ATTEMPT, true).await;
+    let from = s.log().len();
+    let report = phone.receive(None).await.unwrap();
+    assert_eq!(claim_reads(&s, from), 1);
+    let feed = s.log()[from..]
+        .iter()
+        .rposition(|line| line.contains("/feed"))
+        .unwrap();
+    let read = s.log()[from..]
+        .iter()
+        .position(|line| line.contains("/claims/"))
+        .unwrap();
+    assert!(read > feed, "the claim is read after the feed");
+    assert_eq!(claim_changes(&report.events), 1, "{:?}", report.events);
+    let held = phone.claim_evidence(&CLAIM).await.unwrap().unwrap();
+    assert_eq!(held.view.status, ClaimStatus::Settled);
+    assert!(held.view.tombstone);
+    // Held as finished now: later stubs don't have it read again.
+    let other = [0x41; 32];
+    attempt_as(&mut wallet, other, 0, ATTEMPT).await;
+    report_as(&mut wallet, other, 1, ATTEMPT, false).await;
+    let from = s.log().len();
+    let report = phone.receive(None).await.unwrap();
+    assert_eq!(claim_reads(&s, from), 0, "{:?}", &s.log()[from..]);
+    assert_eq!(claim_changes(&report.events), 0);
+}
+
+#[tokio::test]
+async fn test_claims_settled_with_an_attempt_open_is_still_read_again() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    // The first attempt fails; a second is opened; late evidence settles the first, so the
+    // claim is SETTLED with the second attempt still open, and stays live.
+    attempt_as(&mut wallet, CLAIM, 0, ATTEMPT).await;
+    report_as(&mut wallet, CLAIM, 1, ATTEMPT, false).await;
+    attempt_as(&mut wallet, CLAIM, 2, [7; 16]).await;
+    wallet
+        .write_claim(
+            ClaimOp::done(CLAIM, 3, ATTEMPT, Basis::Evidence, Some([8; 32])).unwrap(),
+            vec![],
+            ObligationDeadline::NoDeadline,
+        )
+        .await
+        .unwrap();
+    phone.receive(None).await.unwrap();
+    let held = phone.claim_evidence(&CLAIM).await.unwrap().unwrap();
+    assert_eq!(held.view.status, ClaimStatus::Settled);
+    assert!(!held.view.tombstone);
+    // The open attempt's outcome compacts the claim: it comes as a stub, and the phone,
+    // which holds the claim SETTLED but not finished, reads it again.
+    report_as(&mut wallet, CLAIM, 4, [7; 16], false).await;
+    let from = s.log().len();
+    phone.receive(None).await.unwrap();
+    assert_eq!(claim_reads(&s, from), 1);
+    let held = phone.claim_evidence(&CLAIM).await.unwrap().unwrap();
+    assert!(held.view.tombstone);
+    assert_eq!(held.view.step, 5);
+}
+
+#[tokio::test]
+async fn test_claims_own_compacted_entries_of_a_finished_claim_read_nothing() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    attempt_as(&mut wallet, CLAIM, 0, ATTEMPT).await;
+    report_as(&mut wallet, CLAIM, 1, ATTEMPT, true).await;
+    // The wallet holds the claim finished from its own proofs; its own entries, compacted,
+    // come as stubs in its feed and have nothing read.
+    let from = s.log().len();
+    wallet.receive(None).await.unwrap();
+    assert_eq!(claim_reads(&s, from), 0, "{:?}", &s.log()[from..]);
+}
+
+#[tokio::test]
+async fn test_claims_read_again_at_most_a_bound_per_read() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    let claims: Vec<[u8; 32]> = (0..=crate::app::CLAIM_REREADS_PER_READ)
+        .map(|n| [u8::try_from(n).unwrap() + 0x50; 32])
+        .collect();
+    for claim in &claims {
+        attempt_as(&mut wallet, *claim, 0, ATTEMPT).await;
+    }
+    phone.receive(None).await.unwrap();
+    // One claim's done compacts it: every claim the phone follows is marked, and one read
+    // reads the bound of them; the rest wait for the next read, which sees no new stub.
+    report_as(&mut wallet, claims[0], 1, ATTEMPT, true).await;
+    let from = s.log().len();
+    phone.receive(None).await.unwrap();
+    assert_eq!(claim_reads(&s, from), crate::app::CLAIM_REREADS_PER_READ);
+    let from = s.log().len();
+    phone.receive(None).await.unwrap();
+    assert_eq!(claim_reads(&s, from), 1);
+    let from = s.log().len();
+    phone.receive(None).await.unwrap();
+    assert_eq!(claim_reads(&s, from), 0);
+    let held = phone.claim_evidence(&claims[0]).await.unwrap().unwrap();
+    assert!(held.view.tombstone);
+}
+
+#[tokio::test]
+async fn test_claims_read_again_that_fails_stays_marked() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    attempt_as(&mut wallet, CLAIM, 0, ATTEMPT).await;
+    phone.receive(None).await.unwrap();
+    report_as(&mut wallet, CLAIM, 1, ATTEMPT, true).await;
+    // The claim's read doesn't reach the switch: the feed's read still succeeds, and the
+    // claim stays marked.
+    s.w.switch.fail_next(Fault::Unreachable {
+        path: "claims".into(),
+        after: 0,
+    });
+    let report = phone.receive(None).await.unwrap();
+    assert_eq!(claim_changes(&report.events), 0);
+    let held = phone.claim_evidence(&CLAIM).await.unwrap().unwrap();
+    assert_eq!(held.view.status, ClaimStatus::Attempting);
+    // Loaded again, as after a crash: the mark was kept, and the next read reads the claim,
+    // though its feed shows nothing new.
+    let me = phone.app_id();
+    drop(phone);
+    let mut phone = App::load(s.env(), s.protocol.clone(), World::config(), me)
+        .await
+        .unwrap();
+    let from = s.log().len();
+    let report = phone.receive(None).await.unwrap();
+    assert_eq!(claim_reads(&s, from), 1);
+    assert_eq!(claim_changes(&report.events), 1);
+    let held = phone.claim_evidence(&CLAIM).await.unwrap().unwrap();
+    assert_eq!(held.view.status, ClaimStatus::Settled);
+}
+
+#[tokio::test]
+async fn test_claims_app_without_claims_read_reads_nothing_again() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut writer = s
+        .join_with("phone", &[Permission::ClaimsWrite, Permission::ListsRead])
+        .await;
+    attempt_as(&mut writer, CLAIM, 0, ATTEMPT).await;
+    attempt_as(&mut wallet, [0x42; 32], 0, ATTEMPT).await;
+    // Every claim item is a stub to it, and it holds its own claim open, but it can't read
+    // claims: nothing is read.
+    let from = s.log().len();
+    writer.receive(None).await.unwrap();
+    assert_eq!(claim_reads(&s, from), 0, "{:?}", &s.log()[from..]);
+}
+
 #[tokio::test]
 async fn test_send_acceptance_committed_before_the_follow_ups() {
     // The first commit after the append is answered: stopped right after it, the restart
