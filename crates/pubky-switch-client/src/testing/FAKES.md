@@ -140,7 +140,10 @@ service.
 - **The signer hand-over** (Switch wire 7.4.17), without the 12 MiB body cap of `PUT /handover`: `PUT /handover` runs the core's checks of a
   stored hand-over (`SignerHandover::check_stored`) for a current target with a checked
   certificate, and keeps one, replacing any it held; `GET /handover` serves it to the signer
-  and to its target; the next `identity.json` version, whoever delivered it, drops it.
+  and to its target, also when that target isn't current, where the service answers `403
+  not_current` (Switch wire 7.2): so a test can script a faulty switch that serves a
+  hand-over while holding no copy of the version handed over; the next `identity.json`
+  version, whoever delivered it, drops it.
   `stored_handover` names the target held; `stored_handover_body` and
   `store_handover_again` script a hand-over stored or served again after it was dropped.
 - **`Fault::LeaveOut`** scripts a faulty service whose answer to an own app or the signer

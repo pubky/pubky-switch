@@ -1070,3 +1070,75 @@ async fn test_signer_a_switch_that_lost_its_copy_stays_unconfirmed_after_the_cle
     assert_eq!(world.sent_docs().len(), sent);
     assert!(world.switch.identity_doc().is_none());
 }
+
+#[tokio::test]
+async fn test_signer_run_republishes_over_an_older_missing_or_unreadable_copy() {
+    // Version 2 was published, then the Homeserver's copy went back to version 1, went
+    // missing, or stopped reading: each time, the next run publishes the switch's copy, this
+    // signer's own version 2, again (Switch wire 3.3 "Deliver, then publish"). A Homeserver
+    // that is down fails the run, as it fails every check of the copies, and the next run
+    // republishes.
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let first = signer.identity_doc().unwrap().unwrap();
+    let two = signer.set_record_max_age(Some(86_400)).await.unwrap();
+    let path = pubky_switch_core::records::IDENTITY_PATH;
+    let restore = [
+        Some(serde_json::to_vec(first.signed()).unwrap()),
+        None,
+        Some(b"not a document".to_vec()),
+    ];
+    for copy in restore {
+        match copy {
+            Some(bytes) => world.homeserver.set(path, bytes),
+            None => {
+                world.homeserver.files.lock().unwrap().remove(path);
+            }
+        }
+        signer.run_due().await.unwrap();
+        assert_eq!(world.published().unwrap().signed(), two.signed());
+    }
+    plant(&world, &first);
+    *world.homeserver.down.lock().unwrap() = true;
+    let error = signer.run_due().await.unwrap_err();
+    assert!(matches!(error, SignerError::Homeserver(_)), "{error:?}");
+    *world.homeserver.down.lock().unwrap() = false;
+    assert_eq!(world.published().unwrap().signed(), first.signed());
+    signer.run_due().await.unwrap();
+    assert_eq!(world.published().unwrap().signed(), two.signed());
+    // A copy that is the newest version already isn't written again.
+    let writes = world.homeserver.writes.lock().unwrap().len();
+    signer.run_due().await.unwrap();
+    assert_eq!(world.homeserver.writes.lock().unwrap().len(), writes);
+    // Republishing signs nothing.
+    world.assert_no_version_sent_twice();
+    assert_eq!(world.sent_docs().last().unwrap().signed(), two.signed());
+}
+
+#[tokio::test]
+async fn test_signer_run_never_republishes_over_another_body_or_a_newer_copy() {
+    // Another body at version 2 stays the alarm, and the run writes nothing over it until the
+    // user clears it. A newer copy by another install stops this install, and stays
+    // published.
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let two = signer.set_record_max_age(Some(86_400)).await.unwrap();
+    let other = other_body(&world, &two);
+    plant(&world, &other);
+    let error = signer.run_due().await.unwrap_err();
+    assert!(matches!(error, SignerError::Alarm(_)), "{error:?}");
+    let _ = signer.run_due().await;
+    assert_eq!(world.published().unwrap().signed(), other.signed());
+
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let two = signer.set_record_max_age(Some(86_400)).await.unwrap();
+    let theirs = world.other_install_version(&two, [7; 16]);
+    plant(&world, &theirs);
+    assert_eq!(
+        signer.run_due().await.unwrap_err(),
+        SignerError::NotNamed { install: [7; 16] }
+    );
+    let _ = signer.run_due().await;
+    assert_eq!(world.published().unwrap().signed(), theirs.signed());
+}

@@ -15,6 +15,13 @@
 //! so a claim never names a document the switch refused. The auth request's secret is used to
 //! sign the claim and isn't kept.
 //!
+//! A request from an app listed already, naming exactly the keys it is listed with, is a
+//! renewal (Switch wire 3.9 step 5): [`AppReview::renews`] says so, for the user to see, and
+//! [`Signer::approve`] renews the certificate with the scopes asked for, as [`Signer::renew`]
+//! does (Switch wire 3.8). Its approval and claim hold the renewed certificate and the
+//! renewing version, committed with it and released the same way. A listed App ID with
+//! other keys is refused.
+//!
 //! # What the host does, in this order
 //!
 //! The relay and the Pubky grant are Pubky's transport, so they are the host's, through its
@@ -57,6 +64,7 @@ use pubky_switch_core::scopes::Permission;
 use pubky_switch_core::sig::SignedDoc;
 
 use super::Signer;
+use super::renewal::{Answering, CertChange, clock_agrees};
 use crate::alert::Alert;
 use crate::error::{Refusal, Result, SignerError};
 use crate::protocol::GrantPath;
@@ -79,6 +87,9 @@ pub struct AppReview {
     pub caps: String,
     /// The paths the protocols add to the app's grant, with what each is for.
     pub grant_paths: Vec<GrantPath>,
+    /// The App ID is listed already, with exactly the keys this request names: approving it
+    /// renews the app's certificate with the scopes asked for (Switch wire 3.9 step 5, 3.8).
+    pub renews: bool,
     request: AppRequest,
     auth: AuthRequest,
 }
@@ -139,14 +150,15 @@ impl Signer {
     /// 3.9: the request verifies, its scopes follow the scope rule and are owned by registered
     /// protocols, whose own rules they pass (step 1); it binds the auth request (step 2); the
     /// capabilities are exactly the app's own paths and the paths its protocols add (step 3);
-    /// the App ID was never revoked or removed (step 4), isn't listed (step 5), and fits the
-    /// app limit (step 6).
+    /// the App ID was never revoked or removed (step 4), isn't listed, or is listed with
+    /// exactly the keys the request names, which makes it a renewal ([`AppReview::renews`],
+    /// step 5), and a new App ID fits the app limit (step 6).
     ///
     /// # Errors
     ///
     /// [`Refusal::Scopes`], [`Refusal::UnknownScopes`] or [`Refusal::ProtocolRule`] for the
-    /// scopes; [`Refusal::AppRequest`] naming the step that failed; [`Refusal::AlreadyListed`]
-    /// for an App ID listed with the same keys; [`Refusal::NotSetUp`] before the first version.
+    /// scopes; [`Refusal::AppRequest`] naming the step that failed, a listed App ID with other
+    /// keys included; [`Refusal::NotSetUp`] before the first version.
     pub fn review(&self, request: &SignedDoc, auth: &AuthRequest) -> Result<AppReview> {
         let identity = self.state.identity;
         let verified = AppRequest::verify(request).map_err(refused)?;
@@ -171,9 +183,6 @@ impl Signer {
             knows_scope: &knows,
         };
         let (request, approve) = check_app_request(request, auth, &view).map_err(refused)?;
-        if approve == Approve::Renew {
-            return Err(Refusal::AlreadyListed.into());
-        }
         let body = request.body();
         Ok(AppReview {
             app_id: body.app_id,
@@ -182,6 +191,7 @@ impl Signer {
             keyed: terms.keyed,
             caps: body.caps.clone(),
             grant_paths,
+            renews: approve == Approve::Renew,
             request: request.clone(),
             auth: auth.clone(),
         })
@@ -192,19 +202,43 @@ impl Signer {
     /// commit them, then deliver and publish the version. Returns the claim for the host to
     /// send, once the switch has taken the version.
     ///
-    /// The request is checked again first, against the records as they are now.
+    /// The request is checked again first, against the records as they are now. A request
+    /// that renews ([`AppReview::renews`]) is a renewal with the scopes asked for and the
+    /// default lifetime, as [`Signer::renew`] makes it (Switch wire 3.8): `cert.put` and the
+    /// full key bundle at the switch, then the renewing version. The approval answering it
+    /// holds the renewed certificate and that version, and its claim is released the same way.
     ///
     /// # Errors
     ///
-    /// As [`Signer::review`] and [`Signer::resume`]. When the delivery didn't finish, the
+    /// As [`Signer::review`] and [`Signer::resume`]; for a renewal, as [`Signer::renew`]
+    /// too: [`Refusal::NotJoined`] for an app that hasn't delivered its record yet, whose
+    /// certificate the switch can't renew (Switch wire 6.2). When the delivery didn't finish, the
     /// claim stays held: [`Signer::approved`] gives it once a later [`Signer::resume`] has
     /// delivered the version.
     pub async fn approve(&mut self, review: AppReview) -> Result<ApprovedRequest> {
         self.ready().await?;
         let review = self.review(review.request.signed(), &review.auth)?;
+        if review.renews {
+            let change = CertChange {
+                scopes: Some(review.scopes.clone()),
+                expires_at: None,
+            };
+            let answering = Answering {
+                request: &review.request,
+                auth: &review.auth,
+                caps: &review.caps,
+            };
+            self.renew_listed(review.app_id, change, Some(&answering))
+                .await?;
+            return self.claim_of(&review.request.hash());
+        }
         let identity = self.state.identity;
         let body = review.request.body();
         let now = self.env.clock.now_ms();
+        // The certificate is stamped with the device clock: it must agree with the switch's
+        // time.
+        let (_, switch_time) = self.switch_apps_at().await?;
+        clock_agrees(now, switch_time)?;
         let expires = now.saturating_add(self.state.cert_lifetime_ms);
         let protocols = self.env.protocols.clone();
         let has_keys = |scope: &str| protocols.has_keys(scope);
@@ -244,7 +278,12 @@ impl Signer {
         state.claims.push(pending);
         self.commit(state, Some(flow)).await?;
         self.resume().await?;
-        match self.approved(&review.request.hash())? {
+        self.claim_of(&review.request.hash())
+    }
+
+    /// The claim of `request` once released, or why it is held.
+    fn claim_of(&self, request: &[u8; 32]) -> Result<ApprovedRequest> {
+        match self.approved(request)? {
             Some(approved) => Ok(approved),
             None => Err(Refusal::ClaimHeld {
                 alert: self

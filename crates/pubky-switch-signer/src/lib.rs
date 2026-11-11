@@ -34,7 +34,7 @@ pub mod protocol;
 mod signer;
 pub mod state;
 
-pub use alert::{Alert, Source};
+pub use alert::{Alert, RenewalSkip, Source};
 pub use error::{Refusal, Result, SignerError};
 pub use homeserver::Homeserver;
 pub use key::{

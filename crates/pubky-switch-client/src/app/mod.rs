@@ -48,6 +48,7 @@ mod recovery;
 mod renewal;
 mod rotation;
 mod state;
+mod unverified;
 
 mod admission;
 mod batch;
@@ -63,8 +64,8 @@ mod tests;
 pub use chain::{HELD_MARKS, STUBS_KEPT_FOR_MS};
 pub use error::{Alarm, AppError, Refusal};
 pub use events::{
-    AppEvent, BackupRefusal, ClaimAttempt, EVENT_ID_LEN, EventId, EventIdError, ParkReason,
-    RefusedCall,
+    AppEvent, BackupRefusal, ClaimAttempt, DropReason, EVENT_ID_LEN, EventId, EventIdError,
+    ParkReason, RefusedCall,
 };
 pub use feed::ReceiveReport;
 pub use identity::{DOC_CACHE_MS, HomeserverReader, IdentityRefresh, REVALIDATION_MS};
@@ -80,6 +81,10 @@ pub use provider::ProviderStatus;
 pub use push::{MAX_HANDLE_BYTES, MAX_HANDLES, PushHandles, PushRegistration, PushRelay};
 pub use recovery::{Evidence, LossActions, ProviderLoss, RESIDUAL_WINDOW_MS, RecoveryInfo};
 pub use state::{PROTOCOL_PREFIX, SCHEMA_VERSION};
+pub use unverified::{
+    MAX_UNVERIFIED_AGE_MS, MAX_UNVERIFIED_PER_SENDER, MAX_UNVERIFIED_TOTAL,
+    UNVERIFIED_DROPS_PER_COMMIT,
+};
 
 pub use admission::{INVITE_CODE_BYTES, InviteCode, LISTS_TOO_LARGE_RETRY_MS, SenderDisposition};
 pub use batch::{MAX_KEPT_BATCHES_BYTES, OpBatch, server_time_in};
