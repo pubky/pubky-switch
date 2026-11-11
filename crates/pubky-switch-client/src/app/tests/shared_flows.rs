@@ -5006,3 +5006,158 @@ async fn test_scripted_peer_identity_needed_carries_known_version() {
         Some(&Value::Null)
     );
 }
+
+// -------------------------------------------------------------------------------------
+// Records held unreadable until their keys arrive (Switch spec 3.5)
+
+/// A listing a widening renewal owes waits for the keys of the scope it added: listed
+/// before them, the record would be held `Unreadable`.
+#[tokio::test]
+async fn test_records_listing_after_a_widening_waits_for_the_keys() {
+    let s = Setup::new();
+    let mut wallet = join_scoped(&s, "wallet", &["scope-c"]).await;
+    let mut phone = s.join("phone").await;
+    let key =
+        pubky_switch_core::enc::unb64_array::<32>(&phone_record(&s, &mut phone).await).unwrap();
+    wallet.receive(None).await.unwrap();
+    s.w.clock.advance_ms(HOUR);
+    let earlier = wallet.cert().clone();
+    let renewed = renewed_cert(&s, "wallet", &["scope-a", "scope-c"]);
+    s.w.next_doc(|body| list_renewal(body, &earlier, &renewed, None));
+    wallet.receive(None).await.unwrap();
+    assert_eq!(wallet.cert().hash(), renewed.hash());
+    // The renewal's part came before the document listing it and was skipped: the key of
+    // scope-a is missing, so the listing waits.
+    let listings = s.w.switch.lock().shared.listings;
+    wallet.receive(None).await.unwrap();
+    assert_eq!(
+        s.w.switch.lock().shared.listings,
+        listings,
+        "no listing yet"
+    );
+    assert!(wallet.shared_record(&key).await.unwrap().is_none());
+    // Once the keys arrive, the next read lists, and the record opens.
+    store_parts_for(&s, &renewed);
+    wallet.receive(None).await.unwrap();
+    wallet.receive(None).await.unwrap();
+    assert!(s.w.switch.lock().shared.listings > listings);
+    let held = wallet.shared_record(&key).await.unwrap().unwrap();
+    assert_eq!(ids(held.content.value()), vec!["a"]);
+}
+
+/// The wallet and the phone at data epoch 2, the phone holding its key and the wallet not;
+/// the phone writes `n1` sealed at epoch 2, and the wallet reads it from the feed.
+async fn record_at_a_new_epoch(s: &Setup, wallet: &mut App, phone: &mut App) -> [u8; 32] {
+    wallet.receive(None).await.unwrap();
+    s.w.next_doc(|body| body.data_epoch = 2);
+    store_parts_for(s, &phone.cert().clone());
+    phone.receive(None).await.unwrap();
+    let target = s.target("n1");
+    phone
+        .put_record(&target, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    phone.record_key(&target).unwrap()
+}
+
+/// A record written at a new data epoch whose key reaches the app late is held
+/// `Unreadable`, then opened when the key arrives, without a listing.
+#[tokio::test]
+async fn test_records_held_unreadable_opens_once_its_key_arrives() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    let key = record_at_a_new_epoch(&s, &mut wallet, &mut phone).await;
+    wallet.receive(None).await.unwrap();
+    let held = wallet.shared_record(&key).await.unwrap().unwrap();
+    assert_eq!(held.content, RecordContent::Unreadable);
+    let listings = s.w.switch.lock().shared.listings;
+    store_parts_for(&s, &wallet.cert().clone());
+    let report = wallet.receive(None).await.unwrap();
+    assert_eq!(s.w.switch.lock().shared.listings, listings, "no listing");
+    let held = wallet.shared_record(&key).await.unwrap().unwrap();
+    assert_eq!(ids(held.content.value()), vec!["a"]);
+    assert!(
+        report
+            .events
+            .iter()
+            .any(|e| matches!(e, AppEvent::RecordChanged { key: k } if *k == key)),
+        "{:?}",
+        report.events
+    );
+}
+
+/// An explicit listing of a record held `Unreadable` opens it once its key is held: the
+/// same write, by its item hash, is taken as opened.
+#[tokio::test]
+async fn test_records_relist_opens_a_record_held_unreadable() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    let key = record_at_a_new_epoch(&s, &mut wallet, &mut phone).await;
+    wallet.list_collection(&items()).await.unwrap();
+    let held = wallet.shared_record(&key).await.unwrap().unwrap();
+    assert_eq!(held.content, RecordContent::Unreadable);
+    store_parts_for(&s, &wallet.cert().clone());
+    wallet.receive(None).await.unwrap();
+    wallet.list_collection(&items()).await.unwrap();
+    let held = wallet.shared_record(&key).await.unwrap().unwrap();
+    assert_eq!(ids(held.content.value()), vec!["a"]);
+}
+
+/// A record whose value doesn't open with its key held stays `Unreadable`: tried again
+/// once, when the key arrives, and flagged then; a later read doesn't try it again.
+#[tokio::test]
+async fn test_records_unopenable_with_its_key_held_is_tried_once() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    wallet.receive(None).await.unwrap();
+    s.w.next_doc(|body| body.data_epoch = 2);
+    store_parts_for(&s, &phone.cert().clone());
+    phone.receive(None).await.unwrap();
+    // The phone writes a value sealed under a key that isn't epoch 2's.
+    let target = s.target("n1");
+    let (_, kind) = phone
+        .record_op(&target, Some(&value(&["a"])), vec![])
+        .await
+        .unwrap();
+    let OpKind::RecordPut(mut put) = kind else {
+        unreachable!("a record op");
+    };
+    put.value_sealed = pubky_switch_core::sealed::SealedValue::seal(
+        &[3; 32],
+        &s.w.alice.public(),
+        2,
+        "scope-a",
+        &put.key,
+        &value(&["a"]),
+    )
+    .unwrap();
+    let key = put.key;
+    s.w.switch
+        .app_op(&app_keys("phone"), OpKind::RecordPut(put))
+        .unwrap();
+    wallet.receive(None).await.unwrap();
+    let held = wallet.shared_record(&key).await.unwrap().unwrap();
+    assert_eq!(held.content, RecordContent::Unreadable);
+    store_parts_for(&s, &wallet.cert().clone());
+    let report = wallet.receive(None).await.unwrap();
+    assert_eq!(
+        flagged_rules(&report.events).len(),
+        1,
+        "{:?}",
+        report.events
+    );
+    let held = wallet.shared_record(&key).await.unwrap().unwrap();
+    assert_eq!(held.content, RecordContent::Unreadable);
+    // Not tried at every read.
+    for _ in 0..2 {
+        let report = wallet.receive(None).await.unwrap();
+        assert!(
+            flagged_rules(&report.events).is_empty(),
+            "{:?}",
+            report.events
+        );
+    }
+}

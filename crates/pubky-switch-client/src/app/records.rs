@@ -213,6 +213,15 @@ impl Collection {
         self.member(policy).is_some()
     }
 
+    /// Whether a certificate scope `scope` reads a member of the collection: its read
+    /// scope, or, in a sub-scope family, one of its sub-scopes (Switch spec 3.3, 10.3).
+    pub(crate) fn read_by_scope(&self, scope: &str) -> bool {
+        scope == self.policy.read_scope
+            || (self.family == PolicyFamily::SubScopes
+                && pubky_switch_core::scopes::split(scope)
+                    .is_some_and(|(name, sub)| sub.is_some() && name == self.policy.read_scope))
+    }
+
     /// Whether a certificate holds the read scope of any member, so its app lists the
     /// collection (Switch spec 8.3).
     pub fn readable_by(&self, cert: &AppCert) -> bool {
@@ -776,9 +785,73 @@ impl App {
     /// List the collections when a listing is owed: after joining, a restore, a `missed`
     /// item, and a certificate taken that reads a collection the one before didn't (Switch
     /// spec 8.2, 8.3).
+    ///
+    /// A listing waits while the certificate lacks the key, at the current data epoch, of
+    /// a read scope of a collection it lists, such as after a renewal that adds one: listed
+    /// before its key arrives, a record would be held `Unreadable` until the key opened it
+    /// ([`App::reopen_unreadable`]). `list_due` stays, so the read after the key arrives
+    /// lists.
     pub(crate) async fn list_collections_if_due(&mut self) -> Result<(), AppError> {
-        if self.reader().exists(LIST_DUE).await? {
-            self.list_collections().await?;
+        if !self.reader().exists(LIST_DUE).await? || self.listing_lacks_keys() {
+            return Ok(());
+        }
+        self.list_collections().await
+    }
+
+    /// Whether the certificate lacks, at the current data epoch, the key of a scope it
+    /// holds that reads a collection of the protocol (Switch spec 3.5).
+    fn listing_lacks_keys(&self) -> bool {
+        let epoch = self.state.own_doc.data_epoch();
+        let collections = self.protocol.collections();
+        self.state.cert.scopes().iter().any(|scope| {
+            self.protocol.has_keys(scope)
+                && self.state.scope_keys.get(epoch, scope).is_none()
+                && collections.iter().any(|c| c.read_by_scope(scope))
+        })
+    }
+
+    /// Open again, once a fetch took a scope key, the records held `Unreadable` whose value
+    /// is sealed under a key the app now holds (Switch spec 3.5): their kept write goes
+    /// through the checks again and is taken as opened ([`App::take_write`]). A data-epoch
+    /// rotation and a listing before the keys came both leave such records. A value that
+    /// still doesn't open with its key held is flagged and stays `Unreadable`; it is tried
+    /// only at a fetch that takes a key, and when the write is read again, never at every
+    /// read.
+    pub(crate) async fn reopen_unreadable(&mut self) -> Result<(), AppError> {
+        let held = self.reader().scan::<HeldRecord>(RECORD_PREFIX).await?;
+        let mut tx = self.tx()?;
+        for (_, record) in held {
+            if record.content != RecordContent::Unreadable {
+                continue;
+            }
+            let Ok(op) = SignedOp::peek(&record.op) else {
+                continue;
+            };
+            let OpKind::RecordPut(put) = &op.body().kind else {
+                continue;
+            };
+            let sealed = &put.value_sealed;
+            if self
+                .state
+                .scope_keys
+                .get(sealed.data_epoch, &sealed.scope)
+                .is_none()
+            {
+                continue;
+            }
+            let collection = Collection::new(&record.collection, record.policy.clone());
+            let evidence = Evidence {
+                op: &record.op,
+                cert: record.cert.as_ref(),
+                proof: record.proof.as_ref(),
+                stub: None,
+                view_version: Some(record.version),
+            };
+            self.read_write(&evidence, Some((&put.key, &collection)), put.key, &mut tx)
+                .await?;
+        }
+        if !tx.is_empty() {
+            self.commit(tx).await?;
         }
         Ok(())
     }
@@ -1344,16 +1417,34 @@ impl App {
 
     /// Take an accepted write if it is newer than the one held and the protocol finds it
     /// goes back on nothing the app has seen.
+    ///
+    /// The same write again, by its item hash, changes nothing but a version a proof now
+    /// authenticates, unless the app holds it `Unreadable` and now opens it: a value never
+    /// opened was never seen, so it is taken as a write is, its version evidence the better
+    /// of the two, and the protocol checks and marks it (Switch spec 3.5, 8.2).
     async fn take_write(
         &mut self,
-        accepted: Accepted,
+        mut accepted: Accepted,
         own: bool,
         tx: &mut Tx,
     ) -> Result<Taken, AppError> {
         let key = accepted.key;
         self.keep_cert(&accepted.cert, tx)?;
         let held = self.held_record(&key).await?;
-        if let Some(held) = &held {
+        let reopened = held.as_ref().is_some_and(|held| {
+            held.item_hash == accepted.item_hash
+                && held.content == RecordContent::Unreadable
+                && accepted.content != RecordContent::Unreadable
+        });
+        if let Some(held) = held.as_ref().filter(|_| reopened)
+            && held.authenticated
+            && !accepted.version.authenticated
+        {
+            accepted.version = held.write_version();
+            accepted.proof = accepted.proof.take().or(held.proof.clone());
+            accepted.time = held.written_at_ms.or(accepted.time);
+        }
+        if let Some(held) = held.as_ref().filter(|_| !reopened) {
             if held.item_hash == accepted.item_hash {
                 if accepted.version.authenticated && !held.authenticated {
                     let mut upgraded = held.clone();
@@ -1441,7 +1532,7 @@ impl App {
             item_hash: accepted.item_hash,
             content: accepted.content,
             doubtful: accepted.doubtful,
-            follow: None,
+            follow: held.and_then(|held| held.follow).filter(|_| reopened),
         };
         tx.put(&record_key_of(&key), &record)?;
         self.events.push(AppEvent::RecordChanged { key });

@@ -51,6 +51,7 @@ impl App {
                 Err(error) => return Err(error),
             };
             let mut tx = self.tx()?;
+            let mut took = false;
             if let Some(answer) = answer {
                 let parts: Vec<BundlePart> = answer
                     .bundles
@@ -100,6 +101,7 @@ impl App {
                                     &scope_key,
                                 )?;
                                 self.state.scope_keys.keys.push(scope_key);
+                                took = true;
                             }
                         }
                     }
@@ -108,6 +110,10 @@ impl App {
             let missing = self.update_keys_through();
             tx.put(key::BUNDLE, &self.state.bundle)?;
             self.commit(tx).await?;
+            // A record held unreadable for want of a key taken now opens.
+            if took {
+                self.reopen_unreadable().await?;
+            }
             if missing && self.state.bundle.full_requested_ms.is_none() {
                 self.request_full_bundle().await?;
             }
