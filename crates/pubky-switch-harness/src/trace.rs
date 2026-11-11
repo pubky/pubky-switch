@@ -22,6 +22,12 @@
 //!   that isn't the one the record carries, shows;
 //! - inside each signed document and each base64url JSON value, the same facts again.
 //!
+//! What this can't tell: a long string a switch makes itself, echoing nothing a party sent
+//! (a chain hash, an item hash, a signature of its own), that is wrong from its first
+//! appearance and repeated consistently wherever the right one would show. Two runs read
+//! alike then. [`crate::check`] verifies those the harness has the means to verify, in both
+//! runs; the rest is checked only as far as the client and the signer check it.
+//!
 //! An error's `message` is for people (Switch wire 7.6): it isn't kept.
 //!
 //! Member order is free (Switch wire 1.1), so a reader never depends on it. It is kept all
@@ -42,6 +48,7 @@ use serde::de::{Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde_json::Value;
 
 use crate::HarnessError;
+use crate::check::{Checker, SignedWith};
 
 /// The members whose string value is one of the wire format's fixed words or a name the
 /// flow chose, kept by value whatever its length: error codes, document kinds, operations,
@@ -69,6 +76,13 @@ pub const SHORT: usize = 11;
 
 /// What ends the name of the fact that holds an object's member names in the order written.
 pub const MEMBER_ORDER: &str = " (member order)";
+
+/// What starts the name of a fact that holds a check of [`crate::check`] that failed. The
+/// comparison reports every such fact, also one both runs show.
+pub const VIOLATION: &str = "violation";
+
+/// The fact that says which key an answer's signature verified with.
+const SIGNED_WITH: &str = "answer signed with";
 
 /// The answer headers whose presence is kept (Switch wire 7.1).
 const HEADERS: [&str; 4] = [
@@ -172,11 +186,49 @@ impl std::fmt::Display for Trace {
 pub struct Recorder {
     inner: Arc<dyn Transport>,
     names: Arc<Names>,
+    checker: Arc<Checker>,
     lines: Mutex<Vec<Line>>,
     /// The number of each long string the run showed, by its value, in order of appearance.
     strings: Mutex<HashMap<String, usize>>,
     distortion: Mutex<Option<Distortion>>,
+    /// The faults to apply, each once, in the order added.
+    faults: Mutex<Vec<Fault>>,
 }
+
+/// A fault of the network between a party and its switch, applied to the next request of
+/// its method whose path contains its text. Either switch can be reached through it: the
+/// fault is the transport's, not the switch's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Fault {
+    /// The request reaches the switch and is answered, and the answer is lost on its way:
+    /// the caller sees a timeout. The trace keeps what the switch answered.
+    LoseAnswer {
+        /// The method.
+        method: String,
+        /// A part of the path.
+        path: String,
+    },
+    /// The request doesn't reach the switch: the caller fails to connect, and nothing is
+    /// applied.
+    Unreachable {
+        /// The method.
+        method: String,
+        /// A part of the path.
+        path: String,
+        /// How many matching requests go through first.
+        after: usize,
+    },
+}
+
+impl Fault {
+    fn matches(&self, request: &Request) -> bool {
+        let (Fault::LoseAnswer { method, path } | Fault::Unreachable { method, path, .. }) = self;
+        request.method == *method && request.path_and_query.contains(path.as_str())
+    }
+}
+
+/// The fact that says what a fault did to a request.
+const FAULT: &str = "fault";
 
 /// A change made to what the trace keeps of an answer.
 type Distortion = Box<dyn Fn(&Request, &mut Response) + Send + Sync>;
@@ -188,14 +240,17 @@ impl std::fmt::Debug for Recorder {
 }
 
 impl Recorder {
-    /// A recorder in front of `inner`, naming IDs with `names`.
-    pub fn new(inner: Arc<dyn Transport>, names: Arc<Names>) -> Self {
+    /// A recorder in front of `inner`, naming IDs with `names` and verifying each answer
+    /// with `checker`.
+    pub fn new(inner: Arc<dyn Transport>, names: Arc<Names>, checker: Arc<Checker>) -> Self {
         Self {
             inner,
             names,
+            checker,
             lines: Mutex::new(Vec::new()),
             strings: Mutex::new(HashMap::new()),
             distortion: Mutex::new(None),
+            faults: Mutex::new(Vec::new()),
         }
     }
 
@@ -204,6 +259,16 @@ impl Recorder {
     /// that a switch answering differently is noticed where the client itself accepts it.
     pub fn distort(&self, distort: impl Fn(&Request, &mut Response) + Send + Sync + 'static) {
         *lock(&self.distortion) = Some(Box::new(distort));
+    }
+
+    /// Apply `fault` to the next request it matches, once.
+    pub fn fail_next(&self, fault: Fault) {
+        lock(&self.faults).push(fault);
+    }
+
+    /// The faults added and not applied yet.
+    pub fn faults_left(&self) -> usize {
+        lock(&self.faults).len()
     }
 
     /// Add an outcome line: what a party returned or raised at this point of the flow.
@@ -319,14 +384,46 @@ impl Transport for Recorder {
             let call =
                 route(&request.method, &request.path_and_query).map(|route| route.call.name());
             let sent = request.clone();
+            let fault = {
+                let mut faults = lock(&self.faults);
+                let at = faults.iter().position(|fault| fault.matches(&request));
+                match at.and_then(|at| faults.get_mut(at)) {
+                    // Not yet: this request goes through.
+                    Some(Fault::Unreachable { after, .. }) if *after > 0 => {
+                        *after -= 1;
+                        None
+                    }
+                    _ => at.map(|at| faults.remove(at)),
+                }
+            };
+            if let Some(Fault::Unreachable { .. }) = fault {
+                facts.insert(FAULT.into(), "the request didn't reach the switch".into());
+                lock(&self.lines).push(Line { label, facts, call });
+                return Err(TransportError::Connect("the switch is unreachable".into()));
+            }
             let answer = self.inner.send(request).await;
             match &answer {
                 Ok(answer) => {
+                    let mut violations = Vec::new();
+                    // The signature is of the answer as the switch sent it.
+                    match self.checker.signature(&sent, answer) {
+                        Ok(SignedWith::ServiceKey) => {
+                            facts.insert(SIGNED_WITH.into(), "the account's service key".into());
+                        }
+                        Ok(SignedWith::OperatorKey) => {
+                            facts.insert(SIGNED_WITH.into(), "the operator key".into());
+                        }
+                        Err(violation) => violations.push(violation),
+                    }
                     let mut kept = answer.clone();
                     if let Some(distort) = lock(&self.distortion).as_ref() {
                         distort(&sent, &mut kept);
                     }
                     self.answer_facts(&kept, &mut facts);
+                    violations.extend(self.checker.contents(&sent, &kept));
+                    for (index, violation) in violations.into_iter().enumerate() {
+                        facts.insert(format!("{VIOLATION} {}", index + 1), violation);
+                    }
                 }
                 Err(error) => {
                     let kind = match error {
@@ -339,6 +436,12 @@ impl Transport for Recorder {
                     };
                     facts.insert("transport error".into(), kind.into());
                 }
+            }
+            if fault.is_some() {
+                // The switch answered, and the caller never sees it.
+                facts.insert(FAULT.into(), "the answer was lost".into());
+                lock(&self.lines).push(Line { label, facts, call });
+                return Err(TransportError::Timeout);
             }
             lock(&self.lines).push(Line { label, facts, call });
             answer
@@ -671,11 +774,105 @@ mod tests {
         assert_eq!(facts.len(), 3);
     }
 
+    /// A recorder in front of a transport that answers every request `200 {}`.
+    fn recorder() -> (Recorder, Arc<pubky_switch_client::transport::MockTransport>) {
+        let inner = Arc::new(pubky_switch_client::transport::MockTransport::with_handler(
+            |_| {
+                Ok(Response {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: b"{}".to_vec(),
+                })
+            },
+        ));
+        let recorder = Recorder::new(
+            inner.clone(),
+            Arc::new(Names::default()),
+            Arc::new(Checker::default()),
+        );
+        (recorder, inner)
+    }
+
+    fn post(path: &str) -> Request {
+        Request {
+            method: "POST".into(),
+            origin: "https://switch.example".into(),
+            path_and_query: path.into(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fault_lost_answer_reaches_the_switch_and_times_out_once() {
+        let (recorder, inner) = recorder();
+        recorder.fail_next(Fault::LoseAnswer {
+            method: "POST".into(),
+            path: "/ops".into(),
+        });
+        // Another call isn't touched.
+        assert!(recorder.send(post("/v1/abc/inbox")).await.is_ok());
+        let lost = recorder.send(post("/v1/abc/ops")).await;
+        assert!(matches!(lost, Err(TransportError::Timeout)), "{lost:?}");
+        assert_eq!(inner.requests().len(), 2, "the switch got the request");
+        assert!(recorder.send(post("/v1/abc/ops")).await.is_ok(), "once");
+        assert_eq!(recorder.faults_left(), 0);
+        let trace = recorder.trace();
+        let fact = |line: usize, fact: &str| trace.lines[line].facts.get(fact).cloned();
+        assert_eq!(fact(1, "fault").as_deref(), Some("the answer was lost"));
+        // The trace keeps what the switch answered.
+        assert_eq!(fact(1, "status").as_deref(), Some("200"));
+        assert_eq!(fact(2, "fault"), None);
+    }
+
+    #[tokio::test]
+    async fn test_fault_unreachable_applies_nothing() {
+        let (recorder, inner) = recorder();
+        recorder.fail_next(Fault::Unreachable {
+            method: "POST".into(),
+            path: "/ops".into(),
+            after: 0,
+        });
+        let failed = recorder.send(post("/v1/abc/ops")).await;
+        assert!(
+            matches!(failed, Err(TransportError::Connect(_))),
+            "{failed:?}"
+        );
+        assert!(inner.requests().is_empty(), "nothing reached the switch");
+        let trace = recorder.trace();
+        assert_eq!(
+            trace.lines[0].facts.get("fault").map(String::as_str),
+            Some("the request didn't reach the switch")
+        );
+        assert_eq!(trace.lines[0].facts.get("status"), None);
+        assert!(recorder.send(post("/v1/abc/ops")).await.is_ok(), "once");
+    }
+
+    #[tokio::test]
+    async fn test_fault_unreachable_after_lets_the_first_requests_through() {
+        let (recorder, inner) = recorder();
+        recorder.fail_next(Fault::Unreachable {
+            method: "POST".into(),
+            path: "/ops".into(),
+            after: 2,
+        });
+        assert!(recorder.send(post("/v1/abc/ops")).await.is_ok());
+        assert!(recorder.send(post("/v1/abc/ops")).await.is_ok());
+        assert_eq!(recorder.faults_left(), 1);
+        assert!(
+            recorder.send(post("/v1/abc/ops")).await.is_err(),
+            "the third"
+        );
+        assert_eq!(inner.requests().len(), 2);
+        assert_eq!(recorder.faults_left(), 0);
+    }
+
     #[test]
     fn test_outcome_keeps_strings_by_value() {
         let recorder = Recorder::new(
             Arc::new(pubky_switch_client::transport::MockTransport::new()),
             Arc::new(Names::default()),
+            Arc::new(Checker::default()),
         );
         recorder.outcome("received", &json!({ "events": ["MessageReceived"] }));
         let trace = recorder.trace();

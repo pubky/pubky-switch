@@ -373,6 +373,7 @@ impl App {
                 .msg_id;
             let released = ParkedEntry {
                 reason: ParkReason::Released,
+                released: true,
                 ..stored.clone()
             };
             let mut tx = self.tx()?;
