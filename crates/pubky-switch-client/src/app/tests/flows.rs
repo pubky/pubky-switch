@@ -4140,3 +4140,148 @@ async fn test_submit_batch_local_writes_over_the_bound_are_refused_unkept() {
     assert!(app.kept_batches().await.unwrap().is_empty());
     assert_eq!(conversations_for(&w, w.bob.public()), 0);
 }
+
+/// An own app of alice's, `name`, holding `permissions`, joined on its own store.
+async fn join_holding(w: &World, name: &str, permissions: &[Permission]) -> App {
+    let request = w
+        .signer
+        .approve(
+            &app_keys(name),
+            &AppSpec::new(&["scope-a"]).with_permissions(permissions),
+        )
+        .unwrap();
+    App::join(
+        w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
+        w.protocol.clone(),
+        World::config(),
+        request,
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn test_scripted_feed_shows_an_allow_put_in_full_only_to_lists_read() {
+    // Switch wire 7.5: `allow.*` is read in full by apps with `lists.read`. An app with
+    // `lists.manage` alone writes a contact and is shown its own `allow.put` as a stub.
+    let w = World::new();
+    let mut manager = join_holding(&w, "manager", &[Permission::ListsManage]).await;
+    let reader = join_holding(&w, "reader", &[Permission::ListsRead]).await;
+    let before = w.switch.shown(manager.app_id()).len();
+    manager.add_contact(&w.bob.public()).await.unwrap();
+    let shown = w.switch.shown(manager.app_id());
+    let put = shown[before..]
+        .iter()
+        .find(|item| item.get("stub").is_some())
+        .expect("the allow.put's item");
+    assert_eq!(put["type"], "stub", "{put}");
+    let seq = put["seq"].clone();
+    let full = w
+        .switch
+        .shown(reader.app_id())
+        .into_iter()
+        .find(|item| item["seq"] == seq)
+        .unwrap();
+    assert_eq!(full["type"], "chain", "{full}");
+    assert_eq!(full["item_type"], "op");
+}
+
+#[tokio::test]
+async fn test_scripted_feed_shows_a_compacted_claims_entries_as_stubs() {
+    // Switch wire 6.8 "Tombstones", 7.5: a claim SETTLED with every attempt done or failed
+    // is compacted at once, and its entries show as stubs, also to apps with `claims.read`.
+    let w = World::new();
+    let claim = [7; 32];
+    let attempt = [8; 16];
+    let mut writer = join_holding(&w, "writer", &Permission::ALL).await;
+    let reader = join_holding(&w, "reader", &[Permission::ClaimsRead]).await;
+    let before = w.switch.shown(reader.app_id()).len();
+    writer
+        .write_claim(
+            crate::app::ClaimOp::attempt(claim, 0, attempt, 3600, None),
+            vec![],
+            crate::app::ObligationDeadline::NoDeadline,
+        )
+        .await
+        .unwrap();
+    // While the attempt is open, its entry is read in full by `claims.read`.
+    let open = w.switch.shown(reader.app_id());
+    assert_eq!(open[before]["type"], "chain", "{}", open[before]);
+    let condition = writer.claim_condition(&claim).await.unwrap();
+    writer
+        .write_claim(
+            crate::app::ClaimOp::done(
+                claim,
+                1,
+                attempt,
+                pubky_switch_core::claims::Basis::Owner,
+                None,
+            )
+            .unwrap(),
+            vec![condition],
+            crate::app::ObligationDeadline::NoDeadline,
+        )
+        .await
+        .unwrap();
+    let shown = w.switch.shown(reader.app_id());
+    let entries = &shown[before..];
+    assert_eq!(entries.len(), 2, "{entries:?}");
+    assert!(
+        entries.iter().all(|item| item["type"] == "stub"),
+        "{entries:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_scripted_feed_visibility_follows_a_listed_renewal() {
+    // Switch wire 3.8, 7.5: an item's visibility is judged with the certificate the app is
+    // checked against, a stored renewed one once the newest `identity.json` lists it. The
+    // renewal adds `lists.read`, so the app reads an `allow.put` in full from then on.
+    let w = World::new();
+    let app = w.join("wallet").await;
+    let me = app.app_id();
+    let old = app.cert().clone();
+    let renewed = crate::testing::issue_cert(
+        &w.alice,
+        &app_keys("wallet"),
+        &AppSpec::new(&["scope-a"])
+            .with_permissions(&[Permission::ListsRead, Permission::ConversationAdd]),
+        w.clock.now_ms() + 1000,
+    )
+    .unwrap();
+    w.switch
+        .signer_op(OpKind::CertPut {
+            target_app_id: me,
+            cert: renewed.signed().clone(),
+        })
+        .unwrap();
+    w.next_doc(|body| {
+        body.apps.retain(|a| a.app_id != me);
+        body.apps.push(ListedApp {
+            app_id: me,
+            cert: renewed.hash(),
+        });
+        body.renewed.push(RenewedCert {
+            app_id: me,
+            cert: old.hash(),
+            until: None,
+        });
+    });
+    let mut manager = join_holding(&w, "manager", &[Permission::ListsManage]).await;
+    let before = w.switch.seq();
+    manager.add_contact(&w.bob.public()).await.unwrap();
+    let seq = w
+        .switch
+        .shown(manager.app_id())
+        .into_iter()
+        .find(|item| item["seq"].as_u64().unwrap() > before && item["type"] == "stub")
+        .expect("the allow.put's item")["seq"]
+        .clone();
+    let item = w
+        .switch
+        .shown(me)
+        .into_iter()
+        .find(|item| item["seq"] == seq)
+        .unwrap();
+    assert_eq!(item["type"], "chain", "{item}");
+}
