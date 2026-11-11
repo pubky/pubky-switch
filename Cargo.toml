@@ -5,6 +5,7 @@ members = [
     "crates/pubky-switch-client",
     "crates/pubky-switch-signer",
     "crates/pubky-switch",
+    "crates/pubky-switch-harness",
 ]
 
 [workspace.package]

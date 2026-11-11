@@ -1712,6 +1712,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "pubky-switch-harness"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "pubky-switch",
+ "pubky-switch-client",
+ "pubky-switch-core",
+ "pubky-switch-signer",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tower",
+]
+
+[[package]]
 name = "pubky-switch-signer"
 version = "0.1.0"
 dependencies = [
