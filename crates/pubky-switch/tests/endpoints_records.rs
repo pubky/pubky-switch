@@ -553,3 +553,29 @@ async fn test_records_one_list_after_the_lock_per_account() {
     assert_eq!(first.status, 200);
     replay.db.drop_database().await.expect("drop");
 }
+
+#[tokio::test]
+async fn test_records_list_reads_past_one_read_of_the_snapshot() {
+    let Some(replay) = registered(Limits::default()).await else {
+        return;
+    };
+    // More records than one read of the snapshot takes (32), in batches of 8.
+    let mut all = Vec::new();
+    for id in 1..=5u8 {
+        let puts: Vec<OpKind> = (0..8u8)
+            .map(|i| {
+                let put = record_put(PAYMENTS, &[id, i], "pay", RecordVersion::NONE, b"{}");
+                all.push(b64(&put.key));
+                OpKind::RecordPut(put)
+            })
+            .collect();
+        post(&replay, "wallet", &batch("wallet", id, puts), AT).await;
+    }
+    all.sort();
+    assert_eq!(follow(&replay, "phone", "").await, (all.clone(), 1));
+    // A limit past one read ends the page there, with the next.
+    let page = body(&get_as(&replay, "phone", &list_path(&payments(), "&limit=35")).await);
+    assert_eq!(keys_of(&page), all[..35].to_vec());
+    assert_eq!(page["next"], json!(all[34]));
+    replay.db.drop_database().await.expect("drop");
+}
