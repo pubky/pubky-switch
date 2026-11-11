@@ -44,6 +44,8 @@ zeroize.workspace = true
 
 [dev-dependencies]
 blake3.workspace = true
+# Hand-overs sealed with fixed randomness, for the refusals the tests need.
+pubky-switch-core = { workspace = true, features = ["test-vectors"] }
 pubky-switch = { path = ".", features = ["test-util"] }
 tempfile.workspace = true
 tower.workspace = true

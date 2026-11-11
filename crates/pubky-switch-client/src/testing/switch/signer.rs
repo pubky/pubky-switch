@@ -553,6 +553,9 @@ impl Inner {
 /// A hand-over's `{ "envelopes": [b64], "sig": b64 }`, as the switch reads it without
 /// opening anything (Switch wire 3.12).
 fn read_handover(value: &Value) -> Option<pubky_switch_core::records::SignerHandover> {
+    // Unknown members are `400`, as at the service (Switch wire 7.4.17, 1.1).
+    pubky_switch_core::json::reject_unknown_members(value, &["envelopes", "sig"], "the hand-over")
+        .ok()?;
     let envelopes = value
         .get("envelopes")?
         .as_array()?
@@ -566,4 +569,16 @@ fn read_handover(value: &Value) -> Option<pubky_switch_core::records::SignerHand
     Some(pubky_switch_core::records::SignerHandover::from_parts(
         envelopes, sig,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_scripted_handover_refuses_unknown_members() {
+        let sig = pubky_switch_core::enc::b64(&[0u8; 64]);
+        assert!(read_handover(&json!({ "envelopes": [], "sig": sig })).is_some());
+        assert!(read_handover(&json!({ "envelopes": [], "sig": sig, "x": 1 })).is_none());
+    }
 }
