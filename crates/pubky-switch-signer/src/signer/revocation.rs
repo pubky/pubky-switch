@@ -163,9 +163,8 @@ impl Signer {
         self.refresh().await?;
         self.check_named()?;
         let failures = self.revoke_at_switch().await?;
-        self.ready().await?;
+        let (mut statuses, mut answered_at) = self.ready_at_switch().await?;
         let mut newest = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
-        let (mut statuses, mut answered_at) = self.switch_apps_at().await?;
         let found = self.removals(&newest, &statuses, answered_at);
         if !found.unconfirmed.is_empty() {
             let mut state = self.state.clone();
@@ -423,7 +422,7 @@ impl Signer {
         // read owes these deletions from its own records. A copy that can't be read postpones
         // them to the next run.
         match self.check_copies().await {
-            Ok(()) => {}
+            Ok(_) => {}
             Err(SignerError::Homeserver(_) | SignerError::Switch(_)) => return Ok(()),
             Err(error) => return Err(error),
         }
@@ -494,10 +493,9 @@ impl Signer {
     ///
     /// As [`Signer::resume`].
     pub async fn serve_full_bundles(&mut self) -> Result<Vec<[u8; 16]>> {
-        self.ready().await?;
-        let newest = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
         // Served is judged on the switch's signed time, not the device clock.
-        let (statuses, now) = self.switch_apps_at().await?;
+        let (statuses, now) = self.ready_at_switch().await?;
+        let newest = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
         let certs = self.held_certs()?;
         let current = newest.data_epoch();
         let protocols = self.env.protocols.clone();

@@ -27,6 +27,7 @@
 
 use std::sync::Arc;
 
+use pubky_switch_client::client::answers::{AppStatus, AppsAnswer};
 use pubky_switch_client::clock::Clock;
 use pubky_switch_client::store::StoreHandle;
 use pubky_switch_client::transport::Transport;
@@ -532,6 +533,24 @@ impl Signer {
     /// install named, no flow in progress, the copies checked, and the signing gate passed
     /// ([`gate::refusal`]).
     pub(crate) async fn ready(&mut self) -> Result<()> {
+        self.ready_and_read().await.map(drop)
+    }
+
+    /// [`Signer::ready`], and the switch's apps and the service time its answer is signed at,
+    /// from the `GET /apps` whose copy that check confirmed: one read for both, so the apps
+    /// a step goes by are those of the switch it found holding its mark. Read again only when
+    /// that check read no copy, or delivered since.
+    pub(crate) async fn ready_at_switch(&mut self) -> Result<(Vec<AppStatus>, u64)> {
+        match self.ready_and_read().await? {
+            Some(answer) => Ok((answer.apps, answer.server_time)),
+            None => self.switch_apps_at().await,
+        }
+    }
+
+    /// [`Signer::ready`], and the `GET /apps` answer its copy check read, while nothing was
+    /// delivered since: `None` before the first version, which no copy is checked against,
+    /// and after a closing owed was delivered.
+    pub(crate) async fn ready_and_read(&mut self) -> Result<Option<AppsAnswer>> {
         self.refresh().await?;
         // An erased account has no switch to read (Switch spec 12.7).
         if self.state.erased {
@@ -543,28 +562,31 @@ impl Signer {
         }
         // The copies are read first, so a take-over or records behind are found also while an
         // alarm holds signing back; then the signing gate decides.
-        self.check_copies().await?;
+        let read = self.check_copies().await?;
         if let Some(refused) = gate::refusal(&self.state) {
             return Err(refused);
         }
         if self.owes_closing()? {
             self.resume().await?;
+            // The delivery changed what the switch holds.
+            return Ok(None);
         }
-        Ok(())
+        Ok(read)
     }
 
     /// Before a new version is signed, check every copy that could show this install's
     /// records aren't the newest: the switch's copy is its mark, the signer backup names
     /// neither another install that took over nor a newer version of this install's own, and
     /// the Homeserver's `identity.json` is neither newer nor another body at the mark (Switch
-    /// spec 4.3, Switch wire 3.13). So nothing stale is signed, backed up or sent.
-    async fn check_copies(&mut self) -> Result<()> {
+    /// spec 4.3, Switch wire 3.13). So nothing stale is signed, backed up or sent. Returns
+    /// the switch's answer that showed its copy, `None` before the first version.
+    async fn check_copies(&mut self) -> Result<Option<AppsAnswer>> {
         let Some(newest) = self.state.newest_doc()? else {
-            return Ok(());
+            return Ok(None);
         };
-        self.ensure_signer().await?;
+        let read = self.ensure_signer().await?;
         self.judge_homeserver(&newest).await?;
-        Ok(())
+        Ok(Some(read))
     }
 
     /// Stop at a backup that shows another install took over, or that holds a version of
@@ -941,10 +963,11 @@ impl Signer {
 
     /// Check that the switch still holds the newest version this signer delivered (`GET
     /// /apps` `identity`, Switch wire 7.4.12). Any other copy stops the flow, as
-    /// [`Signer::judge_copy`] says.
-    async fn switch_at_mark(&mut self) -> Result<()> {
-        let held = self.service_client()?.apps().await?.identity;
-        self.confirm_copy(held.as_ref()).await
+    /// [`Signer::judge_copy`] says. Returns the answer.
+    async fn switch_at_mark(&mut self) -> Result<AppsAnswer> {
+        let answer = self.service_client()?.apps().await?;
+        self.confirm_copy(answer.identity.as_ref()).await?;
+        Ok(answer)
     }
 
     /// Judge the switch's copy of `identity.json`, `held` as `GET /apps` gave it, against the
@@ -984,11 +1007,12 @@ impl Signer {
     /// Check that this install still signs before a write at the switch: it is named, the
     /// switch's copy is its mark, and the backup on the Homeserver names neither another
     /// install that took over nor a newer version of this install's own (Switch spec 4.3,
-    /// 12.8; Switch wire 3.13).
-    pub(crate) async fn ensure_signer(&mut self) -> Result<()> {
+    /// 12.8; Switch wire 3.13). Returns the switch's answer that showed its copy.
+    pub(crate) async fn ensure_signer(&mut self) -> Result<AppsAnswer> {
         self.check_named()?;
-        self.switch_at_mark().await?;
-        self.check_backup_copy().await
+        let read = self.switch_at_mark().await?;
+        self.check_backup_copy().await?;
+        Ok(read)
     }
 
     /// Read the signer backup on the Homeserver and stop at one that shows another install

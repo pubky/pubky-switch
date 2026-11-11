@@ -195,7 +195,7 @@ Two exceptions:
 
 ### 4.5 What runs at each start
 
-`Signer::run_due()` runs these steps in order. Each is a no-op when nothing is owed.
+`Signer::run_due()` runs these steps in order. Each is a no-op when nothing is owed. A step that signs checks first that this install still signs, with its own read of the switch, and goes by the apps of that same `GET /apps` answer. It reads the switch again only after a delivery the check made, as of an owed closing. A step with nothing to do from the records alone, such as closing renewals with none open, reads nothing.
 
 1. Check that this install is the one named (`identity` in `GET /apps`, and the backup). If not, set `managed_by` and stop.
 2. Finish the flow in progress.

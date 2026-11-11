@@ -1752,3 +1752,152 @@ async fn test_renewal_each_batch_checked_against_another_install() {
     assert_eq!(error, SignerError::NotNamed { install: [9; 16] });
     assert_eq!(ops(&world), before + 1, "the second batch isn't sent");
 }
+
+/// How many requests `world`'s switch got for `method` `path` (a suffix) so far.
+fn sent(world: &World, method: &str, path: &str) -> usize {
+    world
+        .transport
+        .requests()
+        .iter()
+        .filter(|r| r.method == method && r.path_and_query.ends_with(path))
+        .count()
+}
+
+#[tokio::test]
+async fn test_run_due_with_nothing_due_reads_the_switch_once_a_step() {
+    // Nothing due: each step that checks this install still signs reads `GET /apps` once,
+    // and takes the apps it goes by from that same answer; closing renewals reads nothing
+    // with none open (design note, section 4.5).
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let app = App::new(&["notes"], None, [9; 32]);
+    world.approve(&mut signer, &app).await;
+    let before = sent(&world, "GET", "/apps");
+    signer.run_due().await.unwrap();
+    // Removals, full bundles, renewals past half their lifetime, publication.
+    assert_eq!(sent(&world, "GET", "/apps") - before, 4);
+}
+
+#[tokio::test]
+async fn test_run_due_open_renewal_reads_the_switch_for_it() {
+    // A cooperative renewal open: closing it reads the switch, once, and closes it at the
+    // time the switch took the app's record (Switch wire 3.8 step 4).
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let app = App::new(&["notes"], None, [9; 32]);
+    world.approve(&mut signer, &app).await;
+    let id = app.keys.app_id_bytes();
+    let change = CertChange {
+        scopes: None,
+        expires_at: Some(START_MS + 400 * DAY_MS),
+    };
+    signer.renew(id, change).await.unwrap();
+    world.clock.advance_ms(3_600_000);
+    let new = world.switch.app(&id).renewed.unwrap();
+    let record_at = START_MS + 3_600_000;
+    let record =
+        AppRecord::sign(&app.keys, AppRecordBody::new(&new, Vec::new(), record_at)).unwrap();
+    world
+        .switch
+        .app_op(
+            &app.keys,
+            OpKind::AppPut {
+                record: record.signed().clone(),
+            },
+        )
+        .unwrap();
+    let before = sent(&world, "GET", "/apps");
+    signer.run_due().await.unwrap();
+    assert_eq!(
+        renewals(&signer.identity_doc().unwrap().unwrap(), &id),
+        [Some(record_at + CLOCK_TOLERANCE_MS)]
+    );
+    // The four of a run with nothing due, the closing's read, and its delivery's check
+    // before it publishes.
+    assert_eq!(sent(&world, "GET", "/apps") - before, 6);
+}
+
+#[tokio::test]
+async fn test_approval_reads_the_switch_once_before_its_delivery() {
+    // The approval's copy check and its clock check are one read; its publication checks
+    // again after the delivery (Switch spec 4.3).
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let before = world.transport.requests().len();
+    world
+        .approve(&mut signer, &App::new(&["notes"], None, [9; 32]))
+        .await;
+    let sent: Vec<_> = world.transport.requests()[before..]
+        .iter()
+        .map(|r| {
+            (
+                r.method.clone(),
+                r.path_and_query.ends_with("/apps"),
+                r.path_and_query.ends_with("/identity"),
+            )
+        })
+        .collect();
+    let delivery = sent
+        .iter()
+        .position(|(method, _, identity)| method == "PUT" && *identity)
+        .expect("a delivery");
+    let reads = |requests: &[(String, bool, bool)]| {
+        requests
+            .iter()
+            .filter(|(method, apps, _)| method == "GET" && *apps)
+            .count()
+    };
+    assert_eq!(reads(&sent[..delivery]), 1);
+    assert_eq!(reads(&sent[delivery..]), 1);
+}
+
+#[tokio::test]
+async fn test_run_due_step_reads_the_switch_again_after_delivering_an_owed_closing() {
+    // A crash leaves a reduction's closing owed with no flow in progress. The next step's
+    // check delivers it first; the apps the step then goes by are read after that delivery,
+    // not taken from the read before it (Switch wire 3.8 "A closing delivery owed").
+    let mut found = false;
+    for n in 1..=12 {
+        let world = World::new();
+        let memory = Arc::new(MemoryStore::new());
+        let mut signer = Signer::create(world.env(memory.clone()), world.keyring(), SWITCH_ORIGIN)
+            .await
+            .unwrap();
+        signer.resume().await.unwrap();
+        let app = App::new(&["notes", "notes_tags"], None, [9; 32]);
+        world.approve(&mut signer, &app).await;
+        let id = app.keys.app_id_bytes();
+        world.clock.advance_ms(DAY_MS);
+        let faulty: Arc<dyn StateStore> =
+            Arc::new(FaultStore::new(memory.clone(), Fault::StopAfter(n)));
+        let mut signer = Signer::open(world.env(faulty), world.keyring())
+            .await
+            .unwrap();
+        let _ = signer.renew(id, reduce(&["notes"])).await;
+        let mut restarted = Signer::open(world.env(memory), world.keyring())
+            .await
+            .unwrap();
+        let open = |doc: Option<IdentityDoc>| doc.is_some_and(|d| renewals(&d, &id) == [None]);
+        if !open(world.switch.identity_doc()) {
+            continue;
+        }
+        let before = world.transport.requests().len();
+        // Only where the step itself delivers the closing.
+        if restarted.serve_full_bundles().await.is_err() || open(world.switch.identity_doc()) {
+            continue;
+        }
+        found = true;
+        let requests = world.transport.requests()[before..].to_vec();
+        let closing = requests
+            .iter()
+            .rposition(|r| r.method == "PUT" && r.path_and_query.ends_with("/identity"))
+            .expect("the closing's delivery");
+        let reads = requests[closing..]
+            .iter()
+            .filter(|r| r.method == "GET" && r.path_and_query.ends_with("/apps"))
+            .count();
+        // The publication's check, then the step's own read.
+        assert_eq!(reads, 2, "StopAfter({n})");
+    }
+    assert!(found, "a crash that leaves the closing owed");
+}
