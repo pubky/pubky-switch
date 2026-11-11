@@ -560,6 +560,13 @@ async fn test_records_lists_of_an_account_wait_their_turn() {
                     );
                     tokio::task::yield_now().await;
                 }
+                // The phone holds its one place, whichever call it makes: its second list and
+                // its GET /allow are refused at once, so no app takes two places by mixing
+                // the calls.
+                let again = get_as(&replay, "phone", &list).await;
+                assert_eq!(code_of(&again), (503, json!("unavailable")));
+                let allow = get_as(&replay, "phone", "allow").await;
+                assert_eq!(code_of(&allow), (503, json!("unavailable")));
                 // A read by key, under the lock, takes no turn and goes on.
                 let by_key = get_as(&replay, "wallet", &format!("records/{}", b64(&key))).await;
                 assert_eq!(by_key.status, 200);

@@ -453,11 +453,18 @@ impl Store {
     /// their turn in order, before they take a reader and holding no connection, at most
     /// `lock_timeout_ms` ([`StoreError::LockTimeout`] after it, and at once past 8
     /// waiting). So the readers every account shares can't all be held by one account's
-    /// reads. The caller takes a turn only for a request that has verified as one the read
-    /// serves, so no other request ever waits in, or holds, an account's queue.
-    pub async fn begin_reading(&self, id: &str) -> Result<Option<AccountTxn>, StoreError> {
+    /// reads. The read is `app`'s, an own app whose request signature verified with the key
+    /// the account holds for it; whether it may make the read is judged under the lock.
+    /// Each app holds at most one place in its account's queue: a second read of the same
+    /// app while its first holds or waits for one is refused at once, so no one app, however
+    /// many requests it sends, can keep the other apps' reads waiting past one place.
+    pub async fn begin_reading(
+        &self,
+        id: &str,
+        app: [u8; 16],
+    ) -> Result<Option<AccountTxn>, StoreError> {
         let wait = Duration::from_millis(self.lock_timeout_ms);
-        let turn = snapshot::ReadTurn::wait(&self.reading, id, wait).await?;
+        let turn = snapshot::ReadTurn::wait(&self.reading, id, app, wait).await?;
         let reader = self.readers.begin().await.map_err(StoreError::from_db)?;
         let Some(mut txn) = self.begin(id).await? else {
             return Ok(None);

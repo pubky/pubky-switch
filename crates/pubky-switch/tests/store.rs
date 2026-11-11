@@ -1013,7 +1013,7 @@ async fn readable(
     let held: Vec<String> = held.iter().map(|s| (*s).to_string()).collect();
     let mut txn = fx
         .store()
-        .begin_reading(ID_A)
+        .begin_reading(ID_A, [1; 16])
         .await
         .expect("begin")
         .expect("account");

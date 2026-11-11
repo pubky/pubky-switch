@@ -450,10 +450,15 @@ impl Service {
         });
         // The reads that run after the lock on its snapshot take their account's turn and
         // their reader first, so the lock is never held waiting for one. Only an own app's
-        // verified request takes them: the signer's is refused under the lock without a
-        // read, and an app of another identity's was refused above.
-        let begun = if matches!(call, Call::GetAllow | Call::ListRecords) && verified.is_some() {
-            self.store.begin_reading(&account).await
+        // request whose signature verified takes them, one place per app: the signer's is
+        // refused under the lock without a read, and an app of another identity's was
+        // refused above. Whether the app is current and may read is judged under the lock.
+        let reading_app = verified
+            .as_ref()
+            .filter(|_| matches!(call, Call::GetAllow | Call::ListRecords))
+            .map(batch::VerifiedApp::app_id);
+        let begun = if let Some(app) = reading_app {
+            self.store.begin_reading(&account, app).await
         } else {
             self.store.begin(&account).await
         };
