@@ -27,6 +27,7 @@ mod feed;
 mod identity;
 mod inbox;
 mod peers;
+mod records;
 pub mod rules;
 
 pub use enroll::announced_limits;
@@ -129,6 +130,8 @@ enum Deferred {
     Allow(allow::AllowRead),
     /// `GET /directory`'s apps, from the snapshot of the state under the lock.
     Directory(Box<directory::DirectoryRead>),
+    /// A `GET /records` page, from the snapshot of the state under the lock.
+    Records(Box<records::RecordsRead>),
 }
 
 impl Answer {
@@ -402,6 +405,8 @@ impl Service {
             | Call::GetKeys(_)
             | Call::RequestKeys(_)
             | Call::Leave(_)
+            | Call::GetRecord(_)
+            | Call::ListRecords
             | Call::GetAllow => {
                 match self.authenticate_caller(&account, &request, base_ms, base_ms.max(stamped_ms))
                 {
@@ -447,7 +452,7 @@ impl Service {
         });
         // The reads that run after the lock on its snapshot take their reader first, so the
         // lock is never held waiting for one.
-        let begun = if matches!(call, Call::GetAllow | Call::Directory) {
+        let begun = if matches!(call, Call::GetAllow | Call::Directory | Call::ListRecords) {
             self.store.begin_reading(&account).await
         } else {
             self.store.begin(&account).await
@@ -762,6 +767,10 @@ impl Service {
                         Ok(body) => answer.body = body,
                         Err(error) => answer = Answer::error(&error).with_head(fallback_head),
                     },
+                    Some(Deferred::Records(read)) => match Self::records_body(*read).await {
+                        Ok(body) => answer.body = body,
+                        Err(error) => answer = Answer::error(&error).with_head(fallback_head),
+                    },
                     Some(Deferred::Directory(read)) => match Self::directory_body(*read).await {
                         Ok(body) => answer.body = body,
                         // An app of another identity's refusal carries no head.
@@ -944,6 +953,26 @@ impl Service {
             Call::GetAllow => {
                 return self
                     .get_allow(txn, signer, writer.as_ref(), time_ms)
+                    .await
+                    .map(|answer| (answer, serving))
+                    .map_err(|error| Refused::with_head(error, serving));
+            }
+            Call::GetRecord(key) => {
+                return self
+                    .get_record(txn, signer, writer.as_ref(), key)
+                    .await
+                    .map(|answer| (answer, serving))
+                    .map_err(|error| Refused::with_head(error, serving));
+            }
+            Call::ListRecords => {
+                let query = request.route.query.as_ref().map_err(|_| {
+                    Refused::with_head(
+                        ApiError::bad_request("7.1: the query doesn't decode"),
+                        serving,
+                    )
+                })?;
+                return self
+                    .list_records(txn, signer, writer.as_ref(), query)
                     .await
                     .map(|answer| (answer, serving))
                     .map_err(|error| Refused::with_head(error, serving));

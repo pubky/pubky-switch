@@ -29,6 +29,7 @@ mod identity;
 mod inbox;
 mod ops;
 mod peers;
+mod records;
 mod snapshot;
 #[cfg(any(test, feature = "test-util"))]
 pub mod testing;

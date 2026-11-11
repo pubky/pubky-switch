@@ -57,7 +57,7 @@ The API listener.
 
 A request's network source, which the failed-authentication and public-read limits count by, is an IPv4 address or an IPv6 /64 (Switch wire 7.2). Behind a trusted proxy it is the nearest address in the header that isn't a trusted proxy; otherwise it is the connection's peer.
 
-Served so far: `POST /v1/enroll`; `PUT /v1/{id}/identity` and the public `GET /v1/{id}/identity`; `POST /v1/{id}/ops`; `GET /v1/{id}/feed`; `GET /v1/{id}/claims/{key}`; `GET /v1/{id}/apps` and `POST /v1/{id}/apps/{app_id}/revoke`; `PUT /v1/{id}/peers`; `POST /v1/{id}/inbox`; `GET /v1/{id}/directory`; `GET` and `POST /v1/{id}/apps/{app_id}/keys`; `POST /v1/{id}/apps/{app_id}/leave`; `GET /v1/{id}/allow`. Every other call is answered `503 unavailable` until its endpoint lands. `GET /v1/{id}/apps` answers `recovery: null` until recovery is served.
+Served so far: `POST /v1/enroll`; `PUT /v1/{id}/identity` and the public `GET /v1/{id}/identity`; `POST /v1/{id}/ops`; `GET /v1/{id}/feed`; `GET /v1/{id}/claims/{key}`; `GET /v1/{id}/apps` and `POST /v1/{id}/apps/{app_id}/revoke`; `PUT /v1/{id}/peers`; `POST /v1/{id}/inbox`; `GET /v1/{id}/directory`; `GET` and `POST /v1/{id}/apps/{app_id}/keys`; `POST /v1/{id}/apps/{app_id}/leave`; `GET /v1/{id}/allow`; `GET /v1/{id}/records/{key}` and `GET /v1/{id}/records`. Every other call is answered `503 unavailable` until its endpoint lands. `GET /v1/{id}/apps` answers `recovery: null` until recovery is served.
 
 ### `[log]`
 
@@ -155,7 +155,7 @@ PostgreSQL.
 | `acquire_timeout_ms` | `5000` | how long a request waits for a free connection |
 | `lock_timeout_ms` | `10000` | how long a request waits for its account's lock before it gives up with `503 unavailable` |
 | `migrate_on_start` | `true` | apply pending schema migrations at start; safe with several instances |
-| `snapshot_readers` | `4` | most reads at once that run after the account's lock on a snapshot of the state under it (`GET /allow`, `GET /directory`), each on a connection of its own on top of `max_connections`; a request waits for one before it takes the lock |
+| `snapshot_readers` | `4` | most reads at once that run after the account's lock on a snapshot of the state under it (`GET /allow`, `GET /directory`, a `GET /records` page), each on a connection of its own on top of `max_connections`; a request waits for one before it takes the lock |
 | `connect_retry_ms` | `30000` | how long the service keeps trying to reach the database at start, while it refuses connections or is still starting up, before it exits. It covers the request pool only: the change listener connects once the pool is up, without this retry, and a failure there stops the service |
 
 **Migrations on a large database.** Each migration runs in one transaction, and some take exclusive locks for their duration. `0008_feed` backfills every operation's proof into `chain_items` and builds two indexes without `CONCURRENTLY`, so `chain_items`, `shared_records` and `claim_entries` take no writes until it finishes, and since its `ALTER TABLE` holds an exclusive lock on `chain_items` until it commits, feed reads wait for it too. It is sized for a small database. On a large one, run it in a maintenance window, with `migrate_on_start` off on every instance but one. `0011_inbox` adds a `CHECK` constraint to `list_entries`, which scans the whole table under an exclusive lock while the migration runs, so list reads and writes (and appends, whose admission reads the lists) wait for it; on a large `list_entries`, the same maintenance window applies.
