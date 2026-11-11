@@ -29,6 +29,7 @@ mod feed;
 mod handover;
 mod identity;
 mod inbox;
+mod keyed;
 mod peers;
 mod records;
 pub mod rules;
@@ -37,13 +38,10 @@ pub use enroll::announced_limits;
 
 use std::sync::Arc;
 
-use axum::http::{HeaderName, HeaderValue};
 use pubky_switch_core::{
     chain::SignedHead,
-    enc::b64,
     http::{self as wire_http, RequestTarget, header},
     records::{AppCert, IdentityDoc},
-    time::rfc3339,
 };
 
 use crate::{
@@ -54,13 +52,14 @@ use crate::{
         route::Call,
         source::NetworkSource,
     },
-    keys::{KeyId, KeyStore, MarkCheck, ServiceSigner, sign_head},
+    keys::{KeyId, KeyStore, MarkCheck, ServiceSigner},
     limits::Limits,
     ratelimit::{FailedAuthentications, KeyedMinutes, MinuteWindows},
     store::{AccountTxn, Store, StoreError},
     time::TrustedTime,
 };
 
+use self::keyed::{NotKeyed, Proof};
 use self::rules::{Caller, Claimed, decode_claim, names_this_service, staged_gate};
 
 /// How many sweeps of owed keys a retried erasure of an account gone may run each minute, for
@@ -196,49 +195,6 @@ impl Refused {
     }
 }
 
-/// Sign `answer` (Switch wire 7.1): the response signature over its status, the request
-/// signature, `Switch-Server-Time` and the body.
-fn sign_answer(
-    signer: &ServiceSigner,
-    request_signature: Option<&[u8; 64]>,
-    time_ms: u64,
-    answer: Answer,
-) -> SwitchResponse {
-    let server_time = rfc3339(time_ms);
-    let signature = wire_http::sign_response(
-        signer,
-        answer.status,
-        request_signature,
-        &server_time,
-        &answer.body,
-    );
-    let mut headers = Vec::new();
-    let mut put = |name: &'static str, value: String| {
-        if let Ok(value) = HeaderValue::try_from(value) {
-            headers.push((HeaderName::from_static(name), value));
-        }
-    };
-    put(header::SERVICE_SIGNATURE, b64(&signature));
-    put(header::SERVER_TIME, server_time);
-    if let Some(head) = &answer.head {
-        put(header::HEAD, head.to_header());
-    }
-    if let Some(seconds) = answer.retry_after {
-        put(header::RETRY_AFTER, seconds.to_string());
-    }
-    if answer.cacheable {
-        put("cache-control", "public, max-age=60".into());
-    }
-    if answer.no_store {
-        put("cache-control", "no-store".into());
-    }
-    SwitchResponse {
-        status: answer.status,
-        headers,
-        body: answer.body,
-    }
-}
-
 /// An answer with no signature, when no key can sign: clients treat it as unauthenticated.
 fn unsigned(error: &ApiError) -> SwitchResponse {
     SwitchResponse {
@@ -336,22 +292,6 @@ impl Service {
         &self.failed_auth
     }
 
-    /// An answer signed with the operator key, at the time base (Switch wire 7.1).
-    async fn operator_answer(
-        &self,
-        request_signature: Option<&[u8; 64]>,
-        base_ms: u64,
-        error: &ApiError,
-    ) -> SwitchResponse {
-        match self.keys.operator().await {
-            Ok(signer) => sign_answer(&signer, request_signature, base_ms, Answer::error(error)),
-            Err(failure) => {
-                tracing::error!(%failure, "the operator key");
-                unsigned(error)
-            }
-        }
-    }
-
     async fn serve(&self, request: SwitchRequest) -> SwitchResponse {
         // One reading gives both the time base and whether it is trusted, so nothing that
         // waits for trusted time runs on a base read without it.
@@ -412,7 +352,7 @@ impl Service {
         let stamped_ms = found.stamped_time_ms;
         // The key the account had at the lookup, which an answer after a wait checks again.
         let looked_up_key = found.service_key.clone();
-        let (account_ref, looked_up_ref) = (&account, &looked_up_key);
+        let (account_ref, looked_up_ref, request_ref) = (&account, &looked_up_key, &request);
         let refused_early = |error: ApiError| {
             let signature = if *call == Call::GetIdentity {
                 None
@@ -432,7 +372,7 @@ impl Service {
                         .operator_answer(signature.as_ref(), base_ms, &gone)
                         .await;
                 }
-                self.early_answer(&found, signature.as_ref(), base_ms, &error)
+                self.early_answer(&found, request_ref, signature.as_ref(), base_ms, &error)
                     .await
             }
         };
@@ -595,25 +535,47 @@ impl Service {
     }
 
     /// An answer before the account's lock: signed with its service key, at the service time
-    /// it last committed, which no answer it shows later is behind (Switch wire 7.3 step 3).
+    /// it last committed, which no answer it shows later is behind (Switch wire 7.3 step 3),
+    /// while the account still names that key; otherwise the operator's answer, for the
+    /// identity's signer when the request's signature alone says so (7.4.16).
     async fn early_answer(
         &self,
         found: &crate::store::FoundAccount,
+        request: &SwitchRequest,
         request_signature: Option<&[u8; 64]>,
         base_ms: u64,
         error: &ApiError,
     ) -> SwitchResponse {
-        match self.keys.signer(&found.service_key).await {
-            Ok(signer) => sign_answer(
-                &signer,
-                request_signature,
-                found.stamped_time_ms,
-                Answer::error(error),
-            ),
+        let signer = match self.keys.signer(&found.service_key).await {
+            Ok(signer) => signer,
             Err(failure) => {
                 tracing::error!(%failure, "an account's service key");
-                self.operator_answer(request_signature, base_ms, error)
-                    .await
+                return self
+                    .operator_answer(request_signature, base_ms, error)
+                    .await;
+            }
+        };
+        let account = request.route.account.as_deref().unwrap_or_default();
+        let proof = Proof::checked(account, &found.service_key);
+        let answer = Answer::error(error);
+        match self
+            .try_sign_keyed(proof, &signer, request_signature, |_| {
+                (answer, found.stamped_time_ms)
+            })
+            .await
+        {
+            Ok(signed) => signed,
+            Err(not_keyed) => {
+                let by_signer = not_keyed == NotKeyed::Gone
+                    && self.signed_by_identity(account, request, base_ms).is_some();
+                self.not_keyed_answer(
+                    Some(account),
+                    not_keyed,
+                    by_signer,
+                    request_signature,
+                    base_ms,
+                )
+                .await
             }
         }
     }
@@ -758,6 +720,7 @@ impl Service {
         delivered: Option<&Result<peers::Delivered, ApiError>>,
     ) -> SwitchResponse {
         let signature = request_signature.as_ref();
+        let by_signer = caller.is_some_and(|c| c.caller == Caller::Signer);
         // The time the account last committed, for an answer whose commit fails.
         let committed_ms = txn.head().stamped_time_ms;
         // Step 3: the identity's service time, which never goes back.
@@ -782,14 +745,34 @@ impl Service {
         {
             let _ = store_error(&error);
             let error = ApiError::unavailable("7.6: a temporary failure");
-            return sign_answer(&signer, signature, committed_ms, Answer::error(&error));
+            return self
+                .sign_after_failure(
+                    txn,
+                    &signer,
+                    signature,
+                    committed_ms,
+                    Answer::error(&error),
+                    base_ms,
+                    by_signer,
+                )
+                .await;
         }
         // A read after the lock takes this transaction's snapshot now, outside the endpoint's
         // savepoint, which can't export one.
         if let Err(failure) = txn.prepare_snapshot().await {
             tracing::error!(%failure, "a snapshot for a read after the lock");
             let error = ApiError::unavailable("7.6: a temporary failure");
-            return sign_answer(&signer, signature, committed_ms, Answer::error(&error));
+            return self
+                .sign_after_failure(
+                    txn,
+                    &signer,
+                    signature,
+                    committed_ms,
+                    Answer::error(&error),
+                    base_ms,
+                    by_signer,
+                )
+                .await;
         }
         // What the endpoint writes is undone if it is refused, whatever step refuses it: a
         // refusal commits the stamped time and nothing else, so no later request can build
@@ -799,7 +782,17 @@ impl Service {
             Err(error) => {
                 let _ = store_error(&error);
                 let error = ApiError::unavailable("7.6: a temporary failure");
-                return sign_answer(&signer, signature, committed_ms, Answer::error(&error));
+                return self
+                    .sign_after_failure(
+                        txn,
+                        &signer,
+                        signature,
+                        committed_ms,
+                        Answer::error(&error),
+                        base_ms,
+                        by_signer,
+                    )
+                    .await;
             }
         };
         let (answer, marked) = match self
@@ -818,7 +811,17 @@ impl Service {
                     // Dropped uncommitted: nothing of the request stays, the stamp included.
                     tracing::error!(%failure, "rolling back a refused request");
                     let error = ApiError::unavailable("7.6: a temporary failure");
-                    return sign_answer(&signer, signature, committed_ms, Answer::error(&error));
+                    return self
+                        .sign_after_failure(
+                            txn,
+                            &signer,
+                            signature,
+                            committed_ms,
+                            Answer::error(&error),
+                            base_ms,
+                            by_signer,
+                        )
+                        .await;
                 }
                 // Every 401 counts against the network source, whatever the step: a request
                 // signature, an operation's, a first call's record (Switch wire 7.2, 9.4).
@@ -858,7 +861,6 @@ impl Service {
         }
         let txn_account = txn.head().id.clone();
         let txn_key = txn.head().service_key.clone();
-        let by_signer = caller.is_some_and(|c| c.caller == Caller::Signer);
         let fallback_head = if answer.deferred.is_some() {
             self.head(&txn, &signer).await
         } else {
@@ -879,59 +881,49 @@ impl Service {
                 tracing::error!(%failure, "commit");
             })
         };
+        // Every answer from here on is signed once the lock is gone: only inside a keyed
+        // section, while the account still names the key the request loaded (keyed.rs), so
+        // none is signed with it after an erasure or a change of the key (7.4.16).
+        let proof = Proof::checked(&txn_account, &txn_key);
         match committed {
             Ok(()) => {
                 let mut answer = answer;
                 match answer.deferred.take() {
                     Some(Deferred::Claim(read)) => match self.claim_body(&read).await {
                         Ok(body) => answer.body = body,
-                        Err(error) => {
-                            // Erased, or erased and enrolled again, once the lock was gone:
-                            // never signed with the erased account's key (7.4.16).
-                            if let Some(error) = self
-                                .no_longer_keyed(&txn_account, &txn_key, by_signer)
-                                .await
-                            {
-                                return self.operator_answer(signature, base_ms, &error).await;
-                            }
-                            answer = Answer::error(&error).with_head(fallback_head);
-                        }
+                        Err(error) => answer = Answer::error(&error).with_head(fallback_head),
                     },
-                    Some(Deferred::Allow(read)) => {
-                        let read = Self::allow_body(read).await;
-                        // Signed once the lock is gone: only while the account still names the
-                        // key, as every such answer (7.4.16).
-                        if let Some(error) = self
-                            .no_longer_keyed(&txn_account, &txn_key, by_signer)
-                            .await
-                        {
-                            return self.operator_answer(signature, base_ms, &error).await;
-                        }
-                        match read {
-                            Ok(body) => answer.body = body,
-                            Err(error) => answer = Answer::error(&error).with_head(fallback_head),
-                        }
-                    }
-                    Some(Deferred::Records(read)) => {
-                        let read = Self::records_body(*read).await;
-                        // Signed once the lock is gone: only while the account still names the
-                        // key, as every such answer (7.4.16). A page read from a snapshot taken
-                        // before an erasure committed still reads its rows, so this runs on a
-                        // page read as well as on a failure.
-                        if let Some(error) = self
-                            .no_longer_keyed(&txn_account, &txn_key, by_signer)
-                            .await
-                        {
-                            return self.operator_answer(signature, base_ms, &error).await;
-                        }
-                        match read {
-                            Ok(body) => answer.body = body,
-                            Err(error) => answer = Answer::error(&error).with_head(fallback_head),
-                        }
-                    }
+                    Some(Deferred::Allow(read)) => match Self::allow_body(read).await {
+                        Ok(body) => answer.body = body,
+                        Err(error) => answer = Answer::error(&error).with_head(fallback_head),
+                    },
+                    // A page read from a snapshot taken before an erasure committed still reads
+                    // its rows: its proof, not the read, keeps it from going out.
+                    Some(Deferred::Records(read)) => match Self::records_body(*read).await {
+                        Ok(body) => answer.body = body,
+                        Err(error) => answer = Answer::error(&error).with_head(fallback_head),
+                    },
                     Some(Deferred::Feed(read)) => {
                         return match self.feed_page(&read, &signer).await {
-                            Ok((page, at)) => sign_answer(&signer, signature, at, page),
+                            // The page's head is signed with its answer, inside the proof.
+                            Ok(page) => match self
+                                .try_sign_keyed(proof, &signer, signature, |signing| {
+                                    page.answer(signing)
+                                })
+                                .await
+                            {
+                                Ok(signed) => signed,
+                                Err(not_keyed) => {
+                                    self.not_keyed_answer(
+                                        Some(&txn_account),
+                                        not_keyed,
+                                        by_signer,
+                                        signature,
+                                        base_ms,
+                                    )
+                                    .await
+                                }
+                            },
                             // Erased while the read waited: as an unknown account (step 2).
                             Err(feed::FeedStop::Gone) => {
                                 let error = self.no_such_account(&txn_account, by_signer).await;
@@ -947,45 +939,42 @@ impl Service {
                                 if is_failed_authentication(refusal.error.code) {
                                     self.record_failure(request, txn_account.clone());
                                 }
-                                // Signed once the lock is gone: only while the account still
-                                // names the key, as every such answer (7.4.16).
-                                if let Some(error) = self
-                                    .no_longer_keyed(&txn_account, &txn_key, by_signer)
-                                    .await
-                                {
-                                    return self.operator_answer(signature, base_ms, &error).await;
-                                }
                                 let head = if refusal.head { fallback_head } else { None };
-                                sign_answer(
+                                self.sign_keyed(
+                                    proof,
                                     &signer,
                                     signature,
                                     refusal.time_ms,
                                     Answer::error(&refusal.error).with_head(head),
+                                    base_ms,
+                                    by_signer,
                                 )
+                                .await
                             }
                         };
                     }
                     // An erasure was answered before the commit, above.
                     Some(Deferred::Erase) | None => {}
                 }
-                sign_answer(&signer, signature, time_ms, answer)
+                self.sign_keyed(
+                    proof, &signer, signature, time_ms, answer, base_ms, by_signer,
+                )
+                .await
             }
             // Nothing committed, the stamp included, or committed with the key's mark left
-            // behind: answer at the time last committed. A mark that didn't move because an
-            // erasure deleted the key once the lock was gone is never answered with it.
+            // behind: answer at the time last committed, under the same proof, so a mark that
+            // didn't move because an erasure deleted the key is never answered with it.
             Err(()) => {
-                if let Some(error) = self
-                    .no_longer_keyed(&txn_account, &txn_key, by_signer)
-                    .await
-                {
-                    return self.operator_answer(signature, base_ms, &error).await;
-                }
-                sign_answer(
+                self.sign_keyed(
+                    proof,
                     &signer,
                     signature,
                     committed_ms,
                     Answer::error(&ApiError::unavailable("7.6: a temporary failure")),
+                    base_ms,
+                    by_signer,
                 )
+                .await
             }
         }
     }
@@ -1604,14 +1593,6 @@ impl Service {
             (account, claimed_identity, claimed_app),
             base_ms,
         );
-    }
-
-    /// Sign the head of the account's chain as it will be committed, for an answer to the
-    /// signer or an own app; `None` if the key's mark refuses it.
-    async fn head(&self, txn: &AccountTxn, signer: &ServiceSigner) -> Option<SignedHead> {
-        let head = txn.head();
-        let mark = self.keys.mark(&head.service_key).await.ok()?;
-        sign_head(signer, mark.as_ref(), &head.identity_key, &head.chain_tip()).ok()
     }
 }
 

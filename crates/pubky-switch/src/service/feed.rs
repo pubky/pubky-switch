@@ -8,7 +8,7 @@
 use std::{collections::BTreeMap, future::Future, time::Duration};
 
 use pubky_switch_core::{
-    chain::{ChainEnvelope, ChainTip, ItemType, ServiceTransition, SignedHead, ZERO_HASH},
+    chain::{ChainEnvelope, ChainTip, ItemType, ServiceTransition, ZERO_HASH},
     ops::{MAX_BATCH_ENTRIES, OpKind, Position, SignedOp},
     records::{AppCert, IdentityDoc},
     scopes::Permission,
@@ -18,11 +18,12 @@ use serde_json::Value;
 use super::{
     Answer, Service,
     batch::{Stop, VerifiedApp, check_own_app},
+    keyed::Signing,
 };
 use crate::{
     changes::ChangeHub,
     http::error::{ApiError, ErrorCode},
-    keys::{KeyId, KeyStoreError, Mark, ServiceSigner, sign_head},
+    keys::{KeyId, KeyStoreError, Mark, ServiceSigner, check_mark},
     store::{CurrentDocs, FeedRow, FeedSnapshot, PageReader, StoreError},
 };
 
@@ -721,7 +722,7 @@ impl Service {
         &self,
         read: &FeedRead,
         signer: &ServiceSigner,
-    ) -> Result<(Answer, u64), FeedStop> {
+    ) -> Result<Answered, FeedStop> {
         // The latest service time a read of this wait has seen: no answer is signed at an
         // earlier one, so a refusal after a wait never shows the service's time going back
         // behind a page the same client was answered meanwhile (Switch spec 10.1).
@@ -761,17 +762,9 @@ impl Service {
                 Err(_) => return Err(FeedStop::refused(temporary(), true, answered.time_ms)),
             }
         }
-        // Once the lock is gone, only while the account still names the key the read loaded,
-        // whatever its mark did: an erasure whose key's deletion failed leaves the key in the
-        // store (7.4.16). The reader is an app, never the signer, so no erasure holds its
-        // `404` back.
-        if let Some(error) = self
-            .no_longer_keyed(&read.account, &read.service_key, false)
-            .await
-        {
-            return Err(gone_or_retired(&error));
-        }
-        Ok((answered.answer(), answered.time_ms))
+        // Signed by the caller under its proof (keyed.rs): only while the account still names
+        // the key the read loaded, whatever its mark did (7.4.16).
+        Ok(answered)
     }
 
     /// One page from one snapshot, and its head, signed. The key's mark is read before the
@@ -838,15 +831,11 @@ impl Service {
             seq,
             chain_hash,
         };
-        let head = sign_head(signer, mark.as_ref(), &read.identity_key, &tip).map_err(|_| {
-            FeedStop::refused(
-                ApiError::unavailable(
-                    "7.3: the state is behind its service key's mark; a new generation is needed",
-                ),
-                false,
-                time_ms,
-            )
-        })?;
+        // The head is signed only when the page is answered, inside its proof (keyed.rs);
+        // the key's mark is checked here, so each read of the wait refuses a state behind it.
+        if !check_mark(mark.as_ref(), &Mark::from(tip)).allows_signing() {
+            return Err(FeedStop::refused(behind_the_mark(), false, time_ms));
+        }
         match builder.refusal.take() {
             Some(Stop::Refused(error)) => {
                 return Err(FeedStop::refused(error, true, time_ms));
@@ -868,28 +857,45 @@ impl Service {
                 chain_hash,
             }),
             generation: snapshot.generation,
-            head,
+            tip,
+            key_mark: mark,
+            identity_key: read.identity_key,
             time_ms,
         })
     }
 }
 
-/// A page read and its signed head, before it is answered.
+/// The refusal of a page whose state is behind its key's mark (Switch wire 7.3 step 10).
+fn behind_the_mark() -> ApiError {
+    ApiError::unavailable(
+        "7.3: the state is behind its service key's mark; a new generation is needed",
+    )
+}
+
+/// A page read, before it is answered with its signed head.
 #[derive(Debug)]
-struct Answered {
+pub(super) struct Answered {
     page: Page,
     ready: bool,
     /// The head as a mark, `None` before the first chain item.
     mark: Option<Mark>,
     generation: u64,
-    head: SignedHead,
+    /// The chain's head as the page shows it.
+    tip: ChainTip,
+    /// The key's mark when the page was read, which its head must not be behind.
+    key_mark: Option<Mark>,
+    identity_key: [u8; 32],
     time_ms: u64,
 }
 
 impl Answered {
-    /// The page's answer, `{ items, next, scanned_through, more, head }` in the member order
-    /// of the wire's example (Switch wire 7.4.4), with the head also in `Switch-Head`.
-    fn answer(&self) -> Answer {
+    /// The page's answer at its service time, `{ items, next, scanned_through, more, head }`
+    /// in the member order of the wire's example (Switch wire 7.4.4), with the head, signed
+    /// here inside the answer's proof, also in `Switch-Head`.
+    pub(super) fn answer(&self, signing: &Signing<'_>) -> (Answer, u64) {
+        let Some(head) = signing.head(self.key_mark.as_ref(), &self.identity_key, &self.tip) else {
+            return (Answer::error(&behind_the_mark()), self.time_ms);
+        };
         let mut body = b"{\"items\":[".to_vec();
         for (index, item) in self.page.items.iter().enumerate() {
             if index > 0 {
@@ -906,9 +912,9 @@ impl Answered {
         body.extend_from_slice(b",\"more\":");
         body.extend_from_slice(if self.page.more { b"true" } else { b"false" });
         body.extend_from_slice(b",\"head\":");
-        body.extend_from_slice(&self.head.to_json());
+        body.extend_from_slice(&head.to_json());
         body.push(b'}');
-        Answer::ok(body).with_head(Some(self.head))
+        (Answer::ok(body).with_head(Some(head)), self.time_ms)
     }
 }
 

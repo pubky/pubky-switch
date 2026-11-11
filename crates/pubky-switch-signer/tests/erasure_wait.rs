@@ -278,6 +278,84 @@ async fn test_erasure_wait_revocation_pending_from_before_isnt_sent_while_erasin
     assert!(pending(&signer));
 }
 
+#[tokio::test]
+async fn test_erasure_wait_with_no_mark_runs_on_the_retrys_404_alone() {
+    // The first delivery was refused (`400`): no mark, so no check reads the switch. The
+    // retry's unsigned `404` starts the wait, the next one keeps it, no `GET /apps` goes out,
+    // and a signed answer to the retry ends it.
+    let world = World::new();
+    let store = Arc::new(MemoryStore::new());
+    let post404 = Arc::new(AtomicBool::new(false));
+    let answering = Arc::clone(&post404);
+    let switch = Arc::clone(&world.switch);
+    let transport = Arc::new(MockTransport::with_handler(move |request| {
+        if answering.load(Ordering::SeqCst)
+            && request.method == "POST"
+            && request.path_and_query.ends_with("/erase")
+        {
+            return Ok(Response {
+                status: 404,
+                headers: Vec::new(),
+                body: b"{}".to_vec(),
+            });
+        }
+        switch.handle(request)
+    }));
+    let mut env = world.env(store);
+    env.transport = transport.clone();
+    let mut signer = Signer::create(
+        env,
+        world.keyring(),
+        pubky_switch_client::testing::SWITCH_ORIGIN,
+    )
+    .await
+    .unwrap();
+    world.switch.fail_next(SwitchFault::Error {
+        path: "/identity".into(),
+        code: ErrorCode::BadRequest,
+        current: serde_json::Value::Null,
+    });
+    signer.resume().await.unwrap_err();
+    world.switch.fail_next(SwitchFault::Unreachable {
+        path: "/erase".into(),
+        after: 0,
+    });
+    signer.close_account(confirmed()).await.unwrap_err();
+    assert_eq!(signer.status(), SignerStatus::Erasing);
+    let apps_reads = |transport: &MockTransport| {
+        transport
+            .requests()
+            .iter()
+            .filter(|r| r.method == "GET" && r.path_and_query.ends_with("/apps"))
+            .count()
+    };
+    let reads = apps_reads(&transport);
+    post404.store(true, Ordering::SeqCst);
+    let t0 = world.clock.now_ms();
+    assert_eq!(
+        signer.resume().await.unwrap_err(),
+        SignerError::Refused(Refusal::ErasureUnconfirmed { since_ms: t0 })
+    );
+    world.clock.advance_ms(H);
+    assert_eq!(
+        signer.resume().await.unwrap_err(),
+        SignerError::Refused(Refusal::ErasureUnconfirmed { since_ms: t0 })
+    );
+    assert_eq!(apps_reads(&transport), reads, "no read of the switch");
+    post404.store(false, Ordering::SeqCst);
+    world.switch.fail_next(SwitchFault::Error {
+        path: "/erase".into(),
+        code: ErrorCode::Unavailable,
+        current: serde_json::Value::Null,
+    });
+    signer.resume().await.unwrap_err();
+    assert_eq!(
+        signer.status(),
+        SignerStatus::Erasing,
+        "a signed answer to the retry ends the wait"
+    );
+}
+
 /// A clone of `signer`'s install delivers the next version at the switch and backs it up.
 fn a_clone_delivers_and_backs_up(
     world: &World,

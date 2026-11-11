@@ -10,11 +10,13 @@
 
 mod admission;
 mod claim;
+mod collections;
 mod enrollment;
 mod epochs;
 mod erasure;
 mod handover;
 mod join;
+mod lagging;
 mod lists;
 mod messaging;
 mod pages;
@@ -34,11 +36,13 @@ use pubky_switch::http::route::Call;
 
 pub use admission::{deny_list, invite_code};
 pub use claim::claim;
+pub use collections::two_collections;
 pub use enrollment::enrollment;
 pub use epochs::third_epoch;
 pub use erasure::{erasure, erasure_answer_lost};
 pub use handover::{hand_over, hand_over_aborted};
 pub use join::join;
+pub use lagging::{lagging_app, missed_item, unreadable_after_revoke};
 pub use lists::lists_without_read;
 pub use messaging::messaging;
 pub use pages::pages;
@@ -105,6 +109,7 @@ pub const FLOWS: &[(&str, Flow)] = &[
     }),
     ("renewed twice", |world| Box::pin(renewed_twice(world))),
     ("third epoch", |world| Box::pin(third_epoch(world))),
+    ("two collections", |world| Box::pin(two_collections(world))),
 ];
 
 /// The flow that sends `call` to the service; `None` for a call the service doesn't serve

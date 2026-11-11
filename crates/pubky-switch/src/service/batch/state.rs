@@ -17,6 +17,7 @@ use pubky_switch_core::{
         SignedOp,
     },
     records::{AppCert, AppRecord, IdentityDoc, ReceiveKeyRecord, Standing},
+    recovery::UploadBase,
     scopes::Permission,
     shared::RecordState,
     sig::SignedDoc,
@@ -58,20 +59,74 @@ pub struct HeldRecord {
     pub cert: SignedDoc,
     /// The signed `record.put`.
     pub op: SignedDoc,
-    /// Its transition proof; `None` only for a write of this batch, before it is signed.
-    pub proof: Option<SignedDoc>,
+    /// Where the write came from.
+    pub origin: HeldOrigin,
+    /// Uploads conflict with it (Switch wire 7.4.9 `divergent`); a write here clears them.
+    pub divergent: bool,
+}
+
+/// Where a held record's current write came from (Switch wire 7.4.14, 10.3).
+#[derive(Clone, Debug, PartialEq)]
+pub enum HeldOrigin {
+    /// A write made here.
+    Written {
+        /// Its transition proof; `None` only for a write of this batch, before it is signed.
+        proof: Option<SignedDoc>,
+        /// The uploaded version the first write here built on, with its operation's hash
+        /// (Switch wire 10.3 `upload_base`).
+        upload_base: Option<UploadBase>,
+    },
+    /// Taken from a recovery upload: no proof.
+    Uploaded {
+        /// The `upload` transition's `seq`.
+        seq: u64,
+        /// The lost service's proof gave its version.
+        exact: bool,
+    },
+}
+
+impl HeldRecord {
+    /// The uploaded version that a write here on this record builds on, with its operation,
+    /// which later uploads are compared with (Switch wire 7.4.14 "Writes at N win"): this
+    /// record's when it was taken from an upload, else the one the writes here already built
+    /// on. `None` for an uploaded record whose operation doesn't encode, which then counts
+    /// as built on no upload, the stricter side.
+    pub fn upload_base(&self) -> Option<UploadBase> {
+        match &self.origin {
+            HeldOrigin::Uploaded { .. } => Some(UploadBase {
+                version: self.state.version,
+                op_hash: self.op.doc_hash().ok()?,
+            }),
+            HeldOrigin::Written { upload_base, .. } => *upload_base,
+        }
+    }
+
+    /// Its transition proof, once signed, for a write made here.
+    pub fn proof(&self) -> Option<&SignedDoc> {
+        match &self.origin {
+            HeldOrigin::Written { proof, .. } => proof.as_ref(),
+            HeldOrigin::Uploaded { .. } => None,
+        }
+    }
 }
 
 impl From<crate::store::StoredRecord> for HeldRecord {
-    /// A stored record: its write was signed, so it has its proof.
     fn from(record: crate::store::StoredRecord) -> Self {
+        use crate::store::RecordOrigin;
         Self {
             state: record.state,
             value_bytes: record.value_bytes,
             writer: record.writer,
             cert: record.cert,
             op: record.op,
-            proof: Some(record.proof),
+            origin: match record.origin {
+                RecordOrigin::Written { proof, upload_base } => HeldOrigin::Written {
+                    proof: Some(proof),
+                    upload_base,
+                },
+                RecordOrigin::Uploaded { seq, exact } => HeldOrigin::Uploaded { seq, exact },
+            },
+            divergent: record.divergent,
         }
     }
 }
@@ -496,14 +551,17 @@ pub fn record_view(held: &HeldRecord) -> Value {
         "write_scopes": held.state.policy.write_scopes,
         "generation": held.state.version.generation,
         "version": held.state.version.version,
-        "seq": held.state.version.version,
+        "seq": match held.origin {
+            HeldOrigin::Uploaded { seq, .. } => seq,
+            HeldOrigin::Written { .. } => held.state.version.version,
+        },
         "deleted": held.state.deleted,
         "writer": zbase32_encode(&held.writer),
         "op": held.op,
-        "divergent": false,
+        "divergent": held.divergent,
         "cert": held.cert,
     });
-    if let Some(proof) = &held.proof {
+    if let Some(proof) = held.proof() {
         view["proof"] = serde_json::json!(proof);
     }
     view
