@@ -42,6 +42,8 @@ pub(crate) struct ItemsProtocol {
     pub(crate) pads: std::sync::Mutex<std::collections::VecDeque<usize>>,
     /// What each newer write checked against a mark built on.
     pub(crate) bases: std::sync::Mutex<Vec<WriteBase>>,
+    /// The collections in place of `sample.items` alone, when set.
+    pub(crate) collections: std::sync::Mutex<Option<Vec<Collection>>>,
 }
 
 pub(crate) fn items() -> Collection {
@@ -112,7 +114,11 @@ impl Protocol for ItemsProtocol {
     }
 
     fn collections(&self) -> Vec<Collection> {
-        vec![items()]
+        self.collections
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| vec![items()])
     }
 
     fn record_seen(&self, _: &str, seen: Option<&[u8]>, value: Option<&[u8]>) -> Option<Vec<u8>> {
@@ -2200,6 +2206,36 @@ fn store_parts_for(s: &Setup, cert: &AppCert) {
             }))
             .unwrap();
     }
+}
+
+/// A renewal that adds a sub-scope to a family the app already read part of owes a
+/// listing: the records under the new sub-scope were stubs in its feed.
+#[tokio::test]
+async fn test_records_renewal_adding_a_sub_scope_lists_its_records() {
+    let s = Setup::new();
+    let family = Collection::with_sub_scopes("sample.items", Policy::new("scope-a", &["scope-a"]));
+    *s.protocol.collections.lock().unwrap() = Some(vec![family.clone()]);
+    let mut wallet = join_scoped(&s, "wallet", &["scope-a:kiosk"]).await;
+    let mut phone = s.join("phone").await;
+    let target = RecordTarget::new(family.sub_scope("till").unwrap(), b"t1");
+    phone
+        .put_record(&target, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    let key = phone.record_key(&target).unwrap();
+    wallet.receive(None).await.unwrap();
+    assert!(wallet.shared_record(&key).await.unwrap().is_none());
+    s.w.clock.advance_ms(HOUR);
+    let earlier = wallet.cert().clone();
+    let renewed = renewed_cert(&s, "wallet", &["scope-a:kiosk", "scope-a:till"]);
+    s.w.next_doc(|body| list_renewal(body, &earlier, &renewed, None));
+    wallet.receive(None).await.unwrap();
+    assert_eq!(wallet.cert().hash(), renewed.hash());
+    store_parts_for(&s, &renewed);
+    wallet.receive(None).await.unwrap();
+    wallet.receive(None).await.unwrap();
+    let held = wallet.shared_record(&key).await.unwrap().unwrap();
+    assert_eq!(ids(held.content.value()), vec!["a"]);
 }
 
 /// A renewal that adds no read scope of a collection owes no listing.

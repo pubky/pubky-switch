@@ -62,8 +62,8 @@ impl App {
     }
 
     /// Present `cert` from now on, with `record`; `deliver` signs its `app.put` and keeps it
-    /// before it is sent. A certificate that reads a collection of the protocol the one
-    /// before didn't owes a listing, in the same commit, so the next read lists it (Switch
+    /// before it is sent. A certificate that reads a member of a collection of the protocol
+    /// the one before didn't owes a listing, in the same commit, so the next read lists it (Switch
     /// spec 8.3, Switch wire 7.4.9): the writes made there before it were stubs in the feed.
     async fn take_cert(
         &mut self,
@@ -72,11 +72,14 @@ impl App {
         deliver: bool,
     ) -> Result<(), AppError> {
         let issued_at = cert.issued_at();
-        let widened = self
-            .protocol
-            .collections()
-            .iter()
-            .any(|c| c.readable_by(&cert) && !c.readable_by(&self.state.cert));
+        // Member by member: a scope of the new certificate that reads a collection's member,
+        // its fixed read scope or a sub-scope of its family, and that the one before doesn't
+        // hold (Switch spec 3.3).
+        let collections = self.protocol.collections();
+        let widened = cert.scopes().iter().any(|scope| {
+            !self.state.cert.holds_scope(scope)
+                && collections.iter().any(|c| c.read_by_scope(scope))
+        });
         self.state.cert = cert;
         self.rebuild_client()?;
         let mut tx = self.tx()?;
