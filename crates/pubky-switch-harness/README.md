@@ -58,8 +58,10 @@ A revocation whose answer was lost isn't sent again while the signer can read th
 reads the account's apps and finds it done.
 
 An erasure whose answer was lost isn't sent again either (Switch wire 7.4.16): the signer's
-next read of the account's apps gets the operator's `404`, and it concludes the account is
-erased.
+next read of the account's apps gets the operator's `404`, which nobody can authenticate, so
+it holds the account as erased but unconfirmed. It concludes the account is erased at its
+first run 24 hours after that `404`, every read in between having met it too. The flow moves
+the world's clock, which is the signer's device clock, by those 24 hours.
 
 ## Not covered
 
