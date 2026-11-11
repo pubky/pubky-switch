@@ -161,6 +161,35 @@ const WATCHED: &str = "text ClaimChanged a2tra2tra2tra2tra2tra2tra2tra2tra2tra2t
 const PHONE_FEED: &str = "{alice/phone} GET /v1/{alice}/feed";
 const WALLET_FEED: &str = "{alice/wallet} GET /v1/{alice}/feed";
 
+/// What an app can tell from its feed after the answer to its own `done` was lost.
+const DONE_UNSEEN: &str = "The wallet's `done` was taken and its answer lost. The entry \
+    settles the claim, which the service compacts at once, so the wallet's feed shows its own \
+    entry as a stub: the wallet raises no event and goes on holding the claim as attempting, \
+    its attempt open, with no settling proof, until it writes again and the kept batch \
+    brings the original proof. The scripted switch shows the entry in full, so there the \
+    wallet holds the claim settled, with the proof, from its feed.";
+
+/// An entry of the `claim retries` flow about the feed read after the lost `done`.
+const fn done_unseen(
+    label: &'static str,
+    fact: &'static str,
+    service: &'static str,
+    scripted: &'static str,
+) -> Allowed {
+    Allowed {
+        flow: "claim retries",
+        label,
+        fact,
+        service,
+        scripted,
+        reason: DONE_UNSEEN,
+        reference: "Switch wire 6.8 \"Tombstones\"; 7.5, the entries of compacted claims",
+    }
+}
+
+/// The outcome line of the `claim retries` flow after the lost `done`.
+const AFTER_LOST_DONE: &str = "outcome after the lost done, the app follows its feed";
+
 /// Every accepted difference: those of the two switches as a whole, then by flow.
 pub static ALLOWED: &[Allowed] = &[
     Allowed {
@@ -527,7 +556,7 @@ pub static ALLOWED: &[Allowed] = &[
         flow: "removal retries",
         label: "{alice} GET /v1/{alice}/apps",
         fact: "body.apps[0].last_seen",
-        service: "time 2026-01-01T00:09:11.250Z",
+        service: "time 2026-01-01T00:13:16.250Z",
         scripted: "time 2026-01-01T00:06:07.500Z",
         reason: "The tablet's `leave` that the switch took is its latest request past \
                  authentication, so the service shows that leave's time as its `last_seen` \
@@ -572,6 +601,46 @@ pub static ALLOWED: &[Allowed] = &[
         reason: COUNTER_START,
         reference: "Switch wire 7.4.3, the answer's `directory_version`; 7.4.10",
     },
+    done_unseen(WALLET_FEED, "body.items[0].type", "text stub", "text chain"),
+    done_unseen(WALLET_FEED, "body.items[0].item*", NOTHING, "*"),
+    done_unseen(WALLET_FEED, "body.items[0].proof*", NOTHING, "*"),
+    done_unseen(
+        AFTER_LOST_DONE,
+        "outcome.events",
+        "array of 0",
+        "array of 1",
+    ),
+    done_unseen(
+        AFTER_LOST_DONE,
+        "outcome.events[0]",
+        NOTHING,
+        "text ClaimChanged Li4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4uLi4",
+    ),
+    done_unseen(
+        AFTER_LOST_DONE,
+        "outcome.held.status",
+        "text Attempting",
+        "text Settled",
+    ),
+    done_unseen(AFTER_LOST_DONE, "outcome.held.step", "number 1", "number 2"),
+    done_unseen(
+        AFTER_LOST_DONE,
+        "outcome.held.attempts[0]",
+        "text Open",
+        "text Done",
+    ),
+    done_unseen(
+        AFTER_LOST_DONE,
+        "outcome.held.own_attempt",
+        "bool true",
+        "bool false",
+    ),
+    done_unseen(
+        AFTER_LOST_DONE,
+        "outcome.held.settled_proof",
+        "bool false",
+        "bool true",
+    ),
 ];
 
 #[cfg(test)]

@@ -33,7 +33,8 @@ pub use removal::{departure, revocation};
 pub use renewal::renewal;
 pub use restore::restore;
 pub use retries::{
-    app_retries, append_retry, claim_and_read_retries, removal_retries, signer_retries,
+    app_retries, append_retry, claim_and_read_retries, claim_retries, removal_retries,
+    signer_retries,
 };
 pub use watching::watching;
 
@@ -70,6 +71,7 @@ pub const FLOWS: &[(&str, Flow)] = &[
     ("claim and read retries", |world| {
         Box::pin(claim_and_read_retries(world))
     }),
+    ("claim retries", |world| Box::pin(claim_retries(world))),
 ];
 
 /// The flow that sends `call` to the service; `None` for a call the service doesn't serve

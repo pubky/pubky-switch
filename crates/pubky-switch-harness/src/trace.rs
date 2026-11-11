@@ -215,12 +215,14 @@ pub enum Fault {
         method: String,
         /// A part of the path.
         path: String,
+        /// How many matching requests go through first.
+        after: usize,
     },
 }
 
 impl Fault {
     fn matches(&self, request: &Request) -> bool {
-        let (Fault::LoseAnswer { method, path } | Fault::Unreachable { method, path }) = self;
+        let (Fault::LoseAnswer { method, path } | Fault::Unreachable { method, path, .. }) = self;
         request.method == *method && request.path_and_query.contains(path.as_str())
     }
 }
@@ -385,7 +387,14 @@ impl Transport for Recorder {
             let fault = {
                 let mut faults = lock(&self.faults);
                 let at = faults.iter().position(|fault| fault.matches(&request));
-                at.map(|at| faults.remove(at))
+                match at.and_then(|at| faults.get_mut(at)) {
+                    // Not yet: this request goes through.
+                    Some(Fault::Unreachable { after, .. }) if *after > 0 => {
+                        *after -= 1;
+                        None
+                    }
+                    _ => at.map(|at| faults.remove(at)),
+                }
             };
             if let Some(Fault::Unreachable { .. }) = fault {
                 facts.insert(FAULT.into(), "the request didn't reach the switch".into());
@@ -822,6 +831,7 @@ mod tests {
         recorder.fail_next(Fault::Unreachable {
             method: "POST".into(),
             path: "/ops".into(),
+            after: 0,
         });
         let failed = recorder.send(post("/v1/abc/ops")).await;
         assert!(
@@ -836,6 +846,25 @@ mod tests {
         );
         assert_eq!(trace.lines[0].facts.get("status"), None);
         assert!(recorder.send(post("/v1/abc/ops")).await.is_ok(), "once");
+    }
+
+    #[tokio::test]
+    async fn test_fault_unreachable_after_lets_the_first_requests_through() {
+        let (recorder, inner) = recorder();
+        recorder.fail_next(Fault::Unreachable {
+            method: "POST".into(),
+            path: "/ops".into(),
+            after: 2,
+        });
+        assert!(recorder.send(post("/v1/abc/ops")).await.is_ok());
+        assert!(recorder.send(post("/v1/abc/ops")).await.is_ok());
+        assert_eq!(recorder.faults_left(), 1);
+        assert!(
+            recorder.send(post("/v1/abc/ops")).await.is_err(),
+            "the third"
+        );
+        assert_eq!(inner.requests().len(), 2);
+        assert_eq!(recorder.faults_left(), 0);
     }
 
     #[test]
