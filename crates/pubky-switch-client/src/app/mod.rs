@@ -1278,8 +1278,9 @@ impl App {
     /// from is still in the user's hands; for a lost or stolen one it revokes the app and
     /// joins a new one instead.
     ///
-    /// The app enters reconcile mode. At its next call it takes the certificate its
-    /// `identity.json` lists if the backup predates a renewal, checks its receive key
+    /// The app enters reconcile mode. At its next call it takes the certificate its current
+    /// `identity.json` lists, read with its own record from the directory, if the backup
+    /// predates a renewal, another device's included, checks its receive key
     /// record, registers a fresh key if it rotated after the backup, and asks the user
     /// about registrations it can't account for ([`App::restore_question`]).
     ///

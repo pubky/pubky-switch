@@ -1263,6 +1263,96 @@ async fn test_app_renewal_is_picked_up_once_listed() {
     assert!(received(&report.events, seq));
 }
 
+/// A restore from a backup older than a renewal the other device of the app took and
+/// delivered: the renewal's `cert.put` is a stub by then, carried by the app's record, and
+/// the backup's `identity.json` lists the earlier certificate. The restored app learns the
+/// listed one from the current `identity.json` and its own record in the directory, and
+/// takes it at its first read (Switch spec 3.2 step 3, 12.4 step 1).
+#[tokio::test]
+async fn test_app_restore_takes_a_renewal_another_device_took() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let me = app.app_id();
+    let backup = app.backup().await.unwrap();
+    let earlier = app.cert().clone();
+    w.clock.advance_ms(HOUR);
+    renew_listed(&w, &app);
+    app.receive(None).await.unwrap();
+    app.receive(None).await.unwrap();
+    app.flush_cursor().await.unwrap();
+    let renewed = app.cert().clone();
+    assert_ne!(renewed.hash(), earlier.hash());
+    assert_eq!(
+        w.switch.app(&me).cert.map(|c| c.hash()),
+        Some(renewed.hash())
+    );
+    drop(app);
+    let (mut restored, _) = restored(&w, &backup).await;
+    assert_eq!(restored.cert().hash(), earlier.hash());
+    let report = restored.receive(None).await.unwrap();
+    assert!(
+        has(&report.events, |e| matches!(
+            e,
+            AppEvent::CertificateTaken { .. }
+        )),
+        "{:?}",
+        report.events
+    );
+    assert_eq!(restored.cert().hash(), renewed.hash());
+    assert_eq!(
+        restored.own_identity().listed_cert(&me),
+        Some(renewed.hash())
+    );
+}
+
+/// The failure path: the current `identity.json` lists a renewal, but the own record in the
+/// directory carries another certificate, and the renewal's `cert.put` is a stub. Nothing
+/// shows the listed certificate, so the restored app keeps the one it holds.
+#[tokio::test]
+async fn test_app_restore_takes_no_listed_certificate_it_cant_verify() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let me = app.app_id();
+    let backup = app.backup().await.unwrap();
+    let earlier = app.cert().clone();
+    // The signer stores one renewal, which the other device takes and delivers, then a
+    // newer document lists a certificate no record carries.
+    w.clock.advance_ms(HOUR);
+    renew_listed(&w, &app);
+    app.receive(None).await.unwrap();
+    app.receive(None).await.unwrap();
+    app.flush_cursor().await.unwrap();
+    let renewed = app.cert().clone();
+    assert_ne!(renewed.hash(), earlier.hash());
+    let unshown = cert_for(
+        &w.alice,
+        &app_keys("wallet"),
+        w.clock.now_ms() + 1000,
+        &["scope-a"],
+    );
+    w.next_doc(|body| {
+        body.apps.retain(|a| a.app_id != me);
+        body.apps.push(ListedApp {
+            app_id: me,
+            cert: unshown.hash(),
+        });
+    });
+    drop(app);
+    let (mut restored, _) = restored(&w, &backup).await;
+    // The switch doesn't serve an app listed with a certificate no record carries.
+    let error = restored.receive(None).await.unwrap_err();
+    assert_eq!(error.code(), Some(ErrorCode::NotCurrent), "{error:?}");
+    // Neither the listed certificate, which no record shows, nor the record's, which the
+    // newest document doesn't list, is taken.
+    assert_eq!(restored.cert().hash(), earlier.hash());
+    assert_eq!(
+        restored.own_identity().listed_cert(&me),
+        Some(unshown.hash()),
+        "the newest document was read"
+    );
+    assert_ne!(renewed.hash(), unshown.hash());
+}
+
 #[tokio::test]
 async fn test_app_expired_certificate_is_renewed_by_the_signer_alone() {
     let w = World::new();

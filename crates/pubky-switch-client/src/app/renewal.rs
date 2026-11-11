@@ -173,8 +173,19 @@ impl App {
     /// no `cert.put` for it (Switch spec 3.2 step 3): taken only if the record is signed
     /// with the app's own signing key, and its certificate renews the one held and has the
     /// listed hash. The service holds that record, so nothing is delivered.
+    ///
+    /// It runs after a restore, whose own `identity.json` is the backup's: a renewal that
+    /// another device of the app took since is listed only in a later one, and its
+    /// `cert.put` shows as a stub once the record carries it. So the directory's own
+    /// `identity.json` is taken first when it is newer, and the certificate it lists is the
+    /// one checked (Switch spec 12.4 step 1 "Certificate").
     pub(crate) async fn take_listed_cert(&mut self) -> Result<(), AppError> {
         let me = self.state.meta.app_id;
+        let result = self.client.directory(None).await;
+        let directory = self.take(result).await?;
+        if directory.identity.version() > self.state.own_doc.version() {
+            self.take_own_copy(directory.identity.clone()).await?;
+        }
         let Some(listed) = self.state.own_doc.listed_cert(&me) else {
             return Ok(());
         };
@@ -190,8 +201,6 @@ impl App {
             self.adopt_renewal().await?;
             return Ok(());
         }
-        let result = self.client.directory(None).await;
-        let directory = self.take(result).await?;
         let Some(entry) = directory.apps.into_iter().find(|app| app.app_id == me) else {
             return Ok(());
         };
