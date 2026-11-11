@@ -852,13 +852,22 @@ impl App {
                         self.events
                             .push(AppEvent::RecordDivergent { key: view.key });
                     }
-                    version = RecordVersion::new(view.generation, view.version);
+                    // A view of the feed's own write keeps what the feed gave it: the
+                    // verified stub, which dates the write and gives its version whatever
+                    // proof the view shows, and the item's proof. A view of another write
+                    // is judged on its own evidence, and the feed write not at all.
+                    let same = view.op == *evidence.op;
+                    let stub = evidence.stub.filter(|_| same);
+                    let view_version = RecordVersion::new(view.generation, view.version);
+                    version = stub.map_or(view_version, |env| {
+                        RecordVersion::new(env.generation, env.seq)
+                    });
                     let evidence = Evidence {
                         op: &view.op,
                         cert: Some(&view.cert),
-                        proof: view.proof.as_ref(),
-                        stub: None,
-                        view_version: Some(version),
+                        proof: view.proof.as_ref().or(evidence.proof.filter(|_| same)),
+                        stub,
+                        view_version: Some(view_version),
                     };
                     self.accept_write(&evidence, Some((&shown_key, &collection)), tx)
                         .await?
