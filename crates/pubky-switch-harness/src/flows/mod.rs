@@ -10,6 +10,7 @@
 
 mod claim;
 mod enrollment;
+mod erasure;
 mod handover;
 mod join;
 mod lists;
@@ -28,6 +29,7 @@ use pubky_switch::http::route::Call;
 
 pub use claim::claim;
 pub use enrollment::enrollment;
+pub use erasure::{erasure, erasure_answer_lost};
 pub use handover::{hand_over, hand_over_aborted};
 pub use join::join;
 pub use lists::lists_without_read;
@@ -81,6 +83,10 @@ pub const FLOWS: &[(&str, Flow)] = &[
         Box::pin(hand_over_aborted(world))
     }),
     ("records", |world| Box::pin(records(world))),
+    ("erasure", |world| Box::pin(erasure(world))),
+    ("erasure, answer lost", |world| {
+        Box::pin(erasure_answer_lost(world))
+    }),
 ];
 
 /// The flow that sends `call` to the service; `None` for a call the service doesn't serve
@@ -96,6 +102,7 @@ pub fn flow_of(call: &Call) -> Option<&'static str> {
         Call::Leave(_) => Some("departure"),
         Call::PutHandover | Call::GetHandover => Some("hand-over"),
         Call::GetRecord(_) | Call::ListRecords => Some("records"),
+        Call::Erase => Some("erasure"),
         // Served, and waiting for its flow: an app asks for a full bundle only when it
         // lacks an epoch's keys, and no honest flow leaves it lacking one while the service
         // keeps every bundle part (the restore flow shows it).
@@ -113,8 +120,7 @@ pub fn flow_of(call: &Call) -> Option<&'static str> {
         | Call::ImportChunk(_)
         | Call::ImportActivate
         | Call::RecoveryAdmission
-        | Call::RecoveryUpload
-        | Call::Erase => None,
+        | Call::RecoveryUpload => None,
     }
 }
 
