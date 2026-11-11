@@ -9,13 +9,22 @@ use sqlx::Row;
 
 use super::{AccountTxn, StoreError};
 
-/// The hand-over as stored.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// The hand-over as stored. Its `Debug` shows the target and the body's length only.
+#[derive(Clone, PartialEq, Eq)]
 pub struct StoredHandover {
     /// The App ID of the app it is for.
     pub target: [u8; 16],
     /// The `PUT` body, as received.
     pub body: Vec<u8>,
+}
+
+impl std::fmt::Debug for StoredHandover {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StoredHandover")
+            .field("target", &self.target)
+            .field("body_len", &self.body.len())
+            .finish()
+    }
 }
 
 impl AccountTxn {

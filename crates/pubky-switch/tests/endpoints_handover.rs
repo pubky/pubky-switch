@@ -3,8 +3,9 @@
 //! version drops it.
 //!
 //! The vectors' switch is at `seq` 41, past what `chain.json` replays here, so their answers
-//! are compared by body; their heads are that switch's. Set `PUBKY_SWITCH_TEST_DATABASE_URL`
-//! to run them; see `store::testing`.
+//! are compared byte for byte but for `Switch-Head`, which the answer's signature doesn't
+//! cover: that is that switch's head. Set `PUBKY_SWITCH_TEST_DATABASE_URL` to run them; see
+//! `store::testing`.
 
 // Test helpers fail the test on any error.
 #![allow(clippy::expect_used, clippy::panic)]
@@ -59,6 +60,28 @@ fn fetch_request() -> Value {
         "requests",
         "own app: the phone fetches the hand-over stored for it",
     )
+}
+
+/// The answer matches the vector byte for byte, its status, body, server time and
+/// signature, but for `Switch-Head`, which is the vectors' switch's (module doc).
+fn assert_matches_but_the_head(answer: &SwitchResponse, expected: &Value) {
+    let name = expected["name"].as_str().expect("name");
+    assert_eq!(
+        u64::from(answer.status),
+        expected["status"].as_u64().expect("status"),
+        "{name}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&answer.body),
+        expected["body"].as_str().expect("body"),
+        "{name}"
+    );
+    for (name, value) in expected["headers"].as_object().expect("headers") {
+        if name != header::HEAD {
+            assert_eq!(header_text(answer, name), value.as_str(), "{name}");
+        }
+    }
+    assert!(header_text(answer, header::HEAD).is_some(), "Switch-Head");
 }
 
 /// The time the vectors' requests are answered at, which this account's requests are signed
@@ -235,49 +258,67 @@ fn executor_body() -> Vec<u8> {
     .into_bytes()
 }
 
+/// A hand-over signed for the phone, sealed to the executor's certified bundle key.
+fn sealed_to_the_executor() -> Vec<u8> {
+    let alice = identity_key().public();
+    let executor = AppCert::verify(&document("executor certificate"), &alice).expect("certificate");
+    let phone = pubky_switch_core::enc::app_id_decode(
+        app(&vectors("keys.json"), "phone")["app_id"]
+            .as_str()
+            .expect("id"),
+    )
+    .expect("id");
+    let handover = SignerHandover::seal_parts_with(
+        &identity_key(),
+        &phone,
+        &executor.bundle_key(),
+        &[b"a part"],
+        &[pubky_switch_core::envelope::FixedRandomness {
+            content_key: [1; 32],
+            nonce: [2; 24],
+            ikm_e: [3; 32],
+        }],
+    )
+    .expect("sealed");
+    json!({
+        "app_id": pubky_switch_core::enc::zbase32_encode(&phone),
+        "handover": handover,
+    })
+    .to_string()
+    .into_bytes()
+}
+
 #[tokio::test]
 async fn test_handover_vectors_store_and_fetch() {
     // http.json's store and fetch: the signer stores the hand-over to the phone, answered
-    // with the target and the parts and a head; the phone fetches the body as stored,
-    // byte for byte (Switch wire 7.4.17).
+    // with the target and the parts and a head; the phone fetches the body as stored
+    // (Switch wire 7.4.17).
     let Some(replay) = replay().await else { return };
     alice_with_three_apps(&replay).await;
     let stored = replay
         .service
         .handle(vector_request(&store_request()))
         .await;
-    let expected = http_case("responses", "signer: the hand-over stored for the phone");
-    assert_eq!(
-        stored.status,
-        200,
-        "{}",
-        String::from_utf8_lossy(&stored.body)
+    assert_matches_but_the_head(
+        &stored,
+        &http_case("responses", "signer: the hand-over stored for the phone"),
     );
-    assert_eq!(
-        String::from_utf8_lossy(&stored.body),
-        expected["body"].as_str().expect("body")
-    );
-    assert!(header_text(&stored, header::HEAD).is_some(), "Switch-Head");
-    let fetched = replay
-        .service
-        .handle(vector_request(&fetch_request()))
-        .await;
     let expected = http_case(
         "responses",
         "own app: the hand-over the switch stores for the phone",
     );
-    assert_eq!(
-        fetched.status,
-        200,
-        "{}",
-        String::from_utf8_lossy(&fetched.body)
+    set_time(
+        &replay.clock,
+        expected["headers"]["switch-server-time"]
+            .as_str()
+            .expect("time"),
     );
+    let fetched = replay
+        .service
+        .handle(vector_request(&fetch_request()))
+        .await;
+    assert_matches_but_the_head(&fetched, &expected);
     assert_eq!(fetched.body, phone_body());
-    assert_eq!(
-        String::from_utf8_lossy(&fetched.body),
-        expected["body"].as_str().expect("body")
-    );
-    assert!(header_text(&fetched, header::HEAD).is_some(), "Switch-Head");
     replay.db.drop_database().await.expect("drop");
 }
 
@@ -310,6 +351,19 @@ async fn test_handover_only_the_target_and_the_signer_read_it() {
         ))
         .await;
     assert_eq!(code_of(&shop), (403, json!("permission_missing")));
+    let shop_put = replay
+        .service
+        .handle(other_request(
+            "shop",
+            ORIGIN,
+            "PUT",
+            &handover_path(),
+            phone_body(),
+            None,
+            ms(&vector_time()),
+        ))
+        .await;
+    assert_eq!(code_of(&shop_put), (403, json!("permission_missing")));
     let from_app = replay
         .service
         .handle(app_request(
@@ -342,10 +396,13 @@ async fn test_handover_none_held_is_not_found() {
 
 #[tokio::test]
 async fn test_handover_target_not_current_is_conflict() {
-    // The phone holds a record but is revoked, so it isn't current: `409 conflict`, nothing
-    // kept (Switch wire 7.4.17, spec 3.4).
+    // The phone holds a record but is revoked, so it isn't current: `409 conflict`, before
+    // any check of the envelopes or the signature, and nothing kept; the hand-over held
+    // for it before is refused to it as it is to every app that isn't current (Switch wire
+    // 7.4.17, 7.2, spec 3.4).
     let Some(replay) = replay().await else { return };
     alice_with_three_apps(&replay).await;
+    assert_eq!(put(&replay, phone_body()).await.status, 200);
     let phone = app(&vectors("keys.json"), "phone")["app_id"]
         .as_str()
         .expect("id")
@@ -369,10 +426,68 @@ async fn test_handover_target_not_current_is_conflict() {
         code_of(&put(&replay, phone_body()).await),
         (409, json!("conflict"))
     );
+    let mut forged: Value = serde_json::from_slice(&phone_body()).expect("json");
+    forged["handover"]["sig"] = json!(b64(&[1u8; 64]));
     assert_eq!(
-        code_of(&get(&replay, "signer").await),
-        (404, json!("not_found"))
+        code_of(&put(&replay, forged.to_string().into_bytes()).await),
+        (409, json!("conflict")),
+        "the target first"
     );
+    assert_eq!(
+        code_of(&get(&replay, "phone").await),
+        (403, json!("not_current"))
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_handover_target_without_a_record_is_conflict() {
+    // Before the executor delivers its record, `chain.json`'s account lists it but holds
+    // nothing of it: not current (Switch wire 7.4.17, spec 3.4).
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    set_time(&replay.clock, &vector_time());
+    assert_eq!(
+        code_of(&put(&replay, executor_body()).await),
+        (409, json!("conflict"))
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_handover_expired_target_is_stored_but_not_served_to_it() {
+    // An expired certificate leaves the app current (spec 3.4, Switch wire 3.8): the
+    // hand-over is stored, and the target fetches it only once renewed (7.2 check 3).
+    let Some(replay) = replay().await else { return };
+    alice_with_three_apps(&replay).await;
+    let expired = "2026-12-01T00:00:10.000Z";
+    set_time(&replay.clock, expired);
+    let stored = replay
+        .service
+        .handle(signer_request(
+            "PUT",
+            &handover_path(),
+            executor_body(),
+            ms(expired),
+        ))
+        .await;
+    assert_eq!(
+        stored.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&stored.body)
+    );
+    let fetched = replay
+        .service
+        .handle(app_request(
+            app(&vectors("keys.json"), "executor"),
+            "GET",
+            &handover_path(),
+            Vec::new(),
+            ms(expired),
+        ))
+        .await;
+    assert_eq!(code_of(&fetched), (403, json!("cert_expired")));
     replay.db.drop_database().await.expect("drop");
 }
 
@@ -413,13 +528,25 @@ async fn test_handover_checks_the_form_and_the_signature() {
             with(&|v| v["handover"]["sig"] = json!(b64(&[1u8; 64]))),
         ),
         (
-            "an envelope that isn't one",
+            "an envelope that isn't one, which the signature covers too",
             with(&|v| v["handover"]["envelopes"][0] = json!(b64(b"not an envelope"))),
         ),
-        // The executor is current, but the envelopes are for the phone's bundle key.
         (
-            "another app's bundle key",
+            "signed for another target",
             with(&|v| v["app_id"] = app(&vectors("keys.json"), "executor")["app_id"].clone()),
+        ),
+        (
+            "129 envelopes",
+            with(&|v| {
+                let first = v["handover"]["envelopes"][0].clone();
+                v["handover"]["envelopes"] = json!(vec![first; 129]);
+            }),
+        ),
+        // Signed for the phone, but sealed to the executor's bundle key: only the kid
+        // check refuses it.
+        (
+            "sealed to another app's bundle key",
+            sealed_to_the_executor(),
         ),
     ];
     for (case, body) in cases {
@@ -464,8 +591,7 @@ async fn test_handover_replaced_by_the_next_put() {
 #[tokio::test]
 async fn test_handover_dropped_at_the_next_version_not_at_a_retry() {
     // The same delivery again takes no new version and keeps the hand-over; the next
-    // version, here the old signer's abort at version 5's place, drops it (Switch wire
-    // 7.4.17 Deletion).
+    // version drops it, whichever signer delivered it (Switch wire 7.4.17 Deletion).
     let Some(replay) = replay().await else { return };
     alice_with_three_apps(&replay).await;
     assert_eq!(put(&replay, phone_body()).await.status, 200);

@@ -1097,9 +1097,17 @@ impl Service {
                     .map_err(|error| Refused::with_head(error, serving));
             }
             Call::GetHandover => {
-                // The signer, or the own app it is for (Switch wire 7.4.17).
+                // The signer, or the own app it is for (Switch wire 7.4.17). An app of another
+                // identity was refused above; refused here too, so the read fails closed.
+                let reader = match (writer.as_ref(), other) {
+                    (Some(app), _) => handover::Reader::OwnApp(app),
+                    (None, None) => handover::Reader::Signer,
+                    (None, Some(_)) => {
+                        return Err(Refused::with_head(rules::other_app_refusal(call), serving));
+                    }
+                };
                 return self
-                    .get_handover(txn, signer, writer.as_ref())
+                    .get_handover(txn, signer, reader)
                     .await
                     .map(|answer| (answer, serving))
                     .map_err(|error| Refused::with_head(error, serving));

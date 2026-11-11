@@ -40,22 +40,42 @@ fn none_held() -> ApiError {
 /// at either level (Switch wire 7.4.17, 1.1).
 fn parse_put(body: &[u8]) -> Result<([u8; 16], SignerHandover), ApiError> {
     let bad = |why: &str| ApiError::bad_request(format!("7.4.17: {why}"));
-    let value: Value = parse_json(body).map_err(|_| bad("the body isn't JSON"))?;
+    let mut value: Value = parse_json(body).map_err(|_| bad("the body isn't JSON"))?;
     reject_unknown_members(&value, &["app_id", "handover"], "the hand-over request")
-        .map_err(|e| ApiError::bad_request(e.to_string()))?;
-    let handover = value
-        .get("handover")
-        .ok_or_else(|| bad("the body names `handover`"))?;
-    reject_unknown_members(handover, &["envelopes", "sig"], "the hand-over")
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
     let target = value
         .get("app_id")
         .and_then(Value::as_str)
         .and_then(|text| zbase32_decode::<16>(text).ok())
         .ok_or_else(|| bad("`app_id` isn't an App ID"))?;
-    let handover: SignerHandover = serde_json::from_value(handover.clone())
+    let handover = value
+        .get_mut("handover")
+        .map(Value::take)
+        .ok_or_else(|| bad("the body names `handover`"))?;
+    reject_unknown_members(&handover, &["envelopes", "sig"], "the hand-over")
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    // The count before any envelope is decoded (3.12 `max_handover_parts`).
+    let count = handover
+        .get("envelopes")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    if !(1..=MAX_PARTS).contains(&count) {
+        return Err(bad("a hand-over holds 1 to 128 envelopes"));
+    }
+    let handover: SignerHandover = serde_json::from_value(handover)
         .map_err(|_| bad("the hand-over's envelopes or signature don't read"))?;
     Ok((target, handover))
+}
+
+/// The most envelopes a hand-over holds (Switch wire 3.12, 9.2 `max_handover_parts`).
+const MAX_PARTS: usize = 128;
+
+/// Who reads the stored hand-over (Switch wire 7.4.17).
+pub(super) enum Reader<'a> {
+    /// The signer.
+    Signer,
+    /// An own app that verified: only the target reads it.
+    OwnApp(&'a AppCert),
 }
 
 impl Service {
@@ -110,8 +130,8 @@ impl Service {
         Ok(Answer::ok(answer).with_head(Some(head)))
     }
 
-    /// `GET /v1/{id}/handover`, from the signer (`reader` `None`) or the own app `reader`
-    /// (Switch wire 7.4.17): the `PUT` body held, for the signer or the app it is for.
+    /// `GET /v1/{id}/handover`, from the signer or an own app (Switch wire 7.4.17): the `PUT`
+    /// body held, for the signer or the app it is for.
     ///
     /// # Errors
     ///
@@ -120,11 +140,14 @@ impl Service {
         &self,
         txn: &mut AccountTxn,
         signer: &ServiceSigner,
-        reader: Option<&AppCert>,
+        reader: Reader<'_>,
     ) -> Result<Answer, ApiError> {
         let stored = txn.handover().await.map_err(|e| store_error(&e))?;
         let stored = stored
-            .filter(|stored| reader.is_none_or(|app| app.app_id() == stored.target))
+            .filter(|stored| match reader {
+                Reader::Signer => true,
+                Reader::OwnApp(app) => app.app_id() == stored.target,
+            })
             .ok_or_else(none_held)?;
         let head = self
             .head(txn, signer)
@@ -142,18 +165,22 @@ mod tests {
     fn test_handover_put_body_refuses_unknown_members() {
         let sig = pubky_switch_core::enc::b64(&[0u8; 64]);
         let ok = format!(
-            r#"{{"app_id":"g7teif9k1ur75jrmidqk7z7u6w","handover":{{"envelopes":[],"sig":"{sig}"}}}}"#
+            r#"{{"app_id":"g7teif9k1ur75jrmidqk7z7u6w","handover":{{"envelopes":["AA"],"sig":"{sig}"}}}}"#
         );
         assert!(parse_put(ok.as_bytes()).is_ok());
         let outer = format!(
-            r#"{{"app_id":"g7teif9k1ur75jrmidqk7z7u6w","handover":{{"envelopes":[],"sig":"{sig}"}},"x":1}}"#
+            r#"{{"app_id":"g7teif9k1ur75jrmidqk7z7u6w","handover":{{"envelopes":["AA"],"sig":"{sig}"}},"x":1}}"#
         );
         assert!(parse_put(outer.as_bytes()).is_err());
         let inner = format!(
-            r#"{{"app_id":"g7teif9k1ur75jrmidqk7z7u6w","handover":{{"envelopes":[],"sig":"{sig}","x":1}}}}"#
+            r#"{{"app_id":"g7teif9k1ur75jrmidqk7z7u6w","handover":{{"envelopes":["AA"],"sig":"{sig}","x":1}}}}"#
         );
         assert!(parse_put(inner.as_bytes()).is_err());
         assert!(parse_put(br#"{"app_id":"g7teif9k1ur75jrmidqk7z7u6w"}"#).is_err());
+        let none = format!(
+            r#"{{"app_id":"g7teif9k1ur75jrmidqk7z7u6w","handover":{{"envelopes":[],"sig":"{sig}"}}}}"#
+        );
+        assert!(parse_put(none.as_bytes()).is_err(), "no envelope");
         assert!(parse_put(br#"{"app_id":"nope","handover":{"envelopes":[],"sig":"AA"}}"#).is_err());
     }
 }
