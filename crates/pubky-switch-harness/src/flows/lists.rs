@@ -6,7 +6,7 @@ use super::enrollment::enroll;
 use super::join::{app_status, events};
 use super::messaging::joined_as;
 use super::{ORIGIN, STEP_MS};
-use crate::parties::{Asking, NOTES_LISTS};
+use crate::parties::{Asking, NOTES_LISTS, notes_protocol};
 use crate::{FlowResult, World};
 
 /// alice's app `pad` holds `lists.manage` and not `lists.read`. It saves bob as a contact,
@@ -24,7 +24,7 @@ pub async fn lists_without_read(world: &World) -> FlowResult {
     world.add_switch(ORIGIN, &[&alice]).await?;
     let mut signer = enroll(world, &alice, ORIGIN).await?;
     let asking = Asking::for_scope(world.app_keys(&alice, "pad")?, NOTES_LISTS)?;
-    let (mut pad, _) = joined_as(world, &alice, &mut signer, asking).await?;
+    let (mut pad, _) = joined_as(world, &alice, &mut signer, asking, notes_protocol()).await?;
 
     pad.add_contact(&bob.public()).await?;
     world.outcome("contact saved", &app_status(&mut pad));

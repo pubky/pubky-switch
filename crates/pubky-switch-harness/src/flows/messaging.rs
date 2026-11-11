@@ -89,22 +89,22 @@ pub(crate) async fn joined(
     name: &str,
 ) -> Result<(App, Arc<TestProtocol>), Box<dyn std::error::Error>> {
     let asking = Asking::new(world.app_keys(identity, name)?)?;
-    joined_as(world, identity, signer, asking).await
+    joined_as(world, identity, signer, asking, notes_protocol()).await
 }
 
-/// The app that asks with `asking`, approved by `identity`'s `signer` and joined, with its
-/// protocol.
+/// The app that asks with `asking`, approved by `identity`'s `signer` and joined with
+/// `protocol`.
 pub(crate) async fn joined_as(
     world: &World,
     identity: &TestIdentity,
     signer: &mut Signer,
     asking: Asking,
+    protocol: Arc<TestProtocol>,
 ) -> Result<(App, Arc<TestProtocol>), Box<dyn std::error::Error>> {
     let review = signer.review(asking.request.signed(), &asking.auth)?;
     let approved = signer.approve(review).await?;
     signer.claim_delivered(&approved.request).await?;
     world.advance_ms(STEP_MS);
-    let protocol = notes_protocol();
     let mut app = App::join(
         world.app_env(Arc::new(MemoryStore::new())),
         protocol.clone(),

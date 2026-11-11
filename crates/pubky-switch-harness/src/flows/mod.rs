@@ -13,7 +13,10 @@ mod enrollment;
 mod join;
 mod lists;
 mod messaging;
+mod removal;
 mod renewal;
+mod restore;
+mod watching;
 
 use std::future::Future;
 use std::pin::Pin;
@@ -25,7 +28,10 @@ pub use enrollment::enrollment;
 pub use join::join;
 pub use lists::lists_without_read;
 pub use messaging::messaging;
+pub use removal::{departure, revocation};
 pub use renewal::renewal;
+pub use restore::restore;
+pub use watching::watching;
 
 use crate::{FlowResult, World};
 
@@ -49,6 +55,10 @@ pub const FLOWS: &[(&str, Flow)] = &[
     }),
     ("claim", |world| Box::pin(claim(world))),
     ("renewal", |world| Box::pin(renewal(world))),
+    ("revocation", |world| Box::pin(revocation(world))),
+    ("departure", |world| Box::pin(departure(world))),
+    ("watching", |world| Box::pin(watching(world))),
+    ("restore", |world| Box::pin(restore(world))),
 ];
 
 /// The flow that sends `call` to the service; `None` for a call the service doesn't serve
@@ -60,9 +70,12 @@ pub fn flow_of(call: &Call) -> Option<&'static str> {
         Call::Ops | Call::Feed | Call::GetKeys(_) | Call::GetAllow => Some("join"),
         Call::Append | Call::PutPeers | Call::Directory => Some("messaging"),
         Call::GetClaim(_) => Some("claim"),
-        // Served, and waiting for their flows: a renewal with its full-bundle request, a
-        // revocation and a departure.
-        Call::RequestKeys(_) | Call::Revoke(_) | Call::Leave(_) => None,
+        Call::Revoke(_) => Some("revocation"),
+        Call::Leave(_) => Some("departure"),
+        // Served, and waiting for its flow: an app asks for a full bundle only when it
+        // lacks an epoch's keys, and no honest flow leaves it lacking one while the service
+        // keeps every bundle part (the restore flow shows it).
+        Call::RequestKeys(_) => None,
         // Not served yet.
         Call::PostConnect
         | Call::GetConnect
