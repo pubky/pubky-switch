@@ -502,20 +502,34 @@ impl ScriptedSwitch {
 
     /// The next service of a cooperative move, staged, with this account imported: the same
     /// sequence, chain, apps, cursors and shared state, under its own service key (Switch
-    /// spec 12.5 step 3). It serves once it is delivered an `identity.json` naming its key.
+    /// spec 12.5 step 3), at the origin the freeze names, or this switch's own when it isn't
+    /// frozen. It serves once it is delivered an `identity.json` naming that origin and its
+    /// key.
     pub fn import_into(&self, service_secret: [u8; 32]) -> Arc<Self> {
-        self.continue_into(service_secret, false)
+        self.continue_into(service_secret, false, None)
+    }
+
+    /// [`ScriptedSwitch::import_into`] at `origin`, whatever the freeze names: for a move
+    /// a test scripts without a freeze.
+    pub fn import_into_at(&self, service_secret: [u8; 32], origin: &str) -> Arc<Self> {
+        self.continue_into(service_secret, false, Some(origin))
     }
 
     /// The same account under a new service key at the next generation, a key change in
-    /// place: as [`ScriptedSwitch::import_into`], but the batch records keep their proofs,
+    /// place, at this switch's origin: as [`ScriptedSwitch::import_into`], but the batch
+    /// records keep their proofs,
     /// so a batch sent again unchanged gets its original proofs, signed with the earlier
     /// generation's key (Switch wire 6.4 step 6).
     pub fn change_key_into(&self, service_secret: [u8; 32]) -> Arc<Self> {
-        self.continue_into(service_secret, true)
+        self.continue_into(service_secret, true, None)
     }
 
-    fn continue_into(&self, service_secret: [u8; 32], keep_proofs: bool) -> Arc<Self> {
+    fn continue_into(
+        &self,
+        service_secret: [u8; 32],
+        keep_proofs: bool,
+        origin: Option<&str>,
+    ) -> Arc<Self> {
         let inner = self.lock();
         let mut next = Inner::fresh(
             clone_key(&inner.identity),
@@ -559,6 +573,16 @@ impl ScriptedSwitch {
         next.reachable_since = inner.reachable_since.clone();
         next.open_admission = inner.open_admission;
         next.directory_version = inner.directory_version;
+        // A key change in place serves where this switch does; the next service of a move
+        // serves where the freeze names it (Switch spec 12.5).
+        next.origin = match origin {
+            Some(origin) => origin.to_owned(),
+            None => inner
+                .frozen
+                .as_ref()
+                .and_then(|signed| Freeze::verify(signed, &inner.identity.public()).ok())
+                .map_or_else(|| inner.origin.clone(), |freeze| freeze.next().url.clone()),
+        };
         Arc::new(Self {
             inner: Mutex::new(next),
         })
@@ -805,7 +829,8 @@ impl ScriptedSwitch {
     }
 
     /// Deliver an own `identity.json` (the signer's `PUT /identity`): an `identity` chain
-    /// item. A document naming this switch's service key makes a staged switch serve.
+    /// item. A document naming this switch's origin and service key makes a staged switch
+    /// serve.
     ///
     /// # Errors
     ///

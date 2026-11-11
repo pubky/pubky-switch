@@ -338,6 +338,34 @@ mod tests {
         assert!(body.get("current").is_none(), "{body}");
     }
 
+    #[test]
+    fn test_scripted_switch_key_change_in_place_serves_at_its_origin_only() {
+        // Switch wire 3.7, 7.3 step 7: a staged account serves once the newest
+        // `identity.json` names its origin and its service key; a key change in place keeps
+        // the origin.
+        use pubky_switch_core::records::{IdentityBody, IdentityDoc, IdentityPolicy, Inbox};
+        let seeds = Seeds::default();
+        let alice = TestIdentity::new(&seeds, "alice");
+        let origin = "https://other-switch.example";
+        let clock = Arc::new(TestClock::new(START_MS));
+        let switch = ScriptedSwitch::unenrolled_at(alice.key(), [4; 32], clock, origin);
+        let changed = switch.change_key_into([5; 32]);
+        let doc = |url: &str, version: u64| {
+            let mut body = IdentityBody::first(
+                alice.public(),
+                alice.signer_id(),
+                Inbox::new(url, changed.service_key()),
+                IdentityPolicy::default(),
+            );
+            body.version = version;
+            IdentityDoc::sign(alice.key(), body).unwrap()
+        };
+        changed.deliver_identity(&doc(SWITCH_ORIGIN, 1)).unwrap();
+        assert!(changed.lock().staged, "another origin");
+        changed.deliver_identity(&doc(origin, 2)).unwrap();
+        assert!(!changed.lock().staged);
+    }
+
     fn request(origin: &str, path: &str) -> Request {
         Request {
             method: "GET".into(),

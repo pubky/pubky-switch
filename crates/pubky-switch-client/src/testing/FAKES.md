@@ -138,7 +138,8 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   `lagging` is false, as on the service. The test call `forget_bundle_parts` scripts a faulty service
   that lost an app's stored parts.
 - **Moves and recovery** (Switch spec 12.5, 12.6, Switch wire 10): `import_into` copies the
-  account in memory, with no manifest, chunks or export transfer; a recovery upload is kept
+  account in memory, with no manifest, chunks or export transfer, to serve at the origin the
+  freeze names (`import_into_at` names one for a move a test scripts without a freeze); a recovery upload is kept
   and answered with fixed changes, merging nothing.
 - **Revocation** is `POST /apps/{app_id}/revoke` from the signer, and the test call
   `revoke`; an app that left is answered as one revoked already, with no proof. `leave` is a

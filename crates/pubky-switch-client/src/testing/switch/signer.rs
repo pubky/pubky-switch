@@ -186,13 +186,18 @@ impl Inner {
     }
 
     /// Chain a delivered `identity.json` and hold it; returns the delivery's transition
-    /// proof. A document naming this switch's service key makes a staged switch serve, and
+    /// proof. A document naming this switch's origin and service key makes a staged switch
+    /// serve, and
     /// one at a later generation moves the chain on to it (Switch wire 6.5 "Import").
     pub(super) fn chain_identity(&mut self, doc: &IdentityDoc) -> Result<SignedDoc, ScriptError> {
         if doc.generation() > self.tip.generation {
             self.tip.generation = doc.generation();
         }
-        if doc.inbox().service_key == self.service.verifying_key().to_bytes() {
+        // The staged gate: the document names this service, its origin and its key
+        // (Switch wire 3.7, 7.3 step 7).
+        if doc.inbox().url == self.origin
+            && doc.inbox().service_key == self.service.verifying_key().to_bytes()
+        {
             self.staged = false;
         }
         let bytes = doc.signed().doc_bytes()?;
