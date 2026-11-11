@@ -33,10 +33,11 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   view.
 - **`invite_code.delete`** of a code the switch doesn't hold is `404`; the core has no rule
   for it.
-- **Key bundle parts** the target's cursor passed are never dropped (Switch wire 6.2).
-- **`keys_through`** (Switch wire 7.4.12) counts every stored part as fetched, whatever the
-  app's cursor: the epoch of the first version listing the app, raised by each part that
-  continues it.
+- **Key bundle parts** go as the service drops them, by the core's `parts_to_drop`: at a
+  `key_bundle.put` and at the `cursor.set` that passes them, the parts the target's cursor
+  has passed and its `keys_through` covers, unless a full bundle was requested before the
+  part (Switch wire 6.2). Where `keys_through` starts rises to the height the dropped parts
+  gave. `keys_through` itself is the core's (7.4.12), over the parts the cursor passed.
 
 ## State and retention
 
