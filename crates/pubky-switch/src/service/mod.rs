@@ -879,10 +879,20 @@ impl Service {
                             Err(error) => answer = Answer::error(&error).with_head(fallback_head),
                         }
                     }
-                    Some(Deferred::Records(read)) => match Self::records_body(*read).await {
-                        Ok(body) => answer.body = body,
-                        Err(error) => answer = Answer::error(&error).with_head(fallback_head),
-                    },
+                    Some(Deferred::Records(read)) => {
+                        let read = Self::records_body(*read).await;
+                        // Signed once the lock is gone: only while the account still names the
+                        // key, as every such answer (7.4.16). A page read from a snapshot taken
+                        // before an erasure committed still reads its rows, so this runs on a
+                        // page read as well as on a failure.
+                        if let Some(error) = self.no_longer_keyed(&txn_account, &txn_key).await {
+                            return self.operator_answer(signature, base_ms, &error).await;
+                        }
+                        match read {
+                            Ok(body) => answer.body = body,
+                            Err(error) => answer = Answer::error(&error).with_head(fallback_head),
+                        }
+                    }
                     Some(Deferred::Feed(read)) => {
                         return match self.feed_page(&read, &signer).await {
                             Ok((page, at)) => sign_answer(&signer, signature, at, page),
