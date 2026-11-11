@@ -230,7 +230,10 @@ mod tests {
             .await
             .expect("bob");
         drop(bob);
-        assert_eq!(queued(&reading, "bob"), 0, "bob's queue is gone");
+        assert!(
+            !accounts(&reading).contains_key("bob"),
+            "bob's queue is gone"
+        );
         // A wait past its timeout is refused, and leaves the queue as it was.
         let late = tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -241,7 +244,10 @@ mod tests {
         assert!(matches!(late, Err(StoreError::LockTimeout)));
         assert_eq!(queued(&reading, "alice"), 1);
         drop(second);
-        assert_eq!(queued(&reading, "alice"), 0, "alice's queue is gone");
+        assert!(
+            !accounts(&reading).contains_key("alice"),
+            "alice's queue is gone"
+        );
     }
 
     #[tokio::test]
