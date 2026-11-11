@@ -1600,6 +1600,22 @@ fn upload_at_next(lost: &Lost, body: &str) -> (u16, serde_json::Value) {
 }
 
 #[tokio::test]
+async fn test_loss_upload_refusals_come_in_the_services_order() {
+    // As at the service (Switch wire 7.2, 7.4.14): the caller's own checks before the body,
+    // so an app not current at the next switch yet gets `403 not_current` for a body that
+    // doesn't read; once it is current, `400`.
+    let store = Arc::new(MemoryStore::new());
+    let lost = lost_world(Arc::clone(&store) as Arc<dyn StateStore>).await;
+    let (status, body) = upload_at_next(&lost, "not json");
+    assert_eq!((status, body["code"].as_str()), (403, Some("not_current")));
+    follow_loss(&lost, store as Arc<dyn StateStore>)
+        .await
+        .unwrap();
+    let (status, body) = upload_at_next(&lost, "not json");
+    assert_eq!((status, body["code"].as_str()), (400, Some("bad_request")));
+}
+
+#[tokio::test]
 async fn test_loss_upload_is_limited_per_hour_and_the_lists_are_capped() {
     // As at the service (Switch wire 7.4.14, 9.4): past `uploads_per_app_per_hour` an upload
     // is `429 rate_limited` until the next hour of the switch's clock, and list entries past

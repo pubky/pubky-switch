@@ -2039,6 +2039,32 @@ impl Inner {
         request: &Request,
         caller: Option<[u8; 16]>,
     ) -> Result<Answer, ScriptError> {
+        // In the service's order: the caller's own checks, then the stage, then the body
+        // (Switch wire 7.2, 7.4.14). A staged service takes an app's evidence before the app
+        // registers there (Switch spec 12.5 step 3).
+        let Some(app) = caller else {
+            return Ok(bad(
+                ErrorCode::PermissionMissing,
+                "an own app uploads",
+                json!(null),
+            ));
+        };
+        let cert = if self.staged {
+            None
+        } else {
+            match self.own_call(&app) {
+                Ok(cert) => Some(cert),
+                Err(refusal) => return Ok(batch::refused(&refusal)),
+            }
+        };
+        // Neither after a provider loss nor in a move (Switch wire 7.4.14 "Which stage").
+        if !self.staged && self.recovery_from.is_none() && self.continued_from.is_none() {
+            return Ok(bad(
+                ErrorCode::NotFound,
+                "neither after a provider loss nor in a move",
+                json!(null),
+            ));
+        }
         let Ok(body) = serde_json::from_slice::<Value>(&request.body) else {
             return Ok(bad(ErrorCode::BadRequest, "upload", json!(null)));
         };
@@ -2049,16 +2075,8 @@ impl Inner {
         if self.staged {
             return Ok((200, json!({ "heads": heads, "proofs": proofs })));
         }
-        if let Some(recovery_from) = self.recovery_from {
-            return self.loss_upload(&request.body, caller, recovery_from);
-        }
-        // Neither after a provider loss nor in a move (Switch wire 7.4.14 "Which stage").
-        if self.continued_from.is_none() {
-            return Ok(bad(
-                ErrorCode::NotFound,
-                "neither after a provider loss nor in a move",
-                json!(null),
-            ));
+        if let (Some(recovery_from), Some(cert)) = (self.recovery_from, cert) {
+            return self.loss_upload(&request.body, app, &cert, recovery_from);
         }
         let changes = json!({ "records": [], "divergent": [], "claims": [],
                               "divergent_claims": [], "unverified": 0, "distrusted": 0,
@@ -2078,22 +2096,12 @@ impl Inner {
     fn loss_upload(
         &mut self,
         body: &[u8],
-        caller: Option<[u8; 16]>,
+        app: [u8; 16],
+        cert: &AppCert,
         recovery_from: u64,
     ) -> Result<Answer, ScriptError> {
-        let Some(app) = caller else {
-            return Ok(bad(
-                ErrorCode::PermissionMissing,
-                "an own app uploads",
-                json!(null),
-            ));
-        };
-        let cert = match self.own_call(&app) {
-            Ok(cert) => cert,
-            Err(refusal) => return Ok(batch::refused(&refusal)),
-        };
         let upload = match UploadBody::parse(body).and_then(|upload| {
-            upload.check_permissions(&cert)?;
+            upload.check_permissions(cert)?;
             Ok(upload)
         }) {
             Ok(upload) => upload,
@@ -2145,7 +2153,7 @@ impl Inner {
             now,
             &mut changes,
         );
-        if upload.ends_staged_admission(&cert) {
+        if upload.ends_staged_admission(cert) {
             self.admission_staged = false;
         }
         let proof = self.service_transition(ServiceTransition::Upload {

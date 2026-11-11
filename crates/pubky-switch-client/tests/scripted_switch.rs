@@ -657,8 +657,9 @@ async fn test_testing_upload_in_neither_stage_is_404() {
             "switch-app",
             &pubky_switch_core::enc::zbase32_encode(&app.app_id()),
         )],
-        body: b"{}".to_vec(),
+        body: b"not json".to_vec(),
     };
+    // Before the body is read.
     let answer = s.alice.switch().handle(&request).unwrap();
     assert_eq!(
         (answer.status, code_of(&answer).as_str()),
