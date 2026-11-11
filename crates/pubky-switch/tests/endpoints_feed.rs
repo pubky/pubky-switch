@@ -827,21 +827,28 @@ async fn test_feed_refusal_after_a_wait_is_never_signed_earlier_than_a_read() {
     let later = ms(&at) + 30_000;
     // The wait reads once at its own time, again after a commit stamped 30 s later, then
     // its last read fails: the refusal is signed at the later time, not the request's.
-    let (answer, ()) = tokio::join!(read(&replay, "wallet", "?after=1:9&wait=1", &at), async {
-        tokio::time::sleep(Duration::from_millis(200)).await;
+    // The wait is long enough that only the notifications end it, never its deadline: the
+    // last step wakes it again, so the test takes about a second however slow the machine.
+    let (answer, ()) = tokio::join!(read(&replay, "wallet", "?after=1:9&wait=20", &at), async {
+        // Subscribed: the wait has started, and reads after this point.
+        while replay.service.changes().waiting() == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         sql(
             &replay,
             &format!("UPDATE accounts SET stamped_time_ms = {later} WHERE id = $1"),
         )
         .await;
         sql(&replay, "SELECT pg_notify('pubky_switch_changes', $1)").await;
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // Time for the wait to wake and read at the later stamp before its next read fails.
+        tokio::time::sleep(Duration::from_millis(1_000)).await;
         sql(&replay, "UPDATE accounts SET last_seq = 10 WHERE id = $1").await;
         sql(
             &replay,
             "ALTER TABLE chain_items RENAME TO chain_items_gone",
         )
         .await;
+        sql(&replay, "SELECT pg_notify('pubky_switch_changes', $1)").await;
     });
     assert_eq!(
         answer.status,

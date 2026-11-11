@@ -312,12 +312,19 @@ impl OpsState {
         }
     }
 
-    /// Whether `app` is served now: current ([`Self::is_current`]) and its certificate
-    /// unexpired (Switch wire 3.8 check 3). Only the claim rules take it, for which an
-    /// expired app counts as not current (spec 3.2, 10.2); a caller's own expiry is check 3
-    /// on its request.
+    /// Whether `app` is served now: judged on the certificate it is checked against
+    /// ([`Self::checked_cert`], wire 3.8 "Which certificate"), the one authentication uses:
+    /// neither revoked nor departed, that certificate listed or in an open renewal in the
+    /// newest `identity.json`, and unexpired (check 3). Not on whichever of the app's
+    /// certificates passes: while a renewal's closing is pending, an earlier certificate
+    /// still open must not keep an app served whose listed renewal has expired, since its
+    /// requests are refused. Only the claim rules take it, for which an expired app counts
+    /// as not current (spec 3.2, 10.2).
     pub fn is_served(&self, app: &[u8; 16]) -> bool {
-        self.current_by(app, true)
+        let (Some(doc), Some(cert)) = (&self.doc, self.checked_cert(app)) else {
+            return false;
+        };
+        !self.kept.contains(app) && doc.current_now(app, &cert.hash()) && !cert.expired_at(self.now)
     }
 
     /// Whether `app` is current (Switch spec 3.4): neither revoked nor departed, and its
@@ -327,7 +334,17 @@ impl OpsState {
     /// it back with nothing lost. So entries wait for it (wire 9.1), and an append's targets
     /// (7.4.3 check 5), `stale_key`'s members (7.6) and the directory (7.4.10) take it.
     pub fn is_current(&self, app: &[u8; 16]) -> bool {
-        self.current_by(app, false)
+        let (Some(held), Some(doc)) = (self.apps.get(app), &self.doc) else {
+            return false;
+        };
+        if self.kept.contains(app) {
+            return false;
+        }
+        let record_cert = held.record.as_ref().map(AppRecord::cert);
+        [held.renewed.as_ref(), record_cert]
+            .into_iter()
+            .flatten()
+            .any(|cert| doc.current_now(app, &cert.hash()))
     }
 
     /// The App IDs reachable (Switch wire 7.4.10): current ([`Self::is_current`]) and with
@@ -384,22 +401,6 @@ impl OpsState {
             .filter(|app| self.is_current(app))
             .copied()
             .collect()
-    }
-
-    fn current_by(&self, app: &[u8; 16], expiry: bool) -> bool {
-        let (Some(held), Some(doc)) = (self.apps.get(app), &self.doc) else {
-            return false;
-        };
-        if self.kept.contains(app) {
-            return false;
-        }
-        let record_cert = held.record.as_ref().map(AppRecord::cert);
-        [held.renewed.as_ref(), record_cert]
-            .into_iter()
-            .flatten()
-            .any(|cert| {
-                doc.current_now(app, &cert.hash()) && !(expiry && cert.expired_at(self.now))
-            })
     }
 
     /// The writer's view of a record, as `GET /records` returns it and a `409`'s

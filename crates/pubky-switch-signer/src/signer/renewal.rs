@@ -816,6 +816,13 @@ impl Signer {
         for app_id in due {
             match self.renew(app_id, CertChange::default()).await {
                 Ok(_) => renewed.push(app_id),
+                // At the size a delivery may carry: no renewal can be delivered, and the
+                // near-limit alert tells the user (design note, section 11).
+                Err(SignerError::Refused(Refusal::IdentityTooLarge { .. }))
+                    if self.flow.is_none() =>
+                {
+                    break;
+                }
                 Err(SignerError::Refused(
                     Refusal::NotJoined
                     | Refusal::NotListed
