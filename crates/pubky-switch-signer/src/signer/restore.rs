@@ -77,7 +77,8 @@ impl Signer {
     ///
     /// # Errors
     ///
-    /// [`Refusal::FlowInProgress`] while a flow is in progress; [`Refusal::HandingOver`] or
+    /// [`Refusal::Erased`] once the account is erased; [`Refusal::FlowInProgress`] while a
+    /// flow is in progress; [`Refusal::HandingOver`] or
     /// [`Refusal::TakingOver`] while a hand-over is in progress, which the abort or the
     /// take-over ends; [`Refusal::NoBackup`] when the
     /// Homeserver holds none; [`Refusal::UnreadableBackup`] for one that doesn't open or
@@ -85,6 +86,10 @@ impl Signer {
     /// otherwise as [`Signer::resume`].
     pub async fn restore(&mut self, confirmed: UserConfirmed) -> Result<IdentityDoc> {
         self.refresh().await?;
+        // An erased account has no switch to restore at (Switch spec 12.7).
+        if self.state.erased {
+            return Err(Refusal::Erased.into());
+        }
         if self.flow.is_some() {
             return Err(Refusal::FlowInProgress.into());
         }

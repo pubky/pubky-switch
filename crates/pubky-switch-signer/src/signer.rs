@@ -151,6 +151,10 @@ pub enum SignerStatus {
     /// nothing is signed, an owed closing included, until the user clears the alert
     /// ([`Signer::clear_alert`]) and the switch is confirmed again.
     Alarm,
+    /// The identity's account at its switch is being erased ([`Signer::close_account`]):
+    /// `identity.json` may be off the Homeserver already, and nothing else is signed until
+    /// the erasure is done or aborted ([`Signer::abort_erasure`]).
+    Erasing,
     /// The identity's account at its switch is erased ([`Signer::close_account`]): the
     /// records stay, and nothing more is signed for it.
     Erased,
@@ -333,7 +337,11 @@ impl Signer {
                     policy,
                 } => self.enroll(&origin, &enrollment, policy).await?,
                 Flow::TakingOver { delivery, .. } => self.take_over(delivery).await?,
-                Flow::Erase { unpublished } => self.erase(unpublished).await?,
+                Flow::Erase {
+                    unpublished,
+                    reminded,
+                    unanswered,
+                } => self.erase(unpublished, reminded, unanswered).await?,
                 Flow::Deliver {
                     doc,
                     prev,
@@ -363,6 +371,9 @@ impl Signer {
 
     /// Where the signer stands.
     pub fn status(&self) -> SignerStatus {
+        if matches!(self.flow, Some(Flow::Erase { .. })) {
+            return SignerStatus::Erasing;
+        }
         status_of(&self.state)
     }
 

@@ -411,9 +411,10 @@ impl Inner {
     /// `POST /v1/{id}/erase` from the signer (Switch wire 7.4.16): the body names the
     /// account's service key (`409 conflict` for another), and a move in progress refuses it
     /// (`409 conflict`): a frozen account, whose export this switch doesn't track, and a staged
-    /// one holding an import. Then the account is erased, and every later call, a retry
-    /// included, gets the operator's `404`. The answer is signed with the service key, without
-    /// a head.
+    /// one holding an import, but not one staged for a key change in place. Then the account is
+    /// erased, and every later call, a retry included, gets the operator's `404`. The answer
+    /// is signed with the service key, without a head; an app's call is `403
+    /// permission_missing`.
     pub(super) fn erase_answer(&mut self, body: &[u8]) -> Answer {
         let key = match pubky_switch_core::http::parse_erase_body(body) {
             Ok(key) => key,
@@ -426,7 +427,7 @@ impl Inner {
                 json!(null),
             );
         }
-        if self.frozen.is_some() || (self.staged && self.continued_from.is_some()) {
+        if self.frozen.is_some() || (self.staged && self.holds_import) {
             return bad(ErrorCode::Conflict, "a move is in progress", json!(null));
         }
         self.erased = true;

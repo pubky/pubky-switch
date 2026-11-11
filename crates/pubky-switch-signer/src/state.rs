@@ -416,6 +416,14 @@ pub(crate) enum Flow {
     Erase {
         /// The Homeserver's files are deleted.
         unpublished: bool,
+        /// The App IDs whose grant reminder this erasure raised: withdrawn if it ends without
+        /// erasing the account.
+        #[serde(default)]
+        reminded: Vec<[u8; 16]>,
+        /// An erasure request went out and no answer came back: it may have landed, so the
+        /// operator's `404` now means it did (Switch wire 7.4.16).
+        #[serde(default)]
+        unanswered: bool,
     },
     /// Delivering a new `identity.json` version, then publishing it.
     Deliver {

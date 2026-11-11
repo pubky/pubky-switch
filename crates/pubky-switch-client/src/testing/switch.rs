@@ -215,6 +215,9 @@ pub(crate) struct Inner {
     pub(crate) recovery_from: Option<u64>,
     /// The generation an imported sequence continues from, after a cooperative move.
     pub(crate) continued_from: Option<u64>,
+    /// A staged account holding a cooperative move's import, not a key change in place: it
+    /// refuses an erasure until the move is aborted (Switch wire 7.4.16).
+    pub(crate) holds_import: bool,
     /// When the recovery was declared: its recovery record's time (Switch spec 12.6 step 1).
     pub(crate) recovery_declared_at: Option<u64>,
     /// The service keys of the earlier generations whose proofs an import carried, by
@@ -311,6 +314,7 @@ impl Inner {
             erased: false,
             recovery_from: None,
             continued_from: None,
+            holds_import: false,
             recovery_declared_at: None,
             proof_keys: BTreeMap::new(),
             any_first_n: false,
@@ -459,6 +463,7 @@ impl ScriptedSwitch {
         );
         next.seq = inner.seq;
         next.continued_from = Some(inner.tip.generation);
+        next.holds_import = !keep_proofs;
         // The proofs this switch signed travel with the records and claims, checked with its
         // key for its generation (Switch wire 3.3).
         next.proof_keys = inner.proof_keys.clone();
@@ -1275,6 +1280,11 @@ impl Inner {
         let own_leave = format!("apps/{me}/leave");
         Ok(match (request.method.as_str(), route) {
             ("GET", "handover") => self.handover_answer(Some(app)),
+            ("POST", "erase") => bad(
+                ErrorCode::PermissionMissing,
+                "the erasure is the signer's",
+                json!(null),
+            ),
             ("POST", "ops") => self.ops(caller, &request.body)?,
             ("POST", "inbox") => self.append(request, None, query)?,
             ("GET", "feed") => self.feed(caller, query),

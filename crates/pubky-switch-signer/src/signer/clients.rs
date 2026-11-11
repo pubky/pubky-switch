@@ -78,9 +78,13 @@ impl Named {
     ///
     /// # Errors
     ///
-    /// [`SignerError::NotNamed`] while another install is the signer, and
-    /// [`Refusal::RecordsBehind`] while the records are behind its own newer version.
+    /// [`Refusal::Erased`] once the account is erased, [`SignerError::NotNamed`] while another
+    /// install is the signer, and [`Refusal::RecordsBehind`] while the records are behind its
+    /// own newer version.
     pub(crate) fn check(state: &SignerState) -> Result<Self> {
+        if state.erased {
+            return Err(Refusal::Erased.into());
+        }
         if let Some(install) = state.managed_by {
             return Err(SignerError::NotNamed { install });
         }

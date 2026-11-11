@@ -142,11 +142,18 @@ pub enum Refusal {
     /// signed for it.
     #[error("refused: the account is erased")]
     Erased,
-    /// The switch refused the erasure (`409 conflict`): during a move, or for a service key
-    /// that isn't the account's (Switch wire 7.4.16). Nothing was erased, and `identity.json`
-    /// is published again.
+    /// The switch refused the erasure (`409 conflict`), as it does during a move (Switch wire
+    /// 7.4.16). Nothing was erased: `identity.json` is published again, and the grant
+    /// reminders the erasure raised are withdrawn.
     #[error("refused: the switch refused the erasure")]
     ErasureRefused,
+    /// No erasure is in progress to abort.
+    #[error("refused: no erasure is in progress")]
+    NotErasing,
+    /// An erasure request went unanswered, so it may have erased the account: the erasure
+    /// can't be aborted, and [`crate::Signer::resume`] sends it again to learn the outcome.
+    #[error("refused: the erasure may have reached the switch")]
+    ErasureUnanswered,
     /// This install is taking the identity over: it signs nothing but its first delivery
     /// until that has won (Switch wire 3.12).
     #[error("refused: the identity is being taken over")]
