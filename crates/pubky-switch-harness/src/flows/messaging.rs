@@ -80,7 +80,8 @@ pub async fn messaging(world: &World) -> FlowResult {
     Ok(())
 }
 
-/// `identity`'s app `name`, approved by `signer` and joined, with its protocol.
+/// `identity`'s app `name`, approved by `signer` for the [`NOTES`](crate::parties::NOTES)
+/// scope and joined, with its protocol.
 pub(crate) async fn joined(
     world: &World,
     identity: &TestIdentity,
@@ -88,6 +89,17 @@ pub(crate) async fn joined(
     name: &str,
 ) -> Result<(App, Arc<TestProtocol>), Box<dyn std::error::Error>> {
     let asking = Asking::new(world.app_keys(identity, name))?;
+    joined_as(world, identity, signer, asking).await
+}
+
+/// The app that asks with `asking`, approved by `identity`'s `signer` and joined, with its
+/// protocol.
+pub(crate) async fn joined_as(
+    world: &World,
+    identity: &TestIdentity,
+    signer: &mut Signer,
+    asking: Asking,
+) -> Result<(App, Arc<TestProtocol>), Box<dyn std::error::Error>> {
     let review = signer.review(asking.request.signed(), &asking.auth)?;
     let approved = signer.approve(review).await?;
     signer.claim_delivered(&approved.request).await?;

@@ -108,6 +108,12 @@ const COUNTER_START: &str = "The wire format says when `apps_version` and `direc
     move at the same events, so the scripted switch's is one more; a sender only hands the \
     number back.";
 
+/// A list operation in the feed of an app that may not read the lists.
+const UNREAD_LIST_ITEM: &str = "The first item is the pad's own `allow.put`, the contact it \
+    saved. The pad holds `lists.manage` and not `lists.read`, so the service shows it the \
+    operation as a stub; the scripted switch applies no visibility rule and shows every chain \
+    item in full. The app does the same with both: it checks the stub and moves on.";
+
 /// Every accepted difference: those of the two switches as a whole, then by flow.
 pub static ALLOWED: &[Allowed] = &[
     Allowed {
@@ -165,6 +171,33 @@ pub static ALLOWED: &[Allowed] = &[
         scripted: ONE_MORE,
         reason: COUNTER_START,
         reference: "Switch wire 7.4.3, the answer's `directory_version`; 7.4.10",
+    },
+    Allowed {
+        flow: "lists without read",
+        label: "{alice/pad} GET /v1/{alice}/feed",
+        fact: "body.items[0].type",
+        service: "text stub",
+        scripted: "text chain",
+        reason: UNREAD_LIST_ITEM,
+        reference: "Switch wire 7.5: `allow.*` is for apps with `lists.read`",
+    },
+    Allowed {
+        flow: "lists without read",
+        label: "{alice/pad} GET /v1/{alice}/feed",
+        fact: "body.items[0].item*",
+        service: NOTHING,
+        scripted: "*",
+        reason: UNREAD_LIST_ITEM,
+        reference: "Switch wire 7.5: a stub carries `seq` and `stub`, no `item_type` or `item`",
+    },
+    Allowed {
+        flow: "lists without read",
+        label: "{alice/pad} GET /v1/{alice}/feed",
+        fact: "body.items[0].proof*",
+        service: NOTHING,
+        scripted: "*",
+        reason: UNREAD_LIST_ITEM,
+        reference: "Switch wire 7.5: a stub carries `seq` and `stub`, no `proof`",
     },
 ];
 

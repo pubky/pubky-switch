@@ -10,6 +10,7 @@
 
 mod enrollment;
 mod join;
+mod lists;
 mod messaging;
 
 use std::future::Future;
@@ -19,6 +20,7 @@ use pubky_switch::http::route::Call;
 
 pub use enrollment::enrollment;
 pub use join::join;
+pub use lists::lists_without_read;
 pub use messaging::messaging;
 
 use crate::{FlowResult, World};
@@ -38,6 +40,9 @@ pub const FLOWS: &[(&str, Flow)] = &[
     ("enrollment", |world| Box::pin(enrollment(world))),
     ("join", |world| Box::pin(join(world))),
     ("messaging", |world| Box::pin(messaging(world))),
+    ("lists without read", |world| {
+        Box::pin(lists_without_read(world))
+    }),
 ];
 
 /// The flow that sends `call` to the service; `None` for a call the service doesn't serve
