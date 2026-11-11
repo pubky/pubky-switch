@@ -151,9 +151,9 @@ PostgreSQL.
 | Setting | Default | Meaning |
 |---|---|---|
 | `url` | none | the connection URL; `PUBKY_SWITCH_DATABASE_URL` overrides it, and keeps the password out of the file |
-| `max_connections` | `16` | most connections in the request pool. Each instance also opens one more, outside the pool, for the change listener that wakes feed long-polls: size PostgreSQL's `max_connections` for `instances × (max_connections + 1)` |
+| `max_connections` | `16` | most connections in the request pool. The keyed section that signs an answer once its request's transaction has ended (a commit, or a refusal before the lock) takes one of them for a moment, so a request uses up to two in turn, never two at once. Each instance also opens one more, outside the pool, for the change listener that wakes feed long-polls: size PostgreSQL's `max_connections` for `instances × (max_connections + 1)` |
 | `acquire_timeout_ms` | `5000` | how long a request waits for a free connection |
-| `lock_timeout_ms` | `10000` | how long a request waits for its account's lock before it gives up with `503 unavailable` |
+| `lock_timeout_ms` | `10000` | how long a request waits for its account's lock before it gives up with `503 unavailable`; also how long an answer's keyed section waits for an erasure or a key change holding the account's keying lock, and how long an erasure waits for the keyed sections in progress, each answered `503 unavailable` past it |
 | `migrate_on_start` | `true` | apply pending schema migrations at start; safe with several instances |
 | `snapshot_readers` | `4` | most reads at once that run after the account's lock on a snapshot of the state under it (`GET /allow`, a `GET /records` page), each on a connection of its own on top of `max_connections`; a request waits for one before it takes the lock |
 | `connect_retry_ms` | `30000` | how long the service keeps trying to reach the database at start, while it refuses connections or is still starting up, before it exits. It covers the request pool only: the change listener connects once the pool is up, without this retry, and a failure there stops the service |

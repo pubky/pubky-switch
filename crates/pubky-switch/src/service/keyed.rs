@@ -3,7 +3,11 @@
 //!
 //! An answer of an account's key is signed by [`Service::sign_keyed`], with a [`Proof`]:
 //! - [`Proof::Locked`]: the request holds the account's row lock, uncommitted, so no erasure
-//!   or change of the key can commit meanwhile, and the key is the transaction's;
+//!   or change of the key can commit meanwhile, and the key is the transaction's. Only for
+//!   what goes out after the same transaction commits, such as the erasure's confirmation:
+//!   the commit proves the lock was held all along. A statement that failed may mean the
+//!   database ended the transaction and its lock with it, so an answer to a failure under the
+//!   lock goes through [`Service::sign_after_failure`] instead;
 //! - [`Proof::Checked`]: anything else, a commit already made included. The answer is signed
 //!   inside a keyed section ([`crate::store::Store::while_keyed`]), under the account's shared
 //!   keying lock, which an erasure and a key change take exclusive before they sign their own
@@ -32,8 +36,8 @@ use crate::{
 /// What shows the account still names the key an answer is signed with.
 pub(super) enum Proof<'a> {
     /// The request holds the account's row lock and hasn't committed: the key is `txn`'s.
-    /// The borrow is the proof: the transaction, and with it the lock, lives while the
-    /// answer is signed.
+    /// The borrow keeps the transaction alive while the answer is signed; only what goes out
+    /// after that transaction commits may use it (the module's doc).
     Locked(#[allow(dead_code)] &'a AccountTxn),
     /// Checked in a keyed section: `account` names `key`, or, with `pending`, has it as its
     /// pending key of the next generation.
@@ -210,6 +214,36 @@ impl Service {
                 .await
             }
         }
+    }
+
+    /// The answer to a request whose transaction failed under the account's lock: a database
+    /// that ended the transaction released its lock, and an erasure may have committed
+    /// since. So the transaction is dropped first, holding no second connection, and the
+    /// answer is signed only in a keyed section (the module's doc).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn sign_after_failure(
+        &self,
+        txn: AccountTxn,
+        signer: &ServiceSigner,
+        request_signature: Option<&[u8; 64]>,
+        time_ms: u64,
+        answer: Answer,
+        base_ms: u64,
+        by_signer: bool,
+    ) -> SwitchResponse {
+        let account = txn.head().id.clone();
+        let key = txn.head().service_key.clone();
+        drop(txn);
+        self.sign_keyed(
+            Proof::checked(&account, &key),
+            signer,
+            request_signature,
+            time_ms,
+            answer,
+            base_ms,
+            by_signer,
+        )
+        .await
     }
 
     /// The operator's answer in place of one an account's key couldn't sign.

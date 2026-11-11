@@ -720,6 +720,7 @@ impl Service {
         delivered: Option<&Result<peers::Delivered, ApiError>>,
     ) -> SwitchResponse {
         let signature = request_signature.as_ref();
+        let by_signer = caller.is_some_and(|c| c.caller == Caller::Signer);
         // The time the account last committed, for an answer whose commit fails.
         let committed_ms = txn.head().stamped_time_ms;
         // Step 3: the identity's service time, which never goes back.
@@ -745,14 +746,14 @@ impl Service {
             let _ = store_error(&error);
             let error = ApiError::unavailable("7.6: a temporary failure");
             return self
-                .sign_keyed(
-                    Proof::Locked(&txn),
+                .sign_after_failure(
+                    txn,
                     &signer,
                     signature,
                     committed_ms,
                     Answer::error(&error),
                     base_ms,
-                    false,
+                    by_signer,
                 )
                 .await;
         }
@@ -762,14 +763,14 @@ impl Service {
             tracing::error!(%failure, "a snapshot for a read after the lock");
             let error = ApiError::unavailable("7.6: a temporary failure");
             return self
-                .sign_keyed(
-                    Proof::Locked(&txn),
+                .sign_after_failure(
+                    txn,
                     &signer,
                     signature,
                     committed_ms,
                     Answer::error(&error),
                     base_ms,
-                    false,
+                    by_signer,
                 )
                 .await;
         }
@@ -782,14 +783,14 @@ impl Service {
                 let _ = store_error(&error);
                 let error = ApiError::unavailable("7.6: a temporary failure");
                 return self
-                    .sign_keyed(
-                        Proof::Locked(&txn),
+                    .sign_after_failure(
+                        txn,
                         &signer,
                         signature,
                         committed_ms,
                         Answer::error(&error),
                         base_ms,
-                        false,
+                        by_signer,
                     )
                     .await;
             }
@@ -811,14 +812,14 @@ impl Service {
                     tracing::error!(%failure, "rolling back a refused request");
                     let error = ApiError::unavailable("7.6: a temporary failure");
                     return self
-                        .sign_keyed(
-                            Proof::Locked(&txn),
+                        .sign_after_failure(
+                            txn,
                             &signer,
                             signature,
                             committed_ms,
                             Answer::error(&error),
                             base_ms,
-                            false,
+                            by_signer,
                         )
                         .await;
                 }
@@ -860,7 +861,6 @@ impl Service {
         }
         let txn_account = txn.head().id.clone();
         let txn_key = txn.head().service_key.clone();
-        let by_signer = caller.is_some_and(|c| c.caller == Caller::Signer);
         let fallback_head = if answer.deferred.is_some() {
             self.head(&txn, &signer).await
         } else {
