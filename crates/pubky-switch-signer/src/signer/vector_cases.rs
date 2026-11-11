@@ -1369,3 +1369,90 @@ async fn reduction_at_the_edge(old: &mut OldSigner) -> ([u8; 16], CertChange) {
     };
     (wallet, change)
 }
+
+/// alice rotated her key in place before the loss: her version 4, at generation 2, names
+/// generation 1's key in `service_keys`. Her service then loses everything, and she recovers
+/// there: the version leaves out every generation at or below `recovery_from`, so nothing
+/// resolves a lost generation's key (Switch wire 3.3, spec 12.6 step 1).
+#[tokio::test]
+async fn test_vectors_old_signer_recovers_without_the_lost_generations_service_keys() {
+    let mut old = old_signer().await;
+    let v3 = IdentityDoc::verify(&document("alice identity.json"), &old.key.public()).unwrap();
+    let mut body = v3.body().clone();
+    body.version = 4;
+    body.generation = 2;
+    body.service_keys
+        .push(pubky_switch_core::records::ServiceKeyEntry {
+            generation: 1,
+            key: [0x11; 32],
+        });
+    let rotated = IdentityDoc::sign(&old.key, body).unwrap();
+    old.switch.deliver_identity(&rotated).unwrap();
+    old.signer
+        .delivered(rotated.signed().clone(), Some(v3.hash()), None)
+        .await
+        .unwrap();
+    old.switch.lose_identity();
+    // At the scripted switch's own origin, which its enrollment names.
+    let recovered = old
+        .signer
+        .declare_provider_loss(
+            pubky_switch_client::testing::SWITCH_ORIGIN,
+            UserConfirmed::shown_and_confirmed(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(recovered.generation(), 3);
+    assert_eq!(recovered.body().recovery_from, Some(2));
+    assert!(recovered.body().service_keys.is_empty());
+    assert_eq!(old.switch.identity_doc().unwrap().hash(), recovered.hash());
+}
+
+/// A listed app whose certificate this install doesn't hold may hold `lists.manage`, so the
+/// recovery leaves the staged admission for its upload, failing closed (Switch spec 12.6
+/// step 2). The backup's seal refuses such a version before any delivery (Switch wire
+/// 3.12), so the rule is held here on its own.
+#[tokio::test]
+async fn test_vectors_old_signer_counts_an_unknown_certificate_as_managing_lists() {
+    let mut old = old_signer().await;
+    let v3 = IdentityDoc::verify(&document("alice identity.json"), &old.key.public()).unwrap();
+    let mut body = v3.body().clone();
+    let held = old.signer.held_certs().unwrap();
+    body.apps.retain(|listed| {
+        held.iter()
+            .find(|cert| cert.hash() == listed.cert)
+            .is_some_and(|cert| !cert.has_permission(Permission::ListsManage))
+    });
+    assert!(!body.apps.is_empty(), "an app without lists.manage");
+    let without = IdentityDoc::sign(&old.key, body).unwrap();
+    assert!(!old.signer.listed_may_manage_lists(&without).unwrap());
+    old.signer.state.certs.clear();
+    assert!(old.signer.listed_may_manage_lists(&without).unwrap());
+}
+
+/// A recovery whose version, naming a longer origin, the cap can't take is refused before
+/// its enrollment is sent: nothing at the service, and the user may declare it at another
+/// origin (Switch spec 12.6 step 1, wire 7.1).
+#[tokio::test]
+async fn test_vectors_old_signer_refuses_a_recovery_over_the_cap_before_enrolling() {
+    let mut old = old_signer().await;
+    with_renewed(&mut old, 1_560, Some(VECTOR_START_MS)).await;
+    old.switch.lose_identity();
+    let sent = old.transport.requests().len();
+    let long = format!("https://{}.example", "a".repeat(200));
+    let refused = old
+        .signer
+        .declare_provider_loss(&long, UserConfirmed::shown_and_confirmed())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            refused,
+            SignerError::Refused(Refusal::IdentityTooLarge { .. })
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(old.transport.requests().len(), sent, "nothing sent");
+    assert!(old.signer.flow.is_none());
+    assert!(!old.signer.state.recovering);
+}

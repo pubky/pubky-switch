@@ -55,6 +55,7 @@ mod clients;
 mod erasure;
 pub(crate) mod gate;
 mod handover;
+mod recovery;
 mod renewal;
 mod restore;
 mod revocation;
@@ -119,7 +120,8 @@ impl HighWater {
 }
 
 /// Where the signer stands.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SignerStatus {
     /// Set up, but no switch has accepted a first `identity.json` yet: [`Signer::resume`]
     /// finishes the enrollment.
@@ -168,6 +170,21 @@ pub enum SignerStatus {
     /// The identity's account at its switch is erased ([`Signer::close_account`]): the
     /// records stay, and nothing more is signed for it.
     Erased,
+    /// A provider loss is declared ([`Signer::declare_provider_loss`]) and the service at
+    /// `origin` hasn't taken the recovery's version yet: [`Signer::resume`] goes on with it,
+    /// and nothing else is signed meanwhile (Switch spec 12.6 step 1). Declaring it again, at
+    /// that service or another, replaces it.
+    Recovering {
+        /// The service the recovery goes to.
+        origin: String,
+    },
+    /// The service at `origin` refused the recovery's version for good: nothing is sent there
+    /// again, and the recovery waits for the user to declare it again, at that service or
+    /// another (Switch spec 12.6 step 1). Nothing else is signed meanwhile.
+    RecoveryRefused {
+        /// The service that refused it.
+        origin: String,
+    },
 }
 
 /// Where the records `state` stand: what holds signing back is the signing gate's verdict
@@ -302,6 +319,27 @@ impl Signer {
             if self.state.erased {
                 return Ok(());
             }
+            // A restore's recovery taken after the restore: the version naming this install
+            // comes next, as the restore would have signed it (Switch wire 3.13), after the
+            // copies a restore checks first. The switch's is the version just delivered. The
+            // Homeserver's must be neither newer nor another body at it, and the backup must
+            // name neither another install that took over nor a newer own version; the one
+            // this install was restored from holds that version itself, and is no take-over.
+            if self.state.owes_own_version && gate::refusal(&self.state).is_none() {
+                self.check_before_own_version().await?;
+                self.sign_own_version().await?;
+                continue;
+            }
+            // Right after a recovery's delivery, before its publication, which is how apps
+            // find the new service: the revocations its version still lists go there, so no
+            // app revoked is current there meanwhile. The version removing them follows
+            // (Switch spec 12.6 step 1).
+            if self.state.revoke_at_service {
+                self.revoke_at_switch().await?;
+                let mut state = self.state.clone();
+                state.revoke_at_service = false;
+                self.commit(state, self.flow.clone()).await?;
+            }
             // While a hand-over is in progress nothing routine is signed: its own step only,
             // and owed work stays owed (Switch wire 3.12).
             if self.state.handing_over.is_some() {
@@ -326,9 +364,48 @@ impl Signer {
                 self.check_owed_deletions().await?;
                 // A removed app's record goes once its removal is published (Switch spec
                 // 12.2 step 4).
-                return self.clean_up_removed().await;
+                self.clean_up_removed().await?;
+                // The end of a staged admission comes last, after publication, which is how
+                // apps find the new service: it stays owed, and is sent again at the next
+                // run, without holding any other step back (Switch spec 12.6 step 2).
+                // Only once published: a version waiting for an alarm to be cleared waits
+                // with it (Switch wire 7.4.14).
+                let published = self.state.newest.as_ref().is_some_and(|n| n.published);
+                if published
+                    && self.state.admission_owed
+                    && self.end_owed_admission().await.is_err()
+                {
+                    let mut state = self.state.clone();
+                    state.alert(Alert::AdmissionNotEnded);
+                    if state != self.state {
+                        self.commit(state, self.flow.clone()).await?;
+                    }
+                }
+                return Ok(());
             }
         }
+    }
+
+    /// The copies a restore checks before it signs the version naming this install (Switch
+    /// wire 3.13), checked again before the owed one (the caller's comment).
+    async fn check_before_own_version(&mut self) -> Result<()> {
+        let Some(newest) = self.state.newest_doc()? else {
+            return Ok(());
+        };
+        self.judge_homeserver(&newest).await?;
+        let found = self
+            .env
+            .homeserver
+            .get(SIGNER_BACKUP_PATH)
+            .await
+            .map_err(SignerError::Homeserver)?;
+        if let Some(found) = found.and_then(|bytes| self.open_backup(&bytes).transpose()) {
+            let found = found?;
+            if found.identity_doc.hash() != newest.hash() {
+                self.judge_backup(&found).await?;
+            }
+        }
+        Ok(())
     }
 
     /// Run the flow in progress to its end.
@@ -347,6 +424,7 @@ impl Signer {
                     policy,
                 } => self.enroll(&origin, &enrollment, policy).await?,
                 Flow::TakingOver { delivery, .. } => self.take_over(delivery).await?,
+                Flow::Recover { origin, enrollment } => self.recover(&origin, &enrollment).await?,
                 Flow::Erase {
                     unpublished,
                     reminded,
@@ -382,13 +460,34 @@ impl Signer {
 
     /// Where the signer stands.
     pub fn status(&self) -> SignerStatus {
-        match self.flow {
+        match &self.flow {
             Some(Flow::Erase {
                 first_404_ms: Some(since_ms),
                 ..
-            }) => return SignerStatus::ErasedUnconfirmed { since_ms },
+            }) => {
+                return SignerStatus::ErasedUnconfirmed {
+                    since_ms: *since_ms,
+                };
+            }
             Some(Flow::Erase { .. }) => return SignerStatus::Erasing,
             _ => {}
+        }
+        // A recovery shows as one while its own gate lets it go on: another install named,
+        // records behind, a hand-over or a take-over stop it as they stop every step.
+        if self.state.recovering && gate::recovery_refusal(&self.state).is_none() {
+            let origin = match &self.flow {
+                Some(Flow::Recover { origin, .. }) => Some(origin.clone()),
+                _ => self
+                    .state
+                    .recovery_origin
+                    .clone()
+                    .or_else(|| self.state.service.as_ref().map(|s| s.origin.clone())),
+            }
+            .unwrap_or_default();
+            return match self.flow {
+                Some(_) => SignerStatus::Recovering { origin },
+                None => SignerStatus::RecoveryRefused { origin },
+            };
         }
         status_of(&self.state)
     }
@@ -584,6 +683,11 @@ impl Signer {
         if self.flow.is_some() {
             return Err(Refusal::FlowInProgress.into());
         }
+        // A recovery in progress has no switch whose copy to read: the lost one can't be
+        // asked, and the new one holds nothing yet (Switch spec 12.6 step 1).
+        if self.state.recovering {
+            return Err(Refusal::Recovering.into());
+        }
         // The copies are read first, so a take-over or records behind are found also while an
         // alarm holds signing back; then the signing gate decides.
         let read = self.check_copies().await?;
@@ -620,6 +724,12 @@ impl Signer {
     async fn judge_backup(&mut self, found: &BackupView) -> Result<()> {
         let doc = &found.identity_doc;
         let mark = self.state.newest_doc()?;
+        // The backup this install's records came from, before a version of its own: it
+        // holds nothing they don't, as after a restore whose delivery of that version was
+        // refused mid-recovery (Switch spec 12.6 step 1).
+        if mark.as_ref().is_some_and(|mark| mark.hash() == doc.hash()) && self.state.recovering {
+            return Ok(());
+        }
         let mark_prev = self.state.newest.as_ref().and_then(|n| n.prev);
         if found.taken_over(&self.state.install, mark.as_ref(), mark_prev) {
             return self.managed_by(doc.body().signer).await;
@@ -705,12 +815,32 @@ impl Signer {
         room: Room,
     ) -> Result<(IdentityDoc, Flow)> {
         let newest = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
-        let version = newest
+        let body = self.next_body_on(&newest, change, room)?;
+        let doc = IdentityDoc::sign(key, body)?;
+        let flow = Flow::Deliver {
+            doc: doc.signed().clone(),
+            prev: Some(newest.hash()),
+            backup: None,
+            step: DeliverStep::Signed,
+        };
+        Ok((doc, flow))
+    }
+
+    /// The body of the next version built on `base` with `change`, at a version above both
+    /// `base`'s and every version this install signed, measured against the cap with `room`.
+    /// Nothing is signed.
+    fn next_body_on(
+        &self,
+        base: &IdentityDoc,
+        change: impl FnOnce(&mut IdentityBody),
+        room: Room,
+    ) -> Result<IdentityBody> {
+        let version = base
             .version()
             .max(self.state.signed_through)
             .checked_add(1)
             .ok_or_else(|| SignerError::Records("the version can't go higher".into()))?;
-        let mut body = newest.body().clone();
+        let mut body = base.body().clone();
         body.version = version;
         body.signer = self.state.install;
         change(&mut body);
@@ -727,7 +857,8 @@ impl Signer {
             // Every time is written at the same length, three fraction digits (wire 1.6).
             entry.until.get_or_insert(0);
         }
-        let prev = Some(newest.hash());
+        // Measured as a delivery built on `base`, which a recovery's `null` is no longer than.
+        let prev = Some(base.hash());
         for measure in measures(&self.state, &closed, prev)? {
             if over_cap(measure.bytes, measure.limit, room) {
                 return Err(Refusal::IdentityTooLarge {
@@ -738,14 +869,7 @@ impl Signer {
                 .into());
             }
         }
-        let doc = IdentityDoc::sign(key, body)?;
-        let flow = Flow::Deliver {
-            doc: doc.signed().clone(),
-            prev,
-            backup: None,
-            step: DeliverStep::Signed,
-        };
-        Ok((doc, flow))
+        Ok(body)
     }
 
     /// Refuse every signing call while another install is the signer (Switch spec 4.3).
@@ -965,17 +1089,72 @@ impl Signer {
                     // none. The backup may be another install's, so nothing is written.
                     self.unreadable_before_mark().await.map(|()| None)
                 }
+                // A recovery can't ask the lost service whether another install took over:
+                // the Homeserver's copy is asked instead (Switch spec 12.6 step 1).
+                None if self.state.recovering => self
+                    .homeserver_agrees()
+                    .await
+                    .map(|()| Some(Alert::BackupUnreadable)),
                 None => {
                     self.switch_at_mark().await?;
                     Ok(Some(Alert::BackupUnreadable))
                 }
             },
+            None if self.state.recovering => self
+                .homeserver_agrees()
+                .await
+                .map(|()| Some(Alert::BackupMissing)),
             None if self.state.newest.is_some() => {
                 self.switch_at_mark().await?;
                 Ok(Some(Alert::BackupMissing))
             }
             None => Ok(None),
         }
+    }
+
+    /// While a recovery is in flight, the check a missing or unreadable backup is written over
+    /// on: the lost service can't say whether another install took over, so the Homeserver's
+    /// `identity.json`, which names the signer (Switch spec 4.3), must agree that this install
+    /// signs and isn't ahead of its records. A copy that is missing or doesn't verify agrees
+    /// only when the declaration waived it: the records explained it, or the user confirmed
+    /// them (Switch spec 12.6 step 1).
+    async fn homeserver_agrees(&mut self) -> Result<()> {
+        let held = self
+            .env
+            .homeserver
+            .get(IDENTITY_PATH)
+            .await
+            .map_err(SignerError::Homeserver)?;
+        let waived = self.state.homeserver_copy_waived;
+        let Some(bytes) = held else {
+            return if waived {
+                Ok(())
+            } else {
+                Err(Refusal::HomeserverCopyMissing.into())
+            };
+        };
+        let copy = serde_json::from_slice::<SignedDoc>(&bytes)
+            .ok()
+            .and_then(|signed| IdentityDoc::verify(&signed, &self.state.identity).ok());
+        let Some(copy) = copy else {
+            return if waived {
+                Ok(())
+            } else {
+                Err(Refusal::HomeserverCopyUnreadable.into())
+            };
+        };
+        let signer = copy.body().signer;
+        let mark = self.high_water().map_or(0, |h| h.version);
+        // Another install's copy below the mark is one this install signed over already.
+        if signer != self.state.install && copy.version() >= mark {
+            return self.managed_by(signer).await;
+        }
+        if signer == self.state.install && copy.version() > self.state.signed_through {
+            return self
+                .records_behind(Source::Homeserver, copy.version())
+                .await;
+        }
+        Ok(())
     }
 
     /// A backup this install can't open, found before its first version was delivered: keep
@@ -1035,6 +1214,27 @@ impl Signer {
                 .alerts
                 .retain(|alert| *alert != Alert::AccountNotHosted),
             None => {}
+        }
+        // Whether the end of a staged admission is owed is the switch's to say (Switch wire
+        // 7.4.12 `recovery`), so a restore or a take-over finds it too: owed while the wait is
+        // staged and no listed app could end it, or the user asked; never once it ended or
+        // without a recovery (Switch spec 12.6 step 2).
+        if let Ok(answer) = &read {
+            match &answer.recovery {
+                Some(recovery) if recovery.admission_staged => {
+                    if let Some(newest) = state.newest_doc()?
+                        && !self.listed_may_manage_lists(&newest)?
+                    {
+                        state.admission_owed = true;
+                    }
+                }
+                _ => {
+                    state.admission_owed = false;
+                    state
+                        .alerts
+                        .retain(|alert| *alert != Alert::AdmissionNotEnded);
+                }
+            }
         }
         let mut flow = self.flow.clone();
         if signed && let Some(Flow::Erase { first_404_ms, .. }) = flow.as_mut() {
@@ -1131,8 +1331,13 @@ impl Signer {
             .map(|cert| AppCert::verify(cert, &identity))
             .collect::<std::result::Result<Vec<_>, _>>()?;
         let limits = self.service()?.limits;
-        // Sealing signs the backup, so it takes the gated key.
-        let key = self.signing_key()?;
+        // Sealing signs the backup, so it takes the gated key: a recovery's, while one is
+        // delivered (Switch spec 12.6 step 1).
+        let key = if self.state.recovering {
+            gate::recovery_key(&self.keyring, &self.state)?
+        } else {
+            self.signing_key()?
+        };
         Ok(key.seal_backup(
             doc,
             &self.state.tombstones,
@@ -1140,6 +1345,7 @@ impl Signer {
             limits,
             &self.state.bundle_parts,
             prev,
+            &self.state.picked_distrust(),
         )?)
     }
 
@@ -1164,6 +1370,18 @@ impl Signer {
                 current,
                 ..
             }) => self.stale(&current, doc, prev).await,
+            // A refusal the pinned key didn't sign, while recovering at a service an earlier
+            // declaration enrolled at: one that took that version answers under the key it
+            // serves, so it is read under that key (Switch wire 3.7, 7.4.2).
+            Err(error @ ClientError::BadServiceSignature { status: 409 })
+                if self.state.recovering =>
+            {
+                let origin = self.service()?.origin;
+                if self.taken_under_an_earlier_key(&origin, true).await? {
+                    return Ok(());
+                }
+                Err(error.into())
+            }
             Err(
                 error @ ClientError::Switch {
                     status: 400 | 413, ..
@@ -1189,6 +1407,14 @@ impl Signer {
     ) -> Result<()> {
         let mut state = self.state.clone();
         let verified = IdentityDoc::verify(&doc, &state.identity);
+        // A recovery's version, the only delivery while one is declared: the new service's
+        // account is the one served from here (Switch spec 12.6 step 1). Whether the end of
+        // its staged admission is owed, the next `GET /apps` says, publication's check first.
+        if state.recovering
+            && let Ok(delivered) = &verified
+        {
+            Self::recovered_in(&mut state, delivered);
+        }
         if let (Some(at), Ok(delivered)) = (delivered_at, &verified) {
             for app in &delivered.body().apps {
                 if !state.listed_at.iter().any(|(id, _)| *id == app.app_id) {
@@ -1262,6 +1488,9 @@ impl Signer {
         if copy.as_ref().is_some_and(|copy| copy.signed() == &doc) {
             return self.delivered(doc, prev, None).await;
         }
+        if let Some(copy) = copy.as_ref().filter(|copy| self.own_recovery_version(copy)) {
+            return self.own_recovery_held(copy.clone()).await;
+        }
         match self.judge_copy(copy.as_ref()) {
             Err(alert) => self.alarm(alert).await,
             Ok(Verdict::Newer) => match copy {
@@ -1277,6 +1506,44 @@ impl Signer {
                 Err(stale_without_copy())
             }
         }
+    }
+
+    /// Whether `copy`, while a recovery is in progress, is a version of that recovery this
+    /// install signed: its own, declaring the same generation lost, at a version it spent
+    /// (Switch spec 12.6 step 1), as an earlier declaration's version the service took, its
+    /// answer lost; or, after a restore mid-recovery, the backup's version it was restored
+    /// from.
+    pub(super) fn own_recovery_version(&self, copy: &IdentityDoc) -> bool {
+        // A restore's recovery is built on the backup's version itself, which the install
+        // the backup came from signed (Switch wire 3.13).
+        let restored = self.state.recovery_base.as_ref().is_some_and(|base| {
+            base == copy.signed()
+                && copy.body().recovery_from.is_some()
+                && copy.body().recovery_from == self.state.lost_generation
+        });
+        self.state.recovering
+            && (restored
+                || (copy.body().signer == self.state.install
+                    && copy.body().recovery_from.is_some()
+                    && copy.body().recovery_from == self.state.lost_generation
+                    && copy.version() <= self.state.signed_through))
+    }
+
+    /// The service holds `copy`, a version of the recovery in progress ([`Signer::
+    /// own_recovery_version`]): naming that service and the key pinned for it, the one its
+    /// answer verified with, it is the recovery's version delivered, as its answer would have
+    /// said. Naming another, it was taken elsewhere and this delivery is over: the recovery
+    /// waits to be declared again. Never records behind: this install signed it for this
+    /// recovery.
+    pub(super) async fn own_recovery_held(&mut self, copy: IdentityDoc) -> Result<()> {
+        let names_it = self.state.service.as_ref().is_some_and(|service| {
+            service.origin == copy.inbox().url && service.service_key == copy.inbox().service_key
+        });
+        if !names_it {
+            self.commit(self.state.clone(), None).await?;
+            return Err(stale_without_copy());
+        }
+        self.delivered(copy.signed().clone(), None, None).await
     }
 
     /// Judge a copy of `identity.json` from the switch against the high-water mark (Switch
@@ -1460,6 +1727,12 @@ impl Signer {
         self.switch_at_mark().await?;
         let mine = IdentityDoc::verify(&newest.doc, &self.state.identity)?;
         let already = self.judge_homeserver(&mine).await?;
+        // A recovery's version, the one version delivered while an alarm may be held, waits
+        // for the user to clear it, as a publication over another body does (Switch spec 12.6
+        // step 1): only the switch's alarms go with the lost service.
+        if !already && gate::held_alarm(&self.state).is_some() {
+            return Ok(());
+        }
         if !already {
             let bytes =
                 serde_json::to_vec(&newest.doc).map_err(|e| SignerError::Records(e.to_string()))?;
@@ -1476,6 +1749,7 @@ impl Signer {
         });
         state.homeserver_other = None;
         state.republish_over = None;
+        state.ever_published = true;
         self.commit(state, self.flow.clone()).await
     }
 }

@@ -1204,3 +1204,37 @@ async fn test_restore_refused_next_version_leaves_the_source_signing() {
     );
     assert_eq!(world.homeserver.file(SIGNER_BACKUP_PATH).unwrap(), held);
 }
+
+#[tokio::test]
+async fn test_restore_in_place_starts_the_untaken_renewals_again() {
+    // An app stopped after two untaken automatic renewals. An in-place restore takes the
+    // backup's records, which don't carry the count: it starts again from none, and the
+    // stopped alert goes with it, so the app is renewed again and no stale alert stays
+    // (Switch spec 3.1, 12.8).
+    const DAY_MS: u64 = 86_400_000;
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let app = App::with_keys(
+        AppKeys::from_secrets([3; 32], [4; 32]),
+        &["notes"],
+        None,
+        [9; 32],
+    );
+    world.approve(&mut signer, &app).await;
+    let stopped = |signer: &Signer| {
+        signer
+            .alerts()
+            .iter()
+            .any(|a| matches!(a, Alert::RenewalsStopped { .. }))
+    };
+    for _ in 1..=3 {
+        world.clock.advance_ms(365 * DAY_MS / 2 + DAY_MS);
+        signer.run_due().await.unwrap();
+    }
+    assert!(stopped(&signer));
+    signer.restore(confirmed()).await.unwrap();
+    assert!(!stopped(&signer));
+    let id = app.keys.app_id_bytes();
+    world.clock.advance_ms(365 * DAY_MS / 2 + DAY_MS);
+    assert_eq!(signer.renew_expiring().await.unwrap(), [id]);
+}

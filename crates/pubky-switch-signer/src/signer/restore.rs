@@ -27,7 +27,9 @@
 //! written"). Records behind their own newer version, or an install another took over from,
 //! are restored in place this way.
 
+use pubky_switch_client::ClientError;
 use pubky_switch_client::client::answers::AppsAnswer;
+use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::records::{IDENTITY_PATH, IdentityDoc, SIGNER_BACKUP_PATH, app_record_path};
 use pubky_switch_core::sig::SignedDoc;
 
@@ -38,7 +40,7 @@ use super::{Signer, gate};
 use crate::alert::Alert;
 use crate::error::{Refusal, Result, SignerError};
 use crate::key::{BackupView, IdentityKeyring};
-use crate::state::{self, DeliverStep, Flow, Newest, Service, SignerState};
+use crate::state::{self, DeliverStep, Flow, Newest, Revoking, Service, SignerState};
 
 impl Signer {
     /// Set up this install from the signer backup on the Homeserver, for an identity whose
@@ -73,7 +75,11 @@ impl Signer {
     /// Restore this install's records from the signer backup on the Homeserver, in place:
     /// when they are behind a newer version of its own ([`Alert::RecordsBehind`]), or when
     /// another install signs and the user has this one take over (Switch spec 12.8, Switch
-    /// wire 3.13). Returns the version this install delivers as the signer.
+    /// wire 3.13). Returns the version this install delivers as the signer. A backup written
+    /// mid-recovery, holding the recovery's version, restores as that recovery in progress
+    /// (Switch spec 12.6 step 1): its version is delivered first, and when the service it
+    /// names doesn't take it, the restore returns it, the recovery to be resumed or declared
+    /// again ([`crate::SignerStatus::Recovering`], [`crate::SignerStatus::RecoveryRefused`]).
     ///
     /// # Errors
     ///
@@ -132,9 +138,30 @@ impl Signer {
             pinned: Some(service.service_key),
             identity,
         };
-        let answer = RequestClient::new(&self.env, &target, &self.keyring)?
+        let answer = match RequestClient::new(&self.env, &target, &self.keyring)?
             .apps()
-            .await?;
+            .await
+        {
+            Ok(answer) => answer,
+            // A backup written mid-recovery names the service the recovery went to, which
+            // holds a staged account and no document until it takes that version, or which
+            // can't be reached: it shows no copy, so the version is delivered first, and the
+            // recovery is in progress again (Switch spec 12.6 step 1, wire 3.13, 7.3).
+            Err(
+                ClientError::Switch {
+                    code: ErrorCode::Staged,
+                    ..
+                }
+                | ClientError::Transport(_),
+            ) if is_recovery(&view) => AppsAnswer {
+                apps: Vec::new(),
+                recovery: None,
+                proof_generations: Vec::new(),
+                identity: None,
+                server_time: 0,
+            },
+            Err(error) => return Err(error.into()),
+        };
         let first = self
             .check_restore(&view, answer.identity.as_ref(), in_place)
             .await?;
@@ -153,8 +180,49 @@ impl Signer {
             Vec::new()
         };
         let mut state = self.taken_records(&view, &answer, service, tombstones, cleanup);
+        // In place, the revocations this install asked for stay as they were, with the time
+        // the user picked and their alerts; those only the backup names are added.
         if in_place {
-            state.revoking.clone_from(&self.state.revoking);
+            for carried in &self.state.revoking {
+                if let Some(rebuilt) = state
+                    .revoking
+                    .iter_mut()
+                    .find(|r| r.app_id == carried.app_id)
+                {
+                    rebuilt.clone_from(carried);
+                    state.alerts.retain(|alert| {
+                        !matches!(alert, Alert::RevocationPending { app_id, at_switch: false }
+                            if *app_id == carried.app_id)
+                            || self.state.alerts.contains(alert)
+                    });
+                } else {
+                    state.revoking.push(carried.clone());
+                }
+            }
+        }
+        // A backup written mid-recovery holds the recovery's version, which the service it
+        // names doesn't hold yet: the recovery is in progress again, delivered first, and
+        // declared again elsewhere if that service refuses it (Switch spec 12.6 step 1).
+        if first == Some(None)
+            && is_recovery(&view)
+            && let Some(lost) = doc.body().recovery_from
+        {
+            state.recovering = true;
+            state.recovery_base = Some(doc.signed().clone());
+            state.lost_generation = Some(lost);
+            // The services this recovery enrolled at, kept in place for the same lost
+            // generation, and the one the backup's version names, under its key: declared
+            // again at one, it is read under that key first.
+            if in_place && self.state.recovering && self.state.lost_generation == Some(lost) {
+                state
+                    .recovery_services
+                    .clone_from(&self.state.recovery_services);
+            }
+            if let Some(service) = state.service.clone()
+                && !state.recovery_services.contains(&service)
+            {
+                state.recovery_services.push(service);
+            }
         }
         state.newest = Some(Newest {
             doc: doc.signed().clone(),
@@ -169,12 +237,25 @@ impl Signer {
             backup: None,
             step: DeliverStep::BackupWritten,
         });
+        let recovering = state.recovering;
         self.commit(state, deliver_first).await?;
-        self.finish_flow().await?;
+        match self.finish_flow().await {
+            Ok(()) => {}
+            // The recovery's version wasn't taken: the restore is done, the recovery in
+            // progress, resumed or declared again at another service from here.
+            Err(_) if recovering => return Ok(doc),
+            Err(error) => return Err(error),
+        }
 
-        // The next version, naming this install as the signer. It races any other signer, so
-        // its backup is owed, and written by `resume` once the delivery has won (Switch wire
-        // 3.13).
+        let next = self.sign_own_version().await?;
+        self.resume().await?;
+        Ok(next)
+    }
+
+    /// The next version, naming this install as the signer, committed for delivery: a
+    /// restore's, or a restore's recovery taken later (Switch wire 3.13). It races any other
+    /// signer, so its backup is owed, and written by `resume` once the delivery has won.
+    pub(super) async fn sign_own_version(&mut self) -> Result<IdentityDoc> {
         let key = self.signing_key()?;
         let (next, flow) = self.next_version_closing(&key, |_| {})?;
         drop(key);
@@ -189,6 +270,7 @@ impl Signer {
         let mut state = self.state.clone();
         state.signed_through = next.version();
         state.backup_owed = true;
+        state.owes_own_version = false;
         let flow = Flow::Deliver {
             doc: signed,
             prev,
@@ -196,7 +278,6 @@ impl Signer {
             step: DeliverStep::BackupWritten,
         };
         self.commit(state, Some(flow)).await?;
-        self.resume().await?;
         Ok(next)
     }
 
@@ -230,16 +311,22 @@ impl Signer {
             .state
             .alerts
             .iter()
+            // The count of untaken renewals starts again from none, and the alert it raised
+            // goes with it (Switch spec 3.1).
             .filter(|a| {
                 !matches!(
                     a,
-                    Alert::RecordsBehind { .. } | Alert::ManagedByOtherInstall { .. }
+                    Alert::RecordsBehind { .. }
+                        | Alert::ManagedByOtherInstall { .. }
+                        | Alert::RenewalsStopped { .. }
                 )
             })
             .cloned()
             .collect();
         state.service = Some(service);
         state.certs = view.certs.iter().map(|c| c.signed().clone()).collect();
+        // The install the records came from published its versions (Switch wire 3.12, 3.13).
+        state.ever_published = true;
         state.bundle_parts = view.bundle_parts.clone();
         state.cleanup = cleanup;
         tombstones.sort_unstable();
@@ -269,6 +356,35 @@ impl Signer {
             .copied()
             .filter(|app| doc.listed_cert(app).is_none() && !state.cleanup.contains(app))
             .collect();
+        // A revocation the records named but no version carried out yet: its App ID is a
+        // tombstone the document still lists. It is pending again, sent to the switch and
+        // completed by the version removing the app, its alert shown meanwhile (Switch spec
+        // 12.2). The time the user picked to distrust it from comes with it; records written
+        // without one give it the switch's revocation time.
+        for app_id in view
+            .revoked_apps
+            .iter()
+            .copied()
+            .filter(|app| doc.listed_cert(app).is_some())
+        {
+            if !state.revoking.iter().any(|r| r.app_id == app_id) {
+                let picked = view
+                    .pending_distrust
+                    .iter()
+                    .find(|p| p.app_id == app_id)
+                    .map(|p| p.distrust_from);
+                state.revoking.push(Revoking {
+                    app_id,
+                    distrust_from: picked,
+                    revoked_at: None,
+                    taken: false,
+                });
+                state.alert(Alert::RevocationPending {
+                    app_id,
+                    at_switch: false,
+                });
+            }
+        }
         state.tombstones = tombstones;
         state
     }
@@ -445,3 +561,17 @@ pub(super) fn removed_at_switch<'a>(
 
 /// How many removed apps' records a run checks for.
 const DELETION_CHECKS_PER_RUN: usize = 32;
+
+/// Whether the backup `view` holds the version that starts a recovery: `recovery_from` the
+/// generation before its own, built on none, since later versions of that generation keep
+/// `recovery_from` (Switch spec 12.6 step 1, wire 3.13).
+fn is_recovery(view: &BackupView) -> bool {
+    let doc = &view.identity_doc;
+    view.prev.is_none() && is_recovery_doc(doc)
+}
+
+/// Whether `doc` carries `recovery_from` the generation before its own.
+fn is_recovery_doc(doc: &IdentityDoc) -> bool {
+    doc.body().recovery_from.is_some()
+        && doc.body().recovery_from == doc.generation().checked_sub(1)
+}

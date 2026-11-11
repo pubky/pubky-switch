@@ -155,6 +155,7 @@ impl Signer {
                 &issued,
                 limits,
                 &self.state.bundle_parts,
+                &self.state.picked_distrust(),
                 cert,
                 &confirmed,
             )?
