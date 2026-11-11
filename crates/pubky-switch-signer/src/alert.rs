@@ -80,6 +80,10 @@ pub enum Alert {
     /// version this signer delivered, so no other install had taken over, and the signer
     /// wrote its own backup over it (Switch wire 3.13).
     BackupUnreadable,
+    /// The end of the staged admission a recovery started didn't go through at the new
+    /// service: it stays owed and is sent again at every run, and the alert goes once `GET
+    /// /apps` shows the wait ended (Switch spec 12.6 step 2).
+    AdmissionNotEnded,
     /// Before this install's first version was delivered, the Homeserver held a signer backup
     /// it can't open: another install may sign for the identity, or the file is damaged. The
     /// signer writes nothing and delivers nothing until the user deals with it (Switch wire

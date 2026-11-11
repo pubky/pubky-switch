@@ -141,6 +141,12 @@ impl RequestClient {
         self.0.revoke(app_id).await
     }
 
+    /// `POST /recovery/admission` (Switch wire 7.4.14): ends staged admission after a
+    /// provider loss. It signs nothing new.
+    pub(crate) async fn recovery_admission(&self) -> std::result::Result<WriteAnswer, ClientError> {
+        self.0.recovery_admission().await
+    }
+
     /// `POST /v1/enroll` (Switch wire 7.4.1): the enrollment signed already.
     pub(crate) async fn enroll(
         &self,

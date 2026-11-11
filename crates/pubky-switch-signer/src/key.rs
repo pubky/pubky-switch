@@ -40,7 +40,8 @@ use pubky_switch_core::enc::{kid, pubky_id};
 use pubky_switch_core::keys::IdentityKey;
 use pubky_switch_core::labels;
 use pubky_switch_core::records::{
-    AppCert, IdentityDoc, Limits, SignerBackup, SignerHandover, SignerRecords, StoredPart,
+    AppCert, IdentityDoc, Limits, RemovedApp, SignerBackup, SignerHandover, SignerRecords,
+    StoredPart,
 };
 use pubky_switch_core::signing::Signs;
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -472,6 +473,8 @@ pub(crate) struct BackupView {
     pub(crate) bundle_parts: Vec<StoredPart>,
     /// The document hash of the version `identity_doc` builds on.
     pub(crate) prev: Option<[u8; 32]>,
+    /// The `distrust_from` the user picked for each revocation not carried out yet.
+    pub(crate) pending_distrust: Vec<RemovedApp>,
 }
 
 impl BackupView {
@@ -484,6 +487,7 @@ impl BackupView {
             limits: *records.limits(),
             bundle_parts: records.bundle_parts().to_vec(),
             prev: records.prev(),
+            pending_distrust: records.pending_distrust().to_vec(),
         }
     }
 
@@ -529,6 +533,10 @@ impl SigningKey {
     /// # Errors
     ///
     /// The core's error for records that don't build or seal.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the backup's records, field by field"
+    )]
     pub(crate) fn seal_backup(
         &self,
         doc: IdentityDoc,
@@ -537,6 +545,7 @@ impl SigningKey {
         limits: Limits,
         parts: &[StoredPart],
         prev: Option<[u8; 32]>,
+        picked: &[RemovedApp],
     ) -> Result<SignerBackup, pubky_switch_core::Error> {
         let records = SignerRecords::new(
             IdentityKey::clone(&self.key),
@@ -546,7 +555,8 @@ impl SigningKey {
             limits,
             parts,
             prev,
-        )?;
+        )?
+        .with_pending_distrust(picked);
         SignerBackup::seal(&self.key, &records)
     }
 
@@ -571,6 +581,7 @@ impl SigningKey {
         issued: &[AppCert],
         limits: Limits,
         parts: &[StoredPart],
+        picked: &[RemovedApp],
         new_signer: &AppCert,
         _confirmed: &crate::signer::UserConfirmed,
     ) -> Result<SignerHandover, pubky_switch_core::Error> {
@@ -582,7 +593,8 @@ impl SigningKey {
             limits,
             parts,
             None,
-        )?;
+        )?
+        .with_pending_distrust(picked);
         SignerHandover::seal(&self.key, new_signer, &records)
     }
 }
@@ -940,7 +952,7 @@ pub(crate) mod tests {
         );
         let doc = IdentityDoc::sign(&key, body).unwrap();
         let backup = key
-            .seal_backup(doc, &[[2; 16]], &[], Limits::default(), &[], None)
+            .seal_backup(doc, &[[2; 16]], &[], Limits::default(), &[], None, &[])
             .unwrap();
         let view = keyring.open_backup(&backup).unwrap().unwrap();
         assert_eq!(view.revoked_apps, [[2; 16]]);
@@ -970,6 +982,7 @@ pub(crate) mod tests {
             limits: Limits::default(),
             bundle_parts: Vec::new(),
             prev,
+            pending_distrust: Vec::new(),
         };
         let (me, other) = ([1; 16], [2; 16]);
         let (built_on, elsewhere) = (Some([5; 32]), Some([9; 32]));

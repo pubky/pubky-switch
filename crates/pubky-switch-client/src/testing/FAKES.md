@@ -20,7 +20,9 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   one isn't refused. Every other request stamps the clock's time. Answers to own apps and
   the signer carry `Switch-Head`, refusals included, but a `401`, the enrollment and the
   erasure. An injected `401` fault is answered as before the lock, with the last stamped
-  time and no head; other injected faults with the clock's time and the head. Each operation's signature is
+  time and no head; other injected faults with the clock's time and the head. A request an
+  `Unreachable` fault stops keeps its body, which the test call `unreached_bodies` returns,
+  in order. Each operation's signature is
   verified, and an own app must be current with an unexpired certificate.
 - **Rates** (Switch wire 6.4 step 7, 9.4): no operation, control, per-caller or
   failed-authentication limits; never `429 rate_limited`.
@@ -146,21 +148,33 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   unless a test sets others (`set_enroll_limits`), and without checking the request
   signature. A switch made with `unenrolled` or `unenrolled_at` answers every other call
   with the operator's `404` until then. As at the service, the enrollment that makes the account sets its kept App IDs, and
-  every later one gets the same key and changes nothing. Unlike the service:
+  every later one gets the same key and changes nothing. As at the service, the same
+  enrollment again gets its kept answer first, with no other effect, signed with the key it
+  names. At a serving account, as at the service, a new enrollment is answered with a
+  pending key for the next generation, the same
+  for every such enrollment, signed with that key, and the App IDs it names are held with
+  it. Once a delivery starts a generation under the pending key, an enrollment the outgoing
+  key answered is `409 conflict` again, and one the pending key answered gets its answer
+  again. Unlike the service:
   - an enrollment's `identity_doc` isn't held, so the account starts with no document and
     at the switch's own generation, whatever the enrollment names;
-  - a serving account is answered `400`, never a pending key for the next generation, so
-    there is no key change in place and no provider loss at the same service.
+  - the pending key is derived from the account's, not random.
+
+  Its errors, injected ones and the `409 conflict` included, are signed with the operator
+  key, as at the service.
 - **`PUT /identity`** (Switch wire 3.3, 7.4.2), in `switch/signer.rs`: judged by the core's
   `check_delivery`, like the service, with the kept proofs taken from what it holds: each held
   record's current write proof and each live claim's entry proofs, by the generation each
   names, with the key of that generation (its own, or the earlier service's that
   `import_into` carried). A first document carrying `recovery_from` starts the recovery as
   at the service: the account takes its generation, and its chain starts with the `recovery`
-  transition, unless the switch was made `recovering`, which chained it already. Unlike the
-  service: there is no pending key, so no provider loss in place at a serving account, which
-  the service takes under its pending key, starting the account afresh; and a staged
-  account's generation change, a move's, is chained where the service answers `503`. The test call `deliver_identity` takes any document, without those
+  transition, unless the switch was made `recovering`, which chained it already. A document
+  naming the pending key with `recovery_from` is a provider loss in place, refused with
+  `400` when it lists an App ID held with that key: the account starts afresh under that
+  key, keeping its service time, its enrollments and the App IDs
+  to refuse, those held with the pending key among them. Unlike the service: a key change
+  in place, without `recovery_from`, is answered `400`; and a staged account's generation
+  change, a move's, is chained where the service answers `503`. The test call `deliver_identity` takes any document, without those
   checks, for scripting what another signer or a faulty service did. `forget_delivery_proof`
   makes a retry answer with no proof.
 - **Staged admission** (Switch spec 12.6 step 2, wire 7.4.14), in `switch/signer.rs` and

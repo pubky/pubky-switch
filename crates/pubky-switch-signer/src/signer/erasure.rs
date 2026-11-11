@@ -50,8 +50,8 @@
 //! backup. Nothing more is signed for the account, and a revocation or a restore is refused.
 //! The signer backup on the Homeserver stays, with the identity secret sealed to the
 //! identity's own backup key, naming the erased switch. Enrolling again after an erasure
-//! starts the account as after a provider loss (Switch wire 7.4.16), which this signer doesn't
-//! do yet.
+//! starts the account as after a provider loss (Switch wire 7.4.16):
+//! [`Signer::declare_provider_loss`], at the same service or another.
 
 use pubky_switch_client::ClientError;
 use pubky_switch_core::http::ErrorCode;
@@ -473,7 +473,10 @@ impl Signer {
 /// Withdraw from `state` the grant reminders an erasure raised, `reminded`, for apps its newest
 /// version still lists. A removed app's reminder stays: its grant's revocation is owed whether
 /// or not the account is erased (Switch spec 12.2 step 1).
-fn withdraw_reminders(state: &mut crate::state::SignerState, reminded: &[[u8; 16]]) -> Result<()> {
+pub(super) fn withdraw_reminders(
+    state: &mut crate::state::SignerState,
+    reminded: &[[u8; 16]],
+) -> Result<()> {
     let newest = state.newest_doc()?;
     let listed: Vec<[u8; 16]> = reminded
         .iter()
