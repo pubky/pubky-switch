@@ -23,7 +23,8 @@ pub(crate) struct GatePassed(());
 /// Why the records `state` sign nothing now, if they don't: the account is erased
 /// ([`Refusal::Erased`]), another install is the signer
 /// ([`SignerError::NotNamed`]), the records are behind this install's own newer version
-/// ([`Refusal::RecordsBehind`]), or an alarm is latched or held: the switch hasn't confirmed
+/// ([`Refusal::RecordsBehind`]), a recovery is in progress ([`Refusal::Recovering`]), or an
+/// alarm is latched or held: the switch hasn't confirmed
 /// the mark since a rollback or an equivocation, or the user hasn't cleared its alert
 /// ([`SignerError::Alarm`], or [`Refusal::SwitchUnconfirmed`] once the alert is cleared and
 /// the re-delivery that confirms the switch is still owed).
@@ -58,6 +59,11 @@ fn base_refusal(state: &SignerState) -> Option<SignerError> {
     }
     if let Some(version) = state.records_behind {
         return Some(Refusal::RecordsBehind { version }.into());
+    }
+    // A recovery in progress signs only its own steps, through [`recovery_key`]: a routine
+    // version would build on the lost generation (Switch spec 12.6 step 1).
+    if state.recovering {
+        return Some(Refusal::Recovering.into());
     }
     if let Some(alarm) = held_alarm(state) {
         return Some(SignerError::Alarm(alarm.clone()));
@@ -102,22 +108,36 @@ pub(crate) fn signing_key(keyring: &IdentityKeyring, state: &SignerState) -> Res
 /// [`SignerError::NotNamed`], [`Refusal::RecordsBehind`], [`Refusal::HandingOver`],
 /// [`Refusal::TakingOver`], or the key's error.
 pub(crate) fn recovery_key(keyring: &IdentityKeyring, state: &SignerState) -> Result<SigningKey> {
-    if let Some(install) = state.managed_by {
-        return Err(SignerError::NotNamed { install });
+    if let Some(refused) = recovery_refusal(state) {
+        return Err(refused);
     }
-    if let Some(version) = state.records_behind {
-        return Err(Refusal::RecordsBehind { version }.into());
-    }
-    if let Some(handing) = &state.handing_over {
-        return Err(Refusal::HandingOver {
-            to_app: handing.to_app,
-        }
-        .into());
-    }
-    if state.taking_over || keyring.is_received() {
+    if keyring.is_received() {
         return Err(Refusal::TakingOver.into());
     }
     Ok(keyring.signing_key(GatePassed(()))?)
+}
+
+/// Why the records `state` can't sign a provider loss's own steps, if they can't: another
+/// install named, records behind, a hand-over or a take-over ([`recovery_key`]).
+pub(crate) fn recovery_refusal(state: &SignerState) -> Option<SignerError> {
+    if let Some(install) = state.managed_by {
+        return Some(SignerError::NotNamed { install });
+    }
+    if let Some(version) = state.records_behind {
+        return Some(Refusal::RecordsBehind { version }.into());
+    }
+    if let Some(handing) = &state.handing_over {
+        return Some(
+            Refusal::HandingOver {
+                to_app: handing.to_app,
+            }
+            .into(),
+        );
+    }
+    if state.taking_over {
+        return Some(Refusal::TakingOver.into());
+    }
+    None
 }
 
 /// The identity key for a hand-over's own steps, while this install hands the identity over
@@ -193,6 +213,49 @@ mod tests {
         );
         // Other alerts don't hold signing back.
         assert!(held(&|s| s.alert(Alert::BackupMissing)).is_none());
+    }
+
+    #[test]
+    fn test_gate_lets_a_recovery_sign_only_its_own_steps() {
+        let keyring = IdentityKeyring::open(MemoryVault::holding([7; 32])).unwrap();
+        let fresh = SignerState::new(keyring.public_key(), [1; 16]);
+        let recovering = |change: &dyn Fn(&mut SignerState)| {
+            let mut state = fresh.clone();
+            state.recovering = true;
+            change(&mut state);
+            (
+                signing_key(&keyring, &state).err(),
+                recovery_key(&keyring, &state).err(),
+            )
+        };
+        // Every routine step is refused; the recovery's own pass an alarm and an erasure.
+        assert_eq!(
+            recovering(&|_| {}),
+            (Some(Refusal::Recovering.into()), None)
+        );
+        let alarm = Alert::Equivocation {
+            source: Source::Switch,
+            version: 2,
+        };
+        assert_eq!(recovering(&|s| s.alert(alarm.clone())).1, None);
+        assert_eq!(recovering(&|s| s.erased = true).1, None);
+        // Records behind, another install named, a hand-over and a take-over hold it back.
+        assert_eq!(
+            recovering(&|s| s.records_behind = Some(9)).1,
+            Some(Refusal::RecordsBehind { version: 9 }.into())
+        );
+        assert_eq!(
+            recovering(&|s| s.managed_by = Some([7; 16])).1,
+            Some(SignerError::NotNamed { install: [7; 16] })
+        );
+        assert_eq!(
+            recovering(&|s| s.handing_over = Some(handing_over())).1,
+            Some(Refusal::HandingOver { to_app: [4; 16] }.into())
+        );
+        assert_eq!(
+            recovering(&|s| s.taking_over = true).1,
+            Some(Refusal::TakingOver.into())
+        );
     }
 
     fn handing_over() -> crate::state::HandingOver {

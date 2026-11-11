@@ -259,6 +259,12 @@ pub enum Refusal {
     /// A flow is in progress: [`crate::Signer::resume`] finishes it first.
     #[error("refused: a flow is in progress")]
     FlowInProgress,
+    /// A provider loss is declared and the new service hasn't taken its version yet (Switch
+    /// spec 12.6 step 1): nothing else is signed meanwhile. [`crate::Signer::resume`] goes on
+    /// with it, and [`crate::Signer::declare_provider_loss`] declares it again, at the same
+    /// service or another.
+    #[error("refused: a recovery is in progress")]
+    Recovering,
     /// The switch holds a newer `identity.json` that this install didn't sign, which it
     /// adopted; the change asked for wasn't made, and may be asked for again on top of it
     /// (Switch spec 4.3).

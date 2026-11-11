@@ -984,3 +984,52 @@ async fn test_vectors_old_signer_recovers_without_the_lost_generations_service_k
     assert!(recovered.body().service_keys.is_empty());
     assert_eq!(old.switch.identity_doc().unwrap().hash(), recovered.hash());
 }
+
+/// A listed app whose certificate this install doesn't hold may hold `lists.manage`, so the
+/// recovery leaves the staged admission for its upload, failing closed (Switch spec 12.6
+/// step 2). The backup's seal refuses such a version before any delivery (Switch wire
+/// 3.12), so the rule is held here on its own.
+#[tokio::test]
+async fn test_vectors_old_signer_counts_an_unknown_certificate_as_managing_lists() {
+    let mut old = old_signer().await;
+    let v3 = IdentityDoc::verify(&document("alice identity.json"), &old.key.public()).unwrap();
+    let mut body = v3.body().clone();
+    let held = old.signer.held_certs().unwrap();
+    body.apps.retain(|listed| {
+        held.iter()
+            .find(|cert| cert.hash() == listed.cert)
+            .is_some_and(|cert| !cert.has_permission(Permission::ListsManage))
+    });
+    assert!(!body.apps.is_empty(), "an app without lists.manage");
+    let without = IdentityDoc::sign(&old.key, body).unwrap();
+    assert!(!old.signer.listed_may_manage_lists(&without).unwrap());
+    old.signer.state.certs.clear();
+    assert!(old.signer.listed_may_manage_lists(&without).unwrap());
+}
+
+/// A recovery whose version, naming a longer origin, the cap can't take is refused before
+/// its enrollment is sent: nothing at the service, and the user may declare it at another
+/// origin (Switch spec 12.6 step 1, wire 7.1).
+#[tokio::test]
+async fn test_vectors_old_signer_refuses_a_recovery_over_the_cap_before_enrolling() {
+    let mut old = old_signer().await;
+    with_renewed(&mut old, 1_560, Some(VECTOR_START_MS)).await;
+    old.switch.lose_identity();
+    let sent = old.transport.requests().len();
+    let long = format!("https://{}.example", "a".repeat(200));
+    let refused = old
+        .signer
+        .declare_provider_loss(&long, UserConfirmed::shown_and_confirmed())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            refused,
+            SignerError::Refused(Refusal::IdentityTooLarge { .. })
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(old.transport.requests().len(), sent, "nothing sent");
+    assert!(old.signer.flow.is_none());
+    assert!(!old.signer.state.recovering);
+}

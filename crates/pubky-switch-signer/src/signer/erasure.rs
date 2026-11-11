@@ -473,7 +473,10 @@ impl Signer {
 /// Withdraw from `state` the grant reminders an erasure raised, `reminded`, for apps its newest
 /// version still lists. A removed app's reminder stays: its grant's revocation is owed whether
 /// or not the account is erased (Switch spec 12.2 step 1).
-fn withdraw_reminders(state: &mut crate::state::SignerState, reminded: &[[u8; 16]]) -> Result<()> {
+pub(super) fn withdraw_reminders(
+    state: &mut crate::state::SignerState,
+    reminded: &[[u8; 16]],
+) -> Result<()> {
     let newest = state.newest_doc()?;
     let listed: Vec<[u8; 16]> = reminded
         .iter()

@@ -198,12 +198,20 @@ pub(crate) struct SignerState {
     pub(crate) erased: bool,
     /// A provider loss is declared and its version not delivered yet (Switch spec 12.6 step
     /// 1): its own steps pass the recovery's gate ([`crate::signer::gate::recovery_key`])
-    /// while an alarm about the lost service is held.
+    /// while an alarm about the lost service is held, and every other signing step is
+    /// refused ([`crate::error::Refusal::Recovering`]).
     #[serde(default)]
     pub(crate) recovering: bool,
-    /// The staged admission the recovery started is the signer's to end, since no listed app
-    /// holds `lists.manage` (Switch spec 12.6 step 2): `POST /recovery/admission` is owed,
-    /// sent again at every run until `GET /apps` shows it ended.
+    /// The document a declared recovery builds on (Switch spec 12.6 step 1): the newest this
+    /// install signed when it was first declared, a version in flight to the lost service
+    /// included, since that service may have taken it and apps seen it. Kept while the
+    /// recovery is declared again elsewhere, and dropped once its version is delivered.
+    #[serde(default)]
+    pub(crate) recovery_base: Option<SignedDoc>,
+    /// The staged admission a recovery started is the signer's to end (Switch spec 12.6 step
+    /// 2): none of the listed apps holds `lists.manage`, or the user asked. `POST
+    /// /recovery/admission` is owed, sent again at every run, after publication, until `GET
+    /// /apps` shows the wait ended or no wait.
     #[serde(default)]
     pub(crate) admission_owed: bool,
 }
@@ -313,11 +321,23 @@ impl SignerState {
     /// Keep only the certificates the newest version references, of its apps and its
     /// `renewed` entries, the claims of certificates it lists, and the untaken renewals of
     /// certificates it references: a version that wasn't delivered leaves none of its own
-    /// behind, nor counts as a renewal the app left untaken.
+    /// behind, nor counts as a renewal the app left untaken. A declared recovery's base
+    /// counts as the newest version too, since the recovery's version is built on it.
     pub(crate) fn prune_unreferenced(&mut self) {
-        let doc = self.newest_doc().ok().flatten();
+        let identity = self.identity;
+        let docs: Vec<IdentityDoc> = self
+            .newest_doc()
+            .ok()
+            .flatten()
+            .into_iter()
+            .chain(
+                self.recovery_base
+                    .as_ref()
+                    .and_then(|base| IdentityDoc::verify(base, &identity).ok()),
+            )
+            .collect();
         let referenced = |hash: &[u8; 32]| {
-            doc.as_ref().is_some_and(|doc| {
+            docs.iter().any(|doc| {
                 doc.body().apps.iter().any(|a| &a.cert == hash)
                     || doc.body().renewed.iter().any(|r| &r.cert == hash)
             })
@@ -326,8 +346,8 @@ impl SignerState {
             .retain(|cert| cert.doc_hash().is_ok_and(|hash| referenced(&hash)));
         self.untaken_renewals.retain(|(_, cert)| referenced(cert));
         self.claims.retain(|claim| {
-            doc.as_ref()
-                .is_some_and(|doc| doc.listed_cert(&claim.app_id) == Some(claim.cert))
+            docs.iter()
+                .any(|doc| doc.listed_cert(&claim.app_id) == Some(claim.cert))
         });
     }
 
@@ -368,6 +388,7 @@ impl SignerState {
             closing_unavailable: None,
             erased: false,
             recovering: false,
+            recovery_base: None,
             admission_owed: false,
         }
     }
