@@ -2050,7 +2050,13 @@ async fn test_claim_entry_of_an_earlier_generation_in_the_feed_is_kept() {
         router.env(&w, Arc::clone(&phone_store) as Arc<dyn StateStore>),
         w.protocol.clone(),
         World::config(),
-        w.approve(&app_keys("phone"), &["scope-a"]),
+        // `claims.read`, to read the claim entry in full (Switch wire 7.5).
+        w.signer
+            .approve(
+                &app_keys("phone"),
+                &AppSpec::new(&["scope-a"]).with_permissions(&[Permission::ClaimsRead]),
+            )
+            .unwrap(),
     )
     .await
     .unwrap();
@@ -2448,7 +2454,7 @@ async fn test_unseen_move_sends_a_kept_batch_again_and_its_conflict_shows_it_app
     // A move the app never saw frozen: the import carries the batch's ID without its
     // proofs, so the resend is answered `409 conflict`, which shows it applied.
     let n_key = next_key();
-    let next = w.switch.import_into(n_key.to_bytes());
+    let next = w.switch.import_into_at(n_key.to_bytes(), NEXT);
     router.add(NEXT, &next);
     publish_at(
         &w,
@@ -4027,7 +4033,7 @@ async fn test_not_current_from_a_service_the_identity_left_follows_the_move() {
     // The identity publishes generation 2 at another service, still listing the app with
     // the certificate it holds.
     let n_key = next_key();
-    let next = w.switch.import_into(n_key.to_bytes());
+    let next = w.switch.import_into_at(n_key.to_bytes(), NEXT);
     router.add(NEXT, &next);
     publish_at(
         &w,

@@ -165,6 +165,7 @@ impl TestSigner {
             identity.service_secret(),
             Arc::clone(&clock),
         );
+        switch.lock().origin = origin.to_owned();
         let body = IdentityBody::first(
             identity.public(),
             identity.signer_id(),
