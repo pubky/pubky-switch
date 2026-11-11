@@ -688,7 +688,7 @@ impl App {
         self.state
             .parked
             .get(&id)
-            .is_some_and(|stored| stored.reason == ParkReason::Released)
+            .is_some_and(ParkedEntry::was_released)
     }
 
     /// The protocol's check 10, then its effect, at most twice after a conflict: the records
@@ -1257,7 +1257,14 @@ impl App {
             .stored
             .and_then(|id| self.state.parked.get(&id).cloned().map(|entry| (id, entry)));
         let (id, parked) = match stored {
-            Some((id, stored)) => (id, ParkedEntry { reason, ..stored }),
+            Some((id, stored)) => (
+                id,
+                ParkedEntry {
+                    reason,
+                    released: stored.was_released(),
+                    ..stored
+                },
+            ),
             None => (
                 self.new_stored_id(tx)?,
                 ParkedEntry {
@@ -1270,6 +1277,7 @@ impl App {
                     context: pending.entry.context.clone(),
                     reason,
                     round: self.state.parked_round.number,
+                    released: false,
                 },
             ),
         };
@@ -1492,6 +1500,11 @@ impl App {
             context: entry.context.clone(),
             reason,
             round: self.state.parked_round.number,
+            // Stored again, a released entry stays released, whatever it waits for now.
+            released: entry
+                .stored
+                .and_then(|id| self.state.parked.get(&id))
+                .is_some_and(ParkedEntry::was_released),
         };
         read.tx.put(&key::parked(id), &parked)?;
         // An entry read from the feed may have been held there; a stored one's `seq` names

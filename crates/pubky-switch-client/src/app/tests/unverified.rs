@@ -223,6 +223,7 @@ fn entry_of(
         context: None,
         reason,
         round: 0,
+        released: false,
     }
 }
 

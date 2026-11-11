@@ -138,6 +138,10 @@ impl Protocol for ParkingProtocol {
     fn missed(&self, missed: &MissedEntries) -> Result<Vec<LocalWrite>, StoreFailure> {
         self.sample.missed(missed)
     }
+
+    fn backup_name(&self) -> Option<String> {
+        Some("sample.parking".into())
+    }
 }
 
 /// Alice's wallet with `protocol`, on `store`.
@@ -859,4 +863,104 @@ async fn test_parked_forget_of_a_genuine_copy_takes_a_forgery_under_its_msg_id()
     );
     assert!(listed(&mut app, forgery.stored_id).await.is_none());
     assert!(processed(&app, &message).await);
+}
+
+/// An uncertain entry the host released, whose released run is stored again for `again`:
+/// a quota the switch answers, a store that refuses the entry's state, or a sender that
+/// can't be checked. Returns its listing.
+async fn released_then_stored(
+    w: &World,
+    app: &mut App,
+    protocol: &ParkingProtocol,
+    again: ParkReason,
+) -> ParkedSummary {
+    let (entry, _) = uncertain(w, app).await;
+    app.release_parked(entry.stored_id, &entry.hash)
+        .await
+        .unwrap();
+    match again {
+        ParkReason::Quota => w.switch.fail_next(Fault::Error {
+            path: "ops".into(),
+            code: pubky_switch_core::http::ErrorCode::QuotaExceeded,
+            current: serde_json::json!({}),
+        }),
+        ParkReason::StoreRejected => protocol.set(Mode::Rejected),
+        ParkReason::Unverifiable => w.homeserver.set_down(true),
+        _ => unreachable!(),
+    }
+    let _ = app.receive(None).await;
+    protocol.set(Mode::Plain);
+    w.homeserver.set_down(false);
+    // A quota stores it again for its own reason; a store that refuses its state, or a
+    // sender that can't be checked, leaves it stored as released, tried again.
+    let stored = match again {
+        ParkReason::Quota => ParkReason::Quota,
+        _ => ParkReason::Released,
+    };
+    assert_eq!(reasons(app).await, vec![(entry.stored_id, stored)]);
+    entry
+}
+
+/// The next run of `entry` is handed over as released: a protocol that declines released
+/// runs drops it, and its effect isn't applied again.
+async fn next_run_is_released(
+    w: &World,
+    app: &mut App,
+    protocol: &ParkingProtocol,
+    entry: &ParkedSummary,
+) {
+    protocol.set(Mode::DeclineReleased);
+    let effects = w.effects();
+    app.receive(None).await.unwrap();
+    assert_eq!(protocol.released().last(), Some(&true));
+    assert_eq!(w.effects(), effects);
+    assert!(listed(app, entry.stored_id).await.is_none());
+}
+
+#[tokio::test]
+async fn test_parked_release_survives_a_quota() {
+    let w = World::new();
+    let protocol = ParkingProtocol::new(Mode::Plain);
+    let mut app = wallet_on(&w, &protocol, Arc::clone(&w.store) as Arc<dyn StateStore>).await;
+    let entry = released_then_stored(&w, &mut app, &protocol, ParkReason::Quota).await;
+    next_run_is_released(&w, &mut app, &protocol, &entry).await;
+}
+
+#[tokio::test]
+async fn test_parked_release_survives_a_store_that_refuses() {
+    let w = World::new();
+    let protocol = ParkingProtocol::new(Mode::Plain);
+    let mut app = wallet_on(&w, &protocol, Arc::clone(&w.store) as Arc<dyn StateStore>).await;
+    let entry = released_then_stored(&w, &mut app, &protocol, ParkReason::StoreRejected).await;
+    next_run_is_released(&w, &mut app, &protocol, &entry).await;
+}
+
+#[tokio::test]
+async fn test_parked_release_survives_an_unverifiable_sender() {
+    let w = World::new();
+    let protocol = ParkingProtocol::new(Mode::Plain);
+    let mut app = wallet_on(&w, &protocol, Arc::clone(&w.store) as Arc<dyn StateStore>).await;
+    let entry = released_then_stored(&w, &mut app, &protocol, ParkReason::Unverifiable).await;
+    next_run_is_released(&w, &mut app, &protocol, &entry).await;
+}
+
+#[tokio::test]
+async fn test_parked_release_survives_a_backup_and_restore() {
+    let w = World::new();
+    let protocol = ParkingProtocol::new(Mode::Plain);
+    let mut app = wallet_on(&w, &protocol, Arc::clone(&w.store) as Arc<dyn StateStore>).await;
+    let entry = released_then_stored(&w, &mut app, &protocol, ParkReason::Quota).await;
+    let backup = app.backup_layered().await.unwrap();
+    drop(app);
+    let restored_protocol = ParkingProtocol::new(Mode::Plain);
+    let mut restored = App::restore(
+        w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
+        restored_protocol.clone(),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    assert!(listed(&mut restored, entry.stored_id).await.is_some());
+    next_run_is_released(&w, &mut restored, &restored_protocol, &entry).await;
 }
