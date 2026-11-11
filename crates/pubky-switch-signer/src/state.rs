@@ -362,6 +362,23 @@ impl SignerState {
             self.alerts.push(alert);
         }
     }
+
+    /// Note the size of the newest version, `bytes`, the larger of its delivery and a move's
+    /// enrollment carrying it (Switch wire 3.7, 7.1): [`Alert::IdentityNearLimit`] past three
+    /// quarters of the body cap they share, replacing an earlier one, or none.
+    pub(crate) fn note_size(&mut self, bytes: usize) {
+        self.alerts
+            .retain(|alert| !matches!(alert, Alert::IdentityNearLimit { .. }));
+        let Some(limit) = pubky_switch_core::http::body_cap("PUT", "/v1/id/identity") else {
+            return;
+        };
+        if bytes.saturating_mul(4) > limit.saturating_mul(3) {
+            self.alerts.push(Alert::IdentityNearLimit {
+                bytes: u64::try_from(bytes).unwrap_or(u64::MAX),
+                limit: u64::try_from(limit).unwrap_or(u64::MAX),
+            });
+        }
+    }
 }
 
 /// Where a delivery of a new version is (Switch spec 4.3, 12.8; Switch wire 3.13).
@@ -535,6 +552,27 @@ fn decode<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_identity_near_limit_raised_replaced_and_cleared() {
+        // The cap a delivery and a move's enrollment share is 256 KiB (Switch wire 3.7, 7.1):
+        // past three quarters of it the user is told, one alert at a time, with the newest
+        // size, and none once the version is smaller again.
+        let limit = 256 << 10;
+        let near = |bytes: usize| Alert::IdentityNearLimit {
+            bytes: bytes as u64,
+            limit: limit as u64,
+        };
+        let mut state = SignerState::new([1; 32], [2; 16]);
+        state.note_size(limit * 3 / 4);
+        assert!(state.alerts.is_empty());
+        state.note_size(limit * 3 / 4 + 1);
+        assert_eq!(state.alerts, [near(limit * 3 / 4 + 1)]);
+        state.note_size(limit + 10);
+        assert_eq!(state.alerts, [near(limit + 10)]);
+        state.note_size(1_000);
+        assert!(state.alerts.is_empty());
+    }
 
     #[test]
     fn test_state_written_before_the_approval_fields_still_reads() {

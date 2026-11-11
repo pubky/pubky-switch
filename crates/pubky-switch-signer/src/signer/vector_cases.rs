@@ -24,14 +24,15 @@ use pubky_switch_core::enc::{app_id_decode, unb64, unb64_array};
 use pubky_switch_core::keys::{AppKeys, IdentityKey};
 use pubky_switch_core::ops::OpKind;
 use pubky_switch_core::records::{
-    AppCert, IDENTITY_PATH, IdentityDoc, Limits, SIGNER_BACKUP_PATH, SignerBackup, SignerHandover,
-    StoredPart,
+    AppCert, IDENTITY_PATH, IdentityDoc, Limits, RenewedCert, SIGNER_BACKUP_PATH, SignerBackup,
+    SignerHandover, StoredPart,
 };
 use pubky_switch_core::scopes::Permission;
 use pubky_switch_core::sig::SignedDoc;
 use serde_json::Value;
 
 use super::{AbortOutcome, CertChange, Signer, SignerEnv, UserConfirmed};
+use crate::alert::Alert;
 use crate::homeserver::Homeserver;
 use crate::key::{AddOutcome, IdentityKeyring, IdentitySecret, SecretVault, VaultError};
 use crate::protocol::{Protocol, Protocols, ScopeDef};
@@ -583,4 +584,53 @@ async fn test_vectors_old_signer_erases_the_account_as_the_vectors_do() {
     }
     assert_eq!(old.signer.status(), super::SignerStatus::Erased);
     assert!(!old.homeserver.0.lock().unwrap().contains_key(IDENTITY_PATH));
+}
+
+/// The size check on a delivered version (Switch wire 3.7, 7.1): alice's version 3 with about
+/// 1,200 `renewed` entries passes three quarters of the cap a delivery and a move's enrollment
+/// share, and the user is told; a smaller version after it clears the alert.
+#[tokio::test]
+async fn test_vectors_old_signer_tells_of_an_identity_near_the_limit() {
+    let mut old = old_signer().await;
+    let v3 = IdentityDoc::verify(&document("alice identity.json"), &old.key.public()).unwrap();
+    let mut body = v3.body().clone();
+    body.version = 4;
+    let app_id = body.apps[0].app_id;
+    body.renewed = (0..1_200u32)
+        .map(|n| {
+            let mut cert = [0u8; 32];
+            cert[..4].copy_from_slice(&n.to_be_bytes());
+            RenewedCert {
+                app_id,
+                cert,
+                until: Some(VECTOR_START_MS),
+            }
+        })
+        .collect();
+    let large = IdentityDoc::sign(&old.key, body).unwrap();
+    old.signer
+        .delivered(large.signed().clone(), Some(v3.hash()), None)
+        .await
+        .unwrap();
+    assert!(
+        old.signer
+            .alerts()
+            .iter()
+            .any(|alert| matches!(alert, Alert::IdentityNearLimit { .. })),
+        "{:?}",
+        old.signer.alerts()
+    );
+    let mut small = v3.body().clone();
+    small.version = 5;
+    let small = IdentityDoc::sign(&old.key, small).unwrap();
+    old.signer
+        .delivered(small.signed().clone(), Some(large.hash()), None)
+        .await
+        .unwrap();
+    assert!(
+        !old.signer
+            .alerts()
+            .iter()
+            .any(|alert| matches!(alert, Alert::IdentityNearLimit { .. }))
+    );
 }
