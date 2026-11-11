@@ -1116,6 +1116,15 @@ async fn test_claims_read_refusals() {
     assert_eq!(answer_of(replay.service.handle(request).await).0, 400);
     let (status, body) = read_claim(&replay, AT).await;
     assert_eq!((status, body["code"].as_str()), (404, Some("not_found")));
+    // An app of another identity: only own apps read claims, answered before the lock,
+    // with no head (Switch wire 7.6).
+    let request = other_request("shop", ORIGIN, "GET", &path, Vec::new(), None, ms(AT));
+    let (status, body, head) = answer_of(replay.service.handle(request).await);
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (403, Some("permission_missing"))
+    );
+    assert!(head.is_none(), "no head");
     replay.db.drop_database().await.expect("drop");
 }
 

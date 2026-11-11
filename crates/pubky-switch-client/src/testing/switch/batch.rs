@@ -671,7 +671,8 @@ impl Inner {
 }
 
 /// Whether `app`'s full-bundle request is in force for dropping its parts (Switch wire 6.2):
-/// from the `POST /keys` until its cursor has passed the part that completed it.
+/// from the `POST /keys` until its cursor has passed the part that completed it, or the part
+/// that replaced that one.
 fn in_force(app: &SwitchApp) -> bool {
     app.full_requested.is_some() || app.full_completed.is_some_and(|done| app.cursor < done)
 }

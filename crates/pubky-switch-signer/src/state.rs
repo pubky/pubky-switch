@@ -508,9 +508,11 @@ pub(crate) async fn load(
             "another layout version or identity".into(),
         ));
     }
+    // An erased account has nothing left to resume: a flow stored with it, as an earlier
+    // version could leave one, is never loaded (Switch spec 12.7).
     let flow = match store.get(&ns, FLOW_KEY).await? {
-        Some(bytes) => Some(decode(&bytes)?),
-        None => None,
+        Some(bytes) if !state.erased => Some(decode(&bytes)?),
+        Some(_) | None => None,
     };
     Ok(Some((state, flow)))
 }

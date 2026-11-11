@@ -880,3 +880,136 @@ async fn test_keys_a_part_replacing_the_completing_one_carries_the_force() {
     assert_eq!(keys_through(&replay, &at).await, 3);
     replay.db.drop_database().await.expect("drop");
 }
+
+/// The wallet's `app.put` of the record the service holds (chain.json seq 3), alone in a
+/// batch with ID `[id; 16]`: an unchanged batch (Switch wire 6.4 "No-ops").
+fn wallet_unchanged_app_put(id: u8) -> Vec<SignedOp> {
+    let keys = vectors("keys.json");
+    let wallet = app(&keys, "wallet");
+    let key = ed25519_dalek::SigningKey::from_bytes(&hex32(&wallet["signing_secret_hex"]));
+    let alice_key = hex32(&alice(&keys)["public_hex"]);
+    let op = SignedOp::peek(
+        &serde_json::from_value::<SignedDoc>(chain_item(&vectors("chain.json"), 3)["item"].clone())
+            .expect("op"),
+    )
+    .expect("op");
+    let OpKind::AppPut { record } = &op.body().kind else {
+        panic!("seq 3 is the wallet's app.put");
+    };
+    sign_batch(
+        &key,
+        &alice_key,
+        Some(wallet_cert().app_id()),
+        1,
+        [id; 16],
+        vec![(
+            Vec::new(),
+            OpKind::AppPut {
+                record: record.clone(),
+            },
+        )],
+    )
+    .expect("batch")
+}
+
+#[tokio::test]
+async fn test_keys_an_unchanged_batch_with_a_cursor_move_drops_too() {
+    // A batch whose operations are all unchanged but that moves the cursor isn't a no-op
+    // (Switch wire 6.4 step 10): its move drops the parts it passes, as any move does (6.2).
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let at = revoke_time();
+    store_parts(&replay, &[(1, 1)], 60, &at).await; // seq 10
+    let request = app_request(
+        app(&vectors("keys.json"), "wallet"),
+        "POST",
+        &format!("/v1/{}/ops", alice_id()),
+        OpsRequest::new(
+            &wallet_unchanged_app_put(70),
+            Some(pubky_switch_core::ops::Position {
+                generation: 1,
+                seq: 10,
+            }),
+        )
+        .to_json(),
+        ms(&at),
+    );
+    let answer = replay.service.handle(request).await;
+    let answered = body(&answer);
+    let ranges = bundle_ranges(&replay, &at).await;
+    let through = keys_through(&replay, &at).await;
+    replay.db.drop_database().await.expect("drop");
+    assert_eq!(answer.status, 200, "{answered}");
+    assert_eq!(answered["proofs"], json!([]), "an unchanged batch");
+    assert_eq!(
+        ranges,
+        json!([]),
+        "the move passed epoch 1's part, which keys_through ({through}) covers"
+    );
+}
+
+#[tokio::test]
+async fn test_keys_replacing_another_part_while_in_force_keeps_the_force_where_it_is() {
+    // In force by the completing part (seq 11); a put replaces epoch 1's part (seq 10), not
+    // the completing one: the force stays at 11, so the move to 11 drops the passed,
+    // covered completing part, and epoch 1's new part (seq 12, unpassed) stays.
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let at = revoke_time();
+    let asked = keys_call(&replay, "wallet", "POST", "wallet", Vec::new(), &at).await;
+    assert_eq!(
+        asked.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&asked.body)
+    );
+    store_parts(&replay, &[(1, 1)], 60, &at).await; // seq 10
+    wallet_cursor(&replay, 10, &at).await;
+    store_parts(&replay, &[(2, 2)], 61, &at).await; // seq 11, completes
+    store_parts(&replay, &[(1, 1)], 62, &at).await; // seq 12, replaces 10
+    wallet_cursor(&replay, 11, &at).await;
+    let at_11 = (
+        bundle_ranges(&replay, &at).await,
+        keys_through(&replay, &at).await,
+    );
+    replay.db.drop_database().await.expect("drop");
+    assert_eq!(at_11, (json!([[1, 1]]), json!(2)));
+}
+
+#[tokio::test]
+async fn test_keys_a_replacement_after_the_force_ended_doesnt_restart_it() {
+    // keys_through's start unknown. The request completes at seq 11 (epoch 2); epoch 1's
+    // part is replaced at seq 12 while in force. The move to 11 ends the force; epoch 2's
+    // part stays, passed above epoch 1's unpassed one. Replacing it now (seq 13) doesn't put
+    // the request back in force: the move to 12 drops epoch 1's new part.
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let at = revoke_time();
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    sqlx::query("DELETE FROM app_listings WHERE account_id = $1")
+        .bind(alice_id())
+        .execute(&mut conn)
+        .await
+        .expect("listing");
+    drop(conn);
+    let asked = keys_call(&replay, "wallet", "POST", "wallet", Vec::new(), &at).await;
+    assert_eq!(
+        asked.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&asked.body)
+    );
+    store_parts(&replay, &[(1, 1)], 60, &at).await; // seq 10
+    store_parts(&replay, &[(2, 2)], 61, &at).await; // seq 11, completes
+    store_parts(&replay, &[(1, 1)], 62, &at).await; // seq 12, replaces 10
+    wallet_cursor(&replay, 11, &at).await;
+    let at_11 = bundle_ranges(&replay, &at).await;
+    store_parts(&replay, &[(2, 3)], 63, &at).await; // seq 13, replaces 11
+    wallet_cursor(&replay, 12, &at).await;
+    let at_12 = bundle_ranges(&replay, &at).await;
+    replay.db.drop_database().await.expect("drop");
+    assert_eq!(at_11, json!([[1, 1], [2, 2]]));
+    assert_eq!(at_12, json!([[2, 3]]));
+}

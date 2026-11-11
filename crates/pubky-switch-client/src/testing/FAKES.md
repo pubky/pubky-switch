@@ -36,10 +36,14 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
 - **Key bundle parts** go as the service drops them, by the core's `parts_to_drop`: at a
   `key_bundle.put` and at the `cursor.set` that passes them, the parts the target's cursor
   has passed and its `keys_through` covers, unless a full-bundle request is in force: from
-  the `POST /keys` until the target's cursor has passed the part that completed it, judged
-  at a put as before the part (Switch wire 6.2). Where `keys_through` starts rises to the
-  height the dropped parts gave. `keys_through` itself is the core's (7.4.12), over the
-  parts the cursor passed.
+  the `POST /keys` until the target's cursor has passed the part that completed it, or the
+  part that replaced that one, judged at a put as before the part (Switch wire 6.2). Where
+  `keys_through` starts rises to the height the dropped parts gave. `keys_through` itself is
+  the core's (7.4.12), over the parts the cursor passed.
+- **A cursor of an earlier generation** is a bare `seq` here, so after `change_key_into` or
+  `import_into` the drop, the request's force and `keys_through` compare it as it is. The
+  service counts such a cursor as 0 until the app moves it: nothing drops, a request stays
+  in force, and `keys_through` reads low.
 
 ## State and retention
 
@@ -88,11 +92,18 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   - a record by key is served `200` to any own app, without checking its `read_scope`
     (the service answers `403 permission_missing`);
   - the signer is served too, and its list shows every record (the service answers `403
-    permission_missing` to both);
+    permission_missing` to both); so is an own app whose certificate the switch doesn't
+    hold, whose list shows every record too;
   - a view's `cert` is the writer's current certificate, not the one the write was checked
     against, which a renewal or revocation later doesn't change (7.4.9);
-  - a list without `collection` falls through to the switch's other routes rather than
-    `400`, and `after` is compared as raw text, never refused as a malformed key.
+  - a list without `collection`, and a read by a key that isn't `b64(32)`, fall through to
+    the switch's other routes rather than `400`; `after` is compared as raw text, never
+    refused as a malformed key; and `limit` takes a leading `+` (`limit=+5`), which the
+    service refuses (`400`).
+- **Reads only own apps make, from an app of another identity:** `GET /feed`, `GET
+  /claims/{claim_key}`, `GET /allow`, `GET /records/{key}` and `GET /records` answer `403
+  not_admitted` (`switch/inbox.rs`, every route the switch doesn't serve such an app), where
+  the service answers `403 permission_missing` (Switch wire 7.4.4, 7.6).
 - **`open_admission`** (`admit_everyone`) admits every sender the deny list doesn't hold, a
   test switch only.
 - **App currency outside batches**: a feed read is checked as a batch is, for an app that
