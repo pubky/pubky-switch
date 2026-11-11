@@ -49,7 +49,9 @@ impl AccountTxn {
         }))
     }
 
-    /// Hold `held` as the newest `identity.json`.
+    /// Hold `held` as the newest `identity.json`. A new version ends a hand-over the account
+    /// holds, whichever signer delivered it (Switch wire 7.4.17): so every writer of a version
+    /// drops it, and a retry of the same bytes, which writes nothing, keeps it.
     pub async fn set_identity(&mut self, held: &HeldIdentity) -> Result<(), StoreError> {
         let id = self.head().id.clone();
         let doc = encode_doc(&held.doc)?;
@@ -61,6 +63,7 @@ impl AccountTxn {
             .execute(self.conn())
             .await
             .map_err(StoreError::from_db)?;
+        self.delete_handover().await?;
         self.note_change();
         Ok(())
     }
