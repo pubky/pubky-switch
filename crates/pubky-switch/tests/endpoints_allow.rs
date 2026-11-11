@@ -594,3 +594,38 @@ async fn test_allow_reads_the_state_under_the_lock_not_after() {
     assert_eq!(body(&answer)["invite_codes"], json!([]));
     replay.db.drop_database().await.expect("drop");
 }
+
+#[tokio::test]
+async fn test_allow_one_read_after_the_lock_per_account() {
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let keys = vectors("keys.json");
+    let now = at();
+    let pause = replay.db.pause_next_snapshot_read();
+    let (first, ()) = tokio::join!(read_as(&replay, "wallet", &now), async {
+        tokio::time::timeout(std::time::Duration::from_secs(10), pause.reached.notified())
+            .await
+            .expect("the first read reached its pause");
+        // While it is in flight, another read of the account, of the lists or the
+        // directory, is refused at once rather than holding a reader the other accounts
+        // share.
+        let second = read_as(&replay, "wallet", &at()).await;
+        assert_eq!(code_of(&second), (503, json!("unavailable")));
+        let directory = replay
+            .service
+            .handle(app_request(
+                app(&keys, "wallet"),
+                "GET",
+                &format!("/v1/{}/directory", alice_id()),
+                Vec::new(),
+                ms(&at()),
+            ))
+            .await;
+        assert_eq!(directory.status, 503);
+        pause.resume.notify_one();
+    });
+    assert_eq!(first.status, 200);
+    // Once it has ended, the next read goes on.
+    assert_eq!(read_as(&replay, "wallet", &at()).await.status, 200);
+    replay.db.drop_database().await.expect("drop");
+}

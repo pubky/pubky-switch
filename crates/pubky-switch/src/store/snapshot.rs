@@ -12,12 +12,45 @@ use super::{
     ops::{read_apps, read_directory_versions},
 };
 
+/// The accounts with a read after the lock in flight in this process: at most one each,
+/// so a few slow reads of one account can't hold every reader the other accounts share.
+pub(super) type Reading = std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>;
+
+/// An account's one read after the lock, held from before its reader is taken until the
+/// read ends, or its request does without reading.
+#[derive(Debug)]
+pub(super) struct ReadSlot {
+    reading: Reading,
+    account: String,
+}
+
+impl ReadSlot {
+    /// The account's slot, or `None` while another read of it is in flight.
+    pub(super) fn claim(reading: &Reading, account: &str) -> Option<Self> {
+        let mut accounts = reading.lock().ok()?;
+        accounts.insert(account.to_string()).then(|| Self {
+            reading: reading.clone(),
+            account: account.to_string(),
+        })
+    }
+}
+
+impl Drop for ReadSlot {
+    fn drop(&mut self) {
+        if let Ok(mut accounts) = self.reading.lock() {
+            accounts.remove(&self.account);
+        }
+    }
+}
+
 /// A read-only transaction on the reader pool, begun before the account's lock is taken,
 /// that reads the state its account's locked transaction exported.
 #[derive(Debug)]
 pub struct SnapshotRead {
     pub(super) tx: Transaction<'static, Postgres>,
     pub(super) id: String,
+    /// Released when the read ends.
+    _slot: Option<ReadSlot>,
     #[cfg(any(test, feature = "test-util"))]
     pause: Option<super::testing::SnapshotPause>,
 }
@@ -58,6 +91,7 @@ impl AccountTxn {
         self.snapshot = Some(SnapshotRead {
             tx: reader,
             id: self.head().id.clone(),
+            _slot: self.read_slot.take(),
             #[cfg(any(test, feature = "test-util"))]
             pause: self.snapshot_pause.take(),
         });
@@ -109,6 +143,20 @@ impl SnapshotRead {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_snapshot_one_read_per_account() {
+        let reading = Reading::default();
+        let alice = ReadSlot::claim(&reading, "alice");
+        assert!(alice.is_some());
+        // A second read of alice's account waits for none: it is refused.
+        assert!(ReadSlot::claim(&reading, "alice").is_none());
+        // Another account's read goes on.
+        assert!(ReadSlot::claim(&reading, "bob").is_some());
+        // Once alice's read ends, her next one goes on.
+        drop(alice);
+        assert!(ReadSlot::claim(&reading, "alice").is_some());
+    }
 
     #[test]
     fn test_snapshot_id_shape() {

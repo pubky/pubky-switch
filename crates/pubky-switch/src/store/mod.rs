@@ -260,6 +260,8 @@ pub struct Store {
     /// The connections reads after the lock use, apart from `pool`, so a request holding
     /// an account's lock never waits for one (`snapshot_readers`).
     readers: PgPool,
+    /// The accounts with a read after the lock in flight: one each.
+    reading: snapshot::Reading,
     lock_timeout_ms: u64,
     /// For tests: the next read after the lock waits here ([`testing::SnapshotPause`]).
     #[cfg(any(test, feature = "test-util"))]
@@ -310,6 +312,7 @@ impl Store {
         Ok(Self {
             pool,
             readers,
+            reading: snapshot::Reading::default(),
             lock_timeout_ms: config.lock_timeout_ms,
             #[cfg(any(test, feature = "test-util"))]
             snapshot_pause: std::sync::Arc::default(),
@@ -444,12 +447,19 @@ impl Store {
     /// [`Store::begin`], with a transaction on the reader pool begun first, before the lock
     /// is waited for, so the request waits for a free reader without holding the lock;
     /// [`AccountTxn::snapshot_read`] hands it the locked transaction's snapshot.
+    ///
+    /// At most one such read of an account is in flight in this process: while one is, a
+    /// second is refused at once, [`StoreError::LockTimeout`] as for a busy account, before
+    /// it takes a reader. So the readers every account shares can't all be held by one
+    /// account's reads.
     pub async fn begin_reading(&self, id: &str) -> Result<Option<AccountTxn>, StoreError> {
+        let slot = snapshot::ReadSlot::claim(&self.reading, id).ok_or(StoreError::LockTimeout)?;
         let reader = self.readers.begin().await.map_err(StoreError::from_db)?;
         let Some(mut txn) = self.begin(id).await? else {
             return Ok(None);
         };
         txn.reader = Some(reader);
+        txn.read_slot = Some(slot);
         #[cfg(any(test, feature = "test-util"))]
         {
             txn.snapshot_pause = self
