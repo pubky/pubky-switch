@@ -591,6 +591,12 @@ impl Inner {
                 .find(|(part, _)| part == put)
                 .map_or(seq, |(_, at)| *at),
             KeyBundleEffect::Stores { replaces } => {
+                let replaced: Vec<u64> = parts
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| replaces.contains(index))
+                    .map(|(_, (_, at))| *at)
+                    .collect();
                 let mut index = 0;
                 parts.retain(|_| {
                     let keep = !replaces.contains(&index);
@@ -605,6 +611,16 @@ impl Inner {
                     && app.full_requested.is_some()
                 {
                     app.full_requested = None;
+                    app.full_completed = Some(seq);
+                }
+                // A part replacing the one that completed a request in force carries the
+                // force on (Switch wire 6.2).
+                if full
+                    && let Some(app) = draft.apps.get_mut(&target)
+                    && app
+                        .full_completed
+                        .is_some_and(|done| replaced.contains(&done))
+                {
                     app.full_completed = Some(seq);
                 }
                 drop_passed_parts(draft, &target, full);
