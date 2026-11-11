@@ -8,7 +8,7 @@ use pubky_switch_core::envelope::parse_header;
 use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::ident::{Policy, invite_code_hash};
 use pubky_switch_core::message::MessagePlaintext;
-use pubky_switch_core::ops::{AllowKind, Condition, KeyBundlePut, OpKind, SignedOp};
+use pubky_switch_core::ops::{AllowKind, Condition, KeyBundlePut, OpKind, RecordVersion, SignedOp};
 use pubky_switch_core::records::{
     CLOCK_TOLERANCE_MS, DAY_MS, RemovedApp, RenewedCert, seal_bundle_parts,
 };
@@ -1472,6 +1472,75 @@ async fn test_records_regression_check_sees_the_write_base() {
             held: false
         })
     );
+}
+
+/// A create over a record the app holds deleted builds on what it holds.
+#[tokio::test]
+async fn test_records_regression_base_of_a_create_over_a_held_delete_is_held() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    let target = s.target("n1");
+    wallet
+        .put_record(&target, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    phone.receive(None).await.unwrap();
+    wallet.delete_record(&target, vec![]).await.unwrap();
+    phone.receive(None).await.unwrap();
+    wallet
+        .put_record(&target, &value(&["a", "b"]), vec![])
+        .await
+        .unwrap();
+    phone.receive(None).await.unwrap();
+    let last = *s.protocol.bases.lock().unwrap().last().unwrap();
+    assert_eq!(
+        last,
+        WriteBase {
+            expected_version: RecordVersion::NONE,
+            held: true
+        }
+    );
+}
+
+/// A write built on one the app refused and only follows doesn't build on what it holds.
+#[tokio::test]
+async fn test_records_regression_base_of_a_write_on_a_flagged_one_isnt_held() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    let target = s.target("n1");
+    let key = wallet.record_key(&target).unwrap();
+    wallet
+        .put_record(&target, &value(&["a", "b"]), vec![])
+        .await
+        .unwrap();
+    phone.receive(None).await.unwrap();
+    // The wallet drops b, which the phone flags and follows; then writes on it.
+    wallet
+        .put_record(&target, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    phone.receive(None).await.unwrap();
+    assert!(phone.shared_record(&key).await.unwrap().unwrap().flagged);
+    let flagged = version_of(&wallet, &key).await;
+    wallet
+        .put_record(&target, &value(&["a", "b", "c"]), vec![])
+        .await
+        .unwrap();
+    phone.receive(None).await.unwrap();
+    let last = *s.protocol.bases.lock().unwrap().last().unwrap();
+    assert_eq!(
+        last,
+        WriteBase {
+            expected_version: flagged,
+            held: false
+        }
+    );
+}
+
+async fn version_of(app: &App, key: &[u8; 32]) -> RecordVersion {
+    app.shared_record(key).await.unwrap().unwrap().version
 }
 
 #[tokio::test]

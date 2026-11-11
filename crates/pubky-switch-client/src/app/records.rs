@@ -1562,6 +1562,9 @@ impl App {
         let base = WriteBase {
             expected_version,
             held: match &held {
+                // A writer that holds a deleted record creates it again on `{0, 0}`
+                // (Switch wire 6.2).
+                Some(held) if expected_version.is_none() => held.content == RecordContent::Deleted,
                 Some(held) => held.version == expected_version,
                 None => expected_version.is_none(),
             },
