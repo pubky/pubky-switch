@@ -9,3 +9,7 @@ CREATE TABLE erased_keys (
     account_id      TEXT    NOT NULL,
     erased_at_ms    BIGINT  NOT NULL CHECK (erased_at_ms >= 0)
 );
+
+-- Whether an identity's erased account still owes keys: read for every request to an account
+-- the service doesn't host, so the operator's 404 waits until they are gone.
+CREATE INDEX erased_keys_by_account ON erased_keys (account_id);

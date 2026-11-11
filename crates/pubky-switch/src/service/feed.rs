@@ -153,6 +153,16 @@ pub(crate) enum Shown {
     Stub,
 }
 
+/// A read whose account no longer names its key, by the operator's answer `error`: gone, as an
+/// account the service doesn't host, or its key retired (Switch wire 7.4.16).
+fn gone_or_retired(error: &ApiError) -> FeedStop {
+    if error.code == ErrorCode::NotFound {
+        FeedStop::Gone
+    } else {
+        FeedStop::Retired
+    }
+}
+
 fn corrupt(what: &'static str) -> StoreError {
     StoreError::Corrupt(what)
 }
@@ -708,17 +718,17 @@ impl Service {
         // yet (Switch wire 7.3 step 10).
         if let Some(mark) = answered.mark {
             match self.keys.advance_mark(&read.service_key, mark).await {
-                Ok(_) => {}
                 // Erased once the page was read, its key deleted: never answered with it
                 // (Switch wire 7.4.16).
-                Err(KeyStoreError::NotFound) => {
-                    return Err(match self.store.lookup(&read.account).await {
-                        Ok(None) => FeedStop::Gone,
-                        Ok(Some(_)) | Err(_) => FeedStop::Retired,
-                    });
-                }
+                Ok(_) | Err(KeyStoreError::NotFound) => {}
                 Err(_) => return Err(FeedStop::refused(temporary(), true, answered.time_ms)),
             }
+        }
+        // Once the lock is gone, only while the account still names the key the read loaded,
+        // whatever its mark did: an erasure whose key's deletion failed leaves the key in the
+        // store (7.4.16).
+        if let Some(error) = self.no_longer_keyed(&read.account, &read.service_key).await {
+            return Err(gone_or_retired(&error));
         }
         Ok((answered.answer(), answered.time_ms))
     }
@@ -739,10 +749,12 @@ impl Service {
             // the last to use: an account found again, as after a new enrollment, or one that
             // can't be looked up, gets the operator's temporary failure.
             Err(KeyStoreError::NotFound) => {
-                return Err(match self.store.lookup(&read.account).await {
-                    Ok(None) => FeedStop::Gone,
-                    Ok(Some(_)) | Err(_) => FeedStop::Retired,
-                });
+                return Err(
+                    match self.no_longer_keyed(&read.account, &read.service_key).await {
+                        Some(error) => gone_or_retired(&error),
+                        None => fallback(temporary(), read.time_ms),
+                    },
+                );
             }
             Err(_) => return Err(fallback(temporary(), read.time_ms)),
         };

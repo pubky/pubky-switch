@@ -62,6 +62,10 @@ use crate::{
 
 use self::rules::{Caller, Claimed, decode_claim, names_this_service, staged_gate};
 
+/// How many sweeps of owed keys a retried erasure of an account gone may run each minute, for
+/// that account (Switch wire 7.4.16).
+const ERASURE_SWEEPS_PER_MIN: u32 = 6;
+
 /// How many claims whose time has passed one request deletes at most (Switch wire 7.3
 /// step 4); the rest go with the next requests.
 const DUE_CLAIMS_PER_REQUEST: u64 = 64;
@@ -83,6 +87,9 @@ pub struct Service {
     sender_rate: KeyedMinutes<(String, [u8; 32])>,
     sender_app_rate: KeyedMinutes<(String, [u8; 16])>,
     notify_rate: KeyedMinutes<(String, [u8; 32])>,
+    /// The sweeps a retried erasure of an account gone may run (Switch wire 7.4.16): the
+    /// request is unauthenticated, so they are bounded per account.
+    erasure_sweeps: KeyedMinutes<String>,
     changes: Arc<ChangeHub>,
     /// Where entry IDs come from: random, opaque to senders (Switch wire 1.7).
     entry_ids: EntryIds,
@@ -282,6 +289,7 @@ impl Service {
             sender_rate: KeyedMinutes::default(),
             sender_app_rate: KeyedMinutes::default(),
             notify_rate: KeyedMinutes::default(),
+            erasure_sweeps: KeyedMinutes::default(),
             changes: ChangeHub::new(),
             entry_ids: Arc::new(random_entry_id),
         }
@@ -363,7 +371,19 @@ impl Service {
         let found = match self.store.lookup(&account).await {
             Ok(Some(found)) => found,
             Ok(None) => {
-                let error = ApiError::not_found("no such account");
+                // A retried erasure whose `200` was withheld while its keys were owed: the
+                // sweep runs again, at most a few times a minute for the account, since the
+                // request is unauthenticated (Switch wire 7.4.16).
+                if request.route.call == Call::Erase
+                    && matches!(self.store.owes_erased_keys(&account).await, Ok(true))
+                    && self
+                        .erasure_sweeps
+                        .take(account.clone(), ERASURE_SWEEPS_PER_MIN, base_ms)
+                        .is_ok()
+                {
+                    let _ = self.sweep_erased_keys().await;
+                }
+                let error = self.no_such_account(&account).await;
                 return self
                     .operator_answer(request_signature.as_ref(), base_ms, &error)
                     .await;
@@ -812,7 +832,7 @@ impl Service {
                             Ok((page, at)) => sign_answer(&signer, signature, at, page),
                             // Erased while the read waited: as an unknown account (step 2).
                             Err(feed::FeedStop::Gone) => {
-                                let error = ApiError::not_found("no such account");
+                                let error = self.no_such_account(&txn_account).await;
                                 self.operator_answer(signature, base_ms, &error).await
                             }
                             // Its key retired while the read waited: never signed with it.
@@ -863,11 +883,24 @@ impl Service {
     /// (Switch wire 7.3 step 2), and `503` for one enrolled again under another key, or one
     /// that can't be looked up. So nothing is signed with a key after its account's erasure
     /// was answered (7.4.16).
-    async fn no_longer_keyed(&self, account: &str, key: &KeyId) -> Option<ApiError> {
+    pub(super) async fn no_longer_keyed(&self, account: &str, key: &KeyId) -> Option<ApiError> {
         match self.store.lookup(account).await {
             Ok(Some(found)) if found.service_key == *key => None,
-            Ok(None) => Some(ApiError::not_found("no such account")),
+            Ok(None) => Some(self.no_such_account(account).await),
             Ok(Some(_)) | Err(_) => Some(ApiError::unavailable("7.6: a temporary failure")),
+        }
+    }
+
+    /// The operator's answer for an identity whose account the service doesn't host (Switch
+    /// wire 7.3 step 2): `404`, once no key of an erased account of the identity is still
+    /// owed; `503` while one is, or when that can't be read. The signer takes the `404` after
+    /// a request in doubt as its erasure done, at a retry or at a read (7.4.16), so it waits
+    /// until the erased account's key is gone. A key still owed from an earlier account of the
+    /// same identity holds a later erasure's `404` back the same way.
+    async fn no_such_account(&self, account: &str) -> ApiError {
+        match self.store.owes_erased_keys(account).await {
+            Ok(false) => ApiError::not_found("no such account"),
+            Ok(true) | Err(_) => ApiError::unavailable("7.6: a temporary failure"),
         }
     }
 

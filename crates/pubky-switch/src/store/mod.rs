@@ -361,6 +361,16 @@ impl Store {
             .collect()
     }
 
+    /// Whether an erased account of the identity `account` still owes the deletion of a key
+    /// (Switch wire 7.4.16).
+    pub async fn owes_erased_keys(&self, account: &str) -> Result<bool, StoreError> {
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM erased_keys WHERE account_id = $1)")
+            .bind(account)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(StoreError::from_db)
+    }
+
     /// The erasure owes nothing more of `key`: it is deleted, and the erasure recorded.
     pub async fn forget_erased_key(&self, key: &crate::keys::KeyId) -> Result<(), StoreError> {
         sqlx::query("DELETE FROM erased_keys WHERE key_id = $1")
