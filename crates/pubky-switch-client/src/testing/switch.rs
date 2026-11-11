@@ -1444,13 +1444,18 @@ impl Inner {
                 let at = *held.full_requested.get_or_insert(now);
                 (200, json!({ "requested": rfc3339(at) }))
             }
-            ("POST", r) if r == own_leave => match self.leave(app)? {
-                Some(proof) => (
-                    200,
-                    json!({ "proofs": [proof], "head": self.head().to_value() }),
-                ),
-                None => bad(ErrorCode::NotCurrent, "departed", json!(null)),
-            },
+            // The leave is the app's latest request past authentication (Switch wire 7.4.12
+            // `last_seen`), seen before it departs the app.
+            ("POST", r) if r == own_leave => {
+                self.seen(request);
+                match self.leave(app)? {
+                    Some(proof) => (
+                        200,
+                        json!({ "proofs": [proof], "head": self.head().to_value() }),
+                    ),
+                    None => bad(ErrorCode::NotCurrent, "departed", json!(null)),
+                }
+            }
             _ => bad(ErrorCode::NotFound, "no route", json!(null)),
         })
     }

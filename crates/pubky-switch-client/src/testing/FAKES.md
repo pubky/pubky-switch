@@ -112,7 +112,7 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
     `cert_expires_at` carries that, and a signer that serves an app checks both. An app with
     no record is current while it is listed and not kept;
   - `last_seen`: the time of the app's latest request past authentication, a staged
-    account's refusal included. The scripted switch doesn't authenticate an own app's
+    account's refusal and its `leave` included. The scripted switch doesn't authenticate an own app's
     requests one by one: it takes any app with a record that isn't revoked, departed or kept
     as authenticated. So, unlike the service, it counts an app whose certificate expired or
     isn't listed, which the service refuses at authentication (`cert_expired`,

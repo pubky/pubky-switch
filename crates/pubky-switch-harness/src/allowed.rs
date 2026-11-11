@@ -98,31 +98,17 @@ fn matches(pattern: &str, text: &str) -> bool {
 }
 
 /// Every accepted difference: those of the two switches as a whole, then by flow.
-pub static ALLOWED: &[Allowed] = &[
-    Allowed {
-        flow: EVERY_FLOW,
-        label: "*",
-        fact: "* (member order)",
-        service: "*",
-        scripted: "*",
-        reason: "The service writes an answer's members in the order of the wire format's \
+pub static ALLOWED: &[Allowed] = &[Allowed {
+    flow: EVERY_FLOW,
+    label: "*",
+    fact: "* (member order)",
+    service: "*",
+    scripted: "*",
+    reason: "The service writes an answer's members in the order of the wire format's \
                  tables and examples; the scripted switch writes them sorted by name. A writer \
                  may use any order, and no reader depends on it.",
-        reference: "Switch wire 1.1, \"Exact bytes\"",
-    },
-    Allowed {
-        flow: "departure",
-        label: "{alice} GET /v1/{alice}/apps",
-        fact: "body.apps[0].last_seen",
-        service: "time 2026-01-01T00:05:06.250Z",
-        scripted: "time 2026-01-01T00:04:05.000Z",
-        reason: "The phone's `leave` is its latest request past authentication, so the service \
-                 shows the leave's time as its `last_seen`. The scripted switch doesn't count \
-                 the leave and shows the time of the phone's request before it.",
-        reference: "Switch wire 7.4.12, `last_seen`, which the table gives no rule; `FAKES.md` \
-                    says the scripted switch means the latest request past authentication",
-    },
-];
+    reference: "Switch wire 1.1, \"Exact bytes\"",
+}];
 
 #[cfg(test)]
 mod tests {
