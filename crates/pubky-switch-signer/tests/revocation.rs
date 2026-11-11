@@ -1627,3 +1627,64 @@ async fn test_full_bundle_refused_request_isnt_sent_again() {
     assert_eq!(ops_sent(&world), sent, "not sent again");
     assert!(world.switch.app(&a_id).full_requested.is_some());
 }
+
+#[tokio::test]
+async fn test_revocation_shows_and_warns_of_the_open_attempts_it_orphans() {
+    // Before the user confirms, the host shows how many attempts the app owns open; the
+    // revocation goes on all the same, even after a compromise, and the warning stays while
+    // they are open (Switch spec 12.2, 10.2).
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let app = App::new(&["notes"], None, [9; 32]);
+    world.approve(&mut signer, &app).await;
+    let id = app.keys.app_id_bytes();
+    world.switch.open_attempt([1; 32], [1; 16], id);
+    world.switch.open_attempt([2; 32], [2; 16], id);
+    assert_eq!(signer.open_attempts(id).await.unwrap(), 2);
+    let picked = pubky_switch_client::clock::Clock::now_ms(&*world.clock) - 1_000;
+    let removed = signer
+        .revoke(id, Some(picked), UserConfirmed::shown_and_confirmed())
+        .await
+        .unwrap();
+    assert!(removed.listed_cert(&id).is_none(), "never held back");
+    let warning = |open_attempts| Alert::RevokedWithOpenAttempts {
+        app_id: id,
+        open_attempts,
+    };
+    assert!(
+        signer.alerts().contains(&warning(2)),
+        "{:?}",
+        signer.alerts()
+    );
+    world.switch.fail_attempt([1; 32], [1; 16]);
+    world.switch.fail_attempt([2; 32], [2; 16]);
+    signer.complete_removals().await.unwrap();
+    assert!(
+        !signer
+            .alerts()
+            .iter()
+            .any(|alert| matches!(alert, Alert::RevokedWithOpenAttempts { .. })),
+        "{:?}",
+        signer.alerts()
+    );
+}
+
+#[tokio::test]
+async fn test_revocation_without_open_attempts_warns_of_none() {
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let app = App::new(&["notes"], None, [9; 32]);
+    world.approve(&mut signer, &app).await;
+    let id = app.keys.app_id_bytes();
+    assert_eq!(signer.open_attempts(id).await.unwrap(), 0);
+    signer
+        .revoke(id, None, UserConfirmed::shown_and_confirmed())
+        .await
+        .unwrap();
+    assert!(
+        !signer
+            .alerts()
+            .iter()
+            .any(|alert| matches!(alert, Alert::RevokedWithOpenAttempts { .. }))
+    );
+}

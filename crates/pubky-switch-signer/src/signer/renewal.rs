@@ -888,6 +888,30 @@ impl Signer {
             }
         }
         self.renewals_taken(&taken).await?;
+        // A stopped app that owns open attempts: they are orphaned at its expiry, so the user
+        // is told so beside the stop (Switch spec 3.2, 10.2).
+        let lapsing: Vec<Alert> = skipped
+            .iter()
+            .filter_map(|alert| match alert {
+                Alert::RenewalsStopped { app_id, expires_at } => {
+                    let open_attempts = super::revocation::open_attempts_of(&statuses, app_id);
+                    (open_attempts > 0).then_some(Alert::LapsingWithOpenAttempts {
+                        app_id: *app_id,
+                        expires_at: *expires_at,
+                        open_attempts,
+                    })
+                }
+                _ => None,
+            })
+            .collect();
+        let mut state = self.state.clone();
+        state
+            .alerts
+            .retain(|alert| !matches!(alert, Alert::LapsingWithOpenAttempts { .. }));
+        if state != self.state {
+            self.commit(state, None).await?;
+        }
+        skipped.extend(lapsing);
         self.skip_renewals(skipped).await?;
         let mut renewed = Vec::new();
         for (app_id, lifetime) in due {
@@ -954,13 +978,14 @@ impl Signer {
 }
 
 /// The count of untaken renewals of each app in `apps` starts again in `state`, and its
-/// [`Alert::RenewalsStopped`] goes: the app is back, the user renewed it, or it is removed
-/// (Switch spec 3.1).
+/// [`Alert::RenewalsStopped`] and [`Alert::LapsingWithOpenAttempts`] go: the app is back,
+/// the user renewed it, or it is removed (Switch spec 3.1).
 pub(super) fn renewals_taken_in(state: &mut SignerState, apps: &[[u8; 16]]) {
     state.untaken_renewals.retain(|(id, _)| !apps.contains(id));
-    state.alerts.retain(
-        |alert| !matches!(alert, Alert::RenewalsStopped { app_id, .. } if apps.contains(app_id)),
-    );
+    state.alerts.retain(|alert| {
+        !matches!(alert, Alert::RenewalsStopped { app_id, .. }
+            | Alert::LapsingWithOpenAttempts { app_id, .. } if apps.contains(app_id))
+    });
 }
 
 /// Whether the device clock, `now`, agrees with the switch's signed time within the clock

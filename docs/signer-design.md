@@ -305,7 +305,20 @@ async fn resume_take_over(env: SignerEnv, identity: [u8; 32], keys: &AppKeys, va
     -> Result<Signer>;   // the secret opened again from the flow's hand-over
 ```
 
-- **`UserConfirmed`** is a token the host makes only after it has shown the user the consequence: a revocation, a loss, an erasure, a hand-over or a take-over.
+- **`UserConfirmed`** is a token the host makes only after it has shown the user the consequence: a revocation, a loss, an erasure, a hand-over or a take-over. The calls that take one, and what the host shows first:
+
+  | Call | The host shows first |
+  |---|---|
+  | `revoke(app_id, distrust_from, _)` | the app, that it is cut off for good, the count `open_attempts(app_id)` gives, whose attempts are then orphaned, and, after a compromise, the earlier time from which its messages are distrusted |
+  | `close_account(_)` | that the account at the switch is erased, `identity.json` and the app records deleted from the Homeserver, and each app's grant to be revoked (spec 12.7) |
+  | `hand_over_to(to_app, _)` | the app taking over, and that this install then stops signing and deletes its key (spec 12.8) |
+  | `abort_hand_over(_)` | that the hand-over is called off, and this install signs again once the abort wins |
+  | `take_back(_)` | that the new signer is taken to be lost, and this install signs again over its first version; a new signer still alive stops, keeping its key (wire 3.12) |
+  | `restore(_)`, `restore_new(_, _, _)` | whether the device the backup came from is still the user's, and that the backup's records replace this install's (spec 12.8) |
+  | `declare_provider_loss(origin, _)` | the service at `origin`, and that apps rebuild their state there (spec 12.6) |
+  | `declare_provider_loss_confirming_records(origin, _)` | as above, and that no other install signs, since the Homeserver's `identity.json` is missing or doesn't verify |
+
+  `approve` takes the `AppReview` instead, whose content the host shows: the App ID, the scopes, the protocols' terms and grant paths. `abort_erasure` and `end_staged_admission` take no token: neither cuts anything off.
 - **`SignerEnv`** bundles the store, the clock, the Switch client factory, the Pubky handles and the `Protocols`.
 - **Approval:** `approve` signs the certificate, the version that lists it, the approval with the app's full key bundle and its companion claim, commits them together, then delivers. The claim is released only once the switch took that version. The host delivers it to the auth request's relay and then approves the Pubky grant for exactly the capabilities checked, which include the protocols' grant paths the review showed; the user's approval covers them, since the grant can't be narrowed below the auth request's capabilities.
 - **`receive_hand_over`:**
@@ -331,7 +344,8 @@ Alert = Equivocation { version, ours, theirs }      // stop, show
       | AccountNotHosted                            // GET /apps got an unsigned 404, no erasure in progress: nothing deleted, cleared by any signed answer to GET /apps, an error included
       | IdentityNearLimit { bytes, limit }          // identity.json past 3/4 of the 256 KiB cap of a delivery or a move's enrollment
       | AppIdle { app, last_seen }                  // suggest removal after 90 days
-      | CertLapsingWithOpenAttempts { app, expires_at }
+      | LapsingWithOpenAttempts { app, expires_at, open_attempts }   // renewals stopped, attempts it would orphan at its expiry
+      | RevokedWithOpenAttempts { app, open_attempts }               // revoked, attempts left orphaned
       | GrantRevocationOwed { app }
       | PreviousServiceErasable { origin }
 ```

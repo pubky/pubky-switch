@@ -2371,3 +2371,77 @@ async fn test_full_bundle_request_of_an_app_with_a_scope_no_protocol_owns_is_ski
     assert!(world.switch.bundle_parts_of(&b_id).is_empty());
     assert!(world.switch.app(&b_id).full_requested.is_some());
 }
+
+#[tokio::test]
+async fn test_renewal_stopped_warns_of_the_open_attempts_it_would_orphan() {
+    // Renewals stopped for an app that still owns open attempts: the user is told how many,
+    // since they are orphaned at its expiry. The count follows the switch at each run, and the
+    // warning goes once it owns none, or once the user renews it (Switch spec 3.2, 10.2).
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let (a, _) = two_apps(&["notes"], &["notes"]);
+    world.approve(&mut signer, &a).await;
+    let id = a.keys.app_id_bytes();
+    world.switch.open_attempt([1; 32], [1; 16], id);
+    world.switch.open_attempt([2; 32], [2; 16], id);
+    for _ in 0..3 {
+        world.clock.advance_ms(LIFETIME_MS / 2 + DAY_MS);
+        signer.run_due().await.unwrap();
+    }
+    let newest = signer.identity_doc().unwrap().unwrap();
+    let expires_at = listed_cert(&signer, &newest, &id).expires_at();
+    let warning = |open_attempts| Alert::LapsingWithOpenAttempts {
+        app_id: id,
+        expires_at,
+        open_attempts,
+    };
+    assert!(
+        signer.alerts().contains(&warning(2)),
+        "{:?}",
+        signer.alerts()
+    );
+    world.switch.fail_attempt([1; 32], [1; 16]);
+    signer.run_due().await.unwrap();
+    assert!(signer.alerts().contains(&warning(1)));
+    assert!(!signer.alerts().contains(&warning(2)));
+    world.switch.fail_attempt([2; 32], [2; 16]);
+    signer.run_due().await.unwrap();
+    let lapsing = |signer: &Signer| {
+        signer
+            .alerts()
+            .iter()
+            .any(|alert| matches!(alert, Alert::LapsingWithOpenAttempts { .. }))
+    };
+    assert!(!lapsing(&signer), "none left");
+    // Open again, then the user renews it: the warning goes with the stop.
+    world.switch.open_attempt([3; 32], [3; 16], id);
+    signer.run_due().await.unwrap();
+    assert!(lapsing(&signer));
+    signer.renew(id, CertChange::default()).await.unwrap();
+    assert!(!lapsing(&signer));
+}
+
+#[tokio::test]
+async fn test_renewal_stopped_without_open_attempts_warns_of_none() {
+    // No open attempts: the stop alone (Switch spec 3.2).
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let (a, _) = two_apps(&["notes"], &["notes"]);
+    world.approve(&mut signer, &a).await;
+    for _ in 0..3 {
+        world.clock.advance_ms(LIFETIME_MS / 2 + DAY_MS);
+        signer.run_due().await.unwrap();
+    }
+    assert!(
+        signer
+            .alerts()
+            .iter()
+            .any(|alert| matches!(alert, Alert::RenewalsStopped { .. }))
+    );
+    assert!(
+        !signer
+            .alerts()
+            .iter()
+            .any(|alert| matches!(alert, Alert::LapsingWithOpenAttempts { .. }))
+    );
+}
