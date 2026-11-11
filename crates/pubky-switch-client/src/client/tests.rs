@@ -980,7 +980,7 @@ async fn test_operator_signed_404_reads_as_unauthenticated() {
         ),
     );
     assert_eq!(
-        client.erase().await.unwrap_err(),
+        client.erase(None).await.unwrap_err(),
         ClientError::BadServiceSignature { status: 404 }
     );
 }
@@ -990,7 +990,10 @@ async fn test_signer_and_app_calls_refuse_the_other_caller() {
     let transport = fixed(service_key(), 200, json!({}));
     let client = client_with(app(), Some(service_public()), Arc::clone(&transport));
     assert!(matches!(client.apps().await, Err(ClientError::Usage(_))));
-    assert!(matches!(client.erase().await, Err(ClientError::Usage(_))));
+    assert!(matches!(
+        client.erase(None).await,
+        Err(ClientError::Usage(_))
+    ));
     let client = client_with(signer(), Some(service_public()), Arc::clone(&transport));
     assert!(matches!(client.keys().await, Err(ClientError::Usage(_))));
     assert!(matches!(client.leave().await, Err(ClientError::Usage(_))));

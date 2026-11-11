@@ -92,7 +92,7 @@ async fn erase(replay: &Replay, key: &[u8; 32], at: &str) -> SwitchResponse {
         .handle(signer_request(
             "POST",
             &erase_path(),
-            erase_body(key),
+            erase_body(key, None),
             ms(at),
         ))
         .await
@@ -326,7 +326,7 @@ async fn test_erase_then_every_call_is_the_operators_404() {
         signer_request(
             "POST",
             &erase_path(),
-            erase_body(&alice_service_key()),
+            erase_body(&alice_service_key(), None),
             ms(&at),
         ),
     ];
@@ -448,7 +448,7 @@ async fn test_erase_only_the_signer() {
             app(&keys, "wallet"),
             "POST",
             &erase_path(),
-            erase_body(&alice_service_key()),
+            erase_body(&alice_service_key(), None),
             ms(&at),
         ))
         .await;
@@ -461,7 +461,7 @@ async fn test_erase_only_the_signer() {
             ORIGIN,
             "POST",
             &erase_path(),
-            erase_body(&alice_service_key()),
+            erase_body(&alice_service_key(), None),
             None,
             ms(&at),
         ))
@@ -695,7 +695,7 @@ async fn test_erase_commit_failure_deletes_nothing() {
     let request = signer_request(
         "POST",
         &erase_path(),
-        erase_body(&alice_service_key()),
+        erase_body(&alice_service_key(), None),
         ms(&at),
     );
     let request_signature = signature_of(&request);
@@ -1088,7 +1088,7 @@ async fn test_erase_answer_withheld_until_its_key_is_gone() {
     let request = signer_request(
         "POST",
         &erase_path(),
-        erase_body(&alice_service_key()),
+        erase_body(&alice_service_key(), None),
         ms(&at),
     );
     let request_signature = signature_of(&request);
@@ -1804,7 +1804,7 @@ async fn erased_owing_its_key(replay: &mut Replay) -> std::sync::Arc<Gate> {
 
 /// `request` with its body changed after it was signed: its signature no longer verifies.
 fn tampered(mut request: pubky_switch::http::SwitchRequest) -> pubky_switch::http::SwitchRequest {
-    request.body = erase_body(&[1; 32]).into();
+    request.body = erase_body(&[1; 32], None).into();
     request
 }
 
@@ -1847,7 +1847,7 @@ async fn test_erase_owed_keys_hold_back_only_the_signers_404() {
         tampered(signer_request(
             "POST",
             &erase_path(),
-            erase_body(&alice_service_key()),
+            erase_body(&alice_service_key(), None),
             ms(&at),
         )),
     ];
@@ -1889,7 +1889,7 @@ async fn test_erase_retry_that_doesnt_verify_sweeps_nothing() {
         signer_request(
             "POST",
             &erase_path(),
-            erase_body(&alice_service_key()),
+            erase_body(&alice_service_key(), None),
             ms(&at),
         )
     };
@@ -1983,7 +1983,7 @@ async fn test_erase_stale_signer_while_its_key_is_owed_isnt_a_404() {
     let retry = signer_request(
         "POST",
         &erase_path(),
-        erase_body(&alice_service_key()),
+        erase_body(&alice_service_key(), None),
         skewed,
     );
     let mut got = Vec::new();
@@ -2023,7 +2023,7 @@ async fn test_erase_signer_request_for_another_origin_is_the_404() {
         BOB_ORIGIN,
         "POST",
         &erase_path(),
-        erase_body(&alice_service_key()),
+        erase_body(&alice_service_key(), None),
         ms(&at),
     );
     let signature = signature_of(&elsewhere);
@@ -2161,7 +2161,7 @@ async fn test_erase_stale_signer_retry_sweeps_nothing() {
         signer_request(
             "POST",
             &erase_path(),
-            erase_body(&alice_service_key()),
+            erase_body(&alice_service_key(), None),
             at_ms,
         )
     };
@@ -2241,4 +2241,242 @@ async fn test_erase_own_app_view_gone_after_the_lookup_isnt_signed_with_its_key(
     assert_eq!(got, (404, json!("not_found")));
     assert!(!erased_key, "signed with the erased account's key");
     assert!(operator);
+}
+
+#[tokio::test]
+async fn test_erase_vector_naming_the_identity_json_it_follows() {
+    // http.json's erasure naming the hash of alice's version 3, which her account holds, and
+    // its answer: `{ "erased": true }`, signed with the account's key, without a head (Switch
+    // wire 7.4.16).
+    let Some(replay) = replay().await else { return };
+    serve_alice(&replay).await;
+    let http = vectors("http.json");
+    let expected = named(
+        &http["responses"],
+        "signer: account erasure answer to the request naming its identity.json, signed with the account's key, no head",
+    );
+    set_time(
+        &replay.clock,
+        expected["headers"]["switch-server-time"]
+            .as_str()
+            .expect("time"),
+    );
+    let request = vector_request(named(
+        &http["requests"],
+        "signer: account erasure, naming the account's service key and the identity.json it follows",
+    ));
+    let answer = replay.service.handle(request).await;
+    assert_matches(&answer, expected);
+    assert!(no_head(&answer));
+    assert_eq!(rows(&replay, &alice_id()).await[0], ("accounts", 0));
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_erase_vector_naming_another_identity_json_is_conflict() {
+    // http.json's erasure naming alice's version 1 while her account holds version 3: the
+    // vector's `409 conflict`, signed with the account's key, without a head, and nothing is
+    // deleted, so an erasure can't follow a delivery made after the signer's last check
+    // (Switch wire 7.4.16).
+    let Some(replay) = replay().await else { return };
+    serve_alice(&replay).await;
+    let before = rows(&replay, &alice_id()).await;
+    let http = vectors("http.json");
+    let expected = named(
+        &http["responses"],
+        "signer: account erasure refused, the account holds another identity.json, 409 conflict, no head",
+    );
+    set_time(
+        &replay.clock,
+        expected["headers"]["switch-server-time"]
+            .as_str()
+            .expect("time"),
+    );
+    let request = vector_request(named(
+        &http["requests"],
+        "signer: account erasure naming an identity.json the account doesn't hold",
+    ));
+    let answer = replay.service.handle(request).await;
+    assert_matches(&answer, expected);
+    assert!(no_head(&answer));
+    assert_eq!(rows(&replay, &alice_id()).await, before, "nothing deleted");
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_erase_naming_a_hash_at_an_account_holding_no_identity_json_is_conflict() {
+    // A staged account, enrolled and not yet delivered to, holds no `identity.json`: a hash
+    // can't match, `409 conflict`, nothing deleted; the key alone erases it (7.4.16).
+    let Some(replay) = replay().await else { return };
+    let http = vectors("http.json");
+    let enrolled = named(
+        &http["responses"],
+        "signer: enrollment answer, signed with the new account's key",
+    );
+    let at = enrolled["headers"]["switch-server-time"]
+        .as_str()
+        .expect("time")
+        .to_string();
+    set_time(&replay.clock, &at);
+    let enrollment = vector_request(named(&http["requests"], "signer: enrollment"));
+    assert_eq!(replay.service.handle(enrollment).await.status, 200);
+    let named_hash = replay
+        .service
+        .handle(signer_request(
+            "POST",
+            &erase_path(),
+            erase_body(&alice_service_key(), Some(&[9; 32])),
+            ms(&at),
+        ))
+        .await;
+    assert_eq!(code_of(&named_hash), (409, json!("conflict")));
+    assert!(no_head(&named_hash));
+    assert_eq!(rows(&replay, &alice_id()).await[0], ("accounts", 1));
+    assert_eq!(erase(&replay, &alice_service_key(), &at).await.status, 200);
+    replay.db.drop_database().await.expect("drop");
+}
+
+/// The document hash of documents.json's `name`.
+fn doc_hash(name: &str) -> [u8; 32] {
+    let doc: pubky_switch_core::sig::SignedDoc = serde_json::from_value(
+        named(&vectors("documents.json")["documents"], name)["signed"].clone(),
+    )
+    .expect("signed doc");
+    doc.doc_hash().expect("hash")
+}
+
+/// The time of the erasure answer naming its `identity.json` in http.json.
+fn hash_vector_time() -> String {
+    let http = vectors("http.json");
+    named(
+        &http["responses"],
+        "signer: account erasure answer to the request naming its identity.json, signed with the account's key, no head",
+    )["headers"]["switch-server-time"]
+        .as_str()
+        .expect("time")
+        .to_string()
+}
+
+#[tokio::test]
+async fn test_erase_malformed_identity_hash_is_bad_request_not_conflict() {
+    // A malformed `identity_hash` (short, not a string, null) or an unknown member is `400`,
+    // never a `409`, without a head, and nothing is deleted (wire 7.4.16, 1.1).
+    let Some(replay) = replay().await else { return };
+    serve_alice(&replay).await;
+    let at = hash_vector_time();
+    set_time(&replay.clock, &at);
+    let before = rows(&replay, &alice_id()).await;
+    let key = pubky_switch_core::enc::b64(&alice_service_key());
+    let held = pubky_switch_core::enc::b64(&doc_hash("alice identity.json"));
+    for body in [
+        format!(r#"{{"service_key":"{key}","identity_hash":"AA"}}"#),
+        format!(r#"{{"service_key":"{key}","identity_hash":7}}"#),
+        format!(r#"{{"service_key":"{key}","identity_hash":null}}"#),
+        format!(r#"{{"service_key":"{key}","identity_hash":"{held}","x":1}}"#),
+    ] {
+        let answer = replay
+            .service
+            .handle(signer_request(
+                "POST",
+                &erase_path(),
+                body.clone().into_bytes(),
+                ms(&at),
+            ))
+            .await;
+        assert_eq!(code_of(&answer), (400, json!("bad_request")), "{body}");
+        assert!(no_head(&answer), "{body}");
+    }
+    assert_eq!(rows(&replay, &alice_id()).await, before, "nothing deleted");
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_erase_wrong_key_is_judged_before_the_hash() {
+    // Another key and another hash: the key's refusal, as the wire orders them (7.4.16).
+    let Some(replay) = replay().await else { return };
+    serve_alice(&replay).await;
+    let at = hash_vector_time();
+    set_time(&replay.clock, &at);
+    let answer = replay
+        .service
+        .handle(signer_request(
+            "POST",
+            &erase_path(),
+            erase_body(&[1; 32], Some(&[9; 32])),
+            ms(&at),
+        ))
+        .await;
+    assert_eq!(code_of(&answer), (409, json!("conflict")));
+    assert_eq!(
+        body(&answer)["message"],
+        json!("7.4.16: not the account's service key")
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_erase_retry_with_the_hash_after_it_landed_is_the_operators_404() {
+    // The erasure naming the held version lands; a retry with the same body finds no account:
+    // the operator's `404`, never a `409` (7.4.16).
+    let Some(replay) = replay().await else { return };
+    serve_alice(&replay).await;
+    let at = hash_vector_time();
+    set_time(&replay.clock, &at);
+    let hash = doc_hash("alice identity.json");
+    let first = replay
+        .service
+        .handle(signer_request(
+            "POST",
+            &erase_path(),
+            erase_body(&alice_service_key(), Some(&hash)),
+            ms(&at),
+        ))
+        .await;
+    assert_eq!(first.status, 200);
+    let retry = signer_request(
+        "POST",
+        &erase_path(),
+        erase_body(&alice_service_key(), Some(&hash)),
+        ms(&at) + 1000,
+    );
+    let signature = signature_of(&retry);
+    let answer = replay.service.handle(retry).await;
+    assert_eq!(code_of(&answer), (404, json!("not_found")));
+    assert!(operator_signed(&answer, Some(&signature)));
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_erase_hash_of_an_older_version_at_a_later_account_is_conflict() {
+    // A hash naming version 1 while the account holds version 3, and the key right: `409`,
+    // nothing deleted, and the right hash then erases (7.4.16).
+    let Some(replay) = replay().await else { return };
+    serve_alice(&replay).await;
+    let at = hash_vector_time();
+    set_time(&replay.clock, &at);
+    let before = rows(&replay, &alice_id()).await;
+    let old = doc_hash("alice identity.json, first delivery (version 1)");
+    let refused = replay
+        .service
+        .handle(signer_request(
+            "POST",
+            &erase_path(),
+            erase_body(&alice_service_key(), Some(&old)),
+            ms(&at),
+        ))
+        .await;
+    assert_eq!(code_of(&refused), (409, json!("conflict")));
+    assert_eq!(rows(&replay, &alice_id()).await, before, "nothing deleted");
+    let hash = doc_hash("alice identity.json");
+    let erased = replay
+        .service
+        .handle(signer_request(
+            "POST",
+            &erase_path(),
+            erase_body(&alice_service_key(), Some(&hash)),
+            ms(&at) + 1000,
+        ))
+        .await;
+    assert_eq!(erased.status, 200);
+    replay.db.drop_database().await.expect("drop");
 }
