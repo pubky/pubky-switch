@@ -163,7 +163,8 @@ impl Signer {
         self.refresh().await?;
         self.check_named()?;
         let failures = self.revoke_at_switch().await?;
-        let (mut statuses, mut answered_at) = self.ready_at_switch().await?;
+        let read = self.ready_at_switch().await?;
+        let (mut statuses, mut answered_at) = (read.answer.apps, read.answer.server_time);
         let mut newest = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
         let found = self.removals(&newest, &statuses, answered_at);
         if !found.unconfirmed.is_empty() {
@@ -494,7 +495,8 @@ impl Signer {
     /// As [`Signer::resume`].
     pub async fn serve_full_bundles(&mut self) -> Result<Vec<[u8; 16]>> {
         // Served is judged on the switch's signed time, not the device clock.
-        let (statuses, now) = self.ready_at_switch().await?;
+        let read = self.ready_at_switch().await?;
+        let (statuses, now) = (read.answer.apps, read.answer.server_time);
         let newest = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
         let certs = self.held_certs()?;
         let current = newest.data_epoch();

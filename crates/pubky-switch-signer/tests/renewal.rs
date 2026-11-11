@@ -1901,3 +1901,35 @@ async fn test_run_due_step_reads_the_switch_again_after_delivering_an_owed_closi
     }
     assert!(found, "a crash that leaves the closing owed");
 }
+
+#[tokio::test]
+async fn test_renewal_clock_off_isnt_cleared_by_a_slow_backup_read() {
+    // The device clock is 5.5 minutes behind the switch: the renewals are skipped with
+    // `ClockOff`. At the next check the signer backup read takes 60 s; the device clock when
+    // the switch's answer came is still off, so the alert stays (Switch spec 10.1).
+    use pubky_switch_client::clock::TestClock;
+    let world = World::new();
+    let (mut signer, store) = world.enrolled().await;
+    world
+        .approve(&mut signer, &App::new(&["notes"], None, [9; 32]))
+        .await;
+    drop(signer);
+    let device = Arc::new(TestClock::new(world.clock.now_ms() - 330_000));
+    let mut env = world.env(store);
+    env.clock = device.clone();
+    let mut signer = Signer::open(env, world.keyring()).await.unwrap();
+    signer.renew_expiring().await.unwrap();
+    assert!(signer.alerts().contains(&Alert::ClockOff));
+    let switch_clock = Arc::clone(&world.clock);
+    let device_clock = Arc::clone(&device);
+    *world.homeserver.after_get.lock().unwrap() = Some((
+        SIGNER_BACKUP_PATH.to_owned(),
+        1,
+        Box::new(move || {
+            switch_clock.advance_ms(60_000);
+            device_clock.advance_ms(60_000);
+        }),
+    ));
+    signer.renew_expiring().await.unwrap();
+    assert!(signer.alerts().contains(&Alert::ClockOff));
+}

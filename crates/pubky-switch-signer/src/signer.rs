@@ -27,7 +27,7 @@
 
 use std::sync::Arc;
 
-use pubky_switch_client::client::answers::{AppStatus, AppsAnswer};
+use pubky_switch_client::client::answers::AppsAnswer;
 use pubky_switch_client::clock::Clock;
 use pubky_switch_client::store::StoreHandle;
 use pubky_switch_client::transport::Transport;
@@ -536,21 +536,20 @@ impl Signer {
         self.ready_and_read().await.map(drop)
     }
 
-    /// [`Signer::ready`], and the switch's apps and the service time its answer is signed at,
-    /// from the `GET /apps` whose copy that check confirmed: one read for both, so the apps
-    /// a step goes by are those of the switch it found holding its mark. Read again only when
-    /// that check read no copy, or delivered since.
-    pub(crate) async fn ready_at_switch(&mut self) -> Result<(Vec<AppStatus>, u64)> {
+    /// [`Signer::ready`], and the `GET /apps` whose copy that check confirmed: one read for
+    /// both, so the apps a step goes by are those of the switch it found holding its mark.
+    /// Read again only when that check read no copy, or delivered since.
+    pub(crate) async fn ready_at_switch(&mut self) -> Result<SwitchRead> {
         match self.ready_and_read().await? {
-            Some(answer) => Ok((answer.apps, answer.server_time)),
-            None => self.switch_apps_at().await,
+            Some(read) => Ok(read),
+            None => self.switch_at_mark().await,
         }
     }
 
     /// [`Signer::ready`], and the `GET /apps` answer its copy check read, while nothing was
     /// delivered since: `None` before the first version, which no copy is checked against,
     /// and after a closing owed was delivered.
-    pub(crate) async fn ready_and_read(&mut self) -> Result<Option<AppsAnswer>> {
+    pub(crate) async fn ready_and_read(&mut self) -> Result<Option<SwitchRead>> {
         self.refresh().await?;
         // An erased account has no switch to read (Switch spec 12.7).
         if self.state.erased {
@@ -580,7 +579,7 @@ impl Signer {
     /// the Homeserver's `identity.json` is neither newer nor another body at the mark (Switch
     /// spec 4.3, Switch wire 3.13). So nothing stale is signed, backed up or sent. Returns
     /// the switch's answer that showed its copy, `None` before the first version.
-    async fn check_copies(&mut self) -> Result<Option<AppsAnswer>> {
+    async fn check_copies(&mut self) -> Result<Option<SwitchRead>> {
         let Some(newest) = self.state.newest_doc()? else {
             return Ok(None);
         };
@@ -963,11 +962,12 @@ impl Signer {
 
     /// Check that the switch still holds the newest version this signer delivered (`GET
     /// /apps` `identity`, Switch wire 7.4.12). Any other copy stops the flow, as
-    /// [`Signer::judge_copy`] says. Returns the answer.
-    async fn switch_at_mark(&mut self) -> Result<AppsAnswer> {
+    /// [`Signer::judge_copy`] says. Returns the answer, with the device clock when it came.
+    async fn switch_at_mark(&mut self) -> Result<SwitchRead> {
         let answer = self.service_client()?.apps().await?;
+        let device_ms = self.env.clock.now_ms();
         self.confirm_copy(answer.identity.as_ref()).await?;
-        Ok(answer)
+        Ok(SwitchRead { answer, device_ms })
     }
 
     /// Judge the switch's copy of `identity.json`, `held` as `GET /apps` gave it, against the
@@ -1008,7 +1008,7 @@ impl Signer {
     /// switch's copy is its mark, and the backup on the Homeserver names neither another
     /// install that took over nor a newer version of this install's own (Switch spec 4.3,
     /// 12.8; Switch wire 3.13). Returns the switch's answer that showed its copy.
-    pub(crate) async fn ensure_signer(&mut self) -> Result<AppsAnswer> {
+    pub(crate) async fn ensure_signer(&mut self) -> Result<SwitchRead> {
         self.check_named()?;
         let read = self.switch_at_mark().await?;
         self.check_backup_copy().await?;
@@ -1492,6 +1492,17 @@ fn stale_without_copy() -> SignerError {
     SignerError::InvalidData(pubky_switch_core::Error::Invalid(
         "Switch wire 7.4.2: stale_identity without a newer copy than the one built on".into(),
     ))
+}
+
+/// A `GET /apps` answer whose copy of `identity.json` a check confirmed, and the device clock
+/// when it arrived. A step that judges the device clock against the answer's `server_time`
+/// uses `device_ms`, not the clock after the reads that followed it, so a slow read can't
+/// widen the clock tolerance (Switch spec 10.1).
+pub(crate) struct SwitchRead {
+    /// The answer.
+    pub(crate) answer: AppsAnswer,
+    /// The device clock when the answer arrived.
+    pub(crate) device_ms: u64,
 }
 
 #[cfg(test)]

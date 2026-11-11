@@ -622,9 +622,13 @@ impl Signer {
     /// the new certificate: `until` is the time the switch took that record plus the clock
     /// tolerance (Switch spec 3.2 step 4, Switch wire 3.8 step 4). Returns the apps closed.
     ///
+    /// While no renewal is open, nothing is checked or read: it returns none, whatever the
+    /// state, an erased account, another install named, records behind or a flow in
+    /// progress included.
+    ///
     /// # Errors
     ///
-    /// As [`Signer::resume`].
+    /// With a renewal open, as [`Signer::resume`].
     pub async fn complete_renewals(&mut self) -> Result<Vec<[u8; 16]>> {
         // With no renewal open, nothing is read: the step is a no-op (design note, section
         // 4.5).
@@ -632,7 +636,7 @@ impl Signer {
         if self.open_renewals()?.is_empty() {
             return Ok(Vec::new());
         }
-        let (statuses, _) = self.ready_at_switch().await?;
+        let statuses = self.ready_at_switch().await?.answer.apps;
         let Some(doc) = self.state.newest_doc()? else {
             return Ok(Vec::new());
         };
@@ -761,9 +765,11 @@ impl Signer {
     /// run; a renewal it cut short is finished by [`Signer::resume`], and the apps left are
     /// renewed at the next run.
     pub async fn renew_expiring(&mut self) -> Result<Vec<[u8; 16]>> {
-        let (statuses, switch_time) = self.ready_at_switch().await?;
+        let read = self.ready_at_switch().await?;
+        let (statuses, switch_time) = (read.answer.apps, read.answer.server_time);
         let newest = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
-        if clock_agrees(self.env.clock.now_ms(), switch_time).is_err() {
+        // The device clock when the answer came, not after the reads since.
+        if clock_agrees(read.device_ms, switch_time).is_err() {
             return self.skip_renewals(vec![Alert::ClockOff]).await;
         }
         // The clocks agree again: the alert has served.
