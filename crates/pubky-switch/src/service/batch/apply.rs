@@ -428,7 +428,7 @@ fn receive_key_put(
 
 /// Whether `app`'s full-bundle request is in force for dropping its parts, its cursor at
 /// `cursor` (Switch wire 6.2): from the `POST /keys` until the cursor has passed the part
-/// that completed it.
+/// that completed it, or the part that replaced that one.
 fn in_force(app: &super::state::HeldApp, cursor: u64) -> bool {
     app.full_requested.is_some() || app.full_completed.is_some_and(|done| cursor < done)
 }
@@ -483,11 +483,10 @@ fn key_bundle_put(
             // passed and that its `keys_through` covers go: it holds their keys (Switch wire
             // 6.2). A request is in force from the `POST /keys` until the target's cursor has
             // passed the part that completed it, or the part that replaced that one: until then
-            // the app hasn't read the parts it
-            // asked for, which may include ones it passed before a restore. It is judged as it
-            // was before this part, so a request this part completes keeps them at this put,
-            // and this part's `seq` keeps it in force after. The part just stored is past
-            // every cursor, so it stays.
+            // the app hasn't read the parts it asked for, which may include ones it passed
+            // before a restore. It is judged as it was before this part, so a request this
+            // part completes keeps them at this put, and this part's `seq` keeps it in force
+            // after. The part just stored is past every cursor, so it stays.
             let full = state
                 .apps
                 .get(&target)

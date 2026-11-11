@@ -554,6 +554,7 @@ impl ScriptedSwitch {
         next.doc = inner.doc.clone();
         next.apps = inner.apps.clone();
         next.bundles = inner.bundles.clone();
+        next.listed_at_epoch = inner.listed_at_epoch.clone();
         next.kids = inner.kids.clone();
         // An export carries batch records without their proofs (Switch wire 10.1); a key
         // change in place keeps them.
