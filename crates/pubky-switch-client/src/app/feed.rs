@@ -327,6 +327,9 @@ impl App {
         self.deliver_record().await?;
         self.ensure_scope_keys().await?;
         self.prune_processed().await?;
+        // The bounds on entries stored unverified go before any is tried again (Switch
+        // spec 8.2).
+        self.bound_unverified().await?;
         self.retry_parked().await?;
         self.retry_owed().await?;
         self.list_collections_if_due().await?;
