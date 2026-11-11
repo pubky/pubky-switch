@@ -169,7 +169,8 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   naming the pending key with `recovery_from` is a provider loss in place, refused with
   `400` when it lists an App ID held with that key: the account starts afresh under that
   key, keeping its service time, its enrollments and the App IDs
-  to refuse, those held with the pending key among them. Unlike the service: a key change
+  to refuse, those held with the pending key among them, and, as the service does, its upload
+  limits and hourly upload counts. Unlike the service: a key change
   in place, without `recovery_from`, is answered `400`; and a staged account's generation
   change, a move's, is chained where the service answers `503`. The test call `deliver_identity` takes any document, without those
   checks, for scripting what another signer or a faulty service did. `forget_delivery_proof`

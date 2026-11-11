@@ -271,6 +271,12 @@ impl Inner {
         }
         fresh.enrolled = self.enrolled.take();
         fresh.enroll_limits = self.enroll_limits;
+        // The upload limits are the service's configuration, and its upload counts are kept
+        // by account and app, which a recovery in place doesn't forget (Switch wire 9.4).
+        fresh.uploads_per_app_per_hour = self.uploads_per_app_per_hour;
+        fresh.max_contacts = self.max_contacts;
+        fresh.max_deny = self.max_deny;
+        fresh.upload_counts = std::mem::take(&mut self.upload_counts);
         fresh.faults = std::mem::take(&mut self.faults);
         fresh.kept_at = self.kept_at;
         fresh.kept_app_ids = std::mem::take(&mut self.kept_app_ids);
@@ -946,6 +952,11 @@ mod tests {
             switch.lock().put_identity(delivery.as_bytes()).unwrap().0,
             400
         );
+        {
+            let mut inner = switch.lock();
+            inner.uploads_per_app_per_hour = 7;
+            inner.upload_counts.insert([5; 16], (1, 3));
+        }
         let recovery = IdentityDoc::sign(&identity, body).unwrap();
         let delivery = json!({ "identity": recovery.signed(), "prev": null }).to_string();
         assert_eq!(
@@ -956,6 +967,12 @@ mod tests {
             switch.kept_app_ids().contains(&[7; 16]),
             "the App ID held with the pending key is kept"
         );
+        // The upload limits and counts stay, as the service's do (Switch wire 9.4).
+        {
+            let inner = switch.lock();
+            assert_eq!(inner.uploads_per_app_per_hour, 7);
+            assert_eq!(inner.upload_counts.get(&[5; 16]), Some(&(1, 3)));
+        }
         let (status, retired) = enroll_at(&switch, &identity, 1, None);
         assert_eq!((status, retired["code"].clone()), (409, json!("conflict")));
         let (status, again) = enroll_at(&switch, &identity, 2, Some(vec![[7; 16]]));
