@@ -980,6 +980,11 @@ impl ScriptedSwitch {
                         let at = inner.stamped_ms;
                         return Ok(inner.respond_at(&inner.service, request, status, &body, at));
                     }
+                    // An enrollment's errors are the operator's (Switch wire 7.4.1).
+                    if request.method == "POST" && path == "/v1/enroll" {
+                        let operator = SigningKey::from_bytes(&[42; 32]);
+                        return Ok(inner.respond_with(&operator, request, status, &body));
+                    }
                     return Ok(inner.respond(request, status, &body));
                 }
                 Some(Fault::LoseAnswer { .. }) => lose = true,
@@ -999,6 +1004,11 @@ impl ScriptedSwitch {
             let key = inner.answer_key.take();
             if lose {
                 return Err(TransportError::Timeout);
+            }
+            // Its errors are the operator's, as at the service (Switch wire 7.4.1).
+            if status != 200 {
+                let operator = SigningKey::from_bytes(&[42; 32]);
+                return Ok(inner.respond_with(&operator, request, status, &body));
             }
             if let Some(key) = key {
                 return Ok(inner.respond_with(&key, request, status, &body));

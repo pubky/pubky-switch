@@ -823,6 +823,59 @@ mod tests {
     }
 
     #[test]
+    fn test_scripted_lost_enrollment_answer_leaves_no_signing_key() {
+        // An enrollment answered with the pending key whose answer is lost leaves no key
+        // behind to sign a later answer with (Switch wire 7.4.1).
+        let identity = pubky_switch_core::keys::IdentityKey::from_secret([1; 32]);
+        let switch = ScriptedSwitch::unenrolled_at(
+            &identity,
+            [2; 32],
+            Arc::new(crate::clock::TestClock::new(0)),
+            SWITCH_ORIGIN,
+        );
+        assert_eq!(enroll_at(&switch, &identity, 1, None).0, 200);
+        let service = switch.lock().service.verifying_key().to_bytes();
+        let doc = IdentityDoc::sign(
+            &identity,
+            pubky_switch_core::records::IdentityBody::first(
+                identity.public(),
+                [3; 16],
+                pubky_switch_core::records::Inbox::new(SWITCH_ORIGIN, service),
+                pubky_switch_core::records::IdentityPolicy::default(),
+            ),
+        )
+        .unwrap();
+        let delivery = json!({ "identity": doc.signed(), "prev": null }).to_string();
+        assert_eq!(
+            switch.lock().put_identity(delivery.as_bytes()).unwrap().0,
+            200
+        );
+        switch.fail_next(crate::testing::Fault::LoseAnswer {
+            path: "/enroll".into(),
+        });
+        let body = pubky_switch_core::records::EnrollmentBody {
+            identity: identity.public(),
+            origin: SWITCH_ORIGIN.to_owned(),
+            nonce: [2; 16],
+            policy: pubky_switch_core::records::IdentityPolicy::default(),
+            identity_doc: None,
+            revoked_apps: None,
+        };
+        let enrollment = Enrollment::sign(&identity, body).unwrap();
+        let request = crate::transport::Request {
+            method: "POST".into(),
+            origin: SWITCH_ORIGIN.into(),
+            path_and_query: "/v1/enroll".into(),
+            headers: Vec::new(),
+            body: json!({ "enrollment": enrollment.signed() })
+                .to_string()
+                .into_bytes(),
+        };
+        assert!(switch.handle(&request).is_err(), "the answer is lost");
+        assert!(switch.lock().answer_key.is_none());
+    }
+
+    #[test]
     fn test_scripted_recovery_in_place_retires_the_outgoing_keys_enrollments() {
         // As at the service: after a recovery in place under the pending key, the enrollment
         // the outgoing key answered is `409 conflict`, and the one the pending key answered

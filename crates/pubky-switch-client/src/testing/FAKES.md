@@ -158,9 +158,10 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   again. Unlike the service:
   - an enrollment's `identity_doc` isn't held, so the account starts with no document and
     at the switch's own generation, whatever the enrollment names;
-  - the pending key is derived from the account's, not random;
-  - its errors, the `409 conflict` included, are signed with the account's key, not the
-    operator's.
+  - the pending key is derived from the account's, not random.
+
+  Its errors, injected ones and the `409 conflict` included, are signed with the operator
+  key, as at the service.
 - **`PUT /identity`** (Switch wire 3.3, 7.4.2), in `switch/signer.rs`: judged by the core's
   `check_delivery`, like the service, with the kept proofs taken from what it holds: each held
   record's current write proof and each live claim's entry proofs, by the generation each
