@@ -84,10 +84,10 @@ pub struct ReceivedMessage {
     /// since, or can't tell, declines with [`Outcome::Drop`], which keeps the message
     /// processed.
     ///
-    /// An effect run again this way can apply twice only through what carries no
-    /// condition: local writes, and operations without conditions, such as a list change.
-    /// A claim's step and a record write's expected version are checked by the service,
-    /// which refuses a second application.
+    /// The service refuses an effect run again this way where an operation depends on what
+    /// its first application changed, such as a record write's expected version or a
+    /// claim's step, and it checks conditions for the whole batch (Switch spec 8.2, 10.1);
+    /// otherwise its operations, and its local writes, may apply twice.
     pub released: bool,
     /// After a `409 conflict` on the effect's batch: the answer's `current`, so the
     /// protocol builds its effect again on what the service holds now.

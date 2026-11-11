@@ -30,6 +30,8 @@ enum Mode {
     /// The sample protocol's effect, but the first run of an entry stored locally can't
     /// finish ([`Outcome::Retry`]).
     RetryFirstStoredRun,
+    /// The protocol's store is unavailable: held, then stored after the bounded wait.
+    Unavailable,
 }
 
 /// The sample protocol, whose receive step follows [`Mode`].
@@ -111,6 +113,7 @@ impl Protocol for ParkingProtocol {
                 })
             }
             Mode::Rejected => Outcome::Retry(StoreFailure::of_entry(StoreError::Corrupt)),
+            Mode::Unavailable => Outcome::Retry(StoreError::Unavailable.into()),
             Mode::DeclineReleased if message.released => Outcome::Drop {
                 reason: "sample: it may have been applied".into(),
             },
@@ -363,32 +366,104 @@ async fn test_parked_forget_with_another_hash_is_refused() {
     assert_eq!(listed(&mut app, uncertain.stored_id).await, Some(uncertain));
 }
 
+/// The host forgets `entry` once the duty events are acknowledged: it goes alone, and a
+/// re-send of `message` is a duplicate.
+async fn forgotten(w: &World, app: &mut App, entry: ParkedSummary, message: &Message) {
+    ack_all(app).await;
+    assert_eq!(
+        app.forget_parked(entry.stored_id, &entry.hash)
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(app.parked_entries().await.unwrap().is_empty(), "{entry:?}");
+    assert!(resent_is_duplicate(w, app, message).await, "{entry:?}");
+}
+
 #[tokio::test]
-async fn test_parked_forget_of_an_entry_tried_again_is_refused() {
+async fn test_parked_forget_of_an_entry_stored_for_any_reason() {
     let w = World::new();
     let protocol = ParkingProtocol::new(Mode::Plain);
     let mut app = wallet_on(&w, &protocol, Arc::clone(&w.store) as Arc<dyn StateStore>).await;
-    let (uncertain, _) = uncertain(&w, &mut app).await;
-    let (rejected, _) = parked_as(&w, &mut app, &protocol, Mode::Rejected).await;
-    protocol.set(Mode::Rejected);
-    ack_all(&mut app).await;
-    app.release_parked(uncertain.stored_id, &uncertain.hash)
+    // Tried again: a write over the quota.
+    let (seq, message) = w.note(app.app_id(), "over the quota");
+    w.switch.fail_next(Fault::Error {
+        path: "ops".into(),
+        code: pubky_switch_core::http::ErrorCode::QuotaExceeded,
+        current: serde_json::json!({}),
+    });
+    app.receive(None).await.unwrap();
+    let id = app.stored_id_at(seq).unwrap();
+    let quota = listed(&mut app, id).await.unwrap();
+    assert_eq!(quota.reason, ParkReason::Quota);
+    forgotten(&w, &mut app, quota, &message).await;
+    // Tried again: the protocol's store refused the entry.
+    let (rejected, message) = parked_as(&w, &mut app, &protocol, Mode::Rejected).await;
+    assert_eq!(rejected.reason, ParkReason::StoreRejected);
+    forgotten(&w, &mut app, rejected, &message).await;
+    // Tried again: the protocol's store unavailable past the bounded wait.
+    protocol.set(Mode::Unavailable);
+    let (seq, message) = w.note(app.app_id(), "unavailable");
+    app.receive(None).await.unwrap();
+    w.clock.advance_ms(World::config().park_after_ms + 1);
+    app.receive(None).await.unwrap();
+    protocol.set(Mode::Plain);
+    let id = app.stored_id_at(seq).unwrap();
+    let unavailable = listed(&mut app, id).await.unwrap();
+    assert_eq!(unavailable.reason, ParkReason::StoreUnavailable);
+    // Stored after the app's checks of its sender passed.
+    let view = app
+        .parked_entry(unavailable.stored_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(view.sender_verified);
+    forgotten(&w, &mut app, unavailable, &message).await;
+    // Not tried again: an uncertain effect.
+    let (uncertain_entry, message) = uncertain(&w, &mut app).await;
+    forgotten(&w, &mut app, uncertain_entry, &message).await;
+    // Tried again: an uncertain one the host released.
+    let (released, message) = uncertain(&w, &mut app).await;
+    app.release_parked(released.stored_id, &released.hash)
         .await
         .unwrap();
-    assert!(usage(
-        app.forget_parked(rejected.stored_id, &rejected.hash).await
-    ));
-    assert!(usage(
-        app.forget_parked(uncertain.stored_id, &uncertain.hash)
-            .await
-    ));
+    let released = listed(&mut app, released.stored_id).await.unwrap();
+    assert_eq!(released.reason, ParkReason::Released);
+    forgotten(&w, &mut app, released, &message).await;
+}
+
+#[tokio::test]
+async fn test_parked_forget_of_an_unverifiable_copy_keeps_a_checked_message_processed() {
+    let w = World::new();
+    let protocol = ParkingProtocol::new(Mode::Plain);
+    let mut app = wallet_on(&w, &protocol, Arc::clone(&w.store) as Arc<dyn StateStore>).await;
+    // The message stored once with its sender checked, its effect over one batch.
+    let (wide, message) = parked_as(&w, &mut app, &protocol, Mode::Wide).await;
+    // A re-send of it stored once more, its sender's standing not checked.
+    w.homeserver.set_down(true);
+    w.clock.advance_ms(11 * 60_000);
+    let again = resend(&w, &app, &message);
+    app.receive(None).await.unwrap();
+    w.clock.advance_ms(25 * 3_600_000);
+    app.receive(None).await.unwrap();
+    let id = app.stored_id_at(again).unwrap();
+    let unverified = listed(&mut app, id).await.unwrap();
+    assert_eq!(unverified.reason, ParkReason::Unverifiable);
+    assert_eq!(unverified.hash, wide.hash);
+    // Forgetting the unverified copy is being done with the message: both go, and since
+    // one of them was checked, the message stays processed.
+    ack_all(&mut app).await;
+    let handed = protocol.handed();
     assert_eq!(
-        reasons(&mut app).await,
-        vec![
-            (uncertain.stored_id, ParkReason::Released),
-            (rejected.stored_id, ParkReason::StoreRejected)
-        ]
+        app.forget_parked(unverified.stored_id, &unverified.hash)
+            .await
+            .unwrap(),
+        2
     );
+    assert!(app.parked_entries().await.unwrap().is_empty());
+    w.homeserver.set_down(false);
+    assert!(resent_is_duplicate(&w, &mut app, &message).await);
+    assert_eq!(protocol.handed(), handed);
 }
 
 #[tokio::test]

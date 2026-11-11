@@ -55,14 +55,18 @@ pub struct ParkedMessage {
     pub stored_id: u64,
     /// The `seq` the entry was read at, in [`ParkedMessage::generation`].
     pub seq: u64,
-    /// The generation it was read at.
+    /// The generation it was read at. Two stored entries can share a `seq` from different
+    /// generations, since a provider loss starts a new sequence; the pair names the feed
+    /// position, and [`ParkedMessage::stored_id`] the entry.
     pub generation: u64,
     /// The sender identity.
     pub sender: [u8; 32],
-    /// Whether the app's checks of the sender passed before the entry was stored: `false`
-    /// for an entry stored as [`ParkReason::Unverifiable`] or
-    /// [`ParkReason::StoreUnavailable`], whose sender's identity or standing in the lists
-    /// wasn't checked through. A host doesn't show such content as from a verified sender.
+    /// Whether the app checked the sender's standing before the entry was stored: `false`
+    /// for an entry stored as [`ParkReason::Unverifiable`], whose signing app wasn't
+    /// checked against the sender identity's `identity.json`. A host doesn't show such
+    /// content as from a verified sender. Every other entry passed the app's checks of
+    /// the sender before it was stored: one stored as [`ParkReason::StoreUnavailable`] was
+    /// stored because the protocol's receive step couldn't finish, after those checks.
     pub sender_verified: bool,
     /// When the inbox accepted it, service time in Unix milliseconds.
     pub accepted_at_ms: u64,
@@ -194,10 +198,7 @@ impl App {
                 seq: stored.seq,
                 generation: stored.generation,
                 sender: stored.sender,
-                sender_verified: !matches!(
-                    stored.reason,
-                    ParkReason::Unverifiable | ParkReason::StoreUnavailable
-                ),
+                sender_verified: stored.reason != ParkReason::Unverifiable,
                 accepted_at_ms: stored.accepted_at_ms,
                 reason: stored.reason,
                 plaintext,
@@ -212,33 +213,31 @@ impl App {
     }
 
     /// Forget the entry stored locally at local ID `id`, whose [`ParkedSummary::hash`] is
-    /// `hash`: the host and its protocol are done with its message. Returns how many
-    /// entries went: forgetting is being done with the message, so every stored copy of it
-    /// goes in the same commit, whatever it was stored for. Nothing brings a forgotten
-    /// entry back: a host that might want the message later, for example once the cause of
-    /// a refusal is fixed, doesn't forget it.
+    /// `hash`: the host and its protocol are done with its message (Switch spec 8.2). Any
+    /// stored entry may be forgotten, whatever it was stored for, tried again or not.
+    /// Returns how many entries went: forgetting is being done with the message, so every
+    /// entry stored for it goes in the same commit. Nothing brings a forgotten entry back:
+    /// a host that might want the message later, for example once the cause of a refusal
+    /// is fixed, doesn't forget it.
     ///
-    /// What may be forgotten:
-    /// - an entry that isn't tried again ([`ParkReason::tried_again`] `false`). Its message
-    ///   stays processed, so a re-send of it is a duplicate, not applied (Switch spec 8.2,
-    ///   11): the processed pair is written if none is kept, and goes with the other
-    ///   processed pairs after their retention. Its stored copies are those with the same
-    ///   sender and `msg_id`.
-    /// - an entry stored as [`ParkReason::Unverifiable`]: a message the host gives up
-    ///   whose sender couldn't be checked. Nothing it names was checked, so no processed
-    ///   pair is written, and only copies of the same hash go: a re-send is checked as new.
-    /// - an entry that reads as corrupt ([`ParkedSummary::readable`] `false`), which can't
-    ///   run again: it goes alone, and no processed pair is written.
+    /// **The entries stored for the message.** For a named entry whose sender's standing
+    /// was checked and that reads as a message, those with the same sender identity and
+    /// `msg_id`, as the app's processed pairs name a message. For one stored as
+    /// [`ParkReason::Unverifiable`], only those with the same message hash: the identity
+    /// signed it, but whether the signing app is current in its `identity.json` wasn't
+    /// checked, so its `msg_id` alone doesn't say which message of that identity it is. For
+    /// one that doesn't read as a message ([`ParkedSummary::readable`] `false`), only those
+    /// whose stored bytes have the same hash.
     ///
-    /// Not an entry tried again for another reason ([`ParkReason::Quota`],
-    /// [`ParkReason::StoreUnavailable`], [`ParkReason::StoreRejected`],
-    /// [`ParkReason::Released`]): a later read processes it.
+    /// **The message stays processed,** so a re-send of it is a duplicate, not applied
+    /// (Switch spec 8.2, 11), unless none of the entries that go had its sender's standing
+    /// checked and read as a message. The processed pair is written if none is kept, from
+    /// such an entry, and goes with the other processed pairs after their retention.
     ///
     /// # Errors
     ///
     /// [`Refusal::Usage`], with nothing written:
     /// - for an ID with no entry stored, or a `hash` that isn't the entry's;
-    /// - for an entry that may not be forgotten, as above;
     /// - while a duty event the host hasn't acknowledged ([`App::ack_events`]) names an
     ///   entry that would go ([`AppEvent::Parked`], [`AppEvent::EffectRefused`],
     ///   [`AppEvent::EffectUncertain`]): those carry no content, so a protocol that hasn't
@@ -249,33 +248,22 @@ impl App {
         Box::pin(async move {
             self.ready_local().await?;
             let stored = self.stored(id, hash)?;
-            let opened = opened(&stored);
-            let unverified = stored.reason == ParkReason::Unverifiable;
-            if opened.is_some() && !unverified && stored.reason.tried_again() {
-                return Err(Refusal::Usage(format!(
-                    "the entry at local ID {id} is tried again ({:?}): it can't be forgotten",
-                    stored.reason
-                ))
-                .into());
-            }
-            // The entry, and every other stored copy of its message.
+            let named = opened(&stored);
+            let named_checked = stored.reason != ParkReason::Unverifiable;
+            // Every entry stored for the message, the named one first.
             let mut going = vec![id];
-            if let Some(this) = &opened {
-                for (other, copy) in &self.state.parked {
-                    if *other == id || copy.sender != stored.sender {
-                        continue;
-                    }
-                    let Some(copy) = self::opened(copy) else {
-                        continue;
-                    };
-                    let same = if unverified {
-                        copy.plaintext.hash() == this.plaintext.hash()
-                    } else {
-                        copy.msg_id == this.msg_id
-                    };
-                    if same {
-                        going.push(*other);
-                    }
+            for (other, copy) in &self.state.parked {
+                if *other == id || copy.sender != stored.sender {
+                    continue;
+                }
+                let same = match (&named, opened(copy)) {
+                    (Some(this), Some(copy)) if named_checked => copy.msg_id == this.msg_id,
+                    (Some(this), Some(copy)) => copy.plaintext.hash() == this.plaintext.hash(),
+                    (None, None) => copy.plaintext == stored.plaintext,
+                    _ => false,
+                };
+                if same {
+                    going.push(*other);
                 }
             }
             let kept = self.kept_duties().await?;
@@ -290,17 +278,26 @@ impl App {
                 ))
                 .into());
             }
+            // The message stays processed if one of the entries had its sender's standing
+            // checked and reads as a message.
+            let checked = going.iter().find_map(|gone| {
+                let entry = self.state.parked.get(gone)?;
+                if entry.reason == ParkReason::Unverifiable {
+                    return None;
+                }
+                opened(entry).map(|opened| (entry.sender, opened))
+            });
             let mut tx = self.tx()?;
             for gone in &going {
                 tx.delete(&key::parked(*gone))?;
                 tx.delete(&key::stored_retry(*gone))?;
             }
-            if let Some(this) = opened.filter(|_| !unverified) {
-                let pair = key::processed(&stored.sender, &this.msg_id);
+            if let Some((sender, this)) = checked {
+                let pair = key::processed(&sender, &this.msg_id);
                 if !self.reader().exists(&pair).await? {
                     let now = self.now();
                     let hash = this.plaintext.hash();
-                    processed_writes(&mut tx, &stored.sender, &this.msg_id, hash, now)?;
+                    processed_writes(&mut tx, &sender, &this.msg_id, hash, now)?;
                 }
             }
             self.commit(tx).await?;
@@ -318,7 +315,10 @@ impl App {
     /// more: in one commit its processed pair goes and it is stored as
     /// [`ParkReason::Released`], which a later read tries again as a fresh receive,
     /// building its effect again, with [`super::ReceivedMessage::released`] set so the
-    /// protocol may decline.
+    /// protocol may decline. The service refuses the effect again where an operation
+    /// depends on what its first application changed, such as a record write's expected
+    /// version or a claim's step; otherwise its operations, and its local writes, may apply
+    /// twice (Switch spec 8.2).
     ///
     /// The host releases it only once it knows the effect wasn't applied, such as from the
     /// shared state. A re-send of the message arriving before the run is applied as new,
