@@ -2404,3 +2404,46 @@ async fn test_restore_of_a_backup_whose_app_record_carries_another_cert_writes_n
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn test_restore_past_31_days_of_a_kept_effect_past_a_held_entry_hands_only_the_held() {
+    // A note is held (its step can't finish), the note after it is applied past it and its
+    // answer lost: a kept effect past a held entry (`past_held`). Restored past 31 days,
+    // only the held note is handed over; the kept one is passed, not applied again.
+    let w = World::new();
+    let protocol = FlakyProtocol::new(u32::MAX);
+    let mut app = join_flaky(&w, &protocol, "wallet").await;
+    let (held, held_message) = w.note(app.app_id(), FLAKY);
+    let (past, _) = w.note(app.app_id(), "steady");
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.receive(None).await.is_err());
+    assert!(app.cursor().seq < held, "held");
+    assert!(
+        app.state
+            .pending_effect
+            .as_ref()
+            .is_some_and(|p| p.seq == past && p.past_held && p.stored.is_none())
+    );
+    assert_eq!(w.effects(), 1);
+    let backup = layered(&mut app).await;
+    drop(app);
+    w.clock.advance_ms(31 * pubky_switch_core::records::DAY_MS);
+    w.switch.lock().batches.clear();
+    let again = FlakyProtocol::new(0);
+    let mut restored = App::restore(
+        w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
+        again.clone(),
+        flaky_config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    assert!(restored.state.seen.contains(&past));
+    let report = restored.receive(None).await.unwrap();
+    assert_eq!(handed(&again), vec![held_message.msg_id.clone()]);
+    assert_eq!(w.effects(), 2, "one effect per message");
+    assert!(report.cursor.seq >= past);
+    assert!(restored.state.seen.is_empty(), "seen pruned once passed");
+    restored.receive(None).await.unwrap();
+    assert_eq!(handed(&again).len(), 1);
+}

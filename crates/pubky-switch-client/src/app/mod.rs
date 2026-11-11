@@ -1081,8 +1081,10 @@ impl App {
     /// carries one: the backup holds the effect's entry as what it is once the effect is
     /// gone, one whose effect's fate is unknown, stored as [`ParkReason::Uncertain`] (its
     /// flags, such as a release, kept) with the processed pair of its message, an entry read
-    /// from the feed included. The restored app's bounds never drop it, its host may release
-    /// it, and its read of the feed entry again is a duplicate, never a second application.
+    /// from the feed included. The restored app's bounds never drop it and its host may
+    /// release it. Its read passes the feed entry, whose `seq` the backup's `seen` holds,
+    /// with no event and no second application; the processed pair still catches a re-send
+    /// of the message at a new `seq` within 30 days.
     /// The live store keeps the kept effect, which the app's next read settles. An entry
     /// read from the feed takes a local ID the live store reserves for it first, by moving
     /// its stored-entry counter on (`parkid`), on a halted app too: the backup's counter is
@@ -1148,9 +1150,10 @@ impl App {
                 // what it is once the effect is gone: one whose effect's fate is unknown,
                 // stored as `Uncertain` with the processed pair of its message, as the app
                 // itself stores it when it can't tell (`feed.rs`, `park_uncertain`). The
-                // bounds never drop it, the host may release it, and a read of its feed
-                // entry again is a duplicate, never a second application. The live store
-                // isn't touched.
+                // bounds never drop it and the host may release it. A read passes its feed
+                // entry (its `seq` is put in `seen` below), with no event and no second
+                // application; the processed pair still catches a re-send at a new `seq`
+                // within 30 days. The live store isn't touched.
                 let (id, entry) = uncertain_copy(&state, pending, reserved)?;
                 parked.insert(id, entry);
                 // Its feed `seq` is passed, as the app passes it when it stores an entry: the

@@ -106,7 +106,7 @@ async fn read_once_erased(
     );
     Ok(raised
         .iter()
-        .any(|event| matches!(event, AppEvent::AccountGone)))
+        .any(|event| matches!(event, AppEvent::AccountGone { .. })))
 }
 
 /// The first word of a `Debug` text: a status's or an error's name.

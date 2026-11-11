@@ -767,6 +767,14 @@ async fn test_unverified_bound_backup_of_a_feed_entrys_kept_effect_never_applies
         "{:?}",
         report.events
     );
+    assert!(
+        !has(
+            &report.events,
+            |e| matches!(e, AppEvent::Duplicate { seq: s, .. } if *s == seq)
+        ),
+        "a passed entry is no duplicate: {:?}",
+        report.events
+    );
     assert_eq!(w.effects(), 1);
     assert!(protocol.released.lock().unwrap().is_empty());
     held_uncertain_then_released(&mut restored, &protocol, seq).await;
