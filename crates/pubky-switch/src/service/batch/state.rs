@@ -60,6 +60,20 @@ pub struct HeldRecord {
     pub proof: Option<SignedDoc>,
 }
 
+impl From<crate::store::StoredRecord> for HeldRecord {
+    /// A stored record: its write was signed, so it has its proof.
+    fn from(record: crate::store::StoredRecord) -> Self {
+        Self {
+            state: record.state,
+            value_bytes: record.value_bytes,
+            writer: record.writer,
+            cert: record.cert,
+            op: record.op,
+            proof: Some(record.proof),
+        }
+    }
+}
+
 /// A list entry: the app that wrote it, and when.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ListEntry {

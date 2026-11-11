@@ -30,6 +30,7 @@ mod handover;
 mod identity;
 mod inbox;
 mod peers;
+mod records;
 pub mod rules;
 
 pub use enroll::announced_limits;
@@ -138,6 +139,8 @@ enum Deferred {
     Feed(Box<feed::FeedRead>),
     /// `GET /allow`'s lists, from the snapshot of the state under the lock.
     Allow(allow::AllowRead),
+    /// A `GET /records` page, from the snapshot of the state under the lock.
+    Records(Box<records::RecordsRead>),
     /// The account's erasure, once its answer is signed (Switch wire 7.4.16): not a read,
     /// but done in place of the commit.
     Erase,
@@ -403,6 +406,8 @@ impl Service {
         };
         let call = &request.route.call;
         let stamped_ms = found.stamped_time_ms;
+        // The key the account had at the lookup, which an answer after a wait checks again.
+        let looked_up_key = found.service_key.clone();
         let refused_early = |error: ApiError| {
             let signature = if *call == Call::GetIdentity {
                 None
@@ -466,6 +471,8 @@ impl Service {
             | Call::GetKeys(_)
             | Call::RequestKeys(_)
             | Call::Leave(_)
+            | Call::GetRecord(_)
+            | Call::ListRecords
             | Call::GetAllow => {
                 match self.authenticate_caller(&account, &request, base_ms, base_ms.max(stamped_ms))
                 {
@@ -516,7 +523,7 @@ impl Service {
         // refused above. Whether the app is current and may read is judged under the lock.
         let reading_app = verified
             .as_ref()
-            .filter(|_| matches!(call, Call::GetAllow))
+            .filter(|_| matches!(call, Call::GetAllow | Call::ListRecords))
             .map(batch::VerifiedApp::app_id);
         let begun = if let Some(app) = reading_app {
             self.store.begin_reading(&account, app).await
@@ -534,7 +541,20 @@ impl Service {
                     .operator_answer(request_signature.as_ref(), base_ms, &error)
                     .await;
             }
-            Err(error) => return refused_early(store_error(&error)).await,
+            // The wait for the lock, or for a reader's turn, can outlast an erasure whose key
+            // stays owed: never signed with the key looked up before it (7.4.16).
+            Err(error) => {
+                let by_signer = caller.as_ref().is_some_and(|c| c.caller == Caller::Signer);
+                if let Some(error) = self
+                    .no_longer_keyed(&account, &looked_up_key, by_signer)
+                    .await
+                {
+                    return self
+                        .operator_answer(request_signature.as_ref(), base_ms, &error)
+                        .await;
+                }
+                return refused_early(store_error(&error)).await;
+            }
         };
         let signature = if caller.is_some() {
             request_signature
@@ -875,6 +895,10 @@ impl Service {
                             Err(error) => answer = Answer::error(&error).with_head(fallback_head),
                         }
                     }
+                    Some(Deferred::Records(read)) => match Self::records_body(*read).await {
+                        Ok(body) => answer.body = body,
+                        Err(error) => answer = Answer::error(&error).with_head(fallback_head),
+                    },
                     Some(Deferred::Feed(read)) => {
                         return match self.feed_page(&read, &signer).await {
                             Ok((page, at)) => sign_answer(&signer, signature, at, page),
@@ -1115,6 +1139,26 @@ impl Service {
             Call::GetAllow => {
                 return self
                     .get_allow(txn, signer, writer.as_ref(), time_ms)
+                    .await
+                    .map(|answer| (answer, serving))
+                    .map_err(|error| Refused::with_head(error, serving));
+            }
+            Call::GetRecord(key) => {
+                return self
+                    .get_record(txn, signer, writer.as_ref(), key)
+                    .await
+                    .map(|answer| (answer, serving))
+                    .map_err(|error| Refused::with_head(error, serving));
+            }
+            Call::ListRecords => {
+                let query = request.route.query.as_ref().map_err(|_| {
+                    Refused::with_head(
+                        ApiError::bad_request("7.1: the query doesn't decode"),
+                        serving,
+                    )
+                })?;
+                return self
+                    .list_records(txn, signer, writer.as_ref(), query)
                     .await
                     .map(|answer| (answer, serving))
                     .map_err(|error| Refused::with_head(error, serving));

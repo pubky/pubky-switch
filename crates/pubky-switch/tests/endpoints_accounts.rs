@@ -479,7 +479,7 @@ async fn test_calls_not_served_yet() {
         .service
         .handle(request(
             "GET",
-            &format!("/v1/{}/records", alice.id),
+            &format!("/v1/{}/export", alice.id),
             &[],
             Vec::new(),
         ))

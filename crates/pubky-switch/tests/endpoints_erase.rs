@@ -1487,6 +1487,227 @@ async fn test_erase_deferred_allow_read_isnt_signed_with_its_key() {
     replay.db.drop_database().await.expect("drop");
 }
 
+/// The answer is signed with alice's service key.
+fn alice_signed(answer: &SwitchResponse, request_signature: Option<&[u8; 64]>) -> bool {
+    let Some(text) = header_text(answer, header::SERVICE_SIGNATURE) else {
+        return false;
+    };
+    let signature: [u8; 64] = pubky_switch_core::enc::unb64(text)
+        .expect("b64")
+        .try_into()
+        .expect("64");
+    pubky_switch_core::http::verify_response(
+        &alice_service_key(),
+        answer.status,
+        request_signature,
+        header_text(answer, header::SERVER_TIME).expect("time"),
+        &answer.body,
+        &signature,
+    )
+    .is_ok()
+}
+
+/// alice served, with the wallet's ops 3 and 4 and the phone's app record delivered, at
+/// chain item 3's time, which it returns.
+async fn registered(replay: &Replay) -> String {
+    use pubky_switch_core::{
+        keys::IdentityKey,
+        ops::{OpKind, OpsRequest, SignedOp, sign_batch},
+        sig::SignedDoc,
+    };
+    serve_alice(replay).await;
+    let chain = vectors("chain.json");
+    let keys = vectors("keys.json");
+    let at = item_time(chain_item(&chain, 3));
+    set_time(&replay.clock, &at);
+    let post = |name: &'static str, ops: Vec<SignedOp>| {
+        let request = app_request(
+            app(&keys, name),
+            "POST",
+            &format!("/v1/{}/ops", alice_id()),
+            OpsRequest::new(&ops, None).to_json(),
+            ms(&at),
+        );
+        async move {
+            let answer = replay.service.handle(request).await;
+            assert_eq!(
+                answer.status,
+                200,
+                "{}",
+                String::from_utf8_lossy(&answer.body)
+            );
+        }
+    };
+    let ops: Vec<SignedOp> = [3, 4]
+        .iter()
+        .map(|seq| {
+            let signed: SignedDoc =
+                serde_json::from_value(chain_item(&chain, *seq)["item"].clone()).expect("op");
+            SignedOp::peek(&signed).expect("op")
+        })
+        .collect();
+    post("wallet", ops).await;
+    let document = |name: &str| -> SignedDoc {
+        serde_json::from_value(
+            named(&vectors("documents.json")["documents"], name)["signed"].clone(),
+        )
+        .expect("document")
+    };
+    let phone = app(&keys, "phone");
+    let key = ed25519_dalek::SigningKey::from_bytes(&hex32(&phone["signing_secret_hex"]));
+    let app_id = pubky_switch_core::enc::app_id_decode(phone["app_id"].as_str().expect("id"))
+        .expect("app id");
+    let alice = IdentityKey::from_secret(hex32(&alice(&keys)["secret_hex"]));
+    let ops = sign_batch(
+        &key,
+        &alice.public(),
+        Some(app_id),
+        1,
+        [80; 16],
+        vec![
+            (
+                Vec::new(),
+                OpKind::AppPut {
+                    record: document("phone app record"),
+                },
+            ),
+            (
+                Vec::new(),
+                OpKind::ReceiveKeyPut {
+                    record: document("phone receive key record"),
+                },
+            ),
+        ],
+    )
+    .expect("batch");
+    post("phone", ops).await;
+    at
+}
+
+#[tokio::test]
+async fn test_erase_read_waiting_its_turn_across_an_erasure_isnt_signed_with_its_key() {
+    // The phone's `GET /allow` waits for its account's turn, before the lock, behind the
+    // wallet's paused page. The account is erased meanwhile and its key stays owed (the
+    // ledger fails). The wait times out (`lock_timeout_ms`, 10 s): the answer is the
+    // operator's `404` to an app, never signed with the erased key (7.4.16).
+    use std::sync::atomic::Ordering;
+    let Some(mut replay) = replay().await else {
+        return;
+    };
+    let gate = gated(&mut replay, false);
+    let at = registered(&replay).await;
+    let keys = vectors("keys.json");
+    let path = format!("/v1/{}/allow", alice_id());
+    let first = app_request(app(&keys, "wallet"), "GET", &path, Vec::new(), ms(&at));
+    let second = app_request(app(&keys, "phone"), "GET", &path, Vec::new(), ms(&at));
+    let second_signature = signature_of(&second);
+    let pause = replay.db.pause_next_snapshot_read();
+    let (_, (second, erased)) = tokio::join!(replay.service.handle(first), async {
+        tokio::time::timeout(std::time::Duration::from_secs(10), pause.reached.notified())
+            .await
+            .expect("the wallet's page paused after the lock");
+        let (second, erased) = tokio::join!(replay.service.handle(second), async {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while replay.db.queued_reads(&alice_id()) < 2 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the phone never queued"
+                );
+                tokio::task::yield_now().await;
+            }
+            gate.fail_ledger.store(true, Ordering::SeqCst);
+            erase(&replay, &alice_service_key(), &at).await
+        });
+        pause.resume.notify_one();
+        (second, erased)
+    });
+    assert_eq!(code_of(&erased), (503, json!("unavailable")));
+    assert_eq!(code_of(&second), (404, json!("not_found")));
+    assert!(
+        !alice_signed(&second, Some(&second_signature)),
+        "signed with the erased account's key"
+    );
+    assert!(operator_signed(&second, Some(&second_signature)));
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_erase_lock_waiter_after_an_erasure_whose_key_stays_isnt_a_404() {
+    // The signer's GET /apps looks the account up and waits for its lock behind an erasure
+    // whose key then stays owed (the ledger fails). The waiter finds the account gone at the
+    // lock: the operator's `503` while a key is owed, as at every call (7.4.16).
+    use std::sync::atomic::Ordering;
+    let Some(mut replay) = replay().await else {
+        return;
+    };
+    let gate = gated(&mut replay, false);
+    replay_chain_through_revoke(&replay).await;
+    gate.fail_ledger.store(true, Ordering::SeqCst);
+    let at = revoke_time();
+    let mut holder = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    sqlx::query("BEGIN")
+        .execute(&mut holder)
+        .await
+        .expect("begin");
+    sqlx::query("SELECT 1 FROM accounts WHERE id = $1 FOR UPDATE")
+        .bind(alice_id())
+        .execute(&mut holder)
+        .await
+        .expect("lock");
+    let options = replay.db.options().clone();
+    let apps = signer_request(
+        "GET",
+        &format!("/v1/{}/apps", alice_id()),
+        Vec::new(),
+        ms(&at),
+    );
+    let key = alice_service_key();
+    let (erased, (answer, ())) = tokio::join!(erase(&replay, &key, &at), async {
+        lock_waiters(&options, 1).await;
+        tokio::join!(replay.service.handle(apps), async {
+            lock_waiters(&options, 2).await;
+            sqlx::query("COMMIT")
+                .execute(&mut holder)
+                .await
+                .expect("commit");
+        })
+    });
+    assert_eq!(code_of(&erased), (503, json!("unavailable")));
+    assert_eq!(
+        code_of(&answer),
+        (503, json!("unavailable")),
+        "a 404 while the key is owed"
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+/// Wait until `n` backends of the test database wait for a lock.
+async fn lock_waiters(options: &sqlx::postgres::PgConnectOptions, n: i64) {
+    let mut watcher = sqlx::PgConnection::connect_with(options)
+        .await
+        .expect("conn");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' \
+             AND datname = current_database()",
+        )
+        .fetch_one(&mut watcher)
+        .await
+        .expect("count");
+        if count >= n {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{count} waiting, not {n}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
 /// alice's erasure, its key store unable to record it: `503`, and its key stays owed.
 async fn erased_owing_its_key(replay: &mut Replay) -> std::sync::Arc<Gate> {
     let gate = gated(replay, false);
@@ -1597,70 +1818,5 @@ async fn test_erase_retry_that_doesnt_verify_sweeps_nothing() {
     let answer = replay.service.handle(retry()).await;
     assert_eq!(code_of(&answer), (404, json!("not_found")));
     assert!(replay.keys.public_key(&key).await.is_err(), "swept");
-    replay.db.drop_database().await.expect("drop");
-}
-
-#[tokio::test]
-async fn test_erase_between_the_lookup_and_the_lock_holds_back_the_signers_404() {
-    // The signer's call finds the account, then waits for its lock while an erasure holds
-    // it; the erasure commits and its key is still owed. The call finds no account under
-    // the lock: the operator's `503`, as for every signer's call while the key is owed
-    // (7.4.16).
-    use std::time::Duration;
-    let Some(replay) = replay().await else { return };
-    replay_chain_through_revoke(&replay).await;
-    let owed = replay.keys.generate().await.expect("key");
-    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
-        .await
-        .expect("conn");
-    let mut erasure = conn.begin().await.expect("begin");
-    sqlx::query("SELECT id FROM accounts WHERE id = $1 FOR UPDATE")
-        .bind(alice_id())
-        .execute(&mut *erasure)
-        .await
-        .expect("lock");
-    let request = signer_request(
-        "GET",
-        &format!("/v1/{}/apps", alice_id()),
-        Vec::new(),
-        ms(&revoke_time()),
-    );
-    let request_signature = signature_of(&request);
-    let (answer, ()) = tokio::join!(replay.service.handle(request), async {
-        let mut watch = sqlx::PgConnection::connect_with(replay.db.options())
-            .await
-            .expect("conn");
-        for _ in 0..250 {
-            let waiting: i64 = sqlx::query_scalar(
-                "SELECT count(*) FROM pg_stat_activity \
-                 WHERE datname = current_database() AND wait_event_type = 'Lock'",
-            )
-            .fetch_one(&mut watch)
-            .await
-            .expect("activity");
-            if waiting > 0 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        watch.close().await.expect("close");
-        sqlx::query("DELETE FROM accounts WHERE id = $1")
-            .bind(alice_id())
-            .execute(&mut *erasure)
-            .await
-            .expect("erase");
-        sqlx::query(
-            "INSERT INTO erased_keys (key_id, account_id, erased_at_ms) VALUES ($1, $2, 7)",
-        )
-        .bind(owed.id.as_str())
-        .bind(alice_id())
-        .execute(&mut *erasure)
-        .await
-        .expect("owed");
-        erasure.commit().await.expect("commit");
-    });
-    assert_eq!(code_of(&answer), (503, json!("unavailable")));
-    assert!(no_head(&answer));
-    assert!(operator_signed(&answer, Some(&request_signature)));
     replay.db.drop_database().await.expect("drop");
 }
