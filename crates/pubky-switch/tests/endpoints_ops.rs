@@ -1363,7 +1363,7 @@ async fn revoke_wallet(replay: &Replay) {
 }
 
 #[tokio::test]
-async fn test_revoked_app_is_refused_before_the_lock() {
+async fn test_revoked_app_is_refused_under_the_lock_with_the_head() {
     let Some(replay) = registered(Limits::default(), false).await else {
         return;
     };
@@ -1378,18 +1378,28 @@ async fn test_revoked_app_is_refused_before_the_lock() {
         .expect("account");
     let keys = vectors("keys.json");
     let body = OpsRequest::new(&wallet_batch(60, 1, vec![contact(bob())]), None).to_json();
-    let request = app_request(app(&keys, "wallet"), "POST", &ops_path(), body, ms(AT));
-    let answer = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        replay.service.handle(request),
-    )
-    .await
-    .expect("answered without waiting for the lock");
-    drop(held);
+    let later = pubky_switch_core::time::rfc3339(ms(AT) + 60_000);
+    set_time(&replay.clock, &later);
+    let request = app_request(app(&keys, "wallet"), "POST", &ops_path(), body, ms(&later));
+    // The request verified, so its refusal waits for the lock (Switch wire 7.1: it carries
+    // the head): it is answered only once the lock is released.
+    let started = std::time::Instant::now();
+    let hold = std::time::Duration::from_millis(300);
+    let (answer, ()) = tokio::join!(replay.service.handle(request), async {
+        tokio::time::sleep(hold).await;
+        drop(held);
+    });
+    assert!(
+        started.elapsed() >= hold,
+        "a verified app's refusal takes the lock"
+    );
     let (status, body, head) = answer_of(answer);
     assert_eq!((status, body["code"].as_str()), (403, Some("not_current")));
-    assert!(head.is_none());
-    assert_eq!(stamped_time(&replay).await, before, "nothing was stamped");
+    assert!(head.is_some(), "the refusal carries the head");
+    // Signed at the service time the refusal commits.
+    let later_ms = i64::try_from(ms(&later)).expect("time");
+    assert_eq!(stamped_time(&replay).await, later_ms);
+    assert_ne!(before, later_ms);
     replay.db.drop_database().await.expect("drop");
 }
 
@@ -1415,16 +1425,18 @@ async fn test_app_at_a_signer_call_keeps_the_check_order() {
         (status, body["code"].as_str()),
         (403, Some("permission_missing"))
     );
-    // Its certificate expired: cert_expired comes first.
+    // Revoked: not_current, with the head.
+    revoke_wallet(&replay).await;
+    let (status, body, head) = answer_of(replay.service.handle(put(AT)).await);
+    assert_eq!((status, body["code"].as_str()), (403, Some("not_current")));
+    assert!(head.is_some());
+    // Its certificate expired too: cert_expired comes first (Switch wire 3.8, check 3
+    // before the standing). Last, as the service time never goes back.
     let expired = "2026-12-01T00:00:00.000Z";
     set_time(&replay.clock, expired);
-    let (status, body, _) = answer_of(replay.service.handle(put(expired)).await);
+    let (status, body, head) = answer_of(replay.service.handle(put(expired)).await);
     assert_eq!((status, body["code"].as_str()), (403, Some("cert_expired")));
-    set_time(&replay.clock, AT);
-    // Revoked: not_current.
-    revoke_wallet(&replay).await;
-    let (status, body, _) = answer_of(replay.service.handle(put(AT)).await);
-    assert_eq!((status, body["code"].as_str()), (403, Some("not_current")));
+    assert!(head.is_some());
     replay.db.drop_database().await.expect("drop");
 }
 
@@ -1570,5 +1582,325 @@ async fn test_claims_expired_owner_is_not_current_for_the_claim_rules() {
     );
     let (status, body) = post_app(&replay, "phone", &failed(43), None, later).await;
     assert_eq!(status, 200, "{body}");
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_own_app_refusals_carry_the_head_at_every_call() {
+    let Some(replay) = registered(Limits::default(), false).await else {
+        return;
+    };
+    let keys = vectors("keys.json");
+    let wallet = app(&keys, "wallet")["app_id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    let calls = [
+        ("GET", format!("/v1/{}/feed", alice_id()), Vec::new()),
+        (
+            "GET",
+            format!(
+                "/v1/{}/claims/{}",
+                alice_id(),
+                pubky_switch_core::enc::b64(&[7; 32])
+            ),
+            Vec::new(),
+        ),
+        (
+            "POST",
+            ops_path(),
+            OpsRequest::new(&wallet_batch(70, 1, vec![contact(bob())]), None).to_json(),
+        ),
+        (
+            "GET",
+            format!("/v1/{}/apps/{wallet}/keys", alice_id()),
+            Vec::new(),
+        ),
+        (
+            "POST",
+            format!("/v1/{}/apps/{wallet}/leave", alice_id()),
+            Vec::new(),
+        ),
+    ];
+    let check = |code: &'static str, at: String| {
+        let calls = &calls;
+        let keys = &keys;
+        let replay = &replay;
+        async move {
+            for (method, path, body) in calls {
+                let request = app_request(app(keys, "wallet"), method, path, body.clone(), ms(&at));
+                let (status, answer, head) = answer_of(replay.service.handle(request).await);
+                assert_eq!(
+                    (status, answer["code"].as_str()),
+                    (403, Some(code)),
+                    "{method} {path}: {answer}"
+                );
+                // The request verified: the refusal carries the head (Switch wire 7.1).
+                assert!(head.is_some(), "{method} {path}");
+            }
+        }
+    };
+    // Revoked: not_current at every call.
+    revoke_wallet(&replay).await;
+    check("not_current", AT.to_string()).await;
+    // Expired as well: cert_expired, the earlier check (Switch wire 3.8).
+    let expired = "2026-12-01T00:00:00.000Z";
+    set_time(&replay.clock, expired);
+    check("cert_expired", expired.to_string()).await;
+    replay.db.drop_database().await.expect("drop");
+}
+
+/// The phone registers, with the records of `documents.json`.
+async fn register_phone(replay: &Replay) {
+    let register = phone_batch(
+        80,
+        vec![
+            (
+                Vec::new(),
+                OpKind::AppPut {
+                    record: document("phone app record"),
+                },
+            ),
+            (
+                Vec::new(),
+                OpKind::ReceiveKeyPut {
+                    record: document("phone receive key record"),
+                },
+            ),
+        ],
+    );
+    let (status, body) = post_app(replay, "phone", &register, None, AT).await;
+    assert_eq!(status, 200, "{body}");
+}
+
+/// The wallet's renewal expiring at `expires_ms`, stored by the signer with a key bundle
+/// part, then listed by version 4 of alice's `identity.json` with the earlier certificate
+/// renewed and still open (its closing pending).
+async fn renew_wallet_open(replay: &Replay, expires_ms: u64) {
+    let (app_keys, old) = wallet_keys(replay).await;
+    let alice = IdentityKey::from_secret(hex32(&alice(&vectors("keys.json"))["secret_hex"]));
+    let issued = ms(AT) - 1_000;
+    let renewed = AppCert::issue(
+        &alice,
+        AppCertBody::new(
+            alice_key(),
+            app_keys.signing_public(),
+            app_keys.bundle_public(),
+            old.scopes().to_vec(),
+            old.permissions(),
+            issued,
+            expires_ms,
+        ),
+    )
+    .expect("cert");
+    let part = pubky_switch_core::records::seal_bundle_parts(&alice, &renewed, 1, 1, &|_| true)
+        .expect("bundle")
+        .remove(0);
+    let ops = sign_batch(
+        &alice,
+        &alice_key(),
+        None,
+        1,
+        [81; 16],
+        vec![
+            (
+                Vec::new(),
+                OpKind::CertPut {
+                    target_app_id: renewed.app_id(),
+                    cert: renewed.signed().clone(),
+                },
+            ),
+            (
+                Vec::new(),
+                OpKind::KeyBundlePut(pubky_switch_core::ops::KeyBundlePut {
+                    target_app_id: renewed.app_id(),
+                    bundle: part.bundle,
+                    first_epoch: part.first_epoch,
+                    last_epoch: part.last_epoch,
+                }),
+            ),
+        ],
+    )
+    .expect("batch");
+    let request = signer_request(
+        "POST",
+        &ops_path(),
+        OpsRequest::new(&ops, None).to_json(),
+        ms(AT),
+    );
+    let (status, body, _) = answer_of(replay.service.handle(request).await);
+    assert_eq!(status, 200, "{body}");
+    let v3 = document("alice identity.json");
+    let mut doc: pubky_switch_core::records::IdentityBody =
+        serde_json::from_slice(&v3.body_bytes().expect("body")).expect("body");
+    doc.version = 4;
+    let wallet = renewed.app_id();
+    if let Some(entry) = doc.apps.iter_mut().find(|entry| entry.app_id == wallet) {
+        entry.cert = renewed.hash();
+    }
+    doc.renewed.push(pubky_switch_core::records::RenewedCert {
+        app_id: wallet,
+        cert: old.hash(),
+        until: None,
+    });
+    let v4 = pubky_switch_core::records::IdentityDoc::sign(&alice, doc)
+        .expect("sign")
+        .signed()
+        .clone();
+    let delivery = pubky_switch_core::http::IdentityDelivery {
+        identity: v4,
+        prev: Some(v3.doc_hash().expect("hash")),
+    }
+    .to_json();
+    let request = signer_request(
+        "PUT",
+        &format!("/v1/{}/identity", alice_id()),
+        delivery,
+        ms(AT),
+    );
+    let (status, body, _) = answer_of(replay.service.handle(request).await);
+    assert_eq!(status, 200, "{body}");
+}
+
+/// The wallet opens an attempt its age won't orphan, on claim key `[10; 32]`.
+async fn wallet_attempt(replay: &Replay) {
+    let attempt = (
+        Vec::new(),
+        OpKind::Claim(ClaimFields {
+            claim_key: vec![10; 32],
+            kind: ClaimType::Attempt,
+            expected_step: 0,
+            attempt_id: vec![8; 16],
+            orphan_after: Some(1_000_000_000),
+            deadline: None,
+            basis: None,
+            evidence_ref: None,
+        }),
+    );
+    let (status, body) = post_app(
+        replay,
+        "wallet",
+        &wallet_batch(82, 1, vec![attempt]),
+        None,
+        AT,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+}
+
+/// The attempt's `orphaned` as the phone reads it in `GET /claims` and in a conflict's
+/// claim view at `at`, and the status of the phone's `failed` on it (batch `id`).
+async fn served_as_the_phone_sees_it(replay: &Replay, at: &str, id: u8) -> (Value, Value, u16) {
+    let keys = vectors("keys.json");
+    let path = format!(
+        "/v1/{}/claims/{}",
+        alice_id(),
+        pubky_switch_core::enc::b64(&[10; 32])
+    );
+    let (_, read, _) = answer_of(
+        replay
+            .service
+            .handle(app_request(
+                app(&keys, "phone"),
+                "GET",
+                &path,
+                Vec::new(),
+                ms(at),
+            ))
+            .await,
+    );
+    let unmet = phone_batch(
+        id,
+        vec![(
+            vec![Condition::ClaimStep {
+                claim_key: [10; 32],
+                step: 7,
+            }],
+            OpKind::AllowPut {
+                pubky: bob(),
+                kind: AllowKind::Contact,
+            },
+        )],
+    );
+    let (_, conflict) = post_app(replay, "phone", &unmet, None, at).await;
+    let failed = phone_batch(
+        id.wrapping_add(1),
+        vec![(
+            Vec::new(),
+            OpKind::Claim(ClaimFields {
+                claim_key: vec![10; 32],
+                kind: ClaimType::Failed,
+                expected_step: 1,
+                attempt_id: vec![8; 16],
+                orphan_after: None,
+                deadline: None,
+                basis: None,
+                evidence_ref: None,
+            }),
+        )],
+    );
+    let (status, _) = post_app(replay, "phone", &failed, None, at).await;
+    (
+        read["claim"]["attempts"][0]["orphaned"].clone(),
+        conflict["current"]["claim"]["attempts"][0]["orphaned"].clone(),
+        status,
+    )
+}
+
+#[tokio::test]
+async fn test_claims_served_judges_the_certificate_authentication_uses() {
+    let Some(replay) = registered(Limits::default(), false).await else {
+        return;
+    };
+    register_phone(&replay).await;
+    wallet_attempt(&replay).await;
+    // A shorter renewal, listed, its closing pending: the earlier certificate is still
+    // open and unexpired when the renewal expires.
+    renew_wallet_open(&replay, ms(AT) + 30 * 86_400_000).await;
+    let lapsed = pubky_switch_core::time::rfc3339(ms(AT) + 40 * 86_400_000);
+    set_time(&replay.clock, &lapsed);
+    // The owner is refused: it is checked against the listed renewal, which has expired.
+    let keys = vectors("keys.json");
+    let path = format!("/v1/{}/feed", alice_id());
+    let (status, body, _) = answer_of(
+        replay
+            .service
+            .handle(app_request(
+                app(&keys, "wallet"),
+                "GET",
+                &path,
+                Vec::new(),
+                ms(&lapsed),
+            ))
+            .await,
+    );
+    assert_eq!((status, body["code"].as_str()), (403, Some("cert_expired")));
+    // So the claim rules count it as not served: orphaned in both views, and another
+    // app's failed is taken.
+    assert_eq!(
+        served_as_the_phone_sees_it(&replay, &lapsed, 83).await,
+        (Value::Bool(true), Value::Bool(true), 200)
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_claims_served_through_a_longer_renewal_past_the_earlier_expiry() {
+    let Some(replay) = registered(Limits::default(), false).await else {
+        return;
+    };
+    register_phone(&replay).await;
+    wallet_attempt(&replay).await;
+    // A renewal that outlives the earlier certificate (2026-12-01), listed, the earlier
+    // one still open.
+    renew_wallet_open(&replay, ms("2027-06-01T00:00:00.000Z")).await;
+    let after = "2026-12-15T00:00:00.000Z";
+    set_time(&replay.clock, after);
+    // The owner is served through the renewal: the attempt isn't orphaned, and another
+    // app's failed is refused while the owner is current.
+    assert_eq!(
+        served_as_the_phone_sees_it(&replay, after, 85).await,
+        (Value::Bool(false), Value::Bool(false), 409)
+    );
     replay.db.drop_database().await.expect("drop");
 }

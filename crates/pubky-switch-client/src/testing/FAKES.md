@@ -5,6 +5,11 @@ injected with `app_op` and `signer_op`, through the core's rules (Switch wire 6.
 differs from the spec and the service, it is listed here. Tests of these rules belong to the
 service.
 
+Where the scripted switch answers an honest flow differently from the service, the list is
+`crates/pubky-switch-harness/src/allowed.rs`. That crate runs flows of the real signer and
+the real app against both, and its tests fail on a difference the list doesn't hold. This
+file lists what the scripted switch fakes or leaves out beyond those flows.
+
 ## Batches
 
 - **Request authentication** (Switch wire 7.1, 7.2): no request signature or

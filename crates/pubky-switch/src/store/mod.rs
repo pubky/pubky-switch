@@ -19,6 +19,7 @@
 //! [`AccountTxn::mark_check`] finds a state behind it, as a restored backup would leave.
 
 mod account;
+mod allow;
 mod apps;
 mod chain;
 mod claim_codec;
@@ -40,6 +41,7 @@ use sqlx::{
 };
 
 pub use account::{AccountHead, AccountTxn, CommitError, Committed, NewAccount, Savepoint};
+pub use allow::{AllowEntry, AllowInvite};
 pub use apps::{AppsView, KeptAppId, KeptReason, OpenAttempt, PartSpan, newly_listed};
 pub use chain::NewChainItem;
 pub use feed::{AppDocs, CurrentDocs, FeedRow, FeedSnapshot, PageReader};

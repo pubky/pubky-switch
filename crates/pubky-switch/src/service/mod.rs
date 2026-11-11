@@ -16,6 +16,7 @@
 //! `POST /v1/{id}/erase`. Every other call is answered `503 unavailable`.
 
 mod admission;
+mod allow;
 mod app_keys;
 mod apps;
 pub mod batch;
@@ -400,7 +401,8 @@ impl Service {
             | Call::Directory
             | Call::GetKeys(_)
             | Call::RequestKeys(_)
-            | Call::Leave(_) => {
+            | Call::Leave(_)
+            | Call::GetAllow => {
                 match self.authenticate_caller(&account, &request, base_ms, base_ms.max(stamped_ms))
                 {
                     Ok((claimed, cert)) => {
@@ -937,6 +939,13 @@ impl Service {
             };
         }
         match call {
+            Call::GetAllow => {
+                return self
+                    .get_allow(txn, signer, writer.as_ref(), time_ms)
+                    .await
+                    .map(|answer| (answer, serving))
+                    .map_err(|error| Refused::with_head(error, serving));
+            }
             Call::GetClaim(claim_key) => {
                 return self
                     .get_claim(

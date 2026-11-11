@@ -34,10 +34,11 @@ The Switch is specified in [`spec/`](spec/):
 
 | Path | What it is |
 |---|---|
-| `crates/pubky-switch-core` | Formats, encodings, signatures and verification, shared by the other three crates. |
+| `crates/pubky-switch-core` | Formats, encodings, signatures and verification, shared by the other crates. |
 | `crates/pubky-switch-client` | The client side, for apps that act for an identity. |
 | `crates/pubky-switch-signer` | Identity management, for the signer that holds the identity key. |
 | `crates/pubky-switch` | The service: storage, the HTTP API, and operations. |
+| `crates/pubky-switch-harness` | Tests only: client and signer flows run against the service, and compared with the client's scripted switch. |
 
 ## Running
 
