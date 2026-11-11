@@ -209,6 +209,47 @@ async fn test_hand_over_abort_wins_and_signing_goes_on() {
 }
 
 #[tokio::test]
+async fn test_hand_over_renewal_on_expiry_waits_for_the_new_signer() {
+    // The target's certificate is past half its lifetime. While handing over, the old
+    // signer's run renews nothing; the new signer renews it at its first run after the
+    // take-over (Switch spec 3.2; Switch wire 3.12).
+    let world = World::new();
+    let mut s = setup(&world).await;
+    let app_id = s.app_id();
+    world.clock.advance_ms(200 * 86_400_000);
+    s.old.hand_over_to(app_id, confirmed()).await.unwrap();
+    let sent = world.sent_docs().len();
+    s.old.run_due().await.unwrap();
+    assert_eq!(world.sent_docs().len(), sent, "nothing signed");
+    assert!(
+        world
+            .switch
+            .identity_doc()
+            .unwrap()
+            .body()
+            .renewed
+            .is_empty()
+    );
+    assert_eq!(
+        s.old.renew_expiring().await.unwrap_err(),
+        SignerError::Refused(Refusal::HandingOver { to_app: app_id })
+    );
+
+    let store = Arc::new(MemoryStore::new());
+    let mut new = Signer::receive_hand_over(world.env(store), &s.target, empty_vault())
+        .await
+        .unwrap();
+    let first = new.identity_doc().unwrap().unwrap();
+    assert!(first.body().renewed.is_empty());
+    new.run_due().await.unwrap();
+    let renewing = new.identity_doc().unwrap().unwrap();
+    assert_eq!(renewing.version(), first.version() + 1);
+    assert_eq!(renewing.body().renewed.len(), 1);
+    assert_eq!(renewing.body().renewed[0].app_id, app_id);
+    world.assert_no_version_sent_twice();
+}
+
+#[tokio::test]
 async fn test_take_over_lost_to_an_abort_deletes_what_was_received() {
     // The new signer signed its first delivery, but couldn't send it; the abort won first. Its
     // retry is answered with the abort, a verified copy past it: the take-over is cancelled.

@@ -114,7 +114,7 @@ pub trait Protocol: Send + Sync {
   - grants exactly the app's own paths, and a protocol's grant paths lie outside the Switch's own folders;
   - no grant covering `identity.json` or the signer's backup;
   - the app limit.
-- **Unknown scopes:** a scope no registered protocol owns is refused in a request (wire 3.9 step 1). A received hand-over or a restored backup whose certificates hold one is refused, naming those scopes so the host can tell the user which protocol support is missing. A certificate already in the records that holds one blocks only the steps that need that app's keys, instead of guessing (decision 2): a rotation gives that app no part and raises `RotationSkipped`, naming the app and the scopes, and its next bundle catches it up; a renewal may remove such a scope, which counts as keyed and so rotates, but may not keep it.
+- **Unknown scopes:** a scope no registered protocol owns is refused in a request (wire 3.9 step 1). A received hand-over or a restored backup whose certificates hold one is refused, naming those scopes so the host can tell the user which protocol support is missing. A certificate already in the records that holds one blocks only the steps that need that app's keys, instead of guessing (decision 2): a rotation gives that app no part and raises `RotationSkipped`, naming the app and the scopes, and its next bundle catches it up; the renewal past half its lifetime skips it, raising `RenewalSkipped`; a renewal may remove such a scope, which counts as keyed and so rotates, but may not keep it.
 
 ## 4. State
 
@@ -203,7 +203,7 @@ Two exceptions:
 4. Complete the departures the switch reports (`awaiting_rotation`).
 5. Set `until` for cooperative renewals whose app record now carries the new certificate (`record_cert`, `record_at`).
 6. Serve full-bundle requests, resuming from `bundle_ranges`, with `cert.put` where `record_cert` lags.
-7. Renew certificates past half their lifetime.
+7. Renew certificates past half their lifetime (spec 3.2), each in a renewing version of its own, with the default lifetime from then: every app the newest `identity.json` lists that isn't revoked, being revoked or departed, an app whose certificate has expired already included, since the switch takes the renewal for it all the same (wire 3.8 "An expired certificate"). An app with a renewal still open waits for it to close. The lifetime is judged on the signer's clock, as `issued_at` is; the switch takes the signer's requests only within the clock tolerance of its own time (wire 7.1), and a renewal needs no trusted time there. An app whose certificate holds a scope no registered protocol owns isn't renewed, with `RenewalSkipped` (decision 2).
 8. Check a pending hand-over. While one is in progress, nothing else here runs: its `PUT /handover` is sent again until answered, and the switch's copy is read. A newer copy naming another install, not its abort or take-back, finishes it once the signer backup on the Homeserver holds a newer version naming that install (wire 3.12): commit the deletion, destroy the key, then the records. Without that proof, the install signs nothing, keeps the key, and looks again next run. Its own abort or take-back at the switch means that delivery won.
 9. Republish the switch's copy if the Homeserver copy differs.
 
@@ -325,6 +325,7 @@ Alert = Equivocation { version, ours, theirs }      // stop, show
       | HandOverPending { to_app, since } | HandOverTookEffect { by_app } | HandOverRefused { reason }
       | BackupWriteFailed                           // after a racing delivery won
       | RotationSkipped { app, scopes }             // no registered protocol owns them
+      | RenewalSkipped { app, scopes }              // past half its lifetime, not renewable as it is
       | AppIdle { app, last_seen }                  // suggest removal after 90 days
       | CertLapsingWithOpenAttempts { app, expires_at }
       | GrantRevocationOwed { app }
@@ -410,7 +411,7 @@ The Switch spec answers four questions a signer has to settle:
 ## 10. Decisions
 
 1. **Key bundles follow the neutral rule.** Wire 3.5, 3.8, 3.10 and 7.4.11 word a bundle part's keys in one protocol's terms, where spec 3.5 leaves the choice of keyed scopes to each protocol, and spec 12.7 step 5 names one protocol too. The signer implements the neutral rule through `Protocol::has_keys`, which gives the same bytes for the vectors. A follow-up spec PR fixes the wording.
-2. **A scope no registered protocol owns.** `receive_hand_over` and `restore` refuse unless a registered protocol owns every scope of every listed certificate, and tell the user which protocol is missing. Elsewhere, for example after a protocol is unregistered, the signer blocks only the steps that need that app's keys: a rotation skips the app with `RotationSkipped`, and a renewal may remove the scope, which rotates.
+2. **A scope no registered protocol owns.** `receive_hand_over` and `restore` refuse unless a registered protocol owns every scope of every listed certificate, and tell the user which protocol is missing. Elsewhere, for example after a protocol is unregistered, the signer blocks only the steps that need that app's keys: a rotation skips the app with `RotationSkipped`, the renewal past half its lifetime skips it with `RenewalSkipped`, and a renewal may remove the scope, which rotates.
 3. **Finding a waiting hand-over.** No feed item announces one (wire 7.4.17), so the user drives it. The old signer tells the user to open the new app, and the new app calls `GET /handover` at start and when the user asks; a `404` costs little.
 4. **Revoking Pubky grants.** Revocations and leaves revoke the app's grant (spec 3.4, 12.2 step 1). Until the Pubky SDK offers a revocation call, the signer records each revocation as owed and raises `GrantRevocationOwed`. The rest of the flow doesn't wait for it.
 5. **The `StateStore`:** proposed in section 4.6, to be agreed together with `pubky-switch-client`.

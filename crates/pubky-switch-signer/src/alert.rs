@@ -99,6 +99,17 @@ pub enum Alert {
         /// Its scopes that no registered protocol owns.
         scopes: Vec<String>,
     },
+    /// This app's certificate is past half its lifetime, and the signer can't renew it as it
+    /// is: it holds scopes no registered protocol owns, which a renewal can only remove
+    /// (design note, decision 2). Unless the user renews it without them, or a protocol comes
+    /// to own them, the certificate expires and the switch stops serving the app (Switch spec
+    /// 3.2).
+    RenewalSkipped {
+        /// The app whose certificate isn't renewed.
+        app_id: [u8; 16],
+        /// Its scopes that no registered protocol owns.
+        scopes: Vec<String>,
+    },
     /// A removed app's Pubky grant still lets it write its Homeserver paths: the Pubky SDK
     /// offers no call to revoke a grant yet, so the user revokes it in the Homeserver's own
     /// settings (Switch spec 3.4, 12.2 step 1; design note, decision 4). Raised once for each

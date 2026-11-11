@@ -645,7 +645,8 @@ impl Signer {
     /// What is due at each start, in order (design note, section 4.5): finish the flow in
     /// progress and any closing delivery owed (Switch wire 3.8), remove the apps revoked or
     /// departed (Switch spec 12.2, 12.3), close the cooperative renewals whose apps took their
-    /// new certificate, and answer the full-bundle requests (Switch wire 3.5).
+    /// new certificate, answer the full-bundle requests (Switch wire 3.5), and renew the
+    /// certificates past half their lifetime ([`Signer::renew_expiring`]).
     ///
     /// # Errors
     ///
@@ -670,8 +671,94 @@ impl Signer {
         self.complete_removals().await?;
         self.complete_renewals().await?;
         self.serve_full_bundles().await?;
+        self.renew_expiring().await?;
         resumed
     }
+
+    /// Renew the certificate of every current app once less than half its lifetime remains,
+    /// each with the default lifetime from now, in a renewing version of its own (Switch spec
+    /// 3.2; Switch wire 3.8, Appendix A, A28). Returns the apps renewed.
+    ///
+    /// - Current is spec 3.4's sense, whatever the certificate's expiry: the newest
+    ///   `identity.json` lists the app, and it is neither revoked, being revoked, nor departed.
+    ///   An app whose certificate has expired already is renewed too, which is how it comes
+    ///   back: the switch takes the signer's renewal for it although its certificate has
+    ///   expired (Switch wire 3.8 "An expired certificate").
+    /// - An app with a renewal still open is left for a later run: its listed certificate
+    ///   isn't the one it presents yet. So is one that hasn't joined, or one the switch shows
+    ///   departed, whose removal comes first.
+    /// - The lifetime is judged on the signer's clock, as `issued_at` is. The switch takes the
+    ///   signer's requests only within the clock tolerance of its own time (Switch wire 7.1),
+    ///   so that clock can't be far off while a renewal goes out. A renewal needs no trusted
+    ///   time at the switch (Switch spec 10.1).
+    /// - An app whose certificate holds a scope no registered protocol owns can't be renewed
+    ///   with it (design note, decision 2): it is skipped, with [`Alert::RenewalSkipped`]. A
+    ///   refusal that concerns one app only doesn't hold back the others.
+    ///
+    /// # Errors
+    ///
+    /// As [`Signer::renew`]. A failure of the switch, the Homeserver or the store stops the
+    /// run; a renewal it cut short is finished by [`Signer::resume`], and the apps left are
+    /// renewed at the next run.
+    pub async fn renew_expiring(&mut self) -> Result<Vec<[u8; 16]>> {
+        self.ready().await?;
+        let newest = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
+        let statuses = self.switch_apps().await?;
+        let certs = self.held_certs()?;
+        let now = self.env.clock.now_ms();
+        let due: Vec<[u8; 16]> = newest
+            .body()
+            .apps
+            .iter()
+            .filter(|listed| {
+                let removed = statuses.iter().any(|s| {
+                    s.app_id == listed.app_id && (s.revoked_at.is_some() || s.departed_at.is_some())
+                });
+                let open = newest
+                    .body()
+                    .renewed
+                    .iter()
+                    .any(|r| r.app_id == listed.app_id && r.until.is_none());
+                let past_half = certs
+                    .iter()
+                    .find(|c| c.hash() == listed.cert)
+                    .is_some_and(|cert| past_half_lifetime(cert, now));
+                past_half && !open && !removed
+            })
+            .map(|listed| listed.app_id)
+            .collect();
+        let mut renewed = Vec::new();
+        for app_id in due {
+            match self.renew(app_id, CertChange::default()).await {
+                Ok(_) => renewed.push(app_id),
+                Err(SignerError::Refused(Refusal::UnknownScopes { scopes }))
+                    if self.flow.is_none() =>
+                {
+                    let mut state = self.state.clone();
+                    state.alert(Alert::RenewalSkipped { app_id, scopes });
+                    if state != self.state {
+                        self.commit(state, None).await?;
+                    }
+                }
+                Err(SignerError::Refused(
+                    Refusal::NotJoined
+                    | Refusal::NotListed
+                    | Refusal::CutOff
+                    | Refusal::Superseded { .. }
+                    | Refusal::Scopes { .. }
+                    | Refusal::ProtocolRule { .. },
+                )) if self.flow.is_none() => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(renewed)
+    }
+}
+
+/// Whether less than half of `cert`'s lifetime remains at `now` (Switch spec 3.2).
+fn past_half_lifetime(cert: &AppCert, now: u64) -> bool {
+    let lifetime = cert.expires_at().saturating_sub(cert.issued_at());
+    cert.expires_at().saturating_sub(now).saturating_mul(2) < lifetime
 }
 
 /// A batch operation, with the key bundle part it stores, if any.
