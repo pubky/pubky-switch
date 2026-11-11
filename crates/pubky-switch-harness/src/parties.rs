@@ -111,13 +111,23 @@ impl Asking {
     ///
     /// When the request doesn't sign.
     pub fn for_scope(keys: AppKeys, scope: &str) -> Result<Self, HarnessError> {
+        Self::for_scopes(keys, &[scope])
+    }
+
+    /// The same, for several scopes.
+    ///
+    /// # Errors
+    ///
+    /// When the request doesn't sign.
+    pub fn for_scopes(keys: AppKeys, scopes: &[&str]) -> Result<Self, HarnessError> {
         let auth = AuthRequest {
             client_id: "app.example".into(),
             client_key: [8; 32],
             caps: format!("{}:rw", app_record_path(&keys.app_id_bytes())),
             secret: [9; 32],
         };
-        let body = AppRequestBody::new(&keys, vec![scope.to_owned()], &auth);
+        let scopes = scopes.iter().map(|scope| (*scope).to_owned()).collect();
+        let body = AppRequestBody::new(&keys, scopes, &auth);
         let request = AppRequest::sign(&keys, body)
             .map_err(|error| HarnessError::Setup(error.to_string()))?;
         Ok(Self {
