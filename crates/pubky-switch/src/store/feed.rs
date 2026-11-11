@@ -147,8 +147,8 @@ pub trait PageReader {
     fn begin(&mut self, snapshot: &FeedSnapshot) -> bool;
     /// See the next item; whether the page wants the one after.
     fn take(&mut self, snapshot: &FeedSnapshot, row: FeedRow) -> bool;
-    /// See the next inbox entry; whether the page wants the item after it.
-    fn take_entry(&mut self, snapshot: &FeedSnapshot, entry: super::StoredEntry) -> bool;
+    /// See the next inbox item; whether the page wants the item after it.
+    fn take_entry(&mut self, snapshot: &FeedSnapshot, item: super::InboxItem) -> bool;
 }
 
 /// Read one page of account `id` for its app `reader` from one snapshot: the sequence and
@@ -228,18 +228,23 @@ pub(super) async fn read_feed(
     let db_generation = to_db(generation, "generation")?;
     snapshot.current = current_docs(&mut tx, id, db_generation, low, high).await?;
 
-    // Chain items and inbox entries, in one sequence by seq: only the entries wrapped to the
-    // reader, so another app's envelopes are never read (Switch wire 7.5).
+    // Chain items and inbox items, in one sequence by seq: only the entries wrapped to the
+    // reader, so another app's envelopes are never read, the unreadable items every current
+    // app reads, and the reader's own `missed` item (Switch wire 7.5). The reader's currency
+    // is checked for the page as a whole.
     let mut rows = sqlx::query(
         "SELECT 'chain' AS kind, seq, item_type, item_bytes, envelope, chain_hash, proof, \
                 only_for, NULL::BYTEA AS entry_id, NULL::BYTEA AS sender, NULL::BYTEA AS cert, \
-                NULL::BIGINT AS accepted_at_ms, NULL::BYTEA[] AS targets, NULL::BYTEA AS context \
+                NULL::BIGINT AS accepted_at_ms, NULL::BYTEA[] AS targets, NULL::BYTEA AS context, \
+                NULL::TEXT AS item_kind, NULL::BIGINT AS missed_entries, \
+                NULL::BIGINT AS missed_from_ms, NULL::BIGINT AS missed_until_ms \
          FROM chain_items WHERE account_id = $1 AND generation = $2 AND seq > $3 AND seq <= $4 \
          UNION ALL \
          SELECT 'entry', seq, NULL, NULL, envelope, NULL, NULL, NULL, entry_id, sender, cert, \
-                accepted_at_ms, targets, context \
+                accepted_at_ms, targets, context, kind, missed_entries, missed_from_ms, \
+                missed_until_ms \
          FROM inbox_entries WHERE account_id = $1 AND generation = $2 AND seq > $3 AND seq <= $4 \
-         AND $5 = ANY(targets) \
+         AND (kind = 'unreadable' OR $5 = ANY(targets)) \
          ORDER BY seq",
     )
     .bind(id)
@@ -251,7 +256,7 @@ pub(super) async fn read_feed(
     while let Some(row) = rows.try_next().await.map_err(StoreError::from_db)? {
         let kind: String = row.try_get("kind")?;
         let wants = if kind == "entry" {
-            page.take_entry(&snapshot, super::inbox::entry_of(&row)?)
+            page.take_entry(&snapshot, super::inbox::item_of(&row)?)
         } else {
             page.take(&snapshot, row_of(&row)?)
         };

@@ -290,6 +290,41 @@ fn item_json(row: &FeedRow, shown: Shown) -> Vec<u8> {
     out
 }
 
+/// An inbox item's JSON (Switch wire 7.5): an `entry`, an `unreadable` item or a `missed`
+/// item.
+fn inbox_item_json(item: &crate::store::InboxItem) -> Vec<u8> {
+    use crate::store::InboxItem;
+    use pubky_switch_core::{enc, time::rfc3339};
+    match item {
+        InboxItem::Entry(entry) => entry_json(entry),
+        InboxItem::Unreadable {
+            seq,
+            entry_id,
+            sender,
+            accepted_at_ms,
+        } => format!(
+            "{{\"type\":\"unreadable\",\"seq\":{seq},\"entry_id\":\"{}\",\"sender\":\"{}\",\
+             \"accepted_at\":\"{}\"}}",
+            enc::b64(entry_id),
+            enc::pubky_id(sender),
+            rfc3339(*accepted_at_ms),
+        )
+        .into_bytes(),
+        InboxItem::Missed {
+            seq,
+            entries,
+            from_ms,
+            until_ms,
+        } => format!(
+            "{{\"type\":\"missed\",\"seq\":{seq},\"entries\":{entries},\
+             \"accepted_from\":\"{}\",\"accepted_until\":\"{}\"}}",
+            rfc3339(*from_ms),
+            rfc3339(*until_ms),
+        )
+        .into_bytes(),
+    }
+}
+
 /// An inbox entry's feed item (Switch wire 7.5), in the member order of the wire's example
 /// (7.4.4): `type, seq, entry_id, sender, cert, accepted_at`, the invite code's `context` as
 /// stored when one admitted the sender, then `envelope`.
@@ -459,25 +494,27 @@ impl PageBuilder {
 }
 
 impl PageReader for PageBuilder {
-    /// An entry shows to its target apps only, and to no other app at all: no stub, and
-    /// nothing counted against the page's limit or budget (Switch wire 7.5). The page's
-    /// query reads only the entries wrapped to the reader (`store::feed::read_feed`), so
-    /// every entry seen here is one. It is never part of a batch.
-    fn take_entry(&mut self, snapshot: &FeedSnapshot, entry: crate::store::StoredEntry) -> bool {
+    /// An entry shows to its target apps only, an unreadable item to every current app and
+    /// a `missed` item to its app, and to no other app at all: no stub, and nothing counted
+    /// against the page's limit or budget (Switch wire 7.5). The page's query reads only
+    /// the items the reader is shown (`store::feed::read_feed`), and the reader is a
+    /// current app (`begin`). None is part of a batch.
+    fn take_entry(&mut self, snapshot: &FeedSnapshot, item: crate::store::InboxItem) -> bool {
         if self.cert.is_none() {
             return false;
         }
-        if entry.seq > snapshot.window_end {
+        let seq = item.seq();
+        if seq > snapshot.window_end {
             return false;
         }
         if !self.close_group() {
             return false;
         }
-        let item = entry_json(&entry);
-        self.group_bytes = self.group_bytes.saturating_add(item.len());
-        self.group.push(item);
+        let json = inbox_item_json(&item);
+        self.group_bytes = self.group_bytes.saturating_add(json.len());
+        self.group.push(json);
         self.group_batch = None;
-        self.group_last = entry.seq;
+        self.group_last = seq;
         true
     }
 

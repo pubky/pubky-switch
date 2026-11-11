@@ -85,8 +85,8 @@ The flows send every call the service serves, each at both switches. What they l
   the comparison can't set side by side. Its test holds what each switch does.
 - **A feed with gaps:** a lagging app, a `missed` item, an item an app can't read after a
   revocation.
-- **Lists in use:** an invite code issued and used, and a deny list entry that refuses a
-  sender.
+- **More of the lists:** an invite code withdrawn or used several times, an invite, a
+  conversation entry pruned, a connection request.
 - **Longer lives:** a renewal that changes an app's scopes, a second renewal, a data epoch
   past 2, a claim that runs out by time, an app with several collections, an identity that
   enrolls again after an erasure.
@@ -111,6 +111,6 @@ Run the `trace` example to see what the two switches answered, and list each dif
 ## Run time and databases
 
 Each flow's run against the service makes one test database and drops it, also when its
-test panics; the flows run one after another. Twenty-two flows take about a minute in a
+test panics; the flows run one after another. Twenty-four flows take about a minute in a
 debug build. If that grows too long, the service's halves could share one service and one
 database, with identities of their own per flow: a later option, not needed yet.

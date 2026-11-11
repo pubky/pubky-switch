@@ -98,17 +98,52 @@ fn matches(pattern: &str, text: &str) -> bool {
 }
 
 /// Every accepted difference: those of the two switches as a whole, then by flow.
-pub static ALLOWED: &[Allowed] = &[Allowed {
-    flow: EVERY_FLOW,
-    label: "*",
-    fact: "* (member order)",
-    service: "*",
-    scripted: "*",
-    reason: "The service writes an answer's members in the order of the wire format's \
+pub static ALLOWED: &[Allowed] = &[
+    Allowed {
+        flow: EVERY_FLOW,
+        label: "*",
+        fact: "* (member order)",
+        service: "*",
+        scripted: "*",
+        reason: "The service writes an answer's members in the order of the wire format's \
                  tables and examples; the scripted switch writes them sorted by name. A writer \
                  may use any order, and no reader depends on it.",
-    reference: "Switch wire 1.1, \"Exact bytes\"",
-}];
+        reference: "Switch wire 1.1, \"Exact bytes\"",
+    },
+    Allowed {
+        flow: "invite code",
+        label: "{alice/wallet} GET /v1/{alice}/feed",
+        fact: "body.items[1].context*",
+        service: "*",
+        scripted: NOTHING,
+        reason: "fake batch pending: the service shows the invite code's context on the \
+                 conversation entry it wrote at the code's first use, as a feed item; the \
+                 scripted switch shows it on the entry the code admitted and leaves it off \
+                 the conversation entry.",
+        reference: "Switch wire 7.5, the `chain` item's `context`",
+    },
+    Allowed {
+        flow: "invite code",
+        label: "{alice/wallet} GET /v1/{alice}/allow",
+        fact: "body.conversations[0].context*",
+        service: "*",
+        scripted: NOTHING,
+        reason: "fake batch pending: the service lists a conversation entry an invite code \
+                 made with the code's context; the scripted switch lists it without.",
+        reference: "Switch wire 7.4.6, `conversations`",
+    },
+    Allowed {
+        flow: "invite code",
+        label: "{alice/wallet} GET /v1/{alice}/allow",
+        fact: "body.conversations[0].last_used",
+        service: "time *",
+        scripted: NOTHING,
+        reason: "fake batch pending: the service keeps the time of the last append a \
+                 conversation entry admitted; the scripted switch keeps none, so an app \
+                 that prunes idle entries by it finds every entry never used.",
+        reference: "Switch wire 7.4.6, `last_used`",
+    },
+];
 
 #[cfg(test)]
 mod tests {
