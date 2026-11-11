@@ -431,9 +431,10 @@ async fn test_every_served_call_is_listed_and_sent_by_its_flow() {
     );
 }
 
-/// What `trace` shows of the waiting-read flow: how many items the read with `wait` was
-/// answered, and how many events the watch raised at that read and at its next one.
-fn waiting_read_shown(trace: &Trace) -> (String, String, String) {
+/// What `trace` shows of the waiting-read flow: whether the switch held the read when the
+/// wallet wrote, how many items the read with `wait` was answered, and how many events the
+/// watch raised at that read and at its next one.
+fn waiting_read_shown(trace: &Trace) -> (String, String, String, String) {
     let fact = |label: &str, fact: &str, must_hold: Option<&str>| {
         trace
             .lines
@@ -444,6 +445,11 @@ fn waiting_read_shown(trace: &Trace) -> (String, String, String) {
             .unwrap_or_else(|| panic!("no {fact} at {label}:\n{trace}"))
     };
     (
+        fact(
+            "outcome the watch's waiting read, answered by the wallet's write",
+            "outcome.held_when_the_wallet_wrote",
+            None,
+        ),
         fact(
             "{alice/watch} GET /v1/{alice}/feed",
             "body.items",
@@ -475,8 +481,13 @@ async fn test_waiting_read_is_held_by_the_service_and_not_by_the_scripted_switch
     let none = "array of 0".to_owned();
     assert_eq!(
         waiting_read_shown(&service),
-        (one.clone(), one.clone(), none.clone()),
-        "the service answers a waiting read with the write that ends its wait"
+        (
+            "bool true".to_owned(),
+            one.clone(),
+            one.clone(),
+            none.clone()
+        ),
+        "the service holds a waiting read, and answers it with the write that ends its wait"
     );
 
     let scripted = run(Backend::Scripted, flows::waiting_read)
@@ -485,7 +496,7 @@ async fn test_waiting_read_is_held_by_the_service_and_not_by_the_scripted_switch
         .expect("the scripted switch needs no database");
     assert_eq!(
         waiting_read_shown(&scripted),
-        (none.clone(), none, one),
+        ("bool false".to_owned(), none.clone(), none, one),
         "the scripted switch answered a waiting read otherwise than at once and empty: if \
          it holds the read now, add the flow to `FLOWS` and drop this half"
     );

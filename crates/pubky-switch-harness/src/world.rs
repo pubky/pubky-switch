@@ -315,6 +315,16 @@ impl World {
         self.recorder.faults_left()
     }
 
+    /// How many accounts have a feed read held at a switch now, waiting for a change
+    /// (Switch wire 7.4.4 `wait`). The scripted switch holds none: it answers a waiting
+    /// read at once.
+    pub fn held_reads(&self) -> usize {
+        lock(&self.services)
+            .iter()
+            .map(RealSwitch::held_reads)
+            .sum()
+    }
+
     /// A request no key signs, as any reader of the network sends it: `method path` at
     /// `origin`, with no body.
     ///
