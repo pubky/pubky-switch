@@ -147,6 +147,23 @@ impl World {
         origin: &str,
         identities: &[&TestIdentity],
     ) -> Result<(), HarnessError> {
+        self.add_switch_with(origin, identities, Limits::default())
+            .await
+    }
+
+    /// As [`World::add_switch`], the service running with `limits` (Switch wire 9.2) in
+    /// place of its defaults, as an operator may configure it. The scripted switch has no
+    /// such setting: it keeps its own.
+    ///
+    /// # Errors
+    ///
+    /// When the service can't be started.
+    pub async fn add_switch_with(
+        &self,
+        origin: &str,
+        identities: &[&TestIdentity],
+        limits: Limits,
+    ) -> Result<(), HarnessError> {
         // Each account's answers are verified with the service key of its identity's seed
         // (an Ed25519 key, as an identity key is).
         for identity in identities {
@@ -166,7 +183,7 @@ impl World {
                         .map(|identity| identity.service_secret())
                         .collect(),
                     OPERATOR_SECRET,
-                    Limits::default(),
+                    limits,
                 )
                 .await?
                 .ok_or_else(|| HarnessError::Setup("no test database".into()))?;
@@ -313,6 +330,16 @@ impl World {
     /// The faults asked for that no request has met yet.
     pub fn faults_left(&self) -> usize {
         self.recorder.faults_left()
+    }
+
+    /// How many accounts have a feed read held at a switch now, waiting for a change
+    /// (Switch wire 7.4.4 `wait`). The scripted switch holds none: it answers a waiting
+    /// read at once.
+    pub fn held_reads(&self) -> usize {
+        lock(&self.services)
+            .iter()
+            .map(RealSwitch::held_reads)
+            .sum()
     }
 
     /// A request no key signs, as any reader of the network sends it: `method path` at

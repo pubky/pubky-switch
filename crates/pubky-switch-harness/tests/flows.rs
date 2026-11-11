@@ -431,9 +431,10 @@ async fn test_every_served_call_is_listed_and_sent_by_its_flow() {
     );
 }
 
-/// What `trace` shows of the waiting-read flow: how many items the read with `wait` was
-/// answered, and how many events the watch raised at that read and at its next one.
-fn waiting_read_shown(trace: &Trace) -> (String, String, String) {
+/// What `trace` shows of the waiting-read flow: whether the switch held the read when the
+/// wallet wrote, how many items the read with `wait` was answered, and how many events the
+/// watch raised at that read and at its next one.
+fn waiting_read_shown(trace: &Trace) -> (String, String, String, String) {
     let fact = |label: &str, fact: &str, must_hold: Option<&str>| {
         trace
             .lines
@@ -444,6 +445,11 @@ fn waiting_read_shown(trace: &Trace) -> (String, String, String) {
             .unwrap_or_else(|| panic!("no {fact} at {label}:\n{trace}"))
     };
     (
+        fact(
+            "outcome the watch's waiting read, answered by the wallet's write",
+            "outcome.held_when_the_wallet_wrote",
+            None,
+        ),
         fact(
             "{alice/watch} GET /v1/{alice}/feed",
             "body.items",
@@ -475,8 +481,13 @@ async fn test_waiting_read_is_held_by_the_service_and_not_by_the_scripted_switch
     let none = "array of 0".to_owned();
     assert_eq!(
         waiting_read_shown(&service),
-        (one.clone(), one.clone(), none.clone()),
-        "the service answers a waiting read with the write that ends its wait"
+        (
+            "bool true".to_owned(),
+            one.clone(),
+            one.clone(),
+            none.clone()
+        ),
+        "the service holds a waiting read, and answers it with the write that ends its wait"
     );
 
     let scripted = run(Backend::Scripted, flows::waiting_read)
@@ -485,8 +496,212 @@ async fn test_waiting_read_is_held_by_the_service_and_not_by_the_scripted_switch
         .expect("the scripted switch needs no database");
     assert_eq!(
         waiting_read_shown(&scripted),
-        (none.clone(), none, one),
+        ("bool false".to_owned(), none.clone(), none, one),
         "the scripted switch answered a waiting read otherwise than at once and empty: if \
          it holds the read now, add the flow to `FLOWS` and drop this half"
+    );
+}
+
+/// Every value the fact `fact` has on the lines of `trace` labelled `label`, in order.
+fn values(trace: &Trace, label: &str, fact: &str) -> Vec<String> {
+    trace
+        .lines
+        .iter()
+        .filter(|line| line.label == label)
+        .filter_map(|line| line.facts.get(fact).cloned())
+        .collect()
+}
+
+/// What each `GET /v1/{id}/apps` answer of `trace` says of alice's phone in `member`.
+fn of_the_phone(trace: &Trace, member: &str) -> Vec<String> {
+    trace
+        .lines
+        .iter()
+        .filter(|line| line.label == "{alice} GET /v1/{alice}/apps")
+        .filter_map(|line| {
+            (0..8).find_map(|index| {
+                let is_phone = line.facts.get(&format!("body.apps[{index}].app_id"))
+                    == Some(&"id {alice/phone}".to_owned());
+                is_phone
+                    .then(|| {
+                        line.facts
+                            .get(&format!("body.apps[{index}].{member}"))
+                            .cloned()
+                    })
+                    .flatten()
+            })
+        })
+        .collect()
+}
+
+/// The types of the inbox's items in every feed page `app` read, in order: entries and what
+/// stands for them (`missed`, `unreadable`), the chain's own items left out.
+fn item_types(trace: &Trace, app: &str) -> Vec<String> {
+    let label = format!("{{alice/{app}}} GET /v1/{{alice}}/feed");
+    trace
+        .lines
+        .iter()
+        .filter(|line| line.label == label)
+        .flat_map(|line| {
+            (0..16).filter_map(|index| {
+                line.facts
+                    .get(&format!("body.items[{index}].type"))
+                    .cloned()
+            })
+        })
+        .filter(|kind| kind != "text chain" && kind != "text stub")
+        .collect()
+}
+
+/// One of the flows that run against each switch on its own, at both: `None` when no test
+/// database is configured.
+async fn each_switch(
+    name: &str,
+    flow: impl AsyncFn(&World) -> FlowResult + Copy,
+) -> Option<(Trace, Trace)> {
+    let service = run(Backend::Service, flow)
+        .await
+        .unwrap_or_else(|error| panic!("{name} at the service: {error}"))?;
+    let scripted = run(Backend::Scripted, flow)
+        .await
+        .unwrap_or_else(|error| panic!("{name} at the scripted switch: {error}"))
+        .expect("the scripted switch needs no database");
+    Some((service, scripted))
+}
+
+/// What ends the message of a check that holds the scripted switch to what it does today.
+const FOLLOWS_NOW: &str = "if the scripted switch follows the service here now, drop this \
+                           half, and add the flow to `FLOWS` once its two runs compare";
+
+/// The service marks an app lagging once its unread entries pass its share of the inbox
+/// quota, deletes what only that app was holding, and ends the mark at the app's read
+/// (Switch wire 7.4.4). The scripted switch marks none and keeps every entry.
+#[tokio::test]
+async fn test_lagging_app_is_marked_by_the_service_and_not_by_the_scripted_switch() {
+    let Some((service, scripted)) = each_switch("the lagging app", flows::lagging_app).await else {
+        return;
+    };
+    let read = "outcome the phone reads at last";
+    let text = |value: &str| vec![value.to_owned()];
+
+    let marks = of_the_phone(&service, "lagging");
+    assert!(
+        marks.contains(&"bool true".to_owned()),
+        "the service never showed the phone as lagging: {marks:?}"
+    );
+    assert_eq!(
+        marks.last().map(String::as_str),
+        Some("bool false"),
+        "the phone's read didn't end its mark"
+    );
+    assert_eq!(item_types(&service, "phone"), text("text missed"));
+    assert_eq!(
+        values(&service, read, "outcome.events[0]"),
+        text("text Missed")
+    );
+    assert_eq!(values(&service, read, "outcome.notes"), text("number 0"));
+
+    assert!(
+        !of_the_phone(&scripted, "lagging").contains(&"bool true".to_owned()),
+        "the scripted switch marked the phone lagging: {FOLLOWS_NOW}"
+    );
+    assert_eq!(
+        item_types(&scripted, "phone"),
+        vec!["text entry".to_owned(); 6],
+        "the scripted switch didn't keep every entry for the phone: {FOLLOWS_NOW}"
+    );
+    assert_eq!(
+        values(&scripted, read, "outcome.notes"),
+        text("number 6"),
+        "{FOLLOWS_NOW}"
+    );
+}
+
+/// The service tells a lagging app what it missed in one `missed` item, which a later miss
+/// replaces with one covering both, and the app lists its collections again (Switch wire
+/// 7.4.4, 7.5). The scripted switch writes none: the app reads every entry.
+#[tokio::test]
+async fn test_missed_item_is_written_by_the_service_and_not_by_the_scripted_switch() {
+    let Some((service, scripted)) = each_switch("the missed item", flows::missed_item).await else {
+        return;
+    };
+    let feed = "{alice/phone} GET /v1/{alice}/feed";
+    let read = "outcome the phone reads at last";
+    let text = |value: &str| vec![value.to_owned()];
+    // The phone lists its collection when it joins; another listing follows a `missed` item.
+    let listings = |trace: &Trace| values(trace, "{alice/phone} GET /v1/{alice}/records", "status");
+
+    assert_eq!(item_types(&service, "phone"), text("text missed"));
+    assert_eq!(
+        values(&service, feed, "body.items[0].entries"),
+        text("number 8"),
+        "one item covers the entries missed in both rounds"
+    );
+    assert_eq!(
+        values(&service, read, "outcome.events[0]"),
+        text("text Missed")
+    );
+    assert_eq!(values(&service, read, "outcome.notes"), text("number 0"));
+    assert_eq!(
+        listings(&service).len(),
+        2,
+        "the phone lists again after it"
+    );
+
+    assert_eq!(
+        item_types(&scripted, "phone"),
+        vec!["text entry".to_owned(); 8],
+        "the scripted switch didn't keep every entry for the phone: {FOLLOWS_NOW}"
+    );
+    assert_eq!(
+        values(&scripted, read, "outcome.notes"),
+        text("number 8"),
+        "{FOLLOWS_NOW}"
+    );
+    assert_eq!(listings(&scripted).len(), 1, "{FOLLOWS_NOW}");
+}
+
+/// At a revocation the service turns an entry left without a current reader into an
+/// `unreadable` item for the apps that stay, and before it counts the entry as unread for
+/// the app it targets (Switch wire 7.4.4, 7.4.12). The scripted switch does neither.
+#[tokio::test]
+async fn test_unreadable_item_is_written_by_the_service_and_not_by_the_scripted_switch() {
+    let Some((service, scripted)) =
+        each_switch("the unreadable item", flows::unreadable_after_revoke).await
+    else {
+        return;
+    };
+    let after = "outcome the wallet after the revocation";
+    let unreadable = "text unreadable".to_owned();
+    let one = "number 1".to_owned();
+
+    assert!(
+        of_the_phone(&service, "unread_entries").contains(&one),
+        "the service counts the note the phone hasn't read"
+    );
+    assert!(
+        of_the_phone(&service, "sole_target_unread").contains(&one),
+        "the phone is the note's only target"
+    );
+    assert_eq!(
+        item_types(&service, "wallet")
+            .iter()
+            .filter(|kind| **kind == unreadable)
+            .count(),
+        1,
+        "the wallet finds one unreadable item"
+    );
+    assert!(
+        values(&service, after, "outcome.events[0]").contains(&"text Unreadable".to_owned()),
+        "the wallet raises it"
+    );
+
+    assert!(
+        !of_the_phone(&scripted, "unread_entries").contains(&one),
+        "the scripted switch counted the phone's unread note: {FOLLOWS_NOW}"
+    );
+    assert!(
+        !item_types(&scripted, "wallet").contains(&unreadable),
+        "the scripted switch wrote an unreadable item: {FOLLOWS_NOW}"
     );
 }
