@@ -1487,6 +1487,37 @@ async fn test_erase_deferred_allow_read_isnt_signed_with_its_key() {
     replay.db.drop_database().await.expect("drop");
 }
 
+#[tokio::test]
+async fn test_erase_deferred_records_page_isnt_signed_with_its_key() {
+    // A `GET /records` page read once the lock is gone, from a snapshot taken before an
+    // erasure: the page reads, but as for an account the service doesn't host, it is never
+    // signed with the erased key (7.4.16).
+    let Some(mut replay) = replay().await else {
+        return;
+    };
+    let gate = gated(&mut replay, true);
+    replay_chain_through_revoke(&replay).await;
+    gate.arm(0);
+    let keys = vectors("keys.json");
+    let request = app_request(
+        app(&keys, "wallet"),
+        "GET",
+        &format!(
+            "/v1/{}/records?collection={}",
+            alice_id(),
+            pubky_switch_core::enc::b64(&[1; 32])
+        ),
+        Vec::new(),
+        ms(&revoke_time()),
+    );
+    let request_signature = signature_of(&request);
+    let answer = erased_meanwhile(&replay, &gate, request).await;
+    assert_eq!(code_of(&answer), (404, json!("not_found")));
+    assert!(no_head(&answer));
+    assert!(operator_signed(&answer, Some(&request_signature)));
+    replay.db.drop_database().await.expect("drop");
+}
+
 /// The answer is signed with alice's service key.
 fn alice_signed(answer: &SwitchResponse, request_signature: Option<&[u8; 64]>) -> bool {
     let Some(text) = header_text(answer, header::SERVICE_SIGNATURE) else {
@@ -1600,6 +1631,58 @@ async fn test_erase_read_waiting_its_turn_across_an_erasure_isnt_signed_with_its
     let path = format!("/v1/{}/allow", alice_id());
     let first = app_request(app(&keys, "wallet"), "GET", &path, Vec::new(), ms(&at));
     let second = app_request(app(&keys, "phone"), "GET", &path, Vec::new(), ms(&at));
+    let second_signature = signature_of(&second);
+    let pause = replay.db.pause_next_snapshot_read();
+    let (_, (second, erased)) = tokio::join!(replay.service.handle(first), async {
+        tokio::time::timeout(std::time::Duration::from_secs(10), pause.reached.notified())
+            .await
+            .expect("the wallet's page paused after the lock");
+        let (second, erased) = tokio::join!(replay.service.handle(second), async {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while replay.db.queued_reads(&alice_id()) < 2 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the phone never queued"
+                );
+                tokio::task::yield_now().await;
+            }
+            gate.fail_ledger.store(true, Ordering::SeqCst);
+            erase(&replay, &alice_service_key(), &at).await
+        });
+        pause.resume.notify_one();
+        (second, erased)
+    });
+    assert_eq!(code_of(&erased), (503, json!("unavailable")));
+    assert_eq!(code_of(&second), (404, json!("not_found")));
+    assert!(
+        !alice_signed(&second, Some(&second_signature)),
+        "signed with the erased account's key"
+    );
+    assert!(operator_signed(&second, Some(&second_signature)));
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_erase_records_list_waiting_its_turn_across_an_erasure_isnt_signed_with_its_key() {
+    // As for `GET /allow`: the phone's `GET /records` list waits for its account's turn,
+    // before the lock, behind the wallet's paused page; the account is erased meanwhile and
+    // its key stays owed. The wait's `503` is the operator's, never signed with the erased
+    // key (7.4.16).
+    use std::sync::atomic::Ordering;
+    let Some(mut replay) = replay().await else {
+        return;
+    };
+    let gate = gated(&mut replay, false);
+    let at = registered(&replay).await;
+    let keys = vectors("keys.json");
+    let allow = format!("/v1/{}/allow", alice_id());
+    let list = format!(
+        "/v1/{}/records?collection={}",
+        alice_id(),
+        pubky_switch_core::enc::b64(&[1; 32])
+    );
+    let first = app_request(app(&keys, "wallet"), "GET", &allow, Vec::new(), ms(&at));
+    let second = app_request(app(&keys, "phone"), "GET", &list, Vec::new(), ms(&at));
     let second_signature = signature_of(&second);
     let pause = replay.db.pause_next_snapshot_read();
     let (_, (second, erased)) = tokio::join!(replay.service.handle(first), async {
