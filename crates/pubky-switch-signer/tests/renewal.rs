@@ -356,6 +356,47 @@ async fn test_renewal_a_given_up_rotation_is_completed_before_the_next() {
 }
 
 #[tokio::test]
+async fn test_renewal_full_bundle_request_replaces_a_part_for_another_certificate() {
+    // A given-up renewal stored `a`'s full bundle for a certificate never listed. A range only
+    // such a part covers counts as missing: asked for its full bundle, `a` gets parts for every
+    // epoch, each made for its listed certificate (Switch wire 3.5 "Full bundles on request").
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let (a, b) = two_apps(&["notes", "notes_sync"], &["notes", "notes_sync"]);
+    world.approve(&mut signer, &a).await;
+    world.approve(&mut signer, &b).await;
+    let a_id = a.keys.app_id_bytes();
+    world.switch.fail_next(SwitchFault::Error {
+        path: "/identity".into(),
+        code: ErrorCode::BadRequest,
+        current: serde_json::Value::Null,
+    });
+    signer
+        .renew(a_id, reduce(&["notes_sync"]))
+        .await
+        .unwrap_err();
+    let newest = signer.identity_doc().unwrap().unwrap();
+    let listed = newest.listed_cert(&a_id).unwrap();
+    assert!(opened(&world, &a).iter().all(|p| p.cert != listed));
+
+    world.switch.request_full_bundle(a_id);
+    assert_eq!(signer.serve_full_bundles().await.unwrap(), [a_id]);
+    let fresh: Vec<_> = opened(&world, &a)
+        .into_iter()
+        .filter(|p| p.cert == listed)
+        .collect();
+    for epoch in 1..=newest.data_epoch() {
+        assert!(holds(&world, &fresh, epoch, "notes"), "epoch {epoch}");
+    }
+    assert!(
+        opened(&world, &a).iter().all(|p| p.cert == listed),
+        "the part for the other certificate is replaced"
+    );
+    assert!(world.switch.app(&a_id).full_requested.is_none());
+    assert!(signer.serve_full_bundles().await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn test_renewal_a_given_up_epoch_reaches_its_app_after_a_renewal_in_between() {
     // A rotation is given up after its batches, leaving `a`'s parts made for a certificate
     // never listed. A renewal that doesn't rotate comes in between, and the switch shows
