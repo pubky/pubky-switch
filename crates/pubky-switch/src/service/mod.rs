@@ -401,6 +401,8 @@ impl Service {
         };
         let call = &request.route.call;
         let stamped_ms = found.stamped_time_ms;
+        // The key the account had at the lookup, which an answer after a wait checks again.
+        let looked_up_key = found.service_key.clone();
         let refused_early = |error: ApiError| {
             let signature = if *call == Call::GetIdentity {
                 None
@@ -525,14 +527,24 @@ impl Service {
         };
         let txn = match begun {
             Ok(Some(txn)) => txn,
-            // Erased between the lookup and the lock.
+            // Erased between the lookup and the lock: as for an account the service doesn't
+            // host, held back while the erasure's key is owed (7.4.16).
             Ok(None) => {
-                let error = ApiError::not_found("no such account");
+                let error = self.no_such_account(&account).await;
                 return self
                     .operator_answer(request_signature.as_ref(), base_ms, &error)
                     .await;
             }
-            Err(error) => return refused_early(store_error(&error)).await,
+            // The wait for the lock, or for a reader's turn, can outlast an erasure whose key
+            // stays owed: never signed with the key looked up before it (7.4.16).
+            Err(error) => {
+                if let Some(error) = self.no_longer_keyed(&account, &looked_up_key).await {
+                    return self
+                        .operator_answer(request_signature.as_ref(), base_ms, &error)
+                        .await;
+                }
+                return refused_early(store_error(&error)).await;
+            }
         };
         let signature = if caller.is_some() {
             request_signature
