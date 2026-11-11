@@ -535,6 +535,29 @@ pub fn tombstone_from_proof(view: &ClaimView, at: u64) -> Option<Claim> {
     })
 }
 
+/// Merge an upload's evidence for one claim key: on an obligation the service holds nothing
+/// for, a SETTLED proof among the upload's `proofs` (`settled`, the view and the proof's
+/// time) first rebuilds its tombstone (Switch wire 7.4.14 "`heads` and `proofs`"), and the
+/// entries then merge into it as into any claim ([`merge_claim`]).
+pub fn merge_upload_claim(
+    held: Option<&Claim>,
+    settled: Option<&(ClaimView, u64)>,
+    entries: &[UploadedEntry],
+    now: u64,
+    max_attempts: u64,
+) -> ClaimMerge {
+    let rebuilt = match (held, settled) {
+        (None, Some((view, at))) => tombstone_from_proof(view, *at),
+        _ => None,
+    };
+    let Some(tombstone) = rebuilt else {
+        return merge_claim(held, entries, now, max_attempts);
+    };
+    let mut merge = merge_claim(Some(&tombstone), entries, now, max_attempts);
+    merge.changed = true;
+    merge
+}
+
 /// What an upload changed, as the `upload` transition and the upload's answer list it (Switch
 /// wire 7.4.14 "Answer", 6.5).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -640,6 +663,13 @@ impl UploadChanges {
         })
     }
 }
+
+mod upload;
+
+pub use upload::{
+    CheckedRecord, CheckedUpload, UploadBody, UploadContext, UploadLists, UploadedOp, check_upload,
+    proved_version,
+};
 
 #[cfg(test)]
 mod tests;
