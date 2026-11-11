@@ -99,9 +99,10 @@ async fn test_erasure_unpublishes_then_erases_the_account() {
 
 #[tokio::test]
 async fn test_erasure_answer_lost_is_taken_as_done_from_the_404() {
-    // The switch erased the account, and its `200` was lost. The retry gets the operator's
-    // `404` of an account it doesn't host, which the signer takes as the erasure done
-    // (Switch wire 7.4.16).
+    // The switch erased the account, and its `200` was lost. The check before the retry gets
+    // the operator's `404` of an account it doesn't host, and the backup and the Homeserver
+    // show no other install: the signer takes it as the erasure done, as a retry's `404`
+    // (Switch wire 7.4.16), and sends no other request.
     let world = World::new();
     let (mut signer, _, _) = with_an_app(&world).await;
     world.switch.fail_next(SwitchFault::LoseAnswer {
@@ -117,7 +118,7 @@ async fn test_erasure_answer_lost_is_taken_as_done_from_the_404() {
     );
     signer.resume().await.unwrap();
     assert_eq!(signer.status(), SignerStatus::Erased);
-    assert_eq!(erase_requests(&world), 2);
+    assert_eq!(erase_requests(&world), 1);
 }
 
 #[tokio::test]
@@ -300,29 +301,27 @@ async fn test_erasure_aborted_after_a_signed_refusal() {
     );
 }
 
-/// `world`'s env, whose transport loses the first answer to `POST /erase`, answers the second
-/// with an unsigned `503`, as a proxy could, and passes everything else to the switch.
+/// `world`'s env, whose transport loses the first answer to `POST /erase`, then answers the
+/// next `GET /apps` with an unsigned `503`, as a proxy could, and passes everything else to the
+/// switch.
 fn lost_then_unsigned_503(world: &World, store: Arc<MemoryStore>) -> SignerEnv {
     let switch = Arc::clone(&world.switch);
-    let erasures = Arc::new(std::sync::Mutex::new(0));
+    // 0: nothing lost yet; 1: the erasure's answer lost; 2: the `503` given.
+    let stage = Arc::new(std::sync::Mutex::new(0));
     let transport = Arc::new(MockTransport::with_handler(move |request| {
-        if request.method == "POST" && request.path_and_query.ends_with("/erase") {
-            let mut count = erasures.lock().unwrap();
-            *count += 1;
-            match *count {
-                1 => {
-                    let _ = switch.handle(request);
-                    return Err(pubky_switch_client::TransportError::Timeout);
-                }
-                2 => {
-                    return Ok(Response {
-                        status: 503,
-                        headers: Vec::new(),
-                        body: b"{}".to_vec(),
-                    });
-                }
-                _ => {}
-            }
+        let mut stage = stage.lock().unwrap();
+        if *stage == 0 && request.method == "POST" && request.path_and_query.ends_with("/erase") {
+            *stage = 1;
+            let _ = switch.handle(request);
+            return Err(pubky_switch_client::TransportError::Timeout);
+        }
+        if *stage == 1 && request.method == "GET" && request.path_and_query.ends_with("/apps") {
+            *stage = 2;
+            return Ok(Response {
+                status: 503,
+                headers: Vec::new(),
+                body: b"{}".to_vec(),
+            });
         }
         switch.handle(request)
     }));
@@ -333,9 +332,10 @@ fn lost_then_unsigned_503(world: &World, store: Arc<MemoryStore>) -> SignerEnv {
 
 #[tokio::test]
 async fn test_erasure_unsigned_answer_after_a_lost_200_keeps_it_landed() {
-    // The switch erased the account and its `200` was lost; a proxy answers the retry with an
-    // unsigned `503`; the next retry gets the operator's `404`. The unsigned answer showed
-    // nothing about the account, so the erasure is done (Switch wire 7.4.16).
+    // The switch erased the account and its `200` was lost; a proxy answers the next check's
+    // read with an unsigned `503`, which keeps the request in doubt; the next check gets the
+    // operator's `404`. The unsigned answer showed nothing about the account, so the erasure
+    // is done (Switch wire 7.4.16).
     let world = World::new();
     let (signer, _, store) = with_an_app(&world).await;
     drop(signer);
@@ -775,6 +775,74 @@ async fn test_erasure_kept_through_an_alarm() {
     assert_eq!(signer.status(), SignerStatus::Erasing);
     assert!(world.homeserver.file(&app_record_path(&id)).is_some());
     assert_eq!(erase_requests(&world), 0);
-    signer.abort_erasure().await.unwrap_err();
+    // The other body leaves the Homeserver, and the user hasn't cleared the alarm: the copies
+    // read clean again, but the alarm still holds every step back.
+    world.homeserver.files.lock().unwrap().remove(IDENTITY_PATH);
+    assert!(matches!(
+        signer.resume().await.unwrap_err(),
+        SignerError::Alarm(_)
+    ));
+    assert_eq!(signer.status(), SignerStatus::Erasing);
+    assert!(world.homeserver.file(&app_record_path(&id)).is_some());
+    assert_eq!(erase_requests(&world), 0);
+    // The user's way out: the abort ends it without erasing.
+    signer.abort_erasure().await.unwrap();
     assert_ne!(signer.status(), SignerStatus::Erasing);
+    assert_eq!(erase_requests(&world), 0);
+}
+
+#[tokio::test]
+async fn test_erasure_in_doubt_sends_nothing_more_on_an_unsigned_404() {
+    // A request went unanswered, without landing; another install then delivers at the switch,
+    // and has neither published nor written its backup yet. A proxy answers this install's
+    // check with an unsigned `404`, and the other copies show nothing: it is taken as the
+    // erasure done, and no other request goes out, so the other install's account stays
+    // (Switch wire 7.4.16).
+    let world = World::new();
+    let (signer, _, store) = with_an_app(&world).await;
+    drop(signer);
+    let mut signer = Signer::open(world.env(store.clone()), world.keyring())
+        .await
+        .unwrap();
+    world.switch.fail_next(SwitchFault::Unreachable {
+        path: "/erase".into(),
+        after: 0,
+    });
+    signer.close_account(confirmed()).await.unwrap_err();
+    another_install_delivers(&world, &signer)();
+    drop(signer);
+    let sent = erase_requests(&world);
+    let mut signer = Signer::open(
+        unsigned_404_for_apps(&world, store, usize::MAX),
+        world.keyring(),
+    )
+    .await
+    .unwrap();
+    signer.resume().await.unwrap();
+    assert_eq!(erase_requests(&world), sent);
+    assert!(!world.switch.erased(), "the other install's account stays");
+    assert_eq!(signer.status(), SignerStatus::Erased);
+}
+
+#[tokio::test]
+async fn test_erasure_stops_at_a_copy_published_between_two_deletions() {
+    // Another install's newer copy reaches the Homeserver after `identity.json` went, before
+    // the switch shows it: each later deletion judges the Homeserver too, and the app's record
+    // stays (Switch wire 3.13).
+    let world = World::new();
+    let (mut signer, id, _) = with_an_app(&world).await;
+    let other = world.other_install_version(&signer.identity_doc().unwrap().unwrap(), [9; 16]);
+    let homeserver = Arc::clone(&world.homeserver);
+    *world.homeserver.after_delete.lock().unwrap() = Some((
+        IDENTITY_PATH.to_owned(),
+        Box::new(move || {
+            homeserver.set(IDENTITY_PATH, serde_json::to_vec(other.signed()).unwrap());
+        }),
+    ));
+    assert_eq!(
+        signer.close_account(confirmed()).await.unwrap_err(),
+        SignerError::NotNamed { install: [9; 16] }
+    );
+    assert!(world.homeserver.file(&app_record_path(&id)).is_some());
+    assert_eq!(erase_requests(&world), 0);
 }
