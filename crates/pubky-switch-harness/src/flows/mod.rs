@@ -96,12 +96,13 @@ pub fn flow_of(call: &Call) -> Option<&'static str> {
         // lacks an epoch's keys, and no honest flow leaves it lacking one while the service
         // keeps every bundle part (the restore flow shows it).
         Call::RequestKeys(_) => None,
+        // Served, and waiting for their flow: the watching flow's shared record, which an
+        // app whose protocol has collections lists when it joins.
+        Call::GetRecord(_) | Call::ListRecords => None,
         // Not served yet.
         Call::PostConnect
         | Call::GetConnect
         | Call::DeleteConnect(_)
-        | Call::GetRecord(_)
-        | Call::ListRecords
         | Call::PutPush
         | Call::Freeze
         | Call::Unfreeze

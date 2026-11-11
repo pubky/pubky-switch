@@ -972,3 +972,214 @@ async fn test_store_upgrade_gives_chain_items_their_batch_proofs() {
     drop(conn);
     db.drop_database().await.expect("drop");
 }
+
+/// A shared record at `key` of `collection` whose `read_scope` is `read_scope`, at version
+/// `(1, version)`.
+fn shared_record(
+    key: [u8; 32],
+    collection: [u8; 32],
+    read_scope: &str,
+    deleted: bool,
+    version: u64,
+) -> pubky_switch::store::StoredRecord {
+    use pubky_switch_core::{
+        ident::Policy, ops::RecordVersion, shared::RecordState, sig::SignedDoc,
+    };
+    let doc = SignedDoc::from_parts(b"{}", &[0; 64]);
+    pubky_switch::store::StoredRecord {
+        state: RecordState {
+            key,
+            collection,
+            policy: Policy::new(read_scope, &["pay"]),
+            version: RecordVersion::new(1, version),
+            deleted,
+        },
+        value_bytes: if deleted { 0 } else { 2 },
+        writer: [3; 16],
+        cert: doc.clone(),
+        op: doc.clone(),
+        proof: doc,
+    }
+}
+
+/// Every record `readable_records` gives `held` from `collection` after `after`, read 2 at a
+/// time, by key.
+async fn readable(
+    fx: &Fixture,
+    collection: &[u8; 32],
+    held: &[&str],
+    after: &str,
+) -> Vec<[u8; 32]> {
+    let held: Vec<String> = held.iter().map(|s| (*s).to_string()).collect();
+    let mut txn = fx
+        .store()
+        .begin_reading(ID_A, [1; 16])
+        .await
+        .expect("begin")
+        .expect("account");
+    txn.prepare_snapshot().await.expect("export");
+    let mut read = txn.snapshot_read().expect("snapshot");
+    txn.commit().await.expect("commit");
+    let mut keys = Vec::new();
+    let mut after = after.to_string();
+    loop {
+        let page = read
+            .readable_records(collection, &held, &after, 2)
+            .await
+            .expect("records");
+        let Some(last) = page.last() else { break };
+        after = pubky_switch_core::enc::b64(&last.state.key);
+        keys.extend(page.iter().map(|record| record.state.key));
+    }
+    read.finish().await.expect("finish");
+    keys
+}
+
+#[tokio::test]
+async fn test_store_records_by_key_text_and_read_scope() {
+    use pubky_switch_core::{enc::b64, scopes::holds};
+    let Some(fx) = fixture().await else { return };
+    fx.account(ID_A).await;
+    let collection = [1; 32];
+    // Keys whose text sorts otherwise than their bytes: 0xF8 begins with '-', 0xD0 with
+    // '0', 0x00 with 'A', 0x68 with 'a', 0xFC with '_'.
+    let scopes = [
+        "pay",
+        "pay:x",
+        "contacts",
+        "contacts:x",
+        "request:shop1",
+        "request",
+    ];
+    let mut written = Vec::new();
+    {
+        let mut txn = fx
+            .store()
+            .begin(ID_A)
+            .await
+            .expect("begin")
+            .expect("account");
+        for first in [0xF8u8, 0xD0, 0x00, 0x68, 0xFC, 0x30] {
+            for (j, scope) in scopes.iter().enumerate() {
+                let mut key = [first; 32];
+                key[31] = u8::try_from(j).expect("small");
+                let record = shared_record(key, collection, scope, false, 2);
+                txn.put_record(&record).await.expect("put");
+                written.push((key, (*scope).to_string()));
+            }
+        }
+        // A deleted record, and one of another collection, never listed.
+        let deleted = shared_record([0x40; 32], collection, "pay", true, 3);
+        txn.put_record(&deleted).await.expect("put");
+        let other = shared_record([0x41; 32], [2; 32], "pay", false, 4);
+        txn.put_record(&other).await.expect("put");
+        txn.commit().await.expect("commit");
+    }
+    written.sort_by_key(|(key, _)| b64(key));
+    for held in [
+        &["pay"][..],
+        &["pay:x"],
+        &["contacts", "request:shop1"],
+        &["request"],
+        &["contacts:y"],
+        // A prefix of a name is no parent of it.
+        &["pa"],
+        &["contact"],
+        &["pa_"],
+        &[],
+    ] {
+        let held_owned: Vec<String> = held.iter().map(|s| (*s).to_string()).collect();
+        let expected: Vec<[u8; 32]> = written
+            .iter()
+            .filter(|(_, scope)| holds(&held_owned, scope))
+            .map(|(key, _)| *key)
+            .collect();
+        assert_eq!(
+            readable(&fx, &collection, held, "").await,
+            expected,
+            "{held:?}"
+        );
+        // After a key: exclusive, by text.
+        let middle = b64(&written[written.len() / 2].0);
+        let after: Vec<[u8; 32]> = expected
+            .iter()
+            .copied()
+            .filter(|key| b64(key) > middle)
+            .collect();
+        assert_eq!(
+            readable(&fx, &collection, held, &middle).await,
+            after,
+            "{held:?} after"
+        );
+    }
+    fx.finish().await;
+}
+
+#[tokio::test]
+#[allow(clippy::panic)]
+async fn test_store_upgrade_gives_records_their_key_text() {
+    use pubky_switch::store::{DatabaseConfig, MIGRATIONS, testing::TestDatabase};
+    let db = match TestDatabase::create_with(&DatabaseConfig::default(), false).await {
+        Ok(db) => db,
+        Err(pubky_switch::store::testing::TestDatabaseError::Skipped) => return,
+        Err(error) => panic!("test database: {error}"),
+    };
+    let mut conn = PgConnection::connect_with(db.options())
+        .await
+        .expect("conn");
+    let before = sqlx::migrate::Migrator {
+        migrations: std::borrow::Cow::Owned(
+            MIGRATIONS
+                .iter()
+                .filter(|migration| migration.version < 14)
+                .cloned()
+                .collect(),
+        ),
+        ignore_missing: false,
+        locking: true,
+        no_tx: false,
+    };
+    before.run(&mut conn).await.expect("migrations before 0014");
+    sqlx::query(
+        "INSERT INTO accounts (id, identity_key, generation, service_key, created_at_ms, \
+         announced_limits) VALUES ('old', $1, 1, '00000000000000000000000000000000', 5, \
+         '\\x7b7d')",
+    )
+    .bind([7u8; 32].as_slice())
+    .execute(&mut conn)
+    .await
+    .expect("account");
+    let keys = [[0xF8u8; 32], [0x00; 32], [0xD0; 32]];
+    for key in &keys {
+        sqlx::query(
+            "INSERT INTO shared_records (account_id, key, collection, read_scope, \
+             write_scopes, generation, version, deleted, value_bytes, writer, cert, op, proof) \
+             VALUES ('old', $1, $2, 'pay', '{pay}', 1, 1, false, 0, $3, '\\x7b7d', '\\x7b7d', \
+             '\\x7b7d')",
+        )
+        .bind(key.as_slice())
+        .bind([1u8; 32].as_slice())
+        .bind([3u8; 16].as_slice())
+        .execute(&mut conn)
+        .await
+        .expect("record");
+    }
+    let announced =
+        pubky_switch::service::announced_limits(&pubky_switch::limits::Limits::default());
+    db.store().migrate(&announced).await.expect("upgrade");
+    let texts: Vec<String> = sqlx::query_scalar(
+        "SELECT key_text FROM shared_records WHERE account_id = 'old' ORDER BY key_text",
+    )
+    .fetch_all(&mut conn)
+    .await
+    .expect("rows");
+    let mut expected: Vec<String> = keys
+        .iter()
+        .map(|key| pubky_switch_core::enc::b64(key))
+        .collect();
+    expected.sort();
+    assert_eq!(texts, expected);
+    assert_eq!(texts[0].as_bytes()[0], b'-', "'-' sorts first in ASCII");
+    drop(conn);
+    db.drop_database().await.expect("drop");
+}
