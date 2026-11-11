@@ -370,6 +370,13 @@ fn receive_key_put(
     })
 }
 
+/// Whether `app`'s full-bundle request is in force for dropping its parts, its cursor at
+/// `cursor` (Switch wire 6.2): from the `POST /keys` until the cursor has passed the part
+/// that completed it.
+fn in_force(app: &super::state::HeldApp, cursor: u64) -> bool {
+    app.full_requested.is_some() || app.full_completed.is_some_and(|done| cursor < done)
+}
+
 /// `key_bundle.put`, by [`check_key_bundle_put`], for an app the newest `identity.json` lists,
 /// whatever its certificate's expiry. A pending full-bundle request ends once the stored
 /// parts cover every data epoch from 1 to the current one (Switch wire 6.2).
@@ -410,21 +417,14 @@ fn key_bundle_put(
                     seq: part.seq,
                 })
                 .collect();
-            // Unless a full bundle is requested, the parts the target's cursor has passed and
-            // that its `keys_through` covers go: it holds their keys (Switch wire 6.2). The
-            // request is judged pending as it was before this part, so a request this part
-            // completes still keeps them at this put: the app asked for them and hasn't read
-            // the parts that complete it. The part just stored is past every cursor, so it
-            // stays.
-            let full = state
-                .apps
-                .get(&target)
-                .is_some_and(|app| app.full_requested.is_some());
-            if covers(&spans, epoch)
-                && let Some(app) = state.apps.get_mut(&target)
-            {
-                app.full_requested = None;
-            }
+            // Unless a full-bundle request is in force, the parts the target's cursor has
+            // passed and that its `keys_through` covers go: it holds their keys (Switch wire
+            // 6.2). A request is in force from the `POST /keys` until the target's cursor has
+            // passed the part that completed it: until then the app hasn't read the parts it
+            // asked for, which may include ones it passed before a restore. It is judged as it
+            // was before this part, so a request this part completes keeps them at this put,
+            // and this part's `seq` keeps it in force after. The part just stored is past
+            // every cursor, so it stays.
             let generation = state.generation;
             let cursor = state
                 .apps
@@ -432,6 +432,17 @@ fn key_bundle_put(
                 .and_then(|app| app.cursor)
                 .filter(|cursor| cursor.generation == generation)
                 .map_or(0, |cursor| cursor.seq);
+            let full = state
+                .apps
+                .get(&target)
+                .is_some_and(|app| in_force(app, cursor));
+            if covers(&spans, epoch)
+                && let Some(app) = state.apps.get_mut(&target)
+                && app.full_requested.is_some()
+            {
+                app.full_requested = None;
+                app.full_completed = Some(seq);
+            }
             let through = keys_through(state.listed_epochs.get(&target).copied(), &spans, cursor);
             let gone = parts_to_drop(&spans, cursor, through, full);
             // The parts that go raised keys_through; it keeps that height without them, so

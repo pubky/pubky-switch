@@ -433,6 +433,7 @@ pub(crate) fn held_app(app: &StoredApp, identity: &[u8; 32]) -> Result<HeldApp, 
         cursor: app.cursor,
         reachable_since: app.reachable_since,
         full_requested: app.full_requested_ms,
+        full_completed: app.full_completed_seq,
     })
 }
 
@@ -866,6 +867,7 @@ fn stored_app(app_id: [u8; 16], app: &HeldApp) -> StoredApp {
         cursor: app.cursor,
         reachable_since: app.reachable_since,
         full_requested_ms: app.full_requested,
+        full_completed_seq: app.full_completed,
     }
 }
 
