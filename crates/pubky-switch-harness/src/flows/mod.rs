@@ -8,6 +8,7 @@
 //! [`FLOWS`] names every flow, and [`flow_of`] says which flow sends each call the service
 //! routes.
 
+mod claim;
 mod enrollment;
 mod join;
 mod lists;
@@ -18,6 +19,7 @@ use std::pin::Pin;
 
 use pubky_switch::http::route::Call;
 
+pub use claim::claim;
 pub use enrollment::enrollment;
 pub use join::join;
 pub use lists::lists_without_read;
@@ -43,6 +45,7 @@ pub const FLOWS: &[(&str, Flow)] = &[
     ("lists without read", |world| {
         Box::pin(lists_without_read(world))
     }),
+    ("claim", |world| Box::pin(claim(world))),
 ];
 
 /// The flow that sends `call` to the service; `None` for a call the service doesn't serve
@@ -53,9 +56,10 @@ pub fn flow_of(call: &Call) -> Option<&'static str> {
         Call::Enroll | Call::PutIdentity | Call::GetIdentity | Call::GetApps => Some("enrollment"),
         Call::Ops | Call::Feed | Call::GetKeys(_) | Call::GetAllow => Some("join"),
         Call::Append | Call::PutPeers | Call::Directory => Some("messaging"),
-        // Served, and waiting for their flows: a claim, a renewal with its full-bundle
-        // request, a revocation and a departure.
-        Call::GetClaim(_) | Call::RequestKeys(_) | Call::Revoke(_) | Call::Leave(_) => None,
+        Call::GetClaim(_) => Some("claim"),
+        // Served, and waiting for their flows: a renewal with its full-bundle request, a
+        // revocation and a departure.
+        Call::RequestKeys(_) | Call::Revoke(_) | Call::Leave(_) => None,
         // Not served yet.
         Call::PostConnect
         | Call::GetConnect

@@ -114,6 +114,13 @@ const UNREAD_LIST_ITEM: &str = "The first item is the pad's own `allow.put`, the
     operation as a stub; the scripted switch applies no visibility rule and shows every chain \
     item in full. The app does the same with both: it checks the stub and moves on.";
 
+/// The entries of a finished claim in the feed.
+const COMPACTED_CLAIM: &str = "The `done` entry settles the claim with every attempt `done` or \
+    `failed`, so the service compacts the claim at once and its entries lose their documents: \
+    the feed shows the `done` entry as a stub, also to an app with `claims.read`. The scripted \
+    switch compacts nothing and shows the entry in full, so the app raises a `ClaimChanged` \
+    event from its feed there and none at the service.";
+
 /// Every accepted difference: those of the two switches as a whole, then by flow.
 pub static ALLOWED: &[Allowed] = &[
     Allowed {
@@ -198,6 +205,60 @@ pub static ALLOWED: &[Allowed] = &[
         scripted: "*",
         reason: UNREAD_LIST_ITEM,
         reference: "Switch wire 7.5: a stub carries `seq` and `stub`, no `proof`",
+    },
+    Allowed {
+        flow: "claim",
+        label: "{alice/wallet} GET /v1/{alice}/claims/*",
+        fact: "body.current",
+        service: NOTHING,
+        scripted: "null",
+        reason: NULL_CURRENT,
+        reference: "Switch wire, Conventions, \"Absent and null\"; Switch wire 7.1, error bodies",
+    },
+    Allowed {
+        flow: "claim",
+        label: "{alice/wallet} GET /v1/{alice}/feed",
+        fact: "body.items[0].type",
+        service: "text stub",
+        scripted: "text chain",
+        reason: COMPACTED_CLAIM,
+        reference: "Switch wire 6.8 \"Tombstones\"; 7.5, the entries of compacted claims",
+    },
+    Allowed {
+        flow: "claim",
+        label: "{alice/wallet} GET /v1/{alice}/feed",
+        fact: "body.items[0].item*",
+        service: NOTHING,
+        scripted: "*",
+        reason: COMPACTED_CLAIM,
+        reference: "Switch wire 7.5: a stub carries `seq` and `stub`, no `item_type` or `item`",
+    },
+    Allowed {
+        flow: "claim",
+        label: "{alice/wallet} GET /v1/{alice}/feed",
+        fact: "body.items[0].proof*",
+        service: NOTHING,
+        scripted: "*",
+        reason: COMPACTED_CLAIM,
+        reference: "Switch wire 7.5: a stub carries `seq` and `stub`, no `proof`",
+    },
+    Allowed {
+        flow: "claim",
+        label: "outcome received after done",
+        fact: "outcome.events",
+        service: "array of 0",
+        scripted: "array of 1",
+        reason: COMPACTED_CLAIM,
+        reference: "Switch wire 6.8 \"Tombstones\"; 7.5",
+    },
+    Allowed {
+        flow: "claim",
+        label: "outcome received after done",
+        fact: "outcome.events[0]",
+        service: NOTHING,
+        scripted: "text ClaimChanged WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo",
+        reason: COMPACTED_CLAIM,
+        reference: "Switch wire 6.8 \"Tombstones\"; 7.5",
     },
 ];
 
