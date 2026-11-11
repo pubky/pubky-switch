@@ -214,6 +214,26 @@ impl TestDatabase {
         Ok(seq)
     }
 
+    /// Make the next read after the lock on this database wait, once its request has
+    /// committed, until the pause's `resume` is notified: for a test that writes in between.
+    ///
+    /// # Panics
+    ///
+    /// When another test thread poisoned the slot. For tests only.
+    pub fn pause_next_snapshot_read(&self) -> SnapshotPause {
+        let pause = SnapshotPause::default();
+        #[allow(clippy::expect_used)]
+        let mut slot = self.store.snapshot_pause.lock().expect("pause slot");
+        *slot = Some(pause.clone());
+        pause
+    }
+
+    /// How many reads after the lock of account `id` hold or wait for its turn
+    /// ([`Store::begin_reading`]). For tests only.
+    pub fn queued_reads(&self, id: &str) -> usize {
+        super::snapshot::queued(&self.store.reading, id)
+    }
+
     /// Close the store and drop the database.
     pub async fn drop_database(mut self) -> Result<(), StoreError> {
         self.store.close().await;
@@ -225,13 +245,33 @@ impl TestDatabase {
     }
 }
 
+/// Where the next read after the lock waits ([`TestDatabase::pause_next_snapshot_read`]):
+/// it notifies `reached` once its request has committed, and reads once `resume` is
+/// notified.
+#[derive(Clone, Debug, Default)]
+pub struct SnapshotPause {
+    /// Notified when the read is about to start, its request committed.
+    pub reached: std::sync::Arc<tokio::sync::Notify>,
+    /// Notify it to let the read go on.
+    pub resume: std::sync::Arc<tokio::sync::Notify>,
+}
+
 /// Create a test database, or `None` when the test is to be skipped.
 ///
 /// # Panics
 ///
 /// When the database can't be made, or is required and not configured. For tests only.
 pub async fn test_database() -> Option<TestDatabase> {
-    match TestDatabase::create(&DatabaseConfig::default()).await {
+    test_database_with(&DatabaseConfig::default()).await
+}
+
+/// [`test_database`] with `config`'s pool settings.
+///
+/// # Panics
+///
+/// As [`test_database`]. For tests only.
+pub async fn test_database_with(config: &DatabaseConfig) -> Option<TestDatabase> {
+    match TestDatabase::create(config).await {
         Ok(db) => Some(db),
         Err(TestDatabaseError::Skipped) => {
             eprintln!("skipped: set {TEST_DATABASE_URL_ENV} to run this test against PostgreSQL");

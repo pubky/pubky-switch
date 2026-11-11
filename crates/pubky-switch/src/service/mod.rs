@@ -127,6 +127,8 @@ enum Deferred {
     Claim(claims::ClaimRead),
     /// A feed page, after its long-poll.
     Feed(Box<feed::FeedRead>),
+    /// `GET /allow`'s lists, from the snapshot of the state under the lock.
+    Allow(allow::AllowRead),
 }
 
 impl Answer {
@@ -443,7 +445,21 @@ impl Service {
             let account_key = pubky_switch_core::enc::pubky_key(&account).unwrap_or([0; 32]);
             peers::verify_delivery(&request.body, &account_key, other.as_ref())
         });
-        let txn = match self.store.begin(&account).await {
+        // The reads that run after the lock on its snapshot take their account's turn and
+        // their reader first, so the lock is never held waiting for one. Only an own app's
+        // request whose signature verified takes them, one place per app: the signer's is
+        // refused under the lock without a read, and an app of another identity's was
+        // refused above. Whether the app is current and may read is judged under the lock.
+        let reading_app = verified
+            .as_ref()
+            .filter(|_| matches!(call, Call::GetAllow))
+            .map(batch::VerifiedApp::app_id);
+        let begun = if let Some(app) = reading_app {
+            self.store.begin_reading(&account, app).await
+        } else {
+            self.store.begin(&account).await
+        };
+        let txn = match begun {
             Ok(Some(txn)) => txn,
             // Erased between the lookup and the lock.
             Ok(None) => {
@@ -665,6 +681,13 @@ impl Service {
             let error = ApiError::unavailable("7.6: a temporary failure");
             return sign_answer(&signer, signature, committed_ms, Answer::error(&error));
         }
+        // A read after the lock takes this transaction's snapshot now, outside the endpoint's
+        // savepoint, which can't export one.
+        if let Err(failure) = txn.prepare_snapshot().await {
+            tracing::error!(%failure, "a snapshot for a read after the lock");
+            let error = ApiError::unavailable("7.6: a temporary failure");
+            return sign_answer(&signer, signature, committed_ms, Answer::error(&error));
+        }
         // What the endpoint writes is undone if it is refused, whatever step refuses it: a
         // refusal commits the stamped time and nothing else, so no later request can build
         // on a write it was never answered for (step 10).
@@ -739,6 +762,10 @@ impl Service {
                 let mut answer = answer;
                 match answer.deferred.take() {
                     Some(Deferred::Claim(read)) => match self.claim_body(&read).await {
+                        Ok(body) => answer.body = body,
+                        Err(error) => answer = Answer::error(&error).with_head(fallback_head),
+                    },
+                    Some(Deferred::Allow(read)) => match Self::allow_body(read).await {
                         Ok(body) => answer.body = body,
                         Err(error) => answer = Answer::error(&error).with_head(fallback_head),
                     },

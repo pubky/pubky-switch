@@ -30,6 +30,7 @@ mod identity;
 mod inbox;
 mod ops;
 mod peers;
+mod snapshot;
 #[cfg(any(test, feature = "test-util"))]
 pub mod testing;
 
@@ -54,6 +55,7 @@ pub use ops::{
     StoredRecord,
 };
 pub use peers::{HeldPeer, PeerFloor};
+pub use snapshot::SnapshotRead;
 
 use crate::admin::{CheckFuture, ReadinessCheck};
 
@@ -79,6 +81,10 @@ pub struct DatabaseConfig {
     pub lock_timeout_ms: u64,
     /// Apply pending schema migrations at start.
     pub migrate_on_start: bool,
+    /// Most reads at once that run after the account's lock on a snapshot of the state
+    /// under it (`GET /allow`), each on a connection of its own, on top
+    /// of `max_connections`. A request waits for one before it takes the lock.
+    pub snapshot_readers: u32,
     /// How long the service keeps trying to reach the database at start, while it refuses
     /// connections or is still starting up, before it gives up and exits.
     pub connect_retry_ms: u64,
@@ -92,6 +98,7 @@ impl Default for DatabaseConfig {
             acquire_timeout_ms: 5_000,
             lock_timeout_ms: 10_000,
             migrate_on_start: true,
+            snapshot_readers: 4,
             connect_retry_ms: 30_000,
         }
     }
@@ -105,6 +112,7 @@ impl std::fmt::Debug for DatabaseConfig {
             .field("acquire_timeout_ms", &self.acquire_timeout_ms)
             .field("lock_timeout_ms", &self.lock_timeout_ms)
             .field("migrate_on_start", &self.migrate_on_start)
+            .field("snapshot_readers", &self.snapshot_readers)
             .field("connect_retry_ms", &self.connect_retry_ms)
             .finish()
     }
@@ -132,6 +140,9 @@ impl DatabaseConfig {
         }
         if self.lock_timeout_ms == 0 {
             return fail("lock_timeout_ms", "must be at least 1");
+        }
+        if self.snapshot_readers == 0 {
+            return fail("snapshot_readers", "must be at least 1");
         }
         if let Some(url) = &self.url
             && (!(url.starts_with("postgres://") || url.starts_with("postgresql://"))
@@ -248,7 +259,15 @@ impl DurabilitySettings {
 #[derive(Clone, Debug)]
 pub struct Store {
     pool: PgPool,
+    /// The connections reads after the lock use, apart from `pool`, so a request holding
+    /// an account's lock never waits for one (`snapshot_readers`).
+    readers: PgPool,
+    /// The accounts with a read after the lock in flight: one each.
+    reading: snapshot::Reading,
     lock_timeout_ms: u64,
+    /// For tests: the next read after the lock waits here ([`testing::SnapshotPause`]).
+    #[cfg(any(test, feature = "test-util"))]
+    pub(crate) snapshot_pause: std::sync::Arc<std::sync::Mutex<Option<testing::SnapshotPause>>>,
 }
 
 impl Store {
@@ -285,11 +304,20 @@ impl Store {
                     })
                 })
             })
-            .connect_with(options)
+            .connect_with(options.clone())
             .await?;
+        // Read only, so their commits need no durability check.
+        let readers = PgPoolOptions::new()
+            .max_connections(config.snapshot_readers)
+            .acquire_timeout(Duration::from_millis(config.acquire_timeout_ms))
+            .connect_lazy_with(options);
         Ok(Self {
             pool,
+            readers,
+            reading: snapshot::Reading::default(),
             lock_timeout_ms: config.lock_timeout_ms,
+            #[cfg(any(test, feature = "test-util"))]
+            snapshot_pause: std::sync::Arc::default(),
         })
     }
 
@@ -418,6 +446,44 @@ impl Store {
         AccountTxn::lock(tx, id).await
     }
 
+    /// [`Store::begin`], with a transaction on the reader pool begun first, before the lock
+    /// is waited for, so the request waits for a free reader without holding the lock;
+    /// [`AccountTxn::snapshot_read`] hands it the locked transaction's snapshot.
+    ///
+    /// One such read of an account runs at a time in this process; the next ones wait for
+    /// their turn in order, before they take a reader and holding no connection, at most
+    /// `lock_timeout_ms` ([`StoreError::LockTimeout`] after it, and at once past 8
+    /// waiting). So the readers every account shares can't all be held by one account's
+    /// reads. The read is `app`'s, an own app whose request signature verified with the key
+    /// the account holds for it; whether it may make the read is judged under the lock.
+    /// Each app holds at most one place in its account's queue: a second read of the same
+    /// app while its first holds or waits for one is refused at once, so no one app, however
+    /// many requests it sends, can keep the other apps' reads waiting past one place.
+    pub async fn begin_reading(
+        &self,
+        id: &str,
+        app: [u8; 16],
+    ) -> Result<Option<AccountTxn>, StoreError> {
+        let wait = Duration::from_millis(self.lock_timeout_ms);
+        let turn = snapshot::ReadTurn::wait(&self.reading, id, app, wait).await?;
+        let reader = self.readers.begin().await.map_err(StoreError::from_db)?;
+        let Some(mut txn) = self.begin(id).await? else {
+            return Ok(None);
+        };
+        txn.reader = Some(reader);
+        txn.read_turn = Some(turn);
+        txn.import_timeout_ms = self.lock_timeout_ms;
+        #[cfg(any(test, feature = "test-util"))]
+        {
+            txn.snapshot_pause = self
+                .snapshot_pause
+                .lock()
+                .map_err(|_| StoreError::Corrupt("a test pause"))?
+                .take();
+        }
+        Ok(Some(txn))
+    }
+
     /// The connection pool, for the store's own modules.
     pub(crate) fn pool(&self) -> &PgPool {
         &self.pool
@@ -426,6 +492,7 @@ impl Store {
     /// Close every connection.
     pub async fn close(&self) {
         self.pool.close().await;
+        self.readers.close().await;
     }
 }
 
