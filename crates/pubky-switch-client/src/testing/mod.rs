@@ -366,6 +366,45 @@ mod tests {
         assert!(!changed.lock().staged);
     }
 
+    #[test]
+    fn test_scripted_switch_directory_lists_apps_in_the_documents_order() {
+        // Switch wire 7.4.10: the current apps, in the order the newest identity.json lists
+        // them, not by App ID.
+        let seeds = Seeds::default();
+        let signer = TestSigner::new(
+            TestIdentity::new(&seeds, "alice"),
+            Arc::new(TestClock::new(START_MS)),
+            Arc::new(TestHomeserver::new()),
+            ProtocolSpec::default(),
+        );
+        let mut keys: Vec<_> = ["one", "two", "three"]
+            .iter()
+            .map(|name| signer.identity().app_keys(name))
+            .collect();
+        // Registered, and so listed, in descending App ID order.
+        keys.sort_by_key(|keys| std::cmp::Reverse(keys.app_id_bytes()));
+        for app in &keys {
+            signer.register_app(app, &AppSpec::new(&["notes"])).unwrap();
+        }
+        let path = format!("/v1/{}/directory", signer.identity().key().id());
+        let answer = signer
+            .switch()
+            .handle(&request(SWITCH_ORIGIN, &path))
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&answer.body).unwrap();
+        let shown: Vec<&str> = body["apps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|app| app["app_id"].as_str())
+            .collect();
+        let listed: Vec<String> = keys
+            .iter()
+            .map(|keys| pubky_switch_core::enc::zbase32_encode(&keys.app_id_bytes()))
+            .collect();
+        assert_eq!(shown, listed);
+    }
+
     fn request(origin: &str, path: &str) -> Request {
         Request {
             method: "GET".into(),

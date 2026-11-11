@@ -1823,14 +1823,21 @@ impl Inner {
         }
     }
 
+    /// `GET /directory` (Switch wire 7.4.10): the current apps holding a record, in the
+    /// order the newest `identity.json` lists them, as the service lists them. Current, not
+    /// served: an app whose certificate has expired stays (Switch spec 3.4).
     fn directory(&self) -> Answer {
-        let apps: Vec<Value> = self
-            .apps
-            .iter()
-            .filter(|(_, app)| !app.departed && app.record.is_some())
-            .map(|(id, app)| {
-                json!({ "app_id": zbase32_encode(id), "record": app.record,
-                        "receive_key": app.receive_key })
+        let listed = self.doc.iter().flat_map(|doc| &doc.body().apps);
+        let apps: Vec<Value> = listed
+            .filter(|entry| {
+                !self.kept_app_ids.contains(&entry.app_id)
+                    && self.app_current_by(&self.apps, &entry.app_id, false)
+            })
+            .filter_map(|entry| {
+                let app = self.apps.get(&entry.app_id)?;
+                Some(json!({ "app_id": zbase32_encode(&entry.app_id),
+                             "record": app.record.as_ref()?,
+                             "receive_key": app.receive_key }))
             })
             .collect();
         (
