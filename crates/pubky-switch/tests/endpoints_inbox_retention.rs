@@ -1368,3 +1368,44 @@ async fn test_inbox_an_earlier_entry_with_no_current_target_is_converted_once_fo
     assert_eq!(count(&replay, "unreadable").await, 1);
     replay.db.drop_database().await.expect("drop");
 }
+
+#[tokio::test]
+async fn test_inbox_unreadable_items_count_for_no_senders_share() {
+    // A sender's share of one entry exactly.
+    let Some(replay) = replay_with(Limits {
+        quota_bytes: 4 * entry_bytes(),
+        sender_share_percent: 25,
+        ..Limits::default()
+    })
+    .await
+    else {
+        return;
+    };
+    with_bob(&replay).await;
+    register_executor(&replay).await;
+    append_to(&replay, &["executor"], 1).await;
+    let executor = app(&vectors("keys.json"), "executor")["app_id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    let answer = replay
+        .service
+        .handle(signer_request(
+            "POST",
+            &format!("/v1/{}/apps/{executor}/revoke", alice_id()),
+            Vec::new(),
+            ms(&at()),
+        ))
+        .await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    assert_eq!(count(&replay, "unreadable").await, 1);
+    // bob's unreadable item counts against the inbox quota but not his share: his next
+    // entry still fits it.
+    append_to(&replay, &["wallet"], 2).await;
+    replay.db.drop_database().await.expect("drop");
+}
