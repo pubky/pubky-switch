@@ -294,7 +294,11 @@ async fn call(client: &SwitchClient, r: &Value) -> Outcome {
         ("GET", chunk) if call.contains("/export/chunks/") => {
             outcome(client.export_chunk(chunk).await)
         }
-        ("POST", "erase") => outcome(client.erase().await),
+        ("POST", "erase") => {
+            // The `identity.json` the erasure follows, when it names one (Switch wire 7.4.16).
+            let named = pubky_switch_core::http::parse_erase_body(&body).unwrap();
+            outcome(client.erase(named.identity_hash).await)
+        }
         ("PUT", "peers") => {
             let doc: SignedDoc = serde_json::from_slice(&body).unwrap();
             outcome(client.put_peers(&doc, None).await)
@@ -321,12 +325,6 @@ async fn test_vectors_http_requests_reproduced_by_the_typed_calls() {
     let responses = arr(&v, "responses");
     for r in arr(&v, "requests") {
         let name = st(r, "name");
-        // An erasure naming the `identity.json` it follows (Switch wire 7.4.16): the client
-        // has no typed call that sends the hash yet.
-        let body: Value = serde_json::from_slice(&b64(st(r, "body_b64"))).unwrap_or(Value::Null);
-        if st(r, "path").ends_with("/erase") && body.get("identity_hash").is_some() {
-            continue;
-        }
         let signature = st(r, "signature");
         // The answers to this request, in the file's order.
         let answers: Vec<&Value> = responses

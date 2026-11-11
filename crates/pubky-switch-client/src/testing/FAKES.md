@@ -199,9 +199,11 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
 - **`Fault::LeaveOut`** scripts a faulty service whose answer to an own app or the signer
   leaves out a top-level member, such as a feed page's `items`.
 - **Erasure** (Switch wire 7.4.16), in `switch/signer.rs`: `POST /erase` checks the body names
-  the account's service key (`409 conflict` for another) and refuses during a move (`409
-  conflict`): at any frozen account, since this switch keeps no export to tell whether it was
-  fetched, and at a staged one holding an import (not one staged for a key change in place).
+  the account's service key (`409 conflict` for another) and, when it names one, the hash of
+  the `identity.json` this switch holds (`409 conflict` for another, or for none held), and
+  refuses during a move (`409 conflict`): at any frozen account, since this switch keeps no
+  export to tell whether it was fetched, and at a staged one holding an import (not one
+  staged for a key change in place).
   An app's call is `403 permission_missing`. Then every call, the retry included, gets the
   `404` signed with a fixed operator key. `erased` tells a test it happened; app tests set the
   flag directly. The service keeps no freeze or import state yet, so it refuses no erasure for
