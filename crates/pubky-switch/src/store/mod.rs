@@ -32,6 +32,7 @@ mod keying;
 mod ops;
 mod peers;
 mod records;
+mod recovery;
 mod snapshot;
 #[cfg(any(test, feature = "test-util"))]
 pub mod testing;
@@ -58,6 +59,7 @@ pub use ops::{
     StoredInvite, StoredListEntry, StoredRecord,
 };
 pub use peers::{HeldPeer, PeerFloor};
+pub use recovery::{RECOVERY_KEEPS, Recovery, recovery_clears};
 pub use snapshot::SnapshotRead;
 
 use crate::admin::{CheckFuture, ReadinessCheck};
@@ -74,6 +76,9 @@ pub struct ErasedKey {
     pub account: String,
     /// When the account was erased, in its service time.
     pub erased_at_ms: u64,
+    /// The key was retired by a generation change at an account that lives on, not erased
+    /// with it: its deletion records no erasure (Switch wire 3.3).
+    pub retired: bool,
 }
 
 /// The schema migrations, applied in order.
@@ -374,7 +379,8 @@ impl Store {
     /// The key store entries erasures still owe deleting, oldest first (Switch wire 7.4.16).
     pub async fn erased_keys(&self) -> Result<Vec<ErasedKey>, StoreError> {
         let rows = sqlx::query(
-            "SELECT key_id, account_id, erased_at_ms FROM erased_keys ORDER BY erased_at_ms, key_id",
+            "SELECT key_id, account_id, erased_at_ms, reason FROM erased_keys \
+             ORDER BY erased_at_ms, key_id",
         )
         .fetch_all(&self.pool)
         .await
@@ -387,6 +393,7 @@ impl Store {
                         .map_err(|_| StoreError::Corrupt("erased_keys.key_id"))?,
                     account: row.try_get("account_id")?,
                     erased_at_ms: from_db(row.try_get("erased_at_ms")?, "erased_at_ms")?,
+                    retired: row.try_get::<String, _>("reason")? == "retired",
                 })
             })
             .collect()

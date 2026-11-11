@@ -221,6 +221,21 @@ pub(crate) fn statuses(
     Ok(statuses)
 }
 
+/// The `recovery` member (Switch wire 7.4.12): `{ "recovery_from", "declared_at",
+/// "admission_staged" }` while the account serves the generation a recovery began, else
+/// `null`. Admission isn't staged by this service, so `admission_staged` is `false`.
+fn recovery_member(recovery: Option<&crate::store::Recovery>) -> Vec<u8> {
+    match recovery {
+        Some(recovery) => format!(
+            r#"{{"recovery_from":{},"declared_at":"{}","admission_staged":false}}"#,
+            recovery.recovery_from,
+            pubky_switch_core::time::rfc3339(recovery.declared_at_ms),
+        )
+        .into_bytes(),
+        None => b"null".to_vec(),
+    }
+}
+
 impl Service {
     /// `GET /v1/{id}/apps`, from the signer (Switch wire 7.4.12).
     pub(super) async fn get_apps(
@@ -247,6 +262,7 @@ impl Service {
         let apps = statuses(head.identity_key, head.generation, &view, held, time_ms)
             .map_err(|e| store_error(&e))?;
         let recovery_from = held.and_then(|doc| doc.body().recovery_from);
+        let recovery = txn.recovery().await.map_err(|e| store_error(&e))?;
         let proof_generations = needed_generations(
             &view.record_generations,
             &view.claim_entry_generations,
@@ -258,8 +274,7 @@ impl Service {
                 "identity",
                 json_of(&held.map(IdentityDoc::signed)).map_err(|e| store_error(&e))?,
             ),
-            // Recovery comes with provider changes.
-            ("recovery", b"null".to_vec()),
+            ("recovery", recovery_member(recovery.as_ref())),
         ];
         // Absent when no kept proof names a generation (Switch wire 7.4.12).
         if !proof_generations.is_empty() {

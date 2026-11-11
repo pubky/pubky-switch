@@ -94,10 +94,12 @@ impl Service {
         // keyed section.
         if let Err(failure) = txn.exclude_signers().await {
             tracing::error!(%failure, "excluding an erased account's signers");
+            let key = txn.head().service_key.clone();
             return self
                 .sign_after_failure(
                     txn,
                     signer,
+                    &key,
                     signature,
                     committed_ms,
                     Answer::error(&unavailable()),
@@ -156,7 +158,8 @@ impl Service {
     }
 
     /// Delete every key an erasure still owes deleting, recording each erasure in the key
-    /// store's ledger first (Switch wire 7.4.16, spec 6.5), and drop what is done. A failure
+    /// store's ledger first (Switch wire 7.4.16, spec 6.5), and every key a generation change
+    /// retired, which records none (wire 3.3), and drop what is done. A failure
     /// leaves the key owed for the next sweep: at the next erasure, and at start. Run at
     /// start by the service's binary.
     ///
@@ -172,10 +175,11 @@ impl Service {
         };
         let mut left = Vec::new();
         for erased in owed {
-            if let Err(failure) = self
-                .keys
-                .record_erasure(&erased.account, erased.erased_at_ms)
-                .await
+            if !erased.retired
+                && let Err(failure) = self
+                    .keys
+                    .record_erasure(&erased.account, erased.erased_at_ms)
+                    .await
             {
                 tracing::error!(%failure, "recording an erasure");
                 left.push(erased.account);
