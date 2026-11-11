@@ -473,6 +473,19 @@ pub(crate) struct Evidence<'a> {
     pub(crate) view_version: Option<RecordVersion>,
 }
 
+/// The writer's certificates whose key verifies a write's operation (Switch wire 6.2
+/// "Accepting a write" step 1), with the operation they verify.
+struct WriterCerts {
+    /// The record view's `cert`: the certificate the service checked the write against
+    /// (Switch wire 7.4.9).
+    view: Option<AppCert>,
+    /// The ones the app knows: its own, its pending renewal, and those kept from the
+    /// directory and the feed.
+    known: Vec<AppCert>,
+    /// The operation, verified.
+    op: SignedOp,
+}
+
 /// A write that passed the checks.
 struct Accepted {
     key: [u8; 32],
@@ -887,25 +900,31 @@ impl App {
         }
         // The member of the collection's policy family the write names.
         let collection = Collection::new(&collection.name, put.policy.clone());
-        // Step 1: the writer's certificate and the signature.
-        let Some((cert, op)) = self.writer_cert(evidence, &writer).await? else {
+        // Step 1: the writer's certificates and the signature.
+        let Some(certs) = self.writer_certs(evidence, &writer).await? else {
             return Ok(Err(Refused::Ignored));
         };
         // Step 2: what dates the write and gives its version.
-        let item_hash = op.item_hash()?;
-        let (time, proven) = match self.date(evidence, &op, item_hash) {
+        let item_hash = certs.op.item_hash()?;
+        let (time, proven) = match self.date(evidence, &certs.op, item_hash) {
             Ok(dated) => dated,
             Err(reason) => return Ok(Err(Refused::Misbehaviour(reason))),
         };
-        // Step 4: standing at the write's time.
+        // Step 4: standing at the write's time, of the certificate the write was made under.
         let mut doubtful = false;
+        let write_scopes = &put.policy.write_scopes;
+        let Some(mut cert) = self.write_cert(&certs, time, write_scopes) else {
+            return Ok(Err(Refused::Ignored));
+        };
         let mut standing = self.state.own_doc.standing(&writer, &cert.hash());
         if standing == Standing::None
             && matches!(
                 self.refresh_identity().await,
                 Ok(IdentityRefresh::Newer { .. })
             )
+            && let Some(again) = self.write_cert(&certs, time, write_scopes)
         {
+            cert = again;
             standing = self.state.own_doc.standing(&writer, &cert.hash());
         }
         match standing {
@@ -1007,63 +1026,101 @@ impl App {
             .map(|c| Collection::new(&c.name, put.policy.clone()))
     }
 
-    /// The writer's certificate whose key verifies the operation: the record view's, the
-    /// app's own, or one kept from the directory and the feed; the own directory is read
-    /// again once for a writer the app doesn't know.
-    async fn writer_cert(
+    /// The writer's certificates whose key verifies the operation: the record view's, and
+    /// those the app knows, its own and the ones kept from the directory and the feed; the
+    /// own directory is read again once for a writer the app doesn't know.
+    async fn writer_certs(
         &mut self,
         evidence: &Evidence<'_>,
         writer: &[u8; 16],
-    ) -> Result<Option<(AppCert, SignedOp)>, AppError> {
+    ) -> Result<Option<WriterCerts>, AppError> {
         let identity = self.state.meta.identity;
-        let verify = |cert: &AppCert| -> Option<SignedOp> {
+        let verify = |cert: AppCert| -> Option<(AppCert, SignedOp)> {
             if cert.app_id() != *writer {
                 return None;
             }
-            SignedOp::verify(evidence.op, &cert.signing_key(), &identity, Some(writer)).ok()
+            SignedOp::verify(evidence.op, &cert.signing_key(), &identity, Some(writer))
+                .ok()
+                .map(|op| (cert, op))
         };
-        let mut candidates: Vec<AppCert> = Vec::new();
-        if let Some(signed) = evidence.cert
-            && let Ok(cert) = AppCert::verify(signed, &identity)
-        {
-            candidates.push(cert);
-        }
-        candidates.push(self.state.cert.clone());
+        let view = evidence
+            .cert
+            .and_then(|signed| AppCert::verify(signed, &identity).ok())
+            .and_then(verify);
+        let mut candidates: Vec<AppCert> = vec![self.state.cert.clone()];
         candidates.extend(self.state.renewal.iter().cloned());
         candidates.extend(self.kept_certs(writer).await?);
-        if let Some(found) = self.best_cert(&candidates, &verify) {
-            return Ok(Some(found));
+        let mut known: Vec<(AppCert, SignedOp)> =
+            candidates.into_iter().filter_map(verify).collect();
+        if view.is_none() && known.is_empty() {
+            if self.refresh_own_apps().await.is_err() {
+                return Ok(None);
+            }
+            known = self
+                .kept_certs(writer)
+                .await?
+                .into_iter()
+                .filter_map(verify)
+                .collect();
         }
-        if self.refresh_own_apps().await.is_ok() {
-            let kept = self.kept_certs(writer).await?;
-            return Ok(self.best_cert(&kept, &verify));
-        }
-        Ok(None)
+        let Some(op) = view.as_ref().or(known.first()).map(|(_, op)| op.clone()) else {
+            return Ok(None);
+        };
+        Ok(Some(WriterCerts {
+            view: view.map(|(cert, _)| cert),
+            known: known.into_iter().map(|(cert, _)| cert).collect(),
+            op,
+        }))
     }
 
-    /// Of the certificates whose key verifies the operation, the one with the best standing.
-    fn best_cert(
+    /// The certificate a write is judged with (Switch wire 6.2 "Accepting a write" step 4,
+    /// 7.4.9). A record view's `cert` is the one the service checked the write against, and
+    /// the write is judged with it, whatever certificate the writer holds now: a renewal
+    /// later doesn't change which certificate a write was made under. Without one (a write
+    /// from the feed), the earliest known certificate in force at the write's time, one that
+    /// holds a write scope first; only for a write nothing dates, or that no known
+    /// certificate was in force for, the one in the best standing now.
+    fn write_cert(
         &self,
-        candidates: &[AppCert],
-        verify: &dyn Fn(&AppCert) -> Option<SignedOp>,
-    ) -> Option<(AppCert, SignedOp)> {
-        let rank = |cert: &AppCert| match self.state.own_doc.standing(&cert.app_id(), &cert.hash())
-        {
+        certs: &WriterCerts,
+        time: Option<u64>,
+        write_scopes: &[String],
+    ) -> Option<AppCert> {
+        if let Some(cert) = &certs.view {
+            return Some(cert.clone());
+        }
+        let doc = &self.state.own_doc;
+        if let Some(time) = time {
+            let mut in_force: Vec<&AppCert> = certs
+                .known
+                .iter()
+                .filter(|cert| {
+                    !cert.expired_at(time)
+                        && match doc.standing(&cert.app_id(), &cert.hash()) {
+                            Standing::Listed | Standing::RenewedOpen => true,
+                            Standing::RenewedClosed { until } => time < until,
+                            Standing::Removed { distrust_from } => time <= distrust_from,
+                            Standing::None => false,
+                        }
+                })
+                .collect();
+            in_force.sort_by_key(|cert| cert.issued_at());
+            let found = in_force
+                .iter()
+                .find(|cert| write_scopes.iter().any(|scope| cert.holds_scope(scope)))
+                .or(in_force.first());
+            if let Some(cert) = found {
+                return Some((*cert).clone());
+            }
+        }
+        let rank = |cert: &&AppCert| match doc.standing(&cert.app_id(), &cert.hash()) {
             Standing::Listed => 0,
             Standing::RenewedOpen => 1,
             Standing::RenewedClosed { .. } => 2,
             Standing::Removed { .. } => 3,
             Standing::None => 4,
         };
-        let mut best: Option<(AppCert, SignedOp)> = None;
-        for cert in candidates {
-            if let Some(op) = verify(cert)
-                && best.as_ref().is_none_or(|(b, _)| rank(cert) < rank(b))
-            {
-                best = Some((cert.clone(), op));
-            }
-        }
-        best
+        certs.known.iter().min_by_key(rank).cloned()
     }
 
     async fn kept_certs(&self, app_id: &[u8; 16]) -> Result<Vec<AppCert>, AppError> {
