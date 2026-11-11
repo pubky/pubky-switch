@@ -821,3 +821,51 @@ async fn test_vectors_old_signer_counts_the_closings_its_open_renewals_owe() {
         .unwrap();
     assert!(removed.body().renewed.is_empty());
 }
+
+/// A version whose delivery would land within the headroom kept under the cap is refused,
+/// not only one over it: a later version adds a digit or two, and its closing must still be
+/// deliverable (Switch wire 7.1).
+#[tokio::test]
+async fn test_vectors_old_signer_keeps_headroom_under_the_cap() {
+    let mut old = old_signer().await;
+    let limit = super::identity_limit().unwrap();
+    // About as many closed entries as fill the cap; then version 5, the inbox's host padded
+    // so that version 6, the change below, lands a few bytes under the cap.
+    let large = with_renewed(&mut old, 1_520, Some(VECTOR_START_MS)).await;
+    let size = |body: &pubky_switch_core::records::IdentityBody| {
+        super::delivery_len(body.to_json().unwrap().len())
+    };
+    let padded = |pad: usize| {
+        let mut body = large.body().clone();
+        body.version = 5;
+        body.inbox.url = format!("https://{}.switch.example", "a".repeat(pad));
+        body
+    };
+    let next = |body: &pubky_switch_core::records::IdentityBody| {
+        let mut next = body.clone();
+        next.version = 6;
+        next.record_max_age = Some(60);
+        next
+    };
+    let pad = (0..2_000)
+        .find(|pad| {
+            let bytes = size(&next(&padded(*pad)));
+            bytes <= limit && bytes + 8 > limit
+        })
+        .expect("a padding that lands within the headroom");
+    let five = IdentityDoc::sign(&old.key, padded(pad)).unwrap();
+    old.switch.deliver_identity(&five).unwrap();
+    old.signer
+        .delivered(five.signed().clone(), Some(large.hash()), None)
+        .await
+        .unwrap();
+    let refused = old.signer.set_record_max_age(Some(60)).await.unwrap_err();
+    assert!(
+        matches!(
+            refused,
+            SignerError::Refused(Refusal::IdentityTooLarge { bytes, limit })
+                if bytes <= limit
+        ),
+        "{refused:?}"
+    );
+}
