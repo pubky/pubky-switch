@@ -820,6 +820,16 @@ pub(crate) enum Duty {
 }
 
 impl Duty {
+    /// The local ID of the entry stored locally the event names, if it names one.
+    pub(crate) fn stored_id(&self) -> Option<u64> {
+        match self {
+            Self::Parked { stored_id, .. }
+            | Self::EffectRefused { stored_id, .. }
+            | Self::EffectUncertain { stored_id, .. } => Some(*stored_id),
+            _ => None,
+        }
+    }
+
     /// The event reported for it, with its ID.
     pub(crate) fn event(self, id: EventId) -> AppEvent {
         match self {

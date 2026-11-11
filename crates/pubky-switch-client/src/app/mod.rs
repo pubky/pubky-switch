@@ -333,6 +333,9 @@ pub struct AppBackup {
     chain_batches: Vec<(String, u64)>,
     departed: Vec<(String, u64)>,
     bundle: BundleState,
+    /// The local ID the next entry stored locally takes (`parkid`), so a restore gives out
+    /// none the app gave out before the backup, whether or not the backup carries its entry.
+    stored_next: u64,
     /// The protocol's layer, if it added one; absent from the bytes otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     protocol: Option<LayerOut>,
@@ -554,6 +557,8 @@ struct Carried {
     lost_duties: u64,
     /// The owed calls left behind, their values unreadable.
     lost_owed: u64,
+    /// One past every local ID of an entry stored locally that a carried duty event names.
+    stored_past: u64,
 }
 
 fn missing() -> AppError {
@@ -990,6 +995,7 @@ impl App {
                 .map(|(app, at)| (zbase32_encode(app), *at))
                 .collect(),
             bundle: state.bundle.clone(),
+            stored_next: state.next_stored_id,
             protocol: None,
         })
     }
@@ -1285,9 +1291,22 @@ impl App {
                 store: env.store.clone(),
             };
             let carried = Self::kept_for_protocol(&old).await?.unwrap_or_default();
+            // No local ID is given out twice: past the backup's counter, the counter of the
+            // store restored in place, every ID a carried duty event names, and every entry
+            // the backup brings back.
+            let old_next = match old.get_raw(key::STORED_NEXT.as_bytes()).await? {
+                Some(bytes) => state::decode::<u64>(&bytes).unwrap_or(FIRST_STORED_ID),
+                None => FIRST_STORED_ID,
+            };
+            let next_stored_id = state
+                .next_stored_id
+                .max(backup.stored_next)
+                .max(old_next)
+                .max(carried.stored_past);
             let state = AppState {
                 duty_epoch: carried.epoch.unwrap_or(state.duty_epoch),
                 next_duty: carried.next_duty.max(FIRST_DUTY),
+                next_stored_id,
                 ..state
             };
             let client = Self::client_for(&env, &meta, &backup.keys, &cert)?;
@@ -1723,12 +1742,15 @@ impl App {
         let mut past_kept = FIRST_DUTY;
         for (rest, bytes) in reader.scan_raw(key::DUTY_PREFIX).await? {
             let read = state::parse_num(&rest).and_then(|n| {
-                state::decode::<events::Duty>(&bytes)?;
-                Ok((n, state::decode::<serde_json::Value>(&bytes)?))
+                let duty = state::decode::<events::Duty>(&bytes)?;
+                Ok((n, duty, state::decode::<serde_json::Value>(&bytes)?))
             });
             match read {
-                Ok((n, value)) => {
+                Ok((n, duty, value)) => {
                     past_kept = past_kept.max(n.checked_add(1).ok_or_else(corrupt)?);
+                    if let Some(id) = duty.stored_id() {
+                        carried.stored_past = carried.stored_past.max(id.saturating_add(1));
+                    }
                     carried
                         .values
                         .push((format!("{}{rest}", key::DUTY_PREFIX), value));

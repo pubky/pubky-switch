@@ -1722,3 +1722,137 @@ async fn test_backup_layered_right_after_a_read_restores_exactly_that_state() {
     .unwrap();
     assert_eq!(restorable(&restored).await, before);
 }
+
+/// Bob's note, its effect refused for good at the service: stored for good. Returns the
+/// local ID it was stored under.
+async fn stored_for_good(w: &World, app: &mut App, text: &str) -> u64 {
+    let (seq, _) = w.note(app.app_id(), text);
+    // The fault may meet another request first: the note is tried until it is stored.
+    for _ in 0..3 {
+        w.switch.fail_next(Fault::Error {
+            path: "ops".into(),
+            code: ErrorCode::PermissionMissing,
+            current: serde_json::json!(null),
+        });
+        app.receive(None).await.unwrap();
+        if let Some(id) = app.stored_id_at(seq) {
+            return id;
+        }
+    }
+    panic!("the note at seq {seq} wasn't stored");
+}
+
+#[tokio::test]
+async fn test_restore_in_place_gives_out_no_stored_id_a_carried_duty_event_names() {
+    let w = World::new();
+    let protocol = FlakyProtocol::new(0);
+    let mut app = join_flaky(&w, &protocol, "wallet").await;
+    let me = app.app_id();
+    // A backup with no entry stored, then one stored for good after it, which duty events
+    // name; a later note moves the cursor at the service past it.
+    let backup = app.backup_layered().await.unwrap();
+    let old_id = stored_for_good(&w, &mut app, "refused").await;
+    w.note(me, "steady");
+    app.receive(None).await.unwrap();
+    app.flush_cursor().await.unwrap();
+    drop(app);
+    // Restored in place from the older backup: the duty events are carried, and the entry
+    // stored after the backup is read again and applies.
+    let mut restored = App::restore(w.env(), protocol.clone(), flaky_config(), &backup)
+        .await
+        .unwrap();
+    let carried: Vec<u64> = restored
+        .take_events()
+        .iter()
+        .filter_map(|e| match e {
+            AppEvent::Parked { stored_id, .. } | AppEvent::EffectRefused { stored_id, .. } => {
+                Some(*stored_id)
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(carried.contains(&old_id), "{carried:?}");
+    restored.receive(None).await.unwrap();
+    // An entry stored for good now takes an ID no carried event names.
+    let new_id = stored_for_good(&w, &mut restored, "refused again").await;
+    assert!(new_id > old_id, "ID {new_id} given out again");
+}
+
+#[tokio::test]
+async fn test_restore_of_a_current_backup_gives_out_no_id_of_an_entry_processed_before() {
+    let w = World::new();
+    let protocol = FlakyProtocol::new(0);
+    let mut app = join_flaky(&w, &protocol, "wallet").await;
+    let first = stored_for_good(&w, &mut app, "refused").await;
+    drop(app);
+    // A later entry stored for the store's failure, then processed: the highest ID is gone.
+    let flaky = FlakyProtocol::failing(1, StoreError::Corrupt, Mode::Plain);
+    let mut app = load_flaky(&w, &flaky, app_keys("wallet").app_id_bytes()).await;
+    let (later, _) = w.note(app.app_id(), FLAKY);
+    app.receive(None).await.unwrap();
+    let processed = app.stored_id_at(later).unwrap();
+    assert!(processed > first);
+    app.receive(None).await.unwrap();
+    assert_eq!(app.stored_id_at(later), None);
+    assert_eq!(app.stored_seqs().len(), 1);
+    // A backup of that state, restored onto a new store: the next entry stored takes an
+    // ID past the processed one's, which the host may have been handed.
+    let backup = layered(&mut app).await;
+    let mut restored = App::restore(
+        w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
+        protocol.clone(),
+        flaky_config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    restored.receive(None).await.unwrap();
+    let new_id = stored_for_good(&w, &mut restored, "refused again").await;
+    assert!(new_id > processed, "ID {new_id} given out again");
+}
+
+#[tokio::test]
+async fn test_stored_id_counter_survives_a_reload_after_the_highest_is_processed() {
+    let w = World::new();
+    let flaky = FlakyProtocol::failing(1, StoreError::Corrupt, Mode::Plain);
+    let mut app = join_flaky(&w, &flaky, "wallet").await;
+    let (seq, _) = w.note(app.app_id(), FLAKY);
+    app.receive(None).await.unwrap();
+    let id = app.stored_id_at(seq).unwrap();
+    app.receive(None).await.unwrap();
+    assert!(app.stored_seqs().is_empty());
+    drop(app);
+    // Loaded again with no entry stored: the counter, not the entries, gives the next ID.
+    let flaky = FlakyProtocol::failing(1, StoreError::Corrupt, Mode::Plain);
+    let mut app = load_flaky(&w, &flaky, app_keys("wallet").app_id_bytes()).await;
+    let (next, _) = w.note(app.app_id(), FLAKY);
+    app.receive(None).await.unwrap();
+    let next_id = app.stored_id_at(next).unwrap();
+    assert!(next_id > id, "ID {next_id} given out again");
+}
+
+#[tokio::test]
+async fn test_restore_in_place_of_an_older_backup_gives_out_no_id_the_store_gave_out() {
+    let w = World::new();
+    let flaky = FlakyProtocol::failing(1, StoreError::Corrupt, Mode::Plain);
+    let mut app = join_flaky(&w, &flaky, "wallet").await;
+    let backup = app.backup_layered().await.unwrap();
+    // After the backup, an entry stored for the store's failure, then processed: no duty
+    // event names it, and no entry is stored.
+    let (seq, _) = w.note(app.app_id(), FLAKY);
+    app.receive(None).await.unwrap();
+    let id = app.stored_id_at(seq).unwrap();
+    app.receive(None).await.unwrap();
+    assert!(app.stored_seqs().is_empty());
+    app.flush_cursor().await.unwrap();
+    drop(app);
+    // Restored in place from the older backup, the store still failing once: the note is
+    // read again and stored again, under an ID the store's counter puts past the first.
+    let flaky = FlakyProtocol::failing(1, StoreError::Corrupt, Mode::Plain);
+    let mut restored = App::restore(w.env(), flaky.clone(), flaky_config(), &backup)
+        .await
+        .unwrap();
+    restored.receive(None).await.unwrap();
+    let again = restored.stored_id_at(seq).unwrap();
+    assert!(again > id, "ID {again} given out again");
+}
