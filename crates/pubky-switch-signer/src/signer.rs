@@ -1240,6 +1240,33 @@ impl Signer {
         Err(SignerError::Alarm(alert))
     }
 
+    /// Publish the newest version again where the Homeserver's copy is older, missing or
+    /// doesn't verify (Switch wire 3.3 "Deliver, then publish"; design note, section 4.5 step
+    /// 9). It passes the gate of every signing step first ([`Signer::ready`]): this install
+    /// is the one named, the switch holds its newest version, no alarm is held, no hand-over
+    /// or take-over is in progress (Switch wire 3.12), and the copies were judged, so another
+    /// body at that version stays the alarm and a newer copy stops this install. Only a
+    /// version published already is published again: the first publication is
+    /// [`Signer::publish`]'s, which a take-over's first version passes only once its backup is
+    /// written. A write that fails is tried again at the next run.
+    pub(super) async fn republish(&mut self) -> Result<()> {
+        self.ready().await?;
+        let Some(newest) = self.state.newest.clone() else {
+            return Ok(());
+        };
+        if !newest.published {
+            return Ok(());
+        }
+        let mine = IdentityDoc::verify(&newest.doc, &self.state.identity)?;
+        if self.judge_homeserver(&mine).await? {
+            return Ok(());
+        }
+        let bytes =
+            serde_json::to_vec(&newest.doc).map_err(|e| SignerError::Records(e.to_string()))?;
+        let _ = self.env.homeserver.put(IDENTITY_PATH, bytes).await;
+        Ok(())
+    }
+
     /// Publish the newest version on the Homeserver once the switch accepted it (Switch spec
     /// 4.3: deliver first, publish after).
     async fn publish(&mut self) -> Result<()> {

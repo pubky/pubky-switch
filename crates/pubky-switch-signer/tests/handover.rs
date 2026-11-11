@@ -209,6 +209,47 @@ async fn test_hand_over_abort_wins_and_signing_goes_on() {
 }
 
 #[tokio::test]
+async fn test_hand_over_renewal_on_expiry_waits_for_the_new_signer() {
+    // The target's certificate is past half its lifetime. While handing over, the old
+    // signer's run renews nothing; the new signer renews it at its first run after the
+    // take-over (Switch spec 3.2; Switch wire 3.12).
+    let world = World::new();
+    let mut s = setup(&world).await;
+    let app_id = s.app_id();
+    world.clock.advance_ms(200 * 86_400_000);
+    s.old.hand_over_to(app_id, confirmed()).await.unwrap();
+    let sent = world.sent_docs().len();
+    s.old.run_due().await.unwrap();
+    assert_eq!(world.sent_docs().len(), sent, "nothing signed");
+    assert!(
+        world
+            .switch
+            .identity_doc()
+            .unwrap()
+            .body()
+            .renewed
+            .is_empty()
+    );
+    assert_eq!(
+        s.old.renew_expiring().await.unwrap_err(),
+        SignerError::Refused(Refusal::HandingOver { to_app: app_id })
+    );
+
+    let store = Arc::new(MemoryStore::new());
+    let mut new = Signer::receive_hand_over(world.env(store), &s.target, empty_vault())
+        .await
+        .unwrap();
+    let first = new.identity_doc().unwrap().unwrap();
+    assert!(first.body().renewed.is_empty());
+    new.run_due().await.unwrap();
+    let renewing = new.identity_doc().unwrap().unwrap();
+    assert_eq!(renewing.version(), first.version() + 1);
+    assert_eq!(renewing.body().renewed.len(), 1);
+    assert_eq!(renewing.body().renewed[0].app_id, app_id);
+    world.assert_no_version_sent_twice();
+}
+
+#[tokio::test]
 async fn test_hand_over_to_another_app_after_an_abort_won() {
     // The first target's delivery never reached the switch before the abort won. The old
     // signer then hands the abort's version over to a second app, which takes over at the
@@ -1395,6 +1436,43 @@ async fn test_hand_over_writes_nothing_to_the_homeserver_meanwhile() {
         world.homeserver.file(IDENTITY_PATH).unwrap(),
         b"another copy"
     );
+}
+
+#[tokio::test]
+async fn test_hand_over_republishing_waits_for_the_new_signers_backup() {
+    // The new signer's delivery won, and its backup couldn't be written, so its version isn't
+    // published. Neither side's run puts it, or anything else, on the Homeserver before that
+    // backup: the old signer is still handing over, and the new signer's first publication
+    // waits for its backup (Switch wire 3.12). Once the backup is written, the version is
+    // published, and the old signer then finds its proof.
+    let world = World::new();
+    let mut s = setup(&world).await;
+    s.old.hand_over_to(s.app_id(), confirmed()).await.unwrap();
+    *world.homeserver.failing_path.lock().unwrap() = Some(SIGNER_BACKUP_PATH.to_owned());
+    let store = Arc::new(MemoryStore::new());
+    let vault = empty_vault();
+    let _ = Signer::receive_hand_over(world.env(store.clone()), &s.target, vault.clone()).await;
+    let first = world.switch.identity_doc().unwrap();
+    assert_eq!(first.version(), s.handed.version() + 1);
+    assert_eq!(world.published().unwrap().signed(), s.handed.signed());
+    let writes = world.homeserver.writes.lock().unwrap().len();
+    let _ = s.old.run_due().await;
+    let identity = world.key.public();
+    let mut new = Signer::resume_take_over(world.env(store), identity, &s.target.keys, vault)
+        .await
+        .unwrap();
+    let _ = new.run_due().await;
+    assert_eq!(world.homeserver.writes.lock().unwrap().len(), writes);
+    assert_eq!(world.published().unwrap().signed(), s.handed.signed());
+
+    *world.homeserver.failing_path.lock().unwrap() = None;
+    new.run_due().await.unwrap();
+    assert_eq!(world.backup().identity_doc().signed(), first.signed());
+    assert_eq!(world.published().unwrap().signed(), first.signed());
+    assert!(matches!(
+        s.old.run_due().await.unwrap_err(),
+        SignerError::HandedOver { .. }
+    ));
 }
 
 #[tokio::test]
