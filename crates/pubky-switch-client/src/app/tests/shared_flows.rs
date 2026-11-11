@@ -2235,6 +2235,148 @@ async fn test_receive_that_fails_reports_its_kept_batch_waiting_in_no_later_read
     );
 }
 
+/// Every way a write's own batch fails once it is kept, at the service time read before its
+/// first send or at its send: the error says [`AppError::Kept`] exactly when the batch is
+/// still kept, and the batch is kept or dropped as each answer tells (Switch wire 6.4).
+#[tokio::test]
+async fn test_batch_error_says_kept_exactly_when_the_batch_stays() {
+    let error_at = |path: &str, code: ErrorCode| Fault::Error {
+        path: path.into(),
+        code,
+        current: json!(null),
+    };
+    let unreachable = |path: &str| Fault::Unreachable {
+        path: path.into(),
+        after: 0,
+    };
+    let cases = [
+        // The service time read before the first send: never sent, so kept.
+        (
+            "time read 403 cert_expired",
+            error_at("feed", ErrorCode::CertExpired),
+            true,
+        ),
+        (
+            "time read 401 bad_signature",
+            error_at("feed", ErrorCode::BadSignature),
+            true,
+        ),
+        (
+            "time read 403 not_current",
+            error_at("feed", ErrorCode::NotCurrent),
+            true,
+        ),
+        (
+            "time read 429",
+            error_at("feed", ErrorCode::RateLimited),
+            true,
+        ),
+        (
+            "time read 503",
+            error_at("feed", ErrorCode::Unavailable),
+            true,
+        ),
+        ("time read network", unreachable("feed"), true),
+        // The send, refused at authentication: never applied, dropped.
+        (
+            "401 bad_signature",
+            error_at("ops", ErrorCode::BadSignature),
+            false,
+        ),
+        (
+            "403 cert_expired",
+            error_at("ops", ErrorCode::CertExpired),
+            false,
+        ),
+        (
+            "403 not_current",
+            error_at("ops", ErrorCode::NotCurrent),
+            false,
+        ),
+        // Refused for good at or after the lookup: dropped.
+        ("409 conflict", error_at("ops", ErrorCode::Conflict), false),
+        ("400", error_at("ops", ErrorCode::BadRequest), false),
+        // Anything that may pass with the same bytes later: kept.
+        (
+            "401 stale_timestamp",
+            error_at("ops", ErrorCode::StaleTimestamp),
+            true,
+        ),
+        (
+            "409 identity_needed",
+            error_at("ops", ErrorCode::IdentityNeeded),
+            true,
+        ),
+        ("410 moved", error_at("ops", ErrorCode::Moved), true),
+        ("429", error_at("ops", ErrorCode::RateLimited), true),
+        ("503", error_at("ops", ErrorCode::Unavailable), true),
+        ("503 staged", error_at("ops", ErrorCode::Staged), true),
+        ("network", unreachable("ops"), true),
+        (
+            "answer lost",
+            Fault::LoseAnswer { path: "ops".into() },
+            true,
+        ),
+        (
+            "answer that doesn't read",
+            Fault::LeaveOut {
+                path: "ops".into(),
+                member: "proofs".into(),
+            },
+            true,
+        ),
+    ];
+    for (name, fault, stays) in cases {
+        let s = Setup::new();
+        let mut app = s.join("wallet").await;
+        s.w.switch.fail_next(fault);
+        let error = app
+            .submit_batch(OpBatch::new().op(OpKind::DenyPut { pubky: [9; 32] }))
+            .await
+            .unwrap_err();
+        let kept = app.kept_batches().await.unwrap();
+        assert_eq!(kept.len(), usize::from(stays), "{name}: {error:?}");
+        assert_eq!(
+            error.kept_batch(),
+            kept.first().map(|(id, _)| *id),
+            "{name}: {error:?}"
+        );
+    }
+}
+
+/// An alarm raised once the write's own batch is kept, here by a service time that goes
+/// back (Switch spec 10.1): the app stops, the batch stays kept, and the error says so
+/// around the alarm.
+#[tokio::test]
+async fn test_batch_kept_when_an_alarm_stops_the_write_says_so() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    app.receive(None).await.unwrap();
+    s.w.clock.set_ms(s.w.clock.now_ms() - 60_000);
+    let error = app
+        .submit_batch(OpBatch::new().op(OpKind::DenyPut { pubky: [9; 32] }))
+        .await
+        .unwrap_err();
+    assert!(matches!(error.unkept(), AppError::Alarm(_)), "{error:?}");
+    let kept = app.kept_batches().await.unwrap();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(error.kept_batch(), Some(kept[0].0), "{error:?}");
+}
+
+/// The conversation entry a send owes goes in a kept batch of its own; an alarm that stops
+/// it is the app's own failure, kept batch or not, and fails the send rather than queueing
+/// the message for another try.
+#[tokio::test]
+async fn test_send_stopped_by_an_alarm_in_its_kept_conversation_entry_fails() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    app.receive(None).await.unwrap();
+    s.w.clock.set_ms(s.w.clock.now_ms() - 60_000);
+    let error = app.send(s.note("one")).await.unwrap_err();
+    assert!(matches!(error.unkept(), AppError::Alarm(_)), "{error:?}");
+    assert_eq!(app.kept_batches().await.unwrap().len(), 1);
+}
+
 #[tokio::test]
 async fn test_batch_kept_on_a_retryable_refusal_and_sent_again() {
     for code in [

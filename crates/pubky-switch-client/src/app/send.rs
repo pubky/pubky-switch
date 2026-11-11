@@ -1351,7 +1351,7 @@ impl App {
 /// Whether an error is the app's own (an alarm, the store, a refusal of the app's rules)
 /// rather than the network's or the switch's, which the outbox retries.
 fn is_local(error: &AppError) -> bool {
-    matches!(error, AppError::Alarm(_) | AppError::Store(_))
+    matches!(error.unkept(), AppError::Alarm(_) | AppError::Store(_))
 }
 
 /// A failed try: failed for good only when the switch refused it for good, the Retry column

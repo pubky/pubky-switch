@@ -2447,3 +2447,64 @@ async fn test_restore_past_31_days_of_a_kept_effect_past_a_held_entry_hands_only
     restored.receive(None).await.unwrap();
     assert_eq!(handed(&again).len(), 1);
 }
+
+/// A write whose commits fail one at a time, before or after they apply: keeping the batch,
+/// stamping its first send, settling its answer. The error says [`AppError::Kept`] exactly
+/// when the store still keeps the batch, whichever commit failed.
+#[tokio::test]
+async fn test_batch_error_after_a_failed_commit_says_kept_exactly_when_the_batch_stays() {
+    let mut seen = (false, false);
+    for applied in [false, true] {
+        for nth in 1..=3 {
+            let w = World::new();
+            let me = w.join("wallet").await.app_id();
+            let load = |fault: StoreFault| {
+                let store = Arc::new(FaultStore::new(
+                    Arc::clone(&w.store) as Arc<dyn StateStore>,
+                    fault,
+                ));
+                let env = w.env_on(Arc::clone(&store) as Arc<dyn StateStore>);
+                (store, env)
+            };
+            // The commits the load makes come before the write's.
+            let (counting, env) = load(StoreFault::None);
+            drop(
+                App::load(env, w.protocol.clone(), World::config(), me)
+                    .await
+                    .unwrap(),
+            );
+            let at = counting.commits() + nth;
+            let (_, env) = load(if applied {
+                StoreFault::FailAfter(at)
+            } else {
+                StoreFault::FailBefore(at)
+            });
+            let mut app = App::load(env, w.protocol.clone(), World::config(), me)
+                .await
+                .unwrap();
+            let error = app
+                .submit_batch(
+                    crate::app::OpBatch::new()
+                        .op(pubky_switch_core::ops::OpKind::DenyPut { pubky: [9; 32] }),
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error.unkept(), AppError::Store(_)),
+                "commit {nth} ({applied}): {error:?}"
+            );
+            let kept = app.kept_batches().await.unwrap();
+            assert_eq!(
+                error.kept_batch(),
+                kept.first().map(|(id, _)| *id),
+                "commit {nth} ({applied}): {error:?}"
+            );
+            if kept.is_empty() {
+                seen.0 = true;
+            } else {
+                seen.1 = true;
+            }
+        }
+    }
+    assert_eq!(seen, (true, true), "both a kept and a gone batch were met");
+}

@@ -1685,6 +1685,71 @@ async fn test_receive_sends_no_batch_refused_for_good() {
     assert_eq!(conversations_for(&w, w.bob.public()), 0);
 }
 
+/// The signer renews the app's certificate and lists the renewal (Switch spec 3.2 steps 1
+/// and 2).
+fn renew_listed(w: &World, app: &App) {
+    let me = app.app_id();
+    let old = app.cert().clone();
+    let renewed = cert_for(
+        &w.alice,
+        &app_keys("wallet"),
+        w.clock.now_ms(),
+        &["scope-a"],
+    );
+    let has_keys = |s: &str| SampleProtocol::default().has_keys(s);
+    let epoch = w.switch.identity_doc().unwrap().data_epoch();
+    let mut batch = vec![OpKind::CertPut {
+        target_app_id: me,
+        cert: renewed.signed().clone(),
+    }];
+    for part in seal_bundle_parts(&w.alice, &renewed, 1, epoch, &has_keys).unwrap() {
+        batch.push(OpKind::KeyBundlePut(KeyBundlePut {
+            target_app_id: me,
+            bundle: part.bundle,
+            first_epoch: part.first_epoch,
+            last_epoch: part.last_epoch,
+        }));
+    }
+    w.switch.signer_batch(batch).unwrap();
+    w.next_doc(|body| {
+        body.apps.retain(|a| a.app_id != me);
+        body.apps.push(ListedApp {
+            app_id: me,
+            cert: renewed.hash(),
+        });
+        body.renewed.push(RenewedCert {
+            app_id: me,
+            cert: old.hash(),
+            until: None,
+        });
+    });
+}
+
+/// A write while the certificate is expired: the batch is signed and kept, then the
+/// service time read before its first send is refused (`403 cert_expired`), so it was
+/// never sent. It stays kept, and the error says so; after the renewal a read sends it.
+#[tokio::test]
+async fn test_kept_batch_refused_before_its_first_send_says_it_is_kept() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    w.clock.set_ms(app.cert().expires_at() + 1);
+    let error = app
+        .submit_batch(conversation(w.bob.public()))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Some(ErrorCode::CertExpired), "{error:?}");
+    let kept = app.kept_batches().await.unwrap();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].1.kept_ms, None, "never sent");
+    assert_eq!(error.kept_batch(), Some(kept[0].0), "{error:?}");
+    renew_listed(&w, &app);
+    for _ in 0..2 {
+        let _ = app.receive(None).await;
+    }
+    assert!(app.kept_batches().await.unwrap().is_empty());
+    assert_eq!(conversations_for(&w, w.bob.public()), 1);
+}
+
 #[tokio::test]
 async fn test_kept_batch_written_offline_goes_once_the_service_is_back() {
     let w = World::new();

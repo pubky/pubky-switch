@@ -193,19 +193,25 @@ pub enum AppError {
         /// The first try of the wait, app clock, in Unix milliseconds.
         since_ms: u64,
     },
-    /// The call's own batch was signed and kept, and couldn't be settled now: the network
-    /// failed, or the switch answered `429`, `503`, `410 moved`, `401 stale_timestamp` or
-    /// `409 identity_needed`, or an answer didn't verify (`error`, an
-    /// [`AppError::Transport`] or an [`AppError::Switch`]). The app sends it again, the
-    /// same bytes, before its next write and at the start of its next read
-    /// ([`super::App::submit_batch`], [`super::App::receive`]), and the switch answers a
-    /// batch it applied with its original proofs (Switch wire 6.4 step 5), so the caller
-    /// doesn't build it again: what the batch settles is committed when that answer comes.
+    /// The call's own batch was signed and kept, and couldn't be settled now; `error` says
+    /// why. Most often the network failed, or the switch answered `429`, `503`, `410
+    /// moved`, `401 stale_timestamp` or `409 identity_needed`, or an answer didn't verify;
+    /// also a refusal about the caller met before the batch was sent, such as `403
+    /// cert_expired` on the service time read first, an alarm, or a failed commit after the
+    /// batch was kept. The app sends it again, the same bytes, before its next write and at
+    /// the start of its next read ([`super::App::submit_batch`], [`super::App::receive`]),
+    /// once nothing holds it back, and the switch answers a batch it applied with its
+    /// original proofs (Switch wire 6.4 step 5), so the caller doesn't build it again: what
+    /// the batch settles is committed when that answer comes.
     ///
-    /// A call of [`super::App::submit_batch`] or [`super::App::write_claim`], or one that
-    /// writes through them such as [`super::App::put_record`], that fails with a bare
-    /// [`AppError::Transport`] or [`AppError::Switch`] kept nothing of its own under `opq/`:
-    /// a batch kept from an earlier call couldn't be sent, and the new one wasn't signed.
+    /// The store decides it: a call of [`super::App::submit_batch`] or
+    /// [`super::App::write_claim`], or one that writes through them such as
+    /// [`super::App::put_record`], fails with this exactly when its own batch is still kept
+    /// under `opq/` when it returns. A bare error means the batch isn't kept: it was never
+    /// signed or stored, a batch kept from an earlier call couldn't be sent first, or it was
+    /// refused for good and dropped. When the store can't be read to tell, the call fails
+    /// with that store error, bare: whether the batch is kept can't be told then, and a
+    /// kept one goes again with the next write or read.
     /// Other calls keep their own signed artifacts elsewhere and may fail bare after keeping
     /// one: [`super::App::rotate`] its receive key registration, a join its batch, and the
     /// delivery of the app record its batch; each is sent again by itself (`STATE.md`).
@@ -245,20 +251,16 @@ impl AppError {
         }
     }
 
-    /// `error` after a send of the call's own batch `batch_id` that didn't settle it:
-    /// [`AppError::Kept`] when the batch stays kept, after a failure of the network or the
-    /// switch that may pass with the same bytes later ([`refused_for_good`] gives `None`);
-    /// as it is otherwise: a refusal for good dropped the batch, and an alarm or a store
-    /// failure is reported as itself.
-    pub(crate) fn kept_or(batch_id: [u8; 16], error: AppError) -> AppError {
-        match &error {
-            AppError::Transport(_) | AppError::Switch(_) if refused_for_good(&error).is_none() => {
-                AppError::Kept {
-                    batch_id,
-                    error: Box::new(error),
-                }
+    /// `error` of a call whose own batch `batch_id` was kept, given whether the store still
+    /// keeps it: [`AppError::Kept`] when it does, `error` as it is when it doesn't.
+    pub(crate) fn kept_or(batch_id: [u8; 16], error: AppError, still_kept: bool) -> AppError {
+        if still_kept {
+            AppError::Kept {
+                batch_id,
+                error: Box::new(error),
             }
-            _ => error,
+        } else {
+            error
         }
     }
 }

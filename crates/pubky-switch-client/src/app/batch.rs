@@ -296,10 +296,12 @@ impl App {
     /// were kept without it, so they may already be past it; an
     /// `attempt` while the app may not attempt ([`App::may_attempt`]); the switch's refusal
     /// for good, such as `409 conflict` with its `current`, after which nothing is kept;
-    /// [`AppError::Kept`] with the batch's ID for any other failure of the network or the
-    /// switch (the network, `429`, `503`, an answer that doesn't verify): the batch is kept
-    /// and sent again, the same bytes, by the next call that writes and by the next read
-    /// ([`App::receive`]) before its feed. A batch kept from an
+    /// [`AppError::Kept`] with the batch's ID, around the cause, for any failure that leaves
+    /// the batch kept, as the store shows it when the call returns (the network, `429`,
+    /// `503`, an answer that doesn't verify, a refusal about the caller before its first
+    /// send, an alarm, a failed commit): the batch is sent again, the same bytes, by the
+    /// next call that writes and by the next read ([`App::receive`]) before its feed. A
+    /// batch kept from an
     /// earlier call that still can't be sent fails the call with its bare error
     /// ([`AppError::Transport`], [`AppError::Switch`]) before the new batch is signed, so
     /// nothing of this call is kept. [`AppError::InvalidData`] when an attempt's proof shows another
@@ -505,12 +507,31 @@ impl App {
         }
         let mut tx = self.tx()?;
         tx.put(&pending_key(&id), &pending)?;
-        self.commit(tx).await?;
-        // From here the batch is kept: a failure that leaves it so says it does, so the
-        // caller can tell its own batch kept from an earlier one that couldn't be sent.
-        self.run_pending(&id, &pending, &signed, false)
-            .await
-            .map_err(|error| AppError::kept_or(id, error))
+        // From the commit that keeps it, a failure that leaves the batch kept says so, so
+        // the caller can tell its own batch kept from an earlier one that couldn't be sent:
+        // a commit answered `StoreError::Unknown` may have kept it too.
+        let result = match self.commit(tx).await {
+            Ok(()) => self.run_pending(&id, &pending, &signed, false).await,
+            Err(error) => Err(error),
+        };
+        match result {
+            Ok(submitted) => Ok(submitted),
+            Err(error) => Err(self.kept_or_dropped(id, error).await),
+        }
+    }
+
+    /// `error` of a call whose own batch `id` was kept, as the store shows it now: wrapped
+    /// as [`AppError::Kept`] when the batch is still under `opq/`, bare when it is gone
+    /// (settled, or dropped after a refusal for good). The store decides, not the step that
+    /// failed, so no failure after the batch was kept, before its send included, returns a
+    /// bare error for a batch that stays kept. A store that can't be read to tell gives its
+    /// own error, bare, unless `error` is already a store failure, which is kept as it is.
+    pub(crate) async fn kept_or_dropped(&self, id: [u8; 16], error: AppError) -> AppError {
+        match self.reader().exists(&pending_key(&id)).await {
+            Ok(still_kept) => AppError::kept_or(id, error, still_kept),
+            Err(_) if matches!(error, AppError::Store(_)) => error,
+            Err(unread) => unread,
+        }
     }
 
     /// After `409 stale_epoch` on `batch` (Switch spec 3.5, 6.4): the switch refused it for
