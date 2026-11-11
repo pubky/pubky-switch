@@ -2250,6 +2250,50 @@ async fn test_scripted_keys_a_part_replacing_the_completing_one_carries_the_forc
 }
 
 #[tokio::test]
+async fn test_scripted_keys_replacing_another_part_while_in_force_keeps_the_force_where_it_is() {
+    let w = World::new();
+    let app = w.join("wallet").await;
+    let me = app.app_id();
+    let cert = app.cert().clone();
+    w.next_doc(|body| body.data_epoch = 2);
+    w.switch.request_full_bundle(me);
+    let first = store_part(&w, me, &cert, 1, 1);
+    w.switch.move_cursor(me, first).unwrap();
+    // Epoch 2's part completes the request; a put replaces epoch 1's part, not the
+    // completing one, so the force stays where it was.
+    let completing = store_part(&w, me, &cert, 2, 2);
+    store_part(&w, me, &cert, 1, 1);
+    // The move that passes the completing part ends the force: it goes, and epoch 1's new
+    // part, unpassed, stays.
+    w.switch.move_cursor(me, completing).unwrap();
+    assert_eq!(w.switch.bundles_of(&me), vec![(1, 1)]);
+    assert_eq!(w.switch.keys_through_of(&me), Some(2));
+}
+
+#[tokio::test]
+async fn test_scripted_keys_a_replacement_after_the_force_ended_doesnt_restart_it() {
+    let w = World::new();
+    let app = w.join("wallet").await;
+    let me = app.app_id();
+    let cert = app.cert().clone();
+    w.next_doc(|body| body.data_epoch = 3);
+    w.switch.request_full_bundle(me);
+    store_part(&w, me, &cert, 1, 1);
+    store_part(&w, me, &cert, 2, 2);
+    let completing = store_part(&w, me, &cert, 3, 3);
+    // Epoch 2's part is replaced while in force. The move that passes the completing part
+    // ends the force; that part stays, passed above epoch 2's unpassed one.
+    let second = store_part(&w, me, &cert, 2, 2);
+    w.switch.move_cursor(me, completing).unwrap();
+    assert_eq!(w.switch.bundles_of(&me), vec![(2, 2), (3, 3)]);
+    // Replacing the completing part now doesn't put the request back in force: the move
+    // that passes epoch 2's part drops it.
+    store_part(&w, me, &cert, 3, 3);
+    w.switch.move_cursor(me, second).unwrap();
+    assert_eq!(w.switch.bundles_of(&me), vec![(3, 3)]);
+}
+
+#[tokio::test]
 async fn test_scripted_keys_a_request_stays_in_force_for_the_rest_of_the_completing_batch() {
     let w = World::new();
     let app = w.join("wallet").await;
