@@ -23,7 +23,8 @@
 //!   the app has seen there ([`super::Protocol::record_regression`]). A write refused that
 //!   way is flagged, its content not acted on, but its version followed, so the app's next
 //!   write builds on it and puts back the content it trusts (Switch spec 8.2).
-//! - **Listing** runs at join and after a `missed` item (Switch spec 8.2, 8.3).
+//! - **Listing** runs at join, after a restore, after a `missed` item, and after a certificate
+//!   taken that reads a collection the one before didn't (Switch spec 8.2, 8.3).
 
 use pubky_switch_core::chain::{ChainEnvelope, TransitionProof};
 use pubky_switch_core::enc::{b64, serde_b64, serde_b64_vec, unb64_array};
