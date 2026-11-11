@@ -1426,3 +1426,34 @@ async fn test_revocation_checks_the_switch_again_after_completing_a_given_up_epo
         "nothing more signed"
     );
 }
+
+#[tokio::test]
+async fn test_full_bundle_request_is_answered_though_the_stored_parts_cover_every_epoch() {
+    // `a`'s renewal stored its full bundle, so the parts at the switch already cover every
+    // epoch for its listed certificate. `a` asks all the same, as an app that lost its copy
+    // does: the signer stores every epoch again, which clears the request (Switch wire 3.5).
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let (a, _) = two_joined(&world, &mut signer).await;
+    let id = a.keys.app_id_bytes();
+    signer
+        .renew(
+            id,
+            CertChange {
+                scopes: None,
+                expires_at: Some(START_MS + 400 * DAY_MS),
+            },
+        )
+        .await
+        .unwrap();
+    let current = signer.identity_doc().unwrap().unwrap().data_epoch();
+    assert_eq!(world.switch.bundles_of(&id), [(1, current)]);
+    let stored = world.switch.bundle_parts_of(&id);
+    world.switch.request_full_bundle(id);
+    assert_eq!(signer.serve_full_bundles().await.unwrap(), [id]);
+    assert!(world.switch.app(&id).full_requested.is_none());
+    assert_ne!(world.switch.bundle_parts_of(&id), stored, "stored again");
+    assert!(holds(&world, &opened(&world, &a), 1, "notes"));
+    // Answered, nothing more is sent.
+    assert!(signer.serve_full_bundles().await.unwrap().is_empty());
+}
