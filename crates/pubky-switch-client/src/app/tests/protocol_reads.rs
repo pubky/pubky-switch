@@ -364,7 +364,7 @@ async fn test_receive_need_asked_again_parks_the_entry() {
     assert_eq!(protocol.seen().len(), 2);
     assert!(report.events.iter().any(|e| matches!(
         e,
-        AppEvent::Parked { id: Some(_), seq: s, reason: ParkReason::TooManyReads } if *s == seq
+        AppEvent::Parked { id: Some(_), seq: s, reason: ParkReason::TooManyReads, .. } if *s == seq
     )));
     assert_eq!(wallet.cursor().seq, seq);
     // Not tried again.

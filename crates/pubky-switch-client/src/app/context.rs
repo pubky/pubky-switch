@@ -42,7 +42,7 @@ use pubky_switch_core::records::AppCert;
 use super::admission::{LISTS_AT, SenderDisposition, deny_key, flag_key};
 use super::claims::{ClaimOp, ClaimRead, KeptClaim, ObligationDeadline, claim_key_of};
 use super::error::Refusal;
-use super::protocol::LocalWrite;
+use super::protocol::{LocalWrite, MAX_STEP_LOCAL_BYTES, local_writes_bytes};
 use super::records::{
     Collection, HeldRecord, RecordTarget, SeenMark, SharedRecord, record_key_of, record_put,
     seen_key,
@@ -69,6 +69,9 @@ pub(crate) struct ContextWrites {
     pub(crate) deadlines: Vec<([u8; 32], ObligationDeadline)>,
     /// A write couldn't be built now, such as for want of a scope key: the entry waits.
     pub(crate) not_now: Option<String>,
+    /// A local write was refused for taking the step past [`MAX_STEP_LOCAL_BYTES`]: the
+    /// effect is too large, whatever the step returns with it.
+    pub(crate) over_local_bound: bool,
 }
 
 /// A claim the app read from the switch for a receive step ([`super::Need::Claim`]).
@@ -91,6 +94,7 @@ pub enum ClaimFetch {
 /// move, at most 7 operations beside it (Switch wire 6.4).
 pub struct ReceiveContext<'a> {
     state: &'a AppState,
+    protocol: &'a dyn super::Protocol,
     store: &'a dyn StateStore,
     ns: &'a str,
     may_attempt: bool,
@@ -251,8 +255,12 @@ impl<'a> LocalView<'a> {
 }
 
 /// What a protocol's restore step can read ([`super::Protocol::restore_layer`]): the
-/// identity, the App ID and the naming key of the backup being restored, which the restored
-/// app goes on with, before anything is written.
+/// identity, the App ID, the certificate and the naming key of the backup being restored,
+/// which the restored app goes on with, before anything is written.
+///
+/// With the certificate the protocol checks what the restored app may do by its own rules,
+/// such as scopes or permissions it requires beyond the switch's, and refuses a backup it
+/// wouldn't run with, before the restore commits ([`RestoreContext::cert`]).
 ///
 /// With the naming key the protocol checks its layer against the identity before the
 /// restore commits, such as that each claim key or record key it keeps is the one its
@@ -271,15 +279,31 @@ pub struct RestoreContext<'a> {
     identity: [u8; 32],
     app_id: [u8; 16],
     naming: &'a NamingKey,
+    cert: &'a AppCert,
 }
 
 impl<'a> RestoreContext<'a> {
-    pub(crate) fn new(identity: [u8; 32], app_id: [u8; 16], naming: &'a NamingKey) -> Self {
+    pub(crate) fn new(
+        identity: [u8; 32],
+        app_id: [u8; 16],
+        naming: &'a NamingKey,
+        cert: &'a AppCert,
+    ) -> Self {
         Self {
             identity,
             app_id,
             naming,
+            cert,
         }
+    }
+
+    /// The certificate the restore installs: the backup's own, which the app has checked
+    /// is signed by the identity and names this App ID and the backup's signing key. It
+    /// isn't checked against the identity's current `identity.json` here, nor for expiry:
+    /// after the restore, before it sends anything, the app takes the certificate its
+    /// `identity.json` lists if the backup's was renewed since (Switch spec 12.4).
+    pub fn cert(&self) -> &'a AppCert {
+        self.cert
     }
 
     /// The identity.
@@ -302,8 +326,12 @@ impl<'a> RestoreContext<'a> {
 }
 
 impl<'a> ReceiveContext<'a> {
+    // Each argument is a borrow or a flag the context reads on its own; a struct of them
+    // would only be built here.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         state: &'a AppState,
+        protocol: &'a dyn super::Protocol,
         store: &'a dyn StateStore,
         ns: &'a str,
         may_attempt: bool,
@@ -313,6 +341,7 @@ impl<'a> ReceiveContext<'a> {
     ) -> Self {
         Self {
             state,
+            protocol,
             store,
             ns,
             may_attempt,
@@ -567,10 +596,16 @@ impl<'a> ReceiveContext<'a> {
     /// # Errors
     ///
     /// [`Refusal::Usage`] when the certificate holds none of the write scopes, the record is
-    /// written already in this batch (Switch wire 6.2), or the batch is full;
+    /// written already in this batch (Switch wire 6.2), the batch is full, or the
+    /// protocol's mark of the value is over [`super::MAX_SEEN_MARK_BYTES`];
     /// [`Refusal::NotNow`] while the app lacks the read scope's key at the current data
     /// epoch: the message then waits, whatever the protocol returns, and is handed over
     /// again at a later read; a store failure.
+    ///
+    /// A write refused with [`Refusal::Usage`], its mark over the bound included, isn't
+    /// added: a protocol that carries on returns an effect that applies without it. That is
+    /// unlike [`ReceiveContext::local`] past [`MAX_STEP_LOCAL_BYTES`], whose effect is
+    /// stored locally instead of applied.
     pub fn put_record(
         &mut self,
         target: &RecordTarget,
@@ -594,6 +629,8 @@ impl<'a> ReceiveContext<'a> {
         self.write_record(target, None, conditions)
     }
 
+    /// A refused write adds nothing, and the effect goes on without it
+    /// ([`ReceiveContext::put_record`]).
     fn write_record(
         &mut self,
         target: &RecordTarget,
@@ -601,6 +638,7 @@ impl<'a> ReceiveContext<'a> {
         conditions: Vec<Condition>,
     ) -> Result<[u8; 32], AppError> {
         self.room()?;
+        super::records::refuse_unmarkable(self.protocol, target, value)?;
         let key = self.record_key(target)?;
         if self.writes.records.iter().any(|(k, _)| *k == key) {
             return Err(
@@ -674,7 +712,24 @@ impl<'a> ReceiveContext<'a> {
     }
 
     /// A write of the protocol's own local state, committed with the outcome.
-    pub fn local(&mut self, write: LocalWrite) {
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::Usage`] when the write would take this step's local writes past
+    /// [`MAX_STEP_LOCAL_BYTES`] ([`local_writes_bytes`]): the write isn't added, and an
+    /// effect the step then applies is stored and passed as too large
+    /// ([`super::ParkReason::EffectTooLarge`]), never applied without it.
+    pub fn local(&mut self, write: LocalWrite) -> Result<(), AppError> {
+        let after = local_writes_bytes(&self.writes.local)
+            .saturating_add(local_writes_bytes(std::slice::from_ref(&write)));
+        if after > MAX_STEP_LOCAL_BYTES {
+            self.writes.over_local_bound = true;
+            return Err(Refusal::Usage(format!(
+                "a receive step writes at most {MAX_STEP_LOCAL_BYTES} bytes of local state"
+            ))
+            .into());
+        }
         self.writes.local.push(write);
+        Ok(())
     }
 }

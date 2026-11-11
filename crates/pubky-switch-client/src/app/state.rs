@@ -32,7 +32,7 @@ use crate::store::{StoreHandle, Write, WriteBatch};
 
 /// The schema version of every value the app layer writes. 2: a kept effect keeps the
 /// entry it is for (`pending/effect`).
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// The prefix of the protocol's own keys in the app's namespace.
 pub const PROTOCOL_PREFIX: &[u8] = b"p/";
@@ -111,8 +111,12 @@ pub(crate) mod key {
     /// The prefix of the kept duty events.
     pub(crate) const DUTY_PREFIX: &str = "duty/";
 
-    /// The `seq` the next read's retries of stored entries start from.
+    /// Where the next read's retries of stored entries start from.
     pub(crate) const PARKED_NEXT: &str = "parkn";
+    /// The local ID the next entry stored locally takes.
+    pub(crate) const STORED_NEXT: &str = "parkid";
+    /// Where telling the protocol again of the entries a restore brought back stands.
+    pub(crate) const RETELL: &str = "retell";
     /// The prefix of the protocol calls owed.
     pub(crate) const OWED_PREFIX: &str = "owed/";
 
@@ -175,8 +179,14 @@ pub(crate) mod key {
         format!("retry/{}", num(seq))
     }
 
-    pub(crate) fn parked(seq: u64) -> String {
-        format!("parked/{}", num(seq))
+    /// An entry stored locally, by its local ID, which never changes.
+    pub(crate) fn parked(id: u64) -> String {
+        format!("parked/{}", num(id))
+    }
+
+    /// The count of the store's retries at an entry stored locally, by its local ID.
+    pub(crate) fn stored_retry(id: u64) -> String {
+        format!("sretry/{}", num(id))
     }
 
     pub(crate) fn asked(seq: u64) -> String {
@@ -376,13 +386,13 @@ impl DutyEpoch {
 }
 
 /// `parkn`: where the retries of entries stored locally stand. A round covers the entries
-/// stored before it began, by the round each was stored in, not by `seq`, which a provider
-/// loss renumbers; it tries them in `seq` order from `next` on. One stored later waits for
+/// stored before it began, by the round each was stored in; it tries them in local ID order
+/// from `next` on. One stored later waits for
 /// the next round, so every entry is tried within two rounds, each of at most as many reads
 /// as it covers entries over the per-read bound.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ParkedRound {
-    /// The lowest `seq` the round has yet to try.
+    /// The lowest local ID the round has yet to try.
     pub(crate) next: u64,
     /// The round's number: it covers the entries stored in an earlier one.
     pub(crate) number: u64,
@@ -435,19 +445,25 @@ pub(crate) struct HeldEntry {
     pub(crate) since_ms: u64,
 }
 
-/// `retry/<seq>`: an entry whose receive step couldn't finish because the protocol's store
-/// or the host failed (`Outcome::Retry`): the reads in a row that ended so, and when the
-/// first was. Kept until the entry is processed.
+/// `retry/<seq>` for an entry on the feed, `sretry/<id>` for one stored locally: an entry
+/// whose receive step couldn't finish because the protocol's store or the host failed
+/// (`Outcome::Retry`): the reads in a row that ended so, and when the first was. Kept until
+/// the entry is processed; it moves from the one key to the other when the entry is stored.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RetryEntry {
     pub(crate) reads: u32,
     pub(crate) since_ms: u64,
 }
 
-/// `parked/<seq>`: an entry stored locally and passed with the cursor (Switch spec 8.2).
-/// Sensitive: it holds the opened message, so its `Debug` shows only its size.
+/// `parked/<id>`: an entry stored locally and passed with the cursor (Switch spec 8.2),
+/// keyed by a local ID that never changes, whatever provider change follows. Sensitive: it
+/// holds the opened message, so its `Debug` shows only its size.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ParkedEntry {
+    /// The `seq` the entry was read at, in [`ParkedEntry::generation`].
+    pub(crate) seq: u64,
+    /// The generation it was read at.
+    pub(crate) generation: u64,
     #[serde(with = "serde_b64")]
     pub(crate) sender: [u8; 32],
     pub(crate) cert: SignedDoc,
@@ -505,15 +521,19 @@ pub(crate) struct PendingEffect {
     pub(crate) hash: [u8; 32],
     pub(crate) accepted_at_ms: u64,
     pub(crate) kind: String,
-    /// The protocol's local writes, committed with the outcome.
+    /// The protocol's local writes, committed with the outcome, kept in base64
+    /// ([`kept_local`]).
+    #[serde(with = "kept_local")]
     pub(crate) local: Vec<LocalWrite>,
     /// The cursor the batch moves to, if it moves it.
     pub(crate) cursor_to: Option<u64>,
     /// The entry lies past a held one: it is kept in `seen` until the cursor passes it.
     pub(crate) past_held: bool,
-    /// The entry was stored locally before: removing it from `parked` is part of the
-    /// outcome.
-    pub(crate) parked: bool,
+    /// The generation the entry was read at.
+    pub(crate) generation: u64,
+    /// The local ID of the entry when it was stored locally before: removing it from
+    /// `parked` is part of the outcome.
+    pub(crate) stored: Option<u64>,
     /// The deadlines the app computes itself for the claims the batch writes, kept with
     /// their evidence once it is applied (Switch wire 6.8), by claim key (base64url).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -686,6 +706,11 @@ impl Tx {
         &self.batch.writes
     }
 
+    /// The bytes the batch counts against the store's batch size so far.
+    pub(crate) fn size(&self) -> u64 {
+        self.batch.size()
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.batch.is_empty()
     }
@@ -794,11 +819,203 @@ pub(crate) fn parse_num(text: &str) -> Result<u64, AppError> {
         .map_err(|_| AppError::Store(StoreError::Corrupt))
 }
 
+/// The kept form of local writes in a kept effect or batch: each key and value in
+/// base64url (`{"Put":{"key":"…","value":"…"}}`), so a write keeps in at most 4/3 of its
+/// bytes whatever they are (`MAX_STEP_LOCAL_BYTES`). It reads the form written before,
+/// `LocalWrite`'s own, with its bytes as arrays of numbers, too, so no stored value needs a
+/// migration.
+pub(crate) mod kept_local {
+    use pubky_switch_core::enc::{b64, serde_b64_vec};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use super::LocalWrite;
+
+    fn bytes<S: Serializer>(bytes: &&[u8], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&b64(bytes))
+    }
+
+    #[derive(Serialize)]
+    enum Out<'a> {
+        Put {
+            #[serde(serialize_with = "bytes")]
+            key: &'a [u8],
+            #[serde(serialize_with = "bytes")]
+            value: &'a [u8],
+        },
+        Delete {
+            #[serde(serialize_with = "bytes")]
+            key: &'a [u8],
+        },
+        DeletePrefix {
+            #[serde(serialize_with = "bytes")]
+            prefix: &'a [u8],
+        },
+    }
+
+    #[derive(Deserialize)]
+    enum Kept {
+        Put {
+            #[serde(with = "serde_b64_vec")]
+            key: Vec<u8>,
+            #[serde(with = "serde_b64_vec")]
+            value: Vec<u8>,
+        },
+        Delete {
+            #[serde(with = "serde_b64_vec")]
+            key: Vec<u8>,
+        },
+        DeletePrefix {
+            #[serde(with = "serde_b64_vec")]
+            prefix: Vec<u8>,
+        },
+    }
+
+    /// The base64 form, or the earlier one with arrays of numbers.
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Either {
+        Kept(Kept),
+        Earlier(LocalWrite),
+    }
+
+    pub(crate) fn serialize<S: Serializer>(writes: &[LocalWrite], s: S) -> Result<S::Ok, S::Error> {
+        s.collect_seq(writes.iter().map(|write| match write {
+            LocalWrite::Put { key, value } => Out::Put { key, value },
+            LocalWrite::Delete { key } => Out::Delete { key },
+            LocalWrite::DeletePrefix { prefix } => Out::DeletePrefix { prefix },
+        }))
+    }
+
+    pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<Vec<LocalWrite>, D::Error> {
+        Ok(Vec::<Either>::deserialize(d)?
+            .into_iter()
+            .map(|write| match write {
+                Either::Kept(Kept::Put { key, value }) => LocalWrite::Put { key, value },
+                Either::Kept(Kept::Delete { key }) => LocalWrite::Delete { key },
+                Either::Kept(Kept::DeletePrefix { prefix }) => LocalWrite::DeletePrefix { prefix },
+                Either::Earlier(write) => write,
+            })
+            .collect())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::store::{MemoryStore, StateStore};
     use std::sync::Arc;
+
+    use crate::app::{LOCAL_WRITE_OVERHEAD_BYTES, MAX_STEP_LOCAL_BYTES};
+    use crate::store::MAX_VALUE_BYTES;
+
+    #[derive(Serialize, Deserialize, PartialEq, Debug)]
+    struct Kept {
+        #[serde(with = "kept_local")]
+        local: Vec<LocalWrite>,
+    }
+
+    fn writes() -> Vec<LocalWrite> {
+        vec![
+            LocalWrite::Put {
+                key: b"k".to_vec(),
+                value: vec![0, 255, 7],
+            },
+            LocalWrite::Delete { key: b"d".to_vec() },
+            LocalWrite::DeletePrefix {
+                prefix: b"p/".to_vec(),
+            },
+        ]
+    }
+
+    #[test]
+    fn test_kept_local_writes_are_base64_and_read_back() {
+        let kept = Kept { local: writes() };
+        let json = serde_json::to_value(&kept).unwrap();
+        assert_eq!(json["local"][0]["Put"]["value"], b64(&[0, 255, 7]));
+        assert_eq!(serde_json::from_value::<Kept>(json).unwrap(), kept);
+    }
+
+    #[test]
+    fn test_kept_local_writes_of_the_earlier_form_still_read() {
+        // As `LocalWrite`'s own derive wrote them: bytes as arrays of numbers.
+        let earlier = serde_json::json!({
+            "local": writes()
+                .iter()
+                .map(|write| serde_json::to_value(write).unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            earlier["local"][0]["Put"]["value"],
+            serde_json::json!([0, 255, 7])
+        );
+        assert_eq!(
+            serde_json::from_value::<Kept>(earlier).unwrap(),
+            Kept { local: writes() }
+        );
+    }
+
+    /// A kept effect at the largest it can be: a `POST /ops` body at its 4 MiB cap, the
+    /// largest plaintext and certificate, and `local` writes at the bound.
+    fn largest_effect(local: Vec<LocalWrite>) -> PendingEffect {
+        PendingEffect {
+            body: vec![0xff; 4 << 20],
+            seq: u64::MAX,
+            sender: [0xff; 32],
+            msg_id: "f".repeat(36),
+            hash: [0xff; 32],
+            accepted_at_ms: u64::MAX,
+            kind: "k".repeat(65),
+            local,
+            cursor_to: Some(u64::MAX),
+            past_held: true,
+            generation: u64::MAX,
+            stored: Some(u64::MAX),
+            deadlines: (0..7)
+                .map(|n| {
+                    (
+                        b64(&[n; 32]),
+                        super::super::claims::ObligationDeadline::At(u64::MAX),
+                    )
+                })
+                .collect(),
+            kept_ms: Some(u64::MAX),
+            entry: KeptEntry {
+                cert: SignedDoc {
+                    body: "A".repeat(33 * 1024),
+                    sig: "A".repeat(86),
+                },
+                plaintext: vec![0xff; 64 * 1024],
+                context: Some(Value::String("c".repeat(1024))),
+            },
+        }
+    }
+
+    #[test]
+    fn test_kept_effect_at_the_bound_fits_one_value() {
+        // One write at the bound, and the most writes the bound lets through.
+        let one = vec![LocalWrite::Put {
+            key: vec![0xff],
+            value: vec![0xff; MAX_STEP_LOCAL_BYTES - 1 - LOCAL_WRITE_OVERHEAD_BYTES],
+        }];
+        let many: Vec<LocalWrite> = (0..MAX_STEP_LOCAL_BYTES / (1 + LOCAL_WRITE_OVERHEAD_BYTES))
+            .map(|n| LocalWrite::Put {
+                key: vec![u8::try_from(n % 256).unwrap()],
+                value: Vec::new(),
+            })
+            .collect();
+        for local in [one, many] {
+            assert!(crate::app::local_writes_bytes(&local) <= MAX_STEP_LOCAL_BYTES);
+            let size = encode(&largest_effect(local)).unwrap().len();
+            assert!(
+                u64::try_from(size).unwrap() < MAX_VALUE_BYTES,
+                "{size} bytes kept"
+            );
+            // The arithmetic of `MAX_STEP_LOCAL_BYTES`: under 10.9 MiB.
+            assert!(size < 109 * 1024 * 1024 / 10, "{size}");
+        }
+    }
 
     /// Reads of retries over `due` while each read stores more entries than the bound,
     /// at `seq`s `stored_at` gives; returns how many times each of the first was tried.
@@ -849,9 +1066,8 @@ mod tests {
     }
 
     #[test]
-    fn test_parked_round_reaches_every_entry_after_a_loss_renumbers_them() {
-        // After a provider loss the entries stored before it sit at the top of the `seq`s,
-        // and later ones below them, in the new sequence.
+    fn test_parked_round_reaches_every_entry_whatever_their_ids() {
+        // Entries stored before others whose IDs sort before them, as IDs of any order may.
         let first: Vec<u64> = (0..6).map(|i| u64::MAX - i).collect();
         let tries = rounds_over(&first, |n| 10 + n);
         for seq in &first {
@@ -872,7 +1088,7 @@ mod tests {
             time_ms: 11,
         };
         let bytes = encode(&cursor).unwrap();
-        assert!(bytes.starts_with(b"{\"v\":2,\"d\":"));
+        assert!(bytes.starts_with(b"{\"v\":3,\"d\":"));
         assert_eq!(decode::<Cursor>(&bytes).unwrap(), cursor);
     }
 
@@ -887,7 +1103,7 @@ mod tests {
 
     #[test]
     fn test_record_of_another_schema_is_corrupt() {
-        let bytes = br#"{"v":3,"d":{"generation":1}}"#;
+        let bytes = br#"{"v":4,"d":{"generation":1}}"#;
         assert_eq!(
             decode::<Floor>(bytes).unwrap_err(),
             AppError::Store(StoreError::Corrupt)
@@ -901,6 +1117,8 @@ mod tests {
     #[test]
     fn test_parked_entry_debug_hides_the_message() {
         let parked = ParkedEntry {
+            seq: 1,
+            generation: 1,
             sender: [1; 32],
             cert: SignedDoc::from_parts(b"{}", &[0; 64]),
             accepted_at_ms: 1,

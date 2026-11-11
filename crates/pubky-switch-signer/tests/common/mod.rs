@@ -394,7 +394,11 @@ impl World {
 
     /// `app` joins as Switch spec 12.1 step 2 says: it reads its approval's claim and delivers
     /// its record with the certificate the approval names.
-    pub fn join(&self, app: &App, approved: &pubky_switch_signer::ApprovedRequest) {
+    pub fn join(
+        &self,
+        app: &App,
+        approved: &pubky_switch_signer::ApprovedRequest,
+    ) -> pubky_switch_core::records::AppCert {
         use pubky_switch_core::ops::OpKind;
         use pubky_switch_core::records::{AppRecord, AppRecordBody, Approval, ApprovalClaim};
         let identity = self.key.public();
@@ -427,5 +431,6 @@ impl World {
                 },
             )
             .unwrap();
+        read.cert
     }
 }

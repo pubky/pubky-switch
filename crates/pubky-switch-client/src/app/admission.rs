@@ -66,6 +66,17 @@ pub(crate) fn flag_key(pubky: &[u8; 32]) -> String {
 /// answer, Unix milliseconds. Absent until the first.
 pub(crate) const LISTS_AT: &str = "lc/lists_at";
 
+/// `lc/too_large`: the service time of the last `GET /allow` answer whose lists didn't fit
+/// one commit. While it is less than [`LISTS_TOO_LARGE_RETRY_MS`] old, a read doesn't
+/// refresh the copy it owes; [`App::allow_list`] still does. A refresh that fits, a
+/// provider change and a restore remove it.
+pub(crate) const LISTS_TOO_LARGE: &str = "lc/too_large";
+
+/// How long a read waits, in service time, before it tries again a refresh of the lists
+/// whose answer didn't fit one commit: a day. The answer of such lists is 16 MB or more, so
+/// a read that retried it at every long poll would download and parse it every time.
+pub const LISTS_TOO_LARGE_RETRY_MS: u64 = pubky_switch_core::records::DAY_MS;
+
 /// What the app knows of a sender's standing in the own identity's lists, for a protocol's
 /// receive step ([`super::ReceiveContext::sender_disposition`]), such as to keep only a
 /// count of messages from a sender the user blocked or the service flagged (Switch spec 7
@@ -311,9 +322,11 @@ impl App {
     /// The whole copy is replaced in one commit, which must fit the store's batch size,
     /// [`crate::store::MAX_BATCH_BYTES`]. Lists that don't fit, as they may at raised
     /// limits, fail this call with [`StoreError::TooLarge`] and leave the copy as it was:
-    /// such an app can't refresh its copy today. Its reads go on, the refresh they owe
-    /// failing the same way, so [`SenderDisposition::lists_as_of_ms`] stays as it was,
-    /// `None` when the copy was never refreshed.
+    /// such an app can't refresh its copy today. The refusal is kept with the answer's
+    /// service time: the reads go on, and don't fetch the lists again for the refresh they
+    /// owe until [`LISTS_TOO_LARGE_RETRY_MS`] later, a provider change or a restore, so
+    /// [`SenderDisposition::lists_as_of_ms`] stays as it was, `None` when the copy was
+    /// never refreshed. This call always fetches them.
     ///
     /// # Errors
     ///
@@ -335,7 +348,8 @@ impl App {
     /// Not while a move or a provider loss is in progress, whose steps read and upload the
     /// copy as the app kept it. Best effort: a refused or failed call, or a copy too large
     /// for one commit, leaves the copy as it was, still owed, and the read goes on; an alarm
-    /// or a store failure stops it.
+    /// or a store failure stops it. After lists too large for one commit (`lc/too_large`),
+    /// not before [`LISTS_TOO_LARGE_RETRY_MS`] of service time has passed.
     pub(crate) async fn refresh_lists_if_owed(&mut self) -> Result<(), AppError> {
         if !self.state.cert.has_permission(Permission::ListsRead) {
             return Ok(());
@@ -344,6 +358,17 @@ impl App {
         if reader.exists(LISTS_AT).await?
             || reader.exists(super::provider::keys::MOVE).await?
             || self.loss_record().await?.is_some_and(|loss| !loss.done())
+        {
+            return Ok(());
+        }
+        // Lists too large for one commit are tried again a day later, not at every read.
+        // The day is judged on the highest service time verified, which every read's page
+        // moves on: at most one read later than a fresh time would, and no request of its
+        // own.
+        if let Some(at) = reader.get::<u64>(LISTS_TOO_LARGE).await?
+            && self
+                .highest_service_time()
+                .is_none_or(|now| now < at.saturating_add(LISTS_TOO_LARGE_RETRY_MS))
         {
             return Ok(());
         }
@@ -370,37 +395,52 @@ impl App {
                 .latest_server_time()
                 .or_else(|| self.highest_service_time())
                 .unwrap_or_else(|| self.now());
-            let me = self.state.meta.app_id;
-            let mut tx = self.tx()?;
-            for prefix in [
-                "lc/contact/",
-                "lc/conv/",
-                "lc/deny/",
-                "lc/flag/",
-                "lc/code/",
-            ] {
-                tx.delete_prefix(prefix)?;
+            match self.replace_lists(&list, as_of).await {
+                Err(error @ AppError::Store(StoreError::TooLarge { .. })) => {
+                    // Kept, in a commit of its own, so the reads don't fetch the same lists
+                    // again before [`LISTS_TOO_LARGE_RETRY_MS`].
+                    let mut tx = self.tx()?;
+                    tx.put(LISTS_TOO_LARGE, &as_of)?;
+                    self.commit(tx).await?;
+                    Err(error)
+                }
+                replaced => replaced.map(|()| list),
             }
-            for pubky in &list.contacts {
-                tx.put(&allow_key(AllowKind::Contact, pubky), &())?;
-            }
-            for entry in &list.conversations {
-                tx.put(&allow_key(AllowKind::Conversation, &entry.pubky), &())?;
-            }
-            for pubky in &list.deny {
-                tx.put(&deny_key(pubky), &())?;
-            }
-            for flagged in &list.flagged {
-                tx.put(&flag_key(&flagged.pubky), &())?;
-            }
-            tx.put(LISTS_AT, &as_of)?;
-            for code in list.invite_codes.iter().filter(|c| c.written_by == me) {
-                tx.put(&code_key(&code.code_hash), &())?;
-            }
-            self.commit(tx).await?;
-            Ok(list)
         })
         .await
+    }
+
+    /// The copy of the lists replaced from `list`, answered at `as_of`, in one commit.
+    async fn replace_lists(&mut self, list: &AllowList, as_of: u64) -> Result<(), AppError> {
+        let me = self.state.meta.app_id;
+        let mut tx = self.tx()?;
+        for prefix in [
+            "lc/contact/",
+            "lc/conv/",
+            "lc/deny/",
+            "lc/flag/",
+            "lc/code/",
+        ] {
+            tx.delete_prefix(prefix)?;
+        }
+        tx.delete(LISTS_TOO_LARGE)?;
+        for pubky in &list.contacts {
+            tx.put(&allow_key(AllowKind::Contact, pubky), &())?;
+        }
+        for entry in &list.conversations {
+            tx.put(&allow_key(AllowKind::Conversation, &entry.pubky), &())?;
+        }
+        for pubky in &list.deny {
+            tx.put(&deny_key(pubky), &())?;
+        }
+        for flagged in &list.flagged {
+            tx.put(&flag_key(&flagged.pubky), &())?;
+        }
+        tx.put(LISTS_AT, &as_of)?;
+        for code in list.invite_codes.iter().filter(|c| c.written_by == me) {
+            tx.put(&code_key(&code.code_hash), &())?;
+        }
+        self.commit(tx).await
     }
 
     /// A conversation entry added or removed in the feed (with `lists.read`): the copy of

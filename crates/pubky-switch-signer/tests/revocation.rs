@@ -198,16 +198,17 @@ async fn test_revocation_reaches_the_switch_while_an_alarm_holds_signing_back() 
 async fn test_revocation_takes_the_switchs_time_not_the_signers_clock() {
     // The signer's clock runs ten hours ahead of the switch's: `distrust_from` is the time
     // in the revocation's proof (Switch wire 7.4.12), and the backup keeps the App ID.
+    // The apps are approved first, while the clocks agree: an approval needs them to.
     let world = World::new();
-    let (signer, memory) = world.enrolled().await;
+    let (mut signer, memory) = world.enrolled().await;
+    let (a, _) = two_joined(&world, &mut signer).await;
+    let id = a.keys.app_id_bytes();
     drop(signer);
     let mut env = world.env(memory);
     env.clock = Arc::new(pubky_switch_client::clock::TestClock::new(
         START_MS + 10 * 3_600_000,
     ));
     let mut signer = Signer::open(env, world.keyring()).await.unwrap();
-    let (a, _) = two_joined(&world, &mut signer).await;
-    let id = a.keys.app_id_bytes();
     world.clock.advance_ms(DAY_MS);
     let removing = signer.revoke(id, None, confirmed()).await.unwrap();
     assert_eq!(removing.body().removed[0].distrust_from, START_MS + DAY_MS);
@@ -1207,4 +1208,126 @@ async fn test_full_bundle_request_after_the_approval_stores_every_epoch() {
     assert!(holds(&world, &opened(&world, &a), 1, "notes"));
     assert!(world.switch.app(&id).full_requested.is_none());
     assert!(signer.serve_full_bundles().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_revocation_of_an_app_whose_certificate_lapsed_isnt_unconfirmed() {
+    // The switch couldn't take the revocation of `a`, whose certificate merely lapsed: `a` is
+    // still current in spec 3.4's sense, so this isn't a switch showing no time for a removal.
+    // The revocation stays pending, with no `RevocationUnconfirmed`, and the next run sends it.
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let (a, _) = two_joined(&world, &mut signer).await;
+    let id = a.keys.app_id_bytes();
+    world.clock.advance_ms(800 * DAY_MS);
+    world.switch.fail_next(SwitchFault::Error {
+        path: "/revoke".into(),
+        code: pubky_switch_core::http::ErrorCode::Unavailable,
+        current: serde_json::Value::Null,
+    });
+    signer.revoke(id, None, confirmed()).await.unwrap_err();
+    assert!(
+        !signer
+            .alerts()
+            .contains(&Alert::RevocationUnconfirmed { app_id: id })
+    );
+    assert!(signer.alerts().iter().any(|alert| matches!(
+        alert,
+        Alert::RevocationPending { app_id, at_switch: false } if *app_id == id
+    )));
+    assert!(
+        signer
+            .identity_doc()
+            .unwrap()
+            .unwrap()
+            .listed_cert(&id)
+            .is_some()
+    );
+    let _ = signer.run_due().await;
+    let doc = signer.identity_doc().unwrap().unwrap();
+    assert!(doc.listed_cert(&id).is_none());
+    assert!(doc.body().removed.iter().any(|r| r.app_id == id));
+    assert!(
+        !signer
+            .alerts()
+            .contains(&Alert::RevocationUnconfirmed { app_id: id })
+    );
+}
+
+#[tokio::test]
+async fn test_revocation_rotation_serves_apps_by_the_switchs_time() {
+    // The device clock runs past the other app's certificate's expiry, the switch's time
+    // doesn't: the revocation's rotation still gives it the new epoch's keys (Switch wire 3.8).
+    let world = World::new();
+    let (mut signer, memory) = world.enrolled().await;
+    let (a, b) = two_joined(&world, &mut signer).await;
+    drop(signer);
+    let mut env = world.env(memory);
+    env.clock = Arc::new(pubky_switch_client::clock::TestClock::new(
+        START_MS + 400 * DAY_MS,
+    ));
+    let mut signer = Signer::open(env, world.keyring()).await.unwrap();
+    let removing = signer
+        .revoke(a.keys.app_id_bytes(), None, confirmed())
+        .await
+        .unwrap();
+    assert_eq!(removing.data_epoch(), 2);
+    assert!(holds(&world, &opened(&world, &b), 2, "notes"));
+}
+
+/// A signer for `world` on `memory` whose device clock reads `device_ms`, while the switch
+/// keeps `world`'s clock.
+async fn with_device_clock(world: &World, memory: Arc<MemoryStore>, device_ms: u64) -> Signer {
+    let mut env = world.env(memory);
+    env.clock = Arc::new(pubky_switch_client::clock::TestClock::new(device_ms));
+    Signer::open(env, world.keyring()).await.unwrap()
+}
+
+/// The default certificate lifetime, 365 days (Switch wire 3.1): the apps' certificates,
+/// issued at the start, expire then.
+const EXPIRY_MS: u64 = START_MS + 365 * DAY_MS;
+
+#[tokio::test]
+async fn test_revocation_rotation_skips_an_app_expired_by_the_switchs_time() {
+    // Just past the other app's expiry by the switch's time, with the device clock a few
+    // minutes behind, within the tolerance: the switch doesn't serve it, so the rotation gives
+    // it no part (Switch wire 3.8).
+    let world = World::new();
+    let (mut signer, memory) = world.enrolled().await;
+    let (a, b) = two_joined(&world, &mut signer).await;
+    drop(signer);
+    world.clock.set_ms(EXPIRY_MS + 60_000);
+    let mut signer = with_device_clock(&world, memory, EXPIRY_MS - 120_000).await;
+    signer
+        .revoke(a.keys.app_id_bytes(), None, confirmed())
+        .await
+        .unwrap();
+    assert!(!holds(&world, &opened(&world, &b), 2, "notes"));
+}
+
+#[tokio::test]
+async fn test_full_bundle_request_is_judged_on_the_switchs_time() {
+    // The device clock runs past the app's certificate's expiry, the switch's time doesn't:
+    // the app is served, and its full bundle stored. Just past its expiry by the switch's
+    // time, with the device clock a few minutes behind, it isn't (Switch wire 3.5).
+    let world = World::new();
+    let (mut signer, memory) = world.enrolled().await;
+    let (a, _) = two_joined(&world, &mut signer).await;
+    drop(signer);
+    let id = a.keys.app_id_bytes();
+    world.switch.request_full_bundle(id);
+    let mut signer = with_device_clock(&world, memory.clone(), EXPIRY_MS + DAY_MS).await;
+    assert_eq!(signer.serve_full_bundles().await.unwrap(), [id]);
+    drop(signer);
+
+    let world = World::new();
+    let (mut signer, memory) = world.enrolled().await;
+    let (a, _) = two_joined(&world, &mut signer).await;
+    drop(signer);
+    let id = a.keys.app_id_bytes();
+    world.switch.request_full_bundle(id);
+    world.clock.set_ms(EXPIRY_MS + 60_000);
+    let mut signer = with_device_clock(&world, memory, EXPIRY_MS - 120_000).await;
+    assert!(signer.serve_full_bundles().await.unwrap().is_empty());
+    assert!(world.switch.app(&id).full_requested.is_some());
 }

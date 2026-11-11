@@ -15,6 +15,35 @@ pub enum Source {
     Backup,
 }
 
+/// Why the signer didn't renew a certificate past half its lifetime by itself.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum RenewalSkip {
+    /// The certificate holds scopes no registered protocol owns, which a renewal can only
+    /// remove (design note, decision 2).
+    UnownedScopes {
+        /// Those scopes.
+        scopes: Vec<String>,
+    },
+    /// The registered protocols now give the certificate's scopes other switch permissions
+    /// than it holds. A renewal the user didn't ask for never changes what a certificate
+    /// grants: the user renews it, and sees the change.
+    PermissionsChanged {
+        /// The permissions the certificate holds.
+        held: Vec<String>,
+        /// The permissions a renewal would give it now.
+        now: Vec<String>,
+    },
+    /// The certificate's scopes now fail a scope rule, the Switch's or their protocol's: a
+    /// renewal keeping them would be refused.
+    ScopesRefused {
+        /// The protocol whose rule refused them; `None` for the Switch's own scope rule.
+        protocol: Option<String>,
+        /// The rule's own reason, as its code gives it.
+        reason: String,
+    },
+}
+
 /// Something the user needs to know.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -99,6 +128,31 @@ pub enum Alert {
         /// Its scopes that no registered protocol owns.
         scopes: Vec<String>,
     },
+    /// This app's certificate is past half its lifetime, and the signer doesn't renew it by
+    /// itself, for `reason` (Switch spec 3.2). Unless the user renews it, the certificate
+    /// expires and the switch stops serving the app.
+    RenewalSkipped {
+        /// The app whose certificate isn't renewed.
+        app_id: [u8; 16],
+        /// Why.
+        reason: RenewalSkip,
+    },
+    /// The newest `identity.json`, as delivered or as a move's enrollment would carry it,
+    /// takes more than three quarters of the most either may carry (the body cap `PUT
+    /// /identity` and `POST /enroll` share, Switch wire 3.7, 7.1). Past it no version can be
+    /// delivered, a revocation's included, and no move can enroll. Its `renewed` entries are
+    /// what grow it: an entry stays once its renewal is closed, until its app is removed.
+    IdentityNearLimit {
+        /// The larger of the two sizes, in bytes.
+        bytes: u64,
+        /// The cap, in bytes.
+        limit: u64,
+    },
+    /// The device clock and the switch's signed time differ by more than the clock tolerance
+    /// (Switch spec 10.1): certificates are stamped with the device clock, so the signer
+    /// renews none by itself, and refuses to issue or renew one, until they agree again. It
+    /// clears itself at the first run that finds them agreeing.
+    ClockOff,
     /// A removed app's Pubky grant still lets it write its Homeserver paths: the Pubky SDK
     /// offers no call to revoke a grant yet, so the user revokes it in the Homeserver's own
     /// settings (Switch spec 3.4, 12.2 step 1; design note, decision 4). Raised once for each
@@ -158,6 +212,30 @@ pub enum Alert {
     /// wire 3.13). The backup on the Homeserver is the one restored from; the next version's
     /// backup write replaces it.
     BackupNotWritten,
+    /// The switch refused to store the hand-over to this app for good (Switch wire 7.4.17),
+    /// as when it isn't current there. An earlier send may still be stored, so the hand-over
+    /// stays in progress: it takes effect if that app takes over, and the user aborts it
+    /// otherwise.
+    HandOverRefused {
+        /// The new signer's App ID.
+        to_app: [u8; 16],
+    },
+    /// The take-over's delivery won, but the vault didn't take the received secret, or didn't
+    /// give it back (Switch wire 3.12). The take-over keeps the hand-over as received, and
+    /// [`crate::Signer::resume`] puts the secret in the vault again; nothing is signed until
+    /// then.
+    KeyNotInstalled,
+    /// The switch refused the take-over's first delivery for good, as with a `400`, a `403`
+    /// or a `409 conflict` (Switch wire 3.12). The take-over stays undecided and is sent again;
+    /// the old signer's abort is the way out.
+    TakeOverRefused,
+    /// This install took the identity back from `from`, which the user confirmed lost (Switch
+    /// wire 3.12). If `from` is still around, it holds the key too, and stops as an install
+    /// that isn't named; nothing deletes it there.
+    TakenBack {
+        /// The signer ID the switch's copy named.
+        from: [u8; 16],
+    },
     /// A restore found the switch or the backup claiming keys sent past the next data
     /// epoch, which can't be: epochs never skip, and at most one is in progress beyond
     /// `data_epoch` (Switch spec 3.2, 3.5). The floor is kept at the next epoch.

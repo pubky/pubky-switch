@@ -36,7 +36,9 @@ use serde::{Deserialize, Serialize};
 use pubky_switch_core::enc::serde_b64;
 
 use super::error::Alarm;
-use super::protocol::StoreFailure;
+use super::feed::OwedCall;
+use super::protocol::{MissedEntries, ResendNeeded, StoreFailure};
+use super::recovery::ProviderLoss;
 
 /// The stable ID of a duty event ([`AppEvent::is_duty`]): the store's epoch, and a counter.
 ///
@@ -198,8 +200,10 @@ pub enum AppEvent {
     /// The entry stays unprocessed until a read processes it; the host repairs or frees its
     /// store.
     StoreFailing {
-        /// The entry's `seq`.
+        /// The entry's `seq`, the one it was read at for an entry stored locally.
         seq: u64,
+        /// The entry's local ID when it is stored locally.
+        stored_id: Option<u64>,
         /// The reads in a row that ended in a retry at the entry, this one included.
         reads: u32,
         /// When the first of them was, device time in Unix milliseconds.
@@ -219,20 +223,28 @@ pub enum AppEvent {
     Parked {
         /// The duty event's ID; `None` for an entry that later reads try again.
         id: Option<EventId>,
-        /// The entry's `seq`.
+        /// The `seq` the entry was read at.
         seq: u64,
+        /// The entry's local ID while it is stored ([`super::App`] keys stored entries by
+        /// it): it never changes, across provider changes too.
+        stored_id: u64,
         /// Why.
         reason: ParkReason,
     },
-    /// A received message's effect was refused for good, or has more operations than one
-    /// batch takes with the cursor move: its entry was stored locally and passed
+    /// A received message's effect was refused for good, has more operations than one
+    /// batch takes with the cursor move, or is too large for the app's store to keep or
+    /// commit ([`ParkReason::EffectTooLarge`]): its entry was stored locally and passed
     /// ([`AppEvent::Parked`]), and the effect isn't sent again (Switch spec 8.2). The
     /// protocol may build it again in another form. A duty event.
     EffectRefused {
         /// The duty event's ID.
         id: EventId,
-        /// The entry's `seq`.
+        /// The `seq` the entry was read at.
         seq: u64,
+        /// The entry's local ID while it is stored ([`super::App`] keys stored entries by
+        /// it): it never changes, across provider changes too.
+        stored_id: u64,
+
         /// The sender identity.
         sender: [u8; 32],
         /// The message ID.
@@ -254,8 +266,12 @@ pub enum AppEvent {
     EffectUncertain {
         /// The duty event's ID.
         id: EventId,
-        /// The entry's `seq`.
+        /// The `seq` the entry was read at.
         seq: u64,
+        /// The entry's local ID while it is stored ([`super::App`] keys stored entries by
+        /// it): it never changes, across provider changes too.
+        stored_id: u64,
+
         /// The sender identity.
         sender: [u8; 32],
         /// The message ID.
@@ -265,10 +281,54 @@ pub enum AppEvent {
         /// The effect's own `attempt`s: whether each was applied can't be known.
         attempts: Vec<ClaimAttempt>,
     },
+    /// An entry the host released ([`super::App::release_parked`]) was a duplicate when it
+    /// ran: the message was processed in the meantime, such as from a re-send that arrived
+    /// first, so the released entry went without its effect. A duty event, so the host
+    /// that released it learns how it ended.
+    ReleasedDuplicate {
+        /// The duty event's ID.
+        id: EventId,
+        /// The `seq` the entry was read at.
+        seq: u64,
+        /// The entry's local ID while it was stored.
+        stored_id: u64,
+        /// The sender identity.
+        sender: [u8; 32],
+        /// The message ID.
+        msg_id: String,
+        /// Whether the bytes differ from the message processed before.
+        conflicting: bool,
+    },
+    /// An entry stored because its sender's standing couldn't be checked
+    /// ([`ParkReason::Unverifiable`]) was dropped without being processed, past the bounds
+    /// Switch spec 8.2 sets ([`super::MAX_UNVERIFIED_AGE_MS`],
+    /// [`super::MAX_UNVERIFIED_PER_SENDER`], [`super::MAX_UNVERIFIED_TOTAL`]). The protocol
+    /// may ask the sender to send it again while the sender still keeps it (Switch spec
+    /// 11). A duty event, kept in the commit that deletes the entry.
+    StoredEntryDropped {
+        /// The duty event's ID.
+        id: EventId,
+        /// The entry's local ID while it was stored.
+        stored_id: u64,
+        /// The `seq` the entry was read at, in `generation`.
+        seq: u64,
+        /// The generation it was read at.
+        generation: u64,
+        /// The sender identity, the one its certificate names.
+        sender: [u8; 32],
+        /// When its inbox accepted it, service time in Unix milliseconds: the time a
+        /// re-send request asks from.
+        accepted_at_ms: u64,
+        /// Which bound it was past.
+        reason: DropReason,
+    },
     /// An entry stored locally was processed.
     Unparked {
-        /// The entry's `seq`.
+        /// The `seq` the entry was read at.
         seq: u64,
+        /// The entry's local ID while it is stored ([`super::App`] keys stored entries by
+        /// it): it never changes, across provider changes too.
+        stored_id: u64,
     },
     /// An entry wrapped to a key the app doesn't hold was passed with the cursor (Switch
     /// spec 8.2, 12.4); the protocol was asked to request a re-send when allowed.
@@ -532,7 +592,9 @@ pub enum AppEvent {
     /// A message answered `403 not_admitted` or `403 not_current` for
     /// [`super::UNDELIVERABLE_MS`] wasn't delivered (Switch spec 11). A message its
     /// recipient never accepted was deleted from the outbox with its plaintext; for a
-    /// re-send, only the re-send was given up. A duty event.
+    /// re-send, only the re-send was given up. Also a message whose try needed writes over
+    /// the store's sizes ([`crate::error::StoreError::TooLarge`]), which no later try can
+    /// make: it was deleted from the outbox at once. A duty event.
     MessageUndelivered {
         /// The duty event's ID.
         id: EventId,
@@ -540,6 +602,17 @@ pub enum AppEvent {
         msg_id: String,
         /// Whether it was a re-send of a message accepted before.
         resend: bool,
+    },
+    /// The local writes the protocol answered `call` with were over
+    /// [`super::MAX_STEP_LOCAL_BYTES`]: they weren't committed, and the call isn't made
+    /// again, since the same answer would come. The read went on. The protocol acts on what
+    /// the call said from its own state, such as asking for the re-send with writes that
+    /// fit. A duty event.
+    LocalWritesRefused {
+        /// The duty event's ID.
+        id: EventId,
+        /// The call whose writes were refused.
+        call: RefusedCall,
     },
     /// An app of a counterparty has no receive key record that passes the checks, so a
     /// message went to its other apps (Switch spec 8.1).
@@ -571,6 +644,25 @@ pub enum AppEvent {
         writer: [u8; 16],
         /// The rule, without content.
         reason: String,
+    },
+    /// The protocol's mark of what the app has seen in a record after a write
+    /// ([`super::Protocol::record_seen`]) was over [`super::MAX_SEEN_MARK_BYTES`], so the
+    /// record's writes can't be checked against what the app has seen from that write on
+    /// (Switch spec 8.2). For another app's write the record keeps the mark it held, so
+    /// what was seen before is still checked; for an own write the mark held goes. A duty
+    /// event, of the class of [`AppEvent::WriteFlagged`]. There is one per such write, not
+    /// per record: a writer that keeps the mark over the bound raises one at each write.
+    RecordUncheckable {
+        /// The duty event's ID.
+        id: EventId,
+        /// The record key.
+        key: [u8; 32],
+        /// The app the write names.
+        writer: [u8; 16],
+        /// The write's generation and `seq`.
+        version: pubky_switch_core::ops::RecordVersion,
+        /// The size of the mark that wasn't kept.
+        mark_bytes: u64,
     },
     /// Uploads after a provider loss conflict with a record's current write (Switch spec
     /// 12.6).
@@ -619,11 +711,15 @@ impl AppEvent {
             Self::Parked { id, .. } => *id,
             Self::EffectRefused { id, .. }
             | Self::EffectUncertain { id, .. }
+            | Self::ReleasedDuplicate { id, .. }
+            | Self::StoredEntryDropped { id, .. }
             | Self::KeptBatchDropped { id, .. }
             | Self::BatchRefused { id, .. }
             | Self::RestoreLeftBehind { id, .. }
             | Self::AttemptDropped { id, .. }
-            | Self::MessageUndelivered { id, .. } => Some(*id),
+            | Self::MessageUndelivered { id, .. }
+            | Self::RecordUncheckable { id, .. }
+            | Self::LocalWritesRefused { id, .. } => Some(*id),
             _ => None,
         }
     }
@@ -632,6 +728,62 @@ impl AppEvent {
     /// the store and delivered until acknowledged (module docs, "Duty events").
     pub fn is_duty(&self) -> bool {
         self.id().is_some()
+    }
+}
+
+/// A protocol call whose local writes were over the bound
+/// ([`AppEvent::LocalWritesRefused`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RefusedCall {
+    /// [`super::Protocol::resend_needed`], about the feed item at `seq`.
+    ResendNeeded {
+        /// The feed item's `seq`.
+        seq: u64,
+        /// What the call asked.
+        needed: ResendNeeded,
+    },
+    /// [`super::Protocol::missed`].
+    Missed(MissedEntries),
+    /// [`super::Protocol::provider_lost`], its [`super::LossActions::local`], at this loss;
+    /// the loss went on without them.
+    ProviderLost(ProviderLoss),
+}
+
+/// A [`RefusedCall`] as a duty event keeps it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum KeptRefusal {
+    Owed {
+        seq: u64,
+        call: OwedCall,
+    },
+    Loss {
+        lost_generation: u64,
+        generation: u64,
+        declared_at_ms: u64,
+        accepted_from_ms: u64,
+        uncertain_until_ms: u64,
+    },
+}
+
+impl KeptRefusal {
+    fn call(self) -> RefusedCall {
+        match self {
+            Self::Owed { seq, call } => call.refused(seq),
+            Self::Loss {
+                lost_generation,
+                generation,
+                declared_at_ms,
+                accepted_from_ms,
+                uncertain_until_ms,
+            } => RefusedCall::ProviderLost(ProviderLoss {
+                lost_generation,
+                generation,
+                declared_at_ms,
+                accepted_from_ms,
+                uncertain_until_ms,
+            }),
+        }
     }
 }
 
@@ -651,10 +803,12 @@ pub struct ClaimAttempt {
 pub(crate) enum Duty {
     Parked {
         seq: u64,
+        stored_id: u64,
         reason: ParkReason,
     },
     EffectRefused {
         seq: u64,
+        stored_id: u64,
         #[serde(with = "serde_b64")]
         sender: [u8; 32],
         msg_id: String,
@@ -663,12 +817,30 @@ pub(crate) enum Duty {
     },
     EffectUncertain {
         seq: u64,
+        stored_id: u64,
         #[serde(with = "serde_b64")]
         sender: [u8; 32],
         msg_id: String,
         kind: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         attempts: Vec<ClaimAttempt>,
+    },
+    ReleasedDuplicate {
+        seq: u64,
+        stored_id: u64,
+        #[serde(with = "serde_b64")]
+        sender: [u8; 32],
+        msg_id: String,
+        conflicting: bool,
+    },
+    StoredEntryDropped {
+        stored_id: u64,
+        seq: u64,
+        generation: u64,
+        #[serde(with = "serde_b64")]
+        sender: [u8; 32],
+        accepted_at_ms: u64,
+        reason: DropReason,
     },
     KeptBatchDropped {
         #[serde(with = "serde_b64")]
@@ -689,6 +861,18 @@ pub(crate) enum Duty {
         msg_id: String,
         resend: bool,
     },
+    LocalWritesRefused {
+        call: KeptRefusal,
+    },
+    RecordUncheckable {
+        #[serde(with = "serde_b64")]
+        key: [u8; 32],
+        #[serde(with = "serde_b64")]
+        writer: [u8; 16],
+        generation: u64,
+        version: u64,
+        mark_bytes: u64,
+    },
     RestoreLeftBehind {
         duty_events: u64,
         owed_calls: u64,
@@ -696,16 +880,34 @@ pub(crate) enum Duty {
 }
 
 impl Duty {
+    /// The local ID of the entry stored locally the event names, if it names one.
+    pub(crate) fn stored_id(&self) -> Option<u64> {
+        match self {
+            Self::Parked { stored_id, .. }
+            | Self::EffectRefused { stored_id, .. }
+            | Self::EffectUncertain { stored_id, .. }
+            | Self::ReleasedDuplicate { stored_id, .. }
+            | Self::StoredEntryDropped { stored_id, .. } => Some(*stored_id),
+            _ => None,
+        }
+    }
+
     /// The event reported for it, with its ID.
     pub(crate) fn event(self, id: EventId) -> AppEvent {
         match self {
-            Self::Parked { seq, reason } => AppEvent::Parked {
+            Self::Parked {
+                seq,
+                stored_id,
+                reason,
+            } => AppEvent::Parked {
                 id: Some(id),
                 seq,
+                stored_id,
                 reason,
             },
             Self::EffectRefused {
                 seq,
+                stored_id,
                 sender,
                 msg_id,
                 kind,
@@ -713,6 +915,7 @@ impl Duty {
             } => AppEvent::EffectRefused {
                 id,
                 seq,
+                stored_id,
                 sender,
                 msg_id,
                 kind,
@@ -720,6 +923,7 @@ impl Duty {
             },
             Self::EffectUncertain {
                 seq,
+                stored_id,
                 sender,
                 msg_id,
                 kind,
@@ -727,10 +931,41 @@ impl Duty {
             } => AppEvent::EffectUncertain {
                 id,
                 seq,
+                stored_id,
                 sender,
                 msg_id,
                 kind,
                 attempts,
+            },
+            Self::ReleasedDuplicate {
+                seq,
+                stored_id,
+                sender,
+                msg_id,
+                conflicting,
+            } => AppEvent::ReleasedDuplicate {
+                id,
+                seq,
+                stored_id,
+                sender,
+                msg_id,
+                conflicting,
+            },
+            Self::StoredEntryDropped {
+                stored_id,
+                seq,
+                generation,
+                sender,
+                accepted_at_ms,
+                reason,
+            } => AppEvent::StoredEntryDropped {
+                id,
+                stored_id,
+                seq,
+                generation,
+                sender,
+                accepted_at_ms,
+                reason,
             },
             Self::KeptBatchDropped { batch_id } => AppEvent::KeptBatchDropped { id, batch_id },
             Self::BatchRefused { batch_id, code } => AppEvent::BatchRefused { id, batch_id, code },
@@ -745,6 +980,23 @@ impl Duty {
             Self::MessageUndelivered { msg_id, resend } => {
                 AppEvent::MessageUndelivered { id, msg_id, resend }
             }
+            Self::LocalWritesRefused { call } => AppEvent::LocalWritesRefused {
+                id,
+                call: call.call(),
+            },
+            Self::RecordUncheckable {
+                key,
+                writer,
+                generation,
+                version,
+                mark_bytes,
+            } => AppEvent::RecordUncheckable {
+                id,
+                key,
+                writer,
+                version: pubky_switch_core::ops::RecordVersion::new(generation, version),
+                mark_bytes,
+            },
             Self::RestoreLeftBehind {
                 duty_events,
                 owed_calls,
@@ -766,11 +1018,29 @@ pub enum BackupRefusal {
     TooLarge,
 }
 
+/// Which of the bounds on entries stored as [`ParkReason::Unverifiable`] an entry was
+/// dropped past (Switch spec 8.2, [`AppEvent::StoredEntryDropped`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
+pub enum DropReason {
+    /// It was kept longer than [`super::MAX_UNVERIFIED_AGE_MS`] from its acceptance,
+    /// judged on the highest service time the app verified.
+    Age,
+    /// Its sender identity held more than [`super::MAX_UNVERIFIED_PER_SENDER`] such
+    /// entries, and it was that sender's accepted earliest.
+    PerSender,
+    /// More than [`super::MAX_UNVERIFIED_TOTAL`] such entries were stored, and it was the
+    /// one accepted earliest of the sender identity that held the most.
+    Total,
+}
+
 /// Why an entry was stored locally (Switch spec 8.2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub enum ParkReason {
-    /// Its sender couldn't be checked within the bounded wait.
+    /// Its sender couldn't be checked within the bounded wait. It is tried again at every
+    /// read, within the bounds Switch spec 8.2 sets: past them it is dropped
+    /// ([`AppEvent::StoredEntryDropped`]).
     Unverifiable,
     /// Its shared record write hit a per-kind limit, the storage quota or the value size.
     Quota,
@@ -780,6 +1050,13 @@ pub enum ParkReason {
     /// Its effect has more operations than one batch takes with the cursor move (Switch
     /// wire 6.4): it is kept, not applied, and not tried again.
     TooManyOperations,
+    /// Its effect is too large for the app to keep before it sends it, or to commit with
+    /// its outcome: the kept effect over the store's value size
+    /// ([`crate::store::MAX_VALUE_BYTES`]), or its local writes over what one commit takes
+    /// ([`crate::store::MAX_BATCH_BYTES`]) (Switch spec 8.2). The same effect is refused
+    /// again however often it is built: it is kept, not applied, and not tried again
+    /// ([`AppEvent::EffectRefused`]).
+    EffectTooLarge,
     /// Its receive step asked for more reads from the switch than one entry gets
     /// ([`super::MAX_CLAIM_READS`]), or again for what it was given: it is kept, not
     /// applied, and not tried again.
@@ -800,17 +1077,29 @@ pub enum ParkReason {
     /// applied (Switch spec 12.5 "Kept batches"): it is kept, and not tried again
     /// ([`AppEvent::EffectUncertain`]).
     Uncertain,
+    /// It was stored as [`ParkReason::Uncertain`], and the host released it
+    /// ([`super::App::release_parked`]): its processed pair is gone, and a later read tries
+    /// it again as a fresh receive, with [`super::ReceivedMessage::released`] set. A run
+    /// whose effect is uncertain again is stored as [`ParkReason::Uncertain`] again.
+    ///
+    /// A build earlier than schema 3 (`STATE.md`) refuses a store that holds this reason, or
+    /// [`ParkReason::EffectTooLarge`], from the schema version alone, so neither is misread.
+    Released,
 }
 
 impl ParkReason {
     /// Whether an entry stored for this reason is processed again by a later read: one
-    /// whose sender couldn't be checked, whose write hit a quota, or whose receive step
-    /// the store kept from finishing. The others stay stored until the protocol acts on
-    /// them.
+    /// whose sender couldn't be checked, whose write hit a quota, whose receive step the
+    /// store kept from finishing, or that the host released. The others stay stored until
+    /// the protocol or the host acts on them ([`super::App::forget_parked`]).
     pub fn tried_again(self) -> bool {
         matches!(
             self,
-            Self::Unverifiable | Self::Quota | Self::StoreUnavailable | Self::StoreRejected
+            Self::Unverifiable
+                | Self::Quota
+                | Self::StoreUnavailable
+                | Self::StoreRejected
+                | Self::Released
         )
     }
 }

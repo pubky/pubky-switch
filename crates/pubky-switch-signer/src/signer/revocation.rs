@@ -64,8 +64,9 @@ impl Signer {
     ///
     /// # Errors
     ///
-    /// [`Refusal::NotListed`] for an app the newest `identity.json` doesn't list; otherwise
-    /// as [`Signer::resume`]. A revocation cut short goes on at [`Signer::run_due`]. While an
+    /// [`Refusal::NotListed`] for an app the newest `identity.json` doesn't list;
+    /// [`Refusal::HandingOver`] or [`Refusal::TakingOver`] while a hand-over or a take-over is
+    /// in progress; otherwise as [`Signer::resume`]. A revocation cut short goes on at [`Signer::run_due`]. While an
     /// alarm holds signing back, the app is still revoked at the switch, and the error is the
     /// alarm's: the version that removes it waits until the alarm is cleared.
     pub async fn revoke(
@@ -76,6 +77,20 @@ impl Signer {
     ) -> Result<IdentityDoc> {
         self.refresh().await?;
         self.check_named()?;
+        // The hand-over was sealed before this revocation: one the switch hadn't taken when it
+        // took effect would be lost with these records. The user aborts first, then revokes
+        // (Switch wire 3.12).
+        if let Some(handing) = &self.state.handing_over {
+            return Err(Refusal::HandingOver {
+                to_app: handing.to_app,
+            }
+            .into());
+        }
+        // Nor while taking over: a revocation at the switch can't be undone, and this install
+        // isn't the signer until its first delivery has won (Switch wire 3.12).
+        if self.state.taking_over {
+            return Err(Refusal::TakingOver.into());
+        }
         let newest = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
         if newest.listed_cert(&app_id).is_none() {
             return Err(Refusal::NotListed.into());
@@ -166,7 +181,7 @@ impl Signer {
         // A rotation goes to the epoch after the newest version's, completing first an
         // epoch a given-up rotation sent keys for (Switch spec 3.2, 3.5).
         if self.state.epoch_through > newest.data_epoch() {
-            self.complete_epoch(&statuses).await?;
+            self.complete_epoch(&statuses, answered_at).await?;
             newest = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
             (statuses, answered_at) = self.switch_apps_at().await?;
         }
@@ -179,7 +194,7 @@ impl Signer {
         let key = self.signing_key()?;
         // The apps removed get no part, whatever the switch shows of them.
         let cut: Vec<[u8; 16]> = removing.iter().map(|r| r.app_id).collect();
-        let (ops, mut alerts) = self.catch_up(&key, &newest, &statuses, &cut, last)?;
+        let (ops, mut alerts) = self.catch_up(&key, &newest, &statuses, answered_at, &cut, last)?;
         alerts.extend(found.alerts);
         let batches = self.sign_batches(&key, newest.generation(), ops)?;
         let (doc, flow) = self.next_version(&key, |body| {
@@ -473,9 +488,9 @@ impl Signer {
     pub async fn serve_full_bundles(&mut self) -> Result<Vec<[u8; 16]>> {
         self.ready().await?;
         let newest = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
-        let statuses = self.switch_apps().await?;
+        // Served is judged on the switch's signed time, not the device clock.
+        let (statuses, now) = self.switch_apps_at().await?;
         let certs = self.held_certs()?;
-        let now = self.env.clock.now_ms();
         let current = newest.data_epoch();
         let protocols = self.env.protocols.clone();
         let keyed = keyed(&protocols);

@@ -475,20 +475,20 @@ async fn test_calls_not_served_yet() {
     let Some(replay) = replay().await else { return };
     serving(&replay).await;
     let alice = alice_keys();
-    let directory = replay
+    let unserved = replay
         .service
         .handle(request(
             "GET",
-            &format!("/v1/{}/directory", alice.id),
+            &format!("/v1/{}/records", alice.id),
             &[],
             Vec::new(),
         ))
         .await;
     assert_eq!(
-        (directory.status, code(&directory).as_str()),
+        (unserved.status, code(&unserved).as_str()),
         (503, "unavailable")
     );
-    assert!(signature_key(&directory).is_some());
+    assert!(signature_key(&unserved).is_some());
     replay.db.drop_database().await.expect("drop");
 }
 

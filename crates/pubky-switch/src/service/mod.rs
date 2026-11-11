@@ -11,14 +11,17 @@
 //! Served so far: `POST /v1/enroll`, `PUT /v1/{id}/identity`, the public
 //! `GET /v1/{id}/identity`, `POST /v1/{id}/ops`, `GET /v1/{id}/feed`,
 //! `POST /v1/{id}/inbox`, `PUT /v1/{id}/peers`, `GET /v1/{id}/claims/{claim_key}`,
-//! `GET /v1/{id}/apps` and
-//! `POST /v1/{id}/apps/{app_id}/revoke`. Every other call is answered `503 unavailable`.
+//! `GET /v1/{id}/apps`, `POST /v1/{id}/apps/{app_id}/revoke`, `GET /v1/{id}/directory`,
+//! and `GET` and `POST /v1/{id}/apps/{app_id}/keys`. Every other call is answered `503
+//! unavailable`.
 
 mod admission;
 mod allow;
+mod app_keys;
 mod apps;
 pub mod batch;
 mod claims;
+mod directory;
 mod enroll;
 mod feed;
 mod identity;
@@ -391,6 +394,9 @@ impl Service {
             | Call::Feed
             | Call::PutPeers
             | Call::Append
+            | Call::Directory
+            | Call::GetKeys(_)
+            | Call::RequestKeys(_)
             | Call::GetAllow => {
                 match self.authenticate_caller(&account, &request, base_ms, base_ms.max(stamped_ms))
                 {
@@ -966,6 +972,38 @@ impl Service {
                     .map(|answer| (answer, serving))
                     .map_err(|error| Refused::with_head(error, serving));
             }
+            Call::Directory => {
+                let reader = match (writer.as_ref(), other) {
+                    (Some(_), _) => directory::Reader::OwnApp,
+                    (None, Some(cert)) => directory::Reader::OtherApp(cert),
+                    (None, None) => {
+                        return Err(Refused::with_head(
+                            ApiError::new(
+                                ErrorCode::PermissionMissing,
+                                "7.4.10: apps read the directory; the signer doesn't",
+                            ),
+                            serving,
+                        ));
+                    }
+                };
+                let invite_code = request
+                    .headers
+                    .get(header::INVITE_CODE)
+                    .and_then(|value| value.to_str().ok());
+                return self
+                    .directory(
+                        txn,
+                        signer,
+                        held.as_ref(),
+                        reader,
+                        invite_code,
+                        due.is_some(),
+                        time_ms,
+                    )
+                    .await
+                    .map(|answer| (answer, serving))
+                    .map_err(|error| Refused::with_head(error, serving));
+            }
             Call::PutPeers => {
                 let deliverer = match (writer.as_ref(), other) {
                     (Some(_), _) => peers::Deliverer::OwnApp,
@@ -1026,6 +1064,31 @@ impl Service {
                         &request.route.query,
                         time_ms,
                     )
+                    .map(|answer| (answer, serving))
+                    .map_err(|error| Refused::with_head(error, serving));
+            }
+            Call::GetKeys(app_id) | Call::RequestKeys(app_id) => {
+                // Only the app itself; the signer stores the parts with `key_bundle.put`
+                // (Switch wire 7.4.11).
+                let Some(caller) = writer.as_ref() else {
+                    return Err(Refused::with_head(app_keys::only_that_app(), serving));
+                };
+                let keys_call = if matches!(call, Call::GetKeys(_)) {
+                    app_keys::KeysCall::Read
+                } else {
+                    app_keys::KeysCall::Request
+                };
+                return self
+                    .app_keys(
+                        txn,
+                        signer,
+                        caller,
+                        app_id,
+                        &request.body,
+                        keys_call,
+                        time_ms,
+                    )
+                    .await
                     .map(|answer| (answer, serving))
                     .map_err(|error| Refused::with_head(error, serving));
             }

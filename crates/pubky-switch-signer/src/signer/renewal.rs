@@ -41,18 +41,19 @@ use pubky_switch_client::client::answers::AppStatus;
 
 use pubky_switch_core::ops::{KeyBundlePut, OpKind};
 use pubky_switch_core::records::{
-    AppCert, AppCertBody, BundlePart, CLOCK_TOLERANCE_MS, IdentityDoc, MAX_CERT_LIFETIME_MS,
-    RenewedCert, StoredPart, incremental_first_epoch, is_reduction, owed_closings,
-    reduction_rotates, seal_bundle_parts,
+    AppCert, AppCertBody, AppRequest, Approval, ApprovalClaim, AuthRequest, BundlePart,
+    CLOCK_TOLERANCE_MS, IdentityDoc, MAX_CERT_LIFETIME_MS, RenewedCert, StoredPart,
+    incremental_first_epoch, is_reduction, owed_closings, reduction_rotates, seal_bundle_parts,
 };
+use pubky_switch_core::scopes::Permission;
 use pubky_switch_core::sig::SignedDoc;
 
 use super::Signer;
-use crate::alert::Alert;
+use crate::alert::{Alert, RenewalSkip};
 use crate::error::{Refusal, Result, SignerError};
 use crate::key::SigningKey;
 use crate::protocol::Protocols;
-use crate::state::{Bytes, DeliverStep, Flow, RenewBatch, SignerState};
+use crate::state::{Bytes, DeliverStep, Flow, PendingClaim, RenewBatch, SignerState};
 
 /// The most signed operations in one batch (Switch wire 6.4).
 const MAX_OPS: usize = 8;
@@ -83,6 +84,18 @@ impl Signer {
     /// for an expiry the certificate rules refuse; otherwise as [`Signer::resume`].
     pub async fn renew(&mut self, app_id: [u8; 16], change: CertChange) -> Result<IdentityDoc> {
         self.ready().await?;
+        self.renew_listed(app_id, change, None).await
+    }
+
+    /// [`Signer::renew`], once the signer is ready: with `answering`, the renewal answers that
+    /// app request, and its approval's companion claim is committed with the renewing version,
+    /// released once the switch has taken it (Switch wire 3.9 step 5, 3.10).
+    pub(super) async fn renew_listed(
+        &mut self,
+        app_id: [u8; 16],
+        change: CertChange,
+        answering: Option<&Answering<'_>>,
+    ) -> Result<IdentityDoc> {
         // A revoked or departing app gets no new certificate, expiry or key (Switch spec 12.2).
         if self.cut_off(&app_id) {
             return Err(Refusal::CutOff.into());
@@ -103,9 +116,11 @@ impl Signer {
             .expires_at
             .unwrap_or_else(|| issued.saturating_add(self.state.cert_lifetime_ms))
             .min(issued.saturating_add(MAX_CERT_LIFETIME_MS));
-        // The switch's view, read before anything is signed: this install still signs, and
-        // the app has joined.
-        let statuses = self.switch_apps().await?;
+        // The switch's view, read before anything is signed: this install still signs, the
+        // app has joined, and the device clock the certificate is stamped with agrees with
+        // the switch's time.
+        let (statuses, switch_time) = self.switch_apps_at().await?;
+        clock_agrees(now, switch_time)?;
         let joined = statuses
             .iter()
             .any(|s| s.app_id == app_id && s.record_cert.is_some());
@@ -133,19 +148,21 @@ impl Signer {
         // A rotation goes to the epoch after the newest version's. When a rotation that was
         // given up sent keys above that one, the epoch it sent is completed first, so no app
         // holds the new epoch's keys early and no epoch is skipped (Switch spec 3.2, 3.5).
-        let (newest, statuses) = if rotates && self.state.epoch_through > newest.data_epoch() {
-            self.complete_epoch(&statuses).await?;
-            let newest = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
-            if newest.listed_cert(&app_id) != Some(listed) {
-                return Err(Refusal::Superseded {
-                    version: newest.version(),
+        let (newest, statuses, switch_time) =
+            if rotates && self.state.epoch_through > newest.data_epoch() {
+                self.complete_epoch(&statuses, switch_time).await?;
+                let newest = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
+                if newest.listed_cert(&app_id) != Some(listed) {
+                    return Err(Refusal::Superseded {
+                        version: newest.version(),
+                    }
+                    .into());
                 }
-                .into());
-            }
-            (newest, self.switch_apps().await?)
-        } else {
-            (newest, statuses)
-        };
+                let (statuses, switch_time) = self.switch_apps_at().await?;
+                (newest, statuses, switch_time)
+            } else {
+                (newest, statuses, switch_time)
+            };
         let current = newest.data_epoch();
         let last = if rotates {
             current
@@ -169,7 +186,8 @@ impl Signer {
         // A rotation: every other current app's bundle through the new epoch.
         let mut alerts = Vec::new();
         if rotates {
-            let (more, skipped) = self.catch_up(&key, &newest, &statuses, &[app_id], last)?;
+            let (more, skipped) =
+                self.catch_up(&key, &newest, &statuses, switch_time, &[app_id], last)?;
             ops.extend(more);
             alerts = skipped;
         }
@@ -185,9 +203,28 @@ impl Signer {
             });
             body.data_epoch = last;
         })?;
+        let claim = answering
+            .map(|answering| {
+                let has_keys = |scope: &str| protocols.has_keys(scope);
+                let approval =
+                    Approval::issue(&key, answering.request, new.clone(), doc.clone(), &has_keys)?;
+                let claim = ApprovalClaim::sign(&key, answering.auth, &approval)?;
+                Ok::<_, SignerError>(PendingClaim {
+                    request: answering.request.hash(),
+                    app_id,
+                    cert: new.hash(),
+                    caps: answering.caps.to_owned(),
+                    plaintext: claim.plaintext(),
+                })
+            })
+            .transpose()?;
         drop(key);
         let mut state = self.state.clone();
         state.certs.push(new.signed().clone());
+        if let Some(claim) = claim {
+            state.claims.retain(|held| held.request != claim.request);
+            state.claims.push(claim);
+        }
         state.epoch_through = state.epoch_through.max(last);
         self.commit_batches(state, &newest, &statuses, alerts, batches, &doc, flow)
             .await?;
@@ -199,12 +236,16 @@ impl Signer {
     /// current app holding each keyed scope its keys through it, the app of a given-up
     /// reduction included, as it still holds its scopes, then deliver a version raising
     /// `data_epoch` to it (Switch spec 3.2, 3.5; Switch wire 3.8). `statuses` is the switch's
-    /// view, read once its copy was confirmed.
-    pub(super) async fn complete_epoch(&mut self, statuses: &[AppStatus]) -> Result<()> {
+    /// view, read once its copy was confirmed, and `switch_time` the time it is signed at.
+    pub(super) async fn complete_epoch(
+        &mut self,
+        statuses: &[AppStatus],
+        switch_time: u64,
+    ) -> Result<()> {
         let newest = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
         let through = self.state.epoch_through;
         let key = self.signing_key()?;
-        let (ops, alerts) = self.catch_up(&key, &newest, statuses, &[], through)?;
+        let (ops, alerts) = self.catch_up(&key, &newest, statuses, switch_time, &[], through)?;
         let batches = self.sign_batches(&key, newest.generation(), ops)?;
         let (doc, flow) = self.next_version(&key, |body| body.data_epoch = through)?;
         drop(key);
@@ -222,7 +263,8 @@ impl Signer {
     /// App ID that is a tombstone or has a revocation asked for gets no part, whatever the
     /// switch shows (Switch spec 12.2: a removed app reads nothing written later).
     ///
-    /// An app the switch doesn't serve now, one not current, not joined or expired, gets no
+    /// An app the switch doesn't serve now, one not current, not joined or expired at
+    /// `switch_time`, the switch's signed time of `statuses`, gets no
     /// part, nor does one whose certificate holds a scope no registered protocol owns, with
     /// [`Alert::RotationSkipped`]. Either gets the epochs it lacks from its next bundle, which
     /// starts after `keys_through`.
@@ -231,11 +273,12 @@ impl Signer {
         key: &SigningKey,
         newest: &IdentityDoc,
         statuses: &[AppStatus],
+        switch_time: u64,
         except: &[[u8; 16]],
         last: u64,
     ) -> Result<(Vec<Op>, Vec<Alert>)> {
         let certs = self.held_certs()?;
-        let now = self.env.clock.now_ms();
+        let now = switch_time;
         let keyed = keyed(&self.env.protocols);
         let mut ops = Vec::new();
         let mut alerts = Vec::new();
@@ -375,11 +418,6 @@ impl Signer {
             prev,
         };
         self.commit(state, Some(flow)).await
-    }
-
-    /// The switch's apps, once its copy is confirmed as this install's mark.
-    pub(super) async fn switch_apps(&mut self) -> Result<Vec<AppStatus>> {
-        Ok(self.switch_apps_at().await?.0)
     }
 
     /// The switch's apps, once its copy is confirmed as this install's mark, and the service
@@ -645,14 +683,28 @@ impl Signer {
     /// What is due at each start, in order (design note, section 4.5): finish the flow in
     /// progress and any closing delivery owed (Switch wire 3.8), remove the apps revoked or
     /// departed (Switch spec 12.2, 12.3), close the cooperative renewals whose apps took their
-    /// new certificate, and answer the full-bundle requests (Switch wire 3.5).
+    /// new certificate, answer the full-bundle requests (Switch wire 3.5), renew the
+    /// certificates past half their lifetime ([`Signer::renew_expiring`]), and publish the
+    /// newest version again where the Homeserver's copy is older, missing or unreadable
+    /// (Switch wire 3.3).
     ///
     /// # Errors
     ///
     /// As [`Signer::resume`].
     pub async fn run_due(&mut self) -> Result<()> {
+        // While a hand-over or a take-over is in progress, only its own step runs: nothing
+        // routine is signed, and what is owed stays owed (Switch wire 3.12).
+        self.refresh().await?;
+        if self.state.handing_over.is_some() || self.state.taking_over {
+            return self.resume().await;
+        }
         // A publication that failed doesn't hold back the closings owed at the switch.
+        let erased_before = self.state.erased;
         let resumed = self.resume().await;
+        // The run that completes an erasure has nothing more to do (Switch spec 12.7).
+        if self.state.erased && !erased_before {
+            return resumed;
+        }
         if let Err(error) = &resumed
             && (self.flow.is_some() || !matches!(error, SignerError::Homeserver(_)))
         {
@@ -664,8 +716,159 @@ impl Signer {
         self.complete_removals().await?;
         self.complete_renewals().await?;
         self.serve_full_bundles().await?;
+        self.renew_expiring().await?;
+        self.republish().await?;
         resumed
     }
+
+    /// Renew the certificate of every current app once less than half its lifetime remains,
+    /// each with the default lifetime from now, in a renewing version of its own (Switch spec
+    /// 3.2; Switch wire 3.8, Appendix A, A28). Returns the apps renewed.
+    ///
+    /// - Current is spec 3.4's sense, whatever the certificate's expiry: the newest
+    ///   `identity.json` lists the app, and it is neither revoked, being revoked, nor departed.
+    ///   An app whose certificate has expired already is renewed too, which is how it comes
+    ///   back: the switch takes the signer's renewal for it although its certificate has
+    ///   expired (Switch wire 3.8 "An expired certificate"). One that hasn't joined is left:
+    ///   the switch takes no `cert.put` for it yet (Switch wire 6.2).
+    /// - An app with a renewal still open is renewed again all the same, so an app that stays
+    ///   away never lapses: each renewal adds a `renewed` entry, and a newer `cert.put`
+    ///   replaces the one the switch stores (Switch wire 3.3, 3.8).
+    /// - Half the lifetime is judged on the switch's signed time, from its `GET /apps` answer.
+    ///   The certificate is stamped with the device clock, so while that clock and the
+    ///   switch's time differ by more than the clock tolerance, nothing is renewed by itself,
+    ///   with [`Alert::ClockOff`] (Switch spec 10.1).
+    /// - A renewal the user didn't ask for never changes what a certificate grants: an app
+    ///   whose scopes a registered protocol no longer owns or a scope rule now refuses, or
+    ///   which the protocols' tables now give other switch permissions, is skipped, with
+    ///   [`Alert::RenewalSkipped`] naming why (design note, decision 2). A refusal that
+    ///   concerns one app only doesn't hold back the others.
+    /// - [`Alert::ClockOff`] clears itself at the first run that finds the clocks agreeing.
+    ///
+    /// # Errors
+    ///
+    /// As [`Signer::renew`]. A failure of the switch, the Homeserver or the store stops the
+    /// run; a renewal it cut short is finished by [`Signer::resume`], and the apps left are
+    /// renewed at the next run.
+    pub async fn renew_expiring(&mut self) -> Result<Vec<[u8; 16]>> {
+        self.ready().await?;
+        let newest = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
+        let (statuses, switch_time) = self.switch_apps_at().await?;
+        if clock_agrees(self.env.clock.now_ms(), switch_time).is_err() {
+            return self.skip_renewals(vec![Alert::ClockOff]).await;
+        }
+        // The clocks agree again: the alert has served.
+        if self.state.alerts.contains(&Alert::ClockOff) {
+            let mut state = self.state.clone();
+            state.alerts.retain(|alert| *alert != Alert::ClockOff);
+            self.commit(state, None).await?;
+        }
+        let certs = self.held_certs()?;
+        let mut due = Vec::new();
+        let mut skipped = Vec::new();
+        for listed in &newest.body().apps {
+            let removed = statuses.iter().any(|s| {
+                s.app_id == listed.app_id && (s.revoked_at.is_some() || s.departed_at.is_some())
+            });
+            let Some(cert) = certs.iter().find(|c| c.hash() == listed.cert) else {
+                continue;
+            };
+            if removed || !past_half_lifetime(cert, switch_time) {
+                continue;
+            }
+            // The certificate as it is: the same scopes, and the permissions it holds.
+            let reason = match self.env.protocols.terms(cert.scopes()) {
+                Err(SignerError::Refused(Refusal::UnknownScopes { scopes })) => {
+                    Some(RenewalSkip::UnownedScopes { scopes })
+                }
+                Err(SignerError::Refused(Refusal::ProtocolRule { protocol, reason })) => {
+                    Some(RenewalSkip::ScopesRefused {
+                        protocol: Some(protocol),
+                        reason,
+                    })
+                }
+                Err(SignerError::Refused(Refusal::Scopes(reason))) => {
+                    Some(RenewalSkip::ScopesRefused {
+                        protocol: None,
+                        reason,
+                    })
+                }
+                Err(error) => return Err(error),
+                Ok(terms) if terms.permissions != cert.permissions() => {
+                    let names = |all: &[Permission]| all.iter().map(ToString::to_string).collect();
+                    Some(RenewalSkip::PermissionsChanged {
+                        held: names(cert.permissions()),
+                        now: names(&terms.permissions),
+                    })
+                }
+                Ok(_) => None,
+            };
+            match reason {
+                Some(reason) => skipped.push(Alert::RenewalSkipped {
+                    app_id: listed.app_id,
+                    reason,
+                }),
+                None => due.push(listed.app_id),
+            }
+        }
+        self.skip_renewals(skipped).await?;
+        let mut renewed = Vec::new();
+        for app_id in due {
+            match self.renew(app_id, CertChange::default()).await {
+                Ok(_) => renewed.push(app_id),
+                Err(SignerError::Refused(
+                    Refusal::NotJoined
+                    | Refusal::NotListed
+                    | Refusal::CutOff
+                    | Refusal::Superseded { .. }
+                    | Refusal::Scopes { .. }
+                    | Refusal::UnknownScopes { .. }
+                    | Refusal::ProtocolRule { .. },
+                )) if self.flow.is_none() => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(renewed)
+    }
+
+    /// Raise `alerts` for renewals the signer leaves to the user; renews nothing.
+    async fn skip_renewals(&mut self, alerts: Vec<Alert>) -> Result<Vec<[u8; 16]>> {
+        let mut state = self.state.clone();
+        for alert in alerts {
+            state.alert(alert);
+        }
+        if state != self.state {
+            self.commit(state, None).await?;
+        }
+        Ok(Vec::new())
+    }
+}
+
+/// Whether the device clock, `now`, agrees with the switch's signed time within the clock
+/// tolerance (Switch spec 10.1): a certificate is stamped with the device clock.
+pub(super) fn clock_agrees(now: u64, switch_time: u64) -> Result<()> {
+    if now.abs_diff(switch_time) > CLOCK_TOLERANCE_MS {
+        return Err(Refusal::ClockOff {
+            device_ms: now,
+            switch_ms: switch_time,
+        }
+        .into());
+    }
+    Ok(())
+}
+
+/// Whether less than half of `cert`'s lifetime remains at `now` (Switch spec 3.2).
+fn past_half_lifetime(cert: &AppCert, now: u64) -> bool {
+    let lifetime = cert.expires_at().saturating_sub(cert.issued_at());
+    cert.expires_at().saturating_sub(now).saturating_mul(2) < lifetime
+}
+
+/// The app request a renewal answers (Switch wire 3.9 step 5): the request, the auth request
+/// it travels with, and the capabilities the grant covers.
+pub(super) struct Answering<'a> {
+    pub(super) request: &'a AppRequest,
+    pub(super) auth: &'a AuthRequest,
+    pub(super) caps: &'a str,
 }
 
 /// A batch operation, with the key bundle part it stores, if any.

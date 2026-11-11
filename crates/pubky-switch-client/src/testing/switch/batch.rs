@@ -138,6 +138,18 @@ impl Inner {
     /// and its record's certificate, or a renewed one, listed or in an open renewal in the
     /// newest `identity.json` and unexpired.
     pub(super) fn app_current(&self, apps: &BTreeMap<[u8; 16], SwitchApp>, app: &[u8; 16]) -> bool {
+        self.app_current_by(apps, app, true)
+    }
+
+    /// Whether `app` is current in spec 3.4's sense, listed with its certificate or renewed
+    /// and open, not revoked or departed, and, with `expiry`, with a certificate that hasn't
+    /// expired, as the service serves it.
+    pub(super) fn app_current_by(
+        &self,
+        apps: &BTreeMap<[u8; 16], SwitchApp>,
+        app: &[u8; 16],
+        expiry: bool,
+    ) -> bool {
         let (Some(held), Some(doc)) = (apps.get(app), &self.doc) else {
             return false;
         };
@@ -150,7 +162,7 @@ impl Inner {
                     matches!(
                         doc.standing(app, &cert.hash()),
                         Standing::Listed | Standing::RenewedOpen
-                    ) && !cert.expired_at(now)
+                    ) && !(expiry && cert.expired_at(now))
                 })
     }
 

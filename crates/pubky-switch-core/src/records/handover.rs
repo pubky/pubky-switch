@@ -914,14 +914,31 @@ pub fn taken_over(
     own_newest: Option<&IdentityDoc>,
     own_prev: Option<[u8; 32]>,
 ) -> bool {
-    let doc = &found.identity_doc;
+    backup_taken_over(
+        &found.identity_doc,
+        found.prev,
+        own_signer,
+        own_newest,
+        own_prev,
+    )
+}
+
+/// [`taken_over`] for a backup's document `doc` and the `prev` it built on, as a signer keeps
+/// them once it has dropped the records' key.
+pub fn backup_taken_over(
+    doc: &IdentityDoc,
+    prev: Option<[u8; 32]>,
+    own_signer: &[u8; 16],
+    own_newest: Option<&IdentityDoc>,
+    own_prev: Option<[u8; 32]>,
+) -> bool {
     if &doc.body().signer == own_signer {
         return false;
     }
     let Some(mark) = own_newest else {
         return true;
     };
-    let losing = found.prev.is_some() && found.prev == own_prev && doc.signed() != mark.signed();
+    let losing = prev.is_some() && prev == own_prev && doc.signed() != mark.signed();
     !losing && doc.version() >= mark.version()
 }
 

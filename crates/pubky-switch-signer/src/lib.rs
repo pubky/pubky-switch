@@ -18,7 +18,10 @@
 //!   (Switch spec 1). The signer knows no protocol of its own.
 //! - [`Signer`]: enrolling the identity at a switch, and signing, delivering and publishing
 //!   its `identity.json` versions with the high-water mark, the one-signer rule and the
-//!   backup, each step committed to the host's store before it is sent (Switch spec 4.3, 12.8).
+//!   backup, each step committed to the host's store before it is sent (Switch spec 4.3, 12.8);
+//!   the restore from that backup, the hand-over to another signer, with its abort and the
+//!   new signer's take-over (Switch wire 3.12, 3.13), and the account's erasure when the user
+//!   stops using the Switch (Switch spec 12.7).
 //! - [`homeserver`]: the identity's own Homeserver, which the host implements.
 //! - [`state`]: the signer's records in the host's store.
 //! - [`alert`]: what the signer tells the user.
@@ -32,7 +35,7 @@ pub mod protocol;
 mod signer;
 pub mod state;
 
-pub use alert::{Alert, Source};
+pub use alert::{Alert, RenewalSkip, Source};
 pub use error::{Refusal, Result, SignerError};
 pub use homeserver::Homeserver;
 pub use key::{
@@ -40,6 +43,6 @@ pub use key::{
 };
 pub use protocol::{GrantPath, Protocol, ProtocolError, Protocols, ScopeDef, ScopeTerms};
 pub use signer::{
-    AppReview, ApprovedRequest, CertChange, HighWater, Signer, SignerEnv, SignerStatus,
-    UserConfirmed,
+    AbortOutcome, AppReview, ApprovedRequest, CertChange, HighWater, ReceivingApp, Signer,
+    SignerEnv, SignerStatus, UserConfirmed,
 };
