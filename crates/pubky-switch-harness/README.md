@@ -75,11 +75,14 @@ The flows send every call the service serves, each at both switches. What they l
   lost and no connection fails in front of `GET /allow`, `/claims/{claim_key}`,
   `/directory`, `/apps/{app_id}/keys`, `/records`, `/records/{key}`, `/handover` or the
   public `/identity`, nor in front of `POST /apps/{app_id}/keys` or a record write.
-- **A waiting read, and a list `limit` ends.** No feed read waits (`wait`). The `pages`
-  flow reads a feed in pages that `limit` ends and that the byte budget ends, and a records
-  list in pages the byte budget ends; a records list that `limit` ends takes more than a
-  thousand records, and no flow writes that many. The directory has no pages (Switch wire
-  7.4.10).
+- **A list that `limit` ends.** The `pages` flow reads a feed in pages that `limit` ends
+  and that the byte budget ends, and a records list in pages the byte budget ends; a
+  records list that `limit` ends takes more than a thousand records, and no flow writes
+  that many. The directory has no pages (Switch wire 7.4.10).
+- **A waiting read, compared.** `flows::waiting_read` sends a feed read with `wait`, which
+  a write of another app answers. It runs against each switch on its own: the scripted
+  switch doesn't hold a read, so the two runs make their calls in different orders, which
+  the comparison can't set side by side. Its test holds what each switch does.
 - **A feed with gaps:** a lagging app, a `missed` item, an item an app can't read after a
   revocation.
 - **Lists in use:** an invite code issued and used, and a deny list entry that refuses a

@@ -21,6 +21,7 @@ mod removal;
 mod renewal;
 mod restore;
 mod retries;
+mod waiting;
 mod watching;
 
 use std::future::Future;
@@ -44,6 +45,7 @@ pub use retries::{
     app_retries, append_retry, claim_and_read_retries, claim_retries, removal_retries,
     signer_retries,
 };
+pub use waiting::waiting_read;
 pub use watching::watching;
 
 use crate::{FlowResult, World};
