@@ -68,7 +68,11 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
 - **A restore is one commit:** the namespace cleared, the app's restored state and the
   protocol's backup layer under `p/`, both checked before it, so a failure leaves neither.
   A backup with a layer also carries `seen/`, `parked/` and `proc/` of the same moment,
-  which the layer may reflect, so no entry is handed to the protocol twice.
+  which the layer may reflect, so no entry is handed to the protocol twice. A kept
+  effect's entry goes in as a stored uncertain copy with its `seq` in `seen`, as the app
+  passes an entry it stores: its processed pair ages out after 30 days, and the `seq`
+  keeps a restore from an older backup from handing it over again unless the host
+  releases the copy.
 - **A layered backup reads one moment:** `App::backup_layered` is several store reads in
   sequence, and they agree because the call takes `&mut self`, so no call of the app commits
   between them, and the store allows one writer per namespace (`StateStore`, rule 4), so no
