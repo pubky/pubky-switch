@@ -296,9 +296,8 @@ async fn test_provider_loss_names_the_revoked_apps_in_its_enrollment() {
 }
 
 #[tokio::test]
-async fn test_provider_loss_refused_while_records_are_behind_or_another_install_signs() {
-    // Not an install whose records are behind, which restores first, nor one another install
-    // signs for (Switch spec 12.6 step 1).
+async fn test_provider_loss_refused_while_another_install_signs() {
+    // Not an install another install signs for (Switch spec 12.6 step 1): nothing is sent.
     let world = World::new();
     let (mut signer, store) = world.enrolled().await;
     let mine = signer.identity_doc().unwrap().unwrap();
