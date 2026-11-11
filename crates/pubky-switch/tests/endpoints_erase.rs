@@ -2564,7 +2564,7 @@ async fn settle_the_chains_claim(replay: &Replay) -> Vec<u8> {
     );
     let read = replay
         .service
-        .handle(app_request(&wallet, "GET", &path, Vec::new(), at))
+        .handle(app_request(wallet, "GET", &path, Vec::new(), at))
         .await;
     assert_eq!(read.status, 200, "{}", String::from_utf8_lossy(&read.body));
     let view = body(&read)["claim"].clone();
@@ -2594,7 +2594,7 @@ async fn settle_the_chains_claim(replay: &Replay) -> Vec<u8> {
     let answer = replay
         .service
         .handle(app_request(
-            &wallet,
+            wallet,
             "POST",
             &format!("/v1/{}/ops", alice_id()),
             OpsRequest::new(&ops, None).to_json(),
