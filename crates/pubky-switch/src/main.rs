@@ -140,13 +140,18 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
 
     let api = match config.server.origin.clone() {
         Some(origin) => {
-            let service = Arc::new(Service::new(
-                origin.clone(),
-                store.clone(),
-                Arc::new(keys.clone()),
-                time.clone(),
-                config.limits.clone(),
-            ));
+            // Keys an erasure left owed, by a key store failure or a crash, go first (Switch
+            // wire 7.4.16).
+            let service = Arc::new(
+                Service::start(
+                    origin.clone(),
+                    store.clone(),
+                    Arc::new(keys.clone()),
+                    time.clone(),
+                    config.limits.clone(),
+                )
+                .await,
+            );
             // Changes made by any instance wake the feed reads waiting here.
             let changes = ChangeListener::connect(&store).await?;
             tokio::spawn(changes.run(service.changes(), until_stopped(stopped.clone())));
