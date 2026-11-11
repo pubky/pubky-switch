@@ -108,7 +108,11 @@ pub(crate) fn status(signer: &Signer) -> Result<serde_json::Value, Box<dyn std::
     let doc = signer.identity_doc()?;
     let high_water = signer.high_water();
     Ok(json!({
-        "status": format!("{:?}", signer.status()),
+        // The status's name: what it carries, such as another install's ID, differs from
+        // run to run.
+        "status": format!("{:?}", signer.status())
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .next(),
         "version": doc.as_ref().map(pubky_switch_core::records::IdentityDoc::version),
         "generation": doc.as_ref().map(pubky_switch_core::records::IdentityDoc::generation),
         "apps": doc.as_ref().map(|doc| doc.body().apps.len()),
