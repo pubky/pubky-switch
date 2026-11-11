@@ -230,10 +230,14 @@ impl Signer {
             .state
             .alerts
             .iter()
+            // The count of untaken renewals starts again from none, and the alert it raised
+            // goes with it (Switch spec 3.1).
             .filter(|a| {
                 !matches!(
                     a,
-                    Alert::RecordsBehind { .. } | Alert::ManagedByOtherInstall { .. }
+                    Alert::RecordsBehind { .. }
+                        | Alert::ManagedByOtherInstall { .. }
+                        | Alert::RenewalsStopped { .. }
                 )
             })
             .cloned()
