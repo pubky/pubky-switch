@@ -34,6 +34,7 @@ use serde::{Deserialize, Serialize};
 use super::claims::ObligationDeadline;
 use super::error::{Refusal, RefusalPlace, refused_at, refused_for_good};
 use super::events::AppEvent;
+use super::kept::{Ended, KeptBatchDrop, index_kept};
 use super::protocol::{LocalWrite, MAX_STEP_LOCAL_BYTES, local_writes_bytes};
 use super::recovery::LossStep;
 use super::send::{OutboxItem, SignedMessage};
@@ -109,7 +110,9 @@ fn refused_before_lookup(error: &AppError) -> bool {
     )
 }
 
-fn pending_key(batch_id: &[u8; 16]) -> String {
+/// `opq/<batch_id>`: a kept batch, under the batch ID it was first kept under, whatever ID
+/// its bytes carry once signed again (`kept.rs`).
+pub(crate) fn pending_key(batch_id: &[u8; 16]) -> String {
     format!("{PENDING_PREFIX}{}", b64(batch_id))
 }
 
@@ -507,6 +510,7 @@ impl App {
         }
         let mut tx = self.tx()?;
         tx.put(&pending_key(&id), &pending)?;
+        index_kept(&mut tx, &id, &pending, &signed)?;
         // From the commit that keeps it, a failure that leaves the batch kept says so, so
         // the caller can tell its own batch kept from an earlier one that couldn't be sent:
         // a commit answered `StoreError::Unknown` may have kept it too.
@@ -668,8 +672,7 @@ impl App {
                     && self.may_attempt(false).is_err()
                 {
                     let mut tx = self.tx()?;
-                    Self::replace_kept_batch(&id, None, &mut tx)?;
-                    self.kept_batch_dropped(&id, &batch, &mut tx)?;
+                    self.kept_batch_dropped(&id, &pending, &batch, &mut tx)?;
                     self.commit(tx).await?;
                     continue;
                 }
@@ -688,8 +691,7 @@ impl App {
             }
             if past {
                 let mut tx = self.tx()?;
-                Self::replace_kept_batch(&id, None, &mut tx)?;
-                self.kept_batch_dropped(&id, &batch, &mut tx)?;
+                self.kept_batch_dropped(&id, &pending, &batch, &mut tx)?;
                 self.commit(tx).await?;
                 continue;
             }
@@ -704,7 +706,7 @@ impl App {
                         .await?;
                 }
                 Err(error) => match refused_for_good(&error) {
-                    Some(code) => self.kept_batch_refused(&id, code).await?,
+                    Some(code) => self.kept_batch_refused(&id, &pending, code).await?,
                     None => return Err(error),
                 },
             }
@@ -801,7 +803,7 @@ impl App {
 
     /// A kept batch never sent ([`PendingBatch::kept_ms`]), sent now: signed again first for
     /// the generation followed if it was signed for an earlier one, since no old bytes need
-    /// an answer. A refusal for good, other than one about the caller, which keeps it, drops
+    /// an answer, still kept under `id`. A refusal for good, other than one about the caller, which keeps it, drops
     /// it with what it carried and tells the protocol in that commit ([`AppEvent::BatchRefused`]);
     /// it was never applied.
     async fn send_unsent(
@@ -810,10 +812,10 @@ impl App {
         pending: &PendingBatch,
         batch: &Batch,
     ) -> Result<(), AppError> {
-        let (id, pending, batch) =
+        let (pending, batch) =
             if super::batch_generation(batch).is_some_and(|g| g < self.state.meta.generation) {
                 let signed = self.sign_ops(super::provider::ops_of(batch), None)?;
-                let new_id = signed.id().ok_or_else(|| {
+                let wire_batch_id = signed.id().ok_or_else(|| {
                     AppError::InvalidData("a batch of operations has an ID".into())
                 })?;
                 let renewed = PendingBatch {
@@ -821,21 +823,21 @@ impl App {
                     ..pending.clone()
                 };
                 let mut tx = self.tx()?;
-                Self::replace_kept_batch(id, Some((&new_id, &renewed)), &mut tx)?;
+                Self::keep_signed_again(id, &renewed, &mut tx)?;
                 self.commit(tx).await?;
                 self.events.push(AppEvent::KeptBatchSignedAgain {
                     batch_id: *id,
-                    new_batch_id: new_id,
+                    wire_batch_id,
                 });
-                (new_id, renewed, signed)
+                (renewed, signed)
             } else {
-                (*id, pending.clone(), batch.clone())
+                (pending.clone(), batch.clone())
             };
-        match self.run_pending(&id, &pending, &batch, true).await {
+        match self.run_pending(id, &pending, &batch, true).await {
             Ok(submitted) => self.check_attempts_of(&batch, &submitted).await,
             Err(error) if refused_at(&error) == Some(RefusalPlace::Caller) => Err(error),
             Err(error) => match refused_for_good(&error) {
-                Some(code) => self.kept_batch_refused(&id, code).await,
+                Some(code) => self.kept_batch_refused(id, &pending, code).await,
                 None => Err(error),
             },
         }
@@ -843,10 +845,19 @@ impl App {
 
     /// A kept batch sent again and refused for good at or after its batch ID lookup: it was
     /// never applied, and goes with the local writes and outbox messages it carried; the
-    /// protocol is told in that commit ([`AppEvent::BatchRefused`]).
-    async fn kept_batch_refused(&mut self, id: &[u8; 16], code: ErrorCode) -> Result<(), AppError> {
+    /// protocol is told in that commit ([`AppEvent::BatchRefused`]), which also writes its
+    /// end ([`App::kept_batch`]).
+    async fn kept_batch_refused(
+        &mut self,
+        id: &[u8; 16],
+        pending: &PendingBatch,
+        code: ErrorCode,
+    ) -> Result<(), AppError> {
         let mut tx = self.tx()?;
-        tx.delete(&pending_key(id))?;
+        let reason = KeptBatchDrop::Refused {
+            code: code.as_str().to_owned(),
+        };
+        self.end_kept_batch(id, pending, Ended::Dropped(reason), &mut tx)?;
         self.keep_duty(
             &mut tx,
             super::events::Duty::BatchRefused {
@@ -876,8 +887,7 @@ impl App {
             return Err(error);
         }
         let mut tx = self.tx()?;
-        Self::replace_kept_batch(id, None, &mut tx)?;
-        self.kept_batch_dropped(id, batch, &mut tx)?;
+        self.kept_batch_dropped(id, pending, batch, &mut tx)?;
         self.commit(tx).await
     }
 
@@ -930,9 +940,12 @@ impl App {
                 self.note_kept_rate_limited(&error);
                 // A first send's refusal is its caller's; one sent again is dropped and
                 // reported by its caller, in one commit.
-                if refused_for_good(&error).is_some() && !resent {
+                if let Some(code) = refused_for_good(&error).filter(|_| !resent) {
+                    let reason = KeptBatchDrop::Refused {
+                        code: code.as_str().to_owned(),
+                    };
                     let mut tx = self.tx()?;
-                    tx.delete(&pending_key(id))?;
+                    self.end_kept_batch(id, pending, Ended::Dropped(reason), &mut tx)?;
                     self.commit(tx).await?;
                 }
                 return Err(error);
@@ -944,7 +957,7 @@ impl App {
             self.settle_op(op, proof, pending, &mut tx).await?;
         }
         self.settle_kept_writes(pending, &mut tx).await?;
-        tx.delete(&pending_key(id))?;
+        self.end_kept_batch(id, pending, Ended::Applied, &mut tx)?;
         tx.put(key::CURSOR, &self.state.cursor)?;
         if let Some(chain) = self.state.chain.as_mut() {
             chain.write(&mut tx)?;
@@ -1109,8 +1122,7 @@ impl App {
                 // answer decides nothing, and the batch goes (Switch spec 12.5 "Kept
                 // batches"), reported in the commit that drops it.
                 let mut tx = self.tx()?;
-                Self::replace_kept_batch(id, None, &mut tx)?;
-                self.kept_batch_dropped(id, batch, &mut tx)?;
+                self.kept_batch_dropped(id, pending, batch, &mut tx)?;
                 return self.commit(tx).await;
             }
             Err(AppError::Switch(ClientError::Switch {
@@ -1123,32 +1135,32 @@ impl App {
                     .map(|op| (op.body().conditions.clone(), op.body().kind.clone()))
                     .collect();
                 let signed = self.sign_ops(ops, None)?;
-                let new_id = signed.id().ok_or_else(|| {
+                let wire_batch_id = signed.id().ok_or_else(|| {
                     AppError::InvalidData("a batch of operations has an ID".into())
                 })?;
-                // New bytes, never sent: stamped at their first send.
+                // New bytes, never sent: stamped at their first send, still kept under `id`.
                 let renewed = PendingBatch {
                     body: signed.body().to_vec(),
                     kept_ms: None,
                     ..pending.clone()
                 };
                 let mut tx = self.tx()?;
-                Self::replace_kept_batch(id, Some((&new_id, &renewed)), &mut tx)?;
+                Self::keep_signed_again(id, &renewed, &mut tx)?;
                 self.commit(tx).await?;
                 self.events.push(AppEvent::KeptBatchSignedAgain {
                     batch_id: *id,
-                    new_batch_id: new_id,
+                    wire_batch_id,
                 });
                 // Its first send: a refusal for good, other than one about the caller, which
                 // keeps it, drops it with what it carried, and tells the protocol in that
                 // commit, as a kept batch's refusal does; no caller waits for this one.
-                let submitted = match self.run_pending(&new_id, &renewed, &signed, true).await {
+                let submitted = match self.run_pending(id, &renewed, &signed, true).await {
                     Ok(submitted) => submitted,
                     Err(error) if refused_at(&error) == Some(RefusalPlace::Caller) => {
                         return Err(error);
                     }
                     Err(error) => match refused_for_good(&error) {
-                        Some(code) => return self.kept_batch_refused(&new_id, code).await,
+                        Some(code) => return self.kept_batch_refused(id, &renewed, code).await,
                         None => return Err(error),
                     },
                 };
@@ -1161,7 +1173,7 @@ impl App {
             }
             Err(error) => {
                 if let Some(code) = refused_for_good(&error) {
-                    return self.kept_batch_refused(id, code).await;
+                    return self.kept_batch_refused(id, pending, code).await;
                 }
                 return Err(error);
             }
@@ -1174,7 +1186,7 @@ impl App {
                 .await?;
         }
         self.settle_kept_writes(pending, &mut tx).await?;
-        tx.delete(&pending_key(id))?;
+        self.end_kept_batch(id, pending, Ended::Applied, &mut tx)?;
         if let Some(chain) = self.state.chain.as_mut() {
             chain.write(&mut tx)?;
         }
@@ -1185,7 +1197,7 @@ impl App {
     }
 
     /// A kept batch the old service applied, though its answer was lost: what it settles
-    /// without its proofs goes into `tx`, and it is no longer kept.
+    /// without its proofs goes into `tx`, and it is no longer kept, its end written.
     pub(crate) async fn settle_kept_batch(
         &mut self,
         id: &[u8; 16],
@@ -1197,21 +1209,17 @@ impl App {
             self.settle_op(op, None, pending, tx).await?;
         }
         self.settle_kept_writes(pending, tx).await?;
-        tx.delete(&pending_key(id))
+        self.end_kept_batch(id, pending, Ended::Applied, tx)
     }
 
-    /// Keep `pending` under `new_id` in place of the batch kept under `id`; `None` only
-    /// drops it.
-    pub(crate) fn replace_kept_batch(
+    /// Keep `pending`, signed again, under `id`, the ID the batch was first kept under:
+    /// the batch ID its bytes carry changes, the one it is known by doesn't (`kept.rs`).
+    pub(crate) fn keep_signed_again(
         id: &[u8; 16],
-        replacement: Option<(&[u8; 16], &PendingBatch)>,
+        pending: &PendingBatch,
         tx: &mut Tx,
     ) -> Result<(), AppError> {
-        tx.delete(&pending_key(id))?;
-        match replacement {
-            Some((new_id, pending)) => tx.put(&pending_key(new_id), pending),
-            None => Ok(()),
-        }
+        tx.put(&pending_key(id), pending)
     }
 }
 

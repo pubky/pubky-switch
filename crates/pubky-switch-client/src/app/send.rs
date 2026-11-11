@@ -288,10 +288,21 @@ pub enum Delivery {
         /// The acceptance time.
         accepted_at_ms: u64,
     },
-    /// Refused for good.
+    /// Refused for good, or never queued: the kept batch that would have queued it was
+    /// dropped ([`super::App::kept_batch`]). Answered for [`SENT_RETENTION_MS`] from its
+    /// time, then forgotten.
     Failed {
         /// Why, without content.
         reason: String,
+        /// When, app clock: when it was refused, or its batch dropped; when it was queued,
+        /// for one an earlier build refused without keeping the time.
+        failed_at_ms: u64,
+    },
+    /// In a kept batch, not yet in the outbox: it is queued once the batch is applied, and
+    /// fails with it if the batch is dropped (Switch spec 8.2, [`super::OpBatch::queue`]).
+    Kept {
+        /// The batch ID it is kept under ([`super::App::kept_batch`]).
+        batch_id: [u8; 16],
     },
 }
 
@@ -812,7 +823,9 @@ impl App {
     // ---------------------------------------------------------------------------------
     // State
 
-    /// Where the message `msg_id` is; `None` for one the app doesn't keep.
+    /// Where the message `msg_id` is: in the outbox, sent, or in a kept batch that queues it
+    /// ([`Delivery::Kept`], and [`Delivery::Failed`] once that batch is dropped); `None` for
+    /// one the app doesn't keep.
     ///
     /// # Errors
     ///
@@ -822,6 +835,7 @@ impl App {
             return Ok(Some(match (&item.failed, item.accepted_at_ms) {
                 (Some(reason), _) => Delivery::Failed {
                     reason: reason.clone(),
+                    failed_at_ms: item.failed_ms.unwrap_or(item.queued_ms),
                 },
                 (None, Some(accepted_at_ms)) if !item.resend => {
                     Delivery::Accepted { accepted_at_ms }
@@ -834,13 +848,12 @@ impl App {
                 },
             }));
         }
-        Ok(self
-            .reader()
-            .get::<SentStored>(&sent_key(msg_id))
-            .await?
-            .map(|sent| Delivery::Accepted {
+        if let Some(sent) = self.reader().get::<SentStored>(&sent_key(msg_id)).await? {
+            return Ok(Some(Delivery::Accepted {
                 accepted_at_ms: sent.first_ms,
-            }))
+            }));
+        }
+        self.kept_delivery(msg_id).await
     }
 
     /// The messages sent to `pubky` that its inbox accepted within `[from_ms, until_ms]`,
@@ -882,7 +895,8 @@ impl App {
 
     /// Try every queued message's jobs once (Switch spec 11: on start, on returning to the
     /// foreground, when the network comes back), after the batches and deliveries of the
-    /// own `identity.json` owed, and forget sent messages past their retention.
+    /// own `identity.json` owed, and forget sent messages past their retention, and the ends
+    /// of kept batches past theirs ([`super::App::kept_batch`]).
     ///
     /// # Errors
     ///
@@ -928,6 +942,7 @@ impl App {
                 }
             }
             self.prune_sent().await?;
+            self.prune_kept_ends().await?;
             Ok(report)
         })
         .await

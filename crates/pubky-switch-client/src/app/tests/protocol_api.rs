@@ -1741,7 +1741,16 @@ async fn test_signed_message_not_queued_when_its_batch_is_refused() {
         .await
         .unwrap_err();
     assert_eq!(error.code(), Some(ErrorCode::Conflict));
-    assert!(wallet.delivery(signed.msg_id()).await.unwrap().is_none());
+    // Never queued: its batch was refused, at this time.
+    let delivery = wallet.delivery(signed.msg_id()).await.unwrap();
+    assert!(
+        matches!(
+            &delivery,
+            Some(Delivery::Failed { reason, failed_at_ms })
+                if reason.contains("conflict") && *failed_at_ms == p.clock.now_ms()
+        ),
+        "{delivery:?}"
+    );
     // The same signed message goes in the batch built again.
     let entry = wallet
         .record_op(&target, Some(&value(&["x"])), vec![])
@@ -1751,7 +1760,10 @@ async fn test_signed_message_not_queued_when_its_batch_is_refused() {
         .submit_batch(OpBatch::new().entry(entry).queue(signed.clone()))
         .await
         .unwrap();
-    assert!(wallet.delivery(signed.msg_id()).await.unwrap().is_some());
+    assert!(matches!(
+        wallet.delivery(signed.msg_id()).await.unwrap(),
+        Some(Delivery::Queued { .. } | Delivery::Accepted { .. })
+    ));
 }
 
 #[tokio::test]

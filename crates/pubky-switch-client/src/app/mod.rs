@@ -39,6 +39,7 @@ mod error;
 mod events;
 mod feed;
 mod identity;
+mod kept;
 mod keys;
 mod parked;
 mod peek;
@@ -70,6 +71,7 @@ pub use events::{
 };
 pub use feed::ReceiveReport;
 pub use identity::{DOC_CACHE_MS, HomeserverReader, IdentityRefresh, REVALIDATION_MS};
+pub use kept::{KeptBatch, KeptBatchDrop, KeptBatchStatus};
 pub use parked::{ParkedMessage, ParkedSummary};
 pub use peek::{PeekReport, Peeked};
 pub use protocol::{

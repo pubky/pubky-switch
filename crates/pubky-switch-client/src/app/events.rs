@@ -518,19 +518,21 @@ pub enum AppEvent {
     },
     /// A batch of operations kept before a provider change, its answer lost, is in the
     /// old service's chain: it was applied, and what it settles is committed (Switch spec
-    /// 13.5).
+    /// 13.5), with its end ([`super::App::kept_batch`]).
     KeptBatchApplied {
-        /// The batch ID.
+        /// The batch ID it was kept under.
         batch_id: [u8; 16],
     },
     /// A kept batch the old service didn't apply was signed again for the generation the
-    /// app follows now, under a new batch ID, and is sent there with the next write
-    /// (Switch spec 12.5 step 2, 13.5).
+    /// app follows now, its bytes under a new batch ID, and is sent there with the next
+    /// write (Switch spec 12.5 step 2, 13.5). It is still kept, and known, under the batch
+    /// ID it was first kept under: this event tells nothing [`super::App::kept_batch`]
+    /// doesn't, so a crash that loses it loses no fact.
     KeptBatchSignedAgain {
-        /// The batch ID it had.
+        /// The batch ID it is kept under, which doesn't change.
         batch_id: [u8; 16],
-        /// The batch ID it has now.
-        new_batch_id: [u8; 16],
+        /// The batch ID its signed bytes carry now, on the wire (Switch wire 6.4).
+        wire_batch_id: [u8; 16],
     },
     /// A read sends the batches kept from earlier calls before it reads the feed, and one
     /// couldn't be sent now: the network failed, the switch answered `429`, `503` or `410
@@ -555,11 +557,12 @@ pub enum AppEvent {
     /// that holds an `attempt`, while the app may not attempt, as in reconcile mode (Switch
     /// spec 12.4): never applied, it goes unsent. Each attempt in it follows as
     /// [`AppEvent::AttemptDropped`]. The protocol decides what to write instead. A duty
-    /// event.
+    /// event, in the commit that drops the batch and writes its end
+    /// ([`super::App::kept_batch`]).
     KeptBatchDropped {
         /// The duty event's ID.
         id: EventId,
-        /// The batch ID.
+        /// The batch ID it was kept under, whatever ID its bytes carried once signed again.
         batch_id: [u8; 16],
     },
     /// An `attempt` in a kept batch that was dropped ([`AppEvent::KeptBatchDropped`]): it
@@ -717,11 +720,12 @@ pub enum AppEvent {
     },
     /// A batch kept from an earlier call was sent again and refused for good: it was not
     /// applied, and the app no longer keeps it, nor the local writes and outbox messages it
-    /// carried (Switch spec 6.4, Switch wire 6.4). A duty event.
+    /// carried (Switch spec 6.4, Switch wire 6.4). A duty event, in the commit that drops
+    /// the batch and writes its end ([`super::App::kept_batch`]).
     BatchRefused {
         /// The duty event's ID.
         id: EventId,
-        /// The batch ID.
+        /// The batch ID it was kept under, whatever ID its bytes carried once signed again.
         batch_id: [u8; 16],
         /// The error code of the refusal.
         code: String,

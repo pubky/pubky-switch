@@ -40,6 +40,7 @@ use super::error::{Alarm, AppError};
 use super::events::{AppEvent, Duty};
 use super::feed::{ReceiveReport, processed_writes};
 use super::identity;
+use super::kept::{Ended, KeptBatchDrop};
 use super::state::{Tx, key};
 use super::{App, OpBatch, push};
 use crate::client::answers::{FeedQuery, RecoveryUpload};
@@ -1197,19 +1198,23 @@ impl App {
             }
         }
         for (id, pending) in self.kept_batches().await? {
-            if self.applied_by_old_service(&id) {
+            let kept = Batch::from_body(pending.body.clone())?;
+            // The chain holds the batch ID its bytes carry, which signing it again changed;
+            // it stays kept under the ID it was first kept under (`kept.rs`).
+            if kept
+                .id()
+                .is_some_and(|wire| self.applied_by_old_service(&wire))
+            {
                 self.settle_kept_batch(&id, &pending, tx).await?;
                 events.push(AppEvent::KeptBatchApplied { batch_id: id });
                 continue;
             }
-            let kept = Batch::from_body(pending.body.clone())?;
             // A batch never sent has no answer to wait for: it is signed again for the new
             // generation, and sent as a first send, its old bytes never resent.
             let never_sent = pending.kept_ms.is_none();
             if resend_first && !never_sent {
                 if !answer_decides(pending.kept_ms) {
-                    Self::replace_kept_batch(&id, None, tx)?;
-                    self.kept_batch_dropped(&id, &kept, tx)?;
+                    self.kept_batch_dropped(&id, &pending, &kept, tx)?;
                 }
                 continue;
             }
@@ -1218,36 +1223,44 @@ impl App {
                 matches!(kind, OpKind::Claim(claim) if claim.kind == ClaimType::Attempt)
             });
             if carry == Carry::AfterLoss && attempts {
-                Self::replace_kept_batch(&id, None, tx)?;
-                self.kept_batch_dropped(&id, &kept, tx)?;
+                self.kept_batch_dropped(&id, &pending, &kept, tx)?;
                 continue;
             }
             let signed = self.sign_ops(ops, None)?;
-            let new_id = signed
+            let wire_batch_id = signed
                 .id()
                 .ok_or_else(|| AppError::InvalidData("a batch of operations has an ID".into()))?;
-            // New bytes, never sent: stamped at their first send.
+            // New bytes, never sent: stamped at their first send, still kept under `id`.
             let mut renewed = pending.clone();
             renewed.body = signed.body().to_vec();
             renewed.kept_ms = None;
-            Self::replace_kept_batch(&id, Some((&new_id, &renewed)), tx)?;
+            Self::keep_signed_again(&id, &renewed, tx)?;
             events.push(AppEvent::KeptBatchSignedAgain {
                 batch_id: id,
-                new_batch_id: new_id,
+                wire_batch_id,
             });
         }
         Ok(events)
     }
 
-    /// A kept batch dropped at a provider change: reported, with each `attempt` in it, so
-    /// the protocol treats those obligations as uncertain (Switch spec 12.5 "Kept batches",
-    /// 12.6 step 5). Duty events, kept in `tx`, the commit that drops the batch.
+    /// A kept batch dropped unsent, never to go again: no longer kept, its end written
+    /// ([`App::kept_batch`]), and reported, with each `attempt` in it, so the protocol treats
+    /// those obligations as uncertain (Switch spec 12.5 "Kept batches", 12.6 step 5). Duty
+    /// events, kept in `tx`, the commit that drops the batch. One whose first send never
+    /// left was never applied; once sent, whether it was can't be told.
     pub(crate) fn kept_batch_dropped(
         &mut self,
         id: &[u8; 16],
+        pending: &super::batch::PendingBatch,
         batch: &Batch,
         tx: &mut Tx,
     ) -> Result<(), AppError> {
+        let reason = if pending.kept_ms.is_some() {
+            KeptBatchDrop::Uncertain
+        } else {
+            KeptBatchDrop::Unsent
+        };
+        self.end_kept_batch(id, pending, Ended::Dropped(reason), tx)?;
         self.keep_duty(tx, Duty::KeptBatchDropped { batch_id: *id })?;
         self.attempts_dropped(batch, tx)
     }

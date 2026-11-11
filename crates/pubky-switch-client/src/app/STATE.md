@@ -25,6 +25,12 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
 - **A batch refused with `409 stale_epoch`** is gone from `opq/` with the refusal; the app
   takes the newer `identity.json` and key bundle, each in its own commit, and the batch
   sealed again is signed and kept under a new batch ID before it is first sent.
+- **A kept batch has one ID for its whole life:** the batch ID it is first kept under
+  (`opq/<batch_id>`). Signed again for a later generation, its bytes carry a new batch ID
+  and stay under the same key, so `AppError::Kept`, every event about it and
+  `App::kept_batch` name the first one; the wire ID is in the record's body. The commit
+  that applies or drops it writes its end (`kb/<batch_id>`, `kbt/`) with that change, so
+  no crash leaves a batch neither kept nor ended.
 - **A retired receive key goes only after the cursor's commit** that passes the next key's
   registration (Switch spec 3.6).
 - **Any commit carries everything read before it.** A page's writes go in the next commit
@@ -247,7 +253,11 @@ uploads; `push.rs` holds the push registration. The peek (`peek.rs`) writes noth
 | `lc/lists_at` | the service time of the `GET /allow` answer the copy of the lists was last replaced from, written in that commit; absent until the first, after a restore, and from the commit that starts a provider loss, which keeps `lc/flag/`; while it is absent the copy isn't known to be complete, and a read by an app with `lists.read` refreshes it first, best effort, outside a move or a loss in progress | |
 | `lc/too_large` | the service time of the last `GET /allow` answer whose lists didn't fit one commit, in a commit of its own; while it is less than `LISTS_TOO_LARGE_RETRY_MS` (a day) old by the highest service time verified, which each read's page moves on, a read doesn't refresh the copy it owes; `allow_list()` always does; a refresh that fits, a provider change (the commit that switches the service, or that starts a loss) and a restore remove it | |
 | `invite/<code_hash>` | the code of an invite code the app registered, to show it again | yes |
-| `opq/<batch_id>` | a batch of operations, signed and kept before it is sent, with what its answer settles and, from its first send on, when that left (`kept_ms`, absent while never sent): the protocol's local writes, kept in base64 as in `pending/effect`, and the signed messages it puts in the outbox; it goes with its answer or a refusal for good, and stays through anything else, except that one never sent that holds an `attempt` goes unsent, reported as dropped with its attempts, when it would be sent while the app may not attempt (reconcile mode, Switch spec 12.4). All of them together take at most `MAX_KEPT_BATCHES_BYTES` (12 MiB), so a provider change carries them in its one commit: `submit_batch` keeps no batch past it | the messages' |
+| `opq/<batch_id>` | a batch of operations, signed and kept before it is sent, under the batch ID it was first kept under, whatever batch ID its body carries once signed again, with what its answer settles and, from its first send on, when that left (`kept_ms`, absent while never sent): the protocol's local writes, kept in base64 as in `pending/effect`, and the signed messages it puts in the outbox; it goes with its answer or a refusal for good, and stays through anything else, except that one never sent that holds an `attempt` goes unsent, reported as dropped with its attempts, when it would be sent while the app may not attempt (reconcile mode, Switch spec 12.4). All of them together take at most `MAX_KEPT_BATCHES_BYTES` (12 MiB), so a provider change carries them in its one commit: `submit_batch` keeps no batch past it | the messages' |
+| `kb/<batch_id>` | the end of a batch kept under `opq/`, written in the commit that applies or drops it: when (app clock), applied or dropped and why (refused for good with its code, dropped never sent, or dropped once sent, uncertain), and the `msg_id`s and attempts it named; `App::kept_batch` answers it until `SENT_RETENTION_MS` (30 days) from that time, and the next `flush_outbox` after forgets it with `kbt/` and the `kbm/` and `kba/` entries still naming it | |
+| `kbt/<time>/<batch_id>` | the time index for forgetting those ends | |
+| `kbm/<msg_id>` | the batch kept last that queues this message, written in the commit that keeps it: `App::delivery` answers `Kept` while the batch is kept, `Failed` with the drop's time once it is dropped | |
+| `kba/<claim_key>/<attempt_id>` | the batch kept last that carries this attempt, written in the commit that keeps it, for `App::kept_attempt` | |
 | `list_due` | a listing of the collections is owed: after joining, a restore, a `missed` item, or a certificate taken (a renewal, or the listed one from the own record) that reads a collection of the protocol the one before didn't (`Collection::readable_by`), in the commit that takes it | |
 | `rec/<key>` | the shared record write the app took: the signed operation, certificate and proof, its version and whether a proof gave it, the opened value, and the refused write it follows | yes |
 | `recname/<key>` | the collection name of a record the app creates outside the protocol's collections, from a write or an effect, until its write is answered | |
@@ -260,7 +270,8 @@ uploads; `push.rs` holds the push registration. The peek (`peek.rs`) writes noth
 | `clread/<claim_key>` | a claim the app holds and doesn't hold as finished (SETTLED with every attempt `done` or `failed`), to read again, with the device time it was marked; read at the end of a read, at most `CLAIM_REREADS_PER_READ` (16) per read, oldest mark first, and removed in the commit of any read of the claim, a `404` included, or when its evidence goes | |
 
 Deleting the keys on a leave also removes `rec/`, `hw/`, `recname/`, `out/`, `sent/`,
-`sentt/`, `invite/` and `opq/`. A restore replaces the namespace, these keys included, but
+`sentt/`, `invite/` and `opq/`; the ends of kept batches and their indexes (`kb/`, `kbt/`,
+`kbm/`, `kba/`) hold no content and stay, answered until their retention. A restore replaces the namespace, these keys included, but
 for the `out/` records its backup carries, and sets `list_due`. `rec/`, `clent/` and `claim/` hold the evidence of the shared state that
 uploads carry (`App::shared_evidence`).
 
