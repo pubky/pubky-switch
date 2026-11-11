@@ -1199,3 +1199,246 @@ async fn test_recovery_in_place_after_its_version_was_lost_too() {
     assert!(signed_by(&answer, &pending, &signature));
     replay.db.drop_database().await.expect("drop");
 }
+
+/// The wallet's App ID, from the vectors.
+fn wallet_app_id() -> [u8; 16] {
+    let keys = vectors("keys.json");
+    hex::decode(
+        app(&keys, "wallet")["app_id_bytes_hex"]
+            .as_str()
+            .expect("hex"),
+    )
+    .expect("hex")
+    .try_into()
+    .expect("16")
+}
+
+/// A recovery after `on` naming `key`, at `version`.
+fn recovery_at(on: &IdentityDoc, key: [u8; 32], version: u64) -> SignedDoc {
+    let mut body: IdentityBody = on.body().clone();
+    body.version = version;
+    body.generation += 1;
+    body.inbox.service_key = key;
+    body.recovery_from = Some(on.generation());
+    IdentityDoc::sign(&alice_key(), body)
+        .expect("sign")
+        .signed()
+        .clone()
+}
+
+/// Whether `answer` is the 503 of a state behind its key's mark: no head.
+fn is_behind_the_mark(answer: &SwitchResponse) -> bool {
+    code(answer) == (503, "unavailable".into())
+        && json_of(answer)["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("a new generation is needed"))
+        && header_text(answer, header::HEAD).is_none()
+}
+
+async fn snapshot(replay: &Replay) -> (KeyId, [u8; 32], usize, i64, i64) {
+    let key = service_key_id(replay).await;
+    let held = held(replay).await.hash();
+    let chain = chain(replay).await.len();
+    let seq = scalar_i64(replay, "SELECT last_seq FROM accounts WHERE id = $1").await;
+    let recovery = scalar_i64(
+        replay,
+        "SELECT COALESCE(recovery_from, -1) FROM accounts WHERE id = $1",
+    )
+    .await;
+    (key, held, chain, seq, recovery)
+}
+
+async fn exempt_delivery_refused_deeper(fork: bool) {
+    // Behind (or beside) the mark, a delivery exempt from the mark check (the signer's,
+    // at the next generation, naming the pending key, `recovery_from` the held generation)
+    // that put_identity refuses all the same: a version not higher than the one held (409
+    // stale_identity), or one listing an App ID the pending enrollment revoked (400). Each
+    // gets the behind 503 with no head, signed with the outgoing key as every request in
+    // that state is, and nothing commits: the key, the held version, the chain, the
+    // stamped seq, the recovery columns and the outgoing key's mark all stay.
+    let Some(replay) = replay().await else { return };
+    let (old_key, at) = restored(&replay, fork).await;
+    let old_public = replay.keys.public_key(&old_key).await.expect("key");
+    let wallet = wallet_app_id();
+    let enrolled = enroll(&replay, enrollment(3, Some(vec![wallet])), at).await;
+    assert_eq!(enrolled.status, 200);
+    let pending = answered_key(&enrolled);
+    let before = held(&replay).await;
+    assert!(before.body().apps.iter().any(|a| a.app_id == wallet));
+    let mark_before = replay.keys.mark(&old_key).await.expect("mark");
+    let state_before = snapshot(&replay).await;
+    let mut without_wallet: IdentityBody = before.body().clone();
+    without_wallet.apps.retain(|a| a.app_id != wallet);
+    let without_wallet = IdentityDoc::sign(&alice_key(), without_wallet).expect("sign");
+    for (what, doc) in [
+        (
+            "not a higher version",
+            recovery_at(&without_wallet, pending, before.version()),
+        ),
+        (
+            "lists the revoked wallet",
+            next_generation(&before, pending, Some(before.generation())),
+        ),
+    ] {
+        let (answer, signature) = deliver(&replay, doc, Some(before.hash()), at).await;
+        assert!(
+            is_behind_the_mark(&answer),
+            "{what}: {} {}",
+            answer.status,
+            String::from_utf8_lossy(&answer.body)
+        );
+        assert!(
+            signed_by(&answer, &old_public, &signature),
+            "{what}: old key"
+        );
+        assert_eq!(snapshot(&replay).await, state_before, "{what}: nothing");
+        assert_eq!(
+            replay.keys.mark(&old_key).await.expect("mark"),
+            mark_before,
+            "{what}: mark"
+        );
+        assert!(
+            replay.keys.public_key(&old_key).await.is_ok(),
+            "not retired"
+        );
+    }
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_recovery_behind_the_mark_an_exempt_delivery_refused_deeper_is_the_503() {
+    exempt_delivery_refused_deeper(false).await;
+}
+
+#[tokio::test]
+async fn test_recovery_beside_the_mark_an_exempt_delivery_refused_deeper_is_the_503() {
+    exempt_delivery_refused_deeper(true).await;
+}
+
+#[tokio::test]
+async fn test_recovery_without_prev_still_needs_a_higher_version_and_only_for_a_recovery() {
+    // Wire 3.3: a recovery in place is exempt from comparing `prev`, but needs a
+    // higher version than the one held: one at or below it, whatever its `prev`, is `409
+    // stale_identity` with the held copy. A rotation and an ordinary version with a stale
+    // `prev` aren't exempt: `409 stale_identity`, not the rotation's `503`.
+    let Some(replay) = replay().await else { return };
+    let (pending, at) = serving_with_a_pending_key(&replay).await;
+    let before = held(&replay).await;
+    let state_before = snapshot(&replay).await;
+    for version in [before.version(), before.version() - 1] {
+        let (answer, _) = deliver(
+            &replay,
+            recovery_at(&before, pending, version),
+            Some([3; 32]),
+            at,
+        )
+        .await;
+        assert_eq!(code(&answer), (409, "stale_identity".into()), "v{version}");
+        assert_eq!(
+            json_of(&answer)["current"]["hash"],
+            json!(pubky_switch_core::enc::b64(&before.hash()))
+        );
+    }
+    let mut ordinary: IdentityBody = before.body().clone();
+    ordinary.version += 1;
+    let ordinary = IdentityDoc::sign(&alice_key(), ordinary)
+        .expect("sign")
+        .signed()
+        .clone();
+    let old_public = replay
+        .keys
+        .public_key(&service_key_id(&replay).await)
+        .await
+        .expect("key");
+    let mut rotation: IdentityBody = before.body().clone();
+    rotation.version += 1;
+    rotation.generation += 1;
+    rotation.inbox.service_key = pending;
+    rotation
+        .service_keys
+        .push(pubky_switch_core::records::ServiceKeyEntry {
+            generation: 1,
+            key: old_public,
+        });
+    let rotation = IdentityDoc::sign(&alice_key(), rotation)
+        .expect("sign")
+        .signed()
+        .clone();
+    // With the right prev, the rotation is the 503 of a change not served.
+    let (answer, _) = deliver(&replay, rotation.clone(), Some(before.hash()), at).await;
+    assert_eq!(
+        code(&answer),
+        (503, "unavailable".into()),
+        "rotation, right prev"
+    );
+    for (what, doc) in [
+        ("a rotation", rotation),
+        ("an ordinary version", ordinary),
+        (
+            "a recovery naming another key",
+            next_generation(&before, [9; 32], Some(1)),
+        ),
+    ] {
+        let (answer, _) = deliver(&replay, doc, Some([3; 32]), at).await;
+        assert_eq!(code(&answer), (409, "stale_identity".into()), "{what}");
+    }
+    assert_eq!(snapshot(&replay).await.0, state_before.0);
+    assert_eq!(snapshot(&replay).await.1, state_before.1);
+    // `prev` null at an account holding a version: taken too (the rule's "whatever").
+    let (answer, _) = deliver(
+        &replay,
+        recovery_at(&before, pending, before.version() + 1),
+        None,
+        at,
+    )
+    .await;
+    assert_eq!(answer.status, 200, "prev null, a higher version");
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_recovery_document_replayed_later_is_refused() {
+    // A recovery document delivered before, at a generation the account has since served
+    // past (a later version, then a second loss), never takes the exemption again: its
+    // generation is not the held one plus one.
+    let Some(replay) = replay().await else { return };
+    let (pending, at) = serving_with_a_pending_key(&replay).await;
+    let before = held(&replay).await;
+    let r1 = next_generation(&before, pending, Some(1));
+    let (answer, _) = deliver(&replay, r1.clone(), Some(before.hash()), at).await;
+    assert_eq!(answer.status, 200);
+    let g2 = held(&replay).await;
+    let mut later: IdentityBody = g2.body().clone();
+    later.version += 1;
+    let later = IdentityDoc::sign(&alice_key(), later).expect("sign");
+    let (answer, _) = deliver(&replay, later.signed().clone(), Some(g2.hash()), at).await;
+    assert_eq!(answer.status, 200);
+    let (answer, _) = deliver(&replay, r1.clone(), Some([3; 32]), at).await;
+    assert_eq!(
+        code(&answer),
+        (409, "stale_identity".into()),
+        "after a later version"
+    );
+    let (answer, _) = deliver(&replay, r1.clone(), Some(later.hash()), at).await;
+    assert_eq!(
+        code(&answer),
+        (409, "stale_identity".into()),
+        "older, prev right"
+    );
+    let p2 = answered_key(&enroll(&replay, enrollment(9, None), at).await);
+    let r2 = recovery_at(&later, p2, later.version() + 1);
+    let (answer, _) = deliver(&replay, r2, Some([4; 32]), at).await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    let key_3 = service_key_id(&replay).await;
+    for prev in [Some([3; 32]), Some(later.hash()), None] {
+        let (answer, _) = deliver(&replay, r1.clone(), prev, at).await;
+        assert_eq!(code(&answer), (409, "stale_identity".into()), "{prev:?}");
+    }
+    assert_eq!(service_key_id(&replay).await, key_3);
+    replay.db.drop_database().await.expect("drop");
+}
