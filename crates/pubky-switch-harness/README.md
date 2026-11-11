@@ -63,6 +63,12 @@ it holds the account as erased but unconfirmed. It concludes the account is eras
 first run 24 hours after that `404`, every read in between having met it too. The flow moves
 the world's clock, which is the signer's device clock, by those 24 hours.
 
+An app of an erased account waits too (Switch spec 12.7 step 5): its reads meet the
+operator's `404` and no `identity.json` on the Homeserver, which the signer's erasure took
+off, and it takes the account as gone at the fifth read, each at least 6 hours after the one
+before, 24 hours after the first. Both erasure flows run that wait, and a read short of the
+24 hours that raises nothing.
+
 ## Not covered
 
 The flows send every call the service serves, each at both switches. What they leave out:
