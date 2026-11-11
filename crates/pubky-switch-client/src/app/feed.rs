@@ -270,24 +270,26 @@ impl App {
     /// retired receive keys the cursor passed, rotate if due, and send a deferred cursor
     /// move that is due. `wait` long-polls the first page, at most 25 seconds. Before the
     /// feed, the batches kept from earlier calls are sent again; one that still can't be
-    /// sent stays kept and is reported ([`AppEvent::KeptBatchesWaiting`]), and the read
-    /// goes on.
+    /// sent stays kept and is reported in this read's report
+    /// ([`AppEvent::KeptBatchesWaiting`]), and the read goes on.
     ///
     /// # Errors
     ///
     /// [`Refusal::Stopped`] or [`Refusal::Left`] for a stopped or departed app; an alarm the
     /// read raised; [`AppError::NotAnsweringAsAccount`] while the account may be erased
-    /// (Switch spec 12.7); a failed call or commit, after which nothing past the last commit
-    /// counts and the next read resumes from the store.
+    /// (Switch spec 12.7); a kept batch whose record doesn't read
+    /// ([`crate::error::StoreError::Corrupt`]), at every read until the store is repaired or
+    /// restored; a failed call or commit, after which nothing past the last commit counts
+    /// and the next read resumes from the store.
     pub async fn receive(&mut self, wait: Option<u32>) -> Result<ReceiveReport, AppError> {
         Box::pin(async move {
             self.ready_local().await?;
-            let result = self.receive_inner(wait).await;
+            let result = self.receive_once(wait).await;
             // A move, a provider change, a revocation or an erasure met during the read is
             // followed (`provider.rs`), and the read goes on once at the service followed.
             let result = match self.take_over(result).await {
                 TakeOver::Done(result) => result,
-                TakeOver::ReadAgain => self.receive_inner(None).await,
+                TakeOver::ReadAgain => self.receive_once(None).await,
             };
             if result.is_err() {
                 self.reload = true;
@@ -297,6 +299,22 @@ impl App {
             Ok(report)
         })
         .await
+    }
+
+    /// One read. [`AppEvent::KeptBatchesWaiting`] goes only in the report of the read that
+    /// met it: a read that fails drops it, its error being the outcome, so no later report
+    /// carries a stale one.
+    async fn receive_once(&mut self, wait: Option<u32>) -> Result<ReceiveReport, AppError> {
+        let raised = self.events.len();
+        let result = self.receive_inner(wait).await;
+        if result.is_err() {
+            let mut index = 0;
+            self.events.retain(|event| {
+                index += 1;
+                index <= raised || !matches!(event, AppEvent::KeptBatchesWaiting { .. })
+            });
+        }
+        result
     }
 
     async fn receive_inner(&mut self, wait: Option<u32>) -> Result<ReceiveReport, AppError> {
@@ -335,7 +353,10 @@ impl App {
         // The batches kept from earlier calls go before the feed, and before anything the
         // read writes itself, so a lost answer is settled by this read (Switch wire 6.4
         // step 5).
-        self.resume_batches_before_feed().await?;
+        let waiting = self.resume_batches_before_feed().await?;
+        if let Some(waiting) = waiting {
+            self.events.push(waiting);
+        }
         self.deliver_record().await?;
         self.ensure_scope_keys().await?;
         self.prune_processed().await?;

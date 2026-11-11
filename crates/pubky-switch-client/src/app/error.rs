@@ -202,10 +202,14 @@ pub enum AppError {
     /// batch it applied with its original proofs (Switch wire 6.4 step 5), so the caller
     /// doesn't build it again: what the batch settles is committed when that answer comes.
     ///
-    /// A call that fails with a bare [`AppError::Transport`] or [`AppError::Switch`] kept
-    /// nothing of its own: a batch kept from an earlier call couldn't be sent, and the new
-    /// one wasn't signed. [`AppError::code`] and [`AppError::unkept`] see through this
-    /// variant.
+    /// A call of [`super::App::submit_batch`] or [`super::App::write_claim`], or one that
+    /// writes through them such as [`super::App::put_record`], that fails with a bare
+    /// [`AppError::Transport`] or [`AppError::Switch`] kept nothing of its own under `opq/`:
+    /// a batch kept from an earlier call couldn't be sent, and the new one wasn't signed.
+    /// Other calls keep their own signed artifacts elsewhere and may fail bare after keeping
+    /// one: [`super::App::rotate`] its receive key registration, a join its batch, and the
+    /// delivery of the app record its batch; each is sent again by itself (`STATE.md`).
+    /// [`AppError::code`] and [`AppError::unkept`] see through this variant.
     #[error("the batch is kept, to be sent again: {error}")]
     Kept {
         /// The batch's ID, under which it is kept.

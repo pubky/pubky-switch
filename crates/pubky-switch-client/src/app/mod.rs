@@ -106,7 +106,7 @@ pub use records::{
 pub use send::{
     Delivery, OutboxReport, OutgoingMessage, RecordJob, SENT_RETENTION_MS, SentMessage,
     SignedMessage, UNDELIVERABLE_MAX_MS, UNDELIVERABLE_MS, UNDELIVERABLE_TRIES,
-    UNDELIVERABLE_TRY_SPACING_MS,
+    UNDELIVERABLE_TRY_SPACING_MS, UndeliverableReason,
 };
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -537,6 +537,11 @@ pub struct App {
     /// When, by the device clock, an answer in this call last brought a verified service
     /// time ([`App::fresh_service_time`]).
     time_fresh_at: Option<u64>,
+    /// When a kept batch was last answered `429 rate_limited`, and the end of the wait its
+    /// `retry_after` asked, both device clock: no read sends the kept batches again in
+    /// between (`App::resume_batches_before_feed`). Kept in memory only: a restart sends
+    /// them at its first read.
+    kept_rate_limited: Option<(u64, u64)>,
 }
 
 impl std::fmt::Debug for App {
@@ -759,6 +764,7 @@ impl App {
                 duty_queued: 0,
                 duty_handed: 0,
                 time_fresh_at: None,
+                kept_rate_limited: None,
             };
             app.update_keys_through();
             app.events.clear();
@@ -879,6 +885,7 @@ impl App {
                 duty_queued: 0,
                 duty_handed: 0,
                 time_fresh_at: None,
+                kept_rate_limited: None,
             };
             // A store an earlier build wrote keeps the epoch read now.
             if !app.reader().exists(key::DUTY_EPOCH).await? {
@@ -1476,6 +1483,7 @@ impl App {
                 duty_queued: 0,
                 duty_handed: 0,
                 time_fresh_at: None,
+                kept_rate_limited: None,
             };
             // Every write of the one commit; what fails here is mostly a write the store
             // can't take in one batch, over its sizes.

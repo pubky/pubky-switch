@@ -625,7 +625,11 @@ impl App {
     /// answers. One refused for good is dropped and reported ([`AppEvent::BatchRefused`]);
     /// any other failure stops here, the batch still kept, and is the caller's error, so
     /// later writes don't overtake it. Nothing is sent while the evidence of a provider loss
-    /// isn't uploaded yet.
+    /// isn't uploaded yet. A batch never sent that holds an `attempt` is a new attempt, so
+    /// it goes only while the app may attempt ([`App::may_attempt`]), as the call that kept
+    /// it checked; otherwise, in reconcile mode begun since (Switch spec 8.3, 12.4), it is
+    /// dropped unsent, never applied, and reported with its attempts
+    /// ([`AppEvent::KeptBatchDropped`]).
     pub(crate) async fn resume_batches(&mut self) -> Result<(), AppError> {
         if self.refuse_before_upload().await.is_err() {
             return Ok(());
@@ -636,8 +640,18 @@ impl App {
                 .map_err(|_| AppError::Store(crate::error::StoreError::Corrupt))?;
             let batch = self.without_stale_cursor(Batch::from_body(pending.body.clone())?)?;
             // Never sent, as its record shows: no answer of it can be ambiguous, so it has
-            // no window, and goes out as a first send would.
+            // no window, and goes out as a first send would, an attempt in it only while the
+            // app may attempt (Switch spec 12.4).
             if pending.kept_ms.is_none() {
+                if !super::provider::attempts_in(&batch).is_empty()
+                    && self.may_attempt(false).is_err()
+                {
+                    let mut tx = self.tx()?;
+                    Self::replace_kept_batch(&id, None, &mut tx)?;
+                    self.kept_batch_dropped(&id, &batch, &mut tx)?;
+                    self.commit(tx).await?;
+                    continue;
+                }
                 self.send_unsent(&id, &pending, &batch).await?;
                 continue;
             }
@@ -714,20 +728,53 @@ impl App {
     /// already shows applied is settled and cleared by that answer, its proofs kept as an
     /// answer of its first send would have been. A resend that fails on the network or the
     /// switch doesn't fail the read: the batch stays kept, and the read reports it
-    /// ([`AppEvent::KeptBatchesWaiting`]) and goes on to the feed. An alarm, a store failure
-    /// or a refusal of the app's own rules fails the read, as any of its steps does.
-    pub(crate) async fn resume_batches_before_feed(&mut self) -> Result<(), AppError> {
+    /// ([`AppEvent::KeptBatchesWaiting`], returned for the read's own report) and goes on to
+    /// the feed. After a kept batch was answered `429 rate_limited`, no read sends the kept
+    /// batches again until the `retry_after` it asked has passed by the device clock: each
+    /// read until then reports them waiting with that code, and sends nothing (Switch wire
+    /// 7.6). An alarm, a store failure or a refusal of the app's own rules fails the read,
+    /// as any of its steps does; so does a kept batch whose record under `opq/` doesn't
+    /// read, at every read until the store is repaired or restored, since corruption must
+    /// not pass silently, and a write would meet it as well.
+    pub(crate) async fn resume_batches_before_feed(
+        &mut self,
+    ) -> Result<Option<AppEvent>, AppError> {
+        let now = self.now();
+        let waiting = |kept: usize, code: Option<ErrorCode>| AppEvent::KeptBatchesWaiting {
+            kept: u64::try_from(kept).unwrap_or(u64::MAX),
+            code: code.map(|code| code.as_str().to_owned()),
+        };
+        if self
+            .kept_rate_limited
+            .is_some_and(|(from, until)| from <= now && now < until)
+        {
+            let kept = self.reader().scan_raw(PENDING_PREFIX).await?.len();
+            if kept > 0 {
+                return Ok(Some(waiting(kept, Some(ErrorCode::RateLimited))));
+            }
+        }
         match self.resume_batches().await {
-            Ok(()) => Ok(()),
+            Ok(()) => Ok(None),
             Err(error @ (AppError::Transport(_) | AppError::Switch(_))) => {
                 let kept = self.reader().scan_raw(PENDING_PREFIX).await?.len();
-                self.events.push(AppEvent::KeptBatchesWaiting {
-                    kept: u64::try_from(kept).unwrap_or(u64::MAX),
-                    code: error.code().map(|code| code.as_str().to_owned()),
-                });
-                Ok(())
+                Ok(Some(waiting(kept, error.code())))
             }
             Err(error) => Err(error),
+        }
+    }
+
+    /// Note a kept batch's send answered `429 rate_limited`: the wait its `retry_after`
+    /// asks, from now by the device clock ([`App::resume_batches_before_feed`]).
+    fn note_kept_rate_limited(&mut self, error: &AppError) {
+        if let AppError::Switch(ClientError::Switch {
+            code: ErrorCode::RateLimited,
+            retry_after: Some(seconds),
+            ..
+        }) = error
+        {
+            let now = self.now();
+            let until = now.saturating_add(seconds.saturating_mul(1000));
+            self.kept_rate_limited = Some((now, until));
         }
     }
 
@@ -859,6 +906,7 @@ impl App {
         let submitted = match self.submit(batch).await {
             Ok(submitted) => submitted,
             Err(error) => {
+                self.note_kept_rate_limited(&error);
                 // A first send's refusal is its caller's; one sent again is dropped and
                 // reported by its caller, in one commit.
                 if refused_for_good(&error).is_some() && !resent {
@@ -1022,7 +1070,11 @@ impl App {
         pending: &PendingBatch,
         batch: &Batch,
     ) -> Result<(), AppError> {
-        let proofs = match self.submit(batch).await {
+        let sent = self.submit(batch).await;
+        if let Err(error) = &sent {
+            self.note_kept_rate_limited(error);
+        }
+        let proofs = match sent {
             Ok(submitted) => submitted.proofs,
             Err(AppError::Switch(ClientError::Switch {
                 code: ErrorCode::Conflict,

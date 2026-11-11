@@ -265,6 +265,7 @@ impl std::fmt::Debug for SentMessage {
 
 /// Where a message is (Switch spec 11).
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Delivery {
     /// In the outbox, to be tried again.
     Queued {
@@ -272,11 +273,15 @@ pub enum Delivery {
         tries: u64,
         /// The last failure, without content.
         last_error: Option<String>,
-        /// When a delivery was first answered `403 not_admitted`, or `403 not_current`,
-        /// which the app counts with it, app clock: the start of the time the message stays
-        /// queued so before it is given up ([`UNDELIVERABLE_MS`], Switch spec 11). `None`
-        /// while no delivery of it was answered so.
-        not_admitted_since_ms: Option<u64>,
+        /// When a delivery was first answered `403 not_admitted` or `403 not_current`, app
+        /// clock: the start of the time the message stays queued so before it is given up
+        /// ([`UNDELIVERABLE_MS`], Switch spec 11). `None` while no delivery of it was
+        /// answered so.
+        undeliverable_since_ms: Option<u64>,
+        /// Which of the two the last such answer was: the recipient not admitting the
+        /// sender, or the sender's own certificate not current. `None` while no delivery of
+        /// it was answered so.
+        undeliverable_reason: Option<UndeliverableReason>,
     },
     /// The recipient's inbox accepted it: delivery is complete.
     Accepted {
@@ -288,6 +293,20 @@ pub enum Delivery {
         /// Why, without content.
         reason: String,
     },
+}
+
+/// Why a delivery stays queued for a bounded time before the message is given up
+/// ([`Delivery::Queued`], Switch spec 11).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum UndeliverableReason {
+    /// `403 not_admitted`: the recipient doesn't admit the sender, until it adds a contact
+    /// or an invite (Switch spec 7).
+    NotAdmitted,
+    /// `403 not_current`: the sender's own certificate isn't current, until a renewal makes
+    /// it current again (Switch wire 3.8). Nothing about the recipient.
+    NotCurrent,
 }
 
 /// What a flush of the outbox did.
@@ -379,6 +398,9 @@ pub(crate) struct OutboxItem {
     /// The first `403 not_admitted` or `403 not_current` answer to a delivery, app clock.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     undeliverable_ms: Option<u64>,
+    /// Which of the two the last such answer was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    undeliverable_reason: Option<UndeliverableReason>,
     /// The last such answer counted, app clock.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     undeliverable_last_ms: Option<u64>,
@@ -407,10 +429,12 @@ impl OutboxItem {
         self.accepted_at_ms.is_none() || self.resend
     }
 
-    /// Count a `403 not_admitted` or `403 not_current` answer at `now`: the first starts the
-    /// wait, a later one counts once [`UNDELIVERABLE_TRY_SPACING_MS`] passed since the last
-    /// counted, and a clock gone back starts the wait over.
-    fn count_undeliverable(&mut self, now: u64) {
+    /// Count a `403 not_admitted` or `403 not_current` answer at `now`, for `reason`: the
+    /// first starts the wait, a later one counts once [`UNDELIVERABLE_TRY_SPACING_MS`]
+    /// passed since the last counted, and a clock gone back starts the wait over. The reason
+    /// is the last answer's.
+    fn count_undeliverable(&mut self, now: u64, reason: UndeliverableReason) {
+        self.undeliverable_reason = Some(reason);
         match (self.undeliverable_ms, self.undeliverable_last_ms) {
             (Some(since), last) if now >= since && last.is_none_or(|last| now >= last) => {
                 let last = last.unwrap_or(since);
@@ -429,6 +453,7 @@ impl OutboxItem {
 
     fn clear_undeliverable(&mut self) {
         self.undeliverable_ms = None;
+        self.undeliverable_reason = None;
         self.undeliverable_last_ms = None;
         self.undeliverable_tries = 0;
     }
@@ -481,7 +506,7 @@ enum Tried {
     Accepted(AppendAnswer),
     Queued(String),
     /// Queued after `403 not_admitted` or `403 not_current`, for a bounded time.
-    Undeliverable(String),
+    Undeliverable(String, UndeliverableReason),
     Failed(String),
 }
 
@@ -621,6 +646,7 @@ impl App {
             failed_ms: None,
             resend: false,
             undeliverable_ms: None,
+            undeliverable_reason: None,
             undeliverable_last_ms: None,
             undeliverable_tries: 0,
         })
@@ -706,6 +732,7 @@ impl App {
             failed_ms: None,
             resend: false,
             undeliverable_ms: None,
+            undeliverable_reason: None,
             undeliverable_last_ms: None,
             undeliverable_tries: 0,
         };
@@ -768,7 +795,8 @@ impl App {
                 (None, _) => Delivery::Queued {
                     tries: item.tries,
                     last_error: item.last_error.clone(),
-                    not_admitted_since_ms: item.undeliverable_ms,
+                    undeliverable_since_ms: item.undeliverable_ms,
+                    undeliverable_reason: item.undeliverable_reason,
                 },
             }));
         }
@@ -968,9 +996,9 @@ impl App {
                     item.last_error = Some(why);
                     self.save_item(&item).await?;
                 }
-                Tried::Undeliverable(why) => {
+                Tried::Undeliverable(why, reason) => {
                     item.last_error = Some(why);
-                    item.count_undeliverable(self.now());
+                    item.count_undeliverable(self.now(), reason);
                     self.save_item(&item).await?;
                     if self.drop_undeliverable(&mut item).await? {
                         return Ok(true);
@@ -1336,9 +1364,19 @@ fn queued_or(error: AppError) -> Result<Tried, AppError> {
     match &error {
         AppError::Alarm(_) | AppError::Store(_) => Err(error),
         AppError::Switch(ClientError::Switch {
-            code: ErrorCode::NotAdmitted | ErrorCode::NotCurrent,
+            code: ErrorCode::NotAdmitted,
             ..
-        }) => Ok(Tried::Undeliverable(error.to_string())),
+        }) => Ok(Tried::Undeliverable(
+            error.to_string(),
+            UndeliverableReason::NotAdmitted,
+        )),
+        AppError::Switch(ClientError::Switch {
+            code: ErrorCode::NotCurrent,
+            ..
+        }) => Ok(Tried::Undeliverable(
+            error.to_string(),
+            UndeliverableReason::NotCurrent,
+        )),
         AppError::Switch(ClientError::Switch { code, .. }) if code.retry() == Retry::No => {
             Ok(Tried::Failed(error.to_string()))
         }
@@ -1372,11 +1410,11 @@ mod tests {
         ));
         assert!(matches!(
             queued_or(switch(ErrorCode::NotAdmitted)),
-            Ok(Tried::Undeliverable(_))
+            Ok(Tried::Undeliverable(_, UndeliverableReason::NotAdmitted))
         ));
         assert!(matches!(
             queued_or(switch(ErrorCode::NotCurrent)),
-            Ok(Tried::Undeliverable(_))
+            Ok(Tried::Undeliverable(_, UndeliverableReason::NotCurrent))
         ));
         assert!(matches!(
             queued_or(switch(ErrorCode::Conflict)),

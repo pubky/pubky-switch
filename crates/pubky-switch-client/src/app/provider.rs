@@ -1620,7 +1620,9 @@ impl App {
     /// An erased account seen alive again: the identity publishes an `identity.json`, no
     /// older than the one the app holds, that lists the app (Switch spec 12.7). `gone` goes, the copy is taken, and the app reads
     /// on; one that lists it no longer, or in `removed`, is followed as any copy is.
-    /// Returns whether the app came back.
+    /// The [`AppEvent::AccountGone`] duty events the host hasn't acknowledged go in the same
+    /// commit: they no longer hold, and a later [`App::load`] would deliver them again for a
+    /// live account. Returns whether the app came back.
     async fn revive_erased(&mut self) -> Result<bool, AppError> {
         let identity = self.state.meta.identity;
         let Ok(Some(doc)) =
@@ -1638,9 +1640,24 @@ impl App {
         {
             return Ok(false);
         }
-        // `gone` goes with the copy, in its commit: a copy that fails leaves it.
-        self.take_own_copy_with(doc, |tx| tx.delete(keys::GONE))
-            .await?;
+        let gone_duties: Vec<u64> = self
+            .reader()
+            .scan_numbered::<Duty>(key::DUTY_PREFIX)
+            .await?
+            .into_iter()
+            .filter(|(_, duty)| *duty == Duty::AccountGone)
+            .map(|(n, _)| n)
+            .collect();
+        // `gone` and its duty events go with the copy, in its commit: a copy that fails
+        // leaves them.
+        self.take_own_copy_with(doc, |tx| {
+            tx.delete(keys::GONE)?;
+            for n in gone_duties {
+                tx.delete(&key::duty(n))?;
+            }
+            Ok(())
+        })
+        .await?;
         self.state.gone = None;
         self.events.push(AppEvent::AccountBack);
         Ok(true)

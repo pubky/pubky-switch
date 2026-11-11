@@ -1378,7 +1378,8 @@ async fn test_outbox_give_up_reads_state_again_before_going_on() {
         matches!(
             delivery,
             Delivery::Queued {
-                not_admitted_since_ms: None,
+                undeliverable_since_ms: None,
+                undeliverable_reason: None,
                 ..
             }
         ),

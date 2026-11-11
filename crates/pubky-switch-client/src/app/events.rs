@@ -23,7 +23,8 @@
 //! Every other event is informational: kept in memory only, and shown once.
 //!
 //! Nothing in the app bounds the stored duty events: only the host's acknowledgements
-//! remove them. Each is written once, for one entry stored for good, one kept batch or
+//! remove them, apart from an [`AppEvent::AccountGone`] the account's return no longer
+//! makes true ([`AppEvent::AccountBack`]). Each is written once, for one entry stored for good, one kept batch or
 //! `attempt` dropped, or one outbox message given up, so they grow with those facts, and
 //! without limit for a host that never acknowledges. The app sets no cap, since a cap would
 //! have to lose a duty event or stop the work that makes them: reading the feed, which never
@@ -532,10 +533,15 @@ pub enum AppEvent {
         new_batch_id: [u8; 16],
     },
     /// A read sends the batches kept from earlier calls before it reads the feed, and one
-    /// couldn't be sent now: the network failed, the switch answered `429`, `503`, `410
-    /// moved` or a refusal about the caller, such as `403 cert_expired`, or the answer
-    /// didn't verify. The read went on to the feed; the batches stay kept, the same bytes,
-    /// and go again first at the next read or write (Switch wire 6.4 step 5).
+    /// couldn't be sent now: the network failed, the switch answered `429`, `503` or `410
+    /// moved` (a frozen account takes no write and still serves its feed), or the answer
+    /// didn't verify; or a `429` earlier asked the app to wait, and its `retry_after` hasn't
+    /// passed, so nothing was sent. The read went on to the feed; the batches stay kept, the
+    /// same bytes, and go again first at the next read or write (Switch wire 6.4 step 5). A
+    /// refusal about the caller, such as `403 cert_expired`, comes when the request is
+    /// authenticated, so the feed's read is refused too, and the read fails with that error
+    /// instead. Only the report of the read that met it carries this event: a read that
+    /// fails drops it.
     KeptBatchesWaiting {
         /// How many batches are kept now.
         kept: u64,
@@ -545,8 +551,10 @@ pub enum AppEvent {
     /// A kept batch wasn't carried to the new service: one holding an `attempt` after a
     /// provider loss, since no automatic attempt is made on an obligation from before the
     /// loss (Switch spec 12.6 step 5), or one kept longer than a resend's answer can tell
-    /// whether it was applied (Switch spec 12.5 "Kept batches"). Each attempt in it follows
-    /// as [`AppEvent::AttemptDropped`]. The protocol decides what to write instead. A duty
+    /// whether it was applied (Switch spec 12.5 "Kept batches"). Or a kept batch never sent
+    /// that holds an `attempt`, while the app may not attempt, as in reconcile mode (Switch
+    /// spec 12.4): never applied, it goes unsent. Each attempt in it follows as
+    /// [`AppEvent::AttemptDropped`]. The protocol decides what to write instead. A duty
     /// event.
     KeptBatchDropped {
         /// The duty event's ID.
@@ -557,7 +565,7 @@ pub enum AppEvent {
     /// An `attempt` in a kept batch that was dropped ([`AppEvent::KeptBatchDropped`]): it
     /// is never signed again, and whether it was applied can't be known, so its obligation
     /// is uncertain (Switch spec 12.5 "Kept batches", 12.6 step 5). The protocol treats it
-    /// so. A duty event.
+    /// so; the claim shows no such attempt for one that was never sent. A duty event.
     AttemptDropped {
         /// The duty event's ID.
         id: EventId,
@@ -581,14 +589,17 @@ pub enum AppEvent {
     /// host and the identity publishes no `identity.json`, at every try of the wait (Switch
     /// spec 12.7, [`super::AppError::NotAnsweringAsAccount`]). A duty event, kept in the
     /// commit that marks the app gone: the app reads nothing more, and the protocol learns
-    /// its account is gone, at least once, whenever the host next takes its events.
+    /// its account is gone, at least once, whenever the host next takes its events. Once
+    /// the account is seen alive again ([`AppEvent::AccountBack`]), an `AccountGone` not yet
+    /// acknowledged no longer holds: it goes in that commit, and no later load delivers it.
     AccountGone {
         /// The duty event's ID.
         id: EventId,
     },
     /// An account taken as erased was seen alive again: the identity publishes an
-    /// `identity.json` listing the app (Switch spec 12.7). The app reads on; its push
-    /// registration, which the service dropped, is set again with
+    /// `identity.json` listing the app (Switch spec 12.7). The app reads on, and the
+    /// [`AppEvent::AccountGone`] events the host hasn't acknowledged are no longer kept. Its
+    /// push registration, which the service dropped, is set again with
     /// [`super::App::reregister_push`].
     AccountBack,
     /// The app's push registration is set (Switch spec 9 steps 1 to 3).
