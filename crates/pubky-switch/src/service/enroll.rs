@@ -193,10 +193,10 @@ impl Service {
         // The same enrollment again gets the same answer, whatever the account did since
         // (Switch wire 3.7): the key it named, recognized by the enrollment's hash. An answer
         // drops only while a rebuild would give it byte for byte: one naming the pending key,
-        // as long as that key is pending. Once served, a key rotation or a recovery in place
-        // makes every answer naming a key that is neither the account's nor its pending key a
-        // `409 conflict` on retry, so the signer enrolls anew; a retry never gets another key
-        // under the old enrollment.
+        // as long as that key is pending. Wire 3.7 also answers a retry `409 conflict` once a
+        // key rotation or a recovery in place leaves the key it names neither the account's
+        // nor its pending key, so the signer enrolls anew. That rule isn't applied here yet:
+        // it comes with the generation changes, which this service doesn't serve yet.
         if let Some(key_id) = txn
             .enrollment_answer(&enrollment_hash)
             .await
