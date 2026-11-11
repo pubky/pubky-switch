@@ -107,7 +107,7 @@ impl Homeserver for TestHomeserver {
             let mut hook = self.after_get.lock().unwrap();
             match hook.as_mut() {
                 Some((at, left, _)) if at == path => {
-                    *left -= 1;
+                    *left = left.saturating_sub(1);
                     if *left == 0 { hook.take() } else { None }
                 }
                 _ => None,

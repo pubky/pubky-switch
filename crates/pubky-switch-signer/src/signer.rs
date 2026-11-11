@@ -966,6 +966,12 @@ impl Signer {
     pub(crate) async fn ensure_signer(&mut self) -> Result<()> {
         self.check_named()?;
         self.switch_at_mark().await?;
+        self.check_backup_copy().await
+    }
+
+    /// Read the signer backup on the Homeserver and stop at one that shows another install
+    /// took over, or a newer version of this install's own ([`Signer::judge_backup`]).
+    pub(crate) async fn check_backup_copy(&mut self) -> Result<()> {
         let found = self
             .env
             .homeserver
@@ -1228,6 +1234,8 @@ impl Signer {
         state.backup_owed = false;
         state.managed_by = Some(signer);
         state.alert(Alert::ManagedByOtherInstall { install: signer });
+        // An erasure in progress ends without erasing, in the same commit (Switch spec 12.7).
+        self.end_erasure_in(&mut state)?;
         self.commit(state, None).await?;
         Err(SignerError::NotNamed { install: signer })
     }
@@ -1256,6 +1264,8 @@ impl Signer {
         state.backup_owed = false;
         state.managed_by = Some(install);
         state.alert(Alert::ManagedByOtherInstall { install });
+        // An erasure in progress ends without erasing, in the same commit (Switch spec 12.7).
+        self.end_erasure_in(&mut state)?;
         self.commit(state, None).await?;
         Err(SignerError::NotNamed { install })
     }

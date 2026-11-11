@@ -430,9 +430,9 @@ impl Signer {
 
     /// Send a renewal's or an epoch completion's batches from `sent` on, each with its signed
     /// bytes, recording the parts each stores once the switch took it, then go on to the
-    /// version's delivery. Before the first batch it sends, a resumed one included, it checks
-    /// that this install still signs: the switch's copy is its mark, and no other install's
-    /// backup took over (Switch spec 4.3, 12.8).
+    /// version's delivery. Before each batch it sends, a resumed one included, it checks that
+    /// this install still signs: the switch's copy is its mark, and no other install's backup
+    /// took over (Switch spec 4.3, 12.8).
     pub(super) async fn send_renewal(
         &mut self,
         batches: &[RenewBatch],

@@ -638,3 +638,143 @@ async fn test_erasure_request_not_sent_again_once_another_install_signs() {
             .contains(&Alert::GrantRevocationOwed { app_id: id })
     );
 }
+
+/// `world`'s env, whose transport answers `GET /apps` with an unsigned `404` the first
+/// `times` times, as an intermediary could, and passes everything else to the switch.
+fn unsigned_404_for_apps(world: &World, store: Arc<MemoryStore>, times: usize) -> SignerEnv {
+    let switch = Arc::clone(&world.switch);
+    let left = Arc::new(std::sync::Mutex::new(times));
+    let transport = Arc::new(MockTransport::with_handler(move |request| {
+        if request.method == "GET" && request.path_and_query.ends_with("/apps") {
+            let mut left = left.lock().unwrap();
+            if *left > 0 {
+                *left -= 1;
+                return Ok(Response {
+                    status: 404,
+                    headers: Vec::new(),
+                    body: b"{}".to_vec(),
+                });
+            }
+        }
+        switch.handle(request)
+    }));
+    let mut env = world.env(store);
+    env.transport = transport;
+    env
+}
+
+#[tokio::test]
+async fn test_erasure_unsigned_404_with_nothing_in_doubt_takes_no_step() {
+    // With no request in doubt, an unsigned `404` to the check's read is a copy that can't be
+    // read: nothing is deleted (Switch wire 7.4.16).
+    let world = World::new();
+    let (mut signer, id, store) = with_an_app(&world).await;
+    *world.homeserver.failing_puts.lock().unwrap() = true;
+    signer.close_account(confirmed()).await.unwrap_err();
+    *world.homeserver.failing_puts.lock().unwrap() = false;
+    drop(signer);
+    let mut signer = Signer::open(unsigned_404_for_apps(&world, store, 1), world.keyring())
+        .await
+        .unwrap();
+    signer.resume().await.unwrap_err();
+    assert!(world.published().is_some());
+    assert!(world.homeserver.file(&app_record_path(&id)).is_some());
+    assert_eq!(erase_requests(&world), 0);
+    assert_eq!(signer.status(), SignerStatus::Erasing);
+}
+
+#[tokio::test]
+async fn test_erasure_in_doubt_still_judges_the_backup() {
+    // A request went unanswered, without landing; another device restores and takes over.
+    // An unsigned `404` to the next check's switch read, which could be the operator's after
+    // an erasure, still leaves the backup to judge: it names the other install, and nothing
+    // is sent (Switch wire 3.13, 7.4.16).
+    let world = World::new();
+    let (mut signer, id, store) = with_an_app(&world).await;
+    world.switch.fail_next(SwitchFault::Unreachable {
+        path: "/erase".into(),
+        after: 0,
+    });
+    signer.close_account(confirmed()).await.unwrap_err();
+    assert!(
+        signer
+            .alerts()
+            .contains(&Alert::GrantRevocationOwed { app_id: id })
+    );
+    drop(signer);
+    let other = Signer::restore_new(
+        world.env(Arc::new(MemoryStore::new())),
+        world.keyring(),
+        confirmed(),
+    )
+    .await
+    .unwrap();
+    let sent = erase_requests(&world);
+    let mut signer = Signer::open(unsigned_404_for_apps(&world, store, 1), world.keyring())
+        .await
+        .unwrap();
+    assert_eq!(
+        signer.resume().await.unwrap_err(),
+        SignerError::NotNamed {
+            install: other.install_id()
+        }
+    );
+    assert_eq!(erase_requests(&world), sent);
+    assert!(!world.switch.erased());
+    // Ended in the commit that names the other install: the reminder is withdrawn.
+    assert!(
+        !signer
+            .alerts()
+            .contains(&Alert::GrantRevocationOwed { app_id: id })
+    );
+}
+
+#[tokio::test]
+async fn test_erasure_stops_at_another_installs_copy_on_the_homeserver() {
+    // The Homeserver publishes a newer version of another install's: the full check before the
+    // first deletion finds it, and nothing is deleted (Switch spec 4.3).
+    let world = World::new();
+    let (mut signer, id, _) = with_an_app(&world).await;
+    *world.homeserver.failing_puts.lock().unwrap() = true;
+    signer.close_account(confirmed()).await.unwrap_err();
+    *world.homeserver.failing_puts.lock().unwrap() = false;
+    let other = world.other_install_version(&signer.identity_doc().unwrap().unwrap(), [9; 16]);
+    world
+        .homeserver
+        .set(IDENTITY_PATH, serde_json::to_vec(other.signed()).unwrap());
+    assert_eq!(
+        signer.resume().await.unwrap_err(),
+        SignerError::NotNamed { install: [9; 16] }
+    );
+    assert!(world.homeserver.file(&app_record_path(&id)).is_some());
+    assert!(world.homeserver.file(IDENTITY_PATH).is_some());
+    assert_eq!(erase_requests(&world), 0);
+}
+
+#[tokio::test]
+async fn test_erasure_kept_through_an_alarm() {
+    // Another body at the mark's version on the Homeserver is the equivocation alarm: this
+    // install still signs, so the erasure stays in progress, nothing is deleted meanwhile,
+    // and the user can abort it.
+    let world = World::new();
+    let (mut signer, id, _) = with_an_app(&world).await;
+    *world.homeserver.failing_puts.lock().unwrap() = true;
+    signer.close_account(confirmed()).await.unwrap_err();
+    *world.homeserver.failing_puts.lock().unwrap() = false;
+    let mine = signer.identity_doc().unwrap().unwrap();
+    let mut body = mine.body().clone();
+    body.record_max_age = Some(1);
+    let other = IdentityDoc::sign(&world.key, body).unwrap();
+    world
+        .homeserver
+        .set(IDENTITY_PATH, serde_json::to_vec(other.signed()).unwrap());
+    assert!(matches!(
+        signer.resume().await.unwrap_err(),
+        SignerError::Alarm(_)
+    ));
+    assert_eq!(signer.status(), SignerStatus::Erasing);
+    assert!(world.homeserver.file(&app_record_path(&id)).is_some());
+    assert_eq!(erase_requests(&world), 0);
+    signer.abort_erasure().await.unwrap_err();
+    assert_ne!(signer.status(), SignerStatus::Erasing);
+}
