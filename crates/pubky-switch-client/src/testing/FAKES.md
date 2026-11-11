@@ -33,7 +33,10 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   view.
 - **`invite_code.delete`** of a code the switch doesn't hold is `404`; the core has no rule
   for it.
-- **Key bundle parts** the target's cursor passed are never dropped (Switch wire 6.2).
+- **Key bundle parts** the target's cursor passed are never dropped, neither when a part is
+  stored nor at the cursor move that passes them (Switch wire 6.2); so their items never turn
+  to stubs, `GET /apps/{app_id}/keys` keeps answering them, and `bundle_ranges` never
+  shrinks.
 - **`keys_through`** (Switch wire 7.4.12) counts every stored part as fetched, whatever the
   app's cursor: the epoch of the first version listing the app, raised by each part that
   continues it.
@@ -43,9 +46,14 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
 - **Durability** (Switch spec 6.5): everything is in memory, answered at once; the service
   key's mark isn't kept. Per-account order is a mutex.
 - **Retention and sweeps** (Switch wire 9.1): entries never expire; `missed` items,
-  checkpoints and dropped stubs exist only when a test scripts them; claims are deleted only
-  when `GET /claims` finds them deletable; batch records are never dropped, and their proofs
-  go only when a retry finds them past `batch_proofs_ms`.
+  checkpoints and dropped stubs exist only when a test scripts them;
+  no app is ever marked lagging (`lagging` is always `false`), so entries always wait for
+  every current target and no `missed` item is written (7.4.4);
+  `unreadable` items exist only when a test scripts them (`push_unreadable`), with an
+  `entry_id` of their own rather than the entry's: a revocation, leave or delivery that
+  leaves an entry with no current target writes none, and the entry stays; claims are
+  deleted only when `GET /claims` finds them deletable; batch records are never dropped, and
+  their proofs go only when a retry finds them past `batch_proofs_ms`.
 - **Invite codes**: a revoked app's codes aren't withdrawn (Switch wire 7.4.3 "After a
   revocation"); a code planted for a faulty export never expires.
 - **Lists**: `flagged` is always empty; connect requests are never full. Conversation
