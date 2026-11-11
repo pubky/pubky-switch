@@ -1517,7 +1517,16 @@ impl App {
                 scope_keys: ScopeKeys {
                     keys: backup.scope_keys.clone(),
                 },
-                bundle: backup.bundle.clone(),
+                // A full-bundle request the backup holds may have been answered and its
+                // parts read and dropped since, by the device it came from, leaving the
+                // feed only stubs: the restore drops it, so the first read fetches and asks
+                // once if a key is still missing. A repeated request keeps the service's
+                // first time while it is pending, so a restore adds one request at most
+                // (Switch wire 7.4.11).
+                bundle: BundleState {
+                    full_requested_ms: None,
+                    ..backup.bundle.clone()
+                },
                 own_doc: own_doc.clone(),
                 receive_keys,
                 known_kids,

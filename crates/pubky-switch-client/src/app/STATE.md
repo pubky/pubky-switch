@@ -130,7 +130,7 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
 | `record` | the app record the service holds or is being given (signed) | |
 | `naming` | the naming key | yes |
 | `scope/<epoch>/<scope>` | one scope key | yes |
-| `bundle` | `keys_through`, and when a full bundle was requested (the service's `requested` time), until no key is missing or the feed shows a part stored at or after that time, which asks again for a key still missing: at most once per such part (Switch wire 7.4.11); a backup carries it | |
+| `bundle` | `keys_through`, and when a full bundle was requested (the service's `requested` time), until no key is missing or the feed shows a part stored at or after that time, which asks again for a key still missing: at most once per such part (Switch wire 7.4.11). A backup carries it and a restore drops it, so the restored app's first read fetches and asks once if a key is still missing | |
 | `ident/<pubky>/doc` | the newest `identity.json` taken for an identity, own or a sender's, and when it was read | |
 | `ident/<pubky>/floor` | the highest version and generation seen | |
 | `ident/<pubky>/body/<version>` | the body hash seen at a version, for equivocation | |

@@ -14,7 +14,9 @@
 //! A part stored after the request, seen in the feed, also clears it: it is the signer's
 //! answer, so a key still missing once that part is read is asked for again (Switch wire
 //! 7.4.11). Otherwise a request kept while the parts that answered it went, such as one a
-//! backup carries into a restore after the parts were dropped, would never be made again.
+//! backup carried into a restore, would never be made again. A restore drops the request
+//! the backup holds: its answer may have been read and dropped by the device the backup
+//! came from, leaving the feed only stubs, so the first read asks again if a key is missing.
 //! So the app asks at most once per part stored after its last request: the signer's
 //! answers, not a clock, pace the requests, and while no part arrives a request again would
 //! keep the service's first time and tell the signer nothing new.

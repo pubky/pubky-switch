@@ -2583,6 +2583,48 @@ async fn test_app_restore_asks_again_for_a_full_bundle_a_later_part_left_short()
     );
 }
 
+/// The answer to a full-bundle request the backup holds was read by the device the backup
+/// came from, which moved its cursor past it, so the switch dropped the parts and the
+/// restored app's feed shows only their stubs. The restore drops the request: the first read
+/// asks once, and no later read asks again while no part arrives.
+#[tokio::test]
+async fn test_app_restore_asks_again_for_a_full_bundle_read_and_dropped() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let me = app.app_id();
+    let cert = app.cert().clone();
+    w.next_doc(|body| body.data_epoch = 3);
+    let report = app.receive(None).await.unwrap();
+    let asked = |events: &[AppEvent]| {
+        events
+            .iter()
+            .filter(|e| matches!(e, AppEvent::FullBundleRequested))
+            .count()
+    };
+    assert_eq!(asked(&report.events), 1, "{:?}", report.events);
+    let backup = app.backup().await.unwrap();
+    store_part(&w, me, &cert, 1, 3);
+    app.receive(None).await.unwrap();
+    app.flush_cursor().await.unwrap();
+    assert_eq!(app.keys_through(), 3);
+    store_part(&w, me, &cert, 3, 3);
+    app.receive(None).await.unwrap();
+    app.flush_cursor().await.unwrap();
+    assert!(!w.switch.bundles_of(&me).contains(&(1, 3)), "dropped");
+    drop(app);
+    let (mut restored, _) = restored(&w, &backup).await;
+    let mut events = restored.receive(None).await.unwrap().events;
+    assert_eq!(asked(&events), 1, "{events:?}");
+    assert!(w.switch.app(&me).full_requested.is_some());
+    for _ in 0..2 {
+        events = restored.receive(None).await.unwrap().events;
+        assert_eq!(asked(&events), 0, "{events:?}");
+    }
+    store_part(&w, me, &cert, 1, 3);
+    restored.receive(None).await.unwrap();
+    assert_eq!(restored.keys_through(), 3);
+}
+
 // The scripted switch drops key bundle parts by the core's rule, as the service does (Switch
 // wire 6.2): these mirror the service's tests of the same names in
 // `crates/pubky-switch/tests/endpoints_keys.rs`.
