@@ -259,7 +259,7 @@ impl Signer {
     /// (Switch wire 3.13), and the revocation is the user's confirmed safety step.
     async fn named_for_revoking(&mut self) -> Result<Named> {
         self.check_named()?;
-        let held = self.service_client()?.apps().await?.identity;
+        let held = self.read_apps().await?.answer.identity;
         let in_flow = match &self.flow {
             Some(Flow::Deliver { doc, .. } | Flow::Renew { doc, .. }) => Some(doc.clone()),
             _ => None,

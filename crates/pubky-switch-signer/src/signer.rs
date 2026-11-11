@@ -418,7 +418,7 @@ impl Signer {
     /// 6.5). Then the switch's copy is read instead: one at the mark, as after a single bad
     /// answer, confirms the switch, and signing goes on; none raises the alarm again, and the
     /// user declares a provider loss. Nothing is delivered or read once another install is
-    /// the signer.
+    /// the signer, nor once the account is erased: then only the alert goes.
     ///
     /// # Errors
     ///
@@ -439,15 +439,25 @@ impl Signer {
         }
         let mut state = self.state.clone();
         state.alerts.retain(|held| held != alert);
+        // An erased account has no switch to deliver to or read: the alert goes, nothing else
+        // (Switch spec 12.7).
+        if self.state.erased {
+            return self.commit(state, self.flow.clone()).await;
+        }
+        // Nothing is delivered, published or read for an install that isn't the one to sign:
+        // another install named, or records behind (Switch spec 4.3, wire 3.13).
+        let named = self.check_named().is_ok();
         // Seen, another body on the Homeserver is published over with the switch's copy once
         // the switch is confirmed to hold this signer's newest version (Switch wire 3.3).
-        let republish = matches!(
-            alert,
-            Alert::Equivocation {
-                source: Source::Homeserver,
-                ..
-            }
-        ) && state.homeserver_other.is_some();
+        let republish = named
+            && matches!(
+                alert,
+                Alert::Equivocation {
+                    source: Source::Homeserver,
+                    ..
+                }
+            )
+            && state.homeserver_other.is_some();
         if republish {
             state.republish_over = state.homeserver_other;
             if let Some(newest) = state.newest.as_mut() {
@@ -457,7 +467,8 @@ impl Signer {
         // Delivered again only when the alarm saw a copy at the switch: one that holds nothing
         // has lost the account's state, and a version 1 delivered onto it would start the
         // account afresh at the same generation (Switch spec 6.5 "No restore and continue");
-        // the way out is a provider loss. Never once another install signs.
+        // the way out is a provider loss. Never once another install signs, or while the
+        // records are behind, where the delivery could never go.
         let alarm = matches!(
             alert,
             Alert::Rollback {
@@ -465,7 +476,6 @@ impl Signer {
                 ..
             } | Alert::Equivocation { .. }
         );
-        let named = self.state.managed_by.is_none();
         let again = match (&self.state.newest, &self.flow) {
             (Some(newest), None) if alarm && named && state.switch_unconfirmed => {
                 Some(Flow::Deliver {
@@ -964,10 +974,50 @@ impl Signer {
     /// /apps` `identity`, Switch wire 7.4.12). Any other copy stops the flow, as
     /// [`Signer::judge_copy`] says. Returns the answer, with the device clock when it came.
     async fn switch_at_mark(&mut self) -> Result<SwitchRead> {
-        let answer = self.service_client()?.apps().await?;
+        let read = self.read_apps().await?;
+        self.confirm_copy(read.answer.identity.as_ref()).await?;
+        Ok(read)
+    }
+
+    /// `GET /apps` (Switch wire 7.4.12), for a check of the switch's copy: the answer, with the
+    /// device clock when it came. A `404` the pinned key didn't sign, with no erasure of this
+    /// install's in progress, raises [`Alert::AccountNotHosted`] and is returned as the error
+    /// it is; the next answer the pinned key signs clears it, an error included. Never raised
+    /// once the account is erased. Nothing else changes: an unauthenticated `404` with no
+    /// request in doubt is never an erasure (Switch wire 7.4.16).
+    pub(crate) async fn read_apps(&mut self) -> Result<SwitchRead> {
+        let read = self.service_client()?.apps().await;
+        // The device clock when the answer came, before the alert's commit below, so a step
+        // judging the clock against the answer's time isn't off by that commit.
         let device_ms = self.env.clock.now_ms();
-        self.confirm_copy(answer.identity.as_ref()).await?;
-        Ok(SwitchRead { answer, device_ms })
+        let raised = self.state.alerts.contains(&Alert::AccountNotHosted);
+        // An erasure in progress judges the `404` itself (Switch wire 7.4.16).
+        let erasing = matches!(self.flow, Some(Flow::Erase { .. }));
+        let raise = match &read {
+            // Any answer the pinned key signs, an error included, shows the account hosted.
+            Ok(_) | Err(ClientError::Switch { .. }) if raised => Some(false),
+            Err(ClientError::BadServiceSignature { status: 404 })
+                if !raised && !erasing && !self.state.erased =>
+            {
+                Some(true)
+            }
+            _ => None,
+        };
+        if let Some(raise) = raise {
+            let mut state = self.state.clone();
+            if raise {
+                state.alert(Alert::AccountNotHosted);
+            } else {
+                state
+                    .alerts
+                    .retain(|alert| *alert != Alert::AccountNotHosted);
+            }
+            self.commit(state, self.flow.clone()).await?;
+        }
+        Ok(SwitchRead {
+            answer: read?,
+            device_ms,
+        })
     }
 
     /// Judge the switch's copy of `identity.json`, `held` as `GET /apps` gave it, against the

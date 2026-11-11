@@ -1359,9 +1359,9 @@ async fn test_owed_record_cleanup_waits_for_a_fresh_check() {
 #[tokio::test]
 async fn test_revocation_checks_the_switch_again_after_completing_a_given_up_epoch() {
     // The revocation completes a given-up epoch in a version of its own, then another
-    // install delivers the next version before the rotation goes out. The switch is checked
-    // again before the rotation's batches: the other install is named, and nothing more is
-    // sent, no batch and no version (Switch spec 4.3, 3.2).
+    // install delivers the next version before the rotation goes out. The rotation's batches
+    // check the switch before each one (`send_renewal`): the other install is named, and
+    // nothing more is sent, no batch and no version (Switch spec 4.3, 3.2).
     use pubky_switch_client::transport::MockTransport;
     let world = World::new();
     let (mut signer, store) = world.enrolled().await;
