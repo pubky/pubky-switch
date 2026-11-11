@@ -918,7 +918,10 @@ impl Service {
                         // key, as every such answer (7.4.16). A page read from a snapshot taken
                         // before an erasure committed still reads its rows, so this runs on a
                         // page read as well as on a failure.
-                        if let Some(error) = self.no_longer_keyed(&txn_account, &txn_key).await {
+                        if let Some(error) = self
+                            .no_longer_keyed(&txn_account, &txn_key, by_signer)
+                            .await
+                        {
                             return self.operator_answer(signature, base_ms, &error).await;
                         }
                         match read {

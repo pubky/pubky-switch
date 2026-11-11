@@ -1705,11 +1705,12 @@ async fn test_erase_records_list_waiting_its_turn_across_an_erasure_isnt_signed_
         (second, erased)
     });
     assert_eq!(code_of(&erased), (503, json!("unavailable")));
-    assert_eq!(code_of(&second), (503, json!("unavailable")));
+    assert_eq!(code_of(&second), (404, json!("not_found")));
     assert!(
         !alice_signed(&second, Some(&second_signature)),
         "signed with the erased account's key"
     );
+    assert!(operator_signed(&second, Some(&second_signature)));
     replay.db.drop_database().await.expect("drop");
 }
 
