@@ -1164,3 +1164,150 @@ async fn test_provider_loss_stops_at_a_newer_own_backup() {
     assert!(router.log().is_empty(), "nothing sent");
     assert!(service.identity_doc().is_none());
 }
+
+/// A recovery whose version the new service refused for good, once its backup was written:
+/// the signer, the service, the router, the lost version and the refused one.
+async fn refused_after_its_backup(
+    world: &World,
+) -> (
+    Signer,
+    Arc<ScriptedSwitch>,
+    Arc<Router>,
+    pubky_switch_core::records::IdentityDoc,
+    pubky_switch_core::records::IdentityDoc,
+) {
+    let (mut signer, service, router) = lost_with_an_app(world, notes()).await;
+    let lost = signer.identity_doc().unwrap().unwrap();
+    service.fail_next(Fault::Error {
+        path: "/identity".into(),
+        code: pubky_switch_core::http::ErrorCode::BadRequest,
+        current: serde_json::Value::Null,
+    });
+    signer
+        .declare_provider_loss(NEW_ORIGIN, confirmed())
+        .await
+        .unwrap_err();
+    let refused = world.backup().identity_doc().clone();
+    assert_eq!(refused.body().recovery_from, Some(lost.generation()));
+    (signer, service, router, lost, refused)
+}
+
+#[tokio::test]
+async fn test_provider_loss_restored_mid_recovery_on_a_new_install_declares_again() {
+    // The backup holds a recovery's version the service refused: an install restored from
+    // it is recovering, refused there, and declares the loss again at another service, the
+    // lost generation the same and the version higher (Switch spec 12.6 step 1, wire 3.13).
+    let world = World::new();
+    let (signer, service, router, lost, refused) = refused_after_its_backup(&world).await;
+    drop(signer);
+    service.fail_next(Fault::Error {
+        path: "/identity".into(),
+        code: pubky_switch_core::http::ErrorCode::BadRequest,
+        current: serde_json::Value::Null,
+    });
+    let store = Arc::new(MemoryStore::new());
+    let mut env = world.env_with(store.clone(), notes());
+    env.transport = router.clone();
+    Signer::restore_new(env, world.keyring(), confirmed())
+        .await
+        .unwrap_err();
+    let mut restored = reopened(&world, store, &router, notes()).await;
+    assert_eq!(
+        restored.status(),
+        SignerStatus::RecoveryRefused {
+            origin: NEW_ORIGIN.into()
+        }
+    );
+    let third = service_on(&world, &router, THIRD_ORIGIN, 0x6e);
+    let recovered = restored
+        .declare_provider_loss(THIRD_ORIGIN, confirmed())
+        .await
+        .unwrap();
+    assert_eq!(recovered.generation(), lost.generation() + 1);
+    assert_eq!(recovered.body().recovery_from, Some(lost.generation()));
+    assert!(recovered.version() > refused.version());
+    assert_eq!(third.identity_doc().unwrap().hash(), recovered.hash());
+    assert_eq!(world.published().unwrap().hash(), recovered.hash());
+    assert_eq!(restored.status(), SignerStatus::Signing);
+}
+
+#[tokio::test]
+async fn test_provider_loss_restored_mid_recovery_in_place_declares_again() {
+    // The same, restored in place: the restore delivers the backup's version again, is
+    // refused, and the recovery is declared again elsewhere (Switch spec 12.6 step 1).
+    let world = World::new();
+    let (mut signer, service, router, lost, refused) = refused_after_its_backup(&world).await;
+    service.fail_next(Fault::Error {
+        path: "/identity".into(),
+        code: pubky_switch_core::http::ErrorCode::BadRequest,
+        current: serde_json::Value::Null,
+    });
+    signer.restore(confirmed()).await.unwrap_err();
+    assert_eq!(
+        signer.status(),
+        SignerStatus::RecoveryRefused {
+            origin: NEW_ORIGIN.into()
+        }
+    );
+    service_on(&world, &router, THIRD_ORIGIN, 0x6e);
+    let recovered = signer
+        .declare_provider_loss(THIRD_ORIGIN, confirmed())
+        .await
+        .unwrap();
+    assert_eq!(recovered.generation(), lost.generation() + 1);
+    assert_eq!(recovered.body().recovery_from, Some(lost.generation()));
+    assert!(recovered.version() > refused.version());
+}
+
+#[tokio::test]
+async fn test_provider_loss_restored_mid_recovery_completes_it() {
+    // The install stopped after the recovery's backup, its delivery never sent: an install
+    // restored from that backup delivers it, and the recovery is done there, the admission
+    // ended (Switch spec 12.6, wire 3.13).
+    let world = World::new();
+    let (mut signer, service, router) = lost_with_an_app(&world, notes()).await;
+    service.fail_next(Fault::Unreachable {
+        path: "/identity".into(),
+        after: 0,
+    });
+    signer
+        .declare_provider_loss(NEW_ORIGIN, confirmed())
+        .await
+        .unwrap_err();
+    let backed_up = world.backup().identity_doc().clone();
+    drop(signer);
+    let mut env = world.env_with(Arc::new(MemoryStore::new()), notes());
+    env.transport = router.clone();
+    let mut restored = Signer::restore_new(env, world.keyring(), confirmed())
+        .await
+        .unwrap();
+    restored.resume().await.unwrap();
+    let held = service.identity_doc().unwrap();
+    assert_eq!(held.generation(), backed_up.generation());
+    assert!(
+        held.version() > backed_up.version(),
+        "the restore's own next version"
+    );
+    assert!(!service.admission_staged());
+    assert_eq!(restored.status(), SignerStatus::Signing);
+}
+
+#[tokio::test]
+async fn test_provider_loss_admission_end_owed_after_a_restore_in_place() {
+    // As after a restore on a new install: restored in place, the install still finds the
+    // wait from the service's `GET /apps`, and ends it (Switch spec 12.6 step 2).
+    let world = World::new();
+    let (mut signer, service, _) = lost_with_an_app(&world, notes()).await;
+    service.fail_next(Fault::Unreachable {
+        path: "/recovery/admission".into(),
+        after: 0,
+    });
+    signer
+        .declare_provider_loss(NEW_ORIGIN, confirmed())
+        .await
+        .unwrap();
+    assert!(service.admission_staged());
+    signer.restore(confirmed()).await.unwrap();
+    signer.resume().await.unwrap();
+    assert!(!service.admission_staged());
+}

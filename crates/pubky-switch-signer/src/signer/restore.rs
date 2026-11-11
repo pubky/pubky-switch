@@ -27,7 +27,9 @@
 //! written"). Records behind their own newer version, or an install another took over from,
 //! are restored in place this way.
 
+use pubky_switch_client::ClientError;
 use pubky_switch_client::client::answers::AppsAnswer;
+use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::records::{IDENTITY_PATH, IdentityDoc, SIGNER_BACKUP_PATH, app_record_path};
 use pubky_switch_core::sig::SignedDoc;
 
@@ -132,9 +134,26 @@ impl Signer {
             pinned: Some(service.service_key),
             identity,
         };
-        let answer = RequestClient::new(&self.env, &target, &self.keyring)?
+        let answer = match RequestClient::new(&self.env, &target, &self.keyring)?
             .apps()
-            .await?;
+            .await
+        {
+            Ok(answer) => answer,
+            // A backup written mid-recovery names the service the recovery went to, which
+            // holds a staged account and no document until it takes that version: it holds
+            // no copy, so the version is delivered first (Switch spec 12.6 step 1, wire 7.3).
+            Err(ClientError::Switch {
+                code: ErrorCode::Staged,
+                ..
+            }) if is_recovery(&doc) => AppsAnswer {
+                apps: Vec::new(),
+                recovery: None,
+                proof_generations: Vec::new(),
+                identity: None,
+                server_time: 0,
+            },
+            Err(error) => return Err(error.into()),
+        };
         let first = self
             .check_restore(&view, answer.identity.as_ref(), in_place)
             .await?;
@@ -155,6 +174,17 @@ impl Signer {
         let mut state = self.taken_records(&view, &answer, service, tombstones, cleanup);
         if in_place {
             state.revoking.clone_from(&self.state.revoking);
+        }
+        // A backup written mid-recovery holds the recovery's version, which the service it
+        // names doesn't hold yet: the recovery is in progress again, delivered first, and
+        // declared again elsewhere if that service refuses it (Switch spec 12.6 step 1).
+        if first == Some(None)
+            && is_recovery(&doc)
+            && let Some(lost) = doc.body().recovery_from
+        {
+            state.recovering = true;
+            state.recovery_base = Some(doc.signed().clone());
+            state.lost_generation = Some(lost);
         }
         state.newest = Some(Newest {
             doc: doc.signed().clone(),
@@ -440,3 +470,10 @@ pub(super) fn removed_at_switch(apps: &AppsAnswer) -> impl Iterator<Item = [u8; 
 
 /// How many removed apps' records a run checks for.
 const DELETION_CHECKS_PER_RUN: usize = 32;
+
+/// Whether `doc` starts a recovery: `recovery_from` is the generation before its own (Switch
+/// spec 12.6 step 1).
+fn is_recovery(doc: &IdentityDoc) -> bool {
+    doc.body().recovery_from.is_some()
+        && doc.body().recovery_from == doc.generation().checked_sub(1)
+}

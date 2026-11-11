@@ -208,6 +208,12 @@ pub(crate) struct SignerState {
     /// recovery is declared again elsewhere, and dropped once its version is delivered.
     #[serde(default)]
     pub(crate) recovery_base: Option<SignedDoc>,
+    /// The generation a declared recovery declares lost (Switch spec 12.6 step 1): its
+    /// version is the next one, with `recovery_from` this. Kept while the recovery is
+    /// declared again, since its base may be a recovery's own version not delivered yet, as
+    /// one restored from a backup written mid-recovery.
+    #[serde(default)]
+    pub(crate) lost_generation: Option<u64>,
     /// The staged admission a recovery started is the signer's to end (Switch spec 12.6 step
     /// 2): none of the listed apps holds `lists.manage`, or the user asked. `POST
     /// /recovery/admission` is owed, sent again at every run, after publication, until `GET
@@ -389,6 +395,7 @@ impl SignerState {
             erased: false,
             recovering: false,
             recovery_base: None,
+            lost_generation: None,
             admission_owed: false,
         }
     }

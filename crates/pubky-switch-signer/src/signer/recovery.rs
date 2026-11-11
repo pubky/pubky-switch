@@ -108,8 +108,9 @@ impl Signer {
         revoked.dedup();
         // A version the cap can't take is refused before anything is sent: the origin is in
         // it, and the service's key is as long whatever it is.
+        let lost = self.lost_generation(&base);
         let until = self.env.clock.now_ms().saturating_add(CLOCK_TOLERANCE_MS);
-        self.recovery_body(&base, origin, [0; 32], until)?;
+        self.recovery_body(&base, lost, origin, [0; 32], until)?;
         let identity = self.state.identity;
         let key = gate::recovery_key(&self.keyring, &self.state)?;
         let body = EnrollmentBody {
@@ -136,6 +137,7 @@ impl Signer {
         state.erased = false;
         state.recovering = true;
         state.recovery_base = Some(base.signed().clone());
+        state.lost_generation = Some(lost);
         let flow = Flow::Recover {
             origin: origin.to_owned(),
             enrollment: enrollment.signed().clone(),
@@ -198,17 +200,26 @@ impl Signer {
             .unwrap_or(newest))
     }
 
-    /// The body of the recovery's version on `base`, naming the service at `origin` and its
-    /// key `service_key`, with owed reductions closed at `until` (the module's doc, step 2),
-    /// measured against the cap. Nothing is signed.
+    /// The generation the recovery declares lost: the one kept for a recovery declared
+    /// already, else `base`'s.
+    fn lost_generation(&self, base: &IdentityDoc) -> u64 {
+        self.state
+            .lost_generation
+            .filter(|_| self.state.recovering)
+            .unwrap_or_else(|| base.generation())
+    }
+
+    /// The body of the recovery's version on `base`, declaring generation `lost` lost and
+    /// naming the service at `origin` and its key `service_key`, with owed reductions closed
+    /// at `until` (the module's doc, step 2), measured against the cap. Nothing is signed.
     fn recovery_body(
         &self,
         base: &IdentityDoc,
+        lost: u64,
         origin: &str,
         service_key: [u8; 32],
         until: u64,
     ) -> Result<IdentityBody> {
-        let lost = base.generation();
         let generation = lost
             .checked_add(1)
             .ok_or_else(|| SignerError::Records("the generation can't go higher".into()))?;
@@ -243,9 +254,10 @@ impl Signer {
             .enroll(&enrollment)
             .await?;
         let base = self.recovery_base()?;
+        let lost = self.lost_generation(&base);
         let until = self.env.clock.now_ms().saturating_add(CLOCK_TOLERANCE_MS);
         // The enrollment names no App ID this version lists: both come from `base`.
-        let body = self.recovery_body(&base, origin, answer.service_key, until)?;
+        let body = self.recovery_body(&base, lost, origin, answer.service_key, until)?;
         let key = gate::recovery_key(&self.keyring, &self.state)?;
         let doc = IdentityDoc::sign(&key, body)?;
         drop(key);
@@ -310,6 +322,7 @@ impl Signer {
     pub(super) fn recovered_in(state: &mut SignerState, doc: &IdentityDoc) {
         state.recovering = false;
         state.recovery_base = None;
+        state.lost_generation = None;
         state.switch_unconfirmed = false;
         for revoking in &mut state.revoking {
             revoking.taken = false;

@@ -667,6 +667,12 @@ impl Signer {
     async fn judge_backup(&mut self, found: &BackupView) -> Result<()> {
         let doc = &found.identity_doc;
         let mark = self.state.newest_doc()?;
+        // The backup this install's records came from, before a version of its own: it
+        // holds nothing they don't, as after a restore whose delivery of that version was
+        // refused mid-recovery (Switch spec 12.6 step 1).
+        if mark.as_ref().is_some_and(|mark| mark.hash() == doc.hash()) && self.state.recovering {
+            return Ok(());
+        }
         let mark_prev = self.state.newest.as_ref().and_then(|n| n.prev);
         if found.taken_over(&self.state.install, mark.as_ref(), mark_prev) {
             return self.managed_by(doc.body().signer).await;
