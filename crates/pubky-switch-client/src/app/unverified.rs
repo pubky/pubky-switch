@@ -5,10 +5,25 @@
 //! them and tells its protocol ([`AppEvent::StoredEntryDropped`]), which may ask the sender
 //! to send them again (Switch spec 11).
 //!
-//! The bounds apply at the start of every read, to every such entry the store holds:
-//! those stored before too, as after an upgrade or a restore from an older backup (Switch
-//! spec 12.4), which brings dropped entries back to be dropped, and told, again. Entries
-//! stored for any other reason are neither counted nor dropped.
+//! The bounds apply at the start of every read, before entries stored locally are tried
+//! again, and before a layered backup is taken, to every such entry the store holds: those
+//! stored before too, as after an upgrade or a restore from an older backup (Switch spec
+//! 12.4), which brings dropped entries back to be dropped, and told, again. Entries stored
+//! for any other reason are neither counted nor dropped.
+//!
+//! **What the total can't do.** Dropping from the identity that holds the most keeps a
+//! hostile identity from pushing out an honest sender alone, but identities are cheap:
+//! against `k` admitted identities that keep as many entries stored, an honest sender
+//! keeps about `128 / (k + 1)`, and about 100 identities holding one or two entries each
+//! leave it one. Admission is the only defence: who may write to the inbox at all, by the
+//! lists and invite codes (Switch spec 7).
+//!
+//! **An entry whose effect is being settled.** A stored entry is counted by the reason it
+//! was stored for until a later read changes it. When a retry passes the checks of its
+//! sender and keeps its effect, and that effect is refused once it is sent again, the entry
+//! stays stored as [`ParkReason::Unverifiable`] until its next retry stores it for the
+//! refusal; the bounds can drop it in between, as an entry whose sender couldn't be
+//! checked, and tell the protocol so ([`AppEvent::StoredEntryDropped`]).
 
 use std::collections::BTreeMap;
 
@@ -64,8 +79,10 @@ impl Counted {
 ///   identities' bytes.
 /// - **Total:** of what is left, past [`MAX_UNVERIFIED_TOTAL`], one entry at a time: the
 ///   one accepted earliest of the sender identity that holds the most. Of identities that
-///   hold as many, the one whose earliest entry goes first in the entries' order
-///   ([`Counted::order`]): accepted earliest, then the lowest local ID.
+///   hold as many, the one whose newest entry is newest in the entries' order
+///   ([`Counted::order`]: accepted latest, then the highest local ID), so a sender whose
+///   entries began earlier, as an honest one's do when its outage began first, doesn't
+///   lose the tie to identities that piled up later.
 pub(crate) fn over_bounds(entries: &[Counted], verified_ms: Option<u64>) -> Vec<(u64, DropReason)> {
     let mut sorted = entries.to_vec();
     sorted.sort_by_key(Counted::order);
@@ -95,7 +112,7 @@ pub(crate) fn over_bounds(entries: &[Counted], verified_ms: Option<u64>) -> Vec<
             .min_by_key(|held| {
                 (
                     std::cmp::Reverse(held.len()),
-                    held.first().map(Counted::order),
+                    std::cmp::Reverse(held.last().map(Counted::order)),
                 )
             });
         let Some(held) = largest else {
@@ -169,19 +186,33 @@ mod tests {
     }
 
     #[test]
-    fn test_unverified_bound_order_breaks_ties_by_local_id() {
-        // Two holders of 64 each, their entries accepted at the same times, and a third
-        // holder of 2: the total is 2 over. The holder whose earliest entry has the lower
-        // local ID goes first, and then the other, which now holds the most.
+    fn test_unverified_bound_tie_goes_against_the_holder_whose_newest_entry_is_newest() {
+        // An honest sender whose outage began first and a hostile one that piled up later,
+        // 64 each, and a third holder of 1: one over. The hostile one, whose newest entry
+        // is newest, loses the tie, its accepted earliest.
+        let mut entries: Vec<Counted> = (0..64).map(|n| entry(1 + n, 1, 1_000 + n)).collect();
+        entries.extend((0..64).map(|n| entry(100 + n, 2, 2_000 + n)));
+        entries.push(entry(300, 3, 5_000));
+        let drops = over_bounds(&entries, None);
+        assert_eq!(drops, vec![(100, DropReason::Total)]);
+        // The same entries in another order give the same drops.
+        entries.reverse();
+        assert_eq!(over_bounds(&entries, None), drops);
+    }
+
+    #[test]
+    fn test_unverified_bound_tie_on_the_newest_times_goes_by_local_id() {
+        // Two holders of 64, their entries accepted at the same times, and a third of 2: two
+        // over. The holder whose newest entry has the higher local ID goes first, then the
+        // other, which now holds the most.
         let mut entries: Vec<Counted> = (0..64).map(|n| entry(200 + n, 2, 1_000 + n)).collect();
         entries.extend((0..64).map(|n| entry(100 + n, 1, 1_000 + n)));
         entries.extend([entry(1, 3, 5_000), entry(2, 3, 5_001)]);
         let drops = over_bounds(&entries, None);
         assert_eq!(
             drops,
-            vec![(100, DropReason::Total), (200, DropReason::Total)]
+            vec![(200, DropReason::Total), (100, DropReason::Total)]
         );
-        // The same entries in another order give the same drops.
         entries.reverse();
         assert_eq!(over_bounds(&entries, None), drops);
     }
