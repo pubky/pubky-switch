@@ -230,6 +230,9 @@ impl Fault {
 /// The fact that says what a fault did to a request.
 const FAULT: &str = "fault";
 
+/// The fact a request's line holds until its answer comes, or its failure.
+const UNANSWERED: &str = "unanswered";
+
 /// A change made to what the trace keeps of an answer.
 type Distortion = Box<dyn Fn(&Request, &mut Response) + Send + Sync>;
 
@@ -294,6 +297,31 @@ impl Recorder {
     pub fn trace(&self) -> Trace {
         Trace {
             lines: lock(&self.lines).clone(),
+        }
+    }
+
+    /// Give a request its line, holding what was sent, and return where it is.
+    fn place(
+        &self,
+        label: &str,
+        facts: &BTreeMap<String, String>,
+        call: Option<&'static str>,
+    ) -> usize {
+        let mut facts = facts.clone();
+        facts.insert(UNANSWERED.into(), "the request is in flight".into());
+        let mut lines = lock(&self.lines);
+        lines.push(Line {
+            label: label.to_owned(),
+            facts,
+            call,
+        });
+        lines.len() - 1
+    }
+
+    /// Put a request's finished line where [`Recorder::place`] put it.
+    fn fill(&self, at: usize, line: Line) {
+        if let Some(placed) = lock(&self.lines).get_mut(at) {
+            *placed = line;
         }
     }
 
@@ -384,6 +412,10 @@ impl Transport for Recorder {
             let call =
                 route(&request.method, &request.path_and_query).map(|route| route.call.name());
             let sent = request.clone();
+            // The line takes its place now, and its answer's facts when the answer comes:
+            // of two calls in flight at once, the one sent first comes first in the trace,
+            // whichever is answered first.
+            let at = self.place(&label, &facts, call);
             let fault = {
                 let mut faults = lock(&self.faults);
                 let at = faults.iter().position(|fault| fault.matches(&request));
@@ -398,7 +430,7 @@ impl Transport for Recorder {
             };
             if let Some(Fault::Unreachable { .. }) = fault {
                 facts.insert(FAULT.into(), "the request didn't reach the switch".into());
-                lock(&self.lines).push(Line { label, facts, call });
+                self.fill(at, Line { label, facts, call });
                 return Err(TransportError::Connect("the switch is unreachable".into()));
             }
             let answer = self.inner.send(request).await;
@@ -440,10 +472,10 @@ impl Transport for Recorder {
             if fault.is_some() {
                 // The switch answered, and the caller never sees it.
                 facts.insert(FAULT.into(), "the answer was lost".into());
-                lock(&self.lines).push(Line { label, facts, call });
+                self.fill(at, Line { label, facts, call });
                 return Err(TransportError::Timeout);
             }
-            lock(&self.lines).push(Line { label, facts, call });
+            self.fill(at, Line { label, facts, call });
             answer
         })
     }

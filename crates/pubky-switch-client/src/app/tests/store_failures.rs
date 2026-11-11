@@ -1834,6 +1834,8 @@ async fn test_stored_id_counter_survives_a_reload_after_the_highest_is_processed
 #[tokio::test]
 async fn test_restore_in_place_of_an_older_backup_gives_out_no_id_the_store_gave_out() {
     let w = World::new();
+    // The note stays at the switch after the app's cursor passed it, to be read again.
+    w.switch.keep_passed_entries();
     let flaky = FlakyProtocol::failing(1, StoreError::Corrupt, Mode::Plain);
     let mut app = join_flaky(&w, &flaky, "wallet").await;
     let backup = app.backup_layered().await.unwrap();

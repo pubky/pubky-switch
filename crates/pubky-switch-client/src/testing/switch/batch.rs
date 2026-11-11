@@ -255,6 +255,7 @@ impl Inner {
             (draft, states)
         };
         // Step 10, within the bounds of the sequence (Switch wire 6.2).
+        let mut cursor_moved = false;
         if let (Some(app), Some(position)) = (caller, cursor) {
             let held = &mut draft.apps.entry(app).or_default().cursor;
             if check_cursor(
@@ -266,6 +267,7 @@ impl Inner {
             )? == CursorMove::Moves
             {
                 *held = position.seq;
+                cursor_moved = true;
                 // The parts it now holds the keys of go (Switch wire 6.2), unless a
                 // full-bundle request is still in force at its new position.
                 let full = draft.apps.get(&app).is_some_and(in_force);
@@ -274,6 +276,9 @@ impl Inner {
         }
         if effect == BatchEffect::Unchanged {
             self.commit(draft);
+            if cursor_moved {
+                self.after_cursor_move();
+            }
             return Ok(self.answer(&[]));
         }
         // Step 11: the chain items and their proofs, then the state, all at once.
@@ -315,6 +320,10 @@ impl Inner {
             proofs.push(proof);
         }
         self.commit(draft);
+        // An entry every reader it waits for has passed goes (Switch wire 9.1).
+        if cursor_moved {
+            self.after_cursor_move();
+        }
         if let (Some(first), Some(ops_hash)) = (ops.first(), hash) {
             self.batches.insert(
                 first.body().batch.id,

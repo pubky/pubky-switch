@@ -1482,11 +1482,12 @@ async fn test_scripted_inbox_admits_after_an_invite_and_delivers() {
         p.bob.switch().peer_copy(&alice).unwrap().version(),
         wallet.own_identity().version()
     );
+    // A retry of the same bytes gets the original answer, and no second entry. The entry is
+    // counted before its reader passes it, which is when the switch lets it go.
+    assert_eq!(p.bob.switch().entries_from(&alice), 1);
     shop.receive(None).await.unwrap();
     let seen = protocol.seen();
     assert_eq!(seen.last().unwrap().msg_id, msg_id);
-    // A retry of the same bytes gets the original answer, and no second entry.
-    assert_eq!(p.bob.switch().entries_from(&alice), 1);
 }
 
 #[tokio::test]
