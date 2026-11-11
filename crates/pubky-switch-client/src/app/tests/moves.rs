@@ -1086,15 +1086,16 @@ async fn lost_world(store: Arc<dyn StateStore>) -> Lost {
         Permission::ListsManage,
         Permission::ConversationAdd,
     ];
-    lost_world_with(store, &permissions, false).await
+    lost_world_with(store, &permissions, false, true).await
 }
 
-/// [`lost_world`], the app holding `permissions`, and with `record` a shared record it wrote
-/// before the loss.
+/// [`lost_world`], the app holding `permissions`, with `record` a shared record it wrote
+/// before the loss, and without `contact` no contact in its lists.
 async fn lost_world_with(
     store: Arc<dyn StateStore>,
     permissions: &[Permission],
     record: bool,
+    contact: bool,
 ) -> Lost {
     let w = World::new();
     let router = Router::of(&w);
@@ -1119,15 +1120,17 @@ async fn lost_world_with(
     let carol = IdentityKey::from_secret(seed("carol/identity")).public();
     let dave = IdentityKey::from_secret(seed("dave/identity")).public();
     let phone = w.other_app("phone", &[Permission::ListsManage]);
-    w.switch
-        .app_op(
-            &phone,
-            OpKind::AllowPut {
-                pubky: carol,
-                kind: AllowKind::Contact,
-            },
-        )
-        .unwrap();
+    if contact {
+        w.switch
+            .app_op(
+                &phone,
+                OpKind::AllowPut {
+                    pubky: carol,
+                    kind: AllowKind::Contact,
+                },
+            )
+            .unwrap();
+    }
     w.switch
         .app_op(&phone, OpKind::DenyPut { pubky: dave })
         .unwrap();
@@ -1528,6 +1531,7 @@ async fn test_loss_upload_merges_the_lists_and_ends_staged_admission() {
         Arc::clone(&store) as Arc<dyn StateStore>,
         &permissions,
         true,
+        true,
     )
     .await;
     let written = lost.w.switch.lock().shared.records.clone();
@@ -1549,6 +1553,58 @@ async fn test_loss_upload_merges_the_lists_and_ends_staged_admission() {
     assert_eq!((taken.uploaded, taken.proof.as_ref()), (Some(true), None));
     assert!(next.shared.contacts.contains(&lost.carol));
     assert!(next.shared.deny.contains(&lost.dave));
+    // A fork of that write, built on the same version in another batch, is kept divergent:
+    // the record stays, its view `divergent` (Switch wire 7.4.14).
+    let op = pubky_switch_core::ops::SignedOp::peek(&taken.op).unwrap();
+    let fork = pubky_switch_core::ops::sign_batch(
+        &app_keys("wallet"),
+        &lost.w.alice.public(),
+        Some(app_keys("wallet").app_id_bytes()),
+        op.body().generation,
+        [99; 16],
+        vec![(Vec::new(), op.body().kind.clone())],
+    )
+    .unwrap();
+    let cert = taken.cert.clone().unwrap();
+    let state = taken.state.clone();
+    drop(next);
+    let body = json!({ "records": [{ "op": fork[0].signed(), "cert": cert }] });
+    let (status, answer) = upload_at_next(&lost, &body.to_string());
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(
+        answer["result"]["divergent"],
+        json!([pubky_switch_core::enc::b64(key)])
+    );
+    let next = lost.next.lock();
+    assert_eq!(next.shared.records[key].state, state);
+    assert_eq!(next.shared.divergent[key].len(), 1);
+}
+
+#[tokio::test]
+async fn test_loss_upload_from_manage_holding_no_contacts_sends_them_empty() {
+    // An app with `lists.manage` that holds no contacts still sends `contacts: []`: that
+    // upload ends staged admission (Switch spec 12.6 step 2).
+    let store = Arc::new(MemoryStore::new());
+    let permissions = [Permission::ListsRead, Permission::ListsManage];
+    let lost = lost_world_with(
+        Arc::clone(&store) as Arc<dyn StateStore>,
+        &permissions,
+        false,
+        false,
+    )
+    .await;
+    lost.next.lock().admission_staged = true;
+    follow_loss(&lost, store as Arc<dyn StateStore>)
+        .await
+        .unwrap();
+    let lists = lost
+        .next
+        .uploads()
+        .into_iter()
+        .find_map(|(body, _)| body.get("lists").cloned())
+        .expect("the lists' upload");
+    assert_eq!(lists["contacts"], json!([]), "{lists}");
+    assert!(!lost.next.lock().admission_staged);
 }
 
 #[tokio::test]
@@ -1560,6 +1616,7 @@ async fn test_loss_upload_without_manage_sends_no_contacts() {
         Arc::clone(&store) as Arc<dyn StateStore>,
         &[Permission::ListsRead],
         false,
+        true,
     )
     .await;
     lost.next.lock().admission_staged = true;
@@ -4814,6 +4871,7 @@ async fn test_loss_claim_changed_by_an_upload_after_an_entry_here_is_read() {
         Arc::clone(&store) as Arc<dyn StateStore>,
         &Permission::ALL,
         false,
+        true,
     )
     .await;
     let (mut app, _) = follow_loss(&lost, store as Arc<dyn StateStore>)
@@ -4844,6 +4902,7 @@ async fn test_loss_claim_step_before_its_last_entry_is_a_rollback() {
         Arc::clone(&store) as Arc<dyn StateStore>,
         &Permission::ALL,
         false,
+        true,
     )
     .await;
     let (mut app, _) = follow_loss(&lost, store as Arc<dyn StateStore>)

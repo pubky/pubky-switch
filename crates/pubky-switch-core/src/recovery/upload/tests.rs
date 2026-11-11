@@ -633,3 +633,27 @@ fn test_upload_record_of_another_collection_or_policy_is_divergent() {
         );
     }
 }
+
+#[test]
+fn test_upload_settled_proof_at_the_highest_step_is_taken() {
+    // Of two SETTLED proofs for one claim, the one at the higher step is the one taken,
+    // whatever their order in `proofs`.
+    let done = op_at(LOST, OpKind::Claim(done_fields()));
+    let view = view_after(&[attempt_fields(), done_fields()]);
+    let mut later = view.clone();
+    later.step += 1;
+    let first = claim_proof(&done, &view, 8);
+    let second = proof_of(
+        &done,
+        9,
+        NOW - 1_000,
+        b64(&CLAIM_KEY),
+        &ProofState::Claim(later.to_value()),
+    );
+    for proofs in [vec![first.clone(), second.clone()], vec![second, first]] {
+        let mut body = body_with(vec![], vec![]);
+        body.proofs = proofs;
+        let checked = check(&body, &[]);
+        assert_eq!(checked.settled[&CLAIM_KEY].0.step, later.step);
+    }
+}
