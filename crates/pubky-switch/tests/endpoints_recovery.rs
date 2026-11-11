@@ -2047,6 +2047,23 @@ async fn test_upload_contacts_end_staged_admission_and_lists_only_add() {
 }
 
 #[tokio::test]
+async fn test_upload_contact_also_denied_is_denied() {
+    // An upload may carry one pubky in both lists, as a live `deny.put` leaves a contact in
+    // place: the deny list overrides the contact at admission (Switch spec 7), so bob's shop
+    // is refused once the upload ends staged admission.
+    let Some(replay) = replay().await else { return };
+    let (_, at) = recovered_with_the_wallet(&replay).await;
+    let bob = named(&vectors("keys.json")["identities"], "bob")["pubky_id"].clone();
+    let lists = json!({ "lists": { "contacts": [bob], "deny": [bob] } });
+    assert_eq!(upload(&replay, &lists, at).await.status, 200);
+    assert_eq!(admission_staged(&replay, at).await, json!(false));
+    let (peers, inbox) = from_shop(&replay, at).await;
+    assert_eq!(code(&peers), (403, "not_admitted".into()));
+    assert_eq!(code(&inbox), (403, "not_admitted".into()));
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
 async fn test_upload_lists_need_the_callers_permission() {
     // The executor, current again, holds no list permission: contacts or deny entries from
     // it are `403 permission_missing` for the whole upload, which merges and chains nothing,
