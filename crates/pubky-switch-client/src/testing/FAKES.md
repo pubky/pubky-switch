@@ -151,8 +151,13 @@ service.
   `store_handover_again` script a hand-over stored or served again after it was dropped.
 - **`Fault::LeaveOut`** scripts a faulty service whose answer to an own app or the signer
   leaves out a top-level member, such as a feed page's `items`.
-- **Erasure** (Switch wire 7.4.16) is a flag; its answers are signed with a fixed operator
-  key.
+- **Erasure** (Switch wire 7.4.16), in `switch/signer.rs`: `POST /erase` checks the body names
+  the account's service key (`409 conflict` for another) and refuses during a move (`409
+  conflict`): at any frozen account, since this switch keeps no export to tell whether it was
+  fetched, and at a staged one holding an import (not one staged for a key change in place).
+  An app's call is `403 permission_missing`. Then every call, the retry included, gets the
+  `404` signed with a fixed operator key. `erased` tells a test it happened; app tests set the
+  flag directly.
 - **Push** (Switch wire 8.1): registrations only; nothing is sent to a relay.
 
 ## Signer flows tested only here
@@ -171,4 +176,6 @@ the stored parts can run against it now:
   (`flows.rs`);
 - restore from the signer backup, in place and on a new install (`restore.rs`);
 - the hand-over both ways, the abort, the take-over's checks and its lost answers, and which
-  copies delete a key (`handover.rs`).
+  copies delete a key (`handover.rs`);
+- the account's erasure, its lost answer, retry and refusal (`erasure.rs`): the service
+  doesn't serve `POST /erase` yet.

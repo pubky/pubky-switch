@@ -3,8 +3,10 @@
 //! The signer writes two public files there, which only it writes and no app's grant covers
 //! (Switch spec 3.4): `identity.json` (Switch wire 3.3) and the signer's backup (Switch wire
 //! 3.13). It also deletes a removed app's record, which the app wrote under its own grant
-//! (Switch spec 12.2 step 4). The host implements [`Homeserver`] on its Pubky client, with the identity's own
-//! session; how it signs in, and the request deadlines, are the host's.
+//! (Switch spec 12.2 step 4), and, when the account is erased, `identity.json` and every app
+//! record it knows of (Switch spec 12.7 step 5). The host implements [`Homeserver`] on its
+//! Pubky client, with the identity's own session; how it signs in, and the request deadlines,
+//! are the host's.
 
 use pubky_switch_client::TransportError;
 use pubky_switch_client::transport::BoxFuture;

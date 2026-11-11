@@ -215,6 +215,9 @@ pub(crate) struct Inner {
     pub(crate) recovery_from: Option<u64>,
     /// The generation an imported sequence continues from, after a cooperative move.
     pub(crate) continued_from: Option<u64>,
+    /// A staged account holding a cooperative move's import, not a key change in place: it
+    /// refuses an erasure until the move is aborted (Switch wire 7.4.16).
+    pub(crate) holds_import: bool,
     /// When the recovery was declared: its recovery record's time (Switch spec 12.6 step 1).
     pub(crate) recovery_declared_at: Option<u64>,
     /// The service keys of the earlier generations whose proofs an import carried, by
@@ -311,6 +314,7 @@ impl Inner {
             erased: false,
             recovery_from: None,
             continued_from: None,
+            holds_import: false,
             recovery_declared_at: None,
             proof_keys: BTreeMap::new(),
             any_first_n: false,
@@ -459,6 +463,7 @@ impl ScriptedSwitch {
         );
         next.seq = inner.seq;
         next.continued_from = Some(inner.tip.generation);
+        next.holds_import = !keep_proofs;
         // The proofs this switch signed travel with the records and claims, checked with its
         // key for its generation (Switch wire 3.3).
         next.proof_keys = inner.proof_keys.clone();
@@ -1220,7 +1225,8 @@ impl Inner {
     }
 
     /// The answer an account gives every call `method` `path` makes, before routing: an
-    /// erased account's `404`, a staged account's `503 staged` (but for uploads), and a
+    /// erased account's `404`, a staged account's `503 staged` (but for uploads, the
+    /// delivery that makes it serve and the erasure), and a
     /// frozen account's `410 moved` for writes.
     fn gate(&self, method: &str, path: &str) -> Option<Answer> {
         if self.erased || self.enrolled.is_none() {
@@ -1229,7 +1235,9 @@ impl Inner {
         let upload = method == "POST" && path.contains("recovery/upload");
         // A staged account takes the delivery that makes it serve (Switch wire 7.3 step 7).
         let delivery = method == "PUT" && path.ends_with("/identity");
-        if self.staged && !upload && !delivery {
+        // And the erasure, which a staged account holding an import refuses (7.4.16).
+        let erasure = method == "POST" && path.ends_with("/erase");
+        if self.staged && !upload && !delivery && !erasure {
             return Some(bad(ErrorCode::Staged, "staged", json!(null)));
         }
         if let Some(freeze) = &self.frozen
@@ -1253,6 +1261,7 @@ impl Inner {
                 ("GET", "apps") => self.apps_answer(),
                 ("PUT", "handover") => self.put_handover(&request.body),
                 ("GET", "handover") => self.handover_answer(None),
+                ("POST", "erase") => self.erase_answer(&request.body),
                 ("POST", r) if r.starts_with("apps/") && r.ends_with("/revoke") => {
                     self.revoke_answer(r)?
                 }
@@ -1271,6 +1280,11 @@ impl Inner {
         let own_leave = format!("apps/{me}/leave");
         Ok(match (request.method.as_str(), route) {
             ("GET", "handover") => self.handover_answer(Some(app)),
+            ("POST", "erase") => bad(
+                ErrorCode::PermissionMissing,
+                "the erasure is the signer's",
+                json!(null),
+            ),
             ("POST", "ops") => self.ops(caller, &request.body)?,
             ("POST", "inbox") => self.append(request, None, query)?,
             ("GET", "feed") => self.feed(caller, query),
