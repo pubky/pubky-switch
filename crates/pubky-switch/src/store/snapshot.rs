@@ -9,7 +9,8 @@ use sqlx::{Executor, Postgres, Transaction};
 use super::{AccountTxn, StoreError};
 
 /// Most reads of one account that wait for their turn behind the one in flight; a read past
-/// them is refused at once ([`StoreError::LockTimeout`], `503`).
+/// them is refused at once ([`StoreError::LockTimeout`], `503`). Each app holds at most one
+/// of these places, so no one app can take them all.
 pub(super) const MAX_WAITING_READS: usize = 8;
 
 /// The turns of each account with a read after the lock in flight or waiting in this
@@ -19,11 +20,12 @@ pub(super) const MAX_WAITING_READS: usize = 8;
 pub(super) type Reading =
     std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, Turns>>>;
 
-/// An account's turns: one permit, and how many reads hold it or wait for it.
+/// An account's turns: one permit, and the apps whose read holds it or waits for it, one
+/// place each.
 #[derive(Debug)]
 pub(super) struct Turns {
     permit: std::sync::Arc<tokio::sync::Semaphore>,
-    queued: usize,
+    queued: std::collections::HashSet<[u8; 16]>,
 }
 
 /// The accounts' turns. A panic while the lock was held leaves the map as it was, every
@@ -36,20 +38,21 @@ fn accounts(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// An account's place in its queue: it counts the read from when it starts waiting until
-/// its request ends.
+/// An app's place in its account's queue: held from when its read starts waiting until its
+/// request ends, however it ends.
 #[derive(Debug)]
 struct Queued {
     reading: Reading,
     account: String,
+    app: [u8; 16],
 }
 
 impl Drop for Queued {
     fn drop(&mut self) {
         let mut map = accounts(&self.reading);
         if let Some(turns) = map.get_mut(&self.account) {
-            turns.queued = turns.queued.saturating_sub(1);
-            if turns.queued == 0 {
+            turns.queued.remove(&self.app);
+            if turns.queued.is_empty() {
                 map.remove(&self.account);
             }
         }
@@ -65,29 +68,35 @@ pub(super) struct ReadTurn {
 }
 
 impl ReadTurn {
-    /// Wait for `account`'s turn, in order, at most `timeout`. Refused at once
-    /// ([`StoreError::LockTimeout`]) when [`MAX_WAITING_READS`] reads wait already, and after
+    /// Wait for `account`'s turn for the read of `app`, in order, at most `timeout`. Refused
+    /// at once ([`StoreError::LockTimeout`]) while another read of the same app holds or
+    /// waits for a place, or when [`MAX_WAITING_READS`] reads wait already; and after
     /// `timeout` as a busy account's lock is. Waiting holds no connection.
     pub(super) async fn wait(
         reading: &Reading,
         account: &str,
+        app: [u8; 16],
         timeout: std::time::Duration,
     ) -> Result<Self, StoreError> {
         let permit = {
             let mut map = accounts(reading);
             let turns = map.entry(account.to_string()).or_insert_with(|| Turns {
                 permit: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
-                queued: 0,
+                queued: std::collections::HashSet::new(),
             });
-            if turns.queued > MAX_WAITING_READS {
+            if turns.queued.len() > MAX_WAITING_READS || !turns.queued.insert(app) {
+                // An account's entry stays only while a read holds a place in it.
+                if turns.queued.is_empty() {
+                    map.remove(account);
+                }
                 return Err(StoreError::LockTimeout);
             }
-            turns.queued += 1;
             turns.permit.clone()
         };
         let queued = Queued {
             reading: reading.clone(),
             account: account.to_string(),
+            app,
         };
         let permit = tokio::time::timeout(timeout, permit.acquire_owned())
             .await
@@ -105,7 +114,7 @@ impl ReadTurn {
 pub(super) fn queued(reading: &Reading, account: &str) -> usize {
     accounts(reading)
         .get(account)
-        .map_or(0, |turns| turns.queued)
+        .map_or(0, |turns| turns.queued.len())
 }
 
 /// A read-only transaction on the reader pool, begun before the account's lock is taken,
@@ -214,11 +223,11 @@ mod tests {
     async fn test_snapshot_reads_of_an_account_wait_in_order() {
         let reading = Reading::default();
         let long = std::time::Duration::from_secs(10);
-        let first = ReadTurn::wait(&reading, "alice", long)
+        let first = ReadTurn::wait(&reading, "alice", [1; 16], long)
             .await
             .expect("first");
         // A second read of alice's account waits for the first, then goes on.
-        let (second, ()) = tokio::join!(ReadTurn::wait(&reading, "alice", long), async {
+        let (second, ()) = tokio::join!(ReadTurn::wait(&reading, "alice", [2; 16], long), async {
             while queued(&reading, "alice") < 2 {
                 tokio::task::yield_now().await;
             }
@@ -226,9 +235,14 @@ mod tests {
         });
         let second = second.expect("the second read's turn");
         // Another account's read doesn't wait for alice's.
-        let bob = ReadTurn::wait(&reading, "bob", std::time::Duration::from_millis(1))
-            .await
-            .expect("bob");
+        let bob = ReadTurn::wait(
+            &reading,
+            "bob",
+            [1; 16],
+            std::time::Duration::from_millis(1),
+        )
+        .await
+        .expect("bob");
         drop(bob);
         assert!(
             !accounts(&reading).contains_key("bob"),
@@ -237,7 +251,12 @@ mod tests {
         // A wait past its timeout is refused, and leaves the queue as it was.
         let late = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            ReadTurn::wait(&reading, "alice", std::time::Duration::from_millis(1)),
+            ReadTurn::wait(
+                &reading,
+                "alice",
+                [3; 16],
+                std::time::Duration::from_millis(1),
+            ),
         )
         .await
         .expect("refused after its timeout, not later");
@@ -253,12 +272,20 @@ mod tests {
     #[tokio::test]
     async fn test_snapshot_read_queue_is_bounded() {
         let reading = Reading::default();
-        let first = ReadTurn::wait(&reading, "alice", std::time::Duration::from_secs(1))
-            .await
-            .expect("first");
+        let first = ReadTurn::wait(
+            &reading,
+            "alice",
+            [0; 16],
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .expect("first");
         let long = std::time::Duration::from_secs(10);
-        let waiting: Vec<_> = (0..MAX_WAITING_READS)
-            .map(|_| Box::pin(ReadTurn::wait(&reading, "alice", long)))
+        let waiting: Vec<_> = (1..=MAX_WAITING_READS)
+            .map(|n| {
+                let app = [u8::try_from(n).unwrap_or(u8::MAX); 16];
+                Box::pin(ReadTurn::wait(&reading, "alice", app, long))
+            })
             .collect();
         // Each waiter takes its place once polled.
         let mut waiting = waiting;
@@ -269,7 +296,7 @@ mod tests {
         // One more is refused at once, not after its wait.
         let refused = tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            ReadTurn::wait(&reading, "alice", long),
+            ReadTurn::wait(&reading, "alice", [0xEE; 16], long),
         )
         .await
         .expect("refused at once");
@@ -277,6 +304,43 @@ mod tests {
         drop(waiting);
         drop(first);
         assert_eq!(queued(&reading, "alice"), 0);
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_one_place_per_app() {
+        let reading = Reading::default();
+        let long = std::time::Duration::from_secs(10);
+        let wallet = [1; 16];
+        let first = ReadTurn::wait(&reading, "alice", [9; 16], long)
+            .await
+            .expect("another app's read");
+        // The wallet's read waits for its turn; while it waits, a second read of the wallet
+        // is refused at once and takes no place.
+        let mut waiting = Box::pin(ReadTurn::wait(&reading, "alice", wallet, long));
+        assert!(futures_poll_once(waiting.as_mut()).await.is_none());
+        let refused = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            ReadTurn::wait(&reading, "alice", wallet, long),
+        )
+        .await
+        .expect("refused at once");
+        assert!(matches!(refused, Err(StoreError::LockTimeout)));
+        assert_eq!(queued(&reading, "alice"), 2);
+        // Once it holds the turn, still one place.
+        drop(first);
+        let held = waiting.await.expect("the wallet's turn");
+        let refused = ReadTurn::wait(&reading, "alice", wallet, long).await;
+        assert!(matches!(refused, Err(StoreError::LockTimeout)));
+        // The wallet's place is free once its read ends, and its account's at another
+        // account isn't taken by it.
+        let at_bob = ReadTurn::wait(&reading, "bob", wallet, long).await;
+        assert!(at_bob.is_ok(), "one place per app per account");
+        drop(held);
+        let again = ReadTurn::wait(&reading, "alice", wallet, long).await;
+        assert!(again.is_ok());
+        drop(again);
+        drop(at_bob);
+        assert!(accounts(&reading).is_empty());
     }
 
     /// Poll `future` once: its output if it is ready.
