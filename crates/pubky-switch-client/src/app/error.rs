@@ -174,6 +174,25 @@ pub enum AppError {
     /// A rule of the app layer refused the call.
     #[error("refused: {0}")]
     Refused(Refusal),
+    /// The switch answers as for an account it doesn't host, an error its operator signed
+    /// and the account's key didn't (an unsigned `404`), and the identity publishes no
+    /// `identity.json`: the account may have been erased (Switch spec 12.7). Nothing
+    /// authenticates an erasure, so the app waits: it takes the account as gone only once
+    /// both hold at 5 tries at least 6 hours apart over 24 hours by its clock, then stops
+    /// with [`super::AppEvent::AccountGone`]. Until then each read, and
+    /// [`super::App::check_for_move`], counts a try and fails with this; `since_ms` is the
+    /// first try of the wait, app clock. An answer the pinned key doesn't verify in any
+    /// other case stays [`ClientError::BadServiceSignature`].
+    ///
+    /// It is an error, not a stopped read: nothing was read, and the app tries again at its
+    /// next call, as for a service it can't reach. It is the app's own conclusion from the
+    /// switch's answer, the Homeserver and the wait it keeps (`erasing`), so it is an
+    /// [`AppError`], not a [`ClientError`], which only says what one answer showed.
+    #[error("the switch doesn't answer as the account's, since {since_ms} (app clock)")]
+    NotAnsweringAsAccount {
+        /// The first try of the wait, app clock, in Unix milliseconds.
+        since_ms: u64,
+    },
     /// The call's own batch was signed and kept, and couldn't be settled now: the network
     /// failed, or the switch answered `429`, `503`, `410 moved`, `401 stale_timestamp` or
     /// `409 identity_needed`, or an answer didn't verify (`error`, an

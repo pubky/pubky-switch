@@ -1669,16 +1669,15 @@ async fn test_removed_in_identity_json_stops_for_good() {
     assert_eq!(app.follow_provider().await.unwrap(), ProviderStatus::Gone);
 }
 
-/// A read that meets an erased account and doesn't conclude: the service counts as
-/// unreachable (Switch spec 12.7).
+/// A read that meets an erased account and doesn't conclude: the read fails as the wait's
+/// own outcome, naming its first try (Switch spec 12.7).
 async fn unreachable_read(app: &mut App) {
     let result = app.receive(None).await;
+    let since = app.state.erasing.map(|e| e.since_ms);
     assert!(
         matches!(
             result,
-            Err(AppError::Switch(ClientError::BadServiceSignature {
-                status: 404
-            }))
+            Err(AppError::NotAnsweringAsAccount { since_ms }) if Some(since_ms) == since
         ),
         "{result:?}"
     );
@@ -1704,8 +1703,17 @@ async fn test_erased_account_is_gone_once_the_identity_is_unpublished() {
         .unwrap();
     w.switch.lock().erased = true;
     // While the identity still publishes its identity.json, the unsigned 404 explains
-    // nothing: the error stands and the app isn't stopped.
-    unreachable_read(&mut app).await;
+    // nothing: the error stands, an answer that doesn't verify, and the app isn't stopped.
+    let result = app.receive(None).await;
+    assert!(
+        matches!(
+            result,
+            Err(AppError::Switch(ClientError::BadServiceSignature {
+                status: 404
+            }))
+        ),
+        "{result:?}"
+    );
     assert!(app.state.erasing.is_none());
     // The signer erased the account and deleted identity.json from the Homeserver. Until
     // both have held at tries spread over 24 hours, the service counts as unreachable.
@@ -1719,11 +1727,50 @@ async fn test_erased_account_is_gone_once_the_identity_is_unpublished() {
         .advance_ms(crate::app::provider::ERASURE_TRY_SPACING_MS);
     let report = app.receive(None).await.unwrap();
     assert!(report.stopped);
-    assert!(has(&report.events, |e| matches!(e, AppEvent::AccountGone)));
+    let gone = |events: &[AppEvent]| {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                AppEvent::AccountGone { id } => Some(*id),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let ids = gone(&report.events);
+    assert_eq!(ids.len(), 1, "{:?}", report.events);
     assert_eq!(app.follow_provider().await.unwrap(), ProviderStatus::Gone);
+    // A duty event: kept in the store, and delivered again until it is acknowledged.
+    assert_eq!(gone(&app.unacknowledged_events().await.unwrap()), ids);
+    app.ack_events(ids[0]).await.unwrap();
+    assert!(gone(&app.unacknowledged_events().await.unwrap()).is_empty());
     // The push setting is kept, only no longer set, for when the account shows again.
     assert!(app.push_registration().await.unwrap().is_none());
     assert!(app.push_record().await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn test_erasure_wait_counts_the_tries_of_check_for_move() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join(&w, &router).await;
+    w.switch.lock().erased = true;
+    w.homeserver.remove(w.alice.public(), IDENTITY_PATH);
+    // The public read meets the same unsigned 404: each spaced try counts in the wait's
+    // record, and fails as the wait's outcome.
+    for tries in 1..crate::app::provider::ERASURE_TRIES {
+        let error = app.check_for_move().await.unwrap_err();
+        let since = app.state.erasing.map(|e| e.since_ms);
+        assert!(
+            matches!(error, AppError::NotAnsweringAsAccount { since_ms } if Some(since_ms) == since),
+            "{error:?}"
+        );
+        assert_eq!(app.state.erasing.map(|e| e.tries), Some(tries));
+        w.clock
+            .advance_ms(crate::app::provider::ERASURE_TRY_SPACING_MS);
+    }
+    // A read makes the last try: the account is gone.
+    assert!(app.receive(None).await.unwrap().stopped);
+    assert_eq!(app.check_for_move().await.unwrap(), ProviderStatus::Gone);
 }
 
 #[tokio::test]

@@ -276,8 +276,9 @@ impl App {
     /// # Errors
     ///
     /// [`Refusal::Stopped`] or [`Refusal::Left`] for a stopped or departed app; an alarm the
-    /// read raised; a failed call or commit, after which nothing past the last commit counts
-    /// and the next read resumes from the store.
+    /// read raised; [`AppError::NotAnsweringAsAccount`] while the account may be erased
+    /// (Switch spec 12.7); a failed call or commit, after which nothing past the last commit
+    /// counts and the next read resumes from the store.
     pub async fn receive(&mut self, wait: Option<u32>) -> Result<ReceiveReport, AppError> {
         Box::pin(async move {
             self.ready_local().await?;

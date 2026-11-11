@@ -11,7 +11,7 @@
 //! "Kept batches"); a kept batch dropped at a provider change and each `attempt` in it
 //! (Switch spec 12.5 "Kept batches", 12.6 step 5); a kept batch refused for good, with its
 //! local writes and outbox messages (Switch spec 6.4); a message deleted from the outbox
-//! undelivered (Switch spec 11). Each carries a stable [`EventId`] and is kept in the
+//! undelivered (Switch spec 11); the account taken as erased (Switch spec 12.7). Each carries a stable [`EventId`] and is kept in the
 //! store (`duty/<id>`) in the same commit as the change it reports, so no crash separates
 //! the two. It is reported once that commit is done, or, for a commit whose answer can't
 //! tell whether it was applied, by the reload after it; again by every [`super::App::load`],
@@ -578,8 +578,14 @@ pub enum AppEvent {
         owed_calls: u64,
     },
     /// The account the app used is gone: the service answers as for an identity it doesn't
-    /// host and the identity publishes no `identity.json` (Switch spec 12.7).
-    AccountGone,
+    /// host and the identity publishes no `identity.json`, at every try of the wait (Switch
+    /// spec 12.7, [`super::AppError::NotAnsweringAsAccount`]). A duty event, kept in the
+    /// commit that marks the app gone: the app reads nothing more, and the protocol learns
+    /// its account is gone, at least once, whenever the host next takes its events.
+    AccountGone {
+        /// The duty event's ID.
+        id: EventId,
+    },
     /// An account taken as erased was seen alive again: the identity publishes an
     /// `identity.json` listing the app (Switch spec 12.7). The app reads on; its push
     /// registration, which the service dropped, is set again with
@@ -733,7 +739,8 @@ impl AppEvent {
             | Self::AttemptDropped { id, .. }
             | Self::MessageUndelivered { id, .. }
             | Self::RecordUncheckable { id, .. }
-            | Self::LocalWritesRefused { id, .. } => Some(*id),
+            | Self::LocalWritesRefused { id, .. }
+            | Self::AccountGone { id } => Some(*id),
             _ => None,
         }
     }
@@ -891,6 +898,7 @@ pub(crate) enum Duty {
         duty_events: u64,
         owed_calls: u64,
     },
+    AccountGone,
 }
 
 impl Duty {
@@ -1019,6 +1027,7 @@ impl Duty {
                 duty_events,
                 owed_calls,
             },
+            Self::AccountGone => AppEvent::AccountGone { id },
         }
     }
 }
