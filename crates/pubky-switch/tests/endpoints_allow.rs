@@ -830,11 +830,15 @@ async fn test_allow_and_directory_reads_go_on_while_strangers_loop() {
     replay.db.drop_database().await.expect("drop");
 }
 
-/// While twelve loops of the executor's `GET /allow` run, the wallet reads the lists 100
-/// times: every read is answered. With `revoke`, the signer revokes the executor first; its
-/// request still verifies before the lock, so it takes a place and is refused under it.
-/// Without, it stays current but lacks `lists.read`. Either way it holds one place at most.
-async fn flood_of_refused_reads(revoke: bool) {
+/// The executor's reads hold one place of alice's queue at most. With `revoke`, the signer
+/// revokes it first; its request still verifies before the lock, so it takes a place and is
+/// refused under the lock. Without, it stays current but lacks `lists.read`.
+///
+/// Its first read is held where it waits for the account's lock, which the test holds from
+/// a connection of its own. Meanwhile every further read of the executor is refused at
+/// once, and the wallet's read takes a place of its own and waits its turn; once the lock
+/// is free, the executor's read is refused, the wallet's answered, and the queue is empty.
+async fn refused_reads_hold_one_place(revoke: bool) {
     let Some(replay) = replay().await else { return };
     replay_chain_through_revoke(&replay).await;
     register_executor(&replay).await;
@@ -861,67 +865,64 @@ async fn flood_of_refused_reads(revoke: bool) {
             String::from_utf8_lossy(&answer.body)
         );
     }
-    let stop = std::sync::atomic::AtomicBool::new(false);
-    let flood = || {
-        let (stop, replay, now) = (&stop, &replay, now.clone());
-        async move {
-            let mut sent = 0u32;
-            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                let answer = read_as(replay, "executor", &now).await;
-                assert_ne!(answer.status, 200, "the executor never reads the lists");
-                sent += 1;
+    let mut holder = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    let mut lock = sqlx::Connection::begin(&mut holder).await.expect("tx");
+    sqlx::query("SELECT id FROM accounts WHERE id = $1 FOR UPDATE")
+        .bind(alice_id())
+        .execute(&mut *lock)
+        .await
+        .expect("the account's lock");
+    let exchange = async {
+        tokio::join!(
+            read_as(&replay, "executor", &now),
+            async {
+                until_queued(&replay, 1).await;
+                // Every further read of the executor is refused at once.
+                for _ in 0..12 {
+                    let again = read_as(&replay, "executor", &now).await;
+                    assert_eq!(code_of(&again), (503, json!("unavailable")));
+                }
+                assert_eq!(replay.db.queued_reads(&alice_id()), 1);
+                read_as(&replay, "wallet", &now).await
+            },
+            async {
+                // The wallet's read takes a place of its own, then the lock goes.
+                until_queued(&replay, 2).await;
+                lock.rollback().await.expect("release the lock");
             }
-            sent
-        }
+        )
     };
-    let own = async {
-        let mut statuses = Vec::new();
-        for _ in 0..100 {
-            statuses.push(read_as(&replay, "wallet", &now).await.status);
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        statuses
-    };
-    let (a, b, c, d, e, f, g, h, i, j, k, l, statuses) =
-        tokio::time::timeout(std::time::Duration::from_secs(120), async {
-            tokio::join!(
-                flood(),
-                flood(),
-                flood(),
-                flood(),
-                flood(),
-                flood(),
-                flood(),
-                flood(),
-                flood(),
-                flood(),
-                flood(),
-                flood(),
-                own
-            )
-        })
+    let (first, wallet, ()) = tokio::time::timeout(std::time::Duration::from_secs(60), exchange)
         .await
         .expect("the reads ended");
-    let sent = [a, b, c, d, e, f, g, h, i, j, k, l];
-    assert!(
-        sent.iter().all(|n| *n > 0),
-        "every loop sent reads: {sent:?}"
+    let refused = if revoke {
+        "not_current"
+    } else {
+        "permission_missing"
+    };
+    assert_eq!(code_of(&first), (403, json!(refused)));
+    assert_eq!(
+        wallet.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&wallet.body)
     );
     assert_eq!(
-        statuses,
-        vec![200; 100],
-        "the wallet's reads are all answered"
+        replay.db.queued_reads(&alice_id()),
+        0,
+        "every place is free"
     );
     replay.db.drop_database().await.expect("drop");
 }
 
 #[tokio::test]
 async fn test_allow_a_revoked_app_holds_one_place_at_most() {
-    flood_of_refused_reads(true).await;
+    refused_reads_hold_one_place(true).await;
 }
 
 #[tokio::test]
 async fn test_allow_an_app_without_lists_read_holds_one_place_at_most() {
-    flood_of_refused_reads(false).await;
+    refused_reads_hold_one_place(false).await;
 }
