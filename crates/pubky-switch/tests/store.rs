@@ -1022,7 +1022,13 @@ async fn readable(
     txn.commit().await.expect("commit");
     let mut keys = Vec::new();
     let mut after = after.to_string();
-    loop {
+    // Bounded, so a read that doesn't move past its `after` fails the test instead of
+    // hanging it: every record the tests write fits well inside it.
+    for reads in 0.. {
+        assert!(
+            reads < 1_000,
+            "the reads never reached the collection's end"
+        );
         let page = read
             .readable_records(collection, &held, &after, 2)
             .await
@@ -1182,4 +1188,113 @@ async fn test_store_upgrade_gives_records_their_key_text() {
     assert_eq!(texts[0].as_bytes()[0], b'-', "'-' sorts first in ASCII");
     drop(conn);
     db.drop_database().await.expect("drop");
+}
+
+/// One read of `limit` records of account A's `collection` that the scopes `held` may read.
+async fn read_once(
+    fx: &Fixture,
+    collection: &[u8; 32],
+    held: &[&str],
+    limit: u64,
+) -> Vec<pubky_switch::store::StoredRecord> {
+    let held: Vec<String> = held.iter().map(|s| (*s).to_string()).collect();
+    let mut txn = fx
+        .store()
+        .begin_reading(ID_A, [1; 16])
+        .await
+        .expect("begin")
+        .expect("account");
+    txn.prepare_snapshot().await.expect("export");
+    let mut read = txn.snapshot_read().expect("snapshot");
+    txn.commit().await.expect("commit");
+    let page = read
+        .readable_records(collection, &held, "", limit)
+        .await
+        .expect("records");
+    read.finish().await.expect("finish");
+    page
+}
+
+#[tokio::test]
+async fn test_store_records_page_rows_stay_in_their_account() {
+    let Some(fx) = fixture().await else { return };
+    fx.account(ID_A).await;
+    fx.account(ID_B).await;
+    // Two accounts can hold a record at the same key: a key comes from the collection's
+    // name, the blinded natural key and the policy, not the identity.
+    let key = [0x11; 32];
+    for (id, record) in [
+        (ID_A, shared_record(key, [1; 32], "pay", false, 5)),
+        (ID_B, shared_record(key, [2; 32], "contacts", false, 9)),
+    ] {
+        let mut txn = fx.store().begin(id).await.expect("begin").expect("account");
+        txn.put_record(&record).await.expect("put");
+        txn.commit().await.expect("commit");
+    }
+    // A's page shows A's row only, once.
+    let page = read_once(&fx, &[1; 32], &["pay"], 33).await;
+    assert_eq!(page.len(), 1, "one row, A's");
+    assert_eq!(page[0].state.version.version, 5);
+    assert_eq!(page[0].state.collection, [1; 32]);
+    fx.finish().await;
+}
+
+#[tokio::test]
+async fn test_store_records_page_keeps_key_text_order_under_any_join() {
+    use pubky_switch_core::enc::b64;
+    let Some(fx) = fixture().await else { return };
+    fx.account(ID_A).await;
+    {
+        let mut txn = fx
+            .store()
+            .begin(ID_A)
+            .await
+            .expect("begin")
+            .expect("account");
+        // Byte order differs from text order: 0xF8 begins with '-', 0xD0 with '0', 0x00
+        // with 'A'.
+        for first in [0x00u8, 0x30, 0x68, 0xD0, 0xF8, 0xFC] {
+            for j in 0..6u8 {
+                let mut key = [first; 32];
+                key[31] = j;
+                let record = shared_record(key, [1; 32], "pay", false, 1);
+                txn.put_record(&record).await.expect("put");
+            }
+        }
+        // Many more records of another collection, so a page's keys are the smaller side
+        // of any hash join the planner picks.
+        for n in 0..3_000u32 {
+            let mut key = [0x55; 32];
+            key[..4].copy_from_slice(&n.to_be_bytes());
+            let record = shared_record(key, [2; 32], "pay", false, 1);
+            txn.put_record(&record).await.expect("put");
+        }
+        txn.commit().await.expect("commit");
+    }
+    // The planner kept off nested loops and merge joins, which happen to keep the page's
+    // order: only the query's own ordering of the rows read by key gives it. The readers
+    // connect after this, so they take these settings.
+    let mut conn = PgConnection::connect_with(fx.db.options())
+        .await
+        .expect("conn");
+    let name: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(&mut conn)
+        .await
+        .expect("name");
+    for setting in ["enable_nestloop = off", "enable_mergejoin = off"] {
+        conn.execute(format!("ALTER DATABASE \"{name}\" SET {setting}").as_str())
+            .await
+            .expect("alter");
+    }
+    conn.execute("ANALYZE shared_records")
+        .await
+        .expect("analyze");
+    drop(conn);
+    let page = read_once(&fx, &[1; 32], &["pay"], 33).await;
+    let texts: Vec<String> = page.iter().map(|record| b64(&record.state.key)).collect();
+    let mut sorted = texts.clone();
+    sorted.sort();
+    assert_eq!(texts.len(), 33);
+    assert_eq!(texts, sorted, "key-text order");
+    fx.finish().await;
 }
