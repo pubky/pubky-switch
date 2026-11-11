@@ -137,6 +137,13 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   account's generation change, a move's, is chained where the service answers `503`. The test call `deliver_identity` takes any document, without those
   checks, for scripting what another signer or a faulty service did. `forget_delivery_proof`
   makes a retry answer with no proof.
+- **Staged admission** (Switch spec 12.6 step 2, wire 7.4.14), in `switch/signer.rs` and
+  `switch/inbox.rs`: as at the service, staged at a recovery whose first document lists an
+  app; while it lasts, a sender not otherwise admitted, a stranger asking to connect
+  included, gets `503 staged` at `PUT /peers` and at the inbox; `POST /recovery/admission`
+  ends it with the `admission` transition's proof, answers no proof when it isn't staged,
+  and `404` without a recovery. Unlike the service: a switch made `recovering` doesn't stage
+  admission, and a recovery upload doesn't end it (the upload's own rules come with it).
 - **`GET /apps`** (Switch wire 7.4.12), in `switch/signer.rs`: by the service's rules, member
   by member, but `last_seen`, `unread_entries`, `sole_target_unread` and `recovery` (below):
   - every app the switch holds, every App ID it keeps for good, and every app the newest
@@ -163,7 +170,7 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
     unknown, and only parts from epoch 1 count. A row is an entry in the switch's apps, which
     an `app.put`, a revocation, a departure, a `cert.put` and some test calls create;
   - the account's `identity`, `recovery` as the spec's object (`declared_at` its recovery
-    record's time), with `admission_staged` `false`, as the service sends it, and
+    record's time, `admission_staged` as below), as the service sends it, and
     `proof_generations` from the same kept proofs as the delivery, the member left out when
     there are none.
 

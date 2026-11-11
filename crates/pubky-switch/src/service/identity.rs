@@ -163,7 +163,10 @@ impl Service {
             // its chain starts with the `recovery` transition (Switch wire 3.3, 7.4.2).
             Ok(Delivery::New(None)) if held.is_none() && doc.body().recovery_from.is_some() => {
                 let recovery_from = doc.body().recovery_from.unwrap_or_default();
-                txn.start_recovery(doc.generation(), recovery_from, time_ms)
+                // Admission is staged whenever the document lists an app: the service can't
+                // see their permissions yet (Switch spec 12.6 step 2).
+                let stages = !doc.body().apps.is_empty();
+                txn.start_recovery(doc.generation(), recovery_from, time_ms, stages)
                     .await
                     .map_err(|e| store_error(&e))?;
                 self.chain_recovery(txn, signer, recovery_from, time_ms)
@@ -215,6 +218,7 @@ impl Service {
             recovery_from,
             time_ms,
             self.limits.max_enrollments,
+            !doc.body().apps.is_empty(),
         )
         .await
         .map_err(|e| store_error(&e))?;

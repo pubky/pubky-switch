@@ -32,7 +32,10 @@ mod inbox;
 mod keyed;
 mod peers;
 mod records;
+mod recovery;
 pub mod rules;
+
+pub use recovery::AdmissionEnd;
 
 pub use enroll::announced_limits;
 
@@ -411,6 +414,7 @@ impl Service {
             | Call::GetApps
             | Call::PutHandover
             | Call::GetHandover
+            | Call::RecoveryAdmission
             | Call::Erase => {
                 match self
                     .authenticate_signer(&account, &request, base_ms, base_ms.max(stamped_ms))
@@ -1146,6 +1150,7 @@ impl Service {
                     | Call::Revoke(_)
                     | Call::GetApps
                     | Call::PutHandover
+                    | Call::RecoveryAdmission
                     | Call::Erase
             )
         {
@@ -1444,6 +1449,13 @@ impl Service {
                 };
                 return self
                     .get_handover(txn, signer, reader)
+                    .await
+                    .map(|answer| (answer, serving))
+                    .map_err(|error| Refused::with_head(error, serving));
+            }
+            Call::RecoveryAdmission => {
+                return self
+                    .recovery_admission(txn, signer, &request.body, time_ms)
                     .await
                     .map(|answer| (answer, serving))
                     .map_err(|error| Refused::with_head(error, serving));

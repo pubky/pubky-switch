@@ -118,8 +118,12 @@ impl Inner {
             // Where connect requests are on, a stranger delivers its document too, and asks
             // to connect (Switch wire 7.4.5, 7.4.7).
             ("PUT", "peers") => {
-                if !self.admits(sender, false) && !self.connect_requests_on() {
-                    return Ok(not_admitted());
+                // While admission is staged, a sender it can't otherwise admit waits, a
+                // stranger asking to connect included (Switch spec 12.6 step 2).
+                if !self.admits(sender, false)
+                    && (self.admission_staged || !self.connect_requests_on())
+                {
+                    return Ok(self.not_admitted_now());
                 }
                 self.peers_put(&sender.identity, &request.body)
             }
@@ -149,6 +153,20 @@ impl Inner {
         let hash = invite_code_hash(sender.code.as_deref()?).ok()?;
         let invite = self.shared.invites.get(&hash)?;
         (invite.uses < invite.max_uses && self.now() < invite.expires_at).then_some(hash)
+    }
+
+    /// The answer to a sender not admitted: `503 staged` while admission is staged after a
+    /// provider loss, so it retries, `403 not_admitted` otherwise (Switch spec 12.6 step 2).
+    fn not_admitted_now(&self) -> Answer {
+        if self.admission_staged {
+            bad(
+                ErrorCode::Staged,
+                "admission is staged after a provider loss",
+                json!(null),
+            )
+        } else {
+            not_admitted()
+        }
     }
 
     /// Whether `sender` is admitted (Switch spec 7): a contact, a conversation entry or a live
@@ -320,7 +338,7 @@ impl Inner {
         let mut by_code = None;
         if let Some(sender) = sender {
             if !self.admits(sender, false) {
-                return Ok(not_admitted());
+                return Ok(self.not_admitted_now());
             }
             if self.admits(sender, true) {
                 by_code = self.live_code(sender);

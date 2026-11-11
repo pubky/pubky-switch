@@ -15,6 +15,8 @@ pub struct Recovery {
     pub recovery_from: u64,
     /// The `recovery` transition's service time.
     pub declared_at_ms: u64,
+    /// Whether admission is staged still (Switch spec 12.6 step 2).
+    pub admission_staged: bool,
 }
 
 /// The tables of an account's state for one generation at this service, which a recovery in
@@ -65,7 +67,8 @@ impl AccountTxn {
     pub async fn recovery(&mut self) -> Result<Option<Recovery>, StoreError> {
         let id = self.head().id.clone();
         let row = sqlx::query(
-            "SELECT recovery_from, recovery_declared_at_ms FROM accounts WHERE id = $1",
+            "SELECT recovery_from, recovery_declared_at_ms, admission_staged FROM accounts \
+             WHERE id = $1",
         )
         .bind(id)
         .fetch_one(self.conn())
@@ -79,11 +82,33 @@ impl AccountTxn {
         let recovery = Recovery {
             recovery_from: from_db(from, "recovery_from")?,
             declared_at_ms: from_db(at, "recovery_declared_at_ms")?,
+            admission_staged: row.try_get("admission_staged")?,
         };
         Ok(
             (recovery.recovery_from.checked_add(1) == Some(self.head().generation))
                 .then_some(recovery),
         )
+    }
+
+    /// Whether admission is staged at the account: after a recovery it began with, until the
+    /// signer or a qualifying upload ends it (Switch spec 12.6 step 2).
+    pub async fn admission_staged(&mut self) -> Result<bool, StoreError> {
+        Ok(self.recovery().await?.is_some_and(|r| r.admission_staged))
+    }
+
+    /// End staged admission: whether it was staged, and is no longer. Ending it when it isn't
+    /// staged writes nothing (Switch wire 7.4.14).
+    pub async fn end_admission(&mut self) -> Result<bool, StoreError> {
+        if !self.admission_staged().await? {
+            return Ok(false);
+        }
+        let id = self.head().id.clone();
+        sqlx::query("UPDATE accounts SET admission_staged = false WHERE id = $1")
+            .bind(id)
+            .execute(self.conn())
+            .await
+            .map_err(StoreError::from_db)?;
+        Ok(true)
     }
 
     /// Hold `apps`, an enrollment's `revoked_apps` answered with the pending key, until the
@@ -125,19 +150,20 @@ impl AccountTxn {
     /// Start the recovery of a staged account that holds no document, at the first
     /// document's `generation` (Switch wire 3.3, 7.4.2): the account takes that generation,
     /// its key stays, and its chain starts empty, for the `recovery` transition. Recorded as
-    /// the recovery of `recovery_from` at `at_ms`. The chain must be empty: a staged account
-    /// holds none.
+    /// the recovery of `recovery_from` at `at_ms`, with admission staged when `stages` (Switch
+    /// spec 12.6 step 2). The chain must be empty: a staged account holds none.
     pub async fn start_recovery(
         &mut self,
         generation: u64,
         recovery_from: u64,
         at_ms: u64,
+        stages: bool,
     ) -> Result<(), StoreError> {
         if self.head().chain.is_some() {
             return Err(StoreError::Corrupt("a staged account with a chain"));
         }
         let key = self.head().service_key.clone();
-        self.set_generation(generation, &key, recovery_from, at_ms)
+        self.set_generation(generation, &key, recovery_from, at_ms, stages)
             .await
     }
 
@@ -161,6 +187,7 @@ impl AccountTxn {
         recovery_from: u64,
         at_ms: u64,
         max_enrollments: u64,
+        stages: bool,
     ) -> Result<(), StoreError> {
         let id = self.head().id.clone();
         let old_key = self.head().service_key.clone();
@@ -247,29 +274,32 @@ impl AccountTxn {
         .execute(self.conn())
         .await
         .map_err(StoreError::from_db)?;
-        self.set_generation(generation, new_key, recovery_from, at_ms)
+        self.set_generation(generation, new_key, recovery_from, at_ms, stages)
             .await
     }
 
-    /// Write `generation`, `key` and the recovery of `recovery_from` at `at_ms` to the
-    /// account's row, and take them as its position, its chain empty.
+    /// Write `generation`, `key` and the recovery of `recovery_from` at `at_ms`, staging
+    /// admission when `stages`, to the account's row, and take them as its position, its
+    /// chain empty.
     async fn set_generation(
         &mut self,
         generation: u64,
         key: &KeyId,
         recovery_from: u64,
         at_ms: u64,
+        stages: bool,
     ) -> Result<(), StoreError> {
         let id = self.head().id.clone();
         sqlx::query(
             "UPDATE accounts SET generation = $2, service_key = $3, recovery_from = $4, \
-             recovery_declared_at_ms = $5 WHERE id = $1",
+             recovery_declared_at_ms = $5, admission_staged = $6 WHERE id = $1",
         )
         .bind(&id)
         .bind(to_db(generation, "generation")?)
         .bind(key.as_str())
         .bind(to_db(recovery_from, "recovery_from")?)
         .bind(time_to_db(at_ms)?)
+        .bind(stages)
         .execute(self.conn())
         .await
         .map_err(StoreError::from_db)?;

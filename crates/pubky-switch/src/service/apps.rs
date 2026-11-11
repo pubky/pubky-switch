@@ -223,13 +223,14 @@ pub(crate) fn statuses(
 
 /// The `recovery` member (Switch wire 7.4.12): `{ "recovery_from", "declared_at",
 /// "admission_staged" }` while the account serves the generation a recovery began, else
-/// `null`. Admission isn't staged by this service, so `admission_staged` is `false`.
+/// `null`.
 fn recovery_member(recovery: Option<&crate::store::Recovery>) -> Vec<u8> {
     match recovery {
         Some(recovery) => format!(
-            r#"{{"recovery_from":{},"declared_at":"{}","admission_staged":false}}"#,
+            r#"{{"recovery_from":{},"declared_at":"{}","admission_staged":{}}}"#,
             recovery.recovery_from,
             pubky_switch_core::time::rfc3339(recovery.declared_at_ms),
+            recovery.admission_staged,
         )
         .into_bytes(),
         None => b"null".to_vec(),
