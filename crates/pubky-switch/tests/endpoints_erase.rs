@@ -2942,3 +2942,45 @@ async fn test_erase_keyed_section_reads_committed_whatever_the_pools_default() {
     assert!(operator_signed(&answer, Some(&request_signature)));
     replay.db.drop_database().await.expect("drop");
 }
+
+#[tokio::test]
+async fn test_erase_signer_refusal_parked_while_a_key_is_owed_isnt_a_404() {
+    // A signer call refused before the lock, its timestamp an hour off, parks while the
+    // account is erased and its key left owed: the signer's answer is the operator's `503`,
+    // decided on its signature alone, never the `404` it would take as its erasure done
+    // (7.4.16).
+    let Some(replay) = replay().await else {
+        return;
+    };
+    replay_chain_through_revoke(&replay).await;
+    let key = service_key_id(&replay, &alice_id()).await;
+    let request = signer_request(
+        "GET",
+        &format!("/v1/{}/apps", alice_id()),
+        Vec::new(),
+        ms(&revoke_time()) - 3_600_000,
+    );
+    let request_signature = signature_of(&request);
+    let answer = parked_while(&replay, request, move |conn| {
+        Box::pin(async move {
+            sqlx::query("DELETE FROM accounts WHERE id = $1")
+                .bind(alice_id())
+                .execute(&mut *conn)
+                .await
+                .expect("erased");
+            sqlx::query(
+                "INSERT INTO erased_keys (key_id, account_id, erased_at_ms) VALUES ($1, $2, 1)",
+            )
+            .bind(key.as_str())
+            .bind(alice_id())
+            .execute(&mut *conn)
+            .await
+            .expect("owed");
+        })
+    })
+    .await;
+    assert_eq!(code_of(&answer), (503, json!("unavailable")));
+    assert!(no_head(&answer));
+    assert!(operator_signed(&answer, Some(&request_signature)));
+    replay.db.drop_database().await.expect("drop");
+}
