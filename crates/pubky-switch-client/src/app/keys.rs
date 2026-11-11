@@ -10,6 +10,14 @@
 //! Afterwards the app works out `keys_through`, the newest data epoch through which it
 //! holds every scope key, and asks once for a full bundle when it still lacks a key for an
 //! epoch up to the current one; the request clears once nothing is missing.
+//!
+//! A part stored after the request, seen in the feed, also clears it: it is the signer's
+//! answer, so a key still missing once that part is read is asked for again (Switch wire
+//! 7.4.11). Otherwise a request kept while the parts that answered it went, such as one a
+//! backup carries into a restore after the parts were dropped, would never be made again.
+//! So the app asks at most once per part stored after its last request: the signer's
+//! answers, not a clock, pace the requests, and while no part arrives a request again would
+//! keep the service's first time and tell the signer nothing new.
 
 use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::records::{
@@ -132,6 +140,22 @@ impl App {
             self.state.bundle.full_requested_ms = None;
         }
         !missing.is_empty()
+    }
+
+    /// A `key_bundle.put` for this app at service time `at`, seen in the feed: one stored at
+    /// or after the full-bundle request answers it, so the request clears, and the fetch the
+    /// part leads to asks again if a key is still missing (Switch wire 7.4.11). The fetch's
+    /// commit keeps the cleared request. A part stored in the same millisecond as the
+    /// request counts as after it: the error is one more request.
+    pub(crate) fn part_stored(&mut self, at: u64) {
+        if self
+            .state
+            .bundle
+            .full_requested_ms
+            .is_some_and(|requested| at >= requested)
+        {
+            self.state.bundle.full_requested_ms = None;
+        }
     }
 
     /// Ask the signer for a full bundle, once until one arrives (Switch spec 3.5).

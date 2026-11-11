@@ -2438,6 +2438,53 @@ fn store_part(w: &World, me: [u8; 16], cert: &AppCert, first: u64, last: u64) ->
     seq
 }
 
+#[tokio::test]
+async fn test_app_restore_asks_again_for_a_full_bundle_a_later_part_left_short() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let me = app.app_id();
+    let cert = app.cert().clone();
+    // A new epoch whose part isn't stored: the app asks for a full bundle, and is backed up
+    // while it waits. Then its device is lost.
+    w.next_doc(|body| body.data_epoch = 3);
+    let report = app.receive(None).await.unwrap();
+    let asked = |events: &[AppEvent]| has(events, |e| matches!(e, AppEvent::FullBundleRequested));
+    assert!(asked(&report.events), "{:?}", report.events);
+    let backup = app.backup().await.unwrap();
+    drop(app);
+    // The signer answers in two parts, the second completing the request; then the switch
+    // drops the first.
+    store_part(&w, me, &cert, 1, 2);
+    let completing = store_part(&w, me, &cert, 3, 3);
+    assert_eq!(w.switch.app(&me).full_completed, Some(completing));
+    w.switch
+        .lock()
+        .bundles
+        .entry(me)
+        .or_default()
+        .retain(|(part, _)| part.first_epoch != 1);
+    assert_eq!(w.switch.bundles_of(&me), vec![(3, 3)]);
+    // The restored app holds the backup's request, and reads the part stored after it: the
+    // request is answered, and the keys still lacking are asked for again.
+    let (mut restored, _) = restored(&w, &backup).await;
+    let report = restored.receive(None).await.unwrap();
+    assert!(asked(&report.events), "{:?}", report.events);
+    assert!(w.switch.app(&me).full_requested.is_some());
+    assert!(restored.scope_key(3, "scope-a").is_some());
+    assert_eq!(restored.keys_through(), 1);
+    // Once per part stored: a read without one asks nothing more.
+    let report = restored.receive(None).await.unwrap();
+    assert!(!asked(&report.events), "{:?}", report.events);
+    // The signer answers again, and the keys arrive.
+    store_part(&w, me, &cert, 1, 2);
+    restored.receive(None).await.unwrap();
+    assert_eq!(restored.keys_through(), 3);
+    assert_eq!(
+        restored.scope_key(2, "scope-a"),
+        Some(w.alice.scope_key(2, "scope-a"))
+    );
+}
+
 // The scripted switch drops key bundle parts by the core's rule, as the service does (Switch
 // wire 6.2): these mirror the service's tests of the same names in
 // `crates/pubky-switch/tests/endpoints_keys.rs`.

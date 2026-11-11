@@ -2043,7 +2043,9 @@ impl App {
                     OpKind::KeyBundlePut(put)
                         if put.target_app_id == me && body.app_id.is_none() =>
                     {
-                        // Fetched before the cursor passes the part (Switch spec 3.5).
+                        // Fetched before the cursor passes the part (Switch spec 3.5). A
+                        // part stored after the full-bundle request answers it.
+                        self.part_stored(envelope.server_time);
                         self.fetch_key_bundle().await?;
                         Ok(Step::Pass)
                     }
