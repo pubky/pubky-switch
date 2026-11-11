@@ -1389,6 +1389,33 @@ async fn test_app_restore_removed_by_a_newer_document_registers_nothing() {
     assert_eq!(w.switch.applied().len(), applied, "nothing registered");
 }
 
+/// The restore's directory read brings a newer document naming the next generation:
+/// `take_listed_cert` takes it and reports the app not current here, before the restore's
+/// key check, which would register a key at the generation the app leaves. A read follows
+/// the change at its start (`follow_provider_change`) before it gets here; this is the
+/// guard for a document that arrives between the two.
+#[tokio::test]
+async fn test_app_restore_listed_cert_stops_at_a_newer_generation() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let backup = backup_then_rotate(&w, &mut app).await;
+    drop(app);
+    let mut body = w.switch.identity_doc().unwrap().body().clone();
+    body.version += 1;
+    body.generation += 1;
+    let doc = IdentityDoc::sign(&w.alice, body).unwrap();
+    w.switch.deliver_identity(&doc).unwrap();
+    let (mut restored, _) = restored(&w, &backup).await;
+    let applied = w.switch.applied().len();
+    assert!(matches!(
+        restored.take_listed_cert().await.unwrap(),
+        crate::app::renewal::Listed::NotCurrentHere
+    ));
+    assert_eq!(restored.own_identity().generation(), 2);
+    assert!(restored.not_current_here().is_some());
+    assert_eq!(w.switch.applied().len(), applied, "nothing registered");
+}
+
 /// A listed certificate that isn't a renewal of the one held, an earlier one, isn't taken.
 #[tokio::test]
 async fn test_app_restore_takes_no_listed_certificate_older_than_its_own() {

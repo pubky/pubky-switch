@@ -15,9 +15,9 @@ use pubky_switch_core::sig::SignedDoc;
 
 use super::*;
 use crate::app::{
-    AppError, AppEvent, ClaimOp, Evidence, LocalWrite, LossActions, MAX_STEP_LOCAL_BYTES,
-    ObligationDeadline, ParkReason, ProviderLoss, ProviderStatus, PushRelay, Refusal, RefusedCall,
-    UserConfirmed,
+    AppBackup, AppError, AppEvent, ClaimOp, Evidence, LocalWrite, LossActions,
+    MAX_STEP_LOCAL_BYTES, ObligationDeadline, ParkReason, ProviderLoss, ProviderStatus, PushRelay,
+    Refusal, RefusedCall, UserConfirmed,
 };
 use crate::error::TransportError;
 use crate::error::{ClientError, StoreError};
@@ -4586,4 +4586,213 @@ async fn test_apps_answer_reports_what_the_switch_holds() {
         apps["recovery"]["declared_at"],
         pubky_switch_core::time::rfc3339(declared)
     );
+}
+
+// -------------------------------------------------------------------------------------
+// A restore meeting a provider change: registrations since the backup (Switch spec 12.4)
+
+/// Alice's wallet, joined at `router`, and its backup taken before the device rotated to
+/// key 1: the restored app never made that key.
+async fn backed_up_then_rotated(w: &World, router: &Router) -> AppBackup {
+    let mut app = join(w, router).await;
+    let backup = app.backup().await.unwrap();
+    w.note(app.app_id(), "before the rotation");
+    app.receive(None).await.unwrap();
+    w.clock.advance_ms(25 * 3_600_000);
+    app.receive(None).await.unwrap();
+    assert_eq!(app.receive_key_numbers().last(), Some(&1));
+    backup
+}
+
+/// `backup` restored at `router` onto `store`.
+async fn restored_at(
+    w: &World,
+    router: &Router,
+    store: Arc<dyn StateStore>,
+    backup: &AppBackup,
+) -> App {
+    App::restore(
+        router.env(w, store),
+        w.protocol.clone(),
+        World::config(),
+        backup,
+    )
+    .await
+    .unwrap()
+}
+
+fn asked(events: &[AppEvent]) -> bool {
+    has(events, |e| matches!(e, AppEvent::RestoreQuestion { .. }))
+}
+
+#[tokio::test]
+async fn test_restore_meeting_a_key_change_asks_about_a_later_registration() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let backup = backed_up_then_rotated(&w, &router).await;
+    let changed = change_key(&w, &router);
+    let mut restored = restored_at(&w, &router, Arc::new(MemoryStore::new()), &backup).await;
+    let report = restored.receive(None).await.unwrap();
+    assert!(asked(&report.events), "{:?}", report.events);
+    assert_eq!(restored.restore_question(), vec![1]);
+    assert!(restored.alarm().is_none());
+    assert_eq!(restored.cursor().generation, 2);
+    // It registered a key above the one it can't account for, at the service it follows.
+    assert_eq!(restored.receive_key_numbers().last(), Some(&2));
+    assert_eq!(changed.app(&restored.app_id()).receive_n, Some(2));
+}
+
+#[tokio::test]
+async fn test_restore_meeting_a_move_asks_about_a_later_registration() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let backup = backed_up_then_rotated(&w, &router).await;
+    let n_key = next_key();
+    w.switch.freeze(&freeze_for(&w, &n_key, 2)).unwrap();
+    let next = w.switch.import_into(n_key.to_bytes());
+    router.add(NEXT, &next);
+    publish_at(
+        &w,
+        &next,
+        Inbox::new(NEXT, n_key.verifying_key().to_bytes()),
+        2,
+        None,
+    );
+    let mut restored = restored_at(&w, &router, Arc::new(MemoryStore::new()), &backup).await;
+    let mut events = Vec::new();
+    for _ in 0..2 {
+        events.extend(restored.receive(None).await.unwrap().events);
+    }
+    assert!(asked(&events), "{events:?}");
+    assert_eq!(restored.restore_question(), vec![1]);
+    assert!(restored.alarm().is_none());
+    assert_eq!(restored.cursor().generation, 2);
+}
+
+#[tokio::test]
+async fn test_restore_meeting_a_key_change_then_denied_is_a_compromise() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let backup = backed_up_then_rotated(&w, &router).await;
+    change_key(&w, &router);
+    let mut restored = restored_at(&w, &router, Arc::new(MemoryStore::new()), &backup).await;
+    restored.receive(None).await.unwrap();
+    assert_eq!(restored.restore_question(), vec![1]);
+    let error = restored.refuse_restored_registrations().await.unwrap_err();
+    assert!(
+        matches!(
+            error,
+            AppError::Alarm(crate::app::Alarm::Compromise { n: 1, .. })
+        ),
+        "{error:?}"
+    );
+}
+
+/// The device sync of an app that shares its keys: a registration since the backup that no
+/// device made is asked about while the restore is held, not taken for a compromise.
+#[tokio::test]
+async fn test_restore_device_sync_asks_about_a_registration_no_device_made() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join(&w, &router).await;
+    app.set_multi_device(true).await.unwrap();
+    let backup = app.backup().await.unwrap();
+    w.note(app.app_id(), "before the rotation");
+    app.receive(None).await.unwrap();
+    w.clock.advance_ms(25 * 3_600_000);
+    app.receive(None).await.unwrap();
+    assert_eq!(app.receive_key_numbers().last(), Some(&1));
+    drop(app);
+    let mut restored = restored_at(&w, &router, Arc::new(MemoryStore::new()), &backup).await;
+    restored.receive(None).await.unwrap();
+    assert!(
+        restored.restore_question().is_empty(),
+        "the device sync decides"
+    );
+    // A device sync that brings no key 1: no device made it.
+    let keys = restored.device_keys();
+    restored.take_device_keys(keys).await.unwrap();
+    assert_eq!(restored.restore_question(), vec![1]);
+    assert!(restored.alarm().is_none());
+}
+
+/// A provider loss the device the backup came from followed first, registering its own
+/// key at the new service: the restored app's registration there meets it, and asks.
+#[tokio::test]
+async fn test_restore_meeting_a_loss_asks_about_a_later_registration() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join(&w, &router).await;
+    let backup = app.backup().await.unwrap();
+    w.clock.advance_ms(60_000);
+    let n_key = next_key();
+    let next =
+        ScriptedSwitch::recovering(&w.alice, n_key.to_bytes(), Arc::clone(&w.clock), 2, 1).unwrap();
+    router.add(NEXT, &next);
+    publish_at(
+        &w,
+        &next,
+        Inbox::new(NEXT, n_key.verifying_key().to_bytes()),
+        2,
+        Some(1),
+    );
+    w.switch.lock().erased = true;
+    // The device follows the loss, registering a fresh key there.
+    app.refresh_identity().await.unwrap();
+    app.receive(None).await.unwrap();
+    let theirs = next.app(&app.app_id()).receive_n.unwrap();
+    assert!(theirs >= 1);
+    drop(app);
+    let mut restored = restored_at(&w, &router, Arc::new(MemoryStore::new()), &backup).await;
+    restored.refresh_identity().await.unwrap();
+    let mut events = Vec::new();
+    for _ in 0..2 {
+        events.extend(restored.receive(None).await.unwrap().events);
+    }
+    assert!(asked(&events), "{events:?}");
+    assert!(
+        restored.restore_question().contains(&theirs),
+        "{:?}",
+        restored.restore_question()
+    );
+    assert!(restored.alarm().is_none());
+}
+
+/// The restore's key check owed across a crash: the read that follows the key change stops
+/// before the check, and the app loaded again asks, as the first read would have.
+#[tokio::test]
+async fn test_restore_check_owed_across_a_crash_after_a_key_change_still_asks() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let backup = backed_up_then_rotated(&w, &router).await;
+    let changed = change_key(&w, &router);
+    let store = Arc::new(MemoryStore::new());
+    let mut restored = restored_at(
+        &w,
+        &router,
+        Arc::clone(&store) as Arc<dyn StateStore>,
+        &backup,
+    )
+    .await;
+    // The follow reads the directory once; the restore's check, which reads it again, can't.
+    changed.fail_next(Fault::Unreachable {
+        path: "directory".into(),
+        after: 1,
+    });
+    assert!(restored.receive(None).await.is_err());
+    assert!(restored.alarm().is_none());
+    drop(restored);
+    let mut loaded = App::load(
+        router.env(&w, Arc::clone(&store) as Arc<dyn StateStore>),
+        w.protocol.clone(),
+        World::config(),
+        app_keys("wallet").app_id_bytes(),
+    )
+    .await
+    .unwrap();
+    assert!(loaded.reconcile_mode());
+    loaded.receive(None).await.unwrap();
+    assert_eq!(loaded.restore_question(), vec![1]);
+    assert!(loaded.alarm().is_none());
+    assert_eq!(loaded.receive_key_numbers().last(), Some(&2));
 }

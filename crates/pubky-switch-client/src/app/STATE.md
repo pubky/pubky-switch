@@ -140,7 +140,7 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
 | `ident/<pubky>/reads` | when a counterparty's `identity.json` was last read from its Homeserver, and from its switch | |
 | `rk/<n>` | a held receive key: secret, signed record, registration `seq` and service time, pending batch | yes |
 | `kid/<kid>` | a kid this app or one of its devices made, kept after the key is deleted | |
-| `reg/<n>` | a registration of the own app whose key this device doesn't hold: own, awaiting device sync, or unaccounted after a restore | |
+| `reg/<n>` | a registration of the own app whose key this device doesn't hold: own, awaiting device sync, or unaccounted after a restore. One rule judges a registration no device of the app made wherever it is met (the restore's key check, the feed, a registration conflict, a provider loss's, the re-registration after a move or a key change in place, and the device sync): while the `restore` record is held, one after the backup's newest key and before the key the restored app registered is unaccounted, and only the user's "no" is a compromise (Switch spec 12.4); any other is a compromise at once, or awaits the device sync on an app that shares its keys. The record is in the store, so it holds across a crash between following a provider change and the restore's key check | |
 | `rotation` | the last rotation's time, and whether an envelope to the current key was opened since | |
 | `device` | whether the app shares its keys across devices | |
 | `cursor` | the processed position, the cursor the service holds, the deferral, the cursor's time | |
