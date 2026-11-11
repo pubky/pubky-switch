@@ -49,7 +49,7 @@ pub const RECOVERY_KEEPS: &[&str] = &[
     "erased_keys",
 ];
 
-/// Every table with an account column that a recovery in place empties: [`GENERATION_STATE`]'s,
+/// Every table with an account column that a recovery in place empties: the generation's own state,
 /// `claim_entries` with their claims, and `pending_revoked_apps`, which joins `kept_app_ids`.
 /// A table added later with an account column must be classed here or in
 /// [`RECOVERY_KEEPS`], which a test of every such table checks.
