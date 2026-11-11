@@ -1716,6 +1716,7 @@ name = "pubky-switch-harness"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "futures-util",
  "pubky-switch",
  "pubky-switch-client",
  "pubky-switch-core",

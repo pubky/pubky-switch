@@ -247,7 +247,7 @@ impl Signer {
         let key = self.signing_key()?;
         let (ops, alerts) = self.catch_up(&key, &newest, statuses, switch_time, &[], through)?;
         let batches = self.sign_batches(&key, newest.generation(), ops)?;
-        let (doc, flow) = self.next_version(&key, |body| body.data_epoch = through)?;
+        let (doc, flow) = self.next_version_closing(&key, |body| body.data_epoch = through)?;
         drop(key);
         let state = self.state.clone();
         self.commit_batches(state, &newest, statuses, alerts, batches, &doc, flow)
@@ -607,7 +607,7 @@ impl Signer {
             return Ok(false);
         }
         let key = self.signing_key()?;
-        let (doc, flow) = self.next_version(&key, |body| {
+        let (doc, flow) = self.next_version_closing(&key, |body| {
             for app in &owed {
                 body.close_renewals(app, until);
             }
@@ -667,7 +667,7 @@ impl Signer {
             return Ok(Vec::new());
         }
         let key = self.signing_key()?;
-        let (next, flow) = self.next_version(&key, |body| {
+        let (next, flow) = self.next_version_closing(&key, |body| {
             for (app, until) in &closing {
                 body.close_renewals(app, *until);
             }

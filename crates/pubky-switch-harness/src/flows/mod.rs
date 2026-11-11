@@ -8,16 +8,32 @@
 //! [`FLOWS`] names every flow, and [`flow_of`] says which flow sends each call the service
 //! routes.
 
+mod claim;
 mod enrollment;
 mod join;
+mod lists;
+mod messaging;
+mod removal;
+mod renewal;
+mod restore;
+mod retries;
+mod watching;
 
 use std::future::Future;
 use std::pin::Pin;
 
 use pubky_switch::http::route::Call;
 
+pub use claim::claim;
 pub use enrollment::enrollment;
 pub use join::join;
+pub use lists::lists_without_read;
+pub use messaging::messaging;
+pub use removal::{departure, revocation};
+pub use renewal::renewal;
+pub use restore::restore;
+pub use retries::{app_retries, append_retry, signer_retries};
+pub use watching::watching;
 
 use crate::{FlowResult, World};
 
@@ -35,6 +51,19 @@ pub type Flow = for<'a> fn(&'a World) -> Pin<Box<dyn Future<Output = FlowResult>
 pub const FLOWS: &[(&str, Flow)] = &[
     ("enrollment", |world| Box::pin(enrollment(world))),
     ("join", |world| Box::pin(join(world))),
+    ("messaging", |world| Box::pin(messaging(world))),
+    ("lists without read", |world| {
+        Box::pin(lists_without_read(world))
+    }),
+    ("claim", |world| Box::pin(claim(world))),
+    ("renewal", |world| Box::pin(renewal(world))),
+    ("revocation", |world| Box::pin(revocation(world))),
+    ("departure", |world| Box::pin(departure(world))),
+    ("watching", |world| Box::pin(watching(world))),
+    ("restore", |world| Box::pin(restore(world))),
+    ("signer retries", |world| Box::pin(signer_retries(world))),
+    ("app retries", |world| Box::pin(app_retries(world))),
+    ("append retry", |world| Box::pin(append_retry(world))),
 ];
 
 /// The flow that sends `call` to the service; `None` for a call the service doesn't serve
@@ -44,15 +73,14 @@ pub fn flow_of(call: &Call) -> Option<&'static str> {
     match call {
         Call::Enroll | Call::PutIdentity | Call::GetIdentity | Call::GetApps => Some("enrollment"),
         Call::Ops | Call::Feed | Call::GetKeys(_) | Call::GetAllow => Some("join"),
-        // Served, and waiting for their flows: two identities messaging each other, a
-        // claim, a renewal with its full-bundle request, a revocation and a departure.
-        Call::Append
-        | Call::PutPeers
-        | Call::Directory
-        | Call::GetClaim(_)
-        | Call::RequestKeys(_)
-        | Call::Revoke(_)
-        | Call::Leave(_) => None,
+        Call::Append | Call::PutPeers | Call::Directory => Some("messaging"),
+        Call::GetClaim(_) => Some("claim"),
+        Call::Revoke(_) => Some("revocation"),
+        Call::Leave(_) => Some("departure"),
+        // Served, and waiting for its flow: an app asks for a full bundle only when it
+        // lacks an epoch's keys, and no honest flow leaves it lacking one while the service
+        // keeps every bundle part (the restore flow shows it).
+        Call::RequestKeys(_) => None,
         // Not served yet.
         Call::PostConnect
         | Call::GetConnect

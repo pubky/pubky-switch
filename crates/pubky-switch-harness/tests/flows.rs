@@ -6,12 +6,15 @@
 #![allow(clippy::expect_used, clippy::panic)]
 
 use std::collections::BTreeSet;
+use std::panic::AssertUnwindSafe;
+
+use futures_util::FutureExt;
 
 use pubky_switch::http::route::route;
 use pubky_switch_client::transport::{Request, Response};
 use pubky_switch_core::enc::{b64, unb64};
 use pubky_switch_harness::allowed::{ALLOWED, EVERY_FLOW};
-use pubky_switch_harness::compare::{differences, judge};
+use pubky_switch_harness::compare::{Difference, differences, judge};
 use pubky_switch_harness::flows::{self, CALLS, FLOWS, ORIGIN, flow_of};
 use pubky_switch_harness::{Backend, Comparison, FlowResult, Trace, World, compare_backends, run};
 use tokio::sync::OnceCell;
@@ -26,13 +29,20 @@ async fn comparisons() -> Option<&'static [(&'static str, Comparison)]> {
         .get_or_init(|| async {
             let mut all = Vec::new();
             for (name, flow) in FLOWS {
-                match compare_backends(name, flow).await {
-                    Err(error) => return Err(format!("{name}: {error}")),
-                    Ok(None) => {
+                // A flow that panics is kept as a failure like one that returns an error:
+                // an unwinding init would leave the cell empty, and every test would run
+                // the flows again.
+                let compared = AssertUnwindSafe(compare_backends(name, flow))
+                    .catch_unwind()
+                    .await;
+                match compared {
+                    Err(_) => return Err(format!("{name}: the flow panicked")),
+                    Ok(Err(error)) => return Err(format!("{name}: {error}")),
+                    Ok(Ok(None)) => {
                         eprintln!("ran against the scripted switch only: no test database");
                         return Ok(None);
                     }
-                    Ok(Some(comparison)) => all.push((*name, comparison)),
+                    Ok(Ok(Some(comparison))) => all.push((*name, comparison)),
                 }
             }
             Ok(Some(all))
@@ -255,6 +265,84 @@ async fn test_comparison_fails_a_scripted_switch_that_answers_another_string_of_
     }
 }
 
+/// `value` with every chain hash, previous chain hash and item hash replaced by another,
+/// the same replacement wherever the same hash shows, also inside the JSON a string carries
+/// in base64url: a chain that is wrong from its first item and consistent throughout.
+fn replace_chain_hashes(value: &mut serde_json::Value) {
+    use serde_json::Value;
+    match value {
+        Value::Object(members) => {
+            for (name, member) in members.iter_mut() {
+                let hashed = matches!(
+                    name.as_str(),
+                    "chain_hash" | "prev_chain_hash" | "item_hash"
+                );
+                match member.as_str().map(str::to_owned) {
+                    Some(text) if hashed => {
+                        if let Ok(bytes) = unb64(&text) {
+                            *member = b64(&pubky_switch_core::enc::hash(&bytes)).into();
+                        }
+                    }
+                    Some(text) if text.starts_with("eyJ") => {
+                        let carried = unb64(&text)
+                            .ok()
+                            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+                        if let Some(mut carried) = carried {
+                            replace_chain_hashes(&mut carried);
+                            *member = b64(&serde_json::to_vec(&carried).expect("json")).into();
+                        }
+                    }
+                    _ => replace_chain_hashes(member),
+                }
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(replace_chain_hashes),
+        _ => {}
+    }
+}
+
+/// A scripted switch whose chain is wrong from the start and consistent throughout reads
+/// like the service's in the comparison: every hash repeats where the right one would. The
+/// harness's own checks fail it: the stubs' chain hashes don't follow from their envelopes,
+/// and the heads and proofs don't verify.
+#[tokio::test]
+async fn test_checks_fail_a_scripted_switch_with_a_wrong_but_consistent_chain() {
+    let Some(service) = service_trace("join").await else {
+        return;
+    };
+    let scripted = distorted(flows::join, |_, answer| {
+        change_body(answer, |body| {
+            replace_chain_hashes(body);
+            Some(())
+        });
+        for header in &mut answer.headers {
+            if header.name == "switch-head" {
+                header.value = change_carried(&header.value, replace_chain_hashes);
+            }
+        }
+    })
+    .await;
+    let verdict = judge("join", differences(service, &scripted), ALLOWED);
+    let violations: Vec<&Difference> = verdict
+        .unlisted
+        .iter()
+        .filter(|d| d.fact.starts_with("violation"))
+        .collect();
+    let failed = |what: &str| {
+        violations.iter().any(|d| {
+            d.service.is_none()
+                && d.scripted
+                    .as_deref()
+                    .is_some_and(|text| text.contains(what))
+        })
+    };
+    assert!(failed("the head's signature doesn't verify"), "{verdict}");
+    assert!(failed("the proof's signature doesn't verify"), "{verdict}");
+    assert!(failed("chain hash"), "{verdict}");
+    // Without those checks the two runs read alike: nothing else is unlisted.
+    assert_eq!(violations.len(), verdict.unlisted.len(), "{verdict}");
+}
+
 /// A sample App ID and a sample of any other path parameter.
 const APP: &str = "yyyyyyyyyyyyyyyyyyyyyyyyyy";
 const KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
@@ -339,13 +427,7 @@ async fn test_every_served_call_is_listed_and_sent_by_its_flow() {
     assert_eq!(
         waiting,
         [
-            "POST /v1/{id}/inbox",
-            "PUT /v1/{id}/peers",
-            "GET /v1/{id}/claims/{key}",
-            "GET /v1/{id}/directory",
             "POST /v1/{id}/apps/{app}/keys",
-            "POST /v1/{id}/apps/{app}/leave",
-            "POST /v1/{id}/apps/{app}/revoke",
             "PUT /v1/{id}/handover",
             "GET /v1/{id}/handover",
         ],

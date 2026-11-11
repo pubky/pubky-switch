@@ -821,3 +821,124 @@ async fn test_vectors_old_signer_counts_the_closings_its_open_renewals_owe() {
         .unwrap();
     assert!(removed.body().renewed.is_empty());
 }
+
+/// A version whose delivery would land within the headroom kept under the cap is refused,
+/// not only one over it: a later version adds a digit or two, and its closing must still be
+/// deliverable (Switch wire 7.1).
+#[tokio::test]
+async fn test_vectors_old_signer_keeps_headroom_under_the_cap() {
+    let mut old = old_signer().await;
+    let limit = super::identity_limit().unwrap();
+    // About as many closed entries as fill the cap; then version 5, the inbox's host padded
+    // so that version 6, the change below, lands a few bytes under the cap.
+    let large = with_renewed(&mut old, 1_520, Some(VECTOR_START_MS)).await;
+    let size = |body: &pubky_switch_core::records::IdentityBody| {
+        super::delivery_len(body.to_json().unwrap().len())
+    };
+    let padded = |pad: usize| {
+        let mut body = large.body().clone();
+        body.version = 5;
+        body.inbox.url = format!("https://{}.switch.example", "a".repeat(pad));
+        body
+    };
+    let next = |body: &pubky_switch_core::records::IdentityBody| {
+        let mut next = body.clone();
+        next.version = 6;
+        next.record_max_age = Some(60);
+        next
+    };
+    let pad = (0..2_000)
+        .find(|pad| {
+            let bytes = size(&next(&padded(*pad)));
+            bytes <= limit && bytes + 8 > limit
+        })
+        .expect("a padding that lands within the headroom");
+    let five = IdentityDoc::sign(&old.key, padded(pad)).unwrap();
+    old.switch.deliver_identity(&five).unwrap();
+    old.signer
+        .delivered(five.signed().clone(), Some(large.hash()), None)
+        .await
+        .unwrap();
+    let refused = old.signer.set_record_max_age(Some(60)).await.unwrap_err();
+    assert!(
+        matches!(
+            refused,
+            SignerError::Refused(Refusal::IdentityTooLarge { bytes, limit })
+                if bytes <= limit
+        ),
+        "{refused:?}"
+    );
+}
+
+/// A reduction's renewing version signed within the cap's headroom of the cap: its closing,
+/// which only closes what is signed already, may use the headroom, and is delivered, not
+/// refused; refused, it would block every signing step (Switch wire 3.8, 7.1).
+#[tokio::test]
+async fn test_vectors_old_signer_closes_a_reduction_within_the_headroom() {
+    use pubky_switch_core::records::IdentityBody;
+    let mut old = old_signer().await;
+    let alice = old.key.public();
+    let limit = super::identity_limit().unwrap();
+    let renewed = AppCert::verify(&document("wallet certificate, renewed"), &alice).unwrap();
+    old.signer.state.certs.push(renewed.signed().clone());
+    let v3 = IdentityDoc::verify(&document("alice identity.json"), &alice).unwrap();
+    let renewing = IdentityDoc::verify(
+        &document("alice identity.json, wallet renewal in progress"),
+        &alice,
+    )
+    .unwrap();
+    // Closed entries enough to come near the cap, as the wallet's earlier certificates.
+    let listed = AppCert::verify(&document("wallet certificate"), &alice).unwrap();
+    let filler: Vec<RenewedCert> = (0..1_520u32)
+        .map(|n| {
+            let mut earlier = listed.body().clone();
+            earlier.issued_at -= u64::from(n) + 1;
+            let cert = AppCert::issue(&old.key, earlier).unwrap();
+            old.signer.state.certs.push(cert.signed().clone());
+            RenewedCert {
+                app_id: cert.app_id(),
+                cert: cert.hash(),
+                until: Some(VECTOR_START_MS),
+            }
+        })
+        .collect();
+    let size = |body: &IdentityBody| super::delivery_len(body.to_json().unwrap().len());
+    let padded = |pad: usize| {
+        let mut body = renewing.body().clone();
+        body.renewed.extend(filler.iter().copied());
+        body.inbox.url = format!("https://{}.switch.example", "a".repeat(pad));
+        body
+    };
+    let closing = |body: &IdentityBody| {
+        let mut next = body.clone();
+        next.version += 1;
+        for entry in &mut next.renewed {
+            entry.until.get_or_insert(VECTOR_START_MS);
+        }
+        next
+    };
+    // The closing lands within the headroom, under the cap.
+    let pad = (0..2_000)
+        .find(|pad| {
+            let bytes = size(&closing(&padded(*pad)));
+            bytes <= limit && bytes + 8 > limit
+        })
+        .expect("a padding that lands the closing within the headroom");
+    let four = IdentityDoc::sign(&old.key, padded(pad)).unwrap();
+    old.switch.deliver_identity(&four).unwrap();
+    old.signer
+        .delivered(
+            four.signed().clone(),
+            Some(v3.hash()),
+            Some(VECTOR_START_MS),
+        )
+        .await
+        .unwrap();
+    assert!(!old.signer.owed().unwrap().is_empty(), "a closing is owed");
+    old.signer.resume().await.unwrap();
+    assert!(
+        old.signer.owed().unwrap().is_empty(),
+        "the closing was delivered"
+    );
+    assert_eq!(old.signer.identity_doc().unwrap().unwrap().version(), 5);
+}
