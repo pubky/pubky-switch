@@ -273,7 +273,7 @@ impl Signer {
             self.state.taking_over = false;
             return Err(Refusal::StaleHandOver.into());
         }
-        let switch_removed: Vec<[u8; 16]> = removed_at_switch(&answer).collect();
+        let switch_removed: Vec<[u8; 16]> = removed_at_switch(&answer, &handed).collect();
         let tombstones = revoked_after(&records, &switch_removed);
         let view = BackupView::of(&records);
         let mut state = self.taken_records(&view, &answer, self.service()?, tombstones, Vec::new());
@@ -381,8 +381,8 @@ impl Signer {
         state.alerts.retain(|a| *a != Alert::KeyNotInstalled);
         // An identity taken over near the size a delivery may carry is told at once (Switch
         // wire 3.7, 7.1). Only an alert: a measure that fails never holds back the win.
-        if let Ok(bytes) = super::version_size(&state, &delivery.doc, Some(delivery.prev)) {
-            state.note_size(bytes);
+        if let Ok(nearest) = super::version_size(&state, &delivery.doc, Some(delivery.prev)) {
+            state.note_size(nearest.bytes, nearest.limit);
         }
         state.newest = Some(Newest {
             doc: delivery.doc,
