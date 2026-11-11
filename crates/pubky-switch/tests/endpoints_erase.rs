@@ -2480,3 +2480,132 @@ async fn test_erase_hash_of_an_older_version_at_a_later_account_is_conflict() {
     assert_eq!(erased.status, 200);
     replay.db.drop_database().await.expect("drop");
 }
+
+#[tokio::test]
+async fn test_erase_success_committed_before_it_isnt_signed_with_its_key() {
+    // A request that committed, and moved its key's mark, just before the erasure: its
+    // answer, signed once the erasure has finished, is the operator's, as for an account the
+    // service doesn't host, never signed with the erased key (7.4.16).
+    let Some(mut replay) = replay().await else {
+        return;
+    };
+    let gate = gated(&mut replay, true);
+    replay_chain_through_revoke(&replay).await;
+    gate.arm(0);
+    let request = signer_request(
+        "GET",
+        &format!("/v1/{}/apps", alice_id()),
+        Vec::new(),
+        ms(&revoke_time()),
+    );
+    let request_signature = signature_of(&request);
+    let answer = erased_meanwhile(&replay, &gate, request).await;
+    assert_eq!(code_of(&answer), (404, json!("not_found")));
+    assert!(no_head(&answer));
+    assert!(operator_signed(&answer, Some(&request_signature)));
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_erase_tombstone_read_committed_before_it_isnt_signed_with_its_key() {
+    // A claim read of a tombstone, whose answer is built under the lock, committed just
+    // before the erasure: as for an account the service doesn't host (7.4.16).
+    let Some(mut replay) = replay().await else {
+        return;
+    };
+    let gate = gated(&mut replay, true);
+    replay_chain_through_revoke(&replay).await;
+    let claim_key = settle_the_chains_claim(&replay).await;
+    gate.arm(0);
+    let keys = vectors("keys.json");
+    let request = app_request(
+        app(&keys, "wallet"),
+        "GET",
+        &format!(
+            "/v1/{}/claims/{}",
+            alice_id(),
+            pubky_switch_core::enc::b64(&claim_key)
+        ),
+        Vec::new(),
+        ms(&revoke_time()),
+    );
+    let request_signature = signature_of(&request);
+    let answer = erased_meanwhile(&replay, &gate, request).await;
+    assert_eq!(code_of(&answer), (404, json!("not_found")));
+    assert!(no_head(&answer));
+    assert!(operator_signed(&answer, Some(&request_signature)));
+    replay.db.drop_database().await.expect("drop");
+}
+
+/// The wallet settles the chain's claim with `done`, its own attempt's outcome, which
+/// compacts it to a tombstone (Switch wire 6.8): its claim key.
+async fn settle_the_chains_claim(replay: &Replay) -> Vec<u8> {
+    use pubky_switch_core::{
+        claims::{Basis, ClaimFields, ClaimType},
+        ops::{OpKind, OpsRequest, sign_batch},
+    };
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    let claim_key: Vec<u8> =
+        sqlx::query_scalar("SELECT claim_key FROM claims WHERE account_id = $1 LIMIT 1")
+            .bind(alice_id())
+            .fetch_one(&mut conn)
+            .await
+            .expect("a claim");
+    conn.close().await.expect("close");
+    let keys = vectors("keys.json");
+    let wallet = app(&keys, "wallet");
+    let at = ms(&revoke_time());
+    let path = format!(
+        "/v1/{}/claims/{}",
+        alice_id(),
+        pubky_switch_core::enc::b64(&claim_key)
+    );
+    let read = replay
+        .service
+        .handle(app_request(&wallet, "GET", &path, Vec::new(), at))
+        .await;
+    assert_eq!(read.status, 200, "{}", String::from_utf8_lossy(&read.body));
+    let view = body(&read)["claim"].clone();
+    let attempt_id = pubky_switch_core::enc::unb64(view["attempt_id"].as_str().expect("open"))
+        .expect("attempt id");
+    let done = ClaimFields {
+        claim_key: claim_key.clone(),
+        kind: ClaimType::Done,
+        expected_step: view["step"].as_u64().expect("step"),
+        attempt_id,
+        orphan_after: None,
+        deadline: None,
+        basis: Some(Basis::Owner),
+        evidence_ref: None,
+    };
+    let app_id = pubky_switch_core::enc::app_id_decode(wallet["app_id"].as_str().expect("id"))
+        .expect("app id");
+    let ops = sign_batch(
+        &ed25519_dalek::SigningKey::from_bytes(&hex32(&wallet["signing_secret_hex"])),
+        &hex32(&alice(&keys)["public_hex"]),
+        Some(app_id),
+        1,
+        [77; 16],
+        vec![(Vec::new(), OpKind::Claim(done))],
+    )
+    .expect("batch");
+    let answer = replay
+        .service
+        .handle(app_request(
+            &wallet,
+            "POST",
+            &format!("/v1/{}/ops", alice_id()),
+            OpsRequest::new(&ops, None).to_json(),
+            at,
+        ))
+        .await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    claim_key
+}
