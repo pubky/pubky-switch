@@ -2780,3 +2780,197 @@ async fn test_provider_loss_owed_own_version_judges_the_backup() {
         restored.install_id()
     );
 }
+
+/// A recovery's backup written while a revocation of the listed app is pending: the
+/// revocation never reached the lost service, the recovery's delivery never reached the new
+/// one. The signer, the new service and the router.
+async fn recovery_backed_up_with_a_revocation_pending(
+    world: &World,
+) -> (Signer, Arc<ScriptedSwitch>, Arc<Router>) {
+    let (mut signer, service, router) = lost_with_an_app(world, notes()).await;
+    signer
+        .revoke(notes_app_id(), None, confirmed())
+        .await
+        .unwrap_err();
+    service.fail_next(Fault::Unreachable {
+        path: "/identity".into(),
+        after: 0,
+    });
+    signer
+        .declare_provider_loss(NEW_ORIGIN, confirmed())
+        .await
+        .unwrap_err();
+    let backed_up = world.backup().identity_doc().clone();
+    assert!(backed_up.listed_cert(&notes_app_id()).is_some());
+    (signer, service, router)
+}
+
+/// The revocation of the listed app went to `origin`, and the version removing it is there.
+fn revoked_and_removed_at(world: &World, service: &ScriptedSwitch, router: &Router) {
+    let held = service.identity_doc().unwrap();
+    assert!(held.listed_cert(&notes_app_id()).is_none(), "not listed");
+    assert!(
+        held.body()
+            .removed
+            .iter()
+            .any(|r| r.app_id == notes_app_id())
+    );
+    assert!(
+        router
+            .log()
+            .iter()
+            .any(|line| line.contains(NEW_ORIGIN) && line.contains("/revoke")),
+        "revoked there"
+    );
+    assert_eq!(world.published().unwrap().hash(), held.hash());
+}
+
+#[tokio::test]
+async fn test_provider_loss_restore_on_a_new_install_keeps_a_pending_revocation() {
+    // Restored on a new install from that backup, the pending revocation is rebuilt from the
+    // tombstone the version still lists: the app is revoked at the new service once it takes
+    // the recovery, and the version removing it follows (Switch spec 12.2, 12.6 step 1, wire
+    // 3.13).
+    let world = World::new();
+    let (signer, service, router) = recovery_backed_up_with_a_revocation_pending(&world).await;
+    drop(signer);
+    for path in ["/apps", "/identity"] {
+        service.fail_next(Fault::Unreachable {
+            path: path.into(),
+            after: 0,
+        });
+    }
+    let mut restored = restored_from_the_backup(&world, &router).await;
+    assert!(restored.alerts().contains(&Alert::RevocationPending {
+        app_id: notes_app_id(),
+        at_switch: false
+    }));
+    restored.resume().await.unwrap();
+    assert!(restored.complete_removals().await.unwrap());
+    revoked_and_removed_at(&world, &service, &router);
+    assert!(
+        !restored
+            .alerts()
+            .iter()
+            .any(|a| matches!(a, Alert::RevocationPending { .. }))
+    );
+}
+
+#[tokio::test]
+async fn test_provider_loss_restore_in_place_keeps_a_pending_revocation() {
+    // The same in place: the new service refused the recovery's version once its backup was
+    // written, and the install restores from it. The revocation it asked for stays as it
+    // was, and is completed at the new service (Switch spec 12.2, wire 3.13).
+    let world = World::new();
+    let (mut signer, service, router) = lost_with_an_app(&world, notes()).await;
+    let picked = world.clock.now_ms() - 5_000;
+    signer
+        .revoke(notes_app_id(), Some(picked), confirmed())
+        .await
+        .unwrap_err();
+    service.fail_next(Fault::Error {
+        path: "/identity".into(),
+        code: pubky_switch_core::http::ErrorCode::BadRequest,
+        current: serde_json::Value::Null,
+    });
+    signer
+        .declare_provider_loss(NEW_ORIGIN, confirmed())
+        .await
+        .unwrap_err();
+    assert!(
+        world
+            .backup()
+            .identity_doc()
+            .listed_cert(&notes_app_id())
+            .is_some()
+    );
+    signer.restore(confirmed()).await.unwrap();
+    assert!(signer.complete_removals().await.unwrap());
+    revoked_and_removed_at(&world, &service, &router);
+    let removed = service.identity_doc().unwrap().body().removed.clone();
+    assert_eq!(
+        removed
+            .iter()
+            .find(|r| r.app_id == notes_app_id())
+            .map(|r| r.distrust_from),
+        Some(picked),
+        "the time the user picked"
+    );
+}
+
+#[tokio::test]
+async fn test_restore_keeps_a_revocation_asked_for_before_any_loss() {
+    // A revocation the switch didn't take, then a later version backed up with its
+    // tombstone: a new install restored from that backup completes the revocation (Switch
+    // spec 12.2, wire 3.13).
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let app = App::new(&["notes"], None, [9; 32]);
+    world.approve(&mut signer, &app).await;
+    let id = app.keys.app_id_bytes();
+    world.switch.fail_next(Fault::Unreachable {
+        path: "/revoke".into(),
+        after: 0,
+    });
+    signer.revoke(id, None, confirmed()).await.unwrap_err();
+    signer.set_record_max_age(Some(9)).await.unwrap();
+    assert!(world.backup().identity_doc().listed_cert(&id).is_some());
+    drop(signer);
+    let mut restored = Signer::restore_new(
+        world.env(Arc::new(MemoryStore::new())),
+        world.keyring(),
+        confirmed(),
+    )
+    .await
+    .unwrap();
+    assert!(restored.complete_removals().await.unwrap());
+    let held = world.switch.identity_doc().unwrap();
+    assert!(held.listed_cert(&id).is_none());
+    assert!(held.body().removed.iter().any(|r| r.app_id == id));
+}
+
+#[tokio::test]
+async fn test_restore_leaves_a_removed_apps_tombstone_alone() {
+    // A tombstone in the backup for an app the version no longer lists, its removal signed
+    // already: a restore revokes nothing again and lists nothing again (Switch spec 12.2, wire
+    // 3.13).
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let app = App::new(&["notes"], None, [9; 32]);
+    world.approve(&mut signer, &app).await;
+    let id = app.keys.app_id_bytes();
+    signer.revoke(id, None, confirmed()).await.unwrap();
+    drop(signer);
+    let revokes = |world: &World| {
+        world
+            .transport
+            .requests()
+            .iter()
+            .filter(|r| r.path_and_query.ends_with("/revoke"))
+            .count()
+    };
+    let before = revokes(&world);
+    let mut restored = Signer::restore_new(
+        world.env(Arc::new(MemoryStore::new())),
+        world.keyring(),
+        confirmed(),
+    )
+    .await
+    .unwrap();
+    assert!(!restored.complete_removals().await.unwrap());
+    assert_eq!(revokes(&world), before, "not revoked again");
+    assert!(
+        world
+            .switch
+            .identity_doc()
+            .unwrap()
+            .listed_cert(&id)
+            .is_none()
+    );
+    assert!(
+        !restored
+            .alerts()
+            .iter()
+            .any(|a| matches!(a, Alert::RevocationPending { .. }))
+    );
+}

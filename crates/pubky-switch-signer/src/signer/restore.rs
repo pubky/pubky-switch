@@ -40,7 +40,7 @@ use super::{Signer, gate};
 use crate::alert::Alert;
 use crate::error::{Refusal, Result, SignerError};
 use crate::key::{BackupView, IdentityKeyring};
-use crate::state::{self, DeliverStep, Flow, Newest, Service, SignerState};
+use crate::state::{self, DeliverStep, Flow, Newest, Revoking, Service, SignerState};
 
 impl Signer {
     /// Set up this install from the signer backup on the Homeserver, for an identity whose
@@ -180,8 +180,25 @@ impl Signer {
             Vec::new()
         };
         let mut state = self.taken_records(&view, &answer, service, tombstones, cleanup);
+        // In place, the revocations this install asked for stay as they were, with the time
+        // the user picked and their alerts; those only the backup names are added.
         if in_place {
-            state.revoking.clone_from(&self.state.revoking);
+            for carried in &self.state.revoking {
+                if let Some(rebuilt) = state
+                    .revoking
+                    .iter_mut()
+                    .find(|r| r.app_id == carried.app_id)
+                {
+                    rebuilt.clone_from(carried);
+                    state.alerts.retain(|alert| {
+                        !matches!(alert, Alert::RevocationPending { app_id, at_switch: false }
+                            if *app_id == carried.app_id)
+                            || self.state.alerts.contains(alert)
+                    });
+                } else {
+                    state.revoking.push(carried.clone());
+                }
+            }
         }
         // A backup written mid-recovery holds the recovery's version, which the service it
         // names doesn't hold yet: the recovery is in progress again, delivered first, and
@@ -339,6 +356,30 @@ impl Signer {
             .copied()
             .filter(|app| doc.listed_cert(app).is_none() && !state.cleanup.contains(app))
             .collect();
+        // A revocation the records named but no version carried out yet: its App ID is a
+        // tombstone the document still lists. It is pending again, sent to the switch and
+        // completed by the version removing the app, its alert shown meanwhile (Switch spec
+        // 12.2). The time the user may have picked to distrust it from isn't in the records,
+        // so the switch's revocation time is the one it gets.
+        for app_id in view
+            .revoked_apps
+            .iter()
+            .copied()
+            .filter(|app| doc.listed_cert(app).is_some())
+        {
+            if !state.revoking.iter().any(|r| r.app_id == app_id) {
+                state.revoking.push(Revoking {
+                    app_id,
+                    distrust_from: None,
+                    revoked_at: None,
+                    taken: false,
+                });
+                state.alert(Alert::RevocationPending {
+                    app_id,
+                    at_switch: false,
+                });
+            }
+        }
         state.tombstones = tombstones;
         state
     }

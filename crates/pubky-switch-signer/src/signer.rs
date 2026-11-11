@@ -319,16 +319,6 @@ impl Signer {
             if self.state.erased {
                 return Ok(());
             }
-            // Right after a recovery's delivery, before its publication, which is how apps
-            // find the new service: the revocations its version still lists go there, so no
-            // app revoked is current there meanwhile. The version removing them follows
-            // (Switch spec 12.6 step 1).
-            if self.state.revoke_at_service {
-                self.revoke_at_switch().await?;
-                let mut state = self.state.clone();
-                state.revoke_at_service = false;
-                self.commit(state, self.flow.clone()).await?;
-            }
             // A restore's recovery taken after the restore: the version naming this install
             // comes next, as the restore would have signed it (Switch wire 3.13), after the
             // copies a restore checks first. The switch's is the version just delivered. The
@@ -339,6 +329,16 @@ impl Signer {
                 self.check_before_own_version().await?;
                 self.sign_own_version().await?;
                 continue;
+            }
+            // Right after a recovery's delivery, before its publication, which is how apps
+            // find the new service: the revocations its version still lists go there, so no
+            // app revoked is current there meanwhile. The version removing them follows
+            // (Switch spec 12.6 step 1).
+            if self.state.revoke_at_service {
+                self.revoke_at_switch().await?;
+                let mut state = self.state.clone();
+                state.revoke_at_service = false;
+                self.commit(state, self.flow.clone()).await?;
             }
             // While a hand-over is in progress nothing routine is signed: its own step only,
             // and owed work stays owed (Switch wire 3.12).
