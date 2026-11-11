@@ -89,19 +89,34 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
   write of its own; its commit also keeps a service time not yet committed), so no later
   entry of the live store takes it.
 
-- **A backup carries the outbox:** every `out/` record but those refused for good, as it
-  stands, and the time the backup was taken, the app's clock; both kinds of backup read it
-  from the store, a layered one in the same moment as the rest. A restore writes them back
-  in its one commit, so a message queued before the backup goes after the restore with the
-  same `msg_id`, signed plaintext and last sealed envelope. One the device the backup came
-  from delivered since is sent again: the recipient's switch answers a retry of the same
-  envelope with its first answer while it holds the entry (Switch wire 7.4.3 step 1), and
-  the recipient's apps drop a copy taken as new by its processed pair, kept at least 30
-  days from the first acceptance plus the clock tolerance (Switch spec 11). So a restore
-  more than `SENT_RETENTION_MS` (30 days) after the backup, by the restoring device's
-  clock, writes back no delivery still owed: a message never accepted is left out, one
-  accepted before keeps only its record job, and each keeps a `MessageUndelivered` duty
-  event in the restore's commit. `sent/` and `sentt/` aren't carried, so a restored app
+- **A backup carries the outbox:** every `out/` record as it stands, a message refused for
+  good included, so the restored app reports it failed until it is forgotten; oldest queued
+  first, within `MAX_CARRIED_OUTBOX_BYTES` (8 MiB), so the restore's one commit fits, the
+  messages past it named so the restore keeps a `MessageUndelivered` duty event for each;
+  and the backup's time, the device's and the highest service time verified then. Both
+  kinds of backup read it from the store, a layered one in the same moment as the rest, and
+  both check that the restore fits one commit before they return. A restore writes the
+  records back in its one commit, so a message queued before the backup goes after the
+  restore with the same `msg_id`, signed plaintext and last sealed envelope.
+- **A restored delivery has a replay deadline** (`replay_until_ms` on its record): the
+  backup's verified service time, or its device time without one, less the clock tolerance,
+  plus `SENT_RETENTION_MS` (30 days), or a message's first acceptance plus 30 days when it
+  was accepted before, whichever is earlier, and never later than one it carries already.
+  A copy the device the backup came from delivered since is harmless until then: the
+  recipient's switch answers a retry of the same envelope with its first answer while it
+  holds the entry (Switch wire 7.4.3 step 1), and the recipient's apps drop a copy taken as
+  new by its processed pair, kept 30 days and the tolerance from processing, which is at or
+  after the first acceptance (Switch spec 11). Every try checks it before the delivery, at
+  the later of the device clock and a service time verified in the call, which a one-item
+  feed read fetches when the device clock says the deadline hasn't passed: past it the
+  delivery is given up in one commit with a `MessageUndelivered` duty event, a message never
+  accepted deleted, one accepted before kept for its owed record job, its sealed envelope
+  dropped. A later backup carries the deadline and a later restore keeps the earlier of it
+  and its own.
+- **A backup doesn't carry `opq/`, `sent/` or `sentt/`.** A kept batch's messages go into
+  the outbox only with the batch's answer, so a restored app neither sends the batch nor
+  delivers the messages it would have queued; the restore's reconcile mode reads the shared
+  records and claims, and the protocol queues what it still owes again. A restored app
   answers re-send requests only for what it delivers after the restore.
 
 ## Keys

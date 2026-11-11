@@ -104,9 +104,9 @@ pub use records::{
     SharedRecord, Unopened,
 };
 pub use send::{
-    Delivery, OutboxReport, OutgoingMessage, RecordJob, SENT_RETENTION_MS, SentMessage,
-    SignedMessage, UNDELIVERABLE_MAX_MS, UNDELIVERABLE_MS, UNDELIVERABLE_TRIES,
-    UNDELIVERABLE_TRY_SPACING_MS, UndeliverableReason,
+    Delivery, MAX_CARRIED_OUTBOX_BYTES, OutboxReport, OutgoingMessage, RecordJob,
+    SENT_RETENTION_MS, SentMessage, SignedMessage, UNDELIVERABLE_MAX_MS, UNDELIVERABLE_MS,
+    UNDELIVERABLE_TRIES, UNDELIVERABLE_TRY_SPACING_MS, UndeliverableReason,
 };
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -347,9 +347,16 @@ pub struct AppBackup {
     /// delivery is owed only within [`SENT_RETENTION_MS`] of it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     taken_ms: Option<u64>,
-    /// The outbox (`out/`), but for the messages refused for good (`send::carried_outbox`).
+    /// The highest service time the app had verified when the backup was taken, the base of
+    /// the outbox's replay deadline in place of `taken_ms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    taken_service_ms: Option<u64>,
+    /// The outbox (`out/`), oldest first, within its byte budget (`send::carried_outbox`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     outbox: Vec<send::OutboxItem>,
+    /// The messages of the outbox left out past the budget, and whether each is a re-send.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    outbox_left_out: Vec<(String, bool)>,
     /// The protocol's layer, if it added one; absent from the bytes otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     protocol: Option<LayerOut>,
@@ -459,6 +466,15 @@ enum Restorable {
     Ready(Box<App>, Tx),
     TooLarge(AppError),
     CarriedTooLarge { duty_events: u64, owed_calls: u64 },
+}
+
+/// How a restore's build treats the protocol's check of its layer: in full, for a restore
+/// and a layered backup, or, for a plain backup's own check, only for the sizes, a refusal
+/// counting as no layer writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LayerCheck {
+    Full,
+    SizesOnly,
 }
 
 /// The error of building a restore's commit: [`Restorable::TooLarge`] for writes over the
@@ -1026,6 +1042,21 @@ impl App {
         }
         let mut backup = Self::backup_of(&self.state)?;
         self.carry_outbox(&self.reader(), &mut backup).await?;
+        // The restore is built, not committed, as for a layered backup: one that can never
+        // be installed is refused now.
+        // A protocol may refuse to restore without its layer, its host restoring from a
+        // layered backup: the sizes are checked with no layer writes then.
+        let restorable = Self::restore_commit(
+            self.env.clone(),
+            Arc::clone(&self.protocol),
+            self.config.clone(),
+            &backup,
+            LayerCheck::SizesOnly,
+        )
+        .await?;
+        if let Restorable::TooLarge(error) = restorable {
+            return Err(error);
+        }
         Ok(backup)
     }
 
@@ -1074,41 +1105,53 @@ impl App {
             bundle: state.bundle.clone(),
             stored_next: state.next_stored_id,
             taken_ms: None,
+            taken_service_ms: None,
             outbox: Vec::new(),
+            outbox_left_out: Vec::new(),
             protocol: None,
         })
     }
 
     /// Put a backup's outbox back, in the restore's commit `tx` (Switch spec 11, 12.4): every
-    /// message as the backup holds it, within [`SENT_RETENTION_MS`] of the backup by this
-    /// device's clock. Past it a message the device the backup came from delivered since
-    /// could reach a recipient that no longer holds its processed pair, so its delivery is
-    /// given up and the protocol told, in the same commit; a record job still owed stays.
+    /// message as the backup holds it, each owed delivery with its replay deadline
+    /// ([`send::OutboxItem::replay_until`]), from the backup's verified service time, or its
+    /// device time without one, less the clock tolerance. The deadline is checked at every
+    /// try, not here. The messages the backup left out past its budget are told to the
+    /// protocol as undelivered, in the same commit.
     fn reinstall_outbox(&mut self, backup: &AppBackup, tx: &mut Tx) -> Result<(), AppError> {
-        let now = self.now();
-        let within = backup
-            .taken_ms
-            .is_some_and(|taken| now <= taken.saturating_add(SENT_RETENTION_MS));
+        let baseline = backup
+            .taken_service_ms
+            .or(backup.taken_ms)
+            .unwrap_or(0)
+            .saturating_sub(CLOCK_TOLERANCE_MS);
         for item in &backup.outbox {
-            if within || !item.delivery_owed() {
-                send::put_outbox_item(tx, item)?;
-                continue;
+            let mut item = item.clone();
+            if item.delivery_owed() {
+                item.replay_until(baseline);
             }
-            let (kept, duty) = item.clone().give_up_delivery();
-            if let Some(kept) = &kept {
-                send::put_outbox_item(tx, kept)?;
-            }
-            self.keep_duty(tx, duty)?;
+            send::put_outbox_item(tx, &item)?;
+        }
+        for (msg_id, resend) in &backup.outbox_left_out {
+            self.keep_duty(
+                tx,
+                events::Duty::MessageUndelivered {
+                    msg_id: msg_id.clone(),
+                    resend: *resend,
+                },
+            )?;
         }
         Ok(())
     }
 
-    /// Put the outbox in `backup`, as `reader` holds it, with the backup's time (Switch spec
-    /// 11): every message the app still owes a job, so a restore delivers what was queued
-    /// before the backup with the same `msg_id` and bytes.
+    /// Put the outbox in `backup`, as `reader` holds it, with the backup's times (Switch
+    /// spec 11): every message the app still owes a job, so a restore delivers what was
+    /// queued before the backup with the same `msg_id` and bytes.
     async fn carry_outbox(&self, reader: &Reader, backup: &mut AppBackup) -> Result<(), AppError> {
         backup.taken_ms = Some(self.now());
-        backup.outbox = send::carried_outbox(reader).await?;
+        backup.taken_service_ms = self.state.service_time.map(|time| time.highest_ms);
+        let carried = send::carried_outbox(reader).await?;
+        backup.outbox = carried.items;
+        backup.outbox_left_out = carried.left_out;
         Ok(())
     }
 
@@ -1260,6 +1303,7 @@ impl App {
                 Arc::clone(&self.protocol),
                 self.config.clone(),
                 &backup,
+                LayerCheck::Full,
             )
             .await?;
             if let Restorable::TooLarge(error) = restorable {
@@ -1322,7 +1366,7 @@ impl App {
         backup: &AppBackup,
     ) -> Result<App, AppError> {
         Box::pin(async move {
-            match Self::restore_commit(env, protocol, config, backup).await? {
+            match Self::restore_commit(env, protocol, config, backup, LayerCheck::Full).await? {
                 Restorable::Ready(app, tx) => {
                     tx.commit(&app.env.store).await?;
                     let mut app = *app;
@@ -1353,6 +1397,7 @@ impl App {
         protocol: Arc<dyn Protocol>,
         config: AppConfig,
         backup: &AppBackup,
+        layer_check: LayerCheck,
     ) -> Result<Restorable, AppError> {
         Box::pin(async move {
             let meta = backup.meta.clone();
@@ -1428,12 +1473,15 @@ impl App {
             // The protocol checks its layer against the identity's naming key, the one the
             // restored app goes on with, before anything is written.
             let restoring = RestoreContext::new(meta.identity, meta.app_id, &backup.naming, &cert);
-            let layer_writes =
-                protocol
-                    .restore_layer(layer.as_ref(), &restoring)
-                    .map_err(|why| {
-                        AppError::InvalidData(format!("the backup's protocol layer: {why}"))
-                    })?;
+            let layer_writes = match protocol.restore_layer(layer.as_ref(), &restoring) {
+                Ok(writes) => writes,
+                Err(_) if layer_check == LayerCheck::SizesOnly => Vec::new(),
+                Err(why) => {
+                    return Err(AppError::InvalidData(format!(
+                        "the backup's protocol layer: {why}"
+                    )));
+                }
+            };
             let (seen, parked, processed) = match &backup.protocol {
                 Some(layer) => (
                     layer.seen.iter().copied().collect::<BTreeSet<u64>>(),
