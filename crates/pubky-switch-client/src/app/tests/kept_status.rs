@@ -3,13 +3,14 @@
 //! change it records, and answered by the batch ID, its attempt and its queued message for
 //! the retention after (Switch spec 6.4, 12.5 "Kept batches"; Switch wire 6.4 step 5).
 
+use ed25519_dalek::SigningKey;
 use pubky_switch_core::ops::{Condition, RecordVersion};
-use pubky_switch_core::records::Inbox;
+use pubky_switch_core::records::{Freeze, FreezeBody, Inbox};
 use pubky_switch_core::scopes::Permission;
 
 use super::moves::{
-    ATTEMPT, CLAIM, NEXT, Router, allow_ops_for, change_key, contact_batch, freeze_for, has,
-    join_on, next_key, publish_at,
+    ATTEMPT, CLAIM, NEXT, Router, allow_ops_for, change_key, contact_batch, has, join_on, next_key,
+    publish_at,
 };
 use super::*;
 use crate::app::{
@@ -18,6 +19,9 @@ use crate::app::{
 };
 use crate::store::{Fault as StoreFault, FaultStore};
 use crate::testing::Fault;
+
+/// A third service's origin.
+const THIRD: &str = "https://third.example";
 
 fn carol() -> [u8; 32] {
     IdentityKey::from_secret(seed("carol/identity")).public()
@@ -451,52 +455,179 @@ async fn test_kept_batch_status_end_is_forgotten_at_its_retention() {
     assert_eq!(end_keys(&app).await, 0);
 }
 
-/// A batch signed again under a new wire ID, applied by the service whose answer was lost,
-/// then a move away from that service: the old chain holds its wire ID, so it is settled
-/// applied, under the ID it was kept under, and never signed or applied again.
-#[tokio::test]
-async fn test_kept_batch_status_signed_again_and_applied_is_found_in_the_old_chain() {
-    let (w, router, id, signed, changed, mut app) = signed_again_then_crash(false).await;
-    // The batch's first send at generation 2 is cut off.
-    changed.fail_next(Fault::Unreachable {
-        path: "ops".into(),
-        after: 1,
-    });
-    let _ = app.receive(None).await;
-    changed.lock().faults.clear();
-    assert_eq!(allow_ops_for(&changed.applied(), carol()), 0);
-    // Sent again, applied there, and its answer lost.
-    changed.fail_next(Fault::LoseAnswer { path: "ops".into() });
-    let _ = app.receive(None).await;
-    assert_eq!(allow_ops_for(&changed.applied(), carol()), 1);
-    let Some(KeptBatchStatus::Kept {
-        wire_batch_id,
-        sent_at_ms: Some(_),
-    }) = app.kept_batch(id).await.unwrap()
-    else {
-        panic!("kept, sent");
-    };
-    assert_ne!(wire_batch_id, id);
-    // The account moves on from generation 2 to the next service.
-    let n_key = next_key();
-    changed.freeze(&freeze_for(&w, &n_key, 3)).unwrap();
-    let next = changed.import_into(n_key.to_bytes());
-    router.add(NEXT, &next);
+/// The signer's freeze naming `next` at `origin`, for `next_generation`.
+fn freeze_to(w: &World, origin: &str, next: &SigningKey, next_generation: u64) -> Freeze {
+    Freeze::sign(
+        &w.alice,
+        FreezeBody {
+            identity: w.alice.public(),
+            inbox: Inbox::new(origin, next.verifying_key().to_bytes()),
+            next_generation,
+            issued_at: w.clock.now_ms(),
+            nonce: [next_generation as u8; 16],
+        },
+    )
+    .unwrap()
+}
+
+/// The service an account moves to: its origin, its key and the generation it serves.
+struct Hop<'a> {
+    origin: &'a str,
+    key: &'a SigningKey,
+    generation: u64,
+}
+
+/// Follow a move of `from` to `to`: frozen, imported, published, `faults` set at the next
+/// service, and `reads` reads after. Returns the next service and the reads' events.
+async fn moved(
+    w: &World,
+    router: &Router,
+    app: &mut App,
+    from: &ScriptedSwitch,
+    to: Hop<'_>,
+    faults: Vec<Fault>,
+    reads: usize,
+) -> (Arc<ScriptedSwitch>, Vec<AppEvent>) {
+    let Hop {
+        origin,
+        key,
+        generation,
+    } = to;
+    from.freeze(&freeze_to(w, origin, key, generation)).unwrap();
+    let next = from.import_into(key.to_bytes());
+    router.add(origin, &next);
     let _ = app.receive(None).await;
     publish_at(
-        &w,
+        w,
         &next,
-        Inbox::new(NEXT, n_key.verifying_key().to_bytes()),
-        3,
+        Inbox::new(origin, key.verifying_key().to_bytes()),
+        generation,
         None,
     );
+    for fault in faults {
+        next.fail_next(fault);
+    }
     let mut events = Vec::new();
-    for _ in 0..3 {
+    for _ in 0..reads {
         if let Ok(report) = app.receive(None).await {
             events.extend(report.events);
         }
     }
-    assert_eq!(app.cursor().generation, 3);
+    if reads > 0 {
+        assert_eq!(app.cursor().generation, generation);
+    }
+    (next, events)
+}
+
+/// How many times `switch` applied [`attempt`].
+fn attempts_at(switch: &ScriptedSwitch) -> usize {
+    switch
+        .applied()
+        .iter()
+        .filter(|op| {
+            matches!(&op.body().kind, OpKind::Claim(claim)
+                if claim.check().is_ok_and(|entry| entry.attempt_id == ATTEMPT))
+        })
+        .count()
+}
+
+/// A batch signed again under a new wire ID at a move, applied at the next service with its
+/// answer lost, then a move on from there before it is sent again: the old chain holds its
+/// wire ID, so it is settled applied from the chain, under the ID it was kept under, and
+/// never signed or applied again. The app follows without `lists.read`, so a follow sends no
+/// kept batch of its own: a read sends it before its feed, and goes on when that fails.
+#[tokio::test]
+async fn test_kept_batch_status_signed_again_and_applied_is_found_in_the_old_chain() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join_on(
+        &w,
+        &router,
+        Arc::clone(&w.store) as Arc<dyn StateStore>,
+        w.protocol.clone(),
+        &[
+            Permission::ClaimsRead,
+            Permission::ClaimsWrite,
+            Permission::ConversationAdd,
+        ],
+    )
+    .await;
+    w.switch.fail_next(Fault::Unreachable {
+        path: "feed".into(),
+        after: 0,
+    });
+    w.switch.fail_next(Fault::Unreachable {
+        path: "ops".into(),
+        after: 0,
+    });
+    let body = json!({ "text": "kept" }).as_object().unwrap().clone();
+    let signed = app
+        .sign_message(OutgoingMessage::new(w.bob.public(), "sample.note", body))
+        .unwrap();
+    let batch = OpBatch::new()
+        .op(ClaimOp::attempt(CLAIM, 0, ATTEMPT, 3600, None).kind())
+        .queue(signed.clone());
+    let id = app
+        .submit_batch(batch)
+        .await
+        .unwrap_err()
+        .kept_batch()
+        .unwrap();
+    w.switch.lock().faults.clear();
+    // A move seen frozen signs it again for generation 2, never sent at 1; the read's own
+    // send of it there loses its answer, applied.
+    let (next, _) = moved(
+        &w,
+        &router,
+        &mut app,
+        &w.switch,
+        Hop {
+            origin: NEXT,
+            key: &next_key(),
+            generation: 2,
+        },
+        Vec::new(),
+        0,
+    )
+    .await;
+    // The read that follows it sends the registration, then the batch, whose answer is
+    // lost; the read goes on to the feed, which shows the batch applied.
+    next.fail_next(Fault::LoseAnswerAfter {
+        path: "ops".into(),
+        after: 1,
+    });
+    let report = app.receive(None).await.unwrap();
+    assert_eq!(app.cursor().generation, 2);
+    assert!(has(&report.events, |e| matches!(
+        e,
+        AppEvent::KeptBatchesWaiting { kept: 1, .. }
+    )));
+    let status = app.kept_batch(id).await.unwrap();
+    let Some(KeptBatchStatus::Kept {
+        wire_batch_id,
+        sent_at_ms: Some(_),
+    }) = status
+    else {
+        panic!("kept and sent: {status:?}");
+    };
+    assert_ne!(wire_batch_id, id);
+    assert_eq!(attempts_at(&next), 1);
+    // A move on from generation 2 before any read sends it again.
+    let third = SigningKey::from_bytes(&seed("service/alice/third"));
+    let (last, events) = moved(
+        &w,
+        &router,
+        &mut app,
+        &next,
+        Hop {
+            origin: THIRD,
+            key: &third,
+            generation: 3,
+        },
+        Vec::new(),
+        3,
+    )
+    .await;
     assert!(
         has(
             &events,
@@ -509,6 +640,5 @@ async fn test_kept_batch_status_signed_again_and_applied_is_found_in_the_old_cha
         matches!(found.status, KeptBatchStatus::Applied { .. }),
         "{found:?}"
     );
-    app.submit_batch(contact_batch([7; 32])).await.unwrap();
-    assert_eq!(allow_ops_for(&next.applied(), carol()), 0);
+    assert_eq!(attempts_at(&last), 0);
 }
