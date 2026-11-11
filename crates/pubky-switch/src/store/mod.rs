@@ -39,7 +39,9 @@ use sqlx::{
     postgres::{PgConnectOptions, PgPoolOptions},
 };
 
-pub use account::{AccountHead, AccountTxn, CommitError, Committed, NewAccount, Savepoint};
+pub use account::{
+    AccountHead, AccountTxn, CommitError, Committed, ErasedKeys, NewAccount, Savepoint,
+};
 pub use apps::{AppsView, KeptAppId, KeptReason, OpenAttempt, PartSpan, newly_listed};
 pub use chain::NewChainItem;
 pub use feed::{AppDocs, CurrentDocs, FeedRow, FeedSnapshot, PageReader};

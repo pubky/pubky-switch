@@ -161,6 +161,11 @@ impl<K: Eq + Hash> KeyedMinutes<K> {
         self.state.lock().windows.len()
     }
 
+    /// Forget every count whose key matches `remove`, as an erasure does.
+    pub fn forget(&self, remove: impl Fn(&K) -> bool) {
+        self.state.lock().windows.retain(|key, _| !remove(key));
+    }
+
     /// Whether nothing is counted.
     pub fn is_empty(&self) -> bool {
         self.len() == 0

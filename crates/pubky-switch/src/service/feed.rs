@@ -22,7 +22,7 @@ use super::{
 use crate::{
     changes::ChangeHub,
     http::error::{ApiError, ErrorCode},
-    keys::{KeyId, Mark, ServiceSigner, sign_head},
+    keys::{KeyId, KeyStoreError, Mark, ServiceSigner, sign_head},
     store::{CurrentDocs, FeedRow, FeedSnapshot, PageReader, StoreError},
 };
 
@@ -723,11 +723,19 @@ impl Service {
         signer: &ServiceSigner,
     ) -> Result<Answered, FeedStop> {
         let fallback = |error: ApiError, time_ms| FeedStop::refused(error, true, time_ms);
-        let mark = self
-            .keys
-            .mark(&read.service_key)
-            .await
-            .map_err(|_| fallback(temporary(), read.time_ms))?;
+        let mark = match self.keys.mark(&read.service_key).await {
+            Ok(mark) => mark,
+            // An erasure deletes the account, then its key (Switch wire 7.4.16): a read that
+            // waited on an account erased meanwhile answers as for one the service doesn't
+            // host (7.3 step 2).
+            Err(KeyStoreError::NotFound) => {
+                return Err(match self.store.lookup(&read.account).await {
+                    Ok(None) => FeedStop::Gone,
+                    _ => fallback(temporary(), read.time_ms),
+                });
+            }
+            Err(_) => return Err(fallback(temporary(), read.time_ms)),
+        };
         let budget = usize::try_from(self.limits.max_page_bytes).unwrap_or(usize::MAX);
         let mut builder = PageBuilder::with(
             Reader::Checked {

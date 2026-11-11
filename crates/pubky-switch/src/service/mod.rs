@@ -12,8 +12,8 @@
 //! `GET /v1/{id}/identity`, `POST /v1/{id}/ops`, `GET /v1/{id}/feed`,
 //! `POST /v1/{id}/inbox`, `PUT /v1/{id}/peers`, `GET /v1/{id}/claims/{claim_key}`,
 //! `GET /v1/{id}/apps`, `POST /v1/{id}/apps/{app_id}/revoke`, `GET /v1/{id}/directory`,
-//! `GET` and `POST /v1/{id}/apps/{app_id}/keys`, and `POST /v1/{id}/apps/{app_id}/leave`.
-//! Every other call is answered `503 unavailable`.
+//! `GET` and `POST /v1/{id}/apps/{app_id}/keys`, `POST /v1/{id}/apps/{app_id}/leave`, and
+//! `POST /v1/{id}/erase`. Every other call is answered `503 unavailable`.
 
 mod admission;
 mod app_keys;
@@ -22,6 +22,7 @@ pub mod batch;
 mod claims;
 mod directory;
 mod enroll;
+mod erase;
 mod feed;
 mod identity;
 mod inbox;
@@ -124,6 +125,9 @@ enum Deferred {
     Claim(claims::ClaimRead),
     /// A feed page, after its long-poll.
     Feed(Box<feed::FeedRead>),
+    /// The account's erasure, once its answer is signed (Switch wire 7.4.16): not a read,
+    /// but done in place of the commit.
+    Erase,
 }
 
 impl Answer {
@@ -375,7 +379,7 @@ impl Service {
             }
             // The signer is verified here; an own app under the lock, with the key the
             // account holds for it (Switch wire 7.2).
-            Call::Revoke(_) | Call::GetApps => {
+            Call::Revoke(_) | Call::GetApps | Call::Erase => {
                 match self
                     .authenticate_signer(&account, &request, base_ms, base_ms.max(stamped_ms))
                     .await
@@ -699,7 +703,8 @@ impl Service {
                 // (Switch wire 7.1), except where the key's mark refuses one.
                 // Not to an app of another identity, which no answer shows the head.
                 let own = caller.is_some_and(|c| !matches!(c.caller, Caller::OtherApp { .. }));
-                let head = if own && head {
+                // No answer to an erasure carries one, an error included (7.4.16).
+                let head = if own && head && request.route.call != Call::Erase {
                     self.head(&txn, &signer).await
                 } else {
                     None
@@ -709,6 +714,11 @@ impl Service {
         };
         // A read answered once the lock is gone answers a refusal with the head this request
         // commits, as every refusal to a verified caller carries one (Switch wire 7.1).
+        if matches!(answer.deferred, Some(Deferred::Erase)) {
+            return self
+                .finish_erasure(txn, &signer, signature, committed_ms, time_ms, answer)
+                .await;
+        }
         let txn_account = txn.head().id.clone();
         let fallback_head = if answer.deferred.is_some() {
             self.head(&txn, &signer).await
@@ -766,7 +776,8 @@ impl Service {
                             }
                         };
                     }
-                    None => {}
+                    // An erasure was answered before the commit, above.
+                    Some(Deferred::Erase) | None => {}
                 }
                 sign_answer(&signer, signature, time_ms, answer)
             }
@@ -814,7 +825,8 @@ impl Service {
 
         // A serving account whose state is behind its key's mark fails stop, with no head
         // (step 10).
-        if serving {
+        // An erasure is exempt: its answer carries no head (step 10, 7.4.16).
+        if serving && *call != Call::Erase {
             match txn.mark_check(self.keys.as_ref()).await {
                 Ok(MarkCheck::Behind | MarkCheck::Fork) => {
                     return Err(Refused {
@@ -879,7 +891,12 @@ impl Service {
         }
         // A call only the signer makes, from an own app that verified: refused with the head
         // (Switch wire 7.4, 7.1).
-        if writer.is_some() && matches!(call, Call::PutIdentity | Call::Revoke(_) | Call::GetApps) {
+        if writer.is_some()
+            && matches!(
+                call,
+                Call::PutIdentity | Call::Revoke(_) | Call::GetApps | Call::Erase
+            )
+        {
             return Err(Refused::with_head(
                 ApiError::new(
                     ErrorCode::PermissionMissing,
@@ -1108,6 +1125,15 @@ impl Service {
                     .await
                     .map(|answer| (answer, serving))
                     .map_err(|error| Refused::with_head(error, serving));
+            }
+            Call::Erase => {
+                return Self::erase_answer(signer, &request.body)
+                    .map(|answer| (answer, false))
+                    .map_err(|error| Refused {
+                        error,
+                        serving,
+                        head: false,
+                    });
             }
             Call::Revoke(app_id) => {
                 return self
