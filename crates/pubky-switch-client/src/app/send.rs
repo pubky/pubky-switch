@@ -272,6 +272,11 @@ pub enum Delivery {
         tries: u64,
         /// The last failure, without content.
         last_error: Option<String>,
+        /// When a delivery was first answered `403 not_admitted`, or `403 not_current`,
+        /// which the app counts with it, app clock: the start of the time the message stays
+        /// queued so before it is given up ([`UNDELIVERABLE_MS`], Switch spec 11). `None`
+        /// while no delivery of it was answered so.
+        not_admitted_since_ms: Option<u64>,
     },
     /// The recipient's inbox accepted it: delivery is complete.
     Accepted {
@@ -763,6 +768,7 @@ impl App {
                 (None, _) => Delivery::Queued {
                     tries: item.tries,
                     last_error: item.last_error.clone(),
+                    not_admitted_since_ms: item.undeliverable_ms,
                 },
             }));
         }

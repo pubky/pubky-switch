@@ -496,12 +496,22 @@ async fn test_send_not_admitted_stays_queued_and_goes_once_admitted() {
     let s = Setup::new();
     let mut app = s.join("wallet").await;
     s.peer.lock().admitted = Some(Default::default());
+    let first = s.w.clock.now_ms();
     let (msg_id, delivery) = app.send(s.note("one")).await.unwrap();
-    assert!(matches!(delivery, Delivery::Queued { .. }), "{delivery:?}");
+    assert!(
+        matches!(delivery, Delivery::Queued { not_admitted_since_ms: Some(at), .. } if at == first),
+        "{delivery:?}"
+    );
+    // A later try answered the same keeps the time of the first.
+    s.w.clock.advance_ms(HOUR);
     assert_eq!(
         app.flush_outbox().await.unwrap().queued,
         vec![msg_id.clone()]
     );
+    assert!(matches!(
+        app.delivery(&msg_id).await.unwrap(),
+        Some(Delivery::Queued { not_admitted_since_ms: Some(at), .. }) if at == first
+    ));
     assert!(s.peer.received().is_empty());
     // Bob adds alice as a contact: the same message goes.
     s.peer.lock().admitted = None;
