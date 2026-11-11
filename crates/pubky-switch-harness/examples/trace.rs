@@ -54,8 +54,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     print("the service", &comparison.service, facts);
     print("the scripted switch", &comparison.scripted, facts);
     println!("== differences the list allows");
-    for (difference, entry) in &comparison.verdict.allowed {
-        println!("{difference}\n    {} ({})", entry.reason, entry.reference);
+    let allowed = &comparison.verdict.allowed;
+    for (index, (difference, entry)) in allowed.iter().enumerate() {
+        // Each entry once, with the first difference it allows and how many it allows.
+        if allowed[..index].iter().any(|(_, earlier)| earlier == entry) {
+            continue;
+        }
+        let times = allowed.iter().filter(|(_, other)| other == entry).count();
+        println!("{} ({})", entry.reason, entry.reference);
+        println!("    {times} times, first: {difference}");
     }
     println!("== the verdict");
     if comparison.verdict.agrees() {

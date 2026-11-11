@@ -20,9 +20,9 @@ pub const NOTES: &str = "notes";
 /// The message kind the notes apps accept.
 pub const NOTE_KIND: &str = "example.note";
 
-/// A protocol with one neutral scope, [`NOTES`], which has keys: the signer's side of it.
-/// Its apps change the lists and write claims. They don't hold `lists.read`: an app that
-/// does reads `GET /allow` when it joins, a call the flows don't cover yet.
+/// A protocol with one neutral scope, [`NOTES`], which has keys and needs every switch
+/// permission, so its apps read and change the lists and write claims: the signer's side of
+/// it.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Notes;
 
@@ -40,12 +40,7 @@ impl Protocol for Notes {
     }
 
     fn permissions(&self, _: &[&str]) -> Vec<Permission> {
-        vec![
-            Permission::ClaimsRead,
-            Permission::ClaimsWrite,
-            Permission::ListsManage,
-            Permission::ConversationAdd,
-        ]
+        Permission::ALL.to_vec()
     }
 
     fn grant_paths(&self, _: &[u8; 16], _: &[&str]) -> Vec<GrantPath> {

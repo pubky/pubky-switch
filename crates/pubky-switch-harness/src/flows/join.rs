@@ -12,12 +12,13 @@ use crate::parties::{Asking, notes_protocol};
 use crate::{FlowResult, World};
 
 /// An enrolled identity's signer approves an app, which joins: it delivers its record and
-/// registers its first receive key, follows its feed and asks for its key bundle (none is
-/// stored: the approval carried its keys); the signer then sees it among the account's apps.
+/// registers its first receive key, reads the lists, follows its feed and asks for its key
+/// bundle (none is stored: the approval carried its keys); the signer's routine run then
+/// sees it among the account's apps.
 ///
 /// Calls, beyond the enrollment's: `PUT /v1/{id}/identity` (the listing version), `POST
-/// /v1/{id}/ops` (`app.put`, `receive_key.put`), `GET /v1/{id}/feed`, `GET
-/// /v1/{id}/apps/{app_id}/keys`, `GET /v1/{id}/apps`.
+/// /v1/{id}/ops` (`app.put`, `receive_key.put`), `GET /v1/{id}/allow`, `GET /v1/{id}/feed`,
+/// `GET /v1/{id}/apps/{app_id}/keys`, `GET /v1/{id}/apps`.
 ///
 /// # Errors
 ///

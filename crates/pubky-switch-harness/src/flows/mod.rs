@@ -43,7 +43,7 @@ pub const FLOWS: &[(&str, Flow)] = &[
 pub fn flow_of(call: &Call) -> Option<&'static str> {
     match call {
         Call::Enroll | Call::PutIdentity | Call::GetIdentity | Call::GetApps => Some("enrollment"),
-        Call::Ops | Call::Feed | Call::GetKeys(_) => Some("join"),
+        Call::Ops | Call::Feed | Call::GetKeys(_) | Call::GetAllow => Some("join"),
         // Served, and waiting for their flows: two identities messaging each other, a
         // claim, a renewal with its full-bundle request, a revocation and a departure.
         Call::Append
@@ -54,8 +54,7 @@ pub fn flow_of(call: &Call) -> Option<&'static str> {
         | Call::Revoke(_)
         | Call::Leave(_) => None,
         // Not served yet.
-        Call::GetAllow
-        | Call::PostConnect
+        Call::PostConnect
         | Call::GetConnect
         | Call::DeleteConnect(_)
         | Call::GetRecord(_)
