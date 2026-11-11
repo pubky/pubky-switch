@@ -8,18 +8,23 @@
 //! [`FLOWS`] names every flow, and [`flow_of`] says which flow sends each call the service
 //! routes.
 
+mod admission;
 mod claim;
 mod enrollment;
+mod epochs;
 mod erasure;
 mod handover;
 mod join;
 mod lists;
 mod messaging;
+mod pages;
 mod records;
+mod reduction;
 mod removal;
 mod renewal;
 mod restore;
 mod retries;
+mod waiting;
 mod watching;
 
 use std::future::Future;
@@ -27,21 +32,26 @@ use std::pin::Pin;
 
 use pubky_switch::http::route::Call;
 
+pub use admission::{deny_list, invite_code};
 pub use claim::claim;
 pub use enrollment::enrollment;
+pub use epochs::third_epoch;
 pub use erasure::{erasure, erasure_answer_lost};
 pub use handover::{hand_over, hand_over_aborted};
 pub use join::join;
 pub use lists::lists_without_read;
 pub use messaging::messaging;
+pub use pages::pages;
 pub use records::records;
+pub use reduction::renewal_drops_scope;
 pub use removal::{departure, revocation};
-pub use renewal::renewal;
+pub use renewal::{renewal, renewed_twice};
 pub use restore::restore;
 pub use retries::{
     app_retries, append_retry, claim_and_read_retries, claim_retries, removal_retries,
     signer_retries,
 };
+pub use waiting::waiting_read;
 pub use watching::watching;
 
 use crate::{FlowResult, World};
@@ -87,6 +97,14 @@ pub const FLOWS: &[(&str, Flow)] = &[
     ("erasure, answer lost", |world| {
         Box::pin(erasure_answer_lost(world))
     }),
+    ("pages", |world| Box::pin(pages(world))),
+    ("invite code", |world| Box::pin(invite_code(world))),
+    ("deny list", |world| Box::pin(deny_list(world))),
+    ("renewal, a scope dropped", |world| {
+        Box::pin(renewal_drops_scope(world))
+    }),
+    ("renewed twice", |world| Box::pin(renewed_twice(world))),
+    ("third epoch", |world| Box::pin(third_epoch(world))),
 ];
 
 /// The flow that sends `call` to the service; `None` for a call the service doesn't serve

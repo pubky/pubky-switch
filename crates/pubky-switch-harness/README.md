@@ -49,17 +49,64 @@ every one alike:
 | `POST /v1/{id}/apps/{app_id}/leave` | a lost answer | `403 not_current` |
 | `PUT /v1/{id}/peers` | a lost answer | `200` again |
 | `GET /v1/{id}/feed` | a lost answer | the same page |
-
 | `POST /v1/{id}/apps/{app_id}/revoke` | a lost answer, and a failed read of the apps | `200`, no proofs, the head |
 | a `claim` `done` batch, the same batch | a lost answer | the original proof, which settles the claim for the app |
 | a second `done` at the step the first took | the first try's lost answer | `409 conflict`, the settled claim in `current` |
+| `PUT /v1/{id}/handover`, the same hand-over | a lost answer | `200` again, the same app and parts |
 
 A revocation whose answer was lost isn't sent again while the signer can read the switch: it
 reads the account's apps and finds it done.
 
 An erasure whose answer was lost isn't sent again either (Switch wire 7.4.16): the signer's
-next read of the account's apps gets the operator's `404`, and it concludes the account is
-erased.
+next read of the account's apps gets the operator's `404`, which nobody can authenticate, so
+it holds the account as erased but unconfirmed. It concludes the account is erased at its
+first run 24 hours after that `404`, every read in between having met it too. The flow moves
+the world's clock, which is the signer's device clock, by those 24 hours.
+
+An app of an erased account waits too (Switch spec 12.7 step 5): its reads meet the
+operator's `404` and no `identity.json` on the Homeserver, which the signer's erasure took
+off, and it takes the account as gone at the fifth read, each at least 6 hours after the one
+before, 24 hours after the first. Both erasure flows run that wait, and a read short of the
+24 hours that raises nothing.
+
+## Not covered
+
+The flows send every call the service serves, each at both switches. What they leave out:
+
+- **Calls the service doesn't serve yet**, thirteen of the thirty-three of Switch wire 7.4:
+  the connection requests (`POST`, `GET` and `DELETE /connect`), `PUT /push`, `POST /freeze`
+  and `/unfreeze`, `GET /export` and its chunks, `POST /import` with its chunks and
+  activation, and `POST /recovery/admission` and `/recovery/upload`. So no flow moves an
+  account, changes its key in place, or recovers from a lost provider. `flows::flow_of`
+  lists them, and the test fails once one is served without a flow.
+- **Faults in front of most reads.** The retries above are the ones covered. No answer is
+  lost and no connection fails in front of `GET /allow`, `/claims/{claim_key}`,
+  `/directory`, `/apps/{app_id}/keys`, `/records`, `/records/{key}`, `/handover` or the
+  public `/identity`, nor in front of `POST /apps/{app_id}/keys` or a record write.
+- **A list that `limit` ends.** The `pages` flow reads a feed in pages that `limit` ends
+  and that the byte budget ends, and a records list in pages the byte budget ends; a
+  records list that `limit` ends takes more than a thousand records, and no flow writes
+  that many. The directory has no pages (Switch wire 7.4.10).
+- **A waiting read, compared.** `flows::waiting_read` sends a feed read with `wait`, which
+  a write of another app answers. It runs against each switch on its own: the scripted
+  switch doesn't hold a read, so the two runs make their calls in different orders, which
+  the comparison can't set side by side. Its test holds what each switch does.
+- **A feed with gaps:** a lagging app, a `missed` item, an item an app can't read after a
+  revocation.
+- **More of the lists:** an invite code withdrawn or used several times, an invite, a
+  conversation entry pruned, a connection request.
+- **Longer lives:** a renewal that adds a scope, a claim that runs out by time, an app
+  with several collections, an identity that enrolls again after an erasure.
+- **More than one switch with traffic between them:** the identities of a flow share one
+  origin.
+
+Not this crate's to cover: refusals, limits, rates, quotas and retention, which the
+service's own tests hold, and a faulty or hostile switch, which stays on the scripted
+switch. Around the service, the flows don't touch TLS, the listener, the proxy's
+client-address header, the client's HTTPS transport, the time source (trusted time comes
+from the test clock), key generation (accounts take keys from fixed seeds), or more than one
+instance on a database. `src/check.rs` says what of an answer the harness verifies itself
+and what it leaves to the client and the signer.
 
 ## Adding a flow
 
@@ -71,6 +118,6 @@ Run the `trace` example to see what the two switches answered, and list each dif
 ## Run time and databases
 
 Each flow's run against the service makes one test database and drops it, also when its
-test panics; the flows run one after another. Twenty-one flows take about a minute in a
+test panics; the flows run one after another. Twenty-seven flows take about a minute in a
 debug build. If that grows too long, the service's halves could share one service and one
 database, with identities of their own per flow: a later option, not needed yet.

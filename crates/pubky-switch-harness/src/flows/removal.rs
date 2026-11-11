@@ -103,7 +103,7 @@ pub async fn departure(world: &World) -> FlowResult {
 }
 
 /// `app` follows its feed and fetches its key bundle, with what it shows after each.
-async fn follow(world: &World, app: &mut App, name: &str) -> FlowResult {
+pub(crate) async fn follow(world: &World, app: &mut App, name: &str) -> FlowResult {
     let report = app.receive(None).await?;
     world.outcome(
         &format!("{name}: received"),

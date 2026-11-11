@@ -50,9 +50,15 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
 - **Durability** (Switch spec 6.5): everything is in memory, answered at once; the service
   key's mark isn't kept. Per-account order is a mutex.
 - **Retention and sweeps** (Switch wire 9.1): entries never expire; `missed` items,
-  checkpoints and dropped stubs exist only when a test scripts them; claims are deleted only
-  when `GET /claims` finds them deletable; batch records are never dropped, and their proofs
-  go only when a retry finds them past `batch_proofs_ms`.
+  checkpoints and dropped stubs exist only when a test scripts them, and a scripted `missed`
+  item (`push_missed`) is shown to every app, where the service shows one only to its app;
+  no app is ever marked lagging (`lagging` is always `false`), so entries always wait for
+  every current target and no `missed` item is written (7.4.4);
+  `unreadable` items exist only when a test scripts them (`push_unreadable`), with an
+  `entry_id` of their own rather than the entry's: a revocation, leave or delivery that
+  leaves an entry with no current target writes none, and the entry stays; claims are
+  deleted only when `GET /claims` finds them deletable; batch records are never dropped, and
+  their proofs go only when a retry finds them past `batch_proofs_ms`.
 - **Invite codes**: a revoked app's codes aren't withdrawn (Switch wire 7.4.3 "After a
   revocation"); a code planted for a faulty export never expires.
 - **Lists**: `flagged` is always empty; connect requests are never full. Conversation
@@ -160,7 +166,8 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
 
   `unread_entries` and `sole_target_unread` are always 0, where the service counts them over
   the current targets, expired certificates included; no signer or app code reads them.
-  `lagging` is false, as on the service. The test call `forget_bundle_parts` scripts a faulty service
+  `lagging` is always false, where the service marks lagging apps (Retention and sweeps,
+  above). The test call `forget_bundle_parts` scripts a faulty service
   that lost an app's stored parts.
 - **Moves and recovery** (Switch spec 12.5, 12.6, Switch wire 10): `import_into` copies the
   account in memory, with no manifest, chunks or export transfer, to serve at the origin the

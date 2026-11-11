@@ -1050,3 +1050,59 @@ async fn test_parked_release_survives_a_backup_of_its_kept_effect() {
     assert_eq!(copy.reason, ParkReason::Uncertain);
     assert!(copy.released, "the copy lost its release");
 }
+
+#[tokio::test]
+async fn test_parked_backup_of_a_kept_effect_never_hands_its_entry_over_again() {
+    // A feed entry's effect is applied and its answer lost: the effect is kept. A backup
+    // then holds the entry as uncertain. Restored after the processed pair of its message
+    // has aged out, the app still never hands the entry over again by itself; the host's
+    // release of the stored copy hands it over once.
+    let w = World::new();
+    let protocol = ParkingProtocol::new(Mode::Plain);
+    let mut app = wallet_on(&w, &protocol, Arc::clone(&w.store) as Arc<dyn StateStore>).await;
+    let (seq, _) = w.note(app.app_id(), "kept note");
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.receive(None).await.is_err());
+    assert!(
+        app.state
+            .pending_effect
+            .as_ref()
+            .is_some_and(|p| p.seq == seq && p.stored.is_none())
+    );
+    let backup = app.backup_layered().await.unwrap();
+    drop(app);
+    // Past the processed pair's 30 days and the tolerance.
+    w.clock.advance_ms(31 * DAY_MS);
+    w.switch.lock().batches.clear();
+    let restored_protocol = ParkingProtocol::new(Mode::Plain);
+    let mut restored = App::restore(
+        w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
+        restored_protocol.clone(),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    restored.receive(None).await.unwrap();
+    assert_eq!(
+        restored_protocol.handed(),
+        0,
+        "the entry was handed over again"
+    );
+    restored.receive(None).await.unwrap();
+    assert_eq!(
+        restored_protocol.handed(),
+        0,
+        "the entry was handed over again"
+    );
+    let id = restored.stored_id_at(seq).unwrap();
+    let entry = listed(&mut restored, id).await.unwrap();
+    assert_eq!(entry.reason, ParkReason::Uncertain);
+    restored
+        .release_parked(entry.stored_id, &entry.hash)
+        .await
+        .unwrap();
+    restored.receive(None).await.unwrap();
+    assert_eq!(restored_protocol.handed(), 1);
+    assert_eq!(restored_protocol.released(), vec![true]);
+}

@@ -61,6 +61,7 @@ impl Service {
         signer: &ServiceSigner,
         request: &SwitchRequest,
         held: Option<&IdentityDoc>,
+        trusted: bool,
         time_ms: u64,
     ) -> Result<(Answer, bool), ApiError> {
         let identity_key = txn.head().identity_key;
@@ -161,7 +162,10 @@ impl Service {
                     "7.4.2: a generation change isn't served yet",
                 ))
             }
-            Ok(Delivery::New(None)) => self.chain_delivery(txn, signer, held, &doc, time_ms).await,
+            Ok(Delivery::New(None)) => {
+                self.chain_delivery(txn, signer, held, &doc, trusted, time_ms)
+                    .await
+            }
         }
     }
 
@@ -172,6 +176,7 @@ impl Service {
         signer: &ServiceSigner,
         previous: Option<&IdentityDoc>,
         doc: &IdentityDoc,
+        trusted: bool,
         time_ms: u64,
     ) -> Result<(Answer, bool), ApiError> {
         let failure = |_| ApiError::unavailable("7.6: a temporary failure");
@@ -214,7 +219,15 @@ impl Service {
         .map_err(|e| store_error(&e))?;
         // An app it no longer makes current stops holding entries at once (Switch wire
         // 7.4.2, 9.1).
-        super::batch::settle_change(txn, previous, Some(doc), None, time_ms)
+        let release = self.release(trusted);
+        let current = super::batch::settle_change(txn, previous, Some(doc), None, time_ms, release)
+            .await
+            .map_err(|e| store_error(&e))?;
+        // After its chain item: an app it no longer makes current departs at it, its unread
+        // entries no current app can open becoming unreadable items, and the shares change
+        // (Switch wire 7.4.4).
+        release
+            .departed(txn, &current)
             .await
             .map_err(|e| store_error(&e))?;
         // Where the keys_through of each app it lists for the first time starts (Switch

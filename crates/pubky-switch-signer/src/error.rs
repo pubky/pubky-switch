@@ -167,9 +167,25 @@ pub enum Refusal {
     #[error("refused: no erasure is in progress")]
     NotErasing,
     /// An erasure request went unanswered, so it may have erased the account: the erasure
-    /// can't be aborted, and [`crate::Signer::resume`] sends it again to learn the outcome.
+    /// can't be aborted, and [`crate::Signer::resume`] sends it again, after a check, to learn
+    /// the outcome. Once an unsigned `404` has been met, `resume` only reads, until the `404`
+    /// has held for 24 hours or an answer the pinned key signs ends the wait
+    /// ([`Refusal::ErasureUnconfirmed`]).
     #[error("refused: the erasure may have reached the switch")]
     ErasureUnanswered,
+    /// The account looks erased: after a request in doubt, a check or a retry met an unsigned
+    /// `404` at `since_ms`, by the device clock, which may be the operator's and which nobody
+    /// can authenticate, and no answer the pinned key signs has come since. The erasure is
+    /// done at the first run 24 hours on that meets the `404` again; an answer the pinned key
+    /// signs before that, an error included, ends the wait, and the next `404` starts it
+    /// again (Switch wire 7.4.16, spec 12.7 step 5). No answer, and an unsigned answer other
+    /// than a `404`, leave it as it is. Nothing else is signed meanwhile, and revocations are
+    /// refused.
+    #[error("refused: the account looks erased, unconfirmed until 24 hours have passed")]
+    ErasureUnconfirmed {
+        /// When a check first met the `404`, in Unix milliseconds, by the device clock.
+        since_ms: u64,
+    },
     /// This install is taking the identity over: it signs nothing but its first delivery
     /// until that has won (Switch wire 3.12).
     #[error("refused: the identity is being taken over")]

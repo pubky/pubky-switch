@@ -1330,8 +1330,8 @@ impl Service {
                     .map_err(|error| Refused::with_head(error, serving));
             }
             Call::Feed => {
-                let head = txn.head();
-                return self
+                let head = txn.head().clone();
+                let answer = self
                     .feed(
                         &head.id,
                         head.identity_key,
@@ -1340,8 +1340,14 @@ impl Service {
                         &request.route.query,
                         time_ms,
                     )
-                    .map(|answer| (answer, serving))
-                    .map_err(|error| Refused::with_head(error, serving));
+                    .map_err(|error| Refused::with_head(error, serving))?;
+                // The reader's feed read ends its lagging mark (Switch wire 7.4.4).
+                if let Some(reader) = writer.as_ref() {
+                    txn.set_lagging(&[reader.app_id()], false)
+                        .await
+                        .map_err(|error| Refused::with_head(store_error(&error), serving))?;
+                }
+                return Ok((answer, serving));
             }
             Call::Leave(app_id) => {
                 // Only the app itself leaves (Switch wire 7.4.12).
@@ -1362,6 +1368,7 @@ impl Service {
                         caller,
                         app_id,
                         &request.body,
+                        due.is_some(),
                         time_ms,
                     )
                     .await
@@ -1431,7 +1438,15 @@ impl Service {
             }
             Call::Revoke(app_id) => {
                 return self
-                    .revoke(txn, signer, held.as_ref(), app_id, &request.body, time_ms)
+                    .revoke(
+                        txn,
+                        signer,
+                        held.as_ref(),
+                        app_id,
+                        &request.body,
+                        due.is_some(),
+                        time_ms,
+                    )
                     .await
                     .map(|answer| (answer, serving))
                     .map_err(|error| Refused::with_head(error, serving));
@@ -1439,7 +1454,7 @@ impl Service {
             _ => {}
         }
         let (answer, serves_after) = self
-            .put_identity(txn, signer, request, held.as_ref(), time_ms)
+            .put_identity(txn, signer, request, held.as_ref(), due.is_some(), time_ms)
             .await
             .map_err(|error| Refused::with_head(error, serving))?;
         Ok((answer, serving || serves_after))

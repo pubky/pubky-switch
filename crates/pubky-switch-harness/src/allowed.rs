@@ -98,17 +98,118 @@ fn matches(pattern: &str, text: &str) -> bool {
 }
 
 /// Every accepted difference: those of the two switches as a whole, then by flow.
-pub static ALLOWED: &[Allowed] = &[Allowed {
-    flow: EVERY_FLOW,
-    label: "*",
-    fact: "* (member order)",
-    service: "*",
-    scripted: "*",
-    reason: "The service writes an answer's members in the order of the wire format's \
+pub static ALLOWED: &[Allowed] = &[
+    Allowed {
+        flow: EVERY_FLOW,
+        label: "*",
+        fact: "* (member order)",
+        service: "*",
+        scripted: "*",
+        reason: "The service writes an answer's members in the order of the wire format's \
                  tables and examples; the scripted switch writes them sorted by name. A writer \
                  may use any order, and no reader depends on it.",
-    reference: "Switch wire 1.1, \"Exact bytes\"",
-}];
+        reference: "Switch wire 1.1, \"Exact bytes\"",
+    },
+    Allowed {
+        flow: "invite code",
+        label: "{alice/wallet} GET /v1/{alice}/feed",
+        fact: "body.items[1].context*",
+        service: "*",
+        scripted: NOTHING,
+        reason: "fake batch pending: the service shows the invite code's context on the \
+                 conversation entry it wrote at the code's first use, as a feed item; the \
+                 scripted switch shows it on the entry the code admitted and leaves it off \
+                 the conversation entry.",
+        reference: "Switch wire 7.5, the `chain` item's `context`",
+    },
+    Allowed {
+        flow: "invite code",
+        label: "{alice/wallet} GET /v1/{alice}/allow",
+        fact: "body.conversations[0].context*",
+        service: "*",
+        scripted: NOTHING,
+        reason: "fake batch pending: the service lists a conversation entry an invite code \
+                 made with the code's context; the scripted switch lists it without.",
+        reference: "Switch wire 7.4.6, `conversations`",
+    },
+    Allowed {
+        flow: "invite code",
+        label: "{alice/wallet} GET /v1/{alice}/allow",
+        fact: "body.conversations[0].last_used",
+        service: "time *",
+        scripted: NOTHING,
+        reason: "fake batch pending: the service keeps the time of the last append a \
+                 conversation entry admitted; the scripted switch keeps none, so an app \
+                 that prunes idle entries by it finds every entry never used.",
+        reference: "Switch wire 7.4.6, `last_used`",
+    },
+    Allowed {
+        flow: "renewal, a scope dropped",
+        label: "{alice/phone} GET /v1/{alice}/records/*",
+        fact: "body.cert.*",
+        service: "*",
+        scripted: "*",
+        reason: "fake batch pending: a record view carries the certificate the service checked \
+                 the write against, which a later renewal doesn't change; the scripted switch \
+                 gives the writer's current certificate, here one without the write scope.",
+        reference: "Switch wire 7.4.9, the record view's `cert`",
+    },
+    Allowed {
+        flow: "renewal, a scope dropped",
+        label: "{alice/tablet} GET /v1/{alice}/records",
+        fact: "body.records[0].cert.*",
+        service: "*",
+        scripted: "*",
+        reason: "fake batch pending: a record view carries the certificate the service checked \
+                 the write against, which a later renewal doesn't change; the scripted switch \
+                 gives the writer's current certificate, here one without the write scope.",
+        reference: "Switch wire 7.4.9, the record view's `cert`",
+    },
+    Allowed {
+        flow: "renewal, a scope dropped",
+        label: "{alice/tablet} GET /v1/{alice}/records/*",
+        fact: "body.cert.*",
+        service: "*",
+        scripted: "*",
+        reason: "fake batch pending: a record view carries the certificate the service checked \
+                 the write against, which a later renewal doesn't change; the scripted switch \
+                 gives the writer's current certificate, here one without the write scope.",
+        reference: "Switch wire 7.4.9, the record view's `cert`",
+    },
+    Allowed {
+        flow: "renewal, a scope dropped",
+        label: "outcome the tablet joined after the renewal and listed the collection",
+        fact: "outcome.listed",
+        service: "number 1",
+        scripted: "number 0",
+        reason: "fake batch pending: with the writer's current certificate in the record view, \
+                 an app that joins after the renewal refuses the write (Switch wire 6.2 \
+                 step 5), where with the certificate of the write it takes it.",
+        reference: "Switch wire 7.4.9, the record view's `cert`",
+    },
+    Allowed {
+        flow: "renewal, a scope dropped",
+        label: "outcome what the tablet holds of the record",
+        fact: "outcome.*",
+        service: "*",
+        scripted: "*",
+        reason: "fake batch pending: with the writer's current certificate in the record view, \
+                 an app that joins after the renewal refuses the write (Switch wire 6.2 \
+                 step 5), where with the certificate of the write it takes it.",
+        reference: "Switch wire 7.4.9, the record view's `cert`",
+    },
+    Allowed {
+        flow: "renewal, a scope dropped",
+        label: "outcome what the tablet reads of the record",
+        fact: "outcome.*",
+        service: "*",
+        scripted: "*",
+        reason: "fake batch pending: with the writer's current certificate in the record view, \
+                 an app that joins after the renewal refuses the write (Switch wire 6.2 \
+                 step 5), where with the certificate of the write it takes it.",
+        reference: "Switch wire 7.4.9, the record view's `cert`",
+    },
+];
 
 #[cfg(test)]
 mod tests {
