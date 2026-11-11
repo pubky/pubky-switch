@@ -36,6 +36,10 @@ pub struct HeldRecord {
     pub proof: SignedDoc,
     /// The App ID that wrote it.
     pub writer: [u8; 16],
+    /// The writer's certificate the switch checked the write against, kept with the record:
+    /// a renewal or revocation later doesn't change it (Switch wire 7.4.9). `None` for a
+    /// record held without it, whose view carries the certificate of the writer's record.
+    pub cert: Option<SignedDoc>,
     /// The write's `seq`.
     pub seq: u64,
 }
@@ -180,12 +184,15 @@ impl ConditionState for Before<'_> {
     }
 }
 
-/// A record's view, as `GET /records` returns it (Switch wire 7.4.9).
+/// A record's view, as `GET /records` returns it (Switch wire 7.4.9): its `cert` is the one
+/// the write was checked against, or for a record held without it, the one the writer's
+/// record carries.
 fn record_view(held: &HeldRecord, apps: &BTreeMap<[u8; 16], SwitchApp>, proof: bool) -> Value {
-    let cert = apps
-        .get(&held.writer)
-        .and_then(|app| app.cert.clone())
-        .map(|cert| cert.signed().clone());
+    let cert = held.cert.clone().or_else(|| {
+        apps.get(&held.writer)
+            .and_then(|app| app.cert.clone())
+            .map(|cert| cert.signed().clone())
+    });
     let mut view = json!({
         "key": b64(&held.state.key),
         "collection": b64(&held.state.collection),
@@ -276,6 +283,7 @@ impl Shared {
                 op: written.op.signed().clone(),
                 proof: written.proof.clone(),
                 writer: written.writer,
+                cert: written.cert.map(|cert| cert.signed().clone()),
                 seq: written.seq,
             },
         );
@@ -460,6 +468,8 @@ pub(super) struct Written<'a> {
     pub(super) op: &'a SignedOp,
     pub(super) proof: &'a SignedDoc,
     pub(super) writer: [u8; 16],
+    /// The certificate the writer was checked against; `None` for the signer.
+    pub(super) cert: Option<&'a AppCert>,
     pub(super) generation: u64,
     pub(super) seq: u64,
 }

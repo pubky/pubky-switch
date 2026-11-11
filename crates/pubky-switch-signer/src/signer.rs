@@ -44,7 +44,7 @@ use pubky_switch_core::sig::SignedDoc;
 use serde_json::Value;
 
 use crate::alert::{Alert, Source};
-use crate::error::{Refusal, Result, SignerError};
+use crate::error::{Refusal, Result, SignerError, SizedBody};
 use crate::homeserver::Homeserver;
 use crate::key::{BackupView, IdentityKeyring, SigningKey};
 use crate::protocol::Protocols;
@@ -793,20 +793,24 @@ impl Signer {
         // into a time (wire 3.3, 3.8), so the version is measured with every open entry closed.
         // Otherwise a closing owed past the cap would stop every later step. A removal, which
         // drops the app's `renewed` entries with it, makes the document smaller.
+        // Nor one that couldn't move: a move's enrollment carries it again, encoded once more,
+        // with the App IDs revoked (wire 3.7), so each body it travels in is measured.
         let mut closed = body.clone();
         for entry in &mut closed.renewed {
             // Every time is written at the same length, three fraction digits (wire 1.6).
             entry.until.get_or_insert(0);
         }
-        let bytes = delivery_len(closed.to_json()?.len());
-        if let Some(limit) = identity_limit()
-            && over_cap(bytes, limit, room)
-        {
-            return Err(Refusal::IdentityTooLarge {
-                bytes: u64::try_from(bytes).unwrap_or(u64::MAX),
-                limit: u64::try_from(limit).unwrap_or(u64::MAX),
+        // Measured as a delivery built on `base`, which a recovery's `null` is no longer than.
+        let prev = Some(base.hash());
+        for measure in measures(&self.state, &closed, prev)? {
+            if over_cap(measure.bytes, measure.limit, room) {
+                return Err(Refusal::IdentityTooLarge {
+                    body: measure.body,
+                    bytes: u64::try_from(measure.bytes).unwrap_or(u64::MAX),
+                    limit: u64::try_from(measure.limit).unwrap_or(u64::MAX),
+                }
+                .into());
             }
-            .into());
         }
         Ok(body)
     }
@@ -1352,8 +1356,8 @@ impl Signer {
         }
         // How close the version comes to the most a delivery, or a move's enrollment, may
         // carry (Switch wire 3.7, 7.1).
-        let bytes = version_size(&state, &doc, prev)?;
-        state.note_size(bytes);
+        let nearest = version_size(&state, &doc, prev)?;
+        state.note_size(nearest.bytes, nearest.limit);
         let published = state
             .newest
             .as_ref()
@@ -1630,34 +1634,109 @@ enum Verdict {
     Newer,
 }
 
-/// The size of `doc` as the larger of its delivery built on `prev` and a move's enrollment
-/// carrying it, for the records `state` (Switch wire 3.7, 7.1).
+/// One body a version must fit in, measured (Switch wire 3.7, 7.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Measure {
+    /// The body.
+    pub(super) body: SizedBody,
+    /// Its size with the version in it, in bytes.
+    pub(super) bytes: usize,
+    /// Its cap, in bytes.
+    pub(super) limit: usize,
+}
+
+/// Every body the version `body`, built on `prev`, must later fit in, for the records
+/// `state`, each with its own cap (Switch wire 3.7, 7.1): its delivery, `PUT /identity`, and
+/// a move's enrollment carrying it, `POST /enroll`, with every App ID revoked, those of
+/// `state` and of the version's `removed`, and those of the apps it lists, as if revoked
+/// already, at the longest origin a switch may have, since the one a move goes to isn't known
+/// yet. The one measure both the check before signing and the near-limit alert use. The
+/// delivery is measured as sent, byte for byte; the enrollment is an upper bound, above a
+/// real move's by the listed apps' IDs, so removing an app, or a tombstone committed before
+/// the version that removes it, never grows it. The version's signed form is measured from
+/// its body, with a signature of the length every signature has: nothing is signed to
+/// measure it.
+pub(super) fn measures(
+    state: &SignerState,
+    body: &IdentityBody,
+    prev: Option<[u8; 32]>,
+) -> Result<Vec<Measure>> {
+    // A signed form of `json`, as long as a signed one: every signature is 64 bytes.
+    let carried = |json: &[u8]| SignedDoc {
+        body: pubky_switch_core::enc::b64(json),
+        sig: pubky_switch_core::enc::b64(&[0; 64]),
+    };
+    let doc = carried(&body.to_json()?);
+    let mut measured = Vec::new();
+    if let Some(limit) = identity_limit() {
+        let delivery = IdentityDelivery {
+            identity: doc.clone(),
+            prev,
+        };
+        measured.push(Measure {
+            body: SizedBody::Delivery,
+            bytes: delivery.to_json().len(),
+            limit,
+        });
+    }
+    if let Some(limit) = enrollment_limit() {
+        let mut revoked = state.tombstones.clone();
+        revoked.extend(body.removed.iter().map(|removed| removed.app_id));
+        // And every app the version lists, as if revoked already: a later removal moves its
+        // App ID into `revoked_apps`, which an enrollment carries whatever the version
+        // shrinks to, and a tombstone committed before its removal is signed, as a revocation
+        // commits it, adds nothing then. So the measure is an upper bound, by these IDs.
+        revoked.extend(body.apps.iter().map(|listed| listed.app_id));
+        revoked.sort_unstable();
+        revoked.dedup();
+        let enrollment = EnrollmentBody {
+            identity: state.identity,
+            origin: "a".repeat(pubky_switch_core::net::MAX_ORIGIN_LEN),
+            nonce: [0; 16],
+            policy: body.policy,
+            identity_doc: Some(doc),
+            revoked_apps: (!revoked.is_empty()).then_some(revoked),
+        };
+        // The request's body: `{"enrollment":<signed enrollment>}` (Switch wire 7.4.1).
+        let request = serde_json::json!({ "enrollment": carried(&enrollment.to_json()?) });
+        measured.push(Measure {
+            body: SizedBody::Enrollment,
+            bytes: request.to_string().len(),
+            limit,
+        });
+    }
+    Ok(measured)
+}
+
+/// The measure of the version signed as `doc`, built on `prev`, that comes nearest its cap,
+/// for the near-limit alert ([`measures`]). A document that doesn't verify, which no caller
+/// passes, is measured as its delivery alone: the alert never stops a delivery from being
+/// recorded.
 pub(super) fn version_size(
     state: &SignerState,
     doc: &SignedDoc,
     prev: Option<[u8; 32]>,
-) -> Result<usize> {
-    let delivery = IdentityDelivery {
-        identity: doc.clone(),
-        prev,
+) -> Result<Measure> {
+    let Ok(verified) = IdentityDoc::verify(doc, &state.identity) else {
+        let delivery = IdentityDelivery {
+            identity: doc.clone(),
+            prev,
+        };
+        return Ok(Measure {
+            body: SizedBody::Delivery,
+            bytes: delivery.to_json().len(),
+            limit: identity_limit().unwrap_or(usize::MAX),
+        });
     };
-    let policy = IdentityDoc::verify(doc, &state.identity)
-        .map(|verified| verified.body().policy)
-        .unwrap_or_default();
-    let enrollment = state.service.as_ref().map(|service| EnrollmentBody {
-        identity: state.identity,
-        origin: service.origin.clone(),
-        nonce: [0; 16],
-        policy,
-        identity_doc: Some(doc.clone()),
-        revoked_apps: (!state.tombstones.is_empty()).then(|| state.tombstones.clone()),
-    });
-    let enrollment_bytes = enrollment
-        .map(|body| serde_json::to_vec(&body).map(|json| signed_len(json.len())))
-        .transpose()
-        .map_err(|e| SignerError::Records(e.to_string()))?
-        .unwrap_or(0);
-    Ok(delivery.to_json().len().max(enrollment_bytes))
+    measures(state, verified.body(), prev)?
+        .into_iter()
+        // The larger share of its cap, compared without division.
+        .max_by(|a, b| {
+            a.bytes
+                .saturating_mul(b.limit)
+                .cmp(&b.bytes.saturating_mul(a.limit))
+        })
+        .ok_or_else(|| SignerError::Records("no body to measure the version in".into()))
 }
 
 /// Room kept under the cap for what a later version adds to one measured now without any
@@ -1686,26 +1765,14 @@ fn over_cap(bytes: usize, limit: usize, room: Room) -> bool {
     bytes.saturating_add(headroom) > limit
 }
 
-/// The body cap of `PUT /identity`, which `POST /enroll` shares (Switch wire 3.7, 7.1).
+/// The body cap of `PUT /identity` (Switch wire 7.1).
 pub(crate) fn identity_limit() -> Option<usize> {
     pubky_switch_core::http::body_cap("PUT", "/v1/id/identity")
 }
 
-/// The length of a delivery built on a version, whose `identity.json` body is `body_len` bytes
-/// of JSON: `{"identity":<carrying form>,"prev":"<43 characters>"}` (Switch wire 7.4.2).
-fn delivery_len(body_len: usize) -> usize {
-    signed_len(body_len)
-        .saturating_add(r#"{"identity":,"prev":""}"#.len())
-        .saturating_add(43)
-}
-
-/// The length of a signed document's carrying form whose body is `body_len` bytes of JSON:
-/// `{"body":"<base64url>","sig":"<86 characters>"}` (Switch wire 2.2).
-fn signed_len(body_len: usize) -> usize {
-    let encoded = body_len.saturating_mul(4).saturating_add(2) / 3;
-    encoded
-        .saturating_add(r#"{"body":"","sig":""}"#.len())
-        .saturating_add(86)
+/// The body cap of `POST /enroll` (Switch wire 3.7, 7.1).
+fn enrollment_limit() -> Option<usize> {
+    pubky_switch_core::http::body_cap("POST", "/v1/enroll")
 }
 
 fn stale_without_copy() -> SignerError {
@@ -1764,23 +1831,31 @@ mod tests {
             let mut at = body.clone();
             at.version = version;
             at.data_epoch = epoch;
-            delivery_len(at.to_json().unwrap().len())
+            let state = SignerState::new(key.public(), [4; 16]);
+            measures(&state, &at, Some([8; 32])).unwrap()
         };
         for (before, after) in [(9, 10), (99, 100), (999, 1000), (9_999, 10_000)] {
-            let (measured, closing) = (measure(before, before), measure(after, after));
-            assert!(closing > measured);
-            assert!(
-                closing - measured <= CAP_HEADROOM,
-                "{before}: {measured} to {closing}"
-            );
+            for (measured, closing) in measure(before, before)
+                .into_iter()
+                .zip(measure(after, after))
+            {
+                assert!(closing.bytes > measured.bytes);
+                assert!(
+                    closing.bytes - measured.bytes <= CAP_HEADROOM,
+                    "{before}: {measured:?} to {closing:?}"
+                );
+            }
         }
     }
 
     #[test]
-    fn test_delivery_len_is_the_delivery_as_sent() {
-        // The size `next_version` checks before signing is the delivery's, byte for byte.
+    fn test_identity_measures_are_the_bodies_as_sent() {
+        // The sizes `next_version` checks before signing: the delivery's, byte for byte, and a
+        // move's enrollment's at the longest origin a switch may have, with every App ID
+        // revoked, those of the records and of `removed`, and those of the listed apps, as if
+        // revoked already. So it is never below a real move's, and above it by those IDs.
         let key = pubky_switch_core::keys::IdentityKey::from_secret([3; 32]);
-        let body = IdentityBody::first(
+        let mut body = IdentityBody::first(
             key.public(),
             [4; 16],
             Inbox {
@@ -1789,14 +1864,63 @@ mod tests {
             },
             IdentityPolicy::default(),
         );
+        // A departed app the records don't hold yet, beside one they do.
+        for app_id in [[9; 16], [11; 16]] {
+            body.removed.push(pubky_switch_core::records::RemovedApp {
+                app_id,
+                distrust_from: 0,
+            });
+        }
+        body.apps.push(pubky_switch_core::records::ListedApp {
+            app_id: [12; 16],
+            cert: [13; 32],
+        });
+        let mut state = SignerState::new(key.public(), [4; 16]);
+        state.tombstones = vec![[9; 16], [10; 16]];
         let doc = IdentityDoc::sign(&key, body.clone()).unwrap();
         let delivery = IdentityDelivery {
             identity: doc.signed().clone(),
             prev: Some([6; 32]),
         };
+        let host = format!(
+            "{}.example",
+            "a".repeat(pubky_switch_core::net::MAX_DOMAIN_LEN - 8)
+        );
+        let origin = format!("https://{host}:65535");
+        assert_eq!(origin.len(), pubky_switch_core::net::MAX_ORIGIN_LEN);
+        let request = |revoked: Vec<[u8; 16]>| {
+            let enrollment = pubky_switch_core::records::Enrollment::sign(
+                &key,
+                EnrollmentBody {
+                    identity: key.public(),
+                    origin: origin.clone(),
+                    nonce: [1; 16],
+                    policy: body.policy,
+                    identity_doc: Some(doc.signed().clone()),
+                    revoked_apps: Some(revoked),
+                },
+            )
+            .unwrap();
+            serde_json::json!({ "enrollment": enrollment.signed() }).to_string()
+        };
+        let real = request(vec![[9; 16], [10; 16], [11; 16]]);
+        let request = request(vec![[9; 16], [10; 16], [11; 16], [12; 16]]);
+        let measured = measures(&state, &body, Some([6; 32])).unwrap();
+        assert!(measured[1].bytes > real.len());
         assert_eq!(
-            delivery_len(body.to_json().unwrap().len()),
-            delivery.to_json().len()
+            measured,
+            [
+                Measure {
+                    body: SizedBody::Delivery,
+                    bytes: delivery.to_json().len(),
+                    limit: identity_limit().unwrap(),
+                },
+                Measure {
+                    body: SizedBody::Enrollment,
+                    bytes: request.len(),
+                    limit: enrollment_limit().unwrap(),
+                },
+            ]
         );
     }
 

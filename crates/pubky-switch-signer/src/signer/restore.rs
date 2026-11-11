@@ -164,7 +164,7 @@ impl Signer {
         // which `deletion_checks`, finding no record, wouldn't raise.
         let mut tombstones = view.revoked_apps.clone();
         tombstones.extend(doc.body().removed.iter().map(|r| r.app_id));
-        tombstones.extend(removed_at_switch(&answer));
+        tombstones.extend(removed_at_switch(&answer, &doc));
         let cleanup = if in_place {
             tombstones.extend(self.state.tombstones.iter().copied());
             self.state.cleanup.clone()
@@ -460,12 +460,21 @@ impl Signer {
     }
 }
 
-/// The App IDs `GET /apps` shows revoked or departed.
-pub(super) fn removed_at_switch(apps: &AppsAnswer) -> impl Iterator<Item = [u8; 16]> + '_ {
+/// The App IDs `GET /apps` shows revoked or departed, of the apps `version` lists: a removal
+/// is taken from the switch only for an app the identity's own version lists, as a routine
+/// run takes one. An ID the switch shows for any other app counts for nothing: one the
+/// version removed comes from its `removed` and the records, and one no version listed would
+/// only grow the records, and a move's enrollment with them, on a switch's word (Switch wire
+/// 3.7, 7.4.12).
+pub(super) fn removed_at_switch<'a>(
+    apps: &'a AppsAnswer,
+    version: &'a IdentityDoc,
+) -> impl Iterator<Item = [u8; 16]> + 'a {
     apps.apps
         .iter()
         .filter(|s| s.revoked_at.is_some() || s.departed_at.is_some())
         .map(|s| s.app_id)
+        .filter(|id| version.listed_cert(id).is_some())
 }
 
 /// How many removed apps' records a run checks for.
