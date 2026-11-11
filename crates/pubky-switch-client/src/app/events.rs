@@ -299,6 +299,29 @@ pub enum AppEvent {
         /// Whether the bytes differ from the message processed before.
         conflicting: bool,
     },
+    /// An entry stored because its sender's standing couldn't be checked
+    /// ([`ParkReason::Unverifiable`]) was dropped without being processed, past the bounds
+    /// Switch spec 8.2 sets ([`super::MAX_UNVERIFIED_AGE_MS`],
+    /// [`super::MAX_UNVERIFIED_PER_SENDER`], [`super::MAX_UNVERIFIED_TOTAL`]). The protocol
+    /// may ask the sender to send it again while the sender still keeps it (Switch spec
+    /// 11). A duty event, kept in the commit that deletes the entry.
+    StoredEntryDropped {
+        /// The duty event's ID.
+        id: EventId,
+        /// The entry's local ID while it was stored.
+        stored_id: u64,
+        /// The `seq` the entry was read at, in `generation`.
+        seq: u64,
+        /// The generation it was read at.
+        generation: u64,
+        /// The sender identity, the one its certificate names.
+        sender: [u8; 32],
+        /// When its inbox accepted it, service time in Unix milliseconds: the time a
+        /// re-send request asks from.
+        accepted_at_ms: u64,
+        /// Which bound it was past.
+        reason: DropReason,
+    },
     /// An entry stored locally was processed.
     Unparked {
         /// The `seq` the entry was read at.
@@ -689,6 +712,7 @@ impl AppEvent {
             Self::EffectRefused { id, .. }
             | Self::EffectUncertain { id, .. }
             | Self::ReleasedDuplicate { id, .. }
+            | Self::StoredEntryDropped { id, .. }
             | Self::KeptBatchDropped { id, .. }
             | Self::BatchRefused { id, .. }
             | Self::RestoreLeftBehind { id, .. }
@@ -809,6 +833,15 @@ pub(crate) enum Duty {
         msg_id: String,
         conflicting: bool,
     },
+    StoredEntryDropped {
+        stored_id: u64,
+        seq: u64,
+        generation: u64,
+        #[serde(with = "serde_b64")]
+        sender: [u8; 32],
+        accepted_at_ms: u64,
+        reason: DropReason,
+    },
     KeptBatchDropped {
         #[serde(with = "serde_b64")]
         batch_id: [u8; 16],
@@ -853,7 +886,8 @@ impl Duty {
             Self::Parked { stored_id, .. }
             | Self::EffectRefused { stored_id, .. }
             | Self::EffectUncertain { stored_id, .. }
-            | Self::ReleasedDuplicate { stored_id, .. } => Some(*stored_id),
+            | Self::ReleasedDuplicate { stored_id, .. }
+            | Self::StoredEntryDropped { stored_id, .. } => Some(*stored_id),
             _ => None,
         }
     }
@@ -917,6 +951,22 @@ impl Duty {
                 msg_id,
                 conflicting,
             },
+            Self::StoredEntryDropped {
+                stored_id,
+                seq,
+                generation,
+                sender,
+                accepted_at_ms,
+                reason,
+            } => AppEvent::StoredEntryDropped {
+                id,
+                stored_id,
+                seq,
+                generation,
+                sender,
+                accepted_at_ms,
+                reason,
+            },
             Self::KeptBatchDropped { batch_id } => AppEvent::KeptBatchDropped { id, batch_id },
             Self::BatchRefused { batch_id, code } => AppEvent::BatchRefused { id, batch_id, code },
             Self::AttemptDropped {
@@ -968,11 +1018,29 @@ pub enum BackupRefusal {
     TooLarge,
 }
 
+/// Which of the bounds on entries stored as [`ParkReason::Unverifiable`] an entry was
+/// dropped past (Switch spec 8.2, [`AppEvent::StoredEntryDropped`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
+pub enum DropReason {
+    /// It was kept longer than [`super::MAX_UNVERIFIED_AGE_MS`] from its acceptance,
+    /// judged on the highest service time the app verified.
+    Age,
+    /// Its sender identity held more than [`super::MAX_UNVERIFIED_PER_SENDER`] such
+    /// entries, and it was that sender's accepted earliest.
+    PerSender,
+    /// More than [`super::MAX_UNVERIFIED_TOTAL`] such entries were stored, and it was the
+    /// one accepted earliest of the sender identity that held the most.
+    Total,
+}
+
 /// Why an entry was stored locally (Switch spec 8.2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub enum ParkReason {
-    /// Its sender couldn't be checked within the bounded wait.
+    /// Its sender couldn't be checked within the bounded wait. It is tried again at every
+    /// read, within the bounds Switch spec 8.2 sets: past them it is dropped
+    /// ([`AppEvent::StoredEntryDropped`]).
     Unverifiable,
     /// Its shared record write hit a per-kind limit, the storage quota or the value size.
     Quota,

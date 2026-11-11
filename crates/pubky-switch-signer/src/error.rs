@@ -94,11 +94,6 @@ pub enum Refusal {
     /// The app request fails a check of Switch wire 3.9: the reason names the step.
     #[error("refused: {0}")]
     AppRequest(String),
-    /// The app request names an App ID listed with the same keys, which would renew its
-    /// certificate (Switch wire 3.8, 3.9 step 5); renewals aren't approved through a request
-    /// here.
-    #[error("refused: the app is listed already")]
-    AlreadyListed,
     /// The app isn't listed in the newest `identity.json`, so it has no certificate to renew.
     #[error("refused: the app isn't listed")]
     NotListed,
@@ -134,6 +129,16 @@ pub enum Refusal {
     HandingOver {
         /// The new signer's App ID.
         to_app: [u8; 16],
+    },
+    /// The device clock and the switch's signed time differ by more than the clock tolerance
+    /// (Switch spec 10.1): a certificate would be stamped with a time the switch doesn't
+    /// share, so none is issued or renewed until they agree.
+    #[error("refused: the device clock is off the switch's time")]
+    ClockOff {
+        /// The device clock, in Unix milliseconds.
+        device_ms: u64,
+        /// The switch's signed time, in Unix milliseconds.
+        switch_ms: u64,
     },
     /// No hand-over is in progress to abort.
     #[error("refused: no hand-over is in progress")]

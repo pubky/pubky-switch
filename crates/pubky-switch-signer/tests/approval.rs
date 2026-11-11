@@ -85,14 +85,122 @@ async fn test_approval_lists_the_app_and_the_app_reads_its_claim() {
 }
 
 #[tokio::test]
-async fn test_approval_of_a_listed_app_is_refused() {
+async fn test_approval_of_a_listed_app_with_its_keys_renews_its_certificate() {
+    // The app asks again with the keys it is listed with, now for fewer scopes: approving it
+    // renews its certificate with them (Switch wire 3.9 step 5, 3.8), and the approval that
+    // answers it holds the renewed certificate and the renewing version.
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let app = App::new(&["notes", "notes_tags"], None, [9; 32]);
+    world.approve(&mut signer, &app).await;
+    let id = app.keys.app_id_bytes();
+    let first = signer
+        .identity_doc()
+        .unwrap()
+        .unwrap()
+        .listed_cert(&id)
+        .unwrap();
+    let again = App::new(&["notes"], None, [10; 32]);
+    let review = signer.review(&again.request, &again.auth).unwrap();
+    assert!(review.renews);
+    assert_eq!(review.app_id, id);
+    let approved = signer.approve(review).await.unwrap();
+    let newest = signer.identity_doc().unwrap().unwrap();
+    let renewed = newest.listed_cert(&id).unwrap();
+    assert_ne!(renewed, first);
+    assert!(
+        newest
+            .body()
+            .renewed
+            .iter()
+            .any(|r| r.app_id == id && r.cert == first)
+    );
+    // Stored at the switch with its full bundle, as every renewal is.
+    assert_eq!(world.switch.app(&id).renewed.unwrap().hash(), renewed);
+
+    let identity = world.key.public();
+    let claim = ApprovalClaim::from_plaintext(&approved.claim).unwrap();
+    let json = claim.verify(&identity, &again.auth).unwrap();
+    let request = AppRequest::verify(&again.request).unwrap();
+    let read = Approval::read(
+        json,
+        &request,
+        &identity,
+        &app.keys.bundle_secret(),
+        &|scope: &str| scope == "notes",
+    )
+    .unwrap();
+    assert_eq!(read.cert.hash(), renewed);
+    assert_eq!(read.cert.scopes(), ["notes"]);
+    assert!(read.identity.listed_cert(&id) == Some(renewed));
+    assert_eq!(
+        read.keys.get(1, "notes"),
+        Some(world.key.scope_key(1, "notes"))
+    );
+    world.assert_no_version_sent_twice();
+}
+
+#[tokio::test]
+async fn test_approval_renewing_a_listed_app_holds_its_claim_until_published() {
+    // The renewing version couldn't be published: the claim was committed with it, and is
+    // released only once a later run has published it, as for every approval.
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let app = App::new(&["notes"], None, [9; 32]);
+    world.approve(&mut signer, &app).await;
+    let again = App::new(&["notes"], None, [10; 32]);
+    let review = signer.review(&again.request, &again.auth).unwrap();
+    let request = review.request_hash();
+    *world.homeserver.failing_puts.lock().unwrap() = true;
+    let error = signer.approve(review).await.unwrap_err();
+    assert!(matches!(error, SignerError::Homeserver(_)), "{error:?}");
+    assert!(signer.approved(&request).unwrap().is_none());
+    *world.homeserver.failing_puts.lock().unwrap() = false;
+    signer.resume().await.unwrap();
+    let approved = signer.approved(&request).unwrap().unwrap();
+    let claim = ApprovalClaim::from_plaintext(&approved.claim).unwrap();
+    claim.verify(&world.key.public(), &again.auth).unwrap();
+    world.assert_no_version_sent_twice();
+}
+
+#[tokio::test]
+async fn test_approval_of_a_listed_app_with_other_keys_is_refused() {
+    // The same signing key, so the same App ID, with another bundle key: a listed App ID is
+    // never given other keys (Switch wire 3.9 step 5).
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let app = App::new(&["notes"], None, [9; 32]);
+    world.approve(&mut signer, &app).await;
+    let other = App::with_keys(
+        AppKeys::from_secrets([3; 32], [44; 32]),
+        &["notes"],
+        None,
+        [10; 32],
+    );
+    assert_eq!(other.keys.app_id_bytes(), app.keys.app_id_bytes());
+    let error = signer.review(&other.request, &other.auth).unwrap_err();
+    assert!(matches!(refusal(error), Refusal::AppRequest(ref why) if why.contains("step 5")),);
+}
+
+#[tokio::test]
+async fn test_approval_of_a_listed_app_that_never_joined_isnt_renewed() {
+    // The app was approved but never delivered its record, so the switch can't take a
+    // renewed certificate for it (Switch wire 6.2): the approval is refused, and nothing is
+    // signed.
     let world = World::new();
     let (mut signer, _) = world.enrolled().await;
     let app = App::new(&["notes"], None, [9; 32]);
     let review = signer.review(&app.request, &app.auth).unwrap();
     signer.approve(review).await.unwrap();
-    let error = signer.review(&app.request, &app.auth).unwrap_err();
-    assert_eq!(refusal(error), Refusal::AlreadyListed);
+    let again = App::new(&["notes"], None, [10; 32]);
+    let review = signer.review(&again.request, &again.auth).unwrap();
+    assert!(review.renews);
+    let sent = world.sent_docs().len();
+    assert_eq!(
+        refusal(signer.approve(review).await.unwrap_err()),
+        Refusal::NotJoined
+    );
+    assert_eq!(world.sent_docs().len(), sent);
 }
 
 #[tokio::test]
