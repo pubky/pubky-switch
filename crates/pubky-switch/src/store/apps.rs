@@ -314,13 +314,14 @@ impl AccountTxn {
 
     /// The generations the account's kept proofs name (Switch wire 3.3 "Service keys"):
     /// those of each current record's write proof (7.4.9), and those of each live claim's
-    /// entry proofs (6.8), each ascending.
+    /// entry proofs (6.8), each ascending. A record taken from a recovery upload keeps no
+    /// proof (7.4.14), so it names none.
     pub async fn kept_proof_generations(&mut self) -> Result<(Vec<u64>, Vec<u64>), StoreError> {
         let id = self.head().id.clone();
         let generation = self.head().generation;
         let records: Vec<i64> = sqlx::query_scalar(
             "SELECT DISTINCT generation FROM shared_records WHERE account_id = $1 \
-             ORDER BY generation",
+             AND NOT from_upload ORDER BY generation",
         )
         .bind(&id)
         .fetch_all(self.conn())

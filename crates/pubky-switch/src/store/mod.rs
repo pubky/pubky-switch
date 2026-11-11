@@ -52,8 +52,8 @@ pub use handover::StoredHandover;
 pub use identity::HeldIdentity;
 pub use inbox::{InboxUsage, NewEntry, StoredEntry};
 pub use ops::{
-    ListName, StoredApp, StoredBundlePart, StoredClaimEntry, StoredInvite, StoredListEntry,
-    StoredRecord,
+    DivergentUpload, ListName, RecordOrigin, StoredApp, StoredBundlePart, StoredClaimEntry,
+    StoredInvite, StoredListEntry, StoredRecord,
 };
 pub use peers::{HeldPeer, PeerFloor};
 pub use snapshot::SnapshotRead;

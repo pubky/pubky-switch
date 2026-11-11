@@ -613,3 +613,125 @@ async fn test_records_list_reads_past_one_read_of_the_snapshot() {
     assert_eq!(page["next"], json!(all[34]));
     replay.db.drop_database().await.expect("drop");
 }
+
+/// Turn the record at `key` into one taken from a recovery upload (Switch wire 7.4.14), as
+/// the upload will: no proof, listed by the `upload` transition at `upload_seq`, its version
+/// a lower bound; with one divergent upload kept when `divergent`.
+async fn as_uploaded(replay: &Replay, key: &[u8; 32], upload_seq: u64, divergent: bool) {
+    use sqlx::Connection;
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    sqlx::query(
+        "UPDATE shared_records SET from_upload = true, proof = NULL, upload_seq = $3, \
+         version_exact = false WHERE account_id = $1 AND key = $2",
+    )
+    .bind(alice_id())
+    .bind(key.as_slice())
+    .bind(i64::try_from(upload_seq).expect("seq"))
+    .execute(&mut conn)
+    .await
+    .expect("uploaded");
+    if divergent {
+        sqlx::query(
+            "INSERT INTO divergent_uploads (account_id, key, position, op, op_hash) \
+             VALUES ($1, $2, 0, '\\x7b7d', $3)",
+        )
+        .bind(alice_id())
+        .bind(key.as_slice())
+        .bind([9u8; 32].as_slice())
+        .execute(&mut conn)
+        .await
+        .expect("divergent");
+    }
+}
+
+#[tokio::test]
+async fn test_records_view_of_a_record_taken_from_an_upload() {
+    let Some(replay) = registered(Limits::default()).await else {
+        return;
+    };
+    let (key, ..) = create(&replay, 1, b"uploaded", "pay").await;
+    let (plain, ..) = create(&replay, 2, b"plain", "pay").await;
+    as_uploaded(&replay, &key, 40, true).await;
+    // No proof, the upload transition's seq, and divergent (Switch wire 7.4.9).
+    let view = body(&get_as(&replay, "wallet", &format!("records/{}", b64(&key))).await);
+    assert!(view.get("proof").is_none(), "{view}");
+    assert_eq!(view["seq"], 40);
+    assert_eq!(view["divergent"], true);
+    assert_ne!(view["version"], 40);
+    // A list page shows the same.
+    let page = body(&get_as(&replay, "wallet", &list_path(&payments(), "")).await);
+    let views = page["records"].as_array().expect("records");
+    let listed = views
+        .iter()
+        .find(|v| v["key"] == b64(&key))
+        .expect("listed");
+    assert_eq!(listed, &view);
+    let other = views
+        .iter()
+        .find(|v| v["key"] == b64(&plain))
+        .expect("listed");
+    assert!(other.get("proof").is_some());
+    assert_eq!(other["divergent"], false);
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_records_write_here_on_an_uploaded_record_keeps_its_base() {
+    use sqlx::Connection;
+    let Some(replay) = registered(Limits::default()).await else {
+        return;
+    };
+    let (key, ..) = create(&replay, 1, b"uploaded", "pay").await;
+    as_uploaded(&replay, &key, 40, true).await;
+    let view = body(&get_as(&replay, "wallet", &format!("records/{}", b64(&key))).await);
+    let uploaded = RecordVersion::new(
+        view["generation"].as_u64().expect("generation"),
+        view["version"].as_u64().expect("version"),
+    );
+    let base_of = || async {
+        let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+            .await
+            .expect("conn");
+        let row: (bool, Option<i64>, Option<i64>, i64) = sqlx::query_as(
+            "SELECT from_upload, upload_base_generation, upload_base_version, \
+             (SELECT count(*) FROM divergent_uploads d WHERE d.account_id = $1 \
+             AND d.key = $2) FROM shared_records WHERE account_id = $1 AND key = $2",
+        )
+        .bind(alice_id())
+        .bind(key.as_slice())
+        .fetch_one(&mut conn)
+        .await
+        .expect("row");
+        row
+    };
+    // Two writes here: the first builds on the uploaded version, the second on the first.
+    let mut expected_version = uploaded;
+    for id in [2u8, 3] {
+        let mut put = record_put(PAYMENTS, b"uploaded", "pay", expected_version, b"{\"n\":2}");
+        put.id_inputs = None;
+        let ops = batch("wallet", id, vec![OpKind::RecordPut(put)]);
+        post(&replay, "wallet", &ops, AT).await;
+        // Written here, the divergent uploads gone, and the base the first write built on
+        // kept by the second.
+        let (from_upload, generation, version, divergent) = base_of().await;
+        assert!(!from_upload);
+        assert_eq!(
+            (generation, version),
+            (
+                Some(i64::try_from(uploaded.generation).expect("generation")),
+                Some(i64::try_from(uploaded.version).expect("version"))
+            )
+        );
+        assert_eq!(divergent, 0);
+        let view = body(&get_as(&replay, "wallet", &format!("records/{}", b64(&key))).await);
+        assert_eq!(view["divergent"], false);
+        assert!(view.get("proof").is_some());
+        expected_version = RecordVersion::new(
+            view["generation"].as_u64().expect("generation"),
+            view["version"].as_u64().expect("version"),
+        );
+    }
+    replay.db.drop_database().await.expect("drop");
+}

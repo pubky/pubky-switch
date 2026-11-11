@@ -998,7 +998,11 @@ fn shared_record(
         writer: [3; 16],
         cert: doc.clone(),
         op: doc.clone(),
-        proof: doc,
+        origin: pubky_switch::store::RecordOrigin::Written {
+            proof: doc,
+            upload_base: None,
+        },
+        divergent: false,
     }
 }
 
@@ -1297,4 +1301,253 @@ async fn test_store_records_page_keeps_key_text_order_under_any_join() {
     assert_eq!(texts.len(), 33);
     assert_eq!(texts, sorted, "key-text order");
     fx.finish().await;
+}
+
+/// A record taken from a recovery upload after a provider loss, at `version` of generation 1,
+/// listed by the `upload` transition at `seq`.
+fn uploaded_record(key: [u8; 32], version: u64, seq: u64) -> pubky_switch::store::StoredRecord {
+    let mut record = shared_record(key, [1; 32], "pay", false, version);
+    record.origin = pubky_switch::store::RecordOrigin::Uploaded { seq, exact: false };
+    record
+}
+
+async fn record_at(fx: &Fixture, key: [u8; 32]) -> pubky_switch::store::StoredRecord {
+    let mut txn = fx
+        .store()
+        .begin(ID_A)
+        .await
+        .expect("begin")
+        .expect("account");
+    let mut records = txn.records(&[key]).await.expect("records");
+    drop(txn);
+    records.pop().expect("the record")
+}
+
+#[tokio::test]
+async fn test_store_record_taken_from_an_upload_keeps_no_proof() {
+    use pubky_switch::store::RecordOrigin;
+    let Some(fx) = fixture().await else { return };
+    fx.account(ID_A).await;
+    let key = [0x51; 32];
+    {
+        let mut txn = fx
+            .store()
+            .begin(ID_A)
+            .await
+            .expect("begin")
+            .expect("account");
+        txn.put_record(&uploaded_record(key, 9, 4))
+            .await
+            .expect("put");
+        txn.commit().await.expect("commit");
+    }
+    let held = record_at(&fx, key).await;
+    assert_eq!(
+        held.origin,
+        RecordOrigin::Uploaded {
+            seq: 4,
+            exact: false
+        }
+    );
+    assert_eq!(held.origin.proof(), None);
+    assert!(!held.divergent);
+}
+
+#[tokio::test]
+async fn test_store_record_written_here_keeps_its_upload_base() {
+    use pubky_switch::store::RecordOrigin;
+    use pubky_switch_core::ops::RecordVersion;
+    let Some(fx) = fixture().await else { return };
+    fx.account(ID_A).await;
+    let key = [0x52; 32];
+    let mut record = shared_record(key, [1; 32], "pay", false, 12);
+    let RecordOrigin::Written { proof, .. } = record.origin.clone() else {
+        unreachable!("shared_record writes here");
+    };
+    record.origin = RecordOrigin::Written {
+        proof,
+        upload_base: Some(RecordVersion::new(1, 9)),
+    };
+    {
+        let mut txn = fx
+            .store()
+            .begin(ID_A)
+            .await
+            .expect("begin")
+            .expect("account");
+        txn.put_record(&record).await.expect("put");
+        txn.commit().await.expect("commit");
+    }
+    assert_eq!(record_at(&fx, key).await.origin, record.origin);
+}
+
+#[tokio::test]
+async fn test_store_divergent_uploads_keep_their_order_until_a_write_here() {
+    use pubky_switch_core::sig::SignedDoc;
+    let Some(fx) = fixture().await else { return };
+    fx.account(ID_A).await;
+    let key = [0x53; 32];
+    let first = SignedDoc::from_parts(b"{\"a\":1}", &[1; 64]);
+    let second = SignedDoc::from_parts(b"{\"a\":2}", &[2; 64]);
+    {
+        let mut txn = fx
+            .store()
+            .begin(ID_A)
+            .await
+            .expect("begin")
+            .expect("account");
+        txn.put_record(&uploaded_record(key, 9, 4))
+            .await
+            .expect("put");
+        txn.add_divergent_upload(&key, &first, &[1; 32])
+            .await
+            .expect("first");
+        txn.add_divergent_upload(&key, &second, &[2; 32])
+            .await
+            .expect("second");
+        // The same upload twice is refused: the caller keeps each once.
+        assert!(
+            txn.add_divergent_upload(&key, &first, &[1; 32])
+                .await
+                .is_err()
+        );
+        drop(txn);
+    }
+    {
+        let mut txn = fx
+            .store()
+            .begin(ID_A)
+            .await
+            .expect("begin")
+            .expect("account");
+        txn.put_record(&uploaded_record(key, 9, 4))
+            .await
+            .expect("put");
+        txn.add_divergent_upload(&key, &first, &[1; 32])
+            .await
+            .expect("first");
+        txn.add_divergent_upload(&key, &second, &[2; 32])
+            .await
+            .expect("second");
+        let kept = txn.divergent_uploads(&key).await.expect("kept");
+        assert_eq!(
+            kept.iter()
+                .map(|d| (d.position, d.op_hash))
+                .collect::<Vec<_>>(),
+            vec![(0, [1; 32]), (1, [2; 32])]
+        );
+        assert_eq!(kept[1].op, second);
+        // A newer upload replacing the record keeps them.
+        txn.put_record(&uploaded_record(key, 11, 5))
+            .await
+            .expect("replace");
+        assert_eq!(txn.divergent_uploads(&key).await.expect("kept").len(), 2);
+        txn.commit().await.expect("commit");
+    }
+    assert!(record_at(&fx, key).await.divergent);
+    // A write here is a newer version at this service: it clears them.
+    {
+        let mut txn = fx
+            .store()
+            .begin(ID_A)
+            .await
+            .expect("begin")
+            .expect("account");
+        txn.put_record(&shared_record(key, [1; 32], "pay", false, 20))
+            .await
+            .expect("write here");
+        assert!(txn.divergent_uploads(&key).await.expect("kept").is_empty());
+        txn.commit().await.expect("commit");
+    }
+    assert!(!record_at(&fx, key).await.divergent);
+}
+
+#[tokio::test]
+async fn test_store_record_origin_checks_refuse_mixed_rows() {
+    let Some(fx) = fixture().await else { return };
+    fx.account(ID_A).await;
+    let mut conn = PgConnection::connect_with(fx.db.options())
+        .await
+        .expect("conn");
+    let insert = |columns: &str, values: &str| {
+        format!(
+            "INSERT INTO shared_records (account_id, key, collection, read_scope, write_scopes, \
+             generation, version, deleted, value_bytes, writer, cert, op{columns}) VALUES \
+             ($1, $2, $2, 'pay', '{{pay}}', 1, 1, false, 0, $3, '\\x7b7d', '\\x7b7d'{values})"
+        )
+    };
+    let cases = [
+        // Written here without a proof.
+        (", proof", ", NULL"),
+        // Uploaded with a proof, or without its seq.
+        (", proof, from_upload, upload_seq", ", '\\x7b7d', true, 3"),
+        (", from_upload", ", true"),
+        // Written here with a lower bound, a seq, or half an upload base.
+        (", proof, version_exact", ", '\\x7b7d', false"),
+        (", proof, upload_seq", ", '\\x7b7d', 3"),
+        (", proof, upload_base_generation", ", '\\x7b7d', 1"),
+        // Uploaded with an upload base.
+        (
+            ", from_upload, upload_seq, upload_base_generation, upload_base_version",
+            ", true, 3, 1, 2",
+        ),
+    ];
+    for (i, (columns, values)) in cases.iter().enumerate() {
+        let key = [u8::try_from(i).expect("small"); 32];
+        let result = sqlx::query(&insert(columns, values))
+            .bind(ID_A)
+            .bind(key.as_slice())
+            .bind([3u8; 16].as_slice())
+            .execute(&mut conn)
+            .await;
+        assert!(result.is_err(), "case {i} {columns}");
+    }
+    // The two shapes that hold.
+    for (i, (columns, values)) in [
+        (", proof", ", '\\x7b7d'"),
+        (
+            ", from_upload, upload_seq, version_exact",
+            ", true, 3, false",
+        ),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let key = [0x60 + u8::try_from(i).expect("small"); 32];
+        sqlx::query(&insert(columns, values))
+            .bind(ID_A)
+            .bind(key.as_slice())
+            .bind([3u8; 16].as_slice())
+            .execute(&mut conn)
+            .await
+            .expect(columns);
+    }
+}
+
+#[tokio::test]
+async fn test_store_kept_proof_generations_leave_out_uploaded_records() {
+    let Some(fx) = fixture().await else { return };
+    fx.account(ID_A).await;
+    let mut txn = fx
+        .store()
+        .begin(ID_A)
+        .await
+        .expect("begin")
+        .expect("account");
+    // An uploaded record of generation 1 keeps no proof, so it names no generation.
+    txn.put_record(&uploaded_record([0x54; 32], 9, 4))
+        .await
+        .expect("put");
+    assert_eq!(
+        txn.kept_proof_generations().await.expect("generations").0,
+        Vec::<u64>::new()
+    );
+    txn.put_record(&shared_record([0x55; 32], [1; 32], "pay", false, 3))
+        .await
+        .expect("put");
+    assert_eq!(
+        txn.kept_proof_generations().await.expect("generations").0,
+        vec![1]
+    );
+    drop(txn);
 }

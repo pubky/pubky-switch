@@ -22,7 +22,9 @@ use pubky_switch_core::{
     sig::SignedDoc,
 };
 
-use super::state::{Before, HeldInvite, HeldPart, HeldRecord, ListEntry, NewClaimEntry, OpsState};
+use super::state::{
+    Before, HeldInvite, HeldOrigin, HeldPart, HeldRecord, ListEntry, NewClaimEntry, OpsState,
+};
 
 /// A batch, as authenticated, to apply.
 #[derive(Clone, Copy, Debug)]
@@ -225,7 +227,11 @@ fn apply_op(
                     writer: cert.app_id(),
                     cert: cert.signed().clone(),
                     op: op.signed().clone(),
-                    proof: None,
+                    origin: HeldOrigin::Written {
+                        proof: None,
+                        upload_base: held.and_then(HeldRecord::upload_base),
+                    },
+                    divergent: false,
                 },
             );
             StateAfter::Record(version)
