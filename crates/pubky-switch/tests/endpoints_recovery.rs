@@ -1849,11 +1849,15 @@ async fn recovered_with_the_wallet(replay: &Replay) -> (IdentityDoc, u64) {
 }
 
 async fn upload(replay: &Replay, body: &Value, at_ms: u64) -> SwitchResponse {
+    upload_as(replay, &wallet_keys(), body, at_ms).await
+}
+
+async fn upload_as(replay: &Replay, keys: &Value, body: &Value, at_ms: u64) -> SwitchResponse {
     let path = format!("/v1/{}/recovery/upload", alice_id());
     let body = serde_json::to_vec(body).expect("json");
     replay
         .service
-        .handle(app_request(&wallet_keys(), "POST", &path, body, at_ms))
+        .handle(app_request(keys, "POST", &path, body, at_ms))
         .await
 }
 
@@ -2026,12 +2030,74 @@ async fn test_upload_contacts_end_staged_admission_and_lists_only_add() {
 }
 
 #[tokio::test]
+async fn test_upload_lists_need_the_callers_permission() {
+    // The executor, current again, holds no list permission: contacts or deny entries from
+    // it are `403 permission_missing` for the whole upload, which merges and chains nothing,
+    // and admission stays staged (Switch wire 7.4.14).
+    let Some(replay) = replay().await else { return };
+    let (_, at) = recovered_with_the_wallet(&replay).await;
+    let keys = vectors("keys.json");
+    let executor = app(&keys, "executor").clone();
+    let record: SignedDoc = serde_json::from_value(
+        named(
+            &vectors("documents.json")["documents"],
+            "executor app record",
+        )["signed"]
+            .clone(),
+    )
+    .expect("record");
+    let secret = ed25519_dalek::SigningKey::from_bytes(&hex32(&executor["signing_secret_hex"]));
+    let app_id: [u8; 16] = hex::decode(executor["app_id_bytes_hex"].as_str().expect("hex"))
+        .expect("hex")
+        .try_into()
+        .expect("16 bytes");
+    let batch = pubky_switch_core::ops::sign_batch(
+        &secret,
+        &alice_key().public(),
+        Some(app_id),
+        2,
+        [78; 16],
+        vec![(
+            Vec::new(),
+            pubky_switch_core::ops::OpKind::AppPut { record },
+        )],
+    )
+    .expect("batch");
+    let body = pubky_switch_core::ops::OpsRequest::new(&batch, None).to_json();
+    let path = format!("/v1/{}/ops", alice_id());
+    let put = replay
+        .service
+        .handle(app_request(&executor, "POST", &path, body, at))
+        .await;
+    assert_eq!(put.status, 200, "{}", String::from_utf8_lossy(&put.body));
+    let length = chain(&replay).await.len();
+    let bob = pubky_switch_core::enc::pubky_id(&[40; 32]);
+    for lists in [json!({ "contacts": [] }), json!({ "deny": [bob] })] {
+        let refused = upload_as(&replay, &executor, &json!({ "lists": lists }), at).await;
+        assert_eq!(
+            code(&refused),
+            (403, "permission_missing".into()),
+            "{lists}"
+        );
+    }
+    assert_eq!(chain(&replay).await.len(), length);
+    assert_eq!(admission_staged(&replay, at).await, json!(true));
+    // Without lists it uploads as any own app.
+    assert_eq!(
+        upload_as(&replay, &executor, &json!({}), at).await.status,
+        200
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
 async fn test_upload_refusals() {
     // `404` at an account in neither stage; after the loss, `400` for a body that doesn't
     // read and `429` past `uploads_per_app_per_hour`, with what to wait. A refusal merges
     // and chains nothing.
     let limits = pubky_switch::limits::Limits {
-        uploads_per_app_per_hour: 2,
+        uploads_per_app_per_hour: 3,
+        max_contacts: 1,
         ..pubky_switch::limits::Limits::default()
     };
     let Some(replay) = replay_with(limits.clone()).await else {
@@ -2057,9 +2123,19 @@ async fn test_upload_refusals() {
     assert_eq!(code(&bad), (400, "bad_request".into()));
     assert_eq!(upload(&replay, &json!({}), at).await.status, 200);
     assert_eq!(upload(&replay, &json!({}), at).await.status, 200);
+    // Entries past `max_contacts` are dropped, not refused.
+    let two = [[40; 32], [41; 32]].map(|k| pubky_switch_core::enc::pubky_id(&k));
+    let capped = upload(&replay, &json!({ "lists": { "contacts": two } }), at).await;
+    assert_eq!(capped.status, 200);
+    let allow = wallet_get(&replay, "allow", at).await;
+    assert_eq!(
+        allow["contacts"].as_array().map(Vec::len),
+        Some(1),
+        "{allow}"
+    );
     let limited = upload(&replay, &json!({}), at).await;
     assert_eq!(code(&limited), (429, "rate_limited".into()));
     assert!(header_text(&limited, "retry-after").is_some());
-    assert_eq!(chain(&replay).await.len(), length + 2);
+    assert_eq!(chain(&replay).await.len(), length + 3);
     replay.db.drop_database().await.expect("drop");
 }
