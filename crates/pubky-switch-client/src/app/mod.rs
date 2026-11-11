@@ -100,8 +100,8 @@ pub use directory::{
     SwitchAnswer, SwitchCopy, SwitchLookup,
 };
 pub use records::{
-    Collection, FlaggedWrite, KeptOp, PolicyFamily, RecordContent, RecordTarget, SharedEvidence,
-    SharedRecord, Unopened,
+    Collection, FlaggedWrite, KeptOp, KeptReason, PolicyFamily, RecordContent, RecordRead,
+    RecordTarget, SharedEvidence, SharedRecord, Unopened,
 };
 pub use send::{
     Delivery, MAX_CARRIED_OUTBOX_BYTES, OutboxReport, OutgoingMessage, RecordJob,

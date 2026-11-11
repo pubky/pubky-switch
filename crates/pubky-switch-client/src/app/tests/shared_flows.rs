@@ -17,10 +17,10 @@ use serde_json::{Map, json};
 
 use super::*;
 use crate::app::{
-    Alarm, AppError, AppEvent, ClaimOp, Collection, Delivery, IdentityRefresh,
+    Alarm, AppError, AppEvent, ClaimOp, Collection, Delivery, IdentityRefresh, KeptReason,
     MAX_REGRESSION_REASON_BYTES, MAX_SEEN_MARK_BYTES, ObligationDeadline, OpBatch, OutgoingMessage,
-    RecordContent, RecordJob, RecordTarget, Refusal, SentMessage, UndeliverableReason, Unopened,
-    WriteBase, claim_conflict,
+    RecordContent, RecordJob, RecordRead, RecordTarget, Refusal, SentMessage, UndeliverableReason,
+    Unopened, WriteBase, claim_conflict,
 };
 use crate::store::StoreHandle;
 use crate::store::{Fault as StoreFault, FaultStore};
@@ -5293,4 +5293,61 @@ async fn test_records_unopenable_with_its_key_held_is_tried_once() {
         "{:?}",
         report.events
     );
+}
+
+// -------------------------------------------------------------------------------------
+// A record read now, or an earlier copy kept (Switch wire 7.4.9)
+
+#[tokio::test]
+async fn test_records_read_fresh_tells_a_fresh_read_from_a_kept_copy() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    let target = s.target("n1");
+    let key = wallet.record_key(&target).unwrap();
+    wallet
+        .put_record(&target, &value(&["a", "b"]), vec![])
+        .await
+        .unwrap();
+    // Read now.
+    match phone.read_record_fresh(&target).await.unwrap() {
+        RecordRead::Fresh(record) => assert_eq!(ids(record.content.value()), ["a", "b"]),
+        other => panic!("{other:?}"),
+    }
+    // The wallet drops b, which the phone has seen: the newer write is refused, and the
+    // phone keeps its copy.
+    wallet
+        .put_record(&target, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    match phone.read_record_fresh(&target).await.unwrap() {
+        RecordRead::Kept {
+            record: Some(record),
+            reason: KeptReason::Refused,
+        } => assert_eq!(ids(record.content.value()), ["a", "b"]),
+        other => panic!("{other:?}"),
+    }
+    // The switch forgets the record: a 404, and the copy kept.
+    s.w.switch.lock().shared.records.remove(&key);
+    match phone.read_record_fresh(&target).await.unwrap() {
+        RecordRead::Kept {
+            record: Some(record),
+            reason: KeptReason::NotFound,
+        } => assert_eq!(ids(record.content.value()), ["a", "b"]),
+        other => panic!("{other:?}"),
+    }
+    // The switch can't be reached: the copy kept.
+    s.w.switch.fail_next(Fault::Unreachable {
+        path: "records/".into(),
+        after: 0,
+    });
+    assert!(matches!(
+        phone.read_record_fresh(&target).await.unwrap(),
+        RecordRead::Kept {
+            record: Some(_),
+            reason: KeptReason::Unreachable(_),
+        }
+    ));
+    // The read the existing call makes still returns the copy.
+    assert!(phone.read_record(&target).await.unwrap().is_some());
 }

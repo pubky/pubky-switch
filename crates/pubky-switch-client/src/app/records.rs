@@ -622,6 +622,48 @@ enum Refused {
     Unheld(Collection),
 }
 
+/// What reading a write came to ([`App::read_write`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WriteRead {
+    /// Taken, or the very write the app held.
+    Taken,
+    /// No newer than the write held.
+    NotNewer,
+    /// Refused: a failed check, a regression the protocol found, or a write the app doesn't
+    /// take.
+    Refused,
+}
+
+/// What a read of one record came to ([`App::read_record_fresh`], Switch wire 7.4.9).
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RecordRead {
+    /// Read now: the switch's current write is the one the app holds.
+    Fresh(SharedRecord),
+    /// Nothing read now replaced what the app holds: the earlier copy it keeps, if any.
+    Kept {
+        /// The copy the app keeps.
+        record: Option<SharedRecord>,
+        /// Why nothing read now replaced it.
+        reason: KeptReason,
+    },
+}
+
+/// Why a read of a record kept the earlier copy ([`RecordRead::Kept`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum KeptReason {
+    /// The switch holds no record at the key, or forgot it (`404`).
+    NotFound,
+    /// The switch's write was refused: a failed check, or one that goes back on what the
+    /// app has seen ([`super::AppEvent::WriteFlagged`]).
+    Refused,
+    /// The switch's write is no newer than the one the app holds.
+    NotNewer,
+    /// The switch couldn't be read: the error, without content.
+    Unreachable(String),
+}
+
 /// What [`App::take_write`] did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Taken {
@@ -758,18 +800,65 @@ impl App {
         .await
     }
 
+    /// Read the record at `key` from the switch and take its write; what came of it, `None`
+    /// for a key the switch doesn't know.
     pub(crate) async fn fetch_record(
         &mut self,
         key: &[u8; 32],
         collection: &Collection,
-    ) -> Result<(), AppError> {
+    ) -> Result<Option<WriteRead>, AppError> {
         let Some(view) = self.record_view(key).await? else {
-            return Ok(());
+            return Ok(None);
         };
         let mut tx = self.tx()?;
-        self.take_view(&view, Some((key, collection)), &mut tx)
+        let read = self
+            .take_view(&view, Some((key, collection)), &mut tx)
             .await?;
-        self.commit(tx).await
+        self.commit(tx).await?;
+        Ok(Some(read))
+    }
+
+    /// [`App::read_record`], telling a copy read now from an earlier one the app keeps
+    /// (Switch wire 7.4.9): [`RecordRead::Fresh`] when the switch's current write is what the
+    /// app holds after the read, taken now or the very write it held; otherwise
+    /// [`RecordRead::Kept`], with the copy the app keeps, if any, and why nothing read now
+    /// replaced it: a `404`, a write refused or no newer than the one held, or a switch it
+    /// couldn't read. A kept copy isn't evidence of the switch's state now.
+    ///
+    /// # Errors
+    ///
+    /// A rollback for signed evidence of misbehaviour, an alarm, a refusal of the app's
+    /// rules, or a failed commit. A failed call isn't one: it reads as
+    /// [`KeptReason::Unreachable`].
+    pub async fn read_record_fresh(
+        &mut self,
+        target: &RecordTarget,
+    ) -> Result<RecordRead, AppError> {
+        Box::pin(async move {
+            self.ready_local().await?;
+            self.refuse_when_stopped()?;
+            let key = self.record_key(target)?;
+            let reason = match self.fetch_record(&key, &target.collection).await {
+                Ok(Some(WriteRead::Taken)) => {
+                    if let Some(record) = self.shared_record(&key).await? {
+                        return Ok(RecordRead::Fresh(record));
+                    }
+                    KeptReason::Refused
+                }
+                Ok(Some(WriteRead::NotNewer)) => KeptReason::NotNewer,
+                Ok(Some(WriteRead::Refused)) => KeptReason::Refused,
+                Ok(None) => KeptReason::NotFound,
+                Err(error @ (AppError::Switch(_) | AppError::Transport(_))) => {
+                    KeptReason::Unreachable(error.to_string())
+                }
+                Err(error) => return Err(error),
+            };
+            Ok(RecordRead::Kept {
+                record: self.shared_record(&key).await?,
+                reason,
+            })
+        })
+        .await
     }
 
     /// The switch's view of record `key` (`GET /records/{key}`, Switch wire 7.4.9); `None`
@@ -937,7 +1026,7 @@ impl App {
         view: &SharedRecordView,
         expect: Option<(&[u8; 32], &Collection)>,
         tx: &mut Tx,
-    ) -> Result<(), AppError> {
+    ) -> Result<WriteRead, AppError> {
         let evidence = Evidence {
             op: &view.op,
             cert: Some(&view.cert),
@@ -974,7 +1063,8 @@ impl App {
             view_version: None,
         };
         let key = put.key;
-        self.read_write(&evidence, None, key, tx).await
+        self.read_write(&evidence, None, key, tx).await?;
+        Ok(())
     }
 
     /// Check a write and take it, or flag it, or raise the rollback it proves.
@@ -984,7 +1074,7 @@ impl App {
         expect: Option<(&[u8; 32], &Collection)>,
         shown_key: [u8; 32],
         tx: &mut Tx,
-    ) -> Result<(), AppError> {
+    ) -> Result<WriteRead, AppError> {
         let mut outcome = self.accept_write(evidence, expect, tx).await?;
         let mut version = evidence
             .stub
@@ -1027,7 +1117,11 @@ impl App {
         }
         match outcome {
             Ok(accepted) => {
-                self.take_write(accepted, false, tx).await?;
+                return Ok(match self.take_write(accepted, false, tx).await? {
+                    Taken::New | Taken::Same => WriteRead::Taken,
+                    Taken::NotNewer => WriteRead::NotNewer,
+                    Taken::Flagged => WriteRead::Refused,
+                });
             }
             Err(Refused::Misbehaviour(reason)) => {
                 return Err(self.raise(Alarm::Rollback { reason }).await);
@@ -1051,7 +1145,7 @@ impl App {
             }
             Err(Refused::Ignored | Refused::Unheld(_)) => {}
         }
-        Ok(())
+        Ok(WriteRead::Refused)
     }
 
     /// Record a refused write, and follow its version when it is the switch's current one
