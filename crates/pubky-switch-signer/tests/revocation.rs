@@ -1145,7 +1145,7 @@ async fn test_purge_removed_drops_the_entry_and_keeps_the_app_id() {
 }
 
 #[tokio::test]
-async fn test_full_bundle_request_gets_the_missing_parts_and_the_listed_certificate() {
+async fn test_full_bundle_request_gets_every_epoch_and_the_listed_certificate() {
     // `a` is renewed, and its record still carries the earlier certificate. A later
     // rotation's prune lets the signer forget the part it stored for `a`, once `a` passed it,
     // so it can't tell what `a` holds. `a` asks for its full bundle: the signer stores the
@@ -1359,9 +1359,9 @@ async fn test_owed_record_cleanup_waits_for_a_fresh_check() {
 #[tokio::test]
 async fn test_revocation_checks_the_switch_again_after_completing_a_given_up_epoch() {
     // The revocation completes a given-up epoch in a version of its own, then another
-    // install delivers the next version before the rotation goes out. The switch is checked
-    // again before the rotation's batches: the other install is named, and nothing more is
-    // sent, no batch and no version (Switch spec 4.3, 3.2).
+    // install delivers the next version before the rotation goes out. The rotation's batches
+    // check the switch before each one (`send_renewal`): the other install is named, and
+    // nothing more is sent, no batch and no version (Switch spec 4.3, 3.2).
     use pubky_switch_client::transport::MockTransport;
     let world = World::new();
     let (mut signer, store) = world.enrolled().await;
@@ -1425,4 +1425,205 @@ async fn test_revocation_checks_the_switch_again_after_completing_a_given_up_epo
         Vec::<String>::new(),
         "nothing more signed"
     );
+}
+
+#[tokio::test]
+async fn test_full_bundle_request_is_answered_though_the_stored_parts_cover_every_epoch() {
+    // `a`'s renewal stored its full bundle, so the parts at the switch already cover every
+    // epoch for its listed certificate. `a` asks all the same, as an app that lost its copy
+    // does: the signer stores every epoch again, which clears the request (Switch wire 3.5).
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let (a, _) = two_joined(&world, &mut signer).await;
+    let id = a.keys.app_id_bytes();
+    signer
+        .renew(
+            id,
+            CertChange {
+                scopes: None,
+                expires_at: Some(START_MS + 400 * DAY_MS),
+            },
+        )
+        .await
+        .unwrap();
+    let current = signer.identity_doc().unwrap().unwrap().data_epoch();
+    assert_eq!(world.switch.bundles_of(&id), [(1, current)]);
+    let stored = world.switch.bundle_parts_of(&id);
+    world.switch.request_full_bundle(id);
+    assert_eq!(signer.serve_full_bundles().await.unwrap(), [id]);
+    assert!(world.switch.app(&id).full_requested.is_none());
+    assert_ne!(world.switch.bundle_parts_of(&id), stored, "stored again");
+    assert!(holds(&world, &opened(&world, &a), 1, "notes"));
+    // Answered, nothing more is sent.
+    assert!(signer.serve_full_bundles().await.unwrap().is_empty());
+}
+
+fn key_bundle_puts(world: &World, id: &[u8; 16]) -> usize {
+    world
+        .switch
+        .applied()
+        .iter()
+        .filter(
+            |op| matches!(&op.body().kind, OpKind::KeyBundlePut(put) if put.target_app_id == *id),
+        )
+        .count()
+}
+
+#[tokio::test]
+async fn test_full_bundle_request_at_epoch_two_holds_every_epoch_from_one() {
+    // A removal rotated the data epoch past 1, and the catch-up stored `a`'s part for the
+    // new epoch alone. `a` asks: one range from epoch 1 to the current one, every epoch of
+    // both its scopes and no other scope, the request cleared, and the backup records what
+    // the switch holds (Switch wire 3.5 "Full bundles on request").
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let (a, b) = two_joined(&world, &mut signer).await;
+    let id = a.keys.app_id_bytes();
+    signer
+        .revoke(b.keys.app_id_bytes(), None, confirmed())
+        .await
+        .unwrap();
+    signer.run_due().await.unwrap();
+    let current = signer.identity_doc().unwrap().unwrap().data_epoch();
+    assert!(current >= 2, "epoch {current}");
+    world.switch.request_full_bundle(id);
+    assert_eq!(signer.serve_full_bundles().await.unwrap(), [id]);
+    assert!(world.switch.app(&id).full_requested.is_none(), "cleared");
+    assert_eq!(world.switch.bundles_of(&id), [(1, current)]);
+    let parts = opened(&world, &a);
+    for epoch in 1..=current {
+        assert!(holds(&world, &parts, epoch, "notes"), "notes at {epoch}");
+        assert!(
+            holds(&world, &parts, epoch, "notes_sync"),
+            "notes_sync at {epoch}"
+        );
+    }
+    // Only the listed certificate's scopes.
+    assert!(parts.iter().all(|p| {
+        p.keys
+            .keys
+            .iter()
+            .all(|k| k.scope == "notes" || k.scope == "notes_sync")
+    }));
+    // The signer's record and its backup say what the switch holds.
+    let backup = world.backup();
+    let recorded: Vec<(u64, u64)> = backup
+        .bundle_parts()
+        .iter()
+        .filter(|p| p.app_id == id)
+        .map(|p| (p.first_epoch, p.last_epoch))
+        .collect();
+    assert_eq!(recorded, [(1, current)]);
+}
+
+#[tokio::test]
+async fn test_full_bundle_second_request_replaces_the_first() {
+    // Two requests, each answered with a full bundle: the second's parts replace the first's,
+    // one range, the request cleared (Switch wire 3.5, 6.2).
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let (a, _) = two_joined(&world, &mut signer).await;
+    let id = a.keys.app_id_bytes();
+    world.switch.request_full_bundle(id);
+    assert_eq!(signer.serve_full_bundles().await.unwrap(), [id]);
+    let first = world.switch.bundle_parts_of(&id);
+    world.switch.request_full_bundle(id);
+    assert_eq!(signer.serve_full_bundles().await.unwrap(), [id]);
+    let second = world.switch.bundle_parts_of(&id);
+    assert_ne!(first, second);
+    assert_eq!(world.switch.bundles_of(&id).len(), 1);
+    assert!(world.switch.app(&id).full_requested.is_none());
+    assert!(holds(&world, &opened(&world, &a), 1, "notes"));
+    assert!(signer.serve_full_bundles().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_full_bundle_lost_answer_is_resumed_with_the_same_parts() {
+    // The batch lands and its answer is lost: the flow keeps the signed parts, and the next
+    // run sends the same bytes, which the switch takes as stored once (Switch wire 3.5).
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let (a, _) = two_joined(&world, &mut signer).await;
+    let id = a.keys.app_id_bytes();
+    world.switch.request_full_bundle(id);
+    let before = key_bundle_puts(&world, &id);
+    world.switch.fail_next(SwitchFault::LoseAnswer {
+        path: "/ops".into(),
+    });
+    signer.serve_full_bundles().await.unwrap_err();
+    let landed = world.switch.bundle_parts_of(&id);
+    assert_eq!(key_bundle_puts(&world, &id), before + landed.len());
+    // A later run: the flow goes first, with the same bytes.
+    assert!(
+        signer.serve_full_bundles().await.is_err(),
+        "a flow in progress"
+    );
+    signer.resume().await.unwrap();
+    assert_eq!(world.switch.bundle_parts_of(&id), landed, "the same parts");
+    assert_eq!(
+        key_bundle_puts(&world, &id),
+        before + landed.len(),
+        "stored once"
+    );
+    assert!(world.switch.app(&id).full_requested.is_none());
+    assert!(signer.serve_full_bundles().await.unwrap().is_empty());
+}
+
+/// How many `POST /ops` the switch got so far.
+fn ops_sent(world: &World) -> usize {
+    world
+        .transport
+        .requests()
+        .iter()
+        .filter(|r| r.method == "POST" && r.path_and_query.ends_with("/ops"))
+        .count()
+}
+
+#[tokio::test]
+async fn test_full_bundle_request_of_an_app_that_left_is_skipped_quietly() {
+    // `b` left, and the signer hasn't processed the departure yet: the switch shows it not
+    // current. Its request is skipped: nothing is sent, and no refusal is raised (Switch wire
+    // 3.5, 7.4.12).
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let (_, b) = two_joined(&world, &mut signer).await;
+    let b_id = b.keys.app_id_bytes();
+    world.switch.request_full_bundle(b_id);
+    world.switch.leave(b_id).unwrap();
+    let sent = ops_sent(&world);
+    assert!(signer.serve_full_bundles().await.unwrap().is_empty());
+    assert_eq!(ops_sent(&world), sent, "nothing sent");
+    assert!(
+        !signer
+            .alerts()
+            .contains(&Alert::FullBundleRefused { app_id: b_id })
+    );
+}
+
+#[tokio::test]
+async fn test_full_bundle_refused_request_isnt_sent_again() {
+    // The switch refuses `a`'s full bundle (`409`): the refusal is raised, and the same
+    // request isn't sent again at later runs (Switch wire 3.5).
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let (a, _) = two_joined(&world, &mut signer).await;
+    let a_id = a.keys.app_id_bytes();
+    world.switch.request_full_bundle(a_id);
+    world.switch.fail_next(SwitchFault::Error {
+        path: "/ops".into(),
+        code: pubky_switch_core::http::ErrorCode::Conflict,
+        current: serde_json::Value::Null,
+    });
+    assert!(signer.serve_full_bundles().await.unwrap().is_empty());
+    assert!(
+        signer
+            .alerts()
+            .contains(&Alert::FullBundleRefused { app_id: a_id })
+    );
+    let sent = ops_sent(&world);
+    for _ in 0..2 {
+        assert!(signer.serve_full_bundles().await.unwrap().is_empty());
+    }
+    assert_eq!(ops_sent(&world), sent, "not sent again");
+    assert!(world.switch.app(&a_id).full_requested.is_some());
 }

@@ -65,8 +65,8 @@ pub use identity::{
 pub use key_bundle::{
     BundlePart, BundleReading, KEY_BUNDLE_KIND, KeyBundle, KeyBundleContents, MissingKeys,
     PartReader, SkipReason, SkippedPart, StoredPart, check_bundle_keys, check_part_order,
-    covers_from_one, full_bundle_ranges, incremental_first_epoch, keyed_scopes, missing_keys,
-    missing_ranges, needs_cert_put, note_stored, ranges_for_cert, reader_certs, seal_bundle_parts,
+    covers_from_one, incremental_first_epoch, keyed_scopes, missing_keys, missing_ranges,
+    needs_cert_put, note_stored, reader_certs, seal_bundle_parts,
 };
 pub use receive_key::{RECEIVE_KEY_KIND, ReceiveKeyBody, ReceiveKeyRecord};
 pub use renewal::{
