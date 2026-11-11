@@ -212,6 +212,8 @@ impl Signer {
             !matches!(a, Alert::RevocationUnconfirmed { app_id }
                 | Alert::RevocationPending { app_id, .. } if cut.contains(app_id))
         });
+        // A removed app is renewed no more: its count and its alert go with it.
+        super::renewal::renewals_taken_in(&mut state, &cut);
         for removed in &removing {
             if !state.tombstones.contains(&removed.app_id) {
                 state.tombstones.push(removed.app_id);

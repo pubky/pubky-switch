@@ -155,7 +155,9 @@ pub(crate) struct SignerState {
     pub(crate) cert_lifetime_ms: u64,
     /// For each app, how many automatic renewals in a row no record of it has taken up: at
     /// two, the signer stops renewing it by itself (Switch spec 3.1). A renewal the user asks
-    /// for, or a record carrying the newest certificate, takes the app out.
+    /// for, or a record carrying the newest certificate, takes the app out, as the app's
+    /// removal does. Changed in the commit of the renewing version. This install's own: a new
+    /// install starts it from 0.
     #[serde(default)]
     pub(crate) untaken_renewals: Vec<([u8; 16], u32)>,
     /// The companion claims of approvals, signed once, until the host has delivered them

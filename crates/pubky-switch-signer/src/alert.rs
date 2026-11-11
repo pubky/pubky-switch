@@ -133,7 +133,8 @@ pub enum Alert {
     /// then the switch refuses its every request, its feed read included, and readers check
     /// what it writes or sends against that expiry. The user renews it, which brings it back
     /// with nothing from the app (Switch wire 3.8 "An expired certificate"), or removes it.
-    /// Cleared once the user renews it or a record of it carries the newest certificate.
+    /// Cleared once the user renews it, a record of it carries the newest certificate, or the
+    /// app is removed.
     RenewalsStopped {
         /// The app.
         app_id: [u8; 16],
