@@ -11,6 +11,8 @@
 //! certificate, each transition proof with the lost generation's service key, and judges a
 //! removed app's operations ([`removed_app_counts`]); it passes in only what counted.
 
+use std::collections::BTreeSet;
+
 use serde_json::{Value, json};
 
 use crate::claims::{
@@ -56,6 +58,27 @@ impl UploadVersion {
     }
 }
 
+/// An uploaded `record.put`, as the merge compares it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UploadedRecord {
+    /// `doc_hash` of the signed operation.
+    pub op_hash: [u8; 32],
+    /// The version it built on, its `expected_version`.
+    pub built_on: RecordVersion,
+    /// Its version: the proof's, or the lower bound.
+    pub version: UploadVersion,
+}
+
+/// The uploaded version the first write here built on (Switch wire 10.3 `upload_base`), and
+/// its operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UploadBase {
+    /// Its version.
+    pub version: RecordVersion,
+    /// `doc_hash` of its operation.
+    pub op_hash: [u8; 32],
+}
+
 /// A record as the merge sees it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HeldRecord<'a> {
@@ -63,19 +86,21 @@ pub enum HeldRecord<'a> {
     Lacking,
     /// Its current write came from an upload.
     FromUpload {
-        /// `hash` of the signed operation's bytes.
+        /// `doc_hash` of the signed operation.
         op_hash: [u8; 32],
+        /// The version it built on, its operation's `expected_version`.
+        built_on: RecordVersion,
         /// Its version.
         version: UploadVersion,
-        /// `hash` of each divergent upload kept for the record.
+        /// `doc_hash` of each divergent upload kept for the record.
         divergent: &'a [[u8; 32]],
     },
     /// Its current write was made at this service.
     WrittenHere {
-        /// The uploaded version the first write here built on, or `None` when the writes here
-        /// built on none (Switch wire 10.3 `upload_base`).
-        upload_base: Option<RecordVersion>,
-        /// `hash` of each divergent upload kept for the record.
+        /// What the first write here built on, or `None` when the writes here built on no
+        /// upload.
+        upload_base: Option<UploadBase>,
+        /// `doc_hash` of each divergent upload kept for the record.
         divergent: &'a [[u8; 32]],
     },
 }
@@ -87,7 +112,8 @@ pub enum RecordMerge {
     Fill,
     /// It replaces a record held only from uploads, at a lower version.
     Replace,
-    /// The same operation, now with a proof: the record's version becomes the proof's.
+    /// The same operation, now with a proof where the record held a lower bound: the
+    /// record's version becomes the proof's.
     MakeExact,
     /// It conflicts: kept as a divergent upload, or dropped past the limit (`kept: false`),
     /// and listed in `divergent` either way.
@@ -95,55 +121,57 @@ pub enum RecordMerge {
         /// Whether it is kept.
         kept: bool,
     },
-    /// It changes nothing: an older upload, one already held, or one no newer than the
-    /// version the writes here built on.
+    /// It changes nothing: the same operation again, an older upload, or one no newer than
+    /// the version the writes here built on.
     Unchanged,
 }
 
-/// Merge an uploaded `record.put`, `op_hash` the hash of its signed bytes, at `version`, into
-/// the record at its key (Switch wire 7.4.14 "Records", Switch spec 12.6 step 3):
+/// Merge `upload` into the record at its key (Switch wire 7.4.14 "Records", Switch spec 12.6
+/// step 3), in this order:
 ///
-/// - a record the service lacks is filled in;
-/// - against a record held only from uploads, a lower bound counts as its value: a strictly
-///   newer upload replaces it, an older one changes nothing, and one at the same version with
-///   another operation is divergent. The same operation again changes nothing, unless it
-///   brings a proof where the record held a lower bound;
-/// - against a record written here, an upload newer than the uploaded version the writes here
-///   built on, or any upload when they built on none, is divergent: writes here are never
-///   superseded.
+/// 1. the same operation again, as the record's, as a kept divergent upload, or as the one
+///    the writes here built on, changes nothing; with a proof where the record held a lower
+///    bound, it makes the record's version the proof's;
+/// 2. a record the service lacks is filled in;
+/// 3. against a record held only from uploads, another operation at the same version, or one
+///    that built on the same version, is divergent; otherwise a strictly newer upload
+///    replaces it and an older one changes nothing, a lower bound counting as its value;
+/// 4. against a record written here, an upload newer than the uploaded version the writes
+///    here built on, or any upload when they built on none, is divergent: writes here are
+///    never superseded.
 ///
-/// A divergent upload already kept changes nothing; past `max_divergent` uploads for the
-/// record, a new one is dropped and still divergent.
+/// Past `max_divergent` uploads kept for the record, a new divergent one is dropped and still
+/// divergent.
 pub fn merge_record(
     held: &HeldRecord<'_>,
-    op_hash: [u8; 32],
-    version: UploadVersion,
+    upload: &UploadedRecord,
     max_divergent: usize,
 ) -> RecordMerge {
-    let divergent = |kept: &[[u8; 32]]| {
-        if kept.contains(&op_hash) {
-            RecordMerge::Unchanged
-        } else {
-            RecordMerge::Divergent {
-                kept: kept.len() < max_divergent,
-            }
-        }
+    let divergent = |kept: &[[u8; 32]]| RecordMerge::Divergent {
+        kept: kept.len() < max_divergent,
     };
     match *held {
         HeldRecord::Lacking => RecordMerge::Fill,
         HeldRecord::FromUpload {
-            op_hash: held_hash,
-            version: held_version,
+            op_hash,
+            built_on,
+            version,
             divergent: kept,
         } => {
-            if version.version > held_version.version {
-                RecordMerge::Replace
-            } else if version.version < held_version.version {
-                RecordMerge::Unchanged
-            } else if op_hash != held_hash {
+            if upload.op_hash == op_hash {
+                return if upload.version.exact && !version.exact {
+                    RecordMerge::MakeExact
+                } else {
+                    RecordMerge::Unchanged
+                };
+            }
+            if kept.contains(&upload.op_hash) {
+                return RecordMerge::Unchanged;
+            }
+            if upload.version.version == version.version || upload.built_on == built_on {
                 divergent(kept)
-            } else if version.exact && !held_version.exact {
-                RecordMerge::MakeExact
+            } else if upload.version.version > version.version {
+                RecordMerge::Replace
             } else {
                 RecordMerge::Unchanged
             }
@@ -152,7 +180,11 @@ pub fn merge_record(
             upload_base,
             divergent: kept,
         } => {
-            if upload_base.is_none_or(|base| version.version > base) {
+            if upload_base.is_some_and(|base| base.op_hash == upload.op_hash)
+                || kept.contains(&upload.op_hash)
+            {
+                RecordMerge::Unchanged
+            } else if upload_base.is_none_or(|base| upload.version.version > base.version) {
                 divergent(kept)
             } else {
                 RecordMerge::Unchanged
@@ -261,7 +293,10 @@ pub fn merge_claim(
             c.current = None;
         }
     }
-    let divergent = dropped || (made_divergent && claim.as_ref().is_some_and(|c| c.divergent));
+    // Listed when the upload made the claim divergent, or found it not so and left it so.
+    let divergent = dropped
+        || (claim.as_ref().is_some_and(|c| c.divergent)
+            && (made_divergent || !held.is_some_and(|h| h.divergent)));
     ClaimMerge {
         claim,
         changed,
@@ -287,6 +322,13 @@ fn apply_uploaded(
 ) -> Applied {
     let entry = &uploaded.entry;
     let id = entry.attempt_id;
+    // A proof counts only for its own claim: one whose view is of another claim key binds
+    // nothing here, and the entry is judged as one without a proof (Switch wire 7.4.14
+    // "Members by stage").
+    let proof = uploaded
+        .proof
+        .as_ref()
+        .filter(|proof| proof.view.claim_key == entry.claim_key);
     if let EntryKind::Attempt {
         orphan_after,
         deadline,
@@ -298,7 +340,7 @@ fn apply_uploaded(
         {
             return Applied::Merged;
         }
-        let opened_at = uploaded.proof.as_ref().map_or(now, |p| p.at);
+        let opened_at = proof.map_or(now, |p| p.at);
         let attempt = |c: &Claim| Attempt {
             attempt_id: id,
             owner: uploaded.writer,
@@ -320,7 +362,7 @@ fn apply_uploaded(
             .is_some_and(|c| c.attempts.iter().any(|a| a.attempt_id == id))
     };
     if !held(claim) {
-        let Some(proof) = uploaded.proof.as_ref() else {
+        let Some(proof) = proof else {
             return Applied::Refused;
         };
         let Some(shown) = proof.view.attempt(&id) else {
@@ -356,7 +398,7 @@ fn apply_uploaded(
             ..
         } | EntryKind::Failed
     );
-    if uploaded.proof.is_none() && owners_only && uploaded.writer != c.attempts[i].owner {
+    if proof.is_none() && owners_only && uploaded.writer != c.attempts[i].owner {
         return Applied::Refused;
     }
     let outcome = match entry.kind {
@@ -428,7 +470,9 @@ fn add_attempt(
     }
     reopen(c);
     let added = attempt(c);
-    let beside_open = c.attempts.iter().any(|a| a.outcome == Outcome::Open);
+    // On a SETTLED claim an uploaded attempt can't move the obligation away from SETTLED, so
+    // it is added beside the others without making it divergent (Switch wire 7.4.14).
+    let beside_open = !c.settled && c.attempts.iter().any(|a| a.outcome == Outcome::Open);
     if c.pin == Pin::Unpinned {
         c.pin = pin;
     }
@@ -496,13 +540,13 @@ pub fn tombstone_from_proof(view: &ClaimView, at: u64) -> Option<Claim> {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct UploadChanges {
     /// The record keys whose state the upload changed.
-    pub records: Vec<[u8; 32]>,
+    pub records: BTreeSet<[u8; 32]>,
     /// The record keys that became divergent, or gained a divergent upload.
-    pub divergent: Vec<[u8; 32]>,
+    pub divergent: BTreeSet<[u8; 32]>,
     /// The claim keys whose state the upload changed.
-    pub claims: Vec<[u8; 32]>,
+    pub claims: BTreeSet<[u8; 32]>,
     /// The claim keys that became divergent.
-    pub divergent_claims: Vec<[u8; 32]>,
+    pub divergent_claims: BTreeSet<[u8; 32]>,
     /// Uploaded items that count for nothing.
     pub unverified: u64,
     /// Operations of removed apps that no proof dates before their `distrust_from`.
@@ -516,30 +560,30 @@ pub struct UploadChanges {
 }
 
 impl UploadChanges {
-    /// Note a changed record key, once.
+    /// Note a changed record key; each key is listed once, in key order.
     pub fn record(&mut self, key: [u8; 32]) {
-        push_once(&mut self.records, key);
+        self.records.insert(key);
     }
 
     /// Note a record key that became divergent or gained a divergent upload, once.
     pub fn divergent_record(&mut self, key: [u8; 32]) {
-        push_once(&mut self.divergent, key);
+        self.divergent.insert(key);
     }
 
     /// Note what a claim merge did to `key`.
     pub fn claim(&mut self, key: [u8; 32], merge: &ClaimMerge) {
         if merge.changed {
-            push_once(&mut self.claims, key);
+            self.claims.insert(key);
         }
         if merge.divergent {
-            push_once(&mut self.divergent_claims, key);
+            self.divergent_claims.insert(key);
         }
         self.refused = self.refused.saturating_add(merge.refused);
     }
 
     /// The `changes` object (Switch wire 7.4.14).
     pub fn to_value(&self) -> Value {
-        let keys = |keys: &[[u8; 32]]| keys.iter().map(|k| b64(k)).collect::<Vec<_>>();
+        let keys = |keys: &BTreeSet<[u8; 32]>| keys.iter().map(|k| b64(k)).collect::<Vec<_>>();
         json!({
             "records": keys(&self.records),
             "divergent": keys(&self.divergent),
@@ -561,7 +605,7 @@ impl UploadChanges {
     pub fn from_value(v: &Value) -> Result<Self> {
         use crate::ops::read::{req, req_int};
         let what = "an upload's changes";
-        let keys = |member: &str| -> Result<Vec<[u8; 32]>> {
+        let keys = |member: &str| -> Result<BTreeSet<[u8; 32]>> {
             let Some(items) = req(v, member, what)?.as_array() else {
                 return Err(Error::Invalid(format!(
                     "Switch wire 7.4.14: {member} isn't an array"
@@ -594,12 +638,6 @@ impl UploadChanges {
             heads: req_int(v, "heads", what)?,
             lists,
         })
-    }
-}
-
-fn push_once(keys: &mut Vec<[u8; 32]>, key: [u8; 32]) {
-    if !keys.contains(&key) {
-        keys.push(key);
     }
 }
 

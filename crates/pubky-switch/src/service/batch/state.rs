@@ -17,6 +17,7 @@ use pubky_switch_core::{
         SignedOp,
     },
     records::{AppCert, AppRecord, IdentityDoc, ReceiveKeyRecord, Standing},
+    recovery::UploadBase,
     scopes::Permission,
     shared::RecordState,
     sig::SignedDoc,
@@ -71,9 +72,9 @@ pub enum HeldOrigin {
     Written {
         /// Its transition proof; `None` only for a write of this batch, before it is signed.
         proof: Option<SignedDoc>,
-        /// The uploaded version the first write here built on (Switch wire 10.3
-        /// `upload_base`).
-        upload_base: Option<RecordVersion>,
+        /// The uploaded version the first write here built on, with its operation's hash
+        /// (Switch wire 10.3 `upload_base`).
+        upload_base: Option<UploadBase>,
     },
     /// Taken from a recovery upload: no proof.
     Uploaded {
@@ -85,12 +86,17 @@ pub enum HeldOrigin {
 }
 
 impl HeldRecord {
-    /// The uploaded version that a write here on this record builds on, which later uploads
-    /// are compared with (Switch wire 7.4.14 "Writes at N win"): this record's version when
-    /// it was taken from an upload, else the one the writes here already built on.
-    pub fn upload_base(&self) -> Option<RecordVersion> {
+    /// The uploaded version that a write here on this record builds on, with its operation,
+    /// which later uploads are compared with (Switch wire 7.4.14 "Writes at N win"): this
+    /// record's when it was taken from an upload, else the one the writes here already built
+    /// on. `None` for an uploaded record whose operation doesn't encode, which then counts
+    /// as built on no upload, the stricter side.
+    pub fn upload_base(&self) -> Option<UploadBase> {
         match &self.origin {
-            HeldOrigin::Uploaded { .. } => Some(self.state.version),
+            HeldOrigin::Uploaded { .. } => Some(UploadBase {
+                version: self.state.version,
+                op_hash: self.op.doc_hash().ok()?,
+            }),
             HeldOrigin::Written { upload_base, .. } => *upload_base,
         }
     }

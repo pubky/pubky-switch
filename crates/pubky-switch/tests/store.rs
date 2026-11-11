@@ -1366,7 +1366,10 @@ async fn test_store_record_written_here_keeps_its_upload_base() {
     };
     record.origin = RecordOrigin::Written {
         proof,
-        upload_base: Some(RecordVersion::new(1, 9)),
+        upload_base: Some(pubky_switch_core::recovery::UploadBase {
+            version: RecordVersion::new(1, 9),
+            op_hash: [9; 32],
+        }),
     };
     {
         let mut txn = fx
@@ -1482,10 +1485,14 @@ async fn test_store_record_origin_checks_refuse_mixed_rows() {
         // Uploaded with a proof, or without its seq.
         (", proof, from_upload, upload_seq", ", '\\x7b7d', true, 3"),
         (", from_upload", ", true"),
-        // Written here with a lower bound, a seq, or half an upload base.
+        // Written here with a lower bound, a seq, or part of an upload base.
         (", proof, version_exact", ", '\\x7b7d', false"),
         (", proof, upload_seq", ", '\\x7b7d', 3"),
         (", proof, upload_base_generation", ", '\\x7b7d', 1"),
+        (
+            ", proof, upload_base_generation, upload_base_version",
+            ", '\\x7b7d', 1, 2",
+        ),
         // Uploaded with an upload base.
         (
             ", from_upload, upload_seq, upload_base_generation, upload_base_version",

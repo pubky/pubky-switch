@@ -690,14 +690,19 @@ async fn test_records_write_here_on_an_uploaded_record_keeps_its_base() {
         view["generation"].as_u64().expect("generation"),
         view["version"].as_u64().expect("version"),
     );
+    let uploaded_op = serde_json::from_value::<SignedDoc>(view["op"].clone())
+        .expect("op")
+        .doc_hash()
+        .expect("hash");
     let base_of = || async {
         let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
             .await
             .expect("conn");
-        let row: (bool, Option<i64>, Option<i64>, i64) = sqlx::query_as(
+        let row: (bool, Option<i64>, Option<i64>, i64, Option<Vec<u8>>) = sqlx::query_as(
             "SELECT from_upload, upload_base_generation, upload_base_version, \
              (SELECT count(*) FROM divergent_uploads d WHERE d.account_id = $1 \
-             AND d.key = $2) FROM shared_records WHERE account_id = $1 AND key = $2",
+             AND d.key = $2), upload_base_op_hash FROM shared_records \
+             WHERE account_id = $1 AND key = $2",
         )
         .bind(alice_id())
         .bind(key.as_slice())
@@ -715,8 +720,10 @@ async fn test_records_write_here_on_an_uploaded_record_keeps_its_base() {
         post(&replay, "wallet", &ops, AT).await;
         // Written here, the divergent uploads gone, and the base the first write built on
         // kept by the second.
-        let (from_upload, generation, version, divergent) = base_of().await;
+        let (from_upload, generation, version, divergent, base_op) = base_of().await;
         assert!(!from_upload);
+        // With the operation it built on, which an upload of it again leaves alone.
+        assert_eq!(base_op, Some(uploaded_op.to_vec()));
         assert_eq!(
             (generation, version),
             (
@@ -733,5 +740,132 @@ async fn test_records_write_here_on_an_uploaded_record_keeps_its_base() {
             view["version"].as_u64().expect("version"),
         );
     }
+    replay.db.drop_database().await.expect("drop");
+}
+
+/// Post `ops` from `app_name` at `at`; the whole answer.
+async fn post_answer(
+    replay: &Replay,
+    app_name: &str,
+    ops: &[SignedOp],
+    at: &str,
+) -> SwitchResponse {
+    let keys = vectors("keys.json");
+    let request = app_request(
+        app(&keys, app_name),
+        "POST",
+        &format!("/v1/{}/ops", alice_id()),
+        OpsRequest::new(ops, None).to_json(),
+        ms(at),
+    );
+    replay.service.handle(request).await
+}
+
+async fn divergent_count(replay: &Replay, key: &[u8; 32]) -> (bool, i64) {
+    use sqlx::Connection;
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    sqlx::query_as(
+        "SELECT from_upload, (SELECT count(*) FROM divergent_uploads d WHERE d.account_id = $1 \
+         AND d.key = $2) FROM shared_records WHERE account_id = $1 AND key = $2",
+    )
+    .bind(alice_id())
+    .bind(key.as_slice())
+    .fetch_one(&mut conn)
+    .await
+    .expect("row")
+}
+
+/// A stale write on an uploaded record: `409 conflict` whose `record_view` is the uploaded
+/// record's (no proof, the upload's seq, divergent), and nothing changes: the record stays
+/// uploaded with its divergent upload.
+#[tokio::test]
+async fn test_records_conflict_on_an_uploaded_record_shows_its_view() {
+    let Some(replay) = registered(Limits::default()).await else {
+        return;
+    };
+    let (key, ..) = create(&replay, 1, b"uploaded", "pay").await;
+    as_uploaded(&replay, &key, 40, true).await;
+    let view = body(&get_as(&replay, "wallet", &format!("records/{}", b64(&key))).await);
+    let held = RecordVersion::new(
+        view["generation"].as_u64().expect("generation"),
+        view["version"].as_u64().expect("version"),
+    );
+    let stale = RecordVersion::new(held.generation, held.version + 1);
+    let mut put = record_put(PAYMENTS, b"uploaded", "pay", stale, b"{\"n\":2}");
+    put.id_inputs = None;
+    let ops = batch("wallet", 2, vec![OpKind::RecordPut(put)]);
+    let answer = post_answer(&replay, "wallet", &ops, AT).await;
+    let (status, code) = code_of(&answer);
+    assert_eq!((status, code), (409, json!("conflict")));
+    let current = &body(&answer)["current"];
+    assert_eq!(current["record_view"], view, "{current}");
+    assert!(current["record_view"].get("proof").is_none());
+    assert_eq!(current["record_view"]["seq"], 40);
+    assert_eq!(current["record_view"]["divergent"], true);
+    assert_eq!(divergent_count(&replay, &key).await, (true, 1));
+    replay.db.drop_database().await.expect("drop");
+}
+
+/// A deleted record taken from an upload, created again here with `{0, 0}`: the write here
+/// builds on the uploaded delete, so its version is the upload base, and the divergent
+/// upload goes.
+#[tokio::test]
+async fn test_records_create_over_an_uploaded_delete_keeps_its_base() {
+    use sqlx::Connection;
+    let Some(replay) = registered(Limits::default()).await else {
+        return;
+    };
+    let (key, ..) = create(&replay, 1, b"gone", "pay").await;
+    let view = body(&get_as(&replay, "wallet", &format!("records/{}", b64(&key))).await);
+    let v1 = RecordVersion::new(
+        view["generation"].as_u64().expect("generation"),
+        view["version"].as_u64().expect("version"),
+    );
+    let mut del = record_put(PAYMENTS, b"gone", "pay", v1, b"");
+    del.id_inputs = None;
+    post(
+        &replay,
+        "wallet",
+        &batch("wallet", 2, vec![OpKind::RecordPut(del)]),
+        AT,
+    )
+    .await;
+    as_uploaded(&replay, &key, 41, true).await;
+    let view = body(&get_as(&replay, "wallet", &format!("records/{}", b64(&key))).await);
+    assert_eq!(view["deleted"], true);
+    let uploaded = RecordVersion::new(
+        view["generation"].as_u64().expect("generation"),
+        view["version"].as_u64().expect("version"),
+    );
+    let again = record_put(PAYMENTS, b"gone", "pay", RecordVersion::NONE, b"{\"n\":3}");
+    post(
+        &replay,
+        "wallet",
+        &batch("wallet", 3, vec![OpKind::RecordPut(again)]),
+        AT,
+    )
+    .await;
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    let base: (Option<i64>, Option<i64>) = sqlx::query_as(
+        "SELECT upload_base_generation, upload_base_version FROM shared_records \
+         WHERE account_id = $1 AND key = $2",
+    )
+    .bind(alice_id())
+    .bind(key.as_slice())
+    .fetch_one(&mut conn)
+    .await
+    .expect("row");
+    assert_eq!(
+        base,
+        (
+            Some(i64::try_from(uploaded.generation).expect("g")),
+            Some(i64::try_from(uploaded.version).expect("v"))
+        )
+    );
+    assert_eq!(divergent_count(&replay, &key).await, (false, 0));
     replay.db.drop_database().await.expect("drop");
 }

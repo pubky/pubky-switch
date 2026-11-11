@@ -15,6 +15,52 @@ fn bound(generation: u64, built_on: RecordVersion) -> UploadVersion {
 }
 
 // Records
+//
+// Versions are seqs (spec 10.3): an operation built on (3, 10) and applied by O at seq 50 is
+// proved (3, 50), and its bound is (3, 11).
+
+const OP1: [u8; 32] = [11; 32];
+const OP2: [u8; 32] = [22; 32];
+
+fn upload(op_hash: [u8; 32], built_on: RecordVersion, version: UploadVersion) -> UploadedRecord {
+    UploadedRecord {
+        op_hash,
+        built_on,
+        version,
+    }
+}
+
+/// An upload without a proof: its bound.
+fn unproved(op_hash: [u8; 32], built_on: RecordVersion) -> UploadedRecord {
+    upload(
+        op_hash,
+        built_on,
+        bound(built_on.generation.max(3), built_on),
+    )
+}
+
+fn held_upload(
+    op_hash: [u8; 32],
+    built_on: RecordVersion,
+    version: UploadVersion,
+    divergent: &[[u8; 32]],
+) -> HeldRecord<'_> {
+    HeldRecord::FromUpload {
+        op_hash,
+        built_on,
+        version,
+        divergent,
+    }
+}
+
+fn written_on(base: Option<(RecordVersion, [u8; 32])>, divergent: &[[u8; 32]]) -> HeldRecord<'_> {
+    HeldRecord::WrittenHere {
+        upload_base: base.map(|(version, op_hash)| UploadBase { version, op_hash }),
+        divergent,
+    }
+}
+
+const KEPT: RecordMerge = RecordMerge::Divergent { kept: true };
 
 #[test]
 fn test_recovery_record_bound_is_the_least_version_above_its_base() {
@@ -23,138 +69,187 @@ fn test_recovery_record_bound_is_the_least_version_above_its_base() {
     assert_eq!(bound(3, v(2, 40)).version, v(3, 1));
     assert_eq!(bound(3, v(0, 0)).version, v(3, 1));
     assert!(!bound(3, v(3, 9)).exact);
-    // No service applies a write that built on a later generation than its own.
+    // No service applies a write that built on a later generation than its own, nor one
+    // past the last seq.
     assert_eq!(UploadVersion::bound(3, v(4, 1)), None);
+    assert_eq!(UploadVersion::bound(3, v(3, u64::MAX)), None);
 }
 
 #[test]
 fn test_recovery_record_fills_in_a_record_the_service_lacks() {
-    let merge = merge_record(&HeldRecord::Lacking, [1; 32], bound(3, v(3, 2)), 8);
+    let merge = merge_record(&HeldRecord::Lacking, &unproved(OP1, v(3, 1)), 8);
     assert_eq!(merge, RecordMerge::Fill);
 }
 
 #[test]
 fn test_recovery_record_newer_upload_replaces_an_uploaded_one() {
-    let held = HeldRecord::FromUpload {
-        op_hash: [1; 32],
-        version: UploadVersion::proved(v(3, 9)),
-        divergent: &[],
-    };
-    // A bound counts as its value: (3, 10) is newer than (3, 9).
+    let held = held_upload(OP1, v(3, 5), UploadVersion::proved(v(3, 9)), &[]);
+    // A bound counts as its value: built on (3, 9), (3, 10) is newer than (3, 9).
     assert_eq!(
-        merge_record(&held, [2; 32], bound(3, v(3, 9)), 8),
+        merge_record(&held, &unproved(OP2, v(3, 9)), 8),
         RecordMerge::Replace
     );
     assert_eq!(
-        merge_record(&held, [2; 32], UploadVersion::proved(v(3, 12)), 8),
+        merge_record(
+            &held,
+            &upload(OP2, v(3, 11), UploadVersion::proved(v(3, 12))),
+            8
+        ),
         RecordMerge::Replace
     );
 }
 
 #[test]
 fn test_recovery_record_older_upload_changes_nothing() {
-    let held = HeldRecord::FromUpload {
-        op_hash: [1; 32],
-        version: UploadVersion::proved(v(3, 9)),
-        divergent: &[],
-    };
+    let held = held_upload(OP1, v(3, 8), UploadVersion::proved(v(3, 9)), &[]);
     assert_eq!(
-        merge_record(&held, [2; 32], UploadVersion::proved(v(3, 4)), 8),
+        merge_record(
+            &held,
+            &upload(OP2, v(3, 2), UploadVersion::proved(v(3, 4))),
+            8
+        ),
         RecordMerge::Unchanged
     );
     assert_eq!(
-        merge_record(&held, [2; 32], bound(3, v(3, 2)), 8),
+        merge_record(&held, &unproved(OP2, v(3, 1)), 8),
         RecordMerge::Unchanged
     );
 }
 
 #[test]
 fn test_recovery_record_another_op_at_one_version_is_divergent() {
-    let held = HeldRecord::FromUpload {
-        op_hash: [1; 32],
-        version: UploadVersion::proved(v(3, 9)),
-        divergent: &[],
-    };
+    let held = held_upload(OP1, v(3, 5), UploadVersion::proved(v(3, 9)), &[]);
     assert_eq!(
-        merge_record(&held, [2; 32], UploadVersion::proved(v(3, 9)), 8),
-        RecordMerge::Divergent { kept: true }
+        merge_record(
+            &held,
+            &upload(OP2, v(3, 6), UploadVersion::proved(v(3, 9))),
+            8
+        ),
+        KEPT
     );
     // A bound equal to the held version, with another operation.
-    assert_eq!(
-        merge_record(&held, [2; 32], bound(3, v(3, 8)), 8),
-        RecordMerge::Divergent { kept: true }
-    );
+    assert_eq!(merge_record(&held, &unproved(OP2, v(3, 8)), 8), KEPT);
 }
 
 #[test]
 fn test_recovery_record_two_bounds_on_one_base_are_divergent() {
-    let held = HeldRecord::FromUpload {
-        op_hash: [1; 32],
-        version: bound(3, v(3, 5)),
-        divergent: &[],
-    };
+    let held = held_upload(OP1, v(3, 5), bound(3, v(3, 5)), &[]);
+    assert_eq!(merge_record(&held, &unproved(OP2, v(3, 5)), 8), KEPT);
+}
+
+#[test]
+fn test_recovery_record_an_op_on_the_same_base_is_divergent_whatever_its_proof() {
+    // Held op1 proved (3, 50), built on (3, 10): op2 on (3, 10) without a proof.
+    let exact = held_upload(OP1, v(3, 10), UploadVersion::proved(v(3, 50)), &[]);
+    assert_eq!(merge_record(&exact, &unproved(OP2, v(3, 10)), 8), KEPT);
+    // The other order: held op2's bound, op1 arriving with its proof.
+    let bounded = held_upload(OP2, v(3, 10), bound(3, v(3, 10)), &[]);
     assert_eq!(
-        merge_record(&held, [2; 32], bound(3, v(3, 5)), 8),
-        RecordMerge::Divergent { kept: true }
+        merge_record(
+            &bounded,
+            &upload(OP1, v(3, 10), UploadVersion::proved(v(3, 50))),
+            8
+        ),
+        KEPT
+    );
+    // A forked O: op1 at seq 50 and op2 at seq 51, both on (3, 10), each proved.
+    assert_eq!(
+        merge_record(
+            &exact,
+            &upload(OP2, v(3, 10), UploadVersion::proved(v(3, 51))),
+            8
+        ),
+        KEPT
     );
 }
 
 #[test]
 fn test_recovery_record_same_op_with_a_proof_makes_the_version_exact() {
-    let held = HeldRecord::FromUpload {
-        op_hash: [1; 32],
-        version: bound(3, v(3, 5)),
-        divergent: &[],
-    };
+    // Held op1's bound (3, 11); op1 again with its proof (3, 50).
+    let held = held_upload(OP1, v(3, 10), bound(3, v(3, 10)), &[]);
     assert_eq!(
-        merge_record(&held, [1; 32], UploadVersion::proved(v(3, 6)), 8),
+        merge_record(
+            &held,
+            &upload(OP1, v(3, 10), UploadVersion::proved(v(3, 50))),
+            8
+        ),
         RecordMerge::MakeExact
     );
-    // Again without a proof, or with one where the version is already exact: nothing.
+    // Again without a proof: nothing.
     assert_eq!(
-        merge_record(&held, [1; 32], bound(3, v(3, 5)), 8),
+        merge_record(&held, &unproved(OP1, v(3, 10)), 8),
         RecordMerge::Unchanged
     );
-    let exact = HeldRecord::FromUpload {
-        op_hash: [1; 32],
-        version: UploadVersion::proved(v(3, 6)),
-        divergent: &[],
-    };
+    // Held exact: the same op with another proof, even at a later seq, changes nothing.
+    let exact = held_upload(OP1, v(3, 10), UploadVersion::proved(v(3, 50)), &[]);
     assert_eq!(
-        merge_record(&exact, [1; 32], UploadVersion::proved(v(3, 6)), 8),
+        merge_record(
+            &exact,
+            &upload(OP1, v(3, 10), UploadVersion::proved(v(3, 60))),
+            8
+        ),
+        RecordMerge::Unchanged
+    );
+}
+
+#[test]
+fn test_recovery_record_a_kept_divergent_upload_again_changes_nothing() {
+    // op2 is kept divergent; it comes again with its proof: it never replaces the record.
+    let kept = [OP2];
+    let held = held_upload(OP1, v(3, 10), bound(3, v(3, 10)), &kept);
+    assert_eq!(
+        merge_record(
+            &held,
+            &upload(OP2, v(3, 10), UploadVersion::proved(v(3, 50))),
+            8
+        ),
         RecordMerge::Unchanged
     );
 }
 
 #[test]
 fn test_recovery_record_any_upload_conflicts_with_writes_that_built_on_none() {
-    let held = HeldRecord::WrittenHere {
-        upload_base: None,
-        divergent: &[],
-    };
-    assert_eq!(
-        merge_record(&held, [2; 32], bound(3, v(3, 1)), 8),
-        RecordMerge::Divergent { kept: true }
-    );
+    let held = written_on(None, &[]);
+    assert_eq!(merge_record(&held, &unproved(OP2, v(3, 0)), 8), KEPT);
 }
 
 #[test]
 fn test_recovery_record_upload_newer_than_the_base_writes_built_on_is_divergent() {
-    let held = HeldRecord::WrittenHere {
-        upload_base: Some(v(3, 9)),
-        divergent: &[],
-    };
+    let held = written_on(Some((v(3, 9), OP1)), &[]);
     assert_eq!(
-        merge_record(&held, [2; 32], UploadVersion::proved(v(3, 10)), 8),
-        RecordMerge::Divergent { kept: true }
+        merge_record(
+            &held,
+            &upload(OP2, v(3, 9), UploadVersion::proved(v(3, 10))),
+            8
+        ),
+        KEPT
     );
     // At the base itself, or older: not newer, so nothing.
     assert_eq!(
-        merge_record(&held, [2; 32], UploadVersion::proved(v(3, 9)), 8),
+        merge_record(
+            &held,
+            &upload(OP2, v(3, 5), UploadVersion::proved(v(3, 9))),
+            8
+        ),
         RecordMerge::Unchanged
     );
     assert_eq!(
-        merge_record(&held, [2; 32], bound(3, v(3, 7)), 8),
+        merge_record(&held, &unproved(OP2, v(3, 6)), 8),
+        RecordMerge::Unchanged
+    );
+}
+
+#[test]
+fn test_recovery_record_the_base_op_again_after_a_write_here_changes_nothing() {
+    // A write here built on op1's bound (3, 11); op1 itself comes with its proof (3, 50):
+    // the operation the writes here built on, again (Switch wire 7.4.14).
+    let held = written_on(Some((v(3, 11), OP1)), &[]);
+    assert_eq!(
+        merge_record(
+            &held,
+            &upload(OP1, v(3, 10), UploadVersion::proved(v(3, 50))),
+            8
+        ),
         RecordMerge::Unchanged
     );
 }
@@ -162,18 +257,22 @@ fn test_recovery_record_upload_newer_than_the_base_writes_built_on_is_divergent(
 #[test]
 fn test_recovery_record_divergent_uploads_stop_at_the_limit() {
     let kept = [[5; 32], [6; 32]];
-    let held = HeldRecord::WrittenHere {
-        upload_base: None,
-        divergent: &kept,
-    };
+    let held = written_on(None, &kept);
     assert_eq!(
-        merge_record(&held, [2; 32], bound(3, v(3, 1)), 2),
+        merge_record(&held, &unproved(OP2, v(3, 0)), 2),
         RecordMerge::Divergent { kept: false }
     );
     // One already kept changes nothing.
     assert_eq!(
-        merge_record(&held, [5; 32], bound(3, v(3, 1)), 2),
+        merge_record(&held, &unproved([5; 32], v(3, 0)), 2),
         RecordMerge::Unchanged
+    );
+    // The ninth at the default limit.
+    let eight: Vec<[u8; 32]> = (0..8u8).map(|i| [100 + i; 32]).collect();
+    let full = written_on(None, &eight);
+    assert_eq!(
+        merge_record(&full, &unproved(OP2, v(3, 0)), 8),
+        RecordMerge::Divergent { kept: false }
     );
 }
 
@@ -612,7 +711,161 @@ fn test_recovery_tombstone_needs_every_attempt_final_and_settled() {
     );
 }
 
+#[test]
+fn test_recovery_claim_attempt_on_a_settled_claim_with_an_open_attempt_isnt_divergent() {
+    // SETTLED by A1's evidence with A2 still open: an uploaded attempt can't move it away
+    // from SETTLED, so it isn't divergent (Switch wire 7.4.14).
+    let held = claim_with(vec![
+        attempt_of(1, WALLET, Outcome::Done),
+        attempt_of(2, PHONE, Outcome::Open),
+    ]);
+    let merge = merge_claim(
+        Some(&held),
+        &[up(entry(9, 2, attempt_kind(Some(NOW + 1))), PHONE)],
+        NOW,
+        64,
+    );
+    assert!(!merge.divergent);
+    assert!(!merge.claim.unwrap().divergent);
+}
+
+#[test]
+fn test_recovery_claim_outcome_adding_an_attempt_beside_an_open_one_lists_it_divergent() {
+    // An outcome for an attempt N lacks adds it from its proof's view, beside A1 still open:
+    // the claim becomes divergent, and its key is listed so.
+    let held = claim_with(vec![attempt_of(1, WALLET, Outcome::Open)]);
+    let shown = claim_with(vec![attempt_of(9, PHONE, Outcome::Done)]);
+    let mut uploaded = up(entry(9, 1, done(Basis::Evidence)), PHONE);
+    uploaded.proof = Some(proof_of(&shown, NOW - 50));
+    let merge = merge_claim(Some(&held), &[uploaded], NOW, 64);
+    assert!(merge.divergent);
+    assert!(merge.claim.unwrap().divergent);
+}
+
+#[test]
+fn test_recovery_claim_a_proof_of_another_claim_counts_as_none() {
+    // A proof whose view is of another claim key binds nothing here: the entry is judged as
+    // one without a proof, so an outcome for an attempt N lacks is refused.
+    let shown = claim_with(vec![attempt_of(9, PHONE, Outcome::Done)]);
+    let mut uploaded = up(entry(9, 1, done(Basis::Evidence)), PHONE);
+    uploaded.proof = Some(EntryProof {
+        at: NOW - 50,
+        view: shown.view(&[8; 32], NOW - 50, &|_| true),
+    });
+    let merge = merge_claim(None, &[uploaded], NOW, 64);
+    assert_eq!(merge.refused, 1);
+    assert!(merge.claim.is_none());
+    // And an attempt it came with opens at the upload's time, not the proof's.
+    let mut attempt = up(entry(9, 0, attempt_kind(Some(NOW + 1))), PHONE);
+    attempt.proof = Some(EntryProof {
+        at: NOW - 500,
+        view: shown.view(&[8; 32], NOW - 500, &|_| true),
+    });
+    let claim = merge_claim(None, &[attempt], NOW, 64).claim.unwrap();
+    assert_eq!(claim.attempts[0].opened_at, NOW);
+}
+
+#[test]
+fn test_recovery_claim_uploaded_attempt_keeps_the_claims_pin() {
+    // The deadline the claim's first attempt pinned stays: an upload doesn't re-check
+    // conditions, nor re-pin (Switch spec 12.6 step 3).
+    let held = claim_with(vec![attempt_of(1, WALLET, Outcome::Failed)]);
+    let merge = merge_claim(
+        Some(&held),
+        &[up(entry(9, 1, attempt_kind(Some(NOW + 99))), PHONE)],
+        NOW,
+        64,
+    );
+    assert_eq!(merge.claim.unwrap().pin, Pin::At(NOW + 1));
+}
+
+#[test]
+fn test_recovery_claim_uploaded_attempt_is_possibly_duplicate_after_a_doubtful_one() {
+    // After an attempt whose outcome is unknown, the next attempt is possibly a duplicate
+    // (Switch wire 6.8 row 1), an uploaded one too.
+    let mut doubtful = claim_with(vec![attempt_of(1, WALLET, Outcome::Unknown)]);
+    doubtful.attempts[0].resolved_by = Some(PHONE);
+    let merge = merge_claim(
+        Some(&doubtful),
+        &[up(entry(9, 1, attempt_kind(Some(NOW + 1))), PHONE)],
+        NOW,
+        64,
+    );
+    assert!(merge.claim.unwrap().attempts[1].possibly_duplicate);
+    // After one its owner failed, it isn't.
+    let failed = claim_with(vec![attempt_of(1, WALLET, Outcome::Failed)]);
+    let merge = merge_claim(
+        Some(&failed),
+        &[up(entry(9, 1, attempt_kind(Some(NOW + 1))), PHONE)],
+        NOW,
+        64,
+    );
+    assert!(!merge.claim.unwrap().attempts[1].possibly_duplicate);
+}
+
+#[test]
+fn test_recovery_claim_done_leaves_no_current_attempt() {
+    // The current attempt done while another stays open: no attempt is current, as after a
+    // live `done` (the export's `current` shows it).
+    let mut held = claim_with(vec![
+        attempt_of(1, WALLET, Outcome::Open),
+        attempt_of(2, PHONE, Outcome::Open),
+    ]);
+    held.current = Some(0);
+    held.divergent = true;
+    let merge = merge_claim(
+        Some(&held),
+        &[up(entry(1, 2, done(Basis::Owner)), WALLET)],
+        NOW,
+        64,
+    );
+    let claim = merge.claim.unwrap();
+    assert!(claim.settled && !claim.tombstone);
+    assert_eq!(claim.current, None);
+}
+
+#[test]
+fn test_recovery_claims_merge_by_the_order_uploads_come_in() {
+    // Two uploads, both orders, on a claim N lacks: each step follows the rules, and the
+    // ends differ (accepted: the merge depends on the order uploads arrive).
+    let u1 = [
+        up(entry(1, 0, attempt_kind(Some(NOW + 1))), WALLET),
+        up(entry(1, 1, done(Basis::Owner)), WALLET),
+    ];
+    let u2 = [up(entry(2, 0, attempt_kind(Some(NOW + 1))), PHONE)];
+    let a = merge_claim(None, &u1, NOW, 64).claim;
+    let ab = merge_claim(a.as_ref(), &u2, NOW + 1, 64).claim.unwrap();
+    let b = merge_claim(None, &u2, NOW, 64).claim;
+    let ba = merge_claim(b.as_ref(), &u1, NOW + 1, 64).claim.unwrap();
+    assert!(ab.settled && ba.settled);
+    assert_eq!((ab.creator, ba.creator), (Some(WALLET), Some(PHONE)));
+}
+
+#[test]
+fn test_recovery_tombstone_from_a_proof_keeps_its_step_and_isnt_rebuilt() {
+    let shown = claim_with(vec![attempt_of(1, WALLET, Outcome::Done)]);
+    let tomb = tombstone_from_proof(&shown.view(&KEY, NOW, &|_| true), NOW).unwrap();
+    assert!(!tomb.rebuilt);
+    assert_eq!(tomb.step, shown.step);
+}
+
 // Changes
+
+#[test]
+fn test_recovery_changes_list_only_claims_that_changed() {
+    let mut changes = UploadChanges::default();
+    changes.claim(
+        [3; 32],
+        &ClaimMerge {
+            claim: None,
+            changed: false,
+            divergent: false,
+            refused: 1,
+        },
+    );
+    assert!(changes.claims.is_empty() && changes.divergent_claims.is_empty());
+    assert_eq!(changes.refused, 1);
+}
 
 #[test]
 fn test_recovery_changes_round_trip() {
@@ -635,7 +888,7 @@ fn test_recovery_changes_round_trip() {
             refused: 2,
         },
     );
-    assert_eq!(changes.records, vec![[1; 32]]);
+    assert_eq!(changes.records, BTreeSet::from([[1; 32]]));
     assert_eq!(changes.refused, 2);
     let value = changes.to_value();
     assert_eq!(value["claims"][0], b64(&[3; 32]));

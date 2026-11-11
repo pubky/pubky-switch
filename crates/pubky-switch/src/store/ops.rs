@@ -10,6 +10,7 @@ use pubky_switch_core::{
     claims::{Claim, ClaimTally},
     ident::Policy,
     ops::{BatchRecord, Position},
+    recovery::UploadBase,
     shared::RecordState,
     sig::SignedDoc,
 };
@@ -88,9 +89,9 @@ pub enum RecordOrigin {
     Written {
         /// Its transition proof.
         proof: SignedDoc,
-        /// The uploaded version the first write here built on, or `None` when the writes
-        /// here built on none (Switch wire 10.3 `upload_base`).
-        upload_base: Option<pubky_switch_core::ops::RecordVersion>,
+        /// The uploaded version the first write here built on, with its operation's hash,
+        /// or `None` when the writes here built on none (Switch wire 10.3 `upload_base`).
+        upload_base: Option<UploadBase>,
     },
     /// Taken from a recovery upload after a provider loss. It has no proof: the lost
     /// service's proofs date nothing here (Switch wire 7.4.9 `proof`).
@@ -442,21 +443,24 @@ impl AccountTxn {
             }
         };
         let base_generation = base
-            .map(|b| to_db(b.generation, "upload_base_generation"))
+            .map(|b| to_db(b.version.generation, "upload_base_generation"))
             .transpose()?;
         let base_version = base
-            .map(|b| to_db(b.version, "upload_base_version"))
+            .map(|b| to_db(b.version.version, "upload_base_version"))
             .transpose()?;
+        let base_hash = base.map(|b| b.op_hash.to_vec());
         sqlx::query(
             "INSERT INTO shared_records (account_id, key, collection, read_scope, write_scopes, \
              generation, version, deleted, value_bytes, writer, cert, op, proof, from_upload, \
-             upload_seq, version_exact, upload_base_generation, upload_base_version) \
+             upload_seq, version_exact, upload_base_generation, upload_base_version, \
+             upload_base_op_hash) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, \
-             $17, $18) \
+             $17, $18, $19) \
              ON CONFLICT (account_id, key) DO UPDATE SET generation = $6, version = $7, \
              deleted = $8, value_bytes = $9, writer = $10, cert = $11, op = $12, proof = $13, \
              from_upload = $14, upload_seq = $15, version_exact = $16, \
-             upload_base_generation = $17, upload_base_version = $18",
+             upload_base_generation = $17, upload_base_version = $18, \
+             upload_base_op_hash = $19",
         )
         .bind(id)
         .bind(state.key.as_slice())
@@ -476,6 +480,7 @@ impl AccountTxn {
         .bind(exact)
         .bind(base_generation)
         .bind(base_version)
+        .bind(base_hash)
         .execute(self.conn())
         .await
         .map_err(db)?;
@@ -1044,7 +1049,8 @@ impl AccountTxn {
 /// The columns [`record_of`] reads.
 pub(super) const RECORD_COLUMNS: &str = "key, collection, read_scope, write_scopes, generation, \
      version, deleted, value_bytes, writer, cert, op, proof, from_upload, upload_seq, \
-     version_exact, upload_base_generation, upload_base_version, EXISTS (SELECT 1 FROM \
+     version_exact, upload_base_generation, upload_base_version, upload_base_op_hash, \
+     EXISTS (SELECT 1 FROM \
      divergent_uploads d WHERE d.account_id = shared_records.account_id \
      AND d.key = shared_records.key) AS divergent";
 
@@ -1068,13 +1074,17 @@ pub(super) fn record_of(row: &sqlx::postgres::PgRow) -> Result<StoredRecord, Sto
         let proof = proof.ok_or(StoreError::Corrupt("a record write without its proof"))?;
         let generation: Option<i64> = row.try_get("upload_base_generation")?;
         let version: Option<i64> = row.try_get("upload_base_version")?;
-        let upload_base = match (generation, version) {
-            (Some(g), Some(v)) => Some(pubky_switch_core::ops::RecordVersion::new(
-                from_db(g, "upload_base_generation")?,
-                from_db(v, "upload_base_version")?,
-            )),
-            (None, None) => None,
-            _ => return Err(StoreError::Corrupt("half an upload base")),
+        let hash: Option<Vec<u8>> = row.try_get("upload_base_op_hash")?;
+        let upload_base = match (generation, version, hash) {
+            (Some(g), Some(v), Some(hash)) => Some(UploadBase {
+                version: pubky_switch_core::ops::RecordVersion::new(
+                    from_db(g, "upload_base_generation")?,
+                    from_db(v, "upload_base_version")?,
+                ),
+                op_hash: array(&hash, "upload_base_op_hash")?,
+            }),
+            (None, None, None) => None,
+            _ => return Err(StoreError::Corrupt("part of an upload base")),
         };
         RecordOrigin::Written {
             proof: decode_doc(&proof, "record proof")?,
