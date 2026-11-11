@@ -2206,7 +2206,7 @@ Who may read a chain item in full:
 
 Superseded record writes and key bundles, superseded app records, renewed certificates replaced or carried by the app's record, and the entries of compacted claims lose their document and show as stubs.
 
-A stub names no object: its envelope gives the item's type (6.6), not the claim, record or app it was about, and naming one would show a claim's key to apps without `claims.read`. So an app that follows a claim it holds not yet SETTLED reads that claim again (`GET /claims`) at the end of any read whose feed shows the stub of an operation (`item_type` `op`), whoever wrote it, its own included: the stub may be an entry of that claim, compacted since (6.8).
+A stub names no object: its envelope gives the item's type (6.6), not the claim, record or app it was about, and naming one would show a claim's key to apps without `claims.read`. So an app reads a claim it follows again (`GET /claims`) at the end of any read whose feed shows the stub of an operation (`item_type` `op`), whoever wrote it, its own included, until it holds that claim as finished: SETTLED with every attempt `done` or `failed`, the state that compacts it (6.8). The stub may be an entry of that claim, compacted since, and a SETTLED claim with an attempt still open stays live, so that attempt's outcome comes as a stub too.
 
 ### 7.6 Errors
 
