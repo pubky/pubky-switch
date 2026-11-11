@@ -413,7 +413,9 @@ pub async fn removal_retries(world: &World) -> FlowResult {
 ///
 /// The caller's second attempt first sends the kept batch again, which gets the original
 /// proof, and then its own, which the switch refuses with `409 conflict` and the claim in
-/// `current`: the first attempt holds it.
+/// `current`: the first attempt holds it. The claim shows the app's own attempt at the step
+/// asked for, so the call returns that attempt's outcome, marked repeated, instead of the
+/// conflict.
 ///
 /// Calls: `POST /v1/{id}/ops` (`claim`) again as it was; a second `attempt` at the step the
 /// first one took (`409 conflict`); `PUT /v1/{id}/peers` again; `GET /v1/{id}/feed` again.
@@ -451,6 +453,7 @@ pub async fn claim_and_read_retries(world: &World) -> FlowResult {
             "ended": ended(&again),
             "code": again.as_ref().err().and_then(pubky_switch_client::app::AppError::code).map(|code| code.as_str().to_owned()),
             "status": again.as_ref().ok().map(|written| format!("{:?}", written.view.status)),
+            "repeated": again.as_ref().ok().map(|written| written.repeated),
             "events": events(&wallet.take_events()),
         }),
     );
@@ -522,7 +525,8 @@ const RETRIED_CLAIM: [u8; 32] = [0x7c; 32];
 /// After each lost answer the app follows its feed: the read sends the kept batch again
 /// first, which gets its original proof, and the flow notes what the app then holds of the
 /// claim ([`App::claim_evidence`]) without asking. Then the caller repeats the call, and its
-/// second entry meets the step the first one took.
+/// second entry meets the step the first one took: the `409 conflict` shows the app's own
+/// entry there, so the call returns that entry's outcome, marked repeated.
 ///
 /// Calls: `POST /v1/{id}/ops` (`claim`: `attempt`, then `done`) with the answer lost; `GET
 /// /v1/{id}/feed` after each; each batch again as it was; a second `attempt` and a second
@@ -593,6 +597,7 @@ pub async fn claim_retries(world: &World) -> FlowResult {
                     .err()
                     .and_then(pubky_switch_client::app::AppError::code)
                     .map(|code| code.as_str().to_owned()),
+                "repeated": again.as_ref().ok().map(|written| written.repeated),
                 "events": events(&wallet.take_events()),
                 "held": held(&wallet, &own).await?,
             }),

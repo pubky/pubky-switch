@@ -241,10 +241,21 @@ pub struct ClaimRead {
 /// An entry the switch took, with its proof.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ClaimWritten {
-    /// The claim view after the entry.
+    /// The claim view after the entry; for a [`ClaimWritten::repeated`] entry, the view the
+    /// switch's `409 conflict` showed.
     pub view: ClaimView,
-    /// The entry's transition proof, bound to the operation.
+    /// The entry's transition proof, bound to the operation: for a
+    /// [`ClaimWritten::repeated`] entry, the proof of the app's own earlier entry.
     pub proof: TransitionProof,
+    /// The attempt the entry and its proof are about. For an `attempt` that is
+    /// [`ClaimWritten::repeated`], the attempt that holds the claim: the app's own earlier
+    /// one, which may have another ID than the one this call asked for.
+    pub attempt_id: [u8; 16],
+    /// Whether the switch had already applied this app's own earlier entry at the step the
+    /// call asked for, whose answer the caller may never have had, such as a kept batch
+    /// sent again: the call's own entry was refused (`409 conflict`), and this is that
+    /// earlier entry's outcome ([`App::write_claim`]).
+    pub repeated: bool,
 }
 
 /// Why no automatic attempt relies on a claim (Switch spec 10.2, 12.2 step 3; Switch wire
@@ -416,6 +427,22 @@ impl App {
     /// "Binding"); only then may the protocol carry the attempt out. An `attempt` whose proof
     /// binds the operation but shows another state is written `failed`, and the call fails.
     ///
+    /// **An entry this app already wrote.** A caller whose earlier call failed after the
+    /// switch took its entry, the answer lost, makes the call again; the earlier batch, kept,
+    /// goes first, in this call or in a read before it, and takes the step, so the switch
+    /// refuses this call's entry with `409 conflict`. When that conflict's claim shows the
+    /// step this entry asked for taken by the app's own entry, of the same type, whose
+    /// proof the app holds, the call returns that entry's outcome instead of the conflict,
+    /// marked [`ClaimWritten::repeated`], and raises no [`AppEvent::ClaimChanged`] for the
+    /// claim: the claim changed by this app's own write, which the call reports as its
+    /// result. For an `attempt` the claim must show that earlier attempt open, current and
+    /// owned by this app, and its proof passes the checks above; its ID is in
+    /// [`ClaimWritten::attempt_id`], and may differ from the one asked for when the
+    /// protocol generated a new one: the claim is held by the earlier attempt, which the
+    /// protocol carries out, or reconciles if it did, never the new one. For `done`,
+    /// `failed` and `unknown` the claim must show the same attempt resolved so by this app.
+    /// Anything else is the conflict.
+    ///
     /// # Errors
     ///
     /// The switch's refusal, such as `409 conflict` with the claim in `current`; a rollback
@@ -429,10 +456,26 @@ impl App {
         deadline: ObligationDeadline,
     ) -> Result<ClaimWritten, AppError> {
         Box::pin(async move {
+            let raised = self.events.len();
             let batch = OpBatch::new()
                 .op_if(op.kind(), conditions)
                 .obligation_deadline(op.entry.claim_key, deadline);
-            let (submitted, views) = self.submit_checked(batch).await?;
+            let (submitted, views) = match self.submit_checked(batch).await {
+                Ok(answered) => answered,
+                Err(error) => {
+                    let Some(written) = self.repeated_entry(&op.entry, &error).await? else {
+                        return Err(error);
+                    };
+                    let claim = op.entry.claim_key;
+                    let mut index = 0;
+                    self.events.retain(|event| {
+                        index += 1;
+                        index <= raised
+                            || !matches!(event, AppEvent::ClaimChanged { claim_key } if *claim_key == claim)
+                    });
+                    return Ok(written);
+                }
+            };
             let proof = submitted.proofs.first().cloned().ok_or_else(|| {
                 AppError::InvalidData(
                     "Switch wire 6.5: a claim entry answered without its proof".into(),
@@ -443,9 +486,102 @@ impl App {
                 Some(view) => view,
                 None => ClaimView::from_value(&proof.body().state)?,
             };
-            Ok(ClaimWritten { view, proof })
+            Ok(ClaimWritten {
+                view,
+                proof,
+                attempt_id: op.entry.attempt_id,
+                repeated: false,
+            })
         })
         .await
+    }
+
+    /// The outcome of the app's own earlier entry at the step `entry` asked for, when
+    /// `error` is the switch's `409 conflict` whose claim shows that step taken by it
+    /// ([`App::write_claim`]): the entry the app keeps at that step (`clent/`) is its own,
+    /// of the same type, signed by its key and bound by a proof of the service key of its
+    /// generation; for an `attempt`, the claim shows that attempt open, current and the
+    /// app's, and its proof passes the checks of an own attempt (Switch wire 6.5
+    /// "Binding"); for an outcome, the claim shows the same attempt resolved so by the app.
+    /// `None` otherwise: the conflict stands.
+    async fn repeated_entry(
+        &self,
+        entry: &ClaimEntry,
+        error: &AppError,
+    ) -> Result<Option<ClaimWritten>, AppError> {
+        let Some(view) = claim_conflict(error) else {
+            return Ok(None);
+        };
+        if view.claim_key != entry.claim_key
+            || Some(view.step) != entry.expected_step.checked_add(1)
+        {
+            return Ok(None);
+        }
+        let Some(kept) = self
+            .reader()
+            .get::<KeptEntry>(&entry_key(&entry.claim_key, entry.expected_step))
+            .await?
+        else {
+            return Ok(None);
+        };
+        let me = self.state.meta.app_id;
+        let identity = self.state.meta.identity;
+        let Ok(op) = SignedOp::verify(
+            &kept.op,
+            &self.state.keys.signing_public(),
+            &identity,
+            Some(&me),
+        ) else {
+            return Ok(None);
+        };
+        let Some(held) = (match &op.body().kind {
+            OpKind::Claim(fields) => fields.check().ok(),
+            _ => None,
+        }) else {
+            return Ok(None);
+        };
+        if held.claim_key != entry.claim_key || held.expected_step != entry.expected_step {
+            return Ok(None);
+        }
+        let Some(service_key) = self.service_key_of(op.body().generation).await? else {
+            return Ok(None);
+        };
+        let Ok(proof) = TransitionProof::verify(&kept.proof, &service_key, &identity) else {
+            return Ok(None);
+        };
+        if proof.check_binds(&op).is_err() {
+            return Ok(None);
+        }
+        let resolved_by_me = |outcome: Outcome| {
+            held.attempt_id == entry.attempt_id
+                && view
+                    .attempt(&entry.attempt_id)
+                    .is_some_and(|a| a.outcome == outcome && a.resolved_by == Some(me))
+        };
+        let holds = match (&entry.kind, &held.kind) {
+            (EntryKind::Attempt { .. }, EntryKind::Attempt { .. }) => {
+                view.status == ClaimStatus::Attempting
+                    && view.owner == Some(me)
+                    && view.attempt_id == Some(held.attempt_id)
+                    && view
+                        .attempt(&held.attempt_id)
+                        .is_some_and(|a| a.outcome == Outcome::Open)
+                    && check_attempt_proof(&proof, &held, &me, self.state.own_doc.generation())
+                        .is_ok()
+            }
+            (EntryKind::Done { .. }, EntryKind::Done { .. }) => {
+                view.status == ClaimStatus::Settled && resolved_by_me(Outcome::Done)
+            }
+            (EntryKind::Failed, EntryKind::Failed) => resolved_by_me(Outcome::Failed),
+            (EntryKind::Unknown, EntryKind::Unknown) => resolved_by_me(Outcome::Unknown),
+            _ => false,
+        };
+        Ok(holds.then_some(ClaimWritten {
+            view,
+            proof,
+            attempt_id: held.attempt_id,
+            repeated: true,
+        }))
     }
 
     /// The checks of the proof of an own attempt the switch applied (Switch wire 6.5

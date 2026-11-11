@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use pubky_switch_core::claims::{Basis, ClaimStatus, RECONCILIATION_MS};
+use pubky_switch_core::claims::{Basis, ClaimStatus, ClaimView, RECONCILIATION_MS};
 use pubky_switch_core::envelope::parse_header;
 use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::ident::{Policy, invite_code_hash};
@@ -2352,6 +2352,219 @@ async fn test_claims_app_without_claims_read_reads_nothing_again() {
     let from = s.log().len();
     writer.receive(None).await.unwrap();
     assert_eq!(claim_reads(&s, from), 0, "{:?}", &s.log()[from..]);
+}
+
+/// Write `op` with its answer lost: the switch took it, and the batch is kept.
+async fn lost(s: &Setup, app: &mut App, op: ClaimOp) {
+    s.w.switch
+        .fail_next(Fault::LoseAnswer { path: "ops".into() });
+    let error = app
+        .write_claim(op, vec![], ObligationDeadline::NoDeadline)
+        .await
+        .unwrap_err();
+    assert!(error.kept_batch().is_some(), "{error:?}");
+}
+
+#[tokio::test]
+async fn test_claims_attempt_made_again_returns_the_kept_attempt() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    let attempt = ClaimOp::attempt(CLAIM, 0, ATTEMPT, 3600, None);
+    lost(&s, &mut app, attempt).await;
+    app.take_events();
+    // Made again at once: the kept batch goes first and takes the claim; this call's own
+    // attempt meets `409 conflict` showing the claim held by that attempt, so the call
+    // returns its outcome, with its proof.
+    let written = app
+        .write_claim(attempt, vec![], ObligationDeadline::NoDeadline)
+        .await
+        .unwrap();
+    assert!(written.repeated);
+    assert_eq!(written.attempt_id, ATTEMPT);
+    assert_eq!(written.view.status, ClaimStatus::Attempting);
+    assert_eq!(written.view.owner, Some(app.app_id()));
+    assert_eq!(written.proof.body().step, Some(1));
+    assert_eq!(claim_changes(&app.take_events()), 0);
+    assert!(app.kept_batches().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_claims_attempt_with_a_new_id_learns_the_earlier_one_holds_it() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    lost(
+        &s,
+        &mut app,
+        ClaimOp::attempt(CLAIM, 0, ATTEMPT, 3600, None),
+    )
+    .await;
+    // A read settles the kept attempt; the protocol, which never saw it, attempts again
+    // under a new ID, and learns the earlier attempt holds the claim.
+    app.receive(None).await.unwrap();
+    app.take_events();
+    let written = app
+        .write_claim(
+            ClaimOp::attempt(CLAIM, 0, [9; 16], 3600, None),
+            vec![],
+            ObligationDeadline::NoDeadline,
+        )
+        .await
+        .unwrap();
+    assert!(written.repeated);
+    assert_eq!(written.attempt_id, ATTEMPT, "the earlier attempt holds it");
+    assert_eq!(written.view.attempt_id, Some(ATTEMPT));
+    assert_eq!(claim_changes(&app.take_events()), 0);
+}
+
+#[tokio::test]
+async fn test_claims_outcome_made_again_returns_the_kept_outcome() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    attempt_as(&mut app, CLAIM, 0, ATTEMPT).await;
+    let done = ClaimOp::done(CLAIM, 1, ATTEMPT, Basis::Owner, None).unwrap();
+    lost(&s, &mut app, done).await;
+    app.take_events();
+    let written = app
+        .write_claim(done, vec![], ObligationDeadline::NoDeadline)
+        .await
+        .unwrap();
+    assert!(written.repeated);
+    assert_eq!(written.attempt_id, ATTEMPT);
+    assert_eq!(written.view.status, ClaimStatus::Settled);
+    assert_eq!(written.proof.body().step, Some(2));
+    assert_eq!(claim_changes(&app.take_events()), 0);
+    // A `failed` the same way.
+    let other = [0x43; 32];
+    attempt_as(&mut app, other, 0, ATTEMPT).await;
+    let failed = ClaimOp::failed(other, 1, ATTEMPT);
+    lost(&s, &mut app, failed).await;
+    let written = app
+        .write_claim(failed, vec![], ObligationDeadline::NoDeadline)
+        .await
+        .unwrap();
+    assert!(written.repeated);
+    assert_eq!(written.view.status, ClaimStatus::Free);
+}
+
+#[tokio::test]
+async fn test_claims_unknown_made_again_returns_the_kept_unknown() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    wallet
+        .write_claim(
+            ClaimOp::attempt(CLAIM, 0, ATTEMPT, 60, None),
+            vec![],
+            ObligationDeadline::NoDeadline,
+        )
+        .await
+        .unwrap();
+    s.w.clock.advance_ms(120_000);
+    let unknown = ClaimOp::unknown(CLAIM, 1, ATTEMPT);
+    lost(&s, &mut phone, unknown).await;
+    let written = phone
+        .write_claim(unknown, vec![], ObligationDeadline::NoDeadline)
+        .await
+        .unwrap();
+    assert!(written.repeated);
+    assert_eq!(written.view.status, ClaimStatus::Free);
+}
+
+#[tokio::test]
+async fn test_claims_repeated_entry_needs_the_conflict_to_show_it() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    let me = app.app_id();
+    attempt_as(&mut app, CLAIM, 0, ATTEMPT).await;
+    let attempting = app.claim_evidence(&CLAIM).await.unwrap().unwrap().view;
+    report_as(&mut app, CLAIM, 1, ATTEMPT, true).await;
+    let settled = app.claim_evidence(&CLAIM).await.unwrap().unwrap().view;
+    let conflict = |view: &ClaimView| Fault::Error {
+        path: "ops".into(),
+        code: ErrorCode::Conflict,
+        current: json!({ "claim": view.to_value() }),
+    };
+    // The own done is held at the step asked for, but the conflict shows the attempt still
+    // open: not that done's outcome.
+    let mut open = settled.clone();
+    open.status = ClaimStatus::Attempting;
+    open.attempts[0].outcome = pubky_switch_core::claims::Outcome::Open;
+    open.attempts[0].resolved_by = None;
+    s.w.switch.fail_next(conflict(&open));
+    let error = app
+        .write_claim(
+            ClaimOp::done(CLAIM, 1, ATTEMPT, Basis::Owner, None).unwrap(),
+            vec![],
+            ObligationDeadline::NoDeadline,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Some(ErrorCode::Conflict));
+    // The own attempt is held at the step asked for, but the conflict shows another owner.
+    let mut theirs = attempting.clone();
+    theirs.owner = Some([0x55; 16]);
+    assert_ne!(theirs.owner, Some(me));
+    s.w.switch.fail_next(conflict(&theirs));
+    let error = app
+        .write_claim(
+            ClaimOp::attempt(CLAIM, 0, ATTEMPT, 3600, None),
+            vec![],
+            ObligationDeadline::NoDeadline,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Some(ErrorCode::Conflict));
+}
+
+#[tokio::test]
+async fn test_claims_conflict_not_of_the_own_entry_stands() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    // Another app's attempt holds the claim: the conflict stands.
+    attempt_as(&mut phone, CLAIM, 0, ATTEMPT).await;
+    wallet.receive(None).await.unwrap();
+    let error = wallet
+        .write_claim(
+            ClaimOp::attempt(CLAIM, 0, [9; 16], 3600, None),
+            vec![],
+            ObligationDeadline::NoDeadline,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Some(ErrorCode::Conflict));
+    // The app's own attempt, past the step asked for: the conflict stands too.
+    let other = [0x44; 32];
+    attempt_as(&mut wallet, other, 0, ATTEMPT).await;
+    report_as(&mut wallet, other, 1, ATTEMPT, false).await;
+    let error = wallet
+        .write_claim(
+            ClaimOp::attempt(other, 0, [9; 16], 3600, None),
+            vec![],
+            ObligationDeadline::NoDeadline,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Some(ErrorCode::Conflict));
+    // Its `failed` made again is its own outcome; a `done` where the own attempt was
+    // resolved `failed` is of another type: the conflict.
+    let error = wallet
+        .write_claim(
+            ClaimOp::failed(other, 1, ATTEMPT),
+            vec![],
+            ObligationDeadline::NoDeadline,
+        )
+        .await;
+    assert!(error.as_ref().is_ok_and(|w| w.repeated), "{error:?}");
+    let error = wallet
+        .write_claim(
+            ClaimOp::done(other, 1, ATTEMPT, Basis::Owner, None).unwrap(),
+            vec![],
+            ObligationDeadline::NoDeadline,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Some(ErrorCode::Conflict));
 }
 
 #[tokio::test]
