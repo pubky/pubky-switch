@@ -133,7 +133,7 @@ pub fn check_delivery(
         if doc.check_first().is_err() {
             return Err(DeliveryRefusal::BadRequest(
                 "Switch wire 3.3: a first document has version, generation and data_epoch 1, \
-                 or recovery_from",
+                 or recovery_from, its generation less one",
             ));
         }
         if prev.is_some() {

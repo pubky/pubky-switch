@@ -527,55 +527,6 @@ async fn service_key_id(replay: &Replay, id: &str) -> pubky_switch::keys::KeyId 
 }
 
 #[tokio::test]
-async fn test_identity_first_document_of_a_recovery_isnt_served_yet() {
-    let Some(replay) = replay().await else { return };
-    let alice = alice_keys();
-    set_time(&replay.clock, T);
-    let enrolled = replay
-        .service
-        .handle(signer_request(
-            "POST",
-            "/v1/enroll",
-            enrollment_body(1, ORIGIN),
-            ms(T),
-        ))
-        .await;
-    assert_eq!(enrolled.status, 200);
-    // A first document that starts a recovery at generation 3: the recovery transition comes
-    // with recovery, so the service doesn't chain it at the account's generation 1.
-    let recovery = alice_version(|body| {
-        body.version = 9;
-        body.generation = 3;
-        body.recovery_from = Some(2);
-    });
-    let path = format!("/v1/{}/identity", alice.id);
-    let answer = replay
-        .service
-        .handle(signer_request(
-            "PUT",
-            &path,
-            delivery(recovery, None),
-            ms(T),
-        ))
-        .await;
-    assert_eq!(
-        (answer.status, code(&answer).as_str()),
-        (503, "unavailable"),
-        "{}",
-        String::from_utf8_lossy(&answer.body)
-    );
-    let key = service_key_id(&replay, &alice.id).await;
-    assert_eq!(
-        pubky_switch::keys::KeyStore::mark(replay.keys.as_ref(), &key)
-            .await
-            .expect("mark"),
-        None,
-        "nothing chained"
-    );
-    replay.db.drop_database().await.expect("drop");
-}
-
-#[tokio::test]
 async fn test_authentication_takes_no_account_lock() {
     let Some(replay) = replay().await else { return };
     serving(&replay).await;

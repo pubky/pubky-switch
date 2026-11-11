@@ -2,10 +2,13 @@
 //! 7.4.15).
 
 use pubky_switch_core::{
-    chain::{ItemType, ProofBody, ProofState, TransitionProof, item_hash},
+    chain::{ItemType, ProofBody, ProofState, ServiceTransition, TransitionProof, item_hash},
     enc::b64,
     http::IdentityDelivery,
-    records::{AccountView, Delivery, DeliveryRefusal, IdentityDoc, KeptProofs, check_delivery},
+    records::{
+        AccountView, Delivery, DeliveryRefusal, GenerationChange, IdentityDoc, KeptProofs,
+        check_delivery,
+    },
 };
 use serde_json::{Value, json};
 
@@ -147,16 +150,31 @@ impl Service {
                 let body = write_answer(&proofs, &head.to_json())?;
                 Ok((Answer::ok(body).with_head(Some(head)), !staged))
             }
+            // A provider loss at this service: the account starts afresh under its pending
+            // key (Switch wire 3.3, 7.4.2).
+            Ok(Delivery::New(Some(GenerationChange::ProviderLoss))) => {
+                self.recover_in_place(txn, &doc, trusted, time_ms).await
+            }
+            // A key rotation, and the move to a staged account, aren't served.
             Ok(Delivery::New(Some(_))) => Err(ApiError::unavailable(
                 "7.4.2: a generation change isn't served yet",
             )),
-            // A first document that starts a recovery, or at another generation than the
-            // account's: its chain starts with the recovery transition, at its own
-            // generation (Switch wire 7.4.2), which comes with recovery.
+            // A first document that starts a recovery: the account takes its generation, and
+            // its chain starts with the `recovery` transition (Switch wire 3.3, 7.4.2).
+            Ok(Delivery::New(None)) if held.is_none() && doc.body().recovery_from.is_some() => {
+                let recovery_from = doc.body().recovery_from.unwrap_or_default();
+                txn.start_recovery(doc.generation(), recovery_from, time_ms)
+                    .await
+                    .map_err(|e| store_error(&e))?;
+                self.chain_recovery(txn, signer, recovery_from, time_ms)
+                    .await?;
+                self.chain_delivery(txn, signer, None, &doc, trusted, time_ms)
+                    .await
+            }
+            // A first document at another generation than the account's, an account enrolled
+            // with a document: not taken without a recovery.
             Ok(Delivery::New(None))
-                if held.is_none()
-                    && (doc.body().recovery_from.is_some()
-                        || doc.generation() != txn.head().generation) =>
+                if held.is_none() && doc.generation() != txn.head().generation =>
             {
                 Err(ApiError::unavailable(
                     "7.4.2: a generation change isn't served yet",
@@ -167,6 +185,83 @@ impl Service {
                     .await
             }
         }
+    }
+
+    /// A provider loss at this service (Switch wire 3.3, 3.7, 7.4.2): `doc`, at the next
+    /// generation, names the account's pending key and `recovery_from` the generation that
+    /// ends. Under the account's row lock, the keying lock is taken exclusive first, so no
+    /// answer of the outgoing key is signed once this commits, and nothing here signs with
+    /// it. Then the account starts afresh under the pending key
+    /// ([`AccountTxn::start_recovery_in_place`]), its chain begins with the `recovery`
+    /// transition, and `doc` is taken as its first document. The answer is the new key's.
+    async fn recover_in_place(
+        &self,
+        txn: &mut AccountTxn,
+        doc: &IdentityDoc,
+        trusted: bool,
+        time_ms: u64,
+    ) -> Result<(Answer, bool), ApiError> {
+        let temporary = || ApiError::unavailable("7.6: a temporary failure");
+        let recovery_from = doc.body().recovery_from.ok_or_else(temporary)?;
+        let new_key = txn
+            .pending_key()
+            .await
+            .map_err(|e| store_error(&e))?
+            .ok_or_else(temporary)?;
+        let new_signer = self.keys.signer(&new_key).await.map_err(|_| temporary())?;
+        txn.exclude_signers().await.map_err(|e| store_error(&e))?;
+        txn.start_recovery_in_place(
+            &new_key,
+            recovery_from,
+            time_ms,
+            self.limits.max_enrollments,
+        )
+        .await
+        .map_err(|e| store_error(&e))?;
+        self.chain_recovery(txn, &new_signer, recovery_from, time_ms)
+            .await?;
+        let (mut answer, serving) = self
+            .chain_delivery(txn, &new_signer, None, doc, trusted, time_ms)
+            .await?;
+        answer.rekeyed = Some(new_key);
+        Ok((answer, serving))
+    }
+
+    /// The `recovery` transition, the first chain item of the generation a provider loss
+    /// starts (Switch wire 6.5, 7.4.2), signed with that generation's key, `signer`.
+    async fn chain_recovery(
+        &self,
+        txn: &mut AccountTxn,
+        signer: &ServiceSigner,
+        recovery_from: u64,
+        time_ms: u64,
+    ) -> Result<(), ApiError> {
+        let temporary = |_| ApiError::unavailable("7.6: a temporary failure");
+        let transition = ServiceTransition::Recovery {
+            recovery_from,
+            at: time_ms,
+        };
+        let identity = txn.head().identity_key;
+        let signed = transition.sign(signer, &identity).map_err(temporary)?;
+        let item_bytes = signed.doc_bytes().map_err(temporary)?;
+        let hash = item_hash(ItemType::Service, &item_bytes);
+        let seq = txn.next_seq().map_err(|e| store_error(&e))?;
+        let (stub, _tip) = txn
+            .head()
+            .chain_tip()
+            .append(seq, time_ms, ItemType::Service, hash, None)
+            .map_err(temporary)?;
+        txn.append_chain_item(&NewChainItem {
+            seq,
+            item_type: ItemType::Service,
+            item_bytes: &item_bytes,
+            stub: &stub,
+            server_time_ms: time_ms,
+            only_for: None,
+            proof: None,
+        })
+        .await
+        .map_err(|e| store_error(&e))
     }
 
     /// Chain a new `identity.json` version and answer with its proof and the new head.

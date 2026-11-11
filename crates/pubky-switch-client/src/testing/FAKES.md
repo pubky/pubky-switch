@@ -129,9 +129,12 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   `check_delivery`, like the service, with the kept proofs taken from what it holds: each held
   record's current write proof and each live claim's entry proofs, by the generation each
   names, with the key of that generation (its own, or the earlier service's that
-  `import_into` carried). Unlike the service: there is no pending key, so no
-  generation change at a serving account; and a first document carrying `recovery_from`, or
-  at another generation than the switch's, is chained where the service answers `503`. The test call `deliver_identity` takes any document, without those
+  `import_into` carried). A first document carrying `recovery_from` starts the recovery as
+  at the service: the account takes its generation, and its chain starts with the `recovery`
+  transition, unless the switch was made `recovering`, which chained it already. Unlike the
+  service: there is no pending key, so no provider loss in place at a serving account, which
+  the service takes under its pending key, starting the account afresh; and a staged
+  account's generation change, a move's, is chained where the service answers `503`. The test call `deliver_identity` takes any document, without those
   checks, for scripting what another signer or a faulty service did. `forget_delivery_proof`
   makes a retry answer with no proof.
 - **`GET /apps`** (Switch wire 7.4.12), in `switch/signer.rs`: by the service's rules, member
@@ -160,7 +163,7 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
     unknown, and only parts from epoch 1 count. A row is an entry in the switch's apps, which
     an `app.put`, a revocation, a departure, a `cert.put` and some test calls create;
   - the account's `identity`, `recovery` as the spec's object (`declared_at` its recovery
-    record's time), where the service sends `null` until it serves recoveries, and
+    record's time), with `admission_staged` `false`, as the service sends it, and
     `proof_generations` from the same kept proofs as the delivery, the member left out when
     there are none.
 
@@ -212,8 +215,8 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   a move; it answers an app of another identity `403 permission_missing`, where this switch
   answers `403 not_admitted`; and after an erasure it takes `POST /v1/enroll` again, creating a
   new staged account, where this switch answers it with the operator's `404` too. That account
-  can't serve at the service yet either: its first `identity.json`, at the next generation with
-  `recovery_from` (Switch wire 7.4.16), gets the `503` "a generation change isn't served yet".
+  serves from its first `identity.json`, at the next generation with `recovery_from` (Switch
+  wire 7.4.16), which starts its recovery.
   This switch deletes everything at once and owes no key: its `404` comes right after the
   erasure. The service can owe the erased account's key when its key store fails, and until
   the key is gone it answers a request signed with the identity key, whatever its timestamp,

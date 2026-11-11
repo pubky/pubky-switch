@@ -303,10 +303,13 @@ impl AccountTxn {
     }
 
     /// Move the chain head to the chain item at `seq`, whose chain hash is `chain_hash`.
-    /// `seq` must have been given out by this request, after the current chain head.
+    /// `seq` must have been given out by this request, after the current chain head: in a
+    /// generation this request started (`start_head`), every `seq` is.
     pub fn set_chain_head(&mut self, seq: u64, chain_hash: [u8; 32]) -> Result<(), StoreError> {
         let after_head = self.head.chain.is_none_or(|(head, _)| seq > head);
-        if !after_head || seq <= self.loaded.last_seq || seq > self.head.last_seq {
+        let given_before =
+            self.head.generation == self.loaded.generation && seq <= self.loaded.last_seq;
+        if !after_head || given_before || seq > self.head.last_seq {
             return Err(StoreError::OutOfRange("chain head seq"));
         }
         self.head.chain = Some((seq, chain_hash));
@@ -508,6 +511,17 @@ impl AccountTxn {
             .map_err(StoreError::from_db)?;
         self.tx.commit().await.map_err(StoreError::from_db)?;
         Ok(())
+    }
+
+    /// Take `generation` and `service_key` as the account's position, its chain empty and no
+    /// `seq` given out yet, as at a generation change: the next chain item is the new
+    /// generation's first. What the store holds changes with the caller's own writes, in this
+    /// transaction; a rollback to a savepoint before it undoes both.
+    pub(super) fn start_head(&mut self, generation: u64, service_key: KeyId) {
+        self.head.generation = generation;
+        self.head.service_key = service_key;
+        self.head.last_seq = 0;
+        self.head.chain = None;
     }
 
     /// Commit the request, then move the service key's mark to the committed chain head,

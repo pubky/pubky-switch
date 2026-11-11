@@ -214,10 +214,8 @@ impl Service {
         // The same enrollment again gets the same answer, whatever the account did since
         // (Switch wire 3.7): the key it named, recognized by the enrollment's hash. An answer
         // drops only while a rebuild would give it byte for byte: one naming the pending key,
-        // as long as that key is pending. Wire 3.7 also answers a retry `409 conflict` once a
-        // key rotation or a recovery in place leaves the key it names neither the account's
-        // nor its pending key, so the signer enrolls anew. That rule isn't applied here yet:
-        // it comes with the generation changes, which this service doesn't serve yet.
+        // as long as that key is pending. Once a generation change has retired the key it
+        // named, a retry is `409 conflict`, so its signer enrolls anew.
         if let Some(key_id) = txn
             .enrollment_answer(&enrollment_hash)
             .await
@@ -230,6 +228,18 @@ impl Service {
                 .await
                 .map_err(|_| unavailable())?;
             return Ok((ServiceKey { id: key_id, public }, time_ms, limits));
+        }
+        if txn
+            .retired_enrollment(&enrollment_hash)
+            .await
+            .map_err(|e| store_error(&e))?
+            .is_some()
+        {
+            txn.commit().await.map_err(|e| store_error(&e))?;
+            return Err(ApiError::new(
+                ErrorCode::Conflict,
+                "3.7: a generation change retired the key this enrollment's answer named",
+            ));
         }
         let account_key = txn.head().service_key.clone();
         let account_public = self
@@ -278,6 +288,13 @@ impl Service {
                 key.id
             }
         };
+        // An enrollment answered with the pending key: its `revoked_apps` join the account's
+        // tombstones if a delivery naming that key starts the next generation (wire 3.7).
+        if rebuildable {
+            txn.hold_pending_revoked_apps(enrollment.revoked_apps())
+                .await
+                .map_err(|e| store_error(&e))?;
+        }
         txn.keep_enrollment_answer(
             &enrollment_hash,
             &key_id,

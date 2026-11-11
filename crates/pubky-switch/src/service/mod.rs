@@ -127,6 +127,9 @@ struct Answer {
     no_store: bool,
     /// An answer whose body is read once the lock is gone.
     deferred: Option<Deferred>,
+    /// The account's new service key, when the request changed it (Switch wire 3.3): the
+    /// answer is signed with it, and the outgoing key is owed deleting.
+    rekeyed: Option<KeyId>,
 }
 
 /// A read whose answer is built once the request's lock is gone.
@@ -155,6 +158,7 @@ impl Answer {
             cacheable: false,
             no_store: false,
             deferred: None,
+            rekeyed: None,
         }
     }
 
@@ -167,6 +171,7 @@ impl Answer {
             cacheable: false,
             no_store: false,
             deferred: None,
+            rekeyed: None,
         }
     }
 
@@ -860,6 +865,20 @@ impl Service {
         }
         let txn_account = txn.head().id.clone();
         let txn_key = txn.head().service_key.clone();
+        // A request that changed the account's key is answered with the new one, the key the
+        // account names once it commits (Switch wire 3.3).
+        let rekeyed = answer.rekeyed.clone();
+        let signer = match &rekeyed {
+            Some(key) => match self.keys.signer(key).await {
+                Ok(signer) => signer,
+                Err(failure) => {
+                    tracing::error!(%failure, "a new service key");
+                    let error = ApiError::unavailable("7.6: a temporary failure");
+                    return self.operator_answer(signature, base_ms, &error).await;
+                }
+            },
+            None => signer,
+        };
         let by_signer = caller.is_some_and(|c| c.caller == Caller::Signer);
         let fallback_head = if answer.deferred.is_some() {
             self.head(&txn, &signer).await
@@ -885,6 +904,10 @@ impl Service {
         // section, while the account still names the key the request loaded (keyed.rs), so
         // none is signed with it after an erasure or a change of the key (7.4.16).
         let proof = Proof::checked(&txn_account, &txn_key);
+        // The outgoing key, retired by the change, goes once the change is durable.
+        if rekeyed.is_some() && committed.is_ok() {
+            let _ = self.sweep_erased_keys().await;
+        }
         match committed {
             Ok(()) => {
                 let mut answer = answer;
