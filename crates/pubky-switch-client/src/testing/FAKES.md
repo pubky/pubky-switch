@@ -114,23 +114,26 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
 - **`PUT /peers`** (Switch wire 7.4.5) keeps every copy it takes: no peer limit, but for
   `forget_peer_copy`.
 - **`GET /records/{key}` and `GET /records`** (Switch wire 7.4.9), in `switch/shared.rs`:
-  order, `after`, `limit`, the byte budget with its first view shown, `next`, deleted
-  records shown by key and left out of lists, and a view's `cert`, the certificate the
-  write was checked against, kept with the record whatever a renewal or revocation later
-  changes, are the service's. Unlike the service:
-  - a record by key is served `200` to any own app, without checking its `read_scope`
-    (the service answers `403 permission_missing`);
-  - the signer is served too, and its list shows every record (the service answers `403
-    permission_missing` to both); so is an own app whose certificate the switch doesn't
-    hold, whose list shows every record too;
-  - a list without `collection`, and a read by a key that isn't `b64(32)`, fall through to
-    the switch's other routes rather than `400`; `after` is compared as raw text, never
-    refused as a malformed key; and `limit` takes a leading `+` (`limit=+5`), which the
-    service refuses (`400`).
+  as at the service (`crates/pubky-switch/src/service/records.rs`): only own apps read
+  (the signer gets `403 permission_missing`); a key, `collection` (required) and `after`
+  must be `b64(32)`, and `limit` digits from 1 to 1000 (`400`); a record by key needs its
+  `read_scope` (`403 permission_missing`, with the head), and a list shows only the records
+  whose `read_scope` the reader holds, by the certificate the switch checks the app against;
+  an own app the switch holds no certificate for holds none. Order by the key text, `after`
+  as a key's text, `next`, the byte budget with its first view shown, deleted records shown
+  by key and left out of lists, and a view's `cert`, the certificate the write was checked
+  against, kept with the record whatever a renewal or revocation later changes, are the
+  service's.
+- **`GET /claims/{claim_key}`** (Switch wire 7.4.8), in `switch/shared.rs`: only an own app
+  holding `claims.read`, checked before the key, as at the service
+  (`crates/pubky-switch/src/service/claims.rs`); then a key that isn't `b64(32)` is `400`.
 - **Reads only own apps make, from an app of another identity:** `GET /feed`, `GET
   /claims/{claim_key}`, `GET /allow`, `GET /records/{key}` and `GET /records` answer `403
-  not_admitted` (`switch/inbox.rs`, every route the switch doesn't serve such an app), where
-  the service answers `403 permission_missing` (Switch wire 7.4.4, 7.6).
+  permission_missing` (`switch/inbox.rs`), as at the service (Switch wire 7.4.4, 7.6); a
+  batch, and every other route the switch doesn't serve such an app, `403 not_admitted`.
+- **`409 identity_needed`** to an app of another identity carries `known_version` beside
+  `current`, `null` for no copy held or as to a stranger (Switch wire 7.1, 7.6), at the
+  inbox and at `POST /connect`, here and at the peer switch (`peer.rs`).
 - **`open_admission`** (`admit_everyone`) admits every sender the deny list doesn't hold, a
   test switch only.
 - **App currency outside batches**: a feed read is checked as a batch is, for an app that

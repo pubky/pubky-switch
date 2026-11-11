@@ -105,6 +105,13 @@ pub(crate) fn bad(code: ErrorCode, current: Value) -> (u16, Value) {
     (code.status(), body)
 }
 
+/// `409 identity_needed`, with `known_version` as in `current` (Switch wire 7.1, 7.6).
+fn identity_needed(version: Option<u64>) -> (u16, Value) {
+    let (status, mut body) = bad(ErrorCode::IdentityNeeded, json!({ "version": version }));
+    body["known_version"] = json!(version);
+    (status, body)
+}
+
 impl PeerSwitch {
     /// The switch of `identity` at `origin`, with no apps yet; its service key is the
     /// identity's. Its `identity.json` goes on after any version the Homeserver holds.
@@ -492,7 +499,7 @@ impl PeerInner {
         }
         if !self.listed(&sender, &app) {
             let version = self.peers.get(&sender).map(IdentityDoc::version);
-            return bad(ErrorCode::IdentityNeeded, json!({ "version": version }));
+            return identity_needed(version);
         }
         let sealed_for: u64 = request
             .path_and_query
@@ -582,7 +589,7 @@ impl PeerInner {
 
     fn connect(&mut self, sender: [u8; 32], app: [u8; 16]) -> (u16, Value) {
         if !self.listed(&sender, &app) {
-            return bad(ErrorCode::IdentityNeeded, json!({ "version": null }));
+            return identity_needed(None);
         }
         if !self.connects.contains(&sender) {
             self.connects.push(sender);

@@ -4773,3 +4773,236 @@ fn test_push_setting_debug_hides_the_handles() {
     assert!(!text.contains("secret"), "{text}");
     assert!(text.contains("handles: 1"), "{text}");
 }
+
+// -------------------------------------------------------------------------------------
+// The scripted switch's record and claim reads, as the service answers them
+// (`crates/pubky-switch/src/service/records.rs`, `claims.rs`; Switch wire 7.4.8, 7.4.9)
+
+/// A `GET` of `rest` at alice's scripted switch from her app `app`, `None` for the signer:
+/// the status, the error code, and whether the answer carries the head.
+fn scripted_get(s: &Setup, app: Option<[u8; 16]>, rest: &str) -> (u16, Value, bool) {
+    let (status, body, head) = scripted_answer(s, app, rest);
+    (status, body["code"].clone(), head)
+}
+
+/// The body of a `GET` of `rest` that the scripted switch answers `200`.
+fn scripted_page(s: &Setup, app: Option<[u8; 16]>, rest: &str) -> Value {
+    let (status, body, _) = scripted_answer(s, app, rest);
+    assert_eq!(status, 200, "{body}");
+    body
+}
+
+/// A `GET` of `rest` at alice's scripted switch: the status, the body and whether the answer
+/// carries the head.
+fn scripted_answer(s: &Setup, app: Option<[u8; 16]>, rest: &str) -> (u16, Value, bool) {
+    let mut headers = vec![crate::transport::Header::new(
+        pubky_switch_core::http::header::IDENTITY,
+        &s.w.alice.id(),
+    )];
+    if let Some(app) = app {
+        headers.push(crate::transport::Header::new(
+            pubky_switch_core::http::header::APP,
+            &pubky_switch_core::enc::zbase32_encode(&app),
+        ));
+    }
+    let response =
+        s.w.switch
+            .handle(&crate::transport::Request {
+                method: "GET".into(),
+                origin: ORIGIN.into(),
+                path_and_query: format!("/v1/{}/{rest}", s.w.alice.id()),
+                headers,
+                body: Vec::new(),
+            })
+            .unwrap();
+    let head = response
+        .header(pubky_switch_core::http::header::HEAD)
+        .is_some();
+    let body: Value = serde_json::from_slice(&response.body).unwrap();
+    (response.status, body, head)
+}
+
+/// A record in `sample.items`, written by the phone; the record's key, as text.
+async fn phone_record(s: &Setup, phone: &mut App) -> String {
+    let target = s.target("n1");
+    phone
+        .put_record(&target, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    pubky_switch_core::enc::b64(&phone.record_key(&target).unwrap())
+}
+
+fn items_id(s: &Setup) -> String {
+    pubky_switch_core::enc::b64(&items().id(&s.w.alice.public()))
+}
+
+#[tokio::test]
+async fn test_scripted_records_by_key_needs_the_read_scope() {
+    let s = Setup::new();
+    let wallet = join_scoped(&s, "wallet", &["scope-c"]).await;
+    let mut phone = s.join("phone").await;
+    let key = phone_record(&s, &mut phone).await;
+    let rest = format!("records/{key}");
+    assert_eq!(
+        scripted_get(&s, Some(phone.app_id()), &rest),
+        (200, Value::Null, true)
+    );
+    // Refused with the head, as at the service.
+    assert_eq!(
+        scripted_get(&s, Some(wallet.app_id()), &rest),
+        (403, json!("permission_missing"), true)
+    );
+}
+
+#[tokio::test]
+async fn test_scripted_records_signer_and_an_app_without_a_certificate_read_none() {
+    let s = Setup::new();
+    let mut phone = s.join("phone").await;
+    let key = phone_record(&s, &mut phone).await;
+    let by_key = format!("records/{key}");
+    let list = format!("records?collection={}", items_id(&s));
+    // The signer reads no records.
+    for rest in [&by_key, &list] {
+        assert_eq!(
+            scripted_get(&s, None, rest),
+            (403, json!("permission_missing"), true),
+            "{rest}"
+        );
+    }
+    // An own app the switch holds no certificate for holds no read scope: refused by key,
+    // and its list shows nothing, where the phone's shows the record.
+    let unknown = Some(app_keys("unknown").app_id_bytes());
+    assert_eq!(
+        scripted_get(&s, unknown, &by_key),
+        (403, json!("permission_missing"), true)
+    );
+    let shown = |app| {
+        scripted_page(&s, app, &list)["records"]
+            .as_array()
+            .map(Vec::len)
+    };
+    assert_eq!(shown(Some(phone.app_id())), Some(1));
+    assert_eq!(shown(unknown), Some(0));
+}
+
+#[tokio::test]
+async fn test_scripted_records_query_and_key_are_read_as_the_service_reads_them() {
+    let s = Setup::new();
+    let mut phone = s.join("phone").await;
+    let key = phone_record(&s, &mut phone).await;
+    let me = Some(phone.app_id());
+    let id = items_id(&s);
+    let refused = [
+        "records".to_owned(),
+        "records?after=AAAA".to_owned(),
+        "records?collection=AAAA".to_owned(),
+        format!("records?collection={id}&after=AAAA"),
+        format!("records?collection={id}&after={key}="),
+        format!("records?collection={id}&limit=+5"),
+        format!("records?collection={id}&limit=0"),
+        format!("records?collection={id}&limit=1001"),
+        "records/AAAA".to_owned(),
+        format!("records/{key}="),
+    ];
+    for rest in &refused {
+        assert_eq!(
+            scripted_get(&s, me, rest),
+            (400, json!("bad_request"), true),
+            "{rest}"
+        );
+    }
+    for rest in [
+        format!("records?collection={id}&limit=5"),
+        format!("records?collection={id}&after={key}"),
+    ] {
+        assert_eq!(scripted_get(&s, me, &rest).0, 200, "{rest}");
+    }
+}
+
+#[tokio::test]
+async fn test_scripted_records_list_after_compares_the_key_text() {
+    let s = Setup::new();
+    let mut phone = s.join("phone").await;
+    let first = phone_record(&s, &mut phone).await;
+    let target = s.target("n2");
+    phone
+        .put_record(&target, &value(&["b"]), vec![])
+        .await
+        .unwrap();
+    let id = items().id(&s.w.alice.public());
+    let all = phone.client.records(&id, None, None).await.unwrap();
+    let keys: Vec<String> = all
+        .records
+        .iter()
+        .map(|view| pubky_switch_core::enc::b64(&view.key))
+        .collect();
+    let mut sorted = keys.clone();
+    sorted.sort();
+    assert_eq!(keys, sorted, "by the key text, in ASCII order");
+    // Exclusive: after the first key, only the second.
+    let after = pubky_switch_core::enc::unb64_array::<32>(&keys[0]).unwrap();
+    let page = phone.client.records(&id, Some(&after), None).await.unwrap();
+    assert_eq!(page.records.len(), 1);
+    assert_eq!(pubky_switch_core::enc::b64(&page.records[0].key), keys[1]);
+    assert!(keys.contains(&first));
+}
+
+#[tokio::test]
+async fn test_scripted_claims_read_needs_claims_read() {
+    let s = Setup::new();
+    let reader = s.join("phone").await;
+    let tablet = s.join_with("tablet", &[Permission::ConversationAdd]).await;
+    let claim = pubky_switch_core::enc::b64(&[9u8; 32]);
+    let rest = format!("claims/{claim}");
+    assert_eq!(
+        scripted_get(&s, Some(reader.app_id()), &rest),
+        (404, json!("not_found"), true)
+    );
+    assert_eq!(
+        scripted_get(&s, Some(reader.app_id()), "claims/AAAA"),
+        (400, json!("bad_request"), true)
+    );
+    // Without `claims.read`, and the signer, refused before the key is read.
+    for app in [Some(tablet.app_id()), None] {
+        for rest in [rest.as_str(), "claims/AAAA"] {
+            assert_eq!(
+                scripted_get(&s, app, rest),
+                (403, json!("permission_missing"), true),
+                "{app:?} {rest}"
+            );
+        }
+    }
+}
+
+/// The peer switch's `409 identity_needed` carries `known_version` beside `current`, as the
+/// service's does (Switch wire 7.1, 7.6).
+#[tokio::test]
+async fn test_scripted_peer_identity_needed_carries_known_version() {
+    let s = Setup::new();
+    let wallet = s.join("wallet").await;
+    let request = crate::transport::Request {
+        method: "POST".into(),
+        origin: PEER_ORIGIN.into(),
+        path_and_query: format!("/v1/{}/inbox?apps_version=0", s.w.bob.id()),
+        headers: vec![
+            crate::transport::Header::new(
+                pubky_switch_core::http::header::IDENTITY,
+                &s.w.alice.id(),
+            ),
+            crate::transport::Header::new(
+                pubky_switch_core::http::header::APP,
+                &pubky_switch_core::enc::zbase32_encode(&wallet.app_id()),
+            ),
+        ],
+        body: Vec::new(),
+    };
+    let response = s.peer.transport().send(request).await.unwrap();
+    assert_eq!(response.status, 409);
+    let body: Value = serde_json::from_slice(&response.body).unwrap();
+    assert_eq!(body["code"], json!("identity_needed"));
+    assert_eq!(body["current"], json!({ "version": null }));
+    assert_eq!(
+        body.as_object().unwrap().get("known_version"),
+        Some(&Value::Null)
+    );
+}
