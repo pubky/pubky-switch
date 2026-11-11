@@ -148,19 +148,21 @@ impl Signer {
         // A rotation goes to the epoch after the newest version's. When a rotation that was
         // given up sent keys above that one, the epoch it sent is completed first, so no app
         // holds the new epoch's keys early and no epoch is skipped (Switch spec 3.2, 3.5).
-        let (newest, statuses) = if rotates && self.state.epoch_through > newest.data_epoch() {
-            self.complete_epoch(&statuses).await?;
-            let newest = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
-            if newest.listed_cert(&app_id) != Some(listed) {
-                return Err(Refusal::Superseded {
-                    version: newest.version(),
+        let (newest, statuses, switch_time) =
+            if rotates && self.state.epoch_through > newest.data_epoch() {
+                self.complete_epoch(&statuses, switch_time).await?;
+                let newest = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
+                if newest.listed_cert(&app_id) != Some(listed) {
+                    return Err(Refusal::Superseded {
+                        version: newest.version(),
+                    }
+                    .into());
                 }
-                .into());
-            }
-            (newest, self.switch_apps().await?)
-        } else {
-            (newest, statuses)
-        };
+                let (statuses, switch_time) = self.switch_apps_at().await?;
+                (newest, statuses, switch_time)
+            } else {
+                (newest, statuses, switch_time)
+            };
         let current = newest.data_epoch();
         let last = if rotates {
             current
@@ -184,7 +186,8 @@ impl Signer {
         // A rotation: every other current app's bundle through the new epoch.
         let mut alerts = Vec::new();
         if rotates {
-            let (more, skipped) = self.catch_up(&key, &newest, &statuses, &[app_id], last)?;
+            let (more, skipped) =
+                self.catch_up(&key, &newest, &statuses, switch_time, &[app_id], last)?;
             ops.extend(more);
             alerts = skipped;
         }
@@ -233,12 +236,16 @@ impl Signer {
     /// current app holding each keyed scope its keys through it, the app of a given-up
     /// reduction included, as it still holds its scopes, then deliver a version raising
     /// `data_epoch` to it (Switch spec 3.2, 3.5; Switch wire 3.8). `statuses` is the switch's
-    /// view, read once its copy was confirmed.
-    pub(super) async fn complete_epoch(&mut self, statuses: &[AppStatus]) -> Result<()> {
+    /// view, read once its copy was confirmed, and `switch_time` the time it is signed at.
+    pub(super) async fn complete_epoch(
+        &mut self,
+        statuses: &[AppStatus],
+        switch_time: u64,
+    ) -> Result<()> {
         let newest = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
         let through = self.state.epoch_through;
         let key = self.signing_key()?;
-        let (ops, alerts) = self.catch_up(&key, &newest, statuses, &[], through)?;
+        let (ops, alerts) = self.catch_up(&key, &newest, statuses, switch_time, &[], through)?;
         let batches = self.sign_batches(&key, newest.generation(), ops)?;
         let (doc, flow) = self.next_version(&key, |body| body.data_epoch = through)?;
         drop(key);
@@ -256,7 +263,8 @@ impl Signer {
     /// App ID that is a tombstone or has a revocation asked for gets no part, whatever the
     /// switch shows (Switch spec 12.2: a removed app reads nothing written later).
     ///
-    /// An app the switch doesn't serve now, one not current, not joined or expired, gets no
+    /// An app the switch doesn't serve now, one not current, not joined or expired at
+    /// `switch_time`, the switch's signed time of `statuses`, gets no
     /// part, nor does one whose certificate holds a scope no registered protocol owns, with
     /// [`Alert::RotationSkipped`]. Either gets the epochs it lacks from its next bundle, which
     /// starts after `keys_through`.
@@ -265,11 +273,12 @@ impl Signer {
         key: &SigningKey,
         newest: &IdentityDoc,
         statuses: &[AppStatus],
+        switch_time: u64,
         except: &[[u8; 16]],
         last: u64,
     ) -> Result<(Vec<Op>, Vec<Alert>)> {
         let certs = self.held_certs()?;
-        let now = self.env.clock.now_ms();
+        let now = switch_time;
         let keyed = keyed(&self.env.protocols);
         let mut ops = Vec::new();
         let mut alerts = Vec::new();
@@ -409,11 +418,6 @@ impl Signer {
             prev,
         };
         self.commit(state, Some(flow)).await
-    }
-
-    /// The switch's apps, once its copy is confirmed as this install's mark.
-    pub(super) async fn switch_apps(&mut self) -> Result<Vec<AppStatus>> {
-        Ok(self.switch_apps_at().await?.0)
     }
 
     /// The switch's apps, once its copy is confirmed as this install's mark, and the service
@@ -695,7 +699,12 @@ impl Signer {
             return self.resume().await;
         }
         // A publication that failed doesn't hold back the closings owed at the switch.
+        let erased_before = self.state.erased;
         let resumed = self.resume().await;
+        // The run that completes an erasure has nothing more to do (Switch spec 12.7).
+        if self.state.erased && !erased_before {
+            return resumed;
+        }
         if let Err(error) = &resumed
             && (self.flow.is_some() || !matches!(error, SignerError::Homeserver(_)))
         {
@@ -730,9 +739,11 @@ impl Signer {
     ///   switch's time differ by more than the clock tolerance, nothing is renewed by itself,
     ///   with [`Alert::ClockOff`] (Switch spec 10.1).
     /// - A renewal the user didn't ask for never changes what a certificate grants: an app
-    ///   whose scopes a registered protocol no longer owns, or which the protocols' tables now
-    ///   give other switch permissions, is skipped, with [`Alert::RenewalSkipped`] (design
-    ///   note, decision 2). A refusal that concerns one app only doesn't hold back the others.
+    ///   whose scopes a registered protocol no longer owns or a scope rule now refuses, or
+    ///   which the protocols' tables now give other switch permissions, is skipped, with
+    ///   [`Alert::RenewalSkipped`] naming why (design note, decision 2). A refusal that
+    ///   concerns one app only doesn't hold back the others.
+    /// - [`Alert::ClockOff`] clears itself at the first run that finds the clocks agreeing.
     ///
     /// # Errors
     ///
@@ -745,6 +756,12 @@ impl Signer {
         let (statuses, switch_time) = self.switch_apps_at().await?;
         if clock_agrees(self.env.clock.now_ms(), switch_time).is_err() {
             return self.skip_renewals(vec![Alert::ClockOff]).await;
+        }
+        // The clocks agree again: the alert has served.
+        if self.state.alerts.contains(&Alert::ClockOff) {
+            let mut state = self.state.clone();
+            state.alerts.retain(|alert| *alert != Alert::ClockOff);
+            self.commit(state, None).await?;
         }
         let certs = self.held_certs()?;
         let mut due = Vec::new();
@@ -764,7 +781,19 @@ impl Signer {
                 Err(SignerError::Refused(Refusal::UnknownScopes { scopes })) => {
                     Some(RenewalSkip::UnownedScopes { scopes })
                 }
-                Err(_) => continue,
+                Err(SignerError::Refused(Refusal::ProtocolRule { protocol, reason })) => {
+                    Some(RenewalSkip::ScopesRefused {
+                        protocol: Some(protocol),
+                        reason,
+                    })
+                }
+                Err(SignerError::Refused(Refusal::Scopes(reason))) => {
+                    Some(RenewalSkip::ScopesRefused {
+                        protocol: None,
+                        reason,
+                    })
+                }
+                Err(error) => return Err(error),
                 Ok(terms) if terms.permissions != cert.permissions() => {
                     let names = |all: &[Permission]| all.iter().map(ToString::to_string).collect();
                     Some(RenewalSkip::PermissionsChanged {

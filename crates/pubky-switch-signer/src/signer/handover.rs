@@ -121,9 +121,11 @@ impl Signer {
             });
         }
         let cert_hash = doc.listed_cert(&to_app).ok_or(Refusal::NotListed)?;
-        let now = self.env.clock.now_ms();
-        // Current in spec 3.4's sense, and served: its certificate hasn't expired.
-        let target_current = self.service_client()?.apps().await?.apps.iter().any(|s| {
+        // Current in spec 3.4's sense, and served: its certificate hasn't expired at the
+        // switch's signed time.
+        let answer = self.service_client()?.apps().await?;
+        let now = answer.server_time;
+        let target_current = answer.apps.iter().any(|s| {
             s.app_id == to_app
                 && s.current
                 && s.revoked_at.is_none()

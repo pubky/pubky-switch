@@ -501,3 +501,113 @@ async fn test_unverified_bound_reapplies_to_entries_a_restore_brings_back() {
     let kept = restored.kept_duties().await.unwrap();
     assert!(dropped(&kept).contains(&(seq, DropReason::Age)), "{kept:?}");
 }
+
+#[tokio::test]
+async fn test_unverified_bound_runs_before_the_retries() {
+    let w = World::new();
+    let mut app = wallet(&w, w.env()).await;
+    let bob = Peer {
+        identity: w.bob.clone(),
+        keys: w.bob_keys.clone(),
+        cert: w.bob_cert.clone(),
+    };
+    let seqs = stored_unverified(&w, &mut app, &[(&bob, MAX_UNVERIFIED_PER_SENDER + 1)]).await;
+    // Bob can be checked again: the next read's retries would process his entries, the one
+    // accepted earliest first. The bound goes before them and drops that one instead.
+    w.homeserver.set_down(false);
+    let report = app.receive(None).await.unwrap();
+    assert_eq!(
+        dropped(&report.events),
+        vec![(seqs[0][0], DropReason::PerSender)]
+    );
+    assert!(!has(&report.events, |e| matches!(
+        e,
+        AppEvent::MessageReceived { seq, .. } if *seq == seqs[0][0]
+    )));
+    assert!(has(&report.events, |e| matches!(
+        e,
+        AppEvent::MessageReceived { seq, .. } if *seq == seqs[0][1]
+    )));
+}
+
+#[tokio::test]
+async fn test_unverified_bound_applies_before_a_layered_backup() {
+    let w = World::new();
+    let mut app = wallet(&w, w.env()).await;
+    let h = peer(&w, "honest");
+    let a1 = peer(&w, "hostile-1");
+    let a2 = peer(&w, "hostile-2");
+    // 138 stored by one read, 10 over the total, and a backup taken before any other read.
+    stored_unverified(
+        &w,
+        &mut app,
+        &[
+            (&h, 10),
+            (&a1, MAX_UNVERIFIED_PER_SENDER),
+            (&a2, MAX_UNVERIFIED_PER_SENDER),
+        ],
+    )
+    .await;
+    assert_eq!(app.stored_seqs().len(), 138);
+    let backup = app.backup_layered().await.unwrap();
+    // The backup holds what the bounds leave, and the drops were kept as duty events.
+    assert_eq!(app.stored_seqs().len(), MAX_UNVERIFIED_TOTAL);
+    let kept = app.kept_duties().await.unwrap();
+    assert_eq!(dropped(&kept).len(), 138 - MAX_UNVERIFIED_TOTAL);
+    let restored = App::restore(
+        w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
+        Arc::new(BackedUp::default()),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    assert_eq!(restored.stored_seqs().len(), MAX_UNVERIFIED_TOTAL);
+}
+
+#[tokio::test]
+async fn test_unverified_bound_skipped_by_a_layered_backup_of_a_halted_app() {
+    let w = World::new();
+    let counting = Arc::new(Counting {
+        inner: Arc::clone(&w.store),
+        deleted: Mutex::new(Vec::new()),
+    });
+    let mut app = wallet(&w, w.env_on(Arc::clone(&counting) as Arc<dyn StateStore>)).await;
+    let a1 = peer(&w, "hostile-1");
+    let a2 = peer(&w, "hostile-2");
+    let h = peer(&w, "honest");
+    stored_unverified(
+        &w,
+        &mut app,
+        &[
+            (&h, 10),
+            (&a1, MAX_UNVERIFIED_PER_SENDER),
+            (&a2, MAX_UNVERIFIED_PER_SENDER),
+        ],
+    )
+    .await;
+    assert_eq!(app.stored_seqs().len(), 138);
+    // Halted by an alarm: the backup is taken read-only, with every entry, and nothing is
+    // committed or dropped.
+    app.state.alarm = Some(crate::app::Alarm::Rollback {
+        reason: "test".into(),
+    });
+    let commits = counting.deleted.lock().unwrap().len();
+    let backup = app.backup_layered().await.unwrap();
+    assert_eq!(counting.deleted.lock().unwrap().len(), commits);
+    assert_eq!(app.stored_seqs().len(), 138);
+    assert!(dropped(&app.kept_duties().await.unwrap()).is_empty());
+    let restored = App::restore(
+        w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
+        Arc::new(BackedUp::default()),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    assert_eq!(restored.stored_seqs().len(), 138);
+    // Running again, the next backup applies the bounds.
+    app.state.alarm = None;
+    app.backup_layered().await.unwrap();
+    assert_eq!(app.stored_seqs().len(), MAX_UNVERIFIED_TOTAL);
+}

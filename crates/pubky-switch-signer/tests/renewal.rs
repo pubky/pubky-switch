@@ -1496,6 +1496,11 @@ async fn test_renewal_on_expiry_waits_while_the_device_clock_is_off() {
             usize::from(!ahead),
             "ahead: {ahead}"
         );
+        // The clocks agree again: the alert clears itself.
+        assert!(
+            !signer.alerts().contains(&Alert::ClockOff),
+            "ahead: {ahead}"
+        );
     }
 }
 
@@ -1619,4 +1624,86 @@ async fn test_renewal_on_expiry_judges_half_the_lifetime_on_the_switchs_time() {
     signer.run_due().await.unwrap();
     let renewed = signer.identity_doc().unwrap().unwrap();
     assert_eq!(renewals(&renewed, &id), [None]);
+}
+
+/// The test protocol's scopes, refusing `notes` by its own rule: as after an update.
+struct NotesRefusing;
+
+impl Protocol for NotesRefusing {
+    fn name(&self) -> &str {
+        Notes.name()
+    }
+    fn scopes(&self) -> Vec<ScopeDef> {
+        Notes.scopes()
+    }
+    fn check_scopes(&self, scopes: &[&str]) -> Result<(), String> {
+        if scopes.contains(&"notes") {
+            return Err("notes now needs notes_sync".into());
+        }
+        Ok(())
+    }
+    fn permissions(&self, scopes: &[&str]) -> Vec<Permission> {
+        Notes.permissions(scopes)
+    }
+}
+
+#[tokio::test]
+async fn test_renewal_on_expiry_tells_of_scopes_a_rule_now_refuses() {
+    // The protocol's own rule now refuses the certificate's scopes: a renewal keeping them
+    // would be refused, so the run skips the app and says why, instead of letting it lapse
+    // unnoticed.
+    let world = World::new();
+    let (mut signer, store) = world.enrolled().await;
+    let (a, _) = two_apps(&["notes"], &["notes"]);
+    world.approve(&mut signer, &a).await;
+    drop(signer);
+    let updated = Protocols::new(vec![Arc::new(NotesRefusing)]).unwrap();
+    let mut signer = Signer::open(world.env_with(store, updated), world.keyring())
+        .await
+        .unwrap();
+    world.clock.advance_ms(LIFETIME_MS / 2 + DAY_MS);
+    let sent = world.sent_docs().len();
+    signer.run_due().await.unwrap();
+    assert_eq!(world.sent_docs().len(), sent);
+    assert!(
+        signer.alerts().iter().any(|alert| matches!(
+            alert,
+            Alert::RenewalSkipped {
+                app_id,
+                reason: RenewalSkip::ScopesRefused { protocol, reason },
+            } if *app_id == a.keys.app_id_bytes()
+                && protocol.as_deref() == Some("notes")
+                && reason == "notes now needs notes_sync"
+        )),
+        "{:?}",
+        signer.alerts()
+    );
+}
+
+#[tokio::test]
+async fn test_renewal_by_the_user_applies_the_protocols_table_now() {
+    // The user renews with the scopes unchanged after the protocol's table changed: the new
+    // certificate carries the permissions the table gives now, wider or narrower. A narrower
+    // one is a reduction, which closes at once (Switch wire 3.8).
+    for now in [
+        vec![Permission::ClaimsRead, Permission::ClaimsWrite],
+        Vec::new(),
+    ] {
+        let world = World::new();
+        let (mut signer, store) = world.enrolled().await;
+        let (a, _) = two_apps(&["notes"], &["notes"]);
+        world.approve(&mut signer, &a).await;
+        drop(signer);
+        let id = a.keys.app_id_bytes();
+        let updated = Protocols::new(vec![Arc::new(NotesGiving(now.clone()))]).unwrap();
+        let mut signer = Signer::open(world.env_with(store, updated), world.keyring())
+            .await
+            .unwrap();
+        signer.renew(id, CertChange::default()).await.unwrap();
+        let newest = signer.identity_doc().unwrap().unwrap();
+        let cert = listed_cert(&signer, &newest, &id);
+        assert_eq!(cert.permissions(), now.as_slice());
+        let closed = renewals(&newest, &id).iter().all(Option::is_some);
+        assert_eq!(closed, now.is_empty(), "{now:?}");
+    }
 }

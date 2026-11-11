@@ -51,6 +51,7 @@ use crate::state::{self, DeliverStep, Flow, Newest, Service, SignerState};
 
 mod approval;
 mod clients;
+mod erasure;
 pub(crate) mod gate;
 mod handover;
 mod renewal;
@@ -150,6 +151,13 @@ pub enum SignerStatus {
     /// nothing is signed, an owed closing included, until the user clears the alert
     /// ([`Signer::clear_alert`]) and the switch is confirmed again.
     Alarm,
+    /// The identity's account at its switch is being erased ([`Signer::close_account`]):
+    /// `identity.json` may be off the Homeserver already, and nothing else is signed until
+    /// the erasure is done or aborted ([`Signer::abort_erasure`]).
+    Erasing,
+    /// The identity's account at its switch is erased ([`Signer::close_account`]): the
+    /// records stay, and nothing more is signed for it.
+    Erased,
 }
 
 /// Where the records `state` stand: what holds signing back is the signing gate's verdict
@@ -164,6 +172,7 @@ fn status_of(state: &SignerState) -> SignerStatus {
             SignerStatus::HandingOver { to_app }
         }
         Some(SignerError::Refused(Refusal::TakingOver)) => SignerStatus::TakingOver,
+        Some(SignerError::Refused(Refusal::Erased)) => SignerStatus::Erased,
         Some(_) => SignerStatus::Alarm,
         None if state.newest.is_none() => SignerStatus::Enrolling,
         None => SignerStatus::Signing,
@@ -279,6 +288,10 @@ impl Signer {
         self.refresh().await?;
         loop {
             self.finish_flow().await?;
+            // An erased account: nothing more is owed to it (Switch spec 12.7).
+            if self.state.erased {
+                return Ok(());
+            }
             // While a hand-over is in progress nothing routine is signed: its own step only,
             // and owed work stays owed (Switch wire 3.12).
             if self.state.handing_over.is_some() {
@@ -324,6 +337,11 @@ impl Signer {
                     policy,
                 } => self.enroll(&origin, &enrollment, policy).await?,
                 Flow::TakingOver { delivery, .. } => self.take_over(delivery).await?,
+                Flow::Erase {
+                    unpublished,
+                    reminded,
+                    unanswered,
+                } => self.erase(unpublished, reminded, unanswered).await?,
                 Flow::Deliver {
                     doc,
                     prev,
@@ -353,6 +371,9 @@ impl Signer {
 
     /// Where the signer stands.
     pub fn status(&self) -> SignerStatus {
+        if matches!(self.flow, Some(Flow::Erase { .. })) {
+            return SignerStatus::Erasing;
+        }
         status_of(&self.state)
     }
 
@@ -512,6 +533,10 @@ impl Signer {
     /// ([`gate::refusal`]).
     pub(crate) async fn ready(&mut self) -> Result<()> {
         self.refresh().await?;
+        // An erased account has no switch to read (Switch spec 12.7).
+        if self.state.erased {
+            return Err(Refusal::Erased.into());
+        }
         self.check_named()?;
         if self.flow.is_some() {
             return Err(Refusal::FlowInProgress.into());
@@ -707,7 +732,7 @@ impl Signer {
 
     /// A client of the switch the identity is enrolled at that signs operations with `key`,
     /// which the signing gate handed out.
-    fn signing_client(&self, key: &SigningKey) -> Result<SigningClient> {
+    pub(super) fn signing_client(&self, key: &SigningKey) -> Result<SigningClient> {
         let service = self.service()?;
         SigningClient::new(&self.env, &self.service_target(&service), key)
     }
@@ -1034,6 +1059,29 @@ impl Signer {
                 });
             }
         }
+        // How close the version comes to the most a delivery, or a move's enrollment, may
+        // carry (Switch wire 3.7, 7.1).
+        let delivery = IdentityDelivery {
+            identity: doc.clone(),
+            prev,
+        };
+        let enrollment = state.service.as_ref().map(|service| EnrollmentBody {
+            identity: state.identity,
+            origin: service.origin.clone(),
+            nonce: [0; 16],
+            policy: verified
+                .as_ref()
+                .map(|delivered| delivered.body().policy)
+                .unwrap_or_default(),
+            identity_doc: Some(doc.clone()),
+            revoked_apps: (!state.tombstones.is_empty()).then(|| state.tombstones.clone()),
+        });
+        let enrollment_bytes = enrollment
+            .map(|body| serde_json::to_vec(&body).map(|json| signed_len(json.len())))
+            .transpose()
+            .map_err(|e| SignerError::Records(e.to_string()))?
+            .unwrap_or(0);
+        state.note_size(delivery.to_json().len().max(enrollment_bytes));
         let published = state
             .newest
             .as_ref()
@@ -1288,6 +1336,15 @@ enum Verdict {
     AtMark,
     /// Strictly newer, or any copy before there is a mark.
     Newer,
+}
+
+/// The length of a signed document's carrying form whose body is `body_len` bytes of JSON:
+/// `{"body":"<base64url>","sig":"<86 characters>"}` (Switch wire 2.2).
+fn signed_len(body_len: usize) -> usize {
+    let encoded = body_len.saturating_mul(4).saturating_add(2) / 3;
+    encoded
+        .saturating_add(r#"{"body":"","sig":""}"#.len())
+        .saturating_add(86)
 }
 
 fn stale_without_copy() -> SignerError {

@@ -1906,6 +1906,162 @@ async fn test_restore_in_place_over_an_unreadable_counter_gives_out_no_id_the_st
     assert!(again > id, "ID {again} given out again");
 }
 
+/// What [`retold`] counts: the `Parked` duty events naming `id` among `events`.
+fn retold(events: &[AppEvent], id: u64) -> usize {
+    events
+        .iter()
+        .filter(
+            |e| matches!(e, AppEvent::Parked { id: Some(_), stored_id, .. } if *stored_id == id),
+        )
+        .count()
+}
+
+#[tokio::test]
+async fn test_restore_tells_the_protocol_again_of_an_entry_forgotten_after_the_backup() {
+    let w = World::new();
+    let protocol = FlakyProtocol::new(0);
+    let mut app = join_flaky(&w, &protocol, "wallet").await;
+    // Stored for good by a refusal, the host told and done with the events; then a backup,
+    // and the entry forgotten after it.
+    let id = stored_for_good(&w, &mut app, "refused").await;
+    let events = app.unacknowledged_events().await.unwrap();
+    let last = events.iter().filter_map(AppEvent::id).next_back().unwrap();
+    app.ack_events(last).await.unwrap();
+    let backup = layered(&mut app).await;
+    let entry = app
+        .parked_entries()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|e| e.stored_id == id)
+        .unwrap();
+    assert_eq!(app.forget_parked(id, &entry.hash).await.unwrap(), 1);
+    drop(app);
+    // Restored onto a new store: the entry is back, and the protocol is told of it again.
+    let mut restored = App::restore(
+        w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
+        protocol.clone(),
+        flaky_config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    assert!(restored.stored_id_at(entry.seq).is_some());
+    let events = restored.unacknowledged_events().await.unwrap();
+    assert_eq!(retold(&events, id), 1, "{events:?}");
+    // Once only: a read and a reload don't tell it again.
+    restored.receive(None).await.unwrap();
+    let events = restored.unacknowledged_events().await.unwrap();
+    assert_eq!(retold(&events, id), 1);
+}
+
+/// A store that counts, for each commit, the duty events it keeps.
+struct DutyCounting {
+    inner: Arc<MemoryStore>,
+    kept: Mutex<Vec<usize>>,
+}
+
+impl StateStore for DutyCounting {
+    fn get(&self, ns: &str, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
+        self.inner.get(ns, key)
+    }
+
+    fn scan(
+        &self,
+        ns: &str,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: u32,
+    ) -> Result<Vec<crate::store::KeyValue>, StoreError> {
+        self.inner.scan(ns, prefix, after, limit)
+    }
+
+    fn commit(&self, batch: crate::store::WriteBatch) -> Result<(), StoreError> {
+        let kept = batch
+            .writes
+            .iter()
+            .filter(|write| {
+                matches!(write, crate::store::Write::Put { key, .. } if key.starts_with(b"duty/"))
+            })
+            .count();
+        self.kept.lock().unwrap().push(kept);
+        self.inner.commit(batch)
+    }
+}
+
+#[tokio::test]
+async fn test_restore_tells_the_protocol_again_in_steps() {
+    let w = World::new();
+    let protocol = FlakyProtocol::new(0);
+    let mut app = join_flaky(&w, &protocol, "wallet").await;
+    // 151 entries stored for good, as a store may hold, and backed up.
+    let first = stored_for_good(&w, &mut app, "refused").await;
+    let model = app.state.parked.get(&first).cloned().unwrap();
+    let mut ids = vec![first];
+    for chunk in 0..3u64 {
+        let mut tx = app.tx().unwrap();
+        for n in 0..50u64 {
+            let id = app.state.next_stored_id;
+            app.state.next_stored_id += 1;
+            let stored = crate::app::state::ParkedEntry {
+                seq: 1_000 + chunk * 50 + n,
+                ..model.clone()
+            };
+            tx.put(&crate::app::state::key::parked(id), &stored)
+                .unwrap();
+            app.state.parked.insert(id, stored);
+            ids.push(id);
+        }
+        tx.put(
+            crate::app::state::key::STORED_NEXT,
+            &app.state.next_stored_id,
+        )
+        .unwrap();
+        app.commit(tx).await.unwrap();
+    }
+    let backup = layered(&mut app).await;
+    drop(app);
+    let counting = Arc::new(DutyCounting {
+        inner: Arc::new(MemoryStore::new()),
+        kept: Mutex::new(Vec::new()),
+    });
+    let mut restored = App::restore(
+        w.env_on(Arc::clone(&counting) as Arc<dyn StateStore>),
+        protocol.clone(),
+        flaky_config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    // Every entry told once, in commits after the restore's, at most 64 each.
+    let kept = counting.kept.lock().unwrap().clone();
+    assert_eq!(kept[0], 0, "{kept:?}");
+    assert!(kept.iter().all(|n| *n <= 64), "{kept:?}");
+    assert!(kept.iter().filter(|n| **n > 0).count() >= 3, "{kept:?}");
+    let events = restored.unacknowledged_events().await.unwrap();
+    assert!(ids.iter().all(|id| retold(&events, *id) == 1), "{events:?}");
+}
+
+#[tokio::test]
+async fn test_restore_in_place_carrying_a_parked_event_tells_the_protocol_once() {
+    let w = World::new();
+    let protocol = FlakyProtocol::new(0);
+    let mut app = join_flaky(&w, &protocol, "wallet").await;
+    // Stored for good, its duty events not acknowledged; a backup holding it.
+    let id = stored_for_good(&w, &mut app, "refused").await;
+    let backup = layered(&mut app).await;
+    assert_eq!(retold(&app.kept_duties().await.unwrap(), id), 1);
+    drop(app);
+    // Restored in place: the `Parked` event is carried, so the entry isn't told again.
+    let mut restored = App::restore(w.env(), protocol.clone(), flaky_config(), &backup)
+        .await
+        .unwrap();
+    assert!(restored.state.parked.contains_key(&id));
+    restored.receive(None).await.unwrap();
+    let events = restored.unacknowledged_events().await.unwrap();
+    assert_eq!(retold(&events, id), 1, "{events:?}");
+}
+
 /// [`SampleProtocol`] whose restore step checks the certificate the restore installs, as
 /// a protocol with stricter rules than the switch's does: it takes only one that holds
 /// `required`, and records each certificate it was given.

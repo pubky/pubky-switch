@@ -34,6 +34,14 @@ pub enum RenewalSkip {
         /// The permissions a renewal would give it now.
         now: Vec<String>,
     },
+    /// The certificate's scopes now fail a scope rule, the Switch's or their protocol's: a
+    /// renewal keeping them would be refused.
+    ScopesRefused {
+        /// The protocol whose rule refused them; `None` for the Switch's own scope rule.
+        protocol: Option<String>,
+        /// The rule's own reason, as its code gives it.
+        reason: String,
+    },
 }
 
 /// Something the user needs to know.
@@ -129,9 +137,21 @@ pub enum Alert {
         /// Why.
         reason: RenewalSkip,
     },
+    /// The newest `identity.json`, as delivered or as a move's enrollment would carry it,
+    /// takes more than three quarters of the most either may carry (the body cap `PUT
+    /// /identity` and `POST /enroll` share, Switch wire 3.7, 7.1). Past it no version can be
+    /// delivered, a revocation's included, and no move can enroll. Its `renewed` entries are
+    /// what grow it: an entry stays once its renewal is closed, until its app is removed.
+    IdentityNearLimit {
+        /// The larger of the two sizes, in bytes.
+        bytes: u64,
+        /// The cap, in bytes.
+        limit: u64,
+    },
     /// The device clock and the switch's signed time differ by more than the clock tolerance
     /// (Switch spec 10.1): certificates are stamped with the device clock, so the signer
-    /// renews none by itself, and refuses to issue or renew one, until they agree again.
+    /// renews none by itself, and refuses to issue or renew one, until they agree again. It
+    /// clears itself at the first run that finds them agreeing.
     ClockOff,
     /// A removed app's Pubky grant still lets it write its Homeserver paths: the Pubky SDK
     /// offers no call to revoke a grant yet, so the user revokes it in the Homeserver's own

@@ -204,6 +204,7 @@ impl App {
             standing: received.standing,
             context: entry.context.clone(),
             parked: false,
+            released: false,
             conflict: None,
         };
         if protocol.check_body(&message).is_err() {

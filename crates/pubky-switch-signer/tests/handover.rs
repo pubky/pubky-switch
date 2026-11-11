@@ -353,6 +353,45 @@ async fn test_hand_over_to_another_app_after_an_abort_won() {
 }
 
 #[tokio::test]
+async fn test_hand_over_target_is_judged_on_the_switchs_time() {
+    // The device clock runs past the target's certificate's expiry, the switch's time
+    // doesn't: the target is served, and the hand-over goes ahead (Switch wire 3.12).
+    let world = World::new();
+    let s = setup(&world).await;
+    drop(s.old);
+    let mut env = world.env(s.old_store.clone());
+    env.clock = Arc::new(pubky_switch_client::clock::TestClock::new(
+        START_MS + 800 * 86_400_000,
+    ));
+    let mut old = Signer::open(env, world.keyring()).await.unwrap();
+    let app_id = s.target.cert.app_id();
+    old.hand_over_to(app_id, confirmed()).await.unwrap();
+    assert_eq!(world.switch.stored_handover(), Some(app_id));
+}
+
+#[tokio::test]
+async fn test_hand_over_target_expired_by_the_switchs_time_is_refused() {
+    // Just past the target's expiry by the switch's time, with the device clock a few
+    // minutes behind, within the tolerance: the switch doesn't serve it, so nothing is
+    // handed over (Switch wire 3.12).
+    let world = World::new();
+    let s = setup(&world).await;
+    drop(s.old);
+    let expiry = START_MS + 365 * 86_400_000;
+    world.clock.set_ms(expiry + 60_000);
+    let mut env = world.env(s.old_store.clone());
+    env.clock = Arc::new(pubky_switch_client::clock::TestClock::new(expiry - 120_000));
+    let mut old = Signer::open(env, world.keyring()).await.unwrap();
+    assert_eq!(
+        old.hand_over_to(s.target.cert.app_id(), confirmed())
+            .await
+            .unwrap_err(),
+        SignerError::Refused(Refusal::TargetNotCurrent)
+    );
+    assert_eq!(world.switch.stored_handover(), None);
+}
+
+#[tokio::test]
 async fn test_take_over_lost_to_an_abort_deletes_what_was_received() {
     // The new signer signed its first delivery, but couldn't send it; the abort won first. Its
     // retry is answered with the abort, a verified copy past it: the take-over is cancelled.
