@@ -11,7 +11,7 @@ use std::sync::Arc;
 use pubky_switch_client::app::{
     App, AppConfig, AppEvent, ClaimOp, Collection, ObligationDeadline, RecordContent, RecordTarget,
 };
-use pubky_switch_client::clock::TestClock;
+use pubky_switch_client::clock::{Clock, TestClock};
 use pubky_switch_client::store::{MemoryStore, StateStore};
 use pubky_switch_client::testing::{
     AppSpec, PEER_ORIGIN, PeerSwitch, ProtocolSpec, Router, START_MS, SWITCH_ORIGIN, ScriptError,
@@ -749,4 +749,209 @@ async fn test_testing_held_read_of_an_erased_account_gets_the_operators_404() {
         .verifying_key()
         .to_bytes();
     assert!(verifies(&operator), "signed with the operator key");
+}
+
+/// A feed read by `app` after `seq`, with `wait`.
+fn waiting_read_after(s: &Setup, app: &App, seq: u64, wait: &str) -> Request {
+    let mut request = waiting_read(s, app, wait);
+    request.path_and_query = format!(
+        "/v1/{}/feed?after={}:{seq}&wait={wait}",
+        s.alice.identity().key().id(),
+        app.cursor().generation
+    );
+    request
+}
+
+/// Two apps of alice that have read to the end, sharing a quota of 4 KiB: a share holds one
+/// unread note of 1 KiB with its overhead, not two.
+async fn two_apps_at_a_small_quota(s: &Setup) -> (App, App) {
+    s.alice.switch().set_inbox_quota(4096);
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    for app in [&mut wallet, &mut phone] {
+        app.receive(None).await.unwrap();
+        app.flush_cursor().await.unwrap();
+    }
+    (wallet, phone)
+}
+
+/// `app` reads its feed and moves its cursor past what it read.
+async fn read_and_pass(app: &mut App) {
+    app.receive(None).await.unwrap();
+    app.flush_cursor().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_testing_held_read_ends_its_apps_lagging_mark_when_it_arrives() {
+    let s = Setup::new();
+    let switch = s.alice.switch();
+    let (mut wallet, phone) = two_apps_at_a_small_quota(&s).await;
+    let both = [wallet.app_id(), phone.app_id()];
+    let start = phone.cursor().seq;
+    note(&s, &both);
+    read_and_pass(&mut wallet).await;
+    note(&s, &both);
+    assert!(switch.app(&phone.app_id()).lagging, "past its share");
+    // The phone's read with `wait`, past everything: held, and its mark ends as it arrives,
+    // before any wait (Switch wire 7.4.4).
+    let transport = switch.holding_transport();
+    let mut read = transport.send(waiting_read_after(&s, &phone, switch.seq(), "25"));
+    assert!(poll_once(&mut read).is_none(), "held");
+    assert!(!switch.app(&phone.app_id()).lagging);
+    // The wallet passes the second note, which now waits for the phone: nothing new shows
+    // to the held read, and no `missed` item is written for the note.
+    read_and_pass(&mut wallet).await;
+    assert!(poll_once(&mut read).is_none(), "still held");
+    assert_eq!(feed_past(&s, &phone, start).await.0, ["entry", "missed"]);
+}
+
+#[tokio::test]
+async fn test_testing_held_read_is_seen_when_it_arrives_only() {
+    let s = Setup::new();
+    let switch = s.alice.switch();
+    let (app, request) = held_read(&s).await;
+    let transport = switch.holding_transport();
+    s.clock.advance_ms(1_000);
+    let arrived = s.clock.now_ms();
+    let mut read = transport.send(request);
+    assert!(poll_once(&mut read).is_none());
+    assert_eq!(switch.app(&app.app_id()).last_seen, Some(arrived));
+    // Answered once its wait passed: the app isn't seen again (Switch wire 7.4.12).
+    s.clock.advance_ms(25_000);
+    switch.release_held_reads();
+    let answer = poll_once(&mut read).expect("answered once its wait passed");
+    assert_eq!(answer.status, 200);
+    assert_eq!(switch.app(&app.app_id()).last_seen, Some(arrived));
+}
+
+#[tokio::test]
+async fn test_testing_waiting_read_at_a_staged_account_is_refused_at_once() {
+    let s = Setup::new();
+    let switch = s.alice.switch();
+    let (app, _) = held_read(&s).await;
+    // The account as imported at another switch, staged until a delivery names it (Switch
+    // wire 7.3 step 7): it serves no feed read, and holds none.
+    let next = switch.import_into([7; 32]);
+    let transport = next.holding_transport();
+    let mut read = transport.send(waiting_read_after(&s, &app, next.seq(), "25"));
+    let answer = poll_once(&mut read).map(|answer| (answer.status, code_of(&answer)));
+    assert_eq!(answer, Some((503, "staged".to_owned())));
+    assert_eq!(next.held_reads(), 0);
+}
+
+#[tokio::test]
+async fn test_testing_waiting_read_of_a_gone_account_or_app_is_answered_at_once() {
+    let s = Setup::new();
+    let switch = s.alice.switch();
+    let (app, request) = held_read(&s).await;
+    let transport = switch.holding_transport();
+    // An app revoked before its read: refused when it arrives, never held.
+    switch.revoke(app.app_id()).unwrap();
+    let mut read = transport.send(waiting_read_after(&s, &app, switch.seq(), "25"));
+    let answer = poll_once(&mut read).expect("refused at once");
+    assert_eq!(
+        (answer.status, code_of(&answer).as_str()),
+        (403, "not_current")
+    );
+    // An account erased before the read: the operator's `404` at once.
+    let erase = Request {
+        method: "POST".into(),
+        origin: SWITCH_ORIGIN.into(),
+        path_and_query: format!("/v1/{}/erase", s.alice.identity().key().id()),
+        headers: Vec::new(),
+        body: pubky_switch_core::http::erase_body(&switch.service_key(), None),
+    };
+    assert_eq!(switch.transport().send(erase).await.unwrap().status, 200);
+    let mut read = transport.send(request);
+    let answer = poll_once(&mut read).expect("answered at once");
+    assert_eq!(
+        (answer.status, code_of(&answer).as_str()),
+        (404, "not_found")
+    );
+    assert_eq!(switch.held_reads(), 0);
+}
+
+#[tokio::test]
+async fn test_testing_held_reads_counts_each_held_read_once() {
+    let s = Setup::new();
+    let switch = s.alice.switch();
+    let (_app, request) = held_read(&s).await;
+    let transport = switch.holding_transport();
+    let mut read = transport.send(request);
+    assert!(poll_once(&mut read).is_none());
+    assert!(poll_once(&mut read).is_none());
+    assert_eq!(switch.held_reads(), 1);
+}
+
+#[tokio::test]
+async fn test_testing_departed_apps_lagging_mark_ends() {
+    let s = Setup::new();
+    let switch = s.alice.switch();
+    let (mut wallet, phone) = two_apps_at_a_small_quota(&s).await;
+    let both = [wallet.app_id(), phone.app_id()];
+    note(&s, &both);
+    read_and_pass(&mut wallet).await;
+    note(&s, &both);
+    assert!(switch.app(&phone.app_id()).lagging);
+    // The phone is revoked: its mark ends with it (Switch wire 7.4.4).
+    switch.revoke(phone.app_id()).unwrap();
+    assert!(!switch.app(&phone.app_id()).lagging);
+}
+
+#[tokio::test]
+async fn test_testing_marked_app_within_its_share_is_not_reading() {
+    let s = Setup::new();
+    let switch = s.alice.switch();
+    let (mut wallet, phone) = two_apps_at_a_small_quota(&s).await;
+    let both = [wallet.app_id(), phone.app_id()];
+    // The phone is marked, and what it hadn't read goes: it is within its share again, and
+    // still marked, for it has read nothing.
+    note(&s, &both);
+    read_and_pass(&mut wallet).await;
+    note(&s, &both);
+    read_and_pass(&mut wallet).await;
+    assert!(switch.app(&phone.app_id()).lagging);
+    // Two notes for the wallet alone, unread: the wallet passes its share. No current app
+    // is reading, unmarked and within its share, so none is marked and the marks set before
+    // end (Switch wire 7.4.4): a marked app doesn't count as reading.
+    note(&s, &[wallet.app_id()]);
+    assert!(
+        switch.app(&phone.app_id()).lagging,
+        "the wallet still reads"
+    );
+    note(&s, &[wallet.app_id()]);
+    assert!(!switch.app(&wallet.app_id()).lagging);
+    assert!(!switch.app(&phone.app_id()).lagging);
+}
+
+#[tokio::test]
+async fn test_testing_lagging_marks_are_judged_only_when_the_current_apps_change() {
+    let s = Setup::new();
+    let switch = s.alice.switch();
+    switch.set_inbox_quota(4096);
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    let mut tablet = s.join("tablet").await;
+    for app in [&mut wallet, &mut phone, &mut tablet] {
+        read_and_pass(app).await;
+    }
+    // Three apps share 4 KiB: two unread notes pass a share. With both notes unread by
+    // all three, none is reading, and none is marked.
+    let all = [wallet.app_id(), phone.app_id(), tablet.app_id()];
+    note(&s, &all);
+    note(&s, &all);
+    assert!(!switch.app(&phone.app_id()).lagging);
+    // The wallet and the tablet read; a cursor move sets no mark.
+    read_and_pass(&mut wallet).await;
+    read_and_pass(&mut tablet).await;
+    assert!(!switch.app(&phone.app_id()).lagging);
+    // A delivery that leaves the current apps as they were judges no mark: it lists a new
+    // app, which isn't current before it registers its record.
+    let desk = s.alice.identity().app_keys("desk");
+    s.alice.approve(&desk, &AppSpec::new(&["notes"])).unwrap();
+    assert!(!switch.app(&phone.app_id()).lagging);
+    // A revocation changes them, and with them the shares: the marks are judged, and the
+    // phone, past its share while the wallet reads, is marked.
+    switch.revoke(tablet.app_id()).unwrap();
+    assert!(switch.app(&phone.app_id()).lagging);
 }

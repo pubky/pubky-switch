@@ -263,10 +263,15 @@ pub(crate) struct Inner {
     /// Keep the entries every reader they wait for has passed
     /// ([`ScriptedSwitch::keep_passed_entries`]).
     keep_passed: bool,
-    /// The wakers of the feed reads the switch holds (Switch wire 7.4.4 `wait`): each is
-    /// woken when the account's sequence grows, at the next request, and when a test says
-    /// the clock moved.
-    held: Vec<Waker>,
+    /// The feed reads the switch holds and hasn't woken since they last looked (Switch wire
+    /// 7.4.4 `wait`), each with its waker: woken when the account's sequence grows, at the
+    /// next request, at an erasure, and when a test says the clock moved.
+    held: Vec<(u64, Waker)>,
+    /// The number given to the last held read.
+    held_ids: u64,
+    /// The request being answered is a held read, seen when it arrived: it isn't seen again
+    /// (Switch wire 7.4.12 `last_seen`).
+    seen_at_arrival: bool,
     /// Feed reads answered before every later one is `503 unavailable`: a bound for tests
     /// of reads that must end.
     pub(crate) feed_limit: Option<u64>,
@@ -357,6 +362,8 @@ impl Inner {
             feed_reads: 0,
             keep_passed: false,
             held: Vec::new(),
+            held_ids: 0,
+            seen_at_arrival: false,
             feed_limit: None,
             max_page_bytes: MAX_PAGE_BYTES,
             unreached: Vec::new(),
@@ -404,13 +411,14 @@ struct Holding(Arc<ScriptedSwitch>);
 impl Transport for Holding {
     fn send(&self, request: Request) -> BoxFuture<'_, Result<Response, TransportError>> {
         Box::pin(async move {
-            if let Some(held) = self.0.waiting_read(&request) {
-                held.await;
-            }
+            let Some(held) = self.0.waiting_read(&request) else {
+                return self.0.handle(&request);
+            };
+            held.await;
             // Answered as the account stands now: a reader revoked or departed while its
             // read was held is refused, and an account erased meanwhile is one the switch
             // doesn't host, as at the service (Switch wire 7.4.4, 7.4.16).
-            self.0.handle(&request)
+            self.0.answer(&request, true)
         })
     }
 }
@@ -421,6 +429,8 @@ impl Transport for Holding {
 /// is held only while it looks, never across the wait.
 struct Held<'a> {
     switch: &'a ScriptedSwitch,
+    /// Its number among the reads the switch held.
+    id: u64,
     app: [u8; 16],
     /// The certificate the app was current with when the read arrived.
     cert: AppCert,
@@ -440,7 +450,12 @@ impl Future for Held<'_> {
         {
             return Poll::Ready(());
         }
-        inner.held.push(cx.waker().clone());
+        // One waker a read, the newest.
+        let (id, waker) = (self.id, cx.waker().clone());
+        match inner.held.iter_mut().find(|(held, _)| *held == id) {
+            Some(held) => held.1 = waker,
+            None => inner.held.push((id, waker)),
+        }
         Poll::Pending
     }
 }
@@ -825,7 +840,8 @@ impl ScriptedSwitch {
         self.lock().wake_held();
     }
 
-    /// How many feed reads the switch holds now.
+    /// How many feed reads the switch holds now that it hasn't woken since they last
+    /// looked.
     pub fn held_reads(&self) -> usize {
         self.lock().held.len()
     }
@@ -855,18 +871,31 @@ impl ScriptedSwitch {
         }
         let wait_s = wait.filter(|seconds| *seconds > 0)?;
         // The read is admitted as it arrives, as the service admits it under its lock: an
-        // account that is gone or an app that isn't current is answered at once, and the
-        // app is seen now, not when its read is answered.
+        // account that doesn't serve it (gone, staged, or frozen for a write) or an app that
+        // isn't current is answered at once, and the app is seen now, not when its read is
+        // answered.
         let mut inner = self.lock();
-        if inner.erased || inner.enrolled.is_none() {
+        if inner
+            .gate(&request.method, &request.path_and_query)
+            .is_some()
+        {
             return None;
         }
         let cert = inner.own_call(&app).ok()?;
+        inner.seen_at_arrival = false;
         inner.seen(request);
+        // The read ends its app's lagging mark as it arrives, before any wait (Switch wire
+        // 7.4.4).
+        if let Some(held) = inner.apps.get_mut(&app) {
+            held.lagging = false;
+        }
         let until_ms = inner.now().saturating_add(wait_s.saturating_mul(1000));
+        inner.held_ids += 1;
+        let id = inner.held_ids;
         drop(inner);
         Some(Held {
             switch: self,
+            id,
             app,
             cert,
             after,
@@ -886,7 +915,14 @@ impl ScriptedSwitch {
     /// A scripted fault's connection failure or lost answer, or [`TransportError::Other`]
     /// when the switch can't build its answer.
     pub fn handle(&self, request: &Request) -> Result<Response, TransportError> {
+        self.answer(request, false)
+    }
+
+    /// [`ScriptedSwitch::handle`]; `held` for a feed read the switch held, whose app was
+    /// seen when the read arrived and isn't seen again.
+    fn answer(&self, request: &Request, held: bool) -> Result<Response, TransportError> {
         let mut inner = self.lock();
+        inner.seen_at_arrival = held;
         // A held read whose wait has passed is answered now at the latest.
         inner.wake_held();
         let path = request.path_and_query.clone();
@@ -1355,6 +1391,9 @@ impl Inner {
     /// The scripted switch takes an app with a record, not revoked, departed or kept, as
     /// authenticated; the service sees no other.
     fn seen(&mut self, request: &Request) {
+        if self.seen_at_arrival {
+            return;
+        }
         let Some(app) = request
             .header(header::APP)
             .and_then(|text| app_id_decode(text).ok())
@@ -1393,7 +1432,7 @@ impl Inner {
 
     /// Wake every held feed read, to look again.
     fn wake_held(&mut self) {
-        for waker in self.held.drain(..) {
+        for (_, waker) in self.held.drain(..) {
             waker.wake();
         }
     }

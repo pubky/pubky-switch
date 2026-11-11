@@ -56,12 +56,18 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   `release_held_reads`, where the service answers by itself when its time is up. The
   transport of `transport` holds nothing and answers such a read at once. A `wait` that
   isn't an integer from 0 to 25 is `400`. A read is held only for a current app of an
-  account that serves, which is seen when the read arrives; the switch's lock isn't held
-  across the wait, and every request to the switch lets the held reads look again. A read
-  held while its app is revoked or leaves is woken and refused `403 not_current`, and one
-  held while its account is erased gets the operator's `404`, never a page under the
-  erased account's key (Switch wire 7.4.16). Faults and the stale-timestamp check apply
-  when the read is answered, not when it arrives.
+  account that serves it: one that is gone, staged, or otherwise refuses the call answers at
+  once. The read is admitted when it arrives, as at the service: its app is seen then and
+  not again when the read is answered, and its app's lagging mark ends then. The switch's
+  lock isn't held across the wait, and every request to the switch lets the held reads look
+  again. A read held while its app is revoked or leaves is woken and refused `403
+  not_current`, and one held while its account is erased gets the operator's `404`, never a
+  page under the erased account's key (Switch wire 7.4.16). Unlike the service, a held read
+  looks again only for something to show, the erasure and its time: an app whose
+  certificate expires while its read is held is refused once the read is answered, where
+  the service refuses it at the account's next commit; the answer is the same. Faults and
+  the stale-timestamp check apply when the read is answered, not when it arrives.
+  `held_reads` counts the reads held and not woken since they last looked.
 - **Retention and sweeps** (Switch wire 9.1, 7.4.4): an entry goes once every current
   target that isn't lagging has passed it, as at the service, judged at cursor moves, at
   appends and at deliveries, revocations and leaves (`keep_passed_entries` turns that off
@@ -153,7 +159,7 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   checks, for scripting what another signer or a faulty service did. `forget_delivery_proof`
   makes a retry answer with no proof.
 - **`GET /apps`** (Switch wire 7.4.12), in `switch/signer.rs`: by the service's rules, member
-  by member, but `last_seen`, `unread_entries`, `sole_target_unread` and `recovery` (below):
+  by member, but `last_seen` and `recovery` (below):
   - every app the switch holds, every App ID it keeps for good, and every app the newest
     document lists. An App ID an enrollment named shows `revoked_at` at the enrollment's time;
   - `current` in spec 3.4's sense, as the service reports it, once the app has a record: listed with its certificate, or
@@ -193,8 +199,8 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   `revoke`; an app that left is answered as one revoked already, with no proof. `leave` is a
   test call and also a route, `POST /apps/{app_id}/leave`, which checks only that the app
   hasn't departed: it takes any body, departs an app with no record or one whose certificate
-  has expired or isn't listed, keeps the app's invite codes, push registration and inbox
-  entries, and stamps the test clock's time. The service refuses another app's path and the
+  has expired or isn't listed, keeps the app's invite codes and push registration, and
+  stamps the test clock's time. The service refuses another app's path and the
   signer with `403 permission_missing`, where this switch answers `404`, and an app of
   another identity with `403 permission_missing`, where this switch answers `403
   not_admitted` (Switch wire 7.4.12). `request_full_bundle` is a test call for the app's own
