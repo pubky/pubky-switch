@@ -28,8 +28,8 @@ use crate::{FlowResult, World};
 ///
 /// When a step that should succeed against any switch fails.
 pub async fn messaging(world: &World) -> FlowResult {
-    let alice = world.identity("alice");
-    let bob = world.identity("bob");
+    let alice = world.identity("alice")?;
+    let bob = world.identity("bob")?;
     world.add_switch(ORIGIN, &[&alice, &bob]).await?;
     let mut alice_signer = enroll(world, &alice, ORIGIN).await?;
     let mut bob_signer = enroll(world, &bob, ORIGIN).await?;
@@ -88,7 +88,7 @@ pub(crate) async fn joined(
     signer: &mut Signer,
     name: &str,
 ) -> Result<(App, Arc<TestProtocol>), Box<dyn std::error::Error>> {
-    let asking = Asking::new(world.app_keys(identity, name))?;
+    let asking = Asking::new(world.app_keys(identity, name)?)?;
     joined_as(world, identity, signer, asking).await
 }
 

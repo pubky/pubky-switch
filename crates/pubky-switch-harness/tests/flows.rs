@@ -8,6 +8,8 @@
 use std::collections::BTreeSet;
 
 use pubky_switch::http::route::route;
+use pubky_switch_client::transport::{Request, Response};
+use pubky_switch_core::enc::{b64, unb64};
 use pubky_switch_harness::allowed::{ALLOWED, EVERY_FLOW};
 use pubky_switch_harness::compare::{differences, judge};
 use pubky_switch_harness::flows::{self, CALLS, FLOWS, ORIGIN, flow_of};
@@ -15,26 +17,31 @@ use pubky_switch_harness::{Backend, Comparison, FlowResult, Trace, World, compar
 use tokio::sync::OnceCell;
 
 /// Every flow's comparison, made once for the tests of this file; `None` when no test
-/// database is configured.
+/// database is configured. A flow that fails is kept as the failure: every test that asks
+/// then fails at once with it, and no flow is run again.
 async fn comparisons() -> Option<&'static [(&'static str, Comparison)]> {
-    static COMPARISONS: OnceCell<Option<Vec<(&'static str, Comparison)>>> = OnceCell::const_new();
-    COMPARISONS
+    type Made = Result<Option<Vec<(&'static str, Comparison)>>, String>;
+    static COMPARISONS: OnceCell<Made> = OnceCell::const_new();
+    let made = COMPARISONS
         .get_or_init(|| async {
             let mut all = Vec::new();
             for (name, flow) in FLOWS {
                 match compare_backends(name, flow).await {
-                    Err(error) => panic!("{name}: {error}"),
+                    Err(error) => return Err(format!("{name}: {error}")),
                     Ok(None) => {
                         eprintln!("ran against the scripted switch only: no test database");
-                        return None;
+                        return Ok(None);
                     }
                     Ok(Some(comparison)) => all.push((*name, comparison)),
                 }
             }
-            Some(all)
+            Ok(Some(all))
         })
-        .await
-        .as_deref()
+        .await;
+    match made {
+        Ok(all) => all.as_deref(),
+        Err(failure) => panic!("{failure}"),
+    }
 }
 
 /// What the flow `name` showed against the service.
@@ -51,10 +58,7 @@ async fn service_trace(name: &str) -> Option<&'static Trace> {
 /// changes them.
 async fn distorted(
     flow: impl AsyncFn(&World) -> FlowResult,
-    distort: fn(
-        &pubky_switch_client::transport::Request,
-        &mut pubky_switch_client::transport::Response,
-    ),
+    distort: fn(&Request, &mut Response),
 ) -> Trace {
     run(Backend::Scripted, async |world| {
         world.distort(distort);
@@ -156,6 +160,101 @@ async fn test_comparison_fails_a_scripted_switch_that_leaves_the_head_out() {
     );
 }
 
+/// The answer's JSON body, changed by `change` where `change` finds what it looks for.
+fn change_body(answer: &mut Response, change: impl FnOnce(&mut serde_json::Value) -> Option<()>) {
+    let Ok(mut body) = serde_json::from_slice::<serde_json::Value>(&answer.body) else {
+        return;
+    };
+    if change(&mut body).is_some() {
+        answer.body = serde_json::to_vec(&body).expect("json");
+    }
+}
+
+/// The JSON object `text` carries in base64url, changed by `change`, in base64url again.
+fn change_carried(text: &str, change: impl FnOnce(&mut serde_json::Value)) -> String {
+    let mut carried: serde_json::Value =
+        serde_json::from_slice(&unb64(text).expect("base64url")).expect("json");
+    change(&mut carried);
+    b64(&serde_json::to_vec(&carried).expect("json"))
+}
+
+fn is_get_apps(request: &Request) -> bool {
+    request.method == "GET" && request.path_and_query.ends_with("/apps")
+}
+
+/// A scripted switch that answers a wrong signature, hash or certificate hash of the right
+/// length fails the comparison: the string isn't the one the run showed before, where the
+/// service's is. Each of the three is swapped in the `join` flow's `GET /apps` answers.
+#[tokio::test]
+async fn test_comparison_fails_a_scripted_switch_that_answers_another_string_of_the_same_length() {
+    let Some(service) = service_trace("join").await else {
+        return;
+    };
+    type Distortion = fn(&Request, &mut Response);
+    let cases: [(&str, &str, Distortion); 3] = [
+        (
+            "the signature of the identity.json it holds",
+            "body.identity.sig",
+            |request, answer| {
+                if is_get_apps(request) {
+                    change_body(answer, |body| {
+                        *body.get_mut("identity")?.get_mut("sig")? = b64(&[7; 64]).into();
+                        Some(())
+                    });
+                }
+            },
+        ),
+        (
+            "the hash of a listed certificate, inside the identity.json it holds",
+            "body.identity.body~.apps[0].cert",
+            |request, answer| {
+                if is_get_apps(request) {
+                    change_body(answer, |body| {
+                        let signed = body.get_mut("identity")?.get_mut("body")?;
+                        let mut listed = false;
+                        let changed = change_carried(signed.as_str()?, |identity| {
+                            if let Some(cert) = identity.pointer_mut("/apps/0/cert") {
+                                *cert = b64(&[5; 32]).into();
+                                listed = true;
+                            }
+                        });
+                        *signed = changed.into();
+                        listed.then_some(())
+                    });
+                }
+            },
+        ),
+        (
+            "the chain hash of the head in Switch-Head",
+            "header switch-head~.chain_hash",
+            |request, answer| {
+                if !is_get_apps(request) {
+                    return;
+                }
+                for header in &mut answer.headers {
+                    if header.name == "switch-head" {
+                        header.value = change_carried(&header.value, |head| {
+                            head["chain_hash"] = b64(&[9; 32]).into();
+                        });
+                    }
+                }
+            },
+        ),
+    ];
+    for (what, fact, distortion) in cases {
+        let scripted = distorted(flows::join, distortion).await;
+        let verdict = judge("join", differences(service, &scripted), ALLOWED);
+        assert!(
+            verdict.unlisted.iter().any(|d| d.fact == fact
+                && d.label == "{alice} GET /v1/{alice}/apps"
+                && d.scripted
+                    .as_deref()
+                    .is_some_and(|shown| shown.ends_with("a string not shown before"))),
+            "{what} wasn't noticed:\n{verdict}"
+        );
+    }
+}
+
 /// A sample App ID and a sample of any other path parameter.
 const APP: &str = "yyyyyyyyyyyyyyyyyyyyyyyyyy";
 const KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
@@ -207,7 +306,7 @@ async fn test_every_served_call_is_listed_and_sent_by_its_flow() {
         .expect("a world")
         .expect("a database");
     flows::enrollment(&world).await.expect("enrolled");
-    let id = world.identity("alice").key().id();
+    let id = world.identity("alice").expect("alice").key().id();
     let mut failures = Vec::new();
     let mut waiting = Vec::new();
     for (method, template) in CALLS {

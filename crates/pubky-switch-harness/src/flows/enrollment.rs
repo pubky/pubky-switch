@@ -1,11 +1,13 @@
 //! Enrollment and the first `identity.json` (Switch spec 12.1, Switch wire 3.7, 7.4.1,
-//! 7.4.2).
+//! 7.4.2, 7.4.15).
 
 use std::sync::Arc;
 
 use pubky_switch_client::store::MemoryStore;
 use pubky_switch_client::testing::TestIdentity;
-use pubky_switch_core::records::IDENTITY_PATH;
+use pubky_switch_core::enc::unb64_array;
+use pubky_switch_core::http::{header, verify_response};
+use pubky_switch_core::records::{IDENTITY_PATH, IdentityDoc};
 use pubky_switch_signer::Signer;
 use serde_json::json;
 
@@ -22,7 +24,7 @@ use crate::{FlowResult, World};
 ///
 /// When a step that should succeed against any switch fails.
 pub async fn enrollment(world: &World) -> FlowResult {
-    let alice = world.identity("alice");
+    let alice = world.identity("alice")?;
     world.add_switch(ORIGIN, &[&alice]).await?;
     let store = Arc::new(MemoryStore::new());
 
@@ -32,6 +34,9 @@ pub async fn enrollment(world: &World) -> FlowResult {
     world.advance_ms(STEP_MS);
     signer.resume().await?;
     world.outcome("enrolled", &status(&signer)?);
+    let delivered = signer
+        .identity_doc()?
+        .ok_or("the signer holds no identity.json")?;
     drop(signer);
     world.advance_ms(STEP_MS);
     let published = world.files().identity_doc(&alice.public());
@@ -39,14 +44,37 @@ pub async fn enrollment(world: &World) -> FlowResult {
         "published",
         &json!({
             "path": IDENTITY_PATH,
-            "version": published.as_ref().map(pubky_switch_core::records::IdentityDoc::version),
+            "version": published.as_ref().map(IdentityDoc::version),
         }),
     );
 
-    // Anyone reads the newest `identity.json` from the switch (Switch wire 7.4.2). Neither
-    // the client nor the signer makes this call: a reader without keys does.
+    // Anyone reads the newest `identity.json` from the switch (Switch wire 7.4.15). Neither
+    // the client nor the signer makes this call: a reader without keys does, so the flow
+    // checks the answer as such a reader would. Its body is the document the signer
+    // delivered, byte for byte, and it is signed with the account's service key.
     let path = format!("/v1/{}/identity", alice.key().id());
-    world.request("GET", ORIGIN, &path).await?;
+    let answer = world.request("GET", ORIGIN, &path).await?;
+    let mut expected = b"{\"identity\":".to_vec();
+    expected.extend_from_slice(&serde_json::to_vec(delivered.signed())?);
+    expected.push(b'}');
+    if answer.body != expected {
+        return Err("the public read isn't the delivered identity.json, byte for byte".into());
+    }
+    let signature = answer
+        .header(header::SERVICE_SIGNATURE)
+        .and_then(|text| unb64_array::<64>(text).ok())
+        .ok_or("the public read carries no service signature")?;
+    let server_time = answer
+        .header(header::SERVER_TIME)
+        .ok_or("the public read carries no service time")?;
+    verify_response(
+        &delivered.inbox().service_key,
+        answer.status,
+        None,
+        server_time,
+        &answer.body,
+        &signature,
+    )?;
     world.advance_ms(STEP_MS);
 
     // The same install after a restart: nothing is owed, and nothing changes.
