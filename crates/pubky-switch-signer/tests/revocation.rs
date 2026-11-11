@@ -198,16 +198,17 @@ async fn test_revocation_reaches_the_switch_while_an_alarm_holds_signing_back() 
 async fn test_revocation_takes_the_switchs_time_not_the_signers_clock() {
     // The signer's clock runs ten hours ahead of the switch's: `distrust_from` is the time
     // in the revocation's proof (Switch wire 7.4.12), and the backup keeps the App ID.
+    // The apps are approved first, while the clocks agree: an approval needs them to.
     let world = World::new();
-    let (signer, memory) = world.enrolled().await;
+    let (mut signer, memory) = world.enrolled().await;
+    let (a, _) = two_joined(&world, &mut signer).await;
+    let id = a.keys.app_id_bytes();
     drop(signer);
     let mut env = world.env(memory);
     env.clock = Arc::new(pubky_switch_client::clock::TestClock::new(
         START_MS + 10 * 3_600_000,
     ));
     let mut signer = Signer::open(env, world.keyring()).await.unwrap();
-    let (a, _) = two_joined(&world, &mut signer).await;
-    let id = a.keys.app_id_bytes();
     world.clock.advance_ms(DAY_MS);
     let removing = signer.revoke(id, None, confirmed()).await.unwrap();
     assert_eq!(removing.body().removed[0].distrust_from, START_MS + DAY_MS);
