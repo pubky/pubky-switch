@@ -337,7 +337,11 @@ async fn test_records_get_refusals_and_deleted_records() {
     for path in [&path, &list] {
         let request = other_request("shop", ORIGIN, "GET", path, Vec::new(), None, ms(AT));
         let answer = replay.service.handle(request).await;
-        assert_eq!(code_of(&answer), (403, json!("not_admitted")), "{path}");
+        assert_eq!(
+            code_of(&answer),
+            (403, json!("permission_missing")),
+            "{path}"
+        );
         assert!(header_text(&answer, "switch-head").is_none());
     }
     replay.db.drop_database().await.expect("drop");
