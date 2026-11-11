@@ -40,6 +40,7 @@ mod events;
 mod feed;
 mod identity;
 mod keys;
+mod parked;
 mod peek;
 mod protocol;
 mod provider;
@@ -69,6 +70,7 @@ pub use events::{
 };
 pub use feed::ReceiveReport;
 pub use identity::{DOC_CACHE_MS, HomeserverReader, IdentityRefresh, REVALIDATION_MS};
+pub use parked::{ParkedMessage, ParkedSummary};
 pub use peek::{PeekReport, Peeked};
 pub use protocol::{
     Effect, LOCAL_WRITE_OVERHEAD_BYTES, LocalWrite, MAX_CLAIM_READS, MAX_LOSS_CONVERSATIONS,
@@ -1132,6 +1134,8 @@ impl App {
                 Restorable::Ready(app, tx) => {
                     tx.commit(&app.env.store).await?;
                     let mut app = *app;
+                    // Committed: a failure here leaves the rest to the next read.
+                    let _ = app.retell_restored().await;
                     let kept = app.kept_duties().await?;
                     app.queue_duties(kept);
                     Ok(app)
@@ -1364,6 +1368,9 @@ impl App {
                     feed::processed_writes(&mut tx, sender, msg_id, record.hash, record.at_ms)?;
                 }
                 tx.put(records::LIST_DUE, &true)?;
+                // The entries it brings back are told to the protocol again, in steps after
+                // the restore commits (Switch spec 12.4).
+                parked::Retell::start(&app.state, &mut tx)?;
                 tx.local(&layer_writes)?;
                 tx.put(key::DUTY_NEXT, &app.state.next_duty)?;
                 tx.put(key::DUTY_EPOCH, &app.state.duty_epoch)?;

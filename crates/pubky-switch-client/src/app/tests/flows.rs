@@ -29,7 +29,7 @@ fn has(events: &[AppEvent], pred: impl Fn(&AppEvent) -> bool) -> bool {
     events.iter().any(pred)
 }
 
-fn received(events: &[AppEvent], seq: u64) -> bool {
+pub(crate) fn received(events: &[AppEvent], seq: u64) -> bool {
     has(
         events,
         |e| matches!(e, AppEvent::MessageReceived { seq: s, .. } if *s == seq),
