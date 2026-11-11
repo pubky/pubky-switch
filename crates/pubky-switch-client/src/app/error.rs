@@ -102,6 +102,18 @@ pub enum Refusal {
     NotNow(String),
     /// A value the protocol or the host gave breaks a rule: the text names it.
     Usage(String),
+    /// A restore in place ([`super::App::restore`]) would carry more of what the store
+    /// still owes its protocol than one commit takes beside the backup, which fits on its
+    /// own: the duty events not acknowledged and the protocol calls owed, counted here.
+    /// Nothing was written. The host acknowledges the duty events it has acted on
+    /// ([`super::App::ack_events`]), lets the protocol answer the owed calls, or restores
+    /// onto an empty store, then restores again.
+    CarriedTooLarge {
+        /// The duty events the restore would carry.
+        duty_events: u64,
+        /// The owed protocol calls it would carry.
+        owed_calls: u64,
+    },
 }
 
 impl std::fmt::Display for Refusal {
@@ -117,6 +129,14 @@ impl std::fmt::Display for Refusal {
             }
             Refusal::NotNow(why) => write!(f, "not now: {why}"),
             Refusal::Usage(why) => write!(f, "usage: {why}"),
+            Refusal::CarriedTooLarge {
+                duty_events,
+                owed_calls,
+            } => write!(
+                f,
+                "the restore in place would carry {duty_events} duty events not acknowledged \
+                 and {owed_calls} owed calls, more than one commit takes beside the backup"
+            ),
         }
     }
 }

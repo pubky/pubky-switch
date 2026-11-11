@@ -391,13 +391,30 @@ async fn test_protocol_api_identity_lookup_in_two_halves() {
 }
 
 /// A protocol in another crate tests its own restore step: the context the testing module
-/// builds blinds under the naming key it was given, as the restored app does.
+/// builds blinds under the naming key it was given, and gives the certificate it was given,
+/// as the restored app does.
 #[test]
 fn test_restore_context_for_a_protocols_own_tests() {
     let naming = pubky_switch_core::ident::NamingKey::from_bytes([3; 32]);
-    let restoring = pubky_switch_client::testing::restore_context([1; 32], [2; 16], &naming);
-    assert_eq!(restoring.identity(), [1; 32]);
-    assert_eq!(restoring.app_id(), [2; 16]);
+    let identity = TestIdentity::new(&Seeds::default(), "alice");
+    let keys = identity.app_keys("wallet");
+    let cert = pubky_switch_client::testing::issue_cert(
+        identity.key(),
+        &keys,
+        &AppSpec::new(&["scope-a"]),
+        START_MS,
+    )
+    .unwrap();
+    let restoring = pubky_switch_client::testing::restore_context(
+        identity.public(),
+        cert.app_id(),
+        &naming,
+        &cert,
+    );
+    assert_eq!(restoring.identity(), identity.public());
+    assert_eq!(restoring.app_id(), cert.app_id());
+    assert_eq!(restoring.cert(), &cert);
+    assert!(restoring.cert().holds_scope("scope-a"));
     assert_eq!(restoring.blind(b"input"), naming.blind(b"input"));
     let layer = ProtocolLayer {
         protocol: "example".into(),

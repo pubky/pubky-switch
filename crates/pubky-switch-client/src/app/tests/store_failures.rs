@@ -1905,3 +1905,282 @@ async fn test_restore_in_place_over_an_unreadable_counter_gives_out_no_id_the_st
     let again = restored.stored_id_at(seq).unwrap();
     assert!(again > id, "ID {again} given out again");
 }
+
+/// [`SampleProtocol`] whose restore step checks the certificate the restore installs, as
+/// a protocol with stricter rules than the switch's does: it takes only one that holds
+/// `required`, and records each certificate it was given.
+struct CertCheckProtocol {
+    sample: SampleProtocol,
+    name: Option<String>,
+    required: Mutex<Option<String>>,
+    given: Mutex<Vec<AppCert>>,
+}
+
+impl CertCheckProtocol {
+    fn new(name: Option<&str>, required: Option<&str>) -> Arc<Self> {
+        Arc::new(Self {
+            sample: SampleProtocol::default(),
+            name: name.map(str::to_owned),
+            required: Mutex::new(required.map(str::to_owned)),
+            given: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn given(&self) -> Vec<AppCert> {
+        self.given.lock().unwrap().clone()
+    }
+}
+
+impl Protocol for CertCheckProtocol {
+    fn has_keys(&self, scope: &str) -> bool {
+        self.sample.has_keys(scope)
+    }
+
+    fn sent_between_own_apps(&self, kind: &str) -> bool {
+        self.sample.sent_between_own_apps(kind)
+    }
+
+    fn check_scopes(
+        &self,
+        message: &Message,
+        sender: &AppCert,
+        own: &AppCert,
+    ) -> Result<(), String> {
+        self.sample.check_scopes(message, sender, own)
+    }
+
+    fn accepts(&self, cert: &AppCert) -> Vec<String> {
+        self.sample.accepts(cert)
+    }
+
+    fn check_body(&self, message: &ReceivedMessage) -> Result<(), String> {
+        self.sample.check_body(message)
+    }
+
+    fn resend_needed(
+        &self,
+        needed: &ResendNeeded,
+    ) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
+        self.sample.resend_needed(needed)
+    }
+
+    fn missed(&self, missed: &MissedEntries) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
+        self.sample.missed(missed)
+    }
+
+    fn backup_name(&self) -> Option<String> {
+        self.name.clone()
+    }
+
+    fn restore_layer(
+        &self,
+        layer: Option<&ProtocolLayer>,
+        restoring: &RestoreContext<'_>,
+    ) -> Result<Vec<LocalWrite>, String> {
+        let cert = restoring.cert();
+        self.given.lock().unwrap().push(cert.clone());
+        if let Some(required) = self.required.lock().unwrap().as_deref()
+            && !cert.holds_scope(required)
+        {
+            return Err(format!("sample: the certificate doesn't hold {required}"));
+        }
+        let Some(layer) = layer else {
+            return Ok(Vec::new());
+        };
+        let state = crate::app::decode_local_state(&layer.data)
+            .ok_or_else(|| String::from("sample: the layer doesn't read"))?;
+        Ok(state
+            .into_iter()
+            .map(|(key, value)| LocalWrite::Put { key, value })
+            .collect())
+    }
+}
+
+/// An app of `protocol` on `store`, with a value in its local state.
+async fn cert_checked(
+    w: &World,
+    protocol: &Arc<CertCheckProtocol>,
+    store: &Arc<MemoryStore>,
+) -> App {
+    let request = w.approve(&app_keys("wallet"), &["scope-a"]);
+    let mut app = App::join(
+        w.env_on(Arc::clone(store) as Arc<dyn StateStore>),
+        protocol.clone(),
+        World::config(),
+        request,
+    )
+    .await
+    .unwrap();
+    app.protocol_commit(&[LocalWrite::Put {
+        key: b"note".to_vec(),
+        value: b"kept".to_vec(),
+    }])
+    .await
+    .unwrap();
+    app
+}
+
+/// `backup` restored on `store` by a protocol that requires a scope the certificate
+/// doesn't hold: refused before any commit, the store as it was, and the protocol given the
+/// backup's certificate.
+async fn refused_on_its_cert(
+    w: &World,
+    name: Option<&str>,
+    store: &Arc<MemoryStore>,
+    backup: &AppBackup,
+    cert: &AppCert,
+) {
+    let app_id = cert.app_id();
+    let before = snapshot(store, &app_id);
+    let fault = Arc::new(FaultStore::new(
+        Arc::clone(store) as Arc<dyn StateStore>,
+        StoreFault::None,
+    ));
+    let strict = CertCheckProtocol::new(name, Some("scope-b"));
+    let error = restore_on(
+        w,
+        strict.clone(),
+        fault.clone() as Arc<dyn StateStore>,
+        backup,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(&error, AppError::InvalidData(why) if why.contains("doesn't hold scope-b")),
+        "{error:?}"
+    );
+    assert_eq!(fault.commits(), 0);
+    assert_eq!(snapshot(store, &app_id), before);
+    assert_eq!(strict.given(), vec![cert.clone()]);
+}
+
+#[tokio::test]
+async fn test_restore_refused_on_its_cert_from_a_plain_backup_writes_nothing() {
+    let w = World::new();
+    let store = Arc::new(MemoryStore::new());
+    let app = cert_checked(&w, &CertCheckProtocol::new(None, None), &store).await;
+    let backup = AppBackup::from_bytes(&app.backup().unwrap().to_bytes().unwrap()).unwrap();
+    let cert = app.cert().clone();
+    refused_on_its_cert(&w, None, &Arc::new(MemoryStore::new()), &backup, &cert).await;
+    // The same protocol, taking the certificate, restores it.
+    let taking = CertCheckProtocol::new(None, Some("scope-a"));
+    let empty = Arc::new(MemoryStore::new());
+    restore_on(&w, taking.clone(), empty as Arc<dyn StateStore>, &backup)
+        .await
+        .unwrap();
+    assert_eq!(taking.given(), vec![cert]);
+}
+
+#[tokio::test]
+async fn test_restore_refused_on_its_cert_from_a_layered_backup_writes_nothing() {
+    let w = World::new();
+    let store = Arc::new(MemoryStore::new());
+    let protocol = CertCheckProtocol::new(Some(JOURNAL), None);
+    let mut app = cert_checked(&w, &protocol, &store).await;
+    let backup = layered(&mut app).await;
+    let cert = app.cert().clone();
+    refused_on_its_cert(
+        &w,
+        Some(JOURNAL),
+        &Arc::new(MemoryStore::new()),
+        &backup,
+        &cert,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_restore_in_place_refused_on_its_cert_leaves_the_store_untouched() {
+    let w = World::new();
+    let store = Arc::new(MemoryStore::new());
+    let protocol = CertCheckProtocol::new(Some(JOURNAL), None);
+    let mut app = cert_checked(&w, &protocol, &store).await;
+    let backup = layered(&mut app).await;
+    let cert = app.cert().clone();
+    drop(app);
+    assert!(!snapshot(&store, &cert.app_id()).is_empty());
+    refused_on_its_cert(&w, Some(JOURNAL), &store, &backup, &cert).await;
+}
+
+#[tokio::test]
+async fn test_backup_layered_check_gives_the_current_cert_and_a_refusal_refuses_it() {
+    let w = World::new();
+    let store = Arc::new(MemoryStore::new());
+    let protocol = CertCheckProtocol::new(Some(JOURNAL), None);
+    let mut app = cert_checked(&w, &protocol, &store).await;
+    // The check before the backup is handed over is given the app's own certificate.
+    app.backup_layered().await.unwrap();
+    assert_eq!(protocol.given(), vec![app.cert().clone()]);
+    // One the protocol wouldn't restore with refuses the backup, writing nothing.
+    *protocol.required.lock().unwrap() = Some("scope-b".into());
+    let before = snapshot(&store, &app.app_id());
+    let error = app.backup_layered().await.unwrap_err();
+    assert!(
+        matches!(&error, AppError::InvalidData(why) if why.contains("doesn't hold scope-b")),
+        "{error:?}"
+    );
+    assert_eq!(snapshot(&store, &app.app_id()), before);
+}
+
+#[tokio::test]
+async fn test_restore_in_place_refused_for_what_it_carries_says_so_and_writes_nothing() {
+    let w = World::new();
+    let store = Arc::new(MemoryStore::new());
+    let protocol = CertCheckProtocol::new(Some(JOURNAL), None);
+    let mut app = cert_checked(&w, &protocol, &store).await;
+    let backup = layered(&mut app).await;
+    // Three duty events not acknowledged, each of 12 MiB: the backup fits one commit, but
+    // not with them beside it.
+    let carried_before = app.kept_duties().await.unwrap().len() as u64;
+    for _ in 0..3 {
+        let mut tx = app.tx().unwrap();
+        app.keep_duty(
+            &mut tx,
+            crate::app::events::Duty::EffectRefused {
+                seq: 1,
+                stored_id: 1,
+                sender: w.bob.public(),
+                msg_id: "m".repeat(12 << 20),
+                kind: "sample.note".into(),
+                code: None,
+            },
+        )
+        .unwrap();
+        app.commit(tx).await.unwrap();
+    }
+    // The backup is still taken: it fits on its own.
+    app.backup_layered().await.unwrap();
+    let app_id = app.app_id();
+    drop(app);
+    let before = snapshot(&store, &app_id);
+    let fault = Arc::new(FaultStore::new(
+        Arc::clone(&store) as Arc<dyn StateStore>,
+        StoreFault::None,
+    ));
+    let error = restore_on(
+        &w,
+        protocol.clone(),
+        fault.clone() as Arc<dyn StateStore>,
+        &backup,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        error,
+        AppError::Refused(crate::app::Refusal::CarriedTooLarge {
+            duty_events: carried_before + 3,
+            owed_calls: 0,
+        })
+    );
+    assert_eq!(fault.commits(), 0);
+    assert_eq!(snapshot(&store, &app_id), before);
+    // Onto an empty store, which carries nothing, the same backup restores.
+    restore_on(
+        &w,
+        protocol.clone(),
+        Arc::new(MemoryStore::new()) as Arc<dyn StateStore>,
+        &backup,
+    )
+    .await
+    .unwrap();
+}

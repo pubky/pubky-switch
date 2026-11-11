@@ -243,6 +243,14 @@ tell its protocol, so neither a restore nor a provider change drops them.
   events keep their IDs and are delivered again, and the owed calls are made by the next
   read. The restored cursor may meet the same items again; the protocol then hears of them
   twice, which it tolerates.
+- **A restore in place carries the store's unacknowledged duty events and owed calls in its
+  one commit, beside the backup;** past the 32 MiB batch size with them, the restore is
+  refused (`Refusal::CarriedTooLarge`, with how many of each it would carry) and nothing
+  is written. The host acknowledges the duty events it has acted on (`App::ack_events`),
+  lets the protocol answer the owed calls, or restores onto an empty store, then restores
+  again. A backup too large on its own is refused as `StoreError::TooLarge` instead, and
+  `App::backup_layered` refuses only that one: what a store would carry at a restore in
+  place doesn't refuse the backup.
 - **A restore in place is the way out of a damaged store.** A store that can't be read
   now fails it, to be tried again. A duty event or owed call whose value reads but
   doesn't decode is left behind, and the protocol told how many with `RestoreLeftBehind`,
