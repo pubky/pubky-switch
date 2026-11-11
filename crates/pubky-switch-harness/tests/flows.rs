@@ -426,7 +426,7 @@ async fn test_every_served_call_is_listed_and_sent_by_its_flow() {
     // land, and a call that starts being served must be added to it or given a flow.
     assert_eq!(
         waiting,
-        ["GET /v1/{id}/records/{key}", "GET /v1/{id}/records",],
+        Vec::<String>::new(),
         "the served calls no flow sends yet"
     );
 }

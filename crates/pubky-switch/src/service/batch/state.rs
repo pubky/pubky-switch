@@ -40,6 +40,8 @@ pub struct HeldApp {
     pub reachable_since: Option<u64>,
     /// When a full key bundle was requested for it, while not yet covered.
     pub full_requested: Option<u64>,
+    /// The `seq` of the part that completed its last full-bundle request (Switch wire 6.2).
+    pub full_completed: Option<u64>,
 }
 
 /// A shared record as the account holds it.

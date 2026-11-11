@@ -622,36 +622,25 @@ impl Signer {
     /// the new certificate: `until` is the time the switch took that record plus the clock
     /// tolerance (Switch spec 3.2 step 4, Switch wire 3.8 step 4). Returns the apps closed.
     ///
+    /// While no renewal is open, nothing is checked or read: it returns none, whatever the
+    /// state, an erased account, another install named, records behind or a flow in
+    /// progress included.
+    ///
     /// # Errors
     ///
-    /// As [`Signer::resume`].
+    /// With a renewal open, as [`Signer::resume`].
     pub async fn complete_renewals(&mut self) -> Result<Vec<[u8; 16]>> {
-        self.ready().await?;
+        // With no renewal open, nothing is read: the step is a no-op (design note, section
+        // 4.5).
+        self.refresh().await?;
+        if self.open_renewals()?.is_empty() {
+            return Ok(Vec::new());
+        }
+        let statuses = self.ready_at_switch().await?.answer.apps;
         let Some(doc) = self.state.newest_doc()? else {
             return Ok(Vec::new());
         };
-        let certs = self.held_certs()?;
-        let open: Vec<_> = doc
-            .body()
-            .renewed
-            .iter()
-            .filter(|entry| entry.until.is_none())
-            // A cut-off app's renewals go with it when it is removed.
-            .filter(|entry| !self.cut_off(&entry.app_id))
-            .filter(|entry| {
-                // Reductions close on their own.
-                let old = certs.iter().find(|c| c.hash() == entry.cert);
-                let new = doc
-                    .listed_cert(&entry.app_id)
-                    .and_then(|h| certs.iter().find(|c| c.hash() == h));
-                matches!((old, new), (Some(old), Some(new)) if !is_reduction(old, new))
-            })
-            .map(|entry| entry.app_id)
-            .collect();
-        if open.is_empty() {
-            return Ok(Vec::new());
-        }
-        let statuses = self.service_client()?.apps().await?.apps;
+        let open = self.open_renewals()?;
         let mut closing: Vec<([u8; 16], u64)> = Vec::new();
         for app in open {
             let status = statuses.iter().find(|s| s.app_id == app);
@@ -677,6 +666,32 @@ impl Signer {
         self.commit(state, Some(flow)).await?;
         self.resume().await?;
         Ok(closing.into_iter().map(|(app, _)| app).collect())
+    }
+
+    /// The apps whose cooperative renewal in the newest version is still open: not a
+    /// reduction, which closes on its own, and not a cut-off app's, which goes with it.
+    fn open_renewals(&self) -> Result<Vec<[u8; 16]>> {
+        let Some(doc) = self.state.newest_doc()? else {
+            return Ok(Vec::new());
+        };
+        let certs = self.held_certs()?;
+        Ok(doc
+            .body()
+            .renewed
+            .iter()
+            .filter(|entry| entry.until.is_none())
+            // A cut-off app's renewals go with it when it is removed.
+            .filter(|entry| !self.cut_off(&entry.app_id))
+            .filter(|entry| {
+                // Reductions close on their own.
+                let old = certs.iter().find(|c| c.hash() == entry.cert);
+                let new = doc
+                    .listed_cert(&entry.app_id)
+                    .and_then(|h| certs.iter().find(|c| c.hash() == h));
+                matches!((old, new), (Some(old), Some(new)) if !is_reduction(old, new))
+            })
+            .map(|entry| entry.app_id)
+            .collect())
     }
 
     /// What is due at each start, in order (design note, section 4.5): finish the flow in
@@ -750,10 +765,11 @@ impl Signer {
     /// run; a renewal it cut short is finished by [`Signer::resume`], and the apps left are
     /// renewed at the next run.
     pub async fn renew_expiring(&mut self) -> Result<Vec<[u8; 16]>> {
-        self.ready().await?;
+        let read = self.ready_at_switch().await?;
+        let (statuses, switch_time) = (read.answer.apps, read.answer.server_time);
         let newest = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
-        let (statuses, switch_time) = self.switch_apps_at().await?;
-        if clock_agrees(self.env.clock.now_ms(), switch_time).is_err() {
+        // The device clock when the answer came, not after the reads since.
+        if clock_agrees(read.device_ms, switch_time).is_err() {
             return self.skip_renewals(vec![Alert::ClockOff]).await;
         }
         // The clocks agree again: the alert has served.

@@ -196,7 +196,7 @@ impl Signer {
                 Err(SignerError::HandedOver { install }) => {
                     return Ok(AbortOutcome::SucceededBy { install });
                 }
-                other => other?,
+                other => drop(other?),
             }
             let handed = IdentityDoc::verify(&handing.doc, &self.state.identity)?;
             let (body, prev) = abort_body(&handed)?;
