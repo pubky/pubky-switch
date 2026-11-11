@@ -7,6 +7,7 @@
   - `pubky-switch-client`: the client side, for apps that act for an identity;
   - `pubky-switch-signer`: identity management, for the signer that holds the identity key;
   - `pubky-switch`: the service (storage, HTTP API, operations).
+- A fifth crate, `pubky-switch-harness`, is for tests only: it runs client and signer flows against the service in process, runs the same flows against the client's scripted switch, and fails on a difference its allowed-differences list doesn't hold. Nothing depends on it.
 
 ## The specification
 - **The authority:** `spec/` in this repo. `spec.md` decides behaviour, `wire-format.md` decides bytes, and `vectors/` holds the test vectors.
