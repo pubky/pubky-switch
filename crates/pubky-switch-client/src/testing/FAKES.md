@@ -35,9 +35,11 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   for it.
 - **Key bundle parts** go as the service drops them, by the core's `parts_to_drop`: at a
   `key_bundle.put` and at the `cursor.set` that passes them, the parts the target's cursor
-  has passed and its `keys_through` covers, unless a full bundle was requested before the
-  part (Switch wire 6.2). Where `keys_through` starts rises to the height the dropped parts
-  gave. `keys_through` itself is the core's (7.4.12), over the parts the cursor passed.
+  has passed and its `keys_through` covers, unless a full-bundle request is in force: from
+  the `POST /keys` until the target's cursor has passed the part that completed it, judged
+  at a put as before the part (Switch wire 6.2). Where `keys_through` starts rises to the
+  height the dropped parts gave. `keys_through` itself is the core's (7.4.12), over the
+  parts the cursor passed.
 
 ## State and retention
 
