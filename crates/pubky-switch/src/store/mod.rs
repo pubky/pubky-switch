@@ -63,6 +63,17 @@ use crate::admin::{CheckFuture, ReadinessCheck};
 /// The environment variable that overrides `database.url`.
 pub const DATABASE_URL_ENV: &str = "PUBKY_SWITCH_DATABASE_URL";
 
+/// A key store entry an erasure still owes deleting (Switch wire 7.4.16).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ErasedKey {
+    /// The key's ID in the key store.
+    pub key: crate::keys::KeyId,
+    /// The erased account's Pubky ID.
+    pub account: String,
+    /// When the account was erased, in its service time.
+    pub erased_at_ms: u64,
+}
+
 /// The schema migrations, applied in order.
 pub static MIGRATIONS: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
@@ -356,6 +367,47 @@ impl Store {
     /// identity already.
     pub async fn create_account(&self, account: &NewAccount) -> Result<bool, StoreError> {
         account::create(&self.pool, account).await
+    }
+
+    /// The key store entries erasures still owe deleting, oldest first (Switch wire 7.4.16).
+    pub async fn erased_keys(&self) -> Result<Vec<ErasedKey>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT key_id, account_id, erased_at_ms FROM erased_keys ORDER BY erased_at_ms, key_id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(StoreError::from_db)?;
+        rows.iter()
+            .map(|row| {
+                let key: String = row.try_get("key_id")?;
+                Ok(ErasedKey {
+                    key: crate::keys::KeyId::parse(&key)
+                        .map_err(|_| StoreError::Corrupt("erased_keys.key_id"))?,
+                    account: row.try_get("account_id")?,
+                    erased_at_ms: from_db(row.try_get("erased_at_ms")?, "erased_at_ms")?,
+                })
+            })
+            .collect()
+    }
+
+    /// Whether an erased account of the identity `account` still owes the deletion of a key
+    /// (Switch wire 7.4.16).
+    pub async fn owes_erased_keys(&self, account: &str) -> Result<bool, StoreError> {
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM erased_keys WHERE account_id = $1)")
+            .bind(account)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(StoreError::from_db)
+    }
+
+    /// The erasure owes nothing more of `key`: it is deleted, and the erasure recorded.
+    pub async fn forget_erased_key(&self, key: &crate::keys::KeyId) -> Result<(), StoreError> {
+        sqlx::query("DELETE FROM erased_keys WHERE key_id = $1")
+            .bind(key.as_str())
+            .execute(&self.pool)
+            .await
+            .map_err(StoreError::from_db)?;
+        Ok(())
     }
 
     /// Look account `id` up without taking its lock: its service key and the service time

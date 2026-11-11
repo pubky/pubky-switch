@@ -180,7 +180,7 @@ pub fn other_app_refusal(call: &Call) -> ApiError {
             ErrorCode::PermissionMissing,
             "7.4.17: only the signer and the app it is for",
         ),
-        Call::PutIdentity | Call::Revoke(_) | Call::GetApps => ApiError::new(
+        Call::PutIdentity | Call::Revoke(_) | Call::GetApps | Call::Erase => ApiError::new(
             ErrorCode::PermissionMissing,
             "7.4: a call only the signer may make",
         ),
@@ -350,6 +350,7 @@ mod tests {
             Call::PutIdentity,
             Call::GetApps,
             Call::Leave(String::new()),
+            Call::Erase,
         ] {
             assert_eq!(other_app_refusal(&call).code, ErrorCode::PermissionMissing);
         }

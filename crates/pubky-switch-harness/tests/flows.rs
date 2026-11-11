@@ -430,6 +430,7 @@ async fn test_every_served_call_is_listed_and_sent_by_its_flow() {
             "GET /v1/{id}/records/{key}",
             "GET /v1/{id}/records",
             "POST /v1/{id}/apps/{app}/keys",
+            "POST /v1/{id}/erase",
         ],
         "the served calls no flow sends yet"
     );
