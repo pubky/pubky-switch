@@ -623,7 +623,7 @@ impl Signer {
             state.homeserver_other = Some(other);
             state.alert(alert.clone());
             state.switch_unconfirmed = true;
-            self.commit(state, None).await?;
+            self.commit(state, self.erasure_kept()).await?;
             return Err(SignerError::Alarm(alert));
         }
         Ok(copy.signed() == mine.signed())
@@ -1253,7 +1253,7 @@ impl Signer {
             version,
             high_water_version: self.high_water().map_or(0, |h| h.version),
         });
-        self.commit(state, None).await?;
+        self.commit(state, self.erasure_kept()).await?;
         Err(Refusal::RecordsBehind { version }.into())
     }
 
@@ -1270,13 +1270,23 @@ impl Signer {
         Err(SignerError::NotNamed { install })
     }
 
-    /// Keep `alert` and end the flow: the signer doesn't build on what it saw.
+    /// Keep `alert` and end the flow: the signer doesn't build on what it saw. An erasure in
+    /// progress is kept ([`Signer::erasure_kept`]).
     async fn alarm(&mut self, alert: Alert) -> Result<()> {
         let mut state = self.state.clone();
         state.alert(alert.clone());
         state.switch_unconfirmed = true;
-        self.commit(state, None).await?;
+        self.commit(state, self.erasure_kept()).await?;
         Err(SignerError::Alarm(alert))
+    }
+
+    /// The flow an alarm or records behind keep: an erasure in progress, whose request may be
+    /// in doubt, in the same commit, so neither a crash nor another caller loses it; any other
+    /// flow ends (Switch spec 12.7). The signing gate holds the erasure's steps back meanwhile.
+    fn erasure_kept(&self) -> Option<Flow> {
+        self.flow
+            .clone()
+            .filter(|flow| matches!(flow, Flow::Erase { .. }))
     }
 
     /// Publish the newest version again where the Homeserver's copy is older, missing or

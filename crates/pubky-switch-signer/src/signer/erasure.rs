@@ -194,17 +194,21 @@ impl Signer {
     /// install still signs, as before a delivery (Switch spec 4.3, Switch wire 3.13). In `full`,
     /// every copy ([`Signer::check_copies`]): it is named, the switch's copy is its mark, the
     /// signer backup names no other install that took over, and the Homeserver holds nothing
-    /// newer. Otherwise the switch's copy and the Homeserver's `identity.json`: an install that
-    /// takes over delivers at the switch first, and a restore publishes before it writes its
-    /// backup (wire 3.13), so it shows there before the backup. A check that can't read a copy
-    /// fails, and nothing is deleted or sent: the flow stays, and [`Signer::resume`] tries
-    /// again. A passing check then meets the signing gate ([`gate::refusal`]), as at every
+    /// newer. Otherwise the switch's copy, where a take-over shows first, since an install that
+    /// takes over delivers there before it writes its backup or publishes (wire 3.13), and the
+    /// Homeserver's `identity.json`, a defence against a switch read that lags or lies. A check
+    /// that can't read a copy fails, and nothing is deleted or sent: the flow stays, and
+    /// [`Signer::resume`] tries again. A passing check then meets the signing gate ([`gate::refusal`]), as at every
     /// signing step: while an alarm is held, nothing is deleted or sent either.
     ///
     /// Another install found signing ends the erasure without erasing, in the commit that
     /// records it ([`Signer::end_erasure_in`]), and nothing is published by this install, which
-    /// no longer signs. Records behind or an alarm keep the erasure in progress: this install
-    /// still signs, and the erasure goes on once the user has dealt with them, or is aborted.
+    /// no longer signs. An alarm keeps the erasure in progress, nothing deleted or sent: it
+    /// goes on once the user has cleared it, or is aborted while no request is in doubt.
+    /// Records behind keep it too, nothing deleted, sent or published, but the switch's copy is
+    /// still read: another install's version there ends the erasure, and after a request in
+    /// doubt the operator's `404` shows it erased. A user who wants the account back restores
+    /// on a new install, which takes over; this install then finds it and ends its erasure.
     ///
     /// With a request in doubt, `unanswered`, an unsigned `404` to the switch's read may be the
     /// operator's after the erasure. The signer backup and the Homeserver are still judged; if
@@ -212,8 +216,17 @@ impl Signer {
     /// unauthenticated evidence wire 7.4.16 accepts for a retry's `404`, and no other request
     /// goes out: an install that delivered behind a proxy answering `404` is never erased.
     async fn still_erasing(&mut self, unanswered: bool, full: bool) -> Result<Checked> {
-        let flow = self.flow.clone();
-        let checked = if full {
+        // Records behind block every step that deletes or sends, not the read-only check of
+        // the switch's copy, nor a conclusion drawn from it: another install's version there
+        // ends the erasure, and the operator's `404` after a request in doubt shows it done.
+        // Only that refusal of `check_named` is passed for the read; every other stops here.
+        let behind = matches!(
+            self.check_named(),
+            Err(SignerError::Refused(Refusal::RecordsBehind { .. }))
+        );
+        let checked = if behind {
+            self.switch_at_mark().await
+        } else if full {
             self.check_copies().await
         } else {
             self.switch_and_homeserver().await
@@ -228,12 +241,17 @@ impl Signer {
             }
             checked => checked.map(|()| Checked::Signing),
         };
-        // A check that stopped the flow while this install still signs: the erasure is kept.
-        if checked.is_err() && self.flow.is_none() && self.state.managed_by.is_none() {
-            self.commit(self.state.clone(), flow).await?;
-        }
+        // An alarm or records behind keep the erasure in the commit that records them
+        // (`Signer::erasure_kept`); another install found signing ends it in its own.
         let checked = checked?;
-        if let Some(refused) = gate::refusal(&self.state) {
+        // The gate holds back a deletion or a request, not the conclusion that the account is
+        // erased already: wire 7.4.16 takes the operator's `404` after a request in doubt as
+        // done whatever alarm is held, and `erased` keeps the alarm's alerts. Records still
+        // behind after the read, as when the switch holds this install's own newer version or
+        // the mark, are among the gate's refusals: no step.
+        if checked == Checked::Signing
+            && let Some(refused) = gate::refusal(&self.state)
+        {
             return Err(refused);
         }
         Ok(checked)
@@ -249,12 +267,20 @@ impl Signer {
         Ok(())
     }
 
-    /// The copies but the switch's: the signer backup and the Homeserver's `identity.json`.
+    /// The copies but the switch's, after a request in doubt and an unsigned `404` from the
+    /// switch: the signer backup and the Homeserver's `identity.json`, judged for another
+    /// install signing, which stops it. This install's own newer version there, records behind,
+    /// doesn't: the account is gone at the switch whatever this install's records say (Switch
+    /// wire 7.4.16).
     async fn copies_but_the_switch(&mut self) -> Result<()> {
-        self.check_named()?;
-        self.check_backup_copy().await?;
+        let own_newer = |checked: Result<()>| match checked {
+            Err(SignerError::Refused(Refusal::RecordsBehind { .. })) => Ok(()),
+            checked => checked,
+        };
+        own_newer(self.check_named())?;
+        own_newer(self.check_backup_copy().await)?;
         if let Some(newest) = self.state.newest_doc()? {
-            self.judge_homeserver(&newest).await?;
+            own_newer(self.judge_homeserver(&newest).await.map(drop))?;
         }
         Ok(())
     }
