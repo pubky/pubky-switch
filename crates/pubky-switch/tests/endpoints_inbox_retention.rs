@@ -439,8 +439,27 @@ async fn test_inbox_revocation_releases_entries() {
     replay.db.drop_database().await.expect("drop");
 }
 
+/// The wallet's feed after `after`.
+async fn wallet_feed(replay: &Replay, after: u64) -> Value {
+    let request = app_request(
+        app(&vectors("keys.json"), "wallet"),
+        "GET",
+        &format!("/v1/{}/feed?after=1:{after}", alice_id()),
+        Vec::new(),
+        ms(&at()),
+    );
+    let answer = replay.service.handle(request).await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    body(&answer)
+}
+
 #[tokio::test]
-async fn test_inbox_an_entry_with_no_current_target_stays() {
+async fn test_inbox_an_entry_with_no_current_target_becomes_unreadable() {
     let Some(replay) = replay().await else { return };
     with_bob(&replay).await;
     register_executor(&replay).await;
@@ -458,11 +477,41 @@ async fn test_inbox_an_entry_with_no_current_target_stays() {
         "{}",
         String::from_utf8_lossy(&answer.body)
     );
-    // Its only target stops being current: it stays, for the unreadable item that
-    // replaces it, and the wallet's cursor moving changes nothing.
+    let entry_id = body(&answer)["entry_id"].clone();
+    let entry = entry_seq(&replay).await;
+    // Its only target stops being current through a delivery: in that request, after its
+    // chain item, the entry becomes an unreadable item at a new seq, without its envelope,
+    // with the entry's ID, sender and acceptance time (Switch wire 7.4.4).
     drop_executor(&replay).await;
-    move_cursor(&replay, "wallet", entry_seq(&replay).await).await;
+    let unreadable = entry_seq(&replay).await;
+    assert!(unreadable > entry, "a new seq");
+    assert_eq!(
+        sql_value(
+            &replay,
+            "SELECT count(*) FROM inbox_entries WHERE account_id = $1 \
+             AND kind = 'unreadable' AND octet_length(envelope) = 0",
+        )
+        .await,
+        1
+    );
+    // Shown to every current app: the wallet, which it never targeted.
+    let feed = wallet_feed(&replay, entry).await;
+    let item = feed["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .find(|item| item["seq"] == unreadable)
+        .cloned()
+        .expect("the unreadable item");
+    assert_eq!(item["type"], "unreadable");
+    assert_eq!(item["entry_id"], entry_id);
+    assert_eq!(item["sender"], bob()["pubky_id"]);
+    assert!(item.get("envelope").is_none());
+    // The wallet's cursor passing the entry's old seq keeps it; passing its own releases it.
+    move_cursor(&replay, "wallet", entry).await;
     assert_eq!(entries(&replay).await, 1);
+    move_cursor(&replay, "wallet", unreadable).await;
+    assert_eq!(entries(&replay).await, 0);
     replay.db.drop_database().await.expect("drop");
 }
 
