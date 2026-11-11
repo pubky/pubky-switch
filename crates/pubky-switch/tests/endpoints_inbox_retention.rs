@@ -1133,6 +1133,9 @@ async fn test_inbox_a13_a_lagging_app_is_told_what_it_missed() {
     assert!(!lagging(&replay, "wallet").await);
     assert_eq!(count(&replay, "entry").await, 0);
     assert_eq!(count(&replay, "missed").await, 1);
+    // A missed item is no entry it hasn't read.
+    let status = apps_status(&replay).await;
+    assert_eq!(status_of(&status, "executor")["unread_entries"], 0);
     let first = entry_seq_or(&replay, 0).await;
     // A later miss before the executor passes its item replaces it, at a new seq, covering
     // both.
