@@ -458,6 +458,24 @@ pub static ALLOWED: &[Allowed] = &[
         WATCHED,
         OWN_ENTRIES_COMPACTED,
     ),
+    Allowed {
+        flow: "restore",
+        label: "{alice/wallet} GET /v1/{alice}/directory",
+        fact: "body.apps_version",
+        service: "number 3",
+        scripted: ONE_MORE,
+        reason: COUNTER_START,
+        reference: "Switch wire 7.4.10, `apps_version`",
+    },
+    Allowed {
+        flow: "restore",
+        label: "{alice/wallet} GET /v1/{alice}/directory",
+        fact: "body.directory_version",
+        service: "number 9",
+        scripted: ONE_MORE,
+        reason: COUNTER_START,
+        reference: "Switch wire 7.4.10, `directory_version`",
+    },
 ];
 
 #[cfg(test)]
