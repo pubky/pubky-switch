@@ -1073,18 +1073,34 @@ impl Service {
 
         // A serving account whose state is behind its key's mark fails stop, with no head
         // (step 10).
-        // An erasure is exempt: its answer carries no head (step 10, 7.4.16).
+        // An erasure is exempt: its answer carries no head (step 10, 7.4.16). So is "the
+        // `PUT /identity` that delivers the next generation naming that key", the pending key
+        // an enrollment answered (step 10, 3.3), here only a provider loss's, the one
+        // generation change served: the new generation is the way out, and nothing is signed
+        // with the outgoing key on its path (`recover_in_place`). Every check of the delivery
+        // still runs; a delivery that is refused all the same is answered as any other
+        // request in this state.
+        let behind_mark = || Refused {
+            error: ApiError::unavailable(
+                "7.3: the state is behind its service key's mark; a new generation is needed",
+            ),
+            serving: false,
+            head: false,
+        };
+        let mut behind = false;
         if serving && *call != Call::Erase {
             match txn.mark_check(self.keys.as_ref()).await {
                 Ok(MarkCheck::Behind | MarkCheck::Fork) => {
-                    return Err(Refused {
-                        error: ApiError::unavailable(
-                            "7.3: the state is behind its service key's mark; a new \
-                             generation is needed",
-                        ),
-                        serving: false,
-                        head: false,
-                    });
+                    // The signer's own delivery only: an own app or another identity's has
+                    // no app or certificate of its own here.
+                    let by_signer = verified.is_none() && other.is_none();
+                    if !(*call == Call::PutIdentity
+                        && by_signer
+                        && self.delivers_a_recovery(txn, request, held.as_ref()).await)
+                    {
+                        return Err(behind_mark());
+                    }
+                    behind = true;
                 }
                 Ok(_) => {}
                 Err(failure) => {
@@ -1468,8 +1484,47 @@ impl Service {
         let (answer, serves_after) = self
             .put_identity(txn, signer, request, held.as_ref(), due.is_some(), time_ms)
             .await
-            .map_err(|error| Refused::with_head(error, serving))?;
+            .map_err(|error| {
+                if behind {
+                    behind_mark()
+                } else {
+                    Refused::with_head(error, serving)
+                }
+            })?;
         Ok((answer, serving || serves_after))
+    }
+
+    /// Whether `request`, a `PUT /identity` at a serving account, delivers a provider loss's
+    /// next generation (Switch wire 3.3, 7.3 step 10): a document the identity signed, at the
+    /// held version's generation plus one, naming this service's origin and the account's
+    /// pending key, with `recovery_from` the held generation. The delivery's other checks
+    /// come in `put_identity`.
+    async fn delivers_a_recovery(
+        &self,
+        txn: &mut AccountTxn,
+        request: &SwitchRequest,
+        held: Option<&IdentityDoc>,
+    ) -> bool {
+        let Some(held) = held else {
+            return false;
+        };
+        let Ok(delivery) = pubky_switch_core::http::IdentityDelivery::parse(&request.body) else {
+            return false;
+        };
+        let identity = txn.head().identity_key;
+        let Ok(doc) = IdentityDoc::verify(&delivery.identity, &identity) else {
+            return false;
+        };
+        let Ok(Some(pending)) = txn.pending_key().await else {
+            return false;
+        };
+        let Ok(pending) = self.keys.public_key(&pending).await else {
+            return false;
+        };
+        held.generation().checked_add(1) == Some(doc.generation())
+            && doc.body().recovery_from == Some(held.generation())
+            && doc.inbox().url == self.origin
+            && doc.inbox().service_key == pending
     }
 
     /// Authenticate the caller of a call the signer or an own app makes, as far as needs no

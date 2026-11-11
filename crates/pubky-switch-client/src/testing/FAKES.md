@@ -48,7 +48,9 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
 ## State and retention
 
 - **Durability** (Switch spec 6.5): everything is in memory, answered at once; the service
-  key's mark isn't kept. Per-account order is a mutex.
+  key's mark isn't kept, so there is no state behind it: the service's `503` "a new
+  generation is needed" (Switch wire 7.3 step 10), and the recovery delivery exempt from it,
+  aren't modelled. Per-account order is a mutex.
 - **Retention and sweeps** (Switch wire 9.1): entries never expire; `missed` items,
   checkpoints and dropped stubs exist only when a test scripts them, and a scripted `missed`
   item (`push_missed`) is shown to every app, where the service shows one only to its app;

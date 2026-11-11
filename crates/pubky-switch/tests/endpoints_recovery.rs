@@ -604,3 +604,124 @@ async fn test_recovery_classes_every_account_table() {
     assert_eq!(classed, tables, "every class names a table");
     replay.db.drop_database().await.expect("drop");
 }
+
+/// The account's state restored from before its key's newest head: its chain gone, the
+/// chain head and every `seq` back to none, while the key's mark stays where it was (Switch
+/// wire 7.3 step 10).
+async fn restored_behind_the_mark(replay: &Replay) {
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    sqlx::query("DELETE FROM chain_items WHERE account_id = $1")
+        .bind(alice_id())
+        .execute(&mut conn)
+        .await
+        .expect("chain");
+    sqlx::query(
+        "UPDATE accounts SET last_seq = 0, chain_seq = NULL, chain_hash = NULL WHERE id = $1",
+    )
+    .bind(alice_id())
+    .execute(&mut conn)
+    .await
+    .expect("restore");
+    conn.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn test_recovery_in_place_gets_past_a_state_behind_the_mark() {
+    // The service's state was restored from before what the account's key signed: every
+    // request is `503`, a new generation needed. The recovery delivering it, naming the
+    // pending key, is exempt (Switch wire 7.3 step 10): it is answered with the new key, the
+    // outgoing key retired and the account started afresh.
+    let Some(replay) = replay().await else { return };
+    let (pending, at) = serving_with_a_pending_key(&replay).await;
+    let old_key = service_key_id(&replay).await;
+    let before = held(&replay).await;
+    restored_behind_the_mark(&replay).await;
+    let recovery = next_generation(&before, pending, Some(1));
+    let (answer, signature) = deliver(&replay, recovery, Some(before.hash()), at).await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    assert!(signed_by(&answer, &pending, &signature));
+    assert!(replay.keys.public_key(&old_key).await.is_err(), "retired");
+    assert_eq!(
+        chain(&replay).await,
+        [(2, 1, "service".into()), (2, 2, "identity".into())]
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_recovery_exemption_from_the_mark_is_only_for_a_recovery() {
+    // Behind the mark, only the recovery under the pending key gets through (Switch wire 7.3
+    // step 10): an ordinary next version, a rotation without `recovery_from`, a recovery
+    // naming another key and a recovery built on another version all get the `503` a new
+    // generation is needed, with no head; so does the signer's `GET /apps`, which is how it
+    // learns. The signer's enrollment is exempt: it gets the pending key.
+    let Some(replay) = replay().await else { return };
+    let (pending, at) = serving_with_a_pending_key(&replay).await;
+    let old_key = service_key_id(&replay).await;
+    let old_public = replay.keys.public_key(&old_key).await.expect("key");
+    let before = held(&replay).await;
+    restored_behind_the_mark(&replay).await;
+    let behind = |answer: &SwitchResponse| {
+        code(answer) == (503, "unavailable".into())
+            && json_of(answer)["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("a new generation is needed"))
+            && header_text(answer, header::HEAD).is_none()
+    };
+    let sign = |change: &dyn Fn(&mut IdentityBody)| {
+        let mut body: IdentityBody = before.body().clone();
+        body.version += 1;
+        change(&mut body);
+        IdentityDoc::sign(&alice_key(), body)
+            .expect("sign")
+            .signed()
+            .clone()
+    };
+    let ordinary = sign(&|body| body.record_max_age = Some(60));
+    let rotation = sign(&|body| {
+        body.generation += 1;
+        body.inbox.service_key = pending;
+        body.service_keys
+            .push(pubky_switch_core::records::ServiceKeyEntry {
+                generation: 1,
+                key: old_public,
+            });
+    });
+    let another_key = sign(&|body| {
+        body.generation += 1;
+        body.inbox.service_key = [9; 32];
+        body.recovery_from = Some(1);
+    });
+    let recovery = next_generation(&before, pending, Some(1));
+    for (what, doc, prev) in [
+        ("an ordinary version", ordinary, Some(before.hash())),
+        ("a rotation", rotation, Some(before.hash())),
+        (
+            "a recovery naming another key",
+            another_key,
+            Some(before.hash()),
+        ),
+        ("a recovery on another version", recovery, Some([7; 32])),
+    ] {
+        let (answer, _) = deliver(&replay, doc, prev, at).await;
+        assert!(
+            behind(&answer),
+            "{what}: {}",
+            String::from_utf8_lossy(&answer.body)
+        );
+    }
+    let request = signer_request("GET", &format!("/v1/{}/apps", alice_id()), Vec::new(), at);
+    assert!(behind(&replay.service.handle(request).await));
+    let enrolled = enroll(&replay, enrollment(3, Some(vec![HELD_REVOKED])), at).await;
+    assert_eq!(enrolled.status, 200);
+    assert_eq!(answered_key(&enrolled), pending);
+    assert_eq!(service_key_id(&replay).await, old_key, "nothing changed");
+    replay.db.drop_database().await.expect("drop");
+}
