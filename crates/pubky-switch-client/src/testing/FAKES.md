@@ -20,7 +20,9 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   one isn't refused. Every other request stamps the clock's time. Answers to own apps and
   the signer carry `Switch-Head`, refusals included, but a `401`, the enrollment and the
   erasure. An injected `401` fault is answered as before the lock, with the last stamped
-  time and no head; other injected faults with the clock's time and the head. Each operation's signature is
+  time and no head; other injected faults with the clock's time and the head. A request an
+  `Unreachable` fault stops keeps its body, which the test call `unreached_bodies` returns,
+  in order. Each operation's signature is
   verified, and an own app must be current with an unexpired certificate.
 - **Rates** (Switch wire 6.4 step 7, 9.4): no operation, control, per-caller or
   failed-authentication limits; never `429 rate_limited`.
