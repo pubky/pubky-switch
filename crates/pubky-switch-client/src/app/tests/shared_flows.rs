@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use pubky_switch_core::claims::{Basis, ClaimStatus, RECONCILIATION_MS};
+use pubky_switch_core::claims::{Basis, ClaimStatus, ClaimView, RECONCILIATION_MS};
 use pubky_switch_core::envelope::parse_header;
 use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::ident::{Policy, invite_code_hash};
@@ -17,7 +17,8 @@ use super::*;
 use crate::app::{
     Alarm, AppError, AppEvent, ClaimOp, Collection, Delivery, IdentityRefresh,
     MAX_REGRESSION_REASON_BYTES, MAX_SEEN_MARK_BYTES, ObligationDeadline, OpBatch, OutgoingMessage,
-    RecordContent, RecordJob, RecordTarget, Refusal, SentMessage, claim_conflict,
+    RecordContent, RecordJob, RecordTarget, Refusal, SentMessage, UndeliverableReason,
+    claim_conflict,
 };
 use crate::store::StoreHandle;
 use crate::store::{Fault as StoreFault, FaultStore};
@@ -491,17 +492,64 @@ async fn test_send_refused_for_good_is_failed_not_retried() {
     assert_eq!(app.delivery(&msg_id).await.unwrap(), None);
 }
 
+/// `403 not_current` is about the sender's own certificate, not the recipient: the queued
+/// delivery says so, apart from `403 not_admitted`.
+#[tokio::test]
+async fn test_send_sender_not_current_is_queued_with_its_reason() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    let first = s.w.clock.now_ms();
+    s.peer
+        .fail_next("inbox", ErrorCode::NotCurrent, json!(null));
+    let (msg_id, delivery) = app.send(s.note("one")).await.unwrap();
+    assert!(
+        matches!(
+            delivery,
+            Delivery::Queued {
+                undeliverable_since_ms: Some(at),
+                undeliverable_reason: Some(UndeliverableReason::NotCurrent),
+                ..
+            } if at == first
+        ),
+        "{delivery:?}"
+    );
+    // Accepted once the certificate is current again: the reason goes with the wait.
+    let report = app.flush_outbox().await.unwrap();
+    assert_eq!(report.done, vec![msg_id.clone()]);
+    assert!(matches!(
+        app.delivery(&msg_id).await.unwrap(),
+        Some(Delivery::Accepted { .. })
+    ));
+}
+
 #[tokio::test]
 async fn test_send_not_admitted_stays_queued_and_goes_once_admitted() {
     let s = Setup::new();
     let mut app = s.join("wallet").await;
     s.peer.lock().admitted = Some(Default::default());
+    let first = s.w.clock.now_ms();
     let (msg_id, delivery) = app.send(s.note("one")).await.unwrap();
-    assert!(matches!(delivery, Delivery::Queued { .. }), "{delivery:?}");
+    assert!(
+        matches!(
+            delivery,
+            Delivery::Queued {
+                undeliverable_since_ms: Some(at),
+                undeliverable_reason: Some(UndeliverableReason::NotAdmitted),
+                ..
+            } if at == first
+        ),
+        "{delivery:?}"
+    );
+    // A later try answered the same keeps the time of the first.
+    s.w.clock.advance_ms(HOUR);
     assert_eq!(
         app.flush_outbox().await.unwrap().queued,
         vec![msg_id.clone()]
     );
+    assert!(matches!(
+        app.delivery(&msg_id).await.unwrap(),
+        Some(Delivery::Queued { undeliverable_since_ms: Some(at), .. }) if at == first
+    ));
     assert!(s.peer.received().is_empty());
     // Bob adds alice as a contact: the same message goes.
     s.peer.lock().admitted = None;
@@ -1129,6 +1177,50 @@ async fn test_records_delete_then_create_again() {
         .unwrap();
     assert_eq!(ids(again.content.value()), vec!["c"]);
     assert!(again.version > deleted.version);
+}
+
+#[tokio::test]
+async fn test_records_value_that_isnt_json_is_refused_before_it_is_sent() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    let target = s.target("n1");
+    let written = s.w.switch.applied().len();
+    for bad in [
+        &b"not json"[..],
+        b"",
+        b"{\"a\":1} trailing",
+        b"\xEF\xBB\xBF{}",
+    ] {
+        let error = app.put_record(&target, bad, vec![]).await.unwrap_err();
+        assert!(
+            matches!(error, AppError::Refused(Refusal::Usage(_))),
+            "{error:?}"
+        );
+        assert!(app.record_op(&target, Some(bad), vec![]).await.is_err());
+    }
+    // Refused before the protocol marks it: the mark queued for the next write is still
+    // there.
+    s.protocol.pads.lock().unwrap().push_back(0);
+    assert!(
+        app.record_op(&target, Some(b"not json"), vec![])
+            .await
+            .is_err()
+    );
+    assert_eq!(s.protocol.pads.lock().unwrap().len(), 1);
+    s.protocol.pads.lock().unwrap().clear();
+    // Nothing was signed, kept or sent.
+    assert_eq!(s.w.switch.applied().len(), written);
+    assert!(app.kept_batches().await.unwrap().is_empty());
+    assert!(
+        app.shared_record(&app.record_key(&target).unwrap())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    // A JSON value goes as before.
+    app.put_record(&target, &value(&["a"]), vec![])
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -1992,6 +2084,299 @@ fn denied(s: &Setup, pubky: [u8; 32]) -> usize {
         .count()
 }
 
+/// Whether `events` holds [`AppEvent::KeptBatchesWaiting`] for `kept` batches and `code`.
+fn kept_waiting(events: &[AppEvent], kept: u64, code: Option<ErrorCode>) -> bool {
+    let code = code.map(|code| code.as_str().to_owned());
+    events.iter().any(|event| {
+        matches!(event, AppEvent::KeptBatchesWaiting { kept: k, code: c } if *k == kept && *c == code)
+    })
+}
+
+/// Keep a batch whose answer was lost: the switch applied it.
+async fn keep_lost_batch(s: &Setup, app: &mut App, pubky: [u8; 32]) {
+    s.w.switch
+        .fail_next(Fault::LoseAnswer { path: "ops".into() });
+    let error = app
+        .submit_batch(OpBatch::new().op(OpKind::DenyPut { pubky }))
+        .await
+        .unwrap_err();
+    assert!(error.kept_batch().is_some(), "{error:?}");
+}
+
+#[tokio::test]
+async fn test_receive_waits_out_the_retry_after_of_a_kept_batch() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    keep_lost_batch(&s, &mut app, [9; 32]).await;
+    s.w.switch.fail_next(Fault::Error {
+        path: "ops".into(),
+        code: ErrorCode::RateLimited,
+        current: json!(null),
+    });
+    let report = app.receive(None).await.unwrap();
+    let limited = Some(ErrorCode::RateLimited);
+    assert!(
+        kept_waiting(&report.events, 1, limited),
+        "{:?}",
+        report.events
+    );
+    // Inside the `retry_after`: the read sends nothing again, and says why.
+    let retry_ms = crate::testing::SCRIPTED_RETRY_AFTER_S * 1000;
+    s.w.clock.advance_ms(retry_ms - 1_000);
+    let report = app.receive(None).await.unwrap();
+    assert!(
+        kept_waiting(&report.events, 1, limited),
+        "{:?}",
+        report.events
+    );
+    assert_eq!(app.kept_batches().await.unwrap().len(), 1);
+    // Once it passed, the next read sends it, and its original proof settles it.
+    s.w.clock.advance_ms(1_000);
+    let report = app.receive(None).await.unwrap();
+    assert!(app.kept_batches().await.unwrap().is_empty());
+    assert!(
+        !report
+            .events
+            .iter()
+            .any(|e| matches!(e, AppEvent::KeptBatchesWaiting { .. })),
+        "{:?}",
+        report.events
+    );
+    assert_eq!(denied(&s, [9; 32]), 1);
+}
+
+/// A refusal about the caller, such as `403 cert_expired`, comes when a request is
+/// authenticated, so every request of the read is refused, the kept batch's resend and the
+/// feed alike: the read fails, and the batch stays kept until the app's requests are
+/// accepted again.
+#[tokio::test]
+async fn test_receive_refused_about_the_caller_fails_and_keeps_the_batch() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    keep_lost_batch(&s, &mut app, [9; 32]).await;
+    for _ in 0..8 {
+        s.w.switch.fail_next(Fault::Error {
+            path: "/v1/".into(),
+            code: ErrorCode::CertExpired,
+            current: json!({}),
+        });
+    }
+    let error = app.receive(None).await.unwrap_err();
+    assert_eq!(error.code(), Some(ErrorCode::CertExpired), "{error:?}");
+    s.w.switch.lock().faults.clear();
+    assert_eq!(app.kept_batches().await.unwrap().len(), 1);
+    let report = app.receive(None).await.unwrap();
+    assert!(app.kept_batches().await.unwrap().is_empty());
+    assert!(
+        !report
+            .events
+            .iter()
+            .any(|e| matches!(e, AppEvent::KeptBatchesWaiting { .. })),
+        "{:?}",
+        report.events
+    );
+}
+
+/// A kept batch whose record doesn't read fails every read, as it fails every write:
+/// corruption doesn't pass silently.
+#[tokio::test]
+async fn test_receive_with_a_kept_batch_that_doesnt_read_fails() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    let mut tx = app.tx().unwrap();
+    let id = pubky_switch_core::enc::b64(&[7; 16]);
+    tx.put(&format!("opq/{id}"), &json!("not a batch")).unwrap();
+    app.commit(tx).await.unwrap();
+    for _ in 0..2 {
+        let error = app.receive(None).await.unwrap_err();
+        assert!(
+            matches!(error, AppError::Store(crate::error::StoreError::Corrupt)),
+            "{error:?}"
+        );
+    }
+    let error = app
+        .submit_batch(OpBatch::new().op(OpKind::DenyPut { pubky: [9; 32] }))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, AppError::Store(crate::error::StoreError::Corrupt)),
+        "{error:?}"
+    );
+}
+
+/// A read whose kept batch can't be sent goes on to its feed; when the feed fails too, the
+/// read fails, and the wait it met is in no later read's report.
+#[tokio::test]
+async fn test_receive_that_fails_reports_its_kept_batch_waiting_in_no_later_read() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    keep_lost_batch(&s, &mut app, [9; 32]).await;
+    s.w.switch.fail_next(Fault::Unreachable {
+        path: "ops".into(),
+        after: 0,
+    });
+    s.w.switch.fail_next(Fault::Unreachable {
+        path: "feed".into(),
+        after: 0,
+    });
+    assert!(app.receive(None).await.is_err());
+    s.w.switch.lock().faults.clear();
+    assert_eq!(app.kept_batches().await.unwrap().len(), 1);
+    // The next read settles the batch: nothing waits.
+    let report = app.receive(None).await.unwrap();
+    assert!(app.kept_batches().await.unwrap().is_empty());
+    assert!(
+        !report
+            .events
+            .iter()
+            .any(|e| matches!(e, AppEvent::KeptBatchesWaiting { .. })),
+        "{:?}",
+        report.events
+    );
+}
+
+/// Every way a write's own batch fails once it is kept, at the service time read before its
+/// first send or at its send: the error says [`AppError::Kept`] exactly when the batch is
+/// still kept, and the batch is kept or dropped as each answer tells (Switch wire 6.4).
+#[tokio::test]
+async fn test_batch_error_says_kept_exactly_when_the_batch_stays() {
+    let error_at = |path: &str, code: ErrorCode| Fault::Error {
+        path: path.into(),
+        code,
+        current: json!(null),
+    };
+    let unreachable = |path: &str| Fault::Unreachable {
+        path: path.into(),
+        after: 0,
+    };
+    let cases = [
+        // The service time read before the first send: never sent, so kept.
+        (
+            "time read 403 cert_expired",
+            error_at("feed", ErrorCode::CertExpired),
+            true,
+        ),
+        (
+            "time read 401 bad_signature",
+            error_at("feed", ErrorCode::BadSignature),
+            true,
+        ),
+        (
+            "time read 403 not_current",
+            error_at("feed", ErrorCode::NotCurrent),
+            true,
+        ),
+        (
+            "time read 429",
+            error_at("feed", ErrorCode::RateLimited),
+            true,
+        ),
+        (
+            "time read 503",
+            error_at("feed", ErrorCode::Unavailable),
+            true,
+        ),
+        ("time read network", unreachable("feed"), true),
+        // The send, refused at authentication: never applied, dropped.
+        (
+            "401 bad_signature",
+            error_at("ops", ErrorCode::BadSignature),
+            false,
+        ),
+        (
+            "403 cert_expired",
+            error_at("ops", ErrorCode::CertExpired),
+            false,
+        ),
+        (
+            "403 not_current",
+            error_at("ops", ErrorCode::NotCurrent),
+            false,
+        ),
+        // Refused for good at or after the lookup: dropped.
+        ("409 conflict", error_at("ops", ErrorCode::Conflict), false),
+        ("400", error_at("ops", ErrorCode::BadRequest), false),
+        // Anything that may pass with the same bytes later: kept.
+        (
+            "401 stale_timestamp",
+            error_at("ops", ErrorCode::StaleTimestamp),
+            true,
+        ),
+        (
+            "409 identity_needed",
+            error_at("ops", ErrorCode::IdentityNeeded),
+            true,
+        ),
+        ("410 moved", error_at("ops", ErrorCode::Moved), true),
+        ("429", error_at("ops", ErrorCode::RateLimited), true),
+        ("503", error_at("ops", ErrorCode::Unavailable), true),
+        ("503 staged", error_at("ops", ErrorCode::Staged), true),
+        ("network", unreachable("ops"), true),
+        (
+            "answer lost",
+            Fault::LoseAnswer { path: "ops".into() },
+            true,
+        ),
+        (
+            "answer that doesn't read",
+            Fault::LeaveOut {
+                path: "ops".into(),
+                member: "proofs".into(),
+            },
+            true,
+        ),
+    ];
+    for (name, fault, stays) in cases {
+        let s = Setup::new();
+        let mut app = s.join("wallet").await;
+        s.w.switch.fail_next(fault);
+        let error = app
+            .submit_batch(OpBatch::new().op(OpKind::DenyPut { pubky: [9; 32] }))
+            .await
+            .unwrap_err();
+        let kept = app.kept_batches().await.unwrap();
+        assert_eq!(kept.len(), usize::from(stays), "{name}: {error:?}");
+        assert_eq!(
+            error.kept_batch(),
+            kept.first().map(|(id, _)| *id),
+            "{name}: {error:?}"
+        );
+    }
+}
+
+/// An alarm raised once the write's own batch is kept, here by a service time that goes
+/// back (Switch spec 10.1): the app stops, the batch stays kept, and the error says so
+/// with the alarm inside.
+#[tokio::test]
+async fn test_batch_kept_when_an_alarm_stops_the_write_says_so() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    app.receive(None).await.unwrap();
+    s.w.clock.set_ms(s.w.clock.now_ms() - 60_000);
+    let error = app
+        .submit_batch(OpBatch::new().op(OpKind::DenyPut { pubky: [9; 32] }))
+        .await
+        .unwrap_err();
+    assert!(matches!(error.unkept(), AppError::Alarm(_)), "{error:?}");
+    let kept = app.kept_batches().await.unwrap();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(error.kept_batch(), Some(kept[0].0), "{error:?}");
+}
+
+/// The conversation entry a send owes goes in a kept batch of its own; an alarm that stops
+/// it is the app's own failure, kept batch or not, and fails the send rather than queueing
+/// the message for another try.
+#[tokio::test]
+async fn test_send_stopped_by_an_alarm_in_its_kept_conversation_entry_fails() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    app.receive(None).await.unwrap();
+    s.w.clock.set_ms(s.w.clock.now_ms() - 60_000);
+    let error = app.send(s.note("one")).await.unwrap_err();
+    assert!(matches!(error.unkept(), AppError::Alarm(_)), "{error:?}");
+    assert_eq!(app.kept_batches().await.unwrap().len(), 1);
+}
+
 #[tokio::test]
 async fn test_batch_kept_on_a_retryable_refusal_and_sent_again() {
     for code in [
@@ -2121,6 +2506,641 @@ async fn test_claims_attempt_answer_lost_is_checked_when_sent_again() {
     let evidence = app.claim_evidence(&CLAIM).await.unwrap().unwrap();
     assert_eq!(evidence.view.status, ClaimStatus::Attempting);
     assert_eq!(evidence.view.owner, Some(app.app_id()));
+}
+
+fn claim_changes(events: &[AppEvent]) -> usize {
+    events
+        .iter()
+        .filter(|e| matches!(e, AppEvent::ClaimChanged { claim_key } if *claim_key == CLAIM))
+        .count()
+}
+
+#[tokio::test]
+async fn test_claims_entry_met_again_raises_one_change() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    s.w.switch
+        .fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(
+        app.write_claim(
+            ClaimOp::attempt(CLAIM, 0, ATTEMPT, 3600, None),
+            vec![],
+            ObligationDeadline::NoDeadline,
+        )
+        .await
+        .is_err()
+    );
+    // The read sends the kept attempt again, whose proof the app keeps, then meets the
+    // same entry in its feed: one change.
+    let report = app.receive(None).await.unwrap();
+    assert_eq!(claim_changes(&report.events), 1, "{:?}", report.events);
+    let evidence = app.claim_evidence(&CLAIM).await.unwrap().unwrap();
+    assert_eq!(evidence.view.status, ClaimStatus::Attempting);
+    // Its own next entry changes the claim again.
+    let done = app
+        .write_claim(
+            ClaimOp::done(CLAIM, 1, ATTEMPT, Basis::Owner, None).unwrap(),
+            vec![],
+            ObligationDeadline::NoDeadline,
+        )
+        .await
+        .unwrap();
+    assert_eq!(done.view.status, ClaimStatus::Settled);
+    assert_eq!(claim_changes(&app.take_events()), 1);
+}
+
+/// The claim reads (`GET /claims`) in the router's log from `from` on.
+fn claim_reads(s: &Setup, from: usize) -> usize {
+    s.log()[from..]
+        .iter()
+        .filter(|line| line.starts_with("GET ") && line.contains("/claims/"))
+        .count()
+}
+
+async fn attempt_as(app: &mut App, claim: [u8; 32], step: u64, attempt: [u8; 16]) {
+    app.write_claim(
+        ClaimOp::attempt(claim, step, attempt, 3600, None),
+        vec![],
+        ObligationDeadline::NoDeadline,
+    )
+    .await
+    .unwrap();
+}
+
+async fn report_as(app: &mut App, claim: [u8; 32], step: u64, attempt: [u8; 16], done: bool) {
+    let op = if done {
+        ClaimOp::done(claim, step, attempt, Basis::Owner, None).unwrap()
+    } else {
+        ClaimOp::failed(claim, step, attempt)
+    };
+    app.write_claim(op, vec![], ObligationDeadline::NoDeadline)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn test_claims_compacted_entry_has_the_claim_read_again() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    attempt_as(&mut wallet, CLAIM, 0, ATTEMPT).await;
+    phone.receive(None).await.unwrap();
+    let held = phone.claim_evidence(&CLAIM).await.unwrap().unwrap();
+    assert_eq!(held.view.status, ClaimStatus::Attempting);
+    // The done settles the claim, which is compacted at once: the phone's feed shows both
+    // entries as stubs, naming no claim, so it reads the claim again at the end of its read.
+    report_as(&mut wallet, CLAIM, 1, ATTEMPT, true).await;
+    let from = s.log().len();
+    let report = phone.receive(None).await.unwrap();
+    assert_eq!(claim_reads(&s, from), 1);
+    let feed = s.log()[from..]
+        .iter()
+        .rposition(|line| line.contains("/feed"))
+        .unwrap();
+    let read = s.log()[from..]
+        .iter()
+        .position(|line| line.contains("/claims/"))
+        .unwrap();
+    assert!(read > feed, "the claim is read after the feed");
+    assert_eq!(claim_changes(&report.events), 1, "{:?}", report.events);
+    let held = phone.claim_evidence(&CLAIM).await.unwrap().unwrap();
+    assert_eq!(held.view.status, ClaimStatus::Settled);
+    assert!(held.view.tombstone);
+    // Held as finished now: later stubs don't have it read again.
+    let other = [0x41; 32];
+    attempt_as(&mut wallet, other, 0, ATTEMPT).await;
+    report_as(&mut wallet, other, 1, ATTEMPT, false).await;
+    let from = s.log().len();
+    let report = phone.receive(None).await.unwrap();
+    assert_eq!(claim_reads(&s, from), 0, "{:?}", &s.log()[from..]);
+    assert_eq!(claim_changes(&report.events), 0);
+}
+
+#[tokio::test]
+async fn test_claims_settled_with_an_attempt_open_is_still_read_again() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    // The first attempt fails; a second is opened; late evidence settles the first, so the
+    // claim is SETTLED with the second attempt still open, and stays live.
+    attempt_as(&mut wallet, CLAIM, 0, ATTEMPT).await;
+    report_as(&mut wallet, CLAIM, 1, ATTEMPT, false).await;
+    attempt_as(&mut wallet, CLAIM, 2, [7; 16]).await;
+    wallet
+        .write_claim(
+            ClaimOp::done(CLAIM, 3, ATTEMPT, Basis::Evidence, Some([8; 32])).unwrap(),
+            vec![],
+            ObligationDeadline::NoDeadline,
+        )
+        .await
+        .unwrap();
+    phone.receive(None).await.unwrap();
+    let held = phone.claim_evidence(&CLAIM).await.unwrap().unwrap();
+    assert_eq!(held.view.status, ClaimStatus::Settled);
+    assert!(!held.view.tombstone);
+    // The open attempt's outcome compacts the claim: it comes as a stub, and the phone,
+    // which holds the claim SETTLED but not finished, reads it again.
+    report_as(&mut wallet, CLAIM, 4, [7; 16], false).await;
+    let from = s.log().len();
+    phone.receive(None).await.unwrap();
+    assert_eq!(claim_reads(&s, from), 1);
+    let held = phone.claim_evidence(&CLAIM).await.unwrap().unwrap();
+    assert!(held.view.tombstone);
+    assert_eq!(held.view.step, 5);
+}
+
+#[tokio::test]
+async fn test_claims_own_compacted_entries_of_a_finished_claim_read_nothing() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    attempt_as(&mut wallet, CLAIM, 0, ATTEMPT).await;
+    report_as(&mut wallet, CLAIM, 1, ATTEMPT, true).await;
+    // The wallet holds the claim finished from its own proofs; its own entries, compacted,
+    // come as stubs in its feed and have nothing read.
+    let from = s.log().len();
+    wallet.receive(None).await.unwrap();
+    assert_eq!(claim_reads(&s, from), 0, "{:?}", &s.log()[from..]);
+}
+
+#[tokio::test]
+async fn test_claims_read_again_at_most_a_bound_per_read() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    let claims: Vec<[u8; 32]> = (0..=crate::app::CLAIM_REREADS_PER_READ)
+        .map(|n| [u8::try_from(n).unwrap() + 0x50; 32])
+        .collect();
+    for claim in &claims {
+        attempt_as(&mut wallet, *claim, 0, ATTEMPT).await;
+    }
+    phone.receive(None).await.unwrap();
+    // One claim's done compacts it: every claim the phone follows is marked, and one read
+    // reads the bound of them; the rest wait for the next read, which sees no new stub.
+    report_as(&mut wallet, claims[0], 1, ATTEMPT, true).await;
+    let from = s.log().len();
+    phone.receive(None).await.unwrap();
+    assert_eq!(claim_reads(&s, from), crate::app::CLAIM_REREADS_PER_READ);
+    let from = s.log().len();
+    phone.receive(None).await.unwrap();
+    assert_eq!(claim_reads(&s, from), 1);
+    let from = s.log().len();
+    phone.receive(None).await.unwrap();
+    assert_eq!(claim_reads(&s, from), 0);
+    let held = phone.claim_evidence(&claims[0]).await.unwrap().unwrap();
+    assert!(held.view.tombstone);
+}
+
+#[tokio::test]
+async fn test_claims_read_again_that_fails_stays_marked() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    attempt_as(&mut wallet, CLAIM, 0, ATTEMPT).await;
+    phone.receive(None).await.unwrap();
+    report_as(&mut wallet, CLAIM, 1, ATTEMPT, true).await;
+    // The claim's read doesn't reach the switch: the feed's read still succeeds, and the
+    // claim stays marked.
+    s.w.switch.fail_next(Fault::Unreachable {
+        path: "claims".into(),
+        after: 0,
+    });
+    let report = phone.receive(None).await.unwrap();
+    assert_eq!(claim_changes(&report.events), 0);
+    let held = phone.claim_evidence(&CLAIM).await.unwrap().unwrap();
+    assert_eq!(held.view.status, ClaimStatus::Attempting);
+    // Loaded again, as after a crash: the mark was kept, and the next read reads the claim,
+    // though its feed shows nothing new.
+    let me = phone.app_id();
+    drop(phone);
+    let mut phone = App::load(s.env(), s.protocol.clone(), World::config(), me)
+        .await
+        .unwrap();
+    let from = s.log().len();
+    let report = phone.receive(None).await.unwrap();
+    assert_eq!(claim_reads(&s, from), 1);
+    assert_eq!(claim_changes(&report.events), 1);
+    let held = phone.claim_evidence(&CLAIM).await.unwrap().unwrap();
+    assert_eq!(held.view.status, ClaimStatus::Settled);
+}
+
+#[tokio::test]
+async fn test_claims_app_without_claims_read_reads_nothing_again() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut writer = s
+        .join_with("phone", &[Permission::ClaimsWrite, Permission::ListsRead])
+        .await;
+    attempt_as(&mut writer, CLAIM, 0, ATTEMPT).await;
+    attempt_as(&mut wallet, [0x42; 32], 0, ATTEMPT).await;
+    // Every claim item is a stub to it, and it holds its own claim open, but it can't read
+    // claims: nothing is read.
+    let from = s.log().len();
+    writer.receive(None).await.unwrap();
+    assert_eq!(claim_reads(&s, from), 0, "{:?}", &s.log()[from..]);
+}
+
+/// Write `op` with its answer lost: the switch took it, and the batch is kept.
+async fn lost(s: &Setup, app: &mut App, op: ClaimOp) {
+    s.w.switch
+        .fail_next(Fault::LoseAnswer { path: "ops".into() });
+    let error = app
+        .write_claim(op, vec![], ObligationDeadline::NoDeadline)
+        .await
+        .unwrap_err();
+    assert!(error.kept_batch().is_some(), "{error:?}");
+}
+
+/// An `attempt` kept and never sent, its service time unverifiable when it was written, and
+/// reconcile mode begun before it goes: the read that sends it again first can't verify a
+/// time either, and its feed shows the continuity unverified (Switch spec 8.3). No new
+/// attempt is made in reconcile mode (Switch spec 12.4): the batch, never applied, is
+/// dropped, and the protocol told of it and its attempt.
+#[tokio::test]
+async fn test_claims_unsent_kept_attempt_isnt_sent_in_reconcile_mode() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    app.receive(None).await.unwrap();
+    s.w.switch.fail_next(Fault::Unreachable {
+        path: "feed".into(),
+        after: 0,
+    });
+    s.w.switch.fail_next(Fault::Unreachable {
+        path: "ops".into(),
+        after: 0,
+    });
+    let error = app
+        .write_claim(
+            ClaimOp::attempt(CLAIM, 0, ATTEMPT, 3600, None),
+            vec![],
+            ObligationDeadline::NoDeadline,
+        )
+        .await
+        .unwrap_err();
+    s.w.switch.lock().faults.clear();
+    let kept = error.kept_batch().unwrap();
+    assert_eq!(app.kept_batches().await.unwrap()[0].1.kept_ms, None);
+    // A month later the service checkpointed past the app's position and dropped the
+    // stubs behind it.
+    s.w.clock.advance_ms(31 * DAY_MS);
+    phone
+        .submit_batch(OpBatch::new().op(OpKind::DenyPut { pubky: [9; 32] }))
+        .await
+        .unwrap();
+    {
+        let mut inner = s.w.switch.lock();
+        inner.checkpoint = Some(pubky_switch_core::chain::SignedHead::sign(
+            &inner.service,
+            &inner.identity.public(),
+            &inner.tip,
+        ));
+        inner.dropped_through = inner.seq;
+    }
+    s.w.switch.fail_next(Fault::Unreachable {
+        path: "feed".into(),
+        after: 0,
+    });
+    app.receive(None).await.unwrap();
+    assert!(app.reconcile_mode());
+    assert_eq!(app.kept_batches().await.unwrap()[0].0, kept);
+    // The next read doesn't send it.
+    let report = app.receive(None).await.unwrap();
+    let attempts = |s: &Setup| {
+        s.w.switch
+            .applied()
+            .iter()
+            .filter(|op| matches!(op.body().kind, OpKind::Claim(_)))
+            .count()
+    };
+    assert_eq!(attempts(&s), 0);
+    assert!(app.kept_batches().await.unwrap().is_empty());
+    assert!(
+        report
+            .events
+            .iter()
+            .any(|e| matches!(e, AppEvent::KeptBatchDropped { batch_id, .. } if *batch_id == kept)),
+        "{:?}",
+        report.events
+    );
+    assert!(
+        report.events.iter().any(|e| matches!(
+            e,
+            AppEvent::AttemptDropped { attempt_id, .. } if *attempt_id == ATTEMPT
+        )),
+        "{:?}",
+        report.events
+    );
+}
+
+#[tokio::test]
+async fn test_claims_attempt_made_again_returns_the_kept_attempt() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    let attempt = ClaimOp::attempt(CLAIM, 0, ATTEMPT, 3600, None);
+    lost(&s, &mut app, attempt).await;
+    app.take_events();
+    // Made again at once: the kept batch goes first and takes the claim; this call's own
+    // attempt meets `409 conflict` showing the claim held by that attempt, so the call
+    // returns its outcome, with its proof.
+    let written = app
+        .write_claim(attempt, vec![], ObligationDeadline::NoDeadline)
+        .await
+        .unwrap();
+    assert!(written.repeated);
+    assert_eq!(written.attempt_id, ATTEMPT);
+    assert_eq!(written.view.status, ClaimStatus::Attempting);
+    assert_eq!(written.view.owner, Some(app.app_id()));
+    assert_eq!(written.proof.body().step, Some(1));
+    // The kept batch's settle, in this call, changed the claim the app holds.
+    assert_eq!(claim_changes(&app.take_events()), 1);
+    assert!(app.kept_batches().await.unwrap().is_empty());
+    // Made again once more: nothing changes in that call, and nothing is raised.
+    let written = app
+        .write_claim(attempt, vec![], ObligationDeadline::NoDeadline)
+        .await
+        .unwrap();
+    assert!(written.repeated);
+    assert_eq!(claim_changes(&app.take_events()), 0);
+}
+
+#[tokio::test]
+async fn test_claims_attempt_with_a_new_id_gets_the_conflict() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    lost(
+        &s,
+        &mut app,
+        ClaimOp::attempt(CLAIM, 0, ATTEMPT, 3600, None),
+    )
+    .await;
+    // A read settles the kept attempt; the protocol, which never saw it, attempts again
+    // under a new ID: the earlier attempt isn't this one, so the conflict stands, and its
+    // claim shows the app's own attempt holding the claim.
+    app.receive(None).await.unwrap();
+    let error = app
+        .write_claim(
+            ClaimOp::attempt(CLAIM, 0, [9; 16], 3600, None),
+            vec![],
+            ObligationDeadline::NoDeadline,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Some(ErrorCode::Conflict));
+    let view = claim_conflict(&error).unwrap();
+    assert_eq!(view.attempt_id, Some(ATTEMPT));
+    assert_eq!(view.owner, Some(app.app_id()));
+}
+
+/// Two devices of one app share its keys (Switch spec 3.1 "Several devices"). Device A
+/// attempts; device B, which read its feed, attempts the same claim under an ID of its own:
+/// A's entry is the app's own, but not B's attempt, so B gets the conflict, and only A
+/// carries its attempt out.
+#[tokio::test]
+async fn test_claims_second_device_attempt_under_its_own_id_gets_the_conflict() {
+    let s = Setup::new();
+    let mut a = s.join("wallet").await;
+    a.set_multi_device(true).await.unwrap();
+    let backup = a.backup().unwrap();
+    let store_b = Arc::new(MemoryStore::new());
+    let mut b = App::restore(
+        s.env_on(Arc::clone(&store_b) as Arc<dyn StateStore>),
+        s.protocol.clone(),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    b.receive(None).await.unwrap();
+    b.end_reconcile(crate::app::UserConfirmed::new())
+        .await
+        .unwrap();
+    assert_eq!(a.app_id(), b.app_id());
+    attempt_as(&mut a, CLAIM, 0, ATTEMPT).await;
+    // Device B reads its feed: A's attempt is the app's own entry, kept at step 0.
+    b.receive(None).await.unwrap();
+    let error = b
+        .write_claim(
+            ClaimOp::attempt(CLAIM, 0, [9; 16], 3600, None),
+            vec![],
+            ObligationDeadline::NoDeadline,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Some(ErrorCode::Conflict));
+    let view = claim_conflict(&error).unwrap();
+    assert_eq!(view.attempt_id, Some(ATTEMPT), "device A's attempt");
+    assert_eq!(view.owner, Some(b.app_id()));
+    // The same attempt asked again is the app's own entry: repeated.
+    let written = b
+        .write_claim(
+            ClaimOp::attempt(CLAIM, 0, ATTEMPT, 3600, None),
+            vec![],
+            ObligationDeadline::NoDeadline,
+        )
+        .await
+        .unwrap();
+    assert!(written.repeated);
+    assert_eq!(written.attempt_id, ATTEMPT);
+}
+
+/// An own attempt asked again once it is orphaned, its `orphan_after` passed, isn't held by
+/// the caller any more: any app may resolve it `unknown` (Switch spec 10.2), so the conflict
+/// stands.
+#[tokio::test]
+async fn test_claims_attempt_made_again_once_orphaned_gets_the_conflict() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    let attempt = ClaimOp::attempt(CLAIM, 0, ATTEMPT, 60, None);
+    lost(&s, &mut app, attempt).await;
+    s.w.clock.advance_ms(120_000);
+    let error = app
+        .write_claim(attempt, vec![], ObligationDeadline::NoDeadline)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Some(ErrorCode::Conflict));
+    let view = claim_conflict(&error).unwrap();
+    assert!(view.attempt(&ATTEMPT).unwrap().orphaned, "{view:?}");
+    let doubt = app.claim_doubt(&CLAIM).await.unwrap().unwrap();
+    assert!(doubt.doubtful(), "{doubt:?}");
+}
+
+/// An own outcome of another attempt held at the step asked for is not this entry's
+/// outcome: the conflict stands.
+#[tokio::test]
+async fn test_claims_own_outcome_of_another_attempt_at_the_step_gets_the_conflict() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    let other = [0x0d; 16];
+    attempt_as(&mut app, CLAIM, 0, ATTEMPT).await;
+    report_as(&mut app, CLAIM, 1, ATTEMPT, false).await;
+    attempt_as(&mut app, CLAIM, 2, other).await;
+    report_as(&mut app, CLAIM, 3, other, false).await;
+    // `failed` of the first attempt, asked at step 3, where the own `failed` of the second
+    // is held.
+    let result = app
+        .write_claim(
+            ClaimOp::failed(CLAIM, 3, ATTEMPT),
+            vec![],
+            ObligationDeadline::NoDeadline,
+        )
+        .await;
+    assert!(
+        result
+            .as_ref()
+            .is_err_and(|e| e.code() == Some(ErrorCode::Conflict)),
+        "{result:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_claims_outcome_made_again_returns_the_kept_outcome() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    attempt_as(&mut app, CLAIM, 0, ATTEMPT).await;
+    let done = ClaimOp::done(CLAIM, 1, ATTEMPT, Basis::Owner, None).unwrap();
+    lost(&s, &mut app, done).await;
+    app.take_events();
+    let written = app
+        .write_claim(done, vec![], ObligationDeadline::NoDeadline)
+        .await
+        .unwrap();
+    assert!(written.repeated);
+    assert_eq!(written.attempt_id, ATTEMPT);
+    assert_eq!(written.view.status, ClaimStatus::Settled);
+    assert_eq!(written.proof.body().step, Some(2));
+    assert_eq!(claim_changes(&app.take_events()), 1);
+    // A `failed` the same way.
+    let other = [0x43; 32];
+    attempt_as(&mut app, other, 0, ATTEMPT).await;
+    let failed = ClaimOp::failed(other, 1, ATTEMPT);
+    lost(&s, &mut app, failed).await;
+    let written = app
+        .write_claim(failed, vec![], ObligationDeadline::NoDeadline)
+        .await
+        .unwrap();
+    assert!(written.repeated);
+    assert_eq!(written.view.status, ClaimStatus::Free);
+}
+
+#[tokio::test]
+async fn test_claims_unknown_made_again_returns_the_kept_unknown() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    wallet
+        .write_claim(
+            ClaimOp::attempt(CLAIM, 0, ATTEMPT, 60, None),
+            vec![],
+            ObligationDeadline::NoDeadline,
+        )
+        .await
+        .unwrap();
+    s.w.clock.advance_ms(120_000);
+    let unknown = ClaimOp::unknown(CLAIM, 1, ATTEMPT);
+    lost(&s, &mut phone, unknown).await;
+    let written = phone
+        .write_claim(unknown, vec![], ObligationDeadline::NoDeadline)
+        .await
+        .unwrap();
+    assert!(written.repeated);
+    assert_eq!(written.view.status, ClaimStatus::Free);
+}
+
+#[tokio::test]
+async fn test_claims_repeated_entry_needs_the_conflict_to_show_it() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    let me = app.app_id();
+    attempt_as(&mut app, CLAIM, 0, ATTEMPT).await;
+    let attempting = app.claim_evidence(&CLAIM).await.unwrap().unwrap().view;
+    report_as(&mut app, CLAIM, 1, ATTEMPT, true).await;
+    let settled = app.claim_evidence(&CLAIM).await.unwrap().unwrap().view;
+    let conflict = |view: &ClaimView| Fault::Error {
+        path: "ops".into(),
+        code: ErrorCode::Conflict,
+        current: json!({ "claim": view.to_value() }),
+    };
+    // The own done is held at the step asked for, but the conflict shows the attempt still
+    // open: not that done's outcome.
+    let mut open = settled.clone();
+    open.status = ClaimStatus::Attempting;
+    open.attempts[0].outcome = pubky_switch_core::claims::Outcome::Open;
+    open.attempts[0].resolved_by = None;
+    s.w.switch.fail_next(conflict(&open));
+    let error = app
+        .write_claim(
+            ClaimOp::done(CLAIM, 1, ATTEMPT, Basis::Owner, None).unwrap(),
+            vec![],
+            ObligationDeadline::NoDeadline,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Some(ErrorCode::Conflict));
+    // The own attempt is held at the step asked for, but the conflict shows another owner.
+    let mut theirs = attempting.clone();
+    theirs.owner = Some([0x55; 16]);
+    assert_ne!(theirs.owner, Some(me));
+    s.w.switch.fail_next(conflict(&theirs));
+    let error = app
+        .write_claim(
+            ClaimOp::attempt(CLAIM, 0, ATTEMPT, 3600, None),
+            vec![],
+            ObligationDeadline::NoDeadline,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Some(ErrorCode::Conflict));
+}
+
+#[tokio::test]
+async fn test_claims_conflict_not_of_the_own_entry_stands() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    // Another app's attempt holds the claim: the conflict stands.
+    attempt_as(&mut phone, CLAIM, 0, ATTEMPT).await;
+    wallet.receive(None).await.unwrap();
+    let error = wallet
+        .write_claim(
+            ClaimOp::attempt(CLAIM, 0, [9; 16], 3600, None),
+            vec![],
+            ObligationDeadline::NoDeadline,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Some(ErrorCode::Conflict));
+    // The app's own attempt, past the step asked for: the conflict stands too.
+    let other = [0x44; 32];
+    attempt_as(&mut wallet, other, 0, ATTEMPT).await;
+    report_as(&mut wallet, other, 1, ATTEMPT, false).await;
+    let error = wallet
+        .write_claim(
+            ClaimOp::attempt(other, 0, [9; 16], 3600, None),
+            vec![],
+            ObligationDeadline::NoDeadline,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Some(ErrorCode::Conflict));
+    // Its `failed` made again is its own outcome; a `done` where the own attempt was
+    // resolved `failed` is of another type: the conflict.
+    let error = wallet
+        .write_claim(
+            ClaimOp::failed(other, 1, ATTEMPT),
+            vec![],
+            ObligationDeadline::NoDeadline,
+        )
+        .await;
+    assert!(error.as_ref().is_ok_and(|w| w.repeated), "{error:?}");
+    let error = wallet
+        .write_claim(
+            ClaimOp::done(other, 1, ATTEMPT, Basis::Owner, None).unwrap(),
+            vec![],
+            ObligationDeadline::NoDeadline,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Some(ErrorCode::Conflict));
 }
 
 #[tokio::test]

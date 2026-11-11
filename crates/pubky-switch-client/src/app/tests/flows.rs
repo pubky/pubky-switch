@@ -1473,13 +1473,281 @@ async fn write_offline(w: &World, app: &mut App) {
         path: "ops".into(),
         after: 0,
     });
-    let result = app.submit_batch(conversation(w.bob.public())).await;
-    assert!(matches!(result, Err(AppError::Transport(_))), "{result:?}");
+    let error = app
+        .submit_batch(conversation(w.bob.public()))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error.unkept(), AppError::Transport(_)),
+        "{error:?}"
+    );
     w.switch.lock().faults.clear();
     let kept = app.kept_batches().await.unwrap();
     assert_eq!(kept.len(), 1, "a network failure keeps the batch");
+    assert_eq!(
+        error.kept_batch(),
+        Some(kept[0].0),
+        "the error names it kept"
+    );
     assert_eq!(kept[0].1.kept_ms, None, "never sent, so not stamped");
     assert_eq!(conversations_for(w, w.bob.public()), 0);
+}
+
+#[tokio::test]
+async fn test_submit_batch_lost_answer_says_the_batch_is_kept() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    let error = app
+        .submit_batch(conversation(w.bob.public()))
+        .await
+        .unwrap_err();
+    let kept = app.kept_batches().await.unwrap();
+    assert_eq!(kept.len(), 1);
+    let AppError::Kept {
+        batch_id,
+        error: inner,
+    } = &error
+    else {
+        panic!("the call's own batch is kept: {error:?}");
+    };
+    assert_eq!(*batch_id, kept[0].0);
+    assert!(matches!(**inner, AppError::Transport(_)), "{inner:?}");
+    // A `503` answer keeps it the same way, and its code shows through.
+    let mut app = w.join("phone").await;
+    w.switch.fail_next(Fault::Error {
+        path: "ops".into(),
+        code: ErrorCode::Unavailable,
+        current: json!(null),
+    });
+    let error = app.submit_batch(conversation([7; 32])).await.unwrap_err();
+    assert_eq!(error.code(), Some(ErrorCode::Unavailable));
+    assert_eq!(
+        error.kept_batch(),
+        Some(app.kept_batches().await.unwrap()[0].0)
+    );
+}
+
+#[tokio::test]
+async fn test_submit_batch_behind_an_unsent_kept_batch_keeps_nothing_of_its_own() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    w.switch.fail_next(Fault::Unreachable {
+        path: "ops".into(),
+        after: 0,
+    });
+    let first = app
+        .submit_batch(conversation(w.bob.public()))
+        .await
+        .unwrap_err();
+    let kept = app.kept_batches().await.unwrap();
+    assert_eq!(first.kept_batch(), Some(kept[0].0));
+    // The kept batch still can't be sent: the next call fails before its own batch is
+    // signed, with the bare error, and keeps nothing of its own.
+    w.switch.fail_next(Fault::Unreachable {
+        path: "ops".into(),
+        after: 0,
+    });
+    let second = app.submit_batch(conversation([7; 32])).await.unwrap_err();
+    assert!(matches!(second, AppError::Transport(_)), "{second:?}");
+    assert_eq!(second.kept_batch(), None);
+    let ids = |kept: &[([u8; 16], crate::app::batch::PendingBatch)]| {
+        kept.iter().map(|(id, _)| *id).collect::<Vec<_>>()
+    };
+    assert_eq!(ids(&app.kept_batches().await.unwrap()), ids(&kept));
+    // A refusal for good keeps nothing either, and says so.
+    let mut phone = w.join("phone").await;
+    w.switch.fail_next(Fault::Error {
+        path: "ops".into(),
+        code: ErrorCode::Conflict,
+        current: json!(null),
+    });
+    let refused = phone.submit_batch(conversation([8; 32])).await.unwrap_err();
+    assert_eq!(refused.code(), Some(ErrorCode::Conflict));
+    assert_eq!(refused.kept_batch(), None);
+    assert!(phone.kept_batches().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_receive_sends_a_kept_batch_before_the_feed() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(
+        app.submit_batch(conversation(w.bob.public()))
+            .await
+            .is_err()
+    );
+    assert_eq!(app.kept_batches().await.unwrap().len(), 1);
+    // The feed can't be read past the service time the resend is judged at, but the kept
+    // batch went first: its original proof came back and settled it, applied once.
+    w.switch.fail_next(Fault::Unreachable {
+        path: "feed".into(),
+        after: 1,
+    });
+    assert!(app.receive(None).await.is_err());
+    w.switch.lock().faults.clear();
+    assert!(app.kept_batches().await.unwrap().is_empty());
+    assert_eq!(conversations_for(&w, w.bob.public()), 1);
+    let report = app.receive(None).await.unwrap();
+    assert!(
+        !has(&report.events, |e| matches!(
+            e,
+            AppEvent::KeptBatchesWaiting { .. }
+        )),
+        "{:?}",
+        report.events
+    );
+    assert_eq!(conversations_for(&w, w.bob.public()), 1);
+}
+
+#[tokio::test]
+async fn test_receive_goes_on_when_a_kept_batch_still_cant_be_sent() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.submit_batch(conversation([6; 32])).await.is_err());
+    let (seq, _) = w.note(app.app_id(), "after");
+    // The resend doesn't reach the switch: the read goes on to the feed, reports the
+    // batch waiting, and keeps it.
+    w.switch.fail_next(Fault::Unreachable {
+        path: "ops".into(),
+        after: 0,
+    });
+    let report = app.receive(None).await.unwrap();
+    w.switch.lock().faults.clear();
+    assert!(
+        has(&report.events, |e| matches!(
+            e,
+            AppEvent::KeptBatchesWaiting {
+                kept: 1,
+                code: None
+            }
+        )),
+        "{:?}",
+        report.events
+    );
+    assert!(report.cursor.seq >= seq, "the feed was read");
+    assert_eq!(app.kept_batches().await.unwrap().len(), 1);
+    // The feed showed the operation applied; the kept copy is cleared by the next read's
+    // resend, which the switch answers with the original proof.
+    let report = app.receive(None).await.unwrap();
+    assert!(app.kept_batches().await.unwrap().is_empty());
+    assert!(
+        !has(&report.events, |e| matches!(
+            e,
+            AppEvent::KeptBatchesWaiting { .. }
+        )),
+        "{:?}",
+        report.events
+    );
+    assert_eq!(conversations_for(&w, [6; 32]), 1);
+    // A `503` on the resend is reported with its code.
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.submit_batch(conversation([7; 32])).await.is_err());
+    w.switch.fail_next(Fault::Error {
+        path: "ops".into(),
+        code: ErrorCode::Unavailable,
+        current: json!(null),
+    });
+    let report = app.receive(None).await.unwrap();
+    assert!(
+        has(&report.events, |e| matches!(
+            e,
+            AppEvent::KeptBatchesWaiting { kept: 1, code: Some(code) } if code == "unavailable"
+        )),
+        "{:?}",
+        report.events
+    );
+}
+
+#[tokio::test]
+async fn test_receive_sends_no_batch_refused_for_good() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    w.switch.fail_next(Fault::Error {
+        path: "ops".into(),
+        code: ErrorCode::Conflict,
+        current: json!(null),
+    });
+    assert!(
+        app.submit_batch(conversation(w.bob.public()))
+            .await
+            .is_err()
+    );
+    // Refused for good on its first send: not kept, so no read sends it.
+    assert!(app.kept_batches().await.unwrap().is_empty());
+    let report = app.receive(None).await.unwrap();
+    assert!(!has(&report.events, |e| matches!(
+        e,
+        AppEvent::KeptBatchesWaiting { .. } | AppEvent::BatchRefused { .. }
+    )));
+    assert_eq!(conversations_for(&w, w.bob.public()), 0);
+}
+
+/// The signer renews the app's certificate and lists the renewal (Switch spec 3.2 steps 1
+/// and 2).
+fn renew_listed(w: &World, app: &App) {
+    let me = app.app_id();
+    let old = app.cert().clone();
+    let renewed = cert_for(
+        &w.alice,
+        &app_keys("wallet"),
+        w.clock.now_ms(),
+        &["scope-a"],
+    );
+    let has_keys = |s: &str| SampleProtocol::default().has_keys(s);
+    let epoch = w.switch.identity_doc().unwrap().data_epoch();
+    let mut batch = vec![OpKind::CertPut {
+        target_app_id: me,
+        cert: renewed.signed().clone(),
+    }];
+    for part in seal_bundle_parts(&w.alice, &renewed, 1, epoch, &has_keys).unwrap() {
+        batch.push(OpKind::KeyBundlePut(KeyBundlePut {
+            target_app_id: me,
+            bundle: part.bundle,
+            first_epoch: part.first_epoch,
+            last_epoch: part.last_epoch,
+        }));
+    }
+    w.switch.signer_batch(batch).unwrap();
+    w.next_doc(|body| {
+        body.apps.retain(|a| a.app_id != me);
+        body.apps.push(ListedApp {
+            app_id: me,
+            cert: renewed.hash(),
+        });
+        body.renewed.push(RenewedCert {
+            app_id: me,
+            cert: old.hash(),
+            until: None,
+        });
+    });
+}
+
+/// A write while the certificate is expired: the batch is signed and kept, then the
+/// service time read before its first send is refused (`403 cert_expired`), so it was
+/// never sent. It stays kept, and the error says so; after the renewal a read sends it.
+#[tokio::test]
+async fn test_kept_batch_refused_before_its_first_send_says_it_is_kept() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    w.clock.set_ms(app.cert().expires_at() + 1);
+    let error = app
+        .submit_batch(conversation(w.bob.public()))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Some(ErrorCode::CertExpired), "{error:?}");
+    let kept = app.kept_batches().await.unwrap();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].1.kept_ms, None, "never sent");
+    assert_eq!(error.kept_batch(), Some(kept[0].0), "{error:?}");
+    renew_listed(&w, &app);
+    for _ in 0..2 {
+        let _ = app.receive(None).await;
+    }
+    assert!(app.kept_batches().await.unwrap().is_empty());
+    assert_eq!(conversations_for(&w, w.bob.public()), 1);
 }
 
 #[tokio::test]
