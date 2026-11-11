@@ -192,7 +192,12 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   fetched, and at a staged one holding an import (not one staged for a key change in place).
   An app's call is `403 permission_missing`. Then every call, the retry included, gets the
   `404` signed with a fixed operator key. `erased` tells a test it happened; app tests set the
-  flag directly.
+  flag directly. The service keeps no freeze or import state yet, so it refuses no erasure for
+  a move; it answers an app of another identity `403 permission_missing`, where this switch
+  answers `403 not_admitted`; and after an erasure it takes `POST /v1/enroll` again, creating a
+  new staged account, where this switch answers it with the operator's `404` too. That account
+  can't serve at the service yet either: its first `identity.json`, at the next generation with
+  `recovery_from` (Switch wire 7.4.16), gets the `503` "a generation change isn't served yet".
 - **Push** (Switch wire 8.1): registrations only; nothing is sent to a relay.
 
 ## Signer flows tested only here
@@ -200,8 +205,8 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
 These signer flows run only against the scripted switch, whose `GET /apps` follows the
 service's rules (above). The service in this workspace serves `GET /apps`, `GET` and `POST
 /apps/{app_id}/keys` and `POST /apps/{app_id}/leave`, so the full-bundle requests, reading the
-stored parts, the departures and the hand-over can run against it now (`PUT` and `GET
-/handover` too); the erasure waits for `POST /erase`:
+stored parts, the departures, the hand-over (`PUT` and `GET /handover`) and the erasure can run
+against it now:
 
 - approval, renewals and reductions, their closings, and epoch completion
   (`crates/pubky-switch-signer/tests/approval.rs`, `renewal.rs`);
@@ -212,5 +217,5 @@ stored parts, the departures and the hand-over can run against it now (`PUT` and
 - restore from the signer backup, in place and on a new install (`restore.rs`);
 - the hand-over both ways, the abort, the take-over's checks and its lost answers, and which
   copies delete a key (`handover.rs`), save the scripted faults;
-- the account's erasure, its lost answer, retry and refusal (`erasure.rs`): the service
-  doesn't serve `POST /erase` yet.
+- the account's erasure, its lost answer, retry and refusal (`erasure.rs`), save the scripted
+  faults.

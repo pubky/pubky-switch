@@ -627,7 +627,36 @@ async fn test_feed_of_an_account_erased_meanwhile_is_unknown() {
     .expect("64");
     let (answer, ()) = tokio::join!(replay.service.handle(request), async {
         tokio::time::sleep(Duration::from_millis(200)).await;
-        sql(&replay, "DELETE FROM accounts WHERE id = $1").await;
+        // The signer erases the account (Switch wire 7.4.16).
+        let key = alice(&keys)["pubky_id"].as_str().expect("id").to_string();
+        let service = keys["service_keys"]
+            .as_array()
+            .expect("service keys")
+            .iter()
+            .find(|s| s["account"] == key.as_str())
+            .expect("alice's service key")["public"]
+            .as_str()
+            .expect("public")
+            .to_string();
+        let service: [u8; 32] = pubky_switch_core::enc::unb64(&service)
+            .expect("key")
+            .try_into()
+            .expect("32 bytes");
+        let erased = replay
+            .service
+            .handle(signer_request(
+                "POST",
+                &format!("/v1/{}/erase", alice_id()),
+                pubky_switch_core::http::erase_body(&service),
+                ms(&at),
+            ))
+            .await;
+        assert_eq!(
+            erased.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&erased.body)
+        );
     });
     assert_eq!(
         (answer.status, body(&answer)["code"].clone()),
