@@ -20,10 +20,11 @@ use crate::clock::Clock;
 use crate::error::StoreError;
 use crate::store::{KeyValue, Write, WriteBatch};
 
-/// The sample protocol, with a backup layer.
+/// The sample protocol, with a backup layer, recording whether each run was released.
 #[derive(Default)]
 struct BackedUp {
     sample: SampleProtocol,
+    released: Mutex<Vec<bool>>,
 }
 
 impl Protocol for BackedUp {
@@ -53,6 +54,7 @@ impl Protocol for BackedUp {
     }
 
     fn receive(&self, message: &ReceivedMessage) -> Outcome {
+        self.released.lock().unwrap().push(message.released);
         self.sample.receive(message)
     }
 
@@ -653,32 +655,141 @@ async fn test_unverified_bound_keeps_the_entry_a_kept_effect_belongs_to() {
     assert!(dropped(&duties).iter().all(|(seq, _)| *seq != earliest));
 }
 
-#[tokio::test]
-async fn test_unverified_bound_layered_backup_settles_a_kept_effect_first() {
-    let w = World::new();
-    let mut app = wallet(&w, w.env()).await;
-    let earliest = over_with_a_kept_effect(&w, &mut app).await;
-    // While the kept effect can't be settled, no backup is taken: a restore couldn't
-    // finish the entry, and nothing is dropped.
-    w.switch
-        .fail_next(crate::testing::Fault::LoseAnswer { path: "ops".into() });
-    assert!(app.backup_layered().await.is_err());
-    assert!(app.stored_id_at(earliest).is_some());
-    let duties = app.kept_duties().await.unwrap();
-    assert!(dropped(&duties).iter().all(|(seq, _)| *seq != earliest));
-    // Once it can, the backup settles it first, as a read does: the outcome is finished
-    // with the effect applied once, and the backup holds no trace of the entry to lose.
-    let backup = app.backup_layered().await.unwrap();
-    assert!(app.state.pending_effect.is_none());
-    assert_eq!(app.stored_id_at(earliest), None);
-    assert_eq!(w.effects(), 1);
-    let restored = App::restore(
+/// `backup` restored onto an empty store, with a protocol of its own.
+async fn restored_from(w: &World, backup: &crate::app::AppBackup) -> (App, Arc<BackedUp>) {
+    let protocol = Arc::new(BackedUp::default());
+    let app = App::restore(
         w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
-        Arc::new(BackedUp::default()),
+        protocol.clone(),
         World::config(),
-        &backup,
+        backup,
     )
     .await
     .unwrap();
-    assert_eq!(restored.stored_id_at(earliest), None);
+    (app, protocol)
+}
+
+/// The restored app holds the entry at `seq` stored as uncertain: a read keeps it, and once
+/// the host releases it, the next read runs it, marked released.
+async fn held_uncertain_then_released(app: &mut App, protocol: &BackedUp, seq: u64) {
+    let id = app.stored_id_at(seq).unwrap();
+    assert_eq!(
+        app.state.parked.get(&id).map(|e| e.reason),
+        Some(ParkReason::Uncertain)
+    );
+    app.receive(None).await.unwrap();
+    assert_eq!(app.stored_id_at(seq), Some(id));
+    let entry = app
+        .parked_entries()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|e| e.stored_id == id)
+        .unwrap();
+    app.release_parked(id, &entry.hash).await.unwrap();
+    // Stored entries are tried in rounds, a capped number a read, so it runs within a few.
+    for _ in 0..8 {
+        if app.stored_id_at(seq).is_none() {
+            break;
+        }
+        app.receive(None).await.unwrap();
+    }
+    assert_eq!(app.stored_id_at(seq), None);
+    assert_eq!(protocol.released.lock().unwrap().last(), Some(&true));
+}
+
+#[tokio::test]
+async fn test_unverified_bound_backup_holds_a_kept_effects_entry_as_uncertain() {
+    let w = World::new();
+    let mut app = wallet(&w, w.env()).await;
+    let earliest = over_with_a_kept_effect(&w, &mut app).await;
+    let id = app.stored_id_at(earliest);
+    // The backup is local: the live store keeps the kept effect and the entry as they are.
+    let backup = app.backup_layered().await.unwrap();
+    assert!(app.state.pending_effect.is_some());
+    assert_eq!(app.stored_id_at(earliest), id);
+    assert_eq!(
+        app.state.parked.get(&id.unwrap()).map(|e| e.reason),
+        Some(ParkReason::Unverifiable)
+    );
+    // Restored, the app holds the entry as uncertain, beyond the bounds, until released.
+    let (mut restored, protocol) = restored_from(&w, &backup).await;
+    held_uncertain_then_released(&mut restored, &protocol, earliest).await;
+}
+
+#[tokio::test]
+async fn test_unverified_bound_halted_apps_backup_holds_a_kept_effects_entry_as_uncertain() {
+    let w = World::new();
+    let mut app = wallet(&w, w.env()).await;
+    let earliest = over_with_a_kept_effect(&w, &mut app).await;
+    app.state.alarm = Some(crate::app::Alarm::Rollback {
+        reason: "test".into(),
+    });
+    let backup = app.backup_layered().await.unwrap();
+    let (mut restored, protocol) = restored_from(&w, &backup).await;
+    held_uncertain_then_released(&mut restored, &protocol, earliest).await;
+}
+
+#[tokio::test]
+async fn test_unverified_bound_backup_of_a_feed_entrys_kept_effect_never_applies_it_twice() {
+    let w = World::new();
+    let mut app = wallet(&w, w.env()).await;
+    // A note read from the feed, its effect applied and the answer lost: kept, not stored.
+    let (seq, _) = w.note(app.app_id(), "kept");
+    w.switch
+        .fail_next(crate::testing::Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.receive(None).await.is_err());
+    assert!(
+        app.state
+            .pending_effect
+            .as_ref()
+            .is_some_and(|p| p.stored.is_none())
+    );
+    assert_eq!(w.effects(), 1);
+    // Taken offline: the backup makes no request at all.
+    w.switch.fail_next(crate::testing::Fault::Unreachable {
+        path: String::new(),
+        after: 0,
+    });
+    let backup = app.backup_layered().await.unwrap();
+    assert_eq!(w.switch.lock().faults.len(), 1, "the backup made a request");
+    w.switch.lock().faults.clear();
+    // Restored, the app holds the entry as uncertain, and its read of the feed entry again
+    // is a duplicate: the effect isn't built or applied again.
+    let (mut restored, protocol) = restored_from(&w, &backup).await;
+    let report = restored.receive(None).await.unwrap();
+    assert!(
+        has(
+            &report.events,
+            |e| matches!(e, AppEvent::Duplicate { seq: s, .. } if *s == seq)
+        ),
+        "{:?}",
+        report.events
+    );
+    assert_eq!(w.effects(), 1);
+    assert!(protocol.released.lock().unwrap().is_empty());
+    held_uncertain_then_released(&mut restored, &protocol, seq).await;
+}
+
+#[tokio::test]
+async fn test_unverified_bound_restored_entries_are_tried_from_the_first_round() {
+    // An entry stored late in the backed-up app's life, in its round 40: the restored app's
+    // first round starts past the newest round an entry was stored in, so it tries it at its
+    // first read.
+    let w = World::new();
+    let mut app = wallet(&w, w.env()).await;
+    let bob = Peer {
+        identity: w.bob.clone(),
+        keys: w.bob_keys.clone(),
+        cert: w.bob_cert.clone(),
+    };
+    let now = w.clock.now_ms();
+    let mut entry = entry_of(&w, &bob, 10_000, now, ParkReason::Unverifiable);
+    entry.round = 40;
+    write_stored(&mut app, vec![entry]).await;
+    let backup = app.backup_layered().await.unwrap();
+    let (mut restored, protocol) = restored_from(&w, &backup).await;
+    restored.receive(None).await.unwrap();
+    assert_eq!(restored.stored_id_at(10_000), None);
+    assert_eq!(protocol.released.lock().unwrap().len(), 1);
 }

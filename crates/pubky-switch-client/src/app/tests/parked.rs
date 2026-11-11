@@ -964,3 +964,27 @@ async fn test_parked_release_survives_a_backup_and_restore() {
     assert!(listed(&mut restored, entry.stored_id).await.is_some());
     next_run_is_released(&w, &mut restored, &restored_protocol, &entry).await;
 }
+
+#[tokio::test]
+async fn test_parked_release_by_an_earlier_build_still_reads_as_released() {
+    // An entry an earlier build stored as released, without the `released` field: its next
+    // run is still handed over as released.
+    let w = World::new();
+    let protocol = ParkingProtocol::new(Mode::Plain);
+    let store = Arc::clone(&w.store) as Arc<dyn StateStore>;
+    let mut app = wallet_on(&w, &protocol, Arc::clone(&store)).await;
+    let (entry, _) = uncertain(&w, &mut app).await;
+    app.release_parked(entry.stored_id, &entry.hash)
+        .await
+        .unwrap();
+    let mut stored = app.state.parked.get(&entry.stored_id).cloned().unwrap();
+    assert_eq!(stored.reason, ParkReason::Released);
+    stored.released = false;
+    let mut tx = app.tx().unwrap();
+    tx.put(&crate::app::state::key::parked(entry.stored_id), &stored)
+        .unwrap();
+    app.commit(tx).await.unwrap();
+    drop(app);
+    let mut app = load_on(&w, &protocol, store).await;
+    next_run_is_released(&w, &mut app, &protocol, &entry).await;
+}

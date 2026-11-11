@@ -72,11 +72,13 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
 - **A layered backup reads one moment:** `App::backup_layered` is several store reads in
   sequence, and they agree because the call takes `&mut self`, so no call of the app commits
   between them, and the store allows one writer per namespace (`StateStore`, rule 4), so no
-  other process does. Before those reads it takes a renewed certificate, settles a kept effect (refusing the
-  backup while a stored entry's effect stays kept, which a restore can't carry), and commits
-  the bound's drops of entries stored unverified, so it needs a writable store, and the drops stay committed if the backup is
+  other process does. Before those reads it commits the bound's drops of entries stored
+  unverified, so it needs a writable store, and the drops stay committed if the backup is
   then refused; an app halted by an alarm, left, or no longer current here skips them and
-  only reads.
+  only reads. It makes no network call: the entry a kept effect (`pending/effect`) belongs
+  to, stored or read from the feed, goes into the backup as `Uncertain`, its flags kept,
+  with the processed pair of its message, since a restore never carries the kept effect;
+  the live store keeps the effect as it is.
 
 ## Keys
 
