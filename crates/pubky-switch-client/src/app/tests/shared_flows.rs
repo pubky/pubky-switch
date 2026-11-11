@@ -4966,6 +4966,12 @@ async fn test_scripted_records_signer_and_an_app_without_a_certificate_read_none
     let key = phone_record(&s, &mut phone).await;
     let by_key = format!("records/{key}");
     let list = format!("records?collection={}", items_id(&s));
+    // The query is read before the caller: a parameter given twice is 400, the signer's
+    // included.
+    assert_eq!(
+        scripted_get(&s, None, &format!("{list}&limit=1&limit=2")),
+        (400, json!("bad_request"), true)
+    );
     // The signer reads no records.
     for rest in [&by_key, &list] {
         assert_eq!(
@@ -5008,6 +5014,8 @@ async fn test_scripted_records_query_and_key_are_read_as_the_service_reads_them(
         format!("records?collection={id}&limit=1001"),
         "records/AAAA".to_owned(),
         format!("records/{key}="),
+        format!("records?collection={id}&collection={id}"),
+        format!("records?collection={id}&limit=%zz"),
     ];
     for rest in &refused {
         assert_eq!(
@@ -5016,9 +5024,12 @@ async fn test_scripted_records_query_and_key_are_read_as_the_service_reads_them(
             "{rest}"
         );
     }
+    // Percent-decoded, as at the service.
+    let escaped = id.replace('-', "%2D").replace('_', "%5F");
     for rest in [
         format!("records?collection={id}&limit=5"),
         format!("records?collection={id}&after={key}"),
+        format!("records?collection={escaped}&limit=%35"),
     ] {
         assert_eq!(scripted_get(&s, me, &rest).0, 200, "{rest}");
     }
@@ -5393,5 +5404,68 @@ async fn test_records_read_fresh_keeps_a_copy_past_a_write_that_fails_a_check() 
             reason: KeptReason::Refused,
         } => assert_eq!(ids(record.content.value()), ["a"]),
         other => panic!("{other:?}"),
+    }
+}
+
+/// The feed's query, as the service reads it: decoded, a parameter given twice refused, and
+/// `limit` and `wait` digits only in their ranges; the signer is refused first.
+#[tokio::test]
+async fn test_scripted_feed_query_is_read_as_the_service_reads_it() {
+    let s = Setup::new();
+    let phone = s.join("phone").await;
+    let me = Some(phone.app_id());
+    for rest in [
+        "feed?after=1:0&after=1:1",
+        "feed?limit=%zz",
+        "feed?limit=+5",
+        "feed?limit=0",
+        "feed?limit=501",
+        "feed?wait=26",
+        "feed?wait=+1",
+    ] {
+        assert_eq!(
+            scripted_get(&s, me, rest),
+            (400, json!("bad_request"), true),
+            "{rest}"
+        );
+    }
+    for rest in [
+        "feed?limit=%35",
+        "feed?limit=500",
+        "feed?after=1%3A0&wait=0",
+    ] {
+        assert_eq!(scripted_get(&s, me, rest).0, 200, "{rest}");
+    }
+    assert_eq!(
+        scripted_get(&s, None, "feed?limit=1&limit=2"),
+        (403, json!("permission_missing"), true)
+    );
+}
+
+/// The peer switch reads an append's query first: decoded, a parameter given twice and a
+/// missing `apps_version` refused, before admission and the listing.
+#[tokio::test]
+async fn test_scripted_peer_append_query_is_read_first() {
+    let s = Setup::new();
+    let wallet = s.join("wallet").await;
+    for query in ["apps_version=0&apps_version=0", "apps_version=%zz", ""] {
+        let request = crate::transport::Request {
+            method: "POST".into(),
+            origin: PEER_ORIGIN.into(),
+            path_and_query: format!("/v1/{}/inbox?{query}", s.w.bob.id()),
+            headers: vec![
+                crate::transport::Header::new(
+                    pubky_switch_core::http::header::IDENTITY,
+                    &s.w.alice.id(),
+                ),
+                crate::transport::Header::new(
+                    pubky_switch_core::http::header::APP,
+                    &pubky_switch_core::enc::zbase32_encode(&wallet.app_id()),
+                ),
+            ],
+            body: Vec::new(),
+        };
+        let response = s.peer.transport().send(request).await.unwrap();
+        assert_eq!(response.status, 400, "{query}");
     }
 }

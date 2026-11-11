@@ -130,11 +130,17 @@ impl Inner {
             ("POST", "inbox") => self.append(request, Some(sender), query)?,
             ("POST", "connect") => self.connect(sender),
             // The feed, the claims, the lists and the records are read only by the
-            // account's own apps (Switch wire 7.4.4, 7.6; `crates/pubky-switch/src/service/
-            // rules.rs`, `other_app_refusal`); a batch and every call not served yet keep
-            // `not_admitted`.
+            // account's own apps, and the key bundle calls, a leave, the hand-over and the
+            // signer's calls only an own app or the signer (Switch wire 7.4, 7.6;
+            // `crates/pubky-switch/src/service/rules.rs`, `other_app_refusal`); a batch and
+            // every call not served yet keep `not_admitted`.
             ("GET", "feed" | "allow" | "records") => own_reads_only(),
             ("GET", r) if r.starts_with("claims/") || r.starts_with("records/") => own_reads_only(),
+            (method, r) if own_or_signer_call(method, r) => bad(
+                ErrorCode::PermissionMissing,
+                "7.4: a call only an own app or the signer makes",
+                json!(null),
+            ),
             _ => not_admitted(),
         })
     }
@@ -306,16 +312,22 @@ impl Inner {
         let Some(app) = app else {
             return Ok(bad(ErrorCode::BadRequest, "no app", json!(null)));
         };
+        // The query is read before the endpoint's checks, as at the service
+        // (`crates/pubky-switch/src/service/mod.rs`, `Call::Append`).
+        let Some(params) = super::parse_query(query) else {
+            return Ok(bad(
+                ErrorCode::BadRequest,
+                "the query doesn't decode",
+                json!(null),
+            ));
+        };
         // Step 1: a retry by content returns the original answer.
         if let Some(answer) = self.appended.get(&(identity, request.body.clone())) {
             return Ok((200, answer.clone()));
         }
-        let Some(sealed_for) = query
-            .split('&')
-            .find_map(|pair| match pair.split_once('=') {
-                Some(("apps_version", value)) => value.parse::<u64>().ok(),
-                _ => None,
-            })
+        let Some(sealed_for) = params
+            .get("apps_version")
+            .and_then(|value| super::decimal(value))
         else {
             return Ok(bad(ErrorCode::BadRequest, "apps_version", json!(null)));
         };
@@ -470,6 +482,30 @@ fn not_admitted() -> Answer {
     bad(ErrorCode::NotAdmitted, "not admitted", json!(null))
 }
 
+/// Whether `method` on `route` is a call only an own app or the signer makes, which the
+/// service answers an app of another identity `403 permission_missing`
+/// (`crates/pubky-switch/src/service/rules.rs`, `other_app_refusal`): the key bundle calls,
+/// a leave, the hand-over and the signer's calls (Switch wire 7.4).
+fn own_or_signer_call(method: &str, route: &str) -> bool {
+    let app_call = |name: &str| {
+        route
+            .strip_prefix("apps/")
+            .and_then(|rest| rest.strip_suffix(name))
+            .is_some_and(|app| !app.is_empty() && !app.contains('/'))
+    };
+    match method {
+        "GET" => matches!(route, "apps" | "handover") || app_call("/keys"),
+        "POST" => {
+            matches!(route, "recovery/admission" | "erase")
+                || app_call("/keys")
+                || app_call("/leave")
+                || app_call("/revoke")
+        }
+        "PUT" => matches!(route, "identity" | "handover"),
+        _ => false,
+    }
+}
+
 /// `403 permission_missing` to an app of another identity at a read only own apps make.
 fn own_reads_only() -> Answer {
     bad(
@@ -575,6 +611,71 @@ mod tests {
                 "{method} {rest}"
             );
         }
+    }
+
+    #[test]
+    fn test_scripted_other_identity_at_own_app_and_signer_calls_is_refused() {
+        // `403 permission_missing` at every call only an own app or the signer makes, as
+        // at the service (`crates/pubky-switch/src/service/rules.rs`, `other_app_refusal`).
+        let (switch, cert) = switch_and_stranger();
+        let mut inner = switch.lock();
+        let sender = Sender {
+            identity: cert.identity(),
+            app: Some(cert.app_id()),
+            code: None,
+        };
+        let app = zbase32_encode(&cert.app_id());
+        let calls = [
+            ("GET", format!("apps/{app}/keys")),
+            ("POST", format!("apps/{app}/keys")),
+            ("POST", format!("apps/{app}/leave")),
+            ("POST", format!("apps/{app}/revoke")),
+            ("GET", "apps".to_owned()),
+            ("GET", "handover".to_owned()),
+            ("PUT", "handover".to_owned()),
+            ("PUT", "identity".to_owned()),
+            ("POST", "recovery/admission".to_owned()),
+            ("POST", "erase".to_owned()),
+        ];
+        for (method, rest) in calls {
+            let request = foreign(method, &format!("/{rest}"), &cert);
+            let (status, body) = inner.route_foreign(&request, &sender, &rest).unwrap();
+            assert_eq!(
+                (status, &body["code"]),
+                (403, &json!("permission_missing")),
+                "{method} {rest}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_scripted_append_query_is_read_before_admission() {
+        // The query is decoded, and a parameter given twice refused, before any check of
+        // the append, as at the service (Switch wire 7.1): a stranger gets `400`, not `403
+        // not_admitted`.
+        let (switch, cert) = switch_and_stranger();
+        let mut inner = switch.lock();
+        let sender = Sender {
+            identity: cert.identity(),
+            app: Some(cert.app_id()),
+            code: None,
+        };
+        for rest in [
+            "inbox?apps_version=0&apps_version=0",
+            "inbox?apps_version=%zz",
+        ] {
+            let request = foreign("POST", &format!("/{rest}"), &cert);
+            let (status, body) = inner.route_foreign(&request, &sender, rest).unwrap();
+            assert_eq!(
+                (status, &body["code"]),
+                (400, &json!("bad_request")),
+                "{rest}"
+            );
+        }
+        let rest = "inbox?apps_version=%30";
+        let request = foreign("POST", &format!("/{rest}"), &cert);
+        let (_, body) = inner.route_foreign(&request, &sender, rest).unwrap();
+        assert_eq!(body["code"], json!("not_admitted"), "decoded, then judged");
     }
 
     #[test]
