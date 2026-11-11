@@ -43,10 +43,16 @@ impl UploadVersion {
 
     /// The lower bound of a write without a proof: the least version of the operation's own
     /// generation above the one it built on, `expected_version` (Switch wire 7.4.14). `None`
-    /// when it built on a later generation than its own, which no service applies.
+    /// when it built on a later generation than its own, which no service applies, or when
+    /// the bound would be past 2^53 - 1, which no record view carries and no operation names
+    /// (Switch wire 1.1).
     pub fn bound(op_generation: u64, built_on: RecordVersion) -> Option<Self> {
         let version = if built_on.generation == op_generation {
-            RecordVersion::new(op_generation, built_on.version.checked_add(1)?)
+            let next = built_on.version.checked_add(1)?;
+            if next > crate::json::MAX_INT {
+                return None;
+            }
+            RecordVersion::new(op_generation, next)
         } else if built_on.generation < op_generation {
             RecordVersion::new(op_generation, 1)
         } else {

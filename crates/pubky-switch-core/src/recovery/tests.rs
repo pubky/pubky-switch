@@ -63,6 +63,18 @@ fn written_on(base: Option<(RecordVersion, [u8; 32])>, divergent: &[[u8; 32]]) -
 const KEPT: RecordMerge = RecordMerge::Divergent { kept: true };
 
 #[test]
+fn test_recovery_record_bound_past_the_integer_range_is_none() {
+    // A bound past 2^53 - 1 no record view carries (Switch wire 1.1): the operation counts
+    // as unverified, never as a record no reader can read.
+    let last = crate::json::MAX_INT;
+    assert_eq!(UploadVersion::bound(3, v(3, last)), None);
+    assert_eq!(
+        UploadVersion::bound(3, v(3, last - 1)).map(|b| b.version),
+        Some(v(3, last))
+    );
+}
+
+#[test]
 fn test_recovery_record_bound_is_the_least_version_above_its_base() {
     assert_eq!(bound(3, v(3, 9)).version, v(3, 10));
     // Built on an earlier generation's version, or on none.

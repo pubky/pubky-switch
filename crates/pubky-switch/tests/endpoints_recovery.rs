@@ -14,8 +14,10 @@ use pubky_switch::http::{Handler, SwitchResponse};
 use pubky_switch::keys::{KeyId, KeyStore};
 use pubky_switch::time::Clock;
 use pubky_switch_core::{
+    claims::{ClaimFields, ClaimType},
     http::{IdentityDelivery, header},
     keys::IdentityKey,
+    ops::{OpKind, RecordPut, RecordVersion, SignedOp},
     records::{Enrollment, EnrollmentBody, IdentityBody, IdentityDoc},
     sig::SignedDoc,
     time::rfc3339,
@@ -2267,5 +2269,348 @@ async fn test_upload_judged_before_the_lock_is_judged_again_when_its_state_chang
         (result["records"].clone(), result["distrusted"].clone()),
         (json!([]), json!(1))
     );
+    replay.db.drop_database().await.expect("drop");
+}
+
+/// The operation at `seq` of the vectors' chain.
+fn vector_op(seq: u64) -> SignedOp {
+    let signed: SignedDoc =
+        serde_json::from_value(chain_item(&vectors("chain.json"), seq)["item"].clone())
+            .expect("op");
+    SignedOp::peek(&signed).expect("op")
+}
+
+/// The members of the vectors' claim attempt (seq 7).
+#[allow(clippy::panic)]
+fn vector_claim_fields() -> ClaimFields {
+    let OpKind::Claim(fields) = vector_op(7).body().kind.clone() else {
+        panic!("a claim")
+    };
+    fields
+}
+
+/// The members of the vectors' record update (seq 8).
+#[allow(clippy::panic)]
+fn vector_record_put() -> RecordPut {
+    let OpKind::RecordPut(put) = vector_op(8).body().kind.clone() else {
+        panic!("a record.put")
+    };
+    put
+}
+
+async fn wallet_ops(replay: &Replay, batch: &[SignedOp], at: u64) -> SwitchResponse {
+    let body = pubky_switch_core::ops::OpsRequest::new(batch, None).to_json();
+    let path = format!("/v1/{}/ops", alice_id());
+    replay
+        .service
+        .handle(app_request(&wallet_keys(), "POST", &path, body, at))
+        .await
+}
+
+/// `op` uploaded with the wallet's certificate and no proof.
+fn proofless(op: &SignedOp) -> Value {
+    json!({ "op": op.signed(), "cert": wallet().2.signed() })
+}
+
+/// The wallet's live attempt `[9; 16]` at the vectors' claim key, orphaned only after
+/// 1,000,000 s: the claim's key.
+async fn live_attempt(replay: &Replay, at: u64) -> (ClaimFields, String) {
+    let mut fields = vector_claim_fields();
+    fields.attempt_id = vec![9; 16];
+    fields.expected_step = 0;
+    fields.deadline = None;
+    fields.orphan_after = Some(1_000_000);
+    let batch = wallet_batch(91, 2, vec![(Vec::new(), OpKind::Claim(fields.clone()))]);
+    let written = wallet_ops(replay, &batch, at).await;
+    assert_eq!(
+        written.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&written.body)
+    );
+    let key = pubky_switch_core::enc::b64(&fields.claim_key);
+    (fields, key)
+}
+
+#[tokio::test]
+async fn test_upload_claim_changed_last_by_an_upload_lists_a_gap_at_its_end() {
+    // The wallet writes an attempt here for a claim the service held nothing for (step 0 to
+    // 1); an upload then adds another attempt beside it (divergent, step 1 to 2). GET /claims
+    // lists the one entry, at step 0, and the claim at step 2: the upload's step has no
+    // entry (Switch wire 7.4.8).
+    let Some(replay) = replay().await else { return };
+    let (_, at) = recovered_with_the_wallet(&replay).await;
+    let (fields, key) = live_attempt(&replay, at).await;
+    let mut uploaded = fields;
+    uploaded.attempt_id = vec![10; 16];
+    let lost_op = wallet_batch(92, 1, vec![(Vec::new(), OpKind::Claim(uploaded))]);
+    let answer = upload(&replay, &json!({ "claims": [proofless(&lost_op[0])] }), at).await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    assert_eq!(json_of(&answer)["result"]["divergent_claims"], json!([key]));
+    let read = wallet_get(&replay, &format!("claims/{key}"), at).await;
+    let entries = read["entries"].as_array().expect("entries");
+    assert_eq!(entries.len(), 1, "{read}");
+    let last = entries[0]["step"].as_u64().expect("step");
+    assert_eq!(
+        (last, read["claim"]["step"].as_u64()),
+        (0, Some(2)),
+        "{read}"
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_upload_known_limit_an_inflated_bound_replaces_a_proved_record() {
+    // A known limit (Switch spec 19): a proofless operation built on (1, 1,000,000), never
+    // applied anywhere, replaces the record held at the proved (1, 8), which is kept
+    // nowhere; the proved upload again then changes nothing.
+    let Some(replay) = replay().await else { return };
+    let (lost, at) = recovered_with_the_wallet(&replay).await;
+    let honest = json!({
+        "lost_identity": lost.signed(),
+        "records": [uploaded_op(6, Some(CREATED)), uploaded_op(8, Some(UPDATED))],
+    });
+    assert_eq!(upload(&replay, &honest, at).await.status, 200);
+    let (record, _) = record_and_claim_keys();
+    let mut put = vector_record_put();
+    put.expected_version = RecordVersion::new(1, 1_000_000);
+    let forged = wallet_batch(93, 1, vec![(Vec::new(), OpKind::RecordPut(put))]);
+    let answer = upload(&replay, &json!({ "records": [proofless(&forged[0])] }), at).await;
+    let result = json_of(&answer)["result"].clone();
+    assert_eq!(
+        (result["records"].clone(), result["divergent"].clone()),
+        (json!([record]), json!([]))
+    );
+    let view = wallet_get(&replay, &format!("records/{record}"), at).await;
+    assert_eq!(
+        (view["version"].clone(), view["divergent"].clone()),
+        (json!(1_000_001), json!(false))
+    );
+    let again = json_of(&upload(&replay, &honest, at).await)["result"].clone();
+    assert_eq!(
+        (again["records"].clone(), again["divergent"].clone()),
+        (json!([]), json!([]))
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_upload_known_limit_another_policy_uploaded_first_holds_the_key() {
+    // A known limit (Switch spec 19): at a key the service lacks, a proofless operation with
+    // another policy the uploader's certificate satisfies (an extra write scope; not a create,
+    // so no key derivation binds it) fills the record. The honest proved writes are then
+    // divergent, and a live write with the record's real policy is refused.
+    let Some(replay) = replay().await else { return };
+    let (lost, at) = recovered_with_the_wallet(&replay).await;
+    let (record, _) = record_and_claim_keys();
+    let mut put = vector_record_put();
+    let real_policy = put.policy.clone();
+    let mut scopes = put.policy.write_scopes.clone();
+    scopes.push("zzz".into());
+    scopes.sort();
+    put.policy.write_scopes = scopes;
+    let forged = wallet_batch(94, 1, vec![(Vec::new(), OpKind::RecordPut(put))]);
+    let answer = upload(&replay, &json!({ "records": [proofless(&forged[0])] }), at).await;
+    assert_eq!(
+        json_of(&answer)["result"]["records"],
+        json!([record]),
+        "{}",
+        json_of(&answer)
+    );
+    let honest = json!({
+        "lost_identity": lost.signed(),
+        "records": [uploaded_op(6, Some(CREATED)), uploaded_op(8, Some(UPDATED))],
+    });
+    let answer = upload(&replay, &honest, at).await;
+    assert_eq!(
+        json_of(&answer)["result"]["divergent"],
+        json!([record]),
+        "{}",
+        json_of(&answer)
+    );
+    let view = wallet_get(&replay, &format!("records/{record}"), at).await;
+    let mut write = vector_record_put();
+    write.policy = real_policy;
+    write.expected_version = RecordVersion::new(
+        view["generation"].as_u64().expect("generation"),
+        view["version"].as_u64().expect("version"),
+    );
+    let batch = |id: u8, write: &RecordPut| {
+        wallet_batch(id, 2, vec![(Vec::new(), OpKind::RecordPut(write.clone()))])
+    };
+    let mut answer = wallet_ops(&replay, &batch(95, &write), at).await;
+    if code(&answer).1 == "stale_epoch" {
+        let epoch = json_of(&answer)["current"]["data_epoch"]
+            .as_u64()
+            .expect("epoch");
+        write.value_sealed.data_epoch = epoch;
+        answer = wallet_ops(&replay, &batch(96, &write), at).await;
+    }
+    assert_eq!(
+        code(&answer),
+        (400, "bad_request".into()),
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_upload_known_limit_a_proofless_unknown_applies_to_a_live_attempt() {
+    // A known limit (Switch spec 19): the wallet's live attempt, orphaned only in
+    // 1,000,000 s, refuses a live `unknown`; the same `unknown`, uploaded as an operation of
+    // the lost generation without a proof, applies: the attempt is `unknown`, the claim FREE.
+    let Some(replay) = replay().await else { return };
+    let (_, at) = recovered_with_the_wallet(&replay).await;
+    let (fields, key) = live_attempt(&replay, at).await;
+    let mut unknown = fields;
+    unknown.kind = ClaimType::Unknown;
+    unknown.expected_step = 1;
+    unknown.orphan_after = None;
+    let live_batch = wallet_batch(92, 2, vec![(Vec::new(), OpKind::Claim(unknown.clone()))]);
+    let live = wallet_ops(&replay, &live_batch, at).await;
+    assert_eq!(
+        code(&live),
+        (409, "conflict".into()),
+        "{}",
+        String::from_utf8_lossy(&live.body)
+    );
+    let lost_op = wallet_batch(93, 1, vec![(Vec::new(), OpKind::Claim(unknown))]);
+    let answer = upload(&replay, &json!({ "claims": [proofless(&lost_op[0])] }), at).await;
+    assert_eq!(
+        json_of(&answer)["result"]["claims"],
+        json!([key]),
+        "{}",
+        json_of(&answer)
+    );
+    let read = wallet_get(&replay, &format!("claims/{key}"), at).await;
+    assert_eq!(read["claim"]["state"], json!("FREE"), "{read}");
+    assert_eq!(
+        read["claim"]["attempts"][0]["outcome"],
+        json!("unknown"),
+        "{read}"
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_upload_bound_past_the_integer_range_is_unverified() {
+    // A proofless operation built on (1, 2^53 - 1): its bound would be past what a record
+    // view carries (Switch wire 1.1), so it is unverified and the service holds no record.
+    let Some(replay) = replay().await else { return };
+    let (_, at) = recovered_with_the_wallet(&replay).await;
+    let mut put = vector_record_put();
+    put.expected_version = RecordVersion::new(1, (1u64 << 53) - 1);
+    let key = pubky_switch_core::enc::b64(&put.key);
+    let forged = wallet_batch(97, 1, vec![(Vec::new(), OpKind::RecordPut(put))]);
+    let answer = upload(&replay, &json!({ "records": [proofless(&forged[0])] }), at).await;
+    assert_eq!(answer.status, 200);
+    let result = &json_of(&answer)["result"];
+    assert_eq!(
+        (result["records"].clone(), result["unverified"].clone()),
+        (json!([]), json!(1))
+    );
+    let path = format!("/v1/{}/records/{key}", alice_id());
+    let read = replay
+        .service
+        .handle(app_request(&wallet_keys(), "GET", &path, Vec::new(), at))
+        .await;
+    assert_eq!(code(&read), (404, "not_found".into()));
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_upload_refusals_order_and_the_rate_slot() {
+    // `404` before `400` at an account in neither stage; after the loss a `400` takes no
+    // slot of `uploads_per_app_per_hour`, an app not current here is `403 not_current`, and
+    // the one slot then goes to the first upload that reads.
+    let limits = pubky_switch::limits::Limits {
+        uploads_per_app_per_hour: 1,
+        ..pubky_switch::limits::Limits::default()
+    };
+    let Some(replay) = replay_with(limits.clone()).await else {
+        return;
+    };
+    let (_, at) = serving_with_a_pending_key(&replay).await;
+    let (status, body) = wallet_registers(&replay, 76, 1, 1, false, at).await;
+    assert_eq!(status, 200, "{body}");
+    let path = format!("/v1/{}/recovery/upload", alice_id());
+    let raw = |bytes: &[u8], at| app_request(&wallet_keys(), "POST", &path, bytes.to_vec(), at);
+    assert_eq!(
+        code(&replay.service.handle(raw(b"not json", at)).await),
+        (404, "not_found".into())
+    );
+    replay.db.drop_database().await.expect("drop");
+    let Some(replay) = replay_with(limits).await else {
+        return;
+    };
+    let (_, at) = recovered_with_the_wallet(&replay).await;
+    for _ in 0..2 {
+        let refused = replay.service.handle(raw(b"not json", at)).await;
+        assert_eq!(code(&refused), (400, "bad_request".into()));
+    }
+    let keys = vectors("keys.json");
+    let executor = app(&keys, "executor").clone();
+    let not_current = upload_as(&replay, &executor, &json!({}), at).await;
+    assert_eq!(code(&not_current), (403, "not_current".into()));
+    assert_eq!(upload(&replay, &json!({}), at).await.status, 200);
+    assert_eq!(
+        code(&upload(&replay, &json!({}), at).await),
+        (429, "rate_limited".into())
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_upload_large_body_leaves_the_lock_to_other_requests() {
+    // An upload of about 15 MiB of heads, all verified with the lost key: its items are
+    // judged before the account's lock, so writes sent while it is judged don't wait for it.
+    let Some(replay) = replay().await else { return };
+    let (lost, at) = recovered_with_the_wallet(&replay).await;
+    let replay = std::sync::Arc::new(replay);
+    let head = vectors("chain.json")["signed_heads"][0]["head"].clone();
+    let one_head = serde_json::to_vec(&head).expect("json").len();
+    let heads: Vec<Value> = (0..(15 * 1024 * 1024 / (one_head + 1)))
+        .map(|_| head.clone())
+        .collect();
+    let count = heads.len();
+    let body = json!({ "lost_identity": lost.signed(), "heads": heads });
+    let writes = {
+        let replay = std::sync::Arc::clone(&replay);
+        tokio::spawn(async move {
+            let mut waits = Vec::new();
+            for i in 0..6u8 {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                let mut fields = vector_claim_fields();
+                fields.attempt_id = vec![9; 16];
+                fields.expected_step = 0;
+                fields.deadline = None;
+                fields.claim_key = vec![60 + i; 32];
+                let batch = wallet_batch(120 + i, 2, vec![(Vec::new(), OpKind::Claim(fields))]);
+                let sent = std::time::Instant::now();
+                let written = wallet_ops(&replay, &batch, at).await;
+                assert_eq!(written.status, 200);
+                waits.push(sent.elapsed());
+            }
+            waits
+        })
+    };
+    let started = std::time::Instant::now();
+    let answer = upload(&replay, &body, at).await;
+    let took = started.elapsed();
+    let waits = writes.await.expect("writes");
+    assert_eq!(answer.status, 200);
+    assert_eq!(json_of(&answer)["result"]["heads"], json!(count));
+    let longest = waits.iter().max().copied().unwrap_or_default();
+    assert!(
+        longest * 2 < took,
+        "a write waited {longest:?} of the upload's {took:?}"
+    );
+    let replay = std::sync::Arc::try_unwrap(replay).ok().expect("one owner");
     replay.db.drop_database().await.expect("drop");
 }
