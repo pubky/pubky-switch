@@ -211,22 +211,37 @@ async fn test_allow_shows_each_list_whole() {
     wallet_op(&replay, put_code(CODE, ms(&at()) + 3_600_000, 2), 62).await;
     wallet_op(
         &replay,
-        put_code("expiredcodexxxxxxxxxxx", ms(&at()) + 1, 1),
+        put_code("AAAAAAAAAAAAAAAAAAAAAA", ms(&at()) + 1, 1),
         63,
     )
     .await;
     wallet_op(
         &replay,
-        put_code("usedupcodexxxxxxxxxxxx", ms(&at()) + 3_600_000, 1),
+        put_code("BBBBBBBBBBBBBBBBBBBBBA", ms(&at()) + 3_600_000, 1),
         64,
     )
     .await;
-    sql(
-        &replay,
-        "UPDATE invite_codes SET uses = max_uses WHERE account_id = $1 AND max_uses = 1 \
-         AND expires_at_ms > (SELECT min(expires_at_ms) FROM invite_codes WHERE account_id = $1)",
-    )
-    .await;
+    // The second expired, the third used up.
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    for (code, change) in [
+        ("AAAAAAAAAAAAAAAAAAAAAA", "expires_at_ms = 0"),
+        ("BBBBBBBBBBBBBBBBBBBBBA", "uses = max_uses"),
+    ] {
+        sqlx::query(&format!(
+            "UPDATE invite_codes SET {change} WHERE account_id = $1 AND code_hash = $2"
+        ))
+        .bind(alice_id())
+        .bind(
+            pubky_switch_core::ident::invite_code_hash(code)
+                .expect("hash")
+                .as_slice(),
+        )
+        .execute(&mut conn)
+        .await
+        .expect("code");
+    }
     // A conversation entry the service writes when the code admits bob's shop, then used
     // by a second append: it carries the code's hash and context, and its last use.
     wallet_op(
