@@ -84,11 +84,11 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   and keep nothing for it; they don't check the certificate's expiry (the service answers
   `403 cert_expired`), take any body, and answer `404` ("no route") for another app's path or
   the signer, where the service answers `403 permission_missing` (Switch wire 7.4.11).
-- **`POST /v1/enroll`** (Switch wire 3.7, 7.4.1), in `switch/signer.rs`: only at
-  [`SWITCH_ORIGIN`], with the default limits unless a test sets others
-  (`set_enroll_limits`), and without checking the request signature. A
-  switch made with `unenrolled` answers every other call with the operator's `404` until
-  then. As at the service, the enrollment that makes the account sets its kept App IDs, and
+- **`POST /v1/enroll`** (Switch wire 3.7, 7.4.1), in `switch/signer.rs`: at the switch's
+  origin, [`SWITCH_ORIGIN`] unless it was made with `unenrolled_at`, with the default limits
+  unless a test sets others (`set_enroll_limits`), and without checking the request
+  signature. A switch made with `unenrolled` or `unenrolled_at` answers every other call
+  with the operator's `404` until then. As at the service, the enrollment that makes the account sets its kept App IDs, and
   every later one gets the same key and changes nothing. Unlike the service:
   - an enrollment's `identity_doc` isn't held, so the account starts with no document and
     at the switch's own generation, whatever the enrollment names;
@@ -112,7 +112,7 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
     `cert_expires_at` carries that, and a signer that serves an app checks both. An app with
     no record is current while it is listed and not kept;
   - `last_seen`: the time of the app's latest request past authentication, a staged
-    account's refusal included. The scripted switch doesn't authenticate an own app's
+    account's refusal and its `leave` included. The scripted switch doesn't authenticate an own app's
     requests one by one: it takes any app with a record that isn't revoked, departed or kept
     as authenticated. So, unlike the service, it counts an app whose certificate expired or
     isn't listed, which the service refuses at authentication (`cert_expired`,
@@ -138,7 +138,8 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   `lagging` is false, as on the service. The test call `forget_bundle_parts` scripts a faulty service
   that lost an app's stored parts.
 - **Moves and recovery** (Switch spec 12.5, 12.6, Switch wire 10): `import_into` copies the
-  account in memory, with no manifest, chunks or export transfer; a recovery upload is kept
+  account in memory, with no manifest, chunks or export transfer, to serve at the origin the
+  freeze names (`import_into_at` names one for a move a test scripts without a freeze); a recovery upload is kept
   and answered with fixed changes, merging nothing.
 - **Revocation** is `POST /apps/{app_id}/revoke` from the signer, and the test call
   `revoke`; an app that left is answered as one revoked already, with no proof. `leave` is a

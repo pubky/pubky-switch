@@ -1459,3 +1459,29 @@ async fn test_erase_retries_sweep_a_few_times_a_minute() {
     );
     replay.db.drop_database().await.expect("drop");
 }
+
+#[tokio::test]
+async fn test_erase_deferred_allow_read_isnt_signed_with_its_key() {
+    // A `GET /allow` whose lists are read once the lock is gone, after an erasure: as for an
+    // account the service doesn't host, never signed with the erased key (7.4.16).
+    let Some(mut replay) = replay().await else {
+        return;
+    };
+    let gate = gated(&mut replay, true);
+    replay_chain_through_revoke(&replay).await;
+    gate.arm(0);
+    let keys = vectors("keys.json");
+    let request = app_request(
+        app(&keys, "wallet"),
+        "GET",
+        &format!("/v1/{}/allow", alice_id()),
+        Vec::new(),
+        ms(&revoke_time()),
+    );
+    let request_signature = signature_of(&request);
+    let answer = erased_meanwhile(&replay, &gate, request).await;
+    assert_eq!(code_of(&answer), (404, json!("not_found")));
+    assert!(no_head(&answer));
+    assert!(operator_signed(&answer, Some(&request_signature)));
+    replay.db.drop_database().await.expect("drop");
+}

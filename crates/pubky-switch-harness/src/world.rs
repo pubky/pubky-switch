@@ -253,6 +253,12 @@ impl World {
         IdentityKeyring::open(vault).map_err(|error| HarnessError::Setup(error.to_string()))
     }
 
+    /// An empty vault, as on an install that doesn't hold the identity's key yet: a signer
+    /// taking the identity over puts the secret there once its take-over has won.
+    pub fn empty_vault(&self) -> Arc<dyn SecretVault> {
+        Arc::new(MemoryVault(Mutex::new(None)))
+    }
+
     /// The environment of an app on `store`: this world's transport, clock and Homeservers.
     pub fn app_env(&self, store: Arc<dyn StateStore>) -> AppEnv {
         AppEnv {

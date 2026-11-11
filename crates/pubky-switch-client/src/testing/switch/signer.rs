@@ -43,11 +43,23 @@ impl ScriptedSwitch {
         service_secret: [u8; 32],
         clock: Arc<TestClock>,
     ) -> Arc<Self> {
+        Self::unenrolled_at(identity, service_secret, clock, SWITCH_ORIGIN)
+    }
+
+    /// [`ScriptedSwitch::unenrolled`], at `origin`: the origin an enrollment must name, so
+    /// two signers can enroll at two scripted switches of different origins.
+    pub fn unenrolled_at(
+        identity: &pubky_switch_core::keys::IdentityKey,
+        service_secret: [u8; 32],
+        clock: Arc<TestClock>,
+        origin: &str,
+    ) -> Arc<Self> {
         let switch = Self::new(identity, service_secret, clock);
         {
             let mut inner = switch.lock();
             inner.enrolled = None;
             inner.staged = true;
+            inner.origin = origin.to_owned();
         }
         switch
     }
@@ -137,7 +149,7 @@ impl Inner {
         else {
             return Ok(bad(ErrorCode::BadRequest, "no enrollment", json!(null)));
         };
-        let enrollment = match Enrollment::verify(&signed, &identity, SWITCH_ORIGIN) {
+        let enrollment = match Enrollment::verify(&signed, &identity, &self.origin) {
             Ok(enrollment) => enrollment,
             Err(_) => return Ok(bad(ErrorCode::BadRequest, "bad enrollment", json!(null))),
         };
@@ -174,13 +186,18 @@ impl Inner {
     }
 
     /// Chain a delivered `identity.json` and hold it; returns the delivery's transition
-    /// proof. A document naming this switch's service key makes a staged switch serve, and
+    /// proof. A document naming this switch's origin and service key makes a staged switch
+    /// serve, and
     /// one at a later generation moves the chain on to it (Switch wire 6.5 "Import").
     pub(super) fn chain_identity(&mut self, doc: &IdentityDoc) -> Result<SignedDoc, ScriptError> {
         if doc.generation() > self.tip.generation {
             self.tip.generation = doc.generation();
         }
-        if doc.inbox().service_key == self.service.verifying_key().to_bytes() {
+        // The staged gate: the document names this service, its origin and its key
+        // (Switch wire 3.7, 7.3 step 7).
+        if doc.inbox().url == self.origin
+            && doc.inbox().service_key == self.service.verifying_key().to_bytes()
+        {
             self.staged = false;
         }
         let bytes = doc.signed().doc_bytes()?;
@@ -197,7 +214,7 @@ impl Inner {
             None,
             "identity",
             &state,
-            None,
+            super::Readers::Every,
         )?;
         // A first listing is kept, as the service keeps it, only for an app with no row and
         // no stored part yet; any other's holdings start unknown (Switch wire 7.4.12).
@@ -258,7 +275,7 @@ impl Inner {
             held: self.doc.as_ref(),
             app_limit,
             staged: self.staged,
-            origin: SWITCH_ORIGIN,
+            origin: &self.origin,
             pending_key: None,
             kept_app_ids: &kept,
             kept_proofs: KeptProofs {

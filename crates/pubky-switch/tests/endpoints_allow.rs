@@ -475,3 +475,454 @@ async fn test_allow_needs_lists_read() {
     assert!(header_text(&answer, "switch-head").is_none());
     replay.db.drop_database().await.expect("drop");
 }
+
+async fn stamped_time(replay: &Replay) -> i64 {
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    sqlx::query_scalar("SELECT stamped_time_ms FROM accounts WHERE id = $1")
+        .bind(alice_id())
+        .fetch_one(&mut conn)
+        .await
+        .expect("stamp")
+}
+
+#[tokio::test]
+async fn test_allow_long_read_holds_no_lock_and_shows_the_stamped_state() {
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    // 100,000 conversation entries with a full context: a read of several seconds.
+    sql(
+        &replay,
+        "INSERT INTO list_entries (account_id, list, pubky, written_by, at_ms, code_hash, context) \
+         SELECT $1, 'conversation', decode(lpad(to_hex(g), 64, '0'), 'hex'), NULL, 0, \
+         decode(repeat('cd', 32), 'hex'), convert_to('{\"note\":\"' || repeat('x', 1000) || '\"}', 'UTF8') \
+         FROM generate_series(1, 100000) g",
+    )
+    .await;
+    let read_at = pubky_switch_core::time::rfc3339(ms(&at()) + 60_000);
+    set_time(&replay.clock, &read_at);
+    let read_ms = i64::try_from(ms(&read_at)).expect("time");
+    let phone = app(&vectors("keys.json"), "phone")["app_id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    // The read waits once its request has committed its stamp, so its lock is gone.
+    let pause = replay.db.pause_next_snapshot_read();
+    let (answer, ()) = tokio::join!(read_as(&replay, "wallet", &read_at), async {
+        tokio::time::timeout(std::time::Duration::from_secs(10), pause.reached.notified())
+            .await
+            .expect("the read reached its pause once its request committed");
+        assert_eq!(
+            stamped_time(&replay).await,
+            read_ms,
+            "the read's stamp is committed"
+        );
+        // A revocation by the signer and a write by an own app each take the lock: they
+        // don't wait for the read, which goes on only once they are done.
+        let ten = std::time::Duration::from_secs(10);
+        let revoke = tokio::time::timeout(
+            ten,
+            replay.service.handle(signer_request(
+                "POST",
+                &format!("/v1/{}/apps/{phone}/revoke", alice_id()),
+                Vec::new(),
+                ms(&read_at),
+            )),
+        )
+        .await
+        .expect("the revocation doesn't wait for the read");
+        assert_eq!(
+            revoke.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&revoke.body)
+        );
+        tokio::time::timeout(
+            ten,
+            wallet_op(&replay, put_code(CODE, ms(&read_at) + 3_600_000, 1), 90),
+        )
+        .await
+        .expect("the write doesn't wait for the read");
+        pause.resume.notify_one();
+    });
+    assert_eq!(answer.status, 200);
+    // The answer is the state at its stamped time: the code written after it isn't in it.
+    let lists = body(&answer);
+    assert_eq!(lists["invite_codes"], json!([]));
+    assert_eq!(
+        lists["conversations"].as_array().map(Vec::len),
+        Some(100_000)
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_allow_reads_the_state_under_the_lock_not_after() {
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let read_at = pubky_switch_core::time::rfc3339(ms(&at()) + 60_000);
+    set_time(&replay.clock, &read_at);
+    // The read waits once its request has committed; a code committed then isn't in it,
+    // since it reads the state under the lock, at the stamped time. The whole exchange is
+    // bounded: a read that paused under the lock would hold the row the insert waits for.
+    let pause = replay.db.pause_next_snapshot_read();
+    let exchange = async {
+        tokio::join!(read_as(&replay, "wallet", &read_at), async {
+            tokio::time::timeout(std::time::Duration::from_secs(10), pause.reached.notified())
+                .await
+                .expect("the read reached its pause once its request committed");
+            sql(
+                &replay,
+                "INSERT INTO invite_codes (account_id, code_hash, max_uses, uses, writer, \
+             expires_at_ms, context) VALUES ($1, decode(repeat('ee', 32), 'hex'), 1, 0, \
+             decode(repeat('ab', 16), 'hex'), 9000000000000, convert_to('null', 'UTF8'))",
+            )
+            .await;
+            pause.resume.notify_one();
+        })
+    };
+    let (answer, ()) = tokio::time::timeout(std::time::Duration::from_secs(30), exchange)
+        .await
+        .expect("the read and the insert ended");
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    assert_eq!(
+        header_text(&answer, "switch-server-time"),
+        Some(read_at.as_str())
+    );
+    assert_eq!(body(&answer)["invite_codes"], json!([]));
+    replay.db.drop_database().await.expect("drop");
+}
+
+/// The executor registers at alice's account: an own app without `lists.read`.
+async fn register_executor(replay: &Replay) {
+    let keys = vectors("keys.json");
+    let executor = app(&keys, "executor");
+    let ops = sign_batch(
+        &AppKeys::from_secrets(
+            hex32(&executor["signing_secret_hex"]),
+            hex32(&executor["bundle_secret_hex"]),
+        ),
+        &hex32(&alice(&keys)["public_hex"]),
+        Some(
+            pubky_switch_core::enc::app_id_decode(executor["app_id"].as_str().expect("id"))
+                .expect("app id"),
+        ),
+        1,
+        [80; 16],
+        vec![(
+            Vec::new(),
+            OpKind::AppPut {
+                record: doc("executor app record"),
+            },
+        )],
+    )
+    .expect("batch");
+    let answer = replay
+        .service
+        .handle(app_request(
+            executor,
+            "POST",
+            &format!("/v1/{}/ops", alice_id()),
+            OpsRequest::new(&ops, None).to_json(),
+            ms(&at()),
+        ))
+        .await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+}
+
+/// Wait, at most ten seconds, until `n` reads of alice's account hold or wait for its turn.
+async fn until_queued(replay: &Replay, n: usize) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while replay.db.queued_reads(&alice_id()) != n {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{n} reads never queued"
+        );
+        tokio::task::yield_now().await;
+    }
+}
+
+#[tokio::test]
+async fn test_allow_reads_of_an_account_wait_their_turn() {
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    register_executor(&replay).await;
+    let keys = vectors("keys.json");
+    let now = at();
+    let pause = replay.db.pause_next_snapshot_read();
+    let exchange = async {
+        tokio::join!(
+            read_as(&replay, "wallet", &now),
+            async {
+                tokio::time::timeout(std::time::Duration::from_secs(10), pause.reached.notified())
+                    .await
+                    .expect("the first read reached its pause");
+                // While it is in flight, another app's read of the account waits its turn.
+                read_as(&replay, "executor", &now).await
+            },
+            async {
+                // The first holds the account's turn, the second waits for it.
+                until_queued(&replay, 2).await;
+                // The wallet holds its one place: its second read is refused at once.
+                let again = read_as(&replay, "wallet", &now).await;
+                assert_eq!(code_of(&again), (503, json!("unavailable")));
+                // Neither an app of another identity, nor the signer, nor the directory
+                // waits behind it or takes a place in the queue.
+                let foreign = from_shop(&replay, "GET", &allow_path(), Vec::new(), None).await;
+                assert_eq!(code_of(&foreign), (403, json!("not_admitted")));
+                let signer = replay
+                    .service
+                    .handle(signer_request("GET", &allow_path(), Vec::new(), ms(&now)))
+                    .await;
+                assert_eq!(code_of(&signer), (403, json!("permission_missing")));
+                let directory = replay
+                    .service
+                    .handle(app_request(
+                        app(&keys, "wallet"),
+                        "GET",
+                        &format!("/v1/{}/directory", alice_id()),
+                        Vec::new(),
+                        ms(&now),
+                    ))
+                    .await;
+                assert_eq!(directory.status, 200);
+                assert_eq!(replay.db.queued_reads(&alice_id()), 2);
+                pause.resume.notify_one();
+            }
+        )
+    };
+    let (first, second, ()) = tokio::time::timeout(std::time::Duration::from_secs(30), exchange)
+        .await
+        .expect("both reads ended");
+    assert_eq!(first.status, 200);
+    // The executor's turn came, and under the lock it is refused: it lacks lists.read.
+    assert_eq!(code_of(&second), (403, json!("permission_missing")));
+    assert_eq!(replay.db.queued_reads(&alice_id()), 0);
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_allow_waits_for_a_reader_without_the_lock() {
+    use pubky_switch::keys::KeyStore;
+    let config = pubky_switch::store::DatabaseConfig {
+        snapshot_readers: 1,
+        ..Default::default()
+    };
+    let Some(replay) = replay_with_database(&config).await else {
+        return;
+    };
+    replay_chain_through_revoke(&replay).await;
+    // Another account's read holds the one reader.
+    let key = replay.keys.generate().await.expect("a key");
+    let other = pubky_switch::store::NewAccount {
+        id: "other".into(),
+        identity_key: [9; 32],
+        generation: 1,
+        service_key: key.id,
+        created_at_ms: 0,
+        limits: pubky_switch_core::records::Limits::default(),
+        identity_doc: None,
+        revoked_apps: Vec::new(),
+        enrollment_hash: [0; 32],
+    };
+    assert!(
+        replay
+            .db
+            .store()
+            .create_account(&other)
+            .await
+            .expect("create")
+    );
+    let held = replay
+        .db
+        .store()
+        .begin_reading("other", [7; 16])
+        .await
+        .expect("begin")
+        .expect("account");
+    let now = at();
+    let (answer, ()) = tokio::join!(read_as(&replay, "wallet", &now), async {
+        until_queued(&replay, 1).await;
+        // Let the read reach its wait for a reader.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // It waits holding no lock: a write to the account goes on.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            wallet_op(&replay, put_code(CODE, ms(&now) + 3_600_000, 1), 91),
+        )
+        .await
+        .expect("the write doesn't wait for the read's reader");
+        held.commit().await.expect("release the reader");
+    });
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_allow_and_directory_reads_go_on_while_strangers_loop() {
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let keys = vectors("keys.json");
+    let now = at();
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    // Apps of another identity read the directory and the lists back to back.
+    let stranger = |path: String| {
+        let (stop, replay) = (&stop, &replay);
+        async move {
+            let mut sent = 0u32;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                from_shop(replay, "GET", &path, Vec::new(), None).await;
+                sent += 1;
+            }
+            sent
+        }
+    };
+    let own = async {
+        let mut statuses = Vec::new();
+        for _ in 0..30 {
+            statuses.push(read_as(&replay, "wallet", &now).await.status);
+            let directory = replay
+                .service
+                .handle(app_request(
+                    app(&keys, "wallet"),
+                    "GET",
+                    &format!("/v1/{}/directory", alice_id()),
+                    Vec::new(),
+                    ms(&now),
+                ))
+                .await;
+            statuses.push(directory.status);
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        statuses
+    };
+    let (sent_directory, sent_allow, statuses) =
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            tokio::join!(
+                stranger(format!("/v1/{}/directory", alice_id())),
+                stranger(allow_path()),
+                own
+            )
+        })
+        .await
+        .expect("the reads ended");
+    assert!(
+        sent_directory > 0 && sent_allow > 0,
+        "the strangers sent reads"
+    );
+    assert_eq!(statuses, vec![200; 60], "the account's own reads all go on");
+    replay.db.drop_database().await.expect("drop");
+}
+
+/// The executor's reads hold one place of alice's queue at most. With `revoke`, the signer
+/// revokes it first; its request still verifies before the lock, so it takes a place and is
+/// refused under the lock. Without, it stays current but lacks `lists.read`.
+///
+/// Its first read is held where it waits for the account's lock, which the test holds from
+/// a connection of its own. Meanwhile every further read of the executor is refused at
+/// once, and the wallet's read takes a place of its own and waits its turn; once the lock
+/// is free, the executor's read is refused, the wallet's answered, and the queue is empty.
+async fn refused_reads_hold_one_place(revoke: bool) {
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    register_executor(&replay).await;
+    let keys = vectors("keys.json");
+    let now = at();
+    if revoke {
+        let id = app(&keys, "executor")["app_id"]
+            .as_str()
+            .expect("id")
+            .to_string();
+        let answer = replay
+            .service
+            .handle(signer_request(
+                "POST",
+                &format!("/v1/{}/apps/{id}/revoke", alice_id()),
+                Vec::new(),
+                ms(&now),
+            ))
+            .await;
+        assert_eq!(
+            answer.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&answer.body)
+        );
+    }
+    let mut holder = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    let mut lock = sqlx::Connection::begin(&mut holder).await.expect("tx");
+    sqlx::query("SELECT id FROM accounts WHERE id = $1 FOR UPDATE")
+        .bind(alice_id())
+        .execute(&mut *lock)
+        .await
+        .expect("the account's lock");
+    let exchange = async {
+        tokio::join!(
+            read_as(&replay, "executor", &now),
+            async {
+                until_queued(&replay, 1).await;
+                // Every further read of the executor is refused at once.
+                for _ in 0..12 {
+                    let again = read_as(&replay, "executor", &now).await;
+                    assert_eq!(code_of(&again), (503, json!("unavailable")));
+                }
+                assert_eq!(replay.db.queued_reads(&alice_id()), 1);
+                read_as(&replay, "wallet", &now).await
+            },
+            async {
+                // The wallet's read takes a place of its own, then the lock goes.
+                until_queued(&replay, 2).await;
+                lock.rollback().await.expect("release the lock");
+            }
+        )
+    };
+    let (first, wallet, ()) = tokio::time::timeout(std::time::Duration::from_secs(60), exchange)
+        .await
+        .expect("the reads ended");
+    let refused = if revoke {
+        "not_current"
+    } else {
+        "permission_missing"
+    };
+    assert_eq!(code_of(&first), (403, json!(refused)));
+    assert_eq!(
+        wallet.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&wallet.body)
+    );
+    assert_eq!(
+        replay.db.queued_reads(&alice_id()),
+        0,
+        "every place is free"
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_allow_a_revoked_app_holds_one_place_at_most() {
+    refused_reads_hold_one_place(true).await;
+}
+
+#[tokio::test]
+async fn test_allow_an_app_without_lists_read_holds_one_place_at_most() {
+    refused_reads_hold_one_place(false).await;
+}

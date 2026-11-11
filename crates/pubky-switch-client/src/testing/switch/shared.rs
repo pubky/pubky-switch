@@ -253,6 +253,17 @@ impl Shared {
         (records, entries)
     }
 
+    /// Whether the entry at `seq` belongs to the claim held at `claim_key`, and that claim
+    /// isn't a tombstone: a compacted or deleted claim's entries are gone (Switch wire 6.8
+    /// "Tombstones", 7.5).
+    pub(super) fn claim_entry_current(&self, claim_key: &[u8; 32], seq: u64) -> bool {
+        self.claims.get(claim_key).is_some_and(|c| !c.tombstone)
+            && self
+                .entries
+                .get(claim_key)
+                .is_some_and(|entries| entries.iter().any(|e| e.seq == seq))
+    }
+
     /// Keep a written record with its proof.
     pub(super) fn record_written(&mut self, put: &RecordPut, written: Written<'_>) {
         self.records.insert(
