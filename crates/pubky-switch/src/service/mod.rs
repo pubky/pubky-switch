@@ -377,13 +377,17 @@ impl Service {
         let found = match self.store.lookup(&account).await {
             Ok(Some(found)) => found,
             Ok(None) => {
-                // Only the identity's own signer, its request verified with the key `{id}`
-                // names, waits on an erasure's keys: no one else learns anything from it.
-                let by_signer = self.signed_by_identity(&account, &request, base_ms);
+                // Only the identity's own signer, its request signed with the key `{id}`
+                // names, waits on an erasure's keys: no one else learns anything from it. A
+                // signer whose clock is off still waits, since it can't retry at the
+                // service's time as it would at a hosted account (Switch wire 7.1).
+                let signed = self.signed_by_identity(&account, &request, base_ms);
+                let by_signer = signed.is_some();
                 // A retried erasure whose `200` was withheld while its keys were owed: the
-                // sweep runs again, at most a few times a minute for the account, since a
-                // verified request can be replayed (Switch wire 7.4.16).
-                if by_signer
+                // sweep runs again, only for a request within the time window, at most a few
+                // times a minute for the account, since a verified request can be replayed
+                // (Switch wire 7.4.16).
+                if signed == Some(true)
                     && request.route.call == Call::Erase
                     && matches!(self.store.owes_erased_keys(&account).await, Ok(true))
                     && self
@@ -408,6 +412,7 @@ impl Service {
         let stamped_ms = found.stamped_time_ms;
         // The key the account had at the lookup, which an answer after a wait checks again.
         let looked_up_key = found.service_key.clone();
+        let (account_ref, looked_up_ref) = (&account, &looked_up_key);
         let refused_early = |error: ApiError| {
             let signature = if *call == Call::GetIdentity {
                 None
@@ -415,6 +420,18 @@ impl Service {
                 request_signature
             };
             async move {
+                // A read of the account's state that finds no account: erased since the
+                // lookup, its key maybe still in the store while owed. As for an account the
+                // service doesn't host, never signed with that key (7.4.16).
+                if error.code == ErrorCode::NotFound
+                    && let Some(gone) = self
+                        .no_longer_keyed(account_ref, looked_up_ref, false)
+                        .await
+                {
+                    return self
+                        .operator_answer(signature.as_ref(), base_ms, &gone)
+                        .await;
+                }
                 self.early_answer(&found, signature.as_ref(), base_ms, &error)
                     .await
             }
@@ -1513,15 +1530,28 @@ impl Service {
         Ok(claimed)
     }
 
-    /// Whether `request` comes from the signer of the identity `account` names: its headers,
-    /// timestamp and request signature verify with that identity key, without `Switch-App`
-    /// (Switch wire 7.1). Checked for an account the service doesn't host, so it records no
-    /// failed authentication: the answer is the same either way.
-    fn signed_by_identity(&self, account: &str, request: &SwitchRequest, base_ms: u64) -> bool {
-        pubky_switch_core::enc::pubky_key(account)
-            .ok()
-            .and_then(|identity_key| self.authenticate(&identity_key, request, base_ms).ok())
-            .is_some_and(|claimed| claimed.caller == Caller::Signer)
+    /// Whether `request` comes from the signer of the identity `account` names: `Some` when
+    /// its headers and request signature verify with that identity key, without
+    /// `Switch-App`, over its own `Switch-Timestamp` whatever its skew (Switch wire 7.1);
+    /// `Some(true)` when that timestamp is also within 5 minutes of the service's time.
+    /// Checked for an account the service doesn't host, so it records no failed
+    /// authentication: the answer is the same either way.
+    ///
+    /// The skew doesn't count here: at a hosted account a signer whose clock is off gets a
+    /// signed `stale_timestamp` and retries at the service's time, which the operator's
+    /// answer can't tell it. The cost: anyone who saw one signer request can replay it, later,
+    /// to learn that the identity's erased account still owes a key here.
+    fn signed_by_identity(
+        &self,
+        account: &str,
+        request: &SwitchRequest,
+        base_ms: u64,
+    ) -> Option<bool> {
+        let identity_key = pubky_switch_core::enc::pubky_key(account).ok()?;
+        let text = request.headers.get(header::TIMESTAMP)?.to_str().ok()?;
+        let signed_at = pubky_switch_core::time::parse_rfc3339(text).ok()?;
+        let claimed = self.authenticate(&identity_key, request, signed_at).ok()?;
+        (claimed.caller == Caller::Signer).then(|| rules::check_timestamp(text, base_ms).is_ok())
     }
 
     fn record_failure(&self, request: &SwitchRequest, account: String) {
