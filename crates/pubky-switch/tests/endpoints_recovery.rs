@@ -1946,6 +1946,23 @@ async fn test_upload_fills_in_what_the_lost_generation_held() {
     assert_eq!(json_of(&again)["result"]["records"], json!([]));
     assert_eq!(json_of(&again)["result"]["claims"], json!([]));
     assert_eq!(chain(&replay).await.len(), length + 2);
+    // A fork of the update, built on the same (1, 6) in another batch, is kept divergent:
+    // the record stays at (1, 8), its view `divergent`.
+    let update: SignedDoc =
+        serde_json::from_value(chain_item(&vectors("chain.json"), 8)["item"].clone()).expect("op");
+    let update = pubky_switch_core::ops::SignedOp::peek(&update).expect("op");
+    let fork = wallet_batch(90, 1, vec![(Vec::new(), update.body().kind.clone())]);
+    let forked = json!({
+        "lost_identity": lost.signed(),
+        "records": [{ "op": fork[0].signed(), "cert": wallet().2.signed() }],
+    });
+    let answer = upload(&replay, &forked, at).await;
+    assert_eq!(json_of(&answer)["result"]["divergent"], json!([record]));
+    let view = wallet_get(&replay, &format!("records/{record}"), at).await;
+    assert_eq!(
+        (view["version"].clone(), view["divergent"].clone()),
+        (json!(8), json!(true))
+    );
     replay.db.drop_database().await.expect("drop");
 }
 
