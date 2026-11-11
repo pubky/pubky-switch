@@ -466,7 +466,9 @@ impl Service {
     /// # Errors
     ///
     /// `400` or `413` for the body, `401 bad_signature` (a failed authentication), or `403
-    /// not_current` for an app without a record whose batch carries no `app.put`.
+    /// not_current` for an app without a record whose batch carries no `app.put`, whose
+    /// signature can't be checked. A verified app's `403 not_current` or `403 cert_expired`
+    /// comes under the lock, with the head.
     pub(super) async fn verify_own_app(
         &self,
         account: &str,
@@ -524,8 +526,10 @@ impl Service {
         }
         let verified = VerifiedApp { app, key, parsed };
         // Then the app's checks, in their order, from what the account holds read without
-        // the lock, so a revoked, departed or expired app takes no lock either (Switch spec
-        // 12.2). Under the lock they run again.
+        // the lock. Only a failed authentication is answered here (`401`): a revoked,
+        // departed, unlisted or expired app goes on to the lock, where the same checks run
+        // again and their refusal carries the head, as every refusal after the request
+        // verified does (Switch wire 7.1), signed at the service time the refusal commits.
         let identity = pubky_switch_core::enc::pubky_key(account)
             .map_err(|_| ApiError::not_found("no such account"))?;
         // One statement, so the document, the row and the kept flag are of one state.
@@ -536,7 +540,7 @@ impl Service {
             .map_err(|e| store_error(&e))?
             .ok_or_else(|| ApiError::not_found("no such account"))?;
         let held = doc.and_then(|doc| IdentityDoc::verify(&doc, &identity).ok());
-        if let Err(Stop::Refused(error) | Stop::Unauthenticated(error)) = check_own_app(
+        if let Err(Stop::Unauthenticated(error)) = check_own_app(
             &identity,
             held.as_ref(),
             stored.as_ref(),
