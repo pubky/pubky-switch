@@ -1633,6 +1633,75 @@ async fn test_loss_upload_is_limited_per_hour_and_the_lists_are_capped() {
 }
 
 #[tokio::test]
+async fn test_loss_upload_answered_503_is_sent_again_and_staging_ends() {
+    // A `503` the service may lift fails the step, which the next read sends again: the
+    // lists' upload that ends staged admission isn't given up (Switch wire 7.6, 7.4.14).
+    let store = Arc::new(MemoryStore::new());
+    let lost = lost_world(Arc::clone(&store) as Arc<dyn StateStore>).await;
+    lost.next.lock().admission_staged = true;
+    lost.next.fail_next(Fault::Error {
+        path: "recovery/upload".into(),
+        code: ErrorCode::Unavailable,
+        current: json!({}),
+    });
+    let error = follow_loss(&lost, Arc::clone(&store) as Arc<dyn StateStore>)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Some(ErrorCode::Unavailable), "{error:?}");
+    assert!(lost.next.lock().admission_staged);
+    let (_, events) = follow_loss(&lost, store as Arc<dyn StateStore>)
+        .await
+        .unwrap();
+    assert!(!has(&events, |e| matches!(
+        e,
+        AppEvent::EvidenceRefused { .. }
+    )));
+    assert!(
+        !lost.next.lock().admission_staged,
+        "the lists went, and ended it"
+    );
+}
+
+#[tokio::test]
+async fn test_loss_upload_answered_429_waits_its_retry_after() {
+    // The lists' upload answered `429 rate_limited` is sent again only once its
+    // `retry_after` has passed by the device clock (Switch wire 7.6).
+    let store = Arc::new(MemoryStore::new());
+    let lost = lost_world(Arc::clone(&store) as Arc<dyn StateStore>).await;
+    {
+        let mut next = lost.next.lock();
+        next.admission_staged = true;
+        next.uploads_per_app_per_hour = 1;
+    }
+    let mut app = App::load(
+        lost.router
+            .env(&lost.w, Arc::clone(&store) as Arc<dyn StateStore>),
+        Arc::clone(&lost.protocol) as Arc<dyn Protocol>,
+        World::config(),
+        app_keys("wallet").app_id_bytes(),
+    )
+    .await
+    .unwrap();
+    app.refresh_identity().await.unwrap();
+    let error = app.receive(None).await.unwrap_err();
+    assert_eq!(error.code(), Some(ErrorCode::RateLimited), "{error:?}");
+    let sent = lost.next.uploads().len();
+    let error = app.receive(None).await.unwrap_err();
+    assert!(
+        matches!(error, AppError::Refused(crate::app::Refusal::NotNow(_))),
+        "{error:?}"
+    );
+    assert_eq!(
+        lost.next.uploads().len(),
+        sent,
+        "nothing sent while it waits"
+    );
+    lost.w.clock.advance_ms(3_600_000);
+    app.receive(None).await.unwrap();
+    assert!(!lost.next.lock().admission_staged);
+}
+
+#[tokio::test]
 async fn test_loss_refused_upload_is_reported_and_recovery_goes_on() {
     let store = Arc::new(MemoryStore::new());
     let lost = lost_world(Arc::clone(&store) as Arc<dyn StateStore>).await;

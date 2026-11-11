@@ -31,7 +31,7 @@ use pubky_switch_core::chain::{
     ItemType, ServiceTransition, SignedHead, TransitionProof, Verifier, ZERO_HASH,
 };
 use pubky_switch_core::enc::{b64, pubky_id, pubky_key, serde_b64_vec};
-use pubky_switch_core::http::ErrorCode;
+use pubky_switch_core::http::{ErrorCode, Retry};
 use pubky_switch_core::keys::ReceiveKey;
 use pubky_switch_core::ops::{AllowKind, Condition, MAX_BATCH_ENTRIES, OpKind, Position, SignedOp};
 use pubky_switch_core::records::{
@@ -846,8 +846,20 @@ impl App {
         self.upload_here(&upload).await
     }
 
-    /// `POST /recovery/upload` at the service followed; its head goes to the chain view.
+    /// `POST /recovery/upload` at the service followed; its head goes to the chain view. A
+    /// refusal the service may lift, `503` (unavailable or staged) or `429 rate_limited`,
+    /// fails the step, which is sent again at a later call, after the wait a `429`'s
+    /// `retry_after` asks: the recovery doesn't move on past an upload that may still land,
+    /// such as the one that ends staged admission (Switch wire 7.6, 7.4.14). Any other
+    /// refusal is final: reported, and the recovery goes on.
     async fn upload_here(&mut self, upload: &RecoveryUpload) -> Result<(), AppError> {
+        let now = self.now();
+        if let Some(until) = self.loss_upload_wait.filter(|until| now < *until) {
+            return Err(AppError::Refused(Refusal::NotNow(format!(
+                "Switch wire 7.6: a recovery upload waits {} s more",
+                (until - now).div_ceil(1000)
+            ))));
+        }
         let result = self.client.recovery_upload(upload, false).await;
         match self.take(result).await {
             Ok(answer) => {
@@ -862,6 +874,17 @@ impl App {
                     .or_else(|| answer.result.as_ref().map(|changes| changes.heads));
                 let proofs = answer.proofs.or(Some(u64::from(answer.proof.is_some())));
                 self.uploaded(Ok((heads, proofs)))
+            }
+            Err(AppError::Switch(
+                error @ ClientError::Switch {
+                    code, retry_after, ..
+                },
+            )) if matches!(code.retry(), Retry::Yes | Retry::AfterRetryAfter) => {
+                if code == ErrorCode::RateLimited {
+                    let wait_ms = retry_after.unwrap_or(60).saturating_mul(1000);
+                    self.loss_upload_wait = Some(now.saturating_add(wait_ms));
+                }
+                Err(AppError::Switch(error))
             }
             Err(AppError::Switch(error)) => self.uploaded(Err(error)),
             Err(error) => Err(error),

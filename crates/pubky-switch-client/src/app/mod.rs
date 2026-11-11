@@ -542,6 +542,9 @@ pub struct App {
     /// between (`App::resume_batches_before_feed`). Kept in memory only: a restart sends
     /// them at its first read.
     kept_rate_limited: Option<(u64, u64)>,
+    /// The end of the wait a recovery upload's `429 rate_limited` asked, device clock: no
+    /// upload of a provider loss's steps goes before it. In memory only.
+    loss_upload_wait: Option<u64>,
 }
 
 impl std::fmt::Debug for App {
@@ -765,6 +768,7 @@ impl App {
                 duty_handed: 0,
                 time_fresh_at: None,
                 kept_rate_limited: None,
+                loss_upload_wait: None,
             };
             app.update_keys_through();
             app.events.clear();
@@ -886,6 +890,7 @@ impl App {
                 duty_handed: 0,
                 time_fresh_at: None,
                 kept_rate_limited: None,
+                loss_upload_wait: None,
             };
             // A store an earlier build wrote keeps the epoch read now.
             if !app.reader().exists(key::DUTY_EPOCH).await? {
@@ -1484,6 +1489,7 @@ impl App {
                 duty_handed: 0,
                 time_fresh_at: None,
                 kept_rate_limited: None,
+                loss_upload_wait: None,
             };
             // Every write of the one commit; what fails here is mostly a write the store
             // can't take in one batch, over its sizes.
