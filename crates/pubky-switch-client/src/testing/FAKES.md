@@ -166,10 +166,11 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
 - **Staged admission** (Switch spec 12.6 step 2, wire 7.4.14), in `switch/signer.rs` and
   `switch/inbox.rs`: as at the service, staged at a recovery whose first document lists an
   app; while it lasts, a sender not otherwise admitted, a stranger asking to connect
-  included, gets `503 staged` at `PUT /peers` and at the inbox; `POST /recovery/admission`
-  ends it with the `admission` transition's proof, answers no proof when it isn't staged,
-  and `404` without a recovery. Unlike the service: a switch made `recovering` doesn't stage
-  admission, and a recovery upload doesn't end it (the upload's own rules come with it).
+  included, gets `503 staged` at `PUT /peers`, at the inbox and at the directory;
+  `POST /recovery/admission` ends it with the `admission` transition's proof, answers no
+  proof when it isn't staged, and `404` without a recovery. Unlike the service: a switch
+  made `recovering` doesn't stage admission. Neither ends it at a recovery upload yet: the
+  service serves no upload, and this switch's takes no part in admission.
 - **`GET /apps`** (Switch wire 7.4.12), in `switch/signer.rs`: by the service's rules, member
   by member, but `last_seen` and `recovery` (below):
   - every app the switch holds, every App ID it keeps for good, and every app the newest

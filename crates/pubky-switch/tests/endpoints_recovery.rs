@@ -1637,3 +1637,176 @@ async fn test_admission_staged_holds_back_connect_requests_too() {
     );
     replay.db.drop_database().await.expect("drop");
 }
+
+fn wallet_keys() -> Value {
+    app(&vectors("keys.json"), "wallet").clone()
+}
+
+async fn recovered_staged(replay: &Replay) -> u64 {
+    let (pending, at) = serving_with_a_pending_key(replay).await;
+    let before = held(replay).await;
+    let recovery = next_generation(&before, pending, Some(1));
+    let (answer, _) = deliver(replay, recovery, Some(before.hash()), at).await;
+    assert_eq!(answer.status, 200);
+    assert_eq!(admission_staged(replay, at).await, json!(true));
+    at
+}
+
+#[tokio::test]
+async fn test_admission_an_own_app_cant_end_it() {
+    // POST /recovery/admission is the signer's: an own app, current at the recovered
+    // account, gets 403 permission_missing, and admission stays staged, nothing chained.
+    let Some(replay) = replay().await else { return };
+    let at = recovered_staged(&replay).await;
+    let (status, body) = wallet_registers(&replay, 77, 2, 3, true, at).await;
+    assert_eq!(status, 200, "{body}");
+    let length = chain(&replay).await.len();
+    let path = format!("/v1/{}/recovery/admission", alice_id());
+    let answer = replay
+        .service
+        .handle(app_request(&wallet_keys(), "POST", &path, Vec::new(), at))
+        .await;
+    assert_eq!(code(&answer), (403, "permission_missing".into()));
+    assert_eq!(admission_staged(&replay, at).await, json!(true));
+    assert_eq!(chain(&replay).await.len(), length);
+    // And an app of another identity, as at every call only the signer makes.
+    let other = other_request("shop", ORIGIN, "POST", &path, Vec::new(), None, at);
+    let answer = replay.service.handle(other).await;
+    assert_eq!(code(&answer), (403, "permission_missing".into()));
+    assert_eq!(admission_staged(&replay, at).await, json!(true));
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_admission_two_calls_at_once_chain_one_transition() {
+    // Two signer calls at once serialize on the account's lock: one chains the admission
+    // transition and answers its proof, the other chains nothing and answers none.
+    let Some(replay) = replay().await else { return };
+    let at = recovered_staged(&replay).await;
+    let (a, b) = tokio::join!(
+        admission(&replay, Vec::new(), at),
+        admission(&replay, Vec::new(), at + 1)
+    );
+    assert_eq!((a.status, b.status), (200, 200));
+    let mut lengths = [
+        json_of(&a)["proofs"].as_array().expect("a").len(),
+        json_of(&b)["proofs"].as_array().expect("b").len(),
+    ];
+    lengths.sort_unstable();
+    assert_eq!(lengths, [0, 1]);
+    let kinds: Vec<String> = chain(&replay).await.into_iter().map(|c| c.2).collect();
+    assert_eq!(kinds, ["service", "identity", "service"]);
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_admission_a_second_recovery_stages_again() {
+    // Staging is per generation: a second provider loss whose document lists apps stages
+    // admission again, though the first ended; one listing none doesn't.
+    let Some(replay) = replay().await else { return };
+    let at = recovered_staged(&replay).await;
+    assert_eq!(admission(&replay, Vec::new(), at).await.status, 200);
+    assert_eq!(admission_staged(&replay, at).await, json!(false));
+    let p2 = answered_key(&enroll(&replay, enrollment(9, None), at).await);
+    let g2 = held(&replay).await;
+    let (answer, _) = deliver(
+        &replay,
+        next_generation(&g2, p2, Some(2)),
+        Some(g2.hash()),
+        at,
+    )
+    .await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    assert_eq!(
+        admission_staged(&replay, at).await,
+        json!(true),
+        "staged again"
+    );
+    let (peers, inbox) = from_shop(&replay, at).await;
+    assert_eq!(code(&peers), (503, "staged".into()));
+    assert_eq!(code(&inbox), (503, "staged".into()));
+    let ended = admission(&replay, Vec::new(), at).await;
+    assert_eq!(
+        json_of(&ended)["proofs"].as_array().expect("proofs").len(),
+        1
+    );
+    // A third, listing no app: not staged.
+    let p3 = answered_key(&enroll(&replay, enrollment(10, None), at).await);
+    let g3 = held(&replay).await;
+    let mut body: IdentityBody = g3.body().clone();
+    body.version += 1;
+    body.generation += 1;
+    body.inbox.service_key = p3;
+    body.recovery_from = Some(3);
+    body.apps.clear();
+    body.renewed.clear();
+    let doc = IdentityDoc::sign(&alice_key(), body).expect("sign");
+    let (answer, _) = deliver(&replay, doc.signed().clone(), Some(g3.hash()), at).await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    assert_eq!(admission_staged(&replay, at).await, json!(false));
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_admission_staged_holds_back_a_directory_read() {
+    // An app of another identity reading the directory while admission is staged gets
+    // `503 staged`, as at the inbox and `PUT /peers`, so it retries rather than gives up
+    // (Switch spec 12.6 step 2; wire 7.4.10); once ended, `403 not_admitted`.
+    let Some(replay) = replay().await else { return };
+    let at = recovered_staged(&replay).await;
+    let read = || {
+        other_request(
+            "shop",
+            ORIGIN,
+            "GET",
+            &format!("/v1/{}/directory", alice_id()),
+            Vec::new(),
+            None,
+            at,
+        )
+    };
+    let answer = replay.service.handle(read()).await;
+    assert_eq!(code(&answer), (503, "staged".into()));
+    assert_eq!(admission(&replay, Vec::new(), at).await.status, 200);
+    let answer = replay.service.handle(read()).await;
+    assert_eq!(code(&answer), (403, "not_admitted".into()));
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_admission_ends_with_a_proof_under_the_current_key() {
+    // The admission transition's proof (wire 6.5): a service stub, object "admission", the
+    // body `by: "signer"`; signed with the recovered generation's key, as is the answer.
+    let Some(replay) = replay().await else { return };
+    let at = recovered_staged(&replay).await;
+    let key = replay
+        .keys
+        .public_key(&service_key_id(&replay).await)
+        .await
+        .expect("key");
+    let request = signer_request(
+        "POST",
+        &format!("/v1/{}/recovery/admission", alice_id()),
+        Vec::new(),
+        at,
+    );
+    let signature = signature_of(&request);
+    let answer = replay.service.handle(request).await;
+    assert_eq!(answer.status, 200);
+    assert!(signed_by(&answer, &key, &signature));
+    let proof: SignedDoc =
+        serde_json::from_value(json_of(&answer)["proofs"][0].clone()).expect("proof");
+    let body: Value = serde_json::from_slice(&proof.body_bytes().expect("body")).expect("json");
+    assert_eq!(body["object"], json!("admission"));
+    replay.db.drop_database().await.expect("drop");
+}

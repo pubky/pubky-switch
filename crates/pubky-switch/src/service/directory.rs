@@ -66,9 +66,18 @@ impl Service {
             } else {
                 self.live_invite(txn, invite_code, time_ms).await?
             };
-            match admit(standing, removed, invite, false)
-                .ok_or_else(|| ApiError::new(ErrorCode::NotAdmitted, NOT_ADMITTED))?
-            {
+            // While admission is staged after a provider loss, a reader it can't otherwise
+            // admit, a denied one included, gets `503 staged` and retries, as at the inbox and
+            // `PUT /peers` (Switch spec 12.6 step 2; wire 7.4.10).
+            let staged = txn.admission_staged().await.map_err(|e| store_error(&e))?;
+            let refused = || {
+                if staged {
+                    super::recovery::staged_admission()
+                } else {
+                    ApiError::new(ErrorCode::NotAdmitted, NOT_ADMITTED)
+                }
+            };
+            match admit(standing, removed, invite, false).ok_or_else(refused)? {
                 Admitted::Listed => {}
                 Admitted::InviteCode(hash) => {
                     if !trusted {
