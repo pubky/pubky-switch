@@ -159,7 +159,10 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   and to its target, also when that target isn't current, where the service answers `403
   not_current` (Switch wire 7.2): so a test can script a faulty switch that serves a
   hand-over while holding no copy of the version handed over; the next `identity.json`
-  version, whoever delivered it, drops it.
+  version, whoever delivered it, drops it. Unlike the service, it serves the body it parsed
+  again as JSON, not the bytes the signer sent; it answers an own app's `PUT` `404` ("no
+  route") where the service answers `403 permission_missing` with the head, and an app of
+  another identity `403 not_admitted` where the service answers `403 permission_missing`.
   `stored_handover` names the target held; `stored_handover_body` and
   `store_handover_again` script a hand-over stored or served again after it was dropped.
 - **`Fault::LeaveOut`** scripts a faulty service whose answer to an own app or the signer
@@ -178,8 +181,8 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
 These signer flows run only against the scripted switch, whose `GET /apps` follows the
 service's rules (above). The service in this workspace serves `GET /apps`, `GET` and `POST
 /apps/{app_id}/keys` and `POST /apps/{app_id}/leave`, so the full-bundle requests, reading the
-stored parts and the departures can run against it now; the hand-over and the erasure wait for
-`PUT` and `GET /handover` and `POST /erase`:
+stored parts, the departures and the hand-over can run against it now (`PUT` and `GET
+/handover` too); the erasure waits for `POST /erase`:
 
 - approval, renewals and reductions, their closings, and epoch completion
   (`crates/pubky-switch-signer/tests/approval.rs`, `renewal.rs`);
@@ -189,6 +192,6 @@ stored parts and the departures can run against it now; the hand-over and the er
   (`flows.rs`);
 - restore from the signer backup, in place and on a new install (`restore.rs`);
 - the hand-over both ways, the abort, the take-over's checks and its lost answers, and which
-  copies delete a key (`handover.rs`);
+  copies delete a key (`handover.rs`), save the scripted faults;
 - the account's erasure, its lost answer, retry and refusal (`erasure.rs`): the service
   doesn't serve `POST /erase` yet.
