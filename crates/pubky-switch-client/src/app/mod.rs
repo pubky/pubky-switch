@@ -578,22 +578,23 @@ fn uncertain_copy(
     state: &AppState,
     pending: &PendingEffect,
     reserved: Option<u64>,
-) -> (u64, ParkedEntry) {
-    if let Some((id, stored)) = pending
-        .stored
-        .and_then(|id| state.parked.get(&id).map(|stored| (id, stored)))
-    {
-        return (
+) -> Result<(u64, ParkedEntry), AppError> {
+    // An entry stored locally under a kept effect is kept until the effect settles
+    // (`STATE.md`, `parked/`), and an entry read from the feed has its ID reserved: either
+    // missing is a corrupt store.
+    if let Some(id) = pending.stored {
+        let stored = state.parked.get(&id).ok_or_else(missing)?;
+        return Ok((
             id,
             ParkedEntry {
                 reason: ParkReason::Uncertain,
                 released: stored.was_released(),
                 ..stored.clone()
             },
-        );
+        ));
     }
-    (
-        reserved.unwrap_or(state.next_stored_id),
+    Ok((
+        reserved.ok_or_else(missing)?,
         ParkedEntry {
             seq: pending.seq,
             generation: pending.generation,
@@ -606,7 +607,7 @@ fn uncertain_copy(
             round: state.parked_round.number,
             released: false,
         },
-    )
+    ))
 }
 
 fn missing() -> AppError {
@@ -1086,8 +1087,9 @@ impl App {
     /// read from the feed takes a local ID the live store reserves for it first, by moving
     /// its stored-entry counter on (`parkid`), on a halted app too: the backup's counter is
     /// one past it, and the live store never gives that ID to another entry, which a restore
-    /// in place would install the copy over. The counter is the one write; it changes
-    /// nothing a read or the protocol sees.
+    /// in place would install the copy over. The counter is the one write of its own; its
+    /// commit also keeps a service time verified earlier and not yet committed, as every
+    /// commit does. Neither changes anything a read or the protocol sees.
     ///
     /// The restored app tells its protocol of the copy as stored `Uncertain`
     /// ([`AppEvent::Parked`]), but not which of the kept batch's attempts are uncertain, as
@@ -1116,8 +1118,9 @@ impl App {
                 self.bound_unverified().await?;
             }
             // The local ID the copy of a kept effect's feed entry takes is reserved in the
-            // live store first, for a halted app too: the backup's only write there, which
-            // changes nothing a read or the protocol sees. Without it, the next entry the
+            // live store first, for a halted app too: the backup's only write of its own
+            // there (its commit also keeps a service time not yet committed), which changes
+            // nothing a read or the protocol sees. Without it, the next entry the
             // live store stored would take the same ID, and a restore in place would install
             // the copy under an ID its carried duty events give another message.
             let reserved = if self
@@ -1147,7 +1150,7 @@ impl App {
                 // bounds never drop it, the host may release it, and a read of its feed
                 // entry again is a duplicate, never a second application. The live store
                 // isn't touched.
-                let (id, entry) = uncertain_copy(&state, pending, reserved);
+                let (id, entry) = uncertain_copy(&state, pending, reserved)?;
                 parked.insert(id, entry);
                 let pair = key::processed(&pending.sender, &pending.msg_id);
                 let rest = pair.strip_prefix("proc/").unwrap_or(&pair).to_owned();
