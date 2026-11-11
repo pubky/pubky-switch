@@ -259,6 +259,13 @@ pub fn check_url(url: &str, use_: &UrlUse) -> Result<CheckedUrl> {
     Ok(CheckedUrl { host, port })
 }
 
+/// The most bytes a domain name may have in a URL the Switch takes (Switch wire 7.1).
+pub const MAX_DOMAIN_LEN: usize = 253;
+
+/// The longest origin a switch may have: `https://`, a domain name of [`MAX_DOMAIN_LEN`]
+/// bytes, longer than any IP literal, and a port of five digits (Switch wire 7.1).
+pub const MAX_ORIGIN_LEN: usize = "https://".len() + MAX_DOMAIN_LEN + ":65535".len();
+
 /// Whether `host` is a domain name in the one spelling every URL parser reads alike: labels
 /// of ASCII letters, digits and hyphens, 1 to 63 bytes each, not starting or ending with a
 /// hyphen, at most 253 bytes in all, no empty label (so no trailing dot), and a last label
@@ -278,7 +285,7 @@ fn is_domain_name(host: &str) -> bool {
             && !label.starts_with('-')
             && !label.ends_with('-')
     };
-    host.len() <= 253
+    host.len() <= MAX_DOMAIN_LEN
         && host.split('.').all(label_ok)
         && host
             .rsplit('.')

@@ -64,6 +64,25 @@ pub enum SignerError {
     },
 }
 
+/// A body a version of `identity.json` must fit in (Switch wire 3.7, 7.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SizedBody {
+    /// Its delivery, `PUT /identity`.
+    Delivery,
+    /// A move's enrollment carrying it, `POST /enroll`.
+    Enrollment,
+}
+
+impl std::fmt::Display for SizedBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Delivery => "delivery",
+            Self::Enrollment => "move's enrollment",
+        })
+    }
+}
+
 /// A rule of the Switch or of a protocol said no.
 ///
 /// The `Display` text names the rule only. The fields carry what a host shows the user, such as
@@ -140,15 +159,20 @@ pub enum Refusal {
         /// The switch's signed time, in Unix milliseconds.
         switch_ms: u64,
     },
-    /// The version would be larger than a delivery may carry (`PUT /identity`'s body cap,
-    /// Switch wire 7.1), measured with its open `renewed` entries closed, as later versions
-    /// close them: the switch could never take it, or its closings. Nothing is signed. A
-    /// revocation, which drops the app's `renewed` entries, makes the document smaller.
-    #[error("refused: identity.json would be over the size a delivery may carry")]
+    /// The version would be larger than `body` may carry: a delivery (`PUT /identity`'s body
+    /// cap), or a move's enrollment carrying it with the App IDs revoked (`POST /enroll`'s)
+    /// (Switch wire 3.7, 7.1). It is measured with its open `renewed` entries closed, as later
+    /// versions close them: the switch could never take it or its closings, or the identity
+    /// could never move. Nothing is signed. A revocation, which drops the app's `renewed`
+    /// entries, never makes either body larger: the enrollment is measured with every listed
+    /// app's App ID as revoked already.
+    #[error("refused: identity.json would be over the size a {body} may carry")]
     IdentityTooLarge {
-        /// The delivery's size, in bytes.
+        /// The body that wouldn't fit.
+        body: SizedBody,
+        /// Its size, in bytes.
         bytes: u64,
-        /// The cap, in bytes.
+        /// Its cap, in bytes.
         limit: u64,
     },
     /// No hand-over is in progress to abort.

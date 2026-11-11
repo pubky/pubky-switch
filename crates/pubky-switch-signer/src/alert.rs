@@ -151,14 +151,16 @@ pub enum Alert {
         reason: RenewalSkip,
     },
     /// The newest `identity.json`, as delivered or as a move's enrollment would carry it,
-    /// takes more than three quarters of the most either may carry (the body cap `PUT
-    /// /identity` and `POST /enroll` share, Switch wire 3.7, 7.1). Past it no version can be
-    /// delivered, a revocation's included, and no move can enroll. Its `renewed` entries are
-    /// what grow it: an entry stays once its renewal is closed, until its app is removed.
+    /// takes more than three quarters of the most that body may carry (the body caps of `PUT
+    /// /identity` and `POST /enroll`, Switch wire 3.7, 7.1), in the body it comes nearest to
+    /// filling. Near it, the signer refuses changes that would leave it no room
+    /// ([`crate::Refusal::IdentityTooLarge`]); past it no version can be delivered, a
+    /// revocation's included, or no move can enroll. Its `renewed` entries are what grow it:
+    /// an entry stays once its renewal is closed, until its app is removed.
     IdentityNearLimit {
-        /// The larger of the two sizes, in bytes.
+        /// The version's size in that body, in bytes.
         bytes: u64,
-        /// The cap, in bytes.
+        /// That body's cap, in bytes.
         limit: u64,
     },
     /// The device clock and the switch's signed time differ by more than the clock tolerance
