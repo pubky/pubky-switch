@@ -1503,10 +1503,14 @@ pub(super) struct Measure {
 /// Every body the version `body`, built on `prev`, must later fit in, for the records
 /// `state`, each with its own cap (Switch wire 3.7, 7.1): its delivery, `PUT /identity`, and
 /// a move's enrollment carrying it, `POST /enroll`, with every App ID revoked, those of
-/// `state` and of the version's `removed`, at the longest origin a switch may have, since the
-/// one a move goes to isn't known yet. The one measure both the check before signing and the
-/// near-limit alert use. The version's signed form is measured from its body, with a
-/// signature of the length every signature has: nothing is signed to measure it.
+/// `state` and of the version's `removed`, and those of the apps it lists, as if revoked
+/// already, at the longest origin a switch may have, since the one a move goes to isn't known
+/// yet. The one measure both the check before signing and the near-limit alert use. The
+/// delivery is measured as sent, byte for byte; the enrollment is an upper bound, above a
+/// real move's by the listed apps' IDs, so removing an app, or a tombstone committed before
+/// the version that removes it, never grows it. The version's signed form is measured from
+/// its body, with a signature of the length every signature has: nothing is signed to
+/// measure it.
 pub(super) fn measures(
     state: &SignerState,
     body: &IdentityBody,
@@ -1533,6 +1537,11 @@ pub(super) fn measures(
     if let Some(limit) = enrollment_limit() {
         let mut revoked = state.tombstones.clone();
         revoked.extend(body.removed.iter().map(|removed| removed.app_id));
+        // And every app the version lists, as if revoked already: a later removal moves its
+        // App ID into `revoked_apps`, which an enrollment carries whatever the version
+        // shrinks to, and a tombstone committed before its removal is signed, as a revocation
+        // commits it, adds nothing then. So the measure is an upper bound, by these IDs.
+        revoked.extend(body.apps.iter().map(|listed| listed.app_id));
         revoked.sort_unstable();
         revoked.dedup();
         let enrollment = EnrollmentBody {
@@ -1555,13 +1564,25 @@ pub(super) fn measures(
 }
 
 /// The measure of the version signed as `doc`, built on `prev`, that comes nearest its cap,
-/// for the near-limit alert ([`measures`]).
+/// for the near-limit alert ([`measures`]). A document that doesn't verify, which no caller
+/// passes, is measured as its delivery alone: the alert never stops a delivery from being
+/// recorded.
 pub(super) fn version_size(
     state: &SignerState,
     doc: &SignedDoc,
     prev: Option<[u8; 32]>,
 ) -> Result<Measure> {
-    let verified = IdentityDoc::verify(doc, &state.identity)?;
+    let Ok(verified) = IdentityDoc::verify(doc, &state.identity) else {
+        let delivery = IdentityDelivery {
+            identity: doc.clone(),
+            prev,
+        };
+        return Ok(Measure {
+            body: SizedBody::Delivery,
+            bytes: delivery.to_json().len(),
+            limit: identity_limit().unwrap_or(usize::MAX),
+        });
+    };
     measures(state, verified.body(), prev)?
         .into_iter()
         // The larger share of its cap, compared without division.
@@ -1684,9 +1705,10 @@ mod tests {
 
     #[test]
     fn test_identity_measures_are_the_bodies_as_sent() {
-        // The sizes `next_version` checks before signing are the delivery's and a move's
-        // enrollment's, byte for byte: the enrollment at the longest origin a switch may have,
-        // with every App ID revoked, those of the records and of `removed`.
+        // The sizes `next_version` checks before signing: the delivery's, byte for byte, and a
+        // move's enrollment's at the longest origin a switch may have, with every App ID
+        // revoked, those of the records and of `removed`, and those of the listed apps, as if
+        // revoked already. So it is never below a real move's, and above it by those IDs.
         let key = pubky_switch_core::keys::IdentityKey::from_secret([3; 32]);
         let mut body = IdentityBody::first(
             key.public(),
@@ -1704,6 +1726,10 @@ mod tests {
                 distrust_from: 0,
             });
         }
+        body.apps.push(pubky_switch_core::records::ListedApp {
+            app_id: [12; 16],
+            cert: [13; 32],
+        });
         let mut state = SignerState::new(key.public(), [4; 16]);
         state.tombstones = vec![[9; 16], [10; 16]];
         let doc = IdentityDoc::sign(&key, body.clone()).unwrap();
@@ -1717,20 +1743,25 @@ mod tests {
         );
         let origin = format!("https://{host}:65535");
         assert_eq!(origin.len(), pubky_switch_core::net::MAX_ORIGIN_LEN);
-        let enrollment = pubky_switch_core::records::Enrollment::sign(
-            &key,
-            EnrollmentBody {
-                identity: key.public(),
-                origin,
-                nonce: [1; 16],
-                policy: body.policy,
-                identity_doc: Some(doc.signed().clone()),
-                revoked_apps: Some(vec![[9; 16], [10; 16], [11; 16]]),
-            },
-        )
-        .unwrap();
-        let request = serde_json::json!({ "enrollment": enrollment.signed() }).to_string();
+        let request = |revoked: Vec<[u8; 16]>| {
+            let enrollment = pubky_switch_core::records::Enrollment::sign(
+                &key,
+                EnrollmentBody {
+                    identity: key.public(),
+                    origin: origin.clone(),
+                    nonce: [1; 16],
+                    policy: body.policy,
+                    identity_doc: Some(doc.signed().clone()),
+                    revoked_apps: Some(revoked),
+                },
+            )
+            .unwrap();
+            serde_json::json!({ "enrollment": enrollment.signed() }).to_string()
+        };
+        let real = request(vec![[9; 16], [10; 16], [11; 16]]);
+        let request = request(vec![[9; 16], [10; 16], [11; 16], [12; 16]]);
         let measured = measures(&state, &body, Some([6; 32])).unwrap();
+        assert!(measured[1].bytes > real.len());
         assert_eq!(
             measured,
             [

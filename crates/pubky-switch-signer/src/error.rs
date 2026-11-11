@@ -164,7 +164,8 @@ pub enum Refusal {
     /// (Switch wire 3.7, 7.1). It is measured with its open `renewed` entries closed, as later
     /// versions close them: the switch could never take it or its closings, or the identity
     /// could never move. Nothing is signed. A revocation, which drops the app's `renewed`
-    /// entries, makes the document smaller.
+    /// entries, never makes either body larger: the enrollment is measured with every listed
+    /// app's App ID as revoked already.
     #[error("refused: identity.json would be over the size a {body} may carry")]
     IdentityTooLarge {
         /// The body that wouldn't fit.

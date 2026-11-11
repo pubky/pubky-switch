@@ -1024,3 +1024,284 @@ fn entries_near_the_cap(signer: &Signer, margin: usize) -> u32 {
     };
     (0..2_000).take_while(|n| with(*n)).last().unwrap()
 }
+
+/// The body a real move sends for `doc`, built as `SwitchClient::enroll` builds it, at the
+/// longest origin a switch may have, naming every App ID the records revoked and `doc`'s
+/// `removed`: its length.
+fn real_move_request(old: &OldSigner, doc: &IdentityDoc) -> usize {
+    let host = format!(
+        "{}.example",
+        "a".repeat(pubky_switch_core::net::MAX_DOMAIN_LEN - 8)
+    );
+    let origin = format!("https://{host}:65535");
+    assert_eq!(origin.len(), pubky_switch_core::net::MAX_ORIGIN_LEN);
+    let mut revoked = old.signer.state.tombstones.clone();
+    revoked.extend(doc.body().removed.iter().map(|r| r.app_id));
+    let enrollment = pubky_switch_core::records::Enrollment::sign(
+        &old.key,
+        pubky_switch_core::records::EnrollmentBody {
+            identity: old.key.public(),
+            origin,
+            nonce: [7; 16],
+            policy: doc.body().policy,
+            identity_doc: Some(doc.signed().clone()),
+            revoked_apps: Some(revoked),
+        },
+    )
+    .unwrap();
+    serde_json::json!({ "enrollment": enrollment.signed() })
+        .to_string()
+        .len()
+}
+
+fn enrollment_measure(
+    old: &OldSigner,
+    body: &pubky_switch_core::records::IdentityBody,
+    prev: [u8; 32],
+) -> super::Measure {
+    super::measures(&old.signer.state, body, Some(prev))
+        .unwrap()
+        .into_iter()
+        .find(|m| m.body == SizedBody::Enrollment)
+        .unwrap()
+}
+
+/// alice at version 5, padded so that the signer's own version 6 (`record_max_age`) lands
+/// `lo..=hi` bytes under the enrollment cap, then version 6 signed by the signer. Returns
+/// version 6 and the cap.
+async fn at_the_edge(old: &mut OldSigner, lo: usize, hi: usize) -> (IdentityDoc, usize) {
+    let entries = entries_near_the_cap(&old.signer, 2_000);
+    let large = with_renewed(old, entries, Some(VECTOR_START_MS)).await;
+    let padded = |pad: usize| {
+        let mut body = large.body().clone();
+        body.version = 5;
+        body.inbox.url = format!("https://{}.switch.example", "a".repeat(pad));
+        body
+    };
+    let pad = (1..3_000)
+        .find(|pad| {
+            let mut six = padded(*pad);
+            six.version = 6;
+            six.record_max_age = Some(60);
+            let m = enrollment_measure(old, &six, [0; 32]);
+            m.bytes + lo <= m.limit && m.bytes + hi >= m.limit
+        })
+        .expect("a padding at the edge");
+    let five = IdentityDoc::sign(&old.key, padded(pad)).unwrap();
+    old.switch.deliver_identity(&five).unwrap();
+    old.signer
+        .delivered(five.signed().clone(), Some(large.hash()), None)
+        .await
+        .unwrap();
+    let six = old.signer.set_record_max_age(Some(60)).await.unwrap();
+    let m = enrollment_measure(old, six.body(), five.hash());
+    eprintln!(
+        "v6 enrollment measure {} limit {} (under by {})",
+        m.bytes,
+        m.limit,
+        m.limit - m.bytes
+    );
+    (six, m.limit)
+}
+
+/// At the edge, the measure of a move's enrollment is never below the real move's body, and
+/// above it by exactly the App IDs of the apps the version lists, counted as revoked already
+/// (Switch wire 3.7, 7.1).
+#[tokio::test]
+async fn test_vectors_old_signer_measures_a_real_move_at_the_edge() {
+    let mut old = old_signer().await;
+    let (six, limit) = at_the_edge(&mut old, 16, 20).await;
+    let prev = old.signer.state.newest.as_ref().unwrap().prev.unwrap();
+    let measured = enrollment_measure(&old, six.body(), prev);
+    let real = real_move_request(&old, &six);
+    // Each listed App ID, in `revoked_apps`: a 26-character text, quoted, and its comma, 29
+    // bytes of the enrollment's JSON, which travels base64url-encoded (wire 2.2).
+    let listed = six
+        .body()
+        .apps
+        .iter()
+        .filter(|app| !old.signer.state.tombstones.contains(&app.app_id))
+        .count();
+    assert!(measured.bytes >= real);
+    assert!((measured.bytes - real).abs_diff(listed * 29 * 4 / 3) <= 2);
+    assert!(real + 16 <= limit);
+}
+
+/// At the edge, revoking an app with no `renewed` entries goes through: its App ID was in the
+/// measure already, as a listed app's, so its removal shrinks every body (Switch wire 3.7,
+/// 7.1, spec 12.2).
+#[tokio::test]
+async fn test_vectors_old_signer_revokes_an_app_without_renewals_at_the_edge() {
+    let mut old = old_signer().await;
+    let (six, _) = at_the_edge(&mut old, 16, 30).await;
+    let keys = load("keys.json");
+    let phone = app_keys(&keys, "phone").app_id_bytes();
+    assert!(six.body().renewed.iter().all(|r| r.app_id != phone));
+    let removed = old
+        .signer
+        .revoke(phone, None, UserConfirmed::shown_and_confirmed())
+        .await
+        .unwrap();
+    assert!(removed.listed_cert(&phone).is_none());
+    old.signer.set_record_max_age(Some(61)).await.unwrap();
+}
+
+/// A reduction signed at the edge closes, and both the renewing version and its closing still
+/// fit a real move (Switch wire 3.7, 3.8, 7.1).
+#[tokio::test]
+async fn test_vectors_old_signer_closes_and_moves_a_reduction_at_the_edge() {
+    let mut old = old_signer().await;
+    let (wallet, change) = reduction_at_the_edge(&mut old).await;
+    let six = old.signer.renew(wallet, change).await.unwrap();
+    let limit = super::enrollment_limit().unwrap();
+    assert!(real_move_request(&old, &six) <= limit);
+    old.clock.set_ms(VECTOR_START_MS + 3 * 60_000);
+    old.signer.resume().await.unwrap();
+    old.signer.run_due().await.unwrap();
+    assert!(old.signer.owed().unwrap().is_empty(), "nothing owed");
+    let closed = old.signer.identity_doc().unwrap().unwrap();
+    assert!(closed.body().renewed.iter().all(|r| r.until.is_some()));
+    assert!(real_move_request(&old, &closed) <= limit);
+}
+
+/// A reduction signed at the edge whose renewing delivery failed, then a revocation of an app
+/// without renewals while the closing is owed: the closing still fits, and the revocation
+/// completes after it, nothing wedged (Switch wire 3.8, 7.1, spec 12.2).
+#[tokio::test]
+async fn test_vectors_old_signer_revokes_while_a_closing_is_owed_at_the_edge() {
+    let mut old = old_signer().await;
+    let (wallet, change) = reduction_at_the_edge(&mut old).await;
+    let keys = load("keys.json");
+    let phone = app_keys(&keys, "phone").app_id_bytes();
+    old.switch.fail_next(Fault::Unreachable {
+        path: "/identity".into(),
+        after: 0,
+    });
+    old.signer.renew(wallet, change).await.unwrap_err();
+    old.signer
+        .revoke(phone, None, UserConfirmed::shown_and_confirmed())
+        .await
+        .unwrap_err();
+    old.clock.set_ms(VECTOR_START_MS + 3 * 60_000);
+    old.signer.resume().await.unwrap();
+    old.signer.run_due().await.unwrap();
+    assert!(
+        old.signer.owed().unwrap().is_empty(),
+        "the closing was delivered"
+    );
+    let newest = old.signer.identity_doc().unwrap().unwrap();
+    assert!(
+        newest.listed_cert(&phone).is_none(),
+        "the revocation completed"
+    );
+    let limit = super::enrollment_limit().unwrap();
+    assert!(real_move_request(&old, &newest) <= limit);
+}
+
+/// At the edge, a restore in place after the switch shows a listed app revoked: the restore
+/// adds that App ID to the records, which the measure counted already, as a listed app's, so
+/// its next version, measured against the cap itself, is signed (Switch wire 3.13, 7.1).
+#[tokio::test]
+async fn test_vectors_old_signer_restores_at_the_edge_after_a_revocation_at_the_switch() {
+    let mut old = old_signer().await;
+    at_the_edge(&mut old, 16, 20).await;
+    let keys = load("keys.json");
+    let wallet = app_keys(&keys, "wallet").app_id_bytes();
+    old.switch.revoke(wallet).unwrap();
+    let restored = old
+        .signer
+        .restore(UserConfirmed::shown_and_confirmed())
+        .await
+        .unwrap();
+    assert!(old.signer.state.tombstones.contains(&wallet));
+    let limit = super::enrollment_limit().unwrap();
+    assert!(real_move_request(&old, &restored) <= limit);
+}
+
+/// At the edge, a take-over after the switch shows a listed app revoked: the new signer's
+/// records take that App ID, which the measure counted already, and its first version is
+/// signed and delivered (Switch wire 3.12, 7.1).
+#[tokio::test]
+async fn test_vectors_new_signer_takes_over_at_the_edge_after_a_revocation_at_the_switch() {
+    let mut old = old_signer().await;
+    let (six, _) = at_the_edge(&mut old, 16, 20).await;
+    let keys = load("keys.json");
+    let wallet = app_keys(&keys, "wallet").app_id_bytes();
+    old.switch.revoke(wallet).unwrap();
+    old.signer
+        .hand_over_to(old.phone, UserConfirmed::shown_and_confirmed())
+        .await
+        .unwrap();
+    let alice = old.key.public();
+    let v3 = IdentityDoc::verify(&document("alice identity.json"), &alice).unwrap();
+    let phone = super::ReceivingApp {
+        keys: app_keys(&keys, "phone"),
+        cert: AppCert::verify(&document("phone certificate"), &alice).unwrap(),
+        origin: six.inbox().url.clone(),
+        service_key: v3.inbox().service_key,
+    };
+    let env = SignerEnv {
+        store: StoreHandle::inline(Arc::new(MemoryStore::new())),
+        clock: old.clock.clone(),
+        transport: old.transport.clone(),
+        homeserver: old.homeserver.clone(),
+        protocols: Protocols::new(vec![Arc::new(VectorScopes::new())]).unwrap(),
+    };
+    let new = Signer::receive_hand_over(env, &phone, Arc::new(Vault(Mutex::new(None))))
+        .await
+        .unwrap();
+    assert!(new.state.tombstones.contains(&wallet));
+    let taken = new.identity_doc().unwrap().unwrap();
+    assert_eq!(old.switch.identity_doc().unwrap().hash(), taken.hash());
+    for measure in super::measures(&new.state, taken.body(), None).unwrap() {
+        assert!(measure.bytes <= measure.limit, "{measure:?}");
+    }
+}
+
+/// alice padded so that a reduction of the wallet, as the signer measures its renewing
+/// version (one more entry, closed, at the next epoch), lands 16 to 20 bytes under the
+/// enrollment cap. Returns the wallet and the reduction to ask for.
+async fn reduction_at_the_edge(old: &mut OldSigner) -> ([u8; 16], CertChange) {
+    let alice = old.key.public();
+    let renewed = AppCert::verify(&document("wallet certificate, renewed"), &alice).unwrap();
+    let keys = load("keys.json");
+    let wallet = app_keys(&keys, "wallet").app_id_bytes();
+    let entries = entries_near_the_cap(&old.signer, 2_000);
+    let large = with_renewed(old, entries, Some(VECTOR_START_MS)).await;
+    let padded = |pad: usize| {
+        let mut body = large.body().clone();
+        body.version = 5;
+        body.inbox.url = format!("https://{}.switch.example", "a".repeat(pad));
+        body
+    };
+    let renewing = |pad: usize| {
+        let mut body = padded(pad);
+        body.version = 6;
+        body.renewed.push(RenewedCert {
+            app_id: wallet,
+            cert: body.apps[0].cert,
+            until: Some(0),
+        });
+        body.apps[0].cert = renewed.hash();
+        body.data_epoch += 1;
+        body
+    };
+    let pad = (1..3_000)
+        .find(|pad| {
+            let m = enrollment_measure(old, &renewing(*pad), [0; 32]);
+            m.bytes + 16 <= m.limit && m.bytes + 20 >= m.limit
+        })
+        .expect("a padding at the edge");
+    let five = IdentityDoc::sign(&old.key, padded(pad)).unwrap();
+    old.switch.deliver_identity(&five).unwrap();
+    old.signer
+        .delivered(five.signed().clone(), Some(large.hash()), None)
+        .await
+        .unwrap();
+    old.clock.set_ms(VECTOR_START_MS + 2 * 60_000);
+    let change = CertChange {
+        scopes: Some(renewed.scopes().to_vec()),
+        expires_at: Some(renewed.expires_at()),
+    };
+    (wallet, change)
+}
