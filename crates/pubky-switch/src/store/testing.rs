@@ -228,6 +228,12 @@ impl TestDatabase {
         pause
     }
 
+    /// How many reads after the lock of account `id` hold or wait for its turn
+    /// ([`Store::begin_reading`]). For tests only.
+    pub fn queued_reads(&self, id: &str) -> usize {
+        super::snapshot::queued(&self.store.reading, id)
+    }
+
     /// Close the store and drop the database.
     pub async fn drop_database(mut self) -> Result<(), StoreError> {
         self.store.close().await;
@@ -256,7 +262,16 @@ pub struct SnapshotPause {
 ///
 /// When the database can't be made, or is required and not configured. For tests only.
 pub async fn test_database() -> Option<TestDatabase> {
-    match TestDatabase::create(&DatabaseConfig::default()).await {
+    test_database_with(&DatabaseConfig::default()).await
+}
+
+/// [`test_database`] with `config`'s pool settings.
+///
+/// # Panics
+///
+/// As [`test_database`]. For tests only.
+pub async fn test_database_with(config: &DatabaseConfig) -> Option<TestDatabase> {
+    match TestDatabase::create(config).await {
         Ok(db) => Some(db),
         Err(TestDatabaseError::Skipped) => {
             eprintln!("skipped: set {TEST_DATABASE_URL_ENV} to run this test against PostgreSQL");

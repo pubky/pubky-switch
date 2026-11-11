@@ -80,7 +80,7 @@ pub struct DatabaseConfig {
     /// Apply pending schema migrations at start.
     pub migrate_on_start: bool,
     /// Most reads at once that run after the account's lock on a snapshot of the state
-    /// under it (`GET /allow`, `GET /directory`), each on a connection of its own, on top
+    /// under it (`GET /allow`), each on a connection of its own, on top
     /// of `max_connections`. A request waits for one before it takes the lock.
     pub snapshot_readers: u32,
     /// How long the service keeps trying to reach the database at start, while it refuses
@@ -448,18 +448,22 @@ impl Store {
     /// is waited for, so the request waits for a free reader without holding the lock;
     /// [`AccountTxn::snapshot_read`] hands it the locked transaction's snapshot.
     ///
-    /// At most one such read of an account is in flight in this process: while one is, a
-    /// second is refused at once, [`StoreError::LockTimeout`] as for a busy account, before
-    /// it takes a reader. So the readers every account shares can't all be held by one
-    /// account's reads.
+    /// One such read of an account runs at a time in this process; the next ones wait for
+    /// their turn in order, before they take a reader and holding no connection, at most
+    /// `lock_timeout_ms` ([`StoreError::LockTimeout`] after it, and at once past 8
+    /// waiting). So the readers every account shares can't all be held by one account's
+    /// reads. The caller takes a turn only for a request that has verified as one the read
+    /// serves, so no other request ever waits in, or holds, an account's queue.
     pub async fn begin_reading(&self, id: &str) -> Result<Option<AccountTxn>, StoreError> {
-        let slot = snapshot::ReadSlot::claim(&self.reading, id).ok_or(StoreError::LockTimeout)?;
+        let wait = Duration::from_millis(self.lock_timeout_ms);
+        let turn = snapshot::ReadTurn::wait(&self.reading, id, wait).await?;
         let reader = self.readers.begin().await.map_err(StoreError::from_db)?;
         let Some(mut txn) = self.begin(id).await? else {
             return Ok(None);
         };
         txn.reader = Some(reader);
-        txn.read_slot = Some(slot);
+        txn.read_turn = Some(turn);
+        txn.import_timeout_ms = self.lock_timeout_ms;
         #[cfg(any(test, feature = "test-util"))]
         {
             txn.snapshot_pause = self

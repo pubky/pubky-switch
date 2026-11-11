@@ -443,9 +443,11 @@ impl Service {
             let account_key = pubky_switch_core::enc::pubky_key(&account).unwrap_or([0; 32]);
             peers::verify_delivery(&request.body, &account_key, other.as_ref())
         });
-        // The reads that run after the lock on its snapshot take their reader first, so the
-        // lock is never held waiting for one.
-        let begun = if matches!(call, Call::GetAllow) {
+        // The reads that run after the lock on its snapshot take their account's turn and
+        // their reader first, so the lock is never held waiting for one. Only an own app's
+        // verified request takes them: the signer's is refused under the lock without a
+        // read, and an app of another identity's was refused above.
+        let begun = if matches!(call, Call::GetAllow) && verified.is_some() {
             self.store.begin_reading(&account).await
         } else {
             self.store.begin(&account).await
