@@ -22,6 +22,12 @@
 //!   that isn't the one the record carries, shows;
 //! - inside each signed document and each base64url JSON value, the same facts again.
 //!
+//! What this can't tell: a long string a switch makes itself, echoing nothing a party sent
+//! (a chain hash, an item hash, a signature of its own), that is wrong from its first
+//! appearance and repeated consistently wherever the right one would show. Two runs read
+//! alike then. [`crate::check`] verifies those the harness has the means to verify, in both
+//! runs; the rest is checked only as far as the client and the signer check it.
+//!
 //! An error's `message` is for people (Switch wire 7.6): it isn't kept.
 //!
 //! Member order is free (Switch wire 1.1), so a reader never depends on it. It is kept all
@@ -42,6 +48,7 @@ use serde::de::{Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde_json::Value;
 
 use crate::HarnessError;
+use crate::check::{Checker, SignedWith};
 
 /// The members whose string value is one of the wire format's fixed words or a name the
 /// flow chose, kept by value whatever its length: error codes, document kinds, operations,
@@ -69,6 +76,13 @@ pub const SHORT: usize = 11;
 
 /// What ends the name of the fact that holds an object's member names in the order written.
 pub const MEMBER_ORDER: &str = " (member order)";
+
+/// What starts the name of a fact that holds a check of [`crate::check`] that failed. The
+/// comparison reports every such fact, also one both runs show.
+pub const VIOLATION: &str = "violation";
+
+/// The fact that says which key an answer's signature verified with.
+const SIGNED_WITH: &str = "answer signed with";
 
 /// The answer headers whose presence is kept (Switch wire 7.1).
 const HEADERS: [&str; 4] = [
@@ -172,6 +186,7 @@ impl std::fmt::Display for Trace {
 pub struct Recorder {
     inner: Arc<dyn Transport>,
     names: Arc<Names>,
+    checker: Arc<Checker>,
     lines: Mutex<Vec<Line>>,
     /// The number of each long string the run showed, by its value, in order of appearance.
     strings: Mutex<HashMap<String, usize>>,
@@ -188,11 +203,13 @@ impl std::fmt::Debug for Recorder {
 }
 
 impl Recorder {
-    /// A recorder in front of `inner`, naming IDs with `names`.
-    pub fn new(inner: Arc<dyn Transport>, names: Arc<Names>) -> Self {
+    /// A recorder in front of `inner`, naming IDs with `names` and verifying each answer
+    /// with `checker`.
+    pub fn new(inner: Arc<dyn Transport>, names: Arc<Names>, checker: Arc<Checker>) -> Self {
         Self {
             inner,
             names,
+            checker,
             lines: Mutex::new(Vec::new()),
             strings: Mutex::new(HashMap::new()),
             distortion: Mutex::new(None),
@@ -322,11 +339,26 @@ impl Transport for Recorder {
             let answer = self.inner.send(request).await;
             match &answer {
                 Ok(answer) => {
+                    let mut violations = Vec::new();
+                    // The signature is of the answer as the switch sent it.
+                    match self.checker.signature(&sent, answer) {
+                        Ok(SignedWith::ServiceKey) => {
+                            facts.insert(SIGNED_WITH.into(), "the account's service key".into());
+                        }
+                        Ok(SignedWith::OperatorKey) => {
+                            facts.insert(SIGNED_WITH.into(), "the operator key".into());
+                        }
+                        Err(violation) => violations.push(violation),
+                    }
                     let mut kept = answer.clone();
                     if let Some(distort) = lock(&self.distortion).as_ref() {
                         distort(&sent, &mut kept);
                     }
                     self.answer_facts(&kept, &mut facts);
+                    violations.extend(self.checker.contents(&sent, &kept));
+                    for (index, violation) in violations.into_iter().enumerate() {
+                        facts.insert(format!("{VIOLATION} {}", index + 1), violation);
+                    }
                 }
                 Err(error) => {
                     let kind = match error {
@@ -676,6 +708,7 @@ mod tests {
         let recorder = Recorder::new(
             Arc::new(pubky_switch_client::transport::MockTransport::new()),
             Arc::new(Names::default()),
+            Arc::new(Checker::default()),
         );
         recorder.outcome("received", &json!({ "events": ["MessageReceived"] }));
         let trace = recorder.trace();

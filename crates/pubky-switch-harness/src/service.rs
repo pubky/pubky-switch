@@ -22,7 +22,6 @@ use pubky_switch::time::{Clock as ServiceClock, TimeSample, TrustedTime, Trusted
 use pubky_switch_client::TransportError;
 use pubky_switch_client::clock::{Clock, TestClock};
 use pubky_switch_client::transport::{BoxFuture, Header, Request, Response, Transport};
-use sqlx::{Connection, Executor};
 use tower::ServiceExt;
 
 use crate::HarnessError;
@@ -238,7 +237,9 @@ impl RealSwitch {
         self.database.as_ref().map_or("", TestDatabase::name)
     }
 
-    /// Drop the test database.
+    /// Drop the test database, and wait until it is gone. A switch that goes away without
+    /// this, as when its test panics, still drops its database: the test database drops
+    /// itself ([`pubky_switch::store::testing::TestDatabase`]).
     ///
     /// # Errors
     ///
@@ -250,35 +251,6 @@ impl RealSwitch {
                 .await
                 .map_err(|error| HarnessError::Setup(error.to_string())),
             None => Ok(()),
-        }
-    }
-}
-
-/// A switch that goes away without [`RealSwitch::close`], as when its test panics, still
-/// drops its database, so a failing test leaves none behind on the test server.
-impl Drop for RealSwitch {
-    fn drop(&mut self) {
-        let Some(database) = self.database.take() else {
-            return;
-        };
-        // The test's own runtime may be unwinding: the drop runs on a thread and a runtime
-        // of its own, and ends the store's connections from the server's side.
-        let dropped = std::thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .ok()?;
-            runtime.block_on(async {
-                let mut admin = database.admin().await.ok()?;
-                let drop = format!("DROP DATABASE IF EXISTS {} WITH (FORCE)", database.name());
-                admin.execute(drop.as_str()).await.ok()?;
-                admin.close().await.ok()
-            })
-        })
-        .join();
-        if !matches!(dropped, Ok(Some(()))) {
-            // Nothing more to do while dropping; say which database stays.
-            eprintln!("a test database couldn't be dropped at the end of its test");
         }
     }
 }

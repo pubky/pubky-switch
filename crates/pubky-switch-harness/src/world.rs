@@ -19,7 +19,7 @@ use pubky_switch_client::testing::{
 use pubky_switch_client::transport::{BoxFuture, Request, Response, Transport};
 use pubky_switch_core::enc::zbase32_encode;
 use pubky_switch_core::http::header;
-use pubky_switch_core::keys::AppKeys;
+use pubky_switch_core::keys::{AppKeys, IdentityKey};
 use pubky_switch_signer::{
     AddOutcome, Homeserver, IdentityKeyring, IdentitySecret, Protocols, SecretVault, SignerEnv,
     VaultError,
@@ -27,6 +27,7 @@ use pubky_switch_signer::{
 use serde_json::Value;
 
 use crate::HarnessError;
+use crate::check::Checker;
 use crate::service::{RealSwitch, database_configured};
 use crate::trace::{Names, Recorder, Trace};
 
@@ -55,6 +56,7 @@ pub struct World {
     files: Arc<TestHomeserver>,
     router: Arc<Router>,
     recorder: Arc<Recorder>,
+    checker: Arc<Checker>,
     names: Arc<Names>,
     services: Mutex<Vec<RealSwitch>>,
     scripted: Mutex<Vec<Arc<ScriptedSwitch>>>,
@@ -80,9 +82,12 @@ impl World {
         }
         let names = Arc::new(Names::default());
         let router = Arc::new(Router::new());
+        let checker = Arc::new(Checker::default());
+        checker.operator(IdentityKey::from_secret(OPERATOR_SECRET).public());
         let recorder = Arc::new(Recorder::new(
             router.clone() as Arc<dyn Transport>,
             names.clone(),
+            checker.clone(),
         ));
         Ok(Some(Self {
             backend,
@@ -91,6 +96,7 @@ impl World {
             files: Arc::new(TestHomeserver::new()),
             router,
             recorder,
+            checker,
             names,
             services: Mutex::new(Vec::new()),
             scripted: Mutex::new(Vec::new()),
@@ -141,6 +147,15 @@ impl World {
         origin: &str,
         identities: &[&TestIdentity],
     ) -> Result<(), HarnessError> {
+        // Each account's answers are verified with the service key of its identity's seed
+        // (an Ed25519 key, as an identity key is).
+        for identity in identities {
+            self.checker.account(
+                &identity.key().id(),
+                identity.public(),
+                IdentityKey::from_secret(identity.service_secret()).public(),
+            );
+        }
         match self.backend {
             Backend::Service => {
                 let switch = RealSwitch::start(
