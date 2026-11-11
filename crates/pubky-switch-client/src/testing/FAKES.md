@@ -137,7 +137,7 @@ service.
   scripts a faulty service that shows no time for a removal. Freeze and
   unfreeze are test calls, not routes.
 - **`lose_identity`** scripts a faulty service that lost the account's `identity.json`.
-- **The signer hand-over** (Switch wire 7.4.17): `PUT /handover` runs the core's checks of a
+- **The signer hand-over** (Switch wire 7.4.17), without the 12 MiB body cap of `PUT /handover`: `PUT /handover` runs the core's checks of a
   stored hand-over (`SignerHandover::check_stored`) for a current target with a checked
   certificate, and keeps one, replacing any it held; `GET /handover` serves it to the signer
   and to its target; the next `identity.json` version, whoever delivered it, drops it.

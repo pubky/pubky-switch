@@ -1016,11 +1016,17 @@ impl Signer {
         if let Ok(delivered) = &verified
             && let Some(handing) = state.handing_over.clone()
         {
-            // The abort or the take-back won: the hand-over is over (Switch wire 3.12).
-            if handing.abort == Some(delivered.hash()) {
+            // The abort or the take-back won: the hand-over is over, and this install signs
+            // again, so an alert that another install manages the identity no longer holds
+            // (Switch wire 3.12).
+            let take_back = handing.take_back.filter(|t| t.doc == doc);
+            if handing.abort == Some(delivered.hash()) || take_back.is_some() {
                 state.handing_over = None;
-            } else if let Some(take_back) = handing.take_back.filter(|t| t.doc == doc) {
-                state.handing_over = None;
+                state
+                    .alerts
+                    .retain(|a| !matches!(a, Alert::ManagedByOtherInstall { .. }));
+            }
+            if let Some(take_back) = take_back {
                 state.alert(Alert::TakenBack {
                     from: take_back.from,
                 });

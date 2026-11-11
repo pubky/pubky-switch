@@ -1399,3 +1399,211 @@ async fn test_resume_take_over_opens_a_take_over_that_won() {
     assert_eq!(again.status(), SignerStatus::Signing);
     assert_eq!(again.install_id(), install);
 }
+
+/// A backup of `doc` sealed with the identity key, holding the records of the backup there.
+fn backup_of(world: &World, doc: &IdentityDoc) -> Vec<u8> {
+    use pubky_switch_core::records::{SignerBackup, SignerRecords};
+    let held = world.backup();
+    let records = SignerRecords::new(
+        world.key.clone(),
+        doc.clone(),
+        held.revoked_apps(),
+        held.certs(),
+        *held.limits(),
+        held.bundle_parts(),
+        Some(held.identity_doc().hash()),
+    )
+    .unwrap();
+    serde_json::to_vec(&SignerBackup::seal(&world.key, &records).unwrap()).unwrap()
+}
+
+#[tokio::test]
+async fn test_old_signer_proof_needs_the_same_install_in_a_newer_backup() {
+    // The switch shows install 7's newer version. A genuine backup naming another install, or
+    // naming 7 but at the version handed over, as from an earlier time it signed, isn't the
+    // proof: the key stays.
+    let world = World::new();
+    let mut s = setup(&world).await;
+    s.old.hand_over_to(s.app_id(), confirmed()).await.unwrap();
+    let seven = world.other_install_version(&s.handed, [7; 16]);
+    world.switch.deliver_identity(&seven).unwrap();
+    let eight = world.other_install_version(&seven, [8; 16]);
+    let mut earlier = s.handed.body().clone();
+    earlier.signer = [7; 16];
+    let earlier = IdentityDoc::sign(&world.key, earlier).unwrap();
+    for backup in [backup_of(&world, &eight), backup_of(&world, &earlier)] {
+        world.homeserver.set(SIGNER_BACKUP_PATH, backup);
+        assert_eq!(
+            s.old.resume().await.unwrap_err(),
+            SignerError::Refused(Refusal::SuccessorUnproven { install: [7; 16] })
+        );
+        assert!(vault_holds(&world.vault));
+        assert!(holds_records(&s.old_store).await);
+    }
+    // 7's own newer backup is.
+    world
+        .homeserver
+        .set(SIGNER_BACKUP_PATH, backup_of(&world, &seven));
+    assert_eq!(
+        s.old.resume().await.unwrap_err(),
+        SignerError::HandedOver { install: [7; 16] }
+    );
+    assert!(!vault_holds(&world.vault));
+}
+
+#[tokio::test]
+async fn test_take_over_cancellation_keeps_a_key_held_before() {
+    // The new install's vault already held the identity key. Its take-over is cancelled by an
+    // abort that won: what the hand-over brought goes, the key held before stays.
+    let world = World::new();
+    let mut s = setup(&world).await;
+    s.old.hand_over_to(s.app_id(), confirmed()).await.unwrap();
+    let store = Arc::new(MemoryStore::new());
+    let vault = Arc::new(Vault(Mutex::new(Some(SECRET))));
+    world.switch.fail_next(SwitchFault::Unreachable {
+        path: "/identity".into(),
+        after: 0,
+    });
+    Signer::receive_hand_over(world.env(store.clone()), &s.target, vault.clone())
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        s.old.abort_hand_over(confirmed()).await.unwrap(),
+        AbortOutcome::Aborted { .. }
+    ));
+    assert_eq!(
+        Signer::resume_take_over(
+            world.env(store.clone()),
+            world.key.public(),
+            &s.target.keys,
+            vault.clone()
+        )
+        .await
+        .unwrap_err(),
+        SignerError::Refused(Refusal::TakeOverCancelled)
+    );
+    assert!(!holds_records(&store).await);
+    assert!(
+        vault_holds(&vault),
+        "the key held before the hand-over stays"
+    );
+}
+
+#[tokio::test]
+async fn test_take_back_only_just_after_the_version_handed_over() {
+    // The new signer signed on past its first version, and the Homeserver withholds its
+    // backup: there is no take-back at a later version.
+    let world = World::new();
+    let mut s = setup(&world).await;
+    s.old.hand_over_to(s.app_id(), confirmed()).await.unwrap();
+    let mut new = Signer::receive_hand_over(
+        world.env(Arc::new(MemoryStore::new())),
+        &s.target,
+        empty_vault(),
+    )
+    .await
+    .unwrap();
+    new.set_record_max_age(Some(60)).await.unwrap();
+    world
+        .homeserver
+        .set(SIGNER_BACKUP_PATH, b"withheld".to_vec());
+    let sent = world.sent_docs().len();
+    assert_eq!(
+        s.old.take_back(confirmed()).await.unwrap_err(),
+        SignerError::Refused(Refusal::NothingToTakeBack)
+    );
+    assert_eq!(world.sent_docs().len(), sent);
+    assert!(vault_holds(&world.vault));
+}
+
+#[tokio::test]
+async fn test_hand_over_owed_record_cleanup_waits() {
+    // A revoked app's record deletion is owed when the hand-over starts: it waits, since the
+    // old signer writes nothing to the Homeserver while handing over.
+    let world = World::new();
+    let mut s = setup(&world).await;
+    let b = App::with_keys(
+        AppKeys::from_secrets([13; 32], [14; 32]),
+        &["notes"],
+        None,
+        [15; 32],
+    );
+    world.approve(&mut s.old, &b).await;
+    let b_id = b.keys.app_id_bytes();
+    let path = pubky_switch_core::records::app_record_path(&b_id);
+    world.homeserver.set(&path, b"b's record".to_vec());
+    *world.homeserver.failing_path.lock().unwrap() = Some(path.clone());
+    s.old.revoke(b_id, None, confirmed()).await.unwrap();
+    *world.homeserver.failing_path.lock().unwrap() = None;
+    assert!(
+        world.homeserver.file(&path).is_some(),
+        "the deletion is owed"
+    );
+    s.old.hand_over_to(s.app_id(), confirmed()).await.unwrap();
+    let _ = s.old.resume().await;
+    let _ = s.old.run_due().await;
+    assert!(world.homeserver.file(&path).is_some());
+    // Once the abort has won, the deletion goes.
+    s.old.abort_hand_over(confirmed()).await.unwrap();
+    assert!(world.homeserver.file(&path).is_none());
+}
+
+#[tokio::test]
+async fn test_take_back_leaves_no_alert_that_another_install_signs() {
+    let world = World::new();
+    let mut s = setup(&world).await;
+    s.old.hand_over_to(s.app_id(), confirmed()).await.unwrap();
+    *world.homeserver.failing_path.lock().unwrap() = Some(SIGNER_BACKUP_PATH.to_owned());
+    let new = Signer::receive_hand_over(
+        world.env(Arc::new(MemoryStore::new())),
+        &s.target,
+        empty_vault(),
+    )
+    .await
+    .unwrap();
+    *world.homeserver.failing_path.lock().unwrap() = None;
+    let install = new.install_id();
+    let _ = s.old.resume().await;
+    assert!(
+        s.old
+            .alerts()
+            .contains(&Alert::ManagedByOtherInstall { install })
+    );
+    s.old.take_back(confirmed()).await.unwrap();
+    assert_eq!(s.old.status(), SignerStatus::Signing);
+    assert!(
+        !s.old
+            .alerts()
+            .contains(&Alert::ManagedByOtherInstall { install })
+    );
+    assert!(s.old.alerts().contains(&Alert::TakenBack { from: install }));
+}
+
+#[tokio::test]
+async fn test_revoke_refused_while_taking_over() {
+    // A take-over not yet won, opened by a host whose vault already holds the key: a
+    // revocation at the switch, which can't be undone, is refused.
+    let world = World::new();
+    let mut s = setup(&world).await;
+    s.old.hand_over_to(s.app_id(), confirmed()).await.unwrap();
+    let store = Arc::new(MemoryStore::new());
+    let vault = Arc::new(Vault(Mutex::new(Some(SECRET))));
+    world.switch.fail_next(SwitchFault::Unreachable {
+        path: "/identity".into(),
+        after: 0,
+    });
+    Signer::receive_hand_over(world.env(store.clone()), &s.target, vault.clone())
+        .await
+        .unwrap_err();
+    let keyring = IdentityKeyring::open(vault).unwrap();
+    let mut taking = Signer::open(world.env(store), keyring).await.unwrap();
+    assert_eq!(taking.status(), SignerStatus::TakingOver);
+    assert_eq!(
+        taking
+            .revoke(s.app_id(), None, confirmed())
+            .await
+            .unwrap_err(),
+        SignerError::Refused(Refusal::TakingOver)
+    );
+    assert!(world.switch.app(&s.app_id()).revoked_at.is_none());
+}

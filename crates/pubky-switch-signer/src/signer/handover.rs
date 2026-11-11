@@ -98,7 +98,16 @@ impl Signer {
         if !self.owed()?.is_empty() {
             return Err(Refusal::ClosingOwed.into());
         }
-        if !self.state.revoking.is_empty() {
+        // A revocation whose version isn't delivered: the app is still listed. One that only
+        // owes its record's deletion is in the sealed records as a tombstone, and the new
+        // signer owes that deletion again from them.
+        let newest = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
+        if self
+            .state
+            .revoking
+            .iter()
+            .any(|r| newest.listed_cert(&r.app_id).is_some())
+        {
             return Err(Refusal::RevocationOwed.into());
         }
         let identity = self.state.identity;

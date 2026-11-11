@@ -232,10 +232,11 @@ impl IdentityKeyring {
     ) -> Result<(Self, SignerRecords), pubky_switch_core::Error> {
         let records = handover.open(identity, app_id, bundle_secret)?;
         let key = records.key();
+        let secret = zeroize::Zeroizing::new(key.secret_bytes());
         let keyring = Self {
             vault,
             public: key.public(),
-            held: Some(IdentitySecret::from_bytes(key.secret_bytes())),
+            held: Some(IdentitySecret::from_bytes(*secret)),
         };
         Ok((keyring, records))
     }

@@ -64,8 +64,9 @@ impl Signer {
     ///
     /// # Errors
     ///
-    /// [`Refusal::NotListed`] for an app the newest `identity.json` doesn't list; otherwise
-    /// as [`Signer::resume`]. A revocation cut short goes on at [`Signer::run_due`]. While an
+    /// [`Refusal::NotListed`] for an app the newest `identity.json` doesn't list;
+    /// [`Refusal::HandingOver`] or [`Refusal::TakingOver`] while a hand-over or a take-over is
+    /// in progress; otherwise as [`Signer::resume`]. A revocation cut short goes on at [`Signer::run_due`]. While an
     /// alarm holds signing back, the app is still revoked at the switch, and the error is the
     /// alarm's: the version that removes it waits until the alarm is cleared.
     pub async fn revoke(
@@ -84,6 +85,11 @@ impl Signer {
                 to_app: handing.to_app,
             }
             .into());
+        }
+        // Nor while taking over: a revocation at the switch can't be undone, and this install
+        // isn't the signer until its first delivery has won (Switch wire 3.12).
+        if self.state.taking_over {
+            return Err(Refusal::TakingOver.into());
         }
         let newest = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
         if newest.listed_cert(&app_id).is_none() {
