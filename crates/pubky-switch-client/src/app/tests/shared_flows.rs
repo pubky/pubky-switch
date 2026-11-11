@@ -5351,3 +5351,47 @@ async fn test_records_read_fresh_tells_a_fresh_read_from_a_kept_copy() {
     // The read the existing call makes still returns the copy.
     assert!(phone.read_record(&target).await.unwrap().is_some());
 }
+
+/// A newer write that fails a check, a value that doesn't open with its key held, keeps
+/// the earlier copy.
+#[tokio::test]
+async fn test_records_read_fresh_keeps_a_copy_past_a_write_that_fails_a_check() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    let target = s.target("n1");
+    phone
+        .put_record(&target, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    assert!(matches!(
+        wallet.read_record_fresh(&target).await.unwrap(),
+        RecordRead::Fresh(_)
+    ));
+    let (_, kind) = phone
+        .record_op(&target, Some(&value(&["a", "b"])), vec![])
+        .await
+        .unwrap();
+    let OpKind::RecordPut(mut put) = kind else {
+        unreachable!("a record op");
+    };
+    put.value_sealed = pubky_switch_core::sealed::SealedValue::seal(
+        &[3; 32],
+        &s.w.alice.public(),
+        1,
+        "scope-a",
+        &put.key,
+        &value(&["a", "b"]),
+    )
+    .unwrap();
+    s.w.switch
+        .app_op(&app_keys("phone"), OpKind::RecordPut(put))
+        .unwrap();
+    match wallet.read_record_fresh(&target).await.unwrap() {
+        RecordRead::Kept {
+            record: Some(record),
+            reason: KeptReason::Refused,
+        } => assert_eq!(ids(record.content.value()), ["a"]),
+        other => panic!("{other:?}"),
+    }
+}
