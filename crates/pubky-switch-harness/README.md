@@ -49,10 +49,10 @@ every one alike:
 | `POST /v1/{id}/apps/{app_id}/leave` | a lost answer | `403 not_current` |
 | `PUT /v1/{id}/peers` | a lost answer | `200` again |
 | `GET /v1/{id}/feed` | a lost answer | the same page |
-
 | `POST /v1/{id}/apps/{app_id}/revoke` | a lost answer, and a failed read of the apps | `200`, no proofs, the head |
 | a `claim` `done` batch, the same batch | a lost answer | the original proof, which settles the claim for the app |
 | a second `done` at the step the first took | the first try's lost answer | `409 conflict`, the settled claim in `current` |
+| `PUT /v1/{id}/handover`, the same hand-over | a lost answer | `200` again, the same app and parts |
 
 A revocation whose answer was lost isn't sent again while the signer can read the switch: it
 reads the account's apps and finds it done.
