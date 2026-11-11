@@ -603,6 +603,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_scripted_erasure_naming_a_hash_with_no_identity_json_held_is_conflict() {
+        // A fresh account holds no `identity.json`: a hash can't match, so the erasure is
+        // `409 conflict` and erases nothing; the key alone erases it (Switch wire 7.4.16).
+        use pubky_switch_core::http::erase_body;
+        let identity = pubky_switch_core::keys::IdentityKey::from_secret([1; 32]);
+        let switch = ScriptedSwitch::new(
+            &identity,
+            [2; 32],
+            Arc::new(crate::clock::TestClock::new(0)),
+        );
+        let mut inner = switch.lock();
+        assert!(inner.doc.is_none());
+        let key = inner.service.verifying_key().to_bytes();
+        let (status, body) = inner.erase_answer(&erase_body(&key, Some(&[9; 32])));
+        assert_eq!((status, body["code"].clone()), (409, json!("conflict")));
+        assert!(!inner.erased);
+        let (status, _) = inner.erase_answer(&erase_body(&key, None));
+        assert_eq!(status, 200);
+        assert!(inner.erased);
+    }
+
+    #[test]
     fn test_scripted_handover_refuses_unknown_members() {
         let sig = pubky_switch_core::enc::b64(&[0u8; 64]);
         assert!(read_handover(&json!({ "envelopes": [], "sig": sig })).is_some());
