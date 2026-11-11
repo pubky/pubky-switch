@@ -1943,10 +1943,11 @@ async fn test_records_feed_write_before_a_reduction_is_taken() {
 }
 
 /// Of the certificates in force at a feed write's time that hold a write scope, the reader
-/// takes the earliest, the one the write was made under, and keeps it with the write as its
-/// evidence: a renewal that only adds a scope, still open, leaves both counting.
+/// takes the one in the best standing now, and keeps it with the write as its evidence: a
+/// renewal that only adds a scope, still open, leaves both counting, and the listed one is
+/// kept, which still authorizes the write when nothing dates it, as after an upload.
 #[tokio::test]
-async fn test_records_feed_write_keeps_the_earliest_certificate_in_force() {
+async fn test_records_feed_write_keeps_the_best_standing_certificate_in_force() {
     let s = Setup::new();
     let mut wallet = join_scoped(&s, "wallet", &["scope-a"]).await;
     let mut phone = s.join("phone").await;
@@ -1975,7 +1976,7 @@ async fn test_records_feed_write_keeps_the_earliest_certificate_in_force() {
     );
     let evidence = phone.shared_evidence().await.unwrap();
     assert_eq!(evidence.ops.len(), 1);
-    assert_eq!(evidence.ops[0].cert, *earlier.signed());
+    assert_eq!(evidence.ops[0].cert, *renewed.signed());
 }
 
 /// A certificate expired at a feed write's time isn't in force then: the wallet's
@@ -2605,6 +2606,67 @@ async fn test_records_view_cert_no_identity_json_lists_is_refused() {
         "{from_list:?}"
     );
     assert!(tablet.shared_record(&key).await.unwrap().is_none());
+}
+
+/// A write under the earlier certificate dated `before` milliseconds before its `until`,
+/// which the switch takes before it takes the closed renewal the signer published, as in
+/// the failure path above: what a tablet that joins afterwards flags of it from the list.
+async fn rules_for_a_write_before_until(before: u64) -> (Vec<String>, bool) {
+    let s = Setup::new();
+    let mut wallet = join_scoped(&s, "wallet", &["scope-a", "scope-c"]).await;
+    s.w.clock.advance_ms(DAY_MS);
+    let earlier = wallet.cert().clone();
+    let renewed = renewal_of(&s, "wallet", &["scope-c"]);
+    let until = s.w.clock.now_ms() + CLOCK_TOLERANCE_MS;
+    let opened =
+        s.w.signer
+            .sign_next(|body| list_renewal(body, &earlier, &renewed, None))
+            .unwrap();
+    let closed =
+        s.w.signer
+            .sign_next(|body| list_renewal(body, &earlier, &renewed, Some(until)))
+            .unwrap();
+    s.w.clock.set_ms(until - before);
+    let target = s.target("n1");
+    wallet
+        .put_record(&target, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    let key = wallet.record_key(&target).unwrap();
+    s.w.switch
+        .signer_op(OpKind::CertPut {
+            target_app_id: wallet.app_id(),
+            cert: renewed.signed().clone(),
+        })
+        .unwrap();
+    s.w.switch.deliver_identity(&opened).unwrap();
+    s.w.switch.deliver_identity(&closed).unwrap();
+    let mut tablet = s.join("tablet").await;
+    tablet.list_collection(&items()).await.unwrap();
+    let rules = flagged_rules(&tablet.take_events());
+    let held = tablet.shared_record(&key).await.unwrap().is_some();
+    (rules, held)
+}
+
+/// A write dated exactly at the earlier certificate's `until` isn't before it: the
+/// certificate doesn't count for it (Switch wire 6.2 "Accepting a write" step 4).
+#[tokio::test]
+async fn test_records_write_dated_at_until_is_flagged() {
+    let (rules, held) = rules_for_a_write_before_until(0).await;
+    assert!(
+        rules.iter().any(|rule| rule.contains("step 4")),
+        "{rules:?}"
+    );
+    assert!(!held);
+}
+
+/// A write dated a millisecond before the earlier certificate's `until` counts under it
+/// (Switch wire 6.2 "Accepting a write" step 4).
+#[tokio::test]
+async fn test_records_write_dated_just_before_until_is_taken() {
+    let (rules, held) = rules_for_a_write_before_until(1).await;
+    assert!(rules.is_empty(), "{rules:?}");
+    assert!(held);
 }
 
 // -------------------------------------------------------------------------------------

@@ -1157,9 +1157,10 @@ impl App {
     /// and 4, 7.4.9). A record view's `cert` is the one the service checked the write
     /// against, and the write is judged with it, whatever certificate the writer holds now:
     /// a renewal later doesn't change which certificate a write was made under. Without one
-    /// (a write from the feed), the earliest known certificate in force at the write's time,
-    /// one that holds a write scope first; only when no known certificate was in force, the
-    /// one in the best standing now.
+    /// (a write from the feed), a known certificate in force at the write's time, one that
+    /// holds a write scope first, and of those the one in the best standing now, which
+    /// still authorizes the write when nothing dates it, as after an upload; only when no
+    /// known certificate was in force, the one in the best standing now.
     fn write_cert(
         &self,
         certs: &WriterCerts,
@@ -1182,7 +1183,7 @@ impl App {
             .iter()
             .filter(|cert| in_force(doc, cert, time))
             .collect();
-        counting.sort_by_key(|cert| cert.issued_at());
+        counting.sort_by_key(|cert| (rank(cert), cert.issued_at()));
         let found = counting
             .iter()
             .find(|cert| write_scopes.iter().any(|scope| cert.holds_scope(scope)))
