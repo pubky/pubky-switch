@@ -1034,6 +1034,29 @@ impl Signer {
                 });
             }
         }
+        // How close the version comes to the most a delivery, or a move's enrollment, may
+        // carry (Switch wire 3.7, 7.1).
+        let delivery = IdentityDelivery {
+            identity: doc.clone(),
+            prev,
+        };
+        let enrollment = state.service.as_ref().map(|service| EnrollmentBody {
+            identity: state.identity,
+            origin: service.origin.clone(),
+            nonce: [0; 16],
+            policy: verified
+                .as_ref()
+                .map(|delivered| delivered.body().policy)
+                .unwrap_or_default(),
+            identity_doc: Some(doc.clone()),
+            revoked_apps: (!state.tombstones.is_empty()).then(|| state.tombstones.clone()),
+        });
+        let enrollment_bytes = enrollment
+            .map(|body| serde_json::to_vec(&body).map(|json| signed_len(json.len())))
+            .transpose()
+            .map_err(|e| SignerError::Records(e.to_string()))?
+            .unwrap_or(0);
+        state.note_size(delivery.to_json().len().max(enrollment_bytes));
         let published = state
             .newest
             .as_ref()
@@ -1288,6 +1311,15 @@ enum Verdict {
     AtMark,
     /// Strictly newer, or any copy before there is a mark.
     Newer,
+}
+
+/// The length of a signed document's carrying form whose body is `body_len` bytes of JSON:
+/// `{"body":"<base64url>","sig":"<86 characters>"}` (Switch wire 2.2).
+fn signed_len(body_len: usize) -> usize {
+    let encoded = body_len.saturating_mul(4).saturating_add(2) / 3;
+    encoded
+        .saturating_add(r#"{"body":"","sig":""}"#.len())
+        .saturating_add(86)
 }
 
 fn stale_without_copy() -> SignerError {

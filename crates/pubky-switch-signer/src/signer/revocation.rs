@@ -181,7 +181,7 @@ impl Signer {
         // A rotation goes to the epoch after the newest version's, completing first an
         // epoch a given-up rotation sent keys for (Switch spec 3.2, 3.5).
         if self.state.epoch_through > newest.data_epoch() {
-            self.complete_epoch(&statuses).await?;
+            self.complete_epoch(&statuses, answered_at).await?;
             newest = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
             (statuses, answered_at) = self.switch_apps_at().await?;
         }
@@ -194,7 +194,7 @@ impl Signer {
         let key = self.signing_key()?;
         // The apps removed get no part, whatever the switch shows of them.
         let cut: Vec<[u8; 16]> = removing.iter().map(|r| r.app_id).collect();
-        let (ops, mut alerts) = self.catch_up(&key, &newest, &statuses, &cut, last)?;
+        let (ops, mut alerts) = self.catch_up(&key, &newest, &statuses, answered_at, &cut, last)?;
         alerts.extend(found.alerts);
         let batches = self.sign_batches(&key, newest.generation(), ops)?;
         let (doc, flow) = self.next_version(&key, |body| {
@@ -488,9 +488,9 @@ impl Signer {
     pub async fn serve_full_bundles(&mut self) -> Result<Vec<[u8; 16]>> {
         self.ready().await?;
         let newest = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
-        let statuses = self.switch_apps().await?;
+        // Served is judged on the switch's signed time, not the device clock.
+        let (statuses, now) = self.switch_apps_at().await?;
         let certs = self.held_certs()?;
-        let now = self.env.clock.now_ms();
         let current = newest.data_epoch();
         let protocols = self.env.protocols.clone();
         let keyed = keyed(&protocols);
