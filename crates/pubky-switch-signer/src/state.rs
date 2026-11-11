@@ -153,6 +153,16 @@ pub(crate) struct SignerState {
     /// The certificate lifetime new certificates get, in milliseconds (Switch spec 3.2).
     #[serde(default = "default_cert_lifetime")]
     pub(crate) cert_lifetime_ms: u64,
+    /// The automatic renewals in a row no record of their app has taken up, each by the app
+    /// and the hash of the certificate it issued: at two for an app, the signer stops renewing
+    /// it by itself (Switch spec 3.1). A renewal the user asks for, or a record carrying the
+    /// newest certificate, takes the app out, as the app's removal does. Added in the commit
+    /// of the renewing version, so a renewal counts once however its delivery goes, and
+    /// dropped with its certificate when that version is never delivered
+    /// ([`SignerState::prune_unreferenced`]). This install's own: a new install starts with
+    /// none.
+    #[serde(default)]
+    pub(crate) untaken_renewals: Vec<([u8; 16], [u8; 32])>,
     /// The companion claims of approvals, signed once, until the host has delivered them
     /// (Switch wire 3.10).
     #[serde(default)]
@@ -291,8 +301,9 @@ fn default_cert_lifetime() -> u64 {
 
 impl SignerState {
     /// Keep only the certificates the newest version references, of its apps and its
-    /// `renewed` entries, and the claims of certificates it lists: a version that wasn't
-    /// delivered leaves none of its own behind.
+    /// `renewed` entries, the claims of certificates it lists, and the untaken renewals of
+    /// certificates it references: a version that wasn't delivered leaves none of its own
+    /// behind, nor counts as a renewal the app left untaken.
     pub(crate) fn prune_unreferenced(&mut self) {
         let doc = self.newest_doc().ok().flatten();
         let referenced = |hash: &[u8; 32]| {
@@ -303,6 +314,7 @@ impl SignerState {
         };
         self.certs
             .retain(|cert| cert.doc_hash().is_ok_and(|hash| referenced(&hash)));
+        self.untaken_renewals.retain(|(_, cert)| referenced(cert));
         self.claims.retain(|claim| {
             doc.as_ref()
                 .is_some_and(|doc| doc.listed_cert(&claim.app_id) == Some(claim.cert))
@@ -338,6 +350,7 @@ impl SignerState {
             listed_at: Vec::new(),
             alerts: Vec::new(),
             cert_lifetime_ms: DEFAULT_CERT_LIFETIME_MS,
+            untaken_renewals: Vec::new(),
             claims: Vec::new(),
             switch_unconfirmed: false,
             epoch_through: 0,

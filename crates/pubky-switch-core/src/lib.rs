@@ -28,6 +28,7 @@ pub mod net;
 pub mod ops;
 pub mod receive;
 pub mod records;
+pub mod recovery;
 pub mod scopes;
 pub mod sealed;
 pub mod shared;

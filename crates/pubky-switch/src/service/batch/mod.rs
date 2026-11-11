@@ -27,7 +27,9 @@ use serde_json::json;
 
 use self::{
     apply::{Applied, Batch},
-    state::{HeldApp, HeldInvite, HeldPart, HeldRecord, ListEntry, Needs, OpsState, Totals},
+    state::{
+        HeldApp, HeldInvite, HeldOrigin, HeldPart, HeldRecord, ListEntry, Needs, OpsState, Totals,
+    },
 };
 use super::{Answer, Service, rules::Claimed, store_error};
 use crate::{
@@ -37,7 +39,7 @@ use crate::{
     },
     keys::ServiceSigner,
     store::{
-        AccountTxn, ListName, NewChainItem, StoreError, StoredApp, StoredBundlePart,
+        AccountTxn, ListName, NewChainItem, RecordOrigin, StoreError, StoredApp, StoredBundlePart,
         StoredClaimEntry, StoredInvite, StoredListEntry, StoredRecord,
     },
 };
@@ -242,6 +244,10 @@ async fn load_state(
     let identity = head.identity_key;
     let mut state = OpsState::new(identity, head.generation, head.last_seq, now);
     state.doc = held.cloned();
+    // Through the generation a provider loss began, an app's first receive key at this
+    // service may carry any `n`: one higher than every `n` it registered (Switch spec 3.6,
+    // 12.6 step 1; wire 6.2).
+    state.recovering = txn.recovery().await?.is_some();
     for app in txn.apps().await? {
         state.apps.insert(app.app_id, held_app(&app, &identity)?);
     }
@@ -1105,25 +1111,35 @@ async fn save(
     for (op, proof) in ops.iter().zip(proofs) {
         if let OpKind::RecordPut(put) = &op.body().kind
             && let Some(record) = after.records.get_mut(&put.key)
+            && let HeldOrigin::Written { proof: signed, .. } = &mut record.origin
         {
-            record.proof = Some(proof.clone());
+            *signed = Some(proof.clone());
         }
     }
     save_apps(txn, before, after, release).await?;
     save_parts(txn, before, after).await?;
     for (key, record) in &after.records {
         if before.records.get(key) != Some(record) {
-            let proof = record
-                .proof
-                .clone()
-                .ok_or(StoreError::Corrupt("a record write without its proof"))?;
+            let origin = match &record.origin {
+                HeldOrigin::Written { proof, upload_base } => RecordOrigin::Written {
+                    proof: proof
+                        .clone()
+                        .ok_or(StoreError::Corrupt("a record write without its proof"))?,
+                    upload_base: *upload_base,
+                },
+                HeldOrigin::Uploaded { seq, exact } => RecordOrigin::Uploaded {
+                    seq: *seq,
+                    exact: *exact,
+                },
+            };
             txn.put_record(&StoredRecord {
                 state: record.state.clone(),
                 value_bytes: record.value_bytes,
                 writer: record.writer,
                 cert: record.cert.clone(),
                 op: record.op.clone(),
-                proof,
+                origin,
+                divergent: record.divergent,
             })
             .await?;
         }

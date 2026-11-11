@@ -55,8 +55,8 @@ pub use identity::HeldIdentity;
 pub use inbox::{InboxItem, InboxUsage, NewEntry, StoredEntry};
 pub use keying::{Keyed, keying_lock_key};
 pub use ops::{
-    ListName, StoredApp, StoredBundlePart, StoredClaimEntry, StoredInvite, StoredListEntry,
-    StoredRecord,
+    DivergentUpload, ListName, RecordOrigin, StoredApp, StoredBundlePart, StoredClaimEntry,
+    StoredInvite, StoredListEntry, StoredRecord,
 };
 pub use peers::{HeldPeer, PeerFloor};
 pub use recovery::{RECOVERY_KEEPS, Recovery, recovery_clears};

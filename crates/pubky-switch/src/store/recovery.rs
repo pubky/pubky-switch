@@ -52,12 +52,15 @@ pub const RECOVERY_KEEPS: &[&str] = &[
 ];
 
 /// Every table with an account column that a recovery in place empties: the generation's own state,
-/// `claim_entries` with their claims, and `pending_revoked_apps`, which joins `kept_app_ids`.
+/// `claim_entries` with their claims, `divergent_uploads` with their records, and
+/// `pending_revoked_apps`, which joins `kept_app_ids`.
 /// A table added later with an account column must be classed here or in
 /// [`RECOVERY_KEEPS`], which a test of every such table checks.
 pub fn recovery_clears() -> Vec<&'static str> {
     let mut tables = GENERATION_STATE.to_vec();
     tables.extend(["claim_entries", "pending_revoked_apps"]);
+    // A record's divergent uploads (Switch wire 7.4.14) go with their record.
+    tables.push("divergent_uploads");
     tables
 }
 
@@ -109,6 +112,24 @@ impl AccountTxn {
             .await
             .map_err(StoreError::from_db)?;
         Ok(true)
+    }
+
+    /// The App IDs held with the pending key, from the `revoked_apps` of the enrollments it
+    /// answered (Switch wire 3.7).
+    pub async fn pending_revoked_apps(&mut self) -> Result<Vec<[u8; 16]>, StoreError> {
+        let id = self.head().id.clone();
+        let rows: Vec<Vec<u8>> =
+            sqlx::query_scalar("SELECT app_id FROM pending_revoked_apps WHERE account_id = $1")
+                .bind(id)
+                .fetch_all(self.conn())
+                .await
+                .map_err(StoreError::from_db)?;
+        rows.iter()
+            .map(|app| {
+                <[u8; 16]>::try_from(app.as_slice())
+                    .map_err(|_| StoreError::Corrupt("pending revoked app_id"))
+            })
+            .collect()
     }
 
     /// Hold `apps`, an enrollment's `revoked_apps` answered with the pending key, until the

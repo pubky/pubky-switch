@@ -162,6 +162,12 @@ impl Service {
             // A first document that starts a recovery: the account takes its generation, and
             // its chain starts with the `recovery` transition (Switch wire 3.3, 7.4.2).
             Ok(Delivery::New(None)) if held.is_none() && doc.body().recovery_from.is_some() => {
+                // It names this service: its origin and the account's key (wire 7.4.2).
+                if doc.inbox().url != self.origin || doc.inbox().service_key != service_key {
+                    return Err(ApiError::bad_request(
+                        "7.4.2: a recovery's first document names this service",
+                    ));
+                }
                 let recovery_from = doc.body().recovery_from.unwrap_or_default();
                 // Admission is staged whenever the document lists an app: the service can't
                 // see their permissions yet (Switch spec 12.6 step 2).
@@ -206,6 +212,29 @@ impl Service {
     ) -> Result<(Answer, bool), ApiError> {
         let temporary = || ApiError::unavailable("7.6: a temporary failure");
         let recovery_from = doc.body().recovery_from.ok_or_else(temporary)?;
+        // The generation after the one it ends, the account's (wire 3.3): checked by the
+        // delivery's rules, and again here, where the account's generation changes.
+        if recovery_from != txn.head().generation
+            || recovery_from.checked_add(1) != Some(doc.generation())
+        {
+            return Err(temporary());
+        }
+        // It lists no App ID the pending key's enrollments named: the new generation keeps
+        // them from its start, as a new account does (wire 3.7).
+        let held_revoked = txn
+            .pending_revoked_apps()
+            .await
+            .map_err(|e| store_error(&e))?;
+        if doc
+            .body()
+            .apps
+            .iter()
+            .any(|app| held_revoked.contains(&app.app_id))
+        {
+            return Err(ApiError::bad_request(
+                "3.3: apps lists an App ID the service revoked or saw depart",
+            ));
+        }
         let new_key = txn
             .pending_key()
             .await

@@ -1139,6 +1139,7 @@ impl App {
             let local = self.protocol_scan(b"").await?;
             let mut processed = reader.scan::<Processed>("proc/").await?;
             let mut parked = state.parked.clone();
+            let mut seen = state.seen.clone();
             if let Some(pending) = &state.pending_effect {
                 // A restore never carries a kept effect, so the backup holds its entry as
                 // what it is once the effect is gone: one whose effect's fate is unknown,
@@ -1149,6 +1150,13 @@ impl App {
                 // isn't touched.
                 let (id, entry) = uncertain_copy(&state, pending, reserved);
                 parked.insert(id, entry);
+                // Its feed `seq` is passed, as the app passes it when it stores an entry: the
+                // processed pair ages out after 30 days, and a restore from an older backup
+                // must still never hand the entry over again unless the host releases the
+                // stored copy. An entry stored before was passed when it was stored.
+                if pending.stored.is_none() {
+                    seen.insert(pending.seq);
+                }
                 let pair = key::processed(&pending.sender, &pending.msg_id);
                 let rest = pair.strip_prefix("proc/").unwrap_or(&pair).to_owned();
                 processed.retain(|(held, _)| *held != rest);
@@ -1167,7 +1175,7 @@ impl App {
             backup.protocol = Some(LayerOut {
                 name,
                 data: pubky_switch_core::enc::b64(&data),
-                seen: state.seen.iter().copied().collect(),
+                seen: seen.into_iter().collect(),
                 parked: parked.into_iter().collect(),
                 processed,
             });

@@ -11,7 +11,7 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::extract::connect_info::MockConnectInfo;
 use axum::http::{Request as HttpRequest, header};
-use pubky_switch::changes::ChangeListener;
+use pubky_switch::changes::{ChangeHub, ChangeListener};
 use pubky_switch::http::source::ProxyConfig;
 use pubky_switch::keys::{FileKeyStore, FixedKeys};
 use pubky_switch::limits::Limits;
@@ -150,6 +150,8 @@ pub struct RealSwitch {
     /// The task that forwards the database's change notifications to the service, which
     /// wake its waiting feed reads (Switch wire 7.4.4), as the service's own `main` runs it.
     listening: Option<tokio::task::JoinHandle<()>>,
+    /// The service's hub of waiting feed reads.
+    changes: Arc<ChangeHub>,
     _key_dir: tempfile::TempDir,
 }
 
@@ -205,7 +207,8 @@ impl RealSwitch {
         let listener = ChangeListener::connect(database.store())
             .await
             .map_err(|error| HarnessError::Setup(error.to_string()))?;
-        let listening = tokio::spawn(listener.run(service.changes(), std::future::pending()));
+        let changes = service.changes();
+        let listening = tokio::spawn(listener.run(changes.clone(), std::future::pending()));
         let switch = Self {
             origin: origin.to_owned(),
             database: Some(database),
@@ -213,6 +216,7 @@ impl RealSwitch {
             clock,
             transport: Arc::new(ServiceTransport::new(origin, service)),
             listening: Some(listening),
+            changes,
             _key_dir: key_dir,
         };
         switch.sample_time();
@@ -239,6 +243,13 @@ impl RealSwitch {
             },
             self.clock.monotonic_ms(),
         );
+    }
+
+    /// How many accounts have a feed read held at the service now, waiting for a change
+    /// (Switch wire 7.4.4 `wait`). A read counts from before its first look at the account,
+    /// so a change made once it counts is one the read sees.
+    pub fn held_reads(&self) -> usize {
+        self.changes.waiting()
     }
 
     /// The test database's name; empty once it is dropped.
