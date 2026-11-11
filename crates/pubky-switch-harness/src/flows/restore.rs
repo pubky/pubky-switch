@@ -42,7 +42,7 @@ pub async fn restore(world: &World) -> FlowResult {
     let (phone, _) = joined(world, &alice, &mut signer, "phone").await?;
     wallet.receive(None).await?;
     wallet.flush_cursor().await?;
-    let backup = wallet.backup()?;
+    let backup = wallet.backup().await?;
     world.outcome("backed up", &app_status(&mut wallet));
     world.advance_ms(STEP_MS);
 

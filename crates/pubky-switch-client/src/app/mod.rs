@@ -343,6 +343,13 @@ pub struct AppBackup {
     /// The local ID the next entry stored locally takes (`parkid`), so a restore gives out
     /// none the app gave out before the backup, whether or not the backup carries its entry.
     stored_next: u64,
+    /// When the backup was taken, the app's clock: a restore reinstalls the messages whose
+    /// delivery is owed only within [`SENT_RETENTION_MS`] of it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    taken_ms: Option<u64>,
+    /// The outbox (`out/`), but for the messages refused for good (`send::carried_outbox`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    outbox: Vec<send::OutboxItem>,
     /// The protocol's layer, if it added one; absent from the bytes otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     protocol: Option<LayerOut>,
@@ -981,9 +988,21 @@ impl App {
     }
 
     /// The app's backup (Switch spec 12.4): its keys, certificate and record, scope keys
-    /// and naming key, its receive keys and the kids it knows, its cursor and chain view.
-    /// The app should take one at every rotation, replacing the previous one (Switch spec
-    /// 3.6).
+    /// and naming key, its receive keys and the kids it knows, its cursor and chain view,
+    /// and its outbox. The app should take one at every rotation, replacing the previous one
+    /// (Switch spec 3.6).
+    ///
+    /// The outbox goes in whole, but for the messages refused for good: each message with
+    /// its signed plaintext and the envelope sealed for its last try, so a restore delivers
+    /// what was queued before the backup with the same `msg_id` and bytes. A message the
+    /// device the backup came from delivered after it is then sent again: the recipient's
+    /// switch answers a retry of the same envelope with its first answer while it holds the
+    /// entry (Switch wire 7.4.3 step 1), and the recipient's apps drop a second copy by its
+    /// processed pair, kept at least 30 days from the first acceptance plus the clock
+    /// tolerance (Switch spec 11). So a restore reinstalls a message whose delivery is owed
+    /// only within [`SENT_RETENTION_MS`] of the backup, by the restoring device's clock;
+    /// later it gives that delivery up, as for an undeliverable message
+    /// ([`AppEvent::MessageUndelivered`]).
     ///
     /// A backup is only ever of committed state. After a failed commit the app's memory may
     /// be ahead of its store, such as a cursor past an entry whose processed pair and local
@@ -994,8 +1013,8 @@ impl App {
     ///
     /// [`Refusal::Stopped`] or [`Refusal::Left`] when there is nothing to back up;
     /// [`Refusal::NotNow`] after a failed commit, until the app's next call reads its store
-    /// again.
-    pub fn backup(&self) -> Result<AppBackup, AppError> {
+    /// again; a store failure reading the outbox.
+    pub async fn backup(&self) -> Result<AppBackup, AppError> {
         if self.state.leave.is_some() {
             return Err(Refusal::Left.into());
         }
@@ -1005,7 +1024,9 @@ impl App {
             )
             .into());
         }
-        Self::backup_of(&self.state)
+        let mut backup = Self::backup_of(&self.state)?;
+        self.carry_outbox(&self.reader(), &mut backup).await?;
+        Ok(backup)
     }
 
     /// The backup of `state`.
@@ -1052,8 +1073,43 @@ impl App {
                 .collect(),
             bundle: state.bundle.clone(),
             stored_next: state.next_stored_id,
+            taken_ms: None,
+            outbox: Vec::new(),
             protocol: None,
         })
+    }
+
+    /// Put a backup's outbox back, in the restore's commit `tx` (Switch spec 11, 12.4): every
+    /// message as the backup holds it, within [`SENT_RETENTION_MS`] of the backup by this
+    /// device's clock. Past it a message the device the backup came from delivered since
+    /// could reach a recipient that no longer holds its processed pair, so its delivery is
+    /// given up and the protocol told, in the same commit; a record job still owed stays.
+    fn reinstall_outbox(&mut self, backup: &AppBackup, tx: &mut Tx) -> Result<(), AppError> {
+        let now = self.now();
+        let within = backup
+            .taken_ms
+            .is_some_and(|taken| now <= taken.saturating_add(SENT_RETENTION_MS));
+        for item in &backup.outbox {
+            if within || !item.delivery_owed() {
+                send::put_outbox_item(tx, item)?;
+                continue;
+            }
+            let (kept, duty) = item.clone().give_up_delivery();
+            if let Some(kept) = &kept {
+                send::put_outbox_item(tx, kept)?;
+            }
+            self.keep_duty(tx, duty)?;
+        }
+        Ok(())
+    }
+
+    /// Put the outbox in `backup`, as `reader` holds it, with the backup's time (Switch spec
+    /// 11): every message the app still owes a job, so a restore delivers what was queued
+    /// before the backup with the same `msg_id` and bytes.
+    async fn carry_outbox(&self, reader: &Reader, backup: &mut AppBackup) -> Result<(), AppError> {
+        backup.taken_ms = Some(self.now());
+        backup.outbox = send::carried_outbox(reader).await?;
+        Ok(())
     }
 
     /// The app's backup with the protocol's layer (Switch spec 12.4), the layer taken by
@@ -1065,7 +1121,8 @@ impl App {
     /// [`Protocol::backup_name`], and what the feed holds beyond the cursor that the layer
     /// may reflect: the entries processed past a held one, the entries stored locally, and
     /// the processed pairs, so a restore hands none of those messages to the protocol
-    /// again. [`App::restore`] installs it all in one commit.
+    /// again. It carries the outbox of the same moment, as [`App::backup`] does.
+    /// [`App::restore`] installs it all in one commit.
     ///
     /// The restore of the backup is built, without writing anything, before it is
     /// returned: [`Protocol::restore_layer`] checks the layer, and the one commit that would
@@ -1148,6 +1205,7 @@ impl App {
             let reader = self.reader();
             let state = Self::read_state(&reader).await?;
             let mut backup = Self::backup_of(&state)?;
+            self.carry_outbox(&reader, &mut backup).await?;
             let local = self.protocol_scan(b"").await?;
             let mut processed = reader.scan::<Processed>("proc/").await?;
             let mut parked = state.parked.clone();
@@ -1224,6 +1282,10 @@ impl App {
     /// `identity.json` lists if the backup predates a renewal, checks its receive key
     /// record, registers a fresh key if it rotated after the backup, and asks the user
     /// about registrations it can't account for ([`App::restore_question`]).
+    ///
+    /// The backup's outbox goes back in, to be delivered by the next flush with the same
+    /// `msg_id` and bytes; past [`SENT_RETENTION_MS`] from the backup, a delivery still
+    /// owed is given up instead, with [`AppEvent::MessageUndelivered`] ([`App::backup`]).
     ///
     /// The protocol's layer ([`App::backup_layered`]) is installed with the
     /// app's own state, and with the entries and processed pairs of the same moment that
@@ -1501,6 +1563,7 @@ impl App {
                 // The entries it brings back are told to the protocol again, in steps after
                 // the restore commits (Switch spec 12.4).
                 parked::Retell::start(&app.state, &mut tx)?;
+                app.reinstall_outbox(backup, &mut tx)?;
                 tx.local(&layer_writes)?;
                 tx.put(key::DUTY_NEXT, &app.state.next_duty)?;
                 tx.put(key::DUTY_EPOCH, &app.state.duty_epoch)?;

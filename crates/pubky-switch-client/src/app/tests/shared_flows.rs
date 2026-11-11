@@ -3052,7 +3052,7 @@ async fn test_claims_seen_in_the_feed_and_orphaned_is_doubtful() {
 async fn test_claims_attempt_refused_in_reconcile_mode() {
     let s = Setup::new();
     let mut app = s.join("wallet").await;
-    let backup = app.backup().unwrap();
+    let backup = app.backup().await.unwrap();
     let store = Arc::new(MemoryStore::new());
     let mut restored = App::restore(
         s.env_on(store as Arc<dyn StateStore>),
@@ -4113,7 +4113,7 @@ async fn test_claims_second_device_attempt_under_its_own_id_gets_the_conflict() 
     let s = Setup::new();
     let mut a = s.join("wallet").await;
     a.set_multi_device(true).await.unwrap();
-    let backup = a.backup().unwrap();
+    let backup = a.backup().await.unwrap();
     let store_b = Arc::new(MemoryStore::new());
     let mut b = App::restore(
         s.env_on(Arc::clone(&store_b) as Arc<dyn StateStore>),

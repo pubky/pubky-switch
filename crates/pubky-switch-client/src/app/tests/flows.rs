@@ -345,7 +345,7 @@ async fn test_app_two_devices_rotating_at_once_one_discards_its_key() {
     let me = a.app_id();
     a.set_multi_device(true).await.unwrap();
     // A second device of the app, from the same state, in a store of its own.
-    let backup = a.backup().unwrap();
+    let backup = a.backup().await.unwrap();
     let store_b = Arc::new(MemoryStore::new());
     let mut b = App::restore(
         w.env_on(Arc::clone(&store_b) as Arc<dyn StateStore>),
@@ -373,7 +373,7 @@ async fn test_app_two_devices_rotating_at_once_one_discards_its_key() {
 async fn test_app_device_sync_with_a_bad_key_changes_nothing() {
     let w = World::new();
     let mut a = w.join("wallet").await;
-    let backup = a.backup().unwrap();
+    let backup = a.backup().await.unwrap();
     a.set_multi_device(true).await.unwrap();
     assert!(a.rotate().await.unwrap());
     w.clock.advance_ms(1000);
@@ -388,7 +388,7 @@ async fn test_app_device_sync_with_a_bad_key_changes_nothing() {
     )
     .await
     .unwrap();
-    let before = b.backup().unwrap().to_bytes().unwrap();
+    let before = b.backup().await.unwrap().to_bytes().unwrap();
     let shared_before = b.device_keys();
     // The set's last key carries a record another app signed.
     let mut keys = a.device_keys();
@@ -403,7 +403,7 @@ async fn test_app_device_sync_with_a_bad_key_changes_nothing() {
     // Nothing of the set was taken, in memory or in a backup.
     assert_eq!(b.receive_key_numbers(), vec![0]);
     assert_eq!(b.device_keys(), shared_before);
-    assert_eq!(b.backup().unwrap().to_bytes().unwrap(), before);
+    assert_eq!(b.backup().await.unwrap().to_bytes().unwrap(), before);
     assert!(!b.state.device.multi_device);
 }
 
@@ -798,7 +798,7 @@ async fn test_app_restore_in_place_over_a_store_that_cant_be_read_fails() {
     let w = World::new();
     let mut app = w.join("wallet").await;
     let me = app.app_id();
-    let backup = app.backup().unwrap();
+    let backup = app.backup().await.unwrap();
     assert!(!refuse_next(&w, &mut app).await.is_empty());
     drop(app);
     // The store can't be read right now: the restore fails, to be tried again.
@@ -836,7 +836,7 @@ async fn test_app_restore_in_place_over_a_store_that_cant_be_read_fails() {
 async fn test_app_restore_in_place_leaves_behind_what_doesnt_read_and_says_so() {
     let w = World::new();
     let mut app = w.join("wallet").await;
-    let backup = app.backup().unwrap();
+    let backup = app.backup().await.unwrap();
     let duties = refuse_next(&w, &mut app).await;
     assert_eq!(duties.len(), 2);
     let now = w.clock.now_ms();
@@ -890,7 +890,7 @@ async fn test_app_restore_in_place_leaves_behind_what_doesnt_read_and_says_so() 
 async fn test_app_restore_in_place_over_a_damaged_epoch_starts_a_new_one() {
     let w = World::new();
     let mut app = w.join("wallet").await;
-    let backup = app.backup().unwrap();
+    let backup = app.backup().await.unwrap();
     let duties = refuse_next(&w, &mut app).await;
     let old = last_id(&duties);
     // The store's event epoch doesn't read.
@@ -1412,7 +1412,7 @@ fn conversation(pubky: [u8; 32]) -> crate::app::OpBatch {
 async fn test_kept_batch_window_holds_with_the_device_clock_ahead_after_a_restore() {
     let w = World::new();
     let a = w.join("wallet").await;
-    let backup = a.backup().unwrap();
+    let backup = a.backup().await.unwrap();
     drop(a);
     // Restored on a device whose clock reads two hours ahead: it holds no service time.
     let clock = Arc::new(TestClock::new(w.clock.now_ms() + 2 * HOUR));
@@ -2725,7 +2725,7 @@ async fn test_app_skips_a_bundle_part_with_another_naming_key() {
 
 /// Rotate the app once (an opened envelope, then a day), returning its backup taken before.
 async fn backup_then_rotate(w: &World, app: &mut App) -> AppBackup {
-    let backup = app.backup().unwrap();
+    let backup = app.backup().await.unwrap();
     w.note(app.app_id(), "before the rotation");
     app.receive(None).await.unwrap();
     w.clock.advance_ms(25 * HOUR);
@@ -2831,7 +2831,7 @@ async fn test_app_restore_registration_after_its_own_key_is_a_compromise() {
 async fn test_app_restore_with_its_current_key_registers_nothing() {
     let w = World::new();
     let app = w.join("wallet").await;
-    let backup = app.backup().unwrap();
+    let backup = app.backup().await.unwrap();
     let (mut restored, _) = restored(&w, &backup).await;
     restored.receive(None).await.unwrap();
     assert!(restored.restore_question().is_empty());
@@ -3191,7 +3191,7 @@ async fn test_app_store_of_schema_1_fails_to_load_as_an_old_schema_and_stays() {
 async fn test_app_backup_refuses_another_schema_or_bytes() {
     let w = World::new();
     let app = w.join("wallet").await;
-    let bytes = app.backup().unwrap().to_bytes().unwrap();
+    let bytes = app.backup().await.unwrap().to_bytes().unwrap();
     assert!(AppBackup::from_bytes(&bytes).is_ok());
     let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     // An earlier schema's backup is an old schema, as its store is; a later one doesn't
@@ -3220,7 +3220,7 @@ async fn test_app_backup_refuses_another_schema_or_bytes() {
     ));
     assert!(AppBackup::from_bytes(b"{}").is_err());
     // Its Debug names the app only.
-    let text = format!("{:?}", app.backup().unwrap());
+    let text = format!("{:?}", app.backup().await.unwrap());
     assert!(text.starts_with("AppBackup("));
 }
 
@@ -3569,7 +3569,7 @@ fn test_duty_event_id_round_trips_its_stable_forms() {
 async fn test_duty_event_ids_after_a_restore_on_a_fresh_store_are_new() {
     let w = World::new();
     let mut app = w.join("wallet").await;
-    let backup = app.backup().unwrap();
+    let backup = app.backup().await.unwrap();
     let start = w.clock.now_ms();
     let before = refuse_next(&w, &mut app).await;
     let acked = last_id(&before);
@@ -3615,7 +3615,7 @@ async fn test_duty_event_ids_after_a_restore_on_a_fresh_store_are_new() {
 async fn test_duty_events_and_owed_calls_carried_across_a_restore_in_place() {
     let w = World::new();
     let mut app = w.join("wallet").await;
-    let backup = app.backup().unwrap();
+    let backup = app.backup().await.unwrap();
     let duties = refuse_next(&w, &mut app).await;
     assert_eq!(duties.len(), 2, "{duties:?}");
     let now = w.clock.now_ms();

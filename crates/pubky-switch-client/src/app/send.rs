@@ -425,7 +425,7 @@ impl OutboxItem {
     }
 
     /// Whether a delivery is owed: never accepted, or a re-send asked since.
-    fn delivery_owed(&self) -> bool {
+    pub(crate) fn delivery_owed(&self) -> bool {
         self.accepted_at_ms.is_none() || self.resend
     }
 
@@ -461,6 +461,40 @@ impl OutboxItem {
     fn plaintext(&self) -> Result<MessagePlaintext, AppError> {
         MessagePlaintext::decode(&self.plaintext).map_err(|_| store_corrupt())
     }
+
+    /// The item a restore puts back in place of this one once its backup is older than
+    /// [`SENT_RETENTION_MS`]: the delivery owed is given up, as [`App::drop_undeliverable`]
+    /// gives one up, and the protocol is told by the duty event returned. A message never
+    /// accepted goes, plaintext and all; one accepted before stays while its record job is
+    /// owed. `None` for nothing to put back.
+    pub(crate) fn give_up_delivery(mut self) -> (Option<Self>, Duty) {
+        let duty = Duty::MessageUndelivered {
+            msg_id: self.msg_id.clone(),
+            resend: self.accepted_at_ms.is_some(),
+        };
+        self.resend = false;
+        self.sealed = None;
+        self.clear_undeliverable();
+        let kept = (self.accepted_at_ms.is_some() && !self.complete()).then_some(self);
+        (kept, duty)
+    }
+}
+
+/// The queued messages a backup carries (Switch spec 11, 12.4): every one in the outbox that
+/// wasn't refused for good, as the outbox holds it, its signed plaintext and the envelope
+/// sealed for its last try included, so a restore delivers it with the same `msg_id` and
+/// bytes. That is a message never accepted, one with a re-send owed, and one whose record
+/// job is owed. A refused one is left out: it holds nothing to deliver.
+pub(crate) async fn carried_outbox(
+    reader: &super::state::Reader,
+) -> Result<Vec<OutboxItem>, AppError> {
+    Ok(reader
+        .scan::<OutboxItem>(OUT_PREFIX)
+        .await?
+        .into_iter()
+        .map(|(_, item)| item)
+        .filter(|item| item.failed.is_none())
+        .collect())
 }
 
 /// `sent/<msg_id>`: a sent message, kept 30 days. Sensitive.

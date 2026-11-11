@@ -89,6 +89,21 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
   write of its own; its commit also keeps a service time not yet committed), so no later
   entry of the live store takes it.
 
+- **A backup carries the outbox:** every `out/` record but those refused for good, as it
+  stands, and the time the backup was taken, the app's clock; both kinds of backup read it
+  from the store, a layered one in the same moment as the rest. A restore writes them back
+  in its one commit, so a message queued before the backup goes after the restore with the
+  same `msg_id`, signed plaintext and last sealed envelope. One the device the backup came
+  from delivered since is sent again: the recipient's switch answers a retry of the same
+  envelope with its first answer while it holds the entry (Switch wire 7.4.3 step 1), and
+  the recipient's apps drop a copy taken as new by its processed pair, kept at least 30
+  days from the first acceptance plus the clock tolerance (Switch spec 11). So a restore
+  more than `SENT_RETENTION_MS` (30 days) after the backup, by the restoring device's
+  clock, writes back no delivery still owed: a message never accepted is left out, one
+  accepted before keeps only its record job, and each keeps a `MessageUndelivered` duty
+  event in the restore's commit. `sent/` and `sentt/` aren't carried, so a restored app
+  answers re-send requests only for what it delivers after the restore.
+
 ## Keys
 
 | Key | Holds | Sensitive |
@@ -245,8 +260,8 @@ uploads; `push.rs` holds the push registration. The peek (`peek.rs`) writes noth
 | `clread/<claim_key>` | a claim the app holds and doesn't hold as finished (SETTLED with every attempt `done` or `failed`), to read again, with the device time it was marked; read at the end of a read, at most `CLAIM_REREADS_PER_READ` (16) per read, oldest mark first, and removed in the commit of any read of the claim, a `404` included, or when its evidence goes | |
 
 Deleting the keys on a leave also removes `rec/`, `hw/`, `recname/`, `out/`, `sent/`,
-`sentt/`, `invite/` and `opq/`. A restore replaces the namespace, these keys included, and
-sets `list_due`. `rec/`, `clent/` and `claim/` hold the evidence of the shared state that
+`sentt/`, `invite/` and `opq/`. A restore replaces the namespace, these keys included, but
+for the `out/` records its backup carries, and sets `list_due`. `rec/`, `clent/` and `claim/` hold the evidence of the shared state that
 uploads carry (`App::shared_evidence`).
 
 ## What the app owes its protocol: restores and provider changes
