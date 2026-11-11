@@ -416,8 +416,16 @@ impl Signer {
     pub(super) async fn clean_up_removed(&mut self) -> Result<()> {
         // Only the signer writes the identity's Homeserver; an install that took over owes
         // these deletions again from its own records.
-        if self.check_named().is_err() {
+        if self.check_named().is_err() || self.state.cleanup.is_empty() {
             return Ok(());
+        }
+        // A fresh check before deleting: an install that took over since the records were
+        // read owes these deletions from its own records. A copy that can't be read postpones
+        // them to the next run.
+        match self.check_copies().await {
+            Ok(()) => {}
+            Err(SignerError::Homeserver(_) | SignerError::Switch(_)) => return Ok(()),
+            Err(error) => return Err(error),
         }
         let Some(newest) = self.state.newest_doc()? else {
             return Ok(());

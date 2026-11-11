@@ -8,13 +8,24 @@
 //!    answer, and asks the user to revoke the Pubky grant of each app, listed or removed,
 //!    whose reminder isn't raised yet ([`Alert::GrantRevocationOwed`]), since the Pubky SDK
 //!    offers no call for it (design note, decision 4);
-//! 2. sends `POST /v1/{id}/erase` naming the pinned service key, again until it is answered,
-//!    marking before each request that it may land. A `200` confirms the erasure. So does an
+//! 2. sends `POST /v1/{id}/erase` naming the pinned service key, again until it is answered
+//!    or, after a request in doubt, the check's read meets the operator's `404`, marking
+//!    before each request that it may land. A `200` confirms the erasure. So does an
 //!    unsigned `404`, the operator's, but only after a request that may have landed, as a
 //!    lost `200` leaves it (Switch wire 7.4.16). A `404` is never itself a lost answer: with
 //!    no request in doubt it is an error, and the mark goes back. No answer, or another
 //!    answer the pinned key didn't sign, such as a gateway's `503`, keeps the mark; only an
 //!    answer the pinned key signed shows the account still exists, and clears it.
+//!
+//! Every deletion and every request comes after a fresh check that this install still signs,
+//! since the flow may be resumed much later: every copy, as before a delivery
+//! ([`Signer::check_copies`]), before the first deletion and each request, and the switch's
+//! copy and the Homeserver's `identity.json` before each later deletion; then the signing
+//! gate. Another install found signing ends the erasure without erasing, with nothing more
+//! deleted, sent or published by this install; an alarm or records behind keep it in
+//! progress, with nothing deleted or sent while the alarm is held; a copy that can't be read
+//! takes no step. After a request in doubt, an unsigned `404` to the check, with every other
+//! copy clean, is taken as the erasure done, and no other request goes out.
 //!
 //! A `409 conflict` is the switch refusing it, as during a move: the erasure ends without
 //! erasing, `identity.json` is published again, and the grant reminders it raised for apps
@@ -35,8 +46,8 @@ use pubky_switch_client::ClientError;
 use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::records::{IDENTITY_PATH, app_record_path};
 
-use super::Signer;
 use super::revocation::UserConfirmed;
+use super::{Signer, gate};
 use crate::alert::Alert;
 use crate::error::{Refusal, Result, SignerError};
 use crate::state::Flow;
@@ -110,6 +121,11 @@ impl Signer {
         if !unpublished {
             return self.unpublish().await;
         }
+        // A request in doubt, then the switch's `404` and every other copy clean: erased
+        // already, and no other request goes out without an ownership read.
+        if self.still_erasing(unanswered, true).await? == Checked::ErasedAlready {
+            return self.erased().await;
+        }
         // Before the request: it may land, however its answer goes.
         if !unanswered {
             let flow = Flow::Erase {
@@ -175,6 +191,102 @@ impl Signer {
         }
     }
 
+    /// Before each step of an erasure that deletes or asks to erase, a fresh check that this
+    /// install still signs, as before a delivery (Switch spec 4.3, Switch wire 3.13). In `full`,
+    /// every copy ([`Signer::check_copies`]): it is named, the switch's copy is its mark, the
+    /// signer backup names no other install that took over, and the Homeserver holds nothing
+    /// newer. Otherwise the switch's copy, where a take-over shows first, since an install that
+    /// takes over delivers there before it writes its backup or publishes (wire 3.13), and the
+    /// Homeserver's `identity.json`, a defence against a switch read that lags or lies. A check
+    /// that can't read a copy fails, and nothing is deleted or sent: the flow stays, and
+    /// [`Signer::resume`] tries again. A passing check then meets the signing gate
+    /// ([`gate::refusal`]), as at every signing step: while an alarm is held, nothing is
+    /// deleted or sent either.
+    ///
+    /// Another install found signing ends the erasure without erasing, in the commit that
+    /// records it ([`Signer::end_erasure_in`]), and nothing is published by this install, which
+    /// no longer signs. An alarm keeps the erasure in progress, nothing deleted or sent: it
+    /// goes on once the user has cleared it, or is aborted while no request is in doubt.
+    /// Records behind keep it too, nothing deleted, sent or published, but the switch's copy is
+    /// still read: another install's version there ends the erasure, and after a request in
+    /// doubt the operator's `404` shows it erased. A user who wants the account back restores
+    /// on a new install, which takes over; this install then finds it and ends its erasure.
+    ///
+    /// With a request in doubt, `unanswered`, an unsigned `404` to the switch's read may be the
+    /// operator's after the erasure. The signer backup and the Homeserver are still judged; if
+    /// they show no other install, the account is taken as erased already, on the same
+    /// unauthenticated evidence wire 7.4.16 accepts for a retry's `404`, and no other request
+    /// goes out: an install that delivered behind a proxy answering `404` is never erased.
+    async fn still_erasing(&mut self, unanswered: bool, full: bool) -> Result<Checked> {
+        // Records behind block every step that deletes or sends, not the read-only check of
+        // the switch's copy, nor a conclusion drawn from it: another install's version there
+        // ends the erasure, and the operator's `404` after a request in doubt shows it done.
+        // Only that refusal of `check_named` is passed for the read; every other stops here.
+        let behind = matches!(
+            self.check_named(),
+            Err(SignerError::Refused(Refusal::RecordsBehind { .. }))
+        );
+        let checked = if behind {
+            self.switch_at_mark().await
+        } else if full {
+            self.check_copies().await
+        } else {
+            self.switch_and_homeserver().await
+        };
+        let checked = match checked {
+            Err(SignerError::Switch(ClientError::BadServiceSignature { status: 404 }))
+                if unanswered =>
+            {
+                self.copies_but_the_switch()
+                    .await
+                    .map(|()| Checked::ErasedAlready)
+            }
+            checked => checked.map(|()| Checked::Signing),
+        };
+        // An alarm or records behind keep the erasure in the commit that records them
+        // (`Signer::erasure_kept`); another install found signing ends it in its own.
+        let checked = checked?;
+        // The gate holds back a deletion or a request, not the conclusion that the account is
+        // erased already: wire 7.4.16 takes the operator's `404` after a request in doubt as
+        // done whatever alarm is held, and `erased` keeps the alarm's alerts. Records still
+        // behind after the read, as when the switch holds this install's own newer version or
+        // the mark, are among the gate's refusals: no step.
+        if checked == Checked::Signing
+            && let Some(refused) = gate::refusal(&self.state)
+        {
+            return Err(refused);
+        }
+        Ok(checked)
+    }
+
+    /// The switch's copy and the Homeserver's `identity.json`, as before each later deletion.
+    async fn switch_and_homeserver(&mut self) -> Result<()> {
+        self.check_named()?;
+        self.switch_at_mark().await?;
+        if let Some(newest) = self.state.newest_doc()? {
+            self.judge_homeserver(&newest).await?;
+        }
+        Ok(())
+    }
+
+    /// The copies but the switch's, after a request in doubt and an unsigned `404` from the
+    /// switch: the signer backup and the Homeserver's `identity.json`, judged for another
+    /// install signing, which stops it. This install's own newer version there, records behind,
+    /// doesn't: the account is gone at the switch whatever this install's records say (Switch
+    /// wire 7.4.16).
+    async fn copies_but_the_switch(&mut self) -> Result<()> {
+        let own_newer = |checked: Result<()>| match checked {
+            Err(SignerError::Refused(Refusal::RecordsBehind { .. })) => Ok(()),
+            checked => checked,
+        };
+        own_newer(self.check_named())?;
+        own_newer(self.check_backup_copy().await)?;
+        if let Some(newest) = self.state.newest_doc()? {
+            own_newer(self.judge_homeserver(&newest).await.map(drop))?;
+        }
+        Ok(())
+    }
+
     /// The account is erased: what only it could settle goes, and the records stay.
     async fn erased(&mut self) -> Result<()> {
         let mut state = self.state.clone();
@@ -197,25 +309,19 @@ impl Signer {
     /// publishes again. A removed app's reminder stays: its grant's revocation is owed whether
     /// or not the account is erased (Switch spec 12.2 step 1).
     async fn end_erasure(&mut self, reminded: &[[u8; 16]]) -> Result<()> {
-        let newest = self.state.newest_doc()?;
-        let reminded: Vec<[u8; 16]> = reminded
-            .iter()
-            .copied()
-            .filter(|app| {
-                newest
-                    .as_ref()
-                    .is_some_and(|doc| doc.listed_cert(app).is_some())
-            })
-            .collect();
-        let reminded = reminded.as_slice();
         let mut state = self.state.clone();
-        state.alerts.retain(|alert| {
-            !matches!(alert, Alert::GrantRevocationOwed { app_id } if reminded.contains(app_id))
-        });
-        state
-            .grant_reminded
-            .retain(|app_id| !reminded.contains(app_id));
+        withdraw_reminders(&mut state, reminded)?;
         self.commit(state, None).await
+    }
+
+    /// End the erasure in progress, if any, without erasing, in `state`, which the caller
+    /// commits with no flow: as [`Signer::end_erasure`], when another install is found signing.
+    /// Its newest version may be that install's now.
+    pub(super) fn end_erasure_in(&self, state: &mut crate::state::SignerState) -> Result<()> {
+        if let Some(Flow::Erase { reminded, .. }) = &self.flow {
+            withdraw_reminders(state, reminded)?;
+        }
+        Ok(())
     }
 
     /// Delete `identity.json` and every app record the signer knows of from the Homeserver,
@@ -229,14 +335,18 @@ impl Signer {
             .chain(self.state.cleanup.iter().copied())
             .chain(self.state.deletion_checks.iter().copied())
             .collect();
-        let homeserver = &self.env.homeserver;
-        homeserver
-            .delete(IDENTITY_PATH)
-            .await
-            .map_err(SignerError::Homeserver)?;
-        for app_id in &apps {
-            homeserver
-                .delete(&app_record_path(app_id))
+        // Each deletion only after a fresh check: another install may take over between two
+        // of them, and its files are never this install's to delete. The first after the
+        // full check, each later one after the switch's copy, where a take-over shows first.
+        for (index, path) in std::iter::once(IDENTITY_PATH.to_owned())
+            .chain(apps.iter().map(app_record_path))
+            .enumerate()
+        {
+            // With no request in doubt, the check never takes the account as erased.
+            self.still_erasing(false, index == 0).await?;
+            self.env
+                .homeserver
+                .delete(&path)
                 .await
                 .map_err(SignerError::Homeserver)?;
         }
@@ -261,4 +371,37 @@ impl Signer {
         };
         self.commit(state, Some(flow)).await
     }
+}
+
+/// Withdraw from `state` the grant reminders an erasure raised, `reminded`, for apps its newest
+/// version still lists. A removed app's reminder stays: its grant's revocation is owed whether
+/// or not the account is erased (Switch spec 12.2 step 1).
+fn withdraw_reminders(state: &mut crate::state::SignerState, reminded: &[[u8; 16]]) -> Result<()> {
+    let newest = state.newest_doc()?;
+    let listed: Vec<[u8; 16]> = reminded
+        .iter()
+        .copied()
+        .filter(|app| {
+            newest
+                .as_ref()
+                .is_some_and(|doc| doc.listed_cert(app).is_some())
+        })
+        .collect();
+    state.alerts.retain(
+        |alert| !matches!(alert, Alert::GrantRevocationOwed { app_id } if listed.contains(app_id)),
+    );
+    state
+        .grant_reminded
+        .retain(|app_id| !listed.contains(app_id));
+    Ok(())
+}
+
+/// What a passing check before an erasure step found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Checked {
+    /// This install still signs: the step goes on.
+    Signing,
+    /// The account is erased already: a request in doubt, then the switch's `404`, with no
+    /// other install anywhere.
+    ErasedAlready,
 }
