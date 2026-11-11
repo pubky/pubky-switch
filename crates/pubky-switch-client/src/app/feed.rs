@@ -36,6 +36,9 @@
 //!   deliveries, its own receive key registrations, key bundle parts (fetched before the
 //!   cursor passes them), renewed certificates, and the departures of other own apps.
 //!
+//! Before the feed, a read sends the batches kept from earlier calls again
+//! ([`App::submit_batch`]), so a lost answer is settled by the next read too.
+//!
 //! Cursor moves that apply nothing are deferred, for at most a few seconds while the app
 //! runs, and go with the next batch or alone ([`App::flush_cursor`]).
 
@@ -264,7 +267,10 @@ impl Read {
 impl App {
     /// Read the feed to its end and process it (Switch spec 8.2, 8.3), then delete the
     /// retired receive keys the cursor passed, rotate if due, and send a deferred cursor
-    /// move that is due. `wait` long-polls the first page, at most 25 seconds.
+    /// move that is due. `wait` long-polls the first page, at most 25 seconds. Before the
+    /// feed, the batches kept from earlier calls are sent again; one that still can't be
+    /// sent stays kept and is reported ([`AppEvent::KeptBatchesWaiting`]), and the read
+    /// goes on.
     ///
     /// # Errors
     ///
@@ -324,6 +330,10 @@ impl App {
         // ones stored locally included, is handed over.
         self.refresh_lists_if_owed().await?;
         self.resume_pending_effect().await?;
+        // The batches kept from earlier calls go before the feed, and before anything the
+        // read writes itself, so a lost answer is settled by this read (Switch wire 6.4
+        // step 5).
+        self.resume_batches_before_feed().await?;
         self.deliver_record().await?;
         self.ensure_scope_keys().await?;
         self.prune_processed().await?;

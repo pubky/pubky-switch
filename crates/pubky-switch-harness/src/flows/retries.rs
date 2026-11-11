@@ -122,13 +122,13 @@ pub async fn signer_retries(world: &World) -> FlowResult {
 /// a cursor move alone, and a batch that never reaches the switch.
 ///
 /// After a lost answer the app keeps the batch. The registration is sent again when the
-/// app is loaded and reads. A later batch is not sent again by a read: the app finds its
-/// own operation applied in its feed, and sends the kept batch again, as it was, before its
-/// next write, where the switch answers with the original proofs (Switch wire 6.4 step 5).
+/// app is loaded and reads. A later batch is sent again, as it was, by the next read before
+/// its feed, and the switch answers with the original proofs (Switch wire 6.4 step 5); the
+/// read then finds the operation in its feed, and the next write sends only its own batch.
 ///
 /// Calls: `POST /v1/{id}/ops` again with the same batch after a lost answer (the
-/// registration; an `allow.put` the feed already showed applied; a `cursor.set` alone), and
-/// again after a failed connection.
+/// registration; an `allow.put`, by the next read; a `cursor.set` alone), and again after a
+/// failed connection, by the next write.
 ///
 /// # Errors
 ///
@@ -174,8 +174,8 @@ pub async fn app_retries(world: &World) -> FlowResult {
     );
     world.advance_ms(STEP_MS);
 
-    // A contact whose batch the switch took, and whose answer was lost. The next read finds
-    // the contact in the feed.
+    // A contact whose batch the switch took, and whose answer was lost. The next read sends
+    // the kept batch again first, then finds the contact in the feed.
     world.lose_answer("POST", "/ops");
     let lost = wallet.add_contact(&bob.public()).await;
     world.outcome(
@@ -194,11 +194,10 @@ pub async fn app_retries(world: &World) -> FlowResult {
     );
     world.advance_ms(STEP_MS);
 
-    // The next write first sends the kept batch again, as it was, and gets the original
-    // proof; then its own.
+    // The read settled the kept batch: the next write sends only its own.
     wallet.add_contact(&carol.public()).await?;
     world.outcome(
-        "the next write, after the kept batch again",
+        "the next write",
         &json!({
             "admits": wallet.admits(&carol.public()).await?,
             "app": app_status(&mut wallet),
@@ -520,10 +519,10 @@ const RETRIED_CLAIM: [u8; 32] = [0x7c; 32];
 /// the app can tell about its own entry before it writes again, and what the switch answers
 /// when the caller makes the same call again.
 ///
-/// After each lost answer the app follows its feed and the flow notes what it then holds of
-/// the claim ([`App::claim_evidence`]): whether it can tell, without asking, that its entry
-/// was taken. Then the caller repeats the call: the kept batch goes first and gets its
-/// original proof, and the caller's own second entry meets the step the first one took.
+/// After each lost answer the app follows its feed: the read sends the kept batch again
+/// first, which gets its original proof, and the flow notes what the app then holds of the
+/// claim ([`App::claim_evidence`]) without asking. Then the caller repeats the call, and its
+/// second entry meets the step the first one took.
 ///
 /// Calls: `POST /v1/{id}/ops` (`claim`: `attempt`, then `done`) with the answer lost; `GET
 /// /v1/{id}/feed` after each; each batch again as it was; a second `attempt` and a second
@@ -570,7 +569,7 @@ pub async fn claim_retries(world: &World) -> FlowResult {
         );
         world.advance_ms(STEP_MS);
 
-        // What the app can tell from its feed, without asking.
+        // What the app holds after its next read, which sends the kept batch first.
         let report = wallet.receive(None).await?;
         world.outcome(
             &format!("after the lost {name}, the app follows its feed"),

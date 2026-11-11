@@ -18,8 +18,9 @@
 //! sent again from an earlier call is reported as
 //! [`AppEvent::BatchRefused`]. A batch whose answer didn't come back, or may pass unchanged
 //! later (`429`, `503`, `401 stale_timestamp`, an answer that doesn't verify), stays kept,
-//! and the next call that writes sends it again, the same bytes, so the service answers it
-//! as a retry (Switch spec 6.4; Switch wire 2.1, 6.4 step 5).
+//! and the next call that writes, and the next read before its feed, sends it again, the
+//! same bytes, so the service answers it as a retry (Switch spec 6.4; Switch wire 2.1, 6.4
+//! step 5).
 
 use pubky_switch_core::chain::TransitionProof;
 use pubky_switch_core::claims::{ClaimEntry, ClaimType, ClaimView, EntryKind};
@@ -297,7 +298,8 @@ impl App {
     /// for good, such as `409 conflict` with its `current`, after which nothing is kept;
     /// [`AppError::Kept`] with the batch's ID for any other failure of the network or the
     /// switch (the network, `429`, `503`, an answer that doesn't verify): the batch is kept
-    /// and sent again, the same bytes, by the next call that writes. A batch kept from an
+    /// and sent again, the same bytes, by the next call that writes and by the next read
+    /// ([`App::receive`]) before its feed. A batch kept from an
     /// earlier call that still can't be sent fails the call with its bare error
     /// ([`AppError::Transport`], [`AppError::Switch`]) before the new batch is signed, so
     /// nothing of this call is kept. [`AppError::InvalidData`] when an attempt's proof shows another
@@ -703,6 +705,30 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    /// At the start of a read, before the feed: the batches kept from earlier calls are
+    /// sent again ([`App::resume_batches`]), so an answer that was lost is settled by the
+    /// next read, not only by the next write. The switch answers a batch it applied with
+    /// its original proofs (Switch wire 6.4 step 5), so a batch whose operations the feed
+    /// already shows applied is settled and cleared by that answer, its proofs kept as an
+    /// answer of its first send would have been. A resend that fails on the network or the
+    /// switch doesn't fail the read: the batch stays kept, and the read reports it
+    /// ([`AppEvent::KeptBatchesWaiting`]) and goes on to the feed. An alarm, a store failure
+    /// or a refusal of the app's own rules fails the read, as any of its steps does.
+    pub(crate) async fn resume_batches_before_feed(&mut self) -> Result<(), AppError> {
+        match self.resume_batches().await {
+            Ok(()) => Ok(()),
+            Err(error @ (AppError::Transport(_) | AppError::Switch(_))) => {
+                let kept = self.reader().scan_raw(PENDING_PREFIX).await?.len();
+                self.events.push(AppEvent::KeptBatchesWaiting {
+                    kept: u64::try_from(kept).unwrap_or(u64::MAX),
+                    code: error.code().map(|code| code.as_str().to_owned()),
+                });
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// A kept batch never sent ([`PendingBatch::kept_ms`]), sent now: signed again first for

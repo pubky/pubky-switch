@@ -1569,6 +1569,123 @@ async fn test_submit_batch_behind_an_unsent_kept_batch_keeps_nothing_of_its_own(
 }
 
 #[tokio::test]
+async fn test_receive_sends_a_kept_batch_before_the_feed() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(
+        app.submit_batch(conversation(w.bob.public()))
+            .await
+            .is_err()
+    );
+    assert_eq!(app.kept_batches().await.unwrap().len(), 1);
+    // The feed can't be read past the service time the resend is judged at, but the kept
+    // batch went first: its original proof came back and settled it, applied once.
+    w.switch.fail_next(Fault::Unreachable {
+        path: "feed".into(),
+        after: 1,
+    });
+    assert!(app.receive(None).await.is_err());
+    w.switch.lock().faults.clear();
+    assert!(app.kept_batches().await.unwrap().is_empty());
+    assert_eq!(conversations_for(&w, w.bob.public()), 1);
+    let report = app.receive(None).await.unwrap();
+    assert!(
+        !has(&report.events, |e| matches!(
+            e,
+            AppEvent::KeptBatchesWaiting { .. }
+        )),
+        "{:?}",
+        report.events
+    );
+    assert_eq!(conversations_for(&w, w.bob.public()), 1);
+}
+
+#[tokio::test]
+async fn test_receive_goes_on_when_a_kept_batch_still_cant_be_sent() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.submit_batch(conversation([6; 32])).await.is_err());
+    let (seq, _) = w.note(app.app_id(), "after");
+    // The resend doesn't reach the switch: the read goes on to the feed, reports the
+    // batch waiting, and keeps it.
+    w.switch.fail_next(Fault::Unreachable {
+        path: "ops".into(),
+        after: 0,
+    });
+    let report = app.receive(None).await.unwrap();
+    w.switch.lock().faults.clear();
+    assert!(
+        has(&report.events, |e| matches!(
+            e,
+            AppEvent::KeptBatchesWaiting {
+                kept: 1,
+                code: None
+            }
+        )),
+        "{:?}",
+        report.events
+    );
+    assert!(report.cursor.seq >= seq, "the feed was read");
+    assert_eq!(app.kept_batches().await.unwrap().len(), 1);
+    // The feed showed the operation applied; the kept copy is cleared by the next read's
+    // resend, which the switch answers with the original proof.
+    let report = app.receive(None).await.unwrap();
+    assert!(app.kept_batches().await.unwrap().is_empty());
+    assert!(
+        !has(&report.events, |e| matches!(
+            e,
+            AppEvent::KeptBatchesWaiting { .. }
+        )),
+        "{:?}",
+        report.events
+    );
+    assert_eq!(conversations_for(&w, [6; 32]), 1);
+    // A `503` on the resend is reported with its code.
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.submit_batch(conversation([7; 32])).await.is_err());
+    w.switch.fail_next(Fault::Error {
+        path: "ops".into(),
+        code: ErrorCode::Unavailable,
+        current: json!(null),
+    });
+    let report = app.receive(None).await.unwrap();
+    assert!(
+        has(&report.events, |e| matches!(
+            e,
+            AppEvent::KeptBatchesWaiting { kept: 1, code: Some(code) } if code == "unavailable"
+        )),
+        "{:?}",
+        report.events
+    );
+}
+
+#[tokio::test]
+async fn test_receive_sends_no_batch_refused_for_good() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    w.switch.fail_next(Fault::Error {
+        path: "ops".into(),
+        code: ErrorCode::Conflict,
+        current: json!(null),
+    });
+    assert!(
+        app.submit_batch(conversation(w.bob.public()))
+            .await
+            .is_err()
+    );
+    // Refused for good on its first send: not kept, so no read sends it.
+    assert!(app.kept_batches().await.unwrap().is_empty());
+    let report = app.receive(None).await.unwrap();
+    assert!(!has(&report.events, |e| matches!(
+        e,
+        AppEvent::KeptBatchesWaiting { .. } | AppEvent::BatchRefused { .. }
+    )));
+    assert_eq!(conversations_for(&w, w.bob.public()), 0);
+}
+
+#[tokio::test]
 async fn test_kept_batch_written_offline_goes_once_the_service_is_back() {
     let w = World::new();
     let mut app = w.join("wallet").await;

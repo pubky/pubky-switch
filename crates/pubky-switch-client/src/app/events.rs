@@ -531,6 +531,17 @@ pub enum AppEvent {
         /// The batch ID it has now.
         new_batch_id: [u8; 16],
     },
+    /// A read sends the batches kept from earlier calls before it reads the feed, and one
+    /// couldn't be sent now: the network failed, the switch answered `429`, `503`, `410
+    /// moved` or a refusal about the caller, such as `403 cert_expired`, or the answer
+    /// didn't verify. The read went on to the feed; the batches stay kept, the same bytes,
+    /// and go again first at the next read or write (Switch wire 6.4 step 5).
+    KeptBatchesWaiting {
+        /// How many batches are kept now.
+        kept: u64,
+        /// The switch's error code; `None` for the network or an answer that didn't verify.
+        code: Option<String>,
+    },
     /// A kept batch wasn't carried to the new service: one holding an `attempt` after a
     /// provider loss, since no automatic attempt is made on an obligation from before the
     /// loss (Switch spec 12.6 step 5), or one kept longer than a resend's answer can tell
