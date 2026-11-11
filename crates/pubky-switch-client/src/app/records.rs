@@ -1615,7 +1615,7 @@ impl App {
 /// to the read scope's key, so it takes and chains any value, and a reader, the writer
 /// included, finds one that isn't JSON doesn't open. So it is refused before it is signed
 /// or sent.
-fn refuse_non_json(value: Option<&[u8]>) -> Result<(), AppError> {
+pub(crate) fn refuse_non_json(value: Option<&[u8]>) -> Result<(), AppError> {
     if let Some(json) = value
         && pubky_switch_core::json::check_json(json).is_err()
     {

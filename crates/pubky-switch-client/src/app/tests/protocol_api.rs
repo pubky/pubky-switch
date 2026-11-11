@@ -49,6 +49,8 @@ enum Mode {
     Attempt,
     /// A write of a record whose policy names a write scope the app doesn't hold.
     OtherWriteScope,
+    /// A write of `inbox` with a value that isn't JSON.
+    NotJson,
 }
 
 /// What one call of the receive step saw.
@@ -194,6 +196,11 @@ impl Protocol for ApiProtocol {
                 );
                 seen.writes
                     .push(text(cx.put_record(&target, &value(&["x"]), vec![])));
+                Outcome::Apply(Effect::default())
+            }
+            Mode::NotJson => {
+                seen.writes
+                    .push(text(cx.put_record(&inbox(), b"not json", vec![])));
                 Outcome::Apply(Effect::default())
             }
             Mode::Attempt => {
@@ -452,6 +459,22 @@ async fn test_receive_context_write_whose_mark_wont_fit_is_refused() {
     assert!(refused.contains("mark"), "{refused}");
     assert_eq!(record_puts(&w), 0);
     assert_eq!(app.cursor().seq, seq);
+}
+
+#[tokio::test]
+async fn test_receive_context_value_that_isnt_json_is_refused_before_the_mark() {
+    let w = World::new();
+    let protocol = ApiProtocol::new(Mode::NotJson);
+    let mut app = join(&w, &protocol, "wallet").await;
+    // The mark queued for the next write is still there after the refusal: the protocol
+    // was never asked to mark the value.
+    protocol.items.pads.lock().unwrap().push_back(0);
+    w.note(app.app_id(), "hello");
+    app.receive(None).await.unwrap();
+    let refused = protocol.seen()[0].writes[0].clone().unwrap_err();
+    assert!(refused.contains("JSON"), "{refused}");
+    assert_eq!(protocol.items.pads.lock().unwrap().len(), 1);
+    assert_eq!(record_puts(&w), 0);
 }
 
 #[tokio::test]
