@@ -209,6 +209,109 @@ async fn test_hand_over_abort_wins_and_signing_goes_on() {
 }
 
 #[tokio::test]
+async fn test_hand_over_to_another_app_after_an_abort_won() {
+    // The first target's delivery never reached the switch before the abort won. The old
+    // signer then hands the abort's version over to a second app, which takes over at the
+    // version after it; the first target's delivery, sent again, loses to that, and the old
+    // signer deletes its key on the second app's proof (Switch wire 3.12).
+    let world = World::new();
+    let mut s = setup(&world).await;
+    let second = App::with_keys(
+        AppKeys::from_secrets([5; 32], [6; 32]),
+        &["notes"],
+        None,
+        [10; 32],
+    );
+    let second_cert = approved(&world, &mut s.old, &second).await;
+    let handed = s.old.identity_doc().unwrap().unwrap();
+    s.old.hand_over_to(s.app_id(), confirmed()).await.unwrap();
+    let first_store = Arc::new(MemoryStore::new());
+    let first_vault = empty_vault();
+    world.switch.fail_next(SwitchFault::Unreachable {
+        path: "/identity".into(),
+        after: 0,
+    });
+    Signer::receive_hand_over(
+        world.env(first_store.clone()),
+        &s.target,
+        first_vault.clone(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        holds_records(&first_store).await,
+        "the first take-over is kept"
+    );
+    let version = handed.version() + 2;
+    assert_eq!(
+        s.old.abort_hand_over(confirmed()).await.unwrap(),
+        AbortOutcome::Aborted { version }
+    );
+    let abort = world.switch.identity_doc().unwrap();
+
+    // The switch dropped the first hand-over with the abort's delivery; the second holds
+    // the abort, for the second app.
+    let second_id = second_cert.app_id();
+    s.old.hand_over_to(second_id, confirmed()).await.unwrap();
+    assert_eq!(world.switch.stored_handover(), Some(second_id));
+    let second_target = ReceivingApp {
+        keys: second.keys,
+        cert: second_cert,
+        origin: SWITCH_ORIGIN.to_owned(),
+        service_key: world.switch.service_key(),
+    };
+    let second_store = Arc::new(MemoryStore::new());
+    let second_vault = empty_vault();
+    let mut new = Signer::receive_hand_over(
+        world.env(second_store.clone()),
+        &second_target,
+        second_vault.clone(),
+    )
+    .await
+    .unwrap();
+    let first = new.identity_doc().unwrap().unwrap();
+    assert_eq!(first.version(), version + 1);
+    assert_eq!(first.body().signer, new.install_id());
+    assert_eq!(first.body().apps, abort.body().apps);
+    assert!(vault_holds(&second_vault));
+    assert_eq!(
+        s.old.resume().await.unwrap_err(),
+        SignerError::HandedOver {
+            install: new.install_id()
+        }
+    );
+    assert!(!vault_holds(&world.vault));
+    assert!(!holds_records(&s.old_store).await);
+
+    // The first target's delivery, at the version after the one first handed over, loses.
+    let identity = world.key.public();
+    assert_eq!(
+        Signer::resume_take_over(
+            world.env(first_store.clone()),
+            identity,
+            &s.target.keys,
+            first_vault.clone(),
+        )
+        .await
+        .unwrap_err(),
+        SignerError::Refused(Refusal::TakeOverCancelled)
+    );
+    assert!(!holds_records(&first_store).await);
+    assert!(!vault_holds(&first_vault));
+
+    // The new signer manages the identity from the records it took: it revokes the first
+    // target, whose keys rotate away.
+    let revoked = new
+        .revoke(s.app_id(), None, UserConfirmed::shown_and_confirmed())
+        .await
+        .unwrap();
+    assert!(revoked.listed_cert(&s.app_id()).is_none());
+    assert_eq!(revoked.data_epoch(), first.data_epoch() + 1);
+    assert_eq!(revoked.body().signer, new.install_id());
+    world.assert_no_version_sent_twice();
+}
+
+#[tokio::test]
 async fn test_take_over_lost_to_an_abort_deletes_what_was_received() {
     // The new signer signed its first delivery, but couldn't send it; the abort won first. Its
     // retry is answered with the abort, a verified copy past it: the take-over is cancelled.
