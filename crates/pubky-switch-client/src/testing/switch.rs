@@ -275,6 +275,8 @@ pub(crate) struct Inner {
     /// the account's lock, such as a `401 stale_timestamp`, answers with it and doesn't
     /// move it (Switch wire 7.1).
     pub(crate) stamped_ms: u64,
+    /// The stored signer hand-over (Switch wire 7.4.17): its target and the `PUT` body.
+    pub(crate) handover: Option<([u8; 16], Value)>,
 }
 
 impl Inner {
@@ -333,6 +335,7 @@ impl Inner {
             delivery_proof: None,
             enroll_limits: pubky_switch_core::records::Limits::default(),
             listed_at_epoch: BTreeMap::new(),
+            handover: None,
         }
     }
 }
@@ -1248,6 +1251,8 @@ impl Inner {
             return Ok(match (request.method.as_str(), route) {
                 ("PUT", "identity") => self.put_identity(&request.body)?,
                 ("GET", "apps") => self.apps_answer(),
+                ("PUT", "handover") => self.put_handover(&request.body),
+                ("GET", "handover") => self.handover_answer(None),
                 ("POST", r) if r.starts_with("apps/") && r.ends_with("/revoke") => {
                     self.revoke_answer(r)?
                 }
@@ -1265,6 +1270,7 @@ impl Inner {
         let own_keys = format!("apps/{me}/keys");
         let own_leave = format!("apps/{me}/leave");
         Ok(match (request.method.as_str(), route) {
+            ("GET", "handover") => self.handover_answer(Some(app)),
             ("POST", "ops") => self.ops(caller, &request.body)?,
             ("POST", "inbox") => self.append(request, None, query)?,
             ("GET", "feed") => self.feed(caller, query),

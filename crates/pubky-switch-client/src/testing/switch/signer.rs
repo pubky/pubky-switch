@@ -66,6 +66,23 @@ impl ScriptedSwitch {
             .unwrap_or_default()
     }
 
+    /// The hand-over the switch holds, its target and its `PUT` body, as a test keeps it to
+    /// store again ([`ScriptedSwitch::store_handover_again`]).
+    pub fn stored_handover_body(&self) -> Option<([u8; 16], Value)> {
+        self.lock().handover.clone()
+    }
+
+    /// A switch that stores, or serves again, a hand-over it dropped: as a lost answer's
+    /// resend would, or a faulty switch (Switch wire 7.4.17).
+    pub fn store_handover_again(&self, held: ([u8; 16], Value)) {
+        self.lock().handover = Some(held);
+    }
+
+    /// The target of the hand-over the switch holds, if any (Switch wire 7.4.17).
+    pub fn stored_handover(&self) -> Option<[u8; 16]> {
+        self.lock().stored_handover()
+    }
+
     /// Forget the transition proof of the newest delivery, so a retry of it answers with no
     /// proof, as for a version the service took by enrollment or import (Switch wire 7.4.2).
     pub fn forget_delivery_proof(&self) {
@@ -199,6 +216,8 @@ impl Inner {
             }
         }
         self.doc = Some(doc.clone());
+        // The next version, whoever delivered it, ends a stored hand-over (Switch wire 7.4.17).
+        self.handover = None;
         self.delivery_proof = Some(proof.clone());
         self.directory_version += 1;
         Ok(proof)
@@ -339,6 +358,56 @@ impl Inner {
         ))
     }
 
+    /// `PUT /v1/{id}/handover` from the signer (Switch wire 7.4.17): the core's checks of a
+    /// stored hand-over, for a current target, then kept, replacing any it held.
+    pub(super) fn put_handover(&mut self, body: &[u8]) -> Answer {
+        let Ok(value) = serde_json::from_slice::<Value>(body) else {
+            return bad(ErrorCode::BadRequest, "malformed hand-over", json!(null));
+        };
+        let known = ["app_id", "handover"];
+        let unknown = value
+            .as_object()
+            .is_none_or(|o| o.keys().any(|k| !known.contains(&k.as_str())));
+        let target = value
+            .get("app_id")
+            .and_then(Value::as_str)
+            .and_then(|id| pubky_switch_core::enc::app_id_decode(id).ok());
+        let handover = value.get("handover").and_then(read_handover);
+        let (Some(target), Some(handover), false) = (target, handover, unknown) else {
+            return bad(ErrorCode::BadRequest, "malformed hand-over", json!(null));
+        };
+        if !self.app_current(&self.apps, &target) {
+            return bad(ErrorCode::Conflict, "the target isn't current", json!(null));
+        }
+        let Some(cert) = self.checked_cert(&target) else {
+            return bad(ErrorCode::Conflict, "the target isn't current", json!(null));
+        };
+        let identity = self.identity.public();
+        if let Err(error) = handover.check_stored(&identity, &target, &cert.bundle_key()) {
+            return bad(ErrorCode::BadRequest, &error.to_string(), json!(null));
+        }
+        let parts = handover.envelopes().len();
+        self.handover = Some((target, value));
+        (
+            200,
+            json!({ "app_id": zbase32_encode(&target), "parts": parts }),
+        )
+    }
+
+    /// `GET /v1/{id}/handover` (Switch wire 7.4.17): the stored body, for the signer
+    /// (`caller` `None`) or its target app; `404` for any other caller, or when none is held.
+    pub(super) fn handover_answer(&self, caller: Option<[u8; 16]>) -> Answer {
+        match &self.handover {
+            Some((target, body)) if caller.is_none_or(|app| app == *target) => (200, body.clone()),
+            _ => bad(ErrorCode::NotFound, "no hand-over", json!(null)),
+        }
+    }
+
+    /// The stored hand-over, as the test reads it.
+    pub(super) fn stored_handover(&self) -> Option<[u8; 16]> {
+        self.handover.as_ref().map(|(target, _)| *target)
+    }
+
     /// `GET /v1/{id}/apps` (Switch wire 7.4.12): every app the switch holds or the newest
     /// `identity.json` lists, the recovery in progress, the newest document, and the
     /// generations the kept proofs name but those the newest document declares lost, the
@@ -448,4 +517,22 @@ impl Inner {
             })
             .collect()
     }
+}
+
+/// A hand-over's `{ "envelopes": [b64], "sig": b64 }`, as the switch reads it without
+/// opening anything (Switch wire 3.12).
+fn read_handover(value: &Value) -> Option<pubky_switch_core::records::SignerHandover> {
+    let envelopes = value
+        .get("envelopes")?
+        .as_array()?
+        .iter()
+        .map(|e| {
+            e.as_str()
+                .and_then(|s| pubky_switch_core::enc::unb64(s).ok())
+        })
+        .collect::<Option<Vec<Vec<u8>>>>()?;
+    let sig = pubky_switch_core::enc::unb64_array::<64>(value.get("sig")?.as_str()?).ok()?;
+    Some(pubky_switch_core::records::SignerHandover::from_parts(
+        envelopes, sig,
+    ))
 }

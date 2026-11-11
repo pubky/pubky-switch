@@ -75,7 +75,7 @@ pub enum ExportReason { HandOver { to_app: [u8; 16] }, Backup }
 
 - **It holds no secret.** It holds the vault and the identity's public key. Each use loads the secret, checks that its public key is still this identity's, makes the core's `IdentityKey` for one operation and drops it, zeroized.
 - **No signing in the public API, and none outside the gate.** Every signature over a document, certificate, approval, claim, key bundle, operation or backup is made with a `SigningKey`, which only the signing gate hands out (section 4.4). Clients of the switch get a key that signs `Switch-Signature` only. The keyring's other uses are narrow calls that sign nothing: the backup key's derivation (spec 13.3) and opening a backup.
-- **The secret leaves for two reasons only,** named by `ExportReason`, and only sealed: in the signer's backup (`SigningKey::seal_backup`, wire 3.13), or in a hand-over to `to_app` (wire 3.12, a later PR).
+- **The secret leaves for two reasons only,** named by `ExportReason`, and only sealed: in the signer's backup (`SigningKey::seal_backup`, wire 3.13), or in a hand-over to `to_app` (`SigningKey::seal_hand_over`, wire 3.12).
 - **Received keys:** `install` adds the secret of a hand-over or a backup to the vault only when it is the identity's key. A vault that already holds that same secret, as after a retry, is fine; another secret is `Occupied`.
 - **`KeyError`** says which of these went wrong: the vault failed, it holds no secret, it already holds one, the secret isn't this identity's, the bytes aren't 32 long, or the random generator failed.
 
@@ -204,7 +204,7 @@ Two exceptions:
 5. Set `until` for cooperative renewals whose app record now carries the new certificate (`record_cert`, `record_at`).
 6. Serve full-bundle requests, resuming from `bundle_ranges`, with `cert.put` where `record_cert` lags.
 7. Renew certificates past half their lifetime.
-8. Check a pending hand-over. If the switch holds a newer version this signer didn't deliver, finish: destroy the key and the records.
+8. Check a pending hand-over. While one is in progress, nothing else here runs: its `PUT /handover` is sent again until answered, and the switch's copy is read. A newer copy naming another install, not its abort or take-back, finishes it once the signer backup on the Homeserver holds a newer version naming that install (wire 3.12): commit the deletion, destroy the key, then the records. Without that proof, the install signs nothing, keeps the key, and looks again next run. Its own abort or take-back at the switch means that delivery won.
 9. Republish the switch's copy if the Homeserver copy differs.
 
 It returns a report and refreshes the alerts.
@@ -295,21 +295,24 @@ impl Signer {
 
     // Hand-over, sending side
     async fn hand_over_to(&mut self, app: AppId, ok: UserConfirmed) -> Result<()>; // seal, PUT /handover
-    async fn abort_hand_over(&mut self, ok: UserConfirmed) -> Result<AbortOutcome>; // aborted | already succeeded
+    async fn abort_hand_over(&mut self, ok: UserConfirmed) -> Result<AbortOutcome>; // Aborted | SucceededBy { install }
 }
 
 /// Hand-over, receiving side: run by the target app with its own app keys.
-async fn receive_hand_over(env: SignerEnv, app: AppCredentials, vault: Arc<dyn SecretVault>)
-    -> Result<Signer, HandOverRefused>;   // GET /handover, checks 1-3, the version + 1 delivery
+async fn receive_hand_over(env: SignerEnv, app: &ReceivingApp, vault: Arc<dyn SecretVault>)
+    -> Result<Signer>;   // GET /handover, checks 1-3, the version + 1 delivery
+async fn resume_take_over(env: SignerEnv, identity: [u8; 32], keys: &AppKeys, vault: Arc<dyn SecretVault>)
+    -> Result<Signer>;   // the secret opened again from the flow's hand-over
 ```
 
 - **`UserConfirmed`** is a token the host makes only after it has shown the user the consequence: a revocation, a loss, an erasure, a hand-over or a take-over.
 - **`SignerEnv`** bundles the store, the clock, the Switch client factory, the Pubky handles and the `Protocols`.
 - **Approval:** `approve` signs the certificate, the version that lists it, the approval with the app's full key bundle and its companion claim, commits them together, then delivers. The claim is released only once the switch took that version. The host delivers it to the auth request's relay and then approves the Pubky grant for exactly the capabilities checked, which include the protocols' grant paths the review showed; the user's approval covers them, since the grant can't be narrowed below the auth request's capabilities.
 - **`receive_hand_over`:**
-  - After any refusal, it destroys whatever it opened (wire 3.12).
-  - A delivery that loses the compare-and-swap counts as a refusal.
-  - On success, it stores the secret in the vault only once its delivery has won.
+  - After a refusal of checks 1 to 3, it keeps nothing it opened (wire 3.12). Check 3 also refuses a switch that holds no copy, or an older one: it went back.
+  - It commits a take-over flow holding the hand-over as received, sealed to its bundle key, never the opened secret. The secret is opened in memory from that flow only, at the start and by `resume_take_over`, as the keyring's received form, and the gate lets that form sign only the first delivery.
+  - The delivery loses only to a `409` whose copy verifies, is at or above its version and names another install (wire 3.12): then the records and the flow go. A `409` carrying the delivery itself, or a later version of this install's own, is a win. Any other answer deletes nothing.
+  - On a win, it adds the secret to the vault, reads it back and checks it, and only then drops the flow. A vault that fails keeps the flow with `KeyNotInstalled`.
 
 ### 5.1 Alerts
 
@@ -423,5 +426,11 @@ The Switch spec answers four questions a signer has to settle:
 - **Removals the switch reports.** A revocation or a departure the switch shows that this signer didn't ask for is taken, as it fails safe, with `RemovedAtSwitch` naming the app. Its time is the earlier of `revoked_at` and `departed_at`, the switch's word, bounded on both sides with `RemovalTimeBounded`: never before the service time at which the switch took the first version this signer delivered listing the app, which it can't have left before, and never after the service time of the verified answer reporting it, so a faulty switch can't keep the removed app's later messages counting. Within those bounds a faulty switch can still pick too early a time, which only costs the app's messages from that time on. A version listing a departed app, which the switch takes while the departure awaits its rotation (wire 3.3), doesn't move the time.
 - **What a restore rebuilds.** The backup carries the records of wire 3.12, not the owed record deletions or which grant reminders were shown, and adding members would change a format other signers read. So a restore rebuilds them. The routine run checks, 32 removed apps at a time, whether each one's record is still on the Homeserver: if it is, the deletion is owed again and its grant reminder raised once more, since the restored install can't tell whether the user saw it. A read that fails only postpones the check; taking over doesn't wait for it. The epoch floor comes from the backup's `bundle_parts` and from `keys_through` and `bundle_ranges` in `GET /apps`, which also show parts a refused batch stored before any backup of them, and is kept at most one epoch past `data_epoch` (`EpochFloorBounded`). The tombstones add the App IDs `GET /apps` shows revoked or departed, and, in place, this install's own, with the revocations it asked for. An app the restored document lists gets no listing floor for a removal time, since when it was first listed is unknown.
 - **A restore against an old backup with a switch rolled back to match it.** On a new install, `restore_new` has no mark of its own to compare with. A backup and a switch copy rolled back together to an older version pass the spec's checks, so that restore goes ahead from the older state; nothing in wire 3.13 can tell. In place, the mark catches it: a backup below the mark, or another body at it, is `StaleBackup`, and a restore never clears an alarm.
+- **What a hand-over's deletion rests on.** The old signer deletes its key only on the switch's copy of another install's newer version and that install's signer backup on the Homeserver, holding a newer version naming it (wire 3.12). Only a holder of the identity key makes that backup, and the new signer writes it only once its key is stored, read back and checked, so neither the switch nor the Homeserver, alone or together, can make both installs delete the key.
+- **A new signer lost before its backup.** The old signer then keeps the key and signs nothing (`SuccessorUnproven`); it can't abort, since the switch is past the version handed over, and its in-place `restore` is refused while it is handing over. The way out is the take-back (`Signer::take_back`), on the user's word that the new signer is lost. If that install is still alive, it finds itself not named and keeps its key: two installs then hold it, and `TakenBack` tells the user. If the new signer wrote its backup but didn't publish, the backup is the proof, and the old signer deletes its key.
+- **A losing abort or take-back can share a version with the new signer's next one.** Between the old signer's read of the switch and the compare-and-swap, the new signer may sign its next version at the handed-over version plus 2, the abort's number, or at the take-back's. The switch takes one; the other is a second document signed at that version that only the identity's own switch received (as for racing installs, below).
+- **A switch that answers both the take-over and the abort.** A hostile switch can answer `200` to both. Both build on the version handed over, so the 3.13 losing-delivery exception lets each write over the other's backup; there is no key loss, but two installs then sign.
+- **Records left behind once the key is gone.** The old signer commits its deletion, then deletes the key, then the records. If the key's deletion succeeds and the records' fails, `IdentityKeyring::open` finds no key, so `Signer::open` can't run to finish the deletion. The marked records stay on that store until a new set-up of the identity replaces them; they hold no secret.
+- **A switch that kept the hand-over.** The hand-over is sealed to the new signer's bundle key. A switch that kept the ciphertext keeps the identity key recoverable by anyone with that app's bundle secret, after the new signer has deleted what it received.
 - **Records left managed by each other under the earlier take-over rule.** Records that a race inside a backup write's read-then-write window left with two installs each `ManagedBy` the other, while another install's backup at or past the mark still counted as a take-over whatever it built on, stay so, since only a restore clears `managed_by` and both restores are refused as stale; getting out would take a path, not built, that re-judges a `managed_by` taken from a backup while the switch still holds this install's own mark.
 - **Two documents at one version from racing installs.** Racing installs can leave two documents signed by the identity at one version: a losing delivery's, which the switch refused, and either the winning delivery, when both signed the same number, or the winner's next version, which reuses a number the loser had spent. The losing one goes only to the identity's own switch, which refused it, and into the loser's backup, sealed to the identity's own backup key and replaced by the winner's next write; nothing publishes it, so no counterparty sees the pair that wire 3.3 would treat as equivocation.

@@ -651,6 +651,12 @@ impl Signer {
     ///
     /// As [`Signer::resume`].
     pub async fn run_due(&mut self) -> Result<()> {
+        // While a hand-over or a take-over is in progress, only its own step runs: nothing
+        // routine is signed, and what is owed stays owed (Switch wire 3.12).
+        self.refresh().await?;
+        if self.state.handing_over.is_some() || self.state.taking_over {
+            return self.resume().await;
+        }
         // A publication that failed doesn't hold back the closings owed at the switch.
         let resumed = self.resume().await;
         if let Err(error) = &resumed

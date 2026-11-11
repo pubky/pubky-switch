@@ -5,16 +5,20 @@
 //! [`SigningClient`] is made from the gated key ([`crate::key::SigningKey`]): only it signs
 //! operations, and a mutating signer-only call that signs nothing in its body, such as a
 //! freeze, an unfreeze, an erasure or a hand-over, belongs on it. Each has only the calls its
-//! kind may make.
+//! kind may make. An [`AppClient`] is a new signer's, before it holds the identity key: it
+//! fetches the hand-over and nothing else (Switch wire 7.4.17).
 
 use std::sync::Arc;
 
-use pubky_switch_client::client::answers::{AppsAnswer, WriteAnswer};
+use pubky_switch_client::client::answers::{
+    AppsAnswer, HandoverStored, StoredHandover, WriteAnswer,
+};
 use pubky_switch_client::client::{Batch, Submitted};
 use pubky_switch_client::{ClientError, Credentials, SwitchClient};
 use pubky_switch_core::http::IdentityDelivery;
+use pubky_switch_core::keys::AppKeys;
 use pubky_switch_core::ops::{Condition, OpKind, Position};
-use pubky_switch_core::records::{Enrollment, EnrollmentAnswer};
+use pubky_switch_core::records::{AppCert, Enrollment, EnrollmentAnswer};
 use pubky_switch_core::signing::Signs;
 
 use super::SignerEnv;
@@ -40,13 +44,23 @@ fn client(
     target: &Target<'_>,
     key: Arc<dyn Signs + Send + Sync>,
 ) -> Result<SwitchClient> {
+    let credentials = Credentials::Signer {
+        identity: target.identity,
+        key,
+    };
+    client_with(env, target, credentials)
+}
+
+/// A client for `target` with `credentials`: the one place a switch client is made.
+fn client_with(
+    env: &SignerEnv,
+    target: &Target<'_>,
+    credentials: Credentials,
+) -> Result<SwitchClient> {
     Ok(SwitchClient::new(
         target.origin,
         target.identity,
-        Credentials::Signer {
-            identity: target.identity,
-            key,
-        },
+        credentials,
         target.pinned,
         Arc::clone(&env.transport),
         Arc::clone(&env.clock),
@@ -149,5 +163,41 @@ impl SigningClient {
         cursor: Option<Position>,
     ) -> std::result::Result<Batch, ClientError> {
         self.0.sign_batch(generation, ops, cursor)
+    }
+
+    /// `PUT /handover` (Switch wire 7.4.17): store the hand-over for its target app, sealed
+    /// and signed already, and sent again with the same bytes.
+    pub(crate) async fn put_handover(
+        &self,
+        stored: &StoredHandover,
+    ) -> std::result::Result<HandoverStored, ClientError> {
+        self.0.put_handover(stored).await
+    }
+}
+
+/// A switch client with an app's credentials: a new signer's before it holds the identity
+/// key. It fetches the hand-over held for it, and makes no other call.
+pub(crate) struct AppClient(SwitchClient);
+
+impl AppClient {
+    /// A client for `target` with the credentials of the app whose keys are `keys` and whose
+    /// certificate is `cert`.
+    pub(crate) fn new(
+        env: &SignerEnv,
+        target: &Target<'_>,
+        keys: &AppKeys,
+        cert: &AppCert,
+    ) -> Result<Self> {
+        let credentials = Credentials::App {
+            identity: target.identity,
+            keys: keys.clone(),
+            cert: cert.clone(),
+        };
+        Ok(Self(client_with(env, target, credentials)?))
+    }
+
+    /// `GET /handover` (Switch wire 7.4.17): the hand-over the switch holds for this app.
+    pub(crate) async fn get_handover(&self) -> std::result::Result<StoredHandover, ClientError> {
+        self.0.get_handover().await
     }
 }

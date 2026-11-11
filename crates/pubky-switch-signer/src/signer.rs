@@ -52,14 +52,18 @@ use crate::state::{self, DeliverStep, Flow, Newest, Service, SignerState};
 mod approval;
 mod clients;
 pub(crate) mod gate;
+mod handover;
 mod renewal;
 mod restore;
 mod revocation;
+mod takeover;
 
 pub use approval::{AppReview, ApprovedRequest};
 use clients::{RequestClient, SigningClient, Target};
+pub use handover::AbortOutcome;
 pub use renewal::CertChange;
 pub use revocation::UserConfirmed;
+pub use takeover::ReceivingApp;
 
 /// What the signer works with, from the host.
 #[derive(Clone)]
@@ -131,6 +135,14 @@ pub enum SignerStatus {
         /// That version.
         version: u64,
     },
+    /// This install is handing the identity over to the app `to_app`, until the hand-over
+    /// takes effect or is aborted (Switch wire 3.12).
+    HandingOver {
+        /// The new signer's App ID.
+        to_app: [u8; 16],
+    },
+    /// This install is taking the identity over, until its first delivery has won.
+    TakingOver,
     /// A rollback or an equivocation was seen: its alert is held, or the switch hasn't
     /// confirmed since that it holds this signer's newest version. Claims are held, and
     /// nothing is signed, an owed closing included, until the user clears the alert
@@ -146,6 +158,10 @@ fn status_of(state: &SignerState) -> SignerStatus {
         Some(SignerError::Refused(Refusal::RecordsBehind { version })) => {
             SignerStatus::RecordsBehind { version }
         }
+        Some(SignerError::Refused(Refusal::HandingOver { to_app })) => {
+            SignerStatus::HandingOver { to_app }
+        }
+        Some(SignerError::Refused(Refusal::TakingOver)) => SignerStatus::TakingOver,
         Some(_) => SignerStatus::Alarm,
         None if state.newest.is_none() => SignerStatus::Enrolling,
         None => SignerStatus::Signing,
@@ -186,7 +202,7 @@ impl Signer {
     /// or random generator failure.
     pub async fn create(env: SignerEnv, keyring: IdentityKeyring, origin: &str) -> Result<Self> {
         let identity = keyring.public_key();
-        if state::load(&env.store, &identity).await?.is_some() {
+        if state::set_up(&env.store, &identity).await? {
             return Err(Refusal::AlreadySetUp.into());
         }
         let install = random_bytes::<16>()?;
@@ -233,13 +249,19 @@ impl Signer {
         let (state, flow) = state::load(&env.store, &identity)
             .await?
             .ok_or(Refusal::NotSetUp)?;
-        Ok(Self {
+        let handed_over = state.handed_over_to;
+        let mut signer = Self {
             env,
             keyring,
             state,
             flow,
             unsure: false,
-        })
+        };
+        // Records of a hand-over that took effect: the deletion is finished now.
+        if let Some(install) = handed_over {
+            signer.delete_handed_over(install).await?;
+        }
+        Ok(signer)
     }
 
     /// Finish the flow in progress, resending what it signed, then publish the newest version
@@ -255,6 +277,17 @@ impl Signer {
         self.refresh().await?;
         loop {
             self.finish_flow().await?;
+            // While a hand-over is in progress nothing routine is signed: its own step only,
+            // and owed work stays owed (Switch wire 3.12).
+            if self.state.handing_over.is_some() {
+                self.continue_hand_over().await?;
+                // Still handing over: nothing more this run. Over, as when its own abort or
+                // take-back is found to have won: the run goes on.
+                if self.state.handing_over.is_some() {
+                    return Ok(());
+                }
+                continue;
+            }
             // A closing delivery a reduction owes comes before anything else, publication
             // included: it cuts the earlier certificate off at the switch, and a Homeserver
             // that refuses writes must not hold it back (Switch wire 3.8 "A closing delivery
@@ -288,6 +321,7 @@ impl Signer {
                     enrollment,
                     policy,
                 } => self.enroll(&origin, &enrollment, policy).await?,
+                Flow::TakingOver { delivery, .. } => self.take_over(delivery).await?,
                 Flow::Deliver {
                     doc,
                     prev,
@@ -631,15 +665,18 @@ impl Signer {
 
     /// After a commit the store couldn't tell about, read the records and the flow again.
     async fn refresh(&mut self) -> Result<()> {
-        if !self.unsure {
-            return Ok(());
+        if self.unsure {
+            let (state, flow) = state::load(&self.env.store, &self.state.identity)
+                .await?
+                .ok_or(Refusal::NotSetUp)?;
+            self.state = state;
+            self.flow = flow;
+            self.unsure = false;
         }
-        let (state, flow) = state::load(&self.env.store, &self.state.identity)
-            .await?
-            .ok_or(Refusal::NotSetUp)?;
-        self.state = state;
-        self.flow = flow;
-        self.unsure = false;
+        // A hand-over that took effect: what is left of the key and the records goes first.
+        if let Some(install) = self.state.handed_over_to {
+            return self.delete_handed_over(install).await;
+        }
         Ok(())
     }
 
@@ -941,35 +978,13 @@ impl Signer {
                     .first()
                     .and_then(|proof| proof.body().chain.open().ok())
                     .map(|envelope| envelope.server_time);
-                let mut state = self.state.clone();
-                if let (Some(at), Ok(delivered)) =
-                    (delivered_at, IdentityDoc::verify(&doc, &state.identity))
-                {
-                    for app in &delivered.body().apps {
-                        if !state.listed_at.iter().any(|(id, _)| *id == app.app_id) {
-                            state.listed_at.push((app.app_id, at));
-                        }
-                    }
-                }
-                let published = state
-                    .newest
-                    .as_ref()
-                    .is_some_and(|n| n.doc == doc && n.published);
-                state.newest = Some(Newest {
-                    doc,
-                    prev,
-                    published,
-                    delivered_at,
-                });
-                // The switch took this version, built on the one before: it holds the mark.
-                state.switch_unconfirmed = false;
-                self.commit(state, None).await
+                self.delivered(doc, prev, delivered_at).await
             }
             Err(ClientError::Switch {
                 code: ErrorCode::StaleIdentity,
                 current,
                 ..
-            }) => self.stale(&current).await,
+            }) => self.stale(&current, doc, prev).await,
             Err(error @ ClientError::Switch { status: 400, .. }) => {
                 // A definite refusal: the same bytes would be refused again. The version stays
                 // spent (`signed_through`).
@@ -980,10 +995,68 @@ impl Signer {
         }
     }
 
+    /// The switch took `doc`, built on `prev`, at the service time `delivered_at` when its
+    /// answer gave one: it is the mark. An abort that won ends the hand-over (Switch wire
+    /// 3.12).
+    async fn delivered(
+        &mut self,
+        doc: SignedDoc,
+        prev: Option<[u8; 32]>,
+        delivered_at: Option<u64>,
+    ) -> Result<()> {
+        let mut state = self.state.clone();
+        let verified = IdentityDoc::verify(&doc, &state.identity);
+        if let (Some(at), Ok(delivered)) = (delivered_at, &verified) {
+            for app in &delivered.body().apps {
+                if !state.listed_at.iter().any(|(id, _)| *id == app.app_id) {
+                    state.listed_at.push((app.app_id, at));
+                }
+            }
+        }
+        if let Ok(delivered) = &verified
+            && let Some(handing) = state.handing_over.clone()
+        {
+            // The abort or the take-back won: the hand-over is over, and this install signs
+            // again, so an alert that another install manages the identity no longer holds
+            // (Switch wire 3.12).
+            let take_back = handing.take_back.filter(|t| t.doc == doc);
+            if handing.abort == Some(delivered.hash()) || take_back.is_some() {
+                state.handing_over = None;
+                state
+                    .alerts
+                    .retain(|a| !matches!(a, Alert::ManagedByOtherInstall { .. }));
+            }
+            if let Some(take_back) = take_back {
+                state.alert(Alert::TakenBack {
+                    from: take_back.from,
+                });
+            }
+        }
+        let published = state
+            .newest
+            .as_ref()
+            .is_some_and(|n| n.doc == doc && n.published);
+        state.newest = Some(Newest {
+            doc,
+            prev,
+            published,
+            delivered_at,
+        });
+        // The switch took this version, built on the one before: it holds the mark.
+        state.switch_unconfirmed = false;
+        self.commit(state, None).await
+    }
+
     /// `409 stale_identity`: the switch holds another version than the one this delivery
     /// builds on, and its answer carries the copy, or `null` when it holds none (Switch wire
-    /// 3.3 "Never back", 7.4.2). The delivery is over whatever the copy is.
-    async fn stale(&mut self, current: &Value) -> Result<()> {
+    /// 3.3 "Never back", 7.4.2). The delivery is over whatever the copy is. A copy that is
+    /// `doc` itself means the switch took it, and the answer that said so was lost.
+    async fn stale(
+        &mut self,
+        current: &Value,
+        doc: SignedDoc,
+        prev: Option<[u8; 32]>,
+    ) -> Result<()> {
         let copy = match current.get("identity") {
             None | Some(Value::Null) => None,
             Some(doc) => {
@@ -999,6 +1072,9 @@ impl Signer {
                 }
             }
         };
+        if copy.as_ref().is_some_and(|copy| copy.signed() == &doc) {
+            return self.delivered(doc, prev, None).await;
+        }
         match self.judge_copy(copy.as_ref()) {
             Err(alert) => self.alarm(alert).await,
             Ok(Verdict::Newer) => match copy {
@@ -1056,13 +1132,36 @@ impl Signer {
     /// its records are behind: nothing it holds accounts for that version, so it is neither
     /// adopted nor signed over, and this install stops until a restore from the signer
     /// backup.
+    ///
+    /// While a hand-over is in progress (Switch wire 3.12), the switch's copy of this
+    /// install's own abort or take-back means that delivery won. Another install's newer
+    /// version from the switch is the proof that it took the identity only with that install's
+    /// backup on the Homeserver ([`Signer::succeeded`]); then the key and the records are
+    /// deleted. Any other newer copy stops this install as one that isn't named, keeping the
+    /// key and the hand-over, which it looks at again at each run.
     async fn adopt(&mut self, copy: IdentityDoc, source: Source) -> Result<()> {
         let version = copy.version();
         let signer = copy.body().signer;
+        if self.state.handing_over.is_some() {
+            if source == Source::Switch {
+                if let Some(prev) = self.own_hand_over_delivery(&copy) {
+                    return self
+                        .delivered(copy.signed().clone(), Some(prev), None)
+                        .await;
+                }
+                if self.succeeded_by(&copy) {
+                    return self.succeeded(&copy).await;
+                }
+            }
+            if signer != self.state.install {
+                return Err(Refusal::SuccessorUnproven { install: signer }.into());
+            }
+        }
         if signer == self.state.install {
             return self.records_behind(source, version).await;
         }
         let mut state = self.state.clone();
+        state.handing_over = None;
         state.newest = Some(Newest {
             doc: copy.signed().clone(),
             prev: None,
@@ -1121,6 +1220,10 @@ impl Signer {
             return Ok(());
         };
         if newest.published || self.state.managed_by.is_some() {
+            return Ok(());
+        }
+        // A take-over's first version waits for its backup (Switch wire 3.12).
+        if self.state.publish_after_backup && self.state.backup_owed {
             return Ok(());
         }
         // A publication may come after a crash, once another install has signed and published
@@ -1191,5 +1294,8 @@ mod tests {
             status_of(&state),
             SignerStatus::ManagedBy { install: [7; 16] }
         );
+        let mut state = SignerState::new([1; 32], [2; 16]);
+        state.taking_over = true;
+        assert_eq!(status_of(&state), SignerStatus::TakingOver);
     }
 }
