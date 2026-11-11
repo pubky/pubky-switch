@@ -1090,12 +1090,12 @@ async fn lost_world(store: Arc<dyn StateStore>) -> Lost {
 }
 
 /// [`lost_world`], the app holding `permissions`, with `record` a shared record it wrote
-/// before the loss, and without `contact` no contact in its lists.
+/// before the loss, and without `lists` nothing in its lists.
 async fn lost_world_with(
     store: Arc<dyn StateStore>,
     permissions: &[Permission],
     record: bool,
-    contact: bool,
+    lists: bool,
 ) -> Lost {
     let w = World::new();
     let router = Router::of(&w);
@@ -1120,7 +1120,7 @@ async fn lost_world_with(
     let carol = IdentityKey::from_secret(seed("carol/identity")).public();
     let dave = IdentityKey::from_secret(seed("dave/identity")).public();
     let phone = w.other_app("phone", &[Permission::ListsManage]);
-    if contact {
+    if lists {
         w.switch
             .app_op(
                 &phone,
@@ -1130,10 +1130,10 @@ async fn lost_world_with(
                 },
             )
             .unwrap();
+        w.switch
+            .app_op(&phone, OpKind::DenyPut { pubky: dave })
+            .unwrap();
     }
-    w.switch
-        .app_op(&phone, OpKind::DenyPut { pubky: dave })
-        .unwrap();
     w.clock.advance_ms(1000);
     let note_at_ms = w.clock.now_ms();
     w.note(me, "before the loss");
@@ -1582,7 +1582,7 @@ async fn test_loss_upload_merges_the_lists_and_ends_staged_admission() {
 
 #[tokio::test]
 async fn test_loss_upload_from_manage_holding_no_contacts_sends_them_empty() {
-    // An app with `lists.manage` that holds no contacts still sends `contacts: []`: that
+    // An app with `lists.manage` whose lists hold nothing still sends `contacts: []`: that
     // upload ends staged admission (Switch spec 12.6 step 2).
     let store = Arc::new(MemoryStore::new());
     let permissions = [Permission::ListsRead, Permission::ListsManage];
