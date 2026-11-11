@@ -22,7 +22,9 @@ fails instead.
   entry that no longer shows.
 - `src/check.rs`: what the harness verifies itself in both runs (answer signatures, heads,
   chain stubs, feed items, transition proofs), and what it leaves to the client and the
-  signer.
+  signer. A failed check fails the flow's test and no allowed entry can cover it,
+  so every answer of the service and of the scripted switch passes these checks in every
+  flow.
 
 ## Adding a flow
 
