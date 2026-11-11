@@ -265,17 +265,9 @@ async fn load_state(
     }
     let record_keys: Vec<[u8; 32]> = needs.records.iter().copied().collect();
     for record in txn.records(&record_keys).await? {
-        state.records.insert(
-            record.state.key,
-            HeldRecord {
-                state: record.state,
-                value_bytes: record.value_bytes,
-                writer: record.writer,
-                cert: record.cert,
-                op: record.op,
-                proof: Some(record.proof),
-            },
-        );
+        state
+            .records
+            .insert(record.state.key, HeldRecord::from(record));
     }
     let claim_keys: Vec<[u8; 32]> = needs.claims.iter().copied().collect();
     state.claims = txn.claims(&claim_keys).await?.into_iter().collect();

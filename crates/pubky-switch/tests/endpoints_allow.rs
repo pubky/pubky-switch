@@ -471,7 +471,7 @@ async fn test_allow_needs_lists_read() {
     assert_eq!(code_of(&answer), (403, json!("permission_missing")));
     // An app of another identity: refused, with no head.
     let answer = from_shop(&replay, "GET", &allow_path(), Vec::new(), None).await;
-    assert_eq!(code_of(&answer), (403, json!("not_admitted")));
+    assert_eq!(code_of(&answer), (403, json!("permission_missing")));
     assert!(header_text(&answer, "switch-head").is_none());
     replay.db.drop_database().await.expect("drop");
 }
@@ -680,7 +680,7 @@ async fn test_allow_reads_of_an_account_wait_their_turn() {
                 // Neither an app of another identity, nor the signer, nor the directory
                 // waits behind it or takes a place in the queue.
                 let foreign = from_shop(&replay, "GET", &allow_path(), Vec::new(), None).await;
-                assert_eq!(code_of(&foreign), (403, json!("not_admitted")));
+                assert_eq!(code_of(&foreign), (403, json!("permission_missing")));
                 let signer = replay
                     .service
                     .handle(signer_request("GET", &allow_path(), Vec::new(), ms(&now)))
