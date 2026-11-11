@@ -2117,40 +2117,6 @@ async fn test_provider_loss_enrollment_refused_ends_the_flow() {
 }
 
 #[tokio::test]
-async fn test_provider_loss_enrollment_refused_for_good_by_the_service() {
-    // A `400` the key of an earlier enrollment there verifies is the service's word: the
-    // flow ends at once (Switch wire 7.4.1).
-    let world = World::new();
-    let (mut signer, service, router) = lost_with_an_app(&world, notes()).await;
-    service.fail_next(Fault::Error {
-        path: "/identity".into(),
-        code: pubky_switch_core::http::ErrorCode::BadRequest,
-        current: serde_json::Value::Null,
-    });
-    signer
-        .declare_provider_loss(NEW_ORIGIN, confirmed())
-        .await
-        .unwrap_err();
-    let before = enrollments_at(&router, NEW_ORIGIN);
-    enrollment_errors(&service, pubky_switch_core::http::ErrorCode::BadRequest, 1);
-    signer
-        .declare_provider_loss(NEW_ORIGIN, confirmed())
-        .await
-        .unwrap_err();
-    assert_eq!(
-        enrollments_at(&router, NEW_ORIGIN),
-        before + 1,
-        "not sent again"
-    );
-    assert_eq!(
-        signer.status(),
-        SignerStatus::RecoveryRefused {
-            origin: NEW_ORIGIN.into()
-        }
-    );
-}
-
-#[tokio::test]
 async fn test_provider_loss_enrolls_anew_after_a_conflict() {
     // A `409 conflict` asks for a new enrollment: the signer signs one with a new nonce,
     // keeps it for its retries, and the recovery completes (Switch wire 3.7, 7.4.1).
@@ -2655,7 +2621,33 @@ async fn test_scripted_enrollment_again_gets_its_kept_answer() {
         .declare_provider_loss(SWITCH_ORIGIN, confirmed())
         .await
         .unwrap();
-    assert_eq!(world.switch.handle(&creating).unwrap().status, 409);
+    let retired = world.switch.handle(&creating).unwrap();
+    assert_eq!(retired.status, 409);
+    // Its errors are the operator's, as at the service: the account's key doesn't verify
+    // them, an injected one included (Switch wire 7.4.1).
+    let under_the_account_key = |response: &pubky_switch_client::transport::Response| {
+        let signature = creating
+            .header(pubky_switch_core::http::header::SIGNATURE)
+            .and_then(|text| pubky_switch_core::http::decode_signature(text).ok());
+        !matches!(
+            pubky_switch_client::client::check_response(
+                &world.switch.service_key(),
+                &world.key.public(),
+                signature.as_ref(),
+                response,
+            ),
+            Err(pubky_switch_client::ClientError::BadServiceSignature { .. })
+        )
+    };
+    assert!(!under_the_account_key(&retired));
+    world.switch.fail_next(Fault::Error {
+        path: "/enroll".into(),
+        code: pubky_switch_core::http::ErrorCode::BadRequest,
+        current: serde_json::Value::Null,
+    });
+    let injected = world.switch.handle(&creating).unwrap();
+    assert_eq!(injected.status, 400);
+    assert!(!under_the_account_key(&injected));
     let pending = enrollments(&world).pop().unwrap();
     let again = world.switch.handle(&pending).unwrap();
     assert_eq!(again.status, 200);
@@ -3015,5 +3007,163 @@ async fn test_provider_loss_restore_on_a_new_install_keeps_the_picked_distrust_t
             .map(|r| r.distrust_from),
         Some(picked),
         "the time the user picked"
+    );
+}
+
+#[tokio::test]
+async fn test_provider_loss_restore_on_a_new_install_completes_a_revocation_the_loss_left() {
+    // The revocation the lost service never took is pending at the declaration; the new
+    // service takes the recovery from a new install restored from that backup, which revokes
+    // the app there and removes it (Switch spec 12.2, 12.6 step 1, wire 3.13).
+    let world = World::new();
+    let (signer, service, router) = recovery_backed_up_with_a_revocation_pending(&world).await;
+    drop(signer);
+    let mut restored = restored_from_the_backup(&world, &router).await;
+    restored.resume().await.unwrap();
+    assert!(restored.complete_removals().await.unwrap());
+    revoked_and_removed_at(&world, &service, &router);
+    assert!(service.app(&notes_app_id()).revoked_at.is_some());
+}
+
+#[tokio::test]
+async fn test_restore_in_place_takes_another_installs_pending_revocation() {
+    // Restored in place from another install's backup, which holds a revocation this
+    // install's own records never held: it is pending here too, and carried out (Switch spec
+    // 12.2, wire 3.13).
+    let world = World::new();
+    let (first, first_store) = world.enrolled().await;
+    drop(first);
+    let mut other = Signer::restore_new(
+        world.env(Arc::new(MemoryStore::new())),
+        world.keyring(),
+        confirmed(),
+    )
+    .await
+    .unwrap();
+    let app = App::new(&["notes"], None, [9; 32]);
+    world.approve(&mut other, &app).await;
+    let id = app.keys.app_id_bytes();
+    world.switch.fail_next(Fault::Unreachable {
+        path: "/revoke".into(),
+        after: 0,
+    });
+    other.revoke(id, None, confirmed()).await.unwrap_err();
+    other.set_record_max_age(Some(9)).await.unwrap();
+    assert!(world.backup().identity_doc().listed_cert(&id).is_some());
+    drop(other);
+    let mut signer = Signer::open(world.env(first_store), world.keyring())
+        .await
+        .unwrap();
+    signer.restore(confirmed()).await.unwrap();
+    assert!(signer.alerts().contains(&Alert::RevocationPending {
+        app_id: id,
+        at_switch: false
+    }));
+    assert!(signer.complete_removals().await.unwrap());
+    let held = world.switch.identity_doc().unwrap();
+    assert!(held.listed_cert(&id).is_none());
+    assert!(world.switch.app(&id).revoked_at.is_some());
+}
+
+#[tokio::test]
+async fn test_provider_loss_counts_every_enrollment_send() {
+    // `400`s and `409 conflict`s mixed: three sends in all in the run, whichever they were,
+    // then the flow ends (Switch wire 7.4.1).
+    let world = World::new();
+    let (mut signer, service, router) = lost_with_an_app(&world, notes()).await;
+    for code in [
+        pubky_switch_core::http::ErrorCode::BadRequest,
+        pubky_switch_core::http::ErrorCode::BadRequest,
+        pubky_switch_core::http::ErrorCode::Conflict,
+        pubky_switch_core::http::ErrorCode::Conflict,
+        pubky_switch_core::http::ErrorCode::BadRequest,
+    ] {
+        enrollment_errors(&service, code, 1);
+    }
+    signer
+        .declare_provider_loss(NEW_ORIGIN, confirmed())
+        .await
+        .unwrap_err();
+    assert_eq!(enrollments_at(&router, NEW_ORIGIN), 3);
+    assert_eq!(
+        signer.status(),
+        SignerStatus::RecoveryRefused {
+            origin: NEW_ORIGIN.into()
+        }
+    );
+}
+
+#[tokio::test]
+async fn test_provider_loss_new_enrollment_survives_a_restart() {
+    // A `409 conflict` gets a new enrollment, committed before it is sent: after a stop, the
+    // next run sends those bytes again, not another new one (Switch wire 3.7).
+    let world = World::new();
+    let store = Arc::new(MemoryStore::new());
+    let mut signer = Signer::create(world.env(store.clone()), world.keyring(), SWITCH_ORIGIN)
+        .await
+        .unwrap();
+    signer.resume().await.unwrap();
+    world
+        .approve(&mut signer, &App::new(&["notes"], None, [9; 32]))
+        .await;
+    drop(signer);
+    let (service, router) = new_service(&world);
+    router.remove(SWITCH_ORIGIN);
+    let mut signer = reopened(&world, store.clone(), &router, notes()).await;
+    enrollment_errors(&service, pubky_switch_core::http::ErrorCode::Conflict, 1);
+    service.fail_next(Fault::Unreachable {
+        path: "/enroll".into(),
+        after: 0,
+    });
+    signer
+        .declare_provider_loss(NEW_ORIGIN, confirmed())
+        .await
+        .unwrap_err();
+    drop(signer);
+    let mut signer = reopened(&world, store, &router, notes()).await;
+    service.fail_next(Fault::Unreachable {
+        path: "/enroll".into(),
+        after: 0,
+    });
+    signer.resume().await.unwrap_err();
+    let kept = service.unreached_bodies();
+    assert_eq!(kept.len(), 2);
+    assert_eq!(kept[0], kept[1], "the committed enrollment's bytes");
+    signer.resume().await.unwrap();
+    assert!(service.identity_doc().is_some());
+}
+
+#[tokio::test]
+async fn test_provider_loss_refused_after_the_pre_read_names_the_origin_declared() {
+    // The read under the earlier key finds a version of this recovery naming another key
+    // there: the delivery is over, and the status names the service just declared, not the
+    // one declared before it (Switch spec 12.6 step 1).
+    let world = World::new();
+    let (mut signer, service, _) = lost_with_an_app(&world, notes()).await;
+    service.fail_next(Fault::LoseAnswer {
+        path: "/identity".into(),
+    });
+    signer
+        .declare_provider_loss(NEW_ORIGIN, confirmed())
+        .await
+        .unwrap_err();
+    let taken = service.identity_doc().unwrap();
+    signer
+        .declare_provider_loss("https://unanswered.example", confirmed())
+        .await
+        .unwrap_err();
+    let mut body = taken.body().clone();
+    body.inbox.service_key = [0x42; 32];
+    let other_key = pubky_switch_core::records::IdentityDoc::sign(&world.key, body).unwrap();
+    service.deliver_identity(&other_key).unwrap();
+    signer
+        .declare_provider_loss(NEW_ORIGIN, confirmed())
+        .await
+        .unwrap_err();
+    assert_eq!(
+        signer.status(),
+        SignerStatus::RecoveryRefused {
+            origin: NEW_ORIGIN.into()
+        }
     );
 }

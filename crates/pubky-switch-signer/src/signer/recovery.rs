@@ -49,8 +49,8 @@ use crate::alert::{Alert, Source};
 use crate::error::{Refusal, Result, SignerError};
 use crate::state::{DeliverStep, Flow, Service, SignerState};
 
-/// How many times a recovery's enrollment is sent, or signed anew, before its failure is
-/// shown (Switch wire 7.4.1).
+/// How many times in all a run sends a recovery's enrollment, the same or a new one, before
+/// its failure is shown (Switch wire 7.4.1).
 const ENROLL_TRIES: u32 = 3;
 
 impl Signer {
@@ -443,15 +443,15 @@ impl Signer {
     }
 
     /// Enroll at the service at `origin` with `signed`, as the errors of `POST /enroll` ask
-    /// (Switch wire 7.4.1). They are the operator's, which no client can check, but where a
-    /// key an earlier declaration enrolled under is pinned and verifies them:
+    /// (Switch wire 3.7, 7.4.1). They are the operator's, which no client can check, so none
+    /// is the service's word:
     ///
-    /// - an unverified `400` isn't the service's word: the same enrollment is sent again, up
-    ///   to [`ENROLL_TRIES`] times in all, and only then is the failure shown;
-    /// - a `409 conflict` asks for a new enrollment: one with a new nonce is signed, kept in
-    ///   the flow and sent, up to [`ENROLL_TRIES`] times in all;
-    /// - a verified `400`, or either one past its bound, ends the flow: the recovery waits to
-    ///   be declared again ([`crate::SignerStatus::RecoveryRefused`]), which enrolls afresh.
+    /// - a `400` sends the same enrollment again;
+    /// - a `409 conflict` means enroll again: one with a new nonce is signed, kept in the
+    ///   flow and sent;
+    /// - after [`ENROLL_TRIES`] sends in all in this run, either one ends the flow: the
+    ///   failure is shown, and the recovery waits to be declared again
+    ///   ([`crate::SignerStatus::RecoveryRefused`]), which enrolls afresh.
     ///
     /// Any other failure keeps the flow, for the next run.
     async fn enroll_for_recovery(
@@ -460,22 +460,16 @@ impl Signer {
         signed: &SignedDoc,
     ) -> Result<pubky_switch_core::records::EnrollmentAnswer> {
         let identity = self.state.identity;
-        let pinned = self
-            .state
-            .recovery_services
-            .iter()
-            .rev()
-            .find(|service| service.origin == origin)
-            .map(|service| service.service_key);
         let target = Target {
             origin,
-            pinned,
+            pinned: None,
             identity,
         };
         let mut signed = signed.clone();
-        let (mut sent, mut anew) = (0, 0);
+        let mut sends = 0;
         loop {
             let enrollment = Enrollment::verify(&signed, &identity, origin)?;
+            sends += 1;
             let error = match RequestClient::new(&self.env, &target, &self.keyring)?
                 .enroll(&enrollment)
                 .await
@@ -483,21 +477,13 @@ impl Signer {
                 Ok(answer) => return Ok(answer),
                 Err(error) => error,
             };
+            let more = sends < ENROLL_TRIES;
             match error {
-                ClientError::Switch { status: 409, .. }
-                | ClientError::BadServiceSignature { status: 409 }
-                    if anew + 1 < ENROLL_TRIES =>
-                {
-                    anew += 1;
+                ClientError::BadServiceSignature { status: 409 } if more => {
                     signed = self.enroll_anew(origin, &enrollment).await?;
                 }
-                ClientError::BadServiceSignature { status: 400 } if sent + 1 < ENROLL_TRIES => {
-                    sent += 1;
-                }
-                ClientError::Switch {
-                    status: 400 | 409, ..
-                }
-                | ClientError::BadServiceSignature { status: 400 | 409 } => {
+                ClientError::BadServiceSignature { status: 400 } if more => {}
+                ClientError::BadServiceSignature { status: 400 | 409 } => {
                     self.commit(self.state.clone(), None).await?;
                     return Err(error.into());
                 }

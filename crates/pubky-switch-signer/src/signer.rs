@@ -1516,11 +1516,11 @@ impl Signer {
     pub(super) fn own_recovery_version(&self, copy: &IdentityDoc) -> bool {
         // A restore's recovery is built on the backup's version itself, which the install
         // the backup came from signed (Switch wire 3.13).
-        let restored = self
-            .state
-            .recovery_base
-            .as_ref()
-            .is_some_and(|base| base == copy.signed() && copy.body().recovery_from.is_some());
+        let restored = self.state.recovery_base.as_ref().is_some_and(|base| {
+            base == copy.signed()
+                && copy.body().recovery_from.is_some()
+                && copy.body().recovery_from == self.state.lost_generation
+        });
         self.state.recovering
             && (restored
                 || (copy.body().signer == self.state.install
