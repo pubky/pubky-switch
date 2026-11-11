@@ -66,9 +66,11 @@ impl Signer {
     ///
     /// [`Refusal::NotListed`] for an app the newest `identity.json` doesn't list;
     /// [`Refusal::HandingOver`] or [`Refusal::TakingOver`] while a hand-over or a take-over is
-    /// in progress; otherwise as [`Signer::resume`]. A revocation cut short goes on at [`Signer::run_due`]. While an
-    /// alarm holds signing back, the app is still revoked at the switch, and the error is the
-    /// alarm's: the version that removes it waits until the alarm is cleared.
+    /// in progress; [`Refusal::FlowInProgress`] while an erasure is, with nothing kept or sent
+    /// (Switch spec 12.7 step 5); otherwise as [`Signer::resume`]. A revocation cut short goes
+    /// on at [`Signer::run_due`]. While an alarm holds signing back, the app is still revoked
+    /// at the switch, and the error is the alarm's: the version that removes it waits until the
+    /// alarm is cleared.
     pub async fn revoke(
         &mut self,
         app_id: [u8; 16],
@@ -90,6 +92,12 @@ impl Signer {
         // isn't the signer until its first delivery has won (Switch wire 3.12).
         if self.state.taking_over {
             return Err(Refusal::TakingOver.into());
+        }
+        // Nor during an erasure, which signs nothing else: an app to cut off meanwhile is the
+        // user's to deal with by aborting the erasure, or once it is resolved (Switch spec 12.7
+        // step 5).
+        if matches!(self.flow, Some(Flow::Erase { .. })) {
+            return Err(Refusal::FlowInProgress.into());
         }
         let newest = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
         if newest.listed_cert(&app_id).is_none() {
@@ -231,6 +239,11 @@ impl Signer {
     /// also when an alarm stops the rest, since it signs nothing new and cutting an app off is
     /// the safe step.
     pub(super) async fn revoke_at_switch(&mut self) -> Result<Vec<([u8; 16], SignerError)>> {
+        // An erasure in progress sends nothing else: revocations pending from before it stay
+        // pending, and go out if it ends without erasing (Switch spec 12.7 step 5).
+        if matches!(self.flow, Some(Flow::Erase { .. })) {
+            return Ok(Vec::new());
+        }
         let failures = self.send_revocations().await?;
         if !failures.is_empty() {
             let mut state = self.state.clone();
