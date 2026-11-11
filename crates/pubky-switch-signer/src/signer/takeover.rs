@@ -273,7 +273,7 @@ impl Signer {
             self.state.taking_over = false;
             return Err(Refusal::StaleHandOver.into());
         }
-        let switch_removed: Vec<[u8; 16]> = removed_at_switch(&answer).collect();
+        let switch_removed: Vec<[u8; 16]> = removed_at_switch(&answer, &handed).collect();
         let tombstones = revoked_after(&records, &switch_removed);
         let view = BackupView::of(&records);
         let mut state = self.taken_records(&view, &answer, self.service()?, tombstones, Vec::new());

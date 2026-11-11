@@ -1054,6 +1054,7 @@ fn real_move_request(old: &OldSigner, doc: &IdentityDoc) -> usize {
         .len()
 }
 
+/// The signer's measure of a move's enrollment carrying `body`, built on `prev`.
 fn enrollment_measure(
     old: &OldSigner,
     body: &pubky_switch_core::records::IdentityBody,
@@ -1094,14 +1095,7 @@ async fn at_the_edge(old: &mut OldSigner, lo: usize, hi: usize) -> (IdentityDoc,
         .await
         .unwrap();
     let six = old.signer.set_record_max_age(Some(60)).await.unwrap();
-    let m = enrollment_measure(old, six.body(), five.hash());
-    eprintln!(
-        "v6 enrollment measure {} limit {} (under by {})",
-        m.bytes,
-        m.limit,
-        m.limit - m.bytes
-    );
-    (six, m.limit)
+    (six, super::enrollment_limit().unwrap())
 }
 
 /// At the edge, the measure of a move's enrollment is never below the real move's body, and
@@ -1256,6 +1250,76 @@ async fn test_vectors_new_signer_takes_over_at_the_edge_after_a_revocation_at_th
     for measure in super::measures(&new.state, taken.body(), None).unwrap() {
         assert!(measure.bytes <= measure.limit, "{measure:?}");
     }
+}
+
+/// App IDs no version of alice's ever listed, which a faulty or hostile switch shows revoked.
+const NEVER_LISTED: [[u8; 16]; 3] = [[0x41; 16], [0x42; 16], [0x43; 16]];
+
+/// At the edge, a restore in place while the switch shows revoked App IDs no version listed:
+/// the signer takes a removal from the switch only for an app its version lists, so its
+/// records don't grow and its next version is signed (Switch wire 3.13, 7.1, 7.4.12).
+#[tokio::test]
+async fn test_vectors_old_signer_restores_at_the_edge_ignoring_removals_of_apps_never_listed() {
+    let mut old = old_signer().await;
+    at_the_edge(&mut old, 16, 20).await;
+    for app in NEVER_LISTED {
+        old.switch.revoke(app).unwrap();
+    }
+    let restored = old
+        .signer
+        .restore(UserConfirmed::shown_and_confirmed())
+        .await
+        .unwrap();
+    assert!(
+        NEVER_LISTED
+            .iter()
+            .all(|app| !old.signer.state.tombstones.contains(app))
+    );
+    let limit = super::enrollment_limit().unwrap();
+    assert!(real_move_request(&old, &restored) <= limit);
+    old.signer.set_record_max_age(Some(61)).await.unwrap();
+}
+
+/// At the edge, a take-over while the switch shows revoked App IDs no version listed: the new
+/// signer's records don't take them, and its first version is delivered (Switch wire 3.12,
+/// 7.1, 7.4.12).
+#[tokio::test]
+async fn test_vectors_new_signer_takes_over_at_the_edge_ignoring_removals_of_apps_never_listed() {
+    let mut old = old_signer().await;
+    let (six, _) = at_the_edge(&mut old, 16, 20).await;
+    old.signer
+        .hand_over_to(old.phone, UserConfirmed::shown_and_confirmed())
+        .await
+        .unwrap();
+    for app in NEVER_LISTED {
+        old.switch.revoke(app).unwrap();
+    }
+    let keys = load("keys.json");
+    let alice = old.key.public();
+    let v3 = IdentityDoc::verify(&document("alice identity.json"), &alice).unwrap();
+    let phone = super::ReceivingApp {
+        keys: app_keys(&keys, "phone"),
+        cert: AppCert::verify(&document("phone certificate"), &alice).unwrap(),
+        origin: six.inbox().url.clone(),
+        service_key: v3.inbox().service_key,
+    };
+    let env = SignerEnv {
+        store: StoreHandle::inline(Arc::new(MemoryStore::new())),
+        clock: old.clock.clone(),
+        transport: old.transport.clone(),
+        homeserver: old.homeserver.clone(),
+        protocols: Protocols::new(vec![Arc::new(VectorScopes::new())]).unwrap(),
+    };
+    let new = Signer::receive_hand_over(env, &phone, Arc::new(Vault(Mutex::new(None))))
+        .await
+        .unwrap();
+    assert!(
+        NEVER_LISTED
+            .iter()
+            .all(|app| !new.state.tombstones.contains(app))
+    );
+    let taken = new.identity_doc().unwrap().unwrap();
+    assert_eq!(old.switch.identity_doc().unwrap().hash(), taken.hash());
 }
 
 /// alice padded so that a reduction of the wallet, as the signer measures its renewing
