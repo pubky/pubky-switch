@@ -28,7 +28,7 @@ const DAY_MS: u64 = 24 * 3_600_000;
 ///
 /// When a step that should succeed against any switch fails.
 pub async fn renewal(world: &World) -> FlowResult {
-    let alice = world.identity("alice");
+    let alice = world.identity("alice")?;
     world.add_switch(ORIGIN, &[&alice]).await?;
     let mut signer = enroll(world, &alice, ORIGIN).await?;
     let (mut wallet, _) = joined(world, &alice, &mut signer, "wallet").await?;
