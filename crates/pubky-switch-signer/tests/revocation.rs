@@ -1331,3 +1331,27 @@ async fn test_full_bundle_request_is_judged_on_the_switchs_time() {
     assert!(signer.serve_full_bundles().await.unwrap().is_empty());
     assert!(world.switch.app(&id).full_requested.is_some());
 }
+
+#[tokio::test]
+async fn test_owed_record_cleanup_waits_for_a_fresh_check() {
+    // A removed app's record deletion is owed; another install delivers behind this one's
+    // back. The next run checks the copies before deleting: it finds the other install
+    // signing, and leaves the deletion to it (Switch spec 4.3, 12.2 step 4).
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let (a, _) = two_joined(&world, &mut signer).await;
+    let id = a.keys.app_id_bytes();
+    world
+        .homeserver
+        .set(&app_record_path(&id), b"a's record".to_vec());
+    *world.homeserver.failing_path.lock().unwrap() = Some(app_record_path(&id));
+    signer.revoke(id, None, confirmed()).await.unwrap();
+    *world.homeserver.failing_path.lock().unwrap() = None;
+    let other = world.other_install_version(&signer.identity_doc().unwrap().unwrap(), [9; 16]);
+    world.switch.deliver_identity(&other).unwrap();
+    assert_eq!(
+        signer.resume().await.unwrap_err(),
+        SignerError::NotNamed { install: [9; 16] }
+    );
+    assert!(world.homeserver.file(&app_record_path(&id)).is_some());
+}

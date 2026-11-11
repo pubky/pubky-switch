@@ -440,11 +440,10 @@ impl Signer {
         doc: SignedDoc,
         prev: Option<[u8; 32]>,
     ) -> Result<()> {
-        if sent < batches.len() {
-            self.ensure_signer().await?;
-        }
         let client = self.service_client()?;
         for (index, batch) in batches.iter().enumerate().skip(sent) {
+            // Before each batch, not once: another install may take over between two.
+            self.ensure_signer().await?;
             let signed = Batch::from_body(batch.bytes.0.clone())?;
             match client.submit(&signed).await {
                 Ok(_) => {

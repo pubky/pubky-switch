@@ -64,6 +64,14 @@ pub struct TestHomeserver {
     pub losing_path: Mutex<Option<String>>,
     /// Reads of this path fail while other reads and every write go through.
     pub failing_read_path: Mutex<Option<String>>,
+    /// Run once, right after this path is deleted: something that happens between two
+    /// deletions, such as another install delivering.
+    #[allow(clippy::type_complexity)]
+    pub after_delete: Mutex<Option<(String, Box<dyn FnOnce() + Send>)>>,
+    /// Run once, right after the given read of this path, counted from 1: something that
+    /// happens between a check and the step after it.
+    #[allow(clippy::type_complexity)]
+    pub after_get: Mutex<Option<(String, usize, Box<dyn FnOnce() + Send>)>>,
 }
 
 impl TestHomeserver {
@@ -95,6 +103,19 @@ impl Homeserver for TestHomeserver {
         } else {
             Ok(self.file(path))
         };
+        let hook = {
+            let mut hook = self.after_get.lock().unwrap();
+            match hook.as_mut() {
+                Some((at, left, _)) if at == path => {
+                    *left -= 1;
+                    if *left == 0 { hook.take() } else { None }
+                }
+                _ => None,
+            }
+        };
+        if let Some((_, _, run)) = hook {
+            run();
+        }
         Box::pin(async move { answer })
     }
     fn put(&self, path: &str, bytes: Vec<u8>) -> BoxFuture<'_, Result<(), TransportError>> {
@@ -123,6 +144,17 @@ impl Homeserver for TestHomeserver {
                 Err(TransportError::Connect("down".into()))
             } else {
                 self.files.lock().unwrap().remove(path);
+                let hook = {
+                    let mut hook = self.after_delete.lock().unwrap();
+                    if hook.as_ref().is_some_and(|(at, _)| at == path) {
+                        hook.take()
+                    } else {
+                        None
+                    }
+                };
+                if let Some((_, run)) = hook {
+                    run();
+                }
                 Ok(())
             };
         Box::pin(async move { answer })

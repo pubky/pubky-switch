@@ -16,6 +16,11 @@
 //!    answer the pinned key didn't sign, such as a gateway's `503`, keeps the mark; only an
 //!    answer the pinned key signed shows the account still exists, and clears it.
 //!
+//! Every deletion and every request comes after a fresh check that this install still signs,
+//! the checks a delivery makes ([`Signer::check_copies`]), since the flow may be resumed much
+//! later. Another install found signing ends the erasure without erasing, with nothing more
+//! deleted, sent or published by this install; a copy that can't be read takes no step.
+//!
 //! A `409 conflict` is the switch refusing it, as during a move: the erasure ends without
 //! erasing, `identity.json` is published again, and the grant reminders it raised for apps
 //! still listed are withdrawn; a removed app's stays. [`Signer::abort_erasure`] ends it the same way on the user's word, while no
@@ -110,6 +115,7 @@ impl Signer {
         if !unpublished {
             return self.unpublish().await;
         }
+        self.still_erasing(&reminded, unanswered).await?;
         // Before the request: it may land, however its answer goes.
         if !unanswered {
             let flow = Flow::Erase {
@@ -175,6 +181,36 @@ impl Signer {
         }
     }
 
+    /// Before each step of an erasure that deletes or asks to erase, a fresh check that this
+    /// install still signs, as before a delivery (Switch spec 4.3, Switch wire 3.13): it is
+    /// named, the switch's copy is its mark, the signer backup names no other install that
+    /// took over, and the Homeserver holds nothing newer ([`Signer::check_copies`]). A check
+    /// that can't read a copy fails, and nothing is deleted or sent: the flow stays, and
+    /// [`Signer::resume`] tries again.
+    ///
+    /// A check that finds another install signing, this install's records behind, or an alarm
+    /// ends the flow: the erasure ends without erasing, and the grant reminders it raised for
+    /// apps still listed are withdrawn ([`Signer::end_erasure`]). Nothing is published again
+    /// by an install that no longer signs: [`Signer::publish`] skips while another install
+    /// is named, and that install publishes its own version.
+    ///
+    /// With a request in doubt, `unanswered`, the switch may have erased the account already:
+    /// its operator's `404` is then no failure of the check, and the next request finds out.
+    async fn still_erasing(&mut self, reminded: &[[u8; 16]], unanswered: bool) -> Result<()> {
+        let checked = match self.check_copies().await {
+            Err(SignerError::Switch(ClientError::BadServiceSignature { status: 404 }))
+                if unanswered =>
+            {
+                Ok(())
+            }
+            checked => checked,
+        };
+        if checked.is_err() && self.flow.is_none() {
+            self.end_erasure(reminded).await?;
+        }
+        checked
+    }
+
     /// The account is erased: what only it could settle goes, and the records stay.
     async fn erased(&mut self) -> Result<()> {
         let mut state = self.state.clone();
@@ -229,14 +265,15 @@ impl Signer {
             .chain(self.state.cleanup.iter().copied())
             .chain(self.state.deletion_checks.iter().copied())
             .collect();
-        let homeserver = &self.env.homeserver;
-        homeserver
-            .delete(IDENTITY_PATH)
-            .await
-            .map_err(SignerError::Homeserver)?;
-        for app_id in &apps {
-            homeserver
-                .delete(&app_record_path(app_id))
+        // Each deletion only after a fresh check: another install may take over between two
+        // of them, and its files are never this install's to delete.
+        for path in
+            std::iter::once(IDENTITY_PATH.to_owned()).chain(apps.iter().map(app_record_path))
+        {
+            self.still_erasing(&[], false).await?;
+            self.env
+                .homeserver
+                .delete(&path)
                 .await
                 .map_err(SignerError::Homeserver)?;
         }

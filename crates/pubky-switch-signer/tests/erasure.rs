@@ -491,3 +491,150 @@ async fn test_erasure_run_does_nothing_while_erasing_or_once_erased() {
     assert_eq!(world.homeserver.writes.lock().unwrap().len(), writes);
     assert!(world.homeserver.file(IDENTITY_PATH).is_none());
 }
+
+/// Another install's version after `signer`'s newest, delivered to the switch behind its
+/// back, as a restore on another device delivers.
+fn another_install_delivers(world: &World, signer: &Signer) -> impl FnOnce() + Send + 'static {
+    let doc = world.other_install_version(&signer.identity_doc().unwrap().unwrap(), [9; 16]);
+    let switch = Arc::clone(&world.switch);
+    move || switch.deliver_identity(&doc).unwrap()
+}
+
+#[tokio::test]
+async fn test_erasure_resumed_after_a_restore_elsewhere_deletes_nothing_of_it() {
+    // The erasure stops at a Homeserver failure after deleting `identity.json`; another device
+    // restores from the backup, delivers its version as the signer and publishes it. This
+    // install's resumed erasure then deletes nothing, sends no erasure, and publishes nothing
+    // over the other install's version: it no longer signs (Switch spec 4.3, Switch wire
+    // 3.13).
+    let world = World::new();
+    let (mut signer, id, _) = with_an_app(&world).await;
+    *world.homeserver.failing_path.lock().unwrap() = Some(app_record_path(&id));
+    let error = signer.close_account(confirmed()).await.unwrap_err();
+    assert!(matches!(error, SignerError::Homeserver(_)), "{error:?}");
+    *world.homeserver.failing_path.lock().unwrap() = None;
+    assert_eq!(signer.status(), SignerStatus::Erasing);
+    let mut other = Signer::restore_new(
+        world.env(Arc::new(MemoryStore::new())),
+        world.keyring(),
+        confirmed(),
+    )
+    .await
+    .unwrap();
+    let theirs = other.identity_doc().unwrap().unwrap();
+    assert_eq!(world.published().unwrap().signed(), theirs.signed());
+
+    assert_eq!(
+        signer.resume().await.unwrap_err(),
+        SignerError::NotNamed {
+            install: other.install_id()
+        }
+    );
+    assert_eq!(erase_requests(&world), 0);
+    assert!(!world.switch.erased());
+    assert_eq!(world.published().unwrap().signed(), theirs.signed());
+    assert!(world.homeserver.file(&app_record_path(&id)).is_some());
+    assert!(
+        matches!(signer.status(), SignerStatus::ManagedBy { .. }),
+        "{:?}",
+        signer.status()
+    );
+    // Its grant reminders for the apps still listed are withdrawn: the other install signs.
+    assert!(
+        !signer
+            .alerts()
+            .iter()
+            .any(|alert| matches!(alert, Alert::GrantRevocationOwed { .. })),
+        "{:?}",
+        signer.alerts()
+    );
+    // And it stays so: the next run does nothing, publishing or deleting nothing.
+    signer.resume().await.unwrap();
+    assert_eq!(world.published().unwrap().signed(), theirs.signed());
+    assert_eq!(erase_requests(&world), 0);
+    other.set_record_max_age(Some(60)).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_erasure_stops_when_another_install_delivers_between_two_deletions() {
+    // Each deletion comes after a fresh check: another install delivering after
+    // `identity.json` went stops the erasure before the app's record goes.
+    let world = World::new();
+    let (mut signer, id, _) = with_an_app(&world).await;
+    let delivers = another_install_delivers(&world, &signer);
+    *world.homeserver.after_delete.lock().unwrap() =
+        Some((IDENTITY_PATH.to_owned(), Box::new(delivers)));
+    assert_eq!(
+        signer.close_account(confirmed()).await.unwrap_err(),
+        SignerError::NotNamed { install: [9; 16] }
+    );
+    assert!(world.homeserver.file(&app_record_path(&id)).is_some());
+    assert_eq!(erase_requests(&world), 0);
+    assert!(!world.switch.erased());
+}
+
+#[tokio::test]
+async fn test_erasure_takes_no_step_while_ownership_cant_be_read() {
+    // The switch, or the signer backup, can't be read: nothing is deleted and nothing is sent,
+    // the erasure stays in progress, and goes on once both answer.
+    let world = World::new();
+    let (mut signer, id, _) = with_an_app(&world).await;
+    *world.homeserver.failing_puts.lock().unwrap() = true;
+    signer.close_account(confirmed()).await.unwrap_err();
+    *world.homeserver.failing_puts.lock().unwrap() = false;
+    let published = world.published();
+    assert!(published.is_some());
+
+    world.switch.fail_next(SwitchFault::Unreachable {
+        path: "/apps".into(),
+        after: 0,
+    });
+    signer.resume().await.unwrap_err();
+    *world.homeserver.failing_read_path.lock().unwrap() =
+        Some(pubky_switch_core::records::SIGNER_BACKUP_PATH.to_owned());
+    signer.resume().await.unwrap_err();
+    assert_eq!(
+        world.published().map(|d| d.signed().clone()),
+        published.map(|d| d.signed().clone())
+    );
+    assert!(world.homeserver.file(&app_record_path(&id)).is_some());
+    assert_eq!(erase_requests(&world), 0);
+    assert_eq!(signer.status(), SignerStatus::Erasing);
+
+    *world.homeserver.failing_read_path.lock().unwrap() = None;
+    signer.resume().await.unwrap();
+    assert!(world.switch.erased());
+    assert!(world.homeserver.file(&app_record_path(&id)).is_none());
+}
+
+#[tokio::test]
+async fn test_erasure_request_not_sent_again_once_another_install_signs() {
+    // The files are gone and a request went unanswered; another install then delivers. The
+    // check before the next request finds it: nothing more is sent, and the grant reminders
+    // raised for apps still listed are withdrawn (Switch spec 4.3, 12.7).
+    let world = World::new();
+    let (mut signer, id, _) = with_an_app(&world).await;
+    world.switch.fail_next(SwitchFault::Unreachable {
+        path: "/erase".into(),
+        after: 0,
+    });
+    signer.close_account(confirmed()).await.unwrap_err();
+    assert!(
+        signer
+            .alerts()
+            .contains(&Alert::GrantRevocationOwed { app_id: id })
+    );
+    let sent = erase_requests(&world);
+    another_install_delivers(&world, &signer)();
+    assert_eq!(
+        signer.resume().await.unwrap_err(),
+        SignerError::NotNamed { install: [9; 16] }
+    );
+    assert_eq!(erase_requests(&world), sent);
+    assert!(!world.switch.erased());
+    assert!(
+        !signer
+            .alerts()
+            .contains(&Alert::GrantRevocationOwed { app_id: id })
+    );
+}
