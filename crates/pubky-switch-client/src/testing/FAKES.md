@@ -149,10 +149,14 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   every later one gets the same key and changes nothing. At a serving account, as at the
   service, an enrollment is answered with a pending key for the next generation, the same
   for every such enrollment, signed with that key, and the App IDs it names are held with
-  it. Unlike the service:
+  it. Once a delivery starts a generation under the pending key, an enrollment the outgoing
+  key answered is `409 conflict` again, and one the pending key answered gets its answer
+  again. Unlike the service:
   - an enrollment's `identity_doc` isn't held, so the account starts with no document and
     at the switch's own generation, whatever the enrollment names;
-  - the pending key is derived from the account's, not random.
+  - the pending key is derived from the account's, not random;
+  - its errors, the `409 conflict` included, are signed with the account's key, not the
+    operator's.
 - **`PUT /identity`** (Switch wire 3.3, 7.4.2), in `switch/signer.rs`: judged by the core's
   `check_delivery`, like the service, with the kept proofs taken from what it holds: each held
   record's current write proof and each live claim's entry proofs, by the generation each

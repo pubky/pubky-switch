@@ -746,6 +746,11 @@ impl ScriptedSwitch {
         Ok(())
     }
 
+    /// The bodies of the requests a [`Fault::Unreachable`] stopped, in order.
+    pub fn unreached_bodies(&self) -> Vec<Vec<u8>> {
+        self.lock().unreached.clone()
+    }
+
     /// A faulty service that lost the account's `identity.json`: it holds none from now on.
     pub fn lose_identity(&self) {
         self.lock().doc = None;

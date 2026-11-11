@@ -34,6 +34,9 @@ pub(crate) struct Enrolled {
     /// The answer to each enrollment taken, by enrollment hash, so the same enrollment again
     /// gets the same answer.
     pub(crate) answers: HashMap<[u8; 32], Value>,
+    /// The enrollments answered with a key a generation change has since retired: each is
+    /// `409 conflict` again (Switch wire 3.7).
+    pub(crate) retired: BTreeSet<[u8; 32]>,
 }
 
 impl ScriptedSwitch {
@@ -155,6 +158,19 @@ impl Inner {
             Ok(enrollment) => enrollment,
             Err(_) => return Ok(bad(ErrorCode::BadRequest, "bad enrollment", json!(null))),
         };
+        // An enrollment the service answered with a key a generation change has retired: its
+        // signer enrolls anew (Switch wire 3.7).
+        if self
+            .enrolled
+            .as_ref()
+            .is_some_and(|e| e.retired.contains(&enrollment.hash()))
+        {
+            return Ok(bad(
+                ErrorCode::Conflict,
+                "the key this enrollment's answer named is retired",
+                json!(null),
+            ));
+        }
         // A serving account answers a pending key for the next generation, the same for every
         // such enrollment, signed with that key, and holds the App IDs they name with it
         // (Switch wire 3.7).
@@ -176,6 +192,7 @@ impl Inner {
             let enrolled = self.enrolled.get_or_insert_with(|| Enrolled {
                 limits,
                 answers: HashMap::new(),
+                retired: BTreeSet::new(),
             });
             let value = match enrolled.answers.get(&enrollment.hash()) {
                 Some(answer) => answer.clone(),
@@ -198,6 +215,7 @@ impl Inner {
         let enrolled = self.enrolled.get_or_insert_with(|| Enrolled {
             limits,
             answers: HashMap::new(),
+            retired: BTreeSet::new(),
         });
         if let Some(answer) = enrolled.answers.get(&enrollment.hash()) {
             return Ok((200, answer.clone()));
@@ -233,6 +251,21 @@ impl Inner {
         );
         fresh.stamped_ms = self.stamped_ms;
         fresh.origin = self.origin.clone();
+        // The answers the outgoing key named are retired; the pending key's stay, the
+        // account's key from now on (Switch wire 3.7).
+        let new_key = b64(&fresh.service.verifying_key().to_bytes());
+        if let Some(enrolled) = self.enrolled.as_mut() {
+            let outgoing: Vec<[u8; 32]> = enrolled
+                .answers
+                .iter()
+                .filter(|(_, answer)| answer["service_key"].as_str() != Some(new_key.as_str()))
+                .map(|(hash, _)| *hash)
+                .collect();
+            for hash in outgoing {
+                enrolled.answers.remove(&hash);
+                enrolled.retired.insert(hash);
+            }
+        }
         fresh.enrolled = self.enrolled.take();
         fresh.enroll_limits = self.enroll_limits;
         fresh.faults = std::mem::take(&mut self.faults);
@@ -743,6 +776,93 @@ fn read_handover(value: &Value) -> Option<pubky_switch_core::records::SignerHand
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The scripted switch's answer to an enrollment of `identity`'s with `nonce`.
+    fn enroll_at(
+        switch: &ScriptedSwitch,
+        identity: &pubky_switch_core::keys::IdentityKey,
+        nonce: u8,
+    ) -> (u16, Value) {
+        let body = pubky_switch_core::records::EnrollmentBody {
+            identity: identity.public(),
+            origin: SWITCH_ORIGIN.to_owned(),
+            nonce: [nonce; 16],
+            policy: pubky_switch_core::records::IdentityPolicy::default(),
+            identity_doc: None,
+            revoked_apps: None,
+        };
+        let enrollment = Enrollment::sign(identity, body).unwrap();
+        let request = crate::transport::Request {
+            method: "POST".into(),
+            origin: SWITCH_ORIGIN.into(),
+            path_and_query: "/v1/enroll".into(),
+            headers: Vec::new(),
+            body: json!({ "enrollment": enrollment.signed() })
+                .to_string()
+                .into_bytes(),
+        };
+        switch.lock().enroll(&request).unwrap()
+    }
+
+    #[test]
+    fn test_scripted_recovery_in_place_retires_the_outgoing_keys_enrollments() {
+        // As at the service: after a recovery in place under the pending key, the enrollment
+        // the outgoing key answered is `409 conflict`, and the one the pending key answered
+        // gets its answer again, the account's key now (Switch wire 3.7).
+        let identity = pubky_switch_core::keys::IdentityKey::from_secret([1; 32]);
+        let switch = ScriptedSwitch::unenrolled_at(
+            &identity,
+            [2; 32],
+            Arc::new(crate::clock::TestClock::new(0)),
+            SWITCH_ORIGIN,
+        );
+        let (status, first) = enroll_at(&switch, &identity, 1);
+        assert_eq!(status, 200);
+        let key = |answer: &Value| answer["service_key"].as_str().unwrap().to_owned();
+        let outgoing = key(&first);
+        let service = switch.lock().service.verifying_key().to_bytes();
+        let doc = IdentityDoc::sign(
+            &identity,
+            pubky_switch_core::records::IdentityBody::first(
+                identity.public(),
+                [3; 16],
+                pubky_switch_core::records::Inbox::new(SWITCH_ORIGIN, service),
+                pubky_switch_core::records::IdentityPolicy::default(),
+            ),
+        )
+        .unwrap();
+        let delivery = json!({ "identity": doc.signed(), "prev": null }).to_string();
+        assert_eq!(
+            switch.lock().put_identity(delivery.as_bytes()).unwrap().0,
+            200
+        );
+        let (status, second) = enroll_at(&switch, &identity, 2);
+        assert_eq!(status, 200);
+        let pending = key(&second);
+        assert_ne!(pending, outgoing, "a pending key at a serving account");
+        let mut body = doc.body().clone();
+        body.version = 2;
+        body.generation = 2;
+        body.recovery_from = Some(1);
+        body.inbox = pubky_switch_core::records::Inbox::new(
+            SWITCH_ORIGIN,
+            pubky_switch_core::enc::unb64(&pending)
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        );
+        let recovery = IdentityDoc::sign(&identity, body).unwrap();
+        let delivery = json!({ "identity": recovery.signed(), "prev": null }).to_string();
+        assert_eq!(
+            switch.lock().put_identity(delivery.as_bytes()).unwrap().0,
+            200
+        );
+        let (status, retired) = enroll_at(&switch, &identity, 1);
+        assert_eq!((status, retired["code"].clone()), (409, json!("conflict")));
+        let (status, again) = enroll_at(&switch, &identity, 2);
+        assert_eq!(status, 200);
+        assert_eq!(key(&again), pending);
+    }
 
     #[test]
     fn test_scripted_erasure_naming_a_hash_with_no_identity_json_held_is_conflict() {
