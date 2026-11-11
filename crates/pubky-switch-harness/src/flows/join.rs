@@ -85,17 +85,24 @@ pub(crate) fn app_status(app: &mut App) -> Value {
     })
 }
 
-/// The events' names, in order: what they carry differs from run to run.
+/// The events' names, in order, each with the claim key it is about, if any. What else an
+/// event carries differs from run to run.
 pub(crate) fn events(events: &[AppEvent]) -> Vec<String> {
     events
         .iter()
         .map(|event| {
             let shown = format!("{event:?}");
-            shown
+            let name = shown
                 .split(|c: char| !c.is_ascii_alphanumeric())
                 .next()
-                .unwrap_or_default()
-                .to_owned()
+                .unwrap_or_default();
+            match event {
+                AppEvent::ClaimChanged { claim_key }
+                | AppEvent::ClaimPinDiffers { claim_key, .. } => {
+                    format!("{name} {}", pubky_switch_core::enc::b64(claim_key))
+                }
+                _ => name.to_owned(),
+            }
         })
         .collect()
 }

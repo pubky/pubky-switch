@@ -6,7 +6,7 @@ use pubky_switch_core::claims::{Basis, ClaimView};
 use serde_json::{Value, json};
 
 use super::enrollment::enroll;
-use super::join::app_status;
+use super::join::{app_status, events};
 use super::messaging::joined;
 use super::{ORIGIN, STEP_MS};
 use crate::{FlowResult, World};
@@ -30,7 +30,7 @@ const SECOND_ATTEMPT: [u8; 16] = [2; 16];
 ///
 /// When a step that should succeed against any switch fails.
 pub async fn claim(world: &World) -> FlowResult {
-    let alice = world.identity("alice");
+    let alice = world.identity("alice")?;
     world.add_switch(ORIGIN, &[&alice]).await?;
     let mut signer = enroll(world, &alice, ORIGIN).await?;
     let (mut wallet, _) = joined(world, &alice, &mut signer, "wallet").await?;
@@ -58,10 +58,18 @@ pub async fn claim(world: &World) -> FlowResult {
         ),
     ];
     for (name, entry) in entries {
+        // What the app raises at each step is taken at once, so each outcome shows the
+        // events of its own step: the write, the read of the claim, the read of the feed.
         let written = wallet
             .write_claim(entry, Vec::new(), ObligationDeadline::NotKnown)
             .await?;
-        world.outcome(name, &view(&written.view));
+        world.outcome(
+            name,
+            &json!({
+                "view": view(&written.view),
+                "events": events(&wallet.take_events()),
+            }),
+        );
         world.advance_ms(STEP_MS);
         let read = wallet.read_claim(&CLAIM_KEY).await?;
         world.outcome(
@@ -69,13 +77,14 @@ pub async fn claim(world: &World) -> FlowResult {
             &json!({
                 "view": read.as_ref().map(|read| view(&read.view)),
                 "entries": read.as_ref().map(|read| read.entries.len()),
+                "events": events(&wallet.take_events()),
             }),
         );
         world.advance_ms(STEP_MS);
         let report = wallet.receive(None).await?;
         world.outcome(
             &format!("received after {name}"),
-            &json!({ "events": super::join::events(&report.events) }),
+            &json!({ "events": events(&report.events) }),
         );
     }
 
