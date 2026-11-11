@@ -988,3 +988,110 @@ async fn stamped_time(replay: &Replay) -> i64 {
         .await
         .expect("stamp")
 }
+
+/// A key store whose `advance_mark` fails while armed.
+struct MarkStuck {
+    inner: std::sync::Arc<pubky_switch::keys::FixedKeys>,
+    armed: std::sync::atomic::AtomicBool,
+}
+
+impl KeyStore for MarkStuck {
+    fn generate(&self) -> pubky_switch::keys::KeyFuture<'_, pubky_switch::keys::ServiceKey> {
+        self.inner.generate()
+    }
+    fn public_key<'a>(&'a self, id: &'a KeyId) -> pubky_switch::keys::KeyFuture<'a, [u8; 32]> {
+        self.inner.public_key(id)
+    }
+    fn signer<'a>(
+        &'a self,
+        id: &'a KeyId,
+    ) -> pubky_switch::keys::KeyFuture<'a, pubky_switch::keys::ServiceSigner> {
+        self.inner.signer(id)
+    }
+    fn operator(&self) -> pubky_switch::keys::KeyFuture<'_, pubky_switch::keys::ServiceSigner> {
+        self.inner.operator()
+    }
+    fn mark<'a>(&'a self, id: &'a KeyId) -> pubky_switch::keys::KeyFuture<'a, Option<Mark>> {
+        self.inner.mark(id)
+    }
+    fn advance_mark<'a>(
+        &'a self,
+        id: &'a KeyId,
+        head: Mark,
+    ) -> pubky_switch::keys::KeyFuture<'a, pubky_switch::keys::MarkCheck> {
+        if self.armed.load(std::sync::atomic::Ordering::SeqCst) {
+            return Box::pin(async {
+                Err(pubky_switch::keys::KeyStoreError::Corrupt("stuck".into()))
+            });
+        }
+        self.inner.advance_mark(id, head)
+    }
+    fn delete<'a>(&'a self, id: &'a KeyId) -> pubky_switch::keys::KeyFuture<'a, ()> {
+        self.inner.delete(id)
+    }
+    fn record_erasure<'a>(
+        &'a self,
+        identity: &'a str,
+        erased_at_ms: u64,
+    ) -> pubky_switch::keys::KeyFuture<'a, ()> {
+        self.inner.record_erasure(identity, erased_at_ms)
+    }
+    fn erasure<'a>(&'a self, identity: &'a str) -> pubky_switch::keys::KeyFuture<'a, Option<u64>> {
+        self.inner.erasure(identity)
+    }
+}
+
+#[tokio::test]
+async fn test_feed_refusal_whose_mark_cant_move_carries_the_requests_head() {
+    // As in the expiry test, a held read is refused from a later snapshot; but the key's
+    // mark can't move to that snapshot's head, so the refusal carries the head the request
+    // committed, which the mark covers, never the snapshot's (Switch wire 7.3 step 10).
+    let Some(mut replay) = replay().await else {
+        return;
+    };
+    replay_chain_through_revoke(&replay).await;
+    let key = service_key(&replay).await;
+    let stuck = std::sync::Arc::new(MarkStuck {
+        inner: replay.keys.clone(),
+        armed: std::sync::atomic::AtomicBool::new(false),
+    });
+    replay.service = pubky_switch::service::Service::new(
+        ORIGIN.into(),
+        replay.db.store().clone(),
+        stuck.clone(),
+        replay.time.clone(),
+        Limits::default(),
+    );
+    let at = pubky_switch_core::time::rfc3339(ms(&revoke_time()) + 1_000);
+    set_time(&replay.clock, &at);
+    let read_ms = i64::try_from(ms(&at)).expect("time");
+    let expired = ms("2026-12-01T00:00:01.000Z");
+    let (answer, ()) = tokio::join!(read(&replay, "wallet", "?after=1:9&wait=1", &at), async {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while stamped_time(&replay).await != read_ms {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the read never committed its stamp"
+            );
+            tokio::task::yield_now().await;
+        }
+        stuck.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        sql(
+            &replay,
+            &format!(
+                "UPDATE accounts SET last_seq = 10, chain_seq = 10, \
+                 chain_hash = decode(repeat('ab', 32), 'hex'), stamped_time_ms = {expired} \
+                 WHERE id = $1"
+            ),
+        )
+        .await;
+    });
+    assert_eq!(
+        (answer.status, body(&answer)["code"].clone()),
+        (403, json!("cert_expired"))
+    );
+    assert_eq!(head_seq(&answer), Some(9));
+    let mark = replay.keys.mark(&key).await.expect("mark").expect("a mark");
+    assert!(mark.seq < 10, "the mark didn't move: {mark:?}");
+    replay.db.drop_database().await.expect("drop");
+}

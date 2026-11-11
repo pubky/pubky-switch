@@ -2065,13 +2065,9 @@ async fn test_upload_contact_also_denied_is_denied() {
     replay.db.drop_database().await.expect("drop");
 }
 
-#[tokio::test]
-async fn test_upload_lists_need_the_callers_permission() {
-    // The executor, current again, holds no list permission: contacts or deny entries from
-    // it are `403 permission_missing` for the whole upload, which merges and chains nothing,
-    // and admission stays staged (Switch wire 7.4.14).
-    let Some(replay) = replay().await else { return };
-    let (_, at) = recovered_with_the_wallet(&replay).await;
+/// The executor, listed in alice's document, current again at generation 2 with its
+/// record: its keys.
+async fn executor_registers(replay: &Replay, at: u64) -> Value {
     let keys = vectors("keys.json");
     let executor = app(&keys, "executor").clone();
     let record: SignedDoc = serde_json::from_value(
@@ -2106,6 +2102,17 @@ async fn test_upload_lists_need_the_callers_permission() {
         .handle(app_request(&executor, "POST", &path, body, at))
         .await;
     assert_eq!(put.status, 200, "{}", String::from_utf8_lossy(&put.body));
+    executor
+}
+
+#[tokio::test]
+async fn test_upload_lists_need_the_callers_permission() {
+    // The executor, current again, holds no list permission: contacts or deny entries from
+    // it are `403 permission_missing` for the whole upload, which merges and chains nothing,
+    // and admission stays staged (Switch wire 7.4.14).
+    let Some(replay) = replay().await else { return };
+    let (_, at) = recovered_with_the_wallet(&replay).await;
+    let executor = executor_registers(&replay, at).await;
     let length = chain(&replay).await.len();
     let bob = pubky_switch_core::enc::pubky_id(&[40; 32]);
     for lists in [json!({ "contacts": [] }), json!({ "deny": [bob] })] {
@@ -2132,7 +2139,7 @@ async fn test_upload_refusals() {
     // read and `429` past `uploads_per_app_per_hour`, with what to wait. A refusal merges
     // and chains nothing.
     let limits = pubky_switch::limits::Limits {
-        uploads_per_app_per_hour: 3,
+        uploads_per_app_per_hour: 4,
         max_contacts: 1,
         ..pubky_switch::limits::Limits::default()
     };
@@ -2169,10 +2176,20 @@ async fn test_upload_refusals() {
         Some(1),
         "{allow}"
     );
+    // The limit counts the entries held already: a new contact is dropped too.
+    let third = pubky_switch_core::enc::pubky_id(&[42; 32]);
+    let full = upload(&replay, &json!({ "lists": { "contacts": [third] } }), at).await;
+    assert_eq!(json_of(&full)["result"]["lists"], json!(false));
+    let allow = wallet_get(&replay, "allow", at).await;
+    assert_eq!(
+        allow["contacts"].as_array().map(Vec::len),
+        Some(1),
+        "{allow}"
+    );
     let limited = upload(&replay, &json!({}), at).await;
     assert_eq!(code(&limited), (429, "rate_limited".into()));
     assert!(header_text(&limited, "retry-after").is_some());
-    assert_eq!(chain(&replay).await.len(), length + 3);
+    assert_eq!(chain(&replay).await.len(), length + 4);
     replay.db.drop_database().await.expect("drop");
 }
 
@@ -2617,5 +2634,72 @@ async fn test_upload_large_body_leaves_the_lock_to_other_requests() {
         "a write waited {longest:?} of the upload's {took:?}"
     );
     let replay = std::sync::Arc::try_unwrap(replay).ok().expect("one owner");
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_upload_rate_is_per_app_and_forgotten_on_erasure() {
+    // `uploads_per_app_per_hour` counts each app of each account apart, and an erasure
+    // forgets the account's counts (Switch wire 9.4, 7.4.16).
+    let limits = pubky_switch::limits::Limits {
+        uploads_per_app_per_hour: 1,
+        ..pubky_switch::limits::Limits::default()
+    };
+    let Some(replay) = replay_with(limits).await else {
+        return;
+    };
+    let (_, at) = recovered_with_the_wallet(&replay).await;
+    assert_eq!(upload(&replay, &json!({}), at).await.status, 200);
+    assert_eq!(
+        code(&upload(&replay, &json!({}), at).await),
+        (429, "rate_limited".into())
+    );
+    let executor = executor_registers(&replay, at).await;
+    assert_eq!(
+        upload_as(&replay, &executor, &json!({}), at).await.status,
+        200
+    );
+    let key = replay
+        .keys
+        .public_key(&service_key_id(&replay).await)
+        .await
+        .expect("key");
+    let path = format!("/v1/{}/erase", alice_id());
+    let erase = signer_request(
+        "POST",
+        &path,
+        pubky_switch_core::http::erase_body(&key, None),
+        at,
+    );
+    assert_eq!(replay.service.handle(erase).await.status, 200);
+    assert_eq!(
+        replay.service.counted_at(&alice_id()),
+        0,
+        "every count of the account"
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_claim_that_isnt_rebuilt_and_lost_an_entry_is_unavailable() {
+    // Only a claim rebuilt from uploads may hold fewer entries than its step: one that isn't
+    // and lost an entry is a temporary failure, never a view with the entries missing.
+    let Some(replay) = replay().await else { return };
+    let (_, at) = recovered_with_the_wallet(&replay).await;
+    let (_, key) = live_attempt(&replay, at).await;
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    sqlx::query("DELETE FROM claim_entries WHERE account_id = $1")
+        .bind(alice_id())
+        .execute(&mut conn)
+        .await
+        .expect("delete");
+    let path = format!("/v1/{}/claims/{key}", alice_id());
+    let read = replay
+        .service
+        .handle(app_request(&wallet_keys(), "GET", &path, Vec::new(), at))
+        .await;
+    assert_eq!(code(&read), (503, "unavailable".into()));
     replay.db.drop_database().await.expect("drop");
 }
