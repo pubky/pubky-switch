@@ -115,6 +115,11 @@ fn drop_passed_parts(state: &mut OpsState, target: &[u8; 16], full: bool) {
     if gone.is_empty() {
         return;
     }
+    // The parts that go raised keys_through; it keeps that height without them, so where it
+    // starts rises to it (Switch wire 7.4.12).
+    if let Some(through) = through {
+        state.listed_epochs.insert(*target, through);
+    }
     if let Some(parts) = state.parts.get_mut(target) {
         let mut index = 0;
         parts.retain(|_| {
