@@ -630,11 +630,33 @@ impl Signer {
     }
 
     /// The next version, built from the newest with `change` and signed with `key`, and the
-    /// flow that delivers it. Nothing is committed.
+    /// flow that delivers it, for a change that adds content: it keeps [`CAP_HEADROOM`] under
+    /// the cap. Nothing is committed.
     pub(crate) fn next_version(
         &self,
         key: &SigningKey,
         change: impl FnOnce(&mut IdentityBody),
+    ) -> Result<(IdentityDoc, Flow)> {
+        self.next_version_in(key, change, Room::Headroom)
+    }
+
+    /// As [`Signer::next_version`], for a version that adds no content to what is signed
+    /// already: a closing of renewals, an epoch completion, a restore's next version. Measured
+    /// against the plain cap, since the headroom kept when that content was signed is there
+    /// for exactly this: a digit more of `version` or `data_epoch`.
+    pub(crate) fn next_version_closing(
+        &self,
+        key: &SigningKey,
+        change: impl FnOnce(&mut IdentityBody),
+    ) -> Result<(IdentityDoc, Flow)> {
+        self.next_version_in(key, change, Room::Cap)
+    }
+
+    fn next_version_in(
+        &self,
+        key: &SigningKey,
+        change: impl FnOnce(&mut IdentityBody),
+        room: Room,
     ) -> Result<(IdentityDoc, Flow)> {
         let newest = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
         let version = newest
@@ -659,7 +681,7 @@ impl Signer {
         }
         let bytes = delivery_len(closed.to_json()?.len());
         if let Some(limit) = identity_limit()
-            && over_cap(bytes, limit)
+            && over_cap(bytes, limit, room)
         {
             return Err(Refusal::IdentityTooLarge {
                 bytes: u64::try_from(bytes).unwrap_or(u64::MAX),
@@ -1381,10 +1403,23 @@ pub(super) fn version_size(
 /// reduction closing then blocks every signing step.
 const CAP_HEADROOM: usize = 16;
 
-/// Whether a delivery of `bytes` is too close to the cap `limit` to sign: over it, or within
-/// [`CAP_HEADROOM`] of it (Switch wire 7.1).
-fn over_cap(bytes: usize, limit: usize) -> bool {
-    bytes.saturating_add(CAP_HEADROOM) > limit
+/// How much room a version must leave under the cap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Room {
+    /// A version that adds content keeps [`CAP_HEADROOM`].
+    Headroom,
+    /// A version that only closes or completes what is signed already may use the headroom.
+    Cap,
+}
+
+/// Whether a delivery of `bytes` is too close to the cap `limit` to sign: over it, or, for a
+/// version that adds content, within [`CAP_HEADROOM`] of it (Switch wire 7.1).
+fn over_cap(bytes: usize, limit: usize, room: Room) -> bool {
+    let headroom = match room {
+        Room::Headroom => CAP_HEADROOM,
+        Room::Cap => 0,
+    };
+    bytes.saturating_add(headroom) > limit
 }
 
 /// The body cap of `PUT /identity`, which `POST /enroll` shares (Switch wire 3.7, 7.1).
@@ -1422,9 +1457,12 @@ mod tests {
     #[test]
     fn test_identity_cap_keeps_its_headroom() {
         let limit = identity_limit().unwrap();
-        assert!(!over_cap(limit - CAP_HEADROOM, limit));
-        assert!(over_cap(limit - CAP_HEADROOM + 1, limit));
-        assert!(over_cap(limit, limit));
+        assert!(!over_cap(limit - CAP_HEADROOM, limit, Room::Headroom));
+        assert!(over_cap(limit - CAP_HEADROOM + 1, limit, Room::Headroom));
+        assert!(over_cap(limit, limit, Room::Headroom));
+        // A closing may use the headroom, not more.
+        assert!(!over_cap(limit, limit, Room::Cap));
+        assert!(over_cap(limit + 1, limit, Room::Cap));
     }
 
     #[test]
