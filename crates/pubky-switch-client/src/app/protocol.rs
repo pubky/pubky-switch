@@ -752,11 +752,16 @@ pub trait Protocol: Send + Sync {
     /// writes it ([`decode_local_state`]) and puts every key back, and needs no writes for a
     /// backup without a layer.
     ///
-    /// `restoring` gives the identity, the App ID and `blind` under the naming key of the
-    /// backup, the ones the restored app goes on with ([`RestoreContext`]), so the protocol
-    /// can check its layer against them here, such as that each claim key it keeps is the
-    /// one its inputs blind to, rather than after the restore commits. The default ignores
-    /// it.
+    /// It runs at every restore and at every [`super::App::backup_layered`], so it has no
+    /// side effects: it returns the writes, and the app commits them or doesn't.
+    ///
+    /// `restoring` gives the identity, the App ID, the certificate and `blind` under the
+    /// naming key of the backup, the ones the restored app goes on with
+    /// ([`RestoreContext`]), so the protocol can check its layer and the backup against
+    /// them here, rather than after the restore commits: such as that each claim key it
+    /// keeps is the one its inputs blind to, or that the certificate holds the scopes and
+    /// permissions the protocol requires. In [`super::App::backup_layered`]'s check it gives
+    /// the app's current ones, which the backup carries. The default ignores it.
     ///
     /// # Errors
     ///
