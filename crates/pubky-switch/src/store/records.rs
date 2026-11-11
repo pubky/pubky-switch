@@ -30,7 +30,12 @@ impl SnapshotRead {
         let id = self.id.clone();
         // The page's keys come from the list's index alone (migration 0014), which passes
         // over the records the reader can't read without reading their rows; then the rows
-        // it shows are read by key.
+        // it shows are read by key, the account's only (another account can hold a record
+        // at the same key), in the page's order. The index-only scan skips the rows only
+        // where the visibility map marks them all-visible, which vacuuming keeps: on the
+        // review's 10,000-record collection an empty page took 12.7 ms freshly loaded, 4.5
+        // ms with 5% rewritten and 0.9 to 1.8 ms vacuumed. Either way a page's work is
+        // bounded by the collection's live records, not by the page.
         let rows = sqlx::query(&format!(
             "WITH page AS (SELECT key, key_text FROM shared_records \
              WHERE account_id = $1 AND collection = $2 AND NOT deleted AND key_text > $3 \

@@ -80,11 +80,18 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   - a record by key is served `200` to any own app, without checking its `read_scope`
     (the service answers `403 permission_missing`);
   - the signer is served too, and its list shows every record (the service answers `403
-    permission_missing` to both);
+    permission_missing` to both); so is an own app whose certificate the switch doesn't
+    hold, whose list shows every record too;
   - a view's `cert` is the writer's current certificate, not the one the write was checked
     against, which a renewal or revocation later doesn't change (7.4.9);
-  - a list without `collection` falls through to the switch's other routes rather than
-    `400`, and `after` is compared as raw text, never refused as a malformed key.
+  - a list without `collection`, and a read by a key that isn't `b64(32)`, fall through to
+    the switch's other routes rather than `400`; `after` is compared as raw text, never
+    refused as a malformed key; and `limit` takes a leading `+` (`limit=+5`), which the
+    service refuses (`400`).
+- **Reads only own apps make, from an app of another identity:** `GET /feed`, `GET
+  /claims/{claim_key}`, `GET /allow`, `GET /records/{key}` and `GET /records` answer `403
+  not_admitted` (`switch/inbox.rs`, every route the switch doesn't serve such an app), where
+  the service answers `403 permission_missing` (Switch wire 7.4.4, 7.6).
 - **`open_admission`** (`admit_everyone`) admits every sender the deny list doesn't hold, a
   test switch only.
 - **App currency outside batches**: a feed read is checked as a batch is, for an app that
@@ -191,6 +198,10 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   new staged account, where this switch answers it with the operator's `404` too. That account
   can't serve at the service yet either: its first `identity.json`, at the next generation with
   `recovery_from` (Switch wire 7.4.16), gets the `503` "a generation change isn't served yet".
+  This switch deletes everything at once and owes no key: its `404` comes right after the
+  erasure. The service can owe the erased account's key when its key store fails, and until
+  the key is gone it answers a request signed with the identity key, whatever its timestamp,
+  with the operator's `503` in place of that `404`; every other caller gets the `404` at once.
 - **Push** (Switch wire 8.1): registrations only; nothing is sent to a relay.
 
 ## Signer flows tested only here
