@@ -57,23 +57,26 @@ use super::batch::PendingBatch;
 use super::claims::{ClaimRead, ObligationDeadline};
 use super::context::{ClaimFetch, ContextWrites, ReceiveContext};
 use super::error::{Alarm, Refusal, RefusalPlace, refused_at, refused_for_good};
-use super::events::{AppEvent, Duty, ParkReason};
+use super::events::{AppEvent, Duty, KeptRefusal, ParkReason, RefusedCall};
 use super::identity::{self, DOC_CACHE_MS, Taken};
 use super::protocol::{
-    Effect, LocalWrite, MAX_CLAIM_READS, MissedEntries, Need, OpaqueRule, Outcome,
-    PARKED_RETRIES_PER_READ, Protocol, RETRY_EVENT_READS, ReceivedMessage, ResendNeeded,
-    ResendReason, Rules, StoreFailure,
+    Effect, LocalWrite, MAX_CLAIM_READS, MAX_REGRESSION_REASON_BYTES, MAX_SEEN_MARK_BYTES,
+    MAX_STEP_LOCAL_BYTES, MissedEntries, Need, OpaqueRule, Outcome, PARKED_RETRIES_PER_READ,
+    Protocol, RETRY_EVENT_READS, ReceivedMessage, ResendNeeded, ResendReason, Rules, StoreFailure,
+    local_writes_bytes,
 };
 use super::provider::TakeOver;
 use super::records::{Collection, pending_name_key};
 use super::rotation::RegistrationStep;
 use super::state::{
-    CachedDoc, HeldEntry, KeptEntry, ParkedEntry, PendingEffect, Processed, RetryEntry, Tx, key,
+    CachedDoc, HeldEntry, KeptEntry, PROTOCOL_PREFIX, ParkedEntry, PendingEffect, Processed,
+    RetryEntry, Tx, encode, key,
 };
 use super::{App, AppError, PROCESSED_RETENTION_MS};
 use crate::client::Batch;
 use crate::client::answers::{ChainItem, EntryItem, FeedItem, FeedPage, FeedQuery};
 use crate::error::ClientError;
+use crate::store::{MAX_BATCH_BYTES, MAX_VALUE_BYTES};
 
 /// What one read did.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -127,6 +130,9 @@ enum Sent {
     Quota,
     /// Refused for good, with the error code: the entry is stored and passed.
     Refused(String),
+    /// Too large for the app to keep before it sends it: nothing was kept or sent, and the
+    /// entry is stored and passed.
+    TooLarge,
     /// Sent again and refused before the service looked at its batch ID, past the window in
     /// which a resend tells: its entry is stored and passed as uncertain.
     Uncertain,
@@ -166,27 +172,39 @@ impl From<&ResendNeeded> for OwedCall {
 impl OwedCall {
     /// The call, made again.
     fn make(&self, protocol: &dyn Protocol) -> Result<Vec<LocalWrite>, StoreFailure> {
+        match self.refused(0) {
+            RefusedCall::ResendNeeded { needed, .. } => protocol.resend_needed(&needed),
+            RefusedCall::Missed(missed) => protocol.missed(&missed),
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    /// The call as the protocol is handed it, about the feed item at `seq`.
+    pub(crate) fn refused(&self, seq: u64) -> RefusedCall {
         match *self {
             Self::Resend {
                 sender,
                 accepted_from_ms,
                 accepted_until_ms,
                 unreadable,
-            } => protocol.resend_needed(&ResendNeeded {
-                sender,
-                accepted_from_ms,
-                accepted_until_ms,
-                reason: if unreadable {
-                    ResendReason::Unreadable
-                } else {
-                    ResendReason::Unopenable
+            } => RefusedCall::ResendNeeded {
+                seq,
+                needed: ResendNeeded {
+                    sender,
+                    accepted_from_ms,
+                    accepted_until_ms,
+                    reason: if unreadable {
+                        ResendReason::Unreadable
+                    } else {
+                        ResendReason::Unopenable
+                    },
                 },
-            }),
+            },
             Self::Missed {
                 seq,
                 entries,
                 accepted_from_ms,
-            } => protocol.missed(&MissedEntries {
+            } => RefusedCall::Missed(MissedEntries {
                 seq,
                 entries,
                 accepted_from_ms,
@@ -404,6 +422,9 @@ impl App {
             if seq <= start {
                 continue;
             }
+            // Room for one more item, whatever it writes: the read's writes so far are
+            // committed first once they pass the high-water mark (`ITEM_ROOM_BYTES`).
+            self.make_room(&mut read, ITEM_ROOM_BYTES).await?;
             let step = match item {
                 // Processed past a held entry in an earlier read.
                 FeedItem::Entry(_) if self.state.seen.contains(&seq) => Step::Pass,
@@ -674,6 +695,7 @@ impl App {
             let (outcome, writes) = {
                 let mut cx = ReceiveContext::new(
                     &self.state,
+                    protocol.as_ref(),
                     store.as_ref(),
                     &self.ns,
                     may_attempt,
@@ -720,9 +742,16 @@ impl App {
                 claims,
                 deadlines,
                 not_now: _,
+                over_local_bound,
             } = writes;
             effect.ops = ops.into_iter().chain(effect.ops).collect();
             effect.local = local.into_iter().chain(effect.local).collect();
+            // A step's local writes are bounded (`Protocol`, "Limits a receive step plans
+            // for"): an effect over the bound is too large, stored and passed.
+            if over_local_bound || local_writes_bytes(&effect.local) > MAX_STEP_LOCAL_BYTES {
+                self.too_large(entry, &received, read).await?;
+                return Ok(Step::Pass);
+            }
             // The app layer's own lifecycle operations aren't a protocol's to write: an effect
             // carrying one is never sent. Its entry is stored and passed, so the feed goes on,
             // and the protocol told, as for an effect refused for good (Switch spec 8.2).
@@ -747,6 +776,19 @@ impl App {
                     read,
                 )?;
                 self.effect_refused(entry, &received, None, read)?;
+                return Ok(Step::Pass);
+            }
+            if !self
+                .make_room(read, local_size(&self.ns, &effect.local))
+                .await?
+                || effect.local.iter().any(|write| {
+                    matches!(write, LocalWrite::Put { value, .. }
+                        if u64::try_from(value.len()).unwrap_or(u64::MAX) > MAX_VALUE_BYTES)
+                })
+            {
+                // Switch spec 8.2: an effect too large for the store is stored and passed,
+                // so the feed goes on.
+                self.too_large(entry, &received, read).await?;
                 return Ok(Step::Pass);
             }
             if effect.ops.is_empty() {
@@ -788,6 +830,10 @@ impl App {
                 }
                 Sent::Quota => {
                     self.park(entry, &received.plaintext, ParkReason::Quota, read)?;
+                    return Ok(Step::Pass);
+                }
+                Sent::TooLarge => {
+                    self.too_large(entry, &received, read).await?;
                     return Ok(Step::Pass);
                 }
                 Sent::Refused(code) => {
@@ -951,6 +997,19 @@ impl App {
             if !self.collection_of_name(collection) && self.held_record(key).await?.is_none() {
                 read.tx.put(&pending_name_key(key), &collection.name)?;
             }
+        }
+        // A kept effect over the store's value size can't be kept, so it isn't sent: the
+        // same effect is refused again however often it is built (Switch spec 8.2).
+        let kept = u64::try_from(encode(&pending)?.len()).unwrap_or(u64::MAX);
+        if kept > MAX_VALUE_BYTES
+            || !self
+                .make_room(
+                    read,
+                    kept.saturating_add(write_size(&self.ns, key::PENDING_EFFECT, 0)),
+                )
+                .await?
+        {
+            return Ok(Sent::TooLarge);
         }
         // Everything read so far, with the kept batch, before it is sent.
         read.tx.put(key::PENDING_EFFECT, &pending)?;
@@ -1260,7 +1319,9 @@ impl App {
             | Sent::StaleEpoch
             | Sent::Quota
             | Sent::Refused(_)
-            | Sent::Uncertain => {}
+            | Sent::Uncertain
+            // Only a first send that can't be kept is too large; a kept effect was kept.
+            | Sent::TooLarge => {}
         }
         Ok(())
     }
@@ -1400,6 +1461,36 @@ impl App {
 
     /// Tell the protocol that the effect of `received` won't be sent again (Switch spec
     /// 8.2): a duty event, kept in the commit that stores the entry.
+    /// An effect too large for the store ([`ParkReason::EffectTooLarge`]): its entry stored
+    /// and passed, and the protocol told.
+    async fn too_large(
+        &mut self,
+        entry: &Entry,
+        received: &Received,
+        read: &mut Read,
+    ) -> Result<(), AppError> {
+        self.make_room(read, PARK_ROOM_BYTES).await?;
+        self.park(entry, &received.plaintext, ParkReason::EffectTooLarge, read)?;
+        self.effect_refused(entry, received, None, read)
+    }
+
+    /// Room in the read's commit for `bytes` more, with what processing an entry adds: when
+    /// the read's writes so far and `bytes` would be over the store's batch size, the read's
+    /// writes are committed first, with the cursor, as before a kept effect. `false` when
+    /// `bytes` alone wouldn't fit one commit.
+    async fn make_room(&mut self, read: &mut Read, bytes: u64) -> Result<bool, AppError> {
+        let needed = bytes.saturating_add(ENTRY_RESERVE_BYTES);
+        if needed > MAX_BATCH_BYTES {
+            return Ok(false);
+        }
+        if read.tx.size().saturating_add(needed) > MAX_BATCH_BYTES && !read.tx.is_empty() {
+            read.tx.put(key::CURSOR, &self.state.cursor)?;
+            let tx = std::mem::replace(&mut read.tx, self.tx()?);
+            self.commit(tx).await?;
+        }
+        Ok(true)
+    }
+
     fn effect_refused(
         &mut self,
         entry: &Entry,
@@ -1567,6 +1658,10 @@ impl App {
             return Ok(false);
         }
         let asked = match self.protocol.resend_needed(&needed) {
+            Ok(writes) if local_writes_bytes(&writes) > MAX_STEP_LOCAL_BYTES => {
+                self.local_writes_refused(seq, OwedCall::from(&needed), read)?;
+                false
+            }
             Ok(writes) => {
                 read.tx.local(&writes)?;
                 true
@@ -1579,6 +1674,23 @@ impl App {
         };
         read.tx.put(&key::asked(seq), &())?;
         Ok(asked)
+    }
+
+    /// A call whose answer's local writes are over [`MAX_STEP_LOCAL_BYTES`]: not committed,
+    /// and not owed, since making it again would bring the same answer; the protocol is
+    /// told in the commit that passes its item.
+    fn local_writes_refused(
+        &mut self,
+        seq: u64,
+        call: OwedCall,
+        read: &mut Read,
+    ) -> Result<(), AppError> {
+        self.keep_duty(
+            &mut read.tx,
+            Duty::LocalWritesRefused {
+                call: KeptRefusal::Owed { seq, call },
+            },
+        )
     }
 
     /// A call the protocol couldn't answer: kept in the commit that passes its item, and
@@ -1600,7 +1712,23 @@ impl App {
                 continue;
             };
             let mut tx = self.tx()?;
-            tx.local(&writes)?;
+            if local_writes_bytes(&writes) > MAX_STEP_LOCAL_BYTES {
+                // Over the bound: not committed, and the call made no more, since the same
+                // answer would come at every read; the protocol is told.
+                let seq = rest
+                    .rsplit('/')
+                    .next()
+                    .and_then(|seq| super::state::parse_num(seq).ok())
+                    .unwrap_or(0);
+                self.keep_duty(
+                    &mut tx,
+                    Duty::LocalWritesRefused {
+                        call: KeptRefusal::Owed { seq, call },
+                    },
+                )?;
+            } else {
+                tx.local(&writes)?;
+            }
             tx.delete(&format!("{}{rest}", key::OWED_PREFIX))?;
             self.commit(tx).await?;
         }
@@ -1658,6 +1786,16 @@ impl App {
                 accepted_from_ms: from.max(self.resend_floor()),
             };
             match self.protocol.missed(&missed) {
+                Ok(writes) if local_writes_bytes(&writes) > MAX_STEP_LOCAL_BYTES => self
+                    .local_writes_refused(
+                        seq,
+                        OwedCall::Missed {
+                            seq,
+                            entries,
+                            accepted_from_ms: missed.accepted_from_ms,
+                        },
+                        read,
+                    )?,
                 Ok(writes) => read.tx.local(&writes)?,
                 Err(_) => self.owe(
                     seq,
@@ -2008,4 +2146,101 @@ pub(crate) fn processed_writes(
     )?;
     tx.put(&key::processed_at(now, sender, msg_id), &())?;
     Ok(())
+}
+
+/// What processing one entry writes beside its effect's own writes, at most: its processed
+/// pair, the cursor, a parked or retry record removed, and the chain view's small fields.
+const ENTRY_RESERVE_BYTES: u64 = 256 * 1024;
+
+/// What storing an entry locally writes, at most: its plaintext (the 64 KiB envelope, 87
+/// KiB in base64), the sender's certificate (under 33 KiB) and its duty events.
+const PARK_ROOM_BYTES: u64 = 256 * 1024;
+
+/// The room a read keeps for its next feed item: the read's writes are committed early
+/// before an item once more would leave less, so the page's commit always fits the 32 MiB
+/// batch size (high-water mark: 32 - 12 = 20 MiB). One item writes at most:
+/// - a kept effect, under 10.9 MiB (`MAX_STEP_LOCAL_BYTES`), which goes in a commit of its
+///   own at once (`send_effect`);
+/// - an effect without operations, its local writes at most 4 MiB as stored
+///   (`MAX_STEP_LOCAL_BYTES`), with its processed pair;
+/// - a call's local writes ([`Protocol::resend_needed`], [`Protocol::missed`]), at most 4
+///   MiB, or a duty event refusing them;
+/// - an entry stored locally ([`PARK_ROOM_BYTES`]) and its duty events;
+/// - a chain item's cached record write, its operation and proof and opened value, under
+///   1.2 MiB.
+///
+/// The largest is under 11 MiB; [`ENTRY_RESERVE_BYTES`] and a margin make 12 MiB.
+const ITEM_ROOM_BYTES: u64 = 12 * 1024 * 1024;
+
+/// What an applied effect's outcome caches of one record write, at most: its operation
+/// (`MAX_OP_BYTES`, 512 KiB) and opened value (256 KiB), both in base64, and its proof.
+pub(crate) const CACHED_RECORD_BYTES: u64 = 1_258_291; // 1.2 MiB
+
+/// What a record's mark takes as stored, at most: [`MAX_SEEN_MARK_BYTES`] in base64
+/// (87,382 bytes), its key, namespace and encoding (256 bytes).
+pub(crate) const KEPT_MARK_BYTES: u64 = (MAX_SEEN_MARK_BYTES as u64).div_ceil(3) * 4 + 256;
+
+// An applied effect's outcome is committed on its own: its local writes, at most
+// `MAX_STEP_LOCAL_BYTES` as stored, at most 7 cached record writes with their marks, and
+// what processing its entry writes always fit one commit, so an applied effect can't fail
+// to commit its outcome for its size.
+const _: () = assert!(
+    (MAX_STEP_LOCAL_BYTES as u64)
+        + 7 * (CACHED_RECORD_BYTES + KEPT_MARK_BYTES)
+        + ENTRY_RESERVE_BYTES
+        <= MAX_BATCH_BYTES
+);
+/// The `POST /ops` body cap (Switch wire 7.1), what a kept effect's batch takes at most.
+const OPS_BODY_BYTES: u64 = 4 * 1024 * 1024;
+
+/// A kept effect at its largest (`pending/effect`, `MAX_STEP_LOCAL_BYTES`): its batch and
+/// its local writes in base64, its plaintext in base64 (the 64 KiB envelope), the
+/// certificate (33 KiB), a context (1 KiB) and its other fields (8 KiB).
+const KEPT_EFFECT_BYTES: u64 =
+    (OPS_BODY_BYTES + MAX_STEP_LOCAL_BYTES as u64).div_ceil(3) * 4 + 87_382 + (42 << 10);
+
+// What one feed item writes, at most, fits [`ITEM_ROOM_BYTES`]:
+// - a kept effect, which also fits one value;
+const _: () = assert!(KEPT_EFFECT_BYTES <= MAX_VALUE_BYTES);
+const _: () = assert!(KEPT_EFFECT_BYTES + ENTRY_RESERVE_BYTES <= ITEM_ROOM_BYTES);
+// - an effect without operations, or a call's local writes, with a duty event or an entry
+//   stored locally;
+const _: () = assert!(
+    (MAX_STEP_LOCAL_BYTES as u64) + PARK_ROOM_BYTES + ENTRY_RESERVE_BYTES <= ITEM_ROOM_BYTES
+);
+// - a chain item's cached record write, its mark and a flagged write's rule.
+const _: () = assert!(
+    CACHED_RECORD_BYTES
+        + KEPT_MARK_BYTES
+        + (MAX_REGRESSION_REASON_BYTES as u64)
+        + ENTRY_RESERVE_BYTES
+        <= ITEM_ROOM_BYTES
+);
+// So one more item always fits beside the read's writes kept to the high-water mark.
+const _: () = assert!(ITEM_ROOM_BYTES + ENTRY_RESERVE_BYTES < MAX_BATCH_BYTES);
+
+/// The bytes a write of `value_len` value bytes at `key` counts against a batch in `ns`.
+fn write_size(ns: &str, key: &str, value_len: u64) -> u64 {
+    let len = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
+    len(ns.len())
+        .saturating_add(len(key.len()))
+        .saturating_add(value_len)
+}
+
+/// The bytes the protocol's local writes count against a batch in `ns`, under its prefix.
+fn local_size(ns: &str, local: &[LocalWrite]) -> u64 {
+    let prefix = u64::try_from(PROTOCOL_PREFIX.len()).unwrap_or(u64::MAX);
+    let len = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
+    local.iter().fold(0u64, |total, write| {
+        let (key, value) = match write {
+            LocalWrite::Put { key, value } => (key.len(), value.len()),
+            LocalWrite::Delete { key } => (key.len(), 0),
+            LocalWrite::DeletePrefix { prefix } => (prefix.len(), 0),
+        };
+        total
+            .saturating_add(len(ns.len()))
+            .saturating_add(prefix)
+            .saturating_add(len(key))
+            .saturating_add(len(value))
+    })
 }

@@ -508,7 +508,7 @@ impl App {
         }
     }
 
-    async fn reload_now(&mut self) -> Result<(), AppError> {
+    pub(crate) async fn reload_now(&mut self) -> Result<(), AppError> {
         self.reload = true;
         self.ready_local().await
     }
@@ -1070,6 +1070,8 @@ impl App {
         let batch = self.reregistration_batch()?;
         mv.step = MoveStep::Switched;
         mv.batch = batch.body().to_vec();
+        // Lists too large for one commit at the service left are tried again at the next.
+        tx.delete(super::admission::LISTS_TOO_LARGE)?;
         tx.put(key::META, &self.state.meta)?;
         tx.put(key::CURSOR, &self.state.cursor)?;
         tx.put(keys::MOVE, &*mv)?;

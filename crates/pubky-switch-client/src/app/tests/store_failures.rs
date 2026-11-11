@@ -129,7 +129,8 @@ impl Protocol for FlakyProtocol {
             cx.local(LocalWrite::Put {
                 key: FAILED_STEP.to_vec(),
                 value: b"1".to_vec(),
-            });
+            })
+            .unwrap();
             // A read of the protocol's own state whose store failed: the error that read
             // gives is a store failure, so the step is retried.
             let read = AppError::Store(self.error.clone());
@@ -1222,6 +1223,21 @@ async fn test_restore_layer_refused_by_the_naming_key_writes_neither_layer() {
     assert!(snapshot(&empty, &app.app_id()).is_empty());
 }
 
+#[test]
+fn test_restore_build_error_is_labelled_too_large_only_for_its_size() {
+    let too_large = AppError::Store(StoreError::TooLarge { size: 2, cap: 1 });
+    assert!(matches!(
+        crate::app::restore_build_error(too_large),
+        Ok(crate::app::Restorable::TooLarge(_))
+    ));
+    // A write that can't be encoded is no matter of size: returned as it is.
+    let other = AppError::Store(StoreError::Other("a record can't be written".into()));
+    assert!(matches!(
+        crate::app::restore_build_error(other.clone()),
+        Err(error) if error == other
+    ));
+}
+
 #[tokio::test]
 async fn test_backup_with_a_layer_that_could_never_be_restored_is_refused() {
     let w = World::new();
@@ -1464,7 +1480,8 @@ impl Protocol for CounterProtocol {
             cx.local(LocalWrite::Put {
                 key: COUNT.to_vec(),
                 value: b"99".to_vec(),
-            });
+            })
+            .unwrap();
             return Outcome::Retry(StoreError::Unavailable.into());
         }
         let scanned = cx.local_scan(COUNT).unwrap();

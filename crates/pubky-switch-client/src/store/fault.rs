@@ -24,6 +24,10 @@ pub enum Fault {
     StopAfter(u64),
 }
 
+/// Puts a [`FaultStore`] refuses as too large: under a key prefix, of values over a size,
+/// for a number of commits or, with `None`, for every one.
+type TooLarge = (Vec<u8>, usize, Option<u32>);
+
 /// A store that wraps another and fails, or stops, before or after a chosen commit.
 ///
 /// A stopped store refuses every call, as a process that died would make none; the test then
@@ -36,6 +40,9 @@ pub struct FaultStore {
     /// Key prefixes whose scan fails with [`StoreError::Unavailable`], once each, after
     /// as many scans of it as given pass.
     failing_scans: Mutex<Vec<(Vec<u8>, usize)>>,
+    /// A key prefix whose puts of values over a size make a commit fail with
+    /// [`StoreError::TooLarge`], as a write over the working sizes would.
+    too_large: Mutex<Option<TooLarge>>,
 }
 
 impl std::fmt::Debug for FaultStore {
@@ -57,6 +64,30 @@ impl FaultStore {
             commits: AtomicU64::new(0),
             stopped: AtomicBool::new(false),
             failing_scans: Mutex::new(Vec::new()),
+            too_large: Mutex::new(None),
+        }
+    }
+
+    /// Refuse every commit that puts a key starting with `prefix` with
+    /// [`StoreError::TooLarge`], applying nothing, as for writes over the working sizes;
+    /// `None` stops refusing.
+    pub fn refuse_puts_as_too_large(&self, prefix: Option<&[u8]>) {
+        self.refuse_puts_as_too_large_over(prefix, 0);
+    }
+
+    /// As [`FaultStore::refuse_puts_as_too_large`], for puts of values over `size` bytes
+    /// only, as a store with a smaller value size would.
+    pub fn refuse_puts_as_too_large_over(&self, prefix: Option<&[u8]>, size: usize) {
+        if let Ok(mut too_large) = self.too_large.lock() {
+            *too_large = prefix.map(|prefix| (prefix.to_vec(), size, None));
+        }
+    }
+
+    /// As [`FaultStore::refuse_puts_as_too_large`], for the next commit that puts a key
+    /// starting with `prefix` only; later ones pass.
+    pub fn refuse_puts_as_too_large_once(&self, prefix: &[u8]) {
+        if let Ok(mut too_large) = self.too_large.lock() {
+            *too_large = Some((prefix.to_vec(), 0, Some(1)));
         }
     }
 
@@ -122,6 +153,21 @@ impl StateStore for FaultStore {
 
     fn commit(&self, batch: WriteBatch) -> Result<(), StoreError> {
         self.check_running()?;
+        if let Ok(mut too_large) = self.too_large.lock()
+            && let Some((prefix, size, times)) = too_large.as_mut()
+            && batch.writes.iter().any(|write| {
+                matches!(write, super::Write::Put { key, value, .. }
+                    if key.starts_with(prefix.as_slice()) && value.len() > *size)
+            })
+        {
+            if let Some(times) = times {
+                *times = times.saturating_sub(1);
+                if *times == 0 {
+                    *too_large = None;
+                }
+            }
+            return Err(StoreError::TooLarge { size: 0, cap: 0 });
+        }
         let n = self
             .commits
             .fetch_add(1, Ordering::SeqCst)

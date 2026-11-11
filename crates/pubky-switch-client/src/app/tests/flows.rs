@@ -1,6 +1,6 @@
 //! App flows against the scripted switch.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use pubky_switch_core::envelope::Recipient;
 use pubky_switch_core::http::ErrorCode;
@@ -15,8 +15,9 @@ use serde_json::{Map, json};
 
 use super::*;
 use crate::app::{
-    Alarm, AppBackup, AppError, AppEvent, EventId, IdentityRefresh, LeaveMode, LeaveReport,
-    ParkReason, REVALIDATION_MS, Refusal, UserConfirmed,
+    Alarm, AppBackup, AppError, AppEvent, EventId, IdentityRefresh, LOCAL_WRITE_OVERHEAD_BYTES,
+    LeaveMode, LeaveReport, MAX_STEP_LOCAL_BYTES, ParkReason, REVALIDATION_MS, Refusal,
+    RefusedCall, UserConfirmed,
 };
 use crate::error::ClientError;
 use crate::store::{Fault as StoreFault, FaultStore};
@@ -3415,6 +3416,227 @@ async fn test_app_effect_over_one_batch_is_parked_and_the_feed_goes_on() {
     assert_eq!(protocol.0.received.lock().unwrap().len(), 2);
 }
 
+/// The sample protocol, whose note `big` writes local values of `sizes` bytes of `0xff`,
+/// with a conversation entry when `ops`; other notes as the sample protocol. With
+/// `via_context`, the step adds the writes through its context instead, and keeps what
+/// each add answered.
+#[derive(Default)]
+struct BigProtocol {
+    sample: SampleProtocol,
+    ops: bool,
+    sizes: Vec<usize>,
+    via_context: bool,
+    added: Mutex<Vec<Result<(), String>>>,
+}
+
+impl BigProtocol {
+    fn writes(&self) -> Vec<LocalWrite> {
+        self.sizes
+            .iter()
+            .enumerate()
+            .map(|(n, size)| LocalWrite::Put {
+                key: format!("big/{n}").into_bytes(),
+                value: vec![0xff; *size],
+            })
+            .collect()
+    }
+}
+
+impl Protocol for BigProtocol {
+    fn has_keys(&self, scope: &str) -> bool {
+        self.sample.has_keys(scope)
+    }
+
+    fn sent_between_own_apps(&self, kind: &str) -> bool {
+        self.sample.sent_between_own_apps(kind)
+    }
+
+    fn check_scopes(
+        &self,
+        message: &pubky_switch_core::message::Message,
+        sender: &AppCert,
+        own: &AppCert,
+    ) -> Result<(), String> {
+        self.sample.check_scopes(message, sender, own)
+    }
+
+    fn accepts(&self, cert: &AppCert) -> Vec<String> {
+        self.sample.accepts(cert)
+    }
+
+    fn check_body(&self, message: &ReceivedMessage) -> Result<(), String> {
+        self.sample.check_body(message)
+    }
+
+    fn receive(&self, message: &ReceivedMessage) -> Outcome {
+        if message.message.body.get("text").and_then(Value::as_str) != Some("big") {
+            return self.sample.receive(message);
+        }
+        let ops = if self.ops {
+            vec![(
+                Vec::new(),
+                OpKind::AllowPut {
+                    pubky: message.sender,
+                    kind: AllowKind::Conversation,
+                },
+            )]
+        } else {
+            Vec::new()
+        };
+        Outcome::Apply(Effect {
+            ops,
+            local: self.writes(),
+        })
+    }
+
+    fn receive_with(
+        &self,
+        message: &ReceivedMessage,
+        cx: &mut crate::app::ReceiveContext<'_>,
+    ) -> Outcome {
+        let big = message.message.body.get("text").and_then(Value::as_str) == Some("big");
+        if !self.via_context || !big {
+            return self.receive(message);
+        }
+        for write in self.writes() {
+            let added = cx.local(write).map_err(|error| error.to_string());
+            self.added.lock().unwrap().push(added);
+        }
+        Outcome::Apply(Effect::default())
+    }
+
+    fn resend_needed(
+        &self,
+        needed: &ResendNeeded,
+    ) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
+        self.sample.resend_needed(needed)
+    }
+
+    fn missed(&self, missed: &MissedEntries) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
+        self.sample.missed(missed)
+    }
+}
+
+/// A note `big` to an app with [`BigProtocol`], then a plain one: the big one is stored
+/// and passed as too large, the protocol told, and the plain one applied.
+async fn big_effect_is_parked(ops: bool, sizes: Vec<usize>) {
+    let protocol = Arc::new(BigProtocol {
+        ops,
+        sizes,
+        ..BigProtocol::default()
+    });
+    big_effect_is_parked_with(protocol).await;
+}
+
+async fn big_effect_is_parked_with(protocol: Arc<BigProtocol>) {
+    let w = World::new();
+    let request = w.approve(&app_keys("wallet"), &["scope-a"]);
+    let mut app = App::join(w.env(), protocol.clone(), World::config(), request)
+        .await
+        .unwrap();
+    let (big, _) = w.note(app.app_id(), "big");
+    let (plain, _) = w.note(app.app_id(), "plain");
+    let report = app.receive(None).await.unwrap();
+    assert!(has(&report.events, |e| matches!(
+        e,
+        AppEvent::Parked { id: Some(_), seq: s, reason: ParkReason::EffectTooLarge } if *s == big
+    )));
+    assert!(has(&report.events, |e| matches!(
+        e,
+        AppEvent::EffectRefused { seq: s, code: None, .. } if *s == big
+    )));
+    assert!(received(&report.events, plain), "{:?}", report.events);
+    assert!(app.cursor().seq >= plain);
+    // Only the plain note's conversation entry went.
+    assert_eq!(w.effects(), 1);
+    assert!(app.protocol_get(b"big/0").await.unwrap().is_none());
+    app.receive(None).await.unwrap();
+}
+
+/// The key `big/0` [`BigProtocol`] writes first.
+const BIG_KEY_BYTES: usize = 5;
+
+/// The value size that takes one write of [`BigProtocol`] exactly to the bound.
+const AT_THE_BOUND: usize = MAX_STEP_LOCAL_BYTES - BIG_KEY_BYTES - LOCAL_WRITE_OVERHEAD_BYTES;
+
+#[tokio::test]
+async fn test_effect_at_the_bound_with_operations_is_kept_and_applied() {
+    // Local writes at the bound, of the bytes that took the most room in the earlier kept
+    // form (`255,` each, over 16 MiB): in base64 the kept effect fits one value.
+    let w = World::new();
+    let request = w.approve(&app_keys("wallet"), &["scope-a"]);
+    let protocol = Arc::new(BigProtocol {
+        ops: true,
+        sizes: vec![AT_THE_BOUND],
+        ..BigProtocol::default()
+    });
+    let mut app = App::join(w.env(), protocol.clone(), World::config(), request)
+        .await
+        .unwrap();
+    let (seq, _) = w.note(app.app_id(), "big");
+    let report = app.receive(None).await.unwrap();
+    assert!(received(&report.events, seq), "{:?}", report.events);
+    assert_eq!(w.effects(), 1);
+    assert_eq!(
+        app.protocol_get(b"big/0").await.unwrap().map(|v| v.len()),
+        Some(AT_THE_BOUND)
+    );
+}
+
+#[tokio::test]
+async fn test_step_local_writes_at_the_bound_are_applied() {
+    let w = World::new();
+    let request = w.approve(&app_keys("wallet"), &["scope-a"]);
+    let protocol = Arc::new(BigProtocol {
+        sizes: vec![AT_THE_BOUND],
+        ..BigProtocol::default()
+    });
+    let mut app = App::join(w.env(), protocol.clone(), World::config(), request)
+        .await
+        .unwrap();
+    let (seq, _) = w.note(app.app_id(), "big");
+    let report = app.receive(None).await.unwrap();
+    assert!(received(&report.events, seq), "{:?}", report.events);
+    assert_eq!(
+        app.protocol_get(b"big/0").await.unwrap().map(|v| v.len()),
+        Some(AT_THE_BOUND)
+    );
+}
+
+#[tokio::test]
+async fn test_step_local_writes_one_byte_over_the_bound_are_parked() {
+    big_effect_is_parked(false, vec![AT_THE_BOUND + 1]).await;
+}
+
+#[tokio::test]
+async fn test_step_local_through_the_context_past_the_bound_is_refused() {
+    let protocol = Arc::new(BigProtocol {
+        sizes: vec![AT_THE_BOUND, 1],
+        via_context: true,
+        ..BigProtocol::default()
+    });
+    big_effect_is_parked_with(protocol.clone()).await;
+    let added = protocol.added.lock().unwrap().clone();
+    assert_eq!(added.len(), 2);
+    assert!(added[0].is_ok());
+    assert!(
+        added[1]
+            .as_ref()
+            .is_err_and(|why| why.contains(&MAX_STEP_LOCAL_BYTES.to_string())),
+        "{added:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_effect_local_writes_over_one_commit_are_stored_and_passed() {
+    big_effect_is_parked(false, vec![12 << 20, 12 << 20, 12 << 20]).await;
+}
+
+#[tokio::test]
+async fn test_effect_local_write_over_the_value_size_is_stored_and_passed() {
+    big_effect_is_parked(false, vec![(16 << 20) + 1]).await;
+}
+
 /// The wallet joined, then loaded again on a device clock `offset_ms` ahead of the switch's.
 async fn wallet_on_a_clock_ahead(w: &World, offset_ms: u64) -> App {
     let me = w.join("wallet").await.app_id();
@@ -3573,4 +3795,303 @@ async fn test_kept_batch_unstamped_after_a_crash_was_never_sent() {
     app.submit_batch(conversation([7; 32])).await.unwrap();
     assert!(app.kept_batches().await.unwrap().is_empty());
     assert_eq!(conversations_for(&w, w.bob.public()), 1);
+}
+
+// -------------------------------------------------------------------------------------
+// The page's commit: effects and calls at the bound, and entries stored after them
+
+/// The sample protocol, whose note `fill` writes local values at the bound, `huge…` writes
+/// more than the bound (stored and passed), and whose missed-entries call answers with
+/// `missed` bytes of local writes, after failing `missed_fails` times.
+#[derive(Default)]
+struct FillProtocol {
+    sample: SampleProtocol,
+    missed: usize,
+    missed_fails: Mutex<u32>,
+}
+
+impl Protocol for FillProtocol {
+    fn has_keys(&self, scope: &str) -> bool {
+        self.sample.has_keys(scope)
+    }
+
+    fn sent_between_own_apps(&self, kind: &str) -> bool {
+        self.sample.sent_between_own_apps(kind)
+    }
+
+    fn check_scopes(
+        &self,
+        message: &pubky_switch_core::message::Message,
+        sender: &AppCert,
+        own: &AppCert,
+    ) -> Result<(), String> {
+        self.sample.check_scopes(message, sender, own)
+    }
+
+    fn accepts(&self, cert: &AppCert) -> Vec<String> {
+        self.sample.accepts(cert)
+    }
+
+    fn check_body(&self, message: &ReceivedMessage) -> Result<(), String> {
+        self.sample.check_body(message)
+    }
+
+    fn receive(&self, message: &ReceivedMessage) -> Outcome {
+        let text = message
+            .message
+            .body
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let local = if text == "fill" {
+            vec![LocalWrite::Put {
+                key: format!("fill/{}", message.seq).into_bytes(),
+                value: vec![0xff; MAX_STEP_LOCAL_BYTES - 64 - LOCAL_WRITE_OVERHEAD_BYTES],
+            }]
+        } else if text.starts_with("huge") {
+            (0..3)
+                .map(|n| LocalWrite::Put {
+                    key: format!("huge/{n}").into_bytes(),
+                    value: vec![0; 12 << 20],
+                })
+                .collect()
+        } else {
+            return self.sample.receive(message);
+        };
+        Outcome::Apply(Effect {
+            ops: Vec::new(),
+            local,
+        })
+    }
+
+    fn resend_needed(
+        &self,
+        needed: &ResendNeeded,
+    ) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
+        self.sample.resend_needed(needed)
+    }
+
+    fn missed(&self, missed: &MissedEntries) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
+        {
+            let mut fails = self.missed_fails.lock().unwrap();
+            if *fails > 0 {
+                *fails -= 1;
+                return Err(crate::error::StoreError::Unavailable.into());
+            }
+        }
+        if self.missed == 0 {
+            return self.sample.missed(missed);
+        }
+        let key = format!("missed/{}", missed.seq).into_bytes();
+        // `usize::MAX` stands for exactly the bound.
+        let size = if self.missed == usize::MAX {
+            MAX_STEP_LOCAL_BYTES - LOCAL_WRITE_OVERHEAD_BYTES - key.len()
+        } else {
+            self.missed
+        };
+        Ok(vec![LocalWrite::Put {
+            key,
+            value: vec![0xff; size],
+        }])
+    }
+}
+
+async fn fill_app(w: &World, protocol: &Arc<FillProtocol>) -> App {
+    let request = w.approve(&app_keys("wallet"), &["scope-a"]);
+    App::join(w.env(), protocol.clone(), World::config(), request)
+        .await
+        .unwrap()
+}
+
+/// Bytes of a missed-entries answer that take it to within its key of the bound.
+const MISSED_NEAR_THE_BOUND: usize = MAX_STEP_LOCAL_BYTES - 64 - LOCAL_WRITE_OVERHEAD_BYTES;
+
+#[tokio::test]
+async fn test_page_full_of_effects_near_the_bound_and_entries_stored_goes_on() {
+    let w = World::new();
+    let protocol = Arc::new(FillProtocol::default());
+    let mut app = fill_app(&w, &protocol).await;
+    // Nine effects at the bound, 36 MiB of local writes in all, then entries stored for
+    // effects over it, each with a large plaintext: one page, and more than one commit.
+    let mut filled = Vec::new();
+    for _ in 0..9 {
+        filled.push(w.note(app.app_id(), "fill").0);
+    }
+    let pad = "x".repeat(40_000);
+    let mut huge = Vec::new();
+    for _ in 0..6 {
+        huge.push(w.note(app.app_id(), &format!("huge{pad}")).0);
+    }
+    let (plain, _) = w.note(app.app_id(), "plain");
+    let report = app.receive(None).await.unwrap();
+    assert!(app.cursor().seq >= plain, "the feed goes on");
+    for seq in &filled {
+        let key = format!("fill/{seq}");
+        assert!(app.protocol_get(key.as_bytes()).await.unwrap().is_some());
+    }
+    for seq in &huge {
+        assert!(has(&report.events, |e| matches!(
+            e,
+            AppEvent::Parked { seq: s, reason: ParkReason::EffectTooLarge, .. } if s == seq
+        )));
+    }
+    assert!(received(&report.events, plain));
+}
+
+#[tokio::test]
+async fn test_missed_local_writes_near_the_bound_on_one_page_go_on() {
+    let w = World::new();
+    let protocol = Arc::new(FillProtocol {
+        missed: MISSED_NEAR_THE_BOUND,
+        ..FillProtocol::default()
+    });
+    let mut app = fill_app(&w, &protocol).await;
+    w.note(app.app_id(), "first");
+    app.receive(None).await.unwrap();
+    let now = w.clock.now_ms();
+    let missed: Vec<u64> = (0..9)
+        .map(|_| w.switch.push_missed(1, now - HOUR, now))
+        .collect();
+    let (plain, _) = w.note(app.app_id(), "plain");
+    let report = app.receive(None).await.unwrap();
+    assert!(app.cursor().seq >= plain, "the feed goes on");
+    for seq in missed {
+        let key = format!("missed/{seq}");
+        assert!(app.protocol_get(key.as_bytes()).await.unwrap().is_some());
+    }
+    assert!(received(&report.events, plain));
+}
+
+#[tokio::test]
+async fn test_page_of_effects_at_the_bound_between_entries_stored_goes_on() {
+    let w = World::new();
+    let protocol = Arc::new(FillProtocol::default());
+    let mut app = fill_app(&w, &protocol).await;
+    // Nine effects near the bound, each followed by three entries stored as too large.
+    let pad = "x".repeat(40_000);
+    for _ in 0..9 {
+        w.note(app.app_id(), "fill");
+        for _ in 0..3 {
+            w.note(app.app_id(), &format!("huge{pad}"));
+        }
+    }
+    let (plain, _) = w.note(app.app_id(), "plain");
+    for _ in 0..3 {
+        app.receive(None).await.unwrap();
+    }
+    assert!(app.cursor().seq >= plain, "the feed goes on");
+}
+
+#[tokio::test]
+async fn test_missed_local_writes_at_the_bound_on_one_page_go_on() {
+    let w = World::new();
+    let protocol = Arc::new(FillProtocol {
+        missed: usize::MAX,
+        ..FillProtocol::default()
+    });
+    let mut app = fill_app(&w, &protocol).await;
+    w.note(app.app_id(), "first");
+    app.receive(None).await.unwrap();
+    let now = w.clock.now_ms();
+    for _ in 0..9 {
+        w.switch.push_missed(1, now - HOUR, now);
+    }
+    let (plain, _) = w.note(app.app_id(), "plain");
+    app.receive(None).await.unwrap();
+    assert!(app.cursor().seq >= plain, "the feed goes on");
+    assert!(
+        !app.kept_duties()
+            .await
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, AppEvent::LocalWritesRefused { .. })),
+        "at the bound, the writes are taken"
+    );
+}
+
+#[tokio::test]
+async fn test_missed_local_writes_over_the_bound_are_refused_and_the_feed_goes_on() {
+    let w = World::new();
+    let protocol = Arc::new(FillProtocol {
+        missed: MAX_STEP_LOCAL_BYTES,
+        ..FillProtocol::default()
+    });
+    let mut app = fill_app(&w, &protocol).await;
+    w.note(app.app_id(), "first");
+    app.receive(None).await.unwrap();
+    let now = w.clock.now_ms();
+    let seq = w.switch.push_missed(1, now - HOUR, now);
+    let (plain, _) = w.note(app.app_id(), "plain");
+    let report = app.receive(None).await.unwrap();
+    assert!(app.cursor().seq >= plain, "the feed goes on");
+    let key = format!("missed/{seq}");
+    assert!(app.protocol_get(key.as_bytes()).await.unwrap().is_none());
+    assert!(
+        has(&report.events, |e| matches!(
+            e,
+            AppEvent::LocalWritesRefused {
+                call: RefusedCall::Missed(missed),
+                ..
+            } if missed.seq == seq
+        )),
+        "{:?}",
+        report.events
+    );
+    // Not made again.
+    app.receive(None).await.unwrap();
+    assert!(
+        app.kept_duties()
+            .await
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, AppEvent::LocalWritesRefused { .. }))
+    );
+}
+
+#[tokio::test]
+async fn test_owed_call_local_writes_over_the_bound_are_refused_once() {
+    let w = World::new();
+    let protocol = Arc::new(FillProtocol {
+        missed: MAX_STEP_LOCAL_BYTES,
+        missed_fails: Mutex::new(1),
+        ..FillProtocol::default()
+    });
+    let mut app = fill_app(&w, &protocol).await;
+    w.note(app.app_id(), "first");
+    app.receive(None).await.unwrap();
+    let now = w.clock.now_ms();
+    let seq = w.switch.push_missed(1, now - HOUR, now);
+    // The call fails: owed, made again by the next read, whose answer is over the bound.
+    app.receive(None).await.unwrap();
+    assert_eq!(app.owed_protocol_calls().await.unwrap(), 1);
+    let (plain, _) = w.note(app.app_id(), "plain");
+    let report = app.receive(None).await.unwrap();
+    assert!(received(&report.events, plain), "{:?}", report.events);
+    assert_eq!(app.owed_protocol_calls().await.unwrap(), 0);
+    assert!(has(&report.events, |e| matches!(
+        e,
+        AppEvent::LocalWritesRefused {
+            call: RefusedCall::Missed(missed),
+            ..
+        } if missed.seq == seq
+    )));
+    let key = format!("missed/{seq}");
+    assert!(app.protocol_get(key.as_bytes()).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn test_submit_batch_local_writes_over_the_bound_are_refused_unkept() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let batch = conversation(w.bob.public()).local(LocalWrite::Put {
+        key: b"big".to_vec(),
+        value: vec![0; MAX_STEP_LOCAL_BYTES],
+    });
+    let error = app.submit_batch(batch).await.unwrap_err();
+    assert!(
+        matches!(error, AppError::Refused(Refusal::Usage(_))),
+        "{error:?}"
+    );
+    assert!(app.kept_batches().await.unwrap().is_empty());
+    assert_eq!(conversations_for(&w, w.bob.public()), 0);
 }

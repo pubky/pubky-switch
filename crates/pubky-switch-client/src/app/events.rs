@@ -36,7 +36,9 @@ use serde::{Deserialize, Serialize};
 use pubky_switch_core::enc::serde_b64;
 
 use super::error::Alarm;
-use super::protocol::StoreFailure;
+use super::feed::OwedCall;
+use super::protocol::{MissedEntries, ResendNeeded, StoreFailure};
+use super::recovery::ProviderLoss;
 
 /// The stable ID of a duty event ([`AppEvent::is_duty`]): the store's epoch, and a counter.
 ///
@@ -224,8 +226,9 @@ pub enum AppEvent {
         /// Why.
         reason: ParkReason,
     },
-    /// A received message's effect was refused for good, or has more operations than one
-    /// batch takes with the cursor move: its entry was stored locally and passed
+    /// A received message's effect was refused for good, has more operations than one
+    /// batch takes with the cursor move, or is too large for the app's store to keep or
+    /// commit ([`ParkReason::EffectTooLarge`]): its entry was stored locally and passed
     /// ([`AppEvent::Parked`]), and the effect isn't sent again (Switch spec 8.2). The
     /// protocol may build it again in another form. A duty event.
     EffectRefused {
@@ -532,7 +535,9 @@ pub enum AppEvent {
     /// A message answered `403 not_admitted` or `403 not_current` for
     /// [`super::UNDELIVERABLE_MS`] wasn't delivered (Switch spec 11). A message its
     /// recipient never accepted was deleted from the outbox with its plaintext; for a
-    /// re-send, only the re-send was given up. A duty event.
+    /// re-send, only the re-send was given up. Also a message whose try needed writes over
+    /// the store's sizes ([`crate::error::StoreError::TooLarge`]), which no later try can
+    /// make: it was deleted from the outbox at once. A duty event.
     MessageUndelivered {
         /// The duty event's ID.
         id: EventId,
@@ -540,6 +545,17 @@ pub enum AppEvent {
         msg_id: String,
         /// Whether it was a re-send of a message accepted before.
         resend: bool,
+    },
+    /// The local writes the protocol answered `call` with were over
+    /// [`super::MAX_STEP_LOCAL_BYTES`]: they weren't committed, and the call isn't made
+    /// again, since the same answer would come. The read went on. The protocol acts on what
+    /// the call said from its own state, such as asking for the re-send with writes that
+    /// fit. A duty event.
+    LocalWritesRefused {
+        /// The duty event's ID.
+        id: EventId,
+        /// The call whose writes were refused.
+        call: RefusedCall,
     },
     /// An app of a counterparty has no receive key record that passes the checks, so a
     /// message went to its other apps (Switch spec 8.1).
@@ -571,6 +587,25 @@ pub enum AppEvent {
         writer: [u8; 16],
         /// The rule, without content.
         reason: String,
+    },
+    /// The protocol's mark of what the app has seen in a record after a write
+    /// ([`super::Protocol::record_seen`]) was over [`super::MAX_SEEN_MARK_BYTES`], so the
+    /// record's writes can't be checked against what the app has seen from that write on
+    /// (Switch spec 8.2). For another app's write the record keeps the mark it held, so
+    /// what was seen before is still checked; for an own write the mark held goes. A duty
+    /// event, of the class of [`AppEvent::WriteFlagged`]. There is one per such write, not
+    /// per record: a writer that keeps the mark over the bound raises one at each write.
+    RecordUncheckable {
+        /// The duty event's ID.
+        id: EventId,
+        /// The record key.
+        key: [u8; 32],
+        /// The app the write names.
+        writer: [u8; 16],
+        /// The write's generation and `seq`.
+        version: pubky_switch_core::ops::RecordVersion,
+        /// The size of the mark that wasn't kept.
+        mark_bytes: u64,
     },
     /// Uploads after a provider loss conflict with a record's current write (Switch spec
     /// 12.6).
@@ -623,7 +658,9 @@ impl AppEvent {
             | Self::BatchRefused { id, .. }
             | Self::RestoreLeftBehind { id, .. }
             | Self::AttemptDropped { id, .. }
-            | Self::MessageUndelivered { id, .. } => Some(*id),
+            | Self::MessageUndelivered { id, .. }
+            | Self::RecordUncheckable { id, .. }
+            | Self::LocalWritesRefused { id, .. } => Some(*id),
             _ => None,
         }
     }
@@ -632,6 +669,62 @@ impl AppEvent {
     /// the store and delivered until acknowledged (module docs, "Duty events").
     pub fn is_duty(&self) -> bool {
         self.id().is_some()
+    }
+}
+
+/// A protocol call whose local writes were over the bound
+/// ([`AppEvent::LocalWritesRefused`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RefusedCall {
+    /// [`super::Protocol::resend_needed`], about the feed item at `seq`.
+    ResendNeeded {
+        /// The feed item's `seq`.
+        seq: u64,
+        /// What the call asked.
+        needed: ResendNeeded,
+    },
+    /// [`super::Protocol::missed`].
+    Missed(MissedEntries),
+    /// [`super::Protocol::provider_lost`], its [`super::LossActions::local`], at this loss;
+    /// the loss went on without them.
+    ProviderLost(ProviderLoss),
+}
+
+/// A [`RefusedCall`] as a duty event keeps it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum KeptRefusal {
+    Owed {
+        seq: u64,
+        call: OwedCall,
+    },
+    Loss {
+        lost_generation: u64,
+        generation: u64,
+        declared_at_ms: u64,
+        accepted_from_ms: u64,
+        uncertain_until_ms: u64,
+    },
+}
+
+impl KeptRefusal {
+    fn call(self) -> RefusedCall {
+        match self {
+            Self::Owed { seq, call } => call.refused(seq),
+            Self::Loss {
+                lost_generation,
+                generation,
+                declared_at_ms,
+                accepted_from_ms,
+                uncertain_until_ms,
+            } => RefusedCall::ProviderLost(ProviderLoss {
+                lost_generation,
+                generation,
+                declared_at_ms,
+                accepted_from_ms,
+                uncertain_until_ms,
+            }),
+        }
     }
 }
 
@@ -689,6 +782,18 @@ pub(crate) enum Duty {
         msg_id: String,
         resend: bool,
     },
+    LocalWritesRefused {
+        call: KeptRefusal,
+    },
+    RecordUncheckable {
+        #[serde(with = "serde_b64")]
+        key: [u8; 32],
+        #[serde(with = "serde_b64")]
+        writer: [u8; 16],
+        generation: u64,
+        version: u64,
+        mark_bytes: u64,
+    },
     RestoreLeftBehind {
         duty_events: u64,
         owed_calls: u64,
@@ -745,6 +850,23 @@ impl Duty {
             Self::MessageUndelivered { msg_id, resend } => {
                 AppEvent::MessageUndelivered { id, msg_id, resend }
             }
+            Self::LocalWritesRefused { call } => AppEvent::LocalWritesRefused {
+                id,
+                call: call.call(),
+            },
+            Self::RecordUncheckable {
+                key,
+                writer,
+                generation,
+                version,
+                mark_bytes,
+            } => AppEvent::RecordUncheckable {
+                id,
+                key,
+                writer,
+                version: pubky_switch_core::ops::RecordVersion::new(generation, version),
+                mark_bytes,
+            },
             Self::RestoreLeftBehind {
                 duty_events,
                 owed_calls,
@@ -780,6 +902,13 @@ pub enum ParkReason {
     /// Its effect has more operations than one batch takes with the cursor move (Switch
     /// wire 6.4): it is kept, not applied, and not tried again.
     TooManyOperations,
+    /// Its effect is too large for the app to keep before it sends it, or to commit with
+    /// its outcome: the kept effect over the store's value size
+    /// ([`crate::store::MAX_VALUE_BYTES`]), or its local writes over what one commit takes
+    /// ([`crate::store::MAX_BATCH_BYTES`]) (Switch spec 8.2). The same effect is refused
+    /// again however often it is built: it is kept, not applied, and not tried again
+    /// ([`AppEvent::EffectRefused`]).
+    EffectTooLarge,
     /// Its receive step asked for more reads from the switch than one entry gets
     /// ([`super::MAX_CLAIM_READS`]), or again for what it was given: it is kept, not
     /// applied, and not tried again.

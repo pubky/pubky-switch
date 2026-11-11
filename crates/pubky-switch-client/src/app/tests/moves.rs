@@ -15,8 +15,9 @@ use pubky_switch_core::sig::SignedDoc;
 
 use super::*;
 use crate::app::{
-    AppError, AppEvent, ClaimOp, Evidence, LossActions, ObligationDeadline, ParkReason,
-    ProviderLoss, ProviderStatus, PushRelay, UserConfirmed,
+    AppError, AppEvent, ClaimOp, Evidence, LocalWrite, LossActions, MAX_STEP_LOCAL_BYTES,
+    ObligationDeadline, ParkReason, ProviderLoss, ProviderStatus, PushRelay, Refusal, RefusedCall,
+    UserConfirmed,
 };
 use crate::error::TransportError;
 use crate::error::{ClientError, StoreError};
@@ -80,6 +81,8 @@ pub(crate) struct LossProtocol {
     pub(crate) counterparties: Vec<[u8; 32]>,
     /// How many of the next loss calls fail, as when the protocol can't read its state.
     pub(crate) failing: Mutex<u32>,
+    /// The size of the value the loss call writes; one byte when zero.
+    pub(crate) local_bytes: Mutex<usize>,
 }
 
 impl Protocol for LossProtocol {
@@ -132,11 +135,12 @@ impl Protocol for LossProtocol {
             }
         }
         self.losses.lock().unwrap().push(*loss);
+        let bytes = (*self.local_bytes.lock().unwrap()).max(1);
         Ok(LossActions {
             conversations: self.counterparties.clone(),
             local: vec![LocalWrite::Put {
                 key: format!("lost/{}", loss.lost_generation).into_bytes(),
-                value: b"1".to_vec(),
+                value: vec![b'1'; bytes],
             }],
         })
     }
@@ -767,6 +771,135 @@ async fn test_key_change_in_place_is_followed_without_a_freeze() {
     assert_eq!(app.cursor().generation, 2);
 }
 
+#[tokio::test]
+async fn test_move_with_kept_batches_at_the_cap_completes() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join_on(
+        &w,
+        &router,
+        Arc::clone(&w.store) as Arc<dyn StateStore>,
+        w.protocol.clone(),
+        &[Permission::ListsManage, Permission::ConversationAdd],
+    )
+    .await;
+    let n_key = next_key();
+    w.switch.freeze(&freeze_for(&w, &n_key, 2)).unwrap();
+    // While frozen every batch is kept: each with 3.5 MiB of local writes, 4.7 MiB kept,
+    // 33 MiB for seven, more than the switch's one commit takes. Two fit the cap; the
+    // others are refused, not kept.
+    let mut results = Vec::new();
+    for n in 0..7u8 {
+        let batch = crate::app::OpBatch::new()
+            .op(OpKind::AllowPut {
+                pubky: [n + 40; 32],
+                kind: AllowKind::Contact,
+            })
+            .local(LocalWrite::Put {
+                key: format!("big/{n}").into_bytes(),
+                value: vec![123u8; (7 << 20) / 2],
+            });
+        results.push(app.submit_batch(batch).await.unwrap_err());
+    }
+    assert_eq!(results[0].code(), Some(ErrorCode::Moved));
+    assert_eq!(results[1].code(), Some(ErrorCode::Moved));
+    for refused in &results[2..] {
+        assert!(
+            matches!(refused, AppError::Refused(Refusal::NotNow(why)) if why.contains("not kept")),
+            "{refused:?}"
+        );
+    }
+    assert_eq!(app.kept_batches().await.unwrap().len(), 2);
+    let next = w.switch.import_into(n_key.to_bytes());
+    router.add(NEXT, &next);
+    app.receive(None).await.unwrap();
+    publish_at(
+        &w,
+        &next,
+        Inbox::new(NEXT, n_key.verifying_key().to_bytes()),
+        2,
+        None,
+    );
+    // The switch's one commit carries both kept batches; the move completes.
+    app.receive(None).await.unwrap();
+    assert_eq!(app.cursor().generation, 2);
+    app.receive(None).await.unwrap();
+    assert!(app.kept_batches().await.unwrap().is_empty());
+    for n in 0..2u8 {
+        assert!(next.applied().iter().any(|op| matches!(
+            op.body().kind,
+            OpKind::AllowPut { pubky, .. } if pubky == [n + 40; 32]
+        )));
+    }
+}
+
+#[tokio::test]
+async fn test_lists_too_large_refresh_is_tried_again_after_a_provider_loss() {
+    let store = Arc::new(MemoryStore::new());
+    let lost = lost_world(Arc::clone(&store) as Arc<dyn StateStore>).await;
+    // The copy was refused as too large just before the loss.
+    let ns = crate::store::client_namespace(&app_keys("wallet").app_id_bytes());
+    let mut batch = crate::store::WriteBatch::new();
+    batch
+        .put(
+            &ns,
+            b"lc/too_large".to_vec(),
+            crate::app::state::encode(&lost.w.clock.now_ms()).unwrap(),
+        )
+        .unwrap();
+    store.commit(batch).unwrap();
+    let (mut app, _) = follow_loss(&lost, Arc::clone(&store) as Arc<dyn StateStore>)
+        .await
+        .unwrap();
+    assert_eq!(app.cursor().generation, 2);
+    app.receive(None).await.unwrap();
+    // The loss let the refresh go: the copy is read from the new service.
+    assert!(store.get(&ns, b"lc/too_large").unwrap().is_none());
+    assert!(store.get(&ns, b"lc/lists_at").unwrap().is_some());
+}
+
+#[tokio::test]
+async fn test_lists_too_large_refresh_is_tried_again_after_a_provider_change() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let mut app = join_on(
+        &w,
+        &router,
+        Arc::clone(&w.store) as Arc<dyn StateStore>,
+        w.protocol.clone(),
+        &[Permission::ListsRead, Permission::ConversationAdd],
+    )
+    .await;
+    let ns = crate::store::client_namespace(&app.app_id());
+    let held = |key: &[u8]| w.store.get(&ns, key).unwrap().is_some();
+    {
+        let mut switch = w.switch.lock();
+        for n in 0..310_000u32 {
+            let mut pubky = [9u8; 32];
+            pubky[..4].copy_from_slice(&n.to_be_bytes());
+            switch.shared.flagged.insert(pubky, 3);
+        }
+    }
+    app.receive(None).await.unwrap();
+    assert!(held(b"lc/too_large") && !held(b"lc/lists_at"));
+    // A key change in place; the lists fit at the new service.
+    let pending = SigningKey::from_bytes(&seed("service/alice/pending"));
+    let changed = w.switch.import_into(pending.to_bytes());
+    changed.lock().shared.flagged.clear();
+    router.add(ORIGIN, &changed);
+    publish_at(
+        &w,
+        &changed,
+        Inbox::new(ORIGIN, pending.verifying_key().to_bytes()),
+        2,
+        None,
+    );
+    app.receive(None).await.unwrap();
+    assert_eq!(app.cursor().generation, 2);
+    assert!(!held(b"lc/too_large"));
+    assert!(held(b"lc/lists_at"));
+}
+
 /// Join and read at the old service, freeze it and import the account at the next one,
 /// publish the move, and queue a note there: everything the follow then reads.
 async fn moved_world(store: Arc<dyn StateStore>) -> (World, Router, Arc<ScriptedSwitch>, u64) {
@@ -1035,6 +1168,42 @@ async fn follow_loss(
 }
 
 #[tokio::test]
+async fn test_loss_local_writes_over_the_bound_are_refused_with_the_loss_as_called() {
+    let store = Arc::new(MemoryStore::new());
+    let lost = lost_world(Arc::clone(&store) as Arc<dyn StateStore>).await;
+    *lost.protocol.local_bytes.lock().unwrap() = MAX_STEP_LOCAL_BYTES;
+    let (app, events) = follow_loss(&lost, store as Arc<dyn StateStore>)
+        .await
+        .unwrap();
+    // Asked once, with a view of nothing zero.
+    let losses = lost.protocol.losses.lock().unwrap().clone();
+    assert_eq!(losses.len(), 1);
+    let loss = losses[0];
+    assert_eq!(loss.accepted_from_ms, lost.note_at_ms);
+    assert!(loss.lost_generation > 0 && loss.generation > loss.lost_generation);
+    assert!(loss.declared_at_ms > 0 && loss.uncertain_until_ms > loss.declared_at_ms);
+    // Its writes, over the bound with their overhead, weren't committed; the protocol is
+    // told, durably, of the very loss it was called with; and the recovery went on.
+    assert_eq!(app.protocol_get(b"lost/1").await.unwrap(), None);
+    let refused = |events: &[AppEvent]| {
+        has(events, |e| {
+            matches!(
+                e,
+                AppEvent::LocalWritesRefused { call: RefusedCall::ProviderLost(called), .. }
+                    if *called == loss
+            )
+        })
+    };
+    assert!(refused(&events), "{events:?}");
+    assert!(refused(&app.kept_duties().await.unwrap()));
+    assert!(has(&events, |e| matches!(
+        e,
+        AppEvent::ProviderRecovered { generation: 2 }
+    )));
+    assert_eq!(lost.protocol.losses.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn test_loss_recovers_at_the_new_generation() {
     let store = Arc::new(MemoryStore::new());
     let lost = lost_world(Arc::clone(&store) as Arc<dyn StateStore>).await;
@@ -1097,6 +1266,7 @@ async fn test_loss_recovers_at_the_new_generation() {
     let info = app.recovery_info().await.unwrap().unwrap();
     assert!(info.steps_done);
     assert_eq!(info.loss.generation, 2);
+    assert_eq!(info.conversations_left_out, 0);
     assert_eq!(app.cursor().generation, 2);
     // The new service's feed is followed from its start; a note there is received.
     let seq = note_at(&lost.w, &lost.next, me, "after the loss");

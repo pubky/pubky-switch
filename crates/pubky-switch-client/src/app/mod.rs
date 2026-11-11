@@ -64,22 +64,25 @@ pub use chain::{HELD_MARKS, STUBS_KEPT_FOR_MS};
 pub use error::{Alarm, AppError, Refusal};
 pub use events::{
     AppEvent, BackupRefusal, ClaimAttempt, EVENT_ID_LEN, EventId, EventIdError, ParkReason,
+    RefusedCall,
 };
 pub use feed::ReceiveReport;
 pub use identity::{DOC_CACHE_MS, HomeserverReader, IdentityRefresh, REVALIDATION_MS};
 pub use peek::{PeekReport, Peeked};
 pub use protocol::{
-    Effect, LocalWrite, MAX_CLAIM_READS, MissedEntries, Need, OpaqueRule, Outcome,
-    PARKED_RETRIES_PER_READ, Protocol, ProtocolLayer, RETRY_EVENT_READS, ReceivedMessage,
-    ResendNeeded, ResendReason, StoreFailure, decode_local_state, encode_local_state,
+    Effect, LOCAL_WRITE_OVERHEAD_BYTES, LocalWrite, MAX_CLAIM_READS, MAX_LOSS_CONVERSATIONS,
+    MAX_REGRESSION_REASON_BYTES, MAX_SEEN_MARK_BYTES, MAX_STEP_LOCAL_BYTES, MissedEntries, Need,
+    OpaqueRule, Outcome, PARKED_RETRIES_PER_READ, Protocol, ProtocolLayer, RETRY_EVENT_READS,
+    ReceivedMessage, ResendNeeded, ResendReason, StoreFailure, decode_local_state,
+    encode_local_state, local_writes_bytes,
 };
 pub use provider::ProviderStatus;
 pub use push::{MAX_HANDLE_BYTES, MAX_HANDLES, PushHandles, PushRegistration, PushRelay};
 pub use recovery::{Evidence, LossActions, ProviderLoss, RESIDUAL_WINDOW_MS, RecoveryInfo};
 pub use state::{PROTOCOL_PREFIX, SCHEMA_VERSION};
 
-pub use admission::{INVITE_CODE_BYTES, InviteCode, SenderDisposition};
-pub use batch::{OpBatch, server_time_in};
+pub use admission::{INVITE_CODE_BYTES, InviteCode, LISTS_TOO_LARGE_RETRY_MS, SenderDisposition};
+pub use batch::{MAX_KEPT_BATCHES_BYTES, OpBatch, server_time_in};
 pub use claims::{
     ClaimDoubt, ClaimEntryRead, ClaimEvidence, ClaimOp, ClaimRead, ClaimWritten,
     ObligationDeadline, claim_conflict,
@@ -437,6 +440,16 @@ impl AppBackup {
 enum Restorable {
     Ready(Box<App>, Tx),
     TooLarge(AppError),
+}
+
+/// The error of building a restore's commit: [`Restorable::TooLarge`] for writes over the
+/// store's sizes ([`StoreError::TooLarge`]), which [`App::backup_layered`] reports as
+/// [`BackupRefusal::TooLarge`]; any other error is returned as it is, unlabelled.
+fn restore_build_error(error: AppError) -> Result<Restorable, AppError> {
+    match error {
+        AppError::Store(StoreError::TooLarge { .. }) => Ok(Restorable::TooLarge(error)),
+        error => Err(error),
+    }
 }
 
 /// The app's state in memory, as the store holds it.
@@ -1281,8 +1294,8 @@ impl App {
                 duty_handed: 0,
                 time_fresh_at: None,
             };
-            // Every write of the one commit; what fails here is a write the store can't
-            // take in one batch, over its sizes.
+            // Every write of the one commit; what fails here is mostly a write the store
+            // can't take in one batch, over its sizes.
             let mut tx = Tx::new(&app.ns);
             let built: Result<(), AppError> = async {
                 tx.delete_prefix("")?;
@@ -1310,10 +1323,10 @@ impl App {
                 Ok(())
             }
             .await;
-            Ok(match built {
-                Ok(()) => Restorable::Ready(Box::new(app), tx),
-                Err(error) => Restorable::TooLarge(error),
-            })
+            match built {
+                Ok(()) => Ok(Restorable::Ready(Box::new(app), tx)),
+                Err(error) => restore_build_error(error),
+            }
         })
         .await
     }

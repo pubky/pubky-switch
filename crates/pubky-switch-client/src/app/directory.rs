@@ -35,11 +35,12 @@ use super::context::LocalView;
 use super::error::{Alarm, Refusal};
 use super::events::AppEvent;
 use super::identity::{self, DOC_CACHE_MS, Taken};
-use super::state::CachedDoc;
+use super::state::{CachedDoc, Tx};
 use super::{App, AppError};
 use crate::client::answers::Directory;
+use crate::client::read::Obj;
 use crate::client::{Credentials, SwitchClient};
-use crate::error::ClientError;
+use crate::error::{ClientError, StoreError};
 
 /// How long the app keeps delivering its own `identity.json` to the switches it wrote to:
 /// the 30 days senders keep sent messages (Switch spec 12.2 step 5).
@@ -95,6 +96,20 @@ pub(crate) struct CachedDirectory {
     pub(crate) stale: bool,
     /// When it was read, app clock.
     pub(crate) read_ms: u64,
+}
+
+impl CachedDirectory {
+    /// The directory without its apps, always stale, for one too large to keep: what the
+    /// next read compares with, the switch, generation, versions and read time, so a
+    /// provider loss since is still found and its re-sends made (Switch spec 8.1). It
+    /// sends to nothing: a stale copy is read again before any send.
+    fn stub(&self) -> Self {
+        Self {
+            apps: Vec::new(),
+            stale: true,
+            ..self.clone()
+        }
+    }
 }
 
 /// `peer/<pubky>`: what a counterparty's switch holds of the own `identity.json`, and when
@@ -903,8 +918,17 @@ impl App {
             read_ms: self.now(),
         };
         let mut tx = self.tx()?;
-        tx.put(&dir_key(pubky), &cached)?;
-        self.commit(tx).await?;
+        keep_directory(&mut tx, pubky, &cached)?;
+        match self.commit(tx).await {
+            // A store that refuses it as too large keeps only its stub: this send uses it.
+            Err(AppError::Store(StoreError::TooLarge { .. })) => {
+                self.reload_now().await?;
+                let mut tx = self.tx()?;
+                tx.put(&dir_key(pubky), &cached.stub())?;
+                self.commit(tx).await?;
+            }
+            committed => committed?,
+        }
         // A provider loss since the copy held: the old switch's accepted messages since the
         // previous check are sent again to the new one (Switch spec 8.1).
         if let Some(previous) = previous
@@ -939,7 +963,7 @@ impl App {
         if let Some(mut cached) = self.cached_directory(pubky).await? {
             cached.stale = true;
             let mut tx = self.tx()?;
-            tx.put(&dir_key(pubky), &cached)?;
+            keep_directory(&mut tx, pubky, &cached)?;
             self.commit(tx).await?;
         }
         Ok(())
@@ -1125,18 +1149,26 @@ impl App {
     /// the cache; apps added since are checked, against an `identity.json` read again if the
     /// one held doesn't list them, and join it; the `apps_version` moves on. A `current`
     /// whose `receive_keys`, `not_current` and `added_apps` together name an App ID twice is
-    /// refused: nothing is taken from it, and the directory is read again.
+    /// refused: nothing is taken from it, and the directory is read again. So is one missing
+    /// any member the wire lists as required, or holding one as `null`: `receive_keys`,
+    /// `not_current`, `unknown_kids`, `added_apps` and `apps_version`. A sender then never
+    /// seals again for a set of apps that part of an answer left out.
     pub(crate) async fn take_stale_key(
         &mut self,
         pubky: &[u8; 32],
         current: &Value,
     ) -> Result<(), AppError> {
-        if names_an_app_twice(current) {
+        if !stale_key_reads(current) || names_an_app_twice(current) {
             return self.mark_directory_stale(pubky).await;
         }
         let Some(mut cached) = self.cached_directory(pubky).await? else {
             return Ok(());
         };
+        if cached.stale && cached.apps.is_empty() {
+            // A stub, or a copy without apps read again before the next seal anyway: the
+            // answer has nothing to update.
+            return Ok(());
+        }
         let mut tx = self.tx()?;
         let mut floors = HashMap::new();
         for entry in array(current, "receive_keys") {
@@ -1219,7 +1251,7 @@ impl App {
         if !gone.is_empty() {
             cached.stale = true;
         }
-        tx.put(&dir_key(pubky), &cached)?;
+        keep_directory(&mut tx, pubky, &cached)?;
         self.commit(tx).await
     }
 
@@ -1391,6 +1423,22 @@ impl App {
     }
 }
 
+/// Cache `cached` as `pubky`'s directory, or, when it is over the store's value size, its
+/// stub ([`CachedDirectory::stub`]): a directory may take up to 104 MiB at an app limit of
+/// 255 (Switch wire 9), and one too large to keep is read again at each send instead, which
+/// then still goes, and still finds a provider loss since the read before (Switch spec 8.1).
+fn keep_directory(tx: &mut Tx, pubky: &[u8; 32], cached: &CachedDirectory) -> Result<(), AppError> {
+    let key = dir_key(pubky);
+    let size = super::state::encode(cached)?
+        .len()
+        .saturating_add(key.len());
+    if u64::try_from(size).unwrap_or(u64::MAX) <= crate::store::MAX_VALUE_BYTES {
+        tx.put(&key, cached)
+    } else {
+        tx.put(&key, &cached.stub())
+    }
+}
+
 fn array<'a>(value: &'a Value, name: &str) -> impl Iterator<Item = &'a Value> {
     value
         .get(name)
@@ -1405,6 +1453,18 @@ fn app_id_of(value: &Value, name: &str) -> Option<[u8; 16]> {
 
 fn doc_of(value: &Value, name: &str) -> Option<SignedDoc> {
     SignedDoc::from_strict_value(value.get(name)?).ok()
+}
+
+/// Whether a `409 stale_key`'s `current` holds every member Switch wire 7.6 lists, none
+/// marked optional there: the four lists, present and arrays, and `apps_version`.
+fn stale_key_reads(current: &Value) -> bool {
+    let Ok(current) = Obj::of(current, "Switch wire 7.6: a stale_key's current") else {
+        return false;
+    };
+    ["receive_keys", "not_current", "unknown_kids", "added_apps"]
+        .iter()
+        .all(|name| current.required_list(name).is_ok())
+        && current.u64("apps_version").is_ok()
 }
 
 /// Whether a `409 stale_key`'s `current` names an App ID more than once across its
@@ -1435,6 +1495,73 @@ mod tests {
         assert!(app_id_of(entry, "app_id").is_none());
         assert!(doc_of(entry, "record").is_none());
         assert_eq!(array(&current, "added_apps").count(), 0);
+    }
+
+    fn directory_of(apps: usize, record_bytes: usize) -> CachedDirectory {
+        CachedDirectory {
+            origin: "https://bob-switch.example".into(),
+            service_key: [3; 32],
+            generation: 4,
+            identity_version: 7,
+            directory_version: 9,
+            apps_version: 2,
+            apps: (0..apps)
+                .map(|n| CachedApp {
+                    app_id: [u8::try_from(n).unwrap(); 16],
+                    record: SignedDoc {
+                        body: "A".repeat(record_bytes),
+                        sig: "A".repeat(86),
+                    },
+                    receive_key: None,
+                })
+                .collect(),
+            stale: false,
+            read_ms: 11,
+        }
+    }
+
+    /// The value `tx` puts at `pubky`'s directory key.
+    fn kept(tx: &Tx, pubky: &[u8; 32]) -> CachedDirectory {
+        let key = dir_key(pubky);
+        let value = tx
+            .pending_writes()
+            .iter()
+            .find_map(|write| match write {
+                crate::store::Write::Put { key: k, value, .. } if k == key.as_bytes() => {
+                    Some(value.clone())
+                }
+                _ => None,
+            })
+            .unwrap();
+        super::super::state::decode(&value).unwrap()
+    }
+
+    #[test]
+    fn test_directory_over_the_value_size_is_kept_as_its_stub() {
+        // 38 apps of 450 KB each: over the 16 MiB value size, as a directory at an app limit
+        // of 255 may be (Switch wire 9).
+        let big = directory_of(38, 450_000);
+        let mut tx = Tx::new("ns");
+        keep_directory(&mut tx, &[1; 32], &big).unwrap();
+        let stub = kept(&tx, &[1; 32]);
+        assert!(stub.apps.is_empty() && stub.stale);
+        assert_eq!(
+            (stub.origin.as_str(), stub.generation, stub.read_ms),
+            (big.origin.as_str(), big.generation, big.read_ms)
+        );
+        assert_eq!(
+            (
+                stub.identity_version,
+                stub.directory_version,
+                stub.apps_version
+            ),
+            (7, 9, 2)
+        );
+        // One that fits is kept whole.
+        let small = directory_of(2, 1_000);
+        let mut tx = Tx::new("ns");
+        keep_directory(&mut tx, &[1; 32], &small).unwrap();
+        assert_eq!(kept(&tx, &[1; 32]), small);
     }
 
     #[test]
