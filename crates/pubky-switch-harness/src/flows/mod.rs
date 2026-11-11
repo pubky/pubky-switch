@@ -15,11 +15,13 @@ mod handover;
 mod join;
 mod lists;
 mod messaging;
+mod pages;
 mod records;
 mod removal;
 mod renewal;
 mod restore;
 mod retries;
+mod waiting;
 mod watching;
 
 use std::future::Future;
@@ -34,6 +36,7 @@ pub use handover::{hand_over, hand_over_aborted};
 pub use join::join;
 pub use lists::lists_without_read;
 pub use messaging::messaging;
+pub use pages::pages;
 pub use records::records;
 pub use removal::{departure, revocation};
 pub use renewal::renewal;
@@ -42,6 +45,7 @@ pub use retries::{
     app_retries, append_retry, claim_and_read_retries, claim_retries, removal_retries,
     signer_retries,
 };
+pub use waiting::waiting_read;
 pub use watching::watching;
 
 use crate::{FlowResult, World};
@@ -87,6 +91,7 @@ pub const FLOWS: &[(&str, Flow)] = &[
     ("erasure, answer lost", |world| {
         Box::pin(erasure_answer_lost(world))
     }),
+    ("pages", |world| Box::pin(pages(world))),
 ];
 
 /// The flow that sends `call` to the service; `None` for a call the service doesn't serve

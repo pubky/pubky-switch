@@ -101,6 +101,26 @@ pub(crate) async fn joined_as(
     asking: Asking,
     protocol: Arc<TestProtocol>,
 ) -> Result<(App, Arc<TestProtocol>), Box<dyn std::error::Error>> {
+    joined_with(
+        world,
+        identity,
+        signer,
+        asking,
+        protocol,
+        AppConfig::default(),
+    )
+    .await
+}
+
+/// As [`joined_as`], with the integrator's choices `config`.
+pub(crate) async fn joined_with(
+    world: &World,
+    identity: &TestIdentity,
+    signer: &mut Signer,
+    asking: Asking,
+    protocol: Arc<TestProtocol>,
+    config: AppConfig,
+) -> Result<(App, Arc<TestProtocol>), Box<dyn std::error::Error>> {
     let review = signer.review(asking.request.signed(), &asking.auth)?;
     let approved = signer.approve(review).await?;
     signer.claim_delivered(&approved.request).await?;
@@ -108,7 +128,7 @@ pub(crate) async fn joined_as(
     let mut app = App::join(
         world.app_env(Arc::new(MemoryStore::new())),
         protocol.clone(),
-        AppConfig::default(),
+        config,
         asking.join_request(identity.public(), &approved)?,
     )
     .await?;

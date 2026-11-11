@@ -446,9 +446,15 @@ pub(crate) enum Flow {
         #[serde(default)]
         reminded: Vec<[u8; 16]>,
         /// An erasure request went out and no answer came back: it may have landed, so the
-        /// operator's `404` now means it did (Switch wire 7.4.16).
+        /// operator's `404` now means it did, once it has held for 24 hours (Switch wire
+        /// 7.4.16).
         #[serde(default)]
         unanswered: bool,
+        /// The device time a check first met the operator's `404` after the request in
+        /// doubt, kept until an answer the pinned key signs: erased but unconfirmed, the
+        /// erasure done at the first run 24 hours on (Switch wire 7.4.16, spec 12.7 step 5).
+        #[serde(default)]
+        first_404_ms: Option<u64>,
     },
     /// Delivering a new `identity.json` version, then publishing it.
     Deliver {
