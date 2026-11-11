@@ -14,6 +14,7 @@ mod handover;
 mod join;
 mod lists;
 mod messaging;
+mod records;
 mod removal;
 mod renewal;
 mod restore;
@@ -31,6 +32,7 @@ pub use handover::{hand_over, hand_over_aborted};
 pub use join::join;
 pub use lists::lists_without_read;
 pub use messaging::messaging;
+pub use records::records;
 pub use removal::{departure, revocation};
 pub use renewal::renewal;
 pub use restore::restore;
@@ -78,6 +80,7 @@ pub const FLOWS: &[(&str, Flow)] = &[
     ("hand-over aborted", |world| {
         Box::pin(hand_over_aborted(world))
     }),
+    ("records", |world| Box::pin(records(world))),
 ];
 
 /// The flow that sends `call` to the service; `None` for a call the service doesn't serve
@@ -92,13 +95,11 @@ pub fn flow_of(call: &Call) -> Option<&'static str> {
         Call::Revoke(_) => Some("revocation"),
         Call::Leave(_) => Some("departure"),
         Call::PutHandover | Call::GetHandover => Some("hand-over"),
+        Call::GetRecord(_) | Call::ListRecords => Some("records"),
         // Served, and waiting for its flow: an app asks for a full bundle only when it
         // lacks an epoch's keys, and no honest flow leaves it lacking one while the service
         // keeps every bundle part (the restore flow shows it).
         Call::RequestKeys(_) => None,
-        // Served, and waiting for their flow: the watching flow's shared record, which an
-        // app whose protocol has collections lists when it joins.
-        Call::GetRecord(_) | Call::ListRecords => None,
         // Not served yet.
         Call::PostConnect
         | Call::GetConnect

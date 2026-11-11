@@ -538,6 +538,23 @@ impl Signer {
     /// install named, no flow in progress, the copies checked, and the signing gate passed
     /// ([`gate::refusal`]).
     pub(crate) async fn ready(&mut self) -> Result<()> {
+        self.ready_and_read().await.map(drop)
+    }
+
+    /// [`Signer::ready`], and the `GET /apps` whose copy that check confirmed: one read for
+    /// both, so the apps a step goes by are those of the switch it found holding its mark.
+    /// Read again only when that check read no copy, or delivered since.
+    pub(crate) async fn ready_at_switch(&mut self) -> Result<SwitchRead> {
+        match self.ready_and_read().await? {
+            Some(read) => Ok(read),
+            None => self.switch_at_mark().await,
+        }
+    }
+
+    /// [`Signer::ready`], and the `GET /apps` answer its copy check read, while nothing was
+    /// delivered since: `None` before the first version, which no copy is checked against,
+    /// and after a closing owed was delivered.
+    pub(crate) async fn ready_and_read(&mut self) -> Result<Option<SwitchRead>> {
         self.refresh().await?;
         // An erased account has no switch to read (Switch spec 12.7).
         if self.state.erased {
@@ -549,28 +566,31 @@ impl Signer {
         }
         // The copies are read first, so a take-over or records behind are found also while an
         // alarm holds signing back; then the signing gate decides.
-        self.check_copies().await?;
+        let read = self.check_copies().await?;
         if let Some(refused) = gate::refusal(&self.state) {
             return Err(refused);
         }
         if self.owes_closing()? {
             self.resume().await?;
+            // The delivery changed what the switch holds.
+            return Ok(None);
         }
-        Ok(())
+        Ok(read)
     }
 
     /// Before a new version is signed, check every copy that could show this install's
     /// records aren't the newest: the switch's copy is its mark, the signer backup names
     /// neither another install that took over nor a newer version of this install's own, and
     /// the Homeserver's `identity.json` is neither newer nor another body at the mark (Switch
-    /// spec 4.3, Switch wire 3.13). So nothing stale is signed, backed up or sent.
-    async fn check_copies(&mut self) -> Result<()> {
+    /// spec 4.3, Switch wire 3.13). So nothing stale is signed, backed up or sent. Returns
+    /// the switch's answer that showed its copy, `None` before the first version.
+    async fn check_copies(&mut self) -> Result<Option<SwitchRead>> {
         let Some(newest) = self.state.newest_doc()? else {
-            return Ok(());
+            return Ok(None);
         };
-        self.ensure_signer().await?;
+        let read = self.ensure_signer().await?;
         self.judge_homeserver(&newest).await?;
-        Ok(())
+        Ok(Some(read))
     }
 
     /// Stop at a backup that shows another install took over, or that holds a version of
@@ -947,19 +967,24 @@ impl Signer {
 
     /// Check that the switch still holds the newest version this signer delivered (`GET
     /// /apps` `identity`, Switch wire 7.4.12). Any other copy stops the flow, as
-    /// [`Signer::judge_copy`] says.
-    async fn switch_at_mark(&mut self) -> Result<()> {
-        let held = self.read_apps().await?.identity;
-        self.confirm_copy(held.as_ref()).await
+    /// [`Signer::judge_copy`] says. Returns the answer, with the device clock when it came.
+    async fn switch_at_mark(&mut self) -> Result<SwitchRead> {
+        let read = self.read_apps().await?;
+        self.confirm_copy(read.answer.identity.as_ref()).await?;
+        Ok(read)
     }
 
-    /// `GET /apps` (Switch wire 7.4.12), for a check of the switch's copy. A `404` the pinned
-    /// key didn't sign, with no erasure of this install's in progress, raises
-    /// [`Alert::AccountNotHosted`] and is returned as the error it is; the next one the pinned
-    /// key signs clears it. Never raised once the account is erased. Nothing else changes: an unauthenticated `404` with no
-    /// request in doubt is never an erasure (Switch wire 7.4.16).
-    pub(crate) async fn read_apps(&mut self) -> Result<AppsAnswer> {
+    /// `GET /apps` (Switch wire 7.4.12), for a check of the switch's copy: the answer, with the
+    /// device clock when it came. A `404` the pinned key didn't sign, with no erasure of this
+    /// install's in progress, raises [`Alert::AccountNotHosted`] and is returned as the error
+    /// it is; the next answer the pinned key signs clears it. Never raised once the account is
+    /// erased. Nothing else changes: an unauthenticated `404` with no request in doubt is never
+    /// an erasure (Switch wire 7.4.16).
+    pub(crate) async fn read_apps(&mut self) -> Result<SwitchRead> {
         let read = self.service_client()?.apps().await;
+        // The device clock when the answer came, before the alert's commit below, so a step
+        // judging the clock against the answer's time isn't off by that commit.
+        let device_ms = self.env.clock.now_ms();
         let raised = self.state.alerts.contains(&Alert::AccountNotHosted);
         // An erasure in progress judges the `404` itself (Switch wire 7.4.16).
         let erasing = matches!(self.flow, Some(Flow::Erase { .. }));
@@ -983,7 +1008,10 @@ impl Signer {
             }
             self.commit(state, self.flow.clone()).await?;
         }
-        Ok(read?)
+        Ok(SwitchRead {
+            answer: read?,
+            device_ms,
+        })
     }
 
     /// Judge the switch's copy of `identity.json`, `held` as `GET /apps` gave it, against the
@@ -1023,11 +1051,12 @@ impl Signer {
     /// Check that this install still signs before a write at the switch: it is named, the
     /// switch's copy is its mark, and the backup on the Homeserver names neither another
     /// install that took over nor a newer version of this install's own (Switch spec 4.3,
-    /// 12.8; Switch wire 3.13).
-    pub(crate) async fn ensure_signer(&mut self) -> Result<()> {
+    /// 12.8; Switch wire 3.13). Returns the switch's answer that showed its copy.
+    pub(crate) async fn ensure_signer(&mut self) -> Result<SwitchRead> {
         self.check_named()?;
-        self.switch_at_mark().await?;
-        self.check_backup_copy().await
+        let read = self.switch_at_mark().await?;
+        self.check_backup_copy().await?;
+        Ok(read)
     }
 
     /// Read the signer backup on the Homeserver and stop at one that shows another install
@@ -1507,6 +1536,17 @@ fn stale_without_copy() -> SignerError {
     SignerError::InvalidData(pubky_switch_core::Error::Invalid(
         "Switch wire 7.4.2: stale_identity without a newer copy than the one built on".into(),
     ))
+}
+
+/// A `GET /apps` answer whose copy of `identity.json` a check confirmed, and the device clock
+/// when it arrived. A step that judges the device clock against the answer's `server_time`
+/// uses `device_ms`, not the clock after the reads that followed it, so a slow read can't
+/// widen the clock tolerance (Switch spec 10.1).
+pub(crate) struct SwitchRead {
+    /// The answer.
+    pub(crate) answer: AppsAnswer,
+    /// The device clock when the answer arrived.
+    pub(crate) device_ms: u64,
 }
 
 #[cfg(test)]
