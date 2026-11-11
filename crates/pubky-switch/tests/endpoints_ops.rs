@@ -1363,7 +1363,7 @@ async fn revoke_wallet(replay: &Replay) {
 }
 
 #[tokio::test]
-async fn test_revoked_app_is_refused_before_the_lock() {
+async fn test_revoked_app_is_refused_under_the_lock_with_the_head() {
     let Some(replay) = registered(Limits::default(), false).await else {
         return;
     };
@@ -1378,18 +1378,28 @@ async fn test_revoked_app_is_refused_before_the_lock() {
         .expect("account");
     let keys = vectors("keys.json");
     let body = OpsRequest::new(&wallet_batch(60, 1, vec![contact(bob())]), None).to_json();
-    let request = app_request(app(&keys, "wallet"), "POST", &ops_path(), body, ms(AT));
-    let answer = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        replay.service.handle(request),
-    )
-    .await
-    .expect("answered without waiting for the lock");
-    drop(held);
+    let later = pubky_switch_core::time::rfc3339(ms(AT) + 60_000);
+    set_time(&replay.clock, &later);
+    let request = app_request(app(&keys, "wallet"), "POST", &ops_path(), body, ms(&later));
+    // The request verified, so its refusal waits for the lock (Switch wire 7.1: it carries
+    // the head): it is answered only once the lock is released.
+    let started = std::time::Instant::now();
+    let hold = std::time::Duration::from_millis(300);
+    let (answer, ()) = tokio::join!(replay.service.handle(request), async {
+        tokio::time::sleep(hold).await;
+        drop(held);
+    });
+    assert!(
+        started.elapsed() >= hold,
+        "a verified app's refusal takes the lock"
+    );
     let (status, body, head) = answer_of(answer);
     assert_eq!((status, body["code"].as_str()), (403, Some("not_current")));
-    assert!(head.is_none());
-    assert_eq!(stamped_time(&replay).await, before, "nothing was stamped");
+    assert!(head.is_some(), "the refusal carries the head");
+    // Signed at the service time the refusal commits.
+    let later_ms = i64::try_from(ms(&later)).expect("time");
+    assert_eq!(stamped_time(&replay).await, later_ms);
+    assert_ne!(before, later_ms);
     replay.db.drop_database().await.expect("drop");
 }
 
@@ -1415,16 +1425,18 @@ async fn test_app_at_a_signer_call_keeps_the_check_order() {
         (status, body["code"].as_str()),
         (403, Some("permission_missing"))
     );
-    // Its certificate expired: cert_expired comes first.
+    // Revoked: not_current, with the head.
+    revoke_wallet(&replay).await;
+    let (status, body, head) = answer_of(replay.service.handle(put(AT)).await);
+    assert_eq!((status, body["code"].as_str()), (403, Some("not_current")));
+    assert!(head.is_some());
+    // Its certificate expired too: cert_expired comes first (Switch wire 3.8, check 3
+    // before the standing). Last, as the service time never goes back.
     let expired = "2026-12-01T00:00:00.000Z";
     set_time(&replay.clock, expired);
-    let (status, body, _) = answer_of(replay.service.handle(put(expired)).await);
+    let (status, body, head) = answer_of(replay.service.handle(put(expired)).await);
     assert_eq!((status, body["code"].as_str()), (403, Some("cert_expired")));
-    set_time(&replay.clock, AT);
-    // Revoked: not_current.
-    revoke_wallet(&replay).await;
-    let (status, body, _) = answer_of(replay.service.handle(put(AT)).await);
-    assert_eq!((status, body["code"].as_str()), (403, Some("not_current")));
+    assert!(head.is_some());
     replay.db.drop_database().await.expect("drop");
 }
 
@@ -1570,5 +1582,70 @@ async fn test_claims_expired_owner_is_not_current_for_the_claim_rules() {
     );
     let (status, body) = post_app(&replay, "phone", &failed(43), None, later).await;
     assert_eq!(status, 200, "{body}");
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_own_app_refusals_carry_the_head_at_every_call() {
+    let Some(replay) = registered(Limits::default(), false).await else {
+        return;
+    };
+    let keys = vectors("keys.json");
+    let wallet = app(&keys, "wallet")["app_id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    let calls = [
+        ("GET", format!("/v1/{}/feed", alice_id()), Vec::new()),
+        (
+            "GET",
+            format!(
+                "/v1/{}/claims/{}",
+                alice_id(),
+                pubky_switch_core::enc::b64(&[7; 32])
+            ),
+            Vec::new(),
+        ),
+        (
+            "POST",
+            ops_path(),
+            OpsRequest::new(&wallet_batch(70, 1, vec![contact(bob())]), None).to_json(),
+        ),
+        (
+            "GET",
+            format!("/v1/{}/apps/{wallet}/keys", alice_id()),
+            Vec::new(),
+        ),
+        (
+            "POST",
+            format!("/v1/{}/apps/{wallet}/leave", alice_id()),
+            Vec::new(),
+        ),
+    ];
+    let check = |code: &'static str, at: String| {
+        let calls = &calls;
+        let keys = &keys;
+        let replay = &replay;
+        async move {
+            for (method, path, body) in calls {
+                let request = app_request(app(keys, "wallet"), method, path, body.clone(), ms(&at));
+                let (status, answer, head) = answer_of(replay.service.handle(request).await);
+                assert_eq!(
+                    (status, answer["code"].as_str()),
+                    (403, Some(code)),
+                    "{method} {path}: {answer}"
+                );
+                // The request verified: the refusal carries the head (Switch wire 7.1).
+                assert!(head.is_some(), "{method} {path}");
+            }
+        }
+    };
+    // Revoked: not_current at every call.
+    revoke_wallet(&replay).await;
+    check("not_current", AT.to_string()).await;
+    // Expired as well: cert_expired, the earlier check (Switch wire 3.8).
+    let expired = "2026-12-01T00:00:00.000Z";
+    set_time(&replay.clock, expired);
+    check("cert_expired", expired.to_string()).await;
     replay.db.drop_database().await.expect("drop");
 }
