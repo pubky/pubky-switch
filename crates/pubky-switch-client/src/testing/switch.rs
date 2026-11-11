@@ -1021,24 +1021,39 @@ impl ScriptedSwitch {
         Ok(inner.seq)
     }
 
-    /// The feed items `app` is shown, in order, as its feed would page them, judged with the
-    /// certificate the app is checked against (Switch wire 3.8, 7.4.4, 7.5): for tests of
-    /// what the fake shows each app.
+    /// The feed items `app` is shown, in order, read page by page through the feed route
+    /// itself (Switch wire 3.8, 7.4.4, 7.5), so a test judges what the route shows, with the
+    /// certificate the route checks the app against; the read isn't counted against a
+    /// scripted feed limit. Empty for an app the route refuses. For tests of what the fake
+    /// shows each app.
     #[cfg(test)]
     pub(crate) fn shown(&self, app: [u8; 16]) -> Vec<Value> {
-        let inner = self.lock();
-        let cert = inner.checked_cert(&app);
-        inner
-            .items
-            .iter()
-            .filter_map(|item| inner.show(item, app, cert.as_ref()))
-            .collect()
+        let mut inner = self.lock();
+        let reads = inner.feed_reads;
+        let mut items = Vec::new();
+        let mut query = String::new();
+        loop {
+            let (status, page) = inner.feed(Some(app), &query);
+            if status != 200 {
+                break;
+            }
+            if let Some(shown) = page["items"].as_array() {
+                items.extend(shown.iter().cloned());
+            }
+            match (page["more"].as_bool(), page["next"].as_str()) {
+                (Some(true), Some(next)) => query = format!("after={next}"),
+                _ => break,
+            }
+        }
+        inner.feed_reads = reads;
+        items
     }
 
     /// Chain an operation without checking it, as a faulty service does, and store a key
-    /// bundle part or a renewed certificate it carries, so the feed shows it in full to its
-    /// readers; nothing else is applied. For tests of what an app does with an item a
-    /// compliant switch refuses.
+    /// bundle part or a renewed certificate it carries, so the feed shows that item in full
+    /// to its readers; nothing else is applied, so an unchecked `record.put`, `claim` or
+    /// `app.put` has no current document and shows as a stub to every app. For tests of what
+    /// an app does with an item a compliant switch refuses.
     #[cfg(test)]
     pub(crate) fn chain_unchecked(
         &self,

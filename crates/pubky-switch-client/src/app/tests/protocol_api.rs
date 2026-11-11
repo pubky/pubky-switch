@@ -2661,7 +2661,7 @@ async fn test_scripted_feed_visibility_by_kind_and_currency() {
         vec![],
         vec![plain, shop.app_id()],
     ));
-    // A compacted claim's entries.
+    // A compacted claim's entries: stubs to every app, the claim's own writer included.
     let compacted = [9; 32];
     shop.write_claim(attempt(compacted), vec![], ObligationDeadline::NoDeadline)
         .await
@@ -2677,14 +2677,14 @@ async fn test_scripted_feed_visibility_by_kind_and_currency() {
         compacted_attempt,
         "op",
         vec![],
-        vec![claims],
+        vec![claims, shop.app_id()],
     ));
     rows.push((
         "claim compacted, its last",
         switch.seq(),
         "op",
         vec![],
-        vec![claims],
+        vec![claims, shop.app_id()],
     ));
     // An app record: every app while it is held; a superseded one is a stub.
     p.clock.advance_ms(1000);
