@@ -319,6 +319,12 @@ pub(crate) struct Inner {
     pub(crate) stamped_ms: u64,
     /// The stored signer hand-over (Switch wire 7.4.17): its target and the `PUT` body.
     pub(crate) handover: Option<([u8; 16], Value)>,
+    /// The pending key a serving account's enrollments were answered with, for the next
+    /// generation, and the App IDs those enrollments named (Switch wire 3.7).
+    pub(crate) pending: Option<(SigningKey, Vec<[u8; 16]>)>,
+    /// The key the answer being built is signed with, when it isn't the account's: an
+    /// enrollment answered with the pending key (Switch wire 7.4.1).
+    pub(crate) answer_key: Option<SigningKey>,
 }
 
 impl Inner {
@@ -385,6 +391,8 @@ impl Inner {
             enroll_limits: pubky_switch_core::records::Limits::default(),
             listed_at_epoch: BTreeMap::new(),
             handover: None,
+            pending: None,
+            answer_key: None,
         }
     }
 }
@@ -775,6 +783,11 @@ impl ScriptedSwitch {
         Ok(())
     }
 
+    /// The bodies of the requests a [`Fault::Unreachable`] stopped, in order.
+    pub fn unreached_bodies(&self) -> Vec<Vec<u8>> {
+        self.lock().unreached.clone()
+    }
+
     /// A faulty service that lost the account's `identity.json`: it holds none from now on.
     pub fn lose_identity(&self) {
         self.lock().doc = None;
@@ -1001,6 +1014,11 @@ impl ScriptedSwitch {
                         let at = inner.stamped_ms;
                         return Ok(inner.respond_at(&inner.service, request, status, &body, at));
                     }
+                    // An enrollment's errors are the operator's (Switch wire 7.4.1).
+                    if request.method == "POST" && path == "/v1/enroll" {
+                        let operator = SigningKey::from_bytes(&[42; 32]);
+                        return Ok(inner.respond_with(&operator, request, status, &body));
+                    }
                     return Ok(inner.respond(request, status, &body));
                 }
                 Some(Fault::LoseAnswer { .. }) => lose = true,
@@ -1016,8 +1034,18 @@ impl ScriptedSwitch {
             let (status, body) = inner
                 .enroll(request)
                 .map_err(|error| TransportError::Other(format!("scripted switch: {error}")))?;
+            // Taken whatever happens to the answer, so it never signs a later one.
+            let key = inner.answer_key.take();
             if lose {
                 return Err(TransportError::Timeout);
+            }
+            // Its errors are the operator's, as at the service (Switch wire 7.4.1).
+            if status != 200 {
+                let operator = SigningKey::from_bytes(&[42; 32]);
+                return Ok(inner.respond_with(&operator, request, status, &body));
+            }
+            if let Some(key) = key {
+                return Ok(inner.respond_with(&key, request, status, &body));
             }
             return Ok(inner.respond(request, status, &body));
         }
@@ -1424,6 +1452,16 @@ impl ScriptedSwitch {
     /// The last `seq` of the account's sequence.
     pub fn seq(&self) -> u64 {
         self.lock().seq
+    }
+
+    /// Whether admission is staged after a provider loss (Switch spec 12.6 step 2).
+    pub fn admission_staged(&self) -> bool {
+        self.lock().admission_staged
+    }
+
+    /// The generation the switch's account serves.
+    pub fn generation(&self) -> u64 {
+        self.lock().tip.generation
     }
 
     /// The newest own `identity.json` delivered.
