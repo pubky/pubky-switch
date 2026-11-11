@@ -8,8 +8,9 @@
 //!    answer, and asks the user to revoke the Pubky grant of each app, listed or removed,
 //!    whose reminder isn't raised yet ([`Alert::GrantRevocationOwed`]), since the Pubky SDK
 //!    offers no call for it (design note, decision 4);
-//! 2. sends `POST /v1/{id}/erase` naming the pinned service key, again until it is answered,
-//!    marking before each request that it may land. A `200` confirms the erasure. So does an
+//! 2. sends `POST /v1/{id}/erase` naming the pinned service key, again until it is answered
+//!    or, after a request in doubt, the check's read meets the operator's `404`, marking
+//!    before each request that it may land. A `200` confirms the erasure. So does an
 //!    unsigned `404`, the operator's, but only after a request that may have landed, as a
 //!    lost `200` leaves it (Switch wire 7.4.16). A `404` is never itself a lost answer: with
 //!    no request in doubt it is an error, and the mark goes back. No answer, or another
@@ -198,8 +199,9 @@ impl Signer {
     /// takes over delivers there before it writes its backup or publishes (wire 3.13), and the
     /// Homeserver's `identity.json`, a defence against a switch read that lags or lies. A check
     /// that can't read a copy fails, and nothing is deleted or sent: the flow stays, and
-    /// [`Signer::resume`] tries again. A passing check then meets the signing gate ([`gate::refusal`]), as at every
-    /// signing step: while an alarm is held, nothing is deleted or sent either.
+    /// [`Signer::resume`] tries again. A passing check then meets the signing gate
+    /// ([`gate::refusal`]), as at every signing step: while an alarm is held, nothing is
+    /// deleted or sent either.
     ///
     /// Another install found signing ends the erasure without erasing, in the commit that
     /// records it ([`Signer::end_erasure_in`]), and nothing is published by this install, which

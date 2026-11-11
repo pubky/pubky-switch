@@ -1119,10 +1119,21 @@ fn a_clone_delivers_and_backs_up(world: &World, signer: &Signer) -> IdentityDoc 
 /// As [`a_clone_delivers_and_backs_up`], the delivery made only if `delivers`: a clone writes
 /// its backup first (Switch wire 3.13).
 fn a_clone_backs_up(world: &World, signer: &Signer, delivers: bool) -> IdentityDoc {
+    let mark = signer.identity_doc().unwrap().unwrap();
+    a_clone_signs_on(world, &mark, signer.install_id(), delivers)
+}
+
+/// A clone of `install` signs the version after `on`: its backup written, then, if `delivers`,
+/// its delivery made.
+fn a_clone_signs_on(
+    world: &World,
+    on: &IdentityDoc,
+    install: [u8; 16],
+    delivers: bool,
+) -> IdentityDoc {
     use pubky_switch_core::keys::IdentityKey;
     use pubky_switch_core::records::{SignerBackup, SignerRecords};
-    let mark = signer.identity_doc().unwrap().unwrap();
-    let next = world.other_install_version(&mark, signer.install_id());
+    let next = world.other_install_version(on, install);
     if delivers {
         world.switch.deliver_identity(&next).unwrap();
     }
@@ -1134,7 +1145,7 @@ fn a_clone_backs_up(world: &World, signer: &Signer, delivers: bool) -> IdentityD
         held.certs(),
         *held.limits(),
         held.bundle_parts(),
-        Some(mark.hash()),
+        Some(on.hash()),
     )
     .unwrap();
     let backup = SignerBackup::seal(&world.key, &records).unwrap();
@@ -1278,4 +1289,52 @@ async fn test_erasure_records_behind_before_its_deletions_deletes_nothing() {
     assert!(world.published().is_some());
     assert!(world.homeserver.file(&app_record_path(&id)).is_some());
     assert_eq!(erase_requests(&world), 0);
+}
+
+#[tokio::test]
+async fn test_erasure_in_doubt_ends_erased_though_the_clone_published() {
+    // As when records are behind and the held request lands, but the clone also published its
+    // version on the Homeserver, as a clone does: this install's own copy there isn't another
+    // install, and the `404` still ends the erasure (Switch wire 7.4.16).
+    let world = World::new();
+    let (signer, _, store) = with_an_app(&world).await;
+    drop(signer);
+    let (env, land) = delayed_erasure(&world, store);
+    let mut signer = Signer::open(env, world.keyring()).await.unwrap();
+    signer.close_account(confirmed()).await.unwrap_err();
+    let next = a_clone_backs_up(&world, &signer, true);
+    world
+        .homeserver
+        .set(IDENTITY_PATH, serde_json::to_vec(next.signed()).unwrap());
+    assert!(matches!(
+        signer.resume().await.unwrap_err(),
+        SignerError::Refused(Refusal::RecordsBehind { .. })
+    ));
+    land();
+    assert!(world.switch.erased());
+    signer.resume().await.unwrap();
+    assert_eq!(signer.status(), SignerStatus::Erased);
+}
+
+#[tokio::test]
+async fn test_erasure_in_doubt_ends_erased_though_the_clone_signed_again() {
+    // The clone signs once, records behind, then again: its backup holds a version above any
+    // this install has seen. The held request lands, and the first run after ends the erasure
+    // on the `404` (Switch wire 7.4.16).
+    let world = World::new();
+    let (signer, _, store) = with_an_app(&world).await;
+    drop(signer);
+    let (env, land) = delayed_erasure(&world, store);
+    let mut signer = Signer::open(env, world.keyring()).await.unwrap();
+    signer.close_account(confirmed()).await.unwrap_err();
+    let next = a_clone_backs_up(&world, &signer, true);
+    assert!(matches!(
+        signer.resume().await.unwrap_err(),
+        SignerError::Refused(Refusal::RecordsBehind { .. })
+    ));
+    a_clone_signs_on(&world, &next, signer.install_id(), true);
+    land();
+    assert!(world.switch.erased());
+    signer.resume().await.unwrap();
+    assert_eq!(signer.status(), SignerStatus::Erased);
 }
