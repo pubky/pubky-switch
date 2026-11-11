@@ -695,12 +695,23 @@ async fn test_feed_expiry_is_judged_at_the_snapshots_time() {
     let Some(replay) = replay().await else { return };
     replay_chain_through_revoke(&replay).await;
     let key = service_key(&replay).await;
-    let at = revoke_time();
-    // A commit during the wait stamps a time past the wallet's certificate: the page read
-    // after it refuses the wallet, by the snapshot's time, not the request's.
+    // A second after the revocation, so the read stamps a time of its own.
+    let at = pubky_switch_core::time::rfc3339(ms(&revoke_time()) + 1_000);
+    set_time(&replay.clock, &at);
+    let read_ms = i64::try_from(ms(&at)).expect("time");
+    // A commit once the read's request has committed its stamp, while it waits, stamps a
+    // time past the wallet's certificate: the page read after it refuses the wallet, by the
+    // snapshot's time, not the request's.
     let expired = ms("2026-12-01T00:00:01.000Z");
     let (answer, ()) = tokio::join!(read(&replay, "wallet", "?after=1:9&wait=1", &at), async {
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while stamped_time(&replay).await != read_ms {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the read never committed its stamp"
+            );
+            tokio::task::yield_now().await;
+        }
         sql(
             &replay,
             &format!(
@@ -963,4 +974,16 @@ async fn test_feed_page_check_runs_the_apps_checks_before_the_staged_gate() {
         (403, json!("not_current"))
     );
     replay.db.drop_database().await.expect("drop");
+}
+
+/// The service time alice's account last stamped.
+async fn stamped_time(replay: &Replay) -> i64 {
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    sqlx::query_scalar("SELECT stamped_time_ms FROM accounts WHERE id = $1")
+        .bind(alice_id())
+        .fetch_one(&mut conn)
+        .await
+        .expect("stamp")
 }

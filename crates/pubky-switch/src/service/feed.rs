@@ -1270,6 +1270,7 @@ mod tests {
             cursor: None,
             reachable_since: None,
             full_requested_ms: None,
+            full_completed_seq: None,
         });
         snapshot.current.records.insert(8, "manage_contacts".into());
         let mut builder = PageBuilder::with(

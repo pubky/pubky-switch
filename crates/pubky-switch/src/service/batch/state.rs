@@ -40,6 +40,8 @@ pub struct HeldApp {
     pub reachable_since: Option<u64>,
     /// When a full key bundle was requested for it, while not yet covered.
     pub full_requested: Option<u64>,
+    /// The `seq` of the part that completed its last full-bundle request (Switch wire 6.2).
+    pub full_completed: Option<u64>,
 }
 
 /// A shared record as the account holds it.
@@ -255,6 +257,10 @@ pub struct OpsState {
     pub new_receive_keys: Vec<([u8; 16], ReceiveKeyRecord)>,
     /// The key bundle parts of the batch's targets, in `first_epoch` order.
     pub parts: BTreeMap<[u8; 16], Vec<HeldPart>>,
+    /// Where each of the batch's targets' `keys_through` starts, where it is known: the data
+    /// epoch of the first `identity.json` that listed it, raised as the key bundle parts it
+    /// passed went (Switch wire 7.4.12).
+    pub listed_epochs: BTreeMap<[u8; 16], u64>,
     /// The records the batch names that exist.
     pub records: BTreeMap<[u8; 32], HeldRecord>,
     /// The claims the batch names that exist.
@@ -292,6 +298,7 @@ impl OpsState {
             kids: BTreeSet::new(),
             new_receive_keys: Vec::new(),
             parts: BTreeMap::new(),
+            listed_epochs: BTreeMap::new(),
             records: BTreeMap::new(),
             claims: BTreeMap::new(),
             contacts: BTreeMap::new(),
