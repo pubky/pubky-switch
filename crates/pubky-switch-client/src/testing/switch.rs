@@ -472,6 +472,14 @@ impl Future for Held<'_> {
     }
 }
 
+impl Drop for Held<'_> {
+    /// A read that is answered, or that its caller gave up, is held no more.
+    fn drop(&mut self) {
+        let id = self.id;
+        self.switch.lock().held.retain(|(held, _)| *held != id);
+    }
+}
+
 impl std::fmt::Debug for ScriptedSwitch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let inner = self.lock();

@@ -21,6 +21,7 @@ mod lists;
 mod messaging;
 mod pages;
 mod records;
+mod recovery;
 mod reduction;
 mod removal;
 mod renewal;
@@ -47,6 +48,10 @@ pub use lists::lists_without_read;
 pub use messaging::messaging;
 pub use pages::pages;
 pub use records::records;
+pub use recovery::{
+    provider_loss, provider_loss_enrollment_resent, provider_loss_in_place, provider_loss_refused,
+    provider_loss_restored, provider_loss_sender_staged,
+};
 pub use reduction::renewal_drops_scope;
 pub use removal::{departure, revocation};
 pub use renewal::{renewal, renewed_twice};
@@ -119,6 +124,22 @@ pub const FLOWS: &[(&str, Flow)] = &[
     ("waiting read, the account erased", |world| {
         Box::pin(waiting_read_erased(world))
     }),
+    ("provider loss", |world| Box::pin(provider_loss(world))),
+    ("provider loss, a sender while staged", |world| {
+        Box::pin(provider_loss_sender_staged(world))
+    }),
+    ("provider loss, in place", |world| {
+        Box::pin(provider_loss_in_place(world))
+    }),
+    ("provider loss, refused", |world| {
+        Box::pin(provider_loss_refused(world))
+    }),
+    ("provider loss, the enrollment sent again", |world| {
+        Box::pin(provider_loss_enrollment_resent(world))
+    }),
+    ("provider loss, restored", |world| {
+        Box::pin(provider_loss_restored(world))
+    }),
 ];
 
 /// The flow that sends `call` to the service; `None` for a call the service doesn't serve
@@ -135,6 +156,7 @@ pub fn flow_of(call: &Call) -> Option<&'static str> {
         Call::PutHandover | Call::GetHandover => Some("hand-over"),
         Call::GetRecord(_) | Call::ListRecords => Some("records"),
         Call::Erase => Some("erasure"),
+        Call::RecoveryAdmission => Some("provider loss"),
         // A restored app lacks the keys of a part it passed before its loss, which went.
         Call::RequestKeys(_) => Some("restore"),
         // Not served yet.
@@ -149,7 +171,6 @@ pub fn flow_of(call: &Call) -> Option<&'static str> {
         | Call::Import
         | Call::ImportChunk(_)
         | Call::ImportActivate
-        | Call::RecoveryAdmission
         | Call::RecoveryUpload => None,
     }
 }

@@ -193,6 +193,8 @@ pub struct Recorder {
     distortion: Mutex<Option<Distortion>>,
     /// The faults to apply, each once, in the order added.
     faults: Mutex<Vec<Fault>>,
+    /// The enrollments sent, in order, as they were sent.
+    enrollments: Mutex<Vec<Request>>,
 }
 
 /// A fault of the network between a party and its switch, applied to the next request of
@@ -218,11 +220,26 @@ pub enum Fault {
         /// How many matching requests go through first.
         after: usize,
     },
+    /// The request doesn't reach the switch, and an error answer comes back in its place
+    /// that no key signs, as an intermediary can make one: the caller can't take it for the
+    /// switch's word.
+    Refuse {
+        /// The method.
+        method: String,
+        /// A part of the path.
+        path: String,
+        /// The status of the answer.
+        status: u16,
+        /// Its error `code`.
+        code: String,
+    },
 }
 
 impl Fault {
     fn matches(&self, request: &Request) -> bool {
-        let (Fault::LoseAnswer { method, path } | Fault::Unreachable { method, path, .. }) = self;
+        let (Fault::LoseAnswer { method, path }
+        | Fault::Unreachable { method, path, .. }
+        | Fault::Refuse { method, path, .. }) = self;
         request.method == *method && request.path_and_query.contains(path.as_str())
     }
 }
@@ -254,6 +271,7 @@ impl Recorder {
             strings: Mutex::new(HashMap::new()),
             distortion: Mutex::new(None),
             faults: Mutex::new(Vec::new()),
+            enrollments: Mutex::new(Vec::new()),
         }
     }
 
@@ -267,6 +285,11 @@ impl Recorder {
     /// Apply `fault` to the next request it matches, once.
     pub fn fail_next(&self, fault: Fault) {
         lock(&self.faults).push(fault);
+    }
+
+    /// The `nth` enrollment sent through this recorder, from 0, as it was sent.
+    pub fn enrollment(&self, nth: usize) -> Option<Request> {
+        lock(&self.enrollments).get(nth).cloned()
     }
 
     /// The faults added and not applied yet.
@@ -412,6 +435,13 @@ impl Transport for Recorder {
             let call =
                 route(&request.method, &request.path_and_query).map(|route| route.call.name());
             let sent = request.clone();
+            if request.method == "POST" && request.path_and_query == "/v1/enroll" {
+                let mut enrollments = lock(&self.enrollments);
+                // One sent again is the same enrollment, not another.
+                if !enrollments.contains(&request) {
+                    enrollments.push(request.clone());
+                }
+            }
             // The line takes its place now, and its answer's facts when the answer comes:
             // of two calls in flight at once, the one sent first comes first in the trace,
             // whichever is answered first.
@@ -432,6 +462,22 @@ impl Transport for Recorder {
                 facts.insert(FAULT.into(), "the request didn't reach the switch".into());
                 self.fill(at, Line { label, facts, call });
                 return Err(TransportError::Connect("the switch is unreachable".into()));
+            }
+            if let Some(Fault::Refuse { status, code, .. }) = &fault {
+                let refusal = Response {
+                    status: *status,
+                    headers: Vec::new(),
+                    body: serde_json::json!({ "code": code, "message": "not the switch's" })
+                        .to_string()
+                        .into_bytes(),
+                };
+                facts.insert(
+                    FAULT.into(),
+                    "an answer no key signs came back in the switch's place".into(),
+                );
+                self.answer_facts(&refusal, &mut facts);
+                self.fill(at, Line { label, facts, call });
+                return Ok(refusal);
             }
             let answer = self.inner.send(request).await;
             match &answer {

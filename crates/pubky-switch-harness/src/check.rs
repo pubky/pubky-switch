@@ -41,12 +41,23 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// An account the checker knows: its identity key and its service key.
-#[derive(Clone, Copy)]
+/// An account the checker knows: its identity key and its service keys, one for each
+/// service and generation the identity enrolled at in the run.
+#[derive(Clone)]
 struct Account {
     identity: [u8; 32],
-    service_key: [u8; 32],
+    service_keys: Vec<[u8; 32]>,
 }
+
+impl Account {
+    /// Whether one of the account's service keys passes `check`.
+    fn any_key(&self, check: impl Fn(&[u8; 32]) -> bool) -> bool {
+        self.service_keys.iter().any(check)
+    }
+}
+
+/// One sequence of an account: its Pubky ID and a generation.
+type Sequence = (String, u64);
 
 /// Verifies what a run's answers carry.
 #[derive(Default)]
@@ -55,8 +66,9 @@ pub struct Checker {
     accounts: Mutex<HashMap<String, Account>>,
     /// The operator key of the run's switches.
     operator_key: Mutex<Option<[u8; 32]>>,
-    /// The chain hash the run showed at each `seq`, by account.
-    chains: Mutex<HashMap<String, BTreeMap<u64, [u8; 32]>>>,
+    /// The chain hash the run showed at each `seq`, by account and generation: a new
+    /// generation starts a sequence of its own (Switch wire 6.6).
+    chains: Mutex<HashMap<Sequence, BTreeMap<u64, [u8; 32]>>>,
 }
 
 impl std::fmt::Debug for Checker {
@@ -76,15 +88,37 @@ pub enum SignedWith {
 
 impl Checker {
     /// The answers of the account `id` (a Pubky ID), of the identity `identity`, are
-    /// signed with `service_key`.
+    /// signed with `service_key`: one more key of the account, beside those of the services
+    /// and generations it enrolled at before.
     pub fn account(&self, id: &str, identity: [u8; 32], service_key: [u8; 32]) {
-        lock(&self.accounts).insert(
-            id.to_owned(),
-            Account {
-                identity,
-                service_key,
-            },
-        );
+        let mut accounts = lock(&self.accounts);
+        let account = accounts.entry(id.to_owned()).or_insert(Account {
+            identity,
+            service_keys: Vec::new(),
+        });
+        if !account.service_keys.contains(&service_key) {
+            account.service_keys.push(service_key);
+        }
+    }
+
+    /// The service key an enrollment's answer names, which the answer is signed with
+    /// (Switch wire 7.4.1): the key of a new generation, or of another service, that the
+    /// run hadn't told the checker of. It is taken only when the answer verifies with it.
+    fn enrolled_key(
+        &self,
+        request: &Request,
+        answer: &Response,
+        verifies: &impl Fn(&[u8; 32]) -> bool,
+    ) -> Option<()> {
+        let path = request.path_and_query.strip_prefix("/v1/")?;
+        if answer.status != 200 || !(path == "enroll" || path.starts_with("enroll?")) {
+            return None;
+        }
+        let id = request.header(header::IDENTITY)?;
+        let body: Value = serde_json::from_slice(&answer.body).ok()?;
+        let key = unb64_array::<32>(body.get("service_key")?.as_str()?).ok()?;
+        let identity = lock(&self.accounts).get(id)?.identity;
+        verifies(&key).then(|| self.account(id, identity, key))
     }
 
     /// Answers the switch can't tie to an account are signed with `operator_key`.
@@ -101,7 +135,7 @@ impl Checker {
             }
             rest => rest.split(['/', '?']).next()?,
         };
-        let account = *lock(&self.accounts).get(id)?;
+        let account = lock(&self.accounts).get(id)?.clone();
         Some((id.to_owned(), account))
     }
 
@@ -130,8 +164,10 @@ impl Checker {
             )
             .is_ok()
         };
+        // An enrollment's answer brings its key with it.
+        let _ = self.enrolled_key(request, answer, &verifies);
         if let Some((_, account)) = self.account_of(request)
-            && verifies(&account.service_key)
+            && account.any_key(verifies)
         {
             return Ok(SignedWith::ServiceKey);
         }
@@ -241,16 +277,16 @@ impl Found<'_> {
 
     /// A signed head: its signature, and its chain hash where the run showed its `seq`.
     fn head(&mut self, head: &SignedHead, at: &str) {
-        if head
-            .verify(&self.account.service_key, &self.account.identity)
-            .is_err()
+        if !self
+            .account
+            .any_key(|key| head.verify(key, &self.account.identity).is_ok())
         {
             self.violation(format!(
                 "{at}: the head's signature doesn't verify with the account's service key"
             ));
         }
         let shown = lock(&self.checker.chains)
-            .get(self.id)
+            .get(&(self.id.to_owned(), head.generation))
             .and_then(|chain| chain.get(&head.seq).copied());
         let expected = match shown {
             Some(hash) => Some(hash),
@@ -277,7 +313,9 @@ impl Found<'_> {
         };
         let (same_seq, before) = {
             let mut chains = lock(&self.checker.chains);
-            let chain = chains.entry(self.id.to_owned()).or_default();
+            let chain = chains
+                .entry((self.id.to_owned(), envelope.generation))
+                .or_default();
             let same_seq = chain.insert(envelope.seq, stub.chain_hash);
             let before = envelope
                 .seq
@@ -340,11 +378,16 @@ impl Found<'_> {
             self.violation(format!("{at}: a proof that isn't a signed document"));
             return;
         };
-        match TransitionProof::verify(&signed, &self.account.service_key, &self.account.identity) {
-            Ok(proof) => {
+        let verified = self
+            .account
+            .service_keys
+            .iter()
+            .find_map(|key| TransitionProof::verify(&signed, key, &self.account.identity).ok());
+        match verified {
+            Some(proof) => {
                 self.stub(&proof.body().chain, &format!("{at}, its stub"));
             }
-            Err(_) => self.violation(format!(
+            None => self.violation(format!(
                 "{at}: the proof's signature doesn't verify with the account's service key"
             )),
         }
