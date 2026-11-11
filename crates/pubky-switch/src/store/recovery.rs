@@ -86,6 +86,24 @@ impl AccountTxn {
         )
     }
 
+    /// The App IDs held with the pending key, from the `revoked_apps` of the enrollments it
+    /// answered (Switch wire 3.7).
+    pub async fn pending_revoked_apps(&mut self) -> Result<Vec<[u8; 16]>, StoreError> {
+        let id = self.head().id.clone();
+        let rows: Vec<Vec<u8>> =
+            sqlx::query_scalar("SELECT app_id FROM pending_revoked_apps WHERE account_id = $1")
+                .bind(id)
+                .fetch_all(self.conn())
+                .await
+                .map_err(StoreError::from_db)?;
+        rows.iter()
+            .map(|app| {
+                <[u8; 16]>::try_from(app.as_slice())
+                    .map_err(|_| StoreError::Corrupt("pending revoked app_id"))
+            })
+            .collect()
+    }
+
     /// Hold `apps`, an enrollment's `revoked_apps` answered with the pending key, until the
     /// delivery naming that key starts the new generation (Switch wire 3.7).
     pub async fn hold_pending_revoked_apps(&mut self, apps: &[[u8; 16]]) -> Result<(), StoreError> {

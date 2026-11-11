@@ -242,6 +242,10 @@ async fn load_state(
     let identity = head.identity_key;
     let mut state = OpsState::new(identity, head.generation, head.last_seq, now);
     state.doc = held.cloned();
+    // Through the generation a provider loss began, an app's first receive key at this
+    // service may carry any `n`: one higher than every `n` it registered (Switch spec 3.6,
+    // 12.6 step 1; wire 6.2).
+    state.recovering = txn.recovery().await?.is_some();
     for app in txn.apps().await? {
         state.apps.insert(app.app_id, held_app(&app, &identity)?);
     }
