@@ -688,6 +688,10 @@ pub trait Protocol: Send + Sync {
     ///   checked from that write on ([`super::AppEvent::RecordUncheckable`], a duty event).
     /// - **Another app's write:** the record keeps the mark it held, so what was seen before
     ///   is still checked against later writes, and the protocol is told the same way.
+    ///
+    /// It is called once more for every own write, when the write is built, to refuse one
+    /// whose mark won't fit, and again when the write is taken: it has no side effects, and
+    /// gives the same mark for the same arguments.
     fn record_seen(
         &self,
         collection: &str,

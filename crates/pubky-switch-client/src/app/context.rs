@@ -581,6 +581,11 @@ impl<'a> ReceiveContext<'a> {
     /// [`Refusal::NotNow`] while the app lacks the read scope's key at the current data
     /// epoch: the message then waits, whatever the protocol returns, and is handed over
     /// again at a later read; a store failure.
+    ///
+    /// A write refused with [`Refusal::Usage`], its mark over the bound included, isn't
+    /// added: a protocol that carries on returns an effect that applies without it. That is
+    /// unlike [`ReceiveContext::local`] past [`MAX_STEP_LOCAL_BYTES`], whose effect is
+    /// stored locally instead of applied.
     pub fn put_record(
         &mut self,
         target: &RecordTarget,
@@ -604,6 +609,8 @@ impl<'a> ReceiveContext<'a> {
         self.write_record(target, None, conditions)
     }
 
+    /// A refused write adds nothing, and the effect goes on without it
+    /// ([`ReceiveContext::put_record`]).
     fn write_record(
         &mut self,
         target: &RecordTarget,

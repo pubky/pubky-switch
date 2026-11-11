@@ -122,7 +122,7 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
 | `leave` | a leave in progress or done | |
 | `service_time` | the highest service time verified, its key, the offset from the device clock | |
 | `p/...` | the protocol's own local state (`LocalWrite`) | the protocol's |
-| `duty/<id>` | a duty event (`AppEvent::is_duty`), written in the commit of the change it reports, until the host acknowledges it (`App::ack_events`); one per entry stored for good, kept batch or `attempt` dropped, kept batch refused for good, outbox message given up, or protocol call whose local writes were over the bound (`LocalWritesRefused`). Only acknowledgements remove them: nothing bounds them for a host that never acknowledges | |
+| `duty/<id>` | a duty event (`AppEvent::is_duty`), written in the commit of the change it reports, until the host acknowledges it (`App::ack_events`); one per entry stored for good, kept batch or `attempt` dropped, kept batch refused for good, outbox message given up, protocol call whose local writes were over the bound (`LocalWritesRefused`), or record write whose mark was over its bound (`RecordUncheckable`). Only acknowledgements remove them: nothing bounds them for a host that never acknowledges | |
 | `dutyn` | the counter the next duty event takes; it only goes up in one store, and a restore in place keeps it | |
 | `dutye` | the store's event epoch, random, chosen once when the store starts empty (the first join, or a restore onto a store without one); every duty event ID carries it with its counter | |
 
@@ -220,7 +220,7 @@ uploads; `push.rs` holds the push registration. The peek (`peek.rs`) writes noth
 | `list_due` | a listing of the collections is owed: after joining, a restore or a `missed` item | |
 | `rec/<key>` | the shared record write the app took: the signed operation, certificate and proof, its version and whether a proof gave it, the opened value, and the refused write it follows | yes |
 | `recname/<key>` | the collection name of a record the app creates outside the protocol's collections, from a write or an effect, until its write is answered | |
-| `hw/<key>` | the protocol's mark of what the app has seen in a record, at most `MAX_SEEN_MARK_BYTES` (1 KiB): a longer one isn't kept | the protocol's |
+| `hw/<key>` | the protocol's mark of what the app has seen in a record, in base64, at most `MAX_SEEN_MARK_BYTES` (64 KiB) before it. A longer one is never kept: an own write whose mark won't fit is refused before it is built; another app's write leaves the mark held as it is and keeps a `RecordUncheckable` duty event; an own write found over the bound once taken deletes the mark held and keeps the same event | the protocol's |
 | `flag/<key>/<generation>/<version>` | a write the app refused, with the app it names and the rule, cut to `MAX_REGRESSION_REASON_BYTES` (256 bytes) | |
 | `ocert/<app_id>/<cert_hash>` | a certificate of an own app, for checking its writes | |
 | `claim/<claim_key>` | the newest claim view, the proof that shows it SETTLED, the newest entry's time and the deadline the app computes, kept until the evidence's retention ends | |

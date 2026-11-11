@@ -609,7 +609,8 @@ pub enum AppEvent {
     /// record's writes can't be checked against what the app has seen from that write on
     /// (Switch spec 8.2). For another app's write the record keeps the mark it held, so
     /// what was seen before is still checked; for an own write the mark held goes. A duty
-    /// event, of the class of [`AppEvent::WriteFlagged`].
+    /// event, of the class of [`AppEvent::WriteFlagged`]. There is one per such write, not
+    /// per record: a writer that keeps the mark over the bound raises one at each write.
     RecordUncheckable {
         /// The duty event's ID.
         id: EventId,

@@ -2346,6 +2346,30 @@ async fn test_records_listing_stops_when_next_doesnt_move_on() {
 }
 
 #[tokio::test]
+async fn test_records_listing_page_of_full_marks_commits_early() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    // 420 records on one page, each listed with a mark near the bound: 87 KiB each as
+    // stored, about 35 MiB in all, more than one commit takes.
+    let names: Vec<String> = (0..420).map(|n| format!("n{n:03}")).collect();
+    for name in &names {
+        wallet
+            .put_record(&s.target(name), &value(&[name.as_str()]), vec![])
+            .await
+            .unwrap();
+    }
+    *s.protocol.pad.lock().unwrap() = MAX_SEEN_MARK_BYTES - 64;
+    let mut phone = s.join("phone").await;
+    assert_eq!(phone.list_collection(&items()).await.unwrap(), 420);
+    for name in [&names[0], &names[419]] {
+        let key = phone.record_key(&s.target(name)).unwrap();
+        assert!(phone.shared_record(&key).await.unwrap().is_some());
+        let mark = phone.record_seen(&key).await.unwrap().unwrap();
+        assert!(mark.len() > MAX_SEEN_MARK_BYTES - 64, "{}", mark.len());
+    }
+}
+
+#[tokio::test]
 async fn test_records_listing_pages_by_bytes() {
     let s = Setup::new();
     let mut app = s.join("wallet").await;
