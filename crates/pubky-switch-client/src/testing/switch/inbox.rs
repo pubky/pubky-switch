@@ -391,6 +391,9 @@ impl Inner {
                         "apps_version": self.apps_version }),
             ));
         }
+        // The append brings the pressure: the lagging marks are judged first, so a lagging
+        // app stops holding the quota before it is counted (Switch wire 7.4.4).
+        self.judge_lagging();
         // Step 7: a code that admitted the sender is used, and the service writes its
         // conversation entry (the `conversation.add` transition, Switch wire 6.5).
         let mut context = None;
@@ -403,13 +406,23 @@ impl Inner {
             let at = self.now();
             self.shared
                 .service_conversations
-                .insert(identity, (hash, at));
+                .insert(identity, (hash, at, invite_context.clone()));
             self.service_transition(ServiceTransition::ConversationAdd {
                 pubky: identity,
                 code_hash: hash,
-                context: invite_context,
+                context: invite_context.clone(),
                 at,
             })?;
+            // The feed shows the entry with its code's context (Switch wire 7.5).
+            if let Some(Item::Chain { context, .. }) = self.items.last_mut() {
+                *context = Some(invite_context);
+            }
+        } else if sender.is_some() {
+            // An append a conversation entry may have admitted: its time is the entry's
+            // `last_used` (Switch wire 7.4.6). The append a code admits writes the entry,
+            // and counts for none.
+            let at = self.now();
+            self.shared.note_conversation_used(&identity, at);
         }
         let seq = self.next_seq();
         let accepted_at = self.now();
@@ -422,6 +435,8 @@ impl Inner {
             targets,
             context,
         });
+        // And judged again with the entry in.
+        self.judge_lagging();
         let answer = json!({
             "entry_id": Self::entry_id(seq),
             "accepted_at": rfc3339(accepted_at),

@@ -51,19 +51,40 @@ async fn send_note(world: &World, shop: &mut App, to: [u8; 32], number: usize) -
 /// `app` follows its feed to the end and moves its cursor: the events it raises, the notes
 /// its protocol took so far, and where it stands.
 async fn look(world: &World, name: &str, app: &mut App, protocol: &TestProtocol) -> FlowResult {
+    raised(world, name, app, protocol).await.map(|_| ())
+}
+
+/// As [`look`], returning the names of the events the read raised.
+async fn raised(
+    world: &World,
+    name: &str,
+    app: &mut App,
+    protocol: &TestProtocol,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let report = app.receive(None).await?;
     app.flush_cursor().await?;
+    let raised = events(&report.events);
     world.outcome(
         name,
         &json!({
-            "events": events(&report.events),
+            "events": raised,
             "stopped": report.stopped,
             "notes": protocol.received().len(),
             "app": app_status(app),
         }),
     );
     world.advance_ms(STEP_MS);
-    Ok(())
+    Ok(raised)
+}
+
+/// Fail the flow unless the read named `step` raised `event`: the flows are named for what
+/// the switch does to the feed, at either switch.
+fn expect(raised: &[String], event: &str, step: &str) -> FlowResult {
+    if raised.iter().any(|name| name == event) {
+        Ok(())
+    } else {
+        Err(format!("{step}: the read raised no {event}, but {raised:?}").into())
+    }
 }
 
 /// The signer's routine run, which reads the account's apps: the trace's `GET
@@ -80,9 +101,7 @@ async fn signer_looks(world: &World, signer: &mut Signer, name: &str) -> FlowRes
 /// stops keeping notes for it: bob is never refused for a full inbox. The signer's routine
 /// run sees the mark. When the phone reads at last, the mark ends.
 ///
-/// The service runs with a small inbox quota here ([`World::add_switch_with`]). The
-/// scripted switch marks no app lagging, so this flow isn't among [`super::FLOWS`]: its
-/// test runs it against each switch and holds what each does.
+/// The switch runs with a small inbox quota here ([`World::add_switch_with`]).
 ///
 /// Calls: `POST /v1/{id}/inbox` under pressure; `GET /v1/{id}/apps` with `lagging: true`
 /// and `false` again; `GET /v1/{id}/feed` by a lagging app.
@@ -129,7 +148,9 @@ pub async fn lagging_app(world: &World) -> FlowResult {
     }
     signer_looks(world, &mut alice_signer, "alice's signer looks at her apps").await?;
 
-    look(world, "the phone reads at last", &mut phone, &phone_notes).await?;
+    let step = "the phone reads at last";
+    let read = raised(world, step, &mut phone, &phone_notes).await?;
+    expect(&read, "Missed", step)?;
     signer_looks(
         world,
         &mut alice_signer,
@@ -144,8 +165,6 @@ pub async fn lagging_app(world: &World) -> FlowResult {
 /// `missed` item in its feed for the notes that went unread, then more notes go the same
 /// way before it reads. Its one read finds one item covering both rounds; it lists its
 /// collections again, as an app does that may have missed a forgotten key.
-///
-/// Not among [`super::FLOWS`], as [`lagging_app`] isn't.
 ///
 /// Calls: `GET /v1/{id}/feed` with a `missed` item; `GET /v1/{id}/records` again after it.
 ///
@@ -218,7 +237,9 @@ pub async fn missed_item(world: &World) -> FlowResult {
         .await?;
     }
 
-    look(world, "the phone reads at last", &mut phone, &phone_notes).await?;
+    let step = "the phone reads at last";
+    let read = raised(world, step, &mut phone, &phone_notes).await?;
+    expect(&read, "Missed", step)?;
     look(world, "the phone reads once more", &mut phone, &phone_notes).await?;
     Ok(())
 }
@@ -226,10 +247,6 @@ pub async fn missed_item(world: &World) -> FlowResult {
 /// bob's note reaches alice while her phone is her only app. She adds a wallet; then the
 /// signer revokes the phone, which never read the note. No current app can open it any
 /// more: it becomes an `unreadable` item, which the wallet finds in its feed.
-///
-/// The scripted switch writes no `unreadable` item, and an item of the service takes a
-/// `seq`, so every later `seq` of the two runs differs: this flow isn't among
-/// [`super::FLOWS`] either, and its test holds what each switch does.
 ///
 /// Calls: `POST /v1/{id}/apps/{app_id}/revoke` with an entry left without a reader; `GET
 /// /v1/{id}/apps` with an app's unread entries; `GET /v1/{id}/feed` with an `unreadable`
@@ -273,13 +290,9 @@ pub async fn unreadable_after_revoke(world: &World) -> FlowResult {
     );
     world.advance_ms(STEP_MS);
 
-    look(
-        world,
-        "the wallet after the revocation",
-        &mut wallet,
-        &wallet_notes,
-    )
-    .await?;
+    let step = "the wallet after the revocation";
+    let read = raised(world, step, &mut wallet, &wallet_notes).await?;
+    expect(&read, "Unreadable", step)?;
     wallet.fetch_key_bundle().await?;
     world.outcome("the wallet fetched its keys", &app_status(&mut wallet));
     world.advance_ms(STEP_MS);

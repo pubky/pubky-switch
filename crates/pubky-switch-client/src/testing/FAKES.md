@@ -49,20 +49,44 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
 
 - **Durability** (Switch spec 6.5): everything is in memory, answered at once; the service
   key's mark isn't kept. Per-account order is a mutex.
-- **Retention and sweeps** (Switch wire 9.1): entries never expire; `missed` items,
-  checkpoints and dropped stubs exist only when a test scripts them, and a scripted `missed`
-  item (`push_missed`) is shown to every app, where the service shows one only to its app;
-  no app is ever marked lagging (`lagging` is always `false`), so entries always wait for
-  every current target and no `missed` item is written (7.4.4);
-  `unreadable` items exist only when a test scripts them (`push_unreadable`), with an
-  `entry_id` of their own rather than the entry's: a revocation, leave or delivery that
-  leaves an entry with no current target writes none, and the entry stays; claims are
-  deleted only when `GET /claims` finds them deletable; batch records are never dropped, and
-  their proofs go only when a retry finds them past `batch_proofs_ms`.
+- **Waiting reads** (Switch wire 7.4.4 `wait`): the transport of `holding_transport` holds a
+  feed read with `wait` that has nothing to show its app, until the account's sequence
+  grows or the wait has passed. The wait passes by the switch's clock, a test clock that
+  wakes nobody: a held read notices at the next request to the switch or at
+  `release_held_reads`, where the service answers by itself when its time is up. The
+  transport of `transport` holds nothing and answers such a read at once. A `wait` that
+  isn't an integer from 0 to 25 is `400`. A read is held only for a current app of an
+  account that serves it: one that is gone, staged, or otherwise refuses the call answers at
+  once. The read is admitted when it arrives, as at the service: its app is seen then and
+  not again when the read is answered, and its app's lagging mark ends then. The switch's
+  lock isn't held across the wait, and every request to the switch lets the held reads look
+  again. A read held while its app is revoked or leaves is woken and refused `403
+  not_current`, and one held while its account is erased gets the operator's `404`, never a
+  page under the erased account's key (Switch wire 7.4.16). Unlike the service, a held read
+  looks again only for something to show, the erasure and its time: an app whose
+  certificate expires while its read is held is refused once the read is answered, where
+  the service refuses it at the account's next commit; the answer is the same. Faults and
+  the stale-timestamp check apply when the read is answered, not when it arrives.
+  `held_reads` counts the reads held and not woken since they last looked.
+- **Retention and sweeps** (Switch wire 9.1, 7.4.4): an entry goes once every current
+  target that isn't lagging has passed it, as at the service, judged at cursor moves, at
+  appends and at deliveries, revocations and leaves (`keep_passed_entries` turns that off
+  for a test that reads an entry again); entries never expire by time. An app whose unread
+  entries pass its share of the inbox quota (`set_inbox_quota`, 64 MiB unless set) is
+  marked lagging while another current app reads, the mark ending at its feed read or its
+  departure, and it gets a `missed` item for what goes unread, replaced while unpassed; an
+  entry left with no current target at a delivery, revocation or leave becomes an
+  `unreadable` item with the entry's `entry_id`. The quota refuses nothing here: no append
+  is `429 quota_exceeded`, so a full inbox with no app reading, where the service refuses
+  senders, isn't shown. Marks are judged at every such request, the switch's clock being
+  trusted. A scripted `missed` item (`push_missed`) is shown to every app and a scripted
+  `unreadable` item (`push_unreadable`) has an `entry_id` of its own, and both stay
+  whatever the cursors. Checkpoints and dropped stubs exist only when a test scripts them;
+  claims are deleted only when `GET /claims` finds them deletable; batch records are never
+  dropped, and their proofs go only when a retry finds them past `batch_proofs_ms`.
 - **Invite codes**: a revoked app's codes aren't withdrawn (Switch wire 7.4.3 "After a
   revocation"); a code planted for a faulty export never expires.
-- **Lists**: `flagged` is always empty; connect requests are never full. Conversation
-  entries carry no `last_used`, and those the service wrote carry no `context`.
+- **Lists**: `flagged` is always empty; connect requests are never full.
 - **Records**: `divergent` is always `false`.
 - **Directory** (Switch wire 7.4.10): an app is reachable from its first receive key until
   it is revoked or leaves; one that stops being current otherwise, with an expired or
@@ -135,7 +159,7 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   checks, for scripting what another signer or a faulty service did. `forget_delivery_proof`
   makes a retry answer with no proof.
 - **`GET /apps`** (Switch wire 7.4.12), in `switch/signer.rs`: by the service's rules, member
-  by member, but `last_seen`, `unread_entries`, `sole_target_unread` and `recovery` (below):
+  by member, but `last_seen` and `recovery` (below):
   - every app the switch holds, every App ID it keeps for good, and every app the newest
     document lists. An App ID an enrollment named shows `revoked_at` at the enrollment's time;
   - `current` in spec 3.4's sense, as the service reports it, once the app has a record: listed with its certificate, or
@@ -164,11 +188,9 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
     `proof_generations` from the same kept proofs as the delivery, the member left out when
     there are none.
 
-  `unread_entries` and `sole_target_unread` are always 0, where the service counts them over
-  the current targets, expired certificates included; no signer or app code reads them.
-  `lagging` is always false, where the service marks lagging apps (Retention and sweeps,
-  above). The test call `forget_bundle_parts` scripts a faulty service
-  that lost an app's stored parts.
+  `unread_entries`, `sole_target_unread` and `lagging` are counted and set as at the
+  service (Retention and sweeps, above). The test call `forget_bundle_parts` scripts a
+  faulty service that lost an app's stored parts.
 - **Moves and recovery** (Switch spec 12.5, 12.6, Switch wire 10): `import_into` copies the
   account in memory, with no manifest, chunks or export transfer, to serve at the origin the
   freeze names (`import_into_at` names one for a move a test scripts without a freeze); a recovery upload is kept
@@ -177,8 +199,8 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   `revoke`; an app that left is answered as one revoked already, with no proof. `leave` is a
   test call and also a route, `POST /apps/{app_id}/leave`, which checks only that the app
   hasn't departed: it takes any body, departs an app with no record or one whose certificate
-  has expired or isn't listed, keeps the app's invite codes, push registration and inbox
-  entries, and stamps the test clock's time. The service refuses another app's path and the
+  has expired or isn't listed, keeps the app's invite codes and push registration, and
+  stamps the test clock's time. The service refuses another app's path and the
   signer with `403 permission_missing`, where this switch answers `404`, and an app of
   another identity with `403 permission_missing`, where this switch answers `403
   not_admitted` (Switch wire 7.4.12). `request_full_bundle` is a test call for the app's own
