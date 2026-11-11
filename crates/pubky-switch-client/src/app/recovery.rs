@@ -830,11 +830,13 @@ impl App {
             return Ok(());
         }
         let copy = self.lists_copy().await?;
+        // An app with `lists.manage` uploads its contacts even when it holds none: the
+        // upload ends staged admission (Switch spec 12.6 step 2).
         let lists = UploadLists {
-            contacts: if manage { copy.contacts } else { Vec::new() },
+            contacts: manage.then_some(copy.contacts),
             deny: copy.deny,
         };
-        if lists.contacts.is_empty() && lists.deny.is_empty() {
+        if lists.contacts.is_none() && lists.deny.is_empty() {
             return Ok(());
         }
         let upload = RecoveryUpload {

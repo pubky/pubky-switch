@@ -25,6 +25,7 @@ use pubky_switch_core::ops::{
     sign_batch,
 };
 use pubky_switch_core::records::{AppCert, Freeze, IdentityDoc};
+use pubky_switch_core::recovery::{UploadBody, UploadChanges, UploadContext, check_upload};
 use pubky_switch_core::scopes::Permission;
 use pubky_switch_core::sig::SignedDoc;
 use pubky_switch_core::signing::Signs;
@@ -2036,26 +2037,84 @@ impl Inner {
         if self.staged {
             return Ok((200, json!({ "heads": heads, "proofs": proofs })));
         }
+        if let Some(recovery_from) = self.recovery_from {
+            return self.loss_upload(&request.body, caller, recovery_from);
+        }
         let changes = json!({ "records": [], "divergent": [], "claims": [],
                               "divergent_claims": [], "unverified": 0, "distrusted": 0,
                               "refused": 0, "heads": heads,
                               "lists": body.get("lists").is_some() });
-        if self.recovery_from.is_some() {
-            let at = self.now();
-            let proof = self.service_transition(ServiceTransition::Upload {
-                by: caller.unwrap_or_default(),
-                changes: changes.clone(),
-                proofs,
-                at,
-            })?;
-            return Ok((
-                200,
-                json!({ "result": changes, "proof": proof, "head": self.head().to_value() }),
-            ));
-        }
         Ok((
             200,
             json!({ "heads": heads, "proofs": proofs, "merged": changes,
+                    "head": self.head().to_value() }),
+        ))
+    }
+
+    /// An upload after the loss of generation `recovery_from` (Switch wire 7.4.14), checked
+    /// by the core and merged as the service merges it, ending staged admission for
+    /// contacts from an app holding `lists.manage`: one `upload` transition, and `{ result,
+    /// proof, head }`.
+    fn loss_upload(
+        &mut self,
+        body: &[u8],
+        caller: Option<[u8; 16]>,
+        recovery_from: u64,
+    ) -> Result<Answer, ScriptError> {
+        let Some(app) = caller else {
+            return Ok(bad(
+                ErrorCode::PermissionMissing,
+                "an own app uploads",
+                json!(null),
+            ));
+        };
+        let cert = match self.own_call(&app) {
+            Ok(cert) => cert,
+            Err(refusal) => return Ok(batch::refused(&refusal)),
+        };
+        let upload = match UploadBody::parse(body).and_then(|upload| {
+            upload.check_permissions(&cert)?;
+            Ok(upload)
+        }) {
+            Ok(upload) => upload,
+            Err(refusal) => return Ok(batch::refused(&refusal)),
+        };
+        let removed = self
+            .doc
+            .as_ref()
+            .map(|doc| doc.body().removed.clone())
+            .unwrap_or_default();
+        let identity = self.identity.public();
+        let checked = check_upload(
+            &upload,
+            &UploadContext {
+                identity: &identity,
+                recovery_from,
+                removed: &removed,
+            },
+        );
+        let mut changes = UploadChanges {
+            unverified: checked.unverified,
+            distrusted: checked.distrusted,
+            heads: checked.heads,
+            ..UploadChanges::default()
+        };
+        // The transition's `seq`, the next: a record taken from the upload is at it.
+        let (seq, now) = (self.seq + 1, self.now());
+        self.shared
+            .merge_upload(&checked, upload.lists.as_ref(), seq, now, &mut changes);
+        if upload.ends_staged_admission(&cert) {
+            self.admission_staged = false;
+        }
+        let proof = self.service_transition(ServiceTransition::Upload {
+            by: app,
+            changes: changes.to_value(),
+            proofs: checked.proofs,
+            at: now,
+        })?;
+        Ok((
+            200,
+            json!({ "result": changes.to_value(), "proof": proof,
                     "head": self.head().to_value() }),
         ))
     }

@@ -1081,6 +1081,21 @@ fn lists_copy_in(store: &MemoryStore) -> (bool, Option<u64>) {
 /// processed, and kept evidence; then the signer declares generation 1 lost at a new
 /// service, and the old one is gone.
 async fn lost_world(store: Arc<dyn StateStore>) -> Lost {
+    let permissions = [
+        Permission::ListsRead,
+        Permission::ListsManage,
+        Permission::ConversationAdd,
+    ];
+    lost_world_with(store, &permissions, false).await
+}
+
+/// [`lost_world`], the app holding `permissions`, and with `record` a shared record it wrote
+/// before the loss.
+async fn lost_world_with(
+    store: Arc<dyn StateStore>,
+    permissions: &[Permission],
+    record: bool,
+) -> Lost {
     let w = World::new();
     let router = Router::of(&w);
     let protocol = Arc::new(LossProtocol {
@@ -1092,13 +1107,14 @@ async fn lost_world(store: Arc<dyn StateStore>) -> Lost {
         &router,
         store,
         Arc::clone(&protocol) as Arc<dyn Protocol>,
-        &[
-            Permission::ListsRead,
-            Permission::ListsManage,
-            Permission::ConversationAdd,
-        ],
+        permissions,
     )
     .await;
+    if record {
+        let target = crate::app::RecordTarget::new(super::shared_flows::items(), b"key");
+        let value = super::shared_flows::value(&["a"]);
+        app.put_record(&target, &value, vec![]).await.unwrap();
+    }
     let me = app.app_id();
     let carol = IdentityKey::from_secret(seed("carol/identity")).public();
     let dave = IdentityKey::from_secret(seed("dave/identity")).public();
@@ -1500,6 +1516,71 @@ async fn test_new_feed_entry_at_a_stored_entrys_seq_meets_none_of_it() {
     assert!(received(&report.events, seq), "{:?}", report.events);
     // The stored entry is as it was, under its ID.
     assert_eq!(app.state.parked.get(&id), Some(&stored));
+}
+
+#[tokio::test]
+async fn test_loss_upload_merges_the_lists_and_ends_staged_admission() {
+    // The next switch merges the app's record and lists, and its contacts, from an app
+    // holding `lists.manage`, end staged admission (Switch spec 12.6 step 2, wire 7.4.14).
+    let store = Arc::new(MemoryStore::new());
+    let permissions = [Permission::ListsRead, Permission::ListsManage];
+    let lost = lost_world_with(
+        Arc::clone(&store) as Arc<dyn StateStore>,
+        &permissions,
+        true,
+    )
+    .await;
+    let written = lost.w.switch.lock().shared.records.clone();
+    lost.next.lock().admission_staged = true;
+    let (_, events) = follow_loss(&lost, store as Arc<dyn StateStore>)
+        .await
+        .unwrap();
+    assert!(!has(&events, |e| matches!(
+        e,
+        AppEvent::EvidenceRefused { .. }
+    )));
+    let next = lost.next.lock();
+    assert!(!next.admission_staged);
+    // The record written before the loss is taken at the version the lost switch's proof
+    // gave it, with no proof of its own.
+    let (key, before) = written.iter().next().expect("the record");
+    let taken = next.shared.records.get(key).expect("taken");
+    assert_eq!(taken.state, before.state);
+    assert_eq!((taken.uploaded, taken.proof.as_ref()), (Some(true), None));
+    assert!(next.shared.contacts.contains(&lost.carol));
+    assert!(next.shared.deny.contains(&lost.dave));
+}
+
+#[tokio::test]
+async fn test_loss_upload_without_manage_sends_no_contacts() {
+    // An app with `lists.read` alone uploads its deny list and no contacts, which it may not
+    // send (`403` for the whole upload): staged admission stays for the signer to end.
+    let store = Arc::new(MemoryStore::new());
+    let lost = lost_world_with(
+        Arc::clone(&store) as Arc<dyn StateStore>,
+        &[Permission::ListsRead],
+        false,
+    )
+    .await;
+    lost.next.lock().admission_staged = true;
+    let (_, events) = follow_loss(&lost, store as Arc<dyn StateStore>)
+        .await
+        .unwrap();
+    assert!(!has(&events, |e| matches!(
+        e,
+        AppEvent::EvidenceRefused { .. }
+    )));
+    let lists = lost
+        .next
+        .uploads()
+        .into_iter()
+        .find_map(|(body, _)| body.get("lists").cloned())
+        .expect("the lists' upload");
+    assert!(lists.get("contacts").is_none(), "{lists}");
+    let next = lost.next.lock();
+    assert!(next.admission_staged);
+    assert!(next.shared.contacts.is_empty());
+    assert!(next.shared.deny.contains(&lost.dave));
 }
 
 #[tokio::test]

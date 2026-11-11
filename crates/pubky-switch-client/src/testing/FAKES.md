@@ -89,7 +89,8 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
 - **Invite codes**: a revoked app's codes aren't withdrawn (Switch wire 7.4.3 "After a
   revocation"); a code planted for a faulty export never expires.
 - **Lists**: `flagged` is always empty; connect requests are never full.
-- **Records**: `divergent` is always `false`.
+- **Records**: `divergent` is set by divergent uploads after a provider loss and cleared
+  by a write here, as at the service (Recovery uploads, below).
 - **Directory** (Switch wire 7.4.10): an app is reachable from its first receive key until
   it is revoked or leaves; one that stops being current otherwise, with an expired or
   closed certificate, stays reachable, and `apps_version` doesn't move for it.
@@ -169,8 +170,17 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   included, gets `503 staged` at `PUT /peers`, at the inbox and at the directory;
   `POST /recovery/admission` ends it with the `admission` transition's proof, answers no
   proof when it isn't staged, and `404` without a recovery. Unlike the service: a switch
-  made `recovering` doesn't stage admission. Neither ends it at a recovery upload yet: the
-  service serves no upload, and this switch's takes no part in admission.
+  made `recovering` doesn't stage admission. An upload carrying contacts from an app holding
+  `lists.manage` ends it, as at the service.
+- **Recovery uploads after a provider loss** (Switch wire 7.4.14), in `switch.rs`
+  `loss_upload` and `switch/shared.rs` `merge_upload`: the core's checks
+  (`UploadBody::parse`, `check_permissions`, `check_upload`) and merge
+  (`merge_checked_record`, `merge_upload_claim`), as at the service, so the counts and the
+  changes are the service's, one `upload` transition each. Unlike the service: no
+  `uploads_per_app_per_hour` limit, so no `429`; the lists take every entry, with no
+  `max_contacts` or `max_deny`; `max_divergent_uploads` and `max_attempts_per_claim` are the
+  wire's defaults; and `GET /claims` lists whatever entries the switch kept, with no check
+  that a claim holds one at each step.
 - **`GET /apps`** (Switch wire 7.4.12), in `switch/signer.rs`: by the service's rules, member
   by member, but `last_seen` and `recovery` (below):
   - every app the switch holds, every App ID it keeps for good, and every app the newest
@@ -206,8 +216,8 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   faulty service that lost an app's stored parts.
 - **Moves and recovery** (Switch spec 12.5, 12.6, Switch wire 10): `import_into` copies the
   account in memory, with no manifest, chunks or export transfer, to serve at the origin the
-  freeze names (`import_into_at` names one for a move a test scripts without a freeze); a recovery upload is kept
-  and answered with fixed changes, merging nothing.
+  freeze names (`import_into_at` names one for a move a test scripts without a freeze); a recovery upload at a staged
+  service or after a move is kept and answered with fixed changes, merging nothing.
 - **Revocation** is `POST /apps/{app_id}/revoke` from the signer, and the test call
   `revoke`; an app that left is answered as one revoked already, with no proof. `leave` is a
   test call and also a route, `POST /apps/{app_id}/leave`, which checks only that the app
