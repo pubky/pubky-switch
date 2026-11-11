@@ -15,8 +15,12 @@
 //!   one of the wire format's fixed words ([`WORDS`]);
 //! - inside each signed document and each base64url JSON value, the same facts again.
 //!
-//! An error's `message` is for people (Switch wire 7.6) and member order is free (Switch
-//! wire 1.1): neither is kept.
+//! An error's `message` is for people (Switch wire 7.6): it isn't kept.
+//!
+//! Member order is free (Switch wire 1.1), so a reader never depends on it. It is kept all
+//! the same, as a fact of its own per object of an answer's body ([`MEMBER_ORDER`]), so
+//! that where two switches write their members in different orders the allowed list says
+//! so once, instead of the comparison passing over it.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -27,6 +31,7 @@ use pubky_switch_client::transport::{BoxFuture, Request, Response, Transport};
 use pubky_switch_core::enc::unb64;
 use pubky_switch_core::http::header;
 use pubky_switch_core::time::parse_rfc3339;
+use serde::de::{Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde_json::Value;
 
 /// The members whose string value is one of the wire format's fixed words or a name the
@@ -52,6 +57,9 @@ pub const WORDS: [&str; 14] = [
 /// Strings shorter than this are kept by value: no key, hash, signature or ID of the wire
 /// format is this short in text (the shortest, a kid, is 11 characters).
 pub const SHORT: usize = 11;
+
+/// What ends the name of the fact that holds an object's member names in the order written.
+pub const MEMBER_ORDER: &str = " (member order)";
 
 /// The answer headers whose presence is kept (Switch wire 7.1).
 const HEADERS: [&str; 4] = [
@@ -255,6 +263,9 @@ impl Recorder {
             // For people, not for programs (Switch wire 7.6).
             facts.out.remove("body.message");
         }
+        if let Ok(written) = serde_json::from_slice::<Written>(&answer.body) {
+            written.orders("body", facts.out);
+        }
     }
 }
 
@@ -381,6 +392,93 @@ impl Facts<'_> {
     }
 }
 
+/// A JSON value as written: its objects' members in the order of the text, which a
+/// [`Value`] doesn't keep.
+enum Written {
+    Object(Vec<(String, Written)>),
+    Array(Vec<Written>),
+    Other,
+}
+
+impl Written {
+    /// A [`MEMBER_ORDER`] fact for each object with two members or more, found at `at`.
+    fn orders(&self, at: &str, out: &mut BTreeMap<String, String>) {
+        match self {
+            Written::Object(members) => {
+                if members.len() > 1 {
+                    let names: Vec<&str> = members.iter().map(|(name, _)| name.as_str()).collect();
+                    out.insert(format!("{at}{MEMBER_ORDER}"), names.join(", "));
+                }
+                for (name, member) in members {
+                    member.orders(&format!("{at}.{name}"), out);
+                }
+            }
+            Written::Array(items) => {
+                for (index, item) in items.iter().enumerate() {
+                    item.orders(&format!("{at}[{index}]"), out);
+                }
+            }
+            Written::Other => {}
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Written {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct AsWritten;
+
+        impl<'de> Visitor<'de> for AsWritten {
+            type Value = Written;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a JSON value")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Written, A::Error> {
+                let mut members = Vec::new();
+                while let Some(member) = map.next_entry::<String, Written>()? {
+                    members.push(member);
+                }
+                Ok(Written::Object(members))
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Written, A::Error> {
+                let mut items = Vec::new();
+                while let Some(item) = seq.next_element::<Written>()? {
+                    items.push(item);
+                }
+                Ok(Written::Array(items))
+            }
+
+            fn visit_bool<E>(self, _: bool) -> Result<Written, E> {
+                Ok(Written::Other)
+            }
+
+            fn visit_i64<E>(self, _: i64) -> Result<Written, E> {
+                Ok(Written::Other)
+            }
+
+            fn visit_u64<E>(self, _: u64) -> Result<Written, E> {
+                Ok(Written::Other)
+            }
+
+            fn visit_f64<E>(self, _: f64) -> Result<Written, E> {
+                Ok(Written::Other)
+            }
+
+            fn visit_str<E>(self, _: &str) -> Result<Written, E> {
+                Ok(Written::Other)
+            }
+
+            fn visit_unit<E>(self) -> Result<Written, E> {
+                Ok(Written::Other)
+            }
+        }
+
+        deserializer.deserialize_any(AsWritten)
+    }
+}
+
 /// The JSON object `text` carries in base64url, if it carries one.
 fn carried_json(text: &str) -> Option<Value> {
     // The base64url of `{"`.
@@ -478,6 +576,24 @@ mod tests {
             facts.get("body.value").map(String::as_str),
             Some("string of 12")
         );
+    }
+
+    #[test]
+    fn test_member_order_is_kept_as_written_for_each_object() {
+        let text = br#"{"type":"entry","seq":6,"cert":{"sig":"s","body":"b"},"list":[{"b":1,"a":2}],"one":{"only":1}}"#;
+        let written: Written = serde_json::from_slice(text).unwrap();
+        let mut facts = BTreeMap::new();
+        written.orders("body", &mut facts);
+        let fact = |at: &str| facts.get(at).map(String::as_str);
+        assert_eq!(
+            fact("body (member order)"),
+            Some("type, seq, cert, list, one")
+        );
+        assert_eq!(fact("body.cert (member order)"), Some("sig, body"));
+        assert_eq!(fact("body.list[0] (member order)"), Some("b, a"));
+        // One member has no order.
+        assert_eq!(fact("body.one (member order)"), None);
+        assert_eq!(facts.len(), 3);
     }
 
     #[test]

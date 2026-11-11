@@ -17,8 +17,7 @@ use pubky_switch_harness::service::RealSwitch;
 const ORIGIN: &str = "https://switch.example";
 
 /// A service with no account, or `None` when no test database is configured.
-async fn switch() -> Option<RealSwitch> {
-    let clock = Arc::new(TestClock::new(START_MS));
+async fn switch(clock: Arc<TestClock>) -> Option<RealSwitch> {
     RealSwitch::start(ORIGIN, clock, vec![[1; 32]], [2; 32], Limits::default())
         .await
         .expect("a service")
@@ -39,88 +38,59 @@ fn code(answer: &Response) -> String {
     body["code"].as_str().expect("a code").to_owned()
 }
 
+/// One service, asked four things in turn: one test database for them all.
 #[tokio::test]
-async fn test_service_transport_answers_an_unknown_route_as_the_service_does() {
-    let Some(switch) = switch().await else {
+async fn test_service_transport_takes_the_services_own_path() {
+    let clock = Arc::new(TestClock::new(START_MS));
+    let Some(switch) = switch(clock.clone()).await else {
         return;
     };
-    let answer = switch
-        .transport()
-        .send(request("GET", ORIGIN, "/v1/someone/nowhere", Vec::new()))
+    let transport = switch.transport();
+    let ask = |method: &str, origin: &str, path: &str, body: Vec<u8>| {
+        transport.send(request(method, origin, path, body))
+    };
+
+    // No such route: the operator's signed `404` (Switch wire 7.3 step 1).
+    let answer = ask("GET", ORIGIN, "/v1/someone/nowhere", Vec::new())
         .await
         .expect("an answer");
-    // The operator's signed `404` (Switch wire 7.3 step 1).
     assert_eq!((answer.status, code(&answer).as_str()), (404, "not_found"));
     assert!(answer.header(header::SERVICE_SIGNATURE).is_some());
-    assert!(answer.header(header::SERVER_TIME).is_some());
+    assert_eq!(
+        answer.header(header::SERVER_TIME),
+        Some("2026-01-01T00:00:00.000Z")
+    );
     assert_eq!(answer.header("content-type"), Some("application/json"));
-    switch.close().await.expect("closed");
-}
 
-#[tokio::test]
-async fn test_service_transport_refuses_a_body_over_its_cap() {
-    let Some(switch) = switch().await else {
-        return;
-    };
-    // A `GET` takes no body (Switch wire 7.1).
-    let answer = switch
-        .transport()
-        .send(request("GET", ORIGIN, "/v1/someone/feed", vec![b'x']))
+    // A body over its call's cap: a `GET` takes none (Switch wire 7.1).
+    let answer = ask("GET", ORIGIN, "/v1/someone/feed", vec![b'x'])
         .await
         .expect("an answer");
     assert_eq!((answer.status, code(&answer).as_str()), (413, "too_large"));
-    switch.close().await.expect("closed");
-}
 
-#[tokio::test]
-async fn test_service_transport_reaches_only_its_origin() {
-    let Some(switch) = switch().await else {
-        return;
-    };
-    let elsewhere = request(
+    // Another origin: no service there.
+    let error = ask(
         "GET",
         "https://other.example",
         "/v1/someone/feed",
         Vec::new(),
-    );
-    let error = switch
-        .transport()
-        .send(elsewhere)
-        .await
-        .expect_err("no service there");
-    assert!(matches!(error, TransportError::Connect(_)), "{error:?}");
-    switch.close().await.expect("closed");
-}
-
-#[tokio::test]
-async fn test_service_time_follows_the_clock_with_a_fresh_sample() {
-    let clock = Arc::new(TestClock::new(START_MS));
-    let Some(switch) = RealSwitch::start(
-        ORIGIN,
-        clock.clone(),
-        vec![[1; 32]],
-        [2; 32],
-        Limits::default(),
     )
     .await
-    .expect("a service") else {
-        return;
-    };
-    let server_time = |answer: &Response| answer.header(header::SERVER_TIME).map(str::to_owned);
-    let transport = switch.transport();
-    let ask = || transport.send(request("GET", ORIGIN, "/v1/someone/nowhere", Vec::new()));
-    let first = ask().await.expect("an answer");
-    assert_eq!(
-        server_time(&first).as_deref(),
-        Some("2026-01-01T00:00:00.000Z")
-    );
-    // Two days on, past the oldest sample the service trusts: a fresh sample keeps its time.
+    .expect_err("no service there");
+    assert!(matches!(error, TransportError::Connect(_)), "{error:?}");
+
+    // Two days on, past the oldest sample the service trusts: a fresh sample keeps its
+    // time with the clock's.
     clock.advance_ms(2 * 24 * 3_600_000);
     switch.sample_time();
-    let later = ask().await.expect("an answer");
+    let answer = ask("GET", ORIGIN, "/v1/someone/nowhere", Vec::new())
+        .await
+        .expect("an answer");
     assert_eq!(
-        server_time(&later).as_deref(),
+        answer.header(header::SERVER_TIME),
         Some("2026-01-03T00:00:00.000Z")
     );
+
+    drop(transport);
     switch.close().await.expect("closed");
 }

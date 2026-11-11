@@ -16,6 +16,7 @@ pubky-switch = { workspace = true, features = ["test-util"] }
 pubky-switch-client = { workspace = true, features = ["test-support"] }
 pubky-switch-core.workspace = true
 pubky-switch-signer.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true

@@ -8,7 +8,7 @@
 use std::collections::BTreeSet;
 
 use pubky_switch::http::route::route;
-use pubky_switch_harness::allowed::ALLOWED;
+use pubky_switch_harness::allowed::{ALLOWED, EVERY_FLOW};
 use pubky_switch_harness::compare::{differences, judge};
 use pubky_switch_harness::flows::{self, CALLS, FLOWS, ORIGIN, flow_of};
 use pubky_switch_harness::{Backend, Comparison, FlowResult, Trace, World, compare_backends, run};
@@ -82,11 +82,27 @@ async fn test_flows_answer_alike_at_the_service_and_the_scripted_switch() {
 fn test_allowed_differences_name_flows_that_exist() {
     for entry in ALLOWED {
         assert!(
-            FLOWS.iter().any(|(name, _)| *name == entry.flow),
+            entry.flow == EVERY_FLOW || FLOWS.iter().any(|(name, _)| *name == entry.flow),
             "the allowed-differences list names a flow that doesn't exist: {}",
             entry.flow
         );
         assert!(!entry.reason.is_empty() && !entry.reference.is_empty());
+    }
+}
+
+/// An entry for every flow, such as the one for member order, shows in one flow at least:
+/// like a flow's own entries, it can't stay in the list once the difference is gone.
+#[tokio::test]
+async fn test_allowed_differences_for_every_flow_show_in_one() {
+    let Some(all) = comparisons().await else {
+        return;
+    };
+    for entry in ALLOWED.iter().filter(|entry| entry.flow == EVERY_FLOW) {
+        let shows = all.iter().any(|(_, comparison)| {
+            let allowed = comparison.verdict.allowed.iter();
+            allowed.into_iter().any(|(_, used)| *used == entry)
+        });
+        assert!(shows, "no flow shows: {} ({})", entry.fact, entry.reason);
     }
 }
 

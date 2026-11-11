@@ -14,7 +14,7 @@ use crate::compare::Difference;
 /// One accepted difference.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Allowed {
-    /// The flow it shows in.
+    /// The flow it shows in; [`EVERY_FLOW`] for a difference of the two switches as a whole.
     pub flow: &'static str,
     /// The line's label, as [`crate::trace::Line::label`] gives it. `*` stands for any run
     /// of characters, here and in the next three.
@@ -30,6 +30,10 @@ pub struct Allowed {
     /// The clause of the wire format or the line of `FAKES.md` it follows from.
     pub reference: &'static str,
 }
+
+/// In [`Allowed::flow`]: the entry holds in every flow. Such an entry must show in one flow
+/// at least.
+pub const EVERY_FLOW: &str = "*";
 
 /// What stands for a fact one run didn't show.
 pub const NOTHING: &str = "(nothing)";
@@ -75,16 +79,29 @@ const NULL_CURRENT: &str = "The scripted switch writes `current: null` in every 
     has no `current`; the service leaves the member out, as a writer should. A reader takes the \
     two alike.";
 
-/// Every accepted difference, by flow.
-pub static ALLOWED: &[Allowed] = &[Allowed {
-    flow: "join",
-    label: "{alice/wallet} GET /v1/{alice}/apps/{wallet}/keys",
-    fact: "body.current",
-    service: NOTHING,
-    scripted: "null",
-    reason: NULL_CURRENT,
-    reference: "Switch wire, Conventions, \"Absent and null\"; Switch wire 7.1, error bodies",
-}];
+/// Every accepted difference: those of the two switches as a whole, then by flow.
+pub static ALLOWED: &[Allowed] = &[
+    Allowed {
+        flow: EVERY_FLOW,
+        label: "*",
+        fact: "* (member order)",
+        service: "*",
+        scripted: "*",
+        reason: "The service writes an answer's members in the order of the wire format's \
+                 tables and examples; the scripted switch writes them sorted by name. A writer \
+                 may use any order, and no reader depends on it.",
+        reference: "Switch wire 1.1, \"Exact bytes\"",
+    },
+    Allowed {
+        flow: "join",
+        label: "{alice/wallet} GET /v1/{alice}/apps/{wallet}/keys",
+        fact: "body.current",
+        service: NOTHING,
+        scripted: "null",
+        reason: NULL_CURRENT,
+        reference: "Switch wire, Conventions, \"Absent and null\"; Switch wire 7.1, error bodies",
+    },
+];
 
 #[cfg(test)]
 mod tests {
