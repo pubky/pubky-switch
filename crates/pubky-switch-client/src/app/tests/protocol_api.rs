@@ -2564,7 +2564,8 @@ async fn test_scripted_feed_visibility_by_kind_and_currency() {
         adder_cert.app_id(),
     );
     // (what, seq, item type, shown in full to, shown as a stub to)
-    let mut rows: Vec<(&str, u64, &str, Vec<[u8; 16]>, Vec<[u8; 16]>)> = Vec::new();
+    type Apps = Vec<[u8; 16]>;
+    let mut rows: Vec<(&str, u64, &str, Apps, Apps)> = Vec::new();
     // A claim entry: `claims.read`.
     let attempt = |key: [u8; 32]| ClaimOp::attempt(key, 0, ATTEMPT, 3600, None);
     shop.write_claim(attempt(CLAIM), vec![], ObligationDeadline::NoDeadline)
