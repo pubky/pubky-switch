@@ -1345,6 +1345,7 @@ impl Signer {
             limits,
             &self.state.bundle_parts,
             prev,
+            &self.state.picked_distrust(),
         )?)
     }
 

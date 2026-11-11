@@ -394,6 +394,21 @@ impl SignerState {
         });
     }
 
+    /// The `distrust_from` the user picked for each revocation asked for, which the records
+    /// carry for those no version carried out yet (Switch wire 3.12, 3.13).
+    pub(crate) fn picked_distrust(&self) -> Vec<pubky_switch_core::records::RemovedApp> {
+        self.revoking
+            .iter()
+            .filter_map(|r| {
+                r.distrust_from
+                    .map(|distrust_from| pubky_switch_core::records::RemovedApp {
+                        app_id: r.app_id,
+                        distrust_from,
+                    })
+            })
+            .collect()
+    }
+
     /// The records of a new identity, for this install.
     pub(crate) fn new(identity: [u8; 32], install: [u8; 16]) -> Self {
         Self {

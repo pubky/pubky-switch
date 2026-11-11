@@ -2974,3 +2974,46 @@ async fn test_restore_leaves_a_removed_apps_tombstone_alone() {
             .any(|a| matches!(a, Alert::RevocationPending { .. }))
     );
 }
+
+#[tokio::test]
+async fn test_provider_loss_restore_on_a_new_install_keeps_the_picked_distrust_time() {
+    // The time the user picked to distrust a revoked app from goes into the backup with the
+    // pending revocation, so a new install's removal uses it rather than the later
+    // revocation time (Switch wire 3.13, spec 12.2).
+    let world = World::new();
+    let (mut signer, service, router) = lost_with_an_app(&world, notes()).await;
+    let picked = world.clock.now_ms() - 5_000;
+    signer
+        .revoke(notes_app_id(), Some(picked), confirmed())
+        .await
+        .unwrap_err();
+    service.fail_next(Fault::Unreachable {
+        path: "/identity".into(),
+        after: 0,
+    });
+    signer
+        .declare_provider_loss(NEW_ORIGIN, confirmed())
+        .await
+        .unwrap_err();
+    drop(signer);
+    for path in ["/apps", "/identity"] {
+        service.fail_next(Fault::Unreachable {
+            path: path.into(),
+            after: 0,
+        });
+    }
+    let mut restored = restored_from_the_backup(&world, &router).await;
+    restored.resume().await.unwrap();
+    assert!(restored.complete_removals().await.unwrap());
+    revoked_and_removed_at(&world, &service, &router);
+    let held = service.identity_doc().unwrap();
+    assert_eq!(
+        held.body()
+            .removed
+            .iter()
+            .find(|r| r.app_id == notes_app_id())
+            .map(|r| r.distrust_from),
+        Some(picked),
+        "the time the user picked"
+    );
+}

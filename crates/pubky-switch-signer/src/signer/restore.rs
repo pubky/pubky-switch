@@ -359,8 +359,8 @@ impl Signer {
         // A revocation the records named but no version carried out yet: its App ID is a
         // tombstone the document still lists. It is pending again, sent to the switch and
         // completed by the version removing the app, its alert shown meanwhile (Switch spec
-        // 12.2). The time the user may have picked to distrust it from isn't in the records,
-        // so the switch's revocation time is the one it gets.
+        // 12.2). The time the user picked to distrust it from comes with it; records written
+        // without one give it the switch's revocation time.
         for app_id in view
             .revoked_apps
             .iter()
@@ -368,9 +368,14 @@ impl Signer {
             .filter(|app| doc.listed_cert(app).is_some())
         {
             if !state.revoking.iter().any(|r| r.app_id == app_id) {
+                let picked = view
+                    .pending_distrust
+                    .iter()
+                    .find(|p| p.app_id == app_id)
+                    .map(|p| p.distrust_from);
                 state.revoking.push(Revoking {
                     app_id,
-                    distrust_from: None,
+                    distrust_from: picked,
                     revoked_at: None,
                     taken: false,
                 });
