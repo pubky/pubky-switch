@@ -11,10 +11,12 @@
 //! Served so far: `POST /v1/enroll`, `PUT /v1/{id}/identity`, the public
 //! `GET /v1/{id}/identity`, `POST /v1/{id}/ops`, `GET /v1/{id}/feed`,
 //! `POST /v1/{id}/inbox`, `PUT /v1/{id}/peers`, `GET /v1/{id}/claims/{claim_key}`,
-//! `GET /v1/{id}/apps` and
-//! `POST /v1/{id}/apps/{app_id}/revoke`. Every other call is answered `503 unavailable`.
+//! `GET /v1/{id}/apps`, `POST /v1/{id}/apps/{app_id}/revoke`, `GET /v1/{id}/directory`,
+//! and `GET` and `POST /v1/{id}/apps/{app_id}/keys`. Every other call is answered `503
+//! unavailable`.
 
 mod admission;
+mod app_keys;
 mod apps;
 pub mod batch;
 mod claims;
@@ -391,7 +393,9 @@ impl Service {
             | Call::Feed
             | Call::PutPeers
             | Call::Append
-            | Call::Directory => {
+            | Call::Directory
+            | Call::GetKeys(_)
+            | Call::RequestKeys(_) => {
                 match self.authenticate_caller(&account, &request, base_ms, base_ms.max(stamped_ms))
                 {
                     Ok((claimed, cert)) => {
@@ -1051,6 +1055,31 @@ impl Service {
                         &request.route.query,
                         time_ms,
                     )
+                    .map(|answer| (answer, serving))
+                    .map_err(|error| Refused::with_head(error, serving));
+            }
+            Call::GetKeys(app_id) | Call::RequestKeys(app_id) => {
+                // Only the app itself; the signer stores the parts with `key_bundle.put`
+                // (Switch wire 7.4.11).
+                let Some(caller) = writer.as_ref() else {
+                    return Err(Refused::with_head(app_keys::only_that_app(), serving));
+                };
+                let keys_call = if matches!(call, Call::GetKeys(_)) {
+                    app_keys::KeysCall::Read
+                } else {
+                    app_keys::KeysCall::Request
+                };
+                return self
+                    .app_keys(
+                        txn,
+                        signer,
+                        caller,
+                        app_id,
+                        &request.body,
+                        keys_call,
+                        time_ms,
+                    )
+                    .await
                     .map(|answer| (answer, serving))
                     .map_err(|error| Refused::with_head(error, serving));
             }

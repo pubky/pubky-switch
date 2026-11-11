@@ -74,7 +74,10 @@ service.
 - **App currency outside batches**: a feed read is checked as a batch is, for an app that
   delivered its record: current, with an unexpired certificate, the stored renewed one once
   the newest `identity.json` lists it (Switch wire 7.2, 3.8). Other routes check only that
-  the app hasn't departed.
+  the app hasn't departed, but for the key bundle routes (`GET` and `POST
+  /apps/{app_id}/keys`), which check nothing of the app's standing, take any body, and answer
+  `404` ("no route") for another app's path or the signer, where the service answers `403
+  permission_missing` (Switch wire 7.4.11).
 - **`POST /v1/enroll`** (Switch wire 3.7, 7.4.1), in `switch/signer.rs`: only at
   [`SWITCH_ORIGIN`], with the default limits unless a test sets others
   (`set_enroll_limits`), and without checking the request signature. A
@@ -155,10 +158,10 @@ service.
 ## Signer flows tested only here
 
 These signer flows run only against the scripted switch, whose `GET /apps` follows the
-service's rules (above). The service in this workspace serves `GET /apps`, but not yet
-`POST /apps/{app_id}/leave`, `POST /apps/{app_id}/keys` or `GET /apps/{app_id}/keys`, which
-departures, full-bundle requests and reading the stored parts need. Re-run them against the
-service once it serves those calls:
+service's rules (above). The service in this workspace serves `GET /apps` and `GET` and
+`POST /apps/{app_id}/keys`, but not yet `POST /apps/{app_id}/leave`, which departures need.
+Re-run them against the service once it serves that call; the full-bundle requests and reading
+the stored parts can run against it now:
 
 - approval, renewals and reductions, their closings, and epoch completion
   (`crates/pubky-switch-signer/tests/approval.rs`, `renewal.rs`);
