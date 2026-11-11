@@ -18,9 +18,14 @@ fn print(title: &str, trace: &Trace, facts: bool) {
         return;
     }
     for (index, line) in trace.lines.iter().enumerate() {
+        let fault = line
+            .facts
+            .get("fault")
+            .map(|fault| format!(" ({fault})"))
+            .unwrap_or_default();
         match line.facts.get("status") {
-            Some(status) => println!("{index:3} {} -> {status}", line.label),
-            None => println!("{index:3} {}", line.label),
+            Some(status) => println!("{index:3} {} -> {status}{fault}", line.label),
+            None => println!("{index:3} {}{fault}", line.label),
         }
     }
 }

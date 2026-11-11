@@ -19,7 +19,7 @@ use pubky_switch_client::testing::{
 use pubky_switch_client::transport::{BoxFuture, Request, Response, Transport};
 use pubky_switch_core::enc::zbase32_encode;
 use pubky_switch_core::http::header;
-use pubky_switch_core::keys::AppKeys;
+use pubky_switch_core::keys::{AppKeys, IdentityKey};
 use pubky_switch_signer::{
     AddOutcome, Homeserver, IdentityKeyring, IdentitySecret, Protocols, SecretVault, SignerEnv,
     VaultError,
@@ -27,8 +27,9 @@ use pubky_switch_signer::{
 use serde_json::Value;
 
 use crate::HarnessError;
+use crate::check::Checker;
 use crate::service::{RealSwitch, database_configured};
-use crate::trace::{Names, Recorder, Trace};
+use crate::trace::{Fault, Names, Recorder, Trace};
 
 /// The seed of the operator key every switch of a world signs with where it can't tie an
 /// answer to an account (Switch wire 7.1): the scripted switch's fixed one.
@@ -55,6 +56,7 @@ pub struct World {
     files: Arc<TestHomeserver>,
     router: Arc<Router>,
     recorder: Arc<Recorder>,
+    checker: Arc<Checker>,
     names: Arc<Names>,
     services: Mutex<Vec<RealSwitch>>,
     scripted: Mutex<Vec<Arc<ScriptedSwitch>>>,
@@ -80,9 +82,12 @@ impl World {
         }
         let names = Arc::new(Names::default());
         let router = Arc::new(Router::new());
+        let checker = Arc::new(Checker::default());
+        checker.operator(IdentityKey::from_secret(OPERATOR_SECRET).public());
         let recorder = Arc::new(Recorder::new(
             router.clone() as Arc<dyn Transport>,
             names.clone(),
+            checker.clone(),
         ));
         Ok(Some(Self {
             backend,
@@ -91,6 +96,7 @@ impl World {
             files: Arc::new(TestHomeserver::new()),
             router,
             recorder,
+            checker,
             names,
             services: Mutex::new(Vec::new()),
             scripted: Mutex::new(Vec::new()),
@@ -141,6 +147,15 @@ impl World {
         origin: &str,
         identities: &[&TestIdentity],
     ) -> Result<(), HarnessError> {
+        // Each account's answers are verified with the service key of its identity's seed
+        // (an Ed25519 key, as an identity key is).
+        for identity in identities {
+            self.checker.account(
+                &identity.key().id(),
+                identity.public(),
+                IdentityKey::from_secret(identity.service_secret()).public(),
+            );
+        }
         match self.backend {
             Backend::Service => {
                 let switch = RealSwitch::start(
@@ -263,6 +278,35 @@ impl World {
     /// that a switch answering differently is noticed where the client itself accepts it.
     pub fn distort(&self, distort: impl Fn(&Request, &mut Response) + Send + Sync + 'static) {
         self.recorder.distort(distort);
+    }
+
+    /// Lose the answer to the next `method` request whose path contains `path`: the switch
+    /// takes the request and answers, and the caller sees a timeout.
+    pub fn lose_answer(&self, method: &str, path: &str) {
+        self.recorder.fail_next(Fault::LoseAnswer {
+            method: method.to_owned(),
+            path: path.to_owned(),
+        });
+    }
+
+    /// Make the switch unreachable for the next `method` request whose path contains
+    /// `path`: nothing is applied, and the caller fails to connect.
+    pub fn unreachable(&self, method: &str, path: &str) {
+        self.unreachable_after(method, path, 0);
+    }
+
+    /// As [`World::unreachable`], once `after` matching requests went through.
+    pub fn unreachable_after(&self, method: &str, path: &str, after: usize) {
+        self.recorder.fail_next(Fault::Unreachable {
+            method: method.to_owned(),
+            path: path.to_owned(),
+            after,
+        });
+    }
+
+    /// The faults asked for that no request has met yet.
+    pub fn faults_left(&self) -> usize {
+        self.recorder.faults_left()
     }
 
     /// A request no key signs, as any reader of the network sends it: `method path` at

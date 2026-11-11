@@ -176,7 +176,7 @@ impl Signer {
         // its backup is owed, and written by `resume` once the delivery has won (Switch wire
         // 3.13).
         let key = self.signing_key()?;
-        let (next, flow) = self.next_version(&key, |_| {})?;
+        let (next, flow) = self.next_version_closing(&key, |_| {})?;
         drop(key);
         let Flow::Deliver {
             doc: signed, prev, ..

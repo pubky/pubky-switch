@@ -12,6 +12,8 @@
 //! - [`trace`]: what a run showed, in a form two runs with different keys can be compared
 //!   in.
 //! - [`compare`]: the differences between two runs, judged against the list in [`allowed`].
+//! - [`check`]: what the harness verifies itself of every answer of either switch: the
+//!   answer's signature, each head, chain stub, feed item and transition proof.
 //!
 //! [`compare_backends`] runs one flow in both worlds and gives the verdict. A flow's test
 //! fails when the scripted switch answers differently from the service anywhere the allowed
@@ -19,8 +21,17 @@
 //!
 //! Tests of a faulty or hostile switch stay on the scripted switch, which can roll back, lie
 //! and lose answers; the service can't.
+//!
+//! # What agreement means
+//!
+//! Two runs that agree made the same calls and got answers alike in every fact [`trace`]
+//! keeps, and every check of [`check`] held in both. That is not byte equality, and not a
+//! proof that either switch is right: a hash or signature a switch makes itself and gets
+//! wrong consistently reads alike in both runs, and is caught only where [`check`], the
+//! client or the signer verifies it ([`check`] lists what it covers and what it leaves).
 
 pub mod allowed;
+pub mod check;
 pub mod compare;
 pub mod flows;
 pub mod parties;
