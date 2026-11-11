@@ -410,11 +410,12 @@ fn key_bundle_put(
                     seq: part.seq,
                 })
                 .collect();
-            // Unless a full bundle was requested, the parts the target's cursor has passed and
-            // that its `keys_through` covers go: it holds their keys (Switch wire 6.2). A
-            // request this part completes still keeps them now, since the app asked for them
-            // and hasn't read the parts that complete it. The part just stored is past every
-            // cursor, so it stays.
+            // Unless a full bundle is requested, the parts the target's cursor has passed and
+            // that its `keys_through` covers go: it holds their keys (Switch wire 6.2). The
+            // request is judged pending as it was before this part, so a request this part
+            // completes still keeps them at this put: the app asked for them and hasn't read
+            // the parts that complete it. The part just stored is past every cursor, so it
+            // stays.
             let full = state
                 .apps
                 .get(&target)
