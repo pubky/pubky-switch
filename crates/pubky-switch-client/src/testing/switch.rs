@@ -381,61 +381,55 @@ pub(crate) fn bad(code: ErrorCode, message: &str, current: Value) -> Answer {
 }
 
 /// Who may read a chain item in full (Switch wire 7.5, "Who may read a chain item in
-/// full"); every other own app gets its stub.
+/// full"); every other own app gets its stub. Taken when the item is appended; whether the
+/// item's document is still the current one is judged when a page is read, from the
+/// switch's state then, as the service does: a superseded document shows as a stub to
+/// every app.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Readers {
-    /// Every own app: `identity.json` deliveries, `app.put`, `receive_key.put`,
-    /// `cert.put`, and service transitions other than `conversation.add`.
+    /// Every own app: `identity.json` deliveries, `receive_key.put`, and service
+    /// transitions other than `conversation.add`.
     Every,
-    /// The target app only: a `key_bundle.put`.
-    App([u8; 16]),
     /// Apps holding this switch permission: `lists.read` for `allow.*`, `deny.*` and the
     /// service's `conversation.add`.
     Permission(Permission),
-    /// Apps with `claims.read`, while the claim is held: an entry of a compacted claim
-    /// (SETTLED with every attempt `done` or `failed`) loses its document, and every app
-    /// gets its stub (Switch wire 6.8 "Tombstones", 7.5).
-    Claim(Vec<u8>),
     /// Apps with `lists.read` or `conversation.add`: `invite_code.*`.
     ListsOrConversation,
-    /// Apps holding the record's read scope: a `record.put`.
-    Scope(String),
+    /// Apps with `claims.read`, while the entry belongs to the claim held at this key and
+    /// that claim isn't a tombstone: a compacted or deleted claim's entries show as stubs
+    /// to every app (Switch wire 6.8 "Tombstones").
+    Claim(Vec<u8>),
+    /// Apps holding the read scope of the record at this key, while the item is its
+    /// current write: a `record.put`.
+    Record([u8; 32]),
+    /// The target app only, while the part is stored: a `key_bundle.put`.
+    Bundle([u8; 16]),
+    /// Every own app, while the writing app holds this record: an `app.put`. One without
+    /// a writing app shows as a stub.
+    AppRecord(Option<[u8; 16]>, SignedDoc),
+    /// Every own app, while the target holds this renewed certificate, neither replaced nor
+    /// carried by its record: a `cert.put`.
+    RenewedCert([u8; 16], SignedDoc),
 }
 
 impl Readers {
-    /// The readers of an operation of `kind`.
-    pub(crate) fn of_op(kind: &OpKind) -> Self {
+    /// The readers of an operation of `kind` written by `app_id` (`None` for the signer).
+    pub(crate) fn of_op(kind: &OpKind, app_id: Option<&[u8; 16]>) -> Self {
         match kind {
             OpKind::Claim(fields) => Self::Claim(fields.claim_key.clone()),
-            OpKind::RecordPut(put) => Self::Scope(put.policy.read_scope.clone()),
+            OpKind::RecordPut(put) => Self::Record(put.key),
             OpKind::AllowPut { .. }
             | OpKind::AllowDelete { .. }
             | OpKind::DenyPut { .. }
             | OpKind::DenyDelete { .. } => Self::Permission(Permission::ListsRead),
             OpKind::InviteCodePut(_) | OpKind::InviteCodeDelete { .. } => Self::ListsOrConversation,
-            OpKind::KeyBundlePut(put) => Self::App(put.target_app_id),
-            _ => Self::Every,
-        }
-    }
-
-    /// Whether `app`, with certificate `cert`, reads the item in full; `compacted` says
-    /// whether a claim is compacted, by its key.
-    fn read_by(
-        &self,
-        app: [u8; 16],
-        cert: Option<&AppCert>,
-        compacted: impl Fn(&[u8]) -> bool,
-    ) -> bool {
-        let holds = |permission| cert.is_some_and(|c| c.has_permission(permission));
-        match self {
-            Self::Every => true,
-            Self::Claim(key) => holds(Permission::ClaimsRead) && !compacted(key),
-            Self::App(target) => *target == app,
-            Self::Permission(permission) => holds(*permission),
-            Self::ListsOrConversation => {
-                holds(Permission::ListsRead) || holds(Permission::ConversationAdd)
-            }
-            Self::Scope(scope) => cert.is_some_and(|c| c.holds_scope(scope)),
+            OpKind::AppPut { record } => Self::AppRecord(app_id.copied(), record.clone()),
+            OpKind::ReceiveKeyPut { .. } => Self::Every,
+            OpKind::KeyBundlePut(put) => Self::Bundle(put.target_app_id),
+            OpKind::CertPut {
+                target_app_id,
+                cert,
+            } => Self::RenewedCert(*target_app_id, cert.clone()),
         }
     }
 }
@@ -1017,8 +1011,9 @@ impl ScriptedSwitch {
     }
 
     /// Chain an operation without checking it, as a faulty service does, and store a key
-    /// bundle part it carries; nothing else is applied. For tests of what an app does with
-    /// an item a compliant switch refuses.
+    /// bundle part or a renewed certificate it carries, so the feed shows it in full to its
+    /// readers; nothing else is applied. For tests of what an app does with an item a
+    /// compliant switch refuses.
     #[cfg(test)]
     pub(crate) fn chain_unchecked(
         &self,
@@ -1044,6 +1039,14 @@ impl ScriptedSwitch {
                 let parts = inner.bundles.entry(put.target_app_id).or_default();
                 parts.push((put.clone(), seq));
             }
+            if let OpKind::CertPut {
+                target_app_id,
+                cert,
+            } = &body.kind
+            {
+                let renewed = AppCert::verify(cert, &account)?;
+                inner.apps.entry(*target_app_id).or_default().renewed = Some(renewed);
+            }
             let object = body
                 .kind
                 .proof_object(body.app_id.as_ref())
@@ -1055,7 +1058,7 @@ impl ScriptedSwitch {
                 Some(body.batch),
                 &object,
                 &ProofState::Deny { denied: false },
-                Readers::of_op(&body.kind),
+                Readers::of_op(&body.kind, body.app_id.as_ref()),
             )?;
         }
         Ok(inner.seq)
@@ -1301,7 +1304,13 @@ impl Inner {
         let state = ProofState::Service(transition.to_value());
         let readers = match transition {
             ServiceTransition::ConversationAdd { .. } => Readers::Permission(Permission::ListsRead),
-            _ => Readers::Every,
+            ServiceTransition::Revoke { .. }
+            | ServiceTransition::Leave { .. }
+            | ServiceTransition::Freeze { .. }
+            | ServiceTransition::Unfreeze { .. }
+            | ServiceTransition::Recovery { .. }
+            | ServiceTransition::Admission { .. }
+            | ServiceTransition::Upload { .. } => Readers::Every,
         };
         self.chain_item(
             ItemType::Service,
@@ -1541,6 +1550,52 @@ impl Inner {
         (200, page)
     }
 
+    /// Whether own app `app`, checked against `cert`, reads chain item `seq` in full: it is
+    /// among the item's `readers`, and the item's document is still the current one (Switch
+    /// wire 7.5).
+    fn reads_in_full(
+        &self,
+        readers: &Readers,
+        seq: u64,
+        app: [u8; 16],
+        cert: Option<&AppCert>,
+    ) -> bool {
+        let holds = |permission| cert.is_some_and(|c| c.has_permission(permission));
+        match readers {
+            Readers::Every => true,
+            Readers::Permission(permission) => holds(*permission),
+            Readers::ListsOrConversation => {
+                holds(Permission::ListsRead) || holds(Permission::ConversationAdd)
+            }
+            Readers::Claim(key) => {
+                holds(Permission::ClaimsRead)
+                    && <[u8; 32]>::try_from(key.as_slice())
+                        .is_ok_and(|key| self.shared.claim_entry_current(&key, seq))
+            }
+            Readers::Record(key) => self.shared.records.get(key).is_some_and(|held| {
+                held.seq == seq
+                    && cert.is_some_and(|c| c.holds_scope(&held.state.policy.read_scope))
+            }),
+            Readers::Bundle(target) => {
+                *target == app
+                    && self
+                        .bundles
+                        .get(target)
+                        .is_some_and(|parts| parts.iter().any(|(_, at)| *at == seq))
+            }
+            Readers::AppRecord(writer, record) => writer.is_some_and(|writer| {
+                self.apps
+                    .get(&writer)
+                    .is_some_and(|held| held.record.as_ref() == Some(record))
+            }),
+            Readers::RenewedCert(target, renewed) => self
+                .apps
+                .get(target)
+                .and_then(|held| held.renewed.as_ref())
+                .is_some_and(|held| held.signed() == renewed),
+        }
+    }
+
     /// An entry ID for the item at `seq`: its low byte, repeated.
     fn entry_id(seq: u64) -> String {
         b64(&[seq.to_le_bytes()[0]; 16])
@@ -1582,15 +1637,7 @@ impl Inner {
                 if *seq <= self.dropped_through {
                     return None;
                 }
-                let compacted = |key: &[u8]| {
-                    <[u8; 32]>::try_from(key).is_ok_and(|key| {
-                        self.shared
-                            .claims
-                            .get(&key)
-                            .is_some_and(|claim| claim.tombstone)
-                    })
-                };
-                if !readers.read_by(app, cert, compacted) {
+                if !self.reads_in_full(readers, *seq, app, cert) {
                     return Some(json!({ "type": "stub", "seq": seq, "stub": stub.to_value() }));
                 }
                 let mut value = json!({ "type": "chain", "seq": seq, "stub": stub.to_value(),

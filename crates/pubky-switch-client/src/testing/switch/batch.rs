@@ -286,7 +286,7 @@ impl Inner {
                 Some(body.batch),
                 &object,
                 &state,
-                Readers::of_op(&body.kind),
+                Readers::of_op(&body.kind, body.app_id.as_ref()),
             )?;
             let written = Written {
                 op,
@@ -480,7 +480,7 @@ impl Inner {
     }
 
     /// `app.put`, by [`check_app_put`]; a stored record changes the directory (Switch wire
-    /// 7.4.10).
+    /// 7.4.10), and drops a renewed certificate it now carries (Switch wire 3.8).
     fn app_put(
         &self,
         draft: &mut Draft,
@@ -498,6 +498,14 @@ impl Inner {
         let listed = self.doc.as_ref().and_then(|doc| doc.listed_cert(&app));
         if check_app_put(&app, &new, listed, held.as_ref())? != AppPutEffect::Unchanged {
             let entry = draft.apps.entry(app).or_default();
+            // A record that carries the stored renewed certificate drops it (Switch wire 3.8).
+            if entry
+                .renewed
+                .as_ref()
+                .is_some_and(|renewed| renewed.signed() == new.cert().signed())
+            {
+                entry.renewed = None;
+            }
             entry.record = Some(record.clone());
             entry.record_at = Some(self.now());
             entry.cert = Some(new.cert().clone());

@@ -84,11 +84,11 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   and keep nothing for it; they don't check the certificate's expiry (the service answers
   `403 cert_expired`), take any body, and answer `404` ("no route") for another app's path or
   the signer, where the service answers `403 permission_missing` (Switch wire 7.4.11).
-- **`POST /v1/enroll`** (Switch wire 3.7, 7.4.1), in `switch/signer.rs`: only at
-  [`SWITCH_ORIGIN`], with the default limits unless a test sets others
-  (`set_enroll_limits`), and without checking the request signature. A
-  switch made with `unenrolled` answers every other call with the operator's `404` until
-  then. As at the service, the enrollment that makes the account sets its kept App IDs, and
+- **`POST /v1/enroll`** (Switch wire 3.7, 7.4.1), in `switch/signer.rs`: at the switch's
+  origin, [`SWITCH_ORIGIN`] unless it was made with `unenrolled_at`, with the default limits
+  unless a test sets others (`set_enroll_limits`), and without checking the request
+  signature. A switch made with `unenrolled` or `unenrolled_at` answers every other call
+  with the operator's `404` until then. As at the service, the enrollment that makes the account sets its kept App IDs, and
   every later one gets the same key and changes nothing. Unlike the service:
   - an enrollment's `identity_doc` isn't held, so the account starts with no document and
     at the switch's own generation, whatever the enrollment names;
