@@ -907,3 +907,98 @@ fn test_recovery_changes_refuse_a_malformed_object() {
     value.as_object_mut().unwrap().remove("heads");
     assert!(UploadChanges::from_value(&value).is_err());
 }
+
+// The merge's edges, from #127's review.
+
+const OP3: [u8; 32] = [33; 32];
+
+fn proved(generation: u64, seq: u64) -> UploadVersion {
+    UploadVersion::proved(v(generation, seq))
+}
+
+#[test]
+fn test_recovery_record_kept_divergent_proved_above_the_record_is_unchanged() {
+    // A kept divergent operation, now with a proof above the current record, is that
+    // operation again: unchanged, also against a record written here.
+    let kept = [OP2];
+    let held = held_upload(OP1, v(3, 10), bound(3, v(3, 10)), &kept);
+    let again = upload(OP2, v(3, 10), proved(3, 90));
+    assert_eq!(merge_record(&held, &again, 8), RecordMerge::Unchanged);
+    let written = written_on(Some((v(3, 11), OP1)), &kept);
+    assert_eq!(merge_record(&written, &again, 8), RecordMerge::Unchanged);
+}
+
+#[test]
+fn test_recovery_record_two_creates_are_on_one_base() {
+    // Two creates at one key both build on {0, 0}: one base, so divergent, even when the
+    // record was deleted and created again at the lost service, op1 being op3's history.
+    let held = held_upload(OP3, RecordVersion::NONE, proved(3, 12), &[]);
+    let first = upload(OP1, RecordVersion::NONE, proved(3, 5));
+    assert_eq!(merge_record(&held, &first, 8), KEPT);
+}
+
+#[test]
+fn test_recovery_record_bases_of_two_generations_are_two() {
+    // Bases that differ only by generation aren't one base.
+    let held = held_upload(OP1, v(3, 10), proved(3, 50), &[]);
+    for version in [proved(2, 11), bound(3, v(2, 10))] {
+        let other = upload(OP2, v(2, 10), version);
+        assert_eq!(merge_record(&held, &other, 8), RecordMerge::Unchanged);
+    }
+}
+
+#[test]
+fn test_recovery_record_a_fork_of_a_replaced_upload_depends_on_the_order() {
+    // Held op3, built on op1's (3, 50): op2, a fork of op1 on (3, 10), is older and not on
+    // op3's base, so unchanged. In the other order, op1 then op2 then op3, op2 is kept
+    // divergent and op3 still replaces op1.
+    let held = held_upload(OP3, v(3, 50), proved(3, 60), &[]);
+    let fork = upload(OP2, v(3, 10), bound(3, v(3, 10)));
+    assert_eq!(merge_record(&held, &fork, 8), RecordMerge::Unchanged);
+    let first = held_upload(OP1, v(3, 10), proved(3, 50), &[]);
+    assert_eq!(merge_record(&first, &fork, 8), KEPT);
+    let kept = [OP2];
+    let then = held_upload(OP1, v(3, 10), proved(3, 50), &kept);
+    let last = upload(OP3, v(3, 50), proved(3, 60));
+    assert_eq!(merge_record(&then, &last, 8), RecordMerge::Replace);
+}
+
+#[test]
+fn test_recovery_record_a_linear_history_is_never_divergent() {
+    // op1 on (3, 10) at seq 50, op3 on (3, 50) at seq 60, each with or without its proof,
+    // in any order.
+    let ops = [
+        (OP1, v(3, 10), proved(3, 50)),
+        (OP1, v(3, 10), bound(3, v(3, 10))),
+        (OP3, v(3, 50), proved(3, 60)),
+        (OP3, v(3, 50), bound(3, v(3, 50))),
+    ];
+    for (held_op, held_on, held_version) in ops {
+        for (op, on, version) in ops {
+            let held = held_upload(held_op, held_on, held_version, &[]);
+            let merge = merge_record(&held, &upload(op, on, version), 8);
+            assert!(
+                !matches!(merge, RecordMerge::Divergent { .. }),
+                "{held_op:?}/{held_version:?} vs {op:?}/{version:?}: {merge:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_recovery_claim_a_foreign_proof_leaves_the_writer_rules() {
+    // A proof of another claim key on a held attempt: the writer rules apply as without
+    // one, so a `failed` from an app other than the owner is refused; with its own claim's
+    // proof it applies.
+    let held = claim_with(vec![attempt_of(1, WALLET, Outcome::Open)]);
+    let mut failed = up(entry(1, 1, EntryKind::Failed), PHONE);
+    failed.proof = Some(EntryProof {
+        at: NOW - 50,
+        view: held.view(&[8; 32], NOW - 50, &|_| true),
+    });
+    let merge = merge_claim(Some(&held), &[failed.clone()], NOW, 64);
+    assert_eq!((merge.refused, merge.changed), (1, false));
+    failed.proof = Some(proof_of(&held, NOW - 50));
+    let merge = merge_claim(Some(&held), &[failed], NOW, 64);
+    assert_eq!(merge.claim.unwrap().attempts[0].outcome, Outcome::Failed);
+}
