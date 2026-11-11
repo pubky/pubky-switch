@@ -224,6 +224,28 @@ pub(crate) struct SignerState {
     /// find the service (Switch spec 12.6 step 1).
     #[serde(default)]
     pub(crate) revoke_at_service: bool,
+    /// Some version of the identity was published on the Homeserver, by this install or,
+    /// for records restored or received, by the install they came from (Switch spec 4.3). A
+    /// missing `identity.json` is explained without it only by an erasure (Switch spec 12.6
+    /// step 1). Records kept before this was are taken as published.
+    #[serde(default = "published_before")]
+    pub(crate) ever_published: bool,
+    /// The service the recovery in progress last went to, for its status (Switch spec 12.6
+    /// step 1).
+    #[serde(default)]
+    pub(crate) recovery_origin: Option<String>,
+    /// Each service an earlier declaration of the recovery in progress enrolled at, with
+    /// the key its enrollment answered: declared again there, the signer reads under that
+    /// key whether the earlier version was taken, since a service that took it answers
+    /// another enrollment with a pending key, and the version's refusal with the first
+    /// (Switch wire 3.7, 7.4.2).
+    #[serde(default)]
+    pub(crate) recovery_services: Vec<Service>,
+    /// The recovery's version that a service took names another install: a restore's, from
+    /// a backup written mid-recovery. This install signs the next version naming itself, as
+    /// a restore does (Switch wire 3.13).
+    #[serde(default)]
+    pub(crate) owes_own_version: bool,
     /// The staged admission a recovery started is the signer's to end (Switch spec 12.6 step
     /// 2): none of the listed apps holds `lists.manage`, or the user asked. `POST
     /// /recovery/admission` is owed, sent again at every run, after publication, until `GET
@@ -328,6 +350,11 @@ pub(crate) struct PendingClaim {
     pub(crate) plaintext: Vec<u8>,
 }
 
+/// Records kept before `ever_published` was are taken as published.
+fn published_before() -> bool {
+    true
+}
+
 /// The certificate lifetime of records written before it was kept: the default.
 fn default_cert_lifetime() -> u64 {
     DEFAULT_CERT_LIFETIME_MS
@@ -408,6 +435,10 @@ impl SignerState {
             lost_generation: None,
             homeserver_copy_waived: false,
             revoke_at_service: false,
+            ever_published: false,
+            recovery_origin: None,
+            recovery_services: Vec::new(),
+            owes_own_version: false,
             admission_owed: false,
         }
     }

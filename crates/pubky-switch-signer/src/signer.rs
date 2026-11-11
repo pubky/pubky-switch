@@ -329,6 +329,12 @@ impl Signer {
                 state.revoke_at_service = false;
                 self.commit(state, self.flow.clone()).await?;
             }
+            // A restore's recovery taken after the restore: the version naming this install
+            // comes next, as the restore would have signed it (Switch wire 3.13).
+            if self.state.owes_own_version && gate::refusal(&self.state).is_none() {
+                self.sign_own_version().await?;
+                continue;
+            }
             // While a hand-over is in progress nothing routine is signed: its own step only,
             // and owed work stays owed (Switch wire 3.12).
             if self.state.handing_over.is_some() {
@@ -357,7 +363,13 @@ impl Signer {
                 // The end of a staged admission comes last, after publication, which is how
                 // apps find the new service: it stays owed, and is sent again at the next
                 // run, without holding any other step back (Switch spec 12.6 step 2).
-                if self.state.admission_owed && self.end_owed_admission().await.is_err() {
+                // Only once published: a version waiting for an alarm to be cleared waits
+                // with it (Switch wire 7.4.14).
+                let published = self.state.newest.as_ref().is_some_and(|n| n.published);
+                if published
+                    && self.state.admission_owed
+                    && self.end_owed_admission().await.is_err()
+                {
                     let mut state = self.state.clone();
                     state.alert(Alert::AdmissionNotEnded);
                     if state != self.state {
@@ -438,7 +450,11 @@ impl Signer {
         if self.state.recovering && gate::recovery_refusal(&self.state).is_none() {
             let origin = match &self.flow {
                 Some(Flow::Recover { origin, .. }) => Some(origin.clone()),
-                _ => self.state.service.as_ref().map(|s| s.origin.clone()),
+                _ => self
+                    .state
+                    .recovery_origin
+                    .clone()
+                    .or_else(|| self.state.service.as_ref().map(|s| s.origin.clone())),
             }
             .unwrap_or_default();
             return match self.flow {
@@ -1326,6 +1342,18 @@ impl Signer {
                 current,
                 ..
             }) => self.stale(&current, doc, prev).await,
+            // A refusal the pinned key didn't sign, while recovering at a service an earlier
+            // declaration enrolled at: one that took that version answers under the key it
+            // serves, so it is read under that key (Switch wire 3.7, 7.4.2).
+            Err(error @ ClientError::BadServiceSignature { status: 409 })
+                if self.state.recovering =>
+            {
+                let origin = self.service()?.origin;
+                if self.taken_under_an_earlier_key(&origin, true).await? {
+                    return Ok(());
+                }
+                Err(error.into())
+            }
             Err(
                 error @ ClientError::Switch {
                     status: 400 | 413, ..
@@ -1456,7 +1484,7 @@ impl Signer {
     /// install signed: its own, declaring the same generation lost, at a version it spent
     /// (Switch spec 12.6 step 1). An earlier declaration's version the service took, its
     /// answer lost.
-    fn own_recovery_version(&self, copy: &IdentityDoc) -> bool {
+    pub(super) fn own_recovery_version(&self, copy: &IdentityDoc) -> bool {
         self.state.recovering
             && copy.body().signer == self.state.install
             && copy.body().recovery_from.is_some()
@@ -1465,25 +1493,19 @@ impl Signer {
     }
 
     /// The service holds `copy`, a version of the recovery in progress ([`Signer::
-    /// own_recovery_version`]): naming that service, it is the recovery's version delivered,
-    /// as its answer would have said, under the key it names. Naming another, it was taken
-    /// elsewhere and this delivery is over: the recovery waits to be declared again. Never
-    /// records behind: this install signed it for this recovery.
-    async fn own_recovery_held(&mut self, copy: IdentityDoc) -> Result<()> {
-        let names_it = self
-            .state
-            .service
-            .as_ref()
-            .is_some_and(|service| service.origin == copy.inbox().url);
+    /// own_recovery_version`]): naming that service and the key pinned for it, the one its
+    /// answer verified with, it is the recovery's version delivered, as its answer would have
+    /// said. Naming another, it was taken elsewhere and this delivery is over: the recovery
+    /// waits to be declared again. Never records behind: this install signed it for this
+    /// recovery.
+    pub(super) async fn own_recovery_held(&mut self, copy: IdentityDoc) -> Result<()> {
+        let names_it = self.state.service.as_ref().is_some_and(|service| {
+            service.origin == copy.inbox().url && service.service_key == copy.inbox().service_key
+        });
         if !names_it {
             self.commit(self.state.clone(), None).await?;
             return Err(stale_without_copy());
         }
-        let mut state = self.state.clone();
-        if let Some(service) = state.service.as_mut() {
-            service.service_key = copy.inbox().service_key;
-        }
-        self.commit(state, self.flow.clone()).await?;
         self.delivered(copy.signed().clone(), None, None).await
     }
 
@@ -1690,6 +1712,7 @@ impl Signer {
         });
         state.homeserver_other = None;
         state.republish_over = None;
+        state.ever_published = true;
         self.commit(state, self.flow.clone()).await
     }
 }

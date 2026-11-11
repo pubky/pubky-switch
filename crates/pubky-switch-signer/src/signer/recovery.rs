@@ -39,6 +39,8 @@ use pubky_switch_core::records::{
 use pubky_switch_core::scopes::Permission;
 use pubky_switch_core::sig::SignedDoc;
 
+use pubky_switch_client::ClientError;
+
 use super::clients::{RequestClient, Target};
 use super::erasure::withdraw_reminders;
 use super::revocation::UserConfirmed;
@@ -115,7 +117,10 @@ impl Signer {
         // Declared again where the recovery already goes: its enrollment or its version, sent
         // there with the same bytes, goes on. A new enrollment there could find the first
         // version taken, and a second at the same generation refused for good.
-        if self.recovery_goes_to(origin) {
+        // Declared again at a service an earlier declaration enrolled at: one that took that
+        // version serves it, and would answer a new enrollment with a pending key, so it is
+        // read first under the key it was answered with.
+        if self.recovery_goes_to(origin) || self.taken_under_an_earlier_key(origin, false).await? {
             self.resume().await?;
             self.complete_listed_revocations().await?;
             return self
@@ -178,6 +183,7 @@ impl Signer {
         state.recovery_base = Some(base.signed().clone());
         state.lost_generation = Some(lost);
         state.homeserver_copy_waived = waived;
+        state.recovery_origin = Some(origin.to_owned());
         let flow = Flow::Recover {
             origin: origin.to_owned(),
             enrollment: enrollment.signed().clone(),
@@ -233,10 +239,65 @@ impl Signer {
         }
     }
 
+    /// Whether a service at `origin` an earlier declaration of this recovery enrolled at holds
+    /// a version of it, read under each key it answered, but the one pinned now when
+    /// `skip_pinned` (Switch wire 3.7, 7.4.12): then that is the recovery delivered, under
+    /// that key, and the run goes on from there. A read that fails shows nothing, and the
+    /// caller goes on as if none was taken.
+    pub(super) async fn taken_under_an_earlier_key(
+        &mut self,
+        origin: &str,
+        skip_pinned: bool,
+    ) -> Result<bool> {
+        if !self.state.recovering {
+            return Ok(false);
+        }
+        let pinned = self
+            .state
+            .service
+            .as_ref()
+            .map(|s| s.service_key)
+            .filter(|_| skip_pinned);
+        let earlier: Vec<Service> = self
+            .state
+            .recovery_services
+            .iter()
+            .filter(|s| s.origin == origin && Some(s.service_key) != pinned)
+            .cloned()
+            .collect();
+        let identity = self.state.identity;
+        for service in earlier {
+            let target = Target {
+                origin,
+                pinned: Some(service.service_key),
+                identity,
+            };
+            let Ok(answer) = RequestClient::new(&self.env, &target, &self.keyring)?
+                .apps()
+                .await
+            else {
+                continue;
+            };
+            let copy = answer
+                .identity
+                .as_ref()
+                .and_then(|signed| IdentityDoc::verify(signed, &identity).ok());
+            if let Some(copy) = copy.filter(|copy| self.own_recovery_version(copy)) {
+                let mut state = self.state.clone();
+                state.service = Some(service);
+                self.commit(state, self.flow.clone()).await?;
+                self.own_recovery_held(copy).await?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Judge the Homeserver's `identity.json` before a recovery is signed (Switch spec 12.6
     /// step 1, 4.3): a copy that verifies, as [`Signer::judge_homeserver`] does, an alarm
     /// passing. One that is missing passes when the records explain it: an erasure, done or
-    /// in progress, deleted it, or the mark was never published. Otherwise, and for one that
+    /// in progress, deleted it, or no version was ever published. An unpublished newest
+    /// version explains nothing, since an earlier one was. Otherwise, and for one that
     /// doesn't verify, only with the user's confirmation `records_confirmed`. Returns whether
     /// the copy was waived so.
     async fn check_homeserver_copy(
@@ -253,7 +314,7 @@ impl Signer {
         let Some(bytes) = held else {
             let explained = self.state.erased
                 || matches!(self.flow, Some(Flow::Erase { .. }))
-                || self.state.newest.as_ref().is_some_and(|n| !n.published);
+                || !self.state.ever_published;
             if explained || records_confirmed {
                 return Ok(true);
             }
@@ -348,9 +409,24 @@ impl Signer {
             pinned: None,
             identity,
         };
-        let answer = RequestClient::new(&self.env, &target, &self.keyring)?
+        let answer = match RequestClient::new(&self.env, &target, &self.keyring)?
             .enroll(&enrollment)
-            .await?;
+            .await
+        {
+            Ok(answer) => answer,
+            // Refused for good (Switch wire 7.4.1): the same enrollment would be refused
+            // again, so the recovery waits to be declared again, which enrolls afresh.
+            Err(
+                error @ (ClientError::Switch {
+                    status: 400 | 409, ..
+                }
+                | ClientError::BadServiceSignature { status: 400 | 409 }),
+            ) => {
+                self.commit(self.state.clone(), None).await?;
+                return Err(error.into());
+            }
+            Err(error) => return Err(error.into()),
+        };
         let base = self.recovery_base()?;
         let lost = self.lost_generation(&base);
         let until = self.env.clock.now_ms().saturating_add(CLOCK_TOLERANCE_MS);
@@ -360,11 +436,15 @@ impl Signer {
         let doc = IdentityDoc::sign(&key, body)?;
         drop(key);
         let mut state = self.state.clone();
-        state.service = Some(Service {
+        let service = Service {
             origin: origin.to_owned(),
             service_key: answer.service_key,
             limits: answer.limits,
-        });
+        };
+        if !state.recovery_services.contains(&service) {
+            state.recovery_services.push(service.clone());
+        }
+        state.service = Some(service);
         state.signed_through = state.signed_through.max(doc.version());
         let flow = Flow::Deliver {
             doc: doc.signed().clone(),
@@ -422,6 +502,9 @@ impl Signer {
         state.recovery_base = None;
         state.lost_generation = None;
         state.homeserver_copy_waived = false;
+        state.recovery_origin = None;
+        state.recovery_services.clear();
+        state.owes_own_version = doc.body().signer != state.install;
         state.revoke_at_service = state
             .revoking
             .iter()

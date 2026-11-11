@@ -153,7 +153,7 @@ impl Signer {
                     ..
                 }
                 | ClientError::Transport(_),
-            ) if is_recovery(&doc) => AppsAnswer {
+            ) if is_recovery(&view) => AppsAnswer {
                 apps: Vec::new(),
                 recovery: None,
                 proof_generations: Vec::new(),
@@ -187,7 +187,7 @@ impl Signer {
         // names doesn't hold yet: the recovery is in progress again, delivered first, and
         // declared again elsewhere if that service refuses it (Switch spec 12.6 step 1).
         if first == Some(None)
-            && is_recovery(&doc)
+            && is_recovery(&view)
             && let Some(lost) = doc.body().recovery_from
         {
             state.recovering = true;
@@ -217,9 +217,15 @@ impl Signer {
             Err(error) => return Err(error),
         }
 
-        // The next version, naming this install as the signer. It races any other signer, so
-        // its backup is owed, and written by `resume` once the delivery has won (Switch wire
-        // 3.13).
+        let next = self.sign_own_version().await?;
+        self.resume().await?;
+        Ok(next)
+    }
+
+    /// The next version, naming this install as the signer, committed for delivery: a
+    /// restore's, or a restore's recovery taken later (Switch wire 3.13). It races any other
+    /// signer, so its backup is owed, and written by `resume` once the delivery has won.
+    pub(super) async fn sign_own_version(&mut self) -> Result<IdentityDoc> {
         let key = self.signing_key()?;
         let (next, flow) = self.next_version_closing(&key, |_| {})?;
         drop(key);
@@ -234,6 +240,7 @@ impl Signer {
         let mut state = self.state.clone();
         state.signed_through = next.version();
         state.backup_owed = true;
+        state.owes_own_version = false;
         let flow = Flow::Deliver {
             doc: signed,
             prev,
@@ -241,7 +248,6 @@ impl Signer {
             step: DeliverStep::BackupWritten,
         };
         self.commit(state, Some(flow)).await?;
-        self.resume().await?;
         Ok(next)
     }
 
@@ -289,6 +295,8 @@ impl Signer {
             .collect();
         state.service = Some(service);
         state.certs = view.certs.iter().map(|c| c.signed().clone()).collect();
+        // The install the records came from published its versions (Switch wire 3.12, 3.13).
+        state.ever_published = true;
         state.bundle_parts = view.bundle_parts.clone();
         state.cleanup = cleanup;
         tombstones.sort_unstable();
@@ -495,9 +503,16 @@ pub(super) fn removed_at_switch<'a>(
 /// How many removed apps' records a run checks for.
 const DELETION_CHECKS_PER_RUN: usize = 32;
 
-/// Whether `doc` starts a recovery: `recovery_from` is the generation before its own (Switch
-/// spec 12.6 step 1).
-fn is_recovery(doc: &IdentityDoc) -> bool {
+/// Whether the backup `view` holds the version that starts a recovery: `recovery_from` the
+/// generation before its own, built on none, since later versions of that generation keep
+/// `recovery_from` (Switch spec 12.6 step 1, wire 3.13).
+fn is_recovery(view: &BackupView) -> bool {
+    let doc = &view.identity_doc;
+    view.prev.is_none() && is_recovery_doc(doc)
+}
+
+/// Whether `doc` carries `recovery_from` the generation before its own.
+fn is_recovery_doc(doc: &IdentityDoc) -> bool {
     doc.body().recovery_from.is_some()
         && doc.body().recovery_from == doc.generation().checked_sub(1)
 }
