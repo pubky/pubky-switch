@@ -342,11 +342,9 @@ impl AccountTxn {
     /// The shared records at `keys` that the account holds.
     pub async fn records(&mut self, keys_: &[[u8; 32]]) -> Result<Vec<StoredRecord>, StoreError> {
         let id = self.head().id.clone();
-        let rows = sqlx::query(
-            "SELECT key, collection, read_scope, write_scopes, generation, version, deleted, \
-             value_bytes, writer, cert, op, proof FROM shared_records \
-             WHERE account_id = $1 AND key = ANY($2)",
-        )
+        let rows = sqlx::query(&format!(
+            "SELECT {RECORD_COLUMNS} FROM shared_records WHERE account_id = $1 AND key = ANY($2)"
+        ))
         .bind(id)
         .bind(keys(keys_))
         .fetch_all(self.conn())
@@ -900,7 +898,11 @@ impl AccountTxn {
     }
 }
 
-fn record_of(row: &sqlx::postgres::PgRow) -> Result<StoredRecord, StoreError> {
+/// The columns [`record_of`] reads.
+pub(super) const RECORD_COLUMNS: &str = "key, collection, read_scope, write_scopes, generation, \
+     version, deleted, value_bytes, writer, cert, op, proof";
+
+pub(super) fn record_of(row: &sqlx::postgres::PgRow) -> Result<StoredRecord, StoreError> {
     let key: Vec<u8> = row.try_get("key")?;
     let collection: Vec<u8> = row.try_get("collection")?;
     let writer: Vec<u8> = row.try_get("writer")?;
