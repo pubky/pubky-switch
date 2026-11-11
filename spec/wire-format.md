@@ -2120,8 +2120,8 @@ Example (bob's `shop` reading alice's directory; signed documents cut short):
 
 #### 7.4.14 Recovery
 
-- **Staged admission** (spec 12.6 step 2) starts at the `recovery` transition only when the document lists a current app holding `lists.manage`; otherwise there is nothing to wait for, and admission is never staged. It ends at the first upload that carries `lists.contacts` from an app with `lists.manage`, or at `POST /recovery/admission`, and doesn't start again for that generation, whatever app joins later.
-- **`POST /v1/{id}/recovery/admission`**: the signer, empty body. Ends staged admission; answers with the `admission` transition's proof; `404` without a recovery.
+- **Staged admission** (spec 12.6 step 2) starts at the `recovery` transition whenever the recovery document lists at least one current app: the service can't see permissions then, since certificates reach it only with each app's `app.put` or `cert.put`. A document that lists no app stages nothing. It ends at the first upload that carries `lists.contacts` from an app with `lists.manage`, or at `POST /recovery/admission`, and doesn't start again for that generation, whatever app joins later. The signer ends it itself, with `POST /recovery/admission` right after the recovery's delivery is answered, when none of the listed apps holds `lists.manage`, since no upload could ever end it; the call is a step of its recovery flow, sent again after a crash. Until it ends, senders get `503 staged` and retry, denied ones included, so nobody the deny list keeps out gets in.
+- **`POST /v1/{id}/recovery/admission`**: the signer, empty body. Ends staged admission; answers with the `admission` transition's proof; `404` without a recovery. At an account whose admission isn't staged, or no longer is, it chains no transition and answers `{ "proofs": [], "head" }`, so the signer's retry after a lost answer, or a call where no listed app staged anything, succeeds.
 - **`POST /v1/{id}/recovery/upload`**: an own app. Body:
 
   | Field | Type | Notes |
