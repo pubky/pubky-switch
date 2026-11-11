@@ -14,7 +14,7 @@ use pubky_switch_core::{
         Quota, ReceiveKeyEffect, Refusal, SignedOp, StateAfter, StoredPart, Writer, check_app_put,
         check_cert_put, check_conditions, check_cursor, check_invite_code_put,
         check_key_bundle_put, check_permission, check_quota, check_receive_key_put, check_shape,
-        covers, invite_code_delete, proof_state,
+        covers, invite_code_delete, keys_through, parts_to_drop, proof_state,
     },
     records::{AppCert, AppRecord, ReceiveKeyRecord},
     scopes::Permission,
@@ -410,10 +410,36 @@ fn key_bundle_put(
                     seq: part.seq,
                 })
                 .collect();
+            // Unless a full bundle was requested, the parts the target's cursor has passed and
+            // that its `keys_through` covers go: it holds their keys (Switch wire 6.2). A
+            // request this part completes still keeps them now, since the app asked for them
+            // and hasn't read the parts that complete it. The part just stored is past every
+            // cursor, so it stays.
+            let full = state
+                .apps
+                .get(&target)
+                .is_some_and(|app| app.full_requested.is_some());
             if covers(&spans, epoch)
                 && let Some(app) = state.apps.get_mut(&target)
             {
                 app.full_requested = None;
+            }
+            let generation = state.generation;
+            let cursor = state
+                .apps
+                .get(&target)
+                .and_then(|app| app.cursor)
+                .filter(|cursor| cursor.generation == generation)
+                .map_or(0, |cursor| cursor.seq);
+            let through = keys_through(state.listed_epochs.get(&target).copied(), &spans, cursor);
+            let gone = parts_to_drop(&spans, cursor, through, full);
+            if let Some(parts) = state.parts.get_mut(&target) {
+                let mut index = 0;
+                parts.retain(|_| {
+                    let keep = !gone.contains(&index);
+                    index += 1;
+                    keep
+                });
             }
             seq
         }

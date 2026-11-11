@@ -255,6 +255,9 @@ pub struct OpsState {
     pub new_receive_keys: Vec<([u8; 16], ReceiveKeyRecord)>,
     /// The key bundle parts of the batch's targets, in `first_epoch` order.
     pub parts: BTreeMap<[u8; 16], Vec<HeldPart>>,
+    /// The data epoch of the first `identity.json` that listed each of the batch's targets,
+    /// where it is known: where its `keys_through` starts (Switch wire 7.4.12).
+    pub listed_epochs: BTreeMap<[u8; 16], u64>,
     /// The records the batch names that exist.
     pub records: BTreeMap<[u8; 32], HeldRecord>,
     /// The claims the batch names that exist.
@@ -292,6 +295,7 @@ impl OpsState {
             kids: BTreeSet::new(),
             new_receive_keys: Vec::new(),
             parts: BTreeMap::new(),
+            listed_epochs: BTreeMap::new(),
             records: BTreeMap::new(),
             claims: BTreeMap::new(),
             contacts: BTreeMap::new(),

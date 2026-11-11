@@ -140,6 +140,23 @@ pub fn newly_listed(earlier: Option<&IdentityDoc>, later: &IdentityDoc) -> Vec<[
 }
 
 impl AccountTxn {
+    /// The data epoch of the first `identity.json` that listed `app`, where it is known
+    /// (Switch wire 7.4.12 `keys_through`).
+    pub async fn listed_epoch(&mut self, app: &[u8; 16]) -> Result<Option<u64>, StoreError> {
+        let id = self.head().id.clone();
+        let epoch: Option<i64> = sqlx::query_scalar(
+            "SELECT listed_epoch FROM app_listings WHERE account_id = $1 AND app_id = $2",
+        )
+        .bind(id)
+        .bind(app.as_slice())
+        .fetch_optional(self.conn())
+        .await
+        .map_err(StoreError::from_db)?;
+        epoch
+            .map(|epoch| from_db(epoch, "listed_epoch"))
+            .transpose()
+    }
+
     /// Record that the document this request takes lists `apps` for the first time, at
     /// data epoch `epoch` (Switch wire 7.4.12 `keys_through`).
     pub async fn note_listings(&mut self, apps: &[[u8; 16]], epoch: u64) -> Result<(), StoreError> {

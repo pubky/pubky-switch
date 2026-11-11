@@ -254,6 +254,9 @@ async fn load_state(
         .collect();
     (state.directory_version, state.apps_version) = txn.directory_versions().await?;
     for target in &needs.targets {
+        if let Some(epoch) = txn.listed_epoch(target).await? {
+            state.listed_epochs.insert(*target, epoch);
+        }
         let parts = txn.bundle_parts(target).await?;
         state.parts.insert(
             *target,
