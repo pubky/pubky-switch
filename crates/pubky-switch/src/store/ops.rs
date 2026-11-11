@@ -159,40 +159,6 @@ fn keys<const N: usize>(keys: &[[u8; N]]) -> Vec<Vec<u8>> {
     keys.iter().map(|key| key.to_vec()).collect()
 }
 
-/// Account `id`'s directory versions, on `conn`: the account's transaction, or a read of
-/// its snapshot ([`super::SnapshotRead`]).
-pub(super) async fn read_directory_versions(
-    conn: &mut sqlx::PgConnection,
-    id: &str,
-) -> Result<(u64, u64), StoreError> {
-    let row = sqlx::query("SELECT directory_version, apps_version FROM accounts WHERE id = $1")
-        .bind(id)
-        .fetch_one(conn)
-        .await
-        .map_err(db)?;
-    Ok((
-        from_db(row.try_get("directory_version")?, "directory_version")?,
-        from_db(row.try_get("apps_version")?, "apps_version")?,
-    ))
-}
-
-/// Account `id`'s app rows, on `conn`, by App ID.
-pub(super) async fn read_apps(
-    conn: &mut sqlx::PgConnection,
-    id: &str,
-) -> Result<Vec<StoredApp>, StoreError> {
-    let rows = sqlx::query(
-        "SELECT app_id, record, record_at_ms, renewed_cert, receive_key, cursor_generation, \
-         cursor_seq, reachable_since, full_requested_ms FROM apps WHERE account_id = $1 \
-         ORDER BY app_id",
-    )
-    .bind(id)
-    .fetch_all(conn)
-    .await
-    .map_err(db)?;
-    rows.iter().map(app_of).collect()
-}
-
 fn db(error: sqlx::Error) -> StoreError {
     StoreError::from_db(error)
 }
@@ -201,7 +167,15 @@ impl AccountTxn {
     /// The directory's versions: `directory_version` and `apps_version` (Switch wire 7.4.10).
     pub async fn directory_versions(&mut self) -> Result<(u64, u64), StoreError> {
         let id = self.head().id.clone();
-        read_directory_versions(self.conn(), &id).await
+        let row = sqlx::query("SELECT directory_version, apps_version FROM accounts WHERE id = $1")
+            .bind(id)
+            .fetch_one(self.conn())
+            .await
+            .map_err(db)?;
+        Ok((
+            from_db(row.try_get("directory_version")?, "directory_version")?,
+            from_db(row.try_get("apps_version")?, "apps_version")?,
+        ))
     }
 
     /// Set the directory's versions.
@@ -224,7 +198,16 @@ impl AccountTxn {
     /// Every own app the account holds, by App ID.
     pub async fn apps(&mut self) -> Result<Vec<StoredApp>, StoreError> {
         let id = self.head().id.clone();
-        read_apps(self.conn(), &id).await
+        let rows = sqlx::query(
+            "SELECT app_id, record, record_at_ms, renewed_cert, receive_key, cursor_generation, \
+             cursor_seq, reachable_since, full_requested_ms FROM apps WHERE account_id = $1 \
+             ORDER BY app_id",
+        )
+        .bind(id)
+        .fetch_all(self.conn())
+        .await
+        .map_err(db)?;
+        rows.iter().map(app_of).collect()
     }
 
     /// Store an own app, replacing what the account held for it.

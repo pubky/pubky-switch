@@ -6,11 +6,7 @@
 
 use sqlx::{Executor, Postgres, Transaction};
 
-use super::{
-    AccountTxn, StoreError, StoredApp,
-    identity::read_kept_app_ids,
-    ops::{read_apps, read_directory_versions},
-};
+use super::{AccountTxn, StoreError};
 
 /// The accounts with a read after the lock in flight in this process: at most one each,
 /// so a few slow reads of one account can't hold every reader the other accounts share.
@@ -117,21 +113,6 @@ impl SnapshotRead {
             pause.reached.notify_one();
             pause.resume.notified().await;
         }
-    }
-
-    /// The account's app rows, by App ID.
-    pub async fn apps(&mut self) -> Result<Vec<StoredApp>, StoreError> {
-        read_apps(&mut self.tx, &self.id).await
-    }
-
-    /// The App IDs kept for good.
-    pub async fn kept_app_ids(&mut self) -> Result<Vec<[u8; 16]>, StoreError> {
-        read_kept_app_ids(&mut self.tx, &self.id).await
-    }
-
-    /// The directory's versions.
-    pub async fn directory_versions(&mut self) -> Result<(u64, u64), StoreError> {
-        read_directory_versions(&mut self.tx, &self.id).await
     }
 
     /// End the read; it wrote nothing.

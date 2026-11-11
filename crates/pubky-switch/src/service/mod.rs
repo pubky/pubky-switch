@@ -127,8 +127,6 @@ enum Deferred {
     Feed(Box<feed::FeedRead>),
     /// `GET /allow`'s lists, from the snapshot of the state under the lock.
     Allow(allow::AllowRead),
-    /// `GET /directory`'s apps, from the snapshot of the state under the lock.
-    Directory(Box<directory::DirectoryRead>),
 }
 
 impl Answer {
@@ -447,7 +445,7 @@ impl Service {
         });
         // The reads that run after the lock on its snapshot take their reader first, so the
         // lock is never held waiting for one.
-        let begun = if matches!(call, Call::GetAllow | Call::Directory) {
+        let begun = if matches!(call, Call::GetAllow) {
             self.store.begin_reading(&account).await
         } else {
             self.store.begin(&account).await
@@ -761,14 +759,6 @@ impl Service {
                     Some(Deferred::Allow(read)) => match Self::allow_body(read).await {
                         Ok(body) => answer.body = body,
                         Err(error) => answer = Answer::error(&error).with_head(fallback_head),
-                    },
-                    Some(Deferred::Directory(read)) => match Self::directory_body(*read).await {
-                        Ok(body) => answer.body = body,
-                        // An app of another identity's refusal carries no head.
-                        Err(error) => {
-                            let head = answer.head.is_some().then_some(fallback_head).flatten();
-                            answer = Answer::error(&error).with_head(head);
-                        }
                     },
                     Some(Deferred::Feed(read)) => {
                         return match self.feed_page(&read, &signer).await {

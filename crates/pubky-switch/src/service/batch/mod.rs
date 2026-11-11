@@ -361,49 +361,15 @@ pub(super) async fn load_apps_and_rows(
     now: u64,
 ) -> Result<(OpsState, Vec<StoredApp>), StoreError> {
     let head = txn.head().clone();
-    let apps = txn.apps().await?;
-    let kept = txn.kept_app_ids().await?;
-    let state = apps_state(
-        (head.identity_key, head.generation, head.last_seq),
-        held,
-        &apps,
-        kept,
-        now,
-    )?;
-    Ok((state, apps))
-}
-
-/// As [`load_apps_and_rows`], from a read of the snapshot of the state under the lock
-/// (`crate::store::SnapshotRead`), once the lock is gone; `account` is the identity,
-/// generation and last `seq` as the locked transaction saw them.
-pub(super) async fn load_apps_from_snapshot(
-    snapshot: &mut crate::store::SnapshotRead,
-    account: ([u8; 32], u64, u64),
-    held: Option<&IdentityDoc>,
-    now: u64,
-) -> Result<(OpsState, Vec<StoredApp>), StoreError> {
-    let apps = snapshot.apps().await?;
-    let kept = snapshot.kept_app_ids().await?;
-    let state = apps_state(account, held, &apps, kept, now)?;
-    Ok((state, apps))
-}
-
-/// The state judgments of currency read: the apps, the App IDs kept for good and the
-/// newest `identity.json`.
-fn apps_state(
-    (identity, generation, last_seq): ([u8; 32], u64, u64),
-    held: Option<&IdentityDoc>,
-    apps: &[StoredApp],
-    kept: Vec<[u8; 16]>,
-    now: u64,
-) -> Result<OpsState, StoreError> {
-    let mut state = OpsState::new(identity, generation, last_seq, now);
+    let identity = head.identity_key;
+    let mut state = OpsState::new(identity, head.generation, head.last_seq, now);
     state.doc = held.cloned();
-    for app in apps {
+    let apps = txn.apps().await?;
+    for app in &apps {
         state.apps.insert(app.app_id, held_app(app, &identity)?);
     }
-    state.kept = kept.into_iter().collect();
-    Ok(state)
+    state.kept = txn.kept_app_ids().await?.into_iter().collect();
+    Ok((state, apps))
 }
 
 /// A change outside a batch to the directory and to which apps are current: an

@@ -108,26 +108,20 @@ impl AccountTxn {
     /// enrollment.
     pub async fn kept_app_ids(&mut self) -> Result<Vec<[u8; 16]>, StoreError> {
         let id = self.head().id.clone();
-        read_kept_app_ids(self.conn(), &id).await
+        let rows: Vec<Vec<u8>> = sqlx::query_scalar(
+            "SELECT app_id FROM kept_app_ids WHERE account_id = $1 ORDER BY app_id",
+        )
+        .bind(id)
+        .fetch_all(self.conn())
+        .await
+        .map_err(StoreError::from_db)?;
+        rows.iter()
+            .map(|app_id| {
+                <[u8; 16]>::try_from(app_id.as_slice())
+                    .map_err(|_| StoreError::Corrupt("kept app_id"))
+            })
+            .collect()
     }
-}
-
-/// Account `id`'s App IDs kept for good, on `conn`.
-pub(super) async fn read_kept_app_ids(
-    conn: &mut sqlx::PgConnection,
-    id: &str,
-) -> Result<Vec<[u8; 16]>, StoreError> {
-    let rows: Vec<Vec<u8>> =
-        sqlx::query_scalar("SELECT app_id FROM kept_app_ids WHERE account_id = $1 ORDER BY app_id")
-            .bind(id)
-            .fetch_all(conn)
-            .await
-            .map_err(StoreError::from_db)?;
-    rows.iter()
-        .map(|app_id| {
-            <[u8; 16]>::try_from(app_id.as_slice()).map_err(|_| StoreError::Corrupt("kept app_id"))
-        })
-        .collect()
 }
 
 /// Keep `at_ms` within the store's range.
