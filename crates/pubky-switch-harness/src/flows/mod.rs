@@ -15,6 +15,7 @@ mod lists;
 mod messaging;
 mod removal;
 mod renewal;
+mod watching;
 
 use std::future::Future;
 use std::pin::Pin;
@@ -28,6 +29,7 @@ pub use lists::lists_without_read;
 pub use messaging::messaging;
 pub use removal::{departure, revocation};
 pub use renewal::renewal;
+pub use watching::watching;
 
 use crate::{FlowResult, World};
 
@@ -53,6 +55,7 @@ pub const FLOWS: &[(&str, Flow)] = &[
     ("renewal", |world| Box::pin(renewal(world))),
     ("revocation", |world| Box::pin(revocation(world))),
     ("departure", |world| Box::pin(departure(world))),
+    ("watching", |world| Box::pin(watching(world))),
 ];
 
 /// The flow that sends `call` to the service; `None` for a call the service doesn't serve
