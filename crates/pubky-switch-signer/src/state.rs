@@ -662,6 +662,19 @@ fn decode<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_state_records_kept_before_the_publication_flag_count_as_published() {
+        let state = SignerState::new([1; 32], [2; 16]);
+        let mut value = serde_json::to_value(&state).unwrap();
+        value.as_object_mut().unwrap().remove("ever_published");
+        let read: SignerState = serde_json::from_value(value).unwrap();
+        assert!(read.ever_published);
+        assert!(
+            !state.ever_published,
+            "a new identity's records start unpublished"
+        );
+    }
+
     use super::*;
 
     #[test]

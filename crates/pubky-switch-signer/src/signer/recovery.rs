@@ -124,7 +124,13 @@ impl Signer {
         // Declared again at a service an earlier declaration enrolled at: one that took that
         // version serves it, and would answer a new enrollment with a pending key, so it is
         // read first under the key it was answered with.
-        if self.recovery_goes_to(origin) || self.taken_under_an_earlier_key(origin, false).await? {
+        // The backup is judged first: an install that took over shows there, and its version
+        // must never be superseded by an earlier one the pre-read would take.
+        let goes_to = self.recovery_goes_to(origin);
+        if !goes_to {
+            self.check_backup_copy().await?;
+        }
+        if goes_to || self.taken_under_an_earlier_key(origin, false).await? {
             self.resume().await?;
             self.complete_listed_revocations().await?;
             return self
@@ -289,6 +295,7 @@ impl Signer {
             if let Some(copy) = copy.filter(|copy| self.own_recovery_version(copy)) {
                 let mut state = self.state.clone();
                 state.service = Some(service);
+                state.recovery_origin = Some(origin.to_owned());
                 self.commit(state, self.flow.clone()).await?;
                 self.own_recovery_held(copy).await?;
                 return Ok(true);

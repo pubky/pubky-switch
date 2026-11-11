@@ -193,10 +193,18 @@ impl Signer {
             state.recovering = true;
             state.recovery_base = Some(doc.signed().clone());
             state.lost_generation = Some(lost);
-            // The service the recovery went to, under the key its version names: declared
-            // again there, it is read under that key first.
-            if let Some(service) = state.service.clone() {
-                state.recovery_services = vec![service];
+            // The services this recovery enrolled at, kept in place for the same lost
+            // generation, and the one the backup's version names, under its key: declared
+            // again at one, it is read under that key first.
+            if in_place && self.state.recovering && self.state.lost_generation == Some(lost) {
+                state
+                    .recovery_services
+                    .clone_from(&self.state.recovery_services);
+            }
+            if let Some(service) = state.service.clone()
+                && !state.recovery_services.contains(&service)
+            {
+                state.recovery_services.push(service);
             }
         }
         state.newest = Some(Newest {

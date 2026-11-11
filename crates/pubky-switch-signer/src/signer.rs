@@ -330,8 +330,13 @@ impl Signer {
                 self.commit(state, self.flow.clone()).await?;
             }
             // A restore's recovery taken after the restore: the version naming this install
-            // comes next, as the restore would have signed it (Switch wire 3.13).
+            // comes next, as the restore would have signed it (Switch wire 3.13), after the
+            // copies a restore checks first. The switch's is the version just delivered. The
+            // Homeserver's must be neither newer nor another body at it, and the backup must
+            // name neither another install that took over nor a newer own version; the one
+            // this install was restored from holds that version itself, and is no take-over.
             if self.state.owes_own_version && gate::refusal(&self.state).is_none() {
+                self.check_before_own_version().await?;
                 self.sign_own_version().await?;
                 continue;
             }
@@ -379,6 +384,28 @@ impl Signer {
                 return Ok(());
             }
         }
+    }
+
+    /// The copies a restore checks before it signs the version naming this install (Switch
+    /// wire 3.13), checked again before the owed one (the caller's comment).
+    async fn check_before_own_version(&mut self) -> Result<()> {
+        let Some(newest) = self.state.newest_doc()? else {
+            return Ok(());
+        };
+        self.judge_homeserver(&newest).await?;
+        let found = self
+            .env
+            .homeserver
+            .get(SIGNER_BACKUP_PATH)
+            .await
+            .map_err(SignerError::Homeserver)?;
+        if let Some(found) = found.and_then(|bytes| self.open_backup(&bytes).transpose()) {
+            let found = found?;
+            if found.identity_doc.hash() != newest.hash() {
+                self.judge_backup(&found).await?;
+            }
+        }
+        Ok(())
     }
 
     /// Run the flow in progress to its end.

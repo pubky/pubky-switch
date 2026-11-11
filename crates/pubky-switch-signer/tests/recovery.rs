@@ -2205,11 +2205,29 @@ async fn test_provider_loss_in_place_at_a_serving_service() {
     let (mut signer, _) = world.enrolled().await;
     let app = App::new(&["notes"], None, [9; 32]);
     world.approve(&mut signer, &app).await;
+    let gone = App::with_keys(
+        pubky_switch_core::keys::AppKeys::from_secrets([5; 32], [6; 32]),
+        &["notes"],
+        None,
+        [8; 32],
+    );
+    world.approve(&mut signer, &gone).await;
+    signer
+        .revoke(gone.keys.app_id_bytes(), None, confirmed())
+        .await
+        .unwrap();
     let lost = signer.identity_doc().unwrap().unwrap();
     let recovered = signer
         .declare_provider_loss(SWITCH_ORIGIN, confirmed())
         .await
         .unwrap();
+    assert!(
+        world
+            .switch
+            .kept_app_ids()
+            .contains(&gone.keys.app_id_bytes()),
+        "the App ID held with the pending key is kept"
+    );
     assert_eq!(recovered.generation(), lost.generation() + 1);
     assert_eq!(recovered.body().recovery_from, Some(lost.generation()));
     assert_ne!(
@@ -2363,4 +2381,402 @@ async fn test_provider_loss_restored_then_declared_again_where_the_version_was_t
     assert_eq!(held.body().signer, restored.install_id());
     assert_eq!(held.generation(), backed_up.generation());
     assert_eq!(restored.status(), SignerStatus::Signing);
+}
+
+/// The new install restored from the backup on the Homeserver, reaching `router`.
+async fn restored_from_the_backup(world: &World, router: &Arc<Router>) -> Signer {
+    let mut env = world.env_with(Arc::new(MemoryStore::new()), notes());
+    env.transport = router.clone();
+    Signer::restore_new(env, world.keyring(), confirmed())
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn test_provider_loss_restored_install_and_its_source_end_with_one_signer() {
+    // A new install restores mid-recovery while the service can't be reached and declares
+    // at an origin that never answers; the first install's resend gets the version taken;
+    // the new install declares again there. One install ends up signing there, and the
+    // other doesn't (Switch spec 12.6 step 1, wire 3.13).
+    let world = World::new();
+    let (mut first, service, router) = lost_with_an_app(&world, notes()).await;
+    service.fail_next(Fault::Unreachable {
+        path: "/identity".into(),
+        after: 0,
+    });
+    first
+        .declare_provider_loss(NEW_ORIGIN, confirmed())
+        .await
+        .unwrap_err();
+    for path in ["/apps", "/identity"] {
+        service.fail_next(Fault::Unreachable {
+            path: path.into(),
+            after: 0,
+        });
+    }
+    let mut restored = restored_from_the_backup(&world, &router).await;
+    restored
+        .declare_provider_loss("https://unanswered.example", confirmed())
+        .await
+        .unwrap_err();
+    first.resume().await.unwrap();
+    restored
+        .declare_provider_loss(NEW_ORIGIN, confirmed())
+        .await
+        .unwrap();
+    let held = service.identity_doc().unwrap();
+    assert_eq!(held.body().signer, restored.install_id());
+    assert_eq!(restored.status(), SignerStatus::Signing);
+    signs_again(&world, &mut restored, &service).await;
+    first.set_record_max_age(Some(41)).await.unwrap_err();
+    assert!(matches!(first.status(), SignerStatus::ManagedBy { .. }));
+}
+
+#[tokio::test]
+async fn test_provider_loss_restored_in_place_keeps_its_earlier_services() {
+    // The first service took the recovery's version, its answer lost; a second refused its
+    // own; restored in place, the install still reads the first under the key it answered,
+    // and takes that version as the recovery delivered (Switch spec 12.6 step 1, wire 3.13).
+    let world = World::new();
+    let (mut signer, service, router) = lost_with_an_app(&world, notes()).await;
+    service.fail_next(Fault::LoseAnswer {
+        path: "/identity".into(),
+    });
+    signer
+        .declare_provider_loss(NEW_ORIGIN, confirmed())
+        .await
+        .unwrap_err();
+    let taken = service.identity_doc().unwrap();
+    let second = service_on(&world, &router, THIRD_ORIGIN, 0x6e);
+    for _ in 0..2 {
+        second.fail_next(Fault::Error {
+            path: "/identity".into(),
+            code: pubky_switch_core::http::ErrorCode::BadRequest,
+            current: serde_json::Value::Null,
+        });
+    }
+    signer
+        .declare_provider_loss(THIRD_ORIGIN, confirmed())
+        .await
+        .unwrap_err();
+    signer.restore(confirmed()).await.unwrap();
+    signer
+        .declare_provider_loss(NEW_ORIGIN, confirmed())
+        .await
+        .unwrap();
+    assert_eq!(signer.identity_doc().unwrap().unwrap().hash(), taken.hash());
+    signs_again(&world, &mut signer, &service).await;
+}
+
+#[tokio::test]
+async fn test_provider_loss_judges_the_backup_before_reading_an_earlier_service() {
+    // The first service took this install's version, its answer lost; the second never
+    // answered its delivery; another install restored from the backup and took the second
+    // service, writing its backup, its publication failing. Declared again at the first,
+    // this install reads the backup first, finds the other install, and publishes nothing
+    // (Switch spec 12.6 step 1, wire 3.13).
+    let world = World::new();
+    let (mut signer, service, router) = lost_with_an_app(&world, notes()).await;
+    service.fail_next(Fault::LoseAnswer {
+        path: "/identity".into(),
+    });
+    signer
+        .declare_provider_loss(NEW_ORIGIN, confirmed())
+        .await
+        .unwrap_err();
+    let taken = service.identity_doc().unwrap();
+    let second = service_on(&world, &router, THIRD_ORIGIN, 0x6e);
+    second.fail_next(Fault::Unreachable {
+        path: "/identity".into(),
+        after: 0,
+    });
+    signer
+        .declare_provider_loss(THIRD_ORIGIN, confirmed())
+        .await
+        .unwrap_err();
+    *world.homeserver.failing_path.lock().unwrap() = Some(IDENTITY_PATH.into());
+    let mut env = world.env_with(Arc::new(MemoryStore::new()), notes());
+    env.transport = router.clone();
+    let other = Signer::restore_new(env, world.keyring(), confirmed())
+        .await
+        .err();
+    assert!(other.is_some(), "its publication failed");
+    *world.homeserver.failing_path.lock().unwrap() = None;
+    let error = signer
+        .declare_provider_loss(NEW_ORIGIN, confirmed())
+        .await
+        .unwrap_err();
+    assert!(matches!(error, SignerError::NotNamed { .. }), "{error:?}");
+    assert!(
+        world
+            .published()
+            .is_none_or(|doc| doc.hash() != taken.hash()),
+        "nothing published over the other install"
+    );
+}
+
+#[tokio::test]
+async fn test_provider_loss_owed_own_version_checks_the_copies_first() {
+    // A new install restored mid-recovery while the service can't be reached; the first
+    // install recovers elsewhere and publishes; the new install's resend then gets the
+    // version taken. Before the version naming itself, it reads the copies a restore reads:
+    // the Homeserver shows the first install's newer version, so it signs nothing, and no
+    // version has two bodies (Switch wire 3.13, spec 4.3).
+    let world = World::new();
+    let (mut first, service, router) = lost_with_an_app(&world, notes()).await;
+    service.fail_next(Fault::Unreachable {
+        path: "/identity".into(),
+        after: 0,
+    });
+    first
+        .declare_provider_loss(NEW_ORIGIN, confirmed())
+        .await
+        .unwrap_err();
+    for path in ["/apps", "/identity"] {
+        service.fail_next(Fault::Unreachable {
+            path: path.into(),
+            after: 0,
+        });
+    }
+    let mut restored = restored_from_the_backup(&world, &router).await;
+    let third = service_on(&world, &router, THIRD_ORIGIN, 0x6e);
+    let elsewhere = first
+        .declare_provider_loss(THIRD_ORIGIN, confirmed())
+        .await
+        .unwrap();
+    let error = restored.resume().await.unwrap_err();
+    assert!(matches!(error, SignerError::NotNamed { .. }), "{error:?}");
+    let held = service.identity_doc().unwrap();
+    assert_ne!(held.body().signer, restored.install_id(), "nothing signed");
+    assert_ne!(held.version(), elsewhere.version());
+    assert_eq!(third.identity_doc().unwrap().hash(), elsewhere.hash());
+    world.assert_no_version_sent_twice();
+}
+
+#[tokio::test]
+async fn test_provider_loss_owed_own_version_waits_for_a_held_alarm() {
+    // The owed version naming the restored install passes the signing gate: while an alarm
+    // is held, the run goes on without it, and once the user clears the alarm it is signed
+    // (Switch wire 3.13, spec 4.3).
+    let world = World::new();
+    let (mut first, service, router) = lost_with_an_app(&world, notes()).await;
+    service.fail_next(Fault::Unreachable {
+        path: "/identity".into(),
+        after: 0,
+    });
+    first
+        .declare_provider_loss(NEW_ORIGIN, confirmed())
+        .await
+        .unwrap_err();
+    let backed_up = world.backup().identity_doc().clone();
+    drop(first);
+    for path in ["/apps", "/identity"] {
+        service.fail_next(Fault::Unreachable {
+            path: path.into(),
+            after: 0,
+        });
+    }
+    let mut restored = restored_from_the_backup(&world, &router).await;
+    // Another body at that version on the Homeserver: the alarm, raised before the owed
+    // version is signed.
+    let mut body = backed_up.body().clone();
+    body.record_max_age = Some(9);
+    let other = pubky_switch_core::records::IdentityDoc::sign(&world.key, body).unwrap();
+    world
+        .homeserver
+        .set(IDENTITY_PATH, serde_json::to_vec(other.signed()).unwrap());
+    let error = restored.resume().await.unwrap_err();
+    let SignerError::Alarm(alarm) = error else {
+        panic!("{error:?}")
+    };
+    // The Homeserver is put right, the alert still held: the run goes on, signing nothing.
+    world.homeserver.set(
+        IDENTITY_PATH,
+        serde_json::to_vec(backed_up.signed()).unwrap(),
+    );
+    restored.resume().await.unwrap();
+    assert_eq!(service.identity_doc().unwrap().hash(), backed_up.hash());
+    assert_eq!(restored.status(), SignerStatus::Alarm);
+    restored.clear_alert(&alarm).await.unwrap();
+    restored.resume().await.unwrap();
+    assert_eq!(
+        service.identity_doc().unwrap().body().signer,
+        restored.install_id()
+    );
+}
+
+/// An enrollment request the scripted switch answers, and whether its answer verifies
+/// under the key it names.
+fn answer_verifies(
+    world: &World,
+    request: &pubky_switch_client::transport::Request,
+    response: &pubky_switch_client::transport::Response,
+) -> Option<bool> {
+    let named = pubky_switch_core::records::EnrollmentAnswer::from_json(&response.body)
+        .ok()
+        .map(|answer| answer.service_key)?;
+    let signature = request
+        .header(pubky_switch_core::http::header::SIGNATURE)
+        .and_then(|text| pubky_switch_core::http::decode_signature(text).ok());
+    Some(
+        pubky_switch_client::client::check_response(
+            &named,
+            &world.key.public(),
+            signature.as_ref(),
+            response,
+        )
+        .is_ok(),
+    )
+}
+
+#[tokio::test]
+async fn test_scripted_enrollment_again_gets_its_kept_answer() {
+    // As at the service: the same enrollment again at a serving account gets its kept
+    // answer, signed with the key it names, and makes no pending key; after a recovery in
+    // place, the enrollment the outgoing key answered is `409 conflict`, and the one the
+    // pending key answered gets its answer again (Switch wire 3.7, 7.4.1).
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let enrollments = |world: &World| -> Vec<pubky_switch_client::transport::Request> {
+        world
+            .transport
+            .requests()
+            .into_iter()
+            .filter(|r| r.method == "POST" && r.path_and_query == "/v1/enroll")
+            .collect()
+    };
+    let creating = enrollments(&world).remove(0);
+    let replay = world.switch.handle(&creating).unwrap();
+    assert_eq!(replay.status, 200);
+    assert_eq!(answer_verifies(&world, &creating, &replay), Some(true));
+    let app = App::new(&["notes"], None, [9; 32]);
+    world.approve(&mut signer, &app).await;
+    signer
+        .declare_provider_loss(SWITCH_ORIGIN, confirmed())
+        .await
+        .unwrap();
+    assert_eq!(world.switch.handle(&creating).unwrap().status, 409);
+    let pending = enrollments(&world).pop().unwrap();
+    let again = world.switch.handle(&pending).unwrap();
+    assert_eq!(again.status, 200);
+    assert_eq!(answer_verifies(&world, &pending, &again), Some(true));
+}
+
+#[tokio::test]
+async fn test_provider_loss_publication_crash_is_recorded_by_the_next_run() {
+    // The install stops after the Homeserver write of its first version and before the
+    // commit that records it. The next run finds that copy already there and records it, so
+    // a missing copy later still needs the user's word (Switch spec 12.6 step 1).
+    let counted = World::new();
+    let counting = Arc::new(pubky_switch_client::store::FaultStore::new(
+        Arc::new(MemoryStore::new()),
+        pubky_switch_client::store::Fault::None,
+    ));
+    let mut signer = Signer::create(
+        counted.env(counting.clone()),
+        counted.keyring(),
+        SWITCH_ORIGIN,
+    )
+    .await
+    .unwrap();
+    signer.resume().await.unwrap();
+    let last = counting.commits();
+    let world = World::new();
+    let memory = Arc::new(MemoryStore::new());
+    let stopping = Arc::new(pubky_switch_client::store::FaultStore::new(
+        memory.clone(),
+        pubky_switch_client::store::Fault::StopBefore(last),
+    ));
+    let mut signer = Signer::create(world.env(stopping), world.keyring(), SWITCH_ORIGIN)
+        .await
+        .unwrap();
+    signer.resume().await.unwrap_err();
+    assert!(world.published().is_some(), "written before the stop");
+    drop(signer);
+    let mut signer = Signer::open(world.env(memory.clone()), world.keyring())
+        .await
+        .unwrap();
+    signer.resume().await.unwrap();
+    drop(signer);
+    world.homeserver.files.lock().unwrap().remove(IDENTITY_PATH);
+    let (_, router) = new_service(&world);
+    router.remove(SWITCH_ORIGIN);
+    let mut signer = reopened(&world, memory, &router, notes()).await;
+    assert_eq!(
+        signer
+            .declare_provider_loss(NEW_ORIGIN, confirmed())
+            .await
+            .unwrap_err(),
+        Refusal::HomeserverCopyMissing.into()
+    );
+}
+
+#[tokio::test]
+async fn test_provider_loss_pre_read_takes_only_this_recoverys_version() {
+    // The first service holds another install's version, not this recovery's: declared
+    // again there, the read under the earlier key doesn't take it (Switch spec 12.6 step 1).
+    let world = World::new();
+    let (mut signer, service, _) = lost_with_an_app(&world, notes()).await;
+    service.fail_next(Fault::LoseAnswer {
+        path: "/identity".into(),
+    });
+    signer
+        .declare_provider_loss(NEW_ORIGIN, confirmed())
+        .await
+        .unwrap_err();
+    let taken = service.identity_doc().unwrap();
+    signer
+        .declare_provider_loss("https://unanswered.example", confirmed())
+        .await
+        .unwrap_err();
+    let theirs = world.other_install_version(&taken, [0x77; 16]);
+    service.deliver_identity(&theirs).unwrap();
+    let _ = signer.declare_provider_loss(NEW_ORIGIN, confirmed()).await;
+    assert_ne!(
+        signer.identity_doc().unwrap().unwrap().hash(),
+        theirs.hash(),
+        "not taken as this recovery's"
+    );
+    assert_eq!(
+        service.identity_doc().unwrap().hash(),
+        theirs.hash(),
+        "nothing signed over it"
+    );
+}
+
+#[tokio::test]
+async fn test_provider_loss_owed_own_version_judges_the_backup() {
+    // As above, but the first install's publication elsewhere fails: only its backup shows
+    // it signs there, and the restored install still signs nothing (Switch wire 3.13).
+    let world = World::new();
+    let (mut first, service, router) = lost_with_an_app(&world, notes()).await;
+    service.fail_next(Fault::Unreachable {
+        path: "/identity".into(),
+        after: 0,
+    });
+    first
+        .declare_provider_loss(NEW_ORIGIN, confirmed())
+        .await
+        .unwrap_err();
+    for path in ["/apps", "/identity"] {
+        service.fail_next(Fault::Unreachable {
+            path: path.into(),
+            after: 0,
+        });
+    }
+    let mut restored = restored_from_the_backup(&world, &router).await;
+    service_on(&world, &router, THIRD_ORIGIN, 0x6e);
+    *world.homeserver.failing_path.lock().unwrap() = Some(IDENTITY_PATH.into());
+    first
+        .declare_provider_loss(THIRD_ORIGIN, confirmed())
+        .await
+        .unwrap_err();
+    *world.homeserver.failing_path.lock().unwrap() = None;
+    assert_eq!(world.backup().identity_doc().inbox().url, THIRD_ORIGIN);
+    let error = restored.resume().await.unwrap_err();
+    assert!(matches!(error, SignerError::NotNamed { .. }), "{error:?}");
+    assert_ne!(
+        service.identity_doc().unwrap().body().signer,
+        restored.install_id()
+    );
 }
