@@ -642,3 +642,30 @@ async fn test_kept_batch_status_signed_again_and_applied_is_found_in_the_old_cha
     );
     assert_eq!(attempts_at(&last), 0);
 }
+
+/// A restore in place replaces the namespace with the backup: the end of a batch dropped
+/// before it and its indexes go with it, and no read answers them after.
+#[tokio::test]
+async fn test_kept_batch_status_end_is_not_carried_by_a_restore() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let (id, signed, me) = sent_past_the_window(&w, &router).await;
+    let mut app = load_on(&w, &router, Arc::clone(&w.store) as Arc<dyn StateStore>, me)
+        .await
+        .unwrap();
+    app.receive(None).await.unwrap();
+    assert!(reads_agree(&app, signed.msg_id()).await.is_some());
+    let backup = app.backup().await.unwrap();
+    drop(app);
+    let app = App::restore(
+        router.env(&w, Arc::clone(&w.store) as Arc<dyn StateStore>),
+        w.protocol.clone(),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    assert_eq!(app.kept_batch(id).await.unwrap(), None);
+    assert_eq!(reads_agree(&app, signed.msg_id()).await, None);
+    assert_eq!(end_keys(&app).await, 0);
+}

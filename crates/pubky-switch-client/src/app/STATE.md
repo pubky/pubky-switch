@@ -122,7 +122,10 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
 - **A backup doesn't carry `opq/`, `sent/` or `sentt/`.** A kept batch's messages go into
   the outbox only with the batch's answer, so a restored app neither sends the batch nor
   delivers the messages it would have queued; the restore's reconcile mode reads the shared
-  records and claims, and the protocol queues what it still owes again. A restored app
+  records and claims, and the protocol queues what it still owes again. Nor does it carry
+  the ends of kept batches and their indexes (`kb/`, `kbt/`, `kbm/`, `kba/`): a restored
+  app's `App::kept_batch`, `App::kept_attempt` and `App::delivery` know nothing of a batch
+  kept before the restore. A restored app
   answers re-send requests only for what it delivers after the restore.
 
 ## Keys
