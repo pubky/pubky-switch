@@ -32,7 +32,10 @@ pub use messaging::messaging;
 pub use removal::{departure, revocation};
 pub use renewal::renewal;
 pub use restore::restore;
-pub use retries::{app_retries, append_retry, signer_retries};
+pub use retries::{
+    app_retries, append_retry, claim_and_read_retries, claim_retries, removal_retries,
+    signer_retries,
+};
 pub use watching::watching;
 
 use crate::{FlowResult, World};
@@ -64,6 +67,11 @@ pub const FLOWS: &[(&str, Flow)] = &[
     ("signer retries", |world| Box::pin(signer_retries(world))),
     ("app retries", |world| Box::pin(app_retries(world))),
     ("append retry", |world| Box::pin(append_retry(world))),
+    ("removal retries", |world| Box::pin(removal_retries(world))),
+    ("claim and read retries", |world| {
+        Box::pin(claim_and_read_retries(world))
+    }),
+    ("claim retries", |world| Box::pin(claim_retries(world))),
 ];
 
 /// The flow that sends `call` to the service; `None` for a call the service doesn't serve
