@@ -29,7 +29,7 @@ use serde_json::Value;
 use crate::HarnessError;
 use crate::check::Checker;
 use crate::service::{RealSwitch, database_configured};
-use crate::trace::{Names, Recorder, Trace};
+use crate::trace::{Fault, Names, Recorder, Trace};
 
 /// The seed of the operator key every switch of a world signs with where it can't tie an
 /// answer to an account (Switch wire 7.1): the scripted switch's fixed one.
@@ -278,6 +278,29 @@ impl World {
     /// that a switch answering differently is noticed where the client itself accepts it.
     pub fn distort(&self, distort: impl Fn(&Request, &mut Response) + Send + Sync + 'static) {
         self.recorder.distort(distort);
+    }
+
+    /// Lose the answer to the next `method` request whose path contains `path`: the switch
+    /// takes the request and answers, and the caller sees a timeout.
+    pub fn lose_answer(&self, method: &str, path: &str) {
+        self.recorder.fail_next(Fault::LoseAnswer {
+            method: method.to_owned(),
+            path: path.to_owned(),
+        });
+    }
+
+    /// Make the switch unreachable for the next `method` request whose path contains
+    /// `path`: nothing is applied, and the caller fails to connect.
+    pub fn unreachable(&self, method: &str, path: &str) {
+        self.recorder.fail_next(Fault::Unreachable {
+            method: method.to_owned(),
+            path: path.to_owned(),
+        });
+    }
+
+    /// The faults asked for that no request has met yet.
+    pub fn faults_left(&self) -> usize {
+        self.recorder.faults_left()
     }
 
     /// A request no key signs, as any reader of the network sends it: `method path` at
