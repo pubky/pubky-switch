@@ -1294,10 +1294,7 @@ impl App {
             // No local ID is given out twice: past the backup's counter, the counter of the
             // store restored in place, every ID a carried duty event names, and every entry
             // the backup brings back.
-            let old_next = match old.get_raw(key::STORED_NEXT.as_bytes()).await? {
-                Some(bytes) => state::decode::<u64>(&bytes).unwrap_or(FIRST_STORED_ID),
-                None => FIRST_STORED_ID,
-            };
+            let old_next = Self::stored_next_of(&old).await?;
             let next_stored_id = state
                 .next_stored_id
                 .max(backup.stored_next)
@@ -1776,6 +1773,26 @@ impl App {
             _ => carried.next_duty = past_kept,
         }
         Ok(Some(carried))
+    }
+
+    /// The local ID the store's next entry stored locally would take, for a restore in
+    /// place: its counter (`parkid`) and, past it, every `parked/` and `sretry/` key it
+    /// holds. A counter that doesn't read, from a store that was damaged or of another
+    /// schema, gives way to those keys rather than to the first ID.
+    async fn stored_next_of(reader: &Reader) -> Result<u64, AppError> {
+        let counter = match reader.get_raw(key::STORED_NEXT.as_bytes()).await? {
+            Some(bytes) => state::decode::<u64>(&bytes).ok(),
+            None => None,
+        };
+        let mut next = counter.unwrap_or(FIRST_STORED_ID);
+        for prefix in ["parked/", "sretry/"] {
+            for (rest, _) in reader.scan_raw(prefix).await? {
+                if let Ok(id) = state::parse_num(&rest) {
+                    next = next.max(id.saturating_add(1));
+                }
+            }
+        }
+        Ok(next)
     }
 
     /// The ID the next duty event takes: past the counter and every kept event.

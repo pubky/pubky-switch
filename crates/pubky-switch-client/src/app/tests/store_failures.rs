@@ -1856,3 +1856,52 @@ async fn test_restore_in_place_of_an_older_backup_gives_out_no_id_the_store_gave
     let again = restored.stored_id_at(seq).unwrap();
     assert!(again > id, "ID {again} given out again");
 }
+
+#[tokio::test]
+async fn test_restore_in_place_over_an_unreadable_counter_gives_out_no_id_an_event_names() {
+    let w = World::new();
+    let protocol = FlakyProtocol::new(0);
+    let mut app = join_flaky(&w, &protocol, "wallet").await;
+    let backup = app.backup_layered().await.unwrap();
+    let old_id = stored_for_good(&w, &mut app, "refused").await;
+    // The store's counter no longer reads, and the entry's record is gone: only the duty
+    // events that name it are left of its ID.
+    let mut tx = app.tx().unwrap();
+    tx.put(crate::app::state::key::STORED_NEXT, &"unreadable")
+        .unwrap();
+    tx.delete(&crate::app::state::key::parked(old_id)).unwrap();
+    app.commit(tx).await.unwrap();
+    drop(app);
+    let mut restored = App::restore(w.env(), protocol.clone(), flaky_config(), &backup)
+        .await
+        .unwrap();
+    restored.receive(None).await.unwrap();
+    let new_id = stored_for_good(&w, &mut restored, "refused again").await;
+    assert!(new_id > old_id, "ID {new_id} given out again");
+}
+
+#[tokio::test]
+async fn test_restore_in_place_over_an_unreadable_counter_gives_out_no_id_the_store_holds() {
+    let w = World::new();
+    let flaky = FlakyProtocol::failing(u32::MAX, StoreError::Corrupt, Mode::Plain);
+    let mut app = join_flaky(&w, &flaky, "wallet").await;
+    let backup = app.backup_layered().await.unwrap();
+    // An entry stored for the store's failure, which no duty event names; then the
+    // store's counter no longer reads.
+    let (seq, _) = w.note(app.app_id(), FLAKY);
+    app.receive(None).await.unwrap();
+    let id = app.stored_id_at(seq).unwrap();
+    let mut tx = app.tx().unwrap();
+    tx.put(crate::app::state::key::STORED_NEXT, &"unreadable")
+        .unwrap();
+    app.commit(tx).await.unwrap();
+    drop(app);
+    // Restored in place from the older backup: the note is read again and stored again,
+    // past the ID the store held.
+    let mut restored = App::restore(w.env(), flaky.clone(), flaky_config(), &backup)
+        .await
+        .unwrap();
+    restored.receive(None).await.unwrap();
+    let again = restored.stored_id_at(seq).unwrap();
+    assert!(again > id, "ID {again} given out again");
+}
