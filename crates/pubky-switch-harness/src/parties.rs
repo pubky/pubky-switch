@@ -20,9 +20,13 @@ pub const NOTES: &str = "notes";
 /// The message kind the notes apps accept.
 pub const NOTE_KIND: &str = "example.note";
 
-/// A protocol with one neutral scope, [`NOTES`], which has keys and needs every switch
-/// permission, so its apps read and change the lists and write claims: the signer's side of
-/// it.
+/// A scope of the [`Notes`] protocol without keys, whose apps hold `lists.manage` alone:
+/// they change the lists and can't read them.
+pub const NOTES_LISTS: &str = "notes_lists";
+
+/// A neutral protocol, the signer's side of it. Its scope [`NOTES`] has keys and needs every
+/// switch permission, so its apps read and change the lists and write claims; its scope
+/// [`NOTES_LISTS`] has no keys and needs `lists.manage` alone.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Notes;
 
@@ -32,15 +36,19 @@ impl Protocol for Notes {
     }
 
     fn scopes(&self) -> Vec<ScopeDef> {
-        vec![ScopeDef::keyed(NOTES)]
+        vec![ScopeDef::keyed(NOTES), ScopeDef::unkeyed(NOTES_LISTS)]
     }
 
     fn check_scopes(&self, _: &[&str]) -> Result<(), String> {
         Ok(())
     }
 
-    fn permissions(&self, _: &[&str]) -> Vec<Permission> {
-        Permission::ALL.to_vec()
+    fn permissions(&self, scopes: &[&str]) -> Vec<Permission> {
+        if scopes.contains(&NOTES) {
+            Permission::ALL.to_vec()
+        } else {
+            vec![Permission::ListsManage]
+        }
     }
 
     fn grant_paths(&self, _: &[u8; 16], _: &[&str]) -> Vec<GrantPath> {
@@ -57,8 +65,8 @@ pub fn notes_protocol() -> Arc<TestProtocol> {
     }))
 }
 
-/// An app that asks to be approved: its keys, its request for the [`NOTES`] scope, and the
-/// auth request the request binds (Switch wire 3.9).
+/// An app that asks to be approved: its keys, its request for one scope, and the auth
+/// request the request binds (Switch wire 3.9).
 #[derive(Clone, Debug)]
 pub struct Asking {
     /// The app's keys.
@@ -77,13 +85,22 @@ impl Asking {
     ///
     /// When the request doesn't sign.
     pub fn new(keys: AppKeys) -> Result<Self, HarnessError> {
+        Self::for_scope(keys, NOTES)
+    }
+
+    /// The same, for `scope`.
+    ///
+    /// # Errors
+    ///
+    /// When the request doesn't sign.
+    pub fn for_scope(keys: AppKeys, scope: &str) -> Result<Self, HarnessError> {
         let auth = AuthRequest {
             client_id: "app.example".into(),
             client_key: [8; 32],
             caps: format!("{}:rw", app_record_path(&keys.app_id_bytes())),
             secret: [9; 32],
         };
-        let body = AppRequestBody::new(&keys, vec![NOTES.to_owned()], &auth);
+        let body = AppRequestBody::new(&keys, vec![scope.to_owned()], &auth);
         let request = AppRequest::sign(&keys, body)
             .map_err(|error| HarnessError::Setup(error.to_string()))?;
         Ok(Self {
