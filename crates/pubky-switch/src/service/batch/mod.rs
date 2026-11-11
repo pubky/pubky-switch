@@ -922,6 +922,12 @@ async fn save(
         }
     }
     save_apps(txn, before, after).await?;
+    // Where keys_through starts, raised as passed parts went.
+    for (target, epoch) in &after.listed_epochs {
+        if before.listed_epochs.get(target) != Some(epoch) {
+            txn.raise_keys_start(target, *epoch).await?;
+        }
+    }
     for (target, parts) in &after.parts {
         if before.parts.get(target) != Some(parts) {
             let stored: Vec<StoredBundlePart> = parts

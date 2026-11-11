@@ -434,6 +434,11 @@ fn key_bundle_put(
                 .map_or(0, |cursor| cursor.seq);
             let through = keys_through(state.listed_epochs.get(&target).copied(), &spans, cursor);
             let gone = parts_to_drop(&spans, cursor, through, full);
+            // The parts that go raised keys_through; it keeps that height without them, so
+            // where it starts rises to it (Switch wire 7.4.12).
+            if let (false, Some(through)) = (gone.is_empty(), through) {
+                state.listed_epochs.insert(target, through);
+            }
             if let Some(parts) = state.parts.get_mut(&target) {
                 let mut index = 0;
                 parts.retain(|_| {

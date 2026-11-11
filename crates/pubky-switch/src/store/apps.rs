@@ -157,6 +157,25 @@ impl AccountTxn {
             .transpose()
     }
 
+    /// Raise where `app`'s `keys_through` starts to `epoch`: the key bundle parts it passed
+    /// that held its keys through `epoch` are gone, so `keys_through` keeps that height from
+    /// here (Switch wire 7.4.12). It never goes down.
+    pub async fn raise_keys_start(&mut self, app: &[u8; 16], epoch: u64) -> Result<(), StoreError> {
+        let id = self.head().id.clone();
+        sqlx::query(
+            "INSERT INTO app_listings (account_id, app_id, listed_epoch) VALUES ($1, $2, $3) \
+             ON CONFLICT (account_id, app_id) \
+             DO UPDATE SET listed_epoch = GREATEST(app_listings.listed_epoch, $3)",
+        )
+        .bind(id)
+        .bind(app.as_slice())
+        .bind(to_db(epoch, "listed_epoch")?)
+        .execute(self.conn())
+        .await
+        .map_err(StoreError::from_db)?;
+        Ok(())
+    }
+
     /// Record that the document this request takes lists `apps` for the first time, at
     /// data epoch `epoch` (Switch wire 7.4.12 `keys_through`).
     pub async fn note_listings(&mut self, apps: &[[u8; 16]], epoch: u64) -> Result<(), StoreError> {

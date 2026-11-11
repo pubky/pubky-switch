@@ -673,3 +673,36 @@ async fn test_keys_passed_parts_stay_while_a_full_bundle_is_requested() {
     assert_eq!(bundle_ranges(&replay, &at).await, json!([[1, 1], [2, 2]]));
     replay.db.drop_database().await.expect("drop");
 }
+
+/// The wallet's `keys_through` in `GET /apps`.
+async fn keys_through(replay: &Replay, at: &str) -> Value {
+    let path = format!("/v1/{}/apps", alice_id());
+    let answer = replay
+        .service
+        .handle(signer_request("GET", &path, Vec::new(), ms(at)))
+        .await;
+    let wallet = app_id("wallet");
+    body(&answer)["apps"]
+        .as_array()
+        .expect("apps")
+        .iter()
+        .find(|status| status["app_id"] == wallet.as_str())
+        .expect("the wallet's status")["keys_through"]
+        .clone()
+}
+
+#[tokio::test]
+async fn test_keys_through_keeps_its_height_once_passed_parts_go() {
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let at = revoke_time();
+    // Epoch 2's part, passed: keys_through rises from 1 to 2.
+    store_parts(&replay, &[(2, 2)], 60, &at).await;
+    wallet_cursor(&replay, 10, &at).await;
+    assert_eq!(keys_through(&replay, &at).await, 2);
+    // The part goes when the next one is stored; keys_through stays at 2 without it.
+    store_parts(&replay, &[(1, 1)], 61, &at).await;
+    assert_eq!(bundle_ranges(&replay, &at).await, json!([[1, 1]]));
+    assert_eq!(keys_through(&replay, &at).await, 2);
+    replay.db.drop_database().await.expect("drop");
+}
