@@ -2041,3 +2041,23 @@ async fn test_restore_tells_the_protocol_again_in_steps() {
     let events = restored.unacknowledged_events().await.unwrap();
     assert!(ids.iter().all(|id| retold(&events, *id) == 1), "{events:?}");
 }
+
+#[tokio::test]
+async fn test_restore_in_place_carrying_a_parked_event_tells_the_protocol_once() {
+    let w = World::new();
+    let protocol = FlakyProtocol::new(0);
+    let mut app = join_flaky(&w, &protocol, "wallet").await;
+    // Stored for good, its duty events not acknowledged; a backup holding it.
+    let id = stored_for_good(&w, &mut app, "refused").await;
+    let backup = layered(&mut app).await;
+    assert_eq!(retold(&app.kept_duties().await.unwrap(), id), 1);
+    drop(app);
+    // Restored in place: the `Parked` event is carried, so the entry isn't told again.
+    let mut restored = App::restore(w.env(), protocol.clone(), flaky_config(), &backup)
+        .await
+        .unwrap();
+    assert!(restored.state.parked.contains_key(&id));
+    restored.receive(None).await.unwrap();
+    let events = restored.unacknowledged_events().await.unwrap();
+    assert_eq!(retold(&events, id), 1, "{events:?}");
+}
