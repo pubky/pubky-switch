@@ -8,6 +8,7 @@
 //! [`FLOWS`] names every flow, and [`flow_of`] says which flow sends each call the service
 //! routes.
 
+mod admission;
 mod claim;
 mod enrollment;
 mod erasure;
@@ -29,6 +30,7 @@ use std::pin::Pin;
 
 use pubky_switch::http::route::Call;
 
+pub use admission::{deny_list, invite_code};
 pub use claim::claim;
 pub use enrollment::enrollment;
 pub use erasure::{erasure, erasure_answer_lost};
@@ -92,6 +94,8 @@ pub const FLOWS: &[(&str, Flow)] = &[
         Box::pin(erasure_answer_lost(world))
     }),
     ("pages", |world| Box::pin(pages(world))),
+    ("invite code", |world| Box::pin(invite_code(world))),
+    ("deny list", |world| Box::pin(deny_list(world))),
 ];
 
 /// The flow that sends `call` to the service; `None` for a call the service doesn't serve
