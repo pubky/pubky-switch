@@ -1959,3 +1959,185 @@ async fn test_inbox_a_departure_without_trusted_time_sets_no_marks() {
     assert_eq!(count(&replay, "missed").await, 0);
     replay.db.drop_database().await.expect("drop");
 }
+
+/// An own app's append on `service`.
+async fn own_append_at(
+    replay: &Replay,
+    service: &pubky_switch::service::Service,
+    name: &str,
+    names: &[&str],
+    byte: u8,
+) -> SwitchResponse {
+    let publics: Vec<[u8; 32]> = names.iter().map(|name| receive_public(name)).collect();
+    let version = apps_version(replay).await;
+    service
+        .handle(app_request(
+            app(&vectors("keys.json"), name),
+            "POST",
+            &format!("/v1/{}/inbox?apps_version={version}", alice_id()),
+            sealed_to(&publics, byte),
+            ms(&at()),
+        ))
+        .await
+}
+
+/// The judgement an append makes before its quota check is undone with the append when a
+/// later check refuses it: no mark, no `missed` item, no deletion stays.
+#[tokio::test]
+async fn test_inbox_a_refused_append_keeps_nothing_of_its_judgement() {
+    let limits = Limits {
+        quota_bytes: 4 * entry_bytes(),
+        sender_share_percent: 50,
+        ..Limits::default()
+    };
+    let Some(replay) = replay_with(limits.clone()).await else {
+        return;
+    };
+    with_bob(&replay).await;
+    register_executor(&replay).await;
+    let quiet = replay.restarted_with(Limits {
+        mark_lagging: false,
+        ..limits
+    });
+    // bob holds his share: two entries for both apps, which wait for the wallet.
+    append_at(&replay, &quiet, &["executor", "wallet"], 1).await;
+    append_at(&replay, &quiet, &["executor", "wallet"], 2).await;
+    // The wallet's own two entries for the executor: the executor is over its share,
+    // unmarked; the wallet is within its own, reading.
+    for byte in 3..=4 {
+        let answer = own_append_at(&replay, &quiet, "wallet", &["executor"], byte).await;
+        assert_eq!(
+            answer.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&answer.body)
+        );
+    }
+    assert!(!lagging(&replay, "executor").await);
+    assert_eq!(count(&replay, "entry").await, 4);
+    // bob again: the judgement before the quota check would mark the executor and let the
+    // wallet's two entries go; then bob's share refuses him, and all of it is undone.
+    let publics = [receive_public("executor"), receive_public("wallet")];
+    let version = apps_version(&replay).await;
+    let answer = from_shop(&replay, sealed_to(&publics, 5), Some(version), None).await;
+    let (status, code) = code_of(&answer);
+    assert_eq!((status, code), (429, json!("quota_exceeded")));
+    assert_eq!(body(&answer)["current"]["limit"], json!("sender_share"));
+    assert_eq!(
+        (
+            lagging(&replay, "executor").await,
+            count(&replay, "entry").await,
+            count(&replay, "missed").await
+        ),
+        (false, 4, 0)
+    );
+    // Control: an append the same judgement lets through (alice's own share is freed by
+    // the deletions it makes) keeps what it deleted: the wallet's two entries are in the
+    // executor's missed item. The judgement after the add finds the wallet past its share
+    // with the executor marked, so no app reads and the mark ends in the same request.
+    let answer = own_append_at(&replay, &replay.service, "executor", &["wallet"], 6).await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    assert_eq!(count(&replay, "missed").await, 1);
+    assert_eq!(count(&replay, "entry").await, 3);
+    assert!(!lagging(&replay, "executor").await);
+    replay.db.drop_database().await.expect("drop");
+}
+
+/// An append without trusted time judges no marks, before its quota check or after its add
+/// (Switch wire 7.4.4).
+#[tokio::test]
+async fn test_inbox_an_append_without_trusted_time_sets_no_marks() {
+    let Some(replay) = lagging_replay().await else {
+        return;
+    };
+    let untrusted = replay.without_trusted_time_with(lagging_limits());
+    for byte in 1..=4 {
+        append_at(&replay, &untrusted, &["executor"], byte).await;
+    }
+    assert!(!lagging(&replay, "executor").await);
+    assert_eq!(count(&replay, "entry").await, 4);
+    assert_eq!(count(&replay, "missed").await, 0);
+    replay.db.drop_database().await.expect("drop");
+}
+
+/// alice's signer delivers `version`, `prev` with `change`, at `service`: the document.
+async fn deliver_alice_at(
+    service: &pubky_switch::service::Service,
+    prev: &SignedDoc,
+    version: u64,
+    change: impl FnOnce(&mut pubky_switch_core::records::IdentityBody),
+) -> SignedDoc {
+    let mut body: pubky_switch_core::records::IdentityBody =
+        serde_json::from_slice(&prev.body_bytes().expect("body")).expect("body");
+    body.version = version;
+    change(&mut body);
+    let key = pubky_switch_core::keys::IdentityKey::from_secret(hex32(
+        &alice(&vectors("keys.json"))["secret_hex"],
+    ));
+    let next = pubky_switch_core::records::IdentityDoc::sign(&key, body)
+        .expect("sign")
+        .signed()
+        .clone();
+    let delivery = pubky_switch_core::http::IdentityDelivery {
+        identity: next.clone(),
+        prev: Some(prev.doc_hash().expect("hash")),
+    }
+    .to_json();
+    let path = format!("/v1/{}/identity", alice_id());
+    let answer = service
+        .handle(signer_request("PUT", &path, delivery, ms(&at())))
+        .await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    next
+}
+
+/// A delivery that swaps one current app for another changes the set of current apps,
+/// whatever their number: its marks are judged (Switch wire 7.4.4). The phone leaves at a
+/// service that marks no app; then a delivery lists it again in the wallet's place, two
+/// current apps before and after, and the executor, over its share with the phone reading,
+/// is marked.
+#[tokio::test]
+async fn test_inbox_a_delivery_swapping_current_apps_judges_the_marks() {
+    let Some(replay) = three_apps_with_a_backlog().await else {
+        return;
+    };
+    let quiet = replay.restarted_with(Limits {
+        mark_lagging: false,
+        ..lagging_limits()
+    });
+    let id = |name: &str| app_id_of(name);
+    let v3 = doc("alice identity.json");
+    let phone = v3_entry(&v3, id("phone"));
+    let v4 = deliver_alice_at(&quiet, &v3, 4, |body| {
+        body.apps.retain(|listed| listed.app_id != id("phone"));
+    })
+    .await;
+    assert!(!lagging(&replay, "executor").await);
+    deliver_alice_at(&replay.service, &v4, 5, |body| {
+        body.apps.retain(|listed| listed.app_id != id("wallet"));
+        body.apps.push(phone);
+    })
+    .await;
+    assert!(lagging(&replay, "executor").await);
+    replay.db.drop_database().await.expect("drop");
+}
+
+/// `app`'s entry in the `apps` of `doc`.
+fn v3_entry(doc: &SignedDoc, app: [u8; 16]) -> pubky_switch_core::records::ListedApp {
+    let body: pubky_switch_core::records::IdentityBody =
+        serde_json::from_slice(&doc.body_bytes().expect("body")).expect("body");
+    body.apps
+        .into_iter()
+        .find(|listed| listed.app_id == app)
+        .expect("listed")
+}
