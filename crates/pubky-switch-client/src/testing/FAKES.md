@@ -198,6 +198,10 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   new staged account, where this switch answers it with the operator's `404` too. That account
   can't serve at the service yet either: its first `identity.json`, at the next generation with
   `recovery_from` (Switch wire 7.4.16), gets the `503` "a generation change isn't served yet".
+  This switch deletes everything at once and owes no key: its `404` comes right after the
+  erasure. The service can owe the erased account's key when its key store fails, and until
+  the key is gone it answers a request signed with the identity key, whatever its timestamp,
+  with the operator's `503` in place of that `404`; every other caller gets the `404` at once.
 - **Push** (Switch wire 8.1): registrations only; nothing is sent to a relay.
 
 ## Signer flows tested only here

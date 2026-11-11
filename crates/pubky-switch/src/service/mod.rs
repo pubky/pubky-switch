@@ -88,8 +88,9 @@ pub struct Service {
     sender_rate: KeyedMinutes<(String, [u8; 32])>,
     sender_app_rate: KeyedMinutes<(String, [u8; 16])>,
     notify_rate: KeyedMinutes<(String, [u8; 32])>,
-    /// The sweeps a retried erasure of an account gone may run (Switch wire 7.4.16): the
-    /// request is unauthenticated, so they are bounded per account.
+    /// The sweeps a retried erasure of an account gone may run (Switch wire 7.4.16): only
+    /// the signer's, verified with the identity key, and bounded per account, since anyone
+    /// who saw one can replay it within its timestamp window.
     erasure_sweeps: KeyedMinutes<String>,
     changes: Arc<ChangeHub>,
     /// Where entry IDs come from: random, opaque to senders (Switch wire 1.7).
@@ -376,10 +377,18 @@ impl Service {
         let found = match self.store.lookup(&account).await {
             Ok(Some(found)) => found,
             Ok(None) => {
+                // Only the identity's own signer, its request signed with the key `{id}`
+                // names, waits on an erasure's keys: no one else learns anything from it. A
+                // signer whose clock is off still waits, since it can't retry at the
+                // service's time as it would at a hosted account (Switch wire 7.1).
+                let signed = self.signed_by_identity(&account, &request, base_ms);
+                let by_signer = signed.is_some();
                 // A retried erasure whose `200` was withheld while its keys were owed: the
-                // sweep runs again, at most a few times a minute for the account, since the
-                // request is unauthenticated (Switch wire 7.4.16).
-                if request.route.call == Call::Erase
+                // sweep runs again, only for a request within the time window, at most a few
+                // times a minute for the account, since a verified request can be replayed
+                // (Switch wire 7.4.16).
+                if signed == Some(true)
+                    && request.route.call == Call::Erase
                     && matches!(self.store.owes_erased_keys(&account).await, Ok(true))
                     && self
                         .erasure_sweeps
@@ -388,7 +397,7 @@ impl Service {
                 {
                     let _ = self.sweep_erased_keys().await;
                 }
-                let error = self.no_such_account(&account).await;
+                let error = self.no_such_account(&account, by_signer).await;
                 return self
                     .operator_answer(request_signature.as_ref(), base_ms, &error)
                     .await;
@@ -403,6 +412,7 @@ impl Service {
         let stamped_ms = found.stamped_time_ms;
         // The key the account had at the lookup, which an answer after a wait checks again.
         let looked_up_key = found.service_key.clone();
+        let (account_ref, looked_up_ref) = (&account, &looked_up_key);
         let refused_early = |error: ApiError| {
             let signature = if *call == Call::GetIdentity {
                 None
@@ -410,6 +420,18 @@ impl Service {
                 request_signature
             };
             async move {
+                // A read of the account's state that finds no account: erased since the
+                // lookup, its key maybe still in the store while owed. As for an account the
+                // service doesn't host, never signed with that key (7.4.16).
+                if error.code == ErrorCode::NotFound
+                    && let Some(gone) = self
+                        .no_longer_keyed(account_ref, looked_up_ref, false)
+                        .await
+                {
+                    return self
+                        .operator_answer(signature.as_ref(), base_ms, &gone)
+                        .await;
+                }
                 self.early_answer(&found, signature.as_ref(), base_ms, &error)
                     .await
             }
@@ -528,9 +550,10 @@ impl Service {
         let txn = match begun {
             Ok(Some(txn)) => txn,
             // Erased between the lookup and the lock: as for an account the service doesn't
-            // host, held back while the erasure's key is owed (7.4.16).
+            // host, the signer's answer held back while the erasure's keys are owed (7.4.16).
             Ok(None) => {
-                let error = self.no_such_account(&account).await;
+                let by_signer = caller.as_ref().is_some_and(|c| c.caller == Caller::Signer);
+                let error = self.no_such_account(&account, by_signer).await;
                 return self
                     .operator_answer(request_signature.as_ref(), base_ms, &error)
                     .await;
@@ -538,7 +561,11 @@ impl Service {
             // The wait for the lock, or for a reader's turn, can outlast an erasure whose key
             // stays owed: never signed with the key looked up before it (7.4.16).
             Err(error) => {
-                if let Some(error) = self.no_longer_keyed(&account, &looked_up_key).await {
+                let by_signer = caller.as_ref().is_some_and(|c| c.caller == Caller::Signer);
+                if let Some(error) = self
+                    .no_longer_keyed(&account, &looked_up_key, by_signer)
+                    .await
+                {
                     return self
                         .operator_answer(request_signature.as_ref(), base_ms, &error)
                         .await;
@@ -831,6 +858,7 @@ impl Service {
         }
         let txn_account = txn.head().id.clone();
         let txn_key = txn.head().service_key.clone();
+        let by_signer = caller.is_some_and(|c| c.caller == Caller::Signer);
         let fallback_head = if answer.deferred.is_some() {
             self.head(&txn, &signer).await
         } else {
@@ -860,7 +888,9 @@ impl Service {
                         Err(error) => {
                             // Erased, or erased and enrolled again, once the lock was gone:
                             // never signed with the erased account's key (7.4.16).
-                            if let Some(error) = self.no_longer_keyed(&txn_account, &txn_key).await
+                            if let Some(error) = self
+                                .no_longer_keyed(&txn_account, &txn_key, by_signer)
+                                .await
                             {
                                 return self.operator_answer(signature, base_ms, &error).await;
                             }
@@ -871,7 +901,10 @@ impl Service {
                         let read = Self::allow_body(read).await;
                         // Signed once the lock is gone: only while the account still names the
                         // key, as every such answer (7.4.16).
-                        if let Some(error) = self.no_longer_keyed(&txn_account, &txn_key).await {
+                        if let Some(error) = self
+                            .no_longer_keyed(&txn_account, &txn_key, by_signer)
+                            .await
+                        {
                             return self.operator_answer(signature, base_ms, &error).await;
                         }
                         match read {
@@ -898,7 +931,7 @@ impl Service {
                             Ok((page, at)) => sign_answer(&signer, signature, at, page),
                             // Erased while the read waited: as an unknown account (step 2).
                             Err(feed::FeedStop::Gone) => {
-                                let error = self.no_such_account(&txn_account).await;
+                                let error = self.no_such_account(&txn_account, by_signer).await;
                                 self.operator_answer(signature, base_ms, &error).await
                             }
                             // Its key retired while the read waited: never signed with it.
@@ -913,8 +946,9 @@ impl Service {
                                 }
                                 // Signed once the lock is gone: only while the account still
                                 // names the key, as every such answer (7.4.16).
-                                if let Some(error) =
-                                    self.no_longer_keyed(&txn_account, &txn_key).await
+                                if let Some(error) = self
+                                    .no_longer_keyed(&txn_account, &txn_key, by_signer)
+                                    .await
                                 {
                                     return self.operator_answer(signature, base_ms, &error).await;
                                 }
@@ -937,7 +971,10 @@ impl Service {
             // behind: answer at the time last committed. A mark that didn't move because an
             // erasure deleted the key once the lock was gone is never answered with it.
             Err(()) => {
-                if let Some(error) = self.no_longer_keyed(&txn_account, &txn_key).await {
+                if let Some(error) = self
+                    .no_longer_keyed(&txn_account, &txn_key, by_signer)
+                    .await
+                {
                     return self.operator_answer(signature, base_ms, &error).await;
                 }
                 sign_answer(
@@ -952,25 +989,35 @@ impl Service {
 
     /// Before an answer is signed, once the account's lock is gone, with `key`, the key the
     /// request loaded: `None` while `account` still names it. Otherwise the operator's answer
-    /// to give instead: `404` for an account erased since, as for one the service doesn't host
-    /// (Switch wire 7.3 step 2), and `503` for one enrolled again under another key, or one
-    /// that can't be looked up. So nothing is signed with a key after its account's erasure
-    /// was answered (7.4.16).
-    pub(super) async fn no_longer_keyed(&self, account: &str, key: &KeyId) -> Option<ApiError> {
+    /// to give instead: as for an account the service doesn't host, for one erased since
+    /// (Switch wire 7.3 step 2, [`Self::no_such_account`] for the request's signer when
+    /// `by_signer`), and `503` for one enrolled again under another key, or one that can't
+    /// be looked up. So nothing is signed with a key after its account's erasure was
+    /// answered (7.4.16).
+    pub(super) async fn no_longer_keyed(
+        &self,
+        account: &str,
+        key: &KeyId,
+        by_signer: bool,
+    ) -> Option<ApiError> {
         match self.store.lookup(account).await {
             Ok(Some(found)) if found.service_key == *key => None,
-            Ok(None) => Some(self.no_such_account(account).await),
+            Ok(None) => Some(self.no_such_account(account, by_signer).await),
             Ok(Some(_)) | Err(_) => Some(ApiError::unavailable("7.6: a temporary failure")),
         }
     }
 
     /// The operator's answer for an identity whose account the service doesn't host (Switch
-    /// wire 7.3 step 2): `404`, once no key of an erased account of the identity is still
-    /// owed; `503` while one is, or when that can't be read. The signer takes the `404` after
-    /// a request in doubt as its erasure done, at a retry or at a read (7.4.16), so it waits
-    /// until the erased account's key is gone. A key still owed from an earlier account of the
-    /// same identity holds a later erasure's `404` back the same way.
-    async fn no_such_account(&self, account: &str) -> ApiError {
+    /// wire 7.3 step 2): `404`. To the identity's signer, `by_signer`, only once no key of an
+    /// erased account of the identity is still owed; `503` while one is, or when that can't be
+    /// read. The signer takes the `404` after a request in doubt as its erasure done, at a
+    /// retry or at a read (7.4.16), so it waits until the erased account's key is gone. A key
+    /// still owed from an earlier account of the same identity holds a later erasure's `404`
+    /// back the same way. Anyone else gets the `404` at once, without the store read.
+    async fn no_such_account(&self, account: &str, by_signer: bool) -> ApiError {
+        if !by_signer {
+            return ApiError::not_found("no such account");
+        }
         match self.store.owes_erased_keys(account).await {
             Ok(false) => ApiError::not_found("no such account"),
             Ok(true) | Err(_) => ApiError::unavailable("7.6: a temporary failure"),
@@ -1491,6 +1538,30 @@ impl Service {
             })?;
         }
         Ok(claimed)
+    }
+
+    /// Whether `request` comes from the signer of the identity `account` names: `Some` when
+    /// its headers and request signature verify with that identity key, without
+    /// `Switch-App`, over its own `Switch-Timestamp` whatever its skew (Switch wire 7.1);
+    /// `Some(true)` when that timestamp is also within 5 minutes of the service's time.
+    /// Checked for an account the service doesn't host, so it records no failed
+    /// authentication: the answer is the same either way.
+    ///
+    /// The skew doesn't count here: at a hosted account a signer whose clock is off gets a
+    /// signed `stale_timestamp` and retries at the service's time, which the operator's
+    /// answer can't tell it. The cost: anyone who saw one signer request can replay it, later,
+    /// to learn that the identity's erased account still owes a key here.
+    fn signed_by_identity(
+        &self,
+        account: &str,
+        request: &SwitchRequest,
+        base_ms: u64,
+    ) -> Option<bool> {
+        let identity_key = pubky_switch_core::enc::pubky_key(account).ok()?;
+        let text = request.headers.get(header::TIMESTAMP)?.to_str().ok()?;
+        let signed_at = pubky_switch_core::time::parse_rfc3339(text).ok()?;
+        let claimed = self.authenticate(&identity_key, request, signed_at).ok()?;
+        (claimed.caller == Caller::Signer).then(|| rules::check_timestamp(text, base_ms).is_ok())
     }
 
     fn record_failure(&self, request: &SwitchRequest, account: String) {

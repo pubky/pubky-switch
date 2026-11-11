@@ -227,9 +227,9 @@ impl Signer {
             Err(SignerError::Refused(Refusal::RecordsBehind { .. }))
         );
         let checked = if behind {
-            self.switch_at_mark().await
+            self.switch_at_mark().await.map(drop)
         } else if full {
-            self.check_copies().await
+            self.check_copies().await.map(drop)
         } else {
             self.switch_and_homeserver().await
         };

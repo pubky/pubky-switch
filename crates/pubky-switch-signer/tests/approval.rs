@@ -546,3 +546,40 @@ async fn test_approval_a_reopened_signer_releases_the_same_claim_bytes() {
         .verify(&world.key.public(), &app.auth)
         .unwrap();
 }
+
+#[tokio::test]
+async fn test_approval_clock_check_isnt_widened_by_a_slow_backup_read() {
+    // The device clock is 5.5 minutes behind the switch, the tolerance 5. The copy check
+    // reads `GET /apps`, then the signer backup, which takes 60 s here. The clock check
+    // compares the switch's time with the device clock when that answer came, not after the
+    // backup read: refused (Switch spec 10.1).
+    use pubky_switch_client::clock::TestClock;
+    use pubky_switch_core::records::SIGNER_BACKUP_PATH;
+    use std::sync::Arc;
+    let world = World::new();
+    let (signer, store) = world.enrolled().await;
+    drop(signer);
+    let device = Arc::new(TestClock::new(START_MS - 330_000));
+    let mut env = world.env(store);
+    env.clock = device.clone();
+    let mut signer = pubky_switch_signer::Signer::open(env, world.keyring())
+        .await
+        .unwrap();
+    let switch_clock = Arc::clone(&world.clock);
+    let device_clock = Arc::clone(&device);
+    *world.homeserver.after_get.lock().unwrap() = Some((
+        SIGNER_BACKUP_PATH.to_owned(),
+        1,
+        Box::new(move || {
+            switch_clock.advance_ms(60_000);
+            device_clock.advance_ms(60_000);
+        }),
+    ));
+    let app = App::new(&["notes"], None, [9; 32]);
+    let review = signer.review(&app.request, &app.auth).unwrap();
+    let error = signer.approve(review).await.unwrap_err();
+    assert!(
+        matches!(error, SignerError::Refused(Refusal::ClockOff { .. })),
+        "{error:?}"
+    );
+}
