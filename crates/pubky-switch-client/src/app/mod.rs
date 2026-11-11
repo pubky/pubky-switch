@@ -572,8 +572,13 @@ struct Carried {
 
 /// The entry a kept effect belongs to, as a backup holds it: stored as
 /// [`ParkReason::Uncertain`], under its local ID if it was stored before (its flags kept),
-/// else under the next one, built from what the kept effect keeps of it.
-fn uncertain_copy(state: &AppState, pending: &PendingEffect) -> (u64, ParkedEntry) {
+/// else under `reserved`, the ID the live store reserved for it, built from what the kept
+/// effect keeps of it.
+fn uncertain_copy(
+    state: &AppState,
+    pending: &PendingEffect,
+    reserved: Option<u64>,
+) -> (u64, ParkedEntry) {
     if let Some((id, stored)) = pending
         .stored
         .and_then(|id| state.parked.get(&id).map(|stored| (id, stored)))
@@ -588,7 +593,7 @@ fn uncertain_copy(state: &AppState, pending: &PendingEffect) -> (u64, ParkedEntr
         );
     }
     (
-        state.next_stored_id,
+        reserved.unwrap_or(state.next_stored_id),
         ParkedEntry {
             seq: pending.seq,
             generation: pending.generation,
@@ -1068,7 +1073,8 @@ impl App {
     /// backup holds at most [`MAX_UNVERIFIED_TOTAL`] of them, and keeps the duty events of
     /// what they drop. So it needs a writable store, and the drops stay committed even if
     /// the backup is then refused. An app a read wouldn't run on (stopped by an alarm, left,
-    /// or no longer current here) skips the bounds and only reads its store.
+    /// or no longer current here) skips the bounds, and its backup only reads the store but
+    /// for the one counter write below.
     ///
     /// It makes no network call. A kept effect isn't settled first, and a restore never
     /// carries one: the backup holds the effect's entry as what it is once the effect is
@@ -1076,7 +1082,17 @@ impl App {
     /// flags, such as a release, kept) with the processed pair of its message, an entry read
     /// from the feed included. The restored app's bounds never drop it, its host may release
     /// it, and its read of the feed entry again is a duplicate, never a second application.
-    /// The live store keeps the kept effect, which the app's next read settles.
+    /// The live store keeps the kept effect, which the app's next read settles. An entry
+    /// read from the feed takes a local ID the live store reserves for it first, by moving
+    /// its stored-entry counter on (`parkid`), on a halted app too: the backup's counter is
+    /// one past it, and the live store never gives that ID to another entry, which a restore
+    /// in place would install the copy over. The counter is the one write; it changes
+    /// nothing a read or the protocol sees.
+    ///
+    /// The restored app tells its protocol of the copy as stored `Uncertain`
+    /// ([`AppEvent::Parked`]), but not which of the kept batch's attempts are uncertain, as
+    /// [`AppEvent::EffectUncertain`] would: the restore's reconcile mode covers that, since
+    /// the protocol makes no new attempt until it has reconciled from the claims.
     ///
     /// # Errors
     ///
@@ -1099,6 +1115,24 @@ impl App {
             if !halted {
                 self.bound_unverified().await?;
             }
+            // The local ID the copy of a kept effect's feed entry takes is reserved in the
+            // live store first, for a halted app too: the backup's only write there, which
+            // changes nothing a read or the protocol sees. Without it, the next entry the
+            // live store stored would take the same ID, and a restore in place would install
+            // the copy under an ID its carried duty events give another message.
+            let reserved = if self
+                .state
+                .pending_effect
+                .as_ref()
+                .is_some_and(|pending| pending.stored.is_none())
+            {
+                let mut tx = self.tx()?;
+                let id = self.new_stored_id(&mut tx)?;
+                self.commit(tx).await?;
+                Some(id)
+            } else {
+                None
+            };
             let reader = self.reader();
             let state = Self::read_state(&reader).await?;
             let mut backup = Self::backup_of(&state)?;
@@ -1113,7 +1147,7 @@ impl App {
                 // bounds never drop it, the host may release it, and a read of its feed
                 // entry again is a duplicate, never a second application. The live store
                 // isn't touched.
-                let (id, entry) = uncertain_copy(&state, pending);
+                let (id, entry) = uncertain_copy(&state, pending, reserved);
                 parked.insert(id, entry);
                 let pair = key::processed(&pending.sender, &pending.msg_id);
                 let rest = pair.strip_prefix("proc/").unwrap_or(&pair).to_owned();

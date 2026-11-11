@@ -78,7 +78,9 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
   only reads. It makes no network call: the entry a kept effect (`pending/effect`) belongs
   to, stored or read from the feed, goes into the backup as `Uncertain`, its flags kept,
   with the processed pair of its message, since a restore never carries the kept effect;
-  the live store keeps the effect as it is.
+  the live store keeps the effect as it is. An entry read from the feed takes a local ID the
+  live store reserves first by moving `parkid` on, on a halted app too (the backup's one
+  write), so no later entry of the live store takes it.
 
 ## Keys
 

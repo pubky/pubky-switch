@@ -988,3 +988,34 @@ async fn test_parked_release_by_an_earlier_build_still_reads_as_released() {
     let mut app = load_on(&w, &protocol, store).await;
     next_run_is_released(&w, &mut app, &protocol, &entry).await;
 }
+
+#[tokio::test]
+async fn test_parked_release_survives_a_backup_of_its_kept_effect() {
+    // A released entry whose run applies its effect and loses the answer: the effect is
+    // kept, and a backup holds the entry as uncertain, still released.
+    let w = World::new();
+    let protocol = ParkingProtocol::new(Mode::Plain);
+    let mut app = wallet_on(&w, &protocol, Arc::clone(&w.store) as Arc<dyn StateStore>).await;
+    let (entry, _) = uncertain(&w, &mut app).await;
+    app.release_parked(entry.stored_id, &entry.hash)
+        .await
+        .unwrap();
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.receive(None).await.is_err());
+    assert_eq!(
+        app.state.pending_effect.as_ref().and_then(|p| p.stored),
+        Some(entry.stored_id)
+    );
+    let backup = app.backup_layered().await.unwrap();
+    let restored = App::restore(
+        w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
+        ParkingProtocol::new(Mode::Plain),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    let copy = restored.state.parked.get(&entry.stored_id).unwrap();
+    assert_eq!(copy.reason, ParkReason::Uncertain);
+    assert!(copy.released, "the copy lost its release");
+}

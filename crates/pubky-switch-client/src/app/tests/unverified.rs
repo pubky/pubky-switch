@@ -793,3 +793,75 @@ async fn test_unverified_bound_restored_entries_are_tried_from_the_first_round()
     assert_eq!(restored.stored_id_at(10_000), None);
     assert_eq!(protocol.released.lock().unwrap().len(), 1);
 }
+
+/// A feed entry's effect kept, its answer lost, and a layered backup taken, `halted` by an
+/// alarm or not; then the live app settles that effect and stores another message for good,
+/// its duty events not acknowledged; then a restore in place from the backup. The kept
+/// message's copy never takes the ID the live store gave the other message, and the restored
+/// app tells its protocol once that the kept message is now uncertain.
+async fn copy_and_next_entry_restored_in_place(halted: bool) {
+    let w = World::new();
+    let mut app = wallet(&w, w.env()).await;
+    let (kept_seq, _) = w.note(app.app_id(), "kept");
+    w.switch
+        .fail_next(crate::testing::Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.receive(None).await.is_err());
+    if halted {
+        app.state.alarm = Some(crate::app::Alarm::Rollback {
+            reason: "test".into(),
+        });
+    }
+    let backup = app.backup_layered().await.unwrap();
+    app.state.alarm = None;
+    app.receive(None).await.unwrap();
+    let (other_seq, _) = w.note(app.app_id(), "refused");
+    for _ in 0..3 {
+        w.switch.fail_next(crate::testing::Fault::Error {
+            path: "ops".into(),
+            code: pubky_switch_core::http::ErrorCode::PermissionMissing,
+            current: serde_json::json!(null),
+        });
+        app.receive(None).await.unwrap();
+        if app.stored_id_at(other_seq).is_some() {
+            break;
+        }
+    }
+    let other = app.stored_id_at(other_seq).unwrap();
+    drop(app);
+    let mut restored = App::restore(
+        w.env(),
+        Arc::new(BackedUp::default()),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    let kept = restored.stored_id_at(kept_seq).unwrap();
+    assert_ne!(
+        kept, other,
+        "the copy took an ID the live store gave another message"
+    );
+    assert_eq!(
+        restored.state.parked.get(&kept).map(|e| e.reason),
+        Some(ParkReason::Uncertain)
+    );
+    let events = restored.unacknowledged_events().await.unwrap();
+    let told = events
+        .iter()
+        .filter(|e| {
+            matches!(e, AppEvent::Parked { stored_id, reason: ParkReason::Uncertain, .. }
+                if *stored_id == kept)
+        })
+        .count();
+    assert_eq!(told, 1, "{events:?}");
+}
+
+#[tokio::test]
+async fn test_unverified_bound_backup_copy_takes_an_id_the_live_store_reserves() {
+    copy_and_next_entry_restored_in_place(false).await;
+}
+
+#[tokio::test]
+async fn test_unverified_bound_halted_backup_copy_takes_an_id_the_live_store_reserves() {
+    copy_and_next_entry_restored_in_place(true).await;
+}

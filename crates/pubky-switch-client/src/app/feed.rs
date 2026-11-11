@@ -1550,7 +1550,7 @@ impl App {
     }
 
     /// The local ID the next entry stored locally takes, counted up in `tx`.
-    fn new_stored_id(&mut self, tx: &mut Tx) -> Result<u64, AppError> {
+    pub(crate) fn new_stored_id(&mut self, tx: &mut Tx) -> Result<u64, AppError> {
         let id = self.state.next_stored_id;
         self.state.next_stored_id = id.saturating_add(1);
         tx.put(key::STORED_NEXT, &self.state.next_stored_id)?;
