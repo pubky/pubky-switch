@@ -200,6 +200,8 @@ enum Unknown {
     Gone,
     /// The identity names another service now.
     Moved,
+    /// The account may be erased: the wait goes on, since the first such try (app clock).
+    Waiting(u64),
     /// Nothing the app can tell.
     Unexplained,
 }
@@ -375,7 +377,8 @@ impl App {
     /// # Errors
     ///
     /// As [`App::follow_provider`]; [`AppError::InvalidData`] for a freeze that doesn't
-    /// follow the generation the app follows.
+    /// follow the generation the app follows; [`AppError::NotAnsweringAsAccount`] while the
+    /// account may be erased, the try counted in the wait as a read's is (Switch spec 12.7).
     pub async fn check_for_move(&mut self) -> Result<ProviderStatus, AppError> {
         Box::pin(async move {
             self.ready_local().await?;
@@ -385,7 +388,23 @@ impl App {
                 return self.follow_provider().await;
             }
             let result = self.client.public_identity().await;
-            let public = self.take(result).await?;
+            let public = match self.take(result).await {
+                Ok(public) => public,
+                // An answer the pinned key didn't sign is looked into as at a read: a try
+                // of the erasure wait counts here too (Switch spec 12.7).
+                Err(error @ AppError::Switch(ClientError::BadServiceSignature { status })) => {
+                    self.reload_now().await?;
+                    return match self.unknown_account(status).await? {
+                        Unknown::Gone => Ok(ProviderStatus::Gone),
+                        Unknown::Moved => self.follow_provider().await,
+                        Unknown::Waiting(since_ms) => {
+                            Err(AppError::NotAnsweringAsAccount { since_ms })
+                        }
+                        Unknown::Unexplained => Err(error),
+                    };
+                }
+                Err(error) => return Err(error),
+            };
             if let Some(freeze) = &public.freeze {
                 self.note_freeze(freeze).await?;
             }
@@ -493,6 +512,11 @@ impl App {
                 match self.unknown_account(status).await? {
                     Unknown::Gone => Ok(TakeOver::Done(Ok(self.stopped_report()))),
                     Unknown::Moved => Ok(TakeOver::ReadAgain),
+                    Unknown::Waiting(since_ms) => {
+                        Ok(TakeOver::Done(Err(AppError::NotAnsweringAsAccount {
+                            since_ms,
+                        })))
+                    }
                     Unknown::Unexplained => Ok(TakeOver::Done(Err(error))),
                 }
             }
@@ -543,7 +567,10 @@ impl App {
         if let Some(gone) = reader.get::<GoneRecord>(keys::GONE).await?
             && !(gone.reason == GoneReason::Erased && self.revive_erased().await?)
         {
-            self.events.push(gone_event(gone.reason));
+            // An erasure's duty event stays kept until the host acknowledges it.
+            if gone.reason == GoneReason::NotCurrent {
+                self.events.push(AppEvent::Removed);
+            }
             return Ok(ProviderStatus::Gone);
         }
         let me = self.state.meta.app_id;
@@ -589,7 +616,7 @@ impl App {
     /// to a provider loss declared because that service is gone (Switch spec 12.5 "Abort").
     /// Only a failed call is looked into; a failed read changes nothing.
     pub(crate) async fn look_for_newer_doc(&mut self, error: &AppError) {
-        if !matches!(error, AppError::Switch(_) | AppError::Transport(_)) || self.reload {
+        if !matches!(error.unkept(), AppError::Switch(_) | AppError::Transport(_)) || self.reload {
             return;
         }
         let identity = self.state.meta.identity;
@@ -1556,6 +1583,11 @@ impl App {
         let mut tx = self.tx()?;
         tx.put(keys::GONE, &gone)?;
         tx.delete(keys::ERASING)?;
+        // An erasure is told to the protocol as a duty event, in this commit; a removal is
+        // told at every call (`provider_step`).
+        if reason == GoneReason::Erased {
+            self.keep_duty(&mut tx, Duty::AccountGone)?;
+        }
         let held = self.push_record().await?;
         let had_push = held.is_some();
         match (reason, held) {
@@ -1579,14 +1611,18 @@ impl App {
         if had_push {
             self.events.push(AppEvent::PushRemoved);
         }
-        self.events.push(gone_event(reason));
+        if reason == GoneReason::NotCurrent {
+            self.events.push(AppEvent::Removed);
+        }
         Ok(())
     }
 
     /// An erased account seen alive again: the identity publishes an `identity.json`, no
     /// older than the one the app holds, that lists the app (Switch spec 12.7). `gone` goes, the copy is taken, and the app reads
     /// on; one that lists it no longer, or in `removed`, is followed as any copy is.
-    /// Returns whether the app came back.
+    /// The [`AppEvent::AccountGone`] duty events the host hasn't acknowledged go in the same
+    /// commit: they no longer hold, and a later [`App::load`] would deliver them again for a
+    /// live account. Returns whether the app came back.
     async fn revive_erased(&mut self) -> Result<bool, AppError> {
         let identity = self.state.meta.identity;
         let Ok(Some(doc)) =
@@ -1604,9 +1640,24 @@ impl App {
         {
             return Ok(false);
         }
-        // `gone` goes with the copy, in its commit: a copy that fails leaves it.
-        self.take_own_copy_with(doc, |tx| tx.delete(keys::GONE))
-            .await?;
+        let gone_duties: Vec<u64> = self
+            .reader()
+            .scan_numbered::<Duty>(key::DUTY_PREFIX)
+            .await?
+            .into_iter()
+            .filter(|(_, duty)| *duty == Duty::AccountGone)
+            .map(|(n, _)| n)
+            .collect();
+        // `gone` and its duty events go with the copy, in its commit: a copy that fails
+        // leaves them.
+        self.take_own_copy_with(doc, |tx| {
+            tx.delete(keys::GONE)?;
+            for n in gone_duties {
+                tx.delete(&key::duty(n))?;
+            }
+            Ok(())
+        })
+        .await?;
         self.state.gone = None;
         self.events.push(AppEvent::AccountBack);
         Ok(true)
@@ -1618,7 +1669,8 @@ impl App {
     /// every try for [`ERASURE_WAIT_MS`], unless the verified own copy the app holds names a
     /// later generation than it follows, a live account elsewhere, which is followed
     /// instead. Until then the service counts as unreachable: the app keeps its state and
-    /// tries again. Anything else the app can't tell, and a published `identity.json` or
+    /// tries again, and the call fails with [`AppError::NotAnsweringAsAccount`] (a read and
+    /// [`App::check_for_move`] both count a try). Anything else the app can't tell, and a published `identity.json` or
     /// another status starts the wait over; a Homeserver it can't reach changes nothing.
     async fn unknown_account(&mut self, status: u16) -> Result<Unknown, AppError> {
         let identity = self.state.meta.identity;
@@ -1626,7 +1678,8 @@ impl App {
             Ok(None) if status == 404 && self.provider_superseded() => Ok(Unknown::Moved),
             Ok(None) if status == 404 => {
                 if !self.erasure_held().await? {
-                    return Ok(Unknown::Unexplained);
+                    let since = self.state.erasing.map_or(self.now(), |e| e.since_ms);
+                    return Ok(Unknown::Waiting(since));
                 }
                 self.mark_gone(GoneReason::Erased).await?;
                 Ok(Unknown::Gone)
@@ -1692,13 +1745,6 @@ impl App {
         self.commit(tx).await?;
         self.state.erasing = None;
         Ok(())
-    }
-}
-
-fn gone_event(reason: GoneReason) -> AppEvent {
-    match reason {
-        GoneReason::NotCurrent => AppEvent::Removed,
-        GoneReason::Erased => AppEvent::AccountGone,
     }
 }
 

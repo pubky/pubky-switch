@@ -380,8 +380,16 @@ pub(crate) fn bad(code: ErrorCode, message: &str, current: Value) -> Answer {
     if !current.is_null() {
         body["current"] = current;
     }
+    // A `429` says when to try again, as the service's does: the next minute's window
+    // (Switch wire 7.6).
+    if code == ErrorCode::RateLimited {
+        body["retry_after"] = json!(SCRIPTED_RETRY_AFTER_S);
+    }
     (code.status(), body)
 }
+
+/// The `retry_after` of the scripted switch's `429 rate_limited`, in seconds.
+pub(crate) const SCRIPTED_RETRY_AFTER_S: u64 = 60;
 
 /// Who may read a chain item in full (Switch wire 7.5, "Who may read a chain item in
 /// full"); every other own app gets its stub. Taken when the item is appended; whether the

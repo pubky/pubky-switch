@@ -1373,7 +1373,18 @@ async fn test_outbox_give_up_reads_state_again_before_going_on() {
         after: 0,
     });
     let (msg_id, delivery) = wallet.send(Pair::note(&p.bob, "hello")).await.unwrap();
-    assert!(matches!(delivery, Delivery::Queued { .. }), "{delivery:?}");
+    // Queued for the network, not for admission: no time of a first `403 not_admitted`.
+    assert!(
+        matches!(
+            delivery,
+            Delivery::Queued {
+                undeliverable_since_ms: None,
+                undeliverable_reason: None,
+                ..
+            }
+        ),
+        "{delivery:?}"
+    );
     p.bob.switch().lock().faults.clear();
     // The next try's own write is refused as too large: given up.
     store.refuse_puts_as_too_large_once(format!("out/{msg_id}").as_bytes());

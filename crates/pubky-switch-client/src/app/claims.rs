@@ -27,6 +27,7 @@ use pubky_switch_core::enc::{b64, unb64_array};
 use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::ops::{Condition, OpKind, SignedOp};
 use pubky_switch_core::records::{AppCert, Standing};
+use pubky_switch_core::scopes::Permission;
 use pubky_switch_core::sig::SignedDoc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -42,9 +43,28 @@ use crate::error::ClientError;
 
 const CLAIM_PREFIX: &str = "claim/";
 const ENTRY_PREFIX: &str = "clent/";
+/// A claim the app follows that a read reads again (`clread/<claim_key>`), with when it was
+/// marked, device time: the oldest marks go first.
+const REREAD_PREFIX: &str = "clread/";
+/// The feed showed the stub of an operation since the claims the app follows were last
+/// marked to read again (`clstub`).
+pub(crate) const STUB_SEEN: &str = "clstub";
+
+/// The most claims one read reads again after its feed showed the stub of an operation
+/// (Switch wire 7.5). Each is a request of its own (`GET /claims/{claim_key}`), so the
+/// bound keeps a read's cost and time bounded when the app follows many claims at once,
+/// while covering the claims a protocol has in flight together, such as one obligation's
+/// attempt and its outcome, in one read. 16 is also how many entries stored locally a read
+/// tries again ([`super::PARKED_RETRIES_PER_READ`]). The claims past it stay marked, oldest
+/// mark first, for the next read.
+pub const CLAIM_REREADS_PER_READ: usize = 16;
 
 pub(crate) fn claim_key_of(claim_key: &[u8; 32]) -> String {
     format!("{CLAIM_PREFIX}{}", b64(claim_key))
+}
+
+fn reread_key(claim_key: &[u8; 32]) -> String {
+    format!("{REREAD_PREFIX}{}", b64(claim_key))
 }
 
 fn entry_key(claim_key: &[u8; 32], step: u64) -> String {
@@ -220,11 +240,23 @@ pub struct ClaimRead {
 
 /// An entry the switch took, with its proof.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct ClaimWritten {
-    /// The claim view after the entry.
+    /// The claim view after the entry; for a [`ClaimWritten::repeated`] entry, the view the
+    /// switch's `409 conflict` showed.
     pub view: ClaimView,
-    /// The entry's transition proof, bound to the operation.
+    /// The entry's transition proof, bound to the operation: for a
+    /// [`ClaimWritten::repeated`] entry, the proof of the app's own earlier entry.
     pub proof: TransitionProof,
+    /// The attempt the entry and its proof are about: the one the call asked for.
+    pub attempt_id: [u8; 16],
+    /// Whether the switch had already applied this app's own entry at the step the call
+    /// asked for, of the same type and attempt: the call's own entry was refused (`409
+    /// conflict`), and this is that entry's outcome ([`App::write_claim`]). It need not be
+    /// the caller's own earlier call whose answer was lost, such as a kept batch sent again:
+    /// it may be an entry the app kept from its feed, written by another device of the app
+    /// or by an effect's batch, under the same attempt ID.
+    pub repeated: bool,
 }
 
 /// Why no automatic attempt relies on a claim (Switch spec 10.2, 12.2 step 3; Switch wire
@@ -293,6 +325,33 @@ fn deletable_from(view: &ClaimView, last_entry: u64) -> Option<u64> {
         Some(pinned) => Some(pinned.saturating_add(RECONCILIATION_MS)),
         None => Some(last_entry.saturating_add(MAX_CLAIM_AGE_MS)),
     }
+}
+
+/// Whether the app holds a claim as finished: SETTLED with every attempt `done` or
+/// `failed`, the state that compacts it (Switch wire 6.8 "Tombstones"). A SETTLED claim with
+/// an attempt still open isn't: that attempt's outcome comes as a stub too (Switch wire 7.5).
+fn finished(view: &ClaimView) -> bool {
+    view.status == ClaimStatus::Settled && finished_or_failed(view)
+}
+
+/// Whether a claim the app holds is one it reads again after its feed showed the stub of an
+/// operation (Switch wire 7.5): any claim it doesn't hold as finished, and whose view it can
+/// read, but one whose every attempt failed past the time the service may delete it (Switch
+/// wire 6.8 "Failed claims"), which nothing changes any more.
+fn followed(kept: &KeptClaim, now: u64) -> bool {
+    let Ok(view) = kept.view() else {
+        return true;
+    };
+    if finished(&view) {
+        return false;
+    }
+    let deletable = finished_or_failed(&view)
+        .then(|| {
+            kept.last_entry_ms
+                .and_then(|last| deletable_from(&view, last))
+        })
+        .flatten();
+    deletable.is_none_or(|from| now < from)
 }
 
 fn finished_or_failed(view: &ClaimView) -> bool {
@@ -369,6 +428,22 @@ impl App {
     /// "Binding"); only then may the protocol carry the attempt out. An `attempt` whose proof
     /// binds the operation but shows another state is written `failed`, and the call fails.
     ///
+    /// **An entry this app already wrote.** A caller whose earlier call failed after the
+    /// switch took its entry, the answer lost, makes the call again; the earlier batch, kept,
+    /// goes first, in this call or in a read before it, and takes the step, so the switch
+    /// refuses this call's entry with `409 conflict`. When that conflict's claim shows the
+    /// step this entry asked for taken by the app's own entry, of the same type and the same
+    /// attempt, whose proof the app holds, the call returns that entry's outcome instead of
+    /// the conflict, marked [`ClaimWritten::repeated`]. For an `attempt` the claim must show
+    /// that attempt open, not orphaned, current and owned by this app, and its proof passes
+    /// the checks above. For `done`, `failed` and `unknown` the claim must show the attempt
+    /// resolved so by this app. Anything else is the conflict, an `attempt` under another
+    /// ID included: the app's own attempt that holds the claim may be another device's, or
+    /// an effect's, and only the protocol can tell whether it carries that one out; it sees
+    /// the attempt in the conflict's claim ([`claim_conflict`]). A kept batch this call
+    /// settles raises [`AppEvent::ClaimChanged`] as any settle does, when it changes the
+    /// view or proof the app holds.
+    ///
     /// # Errors
     ///
     /// The switch's refusal, such as `409 conflict` with the claim in `current`; a rollback
@@ -385,7 +460,15 @@ impl App {
             let batch = OpBatch::new()
                 .op_if(op.kind(), conditions)
                 .obligation_deadline(op.entry.claim_key, deadline);
-            let (submitted, views) = self.submit_checked(batch).await?;
+            let (submitted, views) = match self.submit_checked(batch).await {
+                Ok(answered) => answered,
+                Err(error) => {
+                    return match self.repeated_entry(&op.entry, &error).await? {
+                        Some(written) => Ok(written),
+                        None => Err(error),
+                    };
+                }
+            };
             let proof = submitted.proofs.first().cloned().ok_or_else(|| {
                 AppError::InvalidData(
                     "Switch wire 6.5: a claim entry answered without its proof".into(),
@@ -396,9 +479,107 @@ impl App {
                 Some(view) => view,
                 None => ClaimView::from_value(&proof.body().state)?,
             };
-            Ok(ClaimWritten { view, proof })
+            Ok(ClaimWritten {
+                view,
+                proof,
+                attempt_id: op.entry.attempt_id,
+                repeated: false,
+            })
         })
         .await
+    }
+
+    /// The outcome of the app's own earlier entry at the step `entry` asked for, when
+    /// `error` is the switch's `409 conflict` whose claim shows that step taken by it
+    /// ([`App::write_claim`]): the entry the app keeps at that step (`clent/`) is its own,
+    /// of the same type and attempt, signed by its key and bound by a proof of the service
+    /// key of its generation; for an `attempt`, the claim shows that attempt open, not
+    /// orphaned, current and the app's, and its proof passes the checks of an own attempt
+    /// (Switch wire 6.5 "Binding"); for an outcome, the claim shows the attempt resolved so
+    /// by the app. `None` otherwise: the conflict stands.
+    async fn repeated_entry(
+        &self,
+        entry: &ClaimEntry,
+        error: &AppError,
+    ) -> Result<Option<ClaimWritten>, AppError> {
+        let Some(view) = claim_conflict(error) else {
+            return Ok(None);
+        };
+        if view.claim_key != entry.claim_key
+            || Some(view.step) != entry.expected_step.checked_add(1)
+        {
+            return Ok(None);
+        }
+        let Some(kept) = self
+            .reader()
+            .get::<KeptEntry>(&entry_key(&entry.claim_key, entry.expected_step))
+            .await?
+        else {
+            return Ok(None);
+        };
+        let me = self.state.meta.app_id;
+        let identity = self.state.meta.identity;
+        let Ok(op) = SignedOp::verify(
+            &kept.op,
+            &self.state.keys.signing_public(),
+            &identity,
+            Some(&me),
+        ) else {
+            return Ok(None);
+        };
+        let Some(held) = (match &op.body().kind {
+            OpKind::Claim(fields) => fields.check().ok(),
+            _ => None,
+        }) else {
+            return Ok(None);
+        };
+        // The same attempt: an own entry under another attempt ID, another device's or an
+        // effect's, is not this call's to carry out (Switch spec 3.1 "Several devices").
+        if held.claim_key != entry.claim_key
+            || held.expected_step != entry.expected_step
+            || held.attempt_id != entry.attempt_id
+        {
+            return Ok(None);
+        }
+        let Some(service_key) = self.service_key_of(op.body().generation).await? else {
+            return Ok(None);
+        };
+        let Ok(proof) = TransitionProof::verify(&kept.proof, &service_key, &identity) else {
+            return Ok(None);
+        };
+        if proof.check_binds(&op).is_err() {
+            return Ok(None);
+        }
+        let resolved_by_me = |outcome: Outcome| {
+            view.attempt(&entry.attempt_id)
+                .is_some_and(|a| a.outcome == outcome && a.resolved_by == Some(me))
+        };
+        let holds = match (&entry.kind, &held.kind) {
+            // An orphaned attempt may be resolved `unknown` by any app (Switch spec 10.2):
+            // the caller doesn't hold it any more.
+            (EntryKind::Attempt { .. }, EntryKind::Attempt { .. }) => {
+                view.status == ClaimStatus::Attempting
+                    && view.owner == Some(me)
+                    && view.attempt_id == Some(held.attempt_id)
+                    && view
+                        .attempt(&held.attempt_id)
+                        .is_some_and(|a| a.outcome == Outcome::Open && !a.orphaned)
+                    && check_attempt_proof(&proof, &held, &me, self.state.own_doc.generation())
+                        .is_ok()
+            }
+            (EntryKind::Done { .. }, EntryKind::Done { .. }) => {
+                view.status == ClaimStatus::Settled && resolved_by_me(Outcome::Done)
+            }
+            (EntryKind::Failed, EntryKind::Failed) => resolved_by_me(Outcome::Failed),
+            (EntryKind::Unknown, EntryKind::Unknown) => resolved_by_me(Outcome::Unknown),
+            _ => false,
+        };
+        Ok(holds.then_some(ClaimWritten {
+            view,
+            proof,
+            attempt_id: held.attempt_id,
+            repeated: true,
+        }))
     }
 
     /// The checks of the proof of an own attempt the switch applied (Switch wire 6.5
@@ -466,6 +647,12 @@ impl App {
             Ok(answer) => answer,
             Err(error) if error.code() == Some(ErrorCode::NotFound) => {
                 self.check_missing_claim(claim_key).await?;
+                // Nothing more to read of it: a mark to read it again goes.
+                if self.reader().exists(&reread_key(claim_key)).await? {
+                    let mut tx = self.tx()?;
+                    tx.delete(&reread_key(claim_key))?;
+                    self.commit(tx).await?;
+                }
                 return Ok(None);
             }
             Err(error) => return Err(error),
@@ -506,8 +693,73 @@ impl App {
             }
         }
         tx.put(&claim_key_of(claim_key), &kept)?;
+        // Any read of the claim is the read again a stub asked for (Switch wire 7.5).
+        tx.delete(&reread_key(claim_key))?;
         self.commit(tx).await?;
         Ok(Some(read))
+    }
+
+    /// At the end of a read: read again the claims the app follows, after its feed showed
+    /// the stub of an operation (Switch wire 7.5). A stub names no object, so it may be an
+    /// entry of any claim the app holds and doesn't hold as finished, compacted since, its
+    /// own entries included: every such claim is marked (`clread/`), in the commit that
+    /// clears the feed's note of the stub (`clstub`, written with the page that passed it,
+    /// so a crash loses no mark). Then at most [`CLAIM_REREADS_PER_READ`] of them, the
+    /// oldest marks first, are read (`GET /claims/{claim_key}`, one request each), and
+    /// [`AppEvent::ClaimChanged`] is raised for each whose held view or SETTLED proof the
+    /// read changed. A claim read is unmarked in the commit of what it read; the rest stay
+    /// marked for the next read. A read that fails on the network or the switch stops the
+    /// reads here, its claim and the rest still marked, and the feed's read still succeeds;
+    /// an alarm or a store failure fails it. Reading a claim writes no chain item, so it
+    /// shows no stub and can't mark again by itself. An app without `claims.read` can't
+    /// read claims, and marks none.
+    pub(crate) async fn reread_claims(&mut self) -> Result<(), AppError> {
+        if !self.state.cert.has_permission(Permission::ClaimsRead) {
+            return Ok(());
+        }
+        if self.reader().exists(STUB_SEEN).await? {
+            let now = self.service_now();
+            let marked: std::collections::BTreeSet<String> = self
+                .reader()
+                .scan_raw(REREAD_PREFIX)
+                .await?
+                .into_iter()
+                .map(|(rest, _)| rest)
+                .collect();
+            let at = self.now();
+            let mut tx = self.tx()?;
+            for (rest, kept) in self.reader().scan::<KeptClaim>(CLAIM_PREFIX).await? {
+                if !marked.contains(&rest) && followed(&kept, now) {
+                    tx.put(&format!("{REREAD_PREFIX}{rest}"), &at)?;
+                }
+            }
+            tx.delete(STUB_SEEN)?;
+            self.commit(tx).await?;
+        }
+        let mut marks = self.reader().scan::<u64>(REREAD_PREFIX).await?;
+        marks.sort_by(|(a_key, a_at), (b_key, b_at)| a_at.cmp(b_at).then(a_key.cmp(b_key)));
+        for (rest, _) in marks.into_iter().take(CLAIM_REREADS_PER_READ) {
+            let claim_key = unb64_array::<32>(&rest)
+                .map_err(|_| AppError::Store(crate::error::StoreError::Corrupt))?;
+            let held = |kept: Option<KeptClaim>| kept.map(|kept| (kept.view, kept.settled_proof));
+            let before = held(self.kept_claim(&claim_key).await?);
+            if before.is_none() {
+                // No longer held: its evidence went.
+                let mut tx = self.tx()?;
+                tx.delete(&reread_key(&claim_key))?;
+                self.commit(tx).await?;
+                continue;
+            }
+            match self.read_claim_inner(&claim_key).await {
+                Ok(_) => {}
+                Err(AppError::Transport(_) | AppError::Switch(_)) => break,
+                Err(error) => return Err(error),
+            }
+            if held(self.kept_claim(&claim_key).await?) != before {
+                self.events.push(AppEvent::ClaimChanged { claim_key });
+            }
+        }
+        Ok(())
     }
 
     /// The checks of a claim answer; `Err` names the contradiction (Switch wire 7.4.8).
@@ -703,6 +955,7 @@ impl App {
                         .map_err(|_| AppError::Store(crate::error::StoreError::Corrupt))?;
                     tx.delete(&claim_key_of(&claim_key))?;
                     tx.delete_prefix(&format!("{ENTRY_PREFIX}{}/", b64(&claim_key)))?;
+                    tx.delete(&reread_key(&claim_key))?;
                     dropped = dropped.saturating_add(1);
                 }
             }
@@ -903,6 +1156,7 @@ impl App {
             last_entry_ms: None,
             own_deadline: ObligationDeadline::NotKnown,
         });
+        let held = (kept.view.clone(), kept.settled_proof.clone());
         let held_step = kept.view().map_or(0, |v| v.step);
         if view.step >= held_step {
             kept.view = view.to_value();
@@ -910,6 +1164,9 @@ impl App {
         if view.status == ClaimStatus::Settled {
             kept.settled_proof = Some(proof.signed().clone());
         }
+        // Raised when what the app holds changed: an entry it already kept, met again (a
+        // kept batch's answer, then its item in the feed), changes nothing.
+        let changed = held != (kept.view.clone(), kept.settled_proof.clone());
         let at = proof.envelope().server_time;
         kept.last_entry_ms = Some(kept.last_entry_ms.map_or(at, |t| t.max(at)));
         if let Some(deadline) = deadline {
@@ -924,7 +1181,9 @@ impl App {
                 seq: proof.envelope().seq,
             },
         )?;
-        self.events.push(AppEvent::ClaimChanged { claim_key });
+        if changed {
+            self.events.push(AppEvent::ClaimChanged { claim_key });
+        }
         Ok(())
     }
 }

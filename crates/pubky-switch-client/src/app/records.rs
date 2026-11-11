@@ -1443,8 +1443,9 @@ impl App {
     /// # Errors
     ///
     /// [`Refusal::Stopped`] or [`Refusal::Left`] for a stopped or departed app;
-    /// [`Refusal::Usage`] when the certificate holds none of the write scopes, or when the
-    /// protocol's mark of the value ([`super::Protocol::record_seen`]) is over
+    /// [`Refusal::Usage`] when the certificate holds none of the write scopes, for a value
+    /// that isn't strict JSON (Switch wire 6.2), before anything is fetched, marked, signed
+    /// or sent, or when the protocol's mark of the value ([`super::Protocol::record_seen`]) is over
     /// [`super::MAX_SEEN_MARK_BYTES`]; [`Refusal::NotNow`] while the app lacks the read
     /// scope's key at the current data epoch (it fetches its key bundle first); a store
     /// failure.
@@ -1456,6 +1457,8 @@ impl App {
     ) -> Result<(Vec<Condition>, OpKind), AppError> {
         Box::pin(async move {
             self.refuse_when_stopped()?;
+            // Before the key bundle is fetched and the protocol marks the value.
+            refuse_non_json(value)?;
             let epoch = self.state.own_doc.data_epoch();
             let read_scope = &target.collection.policy.read_scope;
             if self.state.scope_keys.get(epoch, read_scope).is_none() {
@@ -1606,6 +1609,24 @@ impl App {
     }
 }
 
+/// Refuse a record value that isn't strict JSON, an empty one included; `None`, a delete,
+/// passes. A record's value is strict JSON, and only the empty plaintext, a delete, isn't
+/// (Switch wire 6.2 "Accepting a write", 1.1). The switch can't tell: the value is sealed
+/// to the read scope's key, so it takes and chains any value, and a reader, the writer
+/// included, finds one that isn't JSON doesn't open. So it is refused before it is signed
+/// or sent.
+fn refuse_non_json(value: Option<&[u8]>) -> Result<(), AppError> {
+    if let Some(json) = value
+        && pubky_switch_core::json::check_json(json).is_err()
+    {
+        return Err(Refusal::Usage(
+            "Switch wire 6.2: a record's value is strict JSON (an empty one is a delete)".into(),
+        )
+        .into());
+    }
+    Ok(())
+}
+
 /// Refuse an own write whose mark ([`super::Protocol::record_seen`] after `value`, from
 /// nothing, as for every own write) would be over [`MAX_SEEN_MARK_BYTES`]: the app couldn't
 /// keep it, and the record couldn't be checked from that write on.
@@ -1631,7 +1652,8 @@ pub(crate) fn refuse_unmarkable(
 ///
 /// # Errors
 ///
-/// [`Refusal::Usage`] when the certificate holds none of the write scopes;
+/// [`Refusal::Usage`] when the certificate holds none of the write scopes, or for a value
+/// that isn't strict JSON, an empty one included, before anything is sealed;
 /// [`Refusal::NotNow`] while the app lacks the read scope's key at the current data epoch.
 pub(crate) fn record_put(
     state: &super::AppState,
@@ -1639,6 +1661,7 @@ pub(crate) fn record_put(
     value: Option<&[u8]>,
     held: Option<&HeldRecord>,
 ) -> Result<RecordPut, AppError> {
+    refuse_non_json(value)?;
     let policy = &target.collection.policy;
     if !policy
         .write_scopes
