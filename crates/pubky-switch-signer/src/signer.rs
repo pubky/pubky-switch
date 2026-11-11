@@ -621,6 +621,19 @@ impl Signer {
         body.version = version;
         body.signer = self.state.install;
         change(&mut body);
+        // Never a version the switch can't take: its delivery would be over `PUT /identity`'s
+        // body cap (Switch wire 7.1), and could never be delivered. A removal, which drops the
+        // app's `renewed` entries with it, makes the document smaller.
+        let bytes = delivery_len(body.to_json()?.len());
+        if let Some(limit) = identity_limit()
+            && bytes > limit
+        {
+            return Err(Refusal::IdentityTooLarge {
+                bytes: u64::try_from(bytes).unwrap_or(u64::MAX),
+                limit: u64::try_from(limit).unwrap_or(u64::MAX),
+            }
+            .into());
+        }
         let doc = IdentityDoc::sign(key, body)?;
         let flow = Flow::Deliver {
             doc: doc.signed().clone(),
@@ -987,9 +1000,13 @@ impl Signer {
                 current,
                 ..
             }) => self.stale(&current, doc, prev).await,
-            Err(error @ ClientError::Switch { status: 400, .. }) => {
-                // A definite refusal: the same bytes would be refused again. The version stays
-                // spent (`signed_through`).
+            Err(
+                error @ ClientError::Switch {
+                    status: 400 | 413, ..
+                },
+            ) => {
+                // A definite refusal, a `400` or a `413 too_large` (Switch wire 7.1): the same
+                // bytes would be refused again. The version stays spent (`signed_through`).
                 self.commit(self.state.clone(), None).await?;
                 Err(error.into())
             }
@@ -1036,27 +1053,8 @@ impl Signer {
         }
         // How close the version comes to the most a delivery, or a move's enrollment, may
         // carry (Switch wire 3.7, 7.1).
-        let delivery = IdentityDelivery {
-            identity: doc.clone(),
-            prev,
-        };
-        let enrollment = state.service.as_ref().map(|service| EnrollmentBody {
-            identity: state.identity,
-            origin: service.origin.clone(),
-            nonce: [0; 16],
-            policy: verified
-                .as_ref()
-                .map(|delivered| delivered.body().policy)
-                .unwrap_or_default(),
-            identity_doc: Some(doc.clone()),
-            revoked_apps: (!state.tombstones.is_empty()).then(|| state.tombstones.clone()),
-        });
-        let enrollment_bytes = enrollment
-            .map(|body| serde_json::to_vec(&body).map(|json| signed_len(json.len())))
-            .transpose()
-            .map_err(|e| SignerError::Records(e.to_string()))?
-            .unwrap_or(0);
-        state.note_size(delivery.to_json().len().max(enrollment_bytes));
+        let bytes = version_size(&state, &doc, prev)?;
+        state.note_size(bytes);
         let published = state
             .newest
             .as_ref()
@@ -1313,6 +1311,49 @@ enum Verdict {
     Newer,
 }
 
+/// The size of `doc` as the larger of its delivery built on `prev` and a move's enrollment
+/// carrying it, for the records `state` (Switch wire 3.7, 7.1).
+pub(super) fn version_size(
+    state: &SignerState,
+    doc: &SignedDoc,
+    prev: Option<[u8; 32]>,
+) -> Result<usize> {
+    let delivery = IdentityDelivery {
+        identity: doc.clone(),
+        prev,
+    };
+    let policy = IdentityDoc::verify(doc, &state.identity)
+        .map(|verified| verified.body().policy)
+        .unwrap_or_default();
+    let enrollment = state.service.as_ref().map(|service| EnrollmentBody {
+        identity: state.identity,
+        origin: service.origin.clone(),
+        nonce: [0; 16],
+        policy,
+        identity_doc: Some(doc.clone()),
+        revoked_apps: (!state.tombstones.is_empty()).then(|| state.tombstones.clone()),
+    });
+    let enrollment_bytes = enrollment
+        .map(|body| serde_json::to_vec(&body).map(|json| signed_len(json.len())))
+        .transpose()
+        .map_err(|e| SignerError::Records(e.to_string()))?
+        .unwrap_or(0);
+    Ok(delivery.to_json().len().max(enrollment_bytes))
+}
+
+/// The body cap of `PUT /identity`, which `POST /enroll` shares (Switch wire 3.7, 7.1).
+pub(crate) fn identity_limit() -> Option<usize> {
+    pubky_switch_core::http::body_cap("PUT", "/v1/id/identity")
+}
+
+/// The length of a delivery built on a version, whose `identity.json` body is `body_len` bytes
+/// of JSON: `{"identity":<carrying form>,"prev":"<43 characters>"}` (Switch wire 7.4.2).
+fn delivery_len(body_len: usize) -> usize {
+    signed_len(body_len)
+        .saturating_add(r#"{"identity":,"prev":""}"#.len())
+        .saturating_add(43)
+}
+
 /// The length of a signed document's carrying form whose body is `body_len` bytes of JSON:
 /// `{"body":"<base64url>","sig":"<86 characters>"}` (Switch wire 2.2).
 fn signed_len(body_len: usize) -> usize {
@@ -1331,6 +1372,30 @@ fn stale_without_copy() -> SignerError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_delivery_len_is_the_delivery_as_sent() {
+        // The size `next_version` checks before signing is the delivery's, byte for byte.
+        let key = pubky_switch_core::keys::IdentityKey::from_secret([3; 32]);
+        let body = IdentityBody::first(
+            key.public(),
+            [4; 16],
+            Inbox {
+                url: "https://switch.example".into(),
+                service_key: [5; 32],
+            },
+            IdentityPolicy::default(),
+        );
+        let doc = IdentityDoc::sign(&key, body.clone()).unwrap();
+        let delivery = IdentityDelivery {
+            identity: doc.signed().clone(),
+            prev: Some([6; 32]),
+        };
+        assert_eq!(
+            delivery_len(body.to_json().unwrap().len()),
+            delivery.to_json().len()
+        );
+    }
 
     #[test]
     fn test_status_follows_the_signing_gate() {

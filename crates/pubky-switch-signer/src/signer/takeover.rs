@@ -379,6 +379,10 @@ impl Signer {
         let mut state = self.state.clone();
         state.taking_over = false;
         state.alerts.retain(|a| *a != Alert::KeyNotInstalled);
+        // An identity taken over near the size a delivery may carry is told at once (Switch
+        // wire 3.7, 7.1).
+        let bytes = super::version_size(&state, &delivery.doc, Some(delivery.prev))?;
+        state.note_size(bytes);
         state.newest = Some(Newest {
             doc: delivery.doc,
             prev: Some(delivery.prev),
