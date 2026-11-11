@@ -232,7 +232,12 @@ mod tests {
         drop(bob);
         assert_eq!(queued(&reading, "bob"), 0, "bob's queue is gone");
         // A wait past its timeout is refused, and leaves the queue as it was.
-        let late = ReadTurn::wait(&reading, "alice", std::time::Duration::from_millis(1)).await;
+        let late = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            ReadTurn::wait(&reading, "alice", std::time::Duration::from_millis(1)),
+        )
+        .await
+        .expect("refused after its timeout, not later");
         assert!(matches!(late, Err(StoreError::LockTimeout)));
         assert_eq!(queued(&reading, "alice"), 1);
         drop(second);
@@ -255,8 +260,13 @@ mod tests {
             assert!(futures_poll_once(wait.as_mut()).await.is_none());
         }
         assert_eq!(queued(&reading, "alice"), MAX_WAITING_READS + 1);
-        // One more is refused at once.
-        let refused = ReadTurn::wait(&reading, "alice", long).await;
+        // One more is refused at once, not after its wait.
+        let refused = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            ReadTurn::wait(&reading, "alice", long),
+        )
+        .await
+        .expect("refused at once");
         assert!(matches!(refused, Err(StoreError::LockTimeout)));
         drop(waiting);
         drop(first);
