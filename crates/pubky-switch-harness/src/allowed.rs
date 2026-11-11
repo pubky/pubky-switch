@@ -121,6 +121,46 @@ const COMPACTED_CLAIM: &str = "The `done` entry settles the claim with every att
     switch compacts nothing and shows the entry in full, so the app raises a `ClaimChanged` \
     event from its feed there and none at the service.";
 
+/// What an app that only follows its feed knows of a claim another app settled.
+const SETTLED_UNSEEN: &str = "The wallet's `done` entry settles the claim, which the service \
+    compacts at once: in the feed of the phone, which holds `claims.read`, the entry is a stub. \
+    So the phone raises no event for it and goes on holding the claim as attempting, at step 1, \
+    until it reads the claim; and since a compacted claim's read has no entries, it never holds \
+    the proof that shows the claim settled. The scripted switch shows the entry in full, so \
+    there the phone holds the claim settled, with that proof, from its feed alone.";
+
+/// The wallet's own entries of the claim it settled, in its own feed.
+const OWN_ENTRIES_COMPACTED: &str = "Once its claim is settled and compacted, the wallet's own \
+    `attempt` and `done` entries are stubs in its feed at the service; the scripted switch \
+    goes on showing them in full, and the wallet raises a `ClaimChanged` event for each as it \
+    reads them.";
+
+/// An entry of the `watching` flow about the compacted claim.
+const fn watching(
+    label: &'static str,
+    fact: &'static str,
+    service: &'static str,
+    scripted: &'static str,
+    reason: &'static str,
+) -> Allowed {
+    Allowed {
+        flow: "watching",
+        label,
+        fact,
+        service,
+        scripted,
+        reason,
+        reference: "Switch wire 6.8 \"Tombstones\"; 7.5, the entries of compacted claims",
+    }
+}
+
+/// The key of the `watching` flow's claim, as its events show it.
+const WATCHED: &str = "text ClaimChanged a2tra2tra2tra2tra2tra2tra2tra2tra2tra2tra2s";
+
+/// The feed reads of the `watching` flow.
+const PHONE_FEED: &str = "{alice/phone} GET /v1/{alice}/feed";
+const WALLET_FEED: &str = "{alice/wallet} GET /v1/{alice}/feed";
+
 /// Every accepted difference: those of the two switches as a whole, then by flow.
 pub static ALLOWED: &[Allowed] = &[
     Allowed {
@@ -259,6 +299,182 @@ pub static ALLOWED: &[Allowed] = &[
         scripted: "text ClaimChanged WlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlpaWlo",
         reason: COMPACTED_CLAIM,
         reference: "Switch wire 6.8 \"Tombstones\"; 7.5",
+    },
+    Allowed {
+        flow: "revocation",
+        label: "{alice/phone} GET /v1/{alice}/apps/{alice/phone}/keys",
+        fact: "body.current",
+        service: NOTHING,
+        scripted: "null",
+        reason: NULL_CURRENT,
+        reference: "Switch wire, Conventions, \"Absent and null\"; Switch wire 7.1, error bodies",
+    },
+    Allowed {
+        flow: "revocation",
+        label: "{alice/tablet} GET /v1/{alice}/apps/{alice/tablet}/keys",
+        fact: "body.current",
+        service: NOTHING,
+        scripted: "null",
+        reason: NULL_CURRENT,
+        reference: "Switch wire, Conventions, \"Absent and null\"; Switch wire 7.1, error bodies",
+    },
+    Allowed {
+        flow: "departure",
+        label: "{alice} GET /v1/{alice}/apps",
+        fact: "body.apps[0].last_seen",
+        service: "time 2026-01-01T00:05:06.250Z",
+        scripted: "time 2026-01-01T00:04:05.000Z",
+        reason: "The phone's `leave` is its latest request past authentication, so the service \
+                 shows the leave's time as its `last_seen`. The scripted switch doesn't count \
+                 the leave and shows the time of the phone's request before it.",
+        reference: "Switch wire 7.4.12, `last_seen`, which the table gives no rule; `FAKES.md` \
+                    says the scripted switch means the latest request past authentication",
+    },
+    // The phone's feed after the wallet's `done`.
+    watching(
+        PHONE_FEED,
+        "body.items[0].type",
+        "text stub",
+        "text chain",
+        SETTLED_UNSEEN,
+    ),
+    watching(
+        PHONE_FEED,
+        "body.items[0].item*",
+        NOTHING,
+        "*",
+        SETTLED_UNSEEN,
+    ),
+    watching(
+        PHONE_FEED,
+        "body.items[0].proof*",
+        NOTHING,
+        "*",
+        SETTLED_UNSEEN,
+    ),
+    watching(
+        "outcome the phone after the outcome",
+        "outcome.events",
+        "array of 0",
+        "array of 1",
+        SETTLED_UNSEEN,
+    ),
+    watching(
+        "outcome the phone after the outcome",
+        "outcome.events[0]",
+        NOTHING,
+        WATCHED,
+        SETTLED_UNSEEN,
+    ),
+    watching(
+        "outcome the claim the phone holds after the outcome",
+        "outcome.status",
+        "text Attempting",
+        "text Settled",
+        SETTLED_UNSEEN,
+    ),
+    watching(
+        "outcome the claim the phone holds after the outcome",
+        "outcome.step",
+        "number 1",
+        "number 2",
+        SETTLED_UNSEEN,
+    ),
+    watching(
+        "outcome the claim the phone holds after the outcome",
+        "outcome.tombstone",
+        "bool false",
+        "bool true",
+        SETTLED_UNSEEN,
+    ),
+    watching(
+        "outcome the claim the phone holds after the outcome",
+        "outcome.settled_proof",
+        "bool false",
+        "bool true",
+        SETTLED_UNSEEN,
+    ),
+    watching(
+        "outcome the claim the phone holds after reading it",
+        "outcome.settled_proof",
+        "bool false",
+        "bool true",
+        SETTLED_UNSEEN,
+    ),
+    // The wallet's own entries, in the two feed reads it makes after settling the claim.
+    watching(
+        WALLET_FEED,
+        "body.items[0].type",
+        "text stub",
+        "text chain",
+        OWN_ENTRIES_COMPACTED,
+    ),
+    watching(
+        WALLET_FEED,
+        "body.items[0].item*",
+        NOTHING,
+        "*",
+        OWN_ENTRIES_COMPACTED,
+    ),
+    watching(
+        WALLET_FEED,
+        "body.items[0].proof*",
+        NOTHING,
+        "*",
+        OWN_ENTRIES_COMPACTED,
+    ),
+    watching(
+        WALLET_FEED,
+        "body.items[1].type",
+        "text stub",
+        "text chain",
+        OWN_ENTRIES_COMPACTED,
+    ),
+    watching(
+        WALLET_FEED,
+        "body.items[1].item*",
+        NOTHING,
+        "*",
+        OWN_ENTRIES_COMPACTED,
+    ),
+    watching(
+        WALLET_FEED,
+        "body.items[1].proof*",
+        NOTHING,
+        "*",
+        OWN_ENTRIES_COMPACTED,
+    ),
+    watching(
+        "outcome the wallet at the end",
+        "outcome.events",
+        "array of 0",
+        "array of 2",
+        OWN_ENTRIES_COMPACTED,
+    ),
+    watching(
+        "outcome the wallet at the end",
+        "outcome.events[*]",
+        NOTHING,
+        WATCHED,
+        OWN_ENTRIES_COMPACTED,
+    ),
+    Allowed {
+        flow: "restore",
+        label: "{alice/wallet} GET /v1/{alice}/directory",
+        fact: "body.apps_version",
+        service: "number 3",
+        scripted: ONE_MORE,
+        reason: COUNTER_START,
+        reference: "Switch wire 7.4.10, `apps_version`",
+    },
+    Allowed {
+        flow: "restore",
+        label: "{alice/wallet} GET /v1/{alice}/directory",
+        fact: "body.directory_version",
+        service: "number 9",
+        scripted: ONE_MORE,
+        reason: COUNTER_START,
+        reference: "Switch wire 7.4.10, `directory_version`",
     },
 ];
 
