@@ -2123,6 +2123,47 @@ async fn test_claims_attempt_answer_lost_is_checked_when_sent_again() {
     assert_eq!(evidence.view.owner, Some(app.app_id()));
 }
 
+fn claim_changes(events: &[AppEvent]) -> usize {
+    events
+        .iter()
+        .filter(|e| matches!(e, AppEvent::ClaimChanged { claim_key } if *claim_key == CLAIM))
+        .count()
+}
+
+#[tokio::test]
+async fn test_claims_entry_met_again_raises_one_change() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    s.w.switch
+        .fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(
+        app.write_claim(
+            ClaimOp::attempt(CLAIM, 0, ATTEMPT, 3600, None),
+            vec![],
+            ObligationDeadline::NoDeadline,
+        )
+        .await
+        .is_err()
+    );
+    // The read sends the kept attempt again, whose proof the app keeps, then meets the
+    // same entry in its feed: one change.
+    let report = app.receive(None).await.unwrap();
+    assert_eq!(claim_changes(&report.events), 1, "{:?}", report.events);
+    let evidence = app.claim_evidence(&CLAIM).await.unwrap().unwrap();
+    assert_eq!(evidence.view.status, ClaimStatus::Attempting);
+    // Its own next entry changes the claim again.
+    let done = app
+        .write_claim(
+            ClaimOp::done(CLAIM, 1, ATTEMPT, Basis::Owner, None).unwrap(),
+            vec![],
+            ObligationDeadline::NoDeadline,
+        )
+        .await
+        .unwrap();
+    assert_eq!(done.view.status, ClaimStatus::Settled);
+    assert_eq!(claim_changes(&app.take_events()), 1);
+}
+
 #[tokio::test]
 async fn test_send_acceptance_committed_before_the_follow_ups() {
     // The first commit after the append is answered: stopped right after it, the restart

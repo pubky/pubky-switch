@@ -903,6 +903,7 @@ impl App {
             last_entry_ms: None,
             own_deadline: ObligationDeadline::NotKnown,
         });
+        let held = (kept.view.clone(), kept.settled_proof.clone());
         let held_step = kept.view().map_or(0, |v| v.step);
         if view.step >= held_step {
             kept.view = view.to_value();
@@ -910,6 +911,9 @@ impl App {
         if view.status == ClaimStatus::Settled {
             kept.settled_proof = Some(proof.signed().clone());
         }
+        // Raised when what the app holds changed: an entry it already kept, met again (a
+        // kept batch's answer, then its item in the feed), changes nothing.
+        let changed = held != (kept.view.clone(), kept.settled_proof.clone());
         let at = proof.envelope().server_time;
         kept.last_entry_ms = Some(kept.last_entry_ms.map_or(at, |t| t.max(at)));
         if let Some(deadline) = deadline {
@@ -924,7 +928,9 @@ impl App {
                 seq: proof.envelope().seq,
             },
         )?;
-        self.events.push(AppEvent::ClaimChanged { claim_key });
+        if changed {
+            self.events.push(AppEvent::ClaimChanged { claim_key });
+        }
         Ok(())
     }
 }

@@ -681,7 +681,10 @@ pub enum AppEvent {
         /// The record key.
         key: [u8; 32],
     },
-    /// The app kept a newer view or proof of a claim (Switch spec 10.2).
+    /// The app kept a newer view or proof of a claim (Switch spec 10.2): from an entry's
+    /// proof, its own or one in the feed, or from reading the claim again after its feed
+    /// showed an operation's stub (Switch wire 7.5). Once per change: an entry met again
+    /// that changes nothing raises none.
     ClaimChanged {
         /// The claim key.
         claim_key: [u8; 32],
