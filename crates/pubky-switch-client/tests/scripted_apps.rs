@@ -258,3 +258,50 @@ async fn test_scripted_apps_last_seen_stops_once_the_app_is_revoked() {
         });
     assert_eq!(s.status(&app.app_id()).await.last_seen, seen);
 }
+
+#[tokio::test]
+async fn test_scripted_switches_at_two_origins_each_take_their_own_enrollment() {
+    use pubky_switch_client::testing::ScriptedSwitch;
+    use pubky_switch_core::keys::IdentityKey;
+    use pubky_switch_core::records::{Enrollment, EnrollmentBody, IdentityPolicy};
+    let clock = Arc::new(TestClock::new(START_MS));
+    let enroll = |key: &IdentityKey, switch: &Arc<ScriptedSwitch>, origin: &str, named: &str| {
+        let identity = key.public();
+        let client = SwitchClient::new(
+            origin,
+            identity,
+            Credentials::Signer {
+                identity,
+                key: Arc::new(key.clone()),
+            },
+            None,
+            switch.transport(),
+            clock.clone(),
+        )
+        .unwrap();
+        let enrollment = Enrollment::sign(
+            key,
+            EnrollmentBody {
+                identity,
+                origin: named.to_owned(),
+                nonce: [1; 16],
+                policy: IdentityPolicy::default(),
+                identity_doc: None,
+                revoked_apps: None,
+            },
+        )
+        .unwrap();
+        async move { client.enroll(&enrollment).await }
+    };
+    let (a, b) = (
+        IdentityKey::from_secret([51; 32]),
+        IdentityKey::from_secret([52; 32]),
+    );
+    let (origin_a, origin_b) = ("https://a.switch.example", "https://b.switch.example");
+    let at_a = ScriptedSwitch::unenrolled_at(&a, [53; 32], Arc::clone(&clock), origin_a);
+    let at_b = ScriptedSwitch::unenrolled_at(&b, [54; 32], Arc::clone(&clock), origin_b);
+    // Each takes an enrollment that names its own origin, and refuses one naming the other.
+    assert!(enroll(&a, &at_a, origin_a, origin_b).await.is_err());
+    assert!(enroll(&a, &at_a, origin_a, origin_a).await.is_ok());
+    assert!(enroll(&b, &at_b, origin_b, origin_b).await.is_ok());
+}

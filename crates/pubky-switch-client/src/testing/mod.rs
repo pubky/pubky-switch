@@ -264,6 +264,147 @@ mod tests {
     use crate::error::TransportError;
     use crate::transport::{Request, Transport};
 
+    #[test]
+    fn test_scripted_error_body_omits_an_absent_current() {
+        // Switch wire, Conventions, "Absent and null": a writer omits an absent member.
+        let (_, body) = switch::bad(
+            pubky_switch_core::http::ErrorCode::NotFound,
+            "x",
+            serde_json::Value::Null,
+        );
+        assert!(body.get("current").is_none(), "{body}");
+        let (_, body) = switch::bad(
+            pubky_switch_core::http::ErrorCode::Conflict,
+            "x",
+            json!({ "server_time": 1 }),
+        );
+        assert_eq!(body["current"], json!({ "server_time": 1 }));
+    }
+
+    #[test]
+    fn test_scripted_versions_start_at_zero_as_the_services() {
+        let identity = pubky_switch_core::keys::IdentityKey::from_secret([3; 32]);
+        let switch = ScriptedSwitch::new(&identity, [4; 32], Arc::new(TestClock::new(0)));
+        assert_eq!(switch.apps_version(), 0);
+        assert_eq!(switch.lock().directory_version, 0);
+    }
+
+    #[test]
+    fn test_scripted_peer_answers_as_the_service_without_current_or_versions() {
+        // Switch wire 7.6: `not_admitted` carries no `current`, and an absent one is left
+        // out; both versions start at 0 (Switch wire 7.4.10).
+        let (_, body) = peer::bad(
+            pubky_switch_core::http::ErrorCode::NotAdmitted,
+            serde_json::Value::Null,
+        );
+        assert!(body.get("current").is_none(), "{body}");
+        let seeds = Seeds::default();
+        let peer = PeerSwitch::new(
+            TestIdentity::new(&seeds, "bob"),
+            PEER_ORIGIN,
+            Arc::new(TestClock::new(START_MS)),
+            Arc::new(TestHomeserver::new()),
+        );
+        let inner = peer.lock();
+        assert_eq!((inner.apps_version, inner.directory_version), (0, 0));
+    }
+
+    #[test]
+    fn test_scripted_switch_second_leave_is_not_current_without_current() {
+        // Switch wire 7.6: `403 not_current` carries no `current`.
+        let seeds = Seeds::default();
+        let signer = TestSigner::new(
+            TestIdentity::new(&seeds, "alice"),
+            Arc::new(TestClock::new(START_MS)),
+            Arc::new(TestHomeserver::new()),
+            ProtocolSpec::default(),
+        );
+        let keys = signer.identity().app_keys("phone");
+        signer
+            .register_app(&keys, &AppSpec::new(&["notes"]))
+            .unwrap();
+        let app = pubky_switch_core::enc::zbase32_encode(&keys.app_id_bytes());
+        let path = format!("/v1/{}/apps/{app}/leave", signer.identity().key().id());
+        let mut leave = request(SWITCH_ORIGIN, &path);
+        leave.method = "POST".into();
+        leave
+            .headers
+            .push(crate::transport::Header::new(header::APP, &app));
+        assert_eq!(signer.switch().handle(&leave).unwrap().status, 200);
+        let again = signer.switch().handle(&leave).unwrap();
+        assert_eq!(again.status, 403);
+        let body: serde_json::Value = serde_json::from_slice(&again.body).unwrap();
+        assert_eq!(body["code"], "not_current");
+        assert!(body.get("current").is_none(), "{body}");
+    }
+
+    #[test]
+    fn test_scripted_switch_key_change_in_place_serves_at_its_origin_only() {
+        // Switch wire 3.7, 7.3 step 7: a staged account serves once the newest
+        // `identity.json` names its origin and its service key; a key change in place keeps
+        // the origin.
+        use pubky_switch_core::records::{IdentityBody, IdentityDoc, IdentityPolicy, Inbox};
+        let seeds = Seeds::default();
+        let alice = TestIdentity::new(&seeds, "alice");
+        let origin = "https://other-switch.example";
+        let clock = Arc::new(TestClock::new(START_MS));
+        let switch = ScriptedSwitch::unenrolled_at(alice.key(), [4; 32], clock, origin);
+        let changed = switch.change_key_into([5; 32]);
+        let doc = |url: &str, version: u64| {
+            let mut body = IdentityBody::first(
+                alice.public(),
+                alice.signer_id(),
+                Inbox::new(url, changed.service_key()),
+                IdentityPolicy::default(),
+            );
+            body.version = version;
+            IdentityDoc::sign(alice.key(), body).unwrap()
+        };
+        changed.deliver_identity(&doc(SWITCH_ORIGIN, 1)).unwrap();
+        assert!(changed.lock().staged, "another origin");
+        changed.deliver_identity(&doc(origin, 2)).unwrap();
+        assert!(!changed.lock().staged);
+    }
+
+    #[test]
+    fn test_scripted_switch_directory_lists_apps_in_the_documents_order() {
+        // Switch wire 7.4.10: the current apps, in the order the newest identity.json lists
+        // them, not by App ID.
+        let seeds = Seeds::default();
+        let signer = TestSigner::new(
+            TestIdentity::new(&seeds, "alice"),
+            Arc::new(TestClock::new(START_MS)),
+            Arc::new(TestHomeserver::new()),
+            ProtocolSpec::default(),
+        );
+        let mut keys: Vec<_> = ["one", "two", "three"]
+            .iter()
+            .map(|name| signer.identity().app_keys(name))
+            .collect();
+        // Registered, and so listed, in descending App ID order.
+        keys.sort_by_key(|keys| std::cmp::Reverse(keys.app_id_bytes()));
+        for app in &keys {
+            signer.register_app(app, &AppSpec::new(&["notes"])).unwrap();
+        }
+        let path = format!("/v1/{}/directory", signer.identity().key().id());
+        let answer = signer
+            .switch()
+            .handle(&request(SWITCH_ORIGIN, &path))
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&answer.body).unwrap();
+        let shown: Vec<&str> = body["apps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|app| app["app_id"].as_str())
+            .collect();
+        let listed: Vec<String> = keys
+            .iter()
+            .map(|keys| pubky_switch_core::enc::zbase32_encode(&keys.app_id_bytes()))
+            .collect();
+        assert_eq!(shown, listed);
+    }
+
     fn request(origin: &str, path: &str) -> Request {
         Request {
             method: "GET".into(),

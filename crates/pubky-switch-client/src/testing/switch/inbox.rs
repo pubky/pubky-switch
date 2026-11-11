@@ -171,7 +171,7 @@ impl Inner {
             return bad(ErrorCode::BadRequest, "peers", json!(null));
         };
         let Ok(doc) = IdentityDoc::verify(&signed, sender) else {
-            return bad(ErrorCode::NotAdmitted, "not admitted", json!({}));
+            return not_admitted();
         };
         if let Some(held) = self.peers.get(sender) {
             if held.version() == doc.version() && held.body_hash() != doc.body_hash() {
@@ -313,7 +313,7 @@ impl Inner {
             }
             None => match self.apps.get(&app).and_then(|held| held.cert.clone()) {
                 Some(cert) => cert,
-                None => return Ok(bad(ErrorCode::NotCurrent, "not current", json!({}))),
+                None => return Ok(bad(ErrorCode::NotCurrent, "not current", json!(null))),
             },
         };
         // Step 2: admission, then the listing in the peer copy (Switch wire 7.4.3).
@@ -434,6 +434,7 @@ impl Inner {
     }
 }
 
+/// `403 not_admitted`, which carries no `current` (Switch wire 7.6).
 fn not_admitted() -> Answer {
-    bad(ErrorCode::NotAdmitted, "not admitted", json!({}))
+    bad(ErrorCode::NotAdmitted, "not admitted", json!(null))
 }
