@@ -49,10 +49,10 @@ every one alike:
 | `POST /v1/{id}/apps/{app_id}/leave` | a lost answer | `403 not_current` |
 | `PUT /v1/{id}/peers` | a lost answer | `200` again |
 | `GET /v1/{id}/feed` | a lost answer | the same page |
-
 | `POST /v1/{id}/apps/{app_id}/revoke` | a lost answer, and a failed read of the apps | `200`, no proofs, the head |
 | a `claim` `done` batch, the same batch | a lost answer | the original proof, which settles the claim for the app |
 | a second `done` at the step the first took | the first try's lost answer | `409 conflict`, the settled claim in `current` |
+| `PUT /v1/{id}/handover`, the same hand-over | a lost answer | `200` again, the same app and parts |
 
 A revocation whose answer was lost isn't sent again while the signer can read the switch: it
 reads the account's apps and finds it done.
@@ -60,6 +60,40 @@ reads the account's apps and finds it done.
 An erasure whose answer was lost isn't sent again either (Switch wire 7.4.16): the signer's
 next read of the account's apps gets the operator's `404`, and it concludes the account is
 erased.
+
+## Not covered
+
+The flows send every call the service serves, each at both switches. What they leave out:
+
+- **Calls the service doesn't serve yet**, thirteen of the thirty-three of Switch wire 7.4:
+  the connection requests (`POST`, `GET` and `DELETE /connect`), `PUT /push`, `POST /freeze`
+  and `/unfreeze`, `GET /export` and its chunks, `POST /import` with its chunks and
+  activation, and `POST /recovery/admission` and `/recovery/upload`. So no flow moves an
+  account, changes its key in place, or recovers from a lost provider. `flows::flow_of`
+  lists them, and the test fails once one is served without a flow.
+- **Faults in front of most reads.** The retries above are the ones covered. No answer is
+  lost and no connection fails in front of `GET /allow`, `/claims/{claim_key}`,
+  `/directory`, `/apps/{app_id}/keys`, `/records`, `/records/{key}`, `/handover` or the
+  public `/identity`, nor in front of `POST /apps/{app_id}/keys` or a record write.
+- **Pages past the first.** No feed and no records list of a flow is longer than one page,
+  and no feed read waits (`wait`). The directory has no pages (Switch wire 7.4.10).
+- **A feed with gaps:** a lagging app, a `missed` item, an item an app can't read after a
+  revocation.
+- **Lists in use:** an invite code issued and used, and a deny list entry that refuses a
+  sender.
+- **Longer lives:** a renewal that changes an app's scopes, a second renewal, a data epoch
+  past 2, a claim that runs out by time, an app with several collections, an identity that
+  enrolls again after an erasure.
+- **More than one switch with traffic between them:** the identities of a flow share one
+  origin.
+
+Not this crate's to cover: refusals, limits, rates, quotas and retention, which the
+service's own tests hold, and a faulty or hostile switch, which stays on the scripted
+switch. Around the service, the flows don't touch TLS, the listener, the proxy's
+client-address header, the client's HTTPS transport, the time source (trusted time comes
+from the test clock), key generation (accounts take keys from fixed seeds), or more than one
+instance on a database. `src/check.rs` says what of an answer the harness verifies itself
+and what it leaves to the client and the signer.
 
 ## Adding a flow
 
