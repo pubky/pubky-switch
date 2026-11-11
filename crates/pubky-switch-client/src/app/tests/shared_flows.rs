@@ -8,7 +8,7 @@ use pubky_switch_core::envelope::parse_header;
 use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::ident::{Policy, invite_code_hash};
 use pubky_switch_core::message::MessagePlaintext;
-use pubky_switch_core::ops::{AllowKind, Condition, KeyBundlePut, OpKind, SignedOp};
+use pubky_switch_core::ops::{AllowKind, Condition, KeyBundlePut, OpKind, RecordVersion, SignedOp};
 use pubky_switch_core::records::{
     CLOCK_TOLERANCE_MS, DAY_MS, RemovedApp, RenewedCert, seal_bundle_parts,
 };
@@ -17,10 +17,10 @@ use serde_json::{Map, json};
 
 use super::*;
 use crate::app::{
-    Alarm, AppError, AppEvent, ClaimOp, Collection, Delivery, IdentityRefresh,
+    Alarm, AppError, AppEvent, ClaimOp, Collection, Delivery, IdentityRefresh, KeptReason,
     MAX_REGRESSION_REASON_BYTES, MAX_SEEN_MARK_BYTES, ObligationDeadline, OpBatch, OutgoingMessage,
-    RecordContent, RecordJob, RecordTarget, Refusal, SentMessage, UndeliverableReason, WriteBase,
-    claim_conflict,
+    RecordContent, RecordJob, RecordRead, RecordTarget, Refusal, SentMessage, UndeliverableReason,
+    Unopened, WriteBase, claim_conflict,
 };
 use crate::store::StoreHandle;
 use crate::store::{Fault as StoreFault, FaultStore};
@@ -42,6 +42,8 @@ pub(crate) struct ItemsProtocol {
     pub(crate) pads: std::sync::Mutex<std::collections::VecDeque<usize>>,
     /// What each newer write checked against a mark built on.
     pub(crate) bases: std::sync::Mutex<Vec<WriteBase>>,
+    /// The collections in place of `sample.items` alone, when set.
+    pub(crate) collections: std::sync::Mutex<Option<Vec<Collection>>>,
 }
 
 pub(crate) fn items() -> Collection {
@@ -112,7 +114,11 @@ impl Protocol for ItemsProtocol {
     }
 
     fn collections(&self) -> Vec<Collection> {
-        vec![items()]
+        self.collections
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| vec![items()])
     }
 
     fn record_seen(&self, _: &str, seen: Option<&[u8]>, value: Option<&[u8]>) -> Option<Vec<u8>> {
@@ -1492,6 +1498,75 @@ async fn test_records_regression_check_sees_the_write_base() {
     );
 }
 
+/// A create over a record the app holds deleted builds on what it holds.
+#[tokio::test]
+async fn test_records_regression_base_of_a_create_over_a_held_delete_is_held() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    let target = s.target("n1");
+    wallet
+        .put_record(&target, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    phone.receive(None).await.unwrap();
+    wallet.delete_record(&target, vec![]).await.unwrap();
+    phone.receive(None).await.unwrap();
+    wallet
+        .put_record(&target, &value(&["a", "b"]), vec![])
+        .await
+        .unwrap();
+    phone.receive(None).await.unwrap();
+    let last = *s.protocol.bases.lock().unwrap().last().unwrap();
+    assert_eq!(
+        last,
+        WriteBase {
+            expected_version: RecordVersion::NONE,
+            held: true
+        }
+    );
+}
+
+/// A write built on one the app refused and only follows doesn't build on what it holds.
+#[tokio::test]
+async fn test_records_regression_base_of_a_write_on_a_flagged_one_isnt_held() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    let target = s.target("n1");
+    let key = wallet.record_key(&target).unwrap();
+    wallet
+        .put_record(&target, &value(&["a", "b"]), vec![])
+        .await
+        .unwrap();
+    phone.receive(None).await.unwrap();
+    // The wallet drops b, which the phone flags and follows; then writes on it.
+    wallet
+        .put_record(&target, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    phone.receive(None).await.unwrap();
+    assert!(phone.shared_record(&key).await.unwrap().unwrap().flagged);
+    let flagged = version_of(&wallet, &key).await;
+    wallet
+        .put_record(&target, &value(&["a", "b", "c"]), vec![])
+        .await
+        .unwrap();
+    phone.receive(None).await.unwrap();
+    let last = *s.protocol.bases.lock().unwrap().last().unwrap();
+    assert_eq!(
+        last,
+        WriteBase {
+            expected_version: flagged,
+            held: false
+        }
+    );
+}
+
+async fn version_of(app: &App, key: &[u8; 32]) -> RecordVersion {
+    app.shared_record(key).await.unwrap().unwrap().version
+}
+
 #[tokio::test]
 async fn test_records_flagged_rule_is_cut_to_its_bound() {
     let s = Setup::new();
@@ -2224,6 +2299,36 @@ fn store_parts_for(s: &Setup, cert: &AppCert) {
             }))
             .unwrap();
     }
+}
+
+/// A renewal that adds a sub-scope to a family the app already read part of owes a
+/// listing: the records under the new sub-scope were stubs in its feed.
+#[tokio::test]
+async fn test_records_renewal_adding_a_sub_scope_lists_its_records() {
+    let s = Setup::new();
+    let family = Collection::with_sub_scopes("sample.items", Policy::new("scope-a", &["scope-a"]));
+    *s.protocol.collections.lock().unwrap() = Some(vec![family.clone()]);
+    let mut wallet = join_scoped(&s, "wallet", &["scope-a:kiosk"]).await;
+    let mut phone = s.join("phone").await;
+    let target = RecordTarget::new(family.sub_scope("till").unwrap(), b"t1");
+    phone
+        .put_record(&target, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    let key = phone.record_key(&target).unwrap();
+    wallet.receive(None).await.unwrap();
+    assert!(wallet.shared_record(&key).await.unwrap().is_none());
+    s.w.clock.advance_ms(HOUR);
+    let earlier = wallet.cert().clone();
+    let renewed = renewed_cert(&s, "wallet", &["scope-a:kiosk", "scope-a:till"]);
+    s.w.next_doc(|body| list_renewal(body, &earlier, &renewed, None));
+    wallet.receive(None).await.unwrap();
+    assert_eq!(wallet.cert().hash(), renewed.hash());
+    store_parts_for(&s, &renewed);
+    wallet.receive(None).await.unwrap();
+    wallet.receive(None).await.unwrap();
+    let held = wallet.shared_record(&key).await.unwrap().unwrap();
+    assert_eq!(ids(held.content.value()), vec!["a"]);
 }
 
 /// A renewal that adds no read scope of a collection owes no listing.
@@ -4903,6 +5008,12 @@ async fn test_scripted_records_signer_and_an_app_without_a_certificate_read_none
     let key = phone_record(&s, &mut phone).await;
     let by_key = format!("records/{key}");
     let list = format!("records?collection={}", items_id(&s));
+    // The query is read before the caller: a parameter given twice is 400, the signer's
+    // included.
+    assert_eq!(
+        scripted_get(&s, None, &format!("{list}&limit=1&limit=2")),
+        (400, json!("bad_request"), true)
+    );
     // The signer reads no records.
     for rest in [&by_key, &list] {
         assert_eq!(
@@ -4945,6 +5056,8 @@ async fn test_scripted_records_query_and_key_are_read_as_the_service_reads_them(
         format!("records?collection={id}&limit=1001"),
         "records/AAAA".to_owned(),
         format!("records/{key}="),
+        format!("records?collection={id}&collection={id}"),
+        format!("records?collection={id}&limit=%zz"),
     ];
     for rest in &refused {
         assert_eq!(
@@ -4953,9 +5066,12 @@ async fn test_scripted_records_query_and_key_are_read_as_the_service_reads_them(
             "{rest}"
         );
     }
+    // Percent-decoded, as at the service.
+    let escaped = id.replace('-', "%2D").replace('_', "%5F");
     for rest in [
         format!("records?collection={id}&limit=5"),
         format!("records?collection={id}&after={key}"),
+        format!("records?collection={escaped}&limit=%35"),
     ] {
         assert_eq!(scripted_get(&s, me, &rest).0, 200, "{rest}");
     }
@@ -5047,4 +5163,351 @@ async fn test_scripted_peer_identity_needed_carries_known_version() {
         body.as_object().unwrap().get("known_version"),
         Some(&Value::Null)
     );
+}
+
+// -------------------------------------------------------------------------------------
+// Records held unreadable until their keys arrive (Switch spec 3.5)
+
+/// A listing a widening renewal owes waits for the keys of the scope it added: listed
+/// before them, the record would be held `Unreadable`.
+#[tokio::test]
+async fn test_records_listing_after_a_widening_waits_for_the_keys() {
+    let s = Setup::new();
+    let mut wallet = join_scoped(&s, "wallet", &["scope-c"]).await;
+    let mut phone = s.join("phone").await;
+    let key =
+        pubky_switch_core::enc::unb64_array::<32>(&phone_record(&s, &mut phone).await).unwrap();
+    wallet.receive(None).await.unwrap();
+    s.w.clock.advance_ms(HOUR);
+    let earlier = wallet.cert().clone();
+    let renewed = renewed_cert(&s, "wallet", &["scope-a", "scope-c"]);
+    s.w.next_doc(|body| list_renewal(body, &earlier, &renewed, None));
+    wallet.receive(None).await.unwrap();
+    assert_eq!(wallet.cert().hash(), renewed.hash());
+    // The renewal's part came before the document listing it and was skipped: the key of
+    // scope-a is missing, so the listing waits.
+    let listings = s.w.switch.lock().shared.listings;
+    wallet.receive(None).await.unwrap();
+    assert_eq!(
+        s.w.switch.lock().shared.listings,
+        listings,
+        "no listing yet"
+    );
+    assert!(wallet.shared_record(&key).await.unwrap().is_none());
+    // Once the keys arrive, the next read lists, and the record opens.
+    store_parts_for(&s, &renewed);
+    wallet.receive(None).await.unwrap();
+    wallet.receive(None).await.unwrap();
+    assert!(s.w.switch.lock().shared.listings > listings);
+    let held = wallet.shared_record(&key).await.unwrap().unwrap();
+    assert_eq!(ids(held.content.value()), vec!["a"]);
+}
+
+/// The wallet and the phone at data epoch 2, the phone holding its key and the wallet not;
+/// the phone writes `n1` sealed at epoch 2, and the wallet reads it from the feed.
+async fn record_at_a_new_epoch(s: &Setup, wallet: &mut App, phone: &mut App) -> [u8; 32] {
+    wallet.receive(None).await.unwrap();
+    s.w.next_doc(|body| body.data_epoch = 2);
+    store_parts_for(s, &phone.cert().clone());
+    phone.receive(None).await.unwrap();
+    let target = s.target("n1");
+    phone
+        .put_record(&target, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    phone.record_key(&target).unwrap()
+}
+
+/// A record written at a new data epoch whose key reaches the app late is held
+/// `Unreadable`, then opened when the key arrives, without a listing.
+#[tokio::test]
+async fn test_records_held_unreadable_opens_once_its_key_arrives() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    let key = record_at_a_new_epoch(&s, &mut wallet, &mut phone).await;
+    wallet.receive(None).await.unwrap();
+    let held = wallet.shared_record(&key).await.unwrap().unwrap();
+    assert_eq!(
+        held.content,
+        RecordContent::Unreadable(Unopened::KeyNotHeld { data_epoch: 2 }),
+        "for now"
+    );
+    let listings = s.w.switch.lock().shared.listings;
+    store_parts_for(&s, &wallet.cert().clone());
+    let report = wallet.receive(None).await.unwrap();
+    assert_eq!(s.w.switch.lock().shared.listings, listings, "no listing");
+    let held = wallet.shared_record(&key).await.unwrap().unwrap();
+    assert_eq!(ids(held.content.value()), vec!["a"]);
+    assert!(
+        report
+            .events
+            .iter()
+            .any(|e| matches!(e, AppEvent::RecordChanged { key: k } if *k == key)),
+        "{:?}",
+        report.events
+    );
+}
+
+/// An explicit listing of a record held `Unreadable` opens it once its key is held: the
+/// same write, by its item hash, is taken as opened.
+#[tokio::test]
+async fn test_records_relist_opens_a_record_held_unreadable() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    let key = record_at_a_new_epoch(&s, &mut wallet, &mut phone).await;
+    wallet.list_collection(&items()).await.unwrap();
+    let held = wallet.shared_record(&key).await.unwrap().unwrap();
+    assert_eq!(
+        held.content,
+        RecordContent::Unreadable(Unopened::KeyNotHeld { data_epoch: 2 }),
+        "for now"
+    );
+    store_parts_for(&s, &wallet.cert().clone());
+    wallet.receive(None).await.unwrap();
+    wallet.list_collection(&items()).await.unwrap();
+    let held = wallet.shared_record(&key).await.unwrap().unwrap();
+    assert_eq!(ids(held.content.value()), vec!["a"]);
+}
+
+/// A record whose value doesn't open with its key held stays `Unreadable`: tried again
+/// once, when the key arrives, and flagged then; a later read doesn't try it again.
+#[tokio::test]
+async fn test_records_unopenable_with_its_key_held_is_tried_once() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    wallet.receive(None).await.unwrap();
+    s.w.next_doc(|body| body.data_epoch = 2);
+    store_parts_for(&s, &phone.cert().clone());
+    phone.receive(None).await.unwrap();
+    // The phone writes a value sealed under a key that isn't epoch 2's.
+    let target = s.target("n1");
+    let (_, kind) = phone
+        .record_op(&target, Some(&value(&["a"])), vec![])
+        .await
+        .unwrap();
+    let OpKind::RecordPut(mut put) = kind else {
+        unreachable!("a record op");
+    };
+    put.value_sealed = pubky_switch_core::sealed::SealedValue::seal(
+        &[3; 32],
+        &s.w.alice.public(),
+        2,
+        "scope-a",
+        &put.key,
+        &value(&["a"]),
+    )
+    .unwrap();
+    let key = put.key;
+    s.w.switch
+        .app_op(&app_keys("phone"), OpKind::RecordPut(put))
+        .unwrap();
+    wallet.receive(None).await.unwrap();
+    let held = wallet.shared_record(&key).await.unwrap().unwrap();
+    assert_eq!(
+        held.content,
+        RecordContent::Unreadable(Unopened::KeyNotHeld { data_epoch: 2 }),
+        "for now"
+    );
+    store_parts_for(&s, &wallet.cert().clone());
+    let report = wallet.receive(None).await.unwrap();
+    assert_eq!(
+        flagged_rules(&report.events).len(),
+        1,
+        "{:?}",
+        report.events
+    );
+    let held = wallet.shared_record(&key).await.unwrap().unwrap();
+    assert_eq!(
+        held.content,
+        RecordContent::Unreadable(Unopened::DoesNotOpen),
+        "for good"
+    );
+    // Not tried at every read, nor at a fetch that takes no key.
+    for _ in 0..2 {
+        let report = wallet.receive(None).await.unwrap();
+        assert!(
+            flagged_rules(&report.events).is_empty(),
+            "{:?}",
+            report.events
+        );
+    }
+    wallet.fetch_key_bundle().await.unwrap();
+    assert!(flagged_rules(&wallet.take_events()).is_empty());
+    // Nor at a later key's arrival: it won't open.
+    s.w.next_doc(|body| body.data_epoch = 3);
+    store_parts_for(&s, &wallet.cert().clone());
+    let report = wallet.receive(None).await.unwrap();
+    assert!(wallet.scope_key(3, "scope-a").is_some());
+    assert!(
+        flagged_rules(&report.events).is_empty(),
+        "{:?}",
+        report.events
+    );
+}
+
+// -------------------------------------------------------------------------------------
+// A record read now, or an earlier copy kept (Switch wire 7.4.9)
+
+#[tokio::test]
+async fn test_records_read_fresh_tells_a_fresh_read_from_a_kept_copy() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    let target = s.target("n1");
+    let key = wallet.record_key(&target).unwrap();
+    wallet
+        .put_record(&target, &value(&["a", "b"]), vec![])
+        .await
+        .unwrap();
+    // Read now.
+    match phone.read_record_fresh(&target).await.unwrap() {
+        RecordRead::Fresh(record) => assert_eq!(ids(record.content.value()), ["a", "b"]),
+        other => panic!("{other:?}"),
+    }
+    // The wallet drops b, which the phone has seen: the newer write is refused, and the
+    // phone keeps its copy.
+    wallet
+        .put_record(&target, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    match phone.read_record_fresh(&target).await.unwrap() {
+        RecordRead::Kept {
+            record: Some(record),
+            reason: KeptReason::Refused,
+        } => assert_eq!(ids(record.content.value()), ["a", "b"]),
+        other => panic!("{other:?}"),
+    }
+    // The switch forgets the record: a 404, and the copy kept.
+    s.w.switch.lock().shared.records.remove(&key);
+    match phone.read_record_fresh(&target).await.unwrap() {
+        RecordRead::Kept {
+            record: Some(record),
+            reason: KeptReason::NotFound,
+        } => assert_eq!(ids(record.content.value()), ["a", "b"]),
+        other => panic!("{other:?}"),
+    }
+    // The switch can't be reached: the copy kept.
+    s.w.switch.fail_next(Fault::Unreachable {
+        path: "records/".into(),
+        after: 0,
+    });
+    assert!(matches!(
+        phone.read_record_fresh(&target).await.unwrap(),
+        RecordRead::Kept {
+            record: Some(_),
+            reason: KeptReason::Unreachable(_),
+        }
+    ));
+    // The read the existing call makes still returns the copy.
+    assert!(phone.read_record(&target).await.unwrap().is_some());
+}
+
+/// A newer write that fails a check, a value that doesn't open with its key held, keeps
+/// the earlier copy.
+#[tokio::test]
+async fn test_records_read_fresh_keeps_a_copy_past_a_write_that_fails_a_check() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    let target = s.target("n1");
+    phone
+        .put_record(&target, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    assert!(matches!(
+        wallet.read_record_fresh(&target).await.unwrap(),
+        RecordRead::Fresh(_)
+    ));
+    let (_, kind) = phone
+        .record_op(&target, Some(&value(&["a", "b"])), vec![])
+        .await
+        .unwrap();
+    let OpKind::RecordPut(mut put) = kind else {
+        unreachable!("a record op");
+    };
+    put.value_sealed = pubky_switch_core::sealed::SealedValue::seal(
+        &[3; 32],
+        &s.w.alice.public(),
+        1,
+        "scope-a",
+        &put.key,
+        &value(&["a", "b"]),
+    )
+    .unwrap();
+    s.w.switch
+        .app_op(&app_keys("phone"), OpKind::RecordPut(put))
+        .unwrap();
+    match wallet.read_record_fresh(&target).await.unwrap() {
+        RecordRead::Kept {
+            record: Some(record),
+            reason: KeptReason::Refused,
+        } => assert_eq!(ids(record.content.value()), ["a"]),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// The feed's query, as the service reads it: decoded, a parameter given twice refused, and
+/// `limit` and `wait` digits only in their ranges; the signer is refused first.
+#[tokio::test]
+async fn test_scripted_feed_query_is_read_as_the_service_reads_it() {
+    let s = Setup::new();
+    let phone = s.join("phone").await;
+    let me = Some(phone.app_id());
+    for rest in [
+        "feed?after=1:0&after=1:1",
+        "feed?limit=%zz",
+        "feed?limit=+5",
+        "feed?limit=0",
+        "feed?limit=501",
+        "feed?wait=26",
+        "feed?wait=+1",
+    ] {
+        assert_eq!(
+            scripted_get(&s, me, rest),
+            (400, json!("bad_request"), true),
+            "{rest}"
+        );
+    }
+    for rest in [
+        "feed?limit=%35",
+        "feed?limit=500",
+        "feed?after=1%3A0&wait=0",
+    ] {
+        assert_eq!(scripted_get(&s, me, rest).0, 200, "{rest}");
+    }
+    assert_eq!(
+        scripted_get(&s, None, "feed?limit=1&limit=2"),
+        (403, json!("permission_missing"), true)
+    );
+}
+
+/// The peer switch reads an append's query first: decoded, a parameter given twice and a
+/// missing `apps_version` refused, before admission and the listing.
+#[tokio::test]
+async fn test_scripted_peer_append_query_is_read_first() {
+    let s = Setup::new();
+    let wallet = s.join("wallet").await;
+    for query in ["apps_version=0&apps_version=0", "apps_version=%zz", ""] {
+        let request = crate::transport::Request {
+            method: "POST".into(),
+            origin: PEER_ORIGIN.into(),
+            path_and_query: format!("/v1/{}/inbox?{query}", s.w.bob.id()),
+            headers: vec![
+                crate::transport::Header::new(
+                    pubky_switch_core::http::header::IDENTITY,
+                    &s.w.alice.id(),
+                ),
+                crate::transport::Header::new(
+                    pubky_switch_core::http::header::APP,
+                    &pubky_switch_core::enc::zbase32_encode(&wallet.app_id()),
+                ),
+            ],
+            body: Vec::new(),
+        };
+        let response = s.peer.transport().send(request).await.unwrap();
+        assert_eq!(response.status, 400, "{query}");
+    }
 }

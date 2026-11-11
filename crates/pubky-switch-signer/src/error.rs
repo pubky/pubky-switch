@@ -283,6 +283,24 @@ pub enum Refusal {
     /// A flow is in progress: [`crate::Signer::resume`] finishes it first.
     #[error("refused: a flow is in progress")]
     FlowInProgress,
+    /// A provider loss is declared and the new service hasn't taken its version yet (Switch
+    /// spec 12.6 step 1): nothing else is signed meanwhile. [`crate::Signer::resume`] goes on
+    /// with it, and [`crate::Signer::declare_provider_loss`] declares it again, at the same
+    /// service or another.
+    #[error("refused: a recovery is in progress")]
+    Recovering,
+    /// The Homeserver holds no `identity.json`, which the records don't explain: another
+    /// install may have signed and published newer versions there, deleted since, so a
+    /// provider loss isn't declared on this install's records alone (Switch spec 12.6 step
+    /// 1). [`crate::Signer::declare_provider_loss_confirming_records`] declares it once the
+    /// user confirms no other install signs.
+    #[error("refused: the Homeserver holds no identity.json")]
+    HomeserverCopyMissing,
+    /// The Homeserver's `identity.json` doesn't verify, which the signer's own steps never
+    /// leave: it is refused as [`Refusal::HomeserverCopyMissing`] is, with the same way past
+    /// it.
+    #[error("refused: the Homeserver's identity.json doesn't verify")]
+    HomeserverCopyUnreadable,
     /// The switch holds a newer `identity.json` that this install didn't sign, which it
     /// adopted; the change asked for wasn't made, and may be asked for again on top of it
     /// (Switch spec 4.3).

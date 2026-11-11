@@ -21,7 +21,7 @@ use pubky_switch_core::sig::SignedDoc;
 use pubky_switch_core::time::rfc3339;
 use serde_json::{Value, json};
 
-use super::{Answer, Inner, ScriptedSwitch, SwitchApp, bad};
+use super::{Answer, Inner, ScriptedSwitch, SwitchApp, bad, parse_query};
 use crate::clock::Clock;
 use crate::transport::Request;
 
@@ -607,18 +607,20 @@ impl Inner {
     /// parameters ignored. The records shown are those whose `read_scope` the reader's
     /// certificate holds.
     fn list_records(&mut self, caller: Option<[u8; 16]>, query: &str) -> Answer {
+        // The query is read before the caller is: percent-decoded, a parameter given twice
+        // refused (`crates/pubky-switch/src/http/route.rs`, `parse_query`; Switch wire 7.1).
+        let Some(params) = parse_query(query) else {
+            return bad(
+                ErrorCode::BadRequest,
+                "the query doesn't decode",
+                json!(null),
+            );
+        };
         let cert = match self.record_reader(caller) {
             Ok(cert) => cert,
             Err(refused) => return refused,
         };
-        let param = |name: &str| {
-            query
-                .split('&')
-                .find_map(|pair| match pair.split_once('=') {
-                    Some((key, value)) if key == name => Some(value),
-                    _ => None,
-                })
-        };
+        let param = |name: &str| params.get(name).map(String::as_str);
         let Some(collection) = param("collection") else {
             return bad(ErrorCode::BadRequest, "collection is required", json!(null));
         };

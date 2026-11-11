@@ -51,9 +51,13 @@ pub struct WriteBase {
     /// `{0, 0}` for a create.
     pub expected_version: RecordVersion,
     /// Whether the app holds that version: the write it holds of the record is at
-    /// `expected_version`, or, for a create, it holds none. `false` when the write builds
-    /// on a version the app never took, such as one it skipped by reading the record's
-    /// current view.
+    /// `expected_version`, or, for a create (`{0, 0}`), it holds none or holds the record
+    /// deleted, as a writer that holds a deleted record creates it again (Switch wire 6.2).
+    /// `false` when the write builds on a version the app never took, such as one it skipped
+    /// by reading the record's current view, or on a write it refused and only follows. The
+    /// held version is the one the app holds, authenticated by a proof or a stub or only the
+    /// record view's word, and whether its value opened doesn't count: a write held not
+    /// open ([`super::RecordContent::Unreadable`]) is held at its version.
     pub held: bool,
 }
 

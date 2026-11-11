@@ -196,6 +196,62 @@ pub(crate) struct SignerState {
     /// and nothing more is signed for that account.
     #[serde(default)]
     pub(crate) erased: bool,
+    /// A provider loss is declared and its version not delivered yet (Switch spec 12.6 step
+    /// 1): its own steps pass the recovery's gate ([`crate::signer::gate::recovery_key`])
+    /// while an alarm about the lost service is held, and every other signing step is
+    /// refused ([`crate::error::Refusal::Recovering`]).
+    #[serde(default)]
+    pub(crate) recovering: bool,
+    /// The document a declared recovery builds on (Switch spec 12.6 step 1): the newest this
+    /// install signed when it was first declared, a version in flight to the lost service
+    /// included, since that service may have taken it and apps seen it. Kept while the
+    /// recovery is declared again elsewhere, and dropped once its version is delivered.
+    #[serde(default)]
+    pub(crate) recovery_base: Option<SignedDoc>,
+    /// The generation a declared recovery declares lost (Switch spec 12.6 step 1): its
+    /// version is the next one, with `recovery_from` this. Kept while the recovery is
+    /// declared again, since its base may be a recovery's own version not delivered yet, as
+    /// one restored from a backup written mid-recovery.
+    #[serde(default)]
+    pub(crate) lost_generation: Option<u64>,
+    /// The Homeserver's `identity.json` was missing or didn't verify when the recovery was
+    /// declared, and the records explained it, or the user confirmed them anyway (Switch spec
+    /// 12.6 step 1): a backup missing or unreadable is then written over without that copy.
+    #[serde(default)]
+    pub(crate) homeserver_copy_waived: bool,
+    /// The recovery's version is delivered and lists apps whose revocation is pending: they
+    /// are revoked at the new service before the version is published, which is how apps
+    /// find the service (Switch spec 12.6 step 1).
+    #[serde(default)]
+    pub(crate) revoke_at_service: bool,
+    /// Some version of the identity was published on the Homeserver, by this install or,
+    /// for records restored or received, by the install they came from (Switch spec 4.3). A
+    /// missing `identity.json` is explained without it only by an erasure (Switch spec 12.6
+    /// step 1). Records kept before this was are taken as published.
+    #[serde(default = "published_before")]
+    pub(crate) ever_published: bool,
+    /// The service the recovery in progress last went to, for its status (Switch spec 12.6
+    /// step 1).
+    #[serde(default)]
+    pub(crate) recovery_origin: Option<String>,
+    /// Each service an earlier declaration of the recovery in progress enrolled at, with
+    /// the key its enrollment answered: declared again there, the signer reads under that
+    /// key whether the earlier version was taken, since a service that took it answers
+    /// another enrollment with a pending key, and the version's refusal with the first
+    /// (Switch wire 3.7, 7.4.2).
+    #[serde(default)]
+    pub(crate) recovery_services: Vec<Service>,
+    /// The recovery's version that a service took names another install: a restore's, from
+    /// a backup written mid-recovery. This install signs the next version naming itself, as
+    /// a restore does (Switch wire 3.13).
+    #[serde(default)]
+    pub(crate) owes_own_version: bool,
+    /// The staged admission a recovery started is the signer's to end (Switch spec 12.6 step
+    /// 2): none of the listed apps holds `lists.manage`, or the user asked. `POST
+    /// /recovery/admission` is owed, sent again at every run, after publication, until `GET
+    /// /apps` shows the wait ended or no wait.
+    #[serde(default)]
+    pub(crate) admission_owed: bool,
 }
 
 /// A hand-over this install is making (Switch wire 3.12).
@@ -294,6 +350,11 @@ pub(crate) struct PendingClaim {
     pub(crate) plaintext: Vec<u8>,
 }
 
+/// Records kept before `ever_published` was are taken as published.
+fn published_before() -> bool {
+    true
+}
+
 /// The certificate lifetime of records written before it was kept: the default.
 fn default_cert_lifetime() -> u64 {
     DEFAULT_CERT_LIFETIME_MS
@@ -303,11 +364,23 @@ impl SignerState {
     /// Keep only the certificates the newest version references, of its apps and its
     /// `renewed` entries, the claims of certificates it lists, and the untaken renewals of
     /// certificates it references: a version that wasn't delivered leaves none of its own
-    /// behind, nor counts as a renewal the app left untaken.
+    /// behind, nor counts as a renewal the app left untaken. A declared recovery's base
+    /// counts as the newest version too, since the recovery's version is built on it.
     pub(crate) fn prune_unreferenced(&mut self) {
-        let doc = self.newest_doc().ok().flatten();
+        let identity = self.identity;
+        let docs: Vec<IdentityDoc> = self
+            .newest_doc()
+            .ok()
+            .flatten()
+            .into_iter()
+            .chain(
+                self.recovery_base
+                    .as_ref()
+                    .and_then(|base| IdentityDoc::verify(base, &identity).ok()),
+            )
+            .collect();
         let referenced = |hash: &[u8; 32]| {
-            doc.as_ref().is_some_and(|doc| {
+            docs.iter().any(|doc| {
                 doc.body().apps.iter().any(|a| &a.cert == hash)
                     || doc.body().renewed.iter().any(|r| &r.cert == hash)
             })
@@ -316,9 +389,24 @@ impl SignerState {
             .retain(|cert| cert.doc_hash().is_ok_and(|hash| referenced(&hash)));
         self.untaken_renewals.retain(|(_, cert)| referenced(cert));
         self.claims.retain(|claim| {
-            doc.as_ref()
-                .is_some_and(|doc| doc.listed_cert(&claim.app_id) == Some(claim.cert))
+            docs.iter()
+                .any(|doc| doc.listed_cert(&claim.app_id) == Some(claim.cert))
         });
+    }
+
+    /// The `distrust_from` the user picked for each revocation asked for, which the records
+    /// carry for those no version carried out yet (Switch wire 3.12, 3.13).
+    pub(crate) fn picked_distrust(&self) -> Vec<pubky_switch_core::records::RemovedApp> {
+        self.revoking
+            .iter()
+            .filter_map(|r| {
+                r.distrust_from
+                    .map(|distrust_from| pubky_switch_core::records::RemovedApp {
+                        app_id: r.app_id,
+                        distrust_from,
+                    })
+            })
+            .collect()
     }
 
     /// The records of a new identity, for this install.
@@ -357,6 +445,16 @@ impl SignerState {
             time_asked: None,
             closing_unavailable: None,
             erased: false,
+            recovering: false,
+            recovery_base: None,
+            lost_generation: None,
+            homeserver_copy_waived: false,
+            revoke_at_service: false,
+            ever_published: false,
+            recovery_origin: None,
+            recovery_services: Vec::new(),
+            owes_own_version: false,
+            admission_owed: false,
         }
     }
 
@@ -412,6 +510,15 @@ pub(crate) enum Flow {
         enrollment: SignedDoc,
         /// The policy the first `identity.json` carries.
         policy: IdentityPolicy,
+    },
+    /// Recovering from a provider loss (Switch spec 12.6 step 1): enrolling at the service
+    /// at `origin`, then signing the next generation's `identity.json` with `recovery_from`,
+    /// which a delivery then takes there.
+    Recover {
+        /// The service's origin.
+        origin: String,
+        /// The signed enrollment, sent again until it is answered.
+        enrollment: SignedDoc,
     },
     /// Renewing an app's certificate (Switch spec 3.2, Switch wire 3.8), or completing a data
     /// epoch before a rotation: storing the new certificate and the key bundles at the switch,
@@ -570,6 +677,19 @@ fn decode<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_state_records_kept_before_the_publication_flag_count_as_published() {
+        let state = SignerState::new([1; 32], [2; 16]);
+        let mut value = serde_json::to_value(&state).unwrap();
+        value.as_object_mut().unwrap().remove("ever_published");
+        let read: SignerState = serde_json::from_value(value).unwrap();
+        assert!(read.ever_published);
+        assert!(
+            !state.ever_published,
+            "a new identity's records start unpublished"
+        );
+    }
+
     use super::*;
 
     #[test]

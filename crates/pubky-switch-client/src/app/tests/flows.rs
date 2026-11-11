@@ -1361,6 +1361,99 @@ async fn test_app_restore_takes_no_listed_certificate_it_cant_verify() {
     );
 }
 
+/// The directory's newer document removes the app: the restored read stops there, and
+/// neither checks its receive key nor registers one at this switch.
+#[tokio::test]
+async fn test_app_restore_removed_by_a_newer_document_registers_nothing() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let me = app.app_id();
+    let backup = backup_then_rotate(&w, &mut app).await;
+    drop(app);
+    w.next_doc(|body| {
+        body.apps.retain(|a| a.app_id != me);
+        body.removed.push(RemovedApp {
+            app_id: me,
+            distrust_from: START,
+        });
+    });
+    let applied = w.switch.applied().len();
+    let (mut restored, _) = restored(&w, &backup).await;
+    let report = restored.receive(None).await.unwrap();
+    assert!(report.stopped);
+    assert!(
+        has(&report.events, |e| matches!(e, AppEvent::Removed)),
+        "{:?}",
+        report.events
+    );
+    assert_eq!(w.switch.applied().len(), applied, "nothing registered");
+}
+
+/// The restore's directory read brings a newer document naming the next generation:
+/// `take_listed_cert` takes it and reports the app not current here, before the restore's
+/// key check, which would register a key at the generation the app leaves. A read follows
+/// the change at its start (`follow_provider_change`) before it gets here; this is the
+/// guard for a document that arrives between the two.
+#[tokio::test]
+async fn test_app_restore_listed_cert_stops_at_a_newer_generation() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let backup = backup_then_rotate(&w, &mut app).await;
+    drop(app);
+    let mut body = w.switch.identity_doc().unwrap().body().clone();
+    body.version += 1;
+    body.generation += 1;
+    let doc = IdentityDoc::sign(&w.alice, body).unwrap();
+    w.switch.deliver_identity(&doc).unwrap();
+    let (mut restored, _) = restored(&w, &backup).await;
+    let applied = w.switch.applied().len();
+    assert!(matches!(
+        restored.take_listed_cert().await.unwrap(),
+        crate::app::renewal::Listed::NotCurrentHere
+    ));
+    assert_eq!(restored.own_identity().generation(), 2);
+    assert!(restored.not_current_here().is_some());
+    assert_eq!(w.switch.applied().len(), applied, "nothing registered");
+}
+
+/// A listed certificate that isn't a renewal of the one held, an earlier one, isn't taken.
+#[tokio::test]
+async fn test_app_restore_takes_no_listed_certificate_older_than_its_own() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let me = app.app_id();
+    let first = app.cert().clone();
+    let before = w.switch.app(&me);
+    w.clock.advance_ms(HOUR);
+    renew_listed(&w, &app);
+    app.receive(None).await.unwrap();
+    app.receive(None).await.unwrap();
+    let renewed = app.cert().clone();
+    assert_ne!(renewed.hash(), first.hash());
+    let backup = app.backup().await.unwrap();
+    drop(app);
+    // The switch holds the first certificate's record again, and a newer document lists it.
+    {
+        let mut inner = w.switch.lock();
+        let held = inner.apps.get_mut(&me).unwrap();
+        held.record = before.record.clone();
+        held.cert = before.cert.clone();
+        held.renewed = None;
+    }
+    w.next_doc(|body| {
+        body.apps.retain(|a| a.app_id != me);
+        body.apps.push(ListedApp {
+            app_id: me,
+            cert: first.hash(),
+        });
+        body.renewed.clear();
+    });
+    let (mut restored, _) = restored(&w, &backup).await;
+    restored.receive(None).await.unwrap();
+    assert_eq!(restored.own_identity().listed_cert(&me), Some(first.hash()));
+    assert_eq!(restored.cert().hash(), renewed.hash());
+}
+
 #[tokio::test]
 async fn test_app_expired_certificate_is_renewed_by_the_signer_alone() {
     let w = World::new();
@@ -2581,6 +2674,48 @@ async fn test_app_restore_asks_again_for_a_full_bundle_a_later_part_left_short()
         restored.scope_key(2, "scope-a"),
         Some(w.alice.scope_key(2, "scope-a"))
     );
+}
+
+/// The answer to a full-bundle request the backup holds was read by the device the backup
+/// came from, which moved its cursor past it, so the switch dropped the parts and the
+/// restored app's feed shows only their stubs. The restore drops the request: the first read
+/// asks once, and no later read asks again while no part arrives.
+#[tokio::test]
+async fn test_app_restore_asks_again_for_a_full_bundle_read_and_dropped() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let me = app.app_id();
+    let cert = app.cert().clone();
+    w.next_doc(|body| body.data_epoch = 3);
+    let report = app.receive(None).await.unwrap();
+    let asked = |events: &[AppEvent]| {
+        events
+            .iter()
+            .filter(|e| matches!(e, AppEvent::FullBundleRequested))
+            .count()
+    };
+    assert_eq!(asked(&report.events), 1, "{:?}", report.events);
+    let backup = app.backup().await.unwrap();
+    store_part(&w, me, &cert, 1, 3);
+    app.receive(None).await.unwrap();
+    app.flush_cursor().await.unwrap();
+    assert_eq!(app.keys_through(), 3);
+    store_part(&w, me, &cert, 3, 3);
+    app.receive(None).await.unwrap();
+    app.flush_cursor().await.unwrap();
+    assert!(!w.switch.bundles_of(&me).contains(&(1, 3)), "dropped");
+    drop(app);
+    let (mut restored, _) = restored(&w, &backup).await;
+    let mut events = restored.receive(None).await.unwrap().events;
+    assert_eq!(asked(&events), 1, "{events:?}");
+    assert!(w.switch.app(&me).full_requested.is_some());
+    for _ in 0..2 {
+        events = restored.receive(None).await.unwrap().events;
+        assert_eq!(asked(&events), 0, "{events:?}");
+    }
+    store_part(&w, me, &cert, 1, 3);
+    restored.receive(None).await.unwrap();
+    assert_eq!(restored.keys_through(), 3);
 }
 
 // The scripted switch drops key bundle parts by the core's rule, as the service does (Switch

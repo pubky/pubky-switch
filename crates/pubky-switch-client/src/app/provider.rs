@@ -1314,7 +1314,8 @@ impl App {
     /// Read the own entry in the next directory, then send the kept re-registration batch
     /// (Switch spec 12.5 step 4, 3.6). An older key of the app shown as current is a
     /// rollback of its registrations: reported, and the current key registered again. A key
-    /// no device of the app made is a compromise.
+    /// no device of the app made is a compromise, or, while a restore asks about it,
+    /// unaccounted, the user asked ([`App::restore_asks_about`], Switch spec 12.4).
     async fn reregister(&mut self, mv: &MoveRecord) -> Result<(), AppError> {
         let current = self
             .state
@@ -1325,7 +1326,15 @@ impl App {
         if let (Some(shown), Some((n, kid))) = (self.own_directory_key().await?, current)
             && shown.kid() != kid
         {
-            if !self.state.known_kids.contains_key(&shown.kid()) {
+            if !self.state.known_kids.contains_key(&shown.kid())
+                && !self.state.device.multi_device
+                && self.restore_asks_about(shown.n())
+            {
+                let mut tx = self.tx()?;
+                self.ask_about_registration(shown.n(), shown.kid(), None, &mut tx)?;
+                self.commit(tx).await?;
+                self.push_restore_question();
+            } else if !self.state.known_kids.contains_key(&shown.kid()) {
                 let error = self
                     .raise(Alarm::Compromise {
                         n: shown.n(),

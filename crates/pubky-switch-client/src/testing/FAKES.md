@@ -20,7 +20,9 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   one isn't refused. Every other request stamps the clock's time. Answers to own apps and
   the signer carry `Switch-Head`, refusals included, but a `401`, the enrollment and the
   erasure. An injected `401` fault is answered as before the lock, with the last stamped
-  time and no head; other injected faults with the clock's time and the head. Each operation's signature is
+  time and no head; other injected faults with the clock's time and the head. A request an
+  `Unreachable` fault stops keeps its body, which the test call `unreached_bodies` returns,
+  in order. Each operation's signature is
   verified, and an own app must be current with an unexpired certificate.
 - **Injected faults** (`fail_next`) script a network or a service that fails: an error
   answer, a lost answer (the request applied, the caller sees a timeout), a connection that
@@ -101,6 +103,12 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
 
 ## Other calls
 
+- **Queries** are read as the service reads them (`crates/pubky-switch/src/http/route.rs`,
+  `parse_query`; Switch wire 7.1): names and values percent-decoded, and a bad escape or a
+  parameter given twice `400` before the endpoint's checks, at `GET /feed` (after the
+  signer's refusal, as at the service), `POST /inbox` (before the retry by content) and
+  `GET /records`, and at the peer switch's `POST /inbox`. The feed's `limit` (1 to 500) and
+  `wait` (at most 25) and the inbox's `apps_version` are digits only.
 - **Injected entries**: `send` and `send_envelope` add entries without admission, quotas,
   size buckets or `409 stale_key`; entry IDs are made up from the `seq`.
 - **`POST /inbox`** (Switch wire 7.4.3), in `switch/inbox.rs`, from apps of other
@@ -119,12 +127,15 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
 - **`PUT /peers`** (Switch wire 7.4.5) keeps every copy it takes: no peer limit, but for
   `forget_peer_copy`.
 - **`GET /records/{key}` and `GET /records`** (Switch wire 7.4.9), in `switch/shared.rs`:
-  as at the service (`crates/pubky-switch/src/service/records.rs`): only own apps read
-  (the signer gets `403 permission_missing`); a key, `collection` (required) and `after`
-  must be `b64(32)`, and `limit` digits from 1 to 1000 (`400`); a record by key needs its
-  `read_scope` (`403 permission_missing`, with the head), and a list shows only the records
-  whose `read_scope` the reader holds, by the certificate the switch checks the app against;
-  an own app the switch holds no certificate for holds none. Order by the key text, `after`
+  as at the service (`crates/pubky-switch/src/service/records.rs`): a list's query is
+  percent-decoded, and a parameter given twice is `400`, before the caller is judged; only
+  own apps read (the signer gets `403 permission_missing`); a key, `collection` (required)
+  and `after` must be `b64(32)`, and `limit` digits from 1 to 1000 (`400`); a record by key
+  needs its `read_scope` (`403 permission_missing`, with the head), and a list shows only
+  the records whose `read_scope` the reader holds, by the certificate the switch checks the
+  app against. Unlike the service, which answers an own app it holds no certificate for
+  `401` at authentication, this switch serves it as one holding no scope: `403` by key and
+  an empty list. Order by the key text, `after`
   as a key's text, `next`, the byte budget with its first view shown, deleted records shown
   by key and left out of lists, and a view's `cert`, the certificate the write was checked
   against, kept with the record whatever a renewal or revocation later changes, are the
@@ -132,13 +143,17 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
 - **`GET /claims/{claim_key}`** (Switch wire 7.4.8), in `switch/shared.rs`: only an own app
   holding `claims.read`, checked before the key, as at the service
   (`crates/pubky-switch/src/service/claims.rs`); then a key that isn't `b64(32)` is `400`.
-- **Reads only own apps make, from an app of another identity:** `GET /feed`, `GET
-  /claims/{claim_key}`, `GET /allow`, `GET /records/{key}` and `GET /records` answer `403
-  permission_missing` (`switch/inbox.rs`), as at the service (Switch wire 7.4.4, 7.6); a
-  batch, and every other route the switch doesn't serve such an app, `403 not_admitted`.
+- **Calls of an app of another identity it doesn't make** (`switch/inbox.rs`), as at the
+  service (`crates/pubky-switch/src/service/rules.rs`, `other_app_refusal`; Switch wire
+  7.4, 7.6): `403 permission_missing` at the reads only own apps make (`GET /feed`, `GET
+  /claims/{claim_key}`, `GET /allow`, `GET /records/{key}`, `GET /records`), the key bundle
+  calls, a leave, the hand-over and the signer's calls (`PUT /identity`, revoke, `GET
+  /apps`, `POST /recovery/admission`, `POST /erase`); a batch and every other route `403
+  not_admitted`.
 - **`409 identity_needed`** to an app of another identity carries `known_version` beside
   `current`, `null` for no copy held or as to a stranger (Switch wire 7.1, 7.6), at the
-  inbox and at `POST /connect`, here and at the peer switch (`peer.rs`).
+  inbox, here and at the peer switch (`peer.rs`). Both also serve `POST /connect` and
+  answer it so; the service doesn't serve it yet (`503 unavailable`).
 - **`open_admission`** (`admit_everyone`) admits every sender the deny list doesn't hold, a
   test switch only.
 - **App currency outside batches**: a feed read is checked as a batch is, for an app that
@@ -154,21 +169,33 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   unless a test sets others (`set_enroll_limits`), and without checking the request
   signature. A switch made with `unenrolled` or `unenrolled_at` answers every other call
   with the operator's `404` until then. As at the service, the enrollment that makes the account sets its kept App IDs, and
-  every later one gets the same key and changes nothing. Unlike the service:
+  every later one gets the same key and changes nothing. As at the service, the same
+  enrollment again gets its kept answer first, with no other effect, signed with the key it
+  names. At a serving account, as at the service, a new enrollment is answered with a
+  pending key for the next generation, the same
+  for every such enrollment, signed with that key, and the App IDs it names are held with
+  it. Once a delivery starts a generation under the pending key, an enrollment the outgoing
+  key answered is `409 conflict` again, and one the pending key answered gets its answer
+  again. Unlike the service:
   - an enrollment's `identity_doc` isn't held, so the account starts with no document and
     at the switch's own generation, whatever the enrollment names;
-  - a serving account is answered `400`, never a pending key for the next generation, so
-    there is no key change in place and no provider loss at the same service.
+  - the pending key is derived from the account's, not random.
+
+  Its errors, injected ones and the `409 conflict` included, are signed with the operator
+  key, as at the service.
 - **`PUT /identity`** (Switch wire 3.3, 7.4.2), in `switch/signer.rs`: judged by the core's
   `check_delivery`, like the service, with the kept proofs taken from what it holds: each held
   record's current write proof and each live claim's entry proofs, by the generation each
   names, with the key of that generation (its own, or the earlier service's that
   `import_into` carried). A first document carrying `recovery_from` starts the recovery as
   at the service: the account takes its generation, and its chain starts with the `recovery`
-  transition, unless the switch was made `recovering`, which chained it already. Unlike the
-  service: there is no pending key, so no provider loss in place at a serving account, which
-  the service takes under its pending key, starting the account afresh; and a staged
-  account's generation change, a move's, is chained where the service answers `503`. The test call `deliver_identity` takes any document, without those
+  transition, unless the switch was made `recovering`, which chained it already. A document
+  naming the pending key with `recovery_from` is a provider loss in place, refused with
+  `400` when it lists an App ID held with that key: the account starts afresh under that
+  key, keeping its service time, its enrollments and the App IDs
+  to refuse, those held with the pending key among them. Unlike the service: a key change
+  in place, without `recovery_from`, is answered `400`; and a staged account's generation
+  change, a move's, is chained where the service answers `503`. The test call `deliver_identity` takes any document, without those
   checks, for scripting what another signer or a faulty service did. `forget_delivery_proof`
   makes a retry answer with no proof.
 - **Staged admission** (Switch spec 12.6 step 2, wire 7.4.14), in `switch/signer.rs` and
@@ -222,9 +249,8 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   hasn't departed: it takes any body, departs an app with no record or one whose certificate
   has expired or isn't listed, keeps the app's invite codes and push registration, and
   stamps the test clock's time. The service refuses another app's path and the
-  signer with `403 permission_missing`, where this switch answers `404`, and an app of
-  another identity with `403 permission_missing`, where this switch answers `403
-  not_admitted` (Switch wire 7.4.12). `request_full_bundle` is a test call for the app's own
+  signer with `403 permission_missing`, where this switch answers `404` (Switch wire
+  7.4.12). `request_full_bundle` is a test call for the app's own
   route, and `forget_removal_time`
   scripts a faulty service that shows no time for a removal. Freeze and
   unfreeze are test calls, not routes.
@@ -237,8 +263,7 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   hand-over while holding no copy of the version handed over; the next `identity.json`
   version, whoever delivered it, drops it. Unlike the service, it serves the body it parsed
   again as JSON, not the bytes the signer sent; it answers an own app's `PUT` `404` ("no
-  route") where the service answers `403 permission_missing` with the head, and an app of
-  another identity `403 not_admitted` where the service answers `403 permission_missing`.
+  route") where the service answers `403 permission_missing` with the head.
   `stored_handover` names the target held; `stored_handover_body` and
   `store_handover_again` script a hand-over stored or served again after it was dropped.
 - **`Fault::LeaveOut`** scripts a faulty service whose answer to an own app or the signer
@@ -252,8 +277,7 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   An app's call is `403 permission_missing`. Then every call, the retry included, gets the
   `404` signed with a fixed operator key. `erased` tells a test it happened; app tests set the
   flag directly. The service keeps no freeze or import state yet, so it refuses no erasure for
-  a move; it answers an app of another identity `403 permission_missing`, where this switch
-  answers `403 not_admitted`; and after an erasure it takes `POST /v1/enroll` again, creating a
+  a move; and after an erasure it takes `POST /v1/enroll` again, creating a
   new staged account, where this switch answers it with the operator's `404` too. That account
   serves from its first `identity.json`, at the next generation with `recovery_from` (Switch
   wire 7.4.16), which starts its recovery.

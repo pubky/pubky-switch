@@ -491,9 +491,24 @@ impl PeerInner {
         app: [u8; 16],
         code: Option<&str>,
     ) -> (u16, Value) {
+        // The query is read first, as at the service: decoded, a parameter given twice
+        // refused (Switch wire 7.1).
+        let query = request
+            .path_and_query
+            .split_once('?')
+            .map_or("", |(_, query)| query);
+        let Some(params) = super::switch::parse_query(query) else {
+            return bad(ErrorCode::BadRequest, json!(null));
+        };
         if let Some(answer) = self.answered.get(&request.body) {
             return (200, answer.clone());
         }
+        let Some(sealed_for) = params
+            .get("apps_version")
+            .and_then(|value| super::switch::decimal(value))
+        else {
+            return bad(ErrorCode::BadRequest, json!(null));
+        };
         if !self.admits(&sender, code, false) {
             return bad(ErrorCode::NotAdmitted, json!(null));
         }
@@ -501,12 +516,6 @@ impl PeerInner {
             let version = self.peers.get(&sender).map(IdentityDoc::version);
             return identity_needed(version);
         }
-        let sealed_for: u64 = request
-            .path_and_query
-            .split("apps_version=")
-            .nth(1)
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
         let Ok(parsed) = parse_header(&request.body) else {
             return bad(ErrorCode::BadRequest, json!(null));
         };

@@ -21,7 +21,7 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use zeroize::{Zeroize as _, Zeroizing};
 
-use super::{AppCert, IdentityBody, IdentityDoc, Limits, StoredPart, fmt};
+use super::{AppCert, IdentityBody, IdentityDoc, Limits, RemovedApp, StoredPart, fmt};
 use crate::enc::{b64, kid, serde_b64, unb64, unb64_array, zbase32_encode};
 use crate::envelope::{self, MAX_FRAMED_JSON_LEN, Recipient};
 use crate::error::{Error, Result, invalid};
@@ -54,6 +54,7 @@ pub struct SignerRecords {
     limits: Limits,
     bundle_parts: Vec<StoredPart>,
     prev: Option<[u8; 32]>,
+    pending_distrust: Vec<RemovedApp>,
 }
 
 impl std::fmt::Debug for SignerRecords {
@@ -81,6 +82,8 @@ struct RecordsIn {
     bundle_parts: Vec<StoredPart>,
     #[serde(default)]
     prev: Option<String>,
+    #[serde(default)]
+    pending_distrust: Vec<RemovedApp>,
 }
 
 impl Drop for RecordsIn {
@@ -105,6 +108,8 @@ struct RecordsOut<'a> {
     bundle_parts: &'a [StoredPart],
     #[serde(skip_serializing_if = "Option::is_none")]
     prev: Option<String>,
+    #[serde(skip_serializing_if = "<[RemovedApp]>::is_empty")]
+    pending_distrust: &'a [RemovedApp],
 }
 
 impl Drop for RecordsOut<'_> {
@@ -152,7 +157,18 @@ impl SignerRecords {
             bundle_parts,
             prev,
             identity_doc,
+            pending_distrust: Vec::new(),
         })
+    }
+
+    /// The records with `picked`: for each revocation the signer asked for and no version
+    /// carried out yet, an App ID of `revoked_apps` that `identity_doc` still lists, the
+    /// earlier `distrust_from` the user picked (Switch wire 3.12, spec 12.2). Entries for
+    /// any other App ID are left out, and each App ID is kept once, ascending by text.
+    #[must_use]
+    pub fn with_pending_distrust(mut self, picked: &[RemovedApp]) -> Self {
+        self.pending_distrust = pending_distrust(&self.identity_doc, &self.revoked_apps, picked);
+        self
     }
 
     /// Read the records from their JSON, the parts concatenated: checks 1 and 2 of Switch
@@ -206,14 +222,18 @@ impl SignerRecords {
             .collect::<Result<Vec<_>>>()?;
         let bundle_parts = listed_parts(&identity_doc, &wire.bundle_parts, false)?;
         let prev = wire.prev.as_deref().map(unb64_array::<32>).transpose()?;
+        let revoked_apps = as_set(&revoked_apps);
+        let pending_distrust =
+            pending_distrust(&identity_doc, &revoked_apps, &wire.pending_distrust);
         Ok(Self {
             key,
             identity_doc,
-            revoked_apps: as_set(&revoked_apps),
+            revoked_apps,
             certs,
             limits: wire.limits,
             bundle_parts,
             prev,
+            pending_distrust,
         })
     }
 
@@ -239,6 +259,7 @@ impl SignerRecords {
             limits: &self.limits,
             bundle_parts: &self.bundle_parts,
             prev: self.prev.map(|hash| b64(&hash)),
+            pending_distrust: &self.pending_distrust,
         };
         serde_json::to_vec(&out).map(Zeroizing::new).map_err(|_| {
             Error::Invalid("Switch wire 3.12: the records can't be written as JSON".into())
@@ -281,6 +302,30 @@ impl SignerRecords {
     pub fn prev(&self) -> Option<[u8; 32]> {
         self.prev
     }
+
+    /// For each revocation asked for and not carried out yet, the earlier `distrust_from`
+    /// the user picked, ascending by App ID text; empty in records written without it.
+    pub fn pending_distrust(&self) -> &[RemovedApp] {
+        &self.pending_distrust
+    }
+}
+
+/// The entries of `picked` for App IDs of `revoked` that `doc` still lists, each once,
+/// ascending by App ID text (Switch wire 3.12).
+fn pending_distrust(
+    doc: &IdentityDoc,
+    revoked: &[[u8; 16]],
+    picked: &[RemovedApp],
+) -> Vec<RemovedApp> {
+    let mut kept: Vec<RemovedApp> = Vec::new();
+    for entry in picked {
+        let pending = revoked.contains(&entry.app_id) && doc.listed_cert(&entry.app_id).is_some();
+        if pending && !kept.iter().any(|k| k.app_id == entry.app_id) {
+            kept.push(*entry);
+        }
+    }
+    kept.sort_by_cached_key(|entry| zbase32_encode(&entry.app_id));
+    kept
 }
 
 /// The certificates `doc` references, those of its `apps` then its `renewed`, each once,
@@ -1031,6 +1076,56 @@ mod tests {
             prev,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn test_handover_records_carry_the_pending_distrust_of_listed_revocations() {
+        // Kept only for a revoked App ID the document still lists, written only when there is
+        // one, and records without the member read as before (Switch wire 3.12).
+        let (mine, other) = certs();
+        let d = doc(3, &[&mine, &other]);
+        let picked = |app_id: [u8; 16]| RemovedApp {
+            app_id,
+            distrust_from: 7,
+        };
+        let r = SignerRecords::new(
+            identity(),
+            d,
+            &[other.app_id(), [1; 16]],
+            &[mine.clone(), other.clone()],
+            Limits::default(),
+            &[],
+            None,
+        )
+        .unwrap()
+        .with_pending_distrust(&[
+            picked(other.app_id()),
+            picked([1; 16]),
+            picked(mine.app_id()),
+            picked(other.app_id()),
+        ]);
+        assert_eq!(r.pending_distrust(), &[picked(other.app_id())]);
+        // The entry's size the bound counts (Switch wire 3.12).
+        assert_eq!(
+            serde_json::to_vec(&picked(other.app_id())).unwrap().len(),
+            82
+        );
+        let json = r.to_json().unwrap();
+        assert!(
+            std::str::from_utf8(&json)
+                .unwrap()
+                .contains(r#","pending_distrust":["#)
+        );
+        let back = SignerRecords::parse(&json, &identity().public()).unwrap();
+        assert_eq!(back.pending_distrust(), r.pending_distrust());
+        let older = records(None).to_json().unwrap();
+        assert!(
+            !std::str::from_utf8(&older)
+                .unwrap()
+                .contains("pending_distrust")
+        );
+        let read = SignerRecords::parse(&older, &identity().public()).unwrap();
+        assert!(read.pending_distrust().is_empty());
     }
 
     #[test]

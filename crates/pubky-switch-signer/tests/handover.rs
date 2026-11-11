@@ -1827,3 +1827,54 @@ async fn test_revoke_refused_while_taking_over() {
     );
     assert!(world.switch.app(&s.app_id()).revoked_at.is_none());
 }
+
+#[tokio::test]
+async fn test_hand_over_waits_for_a_pending_revocation() {
+    // A revocation the switch didn't take, the app still listed: no hand-over until it is
+    // carried out, since the hand-over carries the records, not a revocation in progress.
+    // Once the version removing the app is delivered, the hand-over goes, and the new signer
+    // has nothing pending (Switch wire 3.12, spec 12.2).
+    let world = World::new();
+    let mut s = setup(&world).await;
+    let other = App::with_keys(
+        AppKeys::from_secrets([5; 32], [6; 32]),
+        &["notes"],
+        None,
+        [8; 32],
+    );
+    let other_cert = approved(&world, &mut s.old, &other).await;
+    let other_id = other_cert.app_id();
+    world.switch.fail_next(SwitchFault::Unreachable {
+        path: "/revoke".into(),
+        after: 0,
+    });
+    s.old.revoke(other_id, None, confirmed()).await.unwrap_err();
+    assert_eq!(
+        s.old
+            .hand_over_to(s.app_id(), confirmed())
+            .await
+            .unwrap_err(),
+        Refusal::RevocationOwed.into()
+    );
+    assert!(s.old.complete_removals().await.unwrap());
+    s.old.hand_over_to(s.app_id(), confirmed()).await.unwrap();
+    let store = Arc::new(MemoryStore::new());
+    let new = Signer::receive_hand_over(world.env(store), &s.target, empty_vault())
+        .await
+        .unwrap();
+    assert!(
+        !new.alerts()
+            .iter()
+            .any(|a| matches!(a, Alert::RevocationPending { .. })),
+        "{:?}",
+        new.alerts()
+    );
+    assert!(
+        world
+            .switch
+            .identity_doc()
+            .unwrap()
+            .listed_cert(&other_id)
+            .is_none()
+    );
+}

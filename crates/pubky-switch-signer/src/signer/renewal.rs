@@ -538,11 +538,16 @@ impl Signer {
     /// The apps whose closing delivery the signer owes: open renewals in the newest version
     /// that were reductions (Switch wire 3.8).
     pub(super) fn owed(&self) -> Result<Vec<[u8; 16]>> {
-        let Some(doc) = self.state.newest_doc()? else {
-            return Ok(Vec::new());
-        };
+        match self.state.newest_doc()? {
+            Some(doc) => self.owed_in(&doc),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// The apps whose closing `doc` owes: its open renewals that were reductions.
+    pub(super) fn owed_in(&self, doc: &IdentityDoc) -> Result<Vec<[u8; 16]>> {
         let certs = self.held_certs()?;
-        Ok(owed_closings(&doc, |hash| {
+        Ok(owed_closings(doc, |hash| {
             certs.iter().find(|cert| &cert.hash() == hash)
         }))
     }
