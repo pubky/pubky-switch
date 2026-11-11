@@ -55,7 +55,7 @@ pub use retries::{
     app_retries, append_retry, claim_and_read_retries, claim_retries, removal_retries,
     signer_retries,
 };
-pub use waiting::waiting_read;
+pub use waiting::{waiting_read, waiting_read_erased};
 pub use watching::watching;
 
 use crate::{FlowResult, World};
@@ -115,6 +115,9 @@ pub const FLOWS: &[(&str, Flow)] = &[
     ("missed item", |world| Box::pin(missed_item(world))),
     ("unreadable after a revoke", |world| {
         Box::pin(unreadable_after_revoke(world))
+    }),
+    ("waiting read, the account erased", |world| {
+        Box::pin(waiting_read_erased(world))
     }),
 ];
 

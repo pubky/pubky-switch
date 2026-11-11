@@ -87,9 +87,10 @@ The flows send every call the service serves, each at both switches. What they l
   and that the byte budget ends, and a records list in pages the byte budget ends; a
   records list that `limit` ends takes more than a thousand records, and no flow writes
   that many. The directory has no pages (Switch wire 7.4.10).
-- **A wait that runs out.** The `waiting read` flow's read is answered by a write. A read
-  whose wait passes with nothing written takes real seconds at the service, and no flow
-  sends one.
+- **A wait that runs out, and a held read refused.** The `waiting read` flows' reads are
+  answered by a write and by an erasure. A read whose wait passes with nothing written
+  takes real seconds at the service, and no flow sends one; nor one held while its app is
+  revoked or leaves, where what the app does next depends on when the answer comes.
 - **A full inbox.** The `lagging app`, `missed item` and `unreadable after a revoke` flows
   run with an app that falls behind while another reads. An inbox no app reads, where the
   quota refuses senders, an unreadable item at a leave or at a delivery, and a lagging app
@@ -119,6 +120,6 @@ Run the `trace` example to see what the two switches answered, and list each dif
 ## Run time and databases
 
 Each flow's run against the service makes one test database and drops it, also when its
-test panics; the flows run one after another. Thirty-two flows take about a minute in a
+test panics; the flows run one after another. Thirty-three flows take about a minute in a
 debug build. If that grows too long, the service's halves could share one service and one
 database, with identities of their own per flow: a later option, not needed yet.

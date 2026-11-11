@@ -5,9 +5,10 @@ use std::cell::Cell;
 use std::time::Duration;
 
 use pubky_switch_client::app::{App, AppConfig, RecordTarget};
+use pubky_switch_signer::UserConfirmed;
 use serde_json::json;
 
-use super::enrollment::enroll;
+use super::enrollment::{enroll, status};
 use super::join::{app_status, events};
 use super::messaging::joined_with;
 use super::{ORIGIN, STEP_MS};
@@ -122,5 +123,66 @@ async fn look(world: &World, app: &mut App, name: &str) -> FlowResult {
         }),
     );
     world.advance_ms(STEP_MS);
+    Ok(())
+}
+
+/// A waiting read held while the signer closes the account (Switch wire 7.4.16). alice's
+/// watch, her only app, has read its feed to the end and reads again with `wait`: nothing
+/// is pending, and the switch holds the read. The erasure, the account's first change since
+/// the read arrived, wakes it, and it is answered as for an account the switch doesn't
+/// host: the operator's `404`, never a page under the erased account's key.
+///
+/// The flow notes that the read was held when the signer acted. How the read ended for
+/// the app isn't noted; the trace holds what the switch answered it.
+///
+/// Calls: `GET /v1/{id}/feed` with `wait`, answered by `POST /v1/{id}/erase`.
+///
+/// # Errors
+///
+/// As [`waiting_read`].
+pub async fn waiting_read_erased(world: &World) -> FlowResult {
+    let alice = world.identity("alice")?;
+    world.add_switch(ORIGIN, &[&alice]).await?;
+    let mut signer = enroll(world, &alice, ORIGIN).await?;
+    let (mut watch, _) = joined_with(
+        world,
+        &alice,
+        &mut signer,
+        Asking::new(world.app_keys(&alice, "watch")?)?,
+        notes_protocol_with_records(),
+        AppConfig::default(),
+    )
+    .await?;
+    look(world, &mut watch, "the watch before the wait").await?;
+
+    let answered = Cell::new(false);
+    let held_then = Cell::new(false);
+    let read = async {
+        let report = watch.receive(Some(WAIT_S)).await;
+        answered.set(true);
+        report.is_ok()
+    };
+    let erase = async {
+        // Until the switch holds the read, or answered it without holding it.
+        while world.held_reads() == 0 && !answered.get() {
+            tokio::task::yield_now().await;
+        }
+        held_then.set(world.held_reads() > 0);
+        signer
+            .close_account(UserConfirmed::shown_and_confirmed())
+            .await
+    };
+    let both = futures_util::future::join(read, erase);
+    let Ok((_, erased)) = tokio::time::timeout(STEP_TIMEOUT, both).await else {
+        return Err("the held read wasn't answered: it is still held".into());
+    };
+    erased?;
+    if !held_then.get() {
+        return Err("the switch answered the waiting read without holding it".into());
+    }
+    world.outcome(
+        "the signer closed the account while the watch's read was held",
+        &json!({ "held_when_the_signer_acted": held_then.get(), "signer": status(&signer)? }),
+    );
     Ok(())
 }
