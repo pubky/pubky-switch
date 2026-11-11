@@ -23,7 +23,8 @@ pub struct Allowed {
     pub fact: &'static str,
     /// What the service shows; `(nothing)` when it shows nothing there.
     pub service: &'static str,
-    /// What the scripted switch shows; `(nothing)` when it shows nothing there.
+    /// What the scripted switch shows; `(nothing)` when it shows nothing there, and
+    /// [`ONE_MORE`] for a number one above the service's.
     pub scripted: &'static str,
     /// Why the difference is accepted.
     pub reason: &'static str,
@@ -38,15 +39,37 @@ pub const EVERY_FLOW: &str = "*";
 /// What stands for a fact one run didn't show.
 pub const NOTHING: &str = "(nothing)";
 
+/// In [`Allowed::scripted`]: the scripted switch shows a number one above the service's, as a
+/// counter does that starts one higher and moves at the same events.
+pub const ONE_MORE: &str = "one more than the service";
+
 impl Allowed {
     /// Whether this entry allows `difference`.
     pub fn allows(&self, difference: &Difference) -> bool {
         let shown = |value: &Option<String>| value.clone().unwrap_or_else(|| NOTHING.to_owned());
+        let (service, scripted) = (shown(&difference.service), shown(&difference.scripted));
+        let scripted_allowed = if self.scripted == ONE_MORE {
+            match (number_of(&service), number_of(&scripted)) {
+                (Some(service), Some(scripted)) => service.checked_add(1) == Some(scripted),
+                _ => false,
+            }
+        } else {
+            matches(self.scripted, &scripted)
+        };
         matches(self.label, &difference.label)
             && matches(self.fact, &difference.fact)
-            && matches(self.service, &shown(&difference.service))
-            && matches(self.scripted, &shown(&difference.scripted))
+            && matches(self.service, &service)
+            && scripted_allowed
     }
+}
+
+/// The number a fact shows: of a JSON number, or of a short string of digits, as a query
+/// parameter carries one.
+fn number_of(fact: &str) -> Option<u64> {
+    fact.strip_prefix("number ")
+        .or_else(|| fact.strip_prefix("text "))?
+        .parse()
+        .ok()
 }
 
 /// Whether `text` matches `pattern`, where each `*` stands for any run of characters.
@@ -79,6 +102,12 @@ const NULL_CURRENT: &str = "The scripted switch writes `current: null` in every 
     has no `current`; the service leaves the member out, as a writer should. A reader takes the \
     two alike.";
 
+/// Where the directory's counters start.
+const COUNTER_START: &str = "The wire format says when `apps_version` and `directory_version` \
+    change, not where they start: the service's start at 0, the scripted switch's at 1. They \
+    move at the same events, so the scripted switch's is one more; a sender only hands the \
+    number back.";
+
 /// Every accepted difference: those of the two switches as a whole, then by flow.
 pub static ALLOWED: &[Allowed] = &[
     Allowed {
@@ -101,6 +130,42 @@ pub static ALLOWED: &[Allowed] = &[
         reason: NULL_CURRENT,
         reference: "Switch wire, Conventions, \"Absent and null\"; Switch wire 7.1, error bodies",
     },
+    Allowed {
+        flow: "messaging",
+        label: "{bob/shop} GET /v1/{alice}/directory",
+        fact: "body.apps_version",
+        service: "number 1",
+        scripted: ONE_MORE,
+        reason: COUNTER_START,
+        reference: "Switch wire 7.4.10, `apps_version`",
+    },
+    Allowed {
+        flow: "messaging",
+        label: "{bob/shop} GET /v1/{alice}/directory",
+        fact: "body.directory_version",
+        service: "number 4",
+        scripted: ONE_MORE,
+        reason: COUNTER_START,
+        reference: "Switch wire 7.4.10, `directory_version`",
+    },
+    Allowed {
+        flow: "messaging",
+        label: "{bob/shop} POST /v1/{alice}/inbox",
+        fact: "request query apps_version",
+        service: "text 1",
+        scripted: ONE_MORE,
+        reason: COUNTER_START,
+        reference: "Switch wire 7.4.3, the query's `apps_version`; 7.4.10",
+    },
+    Allowed {
+        flow: "messaging",
+        label: "{bob/shop} POST /v1/{alice}/inbox",
+        fact: "body.directory_version",
+        service: "number 4",
+        scripted: ONE_MORE,
+        reason: COUNTER_START,
+        reference: "Switch wire 7.4.3, the answer's `directory_version`; 7.4.10",
+    },
 ];
 
 #[cfg(test)]
@@ -119,6 +184,37 @@ mod tests {
         assert!(!matches("body.*.seq", "body.seq"));
         assert!(matches("a*b*c", "a-b-b-c"));
         assert!(!matches("a*b*c", "a-c"));
+    }
+
+    #[test]
+    fn test_allowed_one_more_takes_only_a_number_one_above() {
+        let entry = Allowed {
+            flow: "example",
+            label: "*",
+            fact: "body.apps_version",
+            service: "number *",
+            scripted: ONE_MORE,
+            reason: "an example",
+            reference: "nowhere",
+        };
+        let difference = |service: &str, scripted: &str| Difference {
+            line: 0,
+            label: "{bob/shop} GET /v1/{alice}/directory".into(),
+            fact: "body.apps_version".into(),
+            service: Some(service.into()),
+            scripted: Some(scripted.into()),
+        };
+        assert!(entry.allows(&difference("number 1", "number 2")));
+        assert!(entry.allows(&difference("number 9", "number 10")));
+        assert!(
+            !entry.allows(&difference("number 1", "number 3")),
+            "two more"
+        );
+        assert!(
+            !entry.allows(&difference("number 2", "number 1")),
+            "one less"
+        );
+        assert!(!entry.allows(&difference("number 1", "null")), "no number");
     }
 
     #[test]
