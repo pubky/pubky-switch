@@ -158,9 +158,9 @@ pub enum Refusal {
     /// signed for it.
     #[error("refused: the account is erased")]
     Erased,
-    /// The switch refused the erasure (`409 conflict`), as it does during a move (Switch wire
-    /// 7.4.16). Nothing was erased: `identity.json` is published again, and the grant
-    /// reminders the erasure raised are withdrawn.
+    /// The switch refused the erasure (`409 conflict`) while it still holds this install's
+    /// mark, as during a move (Switch wire 7.4.16). Nothing was erased: `identity.json` is
+    /// published again, and the grant reminders the erasure raised are withdrawn.
     #[error("refused: the switch refused the erasure")]
     ErasureRefused,
     /// No erasure is in progress to abort.

@@ -234,6 +234,7 @@ async fn load_state(
     held: Option<&IdentityDoc>,
     ops: &[SignedOp],
     writer: Option<&[u8; 16]>,
+    cursor: bool,
     due: Option<(u64, u64)>,
     now: u64,
 ) -> Result<OpsState, StoreError> {
@@ -253,7 +254,13 @@ async fn load_state(
         .into_iter()
         .collect();
     (state.directory_version, state.apps_version) = txn.directory_versions().await?;
-    for target in &needs.targets {
+    // A cursor move may drop the moving app's passed key bundle parts (Switch wire 6.2), so
+    // its parts are read too.
+    let mut targets = needs.targets.clone();
+    if let (true, Some(app)) = (cursor, writer) {
+        targets.insert(*app);
+    }
+    for target in &targets {
         if let Some(epoch) = txn.listed_epoch(target).await? {
             state.listed_epochs.insert(*target, epoch);
         }
@@ -684,6 +691,7 @@ impl Service {
             held,
             &ops,
             caller_app.as_ref(),
+            parsed.cursor().is_some(),
             due.map(|base| (base, self.limits.max_claim_age_ms)),
             time_ms,
         )
@@ -738,7 +746,11 @@ impl Service {
         // or stop it being so (Switch wire 7.4.10).
         after.settle_directory(&before);
         if effect == BatchEffect::Unchanged {
+            // Not a no-op when it moves the cursor, which may drop parts (Switch wire 6.4).
             save_apps(txn, &before, &after)
+                .await
+                .map_err(|e| storage(&e))?;
+            save_parts(txn, &before, &after)
                 .await
                 .map_err(|e| storage(&e))?;
             return self.write_answer(txn, signer, &[]).await;
@@ -901,6 +913,36 @@ async fn save_apps(
     Ok(())
 }
 
+/// Write back the key bundle parts a batch changed, and where each target's `keys_through`
+/// starts, raised as passed parts went: at a chained batch, and at an unchanged one whose
+/// cursor move dropped parts (Switch wire 6.2, 6.4).
+async fn save_parts(
+    txn: &mut AccountTxn,
+    before: &OpsState,
+    after: &OpsState,
+) -> Result<(), StoreError> {
+    for (target, epoch) in &after.listed_epochs {
+        if before.listed_epochs.get(target) != Some(epoch) {
+            txn.raise_keys_start(target, *epoch).await?;
+        }
+    }
+    for (target, parts) in &after.parts {
+        if before.parts.get(target) != Some(parts) {
+            let stored: Vec<StoredBundlePart> = parts
+                .iter()
+                .map(|part| StoredBundlePart {
+                    first_epoch: part.put.first_epoch,
+                    last_epoch: part.put.last_epoch,
+                    seq: part.seq,
+                    op: part.op.clone(),
+                })
+                .collect();
+            txn.set_bundle_parts(target, &stored).await?;
+        }
+    }
+    Ok(())
+}
+
 /// Write back everything a chained batch changed, with the proofs its records and claim
 /// entries keep.
 async fn save(
@@ -924,26 +966,7 @@ async fn save(
         }
     }
     save_apps(txn, before, after).await?;
-    // Where keys_through starts, raised as passed parts went.
-    for (target, epoch) in &after.listed_epochs {
-        if before.listed_epochs.get(target) != Some(epoch) {
-            txn.raise_keys_start(target, *epoch).await?;
-        }
-    }
-    for (target, parts) in &after.parts {
-        if before.parts.get(target) != Some(parts) {
-            let stored: Vec<StoredBundlePart> = parts
-                .iter()
-                .map(|part| StoredBundlePart {
-                    first_epoch: part.put.first_epoch,
-                    last_epoch: part.put.last_epoch,
-                    seq: part.seq,
-                    op: part.op.clone(),
-                })
-                .collect();
-            txn.set_bundle_parts(target, &stored).await?;
-        }
-    }
+    save_parts(txn, before, after).await?;
     for (key, record) in &after.records {
         if before.records.get(key) != Some(record) {
             let proof = record

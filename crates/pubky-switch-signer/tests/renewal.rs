@@ -2062,3 +2062,30 @@ async fn test_renewal_clock_off_isnt_cleared_by_a_slow_backup_read() {
     signer.renew_expiring().await.unwrap();
     assert!(signer.alerts().contains(&Alert::ClockOff));
 }
+
+#[tokio::test]
+async fn test_full_bundle_request_of_an_app_with_a_scope_no_protocol_owns_is_skipped() {
+    // `b`'s certificate holds `chat`, which no registered protocol owns once the signer is
+    // reopened with `notes` alone: its full bundle isn't stored, with an alert naming the
+    // scope, and its request stays (design note, decision 2).
+    let world = World::new();
+    let store = Arc::new(MemoryStore::new());
+    let mut signer = notes_and_chat(&world, store.clone()).await;
+    let (a, b) = two_apps(&["notes"], &["chat"]);
+    world.approve(&mut signer, &a).await;
+    world.approve(&mut signer, &b).await;
+    drop(signer);
+    let notes_only = Protocols::new(vec![Arc::new(Notes)]).unwrap();
+    let mut signer = Signer::open(world.env_with(store, notes_only), world.keyring())
+        .await
+        .unwrap();
+    let b_id = b.keys.app_id_bytes();
+    world.switch.request_full_bundle(b_id);
+    assert!(signer.serve_full_bundles().await.unwrap().is_empty());
+    assert!(signer.alerts().contains(&Alert::RotationSkipped {
+        app_id: b_id,
+        scopes: vec!["chat".into()],
+    }));
+    assert!(world.switch.bundle_parts_of(&b_id).is_empty());
+    assert!(world.switch.app(&b_id).full_requested.is_some());
+}

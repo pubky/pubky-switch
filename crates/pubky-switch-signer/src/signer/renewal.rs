@@ -430,7 +430,7 @@ impl Signer {
     /// The switch's apps, once its copy is confirmed as this install's mark, and the service
     /// time the answer is signed at.
     pub(super) async fn switch_apps_at(&mut self) -> Result<(Vec<AppStatus>, u64)> {
-        let answer = self.service_client()?.apps().await?;
+        let answer = self.read_apps().await?.answer;
         self.confirm_copy(answer.identity.as_ref()).await?;
         Ok((answer.apps, answer.server_time))
     }

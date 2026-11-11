@@ -2,7 +2,8 @@
 //! account at this service.
 //!
 //! The request passes the signer's checks like every call, and is refused, without a head,
-//! for another service key (`409 conflict`), a malformed body (`400`) or an app (`403`).
+//! for another service key or, when the body names one, another `identity.json` than the
+//! account's newest (`409 conflict`), a malformed body (`400`) or an app (`403`).
 //! An account behind its key's mark still takes it (7.3 step 10), since the answer carries
 //! no head. Then the order is fixed:
 //! 1. the answer `{ "erased": true }` is signed while the key exists;
@@ -35,19 +36,33 @@ use crate::{
 
 impl Service {
     /// The checks of an erasure from the signer, under the account's lock (Switch wire
-    /// 7.4.16): the body names exactly this account's service key. The answer it returns
-    /// erases nothing yet: [`Service::finish_erasure`] does, once it is signed.
+    /// 7.4.16): the body names exactly this account's service key and, when it names one,
+    /// the document hash of `held`, the account's newest `identity.json`. The answer it
+    /// returns erases nothing yet: [`Service::finish_erasure`] does, once it is signed.
     ///
     /// # Errors
     ///
-    /// `400` for a body that isn't `{ "service_key": b64(32) }`; `409 conflict` for another
-    /// key, so a replay can't erase a later account of the identity here.
-    pub(super) fn erase_answer(signer: &ServiceSigner, body: &[u8]) -> Result<Answer, ApiError> {
+    /// `400` for a body that isn't `{ "service_key": b64(32), "identity_hash": b64(32) }`, the
+    /// hash optional; `409 conflict` for another key, so a replay can't erase a later account
+    /// of the identity here; and `409 conflict` for another hash, or a hash at an account
+    /// that holds no `identity.json` yet, so an erasure can't follow a delivery made after
+    /// the signer's last check, such as another install's take-over.
+    pub(super) fn erase_answer(
+        signer: &ServiceSigner,
+        body: &[u8],
+        held: Option<[u8; 32]>,
+    ) -> Result<Answer, ApiError> {
         let named = parse_erase_body(body).map_err(|e| ApiError::bad_request(e.to_string()))?;
-        if named != signer.public_key_bytes() {
+        if named.service_key != signer.public_key_bytes() {
             return Err(ApiError::new(
                 ErrorCode::Conflict,
                 "7.4.16: not the account's service key",
+            ));
+        }
+        if named.identity_hash.is_some_and(|hash| Some(hash) != held) {
+            return Err(ApiError::new(
+                ErrorCode::Conflict,
+                "7.4.16: the account holds another identity.json",
             ));
         }
         let mut answer = Answer::ok(ERASED_BODY.to_vec());

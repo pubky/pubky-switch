@@ -33,10 +33,17 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   view.
 - **`invite_code.delete`** of a code the switch doesn't hold is `404`; the core has no rule
   for it.
-- **Key bundle parts** the target's cursor passed are never dropped (Switch wire 6.2).
-- **`keys_through`** (Switch wire 7.4.12) counts every stored part as fetched, whatever the
-  app's cursor: the epoch of the first version listing the app, raised by each part that
-  continues it.
+- **Key bundle parts** go as the service drops them, by the core's `parts_to_drop`: at a
+  `key_bundle.put` and at the `cursor.set` that passes them, the parts the target's cursor
+  has passed and its `keys_through` covers, unless a full-bundle request is in force: from
+  the `POST /keys` until the target's cursor has passed the part that completed it, or the
+  part that replaced that one, judged at a put as before the part (Switch wire 6.2). Where
+  `keys_through` starts rises to the height the dropped parts gave. `keys_through` itself is
+  the core's (7.4.12), over the parts the cursor passed.
+- **A cursor of an earlier generation** is a bare `seq` here, so after `change_key_into` or
+  `import_into` the drop, the request's force and `keys_through` compare it as it is. The
+  service counts such a cursor as 0 until the app moves it: nothing drops, a request stays
+  in force, and `keys_through` reads low.
 
 ## State and retention
 
@@ -187,9 +194,11 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
 - **`Fault::LeaveOut`** scripts a faulty service whose answer to an own app or the signer
   leaves out a top-level member, such as a feed page's `items`.
 - **Erasure** (Switch wire 7.4.16), in `switch/signer.rs`: `POST /erase` checks the body names
-  the account's service key (`409 conflict` for another) and refuses during a move (`409
-  conflict`): at any frozen account, since this switch keeps no export to tell whether it was
-  fetched, and at a staged one holding an import (not one staged for a key change in place).
+  the account's service key (`409 conflict` for another) and, when it names one, the hash of
+  the `identity.json` this switch holds (`409 conflict` for another, or for none held), and
+  refuses during a move (`409 conflict`): at any frozen account, since this switch keeps no
+  export to tell whether it was fetched, and at a staged one holding an import (not one
+  staged for a key change in place).
   An app's call is `403 permission_missing`. Then every call, the retry included, gets the
   `404` signed with a fixed operator key. `erased` tells a test it happened; app tests set the
   flag directly. The service keeps no freeze or import state yet, so it refuses no erasure for
