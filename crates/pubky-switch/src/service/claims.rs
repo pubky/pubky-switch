@@ -14,7 +14,7 @@ use super::{Answer, Service, batch, store_error};
 use crate::{
     http::error::{ApiError, ErrorCode},
     keys::ServiceSigner,
-    store::{AccountTxn, NewChainItem},
+    store::{AccountTxn, KeptReason, NewChainItem},
 };
 
 /// A `GET /claims` read taken under the lock, whose entries are read after it.
@@ -165,22 +165,85 @@ impl Service {
         if stored_app.is_none() && !listed {
             return Err(unknown());
         }
-        // The data epoch its rotation goes above (Switch wire 7.4.12 awaiting_rotation).
-        let data_epoch = held.map_or(1, IdentityDoc::data_epoch);
-        // It leaves the directory, a reachable app no longer counts among the reachable
-        // ones (Switch wire 7.4.10), and entries no longer wait for it (9.1): settled from
-        // the state before the revocation, then the revocation written.
-        batch::settle_change(txn, held, None, Some(app), time_ms)
-            .await
-            .map_err(|e| store_error(&e))?;
-        txn.revoke_app(&app, time_ms, data_epoch)
-            .await
-            .map_err(|e| store_error(&e))?;
-        let identity = txn.head().identity_key;
         let transition = ServiceTransition::Revoke {
             app_id: app,
             at: time_ms,
         };
+        self.remove_app(txn, signer, held, transition, time_ms)
+            .await
+    }
+
+    /// `POST /v1/{id}/apps/{app_id}/leave` from `caller`, the own app that verified, whose
+    /// App ID must be the path's (Switch wire 7.4.12, Switch spec 12.3): treated exactly as a
+    /// revocation, recorded as a departure flagged for its rotation, and answered with the
+    /// `leave` transition's proof. A departed app is never current again, so a repeat is
+    /// refused when it authenticates (7.2).
+    ///
+    /// # Errors
+    ///
+    /// `403 permission_missing` for another app's path; `400` for a body; `503` for a store
+    /// failure.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn leave(
+        &self,
+        txn: &mut AccountTxn,
+        signer: &ServiceSigner,
+        held: Option<&IdentityDoc>,
+        caller: &AppCert,
+        app_id: &str,
+        body: &[u8],
+        time_ms: u64,
+    ) -> Result<Answer, ApiError> {
+        let app = caller.app_id();
+        if zbase32_decode::<16>(app_id).ok() != Some(app) {
+            return Err(ApiError::new(
+                ErrorCode::PermissionMissing,
+                "7.4.12: only the app itself leaves",
+            ));
+        }
+        if !body.is_empty() {
+            return Err(ApiError::bad_request("7.4.12: a leave has an empty body"));
+        }
+        let transition = ServiceTransition::Leave {
+            app_id: app,
+            at: time_ms,
+        };
+        self.remove_app(txn, signer, held, transition, time_ms)
+            .await
+    }
+
+    /// Remove the app `transition` names, a revocation or a leave, at `time_ms` (Switch spec
+    /// 12.2, 12.3; Switch wire 7.4.12): settle what the removal changes, keep the App ID for
+    /// good, chain the transition and answer with its proof.
+    async fn remove_app(
+        &self,
+        txn: &mut AccountTxn,
+        signer: &ServiceSigner,
+        held: Option<&IdentityDoc>,
+        transition: ServiceTransition,
+        time_ms: u64,
+    ) -> Result<Answer, ApiError> {
+        let (ServiceTransition::Revoke { app_id: app, .. }
+        | ServiceTransition::Leave { app_id: app, .. }) = transition
+        else {
+            return Err(temporary());
+        };
+        // The data epoch its rotation goes above (Switch wire 7.4.12 awaiting_rotation).
+        let data_epoch = held.map_or(1, IdentityDoc::data_epoch);
+        // It leaves the directory, a reachable app no longer counts among the reachable
+        // ones (Switch wire 7.4.10), and entries no longer wait for it (9.1): settled from
+        // the state before the removal, then the removal written.
+        batch::settle_change(txn, held, None, Some(app), time_ms)
+            .await
+            .map_err(|e| store_error(&e))?;
+        let reason = if matches!(transition, ServiceTransition::Leave { .. }) {
+            KeptReason::Departed
+        } else {
+            KeptReason::Revoked
+        };
+        let kept = txn.keep_removed(&app, reason, time_ms, data_epoch).await;
+        kept.map_err(|e| store_error(&e))?;
+        let identity = txn.head().identity_key;
         let signed: SignedDoc = transition
             .sign(signer, &identity)
             .map_err(|_| temporary())?;
