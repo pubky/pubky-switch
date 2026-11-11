@@ -695,7 +695,12 @@ impl Signer {
             return self.resume().await;
         }
         // A publication that failed doesn't hold back the closings owed at the switch.
+        let erased_before = self.state.erased;
         let resumed = self.resume().await;
+        // The run that completes an erasure has nothing more to do (Switch spec 12.7).
+        if self.state.erased && !erased_before {
+            return resumed;
+        }
         if let Err(error) = &resumed
             && (self.flow.is_some() || !matches!(error, SignerError::Homeserver(_)))
         {

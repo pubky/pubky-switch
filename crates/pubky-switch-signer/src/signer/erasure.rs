@@ -10,13 +10,14 @@
 //!    offers no call for it (design note, decision 4);
 //! 2. sends `POST /v1/{id}/erase` naming the pinned service key, again until it is answered,
 //!    marking before each request that it may land. A `200` confirms the erasure. So does the
-//!    operator's `404`, but only after a request that went unanswered, as a lost `200`
-//!    leaves it (Switch wire 7.4.16): on a first request, or after an answer, a `404` is an
-//!    error, since the switch can't have erased anything yet.
+//!    operator's `404`, but only after a request that may have landed, as a lost `200`
+//!    leaves it (Switch wire 7.4.16): on a first request a `404` is an error. Only an answer
+//!    the pinned key signed shows the account still exists, so only such an answer clears the
+//!    mark; no answer, or an unsigned one such as a proxy's, keeps it.
 //!
 //! A `409 conflict` is the switch refusing it, as during a move: the erasure ends without
-//! erasing, `identity.json` is published again, and the grant reminders it raised are
-//! withdrawn. [`Signer::abort_erasure`] ends it the same way on the user's word, while no
+//! erasing, `identity.json` is published again, and the grant reminders it raised for apps
+//! still listed are withdrawn; a removed app's stays. [`Signer::abort_erasure`] ends it the same way on the user's word, while no
 //! request may have landed. The app records it deleted stay deleted until each app writes its
 //! own again.
 //!
@@ -61,7 +62,13 @@ impl Signer {
             reminded: Vec::new(),
             unanswered: false,
         };
-        self.commit(self.state.clone(), Some(flow)).await?;
+        // Unpublished from the first deletion on: an erasure that ends without erasing, after
+        // any part of the Homeserver's files went, has `identity.json` published again.
+        let mut state = self.state.clone();
+        if let Some(newest) = state.newest.as_mut() {
+            newest.published = false;
+        }
+        self.commit(state, Some(flow)).await?;
         self.resume().await
     }
 
@@ -127,8 +134,11 @@ impl Signer {
             Err(ClientError::BadServiceSignature { status: 404 }) if unanswered => {
                 self.erased().await
             }
-            // No answer: the request may have landed, so the mark stays.
-            Err(error @ ClientError::Transport(_)) => Err(error.into()),
+            // No answer, or one the pinned key didn't sign, as a proxy's: nothing shows that
+            // the account still exists, so the request may have landed and the mark stays.
+            Err(error @ (ClientError::Transport(_) | ClientError::BadServiceSignature { .. })) => {
+                Err(error.into())
+            }
             Err(ClientError::Switch {
                 code: ErrorCode::Conflict,
                 ..
@@ -136,8 +146,9 @@ impl Signer {
                 self.end_erasure(&reminded).await?;
                 Err(Refusal::ErasureRefused.into())
             }
-            // An answer that erased nothing: the next request is a first one again.
-            Err(error) => {
+            // An answer the pinned key signed, which the account still exists to sign: the
+            // erasure didn't land, and the next request is a first one again.
+            Err(error @ (ClientError::Switch { .. } | ClientError::InvalidResponse(_))) => {
                 let flow = Flow::Erase {
                     unpublished,
                     reminded,
@@ -146,6 +157,7 @@ impl Signer {
                 self.commit(self.state.clone(), Some(flow)).await?;
                 Err(error.into())
             }
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -166,9 +178,22 @@ impl Signer {
         self.commit(state, None).await
     }
 
-    /// End the erasure without erasing: withdraw the grant reminders it raised, and leave
-    /// `identity.json` unpublished, which the next run publishes again.
+    /// End the erasure without erasing: withdraw the grant reminders it raised for apps the
+    /// newest version still lists, and leave `identity.json` unpublished, which the next run
+    /// publishes again. A removed app's reminder stays: its grant's revocation is owed whether
+    /// or not the account is erased (Switch spec 12.2 step 1).
     async fn end_erasure(&mut self, reminded: &[[u8; 16]]) -> Result<()> {
+        let newest = self.state.newest_doc()?;
+        let reminded: Vec<[u8; 16]> = reminded
+            .iter()
+            .copied()
+            .filter(|app| {
+                newest
+                    .as_ref()
+                    .is_some_and(|doc| doc.listed_cert(app).is_some())
+            })
+            .collect();
+        let reminded = reminded.as_slice();
         let mut state = self.state.clone();
         state.alerts.retain(|alert| {
             !matches!(alert, Alert::GrantRevocationOwed { app_id } if reminded.contains(app_id))

@@ -250,21 +250,41 @@ fn unsigned_404_for_erasure(world: &World, store: Arc<MemoryStore>) -> SignerEnv
 
 #[tokio::test]
 async fn test_erasure_404_to_a_first_request_isnt_taken_as_done() {
-    // A `404` to a request answered before any went unanswered can't be the account already
-    // erased: the erasure stays in progress, and the user can abort it, which publishes
-    // `identity.json` again (Switch wire 7.4.16).
+    // A `404` to the first request can't be the account erased already: the erasure stays in
+    // progress. An unsigned answer doesn't show the account still exists either, so the
+    // request may have landed: it can't be aborted, and a `404` to the next request is the
+    // erasure done (Switch wire 7.4.16).
     let world = World::new();
     let (signer, _, store) = with_an_app(&world).await;
     drop(signer);
     let mut signer = Signer::open(unsigned_404_for_erasure(&world, store), world.keyring())
         .await
         .unwrap();
-    let newest = signer.identity_doc().unwrap().unwrap();
     let error = signer.close_account(confirmed()).await.unwrap_err();
     assert!(matches!(error, SignerError::Switch(_)), "{error:?}");
     assert_eq!(signer.status(), SignerStatus::Erasing);
-    signer.resume().await.unwrap_err();
-    assert_eq!(signer.status(), SignerStatus::Erasing);
+    assert_eq!(
+        signer.abort_erasure().await.unwrap_err(),
+        SignerError::Refused(Refusal::ErasureUnanswered)
+    );
+    signer.resume().await.unwrap();
+    assert_eq!(signer.status(), SignerStatus::Erased);
+}
+
+#[tokio::test]
+async fn test_erasure_aborted_after_a_signed_refusal() {
+    // The switch answered, signed, that it couldn't commit the deletion: the account still
+    // exists, so the user can abort. `identity.json` is published again, and the grant
+    // reminder the erasure raised for the app, still listed, is withdrawn.
+    let world = World::new();
+    let (mut signer, _, _) = with_an_app(&world).await;
+    let newest = signer.identity_doc().unwrap().unwrap();
+    world.switch.fail_next(SwitchFault::Error {
+        path: "/erase".into(),
+        code: ErrorCode::Unavailable,
+        current: serde_json::Value::Null,
+    });
+    signer.close_account(confirmed()).await.unwrap_err();
     signer.abort_erasure().await.unwrap();
     assert_eq!(signer.status(), SignerStatus::Signing);
     assert_eq!(world.published().unwrap().signed(), newest.signed());
@@ -278,6 +298,59 @@ async fn test_erasure_404_to_a_first_request_isnt_taken_as_done() {
         signer.abort_erasure().await.unwrap_err(),
         SignerError::Refused(Refusal::NotErasing)
     );
+}
+
+/// `world`'s env, whose transport loses the first answer to `POST /erase`, answers the second
+/// with an unsigned `503`, as a proxy could, and passes everything else to the switch.
+fn lost_then_unsigned_503(world: &World, store: Arc<MemoryStore>) -> SignerEnv {
+    let switch = Arc::clone(&world.switch);
+    let erasures = Arc::new(std::sync::Mutex::new(0));
+    let transport = Arc::new(MockTransport::with_handler(move |request| {
+        if request.method == "POST" && request.path_and_query.ends_with("/erase") {
+            let mut count = erasures.lock().unwrap();
+            *count += 1;
+            match *count {
+                1 => {
+                    let _ = switch.handle(request);
+                    return Err(pubky_switch_client::TransportError::Timeout);
+                }
+                2 => {
+                    return Ok(Response {
+                        status: 503,
+                        headers: Vec::new(),
+                        body: b"{}".to_vec(),
+                    });
+                }
+                _ => {}
+            }
+        }
+        switch.handle(request)
+    }));
+    let mut env = world.env(store);
+    env.transport = transport;
+    env
+}
+
+#[tokio::test]
+async fn test_erasure_unsigned_answer_after_a_lost_200_keeps_it_landed() {
+    // The switch erased the account and its `200` was lost; a proxy answers the retry with an
+    // unsigned `503`; the next retry gets the operator's `404`. The unsigned answer showed
+    // nothing about the account, so the erasure is done (Switch wire 7.4.16).
+    let world = World::new();
+    let (signer, _, store) = with_an_app(&world).await;
+    drop(signer);
+    let mut signer = Signer::open(lost_then_unsigned_503(&world, store), world.keyring())
+        .await
+        .unwrap();
+    signer.close_account(confirmed()).await.unwrap_err();
+    assert!(world.switch.erased());
+    signer.resume().await.unwrap_err();
+    assert_eq!(
+        signer.abort_erasure().await.unwrap_err(),
+        SignerError::Refused(Refusal::ErasureUnanswered)
+    );
+    signer.resume().await.unwrap();
+    assert_eq!(signer.status(), SignerStatus::Erased);
 }
 
 #[tokio::test]
@@ -344,4 +417,77 @@ async fn test_erasure_reminds_of_removed_apps_whose_record_was_owed() {
     signer.close_account(confirmed()).await.unwrap();
     assert!(signer.alerts().contains(&reminder));
     assert!(world.homeserver.file(&app_record_path(&id)).is_none());
+}
+
+#[tokio::test]
+async fn test_erasure_ended_keeps_a_removed_apps_reminder() {
+    // The app was revoked while the Homeserver refused `identity.json`, so its reminder
+    // waited; the erasure raised it, then ended without erasing, by the switch's refusal or
+    // the user's abort. The removed app's grant revocation is owed all the same: the reminder
+    // stays (Switch spec 12.2 step 1).
+    for refused in [true, false] {
+        let world = World::new();
+        let (mut signer, id, _) = with_an_app(&world).await;
+        *world.homeserver.failing_path.lock().unwrap() = Some(IDENTITY_PATH.to_owned());
+        let _ = signer.revoke(id, None, confirmed()).await;
+        *world.homeserver.failing_path.lock().unwrap() = None;
+        let code = if refused {
+            ErrorCode::Conflict
+        } else {
+            ErrorCode::Unavailable
+        };
+        world.switch.fail_next(SwitchFault::Error {
+            path: "/erase".into(),
+            code,
+            current: serde_json::Value::Null,
+        });
+        signer.close_account(confirmed()).await.unwrap_err();
+        if !refused {
+            signer.abort_erasure().await.unwrap();
+        }
+        let reminder = Alert::GrantRevocationOwed { app_id: id };
+        assert!(signer.alerts().contains(&reminder), "refused: {refused}");
+    }
+}
+
+#[tokio::test]
+async fn test_erasure_aborted_after_a_partial_unpublish_publishes_again() {
+    // `identity.json` left the Homeserver, then the app's record couldn't be deleted: the
+    // erasure stopped before the switch. The user aborts, and `identity.json` is published
+    // again by the abort's own resume.
+    let world = World::new();
+    let (mut signer, id, _) = with_an_app(&world).await;
+    let newest = signer.identity_doc().unwrap().unwrap();
+    *world.homeserver.failing_path.lock().unwrap() = Some(app_record_path(&id));
+    signer.close_account(confirmed()).await.unwrap_err();
+    assert!(world.homeserver.file(IDENTITY_PATH).is_none());
+    assert_eq!(erase_requests(&world), 0);
+    *world.homeserver.failing_path.lock().unwrap() = None;
+    signer.abort_erasure().await.unwrap();
+    assert_eq!(world.published().unwrap().signed(), newest.signed());
+}
+
+#[tokio::test]
+async fn test_erasure_run_does_nothing_while_erasing_or_once_erased() {
+    // Past half the app's lifetime, with the Homeserver's copy gone: while the erasure is in
+    // progress, and once it is done, a run renews nothing and writes nothing to the
+    // Homeserver. The run that completes the erasure returns without error.
+    let world = World::new();
+    let (mut signer, _, _) = with_an_app(&world).await;
+    world.clock.advance_ms(200 * 86_400_000);
+    world.switch.fail_next(SwitchFault::LoseAnswer {
+        path: "/erase".into(),
+    });
+    signer.close_account(confirmed()).await.unwrap_err();
+    let sent = world.sent_docs().len();
+    let writes = world.homeserver.writes.lock().unwrap().len();
+    signer.run_due().await.unwrap();
+    assert_eq!(signer.status(), SignerStatus::Erased);
+    assert_eq!(
+        signer.run_due().await.unwrap_err(),
+        SignerError::Refused(Refusal::Erased)
+    );
+    assert_eq!(world.sent_docs().len(), sent);
+    assert_eq!(world.homeserver.writes.lock().unwrap().len(), writes);
+    assert!(world.homeserver.file(IDENTITY_PATH).is_none());
 }
