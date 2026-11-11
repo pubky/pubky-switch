@@ -19,11 +19,11 @@ use crate::{FlowResult, World};
 ///
 /// When a step that should succeed against any switch fails.
 pub async fn lists_without_read(world: &World) -> FlowResult {
-    let alice = world.identity("alice");
-    let bob = world.identity("bob");
+    let alice = world.identity("alice")?;
+    let bob = world.identity("bob")?;
     world.add_switch(ORIGIN, &[&alice]).await?;
     let mut signer = enroll(world, &alice, ORIGIN).await?;
-    let asking = Asking::for_scope(world.app_keys(&alice, "pad"), NOTES_LISTS)?;
+    let asking = Asking::for_scope(world.app_keys(&alice, "pad")?, NOTES_LISTS)?;
     let (mut pad, _) = joined_as(world, &alice, &mut signer, asking).await?;
 
     pad.add_contact(&bob.public()).await?;

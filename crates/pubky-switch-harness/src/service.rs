@@ -22,6 +22,7 @@ use pubky_switch::time::{Clock as ServiceClock, TimeSample, TrustedTime, Trusted
 use pubky_switch_client::TransportError;
 use pubky_switch_client::clock::{Clock, TestClock};
 use pubky_switch_client::transport::{BoxFuture, Header, Request, Response, Transport};
+use sqlx::{Connection, Executor};
 use tower::ServiceExt;
 
 use crate::HarnessError;
@@ -141,7 +142,8 @@ impl Transport for ServiceTransport {
 /// gives it.
 pub struct RealSwitch {
     origin: String,
-    database: TestDatabase,
+    /// The test database, until it is dropped.
+    database: Option<TestDatabase>,
     time: Arc<TrustedTime>,
     clock: Arc<SharedClock>,
     transport: Arc<ServiceTransport>,
@@ -150,7 +152,7 @@ pub struct RealSwitch {
 
 impl std::fmt::Debug for RealSwitch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "RealSwitch({}, {})", self.origin, self.database.name())
+        write!(f, "RealSwitch({}, {})", self.origin, self.database_name())
     }
 }
 
@@ -199,7 +201,7 @@ impl RealSwitch {
         );
         let switch = Self {
             origin: origin.to_owned(),
-            database,
+            database: Some(database),
             time,
             clock,
             transport: Arc::new(ServiceTransport::new(origin, service)),
@@ -231,16 +233,52 @@ impl RealSwitch {
         );
     }
 
+    /// The test database's name; empty once it is dropped.
+    pub fn database_name(&self) -> &str {
+        self.database.as_ref().map_or("", TestDatabase::name)
+    }
+
     /// Drop the test database.
     ///
     /// # Errors
     ///
     /// When the server refuses.
-    pub async fn close(self) -> Result<(), HarnessError> {
-        drop(self.transport);
-        self.database
-            .drop_database()
-            .await
-            .map_err(|error| HarnessError::Setup(error.to_string()))
+    pub async fn close(mut self) -> Result<(), HarnessError> {
+        match self.database.take() {
+            Some(database) => database
+                .drop_database()
+                .await
+                .map_err(|error| HarnessError::Setup(error.to_string())),
+            None => Ok(()),
+        }
+    }
+}
+
+/// A switch that goes away without [`RealSwitch::close`], as when its test panics, still
+/// drops its database, so a failing test leaves none behind on the test server.
+impl Drop for RealSwitch {
+    fn drop(&mut self) {
+        let Some(database) = self.database.take() else {
+            return;
+        };
+        // The test's own runtime may be unwinding: the drop runs on a thread and a runtime
+        // of its own, and ends the store's connections from the server's side.
+        let dropped = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .ok()?;
+            runtime.block_on(async {
+                let mut admin = database.admin().await.ok()?;
+                let drop = format!("DROP DATABASE IF EXISTS {} WITH (FORCE)", database.name());
+                admin.execute(drop.as_str()).await.ok()?;
+                admin.close().await.ok()
+            })
+        })
+        .join();
+        if !matches!(dropped, Ok(Some(()))) {
+            // Nothing more to do while dropping; say which database stays.
+            eprintln!("a test database couldn't be dropped at the end of its test");
+        }
     }
 }

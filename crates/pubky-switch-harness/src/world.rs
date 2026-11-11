@@ -104,18 +104,29 @@ impl World {
 
     /// The identity `name`, with the keys its name gives it in every world, and its Pubky
     /// ID shown as `{name}` in the trace.
-    pub fn identity(&self, name: &str) -> TestIdentity {
+    ///
+    /// # Errors
+    ///
+    /// When the name already stands for another ID.
+    pub fn identity(&self, name: &str) -> Result<TestIdentity, HarnessError> {
         let identity = TestIdentity::new(&self.seeds, name);
-        self.names.add(&identity.key().id(), name);
-        identity
+        self.names.add(&identity.key().id(), name)?;
+        Ok(identity)
     }
 
     /// The keys of `identity`'s app `app`, the same in every world, with its App ID shown
-    /// as `{app}` in the trace.
-    pub fn app_keys(&self, identity: &TestIdentity, app: &str) -> AppKeys {
+    /// as `{identity/app}` in the trace, so two identities' apps of one name read apart.
+    ///
+    /// # Errors
+    ///
+    /// When the name already stands for another ID.
+    pub fn app_keys(&self, identity: &TestIdentity, app: &str) -> Result<AppKeys, HarnessError> {
         let keys = identity.app_keys(app);
-        self.names.add(&zbase32_encode(&keys.app_id_bytes()), app);
-        keys
+        self.names.add(
+            &zbase32_encode(&keys.app_id_bytes()),
+            &format!("{}/{app}", identity.name()),
+        )?;
+        Ok(keys)
     }
 
     /// Put a switch at `origin` where none of `identities` has an account yet; their signers
