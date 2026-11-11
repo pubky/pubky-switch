@@ -426,13 +426,35 @@ async fn test_handover_target_not_current_is_conflict() {
         code_of(&put(&replay, phone_body()).await),
         (409, json!("conflict"))
     );
-    let mut forged: Value = serde_json::from_slice(&phone_body()).expect("json");
-    forged["handover"]["sig"] = json!(b64(&[1u8; 64]));
-    assert_eq!(
-        code_of(&put(&replay, forged.to_string().into_bytes()).await),
-        (409, json!("conflict")),
-        "the target first"
-    );
+    let good: Value = serde_json::from_slice(&phone_body()).expect("json");
+    let with = |change: &dyn Fn(&mut Value)| {
+        let mut value = good.clone();
+        change(&mut value);
+        value.to_string().into_bytes()
+    };
+    for (case, body) in [
+        (
+            "a bad signature",
+            with(&|v| v["handover"]["sig"] = json!(b64(&[1u8; 64]))),
+        ),
+        (
+            "no envelope",
+            with(&|v| v["handover"]["envelopes"] = json!([])),
+        ),
+        (
+            "129 envelopes",
+            with(&|v| {
+                let first = v["handover"]["envelopes"][0].clone();
+                v["handover"]["envelopes"] = json!(vec![first; 129]);
+            }),
+        ),
+    ] {
+        assert_eq!(
+            code_of(&put(&replay, body).await),
+            (409, json!("conflict")),
+            "the target first, before {case}"
+        );
+    }
     assert_eq!(
         code_of(&get(&replay, "phone").await),
         (403, json!("not_current"))
@@ -700,5 +722,62 @@ async fn test_handover_fetched_as_stored_byte_for_byte() {
     .into_bytes();
     assert_eq!(put(&replay, reordered.clone()).await.status, 200);
     assert_eq!(get(&replay, "phone").await.body, reordered);
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_handover_stored_again_after_the_next_version_is_kept() {
+    // The same `PUT` bytes stored again after the next version dropped the hand-over, as a
+    // signer's stale retry: the switch keeps it, as any store, and the next version after it
+    // drops it again (Switch wire 7.4.17).
+    let Some(replay) = replay().await else { return };
+    alice_with_three_apps(&replay).await;
+    assert_eq!(put(&replay, phone_body()).await.status, 200);
+    let alice = identity_key().public();
+    let version_3 = IdentityDoc::verify(&document("alice identity.json"), &alice).expect("v3");
+    let path = format!("/v1/{}/identity", alice_id());
+    let deliver = |held: &IdentityDoc, version: u64| {
+        let mut next = held.body().clone();
+        next.version = version;
+        let next = IdentityDoc::sign(&identity_key(), next).expect("sign");
+        let body = IdentityDelivery {
+            identity: next.signed().clone(),
+            prev: Some(held.hash()),
+        }
+        .to_json();
+        (next, body)
+    };
+    let (four, body) = deliver(&version_3, 4);
+    let answer = replay
+        .service
+        .handle(signer_request("PUT", &path, body, ms(&vector_time())))
+        .await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    assert_eq!(
+        code_of(&get(&replay, "phone").await),
+        (404, json!("not_found"))
+    );
+    assert_eq!(put(&replay, phone_body()).await.status, 200);
+    assert_eq!(get(&replay, "phone").await.body, phone_body());
+    let (_, body) = deliver(&four, 5);
+    let answer = replay
+        .service
+        .handle(signer_request("PUT", &path, body, ms(&vector_time())))
+        .await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    assert_eq!(
+        code_of(&get(&replay, "phone").await),
+        (404, json!("not_found"))
+    );
     replay.db.drop_database().await.expect("drop");
 }

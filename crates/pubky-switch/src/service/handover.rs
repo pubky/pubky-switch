@@ -36,9 +36,10 @@ fn none_held() -> ApiError {
     ApiError::not_found("7.4.17: no hand-over is held for this caller")
 }
 
-/// Read `PUT`'s body: `{ "app_id", "handover": { "envelopes", "sig" } }`, no other member
-/// at either level (Switch wire 7.4.17, 1.1).
-fn parse_put(body: &[u8]) -> Result<([u8; 16], SignerHandover), ApiError> {
+/// Read `PUT`'s body as far as the target check needs: `{ "app_id", "handover": { "envelopes",
+/// "sig" } }`, no other member at either level (Switch wire 7.4.17, 1.1). The hand-over itself
+/// is read after the target is found current ([`read_handover`]).
+fn parse_put(body: &[u8]) -> Result<([u8; 16], Value), ApiError> {
     let bad = |why: &str| ApiError::bad_request(format!("7.4.17: {why}"));
     let mut value: Value = parse_json(body).map_err(|_| bad("the body isn't JSON"))?;
     reject_unknown_members(&value, &["app_id", "handover"], "the hand-over request")
@@ -54,7 +55,14 @@ fn parse_put(body: &[u8]) -> Result<([u8; 16], SignerHandover), ApiError> {
         .ok_or_else(|| bad("the body names `handover`"))?;
     reject_unknown_members(&handover, &["envelopes", "sig"], "the hand-over")
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
-    // The count before any envelope is decoded (3.12 `max_handover_parts`).
+    Ok((target, handover))
+}
+
+/// Read the hand-over, once its target is found current: 1 to 128 envelopes, counted on the
+/// JSON before any is decoded (3.12 `max_handover_parts`), then the envelopes and the
+/// signature decoded.
+fn read_handover(handover: Value) -> Result<SignerHandover, ApiError> {
+    let bad = |why: &str| ApiError::bad_request(format!("7.4.17: {why}"));
     let count = handover
         .get("envelopes")
         .and_then(Value::as_array)
@@ -62,9 +70,8 @@ fn parse_put(body: &[u8]) -> Result<([u8; 16], SignerHandover), ApiError> {
     if !(1..=MAX_PARTS).contains(&count) {
         return Err(bad("a hand-over holds 1 to 128 envelopes"));
     }
-    let handover: SignerHandover = serde_json::from_value(handover)
-        .map_err(|_| bad("the hand-over's envelopes or signature don't read"))?;
-    Ok((target, handover))
+    serde_json::from_value(handover)
+        .map_err(|_| bad("the hand-over's envelopes or signature don't read"))
 }
 
 /// The most envelopes a hand-over holds (Switch wire 3.12, 9.2 `max_handover_parts`).
@@ -111,6 +118,7 @@ impl Service {
                 )
             })?;
         let identity = txn.head().identity_key;
+        let handover = read_handover(handover)?;
         handover
             .check_stored(&identity, &target, &cert.bundle_key())
             .map_err(|e| ApiError::bad_request(e.to_string()))?;
@@ -180,7 +188,8 @@ mod tests {
         let none = format!(
             r#"{{"app_id":"g7teif9k1ur75jrmidqk7z7u6w","handover":{{"envelopes":[],"sig":"{sig}"}}}}"#
         );
-        assert!(parse_put(none.as_bytes()).is_err(), "no envelope");
+        let (_, handover) = parse_put(none.as_bytes()).unwrap();
+        assert!(read_handover(handover).is_err(), "no envelope");
         assert!(parse_put(br#"{"app_id":"nope","handover":{"envelopes":[],"sig":"AA"}}"#).is_err());
     }
 }
