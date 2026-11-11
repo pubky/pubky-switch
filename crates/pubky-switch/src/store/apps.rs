@@ -140,6 +140,44 @@ pub fn newly_listed(earlier: Option<&IdentityDoc>, later: &IdentityDoc) -> Vec<[
 }
 
 impl AccountTxn {
+    /// Where `app`'s `keys_through` starts, where it is known (Switch wire 7.4.12): the data
+    /// epoch of the first `identity.json` that listed it, raised as the key bundle parts it
+    /// passed went ([`Self::raise_keys_start`]). `app_listings.listed_epoch` holds it; the
+    /// column kept its first name, since migration 0009 can't change.
+    pub async fn listed_epoch(&mut self, app: &[u8; 16]) -> Result<Option<u64>, StoreError> {
+        let id = self.head().id.clone();
+        let epoch: Option<i64> = sqlx::query_scalar(
+            "SELECT listed_epoch FROM app_listings WHERE account_id = $1 AND app_id = $2",
+        )
+        .bind(id)
+        .bind(app.as_slice())
+        .fetch_optional(self.conn())
+        .await
+        .map_err(StoreError::from_db)?;
+        epoch
+            .map(|epoch| from_db(epoch, "listed_epoch"))
+            .transpose()
+    }
+
+    /// Raise where `app`'s `keys_through` starts to `epoch`: the key bundle parts it passed
+    /// that held its keys through `epoch` are gone, so `keys_through` keeps that height from
+    /// here (Switch wire 7.4.12). It never goes down.
+    pub async fn raise_keys_start(&mut self, app: &[u8; 16], epoch: u64) -> Result<(), StoreError> {
+        let id = self.head().id.clone();
+        sqlx::query(
+            "INSERT INTO app_listings (account_id, app_id, listed_epoch) VALUES ($1, $2, $3) \
+             ON CONFLICT (account_id, app_id) \
+             DO UPDATE SET listed_epoch = GREATEST(app_listings.listed_epoch, $3)",
+        )
+        .bind(id)
+        .bind(app.as_slice())
+        .bind(to_db(epoch, "listed_epoch")?)
+        .execute(self.conn())
+        .await
+        .map_err(StoreError::from_db)?;
+        Ok(())
+    }
+
     /// Record that the document this request takes lists `apps` for the first time, at
     /// data epoch `epoch` (Switch wire 7.4.12 `keys_through`).
     pub async fn note_listings(&mut self, apps: &[[u8; 16]], epoch: u64) -> Result<(), StoreError> {

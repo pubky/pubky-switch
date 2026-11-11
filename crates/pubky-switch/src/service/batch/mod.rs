@@ -254,6 +254,9 @@ async fn load_state(
         .collect();
     (state.directory_version, state.apps_version) = txn.directory_versions().await?;
     for target in &needs.targets {
+        if let Some(epoch) = txn.listed_epoch(target).await? {
+            state.listed_epochs.insert(*target, epoch);
+        }
         let parts = txn.bundle_parts(target).await?;
         state.parts.insert(
             *target,
@@ -430,6 +433,7 @@ pub(crate) fn held_app(app: &StoredApp, identity: &[u8; 32]) -> Result<HeldApp, 
         cursor: app.cursor,
         reachable_since: app.reachable_since,
         full_requested: app.full_requested_ms,
+        full_completed: app.full_completed_seq,
     })
 }
 
@@ -863,6 +867,7 @@ fn stored_app(app_id: [u8; 16], app: &HeldApp) -> StoredApp {
         cursor: app.cursor,
         reachable_since: app.reachable_since,
         full_requested_ms: app.full_requested,
+        full_completed_seq: app.full_completed,
     }
 }
 
@@ -919,6 +924,12 @@ async fn save(
         }
     }
     save_apps(txn, before, after).await?;
+    // Where keys_through starts, raised as passed parts went.
+    for (target, epoch) in &after.listed_epochs {
+        if before.listed_epochs.get(target) != Some(epoch) {
+            txn.raise_keys_start(target, *epoch).await?;
+        }
+    }
     for (target, parts) in &after.parts {
         if before.parts.get(target) != Some(parts) {
             let stored: Vec<StoredBundlePart> = parts

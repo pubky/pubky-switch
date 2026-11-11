@@ -41,6 +41,9 @@ pub struct StoredApp {
     pub reachable_since: Option<u64>,
     /// When a full key bundle was requested for it, while not yet covered.
     pub full_requested_ms: Option<u64>,
+    /// The `seq` of the part that completed its last full-bundle request: the request stays
+    /// in force for dropping parts until its cursor has passed it (Switch wire 6.2).
+    pub full_completed_seq: Option<u64>,
 }
 
 /// A key bundle part as stored.
@@ -200,8 +203,8 @@ impl AccountTxn {
         let id = self.head().id.clone();
         let rows = sqlx::query(
             "SELECT app_id, record, record_at_ms, renewed_cert, receive_key, cursor_generation, \
-             cursor_seq, reachable_since, full_requested_ms FROM apps WHERE account_id = $1 \
-             ORDER BY app_id",
+             cursor_seq, reachable_since, full_requested_ms, full_completed_seq FROM apps \
+             WHERE account_id = $1 ORDER BY app_id",
         )
         .bind(id)
         .fetch_all(self.conn())
@@ -216,11 +219,12 @@ impl AccountTxn {
         let doc = |doc: &Option<SignedDoc>| doc.as_ref().map(encode_doc).transpose();
         sqlx::query(
             "INSERT INTO apps (account_id, app_id, record, record_at_ms, renewed_cert, \
-             receive_key, cursor_generation, cursor_seq, reachable_since, full_requested_ms) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
+             receive_key, cursor_generation, cursor_seq, reachable_since, full_requested_ms, \
+             full_completed_seq) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
              ON CONFLICT (account_id, app_id) DO UPDATE SET record = $3, record_at_ms = $4, \
              renewed_cert = $5, receive_key = $6, cursor_generation = $7, cursor_seq = $8, \
-             reachable_since = $9, full_requested_ms = $10",
+             reachable_since = $9, full_requested_ms = $10, full_completed_seq = $11",
         )
         .bind(id)
         .bind(app.app_id.as_slice())
@@ -235,6 +239,7 @@ impl AccountTxn {
         .bind(opt_to_db(app.cursor.map(|c| c.seq), "cursor_seq")?)
         .bind(opt_to_db(app.reachable_since, "reachable_since")?)
         .bind(opt_to_db(app.full_requested_ms, "full_requested_ms")?)
+        .bind(opt_to_db(app.full_completed_seq, "full_completed_seq")?)
         .execute(self.conn())
         .await
         .map_err(db)?;
@@ -982,6 +987,7 @@ fn app_of(row: &sqlx::postgres::PgRow) -> Result<StoredApp, StoreError> {
         cursor,
         reachable_since: opt_u64(row.try_get("reachable_since")?, "reachable_since")?,
         full_requested_ms: opt_u64(row.try_get("full_requested_ms")?, "full_requested_ms")?,
+        full_completed_seq: opt_u64(row.try_get("full_completed_seq")?, "full_completed_seq")?,
     })
 }
 
@@ -996,7 +1002,7 @@ pub(super) async fn own_app_view(
     let row = sqlx::query(
         "SELECT a.identity_doc, p.app_id, p.record, p.record_at_ms, p.renewed_cert, \
          p.receive_key, p.cursor_generation, p.cursor_seq, p.reachable_since, \
-         p.full_requested_ms, EXISTS (SELECT 1 FROM kept_app_ids k \
+         p.full_requested_ms, p.full_completed_seq, EXISTS (SELECT 1 FROM kept_app_ids k \
          WHERE k.account_id = a.id AND k.app_id = $2) AS kept \
          FROM accounts a LEFT JOIN apps p ON p.account_id = a.id AND p.app_id = $2 \
          WHERE a.id = $1",
@@ -1023,7 +1029,7 @@ pub(super) async fn app_row<'c>(
 ) -> Result<Option<StoredApp>, StoreError> {
     let row = sqlx::query(
         "SELECT app_id, record, record_at_ms, renewed_cert, receive_key, cursor_generation, \
-         cursor_seq, reachable_since, full_requested_ms FROM apps \
+         cursor_seq, reachable_since, full_requested_ms, full_completed_seq FROM apps \
          WHERE account_id = $1 AND app_id = $2",
     )
     .bind(id)
