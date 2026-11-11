@@ -74,10 +74,11 @@ service.
 - **App currency outside batches**: a feed read is checked as a batch is, for an app that
   delivered its record: current, with an unexpired certificate, the stored renewed one once
   the newest `identity.json` lists it (Switch wire 7.2, 3.8). Other routes check only that
-  the app hasn't departed, but for the key bundle routes (`GET` and `POST
-  /apps/{app_id}/keys`), which check nothing of the app's standing, take any body, and answer
-  `404` ("no route") for another app's path or the signer, where the service answers `403
-  permission_missing` (Switch wire 7.4.11).
+  the app hasn't departed. The key bundle routes (`GET` and `POST /apps/{app_id}/keys`)
+  answer `403 not_current` to an app that isn't current by its record, as the service does,
+  and keep nothing for it; they don't check the certificate's expiry (the service answers
+  `403 cert_expired`), take any body, and answer `404` ("no route") for another app's path or
+  the signer, where the service answers `403 permission_missing` (Switch wire 7.4.11).
 - **`POST /v1/enroll`** (Switch wire 3.7, 7.4.1), in `switch/signer.rs`: only at
   [`SWITCH_ORIGIN`], with the default limits unless a test sets others
   (`set_enroll_limits`), and without checking the request signature. A

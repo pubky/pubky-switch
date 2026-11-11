@@ -1293,6 +1293,11 @@ impl Inner {
             ("POST", "recovery/upload") => self.upload(request, caller)?,
             ("GET", "allow") => self.allow_answer(),
             ("PUT", "push") => self.put_push(caller, &request.body),
+            // Only a current app reads its parts or asks for a full bundle; the service
+            // answers any other `403 not_current` (Switch wire 7.2), and keeps nothing for it.
+            (_, r) if r == own_keys && !self.app_current_by(&self.apps, &app, false) => {
+                bad(ErrorCode::NotCurrent, "not current", json!(null))
+            }
             ("GET", r) if r == own_keys => {
                 let parts = self.bundles.get(&app).cloned().unwrap_or_default();
                 if parts.is_empty() {
@@ -1309,7 +1314,9 @@ impl Inner {
             }
             ("POST", r) if r == own_keys => {
                 let now = self.now();
-                let held = self.apps.entry(app).or_default();
+                let Some(held) = self.apps.get_mut(&app) else {
+                    return Ok(bad(ErrorCode::NotCurrent, "not current", json!(null)));
+                };
                 let at = *held.full_requested.get_or_insert(now);
                 (200, json!({ "requested": rfc3339(at) }))
             }

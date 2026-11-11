@@ -370,6 +370,161 @@ async fn test_keys_refused_to_an_expired_or_unregistered_app() {
     replay.db.drop_database().await.expect("drop");
 }
 
+/// The signer renews the wallet at `at`: `cert.put` with a full key bundle made for the new
+/// certificate (data epochs 1 to 2), then version 4, which lists the new certificate and keeps
+/// the earlier one open in `renewed` (Switch wire 3.8). Returns the stored parts' bundles.
+async fn renew_wallet(replay: &Replay, at: &str) -> Vec<KeyBundle> {
+    use pubky_switch_core::{
+        http::IdentityDelivery,
+        keys::AppKeys,
+        records::{AppCertBody, IdentityBody, IdentityDoc, RenewedCert, seal_bundle_parts},
+    };
+    let keys = vectors("keys.json");
+    let wallet = app(&keys, "wallet");
+    let wallet_keys = AppKeys::from_secrets(
+        hex32(&wallet["signing_secret_hex"]),
+        hex32(&wallet["bundle_secret_hex"]),
+    );
+    let alice_key: [u8; 32] = hex32(&alice(&keys)["public_hex"]);
+    let identity = IdentityKey::from_secret(hex32(&alice(&keys)["secret_hex"]));
+    let earlier = wallet_cert();
+    let issued = ms(at) - 1_000;
+    let renewed = AppCert::issue(
+        &identity,
+        AppCertBody::new(
+            alice_key,
+            wallet_keys.signing_public(),
+            wallet_keys.bundle_public(),
+            earlier.scopes().to_vec(),
+            earlier.permissions(),
+            issued,
+            issued + 180 * 86_400_000,
+        ),
+    )
+    .expect("certificate");
+    let parts = seal_bundle_parts(&identity, &renewed, 1, 2, &|_| true).expect("bundle");
+    let mut ops = vec![(
+        Vec::new(),
+        OpKind::CertPut {
+            target_app_id: renewed.app_id(),
+            cert: renewed.signed().clone(),
+        },
+    )];
+    let mut bundles = Vec::new();
+    for part in parts {
+        bundles.push(part.bundle.clone());
+        ops.push((
+            Vec::new(),
+            OpKind::KeyBundlePut(KeyBundlePut {
+                target_app_id: renewed.app_id(),
+                bundle: part.bundle,
+                first_epoch: part.first_epoch,
+                last_epoch: part.last_epoch,
+            }),
+        ));
+    }
+    let renewal = sign_batch(&identity, &alice_key, None, 1, [94; 16], ops).expect("batch");
+    let answer = replay
+        .service
+        .handle(signer_request(
+            "POST",
+            &format!("/v1/{}/ops", alice_id()),
+            OpsRequest::new(&renewal, None).to_json(),
+            ms(at),
+        ))
+        .await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    let v3: SignedDoc = serde_json::from_value(
+        named(
+            &vectors("documents.json")["documents"],
+            "alice identity.json",
+        )["signed"]
+            .clone(),
+    )
+    .expect("version 3");
+    let mut next: IdentityBody =
+        serde_json::from_slice(&v3.body_bytes().expect("body")).expect("identity body");
+    next.version = 4;
+    let listed = next
+        .apps
+        .iter_mut()
+        .find(|listed| listed.app_id == renewed.app_id())
+        .expect("the wallet is listed");
+    listed.cert = renewed.hash();
+    next.renewed.push(RenewedCert {
+        app_id: renewed.app_id(),
+        cert: earlier.hash(),
+        until: None,
+    });
+    let v4 = IdentityDoc::sign(&identity, next).expect("sign");
+    let held = IdentityDoc::verify(&v3, &identity.public()).expect("version 3");
+    let delivery = IdentityDelivery {
+        identity: v4.signed().clone(),
+        prev: Some(held.hash()),
+    };
+    let answer = replay
+        .service
+        .handle(signer_request(
+            "PUT",
+            &format!("/v1/{}/identity", alice_id()),
+            delivery.to_json(),
+            ms(at),
+        ))
+        .await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    bundles
+}
+
+#[tokio::test]
+async fn test_keys_lapsed_app_reads_its_parts_once_renewed() {
+    // The wallet's certificate lapses and it is refused; the signer renews it (Switch wire
+    // 3.8 "An expired certificate"); the same `GET` then answers exactly the parts made for
+    // the renewed certificate, and a request for a full bundle is taken (7.4.11).
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let lapsed = "2026-12-01T00:00:10.000Z";
+    set_time(&replay.clock, lapsed);
+    let refused = keys_call(&replay, "wallet", "GET", "wallet", Vec::new(), lapsed).await;
+    assert_eq!(code(&refused), (403, json!("cert_expired")));
+    let bundles = renew_wallet(&replay, lapsed).await;
+    let answer = keys_call(&replay, "wallet", "GET", "wallet", Vec::new(), lapsed).await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    let parts = body(&answer)["bundles"]
+        .as_array()
+        .expect("bundles")
+        .clone();
+    assert_eq!(parts.len(), bundles.len());
+    for (part, bundle) in parts.iter().zip(&bundles) {
+        assert_eq!(
+            part["bundle"],
+            serde_json::to_value(bundle).expect("bundle")
+        );
+    }
+    let answer = keys_call(&replay, "wallet", "POST", "wallet", Vec::new(), lapsed).await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
 #[tokio::test]
 async fn test_keys_staged_account_is_unavailable() {
     // A version naming another switch leaves the account staged here: both calls are `503

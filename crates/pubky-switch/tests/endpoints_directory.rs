@@ -1148,6 +1148,29 @@ async fn test_directory_leave_is_treated_as_a_revocation() {
     let after = read_as(&replay, "phone", &at).await;
     assert_eq!(moved(&before, &after), (true, true));
     assert!(!ids_of(&after).contains(&json!(wallet)));
+    // Another own app sees the departure in its feed: the `leave` item, in full (7.5).
+    let feed = replay
+        .service
+        .handle(app_request(
+            app(&keys, "phone"),
+            "GET",
+            &format!("/v1/{}/feed", alice_id()),
+            Vec::new(),
+            ms(&at),
+        ))
+        .await;
+    let page: Value = serde_json::from_slice(&feed.body).expect("a feed page");
+    let last = page["items"]
+        .as_array()
+        .and_then(|items| items.last())
+        .unwrap_or_else(|| panic!("{page}"))
+        .clone();
+    let item: pubky_switch_core::sig::SignedDoc =
+        serde_json::from_value(last["item"].clone()).unwrap_or_else(|_| panic!("{last}"));
+    let transition: Value =
+        serde_json::from_slice(&item.body_bytes().expect("body")).expect("a transition");
+    assert_eq!(transition["type"], "leave", "{transition}");
+    assert_eq!(transition["app_id"], json!(wallet));
     let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
         .await
         .expect("conn");
