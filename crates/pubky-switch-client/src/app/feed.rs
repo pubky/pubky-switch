@@ -215,7 +215,11 @@ impl OwedCall {
 
 /// An entry as the feed carries it, or as the app stored it.
 struct Entry {
+    /// The `seq` it was read at, in `generation`.
     seq: u64,
+    generation: u64,
+    /// Its local ID when it is stored locally ([`ParkedEntry`]).
+    stored: Option<u64>,
     sender: [u8; 32],
     cert: SignedDoc,
     accepted_at_ms: u64,
@@ -451,10 +455,8 @@ impl App {
             };
             match step {
                 Step::Pass => {
-                    // An entry stored locally isn't processed yet: its count stays.
-                    if !self.state.parked.contains_key(&seq) {
-                        self.clear_retry(seq, &mut read)?;
-                    }
+                    // Processed, or stored locally with its count under its local ID.
+                    self.clear_retry(seq, &mut read)?;
                     if read.blocked.is_none_or(|b| seq < b) {
                         self.pass(seq, item, &mut read)?;
                     } else if matches!(item, FeedItem::Entry(_)) && !self.state.seen.contains(&seq)
@@ -543,6 +545,8 @@ impl App {
     async fn handle_entry(&mut self, item: &EntryItem, read: &mut Read) -> Result<Step, AppError> {
         let entry = Entry {
             seq: item.seq,
+            generation: self.state.cursor.generation,
+            stored: None,
             sender: item.sender,
             cert: item.cert.clone(),
             accepted_at_ms: item.accepted_at,
@@ -606,10 +610,7 @@ impl App {
         let received = match checked {
             Ok(received) => received,
             Err(CheckRefusal::Dropped { check, reason }) => {
-                if parked {
-                    read.tx.delete(&key::parked(entry.seq))?;
-                    self.state.parked.remove(&entry.seq);
-                }
+                self.unpark(entry.stored, &mut read.tx)?;
                 return Ok(self.dropped(entry.seq, check, reason));
             }
             Err(CheckRefusal::Duplicate { conflicting }) => {
@@ -630,10 +631,7 @@ impl App {
         // app's own record of processed messages.
         let pair = (entry.sender, received.message.msg_id.clone());
         if let Some(hash) = read.pairs.get(&pair).copied() {
-            if parked {
-                read.tx.delete(&key::parked(entry.seq))?;
-                self.state.parked.remove(&entry.seq);
-            }
+            self.unpark(entry.stored, &mut read.tx)?;
             self.events.push(AppEvent::Duplicate {
                 seq: entry.seq,
                 conflicting: hash != received.hash(),
@@ -645,10 +643,7 @@ impl App {
             .get(&key::processed(&entry.sender, &received.message.msg_id))
             .await?;
         if let Some(seen) = processed {
-            if parked {
-                read.tx.delete(&key::parked(entry.seq))?;
-                self.state.parked.remove(&entry.seq);
-            }
+            self.unpark(entry.stored, &mut read.tx)?;
             self.events.push(AppEvent::Duplicate {
                 seq: entry.seq,
                 conflicting: seen.hash != received.hash(),
@@ -681,7 +676,7 @@ impl App {
             conflict: None,
         };
         if let Err(reason) = self.protocol.check_body(&message) {
-            self.note_processed(entry, &received, &[], parked, read)?;
+            self.note_processed(entry, &received, &[], read)?;
             return Ok(self.dropped(entry.seq, 10, reason));
         }
         let mut tries = 0usize;
@@ -708,7 +703,7 @@ impl App {
             };
             let mut effect = match outcome {
                 Outcome::Drop { reason } => {
-                    self.note_processed(entry, &received, &[], parked, read)?;
+                    self.note_processed(entry, &received, &[], read)?;
                     return Ok(self.dropped(entry.seq, 10, reason));
                 }
                 Outcome::Need(needs) => match self.read_needs(&needs, &mut fetched).await? {
@@ -757,25 +752,25 @@ impl App {
             // and the protocol told, as for an effect refused for good (Switch spec 8.2).
             if super::batch::refuse_lifecycle_ops(effect.ops.iter().map(|(_, kind)| kind)).is_err()
             {
-                self.park(
+                let stored = self.park(
                     entry,
                     &received.plaintext,
                     ParkReason::LifecycleOperation,
                     read,
                 )?;
-                self.effect_refused(entry, &received, None, read)?;
+                self.effect_refused(entry, &received, stored, None, read)?;
                 return Ok(Step::Pass);
             }
             if effect.ops.len() >= MAX_BATCH_ENTRIES {
                 // Switch wire 6.4: at most 7 operations beside the cursor move. Stored and
                 // passed, so the feed goes on (Switch spec 8.2).
-                self.park(
+                let stored = self.park(
                     entry,
                     &received.plaintext,
                     ParkReason::TooManyOperations,
                     read,
                 )?;
-                self.effect_refused(entry, &received, None, read)?;
+                self.effect_refused(entry, &received, stored, None, read)?;
                 return Ok(Step::Pass);
             }
             if !self
@@ -792,7 +787,7 @@ impl App {
                 return Ok(Step::Pass);
             }
             if effect.ops.is_empty() {
-                self.note_processed(entry, &received, &effect.local, parked, read)?;
+                self.note_processed(entry, &received, &effect.local, read)?;
                 self.received_event(entry, &received);
                 return Ok(Step::Pass);
             }
@@ -837,8 +832,9 @@ impl App {
                     return Ok(Step::Pass);
                 }
                 Sent::Refused(code) => {
-                    self.park(entry, &received.plaintext, ParkReason::Refused, read)?;
-                    self.effect_refused(entry, &received, Some(code), read)?;
+                    let stored =
+                        self.park(entry, &received.plaintext, ParkReason::Refused, read)?;
+                    self.effect_refused(entry, &received, stored, Some(code), read)?;
                     return Ok(Step::Pass);
                 }
                 // A first send isn't a resend; the entry was stored if it ever is.
@@ -921,7 +917,6 @@ impl App {
         entry: &Entry,
         received: &Received,
         local: &[LocalWrite],
-        parked: bool,
         read: &mut Read,
     ) -> Result<(), AppError> {
         let now = self.now();
@@ -937,10 +932,7 @@ impl App {
             received.hash(),
         );
         read.tx.local(local)?;
-        if parked {
-            read.tx.delete(&key::parked(entry.seq))?;
-            self.state.parked.remove(&entry.seq);
-        }
+        self.unpark(entry.stored, &mut read.tx)?;
         Ok(())
     }
 
@@ -978,7 +970,8 @@ impl App {
             local: effect.local,
             cursor_to,
             past_held,
-            parked,
+            generation: entry.generation,
+            stored: entry.stored,
             deadlines: written
                 .deadlines
                 .iter()
@@ -1120,12 +1113,13 @@ impl App {
         processed_writes(&mut tx, &pending.sender, &pending.msg_id, pending.hash, now)?;
         tx.local(&pending.local)?;
         // Processed: a count of the store's retries at it goes with it.
-        if self.state.retries.remove(&pending.seq).is_some() {
+        if pending.stored.is_some() {
+            self.unpark(pending.stored, &mut tx)?;
+        } else if self.state.retries.remove(&pending.seq).is_some() {
             tx.delete(&key::retry(pending.seq))?;
         }
-        if pending.parked {
-            tx.delete(&key::parked(pending.seq))?;
-            self.state.parked.remove(&pending.seq);
+        if pending.stored.is_some() {
+            // Stored before, and passed then.
         } else if pending.past_held {
             tx.put(&key::seen(pending.seq), &())?;
             self.state.seen.insert(pending.seq);
@@ -1220,32 +1214,35 @@ impl App {
     /// current state. One stored before only changes its reason.
     fn park_uncertain(&mut self, pending: &PendingEffect, tx: &mut Tx) -> Result<(), AppError> {
         let reason = ParkReason::Uncertain;
-        let parked = match self.state.parked.get(&pending.seq) {
-            Some(stored) if pending.parked => ParkedEntry {
-                reason,
-                ..stored.clone()
-            },
-            _ => ParkedEntry {
-                sender: pending.sender,
-                cert: pending.entry.cert.clone(),
-                accepted_at_ms: pending.accepted_at_ms,
-                plaintext: pending.entry.plaintext.clone(),
-                context: pending.entry.context.clone(),
-                reason,
-                round: self.state.parked_round.number,
-            },
+        let stored = pending
+            .stored
+            .and_then(|id| self.state.parked.get(&id).cloned().map(|entry| (id, entry)));
+        let (id, parked) = match stored {
+            Some((id, stored)) => (id, ParkedEntry { reason, ..stored }),
+            None => (
+                self.new_stored_id(tx)?,
+                ParkedEntry {
+                    seq: pending.seq,
+                    generation: pending.generation,
+                    sender: pending.sender,
+                    cert: pending.entry.cert.clone(),
+                    accepted_at_ms: pending.accepted_at_ms,
+                    plaintext: pending.entry.plaintext.clone(),
+                    context: pending.entry.context.clone(),
+                    reason,
+                    round: self.state.parked_round.number,
+                },
+            ),
         };
-        tx.put(&key::parked(pending.seq), &parked)?;
-        self.state.parked.insert(pending.seq, parked);
+        tx.put(&key::parked(id), &parked)?;
+        self.state.parked.insert(id, parked);
         // Stored for good: a count of the store's retries at it goes.
-        if self.state.retries.remove(&pending.seq).is_some() {
-            tx.delete(&key::retry(pending.seq))?;
-        }
+        self.drop_retries(pending.stored.is_none().then_some(pending.seq), id, tx)?;
         // Processed, so a re-send of the message is a duplicate, not applied (Switch spec
         // 11).
         let now = self.now();
         uncertain_processed(tx, &pending.sender, &pending.msg_id, pending.hash, now)?;
-        if pending.parked {
+        if pending.stored.is_some() {
             // Stored before, and passed then.
         } else if pending.past_held {
             tx.put(&key::seen(pending.seq), &())?;
@@ -1263,6 +1260,7 @@ impl App {
             tx,
             Duty::Parked {
                 seq: pending.seq,
+                stored_id: id,
                 reason,
             },
         )?;
@@ -1270,6 +1268,7 @@ impl App {
             tx,
             Duty::EffectUncertain {
                 seq: pending.seq,
+                stored_id: id,
                 sender: pending.sender,
                 msg_id: pending.msg_id.clone(),
                 kind: pending.kind.clone(),
@@ -1347,19 +1346,34 @@ impl App {
             return Ok(Step::Pass);
         }
         let now = self.now();
-        let retry = self.state.retries.entry(entry.seq).or_insert(RetryEntry {
+        let fresh = RetryEntry {
             reads: 0,
             since_ms: now,
-        });
-        retry.reads = retry.reads.saturating_add(1);
-        let retry = *retry;
-        read.tx.put(&key::retry(entry.seq), &retry)?;
+        };
+        // Counted under the entry's local ID while it is stored, its `seq` before.
+        let retry = match entry.stored {
+            Some(id) => {
+                let retry = self.state.stored_retries.entry(id).or_insert(fresh);
+                retry.reads = retry.reads.saturating_add(1);
+                let retry = *retry;
+                read.tx.put(&key::stored_retry(id), &retry)?;
+                retry
+            }
+            None => {
+                let retry = self.state.retries.entry(entry.seq).or_insert(fresh);
+                retry.reads = retry.reads.saturating_add(1);
+                let retry = *retry;
+                read.tx.put(&key::retry(entry.seq), &retry)?;
+                retry
+            }
+        };
         // Raised from the count's threshold on, and at every try of an entry stored
         // locally for the store, which waited out the bounded wait or can't be mended by
         // waiting: the host hears of it again at each, however few its tries.
         if retry.reads >= RETRY_EVENT_READS || parked {
             self.events.push(AppEvent::StoreFailing {
                 seq: entry.seq,
+                stored_id: entry.stored,
                 reads: retry.reads,
                 since_ms: retry.since_ms,
                 failure,
@@ -1416,14 +1430,22 @@ impl App {
         Ok(Step::Hold)
     }
 
+    /// Store `entry` locally for `reason`, under its local ID, a new one for an entry read
+    /// from the feed, and pass it (Switch spec 8.2). Returns the local ID.
     fn park(
         &mut self,
         entry: &Entry,
         plaintext: &MessagePlaintext,
         reason: ParkReason,
         read: &mut Read,
-    ) -> Result<(), AppError> {
+    ) -> Result<u64, AppError> {
+        let id = match entry.stored {
+            Some(id) => id,
+            None => self.new_stored_id(&mut read.tx)?,
+        };
         let parked = ParkedEntry {
+            seq: entry.seq,
+            generation: entry.generation,
             sender: entry.sender,
             cert: entry.cert.clone(),
             accepted_at_ms: entry.accepted_at_ms,
@@ -1432,35 +1454,82 @@ impl App {
             reason,
             round: self.state.parked_round.number,
         };
-        read.tx.put(&key::parked(entry.seq), &parked)?;
-        read.tx.delete(&key::held(entry.seq))?;
-        self.state.held.remove(&entry.seq);
-        self.state.parked.insert(entry.seq, parked);
+        read.tx.put(&key::parked(id), &parked)?;
+        // An entry read from the feed may have been held there; a stored one's `seq` names
+        // no position of the feed read now.
+        if entry.stored.is_none() {
+            read.tx.delete(&key::held(entry.seq))?;
+            self.state.held.remove(&entry.seq);
+        }
+        self.state.parked.insert(id, parked);
         if reason.tried_again() {
+            // Its count of the store's retries goes with it, under its local ID.
+            if entry.stored.is_none()
+                && let Some(retry) = self.state.retries.remove(&entry.seq)
+            {
+                read.tx.delete(&key::retry(entry.seq))?;
+                read.tx.put(&key::stored_retry(id), &retry)?;
+                self.state.stored_retries.insert(id, retry);
+            }
             self.events.push(AppEvent::Parked {
                 id: None,
                 seq: entry.seq,
+                stored_id: id,
                 reason,
             });
         } else {
             // Stored for good, never tried again: a count of the store's retries at it goes.
-            if self.state.retries.remove(&entry.seq).is_some() {
-                read.tx.delete(&key::retry(entry.seq))?;
-            }
+            self.drop_retries(
+                entry.stored.is_none().then_some(entry.seq),
+                id,
+                &mut read.tx,
+            )?;
             // A duty event, kept in the commit that stores the entry.
             self.keep_duty(
                 &mut read.tx,
                 Duty::Parked {
                     seq: entry.seq,
+                    stored_id: id,
                     reason,
                 },
             )?;
         }
+        Ok(id)
+    }
+
+    /// The local ID the next entry stored locally takes, counted up in `tx`.
+    fn new_stored_id(&mut self, tx: &mut Tx) -> Result<u64, AppError> {
+        let id = self.state.next_stored_id;
+        self.state.next_stored_id = id.saturating_add(1);
+        tx.put(key::STORED_NEXT, &self.state.next_stored_id)?;
+        Ok(id)
+    }
+
+    /// The counts of the store's retries at an entry go: at its `seq` while it was read
+    /// from the feed, and at its local ID once stored.
+    fn drop_retries(&mut self, seq: Option<u64>, id: u64, tx: &mut Tx) -> Result<(), AppError> {
+        if let Some(seq) = seq
+            && self.state.retries.remove(&seq).is_some()
+        {
+            tx.delete(&key::retry(seq))?;
+        }
+        if self.state.stored_retries.remove(&id).is_some() {
+            tx.delete(&key::stored_retry(id))?;
+        }
         Ok(())
     }
 
-    /// Tell the protocol that the effect of `received` won't be sent again (Switch spec
-    /// 8.2): a duty event, kept in the commit that stores the entry.
+    /// The entry stored locally at `stored`, if any, goes: processed, dropped or a
+    /// duplicate, its count of retries with it.
+    pub(crate) fn unpark(&mut self, stored: Option<u64>, tx: &mut Tx) -> Result<(), AppError> {
+        if let Some(id) = stored {
+            tx.delete(&key::parked(id))?;
+            self.state.parked.remove(&id);
+            self.drop_retries(None, id, tx)?;
+        }
+        Ok(())
+    }
+
     /// An effect too large for the store ([`ParkReason::EffectTooLarge`]): its entry stored
     /// and passed, and the protocol told.
     async fn too_large(
@@ -1470,8 +1539,8 @@ impl App {
         read: &mut Read,
     ) -> Result<(), AppError> {
         self.make_room(read, PARK_ROOM_BYTES).await?;
-        self.park(entry, &received.plaintext, ParkReason::EffectTooLarge, read)?;
-        self.effect_refused(entry, received, None, read)
+        let stored = self.park(entry, &received.plaintext, ParkReason::EffectTooLarge, read)?;
+        self.effect_refused(entry, received, stored, None, read)
     }
 
     /// Room in the read's commit for `bytes` more, with what processing an entry adds: when
@@ -1495,6 +1564,7 @@ impl App {
         &mut self,
         entry: &Entry,
         received: &Received,
+        stored_id: u64,
         code: Option<String>,
         read: &mut Read,
     ) -> Result<(), AppError> {
@@ -1502,6 +1572,7 @@ impl App {
             &mut read.tx,
             Duty::EffectRefused {
                 seq: entry.seq,
+                stored_id,
                 sender: entry.sender,
                 msg_id: received.message.msg_id.clone(),
                 kind: received.message.kind.clone(),
@@ -1521,20 +1592,20 @@ impl App {
             .parked
             .iter()
             .filter(|(_, stored)| stored.reason.tried_again())
-            .map(|(seq, stored)| (*seq, stored.round))
+            .map(|(id, stored)| (*id, stored.round))
             .collect();
         if due.is_empty() {
             return Ok(());
         }
-        let (seqs, round) = self.state.parked_round.turn(&due, PARKED_RETRIES_PER_READ);
+        let (ids, round) = self.state.parked_round.turn(&due, PARKED_RETRIES_PER_READ);
         if round != self.state.parked_round {
             self.state.parked_round = round;
             let mut tx = self.tx()?;
             tx.put(key::PARKED_NEXT, &round)?;
             self.commit(tx).await?;
         }
-        for seq in seqs {
-            let Some(stored) = self.state.parked.get(&seq).cloned() else {
+        for id in ids {
+            let Some(stored) = self.state.parked.get(&id).cloned() else {
                 continue;
             };
             // A refusal for good, an effect over one batch, a step that asked for more reads
@@ -1545,7 +1616,9 @@ impl App {
             let plaintext = MessagePlaintext::decode(&stored.plaintext)
                 .map_err(|_| AppError::Store(crate::error::StoreError::Corrupt))?;
             let entry = Entry {
-                seq,
+                seq: stored.seq,
+                generation: stored.generation,
+                stored: Some(id),
                 sender: stored.sender,
                 cert: stored.cert,
                 accepted_at_ms: stored.accepted_at_ms,
@@ -1555,12 +1628,12 @@ impl App {
             let step = self
                 .check_and_apply(&entry, plaintext, true, &mut read)
                 .await?;
-            if step == Step::Pass && !self.state.parked.contains_key(&seq) {
-                self.clear_retry(seq, &mut read)?;
-            }
             self.commit(read.tx).await?;
-            if step == Step::Pass && !self.state.parked.contains_key(&seq) {
-                self.events.push(AppEvent::Unparked { seq });
+            if step == Step::Pass && !self.state.parked.contains_key(&id) {
+                self.events.push(AppEvent::Unparked {
+                    seq: stored.seq,
+                    stored_id: id,
+                });
             }
         }
         Ok(())

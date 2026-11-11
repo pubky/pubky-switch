@@ -32,7 +32,7 @@ use crate::store::{StoreHandle, Write, WriteBatch};
 
 /// The schema version of every value the app layer writes. 2: a kept effect keeps the
 /// entry it is for (`pending/effect`).
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// The prefix of the protocol's own keys in the app's namespace.
 pub const PROTOCOL_PREFIX: &[u8] = b"p/";
@@ -111,8 +111,10 @@ pub(crate) mod key {
     /// The prefix of the kept duty events.
     pub(crate) const DUTY_PREFIX: &str = "duty/";
 
-    /// The `seq` the next read's retries of stored entries start from.
+    /// Where the next read's retries of stored entries start from.
     pub(crate) const PARKED_NEXT: &str = "parkn";
+    /// The local ID the next entry stored locally takes.
+    pub(crate) const STORED_NEXT: &str = "parkid";
     /// The prefix of the protocol calls owed.
     pub(crate) const OWED_PREFIX: &str = "owed/";
 
@@ -175,8 +177,14 @@ pub(crate) mod key {
         format!("retry/{}", num(seq))
     }
 
-    pub(crate) fn parked(seq: u64) -> String {
-        format!("parked/{}", num(seq))
+    /// An entry stored locally, by its local ID, which never changes.
+    pub(crate) fn parked(id: u64) -> String {
+        format!("parked/{}", num(id))
+    }
+
+    /// The count of the store's retries at an entry stored locally, by its local ID.
+    pub(crate) fn stored_retry(id: u64) -> String {
+        format!("sretry/{}", num(id))
     }
 
     pub(crate) fn asked(seq: u64) -> String {
@@ -376,13 +384,13 @@ impl DutyEpoch {
 }
 
 /// `parkn`: where the retries of entries stored locally stand. A round covers the entries
-/// stored before it began, by the round each was stored in, not by `seq`, which a provider
-/// loss renumbers; it tries them in `seq` order from `next` on. One stored later waits for
+/// stored before it began, by the round each was stored in; it tries them in local ID order
+/// from `next` on. One stored later waits for
 /// the next round, so every entry is tried within two rounds, each of at most as many reads
 /// as it covers entries over the per-read bound.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ParkedRound {
-    /// The lowest `seq` the round has yet to try.
+    /// The lowest local ID the round has yet to try.
     pub(crate) next: u64,
     /// The round's number: it covers the entries stored in an earlier one.
     pub(crate) number: u64,
@@ -435,19 +443,25 @@ pub(crate) struct HeldEntry {
     pub(crate) since_ms: u64,
 }
 
-/// `retry/<seq>`: an entry whose receive step couldn't finish because the protocol's store
-/// or the host failed (`Outcome::Retry`): the reads in a row that ended so, and when the
-/// first was. Kept until the entry is processed.
+/// `retry/<seq>` for an entry on the feed, `sretry/<id>` for one stored locally: an entry
+/// whose receive step couldn't finish because the protocol's store or the host failed
+/// (`Outcome::Retry`): the reads in a row that ended so, and when the first was. Kept until
+/// the entry is processed; it moves from the one key to the other when the entry is stored.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RetryEntry {
     pub(crate) reads: u32,
     pub(crate) since_ms: u64,
 }
 
-/// `parked/<seq>`: an entry stored locally and passed with the cursor (Switch spec 8.2).
-/// Sensitive: it holds the opened message, so its `Debug` shows only its size.
+/// `parked/<id>`: an entry stored locally and passed with the cursor (Switch spec 8.2),
+/// keyed by a local ID that never changes, whatever provider change follows. Sensitive: it
+/// holds the opened message, so its `Debug` shows only its size.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ParkedEntry {
+    /// The `seq` the entry was read at, in [`ParkedEntry::generation`].
+    pub(crate) seq: u64,
+    /// The generation it was read at.
+    pub(crate) generation: u64,
     #[serde(with = "serde_b64")]
     pub(crate) sender: [u8; 32],
     pub(crate) cert: SignedDoc,
@@ -513,9 +527,11 @@ pub(crate) struct PendingEffect {
     pub(crate) cursor_to: Option<u64>,
     /// The entry lies past a held one: it is kept in `seen` until the cursor passes it.
     pub(crate) past_held: bool,
-    /// The entry was stored locally before: removing it from `parked` is part of the
-    /// outcome.
-    pub(crate) parked: bool,
+    /// The generation the entry was read at.
+    pub(crate) generation: u64,
+    /// The local ID of the entry when it was stored locally before: removing it from
+    /// `parked` is part of the outcome.
+    pub(crate) stored: Option<u64>,
     /// The deadlines the app computes itself for the claims the batch writes, kept with
     /// their evidence once it is applied (Switch wire 6.8), by claim key (base64url).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -952,7 +968,8 @@ mod tests {
             local,
             cursor_to: Some(u64::MAX),
             past_held: true,
-            parked: true,
+            generation: u64::MAX,
+            stored: Some(u64::MAX),
             deadlines: (0..7)
                 .map(|n| {
                     (
@@ -1047,9 +1064,8 @@ mod tests {
     }
 
     #[test]
-    fn test_parked_round_reaches_every_entry_after_a_loss_renumbers_them() {
-        // After a provider loss the entries stored before it sit at the top of the `seq`s,
-        // and later ones below them, in the new sequence.
+    fn test_parked_round_reaches_every_entry_whatever_their_ids() {
+        // Entries stored before others whose IDs sort before them, as IDs of any order may.
         let first: Vec<u64> = (0..6).map(|i| u64::MAX - i).collect();
         let tries = rounds_over(&first, |n| 10 + n);
         for seq in &first {
@@ -1070,7 +1086,7 @@ mod tests {
             time_ms: 11,
         };
         let bytes = encode(&cursor).unwrap();
-        assert!(bytes.starts_with(b"{\"v\":2,\"d\":"));
+        assert!(bytes.starts_with(b"{\"v\":3,\"d\":"));
         assert_eq!(decode::<Cursor>(&bytes).unwrap(), cursor);
     }
 
@@ -1085,7 +1101,7 @@ mod tests {
 
     #[test]
     fn test_record_of_another_schema_is_corrupt() {
-        let bytes = br#"{"v":3,"d":{"generation":1}}"#;
+        let bytes = br#"{"v":4,"d":{"generation":1}}"#;
         assert_eq!(
             decode::<Floor>(bytes).unwrap_err(),
             AppError::Store(StoreError::Corrupt)
@@ -1099,6 +1115,8 @@ mod tests {
     #[test]
     fn test_parked_entry_debug_hides_the_message() {
         let parked = ParkedEntry {
+            seq: 1,
+            generation: 1,
             sender: [1; 32],
             cert: SignedDoc::from_parts(b"{}", &[0; 64]),
             accepted_at_ms: 1,

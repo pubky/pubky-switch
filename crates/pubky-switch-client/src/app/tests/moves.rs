@@ -1368,10 +1368,55 @@ async fn test_loss_keeps_an_owed_call_from_the_lost_generation_and_makes_it() {
     assert!(app.reader().scan_raw("owed/").await.unwrap().is_empty());
 }
 
+/// `entries` entries stored for good, with plaintexts of `bytes`, written into `store` as
+/// reads would have stored them, in commits that each fit; returns them by local ID.
+async fn store_entries(
+    lost: &Lost,
+    store: &Arc<MemoryStore>,
+    entries: u64,
+    bytes: usize,
+) -> std::collections::BTreeMap<u64, crate::app::state::ParkedEntry> {
+    let mut app = App::load(
+        lost.router
+            .env(&lost.w, Arc::clone(store) as Arc<dyn StateStore>),
+        Arc::clone(&lost.protocol) as Arc<dyn Protocol>,
+        World::config(),
+        app_keys("wallet").app_id_bytes(),
+    )
+    .await
+    .unwrap();
+    let mut kept = std::collections::BTreeMap::new();
+    for chunk in (0..entries).collect::<Vec<_>>().chunks(64) {
+        let mut tx = app.tx().unwrap();
+        for n in chunk {
+            let id = n + 1;
+            let stored = crate::app::state::ParkedEntry {
+                seq: 3 + n,
+                generation: 1,
+                sender: lost.w.bob.public(),
+                cert: lost.w.bob_cert.signed().clone(),
+                accepted_at_ms: lost.w.clock.now_ms(),
+                plaintext: vec![0xff; bytes],
+                context: None,
+                reason: ParkReason::Refused,
+                round: 0,
+            };
+            tx.put(&crate::app::state::key::parked(id), &stored)
+                .unwrap();
+            kept.insert(id, stored);
+        }
+        tx.put(crate::app::state::key::STORED_NEXT, &(entries + 1))
+            .unwrap();
+        app.commit(tx).await.unwrap();
+    }
+    kept
+}
+
 #[tokio::test]
-async fn test_loss_a_second_time_keeps_every_entry_stored_locally() {
+async fn test_stored_entries_keep_their_ids_across_two_losses_in_order() {
     let store = Arc::new(MemoryStore::new());
     let lost = lost_world(Arc::clone(&store) as Arc<dyn StateStore>).await;
+    let kept = store_entries(&lost, &store, 3, 16).await;
     let load = || async {
         App::load(
             lost.router
@@ -1383,33 +1428,76 @@ async fn test_loss_a_second_time_keeps_every_entry_stored_locally() {
         .await
         .unwrap()
     };
-    // Two entries stored for good before the first loss.
-    {
-        let mut app = load().await;
-        let mut tx = app.tx().unwrap();
-        for seq in [3u64, 4] {
-            let stored = crate::app::state::ParkedEntry {
-                sender: lost.w.bob.public(),
-                cert: lost.w.bob_cert.signed().clone(),
-                accepted_at_ms: lost.w.clock.now_ms(),
-                plaintext: b"kept".to_vec(),
-                context: None,
-                reason: ParkReason::Refused,
-                round: 0,
-            };
-            tx.put(&crate::app::state::key::parked(seq), &stored)
-                .unwrap();
-        }
-        app.commit(tx).await.unwrap();
-    }
-    // The first loss renumbers them to the top of the `seq`s, the second again.
-    lost.router.remove(NEXT);
-    let _ = follow_loss(&lost, Arc::clone(&store) as Arc<dyn StateStore>).await;
-    assert_eq!(load().await.state.parked.len(), 2);
+    // Two losses: neither writes the stored entries again, so each keeps its ID, its
+    // `seq` and generation, and their order.
+    let (app, _) = follow_loss(&lost, Arc::clone(&store) as Arc<dyn StateStore>)
+        .await
+        .unwrap();
+    assert_eq!(app.cursor().generation, 2);
+    assert_eq!(load().await.state.parked, kept);
     let _third = third_recovering(&lost.w, &lost.router, 3, 2);
     let _ = follow_loss(&lost, Arc::clone(&store) as Arc<dyn StateStore>).await;
     let app = load().await;
-    assert_eq!(app.state.parked.len(), 2, "{:?}", app.state.parked.keys());
+    assert_eq!(app.cursor().generation, 3);
+    assert_eq!(app.state.parked, kept);
+    // An entry stored after them takes the next ID.
+    assert_eq!(app.state.next_stored_id, 4);
+}
+
+#[tokio::test]
+async fn test_loss_starts_with_more_entries_stored_than_one_commit_takes() {
+    let store = Arc::new(MemoryStore::new());
+    let lost = lost_world(Arc::clone(&store) as Arc<dyn StateStore>).await;
+    // 420 entries of the largest plaintext, 64 KiB, 87 KiB each as stored, about 36 MiB
+    // in all: writing them again in the loss's first commit would take it past the 32 MiB
+    // batch size.
+    let kept = store_entries(&lost, &store, 420, 64 * 1024).await;
+    let (app, events) = follow_loss(&lost, Arc::clone(&store) as Arc<dyn StateStore>)
+        .await
+        .unwrap();
+    assert!(has(&events, |e| matches!(
+        e,
+        AppEvent::ProviderRecovered { generation: 2 }
+    )));
+    assert_eq!(app.cursor().generation, 2);
+    assert_eq!(app.state.parked.len(), kept.len());
+}
+
+#[tokio::test]
+async fn test_new_feed_entry_at_a_stored_entrys_seq_meets_none_of_it() {
+    let store = Arc::new(MemoryStore::new());
+    let lost = lost_world(Arc::clone(&store) as Arc<dyn StateStore>).await;
+    let (mut app, _) = follow_loss(&lost, Arc::clone(&store) as Arc<dyn StateStore>)
+        .await
+        .unwrap();
+    let me = app.app_id();
+    // A note at the new service, at a `seq` a stored entry of the lost generation was read
+    // at too.
+    let seq = note_at(&lost.w, &lost.next, me, "after the loss");
+    let mut tx = app.tx().unwrap();
+    let stored = crate::app::state::ParkedEntry {
+        seq,
+        generation: 1,
+        sender: lost.w.bob.public(),
+        cert: lost.w.bob_cert.signed().clone(),
+        accepted_at_ms: lost.note_at_ms,
+        plaintext: b"kept".to_vec(),
+        context: None,
+        reason: ParkReason::Refused,
+        round: 0,
+    };
+    let id = app.state.next_stored_id;
+    tx.put(&crate::app::state::key::parked(id), &stored)
+        .unwrap();
+    tx.put(crate::app::state::key::STORED_NEXT, &(id + 1))
+        .unwrap();
+    app.commit(tx).await.unwrap();
+    app.state.parked.insert(id, stored.clone());
+    app.state.next_stored_id = id + 1;
+    let report = app.receive(None).await.unwrap();
+    assert!(received(&report.events, seq), "{:?}", report.events);
+    // The stored entry is as it was, under its ID.
+    assert_eq!(app.state.parked.get(&id), Some(&stored));
 }
 
 #[tokio::test]
@@ -2525,7 +2613,7 @@ async fn test_key_change_effect_resend_past_the_window_parks_its_entry() {
     assert!(
         has(&report.events, |e| matches!(
             e,
-            AppEvent::Parked { id: Some(_), seq: s, reason: ParkReason::Uncertain } if *s == seq
+            AppEvent::Parked { id: Some(_), seq: s, reason: ParkReason::Uncertain, .. } if *s == seq
         )),
         "{:?}",
         report.events
@@ -2583,6 +2671,55 @@ async fn test_store_of_the_earlier_schema_fails_as_an_old_schema() {
         matches!(
             loaded,
             Err(AppError::Store(StoreError::OldSchema { found: 1 }))
+        ),
+        "{:?}",
+        loaded.map(|_| ())
+    );
+}
+
+#[tokio::test]
+async fn test_store_of_schema_two_with_entries_keyed_by_seq_fails_as_an_old_schema() {
+    let w = World::new();
+    let router = Router::of(&w);
+    let app = join(&w, &router).await;
+    let me = app.app_id();
+    // An entry stored as schema 2 kept it: under the `seq` it was read at, which it didn't
+    // hold itself.
+    let stored = crate::app::state::ParkedEntry {
+        seq: 7,
+        generation: 1,
+        sender: w.bob.public(),
+        cert: w.bob_cert.signed().clone(),
+        accepted_at_ms: w.clock.now_ms(),
+        plaintext: b"kept".to_vec(),
+        context: None,
+        reason: ParkReason::Refused,
+        round: 0,
+    };
+    let mut value = serde_json::to_value(&stored).unwrap();
+    value.as_object_mut().unwrap().remove("seq");
+    value.as_object_mut().unwrap().remove("generation");
+    let mut batch = crate::store::WriteBatch::new();
+    batch
+        .put(
+            &app.ns,
+            crate::app::state::key::parked(7).into_bytes(),
+            serde_json::to_vec(&json!({ "v": 2, "d": value })).unwrap(),
+        )
+        .unwrap();
+    app.env.store.commit(batch).await.unwrap();
+    drop(app);
+    let loaded = App::load(
+        router.env(&w, Arc::clone(&w.store) as Arc<dyn StateStore>),
+        w.protocol.clone(),
+        World::config(),
+        me,
+    )
+    .await;
+    assert!(
+        matches!(
+            loaded,
+            Err(AppError::Store(StoreError::OldSchema { found: 2 }))
         ),
         "{:?}",
         loaded.map(|_| ())
@@ -2721,7 +2858,7 @@ async fn test_move_settling_an_applied_effect_clears_its_retry_count() {
     let report = app.receive(None).await.unwrap();
     assert!(received(&report.events, seq), "{:?}", report.events);
     // Settled at the switch: processed, its count gone, in memory and in the store.
-    assert!(app.state.retries.is_empty());
+    assert!(app.no_retries());
     let loaded = App::load(
         router.env(&w, Arc::clone(&w.store) as Arc<dyn StateStore>),
         w.protocol.clone(),
@@ -2730,7 +2867,7 @@ async fn test_move_settling_an_applied_effect_clears_its_retry_count() {
     )
     .await
     .unwrap();
-    assert!(loaded.state.retries.is_empty());
+    assert!(loaded.no_retries());
 }
 
 #[tokio::test]
@@ -2904,7 +3041,7 @@ async fn test_key_change_parks_a_kept_effect_older_than_the_batch_window() {
     assert_eq!(w.effects(), 1);
     assert!(app.cursor().seq >= seq);
     assert_eq!(
-        app.state.parked.get(&seq).map(|p| p.reason),
+        app.stored_at(seq).map(|p| p.reason),
         Some(ParkReason::Uncertain)
     );
     assert_eq!(
@@ -3083,7 +3220,7 @@ async fn test_kept_effect_past_the_window_isnt_sent_again_at_the_same_generation
             "{forgotten}"
         );
         assert_eq!(
-            app.state.parked.get(&seq).map(|p| p.reason),
+            app.stored_at(seq).map(|p| p.reason),
             Some(ParkReason::Uncertain)
         );
         w.switch.lock().faults.clear();
@@ -3280,7 +3417,8 @@ async fn test_loss_reports_the_attempts_of_a_kept_effect_it_drops() {
         local: Vec::new(),
         cursor_to: None,
         past_held: false,
-        parked: false,
+        generation: 1,
+        stored: None,
         deadlines: Vec::new(),
         kept_ms: Some(lost.note_at_ms),
         entry: crate::app::state::KeptEntry {
@@ -3346,7 +3484,8 @@ async fn keep_an_effect(
         local: Vec::new(),
         cursor_to: None,
         past_held,
-        parked,
+        generation: 1,
+        stored: parked.then_some(seq),
         deadlines: Vec::new(),
         kept_ms: Some(w.clock.now_ms()),
         entry: entry.clone(),
@@ -3356,6 +3495,8 @@ async fn keep_an_effect(
         .unwrap();
     if parked {
         let stored = crate::app::state::ParkedEntry {
+            seq,
+            generation: 1,
             sender: w.bob.public(),
             cert: entry.cert,
             accepted_at_ms: pending.accepted_at_ms,
@@ -3395,7 +3536,7 @@ async fn test_uncertain_park_of_an_entry_stored_before_changes_its_reason() {
     );
     // The entry stored before keeps its plaintext; only its reason changes, and it is
     // processed.
-    let stored = app.state.parked.get(&seq).unwrap();
+    let stored = app.stored_at(seq).unwrap();
     assert_eq!(stored.reason, ParkReason::Uncertain);
     assert_eq!(stored.plaintext, pending.entry.plaintext);
     assert!(
@@ -3431,7 +3572,7 @@ async fn test_uncertain_park_of_an_entry_past_a_held_one_keeps_the_cursor() {
     );
     // Past a held entry, it is marked seen; the cursor doesn't pass the held one for it.
     assert_eq!(
-        app.state.parked.get(&seq).map(|p| p.reason),
+        app.stored_at(seq).map(|p| p.reason),
         Some(ParkReason::Uncertain)
     );
     assert!(app.state.seen.contains(&seq));
@@ -3471,7 +3612,7 @@ async fn test_kept_effect_refused_for_its_bytes_is_parked_at_once() {
             report.events
         );
         assert_eq!(
-            app.state.parked.get(&seq).map(|p| p.reason),
+            app.stored_at(seq).map(|p| p.reason),
             Some(ParkReason::Uncertain)
         );
         assert!(app.state.pending_effect.is_none());

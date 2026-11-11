@@ -56,7 +56,10 @@ pub struct OpaqueRule {
 /// protocol for check 10 ([`Protocol::check_body`]) and its effect ([`Protocol::receive`]).
 #[derive(Clone, Debug)]
 pub struct ReceivedMessage {
-    /// The entry's `seq` in the current generation.
+    /// The `seq` the entry was read at: in the current generation for an entry of the
+    /// feed, and for one stored locally (`parked`) in the generation it was read at, which
+    /// a provider change since may have left behind. A stored entry's handle is its local
+    /// ID ([`super::AppEvent::Parked`]), not this `seq`.
     pub seq: u64,
     /// The sender identity.
     pub sender: [u8; 32],

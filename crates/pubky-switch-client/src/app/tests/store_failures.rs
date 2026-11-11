@@ -223,7 +223,7 @@ async fn test_receive_retry_keeps_the_entry_and_applies_it_at_the_next_read() {
     assert_eq!(w.effects(), 0);
     assert_eq!(app.protocol_get(FAILED_STEP).await.unwrap(), None);
     assert_eq!(note_kept(&app, &message).await, None);
-    assert_eq!(app.state.retries.get(&seq).map(|r| r.reads), Some(1));
+    assert_eq!(app.retry_reads_at(seq), Some(1));
     // A peek still shows it: it runs no receive step.
     let peeked = app.peek().await.unwrap();
     assert!(
@@ -251,13 +251,10 @@ async fn test_receive_retry_keeps_the_entry_and_applies_it_at_the_next_read() {
         Some(FLAKY.as_bytes().to_vec())
     );
     assert_eq!(app.protocol_get(FAILED_STEP).await.unwrap(), None);
-    assert!(
-        app.state.retries.is_empty(),
-        "the count goes with the entry"
-    );
+    assert!(app.no_retries(), "the count goes with the entry");
     // Reloaded from the store: nothing of the retry is left.
     let app = load_flaky(&w, &protocol, app.app_id()).await;
-    assert!(app.state.retries.is_empty());
+    assert!(app.no_retries());
 }
 
 #[tokio::test]
@@ -335,7 +332,7 @@ async fn test_receive_retry_repeated_raises_store_failing_and_keeps_the_entry() 
     assert!(store_failing(&report.events).is_empty());
     assert_eq!(report.cursor.seq, seq);
     assert_eq!(w.effects(), 1);
-    assert!(app.state.retries.is_empty());
+    assert!(app.no_retries());
 }
 
 #[test]
@@ -367,7 +364,7 @@ async fn test_receive_retry_after_a_need_commits_nothing_and_applies_later() {
     assert!(report.cursor.seq < seq);
     assert_eq!(w.effects(), 0);
     assert_eq!(app.protocol_get(FAILED_STEP).await.unwrap(), None);
-    assert_eq!(app.state.retries.get(&seq).map(|r| r.reads), Some(1));
+    assert_eq!(app.retry_reads_at(seq), Some(1));
     // The next read asks again, and applies.
     let report = app.receive(None).await.unwrap();
     assert_eq!(protocol.calls(), 4);
@@ -442,7 +439,7 @@ async fn test_receive_retry_unavailable_is_held_for_the_wait_then_parked_and_pro
     let calls = protocol.calls();
     let report = app.receive(None).await.unwrap();
     assert_eq!(protocol.calls(), calls + 1);
-    assert!(app.state.parked.contains_key(&seq));
+    assert!(app.stored_at(seq).is_some());
     assert!(
         !report
             .events
@@ -457,13 +454,10 @@ async fn test_receive_retry_unavailable_is_held_for_the_wait_then_parked_and_pro
         report
             .events
             .iter()
-            .any(|e| matches!(e, AppEvent::Unparked { seq: s } if *s == seq))
+            .any(|e| matches!(e, AppEvent::Unparked { seq: s, .. } if *s == seq))
     );
     assert!(app.state.parked.is_empty());
-    assert!(
-        app.state.retries.is_empty(),
-        "the count goes once it is processed"
-    );
+    assert!(app.no_retries(), "the count goes once it is processed");
     assert_eq!(w.effects(), 1);
     assert_eq!(protocol.applied(), 1);
     assert_eq!(
@@ -490,13 +484,13 @@ async fn test_receive_retry_count_goes_on_while_the_entry_is_stored_locally() {
         Some(ParkReason::StoreUnavailable)
     );
     assert!(store_failing(&report.events).is_empty());
-    assert_eq!(app.state.retries.get(&seq).map(|r| r.reads), Some(2));
+    assert_eq!(app.retry_reads_at(seq), Some(2));
     // Stored, it is tried at each read with the store still failing: the count goes on,
     // and the host learns of it from the third read in a row.
     for reads in RETRY_EVENT_READS..RETRY_EVENT_READS + 3 {
         let report = app.receive(None).await.unwrap();
         assert_eq!(store_failing(&report.events), vec![(seq, reads)]);
-        assert!(app.state.parked.contains_key(&seq));
+        assert!(app.stored_at(seq).is_some());
     }
     // Kept in the store with the entry: loaded again, the app counts on.
     let mut app = load_flaky(&w, &protocol, app.app_id()).await;
@@ -522,7 +516,7 @@ async fn test_receive_retries_a_bounded_number_of_stored_entries_each_read_in_tu
     app.receive(None).await.unwrap();
     for seq in &seqs {
         assert_eq!(
-            app.state.parked.get(seq).map(|p| p.reason),
+            app.stored_at(*seq).map(|p| p.reason),
             Some(ParkReason::StoreUnavailable)
         );
     }
@@ -583,7 +577,7 @@ async fn test_receive_retry_count_goes_when_a_resumed_effect_applies_a_stored_en
     app.receive(None).await.unwrap();
     w.clock.advance_ms(PARK_AFTER_MS);
     app.receive(None).await.unwrap();
-    assert_eq!(app.state.retries.get(&seq).map(|r| r.reads), Some(2));
+    assert_eq!(app.retry_reads_at(seq), Some(2));
     // The store heals; the stored entry's effect is applied, but its answer is lost.
     protocol.heal();
     w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
@@ -592,10 +586,10 @@ async fn test_receive_retry_count_goes_when_a_resumed_effect_applies_a_stored_en
     // The next read sends it again: applied once, the entry processed, its count gone.
     app.receive(None).await.unwrap();
     assert!(app.state.parked.is_empty());
-    assert!(app.state.retries.is_empty(), "{:?}", app.state.retries);
+    assert!(app.no_retries(), "{:?}", app.state.retries);
     assert_eq!(w.effects(), 1);
     let app = load_flaky(&w, &protocol, app.app_id()).await;
-    assert!(app.state.retries.is_empty(), "and in the store");
+    assert!(app.no_retries(), "and in the store");
 }
 
 #[tokio::test]
@@ -607,7 +601,7 @@ async fn test_receive_retry_count_goes_when_a_stored_entry_is_parked_as_uncertai
     app.receive(None).await.unwrap();
     w.clock.advance_ms(PARK_AFTER_MS);
     app.receive(None).await.unwrap();
-    assert_eq!(app.state.retries.get(&seq).map(|r| r.reads), Some(2));
+    assert_eq!(app.retry_reads_at(seq), Some(2));
     // The store heals; the stored entry's effect is sent, its answer lost.
     protocol.heal();
     w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
@@ -618,12 +612,12 @@ async fn test_receive_retry_count_goes_when_a_stored_entry_is_parked_as_uncertai
         .advance_ms(crate::app::provider::KEPT_BATCH_ANSWER_MS);
     app.receive(None).await.unwrap();
     assert_eq!(
-        app.state.parked.get(&seq).map(|p| p.reason),
+        app.stored_at(seq).map(|p| p.reason),
         Some(ParkReason::Uncertain)
     );
-    assert!(app.state.retries.is_empty(), "{:?}", app.state.retries);
+    assert!(app.no_retries(), "{:?}", app.state.retries);
     let app = load_flaky(&w, &protocol, app.app_id()).await;
-    assert!(app.state.retries.is_empty(), "and in the store");
+    assert!(app.no_retries(), "and in the store");
 }
 
 #[tokio::test]
@@ -640,7 +634,7 @@ async fn test_receive_retry_of_the_entry_is_parked_at_once() {
     );
     // Not held: the cursor passes it and the later note in the same read.
     assert!(report.cursor.seq >= later);
-    assert!(app.state.retries.is_empty());
+    assert!(app.no_retries());
     assert_eq!(w.effects(), 1, "the later note only");
     assert_eq!(app.protocol_get(FAILED_STEP).await.unwrap(), None);
     // Tried again at the next read, in case the host repaired the store.
@@ -649,7 +643,7 @@ async fn test_receive_retry_of_the_entry_is_parked_at_once() {
         report
             .events
             .iter()
-            .any(|e| matches!(e, AppEvent::Unparked { seq: s } if *s == seq))
+            .any(|e| matches!(e, AppEvent::Unparked { seq: s, .. } if *s == seq))
     );
     assert_eq!(w.effects(), 2);
 }
@@ -907,7 +901,7 @@ async fn test_restore_of_a_layered_backup_keeps_the_entries_stored_locally() {
     let mut app = join_flaky(&w, &protocol, "wallet").await;
     let (seq, message) = w.note(app.app_id(), FLAKY);
     app.receive(None).await.unwrap();
-    assert!(app.state.parked.contains_key(&seq));
+    assert!(app.stored_at(seq).is_some());
     assert!(app.cursor().seq >= seq, "passed");
     let backup = layered(&mut app).await;
     // Restored with a store that works: the entry the cursor passed is still processed.
@@ -925,10 +919,37 @@ async fn test_restore_of_a_layered_backup_keeps_the_entries_stored_locally() {
         report
             .events
             .iter()
-            .any(|e| matches!(e, AppEvent::Unparked { seq: s } if *s == seq))
+            .any(|e| matches!(e, AppEvent::Unparked { seq: s, .. } if *s == seq))
     );
     assert_eq!(handed(&again), vec![message.msg_id.clone()]);
     assert_eq!(w.effects(), 1);
+}
+
+#[tokio::test]
+async fn test_restore_of_a_layered_backup_stores_the_next_entry_under_a_new_id() {
+    let w = World::new();
+    let protocol = FlakyProtocol::failing(u32::MAX, StoreError::Corrupt, Mode::Plain);
+    let mut app = join_flaky(&w, &protocol, "wallet").await;
+    let (first, _) = w.note(app.app_id(), FLAKY);
+    app.receive(None).await.unwrap();
+    let first_id = app.stored_id_at(first).unwrap();
+    let backup = layered(&mut app).await;
+    // Restored into an empty store, whose protocol still fails: the next entry stored
+    // takes an ID past the restored one's, so neither replaces the other.
+    let mut restored = App::restore(
+        w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
+        protocol.clone(),
+        flaky_config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    let (second, _) = w.note(restored.app_id(), FLAKY);
+    restored.receive(None).await.unwrap();
+    assert_eq!(restored.stored_id_at(first), Some(first_id));
+    let second_id = restored.stored_id_at(second).unwrap();
+    assert!(second_id > first_id, "{second_id} after {first_id}");
+    assert_eq!(restored.stored_seqs(), vec![first, second]);
 }
 
 #[tokio::test]
@@ -1671,7 +1692,7 @@ async fn restorable(app: &App) -> Restorable {
         app.protocol_scan(b"").await.unwrap(),
         app.cursor(),
         app.state.seen.clone(),
-        app.state.parked.keys().copied().collect::<Vec<_>>(),
+        app.stored_seqs(),
         processed,
     )
 }
@@ -1700,4 +1721,187 @@ async fn test_backup_layered_right_after_a_read_restores_exactly_that_state() {
     .await
     .unwrap();
     assert_eq!(restorable(&restored).await, before);
+}
+
+/// Bob's note, its effect refused for good at the service: stored for good. Returns the
+/// local ID it was stored under.
+async fn stored_for_good(w: &World, app: &mut App, text: &str) -> u64 {
+    let (seq, _) = w.note(app.app_id(), text);
+    // The fault may meet another request first: the note is tried until it is stored.
+    for _ in 0..3 {
+        w.switch.fail_next(Fault::Error {
+            path: "ops".into(),
+            code: ErrorCode::PermissionMissing,
+            current: serde_json::json!(null),
+        });
+        app.receive(None).await.unwrap();
+        if let Some(id) = app.stored_id_at(seq) {
+            return id;
+        }
+    }
+    panic!("the note at seq {seq} wasn't stored");
+}
+
+#[tokio::test]
+async fn test_restore_in_place_gives_out_no_stored_id_a_carried_duty_event_names() {
+    let w = World::new();
+    let protocol = FlakyProtocol::new(0);
+    let mut app = join_flaky(&w, &protocol, "wallet").await;
+    let me = app.app_id();
+    // A backup with no entry stored, then one stored for good after it, which duty events
+    // name; a later note moves the cursor at the service past it.
+    let backup = app.backup_layered().await.unwrap();
+    let old_id = stored_for_good(&w, &mut app, "refused").await;
+    w.note(me, "steady");
+    app.receive(None).await.unwrap();
+    app.flush_cursor().await.unwrap();
+    drop(app);
+    // Restored in place from the older backup: the duty events are carried, and the entry
+    // stored after the backup is read again and applies.
+    let mut restored = App::restore(w.env(), protocol.clone(), flaky_config(), &backup)
+        .await
+        .unwrap();
+    let carried: Vec<u64> = restored
+        .take_events()
+        .iter()
+        .filter_map(|e| match e {
+            AppEvent::Parked { stored_id, .. } | AppEvent::EffectRefused { stored_id, .. } => {
+                Some(*stored_id)
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(carried.contains(&old_id), "{carried:?}");
+    restored.receive(None).await.unwrap();
+    // An entry stored for good now takes an ID no carried event names.
+    let new_id = stored_for_good(&w, &mut restored, "refused again").await;
+    assert!(new_id > old_id, "ID {new_id} given out again");
+}
+
+#[tokio::test]
+async fn test_restore_of_a_current_backup_gives_out_no_id_of_an_entry_processed_before() {
+    let w = World::new();
+    let protocol = FlakyProtocol::new(0);
+    let mut app = join_flaky(&w, &protocol, "wallet").await;
+    let first = stored_for_good(&w, &mut app, "refused").await;
+    drop(app);
+    // A later entry stored for the store's failure, then processed: the highest ID is gone.
+    let flaky = FlakyProtocol::failing(1, StoreError::Corrupt, Mode::Plain);
+    let mut app = load_flaky(&w, &flaky, app_keys("wallet").app_id_bytes()).await;
+    let (later, _) = w.note(app.app_id(), FLAKY);
+    app.receive(None).await.unwrap();
+    let processed = app.stored_id_at(later).unwrap();
+    assert!(processed > first);
+    app.receive(None).await.unwrap();
+    assert_eq!(app.stored_id_at(later), None);
+    assert_eq!(app.stored_seqs().len(), 1);
+    // A backup of that state, restored onto a new store: the next entry stored takes an
+    // ID past the processed one's, which the host may have been handed.
+    let backup = layered(&mut app).await;
+    let mut restored = App::restore(
+        w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
+        protocol.clone(),
+        flaky_config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    restored.receive(None).await.unwrap();
+    let new_id = stored_for_good(&w, &mut restored, "refused again").await;
+    assert!(new_id > processed, "ID {new_id} given out again");
+}
+
+#[tokio::test]
+async fn test_stored_id_counter_survives_a_reload_after_the_highest_is_processed() {
+    let w = World::new();
+    let flaky = FlakyProtocol::failing(1, StoreError::Corrupt, Mode::Plain);
+    let mut app = join_flaky(&w, &flaky, "wallet").await;
+    let (seq, _) = w.note(app.app_id(), FLAKY);
+    app.receive(None).await.unwrap();
+    let id = app.stored_id_at(seq).unwrap();
+    app.receive(None).await.unwrap();
+    assert!(app.stored_seqs().is_empty());
+    drop(app);
+    // Loaded again with no entry stored: the counter, not the entries, gives the next ID.
+    let flaky = FlakyProtocol::failing(1, StoreError::Corrupt, Mode::Plain);
+    let mut app = load_flaky(&w, &flaky, app_keys("wallet").app_id_bytes()).await;
+    let (next, _) = w.note(app.app_id(), FLAKY);
+    app.receive(None).await.unwrap();
+    let next_id = app.stored_id_at(next).unwrap();
+    assert!(next_id > id, "ID {next_id} given out again");
+}
+
+#[tokio::test]
+async fn test_restore_in_place_of_an_older_backup_gives_out_no_id_the_store_gave_out() {
+    let w = World::new();
+    let flaky = FlakyProtocol::failing(1, StoreError::Corrupt, Mode::Plain);
+    let mut app = join_flaky(&w, &flaky, "wallet").await;
+    let backup = app.backup_layered().await.unwrap();
+    // After the backup, an entry stored for the store's failure, then processed: no duty
+    // event names it, and no entry is stored.
+    let (seq, _) = w.note(app.app_id(), FLAKY);
+    app.receive(None).await.unwrap();
+    let id = app.stored_id_at(seq).unwrap();
+    app.receive(None).await.unwrap();
+    assert!(app.stored_seqs().is_empty());
+    app.flush_cursor().await.unwrap();
+    drop(app);
+    // Restored in place from the older backup, the store still failing once: the note is
+    // read again and stored again, under an ID the store's counter puts past the first.
+    let flaky = FlakyProtocol::failing(1, StoreError::Corrupt, Mode::Plain);
+    let mut restored = App::restore(w.env(), flaky.clone(), flaky_config(), &backup)
+        .await
+        .unwrap();
+    restored.receive(None).await.unwrap();
+    let again = restored.stored_id_at(seq).unwrap();
+    assert!(again > id, "ID {again} given out again");
+}
+
+#[tokio::test]
+async fn test_restore_in_place_over_an_unreadable_counter_gives_out_no_id_an_event_names() {
+    let w = World::new();
+    let protocol = FlakyProtocol::new(0);
+    let mut app = join_flaky(&w, &protocol, "wallet").await;
+    let backup = app.backup_layered().await.unwrap();
+    let old_id = stored_for_good(&w, &mut app, "refused").await;
+    // The store's counter no longer reads, and the entry's record is gone: only the duty
+    // events that name it are left of its ID.
+    let mut tx = app.tx().unwrap();
+    tx.put(crate::app::state::key::STORED_NEXT, &"unreadable")
+        .unwrap();
+    tx.delete(&crate::app::state::key::parked(old_id)).unwrap();
+    app.commit(tx).await.unwrap();
+    drop(app);
+    let mut restored = App::restore(w.env(), protocol.clone(), flaky_config(), &backup)
+        .await
+        .unwrap();
+    restored.receive(None).await.unwrap();
+    let new_id = stored_for_good(&w, &mut restored, "refused again").await;
+    assert!(new_id > old_id, "ID {new_id} given out again");
+}
+
+#[tokio::test]
+async fn test_restore_in_place_over_an_unreadable_counter_gives_out_no_id_the_store_holds() {
+    let w = World::new();
+    let flaky = FlakyProtocol::failing(u32::MAX, StoreError::Corrupt, Mode::Plain);
+    let mut app = join_flaky(&w, &flaky, "wallet").await;
+    let backup = app.backup_layered().await.unwrap();
+    // An entry stored for the store's failure, which no duty event names; then the
+    // store's counter no longer reads.
+    let (seq, _) = w.note(app.app_id(), FLAKY);
+    app.receive(None).await.unwrap();
+    let id = app.stored_id_at(seq).unwrap();
+    let mut tx = app.tx().unwrap();
+    tx.put(crate::app::state::key::STORED_NEXT, &"unreadable")
+        .unwrap();
+    app.commit(tx).await.unwrap();
+    drop(app);
+    // Restored in place from the older backup: the note is read again and stored again,
+    // past the ID the store held.
+    let mut restored = App::restore(w.env(), flaky.clone(), flaky_config(), &backup)
+        .await
+        .unwrap();
+    restored.receive(None).await.unwrap();
+    let again = restored.stored_id_at(seq).unwrap();
+    assert!(again > id, "ID {again} given out again");
 }
