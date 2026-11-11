@@ -20,7 +20,9 @@ pub enum AdmissionEnd {
     /// The signer, at `POST /recovery/admission`: an `admission` transition records it.
     Signer,
     /// A recovery upload carrying `lists.contacts` from the app `by`, which holds
-    /// `lists.manage`: the upload's own transition records it, in the same transaction.
+    /// `lists.manage`, in the upload's transaction. No transition records it: the `upload`
+    /// transition carries only `by`, `changes`, `proofs` and `at` (Switch wire 6.5), and the
+    /// signer reads the end in `GET /apps`'s `recovery.admission_staged` (7.4.12).
     Upload {
         /// The uploading app.
         by: [u8; 16],
@@ -83,8 +85,8 @@ impl Service {
     /// (Switch spec 12.6 step 2; Switch wire 7.4.14). Idempotent: when admission isn't
     /// staged, or no longer is, it writes nothing, no transition included, and gives `None`.
     /// Ended by the signer, it chains the `admission` transition, signed with `signer`, the
-    /// account's key, and gives its proof; ended by an upload, it gives `None`, the upload's
-    /// transition being the one that records it.
+    /// account's key, and gives its proof; ended by an upload, it chains nothing and gives
+    /// `None` ([`AdmissionEnd::Upload`]).
     pub(crate) async fn end_staged_admission(
         &self,
         txn: &mut AccountTxn,
