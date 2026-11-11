@@ -425,14 +425,18 @@ impl App {
     /// After a restore, before reading (Switch spec 12.4 step 1): read the own current
     /// receive key record; if the restored key isn't it, register a fresh key, `n` one
     /// higher, and ask about a registration since the backup the app can't account for.
-    pub(crate) async fn check_key_after_restore(&mut self) -> Result<(), AppError> {
+    /// `current` is the own receive key record the directory shows, read with the listed
+    /// certificate ([`App::take_listed_cert`]).
+    pub(crate) async fn check_key_after_restore(
+        &mut self,
+        current: Option<ReceiveKeyRecord>,
+    ) -> Result<(), AppError> {
         let Some(restore) = self.state.restore.clone() else {
             return Ok(());
         };
         if restore.key_checked {
             return Ok(());
         }
-        let current = self.own_directory_key().await?;
         let mut tx = self.tx()?;
         let mut register = None;
         if let Some(record) = current

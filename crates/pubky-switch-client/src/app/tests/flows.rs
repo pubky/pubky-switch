@@ -1361,6 +1361,72 @@ async fn test_app_restore_takes_no_listed_certificate_it_cant_verify() {
     );
 }
 
+/// The directory's newer document removes the app: the restored read stops there, and
+/// neither checks its receive key nor registers one at this switch.
+#[tokio::test]
+async fn test_app_restore_removed_by_a_newer_document_registers_nothing() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let me = app.app_id();
+    let backup = backup_then_rotate(&w, &mut app).await;
+    drop(app);
+    w.next_doc(|body| {
+        body.apps.retain(|a| a.app_id != me);
+        body.removed.push(RemovedApp {
+            app_id: me,
+            distrust_from: START,
+        });
+    });
+    let applied = w.switch.applied().len();
+    let (mut restored, _) = restored(&w, &backup).await;
+    let report = restored.receive(None).await.unwrap();
+    assert!(report.stopped);
+    assert!(
+        has(&report.events, |e| matches!(e, AppEvent::Removed)),
+        "{:?}",
+        report.events
+    );
+    assert_eq!(w.switch.applied().len(), applied, "nothing registered");
+}
+
+/// A listed certificate that isn't a renewal of the one held, an earlier one, isn't taken.
+#[tokio::test]
+async fn test_app_restore_takes_no_listed_certificate_older_than_its_own() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let me = app.app_id();
+    let first = app.cert().clone();
+    let before = w.switch.app(&me);
+    w.clock.advance_ms(HOUR);
+    renew_listed(&w, &app);
+    app.receive(None).await.unwrap();
+    app.receive(None).await.unwrap();
+    let renewed = app.cert().clone();
+    assert_ne!(renewed.hash(), first.hash());
+    let backup = app.backup().await.unwrap();
+    drop(app);
+    // The switch holds the first certificate's record again, and a newer document lists it.
+    {
+        let mut inner = w.switch.lock();
+        let held = inner.apps.get_mut(&me).unwrap();
+        held.record = before.record.clone();
+        held.cert = before.cert.clone();
+        held.renewed = None;
+    }
+    w.next_doc(|body| {
+        body.apps.retain(|a| a.app_id != me);
+        body.apps.push(ListedApp {
+            app_id: me,
+            cert: first.hash(),
+        });
+        body.renewed.clear();
+    });
+    let (mut restored, _) = restored(&w, &backup).await;
+    restored.receive(None).await.unwrap();
+    assert_eq!(restored.own_identity().listed_cert(&me), Some(first.hash()));
+    assert_eq!(restored.cert().hash(), renewed.hash());
+}
+
 #[tokio::test]
 async fn test_app_expired_certificate_is_renewed_by_the_signer_alone() {
     let w = World::new();

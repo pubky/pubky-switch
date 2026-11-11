@@ -340,8 +340,22 @@ impl App {
             .as_ref()
             .is_some_and(|restore| !restore.key_checked)
         {
-            self.take_listed_cert().await?;
-            self.check_key_after_restore().await?;
+            match self.take_listed_cert().await? {
+                super::renewal::Listed::Key(current) => {
+                    self.check_key_after_restore(current).await?;
+                }
+                // A newer own document the directory brought: the next read follows it.
+                super::renewal::Listed::NotCurrentHere => {
+                    if let Some(stop) = self.not_current_here() {
+                        self.events.push(stop);
+                    }
+                    return Ok(ReceiveReport {
+                        stopped: true,
+                        cursor: self.cursor(),
+                        ..ReceiveReport::default()
+                    });
+                }
+            }
         }
         // A renewed certificate is taken before the kept effect goes again: the effect may
         // wait on it, refused for the expired one (`403 cert_expired`).
