@@ -783,8 +783,8 @@ async fn test_keys_through_keeps_its_height_once_passed_parts_go() {
 #[tokio::test]
 async fn test_keys_a_request_stays_in_force_until_the_completing_part_is_passed() {
     // The wallet asks for a full bundle; its cursor passing epoch 1's part keeps it. The
-    // signer stores only what isn't stored yet, epoch 2, which completes the request with
-    // epoch 1's part.
+    // signer stores what isn't stored yet: epoch 3's part, then epoch 2's, which completes
+    // the request with epoch 1's part.
     let Some(replay) = replay().await else { return };
     replay_chain_through_revoke(&replay).await;
     let at = revoke_time();
@@ -797,24 +797,26 @@ async fn test_keys_a_request_stays_in_force_until_the_completing_part_is_passed(
     );
     store_parts(&replay, &[(1, 1)], 60, &at).await;
     wallet_cursor(&replay, 10, &at).await;
-    store_parts(&replay, &[(2, 2)], 61, &at).await;
+    store_parts(&replay, &[(3, 3)], 61, &at).await;
+    store_parts(&replay, &[(2, 2)], 62, &at).await;
     assert_eq!(
         full_bundle_requested(&replay, &at).await,
         Value::Null,
         "covered"
     );
-    // The next put comes before the wallet's cursor passes the part that completed it: the
-    // request is still in force, and nothing the wallet asked for goes.
-    store_parts(&replay, &[(3, 3)], 62, &at).await;
-    assert_eq!(
-        bundle_ranges(&replay, &at).await,
-        json!([[1, 1], [2, 2], [3, 3]])
-    );
-    // The move that passes the completing part ends the request's force, and drops the
-    // parts it passed and holds at once.
+    // The next put comes before the wallet's cursor passes the part that completed it (seq
+    // 12): the request is still in force, and nothing the wallet asked for goes.
+    store_parts(&replay, &[(4, 4)], 63, &at).await;
+    let all = json!([[1, 1], [2, 2], [3, 3], [4, 4]]);
+    assert_eq!(bundle_ranges(&replay, &at).await, all);
+    // A move short of it keeps them too.
     wallet_cursor(&replay, 11, &at).await;
-    assert_eq!(bundle_ranges(&replay, &at).await, json!([[3, 3]]));
-    assert_eq!(keys_through(&replay, &at).await, 2);
+    assert_eq!(bundle_ranges(&replay, &at).await, all);
+    // The move that passes it ends the request's force, and drops the parts it passed and
+    // holds at once.
+    wallet_cursor(&replay, 12, &at).await;
+    assert_eq!(bundle_ranges(&replay, &at).await, json!([[4, 4]]));
+    assert_eq!(keys_through(&replay, &at).await, 3);
     replay.db.drop_database().await.expect("drop");
 }
 
