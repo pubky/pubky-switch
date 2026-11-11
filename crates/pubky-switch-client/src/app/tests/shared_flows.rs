@@ -9,7 +9,9 @@ use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::ident::{Policy, invite_code_hash};
 use pubky_switch_core::message::MessagePlaintext;
 use pubky_switch_core::ops::{AllowKind, Condition, KeyBundlePut, OpKind, SignedOp};
-use pubky_switch_core::records::{DAY_MS, RemovedApp, seal_bundle_parts};
+use pubky_switch_core::records::{
+    CLOCK_TOLERANCE_MS, DAY_MS, RemovedApp, RenewedCert, seal_bundle_parts,
+};
 use pubky_switch_core::scopes::Permission;
 use serde_json::{Map, json};
 
@@ -1559,6 +1561,94 @@ async fn test_records_write_by_a_removed_app_after_distrust_is_flagged() {
             .any(|f| f.writer == me && f.reason.contains("distrust")),
         "{flagged:?}"
     );
+}
+
+/// `name` joins with `scopes` and every switch permission.
+async fn join_scoped(s: &Setup, name: &str, scopes: &[&str]) -> App {
+    let app = AppSpec::new(scopes).with_permissions(&ALL_PERMISSIONS);
+    let request = s.w.signer.approve(&app_keys(name), &app).unwrap();
+    App::join(s.env(), s.protocol.clone(), World::config(), request)
+        .await
+        .unwrap()
+}
+
+/// A certificate renewing `name`'s with `scopes`, issued now.
+fn renewal_of(s: &Setup, name: &str, scopes: &[&str]) -> AppCert {
+    let app = AppSpec::new(scopes).with_permissions(&ALL_PERMISSIONS);
+    crate::testing::issue_cert(&s.w.alice, &app_keys(name), &app, s.w.clock.now_ms()).unwrap()
+}
+
+/// The signer renews `name`'s certificate with `scopes` and stores it at the switch with the
+/// key bundle made for it (Switch wire 3.8 step 1). Returns it.
+fn renewed_cert(s: &Setup, name: &str, scopes: &[&str]) -> AppCert {
+    let renewed = renewal_of(s, name, scopes);
+    let target_app_id = renewed.app_id();
+    let has_keys = |scope: &str| SampleProtocol::default().has_keys(scope);
+    let epoch = s.w.switch.identity_doc().unwrap().data_epoch();
+    let mut batch = vec![OpKind::CertPut {
+        target_app_id,
+        cert: renewed.signed().clone(),
+    }];
+    for part in seal_bundle_parts(&s.w.alice, &renewed, 1, epoch, &has_keys).unwrap() {
+        batch.push(OpKind::KeyBundlePut(KeyBundlePut {
+            target_app_id,
+            bundle: part.bundle,
+            first_epoch: part.first_epoch,
+            last_epoch: part.last_epoch,
+        }));
+    }
+    s.w.switch.signer_batch(batch).unwrap();
+    renewed
+}
+
+/// The `identity.json` change that lists `renewed` in place of `earlier`, with `earlier` in
+/// `renewed` and `until` as given (Switch wire 3.3, 3.8 step 2 and "Reductions").
+fn list_renewal(body: &mut IdentityBody, earlier: &AppCert, renewed: &AppCert, until: Option<u64>) {
+    let app_id = renewed.app_id();
+    body.apps.retain(|app| app.app_id != app_id);
+    body.apps.push(ListedApp {
+        app_id,
+        cert: renewed.hash(),
+    });
+    body.renewed.retain(|entry| entry.app_id != app_id);
+    body.renewed.push(RenewedCert {
+        app_id,
+        cert: earlier.hash(),
+        until,
+    });
+}
+
+/// The scripted switch keeps, with a record, the certificate it checked the write against,
+/// and serves it in the record's views, by key and in a list, after a reduction that the
+/// writer has followed (Switch wire 7.4.9).
+#[tokio::test]
+async fn test_scripted_record_view_keeps_the_certificate_the_write_was_checked_against() {
+    let s = Setup::new();
+    let mut wallet = join_scoped(&s, "wallet", &["scope-a", "scope-c"]).await;
+    let phone = s.join("phone").await;
+    let target = s.target("n1");
+    wallet
+        .put_record(&target, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    let key = wallet.record_key(&target).unwrap();
+    s.w.clock.advance_ms(DAY_MS);
+    let earlier = wallet.cert().clone();
+    let renewed = renewed_cert(&s, "wallet", &["scope-c"]);
+    s.w.next_doc(|body| list_renewal(body, &earlier, &renewed, None));
+    let until = s.w.clock.now_ms() + CLOCK_TOLERANCE_MS;
+    s.w.next_doc(|body| list_renewal(body, &earlier, &renewed, Some(until)));
+    wallet.receive(None).await.unwrap();
+    assert_eq!(
+        s.w.switch.app(&wallet.app_id()).cert.map(|c| c.hash()),
+        Some(renewed.hash())
+    );
+    let view = phone.client.record(&key).await.unwrap();
+    assert_eq!(view.cert, *earlier.signed());
+    let id = items().id(&s.w.alice.public());
+    let page = phone.client.records(&id, None, None).await.unwrap();
+    assert_eq!(page.records.len(), 1);
+    assert_eq!(page.records[0].cert, *earlier.signed());
 }
 
 // -------------------------------------------------------------------------------------
