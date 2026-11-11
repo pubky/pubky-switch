@@ -88,14 +88,18 @@ impl Service {
         answer.deferred = None;
         let unavailable = || ApiError::unavailable("7.6: a temporary failure");
         // No keyed section signs with the key from here on: the erasure's answer is the last
-        // it signs (7.4.16, store/keying.rs). Under the row lock, which this transaction
-        // holds, uncommitted, so its answers are signed in place.
+        // it signs (7.4.16, store/keying.rs). The confirmation is signed in place, under the
+        // row lock this transaction holds, since it goes out only once the deletion commits;
+        // a failure here may have ended the transaction, so its `503` is signed only in a
+        // keyed section.
         if let Err(failure) = txn.exclude_signers().await {
             tracing::error!(%failure, "excluding an erased account's signers");
+            let key = txn.head().service_key.clone();
             return self
-                .sign_keyed(
-                    Proof::Locked(&txn),
+                .sign_after_failure(
+                    txn,
                     signer,
+                    &key,
                     signature,
                     committed_ms,
                     Answer::error(&unavailable()),

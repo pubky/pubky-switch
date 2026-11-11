@@ -209,6 +209,50 @@ pub static ALLOWED: &[Allowed] = &[
                  step 5), where with the certificate of the write it takes it.",
         reference: "Switch wire 7.4.9, the record view's `cert`",
     },
+    Allowed {
+        flow: "two collections",
+        label: "{alice/*} GET /v1/{alice}/records/*",
+        fact: "status",
+        service: "403",
+        scripted: "200",
+        reason: "fake batch pending: the service refuses a read of a record whose read scope the \
+                 caller's certificate lacks; the scripted switch answers it with the record's \
+                 view, and the app then keeps a record it can't open.",
+        reference: "Switch wire 7.4.9, `GET /records/{key}`",
+    },
+    Allowed {
+        flow: "two collections",
+        label: "{alice/*} GET /v1/{alice}/records/*",
+        fact: "body.code",
+        service: "text permission_missing",
+        scripted: NOTHING,
+        reason: "fake batch pending: the service refuses a read of a record whose read scope the \
+                 caller's certificate lacks; the scripted switch answers it with the record's \
+                 view, and the app then keeps a record it can't open.",
+        reference: "Switch wire 7.4.9, `GET /records/{key}`",
+    },
+    Allowed {
+        flow: "two collections",
+        label: "{alice/*} GET /v1/{alice}/records/*",
+        fact: "body.*",
+        service: NOTHING,
+        scripted: "*",
+        reason: "fake batch pending: the service refuses a read of a record whose read scope the \
+                 caller's certificate lacks; the scripted switch answers it with the record's \
+                 view, and the app then keeps a record it can't open.",
+        reference: "Switch wire 7.4.9, `GET /records/{key}`",
+    },
+    Allowed {
+        flow: "two collections",
+        label: "outcome what the * reads of *, outside its scope",
+        fact: "outcome.*",
+        service: "*",
+        scripted: "*",
+        reason: "fake batch pending: the service refuses a read of a record whose read scope the \
+                 caller's certificate lacks; the scripted switch answers it with the record's \
+                 view, and the app then keeps a record it can't open.",
+        reference: "Switch wire 7.4.9, `GET /records/{key}`",
+    },
 ];
 
 #[cfg(test)]

@@ -413,7 +413,7 @@ impl Attempt {
     /// Whether a later attempt is `possibly_duplicate` because of this one (row 1): it is
     /// `unknown`, or its `failed` or `unknown` was written by an app other than its owner. A
     /// `done` attempt settles the claim, so no attempt follows it.
-    fn makes_next_doubtful(&self) -> bool {
+    pub(crate) fn makes_next_doubtful(&self) -> bool {
         let by_other = self.resolved_by.is_some_and(|by| by != self.owner);
         self.outcome == Outcome::Unknown || (by_other && self.outcome == Outcome::Failed)
     }
@@ -432,7 +432,7 @@ pub enum Pin {
 }
 
 impl Pin {
-    fn of(deadline: Option<u64>) -> Self {
+    pub(crate) fn of(deadline: Option<u64>) -> Self {
         deadline.map_or(Pin::NoDeadline, Pin::At)
     }
 
@@ -630,7 +630,7 @@ impl Claim {
 
     /// A divergent claim clears once no attempt on it is open or `unknown` (Switch spec
     /// 12.6).
-    fn settle_divergence(&mut self) {
+    pub(crate) fn settle_divergence(&mut self) {
         if self.divergent && !self.attempts.iter().any(|a| a.outcome.unresolved()) {
             self.divergent = false;
         }

@@ -25,6 +25,10 @@ pub const NOTE_KIND: &str = "example.note";
 /// they change the lists and can't read them.
 pub const NOTES_LISTS: &str = "notes_lists";
 
+/// A second scope of the [`Notes`] protocol with Shared Data Keys, for a collection of its
+/// own. Its apps hold `lists.manage` alone, as those of [`NOTES_LISTS`] do.
+pub const NOTES_JOURNAL: &str = "notes_journal";
+
 /// A neutral protocol, the signer's side of it. Its scope [`NOTES`] has keys and needs every
 /// switch permission, so its apps read and change the lists and write claims; its scope
 /// [`NOTES_LISTS`] has no keys and needs `lists.manage` alone.
@@ -37,7 +41,11 @@ impl Protocol for Notes {
     }
 
     fn scopes(&self) -> Vec<ScopeDef> {
-        vec![ScopeDef::keyed(NOTES), ScopeDef::unkeyed(NOTES_LISTS)]
+        vec![
+            ScopeDef::keyed(NOTES),
+            ScopeDef::unkeyed(NOTES_LISTS),
+            ScopeDef::keyed(NOTES_JOURNAL),
+        ]
     }
 
     fn check_scopes(&self, _: &[&str]) -> Result<(), String> {
@@ -70,6 +78,25 @@ pub fn notes_protocol() -> Arc<TestProtocol> {
 /// with the [`NOTES`] scope.
 pub fn notes_collection() -> Collection {
     Collection::new("example.items", Policy::new(NOTES, &[NOTES]))
+}
+
+/// A second collection of the [`Notes`] protocol's apps, read and written with the
+/// [`NOTES_JOURNAL`] scope.
+pub fn journal_collection() -> Collection {
+    Collection::new(
+        "example.journal",
+        Policy::new(NOTES_JOURNAL, &[NOTES_JOURNAL]),
+    )
+}
+
+/// The app's side of the [`Notes`] protocol with both its collections, for an app that
+/// holds the keyed scopes `keyed`: it lists, when it joins, the collections it may read.
+pub fn notes_protocol_with_both_collections(keyed: &[&str]) -> Arc<TestProtocol> {
+    Arc::new(TestProtocol::new(ProtocolSpec {
+        keyed_scopes: keyed.iter().map(|scope| (*scope).to_owned()).collect(),
+        accepts: vec![NOTE_KIND.to_owned()],
+        collections: vec![notes_collection(), journal_collection()],
+    }))
 }
 
 /// The app's side of the [`Notes`] protocol with its [`notes_collection`]: an app with it

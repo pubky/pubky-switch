@@ -50,12 +50,15 @@ pub const RECOVERY_KEEPS: &[&str] = &[
 ];
 
 /// Every table with an account column that a recovery in place empties: the generation's own state,
-/// `claim_entries` with their claims, and `pending_revoked_apps`, which joins `kept_app_ids`.
+/// `claim_entries` with their claims, `divergent_uploads` with their records, and
+/// `pending_revoked_apps`, which joins `kept_app_ids`.
 /// A table added later with an account column must be classed here or in
 /// [`RECOVERY_KEEPS`], which a test of every such table checks.
 pub fn recovery_clears() -> Vec<&'static str> {
     let mut tables = GENERATION_STATE.to_vec();
     tables.extend(["claim_entries", "pending_revoked_apps"]);
+    // A record's divergent uploads (Switch wire 7.4.14) go with their record.
+    tables.push("divergent_uploads");
     tables
 }
 

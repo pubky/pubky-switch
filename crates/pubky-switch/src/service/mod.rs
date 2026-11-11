@@ -725,11 +725,15 @@ impl Service {
         delivered: Option<&Result<peers::Delivered, ApiError>>,
     ) -> SwitchResponse {
         let signature = request_signature.as_ref();
+        let by_signer = caller.is_some_and(|c| c.caller == Caller::Signer);
         // The time the account last committed, for an answer whose commit fails.
         let committed_ms = txn.head().stamped_time_ms;
         // Step 3: the identity's service time, which never goes back.
         let time_ms = txn.stamp(base_ms);
-        let signer = match self.keys.signer(&txn.head().service_key).await {
+        // The key `signer` is loaded for: a request that changes the account's key answers a
+        // failure with this one, whatever its transaction then holds (keyed.rs).
+        let loaded_key = txn.head().service_key.clone();
+        let signer = match self.keys.signer(&loaded_key).await {
             Ok(signer) => signer,
             Err(failure) => {
                 tracing::error!(%failure, "an account's service key");
@@ -750,14 +754,15 @@ impl Service {
             let _ = store_error(&error);
             let error = ApiError::unavailable("7.6: a temporary failure");
             return self
-                .sign_keyed(
-                    Proof::Locked(&txn),
+                .sign_after_failure(
+                    txn,
                     &signer,
+                    &loaded_key,
                     signature,
                     committed_ms,
                     Answer::error(&error),
                     base_ms,
-                    false,
+                    by_signer,
                 )
                 .await;
         }
@@ -767,14 +772,15 @@ impl Service {
             tracing::error!(%failure, "a snapshot for a read after the lock");
             let error = ApiError::unavailable("7.6: a temporary failure");
             return self
-                .sign_keyed(
-                    Proof::Locked(&txn),
+                .sign_after_failure(
+                    txn,
                     &signer,
+                    &loaded_key,
                     signature,
                     committed_ms,
                     Answer::error(&error),
                     base_ms,
-                    false,
+                    by_signer,
                 )
                 .await;
         }
@@ -787,14 +793,15 @@ impl Service {
                 let _ = store_error(&error);
                 let error = ApiError::unavailable("7.6: a temporary failure");
                 return self
-                    .sign_keyed(
-                        Proof::Locked(&txn),
+                    .sign_after_failure(
+                        txn,
                         &signer,
+                        &loaded_key,
                         signature,
                         committed_ms,
                         Answer::error(&error),
                         base_ms,
-                        false,
+                        by_signer,
                     )
                     .await;
             }
@@ -816,14 +823,15 @@ impl Service {
                     tracing::error!(%failure, "rolling back a refused request");
                     let error = ApiError::unavailable("7.6: a temporary failure");
                     return self
-                        .sign_keyed(
-                            Proof::Locked(&txn),
+                        .sign_after_failure(
+                            txn,
                             &signer,
+                            &loaded_key,
                             signature,
                             committed_ms,
                             Answer::error(&error),
                             base_ms,
-                            false,
+                            by_signer,
                         )
                         .await;
                 }
@@ -879,7 +887,6 @@ impl Service {
             },
             None => signer,
         };
-        let by_signer = caller.is_some_and(|c| c.caller == Caller::Signer);
         let fallback_head = if answer.deferred.is_some() {
             self.head(&txn, &signer).await
         } else {

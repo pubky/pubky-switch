@@ -68,6 +68,24 @@ pub struct CertChange {
     pub expires_at: Option<u64>,
 }
 
+/// How many automatic renewals in a row no record of an app may leave untaken before the
+/// signer stops renewing it by itself (Switch spec 3.1).
+const RENEWALS_LEFT_UNTAKEN: usize = 2;
+
+/// Who a renewal is for, which sets its expiry and what it does to the count of untaken
+/// automatic renewals, committed with the renewing version itself (Switch spec 3.1).
+#[derive(Clone, Copy)]
+pub(super) enum RenewedBy {
+    /// The user's renewal, or an approval's: the expiry is the change's, and the count starts
+    /// again.
+    User,
+    /// An automatic renewal, keeping `lifetime` from its `issued_at`: one more in the count.
+    Automatic {
+        /// The lifetime the certificate has, its `expires_at` less its `issued_at`.
+        lifetime: u64,
+    },
+}
+
 impl Signer {
     /// Renew the certificate of the listed app `app_id` with `change` (Switch spec 3.2,
     /// Switch wire 3.8), then deliver and publish the renewing version. A reduction's
@@ -84,17 +102,22 @@ impl Signer {
     /// for an expiry the certificate rules refuse; otherwise as [`Signer::resume`].
     pub async fn renew(&mut self, app_id: [u8; 16], change: CertChange) -> Result<IdentityDoc> {
         self.ready().await?;
-        self.renew_listed(app_id, change, None).await
+        self.renew_listed(app_id, change, None, RenewedBy::User)
+            .await
     }
 
     /// [`Signer::renew`], once the signer is ready: with `answering`, the renewal answers that
     /// app request, and its approval's companion claim is committed with the renewing version,
-    /// released once the switch has taken it (Switch wire 3.9 step 5, 3.10).
+    /// released once the switch has taken it (Switch wire 3.9 step 5, 3.10). `by` sets the
+    /// expiry and the count of untaken renewals, which change in the commit of the renewing
+    /// version, so a renewal whose delivery or publication fails after it is counted all the
+    /// same.
     pub(super) async fn renew_listed(
         &mut self,
         app_id: [u8; 16],
         change: CertChange,
         answering: Option<&Answering<'_>>,
+        by: RenewedBy,
     ) -> Result<IdentityDoc> {
         // A revoked or departing app gets no new certificate, expiry or key (Switch spec 12.2).
         if self.cut_off(&app_id) {
@@ -112,10 +135,14 @@ impl Signer {
         let terms = self.env.protocols.terms(&scopes)?;
         let now = self.env.clock.now_ms();
         let issued = now.max(old.issued_at().saturating_add(1));
-        let expires = change
-            .expires_at
-            .unwrap_or_else(|| issued.saturating_add(self.state.cert_lifetime_ms))
-            .min(issued.saturating_add(MAX_CERT_LIFETIME_MS));
+        let expires = match by {
+            // The lifetime from the time it is issued at, exactly (Switch spec 3.1).
+            RenewedBy::Automatic { lifetime } => issued.saturating_add(lifetime),
+            RenewedBy::User => change
+                .expires_at
+                .unwrap_or_else(|| issued.saturating_add(self.state.cert_lifetime_ms)),
+        }
+        .min(issued.saturating_add(MAX_CERT_LIFETIME_MS));
         // The switch's view, read before anything is signed: this install still signs, the
         // app has joined, and the device clock the certificate is stamped with agrees with
         // the switch's time.
@@ -226,6 +253,10 @@ impl Signer {
             state.claims.push(claim);
         }
         state.epoch_through = state.epoch_through.max(last);
+        match by {
+            RenewedBy::Automatic { .. } => state.untaken_renewals.push((app_id, new.hash())),
+            RenewedBy::User => renewals_taken_in(&mut state, &[app_id]),
+        }
         self.commit_batches(state, &newest, &statuses, alerts, batches, &doc, flow)
             .await?;
         self.resume().await?;
@@ -736,8 +767,9 @@ impl Signer {
     }
 
     /// Renew the certificate of every current app once less than half its lifetime remains,
-    /// each with the default lifetime from now, in a renewing version of its own (Switch spec
-    /// 3.2; Switch wire 3.8, Appendix A, A28). Returns the apps renewed.
+    /// each with the lifetime its certificate has, from now, in a renewing version of its own:
+    /// a lifetime the user chose short stays short (Switch spec 3.1, 3.2; Switch wire 3.8,
+    /// Appendix A, A28). Returns the apps renewed.
     ///
     /// - Current is spec 3.4's sense, whatever the certificate's expiry: the newest
     ///   `identity.json` lists the app, and it is neither revoked, being revoked, nor departed.
@@ -745,9 +777,12 @@ impl Signer {
     ///   back: the switch takes the signer's renewal for it although its certificate has
     ///   expired (Switch wire 3.8 "An expired certificate"). One that hasn't joined is left:
     ///   the switch takes no `cert.put` for it yet (Switch wire 6.2).
-    /// - An app with a renewal still open is renewed again all the same, so an app that stays
-    ///   away never lapses: each renewal adds a `renewed` entry, and a newer `cert.put`
-    ///   replaces the one the switch stores (Switch wire 3.3, 3.8).
+    /// - An app with a renewal still open is renewed again, once: each renewal adds a
+    ///   `renewed` entry, and a newer `cert.put` replaces the one the switch stores (Switch
+    ///   wire 3.3, 3.8). After two automatic renewals in a row that no record of the app took
+    ///   up, it isn't renewed again by itself, with [`Alert::RenewalsStopped`], and lapses at
+    ///   its expiry. A renewal the user asks for, or a record carrying the newest certificate,
+    ///   starts the count again (Switch spec 3.1).
     /// - Half the lifetime is judged on the switch's signed time, from its `GET /apps` answer.
     ///   The certificate is stamped with the device clock, so while that clock and the
     ///   switch's time differ by more than the clock tolerance, nothing is renewed by itself,
@@ -781,6 +816,8 @@ impl Signer {
         let certs = self.held_certs()?;
         let mut due = Vec::new();
         let mut skipped = Vec::new();
+        // The apps a record shows back, which leave the count of untaken renewals.
+        let mut taken = Vec::new();
         for listed in &newest.body().apps {
             let removed = statuses.iter().any(|s| {
                 s.app_id == listed.app_id && (s.revoked_at.is_some() || s.departed_at.is_some())
@@ -788,7 +825,22 @@ impl Signer {
             let Some(cert) = certs.iter().find(|c| c.hash() == listed.cert) else {
                 continue;
             };
+            let carried = statuses
+                .iter()
+                .any(|s| s.app_id == listed.app_id && s.record_cert == Some(listed.cert));
+            if carried {
+                taken.push(listed.app_id);
+            }
             if removed || !past_half_lifetime(cert, switch_time) {
+                continue;
+            }
+            // Two automatic renewals in a row untaken: the app stays away, and the user
+            // decides (Switch spec 3.1).
+            if !carried && self.untaken_renewals(&listed.app_id) >= RENEWALS_LEFT_UNTAKEN {
+                skipped.push(Alert::RenewalsStopped {
+                    app_id: listed.app_id,
+                    expires_at: cert.expires_at(),
+                });
                 continue;
             }
             // The certificate as it is: the same scopes, and the permissions it holds.
@@ -823,13 +875,23 @@ impl Signer {
                     app_id: listed.app_id,
                     reason,
                 }),
-                None => due.push(listed.app_id),
+                // The lifetime it has, from now: a short one the user chose stays short.
+                None => due.push((
+                    listed.app_id,
+                    cert.expires_at().saturating_sub(cert.issued_at()),
+                )),
             }
         }
+        self.renewals_taken(&taken).await?;
         self.skip_renewals(skipped).await?;
         let mut renewed = Vec::new();
-        for app_id in due {
-            match self.renew(app_id, CertChange::default()).await {
+        for (app_id, lifetime) in due {
+            self.ready().await?;
+            let by = RenewedBy::Automatic { lifetime };
+            match self
+                .renew_listed(app_id, CertChange::default(), None, by)
+                .await
+            {
                 Ok(_) => renewed.push(app_id),
                 // At the size a delivery may carry: no renewal can be delivered, and the
                 // near-limit alert tells the user (design note, section 11).
@@ -853,6 +915,26 @@ impl Signer {
         Ok(renewed)
     }
 
+    /// How many automatic renewals of `app_id` in a row no record has taken up.
+    fn untaken_renewals(&self, app_id: &[u8; 16]) -> usize {
+        self.state
+            .untaken_renewals
+            .iter()
+            .filter(|(id, _)| id == app_id)
+            .count()
+    }
+
+    /// The apps in `apps` are back: their count of untaken renewals starts again, and
+    /// [`Alert::RenewalsStopped`] goes (Switch spec 3.1).
+    async fn renewals_taken(&mut self, apps: &[[u8; 16]]) -> Result<()> {
+        let mut state = self.state.clone();
+        renewals_taken_in(&mut state, apps);
+        if state != self.state {
+            self.commit(state, self.flow.clone()).await?;
+        }
+        Ok(())
+    }
+
     /// Raise `alerts` for renewals the signer leaves to the user; renews nothing.
     async fn skip_renewals(&mut self, alerts: Vec<Alert>) -> Result<Vec<[u8; 16]>> {
         let mut state = self.state.clone();
@@ -864,6 +946,16 @@ impl Signer {
         }
         Ok(Vec::new())
     }
+}
+
+/// The count of untaken renewals of each app in `apps` starts again in `state`, and its
+/// [`Alert::RenewalsStopped`] goes: the app is back, the user renewed it, or it is removed
+/// (Switch spec 3.1).
+pub(super) fn renewals_taken_in(state: &mut SignerState, apps: &[[u8; 16]]) {
+    state.untaken_renewals.retain(|(id, _)| !apps.contains(id));
+    state.alerts.retain(
+        |alert| !matches!(alert, Alert::RenewalsStopped { app_id, .. } if apps.contains(app_id)),
+    );
 }
 
 /// Whether the device clock, `now`, agrees with the switch's signed time within the clock
