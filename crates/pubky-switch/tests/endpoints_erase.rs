@@ -2624,6 +2624,21 @@ where
         &'c mut sqlx::PgConnection,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'c>>,
 {
+    parked_at(replay, &replay.service, request, then).await
+}
+
+/// [`parked_while`], answered by `service`.
+async fn parked_at<F>(
+    replay: &Replay,
+    service: &pubky_switch::service::Service,
+    request: pubky_switch::http::SwitchRequest,
+    then: F,
+) -> SwitchResponse
+where
+    F: for<'c> FnOnce(
+        &'c mut sqlx::PgConnection,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'c>>,
+{
     let mut holder = sqlx::PgConnection::connect_with(replay.db.options())
         .await
         .expect("conn");
@@ -2636,7 +2651,7 @@ where
         .execute(&mut holder)
         .await
         .expect("exclusive");
-    let (answer, ()) = tokio::join!(replay.service.handle(request), async {
+    let (answer, ()) = tokio::join!(service.handle(request), async {
         let mut watcher = sqlx::PgConnection::connect_with(replay.db.options())
             .await
             .expect("conn");
@@ -2890,5 +2905,40 @@ async fn test_erase_waits_for_a_keyed_section_in_progress() {
         "{}",
         String::from_utf8_lossy(&erased.body)
     );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_erase_keyed_section_reads_committed_whatever_the_pools_default() {
+    // At a database whose transactions default to REPEATABLE READ, a keyed section's key read
+    // would see the snapshot its transaction took before the lock was granted: the section is
+    // READ COMMITTED explicitly, so it still sees the erasure (store/keying.rs).
+    let Some(replay) = replay().await else {
+        return;
+    };
+    replay_chain_through_revoke(&replay).await;
+    let options = replay
+        .db
+        .options()
+        .clone()
+        .options([("default_transaction_isolation", "repeatable\\ read")]);
+    let store = pubky_switch::store::Store::connect_with(
+        options,
+        &pubky_switch::store::DatabaseConfig::default(),
+    )
+    .await
+    .expect("store");
+    let service = pubky_switch::service::Service::new(
+        ORIGIN.into(),
+        store,
+        replay.keys.clone(),
+        replay.time.clone(),
+        pubky_switch::limits::Limits::default(),
+    );
+    let request = signer_apps();
+    let request_signature = signature_of(&request);
+    let answer = parked_at(&replay, &service, request, erase_row).await;
+    assert_eq!(code_of(&answer), (404, json!("not_found")));
+    assert!(operator_signed(&answer, Some(&request_signature)));
     replay.db.drop_database().await.expect("drop");
 }
