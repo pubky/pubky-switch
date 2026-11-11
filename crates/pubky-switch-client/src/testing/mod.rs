@@ -289,6 +289,55 @@ mod tests {
         assert_eq!(switch.lock().directory_version, 0);
     }
 
+    #[test]
+    fn test_scripted_peer_answers_as_the_service_without_current_or_versions() {
+        // Switch wire 7.6: `not_admitted` carries no `current`, and an absent one is left
+        // out; both versions start at 0 (Switch wire 7.4.10).
+        let (_, body) = peer::bad(
+            pubky_switch_core::http::ErrorCode::NotAdmitted,
+            serde_json::Value::Null,
+        );
+        assert!(body.get("current").is_none(), "{body}");
+        let seeds = Seeds::default();
+        let peer = PeerSwitch::new(
+            TestIdentity::new(&seeds, "bob"),
+            PEER_ORIGIN,
+            Arc::new(TestClock::new(START_MS)),
+            Arc::new(TestHomeserver::new()),
+        );
+        let inner = peer.lock();
+        assert_eq!((inner.apps_version, inner.directory_version), (0, 0));
+    }
+
+    #[test]
+    fn test_scripted_switch_second_leave_is_not_current_without_current() {
+        // Switch wire 7.6: `403 not_current` carries no `current`.
+        let seeds = Seeds::default();
+        let signer = TestSigner::new(
+            TestIdentity::new(&seeds, "alice"),
+            Arc::new(TestClock::new(START_MS)),
+            Arc::new(TestHomeserver::new()),
+            ProtocolSpec::default(),
+        );
+        let keys = signer.identity().app_keys("phone");
+        signer
+            .register_app(&keys, &AppSpec::new(&["notes"]))
+            .unwrap();
+        let app = pubky_switch_core::enc::zbase32_encode(&keys.app_id_bytes());
+        let path = format!("/v1/{}/apps/{app}/leave", signer.identity().key().id());
+        let mut leave = request(SWITCH_ORIGIN, &path);
+        leave.method = "POST".into();
+        leave
+            .headers
+            .push(crate::transport::Header::new(header::APP, &app));
+        assert_eq!(signer.switch().handle(&leave).unwrap().status, 200);
+        let again = signer.switch().handle(&leave).unwrap();
+        assert_eq!(again.status, 403);
+        let body: serde_json::Value = serde_json::from_slice(&again.body).unwrap();
+        assert_eq!(body["code"], "not_current");
+        assert!(body.get("current").is_none(), "{body}");
+    }
+
     fn request(origin: &str, path: &str) -> Request {
         Request {
             method: "GET".into(),

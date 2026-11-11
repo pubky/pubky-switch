@@ -94,11 +94,15 @@ impl std::fmt::Debug for PeerSwitch {
     }
 }
 
-fn bad(code: ErrorCode, current: Value) -> (u16, Value) {
-    (
-        code.status(),
-        json!({ "code": code.as_str(), "message": "scripted", "current": current }),
-    )
+/// An error answer (Switch wire 7.6): `current` only where there is one, `Value::Null`
+/// standing for none, since a writer omits an absent member (Switch wire, Conventions,
+/// "Absent and null").
+pub(crate) fn bad(code: ErrorCode, current: Value) -> (u16, Value) {
+    let mut body = json!({ "code": code.as_str(), "message": "scripted" });
+    if !current.is_null() {
+        body["current"] = current;
+    }
+    (code.status(), body)
 }
 
 impl PeerSwitch {
@@ -128,8 +132,9 @@ impl PeerSwitch {
                 homeserver,
                 body,
                 apps: Vec::new(),
-                apps_version: 1,
-                directory_version: 1,
+                // Both start at 0, as at the service (Switch wire 7.4.10).
+                apps_version: 0,
+                directory_version: 0,
                 inbox: Vec::new(),
                 answered: HashMap::new(),
                 peers: HashMap::new(),
@@ -454,7 +459,7 @@ impl PeerInner {
         code: Option<&str>,
     ) -> Result<(u16, Value), ScriptError> {
         if !self.admits(&sender, code, false) {
-            return Ok(bad(ErrorCode::NotAdmitted, json!({})));
+            return Ok(bad(ErrorCode::NotAdmitted, json!(null)));
         }
         let apps: Vec<Value> = self
             .apps
@@ -483,7 +488,7 @@ impl PeerInner {
             return (200, answer.clone());
         }
         if !self.admits(&sender, code, false) {
-            return bad(ErrorCode::NotAdmitted, json!({}));
+            return bad(ErrorCode::NotAdmitted, json!(null));
         }
         if !self.listed(&sender, &app) {
             let version = self.peers.get(&sender).map(IdentityDoc::version);

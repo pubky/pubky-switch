@@ -1424,7 +1424,7 @@ impl Inner {
                     200,
                     json!({ "proofs": [proof], "head": self.head().to_value() }),
                 ),
-                None => bad(ErrorCode::NotCurrent, "departed", json!({})),
+                None => bad(ErrorCode::NotCurrent, "departed", json!(null)),
             },
             _ => bad(ErrorCode::NotFound, "no route", json!(null)),
         })
