@@ -80,6 +80,11 @@ impl Replay {
     /// Another service on the same database, keys and clock, that needs trusted time and
     /// has no sample.
     pub fn without_trusted_time(&self) -> Service {
+        self.without_trusted_time_with(Limits::default())
+    }
+
+    /// [`Replay::without_trusted_time`], with `limits`.
+    pub fn without_trusted_time_with(&self, limits: Limits) -> Service {
         Service::new(
             ORIGIN.into(),
             self.db.store().clone(),
@@ -88,7 +93,7 @@ impl Replay {
                 TrustedTimeConfig::default(),
                 self.clock.clone(),
             )),
-            Limits::default(),
+            limits,
         )
     }
 }

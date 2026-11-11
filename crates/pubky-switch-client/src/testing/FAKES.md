@@ -50,7 +50,8 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
 - **Durability** (Switch spec 6.5): everything is in memory, answered at once; the service
   key's mark isn't kept. Per-account order is a mutex.
 - **Retention and sweeps** (Switch wire 9.1): entries never expire; `missed` items,
-  checkpoints and dropped stubs exist only when a test scripts them;
+  checkpoints and dropped stubs exist only when a test scripts them, and a scripted `missed`
+  item (`push_missed`) is shown to every app, where the service shows one only to its app;
   no app is ever marked lagging (`lagging` is always `false`), so entries always wait for
   every current target and no `missed` item is written (7.4.4);
   `unreadable` items exist only when a test scripts them (`push_unreadable`), with an
@@ -165,7 +166,8 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
 
   `unread_entries` and `sole_target_unread` are always 0, where the service counts them over
   the current targets, expired certificates included; no signer or app code reads them.
-  `lagging` is false, as on the service. The test call `forget_bundle_parts` scripts a faulty service
+  `lagging` is always false, where the service marks lagging apps (Retention and sweeps,
+  above). The test call `forget_bundle_parts` scripts a faulty service
   that lost an app's stored parts.
 - **Moves and recovery** (Switch spec 12.5, 12.6, Switch wire 10): `import_into` copies the
   account in memory, with no manifest, chunks or export transfer, to serve at the origin the

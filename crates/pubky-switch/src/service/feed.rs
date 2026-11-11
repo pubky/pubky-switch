@@ -290,9 +290,6 @@ fn item_json(row: &FeedRow, shown: Shown) -> Vec<u8> {
     out
 }
 
-/// An inbox entry's feed item (Switch wire 7.5), in the member order of the wire's example
-/// (7.4.4): `type, seq, entry_id, sender, cert, accepted_at`, the invite code's `context` as
-/// stored when one admitted the sender, then `envelope`.
 /// An inbox item's JSON (Switch wire 7.5): an `entry`, an `unreadable` item or a `missed`
 /// item.
 fn inbox_item_json(item: &crate::store::InboxItem) -> Vec<u8> {
@@ -328,6 +325,9 @@ fn inbox_item_json(item: &crate::store::InboxItem) -> Vec<u8> {
     }
 }
 
+/// An inbox entry's feed item (Switch wire 7.5), in the member order of the wire's example
+/// (7.4.4): `type, seq, entry_id, sender, cert, accepted_at`, the invite code's `context` as
+/// stored when one admitted the sender, then `envelope`.
 fn entry_json(entry: &crate::store::StoredEntry) -> Vec<u8> {
     let mut out = b"{\"type\":\"entry\",\"seq\":".to_vec();
     out.extend_from_slice(entry.seq.to_string().as_bytes());

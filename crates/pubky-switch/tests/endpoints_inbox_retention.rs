@@ -1045,16 +1045,20 @@ fn entry_bytes() -> u64 {
         + Limits::default().entry_overhead_bytes
 }
 
+/// An inbox quota of four entries, and no sender share.
+fn lagging_limits() -> Limits {
+    Limits {
+        quota_bytes: 4 * entry_bytes(),
+        sender_share_percent: 100,
+        ..Limits::default()
+    }
+}
+
 /// alice's account with the wallet and the executor current, at an inbox quota of four
 /// entries: each app's share is two (Switch wire 7.4.4). No sender share, so bob's shop
 /// alone may fill it.
 async fn lagging_replay() -> Option<Replay> {
-    let replay = replay_with(Limits {
-        quota_bytes: 4 * entry_bytes(),
-        sender_share_percent: 100,
-        ..Limits::default()
-    })
-    .await?;
+    let replay = replay_with(lagging_limits()).await?;
     with_bob(&replay).await;
     register_executor(&replay).await;
     Some(replay)
@@ -1407,5 +1411,551 @@ async fn test_inbox_unreadable_items_count_for_no_senders_share() {
     // bob's unreadable item counts against the inbox quota but not his share: his next
     // entry still fits it.
     append_to(&replay, &["wallet"], 2).await;
+    replay.db.drop_database().await.expect("drop");
+}
+
+async fn revoke(replay: &Replay, name: &str) {
+    let id = app(&vectors("keys.json"), name)["app_id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    let answer = replay
+        .service
+        .handle(signer_request(
+            "POST",
+            &format!("/v1/{}/apps/{id}/revoke", alice_id()),
+            Vec::new(),
+            ms(&at()),
+        ))
+        .await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+}
+
+/// bob's shop appends an envelope wrapped to `names`; the answer as it is.
+async fn try_append(replay: &Replay, names: &[&str], byte: u8) -> SwitchResponse {
+    let publics: Vec<[u8; 32]> = names.iter().map(|name| receive_public(name)).collect();
+    let version = apps_version(replay).await;
+    from_shop(replay, sealed_to(&publics, byte), Some(version), None).await
+}
+
+/// The reader departs while the other app is marked: a single current app is never marked
+/// (Switch wire 7.4.4, spec 6.3), and the entries it alone holds wait for it.
+#[tokio::test]
+async fn test_inbox_a_lone_current_app_is_never_lagging() {
+    let Some(replay) = lagging_replay().await else {
+        return;
+    };
+    for byte in 1..=3 {
+        append_to(&replay, &["executor"], byte).await;
+    }
+    assert!(lagging(&replay, "executor").await);
+    // An entry for both, which waits for the wallet.
+    append_to(&replay, &["executor", "wallet"], 4).await;
+    assert_eq!(count(&replay, "entry").await, 1);
+    let missed_before = sql_value(
+        &replay,
+        "SELECT coalesce(sum(missed_entries), 0)::BIGINT FROM inbox_entries \
+         WHERE account_id = $1 AND kind = 'missed'",
+    )
+    .await;
+    // The wallet is revoked: the executor is the only current app.
+    revoke(&replay, "wallet").await;
+    let missed_after = sql_value(
+        &replay,
+        "SELECT coalesce(sum(missed_entries), 0)::BIGINT FROM inbox_entries \
+         WHERE account_id = $1 AND kind = 'missed'",
+    )
+    .await;
+    let still_marked = lagging(&replay, "executor").await;
+    let entries_left = count(&replay, "entry").await;
+    // A new entry for the lone executor.
+    append_to(&replay, &["executor"], 5).await;
+    let entries_after_append = count(&replay, "entry").await;
+    assert_eq!(
+        (
+            still_marked,
+            entries_left,
+            missed_after - missed_before,
+            entries_after_append
+        ),
+        (false, 1, 0, 2),
+        "(marked, entries after the revocation, entries missed at it, entries after an append)"
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+/// A14, then the reader's return: with no app reading the inbox fills and senders get 429;
+/// once the wallet reads everything, the next append judges the marks before its quota check
+/// (Switch wire 7.4.4), marks the executor, and its entries stop holding the quota.
+#[tokio::test]
+async fn test_inbox_the_readers_return_frees_a_full_inbox() {
+    let Some(replay) = lagging_replay().await else {
+        return;
+    };
+    for byte in 1..=4 {
+        append_to(&replay, &["executor", "wallet"], byte).await;
+    }
+    assert!(!lagging(&replay, "executor").await);
+    assert_eq!(count(&replay, "entry").await, 4);
+    // Full, nobody reading: 429 (A14).
+    let (status, code) = code_of(&try_append(&replay, &["executor", "wallet"], 5).await);
+    assert_eq!((status, code), (429, json!("quota_exceeded")));
+    // The wallet reads everything and moves its cursor: the entries wait for the executor,
+    // not marked, as before.
+    let newest = entry_seq(&replay).await;
+    move_cursor(&replay, "wallet", newest).await;
+    assert_eq!(count(&replay, "entry").await, 4);
+    // A reader is present now: the next append marks the executor (4 entries over a share
+    // of 2), its entries go into its missed item, and the append fits.
+    let answer = try_append(&replay, &["executor", "wallet"], 6).await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{} (executor lagging: {})",
+        String::from_utf8_lossy(&answer.body),
+        lagging(&replay, "executor").await
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+/// A delivery that leaves the set of current apps as it was judges no marks (Switch wire
+/// 7.4.4): an app over its share that a reader's cursor moves left holding entries isn't
+/// marked by it.
+#[tokio::test]
+async fn test_inbox_a_delivery_that_changes_no_current_app_sets_no_mark() {
+    let Some(replay) = lagging_replay().await else {
+        return;
+    };
+    for byte in 1..=3 {
+        append_to(&replay, &["executor", "wallet"], byte).await;
+    }
+    // Both past their share: none marked (A14).
+    assert!(!lagging(&replay, "executor").await);
+    let newest = entry_seq(&replay).await;
+    move_cursor(&replay, "wallet", newest).await;
+    assert_eq!(count(&replay, "entry").await, 3);
+    // The signer delivers version 4, its apps unchanged.
+    deliver_alice_v4(&replay, |_| {}).await;
+    assert_eq!(
+        (
+            lagging(&replay, "executor").await,
+            count(&replay, "entry").await,
+            count(&replay, "missed").await
+        ),
+        (false, 3, 0),
+        "(executor marked, entries, missed items) after a delivery changing no current app"
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+/// A marked app within its share isn't reading (Switch wire 7.4.4): the executor marked,
+/// then the wallet past its share while the executor is within its own leaves no current app
+/// reading, so no app is marked and the entries wait.
+#[tokio::test]
+async fn test_inbox_no_state_has_every_current_app_marked() {
+    let Some(replay) = lagging_replay().await else {
+        return;
+    };
+    append_to(&replay, &["executor", "wallet"], 1).await;
+    let first = entry_seq(&replay).await;
+    move_cursor(&replay, "executor", first).await;
+    for byte in 2..=4 {
+        append_to(&replay, &["executor"], byte).await;
+    }
+    assert!(lagging(&replay, "executor").await);
+    assert_eq!(
+        count(&replay, "entry").await,
+        1,
+        "the first waits for the wallet"
+    );
+    append_to(&replay, &["executor", "wallet"], 5).await;
+    append_to(&replay, &["executor", "wallet"], 6).await;
+    let both = lagging(&replay, "executor").await && lagging(&replay, "wallet").await;
+    let left = count(&replay, "entry").await;
+    assert_eq!(
+        (both, left),
+        (false, 3),
+        "(both marked, entries after the 6th)"
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+/// An unreadable item waits for every current app, a lagging one included (wire 9.1), and
+/// counts the overhead only.
+#[tokio::test]
+async fn test_inbox_an_unreadable_item_waits_for_a_lagging_app() {
+    let Some(replay) = lagging_replay().await else {
+        return;
+    };
+    for byte in 1..=3 {
+        append_to(&replay, &["executor"], byte).await;
+    }
+    assert!(lagging(&replay, "executor").await);
+    append_to(&replay, &["wallet"], 4).await;
+    let entry = entry_seq(&replay).await;
+    // Left with no current target before this service converted such entries.
+    let phone = hex::encode(app_id_of("phone"));
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    sqlx::query(&format!(
+        "UPDATE inbox_entries SET targets = ARRAY[decode('{phone}', 'hex')] \
+         WHERE account_id = $1 AND kind = 'entry'"
+    ))
+    .bind(alice_id())
+    .execute(&mut conn)
+    .await
+    .expect("legacy");
+    drop(conn);
+    move_cursor(&replay, "wallet", entry).await;
+    assert_eq!(count(&replay, "unreadable").await, 1);
+    let unreadable = u64::try_from(
+        sql_value(
+            &replay,
+            "SELECT seq FROM inbox_entries WHERE account_id = $1 AND kind = 'unreadable'",
+        )
+        .await,
+    )
+    .expect("seq");
+    assert!(unreadable > entry);
+    assert_eq!(
+        u64::try_from(
+            sql_value(
+                &replay,
+                "SELECT quota_bytes FROM inbox_entries WHERE account_id = $1 \
+                 AND kind = 'unreadable'",
+            )
+            .await
+        )
+        .expect("bytes"),
+        Limits::default().entry_overhead_bytes
+    );
+    // The wallet passes it; the lagging executor hasn't: it stays.
+    move_cursor(&replay, "wallet", unreadable).await;
+    assert_eq!(
+        count(&replay, "unreadable").await,
+        1,
+        "it waits for the executor"
+    );
+    // The executor's feed shows it, and once its cursor passes, it goes.
+    let feed = feed_of(&replay, "executor", 0).await;
+    assert_eq!(items_of(&feed, "unreadable").len(), 1, "{feed}");
+    move_cursor(&replay, "executor", unreadable).await;
+    assert_eq!(count(&replay, "unreadable").await, 0);
+    replay.db.drop_database().await.expect("drop");
+}
+
+/// A departed app's mark ends with its departure (Switch wire 7.4.4).
+#[tokio::test]
+async fn test_inbox_a_departed_apps_mark_ends() {
+    let Some(replay) = lagging_replay().await else {
+        return;
+    };
+    for byte in 1..=3 {
+        append_to(&replay, &["executor"], byte).await;
+    }
+    assert!(lagging(&replay, "executor").await);
+    revoke(&replay, "executor").await;
+    let status = apps_status(&replay).await;
+    let executor = status_of(&status, "executor");
+    assert_eq!(executor["current"], false);
+    // Its missed item goes with it.
+    assert_eq!(count(&replay, "missed").await, 0);
+    assert_eq!(executor["lagging"], false, "{executor}");
+    replay.db.drop_database().await.expect("drop");
+}
+
+/// A departed app's `missed` item goes with it.
+#[tokio::test]
+async fn test_inbox_a_departed_apps_missed_item_goes() {
+    let Some(replay) = lagging_replay().await else {
+        return;
+    };
+    for byte in 1..=3 {
+        append_to(&replay, &["executor"], byte).await;
+    }
+    assert_eq!(count(&replay, "missed").await, 1);
+    revoke(&replay, "executor").await;
+    assert_eq!(count(&replay, "missed").await, 0);
+    replay.db.drop_database().await.expect("drop");
+}
+
+/// An entry left with no current target before departures converted them waits for a
+/// cursor move with trusted time: one without it converts nothing (wire 7.4.4).
+#[tokio::test]
+async fn test_inbox_an_old_ownerless_entry_is_converted_only_with_trusted_time() {
+    let Some(replay) = replay().await else { return };
+    with_bob(&replay).await;
+    register_executor(&replay).await;
+    append_to(&replay, &["executor"], 1).await;
+    let phone = hex::encode(app_id_of("phone"));
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    sqlx::query(&format!(
+        "UPDATE inbox_entries SET targets = ARRAY[decode('{phone}', 'hex')] WHERE account_id = $1"
+    ))
+    .bind(alice_id())
+    .execute(&mut conn)
+    .await
+    .expect("legacy");
+    drop(conn);
+    let entry = entry_seq(&replay).await;
+    let untrusted = replay.without_trusted_time();
+    let request = app_request(
+        app(&vectors("keys.json"), "executor"),
+        "POST",
+        &format!("/v1/{}/ops", alice_id()),
+        OpsRequest::new(
+            &[],
+            Some(Position {
+                generation: 1,
+                seq: entry,
+            }),
+        )
+        .to_json(),
+        ms(&at()),
+    );
+    let answer = untrusted.handle(request).await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    assert_eq!(count(&replay, "entry").await, 1);
+    assert_eq!(count(&replay, "unreadable").await, 0);
+    replay.db.drop_database().await.expect("drop");
+}
+
+/// Unreadable items the app hasn't passed count in its unread bytes, overhead each (wire
+/// 7.4.4): enough of them take the executor past its share, and it is marked.
+#[tokio::test]
+async fn test_inbox_unreadable_items_count_in_unread_bytes() {
+    let Some(replay) = lagging_replay().await else {
+        return;
+    };
+    let n = 2 * entry_bytes() / Limits::default().entry_overhead_bytes + 1;
+    let phone = hex::encode(app_id_of("phone"));
+    for i in 0..n {
+        append_to(&replay, &["wallet"], u8::try_from(i + 1).expect("byte")).await;
+        let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+            .await
+            .expect("conn");
+        sqlx::query(&format!(
+            "UPDATE inbox_entries SET targets = ARRAY[decode('{phone}', 'hex')] \
+             WHERE account_id = $1 AND kind = 'entry'"
+        ))
+        .bind(alice_id())
+        .execute(&mut conn)
+        .await
+        .expect("legacy");
+        drop(conn);
+        let newest = entry_seq(&replay).await;
+        move_cursor(&replay, "wallet", newest).await;
+    }
+    assert_eq!(
+        count(&replay, "unreadable").await,
+        i64::try_from(n).expect("n")
+    );
+    let newest = entry_seq(&replay).await;
+    move_cursor(&replay, "wallet", newest).await;
+    append_to(&replay, &["wallet"], 200).await;
+    assert!(
+        lagging(&replay, "executor").await,
+        "over its share by unreadable items alone"
+    );
+    assert!(!lagging(&replay, "wallet").await);
+    replay.db.drop_database().await.expect("drop");
+}
+
+/// An entry a lagging app has passed is no miss of its when it goes.
+#[tokio::test]
+async fn test_inbox_an_entry_a_lagging_app_passed_is_no_miss() {
+    let Some(replay) = lagging_replay().await else {
+        return;
+    };
+    append_to(&replay, &["executor", "wallet"], 1).await;
+    let first = entry_seq(&replay).await;
+    move_cursor(&replay, "executor", first).await;
+    for byte in 2..=4 {
+        append_to(&replay, &["executor"], byte).await;
+    }
+    assert!(lagging(&replay, "executor").await);
+    move_cursor(&replay, "wallet", first).await;
+    assert_eq!(count(&replay, "entry").await, 0);
+    let missed = sql_value(
+        &replay,
+        "SELECT missed_entries FROM inbox_entries WHERE account_id = $1 AND kind = 'missed'",
+    )
+    .await;
+    assert_eq!(missed, 3);
+    replay.db.drop_database().await.expect("drop");
+}
+
+/// A later miss replaces the item with one from the earliest to the latest acceptance time.
+#[tokio::test]
+async fn test_inbox_a_merged_miss_spans_both_times() {
+    let Some(replay) = lagging_replay().await else {
+        return;
+    };
+    for byte in 1..=3 {
+        append_to(&replay, &["executor"], byte).await;
+    }
+    assert!(lagging(&replay, "executor").await);
+    let first = ms(&at());
+    let later = first + 60_000;
+    set_time(&replay.clock, &pubky_switch_core::time::rfc3339(later));
+    let version = apps_version(&replay).await;
+    let path = format!("/v1/{}/inbox?apps_version={version}", alice_id());
+    let request = other_request(
+        "shop",
+        ORIGIN,
+        "POST",
+        &path,
+        sealed_to(&[receive_public("executor")], 9),
+        None,
+        later,
+    );
+    let answer = replay.service.handle(request).await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    let row = |column: &str| {
+        format!("SELECT {column} FROM inbox_entries WHERE account_id = $1 AND kind = 'missed'")
+    };
+    assert_eq!(sql_value(&replay, &row("missed_entries")).await, 4);
+    assert_eq!(
+        sql_value(&replay, &row("missed_from_ms")).await,
+        i64::try_from(first).expect("ms")
+    );
+    assert_eq!(
+        sql_value(&replay, &row("missed_until_ms")).await,
+        i64::try_from(later).expect("ms")
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+/// bob's shop appends an envelope wrapped to `names` at `service`.
+async fn append_at(
+    replay: &Replay,
+    service: &pubky_switch::service::Service,
+    names: &[&str],
+    byte: u8,
+) {
+    let publics: Vec<[u8; 32]> = names.iter().map(|name| receive_public(name)).collect();
+    let version = apps_version(replay).await;
+    let path = format!("/v1/{}/inbox?apps_version={version}", alice_id());
+    let request = other_request(
+        "shop",
+        ORIGIN,
+        "POST",
+        &path,
+        sealed_to(&publics, byte),
+        None,
+        ms(&at()),
+    );
+    let answer = service.handle(request).await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+}
+
+/// The signer revokes `name` at `service`.
+async fn revoke_at(service: &pubky_switch::service::Service, name: &str) {
+    let id = app(&vectors("keys.json"), name)["app_id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    let answer = service
+        .handle(signer_request(
+            "POST",
+            &format!("/v1/{}/apps/{id}/revoke", alice_id()),
+            Vec::new(),
+            ms(&at()),
+        ))
+        .await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+}
+
+/// Three current apps, and three entries for the executor alone appended at a service that
+/// marks no app, so the executor is over its share and unmarked.
+async fn three_apps_with_a_backlog() -> Option<Replay> {
+    let replay = replay_with(lagging_limits()).await?;
+    // The chain before the phone's revocation, so the wallet, the phone and the executor
+    // are current.
+    let chain = vectors("chain.json");
+    serve_alice(&replay).await;
+    replay_batch(&replay, &chain, &[3, 4]).await;
+    // Seq 5 is the chain's inbox entry.
+    replay.db.give_out_seq(&alice_id()).await.expect("seq");
+    replay_batch(&replay, &chain, &[6]).await;
+    replay_batch(&replay, &chain, &[7, 8]).await;
+    set_time(&replay.clock, &at());
+    register_phone(&replay, ms(&at())).await;
+    register_executor(&replay).await;
+    wallet_op(
+        &replay,
+        OpKind::AllowPut {
+            pubky: hex32(&bob()["public_hex"]),
+            kind: AllowKind::Contact,
+        },
+        61,
+    )
+    .await;
+    deliver_bob(&replay).await;
+    let quiet = replay.restarted_with(Limits {
+        mark_lagging: false,
+        ..lagging_limits()
+    });
+    for byte in 1..=3 {
+        append_at(&replay, &quiet, &["executor"], byte).await;
+    }
+    assert!(!lagging(&replay, "executor").await);
+    Some(replay)
+}
+
+/// A revocation that changes the set of current apps judges the marks for the new shares
+/// (Switch wire 7.4.4): the executor, over its share with the wallet reading, is marked, and
+/// the entries only it held go into its `missed` item.
+#[tokio::test]
+async fn test_inbox_a_departure_judges_the_marks() {
+    let Some(replay) = three_apps_with_a_backlog().await else {
+        return;
+    };
+    revoke_at(&replay.service, "phone").await;
+    assert!(lagging(&replay, "executor").await);
+    assert_eq!(count(&replay, "entry").await, 0);
+    assert_eq!(count(&replay, "missed").await, 1);
+    replay.db.drop_database().await.expect("drop");
+}
+
+/// The same revocation without trusted time sets no mark, and the entries wait (Switch wire
+/// 7.4.4).
+#[tokio::test]
+async fn test_inbox_a_departure_without_trusted_time_sets_no_marks() {
+    let Some(replay) = three_apps_with_a_backlog().await else {
+        return;
+    };
+    revoke_at(&replay.without_trusted_time_with(lagging_limits()), "phone").await;
+    assert!(!lagging(&replay, "executor").await);
+    assert_eq!(count(&replay, "entry").await, 3);
+    assert_eq!(count(&replay, "missed").await, 0);
     replay.db.drop_database().await.expect("drop");
 }

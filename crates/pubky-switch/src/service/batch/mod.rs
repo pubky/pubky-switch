@@ -388,7 +388,7 @@ pub(super) async fn settle_change(
     revoked: Option<[u8; 16]>,
     now: u64,
     release: Release,
-) -> Result<Vec<[u8; 16]>, StoreError> {
+) -> Result<CurrentApps, StoreError> {
     let mut before = load_apps(txn, held, now).await?;
     (before.directory_version, before.apps_version) = txn.directory_versions().await?;
     let mut after = before.clone();
@@ -402,9 +402,26 @@ pub(super) async fn settle_change(
     after.settle_directory(&before);
     save_apps(txn, &before, &after, release).await?;
     let current = after.current_app_ids();
-    let lagging = release.lagging(txn, &current).await?;
-    txn.delete_passed_entries(&current, &lagging).await?;
-    Ok(current)
+    let mut was = before.current_app_ids();
+    let mut now_current = current.clone();
+    was.sort_unstable();
+    now_current.sort_unstable();
+    // Entries wait for every current target until the marks are judged again for the new
+    // set of current apps, in this request ([`Release::departed`]): a mark set for the old
+    // shares deletes nothing (Switch wire 7.4.4).
+    txn.delete_passed_entries(&current, &[]).await?;
+    Ok(CurrentApps {
+        changed: was != now_current,
+        ids: current,
+    })
+}
+
+/// The current apps after an `identity.json` delivery, a revocation or a leave.
+pub(super) struct CurrentApps {
+    /// Their App IDs.
+    pub ids: Vec<[u8; 16]>,
+    /// Whether the request changed the set of current apps, and with it the shares.
+    pub changed: bool,
 }
 
 /// How a request releases inbox entries (Switch wire 7.4.4, 9.1): lagging marks count, and
@@ -456,25 +473,38 @@ impl Release {
         Ok(())
     }
 
-    /// After a departure's chain item, `current` holding the App IDs current after it: each
-    /// entry left with no current target becomes an unreadable item, in this request
-    /// (Switch wire 7.4.4); with trusted time the current apps' shares changed, so lagging
-    /// marks are set again ([`Release::mark`]).
+    /// After a departure's chain item, with the apps current after it: each entry left with
+    /// no current target becomes an unreadable item, in this request, and a departed app's
+    /// mark ends (Switch wire 7.4.4). When the set of current apps changed, so did the
+    /// shares, and lagging marks are judged again ([`Release::mark`]); a delivery that left
+    /// it as it was judges none.
     pub(super) async fn departed(
         &self,
         txn: &mut AccountTxn,
-        current: &[[u8; 16]],
+        current: &CurrentApps,
     ) -> Result<(), StoreError> {
-        txn.convert_unreadable(current, self.overhead).await?;
-        self.mark(txn, current).await
+        txn.convert_unreadable(&current.ids, self.overhead).await?;
+        let gone: Vec<[u8; 16]> = txn
+            .lagging_apps()
+            .await?
+            .into_iter()
+            .filter(|app| !current.ids.contains(app))
+            .collect();
+        txn.set_lagging(&gone, false).await?;
+        if current.changed {
+            self.mark(txn, &current.ids).await?;
+        }
+        Ok(())
     }
 
-    /// Set lagging marks, at a request that brings the pressure: an append, or a change of
-    /// the current apps `current` (Switch wire 7.4.4). With trusted time only, and with
-    /// `mark_lagging` on. An app whose unread bytes exceed its share, `quota` divided among
-    /// the current apps, is marked, unless no current app is within its share: then none is,
-    /// and the marks set before end, so entries wait and the quota refuses senders (A14).
-    /// Entries only newly marked apps were holding go now, each in its `missed` item.
+    /// Set lagging marks, at a request that brings the pressure: an append, before its quota
+    /// check, or a change of the current apps `current` (Switch wire 7.4.4). With trusted
+    /// time only, and with `mark_lagging` on. An app whose unread bytes exceed its share,
+    /// `quota` divided among the current apps, is marked, but only while another current app
+    /// is reading: unmarked, and within its share. When none is, none is marked, and the
+    /// marks set before end, so entries wait and the quota refuses senders (A14); so no state
+    /// has every current app marked, and a single current app is never marked. Entries only
+    /// marked apps were holding go now, each in its `missed` item.
     pub(super) async fn mark(
         &self,
         txn: &mut AccountTxn,
@@ -490,7 +520,11 @@ impl Release {
             .filter(|(_, bytes)| *bytes > share)
             .map(|(app, _)| *app)
             .collect();
-        if over.len() == current.len() {
+        let marked = txn.lagging_apps().await?;
+        let reading = current
+            .iter()
+            .any(|app| !over.contains(app) && !marked.contains(app));
+        if !reading {
             txn.set_lagging(current, false).await?;
             return Ok(());
         }
