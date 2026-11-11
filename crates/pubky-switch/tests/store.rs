@@ -1082,6 +1082,10 @@ async fn test_store_records_by_key_text_and_read_scope() {
         &["contacts", "request:shop1"],
         &["request"],
         &["contacts:y"],
+        // A prefix of a name is no parent of it.
+        &["pa"],
+        &["contact"],
+        &["pa_"],
         &[],
     ] {
         let held_owned: Vec<String> = held.iter().map(|s| (*s).to_string()).collect();
