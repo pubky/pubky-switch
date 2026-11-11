@@ -75,7 +75,7 @@ impl AccountTxn {
 
 impl SnapshotRead {
     /// Start reading, once the lock is gone. For tests, it first waits where a test asked it
-    /// to ([`super::testing::TestDatabase::pause_next_snapshot_read`]); otherwise it does
+    /// to (`TestDatabase::pause_next_snapshot_read`, with `test-util`); otherwise it does
     /// nothing.
     pub async fn start(&mut self) {
         #[cfg(any(test, feature = "test-util"))]
