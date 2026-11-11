@@ -3,7 +3,7 @@
 use std::collections::{BTreeSet, HashMap};
 
 use crate::allowed::{Allowed, EVERY_FLOW};
-use crate::trace::{Trace, string_number};
+use crate::trace::{Trace, VIOLATION, string_number};
 
 /// One fact the two runs disagree on.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -119,6 +119,12 @@ pub fn differences(service: &Trace, scripted: &Trace) -> Vec<Difference> {
                     scripted,
                 });
             };
+            // A check the harness made itself and that failed: a difference whatever the
+            // other run shows, the same failure included.
+            if fact.starts_with(VIOLATION) {
+                differ(service.cloned(), scripted.cloned());
+                continue;
+            }
             let numbers = (
                 service.and_then(|fact| string_number(fact)),
                 scripted.and_then(|fact| string_number(fact)),
@@ -428,6 +434,21 @@ mod tests {
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(found[0].service.as_deref(), Some("string of 43"));
         assert_eq!(found[0].scripted.as_deref(), Some("string of 44"));
+    }
+
+    #[test]
+    fn test_differences_report_a_violation_both_runs_show() {
+        let failed = line(
+            "{alice} GET /v1/{alice}/apps",
+            &[
+                ("status", "200"),
+                ("violation 1", "a head that doesn't verify"),
+            ],
+        );
+        let found = differences(&trace(vec![failed.clone()]), &trace(vec![failed]));
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].fact, "violation 1");
+        assert_eq!(found[0].service, found[0].scripted);
     }
 
     #[test]
