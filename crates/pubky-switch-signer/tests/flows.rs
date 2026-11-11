@@ -15,9 +15,9 @@ mod common;
 use common::*;
 use std::sync::Arc;
 
-use pubky_switch_client::StoreError;
 use pubky_switch_client::store::{Fault, FaultStore, MemoryStore, StateStore};
 use pubky_switch_client::testing::SWITCH_ORIGIN;
+use pubky_switch_client::{ClientError, StoreError};
 use pubky_switch_core::keys::IdentityKey;
 use pubky_switch_core::records::{
     IdentityDoc, Limits, SIGNER_BACKUP_PATH, SignerBackup, SignerRecords,
@@ -1141,4 +1141,35 @@ async fn test_signer_run_never_republishes_over_another_body_or_a_newer_copy() {
     );
     let _ = signer.run_due().await;
     assert_eq!(world.published().unwrap().signed(), theirs.signed());
+}
+
+#[tokio::test]
+async fn test_signer_too_large_is_a_definite_refusal() {
+    // The switch answers a delivery `413 too_large` (Switch wire 7.1): the same bytes would be
+    // refused again, so the delivery ends, its version spent, and signing goes on instead of
+    // retrying it for ever.
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    world
+        .switch
+        .fail_next(pubky_switch_client::testing::Fault::Error {
+            path: "/identity".into(),
+            code: pubky_switch_core::http::ErrorCode::TooLarge,
+            current: serde_json::Value::Null,
+        });
+    let error = signer.set_record_max_age(Some(3_600)).await.unwrap_err();
+    assert!(
+        matches!(
+            error,
+            SignerError::Switch(ClientError::Switch {
+                status: 413,
+                code: pubky_switch_core::http::ErrorCode::TooLarge,
+                ..
+            })
+        ),
+        "{error:?}"
+    );
+    let next = signer.set_record_max_age(Some(60)).await.unwrap();
+    assert_eq!(next.body().record_max_age, Some(60));
+    world.assert_no_version_sent_twice();
 }
