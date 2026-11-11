@@ -61,6 +61,8 @@ pub(super) fn refused(refusal: &Refusal) -> Answer {
 struct Draft {
     apps: BTreeMap<[u8; 16], SwitchApp>,
     bundles: BTreeMap<[u8; 16], Vec<(KeyBundlePut, u64)>>,
+    /// Where each app's `keys_through` starts (Switch wire 7.4.12).
+    listed_at_epoch: BTreeMap<[u8; 16], u64>,
     kids: BTreeMap<[u8; 8], [u8; 16]>,
     shared: Shared,
     /// The directory's versions (Switch wire 7.4.10).
@@ -264,6 +266,12 @@ impl Inner {
             )? == CursorMove::Moves
             {
                 *held = position.seq;
+                // The parts it now holds the keys of go (Switch wire 6.2).
+                let full = draft
+                    .apps
+                    .get(&app)
+                    .is_some_and(|held| held.full_requested.is_some());
+                drop_passed_parts(&mut draft, &app, full);
             }
         }
         if effect == BatchEffect::Unchanged {
@@ -417,6 +425,7 @@ impl Inner {
         Draft {
             apps: self.apps.clone(),
             bundles: self.bundles.clone(),
+            listed_at_epoch: self.listed_at_epoch.clone(),
             kids: self.kids.clone(),
             shared: self.shared.clone(),
             directory_version: self.directory_version,
@@ -428,6 +437,7 @@ impl Inner {
     fn commit(&mut self, draft: Draft) {
         self.apps = draft.apps;
         self.bundles = draft.bundles;
+        self.listed_at_epoch = draft.listed_at_epoch;
         self.kids = draft.kids;
         self.shared = draft.shared;
         self.directory_version = draft.directory_version;
@@ -573,6 +583,12 @@ impl Inner {
         let withdrawn = draft.apps.get(&target).is_some_and(|app| app.departed);
         let parts = draft.bundles.entry(target).or_default();
         let stored: Vec<KeyBundlePut> = parts.iter().map(|(part, _)| part.clone()).collect();
+        // A full-bundle request is judged as it was before this part (Switch wire 6.2).
+        let full = draft
+            .apps
+            .get(&target)
+            .is_some_and(|app| app.full_requested.is_some());
+        let parts = draft.bundles.entry(target).or_default();
         let bundle_seq = match check_key_bundle_put(put, self.doc.as_ref(), withdrawn, &stored)? {
             KeyBundleEffect::Unchanged => parts
                 .iter()
@@ -593,6 +609,7 @@ impl Inner {
                 {
                     app.full_requested = None;
                 }
+                drop_passed_parts(draft, &target, full);
                 seq
             }
         };
@@ -636,6 +653,46 @@ impl Inner {
         {
             contacts.push(id);
         }
+    }
+}
+
+/// Drop `target`'s key bundle parts its cursor has passed and its `keys_through` covers,
+/// unless `full`, a full bundle requested, by the core's rule (Switch wire 6.2): at a
+/// `key_bundle.put` and at a `cursor.set`, as the service does. Where its `keys_through`
+/// starts rises to the height the dropped parts gave, so it keeps it.
+fn drop_passed_parts(draft: &mut Draft, target: &[u8; 16], full: bool) {
+    let Some(parts) = draft.bundles.get(target) else {
+        return;
+    };
+    let spans: Vec<pubky_switch_core::ops::StoredPart> = parts
+        .iter()
+        .map(|(part, seq)| pubky_switch_core::ops::StoredPart {
+            first_epoch: part.first_epoch,
+            last_epoch: part.last_epoch,
+            seq: *seq,
+        })
+        .collect();
+    let cursor = draft.apps.get(target).map_or(0, |app| app.cursor);
+    let through = pubky_switch_core::ops::keys_through(
+        draft.listed_at_epoch.get(target).copied(),
+        &spans,
+        cursor,
+    );
+    let gone = pubky_switch_core::ops::parts_to_drop(&spans, cursor, through, full);
+    if gone.is_empty() {
+        return;
+    }
+    if let Some(through) = through {
+        let start = draft.listed_at_epoch.entry(*target).or_insert(through);
+        *start = (*start).max(through);
+    }
+    if let Some(parts) = draft.bundles.get_mut(target) {
+        let mut index = 0;
+        parts.retain(|_| {
+            let keep = !gone.contains(&index);
+            index += 1;
+            keep
+        });
     }
 }
 
