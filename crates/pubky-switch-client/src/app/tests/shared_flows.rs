@@ -2090,6 +2090,71 @@ async fn test_records_feed_write_under_a_scope_a_renewal_added_is_taken() {
     assert_eq!(ids(held.content.value()), vec!["a"]);
 }
 
+/// A renewal that adds a collection's read scope owes a listing: the writes there before it
+/// showed as stubs in the app's feed, so only the next read's listing brings them (Switch
+/// spec 8.3, Switch wire 7.4.9).
+#[tokio::test]
+async fn test_records_renewal_adding_a_read_scope_lists_the_collection() {
+    let s = Setup::new();
+    let mut wallet = join_scoped(&s, "wallet", &["scope-c"]).await;
+    let mut phone = s.join("phone").await;
+    let target = s.target("n1");
+    phone
+        .put_record(&target, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    let key = phone.record_key(&target).unwrap();
+    wallet.receive(None).await.unwrap();
+    assert!(wallet.shared_record(&key).await.unwrap().is_none());
+
+    s.w.clock.advance_ms(HOUR);
+    let earlier = wallet.cert().clone();
+    let renewed = renewed_cert(&s, "wallet", &["scope-a", "scope-c"]);
+    s.w.next_doc(|body| list_renewal(body, &earlier, &renewed, None));
+    wallet.receive(None).await.unwrap();
+    assert_eq!(wallet.cert().hash(), renewed.hash());
+    // The renewal's part came before the document that lists it, and was skipped: the
+    // signer stores the renewed certificate's keys again.
+    store_parts_for(&s, &renewed);
+    wallet.receive(None).await.unwrap();
+    let held = wallet.shared_record(&key).await.unwrap().unwrap();
+    assert_eq!(ids(held.content.value()), vec!["a"]);
+}
+
+/// The signer stores the key bundle made for `cert` over every epoch so far.
+fn store_parts_for(s: &Setup, cert: &AppCert) {
+    let has_keys = |scope: &str| SampleProtocol::default().has_keys(scope);
+    let epoch = s.w.switch.identity_doc().unwrap().data_epoch();
+    for part in seal_bundle_parts(&s.w.alice, cert, 1, epoch, &has_keys).unwrap() {
+        s.w.switch
+            .signer_op(OpKind::KeyBundlePut(KeyBundlePut {
+                target_app_id: cert.app_id(),
+                bundle: part.bundle,
+                first_epoch: part.first_epoch,
+                last_epoch: part.last_epoch,
+            }))
+            .unwrap();
+    }
+}
+
+/// A renewal that adds no read scope of a collection owes no listing.
+#[tokio::test]
+async fn test_records_renewal_adding_no_read_scope_lists_nothing() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    wallet.receive(None).await.unwrap();
+    let listings = s.w.switch.lock().shared.listings;
+
+    s.w.clock.advance_ms(HOUR);
+    let earlier = wallet.cert().clone();
+    let renewed = renewed_cert(&s, "wallet", &["scope-a", "scope-c"]);
+    s.w.next_doc(|body| list_renewal(body, &earlier, &renewed, None));
+    wallet.receive(None).await.unwrap();
+    wallet.receive(None).await.unwrap();
+    assert_eq!(wallet.cert().hash(), renewed.hash());
+    assert_eq!(s.w.switch.lock().shared.listings, listings);
+}
+
 /// A feed write under a certificate the reader never held: the phone joined after the
 /// wallet and kept none of its certificates, the wallet wrote while the phone was away, and
 /// a reduction dropped the record's scope. The newest `identity.json` names the earlier

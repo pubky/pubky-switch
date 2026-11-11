@@ -772,8 +772,9 @@ impl App {
         .await
     }
 
-    /// List the collections when a listing is owed: after joining, and after a `missed` item
-    /// (Switch spec 8.2, 8.3).
+    /// List the collections when a listing is owed: after joining, a restore, a `missed`
+    /// item, and a certificate taken that reads a collection the one before didn't (Switch
+    /// spec 8.2, 8.3).
     pub(crate) async fn list_collections_if_due(&mut self) -> Result<(), AppError> {
         if self.reader().exists(LIST_DUE).await? {
             self.list_collections().await?;

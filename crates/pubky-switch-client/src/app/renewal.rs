@@ -62,7 +62,9 @@ impl App {
     }
 
     /// Present `cert` from now on, with `record`; `deliver` signs its `app.put` and keeps it
-    /// before it is sent.
+    /// before it is sent. A certificate that reads a collection of the protocol the one
+    /// before didn't owes a listing, in the same commit, so the next read lists it (Switch
+    /// spec 8.3, Switch wire 7.4.9): the writes made there before it were stubs in the feed.
     async fn take_cert(
         &mut self,
         cert: AppCert,
@@ -70,9 +72,17 @@ impl App {
         deliver: bool,
     ) -> Result<(), AppError> {
         let issued_at = cert.issued_at();
+        let widened = self
+            .protocol
+            .collections()
+            .iter()
+            .any(|c| c.readable_by(&cert) && !c.readable_by(&self.state.cert));
         self.state.cert = cert;
         self.rebuild_client()?;
         let mut tx = self.tx()?;
+        if widened {
+            tx.put(super::records::LIST_DUE, &true)?;
+        }
         tx.put(key::CERT, self.state.cert.signed())?;
         tx.put(key::RECORD, &record)?;
         tx.delete(key::CERT_RENEWAL)?;
