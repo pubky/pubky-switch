@@ -2157,14 +2157,31 @@ Example (bob's `shop` reading alice's directory; signed documents cut short):
   - two outcomes for one attempt are two different outcomes from entries that both count;
   - an uploaded writer-signed `done` settles an attempt even when it is `failed` at N, flagged `duplicate` if another attempt is done;
   - an uploaded open attempt that N lacks, on an obligation SETTLED at N, is added orphaned and doesn't make it divergent, since it can't move the obligation away from SETTLED.
+- **How a claim merges** (spec 12.6 step 3):
+  - **Order:** an upload's entries for one claim key apply in `expected_step` order, so an attempt comes before its outcomes.
+  - **An `attempt` entry** for an attempt N holds changes nothing. One N lacks is added, marked `from_upload` and owned by its writer, opened at its proof's time, else at the upload's service time:
+    - on a claim N holds nothing for, as a new claim with that attempt current, the entry's deadline pinned and its writer the creator;
+    - on a FREE claim, as its current attempt;
+    - beside an open attempt, making the claim divergent;
+    - on a SETTLED claim, beside the others;
+    - on a tombstone, after reopening it.
+
+    Past `max_attempts_per_claim` it is dropped and the claim becomes divergent: N lacks evidence of an attempt, so the obligation is doubtful.
+  - **An outcome entry** for an attempt N doesn't hold first adds the attempt from its proof's claim view. Without a proof that shows the attempt, the entry is left out and counted in `refused`: neither the attempt's owner nor its members are known.
+    - A `done` settles the attempt: `done`, resolved by its writer, `duplicate` if another attempt is done.
+    - A `failed` or `unknown` applies to an open attempt. On an attempt with another outcome it makes the claim divergent instead. The same outcome again changes nothing.
+    - Divergence clears as after any entry, once no attempt on the claim is open or `unknown` (6.8).
+  - **Each upload that changes a claim** marks it `rebuilt` and moves its `step` by one, so a write at N that read the step before is stale (`409 conflict`). Its last entry time becomes the upload's. A finished claim is compacted to a tombstone, as after any entry.
+  - **A tombstone rebuilt from a SETTLED proof** takes the proof's attempts, marked `from_upload`, its deadline, its first attempt's owner as creator, and the proof's time as its last entry time.
+  - **A removed app's operation** counts when its proof dates it at or before the app's `distrust_from`, as a removed app's write does (spec 10.3).
 - **Records** (spec 12.6 step 3): an uploaded record's version is the one O's transition proof gives it; without that proof, the version it built on plus one is a lower bound. It fills in a record N lacks; two different uploads that build on one version are divergent; a write at N conflicts with an upload newer than the uploaded version the writes at N built on, or with any upload if they built on none.
   - **The proof that gives a version** is the operation's own `proof`, or a `proofs` entry whose stub's `item_hash` is the operation's, either one verifying with the lost generation's service key.
   - **Generations:** an operation of the lost generation or an earlier one counts. A proof counts only when it verifies with the lost generation's key, so an earlier generation's proof counts as none, and its operation gets the lower bound. An operation of N's generation or a later one is `unverified`: it belongs in `POST /ops`. Uploaded operations aren't checked against the current `data_epoch` (6.2).
-  - **Comparing:** a lower bound counts as its value.
+  - **Comparing:** a lower bound counts as its value, the least version of the operation's own generation above the one it built on.
     - An upload strictly newer than a record N holds only from uploads replaces it. An older one changes nothing and is counted nowhere.
     - One at the same version with another operation, or one building on the same version as the held one with another operation, is divergent.
     - The same operation again, byte for byte, changes nothing, unless it comes with a proof where the record held only a lower bound; the version is then the proof's.
-  - **Writes at N win.** A write at N builds on the record view's `generation` and `version`, as for any record. The uploaded version the first write at N on an upload-taken record built on is the one later uploads are compared with. An upload that conflicts with writes at N is never refused and never supersedes them: it is kept as a divergent upload, and the record's view shows `divergent: true`, until a writer writes a newer version at N, which clears the record's divergent uploads.
+  - **Writes at N win.** A write at N builds on the record view's `generation` and `version`, as for any record. The uploaded version the first write at N on an upload-taken record built on is the one later uploads are compared with; an upload at that version itself isn't newer, so it changes nothing. An upload that conflicts with writes at N is never refused and never supersedes them: it is kept as a divergent upload, and the record's view shows `divergent: true`, until a writer writes a newer version at N, which clears the record's divergent uploads.
   - **Past `max_divergent_uploads`** (9.2), a record's further divergent uploads are dropped, and still listed in `divergent`.
   - **A record taken from an upload** has no `record.put` chain item at N. Its view's `seq` is the `upload` transition's, which lists its key, and it carries no `proof` (7.4.9). Apps learn of it from that transition in the feed, and read it with `GET /records`.
 - **`heads` and `proofs` after a provider loss** are evidence N checks and uses, not state it keeps. A head is verified and counted, never stored: O's heads show order, not authority (spec 12.6 step 3). A `proofs` entry is used in the merge: a SETTLED proof rebuilds the tombstone of an obligation N holds nothing for, and a record version proof dates an uploaded operation (above). The transition's `proofs` counts the entries that verified.
