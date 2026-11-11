@@ -4231,3 +4231,57 @@ async fn test_scripted_feed_shows_a_compacted_claims_entries_as_stubs() {
         "{entries:?}"
     );
 }
+
+#[tokio::test]
+async fn test_scripted_feed_visibility_follows_a_listed_renewal() {
+    // Switch wire 3.8, 7.5: an item's visibility is judged with the certificate the app is
+    // checked against, a stored renewed one once the newest `identity.json` lists it. The
+    // renewal adds `lists.read`, so the app reads an `allow.put` in full from then on.
+    let w = World::new();
+    let app = w.join("wallet").await;
+    let me = app.app_id();
+    let old = app.cert().clone();
+    let renewed = crate::testing::issue_cert(
+        &w.alice,
+        &app_keys("wallet"),
+        &AppSpec::new(&["scope-a"])
+            .with_permissions(&[Permission::ListsRead, Permission::ConversationAdd]),
+        w.clock.now_ms() + 1000,
+    )
+    .unwrap();
+    w.switch
+        .signer_op(OpKind::CertPut {
+            target_app_id: me,
+            cert: renewed.signed().clone(),
+        })
+        .unwrap();
+    w.next_doc(|body| {
+        body.apps.retain(|a| a.app_id != me);
+        body.apps.push(ListedApp {
+            app_id: me,
+            cert: renewed.hash(),
+        });
+        body.renewed.push(RenewedCert {
+            app_id: me,
+            cert: old.hash(),
+            until: None,
+        });
+    });
+    let mut manager = join_holding(&w, "manager", &[Permission::ListsManage]).await;
+    let before = w.switch.seq();
+    manager.add_contact(&w.bob.public()).await.unwrap();
+    let seq = w
+        .switch
+        .shown(manager.app_id())
+        .into_iter()
+        .find(|item| item["seq"].as_u64().unwrap() > before && item["type"] == "stub")
+        .expect("the allow.put's item")["seq"]
+        .clone();
+    let item = w
+        .switch
+        .shown(me)
+        .into_iter()
+        .find(|item| item["seq"] == seq)
+        .unwrap();
+    assert_eq!(item["type"], "chain", "{item}");
+}

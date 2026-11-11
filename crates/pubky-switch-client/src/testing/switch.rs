@@ -1002,15 +1002,17 @@ impl ScriptedSwitch {
         Ok(inner.seq)
     }
 
-    /// The feed items `app` is shown, in order, as its feed would page them (Switch wire
-    /// 7.4.4, 7.5): for tests of what the fake shows each app.
+    /// The feed items `app` is shown, in order, as its feed would page them, judged with the
+    /// certificate the app is checked against (Switch wire 3.8, 7.4.4, 7.5): for tests of
+    /// what the fake shows each app.
     #[cfg(test)]
     pub(crate) fn shown(&self, app: [u8; 16]) -> Vec<Value> {
         let inner = self.lock();
+        let cert = inner.checked_cert(&app);
         inner
             .items
             .iter()
-            .filter_map(|item| inner.show(item, app))
+            .filter_map(|item| inner.show(item, app, cert.as_ref()))
             .collect()
     }
 
@@ -1451,9 +1453,12 @@ impl Inner {
         let Some(app) = caller else {
             return bad(ErrorCode::PermissionMissing, "own apps only", json!(null));
         };
-        if let Err(refusal) = self.own_call(&app) {
-            return batch::refused(&refusal);
-        }
+        // Visibility is judged with the certificate the app is checked against: a stored
+        // renewed one once the newest `identity.json` lists it (Switch wire 3.8, 7.5).
+        let cert = match self.own_call(&app) {
+            Ok(cert) => cert,
+            Err(refusal) => return batch::refused(&refusal),
+        };
         if self
             .feed_limit
             .is_some_and(|limit| self.feed_reads >= limit)
@@ -1500,7 +1505,7 @@ impl Inner {
             }
             let shown: Vec<Value> = group
                 .iter()
-                .filter_map(|item| self.show(item, app))
+                .filter_map(|item| self.show(item, app, Some(&cert)))
                 .collect();
             let size: usize = shown.iter().map(|value| value.to_string().len()).sum();
             // The byte budget ends a page before a group that would pass it, but the page's
@@ -1541,7 +1546,9 @@ impl Inner {
         b64(&[seq.to_le_bytes()[0]; 16])
     }
 
-    fn show(&self, item: &Item, app: [u8; 16]) -> Option<Value> {
+    /// How `item` shows to own app `app`, checked against `cert` (Switch wire 7.5); `None`
+    /// for an item it isn't shown at all.
+    fn show(&self, item: &Item, app: [u8; 16], cert: Option<&AppCert>) -> Option<Value> {
         Some(match item {
             Item::Entry {
                 seq,
@@ -1575,7 +1582,6 @@ impl Inner {
                 if *seq <= self.dropped_through {
                     return None;
                 }
-                let cert = self.apps.get(&app).and_then(|held| held.cert.as_ref());
                 let compacted = |key: &[u8]| {
                     <[u8; 32]>::try_from(key).is_ok_and(|key| {
                         self.shared
