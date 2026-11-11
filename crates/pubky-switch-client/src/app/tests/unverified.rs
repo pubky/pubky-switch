@@ -564,3 +564,50 @@ async fn test_unverified_bound_applies_before_a_layered_backup() {
     .unwrap();
     assert_eq!(restored.stored_seqs().len(), MAX_UNVERIFIED_TOTAL);
 }
+
+#[tokio::test]
+async fn test_unverified_bound_skipped_by_a_layered_backup_of_a_halted_app() {
+    let w = World::new();
+    let counting = Arc::new(Counting {
+        inner: Arc::clone(&w.store),
+        deleted: Mutex::new(Vec::new()),
+    });
+    let mut app = wallet(&w, w.env_on(Arc::clone(&counting) as Arc<dyn StateStore>)).await;
+    let a1 = peer(&w, "hostile-1");
+    let a2 = peer(&w, "hostile-2");
+    let h = peer(&w, "honest");
+    stored_unverified(
+        &w,
+        &mut app,
+        &[
+            (&h, 10),
+            (&a1, MAX_UNVERIFIED_PER_SENDER),
+            (&a2, MAX_UNVERIFIED_PER_SENDER),
+        ],
+    )
+    .await;
+    assert_eq!(app.stored_seqs().len(), 138);
+    // Halted by an alarm: the backup is taken read-only, with every entry, and nothing is
+    // committed or dropped.
+    app.state.alarm = Some(crate::app::Alarm::Rollback {
+        reason: "test".into(),
+    });
+    let commits = counting.deleted.lock().unwrap().len();
+    let backup = app.backup_layered().await.unwrap();
+    assert_eq!(counting.deleted.lock().unwrap().len(), commits);
+    assert_eq!(app.stored_seqs().len(), 138);
+    assert!(dropped(&app.kept_duties().await.unwrap()).is_empty());
+    let restored = App::restore(
+        w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
+        Arc::new(BackedUp::default()),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    assert_eq!(restored.stored_seqs().len(), 138);
+    // Running again, the next backup applies the bounds.
+    app.state.alarm = None;
+    app.backup_layered().await.unwrap();
+    assert_eq!(app.stored_seqs().len(), MAX_UNVERIFIED_TOTAL);
+}
