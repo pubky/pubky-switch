@@ -908,7 +908,7 @@ fn test_recovery_changes_refuse_a_malformed_object() {
     assert!(UploadChanges::from_value(&value).is_err());
 }
 
-// The merge's edges, from #127's review.
+// The merge's edges: creates again, forks, bases of two generations, proofs of other claims.
 
 const OP3: [u8; 32] = [33; 32];
 

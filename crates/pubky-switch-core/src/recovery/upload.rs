@@ -283,20 +283,15 @@ fn distrust_from(removed: &[RemovedApp], writer: &[u8; 16]) -> Option<u64> {
         .map(|r| r.distrust_from)
 }
 
-/// An uploaded operation that verified for the identity, with its certificate and kind
-/// (Switch wire 7.4.14 `unverified`): its certificate verifies, the operation verifies
-/// with it, is of `kind`, has a shape every service takes (6.4 step 9), its certificate
-/// holds what its kind needs, and it is of the lost generation or an earlier one.
-fn verified_op(
-    uploaded: &UploadedOp,
-    cx: &UploadContext<'_>,
-    kind: &str,
-) -> Option<(SignedOp, AppCert)> {
+/// An uploaded operation that verified for the identity, with its certificate (Switch wire
+/// 7.4.14 `unverified`): its certificate verifies, the operation verifies with it, has a
+/// shape every service takes (6.4 step 9), its certificate holds what its kind needs, and it
+/// is of the lost generation or an earlier one. The caller checks its type.
+fn verified_op(uploaded: &UploadedOp, cx: &UploadContext<'_>) -> Option<(SignedOp, AppCert)> {
     let cert = AppCert::verify(&uploaded.cert, cx.identity).ok()?;
     let op = SignedOp::verify_with_cert(&uploaded.op, &cert, cx.identity).ok()?;
     let body = op.body();
-    let counts = body.kind.name() == kind
-        && check_shape(body).is_ok()
+    let counts = check_shape(body).is_ok()
         && check_permission(&body.kind, Writer::App(&cert)).is_ok()
         && body.generation <= cx.recovery_from;
     counts.then_some((op, cert))
@@ -354,7 +349,7 @@ pub fn check_upload(body: &UploadBody, cx: &UploadContext<'_>) -> CheckedUpload 
     }
 
     for uploaded in &body.records {
-        let Some((op, cert)) = verified_op(uploaded, cx, "record.put") else {
+        let Some((op, cert)) = verified_op(uploaded, cx) else {
             out.unverified += 1;
             continue;
         };
@@ -409,7 +404,7 @@ pub fn check_upload(body: &UploadBody, cx: &UploadContext<'_>) -> CheckedUpload 
     }
 
     for uploaded in &body.claims {
-        let Some((op, cert)) = verified_op(uploaded, cx, "claim") else {
+        let Some((op, cert)) = verified_op(uploaded, cx) else {
             out.unverified += 1;
             continue;
         };

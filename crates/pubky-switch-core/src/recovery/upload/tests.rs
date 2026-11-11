@@ -107,6 +107,22 @@ fn put(built_on: RecordVersion) -> RecordPut {
     }
 }
 
+/// [`put`] on (3, 10), its value sealed under `scope` instead of its read scope.
+fn sealed_under(scope: &str) -> RecordPut {
+    let id = identity();
+    let mut put = put(RecordVersion::new(3, 10));
+    put.value_sealed = SealedValue::seal(
+        &id.scope_key(1, scope),
+        &id.public(),
+        1,
+        scope,
+        &put.key,
+        b"{}",
+    )
+    .unwrap();
+    put
+}
+
 fn record_op(generation: u64) -> SignedOp {
     op_at(
         generation,
@@ -303,6 +319,10 @@ fn test_upload_lists_need_the_callers_permission() {
     assert!(missing(&contacts, &read));
     assert!(contacts.check_permissions(&manage).is_ok());
     assert!(contacts.ends_staged_admission(&manage));
+    assert!(
+        !contacts.ends_staged_admission(&read),
+        "not without lists.manage"
+    );
     // Deny entries need lists.read or lists.manage, and end nothing.
     let deny = lists(None, Some(vec![[40; 32]]));
     assert!(missing(&deny, &none));
@@ -362,6 +382,8 @@ fn test_upload_out_of_range_proof_counts_as_none() {
         RecordVersion::new(3, 10),
         RecordVersion::new(3, 4),
         RecordVersion::new(2, 50),
+        // Above the version it built on, of another generation than its own.
+        RecordVersion::new(4, 1),
     ] {
         let state = ProofState::Record {
             version,
@@ -451,6 +473,11 @@ fn test_upload_operation_that_doesnt_verify_is_unverified() {
         uploaded(&record_op(LOST + 1), None),
         // A claim entry among the records.
         uploaded(&op_at(LOST, OpKind::Claim(attempt_fields())), None),
+        // Sealed under another scope than its read scope: a shape no service takes.
+        uploaded(
+            &op_at(LOST, OpKind::RecordPut(sealed_under("scope-b"))),
+            None,
+        ),
         // Built on a later generation than its own.
         uploaded(
             &op_at(LOST, OpKind::RecordPut(put(RecordVersion::new(4, 1)))),
@@ -459,7 +486,7 @@ fn test_upload_operation_that_doesnt_verify_is_unverified() {
     ];
     let checked = check(&body_with(records, vec![uploaded(&op, None)]), &[]);
     assert!(checked.records.is_empty() && checked.claims.is_empty());
-    assert_eq!(checked.unverified, 7);
+    assert_eq!(checked.unverified, 8);
     // An earlier generation's operation counts, with its bound.
     let earlier = op_at(2, OpKind::RecordPut(put(RecordVersion::new(2, 10))));
     let checked = check(&body_with(vec![uploaded(&earlier, None)], vec![]), &[]);
