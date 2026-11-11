@@ -320,7 +320,7 @@ impl Inner {
     /// the core's rule: the epoch of the first version that listed it, if kept, raised by each
     /// stored part its cursor has passed that continues it, from epoch 1 when the start is
     /// unknown; `None` when nothing shows any.
-    fn keys_through(&self, app: &[u8; 16]) -> Option<u64> {
+    pub(super) fn keys_through(&self, app: &[u8; 16]) -> Option<u64> {
         let start = self.listed_at_epoch.get(app).copied();
         let spans: Vec<pubky_switch_core::ops::StoredPart> = self
             .bundles

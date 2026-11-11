@@ -22,13 +22,14 @@ use crate::{FlowResult, World};
 /// reads its own directory and the lists, follows its feed from the backup's cursor, and
 /// fetches the new epoch's keys again.
 ///
-/// The restored wallet asks for no full bundle: the bundle part of the new epoch is still
-/// stored for it, so it lacks nothing. `POST /v1/{id}/apps/{app_id}/keys` would follow only
-/// if that part were gone.
+/// The restored wallet asks for a full bundle: the bundle part of the new epoch went once the
+/// wallet's cursor passed it before the loss (Switch wire 6.2), so the restored wallet,
+/// behind it again, lacks that epoch's keys.
 ///
 /// Calls, beyond a revocation's: an own app's `GET /v1/{id}/directory`, `GET /v1/{id}/allow`
-/// after a restore, `GET /v1/{id}/feed` from an earlier cursor, and `GET
-/// /v1/{id}/apps/{app_id}/keys` with a part the app already read once.
+/// after a restore, `GET /v1/{id}/feed` from an earlier cursor, `GET
+/// /v1/{id}/apps/{app_id}/keys` once its part is gone, and `POST
+/// /v1/{id}/apps/{app_id}/keys`.
 ///
 /// # Errors
 ///

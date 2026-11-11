@@ -103,10 +103,8 @@ pub fn flow_of(call: &Call) -> Option<&'static str> {
         Call::PutHandover | Call::GetHandover => Some("hand-over"),
         Call::GetRecord(_) | Call::ListRecords => Some("records"),
         Call::Erase => Some("erasure"),
-        // Served, and waiting for its flow: an app asks for a full bundle only when it
-        // lacks an epoch's keys, and no honest flow leaves it lacking one while the service
-        // keeps every bundle part (the restore flow shows it).
-        Call::RequestKeys(_) => None,
+        // A restored app lacks the keys of a part it passed before its loss, which went.
+        Call::RequestKeys(_) => Some("restore"),
         // Not served yet.
         Call::PostConnect
         | Call::GetConnect
