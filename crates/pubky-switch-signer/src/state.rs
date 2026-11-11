@@ -363,15 +363,13 @@ impl SignerState {
         }
     }
 
-    /// Note the size of the newest version, `bytes`, the larger of its delivery and a move's
-    /// enrollment carrying it (Switch wire 3.7, 7.1): [`Alert::IdentityNearLimit`] past three
-    /// quarters of the body cap they share, replacing an earlier one, or none.
-    pub(crate) fn note_size(&mut self, bytes: usize) {
+    /// Note the size of the newest version, `bytes` in the body it comes nearest to filling,
+    /// its delivery or a move's enrollment carrying it, whose cap is `limit` (Switch wire
+    /// 3.7, 7.1): [`Alert::IdentityNearLimit`] past three quarters of it, replacing an
+    /// earlier one, or none.
+    pub(crate) fn note_size(&mut self, bytes: usize, limit: usize) {
         self.alerts
             .retain(|alert| !matches!(alert, Alert::IdentityNearLimit { .. }));
-        let Some(limit) = pubky_switch_core::http::body_cap("PUT", "/v1/id/identity") else {
-            return;
-        };
         if bytes.saturating_mul(4) > limit.saturating_mul(3) {
             self.alerts.push(Alert::IdentityNearLimit {
                 bytes: u64::try_from(bytes).unwrap_or(u64::MAX),
@@ -572,13 +570,13 @@ mod tests {
             limit: limit as u64,
         };
         let mut state = SignerState::new([1; 32], [2; 16]);
-        state.note_size(limit * 3 / 4);
+        state.note_size(limit * 3 / 4, limit);
         assert!(state.alerts.is_empty());
-        state.note_size(limit * 3 / 4 + 1);
+        state.note_size(limit * 3 / 4 + 1, limit);
         assert_eq!(state.alerts, [near(limit * 3 / 4 + 1)]);
-        state.note_size(limit + 10);
+        state.note_size(limit + 10, limit);
         assert_eq!(state.alerts, [near(limit + 10)]);
-        state.note_size(1_000);
+        state.note_size(1_000, limit);
         assert!(state.alerts.is_empty());
     }
 

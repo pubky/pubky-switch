@@ -33,7 +33,7 @@ use serde_json::Value;
 
 use super::{AbortOutcome, CertChange, Signer, SignerEnv, UserConfirmed};
 use crate::alert::Alert;
-use crate::error::{Refusal, SignerError};
+use crate::error::{Refusal, SignerError, SizedBody};
 use crate::homeserver::Homeserver;
 use crate::key::{AddOutcome, IdentityKeyring, IdentitySecret, SecretVault, VaultError};
 use crate::protocol::{Protocol, Protocols, ScopeDef};
@@ -706,6 +706,38 @@ async fn test_vectors_old_signer_measures_the_enrollment_form_too() {
     assert!(near_limit(&old.signer));
 }
 
+/// An identity whose delivery fits but whose move's enrollment, which carries it encoded
+/// twice, wouldn't: a change that keeps it there is refused before anything is signed, as one
+/// over the delivery's cap is, since the identity could never move (Switch wire 3.7, 7.1).
+#[tokio::test]
+async fn test_vectors_old_signer_signs_no_version_that_cant_move() {
+    let mut old = old_signer().await;
+    let v3 = IdentityDoc::verify(&document("alice identity.json"), &old.key.public()).unwrap();
+    let large = with_renewed(&mut old, 1_300, Some(VECTOR_START_MS)).await;
+    let delivery = pubky_switch_core::http::IdentityDelivery {
+        identity: large.signed().clone(),
+        prev: Some(v3.hash()),
+    };
+    let limit = super::identity_limit().unwrap();
+    assert!(
+        delivery.to_json().len() + 1_000 < limit,
+        "the delivery alone fits: {}",
+        delivery.to_json().len()
+    );
+    let refused = old.signer.set_record_max_age(Some(60)).await.unwrap_err();
+    assert!(
+        matches!(
+            refused,
+            SignerError::Refused(Refusal::IdentityTooLarge { .. })
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(
+        old.signer.identity_doc().unwrap().unwrap().hash(),
+        large.hash()
+    );
+}
+
 /// An identity over the size a delivery may carry: a change that keeps it there is refused
 /// before anything is signed, and so is the automatic renewal, which the run skips with the
 /// near-limit alert; a revocation, which drops the app's `renewed` entries, goes through
@@ -832,13 +864,13 @@ async fn test_vectors_old_signer_counts_the_closings_its_open_renewals_owe() {
 #[tokio::test]
 async fn test_vectors_old_signer_keeps_headroom_under_the_cap() {
     let mut old = old_signer().await;
-    let limit = super::identity_limit().unwrap();
-    // About as many closed entries as fill the cap; then version 5, the inbox's host padded
-    // so that version 6, the change below, lands a few bytes under the cap.
-    let large = with_renewed(&mut old, 1_520, Some(VECTOR_START_MS)).await;
-    let size = |body: &pubky_switch_core::records::IdentityBody| {
-        super::delivery_len(body.to_json().unwrap().len())
-    };
+    // About as many closed entries as fill the cap that binds, a move's enrollment's; then
+    // version 5, the inbox's host padded so that version 6, the change below, lands a few
+    // bytes under it.
+    let entries = entries_near_the_cap(&old.signer, 2_000);
+    let large = with_renewed(&mut old, entries, Some(VECTOR_START_MS)).await;
+    let prev = Some(large.hash());
+    let size = |body: &pubky_switch_core::records::IdentityBody| binding(&old.signer, body, prev);
     let padded = |pad: usize| {
         let mut body = large.body().clone();
         body.version = 5;
@@ -851,10 +883,10 @@ async fn test_vectors_old_signer_keeps_headroom_under_the_cap() {
         next.record_max_age = Some(60);
         next
     };
-    let pad = (0..2_000)
+    let pad = (0..3_000)
         .find(|pad| {
-            let bytes = size(&next(&padded(*pad)));
-            bytes <= limit && bytes + 8 > limit
+            let measure = size(&next(&padded(*pad)));
+            measure.bytes <= measure.limit && measure.bytes + 8 > measure.limit
         })
         .expect("a padding that lands within the headroom");
     let five = IdentityDoc::sign(&old.key, padded(pad)).unwrap();
@@ -867,8 +899,11 @@ async fn test_vectors_old_signer_keeps_headroom_under_the_cap() {
     assert!(
         matches!(
             refused,
-            SignerError::Refused(Refusal::IdentityTooLarge { bytes, limit })
-                if bytes <= limit
+            SignerError::Refused(Refusal::IdentityTooLarge {
+                body: SizedBody::Enrollment,
+                bytes,
+                limit,
+            }) if bytes <= limit
         ),
         "{refused:?}"
     );
@@ -882,7 +917,6 @@ async fn test_vectors_old_signer_closes_a_reduction_within_the_headroom() {
     use pubky_switch_core::records::IdentityBody;
     let mut old = old_signer().await;
     let alice = old.key.public();
-    let limit = super::identity_limit().unwrap();
     let renewed = AppCert::verify(&document("wallet certificate, renewed"), &alice).unwrap();
     old.signer.state.certs.push(renewed.signed().clone());
     let v3 = IdentityDoc::verify(&document("alice identity.json"), &alice).unwrap();
@@ -893,7 +927,7 @@ async fn test_vectors_old_signer_closes_a_reduction_within_the_headroom() {
     .unwrap();
     // Closed entries enough to come near the cap, as the wallet's earlier certificates.
     let listed = AppCert::verify(&document("wallet certificate"), &alice).unwrap();
-    let filler: Vec<RenewedCert> = (0..1_520u32)
+    let filler: Vec<RenewedCert> = (0..entries_near_the_cap(&old.signer, 2_000))
         .map(|n| {
             let mut earlier = listed.body().clone();
             earlier.issued_at -= u64::from(n) + 1;
@@ -906,7 +940,7 @@ async fn test_vectors_old_signer_closes_a_reduction_within_the_headroom() {
             }
         })
         .collect();
-    let size = |body: &IdentityBody| super::delivery_len(body.to_json().unwrap().len());
+    let size = |body: &IdentityBody| binding(&old.signer, body, Some(renewing.hash()));
     let padded = |pad: usize| {
         let mut body = renewing.body().clone();
         body.renewed.extend(filler.iter().copied());
@@ -921,11 +955,11 @@ async fn test_vectors_old_signer_closes_a_reduction_within_the_headroom() {
         }
         next
     };
-    // The closing lands within the headroom, under the cap.
-    let pad = (0..2_000)
+    // The closing lands within the headroom, under the cap that binds.
+    let pad = (0..3_000)
         .find(|pad| {
-            let bytes = size(&closing(&padded(*pad)));
-            bytes <= limit && bytes + 8 > limit
+            let measure = size(&closing(&padded(*pad)));
+            measure.bytes <= measure.limit && measure.bytes + 8 > measure.limit
         })
         .expect("a padding that lands the closing within the headroom");
     let four = IdentityDoc::sign(&old.key, padded(pad)).unwrap();
@@ -944,5 +978,49 @@ async fn test_vectors_old_signer_closes_a_reduction_within_the_headroom() {
         old.signer.owed().unwrap().is_empty(),
         "the closing was delivered"
     );
-    assert_eq!(old.signer.identity_doc().unwrap().unwrap().version(), 5);
+    let closed = old.signer.identity_doc().unwrap().unwrap();
+    assert_eq!(closed.version(), 5);
+    // The closed version still fits every body, its delivery and a move's enrollment.
+    for measure in super::measures(&old.signer.state, closed.body(), Some(four.hash())).unwrap() {
+        assert!(measure.bytes <= measure.limit, "{measure:?}");
+    }
+}
+
+/// The measure of `body`, built on `prev`, that comes nearest its cap, as the signer judges
+/// it.
+fn binding(
+    signer: &Signer,
+    body: &pubky_switch_core::records::IdentityBody,
+    prev: Option<[u8; 32]>,
+) -> super::Measure {
+    super::measures(&signer.state, body, prev)
+        .unwrap()
+        .into_iter()
+        .max_by(|a, b| (a.bytes * b.limit).cmp(&(b.bytes * a.limit)))
+        .unwrap()
+}
+
+/// How many closed `renewed` entries alice's version 3 can take with the body that binds,
+/// a move's enrollment, at least `margin` bytes under its cap, and as few as possible more.
+fn entries_near_the_cap(signer: &Signer, margin: usize) -> u32 {
+    let v3 = IdentityDoc::verify(&document("alice identity.json"), &signer.state.identity).unwrap();
+    let with = |entries: u32| {
+        let mut body = v3.body().clone();
+        body.version = 6;
+        body.renewed = (0..entries)
+            .map(|n| {
+                let mut cert = [0u8; 32];
+                cert[..4].copy_from_slice(&n.to_be_bytes());
+                RenewedCert {
+                    app_id: body.apps[0].app_id,
+                    cert,
+                    until: Some(VECTOR_START_MS),
+                }
+            })
+            .collect();
+        let measure = binding(signer, &body, Some(v3.hash()));
+        assert_eq!(measure.body, SizedBody::Enrollment);
+        measure.bytes + margin <= measure.limit
+    };
+    (0..2_000).take_while(|n| with(*n)).last().unwrap()
 }
