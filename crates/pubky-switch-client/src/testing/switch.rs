@@ -407,16 +407,23 @@ impl Transport for Holding {
             if let Some(held) = self.0.waiting_read(&request) {
                 held.await;
             }
+            // Answered as the account stands now: a reader revoked or departed while its
+            // read was held is refused, and an account erased meanwhile is one the switch
+            // doesn't host, as at the service (Switch wire 7.4.4, 7.4.16).
             self.0.handle(&request)
         })
     }
 }
 
-/// A feed read the switch holds: ready once the feed has something to show its app, or
-/// its wait has passed.
+/// A feed read the switch holds, admitted when it arrived: ready once the feed has
+/// something to show its app, its wait has passed, or the account is gone. A departure of
+/// its app shows it the departure's chain item, so it is ready then too. The switch's lock
+/// is held only while it looks, never across the wait.
 struct Held<'a> {
     switch: &'a ScriptedSwitch,
     app: [u8; 16],
+    /// The certificate the app was current with when the read arrived.
+    cert: AppCert,
     after: u64,
     until_ms: u64,
 }
@@ -426,7 +433,11 @@ impl Future for Held<'_> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         let mut inner = self.switch.lock();
-        if inner.now() >= self.until_ms || inner.shows_after(self.app, self.after) {
+        if inner.now() >= self.until_ms
+            || inner.erased
+            || inner.enrolled.is_none()
+            || inner.shows_after(self.app, &self.cert, self.after)
+        {
             return Poll::Ready(());
         }
         inner.held.push(cx.waker().clone());
@@ -819,8 +830,9 @@ impl ScriptedSwitch {
         self.lock().held.len()
     }
 
-    /// The wait of `request`, if it is a feed read with `wait` that an own app sent: the
-    /// app, the `seq` it reads after, and when its wait ends by the switch's clock.
+    /// The wait of `request`, if it is a feed read with `wait` that a current own app sent:
+    /// the app and its certificate, the `seq` it reads after, and when its wait ends by the
+    /// switch's clock.
     fn waiting_read(&self, request: &Request) -> Option<Held<'_>> {
         if request.method != "GET" {
             return None;
@@ -842,13 +854,21 @@ impl ScriptedSwitch {
             }
         }
         let wait_s = wait.filter(|seconds| *seconds > 0)?;
-        let until_ms = self
-            .lock()
-            .now()
-            .saturating_add(wait_s.saturating_mul(1000));
+        // The read is admitted as it arrives, as the service admits it under its lock: an
+        // account that is gone or an app that isn't current is answered at once, and the
+        // app is seen now, not when its read is answered.
+        let mut inner = self.lock();
+        if inner.erased || inner.enrolled.is_none() {
+            return None;
+        }
+        let cert = inner.own_call(&app).ok()?;
+        inner.seen(request);
+        let until_ms = inner.now().saturating_add(wait_s.saturating_mul(1000));
+        drop(inner);
         Some(Held {
             switch: self,
             app,
+            cert,
             after,
             until_ms,
         })
@@ -1380,12 +1400,11 @@ impl Inner {
 
     /// Whether the feed has an item past `after` to show own app `app`, whole or as a stub:
     /// a read with `wait` is held while it has none (Switch wire 7.4.4).
-    fn shows_after(&self, app: [u8; 16], after: u64) -> bool {
-        let cert = self.own_call(&app).ok();
+    fn shows_after(&self, app: [u8; 16], cert: &AppCert, after: u64) -> bool {
         self.items
             .iter()
             .filter(|item| item.seq() > after)
-            .any(|item| self.show(item, app, cert.as_ref()).is_some())
+            .any(|item| self.show(item, app, Some(cert)).is_some())
     }
 
     fn head(&self) -> SignedHead {

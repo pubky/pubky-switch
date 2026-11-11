@@ -55,7 +55,13 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   wakes nobody: a held read notices at the next request to the switch or at
   `release_held_reads`, where the service answers by itself when its time is up. The
   transport of `transport` holds nothing and answers such a read at once. A `wait` that
-  isn't an integer from 0 to 25 is `400`.
+  isn't an integer from 0 to 25 is `400`. A read is held only for a current app of an
+  account that serves, which is seen when the read arrives; the switch's lock isn't held
+  across the wait, and every request to the switch lets the held reads look again. A read
+  held while its app is revoked or leaves is woken and refused `403 not_current`, and one
+  held while its account is erased gets the operator's `404`, never a page under the
+  erased account's key (Switch wire 7.4.16). Faults and the stale-timestamp check apply
+  when the read is answered, not when it arrives.
 - **Retention and sweeps** (Switch wire 9.1, 7.4.4): an entry goes once every current
   target that isn't lagging has passed it, as at the service, judged at cursor moves, at
   appends and at deliveries, revocations and leaves (`keep_passed_entries` turns that off

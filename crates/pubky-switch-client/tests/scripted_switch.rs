@@ -641,3 +641,112 @@ async fn test_testing_entry_without_a_reader_becomes_unreadable_with_its_entry_i
         .unwrap();
     assert_eq!(unreadable["entry_id"], entry_id);
 }
+
+/// The `code` of an error answer.
+fn code_of(answer: &Response) -> String {
+    let body: serde_json::Value = serde_json::from_slice(&answer.body).unwrap();
+    body["code"].as_str().unwrap_or_default().to_owned()
+}
+
+/// A wallet that has read to the end, and its read with `wait`, held by the switch.
+async fn held_read(s: &Setup) -> (App, Request) {
+    let mut app = s.join("wallet").await;
+    app.receive(None).await.unwrap();
+    app.flush_cursor().await.unwrap();
+    let request = waiting_read(s, &app, "25");
+    (app, request)
+}
+
+#[tokio::test]
+async fn test_testing_held_read_of_a_revoked_app_is_refused() {
+    let s = Setup::new();
+    let switch = s.alice.switch();
+    let (app, request) = held_read(&s).await;
+    let transport = switch.holding_transport();
+    let mut read = transport.send(request);
+    assert!(poll_once(&mut read).is_none());
+    // The signer revokes the reader while its read is held: the read is woken, and
+    // answered as the account answers a revoked app, with no page.
+    switch.revoke(app.app_id()).unwrap();
+    assert_eq!(switch.held_reads(), 0, "the revocation woke the read");
+    let answer = poll_once(&mut read).expect("answered");
+    assert_eq!(
+        (answer.status, code_of(&answer).as_str()),
+        (403, "not_current")
+    );
+}
+
+#[tokio::test]
+async fn test_testing_held_read_of_a_departed_app_is_refused() {
+    let s = Setup::new();
+    let switch = s.alice.switch();
+    let (app, request) = held_read(&s).await;
+    let transport = switch.holding_transport();
+    let mut read = transport.send(request);
+    assert!(poll_once(&mut read).is_none());
+    // The reader leaves while its read is held.
+    switch.leave(app.app_id()).unwrap();
+    assert_eq!(switch.held_reads(), 0, "the departure woke the read");
+    let answer = poll_once(&mut read).expect("answered");
+    assert_eq!(
+        (answer.status, code_of(&answer).as_str()),
+        (403, "not_current")
+    );
+}
+
+#[tokio::test]
+async fn test_testing_held_read_of_an_erased_account_gets_the_operators_404() {
+    let s = Setup::new();
+    let switch = s.alice.switch();
+    let (_app, request) = held_read(&s).await;
+    let transport = switch.holding_transport();
+    let mut read = transport.send(request.clone());
+    assert!(poll_once(&mut read).is_none());
+    // The signer erases the account while the read is held (Switch wire 7.4.16).
+    let erase = Request {
+        method: "POST".into(),
+        origin: SWITCH_ORIGIN.into(),
+        path_and_query: format!("/v1/{}/erase", s.alice.identity().key().id()),
+        headers: Vec::new(),
+        body: pubky_switch_core::http::erase_body(&switch.service_key(), None),
+    };
+    let erased = switch.transport().send(erase).await.unwrap();
+    assert_eq!(erased.status, 200);
+    assert_eq!(switch.held_reads(), 0, "the erasure woke the read");
+    // The held read is answered as for an account the switch doesn't host: the operator's
+    // `404`, never a page under the erased account's key.
+    let answer = poll_once(&mut read).expect("answered");
+    assert_eq!(
+        (answer.status, code_of(&answer).as_str()),
+        (404, "not_found")
+    );
+    assert!(
+        answer.header("switch-head").is_none(),
+        "no head of the erased account"
+    );
+    let signature = answer
+        .header("switch-service-signature")
+        .and_then(|text| pubky_switch_core::enc::unb64_array::<64>(text).ok())
+        .expect("a signature");
+    let verifies = |key: &[u8; 32]| {
+        pubky_switch_core::http::verify_response(
+            key,
+            answer.status,
+            pubky_switch_core::http::request_signature_of(request.header("switch-signature"))
+                .as_ref(),
+            answer.header("switch-server-time").expect("a time"),
+            &answer.body,
+            &signature,
+        )
+        .is_ok()
+    };
+    assert!(
+        !verifies(&switch.service_key()),
+        "signed with the erased account's key"
+    );
+    // The scripted switch's operator key.
+    let operator = ed25519_dalek::SigningKey::from_bytes(&[42; 32])
+        .verifying_key()
+        .to_bytes();
+    assert!(verifies(&operator), "signed with the operator key");
+}

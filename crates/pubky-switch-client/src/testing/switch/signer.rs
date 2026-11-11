@@ -462,6 +462,9 @@ impl Inner {
             return bad(ErrorCode::Conflict, "a move is in progress", json!(null));
         }
         self.erased = true;
+        // A feed read held for the account is answered now, as for an account the switch
+        // doesn't host (Switch wire 7.4.16).
+        self.wake_held();
         (200, json!({ "erased": true }))
     }
 
