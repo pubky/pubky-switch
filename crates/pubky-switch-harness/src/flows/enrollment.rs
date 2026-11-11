@@ -51,7 +51,10 @@ pub async fn enrollment(world: &World) -> FlowResult {
     // Anyone reads the newest `identity.json` from the switch (Switch wire 7.4.15). Neither
     // the client nor the signer makes this call: a reader without keys does, so the flow
     // checks the answer as such a reader would. Its body is the document the signer
-    // delivered, byte for byte, and it is signed with the account's service key.
+    // delivered, byte for byte, and it is signed with the account's service key. Byte for
+    // byte is stricter than the wire asks of the answer's own object, whose members a
+    // writer may order as it likes (Switch wire 1.1): deliberately so, while both switches
+    // write it this way, so that a change of either shows here.
     let path = format!("/v1/{}/identity", alice.key().id());
     let answer = world.request("GET", ORIGIN, &path).await?;
     let mut expected = b"{\"identity\":".to_vec();

@@ -13,7 +13,10 @@ use pubky_switch::{
     keys::{FileKeyStore, FixedKeys},
     limits::Limits,
     service::Service,
-    store::testing::{TestDatabase, test_database},
+    store::{
+        DatabaseConfig,
+        testing::{TestDatabase, test_database, test_database_with},
+    },
     time::{ManualClock, TrustedTime, TrustedTimeConfig},
 };
 use pubky_switch_core::{
@@ -116,8 +119,31 @@ pub async fn replay_at(
     limits: Limits,
     time_required: bool,
 ) -> Option<Replay> {
-    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
     let db = test_database().await?;
+    Some(replay_on(db, origin, service_label, limits, time_required))
+}
+
+/// A service on alice's origin with `config`'s pool settings, on a fresh test database.
+pub async fn replay_with_database(config: &DatabaseConfig) -> Option<Replay> {
+    let db = test_database_with(config).await?;
+    Some(replay_on(
+        db,
+        ORIGIN,
+        "service/alice",
+        Limits::default(),
+        false,
+    ))
+}
+
+/// A service at `origin` on `db`, as [`replay_at`].
+fn replay_on(
+    db: TestDatabase,
+    origin: &str,
+    service_label: &str,
+    limits: Limits,
+    time_required: bool,
+) -> Replay {
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
     let keys = vectors("keys.json");
     let service = keys["service_keys"]
         .as_array()
@@ -150,14 +176,14 @@ pub async fn replay_at(
         time.clone(),
         limits,
     );
-    Some(Replay {
+    Replay {
         db,
         clock,
         service,
         keys,
         time,
         _key_dir: key_dir,
-    })
+    }
 }
 
 /// bob's account at a switch made by `replay_at(BOB_ORIGIN, "service/bob", ..)`, serving,

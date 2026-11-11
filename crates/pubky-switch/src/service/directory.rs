@@ -6,14 +6,14 @@ use pubky_switch_core::records::{AppCert, IdentityDoc};
 use serde_json::{Value, json};
 
 use super::{
-    Answer, Deferred, Service,
+    Answer, Service,
     admission::{Admitted, NOT_ADMITTED, admit},
     store_error,
 };
 use crate::{
     http::error::{ApiError, ErrorCode},
     keys::ServiceSigner,
-    store::{AccountTxn, SnapshotRead},
+    store::AccountTxn,
 };
 
 /// Who reads the directory.
@@ -22,20 +22,6 @@ pub(super) enum Reader<'a> {
     OwnApp,
     /// An app of another identity, verified with the certificate it sent.
     OtherApp(&'a AppCert),
-}
-
-/// A directory's apps and versions, read once the lock is gone from the snapshot of the
-/// state under it.
-#[derive(Debug)]
-pub(super) struct DirectoryRead {
-    snapshot: SnapshotRead,
-    /// The identity, generation and last `seq` the locked transaction saw.
-    account: ([u8; 32], u64, u64),
-    /// The newest `identity.json`, as read under the lock.
-    doc: IdentityDoc,
-    /// For an app of another identity, its `known_version`.
-    known: Option<Option<u64>>,
-    time_ms: u64,
 }
 
 fn temporary() -> ApiError {
@@ -122,43 +108,10 @@ impl Service {
             ));
         };
 
-        // The apps are read after the lock, from the snapshot of the state under it
-        // ([`Service::directory_body`]), so a long read holds no lock other requests wait
-        // for.
-        let head = match known {
-            Some(_) => None,
-            None => Some(self.head(txn, signer).await.ok_or_else(temporary)?),
-        };
-        let account = txn.head().clone();
-        let snapshot = txn.snapshot_read().map_err(|e| store_error(&e))?;
-        let mut answer = Answer::ok(Vec::new()).with_head(head);
-        answer.deferred = Some(Deferred::Directory(Box::new(DirectoryRead {
-            snapshot,
-            account: (account.identity_key, account.generation, account.last_seq),
-            doc: doc.clone(),
-            known,
-            time_ms,
-        })));
-        Ok(answer)
-    }
-
-    /// The directory of `read` (Switch wire 7.4.10): the current apps in the order the newest
-    /// `identity.json` lists them, with the versions, and `known_version` for an app of
-    /// another identity.
-    pub(super) async fn directory_body(read: DirectoryRead) -> Result<Vec<u8>, ApiError> {
-        let DirectoryRead {
-            mut snapshot,
-            account,
-            doc,
-            known,
-            time_ms,
-        } = read;
-        snapshot.start().await;
         // The account's apps, from the loader every judgment of currency uses.
-        let (state, apps) =
-            super::batch::load_apps_from_snapshot(&mut snapshot, account, Some(&doc), time_ms)
-                .await
-                .map_err(|e| store_error(&e))?;
+        let (state, apps) = super::batch::load_apps_and_rows(txn, Some(doc), time_ms)
+            .await
+            .map_err(|e| store_error(&e))?;
         // The current apps, in the order the newest identity.json lists them: each once,
         // since a document naming an App ID twice doesn't verify (Switch wire 3.3).
         let mut listed: Vec<Value> = Vec::new();
@@ -184,11 +137,10 @@ impl Service {
                 "receive_key": app.receive_key,
             }));
         }
-        let (directory_version, apps_version) = snapshot
+        let (directory_version, apps_version) = txn
             .directory_versions()
             .await
             .map_err(|e| store_error(&e))?;
-        snapshot.finish().await.map_err(|e| store_error(&e))?;
         // Members sorted, the order of `http.json`'s directory, which serde_json's map keeps.
         let mut body = json!({
             "identity": doc.signed(),
@@ -196,9 +148,17 @@ impl Service {
             "directory_version": directory_version,
             "apps_version": apps_version,
         });
-        if let Some(known) = known {
-            body["known_version"] = json!(known);
+        match known {
+            Some(known) => {
+                body["known_version"] = json!(known);
+                let bytes = serde_json::to_vec(&body).map_err(|_| temporary())?;
+                Ok(Answer::ok(bytes))
+            }
+            None => {
+                let bytes = serde_json::to_vec(&body).map_err(|_| temporary())?;
+                let head = self.head(txn, signer).await.ok_or_else(temporary)?;
+                Ok(Answer::ok(bytes).with_head(Some(head)))
+            }
         }
-        serde_json::to_vec(&body).map_err(|_| temporary())
     }
 }

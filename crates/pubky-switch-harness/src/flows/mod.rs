@@ -16,6 +16,7 @@ mod messaging;
 mod removal;
 mod renewal;
 mod restore;
+mod retries;
 mod watching;
 
 use std::future::Future;
@@ -31,6 +32,7 @@ pub use messaging::messaging;
 pub use removal::{departure, revocation};
 pub use renewal::renewal;
 pub use restore::restore;
+pub use retries::{app_retries, append_retry, signer_retries};
 pub use watching::watching;
 
 use crate::{FlowResult, World};
@@ -59,6 +61,9 @@ pub const FLOWS: &[(&str, Flow)] = &[
     ("departure", |world| Box::pin(departure(world))),
     ("watching", |world| Box::pin(watching(world))),
     ("restore", |world| Box::pin(restore(world))),
+    ("signer retries", |world| Box::pin(signer_retries(world))),
+    ("app retries", |world| Box::pin(app_retries(world))),
+    ("append retry", |world| Box::pin(append_retry(world))),
 ];
 
 /// The flow that sends `call` to the service; `None` for a call the service doesn't serve

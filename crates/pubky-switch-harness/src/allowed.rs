@@ -476,6 +476,42 @@ pub static ALLOWED: &[Allowed] = &[
         reason: COUNTER_START,
         reference: "Switch wire 7.4.10, `directory_version`",
     },
+    Allowed {
+        flow: "append retry",
+        label: "{bob/shop} GET /v1/{alice}/directory",
+        fact: "body.apps_version",
+        service: "number 1",
+        scripted: ONE_MORE,
+        reason: COUNTER_START,
+        reference: "Switch wire 7.4.10, `apps_version`",
+    },
+    Allowed {
+        flow: "append retry",
+        label: "{bob/shop} GET /v1/{alice}/directory",
+        fact: "body.directory_version",
+        service: "number 4",
+        scripted: ONE_MORE,
+        reason: COUNTER_START,
+        reference: "Switch wire 7.4.10, `directory_version`",
+    },
+    Allowed {
+        flow: "append retry",
+        label: "{bob/shop} POST /v1/{alice}/inbox",
+        fact: "request query apps_version",
+        service: "text 1",
+        scripted: ONE_MORE,
+        reason: COUNTER_START,
+        reference: "Switch wire 7.4.3, the query's `apps_version`; 7.4.10",
+    },
+    Allowed {
+        flow: "append retry",
+        label: "{bob/shop} POST /v1/{alice}/inbox",
+        fact: "body.directory_version",
+        service: "number 4",
+        scripted: ONE_MORE,
+        reason: COUNTER_START,
+        reference: "Switch wire 7.4.3, the answer's `directory_version`; 7.4.10",
+    },
 ];
 
 #[cfg(test)]

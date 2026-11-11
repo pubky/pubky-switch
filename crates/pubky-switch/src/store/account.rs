@@ -136,7 +136,9 @@ pub struct AccountTxn {
     /// The reader, once this transaction's snapshot is exported to it.
     pub(super) snapshot: Option<super::SnapshotRead>,
     /// The account's one read after the lock, until it is handed to the reader.
-    pub(super) read_slot: Option<super::snapshot::ReadSlot>,
+    pub(super) read_turn: Option<super::snapshot::ReadTurn>,
+    /// How long importing the snapshot may take, under the lock: `lock_timeout_ms`.
+    pub(super) import_timeout_ms: u64,
     /// For tests: where that read waits before it reads.
     #[cfg(any(test, feature = "test-util"))]
     pub(super) snapshot_pause: Option<super::testing::SnapshotPause>,
@@ -268,7 +270,8 @@ impl AccountTxn {
             max_flags: 0,
             reader: None,
             snapshot: None,
-            read_slot: None,
+            read_turn: None,
+            import_timeout_ms: 0,
             #[cfg(any(test, feature = "test-util"))]
             snapshot_pause: None,
         }))

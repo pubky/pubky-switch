@@ -530,27 +530,50 @@ async fn test_records_list_reads_the_state_under_the_lock_not_after() {
 }
 
 #[tokio::test]
-async fn test_records_one_list_after_the_lock_per_account() {
+async fn test_records_lists_of_an_account_wait_their_turn() {
     let Some(replay) = registered(Limits::default()).await else {
         return;
     };
-    create(&replay, 1, b"first", "pay").await;
+    let (key, ..) = create(&replay, 1, b"first", "pay").await;
     let list = list_path(&payments(), "");
     let pause = replay.db.pause_next_snapshot_read();
-    let (first, ()) = tokio::join!(get_as(&replay, "phone", &list), async {
-        tokio::time::timeout(std::time::Duration::from_secs(10), pause.reached.notified())
-            .await
-            .expect("the first list reached its pause");
-        // Another list of the account is refused at once; a read by key, under the lock,
-        // goes on.
-        let second = get_as(&replay, "wallet", &list).await;
-        assert_eq!(code_of(&second), (503, json!("unavailable")));
-        let key = record_put(PAYMENTS, b"first", "pay", RecordVersion::NONE, b"{}").key;
-        let by_key = get_as(&replay, "wallet", &format!("records/{}", b64(&key))).await;
-        assert_eq!(by_key.status, 200);
-        pause.resume.notify_one();
-    });
+    let exchange = async {
+        tokio::join!(
+            get_as(&replay, "phone", &list),
+            async {
+                tokio::time::timeout(std::time::Duration::from_secs(10), pause.reached.notified())
+                    .await
+                    .expect("the first list reached its pause");
+                // Another list of the account waits its turn.
+                get_as(&replay, "wallet", &list).await
+            },
+            async {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while replay.db.queued_reads(&alice_id()) != 2 {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the second list never queued"
+                    );
+                    tokio::task::yield_now().await;
+                }
+                // A read by key, under the lock, takes no turn and goes on.
+                let by_key = get_as(&replay, "wallet", &format!("records/{}", b64(&key))).await;
+                assert_eq!(by_key.status, 200);
+                assert_eq!(replay.db.queued_reads(&alice_id()), 2);
+                pause.resume.notify_one();
+            }
+        )
+    };
+    let (first, second, ()) = tokio::time::timeout(std::time::Duration::from_secs(30), exchange)
+        .await
+        .expect("both lists ended");
     assert_eq!(first.status, 200);
+    assert_eq!(
+        second.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&second.body)
+    );
     replay.db.drop_database().await.expect("drop");
 }
 
