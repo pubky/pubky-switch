@@ -146,7 +146,10 @@ service.
   and to its target, also when that target isn't current, where the service answers `403
   not_current` (Switch wire 7.2): so a test can script a faulty switch that serves a
   hand-over while holding no copy of the version handed over; the next `identity.json`
-  version, whoever delivered it, drops it.
+  version, whoever delivered it, drops it. Unlike the service, it serves the body it parsed
+  again as JSON, not the bytes the signer sent; it answers an own app's `PUT` `404` ("no
+  route") where the service answers `403 permission_missing` with the head, and an app of
+  another identity `403 not_admitted` where the service answers `403 permission_missing`.
   `stored_handover` names the target held; `stored_handover_body` and
   `store_handover_again` script a hand-over stored or served again after it was dropped.
 - **`Fault::LeaveOut`** scripts a faulty service whose answer to an own app or the signer
@@ -176,6 +179,7 @@ the stored parts can run against it now:
   (`flows.rs`);
 - restore from the signer backup, in place and on a new install (`restore.rs`);
 - the hand-over both ways, the abort, the take-over's checks and its lost answers, and which
-  copies delete a key (`handover.rs`);
+  copies delete a key (`handover.rs`): the service now serves `PUT` and `GET /handover`, so
+  these can run against it, save the scripted faults;
 - the account's erasure, its lost answer, retry and refusal (`erasure.rs`): the service
   doesn't serve `POST /erase` yet.

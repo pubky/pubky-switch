@@ -12,8 +12,8 @@
 //! `GET /v1/{id}/identity`, `POST /v1/{id}/ops`, `GET /v1/{id}/feed`,
 //! `POST /v1/{id}/inbox`, `PUT /v1/{id}/peers`, `GET /v1/{id}/claims/{claim_key}`,
 //! `GET /v1/{id}/apps`, `POST /v1/{id}/apps/{app_id}/revoke`, `GET /v1/{id}/directory`,
-//! and `GET` and `POST /v1/{id}/apps/{app_id}/keys`. Every other call is answered `503
-//! unavailable`.
+//! `GET` and `POST /v1/{id}/apps/{app_id}/keys`, and `PUT` and `GET /v1/{id}/handover`.
+//! Every other call is answered `503 unavailable`.
 
 mod admission;
 mod app_keys;
@@ -23,6 +23,7 @@ mod claims;
 mod directory;
 mod enroll;
 mod feed;
+mod handover;
 mod identity;
 mod inbox;
 mod peers;
@@ -375,7 +376,7 @@ impl Service {
             }
             // The signer is verified here; an own app under the lock, with the key the
             // account holds for it (Switch wire 7.2).
-            Call::Revoke(_) | Call::GetApps => {
+            Call::Revoke(_) | Call::GetApps | Call::PutHandover | Call::GetHandover => {
                 match self
                     .authenticate_signer(&account, &request, base_ms, base_ms.max(stamped_ms))
                     .await
@@ -878,7 +879,12 @@ impl Service {
         }
         // A call only the signer makes, from an own app that verified: refused with the head
         // (Switch wire 7.4, 7.1).
-        if writer.is_some() && matches!(call, Call::PutIdentity | Call::Revoke(_) | Call::GetApps) {
+        if writer.is_some()
+            && matches!(
+                call,
+                Call::PutIdentity | Call::Revoke(_) | Call::GetApps | Call::PutHandover
+            )
+        {
             return Err(Refused::with_head(
                 ApiError::new(
                     ErrorCode::PermissionMissing,
@@ -1079,6 +1085,21 @@ impl Service {
                         keys_call,
                         time_ms,
                     )
+                    .await
+                    .map(|answer| (answer, serving))
+                    .map_err(|error| Refused::with_head(error, serving));
+            }
+            Call::PutHandover => {
+                return self
+                    .put_handover(txn, signer, held.as_ref(), &request.body, time_ms)
+                    .await
+                    .map(|answer| (answer, serving))
+                    .map_err(|error| Refused::with_head(error, serving));
+            }
+            Call::GetHandover => {
+                // The signer, or the own app it is for (Switch wire 7.4.17).
+                return self
+                    .get_handover(txn, signer, writer.as_ref())
                     .await
                     .map(|answer| (answer, serving))
                     .map_err(|error| Refused::with_head(error, serving));

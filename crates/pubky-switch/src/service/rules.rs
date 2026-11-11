@@ -157,8 +157,8 @@ pub fn takes_other_apps(call: &Call) -> bool {
 
 /// The refusal of an app of another identity at a call it doesn't make, once its
 /// certificate has passed every check, expiry included (Switch wire 7.2, 3.8): `403
-/// permission_missing` at the feed (7.4.4), the key bundle calls (7.4.11) and the
-/// signer's calls (7.4), and `403 not_admitted` elsewhere (6.4).
+/// permission_missing` at the feed (7.4.4), the key bundle calls (7.4.11), the hand-over
+/// (7.4.17) and the signer's calls (7.4), and `403 not_admitted` elsewhere (6.4).
 pub fn other_app_refusal(call: &Call) -> ApiError {
     match call {
         Call::Feed => ApiError::new(
@@ -166,6 +166,10 @@ pub fn other_app_refusal(call: &Call) -> ApiError {
             "7.4.4: only own apps read the feed",
         ),
         Call::GetKeys(_) | Call::RequestKeys(_) => super::app_keys::only_that_app(),
+        Call::PutHandover | Call::GetHandover => ApiError::new(
+            ErrorCode::PermissionMissing,
+            "7.4.17: only the signer and the app it is for",
+        ),
         Call::PutIdentity | Call::Revoke(_) | Call::GetApps => ApiError::new(
             ErrorCode::PermissionMissing,
             "7.4: a call only the signer may make",

@@ -212,6 +212,10 @@ impl Service {
         })
         .await
         .map_err(|e| store_error(&e))?;
+        // The next version ends a hand-over, whichever signer delivered it: the new
+        // signer's, so it took effect, or the old signer's abort (Switch wire 7.4.17). A
+        // retry of the same bytes doesn't come here.
+        txn.delete_handover().await.map_err(|e| store_error(&e))?;
         // An app it no longer makes current stops holding entries at once (Switch wire
         // 7.4.2, 9.1).
         super::batch::settle_change(txn, previous, Some(doc), None, time_ms)
