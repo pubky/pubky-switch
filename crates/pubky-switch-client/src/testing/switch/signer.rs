@@ -89,6 +89,12 @@ impl ScriptedSwitch {
         self.lock().delivery_proof = None;
     }
 
+    /// A faulty service: it no longer holds `app`'s key bundle parts, which `bundle_ranges`
+    /// then stops showing (Switch wire 7.4.12).
+    pub fn forget_bundle_parts(&self, app: &[u8; 16]) {
+        self.lock().bundles.remove(app);
+    }
+
     /// The key bundle parts the switch holds for `app`, in order.
     pub fn bundle_parts_of(&self, app: &[u8; 16]) -> Vec<pubky_switch_core::ops::KeyBundlePut> {
         self.lock()
@@ -188,10 +194,16 @@ impl Inner {
             &state,
             None,
         )?;
+        // A first listing is kept, as the service keeps it, only for an app with no row and
+        // no stored part yet; any other's holdings start unknown (Switch wire 7.4.12).
         for app in &doc.body().apps {
-            self.listed_at_epoch
-                .entry(app.app_id)
-                .or_insert(doc.data_epoch());
+            let fresh = !self.apps.contains_key(&app.app_id)
+                && self.bundles.get(&app.app_id).is_none_or(Vec::is_empty);
+            if fresh {
+                self.listed_at_epoch
+                    .entry(app.app_id)
+                    .or_insert(doc.data_epoch());
+            }
         }
         // A departure's rotation is done once a version removes the app at a higher data
         // epoch than at its departure, and stays done, also after a purge (Switch wire 7.4.12).
@@ -283,10 +295,11 @@ impl Inner {
     }
 
     /// The newest data epoch through which `app` holds every key (Switch wire 7.4.12), by
-    /// the core's rule: the epoch of the first version that listed it, raised by each stored
-    /// part its cursor has passed that continues it; `None` for an app never listed.
+    /// the core's rule: the epoch of the first version that listed it, if kept, raised by each
+    /// stored part its cursor has passed that continues it, from epoch 1 when the start is
+    /// unknown; `None` when nothing shows any.
     fn keys_through(&self, app: &[u8; 16]) -> Option<u64> {
-        let start = *self.listed_at_epoch.get(app)?;
+        let start = self.listed_at_epoch.get(app).copied();
         let spans: Vec<pubky_switch_core::ops::StoredPart> = self
             .bundles
             .get(app)
@@ -302,7 +315,7 @@ impl Inner {
             })
             .unwrap_or_default();
         let cursor = self.apps.get(app).map_or(0, |a| a.cursor);
-        pubky_switch_core::ops::keys_through(Some(start), &spans, cursor)
+        pubky_switch_core::ops::keys_through(start, &spans, cursor)
     }
 
     /// The kept proofs' generations, each with the key that verifies its proofs: an earlier
@@ -428,10 +441,11 @@ impl Inner {
                     .unwrap_or_default();
                 json!({
                     "app_id": zbase32_encode(id),
-                    // By the full rule once the app has a record: listed, or renewed and open,
-                    // with a certificate that hasn't expired (Switch spec 3.4).
+                    // Spec 3.4's sense once the app has a record: listed with its certificate,
+                    // or renewed and open, not revoked or departed. Expiry isn't part of it:
+                    // `cert_expires_at` carries that (Switch wire 7.4.12).
                     "current": if held.is_some_and(|a| a.cert.is_some()) {
-                        !enrolled_kept && self.app_current(&self.apps, id)
+                        !enrolled_kept && self.app_current_by(&self.apps, id, false)
                     } else {
                         listed && !kept
                     },
