@@ -753,3 +753,110 @@ async fn test_parked_release_crash_is_all_or_nothing() {
     app.receive(None).await.unwrap();
     assert_eq!(protocol.handed(), handed + 1);
 }
+
+#[tokio::test]
+async fn test_parked_forget_while_its_effect_is_kept_is_refused_until_a_read_settles_it() {
+    let w = World::new();
+    let protocol = ParkingProtocol::new(Mode::Plain);
+    let mut app = wallet_on(&w, &protocol, Arc::clone(&w.store) as Arc<dyn StateStore>).await;
+    let (entry, _) = parked_as(&w, &mut app, &protocol, Mode::Rejected).await;
+    assert_eq!(entry.reason, ParkReason::StoreRejected);
+    // Its retry builds the effect, keeps it and sends it: applied, the answer lost.
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    assert!(app.receive(None).await.is_err());
+    ack_all(&mut app).await;
+    let error = app
+        .forget_parked(entry.stored_id, &entry.hash)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, AppError::Refused(Refusal::NotNow(why)) if why.contains("kept unanswered")),
+        "{error:?}"
+    );
+    assert_eq!(listed(&mut app, entry.stored_id).await, Some(entry));
+    // The next read settles it: the effect applied, the entry is processed and gone.
+    let report = app.receive(None).await.unwrap();
+    assert!(
+        has(&report.events, |e| matches!(
+            e,
+            AppEvent::MessageReceived { .. }
+        )),
+        "{:?}",
+        report.events
+    );
+    assert_eq!(listed(&mut app, entry.stored_id).await, None);
+    assert!(usage(app.forget_parked(entry.stored_id, &entry.hash).await));
+}
+
+/// Bob's note `message` again under the same `msg_id` with other bytes, signed by an app of
+/// his that isn't listed: stored as unverifiable while his Homeserver can't be reached.
+async fn forged_copy(w: &World, app: &mut App, message: &Message) -> ParkedSummary {
+    let keys = app_keys("removed-app");
+    let cert = cert_for(&w.bob, &keys, w.clock.now_ms(), &["scope-a"]);
+    let mut forged = message.clone();
+    forged.from = pubky_switch_core::message::Sender::of_app(w.bob.public(), &keys);
+    forged
+        .body
+        .insert("text".into(), serde_json::Value::from("forged"));
+    let plaintext = forged.sign(&keys).unwrap();
+    w.homeserver.set_down(true);
+    w.clock.advance_ms(11 * 60_000);
+    let seq = w
+        .switch
+        .send_plaintext(w.bob.public(), &cert, &plaintext, &[app.app_id()])
+        .unwrap();
+    app.receive(None).await.unwrap();
+    w.clock.advance_ms(25 * 3_600_000);
+    app.receive(None).await.unwrap();
+    w.homeserver.set_down(false);
+    let id = app.stored_id_at(seq).unwrap();
+    let entry = listed(app, id).await.unwrap();
+    assert_eq!(entry.reason, ParkReason::Unverifiable);
+    entry
+}
+
+async fn processed(app: &App, message: &Message) -> bool {
+    let pair = crate::app::state::key::processed(&message.from.identity, &message.msg_id);
+    app.reader().exists(&pair).await.unwrap()
+}
+
+#[tokio::test]
+async fn test_parked_forget_of_a_forgery_keeps_the_genuine_copy() {
+    let w = World::new();
+    let protocol = ParkingProtocol::new(Mode::Plain);
+    let mut app = wallet_on(&w, &protocol, Arc::clone(&w.store) as Arc<dyn StateStore>).await;
+    // The genuine message, checked and stored for good; a forgery under its `msg_id`.
+    let (genuine, message) = parked_as(&w, &mut app, &protocol, Mode::Wide).await;
+    let forgery = forged_copy(&w, &mut app, &message).await;
+    assert_ne!(forgery.hash, genuine.hash);
+    ack_all(&mut app).await;
+    // Forgetting the forgery takes it alone, and leaves the message unprocessed.
+    assert_eq!(
+        app.forget_parked(forgery.stored_id, &forgery.hash)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(listed(&mut app, genuine.stored_id).await, Some(genuine));
+    assert!(!processed(&app, &message).await);
+}
+
+#[tokio::test]
+async fn test_parked_forget_of_a_genuine_copy_takes_a_forgery_under_its_msg_id() {
+    let w = World::new();
+    let protocol = ParkingProtocol::new(Mode::Plain);
+    let mut app = wallet_on(&w, &protocol, Arc::clone(&w.store) as Arc<dyn StateStore>).await;
+    let (genuine, message) = parked_as(&w, &mut app, &protocol, Mode::Wide).await;
+    let forgery = forged_copy(&w, &mut app, &message).await;
+    ack_all(&mut app).await;
+    // Forgetting the checked copy is being done with its message, as the processed pairs
+    // name it: the forgery under its `msg_id` goes too, and the message stays processed.
+    assert_eq!(
+        app.forget_parked(genuine.stored_id, &genuine.hash)
+            .await
+            .unwrap(),
+        2
+    );
+    assert!(listed(&mut app, forgery.stored_id).await.is_none());
+    assert!(processed(&app, &message).await);
+}

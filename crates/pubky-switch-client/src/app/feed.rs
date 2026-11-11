@@ -327,6 +327,7 @@ impl App {
         self.deliver_record().await?;
         self.ensure_scope_keys().await?;
         self.prune_processed().await?;
+        self.retell_restored().await?;
         self.retry_parked().await?;
         self.retry_owed().await?;
         self.list_collections_if_due().await?;

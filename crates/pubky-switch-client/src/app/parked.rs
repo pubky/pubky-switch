@@ -18,10 +18,11 @@ use pubky_switch_core::sig::SignedDoc;
 use serde_json::Value;
 
 use super::error::Refusal;
+use super::events::Duty;
 use super::events::{AppEvent, ParkReason};
 use super::feed::processed_writes;
-use super::state::{ParkedEntry, Processed, key};
-use super::{App, AppError};
+use super::state::{ParkedEntry, Processed, Tx, key};
+use super::{App, AppError, AppState};
 use crate::error::StoreError;
 
 /// An entry stored locally, as [`App::parked_entries`] lists it.
@@ -236,6 +237,11 @@ impl App {
     ///
     /// # Errors
     ///
+    /// [`Refusal::NotNow`], with nothing written, while the effect a retry of an entry that
+    /// would go built is kept unanswered (Switch spec 12.5 "Kept batches"): it may still
+    /// apply, so the read that settles it decides, and the host tries again once one has.
+    /// The entry is then processed, gone, or stored again for what its effect came to.
+    ///
     /// [`Refusal::Usage`], with nothing written:
     /// - for an ID with no entry stored, or a `hash` that isn't the entry's;
     /// - while a duty event the host hasn't acknowledged ([`App::ack_events`]) names an
@@ -265,6 +271,21 @@ impl App {
                 if same {
                     going.push(*other);
                 }
+            }
+            // An effect a retry of one of them built and kept, unanswered, may still apply:
+            // the read that settles it decides, not the forget.
+            if let Some(kept) = self
+                .state
+                .pending_effect
+                .as_ref()
+                .and_then(|pending| pending.stored)
+                .filter(|kept| going.contains(kept))
+            {
+                return Err(Refusal::NotNow(format!(
+                    "the effect of the entry at local ID {kept} is kept unanswered: try again \
+                     once a read has settled it"
+                ))
+                .into());
             }
             let kept = self.kept_duties().await?;
             if let Some(named) = kept
@@ -382,5 +403,87 @@ impl App {
             .into());
         }
         Ok(stored.clone())
+    }
+}
+
+/// How many entries a restore brought back one commit tells the protocol of again.
+const RETELL_PER_COMMIT: usize = 64;
+
+/// `retell`: telling the protocol again of the entries stored for good that a restore
+/// brought back (Switch spec 12.4), from local ID `next` up to `until`, the IDs the
+/// restore installed. Each step keeps a [`AppEvent::Parked`] duty event for at most
+/// [`RETELL_PER_COMMIT`] of them and moves `next` past them in the same commit, so a crash
+/// between steps tells none twice and none not at all; the last step deletes it. An entry a
+/// duty event already kept in the store names isn't told again, as after a restore in place
+/// that carried it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Retell {
+    next: u64,
+    until: u64,
+}
+
+impl Retell {
+    /// Start telling, in the restore's commit, if it brings back an entry stored for good.
+    pub(crate) fn start(state: &AppState, tx: &mut Tx) -> Result<(), AppError> {
+        if state
+            .parked
+            .values()
+            .any(|stored| !stored.reason.tried_again())
+        {
+            let retell = Retell {
+                next: 0,
+                until: state.next_stored_id,
+            };
+            tx.put(key::RETELL, &retell)?;
+        }
+        Ok(())
+    }
+}
+
+impl App {
+    /// Tell the protocol again of the entries stored for good a restore brought back, in
+    /// steps ([`Retell`]).
+    pub(crate) async fn retell_restored(&mut self) -> Result<(), AppError> {
+        loop {
+            let Some(mut retell) = self.reader().get::<Retell>(key::RETELL).await? else {
+                return Ok(());
+            };
+            let named: std::collections::BTreeSet<u64> = self
+                .kept_duties()
+                .await?
+                .iter()
+                .filter_map(names_stored)
+                .collect();
+            let step: Vec<(u64, ParkedEntry)> = self
+                .state
+                .parked
+                .range(retell.next..retell.until)
+                .filter(|(_, stored)| !stored.reason.tried_again())
+                .take(RETELL_PER_COMMIT)
+                .map(|(id, stored)| (*id, stored.clone()))
+                .collect();
+            let mut tx = self.tx()?;
+            for (id, stored) in &step {
+                if named.contains(id) {
+                    continue;
+                }
+                self.keep_duty(
+                    &mut tx,
+                    Duty::Parked {
+                        seq: stored.seq,
+                        stored_id: *id,
+                        reason: stored.reason,
+                    },
+                )?;
+            }
+            match step.last() {
+                Some((last, _)) if step.len() == RETELL_PER_COMMIT => {
+                    retell.next = last.saturating_add(1);
+                    tx.put(key::RETELL, &retell)?;
+                }
+                _ => tx.delete(key::RETELL)?,
+            }
+            self.commit(tx).await?;
+        }
     }
 }

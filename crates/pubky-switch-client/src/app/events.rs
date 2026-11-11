@@ -852,7 +852,8 @@ impl Duty {
         match self {
             Self::Parked { stored_id, .. }
             | Self::EffectRefused { stored_id, .. }
-            | Self::EffectUncertain { stored_id, .. } => Some(*stored_id),
+            | Self::EffectUncertain { stored_id, .. }
+            | Self::ReleasedDuplicate { stored_id, .. } => Some(*stored_id),
             _ => None,
         }
     }
