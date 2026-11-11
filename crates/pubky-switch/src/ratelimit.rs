@@ -87,6 +87,16 @@ impl<K: Eq + Hash> MinuteWindows<K> {
         self.state.lock().counts.retain(|key, _| !remove(key));
     }
 
+    /// How many keys matching `matching` are counted.
+    pub fn counted(&self, matching: impl Fn(&K) -> bool) -> usize {
+        self.state
+            .lock()
+            .counts
+            .keys()
+            .filter(|key| matching(key))
+            .count()
+    }
+
     /// Keys counted in the current window.
     pub fn len(&self) -> usize {
         self.state.lock().counts.len()
@@ -161,6 +171,21 @@ impl<K: Eq + Hash> KeyedMinutes<K> {
         self.state.lock().windows.len()
     }
 
+    /// Forget every count whose key matches `remove`, as an erasure does.
+    pub fn forget(&self, remove: impl Fn(&K) -> bool) {
+        self.state.lock().windows.retain(|key, _| !remove(key));
+    }
+
+    /// How many keys matching `matching` are counted.
+    pub fn counted(&self, matching: impl Fn(&K) -> bool) -> usize {
+        self.state
+            .lock()
+            .windows
+            .keys()
+            .filter(|key| matching(key))
+            .count()
+    }
+
     /// Whether nothing is counted.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
@@ -221,6 +246,11 @@ impl FailedAuthentications {
     /// Failures this minute claiming `caller`, for monitoring.
     pub fn claimed(&self, caller: &ClaimedCaller, base_ms: u64) -> u32 {
         self.per_claimed.count(caller, base_ms)
+    }
+
+    /// How many claimed callers at `account` are counted.
+    pub fn counted_at(&self, account: &str) -> usize {
+        self.per_claimed.counted(|(at, _, _)| at == account)
     }
 
     /// Forget the counts at `account`, as its erasure does (Switch wire 7.4.16).

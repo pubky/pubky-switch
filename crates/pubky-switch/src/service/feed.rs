@@ -22,7 +22,7 @@ use super::{
 use crate::{
     changes::ChangeHub,
     http::error::{ApiError, ErrorCode},
-    keys::{KeyId, Mark, ServiceSigner, sign_head},
+    keys::{KeyId, KeyStoreError, Mark, ServiceSigner, sign_head},
     store::{CurrentDocs, FeedRow, FeedSnapshot, PageReader, StoreError},
 };
 
@@ -151,6 +151,16 @@ pub(crate) enum Shown {
     Full { context: Option<Value> },
     /// Its stub only.
     Stub,
+}
+
+/// A read whose account no longer names its key, by the operator's answer `error`: gone, as an
+/// account the service doesn't host, or its key retired (Switch wire 7.4.16).
+fn gone_or_retired(error: &ApiError) -> FeedStop {
+    if error.code == ErrorCode::NotFound {
+        FeedStop::Gone
+    } else {
+        FeedStop::Retired
+    }
 }
 
 fn corrupt(what: &'static str) -> StoreError {
@@ -707,10 +717,18 @@ impl Service {
         // is behind, also when the page shows a commit whose own request hasn't moved it
         // yet (Switch wire 7.3 step 10).
         if let Some(mark) = answered.mark {
-            self.keys
-                .advance_mark(&read.service_key, mark)
-                .await
-                .map_err(|_| FeedStop::refused(temporary(), true, answered.time_ms))?;
+            match self.keys.advance_mark(&read.service_key, mark).await {
+                // Erased once the page was read, its key deleted: never answered with it
+                // (Switch wire 7.4.16).
+                Ok(_) | Err(KeyStoreError::NotFound) => {}
+                Err(_) => return Err(FeedStop::refused(temporary(), true, answered.time_ms)),
+            }
+        }
+        // Once the lock is gone, only while the account still names the key the read loaded,
+        // whatever its mark did: an erasure whose key's deletion failed leaves the key in the
+        // store (7.4.16).
+        if let Some(error) = self.no_longer_keyed(&read.account, &read.service_key).await {
+            return Err(gone_or_retired(&error));
         }
         Ok((answered.answer(), answered.time_ms))
     }
@@ -723,11 +741,23 @@ impl Service {
         signer: &ServiceSigner,
     ) -> Result<Answered, FeedStop> {
         let fallback = |error: ApiError, time_ms| FeedStop::refused(error, true, time_ms);
-        let mark = self
-            .keys
-            .mark(&read.service_key)
-            .await
-            .map_err(|_| fallback(temporary(), read.time_ms))?;
+        let mark = match self.keys.mark(&read.service_key).await {
+            Ok(mark) => mark,
+            // An erasure deletes the account, then its key (Switch wire 7.4.16): a read that
+            // waited on an account erased meanwhile answers as for one the service doesn't
+            // host (7.3 step 2). Never with the key it loaded, which the erasure's answer was
+            // the last to use: an account found again, as after a new enrollment, or one that
+            // can't be looked up, gets the operator's temporary failure.
+            Err(KeyStoreError::NotFound) => {
+                return Err(
+                    match self.no_longer_keyed(&read.account, &read.service_key).await {
+                        Some(error) => gone_or_retired(&error),
+                        None => fallback(temporary(), read.time_ms),
+                    },
+                );
+            }
+            Err(_) => return Err(fallback(temporary(), read.time_ms)),
+        };
         let budget = usize::try_from(self.limits.max_page_bytes).unwrap_or(usize::MAX);
         let mut builder = PageBuilder::with(
             Reader::Checked {

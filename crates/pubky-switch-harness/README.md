@@ -57,6 +57,10 @@ every one alike:
 A revocation whose answer was lost isn't sent again while the signer can read the switch: it
 reads the account's apps and finds it done.
 
+An erasure whose answer was lost isn't sent again either (Switch wire 7.4.16): the signer's
+next read of the account's apps gets the operator's `404`, and it concludes the account is
+erased.
+
 ## Adding a flow
 
 Write it in `src/flows/` against `World`, using only the real `Signer` and `App`; note what
@@ -67,6 +71,6 @@ Run the `trace` example to see what the two switches answered, and list each dif
 ## Run time and databases
 
 Each flow's run against the service makes one test database and drops it, also when its
-test panics; the flows run one after another. Ten flows take about 20 seconds in a debug
-build. If that grows too long, the service's halves could share one service and one
+test panics; the flows run one after another. Twenty-one flows take about a minute in a
+debug build. If that grows too long, the service's halves could share one service and one
 database, with identities of their own per flow: a later option, not needed yet.
