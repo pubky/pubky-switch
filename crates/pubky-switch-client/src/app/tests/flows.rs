@@ -2151,6 +2151,90 @@ async fn test_app_key_bundle_with_a_missing_epoch_asks_for_a_full_bundle() {
     );
 }
 
+/// The signer stores `me`'s key bundle part over `first`..=`last` at the scripted switch,
+/// through its batch path: the `seq` it takes.
+fn store_part(w: &World, me: [u8; 16], cert: &AppCert, first: u64, last: u64) -> u64 {
+    let has_keys = |s: &str| SampleProtocol::default().has_keys(s);
+    let mut seq = 0;
+    for part in seal_bundle_parts(&w.alice, cert, first, last, &has_keys).unwrap() {
+        seq = w
+            .switch
+            .signer_op(OpKind::KeyBundlePut(KeyBundlePut {
+                target_app_id: me,
+                bundle: part.bundle,
+                first_epoch: part.first_epoch,
+                last_epoch: part.last_epoch,
+            }))
+            .unwrap();
+    }
+    seq
+}
+
+// The scripted switch drops key bundle parts by the core's rule, as the service does (Switch
+// wire 6.2): these mirror the service's tests of the same names in
+// `crates/pubky-switch/tests/endpoints_keys.rs`.
+
+#[tokio::test]
+async fn test_scripted_keys_passed_parts_go_when_the_next_part_is_stored() {
+    let w = World::new();
+    let app = w.join("wallet").await;
+    let me = app.app_id();
+    let cert = app.cert().clone();
+    w.next_doc(|body| body.data_epoch = 2);
+    // A full bundle asked for, so the cursor passing epoch 1's part keeps it.
+    w.switch.request_full_bundle(me);
+    let first = store_part(&w, me, &cert, 1, 1);
+    w.switch.move_cursor(me, first).unwrap();
+    assert_eq!(w.switch.bundles_of(&me), vec![(1, 1)]);
+    // Epoch 2's part completes the request; judged as it was before the part, the passed
+    // part stays at this put.
+    store_part(&w, me, &cert, 2, 2);
+    assert!(w.switch.app(&me).full_requested.is_none(), "covered");
+    assert_eq!(w.switch.bundles_of(&me), vec![(1, 1), (2, 2)]);
+    // The next part stored, with no request pending: the passed part goes, and keys_through
+    // keeps its height.
+    store_part(&w, me, &cert, 2, 2);
+    assert_eq!(w.switch.bundles_of(&me), vec![(2, 2)]);
+    assert_eq!(w.switch.keys_through_of(&me), Some(1));
+}
+
+#[tokio::test]
+async fn test_scripted_keys_a_part_passed_before_its_gap_goes_once_the_gap_is_filled() {
+    let w = World::new();
+    let app = w.join("wallet").await;
+    let me = app.app_id();
+    let cert = app.cert().clone();
+    assert_eq!(w.switch.keys_through_of(&me), Some(1));
+    w.next_doc(|body| body.data_epoch = 3);
+    // Epoch 3's part, passed: not covered while epoch 2's keys are missing, so it stays.
+    let third = store_part(&w, me, &cert, 3, 3);
+    w.switch.move_cursor(me, third).unwrap();
+    assert_eq!(w.switch.bundles_of(&me), vec![(3, 3)]);
+    assert_eq!(w.switch.keys_through_of(&me), Some(1));
+    // Epoch 2's part fills the gap; once the cursor passes it too, both go, and
+    // keys_through stays at 3 without them.
+    let second = store_part(&w, me, &cert, 2, 2);
+    assert_eq!(w.switch.bundles_of(&me), vec![(2, 2), (3, 3)]);
+    w.switch.move_cursor(me, second).unwrap();
+    assert_eq!(w.switch.bundles_of(&me), Vec::<(u64, u64)>::new());
+    assert_eq!(w.switch.keys_through_of(&me), Some(3));
+}
+
+#[tokio::test]
+async fn test_scripted_keys_a_cursor_move_keeps_parts_while_a_full_bundle_is_requested() {
+    let w = World::new();
+    let app = w.join("wallet").await;
+    let me = app.app_id();
+    let cert = app.cert().clone();
+    // At data epoch 2, epoch 1's part doesn't complete the request.
+    w.next_doc(|body| body.data_epoch = 2);
+    w.switch.request_full_bundle(me);
+    let first = store_part(&w, me, &cert, 1, 1);
+    w.switch.move_cursor(me, first).unwrap();
+    assert!(w.switch.app(&me).full_requested.is_some());
+    assert_eq!(w.switch.bundles_of(&me), vec![(1, 1)]);
+}
+
 #[tokio::test]
 async fn test_app_keys_calls_without_a_record_are_not_current() {
     // An app listed but holding no record at the switch isn't current: its `GET` and `POST

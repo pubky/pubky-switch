@@ -1021,6 +1021,29 @@ impl ScriptedSwitch {
         Ok(inner.seq)
     }
 
+    /// Move `app`'s cursor to `seq`, in a batch of its own, as a submitted `cursor.set` does
+    /// (Switch wire 6.2). For tests of what a cursor move changes.
+    ///
+    /// # Errors
+    ///
+    /// As [`ScriptedSwitch::signer_op`].
+    #[cfg(test)]
+    pub(crate) fn move_cursor(&self, app: [u8; 16], seq: u64) -> Result<(), ScriptError> {
+        let mut inner = self.lock();
+        let generation = inner.tip.generation;
+        let (status, body) = inner.submit(Some(app), &[], Some(Position { generation, seq }))?;
+        if status != 200 {
+            return Err(ScriptError::Refused { status, body });
+        }
+        Ok(())
+    }
+
+    /// `app`'s `keys_through` as `GET /apps` shows it (Switch wire 7.4.12). For tests.
+    #[cfg(test)]
+    pub(crate) fn keys_through_of(&self, app: &[u8; 16]) -> Option<u64> {
+        self.lock().keys_through(app)
+    }
+
     /// The feed items `app` is shown, in order, read page by page through the feed route
     /// itself (Switch wire 3.8, 7.4.4, 7.5), so a test judges what the route shows, with the
     /// certificate the route checks the app against; the read isn't counted against a
