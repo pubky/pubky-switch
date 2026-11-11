@@ -33,6 +33,7 @@ use serde_json::Value;
 
 use super::{AbortOutcome, CertChange, Signer, SignerEnv, UserConfirmed};
 use crate::alert::Alert;
+use crate::error::{Refusal, SignerError};
 use crate::homeserver::Homeserver;
 use crate::key::{AddOutcome, IdentityKeyring, IdentitySecret, SecretVault, VaultError};
 use crate::protocol::{Protocol, Protocols, ScopeDef};
@@ -633,4 +634,190 @@ async fn test_vectors_old_signer_tells_of_an_identity_near_the_limit() {
             .iter()
             .any(|alert| matches!(alert, Alert::IdentityNearLimit { .. }))
     );
+}
+
+/// alice's version 3 as version 4, with `entries` `renewed` entries of the wallet, closed
+/// at `until` or open, held by the switch and taken by the old signer as delivered. Each entry
+/// names a certificate the signer issued and holds, as a hand-over carries them all (wire
+/// 3.12).
+async fn with_renewed(old: &mut OldSigner, entries: u32, until: Option<u64>) -> IdentityDoc {
+    let v3 = IdentityDoc::verify(&document("alice identity.json"), &old.key.public()).unwrap();
+    let mut body = v3.body().clone();
+    body.version = 4;
+    let listed = body.apps[0].cert;
+    let listed = old
+        .signer
+        .state
+        .certs
+        .iter()
+        .map(|cert| AppCert::verify(cert, &old.key.public()).unwrap())
+        .find(|cert| cert.hash() == listed)
+        .unwrap();
+    body.renewed = (0..entries)
+        .map(|n| {
+            let mut earlier = listed.body().clone();
+            earlier.issued_at -= u64::from(n) + 1;
+            let cert = AppCert::issue(&old.key, earlier).unwrap();
+            old.signer.state.certs.push(cert.signed().clone());
+            RenewedCert {
+                app_id: cert.app_id(),
+                cert: cert.hash(),
+                until,
+            }
+        })
+        .collect();
+    let large = IdentityDoc::sign(&old.key, body).unwrap();
+    old.switch.deliver_identity(&large).unwrap();
+    old.signer
+        .delivered(large.signed().clone(), Some(v3.hash()), None)
+        .await
+        .unwrap();
+    large
+}
+
+fn near_limit(signer: &Signer) -> bool {
+    signer
+        .alerts()
+        .iter()
+        .any(|alert| matches!(alert, Alert::IdentityNearLimit { .. }))
+}
+
+/// About 900 `renewed` entries: a delivery carrying the version stays under three quarters of
+/// the cap, but a move's enrollment, which carries it encoded twice, is past it, and the user
+/// is told (Switch wire 3.7, 7.1).
+#[tokio::test]
+async fn test_vectors_old_signer_measures_the_enrollment_form_too() {
+    let mut old = old_signer().await;
+    let v3 = IdentityDoc::verify(&document("alice identity.json"), &old.key.public()).unwrap();
+    let large = with_renewed(&mut old, 900, Some(VECTOR_START_MS)).await;
+    let delivery = pubky_switch_core::http::IdentityDelivery {
+        identity: large.signed().clone(),
+        prev: Some(v3.hash()),
+    };
+    let limit = super::identity_limit().unwrap();
+    assert!(
+        delivery.to_json().len() * 4 <= limit * 3,
+        "the delivery alone is under"
+    );
+    assert!(near_limit(&old.signer));
+}
+
+/// An identity over the size a delivery may carry: a change that keeps it there is refused
+/// before anything is signed, and so is the automatic renewal, which the run skips with the
+/// near-limit alert; a revocation, which drops the app's `renewed` entries, goes through
+/// (Switch wire 7.1, 3.3).
+#[tokio::test]
+async fn test_vectors_old_signer_signs_nothing_over_the_cap_but_a_removal() {
+    let mut old = old_signer().await;
+    with_renewed(&mut old, 1_560, Some(VECTOR_START_MS)).await;
+    let puts = |old: &OldSigner| {
+        old.transport
+            .requests()
+            .iter()
+            .filter(|r| r.method == "PUT" && r.path_and_query.ends_with("/identity"))
+            .count()
+    };
+    let sent = puts(&old);
+    let refused = old.signer.set_record_max_age(Some(60)).await.unwrap_err();
+    assert!(
+        matches!(
+            refused,
+            SignerError::Refused(Refusal::IdentityTooLarge { .. })
+        ),
+        "{refused:?}"
+    );
+    // Past half the certificates' lifetimes: a renewal is refused, so the run renews nothing,
+    // and says why.
+    old.clock.set_ms(VECTOR_START_MS + 200 * 86_400_000);
+    let keys = load("keys.json");
+    let phone = app_keys(&keys, "phone").app_id_bytes();
+    let refused = old
+        .signer
+        .renew(phone, CertChange::default())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            refused,
+            SignerError::Refused(Refusal::IdentityTooLarge { .. })
+        ),
+        "{refused:?}"
+    );
+    old.signer.run_due().await.unwrap();
+    assert_eq!(puts(&old), sent);
+    assert!(near_limit(&old.signer));
+
+    let wallet = app_keys(&keys, "wallet").app_id_bytes();
+    let removed = old
+        .signer
+        .revoke(wallet, None, UserConfirmed::shown_and_confirmed())
+        .await
+        .unwrap();
+    assert!(removed.body().renewed.is_empty());
+    assert!(puts(&old) > sent);
+    assert!(!near_limit(&old.signer));
+}
+
+/// A new signer taking over an identity near the size a delivery may carry is told at its
+/// take-over, not only at its own next delivery (Switch wire 3.7, 3.12, 7.1).
+#[tokio::test]
+async fn test_vectors_new_signer_is_told_of_a_large_identity_at_its_take_over() {
+    let mut old = old_signer().await;
+    with_renewed(&mut old, 1_200, Some(VECTOR_START_MS)).await;
+    old.signer
+        .hand_over_to(old.phone, UserConfirmed::shown_and_confirmed())
+        .await
+        .unwrap();
+    let keys = load("keys.json");
+    let alice = old.key.public();
+    let v3 = IdentityDoc::verify(&document("alice identity.json"), &alice).unwrap();
+    let phone = super::ReceivingApp {
+        keys: app_keys(&keys, "phone"),
+        cert: AppCert::verify(&document("phone certificate"), &alice).unwrap(),
+        origin: v3.inbox().url.clone(),
+        service_key: v3.inbox().service_key,
+    };
+    let env = SignerEnv {
+        store: StoreHandle::inline(Arc::new(MemoryStore::new())),
+        clock: old.clock.clone(),
+        transport: old.transport.clone(),
+        homeserver: old.homeserver.clone(),
+        protocols: Protocols::new(vec![Arc::new(VectorScopes::new())]).unwrap(),
+    };
+    let new = Signer::receive_hand_over(env, &phone, Arc::new(Vault(Mutex::new(None))))
+        .await
+        .unwrap();
+    assert!(near_limit(&new));
+}
+
+/// Open `renewed` entries under the cap that their closings would take over it: a change is
+/// refused, since a closing owed past the cap could never be delivered and would stop every
+/// later step; the revocation of their app goes through (Switch wire 3.3, 3.8, 7.1).
+#[tokio::test]
+async fn test_vectors_old_signer_counts_the_closings_its_open_renewals_owe() {
+    let mut old = old_signer().await;
+    let v3 = IdentityDoc::verify(&document("alice identity.json"), &old.key.public()).unwrap();
+    let large = with_renewed(&mut old, 1_700, None).await;
+    let delivery = pubky_switch_core::http::IdentityDelivery {
+        identity: large.signed().clone(),
+        prev: Some(v3.hash()),
+    };
+    let limit = super::identity_limit().unwrap();
+    assert!(delivery.to_json().len() < limit, "the open entries fit");
+    let refused = old.signer.set_record_max_age(Some(60)).await.unwrap_err();
+    assert!(
+        matches!(
+            refused,
+            SignerError::Refused(Refusal::IdentityTooLarge { .. })
+        ),
+        "{refused:?}"
+    );
+    let keys = load("keys.json");
+    let wallet = app_keys(&keys, "wallet").app_id_bytes();
+    let removed = old
+        .signer
+        .revoke(wallet, None, UserConfirmed::shown_and_confirmed())
+        .await
+        .unwrap();
+    assert!(removed.body().renewed.is_empty());
 }
