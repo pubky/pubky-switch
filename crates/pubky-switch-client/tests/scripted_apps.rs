@@ -153,3 +153,108 @@ async fn test_scripted_apps_rotation_stays_done_after_a_purge() {
     assert!(!purged.current);
     assert!(purged.departed_at.is_some());
 }
+
+#[tokio::test]
+async fn test_scripted_apps_lists_the_app_ids_an_enrollment_kept() {
+    use pubky_switch_client::testing::{SWITCH_ORIGIN, ScriptedSwitch};
+    use pubky_switch_core::keys::IdentityKey;
+    use pubky_switch_core::records::{
+        Enrollment, EnrollmentBody, IdentityBody, IdentityDoc, IdentityPolicy, Inbox,
+    };
+    let key = IdentityKey::from_secret([31; 32]);
+    let identity = key.public();
+    let clock = Arc::new(TestClock::new(START_MS));
+    let switch = ScriptedSwitch::unenrolled(&key, [32; 32], Arc::clone(&clock));
+    let kept = [44; 16];
+    let client = |pinned| {
+        SwitchClient::new(
+            SWITCH_ORIGIN,
+            identity,
+            Credentials::Signer {
+                identity,
+                key: Arc::new(key.clone()),
+            },
+            pinned,
+            switch.transport(),
+            clock.clone(),
+        )
+        .unwrap()
+    };
+    let body = EnrollmentBody {
+        identity,
+        origin: SWITCH_ORIGIN.to_owned(),
+        nonce: [1; 16],
+        policy: IdentityPolicy::default(),
+        identity_doc: None,
+        revoked_apps: Some(vec![kept]),
+    };
+    let enrollment = Enrollment::sign(&key, body).unwrap();
+    let answer = client(None).enroll(&enrollment).await.unwrap();
+    let first = IdentityBody::first(
+        identity,
+        [2; 16],
+        Inbox::new(SWITCH_ORIGIN, answer.service_key),
+        IdentityPolicy::default(),
+    );
+    switch
+        .deliver_identity(&IdentityDoc::sign(&key, first).unwrap())
+        .unwrap();
+    clock.advance_ms(60_000);
+    let apps = client(Some(answer.service_key)).apps().await.unwrap();
+    let status = apps.apps.iter().find(|s| s.app_id == kept).unwrap();
+    assert!(!status.current);
+    assert_eq!(status.revoked_at, Some(START_MS));
+    assert_eq!(status.departed_at, None);
+    assert_eq!(status.keys_through, None);
+}
+
+#[tokio::test]
+async fn test_scripted_apps_current_isnt_expiry() {
+    // Spec 3.4's sense: a listed app whose certificate lapsed is still current, and
+    // `cert_expires_at` shows the lapse. Once revoked, it isn't current.
+    let s = Setup::new();
+    let keys = s.alice.identity().app_keys("lapsed");
+    s.alice
+        .register_app(&keys, &AppSpec::new(&["notes"]))
+        .unwrap();
+    let id = keys.app_id_bytes();
+    assert!(s.status(&id).await.current);
+    s.clock.advance_ms(800 * DAY_MS);
+    let lapsed = s.status(&id).await;
+    assert!(lapsed.current);
+    assert!(
+        lapsed
+            .cert_expires_at
+            .is_some_and(|at| at < START_MS + 800 * DAY_MS)
+    );
+    s.alice.switch().revoke(id).unwrap();
+    assert!(!s.status(&id).await.current);
+}
+
+#[tokio::test]
+async fn test_scripted_apps_last_seen_stops_once_the_app_is_revoked() {
+    let s = Setup::new();
+    let app = s.join("wallet").await;
+    let seen = s.status(&app.app_id()).await.last_seen;
+    assert!(seen.is_some());
+    s.alice.switch().revoke(app.app_id()).unwrap();
+    s.clock.advance_ms(60_000);
+    // The revoked app's requests are refused, and don't count as seen.
+    let _ = s
+        .alice
+        .switch()
+        .handle(&pubky_switch_client::transport::Request {
+            method: "GET".into(),
+            origin: s.alice.origin().to_owned(),
+            path_and_query: format!(
+                "/v1/{}/feed",
+                pubky_switch_core::enc::zbase32_encode(&s.alice.identity().public())
+            ),
+            headers: vec![pubky_switch_client::transport::Header {
+                name: pubky_switch_core::http::header::APP.to_owned(),
+                value: pubky_switch_core::enc::zbase32_encode(&app.app_id()),
+            }],
+            body: Vec::new(),
+        });
+    assert_eq!(s.status(&app.app_id()).await.last_seen, seen);
+}

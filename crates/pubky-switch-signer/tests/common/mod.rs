@@ -60,6 +60,10 @@ pub struct TestHomeserver {
     pub failing_puts: Mutex<bool>,
     /// Writes to this path fail while reads and other writes go through.
     pub failing_path: Mutex<Option<String>>,
+    /// Writes to this path apply, and their answer is lost: the writer sees a failure.
+    pub losing_path: Mutex<Option<String>>,
+    /// Reads of this path fail while other reads and every write go through.
+    pub failing_read_path: Mutex<Option<String>>,
 }
 
 impl TestHomeserver {
@@ -85,7 +89,8 @@ impl TestHomeserver {
 
 impl Homeserver for TestHomeserver {
     fn get(&self, path: &str) -> BoxFuture<'_, Result<Option<Vec<u8>>, TransportError>> {
-        let answer = if *self.down.lock().unwrap() {
+        let failing = self.failing_read_path.lock().unwrap().as_deref() == Some(path);
+        let answer = if *self.down.lock().unwrap() || failing {
             Err(TransportError::Connect("down".into()))
         } else {
             Ok(self.file(path))
@@ -103,7 +108,11 @@ impl Homeserver for TestHomeserver {
                     .unwrap()
                     .push((path.to_owned(), bytes.clone()));
                 self.set(path, bytes);
-                Ok(())
+                if self.losing_path.lock().unwrap().as_deref() == Some(path) {
+                    Err(TransportError::Connect("answer lost".into()))
+                } else {
+                    Ok(())
+                }
             };
         Box::pin(async move { answer })
     }
@@ -385,7 +394,11 @@ impl World {
 
     /// `app` joins as Switch spec 12.1 step 2 says: it reads its approval's claim and delivers
     /// its record with the certificate the approval names.
-    pub fn join(&self, app: &App, approved: &pubky_switch_signer::ApprovedRequest) {
+    pub fn join(
+        &self,
+        app: &App,
+        approved: &pubky_switch_signer::ApprovedRequest,
+    ) -> pubky_switch_core::records::AppCert {
         use pubky_switch_core::ops::OpKind;
         use pubky_switch_core::records::{AppRecord, AppRecordBody, Approval, ApprovalClaim};
         let identity = self.key.public();
@@ -418,5 +431,6 @@ impl World {
                 },
             )
             .unwrap();
+        read.cert
     }
 }

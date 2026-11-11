@@ -179,7 +179,7 @@ fn apply_op(
             let entry = fields.check()?;
             let writer = cert.app_id();
             let claim = {
-                let current = |app: &[u8; 16]| state.is_current(app);
+                let current = |app: &[u8; 16]| state.is_served(app);
                 let cx = EntryContext {
                     writer,
                     now,
@@ -226,7 +226,7 @@ fn apply_op(
                 .allow_list_mut(*kind)
                 .entry(*pubky)
                 .or_insert(ListEntry {
-                    written_by: cert.app_id(),
+                    written_by: Some(cert.app_id()),
                     at: now,
                 });
             StateAfter::Op
@@ -246,7 +246,7 @@ fn apply_op(
                 batch.limits,
             )?;
             state.deny.entry(*pubky).or_insert(ListEntry {
-                written_by: cert.app_id(),
+                written_by: Some(cert.app_id()),
                 at: now,
             });
             StateAfter::Op
@@ -274,6 +274,7 @@ fn apply_op(
                     writer: cert.app_id(),
                     expires_at: put.expires_at,
                     context: put.context.value().clone(),
+                    context_written: put.context.written_bytes().to_vec(),
                 },
             );
             StateAfter::Op
@@ -333,8 +334,9 @@ fn app_put(state: &mut OpsState, app: [u8; 16], record: &SignedDoc) -> Result<St
 }
 
 /// `receive_key.put`, by [`check_receive_key_put`]. An unchanged one's proof shows the
-/// current `n` and kid (Switch wire 6.4 "No-ops"). A stored key moves the directory, and an
-/// app's first makes it reachable, which moves `apps_version` (Switch wire 7.4.10).
+/// current `n` and kid (Switch wire 6.4 "No-ops"). A stored key moves the directory; an
+/// app it makes reachable moves `apps_version` once the batch settles reachability
+/// ([`OpsState::settle_directory`], Switch wire 7.4.10).
 fn receive_key_put(
     state: &mut OpsState,
     cert: &AppCert,
@@ -354,17 +356,9 @@ fn receive_key_put(
     let shown = match (effect, current) {
         (ReceiveKeyEffect::Unchanged, Some(current)) => current.clone(),
         _ => {
-            let first = current.is_none();
             state.kids.insert(new.kid());
             state.directory_version = state.directory_version.saturating_add(1);
-            if first {
-                state.apps_version = state.apps_version.saturating_add(1);
-            }
-            let apps_version = state.apps_version;
             let entry = state.apps.entry(app).or_default();
-            if first {
-                entry.reachable_since = Some(apps_version);
-            }
             entry.receive_key = Some(new.clone());
             state.new_receive_keys.push((app, new.clone()));
             new
@@ -529,6 +523,7 @@ mod tests {
                 writer,
                 expires_at: 2_000,
                 context: Value::Null,
+                context_written: b"null".to_vec(),
             },
         );
         state.invites.insert(
@@ -539,6 +534,7 @@ mod tests {
                 writer,
                 expires_at: 1_000,
                 context: Value::Null,
+                context_written: b"null".to_vec(),
             },
         );
         assert_eq!(state.live_invites(), 4, "the expired code doesn't count");

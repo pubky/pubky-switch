@@ -1129,3 +1129,38 @@ async fn test_renewal_an_added_scope_survives_the_next_rotation_unfetched() {
         );
     }
 }
+
+#[tokio::test]
+async fn test_renewal_a_part_the_switch_no_longer_holds_is_sent_again() {
+    // The signer stored `a`'s part for epoch 2, which a faulty switch then lost. At the next
+    // rotation that part doesn't count as stored, since `bundle_ranges` no longer shows it:
+    // `a`'s part starts after `keys_through`, and `a` gets epoch 2 again.
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let app = |n: u8| {
+        App::with_keys(
+            AppKeys::from_secrets([n; 32], [n + 1; 32]),
+            &["notes"],
+            None,
+            [n + 2; 32],
+        )
+    };
+    let (a, b, c) = (app(3), app(13), app(23));
+    for each in [&a, &b, &c] {
+        world.approve(&mut signer, each).await;
+    }
+    let a_id = a.keys.app_id_bytes();
+    let confirmed = pubky_switch_signer::UserConfirmed::shown_and_confirmed;
+    signer
+        .revoke(b.keys.app_id_bytes(), None, confirmed())
+        .await
+        .unwrap();
+    assert!(holds(&world, &opened(&world, &a), 2, "notes"));
+    world.switch.forget_bundle_parts(&a_id);
+    signer
+        .revoke(c.keys.app_id_bytes(), None, confirmed())
+        .await
+        .unwrap();
+    let parts = opened(&world, &a);
+    assert!((1..=3).all(|epoch| app_holds(&world, &a, &parts, epoch, "notes")));
+}

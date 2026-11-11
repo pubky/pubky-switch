@@ -10,16 +10,19 @@
 //!
 //! Served so far: `POST /v1/enroll`, `PUT /v1/{id}/identity`, the public
 //! `GET /v1/{id}/identity`, `POST /v1/{id}/ops`, `GET /v1/{id}/feed`,
-//! `PUT /v1/{id}/peers`, `GET /v1/{id}/claims/{claim_key}`, `GET /v1/{id}/apps` and
+//! `POST /v1/{id}/inbox`, `PUT /v1/{id}/peers`, `GET /v1/{id}/claims/{claim_key}`,
+//! `GET /v1/{id}/apps` and
 //! `POST /v1/{id}/apps/{app_id}/revoke`. Every other call is answered `503 unavailable`.
 
 mod admission;
 mod apps;
 pub mod batch;
 mod claims;
+mod directory;
 mod enroll;
 mod feed;
 mod identity;
+mod inbox;
 mod peers;
 pub mod rules;
 
@@ -71,7 +74,23 @@ pub struct Service {
     control_rate: KeyedMinutes<(String, [u8; 16])>,
     invite_rate: KeyedMinutes<(String, [u8; 32])>,
     stranger_rate: KeyedMinutes<String>,
+    sender_rate: KeyedMinutes<(String, [u8; 32])>,
+    sender_app_rate: KeyedMinutes<(String, [u8; 16])>,
+    notify_rate: KeyedMinutes<(String, [u8; 32])>,
     changes: Arc<ChangeHub>,
+    /// Where entry IDs come from: random, opaque to senders (Switch wire 1.7).
+    entry_ids: EntryIds,
+}
+
+/// A source of entry IDs.
+type EntryIds = Arc<dyn Fn() -> [u8; 16] + Send + Sync>;
+
+/// A random entry ID; all zeros only if the system has no randomness, which the service's
+/// own keys would have failed on first.
+fn random_entry_id() -> [u8; 16] {
+    let mut id = [0u8; 16];
+    let _ = getrandom::fill(&mut id);
+    id
 }
 
 impl std::fmt::Debug for Service {
@@ -236,8 +255,20 @@ impl Service {
             control_rate: KeyedMinutes::default(),
             invite_rate: KeyedMinutes::default(),
             stranger_rate: KeyedMinutes::default(),
+            sender_rate: KeyedMinutes::default(),
+            sender_app_rate: KeyedMinutes::default(),
+            notify_rate: KeyedMinutes::default(),
             changes: ChangeHub::new(),
+            entry_ids: Arc::new(random_entry_id),
         }
+    }
+
+    /// The service with entry IDs from `ids`, for tests that replay the vectors' fixed ones.
+    #[cfg(any(test, feature = "test-util"))]
+    #[must_use]
+    pub fn with_entry_ids(mut self, ids: impl Fn() -> [u8; 16] + Send + Sync + 'static) -> Self {
+        self.entry_ids = Arc::new(ids);
+        self
     }
 
     /// The hub that wakes waiting feed reads. Run a [`crate::changes::ChangeListener`]
@@ -328,9 +359,13 @@ impl Service {
                 None
             }
             Call::PutIdentity => {
-                match self.authenticate_signer(&account, &request, base_ms).await {
-                    Ok((claimed, app)) => {
+                match self
+                    .authenticate_signer(&account, &request, base_ms, base_ms.max(stamped_ms))
+                    .await
+                {
+                    Ok((claimed, app, cert)) => {
                         verified = app;
+                        other = cert;
                         Some(claimed)
                     }
                     Err(error) => return refused_early(error).await,
@@ -339,24 +374,28 @@ impl Service {
             // The signer is verified here; an own app under the lock, with the key the
             // account holds for it (Switch wire 7.2).
             Call::Revoke(_) | Call::GetApps => {
-                match self.authenticate_signer(&account, &request, base_ms).await {
-                    Ok((claimed, app)) => {
+                match self
+                    .authenticate_signer(&account, &request, base_ms, base_ms.max(stamped_ms))
+                    .await
+                {
+                    Ok((claimed, app, cert)) => {
                         verified = app;
+                        other = cert;
                         Some(claimed)
                     }
                     Err(error) => return refused_early(error).await,
                 }
             }
-            Call::Ops | Call::GetClaim(_) | Call::Feed | Call::PutPeers => {
-                let others = *call == Call::PutPeers;
-                match self.authenticate_caller(
-                    &account,
-                    &request,
-                    base_ms,
-                    base_ms.max(stamped_ms),
-                    others,
-                ) {
-                    Ok(claimed) => {
+            Call::Ops
+            | Call::GetClaim(_)
+            | Call::Feed
+            | Call::PutPeers
+            | Call::Append
+            | Call::Directory => {
+                match self.authenticate_caller(&account, &request, base_ms, base_ms.max(stamped_ms))
+                {
+                    Ok((claimed, cert)) => {
+                        other = cert;
                         // An own app's request is verified here too, so nothing unverified
                         // takes the lock (Switch wire 7.2 Order).
                         if let Caller::OwnApp(app) = &claimed.caller {
@@ -366,19 +405,6 @@ impl Service {
                                 .await
                             {
                                 Ok(app) => verified = Some(app),
-                                Err(error) => {
-                                    if is_failed_authentication(error.code) {
-                                        self.record_failure(&request, account.clone());
-                                    }
-                                    return refused_early(error).await;
-                                }
-                            }
-                        }
-                        // An app of another identity, by the certificate it sends (Switch
-                        // wire 7.2 checks 1, 2 and 4); check 3 comes under the lock.
-                        if let Caller::OtherApp { app, .. } = &claimed.caller {
-                            match self.verify_other_app(&request, &claimed, app) {
-                                Ok(cert) => other = Some(cert),
                                 Err(error) => {
                                     if is_failed_authentication(error.code) {
                                         self.record_failure(&request, account.clone());
@@ -474,7 +500,8 @@ impl Service {
         account: &str,
         request: &SwitchRequest,
         base_ms: u64,
-    ) -> Result<(Claimed, Option<batch::VerifiedApp>), ApiError> {
+        service_time_ms: u64,
+    ) -> Result<(Claimed, Option<batch::VerifiedApp>, Option<AppCert>), ApiError> {
         if let Err(retry_after) = self.failed_auth.check(request.source, base_ms) {
             return Err(ApiError::rate_limited(
                 "9.4: too many failed authentications from this network source",
@@ -502,20 +529,16 @@ impl Service {
                             self.record_failure(request, account.to_string());
                         }
                     })?;
-                Ok((claimed, Some(verified)))
+                Ok((claimed, Some(verified), None))
             }
-            // Its certificate first, in 7.2's order (`400`, `401`), then the refusal.
+            // Its certificate first, in 7.2's order (`400`, `401`), then its expiry, then
+            // the refusal (3.8).
             Caller::OtherApp { app, .. } => {
-                self.verify_other_app(request, &claimed, app)
-                    .inspect_err(|error| {
-                        if is_failed_authentication(error.code) {
-                            self.record_failure(request, account.to_string());
-                        }
-                    })?;
-                rules::require_signer(&claimed.caller)?;
-                Ok((claimed, None))
+                let cert =
+                    self.other_app_before_lock(account, request, &claimed, app, service_time_ms)?;
+                Ok((claimed, None, Some(cert)))
             }
-            Caller::Signer => Ok((claimed, None)),
+            Caller::Signer => Ok((claimed, None, None)),
         }
     }
 
@@ -835,14 +858,19 @@ impl Service {
             Err(error) => return Err(stop(error)),
         };
         // Check 3 of an app of another identity, at the identity's service time (Switch wire
-        // 7.2): its certificate hasn't expired.
-        if let Some(cert) = other
-            && cert.expired_at(time_ms)
-        {
-            return Err(Refused::with_head(
-                ApiError::new(ErrorCode::CertExpired, "3.8: the certificate has expired"),
-                serving,
-            ));
+        // 7.2): its certificate hasn't expired. The refusal commits this time and is signed
+        // at it. Then, at a call it doesn't make, the refusal it would have got before the
+        // lock (3.8: expiry first).
+        if let Some(cert) = other {
+            if cert.expired_at(time_ms) {
+                return Err(Refused::with_head(
+                    ApiError::new(ErrorCode::CertExpired, "3.8: the certificate has expired"),
+                    serving,
+                ));
+            }
+            if !rules::takes_other_apps(call) {
+                return Err(Refused::with_head(rules::other_app_refusal(call), serving));
+            }
         }
         // A call only the signer makes, from an own app that verified: refused with the head
         // (Switch wire 7.4, 7.1).
@@ -885,6 +913,78 @@ impl Service {
                         writer.as_ref(),
                         claim_key,
                         due,
+                        time_ms,
+                    )
+                    .await
+                    .map(|answer| (answer, serving))
+                    .map_err(|error| Refused::with_head(error, serving));
+            }
+            Call::Append => {
+                let appender = match (writer.as_ref(), other) {
+                    (Some(cert), _) => inbox::Appender::OwnApp(cert),
+                    (None, Some(cert)) => inbox::Appender::OtherApp(cert),
+                    (None, None) => {
+                        return Err(Refused::with_head(
+                            ApiError::new(
+                                ErrorCode::PermissionMissing,
+                                "7.4.3: apps append; the signer doesn't",
+                            ),
+                            serving,
+                        ));
+                    }
+                };
+                let query = request.route.query.as_ref().map_err(|_| {
+                    Refused::with_head(
+                        ApiError::bad_request("7.1: the query doesn't decode"),
+                        serving,
+                    )
+                })?;
+                let invite_code = request
+                    .headers
+                    .get(header::INVITE_CODE)
+                    .and_then(|value| value.to_str().ok());
+                return self
+                    .append(
+                        txn,
+                        signer,
+                        held.as_ref(),
+                        appender,
+                        &request.body,
+                        query,
+                        invite_code,
+                        due.is_some(),
+                        time_ms,
+                    )
+                    .await
+                    .map(|answer| (answer, serving))
+                    .map_err(|error| Refused::with_head(error, serving));
+            }
+            Call::Directory => {
+                let reader = match (writer.as_ref(), other) {
+                    (Some(_), _) => directory::Reader::OwnApp,
+                    (None, Some(cert)) => directory::Reader::OtherApp(cert),
+                    (None, None) => {
+                        return Err(Refused::with_head(
+                            ApiError::new(
+                                ErrorCode::PermissionMissing,
+                                "7.4.10: apps read the directory; the signer doesn't",
+                            ),
+                            serving,
+                        ));
+                    }
+                };
+                let invite_code = request
+                    .headers
+                    .get(header::INVITE_CODE)
+                    .and_then(|value| value.to_str().ok());
+                return self
+                    .directory(
+                        txn,
+                        signer,
+                        held.as_ref(),
+                        reader,
+                        invite_code,
+                        due.is_some(),
                         time_ms,
                     )
                     .await
@@ -982,8 +1082,7 @@ impl Service {
         request: &SwitchRequest,
         base_ms: u64,
         service_time_ms: u64,
-        others: bool,
-    ) -> Result<Claimed, ApiError> {
+    ) -> Result<(Claimed, Option<AppCert>), ApiError> {
         if let Err(retry_after) = self.failed_auth.check(request.source, base_ms) {
             return Err(ApiError::rate_limited(
                 "9.4: too many failed authentications from this network source",
@@ -999,39 +1098,46 @@ impl Service {
                     self.record_failure(request, account.to_string());
                 }
             })?;
-        if let Caller::OtherApp { app, .. } = &claimed.caller
-            && !others
-        {
-            // Authenticated first, by its certificate (`400`, `401`, Switch wire 7.2):
-            // permissions and the endpoint's refusal come after authentication.
-            let cert = self
-                .verify_other_app(request, &claimed, app)
-                .inspect_err(|error| {
-                    if is_failed_authentication(error.code) {
-                        self.record_failure(request, account.to_string());
-                    }
-                })?;
-            // Check 3, expiry, before any permission (Switch wire 3.8), at the identity's
-            // service time as far as it is known before the lock.
-            if cert.expired_at(service_time_ms) {
-                return Err(ApiError::new(
-                    ErrorCode::CertExpired,
-                    "3.8: the certificate has expired",
-                ));
-            }
-            // The feed is for own apps only (Switch wire 7.4.4).
-            if request.route.call == Call::Feed {
-                return Err(ApiError::new(
-                    ErrorCode::PermissionMissing,
-                    "7.4.4: only own apps read the feed",
-                ));
-            }
-            return Err(ApiError::new(
-                ErrorCode::NotAdmitted,
-                "6.4: an app of another identity doesn't write here",
-            ));
+        let cert = match &claimed.caller {
+            Caller::OtherApp { app, .. } => Some(self.other_app_before_lock(
+                account,
+                request,
+                &claimed,
+                app,
+                service_time_ms,
+            )?),
+            _ => None,
+        };
+        Ok((claimed, cert))
+    }
+
+    /// An app of another identity before the lock (Switch wire 7.2): its certificate
+    /// checked (`400`, `401`, counted against the network source), then the call. A call
+    /// it makes goes on, its expiry judged under the lock. At any other call it is refused
+    /// here (`rules::other_app_refusal`), unless its certificate has expired by the
+    /// identity's service time as far as it is known before the lock: expiry comes before
+    /// that refusal (3.8), so it goes on to the lock too, where its `403 cert_expired` is
+    /// judged and signed at the time the refusal commits.
+    fn other_app_before_lock(
+        &self,
+        account: &str,
+        request: &SwitchRequest,
+        claimed: &Claimed,
+        app: &str,
+        service_time_ms: u64,
+    ) -> Result<AppCert, ApiError> {
+        let cert = self
+            .verify_other_app(request, claimed, app)
+            .inspect_err(|error| {
+                if is_failed_authentication(error.code) {
+                    self.record_failure(request, account.to_string());
+                }
+            })?;
+        let call = &request.route.call;
+        if rules::takes_other_apps(call) || cert.expired_at(service_time_ms) {
+            return Ok(cert);
         }
-        Ok(claimed)
+        Err(rules::other_app_refusal(call))
     }
 
     /// Decode and verify a request's signature (Switch wire 7.2): the signer's with the

@@ -40,7 +40,7 @@ use pubky_switch_core::enc::{kid, pubky_id};
 use pubky_switch_core::keys::IdentityKey;
 use pubky_switch_core::labels;
 use pubky_switch_core::records::{
-    AppCert, IdentityDoc, Limits, SignerBackup, SignerRecords, StoredPart,
+    AppCert, IdentityDoc, Limits, SignerBackup, SignerHandover, SignerRecords, StoredPart,
 };
 use pubky_switch_core::signing::Signs;
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -174,12 +174,22 @@ pub enum ExportReason {
 
 /// The identity key, through the host's vault.
 ///
-/// It holds the identity's public key and the vault, never the secret: each use loads the
-/// secret, checks that it is still this identity's, uses it and drops it.
-#[derive(Clone)]
+/// It holds the identity's public key and the vault, and no secret but a received one until
+/// its install: each use loads the secret, checks that it is still this identity's, uses it
+/// and drops it.
+///
+/// The received form is a new signer's while it takes over (Switch wire 3.12): the secret it
+/// opened from the hand-over, held in memory until its first delivery has won and the secret
+/// is put in the vault, read back and checked. It is made in one place only,
+/// by opening the hand-over a committed take-over flow holds with the app's bundle secret, at
+/// the take-over's start and on each resume; there is no public way to make one, nor one from
+/// raw bytes. It isn't `Clone`, its `Debug` shows only the identity, it is never serialized,
+/// and the secret is zeroized when it goes. It signs through the gate like the vault form, and
+/// the gate lets it sign only the take-over's own steps.
 pub struct IdentityKeyring {
     vault: Arc<dyn SecretVault>,
     public: [u8; 32],
+    held: Option<IdentitySecret>,
 }
 
 impl std::fmt::Debug for IdentityKeyring {
@@ -197,7 +207,80 @@ impl IdentityKeyring {
     pub fn open(vault: Arc<dyn SecretVault>) -> Result<Self, KeyError> {
         let secret = vault.load()?.ok_or(KeyError::Missing)?;
         let public = secret.key().public();
-        Ok(Self { vault, public })
+        Ok(Self {
+            vault,
+            public,
+            held: None,
+        })
+    }
+
+    /// The received form: the identity secret opened from `handover`, the hand-over a
+    /// committed take-over flow holds, with the bundle secret of the app `app_id` (checks 1
+    /// and 2 of Switch wire 3.12), held until [`IdentityKeyring::install_held`]; and the
+    /// records it carries. Nothing is written to `vault` here. Its one caller is the
+    /// take-over, at its start and on each resume, with the flow's own hand-over.
+    ///
+    /// # Errors
+    ///
+    /// The core's error of the check that fails.
+    pub(crate) fn received(
+        vault: Arc<dyn SecretVault>,
+        handover: &SignerHandover,
+        identity: &[u8; 32],
+        app_id: &[u8; 16],
+        bundle_secret: &[u8; 32],
+    ) -> Result<(Self, SignerRecords), pubky_switch_core::Error> {
+        let records = handover.open(identity, app_id, bundle_secret)?;
+        let key = records.key();
+        let secret = zeroize::Zeroizing::new(key.secret_bytes());
+        let keyring = Self {
+            vault,
+            public: key.public(),
+            held: Some(IdentitySecret::from_bytes(*secret)),
+        };
+        Ok((keyring, records))
+    }
+
+    /// Check that `vault` could take the secret of `identity`: it holds none, or that one.
+    ///
+    /// # Errors
+    ///
+    /// [`KeyError::Occupied`] when it holds another secret, or the vault's error.
+    pub(crate) fn vault_takes(
+        vault: &dyn SecretVault,
+        identity: &[u8; 32],
+    ) -> Result<(), KeyError> {
+        match vault.load()? {
+            Some(held) if held.key().public() != *identity => Err(KeyError::Occupied),
+            _ => Ok(()),
+        }
+    }
+
+    /// Whether this is the received form, its secret not yet in the vault.
+    pub(crate) fn is_received(&self) -> bool {
+        self.held.is_some()
+    }
+
+    /// Drop the received secret, zeroized, as when the take-over was refused or lost. Nothing
+    /// for the vault form.
+    pub(crate) fn forget_held(&mut self) {
+        self.held = None;
+    }
+
+    /// Put the received secret in the vault, once the new signer's delivery has won (Switch
+    /// wire 3.12): add it, read it back and check it is the identity's, and only then drop the
+    /// held copy. The vault form from then on. Nothing for the vault form.
+    ///
+    /// # Errors
+    ///
+    /// As [`IdentityKeyring::install`]; the held copy stays.
+    pub(crate) fn install_held(&mut self) -> Result<(), KeyError> {
+        let Some(held) = &self.held else {
+            return Ok(());
+        };
+        Self::install(Arc::clone(&self.vault), &self.public, held)?;
+        self.held = None;
+        Ok(())
     }
 
     /// A new identity: a fresh secret from the secure random generator, added to `vault`,
@@ -220,6 +303,7 @@ impl IdentityKeyring {
         let keyring = Self {
             vault,
             public: key.public(),
+            held: None,
         };
         keyring.load()?;
         Ok(keyring)
@@ -234,13 +318,6 @@ impl IdentityKeyring {
     ///
     /// [`KeyError::Mismatch`] when `secret` isn't the key of `identity`, [`KeyError::Occupied`]
     /// when the vault holds another secret, which is kept, or the vault's error.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the hand-over and restore flows take received keys"
-        )
-    )]
     pub(crate) fn install(
         vault: Arc<dyn SecretVault>,
         identity: &[u8; 32],
@@ -260,7 +337,9 @@ impl IdentityKeyring {
         let keyring = Self {
             vault,
             public: *identity,
+            held: None,
         };
+        // Read back from the vault, not the held copy.
         keyring.load()?;
         Ok(keyring)
     }
@@ -290,6 +369,9 @@ impl IdentityKeyring {
 
     /// The secret, checked against this identity.
     fn load(&self) -> Result<IdentitySecret, KeyError> {
+        if let Some(held) = &self.held {
+            return Ok(held.clone());
+        }
         let secret = self.vault.load()?.ok_or(KeyError::Missing)?;
         if secret.key().public() != self.public {
             return Err(KeyError::Mismatch);
@@ -369,10 +451,6 @@ impl IdentityKeyring {
     /// # Errors
     ///
     /// The vault's error.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the hand-over flows delete the key")
-    )]
     pub(crate) fn destroy(&self) -> Result<(), KeyError> {
         self.vault.delete()?;
         Ok(())
@@ -397,7 +475,8 @@ pub(crate) struct BackupView {
 }
 
 impl BackupView {
-    fn of(records: &SignerRecords) -> Self {
+    /// What `records` hold, but the identity key.
+    pub(crate) fn of(records: &SignerRecords) -> Self {
         Self {
             identity_doc: records.identity_doc().clone(),
             revoked_apps: records.revoked_apps().to_vec(),
@@ -408,11 +487,24 @@ impl BackupView {
         }
     }
 
-    /// Whether another install wrote it at or past `own_newest`, the high-water version of
-    /// the install `own_signer`: it took over, and this one stops (Switch wire 3.13
-    /// "Another install's backup"; the core's `taken_over`).
-    pub(crate) fn taken_over(&self, own_signer: &[u8; 16], own_newest: u64) -> bool {
-        &self.identity_doc.body().signer != own_signer && self.identity_doc.version() >= own_newest
+    /// Whether another install than `own_signer` wrote it at or past `own_newest`, the
+    /// high-water mark's document, which built on `own_prev`: it took over, and this one
+    /// stops (Switch wire 3.13 "Another install's backup"; the core's `taken_over`). One that
+    /// builds on `own_prev` too and isn't the mark itself is a losing delivery's, whatever its
+    /// version, and this install, still the signer, writes over it.
+    pub(crate) fn taken_over(
+        &self,
+        own_signer: &[u8; 16],
+        own_newest: Option<&IdentityDoc>,
+        own_prev: Option<[u8; 32]>,
+    ) -> bool {
+        pubky_switch_core::records::backup_taken_over(
+            &self.identity_doc,
+            self.prev,
+            own_signer,
+            own_newest,
+            own_prev,
+        )
     }
 }
 
@@ -456,6 +548,42 @@ impl SigningKey {
             prev,
         )?;
         SignerBackup::seal(&self.key, &records)
+    }
+
+    /// Seal the hand-over of the identity to `new_signer`, the certificate of a current app,
+    /// holding `doc`, the newest version the switch accepted from this signer, and these
+    /// records ([`ExportReason::HandOver`], Switch wire 3.12, Switch spec 12.8). The identity
+    /// secret goes into it, sealed to the app's certified bundle key: the second and last
+    /// place it leaves the vault. Only on the user's confirmation.
+    ///
+    /// # Errors
+    ///
+    /// The core's error for records that don't build or seal, or a `doc` that doesn't list
+    /// `new_signer` as current.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the hand-over's records, field by field"
+    )]
+    pub(crate) fn seal_hand_over(
+        &self,
+        doc: IdentityDoc,
+        revoked: &[[u8; 16]],
+        issued: &[AppCert],
+        limits: Limits,
+        parts: &[StoredPart],
+        new_signer: &AppCert,
+        _confirmed: &crate::signer::UserConfirmed,
+    ) -> Result<SignerHandover, pubky_switch_core::Error> {
+        let records = SignerRecords::new(
+            IdentityKey::clone(&self.key),
+            doc,
+            revoked,
+            issued,
+            limits,
+            parts,
+            None,
+        )?;
+        SignerHandover::seal(&self.key, new_signer, &records)
     }
 }
 
@@ -567,6 +695,40 @@ pub(crate) mod tests {
             self.open()?.secret = None;
             Ok(())
         }
+    }
+
+    /// The received form holding `secret`, over an empty vault, as a take-over makes it.
+    pub(crate) fn received_keyring(secret: [u8; 32]) -> IdentityKeyring {
+        IdentityKeyring {
+            vault: Arc::new(MemoryVault::default()),
+            public: public_of(secret),
+            held: Some(IdentitySecret::from_bytes(secret)),
+        }
+    }
+
+    #[test]
+    fn test_key_received_form_goes_to_the_vault_only_on_install() {
+        let mut keyring = received_keyring([3; 32]);
+        assert!(keyring.is_received());
+        assert!(keyring.vault.load().unwrap().is_none());
+        keyring.backup_public().unwrap();
+        keyring.install_held().unwrap();
+        assert!(!keyring.is_received());
+        assert_eq!(keyring.vault.load().unwrap().unwrap().as_bytes(), &[3; 32]);
+        // Read from the vault from now on.
+        keyring.vault.delete().unwrap();
+        assert_eq!(keyring.backup_public().unwrap_err(), KeyError::Missing);
+        assert!(!format!("{keyring:?}").contains("3, 3"));
+    }
+
+    #[test]
+    fn test_key_received_form_kept_when_the_vault_fails() {
+        let mut keyring = received_keyring([3; 32]);
+        keyring.vault = MemoryVault::holding([5; 32]);
+        assert_eq!(keyring.install_held().unwrap_err(), KeyError::Occupied);
+        assert!(keyring.is_received());
+        keyring.forget_held();
+        assert!(!keyring.is_received());
     }
 
     /// A vault that drops every write.
@@ -784,6 +946,49 @@ pub(crate) mod tests {
         assert_eq!(view.revoked_apps, [[2; 16]]);
         let other = IdentityKeyring::open(MemoryVault::holding([7; 32])).unwrap();
         assert!(other.open_backup(&backup).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_key_backup_built_on_the_marks_prev_is_a_losing_deliverys() {
+        use pubky_switch_core::records::{IdentityBody, IdentityPolicy, Inbox};
+        let key = IdentityKey::from_secret([6; 32]);
+        let doc = |version: u64, signer: [u8; 16], record_max_age: Option<u64>| {
+            let mut body = IdentityBody::first(
+                key.public(),
+                signer,
+                Inbox::new("https://switch.example", [4; 32]),
+                IdentityPolicy::default(),
+            );
+            body.version = version;
+            body.record_max_age = record_max_age;
+            IdentityDoc::sign(&key, body).unwrap()
+        };
+        let view = |identity_doc: IdentityDoc, prev: Option<[u8; 32]>| BackupView {
+            identity_doc,
+            revoked_apps: Vec::new(),
+            certs: Vec::new(),
+            limits: Limits::default(),
+            bundle_parts: Vec::new(),
+            prev,
+        };
+        let (me, other) = ([1; 16], [2; 16]);
+        let (built_on, elsewhere) = (Some([5; 32]), Some([9; 32]));
+        let mine = doc(3, me, Some(60));
+        // Another install's, built on what the mark built on: a losing delivery's, at the
+        // mark's version or past it, as after a spent version.
+        assert!(!view(doc(3, other, None), built_on).taken_over(&me, Some(&mine), built_on));
+        assert!(!view(doc(4, other, None), built_on).taken_over(&me, Some(&mine), built_on));
+        // Built on something else, at or past the mark: taken over.
+        assert!(view(doc(3, other, None), elsewhere).taken_over(&me, Some(&mine), built_on));
+        assert!(view(doc(4, other, None), elsewhere).taken_over(&me, Some(&mine), built_on));
+        // The mark itself, another install's: taken over.
+        let theirs = doc(3, other, None);
+        assert!(view(theirs.clone(), built_on).taken_over(&me, Some(&theirs), built_on));
+        // Behind the mark, this install's own, or a first version's: as before.
+        assert!(!view(doc(2, other, None), elsewhere).taken_over(&me, Some(&mine), built_on));
+        assert!(!view(doc(5, me, None), elsewhere).taken_over(&me, Some(&mine), built_on));
+        assert!(view(doc(3, other, None), None).taken_over(&me, Some(&mine), None));
+        assert!(view(doc(1, other, None), None).taken_over(&me, None, None));
     }
 
     #[test]

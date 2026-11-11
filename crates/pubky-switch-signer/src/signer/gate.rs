@@ -26,7 +26,29 @@ pub(crate) struct GatePassed(());
 /// the mark since a rollback or an equivocation, or the user hasn't cleared its alert
 /// ([`SignerError::Alarm`], or [`Refusal::SwitchUnconfirmed`] once the alert is cleared and
 /// the re-delivery that confirms the switch is still owed).
+///
+/// While this install hands the identity over, or takes it over, the gate also refuses every
+/// routine step ([`Refusal::HandingOver`], [`Refusal::TakingOver`]): only
+/// [`hand_over_key`] and [`taking_over_key`] serve those flows' own steps.
 pub(crate) fn refusal(state: &SignerState) -> Option<SignerError> {
+    base_refusal(state).or_else(|| {
+        if let Some(handing) = &state.handing_over {
+            Some(
+                Refusal::HandingOver {
+                    to_app: handing.to_app,
+                }
+                .into(),
+            )
+        } else if state.taking_over {
+            Some(Refusal::TakingOver.into())
+        } else {
+            None
+        }
+    })
+}
+
+/// The checks every signing step passes, a hand-over's or a take-over's included.
+fn base_refusal(state: &SignerState) -> Option<SignerError> {
     if let Some(install) = state.managed_by {
         return Some(SignerError::NotNamed { install });
     }
@@ -58,6 +80,45 @@ pub(crate) fn held_alarm(state: &SignerState) -> Option<&Alert> {
 pub(crate) fn signing_key(keyring: &IdentityKeyring, state: &SignerState) -> Result<SigningKey> {
     if let Some(refused) = refusal(state) {
         return Err(refused);
+    }
+    // A received key serves only the take-over's own steps.
+    if keyring.is_received() {
+        return Err(Refusal::TakingOver.into());
+    }
+    Ok(keyring.signing_key(GatePassed(()))?)
+}
+
+/// The identity key for a hand-over's own steps, while this install hands the identity over
+/// (Switch wire 3.12): storing it at the switch, and the abort. The base checks still apply.
+///
+/// # Errors
+///
+/// [`Refusal::NotHandingOver`] when it isn't handing over; otherwise as [`signing_key`].
+pub(crate) fn hand_over_key(keyring: &IdentityKeyring, state: &SignerState) -> Result<SigningKey> {
+    if let Some(refused) = base_refusal(state) {
+        return Err(refused);
+    }
+    if state.handing_over.is_none() || keyring.is_received() {
+        return Err(Refusal::NotHandingOver.into());
+    }
+    Ok(keyring.signing_key(GatePassed(()))?)
+}
+
+/// The identity key for a take-over's own step, the new signer's first delivery, signed with
+/// the received key (Switch wire 3.12). The base checks still apply.
+///
+/// # Errors
+///
+/// [`Refusal::TakingOver`] when it isn't taking over; otherwise as [`signing_key`].
+pub(crate) fn taking_over_key(
+    keyring: &IdentityKeyring,
+    state: &SignerState,
+) -> Result<SigningKey> {
+    if let Some(refused) = base_refusal(state) {
+        return Err(refused);
+    }
+    if !state.taking_over {
+        return Err(Refusal::TakingOver.into());
     }
     Ok(keyring.signing_key(GatePassed(()))?)
 }
@@ -100,5 +161,70 @@ mod tests {
         );
         // Other alerts don't hold signing back.
         assert!(held(&|s| s.alert(Alert::BackupMissing)).is_none());
+    }
+
+    fn handing_over() -> crate::state::HandingOver {
+        crate::state::HandingOver {
+            to_app: [4; 16],
+            doc: pubky_switch_core::sig::SignedDoc {
+                body: String::new(),
+                sig: String::new(),
+            },
+            handover: pubky_switch_core::records::SignerHandover::from_parts(
+                vec![vec![0]],
+                [0; 64],
+            ),
+            sent: crate::state::HandOverSent::Stored,
+            abort: None,
+            take_back: None,
+        }
+    }
+
+    #[test]
+    fn test_gate_lets_a_hand_over_sign_only_its_own_steps() {
+        let keyring = IdentityKeyring::open(MemoryVault::holding([7; 32])).unwrap();
+        let fresh = SignerState::new(keyring.public_key(), [1; 16]);
+        assert_eq!(
+            hand_over_key(&keyring, &fresh).err(),
+            Some(Refusal::NotHandingOver.into())
+        );
+        let mut state = fresh.clone();
+        state.handing_over = Some(handing_over());
+        assert_eq!(
+            signing_key(&keyring, &state).err(),
+            Some(Refusal::HandingOver { to_app: [4; 16] }.into())
+        );
+        assert!(hand_over_key(&keyring, &state).is_ok());
+        assert!(taking_over_key(&keyring, &state).is_err());
+        // The base checks still hold a hand-over's own steps back.
+        state.switch_unconfirmed = true;
+        assert_eq!(
+            hand_over_key(&keyring, &state).err(),
+            Some(Refusal::SwitchUnconfirmed.into())
+        );
+    }
+
+    #[test]
+    fn test_gate_lets_a_received_key_sign_only_the_take_over() {
+        let keyring = crate::key::tests::received_keyring([7; 32]);
+        let mut state = SignerState::new(keyring.public_key(), [1; 16]);
+        // Not taking over: a received key signs nothing.
+        assert_eq!(
+            signing_key(&keyring, &state).err(),
+            Some(Refusal::TakingOver.into())
+        );
+        assert!(taking_over_key(&keyring, &state).is_err());
+        state.taking_over = true;
+        assert_eq!(
+            signing_key(&keyring, &state).err(),
+            Some(Refusal::TakingOver.into())
+        );
+        assert!(hand_over_key(&keyring, &state).is_err());
+        assert!(taking_over_key(&keyring, &state).is_ok());
+        state.managed_by = Some([9; 16]);
+        assert_eq!(
+            taking_over_key(&keyring, &state).err(),
+            Some(SignerError::NotNamed { install: [9; 16] })
+        );
     }
 }

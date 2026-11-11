@@ -562,6 +562,12 @@ impl Signer {
             return Ok(true);
         };
         let until = delivered_at.saturating_add(CLOCK_TOLERANCE_MS);
+        // The copies are checked as before every new version (`ready`), so a closing isn't
+        // signed over an install that took over, or over records that are behind.
+        self.check_copies().await?;
+        if self.flow.is_some() || super::gate::refusal(&self.state).is_some() {
+            return Ok(false);
+        }
         let key = self.signing_key()?;
         let (doc, flow) = self.next_version(&key, |body| {
             for app in &owed {
@@ -645,6 +651,12 @@ impl Signer {
     ///
     /// As [`Signer::resume`].
     pub async fn run_due(&mut self) -> Result<()> {
+        // While a hand-over or a take-over is in progress, only its own step runs: nothing
+        // routine is signed, and what is owed stays owed (Switch wire 3.12).
+        self.refresh().await?;
+        if self.state.handing_over.is_some() || self.state.taking_over {
+            return self.resume().await;
+        }
         // A publication that failed doesn't hold back the closings owed at the switch.
         let resumed = self.resume().await;
         if let Err(error) = &resumed
