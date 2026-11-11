@@ -34,6 +34,7 @@ mod peers;
 mod records;
 mod recovery;
 pub mod rules;
+mod upload;
 
 pub use recovery::AdmissionEnd;
 
@@ -57,7 +58,7 @@ use crate::{
     },
     keys::{KeyId, KeyStore, MarkCheck, ServiceSigner},
     limits::Limits,
-    ratelimit::{FailedAuthentications, KeyedMinutes, MinuteWindows},
+    ratelimit::{FailedAuthentications, KeyedWindows, MinuteWindows},
     store::{AccountTxn, Store, StoreError},
     time::TrustedTime,
 };
@@ -83,17 +84,19 @@ pub struct Service {
     failed_auth: FailedAuthentications,
     reads_per_source: MinuteWindows<(String, NetworkSource)>,
     reads_per_account: MinuteWindows<String>,
-    operation_rate: KeyedMinutes<(String, [u8; 16])>,
-    control_rate: KeyedMinutes<(String, [u8; 16])>,
-    invite_rate: KeyedMinutes<(String, [u8; 32])>,
-    stranger_rate: KeyedMinutes<String>,
-    sender_rate: KeyedMinutes<(String, [u8; 32])>,
-    sender_app_rate: KeyedMinutes<(String, [u8; 16])>,
-    notify_rate: KeyedMinutes<(String, [u8; 32])>,
+    operation_rate: KeyedWindows<(String, [u8; 16])>,
+    control_rate: KeyedWindows<(String, [u8; 16])>,
+    invite_rate: KeyedWindows<(String, [u8; 32])>,
+    stranger_rate: KeyedWindows<String>,
+    sender_rate: KeyedWindows<(String, [u8; 32])>,
+    sender_app_rate: KeyedWindows<(String, [u8; 16])>,
+    notify_rate: KeyedWindows<(String, [u8; 32])>,
+    /// Recovery uploads per app per hour (Switch wire 7.4.14).
+    upload_rate: KeyedWindows<(String, [u8; 16])>,
     /// The sweeps a retried erasure of an account gone may run (Switch wire 7.4.16): only
     /// the signer's, verified with the identity key, and bounded per account, since anyone
     /// who saw one can replay it within its timestamp window.
-    erasure_sweeps: KeyedMinutes<String>,
+    erasure_sweeps: KeyedWindows<String>,
     changes: Arc<ChangeHub>,
     /// Where entry IDs come from: random, opaque to senders (Switch wire 1.7).
     entry_ids: EntryIds,
@@ -252,14 +255,15 @@ impl Service {
             failed_auth,
             reads_per_source: MinuteWindows::default(),
             reads_per_account: MinuteWindows::default(),
-            operation_rate: KeyedMinutes::default(),
-            control_rate: KeyedMinutes::default(),
-            invite_rate: KeyedMinutes::default(),
-            stranger_rate: KeyedMinutes::default(),
-            sender_rate: KeyedMinutes::default(),
-            sender_app_rate: KeyedMinutes::default(),
-            notify_rate: KeyedMinutes::default(),
-            erasure_sweeps: KeyedMinutes::default(),
+            operation_rate: KeyedWindows::default(),
+            control_rate: KeyedWindows::default(),
+            invite_rate: KeyedWindows::default(),
+            stranger_rate: KeyedWindows::default(),
+            sender_rate: KeyedWindows::default(),
+            sender_app_rate: KeyedWindows::default(),
+            notify_rate: KeyedWindows::default(),
+            upload_rate: KeyedWindows::hours(),
+            erasure_sweeps: KeyedWindows::default(),
             changes: ChangeHub::new(),
             entry_ids: Arc::new(random_entry_id),
         }
@@ -287,6 +291,7 @@ impl Service {
             + self.sender_rate.counted(|(at, _)| at == account)
             + self.sender_app_rate.counted(|(at, _)| at == account)
             + self.notify_rate.counted(|(at, _)| at == account)
+            + self.upload_rate.counted(|(at, _)| at == account)
     }
 
     /// The hub that wakes waiting feed reads. Run a [`crate::changes::ChangeListener`]
@@ -437,6 +442,7 @@ impl Service {
             | Call::GetKeys(_)
             | Call::RequestKeys(_)
             | Call::Leave(_)
+            | Call::RecoveryUpload
             | Call::GetRecord(_)
             | Call::ListRecords
             | Call::GetAllow => {
@@ -1411,6 +1417,27 @@ impl Service {
                         due.is_some(),
                         time_ms,
                     )
+                    .await
+                    .map(|answer| (answer, serving))
+                    .map_err(|error| Refused::with_head(error, serving));
+            }
+            Call::RecoveryUpload => {
+                // An own app uploads (Switch wire 7.4.14); a staged service's uploads, in a
+                // cooperative move, aren't served yet.
+                let Some(caller) = writer.as_ref() else {
+                    return Err(Refused::with_head(
+                        ApiError::new(ErrorCode::PermissionMissing, "7.4.14: an own app uploads"),
+                        serving,
+                    ));
+                };
+                if !serving {
+                    return Err(Refused::with_head(
+                        ApiError::unavailable("7.4.14: this stage isn't served yet"),
+                        serving,
+                    ));
+                }
+                return self
+                    .recovery_upload(txn, signer, held.as_ref(), caller, &request.body, time_ms)
                     .await
                     .map(|answer| (answer, serving))
                     .map_err(|error| Refused::with_head(error, serving));

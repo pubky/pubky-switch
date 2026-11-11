@@ -102,6 +102,8 @@ pub struct Limits {
     pub cursor_hold_ms: u64,
     /// Divergent uploads kept per record.
     pub max_divergent_uploads: u64,
+    /// `POST /recovery/upload` calls per app per hour.
+    pub uploads_per_app_per_hour: u32,
     /// Bytes of one staged import. Announced at enrollment.
     pub max_import_bytes: u64,
     /// Most bytes of the items of one feed page and of the record views of one
@@ -175,6 +177,7 @@ impl Default for Limits {
             control_per_min: 60,
             cursor_hold_ms: DAYS_30_MS,
             max_divergent_uploads: 8,
+            uploads_per_app_per_hour: 60,
             max_import_bytes: 4 * 1024 * 1024 * 1024,
             max_page_bytes: 8 * 1024 * 1024,
             sender_per_min: 120,
@@ -257,7 +260,7 @@ impl Limits {
                 return fail(name, "must be between 1 and 100");
             }
         }
-        let nonzero: [(&'static str, u64); 35] = [
+        let nonzero: [(&'static str, u64); 36] = [
             ("quota_bytes", self.quota_bytes),
             ("record_quota_bytes", self.record_quota_bytes),
             ("max_record_keys", self.max_record_keys),
@@ -277,6 +280,10 @@ impl Limits {
             ("control_per_min", u64::from(self.control_per_min)),
             ("cursor_hold_ms", self.cursor_hold_ms),
             ("max_divergent_uploads", self.max_divergent_uploads),
+            (
+                "uploads_per_app_per_hour",
+                u64::from(self.uploads_per_app_per_hour),
+            ),
             ("max_import_bytes", self.max_import_bytes),
             ("max_page_bytes", self.max_page_bytes),
             ("sender_per_min", u64::from(self.sender_per_min)),
@@ -359,6 +366,7 @@ mod tests {
         assert_eq!(limits.control_per_min, 60);
         assert_eq!(limits.cursor_hold_ms, 2_592_000_000);
         assert_eq!(limits.max_divergent_uploads, 8);
+        assert_eq!(limits.uploads_per_app_per_hour, 60);
         assert_eq!(limits.max_import_bytes, 4_294_967_296);
         assert_eq!(limits.max_page_bytes, 8_388_608);
         assert_eq!(limits.sender_per_min, 120);

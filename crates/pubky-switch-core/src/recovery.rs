@@ -20,6 +20,7 @@ use crate::claims::{
 };
 use crate::enc::b64;
 use crate::ops::RecordVersion;
+use crate::shared::RecordState;
 use crate::{Error, Result};
 
 /// The version an uploaded `record.put` is merged at (Switch wire 7.4.14 "Records").
@@ -189,6 +190,37 @@ pub fn merge_record(
             } else {
                 RecordMerge::Unchanged
             }
+        }
+    }
+}
+
+/// Merge a checked upload into the record the service holds at its key, whose state is
+/// `state` (`None` when it lacks one): [`merge_record`], except that an upload whose
+/// collection or policy isn't the record's is divergent, since a write with them is refused
+/// (Switch wire 6.2): it can't build on the record.
+pub fn merge_checked_record(
+    held: &HeldRecord<'_>,
+    state: Option<&RecordState>,
+    upload: &CheckedRecord,
+    max_divergent: usize,
+) -> RecordMerge {
+    let other_shape = state.is_some_and(|state| {
+        state.collection != upload.put.collection || state.policy != upload.put.policy
+    });
+    if !other_shape {
+        return merge_record(held, &upload.uploaded, max_divergent);
+    }
+    let kept = match *held {
+        HeldRecord::FromUpload { divergent, .. } | HeldRecord::WrittenHere { divergent, .. } => {
+            divergent
+        }
+        HeldRecord::Lacking => &[],
+    };
+    if kept.contains(&upload.uploaded.op_hash) {
+        RecordMerge::Unchanged
+    } else {
+        RecordMerge::Divergent {
+            kept: kept.len() < max_divergent,
         }
     }
 }

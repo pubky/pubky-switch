@@ -36,6 +36,48 @@ pub(super) fn staged_admission() -> ApiError {
     )
 }
 
+/// Chain `transition` at `seq`, which this request gave out, signed with `signer`, the
+/// account's key, and give its proof (Switch wire 6.5).
+pub(super) async fn chain_transition(
+    txn: &mut AccountTxn,
+    signer: &ServiceSigner,
+    transition: &ServiceTransition,
+    seq: u64,
+    time_ms: u64,
+) -> Result<SignedDoc, ApiError> {
+    let temporary = |_| ApiError::unavailable("7.6: a temporary failure");
+    let identity = txn.head().identity_key;
+    let signed = transition.sign(signer, &identity).map_err(temporary)?;
+    let item_bytes = signed.doc_bytes().map_err(temporary)?;
+    let hash = item_hash(ItemType::Service, &item_bytes);
+    let (stub, _tip) = txn
+        .head()
+        .chain_tip()
+        .append(seq, time_ms, ItemType::Service, hash, None)
+        .map_err(temporary)?;
+    txn.append_chain_item(&NewChainItem {
+        seq,
+        item_type: ItemType::Service,
+        item_bytes: &item_bytes,
+        stub: &stub,
+        server_time_ms: time_ms,
+        only_for: None,
+        proof: None,
+    })
+    .await
+    .map_err(|e| store_error(&e))?;
+    let object = transition
+        .proof_object()
+        .ok_or_else(|| ApiError::unavailable("7.6: a temporary failure"))?;
+    let proof = TransitionProof::sign(
+        signer,
+        &identity,
+        ProofBody::new(stub, object, &ProofState::Service(transition.to_value())),
+    )
+    .map_err(temporary)?;
+    Ok(proof.signed().clone())
+}
+
 impl Service {
     /// End staged admission at the account `txn` holds locked, `by` the signer or an upload
     /// (Switch spec 12.6 step 2; Switch wire 7.4.14). Idempotent: when admission isn't
@@ -56,39 +98,11 @@ impl Service {
         if let AdmissionEnd::Upload { .. } = by {
             return Ok(None);
         }
-        let temporary = |_| ApiError::unavailable("7.6: a temporary failure");
-        let transition = ServiceTransition::Admission { at: time_ms };
-        let identity = txn.head().identity_key;
-        let signed = transition.sign(signer, &identity).map_err(temporary)?;
-        let item_bytes = signed.doc_bytes().map_err(temporary)?;
-        let hash = item_hash(ItemType::Service, &item_bytes);
         let seq = txn.next_seq().map_err(|e| store_error(&e))?;
-        let (stub, _tip) = txn
-            .head()
-            .chain_tip()
-            .append(seq, time_ms, ItemType::Service, hash, None)
-            .map_err(temporary)?;
-        txn.append_chain_item(&NewChainItem {
-            seq,
-            item_type: ItemType::Service,
-            item_bytes: &item_bytes,
-            stub: &stub,
-            server_time_ms: time_ms,
-            only_for: None,
-            proof: None,
-        })
-        .await
-        .map_err(|e| store_error(&e))?;
-        let object = transition
-            .proof_object()
-            .ok_or_else(|| ApiError::unavailable("7.6: a temporary failure"))?;
-        let proof = TransitionProof::sign(
-            signer,
-            &identity,
-            ProofBody::new(stub, object, &ProofState::Service(transition.to_value())),
-        )
-        .map_err(temporary)?;
-        Ok(Some(proof.signed().clone()))
+        let transition = ServiceTransition::Admission { at: time_ms };
+        chain_transition(txn, signer, &transition, seq, time_ms)
+            .await
+            .map(Some)
     }
 
     /// `POST /v1/{id}/recovery/admission`, from the signer, with an empty body (Switch wire

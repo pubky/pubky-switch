@@ -23,8 +23,11 @@ pub(super) struct ClaimRead {
     account: String,
     claim_key: [u8; 32],
     view: serde_json::Value,
-    /// How many entries the claim had: its step, 0 for a tombstone.
+    /// The claim's step, 0 for a tombstone: its entries are before it.
     steps: u64,
+    /// How many entries it holds: one at each step, except on a claim rebuilt from uploads,
+    /// whose upload changes are no entries (Switch wire 7.4.8).
+    entries: u64,
     /// The `seq` of its last entry, which only this claim holds: entries read after the
     /// lock are this claim's, not those of one made again at its key since.
     last_seq: Option<u64>,
@@ -81,15 +84,13 @@ impl Service {
         let current = |app: &[u8; 16]| apps.is_served(app);
         let view = claim.view(&claim_key, time_ms, &current).to_value();
         let steps = if claim.tombstone { 0 } else { claim.step };
-        let last_seq = match steps.checked_sub(1) {
-            Some(last) => Some(
-                txn.claim_entry_seq(&claim_key, last)
-                    .await
-                    .map_err(|e| store_error(&e))?
-                    .ok_or_else(temporary)?,
-            ),
-            None => None,
-        };
+        let (entries, last_seq) = txn
+            .claim_entry_tally(&claim_key, steps)
+            .await
+            .map_err(|e| store_error(&e))?;
+        if entries != steps && !claim.rebuilt {
+            return Err(temporary());
+        }
         let head = self.head(txn, signer).await.ok_or_else(temporary)?;
         let mut answer = Answer::ok(Vec::new()).with_head(Some(head));
         answer.deferred = Some(super::Deferred::Claim(ClaimRead {
@@ -97,6 +98,7 @@ impl Service {
             claim_key,
             view,
             steps,
+            entries,
             last_seq,
         }));
         Ok(answer)
@@ -117,7 +119,7 @@ impl Service {
             .map_err(|e| store_error(&e))?;
         // The claim lost entries since, or another claim took its key: a temporary failure,
         // never a view with entries of another claim.
-        if u64::try_from(entries.len()).ok() != Some(read.steps)
+        if u64::try_from(entries.len()).ok() != Some(read.entries)
             || entries.last().map(|e| e.seq) != read.last_seq
         {
             return Err(temporary());

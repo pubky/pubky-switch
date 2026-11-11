@@ -1810,3 +1810,256 @@ async fn test_admission_ends_with_a_proof_under_the_current_key() {
     assert_eq!(body["object"], json!("admission"));
     replay.db.drop_database().await.expect("drop");
 }
+
+// POST /recovery/upload after a provider loss (Switch wire 7.4.14).
+
+/// The vectors' transition proof named `name`, of the lost generation 1.
+fn lost_proof(name: &str) -> Value {
+    named(&vectors("chain.json")["transition_proofs"], name)["signed"].clone()
+}
+
+/// The wallet's operation at `seq` of the vectors' chain, uploaded with its certificate and,
+/// when `proof` names one, the lost service's proof of it.
+fn uploaded_op(seq: u64, proof: Option<&str>) -> Value {
+    let mut op = json!({
+        "op": chain_item(&vectors("chain.json"), seq)["item"].clone(),
+        "cert": wallet().2.signed(),
+    });
+    if let Some(name) = proof {
+        op["proof"] = lost_proof(name);
+    }
+    op
+}
+
+const CREATED: &str = "record.put create (seq 6): the record's first version is (1, 6)";
+const UPDATED: &str = "record.put update (seq 8): the new version is (1, 8)";
+const ATTEMPTED: &str = "claim attempt (seq 7)";
+
+/// alice recovered in place from the loss of generation 1, admission staged, with the
+/// wallet current again at generation 2: the lost generation's `identity.json` and the time.
+async fn recovered_with_the_wallet(replay: &Replay) -> (IdentityDoc, u64) {
+    let (pending, at) = serving_with_a_pending_key(replay).await;
+    let before = held(replay).await;
+    let recovery = next_generation(&before, pending, Some(1));
+    let (answer, _) = deliver(replay, recovery, Some(before.hash()), at).await;
+    assert_eq!(answer.status, 200);
+    let (status, body) = wallet_registers(replay, 77, 2, 3, true, at).await;
+    assert_eq!(status, 200, "{body}");
+    (before, at)
+}
+
+async fn upload(replay: &Replay, body: &Value, at_ms: u64) -> SwitchResponse {
+    let path = format!("/v1/{}/recovery/upload", alice_id());
+    let body = serde_json::to_vec(body).expect("json");
+    replay
+        .service
+        .handle(app_request(&wallet_keys(), "POST", &path, body, at_ms))
+        .await
+}
+
+async fn wallet_get(replay: &Replay, path: &str, at_ms: u64) -> Value {
+    let path = format!("/v1/{}/{path}", alice_id());
+    let answer = replay
+        .service
+        .handle(app_request(&wallet_keys(), "GET", &path, Vec::new(), at_ms))
+        .await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{path}: {}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    json_of(&answer)
+}
+
+/// The record key and the claim key the vectors' chain writes.
+fn record_and_claim_keys() -> (String, String) {
+    let state = |name: &str| -> Value {
+        let body = lost_proof(name)["body"].as_str().expect("body").to_owned();
+        let bytes = pubky_switch_core::enc::unb64(&body).expect("b64");
+        serde_json::from_slice(&bytes).expect("json")
+    };
+    (
+        state(CREATED)["object"].as_str().expect("key").to_owned(),
+        state(ATTEMPTED)["object"].as_str().expect("key").to_owned(),
+    )
+}
+
+#[tokio::test]
+async fn test_upload_fills_in_what_the_lost_generation_held() {
+    // The wallet uploads its record's two writes and its attempt, each with the lost
+    // service's proof, and the lost service's head: the record is taken at the proved (1, 8),
+    // at the upload transition's seq and with no proof; the claim is rebuilt with the
+    // attempt; one `upload` transition lists both (Switch wire 7.4.14).
+    let Some(replay) = replay().await else { return };
+    let (lost, at) = recovered_with_the_wallet(&replay).await;
+    let head = vectors("chain.json")["signed_heads"][0]["head"].clone();
+    let body = json!({
+        "lost_identity": lost.signed(),
+        "records": [uploaded_op(6, Some(CREATED)), uploaded_op(8, Some(UPDATED))],
+        "claims": [uploaded_op(7, Some(ATTEMPTED))],
+        "heads": [head],
+    });
+    let length = chain(&replay).await.len();
+    let answer = upload(&replay, &body, at).await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    let (record, claim) = record_and_claim_keys();
+    let answered = json_of(&answer);
+    assert_eq!(
+        answered["result"],
+        json!({ "records": [record], "divergent": [], "claims": [claim],
+                "divergent_claims": [], "unverified": 0, "distrusted": 0, "refused": 0,
+                "heads": 1, "lists": false })
+    );
+    assert!(answered["proof"].is_object() && answered["head"].is_object());
+    assert!(header_text(&answer, "switch-head").is_some());
+    let items = chain(&replay).await;
+    assert_eq!(items.len(), length + 1, "one transition");
+    let (_, upload_seq, kind) = items.last().expect("item").clone();
+    assert_eq!(kind, "service");
+    let view = wallet_get(&replay, &format!("records/{record}"), at).await;
+    assert_eq!(
+        (view["generation"].clone(), view["version"].clone()),
+        (json!(1), json!(8))
+    );
+    assert_eq!(view["seq"], json!(upload_seq));
+    assert!(view.get("proof").is_none(), "{view}");
+    assert_eq!(view["divergent"], json!(false));
+    let claimed = wallet_get(&replay, &format!("claims/{claim}"), at).await;
+    assert_eq!(
+        claimed["claim"]["attempts"].as_array().map(Vec::len),
+        Some(1),
+        "{claimed}"
+    );
+    // The same upload again merges nothing new, and still chains a transition of its own.
+    let again = upload(&replay, &body, at).await;
+    assert_eq!(again.status, 200);
+    assert_eq!(json_of(&again)["result"]["records"], json!([]));
+    assert_eq!(json_of(&again)["result"]["claims"], json!([]));
+    assert_eq!(chain(&replay).await.len(), length + 2);
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_upload_without_the_lost_identity_checks_no_proof() {
+    // Without `lost_identity` the proofs and heads count for nothing: the update is taken at
+    // its lower bound, (1, 7) above the (1, 6) it built on, and the head is unverified.
+    let Some(replay) = replay().await else { return };
+    let (lost, at) = recovered_with_the_wallet(&replay).await;
+    let head = vectors("chain.json")["signed_heads"][0]["head"].clone();
+    let body = json!({ "records": [uploaded_op(8, Some(UPDATED))], "heads": [head] });
+    let answer = upload(&replay, &body, at).await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    let result = &json_of(&answer)["result"];
+    assert_eq!(
+        (result["unverified"].clone(), result["heads"].clone()),
+        (json!(1), json!(0))
+    );
+    let (record, _) = record_and_claim_keys();
+    let view = wallet_get(&replay, &format!("records/{record}"), at).await;
+    assert_eq!(
+        (view["generation"].clone(), view["version"].clone()),
+        (json!(1), json!(7))
+    );
+    // The proved write, uploaded later, makes the same operation's version exact.
+    let body = json!({
+        "lost_identity": lost.signed(),
+        "records": [uploaded_op(8, Some(UPDATED))],
+    });
+    let answer = upload(&replay, &body, at).await;
+    assert_eq!(json_of(&answer)["result"]["records"], json!([record]));
+    let view = wallet_get(&replay, &format!("records/{record}"), at).await;
+    assert_eq!(view["version"], json!(8));
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_upload_contacts_end_staged_admission_and_lists_only_add() {
+    // A deny-only upload leaves admission staged; one carrying contacts from an app holding
+    // `lists.manage` ends it in the same transaction, with no `admission` transition: the
+    // upload's own records it (Switch spec 12.6 step 2).
+    let Some(replay) = replay().await else { return };
+    let (_, at) = recovered_with_the_wallet(&replay).await;
+    let bob = pubky_switch_core::enc::pubky_id(&[40; 32]);
+    let denied = upload(&replay, &json!({ "lists": { "deny": [bob] } }), at).await;
+    assert_eq!(denied.status, 200);
+    assert_eq!(json_of(&denied)["result"]["lists"], json!(true));
+    assert_eq!(admission_staged(&replay, at).await, json!(true));
+    let length = chain(&replay).await.len();
+    let contacts = json!({ "lists": { "contacts": [bob, bob], "deny": [bob] } });
+    let ended = upload(&replay, &contacts, at).await;
+    assert_eq!(ended.status, 200);
+    assert_eq!(
+        json_of(&ended)["result"]["lists"],
+        json!(true),
+        "the contact is new"
+    );
+    assert_eq!(admission_staged(&replay, at).await, json!(false));
+    assert_eq!(
+        chain(&replay).await.len(),
+        length + 1,
+        "the upload's transition only"
+    );
+    let again = upload(&replay, &contacts, at).await;
+    assert_eq!(
+        json_of(&again)["result"]["lists"],
+        json!(false),
+        "nothing added"
+    );
+    let allow = wallet_get(&replay, "allow", at).await;
+    assert_eq!(
+        allow["contacts"].as_array().map(Vec::len),
+        Some(1),
+        "{allow}"
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_upload_refusals() {
+    // `404` at an account in neither stage; after the loss, `400` for a body that doesn't
+    // read and `429` past `uploads_per_app_per_hour`, with what to wait. A refusal merges
+    // and chains nothing.
+    let limits = pubky_switch::limits::Limits {
+        uploads_per_app_per_hour: 2,
+        ..pubky_switch::limits::Limits::default()
+    };
+    let Some(replay) = replay_with(limits.clone()).await else {
+        return;
+    };
+    let (_, at) = serving_with_a_pending_key(&replay).await;
+    let (status, body) = wallet_registers(&replay, 76, 1, 1, false, at).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        code(&upload(&replay, &json!({}), at).await),
+        (404, "not_found".into())
+    );
+    let replay = {
+        replay.db.drop_database().await.expect("drop");
+        let Some(replay) = replay_with(limits).await else {
+            return;
+        };
+        replay
+    };
+    let (_, at) = recovered_with_the_wallet(&replay).await;
+    let length = chain(&replay).await.len();
+    let bad = upload(&replay, &json!({ "records": {} }), at).await;
+    assert_eq!(code(&bad), (400, "bad_request".into()));
+    assert_eq!(upload(&replay, &json!({}), at).await.status, 200);
+    assert_eq!(upload(&replay, &json!({}), at).await.status, 200);
+    let limited = upload(&replay, &json!({}), at).await;
+    assert_eq!(code(&limited), (429, "rate_limited".into()));
+    assert!(header_text(&limited, "retry-after").is_some());
+    assert_eq!(chain(&replay).await.len(), length + 2);
+    replay.db.drop_database().await.expect("drop");
+}

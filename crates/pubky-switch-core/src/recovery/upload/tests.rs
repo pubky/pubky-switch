@@ -533,3 +533,58 @@ fn test_upload_settled_proof_rebuilds_a_tombstone_only_for_nothing_held() {
     body.proofs = vec![claim_proof(&attempt, &view_after(&[attempt_fields()]), 7)];
     assert!(check(&body, &[]).settled.is_empty());
 }
+
+#[test]
+fn test_upload_record_of_another_collection_or_policy_is_divergent() {
+    use crate::recovery::{HeldRecord, RecordMerge, merge_checked_record};
+    use crate::shared::RecordState;
+    let op = record_op(LOST);
+    let checked = check(&body_with(vec![uploaded(&op, None)], vec![]), &[]);
+    let upload = &checked.records[0];
+    let state = RecordState {
+        key: [30; 32],
+        collection: [31; 32],
+        policy: Policy::new(SCOPE, &[SCOPE]),
+        version: RecordVersion::new(3, 5),
+        deleted: false,
+    };
+    let held = |divergent: &'static [[u8; 32]]| HeldRecord::FromUpload {
+        op_hash: [1; 32],
+        built_on: RecordVersion::new(3, 4),
+        version: UploadVersion::proved(RecordVersion::new(3, 5)),
+        divergent,
+    };
+    assert_eq!(
+        merge_checked_record(&held(&[]), Some(&state), upload, 8),
+        RecordMerge::Replace
+    );
+    let other_policy = RecordState {
+        policy: Policy::new(SCOPE, &[SCOPE, "scope-b"]),
+        ..state.clone()
+    };
+    let other_collection = RecordState {
+        collection: [32; 32],
+        ..state
+    };
+    for state in [&other_policy, &other_collection] {
+        assert_eq!(
+            merge_checked_record(&held(&[]), Some(state), upload, 8),
+            RecordMerge::Divergent { kept: true }
+        );
+        assert_eq!(
+            merge_checked_record(&held(&[[2; 32]]), Some(state), upload, 1),
+            RecordMerge::Divergent { kept: false }
+        );
+        let kept = [upload.uploaded.op_hash];
+        let holding = HeldRecord::FromUpload {
+            op_hash: [1; 32],
+            built_on: RecordVersion::new(3, 4),
+            version: UploadVersion::proved(RecordVersion::new(3, 5)),
+            divergent: &kept,
+        };
+        assert_eq!(
+            merge_checked_record(&holding, Some(state), upload, 8),
+            RecordMerge::Unchanged
+        );
+    }
+}
