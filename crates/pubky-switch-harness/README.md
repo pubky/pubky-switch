@@ -44,6 +44,14 @@ every one alike:
 | a `cursor.set` alone | a lost answer | no proofs |
 | an app's `POST /v1/{id}/ops` (`allow.put`) | a failed connection | its proof |
 | `POST /v1/{id}/inbox`, the same envelope | a lost answer | the same `entry_id` and `accepted_at` |
+| a `claim` batch, the same batch | a lost answer | the original proof |
+| a second `attempt` at the step the first took | the first try's lost answer | `409 conflict`, the claim in `current` |
+| `POST /v1/{id}/apps/{app_id}/leave` | a lost answer | `403 not_current` |
+| `PUT /v1/{id}/peers` | a lost answer | `200` again |
+| `GET /v1/{id}/feed` | a lost answer | the same page |
+
+A revocation whose answer was lost isn't sent again: the signer reads the account's apps and
+finds it done.
 
 ## Adding a flow
 

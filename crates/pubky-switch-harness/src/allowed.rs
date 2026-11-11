@@ -512,6 +512,66 @@ pub static ALLOWED: &[Allowed] = &[
         reason: COUNTER_START,
         reference: "Switch wire 7.4.3, the answer's `directory_version`; 7.4.10",
     },
+    Allowed {
+        flow: "removal retries",
+        label: "{alice/tablet} POST /v1/{alice}/apps/{alice/tablet}/leave",
+        fact: "body.current",
+        service: NOTHING,
+        scripted: "object",
+        reason: "The app's second `leave`, after the answer to its first was lost, is refused \
+                 as `403 not_current` by both. The scripted switch's refusal carries an empty \
+                 `current`; the service's carries none, as the wire gives `not_current` none.",
+        reference: "Switch wire 7.6, `not_current`: no `current`",
+    },
+    Allowed {
+        flow: "removal retries",
+        label: "{alice} GET /v1/{alice}/apps",
+        fact: "body.apps[0].last_seen",
+        service: "time 2026-01-01T00:09:11.250Z",
+        scripted: "time 2026-01-01T00:06:07.500Z",
+        reason: "The tablet's `leave` that the switch took is its latest request past \
+                 authentication, so the service shows that leave's time as its `last_seen` \
+                 (the refused second leave doesn't count). The scripted switch doesn't count \
+                 a leave and shows the time of the tablet's request before it.",
+        reference: "Switch wire 7.4.12, `last_seen`, which the table gives no rule; `FAKES.md` \
+                    says the scripted switch means the latest request past authentication",
+    },
+    Allowed {
+        flow: "claim and read retries",
+        label: "{bob/shop} GET /v1/{alice}/directory",
+        fact: "body.apps_version",
+        service: "number 1",
+        scripted: ONE_MORE,
+        reason: COUNTER_START,
+        reference: "Switch wire 7.4.10, `apps_version`",
+    },
+    Allowed {
+        flow: "claim and read retries",
+        label: "{bob/shop} GET /v1/{alice}/directory",
+        fact: "body.directory_version",
+        service: "number 4",
+        scripted: ONE_MORE,
+        reason: COUNTER_START,
+        reference: "Switch wire 7.4.10, `directory_version`",
+    },
+    Allowed {
+        flow: "claim and read retries",
+        label: "{bob/shop} POST /v1/{alice}/inbox",
+        fact: "request query apps_version",
+        service: "text 1",
+        scripted: ONE_MORE,
+        reason: COUNTER_START,
+        reference: "Switch wire 7.4.3, the query's `apps_version`; 7.4.10",
+    },
+    Allowed {
+        flow: "claim and read retries",
+        label: "{bob/shop} POST /v1/{alice}/inbox",
+        fact: "body.directory_version",
+        service: "number 4",
+        scripted: ONE_MORE,
+        reason: COUNTER_START,
+        reference: "Switch wire 7.4.3, the answer's `directory_version`; 7.4.10",
+    },
 ];
 
 #[cfg(test)]
