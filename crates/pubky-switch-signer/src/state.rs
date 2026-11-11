@@ -153,6 +153,11 @@ pub(crate) struct SignerState {
     /// The certificate lifetime new certificates get, in milliseconds (Switch spec 3.2).
     #[serde(default = "default_cert_lifetime")]
     pub(crate) cert_lifetime_ms: u64,
+    /// For each app, how many automatic renewals in a row no record of it has taken up: at
+    /// two, the signer stops renewing it by itself (Switch spec 3.1). A renewal the user asks
+    /// for, or a record carrying the newest certificate, takes the app out.
+    #[serde(default)]
+    pub(crate) untaken_renewals: Vec<([u8; 16], u32)>,
     /// The companion claims of approvals, signed once, until the host has delivered them
     /// (Switch wire 3.10).
     #[serde(default)]
@@ -338,6 +343,7 @@ impl SignerState {
             listed_at: Vec::new(),
             alerts: Vec::new(),
             cert_lifetime_ms: DEFAULT_CERT_LIFETIME_MS,
+            untaken_renewals: Vec::new(),
             claims: Vec::new(),
             switch_unconfirmed: false,
             epoch_through: 0,

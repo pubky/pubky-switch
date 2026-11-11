@@ -230,6 +230,8 @@ impl Signer {
             };
             self.renew_listed(review.app_id, change, Some(&answering))
                 .await?;
+            // The user approved it: the count of untaken automatic renewals starts again.
+            self.renewals_taken(&[review.app_id]).await?;
             return self.claim_of(&review.request.hash());
         }
         let identity = self.state.identity;

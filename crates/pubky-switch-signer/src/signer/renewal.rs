@@ -68,6 +68,10 @@ pub struct CertChange {
     pub expires_at: Option<u64>,
 }
 
+/// How many automatic renewals in a row no record of an app may leave untaken before the
+/// signer stops renewing it by itself (Switch spec 3.1).
+const RENEWALS_LEFT_UNTAKEN: u32 = 2;
+
 impl Signer {
     /// Renew the certificate of the listed app `app_id` with `change` (Switch spec 3.2,
     /// Switch wire 3.8), then deliver and publish the renewing version. A reduction's
@@ -84,7 +88,10 @@ impl Signer {
     /// for an expiry the certificate rules refuse; otherwise as [`Signer::resume`].
     pub async fn renew(&mut self, app_id: [u8; 16], change: CertChange) -> Result<IdentityDoc> {
         self.ready().await?;
-        self.renew_listed(app_id, change, None).await
+        let doc = self.renew_listed(app_id, change, None).await?;
+        // Asked for by the user: the count of untaken automatic renewals starts again.
+        self.renewals_taken(&[app_id]).await?;
+        Ok(doc)
     }
 
     /// [`Signer::renew`], once the signer is ready: with `answering`, the renewal answers that
@@ -736,8 +743,9 @@ impl Signer {
     }
 
     /// Renew the certificate of every current app once less than half its lifetime remains,
-    /// each with the default lifetime from now, in a renewing version of its own (Switch spec
-    /// 3.2; Switch wire 3.8, Appendix A, A28). Returns the apps renewed.
+    /// each with the lifetime its certificate has, from now, in a renewing version of its own:
+    /// a lifetime the user chose short stays short (Switch spec 3.1, 3.2; Switch wire 3.8,
+    /// Appendix A, A28). Returns the apps renewed.
     ///
     /// - Current is spec 3.4's sense, whatever the certificate's expiry: the newest
     ///   `identity.json` lists the app, and it is neither revoked, being revoked, nor departed.
@@ -745,9 +753,12 @@ impl Signer {
     ///   back: the switch takes the signer's renewal for it although its certificate has
     ///   expired (Switch wire 3.8 "An expired certificate"). One that hasn't joined is left:
     ///   the switch takes no `cert.put` for it yet (Switch wire 6.2).
-    /// - An app with a renewal still open is renewed again all the same, so an app that stays
-    ///   away never lapses: each renewal adds a `renewed` entry, and a newer `cert.put`
-    ///   replaces the one the switch stores (Switch wire 3.3, 3.8).
+    /// - An app with a renewal still open is renewed again, once: each renewal adds a
+    ///   `renewed` entry, and a newer `cert.put` replaces the one the switch stores (Switch
+    ///   wire 3.3, 3.8). After two automatic renewals in a row that no record of the app took
+    ///   up, it isn't renewed again by itself, with [`Alert::RenewalsStopped`], and lapses at
+    ///   its expiry. A renewal the user asks for, or a record carrying the newest certificate,
+    ///   starts the count again (Switch spec 3.1).
     /// - Half the lifetime is judged on the switch's signed time, from its `GET /apps` answer.
     ///   The certificate is stamped with the device clock, so while that clock and the
     ///   switch's time differ by more than the clock tolerance, nothing is renewed by itself,
@@ -781,6 +792,8 @@ impl Signer {
         let certs = self.held_certs()?;
         let mut due = Vec::new();
         let mut skipped = Vec::new();
+        // The apps a record shows back, which leave the count of untaken renewals.
+        let mut taken = Vec::new();
         for listed in &newest.body().apps {
             let removed = statuses.iter().any(|s| {
                 s.app_id == listed.app_id && (s.revoked_at.is_some() || s.departed_at.is_some())
@@ -788,7 +801,22 @@ impl Signer {
             let Some(cert) = certs.iter().find(|c| c.hash() == listed.cert) else {
                 continue;
             };
+            let carried = statuses
+                .iter()
+                .any(|s| s.app_id == listed.app_id && s.record_cert == Some(listed.cert));
+            if carried {
+                taken.push(listed.app_id);
+            }
             if removed || !past_half_lifetime(cert, switch_time) {
+                continue;
+            }
+            // Two automatic renewals in a row untaken: the app stays away, and the user
+            // decides (Switch spec 3.1).
+            if !carried && self.untaken_renewals(&listed.app_id) >= RENEWALS_LEFT_UNTAKEN {
+                skipped.push(Alert::RenewalsStopped {
+                    app_id: listed.app_id,
+                    expires_at: cert.expires_at(),
+                });
                 continue;
             }
             // The certificate as it is: the same scopes, and the permissions it holds.
@@ -823,14 +851,36 @@ impl Signer {
                     app_id: listed.app_id,
                     reason,
                 }),
-                None => due.push(listed.app_id),
+                // The lifetime it has, from now: a short one the user chose stays short.
+                None => due.push((
+                    listed.app_id,
+                    cert.expires_at().saturating_sub(cert.issued_at()),
+                )),
             }
         }
+        self.renewals_taken(&taken).await?;
         self.skip_renewals(skipped).await?;
         let mut renewed = Vec::new();
-        for app_id in due {
-            match self.renew(app_id, CertChange::default()).await {
-                Ok(_) => renewed.push(app_id),
+        for (app_id, lifetime) in due {
+            let change = CertChange {
+                scopes: None,
+                expires_at: Some(self.env.clock.now_ms().saturating_add(lifetime)),
+            };
+            self.ready().await?;
+            match self.renew_listed(app_id, change, None).await {
+                Ok(_) => {
+                    renewed.push(app_id);
+                    let mut state = self.state.clone();
+                    match state
+                        .untaken_renewals
+                        .iter_mut()
+                        .find(|(id, _)| *id == app_id)
+                    {
+                        Some((_, count)) => *count = count.saturating_add(1),
+                        None => state.untaken_renewals.push((app_id, 1)),
+                    }
+                    self.commit(state, self.flow.clone()).await?;
+                }
                 // At the size a delivery may carry: no renewal can be delivered, and the
                 // near-limit alert tells the user (design note, section 11).
                 Err(SignerError::Refused(Refusal::IdentityTooLarge { .. }))
@@ -851,6 +901,29 @@ impl Signer {
             }
         }
         Ok(renewed)
+    }
+
+    /// How many automatic renewals of `app_id` in a row no record has taken up.
+    fn untaken_renewals(&self, app_id: &[u8; 16]) -> u32 {
+        self.state
+            .untaken_renewals
+            .iter()
+            .find(|(id, _)| id == app_id)
+            .map_or(0, |(_, count)| *count)
+    }
+
+    /// The apps in `apps` are back, or the user renewed them: their count of untaken
+    /// renewals starts again, and [`Alert::RenewalsStopped`] goes (Switch spec 3.1).
+    pub(super) async fn renewals_taken(&mut self, apps: &[[u8; 16]]) -> Result<()> {
+        let mut state = self.state.clone();
+        state.untaken_renewals.retain(|(id, _)| !apps.contains(id));
+        state.alerts.retain(
+            |alert| !matches!(alert, Alert::RenewalsStopped { app_id, .. } if apps.contains(app_id)),
+        );
+        if state != self.state {
+            self.commit(state, self.flow.clone()).await?;
+        }
+        Ok(())
     }
 
     /// Raise `alerts` for renewals the signer leaves to the user; renews nothing.

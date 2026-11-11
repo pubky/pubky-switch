@@ -1505,24 +1505,43 @@ async fn test_renewal_on_expiry_waits_while_the_device_clock_is_off() {
 }
 
 #[tokio::test]
-async fn test_renewal_on_expiry_keeps_an_app_away_for_lifetimes_served() {
-    // The app never takes its renewals: each half lifetime it is renewed again, its listed
-    // certificate never expires, and once it comes back with the newest one, every open
-    // renewal closes (Switch spec 3.2).
+async fn test_renewal_stops_after_two_untaken_and_starts_again_on_the_users_renewal() {
+    // The app never takes its renewals. It is renewed at half its lifetime, twice, and then
+    // not again by itself: the user is told, and the app would lapse at its expiry. The
+    // user renews it: the count starts again. Once it comes back with the newest certificate,
+    // every open renewal closes (Switch spec 3.1, 3.2).
     let world = World::new();
     let (mut signer, _) = world.enrolled().await;
     let (a, _) = two_apps(&["notes"], &["notes"]);
     world.approve(&mut signer, &a).await;
     let id = a.keys.app_id_bytes();
-    for round in 1..=3 {
+    for round in 1..=2 {
         world.clock.advance_ms(LIFETIME_MS / 2 + DAY_MS);
         signer.run_due().await.unwrap();
         let newest = signer.identity_doc().unwrap().unwrap();
         assert_eq!(renewals(&newest, &id), vec![None; round]);
-        let cert = listed_cert(&signer, &newest, &id);
-        assert!(cert.expires_at() > world.clock.now_ms());
     }
+    world.clock.advance_ms(LIFETIME_MS / 2 + DAY_MS);
+    signer.run_due().await.unwrap();
     let newest = signer.identity_doc().unwrap().unwrap();
+    assert_eq!(renewals(&newest, &id), vec![None; 2], "not renewed again");
+    let cert = listed_cert(&signer, &newest, &id);
+    assert!(signer.alerts().contains(&Alert::RenewalsStopped {
+        app_id: id,
+        expires_at: cert.expires_at(),
+    }));
+    // The user renews it: the alert goes, and automatic renewals start again.
+    signer.renew(id, CertChange::default()).await.unwrap();
+    assert!(
+        !signer
+            .alerts()
+            .iter()
+            .any(|alert| matches!(alert, Alert::RenewalsStopped { .. }))
+    );
+    world.clock.advance_ms(LIFETIME_MS / 2 + DAY_MS);
+    signer.run_due().await.unwrap();
+    let newest = signer.identity_doc().unwrap().unwrap();
+    assert_eq!(renewals(&newest, &id), vec![None; 4]);
     let cert = listed_cert(&signer, &newest, &id);
     let record = AppRecord::sign(
         &a.keys,
@@ -1546,6 +1565,116 @@ async fn test_renewal_on_expiry_keeps_an_app_away_for_lifetimes_served() {
         "{entries:?}"
     );
     world.assert_no_version_sent_twice();
+}
+
+#[tokio::test]
+async fn test_renewal_record_carrying_the_newest_certificate_starts_the_count_again() {
+    // The app takes up its first two renewals, then stays away. A record carrying the newest
+    // certificate starts the count again each time, so it is renewed twice more after it
+    // stops coming back, and only then stopped (Switch spec 3.1).
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let (a, _) = two_apps(&["notes"], &["notes"]);
+    world.approve(&mut signer, &a).await;
+    let id = a.keys.app_id_bytes();
+    for round in 1..=5 {
+        world.clock.advance_ms(LIFETIME_MS / 2 + DAY_MS);
+        signer.run_due().await.unwrap();
+        let newest = signer.identity_doc().unwrap().unwrap();
+        let entries = renewals(&newest, &id).len();
+        let stopped = signer
+            .alerts()
+            .iter()
+            .any(|alert| matches!(alert, Alert::RenewalsStopped { .. }));
+        if round <= 4 {
+            assert_eq!(entries, round, "renewed at round {round}");
+            assert!(!stopped, "round {round}");
+        } else {
+            assert_eq!(entries, 4, "not renewed at round {round}");
+            assert!(stopped);
+        }
+        // Back with the newest certificate after the first two renewals only.
+        if round <= 2 {
+            let cert = listed_cert(&signer, &newest, &id);
+            let record = AppRecord::sign(
+                &a.keys,
+                AppRecordBody::new(&cert, Vec::new(), world.clock.now_ms()),
+            )
+            .unwrap();
+            world
+                .switch
+                .app_op(
+                    &a.keys,
+                    OpKind::AppPut {
+                        record: record.signed().clone(),
+                    },
+                )
+                .unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_renewal_approved_again_starts_the_count_again() {
+    // An app stopped for its untaken renewals asks again with the same keys, and the user
+    // approves it: a renewal the user asked for, so the alert goes at once (Switch spec 3.1,
+    // wire 3.9).
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let (a, _) = two_apps(&["notes"], &["notes"]);
+    world.approve(&mut signer, &a).await;
+    let id = a.keys.app_id_bytes();
+    for _ in 0..3 {
+        world.clock.advance_ms(LIFETIME_MS / 2 + DAY_MS);
+        signer.run_due().await.unwrap();
+    }
+    assert!(
+        signer
+            .alerts()
+            .iter()
+            .any(|alert| matches!(alert, Alert::RenewalsStopped { app_id, .. } if *app_id == id))
+    );
+    let again = App::with_keys(a.keys.clone(), &["notes"], None, [21; 32]);
+    let review = signer.review(&again.request, &again.auth).unwrap();
+    assert!(review.renews);
+    signer.approve(review).await.unwrap();
+    assert!(
+        !signer
+            .alerts()
+            .iter()
+            .any(|alert| matches!(alert, Alert::RenewalsStopped { .. }))
+    );
+}
+
+#[tokio::test]
+async fn test_renewal_keeps_a_short_lifetime_the_user_chose() {
+    // The user renewed the app for 30 days. Past half of that, the automatic renewal gives it
+    // 30 days again, from then, not the default year (Switch spec 3.1).
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let (a, _) = two_apps(&["notes"], &["notes"]);
+    world.approve(&mut signer, &a).await;
+    let id = a.keys.app_id_bytes();
+    let month = 30 * DAY_MS;
+    signer
+        .renew(
+            id,
+            CertChange {
+                scopes: None,
+                expires_at: Some(world.clock.now_ms() + month),
+            },
+        )
+        .await
+        .unwrap();
+    let chosen = listed_cert(&signer, &signer.identity_doc().unwrap().unwrap(), &id);
+    let lifetime = chosen.expires_at() - chosen.issued_at();
+    assert!(lifetime <= month && lifetime > month - DAY_MS);
+    world.clock.advance_ms(16 * DAY_MS);
+    assert_eq!(signer.renew_expiring().await.unwrap(), [id]);
+    let newest = signer.identity_doc().unwrap().unwrap();
+    let cert = listed_cert(&signer, &newest, &id);
+    assert_eq!(cert.expires_at() - cert.issued_at(), lifetime);
+    assert_eq!(cert.issued_at(), world.clock.now_ms());
 }
 
 /// The test protocol's scopes, `notes` giving `permissions`: as after an update of its table.
