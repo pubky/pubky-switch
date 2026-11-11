@@ -3,7 +3,10 @@
 //! core's rules (`batch`); `FAKES.md` lists what it leaves out.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::task::{Context, Poll, Waker};
 
 use ed25519_dalek::SigningKey;
 use pubky_switch_core::chain::{
@@ -31,10 +34,11 @@ use serde_json::{Map, Value, json};
 use super::ScriptError;
 use crate::clock::{Clock, TestClock};
 use crate::error::TransportError;
-use crate::transport::{Header, MockTransport, Request, Response};
+use crate::transport::{BoxFuture, Header, MockTransport, Request, Response, Transport};
 
 mod batch;
 mod inbox;
+mod retention;
 mod shared;
 mod signer;
 
@@ -68,14 +72,25 @@ pub(crate) enum Item {
         proof: Option<SignedDoc>,
         /// Who may read it in full; every other app gets its stub (Switch wire 7.5).
         readers: Readers,
+        /// For a conversation entry the service wrote: its invite code's context.
+        context: Option<Value>,
     },
     Unreadable {
         seq: u64,
+        /// The ID of the entry it stands for; one of its own for an item a test scripted.
+        entry_id: String,
         sender: [u8; 32],
         accepted_at: u64,
+        /// A test scripted it ([`ScriptedSwitch::push_unreadable`]): it is kept whatever
+        /// the cursors.
+        scripted: bool,
     },
     Missed {
         seq: u64,
+        /// The lagging app it is for, which alone is shown it; `None` for an item a test
+        /// scripted ([`ScriptedSwitch::push_missed`]), shown to every app and kept
+        /// whatever the cursors.
+        app: Option<[u8; 16]>,
         entries: u64,
         from: u64,
         until: u64,
@@ -125,6 +140,9 @@ pub struct SwitchApp {
     pub receive_n: Option<u64>,
     /// The cursor's `seq`.
     pub cursor: u64,
+    /// Whether the app is marked lagging: its unread entries passed its share of the inbox
+    /// quota, and entries no longer wait for it (Switch wire 7.4.4).
+    pub lagging: bool,
     /// Whether the app left or was revoked.
     pub departed: bool,
     /// When the signer revoked it (`revoked_at`, Switch wire 7.4.12).
@@ -242,6 +260,18 @@ pub(crate) struct Inner {
     pub(crate) shared: shared::Shared,
     /// Feed reads answered so far.
     pub(crate) feed_reads: u64,
+    /// Keep the entries every reader they wait for has passed
+    /// ([`ScriptedSwitch::keep_passed_entries`]).
+    keep_passed: bool,
+    /// The feed reads the switch holds and hasn't woken since they last looked (Switch wire
+    /// 7.4.4 `wait`), each with its waker: woken when the account's sequence grows, at the
+    /// next request, at an erasure, and when a test says the clock moved.
+    held: Vec<(u64, Waker)>,
+    /// The number given to the last held read.
+    held_ids: u64,
+    /// The request being answered is a held read, seen when it arrived: it isn't seen again
+    /// (Switch wire 7.4.12 `last_seen`).
+    seen_at_arrival: bool,
     /// Feed reads answered before every later one is `503 unavailable`: a bound for tests
     /// of reads that must end.
     pub(crate) feed_limit: Option<u64>,
@@ -333,6 +363,10 @@ impl Inner {
             allow: None,
             shared: shared::Shared::default(),
             feed_reads: 0,
+            keep_passed: false,
+            held: Vec::new(),
+            held_ids: 0,
+            seen_at_arrival: false,
             feed_limit: None,
             max_page_bytes: MAX_PAGE_BYTES,
             unreached: Vec::new(),
@@ -365,6 +399,71 @@ pub struct ScriptedSwitch {
     inner: Mutex<Inner>,
 }
 
+/// The longest a feed read may ask to be held, in seconds (Switch wire 7.4.4).
+const MAX_FEED_WAIT_S: u64 = 25;
+
+/// A feed read's `wait`, if it is an integer in its range.
+fn feed_wait(text: &str) -> Option<u64> {
+    text.parse::<u64>()
+        .ok()
+        .filter(|seconds| *seconds <= MAX_FEED_WAIT_S)
+}
+
+/// The scripted switch as a transport: it answers at once, but for a feed read it holds.
+struct Holding(Arc<ScriptedSwitch>);
+
+impl Transport for Holding {
+    fn send(&self, request: Request) -> BoxFuture<'_, Result<Response, TransportError>> {
+        Box::pin(async move {
+            let Some(held) = self.0.waiting_read(&request) else {
+                return self.0.handle(&request);
+            };
+            held.await;
+            // Answered as the account stands now: a reader revoked or departed while its
+            // read was held is refused, and an account erased meanwhile is one the switch
+            // doesn't host, as at the service (Switch wire 7.4.4, 7.4.16).
+            self.0.answer(&request, true)
+        })
+    }
+}
+
+/// A feed read the switch holds, admitted when it arrived: ready once the feed has
+/// something to show its app, its wait has passed, or the account is gone. A departure of
+/// its app shows it the departure's chain item, so it is ready then too. The switch's lock
+/// is held only while it looks, never across the wait.
+struct Held<'a> {
+    switch: &'a ScriptedSwitch,
+    /// Its number among the reads the switch held.
+    id: u64,
+    app: [u8; 16],
+    /// The certificate the app was current with when the read arrived.
+    cert: AppCert,
+    after: u64,
+    until_ms: u64,
+}
+
+impl Future for Held<'_> {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let mut inner = self.switch.lock();
+        if inner.now() >= self.until_ms
+            || inner.erased
+            || inner.enrolled.is_none()
+            || inner.shows_after(self.app, &self.cert, self.after)
+        {
+            return Poll::Ready(());
+        }
+        // One waker a read, the newest.
+        let (id, waker) = (self.id, cx.waker().clone());
+        match inner.held.iter_mut().find(|(held, _)| *held == id) {
+            Some(held) => held.1 = waker,
+            None => inner.held.push((id, waker)),
+        }
+        Poll::Pending
+    }
+}
+
 impl std::fmt::Debug for ScriptedSwitch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let inner = self.lock();
@@ -384,8 +483,16 @@ pub(crate) fn bad(code: ErrorCode, message: &str, current: Value) -> Answer {
     if !current.is_null() {
         body["current"] = current;
     }
+    // A `429` says when to try again, as the service's does: the next minute's window
+    // (Switch wire 7.6).
+    if code == ErrorCode::RateLimited {
+        body["retry_after"] = json!(SCRIPTED_RETRY_AFTER_S);
+    }
     (code.status(), body)
 }
+
+/// The `retry_after` of the scripted switch's `429 rate_limited`, in seconds.
+pub(crate) const SCRIPTED_RETRY_AFTER_S: u64 = 60;
 
 /// Who may read a chain item in full (Switch wire 7.5, "Who may read a chain item in
 /// full"); every other own app gets its stub. Taken when the item is appended; whether the
@@ -720,12 +827,92 @@ impl ScriptedSwitch {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// A transport that answers every request from this switch, and records the requests.
+    /// A transport that answers every request from this switch at once, and records the
+    /// requests. It holds no read: a feed read with `wait` is answered as one without. For a
+    /// switch that holds one, see [`ScriptedSwitch::holding_transport`].
     pub fn transport(self: &Arc<Self>) -> Arc<MockTransport> {
         let switch = Arc::clone(self);
         Arc::new(MockTransport::with_handler(move |request| {
             switch.handle(request)
         }))
+    }
+
+    /// A transport that answers every request from this switch, and holds a feed read with
+    /// `wait` that has nothing to show, as the service holds it (Switch wire 7.4.4): until
+    /// the account's sequence grows, or until the wait has passed by the switch's clock,
+    /// which a held read notices at the next request to the switch or at
+    /// [`ScriptedSwitch::release_held_reads`].
+    pub fn holding_transport(self: &Arc<Self>) -> Arc<dyn Transport> {
+        Arc::new(Holding(Arc::clone(self)))
+    }
+
+    /// Let the held feed reads look again: one whose wait has passed by the clock is
+    /// answered. For a test that moved the clock and sends nothing else to the switch.
+    pub fn release_held_reads(&self) {
+        self.lock().wake_held();
+    }
+
+    /// How many feed reads the switch holds now that it hasn't woken since they last
+    /// looked.
+    pub fn held_reads(&self) -> usize {
+        self.lock().held.len()
+    }
+
+    /// The wait of `request`, if it is a feed read with `wait` that a current own app sent:
+    /// the app and its certificate, the `seq` it reads after, and when its wait ends by the
+    /// switch's clock.
+    fn waiting_read(&self, request: &Request) -> Option<Held<'_>> {
+        if request.method != "GET" {
+            return None;
+        }
+        let (path, query) = request.path_and_query.split_once('?')?;
+        if !path.ends_with("/feed") {
+            return None;
+        }
+        let app = request
+            .header(header::APP)
+            .and_then(|text| app_id_decode(text).ok())?;
+        let mut after = 0;
+        let mut wait = None;
+        for pair in query.split('&') {
+            match pair.split_once('=') {
+                Some(("after", value)) => after = Position::parse(value).ok()?.seq,
+                Some(("wait", value)) => wait = feed_wait(value),
+                _ => {}
+            }
+        }
+        let wait_s = wait.filter(|seconds| *seconds > 0)?;
+        // The read is admitted as it arrives, as the service admits it under its lock: an
+        // account that doesn't serve it (gone, staged, or frozen for a write) or an app that
+        // isn't current is answered at once, and the app is seen now, not when its read is
+        // answered.
+        let mut inner = self.lock();
+        if inner
+            .gate(&request.method, &request.path_and_query)
+            .is_some()
+        {
+            return None;
+        }
+        let cert = inner.own_call(&app).ok()?;
+        inner.seen_at_arrival = false;
+        inner.seen(request);
+        // The read ends its app's lagging mark as it arrives, before any wait (Switch wire
+        // 7.4.4).
+        if let Some(held) = inner.apps.get_mut(&app) {
+            held.lagging = false;
+        }
+        let until_ms = inner.now().saturating_add(wait_s.saturating_mul(1000));
+        inner.held_ids += 1;
+        let id = inner.held_ids;
+        drop(inner);
+        Some(Held {
+            switch: self,
+            id,
+            app,
+            cert,
+            after,
+            until_ms,
+        })
     }
 
     /// Apply `fault` to the next request it matches; faults apply in the order added.
@@ -740,7 +927,16 @@ impl ScriptedSwitch {
     /// A scripted fault's connection failure or lost answer, or [`TransportError::Other`]
     /// when the switch can't build its answer.
     pub fn handle(&self, request: &Request) -> Result<Response, TransportError> {
+        self.answer(request, false)
+    }
+
+    /// [`ScriptedSwitch::handle`]; `held` for a feed read the switch held, whose app was
+    /// seen when the read arrived and isn't seen again.
+    fn answer(&self, request: &Request, held: bool) -> Result<Response, TransportError> {
         let mut inner = self.lock();
+        inner.seen_at_arrival = held;
+        // A held read whose wait has passed is answered now at the latest.
+        inner.wake_held();
         let path = request.path_and_query.clone();
         let mut lose = false;
         let mut leave_out = None;
@@ -925,6 +1121,9 @@ impl ScriptedSwitch {
         to: &[[u8; 16]],
     ) -> u64 {
         let mut inner = self.lock();
+        // As an append: the lagging marks are judged before it and with it in (Switch wire
+        // 7.4.4).
+        inner.judge_lagging();
         let seq = inner.next_seq();
         let accepted_at = inner.clock.now_ms();
         inner.items.push(Item::Entry {
@@ -936,6 +1135,7 @@ impl ScriptedSwitch {
             targets: to.to_vec(),
             context: None,
         });
+        inner.judge_lagging();
         seq
     }
 
@@ -946,10 +1146,27 @@ impl ScriptedSwitch {
         let seq = inner.next_seq();
         inner.items.push(Item::Unreadable {
             seq,
+            entry_id: Inner::entry_id(seq),
             sender,
             accepted_at,
+            scripted: true,
         });
         seq
+    }
+
+    /// Keep the entries every reader they wait for has passed, where the switch deletes
+    /// them as the service does (Switch wire 9.1): the state of an inbox whose entries
+    /// another target still holds, for a test that reads an entry again from an earlier
+    /// cursor, as after a restore.
+    pub fn keep_passed_entries(&self) {
+        self.lock().keep_passed = true;
+    }
+
+    /// Set the inbox quota (Switch wire 9.2 `quota_bytes`), which an enrollment announces
+    /// and the current apps share: an app whose unread entries pass its share is marked
+    /// lagging (Switch wire 7.4.4). The switch refuses no append for it.
+    pub fn set_inbox_quota(&self, quota_bytes: u64) {
+        self.lock().enroll_limits.quota_bytes = quota_bytes;
     }
 
     /// A `missed` item: `entries` entries accepted from `from` until `until` were deleted
@@ -959,6 +1176,7 @@ impl ScriptedSwitch {
         let seq = inner.next_seq();
         inner.items.push(Item::Missed {
             seq,
+            app: None,
             entries,
             from,
             until,
@@ -1195,6 +1413,9 @@ impl Inner {
     /// The scripted switch takes an app with a record, not revoked, departed or kept, as
     /// authenticated; the service sees no other.
     fn seen(&mut self, request: &Request) {
+        if self.seen_at_arrival {
+            return;
+        }
         let Some(app) = request
             .header(header::APP)
             .and_then(|text| app_id_decode(text).ok())
@@ -1226,7 +1447,25 @@ impl Inner {
 
     fn next_seq(&mut self) -> u64 {
         self.seq += 1;
+        // The account changes: the held reads look again.
+        self.wake_held();
         self.seq
+    }
+
+    /// Wake every held feed read, to look again.
+    fn wake_held(&mut self) {
+        for (_, waker) in self.held.drain(..) {
+            waker.wake();
+        }
+    }
+
+    /// Whether the feed has an item past `after` to show own app `app`, whole or as a stub:
+    /// a read with `wait` is held while it has none (Switch wire 7.4.4).
+    fn shows_after(&self, app: [u8; 16], cert: &AppCert, after: u64) -> bool {
+        self.items
+            .iter()
+            .filter(|item| item.seq() > after)
+            .any(|item| self.show(item, app, Some(cert)).is_some())
     }
 
     fn head(&self) -> SignedHead {
@@ -1343,6 +1582,7 @@ impl Inner {
             item,
             proof: Some(proof.signed().clone()),
             readers,
+            context: None,
         });
         Ok(proof.signed().clone())
     }
@@ -1354,14 +1594,16 @@ impl Inner {
             return Ok(None);
         }
         let at = self.now();
+        let was = self.current_app_ids();
         let held = self.apps.entry(app).or_default();
         held.departed = true;
         held.revoked_at = Some(at);
         self.unreachable(&app);
         self.push.remove(&app);
-        Ok(Some(self.service_transition(
-            ServiceTransition::Revoke { app_id: app, at },
-        )?))
+        let proof = self.service_transition(ServiceTransition::Revoke { app_id: app, at })?;
+        // After its chain item (Switch wire 7.4.4).
+        self.after_departure(was);
+        Ok(Some(proof))
     }
 
     /// `app` leaves (Switch spec 12.3): the `leave` transition's proof, or `None` for an app
@@ -1372,14 +1614,15 @@ impl Inner {
         }
         let at = self.now();
         let epoch = self.doc.as_ref().map_or(0, IdentityDoc::data_epoch);
+        let was = self.current_app_ids();
         let held = self.apps.entry(app).or_default();
         held.departed = true;
         held.departed_at = Some((at, epoch));
         self.unreachable(&app);
-        Ok(Some(self.service_transition(ServiceTransition::Leave {
-            app_id: app,
-            at,
-        })?))
+        let proof = self.service_transition(ServiceTransition::Leave { app_id: app, at })?;
+        // After its chain item (Switch wire 7.4.4).
+        self.after_departure(was);
+        Ok(Some(proof))
     }
 
     fn service_transition(
@@ -1581,6 +1824,10 @@ impl Inner {
                     Ok(value) => limit = value,
                     Err(_) => return bad(ErrorCode::BadRequest, "limit", json!(null)),
                 },
+                // The read was held before it came here, if it had nothing to show.
+                Some(("wait", value)) if feed_wait(value).is_none() => {
+                    return bad(ErrorCode::BadRequest, "wait", json!(null));
+                }
                 _ => {}
             }
         }
@@ -1640,6 +1887,10 @@ impl Inner {
             && self.freeze_in_feed
         {
             page["freeze"] = json!(freeze);
+        }
+        // The reader's feed read ends its lagging mark (Switch wire 7.4.4).
+        if let Some(held) = self.apps.get_mut(&app) {
+            held.lagging = false;
         }
         (200, page)
     }
@@ -1727,6 +1978,7 @@ impl Inner {
                 item,
                 proof,
                 readers,
+                context,
             } => {
                 if *seq <= self.dropped_through {
                     return None;
@@ -1741,21 +1993,33 @@ impl Inner {
                 {
                     value["proof"] = json!(proof);
                 }
+                if let Some(context) = context {
+                    value["context"] = context.clone();
+                }
                 value
             }
             Item::Unreadable {
                 seq,
+                entry_id,
                 sender,
                 accepted_at,
-            } => json!({ "type": "unreadable", "seq": seq, "entry_id": Self::entry_id(*seq),
+                ..
+            } => json!({ "type": "unreadable", "seq": seq, "entry_id": entry_id,
                          "sender": pubky_id(sender), "accepted_at": rfc3339(*accepted_at) }),
             Item::Missed {
                 seq,
+                app: of,
                 entries,
                 from,
                 until,
-            } => json!({ "type": "missed", "seq": seq, "entries": entries,
-                         "accepted_from": rfc3339(*from), "accepted_until": rfc3339(*until) }),
+            } => {
+                // The lagging app it was made for alone is shown it (Switch wire 7.5).
+                if of.is_some_and(|of| of != app) {
+                    return None;
+                }
+                json!({ "type": "missed", "seq": seq, "entries": entries,
+                        "accepted_from": rfc3339(*from), "accepted_until": rfc3339(*until) })
+            }
         })
     }
 

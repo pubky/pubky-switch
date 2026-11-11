@@ -180,7 +180,11 @@ pub fn other_app_refusal(call: &Call) -> ApiError {
             ErrorCode::PermissionMissing,
             "7.4.17: only the signer and the app it is for",
         ),
-        Call::PutIdentity | Call::Revoke(_) | Call::GetApps | Call::Erase => ApiError::new(
+        Call::PutIdentity
+        | Call::Revoke(_)
+        | Call::GetApps
+        | Call::RecoveryAdmission
+        | Call::Erase => ApiError::new(
             ErrorCode::PermissionMissing,
             "7.4: a call only the signer may make",
         ),

@@ -200,6 +200,7 @@ impl Inner {
         {
             self.staged = false;
         }
+        let was = self.current_app_ids();
         let bytes = doc.signed().doc_bytes()?;
         let hash = item_hash(ItemType::Identity, &bytes);
         let state = ProofState::Identity {
@@ -242,6 +243,9 @@ impl Inner {
         self.handover = None;
         self.delivery_proof = Some(proof.clone());
         self.directory_version += 1;
+        // After its chain item: an app it no longer makes current departs at it (Switch wire
+        // 7.4.4).
+        self.after_departure(was);
         Ok(proof)
     }
 
@@ -508,6 +512,9 @@ impl Inner {
             return bad(ErrorCode::Conflict, "a move is in progress", json!(null));
         }
         self.erased = true;
+        // A feed read held for the account is answered now, as for an account the switch
+        // doesn't host (Switch wire 7.4.16).
+        self.wake_held();
         (200, json!({ "erased": true }))
     }
 
@@ -567,11 +574,11 @@ impl Inner {
                         .map(|(at, _)| pubky_switch_core::time::rfc3339(at)),
                     "awaiting_rotation": held.is_some_and(|a| a.departed_at.is_some() && !a.rotated),
                     "open_attempts": self.open_attempts(id),
-                    "unread_entries": 0,
-                    "sole_target_unread": 0,
+                    "unread_entries": self.unread_counts(id).0,
+                    "sole_target_unread": self.unread_counts(id).1,
                     "record_cert": held.and_then(|a| a.cert.as_ref()).map(|c| b64(&c.hash())),
                     "record_at": held.and_then(|a| a.record_at).map(pubky_switch_core::time::rfc3339),
-                    "lagging": false,
+                    "lagging": held.is_some_and(|a| a.lagging),
                     "keys_through": self.keys_through(id),
                     "full_bundle_requested": held
                         .and_then(|a| a.full_requested)
