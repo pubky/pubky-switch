@@ -132,8 +132,15 @@ service.
   account in memory, with no manifest, chunks or export transfer; a recovery upload is kept
   and answered with fixed changes, merging nothing.
 - **Revocation** is `POST /apps/{app_id}/revoke` from the signer, and the test call
-  `revoke`; an app that left is answered as one revoked already, with no proof. `leave` and
-  `request_full_bundle` are test calls for the app's own routes, and `forget_removal_time`
+  `revoke`; an app that left is answered as one revoked already, with no proof. `leave` is a
+  test call and also a route, `POST /apps/{app_id}/leave`, which checks only that the app
+  hasn't departed: it takes any body, departs an app with no record or one whose certificate
+  has expired or isn't listed, keeps the app's invite codes, push registration and inbox
+  entries, and stamps the test clock's time. The service refuses another app's path and the
+  signer with `403 permission_missing`, where this switch answers `404`, and an app of
+  another identity with `403 permission_missing`, where this switch answers `403
+  not_admitted` (Switch wire 7.4.12). `request_full_bundle` is a test call for the app's own
+  route, and `forget_removal_time`
   scripts a faulty service that shows no time for a removal. Freeze and
   unfreeze are test calls, not routes.
 - **`lose_identity`** scripts a faulty service that lost the account's `identity.json`.
@@ -155,10 +162,10 @@ service.
 ## Signer flows tested only here
 
 These signer flows run only against the scripted switch, whose `GET /apps` follows the
-service's rules (above). The service in this workspace serves `GET /apps`, but not yet
-`POST /apps/{app_id}/leave`, `POST /apps/{app_id}/keys` or `GET /apps/{app_id}/keys`, which
-departures, full-bundle requests and reading the stored parts need. Re-run them against the
-service once it serves those calls:
+service's rules (above). The service in this workspace serves `GET /apps` and `POST
+/apps/{app_id}/leave`, but not yet `POST /apps/{app_id}/keys` or `GET /apps/{app_id}/keys`,
+which full-bundle requests and reading the stored parts need. Re-run them against the service
+once it serves those calls; the departures can run against it now:
 
 - approval, renewals and reductions, their closings, and epoch completion
   (`crates/pubky-switch-signer/tests/approval.rs`, `renewal.rs`);
