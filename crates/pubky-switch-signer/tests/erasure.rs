@@ -1349,10 +1349,8 @@ async fn test_erasure_unsigned_404_with_nothing_in_doubt_raises_account_not_host
     let (signer, id, store) = with_an_app(&world).await;
     let mark = signer.identity_doc().unwrap().unwrap();
     drop(signer);
-    let mut signer = Signer::open(unsigned_404_for_apps(&world, store, 1), world.keyring())
-        .await
-        .unwrap();
-    let before = world.transport.requests().len();
+    let (env, transport) = nth_apps_answer(&world, store, 1, 404);
+    let mut signer = Signer::open(env, world.keyring()).await.unwrap();
     let error = signer.run_due().await.unwrap_err();
     assert!(
         matches!(
@@ -1369,12 +1367,9 @@ async fn test_erasure_unsigned_404_with_nothing_in_doubt_raises_account_not_host
     assert!(!world.switch.erased());
     assert!(world.homeserver.file(IDENTITY_PATH).is_some());
     assert!(world.homeserver.file(&app_record_path(&id)).is_some());
-    assert!(
-        world.transport.requests()[before..]
-            .iter()
-            .all(|r| r.method == "GET"),
-        "only reads"
-    );
+    let sent = transport.requests();
+    assert!(!sent.is_empty());
+    assert!(sent.iter().all(|r| r.method == "GET"), "only reads");
     signer.run_due().await.unwrap();
     assert!(!signer.alerts().contains(&Alert::AccountNotHosted));
 }
@@ -1393,4 +1388,305 @@ async fn test_erasure_in_doubt_ending_erased_raises_no_account_not_hosted() {
     signer.resume().await.unwrap();
     assert_eq!(signer.status(), SignerStatus::Erased);
     assert!(!signer.alerts().contains(&Alert::AccountNotHosted));
+}
+
+/// `world`'s env, whose transport answers `GET /apps` number `nth`, counted from 1, with an
+/// unsigned answer of `status`, as an intermediary could, and passes everything else to the
+/// switch. Returns the env and the transport, which keeps every request.
+fn nth_apps_answer(
+    world: &World,
+    store: Arc<MemoryStore>,
+    nth: usize,
+    status: u16,
+) -> (SignerEnv, Arc<MockTransport>) {
+    let switch = Arc::clone(&world.switch);
+    let seen = Arc::new(std::sync::Mutex::new(0usize));
+    let transport = Arc::new(MockTransport::with_handler(move |request| {
+        if request.method == "GET" && request.path_and_query.ends_with("/apps") {
+            let mut seen = seen.lock().unwrap();
+            *seen += 1;
+            if *seen == nth {
+                return Ok(Response {
+                    status,
+                    headers: Vec::new(),
+                    body: b"{}".to_vec(),
+                });
+            }
+        }
+        switch.handle(request)
+    }));
+    let mut env = world.env(store);
+    env.transport = transport.clone();
+    (env, transport)
+}
+
+#[tokio::test]
+async fn test_erasure_account_not_hosted_keeps_a_delivery_in_progress() {
+    // A new version's delivery is in progress; the backup is missing, so the backup write
+    // reads the switch, and that read gets the unsigned `404`. The alert's commit keeps the
+    // delivery, and a later run delivers the version and clears the alert.
+    let world = World::new();
+    let (signer, store) = world.enrolled().await;
+    drop(signer);
+    world
+        .homeserver
+        .files
+        .lock()
+        .unwrap()
+        .remove(SIGNER_BACKUP_PATH);
+    // `GET /apps` 1 is the change's own check, 2 the backup write's.
+    let (env, _) = nth_apps_answer(&world, store.clone(), 2, 404);
+    let mut signer = Signer::open(env, world.keyring()).await.unwrap();
+    signer.set_record_max_age(Some(60)).await.unwrap_err();
+    assert!(signer.alerts().contains(&Alert::AccountNotHosted));
+    drop(signer);
+    let mut signer = Signer::open(world.env(store), world.keyring())
+        .await
+        .unwrap();
+    signer.resume().await.unwrap();
+    assert_eq!(
+        world.switch.identity_doc().unwrap().body().record_max_age,
+        Some(60)
+    );
+    assert!(!signer.alerts().contains(&Alert::AccountNotHosted));
+}
+
+#[tokio::test]
+async fn test_erasure_unsigned_503_raises_no_account_not_hosted() {
+    // A gateway's unsigned `503` to `GET /apps` says nothing of the account: no alert.
+    let world = World::new();
+    let (signer, store) = world.enrolled().await;
+    drop(signer);
+    let (env, _) = nth_apps_answer(&world, store, 1, 503);
+    let mut signer = Signer::open(env, world.keyring()).await.unwrap();
+    signer.run_due().await.unwrap_err();
+    assert!(!signer.alerts().contains(&Alert::AccountNotHosted));
+}
+
+#[tokio::test]
+async fn test_erasure_signed_404_raises_no_account_not_hosted() {
+    // A `404` the pinned key signs is the switch's own answer, not one for an account it
+    // doesn't host: no alert.
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    world.switch.fail_next(SwitchFault::Error {
+        path: "/apps".into(),
+        code: ErrorCode::NotFound,
+        current: serde_json::Value::Null,
+    });
+    signer.run_due().await.unwrap_err();
+    assert!(!signer.alerts().contains(&Alert::AccountNotHosted));
+}
+
+#[tokio::test]
+async fn test_erasure_ended_through_an_equivocation_clearing_it_delivers_nothing() {
+    // The account ends erased while the Homeserver's equivocation is still held. Clearing
+    // that alert only removes it: no delivery again, no republication, no read, and every
+    // later run has nothing left to do (Switch spec 12.7).
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    world.switch.fail_next(SwitchFault::LoseAnswer {
+        path: "/erase".into(),
+    });
+    signer.close_account(confirmed()).await.unwrap_err();
+    let mine = signer.identity_doc().unwrap().unwrap();
+    let mut body = mine.body().clone();
+    body.record_max_age = Some(1);
+    let other = IdentityDoc::sign(&world.key, body).unwrap();
+    world
+        .homeserver
+        .set(IDENTITY_PATH, serde_json::to_vec(other.signed()).unwrap());
+    let SignerError::Alarm(alert) = signer.resume().await.unwrap_err() else {
+        panic!("an alarm")
+    };
+    world.homeserver.files.lock().unwrap().remove(IDENTITY_PATH);
+    signer.resume().await.unwrap();
+    assert_eq!(signer.status(), SignerStatus::Erased);
+    let before = world.transport.requests().len();
+    signer.clear_alert(&alert).await.unwrap();
+    assert!(!signer.alerts().contains(&alert));
+    for _ in 0..3 {
+        signer.resume().await.unwrap();
+    }
+    assert_eq!(world.transport.requests().len(), before, "nothing sent");
+    assert!(
+        world.homeserver.file(IDENTITY_PATH).is_none(),
+        "nothing published"
+    );
+}
+
+#[tokio::test]
+async fn test_erasure_ended_through_a_rollback_clearing_it_raises_no_account_not_hosted() {
+    // A request is held on the way; the switch then answers, signed, that it holds no copy:
+    // the rollback alarm keeps the erasure. The held request lands, and the next check ends
+    // the erasure erased. Clearing the rollback only removes it: no read, and no alert for
+    // an account the switch doesn't host on the install that erased it (Switch spec 12.7).
+    let world = World::new();
+    let (signer, _, store) = with_an_app(&world).await;
+    drop(signer);
+    let (env, land) = delayed_erasure(&world, store);
+    let mut signer = Signer::open(env, world.keyring()).await.unwrap();
+    signer.close_account(confirmed()).await.unwrap_err();
+    world.switch.lose_identity();
+    let SignerError::Alarm(alert) = signer.resume().await.unwrap_err() else {
+        panic!("an alarm")
+    };
+    land();
+    assert!(world.switch.erased());
+    signer.resume().await.unwrap();
+    assert_eq!(signer.status(), SignerStatus::Erased);
+    signer.clear_alert(&alert).await.unwrap();
+    assert!(!signer.alerts().contains(&alert));
+    assert!(!signer.alerts().contains(&Alert::AccountNotHosted));
+}
+
+/// What a call on an erased install answers.
+#[derive(Debug)]
+enum OnErased {
+    /// Refused with [`Refusal::Erased`].
+    Erased,
+    /// Refused for another reason, checked before the state.
+    Refused(Refusal),
+    /// Done, with nothing sent.
+    Done,
+}
+
+#[tokio::test]
+async fn test_erasure_erased_install_sends_nothing_whatever_is_called() {
+    // Every public call on an erased install: it refuses with `Erased`, refuses for a reason
+    // its arguments give, or does only local work. None sends a request, writes the
+    // Homeserver, or leaves a flow a reopened install would resume (Switch spec 12.7).
+    use pubky_switch_signer::CertChange;
+    let world = World::new();
+    let (mut signer, id, store) = with_an_app(&world).await;
+    let removed = App::with_keys(
+        AppKeys::from_secrets([5; 32], [6; 32]),
+        &["notes"],
+        None,
+        [10; 32],
+    );
+    world.approve(&mut signer, &removed).await;
+    let removed = removed.keys.app_id_bytes();
+    signer.revoke(removed, None, confirmed()).await.unwrap();
+    signer.close_account(confirmed()).await.unwrap();
+    assert_eq!(signer.status(), SignerStatus::Erased);
+    let alert = signer.alerts().first().cloned().expect("a reminder");
+    let app = App::new(&["notes"], None, [8; 32]);
+    let review = signer.review(&app.request, &app.auth).unwrap();
+    macro_rules! check {
+        ($name:expr, $expect:expr, $call:expr) => {{
+            let requests = world.transport.requests().len();
+            let files = world.homeserver.files.lock().unwrap().clone();
+            let answer = $call.map(drop);
+            match ($expect, &answer) {
+                (OnErased::Erased, Err(SignerError::Refused(Refusal::Erased)))
+                | (OnErased::Done, Ok(())) => {}
+                (OnErased::Refused(want), Err(SignerError::Refused(got))) if want == *got => {}
+                (expect, answer) => panic!("{}: {answer:?}, not {expect:?}", $name),
+            }
+            assert_eq!(world.transport.requests().len(), requests, "{} sent", $name);
+            assert!(
+                *world.homeserver.files.lock().unwrap() == files,
+                "{} wrote",
+                $name
+            );
+            let mut reopened = Signer::open(world.env(store.clone()), world.keyring())
+                .await
+                .unwrap();
+            assert_eq!(reopened.status(), SignerStatus::Erased, "{}", $name);
+            reopened
+                .resume()
+                .await
+                .unwrap_or_else(|e| panic!("{}: a flow left, {e:?}", $name));
+        }};
+    }
+    check!("resume", OnErased::Done, signer.resume().await);
+    check!(
+        "clear_alert",
+        OnErased::Done,
+        signer.clear_alert(&alert).await
+    );
+    check!(
+        "set_record_max_age",
+        OnErased::Erased,
+        signer.set_record_max_age(Some(60)).await
+    );
+    check!(
+        "set_connect_requests",
+        OnErased::Erased,
+        signer.set_connect_requests(Default::default()).await
+    );
+    check!(
+        "renew",
+        OnErased::Erased,
+        signer.renew(id, CertChange::default()).await
+    );
+    check!("run_due", OnErased::Erased, signer.run_due().await);
+    check!(
+        "renew_expiring",
+        OnErased::Erased,
+        signer.renew_expiring().await
+    );
+    check!(
+        "restore",
+        OnErased::Erased,
+        signer.restore(confirmed()).await
+    );
+    check!(
+        "hand_over_to",
+        OnErased::Erased,
+        signer.hand_over_to(id, confirmed()).await
+    );
+    check!(
+        "abort_hand_over",
+        OnErased::Erased,
+        signer.abort_hand_over(confirmed()).await
+    );
+    check!(
+        "take_back",
+        OnErased::Erased,
+        signer.take_back(confirmed()).await
+    );
+    check!(
+        "revoke",
+        OnErased::Erased,
+        signer.revoke(id, None, confirmed()).await
+    );
+    check!(
+        "complete_removals",
+        OnErased::Erased,
+        signer.complete_removals().await
+    );
+    check!(
+        "purge_removed",
+        OnErased::Erased,
+        signer.purge_removed(removed).await
+    );
+    check!(
+        "serve_full_bundles",
+        OnErased::Erased,
+        signer.serve_full_bundles().await
+    );
+    check!(
+        "close_account",
+        OnErased::Erased,
+        signer.close_account(confirmed()).await
+    );
+    check!(
+        "abort_erasure",
+        OnErased::Refused(Refusal::NotErasing),
+        signer.abort_erasure().await
+    );
+    check!("approve", OnErased::Erased, signer.approve(review).await);
+    check!(
+        "claim_delivered",
+        OnErased::Done,
+        signer.claim_delivered(&[0; 32]).await
+    );
+    // `complete_renewals` refuses, or, with no renewal open, has nothing to check.
+    let answer = signer.complete_renewals().await;
+    assert!(
+        matches!(answer, Err(SignerError::Refused(Refusal::Erased))) || answer == Ok(Vec::new()),
+        "{answer:?}"
+    );
 }

@@ -327,7 +327,7 @@ Alert = Equivocation { version, ours, theirs }      // stop, show
       | RotationSkipped { app, scopes }             // no registered protocol owns them
       | RenewalSkipped { app, reason }              // past half its lifetime, not renewed by itself: unowned or refused scopes, or other permissions now
       | ClockOff                                    // the device clock is off the switch's time: nothing issued or renewed
-      | AccountNotHosted                            // GET /apps got an unsigned 404, no erasure in doubt: nothing deleted, cleared by a signed answer
+      | AccountNotHosted                            // GET /apps got an unsigned 404, no erasure in progress: nothing deleted, cleared by a signed GET /apps
       | IdentityNearLimit { bytes, limit }          // identity.json past 3/4 of the 256 KiB cap of a delivery or a move's enrollment
       | AppIdle { app, last_seen }                  // suggest removal after 90 days
       | CertLapsingWithOpenAttempts { app, expires_at }

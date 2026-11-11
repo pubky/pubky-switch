@@ -418,7 +418,7 @@ impl Signer {
     /// 6.5). Then the switch's copy is read instead: one at the mark, as after a single bad
     /// answer, confirms the switch, and signing goes on; none raises the alarm again, and the
     /// user declares a provider loss. Nothing is delivered or read once another install is
-    /// the signer.
+    /// the signer, nor once the account is erased: then only the alert goes.
     ///
     /// # Errors
     ///
@@ -439,6 +439,11 @@ impl Signer {
         }
         let mut state = self.state.clone();
         state.alerts.retain(|held| held != alert);
+        // An erased account has no switch to deliver to or read: the alert goes, nothing else
+        // (Switch spec 12.7).
+        if self.state.erased {
+            return self.commit(state, self.flow.clone()).await;
+        }
         // Seen, another body on the Homeserver is published over with the switch's copy once
         // the switch is confirmed to hold this signer's newest version (Switch wire 3.3).
         let republish = matches!(
@@ -950,8 +955,8 @@ impl Signer {
 
     /// `GET /apps` (Switch wire 7.4.12), for a check of the switch's copy. A `404` the pinned
     /// key didn't sign, with no erasure of this install's in progress, raises
-    /// [`Alert::AccountNotHosted`] and is returned as the error it is; the first answer the
-    /// pinned key signs clears it. Nothing else changes: an unauthenticated `404` with no
+    /// [`Alert::AccountNotHosted`] and is returned as the error it is; the next one the pinned
+    /// key signs clears it. Never raised once the account is erased. Nothing else changes: an unauthenticated `404` with no
     /// request in doubt is never an erasure (Switch wire 7.4.16).
     pub(crate) async fn read_apps(&mut self) -> Result<AppsAnswer> {
         let read = self.service_client()?.apps().await;
@@ -960,7 +965,9 @@ impl Signer {
         let erasing = matches!(self.flow, Some(Flow::Erase { .. }));
         let raise = match &read {
             Ok(_) if raised => Some(false),
-            Err(ClientError::BadServiceSignature { status: 404 }) if !raised && !erasing => {
+            Err(ClientError::BadServiceSignature { status: 404 })
+                if !raised && !erasing && !self.state.erased =>
+            {
                 Some(true)
             }
             _ => None,
