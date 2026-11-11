@@ -627,7 +627,8 @@ pub enum AppEvent {
     /// record's writes can't be checked against what the app has seen from that write on
     /// (Switch spec 8.2). For another app's write the record keeps the mark it held, so
     /// what was seen before is still checked; for an own write the mark held goes. A duty
-    /// event, of the class of [`AppEvent::WriteFlagged`].
+    /// event, of the class of [`AppEvent::WriteFlagged`]. There is one per such write, not
+    /// per record: a writer that keeps the mark over the bound raises one at each write.
     RecordUncheckable {
         /// The duty event's ID.
         id: EventId,
@@ -846,6 +847,16 @@ pub(crate) enum Duty {
 }
 
 impl Duty {
+    /// The local ID of the entry stored locally the event names, if it names one.
+    pub(crate) fn stored_id(&self) -> Option<u64> {
+        match self {
+            Self::Parked { stored_id, .. }
+            | Self::EffectRefused { stored_id, .. }
+            | Self::EffectUncertain { stored_id, .. } => Some(*stored_id),
+            _ => None,
+        }
+    }
+
     /// The event reported for it, with its ID.
     pub(crate) fn event(self, id: EventId) -> AppEvent {
         match self {

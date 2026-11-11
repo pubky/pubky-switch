@@ -1208,3 +1208,47 @@ async fn test_full_bundle_request_after_the_approval_stores_every_epoch() {
     assert!(world.switch.app(&id).full_requested.is_none());
     assert!(signer.serve_full_bundles().await.unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn test_revocation_of_an_app_whose_certificate_lapsed_isnt_unconfirmed() {
+    // The switch couldn't take the revocation of `a`, whose certificate merely lapsed: `a` is
+    // still current in spec 3.4's sense, so this isn't a switch showing no time for a removal.
+    // The revocation stays pending, with no `RevocationUnconfirmed`, and the next run sends it.
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let (a, _) = two_joined(&world, &mut signer).await;
+    let id = a.keys.app_id_bytes();
+    world.clock.advance_ms(800 * DAY_MS);
+    world.switch.fail_next(SwitchFault::Error {
+        path: "/revoke".into(),
+        code: pubky_switch_core::http::ErrorCode::Unavailable,
+        current: serde_json::Value::Null,
+    });
+    signer.revoke(id, None, confirmed()).await.unwrap_err();
+    assert!(
+        !signer
+            .alerts()
+            .contains(&Alert::RevocationUnconfirmed { app_id: id })
+    );
+    assert!(signer.alerts().iter().any(|alert| matches!(
+        alert,
+        Alert::RevocationPending { app_id, at_switch: false } if *app_id == id
+    )));
+    assert!(
+        signer
+            .identity_doc()
+            .unwrap()
+            .unwrap()
+            .listed_cert(&id)
+            .is_some()
+    );
+    let _ = signer.run_due().await;
+    let doc = signer.identity_doc().unwrap().unwrap();
+    assert!(doc.listed_cert(&id).is_none());
+    assert!(doc.body().removed.iter().any(|r| r.app_id == id));
+    assert!(
+        !signer
+            .alerts()
+            .contains(&Alert::RevocationUnconfirmed { app_id: id })
+    );
+}

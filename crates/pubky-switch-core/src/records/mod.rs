@@ -53,8 +53,9 @@ pub use export_transfer::{EXPORT_TRANSFER_KIND, ExportTransfer, ExportTransferBo
 pub use freeze::{DiscardAnswer, FREEZE_KIND, Freeze, FreezeBody, Unfreeze, UnfreezeAt};
 pub use handover::{
     DeliveryKind, HANDOVER_KIND, MAX_BUNDLE_PARTS, MAX_HANDOVER_ENVELOPES, RestoreStart,
-    SignerBackup, SignerHandover, SignerRecords, TakeOver, abort_body, check_handover_copies,
-    check_restore_copies, revoked_after, succeeded, take_over_body, taken_over,
+    SignerBackup, SignerHandover, SignerRecords, TakeOver, abort_body, backup_taken_over,
+    check_handover_copies, check_restore_copies, revoked_after, succeeded, take_over_body,
+    taken_over,
 };
 pub use identity::{
     Admission, ConnectRequests, DEFAULT_RECORD_MAX_AGE_S, IDENTITY_KIND, IdentityBody, IdentityDoc,

@@ -78,7 +78,7 @@ impl Service {
         let apps = batch::load_apps(txn, held, time_ms)
             .await
             .map_err(|e| store_error(&e))?;
-        let current = |app: &[u8; 16]| apps.is_current(app);
+        let current = |app: &[u8; 16]| apps.is_served(app);
         let view = claim.view(&claim_key, time_ms, &current).to_value();
         let steps = if claim.tombstone { 0 } else { claim.step };
         let last_seq = match steps.checked_sub(1) {
@@ -167,22 +167,15 @@ impl Service {
         }
         // The data epoch its rotation goes above (Switch wire 7.4.12 awaiting_rotation).
         let data_epoch = held.map_or(1, IdentityDoc::data_epoch);
+        // It leaves the directory, a reachable app no longer counts among the reachable
+        // ones (Switch wire 7.4.10), and entries no longer wait for it (9.1): settled from
+        // the state before the revocation, then the revocation written.
+        batch::settle_change(txn, held, None, Some(app), time_ms)
+            .await
+            .map_err(|e| store_error(&e))?;
         txn.revoke_app(&app, time_ms, data_epoch)
             .await
             .map_err(|e| store_error(&e))?;
-        // It leaves the directory: its record and receive key no longer show, and a
-        // reachable app no longer counts among the reachable ones (Switch wire 7.4.10).
-        let (directory_version, apps_version) = txn
-            .directory_versions()
-            .await
-            .map_err(|e| store_error(&e))?;
-        let reachable = stored_app.is_some_and(|a| a.receive_key.is_some());
-        txn.set_directory_versions(
-            directory_version.saturating_add(1),
-            apps_version.saturating_add(u64::from(reachable)),
-        )
-        .await
-        .map_err(|e| store_error(&e))?;
         let identity = txn.head().identity_key;
         let transition = ServiceTransition::Revoke {
             app_id: app,

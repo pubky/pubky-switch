@@ -275,6 +275,8 @@ pub(crate) struct Inner {
     /// the account's lock, such as a `401 stale_timestamp`, answers with it and doesn't
     /// move it (Switch wire 7.1).
     pub(crate) stamped_ms: u64,
+    /// The stored signer hand-over (Switch wire 7.4.17): its target and the `PUT` body.
+    pub(crate) handover: Option<([u8; 16], Value)>,
 }
 
 impl Inner {
@@ -333,6 +335,7 @@ impl Inner {
             delivery_proof: None,
             enroll_limits: pubky_switch_core::records::Limits::default(),
             listed_at_epoch: BTreeMap::new(),
+            handover: None,
         }
     }
 }
@@ -659,6 +662,10 @@ impl ScriptedSwitch {
             match inner.faults.remove(index) {
                 Some(Fault::Error { code, current, .. }) => {
                     let (status, body) = bad(code, "scripted", current);
+                    // Past authentication, the service saw the app (Switch wire 7.4.12).
+                    if status != 401 {
+                        inner.seen(request);
+                    }
                     // A `401` is answered before the request verifies, so before the lock:
                     // with the last stamped time and no head (Switch wire 7.1).
                     if status == 401 {
@@ -689,6 +696,8 @@ impl ScriptedSwitch {
             return Ok(answer);
         }
         if let Some((status, body)) = inner.gate(&request.method, &path) {
+            // A staged account's refusal comes after authentication: the app was seen.
+            inner.seen(request);
             if inner.erased || inner.enrolled.is_none() {
                 // Switch wire 7.4.16: signed with the operator key.
                 let operator = SigningKey::from_bytes(&[42; 32]);
@@ -715,12 +724,8 @@ impl ScriptedSwitch {
             Some(answer) => Ok(answer),
             None => inner.route(request, caller, &rest),
         };
-        // An own app's request: its last-seen time (Switch wire 7.4.12), also for the request
-        // that registered it.
-        let now = inner.now();
-        if let Some(held) = caller.and_then(|app| inner.apps.get_mut(&app)) {
-            held.last_seen = Some(now);
-        }
+        // An own app's request: its last-seen time, also for the request that registered it.
+        inner.seen(request);
         let (status, mut body) =
             answer.map_err(|error| TransportError::Other(format!("scripted switch: {error}")))?;
         if lose {
@@ -1012,6 +1017,27 @@ impl ScriptedSwitch {
 }
 
 impl Inner {
+    /// An own app's request passed authentication: its last-seen time (Switch wire 7.4.12).
+    /// The scripted switch takes an app with a record, not revoked, departed or kept, as
+    /// authenticated; the service sees no other.
+    fn seen(&mut self, request: &Request) {
+        let Some(app) = request
+            .header(header::APP)
+            .and_then(|text| app_id_decode(text).ok())
+        else {
+            return;
+        };
+        let now = self.now();
+        let kept = self.kept_app_ids.contains(&app);
+        if let Some(held) = self.apps.get_mut(&app)
+            && held.record.is_some()
+            && !held.departed
+            && !kept
+        {
+            held.last_seen = Some(now);
+        }
+    }
+
     fn now(&self) -> u64 {
         self.clock.now_ms()
     }
@@ -1225,6 +1251,8 @@ impl Inner {
             return Ok(match (request.method.as_str(), route) {
                 ("PUT", "identity") => self.put_identity(&request.body)?,
                 ("GET", "apps") => self.apps_answer(),
+                ("PUT", "handover") => self.put_handover(&request.body),
+                ("GET", "handover") => self.handover_answer(None),
                 ("POST", r) if r.starts_with("apps/") && r.ends_with("/revoke") => {
                     self.revoke_answer(r)?
                 }
@@ -1242,6 +1270,7 @@ impl Inner {
         let own_keys = format!("apps/{me}/keys");
         let own_leave = format!("apps/{me}/leave");
         Ok(match (request.method.as_str(), route) {
+            ("GET", "handover") => self.handover_answer(Some(app)),
             ("POST", "ops") => self.ops(caller, &request.body)?,
             ("POST", "inbox") => self.append(request, None, query)?,
             ("GET", "feed") => self.feed(caller, query),

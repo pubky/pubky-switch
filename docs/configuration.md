@@ -57,7 +57,7 @@ The API listener.
 
 A request's network source, which the failed-authentication and public-read limits count by, is an IPv4 address or an IPv6 /64 (Switch wire 7.2). Behind a trusted proxy it is the nearest address in the header that isn't a trusted proxy; otherwise it is the connection's peer.
 
-Served so far: `POST /v1/enroll`, `PUT /v1/{id}/identity` and the public `GET /v1/{id}/identity`. Every other call is answered `503 unavailable` until its endpoint lands.
+Served so far: `POST /v1/enroll`; `PUT /v1/{id}/identity` and the public `GET /v1/{id}/identity`; `POST /v1/{id}/ops`; `GET /v1/{id}/feed`; `GET /v1/{id}/claims/{key}`; `GET /v1/{id}/apps` and `POST /v1/{id}/apps/{app_id}/revoke`; `PUT /v1/{id}/peers`; `POST /v1/{id}/inbox`; `GET /v1/{id}/directory`. Every other call is answered `503 unavailable` until its endpoint lands.
 
 ### `[log]`
 
@@ -157,7 +157,7 @@ PostgreSQL.
 | `migrate_on_start` | `true` | apply pending schema migrations at start; safe with several instances |
 | `connect_retry_ms` | `30000` | how long the service keeps trying to reach the database at start, while it refuses connections or is still starting up, before it exits. It covers the request pool only: the change listener connects once the pool is up, without this retry, and a failure there stops the service |
 
-**Migrations on a large database.** Each migration runs in one transaction, and some take exclusive locks for their duration. `0008_feed` backfills every operation's proof into `chain_items` and builds two indexes without `CONCURRENTLY`, so `chain_items`, `shared_records` and `claim_entries` take no writes until it finishes, and since its `ALTER TABLE` holds an exclusive lock on `chain_items` until it commits, feed reads wait for it too. It is sized for a small database. On a large one, run it in a maintenance window, with `migrate_on_start` off on every instance but one.
+**Migrations on a large database.** Each migration runs in one transaction, and some take exclusive locks for their duration. `0008_feed` backfills every operation's proof into `chain_items` and builds two indexes without `CONCURRENTLY`, so `chain_items`, `shared_records` and `claim_entries` take no writes until it finishes, and since its `ALTER TABLE` holds an exclusive lock on `chain_items` until it commits, feed reads wait for it too. It is sized for a small database. On a large one, run it in a maintenance window, with `migrate_on_start` off on every instance but one. `0011_inbox` adds a `CHECK` constraint to `list_entries`, which scans the whole table under an exclusive lock while the migration runs, so list reads and writes (and appends, whose admission reads the lists) wait for it; on a large `list_entries`, the same maintenance window applies.
 
 ### `[keys]`
 

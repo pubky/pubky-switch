@@ -63,8 +63,9 @@ pub struct HeldRecord {
 /// A list entry: the app that wrote it, and when.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ListEntry {
-    /// The writing app.
-    pub written_by: [u8; 16],
+    /// The writing app; `None` for the service's conversation entry for a sender an invite
+    /// code admitted.
+    pub written_by: Option<[u8; 16]>,
     /// The service time of the write.
     pub at: u64,
 }
@@ -82,6 +83,9 @@ pub struct HeldInvite {
     pub expires_at: u64,
     /// Its context, any JSON.
     pub context: Value,
+    /// The context's bytes as its writer wrote them, which the feed repeats (Switch wire
+    /// 1.1).
+    pub context_written: Vec<u8>,
 }
 
 impl HeldInvite {
@@ -308,17 +312,78 @@ impl OpsState {
         }
     }
 
-    /// Whether `app` is current now (Switch spec 3.4): neither revoked nor departed, and its
-    /// record's certificate, or a renewed one, listed or in an open renewal in the newest
-    /// `identity.json`, and unexpired.
-    pub fn is_current(&self, app: &[u8; 16]) -> bool {
+    /// Whether `app` is served now: current ([`Self::is_current`]) and its certificate
+    /// unexpired (Switch wire 3.8 check 3). Only the claim rules take it, for which an
+    /// expired app counts as not current (spec 3.2, 10.2); a caller's own expiry is check 3
+    /// on its request.
+    pub fn is_served(&self, app: &[u8; 16]) -> bool {
         self.current_by(app, true)
     }
 
-    /// Whether `app` is current without its certificate's expiry, which only trusted time
-    /// can judge (Switch wire 7.3 "Without trusted time").
-    pub fn current_without_expiry(&self, app: &[u8; 16]) -> bool {
+    /// Whether `app` is current (Switch spec 3.4): neither revoked nor departed, and its
+    /// record's certificate, or a renewed one, listed or in an open renewal in the newest
+    /// `identity.json` (wire 3.8's standing, check 5). Expiry isn't part of it: a lapsed
+    /// certificate stops the app being served (check 3), not current, and a renewal brings
+    /// it back with nothing lost. So entries wait for it (wire 9.1), and an append's targets
+    /// (7.4.3 check 5), `stale_key`'s members (7.6) and the directory (7.4.10) take it.
+    pub fn is_current(&self, app: &[u8; 16]) -> bool {
         self.current_by(app, false)
+    }
+
+    /// The App IDs reachable (Switch wire 7.4.10): current ([`Self::is_current`]) and with
+    /// a receive key.
+    pub fn reachable_app_ids(&self) -> BTreeSet<[u8; 16]> {
+        self.apps
+            .iter()
+            .filter(|(app, held)| held.receive_key.is_some() && self.is_current(app))
+            .map(|(app, _)| *app)
+            .collect()
+    }
+
+    /// The App IDs the directory lists (Switch wire 7.4.10): current, with a record.
+    pub fn listed_app_ids(&self) -> BTreeSet<[u8; 16]> {
+        self.apps
+            .iter()
+            .filter(|(app, held)| held.record.is_some() && self.is_current(app))
+            .map(|(app, _)| *app)
+            .collect()
+    }
+
+    /// After a change from `before`, the directory's two versions (Switch wire 7.4.10):
+    /// - `directory_version` moves if the directory's apps changed and nothing this change
+    ///   did moved it already (an app record, a receive key, a delivery or a revocation
+    ///   does), as when a `cert.put` makes an app current or stops it being so;
+    /// - `apps_version` moves once if the set of reachable apps changed, and only then, and
+    ///   each app that became reachable takes the new version as its `reachable_since`, the
+    ///   version from which a sender must wrap to it (7.4.3 check 5).
+    pub fn settle_directory(&mut self, before: &OpsState) {
+        if self.directory_version == before.directory_version
+            && self.listed_app_ids() != before.listed_app_ids()
+        {
+            self.directory_version = self.directory_version.saturating_add(1);
+        }
+        let (was, now) = (before.reachable_app_ids(), self.reachable_app_ids());
+        if now == was {
+            return;
+        }
+        self.apps_version = self.apps_version.saturating_add(1);
+        let version = self.apps_version;
+        for app in now.difference(&was) {
+            if let Some(held) = self.apps.get_mut(app) {
+                held.reachable_since = Some(version);
+            }
+        }
+    }
+
+    /// The App IDs current ([`Self::is_current`]), expired ones included: the targets an
+    /// inbox entry waits for (Switch wire 9.1) and the current targets of
+    /// `sole_target_unread` (7.4.12).
+    pub fn current_app_ids(&self) -> Vec<[u8; 16]> {
+        self.apps
+            .keys()
+            .filter(|app| self.is_current(app))
+            .copied()
+            .collect()
     }
 
     fn current_by(&self, app: &[u8; 16], expiry: bool) -> bool {
@@ -506,7 +571,7 @@ impl ConditionState for Before<'_> {
     }
 
     fn claim_view(&self, claim_key: &[u8; 32]) -> Option<Value> {
-        let current = |app: &[u8; 16]| self.state.is_current(app);
+        let current = |app: &[u8; 16]| self.state.is_served(app);
         self.state
             .claims
             .get(claim_key)

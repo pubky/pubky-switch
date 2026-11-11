@@ -27,6 +27,7 @@
 //! written"). Records behind their own newer version, or an install another took over from,
 //! are restored in place this way.
 
+use pubky_switch_client::client::answers::AppsAnswer;
 use pubky_switch_core::records::{IDENTITY_PATH, IdentityDoc, SIGNER_BACKUP_PATH, app_record_path};
 use pubky_switch_core::sig::SignedDoc;
 
@@ -54,7 +55,7 @@ impl Signer {
         confirmed: UserConfirmed,
     ) -> Result<Self> {
         let identity = keyring.public_key();
-        if state::load(&env.store, &identity).await?.is_some() {
+        if state::set_up(&env.store, &identity).await? {
             return Err(Refusal::AlreadySetUp.into());
         }
         let install = pubky_switch_core::enc::random_bytes::<16>()?;
@@ -76,7 +77,9 @@ impl Signer {
     ///
     /// # Errors
     ///
-    /// [`Refusal::FlowInProgress`] while a flow is in progress; [`Refusal::NoBackup`] when the
+    /// [`Refusal::FlowInProgress`] while a flow is in progress; [`Refusal::HandingOver`] or
+    /// [`Refusal::TakingOver`] while a hand-over is in progress, which the abort or the
+    /// take-over ends; [`Refusal::NoBackup`] when the
     /// Homeserver holds none; [`Refusal::UnreadableBackup`] for one that doesn't open or
     /// verify; [`Refusal::StaleBackup`] when the switch's or the Homeserver's copy is past it;
     /// otherwise as [`Signer::resume`].
@@ -84,6 +87,17 @@ impl Signer {
         self.refresh().await?;
         if self.flow.is_some() {
             return Err(Refusal::FlowInProgress.into());
+        }
+        // A restore would sign the version after the one handed over, racing the new signer
+        // at its own version, and drop the hand-over from the records.
+        if let Some(handing) = &self.state.handing_over {
+            return Err(Refusal::HandingOver {
+                to_app: handing.to_app,
+            }
+            .into());
+        }
+        if self.state.taking_over {
+            return Err(Refusal::TakingOver.into());
         }
         self.restore_records(true, confirmed).await
     }
@@ -120,81 +134,23 @@ impl Signer {
             .check_restore(&view, answer.identity.as_ref(), in_place)
             .await?;
 
-        let mut state = SignerState::new(identity, self.state.install);
-        // The versions this install spent stay spent. Of the user's alerts, those about the
-        // records restored over go; an alarm can't stand here (`check_restore`).
-        state.signed_through = self.state.signed_through.max(doc.version());
-        state.alerts = self
-            .state
-            .alerts
-            .iter()
-            .filter(|a| {
-                !matches!(
-                    a,
-                    Alert::RecordsBehind { .. } | Alert::ManagedByOtherInstall { .. }
-                )
-            })
-            .cloned()
-            .collect();
-        state.service = Some(service);
-        state.certs = view.certs.iter().map(|c| c.signed().clone()).collect();
-        state.bundle_parts = view.bundle_parts.clone();
         // Revoked for good: the backup's, `identity_doc`'s `removed`, what the switch shows,
         // and, in place, this install's own, with the revocations it asked for and the
         // deletions it owes: one whose record is gone already still owes its grant reminder,
         // which `deletion_checks`, finding no record, wouldn't raise.
         let mut tombstones = view.revoked_apps.clone();
         tombstones.extend(doc.body().removed.iter().map(|r| r.app_id));
-        tombstones.extend(
-            answer
-                .apps
-                .iter()
-                .filter(|s| s.revoked_at.is_some() || s.departed_at.is_some())
-                .map(|s| s.app_id),
-        );
-        if in_place {
+        tombstones.extend(removed_at_switch(&answer));
+        let cleanup = if in_place {
             tombstones.extend(self.state.tombstones.iter().copied());
+            self.state.cleanup.clone()
+        } else {
+            Vec::new()
+        };
+        let mut state = self.taken_records(&view, &answer, service, tombstones, cleanup);
+        if in_place {
             state.revoking.clone_from(&self.state.revoking);
-            state.cleanup.clone_from(&self.state.cleanup);
         }
-        tombstones.sort_unstable();
-        tombstones.dedup();
-        // The apps the restored document lists get no listing floor for their removal time:
-        // the time they were first listed is unknown here, and a reported time before it
-        // changes nothing anyway (Switch spec 12.3).
-        state.listed_at = doc.body().apps.iter().map(|a| (a.app_id, 0)).collect();
-        // The epoch floor: the highest epoch whose keys were sent, by the records or as the
-        // switch shows, and never more than one past `data_epoch`, since epochs never skip
-        // (Switch spec 3.2, 3.5).
-        let claimed = view
-            .bundle_parts
-            .iter()
-            .map(|p| p.last_epoch)
-            .chain(answer.apps.iter().filter_map(|s| s.keys_through))
-            .chain(
-                answer
-                    .apps
-                    .iter()
-                    .flat_map(|s| s.bundle_ranges.iter().map(|r| r.last)),
-            )
-            .fold(doc.data_epoch(), u64::max);
-        let most = doc.data_epoch().saturating_add(1);
-        if claimed > most {
-            state.alert(Alert::EpochFloorBounded {
-                claimed,
-                kept: most,
-            });
-        }
-        state.epoch_through = claimed.min(most);
-        // A removed app's record may still be on the Homeserver: the routine run checks, a
-        // few at a time, and owes its deletion with its grant reminder raised once more,
-        // since this install can't tell the user saw it. Taking over doesn't wait for that.
-        state.deletion_checks = tombstones
-            .iter()
-            .copied()
-            .filter(|app| doc.listed_cert(app).is_none() && !state.cleanup.contains(app))
-            .collect();
-        state.tombstones = tombstones;
         state.newest = Some(Newest {
             doc: doc.signed().clone(),
             prev: view.prev,
@@ -237,6 +193,79 @@ impl Signer {
         self.commit(state, Some(flow)).await?;
         self.resume().await?;
         Ok(next)
+    }
+
+    /// The records an install takes from records it received or restored, `view`, and the
+    /// switch's `GET /apps` answer `apps` (Switch wire 3.12, 3.13), with `tombstones` the App
+    /// IDs revoked for good and `cleanup` the deletions owed already. The versions this
+    /// install spent stay spent; of its alerts, those about the records taken over go. The
+    /// caller sets `newest`.
+    ///
+    /// - The apps the document lists get no listing floor for their removal time: the time
+    ///   they were first listed is unknown here, and a reported time before it changes
+    ///   nothing anyway (Switch spec 12.3).
+    /// - The epoch floor is the highest epoch whose keys were sent, by the records or as the
+    ///   switch shows, and never more than one past `data_epoch`, since epochs never skip
+    ///   (Switch spec 3.2, 3.5).
+    /// - A removed app's record may still be on the Homeserver: the routine run checks, a few
+    ///   at a time, and owes its deletion with its grant reminder raised once more, since
+    ///   this install can't tell the user saw it. Taking over doesn't wait for that.
+    pub(super) fn taken_records(
+        &self,
+        view: &BackupView,
+        apps: &AppsAnswer,
+        service: Service,
+        mut tombstones: Vec<[u8; 16]>,
+        cleanup: Vec<[u8; 16]>,
+    ) -> SignerState {
+        let doc = &view.identity_doc;
+        let mut state = SignerState::new(self.state.identity, self.state.install);
+        state.signed_through = self.state.signed_through.max(doc.version());
+        state.alerts = self
+            .state
+            .alerts
+            .iter()
+            .filter(|a| {
+                !matches!(
+                    a,
+                    Alert::RecordsBehind { .. } | Alert::ManagedByOtherInstall { .. }
+                )
+            })
+            .cloned()
+            .collect();
+        state.service = Some(service);
+        state.certs = view.certs.iter().map(|c| c.signed().clone()).collect();
+        state.bundle_parts = view.bundle_parts.clone();
+        state.cleanup = cleanup;
+        tombstones.sort_unstable();
+        tombstones.dedup();
+        state.listed_at = doc.body().apps.iter().map(|a| (a.app_id, 0)).collect();
+        let claimed = view
+            .bundle_parts
+            .iter()
+            .map(|p| p.last_epoch)
+            .chain(apps.apps.iter().filter_map(|s| s.keys_through))
+            .chain(
+                apps.apps
+                    .iter()
+                    .flat_map(|s| s.bundle_ranges.iter().map(|r| r.last)),
+            )
+            .fold(doc.data_epoch(), u64::max);
+        let most = doc.data_epoch().saturating_add(1);
+        if claimed > most {
+            state.alert(Alert::EpochFloorBounded {
+                claimed,
+                kept: most,
+            });
+        }
+        state.epoch_through = claimed.min(most);
+        state.deletion_checks = tombstones
+            .iter()
+            .copied()
+            .filter(|app| doc.listed_cert(app).is_none() && !state.cleanup.contains(app))
+            .collect();
+        state.tombstones = tombstones;
+        state
     }
 
     /// The checks a restore passes before it takes the backup's records (Switch wire 3.13
@@ -309,8 +338,12 @@ impl Signer {
     }
 
     /// Write the backup a restore owes, holding the newest version, once its delivery has won
-    /// (Switch wire 3.13 "When it is written"). A write that fails raises
-    /// [`Alert::BackupNotWritten`] and stays owed; nothing is held back by it.
+    /// (Switch wire 3.13 "When it is written"). It passes the checks of every backup write
+    /// first ([`Signer::check_backup_write`]): a backup there that another install wrote at or
+    /// past the mark, or a newer one of this install's own, is never written over, and the
+    /// install stops as those checks say. A write, or a check, that fails on the Homeserver or
+    /// the switch raises [`Alert::BackupNotWritten`] and stays owed; nothing is held back by
+    /// it.
     pub(super) async fn write_owed_backup(&mut self) -> Result<()> {
         if !self.state.backup_owed || self.flow.is_some() || gate::refusal(&self.state).is_some() {
             return Ok(());
@@ -318,8 +351,21 @@ impl Signer {
         let Some(newest) = self.state.newest.clone() else {
             return Ok(());
         };
+        // Sealed before the check, so only the check's read comes before the write.
         let backup = self.seal_backup(&newest.doc, newest.prev)?;
         let bytes = serde_json::to_vec(&backup).map_err(|e| SignerError::Records(e.to_string()))?;
+        let raised = match self.check_backup_write().await {
+            Ok(raised) => raised,
+            Err(SignerError::Homeserver(_) | SignerError::Switch(_)) => {
+                let mut state = self.state.clone();
+                state.alert(Alert::BackupNotWritten);
+                if state != self.state {
+                    self.commit(state, None).await?;
+                }
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
         let written = self
             .env
             .homeserver
@@ -327,8 +373,12 @@ impl Signer {
             .await
             .is_ok();
         let mut state = self.state.clone();
+        if let Some(alert) = raised {
+            state.alert(alert);
+        }
         if written {
             state.backup_owed = false;
+            state.publish_after_backup = false;
             state.alerts.retain(|a| *a != Alert::BackupNotWritten);
         } else {
             state.alert(Alert::BackupNotWritten);
@@ -369,6 +419,14 @@ impl Signer {
         }
         Ok(())
     }
+}
+
+/// The App IDs `GET /apps` shows revoked or departed.
+pub(super) fn removed_at_switch(apps: &AppsAnswer) -> impl Iterator<Item = [u8; 16]> + '_ {
+    apps.apps
+        .iter()
+        .filter(|s| s.revoked_at.is_some() || s.departed_at.is_some())
+        .map(|s| s.app_id)
 }
 
 /// How many removed apps' records a run checks for.
