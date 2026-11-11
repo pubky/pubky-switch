@@ -339,10 +339,6 @@ async fn test_every_served_call_is_listed_and_sent_by_its_flow() {
     assert_eq!(
         waiting,
         [
-            "POST /v1/{id}/inbox",
-            "PUT /v1/{id}/peers",
-            "GET /v1/{id}/claims/{key}",
-            "GET /v1/{id}/directory",
             "POST /v1/{id}/apps/{app}/keys",
             "POST /v1/{id}/apps/{app}/leave",
             "POST /v1/{id}/apps/{app}/revoke",
