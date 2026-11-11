@@ -1211,7 +1211,9 @@ async fn test_directory_reads_the_state_under_the_lock_not_after() {
         ms(&at),
     );
     let (answer, ()) = tokio::join!(replay.service.handle(request), async {
-        pause.reached.notified().await;
+        tokio::time::timeout(std::time::Duration::from_secs(10), pause.reached.notified())
+            .await
+            .expect("the read reached its pause once its request committed");
         sql(
             &replay,
             "UPDATE accounts SET directory_version = directory_version + 100 WHERE id = $1",

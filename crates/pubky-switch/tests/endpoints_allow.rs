@@ -569,7 +569,9 @@ async fn test_allow_reads_the_state_under_the_lock_not_after() {
     // since it reads the state under the lock, at the stamped time.
     let pause = replay.db.pause_next_snapshot_read();
     let (answer, ()) = tokio::join!(read_as(&replay, "wallet", &read_at), async {
-        pause.reached.notified().await;
+        tokio::time::timeout(std::time::Duration::from_secs(10), pause.reached.notified())
+            .await
+            .expect("the read reached its pause once its request committed");
         sql(
             &replay,
             "INSERT INTO invite_codes (account_id, code_hash, max_uses, uses, writer, \
