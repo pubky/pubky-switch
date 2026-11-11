@@ -17,7 +17,9 @@ const ATTEMPT: [u8; 16] = [3; 16];
 
 /// The wallet attempts a claim, reports it done and saves a contact. After each step the
 /// phone, which did none of it, follows its feed and moves its cursor; at the end it reads
-/// the claim.
+/// the claim. The outcome compacts the claim, so the phone's feed shows its entries as
+/// stubs, which name no claim: the phone reads the claim it follows again at the end of
+/// that read, and holds it settled (Switch wire 7.5).
 ///
 /// A shared record the wallet writes belongs here too. An app whose protocol has
 /// collections reads `GET /v1/{id}/records` when it joins, which the service doesn't serve
@@ -25,7 +27,8 @@ const ATTEMPT: [u8; 16] = [3; 16];
 ///
 /// Calls, beyond the joins': the wallet's `POST /v1/{id}/ops` (`claim`, `allow.put`) and the
 /// phone's `GET /v1/{id}/feed` after each, with items another app wrote, and its cursor
-/// moves; the phone's `GET /v1/{id}/claims/{claim_key}`.
+/// moves; the phone's `GET /v1/{id}/claims/{claim_key}`, after the outcome's stubs and at
+/// the end.
 ///
 /// # Errors
 ///
