@@ -29,9 +29,141 @@ fn refs(fields: &[Vec<u8>]) -> Vec<&[u8]> {
     fields.iter().map(Vec::as_slice).collect()
 }
 
+/// The names of a request's signed fields and of a response's (Switch wire 7.1), as the
+/// files write them.
+const REQUEST_FIELDS: [&str; 9] = [
+    "method",
+    "path and query",
+    "BLAKE3(body)",
+    "Switch-Timestamp",
+    "switch origin",
+    "Switch-Identity",
+    "Switch-App",
+    "Switch-Cert",
+    "Switch-Invite-Code",
+];
+const RESPONSE_FIELDS: [&str; 4] = [
+    "u64(status)",
+    "BLAKE3(request signature)",
+    "server time",
+    "BLAKE3(body)",
+];
+
+fn named_fields(names: &[&str], fields: &[Vec<u8>]) -> Value {
+    assert_eq!(names.len(), fields.len());
+    names
+        .iter()
+        .zip(fields)
+        .map(|(name, field)| serde_json::json!({ "hex": hex::encode(field), "name": name }))
+        .collect()
+}
+
+/// The erasures naming the `identity.json` they follow (Switch wire 7.4.16), which
+/// `pubky-switch-core` generates (README "How the files were generated"): one naming the hash
+/// of alice's version 3, the version her account holds, answered `{"erased":true}`, and one
+/// naming her version 1, refused `409 conflict`. Each is signed with her identity key, and
+/// each answer with her account's fixed service key, without a head.
+fn conditional_erasures(keys: &Keys) {
+    use pubky_switch_core::enc;
+    let alice = keys.identity("alice");
+    let alice_id = enc::pubky_id(&alice);
+    let identity = ed25519_dalek::SigningKey::from_bytes(&keys.identity_secrets[&alice]);
+    let service = keys.service_key(&alice_id);
+    let service_key = ed25519_dalek::SigningKey::from_bytes(&keys.secret(&service).unwrap());
+    let origin = "https://inbox.example";
+    let timestamp = "2026-01-01T00:07:00Z";
+    let server_time = "2026-01-01T00:07:00.030Z";
+    let refused: &[u8] =
+        br#"{"code":"conflict","message":"7.4.16: the account holds another identity.json"}"#;
+    let cases = [
+        (
+            "signer: account erasure, naming the account's service key and the identity.json it follows",
+            "alice identity.json",
+            200,
+            http::ERASED_BODY,
+            "signer: account erasure answer to the request naming its identity.json, signed with the account's key, no head",
+        ),
+        (
+            "signer: account erasure naming an identity.json the account doesn't hold",
+            "alice identity.json, first delivery (version 1)",
+            409,
+            refused,
+            "signer: account erasure refused, the account holds another identity.json, 409 conflict, no head",
+        ),
+    ];
+    let mut generated_cases = Vec::new();
+    for (name, document_name, status, answer, answer_name) in cases {
+        let hash = document(document_name).doc_hash().unwrap();
+        let body = format!(
+            "{{\"service_key\":\"{}\",\"identity_hash\":\"{}\"}}",
+            enc::b64(&service),
+            enc::b64(&hash)
+        )
+        .into_bytes();
+        let path = format!("/v1/{alice_id}/erase");
+        let target = RequestTarget {
+            method: "POST",
+            path_and_query: &path,
+            body: &body,
+            origin,
+        };
+        let headers = RequestHeaders {
+            timestamp: timestamp.to_owned(),
+            identity: alice_id.clone(),
+            ..RequestHeaders::default()
+        };
+        let fields = http::request_fields(&target, &headers);
+        let signature = sig::sign(&identity, labels::sig::HTTP, &refs(&fields));
+        generated_cases.push((
+            Place::Case("/requests"),
+            serde_json::json!({
+                "body_b64": enc::b64(&body),
+                "fields": named_fields(&REQUEST_FIELDS, &fields),
+                "headers": {
+                    "switch-identity": alice_id,
+                    "switch-signature": enc::b64(&signature),
+                    "switch-timestamp": timestamp,
+                },
+                "label": labels::sig::HTTP,
+                "method": "POST",
+                "name": name,
+                "origin": origin,
+                "path": path,
+                "public_key": enc::b64(&alice),
+                "signature": enc::b64(&signature),
+                "signed_bytes_hex": hex::encode(sig::signed_bytes(labels::sig::HTTP, &refs(&fields))),
+                "signer": name,
+            }),
+        ));
+        let fields = http::response_fields(status, Some(&signature), server_time, answer);
+        let answer_signature = sig::sign(&service_key, labels::sig::HTTP_RESPONSE, &refs(&fields));
+        generated_cases.push((
+            Place::Case("/responses"),
+            serde_json::json!({
+                "body": std::str::from_utf8(answer).unwrap(),
+                "fields": named_fields(&RESPONSE_FIELDS, &fields),
+                "headers": {
+                    "switch-server-time": server_time,
+                    "switch-service-signature": enc::b64(&answer_signature),
+                },
+                "label": labels::sig::HTTP_RESPONSE,
+                "name": answer_name,
+                "public_key": enc::b64(&service),
+                "request_signature": enc::b64(&signature),
+                "signature": enc::b64(&answer_signature),
+                "signed_bytes_hex": hex::encode(sig::signed_bytes(labels::sig::HTTP_RESPONSE, &refs(&fields))),
+                "signer": "service key",
+                "status": status,
+            }),
+        ));
+    }
+    generated("http.json", &generated_cases);
+}
+
 #[test]
 fn test_vectors_http() {
     let keys = keys();
+    conditional_erasures(&keys);
     let v = load("http.json");
     let mut transfer_requests = 0;
     for r in arr(&v, "requests") {
@@ -172,11 +304,21 @@ fn test_vectors_http() {
                     .is_err()
             );
         } else if call.ends_with("/erase") {
+            let value: Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(
-                http::parse_erase_body(&body).unwrap(),
-                keys.service_key(&alice_id)
+                b64n::<32>(st(&value, "service_key")),
+                keys.service_key(&alice_id),
+                "{name}"
             );
-            assert_eq!(http::erase_body(&keys.service_key(&alice_id)), body);
+            // The erasures naming the `identity.json` they follow, which the core generates
+            // above, name a hash; the first one names only the key.
+            if value.get("identity_hash").is_none() {
+                assert_eq!(
+                    http::parse_erase_body(&body).unwrap(),
+                    keys.service_key(&alice_id)
+                );
+                assert_eq!(http::erase_body(&keys.service_key(&alice_id)), body);
+            }
         }
     }
     let enrollment = enrollment.expect("an enrollment request");
