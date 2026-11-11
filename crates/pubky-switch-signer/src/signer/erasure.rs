@@ -122,7 +122,6 @@ impl Signer {
         unpublished: bool,
         reminded: Vec<[u8; 16]>,
         unanswered: bool,
-        first_404_ms: Option<u64>,
     ) -> Result<()> {
         if !unpublished {
             return self.unpublish().await;
@@ -131,18 +130,7 @@ impl Signer {
         // already, once it has held for 24 hours, and no other request goes out without an
         // ownership read.
         if self.still_erasing(unanswered, true).await? == Checked::ErasedAlready {
-            return self.erased_after_doubt(reminded, first_404_ms).await;
-        }
-        // An answer the pinned key signed: the account is there, and the wait for the `404`
-        // to hold starts again, if it ever comes (Switch wire 7.4.16).
-        if first_404_ms.is_some() {
-            let flow = Flow::Erase {
-                unpublished,
-                reminded: reminded.clone(),
-                unanswered,
-                first_404_ms: None,
-            };
-            self.commit(self.state.clone(), Some(flow)).await?;
+            return self.erased_after_doubt(reminded, self.erasure_wait()).await;
         }
         // Before the request: it may land, however its answer goes.
         if !unanswered {
@@ -164,11 +152,12 @@ impl Signer {
         };
         match answer {
             Ok(()) => self.erased().await,
-            // A `404` signed with the operator's key, after a request that went unanswered:
-            // the service hosts no account for the identity, as after a lost `200` (Switch
-            // wire 7.4.16).
+            // An unsigned `404`, which may be the operator's, after a request that went
+            // unanswered: the service may host no account for the identity, as after a lost
+            // `200`, once it has held for 24 hours (Switch wire 7.4.16). The wait is the
+            // flow's as it stands after the check, which ends it on a signed answer.
             Err(ClientError::BadServiceSignature { status: 404 }) if unanswered => {
-                self.erased_after_doubt(reminded, None).await
+                self.erased_after_doubt(reminded, self.erasure_wait()).await
             }
             // A `404` is never a lost answer: the operator's means the switch hosted no account
             // when it answered, an intermediary's that the request wasn't routed. With no
@@ -235,9 +224,12 @@ impl Signer {
     ///
     /// With a request in doubt, `unanswered`, an unsigned `404` to the switch's read may be the
     /// operator's after the erasure. The signer backup and the Homeserver are still judged; if
-    /// they show no other install, the account is taken as erased already, on the same
+    /// they show no other install, the account looks erased already, on the same
     /// unauthenticated evidence wire 7.4.16 accepts for a retry's `404`, and no other request
-    /// goes out: an install that delivered behind a proxy answering `404` is never erased.
+    /// goes out: the caller takes it as erased once the `404` has held for 24 hours
+    /// ([`Signer::erased_after_doubt`]). An answer the pinned key signs, here or at any other
+    /// read, ends that wait ([`Signer::read_apps`]), and an install that delivered behind a
+    /// proxy answering `404` is never erased.
     async fn still_erasing(&mut self, unanswered: bool, full: bool) -> Result<Checked> {
         // Records behind block every step that deletes or sends, not the read-only check of
         // the switch's copy, nor a conclusion drawn from it: another install's version there
@@ -306,6 +298,15 @@ impl Signer {
             own_newer(self.judge_homeserver(&newest).await.map(drop))?;
         }
         Ok(())
+    }
+
+    /// When the erasure's wait for the operator's `404` to hold started, as the flow holds it
+    /// now: an answer the pinned key signed since ends it ([`Signer::read_apps`]).
+    fn erasure_wait(&self) -> Option<u64> {
+        match &self.flow {
+            Some(Flow::Erase { first_404_ms, .. }) => *first_404_ms,
+            _ => None,
+        }
     }
 
     /// The operator's `404` after a request in doubt, at a run of the erasure: how a landed

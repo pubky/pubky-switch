@@ -1615,8 +1615,7 @@ async fn test_erasure_in_doubt_ending_erased_raises_no_account_not_hosted() {
     });
     signer.close_account(confirmed()).await.unwrap_err();
     assert!(world.switch.erased());
-    signer.resume().await.unwrap();
-    assert_eq!(signer.status(), SignerStatus::Erased);
+    confirm_erasure(&world, &mut signer).await;
     assert!(!signer.alerts().contains(&Alert::AccountNotHosted));
 }
 
@@ -1730,8 +1729,7 @@ async fn test_erasure_ended_through_an_equivocation_clearing_it_delivers_nothing
         panic!("an alarm")
     };
     world.homeserver.files.lock().unwrap().remove(IDENTITY_PATH);
-    signer.resume().await.unwrap();
-    assert_eq!(signer.status(), SignerStatus::Erased);
+    confirm_erasure(&world, &mut signer).await;
     let before = world.transport.requests().len();
     signer.clear_alert(&alert).await.unwrap();
     assert!(!signer.alerts().contains(&alert));
@@ -1763,8 +1761,7 @@ async fn test_erasure_ended_through_a_rollback_clearing_it_raises_no_account_not
     };
     land();
     assert!(world.switch.erased());
-    signer.resume().await.unwrap();
-    assert_eq!(signer.status(), SignerStatus::Erased);
+    confirm_erasure(&world, &mut signer).await;
     signer.clear_alert(&alert).await.unwrap();
     assert!(!signer.alerts().contains(&alert));
     assert!(!signer.alerts().contains(&Alert::AccountNotHosted));
