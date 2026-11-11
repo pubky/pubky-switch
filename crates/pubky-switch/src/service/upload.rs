@@ -11,7 +11,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use pubky_switch_core::chain::ServiceTransition;
 use pubky_switch_core::ops::{OpKind, SignedOp};
-use pubky_switch_core::records::{AppCert, IdentityDoc};
+use pubky_switch_core::records::{AppCert, IdentityDoc, RemovedApp};
 use pubky_switch_core::recovery::{
     CheckedRecord, CheckedUpload, HeldRecord, RecordMerge, UploadBody, UploadChanges,
     UploadContext, UploadLists, UploadVersion, check_upload, merge_checked_record,
@@ -119,13 +119,55 @@ fn taken(record: &CheckedRecord, seq: u64) -> StoredRecord {
     }
 }
 
+/// A recovery upload's items judged before the account's lock, and what they were judged
+/// against: the endpoint takes the judgment only if both are unchanged under the lock.
+pub(super) struct Prechecked {
+    recovery_from: u64,
+    removed: Vec<RemovedApp>,
+    checked: CheckedUpload,
+}
+
 impl Service {
+    /// Judge a recovery upload's items before the account's lock, off the async threads:
+    /// their signature work needs only the lost generation and the apps the held
+    /// `identity.json` lists as removed, which are read without the lock. `None` when the
+    /// body doesn't read or the account is in no loss's generation: the endpoint answers it
+    /// under the lock.
+    pub(super) async fn precheck_upload(&self, account: &str, body: &[u8]) -> Option<Prechecked> {
+        let upload = UploadBody::parse(body).ok()?;
+        let identity = pubky_switch_core::enc::pubky_key(account).ok()?;
+        let (recovery_from, doc) = self.store.upload_context(account).await.ok()??;
+        let removed = doc
+            .and_then(|doc| IdentityDoc::verify(&doc, &identity).ok())
+            .map(|doc| doc.body().removed.clone())
+            .unwrap_or_default();
+        let judged = removed.clone();
+        let checked = tokio::task::spawn_blocking(move || {
+            let cx = UploadContext {
+                identity: &identity,
+                recovery_from,
+                removed: &judged,
+            };
+            check_upload(&upload, &cx)
+        })
+        .await
+        .ok()?;
+        Some(Prechecked {
+            recovery_from,
+            removed,
+            checked,
+        })
+    }
+
     /// `POST /v1/{id}/recovery/upload` from the own app `caller` (Switch wire 7.4.14), at a
     /// serving account: `404` at one in neither stage; after a provider loss, `400` for a
     /// body that doesn't read, `403 permission_missing` for lists the caller may not send,
     /// `429 rate_limited` past `uploads_per_app_per_hour`, else the merge, one `upload`
     /// transition, and `{ result, proof, head }`. `held` is the account's newest
-    /// `identity.json`, whose `removed` judges removed apps' operations.
+    /// `identity.json`, whose `removed` judges removed apps' operations. `prechecked` is the
+    /// judgment made before the lock, taken when its `recovery_from` and `removed` are the
+    /// ones read here; otherwise the items are judged here.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn recovery_upload(
         &self,
         txn: &mut AccountTxn,
@@ -133,6 +175,7 @@ impl Service {
         held: Option<&IdentityDoc>,
         caller: &AppCert,
         body: &[u8],
+        prechecked: Option<&Prechecked>,
         time_ms: u64,
     ) -> Result<Answer, ApiError> {
         let Some(recovery) = txn.recovery().await.map_err(|e| store_error(&e))? else {
@@ -153,14 +196,22 @@ impl Service {
                 ApiError::rate_limited("9.4: recovery uploads from this app", retry)
             })?;
         let identity = txn.head().identity_key;
-        let checked = check_upload(
-            &upload,
-            &UploadContext {
-                identity: &identity,
-                recovery_from: recovery.recovery_from,
-                removed: held.map_or(&[], |doc| doc.body().removed.as_slice()),
-            },
-        );
+        let removed = held.map_or(&[][..], |doc| doc.body().removed.as_slice());
+        let judged_here;
+        let checked = match prechecked.filter(|pre| {
+            pre.recovery_from == recovery.recovery_from && pre.removed.as_slice() == removed
+        }) {
+            Some(pre) => &pre.checked,
+            None => {
+                let cx = UploadContext {
+                    identity: &identity,
+                    recovery_from: recovery.recovery_from,
+                    removed,
+                };
+                judged_here = check_upload(&upload, &cx);
+                &judged_here
+            }
+        };
         // The transition's `seq`, given out first: a record taken from the upload is at it.
         let seq = txn.next_seq().map_err(|e| store_error(&e))?;
         let mut changes = UploadChanges {
@@ -172,7 +223,7 @@ impl Service {
         let stored = |e: StoreError| store_error(&e);
         self.merge_records(txn, &checked.records, seq, &mut changes)
             .await?;
-        self.merge_claims(txn, &checked, time_ms, &mut changes)
+        self.merge_claims(txn, checked, time_ms, &mut changes)
             .await
             .map_err(stored)?;
         if let Some(lists) = &upload.lists {

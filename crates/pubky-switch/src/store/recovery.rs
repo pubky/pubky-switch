@@ -6,6 +6,7 @@ use sqlx::Row;
 
 use super::{AccountTxn, StoreError, from_db, identity::time_to_db, to_db};
 use crate::keys::KeyId;
+use pubky_switch_core::sig::SignedDoc;
 
 /// The recovery the generation the account serves began with (Switch wire 7.4.12
 /// `recovery`).
@@ -62,6 +63,42 @@ pub fn recovery_clears() -> Vec<&'static str> {
     // A record's divergent uploads (Switch wire 7.4.14) go with their record.
     tables.push("divergent_uploads");
     tables
+}
+
+impl super::Store {
+    /// What a recovery upload to `id` is judged against, read without the account's lock:
+    /// the generation declared lost, while the account serves the generation a recovery
+    /// began, and the `identity.json` it holds. `None` otherwise. The upload compares both
+    /// with what it reads under the lock before it takes a judgment made with them.
+    pub async fn upload_context(
+        &self,
+        id: &str,
+    ) -> Result<Option<(u64, Option<SignedDoc>)>, StoreError> {
+        let row = sqlx::query(
+            "SELECT recovery_from, generation, identity_doc FROM accounts WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(StoreError::from_db)?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let from: Option<i64> = row.try_get("recovery_from")?;
+        let generation: i64 = row.try_get("generation")?;
+        let Some(from) = from else {
+            return Ok(None);
+        };
+        let from = from_db(from, "recovery_from")?;
+        if from.checked_add(1) != Some(from_db(generation, "generation")?) {
+            return Ok(None);
+        }
+        let doc: Option<Vec<u8>> = row.try_get("identity_doc")?;
+        let doc = doc
+            .map(|doc| super::identity::decode_doc(&doc, "identity_doc"))
+            .transpose()?;
+        Ok(Some((from, doc)))
+    }
 }
 
 impl AccountTxn {

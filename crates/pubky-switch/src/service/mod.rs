@@ -216,6 +216,16 @@ fn unsigned(error: &ApiError) -> SwitchResponse {
 }
 
 /// How a store failure is answered: a temporary failure, or the account being busy.
+/// What a request checked before the account's lock: signature work that needs no lock
+/// (Switch wire 7.2 Order).
+enum Prepared {
+    /// A delivered `identity.json`, read and verified (Switch wire 7.4.5).
+    Delivery(Box<Result<peers::Delivered, ApiError>>),
+    /// A recovery upload's items, judged against the account as it stood before the lock;
+    /// `None` when they couldn't be (Switch wire 7.4.14).
+    Upload(Option<Box<upload::Prechecked>>),
+}
+
 fn store_error(error: &StoreError) -> ApiError {
     tracing::warn!(%error, "storage");
     ApiError::unavailable("7.6: a temporary failure")
@@ -480,14 +490,28 @@ impl Service {
         // A delivered identity.json is read and verified before the lock too: signature work
         // needs no account state (Switch wire 7.2 Order). Its refusal is answered under the
         // lock, after the caller's own checks, with the head an own app's refusal carries.
-        let delivered = (*call == Call::PutPeers).then(|| {
-            let other = match caller.as_ref().map(|claimed| &claimed.caller) {
-                Some(Caller::OtherApp { identity, .. }) => Some(*identity),
-                _ => None,
-            };
-            let account_key = pubky_switch_core::enc::pubky_key(&account).unwrap_or([0; 32]);
-            peers::verify_delivery(&request.body, &account_key, other.as_ref())
-        });
+        // So is a recovery upload's from an own app, which the endpoint takes under the lock
+        // only if what it was judged against is unchanged (Switch wire 7.4.14).
+        let prepared = match call {
+            Call::PutPeers => {
+                let other = match caller.as_ref().map(|claimed| &claimed.caller) {
+                    Some(Caller::OtherApp { identity, .. }) => Some(*identity),
+                    _ => None,
+                };
+                let account_key = pubky_switch_core::enc::pubky_key(&account).unwrap_or([0; 32]);
+                Some(Prepared::Delivery(Box::new(peers::verify_delivery(
+                    &request.body,
+                    &account_key,
+                    other.as_ref(),
+                ))))
+            }
+            Call::RecoveryUpload if verified.is_some() => Some(Prepared::Upload(
+                self.precheck_upload(&account, &request.body)
+                    .await
+                    .map(Box::new),
+            )),
+            _ => None,
+        };
         // The reads that run after the lock on its snapshot take their account's turn and
         // their reader first, so the lock is never held waiting for one. Only an own app's
         // request whose signature verified takes them, one place per app: the signer's is
@@ -544,7 +568,7 @@ impl Service {
             caller.as_ref(),
             verified.as_ref(),
             other.as_ref(),
-            delivered.as_ref(),
+            prepared.as_ref(),
         )
         .await
     }
@@ -732,7 +756,7 @@ impl Service {
         caller: Option<&Claimed>,
         verified: Option<&batch::VerifiedApp>,
         other: Option<&AppCert>,
-        delivered: Option<&Result<peers::Delivered, ApiError>>,
+        prepared: Option<&Prepared>,
     ) -> SwitchResponse {
         let signature = request_signature.as_ref();
         let by_signer = caller.is_some_and(|c| c.caller == Caller::Signer);
@@ -818,7 +842,7 @@ impl Service {
         };
         let (answer, marked) = match self
             .run_at_account(
-                &mut txn, &signer, request, verified, other, delivered, due, time_ms,
+                &mut txn, &signer, request, verified, other, prepared, due, time_ms,
             )
             .await
         {
@@ -1081,7 +1105,7 @@ impl Service {
         request: &SwitchRequest,
         verified: Option<&batch::VerifiedApp>,
         other: Option<&AppCert>,
-        delivered: Option<&Result<peers::Delivered, ApiError>>,
+        prepared: Option<&Prepared>,
         due: Option<u64>,
         time_ms: u64,
     ) -> Result<(Answer, bool), Refused> {
@@ -1354,6 +1378,10 @@ impl Service {
                         ));
                     }
                 };
+                let delivered = match prepared {
+                    Some(Prepared::Delivery(delivered)) => Some(&**delivered),
+                    _ => None,
+                };
                 let delivered = delivered
                     .ok_or_else(|| {
                         Refused::with_head(
@@ -1450,8 +1478,20 @@ impl Service {
                         serving,
                     ));
                 }
+                let prechecked = match prepared {
+                    Some(Prepared::Upload(prechecked)) => prechecked.as_deref(),
+                    _ => None,
+                };
                 return self
-                    .recovery_upload(txn, signer, held.as_ref(), caller, &request.body, time_ms)
+                    .recovery_upload(
+                        txn,
+                        signer,
+                        held.as_ref(),
+                        caller,
+                        &request.body,
+                        prechecked,
+                        time_ms,
+                    )
                     .await
                     .map(|answer| (answer, serving))
                     .map_err(|error| Refused::with_head(error, serving));

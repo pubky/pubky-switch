@@ -2173,3 +2173,99 @@ async fn test_upload_refusals() {
     assert_eq!(chain(&replay).await.len(), length + 3);
     replay.db.drop_database().await.expect("drop");
 }
+
+#[tokio::test]
+async fn test_upload_judged_before_the_lock_is_judged_again_when_its_state_changed() {
+    // The upload's items are judged before the account's lock. A document listing the phone
+    // as removed commits while the upload waits for the lock: the judgment made before is
+    // dropped, and the phone's proofless operation is distrusted (Switch wire 7.4.14).
+    let Some(replay) = replay().await else { return };
+    let (_, at) = recovered_with_the_wallet(&replay).await;
+    let mut txn = replay
+        .db
+        .store()
+        .begin(&alice_id())
+        .await
+        .expect("begin")
+        .expect("account");
+    let held = held(&replay).await;
+    let keys = vectors("keys.json");
+    let phone = app(&keys, "phone").clone();
+    let phone_id: [u8; 16] = hex::decode(phone["app_id_bytes_hex"].as_str().expect("hex"))
+        .expect("hex")
+        .try_into()
+        .expect("16 bytes");
+    let record: SignedDoc = serde_json::from_value(
+        named(&vectors("documents.json")["documents"], "phone app record")["signed"].clone(),
+    )
+    .expect("record");
+    let cert = pubky_switch_core::records::AppRecord::verify(&record, &alice_key().public())
+        .expect("record")
+        .cert()
+        .clone();
+    let update: SignedDoc =
+        serde_json::from_value(chain_item(&vectors("chain.json"), 8)["item"].clone()).expect("op");
+    let update = pubky_switch_core::ops::SignedOp::peek(&update).expect("op");
+    let secret = ed25519_dalek::SigningKey::from_bytes(&hex32(&phone["signing_secret_hex"]));
+    let ops = pubky_switch_core::ops::sign_batch(
+        &secret,
+        &alice_key().public(),
+        Some(phone_id),
+        1,
+        [79; 16],
+        vec![(Vec::new(), update.body().kind.clone())],
+    )
+    .expect("batch");
+    let mut body: IdentityBody = held.body().clone();
+    body.version += 1;
+    body.apps.retain(|listed| listed.app_id != phone_id);
+    body.removed.push(pubky_switch_core::records::RemovedApp {
+        app_id: phone_id,
+        distrust_from: 0,
+    });
+    let removing = IdentityDoc::sign(&alice_key(), body).expect("sign");
+    let uploaded = json!({ "records": [{ "op": ops[0].signed(), "cert": cert.signed() }] });
+    let (answer, ()) = tokio::join!(upload(&replay, &uploaded, at), async {
+        let options = replay.db.options();
+        let mut watcher = sqlx::PgConnection::connect_with(options)
+            .await
+            .expect("conn");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' \
+                 AND datname = current_database()",
+            )
+            .fetch_one(&mut watcher)
+            .await
+            .expect("count");
+            if waiting > 0 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the upload never waited"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        txn.set_identity(&pubky_switch::store::HeldIdentity {
+            doc: removing.signed().clone(),
+            proof: None,
+        })
+        .await
+        .expect("identity");
+        txn.commit().await.expect("commit");
+    });
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    let result = &json_of(&answer)["result"];
+    assert_eq!(
+        (result["records"].clone(), result["distrusted"].clone()),
+        (json!([]), json!(1))
+    );
+    replay.db.drop_database().await.expect("drop");
+}
