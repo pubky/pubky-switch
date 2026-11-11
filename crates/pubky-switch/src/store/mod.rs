@@ -59,7 +59,7 @@ pub use ops::{
     StoredRecord,
 };
 pub use peers::{HeldPeer, PeerFloor};
-pub use recovery::Recovery;
+pub use recovery::{RECOVERY_KEEPS, Recovery, recovery_clears};
 pub use snapshot::SnapshotRead;
 
 use crate::admin::{CheckFuture, ReadinessCheck};

@@ -18,10 +18,9 @@ pub struct Recovery {
 }
 
 /// The tables of an account's state for one generation at this service, which a recovery in
-/// place starts without (Switch wire 3.3): its chain, its own apps and what they wrote, its
-/// lists, invites, batches and inbox, its flagged senders, a hand-over, the counterparties'
-/// copies and their floors. What stays is on the account's row and in `kept_app_ids`,
-/// `enrollment_answers` and `retired_enrollments`.
+/// place empties (Switch wire 3.3): its chain, its own apps and what they wrote, its lists,
+/// invites, batches and inbox, its flagged senders, a hand-over, the counterparties' copies
+/// and their floors.
 const GENERATION_STATE: &[&str] = &[
     "chain_items",
     "apps",
@@ -39,6 +38,26 @@ const GENERATION_STATE: &[&str] = &[
     "peer_copies",
     "peer_floors",
 ];
+
+/// Every table with an account column that a recovery in place keeps (Switch wire 3.3,
+/// 3.7): the App IDs kept for good, the enrollment answers and the retired ones' records, and
+/// the keys owed deleting. The account's row stays too, its service time with it.
+pub const RECOVERY_KEEPS: &[&str] = &[
+    "kept_app_ids",
+    "enrollment_answers",
+    "retired_enrollments",
+    "erased_keys",
+];
+
+/// Every table with an account column that a recovery in place empties: [`GENERATION_STATE`]'s,
+/// `claim_entries` with their claims, and `pending_revoked_apps`, which joins `kept_app_ids`.
+/// A table added later with an account column must be classed here or in
+/// [`RECOVERY_KEEPS`], which a test of every such table checks.
+pub fn recovery_clears() -> Vec<&'static str> {
+    let mut tables = GENERATION_STATE.to_vec();
+    tables.extend(["claim_entries", "pending_revoked_apps"]);
+    tables
+}
 
 impl AccountTxn {
     /// The recovery the generation the account serves began with, if it began with one: a

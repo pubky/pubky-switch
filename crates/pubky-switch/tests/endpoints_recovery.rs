@@ -24,26 +24,6 @@ use serde_json::{Value, json};
 use sqlx::Connection;
 use support::*;
 
-/// The account tables a recovery in place starts without.
-const GENERATION_TABLES: &[&str] = &[
-    "chain_items",
-    "apps",
-    "receive_keys",
-    "key_bundle_parts",
-    "shared_records",
-    "claims",
-    "claim_entries",
-    "list_entries",
-    "invite_codes",
-    "batches",
-    "inbox_entries",
-    "sender_flags",
-    "handovers",
-    "app_listings",
-    "peer_copies",
-    "peer_floors",
-];
-
 /// An App ID an enrollment answered with the pending key names in its `revoked_apps`.
 const HELD_REVOKED: [u8; 16] = [7; 16];
 
@@ -406,9 +386,9 @@ async fn test_recovery_in_place_starts_afresh_under_the_pending_key() {
         .await,
         i64::try_from(before.body().apps.len()).expect("apps")
     );
-    for table in GENERATION_TABLES
-        .iter()
-        .filter(|t| !matches!(**t, "chain_items" | "app_listings"))
+    for table in pubky_switch::store::recovery_clears()
+        .into_iter()
+        .filter(|t| !matches!(*t, "chain_items" | "app_listings"))
     {
         let count = scalar_i64(
             &replay,
@@ -591,5 +571,36 @@ async fn test_recovery_in_place_waits_for_a_signer_of_the_outgoing_key() {
     assert_eq!(answer.status, 200);
     signing.close().await.expect("close");
     let replay = std::sync::Arc::into_inner(replay).expect("one owner");
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_recovery_classes_every_account_table() {
+    // Every table with an account column is either kept or emptied by a recovery in place,
+    // so a table added later fails here until it is classed (Switch wire 3.3).
+    let Some(replay) = replay().await else { return };
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    let mut tables: Vec<String> = sqlx::query_scalar(
+        "SELECT table_name::text FROM information_schema.columns \
+         WHERE table_schema = current_schema() AND column_name = 'account_id' \
+         ORDER BY table_name",
+    )
+    .fetch_all(&mut conn)
+    .await
+    .expect("tables");
+    conn.close().await.expect("close");
+    tables.dedup();
+    let keeps = pubky_switch::store::RECOVERY_KEEPS;
+    let clears = pubky_switch::store::recovery_clears();
+    for table in &tables {
+        let kept = keeps.contains(&table.as_str());
+        let cleared = clears.contains(&table.as_str());
+        assert!(kept != cleared, "{table}: kept {kept}, cleared {cleared}");
+    }
+    let mut classed: Vec<&str> = keeps.iter().copied().chain(clears).collect();
+    classed.sort_unstable();
+    assert_eq!(classed, tables, "every class names a table");
     replay.db.drop_database().await.expect("drop");
 }
