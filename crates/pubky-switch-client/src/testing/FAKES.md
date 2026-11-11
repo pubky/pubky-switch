@@ -148,8 +148,10 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   unless a test sets others (`set_enroll_limits`), and without checking the request
   signature. A switch made with `unenrolled` or `unenrolled_at` answers every other call
   with the operator's `404` until then. As at the service, the enrollment that makes the account sets its kept App IDs, and
-  every later one gets the same key and changes nothing. At a serving account, as at the
-  service, an enrollment is answered with a pending key for the next generation, the same
+  every later one gets the same key and changes nothing. As at the service, the same
+  enrollment again gets its kept answer first, with no other effect, signed with the key it
+  names. At a serving account, as at the service, a new enrollment is answered with a
+  pending key for the next generation, the same
   for every such enrollment, signed with that key, and the App IDs it names are held with
   it. Once a delivery starts a generation under the pending key, an enrollment the outgoing
   key answered is `409 conflict` again, and one the pending key answered gets its answer
@@ -166,8 +168,9 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   `import_into` carried). A first document carrying `recovery_from` starts the recovery as
   at the service: the account takes its generation, and its chain starts with the `recovery`
   transition, unless the switch was made `recovering`, which chained it already. A document
-  naming the pending key with `recovery_from` is a provider loss in place: the account
-  starts afresh under that key, keeping its service time, its enrollments and the App IDs
+  naming the pending key with `recovery_from` is a provider loss in place, refused with
+  `400` when it lists an App ID held with that key: the account starts afresh under that
+  key, keeping its service time, its enrollments and the App IDs
   to refuse, those held with the pending key among them. Unlike the service: a key change
   in place, without `recovery_from`, is answered `400`; and a staged account's generation
   change, a move's, is chained where the service answers `503`. The test call `deliver_identity` takes any document, without those

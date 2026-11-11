@@ -171,6 +171,21 @@ impl Inner {
                 json!(null),
             ));
         }
+        // The same enrollment again gets its kept answer, with no other effect, signed with the
+        // key it names: the account's, or the pending key (Switch wire 3.7, 7.4.1).
+        if let Some(answer) = self
+            .enrolled
+            .as_ref()
+            .and_then(|e| e.answers.get(&enrollment.hash()))
+            .cloned()
+        {
+            let named = answer["service_key"].as_str().map(str::to_owned);
+            let pending = self.pending.as_ref().map(|(key, _)| key.clone());
+            self.answer_key = pending.filter(|key| {
+                named.as_deref() == Some(b64(&key.verifying_key().to_bytes()).as_str())
+            });
+            return Ok((200, answer));
+        }
         // A serving account answers a pending key for the next generation, the same for every
         // such enrollment, signed with that key, and holds the App IDs they name with it
         // (Switch wire 3.7).
@@ -194,19 +209,10 @@ impl Inner {
                 answers: HashMap::new(),
                 retired: BTreeSet::new(),
             });
-            let value = match enrolled.answers.get(&enrollment.hash()) {
-                Some(answer) => answer.clone(),
-                None => {
-                    let answer = EnrollmentAnswer::new(
-                        &enrollment,
-                        key.verifying_key().to_bytes(),
-                        enrolled.limits,
-                    );
-                    let value: Value = serde_json::from_slice(&answer.to_json()?)?;
-                    enrolled.answers.insert(enrollment.hash(), value.clone());
-                    value
-                }
-            };
+            let answer =
+                EnrollmentAnswer::new(&enrollment, key.verifying_key().to_bytes(), enrolled.limits);
+            let value: Value = serde_json::from_slice(&answer.to_json()?)?;
+            enrolled.answers.insert(enrollment.hash(), value.clone());
             self.answer_key = Some(key);
             return Ok((200, value));
         }
@@ -217,9 +223,6 @@ impl Inner {
             answers: HashMap::new(),
             retired: BTreeSet::new(),
         });
-        if let Some(answer) = enrolled.answers.get(&enrollment.hash()) {
-            return Ok((200, answer.clone()));
-        }
         let service_key = self.service.verifying_key().to_bytes();
         let answer = EnrollmentAnswer::new(&enrollment, service_key, enrolled.limits);
         let value: Value = serde_json::from_slice(&answer.to_json()?)?;
@@ -424,6 +427,20 @@ impl Inner {
                         return Ok(bad(
                             ErrorCode::BadRequest,
                             "scripted: no key change in place",
+                            json!(null),
+                        ));
+                    }
+                    // As at the service: the App IDs held with the pending key are refused
+                    // from the start, so a document listing one is refused (Switch wire 3.3).
+                    if doc
+                        .body()
+                        .apps
+                        .iter()
+                        .any(|app| named.contains(&app.app_id))
+                    {
+                        return Ok(bad(
+                            ErrorCode::BadRequest,
+                            "the document lists an App ID its enrollment revoked",
                             json!(null),
                         ));
                     }
@@ -782,6 +799,7 @@ mod tests {
         switch: &ScriptedSwitch,
         identity: &pubky_switch_core::keys::IdentityKey,
         nonce: u8,
+        revoked: Option<Vec<[u8; 16]>>,
     ) -> (u16, Value) {
         let body = pubky_switch_core::records::EnrollmentBody {
             identity: identity.public(),
@@ -789,7 +807,7 @@ mod tests {
             nonce: [nonce; 16],
             policy: pubky_switch_core::records::IdentityPolicy::default(),
             identity_doc: None,
-            revoked_apps: None,
+            revoked_apps: revoked,
         };
         let enrollment = Enrollment::sign(identity, body).unwrap();
         let request = crate::transport::Request {
@@ -816,7 +834,7 @@ mod tests {
             Arc::new(crate::clock::TestClock::new(0)),
             SWITCH_ORIGIN,
         );
-        let (status, first) = enroll_at(&switch, &identity, 1);
+        let (status, first) = enroll_at(&switch, &identity, 1, None);
         assert_eq!(status, 200);
         let key = |answer: &Value| answer["service_key"].as_str().unwrap().to_owned();
         let outgoing = key(&first);
@@ -836,10 +854,22 @@ mod tests {
             switch.lock().put_identity(delivery.as_bytes()).unwrap().0,
             200
         );
-        let (status, second) = enroll_at(&switch, &identity, 2);
+        let (status, second) = enroll_at(&switch, &identity, 2, Some(vec![[7; 16]]));
         assert_eq!(status, 200);
         let pending = key(&second);
         assert_ne!(pending, outgoing, "a pending key at a serving account");
+        let signing = |switch: &ScriptedSwitch| {
+            switch
+                .lock()
+                .answer_key
+                .take()
+                .map(|key| b64(&key.verifying_key().to_bytes()))
+        };
+        assert_eq!(signing(&switch), Some(pending.clone()));
+        // The same enrollment again: its kept answer, signed with the pending key it names.
+        let (status, replayed) = enroll_at(&switch, &identity, 2, Some(vec![[7; 16]]));
+        assert_eq!((status, key(&replayed)), (200, pending.clone()));
+        assert_eq!(signing(&switch), Some(pending.clone()));
         let mut body = doc.body().clone();
         body.version = 2;
         body.generation = 2;
@@ -851,15 +881,31 @@ mod tests {
                 .try_into()
                 .unwrap(),
         );
+        // One listing an App ID held with the pending key is refused, as at the service.
+        let mut listing = body.clone();
+        listing.apps.push(pubky_switch_core::records::ListedApp {
+            app_id: [7; 16],
+            cert: [8; 32],
+        });
+        let listing = IdentityDoc::sign(&identity, listing).unwrap();
+        let delivery = json!({ "identity": listing.signed(), "prev": null }).to_string();
+        assert_eq!(
+            switch.lock().put_identity(delivery.as_bytes()).unwrap().0,
+            400
+        );
         let recovery = IdentityDoc::sign(&identity, body).unwrap();
         let delivery = json!({ "identity": recovery.signed(), "prev": null }).to_string();
         assert_eq!(
             switch.lock().put_identity(delivery.as_bytes()).unwrap().0,
             200
         );
-        let (status, retired) = enroll_at(&switch, &identity, 1);
+        assert!(
+            switch.kept_app_ids().contains(&[7; 16]),
+            "the App ID held with the pending key is kept"
+        );
+        let (status, retired) = enroll_at(&switch, &identity, 1, None);
         assert_eq!((status, retired["code"].clone()), (409, json!("conflict")));
-        let (status, again) = enroll_at(&switch, &identity, 2);
+        let (status, again) = enroll_at(&switch, &identity, 2, Some(vec![[7; 16]]));
         assert_eq!(status, 200);
         assert_eq!(key(&again), pending);
     }

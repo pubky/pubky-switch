@@ -995,10 +995,12 @@ impl ScriptedSwitch {
             let (status, body) = inner
                 .enroll(request)
                 .map_err(|error| TransportError::Other(format!("scripted switch: {error}")))?;
+            // Taken whatever happens to the answer, so it never signs a later one.
+            let key = inner.answer_key.take();
             if lose {
                 return Err(TransportError::Timeout);
             }
-            if let Some(key) = inner.answer_key.take() {
+            if let Some(key) = key {
                 return Ok(inner.respond_with(&key, request, status, &body));
             }
             return Ok(inner.respond(request, status, &body));
