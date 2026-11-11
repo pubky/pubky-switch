@@ -2166,7 +2166,7 @@ Example (bob's `shop` reading alice's directory; signed documents cut short):
     - on a SETTLED claim, beside the others;
     - on a tombstone, after reopening it.
 
-    Past `max_attempts_per_claim` it is dropped and the claim becomes divergent: N lacks evidence of an attempt, so the obligation is doubtful.
+    Past `max_attempts_per_claim` it is dropped and the claim listed in `divergent_claims`. N lacks evidence of an attempt, so the claim is made divergent while an attempt on it is open or `unknown`; with none, it takes no further attempt at N anyway, since the attempt limit refuses it (6.8).
   - **An outcome entry** for an attempt N doesn't hold first adds the attempt from its proof's claim view. Without a proof that shows the attempt, the entry is left out and counted in `refused`: neither the attempt's owner nor its members are known.
     - A `done` settles the attempt: `done`, resolved by its writer, `duplicate` if another attempt is done.
     - A `failed` or `unknown` applies to an open attempt. On an attempt with another outcome it makes the claim divergent instead. The same outcome again changes nothing.
