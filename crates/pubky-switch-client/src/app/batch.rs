@@ -294,12 +294,13 @@ impl App {
     /// again once they are answered. Batches an earlier build kept count toward the cap but
     /// were kept without it, so they may already be past it; an
     /// `attempt` while the app may not attempt ([`App::may_attempt`]); the switch's refusal
-    /// for good, such as `409 conflict` with its `current`, after which nothing is kept; any
-    /// other failure
-    /// (the network, `429`, `503`, an answer that doesn't verify), after which the batch is
-    /// kept and sent again, the same bytes, by the next call that writes. A batch kept from
-    /// an earlier call that still can't be sent fails the call the same way, before the new
-    /// batch is signed. [`AppError::InvalidData`] when an attempt's proof shows another
+    /// for good, such as `409 conflict` with its `current`, after which nothing is kept;
+    /// [`AppError::Kept`] with the batch's ID for any other failure of the network or the
+    /// switch (the network, `429`, `503`, an answer that doesn't verify): the batch is kept
+    /// and sent again, the same bytes, by the next call that writes. A batch kept from an
+    /// earlier call that still can't be sent fails the call with its bare error
+    /// ([`AppError::Transport`], [`AppError::Switch`]) before the new batch is signed, so
+    /// nothing of this call is kept. [`AppError::InvalidData`] when an attempt's proof shows another
     /// state: the batch was applied and its outcome committed, and the attempt is written
     /// `failed`; a rollback for an attempt stamped at or after its deadline.
     pub async fn submit_batch(&mut self, batch: OpBatch) -> Result<Submitted, AppError> {
@@ -503,7 +504,11 @@ impl App {
         let mut tx = self.tx()?;
         tx.put(&pending_key(&id), &pending)?;
         self.commit(tx).await?;
-        self.run_pending(&id, &pending, &signed, false).await
+        // From here the batch is kept: a failure that leaves it so says it does, so the
+        // caller can tell its own batch kept from an earlier one that couldn't be sent.
+        self.run_pending(&id, &pending, &signed, false)
+            .await
+            .map_err(|error| AppError::kept_or(id, error))
     }
 
     /// After `409 stale_epoch` on `batch` (Switch spec 3.5, 6.4): the switch refused it for

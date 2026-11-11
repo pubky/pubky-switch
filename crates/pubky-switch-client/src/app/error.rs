@@ -174,14 +174,68 @@ pub enum AppError {
     /// A rule of the app layer refused the call.
     #[error("refused: {0}")]
     Refused(Refusal),
+    /// The call's own batch was signed and kept, and couldn't be settled now: the network
+    /// failed, or the switch answered `429`, `503`, `410 moved`, `401 stale_timestamp` or
+    /// `409 identity_needed`, or an answer didn't verify (`error`, an
+    /// [`AppError::Transport`] or an [`AppError::Switch`]). The app sends it again, the
+    /// same bytes, before its next write and at the start of its next read
+    /// ([`super::App::submit_batch`], [`super::App::receive`]), and the switch answers a
+    /// batch it applied with its original proofs (Switch wire 6.4 step 5), so the caller
+    /// doesn't build it again: what the batch settles is committed when that answer comes.
+    ///
+    /// A call that fails with a bare [`AppError::Transport`] or [`AppError::Switch`] kept
+    /// nothing of its own: a batch kept from an earlier call couldn't be sent, and the new
+    /// one wasn't signed. [`AppError::code`] and [`AppError::unkept`] see through this
+    /// variant.
+    #[error("the batch is kept, to be sent again: {error}")]
+    Kept {
+        /// The batch's ID, under which it is kept.
+        batch_id: [u8; 16],
+        /// Why it couldn't be settled now.
+        error: Box<AppError>,
+    },
 }
 
 impl AppError {
-    /// The error code of an answer of the switch.
+    /// The error code of an answer of the switch, also of one that left the call's batch
+    /// kept ([`AppError::Kept`]).
     pub fn code(&self) -> Option<ErrorCode> {
-        match self {
+        match self.unkept() {
             AppError::Switch(error) => error.code(),
             _ => None,
+        }
+    }
+
+    /// The error, without the [`AppError::Kept`] around it.
+    pub fn unkept(&self) -> &AppError {
+        match self {
+            AppError::Kept { error, .. } => error,
+            other => other,
+        }
+    }
+
+    /// The ID of the call's own batch, when the call kept it ([`AppError::Kept`]).
+    pub fn kept_batch(&self) -> Option<[u8; 16]> {
+        match self {
+            AppError::Kept { batch_id, .. } => Some(*batch_id),
+            _ => None,
+        }
+    }
+
+    /// `error` after a send of the call's own batch `batch_id` that didn't settle it:
+    /// [`AppError::Kept`] when the batch stays kept, after a failure of the network or the
+    /// switch that may pass with the same bytes later ([`refused_for_good`] gives `None`);
+    /// as it is otherwise: a refusal for good dropped the batch, and an alarm or a store
+    /// failure is reported as itself.
+    pub(crate) fn kept_or(batch_id: [u8; 16], error: AppError) -> AppError {
+        match &error {
+            AppError::Transport(_) | AppError::Switch(_) if refused_for_good(&error).is_none() => {
+                AppError::Kept {
+                    batch_id,
+                    error: Box::new(error),
+                }
+            }
+            _ => error,
         }
     }
 }

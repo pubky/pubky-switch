@@ -589,7 +589,7 @@ impl App {
     /// to a provider loss declared because that service is gone (Switch spec 12.5 "Abort").
     /// Only a failed call is looked into; a failed read changes nothing.
     pub(crate) async fn look_for_newer_doc(&mut self, error: &AppError) {
-        if !matches!(error, AppError::Switch(_) | AppError::Transport(_)) || self.reload {
+        if !matches!(error.unkept(), AppError::Switch(_) | AppError::Transport(_)) || self.reload {
             return;
         }
         let identity = self.state.meta.identity;

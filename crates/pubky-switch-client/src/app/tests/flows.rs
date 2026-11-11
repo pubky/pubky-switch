@@ -1473,13 +1473,99 @@ async fn write_offline(w: &World, app: &mut App) {
         path: "ops".into(),
         after: 0,
     });
-    let result = app.submit_batch(conversation(w.bob.public())).await;
-    assert!(matches!(result, Err(AppError::Transport(_))), "{result:?}");
+    let error = app
+        .submit_batch(conversation(w.bob.public()))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error.unkept(), AppError::Transport(_)),
+        "{error:?}"
+    );
     w.switch.lock().faults.clear();
     let kept = app.kept_batches().await.unwrap();
     assert_eq!(kept.len(), 1, "a network failure keeps the batch");
+    assert_eq!(
+        error.kept_batch(),
+        Some(kept[0].0),
+        "the error names it kept"
+    );
     assert_eq!(kept[0].1.kept_ms, None, "never sent, so not stamped");
     assert_eq!(conversations_for(w, w.bob.public()), 0);
+}
+
+#[tokio::test]
+async fn test_submit_batch_lost_answer_says_the_batch_is_kept() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
+    let error = app
+        .submit_batch(conversation(w.bob.public()))
+        .await
+        .unwrap_err();
+    let kept = app.kept_batches().await.unwrap();
+    assert_eq!(kept.len(), 1);
+    let AppError::Kept {
+        batch_id,
+        error: inner,
+    } = &error
+    else {
+        panic!("the call's own batch is kept: {error:?}");
+    };
+    assert_eq!(*batch_id, kept[0].0);
+    assert!(matches!(**inner, AppError::Transport(_)), "{inner:?}");
+    // A `503` answer keeps it the same way, and its code shows through.
+    let mut app = w.join("phone").await;
+    w.switch.fail_next(Fault::Error {
+        path: "ops".into(),
+        code: ErrorCode::Unavailable,
+        current: json!(null),
+    });
+    let error = app.submit_batch(conversation([7; 32])).await.unwrap_err();
+    assert_eq!(error.code(), Some(ErrorCode::Unavailable));
+    assert_eq!(
+        error.kept_batch(),
+        Some(app.kept_batches().await.unwrap()[0].0)
+    );
+}
+
+#[tokio::test]
+async fn test_submit_batch_behind_an_unsent_kept_batch_keeps_nothing_of_its_own() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    w.switch.fail_next(Fault::Unreachable {
+        path: "ops".into(),
+        after: 0,
+    });
+    let first = app
+        .submit_batch(conversation(w.bob.public()))
+        .await
+        .unwrap_err();
+    let kept = app.kept_batches().await.unwrap();
+    assert_eq!(first.kept_batch(), Some(kept[0].0));
+    // The kept batch still can't be sent: the next call fails before its own batch is
+    // signed, with the bare error, and keeps nothing of its own.
+    w.switch.fail_next(Fault::Unreachable {
+        path: "ops".into(),
+        after: 0,
+    });
+    let second = app.submit_batch(conversation([7; 32])).await.unwrap_err();
+    assert!(matches!(second, AppError::Transport(_)), "{second:?}");
+    assert_eq!(second.kept_batch(), None);
+    let ids = |kept: &[([u8; 16], crate::app::batch::PendingBatch)]| {
+        kept.iter().map(|(id, _)| *id).collect::<Vec<_>>()
+    };
+    assert_eq!(ids(&app.kept_batches().await.unwrap()), ids(&kept));
+    // A refusal for good keeps nothing either, and says so.
+    let mut phone = w.join("phone").await;
+    w.switch.fail_next(Fault::Error {
+        path: "ops".into(),
+        code: ErrorCode::Conflict,
+        current: json!(null),
+    });
+    let refused = phone.submit_batch(conversation([8; 32])).await.unwrap_err();
+    assert_eq!(refused.code(), Some(ErrorCode::Conflict));
+    assert_eq!(refused.kept_batch(), None);
+    assert!(phone.kept_batches().await.unwrap().is_empty());
 }
 
 #[tokio::test]
