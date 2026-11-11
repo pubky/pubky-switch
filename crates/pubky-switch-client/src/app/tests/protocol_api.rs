@@ -2528,3 +2528,244 @@ async fn test_app_call_futures_are_boxed_at_the_boundary() {
     let queue = std::mem::size_of_val(&app.queue(message));
     assert!(queue <= 512, "queue: {queue} bytes");
 }
+
+#[tokio::test]
+async fn test_scripted_feed_visibility_by_kind_and_currency() {
+    // Switch wire 7.5: for each kind of chain item, readers shown it in full and readers
+    // shown its stub; then items whose document is no longer current, a stub to their
+    // readers too, the writer included (6.8 "Tombstones", 3.8).
+    use pubky_switch_core::claims::Basis;
+    use pubky_switch_core::records::{
+        AppRecord, AppRecordBody, ListedApp, RenewedCert, seal_bundle_parts,
+    };
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let mut wallet = p.join(&p.alice, "wallet", &protocol).await;
+    let mut shop = p.join(&p.bob, "shop", &protocol).await;
+    let switch = Arc::clone(p.bob.switch());
+    let bob = p.bob.identity().clone();
+    let register = |name: &str, scopes: &[&str], permissions: &[Permission]| {
+        let keys = bob.app_keys(name);
+        let spec = AppSpec::new(scopes).with_permissions(permissions);
+        let cert = p.bob.register_app(&keys, &spec).unwrap();
+        (keys, cert, switch.seq())
+    };
+    let (_, plain_cert, _) = register("plain", &["scope-a"], &[]);
+    let (claims_keys, claims_cert, claims_put) =
+        register("claims", &["scope-b"], &[Permission::ClaimsRead]);
+    let (_, lists_cert, _) = register("lists", &["scope-b"], &[Permission::ListsRead]);
+    let (adder_keys, adder_cert, _) =
+        register("adder", &["scope-b"], &[Permission::ConversationAdd]);
+    let (renewing_keys, renewing_cert, _) = register("renewing", &["scope-b"], &[]);
+    let (plain, claims, lists, adder) = (
+        plain_cert.app_id(),
+        claims_cert.app_id(),
+        lists_cert.app_id(),
+        adder_cert.app_id(),
+    );
+    // (what, seq, item type, shown in full to, shown as a stub to)
+    let mut rows: Vec<(&str, u64, &str, Vec<[u8; 16]>, Vec<[u8; 16]>)> = Vec::new();
+    // A claim entry: `claims.read`.
+    let attempt = |key: [u8; 32]| ClaimOp::attempt(key, 0, ATTEMPT, 3600, None);
+    shop.write_claim(attempt(CLAIM), vec![], ObligationDeadline::NoDeadline)
+        .await
+        .unwrap();
+    rows.push(("claim", switch.seq(), "op", vec![claims], vec![plain]));
+    // A record write: the read scope (`scope-a`), not another scope.
+    shop.put_record(&inbox(), &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    rows.push((
+        "record.put",
+        switch.seq(),
+        "op",
+        vec![plain, shop.app_id()],
+        vec![claims],
+    ));
+    // An invite code: `lists.read` or `conversation.add`, each alone.
+    let code = shop
+        .register_invite_code(START + DAY_MS, 1, json!({}))
+        .await
+        .unwrap();
+    rows.push((
+        "invite_code.put",
+        switch.seq(),
+        "op",
+        vec![lists, adder],
+        vec![plain],
+    ));
+    // The service's conversation entry for a sender the code admitted: `lists.read` only.
+    let before = switch.seq();
+    let mut note = Pair::note(&p.bob, "hello");
+    note.invite_code = Some(code.code);
+    let (_, delivery) = wallet.send(note).await.unwrap();
+    assert!(
+        matches!(delivery, Delivery::Accepted { .. }),
+        "{delivery:?}"
+    );
+    let added = switch
+        .shown(lists)
+        .into_iter()
+        .find(|i| i["seq"].as_u64().unwrap() > before && i["item_type"] == "service")
+        .expect("the conversation.add")["seq"]
+        .as_u64()
+        .unwrap();
+    rows.push((
+        "conversation.add",
+        added,
+        "service",
+        vec![lists],
+        vec![adder],
+    ));
+    // A key bundle part: its target only.
+    let part = |cert: &AppCert| {
+        let sealed = seal_bundle_parts(bob.key(), cert, 1, 1, &|s: &str| s == "scope-a");
+        OpKind::KeyBundlePut(KeyBundlePut {
+            target_app_id: cert.app_id(),
+            bundle: sealed.unwrap().remove(0).bundle,
+            first_epoch: 1,
+            last_epoch: 1,
+        })
+    };
+    switch.signer_op(part(&plain_cert)).unwrap();
+    let replaced_part = switch.seq();
+    switch.signer_op(part(&plain_cert)).unwrap();
+    rows.push((
+        "key_bundle.put",
+        switch.seq(),
+        "op",
+        vec![plain],
+        vec![claims],
+    ));
+    rows.push((
+        "key_bundle.put replaced",
+        replaced_part,
+        "op",
+        vec![],
+        vec![plain],
+    ));
+    // A superseded record write, to its writer too.
+    let other = RecordTarget::new(items(), b"other");
+    shop.put_record(&other, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    let superseded = switch.seq();
+    shop.put_record(&other, &value(&["a", "b"]), vec![])
+        .await
+        .unwrap();
+    rows.push((
+        "record.put superseded",
+        superseded,
+        "op",
+        vec![],
+        vec![plain, shop.app_id()],
+    ));
+    // A compacted claim's entries.
+    let compacted = [9; 32];
+    shop.write_claim(attempt(compacted), vec![], ObligationDeadline::NoDeadline)
+        .await
+        .unwrap();
+    let compacted_attempt = switch.seq();
+    let condition = shop.claim_condition(&compacted).await.unwrap();
+    let done = ClaimOp::done(compacted, 1, ATTEMPT, Basis::Owner, None).unwrap();
+    shop.write_claim(done, vec![condition], ObligationDeadline::NoDeadline)
+        .await
+        .unwrap();
+    rows.push((
+        "claim compacted",
+        compacted_attempt,
+        "op",
+        vec![],
+        vec![claims],
+    ));
+    rows.push((
+        "claim compacted, its last",
+        switch.seq(),
+        "op",
+        vec![],
+        vec![claims],
+    ));
+    // An app record: every app while it is held; a superseded one is a stub.
+    p.clock.advance_ms(1000);
+    let newer = AppRecord::sign(
+        &claims_keys,
+        AppRecordBody::new(&claims_cert, Vec::new(), p.clock.now_ms()),
+    )
+    .unwrap();
+    let record = newer.signed().clone();
+    switch
+        .app_op(&claims_keys, OpKind::AppPut { record })
+        .unwrap();
+    rows.push(("app.put", switch.seq(), "op", vec![plain], vec![]));
+    rows.push(("app.put superseded", claims_put, "op", vec![], vec![plain]));
+    // A renewed certificate: every app while stored; one the app's record carries is a stub.
+    let renew = |keys: &AppKeys| {
+        let spec = AppSpec::new(&["scope-b"]);
+        let renewed = issue_cert(bob.key(), keys, &spec, p.clock.now_ms()).unwrap();
+        switch
+            .signer_op(OpKind::CertPut {
+                target_app_id: renewed.app_id(),
+                cert: renewed.signed().clone(),
+            })
+            .unwrap();
+        renewed
+    };
+    renew(&adder_keys);
+    rows.push(("cert.put", switch.seq(), "op", vec![plain], vec![]));
+    let renewed = renew(&renewing_keys);
+    let carried = switch.seq();
+    let renewing = renewing_cert.app_id();
+    p.bob
+        .next_doc(|body| {
+            body.apps.retain(|a| a.app_id != renewing);
+            body.apps.push(ListedApp {
+                app_id: renewing,
+                cert: renewed.hash(),
+            });
+            body.renewed.push(RenewedCert {
+                app_id: renewing,
+                cert: renewing_cert.hash(),
+                until: None,
+            });
+        })
+        .unwrap();
+    p.clock.advance_ms(1000);
+    let record = AppRecord::sign(
+        &renewing_keys,
+        AppRecordBody::new(&renewed, Vec::new(), p.clock.now_ms()),
+    )
+    .unwrap();
+    switch
+        .app_op(
+            &renewing_keys,
+            OpKind::AppPut {
+                record: record.signed().clone(),
+            },
+        )
+        .unwrap();
+    rows.push((
+        "cert.put carried by the record",
+        carried,
+        "op",
+        vec![],
+        vec![plain],
+    ));
+    for (what, seq, item_type, full, stub) in &rows {
+        let shown = |app: &[u8; 16]| {
+            switch
+                .shown(*app)
+                .into_iter()
+                .find(|item| item["seq"] == *seq)
+                .unwrap_or_else(|| panic!("{what}: no item at {seq}"))
+        };
+        for app in full {
+            let item = shown(app);
+            assert_eq!(item["type"], "chain", "{what}, in full: {item}");
+            assert_eq!(item["item_type"], *item_type, "{what}: {item}");
+        }
+        for app in stub {
+            let item = shown(app);
+            assert_eq!(item["type"], "stub", "{what}, a stub: {item}");
+        }
+    }
+}
