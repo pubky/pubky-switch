@@ -319,6 +319,12 @@ pub(crate) struct Inner {
     pub(crate) stamped_ms: u64,
     /// The stored signer hand-over (Switch wire 7.4.17): its target and the `PUT` body.
     pub(crate) handover: Option<([u8; 16], Value)>,
+    /// The pending key a serving account's enrollments were answered with, for the next
+    /// generation, and the App IDs those enrollments named (Switch wire 3.7).
+    pub(crate) pending: Option<(SigningKey, Vec<[u8; 16]>)>,
+    /// The key the answer being built is signed with, when it isn't the account's: an
+    /// enrollment answered with the pending key (Switch wire 7.4.1).
+    pub(crate) answer_key: Option<SigningKey>,
 }
 
 impl Inner {
@@ -385,6 +391,8 @@ impl Inner {
             enroll_limits: pubky_switch_core::records::Limits::default(),
             listed_at_epoch: BTreeMap::new(),
             handover: None,
+            pending: None,
+            answer_key: None,
         }
     }
 }
@@ -984,6 +992,9 @@ impl ScriptedSwitch {
                 .map_err(|error| TransportError::Other(format!("scripted switch: {error}")))?;
             if lose {
                 return Err(TransportError::Timeout);
+            }
+            if let Some(key) = inner.answer_key.take() {
+                return Ok(inner.respond_with(&key, request, status, &body));
             }
             return Ok(inner.respond(request, status, &body));
         }

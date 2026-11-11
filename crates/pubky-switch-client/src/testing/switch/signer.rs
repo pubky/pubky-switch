@@ -5,6 +5,8 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
+use ed25519_dalek::SigningKey;
+
 use pubky_switch_core::chain::{ItemType, ProofState, ServiceTransition, item_hash};
 use pubky_switch_core::claims::Outcome;
 use pubky_switch_core::enc::{b64, zbase32_encode};
@@ -153,14 +155,43 @@ impl Inner {
             Ok(enrollment) => enrollment,
             Err(_) => return Ok(bad(ErrorCode::BadRequest, "bad enrollment", json!(null))),
         };
+        // A serving account answers a pending key for the next generation, the same for every
+        // such enrollment, signed with that key, and holds the App IDs they name with it
+        // (Switch wire 3.7).
         if self.enrolled.is_some() && self.doc.is_some() && !self.staged {
-            // A serving account answers a pending key for the next generation (Switch wire
-            // 3.7); the scripted switch doesn't change generations this way.
-            return Ok(bad(
-                ErrorCode::BadRequest,
-                "scripted: no pending key at a serving account",
-                json!(null),
-            ));
+            let generation = self.tip.generation;
+            let (pending, named) = self.pending.get_or_insert_with(|| {
+                let mut seed = self.service.to_bytes();
+                seed[0] ^= 0xa5;
+                seed[31] = seed[31].wrapping_add(u8::try_from(generation % 251).unwrap_or(0));
+                (SigningKey::from_bytes(&seed), Vec::new())
+            });
+            for app in enrollment.revoked_apps() {
+                if !named.contains(app) {
+                    named.push(*app);
+                }
+            }
+            let key = pending.clone();
+            let limits = self.enroll_limits;
+            let enrolled = self.enrolled.get_or_insert_with(|| Enrolled {
+                limits,
+                answers: HashMap::new(),
+            });
+            let value = match enrolled.answers.get(&enrollment.hash()) {
+                Some(answer) => answer.clone(),
+                None => {
+                    let answer = EnrollmentAnswer::new(
+                        &enrollment,
+                        key.verifying_key().to_bytes(),
+                        enrolled.limits,
+                    );
+                    let value: Value = serde_json::from_slice(&answer.to_json()?)?;
+                    enrolled.answers.insert(enrollment.hash(), value.clone());
+                    value
+                }
+            };
+            self.answer_key = Some(key);
+            return Ok((200, value));
         }
         let creating = self.enrolled.is_none();
         let limits = self.enroll_limits;
@@ -183,6 +214,41 @@ impl Inner {
             self.kept_at = self.now();
         }
         Ok((200, value))
+    }
+
+    /// Start the account afresh under `key` at `generation`, as a recovery in place does:
+    /// its service time, its enrollments and the App IDs to refuse stay, `named` among them,
+    /// and everything else goes (Switch spec 12.6 step 1, wire 3.3).
+    fn start_afresh(&mut self, key: SigningKey, named: &[[u8; 16]], generation: u64) {
+        let tip = pubky_switch_core::chain::ChainTip {
+            generation,
+            seq: 0,
+            chain_hash: pubky_switch_core::chain::ZERO_HASH,
+        };
+        let mut fresh = Inner::fresh(
+            super::clone_key(&self.identity),
+            key,
+            Arc::clone(&self.clock),
+            tip,
+        );
+        fresh.stamped_ms = self.stamped_ms;
+        fresh.origin = self.origin.clone();
+        fresh.enrolled = self.enrolled.take();
+        fresh.enroll_limits = self.enroll_limits;
+        fresh.faults = std::mem::take(&mut self.faults);
+        fresh.kept_at = self.kept_at;
+        fresh.kept_app_ids = std::mem::take(&mut self.kept_app_ids);
+        for (id, app) in &self.apps {
+            if app.departed && !fresh.kept_app_ids.contains(id) {
+                fresh.kept_app_ids.push(*id);
+            }
+        }
+        for id in named {
+            if !fresh.kept_app_ids.contains(id) {
+                fresh.kept_app_ids.push(*id);
+            }
+        }
+        *self = fresh;
     }
 
     /// Chain a delivered `identity.json` and hold it; returns the delivery's transition
@@ -302,7 +368,10 @@ impl Inner {
             app_limit,
             staged: self.staged,
             origin: &self.origin,
-            pending_key: None,
+            pending_key: self
+                .pending
+                .as_ref()
+                .map(|(key, _)| key.verifying_key().to_bytes()),
             kept_app_ids: &kept,
             kept_proofs: KeptProofs {
                 records: &records,
@@ -311,6 +380,22 @@ impl Inner {
         };
         match check_delivery(&view, &doc, delivery.prev.as_ref()) {
             Ok(Delivery::New(_)) => {
+                // A document naming the pending key starts the next generation in place: a
+                // recovery there starts the account afresh, keeping only its service time and
+                // the App IDs to refuse (Switch spec 12.6 step 1, wire 3.3). A key change in
+                // place isn't scripted.
+                if let Some((pending, named)) = self.pending.clone()
+                    && doc.inbox().service_key == pending.verifying_key().to_bytes()
+                {
+                    if doc.body().recovery_from.is_none() {
+                        return Ok(bad(
+                            ErrorCode::BadRequest,
+                            "scripted: no key change in place",
+                            json!(null),
+                        ));
+                    }
+                    self.start_afresh(pending, &named, doc.generation());
+                }
                 // A first document that starts a recovery, as at the service: the account
                 // takes its generation, and its chain starts with the `recovery` transition
                 // (Switch wire 3.3, 7.4.2), unless the switch was made recovering, which
