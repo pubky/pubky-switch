@@ -5178,4 +5178,14 @@ async fn test_records_unopenable_with_its_key_held_is_tried_once() {
     }
     wallet.fetch_key_bundle().await.unwrap();
     assert!(flagged_rules(&wallet.take_events()).is_empty());
+    // Nor at a later key's arrival: it won't open.
+    s.w.next_doc(|body| body.data_epoch = 3);
+    store_parts_for(&s, &wallet.cert().clone());
+    let report = wallet.receive(None).await.unwrap();
+    assert!(wallet.scope_key(3, "scope-a").is_some());
+    assert!(
+        flagged_rules(&report.events).is_empty(),
+        "{:?}",
+        report.events
+    );
 }
