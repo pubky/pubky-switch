@@ -214,6 +214,16 @@ pub(crate) struct SignerState {
     /// one restored from a backup written mid-recovery.
     #[serde(default)]
     pub(crate) lost_generation: Option<u64>,
+    /// The Homeserver's `identity.json` was missing or didn't verify when the recovery was
+    /// declared, and the records explained it, or the user confirmed them anyway (Switch spec
+    /// 12.6 step 1): a backup missing or unreadable is then written over without that copy.
+    #[serde(default)]
+    pub(crate) homeserver_copy_waived: bool,
+    /// The recovery's version is delivered and lists apps whose revocation is pending: they
+    /// are revoked at the new service before the version is published, which is how apps
+    /// find the service (Switch spec 12.6 step 1).
+    #[serde(default)]
+    pub(crate) revoke_at_service: bool,
     /// The staged admission a recovery started is the signer's to end (Switch spec 12.6 step
     /// 2): none of the listed apps holds `lists.manage`, or the user asked. `POST
     /// /recovery/admission` is owed, sent again at every run, after publication, until `GET
@@ -396,6 +406,8 @@ impl SignerState {
             recovering: false,
             recovery_base: None,
             lost_generation: None,
+            homeserver_copy_waived: false,
+            revoke_at_service: false,
             admission_owed: false,
         }
     }

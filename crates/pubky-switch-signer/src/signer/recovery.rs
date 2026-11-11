@@ -34,7 +34,7 @@
 //! another install signs, and during a hand-over or a take-over.
 
 use pubky_switch_core::records::{
-    CLOCK_TOLERANCE_MS, Enrollment, EnrollmentBody, IdentityBody, IdentityDoc, Inbox,
+    CLOCK_TOLERANCE_MS, Enrollment, EnrollmentBody, IDENTITY_PATH, IdentityBody, IdentityDoc, Inbox,
 };
 use pubky_switch_core::scopes::Permission;
 use pubky_switch_core::sig::SignedDoc;
@@ -65,12 +65,41 @@ impl Signer {
     /// `identity.json` shows one of them; [`Refusal::FlowInProgress`] during a first
     /// enrollment or a take-over; [`Refusal::IdentityTooLarge`] for a version naming
     /// `origin` that the cap can't take; an origin that isn't a switch origin; otherwise as
-    /// [`Signer::resume`], with the recovery kept and resumed there.
+    /// [`Signer::resume`], with the recovery kept and resumed there. Declared again at the
+    /// service its version is in flight to, the recovery goes on there, as
+    /// [`Signer::resume`] would. [`Refusal::HomeserverCopyMissing`] or
+    /// [`Refusal::HomeserverCopyUnreadable`] when the Homeserver's `identity.json` is
+    /// missing, where the records don't explain it, or doesn't verify:
+    /// [`Signer::declare_provider_loss_confirming_records`] is the way past either.
     pub async fn declare_provider_loss(
         &mut self,
         origin: &str,
         _confirmed: UserConfirmed,
     ) -> Result<IdentityDoc> {
+        self.declare_loss(origin, false).await
+    }
+
+    /// [`Signer::declare_provider_loss`], once the user has also confirmed that no other
+    /// install signs for the identity, when the Homeserver's `identity.json` is missing or
+    /// doesn't verify ([`Refusal::HomeserverCopyMissing`],
+    /// [`Refusal::HomeserverCopyUnreadable`]): that copy is what names the signer while the
+    /// lost service can't be asked (Switch spec 12.6 step 1, 4.3), so without it the user's
+    /// word stands in. A copy that verifies is judged as for every declaration.
+    ///
+    /// # Errors
+    ///
+    /// As [`Signer::declare_provider_loss`], but for those two refusals.
+    pub async fn declare_provider_loss_confirming_records(
+        &mut self,
+        origin: &str,
+        _confirmed: UserConfirmed,
+    ) -> Result<IdentityDoc> {
+        self.declare_loss(origin, true).await
+    }
+
+    /// The declaration (the module's doc), `records_confirmed` when the user confirmed this
+    /// install's records stand without the Homeserver's copy.
+    async fn declare_loss(&mut self, origin: &str, records_confirmed: bool) -> Result<IdentityDoc> {
         self.refresh().await?;
         let newest = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
         // Who may declare it: the recovery's gate, before anything is read or signed.
@@ -83,6 +112,17 @@ impl Signer {
         ) {
             return Err(Refusal::FlowInProgress.into());
         }
+        // Declared again where the recovery already goes: its enrollment or its version, sent
+        // there with the same bytes, goes on. A new enrollment there could find the first
+        // version taken, and a second at the same generation refused for good.
+        if self.recovery_goes_to(origin) {
+            self.resume().await?;
+            self.complete_listed_revocations().await?;
+            return self
+                .state
+                .newest_doc()?
+                .ok_or_else(|| SignerError::Records("the recovery's version is gone".into()));
+        }
         // Taken before the checks below, which may end a flow in progress.
         let base = self.recovery_base()?;
         // The copies the lost service can't be asked about: the backup and the Homeserver's
@@ -90,10 +130,9 @@ impl Signer {
         // spec 4.3). Another body there at the mark is an alarm, which the recovery passes,
         // and its version waits for the user to clear it before it is published.
         self.check_backup_copy().await?;
-        match self.judge_homeserver(&newest).await {
-            Ok(_) | Err(SignerError::Alarm(_)) => {}
-            Err(error) => return Err(error),
-        }
+        let waived = self
+            .check_homeserver_copy(&newest, records_confirmed)
+            .await?;
         // The App IDs to refuse from the start, but those the version still lists: a
         // revocation not signed into a version yet is completed at the service once it
         // took the recovery's version, which can't also rotate (Switch spec 12.6 step 1).
@@ -138,6 +177,7 @@ impl Signer {
         state.recovering = true;
         state.recovery_base = Some(base.signed().clone());
         state.lost_generation = Some(lost);
+        state.homeserver_copy_waived = waived;
         let flow = Flow::Recover {
             origin: origin.to_owned(),
             enrollment: enrollment.signed().clone(),
@@ -174,6 +214,64 @@ impl Signer {
         state.admission_owed = true;
         self.commit(state, None).await?;
         self.end_owed_admission().await
+    }
+
+    /// Whether the recovery in progress goes to the service at `origin`: its enrollment is
+    /// unanswered there, or its version in flight there.
+    fn recovery_goes_to(&self, origin: &str) -> bool {
+        if !self.state.recovering {
+            return false;
+        }
+        match &self.flow {
+            Some(Flow::Recover { origin: going, .. }) => going == origin,
+            Some(Flow::Deliver { .. }) => self
+                .state
+                .service
+                .as_ref()
+                .is_some_and(|service| service.origin == origin),
+            _ => false,
+        }
+    }
+
+    /// Judge the Homeserver's `identity.json` before a recovery is signed (Switch spec 12.6
+    /// step 1, 4.3): a copy that verifies, as [`Signer::judge_homeserver`] does, an alarm
+    /// passing. One that is missing passes when the records explain it: an erasure, done or
+    /// in progress, deleted it, or the mark was never published. Otherwise, and for one that
+    /// doesn't verify, only with the user's confirmation `records_confirmed`. Returns whether
+    /// the copy was waived so.
+    async fn check_homeserver_copy(
+        &mut self,
+        newest: &IdentityDoc,
+        records_confirmed: bool,
+    ) -> Result<bool> {
+        let held = self
+            .env
+            .homeserver
+            .get(IDENTITY_PATH)
+            .await
+            .map_err(SignerError::Homeserver)?;
+        let Some(bytes) = held else {
+            let explained = self.state.erased
+                || matches!(self.flow, Some(Flow::Erase { .. }))
+                || self.state.newest.as_ref().is_some_and(|n| !n.published);
+            if explained || records_confirmed {
+                return Ok(true);
+            }
+            return Err(Refusal::HomeserverCopyMissing.into());
+        };
+        let verifies = serde_json::from_slice::<SignedDoc>(&bytes)
+            .ok()
+            .is_some_and(|signed| IdentityDoc::verify(&signed, &self.state.identity).is_ok());
+        if !verifies {
+            if records_confirmed {
+                return Ok(true);
+            }
+            return Err(Refusal::HomeserverCopyUnreadable.into());
+        }
+        match self.judge_homeserver(newest).await {
+            Ok(_) | Err(SignerError::Alarm(_)) => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 
     /// The document the recovery builds on: the one kept for a recovery declared already,
@@ -323,6 +421,11 @@ impl Signer {
         state.recovering = false;
         state.recovery_base = None;
         state.lost_generation = None;
+        state.homeserver_copy_waived = false;
+        state.revoke_at_service = state
+            .revoking
+            .iter()
+            .any(|r| doc.listed_cert(&r.app_id).is_some());
         state.switch_unconfirmed = false;
         for revoking in &mut state.revoking {
             revoking.taken = false;

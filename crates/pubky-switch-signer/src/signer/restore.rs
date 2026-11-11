@@ -75,7 +75,11 @@ impl Signer {
     /// Restore this install's records from the signer backup on the Homeserver, in place:
     /// when they are behind a newer version of its own ([`Alert::RecordsBehind`]), or when
     /// another install signs and the user has this one take over (Switch spec 12.8, Switch
-    /// wire 3.13). Returns the version this install delivers as the signer.
+    /// wire 3.13). Returns the version this install delivers as the signer. A backup written
+    /// mid-recovery, holding the recovery's version, restores as that recovery in progress
+    /// (Switch spec 12.6 step 1): its version is delivered first, and when the service it
+    /// names doesn't take it, the restore returns it, the recovery to be resumed or declared
+    /// again ([`crate::SignerStatus::Recovering`], [`crate::SignerStatus::RecoveryRefused`]).
     ///
     /// # Errors
     ///
@@ -140,12 +144,16 @@ impl Signer {
         {
             Ok(answer) => answer,
             // A backup written mid-recovery names the service the recovery went to, which
-            // holds a staged account and no document until it takes that version: it holds
-            // no copy, so the version is delivered first (Switch spec 12.6 step 1, wire 7.3).
-            Err(ClientError::Switch {
-                code: ErrorCode::Staged,
-                ..
-            }) if is_recovery(&doc) => AppsAnswer {
+            // holds a staged account and no document until it takes that version, or which
+            // can't be reached: it shows no copy, so the version is delivered first, and the
+            // recovery is in progress again (Switch spec 12.6 step 1, wire 3.13, 7.3).
+            Err(
+                ClientError::Switch {
+                    code: ErrorCode::Staged,
+                    ..
+                }
+                | ClientError::Transport(_),
+            ) if is_recovery(&doc) => AppsAnswer {
                 apps: Vec::new(),
                 recovery: None,
                 proof_generations: Vec::new(),
@@ -199,8 +207,15 @@ impl Signer {
             backup: None,
             step: DeliverStep::BackupWritten,
         });
+        let recovering = state.recovering;
         self.commit(state, deliver_first).await?;
-        self.finish_flow().await?;
+        match self.finish_flow().await {
+            Ok(()) => {}
+            // The recovery's version wasn't taken: the restore is done, the recovery in
+            // progress, resumed or declared again at another service from here.
+            Err(_) if recovering => return Ok(doc),
+            Err(error) => return Err(error),
+        }
 
         // The next version, naming this install as the signer. It races any other signer, so
         // its backup is owed, and written by `resume` once the delivery has won (Switch wire
