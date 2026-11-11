@@ -19,11 +19,13 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// The Homeservers of every identity in a test: public files by identity and path, read
-/// through [`HomeserverReader`]. While it is down, every read fails to connect.
+/// through [`HomeserverReader`]. While it is down, every read fails to connect. Each read is
+/// counted, by identity and path, whether it reached them or not.
 #[derive(Debug, Default)]
 pub struct TestHomeserver {
     files: Mutex<Files>,
     down: Mutex<bool>,
+    reads: Mutex<HashMap<([u8; 32], String), u64>>,
 }
 
 impl TestHomeserver {
@@ -66,6 +68,14 @@ impl TestHomeserver {
         IdentityDoc::verify(&signed, identity).ok()
     }
 
+    /// How many times `identity`'s `identity.json` was read, reached or not.
+    pub fn identity_reads(&self, identity: &[u8; 32]) -> u64 {
+        lock(&self.reads)
+            .get(&(*identity, IDENTITY_PATH.to_owned()))
+            .copied()
+            .unwrap_or(0)
+    }
+
     /// Take every Homeserver down, or bring them back.
     pub fn set_down(&self, down: bool) {
         *lock(&self.down) = down;
@@ -78,6 +88,11 @@ impl HomeserverReader for TestHomeserver {
         identity: [u8; 32],
         path: String,
     ) -> BoxFuture<'_, Result<Option<Vec<u8>>, TransportError>> {
+        {
+            let mut reads = lock(&self.reads);
+            let count = reads.entry((identity, path.clone())).or_insert(0);
+            *count = count.saturating_add(1);
+        }
         let answer = if *lock(&self.down) {
             Err(TransportError::Connect("down".into()))
         } else {

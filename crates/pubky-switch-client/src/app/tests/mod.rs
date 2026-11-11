@@ -8,6 +8,7 @@ mod parked;
 mod protocol_api;
 mod protocol_reads;
 mod push;
+mod sender_document;
 mod shared_flows;
 mod store_failures;
 mod unverified;

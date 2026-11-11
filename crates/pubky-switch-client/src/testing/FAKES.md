@@ -282,3 +282,10 @@ against it now:
   copies delete a key (`handover.rs`), save the scripted faults;
 - the account's erasure, its lost answer, retry and refusal (`erasure.rs`), save the scripted
   faults.
+
+## The test Homeserver
+
+`homeserver.rs` holds public files in memory, as a Homeserver serves them, with no
+authentication. `set_down` makes every read fail to connect, and `identity_reads` counts the
+reads of an identity's `identity.json`, those that failed included, so a test can bound how
+often the app reads a counterparty's document.
