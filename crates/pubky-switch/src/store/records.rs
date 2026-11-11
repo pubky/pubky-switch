@@ -28,12 +28,17 @@ impl SnapshotRead {
         limit: u64,
     ) -> Result<Vec<StoredRecord>, StoreError> {
         let id = self.id.clone();
+        // The page's keys come from the list's index alone (migration 0014), which passes
+        // over the records the reader can't read without reading their rows; then the rows
+        // it shows are read by key.
         let rows = sqlx::query(&format!(
-            "SELECT {RECORD_COLUMNS} FROM shared_records \
+            "WITH page AS (SELECT key, key_text FROM shared_records \
              WHERE account_id = $1 AND collection = $2 AND NOT deleted AND key_text > $3 \
              AND (read_scope = ANY($4) \
                   OR (strpos(read_scope, ':') > 0 AND split_part(read_scope, ':', 1) = ANY($4))) \
-             ORDER BY key_text LIMIT $5"
+             ORDER BY key_text LIMIT $5) \
+             SELECT {RECORD_COLUMNS} FROM page JOIN shared_records USING (key) \
+             WHERE account_id = $1 ORDER BY page.key_text"
         ))
         .bind(id)
         .bind(collection.as_slice())
