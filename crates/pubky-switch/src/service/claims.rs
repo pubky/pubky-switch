@@ -134,6 +134,7 @@ impl Service {
     /// 12.2 step 1): the app is kept as revoked for good, its invite codes are withdrawn and
     /// it leaves the directory, and a `revoke` transition is chained. An app revoked already
     /// gets `{ "proofs": [], "head" }`.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn revoke(
         &self,
         txn: &mut AccountTxn,
