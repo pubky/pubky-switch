@@ -8,7 +8,7 @@
 use std::{collections::BTreeMap, future::Future, time::Duration};
 
 use pubky_switch_core::{
-    chain::{ChainEnvelope, ChainTip, ItemType, ServiceTransition, ZERO_HASH},
+    chain::{ChainEnvelope, ChainTip, ItemType, ServiceTransition, SignedHead, ZERO_HASH},
     ops::{MAX_BATCH_ENTRIES, OpKind, Position, SignedOp},
     records::{AppCert, IdentityDoc},
     scopes::Permission,
@@ -121,18 +121,38 @@ pub(super) enum FeedStop {
     Refused(Box<PageRefusal>),
 }
 
-/// An error answer to a feed read, at `time_ms`. With `head`, it carries the head the
-/// request itself committed, which the key's mark covers already: a refusal never carries
-/// a head read later, so no refusal can show a head the mark is behind (Switch wire 7.3
-/// step 10). The mark's `503` and an unauthenticated reader's `401` carry none.
+/// An error answer to a feed read, at `time_ms`. A refusal decided from a page's snapshot
+/// carries that snapshot's head, the newest the service read (Switch wire 7.1), once the
+/// key's mark has moved to it, as a page's does; any other with `head` carries the head the
+/// request itself committed, which the mark covers already. So no refusal shows a head the
+/// mark is behind (Switch wire 7.3 step 10). The mark's `503` and an unauthenticated
+/// reader's `401` carry none.
 #[derive(Debug)]
 pub(super) struct PageRefusal {
     /// The error.
     pub(super) error: ApiError,
-    /// Whether it carries the request's own head.
+    /// Whether it carries a head.
     pub(super) head: bool,
+    /// The snapshot it was decided from, whose head it carries; `None` for the request's.
+    pub(super) snapshot: Option<SnapshotHead>,
     /// The service time to sign at.
     pub(super) time_ms: u64,
+}
+
+/// The head of the snapshot a refusal was decided from, signed inside its answer's proof.
+#[derive(Debug)]
+pub(super) struct SnapshotHead {
+    tip: ChainTip,
+    /// The key's mark, read before the snapshot.
+    key_mark: Option<Mark>,
+    identity_key: [u8; 32],
+}
+
+impl SnapshotHead {
+    /// The head, unless the key's mark is past it.
+    pub(super) fn sign(&self, signing: &Signing<'_>) -> Option<SignedHead> {
+        signing.head(self.key_mark.as_ref(), &self.identity_key, &self.tip)
+    }
 }
 
 impl FeedStop {
@@ -140,6 +160,7 @@ impl FeedStop {
         Self::Refused(Box::new(PageRefusal {
             error,
             head,
+            snapshot: None,
             time_ms,
         }))
     }
@@ -727,7 +748,7 @@ impl Service {
         // earlier one, so a refusal after a wait never shows the service's time going back
         // behind a page the same client was answered meanwhile (Switch spec 10.1).
         let latest = std::sync::atomic::AtomicU64::new(read.time_ms);
-        let answered = long_poll(
+        let polled = long_poll(
             &self.changes,
             &read.account,
             Duration::from_secs(read.query.wait),
@@ -750,7 +771,25 @@ impl Service {
                 })
             },
         )
-        .await?;
+        .await;
+        let answered = match polled {
+            Ok(answered) => answered,
+            // A refusal from a snapshot moves the mark to its head first, as a page does; if
+            // it can't, the refusal carries the request's own head instead.
+            Err(FeedStop::Refused(mut refusal)) => {
+                if let Some(snapshot) = &refusal.snapshot
+                    && snapshot.tip.seq > 0
+                {
+                    let mark = Mark::from(snapshot.tip);
+                    match self.keys.advance_mark(&read.service_key, mark).await {
+                        Ok(_) | Err(KeyStoreError::NotFound) => {}
+                        Err(_) => refusal.snapshot = None,
+                    }
+                }
+                return Err(FeedStop::Refused(refusal));
+            }
+            Err(stop) => return Err(stop),
+        };
         // The key's mark moves to the page's head first, so no head goes out that the mark
         // is behind, also when the page shows a commit whose own request hasn't moved it
         // yet (Switch wire 7.3 step 10).
@@ -838,7 +877,16 @@ impl Service {
         }
         match builder.refusal.take() {
             Some(Stop::Refused(error)) => {
-                return Err(FeedStop::refused(error, true, time_ms));
+                return Err(FeedStop::Refused(Box::new(PageRefusal {
+                    error,
+                    head: true,
+                    snapshot: Some(SnapshotHead {
+                        tip,
+                        key_mark: mark,
+                        identity_key: read.identity_key,
+                    }),
+                    time_ms,
+                })));
             }
             Some(Stop::Unauthenticated(error)) => {
                 return Err(FeedStop::refused(error, false, time_ms));

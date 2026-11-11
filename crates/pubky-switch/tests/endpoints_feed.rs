@@ -413,8 +413,8 @@ async fn test_feed_long_poll_of_an_app_revoked_meanwhile_is_refused() {
         .as_str()
         .expect("id")
         .to_string();
-    // The wallet waits after seq 11, its revocation's; the executor's attempt after the
-    // revocation (seq 12) wakes the poll.
+    // The wallet waits after seq 11, its revocation's, which wakes the poll; the executor's
+    // attempt after it (seq 12) shows to no read of the wallet's.
     let (answer, ()) = tokio::join!(read(&replay, "wallet", "?after=1:11&wait=10", at), async {
         tokio::time::sleep(Duration::from_millis(300)).await;
         let path = format!("/v1/{}/apps/{wallet}/revoke", alice_id());
@@ -438,17 +438,17 @@ async fn test_feed_long_poll_of_an_app_revoked_meanwhile_is_refused() {
             String::from_utf8_lossy(&written.body)
         );
     });
-    // Refused as a fresh request is, with the head: nothing of seq 12 reaches it.
+    // Refused as a fresh request is, with the head.
     assert_eq!(
         (answer.status, body(&answer)["code"].clone()),
         (403, json!("not_current"))
     );
-    // Its head is the one the request committed, which the key's mark covers: never the
-    // newer head the page was read at.
+    // Its head is the one the page was read at, the revocation's, past the one its request
+    // committed (Switch wire 7.1), and the key's mark covers it (7.3 step 10).
     let key = service_key(&replay).await;
     let mark = replay.keys.mark(&key).await.expect("mark").expect("a mark");
-    assert_eq!(head_seq(&answer), Some(10));
-    assert!(mark.seq >= 10);
+    assert_eq!(head_seq(&answer), Some(11));
+    assert!(mark.seq >= 11);
     let fresh = read(&replay, "wallet", "?after=1:11", at).await;
     assert_eq!(fresh.status, 403);
     let _ = stop.send(());
@@ -726,10 +726,11 @@ async fn test_feed_expiry_is_judged_at_the_snapshots_time() {
         (answer.status, body(&answer)["code"].clone()),
         (403, json!("cert_expired"))
     );
-    // The request's own head, at 9, which the mark covers; not the snapshot's 10.
+    // The snapshot's head, at 10, past the request's own 9 (Switch wire 7.1), the mark moved
+    // to it first (7.3 step 10).
     let mark = replay.keys.mark(&key).await.expect("mark").expect("a mark");
-    assert_eq!(head_seq(&answer), Some(9));
-    assert!(mark.seq >= 9);
+    assert_eq!(head_seq(&answer), Some(10));
+    assert!(mark.seq >= 10);
     assert_eq!(
         header_text(&answer, header::SERVER_TIME),
         Some(pubky_switch_core::time::rfc3339(expired).as_str())

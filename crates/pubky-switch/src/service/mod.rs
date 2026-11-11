@@ -979,17 +979,31 @@ impl Service {
                                 if is_failed_authentication(refusal.error.code) {
                                     self.record_failure(request, txn_account.clone());
                                 }
-                                let head = if refusal.head { fallback_head } else { None };
-                                self.sign_keyed(
-                                    proof,
-                                    &signer,
-                                    signature,
-                                    refusal.time_ms,
-                                    Answer::error(&refusal.error).with_head(head),
-                                    base_ms,
-                                    by_signer,
-                                )
-                                .await
+                                let refusal = *refusal;
+                                let signed = self
+                                    .try_sign_keyed(proof, &signer, signature, |signing| {
+                                        let head = match (&refusal.snapshot, refusal.head) {
+                                            (Some(snapshot), _) => snapshot.sign(signing),
+                                            (None, true) => fallback_head,
+                                            (None, false) => None,
+                                        };
+                                        let answer = Answer::error(&refusal.error).with_head(head);
+                                        (answer, refusal.time_ms)
+                                    })
+                                    .await;
+                                match signed {
+                                    Ok(signed) => signed,
+                                    Err(not_keyed) => {
+                                        self.not_keyed_answer(
+                                            Some(&txn_account),
+                                            not_keyed,
+                                            by_signer,
+                                            signature,
+                                            base_ms,
+                                        )
+                                        .await
+                                    }
+                                }
                             }
                         };
                     }
