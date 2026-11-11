@@ -83,8 +83,12 @@ The flows send every call the service serves, each at both switches. What they l
   a write of another app answers. It runs against each switch on its own: the scripted
   switch doesn't hold a read, so the two runs make their calls in different orders, which
   the comparison can't set side by side. Its test holds what each switch does.
-- **A feed with gaps:** a lagging app, a `missed` item, an item an app can't read after a
-  revocation.
+- **A feed with gaps, compared.** `flows::lagging_app`, `flows::missed_item` and
+  `flows::unreadable_after_revoke` run against each switch on its own, like the waiting
+  read: the service marks an app lagging, writes it a `missed` item, and turns an entry
+  left without a reader into an `unreadable` item; the scripted switch does none of it, and
+  each such item takes a `seq`, so every later `seq` of the two runs differs. Their tests
+  hold what each switch does. The first two start the service with a small inbox quota.
 - **More of the lists:** an invite code withdrawn or used several times, an invite, a
   conversation entry pruned, a connection request.
 - **Longer lives:** a renewal that adds a scope, a claim that runs out by time, an
