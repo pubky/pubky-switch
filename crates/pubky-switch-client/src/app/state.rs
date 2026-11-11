@@ -477,6 +477,19 @@ pub(crate) struct ParkedEntry {
     /// tries it, whatever its `seq`.
     #[serde(default)]
     pub(crate) round: u64,
+    /// The host released it ([`super::App::release_parked`]): kept whatever reason it is
+    /// stored for again, through a backup and a restore, so each later run is handed over
+    /// as released ([`super::ReceivedMessage::released`]). An entry an earlier build stored
+    /// has none; its reason [`ParkReason::Released`] says so ([`ParkedEntry::was_released`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) released: bool,
+}
+
+impl ParkedEntry {
+    /// Whether the host released it, whatever it is stored for now.
+    pub(crate) fn was_released(&self) -> bool {
+        self.released || self.reason == ParkReason::Released
+    }
 }
 
 /// `ident/<identity>/doc`: the newest `identity.json` held for an identity.
@@ -1126,6 +1139,7 @@ mod tests {
             context: None,
             reason: ParkReason::Quota,
             round: 0,
+            released: false,
         };
         let text = format!("{parked:?}");
         assert!(!text.contains("secret"), "{text}");
