@@ -638,6 +638,9 @@ impl<'a> ReceiveContext<'a> {
         conditions: Vec<Condition>,
     ) -> Result<[u8; 32], AppError> {
         self.room()?;
+        // A value that isn't JSON is refused before the protocol marks it, as `record_op`
+        // does: nothing is handed on first.
+        super::records::refuse_non_json(value)?;
         super::records::refuse_unmarkable(self.protocol, target, value)?;
         let key = self.record_key(target)?;
         if self.writes.records.iter().any(|(k, _)| *k == key) {

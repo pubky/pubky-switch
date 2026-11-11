@@ -303,6 +303,7 @@ impl Inner {
                 op,
                 proof: &proof,
                 writer: caller.unwrap_or_default(),
+                cert: cert.as_ref(),
                 generation,
                 seq: self.seq,
             };
