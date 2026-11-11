@@ -74,10 +74,11 @@ service.
 - **App currency outside batches**: a feed read is checked as a batch is, for an app that
   delivered its record: current, with an unexpired certificate, the stored renewed one once
   the newest `identity.json` lists it (Switch wire 7.2, 3.8). Other routes check only that
-  the app hasn't departed, but for the key bundle routes (`GET` and `POST
-  /apps/{app_id}/keys`), which check nothing of the app's standing, take any body, and answer
-  `404` ("no route") for another app's path or the signer, where the service answers `403
-  permission_missing` (Switch wire 7.4.11).
+  the app hasn't departed. The key bundle routes (`GET` and `POST /apps/{app_id}/keys`)
+  answer `403 not_current` to an app that isn't current by its record, as the service does,
+  and keep nothing for it; they don't check the certificate's expiry (the service answers
+  `403 cert_expired`), take any body, and answer `404` ("no route") for another app's path or
+  the signer, where the service answers `403 permission_missing` (Switch wire 7.4.11).
 - **`POST /v1/enroll`** (Switch wire 3.7, 7.4.1), in `switch/signer.rs`: only at
   [`SWITCH_ORIGIN`], with the default limits unless a test sets others
   (`set_enroll_limits`), and without checking the request signature. A
@@ -135,8 +136,15 @@ service.
   account in memory, with no manifest, chunks or export transfer; a recovery upload is kept
   and answered with fixed changes, merging nothing.
 - **Revocation** is `POST /apps/{app_id}/revoke` from the signer, and the test call
-  `revoke`; an app that left is answered as one revoked already, with no proof. `leave` and
-  `request_full_bundle` are test calls for the app's own routes, and `forget_removal_time`
+  `revoke`; an app that left is answered as one revoked already, with no proof. `leave` is a
+  test call and also a route, `POST /apps/{app_id}/leave`, which checks only that the app
+  hasn't departed: it takes any body, departs an app with no record or one whose certificate
+  has expired or isn't listed, keeps the app's invite codes, push registration and inbox
+  entries, and stamps the test clock's time. The service refuses another app's path and the
+  signer with `403 permission_missing`, where this switch answers `404`, and an app of
+  another identity with `403 permission_missing`, where this switch answers `403
+  not_admitted` (Switch wire 7.4.12). `request_full_bundle` is a test call for the app's own
+  route, and `forget_removal_time`
   scripts a faulty service that shows no time for a removal. Freeze and
   unfreeze are test calls, not routes.
 - **`lose_identity`** scripts a faulty service that lost the account's `identity.json`.
@@ -166,10 +174,10 @@ service.
 ## Signer flows tested only here
 
 These signer flows run only against the scripted switch, whose `GET /apps` follows the
-service's rules (above). The service in this workspace serves `GET /apps` and `GET` and
-`POST /apps/{app_id}/keys`, but not yet `POST /apps/{app_id}/leave`, which departures need.
-Re-run them against the service once it serves that call; the full-bundle requests and reading
-the stored parts can run against it now:
+service's rules (above). The service in this workspace serves `GET /apps`, `GET` and `POST
+/apps/{app_id}/keys` and `POST /apps/{app_id}/leave`, so the full-bundle requests, reading the
+stored parts, the departures and the hand-over can run against it now (`PUT` and `GET
+/handover` too); the erasure waits for `POST /erase`:
 
 - approval, renewals and reductions, their closings, and epoch completion
   (`crates/pubky-switch-signer/tests/approval.rs`, `renewal.rs`);
@@ -179,7 +187,6 @@ the stored parts can run against it now:
   (`flows.rs`);
 - restore from the signer backup, in place and on a new install (`restore.rs`);
 - the hand-over both ways, the abort, the take-over's checks and its lost answers, and which
-  copies delete a key (`handover.rs`): the service now serves `PUT` and `GET /handover`, so
-  these can run against it, save the scripted faults;
+  copies delete a key (`handover.rs`), save the scripted faults;
 - the account's erasure, its lost answer, retry and refusal (`erasure.rs`): the service
   doesn't serve `POST /erase` yet.

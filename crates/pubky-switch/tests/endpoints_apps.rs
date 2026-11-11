@@ -653,30 +653,28 @@ async fn next_version(
 
 #[tokio::test]
 async fn test_apps_departure_rotation_is_done_for_good() {
-    use sqlx::Connection;
     let Some(replay) = replay().await else { return };
     replay_chain_through_revoke(&replay).await;
     let at = revoke_time();
     let keys = vectors("keys.json");
-    let executor = pubky_switch_core::enc::app_id_decode(
-        app(&keys, "executor")["app_id"].as_str().expect("id"),
-    )
-    .expect("app id");
-    // The executor departed at data epoch 2 (departures come with leave; seeded here).
-    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
-        .await
-        .expect("conn");
-    sqlx::query(
-        "INSERT INTO kept_app_ids (account_id, app_id, reason, at_ms, data_epoch) \
-         VALUES ($1, $2, 'departed', $3, 2)",
-    )
-    .bind(alice_id())
-    .bind(executor.as_slice())
-    .bind(i64::try_from(ms(&at)).expect("time"))
-    .execute(&mut conn)
-    .await
-    .expect("departure");
-    let awaiting = |apps: &Value| status(apps, "executor")["awaiting_rotation"].clone();
+    let wallet_id = app(&keys, "wallet")["app_id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    let executor = pubky_switch_core::enc::app_id_decode(&wallet_id).expect("app id");
+    // The wallet leaves at data epoch 2 (Switch wire 7.4.12).
+    let left = replay
+        .service
+        .handle(app_request(
+            app(&keys, "wallet"),
+            "POST",
+            &format!("/v1/{}/apps/{wallet_id}/leave", alice_id()),
+            Vec::new(),
+            ms(&at),
+        ))
+        .await;
+    assert_eq!(left.status, 200, "{}", String::from_utf8_lossy(&left.body));
+    let awaiting = |apps: &Value| status(apps, "wallet")["awaiting_rotation"].clone();
     assert_eq!(
         awaiting(&body(&get_apps(&replay, "signer", &at).await)),
         json!(true)

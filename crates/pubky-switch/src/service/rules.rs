@@ -157,8 +157,9 @@ pub fn takes_other_apps(call: &Call) -> bool {
 
 /// The refusal of an app of another identity at a call it doesn't make, once its
 /// certificate has passed every check, expiry included (Switch wire 7.2, 3.8): `403
-/// permission_missing` at the feed (7.4.4), the key bundle calls (7.4.11), the hand-over
-/// (7.4.17) and the signer's calls (7.4), and `403 not_admitted` elsewhere (6.4).
+/// permission_missing` at the feed (7.4.4), the key bundle calls (7.4.11), a leave (7.4.12),
+/// the hand-over (7.4.17) and the signer's calls (7.4), and `403 not_admitted` elsewhere
+/// (6.4).
 pub fn other_app_refusal(call: &Call) -> ApiError {
     match call {
         Call::Feed => ApiError::new(
@@ -166,6 +167,10 @@ pub fn other_app_refusal(call: &Call) -> ApiError {
             "7.4.4: only own apps read the feed",
         ),
         Call::GetKeys(_) | Call::RequestKeys(_) => super::app_keys::only_that_app(),
+        Call::Leave(_) => ApiError::new(
+            ErrorCode::PermissionMissing,
+            "7.4.12: only the app itself leaves",
+        ),
         Call::PutHandover | Call::GetHandover => ApiError::new(
             ErrorCode::PermissionMissing,
             "7.4.17: only the signer and the app it is for",
@@ -331,7 +336,12 @@ mod tests {
         assert!(takes_other_apps(&Call::PutPeers) && takes_other_apps(&Call::Append));
         assert!(takes_other_apps(&Call::Directory));
         assert!(!takes_other_apps(&Call::Feed) && !takes_other_apps(&Call::Ops));
-        for call in [Call::Feed, Call::PutIdentity, Call::GetApps] {
+        for call in [
+            Call::Feed,
+            Call::PutIdentity,
+            Call::GetApps,
+            Call::Leave(String::new()),
+        ] {
             assert_eq!(other_app_refusal(&call).code, ErrorCode::PermissionMissing);
         }
         assert_eq!(other_app_refusal(&Call::Ops).code, ErrorCode::NotAdmitted);
