@@ -475,3 +475,86 @@ async fn test_allow_needs_lists_read() {
     assert!(header_text(&answer, "switch-head").is_none());
     replay.db.drop_database().await.expect("drop");
 }
+
+async fn stamped_time(replay: &Replay) -> i64 {
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    sqlx::query_scalar("SELECT stamped_time_ms FROM accounts WHERE id = $1")
+        .bind(alice_id())
+        .fetch_one(&mut conn)
+        .await
+        .expect("stamp")
+}
+
+#[tokio::test]
+async fn test_allow_long_read_holds_no_lock_and_shows_the_stamped_state() {
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    // 100,000 conversation entries with a full context: a read of several seconds.
+    sql(
+        &replay,
+        "INSERT INTO list_entries (account_id, list, pubky, written_by, at_ms, code_hash, context) \
+         SELECT $1, 'conversation', decode(lpad(to_hex(g), 64, '0'), 'hex'), NULL, 0, \
+         decode(repeat('cd', 32), 'hex'), convert_to('{\"note\":\"' || repeat('x', 1000) || '\"}', 'UTF8') \
+         FROM generate_series(1, 100000) g",
+    )
+    .await;
+    let read_at = pubky_switch_core::time::rfc3339(ms(&at()) + 60_000);
+    set_time(&replay.clock, &read_at);
+    let read_ms = i64::try_from(ms(&read_at)).expect("time");
+    let phone = app(&vectors("keys.json"), "phone")["app_id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    let started = std::time::Instant::now();
+    let ((answer, read_done), writes_done) = tokio::join!(
+        async {
+            let answer = read_as(&replay, "wallet", &read_at).await;
+            (answer, started.elapsed())
+        },
+        async {
+            // The read has committed its stamp, so its lock is gone, and it reads on.
+            while stamped_time(&replay).await != read_ms {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            // A revocation by the signer and a write by an own app each take the lock: they
+            // don't wait for the read.
+            let revoke = replay
+                .service
+                .handle(signer_request(
+                    "POST",
+                    &format!("/v1/{}/apps/{phone}/revoke", alice_id()),
+                    Vec::new(),
+                    ms(&read_at),
+                ))
+                .await;
+            assert_eq!(
+                revoke.status,
+                200,
+                "{}",
+                String::from_utf8_lossy(&revoke.body)
+            );
+            wallet_op(&replay, put_code(CODE, ms(&read_at) + 3_600_000, 1), 90).await;
+            started.elapsed()
+        }
+    );
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)[..200].to_string()
+    );
+    assert!(
+        writes_done < read_done,
+        "the writes ({writes_done:?}) finished while the read ({read_done:?}) went on"
+    );
+    // The answer is the state at its stamped time: the code written after it isn't in it.
+    let lists = body(&answer);
+    assert_eq!(lists["invite_codes"], json!([]));
+    assert_eq!(
+        lists["conversations"].as_array().map(Vec::len),
+        Some(100_000)
+    );
+    replay.db.drop_database().await.expect("drop");
+}
