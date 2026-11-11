@@ -726,8 +726,12 @@ impl Service {
         }
         // Once the lock is gone, only while the account still names the key the read loaded,
         // whatever its mark did: an erasure whose key's deletion failed leaves the key in the
-        // store (7.4.16).
-        if let Some(error) = self.no_longer_keyed(&read.account, &read.service_key).await {
+        // store (7.4.16). The reader is an app, never the signer, so no erasure holds its
+        // `404` back.
+        if let Some(error) = self
+            .no_longer_keyed(&read.account, &read.service_key, false)
+            .await
+        {
             return Err(gone_or_retired(&error));
         }
         Ok((answered.answer(), answered.time_ms))
@@ -750,7 +754,10 @@ impl Service {
             // can't be looked up, gets the operator's temporary failure.
             Err(KeyStoreError::NotFound) => {
                 return Err(
-                    match self.no_longer_keyed(&read.account, &read.service_key).await {
+                    match self
+                        .no_longer_keyed(&read.account, &read.service_key, false)
+                        .await
+                    {
                         Some(error) => gone_or_retired(&error),
                         None => fallback(temporary(), read.time_ms),
                     },

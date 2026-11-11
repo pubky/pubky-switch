@@ -1177,8 +1177,8 @@ async fn test_erase_gone_account_whose_owed_keys_cant_be_read_isnt_a_404() {
 #[tokio::test]
 async fn test_erase_feed_page_after_an_erasure_whose_key_stays_isnt_signed_with_it() {
     // The erasure couldn't delete its key: a feed page read just before it, whose mark move
-    // then succeeds, still answers as for an account gone, not signed with that key
-    // (7.4.16).
+    // then succeeds, still answers as for an account gone, the operator's `404` to an app,
+    // not signed with that key (7.4.16).
     let Some(mut replay) = replay().await else {
         return;
     };
@@ -1204,7 +1204,7 @@ async fn test_erase_feed_page_after_an_erasure_whose_key_stays_isnt_signed_with_
         erased
     });
     assert_eq!(code_of(&erased), (503, json!("unavailable")));
-    assert_eq!(code_of(&answer), (503, json!("unavailable")));
+    assert_eq!(code_of(&answer), (404, json!("not_found")));
     assert!(no_head(&answer));
     assert!(operator_signed(&answer, Some(&request_signature)));
     replay.db.drop_database().await.expect("drop");
@@ -1395,8 +1395,9 @@ async fn test_erase_refusal_moves_no_mark() {
 #[tokio::test]
 async fn test_erase_feed_refusal_after_an_erasure_whose_key_stays_isnt_signed_with_it() {
     // The key store fails: the erasure's key isn't deleted, and a feed page's mark move then
-    // fails too. The refusal goes out once the lock is gone, so as for an account gone, not
-    // signed with the erased key, and without its head (7.4.16).
+    // fails too. The refusal goes out once the lock is gone, so as for an account gone, the
+    // operator's `404` to an app, not signed with the erased key, and without its head
+    // (7.4.16).
     use std::sync::atomic::Ordering;
     let Some(mut replay) = replay().await else {
         return;
@@ -1423,7 +1424,7 @@ async fn test_erase_feed_refusal_after_an_erasure_whose_key_stays_isnt_signed_wi
         erased
     });
     assert_eq!(code_of(&erased), (503, json!("unavailable")));
-    assert_eq!(code_of(&answer), (503, json!("unavailable")));
+    assert_eq!(code_of(&answer), (404, json!("not_found")));
     assert!(no_head(&answer));
     assert!(operator_signed(&answer, Some(&request_signature)));
     replay.db.drop_database().await.expect("drop");
@@ -1432,7 +1433,7 @@ async fn test_erase_feed_refusal_after_an_erasure_whose_key_stays_isnt_signed_wi
 #[tokio::test]
 async fn test_erase_retries_sweep_a_few_times_a_minute() {
     // A retried erasure of an account gone sweeps its owed keys at most six times a minute
-    // for the account: the request is unauthenticated (7.4.16).
+    // for the account: a verified request can be replayed (7.4.16).
     use std::sync::atomic::Ordering;
     let Some(mut replay) = replay().await else {
         return;
@@ -1481,6 +1482,184 @@ async fn test_erase_deferred_allow_read_isnt_signed_with_its_key() {
     let request_signature = signature_of(&request);
     let answer = erased_meanwhile(&replay, &gate, request).await;
     assert_eq!(code_of(&answer), (404, json!("not_found")));
+    assert!(no_head(&answer));
+    assert!(operator_signed(&answer, Some(&request_signature)));
+    replay.db.drop_database().await.expect("drop");
+}
+
+/// alice's erasure, its key store unable to record it: `503`, and its key stays owed.
+async fn erased_owing_its_key(replay: &mut Replay) -> std::sync::Arc<Gate> {
+    let gate = gated(replay, false);
+    replay_chain_through_revoke(replay).await;
+    gate.fail_ledger
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let erased = erase(replay, &alice_service_key(), &revoke_time()).await;
+    assert_eq!(code_of(&erased), (503, json!("unavailable")));
+    gate
+}
+
+/// `request` with its body changed after it was signed: its signature no longer verifies.
+fn tampered(mut request: pubky_switch::http::SwitchRequest) -> pubky_switch::http::SwitchRequest {
+    request.body = erase_body(&[1; 32]).into();
+    request
+}
+
+#[tokio::test]
+async fn test_erase_owed_keys_hold_back_only_the_signers_404() {
+    // While an erased account's key is owed, only its signer, its request verified with the
+    // identity key, gets the operator's `503` in place of the `404`: the public read, an
+    // app's call and a request whose signature doesn't verify get the `404` (7.4.16, 7.3
+    // step 2).
+    let Some(mut replay) = replay().await else {
+        return;
+    };
+    let _gate = erased_owing_its_key(&mut replay).await;
+    let at = revoke_time();
+    let keys = vectors("keys.json");
+    let signer = signer_request(
+        "GET",
+        &format!("/v1/{}/apps", alice_id()),
+        Vec::new(),
+        ms(&at),
+    );
+    assert_eq!(
+        code_of(&replay.service.handle(signer).await),
+        (503, json!("unavailable"))
+    );
+    let others = vec![
+        request(
+            "GET",
+            &format!("/v1/{}/identity", alice_id()),
+            &[],
+            Vec::new(),
+        ),
+        app_request(
+            app(&keys, "wallet"),
+            "GET",
+            &format!("/v1/{}/feed", alice_id()),
+            Vec::new(),
+            ms(&at),
+        ),
+        tampered(signer_request(
+            "POST",
+            &erase_path(),
+            erase_body(&alice_service_key()),
+            ms(&at),
+        )),
+    ];
+    for request in others {
+        let path = request.path_and_query.clone();
+        let request_signature = request
+            .headers
+            .contains_key(header::SIGNATURE)
+            .then(|| signature_of(&request));
+        let answer = replay.service.handle(request).await;
+        assert_eq!(code_of(&answer), (404, json!("not_found")), "{path}");
+        assert!(no_head(&answer), "{path}");
+        assert!(
+            operator_signed(&answer, request_signature.as_ref()),
+            "{path}"
+        );
+    }
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_erase_retry_that_doesnt_verify_sweeps_nothing() {
+    // A retried erasure sweeps the owed keys only when its signature verifies with the
+    // identity key: one that doesn't verify gets the `404` and the key stays owed; the
+    // signer's own retry then sweeps it (7.4.16).
+    use std::sync::atomic::Ordering;
+    let Some(mut replay) = replay().await else {
+        return;
+    };
+    let gate = gated(&mut replay, false);
+    replay_chain_through_revoke(&replay).await;
+    let key = service_key_id(&replay, &alice_id()).await;
+    gate.fail_ledger.store(true, Ordering::SeqCst);
+    let at = revoke_time();
+    let erased = erase(&replay, &alice_service_key(), &at).await;
+    assert_eq!(code_of(&erased), (503, json!("unavailable")));
+    gate.fail_ledger.store(false, Ordering::SeqCst);
+    let retry = || {
+        signer_request(
+            "POST",
+            &erase_path(),
+            erase_body(&alice_service_key()),
+            ms(&at),
+        )
+    };
+    let recorded = gate.recorded.load(Ordering::SeqCst);
+    let answer = replay.service.handle(tampered(retry())).await;
+    assert_eq!(code_of(&answer), (404, json!("not_found")));
+    assert_eq!(gate.recorded.load(Ordering::SeqCst), recorded, "no sweep");
+    assert!(replay.keys.public_key(&key).await.is_ok(), "still owed");
+    let answer = replay.service.handle(retry()).await;
+    assert_eq!(code_of(&answer), (404, json!("not_found")));
+    assert!(replay.keys.public_key(&key).await.is_err(), "swept");
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_erase_between_the_lookup_and_the_lock_holds_back_the_signers_404() {
+    // The signer's call finds the account, then waits for its lock while an erasure holds
+    // it; the erasure commits and its key is still owed. The call finds no account under
+    // the lock: the operator's `503`, as for every signer's call while the key is owed
+    // (7.4.16).
+    use std::time::Duration;
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    let owed = replay.keys.generate().await.expect("key");
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    let mut erasure = conn.begin().await.expect("begin");
+    sqlx::query("SELECT id FROM accounts WHERE id = $1 FOR UPDATE")
+        .bind(alice_id())
+        .execute(&mut *erasure)
+        .await
+        .expect("lock");
+    let request = signer_request(
+        "GET",
+        &format!("/v1/{}/apps", alice_id()),
+        Vec::new(),
+        ms(&revoke_time()),
+    );
+    let request_signature = signature_of(&request);
+    let (answer, ()) = tokio::join!(replay.service.handle(request), async {
+        let mut watch = sqlx::PgConnection::connect_with(replay.db.options())
+            .await
+            .expect("conn");
+        for _ in 0..250 {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity \
+                 WHERE datname = current_database() AND wait_event_type = 'Lock'",
+            )
+            .fetch_one(&mut watch)
+            .await
+            .expect("activity");
+            if waiting > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        watch.close().await.expect("close");
+        sqlx::query("DELETE FROM accounts WHERE id = $1")
+            .bind(alice_id())
+            .execute(&mut *erasure)
+            .await
+            .expect("erase");
+        sqlx::query(
+            "INSERT INTO erased_keys (key_id, account_id, erased_at_ms) VALUES ($1, $2, 7)",
+        )
+        .bind(owed.id.as_str())
+        .bind(alice_id())
+        .execute(&mut *erasure)
+        .await
+        .expect("owed");
+        erasure.commit().await.expect("commit");
+    });
+    assert_eq!(code_of(&answer), (503, json!("unavailable")));
     assert!(no_head(&answer));
     assert!(operator_signed(&answer, Some(&request_signature)));
     replay.db.drop_database().await.expect("drop");
