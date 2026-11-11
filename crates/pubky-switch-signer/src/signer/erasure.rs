@@ -12,7 +12,10 @@
 //!    or, after a request in doubt, the check's read meets the operator's `404`, marking
 //!    before each request that it may land. A `200` confirms the erasure. So does an
 //!    unsigned `404`, the operator's, but only after a request that may have landed, as a
-//!    lost `200` leaves it (Switch wire 7.4.16). A `404` is never itself a lost answer: with
+//!    lost `200` leaves it, and only once every check has met it for 24 hours: until then
+//!    the account is erased but unconfirmed ([`Refusal::ErasureUnconfirmed`]), the time of
+//!    the first `404` kept in the flow, and an answer the pinned key signs ends the wait
+//!    (Switch wire 7.4.16, spec 12.7 step 5). A `404` is never itself a lost answer: with
 //!    no request in doubt it is an error, and the mark goes back. No answer, or another
 //!    answer the pinned key didn't sign, such as a gateway's `503`, keeps the mark; only an
 //!    answer the pinned key signed shows the account still exists, and clears it.
@@ -25,7 +28,8 @@
 //! deleted, sent or published by this install; an alarm or records behind keep it in
 //! progress, with nothing deleted or sent while the alarm is held; a copy that can't be read
 //! takes no step. After a request in doubt, an unsigned `404` to the check, with every other
-//! copy clean, is taken as the erasure done, and no other request goes out.
+//! copy clean, is taken as the erasure done once it has held for 24 hours, and no other
+//! request goes out meanwhile.
 //!
 //! A `409 conflict` is the switch refusing it, as during a move: the erasure ends without
 //! erasing, `identity.json` is published again, and the grant reminders it raised for apps
@@ -73,6 +77,7 @@ impl Signer {
             unpublished: false,
             reminded: Vec::new(),
             unanswered: false,
+            first_404_ms: None,
         };
         // Unpublished from the first deletion on: an erasure that ends without erasing, after
         // any part of the Homeserver's files went, has `identity.json` published again.
@@ -117,14 +122,27 @@ impl Signer {
         unpublished: bool,
         reminded: Vec<[u8; 16]>,
         unanswered: bool,
+        first_404_ms: Option<u64>,
     ) -> Result<()> {
         if !unpublished {
             return self.unpublish().await;
         }
         // A request in doubt, then the switch's `404` and every other copy clean: erased
-        // already, and no other request goes out without an ownership read.
+        // already, once it has held for 24 hours, and no other request goes out without an
+        // ownership read.
         if self.still_erasing(unanswered, true).await? == Checked::ErasedAlready {
-            return self.erased().await;
+            return self.erased_after_doubt(reminded, first_404_ms).await;
+        }
+        // An answer the pinned key signed: the account is there, and the wait for the `404`
+        // to hold starts again, if it ever comes (Switch wire 7.4.16).
+        if first_404_ms.is_some() {
+            let flow = Flow::Erase {
+                unpublished,
+                reminded: reminded.clone(),
+                unanswered,
+                first_404_ms: None,
+            };
+            self.commit(self.state.clone(), Some(flow)).await?;
         }
         // Before the request: it may land, however its answer goes.
         if !unanswered {
@@ -132,6 +150,7 @@ impl Signer {
                 unpublished,
                 reminded: reminded.clone(),
                 unanswered: true,
+                first_404_ms: None,
             };
             self.commit(self.state.clone(), Some(flow)).await?;
         }
@@ -149,7 +168,7 @@ impl Signer {
             // the service hosts no account for the identity, as after a lost `200` (Switch
             // wire 7.4.16).
             Err(ClientError::BadServiceSignature { status: 404 }) if unanswered => {
-                self.erased().await
+                self.erased_after_doubt(reminded, None).await
             }
             // A `404` is never a lost answer: the operator's means the switch hosted no account
             // when it answered, an intermediary's that the request wasn't routed. With no
@@ -159,6 +178,7 @@ impl Signer {
                     unpublished,
                     reminded,
                     unanswered: false,
+                    first_404_ms: None,
                 };
                 self.commit(self.state.clone(), Some(flow)).await?;
                 Err(error.into())
@@ -183,6 +203,7 @@ impl Signer {
                     unpublished,
                     reminded,
                     unanswered: false,
+                    first_404_ms: None,
                 };
                 self.commit(self.state.clone(), Some(flow)).await?;
                 Err(error.into())
@@ -287,6 +308,38 @@ impl Signer {
         Ok(())
     }
 
+    /// The operator's `404` after a request in doubt, at a run of the erasure: how a landed
+    /// erasure looks, taken as one only once every check has met it for 24 hours, as an app
+    /// takes an erasure (Switch wire 7.4.16, spec 12.7 step 5). `first_404_ms` is when a check
+    /// first met it, kept durably in the flow.
+    ///
+    /// The time is the device clock's, the only one there is: the `404` carries no time
+    /// anyone can authenticate. The wait ends at the first run 24 hours after the first `404`,
+    /// so it takes two runs a day apart. A device clock set back below the first `404` starts
+    /// the wait again from then; one set forward shortens it, and a jump of a day ends it at
+    /// the next run, the user's own doing.
+    async fn erased_after_doubt(
+        &mut self,
+        reminded: Vec<[u8; 16]>,
+        first_404_ms: Option<u64>,
+    ) -> Result<()> {
+        let now = self.env.clock.now_ms();
+        let since_ms = first_404_ms.filter(|at| *at <= now).unwrap_or(now);
+        if now.saturating_sub(since_ms) >= ERASURE_CONFIRMATION_MS {
+            return self.erased().await;
+        }
+        if first_404_ms != Some(since_ms) {
+            let flow = Flow::Erase {
+                unpublished: true,
+                reminded,
+                unanswered: true,
+                first_404_ms: Some(since_ms),
+            };
+            self.commit(self.state.clone(), Some(flow)).await?;
+        }
+        Err(Refusal::ErasureUnconfirmed { since_ms }.into())
+    }
+
     /// The account is erased: what only it could settle goes, and the records stay.
     async fn erased(&mut self) -> Result<()> {
         let mut state = self.state.clone();
@@ -368,6 +421,7 @@ impl Signer {
             unpublished: true,
             reminded,
             unanswered: false,
+            first_404_ms: None,
         };
         self.commit(state, Some(flow)).await
     }
@@ -395,6 +449,10 @@ fn withdraw_reminders(state: &mut crate::state::SignerState, reminded: &[[u8; 16
         .retain(|app_id| !listed.contains(app_id));
     Ok(())
 }
+
+/// How long every check must meet the operator's `404` after a request in doubt before the
+/// erasure is taken as done: 24 hours, as for an app (Switch spec 12.7 step 5).
+const ERASURE_CONFIRMATION_MS: u64 = 24 * 60 * 60 * 1000;
 
 /// What a passing check before an erasure step found.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

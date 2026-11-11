@@ -10,6 +10,8 @@ mod common;
 
 use std::sync::Arc;
 
+use pubky_switch_client::clock::Clock;
+
 use common::*;
 use pubky_switch_client::store::MemoryStore;
 use pubky_switch_client::testing::Fault as SwitchFault;
@@ -23,6 +25,30 @@ use pubky_switch_signer::{
 
 fn confirmed() -> UserConfirmed {
     UserConfirmed::shown_and_confirmed()
+}
+
+/// How long every check meets the operator's `404` after a request in doubt before the
+/// erasure is done (Switch wire 7.4.16, spec 12.7 step 5).
+const ERASURE_CONFIRMATION_MS: u64 = 24 * 3_600_000;
+
+/// After a request in doubt, the operator's `404`: the next run leaves the erasure erased
+/// but unconfirmed, and the first run 24 hours on ends it erased (Switch wire 7.4.16).
+async fn confirm_erasure(world: &World, signer: &mut Signer) {
+    let error = signer.resume().await.unwrap_err();
+    assert!(
+        matches!(
+            error,
+            SignerError::Refused(Refusal::ErasureUnconfirmed { .. })
+        ),
+        "{error:?}"
+    );
+    assert!(matches!(
+        signer.status(),
+        SignerStatus::ErasedUnconfirmed { .. }
+    ));
+    world.clock.advance_ms(ERASURE_CONFIRMATION_MS);
+    signer.resume().await.unwrap();
+    assert_eq!(signer.status(), SignerStatus::Erased);
 }
 
 fn erase_requests(world: &World) -> usize {
@@ -116,8 +142,7 @@ async fn test_erasure_answer_lost_is_taken_as_done_from_the_404() {
         signer.abort_erasure().await.unwrap_err(),
         SignerError::Refused(Refusal::ErasureUnanswered)
     );
-    signer.resume().await.unwrap();
-    assert_eq!(signer.status(), SignerStatus::Erased);
+    confirm_erasure(&world, &mut signer).await;
     assert_eq!(erase_requests(&world), 1);
 }
 
@@ -349,8 +374,7 @@ async fn test_erasure_unsigned_answer_after_a_lost_200_keeps_it_landed() {
         signer.abort_erasure().await.unwrap_err(),
         SignerError::Refused(Refusal::ErasureUnanswered)
     );
-    signer.resume().await.unwrap();
-    assert_eq!(signer.status(), SignerStatus::Erased);
+    confirm_erasure(&world, &mut signer).await;
 }
 
 #[tokio::test]
@@ -368,8 +392,7 @@ async fn test_erasure_reopened_mid_flow_finishes() {
         .await
         .unwrap();
     assert_eq!(signer.status(), SignerStatus::Erasing);
-    signer.resume().await.unwrap();
-    assert_eq!(signer.status(), SignerStatus::Erased);
+    confirm_erasure(&world, &mut signer).await;
 }
 
 #[tokio::test]
@@ -481,6 +504,12 @@ async fn test_erasure_run_does_nothing_while_erasing_or_once_erased() {
     signer.close_account(confirmed()).await.unwrap_err();
     let sent = world.sent_docs().len();
     let writes = world.homeserver.writes.lock().unwrap().len();
+    // Unconfirmed for 24 hours, then the run that completes the erasure.
+    assert!(matches!(
+        signer.run_due().await.unwrap_err(),
+        SignerError::Refused(Refusal::ErasureUnconfirmed { .. })
+    ));
+    world.clock.advance_ms(ERASURE_CONFIRMATION_MS);
     signer.run_due().await.unwrap();
     assert_eq!(signer.status(), SignerStatus::Erased);
     assert_eq!(
@@ -818,6 +847,17 @@ async fn test_erasure_in_doubt_sends_nothing_more_on_an_unsigned_404() {
     )
     .await
     .unwrap();
+    // Every check meets the intermediary's `404` for 24 hours: the erasure ends erased, the
+    // stated residual, though the other install's account stays.
+    let error = signer.resume().await.unwrap_err();
+    assert!(
+        matches!(
+            error,
+            SignerError::Refused(Refusal::ErasureUnconfirmed { .. })
+        ),
+        "{error:?}"
+    );
+    world.clock.advance_ms(ERASURE_CONFIRMATION_MS);
     signer.resume().await.unwrap();
     assert_eq!(erase_requests(&world), sent);
     assert!(!world.switch.erased(), "the other install's account stays");
@@ -962,8 +1002,7 @@ async fn test_erasure_in_doubt_ends_erased_through_a_held_alarm() {
     };
     assert_eq!(signer.status(), SignerStatus::Erasing);
     let _ = signer.clear_alert(&alert).await;
-    signer.resume().await.unwrap();
-    assert_eq!(signer.status(), SignerStatus::Erased);
+    confirm_erasure(&world, &mut signer).await;
     assert_eq!(erase_requests(&world), 1);
 }
 
@@ -1010,8 +1049,7 @@ async fn test_erasure_unsigned_503_to_its_request_keeps_it_in_doubt() {
         signer.abort_erasure().await.unwrap_err(),
         SignerError::Refused(Refusal::ErasureUnanswered)
     );
-    signer.resume().await.unwrap();
-    assert_eq!(signer.status(), SignerStatus::Erased);
+    confirm_erasure(&world, &mut signer).await;
 }
 
 #[tokio::test]
@@ -1241,8 +1279,7 @@ async fn test_erasure_records_behind_in_doubt_ends_erased_on_the_404() {
     ));
     land();
     assert!(world.switch.erased());
-    signer.resume().await.unwrap();
-    assert_eq!(signer.status(), SignerStatus::Erased);
+    confirm_erasure(&world, &mut signer).await;
 }
 
 #[tokio::test]
@@ -1312,8 +1349,7 @@ async fn test_erasure_in_doubt_ends_erased_though_the_clone_published() {
     ));
     land();
     assert!(world.switch.erased());
-    signer.resume().await.unwrap();
-    assert_eq!(signer.status(), SignerStatus::Erased);
+    confirm_erasure(&world, &mut signer).await;
 }
 
 #[tokio::test]
@@ -1335,6 +1371,200 @@ async fn test_erasure_in_doubt_ends_erased_though_the_clone_signed_again() {
     a_clone_signs_on(&world, &next, signer.install_id(), true);
     land();
     assert!(world.switch.erased());
+    confirm_erasure(&world, &mut signer).await;
+}
+
+#[tokio::test]
+async fn test_erasure_in_doubt_404_ends_it_only_after_24_hours() {
+    // The request lands and its answer is lost. The next run meets the operator's `404`:
+    // erased but unconfirmed, the time kept through a restart, the erasure still not to be
+    // aborted. A run 23 hours on changes nothing; the first run 24 hours after the first
+    // `404` ends it erased (Switch wire 7.4.16, spec 12.7 step 5).
+    let world = World::new();
+    let (mut signer, _, store) = with_an_app(&world).await;
+    world.switch.fail_next(SwitchFault::LoseAnswer {
+        path: "/erase".into(),
+    });
+    signer.close_account(confirmed()).await.unwrap_err();
+    assert!(world.switch.erased());
+    let first = world.clock.now_ms();
+    assert_eq!(
+        signer.resume().await.unwrap_err(),
+        SignerError::Refused(Refusal::ErasureUnconfirmed { since_ms: first })
+    );
+    assert_eq!(
+        signer.status(),
+        SignerStatus::ErasedUnconfirmed { since_ms: first }
+    );
+    assert_eq!(
+        signer.abort_erasure().await.unwrap_err(),
+        SignerError::Refused(Refusal::ErasureUnanswered)
+    );
+    drop(signer);
+    world.clock.advance_ms(23 * 3_600_000);
+    let mut signer = Signer::open(world.env(store), world.keyring())
+        .await
+        .unwrap();
+    assert_eq!(
+        signer.resume().await.unwrap_err(),
+        SignerError::Refused(Refusal::ErasureUnconfirmed { since_ms: first })
+    );
+    world.clock.advance_ms(3_600_000);
+    signer.resume().await.unwrap();
+    assert_eq!(signer.status(), SignerStatus::Erased);
+    assert_eq!(erase_requests(&world), 1);
+}
+
+#[tokio::test]
+async fn test_erasure_signed_answer_ends_the_wait_and_the_request_goes_again() {
+    // The request never reached the switch, and an intermediary answers the checks `404`:
+    // erased but unconfirmed. Once the switch answers again, signed, the wait ends: the
+    // account is there, and the erasure goes on with its request, the same body; it lands
+    // (Switch wire 7.4.16).
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let world = World::new();
+    let (signer, _, store) = with_an_app(&world).await;
+    drop(signer);
+    let intermediary = Arc::new(AtomicBool::new(false));
+    let answering = Arc::clone(&intermediary);
+    let switch = Arc::clone(&world.switch);
+    let transport = Arc::new(MockTransport::with_handler(move |request| {
+        if answering.load(Ordering::SeqCst)
+            && request.method == "GET"
+            && request.path_and_query.ends_with("/apps")
+        {
+            return Ok(Response {
+                status: 404,
+                headers: Vec::new(),
+                body: b"{}".to_vec(),
+            });
+        }
+        switch.handle(request)
+    }));
+    let mut env = world.env(store);
+    env.transport = transport;
+    let mut signer = Signer::open(env, world.keyring()).await.unwrap();
+    world.switch.fail_next(SwitchFault::Unreachable {
+        path: "/erase".into(),
+        after: 0,
+    });
+    signer.close_account(confirmed()).await.unwrap_err();
+    assert!(!world.switch.erased());
+    intermediary.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        signer.resume().await.unwrap_err(),
+        SignerError::Refused(Refusal::ErasureUnconfirmed { .. })
+    ));
+    intermediary.store(false, Ordering::SeqCst);
+    // The signed check ends the wait; the request it sends again goes unanswered.
+    world.switch.fail_next(SwitchFault::Unreachable {
+        path: "/erase".into(),
+        after: 0,
+    });
+    signer.resume().await.unwrap_err();
+    assert_eq!(signer.status(), SignerStatus::Erasing);
+    signer.resume().await.unwrap();
+    assert_eq!(signer.status(), SignerStatus::Erased);
+    assert!(world.switch.erased());
+}
+
+#[tokio::test]
+async fn test_erasure_clock_set_back_starts_the_wait_again() {
+    // Erased but unconfirmed since a time the device clock is then set back before: the wait
+    // starts again from the clock's time, and ends 24 hours after it (Switch wire 7.4.16).
+    let world = World::new();
+    let (mut signer, _, _) = with_an_app(&world).await;
+    world.switch.fail_next(SwitchFault::LoseAnswer {
+        path: "/erase".into(),
+    });
+    signer.close_account(confirmed()).await.unwrap_err();
+    let first = world.clock.now_ms();
+    signer.resume().await.unwrap_err();
+    world.clock.set_ms(first - 3_600_000);
+    let again = world.clock.now_ms();
+    assert_eq!(
+        signer.resume().await.unwrap_err(),
+        SignerError::Refused(Refusal::ErasureUnconfirmed { since_ms: again })
+    );
+    world.clock.set_ms(again + ERASURE_CONFIRMATION_MS - 1);
+    assert!(matches!(
+        signer.resume().await.unwrap_err(),
+        SignerError::Refused(Refusal::ErasureUnconfirmed { .. })
+    ));
+    world.clock.set_ms(again + ERASURE_CONFIRMATION_MS);
+    signer.resume().await.unwrap();
+    assert_eq!(signer.status(), SignerStatus::Erased);
+}
+
+#[tokio::test]
+async fn test_erasure_unconfirmed_refuses_revocations() {
+    // While the erasure waits for the `404` to hold, a revocation is refused, sending
+    // nothing: it would need the switch, which doesn't answer (spec 12.7 step 5).
+    let world = World::new();
+    let (mut signer, id, _) = with_an_app(&world).await;
+    world.switch.fail_next(SwitchFault::LoseAnswer {
+        path: "/erase".into(),
+    });
+    signer.close_account(confirmed()).await.unwrap_err();
+    signer.resume().await.unwrap_err();
+    let before = world.transport.requests().len();
+    signer.revoke(id, None, confirmed()).await.unwrap_err();
+    assert!(
+        world.transport.requests()[before..]
+            .iter()
+            .all(|r| r.method == "GET"),
+        "nothing sent but reads"
+    );
+    assert!(matches!(
+        signer.status(),
+        SignerStatus::ErasedUnconfirmed { .. }
+    ));
+}
+
+#[tokio::test]
+async fn test_erasure_retry_meeting_the_404_waits_24_hours_too() {
+    // The first request is held on the way; the next check is signed, so the request goes
+    // again, and the held one lands just before it: the retry itself gets the operator's
+    // `404`. That too is only how a landed erasure looks: erased but unconfirmed, then erased
+    // 24 hours on (Switch wire 7.4.16).
+    let world = World::new();
+    let (signer, _, store) = with_an_app(&world).await;
+    drop(signer);
+    let switch = Arc::clone(&world.switch);
+    let held = Arc::new(std::sync::Mutex::new(None));
+    let transport = Arc::new(MockTransport::with_handler(move |request| {
+        if request.method == "POST" && request.path_and_query.ends_with("/erase") {
+            let mut held = held.lock().unwrap();
+            match held.take() {
+                // The first: held, and its answer never comes.
+                None if !switch.erased() && held.is_none() => {
+                    *held = Some(request.clone());
+                    return Err(pubky_switch_client::TransportError::Timeout);
+                }
+                // The retry: the held request lands first.
+                Some(first) => {
+                    let _ = switch.handle(&first);
+                }
+                None => {}
+            }
+        }
+        switch.handle(request)
+    }));
+    let mut env = world.env(store);
+    env.transport = transport;
+    let mut signer = Signer::open(env, world.keyring()).await.unwrap();
+    signer.close_account(confirmed()).await.unwrap_err();
+    assert!(!world.switch.erased());
+    let error = signer.resume().await.unwrap_err();
+    assert!(
+        matches!(
+            error,
+            SignerError::Refused(Refusal::ErasureUnconfirmed { .. })
+        ),
+        "{error:?}"
+    );
+    assert!(world.switch.erased());
+    world.clock.advance_ms(ERASURE_CONFIRMATION_MS);
     signer.resume().await.unwrap();
     assert_eq!(signer.status(), SignerStatus::Erased);
 }

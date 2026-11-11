@@ -156,6 +156,14 @@ pub enum SignerStatus {
     /// `identity.json` may be off the Homeserver already, and nothing else is signed until
     /// the erasure is done or aborted ([`Signer::abort_erasure`]).
     Erasing,
+    /// The erasure's request may have landed, and every check since `since_ms`, by the device
+    /// clock, has met the operator's `404`: the account looks erased, unconfirmed until it has
+    /// held for 24 hours (Switch wire 7.4.16, spec 12.7 step 5). Nothing else is signed, the
+    /// revocations included, and the erasure can't be aborted.
+    ErasedUnconfirmed {
+        /// When a check first met the `404`, in Unix milliseconds, by the device clock.
+        since_ms: u64,
+    },
     /// The identity's account at its switch is erased ([`Signer::close_account`]): the
     /// records stay, and nothing more is signed for it.
     Erased,
@@ -342,7 +350,11 @@ impl Signer {
                     unpublished,
                     reminded,
                     unanswered,
-                } => self.erase(unpublished, reminded, unanswered).await?,
+                    first_404_ms,
+                } => {
+                    self.erase(unpublished, reminded, unanswered, first_404_ms)
+                        .await?
+                }
                 Flow::Deliver {
                     doc,
                     prev,
@@ -372,8 +384,13 @@ impl Signer {
 
     /// Where the signer stands.
     pub fn status(&self) -> SignerStatus {
-        if matches!(self.flow, Some(Flow::Erase { .. })) {
-            return SignerStatus::Erasing;
+        match self.flow {
+            Some(Flow::Erase {
+                first_404_ms: Some(since_ms),
+                ..
+            }) => return SignerStatus::ErasedUnconfirmed { since_ms },
+            Some(Flow::Erase { .. }) => return SignerStatus::Erasing,
+            _ => {}
         }
         status_of(&self.state)
     }
