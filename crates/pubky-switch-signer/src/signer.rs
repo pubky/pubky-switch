@@ -27,6 +27,7 @@
 
 use std::sync::Arc;
 
+use pubky_switch_client::client::answers::AppsAnswer;
 use pubky_switch_client::clock::Clock;
 use pubky_switch_client::store::StoreHandle;
 use pubky_switch_client::transport::Transport;
@@ -943,8 +944,39 @@ impl Signer {
     /// /apps` `identity`, Switch wire 7.4.12). Any other copy stops the flow, as
     /// [`Signer::judge_copy`] says.
     async fn switch_at_mark(&mut self) -> Result<()> {
-        let held = self.service_client()?.apps().await?.identity;
+        let held = self.read_apps().await?.identity;
         self.confirm_copy(held.as_ref()).await
+    }
+
+    /// `GET /apps` (Switch wire 7.4.12), for a check of the switch's copy. A `404` the pinned
+    /// key didn't sign, with no erasure of this install's in progress, raises
+    /// [`Alert::AccountNotHosted`] and is returned as the error it is; the first answer the
+    /// pinned key signs clears it. Nothing else changes: an unauthenticated `404` with no
+    /// request in doubt is never an erasure (Switch wire 7.4.16).
+    pub(crate) async fn read_apps(&mut self) -> Result<AppsAnswer> {
+        let read = self.service_client()?.apps().await;
+        let raised = self.state.alerts.contains(&Alert::AccountNotHosted);
+        // An erasure in progress judges the `404` itself (Switch wire 7.4.16).
+        let erasing = matches!(self.flow, Some(Flow::Erase { .. }));
+        let raise = match &read {
+            Ok(_) if raised => Some(false),
+            Err(ClientError::BadServiceSignature { status: 404 }) if !raised && !erasing => {
+                Some(true)
+            }
+            _ => None,
+        };
+        if let Some(raise) = raise {
+            let mut state = self.state.clone();
+            if raise {
+                state.alert(Alert::AccountNotHosted);
+            } else {
+                state
+                    .alerts
+                    .retain(|alert| *alert != Alert::AccountNotHosted);
+            }
+            self.commit(state, self.flow.clone()).await?;
+        }
+        Ok(read?)
     }
 
     /// Judge the switch's copy of `identity.json`, `held` as `GET /apps` gave it, against the

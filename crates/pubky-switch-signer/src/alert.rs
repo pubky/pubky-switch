@@ -153,6 +153,14 @@ pub enum Alert {
     /// renews none by itself, and refuses to issue or renew one, until they agree again. It
     /// clears itself at the first run that finds them agreeing.
     ClockOff,
+    /// The switch answers `GET /apps` with a `404` its pinned key didn't sign, while no
+    /// erasure of this install's is in progress: the operator's answer for an identity the
+    /// service doesn't host, or an intermediary's. This install can't tell which, so it
+    /// deletes and changes nothing, and signs nothing while the switch can't be read (Switch
+    /// wire 7.3 step 2, 7.4.16). The account may have been erased from another copy of this
+    /// install; the way out is the user's, a restore or an enrollment elsewhere. It clears
+    /// itself at the first answer the pinned key signs.
+    AccountNotHosted,
     /// A removed app's Pubky grant still lets it write its Homeserver paths: the Pubky SDK
     /// offers no call to revoke a grant yet, so the user revokes it in the Homeserver's own
     /// settings (Switch spec 3.4, 12.2 step 1; design note, decision 4). Raised once for each

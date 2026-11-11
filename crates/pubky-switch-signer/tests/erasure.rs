@@ -1338,3 +1338,59 @@ async fn test_erasure_in_doubt_ends_erased_though_the_clone_signed_again() {
     signer.resume().await.unwrap();
     assert_eq!(signer.status(), SignerStatus::Erased);
 }
+
+#[tokio::test]
+async fn test_erasure_unsigned_404_with_nothing_in_doubt_raises_account_not_hosted() {
+    // With no erasure of its own in progress, an unsigned `404` to `GET /apps` raises the
+    // alert and changes nothing else: the records, the switch's account and the Homeserver's
+    // files stay, and only reads go out. The first signed answer clears it (Switch wire
+    // 7.3 step 2, 7.4.16).
+    let world = World::new();
+    let (signer, id, store) = with_an_app(&world).await;
+    let mark = signer.identity_doc().unwrap().unwrap();
+    drop(signer);
+    let mut signer = Signer::open(unsigned_404_for_apps(&world, store, 1), world.keyring())
+        .await
+        .unwrap();
+    let before = world.transport.requests().len();
+    let error = signer.run_due().await.unwrap_err();
+    assert!(
+        matches!(
+            error,
+            SignerError::Switch(pubky_switch_client::ClientError::BadServiceSignature {
+                status: 404
+            })
+        ),
+        "{error:?}"
+    );
+    assert!(signer.alerts().contains(&Alert::AccountNotHosted));
+    assert_eq!(signer.status(), SignerStatus::Signing);
+    assert_eq!(signer.identity_doc().unwrap().unwrap(), mark);
+    assert!(!world.switch.erased());
+    assert!(world.homeserver.file(IDENTITY_PATH).is_some());
+    assert!(world.homeserver.file(&app_record_path(&id)).is_some());
+    assert!(
+        world.transport.requests()[before..]
+            .iter()
+            .all(|r| r.method == "GET"),
+        "only reads"
+    );
+    signer.run_due().await.unwrap();
+    assert!(!signer.alerts().contains(&Alert::AccountNotHosted));
+}
+
+#[tokio::test]
+async fn test_erasure_in_doubt_ending_erased_raises_no_account_not_hosted() {
+    // The erasure's own request in doubt: the `404` that follows ends it erased, and the
+    // alert for an account the switch doesn't host isn't raised (Switch wire 7.4.16).
+    let world = World::new();
+    let (mut signer, _, _) = with_an_app(&world).await;
+    world.switch.fail_next(SwitchFault::LoseAnswer {
+        path: "/erase".into(),
+    });
+    signer.close_account(confirmed()).await.unwrap_err();
+    assert!(world.switch.erased());
+    signer.resume().await.unwrap();
+    assert_eq!(signer.status(), SignerStatus::Erased);
+    assert!(!signer.alerts().contains(&Alert::AccountNotHosted));
+}
