@@ -389,9 +389,13 @@ pub(crate) enum Readers {
     Every,
     /// The target app only: a `key_bundle.put`.
     App([u8; 16]),
-    /// Apps holding this switch permission: `claims.read` for a claim entry, `lists.read`
-    /// for `allow.*`, `deny.*` and the service's `conversation.add`.
+    /// Apps holding this switch permission: `lists.read` for `allow.*`, `deny.*` and the
+    /// service's `conversation.add`.
     Permission(Permission),
+    /// Apps with `claims.read`, while the claim is held: an entry of a compacted claim
+    /// (SETTLED with every attempt `done` or `failed`) loses its document, and every app
+    /// gets its stub (Switch wire 6.8 "Tombstones", 7.5).
+    Claim(Vec<u8>),
     /// Apps with `lists.read` or `conversation.add`: `invite_code.*`.
     ListsOrConversation,
     /// Apps holding the record's read scope: a `record.put`.
@@ -402,7 +406,7 @@ impl Readers {
     /// The readers of an operation of `kind`.
     pub(crate) fn of_op(kind: &OpKind) -> Self {
         match kind {
-            OpKind::Claim(_) => Self::Permission(Permission::ClaimsRead),
+            OpKind::Claim(fields) => Self::Claim(fields.claim_key.clone()),
             OpKind::RecordPut(put) => Self::Scope(put.policy.read_scope.clone()),
             OpKind::AllowPut { .. }
             | OpKind::AllowDelete { .. }
@@ -414,11 +418,18 @@ impl Readers {
         }
     }
 
-    /// Whether `app`, with certificate `cert`, reads the item in full.
-    fn read_by(&self, app: [u8; 16], cert: Option<&AppCert>) -> bool {
+    /// Whether `app`, with certificate `cert`, reads the item in full; `compacted` says
+    /// whether a claim is compacted, by its key.
+    fn read_by(
+        &self,
+        app: [u8; 16],
+        cert: Option<&AppCert>,
+        compacted: impl Fn(&[u8]) -> bool,
+    ) -> bool {
         let holds = |permission| cert.is_some_and(|c| c.has_permission(permission));
         match self {
             Self::Every => true,
+            Self::Claim(key) => holds(Permission::ClaimsRead) && !compacted(key),
             Self::App(target) => *target == app,
             Self::Permission(permission) => holds(*permission),
             Self::ListsOrConversation => {
@@ -1565,7 +1576,15 @@ impl Inner {
                     return None;
                 }
                 let cert = self.apps.get(&app).and_then(|held| held.cert.as_ref());
-                if !readers.read_by(app, cert) {
+                let compacted = |key: &[u8]| {
+                    <[u8; 32]>::try_from(key).is_ok_and(|key| {
+                        self.shared
+                            .claims
+                            .get(&key)
+                            .is_some_and(|claim| claim.tombstone)
+                    })
+                };
+                if !readers.read_by(app, cert, compacted) {
                     return Some(json!({ "type": "stub", "seq": seq, "stub": stub.to_value() }));
                 }
                 let mut value = json!({ "type": "chain", "seq": seq, "stub": stub.to_value(),

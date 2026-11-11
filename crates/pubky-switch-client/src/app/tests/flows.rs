@@ -4185,3 +4185,49 @@ async fn test_scripted_feed_shows_an_allow_put_in_full_only_to_lists_read() {
     assert_eq!(full["type"], "chain", "{full}");
     assert_eq!(full["item_type"], "op");
 }
+
+#[tokio::test]
+async fn test_scripted_feed_shows_a_compacted_claims_entries_as_stubs() {
+    // Switch wire 6.8 "Tombstones", 7.5: a claim SETTLED with every attempt done or failed
+    // is compacted at once, and its entries show as stubs, also to apps with `claims.read`.
+    let w = World::new();
+    let claim = [7; 32];
+    let attempt = [8; 16];
+    let mut writer = join_holding(&w, "writer", &Permission::ALL).await;
+    let reader = join_holding(&w, "reader", &[Permission::ClaimsRead]).await;
+    let before = w.switch.shown(reader.app_id()).len();
+    writer
+        .write_claim(
+            crate::app::ClaimOp::attempt(claim, 0, attempt, 3600, None),
+            vec![],
+            crate::app::ObligationDeadline::NoDeadline,
+        )
+        .await
+        .unwrap();
+    // While the attempt is open, its entry is read in full by `claims.read`.
+    let open = w.switch.shown(reader.app_id());
+    assert_eq!(open[before]["type"], "chain", "{}", open[before]);
+    let condition = writer.claim_condition(&claim).await.unwrap();
+    writer
+        .write_claim(
+            crate::app::ClaimOp::done(
+                claim,
+                1,
+                attempt,
+                pubky_switch_core::claims::Basis::Owner,
+                None,
+            )
+            .unwrap(),
+            vec![condition],
+            crate::app::ObligationDeadline::NoDeadline,
+        )
+        .await
+        .unwrap();
+    let shown = w.switch.shown(reader.app_id());
+    let entries = &shown[before..];
+    assert_eq!(entries.len(), 2, "{entries:?}");
+    assert!(
+        entries.iter().all(|item| item["type"] == "stub"),
+        "{entries:?}"
+    );
+}
