@@ -179,9 +179,13 @@ impl SigningClient {
     }
 
     /// `POST /erase` (Switch wire 7.4.16): erase the identity's account, naming the pinned
-    /// service key. Only the gated key's client sends it.
-    pub(crate) async fn erase(&self) -> std::result::Result<(), ClientError> {
-        self.0.erase().await
+    /// service key and the `identity.json` the erasure follows, `identity_hash`. Only the
+    /// gated key's client sends it.
+    pub(crate) async fn erase(
+        &self,
+        identity_hash: Option<[u8; 32]>,
+    ) -> std::result::Result<(), ClientError> {
+        self.0.erase(identity_hash).await
     }
 }
 

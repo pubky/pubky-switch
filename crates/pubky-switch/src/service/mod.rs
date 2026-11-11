@@ -1394,13 +1394,17 @@ impl Service {
                     .map_err(|error| Refused::with_head(error, serving));
             }
             Call::Erase => {
-                return Self::erase_answer(signer, &request.body)
-                    .map(|answer| (answer, false))
-                    .map_err(|error| Refused {
-                        error,
-                        serving,
-                        head: false,
-                    });
+                return Self::erase_answer(
+                    signer,
+                    &request.body,
+                    held.as_ref().map(IdentityDoc::hash),
+                )
+                .map(|answer| (answer, false))
+                .map_err(|error| Refused {
+                    error,
+                    serving,
+                    head: false,
+                });
             }
             Call::PutHandover => {
                 return self
