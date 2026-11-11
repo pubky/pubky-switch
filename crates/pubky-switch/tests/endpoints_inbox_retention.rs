@@ -1038,3 +1038,330 @@ async fn move_cursor_at(replay: &Replay, name: &str, seq: u64, at: &str) {
         String::from_utf8_lossy(&answer.body)
     );
 }
+
+/// What one entry of the tests' envelopes counts against the inbox quota.
+fn entry_bytes() -> u64 {
+    u64::try_from(sealed_to(&[receive_public("executor")], 1).len()).expect("len")
+        + Limits::default().entry_overhead_bytes
+}
+
+/// alice's account with the wallet and the executor current, at an inbox quota of four
+/// entries: each app's share is two (Switch wire 7.4.4). No sender share, so bob's shop
+/// alone may fill it.
+async fn lagging_replay() -> Option<Replay> {
+    let replay = replay_with(Limits {
+        quota_bytes: 4 * entry_bytes(),
+        sender_share_percent: 100,
+        ..Limits::default()
+    })
+    .await?;
+    with_bob(&replay).await;
+    register_executor(&replay).await;
+    Some(replay)
+}
+
+/// bob's shop appends an envelope wrapped to the apps `names`.
+async fn append_to(replay: &Replay, names: &[&str], byte: u8) {
+    let publics: Vec<[u8; 32]> = names.iter().map(|name| receive_public(name)).collect();
+    let version = apps_version(replay).await;
+    let answer = from_shop(replay, sealed_to(&publics, byte), Some(version), None).await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+}
+
+async fn lagging(replay: &Replay, name: &str) -> bool {
+    status_of(&apps_status(replay).await, name)["lagging"]
+        .as_bool()
+        .expect("lagging")
+}
+
+async fn count(replay: &Replay, kind: &str) -> i64 {
+    sql_value(
+        replay,
+        &format!("SELECT count(*) FROM inbox_entries WHERE account_id = $1 AND kind = '{kind}'"),
+    )
+    .await
+}
+
+/// `name`'s feed after `after`.
+async fn feed_of(replay: &Replay, name: &str, after: u64) -> Value {
+    let request = app_request(
+        app(&vectors("keys.json"), name),
+        "GET",
+        &format!("/v1/{}/feed?after=1:{after}", alice_id()),
+        Vec::new(),
+        ms(&at()),
+    );
+    let answer = replay.service.handle(request).await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    body(&answer)
+}
+
+fn items_of<'a>(feed: &'a Value, kind: &str) -> Vec<&'a Value> {
+    feed["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .filter(|item| item["type"] == kind)
+        .collect()
+}
+
+#[tokio::test]
+async fn test_inbox_a13_a_lagging_app_is_told_what_it_missed() {
+    let Some(replay) = lagging_replay().await else {
+        return;
+    };
+    let start = entry_seq_or(&replay, 0).await;
+    // Two entries for the executor alone: within its share, it isn't marked.
+    append_to(&replay, &["executor"], 1).await;
+    append_to(&replay, &["executor"], 2).await;
+    assert!(!lagging(&replay, "executor").await);
+    assert_eq!(count(&replay, "entry").await, 2);
+    // A third takes it past its share while the wallet is within its own: it is marked at
+    // that append, and the entries only it held go, counted in its missed item.
+    append_to(&replay, &["executor"], 3).await;
+    assert!(lagging(&replay, "executor").await);
+    assert!(!lagging(&replay, "wallet").await);
+    assert_eq!(count(&replay, "entry").await, 0);
+    assert_eq!(count(&replay, "missed").await, 1);
+    let first = entry_seq_or(&replay, 0).await;
+    // A later miss before the executor passes its item replaces it, at a new seq, covering
+    // both.
+    append_to(&replay, &["executor"], 4).await;
+    assert_eq!(count(&replay, "entry").await, 0);
+    assert_eq!(count(&replay, "missed").await, 1);
+    let second = entry_seq_or(&replay, 0).await;
+    assert!(second > first, "a new seq");
+    // The executor reads its feed: the item tells it what it missed, and its mark ends.
+    let feed = feed_of(&replay, "executor", start).await;
+    let missed = items_of(&feed, "missed");
+    assert_eq!(missed.len(), 1, "{feed}");
+    assert_eq!(missed[0]["seq"], second);
+    assert_eq!(missed[0]["entries"], 4);
+    assert_eq!(missed[0]["accepted_from"], at());
+    assert_eq!(missed[0]["accepted_until"], at());
+    assert!(items_of(&feed, "entry").is_empty());
+    assert!(!lagging(&replay, "executor").await);
+    // A13: the item waits for its app, marked or not: the wallet passing it changes
+    // nothing, and it goes once the executor's cursor passes it.
+    move_cursor(&replay, "wallet", second).await;
+    assert_eq!(count(&replay, "missed").await, 1);
+    assert!(items_of(&feed_of(&replay, "wallet", start).await, "missed").is_empty());
+    move_cursor(&replay, "executor", second).await;
+    assert_eq!(count(&replay, "missed").await, 0);
+    replay.db.drop_database().await.expect("drop");
+}
+
+/// The newest seq the inbox holds, or `or` when it holds nothing.
+async fn entry_seq_or(replay: &Replay, or: u64) -> u64 {
+    let seq = sql_value(
+        replay,
+        "SELECT coalesce(max(seq), 0) FROM inbox_entries WHERE account_id = $1",
+    )
+    .await;
+    u64::try_from(seq).ok().filter(|seq| *seq > 0).unwrap_or(or)
+}
+
+#[tokio::test]
+async fn test_inbox_a14_no_app_is_marked_while_none_is_within_its_share() {
+    let Some(replay) = lagging_replay().await else {
+        return;
+    };
+    // The executor marked first.
+    for byte in 1..=3 {
+        append_to(&replay, &["executor"], byte).await;
+    }
+    assert!(lagging(&replay, "executor").await);
+    // Entries for both apps until each is past its share: no current app is within it, so
+    // none is marked and the executor's mark ends; the entries wait for both.
+    for byte in 4..=6 {
+        append_to(&replay, &["executor", "wallet"], byte).await;
+    }
+    assert!(!lagging(&replay, "executor").await);
+    assert!(!lagging(&replay, "wallet").await);
+    assert_eq!(count(&replay, "entry").await, 3);
+    let newest = entry_seq(&replay).await;
+    move_cursor(&replay, "wallet", newest).await;
+    assert_eq!(
+        count(&replay, "entry").await,
+        3,
+        "they wait for the executor too"
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_inbox_without_trusted_time_entries_wait_for_lagging_apps() {
+    let Some(replay) = lagging_replay().await else {
+        return;
+    };
+    for byte in 1..=3 {
+        append_to(&replay, &["executor"], byte).await;
+    }
+    assert!(lagging(&replay, "executor").await);
+    // A fourth append, for both apps, then the wallet passes it at a service without
+    // trusted time: the entry waits for the lagging executor, and no missed item is
+    // written.
+    append_to(&replay, &["executor", "wallet"], 4).await;
+    let entry = entry_seq(&replay).await;
+    let missed_before = count(&replay, "missed").await;
+    let untrusted = replay.without_trusted_time();
+    let request = app_request(
+        app(&vectors("keys.json"), "wallet"),
+        "POST",
+        &format!("/v1/{}/ops", alice_id()),
+        OpsRequest::new(
+            &[],
+            Some(Position {
+                generation: 1,
+                seq: entry,
+            }),
+        )
+        .to_json(),
+        ms(&at()),
+    );
+    let answer = untrusted.handle(request).await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    assert_eq!(count(&replay, "entry").await, 1, "it waits");
+    assert_eq!(count(&replay, "missed").await, missed_before);
+    // With trusted time, the next release, at an append, lets it go into the executor's
+    // missed item.
+    append_to(&replay, &["wallet"], 5).await;
+    assert_eq!(
+        sql_value(
+            &replay,
+            &format!("SELECT count(*) FROM inbox_entries WHERE account_id = $1 AND seq = {entry}"),
+        )
+        .await,
+        0
+    );
+    let missed = sql_value(
+        &replay,
+        "SELECT missed_entries FROM inbox_entries WHERE account_id = $1 AND kind = 'missed'",
+    )
+    .await;
+    assert_eq!(missed, 4);
+    replay.db.drop_database().await.expect("drop");
+}
+
+/// The newest chain item's seq.
+async fn chain_seq(replay: &Replay) -> u64 {
+    u64::try_from(sql_value(replay, "SELECT chain_seq FROM accounts WHERE id = $1").await)
+        .expect("seq")
+}
+
+#[tokio::test]
+async fn test_inbox_a_revocation_turns_entries_unread_by_others_unreadable() {
+    let Some(replay) = replay().await else { return };
+    with_bob(&replay).await;
+    register_executor(&replay).await;
+    append_to(&replay, &["executor"], 1).await;
+    let entry = entry_seq(&replay).await;
+    let executor = app(&vectors("keys.json"), "executor")["app_id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    let answer = replay
+        .service
+        .handle(signer_request(
+            "POST",
+            &format!("/v1/{}/apps/{executor}/revoke", alice_id()),
+            Vec::new(),
+            ms(&at()),
+        ))
+        .await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    // After the revocation's chain item, in its request.
+    let revoke = chain_seq(&replay).await;
+    let unreadable = entry_seq(&replay).await;
+    assert!(
+        revoke > entry && unreadable > revoke,
+        "{entry} {revoke} {unreadable}"
+    );
+    let feed = feed_of(&replay, "wallet", entry).await;
+    let items = items_of(&feed, "unreadable");
+    assert_eq!(items.len(), 1, "{feed}");
+    assert_eq!(items[0]["seq"], unreadable);
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_inbox_a_leave_turns_entries_unread_by_others_unreadable() {
+    let Some(replay) = replay().await else { return };
+    with_bob(&replay).await;
+    register_executor(&replay).await;
+    append_to(&replay, &["executor"], 1).await;
+    let entry = entry_seq(&replay).await;
+    let keys = vectors("keys.json");
+    let executor = app(&keys, "executor");
+    let path = format!(
+        "/v1/{}/apps/{}/leave",
+        alice_id(),
+        executor["app_id"].as_str().expect("id")
+    );
+    let answer = replay
+        .service
+        .handle(app_request(executor, "POST", &path, Vec::new(), ms(&at())))
+        .await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    let leave = chain_seq(&replay).await;
+    let unreadable = entry_seq(&replay).await;
+    assert!(
+        leave > entry && unreadable > leave,
+        "{entry} {leave} {unreadable}"
+    );
+    assert_eq!(count(&replay, "unreadable").await, 1);
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_inbox_an_earlier_entry_with_no_current_target_is_converted_once_found() {
+    let Some(replay) = replay().await else { return };
+    with_bob(&replay).await;
+    register_executor(&replay).await;
+    append_to(&replay, &["executor"], 1).await;
+    // An entry left with no current target before departures converted them: wrapped to
+    // the revoked phone alone.
+    let phone = hex::encode(app_id_of("phone"));
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    sqlx::query(&format!(
+        "UPDATE inbox_entries SET targets = ARRAY[decode('{phone}', 'hex')] WHERE account_id = $1"
+    ))
+    .bind(alice_id())
+    .execute(&mut conn)
+    .await
+    .expect("legacy");
+    drop(conn);
+    // Found at the next cursor move with trusted time: it becomes an unreadable item.
+    let entry = entry_seq(&replay).await;
+    move_cursor(&replay, "executor", entry).await;
+    assert_eq!(count(&replay, "entry").await, 0);
+    assert_eq!(count(&replay, "unreadable").await, 1);
+    replay.db.drop_database().await.expect("drop");
+}
