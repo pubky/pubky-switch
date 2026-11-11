@@ -109,7 +109,7 @@ impl Inner {
         Ok(match (request.method.as_str(), route) {
             ("GET", "directory") => {
                 if !self.admits(sender, false) {
-                    return Ok(not_admitted());
+                    return Ok(self.not_admitted_now());
                 }
                 let (status, mut body) = self.directory();
                 body["known_version"] = self.known(&sender.identity);
@@ -118,8 +118,12 @@ impl Inner {
             // Where connect requests are on, a stranger delivers its document too, and asks
             // to connect (Switch wire 7.4.5, 7.4.7).
             ("PUT", "peers") => {
-                if !self.admits(sender, false) && !self.connect_requests_on() {
-                    return Ok(not_admitted());
+                // While admission is staged, a sender it can't otherwise admit waits, a
+                // stranger asking to connect included (Switch spec 12.6 step 2).
+                if !self.admits(sender, false)
+                    && (self.admission_staged || !self.connect_requests_on())
+                {
+                    return Ok(self.not_admitted_now());
                 }
                 self.peers_put(&sender.identity, &request.body)
             }
@@ -149,6 +153,20 @@ impl Inner {
         let hash = invite_code_hash(sender.code.as_deref()?).ok()?;
         let invite = self.shared.invites.get(&hash)?;
         (invite.uses < invite.max_uses && self.now() < invite.expires_at).then_some(hash)
+    }
+
+    /// The answer to a sender not admitted: `503 staged` while admission is staged after a
+    /// provider loss, so it retries, `403 not_admitted` otherwise (Switch spec 12.6 step 2).
+    fn not_admitted_now(&self) -> Answer {
+        if self.admission_staged {
+            bad(
+                ErrorCode::Staged,
+                "admission is staged after a provider loss",
+                json!(null),
+            )
+        } else {
+            not_admitted()
+        }
     }
 
     /// Whether `sender` is admitted (Switch spec 7): a contact, a conversation entry or a live
@@ -320,7 +338,7 @@ impl Inner {
         let mut by_code = None;
         if let Some(sender) = sender {
             if !self.admits(sender, false) {
-                return Ok(not_admitted());
+                return Ok(self.not_admitted_now());
             }
             if self.admits(sender, true) {
                 by_code = self.live_code(sender);
@@ -452,4 +470,79 @@ impl Inner {
 /// `403 not_admitted`, which carries no `current` (Switch wire 7.6).
 fn not_admitted() -> Answer {
     bad(ErrorCode::NotAdmitted, "not admitted", json!(null))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A request of `method` to `path` from another identity's app carrying `cert`.
+    fn foreign(
+        method: &str,
+        path: &str,
+        cert: &pubky_switch_core::records::AppCert,
+    ) -> crate::transport::Request {
+        crate::transport::Request {
+            method: method.into(),
+            origin: crate::testing::SWITCH_ORIGIN.into(),
+            path_and_query: path.into(),
+            headers: vec![crate::transport::Header {
+                name: header::CERT.into(),
+                value: cert.signed().compact(),
+            }],
+            body: b"{}".to_vec(),
+        }
+    }
+
+    #[test]
+    fn test_scripted_staged_admission_holds_senders_back() {
+        // While admission is staged after a provider loss, a sender the switch can't
+        // otherwise admit gets `503 staged` at `PUT /peers`, the inbox and the directory,
+        // and `403 not_admitted` once it ends (Switch spec 12.6 step 2; wire 7.4.3, 7.4.5,
+        // 7.4.10).
+        let identity = pubky_switch_core::keys::IdentityKey::from_secret([1; 32]);
+        let switch = ScriptedSwitch::new(
+            &identity,
+            [2; 32],
+            std::sync::Arc::new(crate::clock::TestClock::new(1_000)),
+        );
+        let mut inner = switch.lock();
+        let other = pubky_switch_core::keys::IdentityKey::from_secret([7; 32]);
+        let keys = pubky_switch_core::keys::AppKeys::from_secrets([8; 32], [9; 32]);
+        let cert = AppCert::issue(
+            &other,
+            pubky_switch_core::records::AppCertBody::new(
+                other.public(),
+                keys.signing_public(),
+                keys.bundle_public(),
+                vec!["notes".into()],
+                &[],
+                0,
+                86_400_000,
+            ),
+        )
+        .unwrap();
+        let sender = Sender {
+            identity: other.public(),
+            app: Some(cert.app_id()),
+            code: None,
+        };
+        let calls = [
+            ("PUT", "/peers", "peers"),
+            ("POST", "/inbox?apps_version=0", "inbox?apps_version=0"),
+            ("GET", "/directory", "directory"),
+        ];
+        for (staged, code) in [(true, "staged"), (false, "not_admitted")] {
+            inner.admission_staged = staged;
+            for (method, path, rest) in calls {
+                let request = foreign(method, path, &cert);
+                let (_, body) = inner.route_foreign(&request, &sender, rest).unwrap();
+                assert_eq!(
+                    body["code"],
+                    json!(code),
+                    "{method} {path}, staged {staged}"
+                );
+            }
+        }
+    }
 }

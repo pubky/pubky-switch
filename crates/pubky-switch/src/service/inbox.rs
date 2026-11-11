@@ -148,8 +148,18 @@ impl Service {
             } else {
                 self.live_invite(txn, invite_code, time_ms).await?
             };
-            // A stranger can't write at all: connect requests admit nobody to the inbox.
-            match admit(standing, removed, invite, false).ok_or_else(not_admitted)? {
+            // A stranger can't write at all: connect requests admit nobody to the inbox. While
+            // admission is staged after a provider loss, a sender it can't otherwise admit,
+            // a denied one included, gets `503 staged` and retries (Switch spec 12.6 step 2).
+            let staged = txn.admission_staged().await.map_err(|e| store_error(&e))?;
+            let refused = || {
+                if staged {
+                    super::recovery::staged_admission()
+                } else {
+                    not_admitted()
+                }
+            };
+            match admit(standing, removed, invite, false).ok_or_else(refused)? {
                 Admitted::Listed => {}
                 Admitted::InviteCode(code) => {
                     if !trusted {
@@ -159,7 +169,7 @@ impl Service {
                     }
                     by_code = Some(code);
                 }
-                Admitted::ConnectRequests => return Err(not_admitted()),
+                Admitted::ConnectRequests => return Err(refused()),
             }
             // A removed app is answered like a stranger with no copy held (Switch wire 7.2).
             if removed {

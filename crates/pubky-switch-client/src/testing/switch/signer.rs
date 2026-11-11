@@ -249,6 +249,28 @@ impl Inner {
         Ok(proof)
     }
 
+    /// `POST /v1/{id}/recovery/admission` from the signer (Switch wire 7.4.14): ends staged
+    /// admission with the `admission` transition's proof, or answers none when it isn't
+    /// staged; `404` without a recovery.
+    pub(super) fn recovery_admission(&mut self, body: &[u8]) -> Result<Answer, ScriptError> {
+        if !body.is_empty() {
+            return Ok(bad(ErrorCode::BadRequest, "the body is empty", json!(null)));
+        }
+        if self.recovery_from.is_none() {
+            return Ok(bad(ErrorCode::NotFound, "no recovery", json!(null)));
+        }
+        let mut proofs = Vec::new();
+        if self.admission_staged {
+            self.admission_staged = false;
+            let at = self.now();
+            proofs.push(self.service_transition(ServiceTransition::Admission { at })?);
+        }
+        Ok((
+            200,
+            json!({ "proofs": proofs, "head": self.head().to_value() }),
+        ))
+    }
+
     /// `PUT /v1/{id}/identity` from the signer, judged by the core's rules (Switch wire 3.3,
     /// 7.4.2).
     pub(super) fn put_identity(&mut self, body: &[u8]) -> Result<Answer, ScriptError> {
@@ -313,6 +335,8 @@ impl Inner {
                     let at = self.now();
                     self.recovery_from = Some(recovery_from);
                     self.recovery_declared_at = Some(at);
+                    // Staged whenever the document lists an app (Switch spec 12.6 step 2).
+                    self.admission_staged = !doc.body().apps.is_empty();
                     self.service_transition(ServiceTransition::Recovery { recovery_from, at })?;
                 }
                 let proof = self.chain_identity(&doc)?;
@@ -570,7 +594,7 @@ impl Inner {
             let declared_at = self.recovery_declared_at.unwrap_or_default();
             json!({ "recovery_from": from,
                     "declared_at": pubky_switch_core::time::rfc3339(declared_at),
-                    "admission_staged": false })
+                    "admission_staged": self.admission_staged })
         });
         let (records, entries) = self.shared.kept_proof_generations();
         let recovery_from = self.doc.as_ref().and_then(|d| d.body().recovery_from);
@@ -724,6 +748,57 @@ mod tests {
         assert_eq!(inner.recovery_from, Some(2));
         assert_eq!(inner.recovery_declared_at, Some(1_000));
         assert!(inner.any_first_n);
+        // It lists no app: admission isn't staged, and ending it chains nothing.
+        assert!(!inner.admission_staged);
+        let (status, body) = inner.recovery_admission(&[]).unwrap();
+        assert_eq!((status, body["proofs"].clone()), (200, json!([])));
+    }
+
+    #[test]
+    fn test_scripted_recovery_listing_an_app_stages_admission_until_the_signer_ends_it() {
+        // As at the service: staged at a recovery whose document lists an app; the signer's
+        // call ends it with the `admission` transition, and again chains nothing (Switch
+        // spec 12.6 step 2; wire 7.4.14).
+        use pubky_switch_core::records::{IdentityBody, IdentityPolicy, Inbox, ListedApp};
+        let identity = pubky_switch_core::keys::IdentityKey::from_secret([1; 32]);
+        let switch = ScriptedSwitch::new(
+            &identity,
+            [2; 32],
+            Arc::new(crate::clock::TestClock::new(1_000)),
+        );
+        let mut inner = switch.lock();
+        assert_eq!(inner.recovery_admission(&[]).unwrap().0, 404, "no recovery");
+        let mut body = IdentityBody::first(
+            identity.public(),
+            [3; 16],
+            Inbox {
+                url: inner.origin.clone(),
+                service_key: inner.service.verifying_key().to_bytes(),
+            },
+            IdentityPolicy::default(),
+        );
+        body.generation = 2;
+        body.recovery_from = Some(1);
+        body.apps.push(ListedApp {
+            app_id: [4; 16],
+            cert: [5; 32],
+        });
+        let doc = IdentityDoc::sign(&identity, body).unwrap();
+        let delivery = IdentityDelivery {
+            identity: doc.signed().clone(),
+            prev: None,
+        }
+        .to_json();
+        assert_eq!(inner.put_identity(&delivery).unwrap().0, 200);
+        assert!(inner.admission_staged);
+        let (status, body) = inner.recovery_admission(&[]).unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(body["proofs"].as_array().unwrap().len(), 1);
+        assert!(!inner.admission_staged);
+        let seq = inner.tip.seq;
+        let (_, body) = inner.recovery_admission(&[]).unwrap();
+        assert_eq!(body["proofs"], json!([]));
+        assert_eq!(inner.tip.seq, seq, "nothing chained");
     }
 
     #[test]

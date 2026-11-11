@@ -290,6 +290,9 @@ pub(crate) struct Inner {
     pub(crate) reachable_since: BTreeMap<[u8; 16], u64>,
     /// Every sender is admitted, whatever the lists say.
     pub(crate) open_admission: bool,
+    /// Admission is staged after a provider loss (Switch spec 12.6 step 2): a sender it can't
+    /// otherwise admit gets `503 staged`.
+    pub(crate) admission_staged: bool,
     /// The `directory_version`: it moves whenever the directory changes.
     pub(crate) directory_version: u64,
     /// The origin the switch serves at, which an enrollment names (Switch wire 3.7).
@@ -372,6 +375,7 @@ impl Inner {
             apps_version: 0,
             reachable_since: BTreeMap::new(),
             open_admission: false,
+            admission_staged: false,
             directory_version: 0,
             origin: SWITCH_ORIGIN.to_owned(),
             enrolled: Some(signer::Enrolled::default()),
@@ -1684,6 +1688,7 @@ impl Inner {
                 ("GET", "directory") => self.directory(),
                 ("GET", "identity") => self.identity_answer(),
                 ("POST", "recovery/upload") => self.upload(request, None)?,
+                ("POST", "recovery/admission") => self.recovery_admission(&request.body)?,
                 ("POST", "ops") => self.ops(None, &request.body)?,
                 ("GET", "allow") => self.allow_answer(),
                 ("GET", "feed") => self.feed(None, query),

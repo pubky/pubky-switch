@@ -146,8 +146,18 @@ impl Service {
         } else {
             self.live_invite(txn, invite_code, time_ms).await?
         };
-        let admitted =
-            admit(standing, removed, invite, connect_requests).ok_or_else(not_admitted)?;
+        // While admission is staged after a provider loss, a sender it can't otherwise admit,
+        // a denied one included, gets `503 staged` and retries (Switch spec 12.6 step 2; wire
+        // 7.4.5).
+        let staged = txn.admission_staged().await.map_err(|e| storage(&e))?;
+        let refused = || {
+            if staged {
+                super::recovery::staged_admission()
+            } else {
+                not_admitted()
+            }
+        };
+        let admitted = admit(standing, removed, invite, connect_requests).ok_or_else(refused)?;
         match admitted {
             Admitted::Listed => {}
             Admitted::InviteCode(hash) => {
@@ -167,6 +177,9 @@ impl Service {
                         ApiError::rate_limited("9.4: reads with this invite code", retry_after)
                     })?;
             }
+            // While admission is staged, the deny list isn't back yet, so a denied sender
+            // would pass for a stranger: a stranger waits too (Switch spec 12.6 step 2).
+            Admitted::ConnectRequests if staged => return Err(refused()),
             Admitted::ConnectRequests => {
                 self.stranger_rate
                     .take(account.id.clone(), self.limits.stranger_per_min, time_ms)
