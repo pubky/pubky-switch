@@ -13,6 +13,7 @@ mod enrollment;
 mod join;
 mod lists;
 mod messaging;
+mod renewal;
 
 use std::future::Future;
 use std::pin::Pin;
@@ -24,6 +25,7 @@ pub use enrollment::enrollment;
 pub use join::join;
 pub use lists::lists_without_read;
 pub use messaging::messaging;
+pub use renewal::renewal;
 
 use crate::{FlowResult, World};
 
@@ -46,6 +48,7 @@ pub const FLOWS: &[(&str, Flow)] = &[
         Box::pin(lists_without_read(world))
     }),
     ("claim", |world| Box::pin(claim(world))),
+    ("renewal", |world| Box::pin(renewal(world))),
 ];
 
 /// The flow that sends `call` to the service; `None` for a call the service doesn't serve
