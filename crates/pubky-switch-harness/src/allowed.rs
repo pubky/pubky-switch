@@ -260,6 +260,36 @@ pub static ALLOWED: &[Allowed] = &[
         reason: COMPACTED_CLAIM,
         reference: "Switch wire 6.8 \"Tombstones\"; 7.5",
     },
+    Allowed {
+        flow: "revocation",
+        label: "{alice/phone} GET /v1/{alice}/apps/{alice/phone}/keys",
+        fact: "body.current",
+        service: NOTHING,
+        scripted: "null",
+        reason: NULL_CURRENT,
+        reference: "Switch wire, Conventions, \"Absent and null\"; Switch wire 7.1, error bodies",
+    },
+    Allowed {
+        flow: "revocation",
+        label: "{alice/tablet} GET /v1/{alice}/apps/{alice/tablet}/keys",
+        fact: "body.current",
+        service: NOTHING,
+        scripted: "null",
+        reason: NULL_CURRENT,
+        reference: "Switch wire, Conventions, \"Absent and null\"; Switch wire 7.1, error bodies",
+    },
+    Allowed {
+        flow: "departure",
+        label: "{alice} GET /v1/{alice}/apps",
+        fact: "body.apps[0].last_seen",
+        service: "time 2026-01-01T00:05:06.250Z",
+        scripted: "time 2026-01-01T00:04:05.000Z",
+        reason: "The phone's `leave` is its latest request past authentication, so the service \
+                 shows the leave's time as its `last_seen`. The scripted switch doesn't count \
+                 the leave and shows the time of the phone's request before it.",
+        reference: "Switch wire 7.4.12, `last_seen`, which the table gives no rule; `FAKES.md` \
+                    says the scripted switch means the latest request past authentication",
+    },
 ];
 
 #[cfg(test)]
