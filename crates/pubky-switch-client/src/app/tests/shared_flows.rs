@@ -19,8 +19,8 @@ use super::*;
 use crate::app::{
     Alarm, AppError, AppEvent, ClaimOp, Collection, Delivery, IdentityRefresh,
     MAX_REGRESSION_REASON_BYTES, MAX_SEEN_MARK_BYTES, ObligationDeadline, OpBatch, OutgoingMessage,
-    RecordContent, RecordJob, RecordTarget, Refusal, SentMessage, UndeliverableReason, WriteBase,
-    claim_conflict,
+    RecordContent, RecordJob, RecordTarget, Refusal, SentMessage, UndeliverableReason, Unopened,
+    WriteBase, claim_conflict,
 };
 use crate::store::StoreHandle;
 use crate::store::{Fault as StoreFault, FaultStore};
@@ -5070,7 +5070,11 @@ async fn test_records_held_unreadable_opens_once_its_key_arrives() {
     let key = record_at_a_new_epoch(&s, &mut wallet, &mut phone).await;
     wallet.receive(None).await.unwrap();
     let held = wallet.shared_record(&key).await.unwrap().unwrap();
-    assert_eq!(held.content, RecordContent::Unreadable);
+    assert_eq!(
+        held.content,
+        RecordContent::Unreadable(Unopened::KeyNotHeld { data_epoch: 2 }),
+        "for now"
+    );
     let listings = s.w.switch.lock().shared.listings;
     store_parts_for(&s, &wallet.cert().clone());
     let report = wallet.receive(None).await.unwrap();
@@ -5097,7 +5101,11 @@ async fn test_records_relist_opens_a_record_held_unreadable() {
     let key = record_at_a_new_epoch(&s, &mut wallet, &mut phone).await;
     wallet.list_collection(&items()).await.unwrap();
     let held = wallet.shared_record(&key).await.unwrap().unwrap();
-    assert_eq!(held.content, RecordContent::Unreadable);
+    assert_eq!(
+        held.content,
+        RecordContent::Unreadable(Unopened::KeyNotHeld { data_epoch: 2 }),
+        "for now"
+    );
     store_parts_for(&s, &wallet.cert().clone());
     wallet.receive(None).await.unwrap();
     wallet.list_collection(&items()).await.unwrap();
@@ -5140,7 +5148,11 @@ async fn test_records_unopenable_with_its_key_held_is_tried_once() {
         .unwrap();
     wallet.receive(None).await.unwrap();
     let held = wallet.shared_record(&key).await.unwrap().unwrap();
-    assert_eq!(held.content, RecordContent::Unreadable);
+    assert_eq!(
+        held.content,
+        RecordContent::Unreadable(Unopened::KeyNotHeld { data_epoch: 2 }),
+        "for now"
+    );
     store_parts_for(&s, &wallet.cert().clone());
     let report = wallet.receive(None).await.unwrap();
     assert_eq!(
@@ -5150,8 +5162,12 @@ async fn test_records_unopenable_with_its_key_held_is_tried_once() {
         report.events
     );
     let held = wallet.shared_record(&key).await.unwrap().unwrap();
-    assert_eq!(held.content, RecordContent::Unreadable);
-    // Not tried at every read.
+    assert_eq!(
+        held.content,
+        RecordContent::Unreadable(Unopened::DoesNotOpen),
+        "for good"
+    );
+    // Not tried at every read, nor at a fetch that takes no key.
     for _ in 0..2 {
         let report = wallet.receive(None).await.unwrap();
         assert!(
@@ -5160,4 +5176,6 @@ async fn test_records_unopenable_with_its_key_held_is_tried_once() {
             report.events
         );
     }
+    wallet.fetch_key_bundle().await.unwrap();
+    assert!(flagged_rules(&wallet.take_events()).is_empty());
 }

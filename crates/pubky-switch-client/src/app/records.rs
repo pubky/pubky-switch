@@ -264,13 +264,63 @@ impl RecordTarget {
 
 /// What a record holds, as the app reads it. Its `Debug` shows only the size.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "StoredContent", into = "StoredContent")]
 pub enum RecordContent {
     /// The value's JSON bytes.
-    Value(#[serde(with = "serde_b64_vec")] Vec<u8>),
+    Value(Vec<u8>),
     /// A delete: the sealed empty plaintext (Switch wire 6.2).
     Deleted,
-    /// Sealed at a data epoch whose key the app doesn't hold (Switch spec 3.5).
+    /// The value isn't open, for now or for good ([`Unopened`]).
+    Unreadable(Unopened),
+}
+
+/// Why a record's value isn't open (Switch spec 3.5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Unopened {
+    /// For now: sealed at a data epoch whose key for its scope the app doesn't hold yet. An
+    /// app is given the keys of every data epoch from 1 to the current one for each scope
+    /// it holds, its approval's bundle and later parts included, so the key comes, and the
+    /// value opens once it is fetched.
+    KeyNotHeld {
+        /// The data epoch the value is sealed at.
+        data_epoch: u64,
+    },
+    /// For good: the key is held and the value doesn't open with it. The write was
+    /// flagged ([`super::AppEvent::WriteFlagged`]) and isn't tried again.
+    DoesNotOpen,
+}
+
+/// [`RecordContent`] as the store holds it: a value not open for now is kept as before,
+/// its data epoch read from the kept operation.
+#[derive(Serialize, Deserialize)]
+enum StoredContent {
+    Value(#[serde(with = "serde_b64_vec")] Vec<u8>),
+    Deleted,
     Unreadable,
+    DoesNotOpen,
+}
+
+impl From<StoredContent> for RecordContent {
+    fn from(stored: StoredContent) -> Self {
+        match stored {
+            StoredContent::Value(bytes) => Self::Value(bytes),
+            StoredContent::Deleted => Self::Deleted,
+            StoredContent::Unreadable => Self::Unreadable(Unopened::KeyNotHeld { data_epoch: 0 }),
+            StoredContent::DoesNotOpen => Self::Unreadable(Unopened::DoesNotOpen),
+        }
+    }
+}
+
+impl From<RecordContent> for StoredContent {
+    fn from(content: RecordContent) -> Self {
+        match content {
+            RecordContent::Value(bytes) => Self::Value(bytes),
+            RecordContent::Deleted => Self::Deleted,
+            RecordContent::Unreadable(Unopened::KeyNotHeld { .. }) => Self::Unreadable,
+            RecordContent::Unreadable(Unopened::DoesNotOpen) => Self::DoesNotOpen,
+        }
+    }
 }
 
 impl std::fmt::Debug for RecordContent {
@@ -278,7 +328,7 @@ impl std::fmt::Debug for RecordContent {
         match self {
             Self::Value(bytes) => write!(f, "Value({} bytes)", bytes.len()),
             Self::Deleted => f.write_str("Deleted"),
-            Self::Unreadable => f.write_str("Unreadable"),
+            Self::Unreadable(why) => write!(f, "Unreadable({why:?})"),
         }
     }
 }
@@ -290,6 +340,11 @@ impl RecordContent {
             Self::Value(bytes) => Some(bytes),
             _ => None,
         }
+    }
+
+    /// Whether the value isn't open for now only: its key isn't held yet.
+    fn waits_for_key(&self) -> bool {
+        matches!(self, Self::Unreadable(Unopened::KeyNotHeld { .. }))
     }
 }
 
@@ -464,10 +519,27 @@ impl HeldRecord {
             authenticated: self.authenticated,
             writer: self.writer,
             written_at_ms: self.written_at_ms,
-            content: self.content.clone(),
+            content: match self.content {
+                // The data epoch from the kept operation, which a value stored before it was
+                // kept doesn't carry.
+                RecordContent::Unreadable(Unopened::KeyNotHeld { .. }) => {
+                    RecordContent::Unreadable(Unopened::KeyNotHeld {
+                        data_epoch: sealed_epoch(&self.op).unwrap_or(0),
+                    })
+                }
+                ref content => content.clone(),
+            },
             doubtful: self.doubtful,
             flagged: self.follow.is_some(),
         }
+    }
+}
+
+/// The data epoch a kept `record.put` seals its value at.
+fn sealed_epoch(op: &SignedDoc) -> Option<u64> {
+    match &SignedOp::peek(op).ok()?.body().kind {
+        OpKind::RecordPut(put) => Some(put.value_sealed.data_epoch),
+        _ => None,
     }
 }
 
@@ -538,6 +610,9 @@ enum Refused {
     Misbehaviour(String),
     /// A failed check: ignored and shown with the app it names.
     Invalid { writer: [u8; 16], reason: String },
+    /// A value that doesn't open with its key held: as [`Refused::Invalid`], and a record
+    /// held with this very write not open for now is held as not opening for good.
+    DoesNotOpen { writer: [u8; 16], reason: String },
     /// Not a write the app takes: another collection, or a writer it can't find.
     Ignored,
     /// A write without a record view, that no certificate the app holds authorizes, while
@@ -821,7 +896,7 @@ impl App {
         let held = self.reader().scan::<HeldRecord>(RECORD_PREFIX).await?;
         let mut tx = self.tx()?;
         for (_, record) in held {
-            if record.content != RecordContent::Unreadable {
+            if !record.content.waits_for_key() {
                 continue;
             }
             let Ok(op) = SignedOp::peek(&record.op) else {
@@ -958,6 +1033,19 @@ impl App {
                 return Err(self.raise(Alarm::Rollback { reason }).await);
             }
             Err(Refused::Invalid { writer, reason }) => {
+                self.flag_write(&shown_key, version, writer, reason, tx)
+                    .await?;
+            }
+            Err(Refused::DoesNotOpen { writer, reason }) => {
+                // The record held with this very write, not open for now, won't open: its
+                // version is the write's, so the flag below doesn't write it again.
+                if let Some(mut held) = self.held_record(&shown_key).await?
+                    && held.op == *evidence.op
+                    && held.content.waits_for_key()
+                {
+                    held.content = RecordContent::Unreadable(Unopened::DoesNotOpen);
+                    tx.put(&record_key_of(&shown_key), &held)?;
+                }
                 self.flag_write(&shown_key, version, writer, reason, tx)
                     .await?;
             }
@@ -1157,9 +1245,16 @@ impl App {
                     .get(put.value_sealed.data_epoch, &put.value_sealed.scope)
                     .is_none() =>
             {
-                RecordContent::Unreadable
+                RecordContent::Unreadable(Unopened::KeyNotHeld {
+                    data_epoch: put.value_sealed.data_epoch,
+                })
             }
-            Err(_) => return invalid("Switch wire 6.2 step 7: the value doesn't open"),
+            Err(_) => {
+                return Ok(Err(Refused::DoesNotOpen {
+                    writer,
+                    reason: "Switch wire 6.2 step 7: the value doesn't open".into(),
+                }));
+            }
         };
         Ok(Ok(Accepted {
             key: put.key,
@@ -1433,8 +1528,8 @@ impl App {
         let held = self.held_record(&key).await?;
         let reopened = held.as_ref().is_some_and(|held| {
             held.item_hash == accepted.item_hash
-                && held.content == RecordContent::Unreadable
-                && accepted.content != RecordContent::Unreadable
+                && held.content.waits_for_key()
+                && !matches!(accepted.content, RecordContent::Unreadable(_))
         });
         if let Some(held) = held.as_ref().filter(|_| reopened)
             && held.authenticated

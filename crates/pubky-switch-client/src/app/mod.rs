@@ -101,7 +101,7 @@ pub use directory::{
 };
 pub use records::{
     Collection, FlaggedWrite, KeptOp, PolicyFamily, RecordContent, RecordTarget, SharedEvidence,
-    SharedRecord,
+    SharedRecord, Unopened,
 };
 pub use send::{
     Delivery, OutboxReport, OutgoingMessage, RecordJob, SENT_RETENTION_MS, SentMessage,
