@@ -74,6 +74,17 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
     doesn't carry the stored answers, so a retry after a move appends again.
 - **`PUT /peers`** (Switch wire 7.4.5) keeps every copy it takes: no peer limit, but for
   `forget_peer_copy`.
+- **`GET /records/{key}` and `GET /records`** (Switch wire 7.4.9), in `switch/shared.rs`:
+  order, `after`, `limit`, the byte budget with its first view shown, `next`, and deleted
+  records shown by key and left out of lists are the service's. Unlike the service:
+  - a record by key is served `200` to any own app, without checking its `read_scope`
+    (the service answers `403 permission_missing`);
+  - the signer is served too, and its list shows every record (the service answers `403
+    permission_missing` to both);
+  - a view's `cert` is the writer's current certificate, not the one the write was checked
+    against, which a renewal or revocation later doesn't change (7.4.9);
+  - a list without `collection` falls through to the switch's other routes rather than
+    `400`, and `after` is compared as raw text, never refused as a malformed key.
 - **`open_admission`** (`admit_everyone`) admits every sender the deny list doesn't hold, a
   test switch only.
 - **App currency outside batches**: a feed read is checked as a batch is, for an app that
