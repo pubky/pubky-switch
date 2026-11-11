@@ -1025,7 +1025,10 @@ impl App {
     /// locally and every processed pair the app keeps (for 30 days plus the clock
     /// tolerance). While they add up to more than the batch size, every layered backup is
     /// refused, with [`AppEvent::BackupRefused`] for the host, until they drain: entries
-    /// stored locally as they are processed, processed pairs as they age out.
+    /// stored locally as they are processed, processed pairs as they age out. It applies the
+    /// bounds on entries stored unverified first, as a read does (Switch spec 8.2), so the
+    /// backup holds at most [`MAX_UNVERIFIED_TOTAL`] of them, and keeps the duty events of
+    /// what they drop.
     ///
     /// # Errors
     ///
@@ -1039,6 +1042,10 @@ impl App {
             let Some(name) = self.protocol.backup_name() else {
                 return Err(Refusal::NotNow("the protocol names no backup layer".into()).into());
             };
+            // The bounds on entries stored unverified first, as at a read, so a pile stored
+            // during the last read doesn't go into the backup (Switch spec 8.2).
+            self.ready_local().await?;
+            self.bound_unverified().await?;
             let reader = self.reader();
             let state = Self::read_state(&reader).await?;
             let mut backup = Self::backup_of(&state)?;
