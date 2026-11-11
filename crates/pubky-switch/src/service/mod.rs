@@ -845,6 +845,13 @@ impl Service {
                                 if is_failed_authentication(refusal.error.code) {
                                     self.record_failure(request, txn_account.clone());
                                 }
+                                // Signed once the lock is gone: only while the account still
+                                // names the key, as every such answer (7.4.16).
+                                if let Some(error) =
+                                    self.no_longer_keyed(&txn_account, &txn_key).await
+                                {
+                                    return self.operator_answer(signature, base_ms, &error).await;
+                                }
                                 let head = if refusal.head { fallback_head } else { None };
                                 sign_answer(
                                     &signer,

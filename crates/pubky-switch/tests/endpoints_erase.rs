@@ -932,6 +932,9 @@ struct Gate {
     release: tokio::sync::Notify,
     fail_ledger: std::sync::atomic::AtomicBool,
     fail_delete: std::sync::atomic::AtomicBool,
+    fail_advance: std::sync::atomic::AtomicBool,
+    /// The erasures it was asked to record.
+    recorded: std::sync::atomic::AtomicUsize,
 }
 
 impl KeyStore for Gate {
@@ -968,6 +971,11 @@ impl KeyStore for Gate {
                 self.paused.notify_one();
                 self.release.notified().await;
             }
+            if self.fail_advance.load(Ordering::SeqCst) {
+                return Err(pubky_switch::keys::KeyStoreError::Io(
+                    std::io::Error::other("read-only"),
+                ));
+            }
             let moved = self.inner.advance_mark(id, head).await;
             if pause && self.after {
                 self.paused.notify_one();
@@ -991,6 +999,8 @@ impl KeyStore for Gate {
         identity: &'a str,
         erased_at_ms: u64,
     ) -> pubky_switch::keys::KeyFuture<'a, ()> {
+        self.recorded
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if self.fail_ledger.load(std::sync::atomic::Ordering::SeqCst) {
             return Box::pin(async {
                 Err(pubky_switch::keys::KeyStoreError::Io(
@@ -1016,6 +1026,8 @@ fn gated(replay: &mut Replay, after: bool) -> std::sync::Arc<Gate> {
         release: tokio::sync::Notify::new(),
         fail_ledger: std::sync::atomic::AtomicBool::new(false),
         fail_delete: std::sync::atomic::AtomicBool::new(false),
+        fail_advance: std::sync::atomic::AtomicBool::new(false),
+        recorded: std::sync::atomic::AtomicUsize::new(0),
     });
     replay.service = pubky_switch::service::Service::new(
         ORIGIN.into(),
@@ -1377,5 +1389,73 @@ async fn test_erase_refusal_moves_no_mark() {
     let answer = erase(&replay, &[7; 32], &revoke_time()).await;
     assert_eq!(code_of(&answer), (409, json!("conflict")));
     assert!(no_head(&answer));
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_erase_feed_refusal_after_an_erasure_whose_key_stays_isnt_signed_with_it() {
+    // The key store fails: the erasure's key isn't deleted, and a feed page's mark move then
+    // fails too. The refusal goes out once the lock is gone, so as for an account gone, not
+    // signed with the erased key, and without its head (7.4.16).
+    use std::sync::atomic::Ordering;
+    let Some(mut replay) = replay().await else {
+        return;
+    };
+    let gate = gated(&mut replay, false);
+    replay_chain_through_revoke(&replay).await;
+    let at = revoke_time();
+    let keys = vectors("keys.json");
+    let request = app_request(
+        app(&keys, "wallet"),
+        "GET",
+        &format!("/v1/{}/feed?after=1:0", alice_id()),
+        Vec::new(),
+        ms(&at),
+    );
+    let request_signature = signature_of(&request);
+    gate.arm(1);
+    let (answer, erased) = tokio::join!(replay.service.handle(request), async {
+        gate.paused.notified().await;
+        gate.fail_ledger.store(true, Ordering::SeqCst);
+        let erased = erase(&replay, &alice_service_key(), &at).await;
+        gate.fail_advance.store(true, Ordering::SeqCst);
+        gate.release.notify_one();
+        erased
+    });
+    assert_eq!(code_of(&erased), (503, json!("unavailable")));
+    assert_eq!(code_of(&answer), (503, json!("unavailable")));
+    assert!(no_head(&answer));
+    assert!(operator_signed(&answer, Some(&request_signature)));
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_erase_retries_sweep_a_few_times_a_minute() {
+    // A retried erasure of an account gone sweeps its owed keys at most six times a minute
+    // for the account: the request is unauthenticated (7.4.16).
+    use std::sync::atomic::Ordering;
+    let Some(mut replay) = replay().await else {
+        return;
+    };
+    let gate = gated(&mut replay, false);
+    replay_chain_through_revoke(&replay).await;
+    gate.fail_ledger.store(true, Ordering::SeqCst);
+    let at = revoke_time();
+    assert_eq!(
+        code_of(&erase(&replay, &alice_service_key(), &at).await).0,
+        503
+    );
+    let first = gate.recorded.load(Ordering::SeqCst);
+    for _ in 0..10 {
+        assert_eq!(
+            code_of(&erase(&replay, &alice_service_key(), &at).await).0,
+            503
+        );
+    }
+    assert_eq!(
+        gate.recorded.load(Ordering::SeqCst) - first,
+        6,
+        "six sweeps in the minute"
+    );
     replay.db.drop_database().await.expect("drop");
 }
