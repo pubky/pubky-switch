@@ -255,8 +255,12 @@ impl<'a> LocalView<'a> {
 }
 
 /// What a protocol's restore step can read ([`super::Protocol::restore_layer`]): the
-/// identity, the App ID and the naming key of the backup being restored, which the restored
-/// app goes on with, before anything is written.
+/// identity, the App ID, the certificate and the naming key of the backup being restored,
+/// which the restored app goes on with, before anything is written.
+///
+/// With the certificate the protocol checks what the restored app may do by its own rules,
+/// such as scopes or permissions it requires beyond the switch's, and refuses a backup it
+/// wouldn't run with, before the restore commits ([`RestoreContext::cert`]).
 ///
 /// With the naming key the protocol checks its layer against the identity before the
 /// restore commits, such as that each claim key or record key it keeps is the one its
@@ -275,15 +279,31 @@ pub struct RestoreContext<'a> {
     identity: [u8; 32],
     app_id: [u8; 16],
     naming: &'a NamingKey,
+    cert: &'a AppCert,
 }
 
 impl<'a> RestoreContext<'a> {
-    pub(crate) fn new(identity: [u8; 32], app_id: [u8; 16], naming: &'a NamingKey) -> Self {
+    pub(crate) fn new(
+        identity: [u8; 32],
+        app_id: [u8; 16],
+        naming: &'a NamingKey,
+        cert: &'a AppCert,
+    ) -> Self {
         Self {
             identity,
             app_id,
             naming,
+            cert,
         }
+    }
+
+    /// The certificate the restore installs: the backup's own, which the app has checked
+    /// is signed by the identity and names this App ID and the backup's signing key. It
+    /// isn't checked against the identity's current `identity.json` here, nor for expiry:
+    /// after the restore, before it sends anything, the app takes the certificate its
+    /// `identity.json` lists if the backup's was renewed since (Switch spec 12.4).
+    pub fn cert(&self) -> &'a AppCert {
+        self.cert
     }
 
     /// The identity.

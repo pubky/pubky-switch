@@ -86,14 +86,16 @@ pub use switch::{Fault, HeldRecord, MAX_PAGE_BYTES, SWITCH_ORIGIN, ScriptedSwitc
 pub(crate) use switch::{Item, PushReg};
 
 /// A [`RestoreContext`](crate::app::RestoreContext) for a protocol's own tests of its
-/// [`Protocol::restore_layer`](crate::app::Protocol::restore_layer): the identity, App ID
-/// and naming key of a backup the test builds, as [`crate::app::App::restore`] passes them.
-pub fn restore_context(
+/// [`Protocol::restore_layer`](crate::app::Protocol::restore_layer): the identity, App ID,
+/// naming key and certificate of a backup the test builds, as [`crate::app::App::restore`]
+/// passes them once it has checked the certificate ([`issue_cert`] builds one).
+pub fn restore_context<'a>(
     identity: [u8; 32],
     app_id: [u8; 16],
-    naming: &pubky_switch_core::ident::NamingKey,
-) -> crate::app::RestoreContext<'_> {
-    crate::app::RestoreContext::new(identity, app_id, naming)
+    naming: &'a pubky_switch_core::ident::NamingKey,
+    cert: &'a pubky_switch_core::records::AppCert,
+) -> crate::app::RestoreContext<'a> {
+    crate::app::RestoreContext::new(identity, app_id, naming, cert)
 }
 
 use pubky_switch_core::keys::{AppKeys, IdentityKey, ReceiveKey};
