@@ -1315,8 +1315,9 @@ impl App {
     /// # Errors
     ///
     /// [`Refusal::Stopped`] or [`Refusal::Left`] for a stopped or departed app;
-    /// [`Refusal::Usage`] when the certificate holds none of the write scopes, or when the
-    /// protocol's mark of the value ([`super::Protocol::record_seen`]) is over
+    /// [`Refusal::Usage`] when the certificate holds none of the write scopes, for a value
+    /// that isn't strict JSON (Switch wire 6.2), before anything is signed or sent, or when
+    /// the protocol's mark of the value ([`super::Protocol::record_seen`]) is over
     /// [`super::MAX_SEEN_MARK_BYTES`]; [`Refusal::NotNow`] while the app lacks the read
     /// scope's key at the current data epoch (it fetches its key bundle first); a store
     /// failure.
@@ -1503,7 +1504,8 @@ pub(crate) fn refuse_unmarkable(
 ///
 /// # Errors
 ///
-/// [`Refusal::Usage`] when the certificate holds none of the write scopes;
+/// [`Refusal::Usage`] when the certificate holds none of the write scopes, or for a value
+/// that isn't strict JSON, an empty one included, before anything is sealed;
 /// [`Refusal::NotNow`] while the app lacks the read scope's key at the current data epoch.
 pub(crate) fn record_put(
     state: &super::AppState,
@@ -1511,6 +1513,19 @@ pub(crate) fn record_put(
     value: Option<&[u8]>,
     held: Option<&HeldRecord>,
 ) -> Result<RecordPut, AppError> {
+    // A record's value is strict JSON, and only the empty plaintext, a delete, isn't (Switch
+    // wire 6.2 "Accepting a write", 1.1). The switch can't tell: the value is sealed to the
+    // read scope's key, so it takes and chains any value, and a reader, the writer
+    // included, finds one that isn't JSON doesn't open. So it is refused here, before it is
+    // signed or sent.
+    if let Some(json) = value
+        && pubky_switch_core::json::check_json(json).is_err()
+    {
+        return Err(Refusal::Usage(
+            "Switch wire 6.2: a record's value is strict JSON (an empty one is a delete)".into(),
+        )
+        .into());
+    }
     let policy = &target.collection.policy;
     if !policy
         .write_scopes

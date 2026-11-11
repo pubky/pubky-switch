@@ -1132,6 +1132,40 @@ async fn test_records_delete_then_create_again() {
 }
 
 #[tokio::test]
+async fn test_records_value_that_isnt_json_is_refused_before_it_is_sent() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    let target = s.target("n1");
+    let written = s.w.switch.applied().len();
+    for bad in [
+        &b"not json"[..],
+        b"",
+        b"{\"a\":1} trailing",
+        b"\xEF\xBB\xBF{}",
+    ] {
+        let error = app.put_record(&target, bad, vec![]).await.unwrap_err();
+        assert!(
+            matches!(error, AppError::Refused(Refusal::Usage(_))),
+            "{error:?}"
+        );
+        assert!(app.record_op(&target, Some(bad), vec![]).await.is_err());
+    }
+    // Nothing was signed, kept or sent.
+    assert_eq!(s.w.switch.applied().len(), written);
+    assert!(app.kept_batches().await.unwrap().is_empty());
+    assert!(
+        app.shared_record(&app.record_key(&target).unwrap())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    // A JSON value goes as before.
+    app.put_record(&target, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn test_records_stale_epoch_takes_the_new_keys_and_writes_again() {
     let s = Setup::new();
     let mut app = s.join("wallet").await;
