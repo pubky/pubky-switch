@@ -94,11 +94,6 @@ pub enum Refusal {
     /// The app request fails a check of Switch wire 3.9: the reason names the step.
     #[error("refused: {0}")]
     AppRequest(String),
-    /// The app request names an App ID listed with the same keys, which would renew its
-    /// certificate (Switch wire 3.8, 3.9 step 5); renewals aren't approved through a request
-    /// here.
-    #[error("refused: the app is listed already")]
-    AlreadyListed,
     /// The app isn't listed in the newest `identity.json`, so it has no certificate to renew.
     #[error("refused: the app isn't listed")]
     NotListed,

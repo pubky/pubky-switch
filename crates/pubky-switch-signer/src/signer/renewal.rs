@@ -41,9 +41,9 @@ use pubky_switch_client::client::answers::AppStatus;
 
 use pubky_switch_core::ops::{KeyBundlePut, OpKind};
 use pubky_switch_core::records::{
-    AppCert, AppCertBody, BundlePart, CLOCK_TOLERANCE_MS, IdentityDoc, MAX_CERT_LIFETIME_MS,
-    RenewedCert, StoredPart, incremental_first_epoch, is_reduction, owed_closings,
-    reduction_rotates, seal_bundle_parts,
+    AppCert, AppCertBody, AppRequest, Approval, ApprovalClaim, AuthRequest, BundlePart,
+    CLOCK_TOLERANCE_MS, IdentityDoc, MAX_CERT_LIFETIME_MS, RenewedCert, StoredPart,
+    incremental_first_epoch, is_reduction, owed_closings, reduction_rotates, seal_bundle_parts,
 };
 use pubky_switch_core::sig::SignedDoc;
 
@@ -52,7 +52,7 @@ use crate::alert::Alert;
 use crate::error::{Refusal, Result, SignerError};
 use crate::key::SigningKey;
 use crate::protocol::Protocols;
-use crate::state::{Bytes, DeliverStep, Flow, RenewBatch, SignerState};
+use crate::state::{Bytes, DeliverStep, Flow, PendingClaim, RenewBatch, SignerState};
 
 /// The most signed operations in one batch (Switch wire 6.4).
 const MAX_OPS: usize = 8;
@@ -83,6 +83,18 @@ impl Signer {
     /// for an expiry the certificate rules refuse; otherwise as [`Signer::resume`].
     pub async fn renew(&mut self, app_id: [u8; 16], change: CertChange) -> Result<IdentityDoc> {
         self.ready().await?;
+        self.renew_listed(app_id, change, None).await
+    }
+
+    /// [`Signer::renew`], once the signer is ready: with `answering`, the renewal answers that
+    /// app request, and its approval's companion claim is committed with the renewing version,
+    /// released once the switch has taken it (Switch wire 3.9 step 5, 3.10).
+    pub(super) async fn renew_listed(
+        &mut self,
+        app_id: [u8; 16],
+        change: CertChange,
+        answering: Option<&Answering<'_>>,
+    ) -> Result<IdentityDoc> {
         // A revoked or departing app gets no new certificate, expiry or key (Switch spec 12.2).
         if self.cut_off(&app_id) {
             return Err(Refusal::CutOff.into());
@@ -185,9 +197,28 @@ impl Signer {
             });
             body.data_epoch = last;
         })?;
+        let claim = answering
+            .map(|answering| {
+                let has_keys = |scope: &str| protocols.has_keys(scope);
+                let approval =
+                    Approval::issue(&key, answering.request, new.clone(), doc.clone(), &has_keys)?;
+                let claim = ApprovalClaim::sign(&key, answering.auth, &approval)?;
+                Ok::<_, SignerError>(PendingClaim {
+                    request: answering.request.hash(),
+                    app_id,
+                    cert: new.hash(),
+                    caps: answering.caps.to_owned(),
+                    plaintext: claim.plaintext(),
+                })
+            })
+            .transpose()?;
         drop(key);
         let mut state = self.state.clone();
         state.certs.push(new.signed().clone());
+        if let Some(claim) = claim {
+            state.claims.retain(|held| held.request != claim.request);
+            state.claims.push(claim);
+        }
         state.epoch_through = state.epoch_through.max(last);
         self.commit_batches(state, &newest, &statuses, alerts, batches, &doc, flow)
             .await?;
@@ -759,6 +790,14 @@ impl Signer {
 fn past_half_lifetime(cert: &AppCert, now: u64) -> bool {
     let lifetime = cert.expires_at().saturating_sub(cert.issued_at());
     cert.expires_at().saturating_sub(now).saturating_mul(2) < lifetime
+}
+
+/// The app request a renewal answers (Switch wire 3.9 step 5): the request, the auth request
+/// it travels with, and the capabilities the grant covers.
+pub(super) struct Answering<'a> {
+    pub(super) request: &'a AppRequest,
+    pub(super) auth: &'a AuthRequest,
+    pub(super) caps: &'a str,
 }
 
 /// A batch operation, with the key bundle part it stores, if any.

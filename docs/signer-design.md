@@ -343,7 +343,7 @@ Each alert carries the facts to show. The wording is the host's.
 - `Alarm(Alert)`, for a rollback or an equivocation;
 - `InvalidData`, for network data that doesn't verify.
 
-`Refusal` covers a revoked App ID, an App ID listed with other keys, the app limit, a grant that isn't the app's own paths, an unknown scope, a flow in progress, a hand-over in progress, a move in progress, `service_keys` over 256, and the import limit.
+`Refusal` covers a revoked App ID, an App ID listed with other keys (one listed with the same keys is a renewal, wire 3.9 step 5), the app limit, a grant that isn't the app's own paths, an unknown scope, a flow in progress, a hand-over in progress, a move in progress, `service_keys` over 256, and the import limit.
 
 There are no panics on network input, and all arithmetic is checked.
 
