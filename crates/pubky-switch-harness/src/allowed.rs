@@ -129,7 +129,7 @@ pub static ALLOWED: &[Allowed] = &[
     },
     Allowed {
         flow: "join",
-        label: "{alice/wallet} GET /v1/{alice}/apps/{wallet}/keys",
+        label: "{alice/wallet} GET /v1/{alice}/apps/{alice/wallet}/keys",
         fact: "body.current",
         service: NOTHING,
         scripted: "null",

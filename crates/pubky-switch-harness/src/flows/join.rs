@@ -24,11 +24,11 @@ use crate::{FlowResult, World};
 ///
 /// When a step that should succeed against any switch fails.
 pub async fn join(world: &World) -> FlowResult {
-    let alice = world.identity("alice");
+    let alice = world.identity("alice")?;
     world.add_switch(ORIGIN, &[&alice]).await?;
     let mut signer = enroll(world, &alice, ORIGIN).await?;
 
-    let asking = Asking::new(world.app_keys(&alice, "wallet"))?;
+    let asking = Asking::new(world.app_keys(&alice, "wallet")?)?;
     let review = signer.review(asking.request.signed(), &asking.auth)?;
     let approved = signer.approve(review).await?;
     world.outcome("approved", &status(&signer)?);
