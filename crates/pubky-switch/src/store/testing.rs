@@ -122,6 +122,20 @@ impl TestDatabase {
         Ok(seq)
     }
 
+    /// Make the next read after the lock on this database wait, once its request has
+    /// committed, until the pause's `resume` is notified: for a test that writes in between.
+    ///
+    /// # Panics
+    ///
+    /// When another test thread poisoned the slot. For tests only.
+    pub fn pause_next_snapshot_read(&self) -> SnapshotPause {
+        let pause = SnapshotPause::default();
+        #[allow(clippy::expect_used)]
+        let mut slot = self.store.snapshot_pause.lock().expect("pause slot");
+        *slot = Some(pause.clone());
+        pause
+    }
+
     /// Close the store and drop the database.
     pub async fn drop_database(self) -> Result<(), StoreError> {
         self.store.close().await;
@@ -130,6 +144,17 @@ impl TestDatabase {
             .await?;
         Ok(())
     }
+}
+
+/// Where the next read after the lock waits ([`TestDatabase::pause_next_snapshot_read`]):
+/// it notifies `reached` once its request has committed, and reads once `resume` is
+/// notified.
+#[derive(Clone, Debug, Default)]
+pub struct SnapshotPause {
+    /// Notified when the read is about to start, its request committed.
+    pub reached: std::sync::Arc<tokio::sync::Notify>,
+    /// Notify it to let the read go on.
+    pub resume: std::sync::Arc<tokio::sync::Notify>,
 }
 
 /// Create a test database, or `None` when the test is to be skipped.

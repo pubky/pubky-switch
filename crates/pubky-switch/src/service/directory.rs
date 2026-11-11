@@ -153,6 +153,7 @@ impl Service {
             known,
             time_ms,
         } = read;
+        snapshot.start().await;
         // The account's apps, from the loader every judgment of currency uses.
         let (state, apps) =
             super::batch::load_apps_from_snapshot(&mut snapshot, account, Some(&doc), time_ms)

@@ -261,6 +261,9 @@ pub struct Store {
     /// an account's lock never waits for one (`snapshot_readers`).
     readers: PgPool,
     lock_timeout_ms: u64,
+    /// For tests: the next read after the lock waits here ([`testing::SnapshotPause`]).
+    #[cfg(any(test, feature = "test-util"))]
+    pub(crate) snapshot_pause: std::sync::Arc<std::sync::Mutex<Option<testing::SnapshotPause>>>,
 }
 
 impl Store {
@@ -308,6 +311,8 @@ impl Store {
             pool,
             readers,
             lock_timeout_ms: config.lock_timeout_ms,
+            #[cfg(any(test, feature = "test-util"))]
+            snapshot_pause: std::sync::Arc::default(),
         })
     }
 
@@ -445,6 +450,14 @@ impl Store {
             return Ok(None);
         };
         txn.reader = Some(reader);
+        #[cfg(any(test, feature = "test-util"))]
+        {
+            txn.snapshot_pause = self
+                .snapshot_pause
+                .lock()
+                .map_err(|_| StoreError::Corrupt("a test pause"))?
+                .take();
+        }
         Ok(Some(txn))
     }
 

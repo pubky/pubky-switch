@@ -18,6 +18,8 @@ use super::{
 pub struct SnapshotRead {
     pub(super) tx: Transaction<'static, Postgres>,
     pub(super) id: String,
+    #[cfg(any(test, feature = "test-util"))]
+    pause: Option<super::testing::SnapshotPause>,
 }
 
 /// Whether `id` reads as a snapshot ID `pg_export_snapshot()` gives: hex digits and dashes.
@@ -56,6 +58,8 @@ impl AccountTxn {
         self.snapshot = Some(SnapshotRead {
             tx: reader,
             id: self.head().id.clone(),
+            #[cfg(any(test, feature = "test-util"))]
+            pause: self.snapshot_pause.take(),
         });
         Ok(())
     }
@@ -70,6 +74,17 @@ impl AccountTxn {
 }
 
 impl SnapshotRead {
+    /// Start reading, once the lock is gone. For tests, it first waits where a test asked it
+    /// to ([`super::testing::TestDatabase::pause_next_snapshot_read`]); otherwise it does
+    /// nothing.
+    pub async fn start(&mut self) {
+        #[cfg(any(test, feature = "test-util"))]
+        if let Some(pause) = self.pause.take() {
+            pause.reached.notify_one();
+            pause.resume.notified().await;
+        }
+    }
+
     /// The account's app rows, by App ID.
     pub async fn apps(&mut self) -> Result<Vec<StoredApp>, StoreError> {
         read_apps(&mut self.tx, &self.id).await

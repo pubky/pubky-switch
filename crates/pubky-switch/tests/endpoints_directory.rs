@@ -1193,3 +1193,41 @@ async fn test_directory_leave_is_treated_as_a_revocation() {
     assert_eq!(code_of(&refused), (403, json!("not_current")));
     replay.db.drop_database().await.expect("drop");
 }
+
+#[tokio::test]
+async fn test_directory_reads_the_state_under_the_lock_not_after() {
+    let Some(replay) = replay().await else { return };
+    alice_with_three_apps(&replay).await;
+    let at = setup_time();
+    let before = read_as(&replay, "wallet", &at).await;
+    // The read waits once its request has committed; versions moved then aren't in it.
+    let pause = replay.db.pause_next_snapshot_read();
+    let keys = vectors("keys.json");
+    let request = app_request(
+        app(&keys, "wallet"),
+        "GET",
+        &directory_path(),
+        Vec::new(),
+        ms(&at),
+    );
+    let (answer, ()) = tokio::join!(replay.service.handle(request), async {
+        pause.reached.notified().await;
+        sql(
+            &replay,
+            "UPDATE accounts SET directory_version = directory_version + 100 WHERE id = $1",
+        )
+        .await;
+        pause.resume.notify_one();
+    });
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    assert_eq!(
+        body(&answer)["directory_version"],
+        before["directory_version"]
+    );
+    replay.db.drop_database().await.expect("drop");
+}

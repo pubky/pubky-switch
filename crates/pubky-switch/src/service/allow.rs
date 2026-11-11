@@ -172,6 +172,7 @@ impl Service {
             time_ms,
             flag_after,
         } = read;
+        snapshot.start().await;
         let fail = |e: &crate::store::StoreError| store_error(e);
         let contacts = snapshot
             .allow_entries(ListName::Contact)

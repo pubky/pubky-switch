@@ -515,7 +515,12 @@ async fn test_allow_long_read_holds_no_lock_and_shows_the_stamped_state() {
         },
         async {
             // The read has committed its stamp, so its lock is gone, and it reads on.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
             while stamped_time(&replay).await != read_ms {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the read never committed"
+                );
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
             // A revocation by the signer and a write by an own app each take the lock: they
@@ -560,46 +565,29 @@ async fn test_allow_reads_the_state_under_the_lock_not_after() {
     replay_chain_through_revoke(&replay).await;
     let read_at = pubky_switch_core::time::rfc3339(ms(&at()) + 60_000);
     set_time(&replay.clock, &read_at);
-    let read_ms = i64::try_from(ms(&read_at)).expect("time");
-    // A transaction holds list_entries, so the read's first query waits for it; the
-    // request itself doesn't touch that table under the lock.
-    let mut holder = sqlx::PgConnection::connect_with(replay.db.options())
-        .await
-        .expect("conn");
-    sqlx::query("BEGIN")
-        .execute(&mut holder)
-        .await
-        .expect("begin");
-    sqlx::query("LOCK TABLE list_entries IN ACCESS EXCLUSIVE MODE")
-        .execute(&mut holder)
-        .await
-        .expect("lock");
+    // The read waits once its request has committed; a code committed then isn't in it,
+    // since it reads the state under the lock, at the stamped time.
+    let pause = replay.db.pause_next_snapshot_read();
     let (answer, ()) = tokio::join!(read_as(&replay, "wallet", &read_at), async {
-        // The request has committed: its lock is gone, and its read waits.
-        while stamped_time(&replay).await != read_ms {
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-        // A live invite code committed now, before the read gets to run, isn't in it: the
-        // read sees the state under the lock, at the stamped time.
-        sqlx::query(
+        pause.reached.notified().await;
+        sql(
+            &replay,
             "INSERT INTO invite_codes (account_id, code_hash, max_uses, uses, writer, \
              expires_at_ms, context) VALUES ($1, decode(repeat('ee', 32), 'hex'), 1, 0, \
              decode(repeat('ab', 16), 'hex'), 9000000000000, convert_to('null', 'UTF8'))",
         )
-        .bind(alice_id())
-        .execute(&mut holder)
-        .await
-        .expect("code");
-        sqlx::query("COMMIT")
-            .execute(&mut holder)
-            .await
-            .expect("commit");
+        .await;
+        pause.resume.notify_one();
     });
     assert_eq!(
         answer.status,
         200,
         "{}",
         String::from_utf8_lossy(&answer.body)
+    );
+    assert_eq!(
+        header_text(&answer, "switch-server-time"),
+        Some(read_at.as_str())
     );
     assert_eq!(body(&answer)["invite_codes"], json!([]));
     replay.db.drop_database().await.expect("drop");

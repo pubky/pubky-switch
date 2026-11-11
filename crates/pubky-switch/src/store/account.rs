@@ -135,6 +135,9 @@ pub struct AccountTxn {
     pub(super) reader: Option<Transaction<'static, Postgres>>,
     /// The reader, once this transaction's snapshot is exported to it.
     pub(super) snapshot: Option<super::SnapshotRead>,
+    /// For tests: where that read waits before it reads.
+    #[cfg(any(test, feature = "test-util"))]
+    pub(super) snapshot_pause: Option<super::testing::SnapshotPause>,
 }
 
 impl std::fmt::Debug for AccountTxn {
@@ -263,6 +266,8 @@ impl AccountTxn {
             max_flags: 0,
             reader: None,
             snapshot: None,
+            #[cfg(any(test, feature = "test-util"))]
+            snapshot_pause: None,
         }))
     }
 
