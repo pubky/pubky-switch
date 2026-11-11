@@ -157,10 +157,11 @@ pub fn takes_other_apps(call: &Call) -> bool {
 
 /// The refusal of an app of another identity at a call it doesn't make, once its
 /// certificate has passed every check, expiry included (Switch wire 7.2, 3.8): `403
-/// permission_missing` at the reads only own apps make (the feed, 7.4.4, and by 7.6's "a
-/// call only another caller may make" the claims, the lists and the records), the key
-/// bundle calls (7.4.11), a leave (7.4.12), the hand-over (7.4.17) and the signer's calls
-/// (7.4), and `403 not_admitted` at a batch (6.4) and the calls not served yet.
+/// permission_missing`, by 7.6's "a call only another caller may make", at every call only
+/// own apps or the signer make: the reads only own apps make (the feed, 7.4.4, the claims,
+/// the lists and the records), the key bundle calls (7.4.11), a leave (7.4.12), a recovery
+/// upload (7.4.14), push and the connect reads, the hand-over (7.4.17) and the signer's
+/// calls (7.4), the move's included; and `403 not_admitted` at a batch (6.4).
 pub fn other_app_refusal(call: &Call) -> ApiError {
     match call {
         Call::Feed
@@ -176,6 +177,12 @@ pub fn other_app_refusal(call: &Call) -> ApiError {
             ErrorCode::PermissionMissing,
             "7.4.12: only the app itself leaves",
         ),
+        Call::RecoveryUpload | Call::PutPush | Call::GetConnect | Call::DeleteConnect(_) => {
+            ApiError::new(
+                ErrorCode::PermissionMissing,
+                "7.4: only the account's own apps make this call",
+            )
+        }
         Call::PutHandover | Call::GetHandover => ApiError::new(
             ErrorCode::PermissionMissing,
             "7.4.17: only the signer and the app it is for",
@@ -184,6 +191,13 @@ pub fn other_app_refusal(call: &Call) -> ApiError {
         | Call::Revoke(_)
         | Call::GetApps
         | Call::RecoveryAdmission
+        | Call::Freeze
+        | Call::Unfreeze
+        | Call::Export
+        | Call::ExportChunk(_)
+        | Call::Import
+        | Call::ImportChunk(_)
+        | Call::ImportActivate
         | Call::Erase => ApiError::new(
             ErrorCode::PermissionMissing,
             "7.4: a call only the signer may make",

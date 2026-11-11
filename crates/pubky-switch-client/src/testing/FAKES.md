@@ -128,10 +128,6 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
     the switch's other routes rather than `400`; `after` is compared as raw text, never
     refused as a malformed key; and `limit` takes a leading `+` (`limit=+5`), which the
     service refuses (`400`).
-- **Reads only own apps make, from an app of another identity:** `GET /feed`, `GET
-  /claims/{claim_key}`, `GET /allow`, `GET /records/{key}` and `GET /records` answer `403
-  not_admitted` (`switch/inbox.rs`, every route the switch doesn't serve such an app), where
-  the service answers `403 permission_missing` (Switch wire 7.4.4, 7.6).
 - **`open_admission`** (`admit_everyone`) admits every sender the deny list doesn't hold, a
   test switch only.
 - **App currency outside batches**: a feed read is checked as a batch is, for an app that
@@ -240,8 +236,7 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   hand-over while holding no copy of the version handed over; the next `identity.json`
   version, whoever delivered it, drops it. Unlike the service, it serves the body it parsed
   again as JSON, not the bytes the signer sent; it answers an own app's `PUT` `404` ("no
-  route") where the service answers `403 permission_missing` with the head, and an app of
-  another identity `403 not_admitted` where the service answers `403 permission_missing`.
+  route") where the service answers `403 permission_missing` with the head.
   `stored_handover` names the target held; `stored_handover_body` and
   `store_handover_again` script a hand-over stored or served again after it was dropped.
 - **`Fault::LeaveOut`** scripts a faulty service whose answer to an own app or the signer

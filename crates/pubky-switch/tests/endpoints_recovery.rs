@@ -2527,8 +2527,9 @@ async fn test_upload_bound_past_the_integer_range_is_unverified() {
 #[tokio::test]
 async fn test_upload_refusals_order_and_the_rate_slot() {
     // `404` before `400` at an account in neither stage; after the loss a `400` takes no
-    // slot of `uploads_per_app_per_hour`, an app not current here is `403 not_current`, and
-    // the one slot then goes to the first upload that reads.
+    // slot of `uploads_per_app_per_hour`, an app not current here is `403 not_current`, an
+    // app of another identity `403 permission_missing`, and the one slot then goes to the
+    // first upload that reads.
     let limits = pubky_switch::limits::Limits {
         uploads_per_app_per_hour: 1,
         ..pubky_switch::limits::Limits::default()
@@ -2558,6 +2559,10 @@ async fn test_upload_refusals_order_and_the_rate_slot() {
     let executor = app(&keys, "executor").clone();
     let not_current = upload_as(&replay, &executor, &json!({}), at).await;
     assert_eq!(code(&not_current), (403, "not_current".into()));
+    // An app of another identity: a call only own apps make (Switch wire 7.6).
+    let other = other_request("shop", ORIGIN, "POST", &path, b"{}".to_vec(), None, at);
+    let refused = replay.service.handle(other).await;
+    assert_eq!(code(&refused), (403, "permission_missing".into()));
     assert_eq!(upload(&replay, &json!({}), at).await.status, 200);
     assert_eq!(
         code(&upload(&replay, &json!({}), at).await),

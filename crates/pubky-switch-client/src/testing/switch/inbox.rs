@@ -97,8 +97,9 @@ impl ScriptedSwitch {
 }
 
 impl Inner {
-    /// The routes an app of another identity calls; `not_admitted` for every other one
-    /// (Switch wire 6.4 step 1, 7.2).
+    /// The routes an app of another identity calls; `not_admitted` for a batch (Switch wire
+    /// 6.4 step 1), and `permission_missing` for every other call, one only another caller
+    /// makes (Switch wire 7.6), as at the service.
     pub(super) fn route_foreign(
         &mut self,
         request: &Request,
@@ -129,7 +130,12 @@ impl Inner {
             }
             ("POST", "inbox") => self.append(request, Some(sender), query)?,
             ("POST", "connect") => self.connect(sender),
-            _ => not_admitted(),
+            ("POST", "ops") => not_admitted(),
+            _ => bad(
+                ErrorCode::PermissionMissing,
+                "a call only another caller may make",
+                json!(null),
+            ),
         })
     }
 
@@ -491,6 +497,51 @@ mod tests {
                 value: cert.signed().compact(),
             }],
             body: b"{}".to_vec(),
+        }
+    }
+
+    #[test]
+    fn test_scripted_foreign_app_at_an_own_call_is_permission_missing() {
+        // An app of another identity at a call only own apps or the signer make gets
+        // `403 permission_missing`, as at the service; at a batch, `403 not_admitted`
+        // (Switch wire 6.4 step 1, 7.6).
+        let identity = pubky_switch_core::keys::IdentityKey::from_secret([1; 32]);
+        let switch = ScriptedSwitch::new(
+            &identity,
+            [2; 32],
+            std::sync::Arc::new(crate::clock::TestClock::new(1_000)),
+        );
+        let mut inner = switch.lock();
+        let other = pubky_switch_core::keys::IdentityKey::from_secret([7; 32]);
+        let keys = pubky_switch_core::keys::AppKeys::from_secrets([8; 32], [9; 32]);
+        let body = pubky_switch_core::records::AppCertBody::new(
+            other.public(),
+            keys.signing_public(),
+            keys.bundle_public(),
+            vec!["notes".into()],
+            &[],
+            0,
+            86_400_000,
+        );
+        let cert = AppCert::issue(&other, body).unwrap();
+        let sender = Sender {
+            identity: other.public(),
+            app: Some(cert.app_id()),
+            code: None,
+        };
+        for (method, rest, code) in [
+            ("POST", "recovery/upload", "permission_missing"),
+            ("GET", "feed", "permission_missing"),
+            ("GET", "records", "permission_missing"),
+            ("POST", "ops", "not_admitted"),
+        ] {
+            let request = foreign(method, &format!("/{rest}"), &cert);
+            let (status, body) = inner.route_foreign(&request, &sender, rest).unwrap();
+            assert_eq!(
+                (status, &body["code"]),
+                (403, &json!(code)),
+                "{method} {rest}"
+            );
         }
     }
 
