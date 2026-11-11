@@ -25,6 +25,7 @@ mod chain;
 mod claim_codec;
 mod enrollments;
 mod feed;
+mod handover;
 mod identity;
 mod inbox;
 mod ops;
@@ -45,6 +46,7 @@ pub use allow::{AllowEntry, AllowInvite};
 pub use apps::{AppsView, KeptAppId, KeptReason, OpenAttempt, PartSpan, newly_listed};
 pub use chain::NewChainItem;
 pub use feed::{AppDocs, CurrentDocs, FeedRow, FeedSnapshot, PageReader};
+pub use handover::StoredHandover;
 pub use identity::HeldIdentity;
 pub use inbox::{InboxUsage, NewEntry, StoredEntry};
 pub use ops::{

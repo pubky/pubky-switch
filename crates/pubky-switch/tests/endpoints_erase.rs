@@ -38,6 +38,7 @@ const ACCOUNT_TABLES: &[(&str, &str)] = &[
     ("peer_floors", "account_id"),
     ("inbox_entries", "account_id"),
     ("sender_flags", "account_id"),
+    ("handovers", "account_id"),
 ];
 
 fn alice_id() -> String {
@@ -232,6 +233,16 @@ async fn test_erase_deletes_the_account_and_nothing_else() {
     .execute(&mut conn)
     .await
     .expect("peer copy");
+    // A stored hand-over on each account: alice's goes, bob's stays (7.4.17).
+    for account in [alice_id(), bob.clone()] {
+        sqlx::query("INSERT INTO handovers (account_id, target_app_id, body) VALUES ($1, $2, $3)")
+            .bind(account)
+            .bind([1u8; 16].as_slice())
+            .bind(b"{}".as_slice())
+            .execute(&mut conn)
+            .await
+            .expect("a hand-over");
+    }
     conn.close().await.expect("close");
     let bob_before = rows(&replay, &bob).await;
     for table in ["list_entries", "peer_copies"] {

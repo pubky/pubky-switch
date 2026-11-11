@@ -12,8 +12,9 @@
 //! `GET /v1/{id}/identity`, `POST /v1/{id}/ops`, `GET /v1/{id}/feed`,
 //! `POST /v1/{id}/inbox`, `PUT /v1/{id}/peers`, `GET /v1/{id}/claims/{claim_key}`,
 //! `GET /v1/{id}/apps`, `POST /v1/{id}/apps/{app_id}/revoke`, `GET /v1/{id}/directory`,
-//! `GET` and `POST /v1/{id}/apps/{app_id}/keys`, `POST /v1/{id}/apps/{app_id}/leave`, and
-//! `POST /v1/{id}/erase`. Every other call is answered `503 unavailable`.
+//! `GET` and `POST /v1/{id}/apps/{app_id}/keys`, `POST /v1/{id}/apps/{app_id}/leave`,
+//! `PUT` and `GET /v1/{id}/handover`, and `POST /v1/{id}/erase`. Every other call is answered
+//! `503 unavailable`.
 
 mod admission;
 mod allow;
@@ -25,6 +26,7 @@ mod directory;
 mod enroll;
 mod erase;
 mod feed;
+mod handover;
 mod identity;
 mod inbox;
 mod peers;
@@ -411,7 +413,11 @@ impl Service {
             }
             // The signer is verified here; an own app under the lock, with the key the
             // account holds for it (Switch wire 7.2).
-            Call::Revoke(_) | Call::GetApps | Call::Erase => {
+            Call::Revoke(_)
+            | Call::GetApps
+            | Call::PutHandover
+            | Call::GetHandover
+            | Call::Erase => {
                 match self
                     .authenticate_signer(&account, &request, base_ms, base_ms.max(stamped_ms))
                     .await
@@ -968,7 +974,11 @@ impl Service {
         if writer.is_some()
             && matches!(
                 call,
-                Call::PutIdentity | Call::Revoke(_) | Call::GetApps | Call::Erase
+                Call::PutIdentity
+                    | Call::Revoke(_)
+                    | Call::GetApps
+                    | Call::PutHandover
+                    | Call::Erase
             )
         {
             return Err(Refused::with_head(
@@ -1215,6 +1225,29 @@ impl Service {
                         serving,
                         head: false,
                     });
+            }
+            Call::PutHandover => {
+                return self
+                    .put_handover(txn, signer, held.as_ref(), &request.body, time_ms)
+                    .await
+                    .map(|answer| (answer, serving))
+                    .map_err(|error| Refused::with_head(error, serving));
+            }
+            Call::GetHandover => {
+                // The signer, or the own app it is for (Switch wire 7.4.17). An app of another
+                // identity was refused above; refused here too, so the read fails closed.
+                let reader = match (writer.as_ref(), other) {
+                    (Some(app), _) => handover::Reader::OwnApp(app),
+                    (None, None) => handover::Reader::Signer,
+                    (None, Some(_)) => {
+                        return Err(Refused::with_head(rules::other_app_refusal(call), serving));
+                    }
+                };
+                return self
+                    .get_handover(txn, signer, reader)
+                    .await
+                    .map(|answer| (answer, serving))
+                    .map_err(|error| Refused::with_head(error, serving));
             }
             Call::Revoke(app_id) => {
                 return self
