@@ -754,14 +754,15 @@ async fn test_unverified_bound_backup_of_a_feed_entrys_kept_effect_never_applies
     let backup = app.backup_layered().await.unwrap();
     assert_eq!(w.switch.lock().faults.len(), 1, "the backup made a request");
     w.switch.lock().faults.clear();
-    // Restored, the app holds the entry as uncertain, and its read of the feed entry again
-    // is a duplicate: the effect isn't built or applied again.
+    // Restored, the app holds the entry as uncertain, and its read passes the feed entry:
+    // its `seq` is in the backup's `seen`, as the app passes an entry it stores, so the
+    // effect isn't built or applied again, whatever the age of the processed pair.
     let (mut restored, protocol) = restored_from(&w, &backup).await;
     let report = restored.receive(None).await.unwrap();
     assert!(
-        has(
+        !has(
             &report.events,
-            |e| matches!(e, AppEvent::Duplicate { seq: s, .. } if *s == seq)
+            |e| matches!(e, AppEvent::MessageReceived { seq: s, .. } if *s == seq)
         ),
         "{:?}",
         report.events
