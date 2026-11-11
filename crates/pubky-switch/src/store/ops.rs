@@ -98,7 +98,7 @@ pub enum ListName {
 }
 
 impl ListName {
-    fn as_str(self) -> &'static str {
+    pub(super) fn as_str(self) -> &'static str {
         match self {
             ListName::Contact => "contact",
             ListName::Conversation => "conversation",
