@@ -294,6 +294,14 @@ pub(crate) struct Inner {
     /// Admission is staged after a provider loss (Switch spec 12.6 step 2): a sender it can't
     /// otherwise admit gets `503 staged`.
     pub(crate) admission_staged: bool,
+    /// `POST /recovery/upload` calls per app per hour after a provider loss, and the most
+    /// contacts and deny entries an upload adds up to (Switch wire 9.2): the wire's defaults
+    /// unless a test sets them.
+    pub(crate) uploads_per_app_per_hour: u32,
+    pub(crate) max_contacts: u64,
+    pub(crate) max_deny: u64,
+    /// The uploads each app made in the hour of the switch's clock: the hour and the count.
+    upload_counts: BTreeMap<[u8; 16], (u64, u32)>,
     /// The `directory_version`: it moves whenever the directory changes.
     pub(crate) directory_version: u64,
     /// The origin the switch serves at, which an enrollment names (Switch wire 3.7).
@@ -377,6 +385,10 @@ impl Inner {
             reachable_since: BTreeMap::new(),
             open_admission: false,
             admission_staged: false,
+            uploads_per_app_per_hour: 60,
+            max_contacts: 100_000,
+            max_deny: 100_000,
+            upload_counts: BTreeMap::new(),
             directory_version: 0,
             origin: SWITCH_ORIGIN.to_owned(),
             enrolled: Some(signer::Enrolled::default()),
@@ -2040,6 +2052,14 @@ impl Inner {
         if let Some(recovery_from) = self.recovery_from {
             return self.loss_upload(&request.body, caller, recovery_from);
         }
+        // Neither after a provider loss nor in a move (Switch wire 7.4.14 "Which stage").
+        if self.continued_from.is_none() {
+            return Ok(bad(
+                ErrorCode::NotFound,
+                "neither after a provider loss nor in a move",
+                json!(null),
+            ));
+        }
         let changes = json!({ "records": [], "divergent": [], "claims": [],
                               "divergent_claims": [], "unverified": 0, "distrusted": 0,
                               "refused": 0, "heads": heads,
@@ -2079,6 +2099,21 @@ impl Inner {
             Ok(upload) => upload,
             Err(refusal) => return Ok(batch::refused(&refusal)),
         };
+        // Past `uploads_per_app_per_hour` in the hour of the switch's clock: `429`, with the
+        // seconds to the next hour (Switch wire 7.4.14, 9.4).
+        let (now, hour_ms) = (self.now(), 3_600_000);
+        let hour = now / hour_ms;
+        let count = self.upload_counts.entry(app).or_insert((hour, 0));
+        if count.0 < hour {
+            *count = (hour, 0);
+        }
+        if count.1 >= self.uploads_per_app_per_hour {
+            let next = count.0.saturating_add(1).saturating_mul(hour_ms);
+            let mut limited = bad(ErrorCode::RateLimited, "recovery uploads", json!(null));
+            limited.1["retry_after"] = json!(next.saturating_sub(now).div_ceil(1000).max(1));
+            return Ok(limited);
+        }
+        count.1 += 1;
         let removed = self
             .doc
             .as_ref()
@@ -2100,9 +2135,16 @@ impl Inner {
             ..UploadChanges::default()
         };
         // The transition's `seq`, the next: a record taken from the upload is at it.
-        let (seq, now) = (self.seq + 1, self.now());
-        self.shared
-            .merge_upload(&checked, upload.lists.as_ref(), seq, now, &mut changes);
+        let seq = self.seq + 1;
+        let caps = (self.max_contacts, self.max_deny);
+        self.shared.merge_upload(
+            &checked,
+            upload.lists.as_ref(),
+            caps,
+            seq,
+            now,
+            &mut changes,
+        );
         if upload.ends_staged_admission(&cert) {
             self.admission_staged = false;
         }

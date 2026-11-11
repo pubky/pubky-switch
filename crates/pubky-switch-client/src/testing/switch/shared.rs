@@ -331,11 +331,13 @@ impl Shared {
 
     /// Merge what counted in a recovery upload after a provider loss, as the service does
     /// (Switch wire 7.4.14): records taken at `seq`, the `upload` transition's, or kept as
-    /// divergent; claims; and the lists, only added to.
+    /// divergent; claims; and the lists, only added to, each up to its limit in `caps`
+    /// (`max_contacts`, `max_deny`).
     pub(super) fn merge_upload(
         &mut self,
         checked: &CheckedUpload,
         lists: Option<&UploadLists>,
+        (max_contacts, max_deny): (u64, u64),
         seq: u64,
         now: u64,
         changes: &mut UploadChanges,
@@ -424,12 +426,17 @@ impl Shared {
             changes.claim(key, &merge);
         }
         if let Some(lists) = lists {
-            for (list, entries) in [
-                (&mut self.contacts, &lists.contacts),
-                (&mut self.deny, &lists.deny),
+            for (list, entries, max) in [
+                (&mut self.contacts, &lists.contacts, max_contacts),
+                (&mut self.deny, &lists.deny, max_deny),
             ] {
+                // Entries past the list's limit are dropped (Switch wire 7.4.14 "Lists").
                 for pubky in entries.iter().flatten() {
-                    changes.lists |= list.insert(*pubky);
+                    if !list.contains(pubky) && u64::try_from(list.len()).unwrap_or(u64::MAX) < max
+                    {
+                        list.insert(*pubky);
+                        changes.lists = true;
+                    }
                 }
             }
         }

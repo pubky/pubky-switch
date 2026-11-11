@@ -1583,6 +1583,55 @@ async fn test_loss_upload_without_manage_sends_no_contacts() {
     assert!(next.shared.deny.contains(&lost.dave));
 }
 
+/// The wallet's `POST /recovery/upload` of `body` at the lost world's next switch.
+fn upload_at_next(lost: &Lost, body: &str) -> (u16, serde_json::Value) {
+    let request = crate::transport::Request {
+        method: "POST".into(),
+        origin: NEXT.into(),
+        path_and_query: format!("/v1/{}/recovery/upload", lost.w.alice.id()),
+        headers: vec![crate::transport::Header::new(
+            "switch-app",
+            &pubky_switch_core::enc::zbase32_encode(&app_keys("wallet").app_id_bytes()),
+        )],
+        body: body.as_bytes().to_vec(),
+    };
+    let answer = lost.next.handle(&request).unwrap();
+    (answer.status, serde_json::from_slice(&answer.body).unwrap())
+}
+
+#[tokio::test]
+async fn test_loss_upload_is_limited_per_hour_and_the_lists_are_capped() {
+    // As at the service (Switch wire 7.4.14, 9.4): past `uploads_per_app_per_hour` an upload
+    // is `429 rate_limited` until the next hour of the switch's clock, and list entries past
+    // `max_deny` are dropped.
+    let store = Arc::new(MemoryStore::new());
+    let lost = lost_world(Arc::clone(&store) as Arc<dyn StateStore>).await;
+    {
+        let mut next = lost.next.lock();
+        next.uploads_per_app_per_hour = 2;
+        next.max_deny = 0;
+    }
+    let (_, events) = follow_loss(&lost, store as Arc<dyn StateStore>)
+        .await
+        .unwrap();
+    // The evidence and the lists both went, the two the hour takes.
+    assert!(!has(&events, |e| matches!(
+        e,
+        AppEvent::EvidenceRefused { .. }
+    )));
+    {
+        let next = lost.next.lock();
+        assert!(next.shared.contacts.contains(&lost.carol));
+        assert!(next.shared.deny.is_empty(), "past max_deny");
+    }
+    let (status, body) = upload_at_next(&lost, "{}");
+    assert_eq!((status, body["code"].as_str()), (429, Some("rate_limited")));
+    let wait = body["retry_after"].as_u64().unwrap();
+    assert!((1..=3600).contains(&wait), "{wait}");
+    lost.w.clock.advance_ms(wait * 1000);
+    assert_eq!(upload_at_next(&lost, "{}").0, 200);
+}
+
 #[tokio::test]
 async fn test_loss_refused_upload_is_reported_and_recovery_goes_on() {
     let store = Arc::new(MemoryStore::new());

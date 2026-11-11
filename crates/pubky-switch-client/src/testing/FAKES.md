@@ -176,11 +176,12 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   `loss_upload` and `switch/shared.rs` `merge_upload`: the core's checks
   (`UploadBody::parse`, `check_permissions`, `check_upload`) and merge
   (`merge_checked_record`, `merge_upload_claim`), as at the service, so the counts and the
-  changes are the service's, one `upload` transition each. Unlike the service: no
-  `uploads_per_app_per_hour` limit, so no `429`; the lists take every entry, with no
-  `max_contacts` or `max_deny`; `max_divergent_uploads` and `max_attempts_per_claim` are the
-  wire's defaults; and `GET /claims` lists whatever entries the switch kept, with no check
-  that a claim holds one at each step.
+  changes are the service's, one `upload` transition each; `uploads_per_app_per_hour`
+  (`429 rate_limited` until the next hour of the switch's clock), `max_contacts` and
+  `max_deny` as at the service, the wire's defaults unless a test sets them; and `404` at an
+  account in neither stage. Unlike the service: `max_divergent_uploads` and
+  `max_attempts_per_claim` are the wire's defaults, and `GET /claims` lists whatever entries
+  the switch kept, with no check that a claim holds one at each step.
 - **`GET /apps`** (Switch wire 7.4.12), in `switch/signer.rs`: by the service's rules, member
   by member, but `last_seen` and `recovery` (below):
   - every app the switch holds, every App ID it keeps for good, and every app the newest

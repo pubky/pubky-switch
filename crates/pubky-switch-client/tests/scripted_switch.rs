@@ -643,6 +643,29 @@ async fn test_testing_entry_without_a_reader_becomes_unreadable_with_its_entry_i
 }
 
 /// The `code` of an error answer.
+#[tokio::test]
+async fn test_testing_upload_in_neither_stage_is_404() {
+    // An account neither after a provider loss nor in a move answers a recovery upload
+    // `404`, as the service does (Switch wire 7.4.14 "Which stage").
+    let s = Setup::new();
+    let app = s.join("wallet").await;
+    let request = Request {
+        method: "POST".into(),
+        origin: SWITCH_ORIGIN.into(),
+        path_and_query: format!("/v1/{}/recovery/upload", s.alice.identity().key().id()),
+        headers: vec![Header::new(
+            "switch-app",
+            &pubky_switch_core::enc::zbase32_encode(&app.app_id()),
+        )],
+        body: b"{}".to_vec(),
+    };
+    let answer = s.alice.switch().handle(&request).unwrap();
+    assert_eq!(
+        (answer.status, code_of(&answer).as_str()),
+        (404, "not_found")
+    );
+}
+
 fn code_of(answer: &Response) -> String {
     let body: serde_json::Value = serde_json::from_slice(&answer.body).unwrap();
     body["code"].as_str().unwrap_or_default().to_owned()
