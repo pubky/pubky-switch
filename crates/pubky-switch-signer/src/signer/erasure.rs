@@ -8,14 +8,15 @@
 //!    answer, and asks the user to revoke the Pubky grant of each app, listed or removed,
 //!    whose reminder isn't raised yet ([`Alert::GrantRevocationOwed`]), since the Pubky SDK
 //!    offers no call for it (design note, decision 4);
-//! 2. sends `POST /v1/{id}/erase` naming the pinned service key, again until it is answered
+//! 2. sends `POST /v1/{id}/erase` naming the pinned service key and, once this install
+//!    delivered a version there, the hash of its mark, the same body again until it is answered
 //!    or, after a request in doubt, the check's read meets the operator's `404`, marking
 //!    before each request that it may land. A `200` confirms the erasure. So does an
 //!    unsigned `404`, the operator's, but only after a request that may have landed, as a
 //!    lost `200` leaves it, and only once every check has met it for 24 hours: until then
 //!    the account is erased but unconfirmed ([`Refusal::ErasureUnconfirmed`]), the time of
-//!    the first `404` kept in the flow, and an answer the pinned key signs ends the wait
-//!    (Switch wire 7.4.16, spec 12.7 step 5). A `404` is never itself a lost answer: with
+//!    the first `404` kept in the flow, and an answer the pinned key signs, at any read, ends
+//!    the wait (Switch wire 7.4.16, spec 12.7 step 5). A `404` is never itself a lost answer: with
 //!    no request in doubt it is an error, and the mark goes back. No answer, or another
 //!    answer the pinned key didn't sign, such as a gateway's `503`, keeps the mark; only an
 //!    answer the pinned key signed shows the account still exists, and clears it.
@@ -29,22 +30,28 @@
 //! progress, with nothing deleted or sent while the alarm is held; a copy that can't be read
 //! takes no step. After a request in doubt, an unsigned `404` to the check, with every other
 //! copy clean, is taken as the erasure done once it has held for 24 hours, and no other
-//! request goes out meanwhile.
+//! request goes out meanwhile. Revocations are refused during an erasure, and none pending is
+//! sent: it signs nothing else (spec 12.7 step 5).
 //!
-//! A `409 conflict` is the switch refusing it, as during a move: the erasure ends without
-//! erasing, `identity.json` is published again, and the grant reminders it raised for apps
-//! still listed are withdrawn; a removed app's stays. [`Signer::abort_erasure`] ends it the same way on the user's word, while no
-//! request may have landed. The app records it deleted stay deleted until each app writes its
-//! own again.
+//! A `409 conflict`, signed, is the switch refusing it: another key, another `identity.json`
+//! than the mark, or a move in progress. The request didn't land, so it is no longer in doubt,
+//! and the switch's copy is judged first, as every copy: another install's newer copy ends
+//! the erasure as any other install found signing does, this install's own keeps it as
+//! records behind, and a copy that went back raises the alarm. With the mark still held, the
+//! erasure ends without erasing: `identity.json` is published again, and the grant reminders
+//! it raised for apps still listed are withdrawn; a removed app's stays. An unsigned `409` is
+//! no refusal: the request stays in doubt. [`Signer::abort_erasure`] ends it the same way on
+//! the user's word, while no request may have landed. The app records it deleted stay
+//! deleted until each app writes its own again.
 //!
 //! Once erased, the records stay (Switch spec 12.7 step 4): the App IDs revoked for good among
 //! them, which a later enrollment names again. What only the erased account could settle is
 //! dropped: the alerts of revocations not yet sent there and of an owed closing, and an owed
-//! backup. Nothing
-//! more is signed for the account, and a revocation or a restore is refused. The signer backup
-//! on the Homeserver stays, with the identity secret sealed to the identity's own backup key,
-//! naming the erased switch. Enrolling again after an erasure starts the account as after a
-//! provider loss (Switch wire 7.4.16), which this signer doesn't do yet.
+//! backup. Nothing more is signed for the account, and a revocation or a restore is refused.
+//! The signer backup on the Homeserver stays, with the identity secret sealed to the
+//! identity's own backup key, naming the erased switch. Enrolling again after an erasure
+//! starts the account as after a provider loss (Switch wire 7.4.16), which this signer doesn't
+//! do yet.
 
 use pubky_switch_client::ClientError;
 use pubky_switch_core::http::ErrorCode;
@@ -68,9 +75,12 @@ impl Signer {
     ///
     /// The signing gate's refusals, as before every signing step: another install signs, an
     /// alarm is held, a hand-over or a take-over is in progress, a flow is in progress, or the
-    /// account is erased already ([`Refusal::Erased`]). [`Refusal::ErasureRefused`] when the
-    /// switch refuses it. Otherwise the Homeserver's, the switch's or the store's error, the
-    /// erasure kept and finished by [`Signer::resume`].
+    /// account is erased already ([`Refusal::Erased`]). When the switch refuses it (`409
+    /// conflict`), what its copy shows: [`SignerError::NotNamed`] for another install's newer
+    /// copy, [`Refusal::RecordsBehind`] for this install's own, the alarm for a copy that went
+    /// back, and [`Refusal::ErasureRefused`] with the mark still held. Otherwise the
+    /// Homeserver's, the switch's or the store's error, the erasure kept and finished by
+    /// [`Signer::resume`].
     pub async fn close_account(&mut self, _confirmed: UserConfirmed) -> Result<()> {
         self.ready().await?;
         let flow = Flow::Erase {
@@ -143,12 +153,15 @@ impl Signer {
             self.commit(self.state.clone(), Some(flow)).await?;
         }
         // Through the signing gate, as every signing step: the erasure is the identity's
-        // to ask for only while this install signs.
+        // to ask for only while this install signs. It names the mark it follows, so a
+        // delivery since the last check, such as another install's take-over, makes the switch
+        // refuse it; a retry names the same one (Switch wire 7.4.16).
+        let following = self.erasure_follows()?;
         let answer = {
             let key = self.signing_key()?;
             let client = self.signing_client(&key)?;
             drop(key);
-            client.erase().await
+            client.erase(following).await
         };
         match answer {
             Ok(()) => self.erased().await,
@@ -178,10 +191,24 @@ impl Signer {
             Err(error @ (ClientError::Transport(_) | ClientError::BadServiceSignature { .. })) => {
                 Err(error.into())
             }
+            // Signed with the account's key, so the request didn't land: another key, another
+            // `identity.json`, or a move in progress. The switch's copy is judged first, as
+            // every copy (Switch spec 4.3): another install's newer copy ends the erasure
+            // without erasing, this install's own newer one keeps it as records behind, and a
+            // copy that went back raises the alarm. A switch still holding the mark refused for
+            // another reason: the erasure ends, and the user may ask again.
             Err(ClientError::Switch {
                 code: ErrorCode::Conflict,
                 ..
             }) => {
+                let flow = Flow::Erase {
+                    unpublished,
+                    reminded: reminded.clone(),
+                    unanswered: false,
+                    first_404_ms: None,
+                };
+                self.commit(self.state.clone(), Some(flow)).await?;
+                self.switch_at_mark().await?;
                 self.end_erasure(&reminded).await?;
                 Err(Refusal::ErasureRefused.into())
             }
@@ -199,6 +226,21 @@ impl Signer {
             }
             Err(error) => Err(error.into()),
         }
+    }
+
+    /// The document hash an erasure names as the `identity.json` it follows (Switch wire
+    /// 7.4.16): the mark's, once it names this account's service key, that is, once this
+    /// install delivered a version here; `None` before, as at a staged account it delivered
+    /// nothing to, where the key alone is checked.
+    fn erasure_follows(&self) -> Result<Option<[u8; 32]>> {
+        let Some(service) = self.state.service.as_ref() else {
+            return Ok(None);
+        };
+        Ok(self
+            .state
+            .newest_doc()?
+            .filter(|mark| mark.inbox().service_key == service.service_key)
+            .map(|mark| mark.hash()))
     }
 
     /// Before each step of an erasure that deletes or asks to erase, a fresh check that this

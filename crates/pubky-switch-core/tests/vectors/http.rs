@@ -94,12 +94,7 @@ fn conditional_erasures(keys: &Keys) {
     let mut generated_cases = Vec::new();
     for (name, document_name, status, answer, answer_name) in cases {
         let hash = document(document_name).doc_hash().unwrap();
-        let body = format!(
-            "{{\"service_key\":\"{}\",\"identity_hash\":\"{}\"}}",
-            enc::b64(&service),
-            enc::b64(&hash)
-        )
-        .into_bytes();
+        let body = http::erase_body(&service, Some(&hash));
         let path = format!("/v1/{alice_id}/erase");
         let target = RequestTarget {
             method: "POST",
@@ -304,21 +299,14 @@ fn test_vectors_http() {
                     .is_err()
             );
         } else if call.ends_with("/erase") {
-            let value: Value = serde_json::from_slice(&body).unwrap();
+            let parsed = http::parse_erase_body(&body).unwrap();
+            assert_eq!(parsed.service_key, keys.service_key(&alice_id), "{name}");
+            // The body as written, the hash, when named, after the key.
             assert_eq!(
-                b64n::<32>(st(&value, "service_key")),
-                keys.service_key(&alice_id),
+                http::erase_body(&parsed.service_key, parsed.identity_hash.as_ref()),
+                body,
                 "{name}"
             );
-            // The erasures naming the `identity.json` they follow, which the core generates
-            // above, name a hash; the first one names only the key.
-            if value.get("identity_hash").is_none() {
-                assert_eq!(
-                    http::parse_erase_body(&body).unwrap(),
-                    keys.service_key(&alice_id)
-                );
-                assert_eq!(http::erase_body(&keys.service_key(&alice_id)), body);
-            }
         }
     }
     let enrollment = enrollment.expect("an enrollment request");

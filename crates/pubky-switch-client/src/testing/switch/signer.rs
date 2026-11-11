@@ -320,7 +320,7 @@ impl Inner {
     /// the core's rule: the epoch of the first version that listed it, if kept, raised by each
     /// stored part its cursor has passed that continues it, from epoch 1 when the start is
     /// unknown; `None` when nothing shows any.
-    fn keys_through(&self, app: &[u8; 16]) -> Option<u64> {
+    pub(super) fn keys_through(&self, app: &[u8; 16]) -> Option<u64> {
         let start = self.listed_at_epoch.get(app).copied();
         let spans: Vec<pubky_switch_core::ops::StoredPart> = self
             .bundles
@@ -426,21 +426,31 @@ impl Inner {
     }
 
     /// `POST /v1/{id}/erase` from the signer (Switch wire 7.4.16): the body names the
-    /// account's service key (`409 conflict` for another), and a move in progress refuses it
+    /// account's service key (`409 conflict` for another) and, when it names one, the hash of
+    /// the `identity.json` this switch holds (`409 conflict` for another, or for none held),
+    /// and a move in progress refuses it
     /// (`409 conflict`): a frozen account, whose export this switch doesn't track, and a staged
     /// one holding an import, but not one staged for a key change in place. Then the account is
     /// erased, and every later call, a retry included, gets the operator's `404`. The answer
     /// is signed with the service key, without a head; an app's call is `403
     /// permission_missing`.
     pub(super) fn erase_answer(&mut self, body: &[u8]) -> Answer {
-        let key = match pubky_switch_core::http::parse_erase_body(body) {
-            Ok(key) => key,
+        let named = match pubky_switch_core::http::parse_erase_body(body) {
+            Ok(named) => named,
             Err(error) => return bad(ErrorCode::BadRequest, &error.to_string(), json!(null)),
         };
-        if key != self.service.verifying_key().to_bytes() {
+        if named.service_key != self.service.verifying_key().to_bytes() {
             return bad(
                 ErrorCode::Conflict,
                 "not the account's service key",
+                json!(null),
+            );
+        }
+        let held = self.doc.as_ref().map(IdentityDoc::hash);
+        if named.identity_hash.is_some_and(|hash| Some(hash) != held) {
+            return bad(
+                ErrorCode::Conflict,
+                "the account holds another identity.json",
                 json!(null),
             );
         }
@@ -591,6 +601,28 @@ fn read_handover(value: &Value) -> Option<pubky_switch_core::records::SignerHand
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_scripted_erasure_naming_a_hash_with_no_identity_json_held_is_conflict() {
+        // A fresh account holds no `identity.json`: a hash can't match, so the erasure is
+        // `409 conflict` and erases nothing; the key alone erases it (Switch wire 7.4.16).
+        use pubky_switch_core::http::erase_body;
+        let identity = pubky_switch_core::keys::IdentityKey::from_secret([1; 32]);
+        let switch = ScriptedSwitch::new(
+            &identity,
+            [2; 32],
+            Arc::new(crate::clock::TestClock::new(0)),
+        );
+        let mut inner = switch.lock();
+        assert!(inner.doc.is_none());
+        let key = inner.service.verifying_key().to_bytes();
+        let (status, body) = inner.erase_answer(&erase_body(&key, Some(&[9; 32])));
+        assert_eq!((status, body["code"].clone()), (409, json!("conflict")));
+        assert!(!inner.erased);
+        let (status, _) = inner.erase_answer(&erase_body(&key, None));
+        assert_eq!(status, 200);
+        assert!(inner.erased);
+    }
 
     #[test]
     fn test_scripted_handover_refuses_unknown_members() {

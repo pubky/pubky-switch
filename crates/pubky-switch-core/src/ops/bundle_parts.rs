@@ -36,14 +36,16 @@ pub fn keys_through(start: Option<u64>, parts: &[StoredPart], cursor: u64) -> Op
 }
 
 /// The indexes of the stored parts that go (Switch wire 6.2): unless a full-bundle request
-/// is pending, those the target's cursor has passed and that `keys_through` covers.
+/// is in force, those the target's cursor has passed and that `keys_through` covers. A
+/// request is in force from the `POST /keys` until the target's cursor has passed the part
+/// that completed it, or the part that replaced that one; the caller judges it.
 pub fn parts_to_drop(
     parts: &[StoredPart],
     cursor: u64,
     keys_through: Option<u64>,
-    full_requested: bool,
+    request_in_force: bool,
 ) -> Vec<usize> {
-    let Some(through) = keys_through.filter(|_| !full_requested) else {
+    let Some(through) = keys_through.filter(|_| !request_in_force) else {
         return Vec::new();
     };
     parts
