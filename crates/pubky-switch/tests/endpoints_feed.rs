@@ -647,7 +647,7 @@ async fn test_feed_of_an_account_erased_meanwhile_is_unknown() {
             .handle(signer_request(
                 "POST",
                 &format!("/v1/{}/erase", alice_id()),
-                pubky_switch_core::http::erase_body(&service),
+                pubky_switch_core::http::erase_body(&service, None),
                 ms(&at),
             ))
             .await;

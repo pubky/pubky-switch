@@ -136,12 +136,15 @@ impl Signer {
             self.commit(self.state.clone(), Some(flow)).await?;
         }
         // Through the signing gate, as every signing step: the erasure is the identity's
-        // to ask for only while this install signs.
+        // to ask for only while this install signs. It names the mark it follows, so a
+        // delivery since the last check, such as another install's take-over, makes the switch
+        // refuse it; a retry names the same one (Switch wire 7.4.16).
+        let following = self.erasure_follows()?;
         let answer = {
             let key = self.signing_key()?;
             let client = self.signing_client(&key)?;
             drop(key);
-            client.erase().await
+            client.erase(following).await
         };
         match answer {
             Ok(()) => self.erased().await,
@@ -169,10 +172,23 @@ impl Signer {
             Err(error @ (ClientError::Transport(_) | ClientError::BadServiceSignature { .. })) => {
                 Err(error.into())
             }
+            // Signed with the account's key, so the request didn't land: another key, another
+            // `identity.json`, or a move in progress. The switch's copy is judged first, as
+            // every copy (Switch spec 4.3): another install's newer copy ends the erasure
+            // without erasing, this install's own newer one keeps it as records behind, and a
+            // copy that went back raises the alarm. A switch still holding the mark refused for
+            // another reason: the erasure ends, and the user may ask again.
             Err(ClientError::Switch {
                 code: ErrorCode::Conflict,
                 ..
             }) => {
+                let flow = Flow::Erase {
+                    unpublished,
+                    reminded: reminded.clone(),
+                    unanswered: false,
+                };
+                self.commit(self.state.clone(), Some(flow)).await?;
+                self.switch_at_mark().await?;
                 self.end_erasure(&reminded).await?;
                 Err(Refusal::ErasureRefused.into())
             }
@@ -189,6 +205,21 @@ impl Signer {
             }
             Err(error) => Err(error.into()),
         }
+    }
+
+    /// The document hash an erasure names as the `identity.json` it follows (Switch wire
+    /// 7.4.16): the mark's, once it names this account's service key, that is, once this
+    /// install delivered a version here; `None` before, as at a staged account it delivered
+    /// nothing to, where the key alone is checked.
+    fn erasure_follows(&self) -> Result<Option<[u8; 32]>> {
+        let Some(service) = self.state.service.as_ref() else {
+            return Ok(None);
+        };
+        Ok(self
+            .state
+            .newest_doc()?
+            .filter(|mark| mark.inbox().service_key == service.service_key)
+            .map(|mark| mark.hash()))
     }
 
     /// Before each step of an erasure that deletes or asks to erase, a fresh check that this

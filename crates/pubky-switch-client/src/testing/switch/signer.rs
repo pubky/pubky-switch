@@ -426,21 +426,31 @@ impl Inner {
     }
 
     /// `POST /v1/{id}/erase` from the signer (Switch wire 7.4.16): the body names the
-    /// account's service key (`409 conflict` for another), and a move in progress refuses it
+    /// account's service key (`409 conflict` for another) and, when it names one, the hash of
+    /// the `identity.json` this switch holds (`409 conflict` for another, or for none held),
+    /// and a move in progress refuses it
     /// (`409 conflict`): a frozen account, whose export this switch doesn't track, and a staged
     /// one holding an import, but not one staged for a key change in place. Then the account is
     /// erased, and every later call, a retry included, gets the operator's `404`. The answer
     /// is signed with the service key, without a head; an app's call is `403
     /// permission_missing`.
     pub(super) fn erase_answer(&mut self, body: &[u8]) -> Answer {
-        let key = match pubky_switch_core::http::parse_erase_body(body) {
-            Ok(key) => key,
+        let named = match pubky_switch_core::http::parse_erase_body(body) {
+            Ok(named) => named,
             Err(error) => return bad(ErrorCode::BadRequest, &error.to_string(), json!(null)),
         };
-        if key != self.service.verifying_key().to_bytes() {
+        if named.service_key != self.service.verifying_key().to_bytes() {
             return bad(
                 ErrorCode::Conflict,
                 "not the account's service key",
+                json!(null),
+            );
+        }
+        let held = self.doc.as_ref().map(IdentityDoc::hash);
+        if named.identity_hash.is_some_and(|hash| Some(hash) != held) {
+            return bad(
+                ErrorCode::Conflict,
+                "the account holds another identity.json",
                 json!(null),
             );
         }

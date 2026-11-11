@@ -531,9 +531,10 @@ async fn test_vectors_old_signer_renews_the_wallet_as_the_vectors_do() {
     );
 }
 
-/// `http.json`'s account erasure and its answer (Switch wire 7.4.16): at the vector's time,
-/// the erasure alice's signer sends is the vector's request, its body naming her account's
-/// service key, its headers and signature byte for byte; the vector's answer, signed with that
+/// `http.json`'s account erasure naming the `identity.json` it follows, and its answer (Switch
+/// wire 7.4.16): at the vector's time, the erasure alice's signer sends is the vector's
+/// request, its body naming her account's service key and the hash of her version 3, its
+/// mark, its headers and signature byte for byte; the vector's answer, signed with that
 /// key and carrying no head, confirms it, and the signer then signs nothing more.
 #[tokio::test]
 async fn test_vectors_old_signer_erases_the_account_as_the_vectors_do() {
@@ -542,13 +543,16 @@ async fn test_vectors_old_signer_erases_the_account_as_the_vectors_do() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|r| text(r, "name").starts_with("signer: account erasure"))
+        .find(|r| {
+            text(r, "name")
+                == "signer: account erasure, naming the account's service key and the identity.json it follows"
+        })
         .unwrap();
     let answer = http["responses"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|r| text(r, "name").starts_with("signer: account erasure answer"))
+        .find(|r| r["request_signature"] == request["signature"])
         .unwrap();
     let response = Response {
         status: u16::try_from(answer["status"].as_u64().unwrap()).unwrap(),

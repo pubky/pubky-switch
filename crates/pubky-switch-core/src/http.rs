@@ -394,25 +394,57 @@ impl IdentityDelivery {
 /// The answer body of a committed erasure, `{"erased":true}` (Switch wire 7.4.16).
 pub const ERASED_BODY: &[u8] = br#"{"erased":true}"#;
 
-/// Read the body of `POST /v1/{id}/erase`: `{ "service_key": b64(32) }`, the account's
-/// service key the signer pinned (Switch wire 7.4.16).
+/// The body of `POST /v1/{id}/erase` (Switch wire 7.4.16).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EraseBody {
+    /// The account's service key, the one the signer pinned.
+    pub service_key: [u8; 32],
+    /// The document hash of the newest `identity.json` the signer holds, its mark: the
+    /// erasure is refused when the account holds another. Absent from an older signer's.
+    pub identity_hash: Option<[u8; 32]>,
+}
+
+/// Read the body of `POST /v1/{id}/erase`: `{ "service_key": b64(32), "identity_hash":
+/// b64(32) }`, the hash optional (Switch wire 7.4.16).
 ///
 /// # Errors
 ///
-/// [`Error::Invalid`] (`400 bad_request`) for any other member or a key that isn't
+/// [`Error::Invalid`] (`400 bad_request`) for any other member, or a key or hash that isn't
 /// `b64(32)`.
-pub fn parse_erase_body(body: &[u8]) -> Result<[u8; 32]> {
+pub fn parse_erase_body(body: &[u8]) -> Result<EraseBody> {
     let value: serde_json::Value = crate::json::parse_json(body)?;
-    crate::json::reject_unknown_members(&value, &["service_key"], "the erasure body")?;
-    match value.get("service_key") {
-        Some(serde_json::Value::String(text)) => unb64_array::<32>(text),
-        _ => invalid("Switch wire 7.4.16: the erasure body names `service_key`"),
-    }
+    crate::json::reject_unknown_members(
+        &value,
+        &["service_key", "identity_hash"],
+        "the erasure body",
+    )?;
+    let service_key = match value.get("service_key") {
+        Some(serde_json::Value::String(text)) => unb64_array::<32>(text)?,
+        _ => return invalid("Switch wire 7.4.16: the erasure body names `service_key`"),
+    };
+    let identity_hash = match value.get("identity_hash") {
+        None => None,
+        Some(serde_json::Value::String(text)) => Some(unb64_array::<32>(text)?),
+        Some(_) => return invalid("Switch wire 7.4.16: `identity_hash` is b64(32)"),
+    };
+    Ok(EraseBody {
+        service_key,
+        identity_hash,
+    })
 }
 
-/// Write the body of `POST /v1/{id}/erase` (Switch wire 7.4.16).
-pub fn erase_body(service_key: &[u8; 32]) -> Vec<u8> {
-    format!("{{\"service_key\":\"{}\"}}", crate::enc::b64(service_key)).into_bytes()
+/// Write the body of `POST /v1/{id}/erase` (Switch wire 7.4.16): the service key, then the
+/// hash of the `identity.json` the erasure follows, when given.
+pub fn erase_body(service_key: &[u8; 32], identity_hash: Option<&[u8; 32]>) -> Vec<u8> {
+    let key = crate::enc::b64(service_key);
+    match identity_hash {
+        Some(hash) => format!(
+            "{{\"service_key\":\"{key}\",\"identity_hash\":\"{}\"}}",
+            crate::enc::b64(hash)
+        ),
+        None => format!("{{\"service_key\":\"{key}\"}}"),
+    }
+    .into_bytes()
 }
 
 /// The calls after `/v1/{id}/` of a path, without its query.
@@ -795,9 +827,32 @@ mod tests {
     #[test]
     fn test_erase_body_refuses_other_members() {
         let key = [3; 32];
-        assert_eq!(parse_erase_body(&erase_body(&key)).unwrap(), key);
+        assert_eq!(
+            parse_erase_body(&erase_body(&key, None)).unwrap(),
+            EraseBody {
+                service_key: key,
+                identity_hash: None
+            }
+        );
         assert!(parse_erase_body(br#"{"service_key":"AA","x":1}"#).is_err());
         assert!(parse_erase_body(b"{}").is_err());
+    }
+
+    #[test]
+    fn test_erase_body_carries_the_identity_hash() {
+        let (key, hash) = ([3; 32], [4; 32]);
+        assert_eq!(
+            parse_erase_body(&erase_body(&key, Some(&hash))).unwrap(),
+            EraseBody {
+                service_key: key,
+                identity_hash: Some(hash)
+            }
+        );
+        let text = crate::enc::b64(&key);
+        let body = format!(r#"{{"service_key":"{text}","identity_hash":7}}"#);
+        assert!(parse_erase_body(body.as_bytes()).is_err());
+        let body = format!(r#"{{"service_key":"{text}","identity_hash":"AA"}}"#);
+        assert!(parse_erase_body(body.as_bytes()).is_err());
     }
 
     #[test]
