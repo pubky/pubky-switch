@@ -481,11 +481,14 @@ impl Signer {
             .await
     }
 
-    /// Answer every pending full-bundle request of a current app (Switch wire 3.5 "Full
-    /// bundles on request", 7.4.11): the parts for the epochs from 1 to the current one that
-    /// the parts stored for its listed certificate don't cover, with `cert.put` first when
-    /// its record carries another certificate. Then the backup is written again, at the same
-    /// version. Returns the apps answered.
+    /// Answer every pending full-bundle request of a current app (Switch spec 3.5, wire 3.5
+    /// "Full bundles on request", 7.4.11): the parts for every epoch from 1 to the current
+    /// one, also when the parts stored for its listed certificate cover them already, since
+    /// the app that asks may have lost its copy and only a put that completes the range
+    /// answers the request; with `cert.put` first when its record carries another
+    /// certificate. A request answered only in part, as after a failure, is finished by
+    /// [`Signer::resume`], which sends the rest of its batches. Then the backup is written
+    /// again, at the same version. Returns the apps answered.
     ///
     /// An app whose certificate holds a scope no registered protocol owns gets nothing, with
     /// [`Alert::RotationSkipped`] (design note, decision 2).
@@ -539,26 +542,10 @@ impl Signer {
                 });
                 continue;
             }
-            // The ranges stored for the listed certificate that the switch still shows; a
-            // range whose part names another certificate, or that the signer can't tell,
-            // counts as missing (Switch wire 3.5).
-            let covered: Vec<(u64, u64)> = self
-                .state
-                .bundle_parts
-                .iter()
-                .filter(|p| p.app_id == listed.app_id && p.cert == listed.cert)
-                .map(|p| (p.first_epoch, p.last_epoch))
-                .filter(|range| {
-                    status
-                        .bundle_ranges
-                        .iter()
-                        .any(|r| (r.first, r.last) == *range)
-                })
-                .collect();
-            let missing = missing_ranges(&covered, current);
-            if missing.is_empty() {
-                continue;
-            }
+            // Every epoch from 1, whatever the parts stored for its certificate already cover:
+            // the app may have lost its copy, and asks again until a put completes the range,
+            // which clears the request (Switch wire 3.5 "Full bundles on request").
+            let missing = [(1, current)];
             let mut ops: Vec<Op> = Vec::new();
             if status.record_cert != Some(listed.cert) {
                 ops.push((
@@ -652,31 +639,9 @@ fn bounded_time(reported: u64, first_listed: Option<u64>, answered_at: u64) -> u
     reported.max(floor).min(answered_at.max(floor))
 }
 
-/// The ranges of epochs from 1 to `current` that `covered` leaves out, in order.
-fn missing_ranges(covered: &[(u64, u64)], current: u64) -> Vec<(u64, u64)> {
-    let mut covered = covered.to_vec();
-    covered.sort_unstable();
-    let mut missing = Vec::new();
-    let mut next = 1u64;
-    for (first, last) in covered {
-        if first > next {
-            missing.push((next, first.saturating_sub(1).min(current)));
-        }
-        next = next.max(last.saturating_add(1));
-        if next > current {
-            break;
-        }
-    }
-    if next <= current {
-        missing.push((next, current));
-    }
-    missing.retain(|(first, last)| first <= last);
-    missing
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{bounded_time, missing_ranges, reported_time};
+    use super::{bounded_time, reported_time};
 
     #[test]
     fn test_bounded_time_stays_between_the_listing_and_the_answer() {
@@ -693,14 +658,5 @@ mod tests {
         assert_eq!(reported_time(None, Some(7)), Some(7));
         assert_eq!(reported_time(Some(9), Some(7)), Some(7));
         assert_eq!(reported_time(Some(3), Some(7)), Some(3));
-    }
-
-    #[test]
-    fn test_missing_ranges_fill_every_gap_up_to_the_current_epoch() {
-        assert_eq!(missing_ranges(&[], 3), [(1, 3)]);
-        assert_eq!(missing_ranges(&[(1, 3)], 3), []);
-        assert_eq!(missing_ranges(&[(2, 2)], 4), [(1, 1), (3, 4)]);
-        assert_eq!(missing_ranges(&[(3, 4), (1, 1)], 5), [(2, 2), (5, 5)]);
-        assert_eq!(missing_ranges(&[(1, 9)], 3), []);
     }
 }
