@@ -141,6 +141,7 @@ impl Service {
         held: Option<&IdentityDoc>,
         app_id: &str,
         body: &[u8],
+        trusted: bool,
         time_ms: u64,
     ) -> Result<Answer, ApiError> {
         if !body.is_empty() {
@@ -169,7 +170,7 @@ impl Service {
             app_id: app,
             at: time_ms,
         };
-        self.remove_app(txn, signer, held, transition, time_ms)
+        self.remove_app(txn, signer, held, transition, trusted, time_ms)
             .await
     }
 
@@ -192,6 +193,7 @@ impl Service {
         caller: &AppCert,
         app_id: &str,
         body: &[u8],
+        trusted: bool,
         time_ms: u64,
     ) -> Result<Answer, ApiError> {
         let app = caller.app_id();
@@ -208,7 +210,7 @@ impl Service {
             app_id: app,
             at: time_ms,
         };
-        self.remove_app(txn, signer, held, transition, time_ms)
+        self.remove_app(txn, signer, held, transition, trusted, time_ms)
             .await
     }
 
@@ -221,6 +223,7 @@ impl Service {
         signer: &ServiceSigner,
         held: Option<&IdentityDoc>,
         transition: ServiceTransition,
+        trusted: bool,
         time_ms: u64,
     ) -> Result<Answer, ApiError> {
         let (ServiceTransition::Revoke { app_id: app, .. }
@@ -233,7 +236,8 @@ impl Service {
         // It leaves the directory, a reachable app no longer counts among the reachable
         // ones (Switch wire 7.4.10), and entries no longer wait for it (9.1): settled from
         // the state before the removal, then the removal written.
-        batch::settle_change(txn, held, None, Some(app), time_ms)
+        let release = self.release(trusted);
+        let current = batch::settle_change(txn, held, None, Some(app), time_ms, release)
             .await
             .map_err(|e| store_error(&e))?;
         let reason = if matches!(transition, ServiceTransition::Leave { .. }) {
@@ -266,6 +270,12 @@ impl Service {
         })
         .await
         .map_err(|e| store_error(&e))?;
+        // After its chain item: the entries it leaves no current app to read become
+        // unreadable items, and the current apps' shares change (Switch wire 7.4.4).
+        release
+            .departed(txn, &current)
+            .await
+            .map_err(|e| store_error(&e))?;
         let object = transition.proof_object().ok_or_else(temporary)?;
         let proof = TransitionProof::sign(
             signer,

@@ -387,7 +387,8 @@ pub(super) async fn settle_change(
     delivered: Option<&IdentityDoc>,
     revoked: Option<[u8; 16]>,
     now: u64,
-) -> Result<(), StoreError> {
+    release: Release,
+) -> Result<Vec<[u8; 16]>, StoreError> {
     let mut before = load_apps(txn, held, now).await?;
     (before.directory_version, before.apps_version) = txn.directory_versions().await?;
     let mut after = before.clone();
@@ -399,9 +400,105 @@ pub(super) async fn settle_change(
     }
     after.directory_version = after.directory_version.saturating_add(1);
     after.settle_directory(&before);
-    save_apps(txn, &before, &after).await?;
-    txn.delete_passed_entries(&after.current_app_ids()).await?;
-    Ok(())
+    save_apps(txn, &before, &after, release).await?;
+    let current = after.current_app_ids();
+    let lagging = release.lagging(txn, &current).await?;
+    txn.delete_passed_entries(&current, &lagging).await?;
+    Ok(current)
+}
+
+/// How a request releases inbox entries (Switch wire 7.4.4, 9.1): lagging marks count, and
+/// entries left with no current target from before a departure converted them are
+/// converted, only with trusted time; an unreadable item counts `overhead`.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Release {
+    /// The request has trusted time.
+    pub trusted: bool,
+    /// `entry_overhead_bytes` (9.2).
+    pub overhead: u64,
+    /// `quota_bytes` (9.2), which the lagging apps' shares divide.
+    pub quota: u64,
+    /// `mark_lagging` (9.2).
+    pub mark_lagging: bool,
+}
+
+impl Release {
+    /// The apps of `current` marked lagging, which entries don't wait for: none without
+    /// trusted time.
+    async fn lagging(
+        &self,
+        txn: &mut AccountTxn,
+        current: &[[u8; 16]],
+    ) -> Result<Vec<[u8; 16]>, StoreError> {
+        if !self.trusted {
+            return Ok(Vec::new());
+        }
+        let marked = txn.lagging_apps().await?;
+        Ok(marked
+            .into_iter()
+            .filter(|app| current.contains(app))
+            .collect())
+    }
+
+    /// Release what the current apps `current` passed, after a cursor moved: with trusted
+    /// time, entries a departure before this service converted none of become unreadable
+    /// items first.
+    pub(super) async fn passed(
+        &self,
+        txn: &mut AccountTxn,
+        current: &[[u8; 16]],
+    ) -> Result<(), StoreError> {
+        if self.trusted {
+            txn.convert_unreadable(current, self.overhead).await?;
+        }
+        let lagging = self.lagging(txn, current).await?;
+        txn.delete_passed_entries(current, &lagging).await?;
+        Ok(())
+    }
+
+    /// After a departure's chain item, `current` holding the App IDs current after it: each
+    /// entry left with no current target becomes an unreadable item, in this request
+    /// (Switch wire 7.4.4); with trusted time the current apps' shares changed, so lagging
+    /// marks are set again ([`Release::mark`]).
+    pub(super) async fn departed(
+        &self,
+        txn: &mut AccountTxn,
+        current: &[[u8; 16]],
+    ) -> Result<(), StoreError> {
+        txn.convert_unreadable(current, self.overhead).await?;
+        self.mark(txn, current).await
+    }
+
+    /// Set lagging marks, at a request that brings the pressure: an append, or a change of
+    /// the current apps `current` (Switch wire 7.4.4). With trusted time only, and with
+    /// `mark_lagging` on. An app whose unread bytes exceed its share, `quota` divided among
+    /// the current apps, is marked, unless no current app is within its share: then none is,
+    /// and the marks set before end, so entries wait and the quota refuses senders (A14).
+    /// Entries only newly marked apps were holding go now, each in its `missed` item.
+    pub(super) async fn mark(
+        &self,
+        txn: &mut AccountTxn,
+        current: &[[u8; 16]],
+    ) -> Result<(), StoreError> {
+        if !self.trusted || !self.mark_lagging || current.is_empty() {
+            return Ok(());
+        }
+        let share = self.quota / u64::try_from(current.len()).unwrap_or(u64::MAX).max(1);
+        let unread = txn.unread_bytes(current).await?;
+        let over: Vec<[u8; 16]> = unread
+            .iter()
+            .filter(|(_, bytes)| *bytes > share)
+            .map(|(app, _)| *app)
+            .collect();
+        if over.len() == current.len() {
+            txn.set_lagging(current, false).await?;
+            return Ok(());
+        }
+        txn.set_lagging(&over, true).await?;
+        let lagging = self.lagging(txn, current).await?;
+        txn.delete_passed_entries(current, &lagging).await?;
+        Ok(())
+    }
 }
 
 pub(crate) fn held_app(app: &StoredApp, identity: &[u8; 32]) -> Result<HeldApp, StoreError> {
@@ -458,6 +555,16 @@ fn held_part(part: &StoredBundlePart) -> Result<HeldPart, StoreError> {
 }
 
 impl Service {
+    /// How a request releases inbox entries, `trusted` when it has trusted time.
+    pub(super) fn release(&self, trusted: bool) -> Release {
+        Release {
+            trusted,
+            overhead: self.limits.entry_overhead_bytes,
+            quota: self.limits.quota_bytes,
+            mark_lagging: self.limits.mark_lagging,
+        }
+    }
+
     /// An own app's request before the account's lock (Switch wire 7.2 Order): for a `POST
     /// /ops` (`batch`), the body parsed; the key the request is checked with found, and the
     /// request verified with it.
@@ -744,8 +851,9 @@ impl Service {
         // An app record, a receive key or a renewed certificate can make an app reachable
         // or stop it being so (Switch wire 7.4.10).
         after.settle_directory(&before);
+        let release = self.release(due.is_some());
         if effect == BatchEffect::Unchanged {
-            save_apps(txn, &before, &after)
+            save_apps(txn, &before, &after, release)
                 .await
                 .map_err(|e| storage(&e))?;
             return self.write_answer(txn, signer, &[]).await;
@@ -753,7 +861,7 @@ impl Service {
         // Step 11: the chain items and their proofs, then the state, all at once.
         let first_seq = txn.head().last_seq.saturating_add(1);
         let proofs = self.chain_ops(txn, signer, &ops, &applied, time_ms).await?;
-        save(txn, &before, &mut after, &ops, &proofs)
+        save(txn, &before, &mut after, &ops, &proofs, release)
             .await
             .map_err(|e| storage(&e))?;
         if let (Some(first), Some(ops_hash)) = (ops.first(), hash) {
@@ -882,6 +990,7 @@ async fn save_apps(
     txn: &mut AccountTxn,
     before: &OpsState,
     after: &OpsState,
+    release: Release,
 ) -> Result<(), StoreError> {
     let mut cursor_moved = false;
     for (app_id, app) in &after.apps {
@@ -892,7 +1001,7 @@ async fn save_apps(
     }
     // An entry every current target has passed goes (Switch wire 9.1).
     if cursor_moved {
-        txn.delete_passed_entries(&after.current_app_ids()).await?;
+        release.passed(txn, &after.current_app_ids()).await?;
     }
     for (app_id, key) in &after.new_receive_keys {
         txn.add_receive_key(app_id, key.n(), &key.kid(), key.signed())
@@ -915,6 +1024,7 @@ async fn save(
     after: &mut OpsState,
     ops: &[SignedOp],
     proofs: &[SignedDoc],
+    release: Release,
 ) -> Result<(), StoreError> {
     // The records and claim entries this batch wrote keep their operation's proof.
     let proof_at = |seq: u64| -> Option<SignedDoc> {
@@ -929,7 +1039,7 @@ async fn save(
             record.proof = Some(proof.clone());
         }
     }
-    save_apps(txn, before, after).await?;
+    save_apps(txn, before, after, release).await?;
     for (target, parts) in &after.parts {
         if before.parts.get(target) != Some(parts) {
             let stored: Vec<StoredBundlePart> = parts

@@ -310,6 +310,18 @@ impl Service {
         })
         .await
         .map_err(|e| store_error(&e))?;
+        // An append brings the pressure lagging marks answer, with trusted time (Switch wire
+        // 7.4.4).
+        if trusted {
+            let current = super::batch::load_apps(txn, held, time_ms)
+                .await
+                .map_err(|e| store_error(&e))?
+                .current_app_ids();
+            self.release(true)
+                .mark(txn, &current)
+                .await
+                .map_err(|e| store_error(&e))?;
+        }
         self.answer(txn, signer, stored, other).await
     }
 

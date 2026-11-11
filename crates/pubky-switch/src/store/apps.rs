@@ -80,6 +80,8 @@ pub struct AppsView {
     /// target of: filled by the service, which judges which apps are current
     /// ([`AccountTxn::unread_counts`]).
     pub unread: BTreeMap<[u8; 16], (u64, u64)>,
+    /// The apps marked lagging (Switch wire 7.4.4).
+    pub lagging: std::collections::BTreeSet<[u8; 16]>,
     /// The generations that some current record's kept proof names (Switch wire 7.4.9).
     pub record_generations: Vec<u64>,
     /// The generations that some live claim's entry proof names (Switch wire 6.8).
@@ -215,6 +217,7 @@ impl AccountTxn {
                 rotated: row.try_get("rotated")?,
             });
         }
+        view.lagging = self.lagging_apps().await?.into_iter().collect();
         for row in sqlx::query(
             "SELECT app_id, last_seen_ms FROM apps WHERE account_id = $1 \
              AND last_seen_ms IS NOT NULL",
