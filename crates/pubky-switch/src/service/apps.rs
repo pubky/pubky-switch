@@ -185,7 +185,6 @@ pub(crate) fn statuses(
                 json_of(&kept_id.is_some_and(awaiting_rotation))?,
             ),
             ("open_attempts", array(&open_attempts)),
-            // Lagging comes with the next inbox PR.
             (
                 "unread_entries",
                 json_of(&view.unread.get(&id).map_or(0, |(unread, _)| *unread))?,
@@ -199,7 +198,7 @@ pub(crate) fn statuses(
                 "record_at",
                 json_of(&time(held.and_then(|app| app.record_at)))?,
             ),
-            ("lagging", json_of(&false)?),
+            ("lagging", json_of(&view.lagging.contains(&id))?),
             (
                 "keys_through",
                 json_of(&keys_through(
