@@ -386,14 +386,23 @@ async fn test_allow_answer_time_is_the_state_read() {
         header_text(&answer, "switch-server-time"),
         Some(later.as_str())
     );
-    // An expiry is judged at that time too: a code expiring before it isn't live.
-    wallet_op(&replay, put_code(CODE, ms(&later) + 30_000, 1), 70).await;
-    let soon = pubky_switch_core::time::rfc3339(ms(&later) + 31_000);
-    set_time(&replay.clock, &soon);
-    let answer = read_as(&replay, "wallet", &soon).await;
+    // An expiry is judged at that time too: a code is live until the instant it expires,
+    // and not at it.
+    let expires = ms(&later) + 30_000;
+    wallet_op(&replay, put_code(CODE, expires, 1), 70).await;
+    let just_before = pubky_switch_core::time::rfc3339(expires - 1);
+    set_time(&replay.clock, &just_before);
+    let answer = read_as(&replay, "wallet", &just_before).await;
+    assert_eq!(
+        body(&answer)["invite_codes"].as_array().map(Vec::len),
+        Some(1)
+    );
+    let at_expiry = pubky_switch_core::time::rfc3339(expires);
+    set_time(&replay.clock, &at_expiry);
+    let answer = read_as(&replay, "wallet", &at_expiry).await;
     assert_eq!(
         header_text(&answer, "switch-server-time"),
-        Some(soon.as_str())
+        Some(at_expiry.as_str())
     );
     assert_eq!(body(&answer)["invite_codes"], json!([]));
     replay.db.drop_database().await.expect("drop");
