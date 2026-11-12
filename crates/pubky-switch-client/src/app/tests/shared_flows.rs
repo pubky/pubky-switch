@@ -6521,3 +6521,51 @@ async fn test_records_listing_at_a_missed_item_fetches_the_key_and_reads_on() {
     assert_eq!(handed(&s, &note.msg_id), 1, "{:?}", report.events);
     assert!(!app.listing_owed().await.unwrap());
 }
+
+#[tokio::test]
+async fn test_scripted_records_condition_zero_matches_a_held_delete() {
+    // As at the service (Switch wire 6.3): a `record_version` condition of `{0, 0}` holds
+    // for a deleted record, as for an absent one; a live record fails it.
+    use pubky_switch_core::ops::Condition;
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let target = s.target("n1");
+    wallet
+        .put_record(&target, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    let key = wallet.record_key(&target).unwrap();
+    let fenced = |pubky: u8| {
+        OpBatch::new().op_if(
+            OpKind::DenyPut { pubky: [pubky; 32] },
+            vec![Condition::RecordVersion {
+                key,
+                version: RecordVersion::NONE,
+            }],
+        )
+    };
+    assert!(wallet.submit_batch(fenced(9)).await.is_err(), "live");
+    wallet.delete_record(&target, vec![]).await.unwrap();
+    wallet.submit_batch(fenced(8)).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_scripted_records_deleted_key_taken_from_an_upload_is_kept() {
+    // As at the service: a delete taken from a recovery upload has no chain item here to
+    // stand for it, so its key stays, every reader past it or not.
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    let target = s.target("n1");
+    let key = created_and_deleted(&mut wallet, &target).await;
+    s.w.switch
+        .lock()
+        .shared
+        .records
+        .get_mut(&key)
+        .unwrap()
+        .uploaded = Some(true);
+    read_on(&mut wallet).await;
+    read_on(&mut phone).await;
+    assert!(held_at_switch(&s, &key));
+}

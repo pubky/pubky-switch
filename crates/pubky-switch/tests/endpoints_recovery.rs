@@ -2950,6 +2950,13 @@ async fn test_recovery_in_place_and_a_sweep_at_the_same_moment_run_one_after_the
         .execute(&mut conn)
         .await
         .expect("invite");
+        // Due now: the minute's mark cleared, and each sweep's deletes logged.
+        sqlx::query("UPDATE accounts SET swept_at_ms = NULL WHERE id = $1")
+            .bind(alice_id())
+            .execute(&mut conn)
+            .await
+            .expect("due");
+        log_swept_invite_codes(&replay).await;
         let before = held(&replay).await;
         let recovery = next_generation(&before, pending, Some(1));
         let apps = || {
@@ -2991,6 +2998,12 @@ async fn test_recovery_in_place_and_a_sweep_at_the_same_moment_run_one_after_the
             )
             .await,
             0
+        );
+        // A sweep ran: whichever request came first swept the expired code at its step 4.
+        assert_eq!(
+            swept_invite_codes(&replay).await,
+            1,
+            "sweep first: {sweep_first}"
         );
         conn.close().await.expect("close");
         replay.db.drop_database().await.expect("drop");

@@ -3468,11 +3468,17 @@ async fn queued(
     (first, second)
 }
 
-/// An invite code that expired at `at`, for the minute's sweep to drop.
+/// An invite code that expired at `at`, for the minute's sweep to drop, and the sweep due
+/// at the next request.
 async fn expired_invite(replay: &Replay, at: &str) {
     let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
         .await
         .expect("conn");
+    sqlx::query("UPDATE accounts SET swept_at_ms = NULL WHERE id = $1")
+        .bind(alice_id())
+        .execute(&mut conn)
+        .await
+        .expect("due");
     sqlx::query(
         "INSERT INTO invite_codes (account_id, code_hash, max_uses, writer, expires_at_ms, \
          context) VALUES ($1, decode(repeat('ab', 32), 'hex'), 1, \
@@ -3497,6 +3503,7 @@ async fn test_erase_and_a_sweep_at_the_same_moment_run_one_after_the_other() {
         replay_chain_through_revoke(&replay).await;
         let at = revoke_time();
         expired_invite(&replay, &at).await;
+        log_swept_invite_codes(&replay).await;
         let apps = || {
             replay.service.handle(signer_request(
                 "GET",
@@ -3539,6 +3546,13 @@ async fn test_erase_and_a_sweep_at_the_same_moment_run_one_after_the_other() {
                 .await
                 .iter()
                 .all(|(_, count)| *count == 0),
+            "sweep first: {sweep_first}"
+        );
+        // A sweep ran before the erasure took the account: whichever request came first
+        // swept the expired code at its step 4.
+        assert_eq!(
+            swept_invite_codes(&replay).await,
+            1,
             "sweep first: {sweep_first}"
         );
         replay.db.drop_database().await.expect("drop");

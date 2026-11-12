@@ -1206,3 +1206,79 @@ async fn test_records_deleted_key_taken_from_an_upload_is_kept() {
     );
     replay.db.drop_database().await.expect("drop");
 }
+
+/// A batch of the wallet's with batch ID `[id; 16]`: a create at `natural` under the
+/// condition that the record at `key` is at `version`.
+fn conditioned(id: u8, key: [u8; 32], version: RecordVersion, natural: &[u8]) -> Vec<SignedOp> {
+    let keys = vectors("keys.json");
+    let wallet = app(&keys, "wallet");
+    let signing = ed25519_dalek::SigningKey::from_bytes(&hex32(&wallet["signing_secret_hex"]));
+    let app_id = pubky_switch_core::enc::app_id_decode(wallet["app_id"].as_str().expect("id"))
+        .expect("app id");
+    let put = record_put(PAYMENTS, natural, "pay", RecordVersion::NONE, b"{\"n\":1}");
+    sign_batch(
+        &signing,
+        &alice_key().public(),
+        Some(app_id),
+        1,
+        [id; 16],
+        vec![(
+            vec![pubky_switch_core::ops::Condition::RecordVersion { key, version }],
+            OpKind::RecordPut(put),
+        )],
+    )
+    .expect("batch")
+}
+
+#[tokio::test]
+async fn test_records_condition_zero_matches_a_held_delete_and_a_forgotten_key() {
+    // A `record_version` condition of `{0, 0}` holds for a record that is absent,
+    // forgotten or deleted, as `expected_version` `{0, 0}` does: a writer holding a delete
+    // names it the same way before the key is forgotten and after (Switch wire 6.3). A live
+    // record fails it, `409 conflict`.
+    let Some(replay) = registered(Limits::default()).await else {
+        return;
+    };
+    register_executor(&replay).await;
+    let (live, ..) = create(&replay, 1, b"live", "pay").await;
+    let keys = vectors("keys.json");
+    let refused = replay
+        .service
+        .handle(app_request(
+            app(&keys, "wallet"),
+            "POST",
+            &format!("/v1/{}/ops", alice_id()),
+            OpsRequest::new(&conditioned(2, live, RecordVersion::NONE, b"c1"), None).to_json(),
+            ms(AT),
+        ))
+        .await;
+    assert_eq!(code_of(&refused), (409, json!("conflict")));
+    let (key, deleted_at) = created_and_deleted(&replay, 3, b"gone").await;
+    post(
+        &replay,
+        "wallet",
+        &conditioned(5, key, RecordVersion::NONE, b"c2"),
+        AT,
+    )
+    .await;
+    // The delete's own version holds too, while the service keeps it.
+    post(
+        &replay,
+        "wallet",
+        &conditioned(6, key, RecordVersion::new(1, deleted_at), b"c3"),
+        AT,
+    )
+    .await;
+    all_past(&replay, last_seq(&replay).await).await;
+    next_minute(&replay);
+    get_as(&replay, "wallet", &format!("records/{}", b64(&key))).await;
+    assert_eq!(record_rows(&replay, &key).await, 0, "forgotten");
+    post(
+        &replay,
+        "wallet",
+        &conditioned(7, key, RecordVersion::NONE, b"c4"),
+        AT,
+    )
+    .await;
+    replay.db.drop_database().await.expect("drop");
+}

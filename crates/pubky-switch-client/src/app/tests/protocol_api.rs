@@ -3405,10 +3405,16 @@ async fn test_scripted_invite_codes_spent_or_expired_go_at_the_minutes_sweep() {
     );
     shop.receive(None).await.unwrap();
     assert_eq!(p.bob.switch().invite_uses_left(&spent.code), Some(0));
+    // A code expiring at the very time of the sweep is expired then, as at the service.
+    let at_the_sweep = shop
+        .register_invite_code(p.clock.now_ms() + 11 * MINUTE, 1, Value::Null)
+        .await
+        .unwrap();
     p.clock.advance_ms(11 * MINUTE);
     shop.receive(None).await.unwrap();
     let left = |code: &str| p.bob.switch().invite_uses_left(code);
     assert_eq!(left(&spent.code), None);
     assert_eq!(left(&expiring.code), None);
+    assert_eq!(left(&at_the_sweep.code), None);
     assert_eq!(left(&live.code), Some(2));
 }

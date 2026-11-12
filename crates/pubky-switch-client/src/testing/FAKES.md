@@ -106,15 +106,17 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   claims are deleted only when `GET /claims` finds them deletable; batch records are never
   dropped, and their proofs go only when a retry finds them past `batch_proofs_ms`, which
   answers it `409 conflict` as the service's sweep does.
-- **Forgotten deleted keys** (Switch spec 10.3, wire 9.1), as at the service: at each
-  cursor move, a record whose current write is its delete, written here and not taken
-  from a recovery upload, goes once the cursor of every current app is at or past it,
-  but for a lagging app with a `missed` item it hasn't passed (its own, or one
-  `push_missed` scripted for every app); a key a divergent upload names stays. Its read is
-  then `404`, its delete shows as its stub and a create at it starts afresh. Unlike the
-  service, it forgets at each cursor move, not at the minute's sweep, and every such key at
-  once, not 256 a minute; the frozen account's exception has nothing to check (no freeze is
-  served here either).
+- **Forgotten deleted keys** (Switch spec 10.3, wire 9.1), as at the service: a record
+  whose current write is its delete, written here and not taken from a recovery upload,
+  goes once the cursor of every app the held `identity.json` lists, neither revoked nor
+  departed, is at or past it, lagging or not, an app with no cursor here holding every key;
+  a key a divergent upload names stays, and with no document held nothing goes. Its read
+  is then `404`, its delete shows as its stub and a create at it starts afresh; a
+  `record_version` condition of `{0, 0}` matches it, as it matches a held delete. Unlike
+  the service: it forgets only at a cursor move, so a revocation alone frees nothing until
+  the next one, not at the minute's sweep, and every such key at once, not 256 a minute;
+  its cursors are `seq`s with no generation; the frozen account's exception has nothing to
+  check (no freeze is served here either).
 - **Invite codes**: a revoked app's codes aren't withdrawn (Switch wire 7.4.3 "After a
   revocation"); a code planted for a faulty export never expires. Codes that expired or
   ran out go at the first request a minute of the switch's clock after the last sweep,

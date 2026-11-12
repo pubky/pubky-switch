@@ -715,3 +715,41 @@ pub async fn listen(
     }));
     (stop, task)
 }
+
+/// Log, in a table of the test database outside every account, each invite code the
+/// minute's sweep deletes (its statement, not an erasure's cascade or a recovery's clear),
+/// so a test can tell that a sweep ran.
+pub async fn log_swept_invite_codes(replay: &Replay) {
+    use sqlx::Connection;
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    for statement in [
+        "CREATE TABLE swept_codes (statement TEXT NOT NULL)",
+        "CREATE FUNCTION log_swept_code() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN \
+         IF current_query() LIKE '%code_hash IN%' THEN \
+         INSERT INTO swept_codes VALUES (current_query()); END IF; RETURN OLD; END $$",
+        "CREATE TRIGGER log_swept_code AFTER DELETE ON invite_codes \
+         FOR EACH ROW EXECUTE FUNCTION log_swept_code()",
+    ] {
+        sqlx::query(statement)
+            .execute(&mut conn)
+            .await
+            .expect("log");
+    }
+    conn.close().await.expect("close");
+}
+
+/// How many invite codes the minute's sweep deleted since [`log_swept_invite_codes`].
+pub async fn swept_invite_codes(replay: &Replay) -> i64 {
+    use sqlx::Connection;
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    let count = sqlx::query_scalar("SELECT count(*) FROM swept_codes")
+        .fetch_one(&mut conn)
+        .await
+        .expect("count");
+    conn.close().await.expect("close");
+    count
+}

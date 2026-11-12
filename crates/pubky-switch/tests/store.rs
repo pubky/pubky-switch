@@ -1724,3 +1724,57 @@ async fn test_store_sweeps_take_at_most_their_bound_and_the_rest_later() {
     conn.close().await.expect("close");
     fx.finish().await;
 }
+
+#[tokio::test]
+async fn test_store_forget_compares_whole_positions() {
+    // The lowest cursor waited for is a position, generation first: a delete of an earlier
+    // generation is before it whatever its seq, one later in the same generation isn't
+    // (Switch spec 10.3).
+    let Some(fx) = fixture().await else { return };
+    fx.account(ID_A).await;
+    let mut conn = PgConnection::connect_with(fx.db.options())
+        .await
+        .expect("conn");
+    for (key, generation, version) in [(1u8, 0i64, 100i64), (2, 1, 11)] {
+        sqlx::query(
+            "INSERT INTO shared_records (account_id, key, collection, read_scope, write_scopes, \
+             generation, version, deleted, value_bytes, writer, cert, op, proof) \
+             VALUES ($1, $2, $3, 'pay', '{pay}', $4, $5, true, 0, $6, '\\x', '\\x', '\\x')",
+        )
+        .bind(ID_A)
+        .bind([key; 32].as_slice())
+        .bind([9u8; 32].as_slice())
+        .bind(generation)
+        .bind(version)
+        .bind([5u8; 16].as_slice())
+        .execute(&mut conn)
+        .await
+        .expect("record");
+    }
+    let mut txn = fx
+        .store()
+        .begin(ID_A)
+        .await
+        .expect("begin")
+        .expect("account");
+    let through = pubky_switch_core::ops::Position {
+        generation: 1,
+        seq: 10,
+    };
+    assert_eq!(
+        txn.forget_deleted_keys(Some(through), 8)
+            .await
+            .expect("forget"),
+        1
+    );
+    txn.commit().await.expect("commit");
+    let left: Vec<Vec<u8>> =
+        sqlx::query_scalar("SELECT key FROM shared_records WHERE account_id = $1")
+            .bind(ID_A)
+            .fetch_all(&mut conn)
+            .await
+            .expect("left");
+    assert_eq!(left, vec![vec![2u8; 32]]);
+    conn.close().await.expect("close");
+    fx.finish().await;
+}

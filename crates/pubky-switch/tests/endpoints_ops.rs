@@ -2136,3 +2136,35 @@ async fn test_sweeps_cut_short_leave_the_state_as_it_was() {
     assert_eq!(proofs_kept(&replay, 55).await, Some(false));
     replay.db.drop_database().await.expect("drop");
 }
+
+#[tokio::test]
+async fn test_sweeps_mark_ahead_of_the_time_base_doesnt_pause_them() {
+    // A minute's mark ahead of the time base, as one left before the time base stepped
+    // back: the next request's sweep is due, so the sweeps don't wait for the clock to
+    // catch up (Switch wire 9.1).
+    let Some(replay) = registered(Limits::default(), false).await else {
+        return;
+    };
+    let ops = wallet_batch(70, 1, vec![contact(bob())]);
+    let (status, body) = post_app(&replay, "wallet", &ops, None, AT).await;
+    assert_eq!(status, 200, "{body}");
+    let late = after(30 * DAY_MS);
+    let ahead = i64::try_from(ms(&late) + DAY_MS).expect("ms");
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    sqlx::query("UPDATE accounts SET swept_at_ms = $2 WHERE id = $1")
+        .bind(alice_id())
+        .bind(ahead)
+        .execute(&mut conn)
+        .await
+        .expect("ahead");
+    conn.close().await.expect("close");
+    wallet_request_at(&replay, &late).await;
+    assert_eq!(proofs_kept(&replay, 70).await, Some(false));
+    assert_eq!(
+        swept_at(&replay).await,
+        Some(i64::try_from(ms(&late)).expect("ms"))
+    );
+    replay.db.drop_database().await.expect("drop");
+}
