@@ -1606,3 +1606,119 @@ async fn test_store_kept_proof_generations_leave_out_uploaded_records() {
     );
     drop(txn);
 }
+
+#[tokio::test]
+async fn test_store_sweeps_take_at_most_their_bound_and_the_rest_later() {
+    // Each sweep takes at most the bound it is given, the oldest first, and leaves the rest
+    // for a later run: a run stopped after any of them leaves only rows a later one takes
+    // (Switch wire 9.1).
+    let Some(fx) = fixture().await else { return };
+    fx.account(ID_A).await;
+    let mut conn = PgConnection::connect_with(fx.db.options())
+        .await
+        .expect("conn");
+    for i in 1u8..=3 {
+        sqlx::query(
+            "INSERT INTO shared_records (account_id, key, collection, read_scope, write_scopes, \
+             generation, version, deleted, value_bytes, writer, cert, op, proof) \
+             VALUES ($1, $2, $3, 'pay', '{pay}', 1, $4, true, 0, $5, '\\x', '\\x', '\\x')",
+        )
+        .bind(ID_A)
+        .bind([i; 32].as_slice())
+        .bind([9u8; 32].as_slice())
+        .bind(i64::from(10 - i))
+        .bind([5u8; 16].as_slice())
+        .execute(&mut conn)
+        .await
+        .expect("record");
+        sqlx::query(
+            "INSERT INTO batches (account_id, batch_id, ops_hash, proofs, at_ms, generation, \
+             first_seq, last_seq) VALUES ($1, $2, $3, '\\x5b5d', $4, 1, $5, $5)",
+        )
+        .bind(ID_A)
+        .bind([i; 16].as_slice())
+        .bind([i; 32].as_slice())
+        .bind(i64::try_from(T0).expect("t0") + i64::from(i))
+        .bind(i64::from(i))
+        .execute(&mut conn)
+        .await
+        .expect("batch");
+        sqlx::query(
+            "INSERT INTO invite_codes (account_id, code_hash, max_uses, uses, writer, \
+             expires_at_ms, context) VALUES ($1, $2, 1, 0, $3, $4, 'null')",
+        )
+        .bind(ID_A)
+        .bind([i; 32].as_slice())
+        .bind([5u8; 16].as_slice())
+        .bind(i64::try_from(T0).expect("t0") + i64::from(i))
+        .execute(&mut conn)
+        .await
+        .expect("invite");
+    }
+    let later = T0 + 1_000;
+    let mut txn = fx
+        .store()
+        .begin(ID_A)
+        .await
+        .expect("begin")
+        .expect("account");
+    // No current app: nothing waits.
+    assert_eq!(
+        txn.forget_deleted_keys(&[], &[], 2).await.expect("forget"),
+        2
+    );
+    assert_eq!(
+        txn.drop_expired_batch_proofs(later, 0, 2)
+            .await
+            .expect("proofs"),
+        2
+    );
+    assert_eq!(
+        txn.drop_spent_invite_codes(later, 2).await.expect("codes"),
+        2
+    );
+    txn.commit().await.expect("commit");
+    // The oldest went: the delete at the lowest version, the earliest batch and code.
+    let mut left: Vec<Vec<u8>> = sqlx::query_scalar(
+        "SELECT key FROM shared_records WHERE account_id = $1 \
+         UNION ALL SELECT batch_id FROM batches WHERE account_id = $1 AND proofs IS NOT NULL \
+         UNION ALL SELECT code_hash FROM invite_codes WHERE account_id = $1",
+    )
+    .bind(ID_A)
+    .fetch_all(&mut conn)
+    .await
+    .expect("left");
+    left.sort();
+    assert_eq!(
+        left,
+        vec![vec![1u8; 32], vec![3u8; 16], vec![3u8; 32]],
+        "the newest of each"
+    );
+    let mut txn = fx
+        .store()
+        .begin(ID_A)
+        .await
+        .expect("begin")
+        .expect("account");
+    assert_eq!(
+        txn.forget_deleted_keys(&[], &[], 2).await.expect("forget"),
+        1
+    );
+    assert_eq!(
+        txn.drop_expired_batch_proofs(later, 0, 2)
+            .await
+            .expect("proofs"),
+        1
+    );
+    assert_eq!(
+        txn.drop_spent_invite_codes(later, 2).await.expect("codes"),
+        1
+    );
+    assert_eq!(
+        txn.forget_deleted_keys(&[], &[], 2).await.expect("forget"),
+        0
+    );
+    txn.commit().await.expect("commit");
+    conn.close().await.expect("close");
+    fx.finish().await;
+}
