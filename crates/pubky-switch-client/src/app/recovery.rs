@@ -532,6 +532,8 @@ impl App {
         // then, the old service's being all the app knows.
         tx.delete(super::admission::LISTS_AT)?;
         tx.delete(super::admission::LISTS_TOO_LARGE)?;
+        // The lost service's divergent uploads aren't the new one's.
+        tx.delete_prefix(super::uploaded::DIVERGENT_PREFIX)?;
         // Entries stored locally stay as they are: their local IDs, not the `seq`s they
         // were read at, key them, so nothing of them is written again here.
         if self.state.pending_record.take().is_some() {

@@ -63,7 +63,7 @@ pub(crate) fn claim_key_of(claim_key: &[u8; 32]) -> String {
     format!("{CLAIM_PREFIX}{}", b64(claim_key))
 }
 
-fn reread_key(claim_key: &[u8; 32]) -> String {
+pub(super) fn reread_key(claim_key: &[u8; 32]) -> String {
     format!("{REREAD_PREFIX}{}", b64(claim_key))
 }
 

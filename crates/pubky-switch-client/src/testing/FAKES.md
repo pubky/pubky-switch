@@ -221,6 +221,8 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   account in neither stage. Unlike the service: `max_divergent_uploads` and
   `max_attempts_per_claim` are the wire's defaults, and `GET /claims` lists whatever entries
   the switch kept, with no check that a claim holds one at each step.
+  For tests of what an app does with an `upload` transition, `chain_upload` chains one
+  listing the changes as written, merging nothing: the test makes the merge itself, or none.
 - **`GET /apps`** (Switch wire 7.4.12), in `switch/signer.rs`: by the service's rules, member
   by member, but `last_seen` and `recovery` (below):
   - every app the switch holds, every App ID it keeps for good, and every app the newest

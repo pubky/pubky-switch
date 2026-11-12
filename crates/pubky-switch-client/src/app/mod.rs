@@ -51,6 +51,7 @@ mod renewal;
 mod rotation;
 mod state;
 mod unverified;
+mod uploaded;
 
 mod admission;
 mod batch;
@@ -89,6 +90,7 @@ pub use unverified::{
     MAX_UNVERIFIED_AGE_MS, MAX_UNVERIFIED_PER_SENDER, MAX_UNVERIFIED_TOTAL,
     UNVERIFIED_DROPS_PER_COMMIT,
 };
+pub use uploaded::RECORD_REREADS_PER_READ;
 
 pub use admission::{INVITE_CODE_BYTES, InviteCode, LISTS_TOO_LARGE_RETRY_MS, SenderDisposition};
 pub use batch::{MAX_KEPT_BATCHES_BYTES, OpBatch, server_time_in};

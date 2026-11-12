@@ -13,6 +13,7 @@ mod sender_document;
 mod shared_flows;
 mod store_failures;
 mod unverified;
+mod uploads;
 
 use std::sync::{Arc, Mutex};
 
