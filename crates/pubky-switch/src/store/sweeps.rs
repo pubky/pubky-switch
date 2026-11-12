@@ -29,43 +29,37 @@ impl AccountTxn {
         Ok(row.is_some())
     }
 
-    /// The cursors a forgotten key waits for (Switch spec 10.3): those of the apps of
-    /// `current`, but for an app `lagging` holds that has a `missed` item it hasn't passed,
-    /// since passing that item makes it list its collections again (Switch wire 7.4.4), so
-    /// it can't keep the forgotten record. `None` for an app with no cursor yet.
+    /// The cursors of `apps` that have a row here, by App ID: `None` for one with no cursor
+    /// yet. An app with no row has none either; the caller holds every key for it.
     pub async fn waited_cursors(
         &mut self,
-        current: &[[u8; 16]],
-        lagging: &[[u8; 16]],
-    ) -> Result<Vec<Option<Position>>, StoreError> {
+        apps: &[[u8; 16]],
+    ) -> Result<Vec<([u8; 16], Option<Position>)>, StoreError> {
         let id = self.head().id.clone();
         let rows = sqlx::query(
-            "SELECT a.cursor_generation, a.cursor_seq FROM apps a \
-             WHERE a.account_id = $1 AND a.app_id = ANY($2) \
-             AND NOT (a.app_id = ANY($3) AND EXISTS ( \
-                 SELECT 1 FROM inbox_entries m \
-                 WHERE m.account_id = a.account_id \
-                 AND m.kind = 'missed' AND m.targets[1] = a.app_id \
-                 AND (a.cursor_generation IS NULL \
-                      OR (m.generation, m.seq) > (a.cursor_generation, a.cursor_seq))))",
+            "SELECT app_id, cursor_generation, cursor_seq FROM apps \
+             WHERE account_id = $1 AND app_id = ANY($2)",
         )
         .bind(&id)
-        .bind(app_ids(current))
-        .bind(app_ids(lagging))
+        .bind(app_ids(apps))
         .fetch_all(self.conn())
         .await
         .map_err(StoreError::from_db)?;
         let mut cursors = Vec::with_capacity(rows.len());
         for row in &rows {
+            let app: Vec<u8> = row.try_get("app_id")?;
+            let app =
+                <[u8; 16]>::try_from(app.as_slice()).map_err(|_| StoreError::Corrupt("app_id"))?;
             let generation: Option<i64> = row.try_get("cursor_generation")?;
             let seq: Option<i64> = row.try_get("cursor_seq")?;
-            cursors.push(match (generation, seq) {
+            let cursor = match (generation, seq) {
                 (Some(generation), Some(seq)) => Some(Position {
                     generation: from_db(generation, "cursor_generation")?,
                     seq: from_db(seq, "cursor_seq")?,
                 }),
                 _ => None,
-            });
+            };
+            cursors.push((app, cursor));
         }
         Ok(cursors)
     }
@@ -73,8 +67,8 @@ impl AccountTxn {
     /// Forget at most `bound` deleted keys that nothing refers to (Switch spec 10.3, wire
     /// 9.1), the oldest deletes first: the record's current write is its delete, written at
     /// this service (one taken from a recovery upload has no chain item here to stand for
-    /// it), at or before `through`, the lowest cursor the key waits for
-    /// ([`Self::waited_cursors`]; `None` when it waits for none); and no divergent upload
+    /// it), at or before `through`, the lowest cursor the key waits for; and no divergent
+    /// upload
     /// names the key. The record's row goes, so its delete shows as its chain stub and a
     /// create at the key starts afresh. A range scan of `shared_records_deleted` up to
     /// `through`. The number forgotten.
@@ -110,12 +104,14 @@ impl AccountTxn {
 
     /// Whether the once-a-minute sweep is due at service time `now_ms` (Switch wire 9.1): a
     /// minute of service time since the last, or none yet. When it is, the time is noted
-    /// in this transaction, so the sweep runs once in the minute whatever the instance.
+    /// in this transaction, so the sweep runs once in the minute whatever the instance. A
+    /// mark ahead of `now_ms`, left by a time base that has since stepped back, is due too,
+    /// so the sweeps never wait for the clock to catch up with it.
     pub async fn minute_sweep_due(&mut self, now_ms: u64) -> Result<bool, StoreError> {
         let id = self.head().id.clone();
         let due = sqlx::query(
             "UPDATE accounts SET swept_at_ms = $2 WHERE id = $1 \
-             AND (swept_at_ms IS NULL OR swept_at_ms <= $2 - 60000)",
+             AND (swept_at_ms IS NULL OR swept_at_ms <= $2 - 60000 OR swept_at_ms > $2)",
         )
         .bind(&id)
         .bind(to_db(now_ms, "time")?)

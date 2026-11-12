@@ -125,29 +125,30 @@ impl Inner {
         let current = self.current_app_ids();
         self.convert_unreadable(&current);
         self.release_passed(&current, true);
-        self.forget_deleted_keys(&current);
+        self.forget_deleted_keys();
     }
 
-    /// Forget the deleted keys nothing refers to, `current` holding the App IDs current now
-    /// (Switch spec 10.3, wire 9.1), as the service does: the record's current write is
-    /// its delete, written here, not taken from a recovery upload; the cursor of every app
-    /// of `current` is at or past it, but for a lagging app with a `missed` item it hasn't
-    /// passed (its own, or one [`super::ScriptedSwitch::push_missed`] scripted for every app),
-    /// which lists its collections again as it passes the item; and no divergent
-    /// upload names the key. The record goes, so its delete shows as its stub, its reads are
-    /// `404`, and a create at the key starts afresh.
-    fn forget_deleted_keys(&mut self, current: &[[u8; 16]]) {
-        let to_list = |app: &[u8; 16]| {
-            self.marked_lagging(app)
-                && self.items.iter().any(|item| {
-                    matches!(item, Item::Missed { seq, app: of, .. }
-                        if of.is_none_or(|of| of == *app) && *seq > self.cursor_of(app))
-                })
+    /// Forget the deleted keys nothing refers to (Switch spec 10.3, wire 9.1), as the
+    /// service does: the record's current write is its delete, written here, not taken
+    /// from a recovery upload; the cursor of every app the held `identity.json` lists that
+    /// isn't revoked or departed is at or past it, lagging or not, an app with no cursor
+    /// here holding every key; and no divergent upload names the key. With no document held,
+    /// nothing goes. The record goes, so its delete shows as its stub, its reads are `404`,
+    /// and a create at the key starts afresh.
+    fn forget_deleted_keys(&mut self) {
+        let Some(doc) = self.doc.as_ref() else {
+            return;
         };
-        let waited: Vec<u64> = current
+        let waited: Vec<u64> = doc
+            .body()
+            .apps
             .iter()
-            .filter(|app| !to_list(app))
-            .map(|app| self.cursor_of(app))
+            .map(|listed| listed.app_id)
+            .filter(|app| {
+                !self.kept_app_ids.contains(app)
+                    && !self.apps.get(app).is_some_and(|held| held.departed)
+            })
+            .map(|app| self.cursor_of(&app))
             .collect();
         let shared = &mut self.shared;
         let divergent = &shared.divergent;

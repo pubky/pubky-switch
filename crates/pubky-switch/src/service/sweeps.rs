@@ -8,10 +8,10 @@
 //! Once a minute of service time (`AccountTxn::minute_sweep_due`), at most [`PER_MINUTE`]
 //! of each, the oldest first:
 //! - **Deleted keys** nothing refers to are forgotten (`AccountTxn::forget_deleted_keys`
-//!   gives the rule). A lagging app isn't waited for only while it has a `missed` item to
-//!   pass, on which it lists its collections again (7.4.4); a lagging app with none is
-//!   waited for, as a returning app that doesn't list could keep a record forgotten past
-//!   its cursor. A new app lists at join.
+//!   gives the rule): once the cursor of every app the held `identity.json` lists, not
+//!   revoked or departed, is past the delete. A lagging app is waited for like any other:
+//!   a listing doesn't show a key the service forgot, so an app that missed the delete
+//!   would keep the record.
 //! - **Invite codes** that expired or ran out.
 //! - **Transition proofs** of batches past `batch_proofs_ms`. A batch's ID and operation
 //!   hash stay, so a retry is answered `409 conflict` (6.4 step 5). The whole batch record
@@ -51,7 +51,7 @@ impl Service {
         // frozen, since an export carries it"). Freezes aren't served, so there is nothing
         // to check; the check comes with the cooperative move.
         if txn.deleted_key_held().await? {
-            self.forget_deleted_keys(txn, base).await?;
+            self.forget_deleted_keys(txn).await?;
         }
         txn.drop_spent_invite_codes(base, PER_MINUTE).await?;
         txn.drop_expired_batch_proofs(base, self.limits.batch_proofs_ms, PER_MINUTE)
@@ -59,42 +59,39 @@ impl Service {
         Ok(())
     }
 
-    /// Forget the deleted keys nothing refers to, up to the lowest cursor they wait for:
-    /// none while an app they wait for has no cursor yet.
-    async fn forget_deleted_keys(&self, txn: &mut AccountTxn, base: u64) -> Result<(), StoreError> {
-        // The current apps by the held identity.json.
+    /// Forget the deleted keys nothing refers to, up to the lowest cursor they wait for
+    /// (Switch spec 10.3): the cursor of every app the held `identity.json` lists that isn't
+    /// revoked or departed, whether it is current, lagging or yet to register here. An
+    /// app listed with no row here or no cursor yet holds every key, since it may still
+    /// read the delete or, after a provider loss, upload its copy of the record, which a key
+    /// forgotten here would let back in (spec 12.6). With no `identity.json` held, nothing
+    /// goes. Forgetting is the service's choice, not a promise: an app that stops reading
+    /// only delays it, and removing that app, the signer's own path, frees the keys.
+    async fn forget_deleted_keys(&self, txn: &mut AccountTxn) -> Result<(), StoreError> {
         let identity_key = txn.head().identity_key;
-        let held = match txn.held_identity().await? {
-            Some(held) => Some(
-                IdentityDoc::verify(&held.doc, &identity_key)
-                    .map_err(|_| StoreError::Corrupt("the held identity.json"))?,
-            ),
-            None => None,
+        let Some(held) = txn.held_identity().await? else {
+            return Ok(());
         };
-        let current = super::batch::load_apps(txn, held.as_ref(), base)
-            .await?
-            .current_app_ids();
-        let lagging: Vec<[u8; 16]> = txn
-            .lagging_apps()
-            .await?
-            .into_iter()
-            .filter(|app| current.contains(app))
+        let held = IdentityDoc::verify(&held.doc, &identity_key)
+            .map_err(|_| StoreError::Corrupt("the held identity.json"))?;
+        let kept = txn.kept_app_ids().await?;
+        let listed: Vec<[u8; 16]> = held
+            .body()
+            .apps
+            .iter()
+            .map(|listed| listed.app_id)
+            .filter(|app| !kept.contains(app))
             .collect();
-        let cursors = txn.waited_cursors(&current, &lagging).await?;
-        let mut through = None;
-        for cursor in cursors {
-            let Some(cursor) = cursor else {
+        let cursors = txn.waited_cursors(&listed).await?;
+        let mut through: Option<pubky_switch_core::ops::Position> = None;
+        for app in &listed {
+            let Some((_, Some(cursor))) = cursors.iter().find(|(id, _)| id == app) else {
                 return Ok(());
             };
-            through = Some(
-                through.map_or(cursor, |low: pubky_switch_core::ops::Position| {
-                    if (cursor.generation, cursor.seq) < (low.generation, low.seq) {
-                        cursor
-                    } else {
-                        low
-                    }
-                }),
-            );
+            through = Some(match through {
+                Some(low) if (low.generation, low.seq) <= (cursor.generation, cursor.seq) => low,
+                _ => *cursor,
+            });
         }
         txn.forget_deleted_keys(through, PER_MINUTE).await?;
         Ok(())

@@ -897,6 +897,34 @@ fn next_minute(replay: &Replay) {
     set_time(&replay.clock, &pubky_switch_core::time::rfc3339(at));
 }
 
+/// alice's executor, which her `identity.json` lists beside the wallet and the phone,
+/// registers its app record.
+async fn register_executor(replay: &Replay) {
+    let keys = vectors("keys.json");
+    let executor = app(&keys, "executor");
+    let record = document("executor app record");
+    let ops = sign_batch(
+        &ed25519_dalek::SigningKey::from_bytes(&hex32(&executor["signing_secret_hex"])),
+        &alice_key().public(),
+        Some(
+            pubky_switch_core::enc::app_id_decode(executor["app_id"].as_str().expect("id"))
+                .expect("app id"),
+        ),
+        1,
+        [76; 16],
+        vec![(Vec::new(), OpKind::AppPut { record })],
+    )
+    .expect("batch");
+    post(replay, "executor", &ops, AT).await;
+}
+
+/// Every app alice's `identity.json` lists moves its cursor to `seq`.
+async fn all_past(replay: &Replay, seq: u64) {
+    for name in ["wallet", "phone", "executor"] {
+        move_cursor(replay, name, seq, AT).await;
+    }
+}
+
 /// A record the wallet creates at `natural`, then deletes: its key and the delete's `seq`.
 async fn created_and_deleted(replay: &Replay, id: u8, natural: &[u8]) -> ([u8; 32], u64) {
     let (key, ..) = create(replay, id, natural, "pay").await;
@@ -949,8 +977,8 @@ async fn execute(replay: &Replay, sql: &str, key: &[u8; 32]) {
 
 #[tokio::test]
 async fn test_records_deleted_key_every_reader_passed_is_forgotten() {
-    // Once the cursor of every current app is past the delete, the minute's sweep at a
-    // request forgets the key: its view is `404`, and a create at it starts again, at a newer
+    // Once the cursor of every app the held `identity.json` lists is past the delete, the
+    // minute's sweep at a later request forgets the key: its view is `404`, and a create at it starts again, at a newer
     // version (Switch spec 10.3, wire 9.1).
     let Some(replay) = registered(Limits::default()).await else {
         return;
@@ -959,6 +987,17 @@ async fn test_records_deleted_key_every_reader_passed_is_forgotten() {
     let (key, deleted_at) = created_and_deleted(&replay, 1, b"gone").await;
     move_cursor(&replay, "wallet", deleted_at, AT).await;
     move_cursor(&replay, "phone", deleted_at, AT).await;
+    // The executor, listed but not registered here yet, holds the key: it may still read
+    // the delete or, after a provider loss, upload its copy of the record.
+    next_minute(&replay);
+    let answer = get_as(&replay, "phone", &format!("records/{}", b64(&key))).await;
+    assert_eq!(
+        body(&answer)["deleted"],
+        true,
+        "the executor hasn't read it"
+    );
+    register_executor(&replay).await;
+    move_cursor(&replay, "executor", deleted_at, AT).await;
     assert_eq!(
         record_rows(&replay, &key).await,
         1,
@@ -1020,66 +1059,28 @@ async fn sql_app(replay: &Replay, sql: &str, name: &str) {
 
 #[tokio::test]
 async fn test_records_deleted_key_waits_for_a_reader_short_of_it() {
-    // A current app whose cursor is short of the delete holds the key, sweep after sweep.
-    // Marked lagging, it still does while it has no `missed` item to pass, or only one it
-    // has passed: it wouldn't list again on its return, so it would keep the record.
+    // An app whose cursor is short of the delete holds the key, sweep after sweep, lagging
+    // or not, with a `missed` item to pass or not: a listing doesn't show a key the service
+    // forgot, so an app that missed the delete would keep the record (Switch spec 10.3).
+    // Once it reads past the delete, the key goes.
     let Some(replay) = registered(Limits::default()).await else {
         return;
     };
+    register_executor(&replay).await;
     let (key, deleted_at) = created_and_deleted(&replay, 1, b"gone").await;
     move_cursor(&replay, "wallet", deleted_at, AT).await;
+    move_cursor(&replay, "executor", deleted_at, AT).await;
     move_cursor(&replay, "phone", deleted_at - 1, AT).await;
     next_minute(&replay);
     let answer = get_as(&replay, "wallet", &format!("records/{}", b64(&key))).await;
     assert_eq!(body(&answer)["deleted"], true, "the phone hasn't passed it");
+    // Marked lagging, with a `missed` item ahead of its cursor: still waited for.
     sql_app(
         &replay,
         "UPDATE apps SET lagging = true WHERE account_id = $1 AND app_id = $2",
         "phone",
     )
     .await;
-    next_minute(&replay);
-    let answer = get_as(&replay, "wallet", &format!("records/{}", b64(&key))).await;
-    assert_eq!(body(&answer)["deleted"], true, "no missed item to list on");
-    // One it has already passed doesn't count either.
-    sql_app(
-        &replay,
-        &format!(
-            "INSERT INTO inbox_entries (account_id, generation, seq, kind, accepted_at_ms, \
-             envelope, targets, quota_bytes, missed_entries, missed_from_ms, missed_until_ms) \
-             VALUES ($1, 1, {passed}, 'missed', {at}, '\\x', ARRAY[$2::BYTEA], 0, 1, {at}, {at})",
-            passed = deleted_at - 1,
-            at = ms(AT)
-        ),
-        "phone",
-    )
-    .await;
-    next_minute(&replay);
-    let answer = get_as(&replay, "wallet", &format!("records/{}", b64(&key))).await;
-    assert_eq!(body(&answer)["deleted"], true, "a missed item it passed");
-    assert_eq!(record_rows(&replay, &key).await, 1);
-    replay.db.drop_database().await.expect("drop");
-}
-
-#[tokio::test]
-async fn test_records_deleted_key_a_lagging_app_lists_again_on_its_return() {
-    // A lagging app with a `missed` item ahead isn't waited for: the key goes. On its
-    // return its feed shows the delete as its stub, then the item, on which it lists its
-    // collections again (7.4.4), and the listing doesn't have the key. Its mark ends, so
-    // the next delete waits for it.
-    let Some(replay) = registered(Limits::default()).await else {
-        return;
-    };
-    let before = last_seq(&replay).await;
-    let (key, deleted_at) = created_and_deleted(&replay, 1, b"gone").await;
-    move_cursor(&replay, "wallet", deleted_at, AT).await;
-    sql_app(
-        &replay,
-        "UPDATE apps SET lagging = true WHERE account_id = $1 AND app_id = $2",
-        "phone",
-    )
-    .await;
-    // The item at the next `seq`, as the service records one (`record_missed`).
     let missed_at = deleted_at + 1;
     sql_account(
         &replay,
@@ -1099,26 +1100,52 @@ async fn test_records_deleted_key_a_lagging_app_lists_again_on_its_return() {
     .await;
     next_minute(&replay);
     let answer = get_as(&replay, "wallet", &format!("records/{}", b64(&key))).await;
-    assert_eq!(code_of(&answer), (404, json!("not_found")));
-    let feed = body(&get_as(&replay, "phone", &format!("feed?after=1:{before}")).await);
-    let items = feed["items"].as_array().expect("items");
-    let delete = items
-        .iter()
-        .find(|item| item["seq"] == deleted_at)
-        .expect("the delete");
-    assert_eq!(delete["type"], "stub", "{feed}");
-    let missed = items
-        .iter()
-        .find(|item| item["type"] == "missed")
-        .expect("the missed item");
-    assert_eq!(missed["seq"], missed_at);
-    let listing = body(&get_as(&replay, "phone", &list_path(&payments(), "")).await);
-    assert!(!keys_of(&listing).contains(&b64(&key)), "{listing}");
-    let (other, other_deleted_at) = created_and_deleted(&replay, 5, b"next").await;
-    move_cursor(&replay, "wallet", other_deleted_at, AT).await;
+    assert_eq!(
+        body(&answer)["deleted"],
+        true,
+        "a lagging app is waited for"
+    );
+    assert_eq!(record_rows(&replay, &key).await, 1);
+    // The phone reads past it: the next minute's sweep forgets it.
+    move_cursor(&replay, "phone", missed_at, AT).await;
     next_minute(&replay);
-    let answer = get_as(&replay, "wallet", &format!("records/{}", b64(&other))).await;
-    assert_eq!(body(&answer)["deleted"], true, "waited for again");
+    let answer = get_as(&replay, "wallet", &format!("records/{}", b64(&key))).await;
+    assert_eq!(code_of(&answer), (404, json!("not_found")));
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_records_deleted_key_doesnt_wait_for_a_revoked_app() {
+    // A revoked app, kept for good, no longer reads or uploads: the keys it hadn't passed
+    // go once every other listed app has (Switch spec 10.3). Removing the app is what frees
+    // a key a silent app holds.
+    let Some(replay) = registered(Limits::default()).await else {
+        return;
+    };
+    register_executor(&replay).await;
+    let (key, deleted_at) = created_and_deleted(&replay, 1, b"gone").await;
+    move_cursor(&replay, "wallet", deleted_at, AT).await;
+    move_cursor(&replay, "phone", deleted_at, AT).await;
+    next_minute(&replay);
+    let answer = get_as(&replay, "wallet", &format!("records/{}", b64(&key))).await;
+    assert_eq!(
+        body(&answer)["deleted"],
+        true,
+        "the executor hasn't passed it"
+    );
+    sql_app(
+        &replay,
+        &format!(
+            "INSERT INTO kept_app_ids (account_id, app_id, reason, at_ms, data_epoch) \
+             VALUES ($1, $2, 'revoked', {at}, 1)",
+            at = ms(AT)
+        ),
+        "executor",
+    )
+    .await;
+    next_minute(&replay);
+    let answer = get_as(&replay, "wallet", &format!("records/{}", b64(&key))).await;
+    assert_eq!(code_of(&answer), (404, json!("not_found")));
     replay.db.drop_database().await.expect("drop");
 }
 
@@ -1128,9 +1155,9 @@ async fn test_records_deleted_key_a_divergent_upload_names_is_kept() {
     let Some(replay) = registered(Limits::default()).await else {
         return;
     };
+    register_executor(&replay).await;
     let (key, deleted_at) = created_and_deleted(&replay, 1, b"gone").await;
-    move_cursor(&replay, "wallet", deleted_at, AT).await;
-    move_cursor(&replay, "phone", deleted_at, AT).await;
+    all_past(&replay, deleted_at).await;
     execute(
         &replay,
         "INSERT INTO divergent_uploads (account_id, key, position, op, op_hash) \
@@ -1161,8 +1188,8 @@ async fn test_records_deleted_key_taken_from_an_upload_is_kept() {
     as_uploaded(&replay, &key, uploaded_at, false).await;
     // A delete written here beside it, which the same sweep forgets.
     let (here, deleted_at) = created_and_deleted(&replay, 3, b"here").await;
-    move_cursor(&replay, "wallet", deleted_at, AT).await;
-    move_cursor(&replay, "phone", deleted_at, AT).await;
+    register_executor(&replay).await;
+    all_past(&replay, deleted_at).await;
     next_minute(&replay);
     let answer = get_as(&replay, "wallet", &format!("records/{}", b64(&key))).await;
     assert_eq!(
