@@ -147,7 +147,10 @@ pub(super) struct PreparedUpload {
 }
 
 /// The `(account, app)` whose upload's items are being judged before the lock: one at a time
-/// for each, removed when the judgment ends.
+/// for each, removed when the judgment ends. A request cancelled meanwhile, its client gone,
+/// drops the guard while its `spawn_blocking` judgment runs on to its end, so a client that
+/// disconnects can have more than one judgment of an app running at once; each still took a
+/// slot of `uploads_per_app_per_hour`, which bounds them.
 struct Judging<'a> {
     set: &'a parking_lot::Mutex<std::collections::HashSet<(String, [u8; 16])>>,
     key: (String, [u8; 16]),

@@ -2115,6 +2115,7 @@ async fn test_upload_lists_need_the_callers_permission() {
     let executor = executor_registers(&replay, at).await;
     let length = chain(&replay).await.len();
     let bob = pubky_switch_core::enc::pubky_id(&[40; 32]);
+    let before = replay.service.upload_judgments();
     for lists in [json!({ "contacts": [] }), json!({ "deny": [bob] })] {
         let refused = upload_as(&replay, &executor, &json!({ "lists": lists }), at).await;
         assert_eq!(
@@ -2123,6 +2124,8 @@ async fn test_upload_lists_need_the_callers_permission() {
             "{lists}"
         );
     }
+    // Refused for its lists, an upload's items are judged nowhere.
+    assert_eq!(replay.service.upload_judgments(), before);
     assert_eq!(chain(&replay).await.len(), length);
     assert_eq!(admission_staged(&replay, at).await, json!(true));
     // Without lists it uploads as any own app.
