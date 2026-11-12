@@ -390,6 +390,15 @@ pub(crate) struct SignerState {
     /// (Switch wire 3.7, 7.4.2).
     #[serde(default)]
     pub(crate) recovery_services: Vec<Service>,
+    /// A recovery declared in place, at the service that served the lost generation: that
+    /// service, under the key it served the lost generation with. Until it takes the
+    /// recovery's version it signs every answer with that key, but the `200` of the delivery
+    /// that starts the new generation, which the pending key the version names signs (Switch
+    /// wire 3.13, 7.4.1, 7.4.2). So the signer pins this key while the recovery goes there,
+    /// and the delivery's `200` alone is checked with the pending key. Dropped with the
+    /// recovery's other records once its version is delivered.
+    #[serde(default)]
+    pub(crate) recovery_serving: Option<Service>,
     /// The recovery's version that a service took names another install: a restore's, from
     /// a backup written mid-recovery. This install signs the next version naming itself, as
     /// a restore does (Switch wire 3.13).
@@ -605,6 +614,7 @@ impl SignerState {
             ever_published: false,
             recovery_origin: None,
             recovery_services: Vec::new(),
+            recovery_serving: None,
             owes_own_version: false,
             admission_owed: false,
         }

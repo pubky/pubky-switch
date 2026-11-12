@@ -431,6 +431,21 @@ impl Signer {
         if !state.recovery_services.contains(&service) {
             state.recovery_services.push(service.clone());
         }
+        // In place, the service still serves the lost generation under the key the version
+        // the recovery builds on names there (Switch wire 7.4.2): kept from an earlier
+        // declaration or a restore at that origin, else taken from that signed version.
+        state.recovery_serving = self
+            .state
+            .recovery_serving
+            .clone()
+            .filter(|serving| serving.origin == origin)
+            .or_else(|| {
+                (base.inbox().url == origin && base.generation() == lost).then(|| Service {
+                    origin: origin.to_owned(),
+                    service_key: base.inbox().service_key,
+                    limits: answer.limits,
+                })
+            });
         state.service = Some(service);
         state.signed_through = state.signed_through.max(doc.version());
         let flow = Flow::Deliver {
@@ -557,6 +572,7 @@ impl Signer {
         state.homeserver_copy_waived = false;
         state.recovery_origin = None;
         state.recovery_services.clear();
+        state.recovery_serving = None;
         state.owes_own_version = doc.body().signer != state.install;
         state.revoke_at_service = state
             .revoking

@@ -319,6 +319,12 @@ impl Signer {
             if self.state.erased {
                 return Ok(());
             }
+            // A recovery whose version no service took waits to be declared again: that
+            // version isn't published, and nothing else is owed before one is delivered
+            // (Switch spec 12.6 step 1).
+            if self.state.recovering {
+                return Ok(());
+            }
             // A restore's recovery taken after the restore: the version naming this install
             // comes next, as the restore would have signed it (Switch wire 3.13), after the
             // copies a restore checks first. The switch's is the version just delivered. The
@@ -939,11 +945,21 @@ impl Signer {
         RequestClient::new(&self.env, &self.service_target(&service), &self.keyring)
     }
 
-    /// Where the clients of the enrolled switch go.
+    /// Where the clients of the enrolled switch go. While a recovery declared in place goes
+    /// to the service that served the lost generation, its answers are checked with the key
+    /// it served that generation with, but the `200` of the delivery that starts the new
+    /// generation, which the client checks with the pending key the version names (Switch
+    /// wire 3.13, 7.4.2): no answer under a third key is taken, and none under the earlier
+    /// key as the new generation's.
     fn service_target<'a>(&self, service: &'a Service) -> Target<'a> {
+        let serving = self
+            .state
+            .recovery_serving
+            .as_ref()
+            .filter(|serving| serving.origin == service.origin);
         Target {
             origin: &service.origin,
-            pinned: Some(service.service_key),
+            pinned: Some(serving.map_or(service.service_key, |s| s.service_key)),
             identity: self.state.identity,
         }
     }

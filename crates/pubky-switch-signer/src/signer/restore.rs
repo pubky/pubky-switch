@@ -6,8 +6,13 @@
 //! - the switch's copy of `identity.json` is the backup's version, or the version it builds on
 //!   (`prev`), as when the signer stopped between writing the backup and delivering: that
 //!   version is then delivered first. A switch with no copy counts only under a backup of the
-//!   account's first version. Any other copy makes the backup stale, and the restore is
-//!   refused;
+//!   account's first version, or of a recovery's version. A recovery declared in place, at
+//!   the service that served the lost generation, names the pending key, while that service
+//!   answers under the key it served with until it takes the version: an answer the pending
+//!   key didn't sign is read again under the key the Homeserver's copy of the lost generation
+//!   names, at that origin and below the backup's version, and under no other key. There its
+//!   copy of the lost generation, or a signed `503 unavailable`, counts as no copy. Any other
+//!   copy makes the backup stale, and the restore is refused;
 //! - the Homeserver's copy is neither newer than the backup's version nor another document at
 //!   it.
 //!
@@ -138,6 +143,7 @@ impl Signer {
             pinned: Some(service.service_key),
             identity,
         };
+        let mut serving = None;
         let answer = match RequestClient::new(&self.env, &target, &self.keyring)?
             .apps()
             .await
@@ -153,13 +159,19 @@ impl Signer {
                     ..
                 }
                 | ClientError::Transport(_),
-            ) if is_recovery(&view) => AppsAnswer {
-                apps: Vec::new(),
-                recovery: None,
-                proof_generations: Vec::new(),
-                identity: None,
-                server_time: 0,
-            },
+            ) if is_recovery(&view) => no_copy(),
+            // A recovery declared at the service that served the lost generation names the
+            // pending key its enrollment answered, and that service answers under the key it
+            // served with until it takes the version (Switch wire 3.13, 7.4.1, 7.4.2).
+            Err(error @ ClientError::BadServiceSignature { .. }) if is_recovery(&view) => {
+                match self.serving_key_in_place(&view).await? {
+                    Some(key) => {
+                        serving = Some(key);
+                        self.apps_under_serving_key(&view, key).await?
+                    }
+                    None => return Err(error.into()),
+                }
+            }
             Err(error) => return Err(error.into()),
         };
         let first = self
@@ -230,6 +242,15 @@ impl Signer {
             {
                 state.recovery_services.push(service);
             }
+            // In place, the service answers under the key it served the lost generation with
+            // until it takes the version: that key is pinned for it meanwhile (Switch wire
+            // 3.13, 7.4.2).
+            state.recovery_serving = serving.and_then(|key| {
+                state.service.clone().map(|service| Service {
+                    service_key: key,
+                    ..service
+                })
+            });
         }
         state.newest = Some(Newest {
             doc: doc.signed().clone(),
@@ -397,6 +418,77 @@ impl Signer {
         }
         state.tombstones = tombstones;
         state
+    }
+
+    /// The key the service a backup's recovery went to served the lost generation with,
+    /// when that recovery is in place, at the service that served it (Switch wire 3.13): the
+    /// key a copy of `identity.json` names that the identity key signed at the lost
+    /// generation, at the origin the backup's version names and below its version: the
+    /// Homeserver's copy. Any other key is never taken.
+    async fn serving_key_in_place(&self, view: &BackupView) -> Result<Option<[u8; 32]>> {
+        let identity = self.state.identity;
+        let doc = &view.identity_doc;
+        let Some(lost) = doc.body().recovery_from else {
+            return Ok(None);
+        };
+        let serving = self
+            .env
+            .homeserver
+            .get(IDENTITY_PATH)
+            .await
+            .map_err(SignerError::Homeserver)?
+            .and_then(|bytes| serde_json::from_slice::<SignedDoc>(&bytes).ok())
+            .and_then(|signed| IdentityDoc::verify(&signed, &identity).ok())
+            .filter(|copy| {
+                copy.generation() == lost
+                    && copy.version() < doc.version()
+                    && copy.inbox().url == doc.inbox().url
+            })
+            .map(|copy| copy.inbox().service_key);
+        Ok(serving)
+    }
+
+    /// `GET /apps` read again under `serving`, the key the recovery's service served the
+    /// lost generation with (Switch wire 3.13): its copy of the lost generation, below the
+    /// backup's version, and a signed `503 unavailable`, as a lost service answers, show no
+    /// copy, and the restore is that recovery in progress again. Another copy is judged as
+    /// every switch's copy is, and refuses the restore.
+    async fn apps_under_serving_key(
+        &self,
+        view: &BackupView,
+        serving: [u8; 32],
+    ) -> Result<AppsAnswer> {
+        let identity = self.state.identity;
+        let doc = &view.identity_doc;
+        let origin = doc.inbox().url.clone();
+        let target = Target {
+            origin: &origin,
+            pinned: Some(serving),
+            identity,
+        };
+        let mut answer = match RequestClient::new(&self.env, &target, &self.keyring)?
+            .apps()
+            .await
+        {
+            Ok(answer) => answer,
+            Err(ClientError::Switch {
+                code: ErrorCode::Unavailable,
+                ..
+            }) => return Ok(no_copy()),
+            Err(error) => return Err(error.into()),
+        };
+        let lost_copy = answer
+            .identity
+            .as_ref()
+            .and_then(|signed| IdentityDoc::verify(signed, &identity).ok())
+            .is_some_and(|copy| {
+                Some(copy.generation()) == doc.body().recovery_from
+                    && copy.version() < doc.version()
+            });
+        if lost_copy {
+            answer.identity = None;
+        }
+        Ok(answer)
     }
 
     /// The checks a restore passes before it takes the backup's records (Switch wire 3.13
@@ -575,6 +667,18 @@ const DELETION_CHECKS_PER_RUN: usize = 32;
 /// Whether the backup `view` holds the version that starts a recovery: `recovery_from` the
 /// generation before its own, built on none, since later versions of that generation keep
 /// `recovery_from` (Switch spec 12.6 step 1, wire 3.13).
+/// A `GET /apps` answer that shows no copy, nothing revoked and no epoch: a recovery's
+/// service before it takes the version (Switch wire 3.13).
+fn no_copy() -> AppsAnswer {
+    AppsAnswer {
+        apps: Vec::new(),
+        recovery: None,
+        proof_generations: Vec::new(),
+        identity: None,
+        server_time: 0,
+    }
+}
+
 fn is_recovery(view: &BackupView) -> bool {
     let doc = &view.identity_doc;
     view.prev.is_none() && is_recovery_doc(doc)
