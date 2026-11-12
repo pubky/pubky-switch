@@ -1261,6 +1261,32 @@ async fn test_own_record_crash_before_the_leave_is_kept_deletes_nothing() {
     assert!(w.switch.app(&id).departed);
 }
 
+/// Switch spec 4.2: the kept record goes to the switch at the start of a read, before the
+/// feed, so a read whose feed fails still delivers it.
+#[tokio::test]
+async fn test_own_record_kept_record_goes_before_the_feed() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let id = app.app_id();
+    w.clock.advance_ms(1_000);
+    w.switch.fail_next(Fault::Unreachable {
+        path: "/ops".into(),
+        after: 0,
+    });
+    app.set_protocol_member(PROTO, member(json!({ "a": 1 })), None)
+        .await
+        .unwrap_err();
+    let kept = app.record().clone();
+    assert_ne!(w.held(id).as_ref(), Some(&kept));
+    w.switch.fail_next(Fault::Unreachable {
+        path: "/feed".into(),
+        after: 0,
+    });
+    app.receive(None).await.unwrap_err();
+    assert_eq!(w.held(id).as_ref(), Some(&kept));
+    assert!(app.state.pending_record.is_none());
+}
+
 /// Switch spec 4.2: a read publishes a record it delivers before its feed right away, the
 /// switch's acceptance showing the app current, also when the read then fails.
 #[tokio::test]
@@ -1334,6 +1360,32 @@ async fn test_own_record_conflict_on_a_resend_a_later_record_superseded_is_dropp
     assert_eq!(w.held(id).as_ref(), Some(later.signed()));
     assert_eq!(w.published(id), Some(bytes_of(later.signed())));
     app.receive(None).await.unwrap();
+}
+
+/// Switch spec 4.2: a read publishes only once its feed shows the app current, so an app
+/// revoked while offline, whose record the signer's clean-up deleted, writes nothing back.
+#[tokio::test]
+async fn test_own_record_revoked_app_writes_no_copy_back() {
+    use pubky_switch_core::records::RemovedApp;
+    let w = World::new();
+    let mut app = w.join_publishing("wallet").await;
+    let id = app.app_id();
+    app.receive(None).await.unwrap();
+    w.switch.revoke(id).unwrap();
+    w.next_doc(|body| {
+        body.apps.retain(|a| a.app_id != id);
+        body.removed.push(RemovedApp {
+            app_id: id,
+            distrust_from: START,
+        });
+    });
+    w.homeserver.remove(w.alice.public(), &app_record_path(&id));
+    w.clock.advance_ms(PUBLISHED_CHECK_MS);
+    let outcome = app.receive(None).await;
+    assert!(
+        w.published(id).is_none(),
+        "a revoked app wrote its record back: {outcome:?}"
+    );
 }
 
 /// Switch spec 12.3: a delete that fails holds back no immediate leave, also one asked for
