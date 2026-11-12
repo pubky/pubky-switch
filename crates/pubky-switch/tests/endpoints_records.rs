@@ -1146,3 +1146,26 @@ async fn test_records_deleted_key_a_divergent_upload_names_is_kept() {
     assert_eq!(record_rows(&replay, &key).await, 1);
     replay.db.drop_database().await.expect("drop");
 }
+
+#[tokio::test]
+async fn test_records_deleted_key_taken_from_an_upload_is_kept() {
+    // A delete taken from a recovery upload has no chain item here to stand for it: its
+    // key stays, every reader past it or not (Switch spec 10.3, wire 7.4.14).
+    let Some(replay) = registered(Limits::default()).await else {
+        return;
+    };
+    let (key, deleted_at) = created_and_deleted(&replay, 1, b"gone").await;
+    as_uploaded(&replay, &key, deleted_at, false).await;
+    move_cursor(&replay, "wallet", deleted_at, AT).await;
+    move_cursor(&replay, "phone", deleted_at, AT).await;
+    next_minute(&replay);
+    let answer = get_as(&replay, "wallet", &format!("records/{}", b64(&key))).await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    assert_eq!(record_rows(&replay, &key).await, 1);
+    replay.db.drop_database().await.expect("drop");
+}
