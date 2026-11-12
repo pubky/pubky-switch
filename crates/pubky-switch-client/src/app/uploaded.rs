@@ -90,14 +90,15 @@ impl App {
     /// record it may not read is unmarked when the switch refuses its read. Records past
     /// [`MAX_RECORD_MARKS`], counting those marked before, drop the record marks and owe a
     /// listing instead, but for records the app holds outside the protocol's collections.
-    pub(crate) async fn mark_uploaded<'a>(
+    pub(crate) async fn mark_uploaded(
         &self,
-        records: impl IntoIterator<Item = &'a [u8; 32]>,
-        claims: impl IntoIterator<Item = &'a [u8; 32]>,
+        mut records: Vec<[u8; 32]>,
+        mut claims: Vec<[u8; 32]>,
         tx: &mut Tx,
     ) -> Result<(), AppError> {
         let at = self.now();
-        let records: Vec<&[u8; 32]> = records.into_iter().take(MAX_MARKED_KEYS).collect();
+        records.truncate(MAX_MARKED_KEYS);
+        claims.truncate(MAX_MARKED_KEYS);
         if !records.is_empty() {
             // The marks held, at most: those committed, unless `tx` dropped them (a key no
             // mark has shows the drop), and those `tx` puts.
@@ -111,7 +112,7 @@ impl App {
             if marked.saturating_add(records.len()) > MAX_RECORD_MARKS {
                 // The listing reads only the protocol's collections: the marks of records
                 // the app holds outside them stay, bounded by the records it holds.
-                let mut keys: Vec<[u8; 32]> = records.iter().map(|key| **key).collect();
+                let mut keys: Vec<[u8; 32]> = records.clone();
                 let committed = if dropped {
                     Vec::new()
                 } else {
@@ -140,13 +141,13 @@ impl App {
                     }
                 }
             } else {
-                for key in records {
+                for key in &records {
                     tx.put(&record_reread_key(key), &at)?;
                 }
             }
         }
         if self.state.cert.has_permission(Permission::ClaimsRead) {
-            for claim_key in claims.into_iter().take(MAX_MARKED_KEYS) {
+            for claim_key in &claims {
                 let held = claim_key_of(claim_key);
                 let holds = match tx.pending_state(&held) {
                     Some(held) => held,
