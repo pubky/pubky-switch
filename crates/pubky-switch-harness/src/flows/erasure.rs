@@ -377,10 +377,13 @@ pub async fn erasure_enrolled_again(world: &World) -> FlowResult {
     );
     // The new account's own key signs: the one its enrollment answer named, never the
     // erased account's nor the operator's.
-    let key_of = |label: &str| world.last_answer(label).map(|[_, _, key]| key);
+    // An answer the trace names no key for counts as none.
+    let named =
+        |answer: Option<[String; 3]>| answer.map(|[_, _, key]| key).filter(|key| !key.is_empty());
+    let key_of = |label: &str| named(world.last_answer(label));
     let enrolled_under = key_of("{alice} POST /v1/enroll");
     let delivered_under = key_of("{alice} PUT /v1/{alice}/identity");
-    let erased_key = first_key.map(|[_, _, key]| key);
+    let erased_key = named(first_key);
     if doc.generation() != before.generation() + 1
         || doc.body().recovery_from != Some(before.generation())
         || doc.version() <= before.version()

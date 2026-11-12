@@ -968,6 +968,7 @@ mod tests {
         // As at the service, where the erased account doesn't exist any more (Switch wire
         // 7.4.16, Switch spec 12.7 step 4): another key, and nothing of what the erased
         // account kept.
+        use pubky_switch_core::records::{IdentityBody, IdentityPolicy, Inbox};
         let identity = pubky_switch_core::keys::IdentityKey::from_secret([1; 32]);
         let clock = Arc::new(crate::clock::TestClock::new(1_700_000_000_000));
         let switch = ScriptedSwitch::unenrolled_at(&identity, [2; 32], clock, SWITCH_ORIGIN);
@@ -975,7 +976,24 @@ mod tests {
         assert_eq!(status, 200);
         assert_eq!(switch.kept_app_ids(), vec![[7; 16]]);
         {
+            // What a serving account holds: its document, an app, a contact, a pending
+            // connect request, and versions that have moved.
             let mut inner = switch.lock();
+            let inbox = Inbox {
+                url: inner.origin.clone(),
+                service_key: inner.service.verifying_key().to_bytes(),
+            };
+            let body =
+                IdentityBody::first(identity.public(), [3; 16], inbox, IdentityPolicy::default());
+            inner.doc = Some(IdentityDoc::sign(&identity, body).unwrap());
+            inner.staged = false;
+            inner
+                .apps
+                .insert([3; 16], super::super::SwitchApp::default());
+            inner.apps_version = 4;
+            inner.directory_version = 3;
+            inner.shared.contacts.insert([5; 32]);
+            inner.shared.connect.push(([6; 32], 1));
             inner.erased = true;
             inner.uploads_per_app_per_hour = 7;
         }
@@ -989,8 +1007,19 @@ mod tests {
         // The new account's key is the one that signs from now on.
         let named = b64(&switch.lock().service.verifying_key().to_bytes());
         assert_eq!(second["service_key"].as_str(), Some(named.as_str()));
-        // The switch's configuration stays.
-        assert_eq!(switch.lock().uploads_per_app_per_hour, 7);
+        {
+            // Nothing of the erased account is left, and the new one serves only once it
+            // takes its first document.
+            let inner = switch.lock();
+            assert!(inner.staged);
+            assert!(inner.doc.is_none());
+            assert!(inner.apps.is_empty());
+            assert!(inner.shared.contacts.is_empty());
+            assert!(inner.shared.connect.is_empty());
+            assert_eq!((inner.apps_version, inner.directory_version), (0, 0));
+            // The switch's configuration stays.
+            assert_eq!(inner.uploads_per_app_per_hour, 7);
+        }
         // The same enrollment again gets the same answer, and makes no further account.
         let (status, again) = enroll_at(&switch, &identity, 2, Some(vec![[9; 16]]));
         assert_eq!((status, again), (200, second));

@@ -1136,6 +1136,7 @@ pub async fn provider_loss_same_origin_refused(world: &World) -> FlowResult {
         ..Limits::default()
     };
     world.add_switch_with(ORIGIN, &[&alice], one_app).await?;
+    let before = world.trace().lines.len();
     let refused = signer
         .declare_provider_loss(ORIGIN, UserConfirmed::shown_and_confirmed())
         .await;
@@ -1147,19 +1148,61 @@ pub async fn provider_loss_same_origin_refused(world: &World) -> FlowResult {
     // the account's key number two of the run, whose document was never taken.
     let delivery = "{alice} PUT /v1/{alice}/identity";
     expect_answer(world, delivery, 400, "bad_request")?;
-    let enrolled_under = world
-        .last_answer("{alice} POST /v1/enroll")
-        .map(|[_, _, key]| key);
-    let refused_under = world.last_answer(delivery).map(|[_, _, key]| key);
+    // The signer read this origin under the key it had pinned for it, the lost
+    // generation's. The first refusal comes under another key, so the signer asks once
+    // whether the pinned key still serves: a read of the apps, which the new account, not
+    // serving yet, answers under its own key. That ends the pin, and the delivery goes
+    // again, read under the key the enrollment named, to the same refusal.
+    let apps = "{alice} GET /v1/{alice}/apps";
+    let sent: Vec<(String, String)> = world
+        .trace()
+        .lines
+        .iter()
+        .skip(before)
+        .filter(|line| !line.label.starts_with("outcome "))
+        .map(|line| {
+            let status = line.facts.get("status").cloned().unwrap_or_default();
+            (line.label.clone(), status)
+        })
+        .collect();
+    let expected = [
+        ("{alice} POST /v1/enroll", "200"),
+        (delivery, "400"),
+        (apps, "503"),
+        (delivery, "400"),
+    ];
+    let as_expected = sent.len() == expected.len()
+        && sent
+            .iter()
+            .zip(expected)
+            .all(|((label, status), (wanted, answered))| label == wanted && status == answered);
+    if !as_expected {
+        return Err(format!(
+            "the declaration sent {sent:?}: no read of the apps between two refused deliveries"
+        )
+        .into());
+    }
+    expect_answer(world, apps, 503, "staged")?;
+    // An answer the trace names no key for counts as none.
+    let key_of = |label: &str| {
+        world
+            .last_answer(label)
+            .map(|[_, _, key]| key)
+            .filter(|key| !key.is_empty())
+    };
+    let enrolled_under = key_of("{alice} POST /v1/enroll");
+    let refused_under = key_of(delivery);
     let shown = signer.status();
     if refused_under != enrolled_under
+        || key_of(apps) != enrolled_under
         || refused_under.as_deref() == Some("the operator key")
         || refused_under.is_none()
         || !matches!(&shown, SignerStatus::RecoveryRefused { origin } if origin == ORIGIN)
     {
         return Err(format!(
-            "the refusal is signed with {refused_under:?}, the enrollment's answer with \
-             {enrolled_under:?}, and the signer is {shown:?}"
+            "the refusal is signed with {refused_under:?}, the read of the apps with {:?}, \
+             the enrollment's answer with {enrolled_under:?}, and the signer is {shown:?}",
+            key_of(apps)
         )
         .into());
     }
