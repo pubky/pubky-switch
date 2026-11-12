@@ -2917,9 +2917,9 @@ async fn test_renewal_refused_by_a_stale_identity_tells_the_user() {
 
 #[tokio::test]
 async fn test_renewal_refused_again_keeps_the_alerts_place() {
-    // A second refused renewal for an app adds to what the first asked and keeps its alert
-    // where it is, a reduction's still, after which the other app's still comes (Switch spec
-    // 3.2).
+    // A second refused renewal for an app keeps its alert where it is, after which the other
+    // app's still comes. It asks a later expiry than the first's earlier one, so the newer
+    // request stands, and the alert is no reduction's any more (Switch spec 3.2).
     let world = World::new();
     let (mut signer, _) = world.enrolled().await;
     let (a, b) = two_apps(&["notes", "notes_sync"], &["notes", "notes_sync"]);
@@ -2947,7 +2947,7 @@ async fn test_renewal_refused_again_keeps_the_alerts_place() {
         )
         .await
         .unwrap_err();
-    assert_eq!(refused_renewals(&signer), [(a_id, true), (b_id, true)]);
+    assert_eq!(refused_renewals(&signer), [(a_id, false), (b_id, true)]);
 }
 
 #[tokio::test]
@@ -3250,6 +3250,247 @@ async fn test_renewal_refused_plain_renewal_ends_at_the_users_next_renewal() {
                 expires_at: Some(START_MS + 400 * DAY_MS),
             },
         )
+        .await
+        .unwrap();
+    assert!(refused_renewals(&signer).is_empty());
+}
+
+/// The test protocol whose scopes now give no switch permission: renewing under it removes
+/// `notes`'s `claims.read` only.
+struct NotesWithoutPermissions;
+
+impl Protocol for NotesWithoutPermissions {
+    fn name(&self) -> &str {
+        Notes.name()
+    }
+    fn scopes(&self) -> Vec<ScopeDef> {
+        Notes.scopes()
+    }
+    fn check_scopes(&self, scopes: &[&str]) -> Result<(), String> {
+        Notes.check_scopes(scopes)
+    }
+    fn permissions(&self, _: &[&str]) -> Vec<Permission> {
+        Vec::new()
+    }
+}
+
+#[tokio::test]
+async fn test_renewal_refused_permission_only_reduction_is_a_reduction() {
+    // The protocols now give `notes` no `claims.read`, and the user renews keeping the scopes
+    // and the expiry, which removes that permission only: a reduction (Switch wire 3.8
+    // "Reductions"). Refused, its alert stays through a version that keeps the permission,
+    // and goes once a certificate without it is listed (Switch spec 3.2).
+    let world = World::new();
+    let (mut signer, store) = world.enrolled().await;
+    let (a, _) = two_apps(&["notes", "notes_sync"], &["notes"]);
+    world.approve(&mut signer, &a).await;
+    let id = a.keys.app_id_bytes();
+    let expires = world.switch.app(&id).cert.expect("joined").expires_at();
+    drop(signer);
+    let protocols = Protocols::new(vec![Arc::new(NotesWithoutPermissions)]).unwrap();
+    let mut signer = Signer::open(world.env_with(store, protocols), world.keyring())
+        .await
+        .unwrap();
+    let same = || CertChange {
+        scopes: None,
+        expires_at: Some(expires),
+    };
+    world.switch.fail_next(refusal("/ops"));
+    signer.renew(id, same()).await.unwrap_err();
+    assert!(signer.alerts().contains(&Alert::RenewalRefused {
+        app_id: id,
+        reduction: true,
+        by_user: true,
+    }));
+    signer.set_record_max_age(Some(86_400)).await.unwrap();
+    assert_eq!(
+        refused_renewals(&signer),
+        [(id, true)],
+        "the permission held"
+    );
+    world.clock.advance_ms(1_000);
+    signer.renew(id, same()).await.unwrap();
+    assert!(
+        refused_renewals(&signer).is_empty(),
+        "the permission removed"
+    );
+}
+
+/// A change setting only the expiry, `days` after the start.
+fn expiring(days: u64) -> CertChange {
+    CertChange {
+        scopes: None,
+        expires_at: Some(START_MS + days * DAY_MS),
+    }
+}
+
+#[tokio::test]
+async fn test_renewal_refused_newer_request_stands_where_two_contradict() {
+    // An earlier expiry is refused, then a later one: the newer request stands, so the alert
+    // is no reduction's, and the later expiry, once delivered, ends it (Switch spec 3.2).
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let (a, _) = two_apps(&["notes", "notes_sync"], &["notes"]);
+    world.approve(&mut signer, &a).await;
+    let id = a.keys.app_id_bytes();
+    world.switch.fail_next(refusal("/ops"));
+    signer.renew(id, expiring(30)).await.unwrap_err();
+    assert_eq!(refused_renewals(&signer), [(id, true)]);
+    world.switch.fail_next(refusal("/ops"));
+    signer.renew(id, expiring(400)).await.unwrap_err();
+    assert_eq!(refused_renewals(&signer), [(id, false)], "the newer stands");
+    world.clock.advance_ms(1_000);
+    signer.renew(id, expiring(400)).await.unwrap();
+    assert!(refused_renewals(&signer).is_empty());
+}
+
+#[tokio::test]
+async fn test_renewal_refused_two_earlier_expiries_keep_the_earlier() {
+    // Two earlier expiries refused add up to the earlier of them: a certificate expiring
+    // between the two keeps the alert, one expiring by the earlier ends it (Switch spec 3.2).
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let (a, _) = two_apps(&["notes"], &["notes"]);
+    world.approve(&mut signer, &a).await;
+    let id = a.keys.app_id_bytes();
+    world.switch.fail_next(refusal("/ops"));
+    signer.renew(id, expiring(60)).await.unwrap_err();
+    world.switch.fail_next(refusal("/ops"));
+    signer.renew(id, expiring(30)).await.unwrap_err();
+    world.clock.advance_ms(1_000);
+    signer.renew(id, expiring(45)).await.unwrap();
+    assert_eq!(
+        refused_renewals(&signer),
+        [(id, true)],
+        "expires after 30 days"
+    );
+    world.clock.advance_ms(1_000);
+    signer.renew(id, expiring(30)).await.unwrap();
+    assert!(refused_renewals(&signer).is_empty());
+}
+
+#[tokio::test]
+async fn test_renewal_refused_scopes_are_judged_by_their_hierarchy() {
+    // A name covers its sub-scopes, and a sub-scope only itself (Switch wire 3.1): a renewal
+    // from the sub-scope to its name removes nothing, so its refusal is no reduction's; and
+    // asked to remove `notes_sync`, a certificate holding only `notes_sync:work` meets it
+    // (Switch spec 3.2).
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let label = App::with_keys(
+        AppKeys::from_secrets([3; 32], [4; 32]),
+        &["notes", "notes_sync:work"],
+        None,
+        [9; 32],
+    );
+    let name = App::with_keys(
+        AppKeys::from_secrets([5; 32], [6; 32]),
+        &["notes", "notes_sync"],
+        None,
+        [10; 32],
+    );
+    world.approve(&mut signer, &label).await;
+    world.approve(&mut signer, &name).await;
+    let (label_id, name_id) = (label.keys.app_id_bytes(), name.keys.app_id_bytes());
+    world.switch.fail_next(refusal("/ops"));
+    signer
+        .renew(label_id, reduce(&["notes", "notes_sync"]))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        refused_renewals(&signer),
+        [(label_id, false)],
+        "the name covers the sub-scope: nothing removed"
+    );
+    // `name`, asked to drop `notes_sync`, renewed to its sub-scope instead.
+    world.switch.fail_next(refusal("/ops"));
+    signer.renew(name_id, reduce(&["notes"])).await.unwrap_err();
+    assert!(refused_renewals(&signer).contains(&(name_id, true)));
+    world.clock.advance_ms(1_000);
+    signer
+        .renew(name_id, reduce(&["notes", "notes_sync:work"]))
+        .await
+        .unwrap();
+    assert!(
+        !refused_renewals(&signer)
+            .iter()
+            .any(|(id, _)| *id == name_id),
+        "the sub-scope doesn't hold its name"
+    );
+}
+
+#[tokio::test]
+async fn test_renewal_refused_sub_scope_stays_while_its_name_is_held() {
+    // Asked to remove `notes_sync:work`, the alert stays through a renewal to `notes_sync`,
+    // which covers it, and goes once neither is held (Switch wire 3.1, spec 3.2).
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let app = App::with_keys(
+        AppKeys::from_secrets([3; 32], [4; 32]),
+        &["notes", "notes_sync:work"],
+        None,
+        [9; 32],
+    );
+    world.approve(&mut signer, &app).await;
+    let id = app.keys.app_id_bytes();
+    world.switch.fail_next(refusal("/ops"));
+    signer.renew(id, reduce(&["notes"])).await.unwrap_err();
+    assert_eq!(refused_renewals(&signer), [(id, true)]);
+    world.clock.advance_ms(1_000);
+    signer
+        .renew(id, reduce(&["notes", "notes_sync"]))
+        .await
+        .unwrap();
+    assert_eq!(
+        refused_renewals(&signer),
+        [(id, true)],
+        "the name covers it"
+    );
+    world.clock.advance_ms(1_000);
+    signer.renew(id, reduce(&["notes"])).await.unwrap();
+    assert!(refused_renewals(&signer).is_empty());
+}
+
+#[tokio::test]
+async fn test_renewal_refused_scope_asked_back_leaves_the_scopes_to_remove() {
+    // Refused: remove `notes` and expire within 30 days. A later renewal removes `notes`
+    // but keeps a later expiry, so the alert stays. Refused again: `notes` back, within 20
+    // days. The newer request stands for `notes`, which leaves the scopes to remove, while the
+    // earlier expiries add up; a certificate holding `notes` and expiring within 20 days ends
+    // the alert (Switch spec 3.2).
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let (a, _) = two_apps(&["notes", "notes_sync"], &["notes"]);
+    world.approve(&mut signer, &a).await;
+    let id = a.keys.app_id_bytes();
+    let change = |scopes: &[&str], days: u64| CertChange {
+        scopes: Some(scopes.iter().map(|s| (*s).to_owned()).collect()),
+        expires_at: Some(START_MS + days * DAY_MS),
+    };
+    world.switch.fail_next(refusal("/ops"));
+    signer
+        .renew(id, change(&["notes_sync"], 30))
+        .await
+        .unwrap_err();
+    world.clock.advance_ms(1_000);
+    signer
+        .renew(id, change(&["notes_sync"], 300))
+        .await
+        .unwrap();
+    assert_eq!(
+        refused_renewals(&signer),
+        [(id, true)],
+        "expires later than asked"
+    );
+    world.switch.fail_next(refusal("/ops"));
+    signer
+        .renew(id, change(&["notes", "notes_sync"], 20))
+        .await
+        .unwrap_err();
+    assert_eq!(refused_renewals(&signer), [(id, true)]);
+    world.clock.advance_ms(1_000);
+    signer
+        .renew(id, change(&["notes", "notes_sync"], 20))
         .await
         .unwrap();
     assert!(refused_renewals(&signer).is_empty());

@@ -37,20 +37,26 @@ pub fn signer_namespace(identity: &[u8; 32]) -> String {
     format!("{SIGNER_NAMESPACE_PREFIX}{}", zbase32_encode(identity))
 }
 
-/// The switch the identity is enrolled at (Switch wire 3.7).
 /// What the user asked of an app's renewal that didn't happen (Switch spec 3.2): the scopes
-/// to remove and an earlier expiry, which make it a reduction, and the scopes to add and a
-/// later expiry. A second one the user asks for the same app adds to it.
+/// and switch permissions to remove and an earlier expiry, which make it a reduction, and
+/// the scopes to add and a later expiry. A second one the user asks for the same app adds to
+/// it, its parts standing where the two contradict.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct AskedRenewal {
     /// The app.
     pub(crate) app_id: [u8; 16],
     /// The scopes the user asked to remove.
     pub(crate) remove: Vec<String>,
+    /// The switch permissions the user's renewal would have removed, by name.
+    #[serde(default)]
+    pub(crate) remove_permissions: Vec<String>,
     /// The earliest expiry the user asked for, when earlier than the certificate's.
     pub(crate) expires_by: Option<u64>,
     /// The scopes the user asked to add.
     pub(crate) add: Vec<String>,
+    /// The switch permissions the user's renewal would have added, by name.
+    #[serde(default)]
+    pub(crate) add_permissions: Vec<String>,
     /// The latest expiry the user asked for, when later than the certificate's.
     pub(crate) expires_from: Option<u64>,
 }
@@ -68,24 +74,62 @@ impl AskedRenewal {
         Self {
             app_id,
             remove: missing(new, old),
+            remove_permissions: old
+                .permissions()
+                .iter()
+                .filter(|permission| !new.has_permission(**permission))
+                .map(|permission| permission.as_str().to_owned())
+                .collect(),
             expires_by: (new.expires_at() < old.expires_at()).then(|| new.expires_at()),
             add: missing(old, new),
+            add_permissions: new
+                .permissions()
+                .iter()
+                .filter(|permission| !old.has_permission(**permission))
+                .map(|permission| permission.as_str().to_owned())
+                .collect(),
             expires_from: (new.expires_at() > old.expires_at()).then(|| new.expires_at()),
         }
     }
 
-    /// Add what `later` asks: every scope either asks to remove or to add, the earlier of the
-    /// two earlier expiries and the later of the two later ones.
+    /// Add what `later`, the user's newer request, asks. Where the two contradict, the newer
+    /// stands: a scope or permission it asks to add leaves those to remove, and one it asks
+    /// to remove those to add; a later expiry it asks ends the earlier one asked, and an
+    /// earlier one the later. Parts that don't contradict add up: every scope and permission
+    /// either asks to remove or to add, the earlier of two earlier expiries and the later of
+    /// two later ones.
     pub(crate) fn merge(&mut self, later: &AskedRenewal) {
+        self.remove.retain(|scope| !later.add.contains(scope));
+        self.add.retain(|scope| !later.remove.contains(scope));
+        self.remove_permissions
+            .retain(|permission| !later.add_permissions.contains(permission));
+        self.add_permissions
+            .retain(|permission| !later.remove_permissions.contains(permission));
         for scope in &later.remove {
             if !self.remove.contains(scope) {
                 self.remove.push(scope.clone());
+            }
+        }
+        for permission in &later.remove_permissions {
+            if !self.remove_permissions.contains(permission) {
+                self.remove_permissions.push(permission.clone());
             }
         }
         for scope in &later.add {
             if !self.add.contains(scope) {
                 self.add.push(scope.clone());
             }
+        }
+        for permission in &later.add_permissions {
+            if !self.add_permissions.contains(permission) {
+                self.add_permissions.push(permission.clone());
+            }
+        }
+        if later.expires_from.is_some() {
+            self.expires_by = None;
+        }
+        if later.expires_by.is_some() {
+            self.expires_from = None;
         }
         self.expires_by = match (self.expires_by, later.expires_by) {
             (Some(a), Some(b)) => Some(a.min(b)),
@@ -97,19 +141,25 @@ impl AskedRenewal {
         };
     }
 
-    /// Whether the user asked to reduce the app: to remove a scope or expire it earlier.
+    /// Whether the user asked to reduce the app: to remove a scope or a switch permission, or
+    /// to expire it earlier (Switch wire 3.8 "Reductions").
     pub(crate) fn reduction(&self) -> bool {
-        !self.remove.is_empty() || self.expires_by.is_some()
+        !self.remove.is_empty() || !self.remove_permissions.is_empty() || self.expires_by.is_some()
     }
 
     /// Whether `cert` holds what the user asked: for a reduction, none of the scopes to
-    /// remove, by the scope hierarchy, and an expiry no later than asked; otherwise every
-    /// scope to add and an expiry no earlier than asked, when something was asked.
+    /// remove, by the scope hierarchy, none of the switch permissions to remove, and an expiry
+    /// no later than asked; otherwise every scope to add and an expiry no earlier than asked,
+    /// when something was asked.
     pub(crate) fn met_by(&self, cert: &AppCert) -> bool {
         if self.reduction() {
             self.remove
                 .iter()
                 .all(|scope| !scopes::holds(cert.scopes(), scope))
+                && self.remove_permissions.iter().all(|name| {
+                    scopes::Permission::from_name(name)
+                        .is_none_or(|permission| !cert.has_permission(permission))
+                })
                 && self.expires_by.is_none_or(|by| cert.expires_at() <= by)
         } else {
             (!self.add.is_empty() || self.expires_from.is_some())
@@ -124,6 +174,7 @@ impl AskedRenewal {
     }
 }
 
+/// The switch the identity is enrolled at (Switch wire 3.7).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Service {
     /// The switch origin, exactly as `identity.json` names it.

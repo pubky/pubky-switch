@@ -157,15 +157,18 @@ pub enum Alert {
     /// or [`crate::Signer::run_due`], for a renewal the user asked for (`by_user`) and for an
     /// automatic one, which the next run tries again. One per app, kept in its place, and the
     /// user's wins: a refused automatic renewal leaves the user's alert as it is, and a second
-    /// refused renewal the user asked for adds what it asks to the first's. Not raised for an
-    /// app being revoked, whose removal tells of it.
+    /// refused renewal the user asked for adds what it asks to the first's, the user's newest
+    /// request counting where two contradict (a scope asked to be removed, then added; an
+    /// earlier expiry, then a later one). Not raised for an app being revoked, whose removal
+    /// tells of it.
     ///
     /// Whether it holds is judged from the certificate `identity.json` lists for the app,
     /// whoever's renewal listed it, against what the user asked, which the records keep
     /// beside the alert:
     ///
     /// - a reduction the user asked for stays while that certificate still holds a scope the
-    ///   user asked to remove, or expires later than they asked;
+    ///   user asked to remove, by the scope hierarchy, or a switch permission the reduction
+    ///   would have removed, or expires later than they asked;
     /// - another renewal the user asked for stays until a certificate holding what they asked
     ///   is listed, or a later renewal they ask for is delivered for the app;
     /// - an automatic renewal's stays until the app is renewed;

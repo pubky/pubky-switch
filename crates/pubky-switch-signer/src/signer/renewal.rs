@@ -580,8 +580,10 @@ impl Signer {
                     _ => AskedRenewal {
                         app_id: app.app_id,
                         remove: Vec::new(),
+                        remove_permissions: Vec::new(),
                         expires_by: None,
                         add: Vec::new(),
+                        add_permissions: Vec::new(),
                         expires_from: None,
                     },
                 }
