@@ -817,7 +817,7 @@ It names no identity: the user picks the identity in the signer. Unknown members
 5. The App ID isn't listed, unless the request names exactly the `signing_key` and `bundle_key` it is listed with: approving it then renews the app's certificate (3.8). A listed App ID is never given other keys.
 6. A new App ID fits the app limit (3.7).
 
-The signer then shows the user the App ID, the scopes and the capabilities. On approval it issues the certificate, delivers and publishes the `identity.json` that lists it (3.3), grants the Pubky capabilities checked and nothing else, and answers with the approval (3.10).
+The signer then shows the user the App ID, the scopes and the capabilities, with what each path a protocol added is for. The user may decline any of those paths, as that protocol's rule on its paths allows (Paykit's Profile and its blobs go together, Paykit spec 3.4); the signer refuses a decline of any other path, the app's record and backup folder included, and a set of declines that breaks the protocol's rule. On approval it issues the certificate, with the scopes asked for whatever was declined, delivers and publishes the `identity.json` that lists it (3.3), grants the Pubky capabilities checked less the declined paths, in the order the auth request names them, and nothing else, and answers with the approval (3.10). A request from a listed app that renews it (step 5) is approved the same way: its grant covers what that request names less what the user declines there, and a path it leaves out isn't declined (spec 3.4).
 
 Example (`wallet`, `documents.json` "wallet app request"; `documents.json` `auth_request` has the auth request it binds):
 
@@ -865,6 +865,8 @@ Readers ignore unknown members (1.1). The bundle is the format of 3.5: sealed to
 4. It reads `bundles` by the rules of 3.5 "Reading", as it reads every later bundle, holding no naming key yet: the first part it takes sets it, and every other part must carry the same one. Every part's `cert` must be the document hash of the approval's `cert`, and every part must be taken, so each holds exactly one key for each keyed scope of the certificate (3.5) and each data epoch of its range, and together they cover every data epoch from 1 to the document's `data_epoch`. No part goes past it: the signer makes the approval's bundle for the document the approval carries, so here the next epoch of 3.5 Reading is that `data_epoch` itself, and a part with a key for `data_epoch + 1` is refused.
 
 It then keeps the certificate, the scope keys and the naming key, and follows spec 12.1 step 2.
+
+The approval is the same whichever paths the user allowed. The app learns which it holds from its Pubky session, which lists the capabilities the Homeserver granted it; a path it asked for and lacks was declined (spec 3.4).
 
 Example (`documents.json` `approval`, the wallet's at data epoch 2, its signed members shortened):
 
