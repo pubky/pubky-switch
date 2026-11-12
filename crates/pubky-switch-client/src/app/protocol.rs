@@ -397,8 +397,10 @@ impl std::fmt::Display for StoreFailure {
     }
 }
 
-/// The protocol's answer for a received message.
+/// The protocol's answer for a received message. Later versions may add answers: a host
+/// that matches on it keeps a catch-all arm.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub enum Outcome {
     /// Apply the effect.
     Apply(Effect),

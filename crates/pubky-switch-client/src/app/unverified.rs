@@ -181,6 +181,12 @@ fn dropped(id: u64, stored: &ParkedEntry, reason: DropReason) -> Duty {
         accepted_at_ms: stored.accepted_at_ms,
         reason,
         awaited_epoch: stored.reason.awaited_epoch(),
+        // Only an entry that waited for a key passed the checks of its sender before it
+        // was stored (Switch wire 5.1): its `msg_id` is the signed one.
+        msg_id: stored
+            .reason
+            .awaited_epoch()
+            .and_then(|_| super::parked::stored_msg_id(stored)),
     }
 }
 

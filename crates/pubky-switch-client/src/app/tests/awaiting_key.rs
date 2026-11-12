@@ -654,3 +654,56 @@ async fn test_awaiting_key_of_a_later_epoch_fetches_nothing() {
         "{sent:?}"
     );
 }
+
+/// The drop of an entry that waited for a key names its message, which passed the
+/// recipient checks before it was stored; the drop of one whose sender couldn't be checked
+/// names none.
+#[tokio::test]
+async fn test_awaiting_key_drop_names_the_msg_id_an_unverified_drop_none() {
+    let w = World::new();
+    let protocol = Keyed::new(Mode::Write);
+    let transport = w.switch.transport();
+    let mut app = wallet(&w, &protocol, &transport).await;
+    w.next_doc(|body| body.data_epoch = 2);
+    let peer = published_peer(&w, "carol");
+    let (waiting, sent) = w
+        .switch
+        .send(
+            &peer.identity,
+            &peer.keys,
+            &peer.cert,
+            "sample.note",
+            json!({ "text": "waits" }),
+            &[app.app_id()],
+        )
+        .unwrap();
+    app.receive(None).await.unwrap();
+    assert_eq!(app.stored_at(waiting).map(|s| s.reason), awaiting(2));
+    w.homeserver.set_down(true);
+    w.clock.advance_ms(DOC_CACHE_MS + 1);
+    let unverified = notes_from(&w, &peer, app.app_id(), 1)[0];
+    app.receive(None).await.unwrap();
+    w.clock.advance_ms(World::config().park_after_ms + 1);
+    app.receive(None).await.unwrap();
+    assert_eq!(
+        app.stored_at(unverified).map(|s| s.reason),
+        Some(ParkReason::Unverifiable)
+    );
+    w.clock.advance_ms(MAX_UNVERIFIED_AGE_MS);
+    let mut events = Vec::new();
+    for _ in 0..2 {
+        events.extend(app.receive(None).await.unwrap().events);
+    }
+    let dropped: Vec<(u64, Option<String>)> = events
+        .iter()
+        .filter_map(|e| match e {
+            AppEvent::StoredEntryDropped { seq, msg_id, .. } => Some((*seq, msg_id.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        dropped,
+        vec![(waiting, Some(sent.msg_id)), (unverified, None)],
+        "{events:?}"
+    );
+}

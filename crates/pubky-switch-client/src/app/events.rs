@@ -307,7 +307,9 @@ pub enum AppEvent {
     /// Switch spec 8.2 sets for both together ([`super::MAX_UNVERIFIED_AGE_MS`],
     /// [`super::MAX_UNVERIFIED_PER_SENDER`], [`super::MAX_UNVERIFIED_TOTAL`]). The protocol
     /// may ask the sender to send it again while the sender still keeps it (Switch spec
-    /// 11). A duty event, kept in the commit that deletes the entry.
+    /// 11). A duty event, kept in the commit that deletes the entry. Later versions may
+    /// add members: a pattern on it ends in `..`.
+    #[non_exhaustive]
     StoredEntryDropped {
         /// The duty event's ID.
         id: EventId,
@@ -328,6 +330,10 @@ pub enum AppEvent {
         /// ([`ParkReason::AwaitingKey`]); `None` for an entry whose sender couldn't be
         /// checked.
         awaited_epoch: Option<u64>,
+        /// The message's `msg_id`, for an entry that waited for a scope key: it passed the
+        /// recipient checks before it was stored, so its sender signed it. `None` for an
+        /// entry whose sender couldn't be checked, whose `msg_id` no check stands behind.
+        msg_id: Option<String>,
     },
     /// An entry stored locally was processed.
     Unparked {
@@ -925,6 +931,8 @@ pub(crate) enum Duty {
         reason: DropReason,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         awaited_epoch: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        msg_id: Option<String>,
     },
     KeptBatchDropped {
         #[serde(with = "serde_b64")]
@@ -1049,6 +1057,7 @@ impl Duty {
                 accepted_at_ms,
                 reason,
                 awaited_epoch,
+                msg_id,
             } => AppEvent::StoredEntryDropped {
                 id,
                 stored_id,
@@ -1058,6 +1067,7 @@ impl Duty {
                 accepted_at_ms,
                 reason,
                 awaited_epoch,
+                msg_id,
             },
             Self::KeptBatchDropped { batch_id } => AppEvent::KeptBatchDropped { id, batch_id },
             Self::BatchRefused { batch_id, code } => AppEvent::BatchRefused { id, batch_id, code },
