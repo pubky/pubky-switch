@@ -537,6 +537,13 @@ impl App {
         if self.state.pending_record.take().is_some() {
             tx.delete(key::PENDING_RECORD)?;
         }
+        // What the old service accepted counts for nothing at the new one: the record the
+        // new service accepts at the re-registration is the one published from then on
+        // (Switch spec 4.2).
+        self.state.accepted = None;
+        self.state.pending_publish = None;
+        tx.delete(key::ACCEPTED_RECORD)?;
+        tx.delete(key::PENDING_PUBLISH)?;
         // Reconcile mode until the protocol's reconciliation ends it (Switch spec 12.6 step 5).
         let restore = self.state.restore.get_or_insert(RestoreState {
             n_floor: n,

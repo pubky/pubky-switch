@@ -5527,3 +5527,80 @@ async fn move_record_published(homeserver_fails: bool) {
         Some(serde_json::to_vec(&changed).unwrap())
     );
 }
+
+/// Switch spec 4.2: a record the new service refuses at the re-registration, holding a later
+/// one of the app's from another device, is never published.
+#[tokio::test]
+async fn test_loss_record_the_new_service_refuses_is_never_published() {
+    let store = Arc::new(MemoryStore::new());
+    let lost = lost_world(Arc::clone(&store) as Arc<dyn StateStore>).await;
+    lost.router.remove(NEXT);
+    assert!(
+        follow_loss(&lost, Arc::clone(&store) as Arc<dyn StateStore>)
+            .await
+            .is_err()
+    );
+    // Another device of the app registers its key first, with a later record of the app.
+    let mut app = load_lost(&lost, Arc::clone(&store) as Arc<dyn StateStore>).await;
+    let other = pubky_switch_core::keys::ReceiveKey::generate(1).unwrap();
+    let mut later =
+        pubky_switch_core::records::AppRecord::verify(app.record(), &lost.w.alice.public())
+            .unwrap()
+            .body()
+            .clone();
+    later.updated_at += 60_000;
+    later.label = Some("the other device".into());
+    let later = pubky_switch_core::records::AppRecord::sign(&app_keys("wallet"), later).unwrap();
+    let keys = app_keys("wallet");
+    lost.next
+        .app_op(
+            &keys,
+            OpKind::AppPut {
+                record: later.signed().clone(),
+            },
+        )
+        .unwrap();
+    lost.next
+        .app_op(
+            &keys,
+            OpKind::ReceiveKeyPut {
+                record: wallet_key_record(&app, &other).signed().clone(),
+            },
+        )
+        .unwrap();
+    app.take_device_keys(crate::app::DeviceKeys {
+        receive_keys: Vec::new(),
+        known: vec![(pubky_switch_core::enc::b64(&other.kid), 1)],
+        rotation_ms: 0,
+    })
+    .await
+    .unwrap();
+    drop(app);
+    lost.router.add(NEXT, &lost.next);
+    let mut app = App::load(
+        lost.router
+            .env(&lost.w, Arc::clone(&store) as Arc<dyn StateStore>),
+        Arc::clone(&lost.protocol) as Arc<dyn Protocol>,
+        AppConfig {
+            publishes_record: true,
+            ..World::config()
+        },
+        app_keys("wallet").app_id_bytes(),
+    )
+    .await
+    .unwrap();
+    app.refresh_identity().await.unwrap();
+    app.receive(None).await.unwrap();
+    assert!(app.recovery_info().await.unwrap().unwrap().steps_done);
+    // The new service holds the later record; the app's own was refused, so nothing of it
+    // was noted as accepted or published.
+    let me = app.app_id();
+    assert_eq!(lost.next.app(&me).record, Some(later.signed().clone()));
+    let path = pubky_switch_core::records::app_record_path(&me);
+    assert!(
+        lost.w
+            .homeserver
+            .file(lost.w.alice.public(), &path)
+            .is_none()
+    );
+}

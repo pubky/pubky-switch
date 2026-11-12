@@ -284,10 +284,10 @@ impl App {
     /// ([`Publication::Superseded`]). With nothing owed the copy is read at most once per
     /// [`PUBLISHED_CHECK_MS`], unless `check`. Nothing is published once the app has begun
     /// to leave, from the commit before it deletes its Homeserver record (Switch spec
-    /// 12.3). A read or write that fails leaves the publication owed and is reported
+    /// 12.3): every call that leads here refuses a leaving app first. A read or write that fails leaves the publication owed and is reported
     /// ([`AppEvent::RecordPublishFailed`]); only the store's failure is an error.
     pub(crate) async fn publish_owed(&mut self, check: bool) -> Result<Publication, AppError> {
-        if !self.config.publishes_record || self.state.leave.is_some() {
+        if !self.config.publishes_record {
             return Ok(Publication::NotPublishing);
         }
         let Some(record) = self.state.accepted.clone() else {

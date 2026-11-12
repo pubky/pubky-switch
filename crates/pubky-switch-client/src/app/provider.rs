@@ -1092,6 +1092,8 @@ impl App {
         if self.state.pending_record.take().is_some() {
             tx.delete(key::PENDING_RECORD)?;
         }
+        // The next service imported the record the old one accepted, so it stays the newest
+        // accepted until the re-registration's answer (Switch spec 4.2, 12.5).
         // A loss followed before, its kept batch unanswered, goes on at this generation.
         if let Some(mut loss) = self.loss_record().await?
             && !loss.done()
