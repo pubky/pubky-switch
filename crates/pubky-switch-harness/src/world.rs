@@ -397,6 +397,13 @@ impl World {
         ])
     }
 
+    /// One fact of the run's last request labelled `label`, as the trace keeps it.
+    pub fn last_fact(&self, label: &str, fact: &str) -> Option<String> {
+        let trace = self.recorder.trace();
+        let line = trace.lines.iter().rev().find(|line| line.label == label)?;
+        line.facts.get(fact).cloned()
+    }
+
     /// How many requests the run has sent so far.
     pub fn requests_sent(&self) -> usize {
         let trace = self.recorder.trace();

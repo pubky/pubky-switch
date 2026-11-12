@@ -28,8 +28,9 @@ fails instead.
 
 ## Retries
 
-`World::lose_answer` and `World::unreachable` put a fault of the network in front of either
-switch: an answer lost after the switch took the request, or a request that never arrives.
+`World::lose_answer`, `World::unreachable` and `World::refuse` put a fault of the network in
+front of either switch: an answer lost after the switch took the request, a request that
+never arrives, or a refusal that comes back in the switch's place with no signature.
 The retry flows send each of these again, and the service and the scripted switch answer
 every one alike:
 
@@ -78,8 +79,10 @@ The flows send every call the service serves, each at both switches. What they l
   and `/unfreeze`, `GET /export` and its chunks, `POST /import` with its chunks and
   activation, and `POST /recovery/upload`. So no flow moves an account or changes its key in
   place, and after a provider loss none brings an app's records and lists back to the new
-  service: the provider-loss flows are the signer's part. `flows::flow_of` lists them, and
-  the test fails once one is served without a flow.
+  service. The provider-loss flows are the signer's part, and of an app's only its first
+  steps: in two of them the wallet registers at the new service and reads the new chain
+  from its first item, the recovery's record, and its upload is kept from reaching either
+  switch. `flows::flow_of` lists them, and the test fails once one is served without a flow.
 - **Faults in front of most reads.** The retries above are the ones covered. No answer is
   lost and no connection fails in front of `GET /allow`, `/claims/{claim_key}`,
   `/directory`, `/apps/{app_id}/keys`, `/records`, `/records/{key}`, `/handover` or the

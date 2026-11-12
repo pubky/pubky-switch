@@ -48,7 +48,7 @@ use serde::de::{Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde_json::Value;
 
 use crate::HarnessError;
-use crate::check::{Checker, SignedWith};
+use crate::check::Checker;
 
 /// The members whose string value is one of the wire format's fixed words or a name the
 /// flow chose, kept by value whatever its length: error codes, document kinds, operations,
@@ -489,24 +489,22 @@ impl Transport for Recorder {
                 Ok(answer) => {
                     let mut violations = Vec::new();
                     // The signature is of the answer as the switch sent it.
-                    match self.checker.signature(&sent, answer) {
-                        Ok(SignedWith::ServiceKey(number)) => {
-                            facts.insert(
-                                SIGNED_WITH.into(),
-                                format!("the account's service key, number {number}"),
-                            );
+                    let signed = match self.checker.signature(&sent, answer) {
+                        Ok(with) => {
+                            facts.insert(SIGNED_WITH.into(), with.to_string());
+                            Some(with)
                         }
-                        Ok(SignedWith::OperatorKey) => {
-                            facts.insert(SIGNED_WITH.into(), "the operator key".into());
+                        Err(violation) => {
+                            violations.push(violation);
+                            None
                         }
-                        Err(violation) => violations.push(violation),
-                    }
+                    };
                     let mut kept = answer.clone();
                     if let Some(distort) = lock(&self.distortion).as_ref() {
                         distort(&sent, &mut kept);
                     }
                     self.answer_facts(&kept, &mut facts);
-                    violations.extend(self.checker.contents(&sent, &kept));
+                    violations.extend(self.checker.contents(&sent, &kept, signed));
                     for (index, violation) in violations.into_iter().enumerate() {
                         facts.insert(format!("{VIOLATION} {}", index + 1), violation);
                     }
@@ -951,6 +949,45 @@ mod tests {
         );
         assert_eq!(inner.requests().len(), 2);
         assert_eq!(recorder.faults_left(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_fault_refuse_answers_unsigned_in_the_switchs_place_once() {
+        let (recorder, inner) = recorder();
+        recorder.fail_next(Fault::Refuse {
+            method: "POST".into(),
+            path: "/v1/enroll".into(),
+            status: 409,
+            code: "conflict".into(),
+        });
+        // Another call isn't touched.
+        let other = recorder.send(post("/v1/abc/ops")).await.unwrap();
+        assert_eq!(other.status, 200);
+        let refused = recorder.send(post("/v1/enroll")).await.unwrap();
+        assert_eq!(refused.status, 409);
+        let body: Value = serde_json::from_slice(&refused.body).unwrap();
+        assert_eq!(body["code"], "conflict");
+        assert!(
+            refused.header(header::SERVICE_SIGNATURE).is_none(),
+            "no key signs it"
+        );
+        assert_eq!(inner.requests().len(), 1, "it didn't reach the switch");
+        assert_eq!(recorder.faults_left(), 0);
+        assert_eq!(
+            recorder.send(post("/v1/enroll")).await.unwrap().status,
+            200,
+            "once"
+        );
+        let trace = recorder.trace();
+        let fact = |line: usize, fact: &str| trace.lines[line].facts.get(fact).cloned();
+        assert_eq!(
+            fact(1, "fault").as_deref(),
+            Some("an answer no key signs came back in the switch's place")
+        );
+        assert_eq!(fact(1, "status").as_deref(), Some("409"));
+        assert_eq!(fact(1, "body.code").as_deref(), Some("text conflict"));
+        assert_eq!(fact(1, SIGNED_WITH), None, "the checker isn't asked");
+        assert_eq!(fact(2, "fault"), None);
     }
 
     #[test]

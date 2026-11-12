@@ -2,6 +2,14 @@
 //! 3.3, 3.7, 7.4.1, 7.4.2, 7.4.14): the signer declares the service it is enrolled at lost,
 //! enrolls at a service, delivers the next generation's first document there, and ends the
 //! staged admission the recovery starts.
+//!
+//! The recovery's own record, the `recovery` transition that starts the new chain, is in
+//! no answer to the signer. Two flows show it, [`provider_loss`] and
+//! [`provider_loss_in_place`] (and [`provider_loss_sender_staged`] with the first): the
+//! wallet follows the recovery there, registers at the service, and reads the new chain
+//! from its first item. The other three compare neither the record nor the start of the
+//! chain. An app's later steps, from its upload on, are in no flow: the service doesn't
+//! serve `POST /v1/{id}/recovery/upload` yet.
 
 use std::sync::Arc;
 
@@ -39,7 +47,8 @@ fn recovered(doc: &IdentityDoc, signer: &Signer) -> Result<Value, Box<dyn std::e
     }))
 }
 
-/// How a signer's call ended, for the trace: the error's kinds, never its text.
+/// How a party's call ended, for the trace: the error's kinds and the status a switch
+/// refused with, never its text.
 fn ended<T, E: std::fmt::Debug>(result: &Result<T, E>) -> Value {
     match result {
         Ok(_) => json!({ "ok": true }),
@@ -50,7 +59,11 @@ fn ended<T, E: std::fmt::Debug>(result: &Result<T, E>) -> Value {
                 .filter(|word| word.chars().next().is_some_and(|c| c.is_ascii_uppercase()))
                 .take(4)
                 .collect();
-            json!({ "ok": false, "error": kinds.join(" ") })
+            let status = shown.split_once("status: ").and_then(|(_, rest)| {
+                let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+                digits.parse::<u16>().ok()
+            });
+            json!({ "ok": false, "error": kinds.join(" "), "status": status })
         }
     }
 }
@@ -66,6 +79,60 @@ fn expect_answer(world: &World, label: &str, status: u16, code: &str) -> FlowRes
     } else {
         Err(format!("{label} was answered {was} {with}, not {status} {code}").into())
     }
+}
+
+/// Fail the flow unless the signer's `POST /recovery/admission` was answered `200` and its
+/// call ended well (Switch wire 7.4.14).
+fn expect_admission_ended<T, E>(world: &World, ending: &Result<T, E>) -> FlowResult {
+    let answered = world.last_fact("{alice} POST /v1/{alice}/recovery/admission", "status");
+    if ending.is_ok() && answered.as_deref() == Some("200") {
+        Ok(())
+    } else {
+        Err(format!("the end of the staged admission was answered {answered:?}").into())
+    }
+}
+
+/// alice's wallet follows the recovery as far as the service serves it: it reads her newest
+/// `identity.json` from the Homeserver, finds the new service in it, registers there, and reads the new chain from its first
+/// item, the `recovery` transition (Switch wire 7.4.2, spec 12.6 step 1). No answer to the
+/// signer shows that record: a service transition is shown in full to every own app (Switch
+/// wire 7.4.4), so this read is where the two switches' records and the starts of their
+/// chains are set side by side. The app's next step, its upload, is kept from reaching
+/// either switch.
+async fn follow_recovery(world: &World, wallet: &mut App, lost: u64) -> FlowResult {
+    world.unreachable("POST", "/recovery/upload");
+    // As when the Homeserver's event stream names the document (Switch spec 4.3).
+    let refreshed = wallet.refresh_identity().await;
+    let followed = wallet.follow_provider().await;
+    world.outcome(
+        "the wallet followed the recovery, short of its upload",
+        &json!({
+            "refreshed": ended(&refreshed),
+            "ended": ended(&followed),
+            "events": events(&wallet.take_events()),
+        }),
+    );
+    world.advance_ms(STEP_MS);
+    if world.faults_left() != 0 {
+        return Err("the wallet's upload was never sent".into());
+    }
+    // The new chain's first item is the recovery's record, naming the generation lost.
+    let read = "{alice/wallet} GET /v1/{alice}/feed";
+    let fact = |fact: &str| world.last_fact(read, &format!("body.items[0].{fact}"));
+    let first = (
+        fact("seq"),
+        fact("item.body~.type"),
+        fact("item.body~.recovery_from"),
+    );
+    let record = (
+        Some("number 1".to_owned()),
+        Some("text recovery".to_owned()),
+        Some(format!("number {lost}")),
+    );
+    if first != record {
+        return Err(format!("the new chain's first item is {first:?}, not {record:?}").into());
+    }
+    Ok(())
 }
 
 /// bob's delivery of his `identity.json` to alice's switch, his first call when he writes
@@ -119,7 +186,7 @@ async fn recovery_elsewhere(world: &World, during: bool) -> FlowResult {
     world.add_switch(SENDERS_ORIGIN, &[&bob]).await?;
     let mut alice_signer = enroll(world, &alice, ORIGIN).await?;
     let mut bob_signer = enroll(world, &bob, SENDERS_ORIGIN).await?;
-    let (_wallet, _) = joined(world, &alice, &mut alice_signer, "wallet").await?;
+    let (mut wallet, _) = joined(world, &alice, &mut alice_signer, "wallet").await?;
     let (mut shop, _) = joined(world, &bob, &mut bob_signer, "shop").await?;
 
     // The service is gone, and another stands ready.
@@ -133,6 +200,7 @@ async fn recovery_elsewhere(world: &World, during: bool) -> FlowResult {
         &recovered(&doc, &alice_signer)?,
     );
     world.advance_ms(STEP_MS);
+    follow_recovery(world, &mut wallet, 1).await?;
 
     if during {
         send(
@@ -150,6 +218,7 @@ async fn recovery_elsewhere(world: &World, during: bool) -> FlowResult {
         "the signer ended the staged admission",
         &json!({ "ended": ended(&ending), "signer": status(&alice_signer)? }),
     );
+    expect_admission_ended(world, &ending)?;
     world.advance_ms(STEP_MS);
     if during {
         send(
@@ -218,7 +287,7 @@ pub async fn provider_loss_in_place(world: &World) -> FlowResult {
     let alice = world.identity("alice")?;
     world.add_switch(ORIGIN, &[&alice]).await?;
     let mut signer = enroll(world, &alice, ORIGIN).await?;
-    let (_wallet, _) = joined(world, &alice, &mut signer, "wallet").await?;
+    let (mut wallet, _) = joined(world, &alice, &mut signer, "wallet").await?;
 
     let doc = signer
         .declare_provider_loss(ORIGIN, UserConfirmed::shown_and_confirmed())
@@ -229,6 +298,10 @@ pub async fn provider_loss_in_place(world: &World) -> FlowResult {
     );
     world.advance_ms(STEP_MS);
 
+    // Sent now, before anything else takes time: the enrollment was signed at the run's
+    // start, and a switch answers one whose timestamp is more than five minutes old `401
+    // stale_timestamp`, whatever became of its key (Switch wire 7.1). The flow is four
+    // steps of 61.25 seconds in here.
     let retried = world.enroll_again(0).await?;
     world.outcome(
         "the first enrollment, sent again",
@@ -243,12 +316,14 @@ pub async fn provider_loss_in_place(world: &World) -> FlowResult {
         return Err(format!("the conflict is signed with {signed_with:?}").into());
     }
     world.advance_ms(STEP_MS);
+    follow_recovery(world, &mut wallet, 1).await?;
 
     let ending = signer.end_staged_admission().await;
     world.outcome(
         "the signer ended the staged admission",
         &json!({ "ended": ended(&ending), "signer": status(&signer)? }),
     );
+    expect_admission_ended(world, &ending)?;
     world.advance_ms(STEP_MS);
     let next = signer.set_record_max_age(Some(60)).await?;
     world.outcome("the signer signed on", &recovered(&next, &signer)?);
@@ -378,11 +453,14 @@ pub async fn provider_loss_refusals_in_transit(world: &World) -> FlowResult {
 /// A restore in the middle of a recovery. alice's service is lost with a revocation of her
 /// wallet still pending, which it never took. Her signer declares the loss, and the
 /// recovery's first document doesn't reach the new service. The install is gone then; a new
-/// one is restored from the signer backup on the Homeserver. It completes the recovery at
-/// the new service, revokes the wallet there, and delivers the version that removes it.
+/// one is restored from the signer backup on the Homeserver. The restore itself completes
+/// the recovery at the new service, signs the version naming the new install, and revokes
+/// the wallet there. A run after it finds nothing owed. Completing the removals then
+/// delivers the version that removes the wallet, and ends the staged admission.
 ///
-/// Calls: `POST /v1/enroll` and `PUT /v1/{id}/identity` of a recovery by a restored
-/// install, `POST /v1/{id}/apps/{app_id}/revoke` and the removal at the new service.
+/// Calls: `PUT /v1/{id}/identity` of a recovery by a restored install, `POST
+/// /v1/{id}/apps/{app_id}/revoke`, the removal and `POST /v1/{id}/recovery/admission` at
+/// the new service.
 ///
 /// # Errors
 ///
@@ -423,18 +501,28 @@ pub async fn provider_loss_restored(world: &World) -> FlowResult {
         UserConfirmed::shown_and_confirmed(),
     )
     .await?;
-    world.outcome("a new install was restored", &status(&restored)?);
+    world.outcome(
+        "a new install was restored: it completed the recovery and revoked the wallet",
+        &status(&restored)?,
+    );
+    let revocation = "{alice} POST /v1/{alice}/apps/{alice/wallet}/revoke";
+    let revoked = world.last_fact(revocation, "status");
     world.advance_ms(STEP_MS);
+    let sent = world.requests_sent();
     let resumed = restored.resume().await;
     world.outcome(
-        "the restored install completed the recovery",
-        &json!({ "ended": ended(&resumed), "signer": status(&restored)? }),
+        "the restored install's next run, nothing owed",
+        &json!({
+            "ended": ended(&resumed),
+            "requests": world.requests_sent() - sent,
+            "signer": status(&restored)?,
+        }),
     );
     world.advance_ms(STEP_MS);
     let removed = restored.complete_removals().await?;
     let newest = restored.identity_doc()?;
     world.outcome(
-        "the restored install carried out the revocation",
+        "the restored install removed the wallet and ended the staged admission",
         &json!({
             "all_removed": removed,
             "apps": newest.as_ref().map(|doc| doc.body().apps.len()),
@@ -445,9 +533,12 @@ pub async fn provider_loss_restored(world: &World) -> FlowResult {
     if world.faults_left() != 0 {
         return Err("a fault met no request".into());
     }
-    // The wallet is revoked at the new service, and the newest version removes it.
-    let revocation = "{alice} POST /v1/{alice}/apps/{alice/wallet}/revoke";
-    let revoked = world.last_answer(revocation).map(|[status, _, _]| status);
+    // The wallet was revoked at the new service by the restore, the newest version removes
+    // it, and the staged admission is ended.
+    let admission = world.last_fact("{alice} POST /v1/{alice}/recovery/admission", "status");
+    if admission.as_deref() != Some("200") {
+        return Err(format!("the end of the staged admission was answered {admission:?}").into());
+    }
     let listed = newest.as_ref().map(|doc| doc.body().apps.len());
     let gone = newest.as_ref().map(|doc| doc.body().removed.len());
     if revoked.as_deref() != Some("200") || listed != Some(0) || gone != Some(1) || !removed {
