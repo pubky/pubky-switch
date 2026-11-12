@@ -427,6 +427,50 @@ async fn test_recovery_in_place_starts_afresh_under_the_pending_key() {
 }
 
 #[tokio::test]
+async fn test_recovery_in_place_answers_a_held_feed_read_503_as_the_operator() {
+    // A feed read held when the account recovers in place: the recovery's commit wakes it,
+    // and it is answered `503 unavailable` with the operator key, with no head: the
+    // outgoing key signs nothing more, and the new generation's state isn't the read's
+    // (Switch wire 7.4.4, spec 12.6 step 1).
+    let Some(replay) = replay().await else { return };
+    let (pending, at) = serving_with_a_pending_key(&replay).await;
+    let tip = chain(&replay).await.last().map_or(0, |(_, seq, _)| *seq);
+    let before = held(&replay).await;
+    let (stop, task) = listen(&replay).await;
+    let keys = vectors("keys.json");
+    let path = format!("/v1/{}/feed?after=1:{tip}&wait=10", alice_id());
+    let request = app_request(app(&keys, "wallet"), "GET", &path, Vec::new(), at);
+    let request_signature = signature_of(&request);
+    let started = std::time::Instant::now();
+    let waiting = replay.service.handle(request);
+    let (answer, delivered) = tokio::join!(waiting, async {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        deliver(
+            &replay,
+            next_generation(&before, pending, Some(1)),
+            Some(before.hash()),
+            at,
+        )
+        .await
+    });
+    assert_eq!(delivered.0.status, 200, "the recovery");
+    assert_eq!(code(&answer), (503, "unavailable".into()));
+    assert!(
+        json_of(&answer).get("head").is_none(),
+        "{}",
+        json_of(&answer)
+    );
+    // Woken by the recovery, not by the end of its wait.
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    // Neither generation's key signs it: the operator's does.
+    assert!(signed_by(&answer, &operator_public(), &request_signature));
+    assert!(!signed_by(&answer, &pending, &request_signature));
+    let _ = stop.send(());
+    task.await.expect("listener");
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
 async fn test_recovery_in_place_retires_the_outgoing_keys_enrollments() {
     // After the change, the enrollment the outgoing key answered is `409 conflict`, signed
     // with the operator key, so its signer enrolls anew; the one the pending key answered
