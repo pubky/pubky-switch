@@ -964,6 +964,9 @@ async fn test_records_deleted_key_every_reader_passed_is_forgotten() {
         1,
         "not before the minute's sweep"
     );
+    // A request in the same minute as the last sweep sweeps nothing.
+    let answer = get_as(&replay, "phone", &format!("records/{}", b64(&key))).await;
+    assert_eq!(body(&answer)["deleted"], true, "once a minute");
     next_minute(&replay);
     let answer = get_as(&replay, "phone", &format!("records/{}", b64(&key))).await;
     assert_eq!(code_of(&answer), (404, json!("not_found")));
@@ -1154,8 +1157,10 @@ async fn test_records_deleted_key_taken_from_an_upload_is_kept() {
     let Some(replay) = registered(Limits::default()).await else {
         return;
     };
-    let (key, deleted_at) = created_and_deleted(&replay, 1, b"gone").await;
-    as_uploaded(&replay, &key, deleted_at, false).await;
+    let (key, uploaded_at) = created_and_deleted(&replay, 1, b"gone").await;
+    as_uploaded(&replay, &key, uploaded_at, false).await;
+    // A delete written here beside it, which the same sweep forgets.
+    let (here, deleted_at) = created_and_deleted(&replay, 3, b"here").await;
     move_cursor(&replay, "wallet", deleted_at, AT).await;
     move_cursor(&replay, "phone", deleted_at, AT).await;
     next_minute(&replay);
@@ -1167,5 +1172,10 @@ async fn test_records_deleted_key_taken_from_an_upload_is_kept() {
         String::from_utf8_lossy(&answer.body)
     );
     assert_eq!(record_rows(&replay, &key).await, 1);
+    assert_eq!(
+        record_rows(&replay, &here).await,
+        0,
+        "the one written here goes"
+    );
     replay.db.drop_database().await.expect("drop");
 }
