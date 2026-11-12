@@ -9,6 +9,7 @@
 //! routes.
 
 mod admission;
+mod awaiting;
 mod claim;
 mod collections;
 mod enrollment;
@@ -40,6 +41,7 @@ use std::pin::Pin;
 use pubky_switch::http::route::Call;
 
 pub use admission::{deny_list, invite_code};
+pub use awaiting::awaiting_key;
 pub use claim::claim;
 pub use collections::two_collections;
 pub use enrollment::enrollment;
@@ -144,6 +146,7 @@ pub const FLOWS: &[(&str, Flow)] = &[
     ("renewed twice", |world| Box::pin(renewed_twice(world))),
     ("own record", |world| Box::pin(own_record(world))),
     ("third epoch", |world| Box::pin(third_epoch(world))),
+    ("awaiting a key", |world| Box::pin(awaiting_key(world))),
     ("third epoch, three readers", |world| {
         Box::pin(epochs_three_readers(world))
     }),
