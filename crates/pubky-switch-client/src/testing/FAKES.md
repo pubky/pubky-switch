@@ -108,8 +108,11 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   drops the stubs behind it that every current app's cursor has passed or that are
   `cursor_hold_ms` old, never inside a batch and at most `per_request` at a time. It differs
   in one way: an app that hasn't moved its cursor yet holds the stubs from the time the switch
-  took its first record, not from its registration's `seq`. `set_retention(None)` keeps every
-  stub, and a test may still script a checkpoint and the stubs dropped by hand;
+  took its first record, not from its registration's `seq`; an app `identity.json` lists that
+  has no row here yet holds nothing, as for the service. Retention is on by default, for every
+  test: none reaches 1,000 chain items unless it means to. `set_retention(None)` keeps every
+  stub, and a test may still script a checkpoint and the stubs dropped by hand. Once the
+  service retains too, the harness comparison is what shows the two agree;
   claims are deleted only when `GET /claims` finds them deletable; batch records are never
   dropped, and their proofs go only when a retry finds them past `batch_proofs_ms`.
 - **Invite codes**: a revoked app's codes aren't withdrawn (Switch wire 7.4.3 "After a

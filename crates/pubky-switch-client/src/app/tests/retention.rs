@@ -191,7 +191,11 @@ async fn test_retention_drops_nothing_past_the_latest_checkpoint() {
     wallet.receive(None).await.unwrap();
     let (checkpoint, dropped) = w.switch.retained();
     let checkpoint = checkpoint.unwrap();
-    assert!(dropped <= checkpoint.seq, "dropped {dropped} past {}", checkpoint.seq);
+    assert!(
+        dropped <= checkpoint.seq,
+        "dropped {dropped} past {}",
+        checkpoint.seq
+    );
     assert_eq!(checkpoint.seq, first.seq, "no new checkpoint for two items");
 }
 
