@@ -12,6 +12,7 @@ use pubky_switch_signer::{Alert, CertChange, Signer, UserConfirmed};
 use serde_json::{Value, json};
 
 use super::enrollment::{enroll, status};
+use super::handover::expect_delivery_refused;
 use super::messaging::joined;
 use super::{ORIGIN, STEP_MS};
 use crate::store::KeptCommits;
@@ -484,6 +485,79 @@ pub async fn signer_restore_revocation(world: &World) -> FlowResult {
             newest.body().apps.len()
         )
         .into());
+    }
+    Ok(())
+}
+
+/// Two new installs restored at once (Switch wire 3.13, 7.4.2). alice's signer install is
+/// gone. Two new installs are restored from its backup at the same moment, each on a
+/// device of its own: each reads the same newest version and signs the next one, naming
+/// itself. The first one's delivery is held back on its way; the second one's arrives and
+/// is taken. The first then arrives: another body at the version the switch holds, and is
+/// refused. The second install signs for the identity.
+///
+/// Calls: `PUT /v1/{id}/identity` with another body at the held version (`409 stale_identity`).
+///
+/// # Errors
+///
+/// When a step that should succeed against any switch fails, the delivery that arrives
+/// second isn't refused, or the install whose delivery arrived first isn't the signer.
+pub async fn signer_two_installs_race(world: &World) -> FlowResult {
+    let alice = world.identity("alice")?;
+    world.add_switch(ORIGIN, &[&alice]).await?;
+    let mut old = enroll(world, &alice, ORIGIN).await?;
+    let (_wallet, _) = joined(world, &alice, &mut old, "wallet").await?;
+    let before = old.identity_doc()?.ok_or("the signer holds no document")?;
+    drop(old);
+
+    let restore = |world: &World| -> Result<_, Box<dyn std::error::Error>> {
+        let env = world.signer_env(&alice, Arc::new(MemoryStore::new()))?;
+        Ok(Signer::restore_new(
+            env,
+            world.keyring(&alice)?,
+            UserConfirmed::shown_and_confirmed(),
+        ))
+    };
+    world.hold_back_next("PUT", "/identity");
+    let held = restore(world)?;
+    let through = restore(world)?;
+    let second = async {
+        // Once the first install's delivery is on its way and held.
+        while world.held_back_now() == 0 {
+            tokio::task::yield_now().await;
+        }
+        let restored = through.await;
+        world.let_go();
+        restored
+    };
+    let both = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        futures_util::future::join(held, second),
+    );
+    let raced = both.await;
+    world.let_go();
+    let Ok((late, winner)) = raced else {
+        return Err("the two restores didn't both end".into());
+    };
+    let winner = winner?;
+    let taken = winner
+        .identity_doc()?
+        .ok_or("the winner holds no document")?;
+    world.outcome(
+        "one restore's delivery arrived first, the other's after it",
+        &json!({
+            "late": ended(&late.as_ref().map(|_| ())),
+            "version_steps": taken.version() - before.version(),
+            "names_the_winner": taken.body().signer == winner.install_id(),
+            "winner": status(&winner)?,
+        }),
+    );
+    expect_delivery_refused(world)?;
+    if taken.version() != before.version() + 1
+        || taken.body().signer != winner.install_id()
+        || published(world, &alice) != Some(taken.version())
+    {
+        return Err("the install whose delivery arrived first isn't the signer".into());
     }
     Ok(())
 }
