@@ -17,7 +17,9 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   another identity is the `Switch-Identity` header as sent. A `Switch-Timestamp` more than 5
   minutes from the switch's clock is `401 stale_timestamp`, with `current.server_time` and
   the last stamped time in `Switch-Server-Time`, as at the service; a missing or unparsable
-  one isn't refused. Every other request stamps the clock's time. Answers to own apps and
+  one isn't refused. An enrollment's timestamp is checked the same way, before the
+  enrollment is looked at, and its `401` is the operator's, with the clock's time in both
+  places. Every other request stamps the clock's time. Answers to own apps and
   the signer carry `Switch-Head`, refusals included, but a `401`, the enrollment and the
   erasure. An injected `401` fault is answered as before the lock, with the last stamped
   time and no head; other injected faults with the clock's time and the head. A request an

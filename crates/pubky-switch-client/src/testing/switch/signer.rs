@@ -898,6 +898,78 @@ mod tests {
     }
 
     #[test]
+    fn test_scripted_stale_enrollment_is_refused_before_it_is_looked_at() {
+        // As at the service: an enrollment whose timestamp is more than 5 minutes from the
+        // switch's time is `401 stale_timestamp`, signed with the operator key, whether it
+        // is new or the switch holds its answer (Switch wire 7.1, 7.4.1).
+        let identity = pubky_switch_core::keys::IdentityKey::from_secret([1; 32]);
+        let now = 1_700_000_000_000;
+        let clock = Arc::new(crate::clock::TestClock::new(now));
+        let switch =
+            ScriptedSwitch::unenrolled_at(&identity, [2; 32], clock.clone(), SWITCH_ORIGIN);
+        let body = pubky_switch_core::records::EnrollmentBody {
+            identity: identity.public(),
+            origin: SWITCH_ORIGIN.to_owned(),
+            nonce: [1; 16],
+            policy: pubky_switch_core::records::IdentityPolicy::default(),
+            identity_doc: None,
+            revoked_apps: None,
+        };
+        let enrollment = Enrollment::sign(&identity, body).unwrap();
+        let sent_at = |at: u64| crate::transport::Request {
+            method: "POST".into(),
+            origin: SWITCH_ORIGIN.into(),
+            path_and_query: "/v1/enroll".into(),
+            headers: vec![crate::transport::Header::new(
+                pubky_switch_core::http::header::TIMESTAMP,
+                &pubky_switch_core::time::rfc3339(at),
+            )],
+            body: json!({ "enrollment": enrollment.signed() })
+                .to_string()
+                .into_bytes(),
+        };
+        let refused = |answer: &crate::transport::Response| {
+            let body: Value = serde_json::from_slice(&answer.body).unwrap();
+            let signature = pubky_switch_core::enc::unb64_array::<64>(
+                answer
+                    .header(pubky_switch_core::http::header::SERVICE_SIGNATURE)
+                    .unwrap(),
+            )
+            .unwrap();
+            let operator = ed25519_dalek::SigningKey::from_bytes(&[42; 32]);
+            let by_operator = pubky_switch_core::http::verify_response(
+                &operator.verifying_key().to_bytes(),
+                answer.status,
+                None,
+                answer
+                    .header(pubky_switch_core::http::header::SERVER_TIME)
+                    .unwrap(),
+                &answer.body,
+                &signature,
+            )
+            .is_ok();
+            (
+                answer.status,
+                body["code"].as_str().map(str::to_owned),
+                by_operator,
+            )
+        };
+        let tolerance = pubky_switch_core::records::CLOCK_TOLERANCE_MS;
+        let stale = switch.handle(&sent_at(now - tolerance - 1_000)).unwrap();
+        assert_eq!(refused(&stale), (401, Some("stale_timestamp".into()), true));
+        assert!(switch.lock().enrolled.is_none(), "nothing was enrolled");
+        // At the edge of the window it is taken.
+        assert_eq!(
+            switch.handle(&sent_at(now - tolerance)).unwrap().status,
+            200
+        );
+        // The same enrollment once its timestamp is stale: its kept answer isn't given.
+        clock.advance_ms(2_000);
+        let again = switch.handle(&sent_at(now - tolerance)).unwrap();
+        assert_eq!(refused(&again), (401, Some("stale_timestamp".into()), true));
+    }
+
+    #[test]
     fn test_scripted_recovery_in_place_retires_the_outgoing_keys_enrollments() {
         // As at the service: after a recovery in place under the pending key, the enrollment
         // the outgoing key answered is `409 conflict`, and the one the pending key answered

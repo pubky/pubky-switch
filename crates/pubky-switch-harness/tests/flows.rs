@@ -426,12 +426,9 @@ async fn test_every_served_call_is_listed_and_sent_by_its_flow() {
     // land, and a call that starts being served must be added to it or given a flow.
     assert_eq!(
         waiting,
-        // The signer sends the first, and its apps the second, in its provider-loss flow,
-        // which isn't built yet.
-        vec![
-            "POST /v1/{id}/recovery/admission".to_owned(),
-            "POST /v1/{id}/recovery/upload".to_owned(),
-        ],
+        // Its apps send it in the provider-loss flows, whose uploads wait for this call to be
+        // served.
+        vec!["POST /v1/{id}/recovery/upload".to_owned()],
         "the served calls no flow sends yet"
     );
 }
