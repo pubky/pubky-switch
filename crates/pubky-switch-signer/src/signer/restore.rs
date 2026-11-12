@@ -319,7 +319,8 @@ impl Signer {
             .alerts
             .iter()
             // The count of untaken renewals starts again from none, and the alert it raised
-            // goes with it (Switch spec 3.1).
+            // goes with it (Switch spec 3.1). A refused renewal's alert goes too: the restored
+            // version's certificate shows what the app holds (Switch spec 3.2).
             .filter(|a| {
                 !matches!(
                     a,
@@ -327,6 +328,7 @@ impl Signer {
                         | Alert::ManagedByOtherInstall { .. }
                         | Alert::RenewalsStopped { .. }
                         | Alert::LapsingWithOpenAttempts { .. }
+                        | Alert::RenewalRefused { .. }
                 )
             })
             .cloned()

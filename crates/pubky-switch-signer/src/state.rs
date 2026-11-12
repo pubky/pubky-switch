@@ -13,9 +13,10 @@
 use pubky_switch_client::store::{StoreHandle, WriteBatch};
 use pubky_switch_core::enc::zbase32_encode;
 use pubky_switch_core::records::{
-    DEFAULT_CERT_LIFETIME_MS, IdentityDoc, IdentityPolicy, Limits, SignerBackup, SignerHandover,
-    StoredPart,
+    AppCert, DEFAULT_CERT_LIFETIME_MS, IdentityDoc, IdentityPolicy, Limits, SignerBackup,
+    SignerHandover, StoredPart,
 };
+use pubky_switch_core::scopes;
 use pubky_switch_core::sig::SignedDoc;
 use serde::{Deserialize, Serialize};
 
@@ -34,6 +35,143 @@ const FLOW_KEY: &[u8] = b"flow";
 /// The signer's namespace for an identity: `signer/<identity>`.
 pub fn signer_namespace(identity: &[u8; 32]) -> String {
     format!("{SIGNER_NAMESPACE_PREFIX}{}", zbase32_encode(identity))
+}
+
+/// What the user asked of an app's renewal that didn't happen (Switch spec 3.2): the scopes
+/// and switch permissions to remove and an earlier expiry, which make it a reduction, and
+/// the scopes to add and a later expiry. A second one the user asks for the same app adds to
+/// it, its parts standing where the two contradict.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct AskedRenewal {
+    /// The app.
+    pub(crate) app_id: [u8; 16],
+    /// The scopes the user asked to remove.
+    pub(crate) remove: Vec<String>,
+    /// The switch permissions the user's renewal would have removed, by name.
+    #[serde(default)]
+    pub(crate) remove_permissions: Vec<String>,
+    /// The earliest expiry the user asked for, when earlier than the certificate's.
+    pub(crate) expires_by: Option<u64>,
+    /// The scopes the user asked to add.
+    pub(crate) add: Vec<String>,
+    /// The switch permissions the user's renewal would have added, by name.
+    #[serde(default)]
+    pub(crate) add_permissions: Vec<String>,
+    /// The latest expiry the user asked for, when later than the certificate's.
+    pub(crate) expires_from: Option<u64>,
+}
+
+impl AskedRenewal {
+    /// What renewing `old` into `new` asks of the app `app_id`.
+    pub(crate) fn between(app_id: [u8; 16], old: &AppCert, new: &AppCert) -> Self {
+        let missing = |held: &AppCert, from: &AppCert| -> Vec<String> {
+            from.scopes()
+                .iter()
+                .filter(|scope| !scopes::holds(held.scopes(), scope))
+                .cloned()
+                .collect()
+        };
+        Self {
+            app_id,
+            remove: missing(new, old),
+            remove_permissions: old
+                .permissions()
+                .iter()
+                .filter(|permission| !new.has_permission(**permission))
+                .map(|permission| permission.as_str().to_owned())
+                .collect(),
+            expires_by: (new.expires_at() < old.expires_at()).then(|| new.expires_at()),
+            add: missing(old, new),
+            add_permissions: new
+                .permissions()
+                .iter()
+                .filter(|permission| !old.has_permission(**permission))
+                .map(|permission| permission.as_str().to_owned())
+                .collect(),
+            expires_from: (new.expires_at() > old.expires_at()).then(|| new.expires_at()),
+        }
+    }
+
+    /// Add what `later`, the user's newer request, asks. Where the two contradict, the newer
+    /// stands: a scope or permission it asks to add leaves those to remove, and one it asks
+    /// to remove those to add; a later expiry it asks ends the earlier one asked, and an
+    /// earlier one the later. Parts that don't contradict add up: every scope and permission
+    /// either asks to remove or to add, the earlier of two earlier expiries and the later of
+    /// two later ones.
+    pub(crate) fn merge(&mut self, later: &AskedRenewal) {
+        self.remove.retain(|scope| !later.add.contains(scope));
+        self.add.retain(|scope| !later.remove.contains(scope));
+        self.remove_permissions
+            .retain(|permission| !later.add_permissions.contains(permission));
+        self.add_permissions
+            .retain(|permission| !later.remove_permissions.contains(permission));
+        for scope in &later.remove {
+            if !self.remove.contains(scope) {
+                self.remove.push(scope.clone());
+            }
+        }
+        for permission in &later.remove_permissions {
+            if !self.remove_permissions.contains(permission) {
+                self.remove_permissions.push(permission.clone());
+            }
+        }
+        for scope in &later.add {
+            if !self.add.contains(scope) {
+                self.add.push(scope.clone());
+            }
+        }
+        for permission in &later.add_permissions {
+            if !self.add_permissions.contains(permission) {
+                self.add_permissions.push(permission.clone());
+            }
+        }
+        if later.expires_from.is_some() {
+            self.expires_by = None;
+        }
+        if later.expires_by.is_some() {
+            self.expires_from = None;
+        }
+        self.expires_by = match (self.expires_by, later.expires_by) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        self.expires_from = match (self.expires_from, later.expires_from) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+    }
+
+    /// Whether the user asked to reduce the app: to remove a scope or a switch permission, or
+    /// to expire it earlier (Switch wire 3.8 "Reductions").
+    pub(crate) fn reduction(&self) -> bool {
+        !self.remove.is_empty() || !self.remove_permissions.is_empty() || self.expires_by.is_some()
+    }
+
+    /// Whether `cert` holds what the user asked: for a reduction, none of the scopes to
+    /// remove, by the scope hierarchy, none of the switch permissions to remove, and an expiry
+    /// no later than asked; otherwise every scope to add and an expiry no earlier than asked,
+    /// when something was asked.
+    pub(crate) fn met_by(&self, cert: &AppCert) -> bool {
+        if self.reduction() {
+            self.remove
+                .iter()
+                .all(|scope| !scopes::holds(cert.scopes(), scope))
+                && self.remove_permissions.iter().all(|name| {
+                    scopes::Permission::from_name(name)
+                        .is_none_or(|permission| !cert.has_permission(permission))
+                })
+                && self.expires_by.is_none_or(|by| cert.expires_at() <= by)
+        } else {
+            (!self.add.is_empty() || self.expires_from.is_some())
+                && self
+                    .add
+                    .iter()
+                    .all(|scope| scopes::holds(cert.scopes(), scope))
+                && self
+                    .expires_from
+                    .is_none_or(|from| cert.expires_at() >= from)
+        }
+    }
 }
 
 /// The switch the identity is enrolled at (Switch wire 3.7).
@@ -224,6 +362,17 @@ pub(crate) struct SignerState {
     /// find the service (Switch spec 12.6 step 1).
     #[serde(default)]
     pub(crate) revoke_at_service: bool,
+    /// The renewals the user asked for, each as its app and the new certificate's hash, whose
+    /// flow is in progress: one delivered ends that app's [`Alert::RenewalRefused`] for a
+    /// renewal that reduced nothing, as the user's newest choice, and one refused is the
+    /// user's, with what it asked (Switch spec 3.2). Emptied once the flow ends.
+    #[serde(default)]
+    pub(crate) user_renewals: Vec<([u8; 16], [u8; 32])>,
+    /// What the user asked of each renewal that didn't happen, beside its
+    /// [`Alert::RenewalRefused`]: whether the alert holds is judged from the certificate
+    /// `identity.json` lists against it (Switch spec 3.2). One per app; it goes with the alert.
+    #[serde(default)]
+    pub(crate) asked_renewals: Vec<AskedRenewal>,
     /// Some version of the identity was published on the Homeserver, by this install or,
     /// for records restored or received, by the install they came from (Switch spec 4.3). A
     /// missing `identity.json` is explained without it only by an erasure (Switch spec 12.6
@@ -450,6 +599,8 @@ impl SignerState {
             lost_generation: None,
             homeserver_copy_waived: false,
             revoke_at_service: false,
+            user_renewals: Vec::new(),
+            asked_renewals: Vec::new(),
             ever_published: false,
             recovery_origin: None,
             recovery_services: Vec::new(),

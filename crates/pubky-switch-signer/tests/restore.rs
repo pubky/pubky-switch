@@ -1250,3 +1250,46 @@ async fn test_restore_in_place_starts_the_untaken_renewals_again() {
     world.clock.advance_ms(365 * DAY_MS / 2 + DAY_MS);
     assert_eq!(signer.renew_expiring().await.unwrap(), [id]);
 }
+
+#[tokio::test]
+async fn test_restore_brings_back_no_refused_renewal() {
+    // A reduction refused for good raised `RenewalRefused`. A restore, in place or on a new
+    // install, doesn't bring it back: the restored version's certificate shows what the app
+    // holds, both its scopes here (Switch spec 3.2, 12.8).
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let app = App::with_keys(
+        AppKeys::from_secrets([3; 32], [4; 32]),
+        &["notes", "notes_sync"],
+        None,
+        [9; 32],
+    );
+    world.approve(&mut signer, &app).await;
+    let id = app.keys.app_id_bytes();
+    world.switch.fail_next(SwitchFault::Error {
+        path: "/ops".into(),
+        code: ErrorCode::Conflict,
+        current: serde_json::Value::Null,
+    });
+    let reduce = CertChange {
+        scopes: Some(vec!["notes_sync".into()]),
+        expires_at: None,
+    };
+    signer.renew(id, reduce).await.unwrap_err();
+    let refused = |signer: &Signer| {
+        signer
+            .alerts()
+            .iter()
+            .any(|a| matches!(a, Alert::RenewalRefused { .. }))
+    };
+    assert!(refused(&signer));
+    let listed = signer.identity_doc().unwrap().unwrap().listed_cert(&id);
+    signer.restore(confirmed()).await.unwrap();
+    assert!(!refused(&signer), "in place");
+    let restored = restored(&world).await.unwrap();
+    assert!(!refused(&restored), "on a new install");
+    assert_eq!(
+        restored.identity_doc().unwrap().unwrap().listed_cert(&id),
+        listed
+    );
+}
