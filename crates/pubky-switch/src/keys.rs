@@ -91,6 +91,14 @@ impl KeyId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// A new random ID, for a key whose deletion is owed before it exists
+    /// ([`KeyStore::generate_as`]).
+    pub fn random() -> Result<Self, KeyStoreError> {
+        let mut raw = [0u8; 16];
+        getrandom::fill(&mut raw).map_err(|_| KeyStoreError::Random)?;
+        Ok(Self(hex::encode(raw)))
+    }
 }
 
 impl TryFrom<String> for KeyId {
@@ -205,6 +213,12 @@ pub type KeyFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, KeyStoreError>
 pub trait KeyStore: Send + Sync {
     /// Generate a new service key.
     fn generate(&self) -> KeyFuture<'_, ServiceKey>;
+
+    /// Generate a new key under `id`, an ID the caller chose ([`KeyId::random`]), so the
+    /// caller can owe its deletion durably before it exists: a push key (Switch wire 8.1),
+    /// which never gets a mark and whose deletion records no erasure. An `id` already in use
+    /// is refused.
+    fn generate_as<'a>(&'a self, id: &'a KeyId) -> KeyFuture<'a, ServiceKey>;
 
     /// The public key of `id`.
     fn public_key<'a>(&'a self, id: &'a KeyId) -> KeyFuture<'a, [u8; 32]>;
@@ -427,11 +441,12 @@ impl Inner {
     }
 
     fn generate_sync(&self) -> Result<ServiceKey, KeyStoreError> {
+        self.generate_as_sync(KeyId::random()?)
+    }
+
+    fn generate_as_sync(&self, id: KeyId) -> Result<ServiceKey, KeyStoreError> {
         let mut seed = Zeroizing::new([0u8; 32]);
         getrandom::fill(seed.as_mut()).map_err(|_| KeyStoreError::Random)?;
-        let mut raw = [0u8; 16];
-        getrandom::fill(&mut raw).map_err(|_| KeyStoreError::Random)?;
-        let id = KeyId(hex::encode(raw));
         write_atomic(&self.key_path(&id), seed.as_ref(), true)?;
         let key = SigningKey::from_bytes(&seed);
         let public = key.verifying_key().to_bytes();
@@ -562,6 +577,12 @@ impl KeyStore for FileKeyStore {
     fn generate(&self) -> KeyFuture<'_, ServiceKey> {
         let store = self.inner.clone();
         Box::pin(blocking(move || store.generate_sync()))
+    }
+
+    fn generate_as<'a>(&'a self, id: &'a KeyId) -> KeyFuture<'a, ServiceKey> {
+        let store = self.inner.clone();
+        let id = id.clone();
+        Box::pin(blocking(move || store.generate_as_sync(id)))
     }
 
     fn public_key<'a>(&'a self, id: &'a KeyId) -> KeyFuture<'a, [u8; 32]> {
@@ -736,6 +757,10 @@ impl KeyStore for FixedKeys {
             }
             None => self.store.generate(),
         }
+    }
+
+    fn generate_as<'a>(&'a self, id: &'a KeyId) -> KeyFuture<'a, ServiceKey> {
+        self.store.generate_as(id)
     }
 
     fn public_key<'a>(&'a self, id: &'a KeyId) -> KeyFuture<'a, [u8; 32]> {
@@ -992,6 +1017,25 @@ mod tests {
         assert!(matches!(
             sign_head(&signer, Some(&marked), &identity, &other),
             Err(KeyStoreError::Refused(MarkCheck::OtherGeneration))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_key_store_generate_as_takes_the_id_once() {
+        // A key generated under an ID the caller chose, owed before it exists: signs, has no
+        // mark, and a second key under the same ID is refused.
+        let (_dir, store) = open();
+        let id = KeyId::random().expect("id");
+        let key = store.generate_as(&id).await.expect("generate");
+        assert_eq!(key.id, id);
+        assert_eq!(store.public_key(&id).await.expect("public"), key.public);
+        assert_eq!(store.mark(&id).await.expect("mark"), None);
+        assert!(store.generate_as(&id).await.is_err());
+        assert_eq!(store.public_key(&id).await.expect("public"), key.public);
+        store.delete(&id).await.expect("delete");
+        assert!(matches!(
+            store.public_key(&id).await,
+            Err(KeyStoreError::NotFound)
         ));
     }
 

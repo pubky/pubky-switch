@@ -79,8 +79,9 @@ before, 24 hours after the first. Both erasure flows run that wait, and a read s
 
 The flows send every call the service serves, each at both switches. What they leave out:
 
-- **Calls the service doesn't serve yet**, eight of the thirty-three of Switch wire 7.4:
-  `PUT /push`, `POST /freeze` and `/unfreeze`, `GET /export` and its chunks, and `POST
+- **`PUT /push`**, served, which no flow sends yet.
+- **Calls the service doesn't serve yet**, seven of the thirty-three of Switch wire 7.4:
+  `POST /freeze` and `/unfreeze`, `GET /export` and its chunks, and `POST
   /import` with its chunks and activation. So no flow moves an account or changes its key in place, and no upload is
   sent in a cooperative move. `flows::flow_of` lists them, and the test fails once one is
   served without a flow.

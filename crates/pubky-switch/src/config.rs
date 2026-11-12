@@ -28,6 +28,24 @@ pub struct Config {
     pub database: DatabaseConfig,
     /// The key store.
     pub keys: KeysConfig,
+    /// Push (Switch wire 8).
+    pub push: PushConfig,
+}
+
+/// Push (Switch spec 9, Switch wire 8). The service keeps registrations; it sends no
+/// webhook to a relay yet.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PushConfig {
+    /// Take push registrations (`PUT /v1/{id}/push`); off, every one is answered `400`, as
+    /// a service that sends no pushes answers (Switch wire 8.1).
+    pub enabled: bool,
+}
+
+impl Default for PushConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
 }
 
 /// The operator listener, which serves health checks and metrics. Keep it off the public
