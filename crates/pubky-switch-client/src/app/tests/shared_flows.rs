@@ -6192,3 +6192,38 @@ async fn test_records_owed_listing_waiting_for_a_key_hands_nothing_over() {
     assert_eq!(handed(&s, &note.msg_id), 1);
     assert!(app.cursor().seq >= seq);
 }
+
+/// `listing_owed` is true from a join, a restore and a `missed` item until a listing runs:
+/// while it is, a record's absence from the copy decides nothing.
+#[tokio::test]
+async fn test_records_listing_owed_until_a_listing_runs() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    assert!(app.listing_owed().await.unwrap(), "after joining");
+    app.receive(None).await.unwrap();
+    assert!(
+        !app.listing_owed().await.unwrap(),
+        "after the first read's listing"
+    );
+    // A missed item whose listing fails: still owed.
+    s.w.switch.push_missed(3, START, START + 1);
+    s.w.switch.fail_next(Fault::Unreachable {
+        path: "records?collection".into(),
+        after: 0,
+    });
+    app.receive(None).await.unwrap_err();
+    assert!(app.listing_owed().await.unwrap(), "after a missed item");
+    app.receive(None).await.unwrap();
+    assert!(!app.listing_owed().await.unwrap(), "after the listing ran");
+    // A restore owes one too.
+    let backup = app.backup().await.unwrap();
+    let restored = App::restore(
+        s.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
+        s.protocol.clone(),
+        World::config(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    assert!(restored.listing_owed().await.unwrap(), "after a restore");
+}

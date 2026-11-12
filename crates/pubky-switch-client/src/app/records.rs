@@ -977,6 +977,20 @@ impl App {
         .await
     }
 
+    /// Whether a listing of the collections is owed (`list_due`): from joining or a restore,
+    /// a certificate taken that reads a collection the one before didn't, a `missed` item, or
+    /// an `upload` transition past [`super::MAX_RECORD_MARKS`], until a listing has run
+    /// (Switch spec 8.2, 8.3, 12.1 step 3). While it is true, the app's copy of the shared
+    /// records may lack records the switch holds: a record's absence from the copy decides
+    /// nothing. Read-only; the app makes the listing itself, at its next read.
+    ///
+    /// # Errors
+    ///
+    /// A store failure.
+    pub async fn listing_owed(&self) -> Result<bool, AppError> {
+        self.reader().exists(LIST_DUE).await
+    }
+
     /// List every collection of the protocol whose read scope the app's certificate holds
     /// (Switch spec 8.3, 12.1 step 3).
     ///
