@@ -431,18 +431,29 @@ impl Signer {
         if !state.recovery_services.contains(&service) {
             state.recovery_services.push(service.clone());
         }
-        // In place, the service may still serve the lost generation under the key the version
-        // the recovery builds on names there (Switch wire 7.4.2): kept from an earlier
-        // declaration or a restore, whatever origin a declaration went to since, since only
-        // the service at its own origin is read under it; else taken from that signed
-        // version. A delivery whose answer shows that key no longer serves drops it.
-        state.recovery_serving = self.state.recovery_serving.clone().or_else(|| {
-            (base.inbox().url == origin && base.generation() == lost).then(|| Service {
-                origin: origin.to_owned(),
-                service_key: base.inbox().service_key,
-                limits: answer.limits,
-            })
-        });
+        // In place, the service may still serve the lost generation under its key there
+        // (Switch wire 7.4.2). A key kept from an earlier declaration or a restore stays, for
+        // whichever origin it was kept for, since only the service at that origin is read
+        // under it. Otherwise it is taken from a signed copy of the lost generation naming
+        // this origin: the version the recovery builds on, or, when that is a restored
+        // recovery's own version, the Homeserver's copy, as the restore takes it (Switch wire
+        // 3.13). A delivery whose answer shows that key no longer serves drops it.
+        state.recovery_serving = match self.state.recovery_serving.clone() {
+            Some(kept) => Some(kept),
+            None => {
+                let earlier = if base.generation() == lost {
+                    (base.inbox().url == origin).then(|| base.inbox().service_key)
+                } else {
+                    self.lost_generations_key_on_homeserver(origin, lost, base.version())
+                        .await?
+                };
+                earlier.map(|service_key| Service {
+                    origin: origin.to_owned(),
+                    service_key,
+                    limits: answer.limits,
+                })
+            }
+        };
         state.service = Some(service);
         state.signed_through = state.signed_through.max(doc.version());
         let flow = Flow::Deliver {
@@ -452,6 +463,30 @@ impl Signer {
             step: DeliverStep::Signed,
         };
         self.commit(state, Some(flow)).await
+    }
+
+    /// The key the service at `origin` served generation `lost` with, as the Homeserver's
+    /// copy of `identity.json` names it: a copy the identity key signed, at that generation,
+    /// naming that origin, below version `below` (Switch wire 3.13). No other copy gives one.
+    pub(super) async fn lost_generations_key_on_homeserver(
+        &self,
+        origin: &str,
+        lost: u64,
+        below: u64,
+    ) -> Result<Option<[u8; 32]>> {
+        let identity = self.state.identity;
+        Ok(self
+            .env
+            .homeserver
+            .get(IDENTITY_PATH)
+            .await
+            .map_err(SignerError::Homeserver)?
+            .and_then(|bytes| serde_json::from_slice::<SignedDoc>(&bytes).ok())
+            .and_then(|signed| IdentityDoc::verify(&signed, &identity).ok())
+            .filter(|copy| {
+                copy.generation() == lost && copy.version() < below && copy.inbox().url == origin
+            })
+            .map(|copy| copy.inbox().service_key))
     }
 
     /// Enroll at the service at `origin` with `signed`, as the errors of `POST /enroll` ask
