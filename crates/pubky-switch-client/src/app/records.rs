@@ -1101,12 +1101,9 @@ impl App {
             view_version: None,
         };
         let key = put.key;
-        // A newer write at this service clears the record's divergent uploads there
-        // (Switch wire 7.4.14); the write held, or one of an earlier generation, which came
-        // with a move, doesn't.
-        if self.read_write(&evidence, None, key, tx).await? == WriteRead::Taken
-            && envelope.generation == self.state.meta.generation
-        {
+        // A newer write clears the record's divergent uploads before it (Switch wire
+        // 7.4.14); the write held doesn't: uploads after it may conflict with it.
+        if self.read_write(&evidence, None, key, tx).await? == WriteRead::Taken {
             self.note_divergent(&key, false, tx).await?;
         }
         Ok(())

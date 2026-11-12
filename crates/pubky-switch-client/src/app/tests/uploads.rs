@@ -249,6 +249,77 @@ async fn test_upload_divergent_record_is_held_divergent_until_a_newer_write() {
 }
 
 #[tokio::test]
+async fn test_upload_divergent_record_is_cleared_by_a_view_that_isnt() {
+    // A view that shows the record no longer divergent clears the flag, with no event.
+    let store = Arc::new(MemoryStore::new());
+    let (lost, mut app) = followed(&store, true).await;
+    let key = upload_fork(&lost, [99; 16]);
+    app.receive(None).await.unwrap();
+    assert!(app.shared_record(&key).await.unwrap().unwrap().divergent);
+    lost.next.lock().shared.divergent.remove(&key);
+    let changes = UploadChanges {
+        records: [key].into(),
+        ..UploadChanges::default()
+    };
+    lost.next.chain_upload(PHONE, changes.to_value()).unwrap();
+    let report = app.receive(None).await.unwrap();
+    assert_eq!(divergent(&report.events, key), 0, "{:?}", report.events);
+    assert!(!app.shared_record(&key).await.unwrap().unwrap().divergent);
+}
+
+#[tokio::test]
+async fn test_upload_divergent_record_stays_through_the_write_it_conflicts_with() {
+    // An upload newer than the version a write at the switch built on conflicts with that
+    // write. The feed then shows the write, which the app holds already from a read: it
+    // clears nothing, since the uploads came after it.
+    let store = Arc::new(MemoryStore::new());
+    let (lost, mut app) = followed(&store, true).await;
+    let (key, kind, version) = {
+        let next = lost.next.lock();
+        let (key, taken) = next.shared.records.iter().next().expect("the record");
+        let op = pubky_switch_core::ops::SignedOp::peek(&taken.op).unwrap();
+        (*key, op.body().kind.clone(), taken.state.version)
+    };
+    // A second device of the app writes the record at the next switch; the app reads it.
+    let target = RecordTarget::new(items(), b"key");
+    let (_, write) = app
+        .record_op(&target, Some(&value(&["c"])), vec![])
+        .await
+        .unwrap();
+    lost.next.app_op(&app_keys("wallet"), write).unwrap();
+    let read = app.read_record_fresh(&target).await.unwrap();
+    assert!(matches!(read, crate::app::RecordRead::Fresh(_)), "{read:?}");
+    // The lost generation's next write, built on the version uploaded: newer than it.
+    let OpKind::RecordPut(mut put) = kind else {
+        unreachable!("a record op");
+    };
+    put.expected_version = version;
+    put.id_inputs = None;
+    let op = sign_batch(
+        &app_keys("wallet"),
+        &lost.w.alice.public(),
+        Some(app_keys("wallet").app_id_bytes()),
+        1,
+        [96; 16],
+        vec![(Vec::new(), OpKind::RecordPut(put))],
+    )
+    .unwrap();
+    let body = json!({ "records": [{ "op": op[0].signed(), "cert": app.cert().signed() }] });
+    let (status, answer) = upload_at_next(&lost, &body.to_string());
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(answer["result"]["divergent"], json!([b64(&key)]));
+    // Read before the feed shows the write: divergent, its event queued for the next read's
+    // report.
+    app.read_record_fresh(&target).await.unwrap();
+    assert!(app.shared_record(&key).await.unwrap().unwrap().divergent);
+    let report = app.receive(None).await.unwrap();
+    // The fresh read's event only: the feed's write didn't clear the flag for the reread
+    // to raise it again.
+    assert_eq!(divergent(&report.events, key), 1, "{:?}", report.events);
+    assert!(app.shared_record(&key).await.unwrap().unwrap().divergent);
+}
+
+#[tokio::test]
 async fn test_upload_divergent_record_is_cleared_by_a_newer_write_in_the_feed() {
     // Another app's newer write at the switch, read from the feed, clears the divergent
     // uploads there, and in the app.
