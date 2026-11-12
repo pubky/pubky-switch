@@ -283,6 +283,11 @@ impl Inner {
         // 7.4.3 step 5, 7.4.10).
         fresh.apps_version = self.apps_version;
         fresh.directory_version = self.directory_version;
+        // What a test set of the switch's configuration stays set, as a service's does.
+        fresh.feed_limit = self.feed_limit;
+        fresh.max_page_bytes = self.max_page_bytes;
+        fresh.keep_passed = self.keep_passed;
+        fresh.open_admission = self.open_admission;
         fresh.faults = std::mem::take(&mut self.faults);
         fresh.kept_at = self.kept_at;
         fresh.kept_app_ids = std::mem::take(&mut self.kept_app_ids);
@@ -1052,6 +1057,10 @@ mod tests {
             inner.upload_counts.insert([5; 16], (1, 3));
             inner.apps_version = 4;
             inner.directory_version = 9;
+            inner.feed_limit = Some(3);
+            inner.max_page_bytes = 4_096;
+            inner.keep_passed = true;
+            inner.open_admission = true;
         }
         let recovery = IdentityDoc::sign(&identity, body).unwrap();
         let delivery = json!({ "identity": recovery.signed(), "prev": null }).to_string();
@@ -1072,6 +1081,9 @@ mod tests {
             // afresh never shows a version it showed before for another set of apps.
             assert_eq!(inner.apps_version, 4);
             assert!(inner.directory_version >= 9, "{}", inner.directory_version);
+            // And so does what a test configured.
+            assert_eq!((inner.feed_limit, inner.max_page_bytes), (Some(3), 4_096));
+            assert!(inner.keep_passed && inner.open_admission);
         }
         let (status, retired) = enroll_at(&switch, &identity, 1, None);
         assert_eq!((status, retired["code"].clone()), (409, json!("conflict")));
