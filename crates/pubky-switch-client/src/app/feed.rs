@@ -425,6 +425,9 @@ impl App {
         }
         self.deliver_record().await?;
         self.ensure_scope_keys().await?;
+        // A reopening a failure left owed, before anything is handed over that may read
+        // the records it opens.
+        self.reopen_if_due().await?;
         self.prune_processed().await?;
         self.retell_restored().await?;
         // The bounds on entries stored unverified go before any is tried again (Switch

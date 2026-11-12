@@ -5256,6 +5256,87 @@ async fn test_records_held_unreadable_opens_once_its_key_arrives() {
     );
 }
 
+/// A store whose commit that ends an owed reopening fails once, while armed.
+struct FailingReopen {
+    inner: MemoryStore,
+    armed: std::sync::atomic::AtomicBool,
+}
+
+impl StateStore for FailingReopen {
+    fn get(&self, ns: &str, key: &[u8]) -> Result<Option<Vec<u8>>, crate::error::StoreError> {
+        self.inner.get(ns, key)
+    }
+
+    fn scan(
+        &self,
+        ns: &str,
+        prefix: &[u8],
+        after: Option<&[u8]>,
+        limit: u32,
+    ) -> Result<Vec<crate::store::KeyValue>, crate::error::StoreError> {
+        self.inner.scan(ns, prefix, after, limit)
+    }
+
+    fn commit(&self, batch: crate::store::WriteBatch) -> Result<(), crate::error::StoreError> {
+        let ends_reopen = batch.writes.iter().any(|write| {
+            matches!(write, crate::store::Write::Delete { key, .. } if key.as_slice() == b"reopen")
+        });
+        if ends_reopen && self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            return Err(crate::error::StoreError::Unavailable);
+        }
+        self.inner.commit(batch)
+    }
+}
+
+/// The reopening a key owes is kept with the key: when its own commit fails after the key
+/// was taken, the next read reopens the record held `Unreadable`, though no fetch takes a
+/// key again.
+#[tokio::test]
+async fn test_records_reopening_that_fails_is_made_at_the_next_read() {
+    let s = Setup::new();
+    let store = Arc::new(FailingReopen {
+        inner: MemoryStore::new(),
+        armed: std::sync::atomic::AtomicBool::new(false),
+    });
+    let request = s.approve(&app_keys("wallet"), &ALL_PERMISSIONS);
+    let mut wallet = App::join(
+        s.env_on(Arc::clone(&store) as Arc<dyn StateStore>),
+        s.protocol.clone(),
+        World::config(),
+        request,
+    )
+    .await
+    .unwrap();
+    let mut phone = s.join("phone").await;
+    let key = record_at_a_new_epoch(&s, &mut wallet, &mut phone).await;
+    wallet.receive(None).await.unwrap();
+    let held = wallet.shared_record(&key).await.unwrap().unwrap();
+    assert_eq!(
+        held.content,
+        RecordContent::Unreadable(Unopened::KeyNotHeld { data_epoch: 2 }),
+    );
+    // The key arrives, and the reopening's commit fails.
+    store.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+    store_parts_for(&s, &wallet.cert().clone());
+    wallet.receive(None).await.unwrap_err();
+    assert!(!store.armed.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(
+        wallet.scope_key(2, "scope-a").is_some(),
+        "the key was taken"
+    );
+    let held = wallet.shared_record(&key).await.unwrap().unwrap();
+    assert!(held.content.value().is_none(), "not reopened yet");
+    // The next read reopens it.
+    wallet.receive(None).await.unwrap();
+    let held = wallet.shared_record(&key).await.unwrap().unwrap();
+    assert_eq!(ids(held.content.value()), vec!["a"]);
+    let ns = crate::store::client_namespace(&wallet.app_id());
+    assert!(
+        store.get(&ns, b"reopen").unwrap().is_none(),
+        "nothing owed after"
+    );
+}
+
 /// An explicit listing of a record held `Unreadable` opens it once its key is held: the
 /// same write, by its item hash, is taken as opened.
 #[tokio::test]

@@ -52,6 +52,10 @@ const FLAG_PREFIX: &str = "flag/";
 const CERT_PREFIX: &str = "ocert/";
 /// Set while the app owes a listing of its collections: at join, after a `missed` item.
 pub(crate) const LIST_DUE: &str = "list_due";
+/// Set in the commit that takes a scope key, while the records held `Unreadable` are owed
+/// a reopening ([`App::reopen_unreadable`]): cleared in the commit of a reopening that
+/// finished, so a store that fails between the two loses nothing.
+pub(crate) const REOPEN_DUE: &str = "reopen";
 
 /// The most records one listing page asks for (Switch wire 7.4.9).
 const LIST_PAGE: u32 = 1000;
@@ -1051,9 +1055,16 @@ impl App {
     /// still doesn't open with its key held is flagged and stays `Unreadable`; it is tried
     /// only at a fetch that takes a key, and when the write is read again, never at every
     /// read.
+    ///
+    /// The commit that takes the key keeps the reopening owed ([`REOPEN_DUE`]), and the
+    /// reopening's own commit clears it, so a failure between them, or of the reopening,
+    /// leaves it owed: every read makes it first while it is ([`App::reopen_if_due`]).
     pub(crate) async fn reopen_unreadable(&mut self) -> Result<(), AppError> {
         let held = self.reader().scan::<HeldRecord>(RECORD_PREFIX).await?;
         let mut tx = self.tx()?;
+        if self.reader().exists(REOPEN_DUE).await? {
+            tx.delete(REOPEN_DUE)?;
+        }
         for (_, record) in held {
             if !record.content.waits_for_key() {
                 continue;
@@ -1086,6 +1097,15 @@ impl App {
         }
         if !tx.is_empty() {
             self.commit(tx).await?;
+        }
+        Ok(())
+    }
+
+    /// The reopening a commit that took a scope key left owed, made now
+    /// ([`App::reopen_unreadable`]).
+    pub(crate) async fn reopen_if_due(&mut self) -> Result<(), AppError> {
+        if self.reader().exists(REOPEN_DUE).await? {
+            self.reopen_unreadable().await?;
         }
         Ok(())
     }

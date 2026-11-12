@@ -111,6 +111,11 @@ impl App {
             }
             let missing = self.update_keys_through();
             tx.put(key::BUNDLE, &self.state.bundle)?;
+            // The records held unreadable are owed a reopening from the commit that takes
+            // the key, until one finishes.
+            if took {
+                tx.put(super::records::REOPEN_DUE, &())?;
+            }
             self.commit(tx).await?;
             // A record held unreadable for want of a key taken now opens.
             if took {
