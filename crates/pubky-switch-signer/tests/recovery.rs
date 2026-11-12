@@ -3167,3 +3167,62 @@ async fn test_provider_loss_refused_after_the_pre_read_names_the_origin_declared
         }
     );
 }
+
+#[tokio::test]
+async fn test_restore_in_place_keeps_the_earlier_picked_distrust_time() {
+    // In place, where this install's user and another install's backup both picked a time
+    // to distrust the same app from, the earlier wins, whichever it was: after a compromise
+    // it trusts less (Switch wire 3.12, spec 12.2).
+    for own_first in [true, false] {
+        let world = World::new();
+        let (mut first, first_store) = world.enrolled().await;
+        let app = App::new(&["notes"], None, [9; 32]);
+        world.approve(&mut first, &app).await;
+        let id = app.keys.app_id_bytes();
+        let (earlier, later) = (world.clock.now_ms() - 5_000, world.clock.now_ms() - 2_000);
+        let (own, theirs) = if own_first {
+            (earlier, later)
+        } else {
+            (later, earlier)
+        };
+        world.switch.fail_next(Fault::Unreachable {
+            path: "/revoke".into(),
+            after: 0,
+        });
+        first.revoke(id, Some(own), confirmed()).await.unwrap_err();
+        first.set_record_max_age(Some(9)).await.unwrap();
+        drop(first);
+        let mut other = Signer::restore_new(
+            world.env(Arc::new(MemoryStore::new())),
+            world.keyring(),
+            confirmed(),
+        )
+        .await
+        .unwrap();
+        world.switch.fail_next(Fault::Unreachable {
+            path: "/revoke".into(),
+            after: 0,
+        });
+        other
+            .revoke(id, Some(theirs), confirmed())
+            .await
+            .unwrap_err();
+        other.set_record_max_age(Some(10)).await.unwrap();
+        drop(other);
+        let mut first = Signer::open(world.env(first_store), world.keyring())
+            .await
+            .unwrap();
+        first.restore(confirmed()).await.unwrap();
+        assert!(first.complete_removals().await.unwrap());
+        let held = world.switch.identity_doc().unwrap();
+        assert_eq!(
+            held.body()
+                .removed
+                .iter()
+                .find(|r| r.app_id == id)
+                .map(|r| r.distrust_from),
+            Some(earlier),
+            "own first: {own_first}"
+        );
+    }
+}
