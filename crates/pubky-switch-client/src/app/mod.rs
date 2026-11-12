@@ -39,6 +39,7 @@ mod error;
 mod events;
 mod feed;
 mod identity;
+mod kept;
 mod keys;
 mod parked;
 mod peek;
@@ -68,8 +69,9 @@ pub use events::{
     AppEvent, BackupRefusal, ClaimAttempt, DropReason, EVENT_ID_LEN, EventId, EventIdError,
     ParkReason, RefusedCall,
 };
-pub use feed::ReceiveReport;
+pub use feed::{ReceiveReport, SENDER_REREAD_MS};
 pub use identity::{DOC_CACHE_MS, HomeserverReader, IdentityRefresh, REVALIDATION_MS};
+pub use kept::{KeptBatch, KeptBatchDrop, KeptBatchStatus};
 pub use parked::{ParkedMessage, ParkedSummary};
 pub use peek::{PeekReport, Peeked};
 pub use protocol::{
@@ -109,7 +111,7 @@ pub use send::{
     UNDELIVERABLE_TRIES, UNDELIVERABLE_TRY_SPACING_MS, UndeliverableReason,
 };
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use pubky_switch_core::chain::TransitionProof;
@@ -565,6 +567,12 @@ pub struct App {
     /// between (`App::resume_batches_before_feed`). Kept in memory only: a restart sends
     /// them at its first read.
     kept_rate_limited: Option<(u64, u64)>,
+    /// When a failed check 7 last had each sender's `identity.json` read again
+    /// (`feed.rs`, [`SENDER_REREAD_MS`]). Kept in memory only: it bounds the reads, and a
+    /// restart may read once more.
+    sender_rereads: HashMap<[u8; 32], feed::SenderReread>,
+    /// How many reads ([`App::receive`]) this app began since it was loaded.
+    reads_begun: u64,
 }
 
 impl std::fmt::Debug for App {
@@ -788,6 +796,8 @@ impl App {
                 duty_handed: 0,
                 time_fresh_at: None,
                 kept_rate_limited: None,
+                sender_rereads: HashMap::new(),
+                reads_begun: 0,
             };
             app.update_keys_through();
             app.events.clear();
@@ -909,6 +919,8 @@ impl App {
                 duty_handed: 0,
                 time_fresh_at: None,
                 kept_rate_limited: None,
+                sender_rereads: HashMap::new(),
+                reads_begun: 0,
             };
             // A store an earlier build wrote keeps the epoch read now.
             if !app.reader().exists(key::DUTY_EPOCH).await? {
@@ -916,6 +928,8 @@ impl App {
                 tx.put(key::DUTY_EPOCH, &app.state.duty_epoch)?;
                 tx.commit(&app.env.store).await?;
             }
+            // Batches an earlier build kept carry no index of their messages and attempts.
+            app.index_kept_batches().await?;
             // Duty events not acknowledged before are delivered again (`events` module).
             let kept = app.kept_duties().await?;
             app.queue_duties(kept);
@@ -1604,6 +1618,8 @@ impl App {
                 duty_handed: 0,
                 time_fresh_at: None,
                 kept_rate_limited: None,
+                sender_rereads: HashMap::new(),
+                reads_begun: 0,
             };
             // Every write of the one commit; what fails here is mostly a write the store
             // can't take in one batch, over its sizes.

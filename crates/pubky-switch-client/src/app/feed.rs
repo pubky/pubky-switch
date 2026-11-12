@@ -265,6 +265,21 @@ impl Read {
     }
 }
 
+/// The least time, device clock, between two reads of one sender's `identity.json` that a
+/// failed check 7 against a held copy makes (Switch wire 5.1 check 7). Within it, an entry
+/// of the sender failing the check in a later read is held, not dropped, until the first
+/// read after it reads the document again.
+pub const SENDER_REREAD_MS: u64 = 60_000;
+
+/// When a failed check 7 last had a sender's `identity.json` read again: the device time,
+/// the read it came in ([`App::receive`]'s count), and whether the document could be read.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SenderReread {
+    at_ms: u64,
+    read: u64,
+    reached: bool,
+}
+
 impl App {
     /// Read the feed to its end and process it (Switch spec 8.2, 8.3), then delete the
     /// retired receive keys the cursor passed, rotate if due, and send a deferred cursor
@@ -318,6 +333,7 @@ impl App {
     }
 
     async fn receive_inner(&mut self, wait: Option<u32>) -> Result<ReceiveReport, AppError> {
+        self.reads_begun = self.reads_begun.wrapping_add(1);
         if matches!(self.state.alarm, Some(Alarm::Compromise { .. })) {
             self.leave_on_compromise().await;
         }
@@ -657,26 +673,21 @@ impl App {
         parked: bool,
         read: &mut Read,
     ) -> Result<Step, AppError> {
-        let doc = self.sender_doc(&entry.sender).await?;
-        let sender_identity = match &doc {
-            Some(doc) => SenderIdentity::Held(doc),
-            None => SenderIdentity::Unavailable,
-        };
-        let opened = OpenedEntry {
-            sender: entry.sender,
-            cert: &entry.cert,
-            accepted_at_ms: entry.accepted_at_ms,
-        };
-        let protocol = Arc::clone(&self.protocol);
-        let rules = Rules::new(protocol.as_ref(), &self.state.cert, &read.opaque);
-        let checked = check_opened(
-            plaintext.clone(),
-            &opened,
-            &self.state.meta.identity,
-            sender_identity,
-            &rules,
-            &|_, _| None,
-        );
+        let held = self.sender_doc(&entry.sender, false).await?;
+        let read_now = held.as_ref().is_some_and(|(_, read_now)| *read_now);
+        let doc = held.map(|(doc, _)| doc);
+        let mut checked = self.check_entry(entry, &plaintext, doc.as_ref(), &read.opaque);
+        // Check 7 judges the standing in the sender's newest `identity.json` (Switch wire 5.1):
+        // a held copy that doesn't list the certificate may be older than a renewal or a new
+        // app, so it is read again once before the entry is dropped.
+        if doc.is_some()
+            && !read_now
+            && matches!(&checked, Err(CheckRefusal::Dropped { check: 7, .. }))
+        {
+            checked = self
+                .check_against_newer_copy(entry, &plaintext, checked, &read.opaque)
+                .await?;
+        }
         let received = match checked {
             Ok(received) => received,
             Err(CheckRefusal::Dropped { check, reason }) => {
@@ -715,6 +726,74 @@ impl App {
             return Ok(Step::Pass);
         }
         self.apply(entry, received, parked, read).await
+    }
+
+    /// Checks 2 to 9 of `entry` against `doc`, the sender's `identity.json` (`None` when it
+    /// can't be read now).
+    fn check_entry(
+        &self,
+        entry: &Entry,
+        plaintext: &MessagePlaintext,
+        doc: Option<&IdentityDoc>,
+        opaque: &[OpaqueRule],
+    ) -> Result<Received, CheckRefusal> {
+        let opened = OpenedEntry {
+            sender: entry.sender,
+            cert: &entry.cert,
+            accepted_at_ms: entry.accepted_at_ms,
+        };
+        let rules = Rules::new(self.protocol.as_ref(), &self.state.cert, opaque);
+        check_opened(
+            plaintext.clone(),
+            &opened,
+            &self.state.meta.identity,
+            doc.map_or(SenderIdentity::Unavailable, SenderIdentity::Held),
+            &rules,
+            &|_, _| None,
+        )
+    }
+
+    /// Check 7 failed against a held copy of the sender's `identity.json` (`failed`): the
+    /// checks run again against the copy read from the Homeserver now, at most once per
+    /// [`SENDER_REREAD_MS`] for one sender, so neither a sender sending certificates its
+    /// document doesn't list, nor a Homeserver serving one new version after another, makes
+    /// the app read more. No entry is dropped on an answer older than the read it came in:
+    /// later entries of the sender in the read that read it again are judged against that
+    /// copy, or held when it couldn't be read; in a later read within the window they are
+    /// held, and judged against the copy the first read after the window takes. A copy that
+    /// can't be read holds the entry, as an unreachable `identity.json` does (Switch wire
+    /// 5.1 "A sender that can't be checked", Switch spec 8.2), with later entries processed
+    /// past it.
+    async fn check_against_newer_copy(
+        &mut self,
+        entry: &Entry,
+        plaintext: &MessagePlaintext,
+        failed: Result<Received, CheckRefusal>,
+        opaque: &[OpaqueRule],
+    ) -> Result<Result<Received, CheckRefusal>, AppError> {
+        let now = self.now();
+        let read = self.reads_begun;
+        let lately = |at: u64| at <= now && now - at < SENDER_REREAD_MS;
+        match self.sender_rereads.get(&entry.sender) {
+            // Read again in this read: the copy held is the one it took.
+            Some(again) if again.read == read && again.reached => return Ok(failed),
+            Some(again) if lately(again.at_ms) => {
+                return Ok(Err(CheckRefusal::SenderUnverifiable));
+            }
+            _ => {}
+        }
+        let again = self.sender_doc(&entry.sender, true).await?;
+        self.sender_rereads.retain(|_, again| lately(again.at_ms));
+        self.sender_rereads.insert(
+            entry.sender,
+            SenderReread {
+                at_ms: now,
+                read,
+                reached: again.is_some(),
+            },
+        );
+        let doc = again.map(|(doc, _)| doc);
+        Ok(self.check_entry(entry, plaintext, doc.as_ref(), opaque))
     }
 
     /// An entry whose message was processed before (check 9): passed, and gone if it was
@@ -822,6 +901,9 @@ impl App {
                 Outcome::Retry(failure) => {
                     return self.retry_later(entry, &received.plaintext, parked, failure, read);
                 }
+                // Passed, not processed: no processed pair, so a re-send is delivered again
+                // (`Outcome::Pass`). Nothing is unparked: an entry stored locally stays so.
+                Outcome::Pass => return Ok(Step::Pass),
                 Outcome::Apply(effect) => effect,
             };
             if writes.not_now.is_some() {
@@ -1758,11 +1840,16 @@ impl App {
     }
 
     /// The sender's newest `identity.json` for check 7: the own one, or a copy at most 10
-    /// minutes old, read again from the Homeserver otherwise. `None` when it can't be read
-    /// now, or the identity equivocated.
-    async fn sender_doc(&mut self, sender: &[u8; 32]) -> Result<Option<IdentityDoc>, AppError> {
+    /// minutes old, read again from the Homeserver otherwise (`force` reads it again
+    /// whatever its age), with whether it was read in this call. `None` when it can't be
+    /// read now, or the identity equivocated.
+    async fn sender_doc(
+        &mut self,
+        sender: &[u8; 32],
+        force: bool,
+    ) -> Result<Option<(IdentityDoc, bool)>, AppError> {
         if *sender == self.state.meta.identity {
-            return Ok(Some(self.state.own_doc.clone()));
+            return Ok(Some((self.state.own_doc.clone(), true)));
         }
         let reader = self.reader();
         if reader.exists(&key::ident_equivocated(sender)).await? {
@@ -1771,9 +1858,10 @@ impl App {
         let held = identity::held_copy(&reader, sender).await?;
         let now = self.now();
         if let Some((doc, fetched)) = &held
+            && !force
             && now.saturating_sub(*fetched) < DOC_CACHE_MS
         {
-            return Ok(Some(doc.clone()));
+            return Ok(Some((doc.clone(), false)));
         }
         let fetched = match identity::read_homeserver(self.env.homeserver.as_ref(), sender).await {
             Ok(Some(doc)) => doc,
@@ -1805,7 +1893,7 @@ impl App {
             }
         };
         self.commit(tx).await?;
-        Ok(Some(doc))
+        Ok(Some((doc, true)))
     }
 
     // ---------------------------------------------------------------------------------

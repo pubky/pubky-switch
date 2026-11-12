@@ -184,6 +184,13 @@ pub enum Fault {
         /// A part of the request's path and query.
         path: String,
     },
+    /// [`Fault::LoseAnswer`], once `after` matching requests went through.
+    LoseAnswerAfter {
+        /// A part of the request's path and query.
+        path: String,
+        /// How many matching requests go through first.
+        after: usize,
+    },
     /// Fail to connect, applying nothing, once `after` matching requests went through; the
     /// request's body is kept.
     Unreachable {
@@ -1053,11 +1060,14 @@ impl ScriptedSwitch {
         let matching = inner.faults.iter().position(|fault| match fault {
             Fault::Error { path: p, .. }
             | Fault::LoseAnswer { path: p }
+            | Fault::LoseAnswerAfter { path: p, .. }
             | Fault::Unreachable { path: p, .. }
             | Fault::LeaveOut { path: p, .. } => path.contains(p.as_str()),
         });
         let passes = matching.is_some_and(|index| match inner.faults.get_mut(index) {
-            Some(Fault::Unreachable { after, .. }) if *after > 0 => {
+            Some(Fault::Unreachable { after, .. } | Fault::LoseAnswerAfter { after, .. })
+                if *after > 0 =>
+            {
                 *after -= 1;
                 true
             }
@@ -1084,7 +1094,7 @@ impl ScriptedSwitch {
                     }
                     return Ok(inner.respond(request, status, &body));
                 }
-                Some(Fault::LoseAnswer { .. }) => lose = true,
+                Some(Fault::LoseAnswer { .. } | Fault::LoseAnswerAfter { .. }) => lose = true,
                 Some(Fault::LeaveOut { member, .. }) => leave_out = Some(member),
                 Some(Fault::Unreachable { .. }) => {
                     inner.unreached.push(request.body.clone());
