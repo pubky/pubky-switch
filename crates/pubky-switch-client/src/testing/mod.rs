@@ -82,7 +82,9 @@ pub use peer::{PEER_ORIGIN, PeerApp, PeerSwitch};
 pub use router::Router;
 #[cfg(test)]
 pub(crate) use switch::SCRIPTED_RETRY_AFTER_S;
-pub use switch::{Fault, HeldRecord, MAX_PAGE_BYTES, SWITCH_ORIGIN, ScriptedSwitch, SwitchApp};
+pub use switch::{
+    Fault, HeldRecord, MAX_PAGE_BYTES, Retention, SWITCH_ORIGIN, ScriptedSwitch, SwitchApp,
+};
 
 #[cfg(test)]
 pub(crate) use switch::{Item, PushReg};
