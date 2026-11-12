@@ -23,7 +23,7 @@
 //! account's next request.
 //!
 //! A request in a minute that isn't due pays one indexed update that matches no row. A due
-//! one with no deleted key held pays one probe of `shared_records_deleted`.
+//! one with no deleted key held pays one lookup in `shared_records_deleted`.
 
 use pubky_switch_core::records::IdentityDoc;
 

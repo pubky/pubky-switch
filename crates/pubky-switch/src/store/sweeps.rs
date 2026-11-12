@@ -13,7 +13,7 @@ fn app_ids(apps: &[[u8; 16]]) -> Vec<Vec<u8>> {
 }
 
 impl AccountTxn {
-    /// Whether a deleted key written here is held at all: one probe of
+    /// Whether a deleted key written here is held at all: one lookup in
     /// `shared_records_deleted`, so an account with none pays nothing more
     /// ([`Self::forget_deleted_keys`]).
     pub async fn deleted_key_held(&mut self) -> Result<bool, StoreError> {
