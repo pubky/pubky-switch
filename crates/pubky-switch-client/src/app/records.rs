@@ -660,7 +660,15 @@ pub enum KeptReason {
     Refused,
     /// The switch's write is no newer than the one the app holds.
     NotNewer,
-    /// The switch couldn't be read: the error, without content.
+    /// The switch refused the read with an answer the same request won't change, such as
+    /// `403 permission_missing` or `400` (the Retry column of Switch spec 6.4 saying "No"):
+    /// reading again won't help as things stand.
+    SwitchRefused {
+        /// The error code.
+        code: ErrorCode,
+    },
+    /// The switch couldn't be read for now: the network, a `5xx` or a `429`, or an answer
+    /// that didn't verify; the error, without content.
     Unreachable(String),
 }
 
@@ -822,14 +830,14 @@ impl App {
     /// (Switch wire 7.4.9): [`RecordRead::Fresh`] when the switch's current write is what the
     /// app holds after the read, taken now or the very write it held; otherwise
     /// [`RecordRead::Kept`], with the copy the app keeps, if any, and why nothing read now
-    /// replaced it: a `404`, a write refused or no newer than the one held, or a switch it
-    /// couldn't read. A kept copy isn't evidence of the switch's state now.
+    /// replaced it: a `404`, a write refused or no newer than the one held, a read the
+    /// switch refused for good, or a switch it couldn't read for now. A kept copy isn't evidence of the switch's state now.
     ///
     /// # Errors
     ///
     /// A rollback for signed evidence of misbehaviour, an alarm, a refusal of the app's
     /// rules, or a failed commit. A failed call isn't one: it reads as
-    /// [`KeptReason::Unreachable`].
+    /// [`KeptReason::SwitchRefused`] or [`KeptReason::Unreachable`].
     pub async fn read_record_fresh(
         &mut self,
         target: &RecordTarget,
@@ -848,6 +856,11 @@ impl App {
                 Ok(Some(WriteRead::NotNewer)) => KeptReason::NotNewer,
                 Ok(Some(WriteRead::Refused)) => KeptReason::Refused,
                 Ok(None) => KeptReason::NotFound,
+                Err(AppError::Switch(ClientError::Switch { code, .. }))
+                    if code.retry() == pubky_switch_core::http::Retry::No =>
+                {
+                    KeptReason::SwitchRefused { code }
+                }
                 Err(error @ (AppError::Switch(_) | AppError::Transport(_))) => {
                     KeptReason::Unreachable(error.to_string())
                 }

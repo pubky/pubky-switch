@@ -5547,3 +5547,53 @@ async fn test_records_sent_record_job_waits_for_the_key_of_a_held_value() {
     let report = wallet.flush_outbox().await.unwrap();
     assert_eq!(report.queued, vec![msg_id], "the record job is still owed");
 }
+
+/// A read the switch refuses for good is told apart from one it can't answer for now.
+#[tokio::test]
+async fn test_records_read_fresh_tells_a_refusal_from_an_unreachable_switch() {
+    let s = Setup::new();
+    let mut wallet = join_scoped(&s, "wallet", &["scope-c"]).await;
+    let mut phone = s.join("phone").await;
+    let target = s.target("n1");
+    phone
+        .put_record(&target, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    // Without the record's read scope: 403 permission_missing.
+    assert_eq!(
+        wallet.read_record_fresh(&target).await.unwrap(),
+        RecordRead::Kept {
+            record: None,
+            reason: KeptReason::SwitchRefused {
+                code: ErrorCode::PermissionMissing
+            }
+        }
+    );
+    // A 400, for good; a 503, for now.
+    s.w.switch.fail_next(Fault::Error {
+        path: "records/".into(),
+        code: ErrorCode::BadRequest,
+        current: Value::Null,
+    });
+    assert!(matches!(
+        phone.read_record_fresh(&target).await.unwrap(),
+        RecordRead::Kept {
+            reason: KeptReason::SwitchRefused {
+                code: ErrorCode::BadRequest
+            },
+            ..
+        }
+    ));
+    s.w.switch.fail_next(Fault::Error {
+        path: "records/".into(),
+        code: ErrorCode::Unavailable,
+        current: Value::Null,
+    });
+    assert!(matches!(
+        phone.read_record_fresh(&target).await.unwrap(),
+        RecordRead::Kept {
+            reason: KeptReason::Unreachable(_),
+            ..
+        }
+    ));
+}
