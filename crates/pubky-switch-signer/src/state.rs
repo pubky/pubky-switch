@@ -396,7 +396,9 @@ pub(crate) struct SignerState {
     /// that starts the new generation, which the pending key the version names signs (Switch
     /// wire 3.13, 7.4.1, 7.4.2). So the signer pins this key while the recovery goes there,
     /// and the delivery's `200` alone is checked with the pending key. Dropped with the
-    /// recovery's other records once its version is delivered.
+    /// recovery's other records once its version is delivered, and as soon as an answer under
+    /// the key the version names shows the lost generation served there no more: that version
+    /// taken, by this install or another, or the account one the enrollment made.
     #[serde(default)]
     pub(crate) recovery_serving: Option<Service>,
     /// The recovery's version that a service took names another install: a restore's, from

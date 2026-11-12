@@ -664,9 +664,6 @@ pub(super) fn removed_at_switch<'a>(
 /// How many removed apps' records a run checks for.
 const DELETION_CHECKS_PER_RUN: usize = 32;
 
-/// Whether the backup `view` holds the version that starts a recovery: `recovery_from` the
-/// generation before its own, built on none, since later versions of that generation keep
-/// `recovery_from` (Switch spec 12.6 step 1, wire 3.13).
 /// A `GET /apps` answer that shows no copy, nothing revoked and no epoch: a recovery's
 /// service before it takes the version (Switch wire 3.13).
 fn no_copy() -> AppsAnswer {
@@ -679,6 +676,9 @@ fn no_copy() -> AppsAnswer {
     }
 }
 
+/// Whether the backup `view` holds the version that starts a recovery: `recovery_from` the
+/// generation before its own, built on none, since later versions of that generation keep
+/// `recovery_from` (Switch spec 12.6 step 1, wire 3.13).
 fn is_recovery(view: &BackupView) -> bool {
     let doc = &view.identity_doc;
     view.prev.is_none() && is_recovery_doc(doc)

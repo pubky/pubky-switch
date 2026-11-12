@@ -3744,3 +3744,472 @@ async fn test_provider_loss_refused_recovery_of_a_users_reduction_clears_once_de
     );
     assert!(!refused(&signer), "met by the listed certificate");
 }
+
+fn refusal_400() -> Fault {
+    Fault::Error {
+        path: "/identity".into(),
+        code: pubky_switch_core::http::ErrorCode::BadRequest,
+        current: serde_json::Value::Null,
+    }
+}
+
+fn refused_at(origin: &str) -> SignerStatus {
+    SignerStatus::RecoveryRefused {
+        origin: origin.into(),
+    }
+}
+
+fn is_switch_400(error: &SignerError) -> bool {
+    matches!(
+        error,
+        SignerError::Switch(pubky_switch_client::ClientError::Switch { status: 400, .. })
+    )
+}
+
+async fn signer_on_router(world: &World, store: Arc<MemoryStore>, router: &Arc<Router>) -> Signer {
+    let mut env = world.env(store);
+    env.transport = router.clone();
+    Signer::open(env, world.keyring()).await.unwrap()
+}
+
+/// The service at the identity's own origin after it lost every account, as an operator
+/// that started again from an empty database, or after the account's erasure: a new
+/// account there gets a new key (Switch wire 7.4.1 "A new account's answer is signed with
+/// the key the service made for it", 7.4.2 "at an empty account").
+fn emptied_at_the_same_origin(world: &World) -> (Arc<ScriptedSwitch>, Arc<Router>) {
+    let emptied = ScriptedSwitch::unenrolled_at(
+        &world.key,
+        [0x5e; 32],
+        Arc::clone(&world.clock),
+        SWITCH_ORIGIN,
+    );
+    let router = Arc::new(Router::new());
+    router.add_switch(SWITCH_ORIGIN, &emptied);
+    (emptied, router)
+}
+
+#[tokio::test]
+async fn test_provider_loss_in_place_at_an_emptied_service_recovers() {
+    // Control: the delivery's `200`, under the new account's key the version names, is taken.
+    let world = World::new();
+    let (signer, store) = world.enrolled().await;
+    let lost = signer.identity_doc().unwrap().unwrap();
+    drop(signer);
+    let (emptied, router) = emptied_at_the_same_origin(&world);
+    let mut signer = signer_on_router(&world, store, &router).await;
+    let recovered = signer
+        .declare_provider_loss(SWITCH_ORIGIN, confirmed())
+        .await
+        .unwrap();
+    assert_eq!(recovered.generation(), lost.generation() + 1);
+    assert_eq!(emptied.identity_doc().unwrap().hash(), recovered.hash());
+    assert_eq!(signer.status(), SignerStatus::Signing);
+}
+
+#[tokio::test]
+async fn test_provider_loss_in_place_at_an_emptied_service_reads_its_refusal() {
+    // The emptied service refuses the recovery's version under the only key it has, the new
+    // account's: a refusal, not sent again.
+    let world = World::new();
+    let (signer, store) = world.enrolled().await;
+    drop(signer);
+    let (emptied, router) = emptied_at_the_same_origin(&world);
+    let mut signer = signer_on_router(&world, store, &router).await;
+    // Refused again if sent again, as the service would.
+    emptied.fail_next(refusal_400());
+    emptied.fail_next(refusal_400());
+    let error = signer
+        .declare_provider_loss(SWITCH_ORIGIN, confirmed())
+        .await
+        .unwrap_err();
+    assert!(is_switch_400(&error), "{error:?} / {:?}", signer.status());
+    assert_eq!(signer.status(), refused_at(SWITCH_ORIGIN));
+}
+
+#[tokio::test]
+async fn test_provider_loss_erased_then_enrolled_again_in_place_reads_its_refusal() {
+    // Spec 12.7 step 4: an erased install declares the loss at the same service to enroll
+    // again. The service made a new account with a new key; its refusal is read as one.
+    let world = World::new();
+    let (mut signer, store) = world.enrolled().await;
+    signer.close_account(confirmed()).await.unwrap();
+    assert_eq!(signer.status(), SignerStatus::Erased);
+    drop(signer);
+    let (emptied, router) = emptied_at_the_same_origin(&world);
+    let mut signer = signer_on_router(&world, store, &router).await;
+    // Refused again if sent again, as the service would.
+    emptied.fail_next(refusal_400());
+    emptied.fail_next(refusal_400());
+    let error = signer
+        .declare_provider_loss_confirming_records(SWITCH_ORIGIN, confirmed())
+        .await
+        .unwrap_err();
+    assert!(is_switch_400(&error), "{error:?} / {:?}", signer.status());
+    assert_eq!(signer.status(), refused_at(SWITCH_ORIGIN));
+}
+
+#[tokio::test]
+async fn test_provider_loss_restored_in_place_then_elsewhere_then_in_place_again_reads_its_refusal()
+{
+    // Restored in the window and refused there; declared at another service, whose
+    // enrollment answers and whose delivery never arrives; declared again in place. The
+    // service still answers under the key it served the lost generation with, so its refusal
+    // must be read under that key.
+    let world = World::new();
+    let (signer, _, lost, _) = in_place_stopped_before_its_delivery(&world).await;
+    drop(signer);
+    let other =
+        ScriptedSwitch::unenrolled_at(&world.key, [0x5f; 32], Arc::clone(&world.clock), NEW_ORIGIN);
+    let router = Arc::new(Router::new());
+    router.add_switch(SWITCH_ORIGIN, &world.switch);
+    router.add_switch(NEW_ORIGIN, &other);
+    world.switch.fail_next(refusal_400());
+    let mut env = world.env(Arc::new(MemoryStore::new()));
+    env.transport = router.clone();
+    let mut restored = Signer::restore_new(env, world.keyring(), confirmed())
+        .await
+        .unwrap();
+    assert_eq!(restored.status(), refused_at(SWITCH_ORIGIN));
+    other.fail_next(Fault::Unreachable {
+        path: "/identity".into(),
+        after: 0,
+    });
+    restored
+        .declare_provider_loss(NEW_ORIGIN, confirmed())
+        .await
+        .unwrap_err();
+    assert_eq!(
+        restored.status(),
+        SignerStatus::Recovering {
+            origin: NEW_ORIGIN.into()
+        }
+    );
+    world.switch.fail_next(refusal_400());
+    let error = restored
+        .declare_provider_loss(SWITCH_ORIGIN, confirmed())
+        .await
+        .unwrap_err();
+    assert!(is_switch_400(&error), "{error:?} / {:?}", restored.status());
+    assert_eq!(restored.status(), refused_at(SWITCH_ORIGIN));
+    assert_eq!(world.switch.generation(), lost.generation());
+}
+
+#[tokio::test]
+async fn test_provider_loss_revocation_held_through_a_refused_in_place_recovery_and_a_restore() {
+    // A revocation asked for in the window is held, survives the refused delivery and a
+    // restore in place, and is completed once the service takes the recovery's version.
+    let world = World::new();
+    let (mut signer, _, lost, _) = in_place_stopped_before_its_delivery(&world).await;
+    let app_id = App::new(&["notes"], None, [9; 32]).keys.app_id_bytes();
+    signer.revoke(app_id, None, confirmed()).await.unwrap_err();
+    assert!(
+        signer
+            .alerts()
+            .iter()
+            .any(|a| matches!(a, Alert::RevocationPending { app_id: id, .. } if *id == app_id))
+    );
+    world.switch.fail_next(refusal_400());
+    let error = signer.resume().await.unwrap_err();
+    assert!(is_switch_400(&error), "{error:?}");
+    assert_eq!(signer.status(), refused_at(SWITCH_ORIGIN));
+    signer.restore(confirmed()).await.unwrap();
+    signer.complete_removals().await.unwrap();
+    let held = world.switch.identity_doc().unwrap();
+    assert_eq!(held.generation(), lost.generation() + 1);
+    assert!(
+        held.listed_cert(&app_id).is_none(),
+        "removed at the service"
+    );
+    assert!(held.body().removed.iter().any(|r| r.app_id == app_id));
+    assert_eq!(world.published().unwrap().hash(), held.hash());
+    assert_eq!(signer.status(), SignerStatus::Signing);
+}
+
+#[tokio::test]
+async fn test_provider_loss_revocation_backed_up_survives_a_refused_restored_in_place_recovery() {
+    // The earlier provider-loss scenario, in place: a revocation the service never took is in
+    // the backup; a new install restores, the delivery is refused, the user declares again
+    // there, and the app is revoked and removed at the service.
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let app = App::new(&["notes"], None, [9; 32]);
+    world.approve(&mut signer, &app).await;
+    let app_id = app.keys.app_id_bytes();
+    world.switch.fail_next(Fault::Unreachable {
+        path: "/revoke".into(),
+        after: 0,
+    });
+    signer.revoke(app_id, None, confirmed()).await.unwrap_err();
+    world.switch.fail_next(Fault::Unreachable {
+        path: "/identity".into(),
+        after: 0,
+    });
+    signer
+        .declare_provider_loss(SWITCH_ORIGIN, confirmed())
+        .await
+        .unwrap_err();
+    assert!(world.backup().identity_doc().listed_cert(&app_id).is_some());
+    drop(signer);
+    world.switch.fail_next(refusal_400());
+    let mut restored = Signer::restore_new(
+        world.env(Arc::new(MemoryStore::new())),
+        world.keyring(),
+        confirmed(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(restored.status(), refused_at(SWITCH_ORIGIN));
+    restored.resume().await.unwrap();
+    assert_eq!(restored.status(), refused_at(SWITCH_ORIGIN));
+    restored
+        .declare_provider_loss(SWITCH_ORIGIN, confirmed())
+        .await
+        .unwrap();
+    restored.complete_removals().await.unwrap();
+    let held = world.switch.identity_doc().unwrap();
+    assert!(
+        held.listed_cert(&app_id).is_none(),
+        "removed at the service"
+    );
+    assert!(held.body().removed.iter().any(|r| r.app_id == app_id));
+    assert_eq!(restored.status(), SignerStatus::Signing);
+}
+
+#[tokio::test]
+async fn test_provider_loss_second_in_place_restored_in_its_window() {
+    // A second recovery in place, stopped before its delivery, restored on a new install:
+    // the earlier key is the first recovery's pending key, which the Homeserver's copy names.
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let first = signer
+        .declare_provider_loss(SWITCH_ORIGIN, confirmed())
+        .await
+        .unwrap();
+    signer.set_record_max_age(Some(77)).await.unwrap();
+    world.switch.fail_next(Fault::Unreachable {
+        path: "/identity".into(),
+        after: 0,
+    });
+    signer
+        .declare_provider_loss(SWITCH_ORIGIN, confirmed())
+        .await
+        .unwrap_err();
+    drop(signer);
+    let mut restored = Signer::restore_new(
+        world.env(Arc::new(MemoryStore::new())),
+        world.keyring(),
+        confirmed(),
+    )
+    .await
+    .unwrap();
+    restored.resume().await.unwrap();
+    assert_eq!(world.switch.generation(), first.generation() + 1);
+    assert_eq!(restored.status(), SignerStatus::Signing);
+}
+
+#[tokio::test]
+async fn test_provider_loss_source_install_finds_the_restore_that_completed_in_place() {
+    // A new install restored in the window and completed the recovery, then signed its own
+    // version. The source install, still in the window, resends its delivery: the service's
+    // `409 stale_identity`, under the key the version names, shows the take-over (Switch wire
+    // 3.12, 3.13).
+    let world = World::new();
+    let (mut source, _, lost, _) = in_place_stopped_before_its_delivery(&world).await;
+    let mut restored = Signer::restore_new(
+        world.env(Arc::new(MemoryStore::new())),
+        world.keyring(),
+        confirmed(),
+    )
+    .await
+    .unwrap();
+    restored.resume().await.unwrap();
+    assert_eq!(world.switch.generation(), lost.generation() + 1);
+    let install = restored.install_id();
+    let resumed = source.resume().await;
+    assert_eq!(
+        source.status(),
+        SignerStatus::ManagedBy { install },
+        "{resumed:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_provider_loss_source_install_finds_the_restore_that_completed_elsewhere() {
+    // Control at another service: the same sequence ends with the source managed by the
+    // restored install.
+    let world = World::new();
+    let (mut source, store) = world.enrolled().await;
+    let app = App::new(&["notes"], None, [9; 32]);
+    world.approve(&mut source, &app).await;
+    drop(source);
+    let other =
+        ScriptedSwitch::unenrolled_at(&world.key, [0x5f; 32], Arc::clone(&world.clock), NEW_ORIGIN);
+    let router = Arc::new(Router::new());
+    router.add_switch(NEW_ORIGIN, &other);
+    let mut source = signer_on_router(&world, store, &router).await;
+    other.fail_next(Fault::Unreachable {
+        path: "/identity".into(),
+        after: 0,
+    });
+    source
+        .declare_provider_loss(NEW_ORIGIN, confirmed())
+        .await
+        .unwrap_err();
+    let mut env = world.env(Arc::new(MemoryStore::new()));
+    env.transport = router.clone();
+    let mut restored = Signer::restore_new(env, world.keyring(), confirmed())
+        .await
+        .unwrap();
+    restored.resume().await.unwrap();
+    let install = restored.install_id();
+    let resumed = source.resume().await;
+    assert_eq!(
+        source.status(),
+        SignerStatus::ManagedBy { install },
+        "{resumed:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_provider_loss_in_place_resend_after_a_lost_answer_reads_under_the_versions_key() {
+    // The service took the recovery's version and its `200` was lost; the resend gets a
+    // `503`, now signed with the key the version names. One read under that key shows the
+    // lost generation served no more, and the same run sends the version again, whose retry
+    // is answered (Switch wire 7.4.2).
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let lost = signer.identity_doc().unwrap().unwrap();
+    world.switch.fail_next(Fault::LoseAnswer {
+        path: "/identity".into(),
+    });
+    signer
+        .declare_provider_loss(SWITCH_ORIGIN, confirmed())
+        .await
+        .unwrap_err();
+    assert_eq!(world.switch.generation(), lost.generation() + 1);
+    world.switch.fail_next(Fault::Error {
+        path: "/identity".into(),
+        code: pubky_switch_core::http::ErrorCode::Unavailable,
+        current: serde_json::Value::Null,
+    });
+    let count = |method: &str, suffix: &str| {
+        world
+            .transport
+            .requests()
+            .into_iter()
+            .filter(|r| r.method == method && r.path_and_query.ends_with(suffix))
+            .count()
+    };
+    let (reads, sends) = (count("GET", "/apps"), count("PUT", "/identity"));
+    signer.resume().await.unwrap();
+    assert_eq!(signer.status(), SignerStatus::Signing);
+    // One read for the failed delivery, and the version sent twice: the `503`, then the
+    // retry. Publication's check reads once more after the delivery.
+    assert_eq!(count("PUT", "/identity") - sends, 2);
+    assert_eq!(count("GET", "/apps") - reads, 2);
+}
+
+#[tokio::test]
+async fn test_provider_loss_in_place_refusal_under_a_third_key_keeps_the_earlier_key() {
+    // A refusal of the recovery's version under a third key: the read under the version's
+    // key doesn't verify either, since the lost generation is still served, so nothing is
+    // taken and the earlier key stays pinned: the service's own refusal, under that key, is
+    // then read as one (Switch wire 7.4.2).
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    world.switch.fail_next(Fault::ErrorSignedWith {
+        path: "/identity".into(),
+        code: pubky_switch_core::http::ErrorCode::BadRequest,
+        secret: [0x33; 32],
+    });
+    let error = signer
+        .declare_provider_loss(SWITCH_ORIGIN, confirmed())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            SignerError::Switch(pubky_switch_client::ClientError::BadServiceSignature {
+                status: 400
+            })
+        ),
+        "{error:?}"
+    );
+    assert_eq!(
+        signer.status(),
+        SignerStatus::Recovering {
+            origin: SWITCH_ORIGIN.into()
+        }
+    );
+    world.switch.fail_next(refusal_400());
+    let error = signer.resume().await.unwrap_err();
+    assert!(is_switch_400(&error), "{error:?}");
+    assert_eq!(signer.status(), refused_at(SWITCH_ORIGIN));
+}
+
+#[tokio::test]
+async fn test_provider_loss_restored_in_place_keeps_its_key_through_a_bad_answer_elsewhere() {
+    // Restored in the window and refused there; declared at another service, whose refusal
+    // comes under a third key; declared again in place: the key the restore found is still
+    // pinned there, since an answer elsewhere says nothing of that service.
+    let world = World::new();
+    let (signer, _, lost, _) = in_place_stopped_before_its_delivery(&world).await;
+    drop(signer);
+    let other =
+        ScriptedSwitch::unenrolled_at(&world.key, [0x5f; 32], Arc::clone(&world.clock), NEW_ORIGIN);
+    let router = Arc::new(Router::new());
+    router.add_switch(SWITCH_ORIGIN, &world.switch);
+    router.add_switch(NEW_ORIGIN, &other);
+    world.switch.fail_next(refusal_400());
+    let mut env = world.env(Arc::new(MemoryStore::new()));
+    env.transport = router.clone();
+    let mut restored = Signer::restore_new(env, world.keyring(), confirmed())
+        .await
+        .unwrap();
+    assert_eq!(restored.status(), refused_at(SWITCH_ORIGIN));
+    other.fail_next(Fault::ErrorSignedWith {
+        path: "/identity".into(),
+        code: pubky_switch_core::http::ErrorCode::BadRequest,
+        secret: [0x33; 32],
+    });
+    restored
+        .declare_provider_loss(NEW_ORIGIN, confirmed())
+        .await
+        .unwrap_err();
+    world.switch.fail_next(refusal_400());
+    let error = restored
+        .declare_provider_loss(SWITCH_ORIGIN, confirmed())
+        .await
+        .unwrap_err();
+    assert!(is_switch_400(&error), "{error:?} / {:?}", restored.status());
+    assert_eq!(restored.status(), refused_at(SWITCH_ORIGIN));
+    assert_eq!(world.switch.generation(), lost.generation());
+}
+
+#[tokio::test]
+async fn test_provider_loss_restored_in_place_reads_a_refusal_elsewhere_under_that_services_key() {
+    // Restored in the window and refused there, then declared at another service, which
+    // refuses under its own key: the key kept for the first service isn't pinned at the
+    // second, so the refusal is read as one.
+    let world = World::new();
+    let (signer, _, _, _) = in_place_stopped_before_its_delivery(&world).await;
+    drop(signer);
+    let other =
+        ScriptedSwitch::unenrolled_at(&world.key, [0x5f; 32], Arc::clone(&world.clock), NEW_ORIGIN);
+    let router = Arc::new(Router::new());
+    router.add_switch(SWITCH_ORIGIN, &world.switch);
+    router.add_switch(NEW_ORIGIN, &other);
+    world.switch.fail_next(refusal_400());
+    let mut env = world.env(Arc::new(MemoryStore::new()));
+    env.transport = router.clone();
+    let mut restored = Signer::restore_new(env, world.keyring(), confirmed())
+        .await
+        .unwrap();
+    other.fail_next(refusal_400());
+    let error = restored
+        .declare_provider_loss(NEW_ORIGIN, confirmed())
+        .await
+        .unwrap_err();
+    assert!(is_switch_400(&error), "{error:?} / {:?}", restored.status());
+    assert_eq!(restored.status(), refused_at(NEW_ORIGIN));
+}

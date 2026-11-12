@@ -320,7 +320,8 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   whose answer carries another value for it, such as `GET /apps`' `identity` replaced by a
   copy that doesn't verify; **`Fault::SignWith`** one that applies the request and signs
   its answer with another key, such as a third key, or the key a recovery in place leaves,
-  signing the delivery that starts the new generation.
+  signing the delivery that starts the new generation; **`Fault::ErrorSignedWith`** an
+  error answer under another key, applying nothing.
 - **Erasure** (Switch wire 7.4.16), in `switch/signer.rs`: `POST /erase` checks the body names
   the account's service key (`409 conflict` for another) and, when it names one, the hash of
   the `identity.json` this switch holds (`409 conflict` for another, or for none held), and

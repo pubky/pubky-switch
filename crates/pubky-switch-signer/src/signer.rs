@@ -945,6 +945,32 @@ impl Signer {
         RequestClient::new(&self.env, &self.service_target(&service), &self.keyring)
     }
 
+    /// Whether the key a recovery in place's service served the lost generation with is
+    /// pinned for the service the signer goes to ([`Signer::service_target`]).
+    fn pins_the_lost_generations_key(&self) -> Result<bool> {
+        let service = self.service()?;
+        Ok(self
+            .state
+            .recovery_serving
+            .as_ref()
+            .is_some_and(|serving| serving.origin == service.origin))
+    }
+
+    /// Whether the service the signer goes to answers `GET /apps` under the key the version
+    /// in flight names, the key its records hold for it: an error it signs counts too.
+    async fn version_key_signs(&self) -> Result<bool> {
+        let service = self.service()?;
+        let target = Target {
+            origin: &service.origin,
+            pinned: Some(service.service_key),
+            identity: self.state.identity,
+        };
+        let read = RequestClient::new(&self.env, &target, &self.keyring)?
+            .apps()
+            .await;
+        Ok(matches!(read, Ok(_) | Err(ClientError::Switch { .. })))
+    }
+
     /// Where the clients of the enrolled switch go. While a recovery declared in place goes
     /// to the service that served the lost generation, its answers are checked with the key
     /// it served that generation with, but the `200` of the delivery that starts the new
@@ -1388,6 +1414,23 @@ impl Signer {
                 current,
                 ..
             }) => self.stale(&current, doc, prev).await,
+            // The key the lost generation served with is pinned in place, and an answer other
+            // than a `200` it didn't sign may be the service's under the key the version names:
+            // that version was taken, by this install or another, or the account is one the
+            // enrollment made, so the lost generation is served no more (Switch wire 7.4.2).
+            // One read under that key tells: an answer it signs ends the earlier key's pin, and
+            // the delivery is sent again under it. Nothing else is taken from that read, and
+            // once the pin is gone this read isn't made again.
+            Err(error @ ClientError::BadServiceSignature { status })
+                if status != 200 && self.pins_the_lost_generations_key()? =>
+            {
+                if !self.version_key_signs().await? {
+                    return Err(error.into());
+                }
+                let mut state = self.state.clone();
+                state.recovery_serving = None;
+                self.commit(state, self.flow.clone()).await
+            }
             // A refusal the pinned key didn't sign, while recovering at a service an earlier
             // declaration enrolled at: one that took that version answers under the key it
             // serves, so it is read under that key (Switch wire 3.7, 7.4.2).
