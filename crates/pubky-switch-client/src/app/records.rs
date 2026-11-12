@@ -20,10 +20,11 @@
 //!   ignored and shown with the app it names (Switch spec 8.2).
 //! - **A write replaces the one held** only if it is newer by the core's rule
 //!   ([`WriteVersion::replaces`]), and only if the protocol finds it doesn't go back on what
-//!   the app has seen there ([`super::Protocol::record_regression`]). A write refused that
+//!   the app has seen there ([`super::Protocol::record_regression_on`]). A write refused that
 //!   way is flagged, its content not acted on, but its version followed, so the app's next
 //!   write builds on it and puts back the content it trusts (Switch spec 8.2).
-//! - **Listing** runs at join and after a `missed` item (Switch spec 8.2, 8.3).
+//! - **Listing** runs at join, after a restore, after a `missed` item, and after a certificate
+//!   taken that reads a collection the one before didn't (Switch spec 8.2, 8.3).
 
 use pubky_switch_core::chain::{ChainEnvelope, TransitionProof};
 use pubky_switch_core::enc::{b64, serde_b64, serde_b64_vec, unb64_array};
@@ -39,7 +40,7 @@ use serde::{Deserialize, Serialize};
 use super::batch::OpBatch;
 use super::error::{Alarm, Refusal};
 use super::events::{AppEvent, Duty};
-use super::protocol::{MAX_REGRESSION_REASON_BYTES, MAX_SEEN_MARK_BYTES};
+use super::protocol::{MAX_REGRESSION_REASON_BYTES, MAX_SEEN_MARK_BYTES, WriteBase};
 use super::state::{Tx, key};
 use super::{App, AppError, IdentityRefresh};
 use crate::client::answers::{ChainItem, SharedRecordView};
@@ -212,6 +213,15 @@ impl Collection {
         self.member(policy).is_some()
     }
 
+    /// Whether a certificate scope `scope` reads a member of the collection: its read
+    /// scope, or, in a sub-scope family, one of its sub-scopes (Switch spec 3.3, 10.3).
+    pub(crate) fn read_by_scope(&self, scope: &str) -> bool {
+        scope == self.policy.read_scope
+            || (self.family == PolicyFamily::SubScopes
+                && pubky_switch_core::scopes::split(scope)
+                    .is_some_and(|(name, sub)| sub.is_some() && name == self.policy.read_scope))
+    }
+
     /// Whether a certificate holds the read scope of any member, so its app lists the
     /// collection (Switch spec 8.3).
     pub fn readable_by(&self, cert: &AppCert) -> bool {
@@ -254,13 +264,66 @@ impl RecordTarget {
 
 /// What a record holds, as the app reads it. Its `Debug` shows only the size.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "StoredContent", into = "StoredContent")]
 pub enum RecordContent {
     /// The value's JSON bytes.
-    Value(#[serde(with = "serde_b64_vec")] Vec<u8>),
+    Value(Vec<u8>),
     /// A delete: the sealed empty plaintext (Switch wire 6.2).
     Deleted,
-    /// Sealed at a data epoch whose key the app doesn't hold (Switch spec 3.5).
+    /// The value isn't open, for now or for good ([`Unopened`]).
+    Unreadable(Unopened),
+}
+
+/// Why a record's value isn't open (Switch spec 3.5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Unopened {
+    /// Not open for now: sealed at a data epoch whose key for its scope the app doesn't
+    /// hold. The value opens once that key is fetched. An app is given the keys of every
+    /// data epoch from 1 to the current one for each scope it holds, its approval's bundle
+    /// and later parts included, but the key may still never come: a value sealed at an
+    /// epoch the app gets no key for, such as one past the current epoch or under a scope
+    /// its certificate no longer holds, or under a sub-scope it can't derive the key of,
+    /// stays so. The app can't tell those apart from a key on its way.
+    KeyNotHeld {
+        /// The data epoch the value is sealed at.
+        data_epoch: u64,
+    },
+    /// For good: the key is held and the value doesn't open with it. The write was
+    /// flagged ([`super::AppEvent::WriteFlagged`]) and isn't tried again.
+    DoesNotOpen,
+}
+
+/// [`RecordContent`] as the store holds it: a value not open for now is kept as before,
+/// its data epoch read from the kept operation.
+#[derive(Serialize, Deserialize)]
+enum StoredContent {
+    Value(#[serde(with = "serde_b64_vec")] Vec<u8>),
+    Deleted,
     Unreadable,
+    DoesNotOpen,
+}
+
+impl From<StoredContent> for RecordContent {
+    fn from(stored: StoredContent) -> Self {
+        match stored {
+            StoredContent::Value(bytes) => Self::Value(bytes),
+            StoredContent::Deleted => Self::Deleted,
+            StoredContent::Unreadable => Self::Unreadable(Unopened::KeyNotHeld { data_epoch: 0 }),
+            StoredContent::DoesNotOpen => Self::Unreadable(Unopened::DoesNotOpen),
+        }
+    }
+}
+
+impl From<RecordContent> for StoredContent {
+    fn from(content: RecordContent) -> Self {
+        match content {
+            RecordContent::Value(bytes) => Self::Value(bytes),
+            RecordContent::Deleted => Self::Deleted,
+            RecordContent::Unreadable(Unopened::KeyNotHeld { .. }) => Self::Unreadable,
+            RecordContent::Unreadable(Unopened::DoesNotOpen) => Self::DoesNotOpen,
+        }
+    }
 }
 
 impl std::fmt::Debug for RecordContent {
@@ -268,7 +331,7 @@ impl std::fmt::Debug for RecordContent {
         match self {
             Self::Value(bytes) => write!(f, "Value({} bytes)", bytes.len()),
             Self::Deleted => f.write_str("Deleted"),
-            Self::Unreadable => f.write_str("Unreadable"),
+            Self::Unreadable(why) => write!(f, "Unreadable({why:?})"),
         }
     }
 }
@@ -280,6 +343,11 @@ impl RecordContent {
             Self::Value(bytes) => Some(bytes),
             _ => None,
         }
+    }
+
+    /// Whether the value isn't open for now only: its key isn't held yet.
+    fn waits_for_key(&self) -> bool {
+        matches!(self, Self::Unreadable(Unopened::KeyNotHeld { .. }))
     }
 }
 
@@ -454,10 +522,27 @@ impl HeldRecord {
             authenticated: self.authenticated,
             writer: self.writer,
             written_at_ms: self.written_at_ms,
-            content: self.content.clone(),
+            content: match self.content {
+                // The data epoch from the kept operation, which a value stored before it was
+                // kept doesn't carry.
+                RecordContent::Unreadable(Unopened::KeyNotHeld { .. }) => {
+                    RecordContent::Unreadable(Unopened::KeyNotHeld {
+                        data_epoch: sealed_epoch(&self.op).unwrap_or(0),
+                    })
+                }
+                ref content => content.clone(),
+            },
             doubtful: self.doubtful,
             flagged: self.follow.is_some(),
         }
+    }
+}
+
+/// The data epoch a kept `record.put` seals its value at.
+fn sealed_epoch(op: &SignedDoc) -> Option<u64> {
+    match &SignedOp::peek(op).ok()?.body().kind {
+        OpKind::RecordPut(put) => Some(put.value_sealed.data_epoch),
+        _ => None,
     }
 }
 
@@ -528,6 +613,9 @@ enum Refused {
     Misbehaviour(String),
     /// A failed check: ignored and shown with the app it names.
     Invalid { writer: [u8; 16], reason: String },
+    /// A value that doesn't open with its key held: as [`Refused::Invalid`], and a record
+    /// held with this very write not open for now is held as not opening for good.
+    DoesNotOpen { writer: [u8; 16], reason: String },
     /// Not a write the app takes: another collection, or a writer it can't find.
     Ignored,
     /// A write without a record view, that no certificate the app holds authorizes, while
@@ -535,6 +623,56 @@ enum Refused {
     /// time that the app doesn't hold: the record's view decides (Switch wire 6.2
     /// "Accepting a write" step 1). It names the member of the collection.
     Unheld(Collection),
+}
+
+/// What reading a write came to ([`App::read_write`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WriteRead {
+    /// Taken, or the very write the app held.
+    Taken,
+    /// No newer than the write held.
+    NotNewer,
+    /// Refused: a failed check, a regression the protocol found, or a write the app doesn't
+    /// take.
+    Refused,
+}
+
+/// What a read of one record came to ([`App::read_record_fresh`], Switch wire 7.4.9).
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RecordRead {
+    /// Read now: the switch's current write is the one the app holds.
+    Fresh(SharedRecord),
+    /// Nothing read now replaced what the app holds: the earlier copy it keeps, if any.
+    Kept {
+        /// The copy the app keeps.
+        record: Option<SharedRecord>,
+        /// Why nothing read now replaced it.
+        reason: KeptReason,
+    },
+}
+
+/// Why a read of a record kept the earlier copy ([`RecordRead::Kept`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum KeptReason {
+    /// The switch holds no record at the key, or forgot it (`404`).
+    NotFound,
+    /// The switch's write was refused: a failed check, or one that goes back on what the
+    /// app has seen ([`super::AppEvent::WriteFlagged`]).
+    Refused,
+    /// The switch's write is no newer than the one the app holds.
+    NotNewer,
+    /// The switch refused the read with an answer the same request won't change, such as
+    /// `403 permission_missing` or `400` (the Retry column of Switch spec 6.4 saying "No"):
+    /// reading again won't help as things stand.
+    SwitchRefused {
+        /// The error code.
+        code: ErrorCode,
+    },
+    /// The switch couldn't be read for now: the network, a `5xx` or a `429`, or an answer
+    /// that didn't verify; the error, without content.
+    Unreachable(String),
 }
 
 /// What [`App::take_write`] did.
@@ -673,18 +811,70 @@ impl App {
         .await
     }
 
+    /// Read the record at `key` from the switch and take its write; what came of it, `None`
+    /// for a key the switch doesn't know.
     pub(crate) async fn fetch_record(
         &mut self,
         key: &[u8; 32],
         collection: &Collection,
-    ) -> Result<(), AppError> {
+    ) -> Result<Option<WriteRead>, AppError> {
         let Some(view) = self.record_view(key).await? else {
-            return Ok(());
+            return Ok(None);
         };
         let mut tx = self.tx()?;
-        self.take_view(&view, Some((key, collection)), &mut tx)
+        let read = self
+            .take_view(&view, Some((key, collection)), &mut tx)
             .await?;
-        self.commit(tx).await
+        self.commit(tx).await?;
+        Ok(Some(read))
+    }
+
+    /// [`App::read_record`], telling a copy read now from an earlier one the app keeps
+    /// (Switch wire 7.4.9): [`RecordRead::Fresh`] when the switch's current write is what the
+    /// app holds after the read, taken now or the very write it held; otherwise
+    /// [`RecordRead::Kept`], with the copy the app keeps, if any, and why nothing read now
+    /// replaced it: a `404`, a write refused or no newer than the one held, a read the
+    /// switch refused for good, or a switch it couldn't read for now. A kept copy isn't evidence of the switch's state now.
+    ///
+    /// # Errors
+    ///
+    /// A rollback for signed evidence of misbehaviour, an alarm, a refusal of the app's
+    /// rules, or a failed commit. A failed call isn't one: it reads as
+    /// [`KeptReason::SwitchRefused`] or [`KeptReason::Unreachable`].
+    pub async fn read_record_fresh(
+        &mut self,
+        target: &RecordTarget,
+    ) -> Result<RecordRead, AppError> {
+        Box::pin(async move {
+            self.ready_local().await?;
+            self.refuse_when_stopped()?;
+            let key = self.record_key(target)?;
+            let reason = match self.fetch_record(&key, &target.collection).await {
+                Ok(Some(WriteRead::Taken)) => {
+                    if let Some(record) = self.shared_record(&key).await? {
+                        return Ok(RecordRead::Fresh(record));
+                    }
+                    KeptReason::Refused
+                }
+                Ok(Some(WriteRead::NotNewer)) => KeptReason::NotNewer,
+                Ok(Some(WriteRead::Refused)) => KeptReason::Refused,
+                Ok(None) => KeptReason::NotFound,
+                Err(AppError::Switch(ClientError::Switch { code, .. }))
+                    if code.retry() == pubky_switch_core::http::Retry::No =>
+                {
+                    KeptReason::SwitchRefused { code }
+                }
+                Err(error @ (AppError::Switch(_) | AppError::Transport(_))) => {
+                    KeptReason::Unreachable(error.to_string())
+                }
+                Err(error) => return Err(error),
+            };
+            Ok(RecordRead::Kept {
+                record: self.shared_record(&key).await?,
+                reason,
+            })
+        })
+        .await
     }
 
     /// The switch's view of record `key` (`GET /records/{key}`, Switch wire 7.4.9); `None`
@@ -772,11 +962,76 @@ impl App {
         .await
     }
 
-    /// List the collections when a listing is owed: after joining, and after a `missed` item
-    /// (Switch spec 8.2, 8.3).
+    /// List the collections when a listing is owed: after joining, a restore, a `missed`
+    /// item, and a certificate taken that reads a collection the one before didn't (Switch
+    /// spec 8.2, 8.3).
+    ///
+    /// A listing waits while the certificate lacks the key, at the current data epoch, of
+    /// a read scope of a collection it lists, such as after a renewal that adds one: listed
+    /// before its key arrives, a record would be held `Unreadable` until the key opened it
+    /// ([`App::reopen_unreadable`]). `list_due` stays, so the read after the key arrives
+    /// lists.
     pub(crate) async fn list_collections_if_due(&mut self) -> Result<(), AppError> {
-        if self.reader().exists(LIST_DUE).await? {
-            self.list_collections().await?;
+        if !self.reader().exists(LIST_DUE).await? || self.listing_lacks_keys() {
+            return Ok(());
+        }
+        self.list_collections().await
+    }
+
+    /// Whether the certificate lacks, at the current data epoch, the key of a scope it
+    /// holds that reads a collection of the protocol (Switch spec 3.5).
+    fn listing_lacks_keys(&self) -> bool {
+        let epoch = self.state.own_doc.data_epoch();
+        let collections = self.protocol.collections();
+        self.state.cert.scopes().iter().any(|scope| {
+            self.protocol.has_keys(scope)
+                && self.state.scope_keys.get(epoch, scope).is_none()
+                && collections.iter().any(|c| c.read_by_scope(scope))
+        })
+    }
+
+    /// Open again, once a fetch took a scope key, the records held `Unreadable` whose value
+    /// is sealed under a key the app now holds (Switch spec 3.5): their kept write goes
+    /// through the checks again and is taken as opened ([`App::take_write`]). A data-epoch
+    /// rotation and a listing before the keys came both leave such records. A value that
+    /// still doesn't open with its key held is flagged and stays `Unreadable`; it is tried
+    /// only at a fetch that takes a key, and when the write is read again, never at every
+    /// read.
+    pub(crate) async fn reopen_unreadable(&mut self) -> Result<(), AppError> {
+        let held = self.reader().scan::<HeldRecord>(RECORD_PREFIX).await?;
+        let mut tx = self.tx()?;
+        for (_, record) in held {
+            if !record.content.waits_for_key() {
+                continue;
+            }
+            let Ok(op) = SignedOp::peek(&record.op) else {
+                continue;
+            };
+            let OpKind::RecordPut(put) = &op.body().kind else {
+                continue;
+            };
+            let sealed = &put.value_sealed;
+            if self
+                .state
+                .scope_keys
+                .get(sealed.data_epoch, &sealed.scope)
+                .is_none()
+            {
+                continue;
+            }
+            let collection = Collection::new(&record.collection, record.policy.clone());
+            let evidence = Evidence {
+                op: &record.op,
+                cert: record.cert.as_ref(),
+                proof: record.proof.as_ref(),
+                stub: None,
+                view_version: Some(record.version),
+            };
+            self.read_write(&evidence, Some((&put.key, &collection)), put.key, &mut tx)
+                .await?;
+        }
+        if !tx.is_empty() {
+            self.commit(tx).await?;
         }
         Ok(())
     }
@@ -787,7 +1042,7 @@ impl App {
         view: &SharedRecordView,
         expect: Option<(&[u8; 32], &Collection)>,
         tx: &mut Tx,
-    ) -> Result<(), AppError> {
+    ) -> Result<WriteRead, AppError> {
         let evidence = Evidence {
             op: &view.op,
             cert: Some(&view.cert),
@@ -824,7 +1079,8 @@ impl App {
             view_version: None,
         };
         let key = put.key;
-        self.read_write(&evidence, None, key, tx).await
+        self.read_write(&evidence, None, key, tx).await?;
+        Ok(())
     }
 
     /// Check a write and take it, or flag it, or raise the rollback it proves.
@@ -834,7 +1090,7 @@ impl App {
         expect: Option<(&[u8; 32], &Collection)>,
         shown_key: [u8; 32],
         tx: &mut Tx,
-    ) -> Result<(), AppError> {
+    ) -> Result<WriteRead, AppError> {
         let mut outcome = self.accept_write(evidence, expect, tx).await?;
         let mut version = evidence
             .stub
@@ -877,7 +1133,11 @@ impl App {
         }
         match outcome {
             Ok(accepted) => {
-                self.take_write(accepted, false, tx).await?;
+                return Ok(match self.take_write(accepted, false, tx).await? {
+                    Taken::New | Taken::Same => WriteRead::Taken,
+                    Taken::NotNewer => WriteRead::NotNewer,
+                    Taken::Flagged => WriteRead::Refused,
+                });
             }
             Err(Refused::Misbehaviour(reason)) => {
                 return Err(self.raise(Alarm::Rollback { reason }).await);
@@ -886,9 +1146,22 @@ impl App {
                 self.flag_write(&shown_key, version, writer, reason, tx)
                     .await?;
             }
+            Err(Refused::DoesNotOpen { writer, reason }) => {
+                // The record held with this very write, not open for now, won't open: its
+                // version is the write's, so the flag below doesn't write it again.
+                if let Some(mut held) = self.held_record(&shown_key).await?
+                    && held.op == *evidence.op
+                    && held.content.waits_for_key()
+                {
+                    held.content = RecordContent::Unreadable(Unopened::DoesNotOpen);
+                    tx.put(&record_key_of(&shown_key), &held)?;
+                }
+                self.flag_write(&shown_key, version, writer, reason, tx)
+                    .await?;
+            }
             Err(Refused::Ignored | Refused::Unheld(_)) => {}
         }
-        Ok(())
+        Ok(WriteRead::Refused)
     }
 
     /// Record a refused write, and follow its version when it is the switch's current one
@@ -1082,9 +1355,16 @@ impl App {
                     .get(put.value_sealed.data_epoch, &put.value_sealed.scope)
                     .is_none() =>
             {
-                RecordContent::Unreadable
+                RecordContent::Unreadable(Unopened::KeyNotHeld {
+                    data_epoch: put.value_sealed.data_epoch,
+                })
             }
-            Err(_) => return invalid("Switch wire 6.2 step 7: the value doesn't open"),
+            Err(_) => {
+                return Ok(Err(Refused::DoesNotOpen {
+                    writer,
+                    reason: "Switch wire 6.2 step 7: the value doesn't open".into(),
+                }));
+            }
         };
         Ok(Ok(Accepted {
             key: put.key,
@@ -1342,16 +1622,34 @@ impl App {
 
     /// Take an accepted write if it is newer than the one held and the protocol finds it
     /// goes back on nothing the app has seen.
+    ///
+    /// The same write again, by its item hash, changes nothing but a version a proof now
+    /// authenticates, unless the app holds it `Unreadable` and now opens it: a value never
+    /// opened was never seen, so it is taken as a write is, its version evidence the better
+    /// of the two, and the protocol checks and marks it (Switch spec 3.5, 8.2).
     async fn take_write(
         &mut self,
-        accepted: Accepted,
+        mut accepted: Accepted,
         own: bool,
         tx: &mut Tx,
     ) -> Result<Taken, AppError> {
         let key = accepted.key;
         self.keep_cert(&accepted.cert, tx)?;
         let held = self.held_record(&key).await?;
-        if let Some(held) = &held {
+        let reopened = held.as_ref().is_some_and(|held| {
+            held.item_hash == accepted.item_hash
+                && held.content.waits_for_key()
+                && !matches!(accepted.content, RecordContent::Unreadable(_))
+        });
+        if let Some(held) = held.as_ref().filter(|_| reopened)
+            && held.authenticated
+            && !accepted.version.authenticated
+        {
+            accepted.version = held.write_version();
+            accepted.proof = accepted.proof.take().or(held.proof.clone());
+            accepted.time = held.written_at_ms.or(accepted.time);
+        }
+        if let Some(held) = held.as_ref().filter(|_| !reopened) {
             if held.item_hash == accepted.item_hash {
                 if accepted.version.authenticated && !held.authenticated {
                     let mut upgraded = held.clone();
@@ -1369,11 +1667,26 @@ impl App {
         }
         let seen: Option<SeenMark> = self.reader().get(&seen_key(&key)).await?;
         let new_value = accepted.content.value();
+        // What the write builds on, and whether the app holds it (Switch spec 8.2, 10.3).
+        let expected_version = accepted.version.expected_version;
+        let base = WriteBase {
+            expected_version,
+            held: match &held {
+                // A writer that holds a deleted record creates it again on `{0, 0}`
+                // (Switch wire 6.2).
+                Some(held) if expected_version.is_none() => held.content == RecordContent::Deleted,
+                Some(held) => held.version == expected_version,
+                None => expected_version.is_none(),
+            },
+        };
         if !own
             && let Some(mark) = &seen
-            && let Some(reason) =
-                self.protocol
-                    .record_regression(&accepted.collection.name, &mark.mark, new_value)
+            && let Some(reason) = self.protocol.record_regression_on(
+                &accepted.collection.name,
+                &mark.mark,
+                new_value,
+                base,
+            )
         {
             let version = accepted.version.version;
             self.flag_write(&key, version, accepted.writer, reason, tx)
@@ -1427,7 +1740,7 @@ impl App {
             item_hash: accepted.item_hash,
             content: accepted.content,
             doubtful: accepted.doubtful,
-            follow: None,
+            follow: held.and_then(|held| held.follow).filter(|_| reopened),
         };
         tx.put(&record_key_of(&key), &record)?;
         self.events.push(AppEvent::RecordChanged { key });
@@ -1585,13 +1898,19 @@ impl App {
 
     /// Build a record's next value from what the app holds and write it, building it again
     /// on what the switch holds after each `409 conflict` (Switch spec 10.3): `change` gets
-    /// the current value (`None` for none, deleted or unreadable) and returns the new one,
-    /// or `None` when nothing changes. Returns the record written, or `None` when `change`
-    /// changed nothing.
+    /// the current value (`None` for none, deleted, or one that won't open) and returns the
+    /// new one, or `None` when nothing changes. Returns the record written, or `None` when
+    /// `change` changed nothing.
+    ///
+    /// A value the app holds unopened for want of its key (`KeyNotHeld`) isn't handed over
+    /// as `None`, which would have `change` overwrite what it can't see: the write waits
+    /// for the key (Switch spec 3.5, 8.2). The outbox's record jobs go through here, so a
+    /// message's record job waits the same way.
     ///
     /// # Errors
     ///
-    /// As [`App::put_record`]; `409 conflict` when the record kept changing.
+    /// As [`App::put_record`]; [`Refusal::NotNow`] while the held value waits for its key;
+    /// `409 conflict` when the record kept changing.
     pub async fn update_record(
         &mut self,
         target: &RecordTarget,
@@ -1603,6 +1922,14 @@ impl App {
             let mut last = None;
             for _ in 0..UPDATE_TRIES {
                 let current = self.shared_record(&key).await?;
+                if current.as_ref().is_some_and(|r| r.content.waits_for_key()) {
+                    return Err(Refusal::NotNow(
+                        "Switch spec 3.5: the record's value is sealed under a key the app \
+                         doesn't hold yet"
+                            .into(),
+                    )
+                    .into());
+                }
                 let value = current.as_ref().and_then(|r| r.content.value());
                 let Some(next) = change(value) else {
                     return Ok(None);

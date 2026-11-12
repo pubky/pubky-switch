@@ -11,7 +11,9 @@ use pubky_switch_core::claims::ClaimStatus;
 use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::ident::Policy;
 use pubky_switch_core::ops::{Condition, KeyBundlePut, OpKind, RecordVersion};
-use pubky_switch_core::records::{DAY_MS, IdentityDoc, Inbox, seal_bundle_parts};
+use pubky_switch_core::records::{
+    CLOCK_TOLERANCE_MS, DAY_MS, IdentityDoc, Inbox, seal_bundle_parts,
+};
 use pubky_switch_core::scopes::Permission;
 use pubky_switch_core::sig::SignedDoc;
 use serde_json::{Map, Value, json};
@@ -22,7 +24,7 @@ use crate::app::{
     AppBackup, AppError, AppEvent, ClaimOp, Collection, DOC_CACHE_MS, Delivery,
     LISTS_TOO_LARGE_RETRY_MS, MAX_CURSOR_DEFER_MS, MAX_SEEN_MARK_BYTES, ObligationDeadline,
     OpBatch, OutgoingMessage, PolicyFamily, ReceiveContext, RecordJob, RecordTarget, Refusal,
-    SenderDisposition, SentMessage, SwitchCopy,
+    SENT_RETENTION_MS, SenderDisposition, SentMessage, SignedMessage, SwitchCopy,
 };
 use crate::store::{Fault as StoreFault, FaultStore};
 use crate::testing::{Fault, Router, SWITCH_ORIGIN, ScriptedSwitch};
@@ -523,7 +525,7 @@ async fn test_receive_context_attempt_refused_in_reconcile_mode() {
     let w = World::new();
     let protocol = ApiProtocol::new(Mode::Attempt);
     let app = join(&w, &protocol, "wallet").await;
-    let backup = app.backup().unwrap();
+    let backup = app.backup().await.unwrap();
     drop(app);
     let store = Arc::new(MemoryStore::new()) as Arc<dyn StateStore>;
     let mut app = App::restore(w.env_on(store), protocol.clone(), config(), &backup)
@@ -939,7 +941,7 @@ async fn test_record_op_and_key_fetch_refuse_a_stopped_app() {
 async fn test_submit_batch_refuses_an_attempt_in_reconcile_mode() {
     let w = World::new();
     let app = join(&w, &ApiProtocol::new(Mode::Plain), "wallet").await;
-    let backup = app.backup().unwrap();
+    let backup = app.backup().await.unwrap();
     let mut app = App::restore(
         w.env_on(Arc::new(MemoryStore::new())),
         ApiProtocol::new(Mode::Plain),
@@ -976,7 +978,7 @@ async fn test_highest_service_time_follows_verified_answers() {
     app.receive(None).await.unwrap();
     assert_eq!(app.highest_service_time(), Some(START + MINUTE));
     // A restored app has verified nothing yet.
-    let backup = app.backup().unwrap();
+    let backup = app.backup().await.unwrap();
     let restored = App::restore(
         w.env_on(Arc::new(MemoryStore::new())),
         ApiProtocol::new(Mode::Plain),
@@ -1415,7 +1417,11 @@ async fn test_outbox_give_up_reads_state_again_before_going_on() {
     assert_eq!(report.undelivered, vec![msg_id]);
     // The refused commit was read past: what the app holds is the store's again, so a
     // backup, only ever of committed state, is given at once.
-    assert!(wallet.backup().is_ok(), "{:?}", wallet.backup().err());
+    assert!(
+        wallet.backup().await.is_ok(),
+        "{:?}",
+        wallet.backup().await.err()
+    );
 }
 
 #[tokio::test]
@@ -2804,4 +2810,366 @@ async fn test_scripted_feed_visibility_by_kind_and_currency() {
             assert_eq!(item["type"], "stub", "{what}, a stub: {item}");
         }
     }
+}
+
+// -------------------------------------------------------------------------------------
+// The outbox across a backup and a restore
+
+/// Alice's wallet, with a note to bob queued and refused `403 not_admitted`, bob's shop, and
+/// that note as signed.
+async fn wallet_with_a_queued_note(
+    p: &Pair,
+    protocol: &Arc<ApiProtocol>,
+) -> (App, App, SignedMessage) {
+    let mut wallet = p.join(&p.alice, "wallet", protocol).await;
+    let shop = p.join(&p.bob, "shop", protocol).await;
+    let signed = wallet.sign_message(Pair::note(&p.bob, "hello")).unwrap();
+    wallet.queue_signed(signed.clone()).await.unwrap();
+    let delivery = wallet
+        .flush_message(signed.msg_id())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(queued_with(&delivery, "not_admitted"), "{delivery:?}");
+    (wallet, shop, signed)
+}
+
+/// `backup` restored for alice's wallet onto a new store.
+async fn restored_wallet(p: &Pair, protocol: &Arc<ApiProtocol>, backup: &AppBackup) -> App {
+    let backup = AppBackup::from_bytes(&backup.to_bytes().unwrap()).unwrap();
+    let env = p.env(&p.alice, Arc::new(MemoryStore::new()));
+    App::restore(env, protocol.clone(), config(), &backup)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn test_backup_outbox_queued_message_delivers_after_the_restore() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let (wallet, mut shop, signed) = wallet_with_a_queued_note(&p, &protocol).await;
+    let backup = wallet.backup().await.unwrap();
+    drop(wallet);
+    shop.invite(&p.alice.identity().public()).await.unwrap();
+    let mut restored = restored_wallet(&p, &protocol, &backup).await;
+    let msg_id = signed.msg_id().to_owned();
+    assert!(
+        matches!(
+            restored.delivery(&msg_id).await.unwrap(),
+            Some(Delivery::Queued { .. })
+        ),
+        "the restore put the message back in the outbox"
+    );
+    let report = restored.flush_outbox().await.unwrap();
+    assert_eq!(report.done, vec![msg_id.clone()], "{report:?}");
+    // The same signed plaintext, so the same `msg_id` and hash.
+    let sent = restored
+        .sent_to(&p.bob.identity().public(), 0, u64::MAX)
+        .await
+        .unwrap();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].plaintext.encode(), signed.plaintext().encode());
+    shop.receive(None).await.unwrap();
+    let seen = protocol.seen();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].msg_id, msg_id);
+}
+
+#[tokio::test]
+async fn test_backup_outbox_message_delivered_since_the_backup_is_a_harmless_duplicate() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let (mut wallet, mut shop, signed) = wallet_with_a_queued_note(&p, &protocol).await;
+    let backup = wallet.backup_layered().await.unwrap();
+    // The wallet delivers the note after the backup, and bob's app processes it.
+    shop.invite(&p.alice.identity().public()).await.unwrap();
+    let report = wallet.flush_outbox().await.unwrap();
+    assert_eq!(report.done, vec![signed.msg_id().to_owned()]);
+    shop.receive(None).await.unwrap();
+    assert_eq!(protocol.seen().len(), 1);
+    // Read, the entry is gone from bob's inbox.
+    let alice = p.alice.identity().public();
+    assert_eq!(p.bob.switch().entries_from(&alice), 0);
+    // The restore from before the delivery sends it again: bob's switch, which no longer
+    // holds the entry, takes it as new, and bob's app drops it by its processed pair.
+    drop(wallet);
+    let mut restored = restored_wallet(&p, &protocol, &backup).await;
+    let report = restored.flush_outbox().await.unwrap();
+    assert_eq!(report.done, vec![signed.msg_id().to_owned()]);
+    assert_eq!(p.bob.switch().entries_from(&alice), 1);
+    shop.receive(None).await.unwrap();
+    assert_eq!(protocol.seen().len(), 1, "applied once");
+    assert!(
+        protocol.seen().iter().all(|seen| !seen.conflict),
+        "the second copy is a duplicate, not a conflict"
+    );
+}
+
+/// Whether the events tell the protocol, once, that `msg_id` wasn't delivered, as a re-send
+/// or not.
+fn undelivered_once(events: &[AppEvent], msg_id: &str, resend: bool) -> bool {
+    events
+        .iter()
+        .filter(|e| matches!(e, AppEvent::MessageUndelivered { msg_id: m, resend: r, .. } if m == msg_id && *r == resend))
+        .count()
+        == 1
+}
+
+#[tokio::test]
+async fn test_backup_outbox_past_the_window_gives_the_delivery_up() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let (wallet, mut shop, signed) = wallet_with_a_queued_note(&p, &protocol).await;
+    let backup = wallet.backup().await.unwrap();
+    drop(wallet);
+    shop.invite(&p.alice.identity().public()).await.unwrap();
+    // A first try more than 30 days after the backup: bob's app may hold the processed pair
+    // of a delivery since no longer.
+    p.clock.advance_ms(SENT_RETENTION_MS + MINUTE);
+    let mut restored = restored_wallet(&p, &protocol, &backup).await;
+    let msg_id = signed.msg_id().to_owned();
+    restored.take_events();
+    let report = restored.flush_outbox().await.unwrap();
+    assert_eq!(report.undelivered, vec![msg_id.clone()]);
+    assert!(undelivered_once(&restored.take_events(), &msg_id, false));
+    assert_eq!(restored.delivery(&msg_id).await.unwrap(), None);
+    restored.flush_outbox().await.unwrap();
+    assert!(restored.take_events().is_empty(), "told once");
+    assert_eq!(p.bob.switch().entries_from(&p.alice.identity().public()), 0);
+}
+
+/// The deadline is checked at every try, not at the restore: a message put back 29 days
+/// after the backup, and first tried two days later, isn't sent.
+#[tokio::test]
+async fn test_backup_outbox_restored_in_time_and_tried_past_the_window_isnt_sent() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let (mut wallet, mut shop, signed) = wallet_with_a_queued_note(&p, &protocol).await;
+    let backup = wallet.backup().await.unwrap();
+    shop.invite(&p.alice.identity().public()).await.unwrap();
+    assert_eq!(wallet.flush_outbox().await.unwrap().done.len(), 1);
+    shop.receive(None).await.unwrap();
+    drop(wallet);
+    p.clock.advance_ms(29 * DAY_MS);
+    let mut restored = restored_wallet(&p, &protocol, &backup).await;
+    assert!(matches!(
+        restored.delivery(signed.msg_id()).await.unwrap(),
+        Some(Delivery::Queued { .. })
+    ));
+    p.clock.advance_ms(2 * DAY_MS);
+    let report = restored.flush_outbox().await.unwrap();
+    assert_eq!(report.undelivered, vec![signed.msg_id().to_owned()]);
+    shop.receive(None).await.unwrap();
+    assert_eq!(protocol.seen().len(), 1, "applied once");
+}
+
+/// A device clock behind doesn't hold the window open: the deadline is judged at the later
+/// of the device clock and the service time the flush verifies.
+#[tokio::test]
+async fn test_backup_outbox_window_holds_on_a_device_clock_behind() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let (wallet, mut shop, signed) = wallet_with_a_queued_note(&p, &protocol).await;
+    let backup = wallet.backup().await.unwrap();
+    drop(wallet);
+    shop.invite(&p.alice.identity().public()).await.unwrap();
+    p.clock.advance_ms(32 * DAY_MS);
+    let backup = AppBackup::from_bytes(&backup.to_bytes().unwrap()).unwrap();
+    let mut env = p.env(&p.alice, Arc::new(MemoryStore::new()));
+    env.clock = Arc::new(crate::clock::TestClock::new(p.clock.now_ms() - 3 * DAY_MS))
+        as Arc<dyn crate::clock::Clock>;
+    let mut restored = App::restore(env, protocol.clone(), config(), &backup)
+        .await
+        .unwrap();
+    let report = restored.flush_outbox().await.unwrap();
+    assert_eq!(report.undelivered, vec![signed.msg_id().to_owned()]);
+    assert_eq!(p.bob.switch().entries_from(&p.alice.identity().public()), 0);
+}
+
+/// A restored note tried at `offset` from its replay deadline: whether it went.
+async fn tried_at_the_deadline(offset: i64) -> bool {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let (wallet, mut shop, signed) = wallet_with_a_queued_note(&p, &protocol).await;
+    let backup = wallet.backup().await.unwrap();
+    drop(wallet);
+    shop.invite(&p.alice.identity().public()).await.unwrap();
+    let mut restored = restored_wallet(&p, &protocol, &backup).await;
+    let deadline = restored
+        .outbox_record(signed.msg_id())
+        .await
+        .unwrap()
+        .replay_until_ms()
+        .unwrap();
+    p.clock.set_ms(deadline.saturating_add_signed(offset));
+    let report = restored.flush_outbox().await.unwrap();
+    report.done == vec![signed.msg_id().to_owned()]
+}
+
+#[tokio::test]
+async fn test_backup_outbox_window_ends_at_its_deadline() {
+    assert!(tried_at_the_deadline(0).await, "at the deadline, it goes");
+    assert!(!tried_at_the_deadline(1).await, "past it, it doesn't");
+}
+
+/// The deadline is the backup's time less the clock tolerance, plus 30 days, and a later
+/// backup and restore carry it, never moved on.
+#[tokio::test]
+async fn test_backup_outbox_deadline_survives_a_later_backup() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let (wallet, mut shop, signed) = wallet_with_a_queued_note(&p, &protocol).await;
+    let backup = wallet.backup().await.unwrap();
+    drop(wallet);
+    let first = restored_wallet(&p, &protocol, &backup).await;
+    let deadline = first
+        .outbox_record(signed.msg_id())
+        .await
+        .unwrap()
+        .replay_until_ms()
+        .unwrap();
+    assert!(deadline <= START + SENT_RETENTION_MS - CLOCK_TOLERANCE_MS);
+    p.clock.advance_ms(20 * DAY_MS);
+    let later = first.backup().await.unwrap();
+    drop(first);
+    let mut second = restored_wallet(&p, &protocol, &later).await;
+    assert_eq!(
+        second
+            .outbox_record(signed.msg_id())
+            .await
+            .unwrap()
+            .replay_until_ms(),
+        Some(deadline)
+    );
+    shop.invite(&p.alice.identity().public()).await.unwrap();
+    p.clock.advance_ms(11 * DAY_MS);
+    let report = second.flush_outbox().await.unwrap();
+    assert_eq!(report.undelivered, vec![signed.msg_id().to_owned()]);
+}
+
+/// A re-send queued from `sent/` and given up past the window is told as a re-send.
+#[tokio::test]
+async fn test_backup_outbox_resend_given_up_says_resend() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let mut wallet = p.join(&p.alice, "wallet", &protocol).await;
+    let mut shop = p.join(&p.bob, "shop", &protocol).await;
+    shop.invite(&p.alice.identity().public()).await.unwrap();
+    let (msg_id, delivery) = wallet.send(Pair::note(&p.bob, "hello")).await.unwrap();
+    assert!(
+        matches!(delivery, Delivery::Accepted { .. }),
+        "{delivery:?}"
+    );
+    p.bob.switch().fail_next(Fault::Unreachable {
+        path: "inbox".into(),
+        after: 0,
+    });
+    let delivery = wallet.resend(&msg_id).await.unwrap();
+    assert!(matches!(delivery, Delivery::Queued { .. }), "{delivery:?}");
+    let backup = wallet.backup().await.unwrap();
+    drop(wallet);
+    p.clock.advance_ms(SENT_RETENTION_MS + MINUTE);
+    let mut restored = restored_wallet(&p, &protocol, &backup).await;
+    restored.take_events();
+    restored.flush_outbox().await.unwrap();
+    assert!(undelivered_once(&restored.take_events(), &msg_id, true));
+}
+
+/// A message refused for good is carried as it stands: the restored app reports it failed.
+#[tokio::test]
+async fn test_backup_outbox_carries_failed_messages() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let mut wallet = p.join(&p.alice, "wallet", &protocol).await;
+    let mut shop = p.join(&p.bob, "shop", &protocol).await;
+    shop.invite(&p.alice.identity().public()).await.unwrap();
+    p.bob.switch().fail_next(Fault::Error {
+        path: "/inbox".into(),
+        code: ErrorCode::BadRequest,
+        current: Value::Null,
+    });
+    let (msg_id, delivery) = wallet.send(Pair::note(&p.bob, "hello")).await.unwrap();
+    assert!(matches!(delivery, Delivery::Failed { .. }), "{delivery:?}");
+    let backup = wallet.backup().await.unwrap();
+    drop(wallet);
+    let restored = restored_wallet(&p, &protocol, &backup).await;
+    assert!(matches!(
+        restored.delivery(&msg_id).await.unwrap(),
+        Some(Delivery::Failed { .. })
+    ));
+}
+
+/// An outbox over the byte budget is carried oldest first; the rest are told to the
+/// protocol as undelivered, and the restore fits one commit.
+#[tokio::test]
+async fn test_backup_outbox_over_its_budget_carries_the_oldest() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let mut wallet = p.join(&p.alice, "wallet", &protocol).await;
+    let text = "x".repeat(40_000);
+    let mut queued = Vec::new();
+    for _ in 0..260 {
+        let signed = wallet.sign_message(Pair::note(&p.bob, &text)).unwrap();
+        queued.push(wallet.queue_signed(signed).await.unwrap());
+        p.clock.advance_ms(1);
+    }
+    let backup = wallet.backup().await.unwrap();
+    drop(wallet);
+    let mut restored = restored_wallet(&p, &protocol, &backup).await;
+    let first = queued.first().unwrap();
+    let last = queued.last().unwrap();
+    assert!(restored.delivery(first).await.unwrap().is_some());
+    assert_eq!(restored.delivery(last).await.unwrap(), None);
+    let events = restored.take_events();
+    assert!(
+        undelivered_once(&events, last, false),
+        "{} events",
+        events.len()
+    );
+    let mut carried = 0;
+    for msg_id in &queued {
+        if restored.delivery(msg_id).await.unwrap().is_some() {
+            carried += 1;
+        } else {
+            assert!(undelivered_once(&events, msg_id, false));
+        }
+    }
+    assert!(carried > 0 && carried < queued.len(), "{carried}");
+}
+
+/// The deadline's base is the service time the backup's app had verified, not its device
+/// clock: a device clock ahead at the backup doesn't move the window on.
+#[tokio::test]
+async fn test_backup_outbox_deadline_starts_at_the_verified_service_time() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let _shop = p.join(&p.bob, "shop", &protocol).await;
+    // The wallet's device clock runs four minutes ahead of its switch.
+    let ahead = Arc::new(crate::clock::TestClock::new(START + 4 * MINUTE));
+    let keys = p.alice.identity().app_keys("wallet");
+    let request = p
+        .alice
+        .approve(
+            &keys,
+            &AppSpec::new(&["scope-a"]).with_permissions(&Permission::ALL),
+        )
+        .unwrap();
+    let mut env = p.env(&p.alice, Arc::new(MemoryStore::new()));
+    env.clock = Arc::clone(&ahead) as Arc<dyn crate::clock::Clock>;
+    let mut wallet = App::join(env, protocol.clone(), config(), request)
+        .await
+        .unwrap();
+    wallet.receive(None).await.unwrap();
+    let signed = wallet.sign_message(Pair::note(&p.bob, "hello")).unwrap();
+    wallet.queue_signed(signed.clone()).await.unwrap();
+    let backup = wallet.backup().await.unwrap();
+    drop(wallet);
+    let restored = restored_wallet(&p, &protocol, &backup).await;
+    let deadline = restored
+        .outbox_record(signed.msg_id())
+        .await
+        .unwrap()
+        .replay_until_ms()
+        .unwrap();
+    assert_eq!(deadline, START + SENT_RETENTION_MS - CLOCK_TOLERANCE_MS);
 }

@@ -21,7 +21,7 @@ use pubky_switch_core::sig::SignedDoc;
 use pubky_switch_core::time::rfc3339;
 use serde_json::{Value, json};
 
-use super::{Answer, Inner, ScriptedSwitch, SwitchApp, bad};
+use super::{Answer, Inner, ScriptedSwitch, SwitchApp, bad, parse_query};
 use crate::clock::Clock;
 use crate::transport::Request;
 
@@ -463,6 +463,11 @@ impl Shared {
     }
 }
 
+/// `403 permission_missing`, for a read the caller may not make.
+fn permission_missing(message: &str) -> Answer {
+    bad(ErrorCode::PermissionMissing, message, json!(null))
+}
+
 /// A written operation, once its proof is signed.
 pub(super) struct Written<'a> {
     pub(super) op: &'a SignedOp,
@@ -533,98 +538,166 @@ impl Inner {
                 }
                 (200, json!({ "declined": id }))
             }
-            ("GET", "records") => {
-                let collection = query
-                    .split('&')
-                    .find_map(|pair| match pair.split_once('=') {
-                        Some(("collection", value)) => unb64_array::<32>(value).ok(),
-                        _ => None,
-                    })?;
-                // The records the caller may read: its certificate holds the read scope, a
-                // name covering its sub-scopes (Switch wire 7.4.9).
-                let cert = caller
-                    .and_then(|app| self.apps.get(&app))
-                    .and_then(|app| app.cert.clone());
-                let mut after: Option<String> = None;
-                let mut limit = 1000usize;
-                for pair in query.split('&') {
-                    match pair.split_once('=') {
-                        Some(("after", value)) => after = Some(value.to_owned()),
-                        Some(("limit", value)) => match value.parse() {
-                            Ok(value @ 1..=1000) => limit = value,
-                            _ => return Some(bad(ErrorCode::BadRequest, "limit", json!(null))),
-                        },
-                        _ => {}
-                    }
-                }
-                // Ordered by the base64url text of their keys, after `after` (Switch wire
-                // 7.4.9).
-                let mut listed: Vec<(String, Value)> = self
-                    .shared
-                    .records
-                    .values()
-                    .filter(|held| held.state.collection == collection && !held.state.deleted)
-                    .filter(|held| {
-                        cert.as_ref()
-                            .is_none_or(|cert| cert.holds_scope(&held.state.policy.read_scope))
-                    })
-                    .map(|held| {
-                        (
-                            b64(&held.state.key),
-                            record_view(held, &self.apps, !self.shared.hide_proofs),
-                        )
-                    })
-                    .filter(|(key, _)| after.as_ref().is_none_or(|after| key > after))
-                    .collect();
-                listed.sort_by(|a, b| a.0.cmp(&b.0));
-                let mut views = Vec::new();
-                let mut bytes = 0usize;
-                let mut last = None;
-                let mut more = false;
-                for (key, view) in listed {
-                    let size = view.to_string().len();
-                    // `limit`, or the byte budget, ends the page; its first view is shown
-                    // whatever its size.
-                    if views.len() >= limit
-                        || (!views.is_empty() && bytes.saturating_add(size) > self.max_page_bytes)
-                    {
-                        more = true;
-                        break;
-                    }
-                    bytes = bytes.saturating_add(size);
-                    views.push(view);
-                    last = Some(key);
-                }
-                self.shared.listings += 1;
-                let next = match self.shared.alternate_next {
-                    Some((a, b)) if self.shared.listings <= 50 => {
-                        json!(b64(if self.shared.listings % 2 == 1 {
-                            &a
-                        } else {
-                            &b
-                        }))
-                    }
-                    _ if more => json!(last),
-                    _ => json!(null),
-                };
-                (
-                    200,
-                    json!({ "records": views, "seq": self.seq, "next": next }),
-                )
-            }
+            ("GET", "records") => self.list_records(caller, query),
             ("GET", r) if r.starts_with("records/") => {
-                let key = unb64_array::<32>(r.trim_start_matches("records/")).ok()?;
-                match self.shared.records.get(&key) {
-                    Some(held) => (200, record_view(held, &self.apps, !self.shared.hide_proofs)),
-                    None => bad(ErrorCode::NotFound, "no record", json!(null)),
-                }
+                self.record_answer(caller, r.trim_start_matches("records/"))
             }
             ("GET", r) if r.starts_with("claims/") => {
-                let claim_key = unb64_array::<32>(r.trim_start_matches("claims/")).ok()?;
-                self.claim_answer(&claim_key)
+                // Only an own app holding `claims.read`, before the key is read
+                // (`crates/pubky-switch/src/service/claims.rs`, `get_claim`).
+                let reads = caller
+                    .and_then(|app| self.checked_cert(&app))
+                    .is_some_and(|cert| cert.has_permission(Permission::ClaimsRead));
+                if !reads {
+                    return Some(permission_missing(
+                        "7.4.8: reading claims needs claims.read",
+                    ));
+                }
+                match unb64_array::<32>(r.trim_start_matches("claims/")) {
+                    Ok(claim_key) => self.claim_answer(&claim_key),
+                    Err(_) => bad(ErrorCode::BadRequest, "a claim key is b64(32)", json!(null)),
+                }
             }
             _ => return None,
         })
+    }
+
+    /// The certificate an own app's record reads are checked against (Switch wire 7.4.9),
+    /// the one the switch checks the app against; the signer reads no records (`403
+    /// permission_missing`, `crates/pubky-switch/src/service/records.rs`, `only_apps`).
+    fn record_reader(&self, caller: Option<[u8; 16]>) -> Result<Option<AppCert>, Answer> {
+        match caller {
+            Some(app) => Ok(self.checked_cert(&app)),
+            None => Err(permission_missing(
+                "7.4.9: apps read records; the signer doesn't",
+            )),
+        }
+    }
+
+    /// `GET /records/{key}` (Switch wire 7.4.9), in the service's order
+    /// (`crates/pubky-switch/src/service/records.rs`, `get_record`): the signer refused, the
+    /// key read (`400`), the record found (`404`), then its `read_scope` held by the reader's
+    /// certificate (`403 permission_missing`). An own app the switch holds no certificate
+    /// for holds no scope.
+    fn record_answer(&self, caller: Option<[u8; 16]>, key: &str) -> Answer {
+        let cert = match self.record_reader(caller) {
+            Ok(cert) => cert,
+            Err(refused) => return refused,
+        };
+        let Ok(key) = unb64_array::<32>(key) else {
+            return bad(
+                ErrorCode::BadRequest,
+                "a record key is b64(32)",
+                json!(null),
+            );
+        };
+        let Some(held) = self.shared.records.get(&key) else {
+            return bad(ErrorCode::NotFound, "no record", json!(null));
+        };
+        if !cert.is_some_and(|cert| cert.holds_scope(&held.state.policy.read_scope)) {
+            return permission_missing("7.4.9: reading the record needs its read_scope");
+        }
+        (200, record_view(held, &self.apps, !self.shared.hide_proofs))
+    }
+
+    /// `GET /records?collection=&after=&limit=` (Switch wire 7.4.9), its query read as the
+    /// service reads it (`crates/pubky-switch/src/service/records.rs`,
+    /// `RecordsQuery::parse`): `collection` required and `b64(32)`, `after` a record key,
+    /// its text the one keys compare with, and `limit` digits only, 1 to 1000; other
+    /// parameters ignored. The records shown are those whose `read_scope` the reader's
+    /// certificate holds.
+    fn list_records(&mut self, caller: Option<[u8; 16]>, query: &str) -> Answer {
+        // The query is read before the caller is: percent-decoded, a parameter given twice
+        // refused (`crates/pubky-switch/src/http/route.rs`, `parse_query`; Switch wire 7.1).
+        let Some(params) = parse_query(query) else {
+            return bad(
+                ErrorCode::BadRequest,
+                "the query doesn't decode",
+                json!(null),
+            );
+        };
+        let cert = match self.record_reader(caller) {
+            Ok(cert) => cert,
+            Err(refused) => return refused,
+        };
+        let param = |name: &str| params.get(name).map(String::as_str);
+        let Some(collection) = param("collection") else {
+            return bad(ErrorCode::BadRequest, "collection is required", json!(null));
+        };
+        let Ok(collection) = unb64_array::<32>(collection) else {
+            return bad(ErrorCode::BadRequest, "collection", json!(null));
+        };
+        // A key has one text (Switch wire 1.2): the one given, read, is what keys compare
+        // with, as unpadded base64url text in ASCII order.
+        let after = match param("after").map(unb64_array::<32>) {
+            None => None,
+            Some(Ok(key)) => Some(b64(&key)),
+            Some(Err(_)) => return bad(ErrorCode::BadRequest, "after", json!(null)),
+        };
+        let limit = match param("limit") {
+            None => 1000,
+            Some(text) => match text.parse::<usize>() {
+                Ok(value @ 1..=1000)
+                    if text.len() <= 16 && text.bytes().all(|b| b.is_ascii_digit()) =>
+                {
+                    value
+                }
+                _ => return bad(ErrorCode::BadRequest, "limit", json!(null)),
+            },
+        };
+        // Ordered by the base64url text of their keys, after `after` (Switch wire 7.4.9).
+        let mut listed: Vec<(String, Value)> = self
+            .shared
+            .records
+            .values()
+            .filter(|held| held.state.collection == collection && !held.state.deleted)
+            .filter(|held| {
+                cert.as_ref()
+                    .is_some_and(|cert| cert.holds_scope(&held.state.policy.read_scope))
+            })
+            .map(|held| {
+                (
+                    b64(&held.state.key),
+                    record_view(held, &self.apps, !self.shared.hide_proofs),
+                )
+            })
+            .filter(|(key, _)| after.as_ref().is_none_or(|after| key > after))
+            .collect();
+        listed.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut views = Vec::new();
+        let mut bytes = 0usize;
+        let mut last = None;
+        let mut more = false;
+        for (key, view) in listed {
+            let size = view.to_string().len();
+            // `limit`, or the byte budget, ends the page; its first view is shown whatever
+            // its size.
+            if views.len() >= limit
+                || (!views.is_empty() && bytes.saturating_add(size) > self.max_page_bytes)
+            {
+                more = true;
+                break;
+            }
+            bytes = bytes.saturating_add(size);
+            views.push(view);
+            last = Some(key);
+        }
+        self.shared.listings += 1;
+        let next = match self.shared.alternate_next {
+            Some((a, b)) if self.shared.listings <= 50 => {
+                json!(b64(if self.shared.listings % 2 == 1 {
+                    &a
+                } else {
+                    &b
+                }))
+            }
+            _ if more => json!(last),
+            _ => json!(null),
+        };
+        (
+            200,
+            json!({ "records": views, "seq": self.seq, "next": next }),
+        )
     }
 
     fn claim_answer(&mut self, claim_key: &[u8; 32]) -> Answer {

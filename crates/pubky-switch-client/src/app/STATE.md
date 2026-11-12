@@ -89,6 +89,36 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
   write of its own; its commit also keeps a service time not yet committed), so no later
   entry of the live store takes it.
 
+- **A backup carries the outbox:** every `out/` record as it stands, a message refused for
+  good included, so the restored app reports it failed until it is forgotten; oldest queued
+  first, within `MAX_CARRIED_OUTBOX_BYTES` (8 MiB), so the restore's one commit fits, the
+  messages past it named so the restore keeps a `MessageUndelivered` duty event for each;
+  and the backup's time, the device's and the highest service time verified then. Both
+  kinds of backup read it from the store, a layered one in the same moment as the rest, and
+  both check that the restore fits one commit before they return. A restore writes the
+  records back in its one commit, so a message queued before the backup goes after the
+  restore with the same `msg_id`, signed plaintext and last sealed envelope.
+- **A restored delivery has a replay deadline** (`replay_until_ms` on its record): the
+  backup's verified service time, or its device time without one, less the clock tolerance,
+  plus `SENT_RETENTION_MS` (30 days), or a message's first acceptance plus 30 days when it
+  was accepted before, whichever is earlier, and never later than one it carries already.
+  A copy the device the backup came from delivered since is harmless until then: the
+  recipient's switch answers a retry of the same envelope with its first answer while it
+  holds the entry (Switch wire 7.4.3 step 1), and the recipient's apps drop a copy taken as
+  new by its processed pair, kept 30 days and the tolerance from processing, which is at or
+  after the first acceptance (Switch spec 11). Every try checks it before the delivery, at
+  the later of the device clock and a service time verified in the call, which a one-item
+  feed read fetches when the device clock says the deadline hasn't passed: past it the
+  delivery is given up in one commit with a `MessageUndelivered` duty event, a message never
+  accepted deleted, one accepted before kept for its owed record job, its sealed envelope
+  dropped. A later backup carries the deadline and a later restore keeps the earlier of it
+  and its own.
+- **A backup doesn't carry `opq/`, `sent/` or `sentt/`.** A kept batch's messages go into
+  the outbox only with the batch's answer, so a restored app neither sends the batch nor
+  delivers the messages it would have queued; the restore's reconcile mode reads the shared
+  records and claims, and the protocol queues what it still owes again. A restored app
+  answers re-send requests only for what it delivers after the restore.
+
 ## Keys
 
 | Key | Holds | Sensitive |
@@ -100,7 +130,7 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
 | `record` | the app record the service holds or is being given (signed) | |
 | `naming` | the naming key | yes |
 | `scope/<epoch>/<scope>` | one scope key | yes |
-| `bundle` | `keys_through`, and when a full bundle was requested | |
+| `bundle` | `keys_through`, and when a full bundle was requested (the service's `requested` time), until no key is missing or the feed shows a part stored at or after that time, which asks again for a key still missing: at most once per such part (Switch wire 7.4.11). A backup carries it and a restore drops it, so the restored app's first read fetches and asks once if a key is still missing | |
 | `ident/<pubky>/doc` | the newest `identity.json` taken for an identity, own or a sender's, and when it was read | |
 | `ident/<pubky>/floor` | the highest version and generation seen | |
 | `ident/<pubky>/body/<version>` | the body hash seen at a version, for equivocation | |
@@ -110,7 +140,7 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
 | `ident/<pubky>/reads` | when a counterparty's `identity.json` was last read from its Homeserver, and from its switch | |
 | `rk/<n>` | a held receive key: secret, signed record, registration `seq` and service time, pending batch | yes |
 | `kid/<kid>` | a kid this app or one of its devices made, kept after the key is deleted | |
-| `reg/<n>` | a registration of the own app whose key this device doesn't hold: own, awaiting device sync, or unaccounted after a restore | |
+| `reg/<n>` | a registration of the own app whose key this device doesn't hold: own, awaiting device sync, or unaccounted after a restore. One rule judges a registration no device of the app made wherever it is met (the restore's key check, the feed, a registration conflict, a provider loss's, the re-registration after a move or a key change in place, and the device sync): while the `restore` record is held, one after the backup's newest key and before the key the restored app registered is unaccounted, and only the user's "no" is a compromise (Switch spec 12.4); any other is a compromise at once, or awaits the device sync on an app that shares its keys. The record is in the store, so it holds across a crash between following a provider change and the restore's key check | |
 | `rotation` | the last rotation's time, and whether an envelope to the current key was opened since | |
 | `device` | whether the app shares its keys across devices | |
 | `cursor` | the processed position, the cursor the service holds, the deferral, the cursor's time | |
@@ -134,7 +164,7 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
 | `pending/effect` | a received message's effect batch and its outcome writes, with the deadlines of the claims it writes, and the opened entry, to store it locally if the batch outlives the batch ID window; its local writes are kept in base64 (`kept_local`), and the form with arrays of numbers written before still reads | yes |
 | `pending/record` | an `app.put` batch | |
 | `alarm` | the alarm that stopped the app | |
-| `restore` | after a restore: the backup's highest `n`, the key check, the app's own new key, reconcile mode | |
+| `restore` | after a restore: the backup's highest `n`, the key check, the end of the registrations the restore asks about (set at the key check: the key it registered, or one above the backup's highest when the restored key was current), reconcile mode; it goes when reconciliation ends with the key check done, and no registration is judged by the restore rule after. Before the key check the app reads its directory: it takes the own `identity.json` there if newer than the backup's, and the certificate that lists from its own record, under the renewal checks, so a renewal another device of the app took since, whose `cert.put` is a stub by then, is taken at the first read | |
 | `leave` | a leave in progress or done | |
 | `service_time` | the highest service time verified, its key, the offset from the device clock | |
 | `p/...` | the protocol's own local state (`LocalWrite`) | the protocol's |
@@ -233,8 +263,8 @@ uploads; `push.rs` holds the push registration. The peek (`peek.rs`) writes noth
 | `lc/too_large` | the service time of the last `GET /allow` answer whose lists didn't fit one commit, in a commit of its own; while it is less than `LISTS_TOO_LARGE_RETRY_MS` (a day) old by the highest service time verified, which each read's page moves on, a read doesn't refresh the copy it owes; `allow_list()` always does; a refresh that fits, a provider change (the commit that switches the service, or that starts a loss) and a restore remove it | |
 | `invite/<code_hash>` | the code of an invite code the app registered, to show it again | yes |
 | `opq/<batch_id>` | a batch of operations, signed and kept before it is sent, with what its answer settles and, from its first send on, when that left (`kept_ms`, absent while never sent): the protocol's local writes, kept in base64 as in `pending/effect`, and the signed messages it puts in the outbox; it goes with its answer or a refusal for good, and stays through anything else, except that one never sent that holds an `attempt` goes unsent, reported as dropped with its attempts, when it would be sent while the app may not attempt (reconcile mode, Switch spec 12.4). All of them together take at most `MAX_KEPT_BATCHES_BYTES` (12 MiB), so a provider change carries them in its one commit: `submit_batch` keeps no batch past it | the messages' |
-| `list_due` | a listing of the collections is owed: after joining, a restore or a `missed` item | |
-| `rec/<key>` | the shared record write the app took: the signed operation, certificate and proof, its version and whether a proof gave it, the opened value, and the refused write it follows | yes |
+| `list_due` | a listing of the collections is owed: after joining, a restore, a `missed` item, or a certificate taken (a renewal, or the listed one from the own record) that reads a collection of the protocol the one before didn't, in the commit that takes it. It stays while the certificate lacks the key, at the current data epoch, of a scope that reads a collection, so the read after the key arrives lists | |
+| `rec/<key>` | the shared record write the app took: the signed operation, certificate and proof, its version and whether a proof gave it, the opened value, or why it isn't open: its key not held yet (`Unreadable`, the form written before, its data epoch read from the operation), or not opening with its key held (`DoesNotOpen`, flagged); and the refused write it follows. A value whose key isn't held is opened again from the kept operation when a fetch takes a scope key, and whenever the same write is read again; one that doesn't open with its key isn't tried again; neither is tried at every read | yes |
 | `recname/<key>` | the collection name of a record the app creates outside the protocol's collections, from a write or an effect, until its write is answered | |
 | `hw/<key>` | the protocol's mark of what the app has seen in a record, in base64, at most `MAX_SEEN_MARK_BYTES` (64 KiB) before it. A longer one is never kept: an own write whose mark won't fit is refused before it is built; another app's write leaves the mark held as it is and keeps a `RecordUncheckable` duty event; an own write found over the bound once taken deletes the mark held and keeps the same event | the protocol's |
 | `flag/<key>/<generation>/<version>` | a write the app refused, with the app it names and the rule, cut to `MAX_REGRESSION_REASON_BYTES` (256 bytes) | |
@@ -245,8 +275,8 @@ uploads; `push.rs` holds the push registration. The peek (`peek.rs`) writes noth
 | `clread/<claim_key>` | a claim the app holds and doesn't hold as finished (SETTLED with every attempt `done` or `failed`), to read again, with the device time it was marked; read at the end of a read, at most `CLAIM_REREADS_PER_READ` (16) per read, oldest mark first, and removed in the commit of any read of the claim, a `404` included, or when its evidence goes | |
 
 Deleting the keys on a leave also removes `rec/`, `hw/`, `recname/`, `out/`, `sent/`,
-`sentt/`, `invite/` and `opq/`. A restore replaces the namespace, these keys included, and
-sets `list_due`. `rec/`, `clent/` and `claim/` hold the evidence of the shared state that
+`sentt/`, `invite/` and `opq/`. A restore replaces the namespace, these keys included, but
+for the `out/` records its backup carries, and sets `list_due`. `rec/`, `clent/` and `claim/` hold the evidence of the shared state that
 uploads carry (`App::shared_evidence`).
 
 ## What the app owes its protocol: restores and provider changes

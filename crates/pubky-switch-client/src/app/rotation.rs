@@ -251,6 +251,13 @@ impl App {
             });
             return Ok(());
         }
+        // A restore asks the user about it (Switch spec 12.4).
+        if self.restore_asks_about(record.n()) {
+            self.ask_about_registration(record.n(), record.kid(), None, &mut tx)?;
+            self.commit(tx).await?;
+            self.push_restore_question();
+            return Ok(());
+        }
         self.commit(tx).await?;
         let alarm = Alarm::Compromise {
             n: record.n(),
@@ -259,6 +266,51 @@ impl App {
         let error = self.raise(alarm).await;
         self.leave_on_compromise().await;
         Err(error)
+    }
+
+    /// Whether a restore asks the user about the registration `n` whose kid no device of
+    /// the app made (Switch spec 12.4 "Registrations since the backup"): one after the
+    /// backup's newest key, while the restore is held, and, once the restore's key check
+    /// has run, below the bound it set: the key it registered, or one above the backup's
+    /// newest when the restored key was current, so nothing is asked about then. The one rule wherever such a registration is met: the restore's
+    /// key check, the feed, a registration conflict (a fresh key's, a provider loss's), the
+    /// re-registration after a move or a key change in place, and the device sync. Such a
+    /// registration is unaccounted, and only the user's "no" makes it a compromise
+    /// ([`App::refuse_restored_registrations`]); any other is a compromise at once, or, on
+    /// an app that shares its keys, waits for the device sync.
+    pub(crate) fn restore_asks_about(&self, n: u64) -> bool {
+        self.state
+            .restore
+            .as_ref()
+            .is_some_and(|r| n > r.n_floor && r.own_key_n.is_none_or(|own| n < own))
+    }
+
+    /// Keep the registration `n` as unaccounted, in `tx` and memory: a restore asks the
+    /// user about it ([`App::restore_asks_about`]).
+    pub(crate) fn ask_about_registration(
+        &mut self,
+        n: u64,
+        kid: [u8; 8],
+        at_ms: Option<u64>,
+        tx: &mut Tx,
+    ) -> Result<(), AppError> {
+        let registration = Registration {
+            kid,
+            seq: None,
+            at_ms,
+            status: RegStatus::Unaccounted,
+        };
+        tx.put(&key::registration(n), &registration)?;
+        self.state.registrations.insert(n, registration);
+        Ok(())
+    }
+
+    /// Tell the host of the open restore question, once its registrations are committed.
+    pub(crate) fn push_restore_question(&mut self) {
+        let n = self.restore_question();
+        if !n.is_empty() {
+            self.events.push(AppEvent::RestoreQuestion { n });
+        }
     }
 
     /// The `distrust_from` for a registration of the own app learned of without its chain
@@ -337,13 +389,7 @@ impl App {
             } else {
                 RegistrationStep::Continue
             }
-        } else if !self.state.device.multi_device
-            && self
-                .state
-                .restore
-                .as_ref()
-                .is_some_and(|r| n > r.n_floor && r.own_key_n.is_none_or(|own| n < own))
-        {
+        } else if !self.state.device.multi_device && self.restore_asks_about(n) {
             registration.status = RegStatus::Unaccounted;
             RegistrationStep::Continue
         } else if self.state.device.multi_device {
@@ -425,14 +471,18 @@ impl App {
     /// After a restore, before reading (Switch spec 12.4 step 1): read the own current
     /// receive key record; if the restored key isn't it, register a fresh key, `n` one
     /// higher, and ask about a registration since the backup the app can't account for.
-    pub(crate) async fn check_key_after_restore(&mut self) -> Result<(), AppError> {
+    /// `current` is the own receive key record the directory shows, read with the listed
+    /// certificate ([`App::take_listed_cert`]).
+    pub(crate) async fn check_key_after_restore(
+        &mut self,
+        current: Option<ReceiveKeyRecord>,
+    ) -> Result<(), AppError> {
         let Some(restore) = self.state.restore.clone() else {
             return Ok(());
         };
         if restore.key_checked {
             return Ok(());
         }
-        let current = self.own_directory_key().await?;
         let mut tx = self.tx()?;
         let mut register = None;
         if let Some(record) = current
@@ -443,35 +493,27 @@ impl App {
                 .is_none_or(|held| held.key.kid != record.kid())
         {
             let n = record.n();
-            if n > restore.n_floor
-                && !self.state.known_kids.contains_key(&record.kid())
+            if !self.state.known_kids.contains_key(&record.kid())
                 && !self.state.device.multi_device
+                && self.restore_asks_about(n)
             {
-                let registration = Registration {
-                    kid: record.kid(),
-                    seq: None,
-                    at_ms: None,
-                    status: RegStatus::Unaccounted,
-                };
-                tx.put(&key::registration(n), &registration)?;
-                self.state.registrations.insert(n, registration);
+                self.ask_about_registration(n, record.kid(), None, &mut tx)?;
             }
             register = Some(
                 n.checked_add(1)
                     .ok_or_else(|| AppError::InvalidData("receive key numbers ran out".into()))?,
             );
         }
+        // The check closes what the restore asks about at what it saw: up to the key it
+        // registers, or, with the restored key current, nothing above the backup's newest
+        // (Switch spec 12.4). A registration met later is judged as at any time.
         if let Some(state) = self.state.restore.as_mut() {
             state.key_checked = true;
-            state.own_key_n = register;
+            state.own_key_n = Some(register.unwrap_or(restore.n_floor.saturating_add(1)));
             tx.put(key::RESTORE, state)?;
         }
         self.commit(tx).await?;
-        if !self.restore_question().is_empty() {
-            self.events.push(AppEvent::RestoreQuestion {
-                n: self.restore_question(),
-            });
-        }
+        self.push_restore_question();
         if let Some(n) = register {
             self.new_key(n).await?;
             if !self.register(n).await? {
@@ -641,12 +683,21 @@ impl App {
                 self.state.known_kids.contains_key(kid) || kids.iter().any(|(k, _)| k == kid)
             };
             let taken = |n: &u64| held_keys.iter().any(|(m, _)| m == n);
-            let unknown = self
+            // One no device made: unaccounted while a restore asks about it, otherwise a
+            // compromise (Switch spec 3.6, 12.4).
+            let unmade: Vec<(u64, Option<u64>)> = self
                 .state
                 .registrations
                 .iter()
-                .find(|(n, r)| r.status == RegStatus::AwaitingSync && !taken(n) && !known(&r.kid))
-                .map(|(n, r)| (*n, r.at_ms));
+                .filter(|(n, r)| r.status == RegStatus::AwaitingSync && !taken(n) && !known(&r.kid))
+                .map(|(n, r)| (*n, r.at_ms))
+                .collect();
+            let asked: Vec<u64> = unmade
+                .iter()
+                .map(|(n, _)| *n)
+                .filter(|n| self.restore_asks_about(*n))
+                .collect();
+            let unknown = unmade.into_iter().find(|(n, _)| !asked.contains(n));
             let synced: Vec<u64> = self
                 .state
                 .registrations
@@ -683,7 +734,24 @@ impl App {
                     tx.put(&key::registration(*n), &own)?;
                 }
             }
+            for n in &asked {
+                if let Some(registration) = self.state.registrations.get(n) {
+                    let unaccounted = Registration {
+                        status: RegStatus::Unaccounted,
+                        ..registration.clone()
+                    };
+                    tx.put(&key::registration(*n), &unaccounted)?;
+                }
+            }
             self.commit(tx).await?;
+            for n in &asked {
+                if let Some(registration) = self.state.registrations.get_mut(n) {
+                    registration.status = RegStatus::Unaccounted;
+                }
+            }
+            if !asked.is_empty() {
+                self.push_restore_question();
+            }
             self.state.device = device;
             self.state.known_kids.extend(kids);
             for (n, held) in held_keys {

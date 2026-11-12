@@ -97,8 +97,8 @@ impl ScriptedSwitch {
 }
 
 impl Inner {
-    /// The routes an app of another identity calls; `not_admitted` for every other one
-    /// (Switch wire 6.4 step 1, 7.2).
+    /// The routes an app of another identity calls; `permission_missing` at the reads only
+    /// own apps make, and `not_admitted` for every other one (Switch wire 6.4 step 1, 7.2).
     pub(super) fn route_foreign(
         &mut self,
         request: &Request,
@@ -129,6 +129,18 @@ impl Inner {
             }
             ("POST", "inbox") => self.append(request, Some(sender), query)?,
             ("POST", "connect") => self.connect(sender),
+            // The feed, the claims, the lists and the records are read only by the
+            // account's own apps, and the key bundle calls, a leave, the hand-over and the
+            // signer's calls only an own app or the signer (Switch wire 7.4, 7.6;
+            // `crates/pubky-switch/src/service/rules.rs`, `other_app_refusal`); a batch and
+            // every call not served yet keep `not_admitted`.
+            ("GET", "feed" | "allow" | "records") => own_reads_only(),
+            ("GET", r) if r.starts_with("claims/") || r.starts_with("records/") => own_reads_only(),
+            (method, r) if own_or_signer_call(method, r) => bad(
+                ErrorCode::PermissionMissing,
+                "7.4: a call only an own app or the signer makes",
+                json!(null),
+            ),
             _ => not_admitted(),
         })
     }
@@ -239,11 +251,7 @@ impl Inner {
                 .is_some_and(|doc| doc.listed_cert(&app).is_some() && !doc.lists_removed(&app))
         });
         if !listed {
-            return bad(
-                ErrorCode::IdentityNeeded,
-                "identity needed",
-                json!({ "version": null }),
-            );
+            return identity_needed(None);
         }
         let (_, denied) = self.listed(&sender.identity);
         let now = self.now();
@@ -304,16 +312,22 @@ impl Inner {
         let Some(app) = app else {
             return Ok(bad(ErrorCode::BadRequest, "no app", json!(null)));
         };
+        // The query is read before the endpoint's checks, as at the service
+        // (`crates/pubky-switch/src/service/mod.rs`, `Call::Append`).
+        let Some(params) = super::parse_query(query) else {
+            return Ok(bad(
+                ErrorCode::BadRequest,
+                "the query doesn't decode",
+                json!(null),
+            ));
+        };
         // Step 1: a retry by content returns the original answer.
         if let Some(answer) = self.appended.get(&(identity, request.body.clone())) {
             return Ok((200, answer.clone()));
         }
-        let Some(sealed_for) = query
-            .split('&')
-            .find_map(|pair| match pair.split_once('=') {
-                Some(("apps_version", value)) => value.parse::<u64>().ok(),
-                _ => None,
-            })
+        let Some(sealed_for) = params
+            .get("apps_version")
+            .and_then(|value| super::decimal(value))
         else {
             return Ok(bad(ErrorCode::BadRequest, "apps_version", json!(null)));
         };
@@ -349,11 +363,7 @@ impl Inner {
                     .get(&identity)
                     .filter(|doc| !doc.lists_removed(&app))
                     .map(IdentityDoc::version);
-                return Ok(bad(
-                    ErrorCode::IdentityNeeded,
-                    "identity needed",
-                    json!({ "version": version }),
-                ));
+                return Ok(identity_needed(version));
             }
         }
         // Step 3: the header.
@@ -472,6 +482,52 @@ fn not_admitted() -> Answer {
     bad(ErrorCode::NotAdmitted, "not admitted", json!(null))
 }
 
+/// Whether `method` on `route` is a call only an own app or the signer makes, which the
+/// service answers an app of another identity `403 permission_missing`
+/// (`crates/pubky-switch/src/service/rules.rs`, `other_app_refusal`): the key bundle calls,
+/// a leave, the hand-over and the signer's calls (Switch wire 7.4).
+fn own_or_signer_call(method: &str, route: &str) -> bool {
+    let app_call = |name: &str| {
+        route
+            .strip_prefix("apps/")
+            .and_then(|rest| rest.strip_suffix(name))
+            .is_some_and(|app| !app.is_empty() && !app.contains('/'))
+    };
+    match method {
+        "GET" => matches!(route, "apps" | "handover") || app_call("/keys"),
+        "POST" => {
+            matches!(route, "recovery/admission" | "erase")
+                || app_call("/keys")
+                || app_call("/leave")
+                || app_call("/revoke")
+        }
+        "PUT" => matches!(route, "identity" | "handover"),
+        _ => false,
+    }
+}
+
+/// `403 permission_missing` to an app of another identity at a read only own apps make.
+fn own_reads_only() -> Answer {
+    bad(
+        ErrorCode::PermissionMissing,
+        "7.4: only the account's own apps make this read",
+        json!(null),
+    )
+}
+
+/// `409 identity_needed`, with `known_version`, the version of the sender's `identity.json`
+/// the switch holds, `null` for none or as to a stranger, as in `current` (Switch wire 7.1,
+/// 7.6; `crates/pubky-switch/src/service/inbox.rs`, `identity_needed`).
+fn identity_needed(version: Option<u64>) -> Answer {
+    let (status, mut body) = bad(
+        ErrorCode::IdentityNeeded,
+        "identity needed",
+        json!({ "version": version }),
+    );
+    body["known_version"] = json!(version);
+    (status, body)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -492,6 +548,155 @@ mod tests {
             }],
             body: b"{}".to_vec(),
         }
+    }
+
+    /// A scripted switch, and the certificate of an app of another identity.
+    fn switch_and_stranger() -> (std::sync::Arc<ScriptedSwitch>, AppCert) {
+        let identity = pubky_switch_core::keys::IdentityKey::from_secret([1; 32]);
+        let switch = ScriptedSwitch::new(
+            &identity,
+            [2; 32],
+            std::sync::Arc::new(crate::clock::TestClock::new(1_000)),
+        );
+        let other = pubky_switch_core::keys::IdentityKey::from_secret([7; 32]);
+        let keys = pubky_switch_core::keys::AppKeys::from_secrets([8; 32], [9; 32]);
+        let cert = AppCert::issue(
+            &other,
+            pubky_switch_core::records::AppCertBody::new(
+                other.public(),
+                keys.signing_public(),
+                keys.bundle_public(),
+                vec!["notes".into()],
+                &[],
+                0,
+                86_400_000,
+            ),
+        )
+        .unwrap();
+        (switch, cert)
+    }
+
+    #[test]
+    fn test_scripted_other_identity_reads_only_own_apps_make_are_refused() {
+        // `403 permission_missing` at the reads only own apps make, as at the service
+        // (`crates/pubky-switch/src/service/rules.rs`, `other_app_refusal`); a batch keeps
+        // `403 not_admitted` (Switch wire 6.4 step 1, 7.4.4, 7.6).
+        let (switch, cert) = switch_and_stranger();
+        let mut inner = switch.lock();
+        let sender = Sender {
+            identity: cert.identity(),
+            app: Some(cert.app_id()),
+            code: None,
+        };
+        let key = b64(&[3; 32]);
+        let calls = [
+            ("GET", "feed".to_owned(), "permission_missing"),
+            ("GET", "feed?after=0".to_owned(), "permission_missing"),
+            ("GET", format!("claims/{key}"), "permission_missing"),
+            ("GET", "allow".to_owned(), "permission_missing"),
+            (
+                "GET",
+                format!("records?collection={key}"),
+                "permission_missing",
+            ),
+            ("GET", format!("records/{key}"), "permission_missing"),
+            ("POST", "ops".to_owned(), "not_admitted"),
+        ];
+        for (method, rest, code) in calls {
+            let request = foreign(method, &format!("/{rest}"), &cert);
+            let (status, body) = inner.route_foreign(&request, &sender, &rest).unwrap();
+            assert_eq!(
+                (status, &body["code"]),
+                (403, &json!(code)),
+                "{method} {rest}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_scripted_other_identity_at_own_app_and_signer_calls_is_refused() {
+        // `403 permission_missing` at every call only an own app or the signer makes, as
+        // at the service (`crates/pubky-switch/src/service/rules.rs`, `other_app_refusal`).
+        let (switch, cert) = switch_and_stranger();
+        let mut inner = switch.lock();
+        let sender = Sender {
+            identity: cert.identity(),
+            app: Some(cert.app_id()),
+            code: None,
+        };
+        let app = zbase32_encode(&cert.app_id());
+        let calls = [
+            ("GET", format!("apps/{app}/keys")),
+            ("POST", format!("apps/{app}/keys")),
+            ("POST", format!("apps/{app}/leave")),
+            ("POST", format!("apps/{app}/revoke")),
+            ("GET", "apps".to_owned()),
+            ("GET", "handover".to_owned()),
+            ("PUT", "handover".to_owned()),
+            ("PUT", "identity".to_owned()),
+            ("POST", "recovery/admission".to_owned()),
+            ("POST", "erase".to_owned()),
+        ];
+        for (method, rest) in calls {
+            let request = foreign(method, &format!("/{rest}"), &cert);
+            let (status, body) = inner.route_foreign(&request, &sender, &rest).unwrap();
+            assert_eq!(
+                (status, &body["code"]),
+                (403, &json!("permission_missing")),
+                "{method} {rest}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_scripted_append_query_is_read_before_admission() {
+        // The query is decoded, and a parameter given twice refused, before any check of
+        // the append, as at the service (Switch wire 7.1): a stranger gets `400`, not `403
+        // not_admitted`.
+        let (switch, cert) = switch_and_stranger();
+        let mut inner = switch.lock();
+        let sender = Sender {
+            identity: cert.identity(),
+            app: Some(cert.app_id()),
+            code: None,
+        };
+        for rest in [
+            "inbox?apps_version=0&apps_version=0",
+            "inbox?apps_version=%zz",
+        ] {
+            let request = foreign("POST", &format!("/{rest}"), &cert);
+            let (status, body) = inner.route_foreign(&request, &sender, rest).unwrap();
+            assert_eq!(
+                (status, &body["code"]),
+                (400, &json!("bad_request")),
+                "{rest}"
+            );
+        }
+        let rest = "inbox?apps_version=%30";
+        let request = foreign("POST", &format!("/{rest}"), &cert);
+        let (_, body) = inner.route_foreign(&request, &sender, rest).unwrap();
+        assert_eq!(body["code"], json!("not_admitted"), "decoded, then judged");
+    }
+
+    #[test]
+    fn test_scripted_identity_needed_carries_known_version() {
+        // `409 identity_needed` carries `known_version`, `null` for no copy held, beside
+        // `current` (Switch wire 7.1, 7.6; `crates/pubky-switch/src/service/inbox.rs`).
+        let (switch, cert) = switch_and_stranger();
+        let mut inner = switch.lock();
+        inner.open_admission = true;
+        let sender = Sender {
+            identity: cert.identity(),
+            app: Some(cert.app_id()),
+            code: None,
+        };
+        let rest = "inbox?apps_version=0";
+        let request = foreign("POST", &format!("/{rest}"), &cert);
+        let (status, body) = inner.route_foreign(&request, &sender, rest).unwrap();
+        assert_eq!((status, &body["code"]), (409, &json!("identity_needed")));
+        assert_eq!(body["current"], json!({ "version": null }));
+        let members = body.as_object().unwrap();
+        assert_eq!(members.get("known_version"), Some(&Value::Null));
     }
 
     #[test]

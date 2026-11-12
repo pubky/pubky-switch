@@ -407,6 +407,14 @@ pub(crate) struct OutboxItem {
     /// The such answers counted ([`UNDELIVERABLE_TRIES`]).
     #[serde(default)]
     undeliverable_tries: u32,
+    /// A re-send queued from `sent/`: the recipient accepted the message before.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    resend_queued: bool,
+    /// The last time a delivery may go, for a message a restore put back: past it, the
+    /// recipient may have forgotten the processed pair of a copy the device the backup came
+    /// from delivered (Switch spec 11). Kept through later backups, never moved on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    replay_until_ms: Option<u64>,
 }
 
 impl std::fmt::Debug for OutboxItem {
@@ -425,7 +433,7 @@ impl OutboxItem {
     }
 
     /// Whether a delivery is owed: never accepted, or a re-send asked since.
-    fn delivery_owed(&self) -> bool {
+    pub(crate) fn delivery_owed(&self) -> bool {
         self.accepted_at_ms.is_none() || self.resend
     }
 
@@ -461,6 +469,103 @@ impl OutboxItem {
     fn plaintext(&self) -> Result<MessagePlaintext, AppError> {
         MessagePlaintext::decode(&self.plaintext).map_err(|_| store_corrupt())
     }
+
+    /// The item that stays once its owed delivery is given up past its replay deadline
+    /// ([`OutboxItem::replay_until`]), as [`App::drop_undeliverable`] gives one up, and the
+    /// duty event that tells the protocol: a message never accepted goes, plaintext and
+    /// all; one accepted before stays while its record job is owed, its sealed envelope
+    /// dropped. `None` for nothing left.
+    pub(crate) fn give_up_delivery(mut self) -> (Option<Self>, Duty) {
+        let duty = Duty::MessageUndelivered {
+            msg_id: self.msg_id.clone(),
+            resend: self.accepted_at_ms.is_some() || self.resend_queued,
+        };
+        self.resend = false;
+        self.resend_queued = false;
+        self.sealed = None;
+        self.clear_undeliverable();
+        let kept = (self.accepted_at_ms.is_some() && !self.complete()).then_some(self);
+        (kept, duty)
+    }
+
+    /// The replay deadline a restore gives the item (Switch spec 11): the earliest of the
+    /// one it carries, its first acceptance plus [`SENT_RETENTION_MS`] for a message
+    /// accepted before, and `baseline` plus [`SENT_RETENTION_MS`], where `baseline` is when
+    /// the backup was taken, less the clock tolerance. A recipient keeps a processed pair
+    /// 30 days and the tolerance from when it processed the message, which is at or after
+    /// its first acceptance; and the first acceptance of a message not accepted before the
+    /// backup is at or after the backup. So a copy delivered by the deadline is one the
+    /// recipient drops. The deadline only ever comes earlier.
+    pub(crate) fn replay_until(&mut self, baseline: u64) {
+        let deadlines = [
+            self.replay_until_ms,
+            self.accepted_at_ms
+                .map(|at| at.saturating_add(SENT_RETENTION_MS)),
+            Some(baseline.saturating_add(SENT_RETENTION_MS)),
+        ];
+        self.replay_until_ms = deadlines.into_iter().flatten().min();
+    }
+
+    /// The item's replay deadline, if a restore gave it one.
+    #[cfg(test)]
+    pub(crate) fn replay_until_ms(&self) -> Option<u64> {
+        self.replay_until_ms
+    }
+
+    /// The bytes the item takes in the store.
+    fn stored_bytes(&self) -> u64 {
+        super::state::encode(self).map_or(u64::MAX, |bytes| {
+            u64::try_from(bytes.len()).unwrap_or(u64::MAX)
+        })
+    }
+}
+
+/// The most bytes of outbox records a backup carries, so the restore's one commit fits the
+/// store's batch size beside the app's own state: 8 MiB.
+pub const MAX_CARRIED_OUTBOX_BYTES: u64 = 8 * 1024 * 1024;
+
+/// The outbox a backup carries (Switch spec 11, 12.4).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct CarriedOutbox {
+    /// The records, oldest queued first.
+    pub(crate) items: Vec<OutboxItem>,
+    /// The messages left out past [`MAX_CARRIED_OUTBOX_BYTES`], and whether each is a
+    /// re-send of a message accepted before.
+    pub(crate) left_out: Vec<(String, bool)>,
+}
+
+/// The queued messages a backup carries (Switch spec 11, 12.4): every record in the outbox,
+/// as it stands, its signed plaintext and the envelope sealed for its last try included, so
+/// a restore delivers each with the same `msg_id` and bytes; a message refused for good is
+/// carried too, so the restored app still reports it failed until it is forgotten. Oldest
+/// queued first, within [`MAX_CARRIED_OUTBOX_BYTES`]: the rest are named, so the restore
+/// tells the protocol it won't deliver them.
+pub(crate) async fn carried_outbox(
+    reader: &super::state::Reader,
+) -> Result<CarriedOutbox, AppError> {
+    let mut items: Vec<OutboxItem> = reader
+        .scan::<OutboxItem>(OUT_PREFIX)
+        .await?
+        .into_iter()
+        .map(|(_, item)| item)
+        .collect();
+    items.sort_by_key(|item| item.queued_ms);
+    let mut carried = CarriedOutbox::default();
+    let mut bytes = 0u64;
+    for item in items {
+        let size = item.stored_bytes();
+        match bytes.checked_add(size) {
+            Some(total) if total <= MAX_CARRIED_OUTBOX_BYTES => {
+                bytes = total;
+                carried.items.push(item);
+            }
+            _ => carried.left_out.push((
+                item.msg_id.clone(),
+                item.accepted_at_ms.is_some() || item.resend_queued,
+            )),
+        }
+    }
+    Ok(carried)
 }
 
 /// `sent/<msg_id>`: a sent message, kept 30 days. Sensitive.
@@ -490,6 +595,14 @@ impl SentStored {
 impl std::fmt::Debug for SentStored {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "SentStored({}, {})", self.kind, self.msg_id)
+    }
+}
+
+#[cfg(test)]
+impl App {
+    /// The outbox record of `msg_id`.
+    pub(crate) async fn outbox_record(&self, msg_id: &str) -> Option<OutboxItem> {
+        self.reader().get(&out_key(msg_id)).await.ok().flatten()
     }
 }
 
@@ -649,6 +762,8 @@ impl App {
             undeliverable_reason: None,
             undeliverable_last_ms: None,
             undeliverable_tries: 0,
+            resend_queued: false,
+            replay_until_ms: None,
         })
     }
 
@@ -735,6 +850,8 @@ impl App {
             undeliverable_reason: None,
             undeliverable_last_ms: None,
             undeliverable_tries: 0,
+            resend_queued: true,
+            replay_until_ms: None,
         };
         let mut tx = self.tx()?;
         tx.put(&out_key(&item.msg_id), &item)?;
@@ -967,6 +1084,29 @@ impl App {
         };
         if item.failed.is_some() {
             return Ok(false);
+        }
+        // A delivery a restore put back goes only by its replay deadline, judged at the later
+        // of the device clock and a service time verified in this call (Switch spec 11).
+        if item.delivery_owed()
+            && let Some(deadline) = item.replay_until_ms
+        {
+            if self.kept_window_now() <= deadline {
+                match self.fresh_service_time().await {
+                    Err(error) if is_local(&error) => return Err(error),
+                    _ => {}
+                }
+            }
+            if self.kept_window_now() > deadline {
+                let (kept, duty) = item.give_up_delivery();
+                let mut tx = self.tx()?;
+                match &kept {
+                    Some(kept) => tx.put(&out_key(msg_id), kept)?,
+                    None => tx.delete(&out_key(msg_id))?,
+                }
+                self.keep_duty(&mut tx, duty)?;
+                self.commit(tx).await?;
+                return Ok(true);
+            }
         }
         // Past the firm bound, the message goes before it is tried again.
         if item
@@ -1441,5 +1581,85 @@ mod tests {
         body.insert("text".into(), Value::String("secret".into()));
         let message = OutgoingMessage::new([1; 32], "sample.note", body);
         assert_eq!(format!("{message:?}"), "OutgoingMessage(sample.note)");
+    }
+
+    /// A queued message accepted once, with a record job owed and an envelope sealed for
+    /// its re-send.
+    fn accepted_item() -> OutboxItem {
+        OutboxItem {
+            to: [1; 32],
+            kind: "sample.note".into(),
+            msg_id: "m1".into(),
+            plaintext: Vec::new(),
+            notify: false,
+            invite_code: None,
+            conversation: false,
+            sealed: Some(Sealed {
+                envelope: vec![7],
+                apps_version: 1,
+                origin: "https://bob.example".into(),
+                generation: 1,
+            }),
+            record: Some(KeptJob {
+                collection: "sample.items".into(),
+                policy: pubky_switch_core::ident::Policy::new("scope-a", &["scope-a"]),
+                natural_key: b"n1".to_vec(),
+                tag: Vec::new(),
+            }),
+            record_done: false,
+            accepted_at_ms: Some(1_000),
+            failed: None,
+            last_error: None,
+            tries: 1,
+            queued_ms: 500,
+            failed_ms: None,
+            resend: true,
+            undeliverable_ms: None,
+            undeliverable_reason: None,
+            undeliverable_last_ms: None,
+            undeliverable_tries: 0,
+            resend_queued: false,
+            replay_until_ms: None,
+        }
+    }
+
+    #[test]
+    fn test_outbox_give_up_keeps_an_owed_record_job_without_the_envelope() {
+        let (kept, duty) = accepted_item().give_up_delivery();
+        let kept = kept.expect("the record job is owed");
+        assert!(!kept.delivery_owed());
+        assert!(
+            kept.sealed.is_none(),
+            "the envelope sealed for the re-send goes"
+        );
+        assert!(!kept.record_done);
+        assert!(matches!(
+            duty,
+            Duty::MessageUndelivered { resend: true, .. }
+        ));
+        // Never accepted: nothing stays.
+        let mut never = accepted_item();
+        never.accepted_at_ms = None;
+        never.resend = false;
+        let (kept, duty) = never.give_up_delivery();
+        assert!(kept.is_none());
+        assert!(matches!(
+            duty,
+            Duty::MessageUndelivered { resend: false, .. }
+        ));
+    }
+
+    #[test]
+    fn test_outbox_replay_deadline_only_comes_earlier() {
+        let mut item = accepted_item();
+        // The first acceptance's window comes before the backup's.
+        item.replay_until(5_000);
+        assert_eq!(item.replay_until_ms, Some(1_000 + SENT_RETENTION_MS));
+        // A later baseline doesn't move it on; an earlier one brings it forward.
+        item.accepted_at_ms = None;
+        item.replay_until(9_000);
+        assert_eq!(item.replay_until_ms, Some(1_000 + SENT_RETENTION_MS));
+        item.replay_until(100);
+        assert_eq!(item.replay_until_ms, Some(100 + SENT_RETENTION_MS));
     }
 }
