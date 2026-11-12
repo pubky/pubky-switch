@@ -1973,7 +1973,6 @@ impl Inner {
         held.departed = true;
         held.revoked_at = Some(at);
         self.unreachable(&app);
-        self.push.remove(&app);
         let proof = self.service_transition(ServiceTransition::Revoke { app_id: app, at })?;
         // After its chain item (Switch wire 7.4.4).
         self.after_departure(was);
@@ -2587,29 +2586,24 @@ impl Inner {
         ))
     }
 
-    /// `PUT /push` (Switch wire 8.1).
+    /// `PUT /push` (Switch wire 8.1), as the service answers it: the body through the core's
+    /// checks (`400`), the caller an own app (`403 permission_missing` for the signer) that
+    /// is current (`403 not_current`), then 8.1's cases. The relay's host isn't resolved.
     fn put_push(&mut self, caller: Option<[u8; 16]>, body: &[u8]) -> Answer {
-        let (Some(app), Ok(body)) = (caller, serde_json::from_slice::<Value>(body)) else {
-            return bad(ErrorCode::BadRequest, "push", json!(null));
+        let Some(app) = caller else {
+            return bad(
+                ErrorCode::PermissionMissing,
+                "only the account's own apps make this call",
+                json!(null),
+            );
         };
-        let key = |name: &str| -> Result<Option<[u8; 32]>, ()> {
-            match body.get(name).and_then(Value::as_str) {
-                Some(text) => unb64_array::<32>(text).map(Some).map_err(|_| ()),
-                None => Ok(None),
-            }
+        if !self.app_current_by(&self.apps, &app, false) {
+            return bad(ErrorCode::NotCurrent, "not current", json!(null));
+        }
+        let body = match pubky_switch_core::http::parse_push_body(body) {
+            Ok(body) => body,
+            Err(error) => return bad(ErrorCode::BadRequest, &error.to_string(), json!(null)),
         };
-        let (Ok(push_key), Ok(replaces)) = (key("push_key"), key("replaces")) else {
-            return bad(ErrorCode::BadRequest, "push key", json!(null));
-        };
-        let relay_url = body["relay_url"].as_str().unwrap_or_default().to_owned();
-        let handles: Vec<String> = body["handles"]
-            .as_array()
-            .map(|h| {
-                h.iter()
-                    .filter_map(|v| v.as_str().map(str::to_owned))
-                    .collect()
-            })
-            .unwrap_or_default();
         let current = self
             .push
             .get(&app)
@@ -2628,44 +2622,42 @@ impl Inner {
                         "push_key": b64(&reg.key.verifying_key().to_bytes()) }),
             )
         };
-        match push_key {
-            None => {
-                if !handles.is_empty() {
-                    return bad(ErrorCode::BadRequest, "handles on a start", json!(null));
+        match body.push_key {
+            None => match (self.push.get(&app).cloned(), body.replaces) {
+                (Some(reg), None) if reg.relay_url == body.relay_url => answer(&reg),
+                (None, None) => self.new_push(app, body.relay_url, &answer),
+                (Some(_), Some(named)) if Some(named) == current => {
+                    self.new_push(app, body.relay_url, &answer)
                 }
-                let held = self.push.get(&app).cloned();
-                match held {
-                    None if replaces.is_some() => conflict(None),
-                    Some(reg) if replaces.is_none() && reg.relay_url == relay_url => answer(&reg),
-                    Some(_) if replaces.is_some() && replaces != current => conflict(current),
-                    Some(_) if replaces.is_none() => conflict(current),
-                    _ => {
-                        let key = self.mint();
-                        let reg = PushReg {
-                            relay_url,
-                            key,
-                            handles: Vec::new(),
-                        };
-                        let out = answer(&reg);
-                        self.push.insert(app, reg);
-                        out
-                    }
+                _ => conflict(current),
+            },
+            Some(named) => match self.push.get_mut(&app) {
+                Some(reg) if Some(named) == current && reg.relay_url == body.relay_url => {
+                    reg.handles = body.handles;
+                    let reg = reg.clone();
+                    answer(&reg)
                 }
-            }
-            Some(named) => {
-                if replaces.is_some() || handles.len() > 8 {
-                    return bad(ErrorCode::BadRequest, "push", json!(null));
-                }
-                match self.push.get_mut(&app) {
-                    Some(reg) if Some(named) == current && reg.relay_url == relay_url => {
-                        reg.handles = handles;
-                        let reg = reg.clone();
-                        answer(&reg)
-                    }
-                    _ => conflict(current),
-                }
-            }
+                _ => conflict(current),
+            },
         }
+    }
+
+    /// A new registration of `app` at `relay_url`, with a newly minted push key, replacing
+    /// any it held (Switch wire 8.1).
+    fn new_push(
+        &mut self,
+        app: [u8; 16],
+        relay_url: String,
+        answer: &dyn Fn(&PushReg) -> Answer,
+    ) -> Answer {
+        let reg = PushReg {
+            relay_url,
+            key: self.mint(),
+            handles: Vec::new(),
+        };
+        let out = answer(&reg);
+        self.push.insert(app, reg);
+        out
     }
 
     /// `GET /directory` (Switch wire 7.4.10): the current apps holding a record, in the
