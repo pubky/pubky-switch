@@ -48,7 +48,7 @@ use serde::de::{Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde_json::Value;
 
 use crate::HarnessError;
-use crate::check::{Checker, SignedWith};
+use crate::check::Checker;
 
 /// The members whose string value is one of the wire format's fixed words or a name the
 /// flow chose, kept by value whatever its length: error codes, document kinds, operations,
@@ -193,6 +193,8 @@ pub struct Recorder {
     distortion: Mutex<Option<Distortion>>,
     /// The faults to apply, each once, in the order added.
     faults: Mutex<Vec<Fault>>,
+    /// The enrollments sent, in order, as they were sent.
+    enrollments: Mutex<Vec<Request>>,
 }
 
 /// A fault of the network between a party and its switch, applied to the next request of
@@ -218,11 +220,26 @@ pub enum Fault {
         /// How many matching requests go through first.
         after: usize,
     },
+    /// The request doesn't reach the switch, and an error answer comes back in its place
+    /// that no key signs, as an intermediary can make one: the caller can't take it for the
+    /// switch's word.
+    Refuse {
+        /// The method.
+        method: String,
+        /// A part of the path.
+        path: String,
+        /// The status of the answer.
+        status: u16,
+        /// Its error `code`.
+        code: String,
+    },
 }
 
 impl Fault {
     fn matches(&self, request: &Request) -> bool {
-        let (Fault::LoseAnswer { method, path } | Fault::Unreachable { method, path, .. }) = self;
+        let (Fault::LoseAnswer { method, path }
+        | Fault::Unreachable { method, path, .. }
+        | Fault::Refuse { method, path, .. }) = self;
         request.method == *method && request.path_and_query.contains(path.as_str())
     }
 }
@@ -254,6 +271,7 @@ impl Recorder {
             strings: Mutex::new(HashMap::new()),
             distortion: Mutex::new(None),
             faults: Mutex::new(Vec::new()),
+            enrollments: Mutex::new(Vec::new()),
         }
     }
 
@@ -267,6 +285,16 @@ impl Recorder {
     /// Apply `fault` to the next request it matches, once.
     pub fn fail_next(&self, fault: Fault) {
         lock(&self.faults).push(fault);
+    }
+
+    /// The `nth` enrollment sent through this recorder, from 0, as it was sent.
+    pub fn enrollment(&self, nth: usize) -> Option<Request> {
+        lock(&self.enrollments).get(nth).cloned()
+    }
+
+    /// How many different enrollments were sent through this recorder.
+    pub fn enrollments_sent(&self) -> usize {
+        lock(&self.enrollments).len()
     }
 
     /// The faults added and not applied yet.
@@ -412,6 +440,13 @@ impl Transport for Recorder {
             let call =
                 route(&request.method, &request.path_and_query).map(|route| route.call.name());
             let sent = request.clone();
+            if request.method == "POST" && request.path_and_query == "/v1/enroll" {
+                let mut enrollments = lock(&self.enrollments);
+                // One sent again is the same enrollment, not another.
+                if !enrollments.contains(&request) {
+                    enrollments.push(request.clone());
+                }
+            }
             // The line takes its place now, and its answer's facts when the answer comes:
             // of two calls in flight at once, the one sent first comes first in the trace,
             // whichever is answered first.
@@ -433,26 +468,43 @@ impl Transport for Recorder {
                 self.fill(at, Line { label, facts, call });
                 return Err(TransportError::Connect("the switch is unreachable".into()));
             }
+            if let Some(Fault::Refuse { status, code, .. }) = &fault {
+                let refusal = Response {
+                    status: *status,
+                    headers: Vec::new(),
+                    body: serde_json::json!({ "code": code, "message": "not the switch's" })
+                        .to_string()
+                        .into_bytes(),
+                };
+                facts.insert(
+                    FAULT.into(),
+                    "an answer no key signs came back in the switch's place".into(),
+                );
+                self.answer_facts(&refusal, &mut facts);
+                self.fill(at, Line { label, facts, call });
+                return Ok(refusal);
+            }
             let answer = self.inner.send(request).await;
             match &answer {
                 Ok(answer) => {
                     let mut violations = Vec::new();
                     // The signature is of the answer as the switch sent it.
-                    match self.checker.signature(&sent, answer) {
-                        Ok(SignedWith::ServiceKey) => {
-                            facts.insert(SIGNED_WITH.into(), "the account's service key".into());
+                    let signed = match self.checker.signature(&sent, answer) {
+                        Ok(with) => {
+                            facts.insert(SIGNED_WITH.into(), with.to_string());
+                            Some(with)
                         }
-                        Ok(SignedWith::OperatorKey) => {
-                            facts.insert(SIGNED_WITH.into(), "the operator key".into());
+                        Err(violation) => {
+                            violations.push(violation);
+                            None
                         }
-                        Err(violation) => violations.push(violation),
-                    }
+                    };
                     let mut kept = answer.clone();
                     if let Some(distort) = lock(&self.distortion).as_ref() {
                         distort(&sent, &mut kept);
                     }
                     self.answer_facts(&kept, &mut facts);
-                    violations.extend(self.checker.contents(&sent, &kept));
+                    violations.extend(self.checker.contents(&sent, &kept, signed));
                     for (index, violation) in violations.into_iter().enumerate() {
                         facts.insert(format!("{VIOLATION} {}", index + 1), violation);
                     }
@@ -897,6 +949,45 @@ mod tests {
         );
         assert_eq!(inner.requests().len(), 2);
         assert_eq!(recorder.faults_left(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_fault_refuse_answers_unsigned_in_the_switchs_place_once() {
+        let (recorder, inner) = recorder();
+        recorder.fail_next(Fault::Refuse {
+            method: "POST".into(),
+            path: "/v1/enroll".into(),
+            status: 409,
+            code: "conflict".into(),
+        });
+        // Another call isn't touched.
+        let other = recorder.send(post("/v1/abc/ops")).await.unwrap();
+        assert_eq!(other.status, 200);
+        let refused = recorder.send(post("/v1/enroll")).await.unwrap();
+        assert_eq!(refused.status, 409);
+        let body: Value = serde_json::from_slice(&refused.body).unwrap();
+        assert_eq!(body["code"], "conflict");
+        assert!(
+            refused.header(header::SERVICE_SIGNATURE).is_none(),
+            "no key signs it"
+        );
+        assert_eq!(inner.requests().len(), 1, "it didn't reach the switch");
+        assert_eq!(recorder.faults_left(), 0);
+        assert_eq!(
+            recorder.send(post("/v1/enroll")).await.unwrap().status,
+            200,
+            "once"
+        );
+        let trace = recorder.trace();
+        let fact = |line: usize, fact: &str| trace.lines[line].facts.get(fact).cloned();
+        assert_eq!(
+            fact(1, "fault").as_deref(),
+            Some("an answer no key signs came back in the switch's place")
+        );
+        assert_eq!(fact(1, "status").as_deref(), Some("409"));
+        assert_eq!(fact(1, "body.code").as_deref(), Some("text conflict"));
+        assert_eq!(fact(1, SIGNED_WITH), None, "the checker isn't asked");
+        assert_eq!(fact(2, "fault"), None);
     }
 
     #[test]
