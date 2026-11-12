@@ -1116,7 +1116,12 @@ mod tests {
             recorder.let_go();
             (answered.map(|answer| answer.status), reached)
         };
-        let (first, (second, reached)) = futures_util::future::join(first, second).await;
+        // A recorder that held the second too would wait for good.
+        let both = futures_util::future::join(first, second);
+        let (first, (second, reached)) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), both)
+                .await
+                .expect("the request after the held one was held as well");
         assert_eq!(second, Ok(200));
         assert_eq!(reached, ["/v1/xyz/ops"], "the held one hadn't arrived");
         assert_eq!(first.map(|answer| answer.status), Ok(200));
