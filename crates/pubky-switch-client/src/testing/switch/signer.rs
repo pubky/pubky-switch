@@ -1061,6 +1061,7 @@ mod tests {
             inner.max_page_bytes = 4_096;
             inner.keep_passed = true;
             inner.open_admission = true;
+            inner.shared.connect.push(([4; 32], 1));
         }
         let recovery = IdentityDoc::sign(&identity, body).unwrap();
         let delivery = json!({ "identity": recovery.signed(), "prev": null }).to_string();
@@ -1084,6 +1085,8 @@ mod tests {
             // And so does what a test configured.
             assert_eq!((inner.feed_limit, inner.max_page_bytes), (Some(3), 4_096));
             assert!(inner.keep_passed && inner.open_admission);
+            // Pending connect requests don't outlive it (Switch spec 12.6 step 1, wire 7.4.7).
+            assert!(inner.shared.connect.is_empty());
         }
         let (status, retired) = enroll_at(&switch, &identity, 1, None);
         assert_eq!((status, retired["code"].clone()), (409, json!("conflict")));

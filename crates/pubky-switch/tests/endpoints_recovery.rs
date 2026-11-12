@@ -341,6 +341,18 @@ async fn test_recovery_in_place_starts_afresh_under_the_pending_key() {
     )
     .await;
     let before = held(&replay).await;
+    // A pending connect request, which doesn't outlive the recovery (wire 7.4.7).
+    {
+        let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+            .await
+            .expect("conn");
+        sqlx::query("INSERT INTO connect_requests (account_id, pubky, at_ms) VALUES ($1, $2, 0)")
+            .bind(alice_id())
+            .bind([4u8; 32].as_slice())
+            .execute(&mut conn)
+            .await
+            .expect("a pending request");
+    }
     let recovery = next_generation(&before, pending, Some(1));
     let (answer, signature) = deliver(&replay, recovery, Some(before.hash()), at).await;
     assert_eq!(
