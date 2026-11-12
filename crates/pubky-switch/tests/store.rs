@@ -1662,11 +1662,8 @@ async fn test_store_sweeps_take_at_most_their_bound_and_the_rest_later() {
         .await
         .expect("begin")
         .expect("account");
-    // No current app: nothing waits.
-    assert_eq!(
-        txn.forget_deleted_keys(&[], &[], 2).await.expect("forget"),
-        2
-    );
+    // No cursor waited for: every delete may go.
+    assert_eq!(txn.forget_deleted_keys(None, 2).await.expect("forget"), 2);
     assert_eq!(
         txn.drop_expired_batch_proofs(later, 0, 2)
             .await
@@ -1700,10 +1697,18 @@ async fn test_store_sweeps_take_at_most_their_bound_and_the_rest_later() {
         .await
         .expect("begin")
         .expect("account");
+    // Only up to the lowest cursor waited for: the last delete is past it.
+    let through = pubky_switch_core::ops::Position {
+        generation: 1,
+        seq: 8,
+    };
     assert_eq!(
-        txn.forget_deleted_keys(&[], &[], 2).await.expect("forget"),
-        1
+        txn.forget_deleted_keys(Some(through), 2)
+            .await
+            .expect("forget"),
+        0
     );
+    assert_eq!(txn.forget_deleted_keys(None, 2).await.expect("forget"), 1);
     assert_eq!(
         txn.drop_expired_batch_proofs(later, 0, 2)
             .await
@@ -1714,10 +1719,7 @@ async fn test_store_sweeps_take_at_most_their_bound_and_the_rest_later() {
         txn.drop_spent_invite_codes(later, 2).await.expect("codes"),
         1
     );
-    assert_eq!(
-        txn.forget_deleted_keys(&[], &[], 2).await.expect("forget"),
-        0
-    );
+    assert_eq!(txn.forget_deleted_keys(None, 2).await.expect("forget"), 0);
     txn.commit().await.expect("commit");
     conn.close().await.expect("close");
     fx.finish().await;

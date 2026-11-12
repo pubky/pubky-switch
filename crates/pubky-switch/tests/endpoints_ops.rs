@@ -2078,3 +2078,61 @@ async fn test_sweeps_wait_for_trusted_time() {
     assert_eq!(invites_held(&replay, &[1]).await, vec![[1; 32]]);
     replay.db.drop_database().await.expect("drop");
 }
+
+async fn swept_at(replay: &Replay) -> Option<i64> {
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    let at: Option<i64> = sqlx::query_scalar("SELECT swept_at_ms FROM accounts WHERE id = $1")
+        .bind(alice_id())
+        .fetch_one(&mut conn)
+        .await
+        .expect("swept_at");
+    conn.close().await.expect("close");
+    at
+}
+
+#[tokio::test]
+async fn test_sweeps_cut_short_leave_the_state_as_it_was() {
+    // A sweep that fails part way, after the invite codes went and before the proofs: the
+    // request is `503 unavailable` and its transaction rolls back whole, so the codes, the
+    // proofs and the minute's mark are as before; the next request sweeps it all (wire 7.3
+    // step 4, 9.1).
+    let Some(replay) = registered(Limits::default(), false).await else {
+        return;
+    };
+    let ops = wallet_batch(55, 1, vec![contact(bob()), invite(1, ms(AT) + DAY_MS, 1)]);
+    let (status, body) = post_app(&replay, "wallet", &ops, None, AT).await;
+    assert_eq!(status, 200, "{body}");
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    for statement in [
+        "CREATE FUNCTION refuse_proofs() RETURNS trigger LANGUAGE plpgsql AS \
+         $$ BEGIN RAISE EXCEPTION 'refused'; END $$",
+        "CREATE TRIGGER refuse_proofs BEFORE UPDATE OF proofs ON batches \
+         FOR EACH ROW EXECUTE FUNCTION refuse_proofs()",
+    ] {
+        sqlx::query(statement)
+            .execute(&mut conn)
+            .await
+            .expect("trigger");
+    }
+    let before = swept_at(&replay).await;
+    let late = after(31 * DAY_MS);
+    set_time(&replay.clock, &late);
+    let (status, body) = read_claim(&replay, &late).await;
+    assert_eq!((status, body["code"].as_str()), (503, Some("unavailable")));
+    assert_eq!(invites_held(&replay, &[1]).await, vec![[1; 32]]);
+    assert_eq!(proofs_kept(&replay, 55).await, Some(true));
+    assert_eq!(swept_at(&replay).await, before);
+    sqlx::query("DROP TRIGGER refuse_proofs ON batches")
+        .execute(&mut conn)
+        .await
+        .expect("drop trigger");
+    conn.close().await.expect("close");
+    wallet_request_at(&replay, &late).await;
+    assert!(invites_held(&replay, &[1]).await.is_empty());
+    assert_eq!(proofs_kept(&replay, 55).await, Some(false));
+    replay.db.drop_database().await.expect("drop");
+}

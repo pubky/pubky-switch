@@ -3,21 +3,24 @@
 //! decides by the service time the caller passes, never a client's: a run cut short leaves
 //! only rows a later run takes, so a sweep may stop or restart at any point.
 
-use super::{AccountTxn, StoreError, to_db};
+use pubky_switch_core::ops::Position;
+use sqlx::Row;
+
+use super::{AccountTxn, StoreError, from_db, to_db};
 
 fn app_ids(apps: &[[u8; 16]]) -> Vec<Vec<u8>> {
     apps.iter().map(|app| app.to_vec()).collect()
 }
 
 impl AccountTxn {
-    /// Whether a deleted key may be forgotten, cursors aside: a cheap look before the
-    /// cursors are read ([`Self::forget_deleted_keys`]).
-    pub async fn deleted_key_to_forget(&mut self) -> Result<bool, StoreError> {
+    /// Whether a deleted key written here is held at all: one probe of
+    /// `shared_records_deleted`, so an account with none pays nothing more
+    /// ([`Self::forget_deleted_keys`]).
+    pub async fn deleted_key_held(&mut self) -> Result<bool, StoreError> {
         let id = self.head().id.clone();
         let row = sqlx::query(
-            "SELECT 1 FROM shared_records s WHERE s.account_id = $1 AND s.deleted \
-             AND NOT s.from_upload AND NOT EXISTS (SELECT 1 FROM divergent_uploads d \
-             WHERE d.account_id = s.account_id AND d.key = s.key) LIMIT 1",
+            "SELECT 1 FROM shared_records WHERE account_id = $1 AND deleted \
+             AND NOT from_upload LIMIT 1",
         )
         .bind(id)
         .fetch_optional(self.conn())
@@ -26,46 +29,77 @@ impl AccountTxn {
         Ok(row.is_some())
     }
 
-    /// Forget at most `bound` deleted keys that nothing refers to (Switch spec 10.3, wire
-    /// 9.1): the record's current write is its delete, written at this service (one taken
-    /// from a recovery upload has no chain item here to stand for it); the cursor of every
-    /// app of `current` is at or past the delete, but for an app `lagging` holds that has a
-    /// `missed` item it hasn't passed, since passing that item makes it list its
-    /// collections again (Switch wire 7.4.4), so it can't keep the forgotten record; and no
-    /// divergent upload names the key. The record's row goes, so its delete shows as its
-    /// chain stub and a create at the key starts afresh. The oldest deletes go first. The
-    /// number forgotten.
-    pub async fn forget_deleted_keys(
+    /// The cursors a forgotten key waits for (Switch spec 10.3): those of the apps of
+    /// `current`, but for an app `lagging` holds that has a `missed` item it hasn't passed,
+    /// since passing that item makes it list its collections again (Switch wire 7.4.4), so
+    /// it can't keep the forgotten record. `None` for an app with no cursor yet.
+    pub async fn waited_cursors(
         &mut self,
         current: &[[u8; 16]],
         lagging: &[[u8; 16]],
-        bound: u64,
-    ) -> Result<u64, StoreError> {
+    ) -> Result<Vec<Option<Position>>, StoreError> {
         let id = self.head().id.clone();
-        let forgotten = sqlx::query(
-            "DELETE FROM shared_records r WHERE r.account_id = $1 AND r.key IN ( \
-                 SELECT s.key FROM shared_records s \
-                 WHERE s.account_id = $1 AND s.deleted AND NOT s.from_upload \
-                 AND NOT EXISTS (SELECT 1 FROM divergent_uploads d \
-                                 WHERE d.account_id = s.account_id AND d.key = s.key) \
-                 AND NOT EXISTS (SELECT 1 FROM apps a \
-                                 WHERE a.account_id = s.account_id \
-                                 AND a.app_id = ANY($2) \
-                                 AND NOT (a.app_id = ANY($3) AND EXISTS ( \
-                                     SELECT 1 FROM inbox_entries m \
-                                     WHERE m.account_id = a.account_id \
-                                     AND m.kind = 'missed' AND m.targets[1] = a.app_id \
-                                     AND (a.cursor_generation IS NULL \
-                                          OR (m.generation, m.seq) \
-                                             > (a.cursor_generation, a.cursor_seq)))) \
-                                 AND (a.cursor_generation IS NULL \
-                                      OR (a.cursor_generation, a.cursor_seq) \
-                                         < (s.generation, s.version))) \
-                 ORDER BY s.generation, s.version, s.key LIMIT $4)",
+        let rows = sqlx::query(
+            "SELECT a.cursor_generation, a.cursor_seq FROM apps a \
+             WHERE a.account_id = $1 AND a.app_id = ANY($2) \
+             AND NOT (a.app_id = ANY($3) AND EXISTS ( \
+                 SELECT 1 FROM inbox_entries m \
+                 WHERE m.account_id = a.account_id \
+                 AND m.kind = 'missed' AND m.targets[1] = a.app_id \
+                 AND (a.cursor_generation IS NULL \
+                      OR (m.generation, m.seq) > (a.cursor_generation, a.cursor_seq))))",
         )
         .bind(&id)
         .bind(app_ids(current))
         .bind(app_ids(lagging))
+        .fetch_all(self.conn())
+        .await
+        .map_err(StoreError::from_db)?;
+        let mut cursors = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let generation: Option<i64> = row.try_get("cursor_generation")?;
+            let seq: Option<i64> = row.try_get("cursor_seq")?;
+            cursors.push(match (generation, seq) {
+                (Some(generation), Some(seq)) => Some(Position {
+                    generation: from_db(generation, "cursor_generation")?,
+                    seq: from_db(seq, "cursor_seq")?,
+                }),
+                _ => None,
+            });
+        }
+        Ok(cursors)
+    }
+
+    /// Forget at most `bound` deleted keys that nothing refers to (Switch spec 10.3, wire
+    /// 9.1), the oldest deletes first: the record's current write is its delete, written at
+    /// this service (one taken from a recovery upload has no chain item here to stand for
+    /// it), at or before `through`, the lowest cursor the key waits for
+    /// ([`Self::waited_cursors`]; `None` when it waits for none); and no divergent upload
+    /// names the key. The record's row goes, so its delete shows as its chain stub and a
+    /// create at the key starts afresh. A range scan of `shared_records_deleted` up to
+    /// `through`. The number forgotten.
+    pub async fn forget_deleted_keys(
+        &mut self,
+        through: Option<Position>,
+        bound: u64,
+    ) -> Result<u64, StoreError> {
+        let id = self.head().id.clone();
+        let (generation, seq) = match through {
+            Some(at) => (to_db(at.generation, "generation")?, to_db(at.seq, "seq")?),
+            None => (i64::MAX, i64::MAX),
+        };
+        let forgotten = sqlx::query(
+            "DELETE FROM shared_records r WHERE r.account_id = $1 AND r.key IN ( \
+                 SELECT s.key FROM shared_records s \
+                 WHERE s.account_id = $1 AND s.deleted AND NOT s.from_upload \
+                 AND (s.generation, s.version) <= ($2, $3) \
+                 AND NOT EXISTS (SELECT 1 FROM divergent_uploads d \
+                                 WHERE d.account_id = s.account_id AND d.key = s.key) \
+                 ORDER BY s.generation, s.version LIMIT $4)",
+        )
+        .bind(&id)
+        .bind(generation)
+        .bind(seq)
         .bind(to_db(bound, "bound")?)
         .execute(self.conn())
         .await

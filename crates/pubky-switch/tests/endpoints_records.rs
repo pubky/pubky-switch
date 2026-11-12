@@ -890,16 +890,11 @@ async fn move_cursor(replay: &Replay, name: &str, seq: u64, at: &str) {
     );
 }
 
-/// A time sample now, so the next request has trusted time (Switch wire 7.3).
-fn trusted_now(replay: &Replay) {
+/// A minute on: the next request runs the minute's sweep (Switch wire 9.1).
+fn next_minute(replay: &Replay) {
     use pubky_switch::time::Clock;
-    replay.time.note(
-        pubky_switch::time::TimeSample {
-            utc_ms: replay.clock.now_ms(),
-            uncertainty_ms: 0,
-        },
-        replay.clock.monotonic_ms(),
-    );
+    let at = replay.clock.now_ms() + 61_000;
+    set_time(&replay.clock, &pubky_switch_core::time::rfc3339(at));
 }
 
 /// A record the wallet creates at `natural`, then deletes: its key and the delete's `seq`.
@@ -954,20 +949,26 @@ async fn execute(replay: &Replay, sql: &str, key: &[u8; 32]) {
 
 #[tokio::test]
 async fn test_records_deleted_key_every_reader_passed_is_forgotten() {
-    // Once the cursor of every current app is past the delete, a request with trusted time
-    // forgets the key: its view is `404`, and a create at it starts again, at a newer
+    // Once the cursor of every current app is past the delete, the minute's sweep at a
+    // request forgets the key: its view is `404`, and a create at it starts again, at a newer
     // version (Switch spec 10.3, wire 9.1).
     let Some(replay) = registered(Limits::default()).await else {
         return;
     };
+    let (live, ..) = create(&replay, 7, b"live", "pay").await;
     let (key, deleted_at) = created_and_deleted(&replay, 1, b"gone").await;
     move_cursor(&replay, "wallet", deleted_at, AT).await;
     move_cursor(&replay, "phone", deleted_at, AT).await;
-    assert_eq!(record_rows(&replay, &key).await, 1, "no trusted time yet");
-    trusted_now(&replay);
+    assert_eq!(
+        record_rows(&replay, &key).await,
+        1,
+        "not before the minute's sweep"
+    );
+    next_minute(&replay);
     let answer = get_as(&replay, "phone", &format!("records/{}", b64(&key))).await;
     assert_eq!(code_of(&answer), (404, json!("not_found")));
     assert_eq!(record_rows(&replay, &key).await, 0);
+    assert_eq!(record_rows(&replay, &live).await, 1, "a live record stays");
     let (again, ..) = create(&replay, 3, b"gone", "pay").await;
     assert_eq!(again, key);
     let view = body(&get_as(&replay, "wallet", &format!("records/{}", b64(&key))).await);
@@ -1016,15 +1017,16 @@ async fn sql_app(replay: &Replay, sql: &str, name: &str) {
 
 #[tokio::test]
 async fn test_records_deleted_key_waits_for_a_reader_short_of_it() {
-    // A current app whose cursor is short of the delete holds the key, trusted time or not.
-    // Marked lagging, it still does while it has no `missed` item to pass: it wouldn't list
-    // again on its return, so it would keep the record.
+    // A current app whose cursor is short of the delete holds the key, sweep after sweep.
+    // Marked lagging, it still does while it has no `missed` item to pass, or only one it
+    // has passed: it wouldn't list again on its return, so it would keep the record.
     let Some(replay) = registered(Limits::default()).await else {
         return;
     };
     let (key, deleted_at) = created_and_deleted(&replay, 1, b"gone").await;
     move_cursor(&replay, "wallet", deleted_at, AT).await;
-    trusted_now(&replay);
+    move_cursor(&replay, "phone", deleted_at - 1, AT).await;
+    next_minute(&replay);
     let answer = get_as(&replay, "wallet", &format!("records/{}", b64(&key))).await;
     assert_eq!(body(&answer)["deleted"], true, "the phone hasn't passed it");
     sql_app(
@@ -1033,9 +1035,25 @@ async fn test_records_deleted_key_waits_for_a_reader_short_of_it() {
         "phone",
     )
     .await;
-    trusted_now(&replay);
+    next_minute(&replay);
     let answer = get_as(&replay, "wallet", &format!("records/{}", b64(&key))).await;
     assert_eq!(body(&answer)["deleted"], true, "no missed item to list on");
+    // One it has already passed doesn't count either.
+    sql_app(
+        &replay,
+        &format!(
+            "INSERT INTO inbox_entries (account_id, generation, seq, kind, accepted_at_ms, \
+             envelope, targets, quota_bytes, missed_entries, missed_from_ms, missed_until_ms) \
+             VALUES ($1, 1, {passed}, 'missed', {at}, '\\x', ARRAY[$2::BYTEA], 0, 1, {at}, {at})",
+            passed = deleted_at - 1,
+            at = ms(AT)
+        ),
+        "phone",
+    )
+    .await;
+    next_minute(&replay);
+    let answer = get_as(&replay, "wallet", &format!("records/{}", b64(&key))).await;
+    assert_eq!(body(&answer)["deleted"], true, "a missed item it passed");
     assert_eq!(record_rows(&replay, &key).await, 1);
     replay.db.drop_database().await.expect("drop");
 }
@@ -1076,7 +1094,7 @@ async fn test_records_deleted_key_a_lagging_app_lists_again_on_its_return() {
         "phone",
     )
     .await;
-    trusted_now(&replay);
+    next_minute(&replay);
     let answer = get_as(&replay, "wallet", &format!("records/{}", b64(&key))).await;
     assert_eq!(code_of(&answer), (404, json!("not_found")));
     let feed = body(&get_as(&replay, "phone", &format!("feed?after=1:{before}")).await);
@@ -1095,7 +1113,7 @@ async fn test_records_deleted_key_a_lagging_app_lists_again_on_its_return() {
     assert!(!keys_of(&listing).contains(&b64(&key)), "{listing}");
     let (other, other_deleted_at) = created_and_deleted(&replay, 5, b"next").await;
     move_cursor(&replay, "wallet", other_deleted_at, AT).await;
-    trusted_now(&replay);
+    next_minute(&replay);
     let answer = get_as(&replay, "wallet", &format!("records/{}", b64(&other))).await;
     assert_eq!(body(&answer)["deleted"], true, "waited for again");
     replay.db.drop_database().await.expect("drop");
@@ -1117,7 +1135,7 @@ async fn test_records_deleted_key_a_divergent_upload_names_is_kept() {
         &key,
     )
     .await;
-    trusted_now(&replay);
+    next_minute(&replay);
     let answer = get_as(&replay, "wallet", &format!("records/{}", b64(&key))).await;
     assert_eq!(
         answer.status,
