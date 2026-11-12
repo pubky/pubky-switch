@@ -1,6 +1,7 @@
 //! The app layer's flow tests, against the scripted switch of [`crate::testing`], its
 //! Homeserver, and a neutral sample protocol. Keys come from the test seeds.
 
+mod feed_wait;
 mod flows;
 mod forget;
 mod held_reads;

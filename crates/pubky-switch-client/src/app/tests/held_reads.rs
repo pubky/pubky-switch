@@ -30,7 +30,7 @@ type Seen = (u16, Value, Vec<String>, bool);
 /// The switch's transport, keeping each feed answer; with `forge`, every feed read is
 /// answered instead [`operator_503`] signed with a key the app doesn't know, as a hostile
 /// switch or its operator could.
-struct Recording {
+pub(super) struct Recording {
     inner: Arc<dyn Transport>,
     forge: Mutex<bool>,
     feeds: Mutex<Vec<Seen>>,
@@ -45,7 +45,7 @@ impl Recording {
         })
     }
 
-    fn forged(request: &Request) -> Response {
+    pub(super) fn forged(request: &Request) -> Response {
         let body = operator_503().to_string().into_bytes();
         let server_time = "2026-01-01T00:00:00.000Z";
         let request_signature = request

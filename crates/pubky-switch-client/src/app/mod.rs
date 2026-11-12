@@ -55,6 +55,7 @@ mod rotation;
 mod state;
 mod unverified;
 mod uploaded;
+mod wait;
 mod writer_certs;
 
 mod admission;
@@ -96,9 +97,10 @@ pub use unverified::{
     UNVERIFIED_DROPS_PER_COMMIT,
 };
 pub use uploaded::{MAX_RECORD_MARKS, RECORD_REREADS_PER_READ};
+pub use wait::{FeedWait, MAX_WAIT_SECONDS, Woken};
 
 pub use admission::{INVITE_CODE_BYTES, InviteCode, LISTS_TOO_LARGE_RETRY_MS, SenderDisposition};
-pub use batch::{MAX_KEPT_BATCHES_BYTES, OpBatch, server_time_in};
+pub use batch::{KEPT_RESENDS_PER_READ, MAX_KEPT_BATCHES_BYTES, OpBatch, server_time_in};
 pub use claims::{
     CLAIM_REREADS_PER_READ, ClaimDoubt, ClaimEntryRead, ClaimEvidence, ClaimOp, ClaimRead,
     ClaimWritten, ObligationDeadline, claim_conflict,
@@ -109,8 +111,8 @@ pub use directory::{
     SwitchAnswer, SwitchCopy, SwitchLookup,
 };
 pub use records::{
-    Collection, FlaggedWrite, KeptOp, KeptReason, PolicyFamily, RecordContent, RecordRead,
-    RecordTarget, SharedEvidence, SharedRecord, Unopened,
+    Collection, FlaggedWrite, KeptOp, KeptReason, LISTING_PAGES_PER_READ, PolicyFamily,
+    RecordContent, RecordRead, RecordTarget, SharedEvidence, SharedRecord, Unopened,
 };
 pub use send::{
     Delivery, MAX_CARRIED_OUTBOX_BYTES, OutboxReport, OutgoingMessage, RecordJob,
@@ -608,6 +610,9 @@ pub struct App {
     /// When this app last asked for its full key bundle, device clock (`keys.rs`,
     /// [`keys::KEY_REQUEST_RETRY_MS`]). In memory only.
     bundle_asked_ms: Option<u64>,
+    /// Where a wait for the feed starts, as the last read left it ([`App::feed_wait`]). In
+    /// memory only: a restart waits from the cursor.
+    wait_from: Option<wait::WaitFrom>,
 }
 
 impl std::fmt::Debug for App {
@@ -838,6 +843,7 @@ impl App {
                 sender_rereads: HashMap::new(),
                 published_checked_ms: None,
                 bundle_asked_ms: None,
+                wait_from: None,
                 peer_rereads: HashMap::new(),
                 reads_begun: 0,
             };
@@ -973,6 +979,7 @@ impl App {
                 sender_rereads: HashMap::new(),
                 published_checked_ms: None,
                 bundle_asked_ms: None,
+                wait_from: None,
                 peer_rereads: HashMap::new(),
                 reads_begun: 0,
             };
@@ -1699,6 +1706,7 @@ impl App {
                 sender_rereads: HashMap::new(),
                 published_checked_ms: None,
                 bundle_asked_ms: None,
+                wait_from: None,
                 peer_rereads: HashMap::new(),
                 reads_begun: 0,
             };

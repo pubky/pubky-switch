@@ -68,8 +68,10 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   transport of `transport` holds nothing and answers such a read at once. A `wait` that
   isn't an integer from 0 to 25 is `400`. A read is held only for a current app of an
   account that serves it: one that is gone, staged, or otherwise refuses the call answers at
-  once. The read is admitted when it arrives, as at the service: its app is seen then and
-  not again when the read is answered, and its app's lagging mark ends then. The switch's
+  once. Several reads may be held at once, one app's included, each on its own, and other
+  requests are answered while they are held. The read is admitted when it arrives, as at
+  the service: its app is seen then and not again when the read is answered, and its app's
+  lagging mark ends then. The switch's
   lock isn't held across the wait, and every request to the switch lets the held reads look
   again. A read held while its app is revoked or leaves is woken and refused `403
   not_current`, and one held while its account is erased gets the operator's `404`, never a
