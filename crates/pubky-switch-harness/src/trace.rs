@@ -196,7 +196,9 @@ pub struct Recorder {
     /// The enrollments sent, in order, as they were sent.
     enrollments: Mutex<Vec<Request>>,
     /// The requests held back on their way: the method, and a part of the path.
-    held_back: Mutex<Option<(String, String)>>,
+    held_back: Mutex<Option<HeldBack>>,
+    /// How many requests are held back now.
+    waiting: Mutex<usize>,
 }
 
 /// A fault of the network between a party and its switch, applied to the next request of
@@ -246,6 +248,17 @@ impl Fault {
     }
 }
 
+/// The requests held back on their way: of this method, their path containing this text.
+#[derive(Clone, Debug)]
+struct HeldBack {
+    method: String,
+    path: String,
+    /// Whether only the next such request is held.
+    only_next: bool,
+    /// Whether a request was held under it yet.
+    taken: bool,
+}
+
 /// The fact that says what a fault did to a request.
 const FAULT: &str = "fault";
 
@@ -275,6 +288,7 @@ impl Recorder {
             faults: Mutex::new(Vec::new()),
             enrollments: Mutex::new(Vec::new()),
             held_back: Mutex::new(None),
+            waiting: Mutex::new(0),
         }
     }
 
@@ -300,7 +314,24 @@ impl Recorder {
     /// while other calls go on. For a flow in which one party's step must not overtake
     /// another's answer.
     pub fn hold_back(&self, method: &str, path: &str) {
-        *lock(&self.held_back) = Some((method.to_owned(), path.to_owned()));
+        *lock(&self.held_back) = Some(HeldBack {
+            method: method.to_owned(),
+            path: path.to_owned(),
+            only_next: false,
+            taken: false,
+        });
+    }
+
+    /// As [`Recorder::hold_back`], for the next such request only: those after it go
+    /// through while it waits. For two parties' requests of one kind that race, where the
+    /// flow decides which arrives first.
+    pub fn hold_back_next(&self, method: &str, path: &str) {
+        *lock(&self.held_back) = Some(HeldBack {
+            method: method.to_owned(),
+            path: path.to_owned(),
+            only_next: true,
+            taken: false,
+        });
     }
 
     /// Let the requests [`Recorder::hold_back`] holds go, and hold none back from now on.
@@ -308,12 +339,24 @@ impl Recorder {
         *lock(&self.held_back) = None;
     }
 
+    /// How many requests are held back now.
+    pub fn held_back_now(&self) -> usize {
+        *lock(&self.waiting)
+    }
+
+    /// Whether `request` is one to hold back: every matching one, or the first of them.
     fn holds_back(&self, request: &Request) -> bool {
-        lock(&self.held_back)
-            .as_ref()
-            .is_some_and(|(method, path)| {
-                request.method == *method && request.path_and_query.contains(path.as_str())
-            })
+        let mut held = lock(&self.held_back);
+        let Some(held) = held.as_mut() else {
+            return false;
+        };
+        let matches =
+            request.method == held.method && request.path_and_query.contains(held.path.as_str());
+        if !matches || (held.only_next && held.taken) {
+            return false;
+        }
+        held.taken = true;
+        true
     }
 
     /// How many different enrollments were sent through this recorder.
@@ -460,8 +503,12 @@ impl Transport for Recorder {
         Box::pin(async move {
             // Held back, the request isn't on its way yet: it takes its place in the trace
             // when it goes.
-            while self.holds_back(&request) {
-                tokio::task::yield_now().await;
+            if self.holds_back(&request) {
+                *lock(&self.waiting) += 1;
+                while lock(&self.held_back).is_some() {
+                    tokio::task::yield_now().await;
+                }
+                *lock(&self.waiting) -= 1;
             }
             let label = self.label(&request);
             let mut facts = BTreeMap::new();
@@ -1048,6 +1095,38 @@ mod tests {
         );
         // Nothing is held back afterwards.
         assert!(recorder.send(post("/v1/abc/ops")).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_held_back_next_holds_one_request_and_lets_the_like_through() {
+        let (recorder, inner) = recorder();
+        recorder.hold_back_next("POST", "/ops");
+        let first = recorder.send(post("/v1/abc/ops"));
+        let second = async {
+            // The first is waiting; another of its kind goes through.
+            while recorder.held_back_now() == 0 {
+                tokio::task::yield_now().await;
+            }
+            let answered = recorder.send(post("/v1/xyz/ops")).await;
+            let reached: Vec<String> = inner
+                .requests()
+                .iter()
+                .map(|request| request.path_and_query.clone())
+                .collect();
+            recorder.let_go();
+            (answered.map(|answer| answer.status), reached)
+        };
+        // A recorder that held the second too would wait for good.
+        let both = futures_util::future::join(first, second);
+        let (first, (second, reached)) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), both)
+                .await
+                .expect("the request after the held one was held as well");
+        assert_eq!(second, Ok(200));
+        assert_eq!(reached, ["/v1/xyz/ops"], "the held one hadn't arrived");
+        assert_eq!(first.map(|answer| answer.status), Ok(200));
+        assert_eq!(recorder.held_back_now(), 0);
+        assert_eq!(inner.requests().len(), 2);
     }
 
     #[test]

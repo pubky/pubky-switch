@@ -115,9 +115,18 @@ The flows send every call the service serves, each at both switches. What they l
   identity that enrolls again after an erasure.
 - **More of a signer's copies and installs.** The install flows put the published copy
   right, clear the alarm for another document at the published version, take over on a
-  new install, and restore in place. A switch that shows an older copy or another body
-  (a rollback or an equivocation at the switch), a backup that doesn't open, and two
-  installs whose deliveries race stay with the signer's tests on the scripted switch.
+  new install, and restore in place. In most of them the switch only answers ordinary
+  reads of the apps and takes ordinary deliveries: the published copy put right, another
+  document at the version, records behind, a version never delivered, and a new install
+  taking over but for the version that names another signer. What they run at both
+  switches is the signer's behaviour. Clearing the alarm delivers the signer's version
+  again, a retry the switch answers as the delivery it took. The switch refuses a
+  delivery where two deliveries race: a hand-over's abort against its take-over, either
+  arriving first, and two installs restored at once, each `409 stale_identity` for the
+  one that arrives second. A switch that shows an older copy or another body (a rollback
+  or an equivocation at the switch) and a backup that doesn't open stay with the signer's
+  tests on the scripted switch, as do a stale backup refused at a restore, a Homeserver
+  that holds another body at a restore, and a restore in place below the signer's mark.
 - **More of a removal.** The removal flows date a revocation and a departure, clean up
   after one, purge its entry, and send a revocation past a read that failed or during a
   recovery. A removal time a switch reports before the app was listed or after its own
@@ -146,6 +155,6 @@ Run the `trace` example to see what the two switches answered, and list each dif
 ## Run time and databases
 
 Each flow's run against the service makes one test database and drops it, also when its
-test panics; the flows run one after another. Sixty flows take about three minutes in a
+test panics; the flows run one after another. Sixty-three flows take about three minutes in a
 debug build. If that grows too long, the service's halves could share one service and one
 database, with identities of their own per flow: a later option, not needed yet.

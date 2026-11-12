@@ -59,8 +59,10 @@ impl StateStore for KeptCommits {
     }
 
     fn commit(&self, batch: WriteBatch) -> Result<(), StoreError> {
+        // One lock over both, so the kept batches are in the order they were applied.
+        let mut committed = lock(&self.committed);
         self.store.commit(batch.clone())?;
-        lock(&self.committed).push(batch);
+        committed.push(batch);
         Ok(())
     }
 }
