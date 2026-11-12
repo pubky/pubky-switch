@@ -145,6 +145,23 @@ pub enum Alert {
         /// When its certificate expires, in Unix milliseconds.
         expires_at: u64,
     },
+    /// The switch refused this app's renewal for good, at the storage of its certificate and
+    /// key bundle or at its delivery, so it didn't happen (Switch spec 3.2): the app keeps
+    /// the certificate `identity.json` lists, with its scopes, their keys, its switch
+    /// permissions and its expiry. For a `reduction` the access was not reduced: the app
+    /// still holds the scope, or the permission, or the later expiry, that the user asked to
+    /// remove. Raised whichever call met the refusal, the renewal's own or a later
+    /// [`crate::Signer::resume`] or [`crate::Signer::run_due`], for a renewal the user asked
+    /// for and for an automatic one, which the next run tries again. Cleared once a version
+    /// that renews the app, or removes it, is delivered; a user who clears it doesn't see it
+    /// again. It is this install's own: a restore, in place or on a new install, doesn't
+    /// bring it back, since the listed certificate shows what the app holds.
+    RenewalRefused {
+        /// The app.
+        app_id: [u8; 16],
+        /// Whether the renewal refused was a reduction (Switch wire 3.8 "Reductions").
+        reduction: bool,
+    },
     /// An app whose renewals stopped ([`Alert::RenewalsStopped`]) still owns attempts open
     /// or `unknown`, as `GET /apps` lists them: at `expires_at` it isn't current any more, its
     /// open ones are orphaned, and its `unknown` ones are left, for the identity's other apps

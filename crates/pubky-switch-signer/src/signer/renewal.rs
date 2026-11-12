@@ -100,6 +100,12 @@ impl Signer {
     /// [`Refusal::NotListed`] for an app the newest `identity.json` doesn't list; the scope
     /// refusals of [`crate::Protocols::terms`] for new scopes; [`SignerError::InvalidData`]
     /// for an expiry the certificate rules refuse; otherwise as [`Signer::resume`].
+    ///
+    /// When the switch refuses the renewal for good, at a batch or at the delivery, the error
+    /// is its refusal and [`Alert::RenewalRefused`] is raised with it: the renewal didn't
+    /// happen, and for a reduction the access was not reduced. A later [`Signer::resume`] or
+    /// [`Signer::run_due`] that meets the refusal, after this call was cut off, raises the same
+    /// alert, so the host tells the user the same way whichever call met it (Switch spec 3.2).
     pub async fn renew(&mut self, app_id: [u8; 16], change: CertChange) -> Result<IdentityDoc> {
         self.ready().await?;
         self.renew_listed(app_id, change, None, RenewedBy::User)
@@ -501,8 +507,11 @@ impl Signer {
                     if (400..500).contains(&status) && status != 408 && status != 429 =>
                 {
                     // A definite refusal: the flow ends, its version and its epochs stay
-                    // spent, and the parts already stored stay recorded.
-                    self.commit(self.state.clone(), None).await?;
+                    // spent, and the parts already stored stay recorded. A renewal it carried
+                    // didn't happen, and the user is told in the same commit.
+                    let mut state = self.state.clone();
+                    self.note_refused_renewals(&mut state, &doc)?;
+                    self.commit(state, None).await?;
                     return Err(error.into());
                 }
                 Err(error) => return Err(error.into()),
@@ -515,6 +524,45 @@ impl Signer {
             step: DeliverStep::Signed,
         };
         self.commit(self.state.clone(), Some(deliver)).await
+    }
+
+    /// Raise [`Alert::RenewalRefused`] in `state` for each app whose listed certificate `doc`,
+    /// a version the switch refused for good, would have renewed (Switch spec 3.2): one that
+    /// lists another certificate for it than the newest version does. A version that renews
+    /// no app, such as a removal's or an epoch's completion, raises none.
+    pub(super) fn note_refused_renewals(
+        &self,
+        state: &mut SignerState,
+        doc: &SignedDoc,
+    ) -> Result<()> {
+        let Ok(refused) = IdentityDoc::verify(doc, &state.identity) else {
+            return Ok(());
+        };
+        let Some(newest) = state.newest_doc()? else {
+            return Ok(());
+        };
+        let certs = self.held_certs()?;
+        let held = |hash: [u8; 32]| certs.iter().find(|cert| cert.hash() == hash);
+        for app in &refused.body().apps {
+            let Some(listed) = newest.listed_cert(&app.app_id) else {
+                continue;
+            };
+            if listed == app.cert {
+                continue;
+            }
+            let reduction = match (held(listed), held(app.cert)) {
+                (Some(old), Some(new)) => is_reduction(old, new),
+                _ => false,
+            };
+            state.alerts.retain(|alert| {
+                !matches!(alert, Alert::RenewalRefused { app_id, .. } if *app_id == app.app_id)
+            });
+            state.alert(Alert::RenewalRefused {
+                app_id: app.app_id,
+                reduction,
+            });
+        }
+        Ok(())
     }
 
     /// Whether the records cut `app_id` off: a tombstone, or a revocation asked for. Such an

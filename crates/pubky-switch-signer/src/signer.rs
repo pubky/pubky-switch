@@ -1388,8 +1388,11 @@ impl Signer {
                 },
             ) => {
                 // A definite refusal, a `400` or a `413 too_large` (Switch wire 7.1): the same
-                // bytes would be refused again. The version stays spent (`signed_through`).
-                self.commit(self.state.clone(), None).await?;
+                // bytes would be refused again. The version stays spent (`signed_through`). A
+                // renewal it carried didn't happen, and the user is told in the same commit.
+                let mut state = self.state.clone();
+                self.note_refused_renewals(&mut state, &doc)?;
+                self.commit(state, None).await?;
                 Err(error.into())
             }
             Err(error) => Err(error.into()),
@@ -1440,6 +1443,18 @@ impl Signer {
                     from: take_back.from,
                 });
             }
+        }
+        // A refused renewal is told of until a version renewing the app, or removing it, is
+        // delivered (Switch spec 3.2).
+        if let Ok(delivered) = &verified {
+            let before = state.newest_doc()?;
+            state.alerts.retain(|alert| match alert {
+                Alert::RenewalRefused { app_id, .. } => {
+                    let now = delivered.listed_cert(app_id);
+                    now.is_some() && before.as_ref().and_then(|b| b.listed_cert(app_id)) == now
+                }
+                _ => true,
+            });
         }
         // How close the version comes to the most a delivery, or a move's enrollment, may
         // carry (Switch wire 3.7, 7.1).
