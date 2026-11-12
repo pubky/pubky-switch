@@ -118,27 +118,42 @@ impl App {
         )
     }
 
-    /// Send the kept `app.put` until answered. A `409 conflict` naming a record of this app
-    /// with an `updated_at` at or after this one's (another device's) is written again
-    /// once, later than the held one (Switch spec 4.2). Once the switch holds the record,
-    /// an app that publishes owes it to the Homeserver, in the commit that records the
-    /// answer, and writes it there (`own_record.rs`).
+    /// Deliver what is owed of the record, then publish it (`own_record.rs`).
     pub(crate) async fn deliver_record(&mut self) -> Result<Publication, AppError> {
+        let accepted = self.deliver_pending_record().await?;
+        self.publish_owed(false, accepted).await
+    }
+
+    /// Send the kept `app.put` until answered; returns whether the switch accepted a record
+    /// in this call. A `409 conflict` naming a record of this app with an `updated_at` at or
+    /// after this one's (another device's) is written again once, later than the held one
+    /// (Switch spec 4.2). One naming no record that verifies is taken as delivered only when
+    /// the switch's directory shows it holds this very record, as for a re-send of a batch
+    /// the switch applied and holds without its proofs (Switch wire 6.4 step 5); otherwise
+    /// it is refused, and nothing is noted or published. Once the switch holds the record,
+    /// an app that publishes owes it to the Homeserver, in the commit that records the
+    /// answer.
+    pub(crate) async fn deliver_pending_record(&mut self) -> Result<bool, AppError> {
         let Some(pending) = self.state.pending_record.clone() else {
-            return self.publish_owed(false).await;
+            return Ok(false);
         };
         let mut batch = Batch::from_body(pending.body)?;
         let result = self.submit(&batch).await;
         let held = match result {
             Ok(_) => None,
-            Err(AppError::Switch(ClientError::Switch {
-                code: ErrorCode::Conflict,
-                current,
-                ..
-            })) => current
-                .get("record")
-                .and_then(|value| SignedDoc::from_strict_value(value).ok())
-                .and_then(|doc| AppRecord::verify(&doc, &self.state.meta.identity).ok()),
+            Err(error) if error.code() == Some(ErrorCode::Conflict) => {
+                let named = match &error {
+                    AppError::Switch(ClientError::Switch { current, .. }) => current
+                        .get("record")
+                        .and_then(|value| SignedDoc::from_strict_value(value).ok())
+                        .and_then(|doc| AppRecord::verify(&doc, &self.state.meta.identity).ok()),
+                    _ => None,
+                };
+                if named.is_none() && !self.switch_holds(&batch).await? {
+                    return Err(error);
+                }
+                named
+            }
             Err(error) => return Err(error),
         };
         if let Some(held) = held {
@@ -174,7 +189,20 @@ impl App {
         self.state.pending_record = None;
         self.commit(tx).await?;
         self.took_accepted(delivered);
-        self.publish_owed(false).await
+        Ok(true)
+    }
+
+    /// Whether the switch's directory shows it holds, for this app, the record `batch`
+    /// delivers, byte for byte.
+    async fn switch_holds(&mut self, batch: &Batch) -> Result<bool, AppError> {
+        let record = delivered_record(batch)?;
+        let me = self.state.meta.app_id;
+        let result = self.client.directory(None).await;
+        let directory = self.take(result).await?;
+        Ok(directory
+            .apps
+            .iter()
+            .any(|app| app.app_id == me && app.record.signed() == &record))
     }
 
     /// The listed certificate from the own record in the directory, when the own

@@ -928,7 +928,7 @@ impl App {
         self.state.chain = Some(view);
         self.commit(tx).await?;
         self.took_accepted(record);
-        self.publish_owed(false).await?;
+        self.publish_owed(false, true).await?;
         Ok(())
     }
 

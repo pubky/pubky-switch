@@ -46,7 +46,8 @@ use crate::transport::BoxFuture;
 /// Pubky session of the app's grant, which covers the app's record path (Switch spec 3.4);
 /// tests fake it.
 pub trait HomeserverWriter: Send + Sync {
-    /// Put `bytes` at `path` on `identity`'s Homeserver, replacing what is there.
+    /// Put `bytes` at `path` on `identity`'s Homeserver, replacing what is there. `Ok` only
+    /// once the write is durable there: the app then owes nothing more of it.
     ///
     /// # Errors
     ///
@@ -59,7 +60,9 @@ pub trait HomeserverWriter: Send + Sync {
     ) -> BoxFuture<'_, Result<(), TransportError>>;
 
     /// Delete the file at `path` on `identity`'s Homeserver; one that isn't there is
-    /// deleted already.
+    /// deleted already. `Ok` only once the delete is durable on the Homeserver: the app
+    /// calls `leave` on it, and from then on nothing would delete the file again (Switch
+    /// spec 12.3).
     ///
     /// # Errors
     ///
@@ -76,11 +79,16 @@ pub const PUBLISHED_CHECK_MS: u64 = super::DOC_CACHE_MS;
 
 /// Where the app's record stands on the Homeserver after a call (Switch spec 4.2).
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Publication {
     /// The app doesn't publish its record ([`super::AppConfig::publishes_record`]): the switch
     /// alone holds it.
     NotPublishing,
-    /// The Homeserver holds the record the switch holds: nothing is owed.
+    /// The switch has accepted no record of the app that this app knows of, as after a
+    /// provider loss until the new service answers the re-registration, or after a restore
+    /// from a backup that carries none: nothing is published until one is accepted.
+    NothingAccepted,
+    /// The Homeserver holds the newest record the switch accepted: nothing is owed.
     Published,
     /// The Homeserver holds a record of the app with a later `updated_at` than the newest
     /// the switch accepted, as after a restore from an older backup: nothing is written over
@@ -92,6 +100,17 @@ pub enum Publication {
         /// Why the write failed.
         error: TransportError,
     },
+    /// Nothing is owed, and the read that checks the Homeserver copy failed: the copy is
+    /// read again at the next read.
+    Unchecked {
+        /// Why the read failed.
+        error: TransportError,
+    },
+    /// The Homeserver copy is missing, and the app runs on devices that share its keys:
+    /// another device may have deleted it to leave, so the copy is written back only at the
+    /// next read, after its feed shows the app still current (Switch spec 4.2). It stays
+    /// owed until then.
+    AwaitingRead,
 }
 
 impl App {
@@ -199,8 +218,8 @@ impl App {
     /// # Errors
     ///
     /// [`Refusal::Usage`] for a label that starts with `pubky-switch/`, of any version,
-    /// which only the Switch's formats use (Switch spec 13.2 "Labels"); [`Refusal::Stopped`], [`Refusal::Left`] or
-    /// [`Refusal::Gone`].
+    /// which only the Switch's formats use (Switch spec 13.2 "Labels");
+    /// [`Refusal::Stopped`], [`Refusal::Left`] or [`Refusal::Gone`].
     pub fn sign_protocol(&self, label: &str, fields: &[&[u8]]) -> Result<[u8; 64], AppError> {
         self.refuse_when_stopped()?;
         if is_switch_label(label) {
@@ -294,14 +313,26 @@ impl App {
     /// ([`Publication::Superseded`]). With nothing owed the copy is read at most once per
     /// [`PUBLISHED_CHECK_MS`], unless `check`. Nothing is published once the app has begun
     /// to leave, from the commit before it deletes its Homeserver record (Switch spec
-    /// 12.3): every call that leads here refuses a leaving app first. A read or write that fails leaves the publication owed and is reported
-    /// ([`AppEvent::RecordPublishFailed`]); only the store's failure is an error.
-    pub(crate) async fn publish_owed(&mut self, check: bool) -> Result<Publication, AppError> {
+    /// 12.3): every call that leads here refuses a leaving app first.
+    ///
+    /// `current` is whether this call has shown the app current: the switch accepted its
+    /// record in it, or a read read its feed to the end. An app whose devices share its
+    /// keys writes a missing copy back only then, since another device may have deleted it
+    /// to leave ([`Publication::AwaitingRead`]). A write that fails leaves the publication
+    /// owed, and so does a read that fails while one is owed, both reported
+    /// ([`AppEvent::RecordPublishFailed`]); a read that fails while nothing is owed is
+    /// tried again at the next read ([`Publication::Unchecked`]). Only the store's failure
+    /// is an error.
+    pub(crate) async fn publish_owed(
+        &mut self,
+        check: bool,
+        current: bool,
+    ) -> Result<Publication, AppError> {
         if !self.config.publishes_record {
             return Ok(Publication::NotPublishing);
         }
         let Some(record) = self.state.accepted.clone() else {
-            return Ok(Publication::Published);
+            return Ok(Publication::NothingAccepted);
         };
         let owed = self.state.pending_publish.is_some();
         let now = self.now();
@@ -318,14 +349,22 @@ impl App {
             .map_err(|_| AppError::InvalidData("the record doesn't serialize".into()))?;
         let copy = match self.env.homeserver.get(identity, path.clone()).await {
             Ok(copy) => copy,
-            Err(error) => return Ok(self.publication_failed(error)),
+            Err(error) if owed => return Ok(self.publication_failed(error)),
+            Err(error) => return Ok(Publication::Unchecked { error }),
         };
         self.published_checked_ms = Some(now);
         let outcome = match copy {
             Some(held) if held == bytes => Publication::Published,
             Some(held) if self.later_copy(&held, &record) => Publication::Superseded,
+            None if self.state.device.multi_device && !current => {
+                self.owe_publication(&record).await?;
+                return Ok(Publication::AwaitingRead);
+            }
             _ => {
                 if let Err(error) = writer.put(identity, path, bytes).await {
+                    // A repair that failed stays owed, so the next read tries it again
+                    // without waiting out the check's interval.
+                    self.owe_publication(&record).await?;
                     return Ok(self.publication_failed(error));
                 }
                 Publication::Published
@@ -338,6 +377,19 @@ impl App {
             self.state.pending_publish = None;
         }
         Ok(outcome)
+    }
+
+    /// Owe the publication of `record`, the newest accepted, from a check that found the
+    /// Homeserver copy missing or different (`pending/publish`).
+    async fn owe_publication(&mut self, record: &SignedDoc) -> Result<(), AppError> {
+        if self.state.pending_publish.is_some() {
+            return Ok(());
+        }
+        let mut tx = self.tx()?;
+        tx.put(key::PENDING_PUBLISH, record)?;
+        self.commit(tx).await?;
+        self.state.pending_publish = Some(record.clone());
+        Ok(())
     }
 
     /// A publication that couldn't be made now: reported, and owed.

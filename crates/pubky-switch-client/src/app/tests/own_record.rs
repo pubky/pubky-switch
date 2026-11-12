@@ -767,9 +767,10 @@ async fn test_own_record_renewed_certificate_is_republished() {
             until: None,
         });
     });
-    // The Homeserver fails at the first try: the record carrying the new certificate is
-    // delivered, and published at the next read (Switch spec 3.2 step 3).
-    w.homeserver.fail_writes(1, false);
+    // The Homeserver fails at the read's tries, at the delivery and after the feed: the
+    // record carrying the new certificate is delivered, and published at the next read
+    // (Switch spec 3.2 step 3).
+    w.homeserver.fail_writes(2, false);
     app.receive(None).await.unwrap();
     assert_eq!(app.cert().hash(), renewed.hash());
     assert_eq!(w.held(me).as_ref(), Some(app.record()));
@@ -976,25 +977,6 @@ async fn test_own_record_only_a_two_step_leave_waits_for_the_delete() {
     );
 }
 
-/// Switch spec 12.3: the leave's state is committed before the Homeserver record is
-/// deleted. A store that stops at that commit leaves the record published and the app
-/// current; the load after goes on with the whole leave.
-#[tokio::test]
-async fn test_own_record_crash_before_the_leave_is_kept_deletes_nothing() {
-    let w = World::new();
-    let (mut app, _) = on_faulty_store(&w, StoreFault::StopBefore(1)).await;
-    let id = app.app_id();
-    let published = w.published(id);
-    assert!(published.is_some());
-    app.leave(LeaveMode::TwoStep).await.unwrap_err();
-    assert_eq!(w.published(id), published);
-    assert!(!w.switch.app(&id).departed);
-    let mut loaded = w.load_publishing_on(w.store.clone(), id).await;
-    loaded.leave(LeaveMode::TwoStep).await.unwrap();
-    assert!(w.published(id).is_none());
-    assert!(w.switch.app(&id).departed);
-}
-
 /// The wallet restored on a store of its own from `backup`.
 async fn restored_publishing(w: &World, backup: &crate::app::AppBackup) -> App {
     App::restore(
@@ -1082,6 +1064,26 @@ async fn test_own_record_restore_never_publishes_a_record_never_delivered() {
     assert_eq!(w.published(id), accepted.as_ref().map(bytes_of));
 }
 
+/// A backup carrying no accepted record publishes nothing once restored, until the switch
+/// accepts one of the app's.
+#[tokio::test]
+async fn test_own_record_restore_without_an_accepted_record_publishes_nothing() {
+    let w = World::new();
+    let app = w.join_publishing("wallet").await;
+    let id = app.app_id();
+    let mut backup = serde_json::to_value(app.backup().await.unwrap()).unwrap();
+    backup.as_object_mut().unwrap().remove("accepted").unwrap();
+    let backup: crate::app::AppBackup = serde_json::from_value(backup).unwrap();
+    drop(app);
+    w.homeserver.remove(w.alice.public(), &app_record_path(&id));
+    let mut restored = restored_publishing(&w, &backup).await;
+    assert_eq!(
+        restored.publish_record().await.unwrap(),
+        Publication::NothingAccepted
+    );
+    assert!(w.published(id).is_none());
+}
+
 /// Switch spec 4.2: a restore of an app that publishes needs a Homeserver writer, as a join
 /// and a load do; nothing is written without one.
 #[tokio::test]
@@ -1101,4 +1103,160 @@ async fn test_own_record_restore_publishing_needs_a_writer() {
         matches!(error, AppError::Refused(Refusal::Usage(_))),
         "{error}"
     );
+}
+
+/// A `409 conflict` naming no record is a refusal: nothing is noted or published, and the
+/// record goes again at the next read.
+#[tokio::test]
+async fn test_own_record_conflict_naming_no_record_publishes_nothing() {
+    let w = World::new();
+    let mut app = w.join_publishing("wallet").await;
+    let id = app.app_id();
+    let accepted = w.held(id);
+    let published = w.published(id);
+    w.clock.advance_ms(1_000);
+    w.switch.fail_next(Fault::Error {
+        path: "/ops".into(),
+        code: ErrorCode::Conflict,
+        current: json!({}),
+    });
+    let error = app
+        .set_protocol_member(PROTO, member(json!({ "a": 1 })), None)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Some(ErrorCode::Conflict), "{error}");
+    assert_eq!(w.held(id), accepted);
+    assert_eq!(w.published(id), published);
+    assert!(app.state.pending_publish.is_none());
+    assert_ne!(app.state.accepted.as_ref(), Some(app.record()));
+    app.receive(None).await.unwrap();
+    assert_eq!(w.held(id).as_ref(), Some(app.record()));
+    assert_eq!(w.published(id), Some(bytes_of(app.record())));
+}
+
+/// A re-send whose first send the switch applied, answered `409 conflict` naming no record,
+/// as a batch held without its proofs is (Switch wire 6.4 step 5): the switch's directory
+/// shows it holds the record, so it is delivered and published.
+#[tokio::test]
+async fn test_own_record_conflict_on_a_resend_the_switch_holds_is_delivered() {
+    let w = World::new();
+    let mut app = w.join_publishing("wallet").await;
+    let id = app.app_id();
+    w.clock.advance_ms(1_000);
+    w.switch.fail_next(Fault::LoseAnswer {
+        path: "/ops".into(),
+    });
+    app.set_protocol_member(PROTO, member(json!({ "a": 1 })), None)
+        .await
+        .unwrap_err();
+    assert_eq!(w.held(id).as_ref(), Some(app.record()));
+    w.switch.fail_next(Fault::Error {
+        path: "/ops".into(),
+        code: ErrorCode::Conflict,
+        current: json!({}),
+    });
+    assert_eq!(app.publish_record().await.unwrap(), Publication::Published);
+    assert_eq!(app.state.accepted.as_ref(), Some(app.record()));
+    assert_eq!(w.published(id), Some(bytes_of(app.record())));
+}
+
+/// Nothing owed and the check's read failing: nothing failed is reported, and the next read
+/// checks the copy again.
+#[tokio::test]
+async fn test_own_record_check_that_cant_read_owes_nothing() {
+    let w = World::new();
+    let mut app = w.join_publishing("wallet").await;
+    let id = app.app_id();
+    w.homeserver.set_down(true);
+    let publication = app.publish_record().await.unwrap();
+    assert!(
+        matches!(publication, Publication::Unchecked { .. }),
+        "{publication:?}"
+    );
+    assert!(app.state.pending_publish.is_none());
+    assert!(
+        !app.take_events()
+            .iter()
+            .any(|e| matches!(e, AppEvent::RecordPublishFailed { .. }))
+    );
+    w.homeserver.set_down(false);
+    w.homeserver.remove(w.alice.public(), &app_record_path(&id));
+    app.receive(None).await.unwrap();
+    assert_eq!(w.published(id), Some(bytes_of(app.record())));
+}
+
+/// A check that finds the copy missing and fails to write it back owes the publication:
+/// the next read writes it, without waiting out the check's interval.
+#[tokio::test]
+async fn test_own_record_failed_repair_goes_again_at_the_next_read() {
+    let w = World::new();
+    let mut app = w.join_publishing("wallet").await;
+    let id = app.app_id();
+    w.clock.advance_ms(PUBLISHED_CHECK_MS);
+    w.homeserver.remove(w.alice.public(), &app_record_path(&id));
+    w.homeserver.fail_writes(1, false);
+    let report = app.receive(None).await.unwrap();
+    assert!(
+        report
+            .events
+            .iter()
+            .any(|e| matches!(e, AppEvent::RecordPublishFailed { .. })),
+        "{:?}",
+        report.events
+    );
+    assert!(w.published(id).is_none());
+    w.clock.advance_ms(1_000);
+    app.receive(None).await.unwrap();
+    assert_eq!(w.published(id), Some(bytes_of(app.record())));
+}
+
+/// Switch spec 4.2, 12.3: an app whose devices share its keys writes a missing copy back
+/// only in a read, after its feed. So when one device leaves, deleting the record, another
+/// device's read sees the departure in its feed first, and writes nothing.
+#[tokio::test]
+async fn test_own_record_other_device_never_writes_back_a_record_deleted_to_leave() {
+    let w = World::new();
+    let mut a = w.join_publishing("wallet").await;
+    let id = a.app_id();
+    let path = app_record_path(&id);
+    a.set_multi_device(true).await.unwrap();
+    let backup = a.backup().await.unwrap();
+    let mut b = restored_publishing(&w, &backup).await;
+    b.receive(None).await.unwrap();
+    b.end_reconcile(UserConfirmed::new()).await.ok();
+    // A missing copy waits for a read, and the read writes it back after its feed.
+    w.homeserver.remove(w.alice.public(), &path);
+    assert_eq!(a.publish_record().await.unwrap(), Publication::AwaitingRead);
+    assert!(w.published(id).is_none());
+    a.receive(None).await.unwrap();
+    assert_eq!(w.published(id), Some(bytes_of(a.record())));
+    // B leaves: A's next read, its check due, writes nothing back.
+    b.leave(LeaveMode::Immediate(UserConfirmed::new()))
+        .await
+        .unwrap();
+    assert!(w.published(id).is_none());
+    let writes = w.record_writes(id);
+    w.clock.advance_ms(PUBLISHED_CHECK_MS);
+    let _ = a.receive(None).await;
+    assert!(w.published(id).is_none());
+    assert_eq!(w.record_writes(id), writes);
+}
+
+/// Switch spec 12.3: the leave's state is committed before the Homeserver record is
+/// deleted. A store that stops at that commit leaves the record published and the app
+/// current; the load after goes on with the whole leave.
+#[tokio::test]
+async fn test_own_record_crash_before_the_leave_is_kept_deletes_nothing() {
+    let w = World::new();
+    let (mut app, _) = on_faulty_store(&w, StoreFault::StopBefore(1)).await;
+    let id = app.app_id();
+    let published = w.published(id);
+    assert!(published.is_some());
+    app.leave(LeaveMode::TwoStep).await.unwrap_err();
+    assert_eq!(w.published(id), published);
+    assert!(!w.switch.app(&id).departed);
+    let mut loaded = w.load_publishing_on(w.store.clone(), id).await;
+    loaded.leave(LeaveMode::TwoStep).await.unwrap();
+    assert!(w.published(id).is_none());
+    assert!(w.switch.app(&id).departed);
 }
