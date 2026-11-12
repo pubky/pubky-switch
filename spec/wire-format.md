@@ -2029,7 +2029,7 @@ Example page (alice's `wallet` after `1:4`: bob's entry at `seq` 5, then four ch
   | `apps_version` | int | changes only when an app becomes reachable (current, with a receive key) or stops being reachable |
 
   Apps of other identities also get `known_version`. `404` before the account holds an `identity.json`.
-- **The versions are the account's, not a generation's.** `directory_version` and `apps_version` go on counting across a recovery in place (3.3) and never restart for an account, so a value a sender holds from before the loss is never met again for another set of apps (7.4.3 step 5).
+- **The versions are the account's, not a generation's.** `directory_version` and `apps_version` go on counting across a recovery in place (3.3) and never restart for an account that isn't erased, so a value a sender holds from before the loss is never met again for another set of apps (7.4.3 step 5).
 - **Each App ID once:** `apps` names each App ID at most once. A reader refuses a directory that repeats one: it uses none of it, and reads again later.
 - **Two copies of `identity.json`:** a reader holding both this copy and the Homeserver's uses the one with the higher `version`; two copies with one `version` and different body bytes are equivocation (3.3).
 - **Records expire** as their protocols say (3.2): for Paykit, payers ignore the public endpoints of a record whose `expires_at` has passed (Paykit wire 3.2).
