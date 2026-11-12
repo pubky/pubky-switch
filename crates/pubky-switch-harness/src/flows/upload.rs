@@ -905,6 +905,96 @@ pub async fn recovery_upload_refused(world: &World) -> FlowResult {
     Ok(())
 }
 
+/// Uploads from before a loss count against the hour of the uploads after it (Switch wire
+/// 7.4.14, 9.4). alice's service takes three uploads an hour from one app. Her reader's
+/// client sends three uploads while the account has lost no provider: each is `404`, and
+/// each takes a slot, since the service takes it once the request verifies, before it
+/// looks at the stage. In the same hour her signer recovers in place. The reader follows
+/// the recovery: it registers again, and its own upload is `429 rate_limited`, which the
+/// app takes as a refusal the service may lift. In the next hour it follows again, and
+/// the upload is taken.
+///
+/// # Errors
+///
+/// When a step that should succeed against any switch fails, or an upload is answered
+/// other than its step says.
+pub async fn recovery_upload_slots_before_the_loss(world: &World) -> FlowResult {
+    let alice = world.identity("alice")?;
+    let limits = Limits {
+        uploads_per_app_per_hour: UPLOADS_AN_HOUR,
+        ..Limits::default()
+    };
+    world.add_switch_with(ORIGIN, &[&alice], limits).await?;
+    let mut signer = enroll(world, &alice, ORIGIN).await?;
+    let asking = Asking::for_scope(world.app_keys(&alice, "reader")?, NOTES_READER)?;
+    let (mut reader, _) = joined_as(world, &alice, &mut signer, asking, notes_protocol()).await?;
+
+    // The start of an hour of the service's clock: the uploads before the loss and the
+    // one after it fall in one window.
+    world.advance_ms(HOUR_MS - world.now_ms() % HOUR_MS);
+    let doc = signer
+        .identity_doc()?
+        .ok_or("the signer holds no document")?;
+    let before = client_of(
+        world,
+        &alice,
+        "reader",
+        &reader,
+        ORIGIN,
+        doc.inbox().service_key,
+    )?;
+    for nth in ["first", "second", "third"] {
+        upload(
+            world,
+            &format!("the {nth} upload at an account that lost no provider"),
+            &before,
+            "reader",
+            NOTHING,
+            404,
+            Some("not_found"),
+        )
+        .await?;
+    }
+
+    let doc = signer
+        .declare_provider_loss(ORIGIN, UserConfirmed::shown_and_confirmed())
+        .await?;
+    world.outcome(
+        "the signer declared the loss and recovered in place",
+        &recovered(&doc, &signer)?,
+    );
+    world.advance_ms(STEP_MS);
+
+    for (name, status, taken) in [
+        ("in the hour of the uploads before the loss", "429", false),
+        ("in the next hour", "200", true),
+    ] {
+        let refreshed = reader.refresh_identity().await;
+        let followed = reader.follow_provider().await;
+        world.outcome(
+            &format!("the reader followed the recovery {name}"),
+            &json!({
+                "refreshed": ended(&refreshed),
+                "ended": ended(&followed),
+                "events": events(&reader.take_events()),
+            }),
+        );
+        let answered = world.last_fact(&upload_of("reader"), "status");
+        let code = world.last_fact(&upload_of("reader"), "body.code");
+        let limited = code.as_deref() == Some("text rate_limited");
+        if answered.as_deref() != Some(status) || followed.is_ok() != taken || limited == taken {
+            return Err(format!(
+                "{name}, the reader's upload was answered {answered:?} {code:?} and its \
+                 follow ended {}",
+                ended(&followed)
+            )
+            .into());
+        }
+        world.advance_ms(HOUR_MS);
+    }
+    Ok(())
+}
+
 /// How many uploads the run has sent so far.
 fn uploads(world: &World) -> usize {
     let trace = world.trace();

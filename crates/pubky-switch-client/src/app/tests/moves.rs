@@ -1743,6 +1743,52 @@ async fn test_loss_upload_refused_takes_a_slot_of_the_hour() {
 }
 
 #[tokio::test]
+async fn test_loss_upload_before_the_loss_takes_a_slot_of_the_hour() {
+    // As at the service (Switch wire 7.4.14, 9.4): an upload takes its slot once the
+    // caller is an app the switch holds a record for, before the stage is looked at, so
+    // one answered `404` at an account in neither stage counts too. The `404` itself comes
+    // before the `429` in the answer order.
+    let store = Arc::new(MemoryStore::new());
+    let lost = lost_world(Arc::clone(&store) as Arc<dyn StateStore>).await;
+    follow_loss(&lost, store as Arc<dyn StateStore>)
+        .await
+        .unwrap();
+    {
+        // The next switch as an account that lost no provider, the wallet registered there,
+        // in an hour of its own.
+        let mut next = lost.next.lock();
+        next.recovery_from = None;
+        next.uploads_per_app_per_hour = 2;
+    }
+    lost.w.clock.advance_ms(3_600_000);
+    for _ in 0..3 {
+        let (status, body) = upload_at_next(&lost, "{}");
+        assert_eq!((status, body["code"].as_str()), (404, Some("not_found")));
+    }
+    // After a loss in the same hour, the slots are used up.
+    lost.next.lock().recovery_from = Some(1);
+    let (status, body) = upload_at_next(&lost, "{}");
+    assert_eq!((status, body["code"].as_str()), (429, Some("rate_limited")));
+    // An app the switch holds no record for takes none.
+    let unknown = crate::transport::Request {
+        headers: vec![crate::transport::Header::new(
+            "switch-app",
+            &pubky_switch_core::enc::zbase32_encode(&app_keys("unknown").app_id_bytes()),
+        )],
+        ..upload_request(&lost, "{}")
+    };
+    let refused = lost.next.handle(&unknown).unwrap();
+    assert_eq!(refused.status, 403);
+    assert!(
+        !lost
+            .next
+            .lock()
+            .upload_counts_of(&app_keys("unknown").app_id_bytes()),
+        "no slot for an app without a record"
+    );
+}
+
+#[tokio::test]
 async fn test_loss_upload_answered_503_is_sent_again_and_staging_ends() {
     // A `503` the service may lift fails the step, which the next read sends again: the
     // lists' upload that ends staged admission isn't given up (Switch wire 7.6, 7.4.14).

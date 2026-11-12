@@ -64,7 +64,7 @@ pub use retries::{
 };
 pub use upload::{
     recovery_upload_claim, recovery_upload_deny_only, recovery_upload_records,
-    recovery_upload_refused,
+    recovery_upload_refused, recovery_upload_slots_before_the_loss,
 };
 pub use waiting::{waiting_read, waiting_read_erased, waiting_read_revoked};
 pub use watching::watching;
@@ -164,6 +164,10 @@ pub const FLOWS: &[(&str, Flow)] = &[
     ("recovery upload, refused", |world| {
         Box::pin(recovery_upload_refused(world))
     }),
+    (
+        "recovery upload, the hour's slots used before the loss",
+        |world| Box::pin(recovery_upload_slots_before_the_loss(world)),
+    ),
 ];
 
 /// The flow that sends `call` to the service; `None` for a call the service doesn't serve

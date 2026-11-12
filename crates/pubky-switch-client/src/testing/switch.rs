@@ -2261,6 +2261,14 @@ impl Inner {
                 json!(null),
             ));
         };
+        // An upload from an app the switch holds a record for takes its slot of the hour
+        // here, before the caller's own checks and the stage, as the service takes it once
+        // the request verifies: one answered `403 not_current` or `404` counts too (Switch
+        // wire 7.4.14, 9.4). The `429` itself comes last in the answer order.
+        let limited = match self.apps.get(&app) {
+            Some(held) if held.cert.is_some() => self.take_upload_slot(app),
+            _ => None,
+        };
         let cert = if self.staged {
             None
         } else {
@@ -2279,13 +2287,13 @@ impl Inner {
         }
         let read = serde_json::from_slice::<Value>(&request.body);
         let with_cert = request.header(header::CERT).is_some();
-        // After a provider loss the upload takes its slot of the hour before its body is
-        // read, so one that doesn't read counts too (Switch wire 7.4.14, 9.4).
+        // After a provider loss the upload's slot is taken before its body is read, so one
+        // that doesn't read counts too (Switch wire 7.4.14, 9.4).
         if let (false, Some(recovery_from), Some(cert)) = (self.staged, self.recovery_from, cert) {
             if let Ok(body) = read {
                 self.uploads.push((body, with_cert));
             }
-            return self.loss_upload(&request.body, app, &cert, recovery_from);
+            return self.loss_upload(&request.body, app, &cert, recovery_from, limited);
         }
         let Ok(body) = read else {
             return Ok(bad(ErrorCode::BadRequest, "upload", json!(null)));
@@ -2307,6 +2315,30 @@ impl Inner {
         ))
     }
 
+    /// Take `app`'s slot of `uploads_per_app_per_hour` in the hour of the switch's clock
+    /// (Switch wire 9.4): `None` when it got one, else the seconds to the next hour. An
+    /// upload past the limit takes none.
+    fn take_upload_slot(&mut self, app: [u8; 16]) -> Option<u64> {
+        let (now, hour_ms) = (self.now(), 3_600_000);
+        let hour = now / hour_ms;
+        let count = self.upload_counts.entry(app).or_insert((hour, 0));
+        if count.0 < hour {
+            *count = (hour, 0);
+        }
+        if count.1 >= self.uploads_per_app_per_hour {
+            let next = count.0.saturating_add(1).saturating_mul(hour_ms);
+            return Some(next.saturating_sub(now).div_ceil(1000).max(1));
+        }
+        count.1 += 1;
+        None
+    }
+
+    /// Whether `app` has taken a slot of `uploads_per_app_per_hour`, in any hour.
+    #[cfg(test)]
+    pub(crate) fn upload_counts_of(&self, app: &[u8; 16]) -> bool {
+        self.upload_counts.contains_key(app)
+    }
+
     /// An upload after the loss of generation `recovery_from` (Switch wire 7.4.14), checked
     /// by the core and merged as the service merges it, ending staged admission for
     /// contacts from an app holding `lists.manage`: one `upload` transition, and `{ result,
@@ -2317,23 +2349,8 @@ impl Inner {
         app: [u8; 16],
         cert: &AppCert,
         recovery_from: u64,
+        limited: Option<u64>,
     ) -> Result<Answer, ScriptError> {
-        // The upload's slot of `uploads_per_app_per_hour`, in the hour of the switch's clock,
-        // is taken first: an upload refused for its body or its lists counts too (Switch
-        // wire 7.4.14, 9.4). One past the limit takes none.
-        let (now, hour_ms) = (self.now(), 3_600_000);
-        let hour = now / hour_ms;
-        let count = self.upload_counts.entry(app).or_insert((hour, 0));
-        if count.0 < hour {
-            *count = (hour, 0);
-        }
-        let limited = if count.1 >= self.uploads_per_app_per_hour {
-            let next = count.0.saturating_add(1).saturating_mul(hour_ms);
-            Some(next.saturating_sub(now).div_ceil(1000).max(1))
-        } else {
-            count.1 += 1;
-            None
-        };
         // The refusals in the wire's order: the body, the caller's permission, the limit.
         let upload = match UploadBody::parse(body).and_then(|upload| {
             upload.check_permissions(cert)?;
@@ -2347,6 +2364,7 @@ impl Inner {
             limited.1["retry_after"] = json!(retry_after);
             return Ok(limited);
         }
+        let now = self.now();
         let removed = self
             .doc
             .as_ref()
