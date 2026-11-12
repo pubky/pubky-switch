@@ -29,9 +29,14 @@ pub const NOTES_LISTS: &str = "notes_lists";
 /// own. Its apps hold `lists.manage` alone, as those of [`NOTES_LISTS`] do.
 pub const NOTES_JOURNAL: &str = "notes_journal";
 
+/// A scope of the [`Notes`] protocol without keys, whose apps hold `lists.read` alone: they
+/// read the lists and can't change them.
+pub const NOTES_READER: &str = "notes_reader";
+
 /// A neutral protocol, the signer's side of it. Its scope [`NOTES`] has keys and needs every
 /// switch permission, so its apps read and change the lists and write claims; its scope
-/// [`NOTES_LISTS`] has no keys and needs `lists.manage` alone.
+/// [`NOTES_LISTS`] has no keys and needs `lists.manage` alone; its scope [`NOTES_READER`]
+/// has no keys and needs `lists.read` alone.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Notes;
 
@@ -45,6 +50,7 @@ impl Protocol for Notes {
             ScopeDef::keyed(NOTES),
             ScopeDef::unkeyed(NOTES_LISTS),
             ScopeDef::keyed(NOTES_JOURNAL),
+            ScopeDef::unkeyed(NOTES_READER),
         ]
     }
 
@@ -55,6 +61,8 @@ impl Protocol for Notes {
     fn permissions(&self, scopes: &[&str]) -> Vec<Permission> {
         if scopes.contains(&NOTES) {
             Permission::ALL.to_vec()
+        } else if scopes.contains(&NOTES_READER) {
+            vec![Permission::ListsRead]
         } else {
             vec![Permission::ListsManage]
         }

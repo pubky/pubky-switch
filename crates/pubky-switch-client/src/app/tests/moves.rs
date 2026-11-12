@@ -1640,9 +1640,10 @@ async fn test_loss_upload_without_manage_sends_no_contacts() {
     assert!(next.shared.deny.contains(&lost.dave));
 }
 
-/// The wallet's `POST /recovery/upload` of `body` at the lost world's next switch.
-fn upload_at_next(lost: &Lost, body: &str) -> (u16, serde_json::Value) {
-    let request = crate::transport::Request {
+/// The wallet's `POST /recovery/upload` of `body`, as a request to the lost world's next
+/// switch.
+fn upload_request(lost: &Lost, body: &str) -> crate::transport::Request {
+    crate::transport::Request {
         method: "POST".into(),
         origin: NEXT.into(),
         path_and_query: format!("/v1/{}/recovery/upload", lost.w.alice.id()),
@@ -1651,8 +1652,12 @@ fn upload_at_next(lost: &Lost, body: &str) -> (u16, serde_json::Value) {
             &pubky_switch_core::enc::zbase32_encode(&app_keys("wallet").app_id_bytes()),
         )],
         body: body.as_bytes().to_vec(),
-    };
-    let answer = lost.next.handle(&request).unwrap();
+    }
+}
+
+/// The wallet's `POST /recovery/upload` of `body` at the lost world's next switch.
+fn upload_at_next(lost: &Lost, body: &str) -> (u16, serde_json::Value) {
+    let answer = lost.next.handle(&upload_request(lost, body)).unwrap();
     (answer.status, serde_json::from_slice(&answer.body).unwrap())
 }
 
@@ -1703,6 +1708,84 @@ async fn test_loss_upload_is_limited_per_hour_and_the_lists_are_capped() {
     assert!((1..=3600).contains(&wait), "{wait}");
     lost.w.clock.advance_ms(wait * 1000);
     assert_eq!(upload_at_next(&lost, "{}").0, 200);
+}
+
+#[tokio::test]
+async fn test_loss_upload_refused_takes_a_slot_of_the_hour() {
+    // As at the service (Switch wire 7.4.14, 9.4): every upload of an own app counts
+    // against `uploads_per_app_per_hour`, one refused for its body included, and past the
+    // limit the refusals keep the wire's order. The `429` repeats its `retry_after` in
+    // `Retry-After` (Switch wire 7.1).
+    let store = Arc::new(MemoryStore::new());
+    let lost = lost_world(Arc::clone(&store) as Arc<dyn StateStore>).await;
+    lost.next.lock().uploads_per_app_per_hour = 3;
+    // The evidence and the lists: two of the three.
+    follow_loss(&lost, store as Arc<dyn StateStore>)
+        .await
+        .unwrap();
+    let (status, body) = upload_at_next(&lost, "not json");
+    assert_eq!((status, body["code"].as_str()), (400, Some("bad_request")));
+    // The refused one took the third: an upload the switch would take is limited.
+    let (status, body) = upload_at_next(&lost, "{}");
+    assert_eq!((status, body["code"].as_str()), (429, Some("rate_limited")));
+    let wait = body["retry_after"].as_u64().unwrap();
+    let limited = lost.next.handle(&upload_request(&lost, "{}")).unwrap();
+    assert_eq!(limited.status, 429);
+    assert_eq!(
+        limited.header(pubky_switch_core::http::header::RETRY_AFTER),
+        Some(wait.to_string().as_str())
+    );
+    // Past the limit a body that doesn't read is still `400`, and takes no slot.
+    let (status, body) = upload_at_next(&lost, "not json");
+    assert_eq!((status, body["code"].as_str()), (400, Some("bad_request")));
+    lost.w.clock.advance_ms(wait * 1000);
+    assert_eq!(upload_at_next(&lost, "{}").0, 200);
+}
+
+#[tokio::test]
+async fn test_loss_upload_before_the_loss_takes_a_slot_of_the_hour() {
+    // As at the service (Switch wire 7.4.14, 9.4): an upload takes its slot once the
+    // caller is an app the switch holds a record for, before the stage is looked at, so
+    // one answered `404` at an account in neither stage counts too. The `404` itself comes
+    // before the `429` in the answer order.
+    let store = Arc::new(MemoryStore::new());
+    let lost = lost_world(Arc::clone(&store) as Arc<dyn StateStore>).await;
+    follow_loss(&lost, store as Arc<dyn StateStore>)
+        .await
+        .unwrap();
+    {
+        // The next switch as an account that lost no provider, the wallet registered there,
+        // in an hour of its own.
+        let mut next = lost.next.lock();
+        next.recovery_from = None;
+        next.uploads_per_app_per_hour = 2;
+    }
+    lost.w.clock.advance_ms(3_600_000);
+    for _ in 0..3 {
+        let (status, body) = upload_at_next(&lost, "{}");
+        assert_eq!((status, body["code"].as_str()), (404, Some("not_found")));
+    }
+    // After a loss in the same hour, the slots are used up.
+    lost.next.lock().recovery_from = Some(1);
+    let (status, body) = upload_at_next(&lost, "{}");
+    assert_eq!((status, body["code"].as_str()), (429, Some("rate_limited")));
+    // An app the switch holds no record for takes none.
+    let unknown = crate::transport::Request {
+        headers: vec![crate::transport::Header::new(
+            "switch-app",
+            &pubky_switch_core::enc::zbase32_encode(&app_keys("unknown").app_id_bytes()),
+        )],
+        ..upload_request(&lost, "{}")
+    };
+    let refused = lost.next.handle(&unknown).unwrap();
+    assert_eq!(refused.status, 403);
+    assert!(
+        !lost
+            .next
+            .lock()
+            .upload_counts_of(&app_keys("unknown").app_id_bytes()),
+        "no slot for an app without a record"
+    );
 }
 
 #[tokio::test]
