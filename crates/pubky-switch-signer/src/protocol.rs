@@ -533,6 +533,9 @@ fn check_grant_path(path: &str) -> std::result::Result<(), &'static str> {
     {
         return Err("a '.' or '..' segment");
     }
+    if path.contains("//") {
+        return Err("an empty segment");
+    }
     if covers(path, IDENTITY_PATH) || covers(path, SIGNER_BACKUP_PATH) {
         return Err("it covers identity.json or the signer's backup");
     }
@@ -890,6 +893,8 @@ mod tests {
             "/pub/beta/a:rw",
             "/pub/beta/a b",
             "/pub/beta/../pubky-switch/v1/identity.json",
+            "/pub/beta//a.json",
+            "/pub/beta/a//",
             "/pub/",
             "/pub/pubky-switch/",
             "/pub/pubky-switch/v1/identity.json",

@@ -55,10 +55,14 @@ impl Protocol for Media {
     }
     fn check_grant_paths(
         &self,
-        _: &[u8; 16],
+        app_id: &[u8; 16],
         scopes: &[&str],
         allowed: &[&str],
     ) -> Result<(), String> {
+        // Every test app here has the same keys, so the rule knows which app it judges.
+        if *app_id != App::new(&["media"], None, [0; 32]).keys.app_id_bytes() {
+            return Err("another app".into());
+        }
         if scopes != ["media"] {
             return Err("scopes media doesn't own".into());
         }
