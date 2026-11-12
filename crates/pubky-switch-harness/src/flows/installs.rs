@@ -129,7 +129,7 @@ pub async fn publication_other_document(world: &World) -> FlowResult {
     world.add_switch(ORIGIN, &[&alice]).await?;
     let mut signer = enroll(world, &alice, ORIGIN).await?;
 
-    world.fail_homeserver_write(IDENTITY_PATH);
+    world.fail_homeserver_write(&alice, IDENTITY_PATH);
     let unpublished = signer.set_record_max_age(Some(86_400)).await;
     let second = signer
         .identity_doc()?
