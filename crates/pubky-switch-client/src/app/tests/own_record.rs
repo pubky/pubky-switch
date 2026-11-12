@@ -899,3 +899,98 @@ async fn test_own_record_restore_from_an_older_backup_never_rolls_the_copy_back(
     );
     assert_eq!(w.published(id), Some(bytes_of(&newer)));
 }
+
+/// A key of the app's own that no device of it made is registered: a compromise.
+fn register_foreign_key(w: &World, app: &App) {
+    use pubky_switch_core::keys::ReceiveKey;
+    use pubky_switch_core::records::{ReceiveKeyBody, ReceiveKeyRecord};
+    let foreign = ReceiveKey::from_secret(1, [42; 32]);
+    let record = ReceiveKeyRecord::sign(
+        &app_keys("wallet"),
+        app.cert(),
+        ReceiveKeyBody::new(app.cert(), &foreign),
+    )
+    .unwrap();
+    w.switch
+        .app_op(
+            &app_keys("wallet"),
+            OpKind::ReceiveKeyPut {
+                record: record.signed().clone(),
+            },
+        )
+        .unwrap();
+}
+
+/// Switch spec 3.6, 12.3: on a compromise a publishing app leaves at once. Its Homeserver
+/// down, the delete fails, and the app leaves at the switch all the same, in the read that
+/// raised the alarm, and publishes nothing after.
+#[tokio::test]
+async fn test_own_record_compromise_leave_goes_with_the_homeserver_down() {
+    use crate::app::Alarm;
+    let w = World::new();
+    let mut app = w.join_publishing("wallet").await;
+    let id = app.app_id();
+    register_foreign_key(&w, &app);
+    w.homeserver.set_down(true);
+    let error = app.receive(None).await.unwrap_err();
+    assert!(
+        matches!(error, AppError::Alarm(Alarm::Compromise { n: 1, .. })),
+        "{error:?}"
+    );
+    assert!(w.switch.app(&id).departed, "the leave waited on the delete");
+    let writes = w.record_writes(id);
+    w.homeserver.set_down(false);
+    app.receive(None).await.unwrap_err();
+    assert_eq!(w.record_writes(id), writes);
+}
+
+/// An immediate leave goes on when the delete fails, reporting it; a two-step leave waits
+/// for the delete, and calls `leave` once it is made (Switch spec 12.3).
+#[tokio::test]
+async fn test_own_record_only_a_two_step_leave_waits_for_the_delete() {
+    let w = World::new();
+    let mut two_step = w.join_publishing("wallet").await;
+    let id = two_step.app_id();
+    w.homeserver.set_down(true);
+    let error = two_step.leave(LeaveMode::TwoStep).await.unwrap_err();
+    assert!(matches!(error, AppError::Transport(_)), "{error:?}");
+    assert!(!w.switch.app(&id).departed);
+    w.homeserver.set_down(false);
+    two_step.leave(LeaveMode::TwoStep).await.unwrap();
+    assert!(w.switch.app(&id).departed);
+    assert!(w.published(id).is_none());
+
+    let mut immediate = w.join_publishing("phone").await;
+    let id = immediate.app_id();
+    w.homeserver.set_down(true);
+    immediate
+        .leave(LeaveMode::Immediate(UserConfirmed::new()))
+        .await
+        .unwrap();
+    assert!(w.switch.app(&id).departed);
+    assert!(
+        immediate
+            .take_events()
+            .iter()
+            .any(|e| matches!(e, AppEvent::RecordPublishFailed { .. }))
+    );
+}
+
+/// Switch spec 12.3: the leave's state is committed before the Homeserver record is
+/// deleted. A store that stops at that commit leaves the record published and the app
+/// current; the load after goes on with the whole leave.
+#[tokio::test]
+async fn test_own_record_crash_before_the_leave_is_kept_deletes_nothing() {
+    let w = World::new();
+    let (mut app, _) = on_faulty_store(&w, StoreFault::StopBefore(1)).await;
+    let id = app.app_id();
+    let published = w.published(id);
+    assert!(published.is_some());
+    app.leave(LeaveMode::TwoStep).await.unwrap_err();
+    assert_eq!(w.published(id), published);
+    assert!(!w.switch.app(&id).departed);
+    let mut loaded = w.load_publishing_on(w.store.clone(), id).await;
+    loaded.leave(LeaveMode::TwoStep).await.unwrap();
+    assert!(w.published(id).is_none());
+    assert!(w.switch.app(&id).departed);
+}

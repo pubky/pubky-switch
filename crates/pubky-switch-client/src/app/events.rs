@@ -422,7 +422,10 @@ pub enum AppEvent {
         issued_at: u64,
     },
     /// The switch holds the app's record and its Homeserver write failed: it stays owed,
-    /// and goes again at the next read or with the next change (Switch spec 4.2).
+    /// and goes again at the next read or with the next change (Switch spec 4.2). Or the
+    /// delete of an immediate leave, or of a leave after a compromise, failed: the app left
+    /// all the same, and the record stays on the Homeserver until the signer's clean-up
+    /// deletes it (Switch spec 12.2 step 4, 12.3).
     RecordPublishFailed {
         /// Why the write failed.
         error: String,

@@ -2373,8 +2373,23 @@ impl App {
             self.commit(tx).await?;
         }
         // A publishing app deletes its Homeserver record first (Switch spec 12.3); the leave
-        // committed above stops every publication from here on.
-        self.unpublish_to_leave().await?;
+        // committed above stops every publication from here on. Only a two-step leave waits
+        // for the delete: an immediate leave, and a compromise's, which leaves at once
+        // (Switch spec 3.6), go on without it, the failure reported, and the signer's
+        // clean-up deletes the record (Switch spec 12.2 step 4).
+        let waits = self
+            .state
+            .leave
+            .is_some_and(|leave| leave.two_step && !leave.compromise);
+        match self.unpublish_to_leave().await {
+            Ok(()) => {}
+            Err(AppError::Transport(error)) if !waits => {
+                self.events.push(AppEvent::RecordPublishFailed {
+                    error: error.to_string(),
+                });
+            }
+            Err(error) => return Err(error),
+        }
         let result = self.client.leave().await;
         let answered = match self.take(result).await {
             Ok(answer) => {
