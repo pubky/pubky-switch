@@ -70,6 +70,8 @@ pub struct World {
 /// Homeserver can't be reached: nothing is written or deleted.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct HomeserverFault {
+    /// The identity whose Homeserver it is.
+    identity: [u8; 32],
     /// Whether it is a deletion that fails; a write otherwise.
     deletion: bool,
     /// The path of the file.
@@ -303,20 +305,22 @@ impl World {
         })
     }
 
-    /// The next write of the file at `path` by a signer to its own Homeserver fails, once:
-    /// nothing is written, and the signer sees a connection failure. The Homeserver is no
-    /// switch, so this is the same in both runs.
-    pub fn fail_homeserver_write(&self, path: &str) {
+    /// The next write of the file at `path` by `identity`'s signer to its own Homeserver
+    /// fails, once: nothing is written, and the signer sees a connection failure. The
+    /// Homeserver is no switch, so this is the same in both runs.
+    pub fn fail_homeserver_write(&self, identity: &TestIdentity, path: &str) {
         lock(&self.homeserver_faults).push(HomeserverFault {
+            identity: identity.public(),
             deletion: false,
             path: path.to_owned(),
         });
     }
 
-    /// The next deletion of the file at `path` by a signer at its own Homeserver fails,
-    /// once: the file stays.
-    pub fn fail_homeserver_deletion(&self, path: &str) {
+    /// The next deletion of the file at `path` by `identity`'s signer at its own Homeserver
+    /// fails, once: the file stays.
+    pub fn fail_homeserver_deletion(&self, identity: &TestIdentity, path: &str) {
         lock(&self.homeserver_faults).push(HomeserverFault {
+            identity: identity.public(),
             deletion: true,
             path: path.to_owned(),
         });
@@ -576,9 +580,9 @@ impl OwnFiles {
     /// Whether a write or a deletion at `path` meets a fault, which is then used up.
     fn fails(&self, deletion: bool, path: &str) -> bool {
         let mut faults = lock(&self.faults);
-        let met = faults
-            .iter()
-            .position(|fault| fault.deletion == deletion && fault.path == path);
+        let met = faults.iter().position(|fault| {
+            fault.identity == self.identity && fault.deletion == deletion && fault.path == path
+        });
         met.map(|at| faults.remove(at)).is_some()
     }
 }
@@ -637,10 +641,12 @@ mod tests {
         let files = Arc::new(TestHomeserver::new());
         let faults = Arc::new(Mutex::new(vec![
             HomeserverFault {
+                identity: [1; 32],
                 deletion: false,
                 path: "/pub/a".into(),
             },
             HomeserverFault {
+                identity: [1; 32],
                 deletion: true,
                 path: "/pub/a".into(),
             },
@@ -650,7 +656,14 @@ mod tests {
             files: files.clone(),
             faults: faults.clone(),
         };
-        // Another path isn't touched, nor is a read.
+        // Another identity's Homeserver isn't touched, nor another path, nor a read.
+        let others = OwnFiles {
+            identity: [2; 32],
+            files: files.clone(),
+            faults: faults.clone(),
+        };
+        assert!(others.put("/pub/a", b"theirs".to_vec()).await.is_ok());
+        assert!(others.delete("/pub/a").await.is_ok());
         assert!(own.put("/pub/b", b"b".to_vec()).await.is_ok());
         assert_eq!(own.get("/pub/a").await.ok(), Some(None));
         // The write fails once, and writes nothing.

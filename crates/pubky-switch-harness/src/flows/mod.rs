@@ -15,6 +15,7 @@ mod enrollment;
 mod epochs;
 mod erasure;
 mod handover;
+mod installs;
 mod join;
 mod lagging;
 mod lists;
@@ -45,6 +46,10 @@ pub use enrollment::enrollment;
 pub use epochs::{epochs_three_readers, rotation_given_up, third_epoch};
 pub use erasure::{erasure, erasure_answer_lost};
 pub use handover::{hand_over, hand_over_aborted};
+pub use installs::{
+    publication_other_document, publication_repaired, signer_new_install, signer_records_behind,
+    signer_restore_revocation, signer_restore_undelivered,
+};
 pub use join::join;
 pub use lagging::{lagging_app, missed_item, unreadable_after_revoke};
 pub use lists::lists_without_read;
@@ -181,6 +186,25 @@ pub const FLOWS: &[(&str, Flow)] = &[
     ("revocation, the switch unread", |world| {
         Box::pin(revocation_unread(world))
     }),
+    ("publication, the Homeserver's copy put right", |world| {
+        Box::pin(publication_repaired(world))
+    }),
+    ("publication, another document at the version", |world| {
+        Box::pin(publication_other_document(world))
+    }),
+    ("signer, a new install takes over", |world| {
+        Box::pin(signer_new_install(world))
+    }),
+    ("signer, records behind and restored in place", |world| {
+        Box::pin(signer_records_behind(world))
+    }),
+    ("signer restore, a version never delivered", |world| {
+        Box::pin(signer_restore_undelivered(world))
+    }),
+    (
+        "signer restore, a revocation only the switch holds",
+        |world| Box::pin(signer_restore_revocation(world)),
+    ),
     ("recovery upload, a claim rebuilt", |world| {
         Box::pin(recovery_upload_claim(world))
     }),
