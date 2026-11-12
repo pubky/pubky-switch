@@ -16,7 +16,7 @@ use crate::{FlowResult, World};
 const HOUR_MS: u64 = 3_600_000;
 
 /// A note for `to` with `text`, presenting `code` if one is given.
-fn note(to: [u8; 32], text: &str, code: Option<&str>) -> OutgoingMessage {
+pub(super) fn note(to: [u8; 32], text: &str, code: Option<&str>) -> OutgoingMessage {
     let mut body = serde_json::Map::new();
     body.insert("text".into(), json!(text));
     let mut message = OutgoingMessage::new(to, NOTE_KIND, body);
@@ -46,7 +46,7 @@ fn sent<T>(result: &Result<(T, Delivery), AppError>) -> Value {
 
 /// `sender` sends `message`, and the flow notes how that ended. Fails the flow when the
 /// send was admitted or refused against what the step says.
-async fn send(
+pub(super) async fn send(
     world: &World,
     name: &str,
     sender: &mut App,
@@ -76,7 +76,7 @@ async fn send(
 /// how many entries each list holds, who wrote each conversation entry and whether a code
 /// made it, and each live code's uses. The answer's own facts hold the rest, such as an
 /// entry's `context` and `last_used`.
-async fn lists(world: &World, name: &str, app: &mut App) -> FlowResult {
+pub(super) async fn lists(world: &World, name: &str, app: &mut App) -> FlowResult {
     let list = app.allow_list().await?;
     world.outcome(
         name,

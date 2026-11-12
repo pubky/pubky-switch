@@ -115,8 +115,18 @@ The flows send every call the service serves, each at both switches. What they l
   that still finds entries to read are left to the service's own tests.
 - **More of the lists:** an invite code withdrawn or used several times, an invite, a
   conversation entry pruned, a connection request.
+- **More of connect requests.** The `connect request` flows ask, allow, decline and
+  deny, fill the list, turn the policy off with a request pending, and ask across a
+  provider loss. Not sent: a request past `connect_per_min` or `stranger_per_min`, which
+  takes more requests in a minute than a flow sends; the push a request queues; a request
+  an invite code's first admitted append answers; one to a frozen account; and a `POST
+  /connect` from an own app or from the signer.
 - **Longer lives:** a renewal that adds a scope, a claim that runs out by time, an
   identity that enrolls again after an erasure.
+- **The Homeserver's side of a grant.** The `approval` flows hold the capabilities the
+  signer grants when the user declines a protocol's paths, and that the switch is sent
+  the same with the paths declined as with them allowed. The grant itself is given and
+  enforced by the Homeserver, and the one in a world takes every write.
 - **More of a signer's copies and installs.** The install flows put the published copy
   right, clear the alarm for another document at the published version, take over on a
   new install, and restore in place. In most of them the switch only answers ordinary
@@ -133,10 +143,11 @@ The flows send every call the service serves, each at both switches. What they l
   own, and no conforming signer sends one: a signer that builds on a version signs the
   next, and a provider loss in place, whose version needn't build on the held one, is
   declared only by a signer whose backup and published copy show nothing newer than its
-  records. That rule stays with the core's unit test. A switch that shows an older copy or another body (a rollback
-  or an equivocation at the switch) and a backup that doesn't open stay with the signer's
-  tests on the scripted switch, as do a stale backup refused at a restore, a Homeserver
-  that holds another body at a restore, and a restore in place below the signer's mark.
+  records. That rule stays with the core's unit test. A switch that shows an older copy
+  or another body (a rollback or an equivocation at the switch) and a backup that doesn't
+  open stay with the signer's tests on the scripted switch, as do a stale backup refused
+  at a restore, a Homeserver that holds another body at a restore, and a restore in place
+  below the signer's mark.
 - **More of a removal.** The removal flows date a revocation and a departure, clean up
   after one, purge its entry, and send a revocation past a read that failed or during a
   recovery. A removal time a switch reports before the app was listed or after its own
@@ -168,6 +179,6 @@ Each flow's run against the service makes one test database and drops it, also w
 test panics; the flows run one after another. Each run is on a thread of its own with 16 MiB
 of stack (`FLOW_STACK_BYTES`, `on_flow_stack`): in a debug build the deepest flow used
 1.9 MiB, close to the 2 MiB of a test's thread, and a test binary aborted when the thread
-that ran the flows had less left. Sixty-four flows take about three minutes in a
+that ran the flows had less left. Seventy flows take about three minutes in a
 debug build. If that grows too long, the service's halves could share one service and one
 database, with identities of their own per flow: a later option, not needed yet.
