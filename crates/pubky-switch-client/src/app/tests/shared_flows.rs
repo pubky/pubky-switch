@@ -6569,3 +6569,29 @@ async fn test_scripted_records_deleted_key_taken_from_an_upload_is_kept() {
     read_on(&mut phone).await;
     assert!(held_at_switch(&s, &key));
 }
+
+#[tokio::test]
+async fn test_scripted_records_deleted_key_doesnt_wait_for_a_revoked_app() {
+    // As at the service: a revoked or departed app no longer reads or uploads, so the keys
+    // it hadn't passed go once every other listed app has.
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let phone = s.join("phone").await;
+    let target = s.target("n1");
+    let key = created_and_deleted(&mut wallet, &target).await;
+    read_on(&mut wallet).await;
+    assert!(held_at_switch(&s, &key), "the phone hasn't passed it");
+    s.w.switch
+        .lock()
+        .apps
+        .get_mut(&phone.app_id())
+        .unwrap()
+        .departed = true;
+    // The switch judges at a cursor move: the wallet's next write gives it one.
+    wallet
+        .put_record(&s.target("n2"), &value(&["b"]), vec![])
+        .await
+        .unwrap();
+    read_on(&mut wallet).await;
+    assert!(!held_at_switch(&s, &key));
+}
