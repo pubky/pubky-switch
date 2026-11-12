@@ -88,7 +88,15 @@ fn expect_admission_ended<T, E>(world: &World, ending: &Result<T, E>) -> FlowRes
     if ending.is_ok() && answered.as_deref() == Some("200") {
         Ok(())
     } else {
-        Err(format!("the end of the staged admission was answered {answered:?}").into())
+        Err(format!(
+            "the staged admission wasn't ended: the call {}, answered {answered:?}",
+            if ending.is_ok() {
+                "went well"
+            } else {
+                "failed"
+            }
+        )
+        .into())
     }
 }
 
@@ -114,7 +122,11 @@ async fn follow_recovery(world: &World, wallet: &mut App, lost: u64) -> FlowResu
     );
     world.advance_ms(STEP_MS);
     if world.faults_left() != 0 {
-        return Err("the wallet's upload was never sent".into());
+        return Err(format!(
+            "the wallet's upload was never sent: its follow ended {}",
+            ended(&followed)
+        )
+        .into());
     }
     // The new chain's first item is the recovery's record, naming the generation lost.
     let read = "{alice/wallet} GET /v1/{alice}/feed";
@@ -535,10 +547,6 @@ pub async fn provider_loss_restored(world: &World) -> FlowResult {
     }
     // The wallet was revoked at the new service by the restore, the newest version removes
     // it, and the staged admission is ended.
-    let admission = world.last_fact("{alice} POST /v1/{alice}/recovery/admission", "status");
-    if admission.as_deref() != Some("200") {
-        return Err(format!("the end of the staged admission was answered {admission:?}").into());
-    }
     let listed = newest.as_ref().map(|doc| doc.body().apps.len());
     let gone = newest.as_ref().map(|doc| doc.body().removed.len());
     if revoked.as_deref() != Some("200") || listed != Some(0) || gone != Some(1) || !removed {
@@ -547,6 +555,10 @@ pub async fn provider_loss_restored(world: &World) -> FlowResult {
              apps and removes {gone:?}"
         )
         .into());
+    }
+    let admission = world.last_fact("{alice} POST /v1/{alice}/recovery/admission", "status");
+    if admission.as_deref() != Some("200") {
+        return Err(format!("the end of the staged admission was answered {admission:?}").into());
     }
     Ok(())
 }
