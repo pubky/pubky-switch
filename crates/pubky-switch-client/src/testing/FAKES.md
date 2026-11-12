@@ -108,8 +108,9 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   but for a lagging app with a `missed` item it hasn't passed (its own, or one
   `push_missed` scripted for every app); a key a divergent upload names stays. Its read is
   then `404`, its delete shows as its stub and a create at it starts afresh. Unlike the
-  service, every such key goes at once, not 64 a request, and the frozen account's
-  exception has nothing to check (no freeze is served here either).
+  service, it forgets at each cursor move, not at the minute's sweep, and every such key at
+  once, not 256 a minute; the frozen account's exception has nothing to check (no freeze is
+  served here either).
 - **Invite codes**: a revoked app's codes aren't withdrawn (Switch wire 7.4.3 "After a
   revocation"); a code planted for a faulty export never expires. Codes that expired or
   ran out go at the first request a minute of the switch's clock after the last sweep,

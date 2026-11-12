@@ -5855,3 +5855,92 @@ async fn test_scripted_records_deleted_key_a_divergent_upload_names_is_kept() {
     read_on(&mut phone).await;
     assert!(held_at_switch(&s, &key));
 }
+
+#[tokio::test]
+async fn test_scripted_records_app_away_across_a_forget_takes_only_the_newer_create() {
+    // The wallet holds the phone's record at version N, then lags. The phone deletes it,
+    // the key is forgotten (the wallet has a `missed` item to pass) and the phone creates
+    // it again, keeping what the wallet saw (the sample protocol refuses a write
+    // that drops a seen item). Back, the wallet lists on the item and takes the new create, whose version
+    // is past every one the key had. A switch that then shows the old write at N again
+    // gets nothing taken: the wallet keeps the newer one (Switch spec 10.3, 8.2).
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    let target = s.target("n1");
+    phone
+        .put_record(&target, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    let key = phone.record_key(&target).unwrap();
+    read_on(&mut wallet).await;
+    let old = wallet.shared_record(&key).await.unwrap().unwrap();
+    assert_eq!(ids(old.content.value()), vec!["a"]);
+    let old_write = s.w.switch.lock().shared.records.get(&key).cloned().unwrap();
+    s.w.switch
+        .lock()
+        .apps
+        .get_mut(&wallet.app_id())
+        .unwrap()
+        .lagging = true;
+    let now = s.w.clock.now_ms();
+    s.w.switch.push_missed(1, now, now);
+    phone.delete_record(&target, vec![]).await.unwrap();
+    read_on(&mut phone).await;
+    assert!(!held_at_switch(&s, &key), "forgotten");
+    phone
+        .put_record(&target, &value(&["a", "b"]), vec![])
+        .await
+        .unwrap();
+    read_on(&mut wallet).await;
+    let new = wallet.shared_record(&key).await.unwrap().unwrap();
+    assert_eq!(ids(new.content.value()), vec!["a", "b"]);
+    assert!(
+        new.version > old.version,
+        "{:?} after {:?}",
+        new.version,
+        old.version
+    );
+    // The old write shown again, as a switch replaying it would.
+    s.w.switch.lock().shared.records.insert(key, old_write);
+    wallet.list_collection(&items()).await.unwrap();
+    wallet.read_record_fresh(&target).await.unwrap();
+    let held = wallet.shared_record(&key).await.unwrap().unwrap();
+    assert_eq!(ids(held.content.value()), vec!["a", "b"]);
+    assert_eq!(held.version, new.version);
+}
+
+#[tokio::test]
+async fn test_scripted_records_app_away_across_a_forget_refuses_a_create_its_mark_rules_out() {
+    // As above, but the create after the forget drops an item the wallet saw: newer as it
+    // is, the protocol's regression check refuses it against the wallet's seen mark, which
+    // the forget leaves in place, and the wallet keeps what it held.
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    let target = s.target("n1");
+    phone
+        .put_record(&target, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    let key = phone.record_key(&target).unwrap();
+    read_on(&mut wallet).await;
+    s.w.switch
+        .lock()
+        .apps
+        .get_mut(&wallet.app_id())
+        .unwrap()
+        .lagging = true;
+    let now = s.w.clock.now_ms();
+    s.w.switch.push_missed(1, now, now);
+    phone.delete_record(&target, vec![]).await.unwrap();
+    read_on(&mut phone).await;
+    assert!(!held_at_switch(&s, &key), "forgotten");
+    phone
+        .put_record(&target, &value(&["b"]), vec![])
+        .await
+        .unwrap();
+    read_on(&mut wallet).await;
+    let held = wallet.shared_record(&key).await.unwrap().unwrap();
+    assert_eq!(ids(held.content.value()), vec!["a"]);
+}

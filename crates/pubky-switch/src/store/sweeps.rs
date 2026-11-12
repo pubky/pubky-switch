@@ -129,6 +129,10 @@ impl AccountTxn {
     /// Drop the transition proofs of at most `bound` batches past `proofs_ms` at service
     /// time `now_ms`, the oldest first (Switch wire 6.4 step 5, 9.1): their ID and operation
     /// hash stay, so a retry is still answered `409 conflict`. The number dropped.
+    ///
+    /// Not yet: wire 9.1 deletes the whole record once its proofs are gone and none of the
+    /// batch's chain stubs is kept. No stub is dropped yet, so no record goes; the delete
+    /// comes with chain stub retention.
     pub async fn drop_expired_batch_proofs(
         &mut self,
         now_ms: u64,
