@@ -43,8 +43,8 @@ pub(crate) const KEY_REQUEST_RETRY_MS: u64 = 60 * 60 * 1000;
 impl App {
     /// Fetch, read and merge the app's key bundle parts (Switch wire 7.4.11), then ask for a
     /// full bundle if a key is still missing, and reopen the records held `Unreadable` that
-    /// a key taken opens ([`App::reopen_if_due`]): a reopening that fails stays owed and is
-    /// reported, never this call's error.
+    /// a key taken opens: a reopening that fails stays owed and is reported
+    /// ([`super::AppEvent::ReopeningOwed`]), never this call's error.
     ///
     /// # Errors
     ///

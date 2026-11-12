@@ -6630,6 +6630,160 @@ async fn test_records_reopening_cut_short_keeps_the_rest_owed() {
     assert!(store.get(&ns, b"reopen").unwrap().is_none());
 }
 
+/// [`ItemsProtocol`], whose receive step reads the record `shared`: held not open for want
+/// of a key, it waits for that key; open, it writes the note's own record.
+struct SharedReader {
+    items: ItemsProtocol,
+    runs: std::sync::Mutex<usize>,
+}
+
+impl Protocol for SharedReader {
+    fn has_keys(&self, scope: &str) -> bool {
+        self.items.has_keys(scope)
+    }
+
+    fn sent_between_own_apps(&self, kind: &str) -> bool {
+        self.items.sent_between_own_apps(kind)
+    }
+
+    fn check_scopes(
+        &self,
+        message: &Message,
+        sender: &AppCert,
+        own: &AppCert,
+    ) -> Result<(), String> {
+        self.items.check_scopes(message, sender, own)
+    }
+
+    fn accepts(&self, cert: &AppCert) -> Vec<String> {
+        self.items.accepts(cert)
+    }
+
+    fn check_body(&self, message: &ReceivedMessage) -> Result<(), String> {
+        self.items.check_body(message)
+    }
+
+    fn receive_with(
+        &self,
+        message: &ReceivedMessage,
+        cx: &mut crate::app::ReceiveContext<'_>,
+    ) -> Outcome {
+        *self.runs.lock().unwrap() += 1;
+        let shared = RecordTarget::new(items(), b"shared");
+        match cx
+            .record(&shared)
+            .ok()
+            .flatten()
+            .map(|record| record.content)
+        {
+            Some(RecordContent::Unreadable(Unopened::KeyNotHeld { data_epoch })) => {
+                Outcome::AwaitKey { data_epoch }
+            }
+            _ => {
+                let own = RecordTarget::new(items(), message.message.msg_id.as_bytes());
+                let _ = cx.put_record(&own, &value(&["seen"]), vec![]);
+                Outcome::Apply(Effect::default())
+            }
+        }
+    }
+
+    fn resend_needed(
+        &self,
+        needed: &ResendNeeded,
+    ) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
+        self.items.resend_needed(needed)
+    }
+
+    fn missed(&self, missed: &MissedEntries) -> Result<Vec<LocalWrite>, crate::app::StoreFailure> {
+        self.items.missed(missed)
+    }
+
+    fn collections(&self) -> Vec<Collection> {
+        vec![items()]
+    }
+}
+
+/// An entry waiting for a key reads a record the key opens. The key arrives in a read whose
+/// reopening fails at both its tries: the entry isn't run on the record still held not
+/// open. The next read reopens at its start and takes the entry there, before the feed.
+#[tokio::test]
+async fn test_records_waiting_entry_waits_for_an_owed_reopening() {
+    let s = Setup::new();
+    let store = Arc::new(FailingReopen {
+        inner: MemoryStore::new(),
+        failing: std::sync::Mutex::new(0),
+    });
+    let protocol = Arc::new(SharedReader {
+        items: ItemsProtocol::default(),
+        runs: std::sync::Mutex::new(0),
+    });
+    let request = s.approve(&app_keys("wallet"), &ALL_PERMISSIONS);
+    let mut wallet = App::join(
+        s.env_on(Arc::clone(&store) as Arc<dyn StateStore>),
+        protocol.clone(),
+        World::config(),
+        request,
+    )
+    .await
+    .unwrap();
+    let mut phone = s.join("phone").await;
+    let key = record_at_a_new_epoch(&s, &mut wallet, &mut phone).await;
+    assert_eq!(
+        key,
+        wallet
+            .record_key(&RecordTarget::new(items(), b"n1"))
+            .unwrap()
+    );
+    phone
+        .put_record(
+            &RecordTarget::new(items(), b"shared"),
+            &value(&["a"]),
+            vec![],
+        )
+        .await
+        .unwrap();
+    wallet.receive(None).await.unwrap();
+    let shop = s.peer.apps()[0].cert.app_id();
+    let (seq, _) = s
+        .peer
+        .send_to(
+            &s.w.switch,
+            shop,
+            "sample.note",
+            json!({ "text": "reads shared" }),
+            &[wallet.app_id()],
+        )
+        .unwrap();
+    wallet.receive(None).await.unwrap();
+    assert_eq!(*protocol.runs.lock().unwrap(), 1);
+    assert!(wallet.stored_at(seq).is_some(), "waits for the key");
+    // The key comes; both tries of that read's reopening fail.
+    *store.failing.lock().unwrap() = 2;
+    store_parts_for(&s, &wallet.cert().clone());
+    wallet.receive(None).await.unwrap();
+    assert_eq!(*store.failing.lock().unwrap(), 0);
+    assert_eq!(
+        *protocol.runs.lock().unwrap(),
+        1,
+        "not run on a record still not open"
+    );
+    // The next read reopens, then takes the entry before it reads the feed.
+    let from = s.log().len();
+    wallet.receive(None).await.unwrap();
+    assert_eq!(*protocol.runs.lock().unwrap(), 2);
+    assert!(wallet.stored_at(seq).is_none());
+    let log = s.log();
+    let read = &log[from..];
+    let effect = read.iter().position(|line| line.contains("/ops")).unwrap();
+    // The one-item read that verifies a service time before the effect is sent isn't the
+    // feed's (Switch spec 10.1).
+    let feed = read
+        .iter()
+        .position(|line| line.contains("/feed") && !line.ends_with("limit=1"))
+        .unwrap();
+    assert!(effect < feed, "{read:?}");
+}
+
 /// A record write sealed at an epoch whose key a later item of the same page brings: the
 /// write is taken unreadable in the page's open writes, the key's fetch reopens what the
 /// store holds, and the record must still open once the key is held.

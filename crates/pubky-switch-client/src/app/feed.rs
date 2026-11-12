@@ -466,7 +466,10 @@ impl App {
             self.events.push(AppEvent::ListingWaitsForKey);
         } else {
             // The stored entries' retries, the owed calls, and the feed to its end.
-            due_at_start = self.awaiting_due();
+            // None while a reopening is owed: the retries here skip them then.
+            if !self.reader().exists(super::records::REOPEN_DUE).await? {
+                due_at_start = self.awaiting_due();
+            }
             self.retry_parked().await?;
             self.retry_owed().await?;
             let mut wait = wait.map(|w| w.min(25));
@@ -1986,11 +1989,17 @@ impl App {
     async fn retry_parked(&mut self) -> Result<(), AppError> {
         let gaps = self.key_gaps();
         let keys_held = self.keys_held();
+        // An entry that waits for a key may read the records a reopening still owes: it
+        // waits for that too, its count of keys untouched, so it is due once it is done.
+        let reopen_owed = self.reader().exists(super::records::REOPEN_DUE).await?;
         let due: Vec<(u64, u64)> = self
             .state
             .parked
             .iter()
-            .filter(|(_, stored)| due_again(stored, &gaps, keys_held))
+            .filter(|(_, stored)| {
+                due_again(stored, &gaps, keys_held)
+                    && !(reopen_owed && stored.reason.awaited_epoch().is_some())
+            })
             .map(|(id, stored)| (*id, stored.round))
             .collect();
         if due.is_empty() {
@@ -2012,6 +2021,10 @@ impl App {
     /// the rest are due at the next read's retries. The caller makes sure no listing is
     /// owed, so nothing is handed to the protocol before one (Switch spec 8.2).
     async fn retry_awaited(&mut self, due_at_start: &[u64]) -> Result<(), AppError> {
+        // Not while a reopening is owed, which their steps may read (`retry_parked`).
+        if self.reader().exists(super::records::REOPEN_DUE).await? {
+            return Ok(());
+        }
         let ids: Vec<u64> = self
             .awaiting_due()
             .into_iter()
