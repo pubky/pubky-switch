@@ -1,7 +1,9 @@
 //! The Switch's signature and derivation labels (Switch wire 1.5, 2.3).
 //!
 //! Every format the Pubky Switch defines signs and derives under a `pubky-switch/v1/` label.
-//! A protocol on the Switch uses labels of its own, never one of these (Switch spec 1).
+//! A protocol on the Switch uses labels of its own, never one that starts with
+//! `pubky-switch/`: every such label is the Switch's, in this version and every later one
+//! (Switch spec 1, 13.2 "Labels").
 
 /// The start of every label the Pubky Switch defines (Switch spec 13.2, Switch wire 2.3).
 pub const PREFIX: &str = "pubky-switch/v1/";
