@@ -956,6 +956,17 @@ impl Signer {
             .is_some_and(|serving| serving.origin == service.origin))
     }
 
+    /// While recovering, whether the service the signer goes to took a version of this
+    /// recovery under a key an earlier declaration's enrollment answered there, read under
+    /// each such key ([`Signer::taken_under_an_earlier_key`]): that version is then delivered.
+    async fn taken_under_a_remembered_key(&mut self) -> Result<bool> {
+        if !self.state.recovering {
+            return Ok(false);
+        }
+        let origin = self.service()?.origin;
+        self.taken_under_an_earlier_key(&origin, true).await
+    }
+
     /// Whether the service the signer goes to answers `GET /apps` under the key the version
     /// in flight names, the key its records hold for it: an error it signs counts too.
     async fn version_key_signs(&self) -> Result<bool> {
@@ -1424,12 +1435,17 @@ impl Signer {
             Err(error @ ClientError::BadServiceSignature { status })
                 if status != 200 && self.pins_the_lost_generations_key()? =>
             {
-                if !self.version_key_signs().await? {
-                    return Err(error.into());
+                if self.version_key_signs().await? {
+                    let mut state = self.state.clone();
+                    state.recovery_serving = None;
+                    return self.commit(state, self.flow.clone()).await;
                 }
-                let mut state = self.state.clone();
-                state.recovery_serving = None;
-                self.commit(state, self.flow.clone()).await
+                // Not the version's key either: it may still be the key an earlier
+                // declaration's enrollment answered here, whatever the refusal, as below.
+                if self.taken_under_a_remembered_key().await? {
+                    return Ok(());
+                }
+                Err(error.into())
             }
             // A refusal the pinned key didn't sign, while recovering at a service an earlier
             // declaration enrolled at: one that took that version answers under the key it
@@ -1437,8 +1453,7 @@ impl Signer {
             Err(error @ ClientError::BadServiceSignature { status: 409 })
                 if self.state.recovering =>
             {
-                let origin = self.service()?.origin;
-                if self.taken_under_an_earlier_key(&origin, true).await? {
+                if self.taken_under_a_remembered_key().await? {
                     return Ok(());
                 }
                 Err(error.into())

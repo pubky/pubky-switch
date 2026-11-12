@@ -14,6 +14,7 @@ use pubky_switch_client::testing::START_MS;
 use pubky_switch_client::transport::{Request, Response, Transport};
 use pubky_switch_core::http::header;
 use pubky_switch_harness::service::RealSwitch;
+use pubky_switch_harness::service_log::ServiceLog;
 
 const ORIGIN: &str = "https://switch.example";
 
@@ -96,6 +97,47 @@ async fn test_service_transport_takes_the_services_own_path() {
     let name = switch.database_name().to_owned();
     switch.close().await.expect("closed");
     assert!(!database_exists(&name).await, "{name} was left behind");
+}
+
+/// A request the service's storage fails: the service answers `503 unavailable` under the
+/// operator key, and its log, which a run keeps, says that it was the database.
+#[tokio::test]
+async fn test_service_storage_failure_is_a_503_whose_cause_the_log_names() {
+    let Some(switch) = switch(Arc::new(TestClock::new(START_MS))).await else {
+        return;
+    };
+    let identity = pubky_switch_core::keys::IdentityKey::from_secret([7; 32]);
+    let id = pubky_switch_core::enc::zbase32_encode(&identity.public());
+    let read = request("GET", ORIGIN, &format!("/v1/{id}/identity"), Vec::new());
+    let log = ServiceLog::default();
+    let keeping = log.keep();
+
+    // With its database: no such account, and nothing logged.
+    let answer = switch
+        .transport()
+        .send(read.clone())
+        .await
+        .expect("an answer");
+    assert_eq!((answer.status, code(&answer).as_str()), (404, "not_found"));
+    assert!(log.lines().is_empty(), "{:?}", log.lines());
+
+    // Without a connection to it.
+    switch.close_connections().await;
+    let answer = switch.transport().send(read).await.expect("an answer");
+    drop(keeping);
+    assert_eq!(
+        (answer.status, code(&answer).as_str()),
+        (503, "unavailable")
+    );
+    assert!(answer.header(header::SERVICE_SIGNATURE).is_some());
+    let failures = log.storage_failures();
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert!(
+        failures[0].starts_with("WARN pubky_switch::service: storage error=database: "),
+        "{failures:?}"
+    );
+
+    switch.close().await.expect("closed");
 }
 
 /// Whether the test server holds a database named `name`.

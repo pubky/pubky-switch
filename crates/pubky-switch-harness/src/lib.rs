@@ -14,6 +14,8 @@
 //! - [`compare`]: the differences between two runs, judged against the list in [`allowed`].
 //! - [`check`]: what the harness verifies itself of every answer of either switch: the
 //!   answer's signature, each head, chain stub, feed item and transition proof.
+//! - [`service_log`]: the service's warnings and errors of a run, so a run in which the
+//!   test database failed says so.
 //!
 //! [`compare_backends`] runs one flow in both worlds and gives the verdict. A flow's test
 //! fails when the scripted switch answers differently from the service anywhere the allowed
@@ -36,9 +38,12 @@ pub mod compare;
 pub mod flows;
 pub mod parties;
 pub mod service;
+pub mod service_log;
 pub mod store;
 pub mod trace;
 pub mod world;
+
+use pubky_switch::store::testing::TEST_DATABASE_URL_ENV;
 
 pub use compare::Verdict;
 pub use trace::Trace;
@@ -59,6 +64,27 @@ pub enum HarnessError {
         /// The flow's error.
         error: String,
         /// What the run showed until then.
+        trace: Trace,
+    },
+    /// A run in which the service's storage failed: the test database refused a connection,
+    /// or kept a request waiting for one or for an account's lock until the wait ran out.
+    /// The service answers that `503 unavailable` (Switch wire 7.6), so whatever the flow
+    /// showed says nothing about either switch.
+    #[error(
+        "the test database failed during the run against {backend:?}: the service's storage \
+         failed, which it answers `503 unavailable`. The server {TEST_DATABASE_URL_ENV} names \
+         refused a connection or kept a request waiting too long; another suite using that \
+         server at the same time is the usual cause. Nothing was sent again.\n\
+         The service logged:\n{logged}\nThe flow ended: {ended}\n{trace}"
+    )]
+    Database {
+        /// What answered the world's requests.
+        backend: Backend,
+        /// The service's log lines for the failures, one a line.
+        logged: String,
+        /// How the flow ended: its error, or that it had none.
+        ended: String,
+        /// What the run showed.
         trace: Trace,
     },
 }
@@ -125,19 +151,49 @@ async fn run_here(
     backend: Backend,
     flow: impl AsyncFn(&World) -> FlowResult,
 ) -> Result<Option<Trace>, HarnessError> {
+    // Kept on this thread, where the service answers the flow's requests.
+    let log = service_log::ServiceLog::default();
+    let keeping = log.keep();
     let Some(world) = World::start(backend)? else {
         return Ok(None);
     };
     let outcome = flow(&world).await.map_err(|error| error.to_string());
     let trace = world.trace();
     world.close().await?;
+    drop(keeping);
+    let lines = |lines: Vec<String>| -> String {
+        lines
+            .iter()
+            .map(|line| format!("  {line}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    // A run in which the service's storage failed shows the database, not a switch: it
+    // fails as that, whatever the flow made of the `503`, and isn't run again.
+    let failures = log.storage_failures();
+    if !failures.is_empty() {
+        return Err(HarnessError::Database {
+            backend,
+            logged: lines(failures),
+            ended: outcome.err().unwrap_or_else(|| "with no error".to_owned()),
+            trace,
+        });
+    }
     match outcome {
         Ok(()) => Ok(Some(trace)),
-        Err(error) => Err(HarnessError::Flow {
-            backend,
-            error,
-            trace,
-        }),
+        Err(error) => {
+            let logged = log.lines();
+            let error = if logged.is_empty() {
+                error
+            } else {
+                format!("{error}\nthe service logged:\n{}", lines(logged))
+            };
+            Err(HarnessError::Flow {
+                backend,
+                error,
+                trace,
+            })
+        }
     }
 }
 
@@ -181,6 +237,70 @@ pub async fn compare_backends(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The service's log line for a request its storage failed, as `store_error` writes it.
+    fn log_a_storage_failure() {
+        tracing::warn!(
+            target: "pubky_switch::service",
+            error = %"database: pool timed out while waiting for an open connection",
+            "storage"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_fails_as_the_database_when_the_services_storage_failed() {
+        // Whether the flow fails on the `503` or passes it by.
+        for flow_fails in [true, false] {
+            let ended = run(Backend::Scripted, async |_world| {
+                log_a_storage_failure();
+                if flow_fails {
+                    return Err("the write was answered 503 unavailable".into());
+                }
+                Ok(())
+            })
+            .await;
+            let Err(error @ HarnessError::Database { .. }) = ended else {
+                panic!("the run ended {ended:?}");
+            };
+            let text = error.to_string();
+            assert!(text.starts_with("the test database failed"), "{text}");
+            assert!(text.contains(TEST_DATABASE_URL_ENV), "{text}");
+            assert!(
+                text.contains(
+                    "  WARN pubky_switch::service: storage error=database: pool timed out"
+                ),
+                "{text}"
+            );
+            let flow = if flow_fails {
+                "The flow ended: the write was answered 503 unavailable"
+            } else {
+                "The flow ended: with no error"
+            };
+            assert!(text.contains(flow), "{text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_run_shows_what_the_service_logged_when_a_flow_fails() {
+        let ended = run(Backend::Scripted, async |_world| {
+            tracing::error!(target: "pubky_switch::keys", failure = %"no such file", "a key");
+            Err("the enrollment was refused".into())
+        })
+        .await;
+        let Err(HarnessError::Flow { error, .. }) = ended else {
+            panic!("the run ended {ended:?}");
+        };
+        assert_eq!(
+            error,
+            "the enrollment was refused\nthe service logged:\n  ERROR pubky_switch::keys: a \
+             key failure=no such file"
+        );
+        // A run with nothing logged fails and passes as before.
+        let quiet = run(Backend::Scripted, async |_world| Err("refused".into())).await;
+        assert!(matches!(quiet, Err(HarnessError::Flow { error, .. }) if error == "refused"));
+        let passed = run(Backend::Scripted, async |_world| Ok(())).await;
+        assert!(matches!(passed, Ok(Some(_))));
+    }
 
     /// Use about `bytes` of stack, a 64 KiB frame a level, and give 1 back.
     #[inline(never)]

@@ -376,21 +376,20 @@ switch and the service shows there:
   restored at once, the second delivery refused `409 stale_identity`, which the signer's
   own tests don't run;
 - the hand-over both ways, its abort, and the abort racing the take-over with either
-  arriving first (`handover.rs`), the account's erasure and its
-  lost answer (`erasure.rs`), and the provider loss: declared at a new service and in
-  place, declared again, refused, its staged admission ended, and restored mid-recovery
-  (`recovery.rs`).
+  arriving first (`handover.rs`), the account's erasure, its lost answer and an enrollment
+  at the same origin after it (`erasure.rs`), and the provider loss: declared at a new
+  service and in place, declared again, refused at a new service and at the origin the
+  identity was enrolled at, its staged admission ended, restored mid-recovery, and
+  restored on a new install from a backup a recovery in place wrote before its version
+  reached the service (`recovery.rs`).
 
 A grant path the user declines at an approval (Switch spec 3.4) needs nothing here: the
 declines change only the Pubky grant the host approves, never the certificate, the version
 or the key bundle, so the switch's traffic is the same as for an approval that allows them.
 
 Not every honest path has a flow there. Among those without one: a stale backup refused at
-a restore, a Homeserver that holds another body at a restore, a restore in place below
-the signer's mark (`restore.rs`), and a restore on a new install from a backup a recovery in
-place wrote before its version reached the service, which answers under the key it served
-with until then (`recovery.rs`): the scripted switch serves under the account's key and holds
-the pending key apart, as the service does, so it needs nothing more for it.
+a restore, a Homeserver that holds another body at a restore, and a restore in place below
+the signer's mark (`restore.rs`).
 
 What stays only on the scripted switch, and why:
 
