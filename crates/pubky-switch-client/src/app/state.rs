@@ -741,6 +741,13 @@ impl Tx {
     /// How many keys under `prefix` the batch puts and doesn't delete after, not yet
     /// committed.
     pub(crate) fn pending_puts(&self, prefix: &str) -> usize {
+        self.pending_put_keys(prefix).len()
+    }
+
+    /// The keys under `prefix` the batch puts and doesn't delete after, not yet committed,
+    /// without the prefix.
+    pub(crate) fn pending_put_keys(&self, prefix: &str) -> Vec<String> {
+        let start = prefix.len();
         let prefix = prefix.as_bytes();
         let mut keys: std::collections::BTreeSet<&[u8]> = std::collections::BTreeSet::new();
         for write in &self.batch.writes {
@@ -755,7 +762,10 @@ impl Tx {
                 _ => {}
             }
         }
-        keys.len()
+        keys.into_iter()
+            .filter_map(|key| std::str::from_utf8(key.get(start..)?).ok())
+            .map(str::to_owned)
+            .collect()
     }
 
     /// The bytes the batch counts against the store's batch size so far.

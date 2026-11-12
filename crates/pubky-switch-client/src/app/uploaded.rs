@@ -17,8 +17,9 @@
 //! - **records** (`rcread/<key>`): read again by [`App::reread_records`] with
 //!   `GET /records/{key}`, and taken as any read write is, after the checks of Switch spec
 //!   10.3: its version is the service's word, since no proof dates it. At most
-//!   [`MAX_RECORD_MARKS`] are kept: an upload past it drops them all and owes a listing of
-//!   the collections instead (`list_due`), which reads every record the marks could name.
+//!   [`MAX_RECORD_MARKS`] are kept: an upload past it drops them and owes a listing of the
+//!   protocol's collections instead (`list_due`); the marks of records the app holds
+//!   outside those collections, which no listing reads, stay.
 //!
 //! A record the app holds whose latest view shows `divergent` is held so (`rcdiv/<key>`,
 //! [`SharedRecord::divergent`]): uploads conflict with its current write, which the app
@@ -56,8 +57,9 @@ pub const RECORD_REREADS_PER_READ: usize = 16;
 /// The most records the app keeps marked to read again. Each is a request of its own, 16 a
 /// read; past 1,000, a listing of the collections, a request per 1,000 records, reads them
 /// in fewer requests, and it bounds what a switch that chains uploads of fresh keys can
-/// make the app store. An upload that would mark past it drops every mark and owes the
-/// listing instead.
+/// make the app store. An upload that would mark past it drops the marks and owes the
+/// listing instead, keeping only those of records the app holds outside the collections
+/// the listing reads.
 pub const MAX_RECORD_MARKS: usize = 1_000;
 
 /// The most keys of each kind, records and claims, the app marks for one upload: an
@@ -86,8 +88,8 @@ impl App {
     /// feed (Switch wire 7.4.14), in `tx`. A key already marked is marked again, at the
     /// transition's read. An app without `claims.read` can't read claims, and marks none; a
     /// record it may not read is unmarked when the switch refuses its read. Records past
-    /// [`MAX_RECORD_MARKS`], counting those marked before, drop every record mark and owe a
-    /// listing instead.
+    /// [`MAX_RECORD_MARKS`], counting those marked before, drop the record marks and owe a
+    /// listing instead, but for records the app holds outside the protocol's collections.
     pub(crate) async fn mark_uploaded<'a>(
         &self,
         records: impl IntoIterator<Item = &'a [u8; 32]>,
@@ -107,8 +109,36 @@ impl App {
             };
             let marked = committed.saturating_add(tx.pending_puts(RECORD_REREAD_PREFIX));
             if marked.saturating_add(records.len()) > MAX_RECORD_MARKS {
+                // The listing reads only the protocol's collections: the marks of records
+                // the app holds outside them stay, bounded by the records it holds.
+                let mut keys: Vec<[u8; 32]> = records.iter().map(|key| **key).collect();
+                let committed = if dropped {
+                    Vec::new()
+                } else {
+                    self.reader().scan_raw(RECORD_REREAD_PREFIX).await?
+                };
+                let rests = committed
+                    .into_iter()
+                    .map(|(rest, _)| rest)
+                    .chain(tx.pending_put_keys(RECORD_REREAD_PREFIX));
+                keys.extend(rests.filter_map(|rest| unb64_array::<32>(&rest).ok()));
+                keys.sort_unstable();
+                keys.dedup();
+                let listed: Vec<String> = self
+                    .protocol
+                    .collections()
+                    .into_iter()
+                    .map(|collection| collection.name)
+                    .collect();
                 tx.delete_prefix(RECORD_REREAD_PREFIX)?;
                 tx.put(LIST_DUE, &true)?;
+                for key in keys {
+                    if let Some(held) = self.held_collection(&key).await?
+                        && !listed.contains(&held.name)
+                    {
+                        tx.put(&record_reread_key(&key), &at)?;
+                    }
+                }
             } else {
                 for key in records {
                     tx.put(&record_reread_key(key), &at)?;

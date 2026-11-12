@@ -694,7 +694,9 @@ enum Taken {
     New,
     /// The write held.
     Same,
-    /// The write held, unopened before, now opened: no newer write.
+    /// The write held, unopened before, now opened: no newer write. No path from the feed
+    /// reaches it today: a key that arrives reopens the record through `reopen_unreadable`
+    /// before the feed meets the write again. It stays so that `New` keeps meaning newer.
     Reopened,
     NotNewer,
     Flagged,

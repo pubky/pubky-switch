@@ -796,3 +796,127 @@ async fn test_record_read_answered_with_another_records_view_flags_neither() {
     assert!(!app.shared_record(&held).await.unwrap().unwrap().divergent);
     assert_eq!(marks(&store, "rcdiv/"), 0);
 }
+
+#[tokio::test]
+async fn test_upload_feed_write_judged_by_its_view_holds_the_views_divergence() {
+    // A feed write by a writer whose certificate the app can't find (it never saw the
+    // phone's `app.put`, and the directory doesn't show it) is judged by the record's view:
+    // the view's `divergent` is the switch's latest word, so the record is held divergent
+    // although the write is newer, and the app is told once.
+    let store = Arc::new(MemoryStore::new());
+    let w = World::new();
+    let router = super::moves::Router::of(&w);
+    let phone = w.other_app("phone", &Permission::ALL);
+    let protocol = Arc::new(super::moves::LossProtocol::default());
+    *protocol.collections.lock().unwrap() = vec![items()];
+    let mut app = super::moves::join_on(
+        &w,
+        &router,
+        Arc::clone(&store) as Arc<dyn StateStore>,
+        Arc::clone(&protocol) as Arc<dyn crate::app::Protocol>,
+        &Permission::ALL,
+    )
+    .await;
+    // The listing owed since joining goes first, before the write, so only the feed meets it.
+    w.switch
+        .lock()
+        .apps
+        .get_mut(&phone.app_id_bytes())
+        .unwrap()
+        .record = None;
+    app.receive(None).await.unwrap();
+    let listings = w.switch.lock().shared.listings;
+    let target = RecordTarget::new(items(), b"the phone's");
+    let (_, kind) = app
+        .record_op(&target, Some(&value(&["p"])), vec![])
+        .await
+        .unwrap();
+    let OpKind::RecordPut(put) = &kind else {
+        unreachable!("a record op");
+    };
+    let key = put.key;
+    w.switch.app_op(&phone, kind).unwrap();
+    w.switch.lock().shared.divergent.insert(key, vec![[1; 32]]);
+    let report = app.receive(None).await.unwrap();
+    assert_eq!(w.switch.lock().shared.listings, listings, "no listing");
+    let held = app.shared_record(&key).await.unwrap().unwrap();
+    assert_eq!(ids(held.content.value()), vec!["p"]);
+    assert!(held.divergent, "the view said divergent");
+    assert_eq!(divergent(&report.events, key), 1, "{:?}", report.events);
+}
+
+#[tokio::test]
+async fn test_upload_records_past_the_mark_cap_still_read_a_held_record_no_listing_covers() {
+    // A record the app holds of a collection its protocol doesn't list, which an upload
+    // replaced: read again under its own collection when marked. Past `MAX_RECORD_MARKS`
+    // the marks give way to a listing, which reads only the protocol's collections.
+    let store = Arc::new(MemoryStore::new());
+    let (lost, mut app) = followed(&store, true).await;
+    *lost.protocol.collections.lock().unwrap() = vec![];
+    let (key, kind, version) = {
+        let next = lost.next.lock();
+        let (key, taken) = next.shared.records.iter().next().expect("the record");
+        let op = pubky_switch_core::ops::SignedOp::peek(&taken.op).unwrap();
+        (*key, op.body().kind.clone(), taken.state.version)
+    };
+    let OpKind::RecordPut(mut put) = kind else {
+        unreachable!("a record op");
+    };
+    put.expected_version = version;
+    put.id_inputs = None;
+    let op = sign_batch(
+        &app_keys("wallet"),
+        &lost.w.alice.public(),
+        Some(app_keys("wallet").app_id_bytes()),
+        1,
+        [95; 16],
+        vec![(Vec::new(), OpKind::RecordPut(put))],
+    )
+    .unwrap();
+    let body = json!({ "records": [{ "op": op[0].signed(), "cert": app.cert().signed() }] });
+    let (status, answer) = upload_at_next(&lost, &body.to_string());
+    assert_eq!(status, 200, "{answer}");
+    // Another upload, in the same read, lists more records than the marks hold.
+    let many: BTreeSet<[u8; 32]> = (0..MAX_RECORD_MARKS)
+        .map(|i| {
+            let mut key = [1; 32];
+            key[..8].copy_from_slice(&u64::try_from(i).unwrap().to_be_bytes());
+            key
+        })
+        .collect();
+    let changes = UploadChanges {
+        records: many,
+        ..UploadChanges::default()
+    };
+    lost.next.chain_upload(PHONE, changes.to_value()).unwrap();
+    let first = app.receive(None).await.unwrap();
+    let second = app.receive(None).await.unwrap();
+    assert!(
+        changed(&first.events, key) || changed(&second.events, key),
+        "the held record's newer upload was never read"
+    );
+}
+
+#[tokio::test]
+async fn test_upload_claim_kept_earlier_in_the_same_commit_is_marked() {
+    // A claim the app first keeps from an entry on the same feed page as the transition,
+    // before it: held only in the open commit, it is marked and read again, so its view
+    // isn't the one from before the upload.
+    let store = Arc::new(MemoryStore::new());
+    let (lost, mut app) = followed(&store, false).await;
+    assert!(app.claim_doubt(&CLAIM).await.unwrap().is_none());
+    // A second device of the app attempts at the next switch; then an upload beside it.
+    let attempt = ClaimOp::attempt(CLAIM, 0, ATTEMPT, 3600, None);
+    lost.next
+        .app_op(&app_keys("wallet"), attempt.kind())
+        .unwrap();
+    upload_beside(&lost.next);
+    let changes = UploadChanges {
+        divergent_claims: [CLAIM].into(),
+        ..UploadChanges::default()
+    };
+    lost.next.chain_upload(PHONE, changes.to_value()).unwrap();
+    app.receive(None).await.unwrap();
+    assert!(app.claim_doubt(&CLAIM).await.unwrap().unwrap().divergent);
+    assert_eq!(marks(&store, "clread/"), 0);
+}
