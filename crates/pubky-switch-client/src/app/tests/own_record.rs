@@ -1751,3 +1751,266 @@ fn test_own_record_leave_state_with_a_two_step_member_loads() {
     .unwrap();
     assert_eq!(leave, crate::app::state::LeaveState::default());
 }
+
+/// The signer's renewal reaches the app's feed as a `cert.put` before the `identity.json`
+/// that lists it: the app holds the renewal and keeps presenting the old certificate.
+fn store_renewal_unlisted(w: &World, app: &App) -> pubky_switch_core::records::AppCert {
+    use pubky_switch_core::ops::KeyBundlePut;
+    use pubky_switch_core::records::seal_bundle_parts;
+    let me = app.app_id();
+    let renewed = cert_for(
+        &w.alice,
+        &app_keys("wallet"),
+        w.clock.now_ms(),
+        &["scope-a"],
+    );
+    let has_keys = |s: &str| SampleProtocol::default().has_keys(s);
+    let epoch = w.switch.identity_doc().unwrap().data_epoch();
+    let mut batch = vec![OpKind::CertPut {
+        target_app_id: me,
+        cert: renewed.signed().clone(),
+    }];
+    for part in seal_bundle_parts(&w.alice, &renewed, 1, epoch, &has_keys).unwrap() {
+        batch.push(OpKind::KeyBundlePut(KeyBundlePut {
+            target_app_id: me,
+            bundle: part.bundle,
+            first_epoch: part.first_epoch,
+            last_epoch: part.last_epoch,
+        }));
+    }
+    w.switch.signer_batch(batch).unwrap();
+    renewed
+}
+
+/// The signer lists `renewed`, the renewal of `old`.
+fn list_renewal(
+    w: &World,
+    me: [u8; 16],
+    old: &pubky_switch_core::records::AppCert,
+    renewed: &pubky_switch_core::records::AppCert,
+) {
+    use pubky_switch_core::records::{ListedApp, RenewedCert};
+    w.next_doc(|body| {
+        body.apps.retain(|a| a.app_id != me);
+        body.apps.push(ListedApp {
+            app_id: me,
+            cert: renewed.hash(),
+        });
+        body.renewed.push(RenewedCert {
+            app_id: me,
+            cert: old.hash(),
+            until: None,
+        });
+    });
+}
+
+/// The app saw the renewal's `cert.put` but not yet the `identity.json` listing it,
+/// and its kept record was applied and then superseded by another device's later record
+/// under the renewal. The app takes the later record with the renewal, and signs
+/// nothing over it.
+#[tokio::test]
+async fn test_own_record_superseded_under_a_renewal_the_app_holds_keeps_the_later_body() {
+    let w = World::new();
+    let mut app = w.join_publishing("wallet").await;
+    let id = app.app_id();
+    let old = app.cert().clone();
+    w.clock.advance_ms(1_000);
+    let renewed = store_renewal_unlisted(&w, &app);
+    app.receive(None).await.unwrap();
+    assert!(app.state.renewal.is_some(), "the cert.put was not seen");
+    assert_eq!(app.cert().hash(), old.hash());
+    w.clock.advance_ms(1_000);
+    w.switch.fail_next(Fault::LoseAnswer {
+        path: "/ops".into(),
+    });
+    app.set_protocol_member(PROTO, member(json!({ "a": 1 })), None)
+        .await
+        .unwrap_err();
+    list_renewal(&w, id, &old, &renewed);
+    w.clock.advance_ms(1_000);
+    let accepts = w.protocol.accepts(&renewed);
+    let mut later = AppRecordBody::new(&renewed, accepts, w.clock.now_ms());
+    later.label = Some("other device".into());
+    let later = AppRecord::sign(&app_keys("wallet"), later).unwrap();
+    w.switch
+        .app_op(
+            &app_keys("wallet"),
+            OpKind::AppPut {
+                record: later.signed().clone(),
+            },
+        )
+        .unwrap();
+    w.clock.advance_ms(pubky_switch_core::ops::BATCH_PROOFS_MS);
+    let puts = w.app_puts();
+    let outcome = app.receive(None).await;
+    let held = AppRecord::verify(&w.held(id).unwrap(), &app.identity()).unwrap();
+    assert_eq!(app.cert().hash(), renewed.hash(), "{outcome:?}");
+    assert_eq!(
+        w.app_puts(),
+        puts,
+        "signed over the later record: the switch holds label {:?}, protocols {:?} ({outcome:?})",
+        held.body().label,
+        held.body().protocols.keys().collect::<Vec<_>>()
+    );
+}
+
+/// A switch whose directory shows a later record of the app under a certificate the
+/// newest `identity.json` doesn't list (a faulty one). The app takes nothing of that record:
+/// it is not accepted, and never published over the good Homeserver copy.
+#[tokio::test]
+async fn test_own_record_superseded_by_an_unlisted_record_publishes_nothing_of_it() {
+    use pubky_switch_core::enc::zbase32_encode;
+    let w = World::new();
+    let mut app = w.join_publishing("wallet").await;
+    let id = app.app_id();
+    let published = w.published(id);
+    w.clock.advance_ms(1_000);
+    w.switch.fail_next(Fault::LoseAnswer {
+        path: "/ops".into(),
+    });
+    app.set_protocol_member(PROTO, member(json!({ "a": 1 })), None)
+        .await
+        .unwrap_err();
+    w.clock.advance_ms(1_000);
+    let unlisted = cert_for(
+        &w.alice,
+        &app_keys("wallet"),
+        w.clock.now_ms(),
+        &["scope-a"],
+    );
+    let accepts = w.protocol.accepts(&unlisted);
+    let shown = AppRecordBody::new(&unlisted, accepts, w.clock.now_ms());
+    let shown = AppRecord::sign(&app_keys("wallet"), shown).unwrap();
+    w.clock.advance_ms(pubky_switch_core::ops::BATCH_PROOFS_MS);
+    w.switch.fail_next(Fault::Replace {
+        path: "/directory".into(),
+        member: "apps".into(),
+        value: json!([{ "app_id": zbase32_encode(&id), "record": shown.signed(), "receive_key": null }]),
+    });
+    let outcome = app.receive(None).await;
+    assert_ne!(
+        w.published(id),
+        Some(bytes_of(shown.signed())),
+        "the app published a record under an unlisted certificate: {outcome:?}"
+    );
+    assert_ne!(
+        app.state.accepted.as_ref(),
+        Some(shown.signed()),
+        "taken as accepted ({outcome:?}); Homeserver held {:?} before",
+        published.is_some()
+    );
+}
+
+/// A `409` naming no record, with a directory (a faulty one) showing a different
+/// record of the app at the kept record's own `updated_at`: no later record superseded it,
+/// so it is a refusal, and nothing of the shown record is taken.
+#[tokio::test]
+async fn test_own_record_conflict_naming_no_record_with_a_same_time_record_keeps_it() {
+    use pubky_switch_core::enc::zbase32_encode;
+    let w = World::new();
+    let mut app = w.join_publishing("wallet").await;
+    let id = app.app_id();
+    let accepted = app.state.accepted.clone();
+    w.clock.advance_ms(1_000);
+    let accepts = record_of(&app).body().accepts.clone();
+    let mut shown = AppRecordBody::new(app.cert(), accepts, w.clock.now_ms());
+    shown.label = Some("shown".into());
+    let shown = AppRecord::sign(&app_keys("wallet"), shown).unwrap();
+    w.switch.fail_next(Fault::Error {
+        path: "/ops".into(),
+        code: ErrorCode::Conflict,
+        current: json!({}),
+    });
+    w.switch.fail_next(Fault::Replace {
+        path: "/directory".into(),
+        member: "apps".into(),
+        value: json!([{ "app_id": zbase32_encode(&id), "record": shown.signed(), "receive_key": null }]),
+    });
+    let outcome = app
+        .set_protocol_member(PROTO, member(json!({ "a": 1 })), None)
+        .await;
+    assert_eq!(record_of(&app).updated_at(), shown.updated_at());
+    assert!(outcome.is_err(), "{outcome:?}");
+    assert!(app.state.pending_record.is_some());
+    assert_eq!(app.state.accepted, accepted);
+}
+
+/// The drop of a superseded kept record and the take of the later one are in the store: a
+/// load after them presents the later record as accepted, and an unchanged record call
+/// signs nothing.
+#[tokio::test]
+async fn test_own_record_superseding_record_taken_holds_across_a_load() {
+    let w = World::new();
+    let mut app = w.join_publishing("wallet").await;
+    let id = app.app_id();
+    w.clock.advance_ms(1_000);
+    w.switch.fail_next(Fault::LoseAnswer {
+        path: "/ops".into(),
+    });
+    app.set_protocol_member(PROTO, member(json!({ "a": 1 })), None)
+        .await
+        .unwrap_err();
+    w.clock.advance_ms(1_000);
+    let accepts = record_of(&app).body().accepts.clone();
+    let mut later = AppRecordBody::new(app.cert(), accepts, w.clock.now_ms());
+    later.label = Some("other device".into());
+    let later = AppRecord::sign(&app_keys("wallet"), later).unwrap();
+    w.switch
+        .app_op(
+            &app_keys("wallet"),
+            OpKind::AppPut {
+                record: later.signed().clone(),
+            },
+        )
+        .unwrap();
+    w.clock.advance_ms(pubky_switch_core::ops::BATCH_PROOFS_MS);
+    app.receive(None).await.unwrap();
+    drop(app);
+    let mut loaded = w.load_publishing_on(w.store.clone(), id).await;
+    assert_eq!(loaded.state.accepted.as_ref(), Some(later.signed()));
+    assert_eq!(loaded.record(), later.signed());
+    let puts = w.app_puts();
+    loaded.update_accepts().await.unwrap();
+    assert_eq!(w.app_puts(), puts, "an unchanged call signed again");
+}
+
+/// Taking a superseding record resets the Homeserver check: the read that takes it
+/// compares the copy with it at once, though the copy was checked minutes before, and
+/// writes the newer record over the older copy (Switch spec 4.2).
+#[tokio::test]
+async fn test_own_record_superseding_record_taken_is_checked_on_the_homeserver_at_once() {
+    let w = World::new();
+    let mut app = w.join_publishing("wallet").await;
+    let id = app.app_id();
+    let before = w.published(id);
+    w.clock.advance_ms(1_000);
+    w.switch.fail_next(Fault::LoseAnswer {
+        path: "/ops".into(),
+    });
+    app.set_protocol_member(PROTO, member(json!({ "a": 1 })), None)
+        .await
+        .unwrap_err();
+    // Another device puts a later record, and its Homeserver write is lost.
+    w.clock.advance_ms(1_000);
+    let accepts = record_of(&app).body().accepts.clone();
+    let later = AppRecordBody::new(app.cert(), accepts, w.clock.now_ms());
+    let later = AppRecord::sign(&app_keys("wallet"), later).unwrap();
+    w.switch
+        .app_op(
+            &app_keys("wallet"),
+            OpKind::AppPut {
+                record: later.signed().clone(),
+            },
+        )
+        .unwrap();
+    // The re-send is answered as one whose batch the switch holds without its proofs.
+    w.switch.fail_next(Fault::Error {
+        path: "/ops".into(),
+        code: ErrorCode::Conflict,
+        current: json!({}),
+    });
+    assert_eq!(w.published(id), before);
+    app.receive(None).await.unwrap();
+    assert_eq!(app.state.accepted.as_ref(), Some(later.signed()));
+    assert_eq!(w.published(id), Some(bytes_of(later.signed())));
+}

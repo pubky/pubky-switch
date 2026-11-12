@@ -10,7 +10,7 @@
 
 use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::ops::{Condition, OpKind};
-use pubky_switch_core::records::{AppCert, AppRecord, is_renewal};
+use pubky_switch_core::records::{AppCert, AppRecord, IdentityDoc, is_renewal};
 use pubky_switch_core::sig::SignedDoc;
 
 use super::events::AppEvent;
@@ -136,9 +136,9 @@ impl App {
     /// the switch accepted, and as the record the app presents when it carries the
     /// certificate the app presents: the app's next record builds on it, so this older body
     /// is never signed again over it. A later record carrying a renewal another device
-    /// took is presented with that renewal once the newest `identity.json` lists it
-    /// ([`App::take_superseding`]). Otherwise it is refused, and nothing is noted or
-    /// published. Once the switch holds the record, an app that publishes owes it to the
+    /// took is presented with that renewal when the newest `identity.json` lists it, and
+    /// one under any other certificate is never taken ([`App::take_superseding`]).
+    /// Otherwise it is refused, and nothing is noted or published. Once the switch holds the record, an app that publishes owes it to the
     /// Homeserver, in the commit that records the answer.
     pub(crate) async fn deliver_pending_record(&mut self) -> Result<bool, AppError> {
         let Some(pending) = self.state.pending_record.clone() else {
@@ -162,7 +162,8 @@ impl App {
                     match Box::pin(self.switch_holds(&batch)).await? {
                         Held::This => {}
                         Held::Later(later) => {
-                            Box::pin(self.take_superseding(*later)).await?;
+                            let (later, identity) = *later;
+                            Box::pin(self.take_superseding(later, identity)).await?;
                             return Ok(false);
                         }
                         Held::Other => return Err(error),
@@ -209,40 +210,64 @@ impl App {
     }
 
     /// Drop the kept record that `later`, a record of the app the switch holds, superseded,
-    /// and take `later` in the same commit: as the newest record the switch accepted, and as
-    /// the record the app presents when it carries the certificate the app presents. Nothing
-    /// is owed to the Homeserver for it: the device that put it publishes it, and the next
-    /// check compares the copy with it.
+    /// and take `later` in the same commit, as the newest record the switch accepted and
+    /// as the record the app presents, when it carries the certificate the app presents.
+    /// Nothing is owed to the Homeserver for it: the device that put it publishes it, and
+    /// the next check compares the copy with it.
     ///
-    /// A `later` carrying another certificate, a renewal another device took, whose
-    /// `cert.put` the feed shows only as a stub once the record carries it, is presented
-    /// with that certificate as after a restore ([`App::take_listed_cert`], Switch spec 3.2
-    /// step 3): when the newest own `identity.json` lists it and it renews the one held
-    /// under the app's own keys. A switch takes an `app.put` only with the listed
-    /// certificate (Switch wire 6.2), and the directory's `identity.json` lists it, so an
-    /// honest switch gives no other case. Otherwise `later` stays the accepted record only,
-    /// never published over, and the next record call signs the record held again, later
-    /// than it, as for a `409 conflict` naming it.
-    async fn take_superseding(&mut self, later: AppRecord) -> Result<(), AppError> {
+    /// A `later` carrying a renewal another device took, whose `cert.put` the feed shows
+    /// only as a stub once the record carries it, is taken with that certificate first, as
+    /// after a restore (Switch spec 3.2 step 3): when `identity`, the own `identity.json`
+    /// the same directory answer carried, or the newer one held, lists it, and it renews
+    /// the certificate held under the app's own keys. It is presented as it is, so nothing
+    /// is signed over it, also when the app already holds that renewal's `cert.put`.
+    ///
+    /// A `later` under any other certificate, which only a faulty switch shows, is never
+    /// taken: the kept record is dropped alone, nothing is noted as accepted, and nothing
+    /// of it is published.
+    async fn take_superseding(
+        &mut self,
+        later: AppRecord,
+        identity: IdentityDoc,
+    ) -> Result<(), AppError> {
+        let me = self.state.meta.app_id;
+        let newer = identity.version() > self.state.own_doc.version();
+        let listed = if newer {
+            identity.listed_cert(&me)
+        } else {
+            self.state.own_doc.listed_cert(&me)
+        };
+        let cert = later.cert();
+        if cert.hash() != self.state.cert.hash()
+            && listed == Some(cert.hash())
+            && cert.signing_key() == self.state.keys.signing_public()
+            && cert.bundle_key() == self.state.keys.bundle_public()
+            && is_renewal(&self.state.cert, cert)
+        {
+            // Before the newer document is taken, which would sign a renewal the app holds
+            // into the dropped body; and before the drop, so a crash between the two leaves
+            // the kept record, whose re-send then finds the later record under the
+            // certificate presented.
+            self.take_cert(cert.clone(), later.signed().clone(), false)
+                .await?;
+        }
+        if newer {
+            self.take_own_copy(identity).await?;
+        }
+        let taken = later.cert().hash() == self.state.cert.hash();
         let signed = later.signed().clone();
-        let presented = later.cert().hash() == self.state.cert.hash();
         let mut tx = self.tx()?;
         tx.delete(key::PENDING_RECORD)?;
-        tx.put(key::ACCEPTED_RECORD, &signed)?;
-        if presented {
+        if taken {
+            tx.put(key::ACCEPTED_RECORD, &signed)?;
             tx.put(key::RECORD, &signed)?;
         }
         self.commit(tx).await?;
         self.state.pending_record = None;
-        if presented {
+        if taken {
             self.state.record = signed.clone();
-        }
-        self.state.accepted = Some(signed);
-        self.published_checked_ms = None;
-        if !presented {
-            // A document that removes the app or names another generation is taken there,
-            // and the next read stops on it.
-            self.take_listed_cert().await?;
+            self.state.accepted = Some(signed);
+            self.published_checked_ms = None;
         }
         Ok(())
     }
@@ -261,7 +286,7 @@ impl App {
         Ok(if entry.record.signed() == &record {
             Held::This
         } else if entry.record.updated_at() > mine.updated_at() {
-            Held::Later(Box::new(entry.record.clone()))
+            Held::Later(Box::new((entry.record.clone(), directory.identity.clone())))
         } else {
             Held::Other
         })
@@ -329,8 +354,9 @@ enum Held {
     /// That very record, byte for byte.
     This,
     /// A record of the app with a later `updated_at`, verified for the identity and the
-    /// App ID as every directory entry is.
-    Later(Box<AppRecord>),
+    /// App ID as every directory entry is, with the own `identity.json` the same answer
+    /// carried.
+    Later(Box<(AppRecord, IdentityDoc)>),
     /// Another record, or none.
     Other,
 }
