@@ -50,7 +50,7 @@ pub use connect::{
 };
 pub use enrollment::enrollment;
 pub use epochs::{epochs_three_readers, rotation_given_up, third_epoch};
-pub use erasure::{erasure, erasure_answer_lost};
+pub use erasure::{erasure, erasure_answer_lost, erasure_enrolled_again};
 pub use grants::{grant_paths_decline_refused, grant_paths_declined};
 pub use handover::{hand_over, hand_over_abort_late, hand_over_aborted, hand_over_take_over_late};
 pub use installs::{
@@ -141,6 +141,9 @@ pub const FLOWS: &[(&str, Flow)] = &[
     ("erasure", |world| Box::pin(erasure(world))),
     ("erasure, answer lost", |world| {
         Box::pin(erasure_answer_lost(world))
+    }),
+    ("erasure, enrolled again", |world| {
+        Box::pin(erasure_enrolled_again(world))
     }),
     ("pages", |world| Box::pin(pages(world))),
     ("invite code", |world| Box::pin(invite_code(world))),
