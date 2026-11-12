@@ -1605,8 +1605,8 @@ async fn test_admission_needs_a_recovery_and_an_empty_body() {
 async fn test_admission_staged_holds_back_connect_requests_too() {
     // alice takes connect requests, so a stranger may deliver its document and ask to
     // connect. While admission is staged the deny list isn't back yet and a denied sender
-    // would pass for a stranger, so a stranger gets `503 staged` too; once it ends, its
-    // delivery is taken (Switch spec 12.6 step 2).
+    // would pass for a stranger, so a stranger gets `503 staged` too, at both calls; once it
+    // ends, its delivery is taken and its request kept (Switch spec 12.6 step 2).
     let Some(replay) = replay().await else { return };
     let (pending, at) = serving_with_a_pending_key(&replay).await;
     let before = held(&replay).await;
@@ -1627,8 +1627,23 @@ async fn test_admission_staged_holds_back_connect_requests_too() {
         "{}",
         String::from_utf8_lossy(&answer.body)
     );
+    let ask = || {
+        other_request(
+            "shop",
+            ORIGIN,
+            "POST",
+            &format!("/v1/{}/connect", alice_id()),
+            Vec::new(),
+            None,
+            at,
+        )
+    };
     let (peers, _) = from_shop(&replay, at).await;
     assert_eq!(code(&peers), (503, "staged".into()));
+    assert_eq!(
+        code(&replay.service.handle(ask()).await),
+        (503, "staged".into())
+    );
     assert_eq!(admission(&replay, Vec::new(), at).await.status, 200);
     let (peers, _) = from_shop(&replay, at).await;
     assert_eq!(
@@ -1636,6 +1651,13 @@ async fn test_admission_staged_holds_back_connect_requests_too() {
         200,
         "{}",
         String::from_utf8_lossy(&peers.body)
+    );
+    let asked = replay.service.handle(ask()).await;
+    assert_eq!(
+        asked.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&asked.body)
     );
     replay.db.drop_database().await.expect("drop");
 }

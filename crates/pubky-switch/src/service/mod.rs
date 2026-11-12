@@ -22,6 +22,7 @@ mod app_keys;
 mod apps;
 pub mod batch;
 mod claims;
+mod connect;
 mod directory;
 mod enroll;
 mod erase;
@@ -88,6 +89,8 @@ pub struct Service {
     control_rate: KeyedWindows<(String, [u8; 16])>,
     invite_rate: KeyedWindows<(String, [u8; 32])>,
     stranger_rate: KeyedWindows<String>,
+    /// Connect requests per sender identity, per account (Switch wire 9.4).
+    connect_rate: KeyedWindows<(String, [u8; 32])>,
     sender_rate: KeyedWindows<(String, [u8; 32])>,
     sender_app_rate: KeyedWindows<(String, [u8; 16])>,
     notify_rate: KeyedWindows<(String, [u8; 32])>,
@@ -275,6 +278,7 @@ impl Service {
             control_rate: KeyedWindows::default(),
             invite_rate: KeyedWindows::default(),
             stranger_rate: KeyedWindows::default(),
+            connect_rate: KeyedWindows::default(),
             sender_rate: KeyedWindows::default(),
             sender_app_rate: KeyedWindows::default(),
             notify_rate: KeyedWindows::default(),
@@ -318,6 +322,7 @@ impl Service {
             + self.control_rate.counted(|(at, _)| at == account)
             + self.invite_rate.counted(|(at, _)| at == account)
             + self.stranger_rate.counted(|at| at == account)
+            + self.connect_rate.counted(|(at, _)| at == account)
             + self.sender_rate.counted(|(at, _)| at == account)
             + self.sender_app_rate.counted(|(at, _)| at == account)
             + self.notify_rate.counted(|(at, _)| at == account)
@@ -475,7 +480,10 @@ impl Service {
             | Call::RecoveryUpload
             | Call::GetRecord(_)
             | Call::ListRecords
-            | Call::GetAllow => {
+            | Call::GetAllow
+            | Call::PostConnect
+            | Call::GetConnect
+            | Call::DeleteConnect(_) => {
                 match self.authenticate_caller(&account, &request, base_ms, base_ms.max(stamped_ms))
                 {
                     Ok((claimed, cert)) => {
@@ -1350,6 +1358,37 @@ impl Service {
                         due.is_some(),
                         time_ms,
                     )
+                    .await
+                    .map(|answer| (answer, serving))
+                    .map_err(|error| Refused::with_head(error, serving));
+            }
+            Call::PostConnect => {
+                // Apps of another identity ask to connect; the account's own don't.
+                let Some(cert) = other.filter(|_| writer.is_none()) else {
+                    return Err(Refused::with_head(
+                        ApiError::new(
+                            ErrorCode::PermissionMissing,
+                            "7.4.7: apps of another identity ask to connect",
+                        ),
+                        serving,
+                    ));
+                };
+                return self
+                    .post_connect(txn, held.as_ref(), cert, time_ms)
+                    .await
+                    .map(|answer| (answer, serving))
+                    .map_err(|error| Refused::with_head(error, serving));
+            }
+            Call::GetConnect => {
+                return self
+                    .get_connect(txn, held.as_ref(), writer.as_ref())
+                    .await
+                    .map(|answer| (answer, serving))
+                    .map_err(|error| Refused::with_head(error, serving));
+            }
+            Call::DeleteConnect(pubky) => {
+                return self
+                    .delete_connect(txn, writer.as_ref(), pubky)
                     .await
                     .map(|answer| (answer, serving))
                     .map_err(|error| Refused::with_head(error, serving));

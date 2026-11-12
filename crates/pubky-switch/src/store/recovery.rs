@@ -39,6 +39,7 @@ const GENERATION_STATE: &[&str] = &[
     "app_listings",
     "peer_copies",
     "peer_floors",
+    "connect_requests",
 ];
 
 /// Every table with an account column that a recovery in place keeps (Switch wire 3.3,
