@@ -1938,3 +1938,31 @@ async fn test_revocation_stops_when_the_first_read_cant_be_kept() {
     assert!(doc.listed_cert(&id).is_none());
     assert!(world.switch.app(&id).departed);
 }
+
+#[tokio::test]
+async fn test_revocation_goes_on_past_a_copy_that_doesnt_verify() {
+    // The switch answers the read before the revocation with a copy of `identity.json` that
+    // doesn't verify for the identity: a broken or hostile switch, which shows nothing of
+    // who signs. The revocation goes on, as past a copy that can't be read, and the version
+    // that removes the app follows the next read, which gives the switch's own copy (Switch
+    // spec 12.2).
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let (a, _) = two_joined(&world, &mut signer).await;
+    let id = a.keys.app_id_bytes();
+    let newest = signer.identity_doc().unwrap().unwrap();
+    let mut forged = world
+        .other_install_version(&newest, [7; 16])
+        .signed()
+        .clone();
+    forged.sig.clone_from(&newest.signed().sig);
+    world.switch.fail_next(SwitchFault::Replace {
+        path: "/apps".into(),
+        member: "identity".into(),
+        value: serde_json::to_value(&forged).unwrap(),
+    });
+    let doc = signer.revoke(id, None, confirmed()).await.unwrap();
+    assert!(world.switch.app(&id).departed);
+    assert!(doc.listed_cert(&id).is_none());
+    assert!(doc.body().removed.iter().any(|r| r.app_id == id));
+}

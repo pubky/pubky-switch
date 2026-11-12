@@ -3279,3 +3279,54 @@ async fn test_provider_loss_revocation_asked_meanwhile_waits_for_the_new_service
             .any(|a| matches!(a, Alert::RevocationPending { .. }))
     );
 }
+
+#[tokio::test]
+async fn test_provider_loss_revocation_asked_meanwhile_keeps_its_alert_with_it() {
+    // A revocation asked for during a recovery is kept with its alert in one commit: a store
+    // that fails at the next commit leaves neither without the other, and the new service is
+    // sent the revocation once it takes the recovery's version (Switch spec 12.6 step 1).
+    use pubky_switch_client::store::{Fault as StoreFault, FaultStore, StateStore};
+    let world = World::new();
+    let store = Arc::new(MemoryStore::new());
+    let mut signer = Signer::create(
+        world.env_with(store.clone(), notes()),
+        world.keyring(),
+        SWITCH_ORIGIN,
+    )
+    .await
+    .unwrap();
+    signer.resume().await.unwrap();
+    world
+        .approve(&mut signer, &App::new(&["notes"], None, [9; 32]))
+        .await;
+    drop(signer);
+    let (_, router) = new_service(&world);
+    router.remove(SWITCH_ORIGIN);
+    let mut signer = reopened(&world, store.clone(), &router, notes()).await;
+    signer
+        .declare_provider_loss("https://recovery.exmaple", confirmed())
+        .await
+        .unwrap_err();
+    drop(signer);
+    let faulty: Arc<dyn StateStore> =
+        Arc::new(FaultStore::new(store.clone(), StoreFault::FailBefore(2)));
+    let mut env = world.env_with(faulty, notes());
+    env.transport = router.clone();
+    let mut signer = Signer::open(env, world.keyring()).await.unwrap();
+    let id = notes_app_id();
+    assert_eq!(
+        signer.revoke(id, None, confirmed()).await.unwrap_err(),
+        Refusal::Recovering.into()
+    );
+    drop(signer);
+    let mut signer = reopened(&world, store, &router, notes()).await;
+    assert!(signer.alerts().iter().any(|alert| matches!(
+        alert,
+        Alert::RevocationPending { app_id, at_switch: false } if *app_id == id
+    )));
+    let recovered = signer
+        .declare_provider_loss(NEW_ORIGIN, confirmed())
+        .await
+        .unwrap();
+    assert!(recovered.listed_cert(&id).is_none());
+}

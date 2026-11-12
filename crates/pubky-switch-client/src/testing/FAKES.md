@@ -282,7 +282,9 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   `stored_handover` names the target held; `stored_handover_body` and
   `store_handover_again` script a hand-over stored or served again after it was dropped.
 - **`Fault::LeaveOut`** scripts a faulty service whose answer to an own app or the signer
-  leaves out a top-level member, such as a feed page's `items`.
+  leaves out a top-level member, such as a feed page's `items`; **`Fault::Replace`** one
+  whose answer carries another value for it, such as `GET /apps`' `identity` replaced by a
+  copy that doesn't verify.
 - **Erasure** (Switch wire 7.4.16), in `switch/signer.rs`: `POST /erase` checks the body names
   the account's service key (`409 conflict` for another) and, when it names one, the hash of
   the `identity.json` this switch holds (`409 conflict` for another, or for none held), and

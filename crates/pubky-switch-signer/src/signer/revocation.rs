@@ -74,6 +74,18 @@ impl Signer {
     /// on at [`Signer::run_due`]. While an alarm holds signing back, the app is still revoked
     /// at the switch, and the error is the alarm's: the version that removes it waits until the
     /// alarm is cleared.
+    ///
+    /// A revocation asked for during a recovery, once the recovery's backup was written, is
+    /// kept only in this install's records until the recovery completes: a new install
+    /// restored from that backup doesn't have it, while a restore in place keeps it, and so
+    /// does the backup of a later declaration. The backup isn't written again for it, since
+    /// the recovery's delivery sends again, byte for byte, the backup it sealed.
+    ///
+    /// When neither the switch's copy nor the backup can be read, this install goes on with
+    /// its records alone (Switch spec 12.2), so an install another one took over from can
+    /// still send a revocation the user confirmed on it. The switch takes it, since it is a
+    /// request of the identity key; the version that removes the app is then the signer's,
+    /// dated by the switch's revocation time, and the `distrust_from` picked here isn't used.
     pub async fn revoke(
         &mut self,
         app_id: [u8; 16],
@@ -122,11 +134,10 @@ impl Signer {
             revoked_at,
             taken,
         });
-        self.commit(state, self.flow.clone()).await?;
         // During a recovery it is kept for the new service, which is sent it once it takes the
-        // recovery's version; nothing goes to the lost one (Switch spec 12.6 step 1).
-        if self.state.recovering {
-            let mut state = self.state.clone();
+        // recovery's version; nothing goes to the lost one (Switch spec 12.6 step 1). Its alert
+        // goes in the same commit, so it is never kept without one.
+        if state.recovering {
             state.alert(Alert::RevocationPending {
                 app_id,
                 at_switch: false,
@@ -134,6 +145,7 @@ impl Signer {
             self.commit(state, self.flow.clone()).await?;
             return Err(Refusal::Recovering.into());
         }
+        self.commit(state, self.flow.clone()).await?;
         let completed = self.remove_now().await;
         let newest = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
         if newest.listed_cert(&app_id).is_none() {
@@ -359,14 +371,13 @@ impl Signer {
     /// The copy of the version a flow in progress delivers, as after a lost answer, is this
     /// install's own: it is left for [`Signer::resume`], never taken as records behind. A
     /// backup that is read and shows a take-over or records behind stops the revocation,
-    /// alarm or not. One that can't be read, is missing or doesn't open adds nothing, alarm
-    /// or not: a take-over shows at the switch first, as a newer copy, which stops it already
-    /// (Switch wire 3.13), and the revocation is the user's confirmed safety step.
-    ///
-    /// Nor is a revocation held back when the switch's copy can't be read, whatever the
-    /// switch answered instead, a signed error included: it may answer a compromise (Switch
-    /// spec 12.2), and it signs nothing new. The version that removes the app is signed only
-    /// after a read of the switch's copy that does succeed.
+    /// alarm or not, and so does a switch's copy that can't be read, whatever the switch
+    /// answered instead, a signed error included, or one that doesn't verify for the
+    /// identity: the revocation is the user's confirmed safety step, it may answer a
+    /// compromise (Switch spec 12.2), and it signs nothing new. A take-over shows at the
+    /// switch first, as a newer copy, which stops it whenever that copy is read (Switch wire
+    /// 3.13); with neither copy read, it goes on with the records alone. The version that
+    /// removes the app is signed only after a read of the switch's copy that does succeed.
     async fn named_for_revoking(&mut self) -> Result<Named> {
         self.check_named()?;
         let held = match self.read_apps().await {
@@ -378,7 +389,12 @@ impl Signer {
             Some(Flow::Deliver { doc, .. } | Flow::Renew { doc, .. }) => Some(doc.clone()),
             _ => None,
         };
+        // A copy that doesn't verify shows a broken or hostile switch, not who signs.
+        let verifies = |copy: &pubky_switch_core::sig::SignedDoc| {
+            IdentityDoc::verify(copy, &self.state.identity).is_ok()
+        };
         if let Some(held) = held
+            && held.as_ref().is_none_or(verifies)
             && (held.is_none() || held != in_flow)
         {
             match self.confirm_copy(held.as_ref()).await {
