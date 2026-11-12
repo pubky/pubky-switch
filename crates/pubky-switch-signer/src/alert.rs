@@ -146,9 +146,9 @@ pub enum Alert {
         expires_at: u64,
     },
     /// An app whose renewals stopped ([`Alert::RenewalsStopped`]) still owns attempts open
-    /// or `unknown`, as `GET /apps` lists them: at `expires_at` it isn't current any more, and
-    /// they are orphaned, for the identity's other apps or the user to resolve (Switch spec
-    /// 3.2, 10.2). The user renews it, which keeps them its own, or lets it lapse. Brought up
+    /// or `unknown`, as `GET /apps` lists them: at `expires_at` it isn't current any more, its
+    /// open ones are orphaned, and its `unknown` ones are left, for the identity's other apps
+    /// or the user to resolve (Switch spec 3.2, 10.2). The user renews it, which keeps them its own, or lets it lapse. Brought up
     /// to date at each run; cleared once it owns none, its renewals start again, or it is
     /// removed.
     LapsingWithOpenAttempts {
@@ -160,10 +160,12 @@ pub enum Alert {
         open_attempts: u64,
     },
     /// An app being revoked, or revoked, owns attempts open or `unknown`, as `GET /apps`
-    /// lists them: they remain, orphaned, for the identity's other apps or the user to
-    /// resolve (Switch spec 12.2, 10.2). The revocation goes on all the same; before it, the
-    /// host shows the count [`crate::Signer::open_attempts`] gives. Brought up to date at each
-    /// read of `GET /apps` the removal makes; cleared once it owns none.
+    /// lists them: they remain, the open ones orphaned, for the identity's other apps or the
+    /// user to resolve (Switch spec 12.2, 10.2). The revocation goes on all the same; before
+    /// it, the host shows the count [`crate::Signer::open_attempts`] gives. Brought up to date
+    /// at each read of `GET /apps` the removal makes; cleared once it owns none. It is this
+    /// install's own: a new install, restored once the removal is delivered, doesn't find it
+    /// again.
     RevokedWithOpenAttempts {
         /// The app.
         app_id: [u8; 16],

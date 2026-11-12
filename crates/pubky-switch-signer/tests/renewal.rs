@@ -2382,8 +2382,8 @@ async fn test_renewal_stopped_warns_of_the_open_attempts_it_would_orphan() {
     let (a, _) = two_apps(&["notes"], &["notes"]);
     world.approve(&mut signer, &a).await;
     let id = a.keys.app_id_bytes();
-    world.switch.open_attempt([1; 32], [1; 16], id);
-    world.switch.open_attempt([2; 32], [2; 16], id);
+    world.switch.open_attempt([1; 32], [1; 16], id).unwrap();
+    world.switch.open_attempt([2; 32], [2; 16], id).unwrap();
     for _ in 0..3 {
         world.clock.advance_ms(LIFETIME_MS / 2 + DAY_MS);
         signer.run_due().await.unwrap();
@@ -2400,11 +2400,17 @@ async fn test_renewal_stopped_warns_of_the_open_attempts_it_would_orphan() {
         "{:?}",
         signer.alerts()
     );
-    world.switch.fail_attempt([1; 32], [1; 16]);
+    let place = signer.alerts().iter().position(|a| *a == warning(2));
+    world.switch.fail_attempt([1; 32], [1; 16], id);
     signer.run_due().await.unwrap();
     assert!(signer.alerts().contains(&warning(1)));
     assert!(!signer.alerts().contains(&warning(2)));
-    world.switch.fail_attempt([2; 32], [2; 16]);
+    assert_eq!(
+        signer.alerts().iter().position(|a| *a == warning(1)),
+        place,
+        "brought up to date in place"
+    );
+    world.switch.fail_attempt([2; 32], [2; 16], id);
     signer.run_due().await.unwrap();
     let lapsing = |signer: &Signer| {
         signer
@@ -2414,7 +2420,7 @@ async fn test_renewal_stopped_warns_of_the_open_attempts_it_would_orphan() {
     };
     assert!(!lapsing(&signer), "none left");
     // Open again, then the user renews it: the warning goes with the stop.
-    world.switch.open_attempt([3; 32], [3; 16], id);
+    world.switch.open_attempt([3; 32], [3; 16], id).unwrap();
     signer.run_due().await.unwrap();
     assert!(lapsing(&signer));
     signer.renew(id, CertChange::default()).await.unwrap();

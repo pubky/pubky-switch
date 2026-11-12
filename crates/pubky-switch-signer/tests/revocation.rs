@@ -1638,8 +1638,8 @@ async fn test_revocation_shows_and_warns_of_the_open_attempts_it_orphans() {
     let app = App::new(&["notes"], None, [9; 32]);
     world.approve(&mut signer, &app).await;
     let id = app.keys.app_id_bytes();
-    world.switch.open_attempt([1; 32], [1; 16], id);
-    world.switch.open_attempt([2; 32], [2; 16], id);
+    world.switch.open_attempt([1; 32], [1; 16], id).unwrap();
+    world.switch.open_attempt([2; 32], [2; 16], id).unwrap();
     assert_eq!(signer.open_attempts(id).await.unwrap(), 2);
     let picked = pubky_switch_client::clock::Clock::now_ms(&*world.clock) - 1_000;
     let removed = signer
@@ -1656,8 +1656,8 @@ async fn test_revocation_shows_and_warns_of_the_open_attempts_it_orphans() {
         "{:?}",
         signer.alerts()
     );
-    world.switch.fail_attempt([1; 32], [1; 16]);
-    world.switch.fail_attempt([2; 32], [2; 16]);
+    world.switch.fail_attempt([1; 32], [1; 16], [7; 16]);
+    world.switch.fail_attempt([2; 32], [2; 16], [7; 16]);
     signer.complete_removals().await.unwrap();
     assert!(
         !signer
@@ -1687,4 +1687,127 @@ async fn test_revocation_without_open_attempts_warns_of_none() {
             .iter()
             .any(|alert| matches!(alert, Alert::RevokedWithOpenAttempts { .. }))
     );
+}
+
+/// The warnings `signer` holds of a revoked app's open attempts: each app and its count.
+fn revoked_warnings(signer: &Signer) -> Vec<([u8; 16], u64)> {
+    signer
+        .alerts()
+        .iter()
+        .filter_map(|alert| match alert {
+            Alert::RevokedWithOpenAttempts {
+                app_id,
+                open_attempts,
+            } => Some((*app_id, *open_attempts)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn test_revocation_goes_on_when_the_removal_read_fails() {
+    // The revocation reaches the switch, and the removal's own read of `GET /apps` doesn't
+    // get through: nothing holds it back, and the next run warns of the open attempts and
+    // removes the app (Switch spec 12.2).
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let app = App::new(&["notes"], None, [9; 32]);
+    world.approve(&mut signer, &app).await;
+    let id = app.keys.app_id_bytes();
+    world.switch.open_attempt([1; 32], [1; 16], id).unwrap();
+    // The check before the revocation and the revocation go through; the removal's read
+    // doesn't.
+    world.switch.fail_next(SwitchFault::Unreachable {
+        path: "/apps".into(),
+        after: 2,
+    });
+    signer
+        .revoke(id, None, UserConfirmed::shown_and_confirmed())
+        .await
+        .unwrap_err();
+    assert!(
+        world.switch.app(&id).revoked_at.is_some(),
+        "taken at the switch"
+    );
+    assert!(revoked_warnings(&signer).is_empty());
+    assert!(signer.complete_removals().await.unwrap());
+    assert_eq!(revoked_warnings(&signer), vec![(id, 1)]);
+    assert!(
+        world
+            .switch
+            .identity_doc()
+            .unwrap()
+            .listed_cert(&id)
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn test_revocation_warning_stays_current_once_the_app_is_removed() {
+    // Once the app is removed its revocation is no longer asked for, and the warning it left
+    // is still brought up to date at each read (Switch spec 12.2).
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let app = App::new(&["notes"], None, [9; 32]);
+    world.approve(&mut signer, &app).await;
+    let id = app.keys.app_id_bytes();
+    world.switch.open_attempt([1; 32], [1; 16], id).unwrap();
+    world.switch.open_attempt([2; 32], [2; 16], id).unwrap();
+    signer
+        .revoke(id, None, UserConfirmed::shown_and_confirmed())
+        .await
+        .unwrap();
+    assert_eq!(revoked_warnings(&signer), vec![(id, 2)]);
+    signer.complete_removals().await.unwrap();
+    signer.complete_removals().await.unwrap();
+    assert_eq!(revoked_warnings(&signer), vec![(id, 2)], "still open");
+    world.switch.fail_attempt([1; 32], [1; 16], [7; 16]);
+    signer.run_due().await.unwrap();
+    assert_eq!(
+        revoked_warnings(&signer),
+        vec![(id, 1)],
+        "brought up to date"
+    );
+}
+
+#[tokio::test]
+async fn test_revocation_warning_keeps_its_place_among_the_alerts() {
+    // Alerts are kept oldest first: a held warning brought up to date keeps its place, and a
+    // run that changes nothing writes nothing (Switch spec 12.2).
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let first = App::new(&["notes"], None, [9; 32]);
+    world.approve(&mut signer, &first).await;
+    let second = App::with_keys(
+        pubky_switch_core::keys::AppKeys::from_secrets([5; 32], [6; 32]),
+        &["notes"],
+        None,
+        [8; 32],
+    );
+    world.approve(&mut signer, &second).await;
+    let (a, b) = (first.keys.app_id_bytes(), second.keys.app_id_bytes());
+    world.switch.open_attempt([1; 32], [1; 16], a).unwrap();
+    world.switch.open_attempt([2; 32], [2; 16], a).unwrap();
+    world.switch.open_attempt([3; 32], [3; 16], b).unwrap();
+    for id in [a, b] {
+        signer
+            .revoke(id, None, UserConfirmed::shown_and_confirmed())
+            .await
+            .unwrap();
+    }
+    assert_eq!(revoked_warnings(&signer), vec![(a, 2), (b, 1)]);
+    let place = |signer: &Signer| {
+        signer.alerts().iter().position(
+            |alert| matches!(alert, Alert::RevokedWithOpenAttempts { app_id, .. } if *app_id == a),
+        )
+    };
+    let before = place(&signer);
+    assert!(before < Some(signer.alerts().len() - 1), "not last already");
+    world.switch.fail_attempt([1; 32], [1; 16], [7; 16]);
+    signer.complete_removals().await.unwrap();
+    assert_eq!(revoked_warnings(&signer), vec![(a, 1), (b, 1)], "in place");
+    assert_eq!(place(&signer), before, "its place among all the alerts");
+    let alerts = signer.alerts().to_vec();
+    signer.complete_removals().await.unwrap();
+    assert_eq!(signer.alerts(), alerts.as_slice(), "unchanged");
 }

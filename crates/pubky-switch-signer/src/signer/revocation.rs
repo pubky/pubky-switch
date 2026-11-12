@@ -237,14 +237,21 @@ impl Signer {
         Ok((true, failures))
     }
 
-    /// How many attempts the listed app `app_id` owns that are open or `unknown`, as `GET
-    /// /apps` lists them (Switch wire 7.4.12). The host shows the count before the user
-    /// confirms a revocation: they remain, orphaned, for the identity's other apps or the
-    /// user to resolve (Switch spec 12.2, 10.2). It reads only, and holds no revocation back.
+    /// How many attempts the app `app_id` owns that are open or `unknown`, as `GET /apps` lists
+    /// them (Switch wire 7.4.12); `0` for an App ID it doesn't list. The host shows the count
+    /// before the user confirms a revocation: they remain, the open ones orphaned, for the
+    /// identity's other apps or the user to resolve (Switch spec 12.2, 10.2). It signs nothing
+    /// and holds no revocation back. The read is the records' service's: during a recovery,
+    /// the lost one until the new one has answered its enrollment. As every read of `GET
+    /// /apps` it may commit what the answer shows, such as `AccountNotHosted` raised or
+    /// cleared, or the admission's end owed, and it first finishes deleting the records a
+    /// hand-over that took effect left.
     ///
     /// # Errors
     ///
-    /// [`SignerError::NotNamed`] when another install signs; the switch's error.
+    /// [`SignerError::NotNamed`] when another install signs; [`Refusal::RecordsBehind`];
+    /// [`Refusal::Erased`]; [`SignerError::HandedOver`] once a hand-over took effect; the
+    /// switch's or the store's error.
     pub async fn open_attempts(&mut self, app_id: [u8; 16]) -> Result<u64> {
         self.refresh().await?;
         self.check_named()?;
@@ -264,19 +271,35 @@ impl Signer {
                 apps.push(*app_id);
             }
         }
+        // A held warning keeps its place, its count brought up to date; new ones go last.
         let mut state = self.state.clone();
-        state
-            .alerts
-            .retain(|alert| !matches!(alert, Alert::RevokedWithOpenAttempts { .. }));
         for app_id in apps {
-            let open_attempts = open_attempts_of(statuses, &app_id);
-            if open_attempts > 0 {
-                state.alert(Alert::RevokedWithOpenAttempts {
-                    app_id,
+            let count = open_attempts_of(statuses, &app_id);
+            let held = state.alerts.iter_mut().find_map(|alert| match alert {
+                Alert::RevokedWithOpenAttempts {
+                    app_id: held,
                     open_attempts,
-                });
+                } if *held == app_id => Some(open_attempts),
+                _ => None,
+            });
+            match held {
+                Some(open_attempts) => *open_attempts = count,
+                None if count > 0 => state.alert(Alert::RevokedWithOpenAttempts {
+                    app_id,
+                    open_attempts: count,
+                }),
+                None => {}
             }
         }
+        state.alerts.retain(|alert| {
+            !matches!(
+                alert,
+                Alert::RevokedWithOpenAttempts {
+                    open_attempts: 0,
+                    ..
+                }
+            )
+        });
         if state != self.state {
             self.commit(state, self.flow.clone()).await?;
         }

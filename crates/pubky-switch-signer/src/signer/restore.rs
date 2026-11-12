@@ -180,8 +180,10 @@ impl Signer {
             Vec::new()
         };
         let mut state = self.taken_records(&view, &answer, service, tombstones, cleanup);
-        // In place, the revocations this install asked for stay as they were, with the time
-        // the user picked and their alerts; those only the backup names are added.
+        // In place, the revocations this install asked for stay as they were, with their
+        // alerts; those only the backup names are added. Where both picked a time to distrust
+        // an app from, the earlier wins: after a compromise it trusts less, and two installs
+        // that disagree never trust more than either asked (Switch wire 3.12).
         if in_place {
             for carried in &self.state.revoking {
                 if let Some(rebuilt) = state
@@ -189,7 +191,12 @@ impl Signer {
                     .iter_mut()
                     .find(|r| r.app_id == carried.app_id)
                 {
+                    let backed_up = rebuilt.distrust_from;
                     rebuilt.clone_from(carried);
+                    rebuilt.distrust_from = match (carried.distrust_from, backed_up) {
+                        (Some(own), Some(theirs)) => Some(own.min(theirs)),
+                        (own, theirs) => own.or(theirs),
+                    };
                     state.alerts.retain(|alert| {
                         !matches!(alert, Alert::RevocationPending { app_id, at_switch: false }
                             if *app_id == carried.app_id)
@@ -319,6 +326,7 @@ impl Signer {
                     Alert::RecordsBehind { .. }
                         | Alert::ManagedByOtherInstall { .. }
                         | Alert::RenewalsStopped { .. }
+                        | Alert::LapsingWithOpenAttempts { .. }
                 )
             })
             .cloned()
