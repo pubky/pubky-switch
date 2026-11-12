@@ -27,6 +27,7 @@ mod removal;
 mod renewal;
 mod restore;
 mod retries;
+mod upload;
 mod waiting;
 mod watching;
 
@@ -49,8 +50,9 @@ pub use messaging::messaging;
 pub use pages::pages;
 pub use records::records;
 pub use recovery::{
-    provider_loss, provider_loss_in_place, provider_loss_refusals_in_transit,
-    provider_loss_refused, provider_loss_restored, provider_loss_sender_staged,
+    provider_loss, provider_loss_in_place, provider_loss_in_place_sender,
+    provider_loss_refusals_in_transit, provider_loss_refused, provider_loss_restored,
+    provider_loss_sender_admitted,
 };
 pub use reduction::renewal_drops_scope;
 pub use removal::{departure, revocation};
@@ -60,6 +62,7 @@ pub use retries::{
     app_retries, append_retry, claim_and_read_retries, claim_retries, removal_retries,
     signer_retries,
 };
+pub use upload::recovery_upload_records;
 pub use waiting::{waiting_read, waiting_read_erased};
 pub use watching::watching;
 
@@ -125,11 +128,14 @@ pub const FLOWS: &[(&str, Flow)] = &[
         Box::pin(waiting_read_erased(world))
     }),
     ("provider loss", |world| Box::pin(provider_loss(world))),
-    ("provider loss, a sender while staged", |world| {
-        Box::pin(provider_loss_sender_staged(world))
+    ("provider loss, a sender admitted", |world| {
+        Box::pin(provider_loss_sender_admitted(world))
     }),
     ("provider loss, in place", |world| {
         Box::pin(provider_loss_in_place(world))
+    }),
+    ("provider loss in place, a sender while staged", |world| {
+        Box::pin(provider_loss_in_place_sender(world))
     }),
     ("provider loss, refused", |world| {
         Box::pin(provider_loss_refused(world))
@@ -139,6 +145,9 @@ pub const FLOWS: &[(&str, Flow)] = &[
     }),
     ("provider loss, restored", |world| {
         Box::pin(provider_loss_restored(world))
+    }),
+    ("recovery upload, records", |world| {
+        Box::pin(recovery_upload_records(world))
     }),
 ];
 
@@ -157,6 +166,7 @@ pub fn flow_of(call: &Call) -> Option<&'static str> {
         Call::GetRecord(_) | Call::ListRecords => Some("records"),
         Call::Erase => Some("erasure"),
         Call::RecoveryAdmission => Some("provider loss"),
+        Call::RecoveryUpload => Some("provider loss, a sender admitted"),
         // A restored app lacks the keys of a part it passed before its loss, which went.
         Call::RequestKeys(_) => Some("restore"),
         // Not served yet.
@@ -170,8 +180,7 @@ pub fn flow_of(call: &Call) -> Option<&'static str> {
         | Call::ExportChunk(_)
         | Call::Import
         | Call::ImportChunk(_)
-        | Call::ImportActivate
-        | Call::RecoveryUpload => None,
+        | Call::ImportActivate => None,
     }
 }
 

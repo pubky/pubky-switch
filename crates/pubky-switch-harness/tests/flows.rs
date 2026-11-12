@@ -426,9 +426,7 @@ async fn test_every_served_call_is_listed_and_sent_by_its_flow() {
     // land, and a call that starts being served must be added to it or given a flow.
     assert_eq!(
         waiting,
-        // Its apps send it in the provider-loss flows, whose uploads wait for this call to be
-        // served.
-        vec!["POST /v1/{id}/recovery/upload".to_owned()],
+        Vec::<String>::new(),
         "the served calls no flow sends yet"
     );
 }
