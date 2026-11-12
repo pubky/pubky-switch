@@ -62,7 +62,7 @@ pub use retries::{
     app_retries, append_retry, claim_and_read_retries, claim_retries, removal_retries,
     signer_retries,
 };
-pub use upload::recovery_upload_records;
+pub use upload::{recovery_upload_claim, recovery_upload_records};
 pub use waiting::{waiting_read, waiting_read_erased};
 pub use watching::watching;
 
@@ -145,6 +145,9 @@ pub const FLOWS: &[(&str, Flow)] = &[
     }),
     ("provider loss, restored", |world| {
         Box::pin(provider_loss_restored(world))
+    }),
+    ("recovery upload, a claim rebuilt", |world| {
+        Box::pin(recovery_upload_claim(world))
     }),
     ("recovery upload, records", |world| {
         Box::pin(recovery_upload_records(world))

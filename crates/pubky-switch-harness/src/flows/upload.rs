@@ -2,14 +2,16 @@
 //! step 3, Switch wire 7.4.14): records and claims the lost service held, merged into what
 //! the new one holds, and the refusals of an upload.
 
-use pubky_switch_client::app::{App, AppEvent, RecordTarget};
+use pubky_switch_client::app::{App, AppEvent, ClaimOp, ObligationDeadline, RecordTarget};
 use pubky_switch_client::testing::TestIdentity;
+use pubky_switch_core::claims::{Basis, ClaimView};
 use pubky_switch_signer::{Signer, UserConfirmed};
 use serde_json::json;
 
+use super::claim::view;
 use super::enrollment::enroll;
 use super::join::events;
-use super::messaging::joined_as;
+use super::messaging::{joined, joined_as};
 use super::records::{look, shown};
 use super::recovery::{RECOVERY_ORIGIN, follow_recovery, recovered, upload_of};
 use super::{ORIGIN, STEP_MS};
@@ -253,4 +255,252 @@ fn last_record_read(world: &World, name: &str) -> Option<String> {
         .rev()
         .find(|line| line.label.starts_with(&prefix))?;
     line.facts.get("body.divergent").cloned()
+}
+
+/// The claim's key: any 32 bytes, the same in every world.
+const CLAIM_KEY: [u8; 32] = [0x5a; 32];
+
+/// The attempts' IDs.
+const FIRST_ATTEMPT: [u8; 16] = [1; 16];
+const SECOND_ATTEMPT: [u8; 16] = [2; 16];
+const THIRD_ATTEMPT: [u8; 16] = [3; 16];
+
+/// `app` reads the claim from the switch; the flow notes its view and how many entries
+/// the switch lists, and returns the view.
+async fn read_claim(
+    world: &World,
+    name: &str,
+    app: &mut App,
+) -> Result<ClaimView, Box<dyn std::error::Error>> {
+    let read = app
+        .read_claim(&CLAIM_KEY)
+        .await?
+        .ok_or_else(|| format!("{name}: the switch holds no such claim"))?;
+    world.outcome(
+        name,
+        &json!({
+            "view": view(&read.view),
+            "entries": read.entries.len(),
+            "events": events(&app.take_events()),
+        }),
+    );
+    world.advance_ms(STEP_MS);
+    Ok(read.view)
+}
+
+/// `app` writes `entry`; the flow notes the view the switch answered, and returns it.
+async fn write_entry(
+    world: &World,
+    name: &str,
+    app: &mut App,
+    entry: ClaimOp,
+) -> Result<ClaimView, Box<dyn std::error::Error>> {
+    let written = app
+        .write_claim(entry, Vec::new(), ObligationDeadline::NotKnown)
+        .await?;
+    world.outcome(
+        name,
+        &json!({
+            "view": view(&written.view),
+            "events": events(&app.take_events()),
+        }),
+    );
+    world.advance_ms(STEP_MS);
+    Ok(written.view)
+}
+
+/// `app` reads the claim from the switch: the step it reads at, and how many entries the
+/// switch lists.
+async fn app_read(
+    world: &World,
+    name: &str,
+    app: &mut App,
+) -> Result<(u64, usize), Box<dyn std::error::Error>> {
+    let read = app
+        .read_claim(&CLAIM_KEY)
+        .await?
+        .ok_or_else(|| format!("{name}: the switch holds no such claim"))?;
+    world.outcome(
+        name,
+        &json!({
+            "view": view(&read.view),
+            "entries": read.entries.len(),
+            "steps": read.entries.iter().map(|entry| entry.step).collect::<Vec<_>>(),
+            "events": events(&app.take_events()),
+        }),
+    );
+    world.advance_ms(STEP_MS);
+    Ok((read.view.step, read.entries.len()))
+}
+
+/// Fail the flow unless the evidence upload of alice's app `name` changed one claim.
+fn expect_claim(world: &World, name: &str) -> FlowResult {
+    let upload = upload_of(name);
+    let trace = world.trace();
+    let line = trace
+        .lines
+        .iter()
+        .rev()
+        .filter(|line| line.label == upload)
+        .nth(1)
+        .ok_or_else(|| format!("the {name} sent no evidence upload"))?;
+    let fact = |name: &str| line.facts.get(name).cloned();
+    let shown = (
+        fact("status"),
+        fact("body.result.claims"),
+        fact("body.result.divergent_claims"),
+        fact("body.result.refused"),
+        fact("body.result.unverified"),
+    );
+    let expected = (
+        Some("200".to_owned()),
+        Some("array of 1".to_owned()),
+        Some("array of 0".to_owned()),
+        Some("number 0".to_owned()),
+        Some("number 0".to_owned()),
+    );
+    if shown == expected {
+        Ok(())
+    } else {
+        Err(format!("the {name}'s evidence upload shows {shown:?}, not {expected:?}").into())
+    }
+}
+
+/// A claim rebuilt from uploads. At the service that is lost, alice's wallet attempts a
+/// claim and reports the attempt failed; her phone follows. The wallet attempts again,
+/// which the phone never sees. After the recovery the phone follows first: its upload
+/// brings the first attempt and its outcome, and the new service rebuilds the claim, free
+/// again. The wallet follows next: its upload adds the attempt the phone lacked. Each read
+/// of the claim shows it as rebuilt. The wallet then reports that attempt failed at the
+/// new service: the claim lists that one entry, at the step the uploads left it at, and
+/// none for the steps before. The wallet attempts once more and reports it done, which
+/// settles the claim, and the phone reads it.
+///
+/// Calls: `POST /v1/{id}/recovery/upload` with `claims` (a claim the service holds
+/// nothing for, and an attempt it lacks on a free claim); `GET /v1/{id}/claims/{claim_key}`
+/// for a claim rebuilt from uploads, free, attempting and settled; `POST /v1/{id}/ops`
+/// (`claim` with `failed`, `attempt` and `done`) on a rebuilt claim; `GET /v1/{id}/feed` with `upload` transitions
+/// that list a claim.
+///
+/// # Errors
+///
+/// When a step that should succeed against any switch fails, an upload changes other
+/// claims than its step says, or a read doesn't show the claim as rebuilt.
+pub async fn recovery_upload_claim(world: &World) -> FlowResult {
+    let alice = world.identity("alice")?;
+    world.add_switch(ORIGIN, &[&alice]).await?;
+    let mut signer = enroll(world, &alice, ORIGIN).await?;
+    // The phone first: it then sees the wallet join, and keeps the wallet's certificate,
+    // without which it couldn't upload the wallet's entries.
+    let (mut phone, _) = joined(world, &alice, &mut signer, "phone").await?;
+    let (mut wallet, _) = joined(world, &alice, &mut signer, "wallet").await?;
+    look(world, &mut phone, "the phone saw the wallet join").await?;
+
+    let entries = [
+        (
+            "attempted",
+            ClaimOp::attempt(CLAIM_KEY, 0, FIRST_ATTEMPT, 3_600, None),
+            true,
+        ),
+        ("failed", ClaimOp::failed(CLAIM_KEY, 1, FIRST_ATTEMPT), true),
+        (
+            "attempted again, unseen by the phone",
+            ClaimOp::attempt(CLAIM_KEY, 2, SECOND_ATTEMPT, 3_600, None),
+            false,
+        ),
+    ];
+    for (name, entry, seen) in entries {
+        let written = wallet
+            .write_claim(entry, Vec::new(), ObligationDeadline::NotKnown)
+            .await?;
+        world.outcome(
+            &format!("the wallet {name}"),
+            &json!({
+                "view": view(&written.view),
+                "events": events(&wallet.take_events()),
+            }),
+        );
+        world.advance_ms(STEP_MS);
+        if seen {
+            look(world, &mut phone, &format!("the phone followed: {name}")).await?;
+        }
+    }
+
+    lose_and_recover(world, &alice, &mut signer).await?;
+
+    follow_recovery(world, &mut phone, "phone", 1).await?;
+    expect_claim(world, "phone")?;
+    let rebuilt = read_claim(
+        world,
+        "the phone read the claim, rebuilt from its upload",
+        &mut phone,
+    )
+    .await?;
+    if !rebuilt.rebuilt || rebuilt.attempt_id.is_some() {
+        return Err("the claim the phone's upload rebuilt isn't rebuilt and free".into());
+    }
+
+    follow_recovery(world, &mut wallet, "wallet", 1).await?;
+    expect_claim(world, "wallet")?;
+    let attempting = read_claim(
+        world,
+        "the wallet read the claim, its second attempt added",
+        &mut wallet,
+    )
+    .await?;
+    if !attempting.rebuilt || attempting.attempt_id != Some(SECOND_ATTEMPT) {
+        return Err("the claim doesn't hold the wallet's uploaded attempt as current".into());
+    }
+
+    // Entries written at the new service: the claim then lists them, from the step the
+    // uploads left it at, with none for the steps before.
+    let failed = write_entry(
+        world,
+        "the wallet reported its uploaded attempt failed, at the new service",
+        &mut wallet,
+        ClaimOp::failed(CLAIM_KEY, attempting.step, SECOND_ATTEMPT),
+    )
+    .await?;
+    let read = app_read(
+        world,
+        "the wallet read the claim, with one entry",
+        &mut wallet,
+    )
+    .await?;
+    if read != (failed.step, 1) {
+        return Err(format!(
+            "the rebuilt claim reads at step {} with {} entries, not at {} with 1",
+            read.0, read.1, failed.step
+        )
+        .into());
+    }
+    // After a loss an app attempts nothing until its reconciliation is over (Switch spec
+    // 12.6 steps 5 and 6): here the user confirms it is.
+    wallet
+        .end_reconcile(pubky_switch_client::app::UserConfirmed::new())
+        .await?;
+    world.outcome(
+        "the wallet's reconciliation ended",
+        &json!({ "reconcile_mode": wallet.reconcile_mode() }),
+    );
+    let again = write_entry(
+        world,
+        "the wallet attempted again at the new service",
+        &mut wallet,
+        ClaimOp::attempt(CLAIM_KEY, failed.step, THIRD_ATTEMPT, 3_600, None),
+    )
+    .await?;
+    write_entry(
+        world,
+        "the wallet reported that attempt done",
+        &mut wallet,
+        ClaimOp::done(CLAIM_KEY, again.step, THIRD_ATTEMPT, Basis::Owner, None)?,
+    )
+    .await?;
+    look(world, &mut phone, "the phone followed the claim's end").await?;
+    let read = read_claim(world, "the phone read the settled claim", &mut phone).await?;
+    if !read.rebuilt {
+        return Err("the settled claim no longer reads as rebuilt".into());
+    }
+    Ok(())
 }
