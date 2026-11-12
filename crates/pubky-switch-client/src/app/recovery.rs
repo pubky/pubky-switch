@@ -536,6 +536,13 @@ impl App {
         // were read at, key them, so nothing of them is written again here.
         if self.state.pending_record.take().is_some() {
             tx.delete(key::PENDING_RECORD)?;
+            // The re-registration carries the record, so its answer delivers it: what the
+            // Homeserver is owed, it is owed from then on.
+            let record = self.state.record.clone();
+            self.owe_publish(&record, &mut tx)?;
+            if self.config.publishes_record {
+                self.state.pending_publish = Some(record);
+            }
         }
         // Reconcile mode until the protocol's reconciliation ends it (Switch spec 12.6 step 5).
         let restore = self.state.restore.get_or_insert(RestoreState {

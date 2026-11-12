@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use pubky_switch::limits::Limits;
 use pubky_switch_client::TransportError;
-use pubky_switch_client::app::{AppEnv, HomeserverReader};
+use pubky_switch_client::app::{AppEnv, HomeserverReader, HomeserverWriter};
 use pubky_switch_client::clock::{Clock, TestClock};
 use pubky_switch_client::store::{StateStore, StoreHandle};
 use pubky_switch_client::testing::{
@@ -303,13 +303,15 @@ impl World {
         Arc::new(MemoryVault(Mutex::new(None)))
     }
 
-    /// The environment of an app on `store`: this world's transport, clock and Homeservers.
+    /// The environment of an app on `store`: this world's transport, clock and Homeservers,
+    /// which it reads, and writes its record to when it publishes one.
     pub fn app_env(&self, store: Arc<dyn StateStore>) -> AppEnv {
         AppEnv {
             store: StoreHandle::inline(store),
             transport: self.transport(),
             clock: self.clock.clone() as Arc<dyn Clock>,
             homeserver: self.files.clone() as Arc<dyn HomeserverReader>,
+            homeserver_writer: Some(self.files.clone() as Arc<dyn HomeserverWriter>),
         }
     }
 

@@ -421,6 +421,12 @@ pub enum AppEvent {
         /// The new certificate's `issued_at`.
         issued_at: u64,
     },
+    /// The switch holds the app's record and its Homeserver write failed: it stays owed,
+    /// and goes again at the next read or with the next change (Switch spec 4.2).
+    RecordPublishFailed {
+        /// Why the write failed.
+        error: String,
+    },
     /// The own app was revoked or recorded as departed: it is no longer current.
     Removed,
     /// Continuity since the verified position couldn't be verified: the app continued

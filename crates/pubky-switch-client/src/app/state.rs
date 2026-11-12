@@ -104,6 +104,8 @@ pub(crate) mod key {
     pub(crate) const SERVICE_TIME: &str = "service_time";
     pub(crate) const PENDING_EFFECT: &str = "pending/effect";
     pub(crate) const PENDING_RECORD: &str = "pending/record";
+    /// The record the switch holds, owed to the Homeserver.
+    pub(crate) const PENDING_PUBLISH: &str = "pending/publish";
     /// The ID the next duty event takes.
     pub(crate) const DUTY_NEXT: &str = "dutyn";
     /// The store's event epoch.

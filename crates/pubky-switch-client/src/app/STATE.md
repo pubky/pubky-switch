@@ -12,7 +12,9 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
 - **Sign once, commit, send, commit the outcome.** A signed artifact goes into the store
   before it is first sent, and is resent byte for byte until answered (Switch wire 2.1).
   Examples: the join batch (`join`), a registration (`rk/<n>.pending`), a received message's
-  effect (`pending/effect`), a record delivery (`pending/record`).
+  effect (`pending/effect`), a record delivery (`pending/record`). A record is published on
+  the Homeserver only once its delivery's answer is committed (`pending/publish`), in the
+  bytes the switch holds.
 - **The cursor moves only with, or after, what it covers** (Switch spec 8.2, 11). The
   effect's batch carries the cursor move, with the record writes and claim entries the
   protocol added through its receive context. The processed pair, what the batch's
@@ -177,6 +179,7 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
 | `join` | the join step: the registration batch while it is owed | |
 | `pending/effect` | a received message's effect batch and its outcome writes, with the deadlines of the claims it writes, and the opened entry, to store it locally if the batch outlives the batch ID window; its local writes are kept in base64 (`kept_local`), and the form with arrays of numbers written before still reads | yes |
 | `pending/record` | an `app.put` batch | |
+| `pending/publish` | the app record the switch holds and the Homeserver is still owed, for an app that publishes its record; written in the commit that records the delivery's answer, and gone once the Homeserver write is answered | |
 | `alarm` | the alarm that stopped the app | |
 | `restore` | after a restore: the backup's highest `n`, the key check, the end of the registrations the restore asks about (set at the key check: the key it registered, or one above the backup's highest when the restored key was current), reconcile mode; it goes when reconciliation ends with the key check done, and no registration is judged by the restore rule after. Before the key check the app reads its directory: it takes the own `identity.json` there if newer than the backup's, and the certificate that lists from its own record, under the renewal checks, so a renewal another device of the app took since, whose `cert.put` is a stub by then, is taken at the first read | |
 | `leave` | a leave in progress or done | |

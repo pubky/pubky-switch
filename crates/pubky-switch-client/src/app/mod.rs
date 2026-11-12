@@ -21,7 +21,8 @@
 //! ([`App::sign_message`]), or alone ([`App::protocol_commit`]).
 //!
 //! Async is used only at the network edge: the switch, through the base client, the store,
-//! through [`StoreHandle`], and the Homeserver, through [`HomeserverReader`].
+//! through [`StoreHandle`], and the Homeserver, through [`HomeserverReader`] and, for an
+//! app that publishes its record, [`HomeserverWriter`].
 //!
 //! Moves, provider loss and recovery, revocation and erasure as an app sees them, and push
 //! with its peek, are in `provider.rs`, `recovery.rs`, `push.rs` and `peek.rs`.
@@ -41,6 +42,7 @@ mod feed;
 mod identity;
 mod kept;
 mod keys;
+mod own_record;
 mod parked;
 mod peek;
 mod protocol;
@@ -72,6 +74,7 @@ pub use events::{
 pub use feed::{ReceiveReport, SENDER_REREAD_MS};
 pub use identity::{DOC_CACHE_MS, HomeserverReader, IdentityRefresh, REVALIDATION_MS};
 pub use kept::{KeptBatch, KeptBatchDrop, KeptBatchStatus};
+pub use own_record::{HomeserverWriter, Publication};
 pub use parked::{ParkedMessage, ParkedSummary};
 pub use peek::{PeekReport, Peeked};
 pub use protocol::{
@@ -184,8 +187,9 @@ pub struct AppConfig {
     pub cursor_defer_ms: u64,
     /// Items per feed page, 1 to 500.
     pub page_size: u32,
-    /// Whether the app publishes its record on the Homeserver; such an app leaves in two
-    /// steps (Switch spec 12.3).
+    /// Whether the app publishes its record on the Homeserver, as an app whose protocol
+    /// needs public data does (Switch spec 4.2); such an app leaves in two steps (Switch spec
+    /// 12.3). It needs [`AppEnv::homeserver_writer`].
     pub publishes_record: bool,
 }
 
@@ -216,8 +220,8 @@ impl AppConfig {
     }
 }
 
-/// What an app runs on: the host's store, the transport to its switch, the clock and the
-/// Homeserver reader.
+/// What an app runs on: the host's store, the transport to its switch, the clock, the
+/// Homeserver reader and, for an app that publishes its record, the Homeserver writer.
 #[derive(Clone)]
 pub struct AppEnv {
     /// The host's store.
@@ -228,6 +232,9 @@ pub struct AppEnv {
     pub clock: Arc<dyn Clock>,
     /// Reads of Homeservers.
     pub homeserver: Arc<dyn HomeserverReader>,
+    /// Writes to the own identity's Homeserver, for an app that publishes its record
+    /// ([`AppConfig::publishes_record`]); `None` for one that doesn't.
+    pub homeserver_writer: Option<Arc<dyn HomeserverWriter>>,
 }
 
 impl std::fmt::Debug for AppEnv {
@@ -524,6 +531,8 @@ pub(crate) struct AppState {
     pub(crate) join: JoinStep,
     pub(crate) pending_effect: Option<PendingEffect>,
     pub(crate) pending_record: Option<PendingRecord>,
+    /// The record the switch holds and the Homeserver is still owed (`pending/publish`).
+    pub(crate) pending_publish: Option<SignedDoc>,
     pub(crate) alarm: Option<Alarm>,
     pub(crate) restore: Option<RestoreState>,
     pub(crate) leave: Option<LeaveState>,
@@ -678,6 +687,7 @@ impl App {
         request: JoinRequest,
     ) -> Result<App, AppError> {
         Box::pin(async move {
+            own_record::check_publisher(&env, &config)?;
             let approved = Approval::read(
                 &request.approval,
                 &request.request,
@@ -775,6 +785,7 @@ impl App {
                 },
                 pending_effect: None,
                 pending_record: None,
+                pending_publish: None,
                 alarm: None,
                 restore: None,
                 leave: None,
@@ -883,8 +894,17 @@ impl App {
         }
         tx.put(key::CURSOR, &self.state.cursor)?;
         tx.put(key::JOIN, &self.state.join)?;
+        // The switch holds the record now: an app that publishes owes it to the Homeserver
+        // (Switch spec 12.1 step 2).
+        let record = renewal::delivered_record(&batch)?;
+        self.owe_publish(&record, &mut tx)?;
         self.state.chain = Some(view);
-        self.commit(tx).await
+        self.commit(tx).await?;
+        if self.config.publishes_record {
+            self.state.pending_publish = Some(record);
+        }
+        self.publish_owed().await?;
+        Ok(())
     }
 
     /// Load an app from the store alone: nothing is sent. Work left by a crash (a
@@ -901,6 +921,7 @@ impl App {
         app_id: [u8; 16],
     ) -> Result<App, AppError> {
         Box::pin(async move {
+            own_record::check_publisher(&env, &config)?;
             let ns = client_namespace(&app_id);
             let reader = Reader {
                 ns: ns.clone(),
@@ -1006,6 +1027,7 @@ impl App {
             join: reader.get(key::JOIN).await?.ok_or_else(missing)?,
             pending_effect: reader.get(key::PENDING_EFFECT).await?,
             pending_record: reader.get(key::PENDING_RECORD).await?,
+            pending_publish: reader.get(key::PENDING_PUBLISH).await?,
             alarm: reader.get(key::ALARM).await?,
             restore: reader.get(key::RESTORE).await?,
             leave,
@@ -1566,6 +1588,7 @@ impl App {
                 join: JoinStep::Done,
                 pending_effect: None,
                 pending_record: None,
+                pending_publish: None,
                 alarm: None,
                 restore: Some(RestoreState {
                     n_floor,

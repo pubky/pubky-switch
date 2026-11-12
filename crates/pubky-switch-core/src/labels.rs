@@ -3,6 +3,15 @@
 //! Every format the Pubky Switch defines signs and derives under a `pubky-switch/v1/` label.
 //! A protocol on the Switch uses labels of its own, never one of these (Switch spec 1).
 
+/// The start of every label the Pubky Switch defines (Switch spec 13.2, Switch wire 2.3).
+pub const PREFIX: &str = "pubky-switch/v1/";
+
+/// Whether `label` is under [`PREFIX`]: one of the Switch's labels, now or later, which a
+/// protocol's own formats never sign under (Switch spec 13.2 "Labels").
+pub fn is_switch_label(label: &str) -> bool {
+    label.starts_with(PREFIX)
+}
+
 /// Signature labels (Switch wire 2.3).
 pub mod sig {
     /// App certificate, signed by the identity key.
@@ -85,4 +94,52 @@ pub mod derive {
     pub const ITEM: &str = "pubky-switch/v1/item";
     /// Chain hashes, the first part of their `lp()` (Switch wire 6.6).
     pub const CHAIN: &str = "pubky-switch/v1/chain";
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_switch_label_every_signature_label() {
+        for label in [
+            sig::APP_CERT,
+            sig::APP_RECORD,
+            sig::RECEIVE_KEY,
+            sig::IDENTITY,
+            sig::ENROLL,
+            sig::APP_REQUEST,
+            sig::KEY_BUNDLE,
+            sig::SIGNER_HANDOVER,
+            sig::SIGNER_BACKUP,
+            sig::FREEZE,
+            sig::UNFREEZE,
+            sig::DISCARDED,
+            sig::EXPORT_TRANSFER,
+            sig::TRANSFER_REQUEST,
+            sig::MSG,
+            sig::HTTP,
+            sig::HTTP_RESPONSE,
+            sig::OP,
+            sig::SERVICE_OP,
+            sig::PROOF,
+            sig::HEAD,
+            sig::EXPORT_MANIFEST,
+            sig::PUSH,
+        ] {
+            assert!(is_switch_label(label), "{label}");
+        }
+    }
+
+    #[test]
+    fn test_switch_label_refuses_other_labels() {
+        for label in [
+            "sample/v1/grant",
+            "pubky-switch/v2/x",
+            "pubky-switch/v1",
+            "",
+        ] {
+            assert!(!is_switch_label(label), "{label}");
+        }
+    }
 }

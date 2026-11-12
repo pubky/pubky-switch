@@ -1085,6 +1085,13 @@ impl App {
         let events = self.carry_kept_writes(&mut tx, carry).await?;
         if self.state.pending_record.take().is_some() {
             tx.delete(key::PENDING_RECORD)?;
+            // The re-registration carries the record, so its answer delivers it: what the
+            // Homeserver is owed, it is owed from then on.
+            let record = self.state.record.clone();
+            self.owe_publish(&record, &mut tx)?;
+            if self.config.publishes_record {
+                self.state.pending_publish = Some(record);
+            }
         }
         // A loss followed before, its kept batch unanswered, goes on at this generation.
         if let Some(mut loss) = self.loss_record().await?

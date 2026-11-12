@@ -15,7 +15,7 @@ use pubky_switch_core::sig::SignedDoc;
 
 use super::events::AppEvent;
 use super::state::{PendingRecord, Tx, key};
-use super::{App, AppError};
+use super::{App, AppError, Publication};
 use crate::client::Batch;
 use crate::error::ClientError;
 
@@ -106,7 +106,7 @@ impl App {
     /// The `app.put` batch. It is kept and may be sent again after the cursor moved on: a
     /// cursor move in it could take the service's cursor back, so it carries none (Switch
     /// spec 8.2).
-    fn record_batch(&self, record: &SignedDoc) -> Result<Batch, AppError> {
+    pub(crate) fn record_batch(&self, record: &SignedDoc) -> Result<Batch, AppError> {
         self.sign_ops(
             vec![(
                 Vec::<Condition>::new(),
@@ -120,12 +120,14 @@ impl App {
 
     /// Send the kept `app.put` until answered. A `409 conflict` naming a record of this app
     /// with an `updated_at` at or after this one's (another device's) is written again
-    /// once, later than the held one (Switch spec 4.2).
-    pub(crate) async fn deliver_record(&mut self) -> Result<(), AppError> {
+    /// once, later than the held one (Switch spec 4.2). Once the switch holds the record,
+    /// an app that publishes owes it to the Homeserver, in the commit that records the
+    /// answer, and writes it there (`own_record.rs`).
+    pub(crate) async fn deliver_record(&mut self) -> Result<Publication, AppError> {
         let Some(pending) = self.state.pending_record.clone() else {
-            return Ok(());
+            return self.publish_owed().await;
         };
-        let batch = Batch::from_body(pending.body)?;
+        let mut batch = Batch::from_body(pending.body)?;
         let result = self.submit(&batch).await;
         let held = match result {
             Ok(_) => None,
@@ -152,7 +154,7 @@ impl App {
                 .max(held.updated_at().saturating_add(1))
                 .max(mine.updated_at().saturating_add(1));
             let record = AppRecord::sign(&self.state.keys, body)?;
-            let batch = self.record_batch(record.signed())?;
+            batch = self.record_batch(record.signed())?;
             let mut tx = self.tx()?;
             tx.put(key::RECORD, record.signed())?;
             let pending = PendingRecord {
@@ -164,11 +166,17 @@ impl App {
             self.commit(tx).await?;
             self.submit(&batch).await?;
         }
+        let delivered = delivered_record(&batch)?;
         let mut tx = self.tx()?;
         tx.delete(key::PENDING_RECORD)?;
         tx.put(key::CURSOR, &self.state.cursor)?;
+        self.owe_publish(&delivered, &mut tx)?;
         self.state.pending_record = None;
-        self.commit(tx).await
+        self.commit(tx).await?;
+        if self.config.publishes_record {
+            self.state.pending_publish = Some(delivered);
+        }
+        self.publish_owed().await
     }
 
     /// The listed certificate from the own record in the directory, when the own
@@ -234,4 +242,16 @@ pub(crate) enum Listed {
     Key(Option<pubky_switch_core::records::ReceiveKeyRecord>),
     /// The newest own `identity.json` removes the app or names another generation.
     NotCurrentHere,
+}
+
+/// The record a kept `app.put` batch delivers.
+pub(crate) fn delivered_record(batch: &Batch) -> Result<SignedDoc, AppError> {
+    batch
+        .ops()
+        .iter()
+        .find_map(|op| match &op.body().kind {
+            OpKind::AppPut { record } => Some(record.clone()),
+            _ => None,
+        })
+        .ok_or_else(|| AppError::InvalidData("a kept app.put batch carries no record".into()))
 }
