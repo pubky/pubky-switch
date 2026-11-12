@@ -435,6 +435,7 @@ impl App {
             if !report.stopped {
                 self.reread_claims().await?;
                 self.reread_records().await?;
+                self.fetch_entry_writers().await?;
             }
             self.delete_retired_keys().await?;
             self.forget_chain_behind_cursor().await?;

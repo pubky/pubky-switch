@@ -411,6 +411,10 @@ pub struct SharedEvidence {
     pub ops: Vec<KeptOp>,
     /// The SETTLED and tombstone proofs kept.
     pub proofs: Vec<SignedDoc>,
+    /// The claim entries kept without a certificate of their writer that verifies them, so
+    /// left out of `ops`: an upload carries each entry with its writer's certificate
+    /// (Switch wire 7.4.14).
+    pub claim_entries_left_out: u64,
 }
 
 impl std::fmt::Debug for SharedEvidence {
@@ -791,9 +795,13 @@ impl App {
                 })
             })
             .collect();
-        let (claim_ops, proofs) = self.claim_evidence_items().await?;
+        let (claim_ops, proofs, claim_entries_left_out) = self.claim_evidence_items().await?;
         ops.extend(claim_ops);
-        Ok(SharedEvidence { ops, proofs })
+        Ok(SharedEvidence {
+            ops,
+            proofs,
+            claim_entries_left_out,
+        })
     }
 
     /// The protocol's mark of what the app has seen in record `key`, its high water.

@@ -162,6 +162,10 @@ pub struct RecoveryInfo {
     /// [`super::MAX_LOSS_CONVERSATIONS`] the app didn't add back: their writes are refused
     /// `403 not_admitted` until a write of the app's admits them again (Switch spec 7).
     pub conversations_left_out: u64,
+    /// How many claim entries the app's upload left out for want of a certificate of their
+    /// writer that verifies them ([`super::SharedEvidence::claim_entries_left_out`]): the
+    /// writer's own app uploads them, if it still holds them.
+    pub claim_entries_left_out: u64,
 }
 
 /// The steps of following a loss, in order.
@@ -200,6 +204,9 @@ pub(crate) struct LossRecord {
     /// added back.
     #[serde(default)]
     pub(crate) conversations_left_out: u64,
+    /// How many kept claim entries the upload left out, without a certificate.
+    #[serde(default)]
+    pub(crate) claim_entries_left_out: u64,
 }
 
 impl LossRecord {
@@ -410,6 +417,7 @@ impl App {
             loss: loss.view(),
             steps_done: loss.done(),
             conversations_left_out: loss.conversations_left_out,
+            claim_entries_left_out: loss.claim_entries_left_out,
         }))
     }
 
@@ -561,6 +569,7 @@ impl App {
             batch: batch.body().to_vec(),
             conversations: Vec::new(),
             conversations_left_out: 0,
+            claim_entries_left_out: 0,
         };
         tx.put(keys::LOSS, &loss)?;
         tx.put(key::META, &self.state.meta)?;
@@ -608,7 +617,7 @@ impl App {
                 loss.step = LossStep::Upload;
             }
             LossStep::Upload => {
-                self.loss_upload(loss).await?;
+                loss.claim_entries_left_out = self.loss_upload(loss).await?;
                 loss.step = LossStep::Lists;
             }
             LossStep::Lists => {
@@ -801,8 +810,10 @@ impl App {
     }
 
     /// Step 3: upload what the app holds, before its first record write at the new service
-    /// (Switch wire 7.4.14). A refusal is reported and the recovery goes on.
-    async fn loss_upload(&mut self, loss: &LossRecord) -> Result<(), AppError> {
+    /// (Switch wire 7.4.14). A refusal is reported and the recovery goes on. Returns how
+    /// many kept claim entries it left out, without a certificate of their writer.
+    async fn loss_upload(&mut self, loss: &LossRecord) -> Result<u64, AppError> {
+        let left_out = self.shared_evidence().await?.claim_entries_left_out;
         let (records, claims) = self.kept_ops().await?;
         let proofs = self.kept_proofs(None).await?;
         let heads: Vec<SignedHead> = match &loss.newest_head {
@@ -810,7 +821,7 @@ impl App {
             None => Vec::new(),
         };
         if records.is_empty() && claims.is_empty() && proofs.is_empty() && heads.is_empty() {
-            return Ok(());
+            return Ok(left_out);
         }
         let upload = RecoveryUpload {
             lost_identity: self.generation_doc(loss.lost_generation).await?,
@@ -820,7 +831,8 @@ impl App {
             proofs,
             lists: None,
         };
-        self.upload_here(&upload).await
+        self.upload_here(&upload).await?;
+        Ok(left_out)
     }
 
     /// Step 2: the app's copy of the lists, as its permissions allow (Switch spec 12.6
@@ -956,6 +968,7 @@ mod tests {
             batch: Vec::new(),
             conversations: Vec::new(),
             conversations_left_out: 0,
+            claim_entries_left_out: 0,
         }
     }
 

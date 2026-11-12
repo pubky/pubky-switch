@@ -52,6 +52,7 @@ mod rotation;
 mod state;
 mod unverified;
 mod uploaded;
+mod writer_certs;
 
 mod admission;
 mod batch;
