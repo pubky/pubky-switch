@@ -536,13 +536,6 @@ impl App {
         // were read at, key them, so nothing of them is written again here.
         if self.state.pending_record.take().is_some() {
             tx.delete(key::PENDING_RECORD)?;
-            // The re-registration carries the record, so its answer delivers it: what the
-            // Homeserver is owed, it is owed from then on.
-            let record = self.state.record.clone();
-            self.owe_publish(&record, &mut tx)?;
-            if self.config.publishes_record {
-                self.state.pending_publish = Some(record);
-            }
         }
         // Reconcile mode until the protocol's reconciliation ends it (Switch spec 12.6 step 5).
         let restore = self.state.restore.get_or_insert(RestoreState {
@@ -697,20 +690,23 @@ impl App {
     /// its own, and its record goes alone, signed once and kept, since the conflict applied
     /// nothing. A key no device of the app made is a compromise: the app stops and leaves.
     async fn loss_register(&mut self, loss: &mut LossRecord) -> Result<(), AppError> {
-        let proofs = loop {
+        // The record the new service accepted, if it did: the batch applied, now or at an
+        // earlier try whose answer was lost (Switch spec 4.2).
+        let (proofs, accepted) = loop {
             let batch = Batch::from_body(loss.batch.clone())?;
+            let carried = super::renewal::delivered_record(&batch)?;
             let registers = batch
                 .ops()
                 .iter()
                 .any(|op| matches!(op.body().kind, OpKind::ReceiveKeyPut { .. }));
             let current = match self.submit(&batch).await {
-                Ok(submitted) => break submitted.proofs,
+                Ok(submitted) => break (submitted.proofs, Some(carried)),
                 // The record alone: the service holds it, or a later one of the app's
                 // (Switch spec 4.2).
                 Err(AppError::Switch(ClientError::Switch {
                     code: ErrorCode::Conflict,
                     ..
-                })) if !registers => break Vec::new(),
+                })) if !registers => break (Vec::new(), None),
                 Err(AppError::Switch(ClientError::Switch {
                     code: ErrorCode::Conflict,
                     current,
@@ -721,7 +717,7 @@ impl App {
             let named = self.conflict_receive_key(&current).await?;
             let ours = self.state.receive_keys.get(&loss.key_n).map(|h| h.key.kid);
             if Some(named.kid()) == ours {
-                break Vec::new();
+                break (Vec::new(), Some(carried));
             }
             self.registered_elsewhere(loss.key_n, &named).await?;
             loss.key_n = named.n();
@@ -740,6 +736,9 @@ impl App {
             self.commit(tx).await?;
         };
         let mut tx = self.tx()?;
+        if let Some(record) = &accepted {
+            self.note_accepted(record, &mut tx)?;
+        }
         if let Some(proof) = proofs.get(1)
             && let Some(held) = self.state.receive_keys.get_mut(&loss.key_n)
         {
@@ -761,7 +760,11 @@ impl App {
         }
         loss.declared_at_ms = Some(self.recovery_time().await?);
         loss.batch.clear();
-        self.commit(tx).await
+        self.commit(tx).await?;
+        if let Some(record) = accepted {
+            self.took_accepted(record);
+        }
+        Ok(())
     }
 
     /// The recovery record's time: the first item of the new sequence, checked against the

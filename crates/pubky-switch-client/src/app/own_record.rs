@@ -57,7 +57,22 @@ pub trait HomeserverWriter: Send + Sync {
         path: String,
         bytes: Vec<u8>,
     ) -> BoxFuture<'_, Result<(), TransportError>>;
+
+    /// Delete the file at `path` on `identity`'s Homeserver; one that isn't there is
+    /// deleted already.
+    ///
+    /// # Errors
+    ///
+    /// A [`TransportError`] when the Homeserver can't be written now.
+    fn delete(&self, identity: [u8; 32], path: String)
+    -> BoxFuture<'_, Result<(), TransportError>>;
 }
+
+/// How often, at most, an app that owes no publication reads its Homeserver copy to compare
+/// it with the newest record the switch accepted: the readers' cache of 10 minutes
+/// ([`super::DOC_CACHE_MS`]), the app's choice. [`App::publish_record`] reads it whenever
+/// called.
+pub const PUBLISHED_CHECK_MS: u64 = super::DOC_CACHE_MS;
 
 /// Where the app's record stands on the Homeserver after a call (Switch spec 4.2).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -67,8 +82,12 @@ pub enum Publication {
     NotPublishing,
     /// The Homeserver holds the record the switch holds: nothing is owed.
     Published,
-    /// The switch holds the record, and its Homeserver write failed: it stays owed, and goes
-    /// again at the next read or with the next change.
+    /// The Homeserver holds a record of the app with a later `updated_at` than the newest
+    /// the switch accepted, as after a restore from an older backup: nothing is written over
+    /// it (Switch spec 4.2).
+    Superseded,
+    /// The switch holds the record, and its Homeserver read or write failed: it stays owed,
+    /// and goes again at the next read or with the next change.
     Owed {
         /// Why the write failed.
         error: TransportError,
@@ -150,8 +169,11 @@ impl App {
         .await
     }
 
-    /// Send what is owed of the app's record: its delivery, then its Homeserver write. A read
-    /// ([`App::receive`]) does the same.
+    /// Send what is owed of the app's record: its delivery, then its Homeserver write. The
+    /// Homeserver copy is read and, when it differs from the newest record the switch
+    /// accepted, that record is written again, unless the copy is later. A read
+    /// ([`App::receive`]) does the same, reading the copy at most once per
+    /// [`PUBLISHED_CHECK_MS`] while nothing is owed.
     ///
     /// # Errors
     ///
@@ -161,6 +183,8 @@ impl App {
         Box::pin(async move {
             self.ready_local().await?;
             self.refuse_when_stopped()?;
+            // The copy is read whatever the last check.
+            self.published_checked_ms = None;
             self.deliver_record().await
         })
         .await
@@ -229,44 +253,120 @@ impl App {
         self.deliver_record().await
     }
 
-    /// Keep `record`, which the switch now holds, to be published, in `tx`: for an app that
-    /// publishes, the commit that records its delivery owes its Homeserver write.
-    pub(crate) fn owe_publish(
+    /// Keep `record`, which the switch has just accepted, as the newest accepted record, in
+    /// `tx`, the commit that records the acceptance; for an app that publishes, owe its
+    /// Homeserver write there too (Switch spec 4.2). A record the switch refused is never
+    /// noted.
+    pub(crate) fn note_accepted(
         &self,
         record: &SignedDoc,
         tx: &mut super::state::Tx,
     ) -> Result<(), AppError> {
+        tx.put(key::ACCEPTED_RECORD, record)?;
         if self.config.publishes_record {
             tx.put(key::PENDING_PUBLISH, record)?;
         }
         Ok(())
     }
 
-    /// Write the owed record to the Homeserver, the bytes the switch holds, and commit that
-    /// nothing is owed. A write that fails stays owed and is reported
+    /// After the commit of [`App::note_accepted`]: the same in memory.
+    pub(crate) fn took_accepted(&mut self, record: SignedDoc) {
+        if self.config.publishes_record {
+            self.state.pending_publish = Some(record.clone());
+        }
+        self.state.accepted = Some(record);
+    }
+
+    /// Publish the newest record the switch accepted, when it is owed or the Homeserver
+    /// copy differs from it (Switch spec 4.2, wire 3.2 "Deliver, then publish"). The copy
+    /// is read first: one that is the record already settles what is owed, and one with a
+    /// later `updated_at`, as after a restore from an older backup, is never written over
+    /// ([`Publication::Superseded`]). With nothing owed the copy is read at most once per
+    /// [`PUBLISHED_CHECK_MS`], unless `check`. Nothing is published once the app has begun
+    /// to leave, from the commit before it deletes its Homeserver record (Switch spec
+    /// 12.3). A read or write that fails leaves the publication owed and is reported
     /// ([`AppEvent::RecordPublishFailed`]); only the store's failure is an error.
-    pub(crate) async fn publish_owed(&mut self) -> Result<Publication, AppError> {
-        if !self.config.publishes_record {
+    pub(crate) async fn publish_owed(&mut self, check: bool) -> Result<Publication, AppError> {
+        if !self.config.publishes_record || self.state.leave.is_some() {
             return Ok(Publication::NotPublishing);
         }
-        let Some(record) = self.state.pending_publish.clone() else {
+        let Some(record) = self.state.accepted.clone() else {
             return Ok(Publication::Published);
         };
+        let owed = self.state.pending_publish.is_some();
+        let now = self.now();
+        let checked_lately = self
+            .published_checked_ms
+            .is_some_and(|at| at <= now && now - at < PUBLISHED_CHECK_MS);
+        if !owed && !check && checked_lately {
+            return Ok(Publication::Published);
+        }
         let writer = self.publisher()?;
+        let identity = self.state.meta.identity;
+        let path = app_record_path(&self.state.meta.app_id);
         let bytes = serde_json::to_vec(&record)
             .map_err(|_| AppError::InvalidData("the record doesn't serialize".into()))?;
-        let path = app_record_path(&self.state.meta.app_id);
-        if let Err(error) = writer.put(self.state.meta.identity, path, bytes).await {
-            self.events.push(AppEvent::RecordPublishFailed {
-                error: error.to_string(),
-            });
-            return Ok(Publication::Owed { error });
+        let copy = match self.env.homeserver.get(identity, path.clone()).await {
+            Ok(copy) => copy,
+            Err(error) => return Ok(self.publication_failed(error)),
+        };
+        self.published_checked_ms = Some(now);
+        let outcome = match copy {
+            Some(held) if held == bytes => Publication::Published,
+            Some(held) if self.later_copy(&held, &record) => Publication::Superseded,
+            _ => {
+                if let Err(error) = writer.put(identity, path, bytes).await {
+                    return Ok(self.publication_failed(error));
+                }
+                Publication::Published
+            }
+        };
+        if owed {
+            let mut tx = self.tx()?;
+            tx.delete(key::PENDING_PUBLISH)?;
+            self.commit(tx).await?;
+            self.state.pending_publish = None;
         }
-        let mut tx = self.tx()?;
-        tx.delete(key::PENDING_PUBLISH)?;
-        self.commit(tx).await?;
-        self.state.pending_publish = None;
-        Ok(Publication::Published)
+        Ok(outcome)
+    }
+
+    /// A publication that couldn't be made now: reported, and owed.
+    fn publication_failed(&mut self, error: TransportError) -> Publication {
+        self.events.push(AppEvent::RecordPublishFailed {
+            error: error.to_string(),
+        });
+        Publication::Owed { error }
+    }
+
+    /// Whether the Homeserver copy `held` is a record of this app with an `updated_at`
+    /// later than `record`'s. A copy that doesn't read as one is written over.
+    fn later_copy(&self, held: &[u8], record: &SignedDoc) -> bool {
+        let identity = self.state.meta.identity;
+        let Ok(held) = serde_json::from_slice::<SignedDoc>(held) else {
+            return false;
+        };
+        let (Ok(held), Ok(record)) = (
+            AppRecord::verify(&held, &identity),
+            AppRecord::verify(record, &identity),
+        ) else {
+            return false;
+        };
+        held.cert().app_id() == self.state.meta.app_id && held.updated_at() > record.updated_at()
+    }
+
+    /// The first step of a publishing app's leave (Switch spec 12.3): delete its Homeserver
+    /// record. The leave's state is committed before, so nothing republishes it after,
+    /// across a restart too.
+    pub(crate) async fn unpublish_to_leave(&mut self) -> Result<(), AppError> {
+        if !self.config.publishes_record {
+            return Ok(());
+        }
+        let writer = self.publisher()?;
+        let path = app_record_path(&self.state.meta.app_id);
+        writer
+            .delete(self.state.meta.identity, path)
+            .await
+            .map_err(AppError::Transport)
     }
 
     /// The Homeserver writer of an app that publishes its record.

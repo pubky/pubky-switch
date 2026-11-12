@@ -10,7 +10,9 @@ use pubky_switch_core::sig::SignedDoc;
 use serde_json::Map;
 
 use super::*;
-use crate::app::{AppError, AppEvent, LeaveMode, Publication, Refusal, UserConfirmed};
+use crate::app::{
+    AppError, AppEvent, LeaveMode, PUBLISHED_CHECK_MS, Publication, Refusal, UserConfirmed,
+};
 use crate::store::{Fault as StoreFault, FaultStore};
 use crate::testing::Fault;
 
@@ -490,7 +492,7 @@ async fn test_own_record_homeserver_failure_at_a_read_doesnt_fail_it() {
 }
 
 #[tokio::test]
-async fn test_own_record_homeserver_lost_answer_writes_the_same_bytes_again() {
+async fn test_own_record_homeserver_lost_answer_is_settled_by_the_copy() {
     let w = World::new();
     let mut app = w.join_publishing("wallet").await;
     let id = app.app_id();
@@ -502,8 +504,11 @@ async fn test_own_record_homeserver_lost_answer_writes_the_same_bytes_again() {
     assert!(matches!(publication, Publication::Owed { .. }));
     let writes = w.record_writes(id);
     assert_eq!(w.published(id), Some(bytes_of(app.record())));
+    // The copy read first is the record already: nothing more is written, and nothing is
+    // owed from then on.
     assert_eq!(app.publish_record().await.unwrap(), Publication::Published);
-    assert_eq!(w.record_writes(id), writes + 1);
+    assert_eq!(w.record_writes(id), writes);
+    assert!(app.state.pending_publish.is_none());
     assert_eq!(w.published(id), Some(bytes_of(app.record())));
 }
 
@@ -597,7 +602,7 @@ async fn test_own_record_crash_after_the_answer_is_kept_publishes_on_load() {
 }
 
 #[tokio::test]
-async fn test_own_record_crash_after_publishing_writes_again() {
+async fn test_own_record_crash_after_publishing_is_settled_by_the_copy() {
     let w = World::new();
     let (mut app, _) = on_faulty_store(&w, StoreFault::FailBefore(3)).await;
     let id = app.app_id();
@@ -608,7 +613,9 @@ async fn test_own_record_crash_after_publishing_writes_again() {
     let writes = w.record_writes(id);
     let mut loaded = w.load_publishing_on(w.store.clone(), id).await;
     loaded.receive(None).await.unwrap();
-    assert_eq!(w.record_writes(id), writes + 1);
+    // Owed across the crash; the copy read first is the record, so nothing is written.
+    assert_eq!(w.record_writes(id), writes);
+    assert!(loaded.state.pending_publish.is_none());
     assert_eq!(w.published(id), Some(bytes_of(loaded.record())));
 }
 
@@ -772,4 +779,123 @@ async fn test_own_record_renewed_certificate_is_republished() {
     assert_eq!(&published, app.record());
     let record = AppRecord::verify(&published, &w.alice.public()).unwrap();
     assert_eq!(record.cert().hash(), renewed.hash());
+}
+
+/// Switch spec 4.2: the newest record the switch accepted is the one published. A first
+/// record whose publication failed is never written over a later one.
+#[tokio::test]
+async fn test_own_record_failed_publication_never_puts_an_older_record_over_a_newer() {
+    let w = World::new();
+    let mut app = w.join_publishing("wallet").await;
+    let id = app.app_id();
+    w.clock.advance_ms(1_000);
+    w.homeserver.fail_writes(1, false);
+    let first = app
+        .set_protocol_member(PROTO, member(json!({ "a": 1 })), None)
+        .await
+        .unwrap();
+    assert!(matches!(first, Publication::Owed { .. }));
+    let r1 = app.record().clone();
+    w.clock.advance_ms(1_000);
+    let second = app
+        .set_protocol_member(PROTO, member(json!({ "a": 2 })), None)
+        .await
+        .unwrap();
+    assert_eq!(second, Publication::Published);
+    let r2 = app.record().clone();
+    assert_ne!(r1, r2);
+    assert_eq!(w.published(id), Some(bytes_of(&r2)));
+    // Later reads and publications keep the newer one.
+    w.clock.advance_ms(PUBLISHED_CHECK_MS);
+    app.receive(None).await.unwrap();
+    app.publish_record().await.unwrap();
+    let mut loaded = w.load_publishing_on(w.store.clone(), id).await;
+    loaded.receive(None).await.unwrap();
+    assert_eq!(w.published(id), Some(bytes_of(&r2)));
+}
+
+/// Switch spec 4.2: a Homeserver copy that differs from the newest record the switch
+/// accepted is replaced by it, at the read after the copy's check is due, or at once on
+/// `publish_record`.
+#[tokio::test]
+async fn test_own_record_copy_that_differs_is_replaced_by_the_newest_accepted() {
+    let w = World::new();
+    let mut app = w.join_publishing("wallet").await;
+    let id = app.app_id();
+    let path = app_record_path(&id);
+    app.receive(None).await.unwrap();
+    w.homeserver
+        .put(w.alice.public(), &path, b"not a record".to_vec());
+    // Checked at most once per PUBLISHED_CHECK_MS while nothing is owed.
+    app.receive(None).await.unwrap();
+    assert_eq!(w.published(id), Some(b"not a record".to_vec()));
+    w.clock.advance_ms(PUBLISHED_CHECK_MS);
+    app.receive(None).await.unwrap();
+    assert_eq!(w.published(id), Some(bytes_of(app.record())));
+    // Gone from the Homeserver: written again on publish_record.
+    w.homeserver.remove(w.alice.public(), &path);
+    assert_eq!(app.publish_record().await.unwrap(), Publication::Published);
+    assert_eq!(w.published(id), Some(bytes_of(app.record())));
+}
+
+/// Switch spec 4.2, 12.3: a publishing app leaves in two steps, deleting its Homeserver
+/// record and then calling `leave`; nothing is published from the commit that starts the
+/// leave on, across a restart between the two.
+#[tokio::test]
+async fn test_own_record_leave_deletes_the_record_and_publishes_nothing_after() {
+    let w = World::new();
+    let mut app = w.join_publishing("wallet").await;
+    let id = app.app_id();
+    assert!(w.published(id).is_some());
+    w.switch.fail_next(Fault::Unreachable {
+        path: "leave".into(),
+        after: 0,
+    });
+    app.leave(LeaveMode::TwoStep).await.unwrap_err();
+    assert!(w.published(id).is_none());
+    let writes = w.record_writes(id);
+    drop(app);
+    let mut app = w.load_publishing_on(w.store.clone(), id).await;
+    app.receive(None).await.unwrap_err();
+    app.publish_record().await.unwrap_err();
+    w.clock.advance_ms(PUBLISHED_CHECK_MS);
+    app.receive(None).await.unwrap_err();
+    assert!(w.published(id).is_none());
+    assert_eq!(w.record_writes(id), writes);
+    // The leave goes on, and still publishes nothing.
+    app.leave(LeaveMode::TwoStep).await.unwrap();
+    assert!(w.published(id).is_none());
+    assert_eq!(w.record_writes(id), writes);
+}
+
+/// Switch spec 4.2: a Homeserver copy with a later `updated_at` is never written over, as
+/// after a restore from a backup older than the record published since.
+#[tokio::test]
+async fn test_own_record_restore_from_an_older_backup_never_rolls_the_copy_back() {
+    let w = World::new();
+    let mut app = w.join_publishing("wallet").await;
+    let id = app.app_id();
+    app.receive(None).await.unwrap();
+    let backup = app.backup().await.unwrap();
+    w.clock.advance_ms(1_000);
+    app.set_protocol_member(PROTO, member(json!({ "a": 1 })), None)
+        .await
+        .unwrap();
+    let newer = app.record().clone();
+    assert_eq!(w.published(id), Some(bytes_of(&newer)));
+    drop(app);
+    let mut restored = App::restore(
+        w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
+        w.protocol.clone(),
+        publishing(),
+        &backup,
+    )
+    .await
+    .unwrap();
+    assert_ne!(restored.record(), &newer);
+    assert_eq!(
+        restored.publish_record().await.unwrap(),
+        Publication::Superseded
+    );
+    assert_eq!(w.published(id), Some(bytes_of(&newer)));
 }

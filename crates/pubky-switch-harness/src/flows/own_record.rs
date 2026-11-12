@@ -92,6 +92,7 @@ fn changed(world: &World, app: &mut App, result: Result<Publication, AppError>) 
         Ok(Publication::Published) => json!("published"),
         Ok(Publication::NotPublishing) => json!("not publishing"),
         Ok(Publication::Owed { .. }) => json!("owed"),
+        Ok(Publication::Superseded) => json!("superseded"),
         Err(error) => json!({ "error": error.code().map(|code| code.as_str().to_owned()) }),
     };
     json!({

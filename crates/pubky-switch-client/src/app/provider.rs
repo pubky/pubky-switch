@@ -1091,13 +1091,6 @@ impl App {
         let events = self.carry_kept_writes(&mut tx, carry).await?;
         if self.state.pending_record.take().is_some() {
             tx.delete(key::PENDING_RECORD)?;
-            // The re-registration carries the record, so its answer delivers it: what the
-            // Homeserver is owed, it is owed from then on.
-            let record = self.state.record.clone();
-            self.owe_publish(&record, &mut tx)?;
-            if self.config.publishes_record {
-                self.state.pending_publish = Some(record);
-            }
         }
         // A loss followed before, its kept batch unanswered, goes on at this generation.
         if let Some(mut loss) = self.loss_record().await?
@@ -1373,7 +1366,16 @@ impl App {
         }
         let batch = Batch::from_body(mv.batch.clone())?;
         let proofs = match self.submit(&batch).await {
-            Ok(submitted) => submitted.proofs,
+            Ok(submitted) => {
+                // The next service accepted the record the re-registration carries: it is
+                // the one a publication writes from now on (Switch spec 4.2).
+                let record = super::renewal::delivered_record(&batch)?;
+                let mut tx = self.tx()?;
+                self.note_accepted(&record, &mut tx)?;
+                self.commit(tx).await?;
+                self.took_accepted(record);
+                submitted.proofs
+            }
             // A registration the service refuses as it stands, an older own key current
             // there included, is reported; the app reads on with what the service holds.
             Err(AppError::Switch(ClientError::Switch {

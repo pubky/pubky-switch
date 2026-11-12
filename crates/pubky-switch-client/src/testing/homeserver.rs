@@ -123,6 +123,20 @@ impl HomeserverReader for TestHomeserver {
 }
 
 impl HomeserverWriter for TestHomeserver {
+    fn delete(
+        &self,
+        identity: [u8; 32],
+        path: String,
+    ) -> BoxFuture<'_, Result<(), TransportError>> {
+        let answer = if *lock(&self.down) {
+            Err(TransportError::Connect("down".into()))
+        } else {
+            self.remove(identity, &path);
+            Ok(())
+        };
+        Box::pin(async move { answer })
+    }
+
     fn put(
         &self,
         identity: [u8; 32],

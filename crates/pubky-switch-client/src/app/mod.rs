@@ -75,7 +75,7 @@ pub use events::{
 pub use feed::{ReceiveReport, SENDER_REREAD_MS};
 pub use identity::{DOC_CACHE_MS, HomeserverReader, IdentityRefresh, REVALIDATION_MS};
 pub use kept::{KeptBatch, KeptBatchDrop, KeptBatchStatus};
-pub use own_record::{HomeserverWriter, Publication};
+pub use own_record::{HomeserverWriter, PUBLISHED_CHECK_MS, Publication};
 pub use parked::{ParkedMessage, ParkedSummary};
 pub use peek::{PeekReport, Peeked};
 pub use protocol::{
@@ -534,6 +534,9 @@ pub(crate) struct AppState {
     pub(crate) pending_record: Option<PendingRecord>,
     /// The record the switch holds and the Homeserver is still owed (`pending/publish`).
     pub(crate) pending_publish: Option<SignedDoc>,
+    /// The newest record the switch accepted from the app (`record/accepted`), the one a
+    /// publication writes.
+    pub(crate) accepted: Option<SignedDoc>,
     pub(crate) alarm: Option<Alarm>,
     pub(crate) restore: Option<RestoreState>,
     pub(crate) leave: Option<LeaveState>,
@@ -590,6 +593,9 @@ pub struct App {
     peer_rereads: HashMap<[u8; 32], u64>,
     /// How many reads ([`App::receive`]) this app began since it was loaded.
     reads_begun: u64,
+    /// When the Homeserver copy of the app's record was last read to compare it with the
+    /// newest record the switch accepted, device clock (`own_record.rs`). In memory only.
+    published_checked_ms: Option<u64>,
 }
 
 impl std::fmt::Debug for App {
@@ -791,6 +797,7 @@ impl App {
                 pending_effect: None,
                 pending_record: None,
                 pending_publish: None,
+                accepted: None,
                 alarm: None,
                 restore: None,
                 leave: None,
@@ -817,6 +824,7 @@ impl App {
                 kept_rate_limited: None,
                 loss_upload_wait: None,
                 sender_rereads: HashMap::new(),
+                published_checked_ms: None,
                 peer_rereads: HashMap::new(),
                 reads_begun: 0,
             };
@@ -903,13 +911,11 @@ impl App {
         // The switch holds the record now: an app that publishes owes it to the Homeserver
         // (Switch spec 12.1 step 2).
         let record = renewal::delivered_record(&batch)?;
-        self.owe_publish(&record, &mut tx)?;
+        self.note_accepted(&record, &mut tx)?;
         self.state.chain = Some(view);
         self.commit(tx).await?;
-        if self.config.publishes_record {
-            self.state.pending_publish = Some(record);
-        }
-        Box::pin(self.publish_owed()).await?;
+        self.took_accepted(record);
+        Box::pin(self.publish_owed(false)).await?;
         Ok(())
     }
 
@@ -952,6 +958,7 @@ impl App {
                 kept_rate_limited: None,
                 loss_upload_wait: None,
                 sender_rereads: HashMap::new(),
+                published_checked_ms: None,
                 peer_rereads: HashMap::new(),
                 reads_begun: 0,
             };
@@ -1035,6 +1042,7 @@ impl App {
             pending_effect: reader.get(key::PENDING_EFFECT).await?,
             pending_record: reader.get(key::PENDING_RECORD).await?,
             pending_publish: reader.get(key::PENDING_PUBLISH).await?,
+            accepted: reader.get(key::ACCEPTED_RECORD).await?,
             alarm: reader.get(key::ALARM).await?,
             restore: reader.get(key::RESTORE).await?,
             leave,
@@ -1596,6 +1604,9 @@ impl App {
                 pending_effect: None,
                 pending_record: None,
                 pending_publish: None,
+                // The backup's record is one the switch accepted; a publication after the
+                // restore never writes it over a later Homeserver copy (Switch spec 4.2).
+                accepted: Some(backup.record.clone()),
                 alarm: None,
                 restore: Some(RestoreState {
                     n_floor,
@@ -1655,6 +1666,7 @@ impl App {
                 kept_rate_limited: None,
                 loss_upload_wait: None,
                 sender_rereads: HashMap::new(),
+                published_checked_ms: None,
                 peer_rereads: HashMap::new(),
                 reads_begun: 0,
             };
@@ -1724,6 +1736,9 @@ impl App {
         tx.put(key::KEYS, &s.keys)?;
         tx.put(key::CERT, s.cert.signed())?;
         tx.put(key::RECORD, &s.record)?;
+        if let Some(accepted) = &s.accepted {
+            tx.put(key::ACCEPTED_RECORD, accepted)?;
+        }
         tx.put(key::NAMING, &s.naming)?;
         for scope_key in &s.scope_keys.keys {
             tx.put(
@@ -2255,8 +2270,9 @@ impl App {
     /// Leave the identity (Switch spec 12.3): `leave` at the service, then the keys go: at
     /// once for [`LeaveMode::Immediate`], or once the signer published the app as removed
     /// and readers' caches passed for [`LeaveMode::TwoStep`] ([`App::finish_leave`]).
-    /// Deleting the app's Homeserver record, where it publishes one, is the host's, before
-    /// this call.
+    /// An app that publishes its record deletes it from the Homeserver first, and publishes
+    /// nothing from the commit that starts the leave on, across a restart too (Switch spec
+    /// 12.3).
     ///
     /// # Errors
     ///
@@ -2347,6 +2363,9 @@ impl App {
             self.state.leave = Some(leave);
             self.commit(tx).await?;
         }
+        // A publishing app deletes its Homeserver record first (Switch spec 12.3); the leave
+        // committed above stops every publication from here on.
+        self.unpublish_to_leave().await?;
         let result = self.client.leave().await;
         let answered = match self.take(result).await {
             Ok(answer) => {
