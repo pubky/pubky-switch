@@ -2,15 +2,22 @@
 //! switch to hold its read, and a write of another app answers it.
 
 use std::cell::Cell;
+use std::future::Future;
+use std::pin::Pin;
 use std::time::Duration;
 
+use futures_util::StreamExt;
+use futures_util::stream::FuturesUnordered;
+
 use pubky_switch_client::app::{App, AppConfig, RecordTarget};
+use pubky_switch_core::records::IDENTITY_PATH;
 use pubky_switch_signer::UserConfirmed;
 use serde_json::json;
 
 use super::enrollment::{enroll, status};
 use super::join::{app_status, events};
 use super::messaging::joined_with;
+use super::recovery::{ended, expect_upload, follow_recovery};
 use super::{ORIGIN, STEP_MS};
 use crate::parties::{Asking, notes_collection, notes_protocol_with_records};
 use crate::{FlowResult, World};
@@ -85,8 +92,8 @@ pub async fn waiting_read(world: &World) -> FlowResult {
             .put_record(&target, br#"{"items":["milk"]}"#, Vec::new())
             .await
     };
-    let both = futures_util::future::join(read, write);
-    let Ok((read, written)) = tokio::time::timeout(STEP_TIMEOUT, both).await else {
+    let both = each_on_its_own_wake(read, write);
+    let Ok(Some((read, written))) = tokio::time::timeout(STEP_TIMEOUT, both).await else {
         return Err("the write didn't answer the waiting read: the read is still held".into());
     };
     written?;
@@ -107,6 +114,35 @@ pub async fn waiting_read(world: &World) -> FlowResult {
     look(world, &mut watch, "the watch's next read").await?;
     look(world, &mut wallet, "the wallet after its write").await?;
     Ok(())
+}
+
+/// Run a held read and the call that is to wake it to their ends, each polled only when
+/// its own waker fires. Joined as one future, the read would be polled again whenever the
+/// other call moved, and a switch that never woke it would pass. `None` when one of the
+/// two never ended.
+async fn each_on_its_own_wake<A, B>(
+    read: impl Future<Output = A>,
+    act: impl Future<Output = B>,
+) -> Option<(A, B)> {
+    enum Ended<A, B> {
+        Read(A),
+        Act(B),
+    }
+    let read: Pin<Box<dyn Future<Output = Ended<A, B>> + '_>> =
+        Box::pin(async { Ended::Read(read.await) });
+    let act: Pin<Box<dyn Future<Output = Ended<A, B>> + '_>> =
+        Box::pin(async { Ended::Act(act.await) });
+    let mut running = FuturesUnordered::new();
+    running.push(read);
+    running.push(act);
+    let (mut read, mut acted) = (None, None);
+    while let Some(ended) = running.next().await {
+        match ended {
+            Ended::Read(ended) => read = Some(ended),
+            Ended::Act(ended) => acted = Some(ended),
+        }
+    }
+    read.zip(acted)
 }
 
 /// `app` follows its feed to the end and moves its cursor: the events it raises at this
@@ -172,8 +208,8 @@ pub async fn waiting_read_erased(world: &World) -> FlowResult {
             .close_account(UserConfirmed::shown_and_confirmed())
             .await
     };
-    let both = futures_util::future::join(read, erase);
-    let Ok((_, erased)) = tokio::time::timeout(STEP_TIMEOUT, both).await else {
+    let both = each_on_its_own_wake(read, erase);
+    let Ok(Some((_, erased))) = tokio::time::timeout(STEP_TIMEOUT, both).await else {
         return Err("the held read wasn't answered: it is still held".into());
     };
     erased?;
@@ -239,10 +275,10 @@ pub async fn waiting_read_revoked(world: &World) -> FlowResult {
             .revoke(app_id, None, UserConfirmed::shown_and_confirmed())
             .await
     };
-    let both = futures_util::future::join(read, revoke);
+    let both = each_on_its_own_wake(read, revoke);
     let both = tokio::time::timeout(STEP_TIMEOUT, both).await;
     world.let_go();
-    let Ok((report, revoked)) = both else {
+    let Ok(Some((report, revoked))) = both else {
         return Err("the held read wasn't answered: it is still held".into());
     };
     revoked?;
@@ -274,5 +310,147 @@ pub async fn waiting_read_revoked(world: &World) -> FlowResult {
     if refused != expected || expected.2.is_none() {
         return Err(format!("the held read was answered {refused:?}, not {expected:?}").into());
     }
+    Ok(())
+}
+
+/// A feed read held across a recovery in place (Switch wire 7.4.4, 3.3, Switch spec 12.6
+/// step 1). alice's watch reads its feed with a wait, and the switch holds the read. Her
+/// signer declares the service's generation lost there and recovers in place: the version
+/// that names the pending key starts the account afresh. That wakes the read. The account
+/// no longer names the key the read was held under, so the read is answered `503
+/// unavailable`, signed with the operator key and with no head. The watch can't take that
+/// answer as the account's. The new document's publication fails once, so the woken watch
+/// finds nothing to follow yet; once the signer's next run has published it, the watch
+/// learns the new key from alice's `identity.json` and follows the recovery: it registers
+/// again, reads the new sequence from its start, and uploads what it holds.
+///
+/// Calls: `GET /v1/{id}/feed?wait=` held while the account recovers in place, and the
+/// feed read from the start of the next generation after it.
+///
+/// # Errors
+///
+/// When a step that should succeed against any switch fails, the switch answers the read
+/// without holding it or leaves it held, the read is answered otherwise than `503
+/// unavailable` under the operator key with no head, or the watch's next read isn't the
+/// new chain's first item.
+pub async fn waiting_read_recovered(world: &World) -> FlowResult {
+    let alice = world.identity("alice")?;
+    world.add_switch(ORIGIN, &[&alice]).await?;
+    let mut signer = enroll(world, &alice, ORIGIN).await?;
+    let (mut watch, _) = joined_with(
+        world,
+        &alice,
+        &mut signer,
+        Asking::new(world.app_keys(&alice, "watch")?)?,
+        notes_protocol_with_records(),
+        AppConfig::default(),
+    )
+    .await?;
+    look(world, &mut watch, "the watch before the wait").await?;
+
+    // The new document reaches the Homeserver only with the signer's next run, so the watch,
+    // woken before it, finds nothing to follow yet: at either switch, however its answer
+    // and the signer's are ordered.
+    world.fail_homeserver_write(&alice, IDENTITY_PATH);
+    let sent = world.trace().lines.len();
+    let answered = Cell::new(false);
+    let held_then = Cell::new(false);
+    let read = async {
+        let report = watch.receive(Some(WAIT_S)).await;
+        answered.set(true);
+        report.map(|_| ())
+    };
+    let recover = async {
+        // Until the switch holds the read, or answered it without holding it.
+        while world.held_reads() == 0 && !answered.get() {
+            tokio::task::yield_now().await;
+        }
+        held_then.set(world.held_reads() > 0);
+        signer
+            .declare_provider_loss(ORIGIN, UserConfirmed::shown_and_confirmed())
+            .await
+    };
+    let both = each_on_its_own_wake(read, recover);
+    let Ok(Some((report, recovered))) = tokio::time::timeout(STEP_TIMEOUT, both).await else {
+        return Err("the held read wasn't answered: it is still held".into());
+    };
+    if !held_then.get() {
+        return Err("the switch answered the waiting read without holding it".into());
+    }
+    let delivered = signer
+        .identity_doc()?
+        .ok_or("the signer holds no document")?;
+    world.outcome(
+        "the signer recovered in place while the watch's read was held",
+        &json!({
+            "held_when_the_signer_acted": held_then.get(),
+            "the read": ended(&report),
+            "events": events(&watch.take_events()),
+            "the recovery": ended(&recovered),
+            "generation": delivered.generation(),
+            "signer": status(&signer)?,
+        }),
+    );
+    if recovered.is_ok() || world.homeserver_faults_left() != 0 || delivered.generation() != 2 {
+        return Err(format!(
+            "the recovery's version wasn't delivered with its publication failing: it ended \
+             {} at generation {}",
+            ended(&recovered),
+            delivered.generation()
+        )
+        .into());
+    }
+    // The held read is answered, not left held, and not under the account's key or a head:
+    // the account it was held for is the one the recovery replaced.
+    let held = {
+        let trace = world.trace();
+        let fact = |line: &crate::trace::Line, name: &str| line.facts.get(name).cloned();
+        trace.lines[sent..]
+            .iter()
+            .find(|line| line.label == "{alice/watch} GET /v1/{alice}/feed")
+            .map(|line| {
+                (
+                    fact(line, "status"),
+                    fact(line, "body.code"),
+                    fact(line, "answer signed with"),
+                    fact(line, "header switch-head"),
+                )
+            })
+    };
+    let unavailable = (
+        Some("503".to_owned()),
+        Some("text unavailable".to_owned()),
+        Some("the operator key".to_owned()),
+        Some("absent".to_owned()),
+    );
+    if held.as_ref() != Some(&unavailable) || world.held_reads() != 0 {
+        return Err(format!(
+            "the held read was answered {held:?} (status, code, key, head), with {} reads \
+             still held",
+            world.held_reads()
+        )
+        .into());
+    }
+    world.advance_ms(STEP_MS);
+
+    signer.run_due().await?;
+    let published = world
+        .files()
+        .identity_doc(&alice.public())
+        .map(|doc| doc.generation());
+    world.outcome(
+        "the signer's run published the recovery's version",
+        &json!({ "published_generation": published, "signer": status(&signer)? }),
+    );
+    if published != Some(2) {
+        return Err(format!("the Homeserver holds generation {published:?}, not 2").into());
+    }
+    world.advance_ms(STEP_MS);
+
+    // The watch learns the new key from the document, registers again, and reads the new
+    // sequence from its start: the `recovery` transition at `seq` 1.
+    follow_recovery(world, &mut watch, "watch", 1).await?;
+    expect_upload(world, "watch", false)?;
+    look(world, &mut watch, "the watch after the recovery").await?;
     Ok(())
 }

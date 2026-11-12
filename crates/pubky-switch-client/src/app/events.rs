@@ -445,11 +445,19 @@ pub enum AppEvent {
         issued_at: u64,
     },
     /// The switch holds the app's record and its Homeserver write failed: it stays owed,
-    /// and goes again at the next read or with the next change (Switch spec 4.2).
+    /// and goes again at the next read or with the next change (Switch spec 4.2). Or the
+    /// delete of an immediate leave, or of a leave after a compromise, failed: the app left
+    /// all the same, and the record stays on the Homeserver until the signer's clean-up
+    /// deletes it (Switch spec 12.2 step 4, 12.3).
     RecordPublishFailed {
         /// Why the write failed.
         error: String,
     },
+    /// A listing of the collections is owed and waits for a scope key the app lacks at the
+    /// current data epoch: the read ended before the feed, handing nothing over, and the
+    /// app asks for its full key bundle again at a bounded interval (Switch spec 3.5, 8.2).
+    /// The read after the key arrives lists, then reads the feed.
+    ListingWaitsForKey,
     /// The own app was revoked or recorded as departed: it is no longer current.
     Removed,
     /// Continuity since the verified position couldn't be verified: the app continued

@@ -124,3 +124,32 @@ async fn test_not_registered_repeated_headless_refusals_cost_one_request_a_read(
     let report = app.receive(None).await.unwrap();
     assert!(!report.stopped);
 }
+
+/// Revoked while offline, then purged from `removed`: a service that frees the purged app's
+/// record answers its calls without the head (Switch wire 7.2 "Where an own app gets `403
+/// not_current`", 9.1). The newest identity.json lists the app in neither list, so it ends
+/// as removed, and reads on as a stopped app.
+#[tokio::test]
+async fn test_not_registered_purged_app_ends_as_removed() {
+    use pubky_switch_core::records::RemovedApp;
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let me = app.app_id();
+    app.receive(None).await.unwrap();
+    w.switch.revoke(me).unwrap();
+    w.next_doc(|body| {
+        body.apps.retain(|listed| listed.app_id != me);
+        body.removed.push(RemovedApp {
+            app_id: me,
+            distrust_from: START,
+        });
+    });
+    w.clock.advance_ms(1_000);
+    w.next_doc(|body| body.removed.retain(|removed| removed.app_id != me));
+    w.switch.purge(me);
+    let report = app.receive(None).await.unwrap();
+    assert!(report.stopped);
+    assert!(has(&report.events, |e| matches!(e, AppEvent::Removed)));
+    let report = app.receive(None).await.unwrap();
+    assert!(report.stopped);
+}

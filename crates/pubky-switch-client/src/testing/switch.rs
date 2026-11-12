@@ -919,6 +919,21 @@ impl ScriptedSwitch {
         Ok(())
     }
 
+    /// A service that frees a purged app's record (Switch wire 9.1): `app`, revoked or
+    /// departed and purged from `removed`, keeps its App ID for good, but its record and
+    /// receive key go, so every call of it but a first call meets the refusal of one, `403
+    /// not_current` without the head (Switch wire 7.2 "Where an own app gets `403
+    /// not_current`"). The service keeps them, and answers with the head.
+    pub fn purge(&self, app: [u8; 16]) {
+        let mut inner = self.lock();
+        let held = inner.apps.entry(app).or_default();
+        held.departed = true;
+        held.record = None;
+        held.cert = None;
+        held.receive_key = None;
+        held.receive_n = None;
+    }
+
     /// A faulty service: `app` stays revoked or departed, but `GET /apps` shows no time for it.
     pub fn forget_removal_time(&self, app: [u8; 16]) {
         let mut inner = self.lock();

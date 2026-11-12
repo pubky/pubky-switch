@@ -72,8 +72,9 @@ pub(crate) struct ContextWrites {
     /// A local write was refused for taking the step past [`MAX_STEP_LOCAL_BYTES`]: the
     /// effect is too large, whatever the step returns with it.
     pub(crate) over_local_bound: bool,
-    /// The keys of the processed pairs the step forgets ([`ReceiveContext::forget_processed`]).
-    pub(crate) forget: Vec<String>,
+    /// The keys of the processed pairs the step forgets ([`ReceiveContext::forget_processed`]),
+    /// each once. They count against [`MAX_STEP_LOCAL_BYTES`] with the local writes.
+    pub(crate) forget: std::collections::BTreeSet<String>,
 }
 
 /// A claim the app read from the switch for a receive step ([`super::Need::Claim`]).
@@ -744,7 +745,8 @@ impl<'a> ReceiveContext<'a> {
     /// effect the step then applies is stored and passed as too large
     /// ([`super::ParkReason::EffectTooLarge`]), never applied without it.
     pub fn local(&mut self, write: LocalWrite) -> Result<(), AppError> {
-        let after = local_writes_bytes(&self.writes.local)
+        let after = self
+            .step_local_bytes()
             .saturating_add(local_writes_bytes(std::slice::from_ref(&write)));
         if after > MAX_STEP_LOCAL_BYTES {
             self.writes.over_local_bound = true;
@@ -761,14 +763,20 @@ impl<'a> ReceiveContext<'a> {
     /// step's commit, with its local writes, and only with [`super::Outcome::Apply`], as
     /// they are. For a protocol that gives up what an earlier message brought, so that a
     /// re-sent copy of it is delivered again from the next read on (`forget.rs`); the
-    /// protocol must then not apply that copy twice itself. Returns whether a pair is held:
+    /// protocol must then not apply that copy twice itself, since the message's sender can
+    /// replay it at will, every copy delivered (Switch spec 11). Returns whether a pair is held:
     /// one that isn't, another sender's or an unknown `msg_id`, is a no-op, and so is the
     /// message of this step, whose pair the outcome writes.
+    ///
+    /// The keys a forget deletes count against [`MAX_STEP_LOCAL_BYTES`] with the step's
+    /// local writes, each as a delete of its key would ([`local_writes_bytes`]).
     ///
     /// # Errors
     ///
     /// [`Refusal::NotNow`] while the message's effect is kept to be sent, or an entry stored
-    /// locally holds it; a store failure.
+    /// locally holds it; [`Refusal::Usage`] when the forget would take the step past
+    /// [`MAX_STEP_LOCAL_BYTES`], as for [`ReceiveContext::local`]: nothing is added, and an
+    /// effect the step then applies is stored and passed as too large; a store failure.
     pub fn forget_processed(&mut self, sender: [u8; 32], msg_id: &str) -> Result<bool, AppError> {
         let processed = self
             .app_get(&super::state::key::processed(&sender, msg_id))?
@@ -777,11 +785,27 @@ impl<'a> ReceiveContext<'a> {
         let Some(keys) = super::forget::held_pair(self.state, &sender, msg_id, processed)? else {
             return Ok(false);
         };
-        for key in keys {
-            if !self.writes.forget.contains(&key) {
-                self.writes.forget.push(key);
-            }
+        let new: Vec<String> = keys
+            .into_iter()
+            .filter(|key| !self.writes.forget.contains(key))
+            .collect();
+        let after = self
+            .step_local_bytes()
+            .saturating_add(super::forget::forget_bytes(&new));
+        if after > MAX_STEP_LOCAL_BYTES {
+            self.writes.over_local_bound = true;
+            return Err(Refusal::Usage(format!(
+                "a receive step writes at most {MAX_STEP_LOCAL_BYTES} bytes of local state"
+            ))
+            .into());
         }
+        self.writes.forget.extend(new);
         Ok(true)
+    }
+
+    /// What this step's local writes and forgets count against [`MAX_STEP_LOCAL_BYTES`].
+    fn step_local_bytes(&self) -> usize {
+        local_writes_bytes(&self.writes.local)
+            .saturating_add(super::forget::forget_bytes(&self.writes.forget))
     }
 }

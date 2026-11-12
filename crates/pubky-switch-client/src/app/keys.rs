@@ -20,6 +20,12 @@
 //! So the app asks at most once per part stored after its last request: the signer's
 //! answers, not a clock, pace the requests, and while no part arrives a request again would
 //! keep the service's first time and tell the signer nothing new.
+//!
+//! One case reads no feed: a read whose owed listing waits for a scope key ends before the
+//! feed, so the part that answers a request never shows, and the request never clears.
+//! There the app asks again once [`KEY_REQUEST_RETRY_MS`] has passed since it last asked,
+//! in case the answer lacked the key and the service ended the request. The time is kept
+//! in memory only: a restart may ask once more.
 
 use pubky_switch_core::http::ErrorCode;
 use pubky_switch_core::records::{
@@ -29,6 +35,10 @@ use pubky_switch_core::records::{
 use super::events::AppEvent;
 use super::state::key;
 use super::{App, AppError};
+
+/// How often, at most, an app whose owed listing waits for a scope key asks for its full
+/// key bundle again: an hour on the device clock, the app's choice.
+pub(crate) const KEY_REQUEST_RETRY_MS: u64 = 60 * 60 * 1000;
 
 impl App {
     /// Fetch, read and merge the app's key bundle parts (Switch wire 7.4.11), then ask for a
@@ -176,11 +186,26 @@ impl App {
         let result = self.client.request_full_bundle().await;
         let requested = self.take(result).await?;
         self.state.bundle.full_requested_ms = Some(requested);
+        self.bundle_asked_ms = Some(self.now());
         let mut tx = self.tx()?;
         tx.put(key::BUNDLE, &self.state.bundle)?;
         self.commit(tx).await?;
         self.events.push(AppEvent::FullBundleRequested);
         Ok(())
+    }
+
+    /// While an owed listing waits for a scope key: ask for the full bundle again once
+    /// [`KEY_REQUEST_RETRY_MS`] has passed since this app last asked, a request still
+    /// outstanding included (Switch wire 7.4.11).
+    pub(crate) async fn ask_again_while_a_listing_waits(&mut self) -> Result<(), AppError> {
+        let now = self.now();
+        if self
+            .bundle_asked_ms
+            .is_some_and(|at| at <= now && now - at < KEY_REQUEST_RETRY_MS)
+        {
+            return Ok(());
+        }
+        self.request_full_bundle().await
     }
 
     /// Fetch the bundle when a key up to the current data epoch is missing and no full

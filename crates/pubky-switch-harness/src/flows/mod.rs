@@ -77,7 +77,9 @@ pub use upload::{
     recovery_upload_claim, recovery_upload_deny_only, recovery_upload_records,
     recovery_upload_refused, recovery_upload_slots_before_the_loss,
 };
-pub use waiting::{waiting_read, waiting_read_erased, waiting_read_revoked};
+pub use waiting::{
+    waiting_read, waiting_read_erased, waiting_read_recovered, waiting_read_revoked,
+};
 pub use watching::watching;
 
 use crate::{FlowResult, World};
@@ -165,6 +167,9 @@ pub const FLOWS: &[(&str, Flow)] = &[
     }),
     ("waiting read, the reader revoked", |world| {
         Box::pin(waiting_read_revoked(world))
+    }),
+    ("waiting read, a recovery in place", |world| {
+        Box::pin(waiting_read_recovered(world))
     }),
     ("provider loss", |world| Box::pin(provider_loss(world))),
     ("provider loss, a sender admitted", |world| {

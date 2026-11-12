@@ -638,6 +638,8 @@ impl AccountTxn {
         .execute(self.conn())
         .await
         .map_err(StoreError::from_db)?;
+        // The conversation entry answers the sender's connect request (Switch wire 7.4.7).
+        self.delete_connect(sender).await?;
         Ok(())
     }
 

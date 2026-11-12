@@ -84,7 +84,11 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   certificate expires while its read is held is refused once the read is answered, where
   the service refuses it at the account's next commit; the answer is the same. Faults and
   the stale-timestamp check apply when the read is answered, not when it arrives.
-  `held_reads` counts the reads held and not woken since they last looked.
+  `held_reads` counts the reads held and not woken since they last looked. Unlike the
+  service, every request the switch answers first wakes every held read to look again
+  (`wake_held`), and a read with nothing to show then waits on. So a missing specific wake
+  (at a chained item, `start_afresh` or an erasure) is covered by the next request's: a test
+  sees it only if nothing else reaches the switch while the read is held.
 - **Retention and sweeps** (Switch wire 9.1, 7.4.4): an entry goes once every current
   target that isn't lagging has passed it, as at the service, judged at cursor moves, at
   appends and at deliveries, revocations and leaves (`keep_passed_entries` turns that off
@@ -103,7 +107,23 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   dropped, and their proofs go only when a retry finds them past `batch_proofs_ms`.
 - **Invite codes**: a revoked app's codes aren't withdrawn (Switch wire 7.4.3 "After a
   revocation"); a code planted for a faulty export never expires.
-- **Lists**: `flagged` is always empty; connect requests are never full.
+- **Lists**: `flagged` is always empty.
+- **Connect requests** (Switch wire 7.4.7), in `switch/inbox.rs` `connect` and
+  `switch/shared.rs`: as at the service (`crates/pubky-switch/src/service/connect.rs`), in its
+  order: `503 staged` while admission is staged, whatever the policy; `403 not_admitted` with
+  the policy off; check 5 by the sender's certificate: the copy lists the app with it, or
+  a renewal of it still open, a closed renewal being `403 not_current`, and otherwise `409
+  identity_needed` naming the held version, or none when the copy lists the app as
+  removed; a sender already pending answered `pending`; the policy's `max_pending`, capped at the
+  wire's default `max_connect_pending` (1,000), refusing a new sender `429 quota_exceeded`
+  before the deny list; a denied sender answered `pending`, its request not kept. `GET
+  /connect` needs `lists.read`, `DELETE /connect/{pubky}` `conversation.add`, and an own app's
+  or the signer's `POST /connect` is `403 permission_missing`. A contact, a conversation
+  entry or a deny list entry for the sender answers its request, the entry an invite code's
+  first append writes and the entries a recovery upload's list merge writes included. Unlike the service: no `connect_per_min` or
+  `stranger_per_min` (no rates, above), and no flag hits. A sender the allowlist admits is
+  answered `pending` with nothing kept, as at the service. Neither switch sends the push
+  `policy.connect_requests.push` asks for yet: push isn't served.
 - **Records**: `divergent` is set by divergent uploads after a provider loss and cleared
   by a write here, as at the service (Recovery uploads, below).
 - **Directory** (Switch wire 7.4.10): an app is reachable from its first receive key until
@@ -162,7 +182,7 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
 - **`409 identity_needed`** to an app of another identity carries `known_version` beside
   `current`, `null` for no copy held or as to a stranger (Switch wire 7.1, 7.6), at the
   inbox, here and at the peer switch (`peer.rs`). Both also serve `POST /connect` and
-  answer it so; the service doesn't serve it yet (`503 unavailable`).
+  answer it so.
 - **`open_admission`** (`admit_everyone`) admits every sender the deny list doesn't hold, a
   test switch only.
 - **An own app's first call** (Switch wire 7.1 "`Switch-Head` on refusals", 7.2), as at
@@ -172,7 +192,10 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   at authentication, before the account's lock and before a staged or frozen account's
   answer (Switch wire 7.3 steps 5 to 8), whatever the route: no `Switch-Head`,
   `Switch-Server-Time` the last time stamped, and the app not seen. A departed app that
-  delivered its record keeps it, so it goes on to the route's checks.
+  delivered its record keeps it, so it goes on to the route's checks, as at the service,
+  until the test call `purge` frees it, as a service may once the signer purges the app
+  from `removed` (Switch wire 9.1): then it meets the first call's refusal, without the
+  head. The service keeps a purged app's record, so it answers that app with the head.
 - **App currency outside batches**: a feed read is checked as a batch is, for an app that
   delivered its record: current, with an unexpired certificate, the stored renewed one once
   the newest `identity.json` lists it (Switch wire 7.2, 3.8). Other routes check only that
@@ -341,13 +364,18 @@ switch and the service shows there:
 - publication put right, the alarm for another document on the Homeserver and its
   clearing, another install signing, and records behind (`flows.rs`);
 - restore from the signer backup, in place and on a new install, with a version never
-  delivered and with a revocation only the switch holds, and two installs restored at
-  once, the second delivery refused `409 stale_identity` (`restore.rs`);
+  delivered and with a revocation only the switch holds (`restore.rs`); two installs
+  restored at once, the second delivery refused `409 stale_identity`, which the signer's
+  own tests don't run;
 - the hand-over both ways, its abort, and the abort racing the take-over with either
   arriving first (`handover.rs`), the account's erasure and its
   lost answer (`erasure.rs`), and the provider loss: declared at a new service and in
   place, declared again, refused, its staged admission ended, and restored mid-recovery
   (`recovery.rs`).
+
+A grant path the user declines at an approval (Switch spec 3.4) needs nothing here: the
+declines change only the Pubky grant the host approves, never the certificate, the version
+or the key bundle, so the switch's traffic is the same as for an approval that allows them.
 
 Not every honest path has a flow there. Among those without one: a stale backup refused at
 a restore, a Homeserver that holds another body at a restore, and a restore in place below
@@ -358,9 +386,12 @@ What stays only on the scripted switch, and why:
 - **A switch that misbehaves.** A removal time reported before the app was listed or after
   the answer that reports it; a copy of `identity.json` that doesn't verify, is older than
   the signer's mark, or has another body at it; an answer signed with the wrong key or
-  with a member left out; a delivery refused `413 too_large`, which no conforming signer
-  meets at the service. The service does none of these, so only a scripted fault shows
+  with a member left out. The service does none of these, so only a scripted fault shows
   what the signer does about them.
+- **A delivery refused for good,** other than a recovery's version over the service's app
+  limit: a `400` to any other version (an ordinary or a renewing version, a restore's next
+  version), a take-over refused, or a `413 too_large`. No conforming signer meets these at
+  the service, so the tests script the refusal.
 - **Exact timing.** A crash at each commit of a flow, a store that fails or can't tell
   whether it committed, and an answer lost at one chosen call among several alike: the
   tests place these by a commit's or a request's number.

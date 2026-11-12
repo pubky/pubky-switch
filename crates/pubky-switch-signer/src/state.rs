@@ -492,7 +492,8 @@ pub(crate) struct PendingClaim {
     pub(crate) app_id: [u8; 16],
     /// The document hash of its certificate.
     pub(crate) cert: [u8; 32],
-    /// The capabilities of the Pubky grant, as the auth request carries them.
+    /// The capabilities to approve the Pubky grant for: those the auth request asks for, in
+    /// its order, less the paths the user declined (Switch spec 3.4).
     pub(crate) caps: String,
     /// The claim's plaintext: the approval's JSON bytes, then the identity key's signature.
     #[serde(with = "pubky_switch_core::enc::serde_b64_vec")]

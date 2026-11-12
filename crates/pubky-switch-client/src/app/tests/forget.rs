@@ -14,12 +14,15 @@ use crate::testing::Fault;
 
 /// [`SampleProtocol`], whose note with `evict` gives up the note of that `msg_id` from the
 /// same sender: it forgets its pair and deletes its local copy in the step. With `drop` set
-/// too, the step forgets and then drops the message.
+/// too, the step forgets and then drops the message. With `pad`, the step first writes that
+/// many bytes of local state, and goes on to apply when the forget is refused.
 #[derive(Default)]
 struct Evicting {
     sample: SampleProtocol,
     /// What each `forget_processed` of a step returned.
     forgot: Mutex<Vec<bool>>,
+    /// The forgets refused in a step with `pad`.
+    refused: Mutex<Vec<AppError>>,
 }
 
 impl Protocol for Evicting {
@@ -43,8 +46,24 @@ impl Protocol for Evicting {
     }
     fn receive_with(&self, message: &ReceivedMessage, cx: &mut ReceiveContext<'_>) -> Outcome {
         if let Some(evict) = message.message.body.get("evict").and_then(Value::as_str) {
+            let pad = message.message.body.get("pad").and_then(Value::as_u64);
+            if let Some(pad) = pad {
+                let write = LocalWrite::Put {
+                    key: b"pad".to_vec(),
+                    value: vec![0; usize::try_from(pad).unwrap()],
+                };
+                if cx.local(write).is_err() {
+                    return Outcome::Drop {
+                        reason: "pad".into(),
+                    };
+                }
+            }
             let forgot = match cx.forget_processed(message.sender, evict) {
                 Ok(forgot) => forgot,
+                Err(error) if pad.is_some() => {
+                    self.refused.lock().unwrap().push(error);
+                    return self.sample.receive(message);
+                }
                 Err(error) => {
                     return Outcome::Drop {
                         reason: error.to_string(),
@@ -463,4 +482,85 @@ async fn test_forget_processed_in_a_step_without_operations() {
             .unwrap();
     let report = app.receive(None).await.unwrap();
     assert!(received(&report.events, again), "{:?}", report.events);
+}
+
+/// The keys a step forgets count against `MAX_STEP_LOCAL_BYTES` with its local writes: a
+/// forget past the bound is refused, so the pair stays and a re-send is still a duplicate,
+/// and the step's effect, applied all the same, is stored as too large.
+#[tokio::test]
+async fn test_forget_processed_past_the_step_bound_is_refused() {
+    use crate::app::{MAX_STEP_LOCAL_BYTES, ParkReason};
+    let s = Setup::new();
+    let mut app = s.wallet().await;
+    let me = app.app_id();
+    let (_, first) = s.note(me, json!({ "text": "first" }));
+    app.receive(None).await.unwrap();
+    // Room left for a little more, not for the forget's two keys.
+    let pad = MAX_STEP_LOCAL_BYTES - crate::app::LOCAL_WRITE_OVERHEAD_BYTES - b"pad".len() - 16;
+    s.note(
+        me,
+        json!({ "text": "evict", "evict": first.msg_id, "pad": pad }),
+    );
+    app.receive(None).await.unwrap();
+    let refused = s.protocol.refused.lock().unwrap().clone();
+    assert!(
+        matches!(refused.as_slice(), [AppError::Refused(Refusal::Usage(_))]),
+        "{refused:?}"
+    );
+    assert!(s.protocol.forgot.lock().unwrap().is_empty());
+    assert!(
+        app.parked_entries()
+            .await
+            .unwrap()
+            .iter()
+            .any(|entry| entry.reason == ParkReason::EffectTooLarge),
+    );
+    let again = s.again(me, &first);
+    let report = app.receive(None).await.unwrap();
+    assert!(duplicate(&report.events, again), "{:?}", report.events);
+}
+
+/// A kept effect that forgets a pair, applied by the old service and settled from the old
+/// chain when the app follows a move (Switch spec 12.5 "Kept batches"): the forget commits
+/// with that outcome, as with any other.
+#[tokio::test]
+async fn test_forget_processed_settled_at_a_move_forgets_the_pair() {
+    use super::moves::{NEXT, Router, freeze_for, join_on, next_key, publish_at};
+    let s = Setup::new();
+    let router = Router::of(&s.w);
+    let mut app = join_on(
+        &s.w,
+        &router,
+        Arc::clone(&s.w.store) as Arc<dyn StateStore>,
+        s.protocol.clone(),
+        &[Permission::ConversationAdd],
+    )
+    .await;
+    let me = app.app_id();
+    let (_, kept) = s.note(me, json!({ "text": "kept" }));
+    app.receive(None).await.unwrap();
+    s.note(me, json!({ "text": "evict", "evict": kept.msg_id }));
+    s.w.switch
+        .fail_next(Fault::LoseAnswer { path: "ops".into() });
+    app.receive(None).await.unwrap_err();
+    let ns = crate::store::client_namespace(&me);
+    let pair = crate::app::state::key::processed(&s.w.bob.public(), &kept.msg_id);
+    assert!(s.w.store.get(&ns, pair.as_bytes()).unwrap().is_some());
+    // The move: the old service freezes, the next imports it, and the app follows.
+    let n_key = next_key();
+    s.w.switch.freeze(&freeze_for(&s.w, &n_key, 2)).unwrap();
+    let next = s.w.switch.import_into(n_key.to_bytes());
+    router.add(NEXT, &next);
+    let _ = app.receive(None).await;
+    publish_at(
+        &s.w,
+        &next,
+        Inbox::new(NEXT, n_key.verifying_key().to_bytes()),
+        2,
+        None,
+    );
+    app.receive(None).await.unwrap();
+    assert!(app.state.pending_effect.is_none());
+    assert!(s.w.store.get(&ns, pair.as_bytes()).unwrap().is_none());
+    assert!(!note_kept(&app, &kept.msg_id).await);
 }
