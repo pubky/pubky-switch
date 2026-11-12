@@ -4,7 +4,7 @@
 
 use pubky_switch::limits::Limits;
 use pubky_switch_client::app::DOC_CACHE_MS;
-use pubky_switch_client::app::{App, AppEvent, ClaimOp, ObligationDeadline, RecordTarget};
+use pubky_switch_client::app::{App, ClaimOp, ObligationDeadline, RecordTarget};
 use pubky_switch_client::client::{Credentials, SwitchClient};
 use pubky_switch_client::clock::Clock;
 use pubky_switch_client::testing::TestIdentity;
@@ -73,8 +73,8 @@ fn expect_records(world: &World, name: &str, records: usize, divergent: usize) -
     }
 }
 
-/// What `app` reads of the record at `target` from the switch, and whether the read told
-/// it the record is divergent.
+/// What `app` reads of the record at `target` from the switch, and whether it then holds
+/// the record divergent.
 async fn read(
     world: &World,
     name: &str,
@@ -88,9 +88,9 @@ async fn read(
         &json!({ "record": shown(read.as_ref()), "events": events(&raised) }),
     );
     world.advance_ms(STEP_MS);
-    Ok(raised
-        .iter()
-        .any(|event| matches!(event, AppEvent::RecordDivergent { .. })))
+    // Whether the app holds the record divergent: it was told when a view first showed it
+    // so (`RecordDivergent`), at this read or at the feed read that met the upload.
+    Ok(read.as_ref().is_some_and(|record| record.divergent))
 }
 
 /// Records brought to the new service by uploads. alice's wallet and phone share a
