@@ -52,8 +52,6 @@ mod rotation;
 mod state;
 mod unverified;
 mod uploaded;
-#[cfg(test)]
-mod send_futures;
 mod writer_certs;
 
 mod admission;

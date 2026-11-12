@@ -28,12 +28,12 @@
 //! - [`error`]: the typed errors.
 
 pub mod alert;
-#[cfg(test)]
-mod send_futures;
 pub mod error;
 pub mod homeserver;
 pub mod key;
 pub mod protocol;
+#[cfg(test)]
+mod send_futures;
 mod signer;
 pub mod state;
 
