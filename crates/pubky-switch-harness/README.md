@@ -115,6 +115,12 @@ The flows send every call the service serves, each at both switches. What they l
   that still finds entries to read are left to the service's own tests.
 - **More of the lists:** an invite code withdrawn or used several times, an invite, a
   conversation entry pruned, a connection request.
+- **More of connect requests.** The `connect request` flows ask, allow, decline and
+  deny, fill the list, turn the policy off with a request pending, and ask across a
+  provider loss. Not sent: a request past `connect_per_min` or `stranger_per_min`, which
+  takes more requests in a minute than a flow sends; the push a request queues; a request
+  an invite code's first admitted append answers; one to a frozen account; and a `POST
+  /connect` from an own app or from the signer.
 - **Longer lives:** a renewal that adds a scope, a claim that runs out by time, an
   identity that enrolls again after an erasure.
 - **The Homeserver's side of a grant.** The `approval` flows hold the capabilities the
@@ -173,6 +179,6 @@ Each flow's run against the service makes one test database and drops it, also w
 test panics; the flows run one after another. Each run is on a thread of its own with 16 MiB
 of stack (`FLOW_STACK_BYTES`, `on_flow_stack`): in a debug build the deepest flow used
 1.9 MiB, close to the 2 MiB of a test's thread, and a test binary aborted when the thread
-that ran the flows had less left. Sixty-six flows take about three minutes in a
+that ran the flows had less left. Seventy flows take about three minutes in a
 debug build. If that grows too long, the service's halves could share one service and one
 database, with identities of their own per flow: a later option, not needed yet.

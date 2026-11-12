@@ -276,11 +276,9 @@ pub fn flow_of(call: &Call) -> Option<&'static str> {
         Call::RecoveryUpload => Some("provider loss, a sender admitted"),
         // A restored app lacks the keys of a part it passed before its loss, which went.
         Call::RequestKeys(_) => Some("restore"),
+        Call::PostConnect | Call::GetConnect | Call::DeleteConnect(_) => Some("connect request"),
         // Not served yet.
-        Call::PostConnect
-        | Call::GetConnect
-        | Call::DeleteConnect(_)
-        | Call::PutPush
+        Call::PutPush
         | Call::Freeze
         | Call::Unfreeze
         | Call::Export
