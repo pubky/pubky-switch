@@ -62,6 +62,18 @@ pub struct World {
     scripted: Mutex<Vec<Arc<ScriptedSwitch>>>,
     /// How many switches each identity was given an account's key at, by Pubky ID.
     homes: Mutex<std::collections::HashMap<String, u8>>,
+    /// The Homeserver writes and deletions to fail, each once.
+    homeserver_faults: Arc<Mutex<Vec<HomeserverFault>>>,
+}
+
+/// A write or a deletion at a signer's own Homeserver that fails once, as when the
+/// Homeserver can't be reached: nothing is written or deleted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HomeserverFault {
+    /// Whether it is a deletion that fails; a write otherwise.
+    deletion: bool,
+    /// The path of the file.
+    path: String,
 }
 
 impl std::fmt::Debug for World {
@@ -103,6 +115,7 @@ impl World {
             services: Mutex::new(Vec::new()),
             scripted: Mutex::new(Vec::new()),
             homes: Mutex::new(std::collections::HashMap::new()),
+            homeserver_faults: Arc::new(Mutex::new(Vec::new())),
         }))
     }
 
@@ -284,9 +297,34 @@ impl World {
             homeserver: Arc::new(OwnFiles {
                 identity: identity.public(),
                 files: self.files.clone(),
+                faults: self.homeserver_faults.clone(),
             }),
             protocols,
         })
+    }
+
+    /// The next write of the file at `path` by a signer to its own Homeserver fails, once:
+    /// nothing is written, and the signer sees a connection failure. The Homeserver is no
+    /// switch, so this is the same in both runs.
+    pub fn fail_homeserver_write(&self, path: &str) {
+        lock(&self.homeserver_faults).push(HomeserverFault {
+            deletion: false,
+            path: path.to_owned(),
+        });
+    }
+
+    /// The next deletion of the file at `path` by a signer at its own Homeserver fails,
+    /// once: the file stays.
+    pub fn fail_homeserver_deletion(&self, path: &str) {
+        lock(&self.homeserver_faults).push(HomeserverFault {
+            deletion: true,
+            path: path.to_owned(),
+        });
+    }
+
+    /// The Homeserver faults asked for that no write or deletion has met yet.
+    pub fn homeserver_faults_left(&self) -> usize {
+        lock(&self.homeserver_faults).len()
     }
 
     /// A keyring holding `identity`'s key, as after the host stored it in its vault.
@@ -529,6 +567,18 @@ impl Transport for Accounts {
 struct OwnFiles {
     identity: [u8; 32],
     files: Arc<TestHomeserver>,
+    faults: Arc<Mutex<Vec<HomeserverFault>>>,
+}
+
+impl OwnFiles {
+    /// Whether a write or a deletion at `path` meets a fault, which is then used up.
+    fn fails(&self, deletion: bool, path: &str) -> bool {
+        let mut faults = lock(&self.faults);
+        let met = faults
+            .iter()
+            .position(|fault| fault.deletion == deletion && fault.path == path);
+        met.map(|at| faults.remove(at)).is_some()
+    }
 }
 
 impl Homeserver for OwnFiles {
@@ -537,11 +587,17 @@ impl Homeserver for OwnFiles {
     }
 
     fn put(&self, path: &str, bytes: Vec<u8>) -> BoxFuture<'_, Result<(), TransportError>> {
+        if self.fails(false, path) {
+            return Box::pin(async { Err(TransportError::Connect("the Homeserver".into())) });
+        }
         self.files.put(self.identity, path, bytes);
         Box::pin(async { Ok(()) })
     }
 
     fn delete(&self, path: &str) -> BoxFuture<'_, Result<(), TransportError>> {
+        if self.fails(true, path) {
+            return Box::pin(async { Err(TransportError::Connect("the Homeserver".into())) });
+        }
         self.files.remove(self.identity, path);
         Box::pin(async { Ok(()) })
     }

@@ -27,6 +27,7 @@ mod removal;
 mod renewal;
 mod restore;
 mod retries;
+mod revocations;
 mod upload;
 mod waiting;
 mod watching;
@@ -52,7 +53,7 @@ pub use records::records;
 pub use recovery::{
     provider_loss, provider_loss_in_place, provider_loss_in_place_sender,
     provider_loss_refusals_in_transit, provider_loss_refused, provider_loss_restored,
-    provider_loss_sender_admitted,
+    provider_loss_revocation_meanwhile, provider_loss_sender_admitted,
 };
 pub use reduction::renewal_drops_scope;
 pub use removal::{departure, revocation};
@@ -62,6 +63,7 @@ pub use retries::{
     app_retries, append_retry, claim_and_read_retries, claim_retries, removal_retries,
     signer_retries,
 };
+pub use revocations::{departure_time, revocation_cleanup, revocation_times, revocation_unread};
 pub use upload::{
     recovery_upload_claim, recovery_upload_deny_only, recovery_upload_records,
     recovery_upload_refused,
@@ -151,6 +153,21 @@ pub const FLOWS: &[(&str, Flow)] = &[
     }),
     ("provider loss, restored", |world| {
         Box::pin(provider_loss_restored(world))
+    }),
+    ("provider loss, a revocation asked meanwhile", |world| {
+        Box::pin(provider_loss_revocation_meanwhile(world))
+    }),
+    ("revocation, the time it counts from", |world| {
+        Box::pin(revocation_times(world))
+    }),
+    ("departure, a version delivered meanwhile", |world| {
+        Box::pin(departure_time(world))
+    }),
+    ("revocation, cleanup and purge", |world| {
+        Box::pin(revocation_cleanup(world))
+    }),
+    ("revocation, the switch unread", |world| {
+        Box::pin(revocation_unread(world))
     }),
     ("recovery upload, a claim rebuilt", |world| {
         Box::pin(recovery_upload_claim(world))

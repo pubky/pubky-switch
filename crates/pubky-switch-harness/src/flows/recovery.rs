@@ -742,6 +742,96 @@ pub async fn provider_loss_refusals_in_transit(world: &World) -> FlowResult {
     Ok(())
 }
 
+/// A revocation asked for while a recovery is in progress (Switch spec 12.6 step 1, 12.2).
+/// alice's service is lost. Her signer declares the loss, and the recovery's first
+/// document doesn't reach the new service: the recovery is in progress. She revokes her
+/// phone then. Nothing is sent, to the lost service or the new one: the revocation is kept
+/// and shown pending. The signer's next run completes the recovery at the new service and
+/// sends the revocation there; the version that removes the phone follows.
+///
+/// Calls: `POST /v1/{id}/apps/{app_id}/revoke` at the service an identity recovered at,
+/// for an app the recovery's document lists, and the removing version after it.
+///
+/// # Errors
+///
+/// When a step that should succeed against any switch fails, a fault met no request, the
+/// revocation sends a request while the recovery is in progress, or the phone isn't
+/// revoked and removed at the new service.
+pub async fn provider_loss_revocation_meanwhile(world: &World) -> FlowResult {
+    let alice = world.identity("alice")?;
+    world.add_switch(ORIGIN, &[&alice]).await?;
+    let mut signer = enroll(world, &alice, ORIGIN).await?;
+    let (_wallet, _) = joined(world, &alice, &mut signer, "wallet").await?;
+    let (phone, _) = joined(world, &alice, &mut signer, "phone").await?;
+
+    world.lose_switch(ORIGIN);
+    world.add_switch(RECOVERY_ORIGIN, &[&alice]).await?;
+    world.unreachable("PUT", "/identity");
+    let declared = signer
+        .declare_provider_loss(RECOVERY_ORIGIN, UserConfirmed::shown_and_confirmed())
+        .await;
+    world.outcome(
+        "the signer declared the loss, and its document didn't arrive",
+        &json!({ "ended": ended(&declared), "signer": status(&signer)? }),
+    );
+    world.advance_ms(STEP_MS);
+
+    let sent = world.requests_sent();
+    let revoking = signer
+        .revoke(phone.app_id(), None, UserConfirmed::shown_and_confirmed())
+        .await;
+    world.outcome(
+        "the signer was asked to revoke the phone, the recovery in progress",
+        &json!({ "ended": ended(&revoking), "signer": status(&signer)? }),
+    );
+    if revoking.is_ok() || world.requests_sent() != sent {
+        return Err(format!(
+            "a revocation during a recovery ended {} after {} requests",
+            ended(&revoking),
+            world.requests_sent() - sent
+        )
+        .into());
+    }
+    world.advance_ms(STEP_MS);
+
+    let resumed = signer.resume().await;
+    world.outcome(
+        "the signer's next run completed the recovery and sent the revocation",
+        &json!({ "ended": ended(&resumed), "signer": status(&signer)? }),
+    );
+    world.advance_ms(STEP_MS);
+    let removed = signer.complete_removals().await?;
+    let newest = signer.identity_doc()?;
+    world.outcome(
+        "the signer removed the phone at the new service",
+        &json!({
+            "all_removed": removed,
+            "apps": newest.as_ref().map(|doc| doc.body().apps.len()),
+            "removed": newest.as_ref().map(|doc| doc.body().removed.len()),
+            "inbox": newest.as_ref().map(|doc| doc.inbox().url.clone()),
+            "signer": status(&signer)?,
+        }),
+    );
+    if world.faults_left() != 0 {
+        return Err("a fault met no request".into());
+    }
+    let revocation = "{alice} POST /v1/{alice}/apps/{alice/phone}/revoke";
+    let revoked = world.last_fact(revocation, "status");
+    let listed = newest.as_ref().map(|doc| doc.body().apps.len());
+    let gone = newest.as_ref().map(|doc| doc.body().removed.len());
+    let at_new = newest
+        .as_ref()
+        .is_some_and(|doc| doc.inbox().url == RECOVERY_ORIGIN);
+    if revoked.as_deref() != Some("200") || listed != Some(1) || gone != Some(1) || !at_new {
+        return Err(format!(
+            "the revocation was answered {revoked:?}, and the newest version lists {listed:?} \
+             apps and removes {gone:?}"
+        )
+        .into());
+    }
+    Ok(())
+}
+
 /// A restore in the middle of a recovery. alice's service is lost with a revocation of her
 /// wallet still pending, which it never took. Her signer declares the loss, and the
 /// recovery's first document doesn't reach the new service. The install is gone then; a new
