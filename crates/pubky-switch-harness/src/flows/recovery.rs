@@ -402,7 +402,9 @@ pub async fn provider_loss_sender_admitted(world: &World) -> FlowResult {
 /// shop, which still holds her earlier `identity.json`, writes where it wrote before: the
 /// account, started afresh, holds no list, admission is staged, and the inbox answers
 /// `503 staged`. alice's wallet follows the recovery and its upload brings her contacts;
-/// bob's shop reads her newest document, tries again and is admitted.
+/// bob's shop reads her newest document, tries again and is admitted. The directory he
+/// reads then shows higher versions than before the recovery: they are the account's and
+/// went on counting.
 ///
 /// Calls: `POST /v1/{id}/inbox` at a staged account (`503 staged`), from a sender who
 /// holds the document of the generation lost; the same sender's calls after the upload.
@@ -441,6 +443,8 @@ pub async fn provider_loss_in_place_sender(world: &World) -> FlowResult {
     )
     .await?;
 
+    let before = directory_versions(world)?;
+
     let doc = alice_signer
         .declare_provider_loss(ORIGIN, UserConfirmed::shown_and_confirmed())
         .await?;
@@ -476,6 +480,16 @@ pub async fn provider_loss_in_place_sender(world: &World) -> FlowResult {
     if answered.as_deref() != Some("200") {
         return Err(format!("bob's note was answered {answered:?}").into());
     }
+    // The directory's versions are the account's: they went on counting across the
+    // recovery, so the version bob's shop held before it names no other set of apps now
+    // (Switch wire 7.4.10).
+    let after = directory_versions(world)?;
+    if after.0 <= before.0 || after.1 <= before.1 {
+        return Err(format!(
+            "the directory's versions were {before:?} before the recovery and are {after:?}"
+        )
+        .into());
+    }
     read_notes(
         world,
         "the wallet read bob's note after the recovery",
@@ -485,6 +499,24 @@ pub async fn provider_loss_in_place_sender(world: &World) -> FlowResult {
     )
     .await?;
     Ok(())
+}
+
+/// The `directory_version` and the `apps_version` bob's shop read last in alice's
+/// directory.
+fn directory_versions(world: &World) -> Result<(u64, u64), Box<dyn std::error::Error>> {
+    let version = |name: &str| -> Result<u64, Box<dyn std::error::Error>> {
+        let shown = world
+            .last_fact(
+                "{bob/shop} GET /v1/{alice}/directory",
+                &format!("body.{name}"),
+            )
+            .ok_or_else(|| format!("no directory read shows {name}"))?;
+        Ok(shown
+            .strip_prefix("number ")
+            .ok_or_else(|| format!("{name} reads {shown}"))?
+            .parse()?)
+    };
+    Ok((version("directory_version")?, version("apps_version")?))
 }
 
 /// `app` follows its feed; the flow fails unless its protocol has taken `notes` messages
