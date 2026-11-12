@@ -1381,10 +1381,10 @@ impl App {
         Ok(())
     }
 
-    /// One delivery try (module docs, steps 2 to 4).
-    /// [`App::deliver_under`] the copy of the recipient's `identity.json` held, and once
-    /// more after reading the newest one when an answer of its switch didn't verify with the
-    /// service key that copy names and the newest names another key or switch
+    /// One delivery try (module docs, steps 2 to 4): under the copy of the recipient's
+    /// `identity.json` held ([`App::deliver_under`]), and once more after reading the newest
+    /// one when an answer of its switch didn't verify with the service key that copy names
+    /// and the newest names another key or switch
     /// (Switch spec 4.3: a copy is re-fetched after any failure). The reads are bounded
     /// ([`App::reread_after_unverified`]); an answer that still doesn't verify is queued as
     /// any other.
@@ -1604,8 +1604,6 @@ impl App {
     }
 }
 
-/// Whether an error is the app's own (an alarm, the store, a refusal of the app's rules)
-/// rather than the network's or the switch's, which the outbox retries.
 /// What one try of a delivery came to.
 enum Delivered {
     /// Tried: accepted, queued, undeliverable or failed.
@@ -1627,6 +1625,8 @@ fn is_unverified(error: &AppError) -> bool {
     )
 }
 
+/// Whether an error is the app's own (an alarm, the store, a refusal of the app's rules)
+/// rather than the network's or the switch's, which the outbox retries.
 fn is_local(error: &AppError) -> bool {
     matches!(error.unkept(), AppError::Alarm(_) | AppError::Store(_))
 }

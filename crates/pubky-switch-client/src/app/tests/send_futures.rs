@@ -9,8 +9,21 @@ use crate::app::{AppBackup, LeaveMode, OutgoingMessage};
 fn assert_send<T: Send>(_: &T) {}
 
 /// Each future is made and dropped, never polled: the check is the compiler's.
-fn futures_are_send(app: &mut App, env: AppEnv, protocol: Arc<dyn Protocol>, backup: &AppBackup) {
+fn futures_are_send(
+    app: &mut App,
+    env: AppEnv,
+    protocol: Arc<dyn Protocol>,
+    backup: &AppBackup,
+    request: JoinRequest,
+) {
     assert_send(&app.receive(None));
+    assert_send(&app.check_for_move());
+    assert_send(&app.follow_provider());
+    assert_send(&app.fetch_key_bundle());
+    assert_send(&app.list_collections());
+    assert_send(&app.flush_cursor());
+    assert_send(&app.finish_leave());
+    assert_send(&app.backup_layered());
     assert_send(&app.set_protocol_member("sample", Some(Map::new()), None));
     assert_send(&app.renew_record(None));
     assert_send(&app.update_accepts());
@@ -26,10 +39,16 @@ fn futures_are_send(app: &mut App, env: AppEnv, protocol: Arc<dyn Protocol>, bac
         AppConfig::default(),
         [0; 16],
     ));
+    assert_send(&App::join(
+        env.clone(),
+        Arc::clone(&protocol),
+        AppConfig::default(),
+        request,
+    ));
     assert_send(&App::restore(env, protocol, AppConfig::default(), backup));
 }
 
 #[test]
 fn test_send_futures_of_the_app_are_send() {
-    let _ = futures_are_send as fn(&mut App, AppEnv, Arc<dyn Protocol>, &AppBackup);
+    let _ = futures_are_send as fn(&mut App, AppEnv, Arc<dyn Protocol>, &AppBackup, JoinRequest);
 }
