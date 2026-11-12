@@ -278,10 +278,13 @@ pub enum RecordContent {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Unopened {
-    /// For now: sealed at a data epoch whose key for its scope the app doesn't hold yet. An
-    /// app is given the keys of every data epoch from 1 to the current one for each scope
-    /// it holds, its approval's bundle and later parts included, so the key comes, and the
-    /// value opens once it is fetched.
+    /// Not open for now: sealed at a data epoch whose key for its scope the app doesn't
+    /// hold. The value opens once that key is fetched. An app is given the keys of every
+    /// data epoch from 1 to the current one for each scope it holds, its approval's bundle
+    /// and later parts included, but the key may still never come: a value sealed at an
+    /// epoch the app gets no key for, such as one past the current epoch or under a scope
+    /// its certificate no longer holds, or under a sub-scope it can't derive the key of,
+    /// stays so. The app can't tell those apart from a key on its way.
     KeyNotHeld {
         /// The data epoch the value is sealed at.
         data_epoch: u64,
