@@ -293,4 +293,6 @@ against it now:
   save the scripted faults;
 - the warnings about an app's open attempts at a revocation and before a lapse
   (`revocation.rs`, `renewal.rs`), whose attempts the test calls `open_attempt` and
-  `fail_attempt` script directly, with no entry or proof held.
+  `fail_attempt` script directly, with no entry or proof held and without the permission or
+  writer checks the service makes; `open_attempt` refuses, as the service does, a second open
+  attempt on a claim and any on a SETTLED one, and `fail_attempt` names the app resolving it.

@@ -752,12 +752,29 @@ impl ScriptedSwitch {
     }
 
     /// Script an attempt `app` owns on the claim `claim_key`, open, as its `attempt` entry
-    /// would leave it but with no entry or proof held: for what `GET /apps` lists of an app's
-    /// open attempts (Switch wire 7.4.12, 6.8).
-    pub fn open_attempt(&self, claim_key: [u8; 32], attempt_id: [u8; 16], app: [u8; 16]) {
+    /// would leave it, but with no entry or proof held and without the permission check the
+    /// service makes (`claims.write`): for what `GET /apps` lists of an app's open attempts
+    /// (Switch wire 7.4.12, 6.8).
+    ///
+    /// # Errors
+    ///
+    /// [`ScriptError::Refused`], as the service refuses the entry (`409 conflict`), when the
+    /// claim has an open attempt or is SETTLED.
+    pub fn open_attempt(
+        &self,
+        claim_key: [u8; 32],
+        attempt_id: [u8; 16],
+        app: [u8; 16],
+    ) -> Result<(), ScriptError> {
         let mut inner = self.lock();
         let now = inner.now();
         let claim = inner.shared.claims.entry(claim_key).or_default();
+        if claim.settled || claim.current.is_some() {
+            return Err(ScriptError::Refused {
+                status: 409,
+                body: json!({ "code": "conflict" }),
+            });
+        }
         claim.attempts.push(pubky_switch_core::claims::Attempt {
             attempt_id,
             owner: app,
@@ -770,17 +787,19 @@ impl ScriptedSwitch {
             from_upload: false,
         });
         claim.current = Some(claim.attempts.len() - 1);
+        Ok(())
     }
 
-    /// Script the attempt `attempt_id` on `claim_key` resolved as `failed` by its owner, as
-    /// [`ScriptedSwitch::open_attempt`] scripts it open.
-    pub fn fail_attempt(&self, claim_key: [u8; 32], attempt_id: [u8; 16]) {
+    /// Script the attempt `attempt_id` on `claim_key` resolved as `failed` by the app `by`,
+    /// as its `failed` entry would leave it, without the permission and writer checks the
+    /// service makes (Switch wire 6.8).
+    pub fn fail_attempt(&self, claim_key: [u8; 32], attempt_id: [u8; 16], by: [u8; 16]) {
         let mut inner = self.lock();
         if let Some(claim) = inner.shared.claims.get_mut(&claim_key) {
             for attempt in &mut claim.attempts {
                 if attempt.attempt_id == attempt_id {
                     attempt.outcome = pubky_switch_core::claims::Outcome::Failed;
-                    attempt.resolved_by = Some(attempt.owner);
+                    attempt.resolved_by = Some(by);
                 }
             }
             claim.current = None;
