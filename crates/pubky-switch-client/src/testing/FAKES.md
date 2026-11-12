@@ -108,7 +108,9 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   /connect` needs `lists.read`, `DELETE /connect/{pubky}` `conversation.add`. A contact, a
   conversation entry or a deny list entry for the sender answers its request, the entry an
   invite code's first append writes included. Unlike the service: no `connect_per_min` or
-  `stranger_per_min` (no rates, above), and no flag hits.
+  `stranger_per_min` (no rates, above), and no flag hits. A sender the allowlist admits is
+  answered `pending` with nothing kept, as at the service. Neither switch sends the push
+  `policy.connect_requests.push` asks for yet: push isn't served.
 - **Records**: `divergent` is set by divergent uploads after a provider loss and cleared
   by a write here, as at the service (Recovery uploads, below).
 - **Directory** (Switch wire 7.4.10): an app is reachable from its first receive key until

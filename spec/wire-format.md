@@ -1252,7 +1252,7 @@ Example (`operations.json` `record.put create`, which `chain.json` applies at `s
 }
 ```
 
-**`allow.put`, `allow.delete`** (spec 7): `{ "pubky": pubky, "kind": "contact" | "conversation" }`. Contacts need `lists.manage`; adding a conversation entry needs `conversation.add`, removing one `lists.manage`. Adding an entry that exists changes nothing (a conversation entry keeps its first writer) but is still chained. Adding a conversation entry for a pending connect request removes the request.
+**`allow.put`, `allow.delete`** (spec 7): `{ "pubky": pubky, "kind": "contact" | "conversation" }`. Contacts need `lists.manage`; adding a conversation entry needs `conversation.add`, removing one `lists.manage`. Adding an entry that exists changes nothing (a conversation entry keeps its first writer) but is still chained. Adding an entry of either kind for the sender of a pending connect request removes the request (7.4.7).
 
 **`deny.put`, `deny.delete`**: `{ "pubky": pubky }`. Need `lists.manage`. Denying removes a pending connect request.
 
@@ -1984,7 +1984,20 @@ Example page (alice's `wallet` after `1:4`: bob's entry at `seq` 5, then four ch
 
 #### 7.4.7 Connect requests
 
-- **`POST /v1/{id}/connect`** (an app of another identity), empty body. Answer `{ "pending": true, "known_version" }`, also to a denied sender, whose request isn't kept, so the answer doesn't reveal the deny list (spec 7). Errors: `403 not_admitted` when the policy turns connect requests off; `409 identity_needed` as for appends, also to an app the held copy lists as removed (7.2); `429 rate_limited`, per sender (`connect_per_min`) and per account for all such senders together (`stranger_per_min`), a denied sender counted alike; `429 quota_exceeded` with `current.limit` `connect_requests` when `max_pending` requests (the policy's, at most `max_connect_pending`) are pending and the sender has none, checked after the rate limits and before the deny list, so a denied sender gets this same answer while the list is full. One pending request per sender identity: a sender already pending is answered `pending`, full or not. The requests already pending stay; none is dropped to make room. With `policy.connect_requests.push`, the current apps holding `lists.read` get a push, queued like an entry's webhooks (8.2), at most once per app in 60 seconds of service time, however many requests arrive.
+- **`POST /v1/{id}/connect`** (an app of another identity), empty body. Answer `{ "pending": true, "known_version" }`, also to a denied sender, whose request isn't kept, so the answer doesn't reveal the deny list (spec 7). The service judges it in this order, answering with the first that holds:
+  1. the caller's own checks (7.2);
+  2. a frozen account: `410 moved` (7.3);
+  3. while a recovery stages admission, every sender: `503 staged`, as at `PUT /peers` (spec 12.6 step 2);
+  4. the policy turns connect requests off: `403 not_admitted`;
+  5. the service's copy of the sender's `identity.json` doesn't list the app with its certificate: `409 identity_needed`, also to an app the held copy lists as removed, answered like a stranger with no copy held (7.2);
+  6. `429 rate_limited` past `connect_per_min` for the sender, then past `stranger_per_min` for the account, all strangers together, their `PUT /peers` deliveries included;
+  7. a sender already pending, or one a contact or a conversation entry admits, is answered `pending`, full or not; nothing is kept for the admitted one, since an admission answers a request, so the two never hold together. A sender holding an unused invite code isn't on the lists yet and asks as a stranger;
+  8. `429 quota_exceeded` with `current.limit` `connect_requests` when `max_pending` requests are pending (the policy's, at most `max_connect_pending`; 0 refuses every new sender), checked before the deny list, so a denied sender gets this same answer while the list is full;
+  9. a denied sender is answered `pending` and nothing is kept;
+  10. the request is kept, with the service time of its commit as `at`.
+
+  The requests already pending stay; none is dropped to make room, and a cap lowered below the number pending drops none either: the list stays full until the user clears it. Only the `429 rate_limited` refusals of step 6 count a hit for the sender's flag (9.4), as only an append's rate refusals do; a denied sender answered `pending` counts none. With `policy.connect_requests.push`, the current apps holding `lists.read` get a push, queued like an entry's webhooks (8.2), at most once per app in 60 seconds of service time, however many requests arrive.
+- **Answering:** a request goes in the transaction of whatever answers it: an `allow.put` of either kind for its sender, the conversation entry the service writes at an invite code's first admitted append from it (7.4.3), a `deny.put` for it, or `DELETE /connect/{pubky}`. With the policy turned off, `POST` is refused, but the requests pending stay, `GET` and `DELETE` keep serving them and these answers still remove them; turned on again, the policy shows them.
 - **`GET /v1/{id}/connect`** (own app with `lists.read`). Answer `{ "requests": [ { "pubky", "at": time } ], "max_pending": int, "full": bool }`: the requests oldest first, the cap that applies, and whether the list is full, so the app can offer the user to clear it or block senders.
 - **`DELETE /v1/{id}/connect/{pubky}`** (own app with `conversation.add`). Answer `{ "declined": pubky }`; `404` when no request is pending from it.
 
@@ -2442,7 +2455,7 @@ Spec 6.3. For every kind of state the service keeps, how long it keeps it, which
 | Conversation entry | until removed | list limit | `max_conversations` 100,000 | `allow.put` of a new entry is `429` (`conversations`); an append admitted by an invite code is `429` (`conversations`) and waits |
 | Deny list entry | until removed | list limit | `max_deny` 100,000 | `deny.put` of a new entry is `429` (`deny`) |
 | Invite code | until it expires, runs out or is withdrawn | invite code limit, live codes only | `max_invite_codes` 1,000 | `invite_code.put` is `429` (`invite_codes`) |
-| Connect request | until answered (a conversation entry, a deny list entry or `DELETE /connect`) | the policy's `max_pending` | `max_connect_pending` 1,000 caps `max_pending` | a sender with no pending request gets `429 quota_exceeded`, `connect_requests` (7.4.7); none drops |
+| Connect request | until answered (a contact, a conversation entry, a deny list entry or `DELETE /connect`, 7.4.7) | the policy's `max_pending` | `max_connect_pending` 1,000 caps `max_pending` | a sender with no pending request gets `429 quota_exceeded`, `connect_requests` (7.4.7); none drops |
 | A frozen account's last `identity.json` and freeze | while frozen, and after a move at least `record_max_age` (7.4.15) | - | one of each | - |
 | Sender flag | while among the most frequent | - | `max_flags` 1,000 | the least frequent drop |
 | App record, current receive key record, key bundle parts | while the app is listed in `apps` or `removed`, or awaits its rotation; a key bundle part only until the app's cursor has passed it and `keys_through` covers it, unless a full-bundle request is in force: from the `POST /keys` until the app's cursor has passed the part that completed it, or the part that replaced that one (6.2) | app limit (3.7) | one record and one current receive key record per app; key bundle parts that never overlap (6.2), so at most one key per scope and data epoch | - |
