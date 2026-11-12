@@ -11,6 +11,7 @@
 mod admission;
 mod claim;
 mod collections;
+mod connect;
 mod enrollment;
 mod epochs;
 mod erasure;
@@ -42,6 +43,7 @@ use pubky_switch::http::route::Call;
 pub use admission::{deny_list, invite_code};
 pub use claim::claim;
 pub use collections::two_collections;
+pub use connect::connect_request;
 pub use enrollment::enrollment;
 pub use epochs::{epochs_three_readers, rotation_given_up, third_epoch};
 pub use erasure::{erasure, erasure_answer_lost};
@@ -167,6 +169,7 @@ pub const FLOWS: &[(&str, Flow)] = &[
     ("waiting read, a recovery in place", |world| {
         Box::pin(waiting_read_recovered(world))
     }),
+    ("connect request", |world| Box::pin(connect_request(world))),
     ("approval, grant paths declined", |world| {
         Box::pin(grant_paths_declined(world))
     }),
