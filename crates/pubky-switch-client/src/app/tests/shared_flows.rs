@@ -5298,7 +5298,7 @@ async fn test_records_held_unreadable_opens_once_its_key_arrives() {
 /// A store whose commits that end an owed reopening fail, as many times as `failing` says.
 struct FailingReopen {
     inner: MemoryStore,
-    failing: std::sync::atomic::AtomicU32,
+    failing: std::sync::Mutex<u32>,
 }
 
 impl StateStore for FailingReopen {
@@ -5320,15 +5320,12 @@ impl StateStore for FailingReopen {
         let ends_reopen = batch.writes.iter().any(|write| {
             matches!(write, crate::store::Write::Delete { key, .. } if key.as_slice() == b"reopen")
         });
-        let fails = ends_reopen
-            && self
-                .failing
-                .fetch_update(
-                    std::sync::atomic::Ordering::SeqCst,
-                    std::sync::atomic::Ordering::SeqCst,
-                    |left| left.checked_sub(1),
-                )
-                .is_ok();
+        let fails = ends_reopen && {
+            let mut left = self.failing.lock().unwrap();
+            let fails = *left > 0;
+            *left = left.saturating_sub(1);
+            fails
+        };
         if fails {
             return Err(crate::error::StoreError::Unavailable);
         }
@@ -5344,7 +5341,7 @@ async fn test_records_reopening_that_fails_is_made_at_the_next_read() {
     let s = Setup::new();
     let store = Arc::new(FailingReopen {
         inner: MemoryStore::new(),
-        failing: std::sync::atomic::AtomicU32::new(0),
+        failing: std::sync::Mutex::new(0),
     });
     let request = s.approve(&app_keys("wallet"), &ALL_PERMISSIONS);
     let mut wallet = App::join(
@@ -5365,10 +5362,10 @@ async fn test_records_reopening_that_fails_is_made_at_the_next_read() {
     );
     // The key arrives, and the reopening's commit fails at each try of that read: after
     // the page, and at the read's end.
-    store.failing.store(2, std::sync::atomic::Ordering::SeqCst);
+    *store.failing.lock().unwrap() = 2;
     store_parts_for(&s, &wallet.cert().clone());
     let report = wallet.receive(None).await.unwrap();
-    assert_eq!(store.failing.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(*store.failing.lock().unwrap(), 0);
     assert!(
         report
             .events
