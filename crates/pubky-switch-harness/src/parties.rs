@@ -33,10 +33,18 @@ pub const NOTES_JOURNAL: &str = "notes_journal";
 /// read the lists and can't change them.
 pub const NOTES_READER: &str = "notes_reader";
 
+/// A path the [`Notes`] protocol adds to the grant of an app holding [`NOTES`], which the
+/// user may decline (Switch spec 3.4): it goes only together with [`NOTES_PROFILE_FILES`].
+pub const NOTES_PROFILE: &str = "/pub/notes/profile.json";
+
+/// The folder of [`NOTES_PROFILE`]'s files, added and declined with it.
+pub const NOTES_PROFILE_FILES: &str = "/pub/notes/profile-files/";
+
 /// A neutral protocol, the signer's side of it. Its scope [`NOTES`] has keys and needs every
 /// switch permission, so its apps read and change the lists and write claims; its scope
 /// [`NOTES_LISTS`] has no keys and needs `lists.manage` alone; its scope [`NOTES_READER`]
-/// has no keys and needs `lists.read` alone.
+/// has no keys and needs `lists.read` alone. It adds [`NOTES_PROFILE`] and
+/// [`NOTES_PROFILE_FILES`] to the grant of an app holding [`NOTES`], both or neither.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Notes;
 
@@ -68,8 +76,28 @@ impl Protocol for Notes {
         }
     }
 
-    fn grant_paths(&self, _: &[u8; 16], _: &[&str]) -> Vec<GrantPath> {
-        Vec::new()
+    fn grant_paths(&self, _: &[u8; 16], scopes: &[&str]) -> Vec<GrantPath> {
+        if !scopes.contains(&NOTES) {
+            return Vec::new();
+        }
+        vec![
+            GrantPath {
+                path: NOTES_PROFILE.to_owned(),
+                purpose: "Edit the notes profile".to_owned(),
+            },
+            GrantPath {
+                path: NOTES_PROFILE_FILES.to_owned(),
+                purpose: "Store the notes profile's files".to_owned(),
+            },
+        ]
+    }
+
+    fn check_grant_paths(&self, _: &[u8; 16], _: &[&str], allowed: &[&str]) -> Result<(), String> {
+        if allowed.contains(&NOTES_PROFILE) == allowed.contains(&NOTES_PROFILE_FILES) {
+            Ok(())
+        } else {
+            Err("the notes profile and its files go together".to_owned())
+        }
     }
 }
 
@@ -155,11 +183,32 @@ impl Asking {
     ///
     /// When the request doesn't sign.
     pub fn for_scopes(keys: AppKeys, scopes: &[&str]) -> Result<Self, HarnessError> {
+        Self::for_scopes_with_paths(keys, scopes, &[], [9; 32])
+    }
+
+    /// The same, asking for the grant of its own record's path and then of `paths`, such as
+    /// [`NOTES_PROFILE`] and [`NOTES_PROFILE_FILES`], with the auth request's `secret`: a
+    /// second request of a listed app takes another one, as a new auth request does.
+    ///
+    /// # Errors
+    ///
+    /// When the request doesn't sign.
+    pub fn for_scopes_with_paths(
+        keys: AppKeys,
+        scopes: &[&str],
+        paths: &[&str],
+        secret: [u8; 32],
+    ) -> Result<Self, HarnessError> {
+        let caps = std::iter::once(app_record_path(&keys.app_id_bytes()))
+            .chain(paths.iter().map(|path| (*path).to_owned()))
+            .map(|path| format!("{path}:rw"))
+            .collect::<Vec<_>>()
+            .join(",");
         let auth = AuthRequest {
             client_id: "app.example".into(),
             client_key: [8; 32],
-            caps: format!("{}:rw", app_record_path(&keys.app_id_bytes())),
-            secret: [9; 32],
+            caps,
+            secret,
         };
         let scopes = scopes.iter().map(|scope| (*scope).to_owned()).collect();
         let body = AppRequestBody::new(&keys, scopes, &auth);
@@ -192,5 +241,57 @@ impl Asking {
             request: self.request.clone(),
             approval: approval.to_vec(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use super::*;
+
+    #[test]
+    fn test_notes_profile_paths_go_together() {
+        let keys = AppKeys::from_secrets([3; 32], [4; 32]);
+        let id = keys.app_id_bytes();
+        assert_eq!(
+            Notes
+                .grant_paths(&id, &[NOTES])
+                .iter()
+                .map(|p| p.path.as_str())
+                .collect::<Vec<_>>(),
+            [NOTES_PROFILE, NOTES_PROFILE_FILES]
+        );
+        assert!(Notes.grant_paths(&id, &[NOTES_LISTS]).is_empty());
+        assert!(Notes.check_grant_paths(&id, &[NOTES], &[]).is_ok());
+        assert!(
+            Notes
+                .check_grant_paths(&id, &[NOTES], &[NOTES_PROFILE, NOTES_PROFILE_FILES])
+                .is_ok()
+        );
+        assert!(
+            Notes
+                .check_grant_paths(&id, &[NOTES], &[NOTES_PROFILE])
+                .is_err()
+        );
+        assert!(
+            Notes
+                .check_grant_paths(&id, &[NOTES], &[NOTES_PROFILE_FILES])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_notes_asking_with_paths_names_the_record_first() {
+        let keys = AppKeys::from_secrets([3; 32], [4; 32]);
+        let record = app_record_path(&keys.app_id_bytes());
+        let asking =
+            Asking::for_scopes_with_paths(keys.clone(), &[NOTES], &[NOTES_PROFILE], [7; 32])
+                .unwrap();
+        assert_eq!(asking.auth.caps, format!("{record}:rw,{NOTES_PROFILE}:rw"));
+        assert_eq!(asking.auth.secret, [7; 32]);
+        assert_eq!(asking.request.body().caps, asking.auth.caps);
+        let plain = Asking::for_scopes(keys, &[NOTES]).unwrap();
+        assert_eq!(plain.auth.caps, format!("{record}:rw"));
     }
 }
