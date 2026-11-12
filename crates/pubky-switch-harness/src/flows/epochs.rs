@@ -2,8 +2,8 @@
 //! record sealed at each epoch, and what an app that joins at the third epoch reads of
 //! them.
 
-use pubky_switch_client::app::{App, RecordTarget};
-use pubky_switch_signer::{Signer, UserConfirmed};
+use pubky_switch_client::app::{App, LeaveMode, RecordTarget};
+use pubky_switch_signer::{CertChange, Signer, UserConfirmed};
 use serde_json::json;
 
 use super::enrollment::{enroll, status};
@@ -12,8 +12,14 @@ use super::messaging::joined_as;
 use super::records::shown;
 use super::removal::follow;
 use super::{ORIGIN, STEP_MS};
-use crate::parties::{Asking, notes_collection, notes_protocol_with_records};
+use crate::parties::{
+    Asking, NOTES, NOTES_JOURNAL, notes_collection, notes_protocol_with_both_collections,
+    notes_protocol_with_records,
+};
 use crate::{FlowResult, World};
+
+/// A day in milliseconds.
+const DAY_MS: u64 = 24 * 3_600_000;
 
 /// The wallet writes the record `name`, sealed at the data epoch it is at.
 async fn write(world: &World, wallet: &mut App, name: &str) -> FlowResult {
@@ -204,5 +210,153 @@ pub async fn epochs_three_readers(world: &World) -> FlowResult {
     }
     signer.run_due().await?;
     world.outcome("signer ran what is due", &status(&signer)?);
+    Ok(())
+}
+
+/// The apps that hold the keyed scope beside the wallet, in the order they are approved:
+/// eight of them, so that a rotation's key bundles don't fit one batch of eight operations
+/// with the wallet's own (Switch wire 6.4). The last one is the last the document lists.
+const OTHERS: [&str; 8] = [
+    "phone", "tablet", "desk", "pad", "watch", "console", "reader", "radio",
+];
+
+/// A rotation given up, and its epoch completed (Switch spec 3.2, 3.5). alice has nine
+/// apps. Her signer renews the wallet's certificate without one of its keyed scopes, which
+/// rotates the data keys: the renewal's operations take two batches. The first is taken;
+/// the second never arrives. Before the signer sends it again, the radio, whose key bundle
+/// is in that batch, leaves. The batch, sent again byte for byte, is refused `403
+/// not_current`, since it holds a bundle for an app that departed (Switch wire 6.2
+/// `key_bundle.put`), and the signer gives the renewal up: the second epoch's keys are
+/// stored for some apps, and no version raised the epoch.
+///
+/// The signer's next run completes the second epoch for every current app in a version of
+/// its own, then removes the radio with a rotation to the third. The wallet, whose
+/// reduction was given up, keeps both its scopes and follows through both epochs.
+///
+/// Calls: the signer's `POST /v1/{id}/ops` with a rotation's second batch after its
+/// target left (`403 not_current`); `PUT /v1/{id}/identity` with a version that only
+/// raises the data epoch; the removing version after it; `GET
+/// /v1/{id}/apps/{app_id}/keys` by apps two epochs behind.
+///
+/// # Errors
+///
+/// When a step that should succeed against any switch fails, the second batch is taken or
+/// refused otherwise, or the epochs don't end at the third with the radio removed and the
+/// wallet's scopes kept.
+pub async fn rotation_given_up(world: &World) -> FlowResult {
+    let alice = world.identity("alice")?;
+    world.add_switch(ORIGIN, &[&alice]).await?;
+    let mut signer = enroll(world, &alice, ORIGIN).await?;
+    let scopes = [NOTES, NOTES_JOURNAL];
+    let (mut wallet, _) = joined_as(
+        world,
+        &alice,
+        &mut signer,
+        Asking::for_scopes(world.app_keys(&alice, "wallet")?, &scopes)?,
+        notes_protocol_with_both_collections(&scopes),
+    )
+    .await?;
+    let mut others = Vec::new();
+    for name in OTHERS {
+        let (app, _) = joined_as(
+            world,
+            &alice,
+            &mut signer,
+            Asking::new(world.app_keys(&alice, name)?)?,
+            notes_protocol_with_both_collections(&[NOTES]),
+        )
+        .await?;
+        others.push(app);
+    }
+    world.advance_ms(DAY_MS);
+
+    // The reduction's second batch doesn't arrive.
+    world.unreachable_after("POST", "/ops", 1);
+    let change = CertChange {
+        scopes: Some(vec![NOTES.to_owned()]),
+        expires_at: None,
+    };
+    let renewing = signer.renew(wallet.app_id(), change).await;
+    world.outcome(
+        "the signer renewed the wallet without a keyed scope, its second batch not arriving",
+        &json!({ "ok": renewing.is_ok(), "signer": status(&signer)? }),
+    );
+    if renewing.is_ok() || world.faults_left() != 0 {
+        return Err("the renewal's second batch wasn't cut off".into());
+    }
+    world.advance_ms(STEP_MS);
+
+    // The radio, the last app listed, leaves meanwhile.
+    let radio = others.last_mut().ok_or("no app was approved")?;
+    let left = radio.leave(LeaveMode::TwoStep).await?;
+    world.outcome("the radio left", &json!({ "report": format!("{left:?}") }));
+    world.advance_ms(STEP_MS);
+
+    let resumed = signer.resume().await;
+    let held = signer.identity_doc()?;
+    world.outcome(
+        "the signer sent the second batch again and gave the renewal up",
+        &json!({
+            "ok": resumed.is_ok(),
+            "data_epoch": held.as_ref().map(|doc| doc.data_epoch()),
+            "signer": status(&signer)?,
+        }),
+    );
+    let batch = "{alice} POST /v1/{alice}/ops";
+    let refused = (
+        world.last_fact(batch, "status"),
+        world.last_fact(batch, "body.code"),
+    );
+    let not_current = (Some("403".to_owned()), Some("text not_current".to_owned()));
+    if refused != not_current || held.as_ref().map(|doc| doc.data_epoch()) != Some(1) {
+        return Err(format!(
+            "the second batch was answered {refused:?}, and the signer's version is at \
+             epoch {:?}",
+            held.as_ref().map(|doc| doc.data_epoch())
+        )
+        .into());
+    }
+    world.advance_ms(STEP_MS);
+
+    signer.run_due().await?;
+    let newest = signer
+        .identity_doc()?
+        .ok_or("the signer holds no document")?;
+    world.outcome(
+        "the signer's run completed the second epoch and removed the radio at the third",
+        &json!({
+            "version_steps": newest.version() - held.as_ref().map_or(0, |doc| doc.version()),
+            "data_epoch": newest.data_epoch(),
+            "apps": newest.body().apps.len(),
+            "removed": newest.body().removed.len(),
+            "signer": status(&signer)?,
+        }),
+    );
+    if newest.data_epoch() != 3 || newest.body().apps.len() != 8 || newest.body().removed.len() != 1
+    {
+        return Err(format!(
+            "the run ended at epoch {} with {} apps listed and {} removed",
+            newest.data_epoch(),
+            newest.body().apps.len(),
+            newest.body().removed.len()
+        )
+        .into());
+    }
+    world.advance_ms(STEP_MS);
+
+    // Two apps follow, two epochs behind: the wallet, whose reduction was given up, and
+    // the phone.
+    follow(world, &mut wallet, "the wallet after the run").await?;
+    let phone = others.first_mut().ok_or("no app was approved")?;
+    follow(world, phone, "the phone after the run").await?;
+    let kept = wallet.cert().body().scopes.len();
+    if wallet.keys_through() != 3 || phone.keys_through() != 3 || kept != 2 {
+        return Err(format!(
+            "the wallet holds keys through epoch {} with {kept} scopes, the phone through {}",
+            wallet.keys_through(),
+            phone.keys_through()
+        )
+        .into());
+    }
     Ok(())
 }
