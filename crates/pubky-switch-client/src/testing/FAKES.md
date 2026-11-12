@@ -84,7 +84,11 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   certificate expires while its read is held is refused once the read is answered, where
   the service refuses it at the account's next commit; the answer is the same. Faults and
   the stale-timestamp check apply when the read is answered, not when it arrives.
-  `held_reads` counts the reads held and not woken since they last looked.
+  `held_reads` counts the reads held and not woken since they last looked. Unlike the
+  service, every request the switch answers first wakes every held read to look again
+  (`wake_held`), and a read with nothing to show then waits on. So a missing specific wake
+  (at a chained item, `start_afresh` or an erasure) is covered by the next request's: a test
+  sees it only if nothing else reaches the switch while the read is held.
 - **Retention and sweeps** (Switch wire 9.1, 7.4.4): an entry goes once every current
   target that isn't lagging has passed it, as at the service, judged at cursor moves, at
   appends and at deliveries, revocations and leaves (`keep_passed_entries` turns that off
