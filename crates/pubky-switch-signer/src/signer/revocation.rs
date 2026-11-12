@@ -173,6 +173,7 @@ impl Signer {
         let failures = self.revoke_at_switch().await?;
         let read = self.ready_at_switch().await?;
         let (mut statuses, mut answered_at) = (read.answer.apps, read.answer.server_time);
+        self.note_revoked_open_attempts(&statuses).await?;
         let mut newest = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
         let found = self.removals(&newest, &statuses, answered_at);
         if !found.unconfirmed.is_empty() {
@@ -234,6 +235,75 @@ impl Signer {
             .await?;
         self.resume().await?;
         Ok((true, failures))
+    }
+
+    /// How many attempts the app `app_id` owns that are open or `unknown`, as `GET /apps` lists
+    /// them (Switch wire 7.4.12); `0` for an App ID it doesn't list. The host shows the count
+    /// before the user confirms a revocation: they remain, the open ones orphaned, for the
+    /// identity's other apps or the user to resolve (Switch spec 12.2, 10.2). It signs nothing
+    /// and holds no revocation back. The read is the records' service's: during a recovery,
+    /// the lost one until the new one has answered its enrollment. As every read of `GET
+    /// /apps` it may commit what the answer shows, such as `AccountNotHosted` raised or
+    /// cleared, or the admission's end owed, and it first finishes deleting the records a
+    /// hand-over that took effect left.
+    ///
+    /// # Errors
+    ///
+    /// [`SignerError::NotNamed`] when another install signs; [`Refusal::RecordsBehind`];
+    /// [`Refusal::Erased`]; [`SignerError::HandedOver`] once a hand-over took effect; the
+    /// switch's or the store's error.
+    pub async fn open_attempts(&mut self, app_id: [u8; 16]) -> Result<u64> {
+        self.refresh().await?;
+        self.check_named()?;
+        let read = self.read_apps().await?;
+        Ok(open_attempts_of(&read.answer.apps, &app_id))
+    }
+
+    /// Bring [`Alert::RevokedWithOpenAttempts`] up to date with `statuses`: for each app a
+    /// revocation was asked for, and each one whose alert is held, its count of attempts
+    /// open or `unknown`, the alert gone at none (Switch spec 12.2).
+    async fn note_revoked_open_attempts(&mut self, statuses: &[AppStatus]) -> Result<()> {
+        let mut apps: Vec<[u8; 16]> = self.state.revoking.iter().map(|r| r.app_id).collect();
+        for alert in &self.state.alerts {
+            if let Alert::RevokedWithOpenAttempts { app_id, .. } = alert
+                && !apps.contains(app_id)
+            {
+                apps.push(*app_id);
+            }
+        }
+        // A held warning keeps its place, its count brought up to date; new ones go last.
+        let mut state = self.state.clone();
+        for app_id in apps {
+            let count = open_attempts_of(statuses, &app_id);
+            let held = state.alerts.iter_mut().find_map(|alert| match alert {
+                Alert::RevokedWithOpenAttempts {
+                    app_id: held,
+                    open_attempts,
+                } if *held == app_id => Some(open_attempts),
+                _ => None,
+            });
+            match held {
+                Some(open_attempts) => *open_attempts = count,
+                None if count > 0 => state.alert(Alert::RevokedWithOpenAttempts {
+                    app_id,
+                    open_attempts: count,
+                }),
+                None => {}
+            }
+        }
+        state.alerts.retain(|alert| {
+            !matches!(
+                alert,
+                Alert::RevokedWithOpenAttempts {
+                    open_attempts: 0,
+                    ..
+                }
+            )
+        });
+        if state != self.state {
+            self.commit(state, self.flow.clone()).await?;
+        }
+        Ok(())
     }
 
     /// Send the revocations asked for to the switch, as [`Signer::send_revocations`] does, and
@@ -652,6 +722,17 @@ fn reported_time(revoked_at: Option<u64>, departed_at: Option<u64>) -> Option<u6
 fn bounded_time(reported: u64, first_listed: Option<u64>, answered_at: u64) -> u64 {
     let floor = first_listed.unwrap_or(0);
     reported.max(floor).min(answered_at.max(floor))
+}
+
+/// How many attempts `app_id` owns that are open or `unknown`, as `statuses` list them
+/// (Switch wire 7.4.12).
+pub(super) fn open_attempts_of(statuses: &[AppStatus], app_id: &[u8; 16]) -> u64 {
+    statuses
+        .iter()
+        .find(|status| &status.app_id == app_id)
+        .map_or(0, |status| {
+            u64::try_from(status.open_attempts.len()).unwrap_or(u64::MAX)
+        })
 }
 
 #[cfg(test)]

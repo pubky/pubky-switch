@@ -888,7 +888,28 @@ impl Signer {
             }
         }
         self.renewals_taken(&taken).await?;
-        self.skip_renewals(skipped).await?;
+        // A stopped app that owns open or `unknown` attempts: they are its own until its
+        // expiry, and orphaned then, so the user is told so beside the stop (Switch spec 3.2,
+        // 10.2). In the same commit as the stops.
+        let lapsing: Vec<([u8; 16], u64, u64)> = skipped
+            .iter()
+            .filter_map(|alert| match alert {
+                Alert::RenewalsStopped { app_id, expires_at } => Some((
+                    *app_id,
+                    *expires_at,
+                    super::revocation::open_attempts_of(&statuses, app_id),
+                )),
+                _ => None,
+            })
+            .collect();
+        let mut state = self.state.clone();
+        for alert in skipped {
+            state.alert(alert);
+        }
+        lapsing_in(&mut state, &lapsing);
+        if state != self.state {
+            self.commit(state, None).await?;
+        }
         let mut renewed = Vec::new();
         for (app_id, lifetime) in due {
             self.ready().await?;
@@ -954,13 +975,51 @@ impl Signer {
 }
 
 /// The count of untaken renewals of each app in `apps` starts again in `state`, and its
-/// [`Alert::RenewalsStopped`] goes: the app is back, the user renewed it, or it is removed
-/// (Switch spec 3.1).
+/// [`Alert::RenewalsStopped`] and [`Alert::LapsingWithOpenAttempts`] go: the app is back,
+/// the user renewed it, or it is removed (Switch spec 3.1).
 pub(super) fn renewals_taken_in(state: &mut SignerState, apps: &[[u8; 16]]) {
     state.untaken_renewals.retain(|(id, _)| !apps.contains(id));
-    state.alerts.retain(
-        |alert| !matches!(alert, Alert::RenewalsStopped { app_id, .. } if apps.contains(app_id)),
-    );
+    state.alerts.retain(|alert| {
+        !matches!(alert, Alert::RenewalsStopped { app_id, .. }
+            | Alert::LapsingWithOpenAttempts { app_id, .. } if apps.contains(app_id))
+    });
+}
+
+/// Bring [`Alert::LapsingWithOpenAttempts`] in `state` up to date with `stopped`, each app
+/// whose renewals stopped this run with its expiry and its count of attempts open or
+/// `unknown`: a held warning keeps its place with the count and expiry brought up to date,
+/// a new one goes last, and one for an app not stopped now, or with none, goes.
+fn lapsing_in(state: &mut SignerState, stopped: &[([u8; 16], u64, u64)]) {
+    for (app_id, expires_at, count) in stopped {
+        let held = state.alerts.iter_mut().find_map(|alert| match alert {
+            Alert::LapsingWithOpenAttempts {
+                app_id: held,
+                expires_at,
+                open_attempts,
+            } if held == app_id => Some((expires_at, open_attempts)),
+            _ => None,
+        });
+        match held {
+            Some((held_expiry, open_attempts)) => {
+                *held_expiry = *expires_at;
+                *open_attempts = *count;
+            }
+            None if *count > 0 => state.alert(Alert::LapsingWithOpenAttempts {
+                app_id: *app_id,
+                expires_at: *expires_at,
+                open_attempts: *count,
+            }),
+            None => {}
+        }
+    }
+    state.alerts.retain(|alert| match alert {
+        Alert::LapsingWithOpenAttempts {
+            app_id,
+            open_attempts,
+            ..
+        } => *open_attempts > 0 && stopped.iter().any(|(id, _, _)| id == app_id),
+        _ => true,
+    });
 }
 
 /// Whether the device clock, `now`, agrees with the switch's signed time within the clock
