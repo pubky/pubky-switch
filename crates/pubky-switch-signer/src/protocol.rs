@@ -104,6 +104,20 @@ pub trait Protocol: Send + Sync {
         let _ = (app_id, scopes);
         Vec::new()
     }
+
+    /// The protocol's own rule on which of its grant paths one grant may cover, beyond the
+    /// Switch's rules: for example, two paths that go only together (Switch spec 3.4, Switch
+    /// wire 3.9). `allowed` holds the paths this protocol added for the app that the grant
+    /// would cover: those the app asks for, less those the user declines, in the order the
+    /// auth request names them. Every set passes by default.
+    ///
+    /// # Errors
+    ///
+    /// A reason to show the user. It should name the rule, such as which paths go together.
+    fn check_grant_paths(&self, allowed: &[&str]) -> std::result::Result<(), String> {
+        let _ = allowed;
+        Ok(())
+    }
 }
 
 /// A protocol the host registered that is malformed, or that answered with something the
@@ -429,6 +443,36 @@ impl Protocols {
             }
         }
         Ok(out)
+    }
+
+    /// Each owning protocol's rule on the grant paths `allowed` (Switch spec 3.4, Switch wire
+    /// 3.9): every protocol owning some of `scopes` is given those of `allowed` that it adds
+    /// for an app with `app_id`, in their order, none included.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::ProtocolRule`] from the first protocol whose rule refuses its paths.
+    pub fn check_grant_paths(
+        &self,
+        app_id: &[u8; 16],
+        scopes: &[String],
+        allowed: &[&str],
+    ) -> Result<()> {
+        for (protocol, own) in self.by_protocol(scopes) {
+            let added = protocol.grant_paths(app_id, &own);
+            let its: Vec<&str> = allowed
+                .iter()
+                .copied()
+                .filter(|path| added.iter().any(|a| a.path == *path))
+                .collect();
+            protocol
+                .check_grant_paths(&its)
+                .map_err(|reason| Refusal::ProtocolRule {
+                    protocol: protocol.name().to_owned(),
+                    reason,
+                })?;
+        }
+        Ok(())
     }
 }
 

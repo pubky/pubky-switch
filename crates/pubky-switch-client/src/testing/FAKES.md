@@ -342,6 +342,10 @@ switch and the service shows there:
   place, declared again, refused, its staged admission ended, and restored mid-recovery
   (`recovery.rs`).
 
+A grant path the user declines at an approval (Switch spec 3.4) needs nothing here: the
+declines change only the Pubky grant the host approves, never the certificate, the version
+or the key bundle, so the switch's traffic is the same as for an approval that allows them.
+
 Not every honest path has a flow there. Among those without one: a stale backup refused at
 a restore, a Homeserver that holds another body at a restore, and a restore in place below
 the signer's mark (`restore.rs`).

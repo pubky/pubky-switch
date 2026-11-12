@@ -104,11 +104,14 @@ pub trait Protocol: Send + Sync {
     /// Paths it adds to the grant of an app holding these scopes, each shown to
     /// the user for consent (wire 3.9 step 3). None by default.
     fn grant_paths(&self, app_id: &[u8; 16], scopes: &[&str]) -> Vec<GrantPath>;
+    /// Its own rule on which of its grant paths one grant may cover, such as two
+    /// that go only together (spec 3.4). Every set passes by default.
+    fn check_grant_paths(&self, allowed: &[&str]) -> Result<(), String>;
 }
 ```
 
 - **Several protocols:** the signer holds a `Protocols` set. Building it refuses an empty set, a malformed or repeated protocol name, a protocol that owns no scope, a scope name that breaks the scope rule or has a sub-scope, and one name declared twice. An app may hold scopes of several protocols: each protocol sees only its own, the permissions are the union, written in the Switch's fixed order (wire 3.1), and the keyed scopes are those whose owner marks them.
-- **What the set gives:** `terms(scopes)` checks a request and returns its permissions and keyed scopes; `knows_scope` and `has_keys` are the predicates the core's app request check and key bundle functions take; `grant_paths` gives the paths for the core's caps check; `unowned` lists the scopes no registered protocol owns.
+- **What the set gives:** `terms(scopes)` checks a request and returns its permissions and keyed scopes; `knows_scope` and `has_keys` are the predicates the core's app request check and key bundle functions take; `grant_paths` gives the paths for the core's caps check, and `check_grant_paths` each protocol's rule on the paths a grant would cover; `unowned` lists the scopes no registered protocol owns.
 - **The Switch's own rules stay in the signer and the core:**
   - the scope rule and the 32-scope bound, and no name beside its own sub-scope;
   - grants exactly the app's own paths, and a protocol's grant paths lie outside the Switch's own folders;
@@ -271,6 +274,7 @@ impl Signer {
 
     // Apps
     fn review(&self, request: SignedDoc, auth: AuthRequest) -> Result<AppReview>;           // wire 3.9 checks 1-6
+    // AppReview::decline(&mut self, paths: &[&str]) -> Result<()>: the grant paths the user declines, checked at once
     async fn approve(&mut self, review: AppReview) -> Result<ApprovedRequest>;      // cert, version, approval and claim
     fn approved(&self, request: &[u8; 32]) -> Result<Option<ApprovedRequest>>;     // the claim, once its version is delivered
     async fn claim_delivered(&mut self, request: &[u8; 32]) -> Result<()>;          // the host sent the claim and the grant
@@ -321,7 +325,7 @@ async fn resume_take_over(env: SignerEnv, identity: [u8; 32], keys: &AppKeys, va
 
   `approve` takes the `AppReview` instead, whose content the host shows: the App ID, the scopes, the protocols' terms and grant paths. `abort_erasure` and `end_staged_admission` take no token: neither cuts anything off.
 - **`SignerEnv`** bundles the store, the clock, the Switch client factory, the Pubky handles and the `Protocols`.
-- **Approval:** `approve` signs the certificate, the version that lists it, the approval with the app's full key bundle and its companion claim, commits them together, then delivers. The claim is released only once the switch took that version. The host delivers it to the auth request's relay and then approves the Pubky grant for exactly the capabilities checked, which include the protocols' grant paths the review showed; the user's approval covers them, since the grant can't be narrowed below the auth request's capabilities.
+- **Approval:** `approve` signs the certificate, the version that lists it, the approval with the app's full key bundle and its companion claim, commits them together, then delivers. The claim is released only once the switch took that version. The host delivers it to the auth request's relay and then approves the Pubky grant for exactly `ApprovedRequest::caps`: the capabilities checked, less the grant paths the user declined at the review (`AppReview::decline`, spec 3.4). Those can be fewer than the auth request names, so the host grants them with the Pubky SDK's `approve_auth_with_capabilities`, never `approve_auth`; `AppReview::asked_caps` is what the request asks for, to show, never to grant. The certificate, the version and the bundle are the same whatever is declined, so the switch sees nothing of it, and nothing about the decline is kept past the claim.
 - **`receive_hand_over`:**
   - After a refusal of checks 1 to 3, it keeps nothing it opened (wire 3.12). Check 3 also refuses a switch that holds no copy, or an older one: it went back.
   - It commits a take-over flow holding the hand-over as received, sealed to its bundle key, never the opened secret. The secret is opened in memory from that flow only, at the start and by `resume_take_over`, as the keyring's received form, and the gate lets that form sign only the first delivery.
@@ -363,7 +367,7 @@ Each alert carries the facts to show. The wording is the host's.
 - `Alarm(Alert)`, for a rollback or an equivocation;
 - `InvalidData`, for network data that doesn't verify.
 
-`Refusal` covers a revoked App ID, an App ID listed with other keys (one listed with the same keys is a renewal, wire 3.9 step 5), the app limit, a grant that isn't the app's own paths, an unknown scope, a flow in progress, a hand-over in progress, a move in progress, `service_keys` over 256, the import limit, and a version over the size a delivery may carry.
+`Refusal` covers a revoked App ID, an App ID listed with other keys (one listed with the same keys is a renewal, wire 3.9 step 5), the app limit, a grant that isn't the app's own paths, a declined path the user may not decline, an unknown scope, a flow in progress, a hand-over in progress, a move in progress, `service_keys` over 256, the import limit, and a version over the size a delivery may carry.
 
 There are no panics on network input, and all arithmetic is checked.
 
@@ -372,7 +376,7 @@ There are no panics on network input, and all arithmetic is checked.
 | Area | Main calls | Notes |
 |---|---|---|
 | 1 Enrollment | `create`, `move_to`, `declare_provider_loss` | the enrollment is kept signed and resent unchanged; `revoked_apps` comes from the tombstones; the high-water mark after every accepted delivery; `signer` set to this install |
-| 2 App approval | `review`, `approve` | permissions from the `Protocols`; the approval is built from the delivered document; the full bundle in parts; the companion claim delivered before the grant; the approval kept by request hash until the claim is delivered, so a crash resends it |
+| 2 App approval | `review`, `approve` | permissions from the `Protocols`; the approval is built from the delivered document; the full bundle in parts; the companion claim delivered before the grant; the approval kept by request hash until the claim is delivered, so a crash resends it; the user may decline the grant paths a protocol added, as its rule allows, and the claim's capabilities leave them out, a renewing request's too (spec 3.4) |
 | 3 Renewals and reductions | `renew`, `run_due` | `cert.put` with the first bundle part; a reduction closes from the delivery proof's `server_time`, or, when the switch never gave one, from the next delivery's, never the signer's clock; a removed keyed scope rotates the epoch, with the other apps' e+1 bundles stored before the delivery; an epoch a given-up rotation sent keys for is completed, in a version of its own, before the next rotation; a renewal the switch refuses for good, at a batch (a `4xx` other than `408` and `429`) or at its delivery (`400`, `413`, or a `409 stale_identity` whose copy is the mark or doesn't verify), or whose flow an alarm ends, or which is never signed because the epoch completion before it was cut off, didn't happen: `RenewalRefused` is raised in the commit that ends the flow, whichever call met it (`renew`, `resume` or `run_due`), for the user's renewals and the automatic ones (`by_user`), a reduction's saying the access was not reduced, and none for an app being revoked; one per app, kept in its place, the user's winning over an automatic refusal and a second refused request of the user's adding to the first's, the newest counting where two contradict (`asked_renewals`, kept beside the alert); a user's is judged from the certificate listed for the app, whoever's renewal listed it: a reduction's stays while it still holds a scope asked to be removed, by the scope hierarchy, or a switch permission the reduction would have removed, or expires later than asked, another's until it holds what was asked or a later renewal the user asks for is delivered (`user_renewals` keeps which renewals in progress are the user's); an automatic one's goes once the app is renewed, and every one once the app is removed |
 | 4 Revocations and departures | `revoke`, `open_attempts`, `run_due` | the count of the app's open and `unknown` attempts shown first, never holding the revocation back; the switch first: a backup or a switch's copy that is read and shows a take-over or records behind stops it, while a backup that can't be read, is missing or doesn't open, and a switch's copy that can't be read (an error the switch signed included) or doesn't verify for the identity, add nothing, and it goes on with the records alone; the version that removes the app waits for a read of the switch's copy that succeeds; then bundles, delivery, publish, and the record and grant cleanup; `RevokedWithOpenAttempts` kept up to date from the removal's reads; departures completed from `GET /apps`; tombstones kept for good |
 | 5 Service keys | `rotate_service_key`, `move_to` | key rotation in place (`rotate_service_key`): not built, not in v0.2; `service_keys` from `proof_generations`; refused past 256, or for a reported generation whose key it lacks |
