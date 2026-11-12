@@ -1260,3 +1260,28 @@ async fn test_own_record_crash_before_the_leave_is_kept_deletes_nothing() {
     assert!(w.published(id).is_none());
     assert!(w.switch.app(&id).departed);
 }
+
+/// Switch spec 4.2: a read publishes a record it delivers before its feed right away, the
+/// switch's acceptance showing the app current, also when the read then fails.
+#[tokio::test]
+async fn test_own_record_read_publishes_the_record_it_delivers_before_the_feed() {
+    let w = World::new();
+    let mut app = w.join_publishing("wallet").await;
+    let id = app.app_id();
+    w.clock.advance_ms(1_000);
+    w.switch.fail_next(Fault::Unreachable {
+        path: "/ops".into(),
+        after: 0,
+    });
+    app.set_protocol_member(PROTO, member(json!({ "a": 1 })), None)
+        .await
+        .unwrap_err();
+    let kept = app.record().clone();
+    w.switch.fail_next(Fault::Unreachable {
+        path: "/feed".into(),
+        after: 0,
+    });
+    app.receive(None).await.unwrap_err();
+    assert_eq!(w.held(id).as_ref(), Some(&kept));
+    assert_eq!(w.published(id), Some(bytes_of(&kept)));
+}
