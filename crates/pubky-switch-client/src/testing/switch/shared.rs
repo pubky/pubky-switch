@@ -690,8 +690,6 @@ impl Inner {
         Some(match (request.method.as_str(), route) {
             // A scripted answer, for a faulty service, takes precedence.
             ("GET", "allow") if self.allow.is_none() => self.allow_list(),
-            // Own apps only, each with its permission, as at the service
-            // (`crates/pubky-switch/src/service/connect.rs`).
             // Apps of another identity ask to connect (`inbox.rs`); the account's own apps
             // and its signer don't.
             ("POST", "connect") => bad(
@@ -699,6 +697,8 @@ impl Inner {
                 "7.4.7: apps of another identity ask to connect",
                 json!(null),
             ),
+            // Own apps only, each with its permission, as at the service
+            // (`crates/pubky-switch/src/service/connect.rs`).
             ("GET", "connect") => {
                 if !self.caller_holds(caller, Permission::ListsRead) {
                     return Some(bad(
