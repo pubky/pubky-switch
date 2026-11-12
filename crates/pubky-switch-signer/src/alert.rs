@@ -255,8 +255,10 @@ pub enum Alert {
         app_id: [u8; 16],
     },
     /// A revocation is asked for and no version removes the app yet: the switch couldn't be
-    /// reached or refused it, or the version waits for an alarm to be cleared. The App ID is
-    /// refused for good already, and gets no key; each run tries again (Switch spec 12.2).
+    /// reached or refused it, or the version waits for an alarm to be cleared, and each run
+    /// tries again; or a recovery is in progress, when no run sends it and it waits for the
+    /// new service to take the recovery's version (Switch spec 12.2, 12.6 step 1). The App ID
+    /// is refused for good already, and gets no key.
     RevocationPending {
         /// The app.
         app_id: [u8; 16],

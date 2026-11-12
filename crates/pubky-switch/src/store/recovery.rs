@@ -43,7 +43,8 @@ const GENERATION_STATE: &[&str] = &[
 
 /// Every table with an account column that a recovery in place keeps (Switch wire 3.3,
 /// 3.7): the App IDs kept for good, the enrollment answers and the retired ones' records, and
-/// the keys owed deleting. The account's row stays too, its service time with it.
+/// the keys owed deleting. The account's row stays too, its service time and the
+/// directory's two versions with it.
 pub const RECOVERY_KEEPS: &[&str] = &[
     "kept_app_ids",
     "enrollment_answers",
@@ -217,8 +218,10 @@ impl AccountTxn {
     /// ([`AccountTxn::exclude_signers`]), so nothing signs with the outgoing key once this
     /// commits.
     ///
-    /// It keeps the account's service time, its App IDs kept for good, joined by the
-    /// `revoked_apps` held with the pending key, and the enrollments it answered: those that
+    /// It keeps the account's service time, the directory's `directory_version` and
+    /// `apps_version`, which are columns of its row and never restart for an account (Switch
+    /// wire 7.4.10), its App IDs kept for good, joined by the `revoked_apps` held with the
+    /// pending key, and the enrollments it answered: those that
     /// named the pending key now name the account's key; those that named the outgoing key
     /// are kept by hash and generation alone ([`AccountTxn::retired_enrollment`]), at most
     /// `max_enrollments`. Everything else of the generation goes (`GENERATION_STATE`),

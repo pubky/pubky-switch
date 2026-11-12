@@ -459,14 +459,14 @@ async fn test_pending_revocation_on_the_error_path_with_a_lost_answer_goes_out()
 
 #[tokio::test]
 async fn test_revocation_pending_isnt_at_the_switch_when_nothing_was_sent() {
-    // The switch can't be reached for the ownership check, so no revocation is sent: the
-    // alert says the switch still serves the app.
+    // The switch can't be reached for the revocation, so it doesn't take it: the alert says
+    // the switch still serves the app.
     let world = World::new();
     let (mut signer, _) = world.enrolled().await;
     let (a, _) = two_joined(&world, &mut signer).await;
     let id = a.keys.app_id_bytes();
     world.switch.fail_next(SwitchFault::Unreachable {
-        path: "/apps".into(),
+        path: "/revoke".into(),
         after: 0,
     });
     signer.revoke(id, None, confirmed()).await.unwrap_err();
@@ -1810,4 +1810,159 @@ async fn test_revocation_warning_keeps_its_place_among_the_alerts() {
     let alerts = signer.alerts().to_vec();
     signer.complete_removals().await.unwrap();
     assert_eq!(signer.alerts(), alerts.as_slice(), "unchanged");
+}
+
+#[tokio::test]
+async fn test_revocation_goes_on_when_the_first_read_fails() {
+    // The read of the switch's copy before the revocation is answered with an error, signed
+    // or not, or never answered: the revocation isn't held back, since it may answer a
+    // compromise. It goes to the switch in the same call, and the version that removes the
+    // app follows on the next read, which succeeds (Switch spec 12.2).
+    use pubky_switch_core::http::ErrorCode;
+    let faults = [
+        Some(ErrorCode::Unavailable),
+        Some(ErrorCode::RateLimited),
+        Some(ErrorCode::StaleTimestamp),
+        None,
+    ];
+    for code in faults {
+        let world = World::new();
+        let (mut signer, _) = world.enrolled().await;
+        let (a, _) = two_joined(&world, &mut signer).await;
+        let id = a.keys.app_id_bytes();
+        world.switch.fail_next(match code {
+            Some(code) => SwitchFault::Error {
+                path: "/apps".into(),
+                code,
+                current: serde_json::Value::Null,
+            },
+            None => SwitchFault::Unreachable {
+                path: "/apps".into(),
+                after: 0,
+            },
+        });
+        let doc = signer
+            .revoke(id, None, confirmed())
+            .await
+            .unwrap_or_else(|e| panic!("{code:?}: {e:?}"));
+        assert!(world.switch.app(&id).departed, "{code:?}");
+        assert!(doc.listed_cert(&id).is_none(), "{code:?}");
+        assert!(
+            doc.body().removed.iter().any(|r| r.app_id == id),
+            "{code:?}"
+        );
+        assert!(
+            !signer
+                .alerts()
+                .iter()
+                .any(|a| matches!(a, Alert::RevocationPending { .. })),
+            "{code:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_revocation_sent_without_a_read_waits_for_one_to_remove_the_app() {
+    // Neither the read before the revocation nor the one after it is answered: the switch
+    // takes the revocation all the same, but the version that removes the app isn't signed
+    // without a read of the switch's copy. The revocation shows pending at the switch, and
+    // the next run removes the app (Switch spec 12.2, 4.3).
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let (a, _) = two_joined(&world, &mut signer).await;
+    let id = a.keys.app_id_bytes();
+    let before = signer.identity_doc().unwrap().unwrap();
+    world.switch.fail_next(SwitchFault::Error {
+        path: "/apps".into(),
+        code: pubky_switch_core::http::ErrorCode::Unavailable,
+        current: serde_json::Value::Null,
+    });
+    // Past the revocation itself, the next read.
+    world.switch.fail_next(SwitchFault::Unreachable {
+        path: "/apps".into(),
+        after: 1,
+    });
+    signer.revoke(id, None, confirmed()).await.unwrap_err();
+    assert!(world.switch.app(&id).departed);
+    let doc = signer.identity_doc().unwrap().unwrap();
+    assert_eq!(doc.hash(), before.hash(), "nothing signed");
+    assert!(signer.alerts().iter().any(|alert| matches!(
+        alert,
+        Alert::RevocationPending { app_id, at_switch: true } if *app_id == id
+    )));
+    signer.run_due().await.unwrap();
+    let doc = signer.identity_doc().unwrap().unwrap();
+    assert!(doc.listed_cert(&id).is_none());
+    assert!(doc.body().removed.iter().any(|r| r.app_id == id));
+}
+
+#[tokio::test]
+async fn test_revocation_stops_when_the_first_read_cant_be_kept() {
+    // The read before the revocation is answered, but the records can't keep what it showed:
+    // its commit, which clears `AccountNotHosted`, fails. A store failure isn't a copy that
+    // can't be read: the revocation stops there, with nothing sent, and goes on at the next
+    // call.
+    let world = World::new();
+    let (mut signer, memory) = world.enrolled().await;
+    let (a, _) = two_joined(&world, &mut signer).await;
+    let id = a.keys.app_id_bytes();
+    drop(signer);
+    let switch = Arc::clone(&world.switch);
+    let transport = Arc::new(pubky_switch_client::transport::MockTransport::with_handler(
+        move |request| {
+            if request.method == "GET" && request.path_and_query.ends_with("/apps") {
+                return Ok(pubky_switch_client::transport::Response {
+                    status: 404,
+                    headers: Vec::new(),
+                    body: b"{}".to_vec(),
+                });
+            }
+            switch.handle(request)
+        },
+    ));
+    let mut env = world.env(memory.clone());
+    env.transport = transport;
+    let mut signer = Signer::open(env, world.keyring()).await.unwrap();
+    signer.run_due().await.unwrap_err();
+    assert!(signer.alerts().contains(&Alert::AccountNotHosted));
+    drop(signer);
+    // Commit 1 keeps the revocation, commit 2 is the read's.
+    let faulty: Arc<dyn StateStore> = Arc::new(FaultStore::new(memory, Fault::FailBefore(2)));
+    let mut signer = Signer::open(world.env(faulty), world.keyring())
+        .await
+        .unwrap();
+    let error = signer.revoke(id, None, confirmed()).await.unwrap_err();
+    assert!(matches!(error, SignerError::Store(_)), "{error:?}");
+    assert!(!world.switch.app(&id).departed);
+    let doc = signer.revoke(id, None, confirmed()).await.unwrap();
+    assert!(doc.listed_cert(&id).is_none());
+    assert!(world.switch.app(&id).departed);
+}
+
+#[tokio::test]
+async fn test_revocation_goes_on_past_a_copy_that_doesnt_verify() {
+    // The switch answers the read before the revocation with a copy of `identity.json` that
+    // doesn't verify for the identity: a broken or hostile switch, which shows nothing of
+    // who signs. The revocation goes on, as past a copy that can't be read, and the version
+    // that removes the app follows the next read, which gives the switch's own copy (Switch
+    // spec 12.2).
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let (a, _) = two_joined(&world, &mut signer).await;
+    let id = a.keys.app_id_bytes();
+    let newest = signer.identity_doc().unwrap().unwrap();
+    let mut forged = world
+        .other_install_version(&newest, [7; 16])
+        .signed()
+        .clone();
+    forged.sig.clone_from(&newest.signed().sig);
+    world.switch.fail_next(SwitchFault::Replace {
+        path: "/apps".into(),
+        member: "identity".into(),
+        value: serde_json::to_value(&forged).unwrap(),
+    });
+    let doc = signer.revoke(id, None, confirmed()).await.unwrap();
+    assert!(world.switch.app(&id).departed);
+    assert!(doc.listed_cert(&id).is_none());
+    assert!(doc.body().removed.iter().any(|r| r.app_id == id));
 }

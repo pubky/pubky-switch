@@ -3226,3 +3226,107 @@ async fn test_restore_in_place_keeps_the_earlier_picked_distrust_time() {
         );
     }
 }
+
+#[tokio::test]
+async fn test_provider_loss_revocation_asked_meanwhile_waits_for_the_new_service() {
+    // A revocation asked for while a recovery is in progress sends nothing, to the lost
+    // service or any other: it is kept, shown pending, and the new service is sent it right
+    // after it takes the recovery's version, which the version removing the app follows
+    // (Switch spec 12.6 step 1, 12.2).
+    let world = World::new();
+    let (mut signer, service, router) = lost_with_an_app(&world, notes()).await;
+    let id = notes_app_id();
+    let typo = "https://recovery.exmaple";
+    signer
+        .declare_provider_loss(typo, confirmed())
+        .await
+        .unwrap_err();
+    let sent = router.log().len();
+    assert_eq!(
+        signer.revoke(id, None, confirmed()).await.unwrap_err(),
+        Refusal::Recovering.into()
+    );
+    assert_eq!(router.log().len(), sent, "nothing sent");
+    assert!(signer.alerts().iter().any(|alert| matches!(
+        alert,
+        Alert::RevocationPending { app_id, at_switch: false } if *app_id == id
+    )));
+    signer.run_due().await.unwrap_err();
+    assert!(
+        !router.log()[sent..]
+            .iter()
+            .any(|line| line.contains(SWITCH_ORIGIN)),
+        "nothing to the lost service"
+    );
+    let recovered = signer
+        .declare_provider_loss(NEW_ORIGIN, confirmed())
+        .await
+        .unwrap();
+    assert!(recovered.listed_cert(&id).is_none());
+    assert!(recovered.body().removed.iter().any(|r| r.app_id == id));
+    assert_eq!(service.identity_doc().unwrap().hash(), recovered.hash());
+    assert!(
+        router
+            .log()
+            .iter()
+            .any(|line| line.contains(NEW_ORIGIN) && line.contains("/revoke")),
+        "revoked there"
+    );
+    assert!(
+        !signer
+            .alerts()
+            .iter()
+            .any(|a| matches!(a, Alert::RevocationPending { .. }))
+    );
+}
+
+#[tokio::test]
+async fn test_provider_loss_revocation_asked_meanwhile_keeps_its_alert_with_it() {
+    // A revocation asked for during a recovery is kept with its alert in one commit: a store
+    // that fails at the next commit leaves neither without the other, and the new service is
+    // sent the revocation once it takes the recovery's version (Switch spec 12.6 step 1).
+    use pubky_switch_client::store::{Fault as StoreFault, FaultStore, StateStore};
+    let world = World::new();
+    let store = Arc::new(MemoryStore::new());
+    let mut signer = Signer::create(
+        world.env_with(store.clone(), notes()),
+        world.keyring(),
+        SWITCH_ORIGIN,
+    )
+    .await
+    .unwrap();
+    signer.resume().await.unwrap();
+    world
+        .approve(&mut signer, &App::new(&["notes"], None, [9; 32]))
+        .await;
+    drop(signer);
+    let (_, router) = new_service(&world);
+    router.remove(SWITCH_ORIGIN);
+    let mut signer = reopened(&world, store.clone(), &router, notes()).await;
+    signer
+        .declare_provider_loss("https://recovery.exmaple", confirmed())
+        .await
+        .unwrap_err();
+    drop(signer);
+    let faulty: Arc<dyn StateStore> =
+        Arc::new(FaultStore::new(store.clone(), StoreFault::FailBefore(2)));
+    let mut env = world.env_with(faulty, notes());
+    env.transport = router.clone();
+    let mut signer = Signer::open(env, world.keyring()).await.unwrap();
+    let id = notes_app_id();
+    assert_eq!(
+        signer.revoke(id, None, confirmed()).await.unwrap_err(),
+        Refusal::Recovering.into()
+    );
+    drop(signer);
+    let mut signer = reopened(&world, store, &router, notes()).await;
+    assert!(signer.alerts().iter().any(|alert| matches!(
+        alert,
+        Alert::RevocationPending { app_id, at_switch: false } if *app_id == id
+    )));
+    let recovered = signer
+        .declare_provider_loss(NEW_ORIGIN, confirmed())
+        .await
+        .unwrap();
+    assert!(recovered.listed_cert(&id).is_none());
+}
