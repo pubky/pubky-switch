@@ -17,7 +17,7 @@ use std::sync::Arc;
 use pubky_switch_client::store::MemoryStore;
 use pubky_switch_client::testing::TestIdentity;
 use pubky_switch_core::records::{IDENTITY_PATH, IdentityDoc};
-use pubky_switch_signer::{Alert, CertChange, Signer, SignerStatus, UserConfirmed};
+use pubky_switch_signer::{Alert, CertChange, Signer, SignerError, SignerStatus, UserConfirmed};
 use serde_json::{Value, json};
 
 use super::enrollment::{enroll, status};
@@ -560,7 +560,8 @@ pub async fn signer_restore_revocation(world: &World) -> FlowResult {
 /// # Errors
 ///
 /// When a step that should succeed against any switch fails, the delivery that arrives
-/// second isn't refused, or the install whose delivery arrived first isn't the signer.
+/// second isn't refused, the install whose delivery arrived first isn't the signer, or
+/// the other restore ends otherwise than as managed by that install.
 pub async fn signer_two_installs_race(world: &World) -> FlowResult {
     let alice = world.identity("alice")?;
     world.add_switch(ORIGIN, &[&alice]).await?;
@@ -617,6 +618,20 @@ pub async fn signer_two_installs_race(world: &World) -> FlowResult {
         || published(world, &alice) != Some(taken.version())
     {
         return Err("the install whose delivery arrived first isn't the signer".into());
+    }
+    // The restore that lost stands aside: the copy its refusal carries names the other
+    // install, and it raises no alarm over it.
+    let stands_aside = matches!(
+        &late,
+        Err(SignerError::NotNamed { install }) if *install == winner.install_id()
+    );
+    if !stands_aside {
+        return Err(format!(
+            "the restore whose delivery arrived second ended {}, not as managed by the other \
+             install",
+            ended(&late.as_ref().map(|_| ()))
+        )
+        .into());
     }
     Ok(())
 }

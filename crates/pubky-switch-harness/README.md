@@ -123,7 +123,13 @@ The flows send every call the service serves, each at both switches. What they l
   again, a retry the switch answers as the delivery it took. The switch refuses a
   delivery where two deliveries race: a hand-over's abort against its take-over, either
   arriving first, and two installs restored at once, each `409 stale_identity` for the
-  one that arrives second. A switch that shows an older copy or another body (a rollback
+  one that arrives second. All three are refused because the version they build on is
+  no longer the newest the switch holds. A delivery that builds on the held version
+  without a higher version number, or at a lower generation, is refused by a rule of its
+  own, and no conforming signer sends one: a signer that builds on a version signs the
+  next, and a provider loss in place, whose version needn't build on the held one, is
+  declared only by a signer whose backup and published copy show nothing newer than its
+  records. That rule stays with the core's unit test. A switch that shows an older copy or another body (a rollback
   or an equivocation at the switch) and a backup that doesn't open stay with the signer's
   tests on the scripted switch, as do a stale backup refused at a restore, a Homeserver
   that holds another body at a restore, and a restore in place below the signer's mark.
