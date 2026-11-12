@@ -657,6 +657,15 @@ impl ScriptedSwitch {
 }
 
 impl Inner {
+    /// Whether own app `caller` holds `permission` by the certificate its record carries;
+    /// never for the signer (`None`).
+    fn caller_holds(&self, caller: Option<[u8; 16]>, permission: Permission) -> bool {
+        caller
+            .and_then(|app| self.apps.get(&app))
+            .and_then(|app| app.cert.as_ref())
+            .is_some_and(|cert| cert.has_permission(permission))
+    }
+
     /// The reads of the shared state, for `caller` (`None` for the signer); `None` for any
     /// other route.
     pub(super) fn route_shared(
@@ -669,19 +678,37 @@ impl Inner {
         Some(match (request.method.as_str(), route) {
             // A scripted answer, for a faulty service, takes precedence.
             ("GET", "allow") if self.allow.is_none() => self.allow_list(),
+            // Own apps only, each with its permission, as at the service
+            // (`crates/pubky-switch/src/service/connect.rs`).
             ("GET", "connect") => {
+                if !self.caller_holds(caller, Permission::ListsRead) {
+                    return Some(bad(
+                        ErrorCode::PermissionMissing,
+                        "7.4.7: reading connect requests needs lists.read",
+                        json!(null),
+                    ));
+                }
                 let requests: Vec<Value> = self
                     .shared
                     .connect
                     .iter()
                     .map(|(pubky, at)| json!({ "pubky": pubky_id(pubky), "at": rfc3339(*at) }))
                     .collect();
+                let max_pending = self.connect_cap();
+                let full = u64::try_from(requests.len()).unwrap_or(u64::MAX) >= max_pending;
                 (
                     200,
-                    json!({ "requests": requests, "max_pending": 50, "full": false }),
+                    json!({ "requests": requests, "max_pending": max_pending, "full": full }),
                 )
             }
             ("DELETE", r) if r.starts_with("connect/") => {
+                if !self.caller_holds(caller, Permission::ConversationAdd) {
+                    return Some(bad(
+                        ErrorCode::PermissionMissing,
+                        "7.4.7: declining a connect request needs conversation.add",
+                        json!(null),
+                    ));
+                }
                 let id = r.trim_start_matches("connect/");
                 let pubky = pubky_switch_core::enc::pubky_key(id).ok()?;
                 let before = self.shared.connect.len();

@@ -97,7 +97,18 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   dropped, and their proofs go only when a retry finds them past `batch_proofs_ms`.
 - **Invite codes**: a revoked app's codes aren't withdrawn (Switch wire 7.4.3 "After a
   revocation"); a code planted for a faulty export never expires.
-- **Lists**: `flagged` is always empty; connect requests are never full.
+- **Lists**: `flagged` is always empty.
+- **Connect requests** (Switch wire 7.4.7), in `switch/inbox.rs` `connect` and
+  `switch/shared.rs`: as at the service (`crates/pubky-switch/src/service/connect.rs`), in its
+  order: `503 staged` while admission is staged, whatever the policy; `403 not_admitted` with
+  the policy off; `409 identity_needed` unless the copy of the sender's document lists the
+  app; a sender already pending answered `pending`; the policy's `max_pending`, capped at the
+  wire's default `max_connect_pending` (1,000), refusing a new sender `429 quota_exceeded`
+  before the deny list; a denied sender answered `pending`, its request not kept. `GET
+  /connect` needs `lists.read`, `DELETE /connect/{pubky}` `conversation.add`. A contact, a
+  conversation entry or a deny list entry for the sender answers its request, the entry an
+  invite code's first append writes included. Unlike the service: no `connect_per_min` or
+  `stranger_per_min` (no rates, above), and no flag hits.
 - **Records**: `divergent` is set by divergent uploads after a provider loss and cleared
   by a write here, as at the service (Recovery uploads, below).
 - **Directory** (Switch wire 7.4.10): an app is reachable from its first receive key until
@@ -157,7 +168,7 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
 - **`409 identity_needed`** to an app of another identity carries `known_version` beside
   `current`, `null` for no copy held or as to a stranger (Switch wire 7.1, 7.6), at the
   inbox, here and at the peer switch (`peer.rs`). Both also serve `POST /connect` and
-  answer it so; the service doesn't serve it yet (`503 unavailable`).
+  answer it so.
 - **`open_admission`** (`admit_everyone`) admits every sender the deny list doesn't hold, a
   test switch only.
 - **App currency outside batches**: a feed read is checked as a batch is, for an app that

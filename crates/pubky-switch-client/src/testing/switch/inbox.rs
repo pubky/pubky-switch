@@ -96,6 +96,10 @@ impl ScriptedSwitch {
     }
 }
 
+/// The wire's default `max_connect_pending` (Switch wire 9.2), the most pending connect
+/// requests any policy gets.
+const MAX_CONNECT_PENDING: u64 = 1_000;
+
 impl Inner {
     /// The routes an app of another identity calls; for every other call of Switch wire 7.4
     /// `403 permission_missing` (one only another caller makes, 7.6), at a batch `403
@@ -240,9 +244,28 @@ impl Inner {
             .is_some_and(|doc| doc.body().policy.connect_requests.enabled)
     }
 
-    /// `POST /connect` (Switch wire 7.4.7): kept once per sender, never a denied one's;
-    /// `not_admitted` while the policy turns connect requests off.
+    /// The pending connect requests' cap that applies: the policy's `max_pending`, at most
+    /// the wire's default `max_connect_pending` (Switch wire 3.3, 9.2).
+    pub(super) fn connect_cap(&self) -> u64 {
+        self.doc.as_ref().map_or(0, |doc| {
+            doc.body()
+                .policy
+                .connect_requests
+                .max_pending
+                .min(MAX_CONNECT_PENDING)
+        })
+    }
+
+    /// `POST /connect` (Switch wire 7.4.7), in the service's order
+    /// (`crates/pubky-switch/src/service/connect.rs`): `503 staged` while admission is
+    /// staged, whatever the policy; `not_admitted` while the policy turns connect requests
+    /// off; `identity_needed` unless the copy of the sender's document lists the app; a
+    /// sender already pending answered `pending`; a full list `429 quota_exceeded`, before
+    /// the deny list; a denied sender answered `pending`, its request not kept.
     fn connect(&mut self, sender: &Sender) -> Answer {
+        if self.admission_staged {
+            return self.not_admitted_now();
+        }
         if !self.connect_requests_on() {
             return not_admitted();
         }
@@ -254,21 +277,32 @@ impl Inner {
         if !listed {
             return identity_needed(None);
         }
-        let (_, denied) = self.listed(&sender.identity);
-        let now = self.now();
-        if !denied
-            && !self
-                .shared
-                .connect
-                .iter()
-                .any(|(pubky, _)| *pubky == sender.identity)
-        {
-            self.shared.connect.push((sender.identity, now));
-        }
-        (
+        let pending = (
             200,
             json!({ "pending": true, "known_version": self.known(&sender.identity) }),
-        )
+        );
+        if self
+            .shared
+            .connect
+            .iter()
+            .any(|(pubky, _)| *pubky == sender.identity)
+        {
+            return pending;
+        }
+        let count = u64::try_from(self.shared.connect.len()).unwrap_or(u64::MAX);
+        if count >= self.connect_cap() {
+            return bad(
+                ErrorCode::QuotaExceeded,
+                "9.3: the connect request list is full",
+                json!({ "limit": "connect_requests" }),
+            );
+        }
+        let (_, denied) = self.listed(&sender.identity);
+        if !denied {
+            let now = self.now();
+            self.shared.connect.push((sender.identity, now));
+        }
+        pending
     }
 
     /// The app holding receive key `kid`, current or not.
@@ -436,6 +470,8 @@ impl Inner {
             self.shared
                 .service_conversations
                 .insert(identity, (hash, at, invite_context.clone()));
+            // The entry answers the sender's connect request (Switch wire 7.4.7).
+            self.shared.connect.retain(|(pubky, _)| *pubky != identity);
             self.service_transition(ServiceTransition::ConversationAdd {
                 pubky: identity,
                 code_hash: hash,

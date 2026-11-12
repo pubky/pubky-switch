@@ -410,7 +410,10 @@ async fn test_connect_request_is_answered_by_a_list_entry_or_declined() {
     ] {
         // A sender the lists admit may still ask; the entry written after answers it.
         assert!(pending(&ask(&replay).await), "{op:?}");
-        assert_eq!(requested(&list(&replay, "wallet").await), vec![bob_id.clone()]);
+        assert_eq!(
+            requested(&list(&replay, "wallet").await),
+            vec![bob_id.clone()]
+        );
         wallet_op(&replay, op, batch).await;
         assert!(
             requested(&list(&replay, "wallet").await).is_empty(),

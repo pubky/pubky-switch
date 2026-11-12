@@ -1716,6 +1716,76 @@ async fn test_scripted_inbox_connect_requests_follow_the_policy() {
 }
 
 #[tokio::test]
+async fn test_scripted_inbox_connect_requests_full_refuse_before_the_deny_list() {
+    // At `max_pending` 0 the list is always full: `429 quota_exceeded` naming connect
+    // requests, the same for a denied sender, as at the service (Switch wire 7.4.7).
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let mut wallet = p.join(&p.alice, "wallet", &protocol).await;
+    let mut shop = p.join(&p.bob, "shop", &protocol).await;
+    let bob = p.bob.identity().public();
+    let alice = p.alice.identity().public();
+    p.bob
+        .next_doc(|body| {
+            body.policy.connect_requests.enabled = true;
+            body.policy.connect_requests.max_pending = 0;
+        })
+        .unwrap();
+    let error = wallet.ask_to_connect(&bob).await.unwrap_err();
+    assert_eq!(error.code(), Some(ErrorCode::QuotaExceeded));
+    p.bob.switch().lock().shared.deny.insert(alice);
+    let denied = wallet.ask_to_connect(&bob).await.unwrap_err();
+    assert_eq!(denied.code(), Some(ErrorCode::QuotaExceeded));
+    let list = shop.connect_requests().await.unwrap();
+    assert_eq!((list.max_pending, list.full), (0, true));
+    assert!(p.bob.switch().connects().is_empty());
+}
+
+#[tokio::test]
+async fn test_scripted_inbox_connect_request_of_a_denied_sender_is_pending_and_not_kept() {
+    // A denied sender is answered as anyone else, and its request isn't kept.
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let mut wallet = p.join(&p.alice, "wallet", &protocol).await;
+    let mut shop = p.join(&p.bob, "shop", &protocol).await;
+    let bob = p.bob.identity().public();
+    p.bob
+        .next_doc(|body| body.policy.connect_requests.enabled = true)
+        .unwrap();
+    p.bob
+        .switch()
+        .lock()
+        .shared
+        .deny
+        .insert(p.alice.identity().public());
+    assert!(wallet.ask_to_connect(&bob).await.unwrap());
+    assert!(p.bob.switch().connects().is_empty());
+    let list = shop.connect_requests().await.unwrap();
+    assert_eq!((list.max_pending, list.full), (50, false));
+}
+
+#[tokio::test]
+async fn test_scripted_inbox_connect_requests_full_keep_the_one_waiting() {
+    // At `max_pending` 1 the one waiting fills the list, stays, and asking again is
+    // answered pending.
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let mut wallet = p.join(&p.alice, "wallet", &protocol).await;
+    let mut shop = p.join(&p.bob, "shop", &protocol).await;
+    let bob = p.bob.identity().public();
+    p.bob
+        .next_doc(|body| {
+            body.policy.connect_requests.enabled = true;
+            body.policy.connect_requests.max_pending = 1;
+        })
+        .unwrap();
+    assert!(wallet.ask_to_connect(&bob).await.unwrap());
+    assert!(shop.connect_requests().await.unwrap().full);
+    assert!(wallet.ask_to_connect(&bob).await.unwrap());
+    assert_eq!(p.bob.switch().connects(), vec![p.alice.identity().public()]);
+}
+
+#[tokio::test]
 async fn test_scripted_inbox_takes_own_apps_kinds_between_them() {
     let p = Pair::new();
     let protocol = ApiProtocol::new(Mode::Plain);
