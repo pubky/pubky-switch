@@ -447,6 +447,97 @@ pub fn erase_body(service_key: &[u8; 32], identity_hash: Option<&[u8; 32]>) -> V
     .into_bytes()
 }
 
+/// The most handles one push registration holds, one per device (Switch wire 8.1).
+pub const MAX_PUSH_HANDLES: usize = 8;
+
+/// The body of `PUT /v1/{id}/push` (Switch wire 8.1), read by [`parse_push_body`]. Its
+/// `Debug` shows neither the relay URL nor a handle, which stay out of logs.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PushBody {
+    /// The relay URL, which passed [`crate::net::check_url`] for a relay; its host's
+    /// addresses are still the caller's to check, once resolved.
+    pub relay_url: String,
+    /// The handles: empty on a start, at most [`MAX_PUSH_HANDLES`].
+    pub handles: Vec<String>,
+    /// The push key of the registration whose handles this sets; `None` on a start.
+    pub push_key: Option<[u8; 32]>,
+    /// On a start only: the push key of the registration it replaces.
+    pub replaces: Option<[u8; 32]>,
+}
+
+impl PushBody {
+    /// Whether the body starts a registration: it names no `push_key`.
+    pub fn is_start(&self) -> bool {
+        self.push_key.is_none()
+    }
+}
+
+impl std::fmt::Debug for PushBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PushBody")
+            .field("handles", &self.handles.len())
+            .field("push_key", &self.push_key.is_some())
+            .field("replaces", &self.replaces.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Read the body of `PUT /v1/{id}/push` (Switch wire 8.1): `relay_url` and `handles`
+/// required, `push_key` and `replaces` optional (`null` as absent), other members ignored
+/// (1.1). The relay URL passes the syntax, scheme, port and address literal checks of
+/// [`crate::net::check_url`]; resolving its host and checking the addresses is the
+/// caller's.
+///
+/// # Errors
+///
+/// [`Error::Invalid`] (`400 bad_request`) for a body that isn't that, more than
+/// [`MAX_PUSH_HANDLES`] handles, handles on a start, `replaces` with `push_key`, or a relay
+/// URL that fails the checks. No message names the URL or a handle.
+pub fn parse_push_body(body: &[u8]) -> Result<PushBody> {
+    let value: serde_json::Value = crate::json::parse_json(body)?;
+    let Some(relay_url) = value.get("relay_url").and_then(serde_json::Value::as_str) else {
+        return invalid("Switch wire 8.1: `relay_url` is a string");
+    };
+    let handles = match value.get("handles") {
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .map(|item| item.as_str().map(str::to_owned))
+            .collect::<Option<Vec<String>>>(),
+        _ => None,
+    };
+    let Some(handles) = handles else {
+        return invalid("Switch wire 8.1: `handles` is an array of strings");
+    };
+    let key = |name: &str| match value.get(name) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(text)) => unb64_array::<32>(text).map(Some),
+        Some(_) => invalid(format!("Switch wire 8.1: `{name}` is b64(32)")),
+    };
+    let push_key = key("push_key")?;
+    let replaces = key("replaces")?;
+    if handles.len() > MAX_PUSH_HANDLES {
+        return invalid("Switch wire 8.1: at most 8 handles");
+    }
+    if push_key.is_none() && !handles.is_empty() {
+        return invalid("Switch wire 8.1: a start carries no handles");
+    }
+    if push_key.is_some() && replaces.is_some() {
+        return invalid("Switch wire 8.1: `replaces` is only on a start");
+    }
+    if crate::net::check_url(relay_url, &crate::net::UrlUse::Relay).is_err() {
+        return invalid(
+            "Switch wire 8.1: the relay URL isn't https on port 443 without user info, or its \
+             host isn't public",
+        );
+    }
+    Ok(PushBody {
+        relay_url: relay_url.to_owned(),
+        handles,
+        push_key,
+        replaces,
+    })
+}
+
 /// The calls after `/v1/{id}/` of a path, without its query.
 fn call_of(path: &str) -> Option<Vec<&str>> {
     let path = path.split('?').next().unwrap_or_default();
@@ -822,6 +913,46 @@ mod tests {
         assert_eq!(IdentityDelivery::parse(&first.to_json()).unwrap(), first);
         assert!(IdentityDelivery::parse(br#"{"identity":{"body":"","sig":""}}"#).is_err());
         assert!(IdentityDelivery::parse(br#"{"prev":null}"#).is_err());
+    }
+
+    #[test]
+    fn test_push_body_cases() {
+        let key = crate::enc::b64(&[7u8; 32]);
+        let start =
+            parse_push_body(br#"{"relay_url":"https://push.example/v1/hook","handles":[]}"#)
+                .expect("start");
+        assert!(start.is_start() && start.replaces.is_none());
+        let set = format!(
+            r#"{{"relay_url":"https://push.example/h","handles":["a","b"],"push_key":"{key}","x":1}}"#
+        );
+        let set = parse_push_body(set.as_bytes()).expect("set");
+        assert_eq!(set.push_key, Some([7; 32]));
+        assert_eq!(set.handles, ["a", "b"]);
+        let nulls =
+            br#"{"relay_url":"https://push.example","handles":[],"push_key":null,"replaces":null}"#;
+        assert!(parse_push_body(nulls).expect("nulls").is_start());
+        let nine = format!(
+            r#"{{"relay_url":"https://push.example","handles":[{}],"push_key":"{key}"}}"#,
+            ["\"h\""; 9].join(",")
+        );
+        for bad in [
+            r#"{"handles":[]}"#.to_owned(),
+            r#"{"relay_url":"https://push.example"}"#.to_owned(),
+            r#"{"relay_url":"https://push.example","handles":[1]}"#.to_owned(),
+            r#"{"relay_url":"https://push.example","handles":["h"]}"#.to_owned(),
+            r#"{"relay_url":"https://push.example","handles":[],"push_key":"short"}"#.to_owned(),
+            format!(
+                r#"{{"relay_url":"https://push.example","handles":[],"push_key":"{key}","replaces":"{key}"}}"#
+            ),
+            nine,
+            r#"{"relay_url":"http://push.example","handles":[]}"#.to_owned(),
+            r#"{"relay_url":"https://push.example:8443","handles":[]}"#.to_owned(),
+            r#"{"relay_url":"https://u@push.example","handles":[]}"#.to_owned(),
+            r#"{"relay_url":"https://10.0.0.1/hook","handles":[]}"#.to_owned(),
+            r#"{"relay_url":"https://push.example","handles":[],"relay_url":"x"}"#.to_owned(),
+        ] {
+            assert!(parse_push_body(bad.as_bytes()).is_err(), "{bad}");
+        }
     }
 
     #[test]
