@@ -9,7 +9,7 @@ use pubky_switch::limits::Limits;
 use pubky_switch_client::app::{App, OutgoingMessage};
 use pubky_switch_client::store::MemoryStore;
 use pubky_switch_core::records::IdentityDoc;
-use pubky_switch_signer::{Signer, UserConfirmed};
+use pubky_switch_signer::{Signer, SignerStatus, UserConfirmed};
 use serde_json::{Value, json};
 
 use super::enrollment::{enroll, status};
@@ -54,6 +54,23 @@ fn ended<T, E: std::fmt::Debug>(result: &Result<T, E>) -> Value {
         }
     }
 }
+
+/// Fail the flow unless the run's last request labelled `label` was answered `status` with
+/// the error `code`: what the step must be at either switch, not only alike at both.
+fn expect_answer(world: &World, label: &str, status: u16, code: &str) -> FlowResult {
+    let [was, with, _] = world
+        .last_answer(label)
+        .ok_or_else(|| format!("no request {label} was sent"))?;
+    if was == status.to_string() && with == format!("text {code}") {
+        Ok(())
+    } else {
+        Err(format!("{label} was answered {was} {with}, not {status} {code}").into())
+    }
+}
+
+/// bob's delivery of his `identity.json` to alice's switch, his first call when he writes
+/// to her.
+const BOBS_FIRST_CALL: &str = "{bob/shop} PUT /v1/{alice}/peers";
 
 /// `shop` sends alice a note, or tries its queued ones again, and the flow notes how each
 /// stands.
@@ -125,6 +142,8 @@ async fn recovery_elsewhere(world: &World, during: bool) -> FlowResult {
             Some(alice.public()),
         )
         .await?;
+        // Staged, the service holds every sender back (Switch spec 12.6 step 2).
+        expect_answer(world, BOBS_FIRST_CALL, 503, "staged")?;
     }
     let ending = alice_signer.end_staged_admission().await;
     world.outcome(
@@ -149,6 +168,8 @@ async fn recovery_elsewhere(world: &World, during: bool) -> FlowResult {
         )
         .await?;
     }
+    // Ended, bob is judged by the lists, which are empty at the new service.
+    expect_answer(world, BOBS_FIRST_CALL, 403, "not_admitted")?;
 
     alice_signer.run_due().await?;
     world.outcome("alice's signer ran what is due", &status(&alice_signer)?);
@@ -213,6 +234,14 @@ pub async fn provider_loss_in_place(world: &World) -> FlowResult {
         "the first enrollment, sent again",
         &json!({ "status": retried.status }),
     );
+    // The key its answer named is retired: `409 conflict`, which only the operator's key
+    // can sign, the account's being the one in question (Switch wire 3.7, 7.4.1).
+    let enrollment = "{alice} POST /v1/enroll";
+    expect_answer(world, enrollment, 409, "conflict")?;
+    let signed_with = world.last_answer(enrollment).map(|[_, _, key]| key);
+    if signed_with.as_deref() != Some("the operator key") {
+        return Err(format!("the conflict is signed with {signed_with:?}").into());
+    }
     world.advance_ms(STEP_MS);
 
     let ending = signer.end_staged_admission().await;
@@ -263,9 +292,17 @@ pub async fn provider_loss_refused(world: &World) -> FlowResult {
         "the service refused the recovery",
         &json!({ "ended": ended(&refused), "signer": status(&signer)? }),
     );
+    let shown = signer.status();
+    if !matches!(&shown, SignerStatus::RecoveryRefused { origin } if origin == SMALL_ORIGIN) {
+        return Err(format!("the signer is {shown:?}, not refused at {SMALL_ORIGIN}").into());
+    }
     world.advance_ms(STEP_MS);
     // Refused, the recovery waits to be declared again: a run sends nothing.
+    let sent = world.requests_sent();
     let waiting = signer.resume().await;
+    if world.requests_sent() != sent {
+        return Err("the signer sent something while its recovery was refused".into());
+    }
     world.outcome(
         "the signer's next run, the recovery refused",
         &json!({ "ended": ended(&waiting), "signer": status(&signer)? }),
@@ -283,9 +320,11 @@ pub async fn provider_loss_refused(world: &World) -> FlowResult {
     Ok(())
 }
 
-/// An enrollment that takes three sends. The first is answered `400` and the second `409
-/// conflict`, each in the service's place by something that holds none of its keys: the
-/// signer takes neither for the service's word. After the `400` it sends the same
+/// An enrollment that takes three sends, the first two refused in transit. The first is
+/// answered `400` and the second `409 conflict`, each in the service's place by something
+/// that holds none of its keys, so neither refusal is a switch's: the flow shows what the
+/// signer does with them, and the one enrollment that arrives. The signer takes neither for
+/// the service's word. After the `400` it sends the same
 /// enrollment again; after the `409` it signs a new one, which the service answers, and the
 /// recovery completes.
 ///
@@ -294,7 +333,7 @@ pub async fn provider_loss_refused(world: &World) -> FlowResult {
 /// # Errors
 ///
 /// When a step that should succeed against any switch fails, or a fault met no request.
-pub async fn provider_loss_enrollment_resent(world: &World) -> FlowResult {
+pub async fn provider_loss_refusals_in_transit(world: &World) -> FlowResult {
     let alice = world.identity("alice")?;
     world.add_switch(ORIGIN, &[&alice]).await?;
     let mut signer = enroll(world, &alice, ORIGIN).await?;
@@ -304,6 +343,7 @@ pub async fn provider_loss_enrollment_resent(world: &World) -> FlowResult {
     world.add_switch(RECOVERY_ORIGIN, &[&alice]).await?;
     world.refuse("POST", "/v1/enroll", 400, "bad_request");
     world.refuse("POST", "/v1/enroll", 409, "conflict");
+    let (sent, enrollments) = (world.requests_sent(), world.enrollments_sent());
     let doc = signer
         .declare_provider_loss(RECOVERY_ORIGIN, UserConfirmed::shown_and_confirmed())
         .await?;
@@ -311,6 +351,24 @@ pub async fn provider_loss_enrollment_resent(world: &World) -> FlowResult {
         "the signer recovered at its third enrollment",
         &recovered(&doc, &signer)?,
     );
+    // Three sends: the same enrollment twice, around the `400`, and a new one after the
+    // `409` (Switch wire 7.4.1). The recovery's other calls are the delivery and the reads
+    // after it.
+    let new_enrollments = world.enrollments_sent() - enrollments;
+    if new_enrollments != 2 {
+        return Err(format!("{new_enrollments} different enrollments were sent, not 2").into());
+    }
+    let trace = world.trace();
+    let sends = trace
+        .lines
+        .iter()
+        .filter(|line| !line.label.starts_with("outcome "))
+        .skip(sent)
+        .filter(|line| line.label == "{alice} POST /v1/enroll")
+        .count();
+    if sends != 3 {
+        return Err(format!("the enrollment took {sends} sends, not 3").into());
+    }
     if world.faults_left() != 0 {
         return Err("a fault met no request".into());
     }
@@ -386,6 +444,18 @@ pub async fn provider_loss_restored(world: &World) -> FlowResult {
     );
     if world.faults_left() != 0 {
         return Err("a fault met no request".into());
+    }
+    // The wallet is revoked at the new service, and the newest version removes it.
+    let revocation = "{alice} POST /v1/{alice}/apps/{alice/wallet}/revoke";
+    let revoked = world.last_answer(revocation).map(|[status, _, _]| status);
+    let listed = newest.as_ref().map(|doc| doc.body().apps.len());
+    let gone = newest.as_ref().map(|doc| doc.body().removed.len());
+    if revoked.as_deref() != Some("200") || listed != Some(0) || gone != Some(1) || !removed {
+        return Err(format!(
+            "the revocation was answered {revoked:?}, and the newest version lists {listed:?} \
+             apps and removes {gone:?}"
+        )
+        .into());
     }
     Ok(())
 }

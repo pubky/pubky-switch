@@ -292,6 +292,11 @@ impl Recorder {
         lock(&self.enrollments).get(nth).cloned()
     }
 
+    /// How many different enrollments were sent through this recorder.
+    pub fn enrollments_sent(&self) -> usize {
+        lock(&self.enrollments).len()
+    }
+
     /// The faults added and not applied yet.
     pub fn faults_left(&self) -> usize {
         lock(&self.faults).len()
@@ -485,8 +490,11 @@ impl Transport for Recorder {
                     let mut violations = Vec::new();
                     // The signature is of the answer as the switch sent it.
                     match self.checker.signature(&sent, answer) {
-                        Ok(SignedWith::ServiceKey) => {
-                            facts.insert(SIGNED_WITH.into(), "the account's service key".into());
+                        Ok(SignedWith::ServiceKey(number)) => {
+                            facts.insert(
+                                SIGNED_WITH.into(),
+                                format!("the account's service key, number {number}"),
+                            );
                         }
                         Ok(SignedWith::OperatorKey) => {
                             facts.insert(SIGNED_WITH.into(), "the operator key".into());

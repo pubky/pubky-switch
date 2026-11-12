@@ -383,6 +383,35 @@ impl World {
             .map_err(|error| HarnessError::Setup(error.to_string()))
     }
 
+    /// What the run's last request labelled `label` was answered, as the trace keeps it: the
+    /// facts `status`, `body.code` and `answer signed with`, each empty when the line has
+    /// none. For a flow that holds a step to what it must be at either switch.
+    pub fn last_answer(&self, label: &str) -> Option<[String; 3]> {
+        let trace = self.recorder.trace();
+        let line = trace.lines.iter().rev().find(|line| line.label == label)?;
+        let fact = |name: &str| line.facts.get(name).cloned().unwrap_or_default();
+        Some([
+            fact("status"),
+            fact("body.code"),
+            fact("answer signed with"),
+        ])
+    }
+
+    /// How many requests the run has sent so far.
+    pub fn requests_sent(&self) -> usize {
+        let trace = self.recorder.trace();
+        trace
+            .lines
+            .iter()
+            .filter(|line| !line.label.starts_with("outcome "))
+            .count()
+    }
+
+    /// How many different enrollments the run has sent so far: one sent again counts once.
+    pub fn enrollments_sent(&self) -> usize {
+        self.recorder.enrollments_sent()
+    }
+
     /// The faults asked for that no request has met yet.
     pub fn faults_left(&self) -> usize {
         self.recorder.faults_left()

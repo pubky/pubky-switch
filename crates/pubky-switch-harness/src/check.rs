@@ -7,13 +7,22 @@
 //! signer verify much of it, and a flow fails where they refuse. This module checks the
 //! rest of what the harness holds the means to check, on every answer of either switch:
 //!
-//! - the answer's signature (Switch wire 7.1), with the account's service key, or the
-//!   operator key for an answer the switch can't tie to an account;
+//! - the answer's signature (Switch wire 7.1), with one of the account's service keys, or
+//!   the operator key for an answer the switch can't tie to an account. An account has a
+//!   key for each service and generation it enrolled at; the trace says which signed, by
+//!   its number in the order the run brought them, so the two runs must agree on it. A key
+//!   the run didn't give the checker is taken from the enrollment that answers it, on that
+//!   answer's own word, as the signer takes it; a delivery the switch took must then be
+//!   answered under the key its document names;
 //! - every signed head, in `Switch-Head` and in a body's `head` (Switch wire 6.7): its
 //!   signature, and its chain hash against the stub of its `seq` where the run showed one;
 //! - every chain stub (Switch wire 6.6): its chain hash follows from its envelope, the stub
-//!   at one `seq` is always the same, and its `prev_chain_hash` is the chain hash of the
-//!   `seq` before where the run showed it;
+//!   at one `seq` of a generation is always the same, its `prev_chain_hash` is the chain
+//!   hash of the `seq` before where the run showed it, and a stub at `seq` 1 follows
+//!   nothing. Stubs are linked within a generation only: where a generation's sequence
+//!   goes on from the one before, as after a move, nothing here ties the two, and the first
+//!   stub of a recovery's generation, its `recovery` transition, is shown to no party of a
+//!   flow, so that start is checked only by what follows it;
 //! - every feed item shown in full: its document hashes to its envelope's `item_hash`;
 //! - every transition proof (Switch wire 6.5): its signature, and its stub as above.
 //!
@@ -54,6 +63,15 @@ impl Account {
     fn any_key(&self, check: impl Fn(&[u8; 32]) -> bool) -> bool {
         self.service_keys.iter().any(check)
     }
+
+    /// Which of the account's service keys passes `check`: its number, from 1, in the order
+    /// the run brought them.
+    fn which_key(&self, check: impl Fn(&[u8; 32]) -> bool) -> Option<usize> {
+        self.service_keys
+            .iter()
+            .position(check)
+            .map(|at| at.saturating_add(1))
+    }
 }
 
 /// One sequence of an account: its Pubky ID and a generation.
@@ -80,8 +98,9 @@ impl std::fmt::Debug for Checker {
 /// Which key an answer's signature verified with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SignedWith {
-    /// The account's service key.
-    ServiceKey,
+    /// One of the account's service keys: its number, from 1, in the order the run brought
+    /// them, so that two runs agree on which key signed, not only that one of them did.
+    ServiceKey(usize),
     /// The operator key.
     OperatorKey,
 }
@@ -167,9 +186,19 @@ impl Checker {
         // An enrollment's answer brings its key with it.
         let _ = self.enrolled_key(request, answer, &verifies);
         if let Some((_, account)) = self.account_of(request)
-            && account.any_key(verifies)
+            && let Some(number) = account.which_key(verifies)
         {
-            return Ok(SignedWith::ServiceKey);
+            // A delivery the switch took is answered under the key its document names: the
+            // key the enrollment before it answered (Switch wire 3.3, 3.7).
+            if let Some(named) = delivered_service_key(request, answer)
+                && account.service_keys.get(number.saturating_sub(1)) != Some(&named)
+            {
+                return Err(format!(
+                    "the delivery is answered with the account's service key number {number}, \
+                     not the one its document names"
+                ));
+            }
+            return Ok(SignedWith::ServiceKey(number));
         }
         if let Some(operator) = *lock(&self.operator_key)
             && verifies(&operator)
@@ -207,6 +236,19 @@ impl Checker {
         }
         found.violations
     }
+}
+
+/// The service key the `identity.json` of a delivery names, when `request` is a `PUT
+/// /v1/{id}/identity` the switch took.
+fn delivered_service_key(request: &Request, answer: &Response) -> Option<[u8; 32]> {
+    let path = request.path_and_query.strip_prefix("/v1/")?;
+    if request.method != "PUT" || answer.status != 200 || !path.ends_with("/identity") {
+        return None;
+    }
+    let body: Value = serde_json::from_slice(&request.body).ok()?;
+    let signed = serde_json::from_value::<SignedDoc>(body.get("identity")?.clone()).ok()?;
+    let doc: Value = serde_json::from_slice(&signed.doc_bytes().ok()?).ok()?;
+    unb64_array::<32>(doc.get("inbox")?.get("service_key")?.as_str()?).ok()
 }
 
 /// The checks of one answer.
@@ -327,6 +369,13 @@ impl Found<'_> {
             self.violation(format!(
                 "{at}: another chain hash at seq {} than the run showed before",
                 envelope.seq
+            ));
+        }
+        // A sequence's first item follows nothing (Switch wire 6.6).
+        if envelope.seq == 1 && envelope.prev_chain_hash != ZERO_HASH {
+            self.violation(format!(
+                "{at}: the stub at seq 1 of generation {} follows something",
+                envelope.generation
             ));
         }
         if before.is_some_and(|hash| hash != envelope.prev_chain_hash) {

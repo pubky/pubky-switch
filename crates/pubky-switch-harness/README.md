@@ -109,7 +109,10 @@ service's own tests hold, and a faulty or hostile switch, which stays on the scr
 switch. Around the service, the flows don't touch TLS, the listener, the proxy's
 client-address header, the client's HTTPS transport, the time source (trusted time comes
 from the test clock), key generation (accounts take keys from fixed seeds), or more than one
-instance on a database. `src/check.rs` says what of an answer the harness verifies itself
+instance on a database. Of a service's limits, a world carries only the inbox quota and
+the app limit to the scripted switch (`World::add_switch_with`): a flow that leaned on
+another would compare a service so set with a scripted switch at its defaults. `src/check.rs`
+says what of an answer the harness verifies itself
 and what it leaves to the client and the signer.
 
 ## Adding a flow
