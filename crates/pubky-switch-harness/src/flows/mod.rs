@@ -45,7 +45,8 @@ pub use admission::{deny_list, invite_code};
 pub use claim::claim;
 pub use collections::two_collections;
 pub use connect::{
-    connect_request, connect_request_full, connect_request_recovered, connect_request_turned_off,
+    connect_request, connect_request_full, connect_request_recovered,
+    connect_request_recovered_in_place, connect_request_turned_off,
 };
 pub use enrollment::enrollment;
 pub use epochs::{epochs_three_readers, rotation_given_up, third_epoch};
@@ -183,6 +184,9 @@ pub const FLOWS: &[(&str, Flow)] = &[
     }),
     ("connect request, across a provider loss", |world| {
         Box::pin(connect_request_recovered(world))
+    }),
+    ("connect request, a recovery in place", |world| {
+        Box::pin(connect_request_recovered_in_place(world))
     }),
     ("approval, grant paths declined", |world| {
         Box::pin(grant_paths_declined(world))
