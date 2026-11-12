@@ -181,11 +181,21 @@ debug build. If that grows too long, the service's halves could share one servic
 database, with identities of their own per flow: a later option, not needed yet.
 
 The test server is shared with whatever else uses it, and the service answers every failure
-of its storage `503 unavailable` with the reason only in its log: a connection the server
-refused, or a wait for a pooled connection (5 seconds) or for an account's lock (10 seconds)
-that ran out. So a run keeps the service's warnings and errors (`src/service_log.rs`). A run
-in which the service's storage failed ends as a failure that names the test database and
-quotes those lines, whatever the flow made of the `503`; nothing is sent again, and a flow
-is never run a second time. A flow that fails for another reason shows what the service
-logged beside its own error. When a run fails that way, look for another suite on the same
-server: several at once can pass its limit on connections.
+of its storage `503 unavailable` with the reason only in its log. So a run keeps the
+service's warnings and errors (`src/service_log.rs`, at most fifty lines), and tells them
+apart:
+
+- **The server failed a request**: it refused or broke a connection, or the wait for a
+  pooled connection (5 seconds) or for an account's lock (10 seconds) ran out. The run ends
+  as a failure that names the test database and quotes those lines, whatever the flow made
+  of the `503`. Nothing is sent again, and a flow is never run a second time. When a run
+  fails that way, look for another suite on the same server: several at once can pass its
+  limit on connections.
+- **A request failed inside the service for another reason**, such as a statement the
+  database refused or a stored value that doesn't fit: the service's own. The run fails as
+  its flow, with the log, also when the flow made nothing of the answer.
+- **A line about no request**, such as the store trying its first connection again, fails
+  no run. It is shown beside a failed flow's error.
+
+The test that asks the service for every call runs the same way, so a request the server
+failed there isn't read as a call that isn't served.
