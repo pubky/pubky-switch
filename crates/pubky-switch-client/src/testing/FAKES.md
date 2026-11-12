@@ -105,6 +105,16 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   whatever the cursors. Checkpoints and dropped stubs exist only when a test scripts them;
   claims are deleted only when `GET /claims` finds them deletable; batch records are never
   dropped, and their proofs go only when a retry finds them past `batch_proofs_ms`.
+- **Purge of removed apps** (Switch wire 9.1), in `switch/retention.rs` `purge_removed`, by
+  the service's rule and at the service's requests: a revoked or departed app, or an App ID
+  an enrollment named, that the newest `identity.json` lists in neither `apps` nor
+  `removed`, whose departure's rotation is done and that owns no attempt open or `unknown`,
+  is purged at the delivery that leaves it out, at its revocation, and at the batch or
+  recovery upload that resolves the last such attempt it owned (and at the test call
+  `fail_attempt` that does). Its record, certificates, receive keys and their kids, cursor,
+  last-seen time, lagging mark, full-bundle request, key bundle parts and listing go; its
+  App ID, revocation or departure time and rotation stay, and `GET /apps` shows it as the
+  service does, with no unread entries.
 - **Invite codes**: a revoked app's codes aren't withdrawn (Switch wire 7.4.3 "After a
   revocation"); a code planted for a faulty export never expires.
 - **Lists**: `flagged` is always empty.
@@ -191,11 +201,10 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   `app.put` or doesn't parse, gets `403 not_current`
   at authentication, before the account's lock and before a staged or frozen account's
   answer (Switch wire 7.3 steps 5 to 8), whatever the route: no `Switch-Head`,
-  `Switch-Server-Time` the last time stamped, and the app not seen. A departed app that
-  delivered its record keeps it, so it goes on to the route's checks, as at the service,
-  until the test call `purge` frees it, as a service may once the signer purges the app
-  from `removed` (Switch wire 9.1): then it meets the first call's refusal, without the
-  head. The service keeps a purged app's record, so it answers that app with the head.
+  `Switch-Server-Time` the last time stamped, and the app not seen. A revoked or departed
+  app that delivered its record keeps it, so it goes on to the route's checks, as at the
+  service, until it is purged (Purge of removed apps, above): then it meets the first
+  call's refusal, without the head, as at the service.
 - **App currency outside batches**: a feed read is checked as a batch is, for an app that
   delivered its record: current, with an unexpired certificate, the stored renewed one once
   the newest `identity.json` lists it (Switch wire 7.2, 3.8). Other routes check only that
@@ -281,7 +290,8 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
     `not_current`) before recording anything, and it counts any scripted error other than a
     `401`;
   - `revoked_at`, `departed_at`, and `awaiting_rotation` for a departure until a delivered
-    version removes it at a higher data epoch. That stays done after a purge;
+    version removes it at a higher data epoch. That stays done after a purge, which keeps
+    these three and clears the rest, as at the service (Purge of removed apps, above);
   - `open_attempts`: the attempts the app owns that are open or `unknown`;
   - `record_cert`, `record_at`, `full_bundle_requested`, `bundle_ranges` and
     `cert_expires_at`;

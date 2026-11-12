@@ -1,6 +1,6 @@
 //! The scripted switch's `GET /apps` against the service's rules (Switch wire 7.4.12): an
-//! app's last-seen time, its open attempts, and a departure's rotation, which stays done after
-//! the signer purges the app from `removed`.
+//! app's last-seen time, its open attempts, a departure's rotation, which stays done after
+//! the signer purges the app from `removed`, and the purge itself (9.1).
 
 // The helpers set up fixed test state, where a failure is a test failure.
 #![allow(clippy::unwrap_used)]
@@ -304,4 +304,83 @@ async fn test_scripted_switches_at_two_origins_each_take_their_own_enrollment() 
     assert!(enroll(&a, &at_a, origin_a, origin_b).await.is_err());
     assert!(enroll(&a, &at_a, origin_a, origin_a).await.is_ok());
     assert!(enroll(&b, &at_b, origin_b, origin_b).await.is_ok());
+}
+
+impl Setup {
+    /// The signer revokes `app`, moves it to `removed` at a higher data epoch, then purges
+    /// it from there; the switch's status of it in `removed`, and after.
+    async fn revoke_and_purge(&self, app: [u8; 16]) -> (AppStatus, AppStatus) {
+        self.alice.switch().revoke(app).unwrap();
+        self.alice
+            .next_doc(|body| {
+                body.apps.retain(|a| a.app_id != app);
+                body.removed.push(RemovedApp {
+                    app_id: app,
+                    distrust_from: START_MS,
+                });
+                body.data_epoch += 1;
+            })
+            .unwrap();
+        let removed = self.status(&app).await;
+        self.alice
+            .next_doc(|body| body.removed.retain(|r| r.app_id != app))
+            .unwrap();
+        (removed, self.status(&app).await)
+    }
+}
+
+#[tokio::test]
+async fn test_scripted_apps_purged_at_the_delivery_that_drops_it() {
+    let s = Setup::new();
+    let app = s.join("wallet").await;
+    let id = app.app_id();
+    let (removed, purged) = s.revoke_and_purge(id).await;
+    // Kept while in `removed`.
+    assert!(removed.record_cert.is_some());
+    assert!(removed.last_seen.is_some());
+    // Then down to its App ID and revocation time, as at the service.
+    assert!(!purged.current);
+    assert_eq!(purged.revoked_at, removed.revoked_at);
+    assert_eq!(
+        (
+            purged.last_seen,
+            purged.record_cert,
+            purged.record_at,
+            purged.keys_through,
+            purged.cert_expires_at,
+            purged.unread_entries,
+        ),
+        (None, None, None, None, None, 0)
+    );
+    assert!(purged.bundle_ranges.is_empty());
+    let held = s.alice.switch().app(&id);
+    assert!(held.purged && held.record.is_none() && held.receive_key.is_none());
+}
+
+#[tokio::test]
+async fn test_scripted_apps_purge_waits_for_the_apps_open_attempt() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    let id = app.app_id();
+    let (claim_key, attempt_id) = ([5; 32], [6; 16]);
+    let deadline = START_MS + DAY_MS;
+    app.write_claim(
+        ClaimOp::attempt(claim_key, 0, attempt_id, 3600, Some(deadline)),
+        vec![],
+        ObligationDeadline::At(deadline),
+    )
+    .await
+    .unwrap();
+    let (_, dropped) = s.revoke_and_purge(id).await;
+    // In neither list, but it owns an open attempt: it keeps everything.
+    assert!(dropped.record_cert.is_some());
+    assert_eq!(dropped.open_attempts.len(), 1);
+    assert!(!s.alice.switch().app(&id).purged);
+    // Its last open attempt resolved, it goes.
+    s.alice
+        .switch()
+        .fail_attempt(claim_key, attempt_id, [9; 16]);
+    let purged = s.status(&id).await;
+    assert!(purged.record_cert.is_none() && purged.open_attempts.is_empty());
+    assert!(s.alice.switch().app(&id).purged);
 }

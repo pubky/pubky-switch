@@ -165,6 +165,9 @@ pub struct SwitchApp {
     /// data epoch than at its departure: its rotation is done for good (`awaiting_rotation`,
     /// Switch wire 7.4.12).
     pub rotated: bool,
+    /// Whether the switch purged what it held of the removed app, down to its App ID and
+    /// its revocation or departure time (Switch wire 9.1).
+    pub purged: bool,
 }
 
 /// The byte budget of a feed page's items and of a record page's views: 8 MiB (Switch wire
@@ -903,6 +906,7 @@ impl ScriptedSwitch {
     /// service makes (Switch wire 6.8).
     pub fn fail_attempt(&self, claim_key: [u8; 32], attempt_id: [u8; 16], by: [u8; 16]) {
         let mut inner = self.lock();
+        let before = inner.shared.claims.clone();
         if let Some(claim) = inner.shared.claims.get_mut(&claim_key) {
             for attempt in &mut claim.attempts {
                 if attempt.attempt_id == attempt_id {
@@ -912,6 +916,9 @@ impl ScriptedSwitch {
             }
             claim.current = None;
         }
+        // Its owner's last open attempt resolved, a removed app may be purged (Switch wire
+        // 9.1), as at the service's outcome.
+        inner.purge_released(&before);
     }
 
     /// A faulty service that lost the account's `identity.json`: it holds none from now on.
@@ -937,21 +944,6 @@ impl ScriptedSwitch {
     pub fn leave(&self, app: [u8; 16]) -> Result<(), ScriptError> {
         self.lock().leave(app)?;
         Ok(())
-    }
-
-    /// A service that frees a purged app's record (Switch wire 9.1): `app`, revoked or
-    /// departed and purged from `removed`, keeps its App ID for good, but its record and
-    /// receive key go, so every call of it but a first call meets the refusal of one, `403
-    /// not_current` without the head (Switch wire 7.2 "Where an own app gets `403
-    /// not_current`"). The service keeps them, and answers with the head.
-    pub fn purge(&self, app: [u8; 16]) {
-        let mut inner = self.lock();
-        let held = inner.apps.entry(app).or_default();
-        held.departed = true;
-        held.record = None;
-        held.cert = None;
-        held.receive_key = None;
-        held.receive_n = None;
     }
 
     /// A faulty service: `app` stays revoked or departed, but `GET /apps` shows no time for it.
@@ -1977,6 +1969,8 @@ impl Inner {
         let proof = self.service_transition(ServiceTransition::Revoke { app_id: app, at })?;
         // After its chain item (Switch wire 7.4.4).
         self.after_departure(was);
+        // An app the newest document lists in neither list goes at once (Switch wire 9.1).
+        self.purge_removed(Some(&[app]));
         Ok(Some(proof))
     }
 
@@ -2563,6 +2557,7 @@ impl Inner {
         // The transition's `seq`, the next: a record taken from the upload is at it.
         let seq = self.seq + 1;
         let caps = (self.max_contacts, self.max_deny);
+        let claims_before = self.shared.claims.clone();
         self.shared.merge_upload(
             &checked,
             upload.lists.as_ref(),
@@ -2571,6 +2566,7 @@ impl Inner {
             now,
             &mut changes,
         );
+        self.purge_released(&claims_before);
         if upload.ends_staged_admission(cert) {
             self.admission_staged = false;
         }

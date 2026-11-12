@@ -125,9 +125,9 @@ async fn test_not_registered_repeated_headless_refusals_cost_one_request_a_read(
     assert!(!report.stopped);
 }
 
-/// Revoked while offline, then purged from `removed`: a service that frees the purged app's
-/// record answers its calls without the head (Switch wire 7.2 "Where an own app gets `403
-/// not_current`", 9.1). The newest identity.json lists the app in neither list, so it ends
+/// Revoked while offline, then purged from `removed`: the switch purges the app's record at
+/// that delivery and answers its calls without the head (Switch wire 7.2 "Where an own app
+/// gets `403 not_current`", 9.1). The newest identity.json lists the app in neither list, so it ends
 /// as removed, and reads on as a stopped app.
 #[tokio::test]
 async fn test_not_registered_purged_app_ends_as_removed() {
@@ -146,7 +146,7 @@ async fn test_not_registered_purged_app_ends_as_removed() {
     });
     w.clock.advance_ms(1_000);
     w.next_doc(|body| body.removed.retain(|removed| removed.app_id != me));
-    w.switch.purge(me);
+    assert!(w.switch.app(&me).purged);
     let report = app.receive(None).await.unwrap();
     assert!(report.stopped);
     assert!(has(&report.events, |e| matches!(e, AppEvent::Removed)));
