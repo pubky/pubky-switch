@@ -5,9 +5,11 @@
 //! time base, never a client's; a run cut short leaves only rows a later one takes.
 //!
 //! - **Deleted keys** are forgotten at every such request, at most
-//!   [`FORGOTTEN_KEYS_PER_REQUEST`] (`AccountTxn::forget_deleted_keys` gives the rule). An
-//!   app that was lagging, which the rule doesn't wait for, lists its collections again on
-//!   its return (7.4.4), and a new app lists at join.
+//!   [`FORGOTTEN_KEYS_PER_REQUEST`] (`AccountTxn::forget_deleted_keys` gives the rule). A
+//!   lagging app isn't waited for only while it has a `missed` item to pass, on which it
+//!   lists its collections again (7.4.4); a lagging app with none is waited for, as a
+//!   returning app that doesn't list could keep a record forgotten past its cursor. A new
+//!   app lists at join.
 //! - **Once a minute of service time** (`AccountTxn::minute_sweep_due`): invite codes that
 //!   expired or ran out, and the transition proofs of batches past `batch_proofs_ms`, at
 //!   most [`SPENT_PER_MINUTE`] of each. A batch's ID and operation hash stay while any of

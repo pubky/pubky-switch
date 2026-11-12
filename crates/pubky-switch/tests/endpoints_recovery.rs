@@ -2833,3 +2833,132 @@ async fn test_upload_from_a_revoked_app_is_refused_without_its_judgment() {
     );
     replay.db.drop_database().await.expect("drop");
 }
+
+/// Wait until `n` backends of the test database wait for a lock.
+async fn lock_waiters(options: &sqlx::postgres::PgConnectOptions, n: i64) {
+    let mut watcher = sqlx::PgConnection::connect_with(options)
+        .await
+        .expect("conn");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' \
+             AND datname = current_database()",
+        )
+        .fetch_one(&mut watcher)
+        .await
+        .expect("count");
+        if count >= n {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{count} waiting, not {n}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// `first`, then `second`, queued in that order behind a hold on alice's account row, and
+/// answered once the hold ends: so they run one after the other, as two requests that come
+/// at the same moment do.
+async fn queued(
+    replay: &Replay,
+    first: impl std::future::Future<Output = SwitchResponse>,
+    second: impl std::future::Future<Output = SwitchResponse>,
+) -> (SwitchResponse, SwitchResponse) {
+    let mut holder = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    sqlx::query("BEGIN")
+        .execute(&mut holder)
+        .await
+        .expect("begin");
+    sqlx::query("SELECT 1 FROM accounts WHERE id = $1 FOR UPDATE")
+        .bind(alice_id())
+        .execute(&mut holder)
+        .await
+        .expect("lock");
+    let options = replay.db.options().clone();
+    let (first, (second, ())) = tokio::join!(first, async {
+        lock_waiters(&options, 1).await;
+        tokio::join!(second, async {
+            lock_waiters(&options, 2).await;
+            sqlx::query("COMMIT")
+                .execute(&mut holder)
+                .await
+                .expect("commit");
+        })
+    });
+    (first, second)
+}
+
+#[tokio::test]
+async fn test_recovery_in_place_and_a_sweep_at_the_same_moment_run_one_after_the_other() {
+    // A request that sweeps and a recovery in place, at the same moment, in either order:
+    // each takes the account's lock, so one runs after the other, and both are answered.
+    // The recovery starts the account afresh either way: a sweep before it dropped what it
+    // could from the old state, one after it sweeps the fresh state and takes nothing of
+    // it (Switch wire 7.3 step 4, 3.3).
+    for sweep_first in [true, false] {
+        let Some(replay) = replay().await else { return };
+        let (pending, at) = serving_with_a_pending_key(&replay).await;
+        let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+            .await
+            .expect("conn");
+        sqlx::query(
+            "INSERT INTO invite_codes (account_id, code_hash, max_uses, writer, \
+             expires_at_ms, context) VALUES ($1, decode(repeat('ab', 32), 'hex'), 1, \
+             decode(repeat('cd', 16), 'hex'), $2, 'null')",
+        )
+        .bind(alice_id())
+        .bind(i64::try_from(at).expect("ms"))
+        .execute(&mut conn)
+        .await
+        .expect("invite");
+        let before = held(&replay).await;
+        let recovery = next_generation(&before, pending, Some(1));
+        let apps = || {
+            replay.service.handle(signer_request(
+                "GET",
+                &format!("/v1/{}/apps", alice_id()),
+                Vec::new(),
+                at,
+            ))
+        };
+        let deliver = async { deliver(&replay, recovery, Some(before.hash()), at).await.0 };
+        let (swept, recovered) = if sweep_first {
+            queued(&replay, apps(), deliver).await
+        } else {
+            let (recovered, swept) = queued(&replay, deliver, apps()).await;
+            (swept, recovered)
+        };
+        assert_eq!(
+            recovered.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&recovered.body)
+        );
+        assert_eq!(
+            swept.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&swept.body)
+        );
+        assert_eq!(
+            chain(&replay).await,
+            [(2, 1, "service".into()), (2, 2, "identity".into())],
+            "sweep first: {sweep_first}"
+        );
+        assert_eq!(
+            scalar_i64(
+                &replay,
+                "SELECT count(*) FROM invite_codes WHERE account_id = $1"
+            )
+            .await,
+            0
+        );
+        conn.close().await.expect("close");
+        replay.db.drop_database().await.expect("drop");
+    }
+}

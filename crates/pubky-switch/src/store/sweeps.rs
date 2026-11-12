@@ -29,7 +29,9 @@ impl AccountTxn {
     /// Forget at most `bound` deleted keys that nothing refers to (Switch spec 10.3, wire
     /// 9.1): the record's current write is its delete, written at this service (one taken
     /// from a recovery upload has no chain item here to stand for it); the cursor of every
-    /// app of `current` that `lagging` doesn't hold is at or past the delete; and no
+    /// app of `current` is at or past the delete, but for an app `lagging` holds that has a
+    /// `missed` item it hasn't passed, since passing that item makes it list its
+    /// collections again (Switch wire 7.4.4), so it can't keep the forgotten record; and no
     /// divergent upload names the key. The record's row goes, so its delete shows as its
     /// chain stub and a create at the key starts afresh. The oldest deletes go first. The
     /// number forgotten.
@@ -48,7 +50,14 @@ impl AccountTxn {
                                  WHERE d.account_id = s.account_id AND d.key = s.key) \
                  AND NOT EXISTS (SELECT 1 FROM apps a \
                                  WHERE a.account_id = s.account_id \
-                                 AND a.app_id = ANY($2) AND NOT (a.app_id = ANY($3)) \
+                                 AND a.app_id = ANY($2) \
+                                 AND NOT (a.app_id = ANY($3) AND EXISTS ( \
+                                     SELECT 1 FROM inbox_entries m \
+                                     WHERE m.account_id = a.account_id \
+                                     AND m.kind = 'missed' AND m.targets[1] = a.app_id \
+                                     AND (a.cursor_generation IS NULL \
+                                          OR (m.generation, m.seq) \
+                                             > (a.cursor_generation, a.cursor_seq)))) \
                                  AND (a.cursor_generation IS NULL \
                                       OR (a.cursor_generation, a.cursor_seq) \
                                          < (s.generation, s.version))) \
