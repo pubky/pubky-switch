@@ -359,22 +359,6 @@ fn attempt(key: u8) -> (Vec<Condition>, OpKind) {
     )
 }
 
-async fn listen(
-    replay: &Replay,
-) -> (
-    tokio::sync::oneshot::Sender<()>,
-    tokio::task::JoinHandle<()>,
-) {
-    let listener = ChangeListener::connect(replay.db.store())
-        .await
-        .expect("listen");
-    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-    let task = tokio::spawn(listener.run(replay.service.changes(), async {
-        let _ = stopped.await;
-    }));
-    (stop, task)
-}
-
 #[tokio::test]
 async fn test_feed_long_poll_of_an_app_revoked_meanwhile_is_refused() {
     let Some(replay) = replay().await else { return };
