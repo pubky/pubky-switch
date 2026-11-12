@@ -43,6 +43,9 @@ pub struct FaultStore {
     /// A key prefix whose puts of values over a size make a commit fail with
     /// [`StoreError::TooLarge`], as a write over the working sizes would.
     too_large: Mutex<Option<TooLarge>>,
+    /// A key prefix whose next put makes its commit fail with [`StoreError::Unavailable`],
+    /// applying nothing.
+    failing_put: Mutex<Option<Vec<u8>>>,
 }
 
 impl std::fmt::Debug for FaultStore {
@@ -65,6 +68,7 @@ impl FaultStore {
             stopped: AtomicBool::new(false),
             failing_scans: Mutex::new(Vec::new()),
             too_large: Mutex::new(None),
+            failing_put: Mutex::new(None),
         }
     }
 
@@ -88,6 +92,15 @@ impl FaultStore {
     pub fn refuse_puts_as_too_large_once(&self, prefix: &[u8]) {
         if let Ok(mut too_large) = self.too_large.lock() {
             *too_large = Some((prefix.to_vec(), 0, Some(1)));
+        }
+    }
+
+    /// Fail the next commit that puts a key starting with `prefix` with
+    /// [`StoreError::Unavailable`], applying nothing, as a store that can't be written for
+    /// a moment; later ones pass.
+    pub fn fail_put_once(&self, prefix: &[u8]) {
+        if let Ok(mut failing) = self.failing_put.lock() {
+            *failing = Some(prefix.to_vec());
         }
     }
 
@@ -153,6 +166,15 @@ impl StateStore for FaultStore {
 
     fn commit(&self, batch: WriteBatch) -> Result<(), StoreError> {
         self.check_running()?;
+        if let Ok(mut failing) = self.failing_put.lock()
+            && let Some(prefix) = failing.as_ref()
+            && batch.writes.iter().any(|write| {
+                matches!(write, super::Write::Put { key, .. } if key.starts_with(prefix.as_slice()))
+            })
+        {
+            *failing = None;
+            return Err(StoreError::Unavailable);
+        }
         if let Ok(mut too_large) = self.too_large.lock()
             && let Some((prefix, size, times)) = too_large.as_mut()
             && batch.writes.iter().any(|write| {

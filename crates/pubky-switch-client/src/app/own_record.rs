@@ -352,7 +352,6 @@ impl App {
             Err(error) if owed => return Ok(self.publication_failed(error)),
             Err(error) => return Ok(Publication::Unchecked { error }),
         };
-        self.published_checked_ms = Some(now);
         let outcome = match copy {
             Some(held) if held == bytes => Publication::Published,
             Some(held) if self.later_copy(&held, &record) => Publication::Superseded,
@@ -376,6 +375,11 @@ impl App {
             self.commit(tx).await?;
             self.state.pending_publish = None;
         }
+        // The check counts only once what it found is committed. Set before, a check whose
+        // owed write-back failed to commit would leave nothing owed in the store and skip
+        // the next read's repair for the interval; the branches that owe a publication
+        // need no mark, since what is owed goes at every call.
+        self.published_checked_ms = Some(now);
         Ok(outcome)
     }
 

@@ -1435,3 +1435,29 @@ async fn test_own_record_two_step_leave_after_a_compromise_goes_without_the_dele
         "the leave waited on the delete: {outcome:?}"
     );
 }
+
+/// An app whose devices share its keys owes a missing copy's write-back to its next read.
+/// When owing it fails to commit, the check that found the copy missing counts for
+/// nothing: the next healthy read writes the copy back at once, without waiting out
+/// [`PUBLISHED_CHECK_MS`] (Switch spec 4.2).
+#[tokio::test]
+async fn test_own_record_failed_save_of_an_owed_write_back_doesnt_delay_it() {
+    let w = World::new();
+    let id = w.join_publishing("wallet").await.app_id();
+    let faulty = Arc::new(FaultStore::new(
+        Arc::clone(&w.store) as Arc<dyn StateStore>,
+        StoreFault::None,
+    ));
+    let mut app = w
+        .load_publishing_on(Arc::clone(&faulty) as Arc<dyn StateStore>, id)
+        .await;
+    app.set_multi_device(true).await.unwrap();
+    w.homeserver.remove(w.alice.public(), &app_record_path(&id));
+    faulty.fail_put_once(b"pending/publish");
+    let error = app.publish_record().await.unwrap_err();
+    assert!(matches!(error, AppError::Store(_)), "{error:?}");
+    assert!(w.published(id).is_none());
+    w.clock.advance_ms(1_000);
+    app.receive(None).await.unwrap();
+    assert_eq!(w.published(id), Some(bytes_of(app.record())));
+}
