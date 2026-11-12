@@ -95,13 +95,14 @@ async fn pending(
 /// turns them on. bob asks: alice's switch holds no copy of his `identity.json`, so the
 /// shop delivers it and asks again, and the request is pending. Asked a second time, the
 /// switch answers the same and keeps nothing more. carol's stall asks too. alice's wallet
-/// reads the two requests, oldest first, allows bob's with an invite, which removes it, and
-/// declines carol's. bob's note is then taken and carol's refused, and a second decline
-/// finds nothing.
+/// reads the two requests, oldest first, and allows bob's with an invite, which removes
+/// it. bob, admitted now, asks once more: he is answered as pending and nothing is kept
+/// for him. The wallet declines carol's request. bob's note is then taken and carol's
+/// refused, and a second decline finds nothing.
 ///
 /// Calls: `POST /v1/{id}/connect` refused by the policy (`403 not_admitted`), refused for
 /// the sender's document (`409 identity_needed`), kept, and answered for a sender already
-/// pending; `GET /v1/{id}/connect`; `DELETE /v1/{id}/connect/{pubky}`, taken and `404`; an
+/// pending and for one the lists admit; `GET /v1/{id}/connect`; `DELETE /v1/{id}/connect/{pubky}`, taken and `404`; an
 /// invite that answers a request.
 ///
 /// # Errors
@@ -192,6 +193,25 @@ pub async fn connect_request(world: &World) -> FlowResult {
     pending(
         world,
         "the wallet read carol's request alone",
+        &mut wallet,
+        &[carol.public()],
+        false,
+    )
+    .await?;
+    // bob, now admitted, asks once more: the same answer, and nothing kept for him.
+    let admitted = ask(
+        world,
+        "bob's shop asked once admitted",
+        &mut shop,
+        alice.public(),
+    )
+    .await?;
+    if admitted.as_ref().ok() != Some(&true) {
+        return Err(format!("bob, admitted, was answered {}", asked(&admitted)).into());
+    }
+    pending(
+        world,
+        "the wallet still read carol's request alone",
         &mut wallet,
         &[carol.public()],
         false,
@@ -520,10 +540,10 @@ pub async fn connect_request_turned_off(world: &World) -> FlowResult {
 /// wallet's lists, and bob's request is pending. Her service is lost and her signer
 /// recovers at another. While the recovery stages admission bob is refused like every
 /// sender. The signer ends the staged admission, and carol, whom the new service doesn't
-/// know yet, asks: her request is kept. The wallet then follows the recovery and uploads
-/// its lists. The merge writes carol's contact entry, which answers her request, and bob's
-/// request of before the loss isn't there: the account started afresh. bob asks again and
-/// his request is kept.
+/// know yet, asks, and so does dave, a stranger: both requests are kept. The wallet then
+/// follows the recovery and uploads its lists. The merge writes carol's contact entry,
+/// which answers her request and no other: dave's stays. bob asks again and his request
+/// is kept after dave's.
 ///
 /// Calls: `POST /v1/{id}/connect` while admission is staged (`503 staged`); `POST
 /// /v1/{id}/recovery/upload` whose list merge answers a pending request; `GET
@@ -537,14 +557,19 @@ pub async fn connect_request_recovered(world: &World) -> FlowResult {
     let alice = world.identity("alice")?;
     let bob = world.identity("bob")?;
     let carol = world.identity("carol")?;
+    let dave = world.identity("dave")?;
     world.add_switch(ORIGIN, &[&alice]).await?;
-    world.add_switch(SENDERS_ORIGIN, &[&bob, &carol]).await?;
+    world
+        .add_switch(SENDERS_ORIGIN, &[&bob, &carol, &dave])
+        .await?;
     let mut alice_signer = enroll(world, &alice, ORIGIN).await?;
     let mut bob_signer = enroll(world, &bob, SENDERS_ORIGIN).await?;
     let mut carol_signer = enroll(world, &carol, SENDERS_ORIGIN).await?;
+    let mut dave_signer = enroll(world, &dave, SENDERS_ORIGIN).await?;
     let (mut wallet, _) = joined(world, &alice, &mut alice_signer, "wallet").await?;
     let (mut shop, _) = joined(world, &bob, &mut bob_signer, "shop").await?;
     let (mut stall, _) = joined(world, &carol, &mut carol_signer, "stall").await?;
+    let (mut kiosk, _) = joined(world, &dave, &mut dave_signer, "kiosk").await?;
 
     alice_signer.set_connect_requests(taking(50)).await?;
     world.advance_ms(STEP_MS);
@@ -602,15 +627,20 @@ pub async fn connect_request_recovered(world: &World) -> FlowResult {
         return Err(format!("carol's request ended {}", asked(&kept)).into());
     }
 
-    // The wallet's upload brings carol's contact entry, which answers her request. bob's
-    // request stayed with the service that was lost.
+    let kept = ask(world, "dave's kiosk asked", &mut kiosk, alice.public()).await?;
+    if kept.as_ref().ok() != Some(&true) {
+        return Err(format!("dave's request ended {}", asked(&kept)).into());
+    }
+
+    // The wallet's upload brings carol's contact entry, which answers her request and
+    // leaves the stranger's.
     follow_recovery(world, &mut wallet, "wallet", 1).await?;
     expect_upload(world, "wallet", true)?;
     pending(
         world,
-        "the wallet read no request at the new service",
+        "the wallet read dave's request alone at the new service",
         &mut wallet,
-        &[],
+        &[dave.public()],
         false,
     )
     .await?;
@@ -621,12 +651,96 @@ pub async fn connect_request_recovered(world: &World) -> FlowResult {
     }
     pending(
         world,
-        "the wallet read bob's request at the new service",
+        "the wallet read dave's request and bob's at the new service",
+        &mut wallet,
+        &[dave.public(), bob.public()],
+        false,
+    )
+    .await?;
+    lists(world, "the lists at the new service", &mut wallet).await?;
+    Ok(())
+}
+
+/// Connect requests across a recovery in place (Switch wire 7.4.7 "Answering", 3.3, Switch
+/// spec 12.6 step 1). alice takes connect requests and bob's is pending. Her signer
+/// declares the service's generation lost there and recovers in place: the account starts
+/// afresh, and the pending request goes with what it held. The wallet follows the
+/// recovery, which ends the staged admission, and reads no request. bob asks again and
+/// his request is kept.
+///
+/// Calls: `GET /v1/{id}/connect` after a recovery in place, and `POST /v1/{id}/connect` at
+/// the account it started afresh.
+///
+/// # Errors
+///
+/// When a step that should succeed against any switch fails, or a request outlives the
+/// recovery or is kept against what its step says.
+pub async fn connect_request_recovered_in_place(world: &World) -> FlowResult {
+    let alice = world.identity("alice")?;
+    let bob = world.identity("bob")?;
+    world.add_switch(ORIGIN, &[&alice]).await?;
+    world.add_switch(SENDERS_ORIGIN, &[&bob]).await?;
+    let mut alice_signer = enroll(world, &alice, ORIGIN).await?;
+    let mut bob_signer = enroll(world, &bob, SENDERS_ORIGIN).await?;
+    let (mut wallet, _) = joined(world, &alice, &mut alice_signer, "wallet").await?;
+    let (mut shop, _) = joined(world, &bob, &mut bob_signer, "shop").await?;
+
+    alice_signer.set_connect_requests(taking(50)).await?;
+    world.advance_ms(STEP_MS);
+    let kept = ask(world, "bob's shop asked", &mut shop, alice.public()).await?;
+    if kept.as_ref().ok() != Some(&true) {
+        return Err(format!("bob's request ended {}", asked(&kept)).into());
+    }
+    pending(
+        world,
+        "the wallet read bob's request",
         &mut wallet,
         &[bob.public()],
         false,
     )
     .await?;
-    lists(world, "the lists at the new service", &mut wallet).await?;
+
+    let doc = alice_signer
+        .declare_provider_loss(ORIGIN, UserConfirmed::shown_and_confirmed())
+        .await?;
+    world.outcome(
+        "the signer declared the loss and recovered in place",
+        &recovered(&doc, &alice_signer)?,
+    );
+    world.advance_ms(STEP_MS);
+
+    // The wallet's upload, with no contact to bring, ends the staged admission.
+    follow_recovery(world, &mut wallet, "wallet", 1).await?;
+    expect_upload(world, "wallet", false)?;
+    alice_signer.run_due().await?;
+    world.outcome(
+        "alice's signer ran what is due, the admission ended by the upload",
+        &status(&alice_signer)?,
+    );
+    expect_staged(world, false)?;
+    pending(
+        world,
+        "the wallet read no request after the recovery",
+        &mut wallet,
+        &[],
+        false,
+    )
+    .await?;
+
+    // bob's shop uses its copy of alice's `identity.json` for ten minutes (Switch spec
+    // 4.3): until then it would take the new key's answers for another service's.
+    world.advance_ms(DOC_CACHE_MS);
+    let kept = ask(world, "bob's shop asked again", &mut shop, alice.public()).await?;
+    if kept.as_ref().ok() != Some(&true) {
+        return Err(format!("bob's second request ended {}", asked(&kept)).into());
+    }
+    pending(
+        world,
+        "the wallet read bob's new request",
+        &mut wallet,
+        &[bob.public()],
+        false,
+    )
+    .await?;
     Ok(())
 }
