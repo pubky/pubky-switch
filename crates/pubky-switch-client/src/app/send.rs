@@ -20,7 +20,10 @@
 //!    `identity.json` delivered and the append retried; `410 moved` has the counterparty's
 //!    `identity.json` read again; `429` and `503` wait for the next flush.
 //! 5. **The record job** builds the record's next value through the protocol
-//!    ([`super::Protocol::sent_record`]), compare-and-swap.
+//!    ([`super::Protocol::sent_record`]), compare-and-swap. One still not made
+//!    [`SENT_RETENTION_MS`] after the message's first acceptance, such as one whose held
+//!    value waits for a key that never comes, is given up, and the protocol told
+//!    ([`AppEvent::RecordJobDropped`]): the outbox doesn't keep the message for ever.
 //!
 //! The acceptance is committed as soon as the append is answered, before anything else is
 //! done with the answer, so a crash never sends the same bytes again: with it the message
@@ -288,10 +291,21 @@ pub enum Delivery {
         /// The acceptance time.
         accepted_at_ms: u64,
     },
-    /// Refused for good.
+    /// Refused for good, or never queued: the kept batch that would have queued it was
+    /// dropped ([`super::App::kept_batch`]). Answered for [`SENT_RETENTION_MS`] from its
+    /// time, then forgotten.
     Failed {
         /// Why, without content.
         reason: String,
+        /// When, app clock: when it was refused, or its batch dropped; when it was queued,
+        /// for one an earlier build refused without keeping the time.
+        failed_at_ms: u64,
+    },
+    /// In a kept batch, not yet in the outbox: it is queued once the batch is applied, and
+    /// fails with it if the batch is dropped (Switch spec 8.2, [`super::OpBatch::queue`]).
+    Kept {
+        /// The batch ID it is kept under ([`super::App::kept_batch`]).
+        batch_id: [u8; 16],
     },
 }
 
@@ -415,6 +429,10 @@ pub(crate) struct OutboxItem {
     /// from delivered (Switch spec 11). Kept through later backups, never moved on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     replay_until_ms: Option<u64>,
+    /// The batch a try of the record job left kept, the latest one, in base64: named when
+    /// the job is given up ([`AppEvent::RecordJobDropped`]), as it may still apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    record_batch: Option<String>,
 }
 
 impl std::fmt::Debug for OutboxItem {
@@ -764,6 +782,7 @@ impl App {
             undeliverable_tries: 0,
             resend_queued: false,
             replay_until_ms: None,
+            record_batch: None,
         })
     }
 
@@ -852,6 +871,7 @@ impl App {
             undeliverable_tries: 0,
             resend_queued: true,
             replay_until_ms: None,
+            record_batch: None,
         };
         let mut tx = self.tx()?;
         tx.put(&out_key(&item.msg_id), &item)?;
@@ -895,7 +915,11 @@ impl App {
     // ---------------------------------------------------------------------------------
     // State
 
-    /// Where the message `msg_id` is; `None` for one the app doesn't keep.
+    /// Where the message `msg_id` is: in the outbox, sent, or in a kept batch that queues it
+    /// ([`Delivery::Kept`], and [`Delivery::Failed`] once that batch is dropped); `None` for
+    /// one the app doesn't keep. `None` never says the message was never sent: one
+    /// accepted or ended longer than [`SENT_RETENTION_MS`] ago, or queued before a
+    /// restore, isn't known here. The protocol reads its shared state then.
     ///
     /// # Errors
     ///
@@ -905,6 +929,7 @@ impl App {
             return Ok(Some(match (&item.failed, item.accepted_at_ms) {
                 (Some(reason), _) => Delivery::Failed {
                     reason: reason.clone(),
+                    failed_at_ms: item.failed_ms.unwrap_or(item.queued_ms),
                 },
                 (None, Some(accepted_at_ms)) if !item.resend => {
                     Delivery::Accepted { accepted_at_ms }
@@ -917,13 +942,12 @@ impl App {
                 },
             }));
         }
-        Ok(self
-            .reader()
-            .get::<SentStored>(&sent_key(msg_id))
-            .await?
-            .map(|sent| Delivery::Accepted {
+        if let Some(sent) = self.reader().get::<SentStored>(&sent_key(msg_id)).await? {
+            return Ok(Some(Delivery::Accepted {
                 accepted_at_ms: sent.first_ms,
-            }))
+            }));
+        }
+        self.kept_delivery(msg_id).await
     }
 
     /// The messages sent to `pubky` that its inbox accepted within `[from_ms, until_ms]`,
@@ -965,7 +989,8 @@ impl App {
 
     /// Try every queued message's jobs once (Switch spec 11: on start, on returning to the
     /// foreground, when the network comes back), after the batches and deliveries of the
-    /// own `identity.json` owed, and forget sent messages past their retention.
+    /// own `identity.json` owed, and forget sent messages past their retention, and the ends
+    /// of kept batches past theirs ([`super::App::kept_batch`]).
     ///
     /// # Errors
     ///
@@ -1011,6 +1036,7 @@ impl App {
                 }
             }
             self.prune_sent().await?;
+            self.prune_kept_ends().await?;
             Ok(report)
         })
         .await
@@ -1151,14 +1177,23 @@ impl App {
                 }
             }
         }
-        if item.accepted_at_ms.is_some()
+        if let Some(accepted) = item.accepted_at_ms
             && !item.record_done
             && let Some(job) = item.record.clone()
         {
+            if accepted <= self.now().saturating_sub(SENT_RETENTION_MS) {
+                self.drop_record_job(item).await?;
+                return Ok(false);
+            }
             match self.record_job(&item, &job).await {
                 Ok(()) => item.record_done = true,
                 Err(error) if is_local(&error) => return Err(error),
-                Err(error) => item.last_error = Some(error.to_string()),
+                Err(error) => {
+                    if let Some(batch_id) = error.kept_batch() {
+                        item.record_batch = Some(pubky_switch_core::enc::b64(&batch_id));
+                    }
+                    item.last_error = Some(error.to_string());
+                }
             }
             self.save_item(&item).await?;
         }
@@ -1269,6 +1304,28 @@ impl App {
             self.after_accepted(&item.to, answer).await?;
         }
         Ok(())
+    }
+
+    /// Give up the record job of `item`, still owed [`SENT_RETENTION_MS`] after its first
+    /// acceptance, such as one whose held value waits for a key that never comes: in one
+    /// commit with [`AppEvent::RecordJobDropped`], the item kept only while a re-send of it
+    /// is owed, so its plaintext doesn't stay, nor go into every later backup, for ever.
+    async fn drop_record_job(&mut self, mut item: OutboxItem) -> Result<(), AppError> {
+        item.record = None;
+        let mut tx = self.tx()?;
+        if item.complete() {
+            tx.delete(&out_key(&item.msg_id))?;
+        } else {
+            tx.put(&out_key(&item.msg_id), &item)?;
+        }
+        self.keep_duty(
+            &mut tx,
+            Duty::RecordJobDropped {
+                msg_id: item.msg_id.clone(),
+                batch_id: item.record_batch.clone(),
+            },
+        )?;
+        self.commit(tx).await
     }
 
     /// A complete item leaves the outbox; its sent message is kept from its acceptance.
@@ -1620,6 +1677,7 @@ mod tests {
             undeliverable_tries: 0,
             resend_queued: false,
             replay_until_ms: None,
+            record_batch: None,
         }
     }
 

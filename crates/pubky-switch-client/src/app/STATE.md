@@ -25,6 +25,17 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
 - **A batch refused with `409 stale_epoch`** is gone from `opq/` with the refusal; the app
   takes the newer `identity.json` and key bundle, each in its own commit, and the batch
   sealed again is signed and kept under a new batch ID before it is first sent.
+- **A kept batch has one ID for its whole life:** the batch ID it is first kept under
+  (`opq/<batch_id>`). Signed again for a later generation, its bytes carry a new batch ID
+  and stay under the same key, so `AppError::Kept`, every event about it and
+  `App::kept_batch` name the first one; the wire ID is in the record's body. The commit
+  that applies or drops it writes its end (`kb/<batch_id>`, `kbt/`) with that change, so
+  no crash leaves a batch neither kept nor ended.
+- **A passed entry keeps nothing** (`Outcome::Pass`): the cursor moves past it as past a
+  processed one, or `seen/<seq>` marks it past a held one, and nothing else is written: no
+  `proc/` or `proct/` pair, so a re-send of the message is delivered again (Switch spec
+  11), no `parked/` entry, no `duty/` event, nothing the context added. An entry stored
+  locally that the protocol passes stays as it is under `parked/`, with its `sretry/` count.
 - **A retired receive key goes only after the cursor's commit** that passes the next key's
   registration (Switch spec 3.6).
 - **Any commit carries everything read before it.** A page's writes go in the next commit
@@ -116,7 +127,10 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
 - **A backup doesn't carry `opq/`, `sent/` or `sentt/`.** A kept batch's messages go into
   the outbox only with the batch's answer, so a restored app neither sends the batch nor
   delivers the messages it would have queued; the restore's reconcile mode reads the shared
-  records and claims, and the protocol queues what it still owes again. A restored app
+  records and claims, and the protocol queues what it still owes again. Nor does it carry
+  the ends of kept batches and their indexes (`kb/`, `kbt/`, `kbm/`, `kba/`): a restored
+  app's `App::kept_batch`, `App::kept_attempt` and `App::delivery` know nothing of a batch
+  kept before the restore. A restored app
   answers re-send requests only for what it delivers after the restore.
 
 ## Keys
@@ -168,7 +182,7 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
 | `leave` | a leave in progress or done | |
 | `service_time` | the highest service time verified, its key, the offset from the device clock | |
 | `p/...` | the protocol's own local state (`LocalWrite`) | the protocol's |
-| `duty/<id>` | a duty event (`AppEvent::is_duty`), written in the commit of the change it reports, until the host acknowledges it (`App::ack_events`); one per entry stored for good, kept batch or `attempt` dropped, kept batch refused for good, outbox message given up, protocol call whose local writes were over the bound (`LocalWritesRefused`), record write whose mark was over its bound (`RecordUncheckable`), entry stored unverified that was dropped past its bounds (`StoredEntryDropped`), released entry that ran as a duplicate (`ReleasedDuplicate`), or account taken as erased (`AccountGone`, in the commit that writes `gone`, and removed unacknowledged in the commit that takes the account back). Only acknowledgements remove them, apart from that: nothing bounds them for a host that never acknowledges | |
+| `duty/<id>` | a duty event (`AppEvent::is_duty`), written in the commit of the change it reports, until the host acknowledges it (`App::ack_events`); one per entry stored for good, kept batch or `attempt` dropped, kept batch refused for good, outbox message given up, outbox record job given up (`RecordJobDropped`), protocol call whose local writes were over the bound (`LocalWritesRefused`), record write whose mark was over its bound (`RecordUncheckable`), entry stored unverified that was dropped past its bounds (`StoredEntryDropped`), released entry that ran as a duplicate (`ReleasedDuplicate`), or account taken as erased (`AccountGone`, in the commit that writes `gone`, and removed unacknowledged in the commit that takes the account back). Only acknowledgements remove them, apart from that: nothing bounds them for a host that never acknowledges | |
 | `dutyn` | the counter the next duty event takes; it only goes up in one store, and a restore in place keeps it | |
 | `dutye` | the store's event epoch, random, chosen once when the store starts empty (the first join, or a restore onto a store without one); every duty event ID carries it with its counter | |
 
@@ -216,7 +230,8 @@ uploads; `push.rs` holds the push registration. The peek (`peek.rs`) writes noth
   switch, since the record and the newest key go in the re-registration. A kept
   `pending/effect` or `opq/<batch_id>` whose batch ID the old chain holds was applied: its
   outcome commits at the switch. Otherwise the effect goes, and its entry is read again;
-  a kept `opq/` batch is signed again for the new generation under a new batch ID. A
+  a kept `opq/` batch is signed again for the new generation, its bytes under a new wire
+  batch ID, still kept under the ID it was first kept under. A
   frozen service's `410 moved` keeps them for the switch. A move the app never saw frozen,
   or a key change in place, didn't read the old feed to its end: its kept batches and
   effect stay unchanged and go again first, and the answer decides (original proofs or
@@ -250,7 +265,7 @@ uploads; `push.rs` holds the push registration. The peek (`peek.rs`) writes noth
 
 | Key | Holds | Sensitive |
 |---|---|---|
-| `out/<msg_id>` | a queued message, queued alone or with the answer of the batch that carried it: its signed plaintext, signed once, the envelope sealed for one try with its `apps_version`, its jobs (conversation entry, delivery, record) and where each stands, a re-send owed, when it was refused for good, and when a delivery was first and last answered `403 not_admitted` or `403 not_current`, which of the two the last answer was (`UndeliverableReason`), with the answers counted at least 7.5 days apart; a failed one goes after the sent-message retention, an undeliverable one when a try is answered so again 30 days after that first answer and 5 answers were counted, or at the first flush 45 days after it in any case | yes |
+| `out/<msg_id>` | a queued message, queued alone or with the answer of the batch that carried it: its signed plaintext, signed once, the envelope sealed for one try with its `apps_version`, its jobs (conversation entry, delivery, record) and where each stands, a re-send owed, when it was refused for good, and when a delivery was first and last answered `403 not_admitted` or `403 not_current`, which of the two the last answer was (`UndeliverableReason`), with the answers counted at least 7.5 days apart; a failed one goes after the sent-message retention, and so does a record job still owed then, from the first acceptance, given up with a `RecordJobDropped` duty event in that commit; an undeliverable one when a try is answered so again 30 days after that first answer and 5 answers were counted, or at the first flush 45 days after it in any case | yes |
 | `sent/<msg_id>` | a message the recipient's inbox accepted, written in the commit that records the acceptance, kept 30 days from its first acceptance for re-sends | yes |
 | `sentt/<time>/<msg_id>` | the time index for pruning sent messages | |
 | `dir/<pubky>` | a counterparty's directory as signed, the switch, generation and `identity.json` version it was read under, its versions, and whether it is read again before the next send; for a directory over the store's value size, only its stub: the switch, generation, versions and read time, no apps, always stale, so each send reads it again and a provider loss since is still found | |
@@ -262,7 +277,11 @@ uploads; `push.rs` holds the push registration. The peek (`peek.rs`) writes noth
 | `lc/lists_at` | the service time of the `GET /allow` answer the copy of the lists was last replaced from, written in that commit; absent until the first, after a restore, and from the commit that starts a provider loss, which keeps `lc/flag/`; while it is absent the copy isn't known to be complete, and a read by an app with `lists.read` refreshes it first, best effort, outside a move or a loss in progress | |
 | `lc/too_large` | the service time of the last `GET /allow` answer whose lists didn't fit one commit, in a commit of its own; while it is less than `LISTS_TOO_LARGE_RETRY_MS` (a day) old by the highest service time verified, which each read's page moves on, a read doesn't refresh the copy it owes; `allow_list()` always does; a refresh that fits, a provider change (the commit that switches the service, or that starts a loss) and a restore remove it | |
 | `invite/<code_hash>` | the code of an invite code the app registered, to show it again | yes |
-| `opq/<batch_id>` | a batch of operations, signed and kept before it is sent, with what its answer settles and, from its first send on, when that left (`kept_ms`, absent while never sent): the protocol's local writes, kept in base64 as in `pending/effect`, and the signed messages it puts in the outbox; it goes with its answer or a refusal for good, and stays through anything else, except that one never sent that holds an `attempt` goes unsent, reported as dropped with its attempts, when it would be sent while the app may not attempt (reconcile mode, Switch spec 12.4). All of them together take at most `MAX_KEPT_BATCHES_BYTES` (12 MiB), so a provider change carries them in its one commit: `submit_batch` keeps no batch past it | the messages' |
+| `opq/<batch_id>` | a batch of operations, signed and kept before it is sent, under the batch ID it was first kept under, whatever batch ID its body carries once signed again, with what its answer settles and, from its first send on, when that left (`kept_ms`, absent while never sent): the protocol's local writes, kept in base64 as in `pending/effect`, and the signed messages it puts in the outbox; it goes with its answer or a refusal for good, and stays through anything else, except that one never sent that holds an `attempt` goes unsent, reported as dropped with its attempts, when it would be sent while the app may not attempt (reconcile mode, Switch spec 12.4). All of them together take at most `MAX_KEPT_BATCHES_BYTES` (12 MiB), so a provider change carries them in its one commit: `submit_batch` keeps no batch past it | the messages' |
+| `kb/<batch_id>` | the end of a batch kept under `opq/`, written in the commit that applies or drops it: when (app clock), applied or dropped and why (refused for good with its code, dropped never sent, or dropped once sent, uncertain), and the `msg_id`s and attempts it named; `App::kept_batch` answers it until `SENT_RETENTION_MS` (30 days) from that time, and the next `flush_outbox` after forgets it with `kbt/` and the `kbm/` and `kba/` entries still naming it | |
+| `kbt/<time>/<batch_id>` | the time index for forgetting those ends | |
+| `kbm/<msg_id>` | the batch kept last that queues this message, written in the commit that keeps it: `App::delivery` answers `Kept` while the batch is kept, `Failed` with the drop's time once it is dropped | |
+| `kba/<claim_key>/<attempt_id>` | the batch kept last that carries this attempt, written in the commit that keeps it, for `App::kept_attempt` | |
 | `list_due` | a listing of the collections is owed: after joining, a restore, a `missed` item, or a certificate taken (a renewal, or the listed one from the own record) that reads a collection of the protocol the one before didn't, in the commit that takes it. It stays while the certificate lacks the key, at the current data epoch, of a scope that reads a collection, so the read after the key arrives lists | |
 | `rec/<key>` | the shared record write the app took: the signed operation, certificate and proof, its version and whether a proof gave it, the opened value, or why it isn't open: its key not held yet (`Unreadable`, the form written before, its data epoch read from the operation), or not opening with its key held (`DoesNotOpen`, flagged); and the refused write it follows. A value whose key isn't held is opened again from the kept operation when a fetch takes a scope key, and whenever the same write is read again; one that doesn't open with its key isn't tried again; neither is tried at every read | yes |
 | `recname/<key>` | the collection name of a record the app creates outside the protocol's collections, from a write or an effect, until its write is answered | |
@@ -275,7 +294,8 @@ uploads; `push.rs` holds the push registration. The peek (`peek.rs`) writes noth
 | `clread/<claim_key>` | a claim the app holds and doesn't hold as finished (SETTLED with every attempt `done` or `failed`), to read again, with the device time it was marked; read at the end of a read, at most `CLAIM_REREADS_PER_READ` (16) per read, oldest mark first, and removed in the commit of any read of the claim, a `404` included, or when its evidence goes | |
 
 Deleting the keys on a leave also removes `rec/`, `hw/`, `recname/`, `out/`, `sent/`,
-`sentt/`, `invite/` and `opq/`. A restore replaces the namespace, these keys included, but
+`sentt/`, `invite/` and `opq/`, and the ends of kept batches and their indexes (`kb/`,
+`kbt/`, `kbm/`, `kba/`): a left app flushes no outbox, so nothing would prune them after. A restore replaces the namespace, these keys included, but
 for the `out/` records its backup carries, and sets `list_due`. `rec/`, `clent/` and `claim/` hold the evidence of the shared state that
 uploads carry (`App::shared_evidence`).
 

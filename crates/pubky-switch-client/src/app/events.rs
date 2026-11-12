@@ -11,7 +11,8 @@
 //! "Kept batches"); a kept batch dropped at a provider change and each `attempt` in it
 //! (Switch spec 12.5 "Kept batches", 12.6 step 5); a kept batch refused for good, with its
 //! local writes and outbox messages (Switch spec 6.4); a message deleted from the outbox
-//! undelivered (Switch spec 11); the account taken as erased (Switch spec 12.7). Each carries a stable [`EventId`] and is kept in the
+//! undelivered (Switch spec 11), or the record write a sent message named given up; the
+//! account taken as erased (Switch spec 12.7). Each carries a stable [`EventId`] and is kept in the
 //! store (`duty/<id>`) in the same commit as the change it reports, so no crash separates
 //! the two. It is reported once that commit is done, or, for a commit whose answer can't
 //! tell whether it was applied, by the reload after it; again by every [`super::App::load`],
@@ -518,19 +519,21 @@ pub enum AppEvent {
     },
     /// A batch of operations kept before a provider change, its answer lost, is in the
     /// old service's chain: it was applied, and what it settles is committed (Switch spec
-    /// 13.5).
+    /// 13.5), with its end ([`super::App::kept_batch`]).
     KeptBatchApplied {
-        /// The batch ID.
+        /// The batch ID it was kept under.
         batch_id: [u8; 16],
     },
     /// A kept batch the old service didn't apply was signed again for the generation the
-    /// app follows now, under a new batch ID, and is sent there with the next write
-    /// (Switch spec 12.5 step 2, 13.5).
+    /// app follows now, its bytes under a new batch ID, and is sent there with the next
+    /// write (Switch spec 12.5 step 2, 13.5). It is still kept, and known, under the batch
+    /// ID it was first kept under: this event tells nothing [`super::App::kept_batch`]
+    /// doesn't, so a crash that loses it loses no fact.
     KeptBatchSignedAgain {
-        /// The batch ID it had.
+        /// The batch ID it is kept under, which doesn't change.
         batch_id: [u8; 16],
-        /// The batch ID it has now.
-        new_batch_id: [u8; 16],
+        /// The batch ID its signed bytes carry now, on the wire (Switch wire 6.4).
+        wire_batch_id: [u8; 16],
     },
     /// A read sends the batches kept from earlier calls before it reads the feed, and one
     /// couldn't be sent now: the network failed, the switch answered `429`, `503` or `410
@@ -555,11 +558,12 @@ pub enum AppEvent {
     /// that holds an `attempt`, while the app may not attempt, as in reconcile mode (Switch
     /// spec 12.4): never applied, it goes unsent. Each attempt in it follows as
     /// [`AppEvent::AttemptDropped`]. The protocol decides what to write instead. A duty
-    /// event.
+    /// event, in the commit that drops the batch and writes its end
+    /// ([`super::App::kept_batch`]).
     KeptBatchDropped {
         /// The duty event's ID.
         id: EventId,
-        /// The batch ID.
+        /// The batch ID it was kept under, whatever ID its bytes carried once signed again.
         batch_id: [u8; 16],
     },
     /// An `attempt` in a kept batch that was dropped ([`AppEvent::KeptBatchDropped`]): it
@@ -633,6 +637,21 @@ pub enum AppEvent {
         msg_id: String,
         /// Whether it was a re-send of a message accepted before.
         resend: bool,
+    },
+    /// The shared record write a sent message named ([`super::RecordJob`]) was given up:
+    /// still not made [`super::SENT_RETENTION_MS`] after the message's first acceptance,
+    /// such as for a held value whose key never came. The app no longer builds it, so the
+    /// record doesn't reflect the message unless the batch a try left kept still applies:
+    /// `batch_id` names it, and [`super::App::kept_batch`] tells what became of it. The
+    /// outbox no longer keeps the message, plaintext and all, once nothing else of it is
+    /// owed. A duty event, in the commit that gives the write up.
+    RecordJobDropped {
+        /// The duty event's ID.
+        id: EventId,
+        /// The message ID.
+        msg_id: String,
+        /// The batch the job's latest try left kept, if one did.
+        batch_id: Option<[u8; 16]>,
     },
     /// The local writes the protocol answered `call` with were over
     /// [`super::MAX_STEP_LOCAL_BYTES`]: they weren't committed, and the call isn't made
@@ -717,11 +736,12 @@ pub enum AppEvent {
     },
     /// A batch kept from an earlier call was sent again and refused for good: it was not
     /// applied, and the app no longer keeps it, nor the local writes and outbox messages it
-    /// carried (Switch spec 6.4, Switch wire 6.4). A duty event.
+    /// carried (Switch spec 6.4, Switch wire 6.4). A duty event, in the commit that drops
+    /// the batch and writes its end ([`super::App::kept_batch`]).
     BatchRefused {
         /// The duty event's ID.
         id: EventId,
-        /// The batch ID.
+        /// The batch ID it was kept under, whatever ID its bytes carried once signed again.
         batch_id: [u8; 16],
         /// The error code of the refusal.
         code: String,
@@ -752,6 +772,7 @@ impl AppEvent {
             | Self::RestoreLeftBehind { id, .. }
             | Self::AttemptDropped { id, .. }
             | Self::MessageUndelivered { id, .. }
+            | Self::RecordJobDropped { id, .. }
             | Self::RecordUncheckable { id, .. }
             | Self::LocalWritesRefused { id, .. }
             | Self::AccountGone { id } => Some(*id),
@@ -896,6 +917,11 @@ pub(crate) enum Duty {
         msg_id: String,
         resend: bool,
     },
+    RecordJobDropped {
+        msg_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        batch_id: Option<String>,
+    },
     LocalWritesRefused {
         call: KeptRefusal,
     },
@@ -1016,6 +1042,12 @@ impl Duty {
             Self::MessageUndelivered { msg_id, resend } => {
                 AppEvent::MessageUndelivered { id, msg_id, resend }
             }
+            Self::RecordJobDropped { msg_id, batch_id } => AppEvent::RecordJobDropped {
+                id,
+                msg_id,
+                batch_id: batch_id
+                    .and_then(|id| pubky_switch_core::enc::unb64_array::<16>(&id).ok()),
+            },
             Self::LocalWritesRefused { call } => AppEvent::LocalWritesRefused {
                 id,
                 call: call.call(),

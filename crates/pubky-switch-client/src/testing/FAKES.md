@@ -26,6 +26,11 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   `Unreachable` fault stops keeps its body, which the test call `unreached_bodies` returns,
   in order. Each operation's signature is
   verified, and an own app must be current with an unexpired certificate.
+- **Injected faults** (`fail_next`) script a network or a service that fails: an error
+  answer, a lost answer (the request applied, the caller sees a timeout), a connection that
+  fails, or an answer with a member left out. A lost answer or a failed connection can let a
+  number of matching requests through first (`LoseAnswerAfter`, `Unreachable`), so a test
+  can pick one request of several to the same path.
 - **Rates** (Switch wire 6.4 step 7, 9.4): no operation, control, per-caller or
   failed-authentication limits; never `429 rate_limited`.
 - **Quotas and per-kind limits** (Switch wire 9.3): only the claim limits, at the core's
@@ -324,3 +329,10 @@ against it now:
   `fail_attempt` script directly, with no entry or proof held and without the permission or
   writer checks the service makes; `open_attempt` refuses, as the service does, a second open
   attempt on a claim and any on a SETTLED one, and `fail_attempt` names the app resolving it.
+
+## The test Homeserver
+
+`homeserver.rs` holds public files in memory, as a Homeserver serves them, with no
+authentication. `set_down` makes every read fail to connect, and `identity_reads` counts the
+reads of an identity's `identity.json`, those that failed included, so a test can bound how
+often the app reads a counterparty's document.

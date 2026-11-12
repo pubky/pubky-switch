@@ -1806,6 +1806,12 @@ impl App {
     /// holds deleted, sealed under the read scope's key at the current data epoch (Switch
     /// spec 3.5, 10.3, 13.4). `None` writes a delete. To go in a batch ([`OpBatch::entry`]).
     ///
+    /// An explicit write builds on the version held whatever its value: it overwrites a
+    /// value held unopened only for now, its key not held yet
+    /// (`RecordContent::Unreadable(Unopened::KeyNotHeld)`), without reading it. The caller
+    /// sees that in the held record's `content` ([`App::shared_record`]) and decides;
+    /// [`App::update_record`], which builds on the value, refuses it instead.
+    ///
     /// # Errors
     ///
     /// [`Refusal::Stopped`] or [`Refusal::Left`] for a stopped or departed app;
@@ -1843,7 +1849,9 @@ impl App {
     /// holds (Switch spec 10.3). On `409 conflict` the app reads the record again before it
     /// returns the error, so the caller builds its write again on what the switch holds; on
     /// `409 stale_epoch` it takes the newer `identity.json` and its key bundle and writes
-    /// once more.
+    /// once more. Like [`App::record_op`], it overwrites a value held unopened only for now
+    /// (`Unopened::KeyNotHeld`): the caller reads the held record's `content` first and
+    /// decides.
     ///
     /// # Errors
     ///
@@ -1858,7 +1866,9 @@ impl App {
     }
 
     /// Delete the record at `target`: a write whose sealed value is empty (Switch spec
-    /// 10.3).
+    /// 10.3). Like [`App::put_record`], it deletes a value held unopened only for now
+    /// (`Unopened::KeyNotHeld`): the caller reads the held record's `content` first and
+    /// decides.
     ///
     /// # Errors
     ///
@@ -2097,7 +2107,8 @@ pub(crate) fn record_put(
 }
 
 /// Delete, with the keys on a leave, every record of the shared state, the outbox and the
-/// sent messages that holds content or a bearer secret (Switch spec 3.1, 12.3).
+/// sent messages that holds content or a bearer secret (Switch spec 3.1, 12.3), and the
+/// kept batches with their ends and indexes, which no flush of a left app would prune.
 pub(crate) fn destroy_shared(tx: &mut Tx) -> Result<(), AppError> {
     for prefix in [
         RECORD_PREFIX,
@@ -2108,6 +2119,10 @@ pub(crate) fn destroy_shared(tx: &mut Tx) -> Result<(), AppError> {
         "sentt/",
         "invite/",
         "opq/",
+        "kb/",
+        "kbt/",
+        "kbm/",
+        "kba/",
     ] {
         tx.delete_prefix(prefix)?;
     }

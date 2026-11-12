@@ -2352,11 +2352,11 @@ async fn test_not_current_while_listed_with_another_certificate_is_no_removal() 
 // -------------------------------------------------------------------------------------
 // Earlier generations' evidence, and writes before the upload
 
-const CLAIM: [u8; 32] = [5; 32];
-const ATTEMPT: [u8; 16] = [6; 16];
+pub(crate) const CLAIM: [u8; 32] = [5; 32];
+pub(crate) const ATTEMPT: [u8; 16] = [6; 16];
 
 /// The same origin under a new key at generation 2, published (a key change in place).
-fn change_key(w: &World, router: &Router) -> Arc<ScriptedSwitch> {
+pub(crate) fn change_key(w: &World, router: &Router) -> Arc<ScriptedSwitch> {
     let pending = SigningKey::from_bytes(&seed("service/alice/pending"));
     let changed = w.switch.change_key_into(pending.to_bytes());
     router.add(ORIGIN, &changed);
@@ -2562,7 +2562,7 @@ fn transport(error: &AppError) -> bool {
     matches!(error, AppError::Transport(_))
 }
 
-fn allow_ops_for(ops: &[pubky_switch_core::ops::SignedOp], who: [u8; 32]) -> usize {
+pub(crate) fn allow_ops_for(ops: &[pubky_switch_core::ops::SignedOp], who: [u8; 32]) -> usize {
     ops.iter()
         .filter(|op| matches!(op.body().kind, OpKind::AllowPut { pubky, .. } if pubky == who))
         .count()
@@ -2727,7 +2727,12 @@ async fn test_move_carries_kept_batches_to_the_next_service() {
     };
     // A batch the old service applied, its answer lost.
     w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
-    assert!(app.submit_batch(contact(carol)).await.is_err());
+    let applied_id = app
+        .submit_batch(contact(carol))
+        .await
+        .unwrap_err()
+        .kept_batch()
+        .unwrap();
     // A batch queued while the account is frozen (Switch spec 12.5 step 2).
     let n_key = next_key();
     w.switch.freeze(&freeze_for(&w, &n_key, 2)).unwrap();
@@ -2756,6 +2761,13 @@ async fn test_move_carries_kept_batches_to_the_next_service() {
         e,
         AppEvent::KeptBatchSignedAgain { .. }
     )));
+    // Its end says so, at the commit that settled it from the old chain.
+    assert_eq!(
+        app.kept_batch(applied_id).await.unwrap(),
+        Some(crate::app::KeptBatchStatus::Applied {
+            applied_at_ms: w.clock.now_ms()
+        })
+    );
     assert!(app.admits(&carol).await.unwrap());
     // The batch the old service never applied goes to the next one at generation 2, with
     // the next write.
@@ -2781,7 +2793,7 @@ async fn lists_app(w: &World, router: &Router) -> App {
     .await
 }
 
-fn contact_batch(pubky: [u8; 32]) -> crate::app::OpBatch {
+pub(crate) fn contact_batch(pubky: [u8; 32]) -> crate::app::OpBatch {
     crate::app::OpBatch::new().op(OpKind::AllowPut {
         pubky,
         kind: AllowKind::Contact,
@@ -2796,7 +2808,12 @@ async fn test_key_change_sends_a_kept_batch_again_and_its_original_proofs_show_i
     let carol = IdentityKey::from_secret(seed("carol/identity")).public();
     // Applied at generation 1, its answer lost; the app never reads it there.
     w.switch.fail_next(Fault::LoseAnswer { path: "ops".into() });
-    assert!(app.submit_batch(contact_batch(carol)).await.is_err());
+    let id = app
+        .submit_batch(contact_batch(carol))
+        .await
+        .unwrap_err()
+        .kept_batch()
+        .unwrap();
     let changed = change_key(&w, &router);
     // Sent again unchanged, it gets its original proofs, which a key change in place keeps,
     // checked with generation 1's key: applied, and never signed again (Switch spec 12.5
@@ -2830,6 +2847,12 @@ async fn test_key_change_sends_a_kept_batch_again_and_its_original_proofs_show_i
         report.events
     );
     assert!(app.kept_batches().await.unwrap().is_empty());
+    assert_eq!(
+        app.kept_batch(id).await.unwrap(),
+        Some(crate::app::KeptBatchStatus::Applied {
+            applied_at_ms: w.clock.now_ms()
+        })
+    );
     assert_eq!(allow_ops_for(&changed.applied(), carol), 0);
     assert_eq!(allow_ops_for(&w.switch.applied(), carol), 1);
     assert!(app.admits(&carol).await.unwrap());

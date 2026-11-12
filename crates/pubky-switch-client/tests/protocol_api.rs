@@ -351,7 +351,11 @@ async fn test_protocol_api_refused_batch_queues_no_message() {
         .await
         .unwrap_err();
     assert!(matches!(error, AppError::Switch(_)), "{error:?}");
-    assert!(wallet.delivery(signed.msg_id()).await.unwrap().is_none());
+    // Never queued: the delivery read says it failed with its batch.
+    assert!(matches!(
+        wallet.delivery(signed.msg_id()).await.unwrap(),
+        Some(Delivery::Failed { .. })
+    ));
     assert!(wallet.shared_record(&key).await.unwrap().is_none());
 }
 

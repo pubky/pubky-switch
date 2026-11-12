@@ -497,9 +497,18 @@ async fn test_send_refused_for_good_is_failed_not_retried() {
     let mut app = s.join("wallet").await;
     s.peer.fail_next("inbox", ErrorCode::TooLarge, json!(null));
     let (msg_id, delivery) = app.send(s.note("one")).await.unwrap();
-    assert!(matches!(delivery, Delivery::Failed { .. }), "{delivery:?}");
+    assert!(
+        matches!(delivery, Delivery::Failed { failed_at_ms, .. } if failed_at_ms == s.w.clock.now_ms()),
+        "{delivery:?}"
+    );
+    s.w.clock.advance_ms(1000);
     let report = app.flush_outbox().await.unwrap();
     assert_eq!(report.failed, vec![msg_id.clone()]);
+    // The time it was refused, not the time it was last read.
+    assert!(matches!(
+        app.delivery(&msg_id).await.unwrap(),
+        Some(Delivery::Failed { failed_at_ms, .. }) if failed_at_ms == s.w.clock.now_ms() - 1000
+    ));
     assert!(s.peer.received().is_empty());
     // Forgotten, plaintext and all, after the retention of sent messages.
     s.w.clock.advance_ms(29 * DAY_MS);
@@ -511,6 +520,21 @@ async fn test_send_refused_for_good_is_failed_not_retried() {
     let report = app.flush_outbox().await.unwrap();
     assert!(report.failed.is_empty(), "{report:?}");
     assert_eq!(app.delivery(&msg_id).await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn test_send_refused_for_good_is_failed_at_the_refusal_not_the_queueing() {
+    let s = Setup::new();
+    let mut app = s.join("wallet").await;
+    let msg_id = app.queue(s.note("one")).await.unwrap();
+    s.w.clock.advance_ms(1000);
+    s.peer.fail_next("inbox", ErrorCode::TooLarge, json!(null));
+    app.flush_outbox().await.unwrap();
+    s.w.clock.advance_ms(1000);
+    assert!(matches!(
+        app.delivery(&msg_id).await.unwrap(),
+        Some(Delivery::Failed { failed_at_ms, .. }) if failed_at_ms == s.w.clock.now_ms() - 1000
+    ));
 }
 
 /// `403 not_current` is about the sender's own certificate, not the recipient: the queued
@@ -4278,6 +4302,24 @@ async fn test_claims_unsent_kept_attempt_isnt_sent_in_reconcile_mode() {
         "{:?}",
         report.events
     );
+    // Never sent, so never applied: its end says so, by its ID and by its attempt.
+    let dropped = Some(crate::app::KeptBatchStatus::Dropped {
+        dropped_at_ms: s.w.clock.now_ms(),
+        reason: crate::app::KeptBatchDrop::Unsent,
+    });
+    assert_eq!(app.kept_batch(kept).await.unwrap(), dropped);
+    let by_attempt = app
+        .kept_attempt(crate::app::ClaimAttempt {
+            claim_key: CLAIM,
+            attempt_id: ATTEMPT,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (Some(by_attempt.batch_id), Some(by_attempt.status)),
+        (Some(kept), dropped)
+    );
 }
 
 #[tokio::test]
@@ -5523,6 +5565,31 @@ async fn test_records_update_waits_for_the_key_of_a_held_value() {
     assert_eq!(s.w.switch.record(&key).unwrap().state.version, held);
 }
 
+/// An explicit write overwrites a value held unopened for want of its key: the caller saw
+/// it in `content` and chose to, and the write builds on the version held.
+#[tokio::test]
+async fn test_records_explicit_write_overwrites_a_value_waiting_for_its_key() {
+    for delete in [false, true] {
+        let s = Setup::new();
+        let mut wallet = s.join("wallet").await;
+        let mut phone = s.join("phone").await;
+        let target = record_waiting_for_an_older_key(&s, &mut wallet, &mut phone).await;
+        let key = wallet.record_key(&target).unwrap();
+        let held = s.w.switch.record(&key).unwrap().state.version;
+        let written = if delete {
+            wallet.delete_record(&target, vec![]).await.unwrap()
+        } else {
+            wallet
+                .put_record(&target, &value(&["mine"]), vec![])
+                .await
+                .unwrap()
+        };
+        let expected: Vec<&str> = if delete { vec![] } else { vec!["mine"] };
+        assert_eq!(ids(written.content.value()), expected, "delete: {delete}");
+        assert!(s.w.switch.record(&key).unwrap().state.version > held);
+    }
+}
+
 /// A message's record job waits the same way: the message is delivered, the record left
 /// as it is until the key arrives.
 #[tokio::test]
@@ -5595,5 +5662,110 @@ async fn test_records_read_fresh_tells_a_refusal_from_an_unreachable_switch() {
             reason: KeptReason::Unreachable(_),
             ..
         }
+    ));
+}
+
+/// A sent message's record job whose held value waits for a key that never comes is tried
+/// at every flush only until [`crate::app::SENT_RETENTION_MS`] after the message's first
+/// acceptance: then it is given up, with a duty event naming the message, and the outbox
+/// forgets the message, plaintext and all.
+#[tokio::test]
+async fn test_records_record_job_waiting_for_a_key_ends_at_the_retention() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    let key = record_at_a_new_epoch(&s, &mut wallet, &mut phone).await;
+    wallet.receive(None).await.unwrap();
+    assert_eq!(
+        wallet.shared_record(&key).await.unwrap().unwrap().content,
+        RecordContent::Unreadable(Unopened::KeyNotHeld { data_epoch: 2 }),
+    );
+    let signed = wallet
+        .sign_message(s.note("hello"))
+        .unwrap()
+        .with_record(crate::app::RecordJob {
+            target: s.target("n1"),
+            tag: b"sent".to_vec(),
+        });
+    let msg_id = wallet.queue_signed(signed).await.unwrap();
+    wallet.flush_outbox().await.unwrap();
+    let Some(Delivery::Accepted { accepted_at_ms }) = wallet.delivery(&msg_id).await.unwrap()
+    else {
+        panic!("accepted");
+    };
+    let out = format!("out/{msg_id}");
+    let told = |events: &[AppEvent]| {
+        events.iter().any(|e| {
+            matches!(e, AppEvent::RecordJobDropped { msg_id: m, .. } if *m == msg_id) && e.is_duty()
+        })
+    };
+    // Still owed, the value waiting for its key, just inside the retention.
+    s.w.clock
+        .set_ms(accepted_at_ms + crate::app::SENT_RETENTION_MS - 1);
+    wallet.flush_outbox().await.unwrap();
+    assert!(wallet.reader().exists(&out).await.unwrap());
+    assert!(!told(&wallet.unacknowledged_events().await.unwrap()));
+    // At it: given up and told, and the message forgotten.
+    s.w.clock
+        .set_ms(accepted_at_ms + crate::app::SENT_RETENTION_MS);
+    wallet.flush_outbox().await.unwrap();
+    assert!(!wallet.reader().exists(&out).await.unwrap());
+    assert!(told(&wallet.unacknowledged_events().await.unwrap()));
+    assert_eq!(wallet.delivery(&msg_id).await.unwrap(), None);
+}
+
+/// Giving up a record job leaves the message in the outbox while a re-send of it is owed:
+/// only the record job goes, told by its duty event, and the re-send is still tried.
+#[tokio::test]
+async fn test_records_record_job_given_up_keeps_an_owed_resend() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    record_at_a_new_epoch(&s, &mut wallet, &mut phone).await;
+    wallet.receive(None).await.unwrap();
+    let signed = wallet
+        .sign_message(s.note("hello"))
+        .unwrap()
+        .with_record(crate::app::RecordJob {
+            target: s.target("n1"),
+            tag: b"sent".to_vec(),
+        });
+    let msg_id = wallet.queue_signed(signed).await.unwrap();
+    wallet.flush_outbox().await.unwrap();
+    let Some(Delivery::Accepted { accepted_at_ms }) = wallet.delivery(&msg_id).await.unwrap()
+    else {
+        panic!("accepted");
+    };
+    // A re-send asked, and its delivery fails for now.
+    s.peer
+        .fail_next("inbox", ErrorCode::Unavailable, json!(null));
+    let delivery = wallet.resend(&msg_id).await.unwrap();
+    assert!(matches!(delivery, Delivery::Queued { .. }), "{delivery:?}");
+    s.w.clock
+        .set_ms(accepted_at_ms + crate::app::SENT_RETENTION_MS);
+    s.peer
+        .fail_next("inbox", ErrorCode::Unavailable, json!(null));
+    wallet.flush_outbox().await.unwrap();
+    assert!(
+        wallet
+            .unacknowledged_events()
+            .await
+            .unwrap()
+            .iter()
+            .any(|e| matches!(
+                e,
+                AppEvent::RecordJobDropped { msg_id: m, .. } if *m == msg_id
+            ))
+    );
+    assert!(
+        wallet
+            .reader()
+            .exists(&format!("out/{msg_id}"))
+            .await
+            .unwrap()
+    );
+    assert!(matches!(
+        wallet.delivery(&msg_id).await.unwrap(),
+        Some(Delivery::Queued { .. })
     ));
 }
