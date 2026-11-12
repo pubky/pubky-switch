@@ -721,6 +721,53 @@ impl Tx {
         &self.batch.writes
     }
 
+    /// What the batch leaves at `key`, not yet committed: `Some(true)` when its last write
+    /// there puts it, `Some(false)` when it deletes it, `None` when the batch doesn't touch
+    /// it (the store's value stands).
+    pub(crate) fn pending_state(&self, key: &str) -> Option<bool> {
+        let key = key.as_bytes();
+        self.batch
+            .writes
+            .iter()
+            .rev()
+            .find_map(|write| match write {
+                Write::Put { key: k, .. } if k == key => Some(true),
+                Write::Delete { key: k, .. } if k == key => Some(false),
+                Write::DeletePrefix { prefix, .. } if key.starts_with(prefix) => Some(false),
+                _ => None,
+            })
+    }
+
+    /// How many keys under `prefix` the batch puts and doesn't delete after, not yet
+    /// committed.
+    pub(crate) fn pending_puts(&self, prefix: &str) -> usize {
+        self.pending_put_keys(prefix).len()
+    }
+
+    /// The keys under `prefix` the batch puts and doesn't delete after, not yet committed,
+    /// without the prefix.
+    pub(crate) fn pending_put_keys(&self, prefix: &str) -> Vec<String> {
+        let start = prefix.len();
+        let prefix = prefix.as_bytes();
+        let mut keys: std::collections::BTreeSet<&[u8]> = std::collections::BTreeSet::new();
+        for write in &self.batch.writes {
+            match write {
+                Write::Put { key, .. } if key.starts_with(prefix) => {
+                    keys.insert(key);
+                }
+                Write::Delete { key, .. } => {
+                    keys.remove(key.as_slice());
+                }
+                Write::DeletePrefix { prefix: p, .. } => keys.retain(|key| !key.starts_with(p)),
+                _ => {}
+            }
+        }
+        keys.into_iter()
+            .filter_map(|key| std::str::from_utf8(key.get(start..)?).ok())
+            .map(str::to_owned)
+            .collect()
+    }
+
     /// The bytes the batch counts against the store's batch size so far.
     pub(crate) fn size(&self) -> u64 {
         self.batch.size()
