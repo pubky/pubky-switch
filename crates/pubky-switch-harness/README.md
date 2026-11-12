@@ -101,7 +101,11 @@ The flows send every call the service serves, each at both switches. What they l
   records list that `limit` ends takes more than a thousand records, and no flow writes
   that many. The directory has no pages (Switch wire 7.4.10).
 - **A wait that runs out, and a held read after a leave.** The `waiting read` flows' reads
-  are answered by a write, by an erasure and by the reader's revocation. A read whose wait
+  are answered by a write, by an erasure, by the reader's revocation and by a recovery in
+  place. In that last flow the new document's publication fails once, so the woken app
+  finds nothing to follow until the signer's next run: an app woken after the publication
+  follows the recovery inside the same call, and which of the two happens depends on how
+  the read's answer and the signer's are ordered, which no flow pins. A read whose wait
   passes with nothing written takes real seconds at the service, and no flow sends one;
   nor one held while its app leaves, which the app itself would have to send while it
   waits.
@@ -161,6 +165,9 @@ Run the `trace` example to see what the two switches answered, and list each dif
 ## Run time and databases
 
 Each flow's run against the service makes one test database and drops it, also when its
-test panics; the flows run one after another. Sixty-three flows take about three minutes in a
+test panics; the flows run one after another. Each run is on a thread of its own with 16 MiB
+of stack (`FLOW_STACK_BYTES`, `on_flow_stack`): in a debug build the deepest flow used
+1.9 MiB, close to the 2 MiB of a test's thread, and a test binary aborted when the thread
+that ran the flows had less left. Sixty-four flows take about three minutes in a
 debug build. If that grows too long, the service's halves could share one service and one
 database, with identities of their own per flow: a later option, not needed yet.
