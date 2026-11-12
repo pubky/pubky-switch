@@ -62,6 +62,18 @@ pub struct World {
     scripted: Mutex<Vec<Arc<ScriptedSwitch>>>,
     /// How many switches each identity was given an account's key at, by Pubky ID.
     homes: Mutex<std::collections::HashMap<String, u8>>,
+    /// The Homeserver writes and deletions to fail, each once.
+    homeserver_faults: Arc<Mutex<Vec<HomeserverFault>>>,
+}
+
+/// A write or a deletion at a signer's own Homeserver that fails once, as when the
+/// Homeserver can't be reached: nothing is written or deleted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HomeserverFault {
+    /// Whether it is a deletion that fails; a write otherwise.
+    deletion: bool,
+    /// The path of the file.
+    path: String,
 }
 
 impl std::fmt::Debug for World {
@@ -103,6 +115,7 @@ impl World {
             services: Mutex::new(Vec::new()),
             scripted: Mutex::new(Vec::new()),
             homes: Mutex::new(std::collections::HashMap::new()),
+            homeserver_faults: Arc::new(Mutex::new(Vec::new())),
         }))
     }
 
@@ -156,7 +169,8 @@ impl World {
 
     /// As [`World::add_switch`], the service running with `limits` (Switch wire 9.2) in
     /// place of its defaults, as an operator may configure it. The scripted switch takes the
-    /// inbox quota and the app limit of them, the two it has a setting for.
+    /// inbox quota, the app limit and the hourly limit of recovery uploads of them, the
+    /// three it has a setting for.
     ///
     /// # Errors
     ///
@@ -207,6 +221,7 @@ impl World {
                         quota_bytes: limits.quota_bytes,
                         ..pubky_switch_core::records::Limits::default()
                     });
+                    switch.set_uploads_per_app_per_hour(limits.uploads_per_app_per_hour);
                     accounts.push((identity.key().id(), switch.holding_transport()));
                     lock(&self.scripted).push(switch);
                 }
@@ -282,9 +297,34 @@ impl World {
             homeserver: Arc::new(OwnFiles {
                 identity: identity.public(),
                 files: self.files.clone(),
+                faults: self.homeserver_faults.clone(),
             }),
             protocols,
         })
+    }
+
+    /// The next write of the file at `path` by a signer to its own Homeserver fails, once:
+    /// nothing is written, and the signer sees a connection failure. The Homeserver is no
+    /// switch, so this is the same in both runs.
+    pub fn fail_homeserver_write(&self, path: &str) {
+        lock(&self.homeserver_faults).push(HomeserverFault {
+            deletion: false,
+            path: path.to_owned(),
+        });
+    }
+
+    /// The next deletion of the file at `path` by a signer at its own Homeserver fails,
+    /// once: the file stays.
+    pub fn fail_homeserver_deletion(&self, path: &str) {
+        lock(&self.homeserver_faults).push(HomeserverFault {
+            deletion: true,
+            path: path.to_owned(),
+        });
+    }
+
+    /// The Homeserver faults asked for that no write or deletion has met yet.
+    pub fn homeserver_faults_left(&self) -> usize {
+        lock(&self.homeserver_faults).len()
     }
 
     /// A keyring holding `identity`'s key, as after the host stored it in its vault.
@@ -366,6 +406,18 @@ impl World {
             status,
             code: code.to_owned(),
         });
+    }
+
+    /// Hold back every request of `method` whose path contains `path` until
+    /// [`World::let_go`]: it waits on its way while other calls go on. For a flow in which
+    /// one party's step must not overtake another's answer, at either switch.
+    pub fn hold_back(&self, method: &str, path: &str) {
+        self.recorder.hold_back(method, path);
+    }
+
+    /// Let the requests [`World::hold_back`] holds go.
+    pub fn let_go(&self) {
+        self.recorder.let_go();
     }
 
     /// Send the `nth` enrollment of the run again (from 0), byte for byte, as a retry that
@@ -517,6 +569,18 @@ impl Transport for Accounts {
 struct OwnFiles {
     identity: [u8; 32],
     files: Arc<TestHomeserver>,
+    faults: Arc<Mutex<Vec<HomeserverFault>>>,
+}
+
+impl OwnFiles {
+    /// Whether a write or a deletion at `path` meets a fault, which is then used up.
+    fn fails(&self, deletion: bool, path: &str) -> bool {
+        let mut faults = lock(&self.faults);
+        let met = faults
+            .iter()
+            .position(|fault| fault.deletion == deletion && fault.path == path);
+        met.map(|at| faults.remove(at)).is_some()
+    }
 }
 
 impl Homeserver for OwnFiles {
@@ -525,11 +589,17 @@ impl Homeserver for OwnFiles {
     }
 
     fn put(&self, path: &str, bytes: Vec<u8>) -> BoxFuture<'_, Result<(), TransportError>> {
+        if self.fails(false, path) {
+            return Box::pin(async { Err(TransportError::Connect("the Homeserver".into())) });
+        }
         self.files.put(self.identity, path, bytes);
         Box::pin(async { Ok(()) })
     }
 
     fn delete(&self, path: &str) -> BoxFuture<'_, Result<(), TransportError>> {
+        if self.fails(true, path) {
+            return Box::pin(async { Err(TransportError::Connect("the Homeserver".into())) });
+        }
         self.files.remove(self.identity, path);
         Box::pin(async { Ok(()) })
     }
@@ -555,5 +625,44 @@ impl SecretVault for MemoryVault {
     fn delete(&self) -> Result<(), VaultError> {
         *lock(&self.0) = None;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_homeserver_fault_fails_one_write_or_deletion_of_its_path() {
+        let files = Arc::new(TestHomeserver::new());
+        let faults = Arc::new(Mutex::new(vec![
+            HomeserverFault {
+                deletion: false,
+                path: "/pub/a".into(),
+            },
+            HomeserverFault {
+                deletion: true,
+                path: "/pub/a".into(),
+            },
+        ]));
+        let own = OwnFiles {
+            identity: [1; 32],
+            files: files.clone(),
+            faults: faults.clone(),
+        };
+        // Another path isn't touched, nor is a read.
+        assert!(own.put("/pub/b", b"b".to_vec()).await.is_ok());
+        assert_eq!(own.get("/pub/a").await.ok(), Some(None));
+        // The write fails once, and writes nothing.
+        assert!(own.put("/pub/a", b"first".to_vec()).await.is_err());
+        assert_eq!(files.file([1; 32], "/pub/a"), None);
+        assert!(own.put("/pub/a", b"second".to_vec()).await.is_ok());
+        assert_eq!(files.file([1; 32], "/pub/a"), Some(b"second".to_vec()));
+        // The deletion fails once, and the file stays.
+        assert!(own.delete("/pub/a").await.is_err());
+        assert!(files.file([1; 32], "/pub/a").is_some());
+        assert!(own.delete("/pub/a").await.is_ok());
+        assert_eq!(files.file([1; 32], "/pub/a"), None);
+        assert!(lock(&faults).is_empty());
     }
 }

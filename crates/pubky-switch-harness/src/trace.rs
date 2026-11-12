@@ -195,6 +195,8 @@ pub struct Recorder {
     faults: Mutex<Vec<Fault>>,
     /// The enrollments sent, in order, as they were sent.
     enrollments: Mutex<Vec<Request>>,
+    /// The requests held back on their way: the method, and a part of the path.
+    held_back: Mutex<Option<(String, String)>>,
 }
 
 /// A fault of the network between a party and its switch, applied to the next request of
@@ -272,6 +274,7 @@ impl Recorder {
             distortion: Mutex::new(None),
             faults: Mutex::new(Vec::new()),
             enrollments: Mutex::new(Vec::new()),
+            held_back: Mutex::new(None),
         }
     }
 
@@ -290,6 +293,27 @@ impl Recorder {
     /// The `nth` enrollment sent through this recorder, from 0, as it was sent.
     pub fn enrollment(&self, nth: usize) -> Option<Request> {
         lock(&self.enrollments).get(nth).cloned()
+    }
+
+    /// Hold back every request of `method` whose path contains `path`, from now until
+    /// [`Recorder::let_go`]: the caller's request waits on its way, as on a slow network,
+    /// while other calls go on. For a flow in which one party's step must not overtake
+    /// another's answer.
+    pub fn hold_back(&self, method: &str, path: &str) {
+        *lock(&self.held_back) = Some((method.to_owned(), path.to_owned()));
+    }
+
+    /// Let the requests [`Recorder::hold_back`] holds go, and hold none back from now on.
+    pub fn let_go(&self) {
+        *lock(&self.held_back) = None;
+    }
+
+    fn holds_back(&self, request: &Request) -> bool {
+        lock(&self.held_back)
+            .as_ref()
+            .is_some_and(|(method, path)| {
+                request.method == *method && request.path_and_query.contains(path.as_str())
+            })
     }
 
     /// How many different enrollments were sent through this recorder.
@@ -434,6 +458,11 @@ impl Recorder {
 impl Transport for Recorder {
     fn send(&self, request: Request) -> BoxFuture<'_, Result<Response, TransportError>> {
         Box::pin(async move {
+            // Held back, the request isn't on its way yet: it takes its place in the trace
+            // when it goes.
+            while self.holds_back(&request) {
+                tokio::task::yield_now().await;
+            }
             let label = self.label(&request);
             let mut facts = BTreeMap::new();
             self.request_facts(&request, &mut facts);
@@ -988,6 +1017,37 @@ mod tests {
         assert_eq!(fact(1, "body.code").as_deref(), Some("text conflict"));
         assert_eq!(fact(1, SIGNED_WITH), None, "the checker isn't asked");
         assert_eq!(fact(2, "fault"), None);
+    }
+
+    #[tokio::test]
+    async fn test_held_back_request_goes_when_let_go_and_takes_its_place_then() {
+        let (recorder, inner) = recorder();
+        recorder.hold_back("POST", "/ops");
+        let held = recorder.send(post("/v1/abc/ops"));
+        let other = async {
+            // Another call goes on meanwhile, and nothing of the held one reached the switch.
+            let answered = recorder.send(post("/v1/abc/inbox")).await;
+            let reached = inner.requests().len();
+            recorder.let_go();
+            (answered.map(|answer| answer.status), reached)
+        };
+        let (held, (other, reached)) = futures_util::future::join(held, other).await;
+        assert_eq!(other, Ok(200));
+        assert_eq!(reached, 1, "only the other call had reached the switch");
+        assert_eq!(held.map(|answer| answer.status), Ok(200));
+        assert_eq!(inner.requests().len(), 2);
+        let labels: Vec<String> = recorder
+            .trace()
+            .lines
+            .iter()
+            .map(|line| line.label.clone())
+            .collect();
+        assert_eq!(
+            labels,
+            ["public POST /v1/abc/inbox", "public POST /v1/abc/ops"].map(String::from)
+        );
+        // Nothing is held back afterwards.
+        assert!(recorder.send(post("/v1/abc/ops")).await.is_ok());
     }
 
     #[test]

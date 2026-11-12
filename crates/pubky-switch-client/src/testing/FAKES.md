@@ -198,7 +198,9 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   `400` when it lists an App ID held with that key: the account starts afresh under that
   key, keeping its service time, its enrollments and the App IDs
   to refuse, those held with the pending key among them, and, as the service does, its upload
-  limits and hourly upload counts. Unlike the service: a key change
+  limits, its hourly upload counts, the directory's `apps_version` and
+  `directory_version`, which go on counting, and what a test set of its configuration (the
+  feed's page limits, kept passed entries, open admission). Unlike the service: a key change
   in place, without `recovery_from`, is answered `400`; and a staged account's generation
   change, a move's, is chained where the service answers `503`. The test call `deliver_identity` takes any document, without those
   checks, for scripting what another signer or a faulty service did. `forget_delivery_proof`
@@ -216,7 +218,11 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   (`UploadBody::parse`, `check_permissions`, `check_upload`) and merge
   (`merge_checked_record`, `merge_upload_claim`), as at the service, so the counts and the
   changes are the service's, one `upload` transition each; `uploads_per_app_per_hour`
-  (`429 rate_limited` until the next hour of the switch's clock), `max_contacts` and
+  (`429 rate_limited` until the next hour of the switch's clock; every upload from an app
+  the switch holds a record for takes a slot, one refused for its body or its lists, as
+  `not_current`, or with `404` at an account in neither stage included, and the refusals
+  keep the wire's order past the limit; the `429` repeats `retry_after` in `Retry-After`, as every `429` of this switch
+  does), `max_contacts` and
   `max_deny` as at the service, the wire's defaults unless a test sets them; and `404` at an
   account in neither stage. Unlike the service: `max_divergent_uploads` and
   `max_attempts_per_claim` are the wire's defaults, and `GET /claims` lists whatever entries
@@ -282,7 +288,9 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   `stored_handover` names the target held; `stored_handover_body` and
   `store_handover_again` script a hand-over stored or served again after it was dropped.
 - **`Fault::LeaveOut`** scripts a faulty service whose answer to an own app or the signer
-  leaves out a top-level member, such as a feed page's `items`.
+  leaves out a top-level member, such as a feed page's `items`; **`Fault::Replace`** one
+  whose answer carries another value for it, such as `GET /apps`' `identity` replaced by a
+  copy that doesn't verify.
 - **Erasure** (Switch wire 7.4.16), in `switch/signer.rs`: `POST /erase` checks the body names
   the account's service key (`409 conflict` for another) and, when it names one, the hash of
   the `identity.json` this switch holds (`409 conflict` for another, or for none held), and

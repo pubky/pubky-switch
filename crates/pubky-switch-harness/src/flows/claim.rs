@@ -100,7 +100,7 @@ pub async fn claim(world: &World) -> FlowResult {
 }
 
 /// What a claim view says, for the trace.
-fn view(view: &ClaimView) -> Value {
+pub(crate) fn view(view: &ClaimView) -> Value {
     json!({
         "status": format!("{:?}", view.status),
         "step": view.step,
@@ -110,6 +110,7 @@ fn view(view: &ClaimView) -> Value {
         "tombstone": view.tombstone,
         "deadline": view.deadline,
         "divergent": view.divergent,
+        "rebuilt": view.rebuilt,
         "next_possibly_duplicate": view.next_possibly_duplicate,
     })
 }

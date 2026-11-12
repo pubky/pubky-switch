@@ -208,6 +208,16 @@ pub enum Fault {
         /// The member left out.
         member: String,
     },
+    /// [`Fault::LeaveOut`], with the top-level `member` replaced by `value` instead, such as
+    /// `GET /apps`' `identity` by a copy that doesn't verify.
+    Replace {
+        /// A part of the request's path and query.
+        path: String,
+        /// The member replaced.
+        member: String,
+        /// What the answer carries instead.
+        value: Value,
+    },
 }
 
 pub(crate) struct Inner {
@@ -1070,12 +1080,14 @@ impl ScriptedSwitch {
         let path = request.path_and_query.clone();
         let mut lose = false;
         let mut leave_out = None;
+        let mut replace = None;
         let matching = inner.faults.iter().position(|fault| match fault {
             Fault::Error { path: p, .. }
             | Fault::LoseAnswer { path: p }
             | Fault::LoseAnswerAfter { path: p, .. }
             | Fault::Unreachable { path: p, .. }
-            | Fault::LeaveOut { path: p, .. } => path.contains(p.as_str()),
+            | Fault::LeaveOut { path: p, .. }
+            | Fault::Replace { path: p, .. } => path.contains(p.as_str()),
         });
         let passes = matching.is_some_and(|index| match inner.faults.get_mut(index) {
             Some(Fault::Unreachable { after, .. } | Fault::LoseAnswerAfter { after, .. })
@@ -1109,6 +1121,7 @@ impl ScriptedSwitch {
                 }
                 Some(Fault::LoseAnswer { .. } | Fault::LoseAnswerAfter { .. }) => lose = true,
                 Some(Fault::LeaveOut { member, .. }) => leave_out = Some(member),
+                Some(Fault::Replace { member, value, .. }) => replace = Some((member, value)),
                 Some(Fault::Unreachable { .. }) => {
                     inner.unreached.push(request.body.clone());
                     return Err(TransportError::Connect("scripted".into()));
@@ -1181,6 +1194,9 @@ impl ScriptedSwitch {
         }
         if let (Some(member), Some(object)) = (leave_out, body.as_object_mut()) {
             object.remove(&member);
+        }
+        if let (Some((member, value)), Some(object)) = (replace, body.as_object_mut()) {
+            object.insert(member, value);
         }
         Ok(inner.respond(request, status, &body))
     }
@@ -1320,6 +1336,12 @@ impl ScriptedSwitch {
     /// lagging (Switch wire 7.4.4). The switch refuses no append for it.
     pub fn set_inbox_quota(&self, quota_bytes: u64) {
         self.lock().enroll_limits.quota_bytes = quota_bytes;
+    }
+
+    /// Set `uploads_per_app_per_hour` (Switch wire 9.2): the recovery uploads the switch
+    /// takes from each app in an hour of its clock.
+    pub fn set_uploads_per_app_per_hour(&self, uploads: u32) {
+        self.lock().uploads_per_app_per_hour = uploads;
     }
 
     /// A `missed` item: `entries` entries accepted from `from` until `until` were deleted
@@ -1719,12 +1741,21 @@ impl Inner {
             &server_time,
             &bytes,
         );
+        let mut headers = vec![
+            Header::new(header::SERVICE_SIGNATURE, &b64(&signature)),
+            Header::new(header::SERVER_TIME, &server_time),
+        ];
+        // A `429` repeats its body's `retry_after` in `Retry-After` (Switch wire 7.1, 7.6).
+        if let Some(seconds) = body
+            .get("retry_after")
+            .and_then(Value::as_u64)
+            .filter(|_| status == 429)
+        {
+            headers.push(Header::new(header::RETRY_AFTER, &seconds.to_string()));
+        }
         Response {
             status,
-            headers: vec![
-                Header::new(header::SERVICE_SIGNATURE, &b64(&signature)),
-                Header::new(header::SERVER_TIME, &server_time),
-            ],
+            headers,
             body: bytes,
         }
     }
@@ -2230,6 +2261,14 @@ impl Inner {
                 json!(null),
             ));
         };
+        // An upload from an app the switch holds a record for takes its slot of the hour
+        // here, before the caller's own checks and the stage, as the service takes it once
+        // the request verifies: one answered `403 not_current` or `404` counts too (Switch
+        // wire 7.4.14, 9.4). The `429` itself comes last in the answer order.
+        let limited = match self.apps.get(&app) {
+            Some(held) if held.cert.is_some() => self.take_upload_slot(app),
+            _ => None,
+        };
         let cert = if self.staged {
             None
         } else {
@@ -2246,18 +2285,24 @@ impl Inner {
                 json!(null),
             ));
         }
-        let Ok(body) = serde_json::from_slice::<Value>(&request.body) else {
+        let read = serde_json::from_slice::<Value>(&request.body);
+        let with_cert = request.header(header::CERT).is_some();
+        // After a provider loss the upload's slot is taken before its body is read, so one
+        // that doesn't read counts too (Switch wire 7.4.14, 9.4).
+        if let (false, Some(recovery_from), Some(cert)) = (self.staged, self.recovery_from, cert) {
+            if let Ok(body) = read {
+                self.uploads.push((body, with_cert));
+            }
+            return self.loss_upload(&request.body, app, &cert, recovery_from, limited);
+        }
+        let Ok(body) = read else {
             return Ok(bad(ErrorCode::BadRequest, "upload", json!(null)));
         };
         let count = |name: &str| body[name].as_array().map_or(0, Vec::len) as u64;
         let (heads, proofs) = (count("heads"), count("proofs"));
-        self.uploads
-            .push((body.clone(), request.header(header::CERT).is_some()));
+        self.uploads.push((body.clone(), with_cert));
         if self.staged {
             return Ok((200, json!({ "heads": heads, "proofs": proofs })));
-        }
-        if let (Some(recovery_from), Some(cert)) = (self.recovery_from, cert) {
-            return self.loss_upload(&request.body, app, &cert, recovery_from);
         }
         let changes = json!({ "records": [], "divergent": [], "claims": [],
                               "divergent_claims": [], "unverified": 0, "distrusted": 0,
@@ -2270,6 +2315,30 @@ impl Inner {
         ))
     }
 
+    /// Take `app`'s slot of `uploads_per_app_per_hour` in the hour of the switch's clock
+    /// (Switch wire 9.4): `None` when it got one, else the seconds to the next hour. An
+    /// upload past the limit takes none.
+    fn take_upload_slot(&mut self, app: [u8; 16]) -> Option<u64> {
+        let (now, hour_ms) = (self.now(), 3_600_000);
+        let hour = now / hour_ms;
+        let count = self.upload_counts.entry(app).or_insert((hour, 0));
+        if count.0 < hour {
+            *count = (hour, 0);
+        }
+        if count.1 >= self.uploads_per_app_per_hour {
+            let next = count.0.saturating_add(1).saturating_mul(hour_ms);
+            return Some(next.saturating_sub(now).div_ceil(1000).max(1));
+        }
+        count.1 += 1;
+        None
+    }
+
+    /// Whether `app` has taken a slot of `uploads_per_app_per_hour`, in any hour.
+    #[cfg(test)]
+    pub(crate) fn upload_counts_of(&self, app: &[u8; 16]) -> bool {
+        self.upload_counts.contains_key(app)
+    }
+
     /// An upload after the loss of generation `recovery_from` (Switch wire 7.4.14), checked
     /// by the core and merged as the service merges it, ending staged admission for
     /// contacts from an app holding `lists.manage`: one `upload` transition, and `{ result,
@@ -2280,7 +2349,9 @@ impl Inner {
         app: [u8; 16],
         cert: &AppCert,
         recovery_from: u64,
+        limited: Option<u64>,
     ) -> Result<Answer, ScriptError> {
+        // The refusals in the wire's order: the body, the caller's permission, the limit.
         let upload = match UploadBody::parse(body).and_then(|upload| {
             upload.check_permissions(cert)?;
             Ok(upload)
@@ -2288,21 +2359,12 @@ impl Inner {
             Ok(upload) => upload,
             Err(refusal) => return Ok(batch::refused(&refusal)),
         };
-        // Past `uploads_per_app_per_hour` in the hour of the switch's clock: `429`, with the
-        // seconds to the next hour (Switch wire 7.4.14, 9.4).
-        let (now, hour_ms) = (self.now(), 3_600_000);
-        let hour = now / hour_ms;
-        let count = self.upload_counts.entry(app).or_insert((hour, 0));
-        if count.0 < hour {
-            *count = (hour, 0);
-        }
-        if count.1 >= self.uploads_per_app_per_hour {
-            let next = count.0.saturating_add(1).saturating_mul(hour_ms);
+        if let Some(retry_after) = limited {
             let mut limited = bad(ErrorCode::RateLimited, "recovery uploads", json!(null));
-            limited.1["retry_after"] = json!(next.saturating_sub(now).div_ceil(1000).max(1));
+            limited.1["retry_after"] = json!(retry_after);
             return Ok(limited);
         }
-        count.1 += 1;
+        let now = self.now();
         let removed = self
             .doc
             .as_ref()

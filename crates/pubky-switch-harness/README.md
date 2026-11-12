@@ -31,6 +31,11 @@ fails instead.
 `World::lose_answer`, `World::unreachable` and `World::refuse` put a fault of the network in
 front of either switch: an answer lost after the switch took the request, a request that
 never arrives, or a refusal that comes back in the switch's place with no signature.
+`World::hold_back` keeps a request waiting on its way until `World::let_go`, where one
+party's step must not overtake another's answer at either switch.
+`World::fail_homeserver_write` and `World::fail_homeserver_deletion` fail a signer's next
+write or deletion of one file at its own Homeserver, once. The Homeserver is no switch, so
+such a fault is the same in both runs.
 The retry flows send each of these again, and the service and the scripted switch answer
 every one alike:
 
@@ -74,15 +79,19 @@ before, 24 hours after the first. Both erasure flows run that wait, and a read s
 
 The flows send every call the service serves, each at both switches. What they leave out:
 
-- **Calls the service doesn't serve yet**, twelve of the thirty-three of Switch wire 7.4:
+- **Calls the service doesn't serve yet**, eleven of the thirty-three of Switch wire 7.4:
   the connection requests (`POST`, `GET` and `DELETE /connect`), `PUT /push`, `POST /freeze`
-  and `/unfreeze`, `GET /export` and its chunks, `POST /import` with its chunks and
-  activation, and `POST /recovery/upload`. So no flow moves an account or changes its key in
-  place, and after a provider loss none brings an app's records and lists back to the new
-  service. The provider-loss flows are the signer's part, and of an app's only its first
-  steps: in two of them the wallet registers at the new service and reads the new chain
-  from its first item, the recovery's record, and its upload is kept from reaching either
-  switch. `flows::flow_of` lists them, and the test fails once one is served without a flow.
+  and `/unfreeze`, `GET /export` and its chunks, and `POST /import` with its chunks and
+  activation. So no flow moves an account or changes its key in place, and no upload is
+  sent in a cooperative move. `flows::flow_of` lists them, and the test fails once one is
+  served without a flow.
+- **More of a recovery upload** (Switch wire 7.4.14). The upload flows bring records, a
+  claim and the lists to the new service, and send the refusals in their order. They leave
+  to the service's own tests: an operation of a removed app (`distrusted`), items that
+  don't verify (`unverified`) and claim entries the writer rules refuse (`refused`), which
+  no app of the client crate uploads; a claim made divergent by uploads; the caps
+  (`max_divergent_uploads`, `max_contacts`, `max_deny`, `max_attempts_per_claim`); and an
+  upload from an app that hasn't registered at the new service yet.
 - **Faults in front of most reads.** The retries above are the ones covered. No answer is
   lost and no connection fails in front of `GET /allow`, `/claims/{claim_key}`,
   `/directory`, `/apps/{app_id}/keys`, `/records`, `/records/{key}`, `/handover` or the
@@ -91,10 +100,11 @@ The flows send every call the service serves, each at both switches. What they l
   and that the byte budget ends, and a records list in pages the byte budget ends; a
   records list that `limit` ends takes more than a thousand records, and no flow writes
   that many. The directory has no pages (Switch wire 7.4.10).
-- **A wait that runs out, and a held read refused.** The `waiting read` flows' reads are
-  answered by a write and by an erasure. A read whose wait passes with nothing written
-  takes real seconds at the service, and no flow sends one; nor one held while its app is
-  revoked or leaves, where what the app does next depends on when the answer comes.
+- **A wait that runs out, and a held read after a leave.** The `waiting read` flows' reads
+  are answered by a write, by an erasure and by the reader's revocation. A read whose wait
+  passes with nothing written takes real seconds at the service, and no flow sends one;
+  nor one held while its app leaves, which the app itself would have to send while it
+  waits.
 - **A full inbox.** The `lagging app`, `missed item` and `unreadable after a revoke` flows
   run with an app that falls behind while another reads. An inbox no app reads, where the
   quota refuses senders, an unreadable item at a leave or at a delivery, and a lagging app
@@ -103,17 +113,20 @@ The flows send every call the service serves, each at both switches. What they l
   conversation entry pruned, a connection request.
 - **Longer lives:** a renewal that adds a scope, a claim that runs out by time, an
   identity that enrolls again after an erasure.
-- **A message between two switches.** In the provider-loss flows the sender's service
-  isn't the recipient's, and his message is held back; no flow has one accepted across two
-  services.
+- **More of a removal.** The removal flows date a revocation and a departure, clean up
+  after one, purge its entry, and send a revocation past a read that failed or during a
+  recovery. A removal time a switch reports before the app was listed or after its own
+  answer, and a switch's copy that doesn't verify, take a switch that misbehaves: they
+  stay with the signer's tests on the scripted switch.
 
 Not this crate's to cover: refusals, limits, rates, quotas and retention, which the
 service's own tests hold, and a faulty or hostile switch, which stays on the scripted
 switch. Around the service, the flows don't touch TLS, the listener, the proxy's
 client-address header, the client's HTTPS transport, the time source (trusted time comes
 from the test clock), key generation (accounts take keys from fixed seeds), or more than one
-instance on a database. Of a service's limits, a world carries only the inbox quota and
-the app limit to the scripted switch (`World::add_switch_with`): a flow that leaned on
+instance on a database. Of a service's limits, a world carries only the inbox quota, the
+app limit and the hourly limit of recovery uploads to the scripted switch
+(`World::add_switch_with`): a flow that leaned on
 another would compare a service so set with a scripted switch at its defaults. `src/check.rs`
 says what of an answer the harness verifies itself
 and what it leaves to the client and the signer.
@@ -128,6 +141,6 @@ Run the `trace` example to see what the two switches answered, and list each dif
 ## Run time and databases
 
 Each flow's run against the service makes one test database and drops it, also when its
-test panics; the flows run one after another. Thirty-nine flows take about a minute and a half in a
+test panics; the flows run one after another. Fifty-four flows take about two and a half minutes in a
 debug build. If that grows too long, the service's halves could share one service and one
 database, with identities of their own per flow: a later option, not needed yet.
