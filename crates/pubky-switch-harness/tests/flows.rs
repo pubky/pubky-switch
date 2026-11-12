@@ -16,34 +16,10 @@ use pubky_switch_core::enc::{b64, unb64};
 use pubky_switch_harness::allowed::{ALLOWED, EVERY_FLOW};
 use pubky_switch_harness::compare::{Difference, differences, judge};
 use pubky_switch_harness::flows::{self, CALLS, FLOWS, ORIGIN, flow_of};
-use pubky_switch_harness::{Backend, Comparison, FlowResult, Trace, World, compare_backends, run};
+use pubky_switch_harness::{
+    Backend, Comparison, FlowResult, Trace, World, compare_backends, on_flow_stack, run,
+};
 use tokio::sync::OnceCell;
-
-/// The stack each test of this file runs on. A flow runs a signer, apps and a switch in one
-/// thread, and futures are large in debug builds: the longest flows came within an eighth
-/// of a test thread's default 2 MiB. A thread of its own with more room keeps that margin
-/// from deciding a run; the client's own tests keep the default, so a growth of the
-/// client's stack still shows there.
-const FLOW_STACK_BYTES: usize = 16 * 1024 * 1024;
-
-/// Run a test's body as `#[tokio::test]` would, in a runtime of its own on the current
-/// thread, but on a thread with [`FLOW_STACK_BYTES`] of stack; a panic in it fails the
-/// test.
-fn on_flow_stack<F: std::future::Future<Output = ()> + 'static>(body: fn() -> F) {
-    let thread = std::thread::Builder::new()
-        .stack_size(FLOW_STACK_BYTES)
-        .spawn(move || {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("a runtime")
-                .block_on(body());
-        })
-        .expect("a thread");
-    if let Err(panic) = thread.join() {
-        std::panic::resume_unwind(panic);
-    }
-}
 
 /// Every flow's comparison, made once for the tests of this file; `None` when no test
 /// database is configured. A flow that fails is kept as the failure: every test that asks
@@ -93,7 +69,7 @@ async fn service_trace(name: &str) -> Option<&'static Trace> {
 /// What `flow` shows against a scripted switch whose answers the trace keeps as `distort`
 /// changes them.
 async fn distorted(
-    flow: impl AsyncFn(&World) -> FlowResult,
+    flow: impl AsyncFn(&World) -> FlowResult + Sync,
     distort: fn(&Request, &mut Response),
 ) -> Trace {
     run(Backend::Scripted, async |world| {
@@ -105,12 +81,8 @@ async fn distorted(
     .expect("a scripted world")
 }
 
-#[test]
-fn test_flows_answer_alike_at_the_service_and_the_scripted_switch() {
-    on_flow_stack(test_flows_answer_alike_at_the_service_and_the_scripted_switch_body);
-}
-
-async fn test_flows_answer_alike_at_the_service_and_the_scripted_switch_body() {
+#[tokio::test]
+async fn test_flows_answer_alike_at_the_service_and_the_scripted_switch() {
     let Some(all) = comparisons().await else {
         return;
     };
@@ -136,12 +108,8 @@ fn test_allowed_differences_name_flows_that_exist() {
 
 /// An entry for every flow, such as the one for member order, shows in one flow at least:
 /// like a flow's own entries, it can't stay in the list once the difference is gone.
-#[test]
-fn test_allowed_differences_for_every_flow_show_in_one() {
-    on_flow_stack(test_allowed_differences_for_every_flow_show_in_one_body);
-}
-
-async fn test_allowed_differences_for_every_flow_show_in_one_body() {
+#[tokio::test]
+async fn test_allowed_differences_for_every_flow_show_in_one() {
     let Some(all) = comparisons().await else {
         return;
     };
@@ -156,12 +124,8 @@ async fn test_allowed_differences_for_every_flow_show_in_one_body() {
 
 /// A switch that answers differently, where the client itself accepts the answer, fails the
 /// comparison: here a scripted switch whose `GET /apps` shows one more app than it holds.
-#[test]
-fn test_comparison_fails_a_scripted_switch_that_answers_differently() {
-    on_flow_stack(test_comparison_fails_a_scripted_switch_that_answers_differently_body);
-}
-
-async fn test_comparison_fails_a_scripted_switch_that_answers_differently_body() {
+#[tokio::test]
+async fn test_comparison_fails_a_scripted_switch_that_answers_differently() {
     let Some(service) = service_trace("join").await else {
         return;
     };
@@ -187,12 +151,8 @@ async fn test_comparison_fails_a_scripted_switch_that_answers_differently_body()
 }
 
 /// So does one that leaves a header out.
-#[test]
-fn test_comparison_fails_a_scripted_switch_that_leaves_the_head_out() {
-    on_flow_stack(test_comparison_fails_a_scripted_switch_that_leaves_the_head_out_body);
-}
-
-async fn test_comparison_fails_a_scripted_switch_that_leaves_the_head_out_body() {
+#[tokio::test]
+async fn test_comparison_fails_a_scripted_switch_that_leaves_the_head_out() {
     let Some(service) = service_trace("enrollment").await else {
         return;
     };
@@ -237,15 +197,8 @@ fn is_get_apps(request: &Request) -> bool {
 /// A scripted switch that answers a wrong signature, hash or certificate hash of the right
 /// length fails the comparison: the string isn't the one the run showed before, where the
 /// service's is. Each of the three is swapped in the `join` flow's `GET /apps` answers.
-#[test]
-fn test_comparison_fails_a_scripted_switch_that_answers_another_string_of_the_same_length() {
-    on_flow_stack(
-        test_comparison_fails_a_scripted_switch_that_answers_another_string_of_the_same_length_body,
-    );
-}
-
-async fn test_comparison_fails_a_scripted_switch_that_answers_another_string_of_the_same_length_body()
- {
+#[tokio::test]
+async fn test_comparison_fails_a_scripted_switch_that_answers_another_string_of_the_same_length() {
     let Some(service) = service_trace("join").await else {
         return;
     };
@@ -354,12 +307,8 @@ fn replace_chain_hashes(value: &mut serde_json::Value) {
 /// like the service's in the comparison: every hash repeats where the right one would. The
 /// harness's own checks fail it: the stubs' chain hashes don't follow from their envelopes,
 /// and the heads and proofs don't verify.
-#[test]
-fn test_checks_fail_a_scripted_switch_with_a_wrong_but_consistent_chain() {
-    on_flow_stack(test_checks_fail_a_scripted_switch_with_a_wrong_but_consistent_chain_body);
-}
-
-async fn test_checks_fail_a_scripted_switch_with_a_wrong_but_consistent_chain_body() {
+#[tokio::test]
+async fn test_checks_fail_a_scripted_switch_with_a_wrong_but_consistent_chain() {
     let Some(service) = service_trace("join").await else {
         return;
     };
@@ -430,12 +379,8 @@ fn test_calls_list_names_each_call_once() {
 /// the caller. So a request no key signs tells whether a call is served: a served call must
 /// be listed in `flow_of`, under a flow that sends it or as waiting for one, and a call
 /// listed under a flow must be served and sent by it.
-#[test]
-fn test_every_served_call_is_listed_and_sent_by_its_flow() {
-    on_flow_stack(test_every_served_call_is_listed_and_sent_by_its_flow_body);
-}
-
-async fn test_every_served_call_is_listed_and_sent_by_its_flow_body() {
+#[tokio::test]
+async fn test_every_served_call_is_listed_and_sent_by_its_flow() {
     let Some(all) = comparisons().await else {
         return;
     };
@@ -447,6 +392,25 @@ async fn test_every_served_call_is_listed_and_sent_by_its_flow_body() {
         let lines = comparison.service.lines.iter();
         lines.filter_map(|line| line.call).collect()
     };
+    // On a flow's own stack, as every flow runs.
+    let (failures, waiting) =
+        on_flow_stack(async || served_calls(&sent_by).await).expect("a thread for the flow");
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    // The served calls still waiting for a flow: this list shrinks to nothing as the flows
+    // land, and a call that starts being served must be added to it or given a flow.
+    assert_eq!(
+        waiting,
+        Vec::<String>::new(),
+        "the served calls no flow sends yet"
+    );
+}
+
+/// Ask the service for every call of [`CALLS`] with a request no key signs, in a world
+/// where alice is enrolled: the calls that fail their listing, and the served calls no flow
+/// sends yet. `sent_by` gives the calls a flow sent.
+async fn served_calls(
+    sent_by: &(impl Fn(&str) -> BTreeSet<&'static str> + Sync),
+) -> (Vec<String>, Vec<String>) {
     let world = World::start(Backend::Service)
         .expect("a world")
         .expect("a database");
@@ -478,12 +442,5 @@ async fn test_every_served_call_is_listed_and_sent_by_its_flow_body() {
         }
     }
     world.close().await.expect("closed");
-    assert!(failures.is_empty(), "{}", failures.join("\n"));
-    // The served calls still waiting for a flow: this list shrinks to nothing as the flows
-    // land, and a call that starts being served must be added to it or given a flow.
-    assert_eq!(
-        waiting,
-        Vec::<String>::new(),
-        "the served calls no flow sends yet"
-    );
+    (failures, waiting)
 }
