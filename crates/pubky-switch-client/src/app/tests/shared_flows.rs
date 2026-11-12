@@ -5565,6 +5565,31 @@ async fn test_records_update_waits_for_the_key_of_a_held_value() {
     assert_eq!(s.w.switch.record(&key).unwrap().state.version, held);
 }
 
+/// An explicit write overwrites a value held unopened for want of its key: the caller saw
+/// it in `content` and chose to, and the write builds on the version held.
+#[tokio::test]
+async fn test_records_explicit_write_overwrites_a_value_waiting_for_its_key() {
+    for delete in [false, true] {
+        let s = Setup::new();
+        let mut wallet = s.join("wallet").await;
+        let mut phone = s.join("phone").await;
+        let target = record_waiting_for_an_older_key(&s, &mut wallet, &mut phone).await;
+        let key = wallet.record_key(&target).unwrap();
+        let held = s.w.switch.record(&key).unwrap().state.version;
+        let written = if delete {
+            wallet.delete_record(&target, vec![]).await.unwrap()
+        } else {
+            wallet
+                .put_record(&target, &value(&["mine"]), vec![])
+                .await
+                .unwrap()
+        };
+        let expected: Vec<&str> = if delete { vec![] } else { vec!["mine"] };
+        assert_eq!(ids(written.content.value()), expected, "delete: {delete}");
+        assert!(s.w.switch.record(&key).unwrap().state.version > held);
+    }
+}
+
 /// A message's record job waits the same way: the message is delivered, the record left
 /// as it is until the key arrives.
 #[tokio::test]
