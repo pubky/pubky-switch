@@ -1007,3 +1007,182 @@ pub async fn provider_loss_restored(world: &World) -> FlowResult {
     }
     Ok(())
 }
+
+/// A restore in the middle of a recovery in place (Switch spec 12.6 step 1, 12.8, Switch
+/// wire 3.13). alice's service still serves, and her signer declares its generation lost
+/// there. The enrollment is answered with a pending key, and the recovery's first document
+/// doesn't arrive. The install is gone then; a new one is restored from the signer backup
+/// on the Homeserver, which holds that document. The restore delivers it, which starts the
+/// account afresh under the pending key, and then the version naming the new install. The
+/// wallet follows the recovery, and the new install signs on.
+///
+/// Calls: `PUT /v1/{id}/identity` naming a pending key, sent by a restored install, and the
+/// version naming that install after it.
+///
+/// # Errors
+///
+/// When a step that should succeed against any switch fails, a fault met no request, or
+/// the restore ends otherwise than at the next generation with the new install signing.
+pub async fn provider_loss_in_place_restored(world: &World) -> FlowResult {
+    let alice = world.identity("alice")?;
+    world.add_switch(ORIGIN, &[&alice]).await?;
+    let mut signer = enroll(world, &alice, ORIGIN).await?;
+    let (mut wallet, _) = joined(world, &alice, &mut signer, "wallet").await?;
+    let before = signer
+        .identity_doc()?
+        .ok_or("the signer holds no document")?;
+
+    world.unreachable("PUT", "/identity");
+    let declared = signer
+        .declare_provider_loss(ORIGIN, UserConfirmed::shown_and_confirmed())
+        .await;
+    world.outcome(
+        "the signer declared the loss in place, and its document didn't arrive",
+        &json!({ "ended": ended(&declared), "signer": status(&signer)? }),
+    );
+    if declared.is_ok() || world.faults_left() != 0 {
+        return Err("the recovery's document wasn't cut off".into());
+    }
+    world.advance_ms(STEP_MS);
+    drop(signer);
+
+    // A new install, from the backup on the Homeserver.
+    let env = world.signer_env(&alice, Arc::new(MemoryStore::new()))?;
+    let mut restored = Signer::restore_new(
+        env,
+        world.keyring(&alice)?,
+        UserConfirmed::shown_and_confirmed(),
+    )
+    .await?;
+    let newest = restored
+        .identity_doc()?
+        .ok_or("the restored install holds no document")?;
+    world.outcome(
+        "a new install was restored: it completed the recovery in place",
+        &json!({
+            "generation": newest.generation(),
+            "recovery_from": newest.body().recovery_from,
+            "version_steps": newest.version() - before.version(),
+            "names_the_new_install": newest.body().signer == restored.install_id(),
+            "signer": status(&restored)?,
+        }),
+    );
+    let published = world
+        .files()
+        .identity_doc(&alice.public())
+        .map(|doc| doc.version());
+    if newest.generation() != before.generation() + 1
+        || newest.version() != before.version() + 2
+        || newest.body().signer != restored.install_id()
+        || restored.status() != SignerStatus::Signing
+        || published != Some(newest.version())
+    {
+        return Err(format!(
+            "the restore ended at generation {} and version {}, published {published:?}, \
+             the install {:?}",
+            newest.generation(),
+            newest.version(),
+            restored.status()
+        )
+        .into());
+    }
+    world.advance_ms(STEP_MS);
+
+    // The wallet's upload, with no contact to bring, ends the staged admission.
+    follow_recovery(world, &mut wallet, "wallet", 1).await?;
+    expect_upload(world, "wallet", false)?;
+    restored.run_due().await?;
+    world.outcome("the restored install ran what is due", &status(&restored)?);
+    expect_staged(world, false)?;
+    world.advance_ms(STEP_MS);
+    let next = restored.set_record_max_age(Some(60)).await?;
+    world.outcome(
+        "the restored install signed on",
+        &recovered(&next, &restored)?,
+    );
+    Ok(())
+}
+
+/// A recovery refused at the origin the identity was enrolled at (Switch spec 12.6 step 1,
+/// Switch wire 3.3, 7.4.1). alice lists two apps. Her provider loses what it held and
+/// serves again at the same origin, empty, and now takes one app an account. Her signer
+/// declares the loss there: the service knows no account for her, so the enrollment is
+/// answered with a new account's key, not the one the signer had pinned for this origin.
+/// The recovery's first document lists two apps and is refused, under that new key. The
+/// signer takes the refusal for the service's word: it shows the recovery as refused
+/// there and sends nothing more. Declared again at another service, the recovery
+/// completes.
+///
+/// Calls: `POST /v1/enroll` at an origin whose service lost the account, and `PUT
+/// /v1/{id}/identity` refused there for the app limit (`400 bad_request`), signed with the
+/// key the enrollment named.
+///
+/// # Errors
+///
+/// When a step that should succeed against any switch fails, the refusal isn't the
+/// service's under the new account's key, or the signer doesn't end as refused there, or
+/// sends something after it.
+pub async fn provider_loss_same_origin_refused(world: &World) -> FlowResult {
+    let alice = world.identity("alice")?;
+    world.add_switch(ORIGIN, &[&alice]).await?;
+    let mut signer = enroll(world, &alice, ORIGIN).await?;
+    let (_wallet, _) = joined(world, &alice, &mut signer, "wallet").await?;
+    let (_phone, _) = joined(world, &alice, &mut signer, "phone").await?;
+
+    // The same origin, served again with nothing of what it held.
+    world.lose_switch(ORIGIN);
+    let one_app = Limits {
+        app_limit: 1,
+        ..Limits::default()
+    };
+    world.add_switch_with(ORIGIN, &[&alice], one_app).await?;
+    let refused = signer
+        .declare_provider_loss(ORIGIN, UserConfirmed::shown_and_confirmed())
+        .await;
+    world.outcome(
+        "the service, empty at the same origin, refused the recovery",
+        &json!({ "ended": ended(&refused), "signer": status(&signer)? }),
+    );
+    // The refusal is the service's own, signed with the key its enrollment answer named:
+    // the account's key number two of the run, whose document was never taken.
+    let delivery = "{alice} PUT /v1/{alice}/identity";
+    expect_answer(world, delivery, 400, "bad_request")?;
+    let enrolled_under = world
+        .last_answer("{alice} POST /v1/enroll")
+        .map(|[_, _, key]| key);
+    let refused_under = world.last_answer(delivery).map(|[_, _, key]| key);
+    let shown = signer.status();
+    if refused_under != enrolled_under
+        || refused_under.as_deref() == Some("the operator key")
+        || refused_under.is_none()
+        || !matches!(&shown, SignerStatus::RecoveryRefused { origin } if origin == ORIGIN)
+    {
+        return Err(format!(
+            "the refusal is signed with {refused_under:?}, the enrollment's answer with \
+             {enrolled_under:?}, and the signer is {shown:?}"
+        )
+        .into());
+    }
+    world.advance_ms(STEP_MS);
+    // Refused, the recovery waits to be declared again: a run sends nothing.
+    let sent = world.requests_sent();
+    let waiting = signer.resume().await;
+    if world.requests_sent() != sent {
+        return Err("the signer sent something while its recovery was refused".into());
+    }
+    world.outcome(
+        "the signer's next run, the recovery refused",
+        &json!({ "ended": ended(&waiting), "signer": status(&signer)? }),
+    );
+    world.advance_ms(STEP_MS);
+
+    world.add_switch(RECOVERY_ORIGIN, &[&alice]).await?;
+    let doc = signer
+        .declare_provider_loss(RECOVERY_ORIGIN, UserConfirmed::shown_and_confirmed())
+        .await?;
+    world.outcome(
+        "the signer declared the loss again, elsewhere",
+        &recovered(&doc, &signer)?,
+    );
+    Ok(())
+}

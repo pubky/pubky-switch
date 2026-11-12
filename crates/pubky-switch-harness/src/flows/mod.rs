@@ -65,9 +65,10 @@ pub use own_record::own_record;
 pub use pages::pages;
 pub use records::records;
 pub use recovery::{
-    provider_loss, provider_loss_in_place, provider_loss_in_place_sender,
-    provider_loss_refusals_in_transit, provider_loss_refused, provider_loss_restored,
-    provider_loss_revocation_meanwhile, provider_loss_sender_admitted,
+    provider_loss, provider_loss_in_place, provider_loss_in_place_restored,
+    provider_loss_in_place_sender, provider_loss_refusals_in_transit, provider_loss_refused,
+    provider_loss_restored, provider_loss_revocation_meanwhile, provider_loss_same_origin_refused,
+    provider_loss_sender_admitted,
 };
 pub use reduction::{reduction_unpublished, renewal_drops_scope};
 pub use removal::{departure, revocation};
@@ -212,6 +213,12 @@ pub const FLOWS: &[(&str, Flow)] = &[
     }),
     ("provider loss, restored", |world| {
         Box::pin(provider_loss_restored(world))
+    }),
+    ("provider loss in place, restored", |world| {
+        Box::pin(provider_loss_in_place_restored(world))
+    }),
+    ("provider loss, refused at the same origin", |world| {
+        Box::pin(provider_loss_same_origin_refused(world))
     }),
     ("provider loss, a revocation asked meanwhile", |world| {
         Box::pin(provider_loss_revocation_meanwhile(world))
