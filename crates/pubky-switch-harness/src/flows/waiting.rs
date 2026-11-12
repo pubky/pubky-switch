@@ -10,7 +10,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::Duration;
 
-use pubky_switch_client::app::{App, AppConfig, RecordTarget, Woken};
+use pubky_switch_client::app::{App, AppConfig, AppError, RecordTarget, Woken};
+use pubky_switch_client::error::ClientError;
 use pubky_switch_core::records::IDENTITY_PATH;
 use pubky_switch_signer::UserConfirmed;
 use serde_json::json;
@@ -435,7 +436,8 @@ pub async fn waiting_read_revoked(world: &World) -> FlowResult {
 /// When a step that should succeed against any switch fails, the switch answers the read
 /// without holding it or leaves it held, the read is answered otherwise than `503
 /// unavailable` under the operator key with no head, the watch takes that answer for more
-/// than a failed read, or its next read isn't the new chain's first item.
+/// than a read that failed for its signature, or its next read isn't the new chain's
+/// first item.
 pub async fn waiting_read_recovered(world: &World) -> FlowResult {
     let alice = world.identity("alice")?;
     world.add_switch(ORIGIN, &[&alice]).await?;
@@ -537,8 +539,15 @@ pub async fn waiting_read_recovered(world: &World) -> FlowResult {
     }
     // The watch takes that answer for nothing of the account's: its read ends in an error,
     // it raises no event, and it stands where it stood, in the generation it knew.
+    // The error is the answer's own: a `503` whose signature isn't the account's.
     let stands = watch.cursor().generation;
-    if report.is_ok() || !raised.is_empty() || stands != 1 {
+    let unsigned_for_it = matches!(
+        report.as_ref().map_err(AppError::unkept),
+        Err(AppError::Switch(ClientError::BadServiceSignature {
+            status: 503
+        }))
+    );
+    if !unsigned_for_it || !raised.is_empty() || stands != 1 {
         return Err(format!(
             "the watch's read ended {} with the events {:?}, and it stands in generation \
              {stands}",
@@ -592,7 +601,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_a_future_no_one_woke_is_not_polled_when_the_other_moves() {
+    async fn test_own_wake_pair_leaves_a_future_no_one_woke_unpolled() {
         let polls = Cell::new(0);
         let moves = async {
             for _ in 0..10 {
@@ -606,7 +615,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_each_future_runs_to_its_end_on_its_own_wakes() {
+    async fn test_own_wake_pair_runs_each_future_to_its_end() {
         let counts = async {
             let mut steps = 0;
             for _ in 0..3 {
@@ -619,6 +628,9 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
             "slept"
         };
-        assert_eq!(each_on_its_own_wake(counts, sleeps).await, (3, "slept"));
+        // A wrapper that never polled a future again would wait for good.
+        let both = each_on_its_own_wake(counts, sleeps);
+        let ended = tokio::time::timeout(Duration::from_secs(10), both).await;
+        assert_eq!(ended.ok(), Some((3, "slept")));
     }
 }
