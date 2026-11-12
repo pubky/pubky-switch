@@ -270,8 +270,9 @@ impl App {
 
     /// Whether a restore asks the user about the registration `n` whose kid no device of
     /// the app made (Switch spec 12.4 "Registrations since the backup"): one after the
-    /// backup's newest key, and before the key the restored app registered itself, while
-    /// the restore is held. The one rule wherever such a registration is met: the restore's
+    /// backup's newest key, while the restore is held, and, once the restore's key check
+    /// has run, below the bound it set: the key it registered, or one above the backup's
+    /// newest when the restored key was current, so nothing is asked about then. The one rule wherever such a registration is met: the restore's
     /// key check, the feed, a registration conflict (a fresh key's, a provider loss's), the
     /// re-registration after a move or a key change in place, and the device sync. Such a
     /// registration is unaccounted, and only the user's "no" makes it a compromise
@@ -503,9 +504,12 @@ impl App {
                     .ok_or_else(|| AppError::InvalidData("receive key numbers ran out".into()))?,
             );
         }
+        // The check closes what the restore asks about at what it saw: up to the key it
+        // registers, or, with the restored key current, nothing above the backup's newest
+        // (Switch spec 12.4). A registration met later is judged as at any time.
         if let Some(state) = self.state.restore.as_mut() {
             state.key_checked = true;
-            state.own_key_n = register;
+            state.own_key_n = Some(register.unwrap_or(restore.n_floor.saturating_add(1)));
             tx.put(key::RESTORE, state)?;
         }
         self.commit(tx).await?;

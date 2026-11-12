@@ -1884,7 +1884,12 @@ impl App {
             }
             self.refuse_before_upload().await?;
             let mut tx = self.tx()?;
-            if let Some(restore) = self.state.restore.as_mut() {
+            // With its key check done and nothing left to ask, the restore is over: its
+            // record goes, and no registration is judged by the restore rule again.
+            let over = self.state.restore.as_ref().is_some_and(|r| r.key_checked);
+            if over {
+                tx.delete(key::RESTORE)?;
+            } else if let Some(restore) = self.state.restore.as_mut() {
                 restore.reconcile = false;
                 tx.put(key::RESTORE, restore)?;
             }
@@ -1892,7 +1897,11 @@ impl App {
                 chain.gap = None;
                 chain.write(&mut tx)?;
             }
-            self.commit(tx).await
+            self.commit(tx).await?;
+            if over {
+                self.state.restore = None;
+            }
+            Ok(())
         })
         .await
     }
