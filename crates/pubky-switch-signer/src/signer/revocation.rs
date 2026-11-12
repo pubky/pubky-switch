@@ -30,12 +30,12 @@ use pubky_switch_client::ClientError;
 use pubky_switch_client::client::answers::AppStatus;
 use pubky_switch_core::ops::OpKind;
 use pubky_switch_core::records::{
-    IdentityDoc, RemovedApp, SIGNER_BACKUP_PATH, app_record_path, seal_bundle_parts,
+    IdentityDoc, ListedApp, RemovedApp, SIGNER_BACKUP_PATH, app_record_path, seal_bundle_parts,
 };
 
-use super::Signer;
 use super::clients::Named;
 use super::renewal::{Op, keyed, push_parts};
+use super::{FULL_BUNDLES_PER_RUN, RECORD_DELETIONS_PER_RUN, Signer};
 use crate::alert::Alert;
 use crate::error::{Refusal, Result, SignerError};
 use crate::state::{Flow, RefusedRequest, RenewBatch, Revoking};
@@ -575,6 +575,8 @@ impl Signer {
             .copied()
             // Once no version lists the app: removed, or purged from `removed` since.
             .filter(|app| newest.listed_cert(app).is_none())
+            // A bounded number each run; the rest stay owed for the next.
+            .take(RECORD_DELETIONS_PER_RUN)
             .collect();
         // The grant reminder is raised once for each owed deletion, whether or not the record
         // goes now; a deletion that fails stays owed, and doesn't hold back the next app's.
@@ -629,7 +631,8 @@ impl Signer {
     /// again, at the same version. Returns the apps answered.
     ///
     /// An app whose certificate holds a scope no registered protocol owns gets nothing, with
-    /// [`Alert::RotationSkipped`] (design note, decision 2).
+    /// [`Alert::RotationSkipped`] (design note, decision 2). At most four requests are
+    /// answered in one call, the oldest first; the others at the next run.
     ///
     /// # Errors
     ///
@@ -644,16 +647,25 @@ impl Signer {
         let protocols = self.env.protocols.clone();
         let keyed = keyed(&protocols);
         let key = self.signing_key()?;
-        // One flow for each app, so a refused one doesn't hold back the others.
+        // One flow for each app, so a refused one doesn't hold back the others. The oldest
+        // requests first, and at most `FULL_BUNDLES_PER_RUN` of them: the rest are answered
+        // at the next run, and an app asking again goes behind the others.
         let mut requests: Vec<(RefusedRequest, Vec<Op>)> = Vec::new();
         let mut alerts = Vec::new();
-        for listed in &newest.body().apps {
-            let Some(status) = statuses.iter().find(|s| s.app_id == listed.app_id) else {
-                continue;
-            };
-            let Some(requested) = status.full_bundle_requested else {
-                continue;
-            };
+        let mut asking: Vec<(&ListedApp, &AppStatus, u64)> = newest
+            .body()
+            .apps
+            .iter()
+            .filter_map(|listed| {
+                let status = statuses.iter().find(|s| s.app_id == listed.app_id)?;
+                Some((listed, status, status.full_bundle_requested?))
+            })
+            .collect();
+        asking.sort_by_key(|(_, _, requested)| *requested);
+        for (listed, status, requested) in asking {
+            if requests.len() >= FULL_BUNDLES_PER_RUN {
+                break;
+            }
             let request = RefusedRequest {
                 app_id: listed.app_id,
                 requested,

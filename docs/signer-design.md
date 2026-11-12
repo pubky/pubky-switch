@@ -212,6 +212,8 @@ Two exceptions:
 
 It returns a report and refreshes the alerts.
 
+A run is bounded, so the host may call it often and never waits on it for long. Each step does a bounded amount, the rest left for the next run: at most four renewals in step 7, the soonest to expire first; four full-bundle answers in step 6, the oldest requests first, an app asking again going behind the others; 32 record deletions; 32 checks of owed deletions. Once 30 seconds have passed on the device clock since the run began, it starts none of steps 5, 6, 7 and 9: the removals of step 4 always run, since cutting an app off is the safe step. A flow it started finishes, or is resumed by the next run. How long one request may take is the host's, through its Pubky client's timeout, so a run takes at most its bounded number of requests times that.
+
 ### 4.6 The `StateStore` trait (proposal)
 
 `pubky-switch-client` defines the trait, and the signer uses it. The host app implements it once per install, for example on SQLite.

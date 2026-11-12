@@ -48,7 +48,7 @@ use pubky_switch_core::records::{
 use pubky_switch_core::scopes::Permission;
 use pubky_switch_core::sig::SignedDoc;
 
-use super::Signer;
+use super::{RENEWALS_PER_RUN, Signer};
 use crate::alert::{Alert, RenewalSkip};
 use crate::error::{Refusal, Result, SignerError};
 use crate::key::SigningKey;
@@ -814,10 +814,18 @@ impl Signer {
     /// newest version again where the Homeserver's copy is older, missing or unreadable
     /// (Switch wire 3.3).
     ///
+    /// A run is bounded, so the host can call it often and never waits long on it. Each step
+    /// does a bounded amount: at most four renewals, four full-bundle answers and 32 record
+    /// deletions, the rest left for the next run. And once 30 seconds have passed on the
+    /// device clock since the run began, no further step starts: the removals always run,
+    /// since cutting an app off is the safe step, and the steps after them wait for the next
+    /// run. How long one request may take is the host's, through its Pubky client's timeout.
+    ///
     /// # Errors
     ///
     /// As [`Signer::resume`].
     pub async fn run_due(&mut self) -> Result<()> {
+        let began = self.env.clock.now_ms();
         // While a hand-over or a take-over is in progress, only its own step runs: nothing
         // routine is signed, and what is owed stays owed (Switch wire 3.12).
         self.refresh().await?;
@@ -840,10 +848,23 @@ impl Signer {
             return resumed;
         }
         self.complete_removals().await?;
-        self.complete_renewals().await?;
-        self.serve_full_bundles().await?;
-        self.renew_expiring().await?;
-        self.republish().await?;
+        // The later steps start only within the run's time, and the next run does the rest.
+        for step in [
+            Later::Closings,
+            Later::FullBundles,
+            Later::Renewals,
+            Later::Publication,
+        ] {
+            if self.env.clock.now_ms().saturating_sub(began) >= super::RUN_DUE_STEPS_MS {
+                break;
+            }
+            match step {
+                Later::Closings => drop(self.complete_renewals().await?),
+                Later::FullBundles => drop(self.serve_full_bundles().await?),
+                Later::Renewals => drop(self.renew_expiring().await?),
+                Later::Publication => self.republish().await?,
+            }
+        }
         resumed
     }
 
@@ -874,6 +895,8 @@ impl Signer {
     ///   [`Alert::RenewalSkipped`] naming why (design note, decision 2). A refusal that
     ///   concerns one app only doesn't hold back the others.
     /// - [`Alert::ClockOff`] clears itself at the first run that finds the clocks agreeing.
+    /// - At most four are renewed in one call, the soonest to expire first; the others are
+    ///   renewed at the next run, which half a lifetime leaves ample time for.
     ///
     /// # Errors
     ///
@@ -960,6 +983,7 @@ impl Signer {
                 None => due.push((
                     listed.app_id,
                     cert.expires_at().saturating_sub(cert.issued_at()),
+                    cert.expires_at(),
                 )),
             }
         }
@@ -986,8 +1010,11 @@ impl Signer {
         if state != self.state {
             self.commit(state, None).await?;
         }
+        // The soonest to expire first, a bounded number each run: the rest are due at the next.
+        due.sort_by_key(|(_, _, expires_at)| *expires_at);
+        due.truncate(RENEWALS_PER_RUN);
         let mut renewed = Vec::new();
-        for (app_id, lifetime) in due {
+        for (app_id, lifetime, _) in due {
             self.ready().await?;
             let by = RenewedBy::Automatic { lifetime };
             match self
@@ -1211,4 +1238,14 @@ pub(super) fn keep_asked_with_alerts(state: &mut SignerState) {
                 if *app_id == asked.app_id)
         })
     });
+}
+
+/// The steps of [`Signer::run_due`] after the removals, in their order: each starts only
+/// within the run's time.
+#[derive(Clone, Copy)]
+enum Later {
+    Closings,
+    FullBundles,
+    Renewals,
+    Publication,
 }

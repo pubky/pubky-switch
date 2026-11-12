@@ -1983,6 +1983,25 @@ pub(super) fn version_size(
 /// reduction closing then blocks every signing step.
 const CAP_HEADROOM: usize = 16;
 
+/// The most certificates one call renews by itself, the soonest to expire first: the rest are
+/// renewed at the next run, which half a lifetime leaves months for (design note, section
+/// 4.5). Each renewal is a few requests: its read, its `cert.put` and key bundle parts, its
+/// delivery and its publication.
+pub(crate) const RENEWALS_PER_RUN: usize = 4;
+
+/// The most full-bundle requests one call answers, the oldest first: the rest are answered at
+/// the next run, and an app asking again goes behind the others (design note, section 4.5).
+pub(crate) const FULL_BUNDLES_PER_RUN: usize = 4;
+
+/// The most removed apps' records one call deletes from the Homeserver, each one request: the
+/// rest stay owed, deleted at the next run (design note, section 4.5).
+pub(crate) const RECORD_DELETIONS_PER_RUN: usize = 32;
+
+/// How long, on the device clock, [`Signer::run_due`] goes on starting its later steps: once
+/// this has passed since the run began, it starts none, and they come at the next run. The
+/// step in progress finishes its unit of work; each step's own work is bounded too.
+pub(crate) const RUN_DUE_STEPS_MS: u64 = 30_000;
+
 /// How much room a version must leave under the cap.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Room {
