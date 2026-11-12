@@ -8,7 +8,9 @@ use std::time::Duration;
 use pubky_switch_client::app::App;
 use pubky_switch_client::store::MemoryStore;
 use pubky_switch_client::testing::TestIdentity;
-use pubky_switch_signer::{AbortOutcome, ReceivingApp, Signer, SignerStatus, UserConfirmed};
+use pubky_switch_signer::{
+    AbortOutcome, ReceivingApp, Refusal, Signer, SignerError, SignerStatus, UserConfirmed,
+};
 use serde_json::{Value, json};
 
 use super::enrollment::{enroll, status};
@@ -275,7 +277,7 @@ pub async fn hand_over_abort_late(world: &World) -> FlowResult {
 /// # Errors
 ///
 /// When a step that should succeed against any switch fails, the take-over isn't
-/// refused, or the abort doesn't win.
+/// refused or doesn't end as cancelled, or the abort doesn't win.
 pub async fn hand_over_take_over_late(world: &World) -> FlowResult {
     let alice = world.identity("alice")?;
     world.add_switch(ORIGIN, &[&alice]).await?;
@@ -316,13 +318,18 @@ pub async fn hand_over_take_over_late(world: &World) -> FlowResult {
         }),
     );
     expect_delivery_refused(world)?;
-    if taken.is_ok()
+    // The take-over ends as cancelled: the copy its refusal carries is the abort's.
+    let cancelled = matches!(
+        &taken,
+        Err(SignerError::Refused(Refusal::TakeOverCancelled))
+    );
+    if !cancelled
         || !matches!(aborted, Ok(AbortOutcome::Aborted { .. }))
         || old.status() != SignerStatus::Signing
     {
         return Err(format!(
-            "the take-over ended ok: {}, the abort {}, and the old install is {:?}",
-            taken.is_ok(),
+            "the take-over ended {}, the abort {}, and the old install is {:?}",
+            ended(&taken.as_ref().map(|_| ())),
             ended(&aborted),
             old.status()
         )

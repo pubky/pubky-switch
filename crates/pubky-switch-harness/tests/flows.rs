@@ -16,7 +16,9 @@ use pubky_switch_core::enc::{b64, unb64};
 use pubky_switch_harness::allowed::{ALLOWED, EVERY_FLOW};
 use pubky_switch_harness::compare::{Difference, differences, judge};
 use pubky_switch_harness::flows::{self, CALLS, FLOWS, ORIGIN, flow_of};
-use pubky_switch_harness::{Backend, Comparison, FlowResult, Trace, World, compare_backends, run};
+use pubky_switch_harness::{
+    Backend, Comparison, FlowResult, Trace, World, compare_backends, on_flow_stack, run,
+};
 use tokio::sync::OnceCell;
 
 /// Every flow's comparison, made once for the tests of this file; `None` when no test
@@ -67,7 +69,7 @@ async fn service_trace(name: &str) -> Option<&'static Trace> {
 /// What `flow` shows against a scripted switch whose answers the trace keeps as `distort`
 /// changes them.
 async fn distorted(
-    flow: impl AsyncFn(&World) -> FlowResult,
+    flow: impl AsyncFn(&World) -> FlowResult + Sync,
     distort: fn(&Request, &mut Response),
 ) -> Trace {
     run(Backend::Scripted, async |world| {
@@ -390,6 +392,29 @@ async fn test_every_served_call_is_listed_and_sent_by_its_flow() {
         let lines = comparison.service.lines.iter();
         lines.filter_map(|line| line.call).collect()
     };
+    // On a flow's own stack, as every flow runs.
+    let (failures, waiting) =
+        on_flow_stack(async || served_calls(&sent_by).await).expect("a thread for the flow");
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    // The served calls still waiting for a flow: this list shrinks to nothing as the flows
+    // land, and a call that starts being served must be added to it or given a flow.
+    assert_eq!(
+        waiting,
+        [
+            "POST /v1/{id}/connect",
+            "GET /v1/{id}/connect",
+            "DELETE /v1/{id}/connect/{key}",
+        ],
+        "the served calls no flow sends yet"
+    );
+}
+
+/// Ask the service for every call of [`CALLS`] with a request no key signs, in a world
+/// where alice is enrolled: the calls that fail their listing, and the served calls no flow
+/// sends yet. `sent_by` gives the calls a flow sent.
+async fn served_calls(
+    sent_by: &(impl Fn(&str) -> BTreeSet<&'static str> + Sync),
+) -> (Vec<String>, Vec<String>) {
     let world = World::start(Backend::Service)
         .expect("a world")
         .expect("a database");
@@ -421,16 +446,5 @@ async fn test_every_served_call_is_listed_and_sent_by_its_flow() {
         }
     }
     world.close().await.expect("closed");
-    assert!(failures.is_empty(), "{}", failures.join("\n"));
-    // The served calls still waiting for a flow: this list shrinks to nothing as the flows
-    // land, and a call that starts being served must be added to it or given a flow.
-    assert_eq!(
-        waiting,
-        [
-            "POST /v1/{id}/connect",
-            "GET /v1/{id}/connect",
-            "DELETE /v1/{id}/connect/{key}",
-        ],
-        "the served calls no flow sends yet"
-    );
+    (failures, waiting)
 }
