@@ -334,8 +334,9 @@ switch and the service shows there:
 - publication put right, the alarm for another document on the Homeserver and its
   clearing, another install signing, and records behind (`flows.rs`);
 - restore from the signer backup, in place and on a new install, with a version never
-  delivered and with a revocation only the switch holds, and two installs restored at
-  once, the second delivery refused `409 stale_identity` (`restore.rs`);
+  delivered and with a revocation only the switch holds (`restore.rs`); two installs
+  restored at once, the second delivery refused `409 stale_identity`, which the signer's
+  own tests don't run;
 - the hand-over both ways, its abort, and the abort racing the take-over with either
   arriving first (`handover.rs`), the account's erasure and its
   lost answer (`erasure.rs`), and the provider loss: declared at a new service and in
@@ -351,9 +352,12 @@ What stays only on the scripted switch, and why:
 - **A switch that misbehaves.** A removal time reported before the app was listed or after
   the answer that reports it; a copy of `identity.json` that doesn't verify, is older than
   the signer's mark, or has another body at it; an answer signed with the wrong key or
-  with a member left out; a delivery refused `413 too_large`, which no conforming signer
-  meets at the service. The service does none of these, so only a scripted fault shows
+  with a member left out. The service does none of these, so only a scripted fault shows
   what the signer does about them.
+- **A delivery refused for good,** other than a recovery's version over the service's app
+  limit: a `400` to any other version (an ordinary or a renewing version, a restore's next
+  version), a take-over refused, or a `413 too_large`. No conforming signer meets these at
+  the service, so the tests script the refusal.
 - **Exact timing.** A crash at each commit of a flow, a store that fails or can't tell
   whether it committed, and an answer lost at one chosen call among several alike: the
   tests place these by a commit's or a request's number.
