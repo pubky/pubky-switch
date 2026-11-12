@@ -1196,7 +1196,10 @@ impl ScriptedSwitch {
                 Some(Fault::SignWith { secret, .. }) => sign_with = Some(secret),
                 Some(Fault::ErrorSignedWith { code, secret, .. }) => {
                     let (status, body) = bad(code, "scripted", Value::Null);
-                    inner.seen(request);
+                    // As for `Fault::Error`: past authentication, the app was seen.
+                    if status != 401 {
+                        inner.seen(request);
+                    }
                     let key = SigningKey::from_bytes(&secret);
                     return Ok(inner.respond_with(&key, request, status, &body));
                 }
