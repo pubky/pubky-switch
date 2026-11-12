@@ -19,6 +19,32 @@ use pubky_switch_harness::flows::{self, CALLS, FLOWS, ORIGIN, flow_of};
 use pubky_switch_harness::{Backend, Comparison, FlowResult, Trace, World, compare_backends, run};
 use tokio::sync::OnceCell;
 
+/// The stack each test of this file runs on. A flow runs a signer, apps and a switch in one
+/// thread, and futures are large in debug builds: the longest flows came within an eighth
+/// of a test thread's default 2 MiB. A thread of its own with more room keeps that margin
+/// from deciding a run; the client's own tests keep the default, so a growth of the
+/// client's stack still shows there.
+const FLOW_STACK_BYTES: usize = 16 * 1024 * 1024;
+
+/// Run a test's body as `#[tokio::test]` would, in a runtime of its own on the current
+/// thread, but on a thread with [`FLOW_STACK_BYTES`] of stack; a panic in it fails the
+/// test.
+fn on_flow_stack<F: std::future::Future<Output = ()> + 'static>(body: fn() -> F) {
+    let thread = std::thread::Builder::new()
+        .stack_size(FLOW_STACK_BYTES)
+        .spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("a runtime")
+                .block_on(body());
+        })
+        .expect("a thread");
+    if let Err(panic) = thread.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
 /// Every flow's comparison, made once for the tests of this file; `None` when no test
 /// database is configured. A flow that fails is kept as the failure: every test that asks
 /// then fails at once with it, and no flow is run again.
@@ -79,8 +105,12 @@ async fn distorted(
     .expect("a scripted world")
 }
 
-#[tokio::test]
-async fn test_flows_answer_alike_at_the_service_and_the_scripted_switch() {
+#[test]
+fn test_flows_answer_alike_at_the_service_and_the_scripted_switch() {
+    on_flow_stack(test_flows_answer_alike_at_the_service_and_the_scripted_switch_body);
+}
+
+async fn test_flows_answer_alike_at_the_service_and_the_scripted_switch_body() {
     let Some(all) = comparisons().await else {
         return;
     };
@@ -106,8 +136,12 @@ fn test_allowed_differences_name_flows_that_exist() {
 
 /// An entry for every flow, such as the one for member order, shows in one flow at least:
 /// like a flow's own entries, it can't stay in the list once the difference is gone.
-#[tokio::test]
-async fn test_allowed_differences_for_every_flow_show_in_one() {
+#[test]
+fn test_allowed_differences_for_every_flow_show_in_one() {
+    on_flow_stack(test_allowed_differences_for_every_flow_show_in_one_body);
+}
+
+async fn test_allowed_differences_for_every_flow_show_in_one_body() {
     let Some(all) = comparisons().await else {
         return;
     };
@@ -122,8 +156,12 @@ async fn test_allowed_differences_for_every_flow_show_in_one() {
 
 /// A switch that answers differently, where the client itself accepts the answer, fails the
 /// comparison: here a scripted switch whose `GET /apps` shows one more app than it holds.
-#[tokio::test]
-async fn test_comparison_fails_a_scripted_switch_that_answers_differently() {
+#[test]
+fn test_comparison_fails_a_scripted_switch_that_answers_differently() {
+    on_flow_stack(test_comparison_fails_a_scripted_switch_that_answers_differently_body);
+}
+
+async fn test_comparison_fails_a_scripted_switch_that_answers_differently_body() {
     let Some(service) = service_trace("join").await else {
         return;
     };
@@ -149,8 +187,12 @@ async fn test_comparison_fails_a_scripted_switch_that_answers_differently() {
 }
 
 /// So does one that leaves a header out.
-#[tokio::test]
-async fn test_comparison_fails_a_scripted_switch_that_leaves_the_head_out() {
+#[test]
+fn test_comparison_fails_a_scripted_switch_that_leaves_the_head_out() {
+    on_flow_stack(test_comparison_fails_a_scripted_switch_that_leaves_the_head_out_body);
+}
+
+async fn test_comparison_fails_a_scripted_switch_that_leaves_the_head_out_body() {
     let Some(service) = service_trace("enrollment").await else {
         return;
     };
@@ -195,8 +237,15 @@ fn is_get_apps(request: &Request) -> bool {
 /// A scripted switch that answers a wrong signature, hash or certificate hash of the right
 /// length fails the comparison: the string isn't the one the run showed before, where the
 /// service's is. Each of the three is swapped in the `join` flow's `GET /apps` answers.
-#[tokio::test]
-async fn test_comparison_fails_a_scripted_switch_that_answers_another_string_of_the_same_length() {
+#[test]
+fn test_comparison_fails_a_scripted_switch_that_answers_another_string_of_the_same_length() {
+    on_flow_stack(
+        test_comparison_fails_a_scripted_switch_that_answers_another_string_of_the_same_length_body,
+    );
+}
+
+async fn test_comparison_fails_a_scripted_switch_that_answers_another_string_of_the_same_length_body()
+ {
     let Some(service) = service_trace("join").await else {
         return;
     };
@@ -305,8 +354,12 @@ fn replace_chain_hashes(value: &mut serde_json::Value) {
 /// like the service's in the comparison: every hash repeats where the right one would. The
 /// harness's own checks fail it: the stubs' chain hashes don't follow from their envelopes,
 /// and the heads and proofs don't verify.
-#[tokio::test]
-async fn test_checks_fail_a_scripted_switch_with_a_wrong_but_consistent_chain() {
+#[test]
+fn test_checks_fail_a_scripted_switch_with_a_wrong_but_consistent_chain() {
+    on_flow_stack(test_checks_fail_a_scripted_switch_with_a_wrong_but_consistent_chain_body);
+}
+
+async fn test_checks_fail_a_scripted_switch_with_a_wrong_but_consistent_chain_body() {
     let Some(service) = service_trace("join").await else {
         return;
     };
@@ -377,8 +430,12 @@ fn test_calls_list_names_each_call_once() {
 /// the caller. So a request no key signs tells whether a call is served: a served call must
 /// be listed in `flow_of`, under a flow that sends it or as waiting for one, and a call
 /// listed under a flow must be served and sent by it.
-#[tokio::test]
-async fn test_every_served_call_is_listed_and_sent_by_its_flow() {
+#[test]
+fn test_every_served_call_is_listed_and_sent_by_its_flow() {
+    on_flow_stack(test_every_served_call_is_listed_and_sent_by_its_flow_body);
+}
+
+async fn test_every_served_call_is_listed_and_sent_by_its_flow_body() {
     let Some(all) = comparisons().await else {
         return;
     };
