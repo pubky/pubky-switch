@@ -5469,3 +5469,81 @@ async fn test_scripted_peer_append_query_is_read_first() {
         assert_eq!(response.status, 400, "{query}");
     }
 }
+
+/// The wallet holding `n1` sealed at epoch 2, whose key it lacks, and the key of epoch 3,
+/// the current one, so it could write.
+async fn record_waiting_for_an_older_key(
+    s: &Setup,
+    wallet: &mut App,
+    phone: &mut App,
+) -> RecordTarget {
+    record_at_a_new_epoch(s, wallet, phone).await;
+    s.w.next_doc(|body| body.data_epoch = 3);
+    let has_keys = |scope: &str| SampleProtocol::default().has_keys(scope);
+    let cert = wallet.cert().clone();
+    for part in seal_bundle_parts(&s.w.alice, &cert, 3, 3, &has_keys).unwrap() {
+        s.w.switch
+            .signer_op(OpKind::KeyBundlePut(KeyBundlePut {
+                target_app_id: cert.app_id(),
+                bundle: part.bundle,
+                first_epoch: part.first_epoch,
+                last_epoch: part.last_epoch,
+            }))
+            .unwrap();
+    }
+    wallet.receive(None).await.unwrap();
+    assert!(wallet.scope_key(3, "scope-a").is_some());
+    assert!(wallet.scope_key(2, "scope-a").is_none());
+    let target = s.target("n1");
+    let key = wallet.record_key(&target).unwrap();
+    assert_eq!(
+        wallet.shared_record(&key).await.unwrap().unwrap().content,
+        RecordContent::Unreadable(Unopened::KeyNotHeld { data_epoch: 2 })
+    );
+    target
+}
+
+/// A value the app can't open yet isn't overwritten by an update built on nothing.
+#[tokio::test]
+async fn test_records_update_waits_for_the_key_of_a_held_value() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    let target = record_waiting_for_an_older_key(&s, &mut wallet, &mut phone).await;
+    let key = wallet.record_key(&target).unwrap();
+    let held = s.w.switch.record(&key).unwrap().state.version;
+    let error = wallet
+        .update_record(&target, vec![], |_| Some(value(&["mine"])))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, AppError::Refused(Refusal::NotNow(_))),
+        "{error:?}"
+    );
+    assert_eq!(s.w.switch.record(&key).unwrap().state.version, held);
+}
+
+/// A message's record job waits the same way: the message is delivered, the record left
+/// as it is until the key arrives.
+#[tokio::test]
+async fn test_records_sent_record_job_waits_for_the_key_of_a_held_value() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    let target = record_waiting_for_an_older_key(&s, &mut wallet, &mut phone).await;
+    let key = wallet.record_key(&target).unwrap();
+    let held = s.w.switch.record(&key).unwrap().state.version;
+    let mut note = s.note("hello");
+    note.record = Some(RecordJob {
+        target: target.clone(),
+        tag: Vec::new(),
+    });
+    let (msg_id, delivery) = wallet.send(note).await.unwrap();
+    assert!(
+        matches!(delivery, Delivery::Accepted { .. }),
+        "{delivery:?}"
+    );
+    assert_eq!(s.w.switch.record(&key).unwrap().state.version, held);
+    let report = wallet.flush_outbox().await.unwrap();
+    assert_eq!(report.queued, vec![msg_id], "the record job is still owed");
+}

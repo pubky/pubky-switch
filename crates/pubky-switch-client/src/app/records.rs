@@ -1882,13 +1882,19 @@ impl App {
 
     /// Build a record's next value from what the app holds and write it, building it again
     /// on what the switch holds after each `409 conflict` (Switch spec 10.3): `change` gets
-    /// the current value (`None` for none, deleted or unreadable) and returns the new one,
-    /// or `None` when nothing changes. Returns the record written, or `None` when `change`
-    /// changed nothing.
+    /// the current value (`None` for none, deleted, or one that won't open) and returns the
+    /// new one, or `None` when nothing changes. Returns the record written, or `None` when
+    /// `change` changed nothing.
+    ///
+    /// A value the app holds unopened for want of its key (`KeyNotHeld`) isn't handed over
+    /// as `None`, which would have `change` overwrite what it can't see: the write waits
+    /// for the key (Switch spec 3.5, 8.2). The outbox's record jobs go through here, so a
+    /// message's record job waits the same way.
     ///
     /// # Errors
     ///
-    /// As [`App::put_record`]; `409 conflict` when the record kept changing.
+    /// As [`App::put_record`]; [`Refusal::NotNow`] while the held value waits for its key;
+    /// `409 conflict` when the record kept changing.
     pub async fn update_record(
         &mut self,
         target: &RecordTarget,
@@ -1900,6 +1906,14 @@ impl App {
             let mut last = None;
             for _ in 0..UPDATE_TRIES {
                 let current = self.shared_record(&key).await?;
+                if current.as_ref().is_some_and(|r| r.content.waits_for_key()) {
+                    return Err(Refusal::NotNow(
+                        "Switch spec 3.5: the record's value is sealed under a key the app \
+                         doesn't hold yet"
+                            .into(),
+                    )
+                    .into());
+                }
                 let value = current.as_ref().and_then(|r| r.content.value());
                 let Some(next) = change(value) else {
                     return Ok(None);
