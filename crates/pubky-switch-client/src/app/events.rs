@@ -622,7 +622,10 @@ pub enum AppEvent {
     /// recipient never accepted was deleted from the outbox with its plaintext; for a
     /// re-send, only the re-send was given up. Also a message whose try needed writes over
     /// the store's sizes ([`crate::error::StoreError::TooLarge`]), which no later try can
-    /// make: it was deleted from the outbox at once. A duty event.
+    /// make: it was deleted from the outbox at once. Also a message a restore didn't
+    /// deliver again because its backup was older than [`super::SENT_RETENTION_MS`]: the
+    /// device the backup came from may have delivered it since ([`super::App::backup`]).
+    /// A duty event.
     MessageUndelivered {
         /// The duty event's ID.
         id: EventId,

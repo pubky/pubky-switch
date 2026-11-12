@@ -412,9 +412,7 @@ const MAX_FEED_WAIT_S: u64 = 25;
 
 /// A feed read's `wait`, if it is an integer in its range.
 fn feed_wait(text: &str) -> Option<u64> {
-    text.parse::<u64>()
-        .ok()
-        .filter(|seconds| *seconds <= MAX_FEED_WAIT_S)
+    decimal(text).filter(|seconds| *seconds <= MAX_FEED_WAIT_S)
 }
 
 /// The scripted switch as a transport: it answers at once, but for a feed read it holds.
@@ -505,6 +503,45 @@ pub(crate) fn bad(code: ErrorCode, message: &str, current: Value) -> Answer {
         body["retry_after"] = json!(SCRIPTED_RETRY_AFTER_S);
     }
     (code.status(), body)
+}
+
+/// `name=value` pairs joined by `&`, names and values percent-decoded; `None` for a bad
+/// escape, bytes that aren't UTF-8, or a name given twice, which the service answers `400`
+/// before the endpoint reads its parameters (`crates/pubky-switch/src/http/route.rs`,
+/// `parse_query`; Switch wire 7.1).
+pub(crate) fn parse_query(query: &str) -> Option<BTreeMap<String, String>> {
+    let decode = |text: &str| {
+        let bytes = text.as_bytes();
+        let mut decoded = Vec::with_capacity(bytes.len());
+        let mut index = 0;
+        while let Some(&byte) = bytes.get(index) {
+            if byte == b'%' {
+                let hex = std::str::from_utf8(bytes.get(index + 1..index + 3)?).ok()?;
+                decoded.push(u8::from_str_radix(hex, 16).ok()?);
+                index += 3;
+            } else {
+                decoded.push(byte);
+                index += 1;
+            }
+        }
+        String::from_utf8(decoded).ok()
+    };
+    let mut parsed = BTreeMap::new();
+    for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+        let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+        if parsed.insert(decode(name)?, decode(value)?).is_some() {
+            return None;
+        }
+    }
+    Some(parsed)
+}
+
+/// A decimal integer as the service reads a query's numbers: digits only, at most 16
+/// (`crates/pubky-switch/src/service/feed.rs`, `FeedQuery::parse`).
+pub(crate) fn decimal(text: &str) -> Option<u64> {
+    (!text.is_empty() && text.len() <= 16 && text.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| text.parse().ok())
+        .flatten()
 }
 
 /// The `retry_after` of the scripted switch's `429 rate_limited`, in seconds.
@@ -948,16 +985,13 @@ impl ScriptedSwitch {
         let app = request
             .header(header::APP)
             .and_then(|text| app_id_decode(text).ok())?;
-        let mut after = 0;
-        let mut wait = None;
-        for pair in query.split('&') {
-            match pair.split_once('=') {
-                Some(("after", value)) => after = Position::parse(value).ok()?.seq,
-                Some(("wait", value)) => wait = feed_wait(value),
-                _ => {}
-            }
-        }
-        let wait_s = wait.filter(|seconds| *seconds > 0)?;
+        // A query the feed refuses is answered at once.
+        let params = parse_query(query)?;
+        let after = match params.get("after") {
+            Some(value) => Position::parse(value).ok()?.seq,
+            None => 0,
+        };
+        let wait_s = feed_wait(params.get("wait")?).filter(|seconds| *seconds > 0)?;
         // The read is admitted as it arrives, as the service admits it under its lock: an
         // account that doesn't serve it (gone, staged, or frozen for a write) or an app that
         // isn't current is answered at once, and the app is seen now, not when its read is
@@ -1931,24 +1965,32 @@ impl Inner {
             return bad(ErrorCode::Unavailable, "feed read limit", json!(null));
         }
         self.feed_reads += 1;
-        let mut after = 0;
-        let mut limit = 100usize;
-        for pair in query.split('&') {
-            match pair.split_once('=') {
-                Some(("after", value)) => match Position::parse(value) {
-                    Ok(position) => after = position.seq,
-                    Err(_) => return bad(ErrorCode::BadRequest, "after", json!(null)),
-                },
-                Some(("limit", value)) => match value.parse() {
-                    Ok(value) => limit = value,
-                    Err(_) => return bad(ErrorCode::BadRequest, "limit", json!(null)),
-                },
-                // The read was held before it came here, if it had nothing to show.
-                Some(("wait", value)) if feed_wait(value).is_none() => {
-                    return bad(ErrorCode::BadRequest, "wait", json!(null));
-                }
-                _ => {}
-            }
+        // The query as the service reads it (`crates/pubky-switch/src/service/feed.rs`,
+        // `FeedQuery::parse`): decoded, `after` a position, `limit` 1 to 500 (100 by
+        // default) and `wait` at most 25, each digits only. The read was held before it came
+        // here, if it had nothing to show.
+        let Some(params) = parse_query(query) else {
+            return bad(
+                ErrorCode::BadRequest,
+                "the query doesn't decode",
+                json!(null),
+            );
+        };
+        let after = match params.get("after").map(|value| Position::parse(value)) {
+            None => 0,
+            Some(Ok(position)) => position.seq,
+            Some(Err(_)) => return bad(ErrorCode::BadRequest, "after", json!(null)),
+        };
+        let limit = match params.get("limit").map(|value| decimal(value)) {
+            None => 100usize,
+            Some(Some(value @ 1..=500)) => usize::try_from(value).unwrap_or(500),
+            Some(_) => return bad(ErrorCode::BadRequest, "limit", json!(null)),
+        };
+        if params
+            .get("wait")
+            .is_some_and(|value| feed_wait(value).is_none())
+        {
+            return bad(ErrorCode::BadRequest, "wait", json!(null));
         }
         let mut items = Vec::new();
         let mut last = after;
