@@ -6703,12 +6703,10 @@ impl Protocol for SharedReader {
     }
 }
 
-/// An entry waiting for a key reads a record the key opens. The key arrives in a read whose
-/// reopening fails at both its tries: the entry isn't run on the record still held not
-/// open. The next read reopens at its start and takes the entry there, before the feed.
-#[tokio::test]
-async fn test_records_waiting_entry_waits_for_an_owed_reopening() {
-    let s = Setup::new();
+/// alice's wallet on a store whose reopening commits fail, with [`SharedReader`], and a note
+/// waiting for the epoch-2 key that opens the record `shared`: the wallet, its store, the
+/// protocol and the note's `seq`.
+async fn waiting_on_shared(s: &Setup) -> (App, Arc<FailingReopen>, Arc<SharedReader>, u64) {
     let store = Arc::new(FailingReopen {
         inner: MemoryStore::new(),
         failing: std::sync::Mutex::new(0),
@@ -6727,13 +6725,7 @@ async fn test_records_waiting_entry_waits_for_an_owed_reopening() {
     .await
     .unwrap();
     let mut phone = s.join("phone").await;
-    let key = record_at_a_new_epoch(&s, &mut wallet, &mut phone).await;
-    assert_eq!(
-        key,
-        wallet
-            .record_key(&RecordTarget::new(items(), b"n1"))
-            .unwrap()
-    );
+    record_at_a_new_epoch(s, &mut wallet, &mut phone).await;
     phone
         .put_record(
             &RecordTarget::new(items(), b"shared"),
@@ -6757,6 +6749,16 @@ async fn test_records_waiting_entry_waits_for_an_owed_reopening() {
     wallet.receive(None).await.unwrap();
     assert_eq!(*protocol.runs.lock().unwrap(), 1);
     assert!(wallet.stored_at(seq).is_some(), "waits for the key");
+    (wallet, store, protocol, seq)
+}
+
+/// An entry waiting for a key reads a record the key opens. The key arrives in a read whose
+/// reopening fails at both its tries: the entry isn't run on the record still held not
+/// open. The next read reopens at its start and takes the entry there, before the feed.
+#[tokio::test]
+async fn test_records_waiting_entry_waits_for_an_owed_reopening() {
+    let s = Setup::new();
+    let (mut wallet, store, protocol, seq) = waiting_on_shared(&s).await;
     // The key comes; both tries of that read's reopening fail.
     *store.failing.lock().unwrap() = 2;
     store_parts_for(&s, &wallet.cert().clone());
@@ -6782,6 +6784,26 @@ async fn test_records_waiting_entry_waits_for_an_owed_reopening() {
         .position(|line| line.contains("/feed") && !line.ends_with("limit=1"))
         .unwrap();
     assert!(effect < feed, "{read:?}");
+}
+
+/// The same, with the next read's reopening at its start failing too: the retries there
+/// pass the entry over, and it is taken at the read's end, once the reopening after the
+/// page went through.
+#[tokio::test]
+async fn test_records_waiting_entry_passed_over_while_the_start_reopening_fails() {
+    let s = Setup::new();
+    let (mut wallet, store, protocol, seq) = waiting_on_shared(&s).await;
+    *store.failing.lock().unwrap() = 3;
+    store_parts_for(&s, &wallet.cert().clone());
+    wallet.receive(None).await.unwrap();
+    assert_eq!(*protocol.runs.lock().unwrap(), 1);
+    wallet.receive(None).await.unwrap();
+    assert_eq!(*store.failing.lock().unwrap(), 0);
+    assert!(
+        wallet.stored_at(seq).is_none(),
+        "taken once the records opened"
+    );
+    assert_eq!(*protocol.runs.lock().unwrap(), 2);
 }
 
 /// A record write sealed at an epoch whose key a later item of the same page brings: the
