@@ -186,3 +186,93 @@ pub async fn waiting_read_erased(world: &World) -> FlowResult {
     );
     Ok(())
 }
+
+/// A waiting read held while the signer revokes its reader (Switch spec 12.2 step 1,
+/// Switch wire 7.4.4). alice's watch has read its feed to the end and reads again with
+/// `wait`; the switch holds the read. Her signer revokes the watch: the revocation wakes
+/// the read, and the switch refuses it `403 not_current`, as it refuses every call of an
+/// app that is no longer current, under the head the revocation left.
+///
+/// The signer goes on to deliver the version that removes the watch. That delivery is
+/// held back until the read is answered, so that at either switch the watch learns of its
+/// revocation before the removal is published, whatever the order the two calls would
+/// otherwise finish in.
+///
+/// Calls: `GET /v1/{id}/feed` with `wait`, answered by `POST /v1/{id}/apps/{app_id}/revoke`.
+///
+/// # Errors
+///
+/// As [`waiting_read`], or when the held read is answered anything but `403 not_current`
+/// under the revocation's head.
+pub async fn waiting_read_revoked(world: &World) -> FlowResult {
+    let alice = world.identity("alice")?;
+    world.add_switch(ORIGIN, &[&alice]).await?;
+    let mut signer = enroll(world, &alice, ORIGIN).await?;
+    let (mut watch, _) = joined_with(
+        world,
+        &alice,
+        &mut signer,
+        Asking::new(world.app_keys(&alice, "watch")?)?,
+        notes_protocol_with_records(),
+        AppConfig::default(),
+    )
+    .await?;
+    look(world, &mut watch, "the watch before the wait").await?;
+
+    let app_id = watch.app_id();
+    let answered = Cell::new(false);
+    let held_then = Cell::new(false);
+    world.hold_back("PUT", "/identity");
+    let read = async {
+        let report = watch.receive(Some(WAIT_S)).await;
+        answered.set(true);
+        world.let_go();
+        report
+    };
+    let revoke = async {
+        // Until the switch holds the read, or answered it without holding it.
+        while world.held_reads() == 0 && !answered.get() {
+            tokio::task::yield_now().await;
+        }
+        held_then.set(world.held_reads() > 0);
+        signer
+            .revoke(app_id, None, UserConfirmed::shown_and_confirmed())
+            .await
+    };
+    let both = futures_util::future::join(read, revoke);
+    let both = tokio::time::timeout(STEP_TIMEOUT, both).await;
+    world.let_go();
+    let Ok((report, revoked)) = both else {
+        return Err("the held read wasn't answered: it is still held".into());
+    };
+    revoked?;
+    if !held_then.get() {
+        return Err("the switch answered the waiting read without holding it".into());
+    }
+    world.outcome(
+        "the signer revoked the watch while its read was held",
+        &json!({
+            "held_when_the_signer_acted": held_then.get(),
+            "the read ended well": report.is_ok(),
+            "events": events(&watch.take_events()),
+            "signer": status(&signer)?,
+        }),
+    );
+    // The read is refused, under the head the revocation left: the one its answer shows.
+    let read = "{alice/watch} GET /v1/{alice}/feed";
+    let revocation = "{alice} POST /v1/{alice}/apps/{alice/watch}/revoke";
+    let refused = (
+        world.last_fact(read, "status"),
+        world.last_fact(read, "body.code"),
+        world.last_fact(read, "header switch-head~.seq"),
+    );
+    let expected = (
+        Some("403".to_owned()),
+        Some("text not_current".to_owned()),
+        world.last_fact(revocation, "body.head.seq"),
+    );
+    if refused != expected || expected.2.is_none() {
+        return Err(format!("the held read was answered {refused:?}, not {expected:?}").into());
+    }
+    Ok(())
+}

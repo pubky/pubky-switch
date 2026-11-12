@@ -2261,18 +2261,24 @@ impl Inner {
                 json!(null),
             ));
         }
-        let Ok(body) = serde_json::from_slice::<Value>(&request.body) else {
+        let read = serde_json::from_slice::<Value>(&request.body);
+        let with_cert = request.header(header::CERT).is_some();
+        // After a provider loss the upload takes its slot of the hour before its body is
+        // read, so one that doesn't read counts too (Switch wire 7.4.14, 9.4).
+        if let (false, Some(recovery_from), Some(cert)) = (self.staged, self.recovery_from, cert) {
+            if let Ok(body) = read {
+                self.uploads.push((body, with_cert));
+            }
+            return self.loss_upload(&request.body, app, &cert, recovery_from);
+        }
+        let Ok(body) = read else {
             return Ok(bad(ErrorCode::BadRequest, "upload", json!(null)));
         };
         let count = |name: &str| body[name].as_array().map_or(0, Vec::len) as u64;
         let (heads, proofs) = (count("heads"), count("proofs"));
-        self.uploads
-            .push((body.clone(), request.header(header::CERT).is_some()));
+        self.uploads.push((body.clone(), with_cert));
         if self.staged {
             return Ok((200, json!({ "heads": heads, "proofs": proofs })));
-        }
-        if let (Some(recovery_from), Some(cert)) = (self.recovery_from, cert) {
-            return self.loss_upload(&request.body, app, &cert, recovery_from);
         }
         let changes = json!({ "records": [], "divergent": [], "claims": [],
                               "divergent_claims": [], "unverified": 0, "distrusted": 0,

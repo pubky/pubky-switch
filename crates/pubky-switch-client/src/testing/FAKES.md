@@ -216,7 +216,10 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   (`UploadBody::parse`, `check_permissions`, `check_upload`) and merge
   (`merge_checked_record`, `merge_upload_claim`), as at the service, so the counts and the
   changes are the service's, one `upload` transition each; `uploads_per_app_per_hour`
-  (`429 rate_limited` until the next hour of the switch's clock), `max_contacts` and
+  (`429 rate_limited` until the next hour of the switch's clock; an upload refused for its
+  body or its lists takes a slot too, and the refusals keep the wire's order past the
+  limit; the `429` repeats `retry_after` in `Retry-After`, as every `429` of this switch
+  does), `max_contacts` and
   `max_deny` as at the service, the wire's defaults unless a test sets them; and `404` at an
   account in neither stage. Unlike the service: `max_divergent_uploads` and
   `max_attempts_per_claim` are the wire's defaults, and `GET /claims` lists whatever entries

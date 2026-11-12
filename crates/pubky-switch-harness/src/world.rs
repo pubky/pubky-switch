@@ -368,6 +368,18 @@ impl World {
         });
     }
 
+    /// Hold back every request of `method` whose path contains `path` until
+    /// [`World::let_go`]: it waits on its way while other calls go on. For a flow in which
+    /// one party's step must not overtake another's answer, at either switch.
+    pub fn hold_back(&self, method: &str, path: &str) {
+        self.recorder.hold_back(method, path);
+    }
+
+    /// Let the requests [`World::hold_back`] holds go.
+    pub fn let_go(&self) {
+        self.recorder.let_go();
+    }
+
     /// Send the `nth` enrollment of the run again (from 0), byte for byte, as a retry that
     /// was still on its way: to see what the switch answers it now.
     ///
