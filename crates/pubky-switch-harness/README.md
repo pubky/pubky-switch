@@ -117,6 +117,10 @@ The flows send every call the service serves, each at both switches. What they l
   conversation entry pruned, a connection request.
 - **Longer lives:** a renewal that adds a scope, a claim that runs out by time, an
   identity that enrolls again after an erasure.
+- **The Homeserver's side of a grant.** The `approval` flows hold the capabilities the
+  signer grants when the user declines a protocol's paths, and that the switch is sent
+  the same with the paths declined as with them allowed. The grant itself is given and
+  enforced by the Homeserver, and the one in a world takes every write.
 - **More of a signer's copies and installs.** The install flows put the published copy
   right, clear the alarm for another document at the published version, take over on a
   new install, and restore in place. In most of them the switch only answers ordinary
@@ -169,6 +173,6 @@ Each flow's run against the service makes one test database and drops it, also w
 test panics; the flows run one after another. Each run is on a thread of its own with 16 MiB
 of stack (`FLOW_STACK_BYTES`, `on_flow_stack`): in a debug build the deepest flow used
 1.9 MiB, close to the 2 MiB of a test's thread, and a test binary aborted when the thread
-that ran the flows had less left. Sixty-four flows take about three minutes in a
+that ran the flows had less left. Sixty-six flows take about three minutes in a
 debug build. If that grows too long, the service's halves could share one service and one
 database, with identities of their own per flow: a later option, not needed yet.

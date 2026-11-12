@@ -14,6 +14,7 @@ mod collections;
 mod enrollment;
 mod epochs;
 mod erasure;
+mod grants;
 mod handover;
 mod installs;
 mod join;
@@ -44,6 +45,7 @@ pub use collections::two_collections;
 pub use enrollment::enrollment;
 pub use epochs::{epochs_three_readers, rotation_given_up, third_epoch};
 pub use erasure::{erasure, erasure_answer_lost};
+pub use grants::{grant_paths_decline_refused, grant_paths_declined};
 pub use handover::{hand_over, hand_over_abort_late, hand_over_aborted, hand_over_take_over_late};
 pub use installs::{
     publication_other_document, publication_repaired, signer_new_install, signer_records_behind,
@@ -164,6 +166,12 @@ pub const FLOWS: &[(&str, Flow)] = &[
     }),
     ("waiting read, a recovery in place", |world| {
         Box::pin(waiting_read_recovered(world))
+    }),
+    ("approval, grant paths declined", |world| {
+        Box::pin(grant_paths_declined(world))
+    }),
+    ("approval, a decline the protocol refuses", |world| {
+        Box::pin(grant_paths_decline_refused(world))
     }),
     ("provider loss", |world| Box::pin(provider_loss(world))),
     ("provider loss, a sender admitted", |world| {

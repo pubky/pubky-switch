@@ -328,6 +328,8 @@ switch and the service shows there:
 - approval, renewals and reductions, a reduction's closing with its publication failing,
   rotations over several epochs, and an epoch completed after a rotation was given up at a
   batch (`crates/pubky-switch-signer/tests/approval.rs`, `renewal.rs`);
+- an approval with a protocol's grant paths declined, the paths allowed at a later
+  request, and a decline the protocol's rule refuses (`grant_paths.rs`);
 - revocations and departures, the time a removal counts from, full-bundle requests, the
   record's cleanup and the purge, a revocation past a read that failed and one asked for
   during a recovery (`revocation.rs`, `recovery.rs`);
