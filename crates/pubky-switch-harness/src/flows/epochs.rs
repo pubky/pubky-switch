@@ -3,7 +3,7 @@
 //! them.
 
 use pubky_switch_client::app::{App, LeaveMode, RecordTarget};
-use pubky_switch_signer::{CertChange, Signer, UserConfirmed};
+use pubky_switch_signer::{Alert, CertChange, Signer, UserConfirmed};
 use serde_json::json;
 
 use super::enrollment::{enroll, status};
@@ -227,11 +227,13 @@ const OTHERS: [&str; 8] = [
 /// is in that batch, leaves. The batch, sent again byte for byte, is refused `403
 /// not_current`, since it holds a bundle for an app that departed (Switch wire 6.2
 /// `key_bundle.put`), and the signer gives the renewal up: the second epoch's keys are
-/// stored for some apps, and no version raised the epoch.
+/// stored for some apps, and no version raised the epoch. The signer tells the user so
+/// (`Alert::RenewalRefused`).
 ///
 /// The signer's next run completes the second epoch for every current app in a version of
 /// its own, then removes the radio with a rotation to the third. The wallet, whose
-/// reduction was given up, keeps both its scopes and follows through both epochs.
+/// reduction was given up, keeps both its scopes and follows through both epochs, and the
+/// alert stays while its certificate holds the scope the user asked to remove.
 ///
 /// Calls: the signer's `POST /v1/{id}/ops` with a rotation's second batch after its
 /// target left (`403 not_current`); `PUT /v1/{id}/identity` with a version that only
@@ -241,8 +243,8 @@ const OTHERS: [&str; 8] = [
 /// # Errors
 ///
 /// When a step that should succeed against any switch fails, the second batch is taken or
-/// refused otherwise, or the epochs don't end at the third with the radio removed and the
-/// wallet's scopes kept.
+/// refused otherwise, the signer's alerts are other than its steps say, or the epochs
+/// don't end at the third with the radio removed and the wallet's scopes kept.
 pub async fn rotation_given_up(world: &World) -> FlowResult {
     let alice = world.identity("alice")?;
     world.add_switch(ORIGIN, &[&alice]).await?;
@@ -316,6 +318,19 @@ pub async fn rotation_given_up(world: &World) -> FlowResult {
         )
         .into());
     }
+    // The user is told that the reduction they asked for didn't happen.
+    let given_up = Alert::RenewalRefused {
+        app_id: wallet.app_id(),
+        reduction: true,
+        by_user: true,
+    };
+    if signer.alerts() != [given_up.clone()] {
+        return Err(format!(
+            "after the renewal was given up the signer's alerts are {:?}",
+            signer.alerts()
+        )
+        .into());
+    }
     world.advance_ms(STEP_MS);
 
     signer.run_due().await?;
@@ -341,6 +356,21 @@ pub async fn rotation_given_up(world: &World) -> FlowResult {
             newest.body().removed.len()
         )
         .into());
+    }
+    // The alert stays, since the wallet's listed certificate still holds the scope the
+    // user asked to remove. The radio's departure adds its own two.
+    let radio_id = others.last().ok_or("no app was approved")?.app_id();
+    let expected = [
+        given_up,
+        Alert::RemovedAtSwitch {
+            app_id: radio_id,
+            left: true,
+        },
+        Alert::GrantRevocationOwed { app_id: radio_id },
+    ];
+    let alerts = signer.alerts();
+    if alerts.len() != expected.len() || !expected.iter().all(|alert| alerts.contains(alert)) {
+        return Err(format!("after the run the signer's alerts are {alerts:?}").into());
     }
     world.advance_ms(STEP_MS);
 
