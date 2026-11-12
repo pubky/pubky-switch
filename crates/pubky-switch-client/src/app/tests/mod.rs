@@ -4,6 +4,7 @@
 mod flows;
 mod kept_status;
 mod moves;
+mod not_registered;
 mod own_record;
 mod parked;
 mod passed;

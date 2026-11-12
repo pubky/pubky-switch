@@ -468,8 +468,14 @@ impl App {
                 code: ErrorCode::NotCurrent,
                 ..
             }) => {
+                // Without a verified head the refusal came before the request verified: the
+                // service holds no record of the app to check it with, the refusal of a first
+                // call (Switch wire 7.1 "`Switch-Head` on refusals", 7.2). The app isn't
+                // registered there, which says nothing of a revocation or a departure: the
+                // read fails, and a registration owed goes again at the next one.
+                let unverified = self.client.latest_server_time().is_none();
                 self.reload_now().await?;
-                if self.state.leave.is_some() {
+                if self.state.leave.is_some() || unverified {
                     return Ok(TakeOver::Done(Err(error)));
                 }
                 // Switch wire 7.2: final only from the service and generation the newest
