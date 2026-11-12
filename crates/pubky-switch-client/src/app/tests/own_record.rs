@@ -1640,6 +1640,31 @@ async fn test_own_record_read_reports_a_failed_publication_once() {
     assert_eq!(failed, 1, "{:?}", report.events);
 }
 
+/// The call's mode decides: a two-step leave after an immediate one that failed
+/// at the switch waits for the delete.
+#[tokio::test]
+async fn test_own_record_two_step_leave_after_a_failed_immediate_one_waits() {
+    let w = World::new();
+    let mut app = w.join_publishing("wallet").await;
+    let id = app.app_id();
+    w.homeserver.set_down(true);
+    w.switch.fail_next(Fault::Unreachable {
+        path: "/leave".into(),
+        after: 0,
+    });
+    app.leave(LeaveMode::Immediate(UserConfirmed::new()))
+        .await
+        .unwrap_err();
+    assert!(!w.switch.app(&id).departed);
+    let error = app.leave(LeaveMode::TwoStep).await.unwrap_err();
+    assert!(matches!(error, AppError::Transport(_)), "{error:?}");
+    assert!(!w.switch.app(&id).departed);
+    w.homeserver.set_down(false);
+    app.leave(LeaveMode::TwoStep).await.unwrap();
+    assert!(w.switch.app(&id).departed);
+    assert!(w.published(id).is_none());
+}
+
 /// An app whose devices share its keys writes a missing copy back right after
 /// the switch accepts its `app.put` at a read's start, also when the read's feed then fails.
 #[tokio::test]
@@ -1710,4 +1735,19 @@ async fn test_own_record_superseded_by_a_record_under_a_renewal_takes_the_renewa
     app.receive(None).await.unwrap();
     assert_eq!(w.app_puts(), puts, "signed over the later record");
     assert_eq!(w.held(id).as_ref(), Some(later.signed()));
+}
+
+/// A leave kept by a store written before the mode stopped being kept still loads: its
+/// `two_step` member is ignored.
+#[test]
+fn test_own_record_leave_state_with_a_two_step_member_loads() {
+    let leave: crate::app::state::LeaveState = serde_json::from_value(json!({
+        "left_at_ms": null,
+        "two_step": true,
+        "removed_seen_ms": null,
+        "keys_deleted_ms": null,
+        "compromise": false,
+    }))
+    .unwrap();
+    assert_eq!(leave, crate::app::state::LeaveState::default());
 }

@@ -2387,7 +2387,6 @@ impl App {
         if self.state.leave.is_none() {
             let mut tx = self.tx()?;
             let leave = LeaveState {
-                two_step,
                 compromise,
                 ..LeaveState::default()
             };
