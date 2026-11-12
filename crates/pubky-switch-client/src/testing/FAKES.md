@@ -193,9 +193,10 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   answer (Switch wire 7.3 steps 5 to 8), whatever the route: no `Switch-Head`,
   `Switch-Server-Time` the last time stamped, and the app not seen. A departed app that
   delivered its record keeps it, so it goes on to the route's checks, as at the service,
-  until the test call `purge` frees it, as a service may once the signer purges the app
-  from `removed` (Switch wire 9.1): then it meets the first call's refusal, without the
-  head. The service keeps a purged app's record, so it answers that app with the head.
+  until the test call `purge` frees it, as a service does once the signer purges the app
+  from `removed`, keeping only its App ID (Switch wire 9.1): then it meets the first call's
+  refusal, without the head. A known gap of the reference service: it doesn't free a
+  purged app's record yet, so it still answers that app with the head.
 - **App currency outside batches**: a feed read is checked as a batch is, for an app that
   delivered its record: current, with an unexpired certificate, the stored renewed one once
   the newest `identity.json` lists it (Switch wire 7.2, 3.8). Other routes check only that
