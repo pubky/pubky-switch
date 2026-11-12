@@ -77,3 +77,50 @@ async fn test_not_registered_not_current_with_the_head_is_a_removal() {
     assert!(report.stopped);
     assert!(has(&report.events, |e| matches!(e, AppEvent::Removed)));
 }
+
+/// The switch, counting the requests it is sent.
+struct Counting(Arc<dyn Transport>, std::sync::atomic::AtomicUsize);
+
+impl Transport for Counting {
+    fn send(&self, request: Request) -> BoxFuture<'_, Result<Response, TransportError>> {
+        self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.0.send(request)
+    }
+}
+
+/// A switch that keeps answering the headless refusal, as one that lost the app's record
+/// would: every read fails once, with one request and no event, and nothing is retried
+/// inside a read, so the host's own schedule of reads bounds the calls.
+#[tokio::test]
+async fn test_not_registered_repeated_headless_refusals_cost_one_request_a_read() {
+    let w = World::new();
+    let me = w.join("wallet").await.app_id();
+    let counting = Arc::new(Counting(
+        w.switch.transport(),
+        std::sync::atomic::AtomicUsize::new(0),
+    ));
+    let env = AppEnv {
+        transport: Arc::clone(&counting) as Arc<dyn Transport>,
+        ..w.env()
+    };
+    let mut app = App::load(env, w.protocol.clone(), World::config(), me)
+        .await
+        .unwrap();
+    app.receive(None).await.unwrap();
+    let held = w.switch.lock().apps.get_mut(&me).unwrap().record.take();
+    for _ in 0..5 {
+        let before = counting.1.load(std::sync::atomic::Ordering::SeqCst);
+        let error = app.receive(None).await.unwrap_err();
+        assert_eq!(error.code(), Some(ErrorCode::NotCurrent), "{error:?}");
+        assert_eq!(
+            counting.1.load(std::sync::atomic::Ordering::SeqCst) - before,
+            1
+        );
+        assert!(app.take_events().is_empty());
+        w.clock.advance_ms(1_000);
+    }
+    // Once the switch holds the record again, the next read goes on.
+    w.switch.lock().apps.get_mut(&me).unwrap().record = held;
+    let report = app.receive(None).await.unwrap();
+    assert!(!report.stopped);
+}
