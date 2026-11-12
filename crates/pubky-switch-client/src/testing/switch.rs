@@ -1422,6 +1422,26 @@ impl ScriptedSwitch {
         Ok(inner.seq)
     }
 
+    /// Chain an `upload` transition by `by` listing `changes` as written, merging nothing,
+    /// as after an upload whose merge the test made itself (Switch wire 7.4.14). For tests
+    /// of what an app does with the transition.
+    ///
+    /// # Errors
+    ///
+    /// As [`ScriptedSwitch::signer_op`].
+    #[cfg(test)]
+    pub(crate) fn chain_upload(&self, by: [u8; 16], changes: Value) -> Result<(), ScriptError> {
+        let mut inner = self.lock();
+        let at = inner.now();
+        inner.service_transition(ServiceTransition::Upload {
+            by,
+            changes,
+            proofs: 0,
+            at,
+        })?;
+        Ok(())
+    }
+
     /// Move `app`'s cursor to `seq`, in a batch of its own, as a submitted `cursor.set` does
     /// (Switch wire 6.2). For tests of what a cursor move changes.
     ///
