@@ -36,21 +36,35 @@
 //!    whole set the user declines and says at once whether the protocols allow it, with the
 //!    rule's reason when they don't, such as two paths that go only together. The
 //!    certificate, its scopes and keys are the same whatever is declined (Switch spec 3.4).
+//!    For a request that renews a listed app ([`AppReview::renews`]), a decline only keeps
+//!    the path out of this request's grant: a grant an earlier approval made still covers
+//!    what it covered, until it expires or the app is revoked, so don't tell the user the
+//!    path was taken away.
 //! 3. **Approve.** On the user's yes, call [`Signer::approve`]. When it fails, the approval may
-//!    still finish: call [`Signer::resume`] later, then [`Signer::approved`].
+//!    still finish: call [`Signer::resume`] later, then [`Signer::approved`]. `approve` takes
+//!    the review, and a fresh review declines nothing, so keep a clone of the review, or its
+//!    [`AppReview::declined`] set to decline again, until the claim is released: when
+//!    `approve` failed before it committed, [`Signer::approved`] gives nothing, and the host
+//!    approves the kept review again.
 //! 4. **Deliver the claim.** Once [`Signer::approve`] or [`Signer::approved`] returns an
 //!    [`ApprovedRequest`], deliver its `claim` bytes, exactly as given, to the auth request's
 //!    relay as the companion claim under `x-pubky-switch-claim=pubky-switch.v1.approval`:
 //!    encrypted with the auth secret to the claim's relay channel, as the companion claims
 //!    spec says. They are already signed by the identity key; don't sign them again. When the
-//!    delivery fails, deliver the same bytes again.
+//!    delivery fails, deliver the same bytes again. Deliver the claim by itself: a
+//!    companion-claims helper that also approves the grant approves the auth request's own
+//!    capabilities, the declined paths included. The grant is approved separately, at the
+//!    next step.
 //! 5. **Approve the grant.** Only after the relay accepted the claim, approve the Pubky grant
 //!    of the auth request for exactly [`ApprovedRequest::caps`]: the capabilities the auth
 //!    request asks for, less the paths the user declined. That can be fewer than the
 //!    `pubkyauth://` URL names, so approve it with the Pubky SDK's
-//!    `PubkySigner::approve_auth_with_capabilities`, passing those capabilities, never with
-//!    `approve_auth`, which grants what the URL asks for. When the grant fails, try the grant
-//!    again; the claim on the relay authorizes nothing by itself.
+//!    `PubkySigner::approve_auth_with_capabilities`, never with `approve_auth`, which grants
+//!    what the URL asks for, nor with a helper that delivers the claim and grants together.
+//!    Pass it `ApprovedRequest::caps` parsed with `str::parse` into `pubky::Capabilities`,
+//!    which keeps their order; `Capabilities::builder().finish()` would normalize them. When
+//!    the grant fails, try the grant again; the claim on the relay authorizes nothing by
+//!    itself.
 //! 6. **Report.** Call [`Signer::claim_delivered`], and the signer drops the claim.
 //!
 //! The host never:
@@ -143,6 +157,10 @@ impl AppReview {
     /// grant paths. An empty set declines none. On a refusal the set stays as it was, so a
     /// host can try a set to learn whether it is allowed. [`Signer::approve`] grants the
     /// capabilities asked for less these paths, and issues the certificate as asked.
+    ///
+    /// At a request that renews the app ([`AppReview::renews`]), a decline keeps the path
+    /// out of this request's grant only: a grant an earlier approval made stands until it
+    /// expires or the app is revoked, so a decline takes nothing away.
     ///
     /// # Errors
     ///

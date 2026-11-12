@@ -251,9 +251,9 @@ pub enum Alert {
     /// answer leaves it. Every signing step checks first, so it outlasts the switch's
     /// recovery by one check at most. Never raised once the account is erased.
     AccountNotHosted,
-    /// A removed app's Pubky grant still lets it write its Homeserver paths: the Pubky SDK
-    /// offers no call to revoke a grant yet, so the user revokes it in the Homeserver's own
-    /// settings (Switch spec 3.4, 12.2 step 1; design note, decision 4). Raised once for each
+    /// A removed app's Pubky grants still let it write its Homeserver paths: each approved
+    /// request made one, and the Pubky SDK offers no call to revoke a grant yet, so the user
+    /// revokes every grant of the app in the Homeserver's own settings (Switch spec 3.4, 12.2 step 1; design note, decision 4). Raised once for each
     /// removed app, also while its record's deletion keeps failing.
     GrantRevocationOwed {
         /// The removed app.

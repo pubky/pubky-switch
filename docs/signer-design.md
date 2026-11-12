@@ -106,7 +106,7 @@ pub trait Protocol: Send + Sync {
     fn grant_paths(&self, app_id: &[u8; 16], scopes: &[&str]) -> Vec<GrantPath>;
     /// Its own rule on which of its grant paths one grant may cover, such as two
     /// that go only together (spec 3.4). Every set passes by default.
-    fn check_grant_paths(&self, allowed: &[&str]) -> Result<(), String>;
+    fn check_grant_paths(&self, app_id: &[u8; 16], scopes: &[&str], allowed: &[&str]) -> Result<(), String>;
 }
 ```
 
@@ -114,7 +114,7 @@ pub trait Protocol: Send + Sync {
 - **What the set gives:** `terms(scopes)` checks a request and returns its permissions and keyed scopes; `knows_scope` and `has_keys` are the predicates the core's app request check and key bundle functions take; `grant_paths` gives the paths for the core's caps check, and `check_grant_paths` each protocol's rule on the paths a grant would cover; `unowned` lists the scopes no registered protocol owns.
 - **The Switch's own rules stay in the signer and the core:**
   - the scope rule and the 32-scope bound, and no name beside its own sub-scope;
-  - grants exactly the app's own paths, and a protocol's grant paths lie outside the Switch's own folders;
+  - grants exactly the app's own paths, and a protocol's grant paths lie outside the Switch's own folders, none covering another, so a declined one is off the grant;
   - no grant covering `identity.json` or the signer's backup;
   - the app limit.
 - **Unknown scopes:** a scope no registered protocol owns is refused in a request (wire 3.9 step 1). A received hand-over or a restored backup whose certificates hold one is refused, naming those scopes so the host can tell the user which protocol support is missing. A certificate already in the records that holds one blocks only the steps that need that app's keys, instead of guessing (decision 2): a rotation gives that app no part and raises `RotationSkipped`, naming the app and the scopes, and its next bundle catches it up; the renewal past half its lifetime skips it, raising `RenewalSkipped`; a renewal may remove such a scope, which counts as keyed and so rotates, but may not keep it.

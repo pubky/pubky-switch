@@ -92,7 +92,7 @@ impl Protocol for Notes {
         ]
     }
 
-    fn check_grant_paths(&self, allowed: &[&str]) -> Result<(), String> {
+    fn check_grant_paths(&self, _: &[u8; 16], _: &[&str], allowed: &[&str]) -> Result<(), String> {
         if allowed.contains(&NOTES_PROFILE) == allowed.contains(&NOTES_PROFILE_FILES) {
             Ok(())
         } else {
@@ -263,14 +263,22 @@ mod tests {
             [NOTES_PROFILE, NOTES_PROFILE_FILES]
         );
         assert!(Notes.grant_paths(&id, &[NOTES_LISTS]).is_empty());
-        assert!(Notes.check_grant_paths(&[]).is_ok());
+        assert!(Notes.check_grant_paths(&id, &[NOTES], &[]).is_ok());
         assert!(
             Notes
-                .check_grant_paths(&[NOTES_PROFILE, NOTES_PROFILE_FILES])
+                .check_grant_paths(&id, &[NOTES], &[NOTES_PROFILE, NOTES_PROFILE_FILES])
                 .is_ok()
         );
-        assert!(Notes.check_grant_paths(&[NOTES_PROFILE]).is_err());
-        assert!(Notes.check_grant_paths(&[NOTES_PROFILE_FILES]).is_err());
+        assert!(
+            Notes
+                .check_grant_paths(&id, &[NOTES], &[NOTES_PROFILE])
+                .is_err()
+        );
+        assert!(
+            Notes
+                .check_grant_paths(&id, &[NOTES], &[NOTES_PROFILE_FILES])
+                .is_err()
+        );
     }
 
     #[test]

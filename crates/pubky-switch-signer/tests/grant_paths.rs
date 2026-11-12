@@ -14,14 +14,22 @@ use pubky_switch_client::store::MemoryStore;
 use pubky_switch_client::testing::SWITCH_ORIGIN;
 use pubky_switch_core::records::{app_backup_path, app_record_path};
 use pubky_switch_core::scopes::Permission;
-use pubky_switch_signer::{GrantPath, Protocol, Protocols, Refusal, ScopeDef, Signer, SignerError};
+use pubky_switch_signer::{
+    GrantPath, Protocol, ProtocolError, Protocols, Refusal, ScopeDef, Signer, SignerError,
+};
 
 const PROFILE: &str = "/pub/media/profile.json";
 const FILES: &str = "/pub/media/files/";
 const FEED: &str = "/pub/media/feed.json";
+const ZA: &str = "/pub/zine/a.json";
+const ZB: &str = "/pub/zine/b.json";
+const WIDE: &str = "/pub/media/";
 
-/// A protocol adding three grant paths, of which the profile and its files go only together.
-struct Media;
+/// A protocol adding three grant paths, of which the profile and its files go only together;
+/// with `needs_feed`, the feed is needed too.
+struct Media {
+    needs_feed: bool,
+}
 
 impl Protocol for Media {
     fn name(&self) -> &str {
@@ -45,19 +53,97 @@ impl Protocol for Media {
             })
             .collect()
     }
-    fn check_grant_paths(&self, allowed: &[&str]) -> Result<(), String> {
+    fn check_grant_paths(
+        &self,
+        _: &[u8; 16],
+        scopes: &[&str],
+        allowed: &[&str],
+    ) -> Result<(), String> {
+        if scopes != ["media"] {
+            return Err("scopes media doesn't own".into());
+        }
         if allowed.iter().any(|p| ![PROFILE, FILES, FEED].contains(p)) {
             return Err("a path media didn't add".into());
         }
         if allowed.contains(&PROFILE) != allowed.contains(&FILES) {
             return Err("the profile and its files go together".into());
         }
+        if self.needs_feed && !allowed.contains(&FEED) {
+            return Err("the feed is needed".into());
+        }
         Ok(())
     }
 }
 
+/// A second protocol whose two paths go together.
+struct Zine;
+
+impl Protocol for Zine {
+    fn name(&self) -> &str {
+        "zine"
+    }
+    fn scopes(&self) -> Vec<ScopeDef> {
+        vec![ScopeDef::keyed("zine")]
+    }
+    fn check_scopes(&self, _: &[&str]) -> Result<(), String> {
+        Ok(())
+    }
+    fn permissions(&self, _: &[&str]) -> Vec<Permission> {
+        vec![Permission::ListsRead]
+    }
+    fn grant_paths(&self, _: &[u8; 16], _: &[&str]) -> Vec<GrantPath> {
+        [ZA, ZB]
+            .iter()
+            .map(|path| GrantPath {
+                path: (*path).into(),
+                purpose: "a zine file".into(),
+            })
+            .collect()
+    }
+    fn check_grant_paths(&self, _: &[u8; 16], _: &[&str], allowed: &[&str]) -> Result<(), String> {
+        if allowed.contains(&ZA) != allowed.contains(&ZB) {
+            return Err("a and b go together".into());
+        }
+        Ok(())
+    }
+}
+
+/// A protocol adding a folder that covers every media path.
+struct Wide;
+
+impl Protocol for Wide {
+    fn name(&self) -> &str {
+        "wide"
+    }
+    fn scopes(&self) -> Vec<ScopeDef> {
+        vec![ScopeDef::keyed("wide")]
+    }
+    fn check_scopes(&self, _: &[&str]) -> Result<(), String> {
+        Ok(())
+    }
+    fn permissions(&self, _: &[&str]) -> Vec<Permission> {
+        vec![Permission::ListsRead]
+    }
+    fn grant_paths(&self, _: &[u8; 16], _: &[&str]) -> Vec<GrantPath> {
+        vec![GrantPath {
+            path: WIDE.into(),
+            purpose: "every media file".into(),
+        }]
+    }
+}
+
+fn protocols_with(needs_feed: bool) -> Protocols {
+    Protocols::new(vec![
+        Arc::new(Notes),
+        Arc::new(Media { needs_feed }),
+        Arc::new(Zine),
+        Arc::new(Wide),
+    ])
+    .unwrap()
+}
+
 fn protocols() -> Protocols {
-    Protocols::new(vec![Arc::new(Notes), Arc::new(Media)]).unwrap()
+    protocols_with(false)
 }
 
 /// A signer of `world`'s identity with [`Notes`] and [`Media`] registered, enrolled and
@@ -348,4 +434,113 @@ async fn test_grant_paths_declined_stay_out_of_a_renewal_after_a_crash() {
     reopened.resume().await.unwrap();
     let approved = reopened.approved(&request).unwrap().unwrap();
     assert_eq!(approved.caps, caps(&id, &[FEED]));
+}
+
+#[tokio::test]
+async fn test_grant_paths_decline_takes_only_the_exact_path() {
+    let world = World::new();
+    let (signer, _) = enrolled(&world).await;
+    let app = app(&["media"], &[PROFILE, FILES, FEED], [9; 32]);
+    let mut review = signer.review(&app.request, &app.auth).unwrap();
+    for variant in [
+        "/pub/media/feed.json/",
+        "//pub/media/feed.json",
+        "/pub/media/./feed.json",
+        "/pub/media/../media/feed.json",
+        "/pub/media/%66eed.json",
+        "/PUB/media/feed.json",
+        "/pub/media/feed.json:rw",
+        "/pub/media/feed.json:r",
+        "/pub/media/files",
+        "/pub/media/",
+        "/pub/media/feed",
+        " /pub/media/feed.json",
+        "",
+    ] {
+        match refusal(review.decline(&[variant]).unwrap_err()) {
+            Refusal::NotDeclinable { path } => assert_eq!(path, variant),
+            other => panic!("{variant}: {other:?}"),
+        }
+        assert!(review.declined().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn test_grant_paths_one_covering_another_is_refused() {
+    // Another protocol's folder covers the feed: declining the feed couldn't take it off the
+    // grant, so the protocols' paths are refused for that app.
+    let world = World::new();
+    let (signer, _) = enrolled(&world).await;
+    let app = app(&["media", "wide"], &[WIDE, FEED], [9; 32]);
+    let error = signer.review(&app.request, &app.auth).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            SignerError::Protocol(ProtocolError::BadGrantPath {
+                rule: "a path that covers another",
+                ..
+            })
+        ),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_grant_paths_approve_refuses_a_decline_the_protocols_now_refuse() {
+    // The re-decline at `approve` refusing ends the approval: nothing past what the protocols
+    // allow is granted.
+    let world = World::new();
+    let (signer, store) = enrolled(&world).await;
+    let app = app(&["media"], &[PROFILE, FILES, FEED], [9; 32]);
+    let mut review = signer.review(&app.request, &app.auth).unwrap();
+    review.decline(&[FEED]).unwrap();
+    drop(signer);
+    let env = world.env_with(store, protocols_with(true));
+    let mut reopened = Signer::open(env, world.keyring()).await.unwrap();
+    reopened.resume().await.unwrap();
+    match reopened.approve(review).await {
+        Err(error) => match refusal(error) {
+            Refusal::ProtocolRule { protocol, reason } => {
+                assert_eq!(protocol, "media");
+                assert_eq!(reason, "the feed is needed");
+            }
+            other => panic!("{other:?}"),
+        },
+        Ok(approved) => panic!("approved with {}", approved.caps),
+    }
+}
+
+#[tokio::test]
+async fn test_grant_paths_every_owning_protocols_rule_is_applied() {
+    let world = World::new();
+    let (signer, _) = enrolled(&world).await;
+    let asking = app(&["media", "zine"], &[PROFILE, FILES, FEED, ZA, ZB], [9; 32]);
+    let mut review = signer.review(&asking.request, &asking.auth).unwrap();
+    match refusal(review.decline(&[ZA]).unwrap_err()) {
+        Refusal::ProtocolRule { protocol, .. } => assert_eq!(protocol, "zine"),
+        other => panic!("{other:?}"),
+    }
+    let broken = app(&["media", "zine"], &[PROFILE, FILES, ZA], [10; 32]);
+    match refusal(signer.review(&broken.request, &broken.auth).unwrap_err()) {
+        Refusal::ProtocolRule { protocol, .. } => assert_eq!(protocol, "zine"),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_grant_paths_a_kept_review_approved_again_keeps_its_declines() {
+    // A host that keeps a clone of the review and approves it again: the second approval
+    // renews with the same declines.
+    let world = World::new();
+    let (mut signer, _) = enrolled(&world).await;
+    let app = app(&["media"], &[PROFILE, FILES, FEED], [9; 32]);
+    let id = app.keys.app_id_bytes();
+    let mut review = signer.review(&app.request, &app.auth).unwrap();
+    review.decline(&[FEED]).unwrap();
+    let again = review.clone();
+    let approved = signer.approve(review).await.unwrap();
+    signer.claim_delivered(&approved.request).await.unwrap();
+    world.join(&app, &approved);
+    let approved = signer.approve(again).await.unwrap();
+    assert_eq!(approved.caps, caps(&id, &[PROFILE, FILES]));
 }
