@@ -5769,3 +5769,89 @@ async fn test_records_record_job_given_up_keeps_an_owed_resend() {
         Some(Delivery::Queued { .. })
     ));
 }
+
+/// The key of `target`'s record, created by `app` and then deleted.
+async fn created_and_deleted(app: &mut App, target: &RecordTarget) -> [u8; 32] {
+    app.put_record(target, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    app.delete_record(target, vec![]).await.unwrap();
+    app.record_key(target).unwrap()
+}
+
+/// `app` reads its feed and moves its cursor at the switch past what it read.
+async fn read_on(app: &mut App) {
+    app.receive(None).await.unwrap();
+    app.flush_cursor().await.unwrap();
+}
+
+fn held_at_switch(s: &Setup, key: &[u8; 32]) -> bool {
+    s.w.switch.lock().shared.records.contains_key(key)
+}
+
+#[tokio::test]
+async fn test_scripted_records_deleted_key_is_forgotten_once_every_reader_passed() {
+    // As at the service (Switch spec 10.3): once every current app's cursor is past the
+    // delete, the key is forgotten, its read is `404`, and a create at it starts afresh.
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    let target = s.target("n1");
+    let key = created_and_deleted(&mut wallet, &target).await;
+    read_on(&mut wallet).await;
+    assert!(held_at_switch(&s, &key), "the phone hasn't passed it");
+    read_on(&mut phone).await;
+    assert!(!held_at_switch(&s, &key));
+    let rest = format!("records/{}", pubky_switch_core::enc::b64(&key));
+    assert_eq!(
+        scripted_get(&s, Some(phone.app_id()), &rest),
+        (404, json!("not_found"), true)
+    );
+    wallet
+        .put_record(&target, &value(&["b"]), vec![])
+        .await
+        .unwrap();
+    read_on(&mut phone).await;
+    let held = phone.shared_record(&key).await.unwrap().unwrap();
+    assert_eq!(ids(held.content.value()), vec!["b"]);
+}
+
+#[tokio::test]
+async fn test_scripted_records_deleted_key_waits_for_a_lagging_app_with_nothing_to_list_on() {
+    // A lagging app holds the key while it has no `missed` item to pass; with one ahead of
+    // its cursor it no longer does, since passing it lists its collections again.
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let phone = s.join("phone").await;
+    let target = s.target("n1");
+    let key = created_and_deleted(&mut wallet, &target).await;
+    s.w.switch
+        .lock()
+        .apps
+        .get_mut(&phone.app_id())
+        .unwrap()
+        .lagging = true;
+    read_on(&mut wallet).await;
+    assert!(held_at_switch(&s, &key), "no missed item to list on");
+    let now = s.w.clock.now_ms();
+    s.w.switch.push_missed(1, now, now);
+    read_on(&mut wallet).await;
+    assert!(!held_at_switch(&s, &key));
+}
+
+#[tokio::test]
+async fn test_scripted_records_deleted_key_a_divergent_upload_names_is_kept() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    let target = s.target("n1");
+    let key = created_and_deleted(&mut wallet, &target).await;
+    s.w.switch
+        .lock()
+        .shared
+        .divergent
+        .insert(key, vec![[1; 32]]);
+    read_on(&mut wallet).await;
+    read_on(&mut phone).await;
+    assert!(held_at_switch(&s, &key));
+}

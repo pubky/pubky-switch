@@ -125,6 +125,55 @@ impl Inner {
         let current = self.current_app_ids();
         self.convert_unreadable(&current);
         self.release_passed(&current, true);
+        self.forget_deleted_keys(&current);
+    }
+
+    /// Forget the deleted keys nothing refers to, `current` holding the App IDs current now
+    /// (Switch spec 10.3, wire 9.1), as the service does: the record's current write is
+    /// its delete, written here, not taken from a recovery upload; the cursor of every app
+    /// of `current` is at or past it, but for a lagging app with a `missed` item it hasn't
+    /// passed (its own, or one [`super::ScriptedSwitch::push_missed`] scripted for every app),
+    /// which lists its collections again as it passes the item; and no divergent
+    /// upload names the key. The record goes, so its delete shows as its stub, its reads are
+    /// `404`, and a create at the key starts afresh.
+    fn forget_deleted_keys(&mut self, current: &[[u8; 16]]) {
+        let to_list = |app: &[u8; 16]| {
+            self.marked_lagging(app)
+                && self.items.iter().any(|item| {
+                    matches!(item, Item::Missed { seq, app: of, .. }
+                        if of.is_none_or(|of| of == *app) && *seq > self.cursor_of(app))
+                })
+        };
+        let waited: Vec<u64> = current
+            .iter()
+            .filter(|app| !to_list(app))
+            .map(|app| self.cursor_of(app))
+            .collect();
+        let shared = &mut self.shared;
+        let divergent = &shared.divergent;
+        shared.records.retain(|key, held| {
+            !held.state.deleted
+                || held.uploaded.is_some()
+                || divergent.contains_key(key)
+                || waited.iter().any(|cursor| *cursor < held.seq)
+        });
+    }
+
+    /// The sweep the service runs once a minute of service time (Switch wire 9.1), at the
+    /// first request a minute after the last: invite codes that expired or ran out go.
+    pub(super) fn minute_sweep(&mut self) {
+        let now = self.now();
+        let shared = &mut self.shared;
+        if shared
+            .swept_at
+            .is_some_and(|at| now < at.saturating_add(60_000))
+        {
+            return;
+        }
+        shared.swept_at = Some(now);
+        shared
+            .invites
+            .retain(|_, invite| invite.uses < invite.max_uses && now < invite.expires_at);
     }
 
     /// After the chain item of a delivery, a revocation or a leave, `was` holding the apps

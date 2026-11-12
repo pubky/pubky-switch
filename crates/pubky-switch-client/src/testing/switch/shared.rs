@@ -111,6 +111,8 @@ pub(crate) struct Shared {
     pub(crate) alternate_next: Option<([u8; 32], [u8; 32])>,
     /// Listing pages answered.
     pub(crate) listings: u64,
+    /// The service time of the last minute's sweep (Switch wire 9.1); none yet.
+    pub(crate) swept_at: Option<u64>,
 }
 
 #[cfg(test)]

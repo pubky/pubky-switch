@@ -3242,3 +3242,41 @@ async fn test_backup_outbox_deadline_starts_at_the_verified_service_time() {
         .unwrap();
     assert_eq!(deadline, START + SENT_RETENTION_MS - CLOCK_TOLERANCE_MS);
 }
+
+#[tokio::test]
+async fn test_scripted_invite_codes_spent_or_expired_go_at_the_minutes_sweep() {
+    // As at the service (Switch wire 9.1): once a minute of the switch's clock, at a
+    // request, the codes that expired or ran out go; a live one stays, and a spent one
+    // stays until the next sweep.
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let mut wallet = p.join(&p.alice, "wallet", &protocol).await;
+    let mut shop = p.join(&p.bob, "shop", &protocol).await;
+    let spent = shop
+        .register_invite_code(START + DAY_MS, 1, json!({ "order": "o-1" }))
+        .await
+        .unwrap();
+    let expiring = shop
+        .register_invite_code(START + 10 * MINUTE, 1, Value::Null)
+        .await
+        .unwrap();
+    let live = shop
+        .register_invite_code(START + DAY_MS, 2, Value::Null)
+        .await
+        .unwrap();
+    let mut first = Pair::note(&p.bob, "order");
+    first.invite_code = Some(spent.code.clone());
+    let (_, delivery) = wallet.send(first).await.unwrap();
+    assert!(
+        matches!(delivery, Delivery::Accepted { .. }),
+        "{delivery:?}"
+    );
+    shop.receive(None).await.unwrap();
+    assert_eq!(p.bob.switch().invite_uses_left(&spent.code), Some(0));
+    p.clock.advance_ms(11 * MINUTE);
+    shop.receive(None).await.unwrap();
+    let left = |code: &str| p.bob.switch().invite_uses_left(code);
+    assert_eq!(left(&spent.code), None);
+    assert_eq!(left(&expiring.code), None);
+    assert_eq!(left(&live.code), Some(2));
+}

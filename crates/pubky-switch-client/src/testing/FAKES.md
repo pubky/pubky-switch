@@ -100,9 +100,22 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   `unreadable` item (`push_unreadable`) has an `entry_id` of its own, and both stay
   whatever the cursors. Checkpoints and dropped stubs exist only when a test scripts them;
   claims are deleted only when `GET /claims` finds them deletable; batch records are never
-  dropped, and their proofs go only when a retry finds them past `batch_proofs_ms`.
+  dropped, and their proofs go only when a retry finds them past `batch_proofs_ms`, which
+  answers it `409 conflict` as the service's sweep does.
+- **Forgotten deleted keys** (Switch spec 10.3, wire 9.1), as at the service: at each
+  cursor move, a record whose current write is its delete, written here and not taken
+  from a recovery upload, goes once the cursor of every current app is at or past it,
+  but for a lagging app with a `missed` item it hasn't passed (its own, or one
+  `push_missed` scripted for every app); a key a divergent upload names stays. Its read is
+  then `404`, its delete shows as its stub and a create at it starts afresh. Unlike the
+  service, every such key goes at once, not 64 a request, and the frozen account's
+  exception has nothing to check (no freeze is served here either).
 - **Invite codes**: a revoked app's codes aren't withdrawn (Switch wire 7.4.3 "After a
-  revocation"); a code planted for a faulty export never expires.
+  revocation"); a code planted for a faulty export never expires. Codes that expired or
+  ran out go at the first request a minute of the switch's clock after the last sweep,
+  as at the service; until then `invite_uses_left` still shows a spent code at 0. Unlike
+  the service, any request sweeps, a signer's or a caller's that doesn't verify included,
+  and none waits for trusted time, the switch's clock being trusted.
 - **Lists**: `flagged` is always empty; connect requests are never full.
 - **Records**: `divergent` is set by divergent uploads after a provider loss and cleared
   by a write here, as at the service (Recovery uploads, below).
