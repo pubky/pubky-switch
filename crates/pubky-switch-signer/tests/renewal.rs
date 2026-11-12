@@ -2451,3 +2451,109 @@ async fn test_renewal_stopped_without_open_attempts_warns_of_none() {
             .any(|alert| matches!(alert, Alert::LapsingWithOpenAttempts { .. }))
     );
 }
+
+#[tokio::test]
+async fn test_rotation_given_up_by_a_departure_between_its_batches_is_completed() {
+    // A reduction rotates for nine apps, so its operations span two batches. The first is
+    // stored, the connection is cut on the second, and an app whose part is in the second
+    // leaves meanwhile: the batch sent again is refused `403 not_current` (Switch wire 6.2
+    // `key_bundle.put`), and the rotation is given up with epoch 2's keys sent to some apps.
+    // The next run removes the departed app: it completes epoch 2 first, for every current
+    // app holding each keyed scope, the app whose reduction was given up included, then
+    // rotates to epoch 3 (Switch spec 3.2, 3.5, 12.3).
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let (a, b) = two_apps(&["notes", "notes_sync"], &["notes"]);
+    world.approve(&mut signer, &a).await;
+    world.approve(&mut signer, &b).await;
+    let a_id = a.keys.app_id_bytes();
+    let mut apps = vec![a, b];
+    for n in 0..7u8 {
+        let more = App::with_keys(
+            AppKeys::from_secrets([20 + 2 * n; 32], [21 + 2 * n; 32]),
+            &["notes"],
+            None,
+            [40 + n; 32],
+        );
+        world.approve(&mut signer, &more).await;
+        apps.push(more);
+    }
+    let before = signer.identity_doc().unwrap().unwrap();
+    assert_eq!(before.data_epoch(), 1);
+    let listed = before.listed_cert(&a_id).unwrap();
+    world.switch.fail_next(SwitchFault::Unreachable {
+        path: "/ops".into(),
+        after: 1,
+    });
+    // `notes` has keys, so removing it rotates.
+    signer
+        .renew(a_id, reduce(&["notes_sync"]))
+        .await
+        .unwrap_err();
+    // The first batch gave epoch 2's keys to some apps; the app left is in the second.
+    let unsent: Vec<&App> = apps[1..]
+        .iter()
+        .filter(|app| !holds(&world, &opened(&world, app), 2, "notes"))
+        .collect();
+    assert!(
+        unsent.len() < apps.len() - 1,
+        "the first batch stored parts"
+    );
+    let leaving = unsent.first().expect("an app in the second batch");
+    let leaving_id = leaving.keys.app_id_bytes();
+    world.switch.leave(leaving_id).unwrap();
+    let error = signer.resume().await.unwrap_err();
+    assert!(
+        matches!(
+            error,
+            SignerError::Switch(pubky_switch_client::ClientError::Switch {
+                status: 403,
+                code: ErrorCode::NotCurrent,
+                ..
+            })
+        ),
+        "{error:?}"
+    );
+    let given_up = signer.identity_doc().unwrap().unwrap();
+    assert_eq!(given_up.hash(), before.hash(), "nothing delivered");
+    assert_eq!(world.switch.identity_doc().unwrap().hash(), before.hash());
+    let delivered = world.sent_docs().len();
+    signer.run_due().await.unwrap();
+    let doc = signer.identity_doc().unwrap().unwrap();
+    assert_eq!(
+        doc.data_epoch(),
+        3,
+        "epoch 2 completed, then the removal's rotation"
+    );
+    let epochs: Vec<u64> = world.sent_docs()[delivered..]
+        .iter()
+        .map(IdentityDoc::data_epoch)
+        .collect();
+    assert_eq!(epochs, [2, 3], "the completion in a version of its own");
+    assert!(doc.listed_cert(&leaving_id).is_none());
+    assert!(doc.body().removed.iter().any(|r| r.app_id == leaving_id));
+    // The reduction was given up: `a` keeps its certificate and both scopes.
+    assert_eq!(doc.listed_cert(&a_id), Some(listed));
+    // Every app still listed holds each of its keyed scopes' keys through the current epoch.
+    for app in apps
+        .iter()
+        .filter(|app| app.keys.app_id_bytes() != leaving_id)
+    {
+        let parts = opened(&world, app);
+        let scopes: &[&str] = if app.keys.app_id_bytes() == a_id {
+            &["notes", "notes_sync"]
+        } else {
+            &["notes"]
+        };
+        for epoch in 1..=3 {
+            for scope in scopes {
+                assert!(
+                    app_holds(&world, app, &parts, epoch, scope),
+                    "{scope} at {epoch}"
+                );
+            }
+        }
+    }
+    // The departed app gets nothing past the epoch it left at.
+    assert!(!holds(&world, &opened(&world, leaving), 3, "notes"));
+}

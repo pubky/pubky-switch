@@ -4,8 +4,9 @@
 //! staged admission the recovery starts is ended, by the signer or by an app's upload.
 //!
 //! The recovery's own record, the `recovery` transition that starts the new chain, is in
-//! no answer to the signer. Three flows show it, [`provider_loss`],
-//! [`provider_loss_sender_admitted`] and [`provider_loss_in_place`]: the wallet follows the
+//! no answer to the signer. Four flows show it, [`provider_loss`],
+//! [`provider_loss_sender_admitted`], [`provider_loss_in_place`] and
+//! [`provider_loss_in_place_sender`]: the wallet follows the
 //! recovery there, registers at the service, reads the new chain from its first item, and
 //! uploads what it holds. The other three compare neither the record nor the start of the
 //! chain. What an upload merges is in [`super::upload`].
@@ -23,6 +24,7 @@ use serde_json::{Value, json};
 use super::enrollment::{enroll, status};
 use super::join::{app_status, events};
 use super::messaging::joined;
+use super::upload::{CAROLS_FIRST_CALL, expect_lists};
 use super::{ORIGIN, STEP_MS};
 use crate::parties::NOTE_KIND;
 use crate::{FlowResult, World};
@@ -293,12 +295,14 @@ pub async fn provider_loss(world: &World) -> FlowResult {
 }
 
 /// A sender held back while admission is staged, and admitted once alice's wallet has
-/// brought her contacts. bob is alice's contact, and his shop has written to her. Her
-/// service is lost and her signer recovers at another, which holds no list: admission is
-/// staged, and bob's next note is answered `503 staged`, as a stranger's would be. The
-/// wallet follows the recovery; its upload carries her contacts and ends the staged
-/// admission (Switch spec 12.6 step 2). bob's shop tries again and is admitted, and the
-/// wallet reads his note at the new service.
+/// brought her lists. bob is alice's contact, and his shop has written to her; carol is a
+/// contact she blocked. Her service is lost and her signer recovers at another, which
+/// holds no list: admission is staged, and bob's next note is answered `503 staged`, as a
+/// stranger's would be, and so is carol's. The wallet follows the recovery; its upload
+/// carries her contacts and her deny list and ends the staged admission (Switch spec 12.6
+/// step 2). bob's shop tries again and is admitted, and the wallet reads his note at the
+/// new service. carol's stall tries again and is refused: the deny list is in force from
+/// the moment anyone is admitted.
 ///
 /// Calls: a sender's calls at a staged account (`503 staged`); `POST
 /// /v1/{id}/recovery/upload` with `lists.contacts` from an app holding `lists.manage`;
@@ -311,16 +315,23 @@ pub async fn provider_loss(world: &World) -> FlowResult {
 pub async fn provider_loss_sender_admitted(world: &World) -> FlowResult {
     let alice = world.identity("alice")?;
     let bob = world.identity("bob")?;
+    let carol = world.identity("carol")?;
     world.add_switch(ORIGIN, &[&alice]).await?;
-    world.add_switch(SENDERS_ORIGIN, &[&bob]).await?;
+    world.add_switch(SENDERS_ORIGIN, &[&bob, &carol]).await?;
     let mut alice_signer = enroll(world, &alice, ORIGIN).await?;
     let mut bob_signer = enroll(world, &bob, SENDERS_ORIGIN).await?;
+    let mut carol_signer = enroll(world, &carol, SENDERS_ORIGIN).await?;
     let (mut wallet, wallet_protocol) = joined(world, &alice, &mut alice_signer, "wallet").await?;
     let (mut shop, _) = joined(world, &bob, &mut bob_signer, "shop").await?;
+    let (mut stall, _) = joined(world, &carol, &mut carol_signer, "stall").await?;
 
     wallet.add_contact(&bob.public()).await?;
+    world.advance_ms(STEP_MS);
+    wallet.add_contact(&carol.public()).await?;
+    world.advance_ms(STEP_MS);
+    wallet.deny(&carol.public()).await?;
     world.outcome(
-        "the wallet saved bob as a contact",
+        "the wallet saved bob and carol as contacts and blocked carol",
         &app_status(&mut wallet),
     );
     world.advance_ms(STEP_MS);
@@ -363,6 +374,15 @@ pub async fn provider_loss_sender_admitted(world: &World) -> FlowResult {
     // Staged, the service holds every sender back (Switch spec 12.6 step 2). bob wrote to
     // alice before, so his shop asks for her directory first (Switch wire 7.4.10).
     expect_answer(world, "{bob/shop} GET /v1/{alice}/directory", 503, "staged")?;
+    // carol, blocked, is held back the same way: the staging tells her nothing.
+    send(
+        world,
+        "carol's stall wrote to alice while admission was staged",
+        &mut stall,
+        Some(alice.public()),
+    )
+    .await?;
+    expect_answer(world, CAROLS_FIRST_CALL, 503, "staged")?;
 
     follow_recovery(world, &mut wallet, "wallet", 1).await?;
     expect_upload(world, "wallet", true)?;
@@ -386,6 +406,24 @@ pub async fn provider_loss_sender_admitted(world: &World) -> FlowResult {
             return Err(format!("bob's {call} was answered {answered:?}").into());
         }
     }
+    // The same upload brought the deny list: carol, a contact too, is refused as soon as
+    // anyone is admitted.
+    send(
+        world,
+        "carol's stall tried again once the wallet had uploaded",
+        &mut stall,
+        None,
+    )
+    .await?;
+    expect_answer(world, CAROLS_FIRST_CALL, 403, "not_admitted")?;
+    expect_lists(
+        world,
+        "the lists at the new service",
+        &mut wallet,
+        &[&bob, &carol],
+        &[&carol],
+    )
+    .await?;
     read_notes(
         world,
         "the wallet read bob's note at the new service",

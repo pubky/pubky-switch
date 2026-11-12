@@ -319,13 +319,13 @@ async fn write_entry(
     Ok(written.view)
 }
 
-/// `app` reads the claim from the switch: the step it reads at, and how many entries the
-/// switch lists.
+/// `app` reads the claim from the switch: the step it reads at, and the step of each
+/// entry the switch lists.
 async fn app_read(
     world: &World,
     name: &str,
     app: &mut App,
-) -> Result<(u64, usize), Box<dyn std::error::Error>> {
+) -> Result<(u64, Vec<u64>), Box<dyn std::error::Error>> {
     let read = app
         .read_claim(&CLAIM_KEY)
         .await?
@@ -340,7 +340,10 @@ async fn app_read(
         }),
     );
     world.advance_ms(STEP_MS);
-    Ok((read.view.step, read.entries.len()))
+    Ok((
+        read.view.step,
+        read.entries.iter().map(|entry| entry.step).collect(),
+    ))
 }
 
 /// Fail the flow unless the evidence upload of alice's app `name` changed one claim.
@@ -477,10 +480,13 @@ pub async fn recovery_upload_claim(world: &World) -> FlowResult {
         &mut wallet,
     )
     .await?;
-    if read != (failed.step, 1) {
+    // One entry, at the step it was written at: the steps before it, which the uploads
+    // made, have none.
+    if read != (failed.step, vec![attempting.step]) {
         return Err(format!(
-            "the rebuilt claim reads at step {} with {} entries, not at {} with 1",
-            read.0, read.1, failed.step
+            "the rebuilt claim reads at step {} with entries at {:?}, not at {} with one \
+             at {}",
+            read.0, read.1, failed.step, attempting.step
         )
         .into());
     }
@@ -516,22 +522,26 @@ pub async fn recovery_upload_claim(world: &World) -> FlowResult {
 }
 
 /// An upload by an app that reads the lists and can't manage them. alice's wallet saved
-/// bob as a contact and blocked carol; her reader, an app holding `lists.read` alone, read
-/// the lists. After the recovery the reader follows first: its upload brings the deny
-/// list, which only restricts admission, and doesn't end the staged admission. bob and
-/// carol each write to alice and are held back alike, so the staging tells carol nothing.
-/// The wallet follows: its upload brings the contacts and ends the staged admission. bob
-/// tries again and is admitted; carol tries again and is refused.
+/// bob and carol as contacts and then blocked carol; her reader, an app holding
+/// `lists.read` alone, read the lists. After the recovery the reader follows first: its
+/// upload brings the deny list, which only restricts admission, and doesn't end the staged
+/// admission. The lists it then reads at the new service hold carol on the deny list and
+/// no contact. bob and carol each write to alice and are held back alike, so the staging
+/// tells carol nothing. The wallet follows: its upload brings the contacts, carol among
+/// them, and ends the staged admission. bob tries again and is admitted; carol tries again
+/// and is refused, a contact the deny list keeps out.
 ///
 /// Calls: `POST /v1/{id}/recovery/upload` with `lists.deny` alone, from an app holding
-/// `lists.read`; `GET /v1/{id}/apps` with `admission_staged` still true after it; `PUT
+/// `lists.read`; `GET /v1/{id}/allow` with an uploaded deny entry; `GET /v1/{id}/apps`
+/// with `admission_staged` still true after it; `PUT
 /// /v1/{id}/peers` from a contact and from a denied sender while staged (`503 staged`)
 /// and after the upload that ended it (admitted, `403 not_admitted`).
 ///
 /// # Errors
 ///
 /// When a step that should succeed against any switch fails, the reader's upload ends
-/// the staged admission, or a sender is admitted or refused against what its step says.
+/// the staged admission or leaves carol off the deny list, or a sender is admitted or
+/// refused against what its step says.
 pub async fn recovery_upload_deny_only(world: &World) -> FlowResult {
     let alice = world.identity("alice")?;
     let bob = world.identity("bob")?;
@@ -549,9 +559,11 @@ pub async fn recovery_upload_deny_only(world: &World) -> FlowResult {
 
     wallet.add_contact(&bob.public()).await?;
     world.advance_ms(STEP_MS);
+    wallet.add_contact(&carol.public()).await?;
+    world.advance_ms(STEP_MS);
     wallet.deny(&carol.public()).await?;
     world.outcome(
-        "the wallet saved bob as a contact and blocked carol",
+        "the wallet saved bob and carol as contacts and blocked carol",
         &json!({ "events": events(&wallet.take_events()) }),
     );
     world.advance_ms(STEP_MS);
@@ -568,6 +580,16 @@ pub async fn recovery_upload_deny_only(world: &World) -> FlowResult {
         &json!({ "requests": world.requests_sent() }),
     );
     expect_staged(world, true)?;
+    // The deny entry is in force at the new service from the reader's upload on, before
+    // any contact is there: the lists the reader reads say so.
+    expect_lists(
+        world,
+        "the lists after the reader's upload",
+        &mut reader,
+        &[],
+        &[&carol],
+    )
+    .await?;
 
     // The senders' copies of alice's `identity.json` are ten minutes old by now, so each
     // reads it again and finds the new service (Switch spec 4.3).
@@ -613,13 +635,58 @@ pub async fn recovery_upload_deny_only(world: &World) -> FlowResult {
         None,
     )
     .await?;
+    // carol is a contact at the new service now, and refused all the same: the deny list
+    // is what keeps her out.
     expect_answer(world, CAROLS_FIRST_CALL, 403, "not_admitted")?;
+    expect_lists(
+        world,
+        "the lists at the end",
+        &mut wallet,
+        &[&bob, &carol],
+        &[&carol],
+    )
+    .await?;
     Ok(())
+}
+
+/// `app` reads the lists from the switch (`GET /v1/{id}/allow`); the flow fails unless the
+/// contacts are exactly `contacts` and the deny list exactly `deny`.
+pub(super) async fn expect_lists(
+    world: &World,
+    name: &str,
+    app: &mut App,
+    contacts: &[&TestIdentity],
+    deny: &[&TestIdentity],
+) -> FlowResult {
+    let list = app.allow_list().await?;
+    world.outcome(
+        name,
+        &json!({ "contacts": list.contacts.len(), "deny": list.deny.len() }),
+    );
+    world.advance_ms(STEP_MS);
+    let same = |held: &[[u8; 32]], expected: &[&TestIdentity]| {
+        held.len() == expected.len()
+            && expected
+                .iter()
+                .all(|identity| held.contains(&identity.public()))
+    };
+    if same(&list.contacts, contacts) && same(&list.deny, deny) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{name}: {} contacts and {} denied, not the {} and {} expected",
+            list.contacts.len(),
+            list.deny.len(),
+            contacts.len(),
+            deny.len()
+        )
+        .into())
+    }
 }
 
 /// carol's delivery of her `identity.json` to alice's switch, her first call when she
 /// writes to her.
-const CAROLS_FIRST_CALL: &str = "{carol/stall} PUT /v1/{alice}/peers";
+pub(super) const CAROLS_FIRST_CALL: &str = "{carol/stall} PUT /v1/{alice}/peers";
 
 /// A client that sends requests as alice's app `name`, signed with the app's key, to the
 /// service `origin` whose key for her account is `service_key`: for an upload no app of
@@ -835,6 +902,96 @@ pub async fn recovery_upload_refused(world: &World) -> FlowResult {
         None,
     )
     .await?;
+    Ok(())
+}
+
+/// Uploads from before a loss count against the hour of the uploads after it (Switch wire
+/// 7.4.14, 9.4). alice's service takes three uploads an hour from one app. Her reader's
+/// client sends three uploads while the account has lost no provider: each is `404`, and
+/// each takes a slot, since the service takes it once the request verifies, before it
+/// looks at the stage. In the same hour her signer recovers in place. The reader follows
+/// the recovery: it registers again, and its own upload is `429 rate_limited`, which the
+/// app takes as a refusal the service may lift. In the next hour it follows again, and
+/// the upload is taken.
+///
+/// # Errors
+///
+/// When a step that should succeed against any switch fails, or an upload is answered
+/// other than its step says.
+pub async fn recovery_upload_slots_before_the_loss(world: &World) -> FlowResult {
+    let alice = world.identity("alice")?;
+    let limits = Limits {
+        uploads_per_app_per_hour: UPLOADS_AN_HOUR,
+        ..Limits::default()
+    };
+    world.add_switch_with(ORIGIN, &[&alice], limits).await?;
+    let mut signer = enroll(world, &alice, ORIGIN).await?;
+    let asking = Asking::for_scope(world.app_keys(&alice, "reader")?, NOTES_READER)?;
+    let (mut reader, _) = joined_as(world, &alice, &mut signer, asking, notes_protocol()).await?;
+
+    // The start of an hour of the service's clock: the uploads before the loss and the
+    // one after it fall in one window.
+    world.advance_ms(HOUR_MS - world.now_ms() % HOUR_MS);
+    let doc = signer
+        .identity_doc()?
+        .ok_or("the signer holds no document")?;
+    let before = client_of(
+        world,
+        &alice,
+        "reader",
+        &reader,
+        ORIGIN,
+        doc.inbox().service_key,
+    )?;
+    for nth in ["first", "second", "third"] {
+        upload(
+            world,
+            &format!("the {nth} upload at an account that lost no provider"),
+            &before,
+            "reader",
+            NOTHING,
+            404,
+            Some("not_found"),
+        )
+        .await?;
+    }
+
+    let doc = signer
+        .declare_provider_loss(ORIGIN, UserConfirmed::shown_and_confirmed())
+        .await?;
+    world.outcome(
+        "the signer declared the loss and recovered in place",
+        &recovered(&doc, &signer)?,
+    );
+    world.advance_ms(STEP_MS);
+
+    for (name, status, taken) in [
+        ("in the hour of the uploads before the loss", "429", false),
+        ("in the next hour", "200", true),
+    ] {
+        let refreshed = reader.refresh_identity().await;
+        let followed = reader.follow_provider().await;
+        world.outcome(
+            &format!("the reader followed the recovery {name}"),
+            &json!({
+                "refreshed": ended(&refreshed),
+                "ended": ended(&followed),
+                "events": events(&reader.take_events()),
+            }),
+        );
+        let answered = world.last_fact(&upload_of("reader"), "status");
+        let code = world.last_fact(&upload_of("reader"), "body.code");
+        let limited = code.as_deref() == Some("text rate_limited");
+        if answered.as_deref() != Some(status) || followed.is_ok() != taken || limited == taken {
+            return Err(format!(
+                "{name}, the reader's upload was answered {answered:?} {code:?} and its \
+                 follow ended {}",
+                ended(&followed)
+            )
+            .into());
+        }
+        world.advance_ms(HOUR_MS);
+    }
     Ok(())
 }
 
