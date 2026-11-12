@@ -623,6 +623,46 @@ async fn test_inbox_invite_code_admits_once_and_adds_a_conversation() {
     replay.db.drop_database().await.expect("drop");
 }
 
+#[tokio::test]
+async fn test_inbox_invite_code_conversation_answers_the_senders_connect_request() {
+    // The conversation entry the service writes at a code's first admitted append answers
+    // the sender's pending connect request (Switch wire 7.4.7).
+    let Some(replay) = replay().await else { return };
+    replay_chain_through_revoke(&replay).await;
+    deliver_bob_with_code(&replay).await;
+    let bob_hex = bob()["public_hex"].as_str().expect("hex").to_string();
+    let pending = format!(
+        "SELECT count(*) FROM connect_requests WHERE account_id = $1 \
+         AND pubky = decode('{bob_hex}', 'hex')"
+    );
+    {
+        use sqlx::Connection;
+        let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+            .await
+            .expect("conn");
+        sqlx::query(&format!(
+            "INSERT INTO connect_requests (account_id, pubky, at_ms) \
+             VALUES ($1, decode('{bob_hex}', 'hex'), 0)"
+        ))
+        .bind(alice_id())
+        .execute(&mut conn)
+        .await
+        .expect("a pending request");
+    }
+    assert_eq!(sql_value(&replay, &pending).await, 1);
+    let version = apps_version(&replay).await;
+    let code = "IRrC78oNIjZ4hcet2fYnJQ";
+    let answer = from_shop(&replay, to_wallet(14, false), Some(version), Some(code)).await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    assert_eq!(sql_value(&replay, &pending).await, 0);
+    replay.db.drop_database().await.expect("drop");
+}
+
 /// bob's shop delivers his identity.json with an invite code alice's wallet registered.
 async fn deliver_bob_with_code(replay: &Replay) {
     let code = "IRrC78oNIjZ4hcet2fYnJQ";
