@@ -1153,8 +1153,40 @@ impl ScriptedSwitch {
             }
             return Ok(inner.respond(request, status, &body));
         }
+        let stamped_before = inner.stamped_ms;
         if let Some(answer) = inner.stale_timestamp(request) {
             return Ok(answer);
+        }
+        let caller = request
+            .header(header::APP)
+            .and_then(|text| app_id_decode(text).ok());
+        let rest = path.splitn(4, '/').nth(3).unwrap_or_default().to_owned();
+        let account = inner.identity.public();
+        // An own app the switch holds no record for, at any call but the batch that can
+        // carry its `app.put`: no key verifies the request, so authentication refuses it,
+        // whatever the route and before the account's lock, the staged and frozen answers
+        // included, as the service does: `403 not_current`, no head, the last committed
+        // time, and the app not seen (Switch wire 7.1 "`Switch-Head` on refusals", 7.2 "An
+        // own app's first call", 7.3 steps 5 to 8).
+        if let Some(app) = caller
+            && !(inner.erased || inner.enrolled.is_none())
+            && inbox::Sender::foreign(request, &account).is_none()
+            && !(request.method == "POST" && rest == "ops")
+            && inner
+                .apps
+                .get(&app)
+                .is_none_or(|held| held.record.is_none())
+        {
+            inner.stamped_ms = stamped_before;
+            if lose {
+                return Err(TransportError::Timeout);
+            }
+            let (status, body) = bad(
+                ErrorCode::NotCurrent,
+                "Switch wire 7.2: an own app's first call carries its app.put",
+                json!(null),
+            );
+            return Ok(inner.respond_at(&inner.service, request, status, &body, stamped_before));
         }
         if let Some((status, body)) = inner.gate(&request.method, &path) {
             // A staged account's refusal comes after authentication: the app was seen.
@@ -1166,11 +1198,6 @@ impl ScriptedSwitch {
             }
             return Ok(inner.respond(request, status, &body));
         }
-        let caller = request
-            .header(header::APP)
-            .and_then(|text| app_id_decode(text).ok());
-        let rest = path.splitn(4, '/').nth(3).unwrap_or_default().to_owned();
-        let account = inner.identity.public();
         if let Some(sender) = inbox::Sender::foreign(request, &account) {
             // An app of another identity: the routes a sender calls (Switch wire 7.2).
             let (status, body) = inner

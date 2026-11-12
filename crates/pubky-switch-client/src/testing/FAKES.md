@@ -136,9 +136,8 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   and `after` must be `b64(32)`, and `limit` digits from 1 to 1000 (`400`); a record by key
   needs its `read_scope` (`403 permission_missing`, with the head), and a list shows only
   the records whose `read_scope` the reader holds, by the certificate the switch checks the
-  app against. Unlike the service, which answers an own app it holds no certificate for
-  `401` at authentication, this switch serves it as one holding no scope: `403` by key and
-  an empty list. Order by the key text, `after`
+  app against. An own app it holds no record for meets the first-call refusal below, as
+  at the service, before its query or key is read. Order by the key text, `after`
   as a key's text, `next`, the byte budget with its first view shown, deleted records shown
   by key and left out of lists, and a view's `cert`, the certificate the write was checked
   against, kept with the record whatever a renewal or revocation later changes, are the
@@ -160,6 +159,13 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   answer it so; the service doesn't serve it yet (`503 unavailable`).
 - **`open_admission`** (`admit_everyone`) admits every sender the deny list doesn't hold, a
   test switch only.
+- **An own app's first call** (Switch wire 7.1 "`Switch-Head` on refusals", 7.2), as at
+  the service (`crates/pubky-switch/src/service/batch/mod.rs`, `verify_own_app`): an own
+  app the switch holds no record for, at any call but `POST /ops`, gets `403 not_current`
+  at authentication, before the account's lock and before a staged or frozen account's
+  answer (Switch wire 7.3 steps 5 to 8), whatever the route: no `Switch-Head`,
+  `Switch-Server-Time` the last time stamped, and the app not seen. A departed app that
+  delivered its record keeps it, so it goes on to the route's checks.
 - **App currency outside batches**: a feed read is checked as a batch is, for an app that
   delivered its record: current, with an unexpired certificate, the stored renewed one once
   the newest `identity.json` lists it (Switch wire 7.2, 3.8). Other routes check only that

@@ -1892,13 +1892,20 @@ async fn test_loss_registration_naming_another_key_stops_the_recovery() {
     let error = follow_loss(&lost, Arc::clone(&store) as Arc<dyn StateStore>)
         .await
         .unwrap_err();
-    assert!(matches!(error, AppError::InvalidData(_)), "{error:?}");
+    // The conflict names no key, so the app looks for its own in the directory; the new
+    // service holds no record of it yet, its registration refused, and refuses the read as
+    // a first call, with no head (Switch wire 7.2). That isn't a removal.
+    assert_eq!(error.code(), Some(ErrorCode::NotCurrent), "{error:?}");
     // Nothing past the registration ran; the next read resumes it.
     assert!(lost.next.uploads().is_empty());
     assert!(lost.protocol.losses.lock().unwrap().is_empty());
-    let (app, _) = follow_loss(&lost, store as Arc<dyn StateStore>)
+    let (app, events) = follow_loss(&lost, store as Arc<dyn StateStore>)
         .await
         .unwrap();
+    assert!(
+        !has(&events, |e| matches!(e, AppEvent::Removed)),
+        "{events:?}"
+    );
     assert!(app.recovery_info().await.unwrap().unwrap().steps_done);
 }
 

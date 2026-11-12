@@ -5002,7 +5002,7 @@ async fn test_scripted_records_by_key_needs_the_read_scope() {
 }
 
 #[tokio::test]
-async fn test_scripted_records_signer_and_an_app_without_a_certificate_read_none() {
+async fn test_scripted_records_signer_reads_none_and_an_app_without_a_record_is_refused_first() {
     let s = Setup::new();
     let mut phone = s.join("phone").await;
     let key = phone_record(&s, &mut phone).await;
@@ -5022,20 +5022,27 @@ async fn test_scripted_records_signer_and_an_app_without_a_certificate_read_none
             "{rest}"
         );
     }
-    // An own app the switch holds no certificate for holds no read scope: refused by key,
-    // and its list shows nothing, where the phone's shows the record.
+    // An own app the switch holds no record for has no key its request verifies with: it
+    // meets the first-call refusal at both reads, before the lock, so without the head, as
+    // at the service (Switch wire 7.1, 7.2; `verify_own_app`). The phone's list shows the
+    // record.
     let unknown = Some(app_keys("unknown").app_id_bytes());
+    for rest in [&by_key, &list] {
+        assert_eq!(
+            scripted_get(&s, unknown, rest),
+            (403, json!("not_current"), false),
+            "{rest}"
+        );
+    }
+    // A query given twice is the endpoint's to refuse, after that refusal.
     assert_eq!(
-        scripted_get(&s, unknown, &by_key),
-        (403, json!("permission_missing"), true)
+        scripted_get(&s, unknown, &format!("{list}&limit=1&limit=2")),
+        (403, json!("not_current"), false)
     );
-    let shown = |app| {
-        scripted_page(&s, app, &list)["records"]
-            .as_array()
-            .map(Vec::len)
-    };
-    assert_eq!(shown(Some(phone.app_id())), Some(1));
-    assert_eq!(shown(unknown), Some(0));
+    let shown = scripted_page(&s, Some(phone.app_id()), &list)["records"]
+        .as_array()
+        .map(Vec::len);
+    assert_eq!(shown, Some(1));
 }
 
 #[tokio::test]
@@ -5768,4 +5775,101 @@ async fn test_records_record_job_given_up_keeps_an_owed_resend() {
         wallet.delivery(&msg_id).await.unwrap(),
         Some(Delivery::Queued { .. })
     ));
+}
+
+/// A request of `method` to `rest` at alice's scripted switch from her app `app`, as it
+/// arrives: the status, the code, whether it carries the head, and its `Switch-Server-Time`.
+fn scripted_call(
+    s: &Setup,
+    app: [u8; 16],
+    method: &str,
+    rest: &str,
+) -> (u16, Value, bool, Option<String>) {
+    use pubky_switch_core::http::header;
+    let response =
+        s.w.switch
+            .handle(&crate::transport::Request {
+                method: method.into(),
+                origin: ORIGIN.into(),
+                path_and_query: format!("/v1/{}/{rest}", s.w.alice.id()),
+                headers: vec![
+                    crate::transport::Header::new(header::IDENTITY, &s.w.alice.id()),
+                    crate::transport::Header::new(
+                        header::APP,
+                        &pubky_switch_core::enc::zbase32_encode(&app),
+                    ),
+                ],
+                body: b"{}".to_vec(),
+            })
+            .unwrap();
+    let body: Value = serde_json::from_slice(&response.body).unwrap_or(Value::Null);
+    (
+        response.status,
+        body["code"].clone(),
+        response.header(header::HEAD).is_some(),
+        response.header(header::SERVER_TIME).map(str::to_owned),
+    )
+}
+
+/// Switch wire 7.1 "`Switch-Head` on refusals", 7.2: every first call of an own app the
+/// switch holds no record for but a batch is refused alike, whatever the route, before the
+/// account's lock, as the service does (`verify_own_app`).
+#[tokio::test]
+async fn test_scripted_first_call_without_a_record_is_refused_alike_at_every_route() {
+    let s = Setup::new();
+    let mut phone = s.join("phone").await;
+    phone.receive(None).await.unwrap();
+    let committed = pubky_switch_core::time::rfc3339(s.w.switch.lock().stamped_ms);
+    s.w.clock.advance_ms(61_000);
+    let unknown = app_keys("unknown").app_id_bytes();
+    let claim = pubky_switch_core::enc::b64(&[7; 32]);
+    for (method, rest) in [
+        ("GET", "feed".to_owned()),
+        ("GET", "allow".to_owned()),
+        ("GET", format!("claims/{claim}")),
+        ("POST", "recovery/upload".to_owned()),
+        ("GET", "directory".to_owned()),
+        ("GET", "apps".to_owned()),
+        ("PUT", "identity".to_owned()),
+    ] {
+        assert_eq!(
+            scripted_call(&s, unknown, method, &rest),
+            (403, json!("not_current"), false, Some(committed.clone())),
+            "{method} {rest}"
+        );
+    }
+    // Not seen, and nothing stamped.
+    assert_eq!(s.w.switch.app(&unknown).last_seen, None);
+    assert_eq!(
+        pubky_switch_core::time::rfc3339(s.w.switch.lock().stamped_ms),
+        committed
+    );
+    // A batch can carry its `app.put`: it goes on to the batch's checks.
+    let (status, code, _, _) = scripted_call(&s, unknown, "POST", "ops");
+    assert_ne!((status, code), (403, json!("not_current")));
+    // An app the switch holds a record for goes on to the route.
+    let (status, _, head, _) = scripted_call(&s, phone.app_id(), "GET", "allow");
+    assert_eq!((status, head), (200, true));
+    // Authentication comes before the staged answer (Switch wire 7.3 steps 5 and 7): at a
+    // staged account the unrecorded app is refused alike, the phone answered `503 staged`.
+    s.w.switch.lock().staged = true;
+    for rest in ["feed", "recovery/upload"] {
+        let (status, code, head, _) = scripted_call(
+            &s,
+            unknown,
+            if rest == "feed" { "GET" } else { "POST" },
+            rest,
+        );
+        assert_eq!(
+            (status, code, head),
+            (403, json!("not_current"), false),
+            "{rest}"
+        );
+    }
+    let (status, code, head, _) = scripted_call(&s, phone.app_id(), "GET", "feed");
+    assert_eq!((status, code, head), (503, json!("staged"), true));
+    // An account the switch doesn't hold is found missing first (Switch wire 7.3 step 2).
+    s.w.switch.lock().erased = true;
+    let (status, code, head, _) = scripted_call(&s, unknown, "GET", "feed");
+    assert_eq!((status, code, head), (404, json!("not_found"), false));
 }
