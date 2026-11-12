@@ -104,6 +104,26 @@ pub trait Protocol: Send + Sync {
         let _ = (app_id, scopes);
         Vec::new()
     }
+
+    /// The protocol's own rule on which of its grant paths one grant may cover, beyond the
+    /// Switch's rules: for example, two paths that go only together (Switch spec 3.4, Switch
+    /// wire 3.9). `app_id` and `scopes`, its own scopes only, are those [`Protocol::grant_paths`]
+    /// was given for the app. `allowed` holds the paths this protocol added for it that the
+    /// grant would cover: those the app asks for, less those the user declines, in the order
+    /// the auth request names them. Every set passes by default.
+    ///
+    /// # Errors
+    ///
+    /// A reason to show the user. It should name the rule, such as which paths go together.
+    fn check_grant_paths(
+        &self,
+        app_id: &[u8; 16],
+        scopes: &[&str],
+        allowed: &[&str],
+    ) -> std::result::Result<(), String> {
+        let _ = (app_id, scopes, allowed);
+        Ok(())
+    }
 }
 
 /// A protocol the host registered that is malformed, or that answered with something the
@@ -407,12 +427,14 @@ impl Protocols {
     /// The grant paths the owning protocols add for an app with `app_id` holding `scopes`,
     /// each checked against the Switch's rules (Switch spec 3.4, Switch wire 3.9 step 3): an
     /// absolute path the capability text can carry, outside the Switch's own folders, and
-    /// covering neither `identity.json` nor the signer's backup. Each path appears once.
+    /// covering neither `identity.json` nor the signer's backup. Each path appears once, and
+    /// none covers another, of its protocol or another one, so that a path the user declines
+    /// is off the grant.
     ///
     /// # Errors
     ///
-    /// [`ProtocolError::BadGrantPath`] for a path that breaks a rule, or that two protocols
-    /// add.
+    /// [`ProtocolError::BadGrantPath`] for a path that breaks a rule, that two protocols
+    /// add, or that covers or lies in another added path.
     pub fn grant_paths(&self, app_id: &[u8; 16], scopes: &[String]) -> Result<Vec<GrantPath>> {
         let mut out: Vec<GrantPath> = Vec::new();
         for (protocol, own) in self.by_protocol(scopes) {
@@ -425,10 +447,46 @@ impl Protocols {
                 if out.iter().any(|p| p.path == path.path) {
                     return Err(bad("a path added twice").into());
                 }
+                if out
+                    .iter()
+                    .any(|p| covers(&p.path, &path.path) || covers(&path.path, &p.path))
+                {
+                    return Err(bad("a path that covers another").into());
+                }
                 out.push(path);
             }
         }
         Ok(out)
+    }
+
+    /// Each owning protocol's rule on the grant paths `allowed` (Switch spec 3.4, Switch wire
+    /// 3.9): every protocol owning some of `scopes` is given those of `allowed` that it adds
+    /// for an app with `app_id`, in their order, none included.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::ProtocolRule`] from the first protocol whose rule refuses its paths.
+    pub fn check_grant_paths(
+        &self,
+        app_id: &[u8; 16],
+        scopes: &[String],
+        allowed: &[&str],
+    ) -> Result<()> {
+        for (protocol, own) in self.by_protocol(scopes) {
+            let added = protocol.grant_paths(app_id, &own);
+            let its: Vec<&str> = allowed
+                .iter()
+                .copied()
+                .filter(|path| added.iter().any(|a| a.path == *path))
+                .collect();
+            protocol
+                .check_grant_paths(app_id, &own, &its)
+                .map_err(|reason| Refusal::ProtocolRule {
+                    protocol: protocol.name().to_owned(),
+                    reason,
+                })?;
+        }
+        Ok(())
     }
 }
 
@@ -474,6 +532,9 @@ fn check_grant_path(path: &str) -> std::result::Result<(), &'static str> {
         .any(|segment| segment == "." || segment == "..")
     {
         return Err("a '.' or '..' segment");
+    }
+    if path.contains("//") {
+        return Err("an empty segment");
     }
     if covers(path, IDENTITY_PATH) || covers(path, SIGNER_BACKUP_PATH) {
         return Err("it covers identity.json or the signer's backup");
@@ -832,6 +893,8 @@ mod tests {
             "/pub/beta/a:rw",
             "/pub/beta/a b",
             "/pub/beta/../pubky-switch/v1/identity.json",
+            "/pub/beta//a.json",
+            "/pub/beta/a//",
             "/pub/",
             "/pub/pubky-switch/",
             "/pub/pubky-switch/v1/identity.json",
@@ -896,6 +959,77 @@ mod tests {
                 protocol: "gamma".into(),
                 rule: "a path added twice"
             })
+        );
+    }
+
+    #[test]
+    fn test_protocols_grant_paths_refuse_a_path_that_covers_another() {
+        // A declined path another added path covers would stay on the grant, so neither one
+        // protocol nor two may add paths that cover one another (Switch spec 3.4).
+        struct Nested(&'static [&'static str]);
+        impl Protocol for Nested {
+            fn name(&self) -> &str {
+                "gamma"
+            }
+            fn scopes(&self) -> Vec<ScopeDef> {
+                vec![ScopeDef::unkeyed("gamma")]
+            }
+            fn check_scopes(&self, _: &[&str]) -> std::result::Result<(), String> {
+                Ok(())
+            }
+            fn permissions(&self, _: &[&str]) -> Vec<Permission> {
+                Vec::new()
+            }
+            fn grant_paths(&self, _: &[u8; 16], _: &[&str]) -> Vec<GrantPath> {
+                self.0
+                    .iter()
+                    .map(|path| GrantPath {
+                        path: (*path).into(),
+                        purpose: "a file".into(),
+                    })
+                    .collect()
+            }
+        }
+        let covering = |protocol: &str| {
+            SignerError::Protocol(ProtocolError::BadGrantPath {
+                protocol: protocol.into(),
+                rule: "a path that covers another",
+            })
+        };
+        for paths in [
+            &["/pub/gamma/", "/pub/gamma/a.json"][..],
+            &["/pub/gamma/a/b.json", "/pub/gamma/a/"][..],
+        ] {
+            let one = Protocols::new(vec![Arc::new(Nested(paths))]).unwrap();
+            let error = one.grant_paths(&[1; 16], &owned(&["gamma"])).unwrap_err();
+            assert_eq!(error, covering("gamma"));
+        }
+        // A folder of one protocol covering the other's file, whichever the scopes name
+        // first.
+        let two = Protocols::new(vec![
+            Arc::new(Beta {
+                path: "/pub/beta/tags.json",
+            }),
+            Arc::new(Nested(&["/pub/beta/"])),
+        ])
+        .unwrap();
+        for (scopes, second) in [(["beta", "gamma"], "gamma"), (["gamma", "beta"], "beta")] {
+            let error = two.grant_paths(&[1; 16], &owned(&scopes)).unwrap_err();
+            assert_eq!(error, covering(second));
+        }
+        // Paths side by side pass, a folder and a file named like its start included.
+        let apart = Protocols::new(vec![Arc::new(Nested(&[
+            "/pub/gamma/a.json",
+            "/pub/gamma/ab/",
+            "/pub/gamma/a",
+        ]))])
+        .unwrap();
+        assert_eq!(
+            apart
+                .grant_paths(&[1; 16], &owned(&["gamma"]))
+                .unwrap()
+                .len(),
+            3
         );
     }
 
