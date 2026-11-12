@@ -921,7 +921,7 @@ An identity has one signer at a time, the install its newest `identity.json` nam
 - **Signature input:** `lp(label, field1, ..., fieldn)` with the label and fields below.
 - **Signed documents** are carried as `{ "body": "<base64url of the exact JSON bytes>", "sig": "<base64url>" }`. Examples in this spec show the decoded body.
 - **Signed document bytes** are `lp(body bytes, signature)`. Every hash over a signed document, such as a certificate hash or a chain item hash, covers these bytes, never re-serialized JSON.
-- **Labels:** every format the Pubky Switch defines signs under a `pubky-switch/v1/` label. A protocol's own formats sign under labels of the protocol's, such as Paykit's `paykit/v1/` (Paykit spec, Section 10), never under a `pubky-switch/v1/` label.
+- **Labels:** every format the Pubky Switch defines signs under a `pubky-switch/v1/` label. A protocol's own formats sign under labels of the protocol's, such as Paykit's `paykit/v1/` (Paykit spec, Section 10), never under a label that starts with `pubky-switch/`, of this version or any later one, which are the Switch's; an app refuses to sign a protocol's format under one.
 
 | Object | Signed by | Label | Fields |
 |---|---|---|---|

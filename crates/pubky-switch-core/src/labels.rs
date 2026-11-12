@@ -6,10 +6,14 @@
 /// The start of every label the Pubky Switch defines (Switch spec 13.2, Switch wire 2.3).
 pub const PREFIX: &str = "pubky-switch/v1/";
 
-/// Whether `label` is under [`PREFIX`]: one of the Switch's labels, now or later, which a
+/// The start of every label of the Switch, of this version or any later one (Switch spec
+/// 13.2 "Labels").
+pub const ROOT: &str = "pubky-switch/";
+
+/// Whether `label` is under [`ROOT`]: one of the Switch's labels, of any version, which a
 /// protocol's own formats never sign under (Switch spec 13.2 "Labels").
 pub fn is_switch_label(label: &str) -> bool {
-    label.starts_with(PREFIX)
+    label.starts_with(ROOT)
 }
 
 /// Signature labels (Switch wire 2.3).
@@ -127,6 +131,13 @@ mod tests {
             sig::EXPORT_MANIFEST,
             sig::PUSH,
         ] {
+            assert!(
+                label.starts_with(PREFIX) && is_switch_label(label),
+                "{label}"
+            );
+        }
+        // A later version's labels are the Switch's too.
+        for label in ["pubky-switch/v1", "pubky-switch/v2/x", "pubky-switch/"] {
             assert!(is_switch_label(label), "{label}");
         }
     }
@@ -135,8 +146,10 @@ mod tests {
     fn test_switch_label_refuses_other_labels() {
         for label in [
             "sample/v1/grant",
-            "pubky-switch/v2/x",
-            "pubky-switch/v1",
+            "pubky-switch",
+            "pubky-switchx/v1/x",
+            "Pubky-switch/v1/x",
+            "x/pubky-switch/v1/",
             "",
         ] {
             assert!(!is_switch_label(label), "{label}");

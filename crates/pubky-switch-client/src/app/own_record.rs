@@ -26,8 +26,8 @@
 //!
 //! **A protocol's signatures** (Switch spec 1, 13.2; Switch wire 2.3). A protocol's own
 //! formats sign `lp(label, fields...)` with the app's signing key under a label of the
-//! protocol's, never under a `pubky-switch/v1/` label, so no input of a protocol's format is
-//! an input of one of the Switch's.
+//! protocol's, never under one that starts with `pubky-switch/`, of any version, so no input
+//! of a protocol's format is an input of one of the Switch's, now or later.
 
 use pubky_switch_core::labels::is_switch_label;
 use pubky_switch_core::records::{AppRecord, AppRecordBody, app_record_path};
@@ -174,15 +174,15 @@ impl App {
     ///
     /// # Errors
     ///
-    /// [`Refusal::Usage`] for a `pubky-switch/v1/` label, which only the Switch's formats
-    /// use (Switch spec 13.2 "Labels"); [`Refusal::Stopped`], [`Refusal::Left`] or
+    /// [`Refusal::Usage`] for a label that starts with `pubky-switch/`, of any version,
+    /// which only the Switch's formats use (Switch spec 13.2 "Labels"); [`Refusal::Stopped`], [`Refusal::Left`] or
     /// [`Refusal::Gone`].
     pub fn sign_protocol(&self, label: &str, fields: &[&[u8]]) -> Result<[u8; 64], AppError> {
         self.refuse_when_stopped()?;
         if is_switch_label(label) {
             return Err(Refusal::Usage(
                 "Switch spec 13.2: a protocol signs under labels of its own, never a \
-                 pubky-switch/v1/ label"
+                 pubky-switch/ label"
                     .into(),
             )
             .into());
