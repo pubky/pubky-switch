@@ -720,8 +720,11 @@ pub enum AppEvent {
         /// The size of the mark that wasn't kept.
         mark_bytes: u64,
     },
-    /// Uploads after a provider loss conflict with a record's current write (Switch spec
-    /// 12.6).
+    /// Uploads after a provider loss conflict with the current write of a record the app
+    /// holds (Switch spec 12.6): raised once per change, when a view first shows it so, not
+    /// again while it stays so. [`super::SharedRecord::divergent`] is the durable truth: the
+    /// event lives in memory only, so one raised in the commit that writes the flag is lost
+    /// if the app stops before its host takes the report, while the flag stays.
     RecordDivergent {
         /// The record key.
         key: [u8; 32],

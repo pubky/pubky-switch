@@ -377,6 +377,11 @@ pub struct SharedRecord {
     /// The switch's current write is one the app refused: the content is what the app
     /// trusts, and its next write builds on the refused write's version (Switch spec 8.2).
     pub flagged: bool,
+    /// The latest view the app read shows uploads after a provider loss that conflict with
+    /// the current write, kept at the switch until a writer writes a newer version there
+    /// (Switch spec 12.6 step 3). The content is still the current write's, taken by the
+    /// usual checks; what to do about the conflict is the protocol's.
+    pub divergent: bool,
 }
 
 /// A signed operation the app keeps as evidence: a `record.put` or a claim entry, its
@@ -406,6 +411,10 @@ pub struct SharedEvidence {
     pub ops: Vec<KeptOp>,
     /// The SETTLED and tombstone proofs kept.
     pub proofs: Vec<SignedDoc>,
+    /// The claim entries kept without a certificate of their writer that verifies them, so
+    /// left out of `ops`: an upload carries each entry with its writer's certificate
+    /// (Switch wire 7.4.14).
+    pub claim_entries_left_out: u64,
 }
 
 impl std::fmt::Debug for SharedEvidence {
@@ -513,7 +522,7 @@ impl HeldRecord {
         }
     }
 
-    pub(crate) fn shared(&self, key: &[u8; 32]) -> SharedRecord {
+    pub(crate) fn shared(&self, key: &[u8; 32], divergent: bool) -> SharedRecord {
         SharedRecord {
             key: *key,
             collection: self.collection.clone(),
@@ -534,6 +543,7 @@ impl HeldRecord {
             },
             doubtful: self.doubtful,
             flagged: self.follow.is_some(),
+            divergent,
         }
     }
 }
@@ -628,8 +638,10 @@ enum Refused {
 /// What reading a write came to ([`App::read_write`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WriteRead {
-    /// Taken, or the very write the app held.
+    /// Taken: newer than the write held.
     Taken,
+    /// The very write the app held.
+    Held,
     /// No newer than the write held.
     NotNewer,
     /// Refused: a failed check, a regression the protocol found, or a write the app doesn't
@@ -678,8 +690,14 @@ pub enum KeptReason {
 /// What [`App::take_write`] did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Taken {
+    /// A newer write, now held.
     New,
+    /// The write held.
     Same,
+    /// The write held, unopened before, now opened: no newer write. No path from the feed
+    /// reaches it today: a key that arrives reopens the record through `reopen_unreadable`
+    /// before the feed meets the write again. It stays so that `New` keeps meaning newer.
+    Reopened,
     NotNewer,
     Flagged,
 }
@@ -706,13 +724,27 @@ impl App {
         self.reader().get(&record_key_of(key)).await
     }
 
+    /// The collection of the record the app holds at `key`, as its write named it.
+    pub(crate) async fn held_collection(
+        &self,
+        key: &[u8; 32],
+    ) -> Result<Option<Collection>, AppError> {
+        Ok(self
+            .held_record(key)
+            .await?
+            .map(|held| Collection::new(&held.collection, held.policy)))
+    }
+
     /// The record the app holds at `key`, without reading the switch.
     ///
     /// # Errors
     ///
     /// A store failure.
     pub async fn shared_record(&self, key: &[u8; 32]) -> Result<Option<SharedRecord>, AppError> {
-        Ok(self.held_record(key).await?.map(|held| held.shared(key)))
+        let Some(held) = self.held_record(key).await? else {
+            return Ok(None);
+        };
+        Ok(Some(held.shared(key, self.is_divergent(key).await?)))
     }
 
     /// Every record the app holds of `collection`, without reading the switch.
@@ -727,7 +759,7 @@ impl App {
                 continue;
             }
             let key = unb64_array::<32>(&rest).map_err(|_| store_corrupt())?;
-            out.push(held.shared(&key));
+            out.push(held.shared(&key, self.is_divergent(&key).await?));
         }
         Ok(out)
     }
@@ -769,9 +801,13 @@ impl App {
                 })
             })
             .collect();
-        let (claim_ops, proofs) = self.claim_evidence_items().await?;
+        let (claim_ops, proofs, claim_entries_left_out) = self.claim_evidence_items().await?;
         ops.extend(claim_ops);
-        Ok(SharedEvidence { ops, proofs })
+        Ok(SharedEvidence {
+            ops,
+            proofs,
+            claim_entries_left_out,
+        })
     }
 
     /// The protocol's mark of what the app has seen in record `key`, its high water.
@@ -850,7 +886,7 @@ impl App {
             self.refuse_when_stopped()?;
             let key = self.record_key(target)?;
             let reason = match self.fetch_record(&key, &target.collection).await {
-                Ok(Some(WriteRead::Taken)) => {
+                Ok(Some(WriteRead::Taken | WriteRead::Held)) => {
                     if let Some(record) = self.shared_record(&key).await? {
                         return Ok(RecordRead::Fresh(record));
                     }
@@ -879,7 +915,10 @@ impl App {
 
     /// The switch's view of record `key` (`GET /records/{key}`, Switch wire 7.4.9); `None`
     /// for a key it doesn't know, or forgot.
-    async fn record_view(&mut self, key: &[u8; 32]) -> Result<Option<SharedRecordView>, AppError> {
+    pub(crate) async fn record_view(
+        &mut self,
+        key: &[u8; 32],
+    ) -> Result<Option<SharedRecordView>, AppError> {
         let result = self.client.record(key).await;
         match self.take(result).await {
             Ok(view) => Ok(Some(view)),
@@ -1037,8 +1076,9 @@ impl App {
         Ok(())
     }
 
-    /// Take a record view, from a read, a list page or after a conflict.
-    async fn take_view(
+    /// Take a record view, from a read, a list page, after a conflict or after an upload;
+    /// then hold what it says of divergent uploads, once the write is judged.
+    pub(crate) async fn take_view(
         &mut self,
         view: &SharedRecordView,
         expect: Option<(&[u8; 32], &Collection)>,
@@ -1051,11 +1091,13 @@ impl App {
             stub: None,
             view_version: Some(RecordVersion::new(view.generation, view.version)),
         };
-        if view.divergent {
-            self.events
-                .push(AppEvent::RecordDivergent { key: view.key });
+        let read = self.read_write(&evidence, expect, view.key, tx).await?;
+        // Only a view of the key asked for says anything of that record's uploads.
+        if expect.is_none_or(|(asked, _)| *asked == view.key) {
+            self.note_view_divergence(&view.key, view.divergent, tx)
+                .await?;
         }
-        self.read_write(&evidence, expect, view.key, tx).await
+        Ok(read)
     }
 
     /// A `record.put` chain item from the feed, its stub verified (Switch spec 8.3): taken
@@ -1080,17 +1122,49 @@ impl App {
             view_version: None,
         };
         let key = put.key;
-        self.read_write(&evidence, None, key, tx).await?;
+        let mut viewed = None;
+        let read = self
+            .judge_write(&evidence, None, key, tx, &mut viewed)
+            .await?;
+        match viewed {
+            // The record's view, read to judge the write, is the switch's latest word.
+            Some(divergent) => self.note_view_divergence(&key, divergent, tx).await?,
+            // A newer write clears the record's divergent uploads before it (Switch wire
+            // 7.4.14); the write held doesn't: uploads after it may conflict with it.
+            None if read == WriteRead::Taken => self.note_divergent(&key, false, tx).await?,
+            None => {}
+        }
         Ok(())
     }
 
-    /// Check a write and take it, or flag it, or raise the rollback it proves.
+    /// Check a write and take it, or flag it, or raise the rollback it proves; a view
+    /// read to judge it says what the app holds of divergent uploads.
     async fn read_write(
         &mut self,
         evidence: &Evidence<'_>,
         expect: Option<(&[u8; 32], &Collection)>,
         shown_key: [u8; 32],
         tx: &mut Tx,
+    ) -> Result<WriteRead, AppError> {
+        let mut viewed = None;
+        let read = self
+            .judge_write(evidence, expect, shown_key, tx, &mut viewed)
+            .await?;
+        if let Some(divergent) = viewed {
+            self.note_view_divergence(&shown_key, divergent, tx).await?;
+        }
+        Ok(read)
+    }
+
+    /// [`App::read_write`], with `viewed` set to the `divergent` of a view of `shown_key`
+    /// read to judge the write, if one was.
+    async fn judge_write(
+        &mut self,
+        evidence: &Evidence<'_>,
+        expect: Option<(&[u8; 32], &Collection)>,
+        shown_key: [u8; 32],
+        tx: &mut Tx,
+        viewed: &mut Option<bool>,
     ) -> Result<WriteRead, AppError> {
         let mut outcome = self.accept_write(evidence, expect, tx).await?;
         let mut version = evidence
@@ -1105,9 +1179,8 @@ impl App {
             let collection = collection.clone();
             outcome = match self.record_view(&shown_key).await? {
                 Some(view) => {
-                    if view.divergent {
-                        self.events
-                            .push(AppEvent::RecordDivergent { key: view.key });
+                    if view.key == shown_key {
+                        *viewed = Some(view.divergent);
                     }
                     // A view of the feed's own write keeps what the feed gave it: the
                     // verified stub, which dates the write and gives its version whatever
@@ -1135,7 +1208,8 @@ impl App {
         match outcome {
             Ok(accepted) => {
                 return Ok(match self.take_write(accepted, false, tx).await? {
-                    Taken::New | Taken::Same => WriteRead::Taken,
+                    Taken::New => WriteRead::Taken,
+                    Taken::Same | Taken::Reopened => WriteRead::Held,
                     Taken::NotNewer => WriteRead::NotNewer,
                     Taken::Flagged => WriteRead::Refused,
                 });
@@ -1745,7 +1819,11 @@ impl App {
         };
         tx.put(&record_key_of(&key), &record)?;
         self.events.push(AppEvent::RecordChanged { key });
-        Ok(Taken::New)
+        Ok(if reopened {
+            Taken::Reopened
+        } else {
+            Taken::New
+        })
     }
 
     /// An own `record.put` the switch answered: taken at the version its proof gives.
@@ -1789,7 +1867,11 @@ impl App {
             .await?
         {
             Ok(accepted) => {
-                self.take_write(accepted, true, tx).await?;
+                // The app's own write at this service clears the record's divergent
+                // uploads there (Switch wire 7.4.14).
+                if self.take_write(accepted, true, tx).await? == Taken::New {
+                    self.note_divergent(&key, false, tx).await?;
+                }
             }
             Err(Refused::Misbehaviour(reason)) => {
                 return Err(self.raise(Alarm::Rollback { reason }).await);

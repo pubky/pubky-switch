@@ -15,7 +15,7 @@ use pubky_switch_core::sig::SignedDoc;
 
 use super::*;
 use crate::app::{
-    AppBackup, AppError, AppEvent, ClaimOp, Evidence, LocalWrite, LossActions,
+    AppBackup, AppError, AppEvent, ClaimOp, Collection, Evidence, LocalWrite, LossActions,
     MAX_STEP_LOCAL_BYTES, ObligationDeadline, ParkReason, ProviderLoss, ProviderStatus, PushRelay,
     Refusal, RefusedCall, UserConfirmed,
 };
@@ -83,9 +83,15 @@ pub(crate) struct LossProtocol {
     pub(crate) failing: Mutex<u32>,
     /// The size of the value the loss call writes; one byte when zero.
     pub(crate) local_bytes: Mutex<usize>,
+    /// The protocol's collections; none unless a test sets them.
+    pub(crate) collections: Mutex<Vec<Collection>>,
 }
 
 impl Protocol for LossProtocol {
+    fn collections(&self) -> Vec<Collection> {
+        self.collections.lock().unwrap().clone()
+    }
+
     fn has_keys(&self, scope: &str) -> bool {
         self.sample.has_keys(scope)
     }
@@ -1051,11 +1057,11 @@ async fn test_move_crash_at_each_commit_point_resumes() {
 // -------------------------------------------------------------------------------------
 // Provider loss (Switch spec 12.6)
 
-struct Lost {
-    w: World,
-    router: Router,
-    protocol: Arc<LossProtocol>,
-    next: Arc<ScriptedSwitch>,
+pub(crate) struct Lost {
+    pub(crate) w: World,
+    pub(crate) router: Router,
+    pub(crate) protocol: Arc<LossProtocol>,
+    pub(crate) next: Arc<ScriptedSwitch>,
     carol: [u8; 32],
     dave: [u8; 32],
     note_at_ms: u64,
@@ -1091,7 +1097,7 @@ async fn lost_world(store: Arc<dyn StateStore>) -> Lost {
 
 /// [`lost_world`], the app holding `permissions`, with `record` a shared record it wrote
 /// before the loss, and without `lists` nothing in its lists.
-async fn lost_world_with(
+pub(crate) async fn lost_world_with(
     store: Arc<dyn StateStore>,
     permissions: &[Permission],
     record: bool,
@@ -1170,7 +1176,7 @@ async fn lost_world_with(
 
 /// The follow: the own identity.json from the Homeserver, then a read. Returns the app and
 /// the read's events.
-async fn follow_loss(
+pub(crate) async fn follow_loss(
     lost: &Lost,
     store: Arc<dyn StateStore>,
 ) -> Result<(App, Vec<AppEvent>), AppError> {
@@ -1656,7 +1662,7 @@ fn upload_request(lost: &Lost, body: &str) -> crate::transport::Request {
 }
 
 /// The wallet's `POST /recovery/upload` of `body` at the lost world's next switch.
-fn upload_at_next(lost: &Lost, body: &str) -> (u16, serde_json::Value) {
+pub(crate) fn upload_at_next(lost: &Lost, body: &str) -> (u16, serde_json::Value) {
     let answer = lost.next.handle(&upload_request(lost, body)).unwrap();
     (answer.status, serde_json::from_slice(&answer.body).unwrap())
 }
@@ -2627,7 +2633,12 @@ pub(crate) const THIRD: &str = "https://third.example";
 
 /// A service recovering alice's account at `generation` after the loss of `from`, at
 /// `THIRD`, with the signer's document naming it delivered and published.
-fn third_recovering(w: &World, router: &Router, generation: u64, from: u64) -> Arc<ScriptedSwitch> {
+pub(crate) fn third_recovering(
+    w: &World,
+    router: &Router,
+    generation: u64,
+    from: u64,
+) -> Arc<ScriptedSwitch> {
     let key = SigningKey::from_bytes(&seed("service/alice/third"));
     let third = ScriptedSwitch::recovering(
         &w.alice,
@@ -5046,7 +5057,7 @@ async fn test_loss_claim_step_before_its_last_entry_is_a_rollback() {
 
 /// Another app's uploaded attempt beside the one `switch` holds at [`CLAIM`], merged as the
 /// core merges an upload: divergent, one step on, no entry.
-fn upload_beside(switch: &ScriptedSwitch) {
+pub(crate) fn upload_beside(switch: &ScriptedSwitch) {
     let mut next = switch.lock();
     let held = next.shared.claims.get(&CLAIM).cloned();
     let entry = pubky_switch_core::recovery::UploadedEntry {

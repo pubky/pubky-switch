@@ -17,6 +17,8 @@ mod sender_key;
 mod shared_flows;
 mod store_failures;
 mod unverified;
+mod uploads;
+mod writer_certs;
 
 use std::sync::{Arc, Mutex};
 

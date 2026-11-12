@@ -444,7 +444,15 @@ impl<'a> ReceiveContext<'a> {
     ///
     /// A store failure.
     pub fn record_at(&self, key: &[u8; 32]) -> Result<Option<SharedRecord>, AppError> {
-        Ok(self.held(key)?.map(|held| held.shared(key)))
+        let Some(held) = self.held(key)? else {
+            return Ok(None);
+        };
+        let divergent = self
+            .store
+            .get(self.ns, super::uploaded::divergent_key(key).as_bytes())
+            .map_err(store_error)?
+            .is_some();
+        Ok(Some(held.shared(key, divergent)))
     }
 
     /// The protocol's mark of what the app has seen in record `key`, its high water.
