@@ -73,7 +73,10 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   lock isn't held across the wait, and every request to the switch lets the held reads look
   again. A read held while its app is revoked or leaves is woken and refused `403
   not_current`, and one held while its account is erased gets the operator's `404`, never a
-  page under the erased account's key (Switch wire 7.4.16). Unlike the service, a held read
+  page under the erased account's key (Switch wire 7.4.16). One held while its account recovers in place is
+  woken by the recovery and answered `503 unavailable` with the operator key and no head, as
+  at the service: the key it was read under signs nothing more (Switch wire 7.4.4);
+  `recover_in_place` recovers the account through its own `PUT /identity`, for tests. Unlike the service, a held read
   looks again only for something to show, the erasure and its time: an app whose
   certificate expires while its read is held is refused once the read is answered, where
   the service refuses it at the account's next commit; the answer is the same. Faults and

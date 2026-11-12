@@ -454,7 +454,14 @@ impl Transport for Holding {
             let Some(held) = self.0.waiting_read(&request) else {
                 return self.0.handle(&request);
             };
+            let key = held.key;
             held.await;
+            // A read held while the account's service key changed, as at a recovery in
+            // place, is answered `503 unavailable` with the operator key and no head: the
+            // key it was read under signs nothing more (Switch wire 7.4.4).
+            if let Some(answer) = self.0.key_changed_since(key, &request) {
+                return Ok(answer);
+            }
             // Answered as the account stands now: a reader revoked or departed while its
             // read was held is refused, and an account erased meanwhile is one the switch
             // doesn't host, as at the service (Switch wire 7.4.4, 7.4.16).
@@ -464,13 +471,15 @@ impl Transport for Holding {
 }
 
 /// A feed read the switch holds, admitted when it arrived: ready once the feed has
-/// something to show its app, its wait has passed, or the account is gone. A departure of
-/// its app shows it the departure's chain item, so it is ready then too. The switch's lock
-/// is held only while it looks, never across the wait.
+/// something to show its app, its wait has passed, the account is gone, or its service key
+/// changed. A departure of its app shows it the departure's chain item, so it is ready then
+/// too. The switch's lock is held only while it looks, never across the wait.
 struct Held<'a> {
     switch: &'a ScriptedSwitch,
     /// Its number among the reads the switch held.
     id: u64,
+    /// The account's service key when the read arrived.
+    key: [u8; 32],
     app: [u8; 16],
     /// The certificate the app was current with when the read arrived.
     cert: AppCert,
@@ -486,6 +495,7 @@ impl Future for Held<'_> {
         if inner.now() >= self.until_ms
             || inner.erased
             || inner.enrolled.is_none()
+            || inner.service.verifying_key().to_bytes() != self.key
             || inner.shows_after(self.app, &self.cert, self.after)
         {
             return Poll::Ready(());
@@ -1044,15 +1054,34 @@ impl ScriptedSwitch {
         let until_ms = inner.now().saturating_add(wait_s.saturating_mul(1000));
         inner.held_ids += 1;
         let id = inner.held_ids;
+        let key = inner.service.verifying_key().to_bytes();
         drop(inner);
         Some(Held {
             switch: self,
             id,
+            key,
             app,
             cert,
             after,
             until_ms,
         })
+    }
+
+    /// The answer to a held read whose account's service key is no longer `key`: `503
+    /// unavailable` with the operator key, with no head (Switch wire 7.4.4); `None` while
+    /// the key is the same.
+    fn key_changed_since(&self, key: [u8; 32], request: &Request) -> Option<Response> {
+        let inner = self.lock();
+        if inner.service.verifying_key().to_bytes() == key {
+            return None;
+        }
+        let (status, body) = bad(
+            ErrorCode::Unavailable,
+            "7.6: a temporary failure",
+            Value::Null,
+        );
+        let operator = SigningKey::from_bytes(&[42; 32]);
+        Some(inner.respond_with(&operator, request, status, &body))
     }
 
     /// Apply `fault` to the next request it matches; faults apply in the order added.
@@ -1420,6 +1449,35 @@ impl ScriptedSwitch {
             return Err(ScriptError::Refused { status, body });
         }
         Ok(inner.seq)
+    }
+
+    /// Recover the account in place, as a signer that enrolled here again and was answered
+    /// `pending` does by delivering `doc`, the next generation naming that key, on `prev`:
+    /// through the switch's own `PUT /identity` (Switch spec 12.6 step 1, wire 3.3). For
+    /// tests of what a recovery in place does to the apps.
+    ///
+    /// # Errors
+    ///
+    /// The switch's refusal of the delivery.
+    #[cfg(test)]
+    pub(crate) fn recover_in_place(
+        &self,
+        pending: SigningKey,
+        doc: &IdentityDoc,
+        prev: [u8; 32],
+    ) -> Result<(), ScriptError> {
+        let mut inner = self.lock();
+        inner.pending = Some((pending, Vec::new()));
+        let delivery = pubky_switch_core::http::IdentityDelivery {
+            identity: doc.signed().clone(),
+            prev: Some(prev),
+        }
+        .to_json();
+        let (status, body) = inner.put_identity(&delivery)?;
+        if status != 200 {
+            return Err(ScriptError::Refused { status, body });
+        }
+        Ok(())
     }
 
     /// Move `app`'s cursor to `seq`, in a batch of its own, as a submitted `cursor.set` does

@@ -241,6 +241,9 @@ impl Inner {
     /// its service time, its enrollments and the App IDs to refuse stay, `named` among them,
     /// and everything else goes (Switch spec 12.6 step 1, wire 3.3).
     fn start_afresh(&mut self, key: SigningKey, named: &[[u8; 16]], generation: u64) {
+        // The held reads look again, and find the key changed (Switch wire 7.4.4); their
+        // numbers go on, so none is taken for another's.
+        self.wake_held();
         let tip = pubky_switch_core::chain::ChainTip {
             generation,
             seq: 0,
@@ -289,6 +292,7 @@ impl Inner {
         fresh.keep_passed = self.keep_passed;
         fresh.open_admission = self.open_admission;
         fresh.faults = std::mem::take(&mut self.faults);
+        fresh.held_ids = self.held_ids;
         fresh.kept_at = self.kept_at;
         fresh.kept_app_ids = std::mem::take(&mut self.kept_app_ids);
         for (id, app) in &self.apps {

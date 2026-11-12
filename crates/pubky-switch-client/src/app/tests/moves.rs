@@ -54,6 +54,15 @@ impl Router {
         self.0.add_switch(origin, switch);
     }
 
+    /// Route `origin` to `transport`, in place of any switch routed there.
+    pub(crate) fn add_transport(
+        &self,
+        origin: &str,
+        transport: Arc<dyn crate::transport::Transport>,
+    ) {
+        self.0.add(origin, transport);
+    }
+
     /// Route nothing to `origin` any more: its service is unreachable.
     pub(crate) fn remove(&self, origin: &str) {
         self.0.remove(origin);
