@@ -2516,6 +2516,8 @@ async fn test_rotation_given_up_by_a_departure_between_its_batches_is_completed(
     );
     let given_up = signer.identity_doc().unwrap().unwrap();
     assert_eq!(given_up.hash(), before.hash(), "nothing delivered");
+    // The user is told the reduction didn't happen (Switch spec 3.2).
+    assert_eq!(refused_renewals(&signer), [(a_id, true)]);
     assert_eq!(world.switch.identity_doc().unwrap().hash(), before.hash());
     let delivered = world.sent_docs().len();
     signer.run_due().await.unwrap();
@@ -2556,6 +2558,8 @@ async fn test_rotation_given_up_by_a_departure_between_its_batches_is_completed(
     }
     // The departed app gets nothing past the epoch it left at.
     assert!(!holds(&world, &opened(&world, leaving), 3, "notes"));
+    // Neither version renewed `a`, so the alert stays.
+    assert_eq!(refused_renewals(&signer), [(a_id, true)]);
 }
 
 /// The `RenewalRefused` alerts `signer` holds, as `(app_id, reduction)`.
