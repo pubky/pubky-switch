@@ -79,10 +79,9 @@ before, 24 hours after the first. Both erasure flows run that wait, and a read s
 
 The flows send every call the service serves, each at both switches. What they leave out:
 
-- **Calls the service doesn't serve yet**, eleven of the thirty-three of Switch wire 7.4:
-  the connection requests (`POST`, `GET` and `DELETE /connect`), `PUT /push`, `POST /freeze`
-  and `/unfreeze`, `GET /export` and its chunks, and `POST /import` with its chunks and
-  activation. So no flow moves an account or changes its key in place, and no upload is
+- **Calls the service doesn't serve yet**, eight of the thirty-three of Switch wire 7.4:
+  `PUT /push`, `POST /freeze` and `/unfreeze`, `GET /export` and its chunks, and `POST
+  /import` with its chunks and activation. So no flow moves an account or changes its key in place, and no upload is
   sent in a cooperative move. `flows::flow_of` lists them, and the test fails once one is
   served without a flow.
 - **More of a recovery upload** (Switch wire 7.4.14). The upload flows bring records, a
@@ -90,8 +89,7 @@ The flows send every call the service serves, each at both switches. What they l
   to the service's own tests: an operation of a removed app (`distrusted`), items that
   don't verify (`unverified`) and claim entries the writer rules refuse (`refused`), which
   no app of the client crate uploads; a claim made divergent by uploads; the caps
-  (`max_divergent_uploads`, `max_contacts`, `max_deny`, `max_attempts_per_claim`); and an
-  upload from an app that hasn't registered at the new service yet.
+  (`max_divergent_uploads`, `max_contacts`, `max_deny`, `max_attempts_per_claim`).
 - **Faults in front of most reads.** The retries above are the ones covered. No answer is
   lost and no connection fails in front of `GET /allow`, `/claims/{claim_key}`,
   `/directory`, `/apps/{app_id}/keys`, `/records`, `/records/{key}`, `/handover` or the
@@ -113,16 +111,15 @@ The flows send every call the service serves, each at both switches. What they l
   run with an app that falls behind while another reads. An inbox no app reads, where the
   quota refuses senders, an unreadable item at a leave or at a delivery, and a lagging app
   that still finds entries to read are left to the service's own tests.
-- **More of the lists:** an invite code withdrawn or used several times, an invite, a
-  conversation entry pruned, a connection request.
+- **More of the lists:** an invite code withdrawn or used several times, and a
+  conversation entry pruned.
 - **More of connect requests.** The `connect request` flows ask, allow, decline and
   deny, fill the list, turn the policy off with a request pending, and ask across a
-  provider loss. Not sent: a request past `connect_per_min` or `stranger_per_min`, which
+  provider loss, at another service and in place. Not sent: a request past `connect_per_min` or `stranger_per_min`, which
   takes more requests in a minute than a flow sends; the push a request queues; a request
   an invite code's first admitted append answers; one to a frozen account; and a `POST
   /connect` from an own app or from the signer.
-- **Longer lives:** a renewal that adds a scope, a claim that runs out by time, an
-  identity that enrolls again after an erasure.
+- **Longer lives:** a renewal that adds a scope, and a claim that runs out by time.
 - **The Homeserver's side of a grant.** The `approval` flows hold the capabilities the
   signer grants when the user declines a protocol's paths, and that the switch is sent
   the same with the paths declined as with them allowed. The grant itself is given and
@@ -179,6 +176,6 @@ Each flow's run against the service makes one test database and drops it, also w
 test panics; the flows run one after another. Each run is on a thread of its own with 16 MiB
 of stack (`FLOW_STACK_BYTES`, `on_flow_stack`): in a debug build the deepest flow used
 1.9 MiB, close to the 2 MiB of a test's thread, and a test binary aborted when the thread
-that ran the flows had less left. Seventy flows take about three minutes in a
+that ran the flows had less left. Seventy-five flows take about three minutes in a
 debug build. If that grows too long, the service's halves could share one service and one
 database, with identities of their own per flow: a later option, not needed yet.

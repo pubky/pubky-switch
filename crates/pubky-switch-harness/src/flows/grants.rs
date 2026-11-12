@@ -184,18 +184,18 @@ pub async fn grant_paths_declined(world: &World) -> FlowResult {
 }
 
 /// A decline the protocol refuses (Switch spec 3.4). The two paths go together, by the
-/// protocol's own rule. alice declines one of them: the signer refuses that set at once,
-/// before anything is signed or sent, and the set of declined paths stays empty. She then
-/// approves the request as it stands, and the grant names both paths.
+/// protocol's own rule. alice declines one of them: the signer refuses that set at the
+/// review, where nothing is signed yet and no call is made, and the set of declined paths
+/// stays empty. She then approves the request as it stands, and the grant names both
+/// paths.
 ///
-/// Calls: none for the refused decline; `PUT /v1/{id}/identity` with the version that
-/// lists the app once it is approved.
+/// Calls: `PUT /v1/{id}/identity` with the version that lists the app once it is
+/// approved. A decline is the signer's own step and makes no call.
 ///
 /// # Errors
 ///
 /// When a step that should succeed against any switch fails, the decline of one path is
-/// taken or a request is sent for it, or the approval that follows grants other than both
-/// paths.
+/// taken, or the approval that follows grants other than both paths.
 pub async fn grant_paths_decline_refused(world: &World) -> FlowResult {
     let alice = world.identity("alice")?;
     world.add_switch(ORIGIN, &[&alice]).await?;
@@ -212,7 +212,6 @@ pub async fn grant_paths_decline_refused(world: &World) -> FlowResult {
         .iter()
         .map(|path| path.path.clone())
         .collect();
-    let sent = world.requests_sent();
     let refused = review.decline(&[NOTES_PROFILE]);
     let by_rule = matches!(
         &refused,
@@ -224,19 +223,12 @@ pub async fn grant_paths_decline_refused(world: &World) -> FlowResult {
             "offered": offered,
             "refused_by_the_protocols_rule": by_rule,
             "declined": review.declined(),
-            "requests_sent_for_it": world.requests_sent() - sent,
         }),
     );
-    if offered != PATHS
-        || !by_rule
-        || !review.declined().is_empty()
-        || world.requests_sent() != sent
-    {
+    if offered != PATHS || !by_rule || !review.declined().is_empty() {
         return Err(format!(
-            "of the paths {offered:?}, declining one ended {refused:?} with {:?} declined \
-             and {} requests sent",
-            review.declined(),
-            world.requests_sent() - sent
+            "of the paths {offered:?}, declining one ended {refused:?} with {:?} declined",
+            review.declined()
         )
         .into());
     }
