@@ -114,3 +114,95 @@ pub async fn third_epoch(world: &World) -> FlowResult {
     world.outcome("signer ran what is due", &status(&signer)?);
     Ok(())
 }
+
+/// Which of the three records `app` opens when it reads them from the switch.
+async fn opens(
+    world: &World,
+    app: &mut App,
+    name: &str,
+) -> Result<[bool; 3], Box<dyn std::error::Error>> {
+    let mut opened = [false; 3];
+    for (at, record) in ["first", "second", "third"].into_iter().enumerate() {
+        let target = RecordTarget::new(notes_collection(), record.as_bytes());
+        let read = app.read_record(&target).await?;
+        opened[at] = read.is_some_and(|read| read.content.value().is_some());
+        world.advance_ms(STEP_MS);
+    }
+    world.outcome(
+        &format!("what {name} opens of the three records"),
+        &json!({ "opened": opened, "app": app_status(app) }),
+    );
+    Ok(opened)
+}
+
+/// Two rotations with three apps that stay (Switch spec 3.5, Switch wire 7.4.11). alice's
+/// wallet, phone and tablet share a collection; her desk and her pad are revoked in turn,
+/// and each revocation rotates the data keys for the three that stay. The wallet follows
+/// each rotation and writes a record at each epoch. The tablet reads the three records
+/// before it has followed anything: it opens the first, and the other two, sealed at
+/// epochs it holds no key for, it can't. The phone and the tablet then follow, two epochs
+/// behind: one fetch brings each the parts of both epochs. At the end each of the three
+/// holds keys through the third epoch and opens all three records.
+///
+/// Calls: the signer's `POST /v1/{id}/ops` with `key_bundle.put` for three apps, twice;
+/// `GET /v1/{id}/apps/{app_id}/keys` by an app two epochs behind; `GET
+/// /v1/{id}/records/{key}` by an app that holds no key for the record's epoch.
+///
+/// # Errors
+///
+/// When a step that should succeed against any switch fails, or an app that stays ends
+/// without the third epoch's keys or can't open a record.
+pub async fn epochs_three_readers(world: &World) -> FlowResult {
+    let alice = world.identity("alice")?;
+    world.add_switch(ORIGIN, &[&alice]).await?;
+    let mut signer = enroll(world, &alice, ORIGIN).await?;
+    let join = async |signer: &mut Signer, name: &str| {
+        joined_as(
+            world,
+            &alice,
+            signer,
+            Asking::new(world.app_keys(&alice, name)?)?,
+            notes_protocol_with_records(),
+        )
+        .await
+    };
+    let (mut wallet, _) = join(&mut signer, "wallet").await?;
+    let (mut phone, _) = join(&mut signer, "phone").await?;
+    let (mut tablet, _) = join(&mut signer, "tablet").await?;
+    let (desk, _) = join(&mut signer, "desk").await?;
+    let (pad, _) = join(&mut signer, "pad").await?;
+    follow(world, &mut wallet, "the wallet at the first epoch").await?;
+
+    write(world, &mut wallet, "first").await?;
+    rotate_by_revoking(world, &mut signer, &desk, &mut wallet, "the desk").await?;
+    write(world, &mut wallet, "second").await?;
+    rotate_by_revoking(world, &mut signer, &pad, &mut wallet, "the pad").await?;
+    write(world, &mut wallet, "third").await?;
+
+    // The tablet reads before it has followed anything: it holds the first epoch's keys
+    // only, and a read fetches none.
+    let behind = opens(world, &mut tablet, "the tablet, two epochs behind,").await?;
+    if behind != [true, false, false] {
+        return Err(format!("two epochs behind, the tablet opens {behind:?}").into());
+    }
+    // The phone and the tablet follow now, two epochs behind.
+    follow(world, &mut phone, "the phone after both rotations").await?;
+    follow(world, &mut tablet, "the tablet after both rotations").await?;
+    for (name, app) in [
+        ("wallet", &mut wallet),
+        ("phone", &mut phone),
+        ("tablet", &mut tablet),
+    ] {
+        let opened = opens(world, app, &format!("the {name}")).await?;
+        if opened != [true, true, true] || app.keys_through() != 3 {
+            return Err(format!(
+                "the {name} opens {opened:?} and holds keys through epoch {}",
+                app.keys_through()
+            )
+            .into());
+        }
+    }
+    signer.run_due().await?;
+    world.outcome("signer ran what is due", &status(&signer)?);
+    Ok(())
+}

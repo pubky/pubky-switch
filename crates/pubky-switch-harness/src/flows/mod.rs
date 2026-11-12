@@ -41,7 +41,7 @@ pub use admission::{deny_list, invite_code};
 pub use claim::claim;
 pub use collections::two_collections;
 pub use enrollment::enrollment;
-pub use epochs::third_epoch;
+pub use epochs::{epochs_three_readers, third_epoch};
 pub use erasure::{erasure, erasure_answer_lost};
 pub use handover::{hand_over, hand_over_aborted};
 pub use join::join;
@@ -125,6 +125,9 @@ pub const FLOWS: &[(&str, Flow)] = &[
     }),
     ("renewed twice", |world| Box::pin(renewed_twice(world))),
     ("third epoch", |world| Box::pin(third_epoch(world))),
+    ("third epoch, three readers", |world| {
+        Box::pin(epochs_three_readers(world))
+    }),
     ("two collections", |world| Box::pin(two_collections(world))),
     ("waiting read", |world| Box::pin(waiting_read(world))),
     ("lagging app", |world| Box::pin(lagging_app(world))),
