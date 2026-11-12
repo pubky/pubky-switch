@@ -54,6 +54,7 @@ use pubky_switch_core::receive::{
     OpenedEntry, Received, Refusal as CheckRefusal, SenderIdentity, check_opened,
 };
 use pubky_switch_core::records::{CLOCK_TOLERANCE_MS, IdentityDoc};
+use pubky_switch_core::recovery::UploadChanges;
 use pubky_switch_core::scopes::Permission;
 use pubky_switch_core::sig::SignedDoc;
 
@@ -430,9 +431,11 @@ impl App {
             }
         }
         if self.state.alarm.is_none() {
-            // A stopped read leaves the claims it marked for the next one.
+            // A stopped read leaves the claims and records it marked for the next one.
             if !report.stopped {
                 self.reread_claims().await?;
+                self.reread_records().await?;
+                self.fetch_entry_writers().await?;
             }
             self.delete_retired_keys().await?;
             self.forget_chain_behind_cursor().await?;
@@ -2192,6 +2195,20 @@ impl App {
                         self.state.departed.insert(app_id, at);
                         Ok(Step::Pass)
                     }
+                    // What an upload merged here has no chain item of its own: the claims
+                    // and records it lists are read again at the end of the read (Switch
+                    // wire 7.4.14). Changes that don't read mark nothing.
+                    ServiceTransition::Upload { changes, .. } => {
+                        if let Ok(changes) = UploadChanges::from_value(&changes) {
+                            self.mark_uploaded(
+                                changes.records.iter().chain(&changes.divergent),
+                                changes.claims.iter().chain(&changes.divergent_claims),
+                                &mut read.tx,
+                            )
+                            .await?;
+                        }
+                        Ok(Step::Pass)
+                    }
                     // A frozen account's pages carry the freeze, which `process_page` takes
                     // before any item; a freeze transition on another page is history: a
                     // move followed, read again at the next service, or a cancelled one.
@@ -2451,7 +2468,7 @@ const PARK_ROOM_BYTES: u64 = 256 * 1024;
 ///   1.2 MiB.
 ///
 /// The largest is under 11 MiB; [`ENTRY_RESERVE_BYTES`] and a margin make 12 MiB.
-const ITEM_ROOM_BYTES: u64 = 12 * 1024 * 1024;
+pub(crate) const ITEM_ROOM_BYTES: u64 = 12 * 1024 * 1024;
 
 /// What an applied effect's outcome caches of one record write, at most: its operation
 /// (`MAX_OP_BYTES`, 512 KiB) and opened value (256 KiB), both in base64, and its proof.

@@ -63,7 +63,7 @@ pub(crate) fn claim_key_of(claim_key: &[u8; 32]) -> String {
     format!("{CLAIM_PREFIX}{}", b64(claim_key))
 }
 
-fn reread_key(claim_key: &[u8; 32]) -> String {
+pub(super) fn reread_key(claim_key: &[u8; 32]) -> String {
     format!("{REREAD_PREFIX}{}", b64(claim_key))
 }
 
@@ -685,6 +685,7 @@ impl App {
                     seq: item.seq,
                 },
             )?;
+            self.note_entry_writer(&item.op, &mut tx).await?;
             let state = TransitionProof::peek(&item.proof)
                 .ok()
                 .and_then(|p| ClaimView::from_value(&p.body().state).ok());
@@ -1036,13 +1037,16 @@ impl App {
         Ok(Some(doubt))
     }
 
-    /// The claim entries the app keeps, each with its writer's certificate where the app
-    /// knows it, and the SETTLED and tombstone proofs: evidence for the uploads of a move
-    /// or a recovery (Switch spec 6.3, 12.5, 12.6).
+    /// The claim entries the app keeps, each with a certificate of its writer that verifies
+    /// it, and the SETTLED and tombstone proofs: evidence for the uploads of a move or a
+    /// recovery (Switch spec 6.3, 12.5, 12.6); and how many entries it keeps without one,
+    /// which an upload can't carry (Switch wire 7.4.14).
     pub(crate) async fn claim_evidence_items(
         &self,
-    ) -> Result<(Vec<KeptOp>, Vec<SignedDoc>), AppError> {
+    ) -> Result<(Vec<KeptOp>, Vec<SignedDoc>, u64), AppError> {
+        let identity = self.state.meta.identity;
         let mut ops = Vec::new();
+        let mut left_out = 0u64;
         for (_, entry) in self.reader().scan::<KeptEntry>(ENTRY_PREFIX).await? {
             let Some(writer) = SignedOp::peek(&entry.op)
                 .ok()
@@ -1050,12 +1054,23 @@ impl App {
             else {
                 continue;
             };
-            if let Some(cert) = self.cert_of(&writer).await? {
-                ops.push(KeptOp {
+            // Only a certificate whose key verifies the entry: a switch that forged an
+            // entry in a writer's name gets nothing uploaded for it.
+            let verifies = |cert: &AppCert| {
+                SignedOp::verify(&entry.op, &cert.signing_key(), &identity, Some(&writer)).is_ok()
+            };
+            let cert = self
+                .writer_certs_held(&writer)
+                .await?
+                .into_iter()
+                .find(|cert| verifies(cert));
+            match cert {
+                Some(cert) => ops.push(KeptOp {
                     op: entry.op,
                     cert: cert.signed().clone(),
                     proof: Some(entry.proof),
-                });
+                }),
+                None => left_out = left_out.saturating_add(1),
             }
         }
         let proofs = self
@@ -1065,7 +1080,7 @@ impl App {
             .into_iter()
             .filter_map(|(_, kept)| kept.settled_proof)
             .collect();
-        Ok((ops, proofs))
+        Ok((ops, proofs, left_out))
     }
 
     /// Every claim the app keeps that a rule makes doubtful.
@@ -1191,6 +1206,7 @@ impl App {
                 seq: proof.envelope().seq,
             },
         )?;
+        self.note_entry_writer(op, tx).await?;
         if changed {
             self.events.push(AppEvent::ClaimChanged { claim_key });
         }
