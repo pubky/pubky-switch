@@ -252,6 +252,14 @@ impl RealSwitch {
         self.changes.waiting()
     }
 
+    /// Close the service's connections to its database, as a server that takes no more:
+    /// every later request fails in the service's storage. For a test of how that shows.
+    pub async fn close_connections(&self) {
+        if let Some(database) = &self.database {
+            database.store().close().await;
+        }
+    }
+
     /// The test database's name; empty once it is dropped.
     pub fn database_name(&self) -> &str {
         self.database.as_ref().map_or("", TestDatabase::name)
