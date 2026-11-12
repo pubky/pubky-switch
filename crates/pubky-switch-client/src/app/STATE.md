@@ -133,7 +133,11 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
 - **A backup doesn't carry `opq/`, `sent/` or `sentt/`.** A kept batch's messages go into
   the outbox only with the batch's answer, so a restored app neither sends the batch nor
   delivers the messages it would have queued; the restore's reconcile mode reads the shared
-  records and claims, and the protocol queues what it still owes again. Nor does it carry
+  records and claims, and the protocol queues what it still owes again: a message such a
+  batch queued, when the batch was applied and a record it wrote stores the message, goes
+  again from that record's signed plaintext through `App::queue_stored`, with the same
+  bytes and `msg_id`, its replay deadline 30 days from its `created_at`, less the clock
+  tolerance (Switch spec 11). Nor does it carry
   the ends of kept batches and their indexes (`kb/`, `kbt/`, `kbm/`, `kba/`): a restored
   app's `App::kept_batch`, `App::kept_attempt` and `App::delivery` know nothing of a batch
   kept before the restore. A restored app
@@ -273,7 +277,7 @@ uploads; `push.rs` holds the push registration. The peek (`peek.rs`) writes noth
 
 | Key | Holds | Sensitive |
 |---|---|---|
-| `out/<msg_id>` | a queued message, queued alone or with the answer of the batch that carried it: its signed plaintext, signed once, the envelope sealed for one try with its `apps_version`, its jobs (conversation entry, delivery, record) and where each stands, a re-send owed, when it was refused for good, and when a delivery was first and last answered `403 not_admitted` or `403 not_current`, which of the two the last answer was (`UndeliverableReason`), with the answers counted at least 7.5 days apart; a failed one goes after the sent-message retention, and so does a record job still owed then, from the first acceptance, given up with a `RecordJobDropped` duty event in that commit; an undeliverable one when a try is answered so again 30 days after that first answer and 5 answers were counted, or at the first flush 45 days after it in any case | yes |
+| `out/<msg_id>` | a queued message, queued alone, with the answer of the batch that carried it, or again from its stored signed plaintext (`App::queue_stored`, with a replay deadline): its signed plaintext, signed once, the envelope sealed for one try with its `apps_version`, its jobs (conversation entry, delivery, record) and where each stands, a re-send owed, when it was refused for good, and when a delivery was first and last answered `403 not_admitted` or `403 not_current`, which of the two the last answer was (`UndeliverableReason`), with the answers counted at least 7.5 days apart; a failed one goes after the sent-message retention, and so does a record job still owed then, from the first acceptance, given up with a `RecordJobDropped` duty event in that commit; an undeliverable one when a try is answered so again 30 days after that first answer and 5 answers were counted, or at the first flush 45 days after it in any case | yes |
 | `sent/<msg_id>` | a message the recipient's inbox accepted, written in the commit that records the acceptance, kept 30 days from its first acceptance for re-sends | yes |
 | `sentt/<time>/<msg_id>` | the time index for pruning sent messages | |
 | `dir/<pubky>` | a counterparty's directory as signed, the switch, generation and `identity.json` version it was read under, its versions, and whether it is read again before the next send; for a directory over the store's value size, only its stub: the switch, generation, versions and read time, no apps, always stale, so each send reads it again and a provider loss since is still found | |

@@ -45,9 +45,10 @@
 
 use pubky_switch_core::enc::{serde_b64, serde_b64_vec};
 use pubky_switch_core::http::{ErrorCode, Retry};
+use pubky_switch_core::json::OpaqueMember;
 use pubky_switch_core::message::{Message, MessagePlaintext, Sender};
 use pubky_switch_core::ops::{AllowKind, OpKind};
-use pubky_switch_core::records::{DAY_MS, IdentityDoc};
+use pubky_switch_core::records::{CLOCK_TOLERANCE_MS, DAY_MS, IdentityDoc};
 use pubky_switch_core::scopes::Permission;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -745,6 +746,107 @@ impl App {
             Ok(item.msg_id)
         })
         .await
+    }
+
+    /// Queue again a message this app signed itself, from its stored signed plaintext, with
+    /// the same bytes and so the same `msg_id`, sending nothing (Switch spec 11 "Queued
+    /// again by its signer"). Returns its `msg_id`.
+    ///
+    /// It is for a message no outbox holds although the protocol's records show it sent. A
+    /// batch that queues a message ([`super::OpBatch::queue`]) puts it in the outbox only
+    /// with the batch's answer, and a backup doesn't carry a batch kept unanswered. So
+    /// after a restore from a backup taken while such a batch was kept, if the batch was
+    /// applied, the record it wrote stores the message while neither the outbox nor the
+    /// sent messages hold it. The protocol queues it again from that record.
+    ///
+    /// The plaintext must be signed with this app's key, the one its certificate names,
+    /// with the App ID and `from` of this app and identity; the recipient, the kind and the
+    /// `msg_id` are the message's. It is queued as [`App::queue_signed`] queues one: pushed,
+    /// with the conversation entry its kind needs, and no record job, since the record holds
+    /// it already. A message the outbox holds, or that was sent, is left as it is, so the
+    /// call queues it once however often it is made. A recipient that processed the
+    /// message drops a copy as a duplicate only while it keeps the pair, so the copy is
+    /// delivered only until [`SENT_RETENTION_MS`] from the message's `created_at`, less
+    /// the clock tolerance; past that, it is given up and
+    /// [`AppEvent::MessageUndelivered`] tells the protocol.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::Stopped`] or [`Refusal::Left`]; [`Refusal::Usage`] for a plaintext that
+    /// doesn't read as a message, or that this app didn't sign; a store failure.
+    pub async fn queue_stored(&mut self, plaintext: &MessagePlaintext) -> Result<String, AppError> {
+        Box::pin(async move {
+            self.ready_local().await?;
+            self.refuse_when_stopped()?;
+            let item = self.stored_item(plaintext)?;
+            if self.knows_message(&item.msg_id).await? {
+                return Ok(item.msg_id);
+            }
+            let mut tx = self.tx()?;
+            put_outbox_item(&mut tx, &item)?;
+            self.commit(tx).await?;
+            Ok(item.msg_id)
+        })
+        .await
+    }
+
+    /// The outbox item of a message this app signed, read from its signed plaintext
+    /// ([`App::queue_stored`]).
+    fn stored_item(&self, plaintext: &MessagePlaintext) -> Result<OutboxItem, AppError> {
+        let not_ours = || AppError::from(Refusal::Usage("a message this app didn't sign".into()));
+        let me = self.state.meta.identity;
+        let app_id = self.state.meta.app_id;
+        if plaintext.sender_app_id() != app_id {
+            return Err(not_ours());
+        }
+        let rules = self.protocol.opaque_members();
+        let opaque: Vec<OpaqueMember<'_>> = rules
+            .iter()
+            .map(|rule| OpaqueMember {
+                kind: rule.kind.as_deref(),
+                member: rule.member.as_str(),
+            })
+            .collect();
+        let message = Message::parse(plaintext.json(), &opaque)
+            .map_err(|_| Refusal::Usage("a stored plaintext that isn't a message".into()))?;
+        if message.from.identity != me || message.from.app_id != app_id {
+            return Err(not_ours());
+        }
+        // Switch wire 5.1 check 4, as the recipient makes it: the key the certificate names,
+        // over the recipient identity and the JSON bytes.
+        plaintext
+            .verify_signature(&self.state.cert.signing_key(), &message.to)
+            .map_err(|_| not_ours())?;
+        let deadline = message
+            .created_at_ms
+            .saturating_sub(CLOCK_TOLERANCE_MS)
+            .saturating_add(SENT_RETENTION_MS);
+        Ok(OutboxItem {
+            to: message.to,
+            conversation: message.to != me && self.protocol.adds_conversation(&message.kind),
+            kind: message.kind,
+            msg_id: message.msg_id,
+            plaintext: plaintext.encode(),
+            notify: true,
+            invite_code: None,
+            sealed: None,
+            record: None,
+            record_done: false,
+            accepted_at_ms: None,
+            failed: None,
+            last_error: None,
+            tries: 0,
+            queued_ms: self.now(),
+            failed_ms: None,
+            resend: false,
+            undeliverable_ms: None,
+            undeliverable_reason: None,
+            undeliverable_last_ms: None,
+            undeliverable_tries: 0,
+            resend_queued: false,
+            replay_until_ms: Some(deadline),
+            record_batch: None,
+        })
     }
 
     /// Whether the outbox holds the message `msg_id`, or the app keeps it as sent.
