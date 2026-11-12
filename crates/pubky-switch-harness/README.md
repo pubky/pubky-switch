@@ -133,10 +133,11 @@ The flows send every call the service serves, each at both switches. What they l
   own, and no conforming signer sends one: a signer that builds on a version signs the
   next, and a provider loss in place, whose version needn't build on the held one, is
   declared only by a signer whose backup and published copy show nothing newer than its
-  records. That rule stays with the core's unit test. A switch that shows an older copy or another body (a rollback
-  or an equivocation at the switch) and a backup that doesn't open stay with the signer's
-  tests on the scripted switch, as do a stale backup refused at a restore, a Homeserver
-  that holds another body at a restore, and a restore in place below the signer's mark.
+  records. That rule stays with the core's unit test. A switch that shows an older copy
+  or another body (a rollback or an equivocation at the switch) and a backup that doesn't
+  open stay with the signer's tests on the scripted switch, as do a stale backup refused
+  at a restore, a Homeserver that holds another body at a restore, and a restore in place
+  below the signer's mark.
 - **More of a removal.** The removal flows date a revocation and a departure, clean up
   after one, purge its entry, and send a revocation past a read that failed or during a
   recovery. A removal time a switch reports before the app was listed or after its own

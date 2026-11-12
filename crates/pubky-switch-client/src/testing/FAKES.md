@@ -356,8 +356,8 @@ What stays only on the scripted switch, and why:
   what the signer does about them.
 - **A delivery refused for good,** other than a recovery's version over the service's app
   limit: a `400` to any other version (an ordinary or a renewing version, a restore's next
-  version), a take-over refused, or a `413 too_large`. No conforming signer meets these at
-  the service, so the tests script the refusal.
+  version), a take-over refused `400`, or a `413 too_large`. No conforming signer meets
+  these at the service, so the tests script the refusal.
 - **Exact timing.** A crash at each commit of a flow, a store that fails or can't tell
   whether it committed, and an answer lost at one chosen call among several alike: the
   tests place these by a commit's or a request's number.
