@@ -277,6 +277,12 @@ impl Inner {
         fresh.max_contacts = self.max_contacts;
         fresh.max_deny = self.max_deny;
         fresh.upload_counts = std::mem::take(&mut self.upload_counts);
+        // The directory's versions are the account's, not the generation's: they go on
+        // counting, as at the service, so a sender's copy from before the loss never
+        // carries a version the new generation gives another set of apps (Switch wire
+        // 7.4.3 step 5, 7.4.10).
+        fresh.apps_version = self.apps_version;
+        fresh.directory_version = self.directory_version;
         fresh.faults = std::mem::take(&mut self.faults);
         fresh.kept_at = self.kept_at;
         fresh.kept_app_ids = std::mem::take(&mut self.kept_app_ids);
@@ -1044,6 +1050,8 @@ mod tests {
             let mut inner = switch.lock();
             inner.uploads_per_app_per_hour = 7;
             inner.upload_counts.insert([5; 16], (1, 3));
+            inner.apps_version = 4;
+            inner.directory_version = 9;
         }
         let recovery = IdentityDoc::sign(&identity, body).unwrap();
         let delivery = json!({ "identity": recovery.signed(), "prev": null }).to_string();
@@ -1060,6 +1068,10 @@ mod tests {
             let inner = switch.lock();
             assert_eq!(inner.uploads_per_app_per_hour, 7);
             assert_eq!(inner.upload_counts.get(&[5; 16]), Some(&(1, 3)));
+            // The directory's versions go on from where they stood: the account started
+            // afresh never shows a version it showed before for another set of apps.
+            assert_eq!(inner.apps_version, 4);
+            assert!(inner.directory_version >= 9, "{}", inner.directory_version);
         }
         let (status, retired) = enroll_at(&switch, &identity, 1, None);
         assert_eq!((status, retired["code"].clone()), (409, json!("conflict")));
