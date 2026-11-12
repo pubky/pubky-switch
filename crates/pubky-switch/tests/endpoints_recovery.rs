@@ -454,12 +454,20 @@ async fn test_recovery_in_place_answers_a_held_feed_read_503_as_the_operator() {
         .await
     });
     assert_eq!(delivered.0.status, 200, "the recovery");
-    assert_eq!(code(&answer), (503, "unavailable".into()));
-    assert!(
-        json_of(&answer).get("head").is_none(),
-        "{}",
-        json_of(&answer)
+    // Exactly these members, and the two headers every answer carries: the scripted
+    // switch's answer is held to the same (the client's `held_reads` test).
+    assert_eq!(answer.status, 503);
+    assert_eq!(
+        json_of(&answer),
+        json!({ "code": "unavailable", "message": "7.6: a temporary failure" })
     );
+    let mut names: Vec<&str> = answer
+        .headers
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect();
+    names.sort_unstable();
+    assert_eq!(names, ["switch-server-time", "switch-service-signature"]);
     // Woken by the recovery, not by the end of its wait.
     assert!(started.elapsed() < std::time::Duration::from_secs(10));
     // Neither generation's key signs it: the operator's does.
