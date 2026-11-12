@@ -1390,11 +1390,11 @@ impl App {
     /// any other.
     async fn deliver(&mut self, item: &mut OutboxItem) -> Result<Tried, AppError> {
         loop {
-            match self.deliver_under(item).await? {
+            match Box::pin(self.deliver_under(item)).await? {
                 Delivered::Tried(tried) => return Ok(tried),
                 // The bound makes this at most once per call.
                 Delivered::Unverified { held, error } => {
-                    if !self.reread_after_unverified(&item.to, &held).await? {
+                    if !Box::pin(self.reread_after_unverified(&item.to, &held)).await? {
                         return queued_or(error);
                     }
                 }

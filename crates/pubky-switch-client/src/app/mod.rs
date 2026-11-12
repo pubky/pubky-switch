@@ -909,7 +909,7 @@ impl App {
         if self.config.publishes_record {
             self.state.pending_publish = Some(record);
         }
-        self.publish_owed().await?;
+        Box::pin(self.publish_owed()).await?;
         Ok(())
     }
 
