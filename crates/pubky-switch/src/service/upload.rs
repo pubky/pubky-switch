@@ -128,6 +128,15 @@ pub(super) struct Prechecked {
     checked: CheckedUpload,
 }
 
+impl Prechecked {
+    /// The judgment, when it was made against `recovery_from` and `removed`, the ones read
+    /// under the lock.
+    fn judged_against(&self, recovery_from: u64, removed: &[RemovedApp]) -> Option<&CheckedUpload> {
+        (self.recovery_from == recovery_from && self.removed.as_slice() == removed)
+            .then_some(&self.checked)
+    }
+}
+
 /// What a recovery upload settled before the account's lock: its slot of
 /// `uploads_per_app_per_hour` (the seconds to wait when it got none), and its items judged,
 /// when they could be.
@@ -298,20 +307,19 @@ impl Service {
         let identity = txn.head().identity_key;
         let removed = held.map_or(&[][..], |doc| doc.body().removed.as_slice());
         let judged_here;
-        let checked = match prechecked.filter(|pre| {
-            pre.recovery_from == recovery.recovery_from && pre.removed.as_slice() == removed
-        }) {
-            Some(pre) => &pre.checked,
-            None => {
-                let cx = UploadContext {
-                    identity: &identity,
-                    recovery_from: recovery.recovery_from,
-                    removed,
-                };
-                judged_here = check_upload(&upload, &cx);
-                &judged_here
-            }
-        };
+        let checked =
+            match prechecked.and_then(|pre| pre.judged_against(recovery.recovery_from, removed)) {
+                Some(checked) => checked,
+                None => {
+                    let cx = UploadContext {
+                        identity: &identity,
+                        recovery_from: recovery.recovery_from,
+                        removed,
+                    };
+                    judged_here = check_upload(&upload, &cx);
+                    &judged_here
+                }
+            };
         // The transition's `seq`, given out first: a record taken from the upload is at it.
         let seq = txn.next_seq().map_err(|e| store_error(&e))?;
         let mut changes = UploadChanges {
@@ -490,5 +498,31 @@ impl Service {
             }
         }
         Ok(added)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_upload_judgment_is_taken_only_against_what_it_was_made_with() {
+        // A judgment made before the lock is taken only when the lost generation and the
+        // removed apps read under the lock are the ones it was made with (Switch wire 7.4.14).
+        let removed = vec![RemovedApp {
+            app_id: [1; 16],
+            distrust_from: 5,
+        }];
+        let pre = Prechecked {
+            recovery_from: 1,
+            removed: removed.clone(),
+            checked: CheckedUpload::default(),
+        };
+        assert!(pre.judged_against(1, &removed).is_some());
+        assert!(
+            pre.judged_against(2, &removed).is_none(),
+            "another lost generation"
+        );
+        assert!(pre.judged_against(1, &[]).is_none(), "other removed apps");
     }
 }

@@ -131,11 +131,13 @@ impl Inner {
             ("POST", "inbox") => self.append(request, Some(sender), query)?,
             ("POST", "connect") => self.connect(sender),
             ("POST", "ops") => not_admitted(),
-            _ => bad(
+            (method, route) if is_route(method, route) => bad(
                 ErrorCode::PermissionMissing,
                 "a call only another caller may make",
                 json!(null),
             ),
+            // As the service answers a request it has no route for.
+            _ => bad(ErrorCode::NotFound, "no such route", json!(null)),
         })
     }
 
@@ -474,6 +476,42 @@ impl Inner {
 }
 
 /// `403 not_admitted`, which carries no `current` (Switch wire 7.6).
+/// Whether `method` `route` (the path after `/v1/{id}/`) is a call of Switch wire 7.4.
+fn is_route(method: &str, route: &str) -> bool {
+    let segments: Vec<&str> = route.split('/').collect();
+    matches!(
+        (method, segments.as_slice()),
+        ("PUT" | "GET", ["identity"])
+            | (
+                "POST",
+                ["inbox"] | ["ops"] | ["connect"] | ["freeze"] | ["unfreeze"]
+            )
+            | (
+                "POST",
+                ["import"] | ["erase"] | ["recovery", "admission" | "upload"]
+            )
+            | (
+                "POST",
+                ["import", "activate"] | ["apps", _, "keys" | "leave" | "revoke"]
+            )
+            | (
+                "GET",
+                ["feed"] | ["allow"] | ["connect"] | ["records"] | ["directory"]
+            )
+            | (
+                "GET",
+                ["apps"] | ["export"] | ["claims", _] | ["records", _]
+            )
+            | ("GET", ["apps", _, "keys"] | ["export", "chunks", _])
+            | (
+                "PUT",
+                ["peers"] | ["push"] | ["handover"] | ["import", "chunks", _]
+            )
+            | ("GET", ["handover"])
+            | ("DELETE", ["connect", _])
+    )
+}
+
 fn not_admitted() -> Answer {
     bad(ErrorCode::NotAdmitted, "not admitted", json!(null))
 }
@@ -534,12 +572,14 @@ mod tests {
             ("GET", "feed", "permission_missing"),
             ("GET", "records", "permission_missing"),
             ("POST", "ops", "not_admitted"),
+            ("GET", "no/such/route", "not_found"),
         ] {
             let request = foreign(method, &format!("/{rest}"), &cert);
             let (status, body) = inner.route_foreign(&request, &sender, rest).unwrap();
+            let expected = if code == "not_found" { 404 } else { 403 };
             assert_eq!(
                 (status, &body["code"]),
-                (403, &json!(code)),
+                (expected, &json!(code)),
                 "{method} {rest}"
             );
         }

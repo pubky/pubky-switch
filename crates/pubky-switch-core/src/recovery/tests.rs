@@ -1014,3 +1014,18 @@ fn test_recovery_claim_a_foreign_proof_leaves_the_writer_rules() {
     let merge = merge_claim(Some(&held), &[failed], NOW, 64);
     assert_eq!(merge.claim.unwrap().attempts[0].outcome, Outcome::Failed);
 }
+
+#[test]
+fn test_recovery_settled_proof_leaves_a_claim_held_settled() {
+    // A SETTLED proof makes a claim the service holds open and unsettled divergent; one it
+    // holds settled, live with an attempt still open, it leaves unchanged (Switch wire
+    // 7.4.14).
+    let held = claim_with(vec![
+        attempt_of(1, WALLET, Outcome::Done),
+        attempt_of(2, PHONE, Outcome::Open),
+    ]);
+    assert!(held.settled && !held.tombstone);
+    let view = held.view(&KEY, NOW, &|_| true);
+    let merge = merge_upload_claim(Some(&held), Some(&(view, NOW - 10)), &[], NOW, 64);
+    assert!(!merge.changed && !merge.divergent, "{merge:?}");
+}
