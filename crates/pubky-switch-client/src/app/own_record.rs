@@ -13,11 +13,16 @@
 //! before its `app.put` is first sent, and sent again byte for byte until answered. Once the
 //! switch holds it, the commit that records the answer keeps it under `pending/publish`, for
 //! an app that publishes, and only then is it written to the Homeserver: the record
-//! published is the one delivered, in the same bytes (Switch wire 2.1 "Sign once", and as
-//! `identity.json` is delivered before it is published, Switch spec 4.3). A delivery that
-//! fails keeps the record and goes again at the next read, before anything is published; a
-//! Homeserver write that fails stays owed, and goes again at the next read or with the next
-//! change, without failing the read.
+//! published is the one delivered, in the same bytes (Switch spec 4.2: an app delivers its
+//! record with `app.put` before it publishes it, and publishes again a publication that
+//! failed; Switch wire 2.1 "Sign once"). A delivery that fails keeps the record and goes
+//! again at the next read, before anything is published; a Homeserver write that fails
+//! stays owed, and goes again at the next read or with the next change, without failing the
+//! read. Until then, readers of the Homeserver see the record published before.
+//!
+//! **Renewal.** The Switch sets no schedule for renewing a record: `expires_at` is the app's
+//! choice (Switch spec 4.2). A protocol whose readers rely on its apps' records picks one
+//! and calls [`App::renew_record`] by it.
 //!
 //! **A protocol's signatures** (Switch spec 1, 13.2; Switch wire 2.3). A protocol's own
 //! formats sign `lp(label, fields...)` with the app's signing key under a label of the
@@ -108,10 +113,13 @@ impl App {
     }
 
     /// Renew the app's record: sign it again with a new `updated_at` and `expires_at`, the
-    /// rest unchanged, deliver it and publish it (Switch spec 4.2). When to renew is the
-    /// protocol's rule; readers trust a record until the earlier of its `expires_at` and
-    /// its `updated_at` plus the identity's record age limit (Switch spec 4.3,
-    /// `record_max_age`).
+    /// rest unchanged, deliver it and publish it (Switch spec 4.2).
+    ///
+    /// The Switch sets no schedule for it: when to renew is the protocol's to choose, and a
+    /// protocol whose readers rely on its apps' records must choose one, or its records
+    /// lapse. Readers trust a record until the earlier of its `expires_at` and its
+    /// `updated_at` plus the identity's record age limit (Switch spec 4.3,
+    /// `record_max_age`), so a schedule renews within both.
     ///
     /// # Errors
     ///

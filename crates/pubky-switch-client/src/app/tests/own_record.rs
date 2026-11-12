@@ -349,6 +349,8 @@ async fn test_own_record_conflict_with_another_device_is_written_again_later() {
     assert_eq!(w.published(id), Some(bytes_of(app.record())));
 }
 
+/// Switch spec 4.2: the record is delivered with `app.put` before it is published, so a
+/// refused delivery publishes nothing.
 #[tokio::test]
 async fn test_own_record_refused_delivery_publishes_nothing() {
     let w = World::new();
@@ -420,6 +422,7 @@ async fn test_own_record_unreachable_switch_keeps_the_record() {
     assert_eq!(w.published(id), Some(bytes_of(app.record())));
 }
 
+/// Switch spec 4.2: a publication that failed is published again.
 #[tokio::test]
 async fn test_own_record_homeserver_failure_stays_owed() {
     let w = World::new();
@@ -438,7 +441,14 @@ async fn test_own_record_homeserver_failure_stays_owed() {
     );
     // The switch holds the record either way.
     assert_eq!(w.held(id).as_ref(), Some(app.record()));
+    // Meanwhile readers of the Homeserver see the earlier record, as published at join; a
+    // reader of both copies takes the switch's, its `updated_at` being later (Switch spec
+    // 4.2).
     assert_eq!(w.published(id), published);
+    let earlier: SignedDoc = serde_json::from_slice(&published.unwrap()).unwrap();
+    let earlier = AppRecord::verify(&earlier, &w.alice.public()).unwrap();
+    assert!(earlier.body().protocol(PROTO).is_none());
+    assert!(earlier.updated_at() < record_of(&app).updated_at());
     // Owed across a load; the read publishes it and reports nothing failed.
     let mut loaded = w.load_publishing_on(w.store.clone(), id).await;
     let report = loaded.receive(None).await.unwrap();
