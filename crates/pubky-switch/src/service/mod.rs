@@ -1381,14 +1381,14 @@ impl Service {
             }
             Call::GetConnect => {
                 return self
-                    .get_connect(txn, held.as_ref(), writer.as_ref())
+                    .get_connect(txn, signer, held.as_ref(), writer.as_ref())
                     .await
                     .map(|answer| (answer, serving))
                     .map_err(|error| Refused::with_head(error, serving));
             }
             Call::DeleteConnect(pubky) => {
                 return self
-                    .delete_connect(txn, writer.as_ref(), pubky)
+                    .delete_connect(txn, signer, writer.as_ref(), pubky)
                     .await
                     .map(|answer| (answer, serving))
                     .map_err(|error| Refused::with_head(error, serving));

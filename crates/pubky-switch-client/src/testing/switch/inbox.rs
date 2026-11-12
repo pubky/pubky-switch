@@ -260,7 +260,8 @@ impl Inner {
     /// (`crates/pubky-switch/src/service/connect.rs`): `503 staged` while admission is
     /// staged, whatever the policy; `not_admitted` while the policy turns connect requests
     /// off; `identity_needed` unless the copy of the sender's document lists the app; a
-    /// sender already pending answered `pending`; a full list `429 quota_exceeded`, before
+    /// sender already pending, or one the allowlist admits, answered `pending`, nothing kept
+    /// for the admitted one; a full list `429 quota_exceeded`, before
     /// the deny list; a denied sender answered `pending`, its request not kept.
     fn connect(&mut self, sender: &Sender) -> Answer {
         if self.admission_staged {
@@ -281,11 +282,15 @@ impl Inner {
             200,
             json!({ "pending": true, "known_version": self.known(&sender.identity) }),
         );
-        if self
-            .shared
-            .connect
-            .iter()
-            .any(|(pubky, _)| *pubky == sender.identity)
+        // A sender already pending, or one the allowlist already admits, which nothing is
+        // kept for.
+        let (listed, denied) = self.listed(&sender.identity);
+        if (listed && !denied)
+            || self
+                .shared
+                .connect
+                .iter()
+                .any(|(pubky, _)| *pubky == sender.identity)
         {
             return pending;
         }
@@ -297,7 +302,6 @@ impl Inner {
                 json!({ "limit": "connect_requests" }),
             );
         }
-        let (_, denied) = self.listed(&sender.identity);
         if !denied {
             let now = self.now();
             self.shared.connect.push((sender.identity, now));

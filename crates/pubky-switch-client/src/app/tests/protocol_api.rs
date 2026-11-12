@@ -1786,6 +1786,68 @@ async fn test_scripted_inbox_connect_requests_full_keep_the_one_waiting() {
 }
 
 #[tokio::test]
+async fn test_scripted_inbox_connect_request_is_answered_by_each_entry_and_a_decline() {
+    // As at the service: a contact, a conversation entry, a deny list entry, a decline and
+    // the conversation entry an invite code's first append writes each answer the request;
+    // a sender the lists admit asks without a request kept.
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let mut wallet = p.join(&p.alice, "wallet", &protocol).await;
+    let mut shop = p.join(&p.bob, "shop", &protocol).await;
+    let bob = p.bob.identity().public();
+    let alice = p.alice.identity().public();
+    p.bob
+        .next_doc(|body| body.policy.connect_requests.enabled = true)
+        .unwrap();
+    let asked = |p: &Pair| p.bob.switch().connects() == vec![alice];
+    assert!(wallet.ask_to_connect(&bob).await.unwrap());
+    assert!(asked(&p));
+    shop.add_contact(&alice).await.unwrap();
+    assert!(p.bob.switch().connects().is_empty(), "a contact");
+    assert!(wallet.ask_to_connect(&bob).await.unwrap());
+    assert!(
+        p.bob.switch().connects().is_empty(),
+        "admitted: nothing kept"
+    );
+    shop.remove_contact(&alice).await.unwrap();
+
+    assert!(wallet.ask_to_connect(&bob).await.unwrap());
+    assert!(asked(&p));
+    shop.invite(&alice).await.unwrap();
+    assert!(p.bob.switch().connects().is_empty(), "a conversation entry");
+    shop.remove_conversation(&alice).await.unwrap();
+
+    assert!(wallet.ask_to_connect(&bob).await.unwrap());
+    assert!(asked(&p));
+    shop.deny(&alice).await.unwrap();
+    assert!(p.bob.switch().connects().is_empty(), "a deny list entry");
+    shop.undeny(&alice).await.unwrap();
+
+    assert!(wallet.ask_to_connect(&bob).await.unwrap());
+    assert!(asked(&p));
+    shop.decline_connect(&alice).await.unwrap();
+    assert!(p.bob.switch().connects().is_empty(), "a decline");
+
+    assert!(wallet.ask_to_connect(&bob).await.unwrap());
+    assert!(asked(&p));
+    let code = shop
+        .register_invite_code(START + DAY_MS, 1, json!({ "order": "o-1" }))
+        .await
+        .unwrap();
+    let mut first = Pair::note(&p.bob, "order");
+    first.invite_code = Some(code.code.clone());
+    let (_, delivery) = wallet.send(first).await.unwrap();
+    assert!(
+        matches!(delivery, Delivery::Accepted { .. }),
+        "{delivery:?}"
+    );
+    assert!(
+        p.bob.switch().connects().is_empty(),
+        "an invite code's entry"
+    );
+}
+
+#[tokio::test]
 async fn test_scripted_inbox_takes_own_apps_kinds_between_them() {
     let p = Pair::new();
     let protocol = ApiProtocol::new(Mode::Plain);

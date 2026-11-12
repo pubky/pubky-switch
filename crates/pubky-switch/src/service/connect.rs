@@ -7,8 +7,9 @@
 //!   admit, whatever the policy; the policy off is `403 not_admitted`; the service's copy of the sender's `identity.json` must
 //!   list the app (`409 identity_needed`); then the rates, per sender (`connect_per_min`)
 //!   and per account for every stranger together (`stranger_per_min`, shared with their
-//!   `PUT /peers`), each refusal a hit on the sender's flag. A sender already pending is
-//!   answered `pending`, full or not. A full list (the policy's `max_pending`, capped by
+//!   `PUT /peers`), each refusal a hit on the sender's flag. A sender already pending, or
+//!   one the allowlist already admits (a contact or a conversation entry), is answered
+//!   `pending`, full or not, and nothing is kept for the admitted one. A full list (the policy's `max_pending`, capped by
 //!   `max_connect_pending`) refuses a new sender `429 quota_exceeded`, before the deny list
 //!   is looked at, so a denied sender gets the same answer; otherwise a denied sender is
 //!   answered `pending` and its request isn't kept. None waiting is dropped to make room.
@@ -31,6 +32,7 @@ use serde_json::json;
 
 use super::{Answer, Service, store_error};
 use crate::http::error::{ApiError, ErrorCode};
+use crate::keys::ServiceSigner;
 use crate::store::AccountTxn;
 
 /// The pending requests' cap that applies: the policy's `max_pending`, at most
@@ -121,10 +123,15 @@ impl Service {
                 .take(account.id.clone(), self.limits.stranger_per_min, time_ms);
         limited(txn, taken, "strangers at this account")?;
         let pending = json!({ "pending": true, "known_version": known });
-        if txn
-            .connect_pending(&sender)
-            .await
-            .map_err(|e| store_error(&e))?
+        // A sender already pending, or one the allowlist already admits, which nothing is
+        // kept for: an admission answers a request, so the two never hold together.
+        let standing = self.standing(txn, &sender).await?;
+        let admitted = !standing.denied && (standing.contact || standing.conversation);
+        if admitted
+            || txn
+                .connect_pending(&sender)
+                .await
+                .map_err(|e| store_error(&e))?
         {
             return Ok(Answer::ok(serde_json::to_vec(&pending).unwrap_or_default()));
         }
@@ -137,7 +144,6 @@ impl Service {
                 "9.3: the connect request list is full",
             ));
         }
-        let standing = self.standing(txn, &sender).await?;
         if !standing.denied {
             txn.put_connect(&sender, time_ms)
                 .await
@@ -152,6 +158,7 @@ impl Service {
     pub(super) async fn get_connect(
         &self,
         txn: &mut AccountTxn,
+        signer: &ServiceSigner,
         held: Option<&IdentityDoc>,
         writer: Option<&AppCert>,
     ) -> Result<Answer, ApiError> {
@@ -174,7 +181,7 @@ impl Service {
             .map(|request| json!({ "pubky": pubky_id(&request.pubky), "at": rfc3339(request.at_ms) }))
             .collect();
         let body = json!({ "requests": requests, "max_pending": max_pending, "full": full });
-        Ok(Answer::ok(serde_json::to_vec(&body).unwrap_or_default()))
+        self.own_answer(txn, signer, &body).await
     }
 
     /// `DELETE /v1/{id}/connect/{pubky}` under the lock, from an own app (Switch wire
@@ -182,6 +189,7 @@ impl Service {
     pub(super) async fn delete_connect(
         &self,
         txn: &mut AccountTxn,
+        signer: &ServiceSigner,
         writer: Option<&AppCert>,
         pubky: &str,
     ) -> Result<Answer, ApiError> {
@@ -203,6 +211,20 @@ impl Service {
         }
         txn.note_change();
         let body = json!({ "declined": pubky_id(&sender) });
-        Ok(Answer::ok(serde_json::to_vec(&body).unwrap_or_default()))
+        self.own_answer(txn, signer, &body).await
+    }
+
+    /// An own app's answer, with the newest signed head (Switch wire 7.1).
+    async fn own_answer(
+        &self,
+        txn: &mut AccountTxn,
+        signer: &ServiceSigner,
+        body: &serde_json::Value,
+    ) -> Result<Answer, ApiError> {
+        let head = self
+            .head(txn, signer)
+            .await
+            .ok_or_else(|| ApiError::unavailable("7.6: a temporary failure"))?;
+        Ok(Answer::ok(serde_json::to_vec(body).unwrap_or_default()).with_head(Some(head)))
     }
 }

@@ -11,6 +11,7 @@ mod support;
 use pubky_switch::http::{Handler, SwitchResponse};
 use pubky_switch::limits::Limits;
 use pubky_switch_core::enc::pubky_id;
+use pubky_switch_core::http::header;
 use pubky_switch_core::keys::{AppKeys, IdentityKey};
 use pubky_switch_core::ops::{AllowKind, OpKind, sign_batch};
 use pubky_switch_core::records::{IdentityBody, IdentityDoc};
@@ -223,6 +224,8 @@ async fn test_connect_request_is_pending_once_and_listed() {
     );
     assert_eq!(body(&listed)["max_pending"], json!(50));
     assert_eq!(body(&listed)["full"], json!(false));
+    // An own app's answers carry the newest signed head (Switch wire 7.1).
+    assert!(header_text(&listed, header::HEAD).is_some());
     replay.db.drop_database().await.expect("drop");
 }
 
@@ -385,40 +388,52 @@ async fn test_connect_request_is_answered_by_a_list_entry_or_declined() {
         "{}",
         String::from_utf8_lossy(&declined.body)
     );
-    assert_eq!(body(&declined), json!({ "declined": bob_id }));
+    assert_eq!(body(&declined)["declined"], json!(bob_id));
+    assert!(header_text(&declined, header::HEAD).is_some());
     assert!(requested(&list(&replay, "wallet").await).is_empty());
     assert_eq!(
         code(&decline(&replay, &bob_id).await),
         (404, json!("not_found"))
     );
-    for (batch, op) in [
+    // Each entry kind answers a pending request in the commit that writes it; the entry
+    // goes again before the next kind, so the sender asks as a stranger each time.
+    let kinds = [
         (
-            72,
             OpKind::AllowPut {
                 pubky: bob(),
                 kind: AllowKind::Conversation,
             },
+            Some(OpKind::AllowDelete {
+                pubky: bob(),
+                kind: AllowKind::Conversation,
+            }),
         ),
         (
-            73,
             OpKind::AllowPut {
                 pubky: bob(),
                 kind: AllowKind::Contact,
             },
+            Some(OpKind::AllowDelete {
+                pubky: bob(),
+                kind: AllowKind::Contact,
+            }),
         ),
-        (74, OpKind::DenyPut { pubky: bob() }),
-    ] {
-        // A sender the lists admit may still ask; the entry written after answers it.
-        assert!(pending(&ask(&replay).await), "{op:?}");
+        (OpKind::DenyPut { pubky: bob() }, None),
+    ];
+    for (batch, (put, delete)) in (72u8..).step_by(2).zip(kinds) {
+        assert!(pending(&ask(&replay).await), "{put:?}");
         assert_eq!(
             requested(&list(&replay, "wallet").await),
             vec![bob_id.clone()]
         );
-        wallet_op(&replay, op, batch).await;
+        wallet_op(&replay, put, batch).await;
         assert!(
             requested(&list(&replay, "wallet").await).is_empty(),
             "{batch}"
         );
+        if let Some(delete) = delete {
+            wallet_op(&replay, delete, batch + 1).await;
+        }
     }
     replay.db.drop_database().await.expect("drop");
 }
@@ -478,4 +493,143 @@ async fn test_connect_requests_read_needs_lists_read() {
     );
     assert_eq!(list(&replay, "wallet").await.status, 200);
     replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_connect_request_of_a_sender_the_lists_admit_is_pending_and_not_kept() {
+    // A contact or a conversation entry already admits the sender: it is answered pending,
+    // as anyone is, and nothing is kept, even while the list is full.
+    let Some(replay) = serving(Limits::default(), 0).await else {
+        return;
+    };
+    for (batch, kind) in [(80, AllowKind::Contact), (82, AllowKind::Conversation)] {
+        wallet_op(&replay, OpKind::AllowPut { pubky: bob(), kind }, batch).await;
+        let asked = ask(&replay).await;
+        assert!(pending(&asked), "{}", String::from_utf8_lossy(&asked.body));
+        assert!(requested(&list(&replay, "wallet").await).is_empty());
+        wallet_op(
+            &replay,
+            OpKind::AllowDelete { pubky: bob(), kind },
+            batch + 1,
+        )
+        .await;
+    }
+    replay.db.drop_database().await.expect("drop");
+}
+
+/// Who asks: bob's shop as a stranger, bob denied, or the shop removed in the copy of bob's
+/// `identity.json` the switch holds.
+#[derive(Clone, Copy, Debug)]
+enum Asker {
+    Stranger,
+    Denied,
+    Removed,
+}
+
+/// bob's version 2, which removes the shop: delivered by the shop itself, which a stranger
+/// may do where connect requests are on, and kept, as from a stranger.
+async fn deliver_bob_removing_the_shop(replay: &Replay) {
+    let keys = vectors("keys.json");
+    let bob_keys = keys["identities"]
+        .as_array()
+        .expect("identities")
+        .iter()
+        .find(|identity| identity["name"] == "bob")
+        .cloned()
+        .expect("bob");
+    let v1 = doc("bob identity.json");
+    let mut body: IdentityBody =
+        serde_json::from_slice(&v1.body_bytes().expect("body")).expect("body");
+    let shop = body.apps[0].app_id;
+    body.version += 1;
+    body.apps.clear();
+    body.removed.push(pubky_switch_core::records::RemovedApp {
+        app_id: shop,
+        distrust_from: 0,
+    });
+    let key = IdentityKey::from_secret(hex32(&bob_keys["secret_hex"]));
+    let v2 = IdentityDoc::sign(&key, body)
+        .expect("sign")
+        .signed()
+        .clone();
+    let path = format!("/v1/{}/peers", alice_id());
+    let request = other_request(
+        "shop",
+        ORIGIN,
+        "PUT",
+        &path,
+        serde_json::to_vec(&v2).expect("body"),
+        None,
+        ms(&at()),
+    );
+    let answer = replay.service.handle(request).await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+}
+
+/// The status and body bytes `asker` gets at a fresh switch: connect requests off (`None`)
+/// or on up to `max_pending`, with or without a copy of bob's document held.
+async fn answer_to(asker: Asker, max_pending: Option<u64>, copy: bool) -> Option<(u16, Vec<u8>)> {
+    let replay = replay().await?;
+    replay_chain_through_revoke(&replay).await;
+    if let Some(max_pending) = max_pending {
+        take_connect_requests(&replay, max_pending).await;
+        if copy {
+            deliver_bob(&replay).await;
+        }
+        if matches!(asker, Asker::Removed) {
+            deliver_bob_removing_the_shop(&replay).await;
+        }
+    }
+    if matches!(asker, Asker::Denied) {
+        wallet_op(&replay, OpKind::DenyPut { pubky: bob() }, 90).await;
+    }
+    let asked = ask(&replay).await;
+    replay.db.drop_database().await.expect("drop");
+    Some((asked.status, asked.body.to_vec()))
+}
+
+#[tokio::test]
+async fn test_connect_answers_dont_show_the_deny_list_or_a_removal() {
+    // At each step the spec names, a denied sender gets the stranger's very bytes, and a
+    // removed app the bytes of a stranger whose document the switch doesn't hold: the
+    // policy off; on without a copy held; on with one; full; not full.
+    let cases: [(Option<u64>, bool, u16); 4] = [
+        (None, false, 403),
+        (Some(50), false, 409),
+        (Some(50), true, 200),
+        (Some(0), true, 429),
+    ];
+    for (max_pending, copy, status) in cases {
+        let Some(stranger) = answer_to(Asker::Stranger, max_pending, copy).await else {
+            return;
+        };
+        assert_eq!(
+            stranger.0,
+            status,
+            "{}",
+            String::from_utf8_lossy(&stranger.1)
+        );
+        let denied = answer_to(Asker::Denied, max_pending, copy)
+            .await
+            .expect("db");
+        assert_eq!(denied, stranger, "denied, {max_pending:?} {copy}");
+    }
+    // A removed app: as a stranger with no copy held, whatever the switch holds.
+    let Some(no_copy) = answer_to(Asker::Stranger, Some(50), false).await else {
+        return;
+    };
+    for (max_pending, copy) in [(Some(50), true), (Some(0), true), (Some(50), false)] {
+        let removed = answer_to(Asker::Removed, max_pending, copy)
+            .await
+            .expect("db");
+        assert_eq!(removed, no_copy, "removed, {max_pending:?} {copy}");
+    }
+    let off = answer_to(Asker::Stranger, None, false).await.expect("db");
+    let removed_off = answer_to(Asker::Removed, None, false).await.expect("db");
+    assert_eq!(removed_off, off, "removed, off");
 }
