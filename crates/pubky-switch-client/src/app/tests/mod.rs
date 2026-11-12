@@ -5,6 +5,7 @@ mod flows;
 mod kept_status;
 mod moves;
 mod parked;
+mod passed;
 mod protocol_api;
 mod protocol_reads;
 mod push;

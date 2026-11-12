@@ -901,6 +901,9 @@ impl App {
                 Outcome::Retry(failure) => {
                     return self.retry_later(entry, &received.plaintext, parked, failure, read);
                 }
+                // Passed, not processed: no processed pair, so a re-send is delivered again
+                // (`Outcome::Pass`). Nothing is unparked: an entry stored locally stays so.
+                Outcome::Pass => return Ok(Step::Pass),
                 Outcome::Apply(effect) => effect,
             };
             if writes.not_now.is_some() {

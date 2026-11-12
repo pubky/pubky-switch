@@ -31,6 +31,11 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
   `App::kept_batch` name the first one; the wire ID is in the record's body. The commit
   that applies or drops it writes its end (`kb/<batch_id>`, `kbt/`) with that change, so
   no crash leaves a batch neither kept nor ended.
+- **A passed entry keeps nothing** (`Outcome::Pass`): the cursor moves past it as past a
+  processed one, or `seen/<seq>` marks it past a held one, and nothing else is written: no
+  `proc/` or `proct/` pair, so a re-send of the message is delivered again (Switch spec
+  11), no `parked/` entry, no `duty/` event, nothing the context added. An entry stored
+  locally that the protocol passes stays as it is under `parked/`, with its `sretry/` count.
 - **A retired receive key goes only after the cursor's commit** that passes the next key's
   registration (Switch spec 3.6).
 - **Any commit carries everything read before it.** A page's writes go in the next commit

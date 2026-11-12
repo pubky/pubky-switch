@@ -446,6 +446,23 @@ pub enum Outcome {
     /// stay kept, in their own commits. A push extension's peek runs no receive step, so a
     /// retry doesn't change what it shows.
     Retry(StoreFailure),
+    /// Passed, not processed: the protocol can't take the message now, such as a reply its
+    /// own store bounds out, and wants a later re-send of it delivered again. The cursor
+    /// moves past the entry as past a processed one, but no processed pair is kept (Switch
+    /// spec 11), so a re-send of the same `msg_id` comes to the protocol as a new entry, not
+    /// as a duplicate. What the context added is discarded; nothing is stored locally and no
+    /// duty event is kept. Once the service's cursor passes the entry it is gone: only a
+    /// re-send brings the message back.
+    ///
+    /// Only an entry read from the feed is passed so. For an entry stored locally
+    /// ([`ReceivedMessage::parked`], a released one included) a `Pass` changes nothing: it
+    /// stays stored, with what it counts, and is tried again at a later read; a protocol done
+    /// with it returns [`Outcome::Drop`]. No entry whose effect the app must keep is asked
+    /// about: one whose effect was applied is a duplicate before its receive step (check
+    /// 9), and a kept effect goes again before the feed is read; after `409 conflict` on the
+    /// effect's batch ([`ReceivedMessage::conflict`]) nothing of it was applied, so a `Pass`
+    /// then passes the entry.
+    Pass,
 }
 
 /// Entries the app can't read and whose senders it asks to send again (Switch spec 8.2):
@@ -591,8 +608,8 @@ pub trait Protocol: Send + Sync {
     /// state at hand (Switch spec 8.2): `cx` derives record keys and blinded inputs, reads
     /// the writes the app holds and the claims it keeps, and adds record writes and claim
     /// entries to the effect's batch, which carries the cursor move. What `cx` added goes
-    /// only with [`Outcome::Apply`]; a [`Outcome::Drop`], an [`Outcome::Need`] or an
-    /// [`Outcome::Retry`] discards it. After an [`Outcome::Need`] the app reads what it
+    /// only with [`Outcome::Apply`]; a [`Outcome::Drop`], an [`Outcome::Need`], an
+    /// [`Outcome::Retry`] or an [`Outcome::Pass`] discards it. After an [`Outcome::Need`] the app reads what it
     /// names and calls this again, the answers in [`ReceiveContext::switch_claim`]. A read
     /// of the context, or of the protocol's own store, that fails with a store error is an
     /// [`Outcome::Retry`] ([`StoreFailure::try_from`]): the entry is held for a later read,
