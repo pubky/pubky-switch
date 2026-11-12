@@ -113,6 +113,11 @@ The flows send every call the service serves, each at both switches. What they l
   conversation entry pruned, a connection request.
 - **Longer lives:** a renewal that adds a scope, a claim that runs out by time, an
   identity that enrolls again after an erasure.
+- **More of a signer's copies and installs.** The install flows put the published copy
+  right, clear the alarm for another document at the published version, take over on a
+  new install, and restore in place. A switch that shows an older copy or another body
+  (a rollback or an equivocation at the switch), a backup that doesn't open, and two
+  installs whose deliveries race stay with the signer's tests on the scripted switch.
 - **More of a removal.** The removal flows date a revocation and a departure, clean up
   after one, purge its entry, and send a revocation past a read that failed or during a
   recovery. A removal time a switch reports before the app was listed or after its own
@@ -141,6 +146,6 @@ Run the `trace` example to see what the two switches answered, and list each dif
 ## Run time and databases
 
 Each flow's run against the service makes one test database and drops it, also when its
-test panics; the flows run one after another. Fifty-four flows take about two and a half minutes in a
+test panics; the flows run one after another. Sixty flows take about three minutes in a
 debug build. If that grows too long, the service's halves could share one service and one
 database, with identities of their own per flow: a later option, not needed yet.

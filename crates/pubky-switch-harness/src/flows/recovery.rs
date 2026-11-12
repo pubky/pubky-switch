@@ -832,6 +832,27 @@ pub async fn provider_loss_revocation_meanwhile(world: &World) -> FlowResult {
     }
     world.advance_ms(STEP_MS);
 
+    // A run while the recovery still can't complete: its document doesn't arrive this
+    // time either. The run sends that delivery and nothing else: the revocation waits for
+    // the service that takes the recovery, and goes to no other.
+    world.unreachable("PUT", "/identity");
+    let revocations = revocations_sent(world);
+    let meanwhile = signer.run_due().await;
+    world.outcome(
+        "the signer's run, the recovery still in progress",
+        &json!({ "ended": ended(&meanwhile), "signer": status(&signer)? }),
+    );
+    if meanwhile.is_ok() || revocations_sent(world) != revocations || world.faults_left() != 0 {
+        return Err(format!(
+            "a run during the recovery ended {} and sent {} revocations",
+            ended(&meanwhile),
+            revocations_sent(world) - revocations
+        )
+        .into());
+    }
+    world.advance_ms(STEP_MS);
+
+    let revoked_at = world.now_ms();
     let resumed = signer.resume().await;
     world.outcome(
         "the signer's next run completed the recovery and sent the revocation",
@@ -860,14 +881,30 @@ pub async fn provider_loss_revocation_meanwhile(world: &World) -> FlowResult {
     let at_new = newest
         .as_ref()
         .is_some_and(|doc| doc.inbox().url == RECOVERY_ORIGIN);
-    if revoked.as_deref() != Some("200") || listed != Some(1) || gone != Some(1) || !at_new {
+    // The removal counts from the time the new service took the revocation.
+    let dated: Vec<u64> = newest
+        .iter()
+        .flat_map(|doc| doc.body().removed.iter())
+        .map(|removed| removed.distrust_from)
+        .collect();
+    if revoked.as_deref() != Some("200") || listed != Some(1) || dated != [revoked_at] || !at_new {
         return Err(format!(
             "the revocation was answered {revoked:?}, and the newest version lists {listed:?} \
-             apps and removes {gone:?}"
+             apps and removes {gone:?}, dated {dated:?}, not {revoked_at}"
         )
         .into());
     }
     Ok(())
+}
+
+/// How many revocations the run has sent so far, to any service, answered or not.
+fn revocations_sent(world: &World) -> usize {
+    let trace = world.trace();
+    trace
+        .lines
+        .iter()
+        .filter(|line| line.label.starts_with("{alice} POST ") && line.label.ends_with("/revoke"))
+        .count()
 }
 
 /// A restore in the middle of a recovery. alice's service is lost with a revocation of her

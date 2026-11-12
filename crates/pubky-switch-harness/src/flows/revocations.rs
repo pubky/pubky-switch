@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 
 use super::enrollment::{enroll, status};
 use super::messaging::joined;
+use super::recovery::expect_answer;
 use super::removal::follow;
 use super::{ORIGIN, STEP_MS};
 use crate::parties::Asking;
@@ -47,6 +48,34 @@ fn distrust_from(doc: &IdentityDoc, app_id: [u8; 16]) -> Option<u64> {
         .map(|removed| removed.distrust_from)
 }
 
+/// Fail the flow unless the signer's last read of the apps (`GET /v1/{id}/apps`) reports
+/// alice's app `name` as revoked at `at` (Switch wire 7.4.12 `revoked_at`).
+fn expect_revoked_at(world: &World, name: &str, at: u64) -> FlowResult {
+    let trace = world.trace();
+    let line = trace
+        .lines
+        .iter()
+        .rev()
+        .find(|line| line.label == "{alice} GET /v1/{alice}/apps")
+        .ok_or("the signer read no apps")?;
+    let app = format!("id {{alice/{name}}}");
+    let reported = line.facts.iter().find_map(|(fact, value)| {
+        let index = fact.strip_prefix("body.apps[")?.strip_suffix("].app_id")?;
+        (*value == app)
+            .then(|| line.facts.get(&format!("body.apps[{index}].revoked_at")))
+            .flatten()
+    });
+    let expected = format!("time {}", pubky_switch_core::time::rfc3339(at));
+    if reported == Some(&expected) {
+        Ok(())
+    } else {
+        Err(
+            format!("the apps read reports the {name} revoked at {reported:?}, not {expected}")
+                .into(),
+        )
+    }
+}
+
 /// The time a revocation counts from (Switch spec 12.2 step 3). A day after alice's three
 /// apps joined, her signer revokes the phone and names a time an hour earlier, as after a
 /// compromise the user dates: the version that removes the phone distrusts it from that
@@ -70,6 +99,7 @@ pub async fn revocation_times(world: &World) -> FlowResult {
     world.advance_ms(DAY_MS);
 
     let earlier = world.now_ms() - HOUR_MS;
+    let phone_revoked_at = world.now_ms();
     let removing = signer
         .revoke(
             phone.app_id(),
@@ -85,6 +115,8 @@ pub async fn revocation_times(world: &World) -> FlowResult {
     if dated != Some(earlier) {
         return Err(format!("the phone is distrusted from {dated:?}, not {earlier}").into());
     }
+    // The switch's own time of the revocation is when it took it, whatever the user named.
+    expect_revoked_at(world, "phone", phone_revoked_at)?;
     world.advance_ms(STEP_MS);
 
     let revoked_at = world.now_ms();
@@ -103,6 +135,7 @@ pub async fn revocation_times(world: &World) -> FlowResult {
     if dated != Some(revoked_at) {
         return Err(format!("the tablet is distrusted from {dated:?}, not {revoked_at}").into());
     }
+    expect_revoked_at(world, "tablet", revoked_at)?;
     world.advance_ms(STEP_MS);
 
     follow(world, &mut wallet, "the wallet after both revocations").await?;
@@ -181,7 +214,7 @@ pub async fn revocation_cleanup(world: &World) -> FlowResult {
     world.add_switch(ORIGIN, &[&alice]).await?;
     let mut signer = enroll(world, &alice, ORIGIN).await?;
     let (mut wallet, _) = joined(world, &alice, &mut signer, "wallet").await?;
-    let (phone, _) = joined(world, &alice, &mut signer, "phone").await?;
+    let (mut phone, _) = joined(world, &alice, &mut signer, "phone").await?;
 
     let record = app_record_path(&phone.app_id());
     world
@@ -195,7 +228,7 @@ pub async fn revocation_cleanup(world: &World) -> FlowResult {
             .map(|doc| doc.version())
     };
 
-    world.fail_homeserver_deletion(&record);
+    world.fail_homeserver_deletion(&alice, &record);
     let removing = signer
         .revoke(phone.app_id(), None, UserConfirmed::shown_and_confirmed())
         .await;
@@ -250,6 +283,20 @@ pub async fn revocation_cleanup(world: &World) -> FlowResult {
     if reviewed.is_ok() {
         return Err("the signer would approve a purged App ID again".into());
     }
+    // And the switch keeps it too: purged from the document, the phone is still refused
+    // (Switch wire 3.3 "Purging", 7.2).
+    let refused = phone.receive(None).await;
+    world.outcome(
+        "the purged phone read its feed",
+        &json!({ "refused": refused.is_err() }),
+    );
+    world.advance_ms(STEP_MS);
+    expect_answer(
+        world,
+        "{alice/phone} GET /v1/{alice}/feed",
+        403,
+        "not_current",
+    )?;
     follow(world, &mut wallet, "the wallet at the end").await?;
     Ok(())
 }
@@ -285,6 +332,7 @@ pub async fn revocation_unread(world: &World) -> FlowResult {
         } else {
             world.refuse("GET", "/apps", 503, "unavailable");
         }
+        let revoked_at = world.now_ms();
         let removing = signer
             .revoke(app_id, None, UserConfirmed::shown_and_confirmed())
             .await?;
@@ -295,12 +343,12 @@ pub async fn revocation_unread(world: &World) -> FlowResult {
         let revocation = format!("{{alice}} POST /v1/{{alice}}/apps/{{alice/{name}}}/revoke");
         let answered = world.last_fact(&revocation, "status");
         if answered.as_deref() != Some("200")
-            || distrust_from(&removing, app_id).is_none()
+            || distrust_from(&removing, app_id) != Some(revoked_at)
             || world.faults_left() != 0
         {
             return Err(format!(
                 "the {name}'s revocation was answered {answered:?}, and its removal is \
-                 dated {:?}",
+                 dated {:?}, not {revoked_at}",
                 distrust_from(&removing, app_id)
             )
             .into());

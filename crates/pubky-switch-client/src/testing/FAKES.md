@@ -310,29 +310,42 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   with the operator's `503` in place of that `404`; every other caller gets the `404` at once.
 - **Push** (Switch wire 8.1): registrations only; nothing is sent to a relay.
 
-## Signer flows tested only here
+## Signer flows: what runs against the service too
 
-These signer flows run only against the scripted switch, whose `GET /apps` follows the
-service's rules (above). The service in this workspace serves `GET /apps`, `GET` and `POST
-/apps/{app_id}/keys` and `POST /apps/{app_id}/leave`, so the full-bundle requests, reading the
-stored parts, the departures, the hand-over (`PUT` and `GET /handover`) and the erasure can run
-against it now:
+The signer's own tests run against the scripted switch. The harness
+(`crates/pubky-switch-harness`) runs the honest paths of the same flows against the service
+as well and compares the two, so for these groups a difference between the scripted switch
+and the service shows there:
 
-- approval, renewals and reductions, their closings, and epoch completion
-  (`crates/pubky-switch-signer/tests/approval.rs`, `renewal.rs`);
-- revocations, departures, removal times and their bounds, full-bundle requests, purge and
-  record cleanup (`revocation.rs`);
-- the one-signer checks, alarms and their clearing, records behind, and publication
-  (`flows.rs`);
-- restore from the signer backup, in place and on a new install (`restore.rs`);
-- the hand-over both ways, the abort, the take-over's checks and its lost answers, and which
-  copies delete a key (`handover.rs`), save the scripted faults;
-- the account's erasure, its lost answer, retry and refusal (`erasure.rs`), save the scripted
-  faults;
-- the provider loss: declaring it, at a new service and in place, declaring it again, the
-  staged admission's end, a refused recovery, and a restore mid-recovery (`recovery.rs`),
-  save the scripted faults;
-- the warnings about an app's open attempts at a revocation and before a lapse
+- approval, renewals and reductions, a reduction's closing with its publication failing,
+  rotations over several epochs, and an epoch completed after a rotation was given up at a
+  batch (`crates/pubky-switch-signer/tests/approval.rs`, `renewal.rs`);
+- revocations and departures, the time a removal counts from, full-bundle requests, the
+  record's cleanup and the purge, a revocation past a read that failed and one asked for
+  during a recovery (`revocation.rs`, `recovery.rs`);
+- publication put right, the alarm for another document on the Homeserver and its
+  clearing, another install signing, and records behind (`flows.rs`);
+- restore from the signer backup, in place and on a new install, with a version never
+  delivered and with a revocation only the switch holds (`restore.rs`);
+- the hand-over both ways and its abort (`handover.rs`), the account's erasure and its
+  lost answer (`erasure.rs`), and the provider loss: declared at a new service and in
+  place, declared again, refused, its staged admission ended, and restored mid-recovery
+  (`recovery.rs`).
+
+What stays only on the scripted switch, and why:
+
+- **A switch that misbehaves.** A removal time reported before the app was listed or after
+  the answer that reports it; a copy of `identity.json` that doesn't verify, is older than
+  the signer's mark, or has another body at it; an answer signed with the wrong key or
+  with a member left out; a delivery refused for good, which no conforming signer meets at
+  the service. The service does none of these, so only a scripted fault shows what the
+  signer does about them.
+- **Exact timing.** Two installs whose deliveries race, a crash at each commit of a flow, a
+  store that fails or can't tell whether it committed, and an answer lost at one chosen
+  call among several alike: the tests place these by a commit's or a request's number.
+- **A backup that doesn't open or is missing,** and a Homeserver that is down for a whole
+  call: the Homeserver's faults in the harness are a single failed write or deletion.
+- **The warnings about an app's open attempts** at a revocation and before a lapse
   (`revocation.rs`, `renewal.rs`), whose attempts the test calls `open_attempt` and
   `fail_attempt` script directly, with no entry or proof held and without the permission or
   writer checks the service makes; `open_attempt` refuses, as the service does, a second open
