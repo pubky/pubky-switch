@@ -23,6 +23,7 @@ mod allow;
 mod apps;
 mod chain;
 mod claim_codec;
+mod connect;
 mod documents;
 mod enrollments;
 mod feed;
@@ -50,6 +51,7 @@ pub use account::{AccountHead, AccountTxn, CommitError, Committed, NewAccount, S
 pub use allow::{AllowEntry, AllowInvite};
 pub use apps::{AppsView, KeptAppId, KeptReason, OpenAttempt, PartSpan, newly_listed};
 pub use chain::NewChainItem;
+pub use connect::ConnectRequest;
 pub use feed::{AppDocs, CurrentDocs, FeedRow, FeedSnapshot, PageReader};
 pub use handover::StoredHandover;
 pub use identity::HeldIdentity;

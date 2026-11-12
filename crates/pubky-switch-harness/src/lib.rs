@@ -71,7 +71,7 @@ pub type FlowResult = Result<(), Box<dyn std::error::Error>>;
 /// A flow's futures nest deeply: the client's and the signer's calls, and under them the
 /// service itself, are all polled from the flow's thread, and in a debug build every level
 /// takes a large frame. Measured in a debug build, the deepest flow (`third epoch, three
-/// readers`, against the service) used 1.9 MiB of stack and 27 of the 63 flows used more
+/// readers`, against the service) used 1.9 MiB of stack and two flows in five used more
 /// than 1.5 MiB, against the 2 MiB a test's thread has. So a flow gets a thread of its own
 /// whose stack doesn't depend on who runs it: 16 MiB, eight times what the deepest flow
 /// used. The pages are committed only as they are touched.
@@ -182,17 +182,17 @@ pub async fn compare_backends(
 mod tests {
     use super::*;
 
-    /// Touch `bytes` of stack and give the last byte back.
+    /// Use about `bytes` of stack, a 64 KiB frame a level, and give 1 back.
     #[inline(never)]
     fn deep(bytes: usize) -> u8 {
         const STEP: usize = 64 * 1024;
         let mut frame = [0u8; STEP];
-        frame[STEP - 1] = 1;
-        let frame = std::hint::black_box(frame);
+        // By reference: moved by value, a frame would cost its size several times over.
+        std::hint::black_box(&mut frame)[STEP - 1] = 1;
         if bytes <= STEP {
             frame[STEP - 1]
         } else {
-            std::hint::black_box(deep(bytes - STEP))
+            deep(bytes - STEP).min(frame[STEP - 1])
         }
     }
 

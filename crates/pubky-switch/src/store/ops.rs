@@ -937,6 +937,9 @@ impl AccountTxn {
         .execute(self.conn())
         .await
         .map_err(db)?;
+        // A contact, a conversation entry or a deny list entry for the sender answers its
+        // connect request (Switch wire 7.4.7, 9.1).
+        self.delete_connect(&entry.pubky).await?;
         Ok(())
     }
 

@@ -149,10 +149,13 @@ pub fn staged_gate(call: &Call, staged: bool) -> Result<(), ApiError> {
     Ok(())
 }
 
-/// Whether apps of other identities make `call`: `PUT /peers`, `POST /inbox` and `GET
-/// /directory` (Switch wire 7.2, 7.4).
+/// Whether apps of other identities make `call`: `PUT /peers`, `POST /inbox`, `GET
+/// /directory` and `POST /connect` (Switch wire 7.2, 7.4).
 pub fn takes_other_apps(call: &Call) -> bool {
-    matches!(call, Call::PutPeers | Call::Append | Call::Directory)
+    matches!(
+        call,
+        Call::PutPeers | Call::Append | Call::Directory | Call::PostConnect
+    )
 }
 
 /// The refusal of an app of another identity at a call it doesn't make, once its
@@ -357,9 +360,12 @@ mod tests {
     #[test]
     fn test_rules_other_app_refusal() {
         assert!(takes_other_apps(&Call::PutPeers) && takes_other_apps(&Call::Append));
-        assert!(takes_other_apps(&Call::Directory));
+        assert!(takes_other_apps(&Call::Directory) && takes_other_apps(&Call::PostConnect));
         assert!(!takes_other_apps(&Call::Feed) && !takes_other_apps(&Call::Ops));
+        assert!(!takes_other_apps(&Call::GetConnect));
         for call in [
+            Call::GetConnect,
+            Call::DeleteConnect(String::new()),
             Call::Feed,
             Call::GetClaim(String::new()),
             Call::GetAllow,

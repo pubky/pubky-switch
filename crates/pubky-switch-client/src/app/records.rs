@@ -977,6 +977,20 @@ impl App {
         .await
     }
 
+    /// Whether a listing of the collections is owed (`list_due`): from joining or a restore,
+    /// a certificate taken that reads a collection the one before didn't, a `missed` item, or
+    /// an `upload` transition past [`super::MAX_RECORD_MARKS`], until a listing has run
+    /// (Switch spec 8.2, 8.3, 12.1 step 3). While it is true, the app's copy of the shared
+    /// records may lack records the switch holds: a record's absence from the copy decides
+    /// nothing. Read-only; the app makes the listing itself, at its next read.
+    ///
+    /// # Errors
+    ///
+    /// A store failure.
+    pub async fn listing_owed(&self) -> Result<bool, AppError> {
+        self.reader().exists(LIST_DUE).await
+    }
+
     /// List every collection of the protocol whose read scope the app's certificate holds
     /// (Switch spec 8.3, 12.1 step 3).
     ///
@@ -1009,12 +1023,13 @@ impl App {
     /// a read scope of a collection it lists, such as after a renewal that adds one: listed
     /// before its key arrives, a record would be held `Unreadable` until the key opened it
     /// ([`App::reopen_unreadable`]). `list_due` stays, so the read after the key arrives
-    /// lists.
-    pub(crate) async fn list_collections_if_due(&mut self) -> Result<(), AppError> {
+    /// lists. Returns whether it listed.
+    pub(crate) async fn list_collections_if_due(&mut self) -> Result<bool, AppError> {
         if !self.reader().exists(LIST_DUE).await? || self.listing_lacks_keys() {
-            return Ok(());
+            return Ok(false);
         }
-        self.list_collections().await
+        self.list_collections().await?;
+        Ok(true)
     }
 
     /// Whether the certificate lacks, at the current data epoch, the key of a scope it

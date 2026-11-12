@@ -468,17 +468,27 @@ impl App {
                 code: ErrorCode::NotCurrent,
                 ..
             }) => {
+                // Without a verified head the refusal came before the request verified: the
+                // service holds no record of the app to check it with (Switch wire 7.1
+                // "`Switch-Head` on refusals", 7.2 "Where an own app gets `403
+                // not_current`"). That is an app never registered there, or one purged after
+                // its revocation or departure: the newest identity.json tells them apart.
+                let unverified = self.client.latest_server_time().is_none();
                 self.reload_now().await?;
                 if self.state.leave.is_some() {
                     return Ok(TakeOver::Done(Err(error)));
                 }
-                // Switch wire 7.2: final only from the service and generation the newest
-                // identity.json names, and unless it lists the app with another certificate
-                // than the one it holds, a renewal it takes before it asks again. Listed with
-                // its own, listed in `removed` or not listed, it is revoked, departed or
-                // dropped (Switch spec 12.2, 12.3). A service the identity has left may say
-                // anything: the app follows the newer document instead. Without a read of
-                // the Homeserver, the newest isn't known: the answer stands for now.
+                // Switch wire 7.2 "How an own app reads it": final only from the service and
+                // generation the newest identity.json names, and unless it lists the app with
+                // another certificate than the one it holds, a renewal it takes before it
+                // asks again. Listed in `removed` or not listed, it is revoked, departed or
+                // dropped (Switch spec 12.2, 12.3), with the head or without. Listed with its
+                // own, the head says the service counts it as revoked or departed; without
+                // the head the service only holds no record of it: the read fails, and a
+                // registration owed goes again at the next one. A service the identity has
+                // left may say anything: the app follows the newer document instead.
+                // Without a read of the Homeserver, the newest isn't known: the answer
+                // stands for now.
                 let identity = self.state.meta.identity;
                 match identity::read_homeserver(self.env.homeserver.as_ref(), &identity).await {
                     Ok(Some(doc)) => {
@@ -499,6 +509,12 @@ impl App {
                     && doc
                         .listed_cert(&me)
                         .is_some_and(|listed| listed != self.state.cert.hash())
+                {
+                    return Ok(TakeOver::Done(Err(error)));
+                }
+                if unverified
+                    && !doc.lists_removed(&me)
+                    && doc.listed_cert(&me) == Some(self.state.cert.hash())
                 {
                     return Ok(TakeOver::Done(Err(error)));
                 }
@@ -1086,6 +1102,8 @@ impl App {
         if self.state.pending_record.take().is_some() {
             tx.delete(key::PENDING_RECORD)?;
         }
+        // The next service imported the record the old one accepted, so it stays the newest
+        // accepted until the re-registration's answer (Switch spec 4.2, 12.5).
         // A loss followed before, its kept batch unanswered, goes on at this generation.
         if let Some(mut loss) = self.loss_record().await?
             && !loss.done()
@@ -1170,6 +1188,9 @@ impl App {
                 }
                 processed_writes(tx, &pending.sender, &pending.msg_id, pending.hash, now)?;
                 tx.local(&pending.local)?;
+                for key in &pending.forget {
+                    tx.delete(key)?;
+                }
                 // Processed: a count of the store's retries at it goes with it.
                 if pending.stored.is_some() {
                     self.unpark(pending.stored, tx)?;
@@ -1357,7 +1378,16 @@ impl App {
         }
         let batch = Batch::from_body(mv.batch.clone())?;
         let proofs = match self.submit(&batch).await {
-            Ok(submitted) => submitted.proofs,
+            Ok(submitted) => {
+                // The next service accepted the record the re-registration carries: it is
+                // the one a publication writes from now on (Switch spec 4.2).
+                let record = super::renewal::delivered_record(&batch)?;
+                let mut tx = self.tx()?;
+                self.note_accepted(&record, &mut tx)?;
+                self.commit(tx).await?;
+                self.took_accepted(record);
+                submitted.proofs
+            }
             // A registration the service refuses as it stands, an older own key current
             // there included, is reported; the app reads on with what the service holds.
             Err(AppError::Switch(ClientError::Switch {
