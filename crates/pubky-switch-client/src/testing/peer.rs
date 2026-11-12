@@ -105,6 +105,13 @@ pub(crate) fn bad(code: ErrorCode, current: Value) -> (u16, Value) {
     (code.status(), body)
 }
 
+/// `409 identity_needed`, with `known_version` as in `current` (Switch wire 7.1, 7.6).
+fn identity_needed(version: Option<u64>) -> (u16, Value) {
+    let (status, mut body) = bad(ErrorCode::IdentityNeeded, json!({ "version": version }));
+    body["known_version"] = json!(version);
+    (status, body)
+}
+
 impl PeerSwitch {
     /// The switch of `identity` at `origin`, with no apps yet; its service key is the
     /// identity's. Its `identity.json` goes on after any version the Homeserver holds.
@@ -484,22 +491,31 @@ impl PeerInner {
         app: [u8; 16],
         code: Option<&str>,
     ) -> (u16, Value) {
+        // The query is read first, as at the service: decoded, a parameter given twice
+        // refused (Switch wire 7.1).
+        let query = request
+            .path_and_query
+            .split_once('?')
+            .map_or("", |(_, query)| query);
+        let Some(params) = super::switch::parse_query(query) else {
+            return bad(ErrorCode::BadRequest, json!(null));
+        };
         if let Some(answer) = self.answered.get(&request.body) {
             return (200, answer.clone());
         }
+        let Some(sealed_for) = params
+            .get("apps_version")
+            .and_then(|value| super::switch::decimal(value))
+        else {
+            return bad(ErrorCode::BadRequest, json!(null));
+        };
         if !self.admits(&sender, code, false) {
             return bad(ErrorCode::NotAdmitted, json!(null));
         }
         if !self.listed(&sender, &app) {
             let version = self.peers.get(&sender).map(IdentityDoc::version);
-            return bad(ErrorCode::IdentityNeeded, json!({ "version": version }));
+            return identity_needed(version);
         }
-        let sealed_for: u64 = request
-            .path_and_query
-            .split("apps_version=")
-            .nth(1)
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
         let Ok(parsed) = parse_header(&request.body) else {
             return bad(ErrorCode::BadRequest, json!(null));
         };
@@ -582,7 +598,7 @@ impl PeerInner {
 
     fn connect(&mut self, sender: [u8; 32], app: [u8; 16]) -> (u16, Value) {
         if !self.listed(&sender, &app) {
-            return bad(ErrorCode::IdentityNeeded, json!({ "version": null }));
+            return identity_needed(None);
         }
         if !self.connects.contains(&sender) {
             self.connects.push(sender);

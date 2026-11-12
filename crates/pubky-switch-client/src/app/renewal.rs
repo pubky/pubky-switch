@@ -62,7 +62,9 @@ impl App {
     }
 
     /// Present `cert` from now on, with `record`; `deliver` signs its `app.put` and keeps it
-    /// before it is sent.
+    /// before it is sent. A certificate that reads a member of a collection of the protocol
+    /// the one before didn't owes a listing, in the same commit, so the next read lists it (Switch
+    /// spec 8.3, Switch wire 7.4.9): the writes made there before it were stubs in the feed.
     async fn take_cert(
         &mut self,
         cert: AppCert,
@@ -70,9 +72,20 @@ impl App {
         deliver: bool,
     ) -> Result<(), AppError> {
         let issued_at = cert.issued_at();
+        // Member by member: a scope of the new certificate that reads a collection's member,
+        // its fixed read scope or a sub-scope of its family, and that the one before doesn't
+        // hold (Switch spec 3.3).
+        let collections = self.protocol.collections();
+        let widened = cert.scopes().iter().any(|scope| {
+            !self.state.cert.holds_scope(scope)
+                && collections.iter().any(|c| c.read_by_scope(scope))
+        });
         self.state.cert = cert;
         self.rebuild_client()?;
         let mut tx = self.tx()?;
+        if widened {
+            tx.put(super::records::LIST_DUE, &true)?;
+        }
         tx.put(key::CERT, self.state.cert.signed())?;
         tx.put(key::RECORD, &record)?;
         tx.delete(key::CERT_RENEWAL)?;
@@ -163,13 +176,35 @@ impl App {
     /// no `cert.put` for it (Switch spec 3.2 step 3): taken only if the record is signed
     /// with the app's own signing key, and its certificate renews the one held and has the
     /// listed hash. The service holds that record, so nothing is delivered.
-    pub(crate) async fn take_listed_cert(&mut self) -> Result<(), AppError> {
+    ///
+    /// It runs after a restore, whose own `identity.json` is the backup's: a renewal that
+    /// another device of the app took since is listed only in a later one, and its
+    /// `cert.put` shows as a stub once the record carries it. So the directory's own
+    /// `identity.json` is taken first when it is newer, and the certificate it lists is the
+    /// one checked (Switch spec 12.4 step 1 "Certificate"). A newer document that removes
+    /// the app or names another generation is taken and nothing more is done here
+    /// ([`Listed::NotCurrentHere`]): the read stops, or follows the provider change, and
+    /// registers nothing at this switch. Otherwise it returns the own receive key record the
+    /// same directory shows, which the restore's key check reads ([`Listed::Key`]).
+    pub(crate) async fn take_listed_cert(&mut self) -> Result<Listed, AppError> {
         let me = self.state.meta.app_id;
+        let result = self.client.directory(None).await;
+        let directory = self.take(result).await?;
+        if directory.identity.version() > self.state.own_doc.version() {
+            self.take_own_copy(directory.identity.clone()).await?;
+        }
+        if self.not_current_here().is_some() {
+            return Ok(Listed::NotCurrentHere);
+        }
+        let Some(entry) = directory.apps.into_iter().find(|app| app.app_id == me) else {
+            return Ok(Listed::Key(None));
+        };
+        let key = entry.receive_key.clone();
         let Some(listed) = self.state.own_doc.listed_cert(&me) else {
-            return Ok(());
+            return Ok(Listed::Key(key));
         };
         if listed == self.state.cert.hash() {
-            return Ok(());
+            return Ok(Listed::Key(key));
         }
         if self
             .state
@@ -178,13 +213,8 @@ impl App {
             .is_some_and(|r| r.hash() == listed)
         {
             self.adopt_renewal().await?;
-            return Ok(());
+            return Ok(Listed::Key(key));
         }
-        let result = self.client.directory(None).await;
-        let directory = self.take(result).await?;
-        let Some(entry) = directory.apps.into_iter().find(|app| app.app_id == me) else {
-            return Ok(());
-        };
         let cert = entry.record.cert().clone();
         if cert.signing_key() == self.state.keys.signing_public()
             && cert.bundle_key() == self.state.keys.bundle_public()
@@ -194,6 +224,14 @@ impl App {
             self.take_cert(cert, entry.record.signed().clone(), false)
                 .await?;
         }
-        Ok(())
+        Ok(Listed::Key(key))
     }
+}
+
+/// What [`App::take_listed_cert`] found.
+pub(crate) enum Listed {
+    /// The app is current here: the own receive key record the directory shows, if any.
+    Key(Option<pubky_switch_core::records::ReceiveKeyRecord>),
+    /// The newest own `identity.json` removes the app or names another generation.
+    NotCurrentHere,
 }

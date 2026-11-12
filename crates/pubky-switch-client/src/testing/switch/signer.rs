@@ -829,6 +829,22 @@ mod tests {
     }
 
     #[test]
+    fn test_scripted_open_attempt_refuses_a_second_open_one() {
+        // As the service refuses the entry: a claim takes one open attempt at a time, and a
+        // new one once that one has failed (Switch wire 6.8).
+        let identity = pubky_switch_core::keys::IdentityKey::from_secret([1; 32]);
+        let switch = ScriptedSwitch::new(
+            &identity,
+            [2; 32],
+            Arc::new(crate::clock::TestClock::new(0)),
+        );
+        switch.open_attempt([1; 32], [1; 16], [3; 16]).unwrap();
+        assert!(switch.open_attempt([1; 32], [2; 16], [3; 16]).is_err());
+        switch.fail_attempt([1; 32], [1; 16], [3; 16]);
+        switch.open_attempt([1; 32], [2; 16], [3; 16]).unwrap();
+    }
+
+    #[test]
     fn test_scripted_lost_enrollment_answer_leaves_no_signing_key() {
         // An enrollment answered with the pending key whose answer is lost leaves no key
         // behind to sign a later answer with (Switch wire 7.4.1).

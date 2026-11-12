@@ -607,7 +607,9 @@ pub(crate) struct RestoreState {
     pub(crate) n_floor: u64,
     /// Whether the app checked its current receive key record since the restore.
     pub(crate) key_checked: bool,
-    /// The `n` of the key the restored app registered itself, if it did.
+    /// The end of the registrations the restore asks about, set by its key check: the `n`
+    /// of the key the restored app registered itself, or one above `n_floor` when its key
+    /// was current; `None` until the check.
     pub(crate) own_key_n: Option<u64>,
     /// Reconcile mode: no new attempts until the protocol's reconciliation ends it.
     pub(crate) reconcile: bool,

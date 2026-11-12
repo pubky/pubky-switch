@@ -1159,7 +1159,7 @@ async fn test_restore_refused_protocol_layer_writes_nothing() {
     assert_eq!(fault.commits(), 0);
     assert_eq!(snapshot(&store, &app.app_id()), before);
     // A backup without the layer the protocol needs is refused the same way.
-    let bare = AppBackup::from_bytes(&app.backup().unwrap().to_bytes().unwrap()).unwrap();
+    let bare = AppBackup::from_bytes(&app.backup().await.unwrap().to_bytes().unwrap()).unwrap();
     assert_eq!(bare.protocol_layer().unwrap(), None);
     let error = restore_on(&w, protocol, fault.clone() as Arc<dyn StateStore>, &bare)
         .await
@@ -1350,7 +1350,7 @@ async fn test_backup_with_a_layer_carries_a_version_a_reader_without_layers_refu
         value["v"] = json!(v);
         serde_json::to_vec(&value).unwrap()
     };
-    let bare = app.backup().unwrap().to_bytes().unwrap();
+    let bare = app.backup().await.unwrap().to_bytes().unwrap();
     let layered = app.backup_layered().await.unwrap().to_bytes().unwrap();
     // Without a layer, the schema's version, as before; with one, another, which a reader
     // that takes only the schema's version refuses.
@@ -1415,7 +1415,7 @@ async fn test_restore_without_a_layer_by_a_protocol_that_takes_none() {
     }])
     .await
     .unwrap();
-    let backup = AppBackup::from_bytes(&app.backup().unwrap().to_bytes().unwrap()).unwrap();
+    let backup = AppBackup::from_bytes(&app.backup().await.unwrap().to_bytes().unwrap()).unwrap();
     // The bytes of a backup without a layer carry no member for it.
     assert!(
         !String::from_utf8(backup.to_bytes().unwrap())
@@ -1606,7 +1606,7 @@ async fn test_backup_after_a_failed_commit_is_refused_until_the_store_is_read_ag
         None,
         "the store isn't"
     );
-    let error = app.backup().unwrap_err();
+    let error = app.backup().await.unwrap_err();
     assert!(
         matches!(error, AppError::Refused(crate::app::Refusal::NotNow(_))),
         "{error:?}"
@@ -1614,7 +1614,7 @@ async fn test_backup_after_a_failed_commit_is_refused_until_the_store_is_read_ag
     // The next call reads the store again and processes the note; then it backs up.
     app.receive(None).await.unwrap();
     assert_eq!(count_of(app.protocol_get(COUNT).await.unwrap()), 1);
-    let backup = app.backup().unwrap();
+    let backup = app.backup().await.unwrap();
     let restored = App::restore(
         w.env_on(Arc::new(MemoryStore::new()) as Arc<dyn StateStore>),
         protocol,
@@ -2217,7 +2217,7 @@ async fn test_restore_refused_on_its_cert_from_a_plain_backup_writes_nothing() {
     let w = World::new();
     let store = Arc::new(MemoryStore::new());
     let app = cert_checked(&w, &CertCheckProtocol::new(None, None), &store).await;
-    let backup = AppBackup::from_bytes(&app.backup().unwrap().to_bytes().unwrap()).unwrap();
+    let backup = AppBackup::from_bytes(&app.backup().await.unwrap().to_bytes().unwrap()).unwrap();
     let cert = app.cert().clone();
     refused_on_its_cert(&w, None, &Arc::new(MemoryStore::new()), &backup, &cert).await;
     // The same protocol, taking the certificate, restores it.
