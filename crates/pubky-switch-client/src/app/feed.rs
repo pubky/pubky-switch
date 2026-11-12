@@ -316,14 +316,12 @@ impl App {
     pub async fn receive(&mut self, wait: Option<u32>) -> Result<ReceiveReport, AppError> {
         Box::pin(async move {
             self.ready_local().await?;
-            // Each step boxed, so a read's stack holds only pointers to their states, debug
-            // builds included.
-            let result = Box::pin(self.receive_once(wait)).await;
+            let result = self.receive_once(wait).await;
             // A move, a provider change, a revocation or an erasure met during the read is
             // followed (`provider.rs`), and the read goes on once at the service followed.
-            let result = match Box::pin(self.take_over(result)).await {
+            let result = match self.take_over(result).await {
                 TakeOver::Done(result) => result,
-                TakeOver::ReadAgain => Box::pin(self.receive_once(None)).await,
+                TakeOver::ReadAgain => self.receive_once(None).await,
             };
             if result.is_err() {
                 self.reload = true;
@@ -406,7 +404,7 @@ impl App {
         if let Some(waiting) = waiting {
             self.events.push(waiting);
         }
-        Box::pin(self.deliver_record()).await?;
+        self.deliver_record().await?;
         self.ensure_scope_keys().await?;
         self.prune_processed().await?;
         self.retell_restored().await?;

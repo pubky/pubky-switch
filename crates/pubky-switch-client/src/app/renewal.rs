@@ -125,7 +125,7 @@ impl App {
     /// answer, and writes it there (`own_record.rs`).
     pub(crate) async fn deliver_record(&mut self) -> Result<Publication, AppError> {
         let Some(pending) = self.state.pending_record.clone() else {
-            return Box::pin(self.publish_owed(false)).await;
+            return self.publish_owed(false).await;
         };
         let mut batch = Batch::from_body(pending.body)?;
         let result = self.submit(&batch).await;
@@ -174,7 +174,7 @@ impl App {
         self.state.pending_record = None;
         self.commit(tx).await?;
         self.took_accepted(delivered);
-        Box::pin(self.publish_owed(false)).await
+        self.publish_owed(false).await
     }
 
     /// The listed certificate from the own record in the directory, when the own
