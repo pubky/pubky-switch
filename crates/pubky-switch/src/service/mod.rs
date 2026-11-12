@@ -96,6 +96,9 @@ pub struct Service {
     /// The `(account, app)` whose recovery upload's items are being judged before the lock:
     /// one at a time for each.
     upload_judging: parking_lot::Mutex<std::collections::HashSet<(String, [u8; 16])>>,
+    /// Recovery uploads whose items were judged before the account's lock, and under it.
+    judged_before_lock: std::sync::atomic::AtomicU64,
+    judged_under_lock: std::sync::atomic::AtomicU64,
     /// The sweeps a retried erasure of an account gone may run (Switch wire 7.4.16): only
     /// the signer's, verified with the identity key, and bounded per account, since anyone
     /// who saw one can replay it within its timestamp window.
@@ -277,6 +280,8 @@ impl Service {
             notify_rate: KeyedWindows::default(),
             upload_rate: KeyedWindows::hours(),
             upload_judging: parking_lot::Mutex::default(),
+            judged_before_lock: std::sync::atomic::AtomicU64::new(0),
+            judged_under_lock: std::sync::atomic::AtomicU64::new(0),
             erasure_sweeps: KeyedWindows::default(),
             changes: ChangeHub::new(),
             entry_ids: Arc::new(random_entry_id),
@@ -289,6 +294,17 @@ impl Service {
     pub fn with_entry_ids(mut self, ids: impl Fn() -> [u8; 16] + Send + Sync + 'static) -> Self {
         self.entry_ids = Arc::new(ids);
         self
+    }
+
+    /// How many recovery uploads had their items judged before the account's lock, and how
+    /// many under it, for tests of what a refused upload costs (Switch wire 7.4.14).
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn upload_judgments(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (
+            self.judged_before_lock.load(Relaxed),
+            self.judged_under_lock.load(Relaxed),
+        )
     }
 
     /// How many counts of its rate limits and of failed authentications the service keeps

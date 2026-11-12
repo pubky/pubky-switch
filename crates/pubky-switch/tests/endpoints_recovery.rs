@@ -2244,6 +2244,7 @@ async fn test_upload_judged_before_the_lock_is_judged_again_when_its_state_chang
     });
     let removing = IdentityDoc::sign(&alice_key(), body).expect("sign");
     let uploaded = json!({ "records": [{ "op": ops[0].signed(), "cert": cert.signed() }] });
+    let before = replay.service.upload_judgments();
     let (answer, ()) = tokio::join!(upload(&replay, &uploaded, at), async {
         let options = replay.db.options();
         let mut watcher = sqlx::PgConnection::connect_with(options)
@@ -2285,6 +2286,11 @@ async fn test_upload_judged_before_the_lock_is_judged_again_when_its_state_chang
     assert_eq!(
         (result["records"].clone(), result["distrusted"].clone()),
         (json!([]), json!(1))
+    );
+    // Judged before the lock, and again under it.
+    assert_eq!(
+        replay.service.upload_judgments(),
+        (before.0 + 1, before.1 + 1)
     );
     replay.db.drop_database().await.expect("drop");
 }
@@ -2588,52 +2594,21 @@ async fn test_upload_refusals_order_and_the_rate_slot() {
     replay.db.drop_database().await.expect("drop");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_upload_large_body_leaves_the_lock_to_other_requests() {
+#[tokio::test]
+async fn test_upload_large_body_is_judged_before_the_lock() {
     // An upload of about 15 MiB of heads, all verified with the lost key: its items are
-    // judged before the account's lock, so writes sent while it is judged don't wait for it.
+    // judged once, before the account's lock, never under it, so the lock is held only for
+    // the merge (Switch wire 7.4.14).
     let Some(replay) = replay().await else { return };
     let (lost, at) = recovered_with_the_wallet(&replay).await;
-    let replay = std::sync::Arc::new(replay);
     let head = vectors("chain.json")["signed_heads"][0]["head"].clone();
     let one_head = serde_json::to_vec(&head).expect("json").len();
-    let heads: Vec<Value> = (0..(15 * 1024 * 1024 / (one_head + 1)))
-        .map(|_| head.clone())
-        .collect();
-    let count = heads.len();
-    let body = json!({ "lost_identity": lost.signed(), "heads": heads });
-    let writes = {
-        let replay = std::sync::Arc::clone(&replay);
-        tokio::spawn(async move {
-            let mut waits = Vec::new();
-            for i in 0..6u8 {
-                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                let mut fields = vector_claim_fields();
-                fields.attempt_id = vec![9; 16];
-                fields.expected_step = 0;
-                fields.deadline = None;
-                fields.claim_key = vec![60 + i; 32];
-                let batch = wallet_batch(120 + i, 2, vec![(Vec::new(), OpKind::Claim(fields))]);
-                let sent = std::time::Instant::now();
-                let written = wallet_ops(&replay, &batch, at).await;
-                assert_eq!(written.status, 200);
-                waits.push(sent.elapsed());
-            }
-            waits
-        })
-    };
-    let started = std::time::Instant::now();
-    let answer = upload(&replay, &body, at).await;
-    let took = started.elapsed();
-    let waits = writes.await.expect("writes");
+    let count = 15 * 1024 * 1024 / (one_head + 1);
+    let before = replay.service.upload_judgments();
+    let answer = upload(&replay, &many_heads(&lost, count), at).await;
     assert_eq!(answer.status, 200);
     assert_eq!(json_of(&answer)["result"]["heads"], json!(count));
-    let longest = waits.iter().max().copied().unwrap_or_default();
-    assert!(
-        longest * 2 < took,
-        "a write waited {longest:?} of the upload's {took:?}"
-    );
-    let replay = std::sync::Arc::try_unwrap(replay).ok().expect("one owner");
+    assert_eq!(replay.service.upload_judgments(), (before.0 + 1, before.1));
     replay.db.drop_database().await.expect("drop");
 }
 
@@ -2714,8 +2689,8 @@ fn many_heads(lost: &IdentityDoc, count: usize) -> Value {
 #[tokio::test]
 async fn test_upload_past_the_limit_is_refused_without_its_judgment() {
     // The slot of `uploads_per_app_per_hour` is taken before an upload's items are judged:
-    // past the limit, a body of 20,000 heads is `429` about as fast as an empty one, its
-    // items never judged (Switch wire 7.4.14).
+    // past the limit, a body of 20,000 heads that verify is `429`, its items judged neither
+    // before the account's lock nor under it (Switch wire 7.4.14).
     let limits = pubky_switch::limits::Limits {
         uploads_per_app_per_hour: 1,
         ..pubky_switch::limits::Limits::default()
@@ -2725,39 +2700,48 @@ async fn test_upload_past_the_limit_is_refused_without_its_judgment() {
     };
     let (lost, at) = recovered_with_the_wallet(&replay).await;
     assert_eq!(upload(&replay, &json!({}), at).await.status, 200);
-    let body = many_heads(&lost, 20_000);
-    let started = std::time::Instant::now();
-    let limited = upload(&replay, &body, at).await;
-    let refused_in = started.elapsed();
-    let small = std::time::Instant::now();
-    let limited_small = upload(&replay, &json!({}), at).await;
-    let small_in = small.elapsed();
+    let before = replay.service.upload_judgments();
+    let limited = upload(&replay, &many_heads(&lost, 20_000), at).await;
     assert_eq!(code(&limited), (429, "rate_limited".into()));
-    assert_eq!(code(&limited_small), (429, "rate_limited".into()));
-    assert!(
-        refused_in < small_in * 20,
-        "the 429 waited for a judgment: {refused_in:?} vs {small_in:?}"
+    assert_eq!(
+        replay.service.upload_judgments(),
+        before,
+        "no judgment for a refused upload"
     );
     replay.db.drop_database().await.expect("drop");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_upload_while_another_of_the_app_is_judged_is_429() {
-    // One upload of each app of an account is judged at a time: a second sent meanwhile is
-    // `429` with a second to wait, and once the first is answered the app uploads again.
+    // One upload of each app of an account is judged at a time: a second sent while the
+    // first is judged is `429` with a second to wait, judged nowhere, and once the first is
+    // answered the app uploads again.
     let Some(replay) = replay().await else { return };
     let (lost, at) = recovered_with_the_wallet(&replay).await;
     let replay = std::sync::Arc::new(replay);
+    let before = replay.service.upload_judgments();
     let body = many_heads(&lost, 20_000);
     let first = {
         let replay = std::sync::Arc::clone(&replay);
         tokio::spawn(async move { upload(&replay, &body, at).await })
     };
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    // Until the first is being judged.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while replay.service.upload_judgments().0 == before.0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the first upload was never judged"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    // Judging 20,000 heads takes at least half a second even in a release build, so the
+    // second, sent as soon as the first is being judged, arrives while it still is.
     let second = upload(&replay, &json!({}), at).await;
+    let first = first.await.expect("first");
+    assert_eq!(first.status, 200);
     assert_eq!(code(&second), (429, "rate_limited".into()));
     assert_eq!(json_of(&second)["retry_after"], json!(1));
-    assert_eq!(first.await.expect("first").status, 200);
+    assert_eq!(replay.service.upload_judgments(), (before.0 + 1, before.1));
     assert_eq!(upload(&replay, &json!({}), at).await.status, 200);
     let replay = std::sync::Arc::try_unwrap(replay).ok().expect("one owner");
     replay.db.drop_database().await.expect("drop");
@@ -2766,8 +2750,7 @@ async fn test_upload_while_another_of_the_app_is_judged_is_429() {
 #[tokio::test]
 async fn test_upload_from_a_revoked_app_is_refused_without_its_judgment() {
     // An app whose record remains but that isn't current any more is `403 not_current`, and
-    // its upload's items aren't judged for it: a large body is refused about as fast as an
-    // empty one.
+    // its upload's items are judged neither before the lock nor under it.
     let Some(replay) = replay().await else { return };
     let (lost, at) = recovered_with_the_wallet(&replay).await;
     let wallet = app(&vectors("keys.json"), "wallet")["app_id"]
@@ -2785,18 +2768,13 @@ async fn test_upload_from_a_revoked_app_is_refused_without_its_judgment() {
         "{}",
         String::from_utf8_lossy(&revoked.body)
     );
-    let body = many_heads(&lost, 20_000);
-    let started = std::time::Instant::now();
-    let refused = upload(&replay, &body, at).await;
-    let refused_in = started.elapsed();
-    let small = std::time::Instant::now();
-    let refused_small = upload(&replay, &json!({}), at).await;
-    let small_in = small.elapsed();
+    let before = replay.service.upload_judgments();
+    let refused = upload(&replay, &many_heads(&lost, 20_000), at).await;
     assert_eq!(code(&refused), (403, "not_current".into()));
-    assert_eq!(code(&refused_small), (403, "not_current".into()));
-    assert!(
-        refused_in < small_in * 20,
-        "the 403 waited for a judgment: {refused_in:?} vs {small_in:?}"
+    assert_eq!(
+        replay.service.upload_judgments(),
+        before,
+        "no judgment for a refused upload"
     );
     replay.db.drop_database().await.expect("drop");
 }

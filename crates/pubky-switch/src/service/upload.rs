@@ -137,10 +137,11 @@ impl Prechecked {
     }
 }
 
-/// What a recovery upload settled before the account's lock: its slot of
+/// What a recovery upload settled before the account's lock: its body read, its slot of
 /// `uploads_per_app_per_hour` (the seconds to wait when it got none), and its items judged,
 /// when they could be.
 pub(super) struct PreparedUpload {
+    body: Result<UploadBody, pubky_switch_core::ops::Refusal>,
     rate: Result<(), u64>,
     prechecked: Option<Prechecked>,
 }
@@ -186,25 +187,30 @@ impl Service {
         body: &[u8],
         time_ms: u64,
     ) -> PreparedUpload {
+        // The body is read here, once: the endpoint answers its `400` under the lock in the
+        // wire's order, without reading it again there.
+        let body = UploadBody::parse(body);
         let key = (account.to_owned(), verified.app_id());
         let rate =
             self.upload_rate
                 .take(key.clone(), self.limits.uploads_per_app_per_hour, time_ms);
-        if rate.is_err() {
-            return PreparedUpload {
-                rate,
-                prechecked: None,
-            };
-        }
-        let Some(_judging) = Judging::enter(&self.upload_judging, key) else {
-            return PreparedUpload {
-                rate: Err(1),
-                prechecked: None,
-            };
+        let judging = match (&body, rate) {
+            (Ok(_), Ok(())) => Judging::enter(&self.upload_judging, key),
+            _ => None,
+        };
+        let (rate, prechecked) = match (&body, rate, judging) {
+            (Ok(upload), Ok(()), Some(_judging)) => (
+                Ok(()),
+                self.precheck_upload(account, verified, upload, time_ms)
+                    .await,
+            ),
+            (Ok(_), Ok(()), None) => (Err(1), None),
+            (_, rate, _) => (rate, None),
         };
         PreparedUpload {
+            body,
             rate,
-            prechecked: self.precheck_upload(account, verified, body, time_ms).await,
+            prechecked,
         }
     }
 
@@ -218,7 +224,7 @@ impl Service {
         &self,
         account: &str,
         verified: &VerifiedApp,
-        body: &[u8],
+        upload: &UploadBody,
         time_ms: u64,
     ) -> Option<Prechecked> {
         let identity = pubky_switch_core::enc::pubky_key(account).ok()?;
@@ -240,13 +246,15 @@ impl Service {
             time_ms,
         )
         .ok()?;
-        let upload = UploadBody::parse(body).ok()?;
         upload.check_permissions(&cert).ok()?;
         let recovery_from = self.store.recovery_from_of(account).await.ok()??;
+        let upload = upload.clone();
         let removed = held
             .map(|doc| doc.body().removed.clone())
             .unwrap_or_default();
         let judged = removed.clone();
+        self.judged_before_lock
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let checked = tokio::task::spawn_blocking(move || {
             let cx = UploadContext {
                 identity: &identity,
@@ -289,7 +297,15 @@ impl Service {
                 "7.4.14: neither after a provider loss nor in a move",
             ));
         };
-        let upload = UploadBody::parse(body).map_err(refused)?;
+        let parsed_here;
+        let upload = match prepared.map(|prepared| &prepared.body) {
+            Some(Ok(upload)) => upload,
+            Some(Err(refusal)) => return Err(refused(refusal.clone())),
+            None => {
+                parsed_here = UploadBody::parse(body).map_err(refused)?;
+                &parsed_here
+            }
+        };
         upload.check_permissions(caller).map_err(refused)?;
         let by = caller.app_id();
         // The slot was taken before the lock; an upload that settled nothing there takes it
@@ -316,7 +332,9 @@ impl Service {
                         recovery_from: recovery.recovery_from,
                         removed,
                     };
-                    judged_here = check_upload(&upload, &cx);
+                    self.judged_under_lock
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    judged_here = check_upload(upload, &cx);
                     &judged_here
                 }
             };
