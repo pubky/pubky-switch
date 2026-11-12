@@ -32,6 +32,7 @@ mod identity;
 mod inbox;
 mod keyed;
 mod peers;
+mod purge;
 mod records;
 mod recovery;
 pub mod rules;

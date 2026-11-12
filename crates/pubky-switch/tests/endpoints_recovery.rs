@@ -2910,3 +2910,62 @@ async fn test_admission_staged_holds_back_connect_requests_whatever_the_policy()
     );
     replay.db.drop_database().await.expect("drop");
 }
+
+#[tokio::test]
+async fn test_recovery_in_place_after_a_purge() {
+    // The wallet revoked and purged (Switch wire 9.1): a provider loss in place keeps its
+    // App ID as before, so the recovery's document can't list it again, and `GET /apps`
+    // still shows it revoked.
+    let Some(replay) = replay().await else { return };
+    let (_, revoked_at) = purge_wallet(&replay).await;
+    let at = revoked_at + 60_000;
+    set_time(&replay.clock, &rfc3339(at));
+    let answer = enroll(&replay, enrollment(3, None), at).await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    let pending = answered_key(&answer);
+    let before = held(&replay).await;
+    let wallet = app_id_of("wallet");
+    let mut listing: IdentityBody = before.body().clone();
+    listing.version += 1;
+    listing.generation += 1;
+    listing.inbox.service_key = pending;
+    listing.recovery_from = Some(1);
+    listing.apps.push(pubky_switch_core::records::ListedApp {
+        app_id: wallet,
+        cert: [1; 32],
+    });
+    let listing = IdentityDoc::sign(&alice_key(), listing).expect("sign");
+    let (answer, _) = deliver(&replay, listing.signed().clone(), Some(before.hash()), at).await;
+    assert_eq!(code(&answer), (400, "bad_request".into()));
+    let recovery = next_generation(&before, pending, Some(1));
+    let (answer, _) = deliver(&replay, recovery, Some(before.hash()), at).await;
+    assert_eq!(
+        answer.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&answer.body)
+    );
+    assert_eq!(
+        rows_naming(&replay, "kept_app_ids", "app_id", &wallet).await,
+        1
+    );
+    let request = signer_request("GET", &format!("/v1/{}/apps", alice_id()), Vec::new(), at);
+    let apps = json_of(&replay.service.handle(request).await);
+    let status = apps["apps"]
+        .as_array()
+        .expect("apps")
+        .iter()
+        .find(|s| s["app_id"] == pubky_switch_core::enc::zbase32_encode(&wallet).as_str())
+        .expect("the wallet's kept App ID")
+        .clone();
+    assert_eq!(
+        (status["current"].clone(), status["revoked_at"].clone()),
+        (json!(false), json!(rfc3339(revoked_at)))
+    );
+    replay.db.drop_database().await.expect("drop");
+}

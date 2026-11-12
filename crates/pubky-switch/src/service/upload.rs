@@ -352,9 +352,17 @@ impl Service {
         let stored = |e: StoreError| store_error(&e);
         self.merge_records(txn, &checked.records, seq, &mut changes)
             .await?;
-        self.merge_claims(txn, checked, time_ms, &mut changes)
+        let released = self
+            .merge_claims(txn, checked, time_ms, &mut changes)
             .await
             .map_err(stored)?;
+        // A removed app whose last open or `unknown` attempt the upload resolved may be
+        // purged now (Switch wire 9.1).
+        if !released.is_empty() {
+            super::purge::purge_removed_apps(txn, held, Some(&released))
+                .await
+                .map_err(stored)?;
+        }
         if let Some(lists) = &upload.lists {
             changes.lists = self
                 .merge_lists(txn, lists, by, time_ms)
@@ -440,14 +448,15 @@ impl Service {
     }
 
     /// The upload's claim entries and SETTLED proofs, by claim key (Switch wire 7.4.14 "How a
-    /// claim merges").
+    /// claim merges"). Returns the apps that owned an open or `unknown` attempt on a claim
+    /// it changed and own none there any more ([`super::purge::released_owners`]).
     async fn merge_claims(
         &self,
         txn: &mut AccountTxn,
         checked: &CheckedUpload,
         time_ms: u64,
         changes: &mut UploadChanges,
-    ) -> Result<(), StoreError> {
+    ) -> Result<Vec<[u8; 16]>, StoreError> {
         let keys: Vec<[u8; 32]> = checked
             .claims
             .keys()
@@ -457,6 +466,7 @@ impl Service {
             .into_iter()
             .collect();
         let held: HashMap<_, _> = txn.claims(&keys).await?.into_iter().collect();
+        let (mut before, mut after) = (Vec::new(), Vec::new());
         for key in keys {
             let entries = checked.claims.get(&key).map_or(&[][..], Vec::as_slice);
             let merge = merge_upload_claim(
@@ -470,10 +480,12 @@ impl Service {
                 && let Some(claim) = &merge.claim
             {
                 txn.put_claim(&key, claim).await?;
+                before.extend(held.get(&key));
+                after.push(claim.clone());
             }
             changes.claim(key, &merge);
         }
-        Ok(())
+        Ok(super::purge::released_owners(before, &after))
     }
 
     /// The upload's lists added to what the account holds, never removed from it, each up to

@@ -909,6 +909,14 @@ impl Service {
         save(txn, &before, &mut after, &ops, &proofs, release)
             .await
             .map_err(|e| storage(&e))?;
+        // A removed app whose last open or `unknown` attempt this batch resolved may be
+        // purged now (Switch wire 9.1).
+        let released = super::purge::released_owners(before.claims.values(), after.claims.values());
+        if !released.is_empty() {
+            super::purge::purge_removed_apps(txn, held, Some(&released))
+                .await
+                .map_err(|e| storage(&e))?;
+        }
         if let (Some(first), Some(ops_hash)) = (ops.first(), hash) {
             txn.put_batch(
                 &first.body().batch.id,
