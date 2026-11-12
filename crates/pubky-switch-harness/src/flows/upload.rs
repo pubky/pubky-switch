@@ -792,9 +792,15 @@ async fn upload(
     let answered = client.send(signed).await;
     world.outcome(
         name,
+        // The error by its code, never by its text: a message is the switch's own wording.
         &json!({
             "status": answered.as_ref().ok().map(|answer| answer.status),
-            "ended": ended(&answered),
+            "ok": answered.is_ok(),
+            "code": answered
+                .as_ref()
+                .err()
+                .and_then(pubky_switch_client::error::ClientError::code)
+                .map(|code| code.as_str().to_owned()),
         }),
     );
     world.advance_ms(STEP_MS);
@@ -823,6 +829,9 @@ const HOUR_MS: u64 = 3_600_000;
 ///
 /// - at the service alice is enrolled at, before any loss: `404`, for a body that doesn't
 ///   read too, since the account is in neither stage;
+/// - at the service she recovered at, before the reader has registered there: `403
+///   not_current` with no head, as for every call of an app the service holds no record
+///   for, and without taking a slot of the hour;
 /// - at the service she recovered at, once the reader has registered there and uploaded
 ///   what it holds, a body that doesn't read and carries contacts: `400`, before the
 ///   permission is looked at; contacts, which need `lists.manage`: `403
@@ -896,6 +905,22 @@ pub async fn recovery_upload_refused(world: &World) -> FlowResult {
         RECOVERY_ORIGIN,
         service_key(&signer)?,
     )?;
+    // Before the reader has registered there, the service holds no record for it: its
+    // upload is refused like any call of an app it doesn't know, with no head.
+    upload(
+        world,
+        "an upload before the reader registered at the new service",
+        &after,
+        "reader",
+        NOTHING,
+        403,
+        Some("not_current"),
+    )
+    .await?;
+    let head = world.last_fact(&upload_of("reader"), "header switch-head");
+    if head.as_deref() != Some("absent") {
+        return Err(format!("the refusal of an unregistered app carries the head {head:?}").into());
+    }
     // The reader registers, and uploads what it holds: the lost service's newest head.
     let sent = uploads(world);
     follow_recovery(world, &mut reader, "reader", 1).await?;

@@ -89,8 +89,7 @@ The flows send every call the service serves, each at both switches. What they l
   to the service's own tests: an operation of a removed app (`distrusted`), items that
   don't verify (`unverified`) and claim entries the writer rules refuse (`refused`), which
   no app of the client crate uploads; a claim made divergent by uploads; the caps
-  (`max_divergent_uploads`, `max_contacts`, `max_deny`, `max_attempts_per_claim`); and an
-  upload from an app that hasn't registered at the new service yet.
+  (`max_divergent_uploads`, `max_contacts`, `max_deny`, `max_attempts_per_claim`).
 - **Faults in front of most reads.** The retries above are the ones covered. No answer is
   lost and no connection fails in front of `GET /allow`, `/claims/{claim_key}`,
   `/directory`, `/apps/{app_id}/keys`, `/records`, `/records/{key}`, `/handover` or the
