@@ -163,7 +163,8 @@ impl App {
                 let Some(stored) = self.state.parked.get(id).cloned() else {
                     continue;
                 };
-                self.keep_duty(&mut tx, dropped(*id, &stored, *reason))?;
+                let given_up = self.given_up(*id, &stored).await?;
+                self.keep_duty(&mut tx, dropped(*id, &stored, *reason, given_up))?;
                 self.unpark(Some(*id), &mut tx)?;
             }
             self.commit(tx).await?;
@@ -172,7 +173,39 @@ impl App {
     }
 }
 
-fn dropped(id: u64, stored: &ParkedEntry, reason: DropReason) -> Duty {
+impl App {
+    /// The `msg_id` of the message an entry dropped past the bounds gives up: only for an
+    /// entry that waited for a key, which passed the checks of its sender before it was
+    /// stored (Switch wire 5.1), so its `msg_id` is the signed one; and only when nothing
+    /// else may still apply the message: no other entry stored locally holds it, whatever
+    /// it waits for, no kept effect is its, and it isn't processed already. A copy dropped
+    /// while another waits names none; the last copy to go names it.
+    async fn given_up(&self, id: u64, stored: &ParkedEntry) -> Result<Option<String>, AppError> {
+        if stored.reason.awaited_epoch().is_none() {
+            return Ok(None);
+        }
+        let Some(msg_id) = super::parked::stored_msg_id(stored) else {
+            return Ok(None);
+        };
+        let held_elsewhere = self.state.parked.iter().any(|(other, entry)| {
+            *other != id
+                && entry.sender == stored.sender
+                && super::parked::stored_msg_id(entry).as_deref() == Some(msg_id.as_str())
+        });
+        let kept = self
+            .state
+            .pending_effect
+            .as_ref()
+            .is_some_and(|pending| pending.sender == stored.sender && pending.msg_id == msg_id);
+        let processed = self
+            .reader()
+            .exists(&super::state::key::processed(&stored.sender, &msg_id))
+            .await?;
+        Ok((!held_elsewhere && !kept && !processed).then_some(msg_id))
+    }
+}
+
+fn dropped(id: u64, stored: &ParkedEntry, reason: DropReason, msg_id: Option<String>) -> Duty {
     Duty::StoredEntryDropped {
         stored_id: id,
         seq: stored.seq,
@@ -181,12 +214,7 @@ fn dropped(id: u64, stored: &ParkedEntry, reason: DropReason) -> Duty {
         accepted_at_ms: stored.accepted_at_ms,
         reason,
         awaited_epoch: stored.reason.awaited_epoch(),
-        // Only an entry that waited for a key passed the checks of its sender before it
-        // was stored (Switch wire 5.1): its `msg_id` is the signed one.
-        msg_id: stored
-            .reason
-            .awaited_epoch()
-            .and_then(|_| super::parked::stored_msg_id(stored)),
+        msg_id,
     }
 }
 

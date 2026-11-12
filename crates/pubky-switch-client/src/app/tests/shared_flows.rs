@@ -5295,10 +5295,10 @@ async fn test_records_held_unreadable_opens_once_its_key_arrives() {
     );
 }
 
-/// A store whose commit that ends an owed reopening fails once, while armed.
+/// A store whose commits that end an owed reopening fail, as many times as `failing` says.
 struct FailingReopen {
     inner: MemoryStore,
-    armed: std::sync::atomic::AtomicBool,
+    failing: std::sync::atomic::AtomicU32,
 }
 
 impl StateStore for FailingReopen {
@@ -5320,7 +5320,16 @@ impl StateStore for FailingReopen {
         let ends_reopen = batch.writes.iter().any(|write| {
             matches!(write, crate::store::Write::Delete { key, .. } if key.as_slice() == b"reopen")
         });
-        if ends_reopen && self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        let fails = ends_reopen
+            && self
+                .failing
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |left| left.checked_sub(1),
+                )
+                .is_ok();
+        if fails {
             return Err(crate::error::StoreError::Unavailable);
         }
         self.inner.commit(batch)
@@ -5328,14 +5337,14 @@ impl StateStore for FailingReopen {
 }
 
 /// The reopening a key owes is kept with the key: when its own commit fails after the key
-/// was taken, the next read reopens the record held `Unreadable`, though no fetch takes a
-/// key again.
+/// was taken, the read goes on and reports it, and the next read reopens the record held
+/// `Unreadable`, though no fetch takes a key again.
 #[tokio::test]
 async fn test_records_reopening_that_fails_is_made_at_the_next_read() {
     let s = Setup::new();
     let store = Arc::new(FailingReopen {
         inner: MemoryStore::new(),
-        armed: std::sync::atomic::AtomicBool::new(false),
+        failing: std::sync::atomic::AtomicU32::new(0),
     });
     let request = s.approve(&app_keys("wallet"), &ALL_PERMISSIONS);
     let mut wallet = App::join(
@@ -5354,11 +5363,20 @@ async fn test_records_reopening_that_fails_is_made_at_the_next_read() {
         held.content,
         RecordContent::Unreadable(Unopened::KeyNotHeld { data_epoch: 2 }),
     );
-    // The key arrives, and the reopening's commit fails.
-    store.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+    // The key arrives, and the reopening's commit fails at each try of that read: after
+    // the page, and at the read's end.
+    store.failing.store(2, std::sync::atomic::Ordering::SeqCst);
     store_parts_for(&s, &wallet.cert().clone());
-    wallet.receive(None).await.unwrap_err();
-    assert!(!store.armed.load(std::sync::atomic::Ordering::SeqCst));
+    let report = wallet.receive(None).await.unwrap();
+    assert_eq!(store.failing.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(
+        report
+            .events
+            .iter()
+            .any(|e| matches!(e, AppEvent::ReopeningOwed { .. })),
+        "{:?}",
+        report.events
+    );
     assert!(
         wallet.scope_key(2, "scope-a").is_some(),
         "the key was taken"
@@ -6467,4 +6485,86 @@ async fn test_records_listing_at_a_missed_item_fetches_the_key_and_reads_on() {
     let report = app.receive(None).await.unwrap();
     assert_eq!(handed(&s, &note.msg_id), 1, "{:?}", report.events);
     assert!(!app.listing_owed().await.unwrap());
+}
+
+/// Records held `Unreadable` whose reopened writes together pass one commit's size: the
+/// reopening owed once their key arrives must not keep every later read from the feed.
+#[tokio::test]
+async fn test_records_reopening_too_large_for_one_commit_keeps_reads_going() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    wallet.receive(None).await.unwrap();
+    s.w.next_doc(|body| body.data_epoch = 2);
+    store_parts_for(&s, &phone.cert().clone());
+    phone.receive(None).await.unwrap();
+    let pad = "x".repeat(200 * 1024);
+    let mut keys = Vec::new();
+    for n in 0..80 {
+        let target = s.target(&format!("big{n}"));
+        let big = json!({ "items": ["a"], "pad": pad })
+            .to_string()
+            .into_bytes();
+        phone.put_record(&target, &big, vec![]).await.unwrap();
+        keys.push(phone.record_key(&target).unwrap());
+    }
+    wallet.receive(None).await.unwrap();
+    for key in &keys {
+        let held = wallet.shared_record(key).await.unwrap().unwrap();
+        assert!(held.content.value().is_none(), "held unreadable for now");
+    }
+    store_parts_for(&s, &wallet.cert().clone());
+    let first = wallet.receive(None).await;
+    // A note sent after the key: a read that gets to the feed takes it.
+    let (seq, _) = s.w.note(wallet.app_id(), "after the key");
+    let mut results = Vec::new();
+    for _ in 0..3 {
+        results.push(wallet.receive(None).await.map(|_| ()));
+    }
+    assert!(
+        results.iter().all(Result::is_ok),
+        "the first read after the key: {first:?}; later reads: {results:?}"
+    );
+    assert!(wallet.cursor().seq >= seq, "the feed is read on");
+    for key in &keys {
+        let held = wallet.shared_record(key).await.unwrap().unwrap();
+        assert_eq!(ids(held.content.value()), vec!["a"]);
+    }
+}
+
+/// A record write sealed at an epoch whose key a later item of the same page brings: the
+/// write is taken unreadable in the page's open writes, the key's fetch reopens what the
+/// store holds, and the record must still open once the key is held.
+#[tokio::test]
+async fn test_records_key_on_the_same_page_as_the_unreadable_write_opens_it() {
+    let s = Setup::new();
+    let mut wallet = s.join("wallet").await;
+    let mut phone = s.join("phone").await;
+    wallet.receive(None).await.unwrap();
+    s.w.next_doc(|body| body.data_epoch = 2);
+    store_parts_for(&s, &phone.cert().clone());
+    phone.receive(None).await.unwrap();
+    let target = s.target("n1");
+    phone
+        .put_record(&target, &value(&["a"]), vec![])
+        .await
+        .unwrap();
+    let key = phone.record_key(&target).unwrap();
+    // The wallet's key comes after the write, and both are read in one page.
+    store_parts_for(&s, &wallet.cert().clone());
+    wallet.receive(None).await.unwrap();
+    assert!(
+        wallet.scope_key(2, "scope-a").is_some(),
+        "the key was taken"
+    );
+    for _ in 0..2 {
+        wallet.receive(None).await.unwrap();
+    }
+    let held = wallet.shared_record(&key).await.unwrap().unwrap();
+    assert_eq!(
+        ids(held.content.value()),
+        vec!["a"],
+        "held {:?} with its key held",
+        held.content
+    );
 }

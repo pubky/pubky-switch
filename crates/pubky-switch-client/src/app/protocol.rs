@@ -480,7 +480,9 @@ pub enum Outcome {
     /// and runs the step again if the epoch's keys came; otherwise the entry is stored
     /// locally and the cursor passes it at once ([`super::ParkReason::AwaitingKey`]), with
     /// no bounded wait and no [`super::AppEvent::StoreFailing`]. It is tried again once the
-    /// app holds every key of `data_epoch` its certificate is given, in the read whose
+    /// app holds every key of `data_epoch` its certificate is given and a key came since
+    /// the step last ran, so a key the certificate is never given runs it again only when
+    /// another key comes; in the read whose
     /// fetch brought them, after the listing a read owes first, or at a later read; it is
     /// bounded with the entries whose sender couldn't be checked and dropped past the
     /// bounds ([`super::AppEvent::StoredEntryDropped`]). Each read's report names the

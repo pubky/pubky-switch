@@ -677,6 +677,7 @@ fn uncertain_copy(
             reason: ParkReason::Uncertain,
             round: state.parked_round.number,
             released: false,
+            keys_at: None,
         },
     ))
 }
