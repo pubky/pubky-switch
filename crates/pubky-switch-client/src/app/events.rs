@@ -641,8 +641,8 @@ pub enum AppEvent {
     /// The shared record write a sent message named ([`super::RecordJob`]) was given up:
     /// still not made [`super::SENT_RETENTION_MS`] after the message's first acceptance,
     /// such as for a held value whose key never came. The app no longer builds it, so the
-    /// record doesn't reflect the message unless a batch of an earlier try, kept
-    /// unanswered, still applies, which its end tells ([`super::App::kept_batch`]). The
+    /// record doesn't reflect the message unless the batch a try left kept still applies:
+    /// `batch_id` names it, and [`super::App::kept_batch`] tells what became of it. The
     /// outbox no longer keeps the message, plaintext and all, once nothing else of it is
     /// owed. A duty event, in the commit that gives the write up.
     RecordJobDropped {
@@ -650,6 +650,8 @@ pub enum AppEvent {
         id: EventId,
         /// The message ID.
         msg_id: String,
+        /// The batch the job's latest try left kept, if one did.
+        batch_id: Option<[u8; 16]>,
     },
     /// The local writes the protocol answered `call` with were over
     /// [`super::MAX_STEP_LOCAL_BYTES`]: they weren't committed, and the call isn't made
@@ -917,6 +919,8 @@ pub(crate) enum Duty {
     },
     RecordJobDropped {
         msg_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        batch_id: Option<String>,
     },
     LocalWritesRefused {
         call: KeptRefusal,
@@ -1038,7 +1042,12 @@ impl Duty {
             Self::MessageUndelivered { msg_id, resend } => {
                 AppEvent::MessageUndelivered { id, msg_id, resend }
             }
-            Self::RecordJobDropped { msg_id } => AppEvent::RecordJobDropped { id, msg_id },
+            Self::RecordJobDropped { msg_id, batch_id } => AppEvent::RecordJobDropped {
+                id,
+                msg_id,
+                batch_id: batch_id
+                    .and_then(|id| pubky_switch_core::enc::unb64_array::<16>(&id).ok()),
+            },
             Self::LocalWritesRefused { call } => AppEvent::LocalWritesRefused {
                 id,
                 call: call.call(),

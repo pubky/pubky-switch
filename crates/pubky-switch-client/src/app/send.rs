@@ -429,6 +429,10 @@ pub(crate) struct OutboxItem {
     /// from delivered (Switch spec 11). Kept through later backups, never moved on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     replay_until_ms: Option<u64>,
+    /// The batch a try of the record job left kept, the latest one, in base64: named when
+    /// the job is given up ([`AppEvent::RecordJobDropped`]), as it may still apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    record_batch: Option<String>,
 }
 
 impl std::fmt::Debug for OutboxItem {
@@ -778,6 +782,7 @@ impl App {
             undeliverable_tries: 0,
             resend_queued: false,
             replay_until_ms: None,
+            record_batch: None,
         })
     }
 
@@ -866,6 +871,7 @@ impl App {
             undeliverable_tries: 0,
             resend_queued: true,
             replay_until_ms: None,
+            record_batch: None,
         };
         let mut tx = self.tx()?;
         tx.put(&out_key(&item.msg_id), &item)?;
@@ -1182,7 +1188,12 @@ impl App {
             match self.record_job(&item, &job).await {
                 Ok(()) => item.record_done = true,
                 Err(error) if is_local(&error) => return Err(error),
-                Err(error) => item.last_error = Some(error.to_string()),
+                Err(error) => {
+                    if let Some(batch_id) = error.kept_batch() {
+                        item.record_batch = Some(pubky_switch_core::enc::b64(&batch_id));
+                    }
+                    item.last_error = Some(error.to_string());
+                }
             }
             self.save_item(&item).await?;
         }
@@ -1312,6 +1323,7 @@ impl App {
             &mut tx,
             Duty::RecordJobDropped {
                 msg_id: item.msg_id.clone(),
+                batch_id: item.record_batch.clone(),
             },
         )?;
         self.commit(tx).await
@@ -1665,6 +1677,7 @@ mod tests {
             undeliverable_tries: 0,
             resend_queued: false,
             replay_until_ms: None,
+            record_batch: None,
         }
     }
 

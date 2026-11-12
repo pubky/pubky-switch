@@ -1387,6 +1387,63 @@ async fn test_outbox_give_up_of_an_accepted_message_keeps_its_owed_record_job() 
     assert_eq!(ids(record.content.value()), vec![msg_id]);
 }
 
+/// A record job whose try left its batch kept, and that is given up at the sent retention,
+/// names that batch in its duty event: it may still apply, and its end tells.
+#[tokio::test]
+async fn test_outbox_record_job_given_up_names_the_batch_it_left_kept() {
+    let p = Pair::new();
+    let protocol = ApiProtocol::new(Mode::Plain);
+    let (mut wallet, _shop, _store) = wallet_on_a_fault_store(&p, &protocol).await;
+    let signed = wallet.sign_message(Pair::note(&p.bob, "hello")).unwrap();
+    let target = RecordTarget::new(items(), &signed.hash());
+    let signed = signed.with_record(RecordJob {
+        target,
+        tag: b"sent".to_vec(),
+    });
+    let msg_id = wallet.queue_signed(signed).await.unwrap();
+    // Accepted; the record job's batch, after the conversation entry's, is kept unsent.
+    p.alice.switch().fail_next(Fault::Unreachable {
+        path: "ops".into(),
+        after: 1,
+    });
+    wallet.flush_outbox().await.unwrap();
+    let Some(Delivery::Accepted { accepted_at_ms }) = wallet.delivery(&msg_id).await.unwrap()
+    else {
+        panic!("accepted");
+    };
+    let kept = wallet.kept_batches().await.unwrap();
+    assert_eq!(kept.len(), 1);
+    let batch_id = kept[0].0;
+    // At the retention the kept batch is past its window, and the job is given up.
+    p.alice.switch().lock().faults.clear();
+    for _ in 0..8 {
+        p.alice.switch().fail_next(Fault::Unreachable {
+            path: "ops".into(),
+            after: 0,
+        });
+    }
+    p.clock
+        .set_ms(accepted_at_ms + crate::app::SENT_RETENTION_MS);
+    wallet.flush_outbox().await.unwrap();
+    let events = wallet.unacknowledged_events().await.unwrap();
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AppEvent::RecordJobDropped { msg_id: m, batch_id: Some(b), .. }
+                if *m == msg_id && *b == batch_id
+        )),
+        "{events:?}"
+    );
+    // Its end tells what became of it: sent once, then past the window a resend tells in.
+    assert!(matches!(
+        wallet.kept_batch(batch_id).await.unwrap(),
+        Some(crate::app::KeptBatchStatus::Dropped {
+            reason: crate::app::KeptBatchDrop::Uncertain,
+            ..
+        })
+    ));
+}
+
 #[tokio::test]
 async fn test_outbox_give_up_reads_state_again_before_going_on() {
     let p = Pair::new();
