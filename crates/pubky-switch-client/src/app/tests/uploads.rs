@@ -757,3 +757,35 @@ async fn test_upload_record_held_is_read_again_under_its_own_collection() {
     let report = app.receive(None).await.unwrap();
     assert!(changed(&report.events, key), "{:?}", report.events);
 }
+
+#[tokio::test]
+async fn test_record_read_answered_with_another_records_view_flags_neither() {
+    // A read of one record answered with its divergent view under another key the app
+    // holds: the view says nothing of either record, so neither is held divergent.
+    let store = Arc::new(MemoryStore::new());
+    let (lost, mut app) = followed(&store, true).await;
+    let held = *lost
+        .next
+        .lock()
+        .shared
+        .records
+        .keys()
+        .next()
+        .expect("the record");
+    let key = upload_unheld_record(&lost, &mut app).await;
+    lost.next.lock().shared.divergent.insert(key, vec![[1; 32]]);
+    lost.next.fail_next(Fault::Replace {
+        path: "/records/".into(),
+        member: "key".into(),
+        value: json!(b64(&held)),
+    });
+    // The write is judged by its own operation, whose key is the one asked for.
+    let read = app
+        .read_record_fresh(&RecordTarget::new(items(), b"uploaded"))
+        .await
+        .unwrap();
+    assert!(matches!(read, crate::app::RecordRead::Fresh(ref r) if r.key == key));
+    assert!(!app.shared_record(&key).await.unwrap().unwrap().divergent);
+    assert!(!app.shared_record(&held).await.unwrap().unwrap().divergent);
+    assert_eq!(marks(&store, "rcdiv/"), 0);
+}
