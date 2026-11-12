@@ -12,6 +12,7 @@
 //!
 //! What the caller takes on: from the commit on, a re-sent copy of the message is a new
 //! entry, delivered to the protocol again, and the protocol itself must not apply it twice.
+//! The message's sender can replay it at will, every copy delivered (Switch spec 11).
 
 use pubky_switch_core::message::MessagePlaintext;
 use serde_json::Value;
@@ -54,6 +55,18 @@ pub(crate) fn held_pair(
     }))
 }
 
+/// What forgetting the pairs under `keys` counts against
+/// [`super::MAX_STEP_LOCAL_BYTES`]: each key as a delete of it would
+/// ([`super::local_writes_bytes`]).
+pub(crate) fn forget_bytes<'a>(keys: impl IntoIterator<Item = &'a String>) -> usize {
+    keys.into_iter().fold(0usize, |total, key| {
+        total.saturating_add(
+            key.len()
+                .saturating_add(super::protocol::LOCAL_WRITE_OVERHEAD_BYTES),
+        )
+    })
+}
+
 /// The `msg_id` of a stored entry's signed plaintext.
 fn stored_msg_id(plaintext: &[u8]) -> Option<String> {
     let plaintext = MessagePlaintext::decode(plaintext).ok()?;
@@ -68,7 +81,10 @@ impl App {
     /// unknown `msg_id`, changes nothing but `local`.
     ///
     /// From then on a re-sent copy of the message is delivered as a new entry, and the
-    /// protocol must not apply it twice itself. Nothing is delivered again by this call, and
+    /// protocol must not apply it twice itself: the message's sender can replay it at will,
+    /// as often as it likes, and nothing in the app drops a copy as a duplicate any more,
+    /// nor shows one with other bytes as a conflict (Switch spec 11). Nothing is delivered
+    /// again by this call, and
     /// no cursor moves. Inside a receive step, use [`super::ReceiveContext::forget_processed`],
     /// which commits with the step. A caller that commits its own writes apart from this
     /// call forgets first: a crash between the two leaves the protocol still keeping what

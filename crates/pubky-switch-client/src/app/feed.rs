@@ -1019,11 +1019,17 @@ impl App {
                 over_local_bound,
                 forget,
             } = writes;
+            let forget: Vec<String> = forget.into_iter().collect();
             effect.ops = ops.into_iter().chain(effect.ops).collect();
             effect.local = local.into_iter().chain(effect.local).collect();
             // A step's local writes are bounded (`Protocol`, "Limits a receive step plans
-            // for"): an effect over the bound is too large, stored and passed.
-            if over_local_bound || local_writes_bytes(&effect.local) > MAX_STEP_LOCAL_BYTES {
+            // for"), its forgets with them: an effect over the bound is too large, stored and
+            // passed.
+            if over_local_bound
+                || local_writes_bytes(&effect.local)
+                    .saturating_add(super::forget::forget_bytes(&forget))
+                    > MAX_STEP_LOCAL_BYTES
+            {
                 self.too_large(entry, &received, read).await?;
                 return Ok(Step::Pass);
             }
