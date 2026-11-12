@@ -521,7 +521,8 @@ pub enum ResendReason {
 
 /// Entries the service deleted while the app was lagging (Switch spec 8.2): the protocol
 /// asks the counterparties of its unfinished activity to re-send what their inboxes
-/// accepted from `accepted_from_ms`, and lists its collections again.
+/// accepted from `accepted_from_ms`, through `accepted_until_ms` if it bounds its
+/// re-sends, and lists its collections again.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MissedEntries {
     /// The item's `seq`, in the sequence of the generation the app read it at: a call made
@@ -532,6 +533,11 @@ pub struct MissedEntries {
     /// The time to ask from: the later of the item's first acceptance time and the cursor's
     /// time, less the clock tolerance.
     pub accepted_from_ms: u64,
+    /// The item's last acceptance time, `accepted_until` (Switch wire 7.5), raised to
+    /// `accepted_from_ms` when it is earlier. The service writes it, and the app can't
+    /// check it. A call kept owed by a build that didn't keep this time is made with
+    /// `u64::MAX`: no end is known.
+    pub accepted_until_ms: u64,
 }
 
 /// A protocol on the Switch, as the app layer uses it. Object-safe; the app holds an

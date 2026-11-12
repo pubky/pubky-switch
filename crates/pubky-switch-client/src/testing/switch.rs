@@ -1425,6 +1425,12 @@ impl ScriptedSwitch {
         self.push_missed(entries, UNPARSABLE_TIME, UNPARSABLE_TIME)
     }
 
+    /// A `missed` item whose first acceptance time is `from` and whose last doesn't parse,
+    /// as a faulty service may write one (Switch wire 7.4.4). Returns its `seq`.
+    pub fn push_missed_until_unparsable(&self, entries: u64, from: u64) -> u64 {
+        self.push_missed(entries, from, UNPARSABLE_TIME)
+    }
+
     /// A `missed` item: `entries` entries accepted from `from` until `until` were deleted
     /// while the app lagged (Switch wire 7.4.4). Returns its `seq`.
     pub fn push_missed(&self, entries: u64, from: u64, until: u64) -> u64 {
