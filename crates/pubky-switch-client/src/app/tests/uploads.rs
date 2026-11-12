@@ -468,8 +468,15 @@ async fn test_upload_claim_the_app_doesnt_hold_isnt_marked() {
         assert!(merge.changed, "{merge:?}");
         next.shared.claims.insert(CLAIM, merge.claim.unwrap());
     }
+    // With it, more claims the app doesn't hold than one read reads again: a mark for any
+    // of them would outlast the read.
+    let claims: BTreeSet<[u8; 32]> = std::iter::once(CLAIM)
+        .chain(
+            (0..crate::app::CLAIM_REREADS_PER_READ).map(|i| [u8::try_from(i).unwrap() + 100; 32]),
+        )
+        .collect();
     let changes = UploadChanges {
-        claims: [CLAIM].into(),
+        claims,
         ..UploadChanges::default()
     };
     lost.next.chain_upload(PHONE, changes.to_value()).unwrap();
