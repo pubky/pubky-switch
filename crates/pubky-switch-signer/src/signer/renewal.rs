@@ -106,6 +106,9 @@ impl Signer {
     /// happen, and for a reduction the access was not reduced. A later [`Signer::resume`] or
     /// [`Signer::run_due`] that meets the refusal, after this call was cut off, raises the same
     /// alert, so the host tells the user the same way whichever call met it (Switch spec 3.2).
+    /// A rotating renewal first completes an epoch a given-up rotation sent keys for; when that
+    /// completion is cut off, this renewal is never signed, no later call makes it, and the
+    /// alert is raised with this call's error.
     pub async fn renew(&mut self, app_id: [u8; 16], change: CertChange) -> Result<IdentityDoc> {
         self.ready().await?;
         self.renew_listed(app_id, change, None, RenewedBy::User)
@@ -183,7 +186,16 @@ impl Signer {
         // holds the new epoch's keys early and no epoch is skipped (Switch spec 3.2, 3.5).
         let (newest, statuses, switch_time) =
             if rotates && self.state.epoch_through > newest.data_epoch() {
-                self.complete_epoch(&statuses, switch_time).await?;
+                // The renewal is signed only once the completion is delivered: cut off there,
+                // no later call makes it, so the user is told now (Switch spec 3.2).
+                if let Err(error) = self.complete_epoch(&statuses, switch_time).await {
+                    if matches!(by, RenewedBy::User) {
+                        let mut state = self.state.clone();
+                        refused_in(&mut state, app_id, is_reduction(&old, &new), true);
+                        self.commit(state, self.flow.clone()).await?;
+                    }
+                    return Err(error);
+                }
                 let newest = self.state.newest_doc()?.ok_or(Refusal::NotSetUp)?;
                 if newest.listed_cert(&app_id) != Some(listed) {
                     return Err(Refusal::Superseded {
@@ -261,7 +273,11 @@ impl Signer {
         state.epoch_through = state.epoch_through.max(last);
         match by {
             RenewedBy::Automatic { .. } => state.untaken_renewals.push((app_id, new.hash())),
-            RenewedBy::User => renewals_taken_in(&mut state, &[app_id]),
+            RenewedBy::User => {
+                renewals_taken_in(&mut state, &[app_id]);
+                state.user_renewals.retain(|(app, _)| *app != app_id);
+                state.user_renewals.push((app_id, new.hash()));
+            }
         }
         self.commit_batches(state, &newest, &statuses, alerts, batches, &doc, flow)
             .await?;
@@ -541,26 +557,26 @@ impl Signer {
         let Some(newest) = state.newest_doc()? else {
             return Ok(());
         };
+        // The flow ends: no renewal the user asked for is in progress any more.
+        let asked = std::mem::take(&mut state.user_renewals);
         let certs = self.held_certs()?;
         let held = |hash: [u8; 32]| certs.iter().find(|cert| cert.hash() == hash);
         for app in &refused.body().apps {
             let Some(listed) = newest.listed_cert(&app.app_id) else {
                 continue;
             };
-            if listed == app.cert {
+            // An app cut off meanwhile, revoked or to be, is told of by its removal.
+            let cut_off = state.tombstones.contains(&app.app_id)
+                || state.revoking.iter().any(|r| r.app_id == app.app_id);
+            if listed == app.cert || cut_off {
                 continue;
             }
             let reduction = match (held(listed), held(app.cert)) {
                 (Some(old), Some(new)) => is_reduction(old, new),
                 _ => false,
             };
-            state.alerts.retain(|alert| {
-                !matches!(alert, Alert::RenewalRefused { app_id, .. } if *app_id == app.app_id)
-            });
-            state.alert(Alert::RenewalRefused {
-                app_id: app.app_id,
-                reduction,
-            });
+            let by_user = asked.contains(&(app.app_id, app.cert));
+            refused_in(state, app.app_id, reduction, by_user);
         }
         Ok(())
     }
@@ -1129,5 +1145,22 @@ pub(super) fn push_parts(
             }),
             Some(stored),
         ));
+    }
+}
+
+/// Raise [`Alert::RenewalRefused`] for `app_id` in `state`, or bring the one held up to date
+/// in its place (Switch spec 3.2).
+fn refused_in(state: &mut SignerState, app_id: [u8; 16], reduction: bool, by_user: bool) {
+    let fresh = Alert::RenewalRefused {
+        app_id,
+        reduction,
+        by_user,
+    };
+    let held = state.alerts.iter_mut().find(
+        |alert| matches!(alert, Alert::RenewalRefused { app_id: held, .. } if *held == app_id),
+    );
+    match held {
+        Some(held) => *held = fresh,
+        None => state.alert(fresh),
     }
 }

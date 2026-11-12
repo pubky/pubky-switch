@@ -1444,15 +1444,22 @@ impl Signer {
                 });
             }
         }
-        // A refused renewal is told of until a version renewing the app, or removing it, is
-        // delivered (Switch spec 3.2).
+        // A refused renewal is told of until a renewal the user asked for is delivered for
+        // the app, or a version removing it: an automatic renewal keeps the scopes the user
+        // may have asked to remove (Switch spec 3.2).
         if let Ok(delivered) = &verified {
+            let asked = std::mem::take(&mut state.user_renewals);
             let before = state.newest_doc()?;
             state.alerts.retain(|alert| match alert {
-                Alert::RenewalRefused { app_id, .. } => {
-                    let now = delivered.listed_cert(app_id);
-                    now.is_some() && before.as_ref().and_then(|b| b.listed_cert(app_id)) == now
-                }
+                Alert::RenewalRefused {
+                    app_id, by_user, ..
+                } => delivered.listed_cert(app_id).is_some_and(|now| {
+                    if *by_user {
+                        !asked.contains(&(*app_id, now))
+                    } else {
+                        before.as_ref().and_then(|b| b.listed_cert(app_id)) == Some(now)
+                    }
+                }),
                 _ => true,
             });
         }
@@ -1487,14 +1494,16 @@ impl Signer {
     ) -> Result<()> {
         let copy = match current.get("identity") {
             None | Some(Value::Null) => None,
-            Some(doc) => {
-                let verified = serde_json::from_value::<SignedDoc>(doc.clone())
+            Some(value) => {
+                let verified = serde_json::from_value::<SignedDoc>(value.clone())
                     .map_err(|e| pubky_switch_core::Error::Invalid(e.to_string()))
                     .and_then(|signed| IdentityDoc::verify(&signed, &self.state.identity));
                 match verified {
                     Ok(copy) => Some(copy),
                     Err(error) => {
-                        self.commit(self.state.clone(), None).await?;
+                        let mut state = self.state.clone();
+                        self.note_refused_renewals(&mut state, &doc)?;
+                        self.commit(state, None).await?;
                         return Err(error.into());
                     }
                 }
@@ -1516,8 +1525,11 @@ impl Signer {
                 }
             },
             Ok(Verdict::AtMark) => {
-                // The switch holds the version this delivery builds on, yet refused it.
-                self.commit(self.state.clone(), None).await?;
+                // The switch holds the version this delivery builds on, yet refused it. A
+                // renewal it carried didn't happen (Switch spec 3.2).
+                let mut state = self.state.clone();
+                self.note_refused_renewals(&mut state, &doc)?;
+                self.commit(state, None).await?;
                 Err(stale_without_copy())
             }
         }
@@ -1683,6 +1695,11 @@ impl Signer {
         let mut state = self.state.clone();
         state.alert(alert.clone());
         state.switch_unconfirmed = true;
+        // The flow ends, a renewal it carried with it: the user is told it didn't happen
+        // (Switch spec 3.2).
+        if let Some(Flow::Renew { doc, .. } | Flow::Deliver { doc, .. }) = &self.flow {
+            self.note_refused_renewals(&mut state, doc)?;
+        }
         self.commit(state, self.erasure_kept()).await?;
         Err(SignerError::Alarm(alert))
     }

@@ -145,22 +145,31 @@ pub enum Alert {
         /// When its certificate expires, in Unix milliseconds.
         expires_at: u64,
     },
-    /// The switch refused this app's renewal for good, at the storage of its certificate and
-    /// key bundle or at its delivery, so it didn't happen (Switch spec 3.2): the app keeps
-    /// the certificate `identity.json` lists, with its scopes, their keys, its switch
-    /// permissions and its expiry. For a `reduction` the access was not reduced: the app
-    /// still holds the scope, or the permission, or the later expiry, that the user asked to
-    /// remove. Raised whichever call met the refusal, the renewal's own or a later
-    /// [`crate::Signer::resume`] or [`crate::Signer::run_due`], for a renewal the user asked
-    /// for and for an automatic one, which the next run tries again. Cleared once a version
-    /// that renews the app, or removes it, is delivered; a user who clears it doesn't see it
-    /// again. It is this install's own: a restore, in place or on a new install, doesn't
-    /// bring it back, since the listed certificate shows what the app holds.
+    /// This app's renewal didn't happen (Switch spec 3.2): the switch refused it for good, at
+    /// the storage of its certificate and key bundle or at its delivery, or its flow ended
+    /// without it, as at an alarm or when the epoch completion it waited for was cut off. The
+    /// app keeps the certificate `identity.json` lists, with its scopes, their keys, its
+    /// switch permissions and its expiry. For a `reduction` the access was not reduced: the
+    /// app still holds the scope, or the permission, or the later expiry, that the user asked
+    /// to remove. The user renews or reduces it again, or revokes it.
+    ///
+    /// Raised whichever call met it, the renewal's own or a later [`crate::Signer::resume`]
+    /// or [`crate::Signer::run_due`], for a renewal the user asked for and for an automatic
+    /// one, which the next run tries again; a later one for the same app updates it in its
+    /// place. Not raised for an app being revoked, whose removal tells of it. Cleared once a
+    /// version removing the app is delivered, or, for a renewal the user asked for
+    /// (`by_user`), once a renewal the user asks for is delivered for it: an automatic
+    /// renewal, which keeps the app's scopes, doesn't clear that one. One raised for an
+    /// automatic renewal goes once any renewal of the app is delivered. A user who clears it
+    /// doesn't see it again. It is this install's own: a restore, in place or on a new
+    /// install, doesn't bring it back, since the listed certificate shows what the app holds.
     RenewalRefused {
         /// The app.
         app_id: [u8; 16],
         /// Whether the renewal refused was a reduction (Switch wire 3.8 "Reductions").
         reduction: bool,
+        /// Whether the user asked for it, rather than an automatic renewal.
+        by_user: bool,
     },
     /// An app whose renewals stopped ([`Alert::RenewalsStopped`]) still owns attempts open
     /// or `unknown`, as `GET /apps` lists them: at `expires_at` it isn't current any more, its

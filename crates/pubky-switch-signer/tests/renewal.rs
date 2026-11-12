@@ -2568,7 +2568,9 @@ fn refused_renewals(signer: &Signer) -> Vec<([u8; 16], bool)> {
         .alerts()
         .iter()
         .filter_map(|alert| match alert {
-            Alert::RenewalRefused { app_id, reduction } => Some((*app_id, *reduction)),
+            Alert::RenewalRefused {
+                app_id, reduction, ..
+            } => Some((*app_id, *reduction)),
             _ => None,
         })
         .collect()
@@ -2631,6 +2633,14 @@ async fn test_renewal_refused_tells_the_user_whichever_call_meets_it() {
                     signer.renew(id, change).await.unwrap_err();
                 }
                 assert_eq!(refused_renewals(&signer), [(id, reduction)], "{case}");
+                assert!(
+                    signer.alerts().contains(&Alert::RenewalRefused {
+                        app_id: id,
+                        reduction,
+                        by_user: true,
+                    }),
+                    "{case}: the user's"
+                );
                 let doc = signer.identity_doc().unwrap().unwrap();
                 assert_eq!(doc.hash(), before.hash(), "{case}");
                 assert_eq!(world.switch.identity_doc().unwrap().hash(), before.hash());
@@ -2678,6 +2688,7 @@ async fn test_renewal_refused_alert_goes_once_the_app_is_renewed_or_removed() {
         let held = Alert::RenewalRefused {
             app_id: a_id,
             reduction: false,
+            by_user: true,
         };
         signer
             .renew(
@@ -2729,6 +2740,11 @@ async fn test_renewal_refused_automatic_renewal_tells_the_user_and_is_tried_agai
     world.switch.fail_next(refusal("/identity"));
     signer.run_due().await.unwrap_err();
     assert_eq!(refused_renewals(&signer), [(id, false)]);
+    assert!(signer.alerts().contains(&Alert::RenewalRefused {
+        app_id: id,
+        reduction: false,
+        by_user: false,
+    }));
     assert_eq!(
         signer.identity_doc().unwrap().unwrap().hash(),
         before.hash()
@@ -2785,4 +2801,235 @@ async fn test_renewal_refused_survives_a_crash_before_its_commit() {
         assert_eq!(doc.hash(), before.hash(), "{n}");
         restarted.set_record_max_age(Some(86_400)).await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn test_renewal_refused_reduction_isnt_cleared_by_an_automatic_renewal() {
+    // The user's reduction is cut off and a background run meets its refusal. The next
+    // automatic renewal keeps the app's scopes, the one the user removed included, so the
+    // alert stays; the user's reduction, once delivered, clears it (Switch spec 3.2).
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let (a, _) = two_apps(&["notes", "notes_sync"], &["notes"]);
+    world.approve(&mut signer, &a).await;
+    let id = a.keys.app_id_bytes();
+    let listed = signer.identity_doc().unwrap().unwrap().listed_cert(&id);
+    world.clock.advance_ms(LIFETIME_MS / 2 - DAY_MS);
+    world.switch.fail_next(SwitchFault::Unreachable {
+        path: "/ops".into(),
+        after: 0,
+    });
+    signer.renew(id, reduce(&["notes_sync"])).await.unwrap_err();
+    world.switch.fail_next(refusal("/ops"));
+    signer.run_due().await.unwrap_err();
+    assert_eq!(refused_renewals(&signer), [(id, true)]);
+    world.clock.advance_ms(2 * DAY_MS);
+    signer.run_due().await.unwrap();
+    let doc = signer.identity_doc().unwrap().unwrap();
+    assert_ne!(doc.listed_cert(&id), listed, "renewed automatically");
+    assert!(
+        listed_cert(&signer, &doc, &id)
+            .scopes()
+            .iter()
+            .any(|s| s == "notes"),
+        "the scope the user removed is still held"
+    );
+    assert_eq!(refused_renewals(&signer), [(id, true)], "still told");
+    signer.renew(id, reduce(&["notes_sync"])).await.unwrap();
+    assert!(refused_renewals(&signer).is_empty());
+}
+
+#[tokio::test]
+async fn test_renewal_refused_by_a_stale_identity_tells_the_user() {
+    // A `409 stale_identity` whose copy is the version the delivery builds on, or doesn't
+    // verify, ends the reduction without it: the user is told, whichever call met it
+    // (Switch spec 3.2, Switch wire 7.4.2).
+    for when in ["renew", "resume", "run_due"] {
+        for copy in ["mark", "unverifiable"] {
+            let case = format!("{when} {copy}");
+            let world = World::new();
+            let (mut signer, _) = world.enrolled().await;
+            let first = signer.identity_doc().unwrap().unwrap();
+            let (a, _) = two_apps(&["notes", "notes_sync"], &["notes"]);
+            world.approve(&mut signer, &a).await;
+            let id = a.keys.app_id_bytes();
+            let before = signer.identity_doc().unwrap().unwrap();
+            let current = if copy == "mark" {
+                serde_json::json!({ "identity": before.signed() })
+            } else {
+                let mut forged = before.signed().clone();
+                forged.sig.clone_from(&first.signed().sig);
+                serde_json::json!({ "identity": forged })
+            };
+            let stale = SwitchFault::Error {
+                path: "/identity".into(),
+                code: ErrorCode::StaleIdentity,
+                current,
+            };
+            if when == "renew" {
+                world.switch.fail_next(stale);
+                signer.renew(id, reduce(&["notes_sync"])).await.unwrap_err();
+            } else {
+                world.switch.fail_next(SwitchFault::Unreachable {
+                    path: "/identity".into(),
+                    after: 0,
+                });
+                signer.renew(id, reduce(&["notes_sync"])).await.unwrap_err();
+                world.switch.fail_next(stale);
+                match when {
+                    "resume" => signer.resume().await.unwrap_err(),
+                    _ => signer.run_due().await.unwrap_err(),
+                };
+            }
+            assert_eq!(refused_renewals(&signer), [(id, true)], "{case}");
+            assert_eq!(
+                signer.identity_doc().unwrap().unwrap().listed_cert(&id),
+                before.listed_cert(&id),
+                "{case}: not reduced"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_renewal_refused_again_keeps_the_alerts_place() {
+    // A second refusal for an app brings its alert up to date where it is, after which the
+    // other app's still comes (Switch spec 3.2).
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let (a, b) = two_apps(&["notes", "notes_sync"], &["notes", "notes_sync"]);
+    world.approve(&mut signer, &a).await;
+    world.approve(&mut signer, &b).await;
+    let (a_id, b_id) = (a.keys.app_id_bytes(), b.keys.app_id_bytes());
+    // An earlier expiry is a reduction that rotates nothing.
+    let shorter = || CertChange {
+        scopes: None,
+        expires_at: Some(START_MS + 30 * DAY_MS),
+    };
+    world.switch.fail_next(refusal("/ops"));
+    signer.renew(a_id, shorter()).await.unwrap_err();
+    world.switch.fail_next(refusal("/ops"));
+    signer.renew(b_id, shorter()).await.unwrap_err();
+    assert_eq!(refused_renewals(&signer), [(a_id, true), (b_id, true)]);
+    world.switch.fail_next(refusal("/identity"));
+    signer
+        .renew(
+            a_id,
+            CertChange {
+                scopes: None,
+                expires_at: Some(START_MS + 400 * DAY_MS),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(refused_renewals(&signer), [(a_id, false), (b_id, true)]);
+}
+
+#[tokio::test]
+async fn test_renewal_ended_by_an_alarm_tells_the_user() {
+    // The resumed reduction's check finds an older copy at the switch: the rollback alarm
+    // ends the flow, the reduction with it, and the user is told it didn't happen, beside
+    // the alarm, and still once the alarm is cleared (Switch spec 3.2, 4.3).
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let (a, b) = two_apps(&["notes", "notes_sync"], &["notes"]);
+    world.approve(&mut signer, &a).await;
+    let older = signer.identity_doc().unwrap().unwrap();
+    world.approve(&mut signer, &b).await;
+    let id = a.keys.app_id_bytes();
+    let before = signer.identity_doc().unwrap().unwrap();
+    world.switch.fail_next(SwitchFault::Unreachable {
+        path: "/ops".into(),
+        after: 0,
+    });
+    signer.renew(id, reduce(&["notes_sync"])).await.unwrap_err();
+    world.switch.fail_next(SwitchFault::Replace {
+        path: "/apps".into(),
+        member: "identity".into(),
+        value: serde_json::to_value(older.signed()).unwrap(),
+    });
+    let SignerError::Alarm(alarm) = signer.resume().await.unwrap_err() else {
+        panic!("no alarm")
+    };
+    assert_eq!(refused_renewals(&signer), [(id, true)]);
+    signer.clear_alert(&alarm).await.unwrap();
+    signer.run_due().await.unwrap();
+    let doc = signer.identity_doc().unwrap().unwrap();
+    assert_eq!(doc.listed_cert(&id), before.listed_cert(&id), "not reduced");
+    assert_eq!(refused_renewals(&signer), [(id, true)]);
+}
+
+#[tokio::test]
+async fn test_renewal_not_made_after_its_epoch_completion_is_cut_off_tells_the_user() {
+    // A reduction of `a` was refused at its delivery after sending epoch 2's keys. The user's
+    // reduction of `b` completes epoch 2 first, and that is cut off: the reduction of `b` is
+    // never signed, and no later call makes it, so the user is told at once. A later run
+    // finishes the completion, or meets its refusal, and the alert stays (Switch spec 3.2,
+    // 3.5).
+    for later in ["completes", "refused"] {
+        let world = World::new();
+        let (mut signer, _) = world.enrolled().await;
+        let (a, b) = two_apps(&["notes", "notes_sync"], &["notes", "notes_sync"]);
+        world.approve(&mut signer, &a).await;
+        world.approve(&mut signer, &b).await;
+        let (a_id, b_id) = (a.keys.app_id_bytes(), b.keys.app_id_bytes());
+        world.switch.fail_next(refusal("/identity"));
+        signer
+            .renew(a_id, reduce(&["notes_sync"]))
+            .await
+            .unwrap_err();
+        let before = signer.identity_doc().unwrap().unwrap();
+        world.switch.fail_next(SwitchFault::Unreachable {
+            path: "/ops".into(),
+            after: 0,
+        });
+        signer
+            .renew(b_id, reduce(&["notes_sync"]))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            refused_renewals(&signer),
+            [(a_id, true), (b_id, true)],
+            "{later}"
+        );
+        if later == "refused" {
+            world.switch.fail_next(refusal("/ops"));
+        }
+        let _ = signer.resume().await;
+        signer.set_record_max_age(Some(86_400)).await.unwrap();
+        let doc = signer.identity_doc().unwrap().unwrap();
+        assert_eq!(doc.listed_cert(&b_id), before.listed_cert(&b_id), "{later}");
+        assert_eq!(
+            refused_renewals(&signer),
+            [(a_id, true), (b_id, true)],
+            "{later}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_renewal_of_an_app_revoked_meanwhile_isnt_told_as_refused() {
+    // The app is revoked while its reduction is in progress: the switch refuses the
+    // reduction's `cert.put` for an app it cut off, and the removal tells of it, not a
+    // refused renewal (Switch spec 3.2, 12.2).
+    let world = World::new();
+    let (mut signer, _) = world.enrolled().await;
+    let (a, b) = two_apps(&["notes", "notes_sync"], &["notes"]);
+    world.approve(&mut signer, &a).await;
+    world.approve(&mut signer, &b).await;
+    let id = a.keys.app_id_bytes();
+    world.switch.fail_next(SwitchFault::Unreachable {
+        path: "/ops".into(),
+        after: 0,
+    });
+    signer.renew(id, reduce(&["notes_sync"])).await.unwrap_err();
+    let _ = signer
+        .revoke(id, None, UserConfirmed::shown_and_confirmed())
+        .await;
+    let _ = signer.resume().await;
+    assert!(refused_renewals(&signer).is_empty());
+    signer.run_due().await.unwrap();
+    assert!(refused_renewals(&signer).is_empty());
+    let doc = signer.identity_doc().unwrap().unwrap();
+    assert!(doc.listed_cert(&id).is_none(), "removed");
 }

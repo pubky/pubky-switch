@@ -224,6 +224,11 @@ pub(crate) struct SignerState {
     /// find the service (Switch spec 12.6 step 1).
     #[serde(default)]
     pub(crate) revoke_at_service: bool,
+    /// The renewals the user asked for, each as its app and the new certificate's hash, whose
+    /// flow is in progress: the one delivered ends that app's [`Alert::RenewalRefused`], which
+    /// an automatic renewal doesn't (Switch spec 3.2). Emptied once the flow ends.
+    #[serde(default)]
+    pub(crate) user_renewals: Vec<([u8; 16], [u8; 32])>,
     /// Some version of the identity was published on the Homeserver, by this install or,
     /// for records restored or received, by the install they came from (Switch spec 4.3). A
     /// missing `identity.json` is explained without it only by an erasure (Switch spec 12.6
@@ -450,6 +455,7 @@ impl SignerState {
             lost_generation: None,
             homeserver_copy_waived: false,
             revoke_at_service: false,
+            user_renewals: Vec::new(),
             ever_published: false,
             recovery_origin: None,
             recovery_services: Vec::new(),
