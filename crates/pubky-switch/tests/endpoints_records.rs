@@ -869,3 +869,186 @@ async fn test_records_create_over_an_uploaded_delete_keeps_its_base() {
     assert_eq!(divergent_count(&replay, &key).await, (false, 0));
     replay.db.drop_database().await.expect("drop");
 }
+
+#[tokio::test]
+async fn test_records_superseded_write_loses_its_document() {
+    // A record's write keeps its document and proof while it is the record's current one;
+    // the write that supersedes it deletes both in its own transaction, so only the stub is
+    // left (Switch wire 7.5). The phone, which hasn't read past either, sees the first as a
+    // stub and the second in full, as before; the delete later does the same to the update.
+    let Some(replay) = registered(Limits::default()).await else {
+        return;
+    };
+    let before = last_seq(&replay).await;
+    let (key, ..) = create(&replay, 1, b"n1", "pay").await;
+    let created = last_seq(&replay).await;
+    assert_eq!(
+        chain_document_kept(&replay, &alice_id(), created).await,
+        (true, true)
+    );
+    let update = record_put(
+        PAYMENTS,
+        b"n1",
+        "pay",
+        RecordVersion::new(1, created),
+        b"{\"n\":2}",
+    );
+    post(
+        &replay,
+        "wallet",
+        &batch("wallet", 2, vec![OpKind::RecordPut(update)]),
+        AT,
+    )
+    .await;
+    let updated = last_seq(&replay).await;
+    assert_eq!(
+        chain_document_kept(&replay, &alice_id(), created).await,
+        (false, false)
+    );
+    assert_eq!(
+        chain_document_kept(&replay, &alice_id(), updated).await,
+        (true, true)
+    );
+    let feed = body(&get_as(&replay, "phone", &format!("feed?after=1:{before}")).await);
+    let shown = |seq: u64| {
+        feed["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .find(|item| item["seq"] == seq)
+            .expect("item")["type"]
+            .clone()
+    };
+    assert_eq!(shown(created), json!("stub"));
+    assert_eq!(shown(updated), json!("chain"));
+    let delete = record_put(PAYMENTS, b"n1", "pay", RecordVersion::new(1, updated), b"");
+    post(
+        &replay,
+        "wallet",
+        &batch("wallet", 3, vec![OpKind::RecordPut(delete)]),
+        AT,
+    )
+    .await;
+    assert_eq!(
+        chain_document_kept(&replay, &alice_id(), updated).await,
+        (false, false)
+    );
+    assert_eq!(
+        chain_document_kept(&replay, &alice_id(), last_seq(&replay).await).await,
+        (true, true),
+        "the delete is the record's current write"
+    );
+    assert_eq!(record_rows(&replay, &key).await, 1);
+    replay.db.drop_database().await.expect("drop");
+}
+
+#[tokio::test]
+async fn test_records_documents_chained_before_the_rule_are_checked_a_bounded_number_at_a_time() {
+    // Documents from before superseded ones were deleted: a superseded write's document is
+    // put back, as an earlier service left it, and the account's items marked unchecked.
+    // The next requests check 64 a request, oldest first, and delete it; a current write
+    // keeps its document.
+    let Some(replay) = registered(Limits::default()).await else {
+        return;
+    };
+    create(&replay, 1, b"n1", "pay").await;
+    let created = last_seq(&replay).await;
+    let update = record_put(
+        PAYMENTS,
+        b"n1",
+        "pay",
+        RecordVersion::new(1, created),
+        b"{\"n\":2}",
+    );
+    post(
+        &replay,
+        "wallet",
+        &batch("wallet", 2, vec![OpKind::RecordPut(update)]),
+        AT,
+    )
+    .await;
+    let updated = last_seq(&replay).await;
+    for n in 0..70u8 {
+        create(&replay, n.wrapping_add(10), &[b'k', n], "pay").await;
+    }
+    let end = last_seq(&replay).await;
+    assert!(end > 64 + updated, "more than one request's bound");
+    sql_account(
+        &replay,
+        &format!(
+            "UPDATE chain_items SET item_bytes = (SELECT item_bytes FROM chain_items \
+             WHERE account_id = $1 AND seq = {updated}), proof = (SELECT proof FROM \
+             chain_items WHERE account_id = $1 AND seq = {updated}) \
+             WHERE account_id = $1 AND seq = {created}"
+        ),
+    )
+    .await;
+    sql_account(
+        &replay,
+        &format!(
+            "UPDATE accounts SET documents_checked_seq = 0, documents_check_end = {end} \
+             WHERE id = $1"
+        ),
+    )
+    .await;
+    assert_eq!(
+        chain_document_kept(&replay, &alice_id(), created).await,
+        (true, true)
+    );
+    get_as(&replay, "wallet", &list_path(&payments(), "")).await;
+    assert_eq!(checked(&replay).await, 64);
+    assert_eq!(
+        chain_document_kept(&replay, &alice_id(), created).await,
+        (false, false)
+    );
+    assert_eq!(
+        chain_document_kept(&replay, &alice_id(), updated).await,
+        (true, true)
+    );
+    get_as(&replay, "wallet", &list_path(&payments(), "")).await;
+    assert_eq!(checked(&replay).await, i64::try_from(end).expect("end"));
+    get_as(&replay, "wallet", &list_path(&payments(), "")).await;
+    assert_eq!(
+        checked(&replay).await,
+        i64::try_from(end).expect("end"),
+        "done"
+    );
+    replay.db.drop_database().await.expect("drop");
+}
+
+async fn record_rows(replay: &Replay, key: &[u8; 32]) -> i64 {
+    use sqlx::Connection;
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    sqlx::query_scalar("SELECT count(*) FROM shared_records WHERE account_id = $1 AND key = $2")
+        .bind(alice_id())
+        .bind(key.as_slice())
+        .fetch_one(&mut conn)
+        .await
+        .expect("count")
+}
+
+async fn sql_account(replay: &Replay, sql: &str) {
+    use sqlx::Connection;
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    sqlx::query(sql)
+        .bind(alice_id())
+        .execute(&mut conn)
+        .await
+        .expect("sql");
+}
+
+async fn checked(replay: &Replay) -> i64 {
+    use sqlx::Connection;
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    sqlx::query_scalar("SELECT documents_checked_seq FROM accounts WHERE id = $1")
+        .bind(alice_id())
+        .fetch_one(&mut conn)
+        .await
+        .expect("checked")
+}

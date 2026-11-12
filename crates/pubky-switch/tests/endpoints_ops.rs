@@ -1913,3 +1913,125 @@ async fn test_claims_served_through_a_longer_renewal_past_the_earlier_expiry() {
     );
     replay.db.drop_database().await.expect("drop");
 }
+
+#[tokio::test]
+async fn test_claims_compacted_or_deleted_entries_lose_their_documents() {
+    // A live claim's entry keeps its document. The `done` that settles it compacts it to a
+    // tombstone, whose entries show as stubs: their documents and proofs go in that same
+    // transaction (Switch wire 6.8, 7.5). A failed claim's entries keep theirs until the
+    // claim is deleted, at a request past its deadline and the reconciliation window.
+    let Some(replay) = registered(Limits::default(), false).await else {
+        return;
+    };
+    let ops = wallet_batch(60, 1, vec![claim(ClaimType::Attempt, 0, None)]);
+    let (status, body) = post_app(&replay, "wallet", &ops, None, AT).await;
+    assert_eq!(status, 200, "{body}");
+    let attempt = head_seq(&body);
+    assert_eq!(
+        chain_document_kept(&replay, &alice_id(), attempt).await,
+        (true, true)
+    );
+    let ops = wallet_batch(61, 1, vec![claim(ClaimType::Done, 1, None)]);
+    let (status, body) = post_app(&replay, "wallet", &ops, None, AT).await;
+    assert_eq!(status, 200, "{body}");
+    let done = head_seq(&body);
+    for seq in [attempt, done] {
+        assert_eq!(
+            chain_document_kept(&replay, &alice_id(), seq).await,
+            (false, false),
+            "seq {seq}"
+        );
+    }
+    let deadline = ms(AT) + 60_000;
+    let ops = wallet_batch(
+        62,
+        1,
+        vec![
+            claim_at(9, ClaimType::Attempt, 0, Some(deadline)),
+            claim_at(9, ClaimType::Failed, 1, None),
+        ],
+    );
+    let (status, body) = post_app(&replay, "wallet", &ops, None, AT).await;
+    assert_eq!(status, 200, "{body}");
+    let failed = head_seq(&body);
+    assert_eq!(
+        chain_document_kept(&replay, &alice_id(), failed).await,
+        (true, true)
+    );
+    // A request past the deadline and the reconciliation window: step 4 deletes the claim.
+    let late = pubky_switch_core::time::rfc3339(deadline + 31 * DAY_MS);
+    set_time(&replay.clock, &late);
+    read_claim(&replay, &late).await;
+    for seq in [failed - 1, failed] {
+        assert_eq!(
+            chain_document_kept(&replay, &alice_id(), seq).await,
+            (false, false),
+            "seq {seq}"
+        );
+    }
+    replay.db.drop_database().await.expect("drop");
+}
+
+/// The `seq`s of the chain items whose kept document concerns app `app`.
+async fn app_documents(replay: &Replay, app: &[u8; 16]) -> Vec<i64> {
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    let seqs = sqlx::query_scalar(
+        "SELECT seq FROM chain_items WHERE account_id = $1 AND doc_app = $2 \
+         AND item_bytes IS NOT NULL ORDER BY seq",
+    )
+    .bind(alice_id())
+    .bind(app.as_slice())
+    .fetch_all(&mut conn)
+    .await
+    .expect("seqs");
+    conn.close().await.expect("close");
+    seqs
+}
+
+#[tokio::test]
+async fn test_ops_replaced_app_record_loses_its_document() {
+    // The wallet's app record replaced by a newer one: the earlier `app.put` shows as its
+    // stub from then on, and its document and proof go in the same transaction; the new
+    // one keeps both (Switch wire 7.5).
+    let Some(replay) = registered(Limits::default(), false).await else {
+        return;
+    };
+    let (keys, cert) = wallet_keys(&replay).await;
+    let earlier = app_documents(&replay, &cert.app_id()).await;
+    assert_eq!(earlier.len(), 1, "the registration's app.put");
+    let earlier = u64::try_from(earlier[0]).expect("seq");
+    assert_eq!(
+        chain_document_kept(&replay, &alice_id(), earlier).await,
+        (true, true)
+    );
+    let record = AppRecord::sign(&keys, AppRecordBody::new(&cert, Vec::new(), ms(AT) + 1_000))
+        .expect("record");
+    let ops = wallet_batch(
+        63,
+        1,
+        vec![(
+            Vec::new(),
+            OpKind::AppPut {
+                record: record.signed().clone(),
+            },
+        )],
+    );
+    let (status, body) = post_app(&replay, "wallet", &ops, None, AT).await;
+    assert_eq!(status, 200, "{body}");
+    let newer = head_seq(&body);
+    assert_eq!(
+        chain_document_kept(&replay, &alice_id(), earlier).await,
+        (false, false)
+    );
+    assert_eq!(
+        chain_document_kept(&replay, &alice_id(), newer).await,
+        (true, true)
+    );
+    assert_eq!(
+        app_documents(&replay, &cert.app_id()).await,
+        vec![i64::try_from(newer).expect("seq")]
+    );
+    replay.db.drop_database().await.expect("drop");
+}

@@ -23,6 +23,7 @@ mod allow;
 mod apps;
 mod chain;
 mod claim_codec;
+mod documents;
 mod enrollments;
 mod feed;
 mod handover;

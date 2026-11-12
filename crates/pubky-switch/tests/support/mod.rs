@@ -715,3 +715,24 @@ pub async fn listen(
     }));
     (stop, task)
 }
+
+/// Whether account `account`'s chain item at `seq` keeps its document, and its proof
+/// (Switch wire 7.5).
+pub async fn chain_document_kept(replay: &Replay, account: &str, seq: u64) -> (bool, bool) {
+    use sqlx::Connection;
+    let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+        .await
+        .expect("conn");
+    let kept: (bool, bool) = sqlx::query_as(
+        "SELECT item_bytes IS NOT NULL, proof IS NOT NULL FROM chain_items \
+         WHERE account_id = $1 AND seq = $2 \
+         AND generation = (SELECT generation FROM accounts WHERE id = $1)",
+    )
+    .bind(account)
+    .bind(i64::try_from(seq).expect("seq"))
+    .fetch_one(&mut conn)
+    .await
+    .expect("chain item");
+    conn.close().await.expect("close");
+    kept
+}
