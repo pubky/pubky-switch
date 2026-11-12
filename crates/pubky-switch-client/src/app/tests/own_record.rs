@@ -1475,6 +1475,40 @@ async fn test_own_record_failed_save_of_an_owed_write_back_doesnt_delay_it() {
     assert_eq!(w.published(id), Some(bytes_of(app.record())));
 }
 
+/// An app whose devices share its keys holds a kept record; another device
+/// leaves, deleting the Homeserver copy. The kept record's `app.put` at the read's start is
+/// refused, so the read's own publication never writes the copy back.
+#[tokio::test]
+async fn test_own_record_kept_record_after_another_device_left_writes_nothing_back() {
+    let w = World::new();
+    let mut a = w.join_publishing("wallet").await;
+    let id = a.app_id();
+    a.set_multi_device(true).await.unwrap();
+    let backup = a.backup().await.unwrap();
+    let mut b = restored_publishing(&w, &backup).await;
+    b.receive(None).await.unwrap();
+    b.end_reconcile(UserConfirmed::new()).await.ok();
+    a.receive(None).await.unwrap();
+    w.clock.advance_ms(1_000);
+    w.switch.fail_next(Fault::Unreachable {
+        path: "/ops".into(),
+        after: 0,
+    });
+    a.set_protocol_member(PROTO, member(json!({ "a": 1 })), None)
+        .await
+        .unwrap_err();
+    assert!(a.state.pending_record.is_some());
+    b.leave(LeaveMode::Immediate(UserConfirmed::new()))
+        .await
+        .unwrap();
+    assert!(w.published(id).is_none());
+    let writes = w.record_writes(id);
+    w.clock.advance_ms(PUBLISHED_CHECK_MS);
+    let outcome = a.receive(None).await;
+    assert!(w.published(id).is_none(), "{outcome:?}");
+    assert_eq!(w.record_writes(id), writes);
+}
+
 /// After a kept record is dropped as superseded, a record call that changes
 /// nothing must not sign the superseded body again over the later record.
 #[tokio::test]
@@ -1579,6 +1613,58 @@ async fn test_own_record_conflict_naming_no_record_with_no_directory_entry_keeps
     assert!(app.state.pending_record.is_some());
     assert_eq!(app.state.accepted, accepted);
     assert_eq!(w.published(id), published);
+}
+
+/// A read that delivers a kept record with the Homeserver down reports the
+/// failed publication once.
+#[tokio::test]
+async fn test_own_record_read_reports_a_failed_publication_once() {
+    let w = World::new();
+    let mut app = w.join_publishing("wallet").await;
+    w.clock.advance_ms(1_000);
+    w.switch.fail_next(Fault::Unreachable {
+        path: "/ops".into(),
+        after: 0,
+    });
+    app.set_protocol_member(PROTO, member(json!({ "a": 1 })), None)
+        .await
+        .unwrap_err();
+    app.take_events();
+    w.homeserver.set_down(true);
+    let report = app.receive(None).await.unwrap();
+    let failed = report
+        .events
+        .iter()
+        .filter(|e| matches!(e, AppEvent::RecordPublishFailed { .. }))
+        .count();
+    assert_eq!(failed, 1, "{:?}", report.events);
+}
+
+/// An app whose devices share its keys writes a missing copy back right after
+/// the switch accepts its `app.put` at a read's start, also when the read's feed then fails.
+#[tokio::test]
+async fn test_own_record_delivery_at_a_read_start_writes_a_missing_copy_back() {
+    let w = World::new();
+    let mut app = w.join_publishing("wallet").await;
+    let id = app.app_id();
+    app.set_multi_device(true).await.unwrap();
+    w.clock.advance_ms(1_000);
+    w.switch.fail_next(Fault::Unreachable {
+        path: "/ops".into(),
+        after: 0,
+    });
+    app.set_protocol_member(PROTO, member(json!({ "a": 1 })), None)
+        .await
+        .unwrap_err();
+    let kept = app.record().clone();
+    w.homeserver.remove(w.alice.public(), &app_record_path(&id));
+    w.switch.fail_next(Fault::Unreachable {
+        path: "/feed".into(),
+        after: 0,
+    });
+    app.receive(None).await.unwrap_err();
+    assert_eq!(w.held(id).as_ref(), Some(&kept));
+    assert_eq!(w.published(id), Some(bytes_of(&kept)));
 }
 
 /// A later record that superseded a kept one carries another certificate: a renewal

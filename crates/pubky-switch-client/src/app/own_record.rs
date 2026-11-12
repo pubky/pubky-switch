@@ -107,9 +107,10 @@ pub enum Publication {
         error: TransportError,
     },
     /// The Homeserver copy is missing, and the app runs on devices that share its keys:
-    /// another device may have deleted it to leave, so the copy is written back only at the
-    /// next read, after its feed shows the app still current (Switch spec 4.2). It stays
-    /// owed until then.
+    /// another device may have deleted it to leave, so the copy is written back only once
+    /// the switch has shown the app current: at the next read, after its feed, or right
+    /// after the switch accepts the app's `app.put` (Switch spec 4.2). It stays owed until
+    /// then.
     AwaitingRead,
 }
 

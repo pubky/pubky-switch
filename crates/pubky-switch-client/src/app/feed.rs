@@ -406,8 +406,10 @@ impl App {
         }
         // The record's delivery goes before the feed. A record the switch accepts here is
         // published here too: accepting the `app.put` shows the app current, as the feed
-        // would (Switch spec 4.2, `own_record.rs`).
-        if self.deliver_pending_record().await? {
+        // would (Switch spec 4.2, `own_record.rs`). That is the read's one publication: a
+        // write that failed here isn't tried again after the feed.
+        let published = self.deliver_pending_record().await?;
+        if published {
             self.publish_owed(false, true).await?;
         }
         self.ensure_scope_keys().await?;
@@ -505,12 +507,16 @@ impl App {
             // a call outside a read does: what is owed goes, and an app whose devices share
             // its keys writes no missing copy back (Switch spec 4.2).
             if waits_for_key {
-                self.publish_owed(false, false).await?;
+                if !published {
+                    self.publish_owed(false, false).await?;
+                }
             } else if !report.stopped {
                 self.reread_claims().await?;
                 self.reread_records().await?;
                 self.fetch_entry_writers().await?;
-                self.publish_owed(false, true).await?;
+                if !published {
+                    self.publish_owed(false, true).await?;
+                }
             }
             self.delete_retired_keys().await?;
             self.forget_chain_behind_cursor().await?;

@@ -6509,3 +6509,84 @@ async fn test_records_listing_waiting_for_a_key_writes_no_missing_copy_back() {
     );
     assert!(s.w.homeserver.file(s.w.alice.public(), &path).is_none());
 }
+
+/// A publishing app whose owed listing waits for a scope key: joined, its scope keys
+/// dropped, and a `missed` item read so that the listing is owed.
+async fn publishing_app_waiting_for_a_key(s: &Setup) -> App {
+    let request = s.approve(&app_keys("wallet"), &ALL_PERMISSIONS);
+    let config = AppConfig {
+        publishes_record: true,
+        ..World::config()
+    };
+    let mut app = App::join(s.env(), s.protocol.clone(), config, request)
+        .await
+        .unwrap();
+    app.receive(None).await.unwrap();
+    app.state.scope_keys.keys.clear();
+    let mut tx = app.tx().unwrap();
+    tx.delete_prefix("scope/").unwrap();
+    app.commit(tx).await.unwrap();
+    s.w.switch.push_missed(3, START, START + 1);
+    app.receive(None).await.unwrap();
+    assert!(app.listing_owed().await.unwrap());
+    app
+}
+
+/// A single-device app revoked while offline, whose publication is owed and
+/// whose copy the signer's clean-up deleted, writes nothing back in a read that waits for
+/// a key: the key bundle read is refused first.
+#[tokio::test]
+async fn test_records_listing_waiting_for_a_key_revoked_app_writes_nothing_back() {
+    let s = Setup::new();
+    let mut app = publishing_app_waiting_for_a_key(&s).await;
+    let me = app.app_id();
+    let path = pubky_switch_core::records::app_record_path(&me);
+    s.w.clock.advance_ms(1_000);
+    s.w.homeserver.fail_writes(1, false);
+    let member = serde_json::Map::from_iter([("a".to_owned(), json!(1))]);
+    app.set_protocol_member("sample", Some(member), None)
+        .await
+        .unwrap();
+    assert!(app.state.pending_publish.is_some());
+    s.w.switch.revoke(me).unwrap();
+    s.w.homeserver.remove(s.w.alice.public(), &path);
+    let outcome = app.receive(None).await;
+    assert!(
+        s.w.homeserver.file(s.w.alice.public(), &path).is_none(),
+        "{outcome:?}"
+    );
+}
+
+/// A read that delivers a kept record and then waits for a key, with the
+/// Homeserver down, reports the failed publication once.
+#[tokio::test]
+async fn test_records_listing_waiting_for_a_key_reports_a_failed_publication_once() {
+    let s = Setup::new();
+    let mut app = publishing_app_waiting_for_a_key(&s).await;
+    s.w.clock.advance_ms(1_000);
+    s.w.switch.fail_next(Fault::Unreachable {
+        path: "/ops".into(),
+        after: 0,
+    });
+    let member = serde_json::Map::from_iter([("a".to_owned(), json!(1))]);
+    app.set_protocol_member("sample", Some(member), None)
+        .await
+        .unwrap_err();
+    app.take_events();
+    s.w.homeserver.set_down(true);
+    let report = app.receive(None).await.unwrap();
+    assert!(
+        report
+            .events
+            .iter()
+            .any(|e| matches!(e, AppEvent::ListingWaitsForKey)),
+        "{:?}",
+        report.events
+    );
+    let failed = report
+        .events
+        .iter()
+        .filter(|e| matches!(e, AppEvent::RecordPublishFailed { .. }))
+        .count();
+    assert_eq!(failed, 1, "{:?}", report.events);
+}
