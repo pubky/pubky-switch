@@ -72,6 +72,11 @@ pub(crate) struct PeerInner {
     /// Every request, as (method, route).
     pub(crate) requests: Vec<(String, String)>,
     pub(crate) down: bool,
+    /// Every answer is `503 staged`, as at an account recovering from a provider loss.
+    pub(crate) staged: bool,
+    /// Answers are signed with this key in place of the service key, as by a switch whose
+    /// key no document names.
+    pub(crate) foreign: Option<SigningKey>,
 }
 
 /// The switch of another identity, the counterparty a sending app writes to.
@@ -151,6 +156,8 @@ impl PeerSwitch {
                 faults: VecDeque::new(),
                 requests: Vec::new(),
                 down: false,
+                staged: false,
+                foreign: None,
             }),
         })
     }
@@ -272,6 +279,40 @@ impl PeerSwitch {
         self.lock().peers.get(identity).cloned()
     }
 
+    /// A provider loss declared in place (Switch spec 12.6): the account signs with the key
+    /// of `service_secret` from now on, at the next generation, holds no peer copy, and is
+    /// staged until [`PeerSwitch::set_staged`] ends it; the identity's next `identity.json`,
+    /// naming the new key and the lost generation, is published.
+    ///
+    /// # Errors
+    ///
+    /// When the document doesn't sign.
+    pub fn recover_in_place(&self, service_secret: [u8; 32]) -> Result<(), ScriptError> {
+        let mut inner = self.lock();
+        inner.service = SigningKey::from_bytes(&service_secret);
+        let lost = inner.body.generation;
+        inner.body.generation = lost.saturating_add(1);
+        inner.body.recovery_from = Some(lost);
+        let url = inner.body.inbox.url.clone();
+        inner.body.inbox = Inbox::new(&url, inner.service.verifying_key().to_bytes());
+        inner.body.version = inner.body.version.saturating_add(1);
+        inner.peers.clear();
+        inner.answered.clear();
+        inner.staged = true;
+        inner.publish()
+    }
+
+    /// Answer `503 staged` to everything, or serve again.
+    pub fn set_staged(&self, staged: bool) {
+        self.lock().staged = staged;
+    }
+
+    /// Sign every answer with the key of `secret`, which no document names, or, with
+    /// `None`, with the service key again.
+    pub fn sign_with(&self, secret: Option<[u8; 32]>) {
+        self.lock().foreign = secret.map(|s| SigningKey::from_bytes(&s));
+    }
+
     /// Make the switch unreachable, or reachable again.
     pub fn set_down(&self, down: bool) {
         self.lock().down = down;
@@ -367,6 +408,10 @@ impl PeerSwitch {
             let (status, body) = bad(code, current);
             return Ok(inner.respond(request, status, &body));
         }
+        if inner.staged {
+            let (status, body) = bad(ErrorCode::Staged, json!(null));
+            return Ok(inner.respond(request, status, &body));
+        }
         let sender = request
             .header(header::IDENTITY)
             .and_then(|text| pubky_key(text).ok())
@@ -411,7 +456,7 @@ impl PeerInner {
         let server_time = rfc3339(self.clock.now_ms());
         let request_signature = request_signature_of(request.header(header::SIGNATURE));
         let signature = sign_response(
-            &self.service,
+            self.foreign.as_ref().unwrap_or(&self.service),
             status,
             request_signature.as_ref(),
             &server_time,

@@ -208,6 +208,7 @@ impl Service {
         self.control_rate.forget(|(at, _)| at == account);
         self.invite_rate.forget(|(at, _)| at == account);
         self.stranger_rate.forget(|at| at == account);
+        self.connect_rate.forget(|(at, _)| at == account);
         self.sender_rate.forget(|(at, _)| at == account);
         self.sender_app_rate.forget(|(at, _)| at == account);
         self.upload_rate.forget(|(at, _)| at == account);

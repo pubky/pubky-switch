@@ -102,13 +102,22 @@ pub enum Refusal {
         /// The scopes, in the order they were asked for.
         scopes: Vec<String>,
     },
-    /// A protocol's own rule on its scopes refused them (Switch spec 1).
+    /// A protocol's own rule on its scopes, or on its grant paths, refused them (Switch spec 1,
+    /// 3.4).
     #[error("refused by the rules of protocol {protocol}: {reason}")]
     ProtocolRule {
         /// The protocol's name.
         protocol: String,
         /// The protocol's reason.
         reason: String,
+    },
+    /// A decline of a path that isn't one the user may decline: only a path a protocol added
+    /// to the app's grant, and the app asks for, is (Switch spec 3.4, Switch wire 3.9). The
+    /// app's record and backup paths never are.
+    #[error("refused: a path the user can't decline")]
+    NotDeclinable {
+        /// The path.
+        path: String,
     },
     /// The app request fails a check of Switch wire 3.9: the reason names the step.
     #[error("refused: {0}")]

@@ -45,6 +45,9 @@ mod signer;
 
 pub use shared::HeldRecord;
 
+/// The time a scripted `missed` item writes as text that doesn't parse.
+const UNPARSABLE_TIME: u64 = u64::MAX;
+
 /// The origin the scripted switch of an account is reached at, unless a test routes
 /// another one to it.
 pub const SWITCH_ORIGIN: &str = "https://switch.example";
@@ -217,6 +220,26 @@ pub enum Fault {
         member: String,
         /// What the answer carries instead.
         value: Value,
+    },
+    /// Apply an own app's or the signer's request, then sign the answer with the key
+    /// `secret` makes instead of the account's, with no head, as a hostile or faulty
+    /// service would. An enrollment, a staged or erased account's refusal and a `401
+    /// stale_timestamp` are answered as without it, and use it up.
+    SignWith {
+        /// A part of the request's path and query.
+        path: String,
+        /// The secret of the key that signs the answer.
+        secret: [u8; 32],
+    },
+    /// [`Fault::Error`], the answer signed with the key `secret` makes instead of the
+    /// account's, with no head.
+    ErrorSignedWith {
+        /// A part of the request's path and query.
+        path: String,
+        /// The error code answered.
+        code: ErrorCode,
+        /// The secret of the key that signs the answer.
+        secret: [u8; 32],
     },
 }
 
@@ -916,6 +939,21 @@ impl ScriptedSwitch {
         Ok(())
     }
 
+    /// A service that frees a purged app's record (Switch wire 9.1): `app`, revoked or
+    /// departed and purged from `removed`, keeps its App ID for good, but its record and
+    /// receive key go, so every call of it but a first call meets the refusal of one, `403
+    /// not_current` without the head (Switch wire 7.2 "Where an own app gets `403
+    /// not_current`"). The service keeps them, and answers with the head.
+    pub fn purge(&self, app: [u8; 16]) {
+        let mut inner = self.lock();
+        let held = inner.apps.entry(app).or_default();
+        held.departed = true;
+        held.record = None;
+        held.cert = None;
+        held.receive_key = None;
+        held.receive_n = None;
+    }
+
     /// A faulty service: `app` stays revoked or departed, but `GET /apps` shows no time for it.
     pub fn forget_removal_time(&self, app: [u8; 16]) {
         let mut inner = self.lock();
@@ -1111,13 +1149,16 @@ impl ScriptedSwitch {
         let mut lose = false;
         let mut leave_out = None;
         let mut replace = None;
+        let mut sign_with = None;
         let matching = inner.faults.iter().position(|fault| match fault {
             Fault::Error { path: p, .. }
             | Fault::LoseAnswer { path: p }
             | Fault::LoseAnswerAfter { path: p, .. }
             | Fault::Unreachable { path: p, .. }
             | Fault::LeaveOut { path: p, .. }
-            | Fault::Replace { path: p, .. } => path.contains(p.as_str()),
+            | Fault::Replace { path: p, .. }
+            | Fault::SignWith { path: p, .. }
+            | Fault::ErrorSignedWith { path: p, .. } => path.contains(p.as_str()),
         });
         let passes = matching.is_some_and(|index| match inner.faults.get_mut(index) {
             Some(Fault::Unreachable { after, .. } | Fault::LoseAnswerAfter { after, .. })
@@ -1152,6 +1193,13 @@ impl ScriptedSwitch {
                 Some(Fault::LoseAnswer { .. } | Fault::LoseAnswerAfter { .. }) => lose = true,
                 Some(Fault::LeaveOut { member, .. }) => leave_out = Some(member),
                 Some(Fault::Replace { member, value, .. }) => replace = Some((member, value)),
+                Some(Fault::SignWith { secret, .. }) => sign_with = Some(secret),
+                Some(Fault::ErrorSignedWith { code, secret, .. }) => {
+                    let (status, body) = bad(code, "scripted", Value::Null);
+                    inner.seen(request);
+                    let key = SigningKey::from_bytes(&secret);
+                    return Ok(inner.respond_with(&key, request, status, &body));
+                }
                 Some(Fault::Unreachable { .. }) => {
                     inner.unreached.push(request.body.clone());
                     return Err(TransportError::Connect("scripted".into()));
@@ -1183,8 +1231,41 @@ impl ScriptedSwitch {
             }
             return Ok(inner.respond(request, status, &body));
         }
+        let stamped_before = inner.stamped_ms;
         if let Some(answer) = inner.stale_timestamp(request) {
             return Ok(answer);
+        }
+        let caller = request
+            .header(header::APP)
+            .and_then(|text| app_id_decode(text).ok());
+        let rest = path.splitn(4, '/').nth(3).unwrap_or_default().to_owned();
+        let account = inner.identity.public();
+        // An own app the switch holds no record for, at any call but a batch that carries
+        // its `app.put` (or doesn't parse, which the batch's checks refuse first): no key
+        // verifies the request, so authentication refuses it,
+        // whatever the route and before the account's lock, the staged and frozen answers
+        // included, as the service does: `403 not_current`, no head, the last committed
+        // time, and the app not seen (Switch wire 7.1 "`Switch-Head` on refusals", 7.2 "An
+        // own app's first call", 7.3 steps 5 to 8).
+        if let Some(app) = caller
+            && !(inner.erased || inner.enrolled.is_none())
+            && inbox::Sender::foreign(request, &account).is_none()
+            && !(request.method == "POST" && rest == "ops" && carries_app_put(&request.body, &app))
+            && inner
+                .apps
+                .get(&app)
+                .is_none_or(|held| held.record.is_none())
+        {
+            inner.stamped_ms = stamped_before;
+            if lose {
+                return Err(TransportError::Timeout);
+            }
+            let (status, body) = bad(
+                ErrorCode::NotCurrent,
+                "Switch wire 7.2: an own app's first call carries its app.put",
+                json!(null),
+            );
+            return Ok(inner.respond_at(&inner.service, request, status, &body, stamped_before));
         }
         if let Some((status, body)) = inner.gate(&request.method, &path) {
             // A staged account's refusal comes after authentication: the app was seen.
@@ -1196,11 +1277,6 @@ impl ScriptedSwitch {
             }
             return Ok(inner.respond(request, status, &body));
         }
-        let caller = request
-            .header(header::APP)
-            .and_then(|text| app_id_decode(text).ok());
-        let rest = path.splitn(4, '/').nth(3).unwrap_or_default().to_owned();
-        let account = inner.identity.public();
         if let Some(sender) = inbox::Sender::foreign(request, &account) {
             // An app of another identity: the routes a sender calls (Switch wire 7.2).
             let (status, body) = inner
@@ -1227,6 +1303,10 @@ impl ScriptedSwitch {
         }
         if let (Some((member, value)), Some(object)) = (replace, body.as_object_mut()) {
             object.insert(member, value);
+        }
+        if let Some(secret) = sign_with {
+            let key = SigningKey::from_bytes(&secret);
+            return Ok(inner.respond_with(&key, request, status, &body));
         }
         Ok(inner.respond(request, status, &body))
     }
@@ -1372,6 +1452,12 @@ impl ScriptedSwitch {
     /// takes from each app in an hour of its clock.
     pub fn set_uploads_per_app_per_hour(&self, uploads: u32) {
         self.lock().uploads_per_app_per_hour = uploads;
+    }
+
+    /// A `missed` item whose times don't parse, as a faulty service may write one (Switch
+    /// wire 7.4.4). Returns its `seq`.
+    pub fn push_missed_unparsable(&self, entries: u64) -> u64 {
+        self.push_missed(entries, UNPARSABLE_TIME, UNPARSABLE_TIME)
     }
 
     /// A `missed` item: `entries` entries accepted from `from` until `until` were deleted
@@ -2311,8 +2397,16 @@ impl Inner {
                 if of.is_some_and(|of| of != app) {
                     return None;
                 }
+                // A scripted item whose times don't parse ([`ScriptedSwitch::push_missed_unparsable`]).
+                let time = |at: u64| {
+                    if at == UNPARSABLE_TIME {
+                        json!("not a time")
+                    } else {
+                        json!(rfc3339(at))
+                    }
+                };
                 json!({ "type": "missed", "seq": seq, "entries": entries,
-                        "accepted_from": rfc3339(*from), "accepted_until": rfc3339(*until) })
+                        "accepted_from": time(*from), "accepted_until": time(*until) })
             }
         })
     }
@@ -2596,4 +2690,17 @@ impl Inner {
                     "apps_version": self.apps_version }),
         )
     }
+}
+
+/// Whether a `POST /ops` body can be an own app's first call (Switch wire 7.2): it doesn't
+/// parse, which the batch's own checks refuse first (Switch wire 6.4 step 2), or an
+/// `app.put` of the batch names `app`, as the service looks for it.
+fn carries_app_put(body: &[u8], app: &[u8; 16]) -> bool {
+    let Ok(parsed) = OpsRequest::parse(body) else {
+        return true;
+    };
+    parsed
+        .signed()
+        .filter_map(|doc| SignedOp::peek(doc).ok())
+        .any(|op| matches!((&op.body().kind, op.body().app_id), (OpKind::AppPut { .. }, Some(id)) if &id == app))
 }

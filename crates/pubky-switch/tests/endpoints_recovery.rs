@@ -341,6 +341,18 @@ async fn test_recovery_in_place_starts_afresh_under_the_pending_key() {
     )
     .await;
     let before = held(&replay).await;
+    // A pending connect request, which doesn't outlive the recovery (wire 7.4.7).
+    {
+        let mut conn = sqlx::PgConnection::connect_with(replay.db.options())
+            .await
+            .expect("conn");
+        sqlx::query("INSERT INTO connect_requests (account_id, pubky, at_ms) VALUES ($1, $2, 0)")
+            .bind(alice_id())
+            .bind([4u8; 32].as_slice())
+            .execute(&mut conn)
+            .await
+            .expect("a pending request");
+    }
     let recovery = next_generation(&before, pending, Some(1));
     let (answer, signature) = deliver(&replay, recovery, Some(before.hash()), at).await;
     assert_eq!(
@@ -1657,8 +1669,8 @@ async fn test_admission_needs_a_recovery_and_an_empty_body() {
 async fn test_admission_staged_holds_back_connect_requests_too() {
     // alice takes connect requests, so a stranger may deliver its document and ask to
     // connect. While admission is staged the deny list isn't back yet and a denied sender
-    // would pass for a stranger, so a stranger gets `503 staged` too; once it ends, its
-    // delivery is taken (Switch spec 12.6 step 2).
+    // would pass for a stranger, so a stranger gets `503 staged` too, at both calls; once it
+    // ends, its delivery is taken and its request kept (Switch spec 12.6 step 2).
     let Some(replay) = replay().await else { return };
     let (pending, at) = serving_with_a_pending_key(&replay).await;
     let before = held(&replay).await;
@@ -1679,8 +1691,23 @@ async fn test_admission_staged_holds_back_connect_requests_too() {
         "{}",
         String::from_utf8_lossy(&answer.body)
     );
+    let ask = || {
+        other_request(
+            "shop",
+            ORIGIN,
+            "POST",
+            &format!("/v1/{}/connect", alice_id()),
+            Vec::new(),
+            None,
+            at,
+        )
+    };
     let (peers, _) = from_shop(&replay, at).await;
     assert_eq!(code(&peers), (503, "staged".into()));
+    assert_eq!(
+        code(&replay.service.handle(ask()).await),
+        (503, "staged".into())
+    );
     assert_eq!(admission(&replay, Vec::new(), at).await.status, 200);
     let (peers, _) = from_shop(&replay, at).await;
     assert_eq!(
@@ -1688,6 +1715,13 @@ async fn test_admission_staged_holds_back_connect_requests_too() {
         200,
         "{}",
         String::from_utf8_lossy(&peers.body)
+    );
+    let asked = replay.service.handle(ask()).await;
+    assert_eq!(
+        asked.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&asked.body)
     );
     replay.db.drop_database().await.expect("drop");
 }
@@ -2961,4 +2995,47 @@ async fn test_recovery_in_place_and_a_sweep_at_the_same_moment_run_one_after_the
         conn.close().await.expect("close");
         replay.db.drop_database().await.expect("drop");
     }
+}
+
+#[tokio::test]
+async fn test_admission_staged_holds_back_connect_requests_whatever_the_policy() {
+    // The recovery document takes no connect requests: while admission is staged a
+    // stranger's `POST /connect` is still `503 staged` (decision: "whatever the policy"),
+    // and `403 not_admitted` once it ends.
+    let Some(replay) = replay().await else { return };
+    let (pending, at) = serving_with_a_pending_key(&replay).await;
+    let before = held(&replay).await;
+    let mut body: IdentityBody = before.body().clone();
+    body.version += 1;
+    body.generation += 1;
+    body.inbox.service_key = pending;
+    body.recovery_from = Some(1);
+    body.policy.connect_requests.enabled = false;
+    let recovery = IdentityDoc::sign(&alice_key(), body)
+        .expect("sign")
+        .signed()
+        .clone();
+    let (answer, _) = deliver(&replay, recovery, Some(before.hash()), at).await;
+    assert_eq!(answer.status, 200);
+    let ask = || {
+        other_request(
+            "shop",
+            ORIGIN,
+            "POST",
+            &format!("/v1/{}/connect", alice_id()),
+            Vec::new(),
+            None,
+            at,
+        )
+    };
+    assert_eq!(
+        code(&replay.service.handle(ask()).await),
+        (503, "staged".into())
+    );
+    assert_eq!(admission(&replay, Vec::new(), at).await.status, 200);
+    assert_eq!(
+        code(&replay.service.handle(ask()).await),
+        (403, "not_admitted".into())
+    );
+    replay.db.drop_database().await.expect("drop");
 }

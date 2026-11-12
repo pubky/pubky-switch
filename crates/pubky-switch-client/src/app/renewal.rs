@@ -15,7 +15,7 @@ use pubky_switch_core::sig::SignedDoc;
 
 use super::events::AppEvent;
 use super::state::{PendingRecord, Tx, key};
-use super::{App, AppError};
+use super::{App, AppError, Publication};
 use crate::client::Batch;
 use crate::error::ClientError;
 
@@ -106,7 +106,7 @@ impl App {
     /// The `app.put` batch. It is kept and may be sent again after the cursor moved on: a
     /// cursor move in it could take the service's cursor back, so it carries none (Switch
     /// spec 8.2).
-    fn record_batch(&self, record: &SignedDoc) -> Result<Batch, AppError> {
+    pub(crate) fn record_batch(&self, record: &SignedDoc) -> Result<Batch, AppError> {
         self.sign_ops(
             vec![(
                 Vec::<Condition>::new(),
@@ -118,25 +118,44 @@ impl App {
         )
     }
 
-    /// Send the kept `app.put` until answered. A `409 conflict` naming a record of this app
-    /// with an `updated_at` at or after this one's (another device's) is written again
-    /// once, later than the held one (Switch spec 4.2).
-    pub(crate) async fn deliver_record(&mut self) -> Result<(), AppError> {
+    /// Deliver what is owed of the record, then publish it (`own_record.rs`).
+    pub(crate) async fn deliver_record(&mut self) -> Result<Publication, AppError> {
+        let accepted = self.deliver_pending_record().await?;
+        self.publish_owed(false, accepted).await
+    }
+
+    /// Send the kept `app.put` until answered; returns whether the switch accepted a record
+    /// in this call. A `409 conflict` naming a record of this app with an `updated_at` at or
+    /// after this one's (another device's) is written again once, later than the held one
+    /// (Switch spec 4.2). One naming no record that verifies is taken as delivered only when
+    /// the switch's directory shows it holds this very record, as for a re-send of a batch
+    /// the switch applied and holds without its proofs (Switch wire 6.4 step 5); otherwise
+    /// it is refused, and nothing is noted or published. Once the switch holds the record,
+    /// an app that publishes owes it to the Homeserver, in the commit that records the
+    /// answer.
+    pub(crate) async fn deliver_pending_record(&mut self) -> Result<bool, AppError> {
         let Some(pending) = self.state.pending_record.clone() else {
-            return Ok(());
+            return Ok(false);
         };
-        let batch = Batch::from_body(pending.body)?;
+        let mut batch = Batch::from_body(pending.body)?;
         let result = self.submit(&batch).await;
         let held = match result {
             Ok(_) => None,
-            Err(AppError::Switch(ClientError::Switch {
-                code: ErrorCode::Conflict,
-                current,
-                ..
-            })) => current
-                .get("record")
-                .and_then(|value| SignedDoc::from_strict_value(value).ok())
-                .and_then(|doc| AppRecord::verify(&doc, &self.state.meta.identity).ok()),
+            Err(error) if error.code() == Some(ErrorCode::Conflict) => {
+                let named = match &error {
+                    AppError::Switch(ClientError::Switch { current, .. }) => current
+                        .get("record")
+                        .and_then(|value| SignedDoc::from_strict_value(value).ok())
+                        .and_then(|doc| AppRecord::verify(&doc, &self.state.meta.identity).ok()),
+                    _ => None,
+                };
+                // Boxed: the directory read is rare, and would otherwise widen every future
+                // that delivers a record.
+                if named.is_none() && !Box::pin(self.switch_holds(&batch)).await? {
+                    return Err(error);
+                }
+                named
+            }
             Err(error) => return Err(error),
         };
         if let Some(held) = held {
@@ -152,7 +171,7 @@ impl App {
                 .max(held.updated_at().saturating_add(1))
                 .max(mine.updated_at().saturating_add(1));
             let record = AppRecord::sign(&self.state.keys, body)?;
-            let batch = self.record_batch(record.signed())?;
+            batch = self.record_batch(record.signed())?;
             let mut tx = self.tx()?;
             tx.put(key::RECORD, record.signed())?;
             let pending = PendingRecord {
@@ -164,11 +183,28 @@ impl App {
             self.commit(tx).await?;
             self.submit(&batch).await?;
         }
+        let delivered = delivered_record(&batch)?;
         let mut tx = self.tx()?;
         tx.delete(key::PENDING_RECORD)?;
         tx.put(key::CURSOR, &self.state.cursor)?;
+        self.note_accepted(&delivered, &mut tx)?;
         self.state.pending_record = None;
-        self.commit(tx).await
+        self.commit(tx).await?;
+        self.took_accepted(delivered);
+        Ok(true)
+    }
+
+    /// Whether the switch's directory shows it holds, for this app, the record `batch`
+    /// delivers, byte for byte.
+    async fn switch_holds(&mut self, batch: &Batch) -> Result<bool, AppError> {
+        let record = delivered_record(batch)?;
+        let me = self.state.meta.app_id;
+        let result = self.client.directory(None).await;
+        let directory = self.take(result).await?;
+        Ok(directory
+            .apps
+            .iter()
+            .any(|app| app.app_id == me && app.record.signed() == &record))
     }
 
     /// The listed certificate from the own record in the directory, when the own
@@ -234,4 +270,16 @@ pub(crate) enum Listed {
     Key(Option<pubky_switch_core::records::ReceiveKeyRecord>),
     /// The newest own `identity.json` removes the app or names another generation.
     NotCurrentHere,
+}
+
+/// The record a kept `app.put` batch delivers.
+pub(crate) fn delivered_record(batch: &Batch) -> Result<SignedDoc, AppError> {
+    batch
+        .ops()
+        .iter()
+        .find_map(|op| match &op.body().kind {
+            OpKind::AppPut { record } => Some(record.clone()),
+            _ => None,
+        })
+        .ok_or_else(|| AppError::InvalidData("a kept app.put batch carries no record".into()))
 }

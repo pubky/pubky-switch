@@ -2,15 +2,20 @@
 //! Homeserver, and a neutral sample protocol. Keys come from the test seeds.
 
 mod flows;
+mod forget;
 mod held_reads;
 mod kept_status;
 mod moves;
+mod not_registered;
+mod own_record;
 mod parked;
 mod passed;
 mod protocol_api;
 mod protocol_reads;
 mod push;
+mod send_futures;
 mod sender_document;
+mod sender_key;
 mod shared_flows;
 mod store_failures;
 mod unverified;

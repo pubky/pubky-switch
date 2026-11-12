@@ -21,7 +21,8 @@
 //! ([`App::sign_message`]), or alone ([`App::protocol_commit`]).
 //!
 //! Async is used only at the network edge: the switch, through the base client, the store,
-//! through [`StoreHandle`], and the Homeserver, through [`HomeserverReader`].
+//! through [`StoreHandle`], and the Homeserver, through [`HomeserverReader`] and, for an
+//! app that publishes its record, [`HomeserverWriter`].
 //!
 //! Moves, provider loss and recovery, revocation and erasure as an app sees them, and push
 //! with its peek, are in `provider.rs`, `recovery.rs`, `push.rs` and `peek.rs`.
@@ -38,9 +39,11 @@ mod chain;
 mod error;
 mod events;
 mod feed;
+mod forget;
 mod identity;
 mod kept;
 mod keys;
+mod own_record;
 mod parked;
 mod peek;
 mod protocol;
@@ -74,6 +77,7 @@ pub use events::{
 pub use feed::{ReceiveReport, SENDER_REREAD_MS};
 pub use identity::{DOC_CACHE_MS, HomeserverReader, IdentityRefresh, REVALIDATION_MS};
 pub use kept::{KeptBatch, KeptBatchDrop, KeptBatchStatus};
+pub use own_record::{HomeserverWriter, PUBLISHED_CHECK_MS, Publication};
 pub use parked::{ParkedMessage, ParkedSummary};
 pub use peek::{PeekReport, Peeked};
 pub use protocol::{
@@ -187,8 +191,9 @@ pub struct AppConfig {
     pub cursor_defer_ms: u64,
     /// Items per feed page, 1 to 500.
     pub page_size: u32,
-    /// Whether the app publishes its record on the Homeserver; such an app leaves in two
-    /// steps (Switch spec 12.3).
+    /// Whether the app publishes its record on the Homeserver, as an app whose protocol
+    /// needs public data does (Switch spec 4.2); such an app leaves in two steps (Switch spec
+    /// 12.3). It needs [`AppEnv::homeserver_writer`].
     pub publishes_record: bool,
 }
 
@@ -219,8 +224,8 @@ impl AppConfig {
     }
 }
 
-/// What an app runs on: the host's store, the transport to its switch, the clock and the
-/// Homeserver reader.
+/// What an app runs on: the host's store, the transport to its switch, the clock, the
+/// Homeserver reader and, for an app that publishes its record, the Homeserver writer.
 #[derive(Clone)]
 pub struct AppEnv {
     /// The host's store.
@@ -231,6 +236,9 @@ pub struct AppEnv {
     pub clock: Arc<dyn Clock>,
     /// Reads of Homeservers.
     pub homeserver: Arc<dyn HomeserverReader>,
+    /// Writes to the own identity's Homeserver, for an app that publishes its record
+    /// ([`AppConfig::publishes_record`]); `None` for one that doesn't.
+    pub homeserver_writer: Option<Arc<dyn HomeserverWriter>>,
 }
 
 impl std::fmt::Debug for AppEnv {
@@ -331,7 +339,13 @@ pub struct AppBackup {
     meta: Meta,
     keys: AppKeys,
     cert: SignedDoc,
+    /// The record the app presents, which may be one the switch hasn't accepted yet.
     record: SignedDoc,
+    /// The newest record the switch accepted from the app (`record/accepted`), apart from
+    /// `record`: a restore publishes this one, never `record` (Switch spec 4.2). Absent from
+    /// a backup of an app the switch accepted no record from that it knows of.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    accepted: Option<SignedDoc>,
     naming: NamingKey,
     scope_keys: Vec<ScopeKey>,
     own_doc: SignedDoc,
@@ -527,6 +541,11 @@ pub(crate) struct AppState {
     pub(crate) join: JoinStep,
     pub(crate) pending_effect: Option<PendingEffect>,
     pub(crate) pending_record: Option<PendingRecord>,
+    /// The record the switch holds and the Homeserver is still owed (`pending/publish`).
+    pub(crate) pending_publish: Option<SignedDoc>,
+    /// The newest record the switch accepted from the app (`record/accepted`), the one a
+    /// publication writes.
+    pub(crate) accepted: Option<SignedDoc>,
     pub(crate) alarm: Option<Alarm>,
     pub(crate) restore: Option<RestoreState>,
     pub(crate) leave: Option<LeaveState>,
@@ -577,8 +596,18 @@ pub struct App {
     /// (`feed.rs`, [`SENDER_REREAD_MS`]). Kept in memory only: it bounds the reads, and a
     /// restart may read once more.
     sender_rereads: HashMap<[u8; 32], feed::SenderReread>,
+    /// When an answer of each recipient's switch that didn't verify last had its
+    /// `identity.json` read again (`send.rs`, [`SENDER_REREAD_MS`]), device clock. Kept in
+    /// memory only: it bounds the reads, and a restart may read once more.
+    peer_rereads: HashMap<[u8; 32], u64>,
     /// How many reads ([`App::receive`]) this app began since it was loaded.
     reads_begun: u64,
+    /// When the Homeserver copy of the app's record was last read to compare it with the
+    /// newest record the switch accepted, device clock (`own_record.rs`). In memory only.
+    published_checked_ms: Option<u64>,
+    /// When this app last asked for its full key bundle, device clock (`keys.rs`,
+    /// [`keys::KEY_REQUEST_RETRY_MS`]). In memory only.
+    bundle_asked_ms: Option<u64>,
 }
 
 impl std::fmt::Debug for App {
@@ -681,6 +710,7 @@ impl App {
         request: JoinRequest,
     ) -> Result<App, AppError> {
         Box::pin(async move {
+            own_record::check_publisher(&env, &config)?;
             let approved = Approval::read(
                 &request.approval,
                 &request.request,
@@ -778,6 +808,8 @@ impl App {
                 },
                 pending_effect: None,
                 pending_record: None,
+                pending_publish: None,
+                accepted: None,
                 alarm: None,
                 restore: None,
                 leave: None,
@@ -804,6 +836,9 @@ impl App {
                 kept_rate_limited: None,
                 loss_upload_wait: None,
                 sender_rereads: HashMap::new(),
+                published_checked_ms: None,
+                bundle_asked_ms: None,
+                peer_rereads: HashMap::new(),
                 reads_begun: 0,
             };
             app.update_keys_through();
@@ -886,8 +921,15 @@ impl App {
         }
         tx.put(key::CURSOR, &self.state.cursor)?;
         tx.put(key::JOIN, &self.state.join)?;
+        // The switch holds the record now: an app that publishes owes it to the Homeserver
+        // (Switch spec 12.1 step 2).
+        let record = renewal::delivered_record(&batch)?;
+        self.note_accepted(&record, &mut tx)?;
         self.state.chain = Some(view);
-        self.commit(tx).await
+        self.commit(tx).await?;
+        self.took_accepted(record);
+        self.publish_owed(false, true).await?;
+        Ok(())
     }
 
     /// Load an app from the store alone: nothing is sent. Work left by a crash (a
@@ -904,6 +946,7 @@ impl App {
         app_id: [u8; 16],
     ) -> Result<App, AppError> {
         Box::pin(async move {
+            own_record::check_publisher(&env, &config)?;
             let ns = client_namespace(&app_id);
             let reader = Reader {
                 ns: ns.clone(),
@@ -928,6 +971,9 @@ impl App {
                 kept_rate_limited: None,
                 loss_upload_wait: None,
                 sender_rereads: HashMap::new(),
+                published_checked_ms: None,
+                bundle_asked_ms: None,
+                peer_rereads: HashMap::new(),
                 reads_begun: 0,
             };
             // A store an earlier build wrote keeps the epoch read now.
@@ -1009,6 +1055,8 @@ impl App {
             join: reader.get(key::JOIN).await?.ok_or_else(missing)?,
             pending_effect: reader.get(key::PENDING_EFFECT).await?,
             pending_record: reader.get(key::PENDING_RECORD).await?,
+            pending_publish: reader.get(key::PENDING_PUBLISH).await?,
+            accepted: reader.get(key::ACCEPTED_RECORD).await?,
             alarm: reader.get(key::ALARM).await?,
             restore: reader.get(key::RESTORE).await?,
             leave,
@@ -1098,6 +1146,7 @@ impl App {
             keys: state.keys.clone(),
             cert: state.cert.signed().clone(),
             record: state.record.clone(),
+            accepted: state.accepted.clone(),
             naming: state.naming.clone(),
             scope_keys: state.scope_keys.keys.clone(),
             own_doc: state.own_doc.signed().clone(),
@@ -1379,8 +1428,9 @@ impl App {
     /// another protocol, or a protocol without a backup name, made, or for one the protocol
     /// refuses; [`Refusal::CarriedTooLarge`] for a restore in place whose backup fits one
     /// commit but not with the duty events and owed calls the store would carry beside it;
-    /// a store failure, writes over the store's sizes included. Nothing is written on any
-    /// of them.
+    /// [`Refusal::Usage`] for an app that publishes its record without a Homeserver writer
+    /// ([`AppEnv::homeserver_writer`]); a store failure, writes over the store's sizes
+    /// included. Nothing is written on any of them.
     pub async fn restore(
         env: AppEnv,
         protocol: Arc<dyn Protocol>,
@@ -1422,6 +1472,8 @@ impl App {
         layer_check: LayerCheck,
     ) -> Result<Restorable, AppError> {
         Box::pin(async move {
+            // As at a join and a load: an app that publishes needs its writer.
+            own_record::check_publisher(&env, &config)?;
             let meta = backup.meta.clone();
             let invalid = |why: &str| AppError::InvalidData(format!("the backup: {why}"));
             let cert = AppCert::verify(&backup.cert, &meta.identity)
@@ -1437,6 +1489,16 @@ impl App {
                 .map_err(|_| invalid("its app record doesn't verify"))?;
             if record.cert().hash() != cert.hash() {
                 return Err(invalid("its app record carries another certificate"));
+            }
+            // The newest record the switch accepted is the app's own, signed with its key.
+            if let Some(accepted) = &backup.accepted {
+                let accepted = AppRecord::verify(accepted, &meta.identity)
+                    .map_err(|_| invalid("its accepted app record doesn't verify"))?;
+                if accepted.cert().app_id() != meta.app_id
+                    || accepted.cert().signing_key() != backup.keys.signing_public()
+                {
+                    return Err(invalid("its accepted app record isn't its keys'"));
+                }
             }
             let own_doc = IdentityDoc::verify(&backup.own_doc, &meta.identity)
                 .map_err(|_| invalid("its identity.json doesn't verify"))?;
@@ -1569,6 +1631,13 @@ impl App {
                 join: JoinStep::Done,
                 pending_effect: None,
                 pending_record: None,
+                pending_publish: None,
+                // The newest record the switch accepted, as the backup carries it apart from
+                // the record held, which may be one whose `app.put` was refused or never
+                // answered: only the accepted one is published, and never over a later
+                // Homeserver copy (Switch spec 4.2). The record held goes to the switch again
+                // only with the next change the protocol makes (`own_record.rs`).
+                accepted: backup.accepted.clone(),
                 alarm: None,
                 restore: Some(RestoreState {
                     n_floor,
@@ -1628,6 +1697,9 @@ impl App {
                 kept_rate_limited: None,
                 loss_upload_wait: None,
                 sender_rereads: HashMap::new(),
+                published_checked_ms: None,
+                bundle_asked_ms: None,
+                peer_rereads: HashMap::new(),
                 reads_begun: 0,
             };
             // Every write of the one commit; what fails here is mostly a write the store
@@ -1696,6 +1768,9 @@ impl App {
         tx.put(key::KEYS, &s.keys)?;
         tx.put(key::CERT, s.cert.signed())?;
         tx.put(key::RECORD, &s.record)?;
+        if let Some(accepted) = &s.accepted {
+            tx.put(key::ACCEPTED_RECORD, accepted)?;
+        }
         tx.put(key::NAMING, &s.naming)?;
         for scope_key in &s.scope_keys.keys {
             tx.put(
@@ -2227,8 +2302,9 @@ impl App {
     /// Leave the identity (Switch spec 12.3): `leave` at the service, then the keys go: at
     /// once for [`LeaveMode::Immediate`], or once the signer published the app as removed
     /// and readers' caches passed for [`LeaveMode::TwoStep`] ([`App::finish_leave`]).
-    /// Deleting the app's Homeserver record, where it publishes one, is the host's, before
-    /// this call.
+    /// An app that publishes its record deletes it from the Homeserver first, and publishes
+    /// nothing from the commit that starts the leave on, across a restart too (Switch spec
+    /// 12.3).
     ///
     /// # Errors
     ///
@@ -2318,6 +2394,24 @@ impl App {
             tx.put(key::LEAVE, &leave)?;
             self.state.leave = Some(leave);
             self.commit(tx).await?;
+        }
+        // A publishing app deletes its Homeserver record first (Switch spec 12.3); the leave
+        // committed above stops every publication from here on. Only a two-step leave waits
+        // for the delete: an immediate leave, and a compromise's, which leaves at once
+        // (Switch spec 3.6), go on without it, the failure reported, and the signer's
+        // clean-up deletes the record (Switch spec 12.2 step 4).
+        let waits = self
+            .state
+            .leave
+            .is_some_and(|leave| leave.two_step && !leave.compromise);
+        match self.unpublish_to_leave().await {
+            Ok(()) => {}
+            Err(AppError::Transport(error)) if !waits => {
+                self.events.push(AppEvent::RecordPublishFailed {
+                    error: error.to_string(),
+                });
+            }
+            Err(error) => return Err(error),
         }
         let result = self.client.leave().await;
         let answered = match self.take(result).await {

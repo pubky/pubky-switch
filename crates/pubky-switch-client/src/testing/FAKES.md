@@ -84,7 +84,11 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   certificate expires while its read is held is refused once the read is answered, where
   the service refuses it at the account's next commit; the answer is the same. Faults and
   the stale-timestamp check apply when the read is answered, not when it arrives.
-  `held_reads` counts the reads held and not woken since they last looked.
+  `held_reads` counts the reads held and not woken since they last looked. Unlike the
+  service, every request the switch answers first wakes every held read to look again
+  (`wake_held`), and a read with nothing to show then waits on. So a missing specific wake
+  (at a chained item, `start_afresh` or an erasure) is covered by the next request's: a test
+  sees it only if nothing else reaches the switch while the read is held.
 - **Retention and sweeps** (Switch wire 9.1, 7.4.4): an entry goes once every current
   target that isn't lagging has passed it, as at the service, judged at cursor moves, at
   appends and at deliveries, revocations and leaves (`keep_passed_entries` turns that off
@@ -96,7 +100,7 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   `unreadable` item with the entry's `entry_id`. The quota refuses nothing here: no append
   is `429 quota_exceeded`, so a full inbox with no app reading, where the service refuses
   senders, isn't shown. Marks are judged at every such request, the switch's clock being
-  trusted. A scripted `missed` item (`push_missed`) is shown to every app and a scripted
+  trusted. A scripted `missed` item (`push_missed`, or `push_missed_unparsable` for one whose times don't parse) is shown to every app and a scripted
   `unreadable` item (`push_unreadable`) has an `entry_id` of its own, and both stay
   whatever the cursors. Checkpoints and dropped stubs exist only when a test scripts them;
   claims are deleted only when `GET /claims` finds them deletable; batch records are never
@@ -117,7 +121,23 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   as at the service; until then `invite_uses_left` still shows a spent code at 0. Unlike
   the service, any request sweeps, a signer's or a caller's that doesn't verify included,
   and none waits for trusted time, the switch's clock being trusted.
-- **Lists**: `flagged` is always empty; connect requests are never full.
+- **Lists**: `flagged` is always empty.
+- **Connect requests** (Switch wire 7.4.7), in `switch/inbox.rs` `connect` and
+  `switch/shared.rs`: as at the service (`crates/pubky-switch/src/service/connect.rs`), in its
+  order: `503 staged` while admission is staged, whatever the policy; `403 not_admitted` with
+  the policy off; check 5 by the sender's certificate: the copy lists the app with it, or
+  a renewal of it still open, a closed renewal being `403 not_current`, and otherwise `409
+  identity_needed` naming the held version, or none when the copy lists the app as
+  removed; a sender already pending answered `pending`; the policy's `max_pending`, capped at the
+  wire's default `max_connect_pending` (1,000), refusing a new sender `429 quota_exceeded`
+  before the deny list; a denied sender answered `pending`, its request not kept. `GET
+  /connect` needs `lists.read`, `DELETE /connect/{pubky}` `conversation.add`, and an own app's
+  or the signer's `POST /connect` is `403 permission_missing`. A contact, a conversation
+  entry or a deny list entry for the sender answers its request, the entry an invite code's
+  first append writes and the entries a recovery upload's list merge writes included. Unlike the service: no `connect_per_min` or
+  `stranger_per_min` (no rates, above), and no flag hits. A sender the allowlist admits is
+  answered `pending` with nothing kept, as at the service. Neither switch sends the push
+  `policy.connect_requests.push` asks for yet: push isn't served.
 - **Records**: `divergent` is set by divergent uploads after a provider loss and cleared
   by a write here, as at the service (Recovery uploads, below).
 - **Directory** (Switch wire 7.4.10): an app is reachable from its first receive key until
@@ -156,9 +176,8 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
   and `after` must be `b64(32)`, and `limit` digits from 1 to 1000 (`400`); a record by key
   needs its `read_scope` (`403 permission_missing`, with the head), and a list shows only
   the records whose `read_scope` the reader holds, by the certificate the switch checks the
-  app against. Unlike the service, which answers an own app it holds no certificate for
-  `401` at authentication, this switch serves it as one holding no scope: `403` by key and
-  an empty list. Order by the key text, `after`
+  app against. An own app it holds no record for meets the first-call refusal below, as
+  at the service, before its query or key is read. Order by the key text, `after`
   as a key's text, `next`, the byte budget with its first view shown, deleted records shown
   by key and left out of lists, and a view's `cert`, the certificate the write was checked
   against, kept with the record whatever a renewal or revocation later changes, are the
@@ -177,9 +196,20 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
 - **`409 identity_needed`** to an app of another identity carries `known_version` beside
   `current`, `null` for no copy held or as to a stranger (Switch wire 7.1, 7.6), at the
   inbox, here and at the peer switch (`peer.rs`). Both also serve `POST /connect` and
-  answer it so; the service doesn't serve it yet (`503 unavailable`).
+  answer it so.
 - **`open_admission`** (`admit_everyone`) admits every sender the deny list doesn't hold, a
   test switch only.
+- **An own app's first call** (Switch wire 7.1 "`Switch-Head` on refusals", 7.2), as at
+  the service (`crates/pubky-switch/src/service/batch/mod.rs`, `verify_own_app`): an own
+  app the switch holds no record for, at any call but a `POST /ops` whose batch carries its
+  `app.put` or doesn't parse, gets `403 not_current`
+  at authentication, before the account's lock and before a staged or frozen account's
+  answer (Switch wire 7.3 steps 5 to 8), whatever the route: no `Switch-Head`,
+  `Switch-Server-Time` the last time stamped, and the app not seen. A departed app that
+  delivered its record keeps it, so it goes on to the route's checks, as at the service,
+  until the test call `purge` frees it, as a service may once the signer purges the app
+  from `removed` (Switch wire 9.1): then it meets the first call's refusal, without the
+  head. The service keeps a purged app's record, so it answers that app with the head.
 - **App currency outside batches**: a feed read is checked as a batch is, for an app that
   delivered its record: current, with an unexpired certificate, the stored renewed one once
   the newest `identity.json` lists it (Switch wire 7.2, 3.8). Other routes check only that
@@ -312,7 +342,10 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
 - **`Fault::LeaveOut`** scripts a faulty service whose answer to an own app or the signer
   leaves out a top-level member, such as a feed page's `items`; **`Fault::Replace`** one
   whose answer carries another value for it, such as `GET /apps`' `identity` replaced by a
-  copy that doesn't verify.
+  copy that doesn't verify; **`Fault::SignWith`** one that applies the request and signs
+  its answer with another key, such as a third key, or the key a recovery in place leaves,
+  signing the delivery that starts the new generation; **`Fault::ErrorSignedWith`** an
+  error answer under another key, applying nothing.
 - **Erasure** (Switch wire 7.4.16), in `switch/signer.rs`: `POST /erase` checks the body names
   the account's service key (`409 conflict` for another) and, when it names one, the hash of
   the `identity.json` this switch holds (`409 conflict` for another, or for none held), and
@@ -342,6 +375,8 @@ switch and the service shows there:
 - approval, renewals and reductions, a reduction's closing with its publication failing,
   rotations over several epochs, and an epoch completed after a rotation was given up at a
   batch (`crates/pubky-switch-signer/tests/approval.rs`, `renewal.rs`);
+- an approval with a protocol's grant paths declined, the paths allowed at a later
+  request, and a decline the protocol's rule refuses (`grant_paths.rs`);
 - revocations and departures, the time a removal counts from, full-bundle requests, the
   record's cleanup and the purge, a revocation past a read that failed and one asked for
   during a recovery (`revocation.rs`, `recovery.rs`);
@@ -357,9 +392,16 @@ switch and the service shows there:
   place, declared again, refused, its staged admission ended, and restored mid-recovery
   (`recovery.rs`).
 
+A grant path the user declines at an approval (Switch spec 3.4) needs nothing here: the
+declines change only the Pubky grant the host approves, never the certificate, the version
+or the key bundle, so the switch's traffic is the same as for an approval that allows them.
+
 Not every honest path has a flow there. Among those without one: a stale backup refused at
-a restore, a Homeserver that holds another body at a restore, and a restore in place below
-the signer's mark (`restore.rs`).
+a restore, a Homeserver that holds another body at a restore, a restore in place below
+the signer's mark (`restore.rs`), and a restore on a new install from a backup a recovery in
+place wrote before its version reached the service, which answers under the key it served
+with until then (`recovery.rs`): the scripted switch serves under the account's key and holds
+the pending key apart, as the service does, so it needs nothing more for it.
 
 What stays only on the scripted switch, and why:
 
@@ -370,8 +412,8 @@ What stays only on the scripted switch, and why:
   what the signer does about them.
 - **A delivery refused for good,** other than a recovery's version over the service's app
   limit: a `400` to any other version (an ordinary or a renewing version, a restore's next
-  version), a take-over refused, or a `413 too_large`. No conforming signer meets these at
-  the service, so the tests script the refusal.
+  version), a take-over refused `400`, or a `413 too_large`. No conforming signer meets
+  these at the service, so the tests script the refusal.
 - **Exact timing.** A crash at each commit of a flow, a store that fails or can't tell
   whether it committed, and an answer lost at one chosen call among several alike: the
   tests place these by a commit's or a request's number.
@@ -386,6 +428,9 @@ What stays only on the scripted switch, and why:
 ## The test Homeserver
 
 `homeserver.rs` holds public files in memory, as a Homeserver serves them, with no
-authentication. `set_down` makes every read fail to connect, and `identity_reads` counts the
-reads of an identity's `identity.json`, those that failed included, so a test can bound how
-often the app reads a counterparty's document.
+authentication: an app's writes through `HomeserverWriter` go to any path of the identity it
+names, where a Homeserver checks the app's grant (Switch spec 3.4). `set_down` makes every
+read and write fail to connect, and `identity_reads` counts the reads of an identity's
+`identity.json`, those that failed included, so a test can bound how often the app reads a
+counterparty's document. `fail_writes` fails the next writes, refused or with the answer
+lost after the file is written, and `writes` counts the writes of a path.

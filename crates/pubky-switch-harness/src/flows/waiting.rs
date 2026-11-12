@@ -4,10 +4,10 @@
 use std::cell::Cell;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::task::{Context, Poll, Wake, Waker};
 use std::time::Duration;
-
-use futures_util::StreamExt;
-use futures_util::stream::FuturesUnordered;
 
 use pubky_switch_client::app::{App, AppConfig, RecordTarget};
 use pubky_switch_core::records::IDENTITY_PATH;
@@ -93,7 +93,7 @@ pub async fn waiting_read(world: &World) -> FlowResult {
             .await
     };
     let both = each_on_its_own_wake(read, write);
-    let Ok(Some((read, written))) = tokio::time::timeout(STEP_TIMEOUT, both).await else {
+    let Ok((read, written)) = tokio::time::timeout(STEP_TIMEOUT, both).await else {
         return Err("the write didn't answer the waiting read: the read is still held".into());
     };
     written?;
@@ -116,33 +116,67 @@ pub async fn waiting_read(world: &World) -> FlowResult {
     Ok(())
 }
 
+/// What tells a future of a pair that its own waker fired.
+struct OwnWake {
+    /// Set when the future's waker fires, and at the start.
+    fired: AtomicBool,
+    /// The waker of whoever polls the pair.
+    pair: Mutex<Option<Waker>>,
+}
+
+impl Wake for OwnWake {
+    fn wake(self: Arc<Self>) {
+        self.fired.store(true, Ordering::SeqCst);
+        let pair = self.pair.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(pair) = pair.as_ref() {
+            pair.wake_by_ref();
+        }
+    }
+}
+
+/// A future polled once at the start, and then only after its own waker fired.
+struct OnOwnWake<F> {
+    inner: Pin<Box<F>>,
+    wake: Arc<OwnWake>,
+}
+
+impl<F: Future> OnOwnWake<F> {
+    fn new(inner: F) -> Self {
+        Self {
+            inner: Box::pin(inner),
+            wake: Arc::new(OwnWake {
+                fired: AtomicBool::new(true),
+                pair: Mutex::new(None),
+            }),
+        }
+    }
+}
+
+impl<F: Future> Future for OnOwnWake<F> {
+    type Output = F::Output;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<F::Output> {
+        *self
+            .wake
+            .pair
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(cx.waker().clone());
+        if !self.wake.fired.swap(false, Ordering::SeqCst) {
+            return Poll::Pending;
+        }
+        let own = Waker::from(Arc::clone(&self.wake));
+        self.inner.as_mut().poll(&mut Context::from_waker(&own))
+    }
+}
+
 /// Run a held read and the call that is to wake it to their ends, each polled only when
-/// its own waker fires. Joined as one future, the read would be polled again whenever the
-/// other call moved, and a switch that never woke it would pass. `None` when one of the
-/// two never ended.
+/// its own waker fires. Joined as they are, the read would be polled again whenever the
+/// other call moved, and a switch that never woke it would pass.
 async fn each_on_its_own_wake<A, B>(
     read: impl Future<Output = A>,
     act: impl Future<Output = B>,
-) -> Option<(A, B)> {
-    enum Ended<A, B> {
-        Read(A),
-        Act(B),
-    }
-    let read: Pin<Box<dyn Future<Output = Ended<A, B>> + '_>> =
-        Box::pin(async { Ended::Read(read.await) });
-    let act: Pin<Box<dyn Future<Output = Ended<A, B>> + '_>> =
-        Box::pin(async { Ended::Act(act.await) });
-    let mut running = FuturesUnordered::new();
-    running.push(read);
-    running.push(act);
-    let (mut read, mut acted) = (None, None);
-    while let Some(ended) = running.next().await {
-        match ended {
-            Ended::Read(ended) => read = Some(ended),
-            Ended::Act(ended) => acted = Some(ended),
-        }
-    }
-    read.zip(acted)
+) -> (A, B) {
+    futures_util::future::join(OnOwnWake::new(read), OnOwnWake::new(act)).await
 }
 
 /// `app` follows its feed to the end and moves its cursor: the events it raises at this
@@ -209,7 +243,7 @@ pub async fn waiting_read_erased(world: &World) -> FlowResult {
             .await
     };
     let both = each_on_its_own_wake(read, erase);
-    let Ok(Some((_, erased))) = tokio::time::timeout(STEP_TIMEOUT, both).await else {
+    let Ok((_, erased)) = tokio::time::timeout(STEP_TIMEOUT, both).await else {
         return Err("the held read wasn't answered: it is still held".into());
     };
     erased?;
@@ -278,7 +312,7 @@ pub async fn waiting_read_revoked(world: &World) -> FlowResult {
     let both = each_on_its_own_wake(read, revoke);
     let both = tokio::time::timeout(STEP_TIMEOUT, both).await;
     world.let_go();
-    let Ok(Some((report, revoked))) = both else {
+    let Ok((report, revoked)) = both else {
         return Err("the held read wasn't answered: it is still held".into());
     };
     revoked?;
@@ -331,8 +365,8 @@ pub async fn waiting_read_revoked(world: &World) -> FlowResult {
 ///
 /// When a step that should succeed against any switch fails, the switch answers the read
 /// without holding it or leaves it held, the read is answered otherwise than `503
-/// unavailable` under the operator key with no head, or the watch's next read isn't the
-/// new chain's first item.
+/// unavailable` under the operator key with no head, the watch takes that answer for more
+/// than a failed read, or its next read isn't the new chain's first item.
 pub async fn waiting_read_recovered(world: &World) -> FlowResult {
     let alice = world.identity("alice")?;
     world.add_switch(ORIGIN, &[&alice]).await?;
@@ -371,7 +405,7 @@ pub async fn waiting_read_recovered(world: &World) -> FlowResult {
             .await
     };
     let both = each_on_its_own_wake(read, recover);
-    let Ok(Some((report, recovered))) = tokio::time::timeout(STEP_TIMEOUT, both).await else {
+    let Ok((report, recovered)) = tokio::time::timeout(STEP_TIMEOUT, both).await else {
         return Err("the held read wasn't answered: it is still held".into());
     };
     if !held_then.get() {
@@ -380,12 +414,13 @@ pub async fn waiting_read_recovered(world: &World) -> FlowResult {
     let delivered = signer
         .identity_doc()?
         .ok_or("the signer holds no document")?;
+    let raised = watch.take_events();
     world.outcome(
         "the signer recovered in place while the watch's read was held",
         &json!({
             "held_when_the_signer_acted": held_then.get(),
             "the read": ended(&report),
-            "events": events(&watch.take_events()),
+            "events": events(&raised),
             "the recovery": ended(&recovered),
             "generation": delivered.generation(),
             "signer": status(&signer)?,
@@ -431,6 +466,18 @@ pub async fn waiting_read_recovered(world: &World) -> FlowResult {
         )
         .into());
     }
+    // The watch takes that answer for nothing of the account's: its read ends in an error,
+    // it raises no event, and it stands where it stood, in the generation it knew.
+    let stands = watch.cursor().generation;
+    if report.is_ok() || !raised.is_empty() || stands != 1 {
+        return Err(format!(
+            "the watch's read ended {} with the events {:?}, and it stands in generation \
+             {stands}",
+            ended(&report),
+            events(&raised)
+        )
+        .into());
+    }
     world.advance_ms(STEP_MS);
 
     signer.run_due().await?;
@@ -453,4 +500,56 @@ pub async fn waiting_read_recovered(world: &World) -> FlowResult {
     expect_upload(world, "watch", false)?;
     look(world, &mut watch, "the watch after the recovery").await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pending at its first poll without keeping its waker; done at a second poll.
+    struct NeverWoken<'a>(&'a Cell<u32>);
+
+    impl Future for NeverWoken<'_> {
+        type Output = ();
+
+        fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+            self.0.set(self.0.get() + 1);
+            if self.0.get() > 1 {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_future_no_one_woke_is_not_polled_when_the_other_moves() {
+        let polls = Cell::new(0);
+        let moves = async {
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+        };
+        let both = each_on_its_own_wake(NeverWoken(&polls), moves);
+        let ended = tokio::time::timeout(Duration::from_millis(200), both).await;
+        assert!(ended.is_err(), "the future no one woke was polled again");
+        assert_eq!(polls.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_each_future_runs_to_its_end_on_its_own_wakes() {
+        let counts = async {
+            let mut steps = 0;
+            for _ in 0..3 {
+                tokio::task::yield_now().await;
+                steps += 1;
+            }
+            steps
+        };
+        let sleeps = async {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            "slept"
+        };
+        assert_eq!(each_on_its_own_wake(counts, sleeps).await, (3, "slept"));
+    }
 }

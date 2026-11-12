@@ -390,6 +390,17 @@ pub(crate) struct SignerState {
     /// (Switch wire 3.7, 7.4.2).
     #[serde(default)]
     pub(crate) recovery_services: Vec<Service>,
+    /// A recovery declared in place, at the service that served the lost generation: that
+    /// service, under the key it served the lost generation with. Until it takes the
+    /// recovery's version it signs every answer with that key, but the `200` of the delivery
+    /// that starts the new generation, which the pending key the version names signs (Switch
+    /// wire 3.13, 7.4.1, 7.4.2). So the signer pins this key while the recovery goes there,
+    /// and the delivery's `200` alone is checked with the pending key. Dropped with the
+    /// recovery's other records once its version is delivered, and as soon as an answer under
+    /// the key the version names shows the lost generation served there no more: that version
+    /// taken, by this install or another, or the account one the enrollment made.
+    #[serde(default)]
+    pub(crate) recovery_serving: Option<Service>,
     /// The recovery's version that a service took names another install: a restore's, from
     /// a backup written mid-recovery. This install signs the next version naming itself, as
     /// a restore does (Switch wire 3.13).
@@ -492,7 +503,8 @@ pub(crate) struct PendingClaim {
     pub(crate) app_id: [u8; 16],
     /// The document hash of its certificate.
     pub(crate) cert: [u8; 32],
-    /// The capabilities of the Pubky grant, as the auth request carries them.
+    /// The capabilities to approve the Pubky grant for: those the auth request asks for, in
+    /// its order, less the paths the user declined (Switch spec 3.4).
     pub(crate) caps: String,
     /// The claim's plaintext: the approval's JSON bytes, then the identity key's signature.
     #[serde(with = "pubky_switch_core::enc::serde_b64_vec")]
@@ -604,6 +616,7 @@ impl SignerState {
             ever_published: false,
             recovery_origin: None,
             recovery_services: Vec::new(),
+            recovery_serving: None,
             owes_own_version: false,
             admission_owed: false,
         }

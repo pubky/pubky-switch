@@ -111,6 +111,7 @@ enum Step {
 struct Written<'a> {
     records: &'a [([u8; 32], Collection)],
     deadlines: &'a [([u8; 32], ObligationDeadline)],
+    forget: &'a [String],
 }
 
 /// How many times an effect is built for one entry in one read: once, and once more after a
@@ -243,6 +244,18 @@ struct Read {
     /// The (sender, `msg_id`) pairs processed in this read and not yet committed, with
     /// their message hashes (Switch spec 11).
     pairs: HashMap<([u8; 32], String), [u8; 32]>,
+    /// A `missed` item owed a listing of the collections: no later item of the read is
+    /// processed before it (Switch wire 7.4.4).
+    list_first: bool,
+}
+
+/// How a page of the feed ended, when the read didn't stop on it.
+enum PageEnd {
+    /// Processed to its end; whether the feed has more.
+    Read { more: bool },
+    /// Processed through the `missed` item at this `seq`, which owes a listing of the
+    /// collections, made before any later item is processed (Switch wire 7.4.4).
+    ListFirst(u64),
 }
 
 impl Read {
@@ -253,6 +266,7 @@ impl Read {
             opaque,
             epoch_rose: false,
             pairs: HashMap::new(),
+            list_first: false,
         }
     }
 
@@ -266,10 +280,12 @@ impl Read {
     }
 }
 
-/// The least time, device clock, between two reads of one sender's `identity.json` that a
-/// failed check 7 against a held copy makes (Switch wire 5.1 check 7). Within it, an entry
-/// of the sender failing the check in a later read is held, not dropped, until the first
-/// read after it reads the document again.
+/// The least time, device clock, between two reads of one identity's `identity.json` that
+/// a failed check makes: of a sender's, a failed check 7 against a held copy (Switch wire
+/// 5.1 check 7), and of a recipient's, an answer of its switch that doesn't verify with the
+/// key the held copy names (Switch spec 4.3). Within it, an entry of the sender failing the
+/// check in a later read is held, not dropped, until the first read after it reads the
+/// document again; a message to the recipient stays queued.
 pub const SENDER_REREAD_MS: u64 = 60_000;
 
 /// When a failed check 7 last had a sender's `identity.json` read again: the device time,
@@ -388,54 +404,106 @@ impl App {
         if let Some(waiting) = waiting {
             self.events.push(waiting);
         }
-        self.deliver_record().await?;
+        // The record's delivery goes before the feed; its publication comes after it, once the
+        // feed shows the app still current (`own_record.rs`).
+        self.deliver_pending_record().await?;
         self.ensure_scope_keys().await?;
         self.prune_processed().await?;
         self.retell_restored().await?;
         // The bounds on entries stored unverified go before any is tried again (Switch
         // spec 8.2).
         self.bound_unverified().await?;
-        self.retry_parked().await?;
-        self.retry_owed().await?;
-        self.list_collections_if_due().await?;
+        // A listing owed comes before any entry is handed to the protocol, one stored
+        // locally or an owed call included (Switch spec 8.2, wire 7.4.4). One that can't be
+        // made yet, for want of a scope key, ends the read here: receiving waits for the
+        // key, and nothing is passed or lost meanwhile. At most one listing a read, so a
+        // switch that shows one `missed` item after another can't make a read list again
+        // and again: a later item that owes one ends the read, and the next read lists
+        // first.
+        let mut listed = self.list_collections_if_due().await?;
+        let mut waits_for_key = false;
+        if !listed && self.reader().exists(super::records::LIST_DUE).await? {
+            // The key a listing waits for comes in a key bundle part, which the feed would
+            // show only past this point: fetched here, then the listing tried once more.
+            self.fetch_key_bundle().await?;
+            listed = self.list_collections_if_due().await?;
+            waits_for_key = !listed && self.reader().exists(super::records::LIST_DUE).await?;
+        }
         let mut report = ReceiveReport::default();
-        let mut wait = wait.map(|w| w.min(25));
-        // The read position moves on page by page, past a held entry, while the cursor
-        // stays before it (Switch spec 8.2); the held `seq` carries over to later pages.
-        let mut after = self.state.cursor.seq;
-        let mut blocked = None;
-        loop {
-            if let (Some(seconds), Some(since)) = (wait, self.state.cursor.deferred_since_ms) {
-                let due = since.saturating_add(self.config.defer_ms());
-                let left = due.saturating_sub(self.now()).div_ceil(1000).max(1);
-                wait = Some(seconds.min(u32::try_from(left).unwrap_or(u32::MAX)));
-            }
-            let query = FeedQuery {
-                after: Some(Position {
-                    generation: self.state.cursor.generation,
-                    seq: after,
-                }),
-                limit: Some(self.config.page()),
-                wait: wait.take(),
-            };
-            let result = self.client.feed(query).await;
-            let page = self.take(result).await?;
-            let scanned = page.scanned_through;
-            match self.process_page(page, after, &mut blocked).await? {
-                Some(true) => after = after.max(scanned).max(self.state.cursor.seq),
-                Some(false) => break,
-                None => {
-                    report.stopped = true;
-                    break;
+        if waits_for_key {
+            // Receiving waits for the key, and the read says so. The feed item that would
+            // answer the full-bundle request isn't read meanwhile, so the request is made
+            // again at a bounded interval: the signer's answer may have lacked the key.
+            // The read's upkeep below goes on.
+            self.ask_again_while_a_listing_waits().await?;
+            self.events.push(AppEvent::ListingWaitsForKey);
+        } else {
+            // The stored entries' retries, the owed calls, and the feed to its end.
+            self.retry_parked().await?;
+            self.retry_owed().await?;
+            let mut wait = wait.map(|w| w.min(25));
+            // The read position moves on page by page, past a held entry, while the cursor
+            // stays before it (Switch spec 8.2); the held `seq` carries over to later pages.
+            let mut after = self.state.cursor.seq;
+            let mut blocked = None;
+            loop {
+                if let (Some(seconds), Some(since)) = (wait, self.state.cursor.deferred_since_ms) {
+                    let due = since.saturating_add(self.config.defer_ms());
+                    let left = due.saturating_sub(self.now()).div_ceil(1000).max(1);
+                    wait = Some(seconds.min(u32::try_from(left).unwrap_or(u32::MAX)));
+                }
+                let query = FeedQuery {
+                    after: Some(Position {
+                        generation: self.state.cursor.generation,
+                        seq: after,
+                    }),
+                    limit: Some(self.config.page()),
+                    wait: wait.take(),
+                };
+                let result = self.client.feed(query).await;
+                let page = self.take(result).await?;
+                let scanned = page.scanned_through;
+                match self.process_page(page, after, &mut blocked).await? {
+                    Some(PageEnd::Read { more: true }) => {
+                        after = after.max(scanned).max(self.state.cursor.seq);
+                    }
+                    Some(PageEnd::Read { more: false }) => break,
+                    // The listing a `missed` item owes, before any later item: ending the page's
+                    // processing at the item and committing it keeps the cursor rules as they
+                    // are, the listing's own commits never interleaving with a page's open
+                    // writes. A listing that can't be made yet, for want of a scope key, ends
+                    // the read there; the next one lists first, and so does one past the read's
+                    // one listing.
+                    Some(PageEnd::ListFirst(through)) => {
+                        if listed {
+                            break;
+                        }
+                        listed = self.list_collections_if_due().await?;
+                        if !listed && self.reader().exists(super::records::LIST_DUE).await? {
+                            self.fetch_key_bundle().await?;
+                            listed = self.list_collections_if_due().await?;
+                        }
+                        if !listed {
+                            break;
+                        }
+                        after = after.max(through);
+                    }
+                    None => {
+                        report.stopped = true;
+                        break;
+                    }
                 }
             }
         }
         if self.state.alarm.is_none() {
-            // A stopped read leaves the claims and records it marked for the next one.
-            if !report.stopped {
+            // A stopped read leaves the claims and records it marked for the next one, and so
+            // does one that waits for a key. A publication goes only once the feed shows the
+            // app current (Switch spec 4.2).
+            if !report.stopped && !waits_for_key {
                 self.reread_claims().await?;
                 self.reread_records().await?;
                 self.fetch_entry_writers().await?;
+                self.publish_owed(false, true).await?;
             }
             self.delete_retired_keys().await?;
             self.forget_chain_behind_cursor().await?;
@@ -446,14 +514,14 @@ impl App {
         Ok(report)
     }
 
-    /// One page, read after `after`, with the lowest `seq` held so far in this read:
-    /// `Some(more)`, or `None` when the read stops on it.
+    /// One page, read after `after`, with the lowest `seq` held so far in this read: how it
+    /// ended, or `None` when the read stops on it.
     async fn process_page(
         &mut self,
         page: FeedPage,
         after: u64,
         blocked: &mut Option<u64>,
-    ) -> Result<Option<bool>, AppError> {
+    ) -> Result<Option<PageEnd>, AppError> {
         let now = self.now();
         let multi = self.state.device.multi_device;
         let Some(chain) = self.state.chain.as_mut() else {
@@ -495,6 +563,7 @@ impl App {
             return Ok(None);
         }
         let mut stopped = None;
+        let mut list_through = None;
         // A stub names no object: once the page shows the stub of an operation, the claims
         // the app follows are read again at the end of the read (Switch wire 7.5), noted in
         // the commit that passes it.
@@ -503,6 +572,9 @@ impl App {
             let seq = item.seq();
             if seq <= start {
                 continue;
+            }
+            if list_through.is_some() && !matches!(item, FeedItem::Missed { .. }) {
+                break;
             }
             // Room for one more item, whatever it writes: the read's writes so far are
             // committed first once they pass the high-water mark (`ITEM_ROOM_BYTES`).
@@ -564,13 +636,20 @@ impl App {
                 stopped = Some(seq);
                 break;
             }
+            // Switch wire 7.4.4: the listing a `missed` item owes comes before any later
+            // item is processed but another `missed` item, which only tells the protocol and
+            // owes the same listing.
+            if read.list_first {
+                list_through = Some(seq);
+            }
         }
+        let through = list_through.unwrap_or(page.scanned_through);
         let end = match (stopped, read.blocked) {
             (Some(stop), _) => stop
                 .saturating_sub(1)
                 .min(read.blocked.map_or(u64::MAX, |b| b.saturating_sub(1))),
-            (None, Some(blocked)) => blocked.saturating_sub(1).min(page.scanned_through),
-            (None, None) => page.scanned_through,
+            (None, Some(blocked)) => blocked.saturating_sub(1).min(through),
+            (None, None) => through,
         };
         if end > self.state.cursor.seq {
             self.state.cursor.seq = end;
@@ -584,7 +663,10 @@ impl App {
         if stopped.is_some() {
             return Ok(None);
         }
-        Ok(Some(page.more))
+        if let Some(through) = list_through {
+            return Ok(Some(PageEnd::ListFirst(through)));
+        }
+        Ok(Some(PageEnd::Read { more: page.more }))
     }
 
     /// Commit the page: the cursor, deferred when it moved past what the service holds,
@@ -928,12 +1010,19 @@ impl App {
                 deadlines,
                 not_now: _,
                 over_local_bound,
+                forget,
             } = writes;
+            let forget: Vec<String> = forget.into_iter().collect();
             effect.ops = ops.into_iter().chain(effect.ops).collect();
             effect.local = local.into_iter().chain(effect.local).collect();
             // A step's local writes are bounded (`Protocol`, "Limits a receive step plans
-            // for"): an effect over the bound is too large, stored and passed.
-            if over_local_bound || local_writes_bytes(&effect.local) > MAX_STEP_LOCAL_BYTES {
+            // for"), its forgets with them: an effect over the bound is too large, stored and
+            // passed.
+            if over_local_bound
+                || local_writes_bytes(&effect.local)
+                    .saturating_add(super::forget::forget_bytes(&forget))
+                    > MAX_STEP_LOCAL_BYTES
+            {
                 self.too_large(entry, &received, read).await?;
                 return Ok(Step::Pass);
             }
@@ -978,12 +1067,16 @@ impl App {
             }
             if effect.ops.is_empty() {
                 self.note_processed(entry, &received, &effect.local, read)?;
+                for key in &forget {
+                    read.tx.delete(key)?;
+                }
                 self.received_event(entry, &received);
                 return Ok(Step::Pass);
             }
             let written = Written {
                 records: &records,
                 deadlines: &deadlines,
+                forget: &forget,
             };
             match self
                 .send_effect(entry, &received, effect, written, parked, read)
@@ -1168,6 +1261,7 @@ impl App {
                 .map(|(claim_key, deadline)| (pubky_switch_core::enc::b64(claim_key), *deadline))
                 .collect(),
             kept_ms: Some(self.kept_stamp()),
+            forget: written.forget.to_vec(),
             entry: KeptEntry {
                 cert: entry.cert.clone(),
                 plaintext: received.plaintext.encode(),
@@ -1302,6 +1396,9 @@ impl App {
         }
         processed_writes(&mut tx, &pending.sender, &pending.msg_id, pending.hash, now)?;
         tx.local(&pending.local)?;
+        for key in &pending.forget {
+            tx.delete(key)?;
+        }
         // Processed: a count of the store's retries at it goes with it.
         if pending.stored.is_some() {
             self.unpark(pending.stored, &mut tx)?;
@@ -2058,7 +2155,13 @@ impl App {
         read: &mut Read,
     ) -> Result<Step, AppError> {
         let Some(from) = accepted_from else {
-            // The service writes the item; one whose times don't parse is ignored.
+            // The service writes the item: one whose times don't parse asks for no re-send,
+            // but still owes the listing (Switch spec 8.2, wire 7.4.4).
+            if self.state.asked.insert(seq) {
+                read.tx.put(&key::asked(seq), &())?;
+                read.tx.put(super::records::LIST_DUE, &true)?;
+                read.list_first = true;
+            }
             return Ok(Step::Pass);
         };
         if self.state.asked.insert(seq) {
@@ -2091,6 +2194,7 @@ impl App {
             }
             read.tx.put(&key::asked(seq), &())?;
             read.tx.put(super::records::LIST_DUE, &true)?;
+            read.list_first = true;
             self.events.push(AppEvent::Missed { seq, entries });
         }
         Ok(Step::Pass)
@@ -2209,6 +2313,11 @@ impl App {
                                 &mut read.tx,
                             )
                             .await?;
+                            // One past the record marks owes a listing: made before any
+                            // later entry is handed over, as a `missed` item's is.
+                            if read.tx.pending_state(super::records::LIST_DUE) == Some(true) {
+                                read.list_first = true;
+                            }
                         }
                         Ok(Step::Pass)
                     }
