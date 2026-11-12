@@ -3107,6 +3107,94 @@ async fn test_app_restore_registration_after_its_own_key_is_a_compromise() {
     );
 }
 
+/// A thief's registration of key `n`, signed with the app's signing key, at the switch.
+fn thief_registers(w: &World, cert: &AppCert, n: u64) {
+    let thief = ReceiveKey::from_secret(n, [47; 32]);
+    let record =
+        ReceiveKeyRecord::sign(&app_keys("wallet"), cert, ReceiveKeyBody::new(cert, &thief))
+            .unwrap();
+    w.switch
+        .app_op(
+            &app_keys("wallet"),
+            OpKind::ReceiveKeyPut {
+                record: record.signed().clone(),
+            },
+        )
+        .unwrap();
+}
+
+/// A restore whose key was current at its check asks about nothing after it: a later
+/// registration no device made, read in the feed, is a compromise.
+#[tokio::test]
+async fn test_app_restore_with_its_key_current_takes_a_later_unknown_key_for_a_compromise() {
+    let w = World::new();
+    let app = w.join("wallet").await;
+    let backup = app.backup().await.unwrap();
+    let (mut restored, _) = restored(&w, &backup).await;
+    restored.receive(None).await.unwrap();
+    assert!(restored.restore_question().is_empty());
+    w.clock.advance_ms(30 * 24 * HOUR);
+    thief_registers(&w, &restored.cert().clone(), 1);
+    let error = restored.receive(None).await.unwrap_err();
+    assert!(
+        matches!(error, AppError::Alarm(Alarm::Compromise { n: 1, .. })),
+        "{error:?}"
+    );
+    assert!(restored.restore_question().is_empty());
+}
+
+/// The same through a registration conflict: the restored app rotates onto the number a
+/// thief took.
+#[tokio::test]
+async fn test_app_restore_with_its_key_current_takes_a_later_conflict_for_a_compromise() {
+    let w = World::new();
+    let app = w.join("wallet").await;
+    let backup = app.backup().await.unwrap();
+    let (mut restored, _) = restored(&w, &backup).await;
+    restored.receive(None).await.unwrap();
+    w.clock.advance_ms(30 * 24 * HOUR);
+    thief_registers(&w, &restored.cert().clone(), 1);
+    let error = restored.rotate().await.unwrap_err();
+    assert!(
+        matches!(error, AppError::Alarm(Alarm::Compromise { n: 1, .. })),
+        "{error:?}"
+    );
+}
+
+/// A restore whose check registered a fresh key asks about what came before it, and takes
+/// an unknown key above it for a compromise.
+#[tokio::test]
+async fn test_app_restore_takes_an_unknown_key_above_its_own_for_a_compromise() {
+    let w = World::new();
+    let mut app = w.join("wallet").await;
+    let backup = backup_then_rotate(&w, &mut app).await;
+    drop(app);
+    let (mut restored, _) = restored(&w, &backup).await;
+    restored.receive(None).await.unwrap();
+    assert_eq!(restored.restore_question(), vec![1]);
+    assert_eq!(restored.receive_key_numbers().last(), Some(&2));
+    thief_registers(&w, &restored.cert().clone(), 3);
+    let error = restored.receive(None).await.unwrap_err();
+    assert!(
+        matches!(error, AppError::Alarm(Alarm::Compromise { n: 3, .. })),
+        "{error:?}"
+    );
+}
+
+/// Once reconciliation ends with nothing to ask, the restore is over: its record goes.
+#[tokio::test]
+async fn test_app_restore_record_goes_when_reconciliation_ends() {
+    let w = World::new();
+    let app = w.join("wallet").await;
+    let backup = app.backup().await.unwrap();
+    let (mut restored, store) = restored(&w, &backup).await;
+    restored.receive(None).await.unwrap();
+    restored.end_reconcile(UserConfirmed::new()).await.unwrap();
+    assert!(!restored.reconcile_mode());
+    let ns = crate::store::client_namespace(&restored.app_id());
+    assert!(store.get(&ns, b"restore").unwrap().is_none());
+}
+
 #[tokio::test]
 async fn test_app_restore_with_its_current_key_registers_nothing() {
     let w = World::new();
