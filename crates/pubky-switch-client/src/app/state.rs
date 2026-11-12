@@ -556,6 +556,10 @@ pub(crate) struct PendingEffect {
     /// When it was kept, before its first send, app clock.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) kept_ms: Option<u64>,
+    /// The keys of the processed pairs the step forgets, deleted with the outcome, as its
+    /// local writes are ([`super::ReceiveContext::forget_processed`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) forget: Vec<String>,
     /// What storing the entry locally takes, beside the fields above: the entry is stored
     /// when the effect is kept so long that its fate can't be known (Switch spec 12.5
     /// "Kept batches"). Required: a kept effect without it doesn't read.
@@ -998,6 +1002,7 @@ mod tests {
                 })
                 .collect(),
             kept_ms: Some(u64::MAX),
+            forget: Vec::new(),
             entry: KeptEntry {
                 cert: SignedDoc {
                     body: "A".repeat(33 * 1024),

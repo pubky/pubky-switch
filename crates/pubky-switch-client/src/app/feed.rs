@@ -110,6 +110,7 @@ enum Step {
 struct Written<'a> {
     records: &'a [([u8; 32], Collection)],
     deadlines: &'a [([u8; 32], ObligationDeadline)],
+    forget: &'a [String],
 }
 
 /// How many times an effect is built for one entry in one read: once, and once more after a
@@ -927,6 +928,7 @@ impl App {
                 deadlines,
                 not_now: _,
                 over_local_bound,
+                forget,
             } = writes;
             effect.ops = ops.into_iter().chain(effect.ops).collect();
             effect.local = local.into_iter().chain(effect.local).collect();
@@ -977,12 +979,16 @@ impl App {
             }
             if effect.ops.is_empty() {
                 self.note_processed(entry, &received, &effect.local, read)?;
+                for key in &forget {
+                    read.tx.delete(key)?;
+                }
                 self.received_event(entry, &received);
                 return Ok(Step::Pass);
             }
             let written = Written {
                 records: &records,
                 deadlines: &deadlines,
+                forget: &forget,
             };
             match self
                 .send_effect(entry, &received, effect, written, parked, read)
@@ -1167,6 +1173,7 @@ impl App {
                 .map(|(claim_key, deadline)| (pubky_switch_core::enc::b64(claim_key), *deadline))
                 .collect(),
             kept_ms: Some(self.kept_stamp()),
+            forget: written.forget.to_vec(),
             entry: KeptEntry {
                 cert: entry.cert.clone(),
                 plaintext: received.plaintext.encode(),
@@ -1301,6 +1308,9 @@ impl App {
         }
         processed_writes(&mut tx, &pending.sender, &pending.msg_id, pending.hash, now)?;
         tx.local(&pending.local)?;
+        for key in &pending.forget {
+            tx.delete(key)?;
+        }
         // Processed: a count of the store's retries at it goes with it.
         if pending.stored.is_some() {
             self.unpark(pending.stored, &mut tx)?;

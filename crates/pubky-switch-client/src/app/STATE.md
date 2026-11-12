@@ -163,7 +163,7 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
 | `chain` | the chain view's small fields: tip, open batch, pending heads and checkpoint, newest head, the continuity gap, held marks, restore state | |
 | `chain/at/<seq>` | the verified chain hash at a `seq`, from a little behind the cursor on: the hashes behind it are forgotten in steps | |
 | `chain/batch/<id>` | a batch ID in the 30-day window, with its first stub's time | |
-| `proc/<sender>/<msg_id>` | a processed message's hash and time | |
+| `proc/<sender>/<msg_id>` | a processed message's hash and time. The protocol may forget one (`ReceiveContext::forget_processed`, in the step's commit with its other writes, or `App::forget_processed`, in one commit with the protocol's local writes): the pair and its `proct/` entry go, so a re-send is delivered again and nothing is left to prune; refused while the message's effect is kept (`pending/effect`) or an entry stored locally holds it | |
 | `proct/<time>/<sender>/<msg_id>` | the time index for pruning processed pairs | |
 | `seen/<seq>` | an entry processed past a held one | |
 | `held/<seq>` | an entry held because its sender can't be checked, since when | |
@@ -177,7 +177,7 @@ are zero-padded to 20 digits so keys sort numerically. The record types are in `
 | `owed/<generation>/<seq>` | a re-send or missed-entries call about this item that the protocol answered with an error: written in the commit that passes the item, made again at the start of each read, each call on its own, and gone in the commit of its answer's writes, or, for an answer whose writes are over `MAX_STEP_LOCAL_BYTES`, in the commit of the duty event that refuses them; `App::owed_protocol_calls` counts them. The key names the generation the item was read at | |
 | `departed/<app_id>` | another own app's departure verified in the chain, and its time | |
 | `join` | the join step: the registration batch while it is owed | |
-| `pending/effect` | a received message's effect batch and its outcome writes, with the deadlines of the claims it writes, and the opened entry, to store it locally if the batch outlives the batch ID window; its local writes are kept in base64 (`kept_local`), and the form with arrays of numbers written before still reads | yes |
+| `pending/effect` | a received message's effect batch and its outcome writes, the keys of the processed pairs its step forgets (`forget`) among them, with the deadlines of the claims it writes, and the opened entry, to store it locally if the batch outlives the batch ID window; its local writes are kept in base64 (`kept_local`), and the form with arrays of numbers written before still reads | yes |
 | `pending/record` | an `app.put` batch | |
 | `pending/publish` | the app record the switch holds and the Homeserver is still owed, for an app that publishes its record; written in the commit that records the delivery's answer, and gone once the Homeserver write is answered | |
 | `alarm` | the alarm that stopped the app | |

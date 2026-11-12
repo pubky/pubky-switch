@@ -2,6 +2,7 @@
 //! Homeserver, and a neutral sample protocol. Keys come from the test seeds.
 
 mod flows;
+mod forget;
 mod kept_status;
 mod moves;
 mod not_registered;

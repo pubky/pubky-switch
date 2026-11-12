@@ -39,6 +39,7 @@ mod chain;
 mod error;
 mod events;
 mod feed;
+mod forget;
 mod identity;
 mod kept;
 mod keys;

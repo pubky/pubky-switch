@@ -1183,6 +1183,9 @@ impl App {
                 }
                 processed_writes(tx, &pending.sender, &pending.msg_id, pending.hash, now)?;
                 tx.local(&pending.local)?;
+                for key in &pending.forget {
+                    tx.delete(key)?;
+                }
                 // Processed: a count of the store's retries at it goes with it.
                 if pending.stored.is_some() {
                     self.unpark(pending.stored, tx)?;

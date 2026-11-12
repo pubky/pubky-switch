@@ -3935,6 +3935,7 @@ async fn test_loss_reports_the_attempts_of_a_kept_effect_it_drops() {
         stored: None,
         deadlines: Vec::new(),
         kept_ms: Some(lost.note_at_ms),
+        forget: Vec::new(),
         entry: crate::app::state::KeptEntry {
             cert: app.cert().signed().clone(),
             plaintext: Vec::new(),
@@ -4002,6 +4003,7 @@ async fn keep_an_effect(
         stored: parked.then_some(seq),
         deadlines: Vec::new(),
         kept_ms: Some(w.clock.now_ms()),
+        forget: Vec::new(),
         entry: entry.clone(),
     };
     let mut tx = app.tx().unwrap();
