@@ -149,7 +149,9 @@ impl App {
                         .and_then(|doc| AppRecord::verify(&doc, &self.state.meta.identity).ok()),
                     _ => None,
                 };
-                if named.is_none() && !self.switch_holds(&batch).await? {
+                // Boxed: the directory read is rare, and would otherwise widen every future
+                // that delivers a record.
+                if named.is_none() && !Box::pin(self.switch_holds(&batch)).await? {
                     return Err(error);
                 }
                 named

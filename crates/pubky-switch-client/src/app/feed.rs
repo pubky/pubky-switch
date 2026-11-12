@@ -438,7 +438,62 @@ impl App {
             self.ask_again_while_a_listing_waits().await?;
             self.events.push(AppEvent::ListingWaitsForKey);
         } else {
-            self.read_the_feed(wait, listed, &mut report).await?;
+            // The stored entries' retries, the owed calls, and the feed to its end.
+            self.retry_parked().await?;
+            self.retry_owed().await?;
+            let mut wait = wait.map(|w| w.min(25));
+            // The read position moves on page by page, past a held entry, while the cursor
+            // stays before it (Switch spec 8.2); the held `seq` carries over to later pages.
+            let mut after = self.state.cursor.seq;
+            let mut blocked = None;
+            loop {
+                if let (Some(seconds), Some(since)) = (wait, self.state.cursor.deferred_since_ms) {
+                    let due = since.saturating_add(self.config.defer_ms());
+                    let left = due.saturating_sub(self.now()).div_ceil(1000).max(1);
+                    wait = Some(seconds.min(u32::try_from(left).unwrap_or(u32::MAX)));
+                }
+                let query = FeedQuery {
+                    after: Some(Position {
+                        generation: self.state.cursor.generation,
+                        seq: after,
+                    }),
+                    limit: Some(self.config.page()),
+                    wait: wait.take(),
+                };
+                let result = self.client.feed(query).await;
+                let page = self.take(result).await?;
+                let scanned = page.scanned_through;
+                match self.process_page(page, after, &mut blocked).await? {
+                    Some(PageEnd::Read { more: true }) => {
+                        after = after.max(scanned).max(self.state.cursor.seq);
+                    }
+                    Some(PageEnd::Read { more: false }) => break,
+                    // The listing a `missed` item owes, before any later item: ending the page's
+                    // processing at the item and committing it keeps the cursor rules as they
+                    // are, the listing's own commits never interleaving with a page's open
+                    // writes. A listing that can't be made yet, for want of a scope key, ends
+                    // the read there; the next one lists first, and so does one past the read's
+                    // one listing.
+                    Some(PageEnd::ListFirst(through)) => {
+                        if listed {
+                            break;
+                        }
+                        listed = self.list_collections_if_due().await?;
+                        if !listed && self.reader().exists(super::records::LIST_DUE).await? {
+                            self.fetch_key_bundle().await?;
+                            listed = self.list_collections_if_due().await?;
+                        }
+                        if !listed {
+                            break;
+                        }
+                        after = after.max(through);
+                    }
+                    None => {
+                        report.stopped = true;
+                        break;
+                    }
+                }
+            }
         }
         if self.state.alarm.is_none() {
             // A stopped read leaves the claims and records it marked for the next one, and so
@@ -457,72 +512,6 @@ impl App {
         }
         report.cursor = self.cursor();
         Ok(report)
-    }
-
-    /// The stored entries' retries, the owed calls, and the feed to its end, for a read whose
-    /// owed listing, if any, is made (`listed`).
-    async fn read_the_feed(
-        &mut self,
-        wait: Option<u32>,
-        mut listed: bool,
-        report: &mut ReceiveReport,
-    ) -> Result<(), AppError> {
-        self.retry_parked().await?;
-        self.retry_owed().await?;
-        let mut wait = wait.map(|w| w.min(25));
-        // The read position moves on page by page, past a held entry, while the cursor
-        // stays before it (Switch spec 8.2); the held `seq` carries over to later pages.
-        let mut after = self.state.cursor.seq;
-        let mut blocked = None;
-        loop {
-            if let (Some(seconds), Some(since)) = (wait, self.state.cursor.deferred_since_ms) {
-                let due = since.saturating_add(self.config.defer_ms());
-                let left = due.saturating_sub(self.now()).div_ceil(1000).max(1);
-                wait = Some(seconds.min(u32::try_from(left).unwrap_or(u32::MAX)));
-            }
-            let query = FeedQuery {
-                after: Some(Position {
-                    generation: self.state.cursor.generation,
-                    seq: after,
-                }),
-                limit: Some(self.config.page()),
-                wait: wait.take(),
-            };
-            let result = self.client.feed(query).await;
-            let page = self.take(result).await?;
-            let scanned = page.scanned_through;
-            match self.process_page(page, after, &mut blocked).await? {
-                Some(PageEnd::Read { more: true }) => {
-                    after = after.max(scanned).max(self.state.cursor.seq);
-                }
-                Some(PageEnd::Read { more: false }) => break,
-                // The listing a `missed` item owes, before any later item: ending the page's
-                // processing at the item and committing it keeps the cursor rules as they
-                // are, the listing's own commits never interleaving with a page's open
-                // writes. A listing that can't be made yet, for want of a scope key, ends
-                // the read there; the next one lists first, and so does one past the read's
-                // one listing.
-                Some(PageEnd::ListFirst(through)) => {
-                    if listed {
-                        break;
-                    }
-                    listed = self.list_collections_if_due().await?;
-                    if !listed && self.reader().exists(super::records::LIST_DUE).await? {
-                        self.fetch_key_bundle().await?;
-                        listed = self.list_collections_if_due().await?;
-                    }
-                    if !listed {
-                        break;
-                    }
-                    after = after.max(through);
-                }
-                None => {
-                    report.stopped = true;
-                    break;
-                }
-            }
-        }
-        Ok(())
     }
 
     /// One page, read after `after`, with the lowest `seq` held so far in this read: how it
