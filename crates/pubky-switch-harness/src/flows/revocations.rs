@@ -200,7 +200,8 @@ pub async fn departure_time(world: &World) -> FlowResult {
 /// deletion once. The removal stands, delivered and published, and the record stays until
 /// the signer's next run deletes it. The signer then purges the phone's `removed` entry in
 /// a new version. The phone's App ID stays refused: asked again with the same keys, the
-/// signer doesn't approve it.
+/// signer doesn't approve it, the switch refuses the phone's call, and the apps the switch
+/// reports still hold the phone with the time it was revoked.
 ///
 /// Calls: `POST /v1/{id}/apps/{app_id}/revoke`, `PUT /v1/{id}/identity` with the removing
 /// version and with the version that purges the entry.
@@ -208,7 +209,8 @@ pub async fn departure_time(world: &World) -> FlowResult {
 /// # Errors
 ///
 /// When a step that should succeed against any switch fails, the record is deleted or
-/// kept against what its step says, or the purged App ID is approved again.
+/// kept against what its step says, the purged App ID is approved again or served, or
+/// the switch no longer reports it as revoked.
 pub async fn revocation_cleanup(world: &World) -> FlowResult {
     let alice = world.identity("alice")?;
     world.add_switch(ORIGIN, &[&alice]).await?;
@@ -229,6 +231,7 @@ pub async fn revocation_cleanup(world: &World) -> FlowResult {
     };
 
     world.fail_homeserver_deletion(&alice, &record);
+    let revoked_at = world.now_ms();
     let removing = signer
         .revoke(phone.app_id(), None, UserConfirmed::shown_and_confirmed())
         .await;
@@ -297,6 +300,15 @@ pub async fn revocation_cleanup(world: &World) -> FlowResult {
         403,
         "not_current",
     )?;
+    // Any app the document doesn't list is refused so. That the switch still knows this
+    // one shows in the apps it reports: the phone, with the time it was revoked.
+    signer.run_due().await?;
+    world.outcome(
+        "the signer's run after the purge",
+        &json!({ "signer": status(&signer)? }),
+    );
+    expect_revoked_at(world, "phone", revoked_at)?;
+    world.advance_ms(STEP_MS);
     follow(world, &mut wallet, "the wallet at the end").await?;
     Ok(())
 }
