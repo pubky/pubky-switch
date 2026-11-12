@@ -11,9 +11,11 @@
 mod admission;
 mod claim;
 mod collections;
+mod connect;
 mod enrollment;
 mod epochs;
 mod erasure;
+mod grants;
 mod handover;
 mod installs;
 mod join;
@@ -42,9 +44,14 @@ use pubky_switch::http::route::Call;
 pub use admission::{deny_list, invite_code};
 pub use claim::claim;
 pub use collections::two_collections;
+pub use connect::{
+    connect_request, connect_request_full, connect_request_recovered,
+    connect_request_recovered_in_place, connect_request_turned_off,
+};
 pub use enrollment::enrollment;
 pub use epochs::{epochs_three_readers, rotation_given_up, third_epoch};
-pub use erasure::{erasure, erasure_answer_lost};
+pub use erasure::{erasure, erasure_answer_lost, erasure_enrolled_again};
+pub use grants::{grant_paths_decline_refused, grant_paths_declined};
 pub use handover::{hand_over, hand_over_abort_late, hand_over_aborted, hand_over_take_over_late};
 pub use installs::{
     publication_other_document, publication_repaired, signer_new_install, signer_records_behind,
@@ -58,9 +65,10 @@ pub use own_record::own_record;
 pub use pages::pages;
 pub use records::records;
 pub use recovery::{
-    provider_loss, provider_loss_in_place, provider_loss_in_place_sender,
-    provider_loss_refusals_in_transit, provider_loss_refused, provider_loss_restored,
-    provider_loss_revocation_meanwhile, provider_loss_sender_admitted,
+    provider_loss, provider_loss_in_place, provider_loss_in_place_restored,
+    provider_loss_in_place_sender, provider_loss_refusals_in_transit, provider_loss_refused,
+    provider_loss_restored, provider_loss_revocation_meanwhile, provider_loss_same_origin_refused,
+    provider_loss_sender_admitted,
 };
 pub use reduction::{reduction_unpublished, renewal_drops_scope};
 pub use removal::{departure, revocation};
@@ -134,6 +142,9 @@ pub const FLOWS: &[(&str, Flow)] = &[
     ("erasure, answer lost", |world| {
         Box::pin(erasure_answer_lost(world))
     }),
+    ("erasure, enrolled again", |world| {
+        Box::pin(erasure_enrolled_again(world))
+    }),
     ("pages", |world| Box::pin(pages(world))),
     ("invite code", |world| Box::pin(invite_code(world))),
     ("deny list", |world| Box::pin(deny_list(world))),
@@ -168,6 +179,25 @@ pub const FLOWS: &[(&str, Flow)] = &[
     ("waiting read, a recovery in place", |world| {
         Box::pin(waiting_read_recovered(world))
     }),
+    ("connect request", |world| Box::pin(connect_request(world))),
+    ("connect request, the list full", |world| {
+        Box::pin(connect_request_full(world))
+    }),
+    ("connect request, turned off", |world| {
+        Box::pin(connect_request_turned_off(world))
+    }),
+    ("connect request, across a provider loss", |world| {
+        Box::pin(connect_request_recovered(world))
+    }),
+    ("connect request, a recovery in place", |world| {
+        Box::pin(connect_request_recovered_in_place(world))
+    }),
+    ("approval, grant paths declined", |world| {
+        Box::pin(grant_paths_declined(world))
+    }),
+    ("approval, a decline the protocol refuses", |world| {
+        Box::pin(grant_paths_decline_refused(world))
+    }),
     ("provider loss", |world| Box::pin(provider_loss(world))),
     ("provider loss, a sender admitted", |world| {
         Box::pin(provider_loss_sender_admitted(world))
@@ -186,6 +216,12 @@ pub const FLOWS: &[(&str, Flow)] = &[
     }),
     ("provider loss, restored", |world| {
         Box::pin(provider_loss_restored(world))
+    }),
+    ("provider loss in place, restored", |world| {
+        Box::pin(provider_loss_in_place_restored(world))
+    }),
+    ("provider loss, refused at the same origin", |world| {
+        Box::pin(provider_loss_same_origin_refused(world))
     }),
     ("provider loss, a revocation asked meanwhile", |world| {
         Box::pin(provider_loss_revocation_meanwhile(world))
@@ -257,11 +293,9 @@ pub fn flow_of(call: &Call) -> Option<&'static str> {
         Call::RecoveryUpload => Some("provider loss, a sender admitted"),
         // A restored app lacks the keys of a part it passed before its loss, which went.
         Call::RequestKeys(_) => Some("restore"),
+        Call::PostConnect | Call::GetConnect | Call::DeleteConnect(_) => Some("connect request"),
         // Not served yet.
-        Call::PostConnect
-        | Call::GetConnect
-        | Call::DeleteConnect(_)
-        | Call::PutPush
+        Call::PutPush
         | Call::Freeze
         | Call::Unfreeze
         | Call::Export
