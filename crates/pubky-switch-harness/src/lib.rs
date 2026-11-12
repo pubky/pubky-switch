@@ -36,6 +36,7 @@ pub mod compare;
 pub mod flows;
 pub mod parties;
 pub mod service;
+pub mod store;
 pub mod trace;
 pub mod world;
 

@@ -200,9 +200,14 @@ pub async fn renewal_drops_scope(world: &World) -> FlowResult {
 /// wallet holds two scopes. A day later her signer renews its certificate without the one
 /// that has no keys, a reduction that rotates nothing; her Homeserver fails the write of
 /// `identity.json` once. The switch takes the renewing version and then the closing one,
-/// which cuts the earlier certificate off: a Homeserver that refuses writes doesn't hold
-/// the closing back. Only publication waits, and the signer's next run publishes the
+/// which gives the earlier certificate its end: a Homeserver that refuses writes doesn't
+/// hold the closing back. Only publication waits, and the signer's next run publishes the
 /// closing version.
+///
+/// The flow holds that both versions reach the switch and when each is published. The
+/// scope dropped here gates no call at the switch, so no refusal follows from it; what a
+/// switch refuses once a certificate has lost a scope it enforces is in
+/// [`renewal_drops_scope`].
 ///
 /// Calls: `PUT /v1/{id}/identity` with a renewing version and with the version that closes
 /// the earlier certificate, neither published yet.
@@ -244,7 +249,7 @@ pub async fn reduction_unpublished(world: &World) -> FlowResult {
             .count()
     };
     let delivered = deliveries(world);
-    world.fail_homeserver_write(IDENTITY_PATH);
+    world.fail_homeserver_write(&alice, IDENTITY_PATH);
     let change = CertChange {
         scopes: Some(vec![NOTES.to_owned()]),
         expires_at: None,

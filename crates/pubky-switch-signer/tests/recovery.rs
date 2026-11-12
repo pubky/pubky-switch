@@ -3330,3 +3330,66 @@ async fn test_provider_loss_revocation_asked_meanwhile_keeps_its_alert_with_it()
         .unwrap();
     assert!(recovered.listed_cert(&id).is_none());
 }
+
+#[tokio::test]
+async fn test_provider_loss_refused_recovery_of_a_users_reduction_clears_once_delivered() {
+    // The user's reduction is taken at the lost service, its answer lost. The recovery builds
+    // on that version, and the first service refuses it for good: the user is told the
+    // reduction didn't happen. A second declaration delivers the same base, whose listed
+    // certificate removes the scope: the alert goes by itself (Switch spec 3.2, 12.6 step 1).
+    let world = World::new();
+    let store = Arc::new(MemoryStore::new());
+    let mut signer = Signer::create(world.env(store.clone()), world.keyring(), SWITCH_ORIGIN)
+        .await
+        .unwrap();
+    signer.resume().await.unwrap();
+    let app = App::new(&["notes", "notes_sync"], None, [9; 32]);
+    world.approve(&mut signer, &app).await;
+    let id = app.keys.app_id_bytes();
+    world.switch.fail_next(Fault::LoseAnswer {
+        path: "/identity".into(),
+    });
+    let change = pubky_switch_signer::CertChange {
+        scopes: Some(vec!["notes_sync".into()]),
+        expires_at: None,
+    };
+    signer.renew(id, change).await.unwrap_err();
+    let reduced = world.switch.identity_doc().unwrap().listed_cert(&id);
+    drop(signer);
+    let (service, router) = new_service(&world);
+    router.remove(SWITCH_ORIGIN);
+    let mut signer = reopened(&world, store, &router, notes()).await;
+    service.fail_next(Fault::Error {
+        path: "/identity".into(),
+        code: pubky_switch_core::http::ErrorCode::BadRequest,
+        current: serde_json::Value::Null,
+    });
+    signer
+        .declare_provider_loss(NEW_ORIGIN, confirmed())
+        .await
+        .unwrap_err();
+    let refused = |signer: &Signer| {
+        signer
+            .alerts()
+            .iter()
+            .any(|a| matches!(a, Alert::RenewalRefused { app_id, .. } if *app_id == id))
+    };
+    assert!(refused(&signer), "told while it isn't delivered");
+    assert!(signer.alerts().contains(&Alert::RenewalRefused {
+        app_id: id,
+        reduction: true,
+        by_user: true,
+    }));
+    let third = service_on(&world, &router, THIRD_ORIGIN, 0x6e);
+    let recovered = signer
+        .declare_provider_loss(THIRD_ORIGIN, confirmed())
+        .await
+        .unwrap();
+    assert_eq!(third.identity_doc().unwrap().hash(), recovered.hash());
+    assert_eq!(
+        recovered.listed_cert(&id),
+        reduced,
+        "the reduced certificate"
+    );
+    assert!(!refused(&signer), "met by the listed certificate");
+}

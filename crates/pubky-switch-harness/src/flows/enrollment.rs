@@ -103,6 +103,17 @@ pub(crate) async fn enroll(
     Ok(signer)
 }
 
+/// An alert, for the trace: as it prints, but for the one that names another install, whose
+/// ID is made at random on each run and so is left out.
+fn shown_alert(alert: &pubky_switch_signer::Alert) -> String {
+    match alert {
+        pubky_switch_signer::Alert::ManagedByOtherInstall { .. } => {
+            "ManagedByOtherInstall".to_owned()
+        }
+        other => format!("{other:?}"),
+    }
+}
+
 /// What a signer shows of itself, for the trace.
 pub(crate) fn status(signer: &Signer) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let doc = signer.identity_doc()?;
@@ -118,6 +129,6 @@ pub(crate) fn status(signer: &Signer) -> Result<serde_json::Value, Box<dyn std::
         "apps": doc.as_ref().map(|doc| doc.body().apps.len()),
         "high_water_version": high_water.map(|mark| mark.version),
         "high_water_generation": high_water.map(|mark| mark.generation),
-        "alerts": signer.alerts().iter().map(|alert| format!("{alert:?}")).collect::<Vec<_>>(),
+        "alerts": signer.alerts().iter().map(shown_alert).collect::<Vec<_>>(),
     }))
 }
