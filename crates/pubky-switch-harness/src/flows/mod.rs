@@ -45,10 +45,10 @@ pub use collections::two_collections;
 pub use enrollment::enrollment;
 pub use epochs::{epochs_three_readers, rotation_given_up, third_epoch};
 pub use erasure::{erasure, erasure_answer_lost};
-pub use handover::{hand_over, hand_over_aborted};
+pub use handover::{hand_over, hand_over_abort_late, hand_over_aborted, hand_over_take_over_late};
 pub use installs::{
     publication_other_document, publication_repaired, signer_new_install, signer_records_behind,
-    signer_restore_revocation, signer_restore_undelivered,
+    signer_restore_revocation, signer_restore_undelivered, signer_two_installs_race,
 };
 pub use join::join;
 pub use lagging::{lagging_app, missed_item, unreadable_after_revoke};
@@ -115,6 +115,17 @@ pub const FLOWS: &[(&str, Flow)] = &[
     ("hand-over", |world| Box::pin(hand_over(world))),
     ("hand-over aborted", |world| {
         Box::pin(hand_over_aborted(world))
+    }),
+    (
+        "hand-over, the abort arrives after the take-over",
+        |world| Box::pin(hand_over_abort_late(world)),
+    ),
+    (
+        "hand-over, the take-over arrives after the abort",
+        |world| Box::pin(hand_over_take_over_late(world)),
+    ),
+    ("signer, two new installs restored at once", |world| {
+        Box::pin(signer_two_installs_race(world))
     }),
     ("records", |world| Box::pin(records(world))),
     ("erasure", |world| Box::pin(erasure(world))),

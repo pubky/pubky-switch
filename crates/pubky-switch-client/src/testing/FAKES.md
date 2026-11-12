@@ -319,9 +319,9 @@ file lists what the scripted switch fakes or leaves out beyond those flows.
 ## Signer flows: what runs against the service too
 
 The signer's own tests run against the scripted switch. The harness
-(`crates/pubky-switch-harness`) runs the honest paths of the same flows against the service
-as well and compares the two, so for these groups a difference between the scripted switch
-and the service shows there:
+(`crates/pubky-switch-harness`) runs some of the honest paths of the same flows against the
+service as well and compares the two, so for these groups a difference between the scripted
+switch and the service shows there:
 
 - approval, renewals and reductions, a reduction's closing with its publication failing,
   rotations over several epochs, and an epoch completed after a rotation was given up at a
@@ -332,23 +332,29 @@ and the service shows there:
 - publication put right, the alarm for another document on the Homeserver and its
   clearing, another install signing, and records behind (`flows.rs`);
 - restore from the signer backup, in place and on a new install, with a version never
-  delivered and with a revocation only the switch holds (`restore.rs`);
-- the hand-over both ways and its abort (`handover.rs`), the account's erasure and its
+  delivered and with a revocation only the switch holds, and two installs restored at
+  once, the second delivery refused `409 stale_identity` (`restore.rs`);
+- the hand-over both ways, its abort, and the abort racing the take-over with either
+  arriving first (`handover.rs`), the account's erasure and its
   lost answer (`erasure.rs`), and the provider loss: declared at a new service and in
   place, declared again, refused, its staged admission ended, and restored mid-recovery
   (`recovery.rs`).
+
+Not every honest path has a flow there. Among those without one: a stale backup refused at
+a restore, a Homeserver that holds another body at a restore, and a restore in place below
+the signer's mark (`restore.rs`).
 
 What stays only on the scripted switch, and why:
 
 - **A switch that misbehaves.** A removal time reported before the app was listed or after
   the answer that reports it; a copy of `identity.json` that doesn't verify, is older than
   the signer's mark, or has another body at it; an answer signed with the wrong key or
-  with a member left out; a delivery refused for good, which no conforming signer meets at
-  the service. The service does none of these, so only a scripted fault shows what the
-  signer does about them.
-- **Exact timing.** Two installs whose deliveries race, a crash at each commit of a flow, a
-  store that fails or can't tell whether it committed, and an answer lost at one chosen
-  call among several alike: the tests place these by a commit's or a request's number.
+  with a member left out; a delivery refused `413 too_large`, which no conforming signer
+  meets at the service. The service does none of these, so only a scripted fault shows
+  what the signer does about them.
+- **Exact timing.** A crash at each commit of a flow, a store that fails or can't tell
+  whether it committed, and an answer lost at one chosen call among several alike: the
+  tests place these by a commit's or a request's number.
 - **A backup that doesn't open or is missing,** and a Homeserver that is down for a whole
   call: the Homeserver's faults in the harness are a single failed write or deletion.
 - **The warnings about an app's open attempts** at a revocation and before a lapse

@@ -419,6 +419,18 @@ impl World {
         self.recorder.hold_back(method, path);
     }
 
+    /// As [`World::hold_back`], for the next such request only: those after it go through
+    /// while it waits. For two parties' requests of one kind that race, where the flow
+    /// decides which arrives first.
+    pub fn hold_back_next(&self, method: &str, path: &str) {
+        self.recorder.hold_back_next(method, path);
+    }
+
+    /// How many requests are held back now.
+    pub fn held_back_now(&self) -> usize {
+        self.recorder.held_back_now()
+    }
+
     /// Let the requests [`World::hold_back`] holds go.
     pub fn let_go(&self) {
         self.recorder.let_go();
