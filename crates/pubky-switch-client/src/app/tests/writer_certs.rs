@@ -51,6 +51,13 @@ fn pending_faults(w: &World) -> usize {
 /// The phone, registered before the wallet joins, so the wallet never sees its `app.put`;
 /// then the wallet; then the phone's attempt on [`CLAIM`].
 async fn joined_after_the_writer(store: &Arc<MemoryStore>) -> (World, App) {
+    let (w, _, app) = joined_after_the_writer_on(store).await;
+    (w, app)
+}
+
+async fn joined_after_the_writer_on(
+    store: &Arc<MemoryStore>,
+) -> (World, super::moves::Router, App) {
     let w = World::new();
     let router = super::moves::Router::of(&w);
     w.other_app("phone", &Permission::ALL);
@@ -64,7 +71,12 @@ async fn joined_after_the_writer(store: &Arc<MemoryStore>) -> (World, App) {
     .await;
     let attempt = ClaimOp::attempt(CLAIM, 0, ATTEMPT, 3600, None);
     w.switch.app_op(&app_keys("phone"), attempt.kind()).unwrap();
-    (w, app)
+    (w, router, app)
+}
+
+/// The directory shows no record of the phone, so its certificate can't be fetched.
+fn hide_the_phone(w: &World) {
+    w.switch.lock().apps.get_mut(&phone()).unwrap().record = None;
 }
 
 #[tokio::test]
@@ -176,4 +188,77 @@ async fn test_writer_cert_of_a_writer_no_longer_listed_is_dropped_unread() {
         app.shared_evidence().await.unwrap().claim_entries_left_out,
         1
     );
+}
+
+#[tokio::test]
+async fn test_writer_cert_that_doesnt_verify_the_entry_isnt_uploaded_with_it() {
+    // An entry kept before its writer's certificate came, which that certificate doesn't
+    // verify, as one a switch forged in the writer's name, is left out of the upload.
+    let store = Arc::new(MemoryStore::new());
+    let (_w, mut app) = joined_after_the_writer(&store).await;
+    app.receive(None).await.unwrap();
+    assert!(holds_cert_of(&store, &phone()));
+    // The kept entry's signature is replaced by another valid encoding.
+    let ns = crate::store::client_namespace(&app_keys("wallet").app_id_bytes());
+    let (key, value) = store
+        .scan(&ns, b"clent/", None, 10)
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("the kept entry");
+    let mut entry: Value = serde_json::from_slice(&value).unwrap();
+    let forged = b64(&[7; 64]);
+    let sig = &mut entry["d"]["op"]["sig"];
+    assert!(
+        sig.is_string() && *sig != Value::String(forged.clone()),
+        "{sig}"
+    );
+    *sig = Value::String(forged);
+    let mut batch = crate::store::WriteBatch::new();
+    batch
+        .put(&ns, key, serde_json::to_vec(&entry).unwrap())
+        .unwrap();
+    store.commit(batch).unwrap();
+    let evidence = app.shared_evidence().await.unwrap();
+    assert_eq!(evidence.claim_entries_left_out, 1);
+    assert!(evidence.ops.is_empty(), "{evidence:?}");
+}
+
+#[tokio::test]
+async fn test_writer_cert_left_out_entries_are_in_the_recovery_report() {
+    // After a provider loss, the upload leaves out the entry it holds no certificate for,
+    // and the recovery report says how many.
+    let store = Arc::new(MemoryStore::new());
+    let (w, router, mut app) = joined_after_the_writer_on(&store).await;
+    hide_the_phone(&w);
+    app.receive(None).await.unwrap();
+    drop(app);
+    let n_key = super::moves::next_key();
+    let next =
+        ScriptedSwitch::recovering(&w.alice, n_key.to_bytes(), Arc::clone(&w.clock), 2, 1).unwrap();
+    router.add(super::moves::NEXT, &next);
+    super::moves::publish_at(
+        &w,
+        &next,
+        pubky_switch_core::records::Inbox::new(
+            super::moves::NEXT,
+            n_key.verifying_key().to_bytes(),
+        ),
+        2,
+        Some(1),
+    );
+    w.switch.lock().erased = true;
+    let mut app = App::load(
+        router.env(&w, Arc::clone(&store) as Arc<dyn StateStore>),
+        w.protocol.clone(),
+        World::config(),
+        app_keys("wallet").app_id_bytes(),
+    )
+    .await
+    .unwrap();
+    app.refresh_identity().await.unwrap();
+    app.receive(None).await.unwrap();
+    let info = app.recovery_info().await.unwrap().unwrap();
+    assert_eq!(info.loss.generation, 2);
+    assert_eq!(info.claim_entries_left_out, 1);
 }
