@@ -1335,3 +1335,51 @@ async fn test_own_record_conflict_on_a_resend_a_later_record_superseded_is_dropp
     assert_eq!(w.published(id), Some(bytes_of(later.signed())));
     app.receive(None).await.unwrap();
 }
+
+/// Switch spec 12.3: a delete that fails holds back no immediate leave, also one asked for
+/// after a two-step leave whose delete failed.
+#[tokio::test]
+async fn test_own_record_immediate_leave_after_a_failed_two_step_one_goes_ahead() {
+    let w = World::new();
+    let mut app = w.join_publishing("wallet").await;
+    let id = app.app_id();
+    w.homeserver.set_down(true);
+    app.leave(LeaveMode::TwoStep).await.unwrap_err();
+    assert!(!w.switch.app(&id).departed);
+    app.leave(LeaveMode::Immediate(UserConfirmed::new()))
+        .await
+        .unwrap();
+    assert!(w.switch.app(&id).departed);
+    assert!(
+        app.take_events()
+            .iter()
+            .any(|e| matches!(e, AppEvent::RecordPublishFailed { .. }))
+    );
+}
+
+/// Switch spec 3.6, 12.3: a leave after a compromise goes without the delete, also a
+/// two-step one asked for once the compromise's own leave failed.
+#[tokio::test]
+async fn test_own_record_two_step_leave_after_a_compromise_goes_without_the_delete() {
+    use crate::app::Alarm;
+    let w = World::new();
+    let mut app = w.join_publishing("wallet").await;
+    let id = app.app_id();
+    register_foreign_key(&w, &app);
+    w.homeserver.set_down(true);
+    w.switch.fail_next(Fault::Unreachable {
+        path: "/leave".into(),
+        after: 0,
+    });
+    let error = app.receive(None).await.unwrap_err();
+    assert!(
+        matches!(error, AppError::Alarm(Alarm::Compromise { n: 1, .. })),
+        "{error:?}"
+    );
+    assert!(!w.switch.app(&id).departed);
+    let outcome = app.leave(LeaveMode::TwoStep).await;
+    assert!(
+        w.switch.app(&id).departed,
+        "the leave waited on the delete: {outcome:?}"
+    );
+}
