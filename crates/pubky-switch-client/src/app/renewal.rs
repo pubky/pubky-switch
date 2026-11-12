@@ -127,12 +127,15 @@ impl App {
     /// Send the kept `app.put` until answered; returns whether the switch accepted a record
     /// in this call. A `409 conflict` naming a record of this app with an `updated_at` at or
     /// after this one's (another device's) is written again once, later than the held one
-    /// (Switch spec 4.2). One naming no record that verifies is taken as delivered only when
-    /// the switch's directory shows it holds this very record, as for a re-send of a batch
-    /// the switch applied and holds without its proofs (Switch wire 6.4 step 5); otherwise
-    /// it is refused, and nothing is noted or published. Once the switch holds the record,
-    /// an app that publishes owes it to the Homeserver, in the commit that records the
-    /// answer.
+    /// (Switch spec 4.2). One naming no record that verifies answers a re-send of a batch
+    /// the switch applied and holds without its proofs (Switch wire 6.4 step 5), so the
+    /// switch's directory decides it: a directory that shows this very record makes it
+    /// delivered; one that shows a later record of the app, which another device put after
+    /// it, makes it superseded, so the kept record is dropped, neither noted as accepted
+    /// nor published, and not signed again, which would put this older body over the later
+    /// record (Switch spec 4.2 "The later `updated_at` wins"); otherwise it is refused, and
+    /// nothing is noted or published. Once the switch holds the record, an app that
+    /// publishes owes it to the Homeserver, in the commit that records the answer.
     pub(crate) async fn deliver_pending_record(&mut self) -> Result<bool, AppError> {
         let Some(pending) = self.state.pending_record.clone() else {
             return Ok(false);
@@ -151,8 +154,18 @@ impl App {
                 };
                 // Boxed: the directory read is rare, and would otherwise widen every future
                 // that delivers a record.
-                if named.is_none() && !Box::pin(self.switch_holds(&batch)).await? {
-                    return Err(error);
+                if named.is_none() {
+                    match Box::pin(self.switch_holds(&batch)).await? {
+                        Held::This => {}
+                        Held::Later => {
+                            let mut tx = self.tx()?;
+                            tx.delete(key::PENDING_RECORD)?;
+                            self.commit(tx).await?;
+                            self.state.pending_record = None;
+                            return Ok(false);
+                        }
+                        Held::Other => return Err(error),
+                    }
                 }
                 named
             }
@@ -194,17 +207,24 @@ impl App {
         Ok(true)
     }
 
-    /// Whether the switch's directory shows it holds, for this app, the record `batch`
-    /// delivers, byte for byte.
-    async fn switch_holds(&mut self, batch: &Batch) -> Result<bool, AppError> {
+    /// What the switch's directory shows it holds for this app, beside the record `batch`
+    /// delivers.
+    async fn switch_holds(&mut self, batch: &Batch) -> Result<Held, AppError> {
         let record = delivered_record(batch)?;
+        let mine = AppRecord::verify(&record, &self.state.meta.identity)?;
         let me = self.state.meta.app_id;
         let result = self.client.directory(None).await;
         let directory = self.take(result).await?;
-        Ok(directory
-            .apps
-            .iter()
-            .any(|app| app.app_id == me && app.record.signed() == &record))
+        let Some(entry) = directory.apps.iter().find(|app| app.app_id == me) else {
+            return Ok(Held::Other);
+        };
+        Ok(if entry.record.signed() == &record {
+            Held::This
+        } else if entry.record.updated_at() > mine.updated_at() {
+            Held::Later
+        } else {
+            Held::Other
+        })
     }
 
     /// The listed certificate from the own record in the directory, when the own
@@ -262,6 +282,16 @@ impl App {
         }
         Ok(Listed::Key(key))
     }
+}
+
+/// What the switch's directory shows for the app, beside a kept `app.put`'s record.
+enum Held {
+    /// That very record, byte for byte.
+    This,
+    /// A record of the app with a later `updated_at`.
+    Later,
+    /// Another record, or none.
+    Other,
 }
 
 /// What [`App::take_listed_cert`] found.

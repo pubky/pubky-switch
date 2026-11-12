@@ -1285,3 +1285,53 @@ async fn test_own_record_read_publishes_the_record_it_delivers_before_the_feed()
     assert_eq!(w.held(id).as_ref(), Some(&kept));
     assert_eq!(w.published(id), Some(bytes_of(&kept)));
 }
+
+/// Switch spec 4.2, wire 6.4 step 5: the switch applied the kept record, its answer lost,
+/// and another device of the app put a later one. Once the switch forgets the batch's
+/// proofs, the re-send gets `409 conflict` naming no record, and the directory shows the
+/// later record: the kept one is superseded. It is dropped, never noted as accepted,
+/// published or signed again over the later record, and the reads go on.
+#[tokio::test]
+async fn test_own_record_conflict_on_a_resend_a_later_record_superseded_is_dropped() {
+    let w = World::new();
+    let mut app = w.join_publishing("wallet").await;
+    let id = app.app_id();
+    let accepted = app.state.accepted.clone();
+    w.clock.advance_ms(1_000);
+    w.switch.fail_next(Fault::LoseAnswer {
+        path: "/ops".into(),
+    });
+    app.set_protocol_member(PROTO, member(json!({ "a": 1 })), None)
+        .await
+        .unwrap_err();
+    let kept = app.record().clone();
+    assert_eq!(w.held(id).as_ref(), Some(&kept));
+    // Another device of the app puts a later record, and publishes it.
+    w.clock.advance_ms(1_000);
+    let mut later = AppRecordBody::new(app.cert(), Vec::new(), w.clock.now_ms());
+    later.label = Some("other device".into());
+    let later = AppRecord::sign(&app_keys("wallet"), later).unwrap();
+    w.switch
+        .app_op(
+            &app_keys("wallet"),
+            OpKind::AppPut {
+                record: later.signed().clone(),
+            },
+        )
+        .unwrap();
+    w.homeserver.put(
+        w.alice.public(),
+        &app_record_path(&id),
+        bytes_of(later.signed()),
+    );
+    // This device stays offline until the switch forgets the batch's proofs.
+    w.clock.advance_ms(pubky_switch_core::ops::BATCH_PROOFS_MS);
+    let puts = w.app_puts();
+    app.receive(None).await.unwrap();
+    assert!(app.state.pending_record.is_none());
+    assert_eq!(app.state.accepted, accepted);
+    assert_eq!(w.app_puts(), puts, "signed again over the later record");
+    assert_eq!(w.held(id).as_ref(), Some(later.signed()));
+    assert_eq!(w.published(id), Some(bytes_of(later.signed())));
+    app.receive(None).await.unwrap();
+}
